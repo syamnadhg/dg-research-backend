@@ -7853,6 +7853,17 @@ def _clear_pending_decision(agent: "str | None" = None):
     unconditionally, exactly as before."""
     global _pending_decision_active, _pending_decision_agent
     a = (agent or "").lower() or None
+    # #955 Phase 2: drop this agent's armed auto-skip deadline BEFORE the mirror
+    # keep-guard below. The guard protects the single durable-mirror slot when a
+    # DIFFERENT agent owns it — but the registry is per-agent and multi-entry, so
+    # disarming the acting agent's deadline is always correct even when the live
+    # mirror belongs to a sibling (gating it behind the guard would orphan the
+    # entry and auto-skip a recovered agent). Agent-LESS clears (None) leave the
+    # registry untouched here — the central resolve seam owns clear-all on the
+    # genuine phase-level / whole-run signals, so an incidental agent-less mirror
+    # clear (an HV finalize, a login gate) can't nuke a sibling's live deadline.
+    if a is not None:
+        _disarm_registry(a)
     if (a is not None and _pending_decision_active
             and _pending_decision_agent is not None
             and _pending_decision_agent != a):
@@ -13095,6 +13106,23 @@ def emit_event(event_type, phase=None, agent=None, **data):
                 agent if event_type in ("agent_skipped", "pipeline_resumed") else None)
     except Exception:
         pass
+    # #955 Phase 2: disarm the auto-skip deadline registry on the SAME
+    # resolution signals — otherwise a resolved card's armed deadline lingers in
+    # the module-global registry and _fire_due_autoskips skips a recovered /
+    # retried / resumed agent. Agent-scoped for a specific agent_skipped or an
+    # agent-carrying pipeline_resumed; clear-ALL for phase-level and whole-run
+    # signals (pipeline_stopped, phase_skipped, phase_restart, and the agent-less
+    # pipeline_resumed emitted after a whole-run pause — its rebuilt `pending`
+    # has no stuck bookkeeping, so a stale deadline would fire on the first
+    # post-resume tick). Separate try/except so a registry error can't break
+    # mirror clearing and vice-versa.
+    try:
+        if event_type in ("pipeline_stopped", "phase_skipped", "phase_restart"):
+            _disarm_registry("__all__")
+        elif event_type in ("agent_skipped", "pipeline_resumed"):
+            _disarm_registry(agent if agent else "__all__")
+    except Exception:
+        pass
     # #715 universal alert persistence: ANY blocking pipeline_error decision
     # card gets a durable pendingDecision mirror so it RE-SURFACES on a cold
     # chat-open (the run is paused waiting on the user — the card must not
@@ -13889,6 +13917,36 @@ ALERT_INTENTS = {
 _active_decisions: set = set()
 
 
+def _disarm_registry(agent_or_all):
+    """#955 Phase 2: drop armed auto-skip deadlines so the round-robin firer
+    (_fire_due_autoskips) can't skip an agent whose card was already resolved
+    (Retry / Skip / growth-recovery / WORKING re-verdict / poke / wait-longer)
+    or a run that was paused-then-resumed (the module-global registry survives
+    the whole-run pause, whose rebuilt `pending` carries no stuck bookkeeping —
+    a stale deadline would fire on the first post-resume tick).
+
+    The disarm sites only ever know the AGENT (the decision_id is out of scope
+    at a growth-clock reset or a command chokepoint), so this is agent-keyed:
+      • `"__all__"` → clear the WHOLE registry (+ _active_decisions) — the
+        agent-less resolution signals (pipeline_stopped, phase_skipped,
+        phase_restart, whole-run pipeline_resumed).
+      • an agent key → drop only that agent's entries (+ their decision_ids).
+    Idempotent; safe when nothing is armed. Pure dict work — never raises."""
+    global _pending_decisions
+    if agent_or_all == "__all__":
+        for _did in list(_pending_decisions.keys()):
+            _active_decisions.discard(_did)
+        _pending_decisions.clear()
+        return
+    a = agent_or_all.lower() if isinstance(agent_or_all, str) else agent_or_all
+    if not a:
+        return
+    for _did, _entry in list(_pending_decisions.items()):
+        if _entry.get("agent") == a:
+            del _pending_decisions[_did]
+            _active_decisions.discard(_did)
+
+
 def _alert_actions_for(intent: str, phase, agent=None):
     """Expand an intent's action TOKENS into the exact button dicts the FE
     renders (#955). Deterministic — byte-identical to the inline dicts each
@@ -13967,10 +14025,33 @@ def emit_decision(*, phase, title=None, details="", actions=None, recoverability
             "emit_decision needs either intent= or explicit title/actions/recoverability")
     if not decision_id:
         decision_id = _new_decision_id()
+    # #955 Phase 2: a blocker/infra card is one the user must resolve (login, HV,
+    # pro, CUA-down) — auto-skipping it would silently drop an agent the user was
+    # told to attend to. Arming a deadline on one is a caller bug.
+    if auto_skip_deadline is not None and recoverability in ("blocker", "infra"):
+        raise ValueError(
+            f"auto_skip_deadline armed on a {recoverability!r} card "
+            f"(alert_id={alert_id!r}) — blocker/infra never auto-fire")
+    _agent_key = (agent.lower() if isinstance(agent, str) else None)
+    # One live registry entry per agent — superseded by ANY newer card for that
+    # agent, deadline or NOT. A no-deadline re-card (a stuck agent that then
+    # reports an error / hits session-expiry / a login wall) must DROP the stale
+    # stuck deadline: otherwise it outlives the card it was armed for and later
+    # auto-skips the agent off wrong "stayed frozen" copy — even after the agent
+    # was parked awaiting the user (adversarial findings #5/#6). This runs before
+    # the (conditional) re-arm below, so a fresh stuck deadline both clears the
+    # agent's old entry and installs the new one (one-live-entry invariant). A
+    # re-emit that keeps a live card armed re-derives + passes its deadline
+    # (Phase 3), so the purge+re-arm is a no-op round-trip for it.
+    if _agent_key:
+        for _old_did in list(_pending_decisions):
+            if _pending_decisions[_old_did].get("agent") == _agent_key:
+                del _pending_decisions[_old_did]
+                _active_decisions.discard(_old_did)
     if auto_skip_deadline is not None:
         _pending_decisions[decision_id] = {
             "phase": phase,
-            "agent": (agent.lower() if isinstance(agent, str) else None),
+            "agent": _agent_key,
             "alert_id": alert_id,
             "deadline": auto_skip_deadline,
             "recoverability": recoverability,
@@ -14773,7 +14854,7 @@ def _agent_error_alert_id(agent_key: str, phase: "int | None" = None) -> str:
 
 
 def fail_agent(agent_key: str, title: str, details: str = "", skip_only: bool = False,
-               phase: "int | None" = None):
+               phase: "int | None" = None, auto_skip_deadline: "float | None" = None):
     """Template B: per-agent error alert (Phase 2 in the common case). Emits
     pipeline_error scoped to one agent with [Retry (hard), Skip]. NO Stop.
     Retry uses mode=hard (close tab + re-run setup) — the more recoverable
@@ -14830,10 +14911,15 @@ def fail_agent(agent_key: str, title: str, details: str = "", skip_only: bool = 
     # auto-skips on a short window (~5 min, armed in Phase 1) with an honest
     # "verification wall wasn't cleared" greyed tile. A normal agent failure is
     # recoverable (~30 min auto-skip). Byte-identical event + the new fields.
+    # #955 Phase 2: only the round-robin stuck card passes a deadline (in-`pending`
+    # P2 context, fired by _fire_due_autoskips on the tick). skip_only (hands-off
+    # HV) fires loop-locally from its own wait, never via this registry, so it
+    # never arms here even though its class is auto-skip-eligible.
     emit_decision(phase=_eff_phase, agent=agent_key,
                   title=title, details=details, actions=actions,
                   recoverability="hands_off" if skip_only else "recoverable",
-                  alert_id=_agent_error_alert_id(agent_key, _eff_phase))
+                  alert_id=_agent_error_alert_id(agent_key, _eff_phase),
+                  auto_skip_deadline=(None if skip_only else auto_skip_deadline))
     # 2026-07-13: stamp the emit so the caller's GENERIC "didn't start" card
     # doesn't fire seconds later and OVERWRITE this (same alert_id) with a
     # less specific message — the 03:42 run persisted "Couldn't send the
@@ -23937,6 +24023,99 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 elapsed_sec=int(_fin_r.get("elapsed_sec", 0) or 0),
                 results=results, results_name=_fin_name)
 
+    async def _fire_due_autoskips():
+        # #955 Phase 2: THE registry-driven auto-skip firer (design G(i)). Once
+        # per tick, auto-skip any in-`pending` agent whose armed deadline has
+        # passed. This is the single SOURCE→FIRE pairing for the stuck card:
+        # emit_decision stamps `auto_skip_deadline` (the FE counts down to the
+        # exact same epoch), the round-robin arms it at the stuck site, and this
+        # fires it — no drift between the shown countdown and when the BE acts.
+        # It REPLACES the old in-loop `_unacted_too_long` timer (which counted
+        # from `stuck_alerted_at` and was never reflected on the FE deadline
+        # field, so the countdown and the real fire could disagree).
+        #
+        # Gated on the user's auto-skip setting (parity with the old L3 gate +
+        # the HV finalize). Fires ONLY `recoverable` entries — in Phase 2 the
+        # sole in-`pending` armed card is the stuck card, so the finalize copy is
+        # the stuck copy. hands_off HV walls fire loop-locally from their own
+        # wait (design G(ii)) and never enter this registry; blocker/infra never
+        # arm at all (emit_decision refuses). A defensive WARN+skip on any other
+        # class means a future in-`pending` card that needs different copy must
+        # extend this firer, not silently inherit the stuck wording.
+        # Bail under stop/pause — the firer does real page I/O (salvage-extract +
+        # tab close); a resume clears the whole registry (agent-less
+        # pipeline_resumed → seam clear-all) so nothing fires stale post-resume.
+        if not _runtime.auto_skip_stuck or _controls.is_stop() or _controls.is_pause():
+            return
+        _now_ms = time.time() * 1000
+        _name_by_key = {normalize_agent_key(_n): _n for _n in pending}
+        for _did, _entry in list(_pending_decisions.items()):
+            _dl = _entry.get("deadline")
+            if _dl is None or _now_ms < _dl:
+                continue
+            _key = _entry.get("agent")
+            _nm = _name_by_key.get(_key)
+            if not _key or not _nm or _nm not in pending:
+                continue   # not one of our live pending agents (a setup/P1/P3 card)
+            if _entry.get("recoverability") != "recoverable":
+                log(f"[{_nm}] registry firer saw a {_entry.get('recoverability')!r} "
+                    "armed entry — skipping (only the recoverable stuck card fires "
+                    "here; other classes fire loop-locally)", "WARN")
+                continue
+            _p = pending[_nm]
+            # #955 Phase 2 (adversarial finding #6): a PARKED agent (session
+            # expiry / empty extraction / missing artifact) is governed by the
+            # parked-decision resolver, NOT this firer — its live card is no
+            # longer the stuck card, so a stale stuck deadline must not auto-skip
+            # it (off "stayed frozen" copy) while the user is being told to sign
+            # back in and Retry. The supersede purge above normally drops the
+            # stale deadline on the re-card, but this is a belt-and-braces guard.
+            if _p.get("awaiting_decision"):
+                continue
+            _elapsed = time.time() - _p.get("start_time", time.time())
+            log(f"[{_nm}] Auto-skip — the [Retry][Skip] card sat unanswered past its "
+                f"deadline (elapsed {int(_elapsed/60)}m). Salvaging partial output, "
+                "closing tab, continuing other agents.", "WARN")
+            # #929 hands-off parity: never run the extraction ladder against a
+            # verification-walled tab (the touches the Cloudflare directive
+            # forbids), and a walled agent has nothing to salvage anyway.
+            _partial = ""
+            if _key in _controls.hv_blocked:
+                log(f"[{_nm}] Auto-skip — verification-walled tab, skipping partial "
+                    "extraction (hands-off)", "WARN")
+            else:
+                try:
+                    await browser.switch_to_page(_p["page"])
+                    _partial = await extract_fns[_nm](
+                        _p["page"], browser=browser, cua_client=cua_client,
+                        label=_nm, verbose=verbose) or ""
+                except Exception as _fe:
+                    log(f"[{_nm}] Auto-skip salvage extract failed: {_fe}", "WARN")
+            # #955 Phase 2 (adversarial finding #4): the salvage-extract above
+            # awaits real page I/O for seconds. A user Retry/Skip (dispatched onto
+            # the loop by the Firestore command listener) that lands DURING that
+            # await disarms this entry (and the retry/skip consumers resolve the
+            # agent next tick). Re-validate against LIVE state before committing —
+            # an explicit user action inside the window must WIN, not be
+            # overridden by this firer's stale pre-await snapshot (which would
+            # finalize an auto_skipped result that then vetoes the user's retry).
+            if _did not in _pending_decisions or _nm not in pending:
+                log(f"[{_nm}] Auto-skip aborted — card resolved during salvage "
+                    "(user acted / agent recovered mid-extract)", "INFO")
+                continue
+            await _finalize_agent_autoskip(
+                browser, _p.get("page"), _key, _nm,
+                reason="auto_skip_stuck_no_response",
+                copy_key="stuck", why="stayed frozen with no response",
+                partial=_partial, url=_p.get("url", ""),
+                elapsed_sec=int(_elapsed),
+                results=results, results_name=_nm)
+            # Purge ALL of this agent's registry entries (agent_skipped's central
+            # clear also disarms, but be explicit — one-live-entry invariant).
+            _disarm_registry(_key)
+            if _nm in pending:
+                del pending[_nm]
+
     if not pending:
         # Every enabled agent failed setup with a null page handle — none
         # entered the poll set. Still finalize them as clean auto-skips.
@@ -23999,6 +24178,12 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                         "url": _crash_p.get("url", ""),
                                         "page": None,
                                         "elapsed_sec": int(time.time() - _crash_p.get("start_time", time.time()))}
+                # #955 Phase 2 (adversarial finding #1): a crashed tab emits only
+                # a passive browser-recovery banner — NOT a resolve-seam signal —
+                # so drop its armed deadline explicitly, else the stale entry
+                # (module-global registry) auto-skips a healthy same-key agent on
+                # the first tick of the next run in this long-lived worker.
+                _disarm_registry(_crash_key)
                 del pending[_crash_name]
                 continue
         # ── Stop/Pause check via asyncio Events ──
@@ -24310,6 +24495,11 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 continue
             if not _controls.consume_retry_agent_hard(_agent_key):
                 continue
+            # #955 Phase 2: an explicit hard retry resolves the card and restarts
+            # the agent from scratch (fresh `pending` entry, new clock). Drop any
+            # stale stuck deadline now so _fire_due_autoskips can't auto-skip the
+            # freshly-restarted agent off the OLD (already-passed) deadline.
+            _disarm_registry(_agent_key)
             _agent_name = _hard_name_map.get(_agent_key)
             if not _agent_name:
                 continue
@@ -24649,6 +24839,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         partial=_hc_partial, url=p.get("url", ""),
                         elapsed_sec=int(elapsed),
                         results=results, results_name=name)
+                    _disarm_registry(_pk_key)   # #955 P2: purge any stale deadline
                     if name in pending:
                         del pending[name]
                     continue
@@ -25762,6 +25953,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 if p.get("stuck_alerted_at", 0.0):
                     p["stuck_alerted_at"] = 0.0
                     p["stuck_warned_at"] = 0.0
+                    _disarm_registry(agent_key_stuck)   # #955 P2: flag↔registry lockstep
                     log(f"[{name}] Recovered after a stuck alert (growth resumed) — "
                         "retracting card, cancelling auto-skip", "INFO")
                     try:
@@ -25801,18 +25993,24 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             #       already shown the card + pinged, so this is "not coming back".
             # Mirrors the existing chat-mode 3h auto-skip precedent. Partial
             # output is salvaged before the tab closes.
-            _stuck_alerted_at = p.get("stuck_alerted_at", 0.0)
-            _hit_hard_cap = elapsed > PER_AGENT_HARD_CAP_SEC
-            _unacted_too_long = (_stuck_alerted_at > 0
-                                 and (time.time() - _stuck_alerted_at) > AUTO_SKIP_UNACTED_SEC)
+            # #955 Phase 2: the UNACTED-card auto-skip (trigger (b)) moved to the
+            # registry firer (_fire_due_autoskips), which auto-skips off the SAME
+            # deadline the FE counts down to (armed at the stuck site below) — no
+            # drift between the shown countdown and the real fire, and it fires
+            # from the tick even when this per-agent leg is dwelling on a sibling.
+            # This branch keeps ONLY the independent 90-min ceiling (trigger (a)):
+            # it catches the agent that was never carded stuck (slowly emitting
+            # but never finishing, or a verified=False handoff that yields no CUA
+            # verdict), which a card-driven deadline can't see. Deliberately OFF
+            # the registry (a silent backstop, no user-facing countdown). `>=`
+            # standardized (matches the parked-resolver hard cap).
+            _hit_hard_cap = elapsed >= PER_AGENT_HARD_CAP_SEC
             # #921: auto-skip is user-controllable (Settings → Pipeline). When
             # OFF, the stuck card + FE watchdog still surface, but we never
             # auto-resolve — the card waits for a manual Retry/Skip.
-            if _runtime.auto_skip_stuck and (_hit_hard_cap or _unacted_too_long):
-                _as_why = (f"ran past the {PER_AGENT_HARD_CAP_SEC // 60}-min limit"
-                           if _hit_hard_cap else "stayed frozen with no response")
-                _as_reason = ("auto_skip_hard_cap" if _hit_hard_cap
-                              else "auto_skip_stuck_no_response")
+            if _runtime.auto_skip_stuck and _hit_hard_cap:
+                _as_why = f"ran past the {PER_AGENT_HARD_CAP_SEC // 60}-min limit"
+                _as_reason = "auto_skip_hard_cap"
                 log(f"[{name}] Auto-skip — {_as_why} (elapsed {int(elapsed/60)}m). "
                     "Salvaging partial output, closing tab, continuing other agents.", "WARN")
                 _as_partial = ""
@@ -25923,13 +26121,27 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     p["stuck_warned_at"] = time.time()
                     p["stuck_alerted_at"] = time.time()
                     log(f"[{name}] CUA arbiter: CONFIRMED STUCK — raising [Retry][Skip] card", "WARN")
+                    # #955 Phase 2: ARM the auto-skip deadline on the card itself
+                    # (epoch-ms — the FE <AutoSkipCountdown> counts down to this
+                    # exact value). _fire_due_autoskips fires it off the SAME
+                    # deadline on the tick once it passes; a Retry / Skip / growth
+                    # / WORKING re-verdict / poke / wait-longer disarms it first.
+                    # stuck_alerted_at (set above) stays the in-loop "carded" flag,
+                    # kept in lockstep with the registry at every disarm site.
+                    # Arm ONLY when auto-skip is ON — otherwise the FE would count
+                    # down to a fire that (correctly) never happens (the firer is
+                    # gated on the same setting). Auto-skip OFF ⇒ no countdown, the
+                    # card just waits for a manual Retry/Skip (pre-#955 behavior).
                     fail_agent(agent_key_stuck,
                                f"{name} seems stuck",
                                (f"{name} stopped producing output — likely a platform-side "
-                                "glitch. Retry to restart it, or Skip to continue without it."))
+                                "glitch. Retry to restart it, or Skip to continue without it."),
+                               auto_skip_deadline=(
+                                   int((time.time() + AUTO_SKIP_UNACTED_SEC) * 1000)
+                                   if _runtime.auto_skip_stuck else None))
                     # Non-blocking: the other agents keep polling; the command
                     # bus applies a user Retry/Skip on the next tick. If none
-                    # comes, Layer 3 auto-skips after AUTO_SKIP_UNACTED_SEC.
+                    # comes, _fire_due_autoskips auto-skips after AUTO_SKIP_UNACTED_SEC.
                 else:
                     # CUA saw real output the scraper couldn't (cross-origin
                     # iframe etc.). Reset the growth clock so we neither re-probe
@@ -25946,6 +26158,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     if p.get("stuck_alerted_at", 0.0):
                         p["stuck_alerted_at"] = 0.0
                         p["stuck_warned_at"] = 0.0
+                        _disarm_registry(agent_key_stuck)   # #955 P2: flag↔registry lockstep
                         log(f"[{name}] WORKING re-verdict after a stuck alert — "
                             "retracting card, cancelling auto-skip", "INFO")
                         try:
@@ -25973,6 +26186,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 # kept running and could auto-skip right after the poke.
                 p["stuck_alerted_at"] = 0.0
                 p["stuck_warned_at"] = 0.0
+                _disarm_registry(agent_key_stuck)   # #955 P2: poke disarms the deadline
             if _controls.consume_wait_longer_agent(agent_key_stuck):
                 log(f"[{name}] User granted another 20 min of no-growth budget")
                 p["last_growth_time"] = time.time()
@@ -25980,6 +26194,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 # user decision that the agent should keep running.
                 p["stuck_alerted_at"] = 0.0
                 p["stuck_warned_at"] = 0.0
+                _disarm_registry(agent_key_stuck)   # #955 P2: wait-longer disarms the deadline
 
             # #930: continuous stage for the FE milestone stepper. The launch
             # sites emit stage="researching" exactly once (post-verify); if the
@@ -26744,6 +26959,16 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             else:
                 p["done_count"] = 0
                 p["cua_confirmed"] = False
+
+        # #955 Phase 2: fire any due auto-skip deadline at the END of the tick —
+        # AFTER every per-agent leg has scraped and had its chance to disarm
+        # (growth-recovery / WORKING re-verdict / poke / wait-longer). Firing at
+        # the TOP of the tick raced those disarms: an agent that resumed in the
+        # last poll interval was auto-skipped one cycle before this tick's scrape
+        # would have cleared its card (adversarial re-verify finding). User
+        # skip/hard-retry commands were already consumed at the tick top, so an
+        # explicit action still wins; the firer bails under stop/pause.
+        await _fire_due_autoskips()
 
         # Status update per cycle
         if pending:
@@ -38458,6 +38683,16 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     # ── Initialize pipeline controls + Firestore bridge ──
     _controls.reset()
     _runtime.reset()
+    # #955 Phase 2 (adversarial findings #1/#2/#3/#5): wipe the auto-skip
+    # deadline registry at every run entry. It's a MODULE global (not owned by
+    # _runtime), and jobs run sequentially in one long-lived worker process, so
+    # an armed deadline that a prior run left stranded (a crashed/completed/
+    # errored agent whose drop path didn't emit a resolve-seam signal) would
+    # otherwise survive into THIS run and auto-skip a healthy same-key agent on
+    # the first Phase-2 tick. This is the load-bearing cross-run backstop; the
+    # per-drop-path disarms keep it clean within a run. Also covers resume
+    # re-entries (a stale pre-crash deadline must not ride the checkpoint back).
+    _disarm_registry("__all__")
     # Clear dedup cache — stale keys from a prior run in the same process
     # would otherwise suppress early events in this run.
     _last_progress.clear()

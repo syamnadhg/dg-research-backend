@@ -177,10 +177,14 @@ def test_stuck_arbiter_defaults_working_on_probe_error():
 
 
 def test_auto_skip_is_user_controllable():
-    # Settings → Pipeline "Auto-skip stuck agents" (default ON). The Layer-3
-    # auto-skip is gated on _runtime.auto_skip_stuck; the Layer-1 stuck card is
-    # NOT gated (it always surfaces so the user knows).
-    assert "_runtime.auto_skip_stuck and (_hit_hard_cap or _unacted_too_long)" in _POLL
+    # Settings → Pipeline "Auto-skip stuck agents" (default ON). EVERY auto-skip
+    # is gated on _runtime.auto_skip_stuck; the Layer-1 stuck card is NOT gated
+    # (it always surfaces so the user knows).
+    # #955 Phase 2: the unacted-card auto-skip moved to the registry firer
+    # (_fire_due_autoskips), which early-returns when auto-skip is OFF; the
+    # in-loop branch keeps ONLY the 90-min hard cap, still behind the same gate.
+    assert "if not _runtime.auto_skip_stuck:" in _POLL              # firer's gate
+    assert "_runtime.auto_skip_stuck and _hit_hard_cap" in _POLL    # in-loop hard cap
     # Default True on the runtime object + primed per-run from config.json.
     assert "self.auto_skip_stuck: bool = True" in _SRC
     assert 'pipeline_config.get("autoSkipStuck", True)' in _SRC
@@ -189,17 +193,27 @@ def test_auto_skip_is_user_controllable():
 def test_layer3_auto_skip_is_single_agent_and_notifies():
     # Auto-skip drops ONLY this agent (others keep output), greys its tile
     # (agent_skipped) and posts an informational notice. #955: the emit +
-    # notice + tab-close collapsed into the ONE _finalize_agent_autoskip
-    # helper — the L3 site routes THROUGH it. Pin the L3-UNIQUE call: only the
-    # L3 site passes copy_key="stuck", and it must finalize agent_key_stuck +
-    # drop it from pending (a vacuous membership check would pass even if the
-    # L3 call were deleted — the other 3 finalize sites also match).
-    assert 'copy_key="stuck"' in _POLL          # unique to the L3 site
-    _i = _POLL.index('copy_key="stuck"')
-    _l3 = _POLL[_i - 400:_i + 200]
-    assert "_finalize_agent_autoskip(" in _l3
-    assert "agent_key_stuck" in _l3             # this agent, not a sibling
-    assert "del pending[name]" in _POLL[_i:_i + 400]
+    # notice + tab-close collapsed into the ONE _finalize_agent_autoskip helper.
+    # #955 Phase 2: the UNACTED-card L3 auto-skip moved OUT of the per-agent leg
+    # into the registry firer _fire_due_autoskips (fires off the armed deadline
+    # the FE counts down to). Pin THAT firer — single agent, stuck copy, honest
+    # reason, drops from pending, disarms the registry, hands-off on a walled tab.
+    assert "async def _fire_due_autoskips" in _POLL
+    _fs = _POLL.index("async def _fire_due_autoskips")
+    _fire = _POLL[_fs:_POLL.index("if not pending:", _fs)]   # the closure body
+    assert 'reason="auto_skip_stuck_no_response"' in _fire
+    assert 'copy_key="stuck"' in _fire
+    assert "_finalize_agent_autoskip(" in _fire
+    assert "del pending[_nm]" in _fire          # this agent, not a sibling
+    assert "_disarm_registry(_key)" in _fire    # deadline purged on fire
+    assert "_controls.hv_blocked" in _fire      # hands-off: no extract from a walled tab
+    # The in-loop branch keeps the independent 90-min hard cap — also per-agent,
+    # routed through the same helper, dropping just this agent from pending.
+    _hc = _POLL.index('copy_key="stuck", why=_as_why')
+    _hcblk = _POLL[_hc - 500:_hc + 400]
+    assert "_finalize_agent_autoskip(" in _hcblk
+    assert "del pending[name]" in _hcblk
+    # The finalize helper greys the tile + posts the notice (single source).
     _fin = inspect.getsource(research._finalize_agent_autoskip)
     assert 'emit_event("agent_skipped", phase=phase, agent=key' in _fin
     assert 'alert_id=f"agent_{key}_autoskip"' in _fin

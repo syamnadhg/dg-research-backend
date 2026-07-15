@@ -282,13 +282,16 @@ def test_retraction_only_when_a_card_was_stamped():
 
 def test_hard_retry_dropped_for_completed_agent():
     i = POLL_SRC.index("consume_retry_agent_hard")
-    blk = POLL_SRC[i:i + 4400]
+    blk = POLL_SRC[i:i + 4800]   # #955 P2: widened — the loop-top registry disarm added lines
     assert "Hard retry ignored" in blk
     assert '_rec_done.get("status") == "done"' in blk
     assert '== "complete"' in blk
-    # The stale card is retracted, not left dangling.
+    # The stale card is retracted, not left dangling. Re-anchored (#955 P2):
+    # pin the clear right where the "already finished" retraction is emitted,
+    # not by an absolute window offset (which flakes when nearby code shifts).
     assert "already finished" in blk
-    assert "_clear_pending_decision(_agent_key)" in blk
+    _j = POLL_SRC.index('error=f"{_agent_name} already finished"')
+    assert "_clear_pending_decision(_agent_key)" in POLL_SRC[_j:_j + 600]
 
 
 def test_hard_retry_guard_precedes_stub_seeding():
