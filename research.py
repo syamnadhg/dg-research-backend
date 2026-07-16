@@ -9010,8 +9010,9 @@ def _start_cli_command_reader(loop):
                 else:
                     log(f"[CMD] skip phase {ph}")
                     loop.call_soon_threadsafe(_controls.request_skip_phase, ph)
-                    # request_skip_phase doesn't release the pause; mirror the
-                    # Firestore handler at line ~2682 and resume.
+                    # request_skip_phase now releases pause_event itself (parity
+                    # with request_retry_phase); we still request_resume to also
+                    # clear pause_reason/pause_target_agent for the CLI menu.
                     loop.call_soon_threadsafe(_controls.request_resume)
             elif cmd in ("c", "continue"):
                 # "Continue with Free" — mirrors the web frontend's
@@ -9446,11 +9447,20 @@ class PipelineControls:
         Each phase calls consume_phase_skip(N) at its entry branch — if True,
         the phase emits phase_skipped(reason=user_skip) instead of running,
         and the pipeline advances to the next phase with whatever partial
-        results already exist."""
+        results already exist.
+
+        Also releases any pause (pause_event/resume_event) so a phase coroutine
+        parked in wait_if_paused can wake and consume the skip — parity with
+        request_retry_phase (2026-07-16, INV #3). This does NOT clear
+        pause_reason/pause_target_agent; the Firestore/CLI callers still invoke
+        request_resume() for that fuller reset, but the method is now
+        self-sufficient for any future caller."""
         try:
             self.skipped_phases.add(int(phase))
         except (TypeError, ValueError):
-            pass
+            return
+        self.pause_event.clear()
+        self.resume_event.set()
 
     def set_continue_anyway(self):
         """User clicked 'Continue anyway' on a pipeline_warning. One-shot —
@@ -9564,6 +9574,13 @@ class PipelineControls:
                 if self.consume_phase_skip(phase):
                     return "skip"
                 await asyncio.sleep(0.5)
+            # INV #3 (2026-07-16): a timed-out phase decision (the ~never 24h
+            # backstop) must not leave the run wedged paused — release any pause
+            # so a fall-through caller isn't blocked at the next wait_if_paused.
+            # User retry/skip already release via request_retry_phase /
+            # request_skip_phase; this covers only the unattended-timeout tail.
+            if self.pause_event.is_set():
+                self.request_resume()
             return "timeout"
         finally:
             self._awaiting_user = False
@@ -33792,11 +33809,23 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
                                      preserve_tab=preserve_tab, release_pause=True)
         return False
     log(f"[{label}] Human verification timed out ({max_wait_loops * 5}s) — skipping agent", "WARN")
-    # #710: this timeout exit drops the agent WITHOUT emitting
-    # pipeline_resumed/stopped, so the universal emit_event clear never fires —
-    # retract the durable mirror here (load-bearing, like the login
-    # skip_init_verify break) so a cold chat-open can't paint a ghost
-    # "needs human verification" card for an agent that already timed out.
+    # INV #3 / #954 leak class (2026-07-16): auto-skip OFF must STILL release the
+    # HV pause before handing back to the caller's manual card. request_pause set
+    # pause_event on entry; returning False without clearing it leaves pause_event
+    # SET, so the caller's next wait_if_paused() would block the WHOLE run
+    # indefinitely (reason=human_verification_required, no resume path). The ON
+    # branch releases via _hv_auto_skip_finalize(release_pause=True); this OFF
+    # branch had no equivalent. The agent-scoped pipeline_resumed also fires the
+    # universal clear seam for THIS agent — retracting its HV mirror + auto-
+    # clearing the FE card — so #710's ghost-card concern is handled exactly the
+    # way any resolved gate is (superseding the manual retract below).
+    if _controls.is_pause():
+        _controls.request_resume()
+        emit_event("pipeline_resumed", phase=phase, reason="hv_timeout_handoff",
+                   agent=platform_key)
+    # #710 belt-and-suspenders: retract the durable mirror explicitly too (the
+    # login skip_init_verify break does the same) — harmless if the resume seam
+    # already cleared it.
     _clear_pending_decision()
     return False
 
