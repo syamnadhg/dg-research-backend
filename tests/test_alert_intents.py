@@ -186,15 +186,45 @@ def test_pro_required_skip_is_skip_init_verify_at_p0():
 
 
 def test_chat_mode_actions_keep_stop_and_named_skip():
+    # Gap #1: chat_mode is now non-blocking — "Continue in chat mode" routes
+    # through the AGENT-SCOPED agent_decision channel (decision="continue_chat"),
+    # NOT the global one-shot continue_anyway a sibling would steal. Skip + Stop
+    # are unchanged.
     acts = research._alert_actions_for("chat_mode", 2, "claude")
     assert acts == [
         {"id": "continue_in_chat_mode", "label": "Continue in chat mode", "style": "default",
-         "command": {"action": "continue_anyway"}},
+         "command": {"action": "agent_decision", "agent": "claude", "decision": "continue_chat"}},
         {"id": "skip_claude", "label": "Skip Claude", "style": "default",
          "command": {"action": "skip_agent", "agent": "claude"}},
         {"id": "stop", "label": "Stop", "style": "danger",
          "command": {"action": "stop"}},
     ]
+
+
+def test_continue_chat_maps_to_continue_anyway_agent_scoped():
+    # Gap #1: "Continue in chat mode" routes agent-scoped as decision
+    # "continue_chat" and poll_agent_decision maps it to the resolver's
+    # "continue_anyway" verdict — for the RIGHT agent only (a sibling's park
+    # can't steal it, unlike the global one-shot continue_anyway).
+    c = research.PipelineControls()
+    c.set_agent_decision("continue_chat", "claude")
+    # sibling unaffected
+    assert c.poll_agent_decision("gemini") == "pending"
+    # correct agent → mapped verdict, one-shot
+    assert c.poll_agent_decision("claude") == "continue_anyway"
+    assert c.poll_agent_decision("claude") == "pending"
+    # the GLOBAL continue_anyway is untouched by the agent-scoped decision
+    assert c.consume_continue_anyway() is False
+
+
+def test_dispatcher_agent_decision_whitelist_includes_continue_chat():
+    # Gap #1 Finding 3 (MANDATORY): the dispatcher's agent_decision handler must
+    # accept "continue_chat" — otherwise the non-blocking chat_mode "Continue in
+    # chat mode" is silently dropped and the parked agent only resolves on
+    # timeout. Both the consume handler and the command-ack path must include it.
+    mod = inspect.getsource(research)
+    assert 'decision not in ("retry", "skip", "stop", "continue_chat")' in mod
+    assert '_ad in ("retry", "skip", "stop", "continue_chat")' in mod
 
 
 def test_chat_mode_stamps_deadline_but_does_not_arm_the_registry(monkeypatch):

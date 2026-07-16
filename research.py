@@ -8435,7 +8435,10 @@ def _start_command_listener(uid, research_id, loop):
                 _ack_ok = True
                 if action == "agent_decision":
                     _ad = (data.get("decision", "") or "").lower()
-                    _ack_ok = _ad in ("retry", "skip", "stop")
+                    # Gap #1: chat_mode "Continue in chat mode" routes through
+                    # agent_decision now — ack it too so the button doesn't hang
+                    # on "Sending…" until the 12s fallback.
+                    _ack_ok = _ad in ("retry", "skip", "stop", "continue_chat")
                 if _ack_ok:
                     try:
                         emit_event("command_ack", command_id=_cmd_id,
@@ -8840,10 +8843,14 @@ def _start_command_listener(uid, research_id, loop):
                 else:
                     log("Command received: WAIT_LONGER_AGENT rejected — no agent", "WARN")
             elif action == "agent_decision":
-                # Frontend response to agent_link_failed modal.
+                # Frontend response to an agent_link_failed / chat_mode card.
                 decision = (data.get("decision", "") or "").lower()
                 agent = data.get("agent", "")
-                if decision not in ("retry", "skip", "stop"):
+                # Gap #1 (Finding 3, MANDATORY): "continue_chat" MUST be in this
+                # whitelist — the non-blocking chat_mode "Continue in chat mode"
+                # routes through agent_decision now; without it the command was
+                # silently dropped and the parked agent only resolved on timeout.
+                if decision not in ("retry", "skip", "stop", "continue_chat"):
                     log(f"Command received: AGENT_DECISION agent={agent} INVALID decision={decision}", "WARN")
                 else:
                     loop.call_soon_threadsafe(_controls.set_agent_decision, decision, agent)
@@ -9193,6 +9200,11 @@ class PipelineControls:
         # a CLI 'c'/'s' (which has no pause_reason to key on once the gate is
         # non-blocking) can target the right agent.
         self.last_pro_agent: str = ""
+        # Gap #1 (non-blocking chat_mode): platform_l -> {"since","timeout"}. Set
+        # when a DR-unavailable agent submits its brief in chat mode; the
+        # round-robin pending-build reads it to seed a kind="chat_mode" park so
+        # the keep/skip decision resolves WITHOUT a setup-context pause.
+        self.chat_mode_pending: dict = {}
 
     def request_stop(self):
         self.stop_event.set()
@@ -9219,8 +9231,13 @@ class PipelineControls:
         #955 Phase 5: `agent` scopes the decision so the NON-blocking Claude
         2-artifact park consumes it agent-scoped (poll_agent_decision) without a
         sibling park stealing it. Falsy `agent` keeps the legacy agent-less shape
-        the blocking gate's pop_agent_decision reads."""
-        if decision in ("retry", "skip", "stop"):
+        the blocking gate's pop_agent_decision reads.
+
+        Gap #1: "continue_chat" joins the whitelist so the non-blocking chat_mode
+        card's "Continue in chat mode" routes through this agent-scoped channel
+        (poll_agent_decision maps it → "continue_anyway" for the resolver),
+        instead of the global one-shot continue_anyway a sibling would steal."""
+        if decision in ("retry", "skip", "stop", "continue_chat"):
             self.pending_agent_decision = decision
             self.pending_agent_decision_agent = (agent or "").strip().lower()
 
@@ -9367,6 +9384,7 @@ class PipelineControls:
         self.free_tier_consent.clear()
         self.pro_ack_agents.clear()
         self.last_pro_agent = ""
+        self.chat_mode_pending.clear()
         self.retry_phase_requested.clear()
         self.retry_agents.clear()
         self.retry_agents_hard.clear()
@@ -9730,6 +9748,13 @@ class PipelineControls:
             self.pending_agent_decision_agent = ""
             if _d in ("retry", "skip", "stop"):
                 return _d
+            # Gap #1: the non-blocking chat_mode "Continue in chat mode" arrives
+            # agent-scoped as "continue_chat" — map it to the resolver's
+            # "continue_anyway" verdict (agent-scoped, so a co-live pro ack can't
+            # steal it, unlike the GLOBAL continue_anyway deliberately ignored
+            # above).
+            if _d == "continue_chat":
+                return "continue_anyway"
         return "pending"
 
     def consume_phase_skip(self, phase: int) -> bool:
@@ -14181,10 +14206,18 @@ def _alert_actions_for(intent: str, phase, agent=None):
                         "command": ({"action": "skip_init_verify"} if phase == 0
                                     else {"action": "skip_agent", "agent": (agent or "").lower()})})
         elif token == "continue_chat":
-            # #955 Phase 4: chat_mode "Continue in chat mode" → continue_anyway
-            # (send in chat mode + set the sticky agent_modes flag downstream).
+            # #955 Phase 4: chat_mode "Continue in chat mode".
+            # Gap #1: route through the AGENT-SCOPED agent_decision channel, NOT
+            # the global one-shot continue_anyway. The chat_mode card is now
+            # non-blocking (resolved by the round-robin parked-decision resolver),
+            # and the global continue_anyway would be stolen by a co-live
+            # pro_required ack / a sibling await_agent_decision. The dispatcher
+            # relays this to set_agent_decision(decision, agent); poll_agent_decision
+            # maps "continue_chat" → "continue_anyway" for the resolver.
             out.append({"id": "continue_in_chat_mode", "label": "Continue in chat mode",
-                        "style": "default", "command": {"action": "continue_anyway"}})
+                        "style": "default",
+                        "command": {"action": "agent_decision", "agent": agent,
+                                    "decision": "continue_chat"}})
         elif token == "skip_agent_named":
             # #955 Phase 4: chat_mode "Skip <Name>" — the platform-named Skip.
             out.append({"id": f"skip_{agent}", "label": f"Skip {_agent_display_name(agent)}",
@@ -24466,6 +24499,34 @@ async def _resolve_parked_agent_decision(kind, action, p, name, key, elapsed,
         p["cua_confirmed"] = False
         return "continue"
 
+    # ── Gap #1 non-blocking chat_mode: continue = keep the chat answer; ──────
+    # timeout = discard + auto-skip (grey + close). Skip is handled upstream by
+    # the loop-top skip consumer. The card has NO Retry (a stray retry maps to
+    # timeout here → a non-degrading skip, never a silent chat-mode consent).
+    if kind == "chat_mode":
+        if action == "continue_anyway":
+            # User KEPT chat-mode output — acknowledge; the agent stays in
+            # pending and the round-robin finalizes the chat answer normally
+            # (awaiting_decision was already cleared by the caller).
+            _runtime.agent_modes[key] = {
+                "requested": "research", "actual": "chat",
+                "user_acknowledged_chat": True}
+            log(f"[{name}] chat_mode KEPT — actual=chat acknowledged; finalizing "
+                "the chat answer normally", "INFO")
+            return "continue"
+        # timeout / any non-continue → discard the chat output, grey + close.
+        log(f"[{name}] chat_mode {action} → discarding chat output, greying + "
+            "closing (no silent auto-degrade to chat without consent)", "WARN")
+        await _finalize_agent_autoskip(
+            browser, p.get("page"), key, name,
+            reason=("research_unavailable_timeout_default_skip"
+                    if action == "timeout" else "chat_mode_skip"),
+            copy_key="chat_mode", partial="", url=p.get("url", ""),
+            elapsed_sec=int(elapsed), results=results, results_name=name)
+        if name in pending:
+            del pending[name]
+        return "continue"
+
     return "continue"
 
 
@@ -24569,6 +24630,18 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
         # Register for mid-run input dispatcher
         platform_key = name.lower().replace(" ", "")
         _runtime.register_page(platform_key, agent["page"], agent["url"])
+        # Gap #1 (non-blocking chat_mode): an agent that submitted its brief in
+        # chat mode during setup left a chat_mode_pending marker — seed its
+        # kind="chat_mode" park so the round-robin gates finalization (#709) and
+        # resolves keep/skip WITHOUT a setup-context pause.
+        _cm = _controls.chat_mode_pending.pop(platform_key, None)
+        if _cm:
+            pending[name]["awaiting_decision"] = {
+                "kind": "chat_mode", "key": platform_key,
+                "since": _cm.get("since", time.time()),
+                "timeout": _cm.get("timeout", 1800.0)}
+            log(f"[round-robin] {name} parked kind=chat_mode (submitted in chat "
+                "mode, awaiting keep/skip) — siblings keep polling", "INFO")
 
     # ── Auto-skip finalization (bug 2.5): make an unresolved failure LOOK ────
     # ── exactly like a normal skip ──────────────────────────────────────────
@@ -25376,6 +25449,18 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             }
             _runtime.register_page(_agent_key, new_page,
                                     new_page.url if new_page else "")
+            # Gap #1: a hard-retry that landed in chat mode (DR still
+            # unavailable) left a chat_mode_pending marker; re-seed the
+            # kind="chat_mode" park on the rebuilt entry (a marker on the old `p`
+            # would be lost — the _controls-level dict survives the rebuild).
+            _cm_hr = _controls.chat_mode_pending.pop(_agent_key, None)
+            if _cm_hr:
+                pending[_agent_name]["awaiting_decision"] = {
+                    "kind": "chat_mode", "key": _agent_key,
+                    "since": _cm_hr.get("since", time.time()),
+                    "timeout": _cm_hr.get("timeout", 1800.0)}
+                log(f"[{_agent_name}] parked kind=chat_mode after hard-retry "
+                    "(submitted in chat mode, awaiting keep/skip)", "INFO")
             if verified_h:
                 try:
                     await inject_agent_observer(new_page, _agent_key)
@@ -33005,6 +33090,9 @@ def _autoskip_details(copy_key: str, name: str, why: str = "") -> str:
     if copy_key == "hv_wall":
         return (f"{name} hit a verification wall that wasn't cleared in time "
                 f"{_tail}")
+    if copy_key == "chat_mode":
+        return (f"{name} couldn't run Deep Research and the "
+                f"continue-in-chat-mode alert went unanswered {_tail}")
     raise KeyError(f"unknown auto-skip copy_key {copy_key!r}")
 
 
@@ -34699,107 +34787,34 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
 
         if not research_ok:
             log(f"[{label}] Deep Research unavailable after Layer 1 + Layer 2 + "
-                f"pre-send re-activation — emitting chat-mode decision alert", "WARN")
-            # #955 Phase 4 (behavior #8): the chat-mode window is 30 min, down
-            # from 3h. A DR-unavailable state needs human eyes, but a 3h wait let
-            # an AFK operator's run sit paused for hours; 30 min matches the
-            # unified auto-skip window (AUTO_SKIP_UNACTED_SEC). Stamp the deadline
-            # on the card so the FE renders the honest countdown; this caller (a
-            # setup-context wait, not the round-robin) is the firer — on timeout
-            # we SKIP the agent (rather than fall to chat mode) so a missed
-            # decision doesn't auto-degrade fidelity.
-            _chat_mode_window_sec = 1800.0
+                f"pre-send re-activation — chat-mode gate (non-blocking)", "WARN")
+            # Gap #1: NON-BLOCKING chat_mode (send-before-decision). The old gate
+            # request_pause + wait_if_paused + await_agent_decision(1800) froze
+            # the single sequential P2 setup coroutine + starved siblings for up
+            # to 30 min. Instead: submit the brief in chat mode NOW (the Send
+            # block below is mode-agnostic — same composer, the pill state set by
+            # ensure_deep_mode_active decides DR-vs-chat), PARK the keep/skip
+            # decision, and fall through. The round-robin resolves it (Continue
+            # in chat mode / Skip / auto-skip on timeout) without any pause.
+            # Tentative: actual=chat but NOT acknowledged — the park gates
+            # finalization (#709 premature green-tick of the fast chat answer)
+            # until the user consents.
+            _chat_mode_window_sec = float(os.environ.get("DG_CHATMODE_SEC", "1800"))
             _chat_mode_deadline_ms = int((time.time() + _chat_mode_window_sec) * 1000)
-            _emit_chat_mode_alert(platform_l, auto_skip_deadline=_chat_mode_deadline_ms)
-            _controls.request_pause(f"{platform_l}_chat_mode")
-            emit_event("pipeline_paused", phase=2, agent=platform_l,
-                       reason=f"{platform_l}_chat_mode")
-            await _controls.wait_if_paused()
-            if _controls.is_stop():
-                emit_event("pipeline_stopped", phase=2, agent=platform_l,
-                           reason="user_stop_chat_mode")
-                return page, False
-            decision = await _controls.await_agent_decision(platform_l, timeout=_chat_mode_window_sec)
-            log(f"[{label}] Chat-mode user decision: {decision}", "INFO")
-            if decision == "stop":
-                emit_event("pipeline_stopped", phase=2, agent=platform_l,
-                           reason="user_stop_chat_mode")
-                return page, False
-            # The chat-mode alert action set is [Continue in chat mode] /
-            # [Skip <agent>] / [Stop] — there is NO Retry button here. But
-            # await_agent_decision also drains the hard-retry set. To stay safe
-            # if a stray retry_agent command lands while this wait is active,
-            # surface a SKIP rather than silently falling through to
-            # continue_anyway (which would auto-degrade the agent to chat mode
-            # without consent).
-            if decision == "retry":
-                log(f"[{label}] Retry requested on chat-mode alert (no retry path here) "
-                    f"— treating as Skip to avoid silent chat-mode degradation", "WARN")
-                _runtime.agent_modes[platform_l] = {
-                    "requested": "research", "actual": "skipped",
-                    "user_acknowledged_chat": False,
-                }
-                # #921: agent_skipped alone greys the tile + retracts the
-                # chat-mode card (via the emit_event hook). The old
-                # fail_agent("was skipped") here re-wrote status="errored" and
-                # raised a fresh RED [Retry][Skip] card on an agent the user
-                # just skipped — a double-fire that left the tile red with a
-                # live retry button. A skip is an informational state, never a
-                # red error card.
-                emit_event("agent_skipped", phase=2, agent=platform_l,
-                           reason="retry_on_chat_mode_alert_unsupported")
-                # Internal skip marker (mirrors the setup-fail path ~34144): the
-                # caller's post-setup handler otherwise reaches its `else` and
-                # fires a contradictory RED "didn't start" fail_agent card on an
-                # agent we just greyed — it gates that off on
-                # `platform in skipped_agents`. Also drops the agent from the
-                # round-robin poll set (no sitting on a dead chat-mode tab).
-                _controls.skipped_agents.add(platform_l)
-                _controls.auto_skip_reasons[platform_l] = "chat_mode_skip"
-                # Close the chat-mode pipeline_paused (@33424): agent_skipped
-                # greys the tile but does NOT clear the FE paused chrome, so
-                # without this the run stays stuck "Paused MM:SS" after the
-                # skip. (wait_if_paused already cleared pause_event BE-side.)
-                emit_event("pipeline_resumed", phase=2, agent=platform_l,
-                           reason="chat_mode_skip")
-                return page, False
-            if decision == "skip" or decision == "timeout":
-                _runtime.agent_modes[platform_l] = {
-                    "requested": "research",
-                    "actual": "skipped",
-                    "user_acknowledged_chat": False,
-                }
-                _reason = ("research_unavailable_user_skip"
-                           if decision == "skip"
-                           else "research_unavailable_timeout_default_skip")
-                # #921: emit_event(agent_skipped) greys the tile + retracts the
-                # chat-mode card. Dropped the follow-on fail_agent("was
-                # skipped"): it re-wrote status="errored" + raised a red retry
-                # card on a just-skipped agent (the double-fire). The chat-mode
-                # card already told the user WHY before they chose Skip.
-                emit_event("agent_skipped", phase=2, agent=platform_l, reason=_reason)
-                # Internal skip marker (see the retry-branch note above): suppress
-                # the caller's contradictory red "didn't start" card + drop the
-                # agent from the round-robin poll set.
-                _controls.skipped_agents.add(platform_l)
-                _controls.auto_skip_reasons[platform_l] = _reason
-                # Close the chat-mode pipeline_paused (@33424) — see the
-                # retry-branch note above; the skip/timeout resolution must
-                # auto-resume the FE or it stays stuck "Paused MM:SS".
-                emit_event("pipeline_resumed", phase=2, agent=platform_l,
-                           reason="chat_mode_skip")
-                return page, False
-            # continue_anyway → proceed in chat mode with sticky flag.
-            # (Explicit-only per 2026-05-12: an AFK operator must not
-            # accidentally consent to lower-fidelity chat-mode output.)
             _runtime.agent_modes[platform_l] = {
                 "requested": "research", "actual": "chat",
-                "user_acknowledged_chat": True,
+                "user_acknowledged_chat": False,
             }
-            log(f"[{label}] Proceeding in CHAT MODE — user acknowledged "
-                f"(downstream extraction will use mode-agnostic path)", "WARN")
-            emit_event("pipeline_resumed", phase=2, agent=platform_l,
-                       reason="continue_chat_mode")
+            # arm_registry=False stays: the round-robin parked-decision resolver
+            # is the firer (the deadline on the card is only the FE countdown).
+            _emit_chat_mode_alert(platform_l, auto_skip_deadline=_chat_mode_deadline_ms)
+            _controls.chat_mode_pending[platform_l] = {
+                "since": time.time(), "timeout": _chat_mode_window_sec}
+            log(f"[{label}] chat_mode NON-BLOCKING — submitting brief in chat mode + "
+                f"parking keep/skip (no pipeline pause); window={_chat_mode_window_sec}s "
+                f"deadline_ms={_chat_mode_deadline_ms}", "WARN")
+            # fall through to the Send block → return page, True (parked in the
+            # round-robin, which finalizes on Continue or discards on Skip/timeout)
         else:
             _runtime.agent_modes[platform_l] = {
                 "requested": "research", "actual": "research",
@@ -34854,6 +34869,12 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                                                 max_attempts=2):
                 log(f"[{label}] CRITICAL: brief chip lost at send time and "
                     f"re-attach failed — NOT sending a brief-less run", "ERROR")
+                # Gap #1: the brief never sent, so undo the tentative chat_mode
+                # marker (set before this Send). Otherwise a Send-failed but
+                # /c/-alive ChatGPT hands off to the round-robin, gets parked
+                # kind=chat_mode, and its fail-card Retry is silently converted
+                # to a skip by the parked resolver.
+                _controls.chat_mode_pending.pop(platform_l, None)
                 fail_agent(platform_l, f"Couldn't send the brief to {platform}",
                            f"{platform} kept rejecting the brief upload. "
                            f"Retry to try again, or Skip it.")
@@ -34874,6 +34895,9 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             if not await verified_paste_brief(page, brief_to_paste, platform, label):
                 log(f"[{label}] CRITICAL: pasted brief lost at send time and "
                     f"re-paste failed — NOT sending a brief-less run", "ERROR")
+                # Gap #1: undo the tentative chat_mode marker — see the attach-path
+                # twin above (a Send-failed /c/-alive agent must not park chat_mode).
+                _controls.chat_mode_pending.pop(platform_l, None)
                 fail_agent(platform_l, f"Couldn't send the brief to {platform}",
                            f"{platform} kept rejecting the brief upload. "
                            f"Retry to try again, or Skip it.")

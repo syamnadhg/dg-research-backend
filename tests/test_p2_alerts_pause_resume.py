@@ -146,16 +146,34 @@ def test_hv_unacted_timeout_caller_releases_pause():
 
 # ── chat-mode gate skip auto-resumes + suppresses the red card ────────────────
 
-def test_chat_mode_skip_emits_pipeline_resumed():
-    # Both the retry-as-skip and skip/timeout branches close the chat-mode
-    # pipeline_paused so the run doesn't stay stuck "Paused MM:SS".
-    assert START_AGENT_SRC.count('reason="chat_mode_skip"') >= 2
+def test_chat_mode_gate_is_non_blocking():
+    # Gap #1: the chat_mode gate no longer pauses the pipeline (which froze the
+    # sequential setup coroutine + starved siblings for up to 30 min). It submits
+    # the brief in chat mode, records chat_mode_pending, and falls through — so
+    # start_agent has NO request_pause / await_agent_decision for chat_mode.
+    assert 'request_pause(f"{platform_l}_chat_mode")' not in START_AGENT_SRC
+    assert "await_agent_decision(platform_l" not in START_AGENT_SRC
+    assert "chat_mode_pending[platform_l]" in START_AGENT_SRC
 
 
-def test_chat_mode_skip_marks_skipped_agents():
-    # Marking skipped_agents makes the caller suppress its contradictory red
-    # "didn't start" fail card (it gates on `platform in skipped_agents`).
-    assert START_AGENT_SRC.count("_controls.skipped_agents.add(platform_l)") >= 2
+def test_chat_mode_marker_popped_on_send_failure():
+    # Gap #1 (adversarial finding): the chat_mode gate sets chat_mode_pending
+    # BEFORE the mode-agnostic Send. If Send fails (brief chip lost + re-attach/
+    # re-paste failed), the marker must be undone — else a Send-failed but
+    # /c/-alive ChatGPT hands off to the round-robin, parks kind=chat_mode, and
+    # its fail-card Retry is silently converted to a skip by the parked resolver.
+    assert START_AGENT_SRC.count("chat_mode_pending.pop(platform_l, None)") >= 2
+
+
+def test_chat_mode_resolution_lives_in_round_robin():
+    # Gap #1: keep/skip for a chat_mode-parked agent is resolved by the
+    # round-robin's parked-decision resolver (continue → keep + finalize;
+    # timeout → discard + auto-skip grey+close), NOT inline in start_agent. The
+    # gate itself no longer marks skipped_agents for chat_mode.
+    res = inspect.getsource(research._resolve_parked_agent_decision)
+    assert 'if kind == "chat_mode":' in res
+    assert 'copy_key="chat_mode"' in res
+    assert START_AGENT_SRC.count("_controls.skipped_agents.add(platform_l)") == 0
 
 
 # ── retry_agent intake auto-resumes every surface ─────────────────────────────

@@ -76,16 +76,21 @@ def test_skip_elif_guards_completed_agent():
 # ── Consistency: no chat-mode skip → fail_agent double-fire ──────────────────
 
 def test_chat_mode_skip_no_double_fire():
-    # The chat-mode decision branches emit agent_skipped (greys tile + retracts
-    # the card). The old fail_agent("<name> was skipped", ...) re-wrote
-    # status="errored" + raised a RED retry card on a just-skipped agent.
-    # Target the exact removed call (the f-string form), not comment mentions.
+    # Gap #1: chat_mode is non-blocking now — the inline blocking gate branches
+    # (which carried the fail_agent double-fire risk) are gone from start_agent.
+    # Keep/skip is resolved by the round-robin parked-decision resolver via a
+    # single _finalize_agent_autoskip (agent_skipped greys + retracts the card;
+    # no second RED fail card). The old double-fire call must stay gone.
     assert 'f"{_agent_name} was skipped"' not in _GEM, (
         "the fail_agent('<name> was skipped') double-fire must be gone"
     )
-    # The skip path still emits agent_skipped with a research-unavailable reason.
-    assert "research_unavailable_user_skip" in _GEM
-    assert "retry_on_chat_mode_alert_unsupported" in _GEM
+    # the inline blocking skip branches are gone from start_agent.
+    assert "retry_on_chat_mode_alert_unsupported" not in _GEM
+    assert 'request_pause(f"{platform_l}_chat_mode")' not in _GEM
+    # resolution moved to the resolver: a single finalize, no red fail_agent.
+    _res = inspect.getsource(research._resolve_parked_agent_decision)
+    assert 'if kind == "chat_mode":' in _res
+    assert "_finalize_agent_autoskip(" in _res
 
 
 # ── Incident #2: detect_completion_claude rejects an empty done-marker ───────

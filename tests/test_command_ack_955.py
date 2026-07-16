@@ -63,13 +63,15 @@ def test_command_ack_skips_ping_and_missing_id():
 
 
 def test_command_ack_skips_invalid_agent_decision():
-    # Acking an invalid agent_decision would falsely confirm a no-op (the branch
-    # below rejects a decision not in retry/skip/stop), so the ack must gate on
-    # the same whitelist.
+    # Acking an invalid agent_decision would falsely confirm a no-op (the consume
+    # branch rejects a decision not in the whitelist), so the ack must gate on
+    # the same whitelist. Gap #1: the whitelist now includes "continue_chat"
+    # (non-blocking chat_mode's "Continue in chat mode") on BOTH the ack + consume
+    # sides, so a valid continue_chat is acked and an invalid decision still isn't.
     m = re.search(r"_cmd_id = data\.get\(\"command_id\"\)(.*?)if action == \"ping\":",
                   _SRC, re.DOTALL)
     block = m.group(1)
     assert 'action == "agent_decision"' in block
-    assert '_ad in ("retry", "skip", "stop")' in block, (
+    assert '_ad in ("retry", "skip", "stop", "continue_chat")' in block, (
         "an invalid agent_decision must NOT be acked (it does nothing)."
     )
