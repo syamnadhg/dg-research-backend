@@ -48,3 +48,29 @@ def test_step3a_dumps_composer_buttons_on_failure():
         "buttons so the exact tools-menu selector can be pinned from a real "
         "run instead of guessed (#708)."
     )
+
+
+# 2026-07-16 — claude.ai added a Chat|Cowork segmented control to the composer.
+# Deep Research (the "+" tools menu + Research tool of Step 3) lives under CHAT;
+# Cowork has no Research tool, so a run that lands on Cowork would fail Step 3.
+# Step 0 ensures the composer is on Chat BEFORE the model/tools steps run.
+def test_step0_ensures_chat_tab_before_tools():
+    src = inspect.getsource(research.setup_claude_dr)
+    # Ground-truth selectors from the live DOM: the stable segment label +
+    # the aria-checked/data-checked active state on the radio.
+    assert 'data-surface-segment="chat"' in src, (
+        "Step 0 must target the Chat segment by its stable data-surface-segment "
+        "hook (the visible label is sr-only at narrow widths)."
+    )
+    assert "aria-checked" in src and "data-checked" in src, (
+        "Step 0 must read the radio's active state (aria-checked/data-checked)."
+    )
+    # It runs BEFORE Step 3 (the tools/Research menu) so Research is enabled in
+    # the right mode.
+    assert src.index("Step 0:") < src.index("Step 3"), (
+        "the Chat-tab guard must run before the tools-menu/Research step."
+    )
+    # No-op safety on the older UI (segment absent) — never hard-fails setup.
+    assert "'no-toggle'" in src, (
+        "Step 0 must no-op when the Chat/Cowork toggle is absent (older UI)."
+    )

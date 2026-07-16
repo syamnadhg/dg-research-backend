@@ -31582,6 +31582,60 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
     try:
         await asyncio.sleep(2)
 
+        # ── Step 0: ensure the composer is on the "Chat" tab, NOT "Cowork" ──
+        # (2026-07-16) claude.ai added a Chat|Cowork segmented control to the
+        # composer. Deep Research — the "+" tools menu + Research tool that
+        # Step 3 enables — lives under CHAT; Cowork has no Research tool, so a
+        # run that lands on Cowork (Claude persists composer mode across
+        # sessions) would fail Step 3 outright. Ground-truth DOM (live console
+        # dump 2026-07-16): a radiogroup of span[role="radio"] options, each
+        # carrying a stable span[data-surface-segment="chat"|"cowork"] label;
+        # active = aria-checked="true" / data-checked. Click Chat when it isn't
+        # active. No-op on the older UI (segment absent). Best-effort: WARN on a
+        # miss — the CUA setup-validate one layer up still catches a wrong mode.
+        _ENSURE_CHAT_JS = """
+        () => {
+          const seg = document.querySelector('[data-surface-segment="chat"]');
+          if (!seg) return 'no-toggle';
+          const radio = seg.closest('[role="radio"]') || seg.parentElement;
+          if (!radio) return 'no-toggle';
+          const onChat = radio.getAttribute('aria-checked') === 'true'
+                         || radio.hasAttribute('data-checked');
+          if (onChat) return 'already-chat';
+          radio.click();
+          return 'clicked-chat';
+        }
+        """
+        _VERIFY_CHAT_JS = """
+        () => {
+          const seg = document.querySelector('[data-surface-segment="chat"]');
+          if (!seg) return 'no-toggle';
+          const radio = seg.closest('[role="radio"]') || seg.parentElement;
+          return (radio && (radio.getAttribute('aria-checked') === 'true'
+                  || radio.hasAttribute('data-checked'))) ? 'chat' : 'cowork';
+        }
+        """
+        try:
+            _chat_state = await page.evaluate(_ENSURE_CHAT_JS)
+            if _chat_state == "clicked-chat":
+                await asyncio.sleep(1.2)  # let the composer re-render into Chat
+                _cs = await page.evaluate(_VERIFY_CHAT_JS)
+                if _cs != "chat":
+                    # one retry — the first click can race the control's mount
+                    await page.evaluate(_ENSURE_CHAT_JS)
+                    await asyncio.sleep(1.2)
+                    _cs = await page.evaluate(_VERIFY_CHAT_JS)
+                log(f"[setup_claude_dr] Step 0: switched composer Cowork→Chat (now={_cs})",
+                    "INFO" if _cs == "chat" else "WARN")
+            elif _chat_state == "already-chat":
+                log("[setup_claude_dr] Step 0 OK: composer already on Chat")
+            else:
+                log("[setup_claude_dr] Step 0: no Chat/Cowork toggle present "
+                    "(older UI) — nothing to switch", "INFO")
+        except Exception as _ce:
+            log(f"[setup_claude_dr] Step 0: Chat-tab guard errored "
+                f"(non-fatal, CUA validate will catch a wrong mode): {_ce}", "WARN")
+
         # Never-downgrade version floor — single source of truth (P2_MODEL_POLICY
         # in models.py). The runtime still auto-picks the HIGHEST Opus offered;
         # this floor only refuses anything below it. Injected into the picker JS
