@@ -34145,81 +34145,164 @@ async def _gemini_adopt_lost_conversation(page, pasted_text: str, label: str):
     #     we're on the empty home — to freshen the Recent list, then open it and
     #     click the most-recent OWNED entry (checking the top one or two). We
     #     never reload once in a conversation, and never after opening one.
+    # 2026-07-16 — GROUND-TRUTH selectors captured from the live Gemini rail
+    # (console DOM dump). A Recent chat = an anchor
+    #   `a[href^="/app/<id>"]` with aria-label=title, wrapped in
+    #   `gem-nav-list-item[data-test-id="conversation"]` inside
+    #   `conversations-list[data-test-id="all-conversations"]`.
+    # Read the anchor's aria-label (the CLEAN title) — innerText on the wrapper
+    # concatenates trailing hover-affordance text; aria-label is exactly the
+    # title. Dedup so repeated wrappers/anchors don't double-count.
     _SIDEBAR_LIST_JS = """
     (n) => {
-      const out = [];
-      const els = Array.from(document.querySelectorAll(
-        '[data-test-id*="conversation"], a[href*="/app/"]'));
+      const out = [], seen = new Set();
+      const els = document.querySelectorAll('a[href*="/app/"]');
       for (const el of els) {
-        const t = ((el.innerText || el.textContent) || '').trim();
-        // Length cap rejects list CONTAINERS whose innerText concatenates every
-        // title into a blob (adversarial-review finding) — a real entry is short.
-        if (t && t.length <= 120) { out.push(t.slice(0, 200)); if (out.length >= n) break; }
+        const t = ((el.getAttribute('aria-label') || el.innerText
+                    || el.textContent) || '').replace(/\\s+/g, ' ').trim();
+        if (t && t.length <= 120 && !seen.has(t)) {
+          seen.add(t); out.push(t.slice(0, 200)); if (out.length >= n) break;
+        }
       }
       return out;
     }
     """
+    # The rail has TWO gates: OPEN the side nav (aria "Open sidebar" /
+    # data-test-id "side-nav-sparkle-button"), then EXPAND the collapsible
+    # "Recent" section (aria "Toggle Recent" / data-test-id
+    # "expandable-section-toggle"). The old ladder only clicked ONE generic
+    # button and never expanded Recent, so the conversation anchors stayed out
+    # of the DOM (live 2026-07-16 stuck run: "no recent conversation entry").
+    # Guarded so we never COLLAPSE an already-open section.
     _EXPAND_SIDEBAR_JS = """
     () => {
-      // Recent list is usually collapsed — same expansion ladder the retired
-      // #897a recovery used (aria labels: Open sidebar / Toggle Recent).
-      const sels = ['[data-test-id="side-nav-menu-button"]',
-        'button[aria-label*="open sidebar" i]', 'button[aria-label*="sidebar" i]',
-        'button[aria-label*="recent" i]', 'button[aria-label*="main menu" i]',
-        'button[aria-label*="expand" i]', 'button[aria-label*="menu" i]'];
-      for (const s of sels) { const b = document.querySelector(s); if (b) { b.click(); return true; } }
-      return false;
+      let acted = false;
+      const q = (s) => document.querySelector(s);
+      // Robust visibility — offsetParent is blind to visibility:hidden /
+      // opacity:0 / position:fixed, and Gemini toggles the open/close buttons
+      // via VISIBILITY (both co-exist in the DOM). Check computed display /
+      // visibility / opacity (catches ancestor hiding too — both inherit or
+      // zero the box) plus a real rendered box.
+      const vis = (el) => {
+        if (!el) return false;
+        const s = getComputedStyle(el);
+        if (s.display === 'none' || s.visibility === 'hidden' || +s.opacity === 0) return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 1 && r.height > 1;
+      };
+      // 1) Open the rail ONLY when it's actually collapsed. The stable
+      //    data-test-id matches in BOTH states (the open + close buttons can
+      //    co-exist in the DOM), so a blind click would TOGGLE an already-open
+      //    rail SHUT and hide the very anchors we need (adversarial-review
+      //    finding). Gate on VISIBILITY: open only when the opener is visible
+      //    and there's no visible "Close sidebar".
+      const opener = q('[data-test-id="side-nav-sparkle-button"],'
+                       + ' button[aria-label="Open sidebar" i]');
+      const closer = q('button[aria-label="Close sidebar" i]');
+      if (opener && vis(opener) && !vis(closer)) { opener.click(); acted = true; }
+      // 2) Expand "Recent" only when collapsed — authoritative aria-expanded
+      //    when present, else a no-anchors proxy SCOPED to conversations-list
+      //    (an unscoped a[href*="/app/"] would let a stray /app/ link elsewhere
+      //    on the page suppress the expand — adversarial-review finding).
+      const rec = q('[data-test-id="expandable-section-toggle"],'
+                    + ' button[aria-label="Toggle Recent" i]');
+      if (rec) {
+        const exp = rec.getAttribute('aria-expanded');
+        const hasConvos = !!q('conversations-list a[href*="/app/"]');
+        if (exp === 'false' || (exp == null && !hasConvos)) { rec.click(); acted = true; }
+      }
+      return acted;
     }
     """
     _CLICK_ENTRY_BY_TITLE_JS = """
     (title) => {
-      const els = Array.from(document.querySelectorAll(
-        '[data-test-id*="conversation"], a[href*="/app/"]'));
-      for (const el of els) {
-        const t = ((el.innerText || el.textContent) || '').trim();
-        if (t && t.slice(0, 200) === title) {
-          // Click the real navigation anchor so the SPA routes (clicking a
-          // wrapper div was what "never landed on /app/<id>" — the anchor is
-          // the routed element).
-          const a = el.matches('a[href*="/app/"]') ? el
-                  : (el.querySelector('a[href*="/app/"]') || el.closest('a[href*="/app/"]') || el);
-          a.click();
-          return true;
-        }
+      // The anchor IS the routed element — click it directly so the SPA routes
+      // to /app/<id> (a wrapper-div click was what "never landed"). Match on the
+      // aria-label (the clean title) first, innerText as fallback.
+      for (const a of document.querySelectorAll('a[href*="/app/"]')) {
+        const t = ((a.getAttribute('aria-label') || a.innerText
+                    || a.textContent) || '').replace(/\\s+/g, ' ').trim().slice(0, 200);
+        if (t === title) { a.click(); return true; }
       }
       return false;
     }
     """
-    # Refresh ONCE, and ONLY because we're on the empty home, to freshen the
-    # Recent list (never reload in a conversation).
-    try:
-        _cur = (page.url or "").split("?", 1)[0].rstrip("/").lower()
-    except Exception:
-        _cur = ""
-    if _cur.endswith("gemini.google.com/app") or _cur.endswith("gemini.google.com"):
-        log(f"[{label}] on the empty home — refreshing once to freshen the Recent list", "WARN")
-        try:
-            await page.reload(wait_until="domcontentloaded", timeout=25000)
-            await asyncio.sleep(2.0)  # let the SPA hydrate the sidebar
-        except Exception as _re:
-            log(f"[{label}] empty-home refresh failed ({_re}) — reading the sidebar as-is", "WARN")
-    # Expand + read the top 1-2 recent entries (expansion may mount a frame late).
+    # Diagnostic dump — when the Recent read comes back empty after the whole
+    # refresh budget, this reveals the ACTUAL left-rail markup (tag/role/aria/
+    # test-id/href + short text) so a stuck run tells us the real selector to
+    # match, WITHOUT a live bot-score-raising probe. (2026-07-16.)
+    _SIDEBAR_DIAG_JS = """
+    () => {
+      const seen = [];
+      const els = document.querySelectorAll(
+        'nav a, nav [role="button"], [data-test-id], a[href*="/app/"],'
+        + ' conversations-list *, side-nav *, [class*="conversation" i]');
+      for (const el of els) {
+        const t = ((el.innerText || el.textContent) || '').trim().slice(0, 40);
+        if (!t || t.length > 60) continue;
+        seen.push({ tag: el.tagName.toLowerCase(),
+          role: el.getAttribute('role') || '',
+          testid: el.getAttribute('data-test-id') || '',
+          aria: (el.getAttribute('aria-label') || '').slice(0, 30),
+          href: (el.getAttribute('href') || '').slice(0, 40), text: t });
+        if (seen.length >= 20) break;
+      }
+      return JSON.stringify(seen);
+    }
+    """
+    # 2026-07-16 (user-directed, live incident): a SINGLE refresh + 3 quick reads
+    # gave Recent too little time — the just-created conversation can take a few
+    # reloads to propagate into Recent AND the rail hydrates lazily, so the probe
+    # read empty and the recovery wrongly fell through to the re-paste ladder
+    # (which spawned a DUPLICATE conversation, the exact thing adopt-first
+    # exists to prevent). REFRESH the empty home UNTIL Recent actually shows
+    # entries (bounded). Refresh is safe ONLY on the empty home (never a
+    # conversation) — re-checked each pass. Still empty after the budget → dump
+    # the rail DOM (markup-drift is the other possible cause we can't see here).
     _titles = []
-    for _ in range(3):
-        try:
-            _titles = await page.evaluate(_SIDEBAR_LIST_JS, 2)
-        except Exception as _se:
-            log(f"[{label}] sidebar probe raised (non-fatal): {_se}", "DEBUG")
-            _titles = []
+    _refresh_budget = int(os.environ.get("DG_GEMINI_ADOPT_REFRESHES", "5"))
+    for _cyc in range(_refresh_budget):
+        # (a) expand the rail (mounts late) + read the top entries.
+        for _ in range(2):
+            try:
+                await page.evaluate(_EXPAND_SIDEBAR_JS)
+            except Exception:
+                pass
+            await asyncio.sleep(1.2)
+            try:
+                _titles = await page.evaluate(_SIDEBAR_LIST_JS, 3)
+            except Exception as _se:
+                log(f"[{label}] sidebar probe raised (non-fatal): {_se}", "DEBUG")
+                _titles = []
+            if _titles:
+                break
         if _titles:
+            log(f"[{label}] Recent list surfaced {len(_titles)} entr(ies) "
+                f"after {_cyc} refresh(es)", "INFO")
             break
+        # (b) still empty — refresh the empty home to freshen Recent, then retry.
         try:
-            await page.evaluate(_EXPAND_SIDEBAR_JS)
+            _cur = (page.url or "").split("?", 1)[0].rstrip("/").lower()
         except Exception:
-            pass
-        await asyncio.sleep(1.5)
+            _cur = ""
+        if not (_cur.endswith("gemini.google.com/app")
+                or _cur.endswith("gemini.google.com")):
+            break  # safety: only ever refresh the empty home, never a conversation
+        if _cyc < _refresh_budget - 1:
+            log(f"[{label}] Recent list empty — refresh {_cyc + 1}/{_refresh_budget} "
+                "to freshen it", "WARN")
+            try:
+                await page.reload(wait_until="domcontentloaded", timeout=25000)
+                await asyncio.sleep(2.5)  # let the SPA hydrate the sidebar
+            except Exception as _re:
+                log(f"[{label}] empty-home refresh failed ({_re})", "WARN")
     if not _titles:
-        log(f"[{label}] sidebar probe: no recent conversation entry found", "INFO")
+        try:
+            _diag = await page.evaluate(_SIDEBAR_DIAG_JS)
+        except Exception:
+            _diag = "<diag failed>"
+        log(f"[{label}] sidebar probe: no recent conversation entry after "
+            f"{_refresh_budget} refresh(es) — rail-diag: {str(_diag)[:900]}", "WARN")
         return page, False
     # Check the top one or two OWNED entries — a concurrent worker's similar-
     # titled chat can land ABOVE ours and pass the title-level ownership gate,

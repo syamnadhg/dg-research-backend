@@ -207,8 +207,9 @@ def test_finalizer_result_buckets_as_skipped_not_errored():
 def test_lost_send_recovery_refreshes_only_on_empty_home_then_clicks_sidebar():
     # User-directed: Gemini does NOT restore a conversation from a direct URL
     # (page.goto /app/<id> → empty home). The ONLY reliable adoption is to
-    # refresh ONCE on the empty home (freshen the stale Recent list), then CLICK
-    # the most-recent owned sidebar entry — never a direct URL nav.
+    # refresh the empty home (freshen the stale Recent list — see the bounded
+    # refresh-till-found loop in test_lost_send_recovery_refreshes_until_recent_
+    # surfaces), then CLICK the most-recent owned sidebar entry — never a URL nav.
     src = inspect.getsource(research._gemini_adopt_lost_conversation)
     # No direct-CONVERSATION URL nav (Gemini won't restore /app/<id> from a URL
     # — it'd land on the home). The only goto is the back-out to the bare home
@@ -222,11 +223,14 @@ def test_lost_send_recovery_refreshes_only_on_empty_home_then_clicks_sidebar():
     # ...and there is no goto of a per-conversation href.
     assert "page.goto(_abs" not in src
     # Refresh is gated to the EMPTY HOME (never reload in a conversation).
+    # Index-ordering (not a char-window) so it survives the refresh-till-found
+    # loop's extra log() between the guard and the reload.
     assert "await page.reload(" in src, "must refresh to freshen the sidebar"
-    i_reload = src.index("await page.reload(")
-    guard = src[max(0, i_reload - 300):i_reload]
-    assert 'gemini.google.com/app' in guard and "_cur" in guard, (
+    assert '_cur.endswith("gemini.google.com/app")' in src, (
         "the refresh must be gated on being on the empty home — never in-chat"
+    )
+    assert src.index('_cur.endswith("gemini.google.com/app")') < src.index("await page.reload("), (
+        "the empty-home guard must precede the refresh"
     )
     # Adoption is a sidebar CLICK on the real anchor, not a URL nav.
     assert "_CLICK_ENTRY_BY_TITLE_JS" in src and "a.click();" in src
@@ -235,8 +239,8 @@ def test_lost_send_recovery_refreshes_only_on_empty_home_then_clicks_sidebar():
 
 def test_lost_send_recovery_checks_top_one_or_two_recent_entries():
     src = inspect.getsource(research._gemini_adopt_lost_conversation)
-    # Reads the top 1-2 recent entries (a concurrent chat could sit above ours).
-    assert "_SIDEBAR_LIST_JS, 2" in src
+    # Reads the top few recent entries (a concurrent chat could sit above ours).
+    assert "_SIDEBAR_LIST_JS, 3" in src
     assert "_owned = [_t for _t in _titles if _gemini_owns_candidate(_t, pasted_head)]" in src, (
         "collect ALL owned entries among the top two"
     )
@@ -246,6 +250,48 @@ def test_lost_send_recovery_checks_top_one_or_two_recent_entries():
     assert "for _ci, _cand_title in enumerate(_owned):" in src
     # conv→conv clicks are detected by URL CHANGE, not just "/app/" presence.
     assert "_before_u" in src and '_u != _before_u' in src
+
+
+def test_lost_send_recovery_refreshes_until_recent_surfaces():
+    # 2026-07-16 (live incident): a SINGLE refresh + 3 quick reads gave the
+    # Recent list too little time — the just-created conversation hadn't
+    # propagated/hydrated, so the probe read empty and wrongly fell through to
+    # the re-paste ladder (spawning a DUPLICATE). The read is now a BOUNDED
+    # refresh-till-found loop, gated to the empty home, with a rail-DOM dump on
+    # final failure so markup drift is visible without a live probe.
+    src = inspect.getsource(research._gemini_adopt_lost_conversation)
+    # A bounded budget (not a single refresh), env-overridable.
+    assert 'DG_GEMINI_ADOPT_REFRESHES' in src
+    assert "for _cyc in range(_refresh_budget):" in src, (
+        "the Recent read must loop-refresh until entries surface, not read once"
+    )
+    # The refresh inside the loop stays gated on the empty home (never in-chat).
+    assert src.index('_cur.endswith("gemini.google.com/app")') < src.index("await page.reload("), (
+        "the loop refresh must stay gated on the empty home"
+    )
+    # On final empty, dump the rail DOM so the next incident pins the selector.
+    assert "_SIDEBAR_DIAG_JS" in src and "rail-diag" in src, (
+        "an empty Recent after the whole budget must dump the rail markup"
+    )
+
+
+def test_expand_sidebar_opener_visibility_guarded_and_recent_proxy_scoped():
+    # 2026-07-16 adversarial findings on the ground-truth-selector rework:
+    #  (1) the rail opener uses a STABLE data-test-id that matches in both
+    #      open/closed states — a blind click toggles an OPEN rail shut and hides
+    #      the anchors, so it must be VISIBILITY-gated (open only when the opener
+    #      is visible and no visible "Close sidebar").
+    #  (2) the Recent "already populated?" proxy must be SCOPED to
+    #      conversations-list — an unscoped a[href*="/app/"] lets a stray /app/
+    #      link elsewhere on the page suppress the Recent expand.
+    src = inspect.getsource(research._gemini_adopt_lost_conversation)
+    assert "vis(opener)" in src and "!vis(closer)" in src, (
+        "the rail opener must be visibility-gated (never toggle an open rail shut)"
+    )
+    # The no-anchors proxy is scoped, NOT the unscoped document-wide form.
+    assert "!!q('conversations-list a[href*=\"/app/\"], a[href*=\"/app/\"]')" not in src, (
+        "the Recent proxy must not fall back to a document-wide a[href*='/app/']"
+    )
 
 
 def test_lost_send_recovery_still_verifies_ownership_before_adopting():
