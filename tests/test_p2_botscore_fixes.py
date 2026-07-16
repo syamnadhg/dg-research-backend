@@ -85,8 +85,10 @@ def test_start_agent_accepts_reuse_page():
     sig = inspect.signature(research.start_agent_no_gemini_wait)
     assert "reuse_page" in sig.parameters
     assert sig.parameters["reuse_page"].default is None, (
-        "reuse_page must default to None so every other caller (2B/2C, "
-        "hard-retry restart, known-good fallback) keeps fresh-tab behavior."
+        "reuse_page must default to None so the 2B/2C initial-setup calls and "
+        "any known-good fallback keep fresh-tab behavior. (Gap #3: the "
+        "hard-retry restart now passes an explicit reuse_page when the old tab "
+        "is alive and hard_retry_count < 2 — see the _restart_phase2_agent pins.)"
     )
 
 
@@ -141,6 +143,48 @@ def test_chatgpt_force_new_chat_functional():
     # Clicked but the SPA never left the conversation → False.
     assert asyncio.run(_run(FakePage(
         "https://chatgpt.com/c/abc", url_after="https://chatgpt.com/c/abc"))) is False
+
+
+# ── 2b. Gap #3: hard-retry reuses the warm tab (same-tab New chat) ───────────
+
+def test_restart_phase2_agent_forwards_reuse_page():
+    # Gap #3: the hard-retry helper accepts reuse_page (default None) and
+    # forwards it into all THREE per-agent start calls (ChatGPT/Claude/Gemini),
+    # so a retry can reuse the agent's warm, challenge-passed tab.
+    sig = inspect.signature(research._restart_phase2_agent)
+    assert "reuse_page" in sig.parameters
+    assert sig.parameters["reuse_page"].default is None
+    src = inspect.getsource(research._restart_phase2_agent)
+    assert src.count("reuse_page=reuse_page") == 3, (
+        "reuse_page must be forwarded to each of the 3 start_agent_no_gemini_wait "
+        "calls (ChatGPT/Claude/Gemini)."
+    )
+
+
+def test_reuse_block_is_platform_aware():
+    # Gap #3: the reuse block branches per platform — ChatGPT does the SPA
+    # New-chat (+panel hygiene); Claude/Gemini fall through to a same-tab goto
+    # (Claude /new = fresh composer; Gemini bare /app re-triggers Layer 0.6).
+    src = inspect.getsource(research.start_agent_no_gemini_wait)
+    assert '_pl == "chatgpt"' in src
+    # The observer-state reset must run for EVERY reused platform, i.e. BEFORE
+    # the ChatGPT-only branch (otherwise a reused Claude/Gemini tab inherits a
+    # poisoned partialTextLen/stall baseline).
+    assert src.index("_agent_streams.pop(id(page)") < src.index('_pl == "chatgpt"')
+    # Layer 0.6 (Gemini fresh-chat guard) still runs unconditionally downstream.
+    assert "Layer 0.6" in src or "LAYER 0.6" in src
+
+
+def test_hard_retry_reuses_then_falls_back_to_fresh():
+    # Gap #3: the round-robin hard-retry reuses the warm tab on retry #1 and
+    # opens a fresh tab on #2 (wedged-DOM clean-slate escape hatch); it threads
+    # the reuse into the restart and closes an orphaned tab if reuse fell back.
+    src = inspect.getsource(research.poll_all_agents_round_robin)
+    assert "_hard_count < 2" in src           # reuse on #1, fresh on #2
+    assert "reuse_page=_reuse_page" in src     # threaded into the restart
+    # Leak-guard: if the in-helper reuse fell back to a fresh tab, the orphaned
+    # warm tab is closed (new_page is not _reuse_page).
+    assert "new_page is not _reuse_page" in src
 
 
 # ── 3. HV-trim: Cloudflare-aware clearance cascade ──────────────────────────

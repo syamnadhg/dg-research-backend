@@ -23096,9 +23096,16 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
 # ── Round-Robin Polling (Phase 2) ─────────────────────────────────────────────
 
 async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
-                                 brief_path, verbose: bool):
+                                 brief_path, verbose: bool, reuse_page=None):
     """Hard-retry helper: re-run the per-agent setup for a Phase 2 agent from
-    scratch (fresh tab, Pro/DR mode selection, brief paste, submit, verify).
+    scratch (Pro/DR mode selection, brief paste, submit, verify).
+
+    reuse_page (Gap #3, 2026-07-15): when the caller passes the agent's still-
+    alive tab, the restart REUSES it (client-side New chat) instead of a cold
+    top-level load — every fresh chatgpt.com/claude.ai/gemini load is a
+    Cloudflare bot-score event, and a warm, challenge-passed tab avoids it.
+    Forwarded straight into start_agent_no_gemini_wait; None (or a dead page)
+    falls back to a fresh tab, so recovery always has a clean-slate escape.
 
     Mirrors the per-agent setup blocks inside `run_phase2` — kept in sync
     manually because run_phase2's setup is entangled with agent startup
@@ -23117,7 +23124,7 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
             PROMPT_CHATGPT_DEEP_RESEARCH,
             "Enable Deep Research mode in ChatGPT. Do NOT type — just set up and focus input. Say 'ready for paste'.",
             brief_text, "2A-retry", "ChatGPT", verbose, brief_path=brief_path,
-            source_paths=source_paths)
+            source_paths=source_paths, reuse_page=reuse_page)
         if not _setup_ok:
             return (new_page, False)
         verified = await wait_until_verified(
@@ -23132,7 +23139,7 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
             PROMPT_CLAUDE_DEEP_RESEARCH,
             p2_claude_setup_directive(),
             brief_text, "2C-retry", "Claude", verbose, brief_path=brief_path,
-            source_paths=source_paths)
+            source_paths=source_paths, reuse_page=reuse_page)
         if not _setup_ok:
             return (new_page, False)
         verified = await wait_until_verified(
@@ -23147,7 +23154,7 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
             PROMPT_GEMINI_DEEP_RESEARCH,
             "Enable Deep Research mode in Gemini. Do NOT type — just set up and focus input. Say 'ready for paste'.",
             brief_text, "2B-retry", "Gemini", verbose, brief_path=brief_path,
-            source_paths=source_paths)
+            source_paths=source_paths, reuse_page=reuse_page)
         if not _setup_ok:
             return (new_page, False)
         await browser.switch_to_page(new_page)
@@ -25148,36 +25155,53 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         f"({len(_brief_text_hr)} chars — original_inputs had none)", "INFO")
                 except Exception as _bre:
                     log(f"[{_agent_name}] Hard retry: brief.md read failed ({_bre})", "WARN")
-            # Close old tab — non-fatal if it's already gone.
-            # 2026-07-06 (warm-tab reuse review): NEVER close the browser's
-            # main tab or the persistent context's LAST page. With 2A reusing
-            # the P1 tab, ChatGPT's p["page"] can BE browser.page — closing it
-            # would drop the main handle, and on a ChatGPT-only run it's the
-            # context's only page, so closing it exits headful Chrome entirely
-            # (the restart's new_tab then dies on a closed context). Leaving
-            # the old tab open is harmless — the restart opens a fresh one.
-            try:
-                old_page = p.get("page")
-                if old_page is not None:
-                    _keep_open = old_page is getattr(browser, "page", None)
-                    if not _keep_open:
-                        try:
-                            _keep_open = len(old_page.context.pages) <= 1
-                        except Exception:
-                            _keep_open = False
-                    if _keep_open:
-                        log(f"[{_agent_name}] Hard retry: keeping the old tab open "
-                            "(main/last tab) — the restart opens a fresh one", "INFO")
-                    else:
-                        await old_page.close()
-            except Exception:
-                pass
+            old_page = p.get("page")
+            # Gap #3 (2026-07-15): reuse the warm, challenge-passed tab for the
+            # restart (same-tab New chat) instead of a cold load, which is a
+            # Cloudflare bot-score event. Fall back to a FRESH tab when the page
+            # is dead/closed, or on hard-retry #2 (wedged-DOM escape hatch →
+            # guaranteed clean slate). This reverses the old "retries always
+            # pass None" stance but keeps the clean-slate hatch on #2.
+            _reuse_page = None
+            if old_page is not None and _hard_count < 2:
+                try:
+                    if not old_page.is_closed():
+                        _reuse_page = old_page
+                except Exception:
+                    _reuse_page = None
+            if _reuse_page is not None:
+                log(f"[{_agent_name}] Hard retry #{_hard_count}: reusing the warm "
+                    "tab (same-tab New chat) — no cold navigation", "INFO")
+            else:
+                # Fresh-tab fallback (dead page, or the #2 escape hatch). Close
+                # the old tab, honoring the main/last-tab guard (2026-07-06
+                # review): NEVER close browser.page or the persistent context's
+                # LAST page — doing so drops the main handle / exits headful
+                # Chrome, and the restart's new_tab then dies on a closed
+                # context. Leaving it open is harmless — the restart opens a
+                # fresh one.
+                try:
+                    if old_page is not None:
+                        _keep_open = old_page is getattr(browser, "page", None)
+                        if not _keep_open:
+                            try:
+                                _keep_open = len(old_page.context.pages) <= 1
+                            except Exception:
+                                _keep_open = False
+                        if _keep_open:
+                            log(f"[{_agent_name}] Hard retry: keeping the old tab open "
+                                "(main/last tab) — the restart opens a fresh one", "INFO")
+                        else:
+                            await old_page.close()
+                except Exception:
+                    pass
             # Re-run agent setup. On crash, drop the agent from pending so
             # the phase can proceed with whoever else is still healthy.
             try:
                 restart = await _restart_phase2_agent(
                     _agent_name, browser, cua_client,
-                    _brief_text_hr, _brief_path_hr, verbose)
+                    _brief_text_hr, _brief_path_hr, verbose,
+                    reuse_page=_reuse_page)
             except Exception as _e:
                 log(f"[{_agent_name}] Hard retry setup crashed: {_e}", "ERROR")
                 fail_agent(_agent_key, f"{_agent_name} couldn't restart", f"{_agent_name} hit an error while restarting. Retry to try again, or Skip it.")
@@ -25192,6 +25216,28 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                          "url": "", "page": None, "elapsed_sec": 0}
                 continue
             new_page, verified_h = restart
+            # Gap #3 leak-guard: if the in-helper reuse threw AFTER the
+            # is_closed() check (e.g. a slow same-tab goto timed out), it fell
+            # back to a fresh tab, leaving the warm tab we handed in orphaned —
+            # two authenticated surfaces persisting until browser close. Close
+            # the orphan here, honoring the same main/last-tab guard. No-op on
+            # the happy path (new_page IS _reuse_page) and on the fresh-tab
+            # branch (_reuse_page is None).
+            if (_reuse_page is not None and new_page is not None
+                    and new_page is not _reuse_page):
+                try:
+                    _keep_open = _reuse_page is getattr(browser, "page", None)
+                    if not _keep_open:
+                        try:
+                            _keep_open = len(_reuse_page.context.pages) <= 1
+                        except Exception:
+                            _keep_open = False
+                    if not _keep_open and not _reuse_page.is_closed():
+                        log(f"[{_agent_name}] Hard retry: reuse fell back to a fresh "
+                            "tab — closing the orphaned warm tab", "INFO")
+                        await _reuse_page.close()
+                except Exception:
+                    pass
             # If the restart's setup/paste failed (verified_h False AND we
             # got a non-verified page back from start_agent_no_gemini_wait
             # ok=False), the helper already emitted pipeline_error with
@@ -34023,36 +34069,56 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     if reuse_page is not None:
         try:
             if not reuse_page.is_closed():
+                # Gap #3 (2026-07-15): the reuse path is now platform-aware.
+                # Originally ChatGPT/2A-only; the hard-retry restart now threads
+                # each agent's own warm tab here so retries reuse the same,
+                # challenge-passed tab (a client-side New chat) instead of a cold
+                # top-level load (a Cloudflare bot-score event).
+                _pl = platform.lower()
                 log(f"[{label}] Reusing the warm {platform} tab (client-side New chat — no cold navigation)")
                 page = reuse_page
                 # Review 2026-07-06: _agent_streams is keyed by id(page) and
                 # inject_agent_observer only setdefault-inits it — a reused
-                # page would keep P1's final text length as P2's starting
-                # observer state (wrong partialTextLen from tick 1, poisoned
-                # text-growth stall baseline). Hard-reset the entry; the P2
-                # observer injection re-creates it from zero.
+                # page would keep the prior run's final text length as this
+                # run's starting observer state (wrong partialTextLen from tick
+                # 1, poisoned text-growth stall baseline). Hard-reset the entry
+                # for EVERY reused platform; the observer injection re-creates
+                # it from zero.
                 _agent_streams.pop(id(page), None)
                 await browser.switch_to_page(page)
-                if await _chatgpt_force_new_chat(page, label):
-                    await asyncio.sleep(2)
-                    # #913: warm-tab hygiene — P1 and P2 share this tab. If
-                    # P1's "Activity" panel survived the SPA New chat, P2's
-                    # cycle-1 anti-toggle pre-check would flag the panel
-                    # open without ever clicking the DR strip and scrape
-                    # stale P1 data all phase. Detect + close + log.
-                    try:
-                        _st_warm = await _chatgpt_activity_state(page)
-                        if _st_warm.get("side_panel"):
-                            _closed = await _close_chatgpt_side_panel(page)
-                            log(f"[{label}] stale P1 activity panel on the reused "
-                                f"tab — close dispatched={_closed} (warm-tab hygiene)")
-                            await asyncio.sleep(1)
-                    except Exception as _wh_err:
-                        log(f"[{label}] warm-tab panel hygiene check failed: {_wh_err}", "DEBUG")
+                if _pl == "chatgpt":
+                    if await _chatgpt_force_new_chat(page, label):
+                        await asyncio.sleep(2)
+                        # #913: warm-tab hygiene — P1 and P2 share this tab. If
+                        # P1's "Activity" panel survived the SPA New chat, P2's
+                        # cycle-1 anti-toggle pre-check would flag the panel
+                        # open without ever clicking the DR strip and scrape
+                        # stale P1 data all phase. Detect + close + log.
+                        try:
+                            _st_warm = await _chatgpt_activity_state(page)
+                            if _st_warm.get("side_panel"):
+                                _closed = await _close_chatgpt_side_panel(page)
+                                log(f"[{label}] stale P1 activity panel on the reused "
+                                    f"tab — close dispatched={_closed} (warm-tab hygiene)")
+                                await asyncio.sleep(1)
+                        except Exception as _wh_err:
+                            log(f"[{label}] warm-tab panel hygiene check failed: {_wh_err}", "DEBUG")
+                    else:
+                        # SPA New-chat didn't land — same-tab navigation fallback
+                        # (one nav; still no second ChatGPT surface).
+                        log(f"[{label}] New-chat click didn't land — same-tab nav to {url}", "WARN")
+                        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                        await asyncio.sleep(4)
                 else:
-                    # SPA New-chat didn't land — same-tab navigation fallback
-                    # (one nav; still no second ChatGPT surface).
-                    log(f"[{label}] New-chat click didn't land — same-tab nav to {url}", "WARN")
+                    # Claude: url == https://claude.ai/new — a same-tab nav to
+                    #   /new IS Claude's canonical fresh composer (cheaper than a
+                    #   fresh tab + a second authenticated surface).
+                    # Gemini: url == https://gemini.google.com — a bare /app load
+                    #   re-triggers Layer 0.6 below (@~34135), which force-New-
+                    #   chats any /app/<id> so we always land on a clean composer.
+                    # Both: a same-tab nav on the warm, challenge-passed tab
+                    #   AVOIDS a scored cold top-level navigation.
+                    log(f"[{label}] Warm-tab reuse ({_pl}) — same-tab nav to {url}")
                     await page.goto(url, wait_until="domcontentloaded", timeout=30000)
                     await asyncio.sleep(4)
         except Exception as _ru_err:
