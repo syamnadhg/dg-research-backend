@@ -133,18 +133,50 @@ def test_unwired_tokens_raise_until_their_phase():
 
 # ── #955 Phase 4 — pro_required + chat_mode token expansion (byte-parity) ─────
 
-def test_pro_required_actions_phase_aware_skip():
-    # phase >= 1 → skip_agent for this platform; the copy/order matches the old
-    # inline dicts exactly.
+def test_pro_required_actions_phase2_non_blocking():
+    # Gap #1: at phase 2 the pro card is NON-BLOCKING. Two changes vs the old
+    # inline dicts: (Finding 1) NO retry_phase action — a retry_phase(2) has no
+    # round-robin consumer and the 120-min supervisor would restart the phase;
+    # (Finding 2) "Continue with Free" is AGENT-SCOPED (continue_free{agent}),
+    # not the global continue_anyway a sibling await_agent_decision would steal.
     acts = research._alert_actions_for("pro_required", 2, "gemini")
+    assert acts == [
+        {"id": "continue_with_free", "label": "Continue with Free", "style": "default",
+         "command": {"action": "continue_free", "agent": "gemini"}},
+        {"id": "skip", "label": "Skip", "style": "default",
+         "command": {"action": "skip_agent", "agent": "gemini"}},
+    ]
+
+
+def test_pro_required_phase1_keeps_blocking_shape():
+    # B1 guard: the P1 brief-gen pro gate is STILL BLOCKING and polls
+    # consume_retry_phase(1) + consume_continue_anyway(). Its card must keep the
+    # global continue_anyway command AND the Retry action — the non-blocking
+    # rework is scoped to phase 2 only. (P0 is identical modulo skip target.)
+    acts = research._alert_actions_for("pro_required", 1, "gemini")
     assert acts == [
         {"id": "continue_with_free", "label": "Continue with Free", "style": "default",
          "command": {"action": "continue_anyway"}},
         {"id": "retry", "label": "Retry", "style": "primary",
-         "command": {"action": "retry_phase", "phase": 2}},
+         "command": {"action": "retry_phase", "phase": 1}},
         {"id": "skip", "label": "Skip", "style": "default",
          "command": {"action": "skip_agent", "agent": "gemini"}},
     ]
+
+
+def test_pro_ack_agents_is_agent_scoped_and_one_shot():
+    # Gap #1 Finding 2: the non-blocking pro ack is a per-agent set, NOT the
+    # global one-shot continue_anyway. Acking one agent must not consume
+    # another's, and each ack is one-shot.
+    c = research.PipelineControls()
+    c.request_pro_continue_free("gemini")
+    # sibling unaffected
+    assert c.consume_pro_continue_free("chatgpt") is False
+    # first consume True, second False (one-shot)
+    assert c.consume_pro_continue_free("gemini") is True
+    assert c.consume_pro_continue_free("gemini") is False
+    # the global continue_anyway is untouched by the agent-scoped ack
+    assert c.consume_continue_anyway() is False
 
 
 def test_pro_required_skip_is_skip_init_verify_at_p0():

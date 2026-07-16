@@ -232,46 +232,46 @@ def test_chatgpt_gets_a_zero_navigation_tier_backstop():
     src = inspect.getsource(research.run_phase2)
     assert "_chatgpt_dom_tier(chatgpt_page)" in src
     assert '_emit_pro_required_alert(phase=2, agent="chatgpt", source="phase2/setup_pro_backstop")' in src
-    # POSITION is load-bearing (review MAJOR): the read must sit AFTER 2C so
-    # its pro_required pause can only delay round-robin polling — a pause
-    # inside 2A would freeze Claude + Gemini startup behind a fail-open DOM
-    # heuristic (2/3 of the phase never launching on an unattended run).
+    # POSITION is load-bearing: the ChatGPT read must sit AFTER 2C's Gemini read.
     assert src.index("_chatgpt_dom_tier(chatgpt_page)") > src.index("_gemini_dom_tier(gemini_page)")
     _idx = src.index("_chatgpt_dom_tier(chatgpt_page)")
-    _blk = src[_idx - 900:_idx + 3400]
-    # all three guards (consent ×2 + liveness), the pause machinery, and a
-    # resolution for EVERY path — Skip must close the paused/resumed pair
-    # (mutation-verified gaps in review: each of these was droppable green).
+    _blk = src[_idx - 900:_idx + 900]
+    # The three guards (consent ×2 + liveness) still gate the emit.
     assert "pro_warning_acknowledged" in _blk
     assert 'free_tier_consent.get("chatgpt"' in _blk
     assert '"chatgpt" not in _controls.skipped_agents' in _blk
-    assert '_controls.request_pause("pro_required")' in _blk
-    assert "wait_if_paused" in _blk
-    assert 'reason="agent_skipped"' in _blk
+    # Gap #1: NON-BLOCKING — the pause machinery is GONE. A pro_required pause
+    # here would freeze the whole sequential setup coroutine and starve the
+    # other agents; the card is now resolved by the round-robin's agent-scoped
+    # pro-ack consumer (or the existing skip path), not a wait_if_paused.
+    assert '_controls.request_pause("pro_required")' not in src
 
 
-def test_p2_tier_backstop_skip_closes_pause_pair():
-    # BOTH tier backstops (2C Gemini + post-2C ChatGPT) must emit
-    # pipeline_resumed on the Skip path. Every other pro_required wait site
-    # closes the paused/resumed pair; an unclosed pipeline_paused leaves the
-    # FE pause chrome stale (the F3/DGOPS-7449 stale-alert class).
+def test_p2_tier_backstop_is_non_blocking():
+    # Gap #1: BOTH P2 tier backstops (2C Gemini + post-2C ChatGPT) are now
+    # NON-BLOCKING. A pro_required pause froze the sequential setup coroutine
+    # and starved the other agents; neither gate may request_pause / emit a
+    # pipeline_paused(reason="pro_required") anymore. The card is resolved by
+    # the round-robin pro-ack consumer (Continue with Free) or the skip path.
     src = inspect.getsource(research.run_phase2)
-    assert src.count('emit_event("pipeline_resumed", phase=2, reason="agent_skipped")') >= 2
+    assert 'request_pause("pro_required")' not in src
+    assert 'reason="pro_required"' not in src
+    # both emits survive (the informational card is still raised).
+    assert src.count('_emit_pro_required_alert(phase=2, agent=') == 2
 
 
-def test_chatgpt_tier_retry_actually_re_verifies():
-    # The pro_required card promises 'sign in with Pro, then Retry' — Retry
-    # must RE-READ the tier (review MAJOR: it was a silent no-op that left
-    # the card unresolved). A still-free re-read resolves to
-    # Free-acknowledged + alert clear, never an unbounded re-card loop.
+def test_p2_pro_card_has_no_retry_and_no_re_read():
+    # Gap #1 Finding 1: the P2 pro_required card must NOT carry a retry_phase(2)
+    # action — it has no round-robin consumer and the 120-min soft-warn
+    # supervisor would consume the latent flag, cancel run_phase2, and restart
+    # the whole phase (nuking in-flight DRs). The old Retry-path tier re-read is
+    # gone too, so exactly ONE ChatGPT tier read remains (the backstop read).
     src = inspect.getsource(research.run_phase2)
-    assert src.count("_chatgpt_dom_tier(chatgpt_page)") >= 2
-    # the first pro_retry AFTER the ChatGPT tier read (the 2C Gemini block
-    # has its own, earlier pro_retry — don't pin that one)
-    _retry_at = src.index('reason="pro_retry"', src.index("_chatgpt_dom_tier(chatgpt_page)"))
-    _retry_blk = src[_retry_at:_retry_at + 1200]
-    assert "_chatgpt_dom_tier(chatgpt_page)" in _retry_blk
-    assert "_clear_pro_required_alerts(triggered_at_phase=2)" in _retry_blk
+    assert src.count("_chatgpt_dom_tier(chatgpt_page)") == 1
+    for _ag in ("chatgpt", "gemini"):
+        acts = research._alert_actions_for("pro_required", 2, _ag)
+        assert not any(a.get("command", {}).get("action") == "retry_phase" for a in acts)
+        assert not any(a.get("id") == "retry" for a in acts)
 
 
 # ── phase C: P1 + P3 wiring ───────────────────────────────────────────────────

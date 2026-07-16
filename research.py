@@ -8680,6 +8680,17 @@ def _start_command_listener(uid, research_id, loop):
                 loop.call_soon_threadsafe(_controls.set_continue_anyway)
                 loop.call_soon_threadsafe(_controls.request_resume)
                 log("Command received: CONTINUE_ANYWAY — resuming past warning")
+            elif action == "continue_free":
+                # Gap #1: agent-scoped "Continue with Free" ack for a NON-BLOCKING
+                # P2 pro_required card. NOT the global continue_anyway (Finding 2:
+                # a sibling await_agent_decision / a second live pro card would
+                # steal it). No request_resume — nothing is paused in the
+                # non-blocking model; the round-robin loop-top consumer clears the
+                # card + records free_tier_consent for this agent.
+                _ag = (data.get("agent") or "").strip()
+                loop.call_soon_threadsafe(_controls.request_pro_continue_free, _ag)
+                log(f"Command received: CONTINUE_FREE agent={_ag or '?'} "
+                    "(agent-scoped pro ack, no pause)")
             elif action == "retry_phase":
                 # User clicked "Retry Phase N" on a pipeline_warning. The
                 # phase coroutine that emitted the warning is polling
@@ -9006,8 +9017,15 @@ def _start_cli_command_reader(loop):
                 if pr == "pro_required":
                     log("[CMD] continue with Free")
                     loop.call_soon_threadsafe(_controls.set_continue_anyway)
+                elif _controls.pro_alert_emitted and _controls.last_pro_agent:
+                    # Gap #1: the P2 pro_required card is NON-BLOCKING (no
+                    # pause_reason), so route `c` to the agent-scoped ack for the
+                    # most-recent pro card; the round-robin consumer clears it.
+                    _tgt = _controls.last_pro_agent
+                    log(f"[CMD] continue with Free (non-blocking pro card, agent={_tgt})")
+                    loop.call_soon_threadsafe(_controls.request_pro_continue_free, _tgt)
                 else:
-                    log(f"[CMD] 'c' only valid at pro_required pause (current: '{pr or 'none'}')")
+                    log(f"[CMD] 'c' only valid at a pro_required card (current pause: '{pr or 'none'}', no live pro card)")
             else:
                 log("[CMD] unknown — type r/s (resume/skip); c at pro_required pauses; Ctrl+C to stop")
     _threading.Thread(target=_reader, daemon=True, name="cli-cmd-reader").start()
@@ -9165,6 +9183,16 @@ class PipelineControls:
         # Retry path; the 2C Gemini backstop consents via the GLOBAL flag
         # (its guard checks both, so behavior is unchanged).
         self.free_tier_consent: dict[str, bool] = {}
+        # Gap #1 (non-blocking pro_required): per-agent "Continue with Free"
+        # acks. The P2 pro card is now non-blocking (no request_pause) — its
+        # ack must NOT ride the GLOBAL one-shot continue_anyway (a sibling
+        # await_agent_decision / a second live pro card would steal it —
+        # Finding 2). Agent-scoped, consumed by the round-robin loop-top.
+        self.pro_ack_agents: set[str] = set()
+        # Gap #1: the agent of the most-recently-emitted pro_required card, so
+        # a CLI 'c'/'s' (which has no pause_reason to key on once the gate is
+        # non-blocking) can target the right agent.
+        self.last_pro_agent: str = ""
 
     def request_stop(self):
         self.stop_event.set()
@@ -9337,6 +9365,8 @@ class PipelineControls:
         self.pro_warning_acknowledged = False
         self.pro_alert_emitted.clear()
         self.free_tier_consent.clear()
+        self.pro_ack_agents.clear()
+        self.last_pro_agent = ""
         self.retry_phase_requested.clear()
         self.retry_agents.clear()
         self.retry_agents_hard.clear()
@@ -9419,6 +9449,23 @@ class PipelineControls:
         v = self.continue_anyway
         self.continue_anyway = False
         return v
+
+    def request_pro_continue_free(self, agent: str = ""):
+        """Gap #1: non-blocking pro_required "Continue with Free" ack, AGENT-
+        SCOPED — NOT the global one-shot continue_anyway, which a sibling
+        await_agent_decision or a second live pro card would steal (Finding 2).
+        Nothing is paused in the non-blocking model, so no pause_event poke."""
+        k = (agent or "").strip().lower()
+        if k:
+            self.pro_ack_agents.add(k)
+
+    def consume_pro_continue_free(self, agent: str) -> bool:
+        """Check + clear the per-agent pro Free-tier ack."""
+        k = (agent or "").strip().lower()
+        if k in self.pro_ack_agents:
+            self.pro_ack_agents.discard(k)
+            return True
+        return False
 
 
     def request_retry_phase(self, phase: int):
@@ -14082,6 +14129,17 @@ def _alert_actions_for(intent: str, phase, agent=None):
     out = []
     for token in spec["actions"]:
         if token == "retry_phase":
+            # Gap #1 Finding 1: the P2 pro_required card must NOT carry a
+            # retry_phase(2) action — it has no round-robin consumer, and the
+            # 120-min soft-warn supervisor would consume the latent flag, cancel
+            # run_phase2, and restart the whole phase (nuking every in-flight
+            # DR). Retry is meaningless once the DR is already generating. ONLY
+            # phase-2 pro_required is affected; P0/P1 pro cards (live
+            # consume_retry_phase(0|1) consumers) keep their Retry.
+            if phase == 2 and intent == "pro_required":
+                log("[pro_required] retry_phase token suppressed at phase=2 "
+                    "(Finding 1: no phase-restart on an already-generating DR)", "DEBUG")
+                continue
             out.append({"id": "retry", "label": "Retry", "style": "primary",
                         "command": {"action": "retry_phase", "phase": phase}})
         elif token == "skip_phase":
@@ -14100,9 +14158,20 @@ def _alert_actions_for(intent: str, phase, agent=None):
                         "style": "primary" if klass == "hands_off" else "default",
                         "command": {"action": "skip_agent", "agent": agent}})
         elif token == "continue_free":
-            # #955 Phase 4: pro_required "Continue with Free" → continue_anyway.
-            out.append({"id": "continue_with_free", "label": "Continue with Free",
-                        "style": "default", "command": {"action": "continue_anyway"}})
+            # #955 Phase 4: pro_required "Continue with Free".
+            # Gap #1 Finding 2: at phase 2 the card is NON-BLOCKING, so its ack
+            # must be AGENT-SCOPED (continue_free{agent}) — the global one-shot
+            # continue_anyway would be stolen by a sibling await_agent_decision
+            # or a second live pro card (ChatGPT + Gemini both Free). P0/P1 pro
+            # gates stay BLOCKING and still poll consume_continue_anyway(), so
+            # they keep the global command.
+            if phase == 2:
+                out.append({"id": "continue_with_free", "label": "Continue with Free",
+                            "style": "default",
+                            "command": {"action": "continue_free", "agent": (agent or "").lower()}})
+            else:
+                out.append({"id": "continue_with_free", "label": "Continue with Free",
+                            "style": "default", "command": {"action": "continue_anyway"}})
         elif token == "skip_pro":
             # #955 Phase 4: pro_required Skip is destination-aware — at P0 it
             # bypasses init verification (skip_init_verify; the work-tab
@@ -14691,6 +14760,9 @@ def _emit_pro_required_alert(phase: int, agent: str, source: str = ""):
     # Free. Tuple key matches the alert_id shape so multi-agent runs
     # (chatgpt + claude + gemini all Free) all get cleared at once.
     _controls.pro_alert_emitted.add((phase, agent.lower()))
+    # Gap #1: remember the agent so a CLI 'c'/'s' can target it (a non-blocking
+    # pro card sets no pause_reason for the CLI reader to key on).
+    _controls.last_pro_agent = agent.lower()
     title, details = _PRO_TIER_DETAILS_BY_KEY.get(
         agent.lower(),
         (f"{agent.title()} isn't on a Pro account",
@@ -14728,7 +14800,7 @@ def _emit_pro_required_alert(phase: int, agent: str, source: str = ""):
     )
 
 
-def _clear_pro_required_alerts(triggered_at_phase: int) -> None:
+def _clear_pro_required_alerts(triggered_at_phase: int, agent: str = None) -> None:
     """F3 (DGOPS-7449): clear stale pro_required alert documents from the
     FE store the moment the user acknowledges Free. Without this, the
     actionable alert lingers in the phase-alert slot — when the pipeline
@@ -14755,8 +14827,17 @@ def _clear_pro_required_alerts(triggered_at_phase: int) -> None:
     re-pair the run anyway."""
     if not _controls.pro_alert_emitted:
         return
+    # Gap #1 Finding 1: agent-scoped clear. Under the non-blocking model,
+    # ChatGPT + Gemini can BOTH have a live pro card at once; a Continue-with-
+    # Free tap on ONE must clear only THAT card — the old all-agents sweep would
+    # silently dismiss the sibling's card + implicitly Free-consent it. When
+    # `agent` is given, clear only its (phase, agent) tuple; None = legacy
+    # all-clear (P0/P1 blocking gates, where at most one card is live).
+    _agent_l = (agent or "").strip().lower()
+    _targets = ([t for t in _controls.pro_alert_emitted if t[1] == _agent_l]
+                if _agent_l else list(_controls.pro_alert_emitted))
     cleared: list[tuple[int, str]] = []
-    for (alert_phase, agent) in list(_controls.pro_alert_emitted):
+    for (alert_phase, agent) in _targets:
         try:
             emit_event(
                 "pipeline_warning",
@@ -14774,9 +14855,16 @@ def _clear_pro_required_alerts(triggered_at_phase: int) -> None:
         except Exception as e:
             log(f"_clear_pro_required_alerts: failed to clear phase={alert_phase} agent={agent}: {e}", "WARN")
     if cleared:
-        log(f"Pro-tier alerts cleared (triggered_at_phase={triggered_at_phase}): "
+        log(f"Pro-tier alerts cleared (triggered_at_phase={triggered_at_phase}"
+            f"{', agent=' + _agent_l if _agent_l else ''}): "
             f"{', '.join(f'phase{p}/{a}' for (p, a) in cleared)}", "INFO")
-    _controls.pro_alert_emitted.clear()
+    if _agent_l:
+        # Agent-scoped: drop only the cleared tuples, leaving a sibling's live
+        # pro card recorded so ITS ack still finds + clears it.
+        for t in cleared:
+            _controls.pro_alert_emitted.discard(t)
+    else:
+        _controls.pro_alert_emitted.clear()
 
 
 _PLATFORM_LABEL_BY_KEY = {
@@ -25298,6 +25386,29 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             else:
                 log(f"[{_agent_name}] Hard retry tab opened but not verified yet — polling will re-check", "WARN")
 
+        # ── pro_required ack consumer (Gap #1) ──────────────────────────────
+        # The P2 pro_required card is now NON-BLOCKING (no setup-context pause),
+        # so "Continue with Free" is resolved HERE, once per tick, before the
+        # per-agent leg. Agent-scoped (pro_ack_agents / free_tier_consent /
+        # per-agent alert clear) so two simultaneous pro cards (ChatGPT + Gemini
+        # both Free) resolve INDEPENDENTLY — a Free-accept on one never dismisses
+        # or Free-consents the other (Finding 1). Skip needs no consumer here:
+        # skip_pro → skip_agent → the existing skip path greys + closes the tab.
+        for _pn in list(pending.keys()):
+            _pk = normalize_agent_key(_pn)
+            if _controls.consume_pro_continue_free(_pk):
+                _controls.free_tier_consent[_pk] = True
+                # Agent-scoped clear (NOT the global pro_warning_acknowledged,
+                # which would suppress + sweep the sibling's still-live card).
+                _clear_pro_required_alerts(triggered_at_phase=2, agent=_pk)
+                # pipeline_resumed triggers the FE auto-clear sweep of the
+                # transient _clear_pro_required_alerts just emitted (nothing is
+                # BE-paused in the non-blocking model — this is FE housekeeping).
+                emit_event("pipeline_resumed", phase=2, agent=_pk,
+                           reason="continue_with_free")
+                log(f"[round-robin] pro_required ack consumed for {_pk} — Free "
+                    "accepted, agent stays live, card cleared", "INFO")
+
         # Rotate iteration order so no agent is always "first". With 3
         # agents, the order cycles A→B→C, B→C→A, C→A→B, A→B→C, ensuring
         # that over 3 ticks every agent has been processed first.
@@ -35498,27 +35609,20 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 except Exception:
                     _gm_tier = "unsure"
                 if _gm_tier == "free":
-                    log("[2C] Gemini DOM tier reads FREE — surfacing pro_required (verification is off by default)", "WARN")
+                    # Gap #1: NON-BLOCKING pro_required. The old request_pause +
+                    # wait_if_paused froze the single sequential setup coroutine,
+                    # starving Claude + the [2D] plan wait. The Free-tier DR is
+                    # already generating server-side, so the card is
+                    # informational: its taps are consumed by the always-on
+                    # round-robin (Continue-with-Free via the agent-scoped
+                    # pro-ack, Skip via skip_agent), NOT a pipeline pause. Gemini
+                    # is registered in agents[] after [2D], so it lands in
+                    # `pending` and the loop-top ack consumer sees it.
+                    log("[2C] Gemini DOM tier reads FREE — non-blocking pro_required "
+                        "emitted; agent stays live in the round-robin (no pipeline pause)", "WARN")
                     _emit_pro_required_alert(phase=2, agent="gemini", source="phase2/setup_pro_backstop")
-                    _controls.request_pause("pro_required")
-                    emit_event("pipeline_paused", phase=2, reason="pro_required")
-                    await _controls.wait_if_paused()
-                    if not _controls.is_stop():
-                        if _controls.consume_retry_phase(2):
-                            emit_event("pipeline_resumed", phase=2, reason="pro_retry")
-                        elif "gemini" not in _controls.skipped_agents:
-                            _controls.consume_continue_anyway()
-                            _controls.pro_warning_acknowledged = True
-                            log("[2C] user opted into Free-tier Gemini — continuing", "INFO")
-                            _clear_pro_required_alerts(triggered_at_phase=2)
-                            emit_event("pipeline_resumed", phase=2, reason="continue_with_free")
-                        else:
-                            # Skip → the dispatcher already put gemini in
-                            # skipped_agents; close the paused/resumed pair
-                            # (#899 review — every other pro_required site
-                            # does; an unclosed pipeline_paused leaves the
-                            # FE pause chrome stale).
-                            emit_event("pipeline_resumed", phase=2, reason="agent_skipped")
+                    log("[2C] pro_required is non-blocking — flowing to round-robin without "
+                        "wait_if_paused (ack via continue_free agent-scoped; Skip via skip_agent)", "INFO")
         elif "gemini" in _controls.skipped_agents:
             # #906: the user already skipped Gemini (e.g. during the HV wait
             # — the tier-5 loop keeps the marker for this check). The skip
@@ -35596,41 +35700,20 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         except Exception:
             _cg_tier = "unsure"
         if _cg_tier == "free":
-            log("[2A] ChatGPT DOM tier reads FREE — surfacing pro_required (verification is off by default)", "WARN")
+            # Gap #1: NON-BLOCKING pro_required (see the 2C Gemini twin). No
+            # request_pause — the ChatGPT DR is already generating server-side,
+            # so [2D] (Gemini Start-research) and the round-robin no longer wait
+            # behind this decision. The card's taps are consumed by the always-on
+            # round-robin (Continue-with-Free via the agent-scoped pro-ack, Skip
+            # via skip_agent). The old Retry-path tier re-read is intentionally
+            # gone — Finding 1 removed Retry from the P2 pro card (a
+            # retry_phase(2) has no round-robin consumer and the 120-min
+            # supervisor would restart the whole phase, nuking in-flight DRs).
+            log("[2A] ChatGPT DOM tier reads FREE — non-blocking pro_required emitted; "
+                "the card lives into the round-robin (no pause, [2D] proceeds)", "WARN")
             _emit_pro_required_alert(phase=2, agent="chatgpt", source="phase2/setup_pro_backstop")
-            _controls.request_pause("pro_required")
-            emit_event("pipeline_paused", phase=2, reason="pro_required")
-            await _controls.wait_if_paused()
-            if not _controls.is_stop():
-                if _controls.consume_retry_phase(2):
-                    # Honest Retry: the card promises a re-verify, so re-read
-                    # the tier. The DR already submitted on this session — a
-                    # still-free re-read resolves to Free-acknowledged (with
-                    # the alert cleared) rather than re-carding a decision
-                    # that can't change the already-running research.
-                    emit_event("pipeline_resumed", phase=2, reason="pro_retry")
-                    try:
-                        _cg_tier2 = await _chatgpt_dom_tier(chatgpt_page)
-                    except Exception:
-                        _cg_tier2 = "unsure"
-                    if _cg_tier2 == "free":
-                        _controls.free_tier_consent["chatgpt"] = True
-                        _controls.pro_warning_acknowledged = True
-                        log("[2A] ChatGPT still reads Free after Retry — continuing with the already-running DR (Free-acknowledged)", "WARN")
-                    else:
-                        log("[2A] ChatGPT tier re-read after Retry: not Free ✓", "INFO")
-                    _clear_pro_required_alerts(triggered_at_phase=2)
-                elif "chatgpt" not in _controls.skipped_agents:
-                    _controls.consume_continue_anyway()
-                    _controls.pro_warning_acknowledged = True
-                    log("[2A] user opted into Free-tier ChatGPT — continuing", "INFO")
-                    _clear_pro_required_alerts(triggered_at_phase=2)
-                    emit_event("pipeline_resumed", phase=2, reason="continue_with_free")
-                else:
-                    # Skip → the dispatcher already put chatgpt in
-                    # skipped_agents; close the paused/resumed pair (gate
-                    # parity — the FE pause chrome keys on it).
-                    emit_event("pipeline_resumed", phase=2, reason="agent_skipped")
+            log("[2A] pro_required non-blocking — Gemini Start-research (2D) no longer "
+                "waits behind the ChatGPT decision", "INFO")
 
     # ── First wave: 60s sequential per agent (2026-04 overhaul) ──
     # Instead of one instant snapshot, dwell on each agent's tab for 60s and
