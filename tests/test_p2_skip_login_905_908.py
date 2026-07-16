@@ -101,9 +101,13 @@ def test_hv_fail_copy_cloudflare_never_mentions_retry():
     assert "login command" not in details.lower()
 
 
-def test_hv_setup_fail_card_wires_skip_only_for_cloudflare():
+def test_hv_setup_fail_card_is_skip_only_for_all_walls():
+    # Gap #1 + HV never-solve (2026-07-15): unified hands-off — the HV card is
+    # Skip-only for EVERY wall (not just Cloudflare). A Retry re-navigates the
+    # walled tab and raises the bot score for reCAPTCHA/hCaptcha/Claude-HV too.
     src = inspect.getsource(research._hv_setup_fail_card)
-    assert "skip_only=" in src and "cloudflare" in src
+    assert "skip_only=True" in src
+    assert 'skip_only="cloudflare"' not in src
 
 
 # ── #906: _close_skipped_agent_tab guards ────────────────────────────────────
@@ -164,12 +168,21 @@ def test_tier5_skip_branch_keeps_marker_and_closes_tab():
     assert "_close_skipped_agent_tab" in src
 
 
-def test_hv_callers_suppress_fail_card_on_user_skip():
+def test_hv_callers_hand_off_non_blocking_no_duplicate_card():
+    # Gap #1 + HV never-solve (2026-07-15): P2's HV handling is now non-blocking
+    # hands-off — there is no tier-5 wait, so the old "user skipped DURING the
+    # wait → suppress the duplicate fail card" branch is gone. Both HV probes
+    # (Layer-0 + mid-setup) hand off to _hv_setup_fail_card, and
+    # _hv_auto_skip_finalize's hv_auto_skipped guard makes a second handoff a
+    # no-op — so no duplicate card can fire.
     src = inspect.getsource(research.start_agent_no_gemini_wait)
-    assert src.count("in _controls.skipped_agents") >= 2, (
-        "both HV-clearance callers (Layer-0 + mid-setup) must check skip "
-        "membership before emitting the fail card")
-    assert "no failure card" in src
+    assert src.count("await _hv_setup_fail_card(browser, page, platform, label)") >= 2, (
+        "both HV probes (Layer-0 + mid-setup) must hand off to _hv_setup_fail_card")
+    assert "wait_for_verification_clearance(" not in src, (
+        "P2 must not call the blocking clearance cascade (never-solve, non-blocking)")
+    fin = inspect.getsource(research._hv_auto_skip_finalize)
+    assert "if agent_key in _controls.hv_auto_skipped:" in fin, (
+        "the finalize guard is what makes the double handoff idempotent")
 
 
 def test_skip_consumer_hands_off_walled_tabs_and_closes():

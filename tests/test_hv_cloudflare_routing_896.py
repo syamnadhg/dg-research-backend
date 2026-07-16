@@ -59,10 +59,17 @@ def test_cloudflare_copy_is_short_hands_off_and_login_free():
     assert len(details) < 200, "keep it to the point"
 
 
-def test_non_cloudflare_copy_stays_solvable_in_place():
+def test_non_cloudflare_copy_is_hands_off_no_retry():
+    # Gap #1 + HV never-solve (user directive 2026-07-15): HV == Cloudflare ==
+    # the same — non-Cloudflare walls (reCAPTCHA/hCaptcha/Claude-HV) are now
+    # ALSO hands-off / Skip-only. A Retry would re-navigate the walled tab and
+    # raise the bot score, so the copy no longer tells the user to "Retry"
+    # (adversarial finding #6, 2026-07-15). The user can still solve it by hand
+    # and re-run.
     title, details = research._hv_fail_copy("chatgpt", "reCAPTCHA")
     assert "reCAPTCHA" in details
-    assert "open browser" in details, "non-attestation checks ARE solvable in place"
+    assert "Retry" not in details, "unified hands-off: no in-place Retry on any wall"
+    assert "re-run" in details
 
 
 def test_copy_uses_proper_platform_display_names():
@@ -171,9 +178,12 @@ def test_settled_clear_never_trusts_a_dead_page():
 
 
 def test_callers_seed_their_confirmed_reason():
-    # Layer-0, post-setup-fail, and check_hv_gate all probe right before the
-    # cascade — their confirmed reason seeds it.
-    assert MODSRC.count("initial_reason=") >= 3
+    # check_hv_gate (P1/P3) probes right before the shared cascade and seeds its
+    # confirmed reason. Gap #1 (2026-07-15): the two P2 callers no longer route
+    # through the blocking cascade (hands-off + non-blocking via
+    # _hv_setup_fail_card), so they no longer pass initial_reason — only the P1/P3
+    # gate does now.
+    assert MODSRC.count("initial_reason=") >= 1
 
 
 def test_hv_card_preserves_893_cookie_trust_bookkeeping():

@@ -24316,6 +24316,17 @@ async def _resolve_parked_agent_decision(kind, action, p, name, key, elapsed,
     the caller. Returns 'break' (unused today) or 'continue'; the caller
     always `continue`s the round-robin afterwards, so every path here just
     mutates `p` / finalizes into `results` and returns 'continue'."""
+    # Gap #1 belt-and-braces (HV never-touch): several resolver branches
+    # interact with the tab (session_expiry reload @~24336, switch_to_page in
+    # the extract branches) and are NOT individually hv_blocked-guarded. A
+    # verification-walled agent must never reach them — today that state is
+    # unreachable (an agent is non-hv_blocked when it parks, and hv_blocked is
+    # never set from inside the round-robin), but this guard removes the reliance
+    # on that invariant so a future edit can't route a walled tab into a reload.
+    if key in _controls.hv_blocked:
+        log(f"[{name}] parked-decision resolver: {key} is verification-walled "
+            "(hv_blocked) — hands-off no-op, never touching the wall", "WARN")
+        return "continue"
     _retry = (action == "retry")
 
     # ── Session expiry: retry = reload the tab so the re-auth cookie lands ──
@@ -25458,6 +25469,33 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 continue  # dropped by a signal handled mid-tick
             p = pending[name]
             elapsed = time.time() - p["start_time"]
+
+            # ── Gap #1 defense-in-depth (HV never-touch) ──────────────────────
+            # A verification-walled agent must NEVER reach the poll body's page
+            # interactions (switch_to_page, spotlight/scrape evaluate, CUA
+            # vision) — each re-issues the challenge and RAISES the bot score.
+            # The setup path hands walls off before they enter pending, but a
+            # hard-retry that HITS a wall can re-seed a walled page here (with
+            # auto-skip off it isn't in skipped_agents, so the loop-top consumer
+            # doesn't catch it). hv_blocked is cleared on any clean nav, so a
+            # still-set verdict means genuinely walled. Bail BEFORE any touch:
+            # finalize (grey + close) when auto-skip is on, else just idle the
+            # leg (card stays up for a manual Skip). Either way, zero wall touch.
+            _leg_hv_key = normalize_agent_key(name)
+            if _leg_hv_key in _controls.hv_blocked and not p.get("awaiting_decision"):
+                if _runtime.auto_skip_stuck:
+                    log(f"[{name}] walled tab (hv_blocked) reached the poll leg — "
+                        "hands-off skip (grey + close), never touching the wall", "WARN")
+                    await _hv_auto_skip_finalize(browser, p.get("page"), _leg_hv_key, name, phase=2)
+                    results[name] = {"status": "skipped_auto_hv", "text": "",
+                                     "url": p.get("url", ""), "page": None,
+                                     "elapsed_sec": int(elapsed)}
+                    if name in pending:
+                        del pending[name]
+                else:
+                    log(f"[{name}] walled tab (hv_blocked) — idling the poll leg "
+                        "(auto-skip off; Skip-only card stays up, wall untouched)", "DEBUG")
+                continue
 
             # ── #953 (audit): NON-BLOCKING parked-decision resolver ──
             # A per-agent decision card (session expiry, empty extraction,
@@ -32873,28 +32911,31 @@ async def detect_session_expiry(page, platform: str, label: str) -> tuple[bool, 
 def _hv_fail_copy(platform: str, reason: str) -> tuple[str, str]:
     """#896: user-facing (title, details) for a human-verification failure.
 
-    Cloudflare gets its own copy because its checkbox is an ATTESTATION, not
-    a click test: the automation browser fails the browser-integrity check,
-    so the challenge re-issues after every click — solving it in the
-    automation window is a losing loop, hence hands-off + Skip-only.
+    Gap #1 + HV never-solve (user directive 2026-07-15): HV == Cloudflare ==
+    the SAME — ALL verification walls are hands-off + Skip-only. Any attempt to
+    clear one from the automation window (a Retry re-navigates the walled tab,
+    a click/CUA hammers the challenge) re-issues it and RAISES the bot score,
+    so no card offers Retry. Cloudflare keeps its distinct copy (it self-clears
+    on decay); every other challenge shares one hands-off message. The user can
+    solve any of them by hand in the open browser and re-run.
     2026-07-09 (user): keep the copy short + to the point and do NOT tell the
-    user to run the login command (it isn't the right fix for a Cloudflare wall)."""
+    user to run the login command (it isn't the right fix for a wall)."""
     _names = {"claude": "Claude", "gemini": "Gemini", "chatgpt": "ChatGPT"}
     plat = _names.get(platform.lower(), platform.capitalize())
     if "cloudflare" in (reason or "").lower():
-        # #906 + hands-off directive: no Retry mention — the card is
-        # Skip-only for Cloudflare (fail_agent skip_only=True) because a
-        # Retry (hard) would re-navigate the walled tab and raise the score.
         return (
             f"{plat} hit Cloudflare's human check",
             f"It can't be cleared from here — trying only makes Cloudflare ask harder. "
             f"Skip {plat} for this run; if it clears on its own, the run resumes automatically.",
         )
+    # Unified hands-off (no "then Retry"): a Retry would re-navigate the walled
+    # tab and raise the bot score, the same failure mode as Cloudflare.
     return (
         f"{plat} needs a human check",
         f"{plat} is showing a human-verification challenge"
-        f"{f' ({reason})' if reason else ''}. Solve it in the open browser window, "
-        f"then Retry — or Skip {plat} for this run.",
+        f"{f' ({reason})' if reason else ''}. It can't be cleared from here without "
+        f"raising the bot score — Skip {plat} for this run. You can solve it by hand "
+        f"in the open browser and re-run if you want it back.",
     )
 
 
@@ -33016,6 +33057,14 @@ async def _hv_auto_skip_finalize(browser, page, agent_key: str, label: str,
 
     Caller gates this on `_runtime.auto_skip_stuck` — when auto-skip is OFF the
     HV card stays up for a manual Skip instead."""
+    # Gap #1: idempotent. The non-blocking HV path can reach this both from
+    # start_agent_no_gemini_wait's hands-off handoff AND from the run_phase2
+    # setup-fail handler's _hv_setup_fail_card on the same agent — the second
+    # call must not re-emit agent_skipped / re-close the (already-closed) tab.
+    if agent_key in _controls.hv_auto_skipped:
+        log(f"[{label}] HV auto-skip already finalized for {agent_key} — "
+            "skipping duplicate", "DEBUG")
+        return
     _name = {"chatgpt": "ChatGPT", "claude": "Claude", "gemini": "Gemini"}.get(
         agent_key, agent_key.capitalize())
     log(f"[{label}] HV auto-skip — verification wall unanswered; greying {agent_key} "
@@ -33098,10 +33147,13 @@ async def _hv_setup_fail_card(browser, page, platform: str, label: str) -> bool:
         await _hv_auto_skip_finalize(browser, page, platform_key, label, phase=2)
         return True
     log(f"[{label}] setup failed ON a human-verification wall ({reason}) — emitting HV card, not the generic fail", "WARN")
-    # #906 hands-off Cloudflare: Skip-only card (Retry (hard) would re-open /
-    # re-navigate the walled surface — the exact touch the directive forbids).
-    fail_agent(platform_key, title, details,
-               skip_only="cloudflare" in (reason or "").lower())
+    # Gap #1 + HV never-solve (user directive 2026-07-15): ALL HV is Skip-only,
+    # not just Cloudflare. A Retry (hard) re-navigates the walled surface — the
+    # exact touch the directive forbids (raises the bot score for reCAPTCHA /
+    # hCaptcha / Claude-HV walls too, not only Cloudflare). Unconditional
+    # skip_only=True closes the non-Cloudflare Retry-re-nav hole (adversarial
+    # finding #6, 2026-07-15).
+    fail_agent(platform_key, title, details, skip_only=True)
     return True
 
 
@@ -34242,12 +34294,9 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
 
     # LAYER 0: Detect human-verification gates BEFORE Playwright setup tries to
     # click selectors that don't exist under a Cloudflare / CAPTCHA overlay.
-    # If a challenge is present, pause the pipeline and let the user solve it
-    # in the browser, then auto-resume when cleared.
+    # Gap #1 + HV never-solve: a detected wall is handled HANDS-OFF + NON-BLOCKING
+    # below (no tier cascade, no pause) — the automation never touches the wall.
     platform_l = platform.lower()
-    # Warm-tab reuse: this page is the caller's live P1/main tab — the HV
-    # cascade must never kill it (its tier-4 replacement page can't reach us).
-    _preserve_tab = reuse_page is not None and page is reuse_page
     blocked, reason = await detect_human_verification(page, platform, label)
     if not blocked:
         # #896: fresh nav landed clean — drop any stale wall verdict from a
@@ -34256,33 +34305,27 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
         # post-setup-fail probes below, which rebuild the verdict.)
         _controls.hv_blocked.pop(platform_l, None)
     if blocked:
-        cleared = await wait_for_verification_clearance(browser, cua_client, page, platform, label,
-                                                        verbose=verbose, initial_reason=reason,
-                                                        preserve_tab=_preserve_tab)
-        if not cleared:
-            # #906: a user Skip during the tier-5 wait also returns False —
-            # the HV loop keeps the marker in skipped_agents exactly so we
-            # can tell that apart from "unresolved". The skip already emitted
-            # agent_skipped + closed the tab; a fail card here was the
-            # observed duplicate-alert bug (Skip → second "hit Cloudflare's
-            # human check" card with Retry (hard) right after skipping).
-            if platform_l in _controls.skipped_agents:
-                log(f"[{label}] User skipped {platform} during verification — no failure card")
-                return page, False
-            # #896: reason-aware card — Cloudflare gets the real-Chrome
-            # trust-building guidance, not "try again in the open browser".
-            # Prefer the cascade's refreshed verdict (hv_blocked) over our
-            # possibly-stale pre-cascade probe.
-            _hv_reason_final = _controls.hv_blocked.get(platform_l, reason)
-            _hv_title, _hv_details = _hv_fail_copy(platform, _hv_reason_final)
-            # Hands-off Cloudflare (2026-07-06 directive): Skip is the ONLY
-            # action — a Retry (hard) re-navigates the walled tab, which is
-            # exactly the interaction that raises the bot score.
-            fail_agent(platform_l, _hv_title, _hv_details,
-                       skip_only="cloudflare" in (_hv_reason_final or "").lower())
-            return page, False
-        # Settle after clearance — page often reloads to the real content
-        await asyncio.sleep(2)
+        # Gap #1 + HV never-solve (unified hands-off, user directive 2026-07-15):
+        # HV == Cloudflare == the same thing — we do NOT try to clear it. The
+        # old wait_for_verification_clearance ran a solve cascade (Playwright
+        # click / CUA / cooldown+reload / kill-tab) for non-Cloudflare walls and
+        # a tier-5 request_pause + 600s poll for all of them. EVERY interaction
+        # with the wall re-issues the challenge and raises the bot score, and the
+        # pause froze the single sequential P2 setup coroutine + starved the
+        # sibling agents. So P2 no longer calls it: record the sticky verdict and
+        # hand straight to _hv_setup_fail_card, which emits the Skip-only
+        # hands-off card and (auto-skip on = the default) immediately greys +
+        # closes the tab. NON-BLOCKING — 2B/2C keep starting. This covers BOTH
+        # the initial-setup path AND the hard-retry path (_restart_phase2_agent
+        # has no run_phase2 setup-fail handler of its own). The user solves the
+        # wall by hand in the open browser and re-runs if they want the agent.
+        # (P1/P5 keep the shared wait_for_verification_clearance — single-surface
+        # phases where a pause starves nobody; this change is P2-scoped.)
+        _controls.hv_blocked[platform_l] = reason
+        log(f"[{label}] HV wall ({reason}) — NON-BLOCKING hands-off handoff: no "
+            f"pause, no solve-attempt, no page interaction (unified hands-off)", "WARN")
+        await _hv_setup_fail_card(browser, page, platform, label)
+        return page, False
 
     # LAYER 0.5 (#899 work-tab preflight): confirmed signed-out probe on the
     # tab we're about to work in — the isolated verify tab's replacement
@@ -34354,30 +34397,16 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     if not setup_ok:
         blocked, _hv_reason = await detect_human_verification(page, platform, label)
         if blocked:
-            cleared = await wait_for_verification_clearance(browser, cua_client, page, platform, label,
-                                                            verbose=verbose, initial_reason=_hv_reason,
-                                                            preserve_tab=_preserve_tab)
-            if not cleared:
-                # #906: user Skip during the wait → no second card (see the
-                # Layer-0 twin above for the full rationale).
-                if platform_l in _controls.skipped_agents:
-                    log(f"[{label}] User skipped {platform} during verification — no failure card")
-                    return page, False
-                # #896: reason-aware card (Cloudflare → real-Chrome guidance);
-                # prefer the cascade's refreshed verdict over our pre-probe.
-                _hv_reason_final = _controls.hv_blocked.get(platform_l, _hv_reason)
-                _hv_title, _hv_details = _hv_fail_copy(platform, _hv_reason_final)
-                fail_agent(platform_l, _hv_title, _hv_details,
-                           skip_only="cloudflare" in (_hv_reason_final or "").lower())
-                return page, False
-            await asyncio.sleep(2)
-            # Retry Playwright setup once, now that the challenge is gone
-            if platform_l == "chatgpt":
-                setup_ok = await setup_chatgpt_dr(page)
-            elif platform_l == "gemini":
-                setup_ok = await setup_gemini_dr(page)
-            elif platform_l == "claude":
-                setup_ok = await setup_claude_dr(page)
+            # Gap #1 + HV never-solve (see the Layer-0 twin above): non-blocking
+            # hands-off — no clearance cascade, no pause, no page interaction. A
+            # wall that surfaces mid-Playwright-setup gets the same treatment,
+            # and the CUA setup fallback below is intentionally SKIPPED (running
+            # CUA vision against a challenge is itself a score-raising touch).
+            _controls.hv_blocked[platform_l] = _hv_reason
+            log(f"[{label}] HV wall mid-setup ({_hv_reason}) — NON-BLOCKING "
+                f"hands-off handoff (no pause / no solve / no CUA)", "WARN")
+            await _hv_setup_fail_card(browser, page, platform, label)
+            return page, False
 
     if setup_ok:
         log(f"[{label}] Playwright-direct setup OK")

@@ -396,13 +396,17 @@ def test_check_hv_gate_no_second_cascade_pass_for_cloudflare():
 
 
 def test_hv_trim_is_challenge_scoped_not_platform_scoped():
-    """User rule (2026-07-06): ALL HV is dealt with carefully — every platform,
-    every phase. The trim therefore lives in the ONE shared cascade and keys on
-    the CHALLENGE TYPE (the probe-refreshed `reason`), never on platform/phase:
-    P1's ChatGPT gate, P2's Layer-0 + post-setup probes (ChatGPT/Claude/Gemini),
-    and P3's NotebookLM gates (upload + audio) all route here. A regression that
-    special-cases the trim to one platform re-opens the score snowball on the
-    others."""
+    """User rule (2026-07-06): the shared cascade's trim keys on the CHALLENGE
+    TYPE (the probe-refreshed `reason`), never on platform/phase. The shared fn
+    is left intact for P1 + P3 (single-surface phases where a pause starves
+    nobody). A regression that special-cases the trim to one platform re-opens
+    the score snowball on the others.
+
+    Gap #1 + HV never-solve (2026-07-15): P2 no longer routes through this
+    cascade at all — it handles a wall HANDS-OFF + NON-BLOCKING via
+    _hv_setup_fail_card (no solve tiers, no pause), so a walled P2 agent never
+    freezes the sequential setup coroutine. This is the P2-scoped (Option b)
+    change: P1/P3 keep the shared fn untouched."""
     src = inspect.getsource(research.wait_for_verification_clearance)
     # The gate reads the challenge verdict, not the platform.
     assert '"cloudflare" in (reason or "").lower()' in src
@@ -411,12 +415,74 @@ def test_hv_trim_is_challenge_scoped_not_platform_scoped():
     _body = src[src.index("def _is_cloudflare"):]
     _body = _body[_body.index("\n"):_body.index("def ", 4)]  # body only, up to the next def
     assert "platform" not in _body.replace("profile+IP", "")
-    # Every phase's HV entry point funnels into this one cascade — P1 + P3 via
-    # check_hv_gate, P2 via start_agent_no_gemini_wait's two probes.
+    # P1 + P3 still funnel into this one cascade via check_hv_gate.
     assert "wait_for_verification_clearance" in inspect.getsource(research.check_hv_gate)
+    # Gap #1: P2 no longer calls the blocking cascade — it is hands-off
+    # (never-solve) + non-blocking via _hv_setup_fail_card instead.
     _p2_src = inspect.getsource(research.start_agent_no_gemini_wait)
-    assert _p2_src.count("wait_for_verification_clearance(") == 2
+    assert _p2_src.count("wait_for_verification_clearance(") == 0
+    assert _p2_src.count("_hv_setup_fail_card(") >= 2
     _p1_src = inspect.getsource(research.run_phase1)
     assert "check_hv_gate" in _p1_src
     assert "check_hv_gate" in inspect.getsource(research.run_phase3_upload)
     assert "check_hv_gate" in inspect.getsource(research.run_phase3_audio)
+
+
+def test_p2_hv_wall_is_non_blocking_and_handsoff():
+    # Gap #1 + HV never-solve (2026-07-15): a wall detected during P2 setup must
+    # NOT pause the pipeline (request_pause) and must NOT run any solve tier — it
+    # hands off to _hv_setup_fail_card (Skip-only hands-off card + auto-skip) and
+    # returns (page, False), so the sequential setup coroutine keeps going and
+    # siblings keep starting. The automation never touches the wall.
+    src = inspect.getsource(research.start_agent_no_gemini_wait)
+    assert 'request_pause("human_verification_required")' not in src
+    assert "wait_for_verification_clearance(" not in src
+    # both HV probes (Layer 0 + post-setup-fail) hand off to _hv_setup_fail_card.
+    assert "await _hv_setup_fail_card(browser, page, platform, label)" in src
+
+
+def test_hv_card_is_skip_only_for_all_walls():
+    # Gap #1 + HV never-solve: the P2 HV card is Skip-only for EVERY wall type,
+    # not just Cloudflare (adversarial finding #6). A Retry re-navigates the
+    # walled tab and raises the bot score for reCAPTCHA/hCaptcha/Claude-HV too.
+    src = inspect.getsource(research._hv_setup_fail_card)
+    assert "skip_only=True" in src
+    assert 'skip_only="cloudflare"' not in src
+    # copy carries no in-place "Retry" for a non-Cloudflare wall.
+    _, details = research._hv_fail_copy("claude", "Claude human verification")
+    assert "Retry" not in details
+
+
+def test_round_robin_hands_off_a_walled_tab_before_any_touch():
+    # Gap #1 defense-in-depth: a walled agent (hv_blocked) that reaches the
+    # per-agent poll leg (e.g. re-seeded by a hard-retry that hit a wall) must
+    # be handed off BEFORE any switch_to_page / scrape / CUA touch.
+    src = inspect.getsource(research.poll_all_agents_round_robin)
+    assert "in _controls.hv_blocked and not p.get(\"awaiting_decision\")" in src
+    # the guard must sit before the main-leg switch_to_page/scrape.
+    _guard = src.index("in _controls.hv_blocked and not p.get(\"awaiting_decision\")")
+    _main_switch = src.index('await browser.switch_to_page(p["page"])', _guard)
+    assert _guard < _main_switch
+
+
+def test_parked_resolver_hands_off_a_walled_agent():
+    # Gap #1 belt-and-braces: _resolve_parked_agent_decision has reload/
+    # switch_to_page branches that aren't individually hv_blocked-guarded, so a
+    # top-of-function guard hands-off any walled agent before they run (removes
+    # reliance on the "parked ⇒ never hv_blocked" invariant).
+    src = inspect.getsource(research._resolve_parked_agent_decision)
+    assert "if key in _controls.hv_blocked:" in src
+    # the guard precedes the session_expiry reload.
+    assert src.index("if key in _controls.hv_blocked:") < src.index('p["page"].reload(')
+
+
+def test_hv_auto_skip_finalize_is_idempotent():
+    # Gap #1: the non-blocking HV path can reach _hv_auto_skip_finalize twice for
+    # the same agent (start_agent's hands-off handoff + the run_phase2 setup-fail
+    # handler's _hv_setup_fail_card). The early-return on hv_auto_skipped makes
+    # the second call a no-op — no duplicate agent_skipped, no re-close.
+    src = inspect.getsource(research._hv_auto_skip_finalize)
+    assert "if agent_key in _controls.hv_auto_skipped:" in src
+    # the guard must precede the .add (else it can never fire).
+    assert (src.index("if agent_key in _controls.hv_auto_skipped:")
+            < src.index("_controls.hv_auto_skipped.add"))
