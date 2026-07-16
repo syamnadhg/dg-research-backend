@@ -8418,6 +8418,32 @@ def _start_command_listener(uid, research_id, loop):
                             pass
                         continue
             action = data.get("action", "")
+            # #955 Phase 6: command-ack at DISPATCHER INTAKE. The FE stamps a
+            # client-nonce `command_id` (+ the card's `decisionId`) on the doc
+            # and shows the button as "Sending…" until it hears back. We ack the
+            # instant the dispatcher accepts the command (the control flag is set
+            # microseconds below) — NOT when the engine consumes it, which can
+            # lag minutes during setup / hard-retry and would falsely re-enable
+            # the button at the FE's 12s no-ack timeout. Skip: ping (has its own
+            # pong), the stale first-attach replay (already `continue`d above),
+            # commands with no command_id (a legacy/opt-out client — nothing is
+            # waiting on an ack), and an invalid agent_decision (acking a no-op
+            # would falsely confirm it). The FE also treats the doc delete below
+            # as a fallback resolve signal, so a dropped ack still recovers.
+            _cmd_id = data.get("command_id") or data.get("commandId")
+            if _cmd_id and action and action != "ping":
+                _ack_ok = True
+                if action == "agent_decision":
+                    _ad = (data.get("decision", "") or "").lower()
+                    _ack_ok = _ad in ("retry", "skip", "stop")
+                if _ack_ok:
+                    try:
+                        emit_event("command_ack", command_id=_cmd_id,
+                                   decision_id=(data.get("decisionId")
+                                                or data.get("decision_id")),
+                                   ack_action=action)
+                    except Exception:
+                        pass
             if action == "ping":
                 # Watchdog confirmation ping. Frontend writes this when it
                 # suspects silence; our processing of the command proves
