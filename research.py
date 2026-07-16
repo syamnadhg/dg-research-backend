@@ -15419,8 +15419,8 @@ PHASE_FLOW_CONTEXT = {
         "that ChatGPT, Gemini, Claude, and NotebookLM are all logged in. "
         "With skipInitVerify the probe is a cookie sniff (<10s); full "
         "verify is a per-platform CUA round (1-2 min)."),
-    1: ("Phase 1 is brief generation. ChatGPT Pro with Extended Thinking "
-        "drafts a detailed research brief from the topic + any PDFs. The "
+    1: ("Phase 1 is brief generation. ChatGPT Pro with its latest thinking "
+        "model drafts a detailed research brief from the topic + any PDFs. The "
         "flow is: open ChatGPT, clear any HV gate, select Pro + Thinking, "
         "attach PDFs, submit the brief prompt, then ~10-20 min of reasoning "
         "+ writing while the frontend token-streams the output."),
@@ -15445,8 +15445,8 @@ PHASE_FLOW_CONTEXT = {
 AGENT_PHASE_FLOWS: dict[tuple[str, int], list[str]] = {
     ("chatgpt", 1): [
         "0-30s: Opening ChatGPT, clicking the model selector",
-        "30-90s: Pasting the topic, selecting Pro + Extended Thinking",
-        "90s-3m: Extended Thinking active — internal reasoning visible in the UI",
+        "30-90s: Pasting the topic, selecting Pro + the latest thinking model",
+        "90s-3m: Thinking active — internal reasoning visible in the UI",
         "3-15m: Drafting the research brief with structured sections",
         "15-25m: Finalizing brief and validating sources to target",
     ],
@@ -15729,7 +15729,7 @@ def _extract_top_hosts(events: list, limit: int = 2) -> list:
 # equality guard at line ~7131/~7207 (silent-emit trap).
 AGENT_TIER4_VARIANTS = {
     ("chatgpt", 1): [
-        "ChatGPT is reasoning through the brief in extended thinking.",
+        "ChatGPT is reasoning through the brief with its latest thinking model.",
         "ChatGPT is shaping the brief outline with structured sections.",
         "ChatGPT is consolidating the brief output and validating sources.",
     ],
@@ -17055,7 +17055,7 @@ async def scrape_progress_chatgpt(page):
         if not result.get("steps"):
             synth = []
             if result.get("thinking"):
-                synth.append("Extended Thinking: " + result["thinking"][:100])
+                synth.append("Thinking: " + result["thinking"][:100])
             hosts = set()
             for u in result.get("source_urls", []):
                 try:
@@ -18259,7 +18259,7 @@ async def scrape_progress_claude(page):
             } catch(e) {}
 
             // ---- Steps: synthesize from tool_uses + live markers + sources
-            if (r.thinking) r.steps.push('Extended Thinking: ' + r.thinking.substring(0, 100));
+            if (r.thinking) r.steps.push('Thinking: ' + r.thinking.substring(0, 100));
             r.tool_uses.slice(-5).forEach(t => {
                 const brief = t.substring(0, 120);
                 r.steps.push(brief.toLowerCase().includes('earch') ? 'Searching: ' + brief : brief);
@@ -29731,7 +29731,7 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
             log("Selecting Pro + Extended Thinking...")
             emit_event("agent_progress", phase=1, agent="chatgpt",
                        status="selecting_model",
-                       progress="Selecting ChatGPT Pro with Extended Thinking…")
+                       progress="Selecting ChatGPT Pro with its latest thinking model…")
             try:
                 async def _select_pro_cua():
                     return await asyncio.wait_for(
@@ -40682,7 +40682,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 and 1 not in _controls.skipped_phases
                 and not _controls.is_stop()):
             emit_event("phase_start", phase=1,
-                       description="Generating research brief with ChatGPT Pro + Extended Thinking",
+                       description="Generating research brief with ChatGPT Pro + latest thinking model",
                        agents=["chatgpt"])
             _update_firestore_research({"phase": 1, "currentPhase": 1, "status": "ongoing"})
             _p1_start_emitted = True
@@ -40804,7 +40804,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # Edge case: pre-emit was gated out above (e.g. stop pressed
                 # mid-verify-gate, then cleared). Emit now so the dispatch
                 # has a corresponding start event.
-                emit_event("phase_start", phase=1, description="Generating research brief with ChatGPT Pro + Extended Thinking", agents=["chatgpt"])
+                emit_event("phase_start", phase=1, description="Generating research brief with ChatGPT Pro + latest thinking model", agents=["chatgpt"])
                 _update_firestore_research({"phase": 1, "currentPhase": 1, "status": "ongoing"})
             _p1_start = time.time()
             # Active-time ceiling for Phase 1 — paused seconds don't count.
