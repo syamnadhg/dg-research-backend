@@ -42840,6 +42840,21 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # is done so it can advance to the next queue item; the
         # user-visible research.status stays "ongoing" until FE-P5's
         # markFeP5Completed flips it to "completed".
+        #
+        # 2026-07-16 (pause/resume invariant #4 — defensive): release any
+        # residual pause / awaiting-user state before the FE handoff. On the
+        # golden path nothing is held (await_*_decision clears in its finally),
+        # but a non-golden exit into this terminal block must never strand the
+        # FE "Paused" — P4/P5 are FE-owned, so the BE emits nothing more and no
+        # later BE resume is coming. Emit pipeline_resumed so the FE clears its
+        # paused chrome if a pause somehow survived to completion.
+        try:
+            if _controls.is_pause():
+                _controls.request_resume()
+                emit_event("pipeline_resumed", phase=3, reason="completion_handoff")
+            _controls._awaiting_user = False
+        except Exception as _clr_err:
+            log(f"terminal pause-clear (non-fatal): {_clr_err}", "WARN")
         update_delivery(status="completed")
         # 2026-05-11: write beDone marker so the queue gate
         # (_wait_for_prior_fe_completion) knows BE handed off to FE.
