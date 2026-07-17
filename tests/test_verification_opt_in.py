@@ -155,7 +155,8 @@ def test_gemini_gets_a_zero_navigation_tier_backstop():
         "with verification off by default the 2C DOM tier read is Gemini's "
         "only Free-tier tell (P0 walk + gate tier checks no longer run)"
     )
-    assert "phase2/setup_pro_backstop" in src
+    # Round 2 (#60): the Free-tier read now emits a PASSIVE status, not a card.
+    assert "Running Gemini on the Free tier" in src
 
 
 def test_gate_has_trust_first_fast_path():

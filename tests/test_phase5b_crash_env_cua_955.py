@@ -195,18 +195,15 @@ def test_env_missing_key_authors_on_the_login_required_event(monkeypatch):
 # ── 6. soft-warn lift ─────────────────────────────────────────────────────────
 
 def test_soft_warn_stays_a_pipeline_warning_with_message_title(monkeypatch):
+    # Round 2 (#60): the soft "taking a while" warning is now a PASSIVE,
+    # buttonless banner — a slow-but-healthy phase is self-healing, not a user
+    # decision. It stays a pipeline_warning whose title comes from message.
     events = _capture(monkeypatch)
     research.emit_decision(
         phase=1, title="This step is taking a while",
-        details="This step is still running and may just be a long one. "
-                "Keep waiting, or restart it / skip it.",
-        actions=[
-            {"id": "wait", "label": "Wait — keep going", "style": "primary",
-             "command": {"action": "dismiss_alert"}},
-            {"id": "retry", "label": "Retry from checkpoint", "style": "default",
-             "command": {"action": "retry_phase", "phase": 1}},
-            {"id": "skip", "label": "Skip phase", "style": "default",
-             "command": {"action": "skip_phase", "phase": 1}}],
+        details="This step is still running — it may just be a long one. "
+                "No action needed; it will continue on its own.",
+        actions=[],
         recoverability="recoverable", event_name="pipeline_warning",
         alert_id="phase1_soft_timeout_x", dismissible=True, alertType="warn",
         message="This step is taking a while")
@@ -214,10 +211,9 @@ def test_soft_warn_stays_a_pipeline_warning_with_message_title(monkeypatch):
     # FE warning handler reads the title from message, never error
     assert ev["message"] == "This step is taking a while"
     assert ev["alertType"] == "warn"
-    # the verbatim 3-action list (the FE RENDERS actions on pipeline_warning)
-    assert [a["id"] for a in ev["actions"]] == ["wait", "retry", "skip"]
-    assert ev["actions"][0]["label"] == "Wait — keep going"
-    # gained a decision_id without changing the wire routing
+    # buttonless — the Retry/Skip actions were stripped (self-heal must be silent)
+    assert ev["actions"] == []
+    # still gained a decision_id without changing the wire routing
     assert ev["decision_id"]
     assert ev["recoverability"] == "recoverable"
 

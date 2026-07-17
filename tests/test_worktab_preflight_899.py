@@ -231,7 +231,8 @@ def test_chatgpt_gets_a_zero_navigation_tier_backstop():
     # never runs (skip-P1 / attached-sources runs).
     src = inspect.getsource(research.run_phase2)
     assert "_chatgpt_dom_tier(chatgpt_page)" in src
-    assert '_emit_pro_required_alert(phase=2, agent="chatgpt", source="phase2/setup_pro_backstop")' in src
+    # Round 2 (#60): the Free-tier read now emits a PASSIVE status, not a card.
+    assert "Running ChatGPT on the Free tier" in src
     # POSITION is load-bearing: the ChatGPT read must sit AFTER 2C's Gemini read.
     assert src.index("_chatgpt_dom_tier(chatgpt_page)") > src.index("_gemini_dom_tier(gemini_page)")
     _idx = src.index("_chatgpt_dom_tier(chatgpt_page)")
@@ -256,8 +257,12 @@ def test_p2_tier_backstop_is_non_blocking():
     src = inspect.getsource(research.run_phase2)
     assert 'request_pause("pro_required")' not in src
     assert 'reason="pro_required"' not in src
-    # both emits survive (the informational card is still raised).
-    assert src.count('_emit_pro_required_alert(phase=2, agent=') == 2
+    # Round 2 (#60): the informational pro_required CARD is downgraded to a
+    # passive Free-tier status — the run continues on Free regardless, so this
+    # is not a user-action gate. No pro_required card is emitted at P2.
+    assert src.count('_emit_pro_required_alert(phase=2, agent=') == 0
+    assert "Running Gemini on the Free tier" in src
+    assert "Running ChatGPT on the Free tier" in src
 
 
 def test_p2_pro_card_has_no_retry_and_no_re_read():

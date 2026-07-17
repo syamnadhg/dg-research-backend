@@ -35813,20 +35813,19 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 except Exception:
                     _gm_tier = "unsure"
                 if _gm_tier == "free":
-                    # Gap #1: NON-BLOCKING pro_required. The old request_pause +
-                    # wait_if_paused froze the single sequential setup coroutine,
-                    # starving Claude + the [2D] plan wait. The Free-tier DR is
-                    # already generating server-side, so the card is
-                    # informational: its taps are consumed by the always-on
-                    # round-robin (Continue-with-Free via the agent-scoped
-                    # pro-ack, Skip via skip_agent), NOT a pipeline pause. Gemini
-                    # is registered in agents[] after [2D], so it lands in
-                    # `pending` and the loop-top ack consumer sees it.
-                    log("[2C] Gemini DOM tier reads FREE — non-blocking pro_required "
-                        "emitted; agent stays live in the round-robin (no pipeline pause)", "WARN")
-                    _emit_pro_required_alert(phase=2, agent="gemini", source="phase2/setup_pro_backstop")
-                    log("[2C] pro_required is non-blocking — flowing to round-robin without "
-                        "wait_if_paused (ack via continue_free agent-scoped; Skip via skip_agent)", "INFO")
+                    # Round 2 (#60): Free-tier is NOT a user-action gate. The Deep
+                    # Research is already generating server-side and the run
+                    # continues on Free regardless; Skip stays reachable via the
+                    # normal agent-tile control. Downgrade the (already
+                    # non-blocking) pro_required card to a PASSIVE status: no card,
+                    # no ack to chase, no round-robin consumer needed. stage=
+                    # "planning" preserves the milestone the emit above just set
+                    # (a bare status="generating" would reset the stepper).
+                    log("[2C] Gemini DOM tier reads FREE — passive Free-tier status "
+                        "(no pro_required card; run continues on Free)", "INFO")
+                    emit_event("agent_progress", phase=2, agent="gemini",
+                               status="generating", stage="planning",
+                               progress="Running Gemini on the Free tier — Deep Research quality may be lower")
         elif "gemini" in _controls.skipped_agents:
             # #906: the user already skipped Gemini (e.g. during the HV wait
             # — the tier-5 loop keeps the marker for this check). The skip
@@ -35904,20 +35903,16 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         except Exception:
             _cg_tier = "unsure"
         if _cg_tier == "free":
-            # Gap #1: NON-BLOCKING pro_required (see the 2C Gemini twin). No
-            # request_pause — the ChatGPT DR is already generating server-side,
-            # so [2D] (Gemini Start-research) and the round-robin no longer wait
-            # behind this decision. The card's taps are consumed by the always-on
-            # round-robin (Continue-with-Free via the agent-scoped pro-ack, Skip
-            # via skip_agent). The old Retry-path tier re-read is intentionally
-            # gone — Finding 1 removed Retry from the P2 pro card (a
-            # retry_phase(2) has no round-robin consumer and the 120-min
-            # supervisor would restart the whole phase, nuking in-flight DRs).
-            log("[2A] ChatGPT DOM tier reads FREE — non-blocking pro_required emitted; "
-                "the card lives into the round-robin (no pause, [2D] proceeds)", "WARN")
-            _emit_pro_required_alert(phase=2, agent="chatgpt", source="phase2/setup_pro_backstop")
-            log("[2A] pro_required non-blocking — Gemini Start-research (2D) no longer "
-                "waits behind the ChatGPT decision", "INFO")
+            # Round 2 (#60): Free-tier is not a user-action gate — the ChatGPT DR
+            # is already generating server-side and the run continues on Free.
+            # Passive status instead of the (non-blocking) pro_required card.
+            # stage="researching" matches the live DR stage at this post-2C point
+            # (the round-robin corrects it next tick regardless).
+            log("[2A] ChatGPT DOM tier reads FREE — passive Free-tier status "
+                "(no pro_required card; run continues on Free)", "INFO")
+            emit_event("agent_progress", phase=2, agent="chatgpt",
+                       status="generating", stage="researching",
+                       progress="Running ChatGPT on the Free tier — Deep Research quality may be lower")
 
     # ── First wave: 60s sequential per agent (2026-04 overhaul) ──
     # Instead of one instant snapshot, dwell on each agent's tab for 60s and
@@ -40232,38 +40227,28 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
 
     def _emit_phase_soft_warn(phase: int, max_min: int, alert_id: str):
         """Emit the phase-level soft-timeout pipeline_warning. Used only by
-        _await_phase_with_active_deadline's soft path. Actions:
-          - Wait: pure FE dismiss, no Firestore command needed because BE
-            was never paused. Polling continues uninterrupted.
-          - Retry from checkpoint: writes retry_phase command → helper
-            consumes consume_retry_phase, cancels run_task, raises
-            _PhaseSoftDecision("retry") so the caller can restart.
-          - Skip phase: writes skip_phase command → helper consumes
-            consume_phase_skip, cancels run_task, raises
-            _PhaseSoftDecision("skip") so the caller can advance.
+        _await_phase_with_active_deadline's soft path. Round 2 (#60): a phase
+        that is merely SLOW (not failed) is a self-healing state, not a user
+        decision — so this is a PASSIVE, buttonless (actions=[]) info banner.
+        The run is NOT paused and keeps polling to natural completion; the
+        FE-dismissible banner is informational only. The genuine-hang path
+        (_phase_timeout_decision at the hard ceiling) still pauses and offers
+        Retry/Skip, and the global Stop button remains the escape.
         """
-        actions = [
-            {"id": "wait", "label": "Wait — keep going", "style": "primary",
-             "command": {"action": "dismiss_alert"}},
-            {"id": "retry", "label": "Retry from checkpoint", "style": "default",
-             "command": {"action": "retry_phase", "phase": phase}},
-            {"id": "skip", "label": "Skip phase", "style": "default",
-             "command": {"action": "skip_phase", "phase": phase}},
-        ]
+        actions = []
         try:
-            # #955 Phase 5B: author through the seam in EXPLICIT mode (no catalog
-            # row — the Wait/Retry/Skip trio is unique to this card). event_name=
-            # "pipeline_warning" keeps the FE routing; the FE warning handler
-            # renders evt.data.actions (so the verbatim 3-list is wire parity) and
-            # reads the title from message (never error), so message= is
-            # load-bearing via **extra. This gains a decision_id (Phase-6 ack)
-            # without changing any wire field. Fresh id per fire (no re-emit).
+            # #955 Phase 5B / Round 2 (#60): author through the seam in EXPLICIT
+            # mode (no catalog row). event_name="pipeline_warning" keeps the FE
+            # routing; the FE warning handler renders evt.data.actions (now [] —
+            # a passive, dismissible banner) and reads the title from message
+            # (never error), so message= is load-bearing via **extra. Fresh id
+            # per fire (no re-emit).
             emit_decision(
                 phase=phase,
                 title="This step is taking a while",
                 details=(
-                    "This step is still running and may just be a long one. "
-                    "Keep waiting, or restart it / skip it."
+                    "This step is still running — it may just be a long one. "
+                    "No action needed; it will continue on its own."
                 ),
                 actions=actions,
                 recoverability="recoverable",
@@ -40345,18 +40330,18 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
           (factory creates a fresh coro). Existing behavior — unchanged.
 
         soft_warn_only=True (P1 + P2 + P3-audio — long-running advisory, 2026-05-04):
-          Emits a pipeline_warning [Wait/Retry/Skip] (amber) at the
-          deadline, DOES NOT cancel the coroutine, and continues polling
-          for the user's decision while the run_task keeps doing work.
-          Wait is implicit — no command needed; the polling never
-          stopped, the alert FE-clears when user dismisses. Retry →
-          cancel + raise _PhaseSoftDecision("retry"). Skip → cancel +
-          raise _PhaseSoftDecision("skip"). User-Stop (chat input) →
-          cancel + raise CancelledError. Run_task completing naturally
-          returns its result. The user's contract: 'BE can't bail on
-          long researches and fail.' One warn per helper invocation —
-          if user clicks Wait and the run continues past another budget
-          window, no re-warn (prevents spam).
+          Emits a PASSIVE pipeline_warning banner (amber) at the deadline
+          and DOES NOT cancel the coroutine — the run_task keeps working to
+          natural completion. Round 2 (#60): the banner is now buttonless
+          (a slow-but-healthy phase is self-healing, not a user decision),
+          so it no longer sources a Retry/Skip. The retry/skip polling below
+          stays as a latent honor-path — if a phase-level Retry/Skip command
+          arrives from any other surface it is still honored (cancel + raise
+          _PhaseSoftDecision) — but nothing sets it during a soft warn in
+          practice. User-Stop (chat input) → cancel + raise CancelledError.
+          Run_task completing naturally returns its result. The user's
+          contract: 'BE can't bail on long researches and fail.' One warn per
+          helper invocation (no re-warn / no spam).
 
         coro_factory is `Callable[[], Coroutine]` — must produce a fresh
         coroutine on each call so retry doesn't await an already-awaited
@@ -40390,10 +40375,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 try: await run_task
                 except BaseException: pass
                 raise asyncio.CancelledError(f"phase {phase} stopped by user")
-            # Soft-mode user-decision polling — only AFTER the warn is
-            # emitted. Until then there's nothing for the user to decide.
-            # Wait is implicit (no signal); Retry/Skip drive the existing
-            # consume_retry_phase / consume_phase_skip controls.
+            # Soft-mode phase-decision polling — only AFTER the warn is
+            # emitted. Round 2 (#60): the soft-warn banner is buttonless, so
+            # this no longer fires from the card itself; it remains a latent
+            # honor-path for a retry_phase/skip_phase command arriving from any
+            # other surface while the phase runs long (none does in practice).
             if soft_warn_only and soft_warn_emitted:
                 if _controls.consume_retry_phase(phase):
                     log(f"Phase {phase}: user chose Retry on soft-warn — cancelling run_task", "INFO")
@@ -40411,11 +40397,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 active_sec += tick
             if active_sec >= deadline_sec and not run_task.done():
                 if soft_warn_only and not soft_warn_emitted:
-                    # Soft path: emit pipeline_warning ONCE, keep polling.
-                    # Run_task continues uninterrupted; user's Wait/Retry/
-                    # Skip is consumed in subsequent ticks above. Per the
-                    # 'BE can't bail on long researches' contract, Wait
-                    # is implicit — no command, no stop, polling intact.
+                    # Soft path: emit the passive pipeline_warning ONCE, keep
+                    # polling. Run_task continues uninterrupted to natural
+                    # completion. Round 2 (#60): the banner is buttonless, so
+                    # there is no Wait/Retry/Skip to consume — the run simply
+                    # keeps going (global Stop still exits within one tick).
                     log(f"Phase {phase}: active-time {active_sec:.0f}s past "
                         f"{deadline_sec:.0f}s — soft warn emitted, polling continues", "WARN")
                     _emit_phase_soft_warn(phase, max_min, soft_alert_id)
