@@ -40373,12 +40373,18 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 ),
                 agent=agent,
                 actions=actions,
+                # #62: distinct alert_id (was the generic phase{n}_error). The
+                # hard phase-timeout card and the crash_loop card both fired at
+                # the same phase into one FE dedup/dismiss slot; a dismissed
+                # timeout card then permanently silenced the crash card. Distinct
+                # from the soft path's phase{n}_soft_timeout_{ts} id.
+                alert_id=f"phase{phase}_timeout",
             )
         except Exception as _e:
             log(f"_phase_timeout_decision: fail_phase fallback ({_e})", "WARN")
             fail_phase(phase, "This step seems stuck",
                        "This step has run a long time without finishing. Restart it, or skip it and keep going.",
-                       agent=agent, actions=actions)
+                       agent=agent, actions=actions, alert_id=f"phase{phase}_timeout")
         # Pause flag freezes the active-time clock during the user's
         # decision wait, so a 20-min decision delay doesn't burn budget
         # against the next retry. Also flips the FE chat input to paused.
@@ -41689,7 +41695,27 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         elif start_phase <= 2:
             if not brief_text:
                 log("No brief text available — cannot run Phase 2", "ERROR")
-                fail_phase(2, "No brief to research", "There's no research brief yet, so deep research can't start. Retry the brief step, or Skip.")
+                # #62: honest buttonless terminal notice, NOT a Retry/Skip card.
+                # This is an emit-then-return backstop — after run_pipeline
+                # returns, teardown_firestore_run() drops the per-run command
+                # listener, so Retry/Skip would write to a dead command bus
+                # (dead-end buttons). actions=[] renders a title/details card
+                # with a corner ✕ and no buttons. fail_phase is KEPT (its
+                # unconditional _QUEUE_STATE["_errored"]=True is what lets the
+                # next queued run dequeue promptly). Distinct alert_id avoids the
+                # generic phase2_error dismiss-ledger collision.
+                fail_phase(2, "No brief to research",
+                           "There's no research brief yet, so deep research "
+                           "can't start. This run stopped here.",
+                           actions=[], alert_id="phase2_no_brief")
+                # #62: emit the FE run-terminal signal (matches the two
+                # all-skipped sites below). Without it, the pipeline_error above
+                # auto-pauses the FE (usePipeline flips every error alert to
+                # paused) and leaves a chat-input Resume that dead-ends —
+                # run_pipeline has already returned, so the per-run command
+                # listener is torn down. pipeline_stopped drives the run terminal
+                # (follow-up mode) instead of a phantom Resume.
+                emit_event("pipeline_stopped", phase=2, reason="no_brief_for_phase2")
                 return
             # Record the P2 source-doc decision once, before run_phase2 reads
             # the manifest: attach the user's sources only when P1 did NOT run
@@ -41746,10 +41772,20 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     enabled_agents = [a for a in enabled_agents if a not in _p2_dropped_at_gate]
                 if not enabled_agents:
                     log("Phase 2: all agents skipped at verify gate — aborting", "WARN")
+                    # #62: honest buttonless terminal notice (was a Retry/Skip
+                    # card whose buttons dead-end — the paired pipeline_stopped
+                    # tears down the FE run + BE command listener). Every agent
+                    # was already skipped by the user, so there's no action left
+                    # to offer; the per-agent agent_skipped events above carry
+                    # the reasons. fail_phase is KEPT (its _errored=True advances
+                    # the queue). Both all-skipped sites (verify-gate + preskip)
+                    # share one alert_id so they're one logical card, not two
+                    # byte-dup cards colliding on the generic phase2_error slot.
                     fail_phase(2,
                                "No agents left to run",
-                               "Every research agent was skipped, so there's nothing "
-                               "to run. Retry to re-check logins, or Skip.")
+                               "Every research agent was skipped, so there's "
+                               "nothing to run. This run stopped here.",
+                               actions=[], alert_id="phase2_no_agents")
                     emit_event("pipeline_stopped", phase=2,
                                reason="all_agents_skipped_at_verify_gate")
                     return
@@ -41771,10 +41807,20 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 enabled_agents = [a for a in enabled_agents if a not in _p2_preskipped]
                 if not enabled_agents:
                     log("Phase 2: all agents skipped before launch — aborting", "WARN")
+                    # #62: honest buttonless terminal notice (was a Retry/Skip
+                    # card whose buttons dead-end — the paired pipeline_stopped
+                    # tears down the FE run + BE command listener). Every agent
+                    # was already skipped by the user, so there's no action left
+                    # to offer; the per-agent agent_skipped events above carry
+                    # the reasons. fail_phase is KEPT (its _errored=True advances
+                    # the queue). Both all-skipped sites (verify-gate + preskip)
+                    # share one alert_id so they're one logical card, not two
+                    # byte-dup cards colliding on the generic phase2_error slot.
                     fail_phase(2,
                                "No agents left to run",
-                               "Every research agent was skipped, so there's nothing "
-                               "to run. Retry to re-check logins, or Skip.")
+                               "Every research agent was skipped, so there's "
+                               "nothing to run. This run stopped here.",
+                               actions=[], alert_id="phase2_no_agents")
                     emit_event("pipeline_stopped", phase=2,
                                reason="all_agents_skipped_at_verify_gate")
                     return
@@ -43066,6 +43112,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                        "or Skip to stop here.",
                 agent=None,
                 intent="crash_loop",
+                # #62: distinct alert_id so a dismissed phase-timeout card
+                # (phase{n}_timeout) can't silence this crash-recovery card via
+                # the FE dismiss-resurface ledger (keyed on alert_id). Was
+                # sharing the generic phase{n}_error slot with _phase_timeout_
+                # decision — a timeout-then-crash at the same phase suppressed
+                # the crash card. Mirrors crash_login_interrupt's own id above.
+                alert_id=f"phase{last_phase}_crash_loop",
             )
     finally:
         # New pause semantics: browser is closed by pause_and_close_browser when pause fires.
