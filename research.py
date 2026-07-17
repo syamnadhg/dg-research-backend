@@ -4041,6 +4041,23 @@ def load_worker_count() -> int:
     return 1
 
 
+def _owner_worker_of(assigned) -> int:
+    """Which worker owns a run, from its Firestore `assignedWorker` field.
+
+    Workers are numbered 1..load_worker_count(); each runs on its OWN browser
+    profile (`_profile_dir(WORKER_ID)`) = its own logged-in ChatGPT / Gemini /
+    Claude / NotebookLM accounts (#728). A run's owning worker is the profile it
+    was launched on — auto-resuming it on any OTHER worker would re-open it
+    against the wrong accounts. `None` / `""` / `0` / a non-numeric value means
+    the field predates worker-affinity (or is the owner default) → worker 1, the
+    legacy primary."""
+    try:
+        w = int(assigned)
+        return w if w >= 1 else 1
+    except (TypeError, ValueError):
+        return 1
+
+
 # ── #903 worker rest (2026-07-06) ────────────────────────────────────────────
 # The owner can park a worker from the app (Shared-With popup → tap an idle
 # pill): the device doc's `restingWorkerIds` (owner-writable, firestore.rules)
@@ -10141,13 +10158,6 @@ def validate_email(email):
     if not _EMAIL_RE.match(email):
         return False, f"email format invalid: {email[:60]}"
     return True, ""
-
-
-class _SkipRehydration(Exception):
-    """Sentinel raised by worker N≥2 to short-circuit the Firestore queue
-    rehydration in run_server (research.py:~26882). Multi-worker: only
-    worker 1 rehydrates; others rely on the listener claim + idle-rescan
-    paths. Catch is non-warning so the log doesn't read as an error."""
 
 
 class SessionExpiredError(Exception):
@@ -43104,10 +43114,16 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
 
     Factored out of run_server's previously owner-only inline rehydration so the
     SAME recovery logic (sibling-lock guard, supervised auto-resume, paused mark)
-    runs for sharer trees too. Worker-gating, the _SkipRehydration sentinel, and
-    the aggregate log line stay in the caller."""
+    runs for sharer trees too. #966: this helper now runs on EVERY worker and
+    keys recovery on per-run ownership (_owner_worker_of) — each worker resumes
+    the runs it owns; worker 1 additionally marks orphan (out-of-fleet-owner)
+    runs paused. The aggregate log line stays in the caller."""
     rehydrated = 0
     orphaned = 0
+    # Fleet size (workers are 1..N). Read once per tree scan — it can't change
+    # mid-boot. Used to tell an in-fleet sibling's run (leave it for that worker)
+    # from an orphan (owner gone; worker 1 marks it paused as a safety net).
+    _fleet_size = load_worker_count()
     researches_col = _firebase_db.collection("users").document(tree_uid) \
         .collection("researches")
     # 2026-05-22: dropped "queued" from rehydration. The
@@ -43177,69 +43193,100 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
                         "INFO",
                     )
                     continue
-                # Mid-run runs need either auto-resume (supervised device) or a
-                # paused_backend_restart marker so the FE shows a Resume CTA.
+                # #728/#966 worker-affinity + per-worker ownership: each worker
+                # runs on its OWN browser profile (_profile_dir(WORKER_ID)) = its
+                # own logged-in ChatGPT/Gemini/Claude/NotebookLM accounts. Auto-
+                # resuming a run a DIFFERENT worker owned would re-open it against
+                # THIS worker's (wrong) accounts. So key recovery on the OWNING
+                # worker (assignedWorker; None/"" → worker 1 legacy default):
+                #   • I own it            → auto-resume (supervised) or mark paused.
+                #   • a live sibling owns → LEAVE IT (that worker rehydrates its
+                #     own runs at its boot, on the right profile). Marking it paused
+                #     here would pop a needless Resume CTA for a run the fleet is
+                #     already auto-recovering — the #966 bug this fixes.
+                #   • orphan (owner ∉ fleet) → worker 1 alone marks it paused as a
+                #     safety net (a Resume re-routes it via claim); other workers
+                #     leave it, so no two workers double-write the same doc.
+                _assigned = data.get("assignedWorker")
+                _owner_worker = _owner_worker_of(_assigned)
+                _i_own = (_owner_worker == WORKER_ID)
+                if not _i_own:
+                    if 1 <= _owner_worker <= _fleet_size:
+                        # KNOWN LIMITATION (#966, documented 2026-07-16): if the
+                        # owning sibling is PERMANENTLY dead (the daemon-loop marks
+                        # a worker≥2 `_dead` after a crash loop / repeated spawn
+                        # failure) it never runs its own rehydration, so this run
+                        # stays frozen "ongoing" with no Resume CTA until the
+                        # operator repairs that worker (a loud `_sup_audit` ERROR
+                        # fires on the death; the on-disk checkpoint survives, so
+                        # the run self-heals once the worker is back). A worker-1
+                        # backstop that marked such runs paused was prototyped and
+                        # REVERTED: the only cheap liveness signal (the per-run
+                        # worker-lock) is released the moment BE phases finish, so
+                        # it can't tell a dead worker from one whose run is simply
+                        # in its long FE-owned P4/P5 tail (or tab-closed) — it
+                        # would false-mark routine healthy runs, which is worse
+                        # than the rare abandonment. A correct backstop needs a
+                        # real per-worker liveness heartbeat (not present in
+                        # Firestore today); tracked for a follow-up.
+                        log(
+                            f"[rehydrate] {research_id[:24]}… owned by sibling "
+                            f"worker {_owner_worker} (fleet={_fleet_size}) — leaving "
+                            f"it for that worker's own rehydration (no paused mark)",
+                            "INFO",
+                        )
+                        continue
+                    if WORKER_ID != 1:
+                        # Orphan (owner ∉ fleet), but I'm not the marker of record.
+                        continue
+                    log(
+                        f"[rehydrate] {research_id[:24]}… owned by out-of-fleet "
+                        f"worker {_owner_worker} (fleet={_fleet_size}) — marking "
+                        f"paused_backend_restart (worker-1 safety net; a Resume "
+                        f"re-routes it via claim)",
+                        "INFO",
+                    )
+                # Mid-run runs need either auto-resume (supervised device, MY run)
+                # or a paused_backend_restart marker so the FE shows a Resume CTA.
                 # Browser + CUA state is gone either way, but on-disk checkpoints
                 # (documents/*.md + checkpoint.json + delivery.json under
                 # queues/{run}/) let detect_resume_phase() skip completed phases.
-                device_id = data.get("deviceId") or ""
+                # Only a run I OWN needs the supervised read (an orphan is marked
+                # paused regardless — I can't re-open it on my profile).
                 is_supervised = False
-                if device_id:
-                    # Track D: top-level devices/{deviceId} is the canonical
-                    # home; synth user CAN read its own doc. Legacy
-                    # users/{ownerUid}/devices/{deviceId} read 403s under synth
-                    # auth, so try modern first and only fall back on miss.
-                    try:
-                        dev_snap = _firebase_db.collection("devices") \
-                            .document(device_id).get()
-                        if dev_snap.exists:
-                            is_supervised = bool(
-                                (dev_snap.to_dict() or {})
-                                .get("supervised", False))
-                    except Exception as _de:
-                        log(f"Rehydrate: top-level device read failed for {research_id[:24]}…: {_de}", "WARN")
-                    if not is_supervised:
+                if _i_own:
+                    device_id = data.get("deviceId") or ""
+                    if device_id:
+                        # Track D: top-level devices/{deviceId} is the canonical
+                        # home; synth user CAN read its own doc. Legacy
+                        # users/{ownerUid}/devices/{deviceId} read 403s under synth
+                        # auth, so try modern first and only fall back on miss.
                         try:
-                            dev_snap = _firebase_db.collection("users") \
-                                .document(owner_uid) \
-                                .collection("devices") \
+                            dev_snap = _firebase_db.collection("devices") \
                                 .document(device_id).get()
                             if dev_snap.exists:
                                 is_supervised = bool(
                                     (dev_snap.to_dict() or {})
                                     .get("supervised", False))
-                        except Exception:
-                            # Synth user is denied on user-tree devices
-                            # subcollection — expected.
-                            pass
+                        except Exception as _de:
+                            log(f"Rehydrate: top-level device read failed for {research_id[:24]}…: {_de}", "WARN")
+                        if not is_supervised:
+                            try:
+                                dev_snap = _firebase_db.collection("users") \
+                                    .document(owner_uid) \
+                                    .collection("devices") \
+                                    .document(device_id).get()
+                                if dev_snap.exists:
+                                    is_supervised = bool(
+                                        (dev_snap.to_dict() or {})
+                                        .get("supervised", False))
+                            except Exception:
+                                # Synth user is denied on user-tree devices
+                                # subcollection — expected.
+                                pass
 
-                # #728 worker-affinity: each worker runs on its OWN browser
-                # profile (_profile_dir(WORKER_ID)) = its own logged-in
-                # ChatGPT/Gemini/Claude/NotebookLM accounts. Auto-resuming a run
-                # that a DIFFERENT worker was on would re-open it on THIS worker's
-                # (wrong) profile/account. Rehydration is worker-1-only, so only
-                # auto-resume runs this worker owns (assignedWorker == WORKER_ID)
-                # or that predate the field / were never stamped (None/"" → legacy
-                # or owner default → worker-1). A run owned by another worker
-                # falls through to the paused_backend_restart mark (safe: a Resume
-                # re-routes via claim) rather than being funneled onto worker-1's
-                # profile. That worker's OWN disk-restore (per-worker pending_queue
-                # snapshot) can still auto-recover it on the correct profile when
-                # the snapshot is intact — and _safe_enqueue's status read then
-                # sees paused_backend_restart and defers, so they don't both fire.
-                _assigned = data.get("assignedWorker")
-                _affinity_ok = _assigned in (None, "", WORKER_ID)
                 auto_resumed = False
-                if is_supervised and not _affinity_ok:
-                    log(
-                        f"[rehydrate] {research_id[:24]}… supervised but "
-                        f"assignedWorker={_assigned} != worker {WORKER_ID} — NOT "
-                        f"funneling onto this profile; marking paused_backend_restart "
-                        f"(its own worker's disk-restore / a Resume recovers it on "
-                        f"the correct profile)",
-                        "INFO",
-                    )
-                if is_supervised and _affinity_ok:
+                if _i_own and is_supervised:
                     run_id = data.get("backendRunId") or ""
                     if run_id:
                         queue_dir = Path(__file__).parent / "queues" / run_id
@@ -43272,12 +43319,14 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
                                     log(f"Rehydrate: auto-resumed {research_id[:24]}… on supervised device")
 
                 if not auto_resumed:
-                    # Either unsupervised, or supervised-but-couldn't-auto-resume
-                    # (queue_dir missing, run_id absent, .stop sentinel, etc.).
-                    # Mark paused_backend_restart so the FE recovery banner fires.
+                    # A run I OWN that couldn't auto-resume (unsupervised, or
+                    # supervised-but-no-artifacts: queue_dir missing, run_id
+                    # absent, .stop sentinel) OR an orphan run worker 1 is marking
+                    # as a safety net. Mark paused_backend_restart so the FE
+                    # recovery banner fires.
                     # #720: route through _update_research_doc so it gets
                     # _be_payload's deviceId injection AND the gRPC 403 self-heal
-                    # — this fires at worker-1 boot, the exact window a stale/
+                    # — this fires at worker boot, the exact window a stale/
                     # claim-propagation-race token would 403 and the FE Resume
                     # CTA never fire.
                     if _update_research_doc(tree_uid, research_id, {
@@ -45282,41 +45331,36 @@ async def run_server(port=8000):
             # the event loop and prevents uvicorn from binding port 8000 ->
             # `--resurrect` handoff fails its API health check.
             #
-            # Multi-worker (2026-05-21): only worker 1 runs the
-            # Firestore rehydration. Pre-fix, every worker would scan
-            # the same users/{uid}/researches collection, re-enqueue
-            # every queued doc into its own local job_queue, and both
-            # would race the same Browser(_profile_dir(K)) for the same
-            # backendRunId — double-running the pipeline. Disk-restore
-            # (the pending_queue_*.json snapshot) is per-worker file
-            # (commit 4) so it's already safe; only the Firestore-side
-            # rehydration needs gating. Workers 2+ rely on the listener
-            # claim path + idle-rescan to pick up unclaimed Firestore
-            # queue docs on next dequeue.
+            # Multi-worker (#966, 2026-07-16): EVERY worker runs the
+            # Firestore rehydration, keyed on per-run ownership inside
+            # _rehydrate_ongoing_for_tree — each worker auto-resumes the
+            # runs IT owns (on its own profile/account) and worker 1 alone
+            # marks orphan (out-of-fleet-owner) runs paused. Pre-fix this
+            # was worker-1-only, so a sibling-owned run left mid-flight by a
+            # fleet-wide respawn got funneled to paused_backend_restart (a
+            # needless Resume CTA): worker 1 can't re-open it on its own
+            # profile, and the owning worker never scanned Firestore. The
+            # re-enqueue race the old gate guarded against is now closed by
+            # that ownership check (queued docs aren't rehydrated; each
+            # worker only resumes runs it owns) plus the sibling-lock guard.
+            # Disk-restore (the per-worker pending_queue_*.json snapshot)
+            # stays the gap-filler for runs that never reached status=queued.
             rehydrated = 0
             orphaned = 0
-            if WORKER_ID == 1:
-                # #724 item 3 / #725 item 6: surface the flag state at boot so a
-                # validation run can confirm BOTH that the new code is loaded
-                # (this line exists) AND whether sharer-tree rehydration is armed
-                # — removes the PowerShell-`set`-didn't-take ambiguity. Reads
-                # env OR research_config.json (the env var didn't propagate to
-                # the relaunched daemon; the JSON fallback always does).
-                log(f"[rehydration] sharer-rehydration="
-                    f"{'on' if _sharer_rehydration_enabled() else 'off'} "
-                    f"(env={os.environ.get('ENABLE_SHARER_REHYDRATION') or 'unset'})", "INFO")
-            if WORKER_ID != 1:
-                log(f"[rehydration] worker {WORKER_ID}: skipping Firestore rehydration (worker-1-only)", "INFO")
+            # #724 item 3 / #725 item 6: surface the flag state at boot so a
+            # validation run can confirm BOTH that the new code is loaded
+            # (this line exists) AND whether sharer-tree rehydration is armed
+            # — removes the PowerShell-`set`-didn't-take ambiguity. Reads
+            # env OR research_config.json (the env var didn't propagate to
+            # the relaunched daemon; the JSON fallback always does).
+            log(f"[rehydration] worker {WORKER_ID}: sharer-rehydration="
+                f"{'on' if _sharer_rehydration_enabled() else 'off'} "
+                f"(env={os.environ.get('ENABLE_SHARER_REHYDRATION') or 'unset'})", "INFO")
             try:
-                if WORKER_ID != 1:
-                    raise _SkipRehydration()  # local sentinel, caught below
-                # #725 (DRY): owner-tree rehydration now delegates to the shared
-                # _rehydrate_ongoing_for_tree helper. The inline block this
-                # replaced was byte-for-byte the same logic (sibling-lock guard,
-                # modern-then-legacy supervised read, supervised auto-resume,
-                # paused_backend_restart mark); for the owner tree_uid ==
-                # owner_uid == paired_uid. Worker-gating, the _SkipRehydration
-                # sentinel, the sharer loop, and the aggregate log line stay here.
+                # #725 (DRY): owner-tree rehydration delegates to the shared
+                # _rehydrate_ongoing_for_tree helper (per-run worker ownership
+                # lives inside it). For the owner tree, tree_uid == owner_uid ==
+                # paired_uid. The sharer loop and the aggregate log line stay here.
                 if sys.stdout and sys.stdout.isatty():
                     async with _async_spinner_ctx("Recovering interrupted runs"):
                         _own_r, _own_o = await _rehydrate_ongoing_for_tree(
@@ -45373,10 +45417,6 @@ async def run_server(port=8000):
                         log(f"[rehydrate:sharers] scanned {len(_sharers)} sharer tree(s) (sharer-rehydration armed)")
                 if rehydrated or orphaned:
                     log(f"Queue rehydration: auto-resumed {rehydrated} supervised run(s), marked {orphaned} as paused_backend_restart")
-            except _SkipRehydration:
-                # Worker N≥2 — intentional skip, not an error. Already
-                # logged above; no-op here.
-                pass
             except Exception as e:
                 log(f"Queue rehydration failed: {e}", "WARN")
 

@@ -3,13 +3,15 @@
 Three independent BE hardening fixes, all latent (the 2026-06-01/02 multi-worker
 E2E ran clean — sibling-claim guards held), pinned here so they don't regress:
 
-(a) worker-1 funnel / worker-affinity: each worker runs on its OWN browser
+(a) worker funnel / worker-affinity: each worker runs on its OWN browser
     profile (_profile_dir(WORKER_ID)) = its own logged-in agent accounts. The
-    run-start ongoing-flip now stamps `assignedWorker = WORKER_ID`, and worker-1's
+    run-start ongoing-flip now stamps `assignedWorker = WORKER_ID`, and a worker's
     rehydration only AUTO-RESUMES a supervised run it owns (assignedWorker ==
-    WORKER_ID, or unset/legacy) — a run another worker was on falls through to
-    the paused_backend_restart mark instead of being re-opened on worker-1's
-    (wrong) profile/account.
+    WORKER_ID, or unset/legacy → worker 1) — a run another worker was on is left
+    for that worker (or, if its owner is out of the fleet, marked
+    paused_backend_restart) instead of being re-opened on this worker's (wrong)
+    profile/account. #966 generalized the gate from worker-1-only to per-worker
+    ownership (_owner_worker_of); the affinity guarantee here is unchanged.
 
 (b) disk-restore dedup: the BOOT disk-restore now passes a TIGHTER
     `allowed_statuses=("queued","ongoing")` to _safe_enqueue, so a run worker-1's
@@ -118,27 +120,36 @@ def test_run_start_stamps_assigned_worker():
 
 
 def test_rehydration_autoresume_gated_on_worker_affinity():
-    """worker-1's rehydration must only AUTO-RESUME a supervised run it owns
-    (assignedWorker == WORKER_ID / unset), never funnel another worker's run
-    onto its own profile."""
+    """Rehydration must only AUTO-RESUME a supervised run the CURRENT worker owns,
+    never funnel another worker's run onto its own profile. #966 generalized the
+    gate from worker-1-only to per-worker ownership via _owner_worker_of, but the
+    profile-affinity guarantee is unchanged (and now stronger — every worker
+    recovers its own runs)."""
     src = inspect.getsource(research._rehydrate_ongoing_for_tree)
     assert 'data.get("assignedWorker")' in src, (
         "rehydration must read the run's assignedWorker (#728)."
     )
-    assert "_affinity_ok" in src and "WORKER_ID" in src, (
-        "rehydration must compute a worker-affinity check (#728)."
+    # Ownership is derived from assignedWorker via the shared helper, then the
+    # current worker's identity (WORKER_ID) gates what it may auto-resume/mark.
+    assert "_owner_worker_of(" in src and "WORKER_ID" in src, (
+        "rehydration must derive the owning worker and compare to WORKER_ID "
+        "(#728/#966)."
     )
-    # The supervised auto-resume branch must require affinity.
-    assert "if is_supervised and _affinity_ok:" in src, (
-        "supervised auto-resume must be gated on worker affinity so a run owned "
-        "by another worker is NOT re-opened on this worker's profile (#728)."
+    # The supervised auto-resume branch must require that THIS worker owns the run.
+    assert "if _i_own and is_supervised:" in src, (
+        "supervised auto-resume must be gated on owning the run so a run owned by "
+        "another worker is NOT re-opened on this worker's profile (#728/#966)."
     )
-    # Unset / legacy assignedWorker must still auto-resume on worker-1 (no
-    # regression for single-worker installs / pre-#728 runs).
-    assert "in (None, \"\", WORKER_ID)" in src, (
-        "an unset/legacy assignedWorker must count as own-worker so single-worker "
-        "and pre-#728 runs still auto-resume (#728)."
-    )
+
+
+def test_unset_or_legacy_assignedworker_owned_by_worker1():
+    """An unset / blank / legacy assignedWorker must count as worker-1's own run
+    so single-worker installs and pre-#728 runs still auto-resume; a stamped
+    value routes to that worker (#728/#966)."""
+    assert research._owner_worker_of(None) == 1
+    assert research._owner_worker_of("") == 1
+    assert research._owner_worker_of(1) == 1
+    assert research._owner_worker_of(2) == 2
 
 
 # ── (c) synth-403 self-heal log noise — source-inspection guard ───────
