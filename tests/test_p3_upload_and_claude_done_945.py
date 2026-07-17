@@ -164,9 +164,9 @@ def test_agent_loop_retries_transient_5xx():
         "the 5xx retry must be inside the inner while-True around the "
         "create call, not the outer iteration loop"
     )
-    assert "_handled_elsewhere" in src, (
-        "the inner 5xx retry must exclude 429/529/rate-limit so those keep "
-        "their dedicated handling"
+    assert "not (_is_rate_limit or _is_overload)" in src, (
+        "the inner 5xx retry must exclude 429/529/rate-limit (#61 gives those "
+        "their own in-place bounded retry + paused-blocker escalation)"
     )
 
 

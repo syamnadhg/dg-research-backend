@@ -15471,7 +15471,8 @@ def _agent_error_alert_id(agent_key: str, phase: "int | None" = None) -> str:
 
 
 def fail_agent(agent_key: str, title: str, details: str = "", skip_only: bool = False,
-               phase: "int | None" = None, auto_skip_deadline: "float | None" = None):
+               phase: "int | None" = None, auto_skip_deadline: "float | None" = None,
+               recoverability: "str | None" = None):
     """Template B: per-agent error alert (Phase 2 in the common case). Emits
     pipeline_error scoped to one agent with [Retry, Skip]. NO Stop. #955: the
     single "Retry" restarts the agent (close tab + re-run setup) — the only
@@ -15531,11 +15532,17 @@ def fail_agent(agent_key: str, title: str, details: str = "", skip_only: bool = 
     # P2 context, fired by _fire_due_autoskips on the tick). skip_only never arms
     # here even though its class is auto-skip-eligible (emit_decision drops the
     # deadline for it via the skip_only guard below).
+    # #61: a caller may force `recoverability="blocker"` to mark a run-level
+    # must-act failure (a dead/capped/rate-limited Anthropic key that survived
+    # the silent-retry budget) — emit_decision honors an explicit override even
+    # with an intent set, so the card is un-auto-skippable AND the FE can never
+    # swallow it into the quiet-infra banner (it gates on recoverability!="blocker").
     emit_decision(phase=_eff_phase, agent=agent_key,
                   intent=("agent_failed_handsoff" if skip_only else "agent_failed"),
                   facts={"title": title, "details": details, "agent": agent_key},
                   alert_id=_agent_error_alert_id(agent_key, _eff_phase),
-                  auto_skip_deadline=(None if skip_only else auto_skip_deadline))
+                  auto_skip_deadline=(None if skip_only else auto_skip_deadline),
+                  recoverability=recoverability)
     # 2026-07-13: stamp the emit so the caller's GENERIC "didn't start" card
     # doesn't fire seconds later and OVERWRITE this (same alert_id) with a
     # less specific message — the 03:42 run persisted "Couldn't send the
@@ -21206,6 +21213,15 @@ async def agent_loop(client, browser, system_prompt, user_message,
     last_text = ""
     recent_actions = []
     transient_api_retries = 0
+    # #61: mission-wide budgets for the transient-then-escalate Anthropic classes.
+    # A 429/529 that clears within budget self-heals SILENTLY (no card — matches
+    # decision #2 + the FE isAnthropicRuntimeError quiet set); one that survives
+    # the budget escalates to a paused blocker card (#705: a persistent rate-limit
+    # / overload must not hide behind a forever-"retrying" banner and strand the
+    # run). Placed before the loop so the budget is cumulative across iterations —
+    # the 429/529 branches `continue` back into the loop without resetting them.
+    rate_limit_retries = 0
+    overload_retries = 0
 
     for iteration in range(1, max_iterations + 1):
         # ── Check stop/pause before each CUA API call ──
@@ -21244,9 +21260,30 @@ async def agent_loop(client, browser, system_prompt, user_message,
                     _is_5xx = ("internal server error" in _api_l
                                or "api_error" in _api_l
                                or re.search(r"error code:\s*5\d\d", _api_l))
-                    _handled_elsewhere = ("overloaded" in _api_l or "529" in _api_s
-                                          or "429" in _api_s or "rate_limit" in _api_l)
-                    if _is_5xx and not _handled_elsewhere and transient_api_retries < 3:
+                    _is_rate_limit = ("429" in _api_s or "rate_limit" in _api_l)
+                    _is_overload = ("overloaded" in _api_l or "529" in _api_s)
+                    # #61: 429/529 are transient — bounded SILENT retry IN PLACE
+                    # (the same shape as the 5xx path below) so the backoff never
+                    # burns a mission iteration. Retrying via the OUTER loop's
+                    # `continue` instead would drain a short-budget caller
+                    # (max_iterations ≤ budget) before the escalation could fire,
+                    # returning a mute status="max_iterations" with no card. Only
+                    # once the mission-wide budget is spent do we `raise` to the
+                    # paused-blocker escalation in the outer handler. Stop-aware:
+                    # a Stop skips the retry so it lands within the current sleep,
+                    # not after the whole 90s / 5-min backoff.
+                    if _is_rate_limit and rate_limit_retries < 3 and not _controls.is_stop():
+                        rate_limit_retries += 1
+                        log(f"Claude API rate limited (429) — transient retry "
+                            f"{rate_limit_retries}/3 in 30s: {_api_s[:160]}", "WARN")
+                        await asyncio.sleep(30)
+                        continue
+                    if _is_overload and overload_retries < 5 and not _controls.is_stop():
+                        overload_retries += 1
+                        log(f"API overloaded (529) — transient retry {overload_retries}/5 in 60s", "WARN")
+                        await asyncio.sleep(60)
+                        continue
+                    if _is_5xx and not (_is_rate_limit or _is_overload) and transient_api_retries < 3:
                         transient_api_retries += 1
                         log(f"API transient 5xx — retry {transient_api_retries}/3 "
                             f"in 20s: {_api_s[:160]}", "WARN")
@@ -21262,37 +21299,72 @@ async def agent_loop(client, browser, system_prompt, user_message,
             _phase = phase if phase is not None else _runtime.phase
             _agent = agent_name or None
             low = err.lower()
+            # #61: a Stop during the in-place transient backoff (or any error the
+            # user chose to abort through) returns cleanly — never fire a card.
+            if _controls.is_stop():
+                return {"status": "stopped", "text": last_text}
             if "rate_limit" in low or "429" in err:
-                # #705: a 429 is a key/quota problem the user must act on —
-                # switching to another key clears it. Don't silent-retry (that
-                # hid a persistent rate limit and made the alert appear-then-
-                # vanish); pause immediately with a Retry-only 'load or switch
-                # your key' card, same as the cap / key-rejected branches below.
-                log(f"Claude API rate limited (429) — pausing for key action: {err[:160]}", "ERROR")
+                # #61: reached here only AFTER the in-place silent-retry budget (in
+                # the create loop above) is exhausted — a PERSISTENT 429 is a
+                # key/quota problem the user must act on (#705 preserved via
+                # escalation, not pause-on-first-429). Escalate to a paused BLOCKER
+                # whose title dodges the FE quiet set ("rate limit" with a SPACE ≠
+                # "rate_limit"/"rate-limit", no "429"), so it can never be swallowed
+                # into "retrying automatically" while the run sits paused — the
+                # appear-then-vanish strand #705 feared (which the OLD title "API
+                # key is rate-limited" still caused).
+                log(f"Claude API 429 persisted past the retry budget "
+                    f"— escalating to paused key card: {err[:160]}", "ERROR")
                 _rl_msg = _anthropic_key_card_copy("rate_limit")
                 if _phase == 2 and _agent:
-                    fail_agent(_agent, "API key is rate-limited", _rl_msg)
+                    fail_agent(_agent, "API key rate limit persists", _rl_msg,
+                               recoverability="blocker")
                 else:
-                    fail_phase(_phase, "API key is rate-limited", _rl_msg)
+                    fail_phase(_phase, "API key rate limit persists", _rl_msg,
+                               recoverability="blocker")
                 return {"status": "error", "text": str(e)}
             elif "overloaded" in low or "529" in err:
-                log("API overloaded — waiting 60s", "WARN")
-                await asyncio.sleep(60); continue
+                # #61: reached here only AFTER the in-place 529 retry budget is
+                # exhausted — a sustained Anthropic outage. Escalate to a paused
+                # blocker (the user can wait it out or Stop; Retry re-probes once
+                # Anthropic recovers). The old unbounded sleep(60)+continue silently
+                # burned the whole iteration budget and ended as a mute
+                # status="max_iterations" partial with no actionable card. Title
+                # carries no "overloaded"/"529" substring so it never re-enters the
+                # FE quiet branch (belt; recoverability="blocker" is the real guard).
+                log("API overloaded (529) persisted past the retry budget — escalating to paused card", "ERROR")
+                _ov_msg = ("Anthropic's servers are overloaded and haven't recovered. "
+                           "Wait a few minutes and Retry, or Stop the run.")
+                if _phase == 2 and _agent:
+                    fail_agent(_agent, "AI service unavailable", _ov_msg,
+                               recoverability="blocker")
+                else:
+                    fail_phase(_phase, "AI service unavailable", _ov_msg,
+                               recoverability="blocker")
+                return {"status": "error", "text": str(e)}
             elif "workspace api usage limits" in low or ("400" in err and "usage limit" in low):
                 log(f"Workspace API cap hit — aborting CUA loop: {err[:200]}", "ERROR")
                 _cap_hint = _anthropic_key_card_copy("cap")
+                # #61: a workspace cap is a genuine must-act key problem — mark it a
+                # blocker (class-honesty; keeps the per-agent card, adds the FE
+                # un-swallowable gate). Title already dodges the FE quiet set.
                 if _phase == 2 and _agent:
-                    fail_agent(_agent, "API key is over its limit", _cap_hint)
+                    fail_agent(_agent, "API key is over its limit", _cap_hint,
+                               recoverability="blocker")
                 else:
-                    fail_phase(_phase, "API key is over its limit", _cap_hint)
+                    fail_phase(_phase, "API key is over its limit", _cap_hint,
+                               recoverability="blocker")
                 return {"status": "error", "text": str(e)}
             elif "401" in err and ("unauthorized" in low or "invalid" in low or "api_key" in low):
                 log(f"Claude API key rejected — aborting CUA loop: {err[:200]}", "ERROR")
                 _bad_key_hint = _anthropic_key_card_copy("invalid")
+                # #61: a rejected key is must-act — mark it a blocker (class-honesty).
                 if _phase == 2 and _agent:
-                    fail_agent(_agent, "API key was rejected", _bad_key_hint)
+                    fail_agent(_agent, "API key was rejected", _bad_key_hint,
+                               recoverability="blocker")
                 else:
-                    fail_phase(_phase, "API key was rejected", _bad_key_hint)
+                    fail_phase(_phase, "API key was rejected", _bad_key_hint,
+                               recoverability="blocker")
                 return {"status": "error", "text": str(e)}
             else:
                 # Transient 5xx already exhausted its bounded in-place retries
