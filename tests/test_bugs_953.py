@@ -101,7 +101,8 @@ def test_fail_agent_guarded_by_final_streaming_probe():
     # The false "couldn't start" card fired on an agent that was mid-research.
     # A final scrape must veto the card when Gemini is actively generating.
     i_final = P2_SRC.index("_final_streaming")
-    i_card = P2_SRC.index('"gemini", "Gemini couldn\'t start Deep Research"', i_final)
+    # #63: couldn't-start copy centralized in the _GEMINI_CANT_START constant.
+    i_card = P2_SRC.index('fail_agent("gemini", *_GEMINI_CANT_START)', i_final)
     assert i_final < i_card
     assert "elif not _controls.is_stop():" in P2_SRC
 

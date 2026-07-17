@@ -15470,6 +15470,33 @@ def _agent_error_alert_id(agent_key: str, phase: "int | None" = None) -> str:
     return f"phase{_p}_agent_{agent_key}_error"
 
 
+# #63: single-source the two P2 agent-error copies that were duplicated across
+# their emit sites (5× "Gemini couldn't start", 4× "Couldn't send the brief").
+# Behavior is unchanged — each caller keeps its own guards / control flow; only
+# the user-facing strings move here so a future edit can't drift one site out of
+# sync (the class of the #929 "internal step label leaked into copy" bug).
+_GEMINI_CANT_START = (
+    "Gemini couldn't start Deep Research",
+    "Gemini didn't begin its research — likely a platform-side glitch. "
+    "Retry to try again, or Skip to continue without it.",
+)
+
+
+def _brief_send_fail_copy(platform: str, *, rejected: bool = False) -> "tuple[str, str]":
+    """(title, details) for the per-agent "Couldn't send the brief to {platform}"
+    card. One title, two bodies: the default hand-off failure, and `rejected=True`
+    for the paste/chip path where the surface accepted keystrokes but kept bouncing
+    the brief. Pass the display name (e.g. "Gemini"), never the internal step tag."""
+    title = f"Couldn't send the brief to {platform}"
+    if rejected:
+        details = (f"{platform} kept rejecting the brief upload. "
+                   "Retry to try again, or Skip it.")
+    else:
+        details = (f"We couldn't hand the research brief to {platform}. "
+                   "Retry to try again, or Skip it.")
+    return title, details
+
+
 def fail_agent(agent_key: str, title: str, details: str = "", skip_only: bool = False,
                phase: "int | None" = None, auto_skip_deadline: "float | None" = None,
                recoverability: "str | None" = None):
@@ -21320,8 +21347,21 @@ async def agent_loop(client, browser, system_prompt, user_message,
                     fail_agent(_agent, "API key rate limit persists", _rl_msg,
                                recoverability="blocker")
                 else:
+                    # #63: distinct alert_id (was the generic phase{n}_error).
+                    # The four Anthropic key cards (rate-limit / overload / cap /
+                    # rejected) are distinct blockers that can SEQUENCE at one
+                    # phase (e.g. rate-limit → user swaps key → Retry → rejected).
+                    # Sharing phase{n}_error meant the FE dismiss-resurface ledger
+                    # (store.ts, keyed on alert_id) let a dismissed earlier card
+                    # silence the later one within its 5-min window — a paused run
+                    # with no visible reason. Distinct ids can't cross-silence and
+                    # don't double-card (phaseAlerts is one slot per phase, so it's
+                    # still last-write-wins on the tile). The P2 per-agent path
+                    # above keeps phase{n}_agent_{key}_error on purpose — that's the
+                    # intentional one-card-per-agent slot.
                     fail_phase(_phase, "API key rate limit persists", _rl_msg,
-                               recoverability="blocker")
+                               recoverability="blocker",
+                               alert_id=f"phase{_phase}_ai_rate_limit")
                 return {"status": "error", "text": str(e)}
             elif "overloaded" in low or "529" in err:
                 # #61: reached here only AFTER the in-place 529 retry budget is
@@ -21340,7 +21380,8 @@ async def agent_loop(client, browser, system_prompt, user_message,
                                recoverability="blocker")
                 else:
                     fail_phase(_phase, "AI service unavailable", _ov_msg,
-                               recoverability="blocker")
+                               recoverability="blocker",
+                               alert_id=f"phase{_phase}_ai_unavailable")  # #63: distinct id
                 return {"status": "error", "text": str(e)}
             elif "workspace api usage limits" in low or ("400" in err and "usage limit" in low):
                 log(f"Workspace API cap hit — aborting CUA loop: {err[:200]}", "ERROR")
@@ -21353,7 +21394,8 @@ async def agent_loop(client, browser, system_prompt, user_message,
                                recoverability="blocker")
                 else:
                     fail_phase(_phase, "API key is over its limit", _cap_hint,
-                               recoverability="blocker")
+                               recoverability="blocker",
+                               alert_id=f"phase{_phase}_ai_cap")  # #63: distinct id
                 return {"status": "error", "text": str(e)}
             elif "401" in err and ("unauthorized" in low or "invalid" in low or "api_key" in low):
                 log(f"Claude API key rejected — aborting CUA loop: {err[:200]}", "ERROR")
@@ -21364,7 +21406,8 @@ async def agent_loop(client, browser, system_prompt, user_message,
                                recoverability="blocker")
                 else:
                     fail_phase(_phase, "API key was rejected", _bad_key_hint,
-                               recoverability="blocker")
+                               recoverability="blocker",
+                               alert_id=f"phase{_phase}_ai_key_rejected")  # #63: distinct id
                 return {"status": "error", "text": str(e)}
             else:
                 # Transient 5xx already exhausted its bounded in-place retries
@@ -23451,10 +23494,7 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
             # — re-raise the Retry/Skip alert immediately (close the gap where a
             # second failure silently dropped to the wall-clock cap). dedup-safe.
             if not _controls.is_stop():
-                fail_agent(
-                    "gemini", "Gemini couldn't start Deep Research",
-                    "Gemini didn't begin its research — likely a platform-side glitch. "
-                    "Retry to try again, or Skip to continue without it.")
+                fail_agent("gemini", *_GEMINI_CANT_START)  # #63: centralized copy
             return (new_page, False)
         verified = await wait_until_verified(
             verify_gemini_generating, new_page, "2B-retry",
@@ -34847,8 +34887,8 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                     # #929: `platform` (display name, e.g. "Gemini"), never
                     # `label` — that's the internal step tag ("2C") and it
                     # leaked into user-facing copy ("…hand the brief to 2C").
-                    fail_agent(platform_l, f"Couldn't send the brief to {platform}",
-                               f"We couldn't hand the research brief to {platform}. Retry to try again, or Skip it.")
+                    # #63: copy centralized in _brief_send_fail_copy.
+                    fail_agent(platform_l, *_brief_send_fail_copy(platform))
                 return page, False
     else:
         # Inline paste path — engaged in two cases:
@@ -34880,8 +34920,8 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             # probe before blaming the paste machinery.
             if not await _hv_setup_fail_card(browser, page, platform, label):
                 # #929: platform display name, not the internal step label.
-                fail_agent(platform_l, f"Couldn't send the brief to {platform}",
-                           f"We couldn't hand the research brief to {platform}. Retry to try again, or Skip it.")
+                # #63: copy centralized in _brief_send_fail_copy.
+                fail_agent(platform_l, *_brief_send_fail_copy(platform))
             return page, False
 
     # ── Paste→chip top-up (2026-07-13) ──
@@ -35123,9 +35163,8 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 # kind=chat_mode, and its fail-card Retry is silently converted
                 # to a skip by the parked resolver.
                 _controls.chat_mode_pending.pop(platform_l, None)
-                fail_agent(platform_l, f"Couldn't send the brief to {platform}",
-                           f"{platform} kept rejecting the brief upload. "
-                           f"Retry to try again, or Skip it.")
+                # #63: copy centralized in _brief_send_fail_copy (rejected variant).
+                fail_agent(platform_l, *_brief_send_fail_copy(platform, rejected=True))
                 return page, False
     elif _paste_chip_head is not None:
         # Converted-paste twin of the check above: the "Pasted text" chip is
@@ -35146,9 +35185,8 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 # Gap #1: undo the tentative chat_mode marker — see the attach-path
                 # twin above (a Send-failed /c/-alive agent must not park chat_mode).
                 _controls.chat_mode_pending.pop(platform_l, None)
-                fail_agent(platform_l, f"Couldn't send the brief to {platform}",
-                           f"{platform} kept rejecting the brief upload. "
-                           f"Retry to try again, or Skip it.")
+                # #63: copy centralized in _brief_send_fail_copy (rejected variant).
+                fail_agent(platform_l, *_brief_send_fail_copy(platform, rejected=True))
                 return page, False
 
     _send_sels = ['button[data-testid="send-button"]', 'button[aria-label="Send prompt"]',
@@ -35411,9 +35449,7 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                         "surfacing the Retry/Skip blocker (refusing to confirm on the "
                         "wrong chat)", "ERROR")
                     try:
-                        fail_agent("gemini", "Gemini couldn't start Deep Research",
-                                   "Gemini didn't begin its research — likely a platform-side glitch. "
-                                   "Retry to try again, or Skip to continue without it.")
+                        fail_agent("gemini", *_GEMINI_CANT_START)  # #63: centralized copy
                     except Exception:
                         pass
                     return page, False
@@ -35502,9 +35538,7 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             log(f"[{label}] Gemini brief never started a research plan after "
                 f"{_max_attempts} retries — surfacing a Retry/Skip blocker (no silent skip)", "ERROR")
             try:
-                fail_agent("gemini", "Gemini couldn't start Deep Research",
-                           "Gemini didn't begin its research — likely a platform-side glitch. "
-                           "Retry to try again, or Skip to continue without it.")
+                fail_agent("gemini", *_GEMINI_CANT_START)  # #63: centralized copy
             except Exception:
                 pass
             return page, False
@@ -36348,9 +36382,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                     f"(regens={_regen_count}) — surfacing early [Retry][Skip] card "
                     "(non-blocking; recovery continues)", "WARN")
                 try:
-                    fail_agent("gemini", "Gemini couldn't start Deep Research",
-                               "Gemini didn't begin its research — likely a platform-side glitch. "
-                               "Retry to try again, or Skip to continue without it.")
+                    fail_agent("gemini", *_GEMINI_CANT_START)  # #63: centralized copy
                 except Exception:
                     pass
 
@@ -36585,10 +36617,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                     log("[2D] Final probe: Gemini is streaming — suppressing the "
                         "'couldn't start' card and handing off to the round-robin", "INFO")
                 elif not _controls.is_stop():
-                    fail_agent(
-                        "gemini", "Gemini couldn't start Deep Research",
-                        "Gemini didn't begin its research — likely a platform-side glitch. "
-                        "Retry to try again, or Skip to continue without it.")
+                    fail_agent("gemini", *_GEMINI_CANT_START)  # #63: centralized copy
 
         # Verify Gemini is actually researching. #755: on Stop, skip the ~45s
         # DOM-verify retry churn — record not-verified and let the stop-aware

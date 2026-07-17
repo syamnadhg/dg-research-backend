@@ -108,14 +108,16 @@ def test_failed_adopt_normalizes_to_home_and_fails_safe_if_stranded():
     assert "not _adopted and _gemini_in_conversation()" in seg
     assert 'page.goto("https://gemini.google.com/app"' in seg
     # stranded-and-can't-leave → terminal blocker + return False (safe fail)
-    assert 'fail_agent("gemini", "Gemini couldn\'t start Deep Research"' in seg
+    # #63: couldn't-start copy centralized in the _GEMINI_CANT_START constant.
+    assert 'fail_agent("gemini", *_GEMINI_CANT_START)' in seg
     assert "return page, False" in seg
 
 
 def test_total_failure_still_escalates_to_the_terminal_blocker():
     # Adoption found nothing AND every re-submit failed → terminal Retry/Skip
     # blocker (never a silent drop; the round-robin auto-skips if unattended).
-    assert 'fail_agent("gemini", "Gemini couldn\'t start Deep Research"' in _GEM
+    # #63: couldn't-start copy centralized in the _GEMINI_CANT_START constant.
+    assert 'fail_agent("gemini", *_GEMINI_CANT_START)' in _GEM
     assert "no silent skip" not in _GEM.lower() or "auto-skips Gemini" in _GEM
 
 

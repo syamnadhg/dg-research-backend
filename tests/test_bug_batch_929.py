@@ -293,5 +293,12 @@ def test_brief_fail_copy_uses_platform_not_label():
     # third fail site (chip lost at send time), same platform-name rule.
     # 2026-07-13 (#950): 3 -> 4 — the converted-paste twin of that re-check
     # (pasted-text chip lost at send time) added a fourth.
-    assert _GEM.count('f"Couldn\'t send the brief to {platform}"') == 4
+    # #63: the copy is centralized in _brief_send_fail_copy; the four sites now
+    # PASS the display name to it. The platform-name rule is enforced by (a) all
+    # four sites passing `platform`, never `label`, and (b) the helper using the
+    # {platform} placeholder.
+    assert _GEM.count("_brief_send_fail_copy(platform") == 4
+    assert "_brief_send_fail_copy(label" not in _GEM
     assert "brief to {label}" not in _GEM
+    _copy_src = inspect.getsource(research._brief_send_fail_copy)
+    assert 'f"Couldn\'t send the brief to {platform}"' in _copy_src

@@ -234,7 +234,10 @@ def test_gemini_submit_retries_standardized_to_3():
 def test_gemini_2d_raises_early_card():
     assert "_plan_alert_emitted" in _P2
     assert "_PLAN_ALERT_SEC" in _P2
-    assert "Gemini couldn't start Deep Research" in _P2
+    # #63: the 2D early card's couldn't-start copy is centralized in the
+    # _GEMINI_CANT_START constant; the site spreads it.
+    assert 'fail_agent("gemini", *_GEMINI_CANT_START)' in _P2
+    assert research._GEMINI_CANT_START[0] == "Gemini couldn't start Deep Research"
     # Non-blocking + retracted if the plan recovers.
     assert "Retracted the early plan-stall card" in _P2
 

@@ -71,9 +71,12 @@ def test_2c_confirmation_has_bounded_retry_loop():
 
 def test_2c_persistent_failure_raises_blocker_not_silent_skip():
     # a real Retry/Skip blocker on persistent failure ...
-    assert 'fail_agent("gemini", "Gemini couldn' in MODSRC, (
+    # #63: the couldn't-start copy is centralized in the _GEMINI_CANT_START
+    # constant; the persistent-failure site spreads it.
+    assert 'fail_agent("gemini", *_GEMINI_CANT_START)' in MODSRC, (
         "persistent Gemini submit failure must call fail_agent (no silent skip)"
     )
+    assert research._GEMINI_CANT_START[0] == "Gemini couldn't start Deep Research"
     # ... and the old single-resubmit silent fail-fast log is gone
     assert "skips the 10-min plan wait" not in MODSRC, (
         "old silent fail-fast path should be replaced by the retry loop + blocker"

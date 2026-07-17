@@ -159,7 +159,10 @@ def test_plan_failure_raises_retry_skip_alert_promptly():
     # #921: title tightened to "Gemini couldn't start Deep Research" (unified
     # across all sites — the [2C] submit exhaustion, the [2D] early + terminal
     # cards, and the failed-user-retry all share it).
-    assert MODSRC.count("Gemini couldn't start Deep Research") >= 3, (
+    # #63: the couldn't-start copy now lives in the _GEMINI_CANT_START constant;
+    # the [2C], [2D], and failed-user-retry sites (≥3 of the 5) spread it.
+    assert research._GEMINI_CANT_START[0] == "Gemini couldn't start Deep Research"
+    assert MODSRC.count('fail_agent("gemini", *_GEMINI_CANT_START)') >= 3, (
         "fail_agent for an unstartable Gemini plan must fire at [2C], [2D], and on a "
         "failed user-retry"
     )
