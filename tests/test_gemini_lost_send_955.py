@@ -10,9 +10,16 @@ never ran). Phase 2G:
   1. ADOPT-FIRST: find + adopt the owned, brief-matching, pre-Start conversation
      (sibling tab / sidebar most-recent) BEFORE any re-submit. Only a genuine
      dropped send (adoption finds nothing) falls through to the re-paste ladder.
-  2. ONE honest reconnect card visible throughout the ladder (not just a terminal
-     blocker at the very end), retracted the instant we reconnect, escalated to
-     the terminal Retry/Skip blocker only on total failure.
+  2. SILENT self-heal (e2e 2026-07-16): the recovery raises NO alert and does NOT
+     pause. The earlier build emitted a recoverable [Retry][Skip] card here (a
+     pipeline_error the FE auto-pauses on) BEFORE even attempting the sidebar
+     adopt — which normally resolves in seconds — and its "retract" was only a
+     pipeline_warning that neither un-paused the FE nor cleared the card, so an
+     adopt-SUCCESS stranded the run "Paused" needing a manual resume. Now: a
+     single agent_progress heartbeat keeps the tile alive during a quiet recovery
+     (a 2-3 min ladder is well inside the 30-min P2 event-silence watchdog), and
+     ONLY when recovery is EXHAUSTED does the terminal fail_agent [Retry][Skip]
+     blocker fire — the one genuine user-action alert.
   3. The mid-run kickoff nudge no longer resets the stall clocks (that deferred
      the unified auto-skip ~7 min per nudge).
 
@@ -54,33 +61,38 @@ def test_adopt_success_returns_without_repasting():
     assert "return page, True" in tail
 
 
-# ── 2. one honest reconnect card ─────────────────────────────────────────────
+# ── 2. silent self-heal (no pausing card during recovery) ────────────────────
 
-def test_reconnect_card_uses_the_unified_seam_as_recoverable():
-    assert "_emit_gemini_recovery_card" in _GEM
-    # authored via emit_decision as the recoverable agent_failed intent (NOT
-    # fail_agent — that would persist an errored red tile while merely reconnecting).
-    assert 'intent="agent_failed"' in _GEM
+def test_lost_send_recovery_raises_no_pausing_card():
+    # The old build emitted a recoverable [Retry][Skip] card (pipeline_error →
+    # FE auto-pause) the moment the URL read bare /app — before even trying the
+    # adopt. That machinery is GONE (removed, not shadowed): no emit helper, no
+    # retract helper, no shared alert-id var, and no agent_failed decision in
+    # this function (the terminal fail_agent authors its own downstream).
+    assert "_emit_gemini_recovery_card" not in _GEM
+    assert "_retract_gemini_recovery_card" not in _GEM
+    assert "_gem_alert_id" not in _GEM
+    assert 'intent="agent_failed"' not in _GEM
+
+
+def test_recovery_shows_a_silent_agent_progress_not_an_alert():
+    # A single non-blocking agent_progress keeps the tile alive during the quiet
+    # recovery — a status, NOT an alert (no actions, no pause).
+    assert 'emit_event("agent_progress", phase=2, agent="gemini"' in _GEM
     assert "Reconnecting to Gemini" in _GEM
-    # emitted BEFORE adoption so it's visible for the whole ladder.
-    assert _GEM.index("_emit_gemini_recovery_card()") < _GEM.index("_gemini_adopt_lost_conversation(")
+    assert "silent self-heal" in _GEM
+    # …and it's emitted BEFORE the adopt so the tile isn't dead during it.
+    assert _GEM.index('emit_event("agent_progress"') < _GEM.index("_gemini_adopt_lost_conversation(")
 
 
-def test_reconnect_card_retracts_on_every_success_path():
-    # Retracted on BOTH adoption success AND re-submit-landed success.
-    assert '_retract_gemini_recovery_card("adopted lost conversation")' in _GEM
-    assert '_retract_gemini_recovery_card("re-submit landed")' in _GEM
-    # Retract = pipeline_warning on the SAME alert_id + clear the durable mirror.
-    _rt = _GEM.index("def _retract_gemini_recovery_card")
-    _body = _GEM[_rt:_rt + 700]
-    assert 'emit_event("pipeline_warning", phase=2, agent="gemini"' in _body
-    assert '_clear_pending_decision("gemini")' in _body
-
-
-def test_reconnect_card_shares_the_gemini_error_alert_id():
-    # Single-card contract: reconnect card, its retraction, and the terminal
-    # blocker all key on the SAME gemini error alert_id (updates in place).
-    assert '_gem_alert_id = _agent_error_alert_id("gemini", 2)' in _GEM
+def test_adopt_and_resubmit_success_paths_are_silent():
+    # On BOTH silent-recovery success paths we just log + return page,True —
+    # there is no card to clear (none was ever shown).
+    assert _GEM.count("return page, True") >= 2
+    i_adopt = _GEM.index("adopted lost conversation")
+    assert "return page, True" in _GEM[i_adopt:i_adopt + 200]
+    i_resub = _GEM.index("re-submit landed")
+    assert "return page, True" in _GEM[i_resub:i_resub + 200]
 
 
 def test_failed_adopt_normalizes_to_home_and_fails_safe_if_stranded():
@@ -90,7 +102,7 @@ def test_failed_adopt_normalizes_to_home_and_fails_safe_if_stranded():
     # and the ladder we force the tab back to the empty home — and if it STILL
     # won't leave, we fail to the terminal blocker rather than let the ladder
     # misread the stale chat as a landing and confirm on the WRONG conversation.
-    i_adopt = _GEM.index('_retract_gemini_recovery_card("adopted lost conversation")')
+    i_adopt = _GEM.index('adopted lost conversation')
     i_ladder = _GEM.index("_max_attempts = 3")
     seg = _GEM[i_adopt:i_ladder]
     assert "not _adopted and _gemini_in_conversation()" in seg

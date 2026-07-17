@@ -35235,55 +35235,31 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             # /app). #955 Phase 2G: ADOPT that lost conversation FIRST — re-pasting
             # first (the old order) spawned a DUPLICATE run into a fresh chat and
             # orphaned the real one. Only a genuine dropped send (adoption finds
-            # nothing) falls through to the re-paste/re-submit ladder. Throughout,
-            # ONE honest recovery card is visible (not just a terminal blocker at
-            # the very end), retracted the instant we reconnect.
+            # nothing) falls through to the re-paste/re-submit ladder. The whole
+            # recovery is SILENT (see below) — no alert, no pause — with the
+            # terminal blocker firing ONLY if every recovery path is exhausted.
 
-            # ── One honest recovery card, shared alert_id (updates in place) ──
-            _recovery_carded = False
-            _gem_alert_id = _agent_error_alert_id("gemini", 2)
-
-            def _emit_gemini_recovery_card():
-                nonlocal _recovery_carded
-                if _recovery_carded:
-                    return
-                try:
-                    # recoverable [Retry (hard)][Skip] via the catalog — NOT
-                    # fail_agent (which would persist an "errored" red tile while
-                    # we're merely reconnecting). Escalated to the terminal
-                    # blocker via fail_agent (same alert_id) only if all recovery
-                    # fails; retracted the instant we reconnect.
-                    emit_decision(
-                        phase=2, agent="gemini", intent="agent_failed",
-                        title="Reconnecting to Gemini's research…",
-                        details=("Gemini's tab landed on an empty page after the brief "
-                                 "was sent. Reconnecting to its research — this can take "
-                                 "a minute. Retry to force a fresh start, or Skip to "
-                                 "continue without it."),
-                        alert_id=_gem_alert_id)
-                    _recovery_carded = True
-                except Exception:
-                    pass
-
-            def _retract_gemini_recovery_card(where: str):
-                nonlocal _recovery_carded
-                if not _recovery_carded:
-                    return
-                try:
-                    emit_event("pipeline_warning", phase=2, agent="gemini",
-                               error="Gemini reconnected",
-                               details="Gemini's research reconnected and is running.",
-                               actions=[], alert_id=_gem_alert_id,
-                               auto_clear_on_resume=True)
-                    _clear_pending_decision("gemini")
-                except Exception:
-                    pass
-                _recovery_carded = False
-                log(f"[{label}] Retracted the Gemini reconnect card ({where})", "INFO")
-
+            # ── Silent self-heal (no alert) ──
+            # #955 (e2e 2026-07-16): the lost-send recovery is a SELF-HEAL, not a
+            # user-action gate — so it must NOT raise an alert and must NOT pause.
+            # The old code emitted a recoverable [Retry][Skip] card HERE (a
+            # pipeline_error the FE auto-pauses on) BEFORE even attempting the
+            # sidebar adopt — which normally resolves in seconds. Its "retract" only
+            # emitted a pipeline_warning, which neither un-pauses the FE nor clears
+            # the card, so an adopt-SUCCESS stranded the run "Paused" needing a
+            # manual resume (the exact live report). We recover QUIETLY instead: a
+            # single agent_progress keeps the tile alive (a 2-3 min recovery is well
+            # inside the 30-min P2 event-silence watchdog window) with no pausing
+            # alert. Only if recovery is EXHAUSTED does the terminal fail_agent
+            # [Retry][Skip] blocker fire below — the one genuine user-action alert.
             log(f"[{label}] Gemini submission not confirmed (URL still bare /app) — "
-                "adopting a lost conversation before any re-submit", "WARN")
-            _emit_gemini_recovery_card()
+                "adopting a lost conversation before any re-submit (silent self-heal)", "WARN")
+            try:
+                emit_event("agent_progress", phase=2, agent="gemini",
+                           status="starting",
+                           progress="Reconnecting to Gemini's research…")
+            except Exception:
+                pass
 
             # ── Adopt FIRST (correctness) ──
             # The send may have SUCCEEDED into a conversation our tab never routed
@@ -35320,7 +35296,7 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                                 log(f"[{label}] closed the abandoned bare-/app tab", "INFO")
                         except Exception:
                             pass
-                    _retract_gemini_recovery_card("adopted lost conversation")
+                    # Adopt succeeded — a silent self-heal (no card was ever shown).
                     log(f"[{label}] Gemini submission confirmed ✓ (adopted lost conversation)")
                     return page, True
 
@@ -35431,17 +35407,16 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                     break
             if _landed or _gemini_in_conversation():
                 # A re-submit created the conversation (the send really was
-                # dropped, now recovered) — retract the reconnect card.
-                _retract_gemini_recovery_card("re-submit landed")
+                # dropped, now recovered) — a silent self-heal, no card to clear.
                 log(f"[{label}] Gemini submission confirmed ✓ (re-submit landed)")
                 return page, True
-            # Adoption found nothing AND every re-submit failed → escalate the
-            # reconnect card to the terminal Retry/Skip blocker (same alert_id →
-            # updates in place; fail_agent also persists the errored tile). The
-            # card is shown FIRST (never a silent drop) — if the user doesn't act
-            # on it, the round-robin auto-skips Gemini anyway (the setup-fail
-            # sweep at phase end, or the stuck-card deadline if it enters polling)
-            # so the run still finishes.
+            # Adoption found nothing AND every re-submit failed → recovery is
+            # EXHAUSTED, so NOW surface the terminal Retry/Skip blocker (the one
+            # genuine user-action alert; fail_agent also persists the errored
+            # tile). Never a silent drop — if the user doesn't act on it, the
+            # round-robin auto-skips Gemini anyway (the setup-fail sweep at phase
+            # end, or the stuck-card deadline if it enters polling) so the run
+            # still finishes.
             log(f"[{label}] Gemini brief never started a research plan after "
                 f"{_max_attempts} retries — surfacing a Retry/Skip blocker (no silent skip)", "ERROR")
             try:
