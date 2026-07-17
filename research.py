@@ -321,6 +321,106 @@ def _delete_worker_lock(worker_id: int) -> None:
         pass
 
 
+# ── #64: permanently-dead-worker markers ──────────────────────────────────
+# When the supervisor (run_daemon_loop) declares a worker (id>=2) permanently
+# dead after a crash loop it STOPS respawning it — so that worker never runs its
+# own rehydration and its owned "ongoing" runs would stay frozen with no Resume
+# CTA until an operator repairs it. The supervisor has NO Firestore client, so it
+# drops a durable on-disk marker here; worker-1 (always alive — k=1 is never
+# marked dead) reads these and marks the abandoned runs paused_backend_restart so
+# the FE surfaces a Resume banner. Unlike the per-run worker-lock (released at
+# BE-phase-end, so its ABSENCE can't tell a dead worker from a healthy FE-tail
+# run — the #58 false-positive that got the lock-based backstop reverted), the
+# `_dead` flag is a DEFINITIVE death signal, so a marker driven by it is safe.
+DEAD_WORKER_MARKER_GRACE_MS = 60_000  # only act on a SETTLED death (absorbs the
+                                      # supervisor's own death-detection window)
+
+
+def _worker_dead_marker_path(worker_id: int) -> Path:
+    return Path(__file__).parent / "queues" / f".worker.{worker_id}.dead"
+
+
+def _write_worker_dead_marker(worker_id: int, *, pid: "int | None" = None,
+                              crash_count: int = 0) -> None:
+    """Supervisor-side: durably record that `worker_id` was declared dead.
+    Atomic tmp+os.replace (mirrors _write_worker_lock) so a concurrent worker-1
+    scan never reads a half-written file. The `.dead.tmp` suffix is excluded from
+    the reader's `.worker.*.dead` glob. Best-effort; failures logged DEBUG."""
+    tmp = None
+    try:
+        lock_dir = Path(__file__).parent / "queues"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        path = _worker_dead_marker_path(worker_id)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps({
+            "worker_id": worker_id,
+            "pid": pid,
+            "died_at": int(time.time() * 1000),
+            "reason": "crash_loop",
+            "crash_count": crash_count,
+            "supervisor_pid": os.getpid(),
+        }), encoding="utf-8")
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                tmp = None
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.01 * (attempt + 1))
+    except Exception as _de:
+        log(f"[dead-marker] write failed for worker {worker_id} (non-fatal): {_de}", "DEBUG")
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
+
+
+def _clear_worker_dead_marker(worker_id: int) -> None:
+    """Worker-side: a process that reaches --serve boot is ALIVE, so it drops any
+    stale dead-marker for itself. This means an operator repair needs no manual
+    step — the repaired worker's own boot retracts the marker before worker-1's
+    reconciler could re-pause the runs it is about to recover. Best-effort."""
+    try:
+        path = _worker_dead_marker_path(worker_id)
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
+
+
+def _read_dead_worker_ids() -> "set[int]":
+    """Worker-1-side: the set of worker ids the supervisor has declared dead —
+    settled past the grace window and within the current fleet range (2..N). A
+    marker outside that range (fleet shrank / bogus) is ignored (those runs are
+    covered by the out-of-fleet orphan branch in _rehydrate_ongoing_for_tree).
+    Pure read — no side effects; markers are retracted by their worker at boot."""
+    out: "set[int]" = set()
+    lock_dir = Path(__file__).parent / "queues"
+    if not lock_dir.exists():
+        return out
+    try:
+        fleet = load_worker_count()
+    except Exception:
+        fleet = 1
+    now_ms = int(time.time() * 1000)
+    for p in lock_dir.glob(".worker.*.dead"):
+        try:
+            rec = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        k = rec.get("worker_id")
+        if not isinstance(k, int) or k < 2 or k > fleet:
+            continue
+        if now_ms - (rec.get("died_at") or 0) < DEAD_WORKER_MARKER_GRACE_MS:
+            continue  # death not settled yet
+        out.add(k)
+    return out
+
+
 def _scan_sibling_locks_for_research(research_id: str, exclude_worker_id: int) -> "list[dict]":
     """Return list of live sibling claim records for the given research_id.
 
@@ -43481,6 +43581,82 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
     return (rehydrated, orphaned)
 
 
+async def _reconcile_dead_worker_runs(tree_uid: str, dead_ids: "set[int]") -> int:
+    """Worker-1: for each "ongoing" run in `tree_uid` owned by a worker the
+    supervisor declared PERMANENTLY dead (`dead_ids` from _read_dead_worker_ids),
+    mark it paused_backend_restart so the FE surfaces a Resume CTA. The dead
+    worker never reboots (respawn was stopped), so nothing else recovers its runs.
+
+    MARK-ONLY — never auto-resume: the run belongs to another worker's browser
+    profile (its own logged-in accounts), which worker-1 can't drive. A Resume
+    re-routes the run via the queue claim onto whichever LIVE worker wins it
+    (which re-stamps assignedWorker to itself). Returns the number marked.
+
+    Guards, ALL required before marking:
+      • status still exactly "ongoing" (the query filter — a completed/paused/
+        stopped run isn't returned, so this is idempotent + never re-marks);
+      • owner ∈ dead_ids;
+      • no LIVE sibling holds the run's lock (a re-claim — mirrors the rehydrate
+        sibling-lock guard; a dead worker's stale lock fails the PID-alive check);
+      • the BE has NOT handed off to the autonomous Cloud-Run P4/P5 tail
+        (delivery.json status=="completed" — research.status deliberately stays
+        "ongoing" through that tail, which Cloud Run finishes without any worker,
+        so marking it paused would pop a false Resume on a healthy run)."""
+    if not dead_ids or not _firebase_db:
+        return 0
+    researches_col = _firebase_db.collection("users").document(tree_uid) \
+        .collection("researches")
+    try:
+        snaps = await asyncio.wait_for(
+            asyncio.to_thread(
+                lambda: list(researches_col.where("status", "==", "ongoing").get())
+            ),
+            timeout=15.0,
+        )
+    except asyncio.TimeoutError:
+        log("[dead-worker-reconcile] ongoing-query timed out after 15s — skipping", "WARN")
+        return 0
+    except Exception as _qe:
+        log(f"[dead-worker-reconcile] ongoing-query failed ({_qe}) — skipping", "WARN")
+        return 0
+    marked = 0
+    for snap in snaps:
+        data = snap.to_dict() or {}
+        research_id = snap.id
+        owner = _owner_worker_of(data.get("assignedWorker"))
+        if owner not in dead_ids:
+            continue
+        # A LIVE worker holding the lock means the run was re-claimed and is
+        # actively running — leave it (a dead worker's stale lock is filtered by
+        # the scanner's PID-alive guard, so it never blocks here).
+        if _scan_sibling_locks_for_research(research_id, WORKER_ID):
+            continue
+        # BE-tail guard: once delivery.json flips to "completed" the BE has handed
+        # P4/P5 to an autonomous Cloud-Run task that finishes the run on its own
+        # (research.status stays "ongoing" until FE-P5 flips it). Unreadable /
+        # missing delivery.json ⇒ treat as BE-incomplete ⇒ mark (recoverable from
+        # the on-disk checkpoint).
+        run_id = data.get("backendRunId") or ""
+        if run_id:
+            _dpath = Path(__file__).parent / "queues" / run_id / "delivery.json"
+            try:
+                if _dpath.exists() and json.loads(
+                        _dpath.read_text(encoding="utf-8")).get("status") == "completed":
+                    continue
+            except Exception:
+                pass
+        if _update_research_doc(tree_uid, research_id, {
+            "status": "paused_backend_restart",
+            "summary": "Backend restarted mid-run — hit Resume to pick up from the last checkpoint.",
+        }):
+            marked += 1
+            log(f"[dead-worker-reconcile] {research_id[:24]}… owned by dead worker "
+                f"{owner} — marked paused_backend_restart")
+        else:
+            log(f"[dead-worker-reconcile] mark failed for {research_id[:24]}…", "WARN")
+    return marked
+
+
 async def run_server(port=8000):
     """Start FastAPI server for real-time web app streaming."""
     from fastapi import FastAPI
@@ -43651,6 +43827,39 @@ async def run_server(port=8000):
                 return
             except Exception as _e:
                 log(f"[orphan-sweep] iteration failed: {_e}", "WARN")
+
+    # ── #64: periodic permanently-dead-worker reconcile ──
+    # A worker (id>=2) can crash-loop to death AFTER worker-1 has booted; the
+    # supervisor drops an on-disk dead-marker and stops respawning it, so its
+    # owned "ongoing" runs would freeze with no Resume CTA. Worker-1 (always
+    # alive — k=1 is never marked dead) re-scans on an interval and marks those
+    # abandoned runs paused_backend_restart (the FE then shows a Resume banner).
+    # This periodic loop is the SOLE trigger (no boot pass): on a routine daemon
+    # restart every worker retracts its own marker early at boot, well before the
+    # first tick, so a healthy worker is never briefly mistaken for dead. ~90s
+    # latency is fine for a rare abandonment. Worker-1 only; mark-only.
+    DEAD_WORKER_RECONCILE_INTERVAL_SEC = 90
+
+    async def _dead_worker_reconcile_loop():
+        while True:
+            try:
+                await asyncio.sleep(DEAD_WORKER_RECONCILE_INTERVAL_SEC)
+                if not _firebase_db:
+                    continue
+                _dead_ids = _read_dead_worker_ids()
+                if not _dead_ids:
+                    continue
+                _uid = load_paired_uid()
+                if not _uid:
+                    continue
+                _n = await _reconcile_dead_worker_runs(_uid, _dead_ids)
+                if _n:
+                    log(f"[dead-worker-reconcile] marked {_n} abandoned run(s) "
+                        f"paused_backend_restart (dead workers: {sorted(_dead_ids)})")
+            except asyncio.CancelledError:
+                return
+            except Exception as _e:
+                log(f"[dead-worker-reconcile] iteration failed: {_e}", "WARN")
 
     @app.get("/api/runs")
     async def list_runs():
@@ -45419,6 +45628,8 @@ async def run_server(port=8000):
         if WORKER_ID == 1:
             asyncio.create_task(_orphan_sweep_loop())
             log(f"[orphan-sweep] started ({ORPHAN_SWEEP_INTERVAL_SEC}s interval)")
+            asyncio.create_task(_dead_worker_reconcile_loop())
+            log(f"[dead-worker-reconcile] started ({DEAD_WORKER_RECONCILE_INTERVAL_SEC}s interval)")
         # Refresh the paired device doc so the Account page sees this PC
         # online immediately on server start.
         paired_uid = load_paired_uid()
@@ -45441,6 +45652,13 @@ async def run_server(port=8000):
         # `currentRunId` set; cleared state ⇒ fallback not engaged ⇒ no
         # banner.
         _clear_current_run_id_best_effort(f"worker-{WORKER_ID}-boot")
+        # #64: this worker reached --serve boot, so it is ALIVE — retract any
+        # stale supervisor dead-marker for itself (written if it previously
+        # crash-looped). Clearing BEFORE rehydration means worker-1's periodic
+        # reconciler won't re-pause the runs this worker is about to recover, so
+        # an operator repair needs no manual cleanup step.
+        if WORKER_ID >= 2:
+            _clear_worker_dead_marker(WORKER_ID)
         # Track every Firestore research_id touched by rehydration — used by
         # the disk-restore block below so an ongoing run that got marked
         # paused_backend_restart isn't falsely re-enqueued from
@@ -49930,6 +50148,17 @@ def run_daemon_loop(port: int = 8000):
                                         f"underlying issue (port conflict / profile dir "
                                         f"missing / dep mismatch). Siblings keep running.",
                                         "ERROR",
+                                    )
+                                    # #64: durable on-disk marker so worker-1
+                                    # (alive) can mark this permanently-dead
+                                    # worker's abandoned "ongoing" runs
+                                    # paused_backend_restart — the supervisor has
+                                    # no Firestore client of its own.
+                                    _write_worker_dead_marker(
+                                        k,
+                                        pid=(state.get("process").pid
+                                             if state.get("process") else None),
+                                        crash_count=len(state.get("crash_window") or []),
                                     )
                                     workers[k] = {"_dead": True}
                                     continue
