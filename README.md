@@ -34,11 +34,11 @@ The supervisor (`--resurrect` / `--retire`) is cross-platform first-class on all
 - **Anthropic API key** with browser-automation access (`ANTHROPIC_API_KEY`; see Step 2).
 - **Super Research web app account** — sign in at the deployment URL the dev shares with you (Google sign-in). You'll paste the 8-char pair code into Account → Add Device during `--pair` Stage 1.
 - **Paid Pro tiers on ChatGPT, Claude, and Gemini** — required for the depth Phases 1–2 were tuned against:
-  - **ChatGPT Pro** ($200/mo per seat) — Phase 1 brief uses Pro + Extended Thinking.
+  - **ChatGPT Pro** ($200/mo per seat) — Phase 1 brief uses Pro + its latest thinking model.
   - **Claude Pro** ($20/mo per seat) — Phase 2 Claude agent uses Opus 4.8 + Max effort + Adaptive Thinking + Research tool (Free tiers don't expose Opus or Research).
   - **Gemini Advanced** ($20/mo per seat, via Google One AI Premium) — Phase 2 Gemini agent uses 2.5 Pro / Deep Think + Deep Research.
   - The pipeline will *run* end-to-end on Free tiers, but Deep Research depth, image quality, and turn limits are far lower. **A non-Pro account is flagged with a `[Continue with Free] [Retry]` alert** — via the in-phase tier tells by default (ChatGPT's P1 Pro selector, Gemini's P2 DOM read), or Phase 0's vision check when the opt-in "Verify sign-ins before each run" Setting is on — sign in with a Pro account in the same browser, then click Retry. Opting into Free for one platform suppresses the prompt for the rest of the run, so verify Pro is active in each platform's account/billing page before pairing to avoid surprises. (Stop is always reachable from the chat-box during a paused pipeline — no separate Stop button on the alert.)
-- *(Optional)* Gemini API key for the narrator's Flash fallback. (Phase 4 — YouTube upload — and Phase 5 — Google Doc creation + email — both run entirely in the frontend; no BE-side Resend / YouTube / Docs setup needed.)
+- *(Optional)* Gemini API key — powers the narrator (Gemini 3.5 Flash is the narration **primary**, with Anthropic Haiku 4.5 as the cross-vendor fallback); narration silently disables without any key. (Phase 4 — YouTube upload — and Phase 5 — Google Doc creation + email — both run entirely in the frontend; no BE-side Resend / YouTube / Docs setup needed.)
 
 ## Quick Start
 
@@ -141,10 +141,13 @@ python research.py agent serve        # start the bridge that holds your account
 
 > On an installed build, the same front door is `superresearch agent connect` (and the other `agent` verbs). The chat-runtime agent is a **separate package** — the installed `superresearch agent <verb>` delegates to `pipx run superresearch-agent <verb>`, which installs the `/sr` skill into Hermes/OpenClaw; a source checkout runs the in-tree agent instead.
 
-The agent is **research-only** — it runs / tracks / cancels research on your
-existing devices but can never add, remove, pair, or share them (that stays
-owner-only in the web app). Full command list: `python research.py agent
---help`. How it works + the chat slash commands: **[`agent/README.md`](agent/README.md)**.
+The agent runs / tracks / cancels research **and** can add (pair by access
+code), switch, or remove Research Computers from chat (bridge routes
+`/device/pair`, `/device/select`, `/device/remove`, `/install-backend`). What it
+**can't** do stays owner-only in the web app: sharing a device with other
+people, revoking sharers, and resetting the pair code. Full command list:
+`python research.py agent --help`. How it works + the chat slash commands:
+**[`agent/README.md`](agent/README.md)**.
 
 ## Pairing model (no JSON keys to copy around)
 
@@ -283,7 +286,7 @@ The supervisor reads env vars from `.dg-supervisor.env` (created automatically o
 - **(file-based, all platforms)** Uncomment `ANTHROPIC_API_KEY=sk-ant-...` and/or `GEMINI_API_KEY=AIza...` in `.dg-supervisor.env`. Loaded by `--env-file` at supervisor startup; survives reboots via the persistence supervisor. Good for un-paired backends or operators who prefer files. (On POSIX, `--pair` writes here too.)
 - **(advanced / legacy)** Set in your shell rc (Mac/Linux) or via PowerShell `[System.Environment]::SetEnvironmentVariable(..., 'User')` (Windows user-scope). The canonical env-var names are `ANTHROPIC_API_KEY` and `GEMINI_API_KEY` (matching the Anthropic SDK + Gemini API docs). Legacy aliases `CUA_API_KEY` and `GOOGLE_API_KEY` are auto-migrated on next startup and removed; new BE versions only read the canonical names. (On Windows, `--pair` writes here too.)
 
-**Don't set the same key in multiple places with different values** — pick one. Priority chain: CLI `--api-key` → **FE Account-page Firestore key** → Windows user-scope env (where `--pair` persists on Windows) → `os.environ` (the `.dg-supervisor.env` file loads here on POSIX, including pair-time keys). FE-Account-page key wins, so a stale BE-local pair key won't override a freshly-set web-app key.
+**Don't set the same key in multiple places with different values** — pick one. Submitter-aware priority chain (#928 per-device + #938 sharer keys): CLI `--api-key` → **run-submitter's per-device FE key** `apiKeys.byDevice.{deviceId}` (only when the submitter ≠ the device owner — i.e. a sharer's own key, used ONLY for their runs) → **owner's per-device FE key** `apiKeys.byDevice.{deviceId}` → **owner's flat FE Account-page key** `apiKeys.{anthropic,gemini}` → Windows user-scope env (where `--pair` persists on Windows) → `os.environ` (the `.dg-supervisor.env` file loads here on POSIX, including pair-time keys). A newer FE key wins over a stale BE-local pair key. Owner-submitted runs are unchanged from before per-device keys; a sharer's key never touches the owner's runs.
 
 **Other config** (Vision tier, CUA model overrides, shadow log path) also lives in `.dg-supervisor.env`. See `scripts/dg-supervisor.env.example` for the documented template + key descriptions.
 
@@ -540,12 +543,14 @@ The same 8-char pair code drives sharing. Show the code in Account → Manage de
 
 Per-user scoping is enforced by Firestore rules + the BE's custom claim. Sharers can submit research and read their own runs; they can't read the owner's other data, can't read the owner's research history, and can't see the pair code (it's gated by the owner's Pair Code Lock if enabled). Reset clears `sharedWith=[]` in one step — handy for revoking access to a stolen / overshared device without taking the BE down.
 
+**Sharer keys (#938) — cost follows the submitter.** A sharer can save their OWN Anthropic/Gemini API keys for a computer shared with them (Account → API Config lists the shared computers alongside owned ones). Those keys are used **only for the research the sharer submits** on that computer — resolution is submitter-aware (sharer `byDevice` → owner `byDevice` → owner flat → env), so the owner keeps a **byte-identical zero-change path** and never pays for a sharer's runs. The owner never sees a sharer's key value, only a small **key-glyph** beside any sharer who has supplied one (server-computed — the owner can't read a sharer's prefs). A sharer with no per-device key of their own simply falls back to the owner's chain (unchanged behavior).
+
 ## Pipeline Phases
 
 | Phase | Platform | Typical Time |
 |-------|----------|------|
 | 0. Init | System (browser launch + login check) | ~10s |
-| 1. Brief | ChatGPT Pro + Extended Thinking | ~25 min |
+| 1. Brief | ChatGPT Pro + latest thinking model | ~25 min |
 | 2. Research | ChatGPT + Gemini + Claude (parallel) | ~49 min |
 | 3. Podcast | NotebookLM (upload + audio generation) | ~25 min |
 | 4. YouTube | FE-owned: Data API (ffmpeg encode + `youtube.videos.insert` via OAuth) | ~1-2 min |
@@ -561,7 +566,7 @@ Long quiet stretches in Phases 1–3 are expected (ChatGPT Pro thinks for ~3 min
 - **Anti-parroting prompt + chrome scrub.** The narrator system prompt (research.py:~13005-13104) has explicit anti-pattern rules: don't echo input verbatim, don't start with "currently" or "Status:", skip chat-thread chrome (`You said:` / `Claude responded:` / `Gemini said` / `brief.md`). Above the narrator, `_compact_event_for_narration` (research.py:12705) scrubs those same chrome strings out of the input window BEFORE the narrator sees them — scrape outputs (chip / step counts) are untouched.
 - **DOM scrape rules per platform:** Claude scrape (research.py:7116-7124) is panel-scoped to `aside` / `[class*="artifact"]` / `[class*="research"]` — dropped `.font-claude-message` and `.contents` heading selectors that grabbed conversation-chrome. ChatGPT P2 panel walker (research.py:7979-7984) dropped the loose `[class*="row" i]` selector and added a 23-verb `VERB_GATE` regex with min-length raised 4→12 to drop "OK" / "Done" single-word noise.
 - **Vision narrator (`narrate.py`) RETIRED.** `PHASE_BUDGET=0` by default — the per-agent narrator covers the same slot via DOM events without burning a separate Gemini call. Set `DG_VISION_NARRATE=1` to re-enable it as a coverage escape hatch.
-- **BE phase-fallback tail.** When the narrator is silent (Gemini + Haiku both failing, or 6s startup gap), research.py:9601-9604 emits `Extended Thinking active · 12,400 chars drafted` into `progress["progress"]`. The FE renders this as a final tail under the agent narration (PhaseDropdown.tsx:1880-1885). No more dead silence on a working agent.
+- **BE phase-fallback tail.** When the narrator is silent (Gemini + Haiku both failing, or 6s startup gap), the `is_et` poll-dedupe branch (research.py ~23025-23063) emits a per-agent status tail — `Extended Thinking active · 12,400 chars drafted` (ChatGPT), `Adaptive Thinking active …` (Claude), `Planning …` (Gemini) — into `progress["progress"]`. The FE renders this as a final tail under the agent narration. *(These are load-bearing DOM/status matchers, deliberately kept when #955/`01a7248` dropped "Extended Thinking" from user-facing narration copy.)* No more dead silence on a working agent.
 
 > **Narration brain envs:** `DG_NARRATOR_USE_GEMINI` (default `1`; set `0` to skip Gemini and go straight to the Haiku fallback — renamed from `DG_NARRATOR_USE_HAIKU` on 2026-05-28 when the primary swapped, with the old name honored as a backwards-compat alias for one release), `GEMINI_TEXT_MODEL` (default `gemini-3.5-flash`, also drives narrator primary), `DG_NARRATOR_HAIKU_MODEL` (default `claude-haiku-4-5`, the cross-vendor fallback), `DG_VISION_NARRATE` (default `0`; set `1` to re-enable the retired vision narrator). All optional.
 
@@ -588,7 +593,7 @@ Every extraction method logs explicitly: `[gemini_extractor] method=X result=Y` 
 
 **Tab round-robin — `target_page` anchoring.** `agent_loop` accepts a `target_page=None` parameter. Before every polling tick it calls `bring_to_front()` on that agent's tab so CUA always sees a live browser viewport, not a stale background capture from whichever tab happened to be front when three agents were racing. `_anchored_screenshot()` helper handles the pattern; re-anchors after every `execute_action` too. Prevents cross-agent tab interference — e.g. Gemini's vision call returning Claude's screenshot because Claude's tab happened to be front-of-stack when the capture fired.
 
-**Claude setup via Playwright (not CUA).** `setup_claude_dr` was rewritten as Playwright steps — select Opus 4.8 from the model dropdown, set Effort = Max, toggle Adaptive Thinking, enable the Research tool — all DOM selectors + `.click()` calls. Eliminates ~30-90s of CUA vision overhead per setup and removes a class of "CUA clicked the wrong thing" setup failures. CUA is still used mid-run for anything that isn't deterministic DOM.
+**Claude setup via Playwright (not CUA).** `setup_claude_dr` was rewritten as Playwright steps — first ensure the composer is on **"Chat"** (not "Cowork") mode, then select Opus 4.8 from the model dropdown, set Effort = Max, toggle Adaptive Thinking, enable the Research tool — all DOM selectors + `.click()` calls. Eliminates ~30-90s of CUA vision overhead per setup and removes a class of "CUA clicked the wrong thing" setup failures. CUA is still used mid-run for anything that isn't deterministic DOM.
 
 **Clipboard permissions — granted once at browser bootstrap, covers every P1/P2 agent.** The pipeline drives the clipboard for two things: brief *delivery* (`verified_paste_brief` Strategy A pastes via `navigator.clipboard.writeText` + Ctrl+V — Phase 1 brief and Phase 2 brief hand-off) and report *extraction* (Gemini's "Share & Export → Copy contents" writes the report markdown to the clipboard for the T1 tier; ChatGPT/Claude copy paths likewise). In the automated patchright context those clipboard APIs are **denied** unless the permission is granted, and the denial is silent — the page still shows a "copied" toast but the read comes back empty, so Gemini T1 falls through to the T2 DOM scrape on every run. To cover all agents in one place, `Browser.start` grants `clipboardReadWrite` once at browser bootstrap via CDP `Browser.grantPermissions` (research.py `Browser.start`, ~line 14564). The grant has no `origin`/`browserContextId`, so it applies to the persistent context and persists for the session — every agent tab (`new_tab` and `open_isolated_tab` share this one context) inherits it. `verified_paste_brief` still grants per-paste as a defensive fallback in case the bootstrap grant ever fails.
 
@@ -598,11 +603,21 @@ Every failure category — timeouts, CUA fallbacks, Anthropic 429/529 retries, s
 
 - **Phase 0** — browser launch/crash, Playwright profile lock, missing Chromium binary
 - **Phase 1** — brief timeout, brief paste retry per attempt, brief-short (offers `continue_anyway`), brief model error, manual-brief 3h backstop (auto-fail with `pipeline_stopped` reason `manual_brief_wait_backstop_3h`)
-- **Phase 2** — agent timeout (auto-skip with partial save if ≥200 chars; no human prompt needed since 2026-04-30 `be8f7b3`), send-button CUA fallback, paste outer-retry narration. **Cloudflare / human-verification is hands-off**: passive detection only (zero interaction with the walled tab), one short **Skip-only** alert (the copy is a single hands-off line and does NOT mention the login command, #924); Skip greys the agent icon and closes its tab; it clears on its own once the challenge passes (solve by signing into that platform via real Chrome between runs). Browser crashes auto-retry with a passive recovery banner; no Retry/Skip prompt.
+- **Phase 2** — agent timeout (auto-skip with partial save if ≥200 chars; no human prompt needed since 2026-04-30 `be8f7b3`), send-button CUA fallback, paste outer-retry narration. **Cloudflare / human-verification is hands-off AND non-blocking** (#955 Gap #1b, `115fe71`): passive detection only (zero interaction with the walled tab) and P2 **no longer pauses** on it — the old blocking `wait_for_verification_clearance` / 600s tier-5 poll was dropped for P2 (research.py:34786-34803 sets `hv_blocked` + hands to `_hv_setup_fail_card`), so siblings 2B/2C keep starting the moment the wall is hit and one agent's card never freezes the round-robin (non-blocking parked-decision resolver, #953). With the L3 auto-skip toggle ON (default), the walled agent is greyed + its tab closed on the hands-off deadline (`HANDS_OFF_AUTO_SKIP_SEC=300`, ~5 min); off = a **Skip-only** `DecisionCard` (Retry omitted — it would only re-navigate a walled account; unified across ALL walls). Clear it by signing into that platform in real Chrome between runs. (P1/P5 still use the shared *blocking* single-surface verification wait.) Browser crashes auto-retry with a passive recovery banner; no Retry/Skip prompt.
 - **Phase 3** — per-agent share-link extraction failure, NotebookLM login-expired vs generic upload failure, "no MD files" gate, inter-phase gate (P2 produced no documents). Derived stems (`brief.md`, `consolidated.md`) are excluded from NotebookLM uploads via `_DERIVED_STEMS` filter (research.py:14627) — never uploads consolidated.md.
 - **Phase 4** — owned by FE (YouTube upload via Data API). BE no longer surfaces P4 errors; see FE for the alert matrix (`uploadYouTube 401/403/quotaExceeded` map to OAuth-scope / quota-cap actionable copy).
 - **Phase 5** — owned by FE (Doc creation + email). BE no longer surfaces P5 errors; see FE for the alert matrix.
 - **Cross-cutting** — Anthropic 429/529 narrate as retrying; other API errors surface as `pipeline_warning` on the current phase
+
+### Alert intent catalog + non-blocking decisions (#955)
+
+Alerts are authored through one seam — `emit_decision` (research.py ~14421) over an `ALERT_INTENTS` catalog (~14173) — so every actionable card carries a **recoverability class**, a `decision_id`, and (when auto-skippable) a deadline:
+
+- **recoverable** → `[Retry][Skip]`; **hands_off** → Skip-only (Cloudflare/HV — a Retry would only re-hit the wall); **blocker** → must-act (e.g. a dead Anthropic key), never silently swallowed into a retry banner and it bypasses the dismiss-then-resurface ledger (FE #65); **infra** → environment/CUA-unavailable.
+- **Non-blocking:** the P2 setup gates — HV (#1b), `pro_required` (#1a), `chat_mode` (#1c) — are send-before-decision and do **not** pause the round-robin; every alert **auto-resumes** on resolve, and the pause is released on every HV/skip/timeout path.
+- **Auto-skip lifecycle** arm → fire → disarm; `HANDS_OFF_AUTO_SKIP_SEC=300` for hands-off walls (a longer unacted tier applies elsewhere). A **command-ack** is emitted at dispatcher intake so the FE re-enables the tapped button promptly.
+- **Silent self-heals (no card):** a **Gemini "lost send"** is recovered silently — the agent adopts the existing sidebar chat (adopt-first) and, if needed, shows a one-**Retry** reconnect card (no "hard" retry); transient Anthropic errors retry silently before any card. A sticky Deep-Research tool on the P1 composer is cleared with **Backspace**, never a re-click (a re-click adds a *second* DR) (#952).
+- **Recovery backstops:** a permanently-dead worker's run is abandoned to `paused_backend_restart` (#64); a fleet respawn self-heals **per-worker** (not whole-fleet) (#966); the self-heal watchdog no longer fires a T1 push, and surfaces one honest Resume card (no misleading 2-min wait).
 
 Default action on every alert is `[Retry] [Skip]`. Skip writes the unified `skip_phase phase=N` command, replacing the old `skip_phase` / `skip_phase` verbs (removed in U2). Phase-specific alerts may add `HV Resume` or `continue_anyway`. **Stop is NOT a per-phase action** — pause/stop/resume stay global in the app's chat input bar.
 
@@ -658,6 +673,7 @@ After completing the login in the Chrome window the backend opened, type `r` + E
 | `CUA_MODEL` | `claude-sonnet-4-6` | Claude model for CUA. Sonnet 4.6 is Anthropic's recommended CUA model (largest OSWorld jump in the 4.x lineup) and ~40% cheaper than Opus. Override via env for A/B tests. |
 | `VISION_LIGHT_MODEL` | `claude-sonnet-4-6` | Claude model for the lightweight vision checks (login-wall detection, pro-tier detection). Decoupled from `CUA_MODEL` so they can evolve independently. |
 | `VISION_HEAVY_MODEL` | `claude-opus-4-8` | Claude model for the vision tier-2 high-stakes / retry-after-failure path. |
+| `DG_VISION_TIER` | `off` | The single VisionRecipe / Track-B switch that arms the Vision **acting** tier. `off` = disabled; `shadow` = observe-and-log only (no acting); `act` (alias `tier2`) = Vision may act as the tier-2 fallback; `tier3` = deeper escalation. Leave `off` until validated (Vision is still CUA-primary). |
 | `CUA_SCREEN_WIDTH` | `1280` | Browser viewport width |
 | `CUA_SCREEN_HEIGHT` | `800` | Browser viewport height |
 | `GEMINI_API_KEY` | (optional) | Gemini API key. Used by the narrator (Gemini 3.5 Flash primary), summary helper, URL extractor, and other BE text tasks. (P4 thumbnail generation lives on the FE — `web/src/lib/album-art.ts` — and uses the FE-side env / per-user-pref Gemini key, not this BE one.) |

@@ -5,8 +5,10 @@ session of your account*. You install a small `/sr` skill + a local loopback
 bridge, sign in once with Google, and then run / track research from chat —
 every run shows up in the web app like a normal chat.
 
-- **Research-only.** Run / track / fetch research. It can **never** control
-  devices (add / remove / pair / share stay owner-only in the app).
+- **Research + device management.** Run / track / fetch research, and add (pair
+  by access code), switch, or remove Research Computers from chat. Only *sharing*
+  a device, revoking sharers, and resetting the pair code stay owner-only in the
+  web app.
 - **One agent per account** (owner or sharer).
 - **No dedicated worker, no separate logins, no identity minting.** It uses your
   account's existing paired devices, on the app's normal Firestore plane.

@@ -18,6 +18,10 @@ the account session — every CLI/skill command routes through it over loopback.
 | List researches | `GET /researches` | `test_bridge_routes`, `test_firestore_rest` |
 | Devices: list + owned label | `GET /devices` | `test_bridge_device` |
 | Device select / current / stale | `GET /device`, `POST /device/select` | `test_bridge_device` |
+| Device pair (add by access code) | `POST /device/pair` | — (live-only; no bridge unit test yet) |
+| Device remove | `POST /device/remove` | — (live-only; no bridge unit test yet) |
+| Install backend (from chat) | `POST /install-backend` | — (live-only; no bridge unit test yet) |
+| Vision act-tier dispatcher wiring (source guard) | — | `test_vision_act_wiring` (asserts the `_shadow_observed_cua` per-hotspot dispatcher is wired; source-guard only — does NOT flip `DG_VISION_TIER` default; act stays opt-in / CUA-primary, #900 open) |
 | Start a run (+ device resolve) | `POST /research` | `test_bridge_routes`, `test_bridge_device` |
 | Run status (+ events) | `GET /research/<id>` | `test_bridge_device` |
 | Streaming snapshot | `GET /updates` | `test_bridge_device`, `test_runview` |
