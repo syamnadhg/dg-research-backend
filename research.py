@@ -34623,30 +34623,86 @@ async def _gemini_adopt_lost_conversation(page, pasted_text: str, label: str):
     for _ci, _cand_title in enumerate(_owned):
         log(f"[{label}] opening owned sidebar chat '{_cand_title[:60]}' "
             f"({_ci + 1}/{len(_owned)}) from the sidebar", "WARN")
-        # Capture the pre-click URL so a conv→conv click (when a prior candidate
-        # left us in a conversation) is detected by CHANGE, not just "/app/".
-        try:
-            _before_u = (page.url or "").split("?", 1)[0].rstrip("/")
-        except Exception:
-            _before_u = ""
-        try:
-            if not await page.evaluate(_CLICK_ENTRY_BY_TITLE_JS, _cand_title):
-                log(f"[{label}] sidebar entry '{_cand_title[:40]}' vanished before open — trying next", "WARN")
-                continue
-        except Exception:
-            continue
+        # 2026-07-19 e2e: ONE click + one 15s route-wait abandoned adoption of
+        # the CORRECT sole candidate — the wedged SPA (the same platform state
+        # that dropped our send and left us on the bare /app home) silently ate
+        # the sidebar click, and the recovery fell through to the re-paste
+        # ladder = the duplicate-run adopt-first exists to prevent. Give each
+        # candidate a bounded number of click attempts; between failed attempts
+        # reload the EMPTY HOME (the only place reload is safe — same policy as
+        # the Recent-list refresh above) to unwedge the SPA, re-expand the rail,
+        # and re-click.
+        _click_tries = int(os.environ.get("DG_GEMINI_ADOPT_CLICK_TRIES", "3"))
+        _routed = False
         _u = ""
-        for _ in range(10):  # wait for the SPA to route to a NEW /app/<id> (a CLICK, not a URL nav)
-            await asyncio.sleep(1.5)
+        _entry_gone = False
+        for _at in range(_click_tries):
+            # Capture the pre-click URL so a conv→conv click (when a prior
+            # candidate left us in a conversation) is detected by CHANGE, not
+            # just "/app/". Re-captured per attempt — a reload can normalize it.
             try:
-                _u = (page.url or "").split("?", 1)[0].rstrip("/")
+                _before_u = (page.url or "").split("?", 1)[0].rstrip("/")
             except Exception:
-                _u = ""
-            if "/app/" in _u and _u != _before_u:
+                _before_u = ""
+            try:
+                if not await page.evaluate(_CLICK_ENTRY_BY_TITLE_JS, _cand_title):
+                    log(f"[{label}] sidebar entry '{_cand_title[:40]}' vanished before open — trying next", "WARN")
+                    _entry_gone = True
+                    break
+            except Exception:
+                _entry_gone = True
                 break
-        if "/app/" not in _u or _u == _before_u:
-            log(f"[{label}] sidebar click never routed to a new /app/<id> "
-                f"(url={_u or '?'}) — trying next", "WARN")
+            for _ in range(10):  # wait for the SPA to route to a NEW /app/<id> (a CLICK, not a URL nav)
+                await asyncio.sleep(1.5)
+                try:
+                    _u = (page.url or "").split("?", 1)[0].rstrip("/")
+                except Exception:
+                    _u = ""
+                if "/app/" in _u and _u != _before_u:
+                    break
+            if "/app/" in _u and _u != _before_u:
+                _routed = True
+                break
+            if _at >= _click_tries - 1:
+                break
+            # Click didn't route within the wait — but re-read the URL before
+            # gating the reload: the SPA can route in the sub-second gap AFTER
+            # the inner wait's last read (adversarial-review catch). If we are
+            # NOW in a new conversation, count it as routed — the body-verify
+            # below decides adoption — rather than abandoning an already-open,
+            # possibly-correct chat to the next candidate / re-paste ladder.
+            try:
+                _cur = (page.url or "").split("?", 1)[0].rstrip("/").lower()
+            except Exception:
+                _cur = ""
+            if "/app/" in _cur and _cur != _before_u.lower():
+                _u = _cur
+                _routed = True
+                break
+            # Only reload if we're still on the bare empty home (never a
+            # conversation), then re-surface the rail entry.
+            if not (_cur.endswith("gemini.google.com/app")
+                    or _cur.endswith("gemini.google.com")):
+                break
+            log(f"[{label}] sidebar click didn't route (attempt {_at + 1}/"
+                f"{_click_tries}) — reloading the empty home to unwedge the SPA, "
+                "then re-clicking", "WARN")
+            try:
+                await page.reload(wait_until="domcontentloaded", timeout=25000)
+                await asyncio.sleep(2.5)  # let the SPA hydrate the sidebar
+            except Exception as _rre:
+                log(f"[{label}] unwedge reload failed ({_rre})", "WARN")
+            for _ in range(2):
+                try:
+                    await page.evaluate(_EXPAND_SIDEBAR_JS)
+                except Exception:
+                    pass
+                await asyncio.sleep(1.2)
+        if _entry_gone:
+            continue
+        if not _routed:
+            log(f"[{label}] sidebar click never routed to a new /app/<id> after "
+                f"{_click_tries} attempt(s) (url={_u or '?'}) — trying next", "WARN")
             continue
         # The conversation content mounts lazily after the URL flips — retry the
         # match a few times before moving on (adversarial-review finding: a
@@ -35600,6 +35656,24 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                     else:
                         log(f"[{label}] composer unreadable (selector miss) — "
                             "re-clicking Send as-is, no blind re-paste", "INFO")
+                    # 2026-07-19 e2e: the dropped send ALSO reverts the Deep
+                    # Research tool selection (and adopt's empty-home reloads
+                    # reset the composer to chat mode), so a re-submit without
+                    # re-arming DR lands as a PLAIN CHAT message — Gemini
+                    # answers the brief inline, no 'Start research' ever
+                    # appears, and 2D burns its whole plan-wait + CUA budget on
+                    # a research that never existed. Re-arm via the same
+                    # pre-send helper the normal path uses (paste → ensure →
+                    # send order mirrors it). Fail-open on a measurement miss,
+                    # matching the normal pre-send path — 2D verifies the plan.
+                    try:
+                        _dr_st = await ensure_deep_mode_active(page, platform, label)
+                        if not _dr_st.get("active", True):
+                            log(f"[{label}] Deep Research still OFF after re-arm "
+                                f"(attempt {_att}/{_max_attempts}) — sending "
+                                "anyway (2D verifies the plan)", "WARN")
+                    except Exception as _dre:
+                        log(f"[{label}] DR re-arm raised (non-fatal): {_dre}", "DEBUG")
                     log(f"[{label}] Gemini URL still bare, no error yet — re-submitting "
                         f"(attempt {_att}/{_max_attempts})", "WARN")
                     try:
