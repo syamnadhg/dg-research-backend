@@ -48824,9 +48824,30 @@ def _arm_supervisor_macos() -> "tuple[bool, int | None, str, int]":
     _seed_env_file_if_missing()
 
     script_dir = Path(__file__).parent
-    log_dir = script_dir / "logs"
+    # Supervisor logs live in ~/Library/Logs (platform-canonical), NOT
+    # script_dir/logs. launchd opens StandardOutPath/StandardErrorPath ITSELF
+    # before exec — that open is attributed to launchd, not the target binary,
+    # so no user TCC grant can allow it into a protected folder (~/Downloads,
+    # ~/Desktop, ~/Documents, iCloud). A source checkout in ~/Downloads made
+    # the agent die at spawn-init (exit 78 EX_CONFIG, EMPTY logs, respawn
+    # every 10s — device never online after --pair; live incident 2026-07-19).
+    # Installed (pipx) builds benefit too: script_dir/logs sat inside
+    # site-packages, where an `--update` reinstall wiped them.
+    log_dir = Path.home() / "Library" / "Logs" / "SuperResearch"
+    # Python-attributed ops (reading research.py, the WorkingDirectory) in a
+    # TCC-protected folder still need a one-time per-binary grant — surface it
+    # loudly instead of letting the agent die silently at first spawn.
     try:
-        log_dir.mkdir(exist_ok=True)
+        _rel = script_dir.resolve().relative_to(Path.home())
+        if _rel.parts and _rel.parts[0] in ("Downloads", "Desktop", "Documents"):
+            log(f"[resurrect] checkout is under ~/{_rel.parts[0]} — macOS TCC can block the "
+                f"background service. If the device never comes online: grant Full Disk "
+                f"Access to {sys.executable} (System Settings → Privacy & Security → Full "
+                f"Disk Access), or move the checkout out of ~/{_rel.parts[0]}.", "WARN")
+    except Exception:
+        pass
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
         _SUPERVISOR_PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
     except Exception as e:
         return False, None, f"could not create dirs: {e}", 0
