@@ -159,6 +159,27 @@ def main() -> None:
     if sys.platform == "darwin" and not os.environ.get("MACOSX_DEPLOYMENT_TARGET"):
         os.environ["MACOSX_DEPLOYMENT_TARGET"] = args.macos_target
         print(f"[build] MACOSX_DEPLOYMENT_TARGET={args.macos_target} (broad-compat tag)")
+    if sys.platform == "darwin":
+        # FAIL-LOUD tag guard (2026-07-19 incident): CPython IGNORES an env
+        # MACOSX_DEPLOYMENT_TARGET LOWER than the interpreter's own build-time
+        # target. On a Homebrew python (bottles target the bottle's macOS, e.g.
+        # 26) the env pin above is silently ineffective and the wheel tags
+        # macosx_26_0_arm64 — installable nowhere older. Check the DERIVED
+        # platform up front, before the ~5-minute compile, and stop with the
+        # remedy instead of emitting a mistagged wheel.
+        derived = sysconfig.get_platform()
+        want_prefix = f"macosx-{args.macos_target}-"
+        if not derived.startswith(want_prefix):
+            sys.exit(
+                f"[build] ABORT: this interpreter derives platform '{derived}', not "
+                f"'{want_prefix}*'. Its own build-time MACOSX_DEPLOYMENT_TARGET "
+                f"({sysconfig.get_config_var('MACOSX_DEPLOYMENT_TARGET')}) is higher "
+                f"than the requested {args.macos_target}, and CPython ignores a lower "
+                "env override — the wheel would be mistagged for this macOS only. "
+                "Build with a CPython whose own build target <= the requested one: "
+                "the uv-managed 3.13 (`uv python install 3.13`; python-build-standalone "
+                "targets 11.0 on arm64) or the python.org installer — never Homebrew."
+            )
 
     outdir = (REPO / args.outdir).resolve()
     outdir.mkdir(parents=True, exist_ok=True)
