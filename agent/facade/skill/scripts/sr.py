@@ -59,7 +59,7 @@ from pathlib import Path
 # silently (live 2026-07-02: a stale copy predating the podcast MEDIA: fix
 # kept sending bare audio paths). Bumped together with pyproject.toml —
 # guarded by tests/test_sr_skip_agents.py::test_skill_build_matches_package_version.
-_SKILL_BUILD = "0.1.25"
+_SKILL_BUILD = "0.1.26"
 
 _TIMEOUT = 30
 # By-title run resolution scans the newest N runs (status / podcast / list / the
@@ -1410,7 +1410,14 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     #     video, not the agent);
     #   • a research ask in the same message bails ("no gpt needed, research
     #     solar panels" must not eat the research and drop ChatGPT).
-    _q_start = re.match(r"\s*(why|is|are|did|does|has|have|what|when|where|who|how)\b", low)
+    _q_start = re.match(
+        r"\s*(why|is|are|did|does|has|have|what|when|where|who|how"
+        # Modal-verb yes/no questions are ASKS, not orders: "can/could/should/
+        # would/will/shall/may/do I skip the podcast?" must bail to a relay, not
+        # silently skip a phase on the live run (skip is not confirm-gated).
+        r"|can|could|should|would|will|shall|may|do|don't|dont)\b",
+        low,
+    )
     _device_noun = re.search(r"\b(device|node|laptop|pc|computer|machine|phone|desktop)\b", low)
     if not _q_start and not _device_noun and \
             re.search(r"\b(skip|drop|remove|cut|leave out|without|no)\b", low):
