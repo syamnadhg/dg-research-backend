@@ -52540,11 +52540,31 @@ def _pipx_cmd() -> "list[str] | None":
     Python, NOT this app's isolated pipx venv — so NEVER use sys.executable (the
     venv's python has no pipx module; that's the bug that made `--update` /
     `--uninstall` wrongly report 'pipx not found'). Prefer the `pipx` shim on
-    PATH, else a PATH python's `-m pipx`."""
+    PATH; else the shim in the pip --user script dir that `pipx ensurepath` only
+    wired for FUTURE shells; else a PATH python's `-m pipx`."""
     import shutil as _shutil
     if _shutil.which("pipx"):
         return ["pipx"]
-    for _cand in ("python", "py", "python3"):
+    # The install one-liner puts pipx there with `pip install --user`, whose
+    # script dir is OFF the default PATH until a NEW shell picks up
+    # `pipx ensurepath` — so a machine that DID install via the one-liner can have
+    # a perfectly good pipx that `which` can't see, and `--update` wrongly bailed
+    # with "pipx not found" (reported on a macOS Research Computer, where
+    # pip --user lands the shim in ~/Library/Python/X.Y/bin, never on PATH). Probe
+    # the known user-script dirs directly (newest macOS pythonX.Y first).
+    import glob as _glob
+    _home = os.path.expanduser("~")
+    _shims = sorted(
+        _glob.glob(os.path.join(_home, "Library", "Python", "*", "bin", "pipx")),
+        reverse=True,
+    ) + [os.path.join(_home, ".local", "bin", "pipx")]
+    for _shim in _shims:
+        if os.path.isfile(_shim) and os.access(_shim, os.X_OK):
+            return [_shim]
+    # Else any python with pipx importable as a module — including the versioned
+    # interpreters the installer prefers (the default `python3` may not be the one
+    # pip --user'd pipx into).
+    for _cand in ("python", "py", "python3", "python3.13", "python3.12", "python3.11"):
         _exe = _shutil.which(_cand)
         if not _exe:
             continue

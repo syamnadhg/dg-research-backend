@@ -60,6 +60,56 @@ class TestPerformSelfUpdate:
         assert capsys.readouterr().out == ""
 
 
+# ── _pipx_cmd: locate pipx even when its shim isn't on PATH ────────────────────
+
+class TestPipxCmdDiscovery:
+    """The install one-liner pip --user-installs pipx, whose shim sits OFF the
+    default PATH until a new shell runs `pipx ensurepath` — on macOS in
+    ~/Library/Python/X.Y/bin, on Linux in ~/.local/bin. `--update` must still find
+    it (the reported "pipx not found" on a machine that DID install correctly)."""
+
+    def _no_path_pipx(self, monkeypatch, home):
+        import shutil
+        # No `pipx` shim and no module-python on PATH → forces the shim-dir probe.
+        monkeypatch.setattr(shutil, "which", lambda _n: None)
+        monkeypatch.setattr(research.os.path, "expanduser", lambda p: str(home))
+
+    def test_prefers_shim_on_path(self, monkeypatch):
+        import shutil
+        monkeypatch.setattr(shutil, "which", lambda n: "/usr/bin/pipx" if n == "pipx" else None)
+        assert research._pipx_cmd() == ["pipx"]
+
+    def test_finds_macos_user_shim_off_path(self, monkeypatch, tmp_path):
+        self._no_path_pipx(monkeypatch, tmp_path)
+        shim = tmp_path / "Library" / "Python" / "3.13" / "bin" / "pipx"
+        shim.parent.mkdir(parents=True)
+        shim.write_text("#!/bin/sh\n")
+        shim.chmod(0o755)
+        assert research._pipx_cmd() == [str(shim)]
+
+    def test_finds_local_bin_shim_off_path(self, monkeypatch, tmp_path):
+        self._no_path_pipx(monkeypatch, tmp_path)
+        shim = tmp_path / ".local" / "bin" / "pipx"
+        shim.parent.mkdir(parents=True)
+        shim.write_text("#!/bin/sh\n")
+        shim.chmod(0o755)
+        assert research._pipx_cmd() == [str(shim)]
+
+    def test_prefers_newest_macos_python(self, monkeypatch, tmp_path):
+        self._no_path_pipx(monkeypatch, tmp_path)
+        for minor in ("3.12", "3.13"):
+            s = tmp_path / "Library" / "Python" / minor / "bin" / "pipx"
+            s.parent.mkdir(parents=True)
+            s.write_text("#!/bin/sh\n")
+            s.chmod(0o755)
+        got = research._pipx_cmd()
+        assert got == [str(tmp_path / "Library" / "Python" / "3.13" / "bin" / "pipx")]
+
+    def test_none_when_truly_absent(self, monkeypatch, tmp_path):
+        self._no_path_pipx(monkeypatch, tmp_path)
+        assert research._pipx_cmd() is None
+
+
 # ── _handle_update_command: the remote command handler ────────────────────────
 
 class _FakeDocRef:
