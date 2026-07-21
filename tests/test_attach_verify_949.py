@@ -115,8 +115,21 @@ def test_p1_poll_walks_the_open_panel():
     # Live data merged into the emitted progress dict.
     for key in ('"source_urls"', '"steps"', '"source_items"'):
         assert key in walk[:3000]
-    # Throttled + gated on the panel actually being open.
-    assert "_panel_open_done" in walk[:1400] and "_last_panel_walk" in walk[:1400]
+    # 45s-throttled via _last_panel_walk.
+    throttle_i = walk.index("_last_panel_walk = time.time()")
+    walk_gate = walk[:throttle_i].rsplit("if (label", 1)[-1]
+    assert "(time.time() - _last_panel_walk) > 45" in walk_gate, (
+        "the P1 walk must stay 45s-throttled"
+    )
+    # 2026-07-20: the walk is NO LONGER gated on _panel_open_done — since #952
+    # cleared sticky Deep Research, P1 runs pure Pro+Thinking whose narrower
+    # panel can fail the opener's verify and never flip _panel_open_done, which
+    # starved the walk. The scrape self-guards (returns None when no panel), so
+    # the walk now runs on the throttle alone and merges nothing when empty.
+    assert "_panel_open_done" not in walk_gate, (
+        "the P1 walk gate must not depend on _panel_open_done (decoupled "
+        "2026-07-20 so a flaky opener verify can't starve the live activity fill)"
+    )
 
 
 def test_p1_walk_precedes_the_progress_emit():

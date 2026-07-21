@@ -22824,7 +22824,20 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                 # emitted progress so the panel fills LIVE as ChatGPT
                 # searches — exactly the "show stuff from the source panel,
                 # links etc." ask. Cheap DOM walk, no CUA.
-                if (label in ("Phase1", "Phase1-followup") and _panel_open_done
+                # 2026-07-20: run the walk on the throttle REGARDLESS of
+                # _panel_open_done. scrape_chatgpt_activity_panel_tracking
+                # self-guards (returns None when the panel isn't mounted /
+                # mounted-but-empty), so this only ADDS scrape attempts — it
+                # costs nothing when there is no panel. Since #952 clears a
+                # sticky Deep Research tool, P1 now runs pure Pro + Extended
+                # Thinking, whose activity surface is narrower; the opener's
+                # verify gates can reject it and never flip _panel_open_done,
+                # which starved the walk and left the raw-activity popup empty
+                # until the run finished. Decoupling lets the walk scrape
+                # whatever panel the opener managed to expand even when the
+                # verify step didn't confirm it. (The opener block above still
+                # keeps trying to open/expand the panel independently.)
+                if (label in ("Phase1", "Phase1-followup")
                         and (time.time() - _last_panel_walk) > 45):
                     _last_panel_walk = time.time()
                     try:
@@ -23100,6 +23113,14 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                         progress=progress.get("progress", ""),
                         sources=progress.get("sources", 0),
                         sourceUrls=progress.get("source_urls", []),
+                        # 2026-07-20: emit the titled {url,title} items too, at
+                        # parity with the P2 round-robin emit (~27303). The P1
+                        # panel walk above builds progress["source_items"] but
+                        # this emit only ever sent bare sourceUrls, so the
+                        # raw-activity popup could show hostnames but never the
+                        # source TITLES during a P1 run (the FE drilldown prefers
+                        # sourceItems and falls back to sourceUrls).
+                        sourceItems=progress.get("source_items", []),
                         sections=progress.get("sections", []),
                         partialTextLen=_merged_partial_len,
                         partialTextPreview=_obs_preview,
