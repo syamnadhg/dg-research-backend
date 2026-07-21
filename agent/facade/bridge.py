@@ -1811,19 +1811,20 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 return None
             ids = {d.get("id") for d in devs}
             selected = prefs.get_selected_device(sess.uid)
-            if selected:
-                if selected in ids:
-                    return selected
-                # The saved selection points at a device that's no longer a
-                # pair-confirmed account member (e.g. removed/unlinked in the app) —
-                # drop the stale pref so we never enqueue to a phantom device and a
-                # later run can auto-pick a live one.
+            if selected and selected in ids:
+                return selected
+            # A saved selection that's no longer a pair-confirmed member
+            # (removed/unlinked in the app) is STALE: drop it so we never enqueue to
+            # a phantom device, then fall THROUGH to the same auto-pick a fresh run
+            # gets. Only ask "pick another" when there's genuinely more than one
+            # candidate — a single remaining device or a sole online one is routed
+            # seamlessly, and zero devices routes to pairing (not a "pick from an
+            # empty list" dead end). Pre-0.1.27 this returned stale_selection
+            # immediately, so a single-device account was told to "pick another" from
+            # a list of one.
+            stale = bool(selected)
+            if stale:
                 prefs.clear_selected_device()
-                self._json(409, {"reason": "stale_selection",
-                                 "error": "the computer you last used isn't reachable "
-                                          "anymore — pick another from the device list",
-                                 "devices": [_device_descriptor(d) for d in devs]})
-                return None
             if not devs:
                 # Relayed verbatim into chat — make it the next step, not a dead end.
                 self._json(400, {"reason": "no_devices",
@@ -1835,12 +1836,21 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 did = devs[0].get("id")
                 if did:
                     return did
-            # Several devices, none selected → auto-pick when exactly ONE is online
-            # right now (the obvious target); otherwise ask which (the user later
-            # says "use Research Computer", which persists via /device/select).
+            # Several devices, none usable-by-default → auto-pick when exactly ONE is
+            # online right now (the obvious target); otherwise ask which (the user
+            # later says "use Research Computer", which persists via /device/select).
             online = [d for d in devs if _device_is_online(d) and d.get("id")]
             if len(online) == 1:
                 return online[0].get("id")
+            # Ask which. A stale selection keeps its own reason + message so the user
+            # knows WHY they're being asked (their last computer isn't reachable); a
+            # never-selected multi-device account gets the plain no_selection ask.
+            if stale:
+                self._json(409, {"reason": "stale_selection",
+                                 "error": "the computer you last used isn't reachable "
+                                          "anymore — pick another from the device list",
+                                 "devices": [_device_descriptor(d) for d in devs]})
+                return None
             self._json(400, {"reason": "no_selection",
                              "error": "no device selected — pick one from the device list",
                              "devices": [_device_descriptor(d) for d in devs]})

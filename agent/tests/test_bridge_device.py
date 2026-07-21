@@ -144,13 +144,14 @@ def test_select_unknown_device_404(live):
 
 def test_research_clears_stale_selection_when_device_gone(live):
     # A saved selection points at a device the account no longer has (removed in the
-    # app). /research must NOT enqueue to it — 409 + drop the stale pref so a later
-    # run can auto-pick a live device.
+    # app) AND there are no devices left. /research must NOT enqueue to it — drop the
+    # stale pref and route to pairing (no_devices), not a "pick from an empty list"
+    # dead end.
     base, sel = live
     FakeFS.devices = []      # account has no (pair-confirmed) devices anymore
     sel["v"] = "ghost"       # but the local selection persists from before
     r = requests.post(base + "/research", json={"topic": "the EV battery market"})
-    assert r.status_code == 409
+    assert r.status_code == 400 and r.json()["reason"] == "no_devices"
     assert sel["v"] is None              # stale selection cleared
     assert FakeFS.last_enqueue is None   # nothing queued to the phantom device
 
@@ -191,17 +192,31 @@ def test_research_falls_back_to_selection(live):
     assert r.status_code == 200 and FakeFS.last_enqueue["device_id"] == "a"
 
 
-def test_research_409_when_selection_unreachable(live):
+def test_research_stale_selection_auto_picks_sole_remaining_device(live):
+    # A saved selection is gone but exactly ONE device remains → auto-pick it
+    # seamlessly (drop the stale pref, route to the sole device) instead of telling a
+    # single-device account to "pick another" from a list of one.
     base, sel = live
     sel["v"] = "gone"  # selection no longer in the reachable set
     FakeFS.devices = [{"id": "a", "ownerUid": "u1"}]
     r = requests.post(base + "/research", json={"topic": "T"})
+    assert r.status_code == 200 and FakeFS.last_enqueue["device_id"] == "a"
+    assert sel["v"] is None  # stale pref still cleared
+
+
+def test_research_409_when_stale_selection_and_several_devices(live):
+    # Stale selection AND several candidates, none clearly the target → 409 with the
+    # stale-specific reason/message + the device list so sr.py renders a "pick one"
+    # ask, NOT the pair/install prompt (the account still has computers).
+    base, sel = live
+    sel["v"] = "gone"
+    FakeFS.devices = [{"id": "a", "ownerUid": "u1"}, {"id": "b", "ownerUid": "u1"}]
+    r = requests.post(base + "/research", json={"topic": "T"})
     assert r.status_code == 409 and FakeFS.last_enqueue is None
     body = r.json()
-    # Machine-readable reason + the device list so sr.py renders a "pick one" ask,
-    # NOT the pair/install prompt (the account still has computers).
     assert body["reason"] == "stale_selection"
-    assert [d["id"] for d in body["devices"]] == ["a"]
+    assert {d["id"] for d in body["devices"]} == {"a", "b"}
+    assert sel["v"] is None
 
 
 def test_research_auto_picks_single_device(live):
