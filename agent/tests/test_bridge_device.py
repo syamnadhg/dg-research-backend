@@ -1,6 +1,7 @@
 """Bridge /device routes (owned flag, selection) + /research device resolution."""
 
 import threading
+import time
 from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
 
@@ -9,6 +10,11 @@ import requests
 
 from facade import bridge
 from facade.firestore_rest import FirestoreError
+
+
+def _hb_now() -> int:
+    """A lastHeartbeat that reads as ONLINE (within bridge._DEVICE_ONLINE_MS)."""
+    return int(time.time() * 1000)
 
 
 class FakeFS:
@@ -191,6 +197,11 @@ def test_research_409_when_selection_unreachable(live):
     FakeFS.devices = [{"id": "a", "ownerUid": "u1"}]
     r = requests.post(base + "/research", json={"topic": "T"})
     assert r.status_code == 409 and FakeFS.last_enqueue is None
+    body = r.json()
+    # Machine-readable reason + the device list so sr.py renders a "pick one" ask,
+    # NOT the pair/install prompt (the account still has computers).
+    assert body["reason"] == "stale_selection"
+    assert [d["id"] for d in body["devices"]] == ["a"]
 
 
 def test_research_auto_picks_single_device(live):
@@ -200,11 +211,43 @@ def test_research_auto_picks_single_device(live):
     assert r.status_code == 200 and FakeFS.last_enqueue["device_id"] == "only"
 
 
+def test_research_auto_picks_single_online_device(live):
+    # Several devices, none selected, exactly ONE online → auto-pick it (the obvious
+    # target) instead of asking. This is the #2 fix: a multi-device account must not
+    # be sent to the pair/install prompt.
+    base, _ = live
+    FakeFS.devices = [
+        {"id": "off", "ownerUid": "u1"},                       # no heartbeat → offline
+        {"id": "live", "ownerUid": "u1", "lastHeartbeat": _hb_now()},
+    ]
+    r = requests.post(base + "/research", json={"topic": "T"})
+    assert r.status_code == 200 and FakeFS.last_enqueue["device_id"] == "live"
+
+
 def test_research_400_when_ambiguous(live):
+    # Several devices, none selected, and NOT exactly one online (here: none online)
+    # → ask which, carrying reason + the device list. Never the "install a backend
+    # here" prompt (the old "no device" substring collision).
     base, _ = live
     FakeFS.devices = [{"id": "a", "ownerUid": "u1"}, {"id": "b", "ownerUid": "u1"}]
     r = requests.post(base + "/research", json={"topic": "T"})
     assert r.status_code == 400
+    body = r.json()
+    assert body["reason"] == "no_selection"
+    assert {d["id"] for d in body["devices"]} == {"a", "b"}
+    assert FakeFS.last_enqueue is None
+
+
+def test_research_ambiguous_when_multiple_online(live):
+    # Two devices BOTH online → still ambiguous (can't guess), ask which.
+    base, _ = live
+    FakeFS.devices = [
+        {"id": "a", "ownerUid": "u1", "lastHeartbeat": _hb_now()},
+        {"id": "b", "ownerUid": "u1", "lastHeartbeat": _hb_now()},
+    ]
+    r = requests.post(base + "/research", json={"topic": "T"})
+    assert r.status_code == 400 and r.json()["reason"] == "no_selection"
+    assert FakeFS.last_enqueue is None
 
 
 def test_research_400_when_no_devices(live):
@@ -212,6 +255,8 @@ def test_research_400_when_no_devices(live):
     FakeFS.devices = []
     r = requests.post(base + "/research", json={"topic": "T"})
     assert r.status_code == 400
+    # reason=no_devices is the ONLY case that should route to the pair/install prompt.
+    assert r.json()["reason"] == "no_devices"
 
 
 def test_research_requires_topic(live):

@@ -450,3 +450,76 @@ def test_main_401_routes_to_unauthed_wait(monkeypatch):
     monkeypatch.setattr(poll, "_tick_unauthed", lambda o, sf: seen.__setitem__("o", o) or 0)
     assert poll.main(origin) == 0
     assert seen.get("o") == origin  # 401 → login-listener waiting path, not an error exit
+
+
+# ── #3: completion driven by terminal STATUS (not a phase `final` flag) ──────
+
+def test_completion_fires_on_terminal_status_even_without_final_flag():
+    # A run whose last phase is disabled (e.g. email off) completes with NO
+    # phaseUpdate flagged final. Completion must still fire off the run's status,
+    # exactly once — the old design keyed on `final` and would miss this run.
+    runs = [_run(status="completed", phase_updates=[
+        _pu(1, "Research Brief", [("Brief", "https://sr.io/shared/doc/B", True)]),
+        _pu(3, "Audio Overview", [("Podcast", "https://sr.io/shared/podcast/P", True)], final=False),
+    ])]
+    msgs, state = poll.compute(runs, {})
+    blob = "\n".join(msgs)
+    assert "pipeline complete" in blob and "https://sr.io/shared/podcast/P" in blob
+    assert state["r1"]["completed"] is True
+    assert poll.compute(runs, state)[0] == []            # exactly once
+
+
+def test_baseline_announces_recent_completion():
+    # Watchdog armed LATE (after the run finished — e.g. after an update/restart):
+    # a RECENT completion must still post on the baseline tick, not be swallowed.
+    now = 10_000_000_000
+    runs = [_run(status="completed", phase_updates=[
+        _pu(1, "Research Brief", [("Brief", "u-b", True)]),
+        _pu(5, "Delivery", [], final=True),
+    ])]
+    runs[0]["updatedAt"] = now - 60_000        # finished a minute ago → recent
+    msgs, state = poll.compute(runs, {}, baseline=True, now_ms=now)
+    assert any("pipeline complete" in m for m in msgs)
+    assert state["r1"]["completed"] is True
+
+
+def test_baseline_suppresses_stale_completion():
+    # Arming while an OLD finished run sits in the /updates window must NOT replay a
+    # stale 🎉 — but it's marked completed so it never fires on a later tick either.
+    now = 10_000_000_000
+    runs = [_run(status="completed", phase_updates=[_pu(5, "Delivery", [], final=True)])]
+    runs[0]["updatedAt"] = now - 7 * 3600 * 1000   # 7h ago → stale (> 6h window)
+    msgs, state = poll.compute(runs, {}, baseline=True, now_ms=now)
+    assert msgs == []
+    assert state["r1"]["completed"] is True
+    assert poll.compute(runs, state, now_ms=now)[0] == []
+
+
+# ── #3: teardown race — don't delete the watchdog that must stream a fresh run ──
+
+def test_teardown_not_on_autostart_login_tick(monkeypatch):
+    # Sign-in auto-started a run, but it's not visible in /updates yet (Firestore
+    # lag). The watchdog must stay alive to stream it — NOT tear down on this tick.
+    origin = {"platform": "telegram", "chat_id": "c1"}
+    signed_in = {"ts": 1, "autoStarted": True, "runId": "r9", "topic": "X"}
+    monkeypatch.setattr(poll, "_get_updates", lambda o=None: ([], signed_in))
+    monkeypatch.setattr(poll, "_load_state", lambda p=None: None)
+    monkeypatch.setattr(poll, "_save_state", lambda s, p=None: None)
+    torn = {"v": False}
+    monkeypatch.setattr(poll, "_teardown", lambda o: torn.__setitem__("v", True))
+    poll.main(origin)
+    assert torn["v"] is False
+
+
+def test_teardown_on_login_with_nothing_to_stream(monkeypatch):
+    # Sign-in that did NOT auto-start a run (needs a device) + nothing active →
+    # the login listener has done its job and tears down (a later research re-arms).
+    origin = {"platform": "telegram", "chat_id": "c1"}
+    signed_in = {"ts": 1, "needsDevice": True}
+    monkeypatch.setattr(poll, "_get_updates", lambda o=None: ([], signed_in))
+    monkeypatch.setattr(poll, "_load_state", lambda p=None: None)
+    monkeypatch.setattr(poll, "_save_state", lambda s, p=None: None)
+    torn = {"v": False}
+    monkeypatch.setattr(poll, "_teardown", lambda o: torn.__setitem__("v", True))
+    poll.main(origin)
+    assert torn["v"] is True

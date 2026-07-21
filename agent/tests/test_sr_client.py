@@ -388,7 +388,12 @@ def test_update_updates_the_skill(bridge_port, monkeypatch, capsys):
     monkeypatch.setattr(bridge.selfupdate, "agent_resolvable", lambda: True)
     monkeypatch.setattr(bridge.selfupdate, "spawn_detached_reconnect", lambda: True)
     assert sr.main(["update"]) == 0
-    assert "Updating the Super Research skill" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "Updating Super Research to the latest version" in out
+    # The seamless finish: a do-not-relay directive scripting verify → reload → confirm
+    # (so the assistant doesn't improvise multi-step recovery — the reported friction).
+    assert sr._AGENT_ONLY_MARKER in out
+    assert "/reload-skills" in out and "version" in out
 
 
 def test_update_skill_alias(bridge_port, monkeypatch, capsys):
@@ -396,7 +401,45 @@ def test_update_skill_alias(bridge_port, monkeypatch, capsys):
     monkeypatch.setattr(bridge.selfupdate, "agent_resolvable", lambda: True)
     monkeypatch.setattr(bridge.selfupdate, "spawn_detached_reconnect", lambda: True)
     assert sr.main(["update-skill"]) == 0
-    assert "Updating the Super Research skill" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "Updating Super Research to the latest version" in out
+    assert sr._AGENT_ONLY_MARKER in out
+
+
+def test_research_no_devices_shows_pair_prompt(monkeypatch, capsys):
+    # reason=no_devices → the pair/install-a-backend step (the account genuinely has
+    # no research computer).
+    monkeypatch.setattr(sr, "_origin_from_env", lambda: None)
+    monkeypatch.setattr(sr, "_post", lambda path, body=None: (
+        400, {"reason": "no_devices", "error": "no devices yet — grab the pair code"}))
+    assert sr.main(["research", "Pitbull"]) != 0
+    out = capsys.readouterr().out
+    assert "Paste the access code" in out and "install.ps1" in out
+
+
+def test_research_multi_device_asks_which_not_pair(monkeypatch, capsys):
+    # reason=no_selection → the account HAS computers; ask WHICH (never the pair/
+    # install prompt — the #2 bug). Render from the device list the bridge attached.
+    monkeypatch.setattr(sr, "_origin_from_env", lambda: None)
+    body = {"reason": "no_selection", "error": "no device selected",
+            "devices": [{"id": "rc", "name": "Research Computer", "online": True},
+                        {"id": "mac", "name": "MacBook", "online": False}]}
+    monkeypatch.setattr(sr, "_post", lambda path, b=None: (400, body))
+    assert sr.main(["research", "Pitbull"]) != 0
+    out = capsys.readouterr().out
+    assert "which should run this" in out
+    assert "Research Computer" in out and "MacBook" in out
+    assert "use “Research Computer”" in out            # steer to device-use
+    assert "install.ps1" not in out and "Paste the access code" not in out  # NOT the pair prompt
+
+
+def test_research_older_bridge_infers_pair_prompt_from_text(monkeypatch, capsys):
+    # An older bridge returns no `reason`; infer no_devices from the English text.
+    monkeypatch.setattr(sr, "_origin_from_env", lambda: None)
+    monkeypatch.setattr(sr, "_post", lambda path, b=None: (
+        400, {"error": "no devices yet — grab the pair code"}))
+    assert sr.main(["research", "X"]) != 0
+    assert "Paste the access code" in capsys.readouterr().out
 
 
 def test_no_backend_update_surface_left(bridge_port, monkeypatch):

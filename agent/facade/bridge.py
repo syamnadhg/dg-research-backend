@@ -220,6 +220,29 @@ def _device_label(d: dict[str, Any]) -> str:
     return d.get("name") or d.get("hostname") or d.get("id") or "your Research Computer"
 
 
+# A device is "online right now" if its last heartbeat is within this window.
+# Mirrors the web app's single source of truth (firestore.ts
+# DEVICE_OFFLINE_THRESHOLD_MS = 30_000; the BE heartbeats every ~5s, so 30s =
+# 6× cadence — absorbs jitter, still flags a genuine kill within one window).
+_DEVICE_ONLINE_MS = 30_000
+
+
+def _device_is_online(d: dict[str, Any]) -> bool:
+    """Whether a pair-confirmed device is heartbeating RIGHT NOW (recent
+    lastHeartbeat), not merely paired-but-powered-off. `lastHeartbeat` is epoch
+    millis written by the BE heartbeat loop. Missing/zero/non-numeric → offline."""
+    hb = d.get("lastHeartbeat")
+    if not isinstance(hb, (int, float)) or isinstance(hb, bool) or hb <= 0:
+        return False
+    return (time.time() * 1000 - hb) < _DEVICE_ONLINE_MS
+
+
+def _device_descriptor(d: dict[str, Any]) -> dict[str, Any]:
+    """A minimal, chat-safe device descriptor for a 'pick one' error body — id +
+    friendly name + online flag (never tokens/heartbeat internals)."""
+    return {"id": d.get("id"), "name": _device_label(d), "online": _device_is_online(d)}
+
+
 def _resolve_run_config(fs: FirestoreRest, sess: AccountSession,
                         chat_cfg: dict[str, Any] | None) -> dict[str, Any]:
     """The run-config for an agent-fired run: the account's saved pipeline Settings
@@ -769,6 +792,13 @@ def _phase_updates(doc: dict, sr_links: dict) -> list:
     plan, so it never reaches chat. Skipped phases carry no links."""
     done = _completed_phases(doc)
     platform = _platform_links(doc)
+    # The completion (🎉) marker is the LAST done phase of a run that has actually
+    # completed — NOT hard-coded P5: a run with its last phase disabled (e.g. email
+    # off) finishes at P4/P3, and pinning `final` to P5 would leave such a run with
+    # no completion marker at all. Display-only here (the streaming watchdog now
+    # announces completion off the run's terminal status, not this flag).
+    completed = doc.get("status") == "completed"
+    last_done = max(done) if done else None
     out = []
     for p in (1, 2, 3, 4, 5):
         st = done.get(p)
@@ -790,7 +820,8 @@ def _phase_updates(doc: dict, sr_links: dict) -> list:
                     permanent = False
                 if url:
                     links.append({"label": label, "url": url, "permanent": permanent})
-        out.append({"phase": p, "name": name, "status": st, "links": links, "final": p == 5})
+        out.append({"phase": p, "name": name, "status": st, "links": links,
+                    "final": completed and p == last_done})
     return out
 
 
@@ -1755,9 +1786,17 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
         def _resolve_device(self, body: dict[str, Any], sess: AccountSession,
                             fs: FirestoreRest) -> str | None:
             """Resolve the target device for a run: explicit body.deviceId →
-            persisted selection (re-validated reachable) → the sole reachable
-            device. Sends an error and returns None when it can't resolve (so the
-            caller just returns)."""
+            persisted selection (re-validated reachable) → the sole device → the
+            sole ONLINE device when there are several. Sends an error and returns
+            None when it genuinely can't resolve (so the caller just returns).
+
+            Every error body carries a machine-readable ``reason`` so the client
+            (sr.py) can tell the cases apart WITHOUT parsing English — the run
+            path routes a `no_devices` to the pair/install prompt, but a
+            `no_selection`/`stale_selection` to a 'pick which computer' ask
+            (the account HAS computers; it just needs to be told which). The old
+            single "no device …" substring collided across these, so a
+            multi-device account got the wrong "install a backend here" prompt."""
             device_id = (body.get("deviceId") or "").strip()
             if device_id:
                 return device_id  # explicit wins; membership enforced at enqueue
@@ -1780,20 +1819,31 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 # drop the stale pref so we never enqueue to a phantom device and a
                 # later run can auto-pick a live one.
                 prefs.clear_selected_device()
-                self._json(409, {"error": "selected device no longer reachable — "
-                                          "pick another from the device list"})
+                self._json(409, {"reason": "stale_selection",
+                                 "error": "the computer you last used isn't reachable "
+                                          "anymore — pick another from the device list",
+                                 "devices": [_device_descriptor(d) for d in devs]})
+                return None
+            if not devs:
+                # Relayed verbatim into chat — make it the next step, not a dead end.
+                self._json(400, {"reason": "no_devices",
+                                 "error": "no devices yet — on the computer running "
+                                          "Super Research, grab the pair code from its "
+                                          "screen and add it here (device add <code>)"})
                 return None
             if len(devs) == 1:
                 did = devs[0].get("id")
                 if did:
                     return did
-            if not devs:
-                # Relayed verbatim into chat — make it the next step, not a dead end.
-                self._json(400, {"error": "no devices yet — on the computer running "
-                                          "Super Research, grab the pair code from its "
-                                          "screen and add it here (device add <code>)"})
-                return None
-            self._json(400, {"error": "no device selected — pick one from the device list"})
+            # Several devices, none selected → auto-pick when exactly ONE is online
+            # right now (the obvious target); otherwise ask which (the user later
+            # says "use Research Computer", which persists via /device/select).
+            online = [d for d in devs if _device_is_online(d) and d.get("id")]
+            if len(online) == 1:
+                return online[0].get("id")
+            self._json(400, {"reason": "no_selection",
+                             "error": "no device selected — pick one from the device list",
+                             "devices": [_device_descriptor(d) for d in devs]})
             return None
 
         def _research(self) -> None:
@@ -2436,13 +2486,16 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
 
         def _agent_install(self) -> None:
             """Update the AGENT itself (package + skill + bridge) to the latest
-            published version. The detached reconnect uses `pipx run --no-cache`
-            (see selfupdate.spawn_detached_reconnect — without --no-cache pipx
-            re-runs its stale cached build), redeploys the skill + re-pins the
-            launcher + starts the new bridge once THIS process exits, then shut
-            down — freeing the loopback port so the new bridge can bind it.
-            Host/Origin gated like every write; this is a local maintenance action
-            on the host user's own agent (no account needed)."""
+            published version. The detached reconnect upgrades the PERSISTENT
+            install (`pipx install --force`) and reconnects from it — so the ONLOGON
+            launcher pins to a durable venv and a reboot comes back on the NEW
+            version (see selfupdate.spawn_detached_reconnect; it falls back to the
+            ephemeral `pipx run --no-cache` path if the persistent venv can't be
+            resolved). It redeploys the skill + re-pins the launcher + starts the new
+            bridge once THIS process exits, then we shut down — freeing the loopback
+            port so the new bridge can bind it. Host/Origin gated like every write;
+            this is a local maintenance action on the host user's own agent (no
+            account needed)."""
             # Already on (or ahead of) the latest published agent → say so instead of
             # a pointless reconnect + bridge restart (fresh check, not the 24h cache).
             latest = selfupdate.latest_on_pypi(selfupdate.AGENT_PKG, force=True)

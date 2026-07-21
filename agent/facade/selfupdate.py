@@ -7,15 +7,18 @@ Two pieces:
   • version notice — a pip-style "a newer AGENT is on PyPI" nudge, cached 24h so
     it costs at most one short network call per day and can never block or break a
     command. (`latest_on_pypi` is generic and still used for backend INSTALL.)
-  • a detached reconnect — "update the agent" is a
-    `pipx run --no-cache superresearch-agent connect` that runs ONCE the current
-    bridge process exits (so the new bridge can bind the freed port). The
-    `--no-cache` is LOAD-BEARING: `pipx run` reuses its cached run-venv for ~14
-    days and would otherwise silently re-run the STALE build instead of the
-    newly-published one (the "said updated but stayed vX" bug) — the same reason
-    connect.py:run_agent_in_wsl forces it for connect/serve/resurrect. This
-    mirrors the backend's proven `_spawn_detached_lifecycle` / `_LIFECYCLE_WAITER`
-    pattern (research.py).
+  • a detached reconnect — "update the agent" upgrades the PERSISTENT install
+    (`pipx install --force superresearch-agent`) and reconnects from it, ONCE the
+    current bridge process exits (so the new bridge can bind the freed port). The
+    persistent install is what makes updates STICK: the ONLOGON launcher pins
+    sys.path to the interpreter that ran `connect`, and a `pipx run` venv is
+    ephemeral (pipx evicts it), so a launcher pinned there goes stale and a reboot
+    resurrects the OLD bridge (the "said updated but stayed vX / reboot brought the
+    old one back" bug). If the persistent venv can't be resolved it falls back to
+    the ephemeral `pipx run --no-cache` reconnect (`--no-cache` is load-bearing
+    there — `pipx run` reuses its ~14-day cached venv and would re-run the STALE
+    build), so it is never worse than before. Mirrors the backend's proven
+    `_spawn_detached_lifecycle` / `_LIFECYCLE_WAITER` pattern (research.py).
 """
 from __future__ import annotations
 
@@ -126,12 +129,23 @@ def agent_update_available(*, force: bool = False) -> "str | None":
 # separate, supported action).
 
 
-# Detached helper: wait for the bridge process (passed pid) to exit, then run the
-# reconnect command. Stdlib only; cross-platform. Mirrors research.py's
-# _LIFECYCLE_WAITER so the freed loopback port lets the NEW bridge bind.
+# Detached helper: wait for the bridge process (passed pid) to exit, then upgrade
+# the PERSISTENT install and reconnect from it. Stdlib only; cross-platform.
+# Mirrors research.py's _LIFECYCLE_WAITER so the freed loopback port lets the NEW
+# bridge bind.
+#
+# Why upgrade a persistent install (not just `pipx run`): the ONLOGON launcher
+# (autostart.py) pins sys.path to the dir of whatever interpreter ran `connect`.
+# A `pipx run` venv is EPHEMERAL — pipx evicts it — so a launcher pinned there
+# goes stale and a reboot resurrects the OLD bridge (the "still v0.1.25 after
+# update / reboot brought the old one back" bug). `pipx install --force` pins the
+# launcher to a DURABLE venv. If that can't be resolved we fall back to the
+# original ephemeral `pipx run --no-cache` path, so this is never worse than before.
 _RECONNECT_WAITER = r'''
-import os, sys, time, subprocess
-pid = int(sys.argv[1]); cmd = sys.argv[2:]
+import os, sys, time, json, subprocess
+from pathlib import Path
+pid = int(sys.argv[1]); cfg = json.loads(sys.argv[2])
+pipx = cfg["pipx"]; pkg = cfg["pkg"]; connect_args = cfg["connect_args"]
 def alive(p):
     if sys.platform == "win32":
         import ctypes
@@ -152,7 +166,34 @@ for _ in range(120):  # wait up to ~60s for the bridge to exit
         break
     time.sleep(0.5)
 time.sleep(2)  # grace for the OS to release the loopback port
-subprocess.run(cmd)
+def installed_entry():
+    """Path to the persistently-installed agent console script, or None."""
+    try:
+        r = subprocess.run(pipx + ["environment", "--value", "PIPX_LOCAL_VENVS"],
+                           capture_output=True, text=True, timeout=30)
+        venvs = (r.stdout or "").strip()
+        if r.returncode != 0 or not venvs:
+            return None
+        rel = ("Scripts", pkg + ".exe") if sys.platform == "win32" else ("bin", pkg)
+        cand = Path(venvs).joinpath(pkg, *rel)
+        return str(cand) if cand.exists() else None
+    except Exception:
+        return None
+# 1) Upgrade the PERSISTENT install so the launcher pins to a durable venv.
+entry = None
+try:
+    r = subprocess.run(pipx + ["install", "--force", pkg], timeout=600)
+    if r.returncode == 0:
+        entry = installed_entry()
+except Exception:
+    entry = None
+# 2) Connect from the persistent install if resolved; else the ephemeral pipx-run
+#    fallback (never worse than before). Both redeploy the skill + re-pin the
+#    launcher + start the new bridge.
+if entry:
+    subprocess.run([entry] + connect_args)
+else:
+    subprocess.run(pipx + ["run", "--no-cache", pkg] + connect_args)
 '''
 
 
@@ -223,10 +264,13 @@ def _spawn_detached(cmd: list, log_name: str) -> bool:
 
 
 def spawn_detached_reconnect() -> bool:
-    """Spawn a DETACHED process that, once THIS (bridge) process exits, runs
-    ``pipx run --no-cache superresearch-agent connect --yes --no-login`` — fetching the latest
-    agent from PyPI, redeploying the skill, re-pinning the launcher to the new code,
-    and starting the new bridge. Returns True if the helper launched.
+    """Spawn a DETACHED process that, once THIS (bridge) process exits, upgrades the
+    PERSISTENT agent install (`pipx install --force superresearch-agent`) and
+    reconnects from it — fetching the latest agent from PyPI, redeploying the skill,
+    re-pinning the ONLOGON launcher to the DURABLE venv (so a reboot comes back on
+    the new version), and starting the new bridge. Falls back to the ephemeral
+    `pipx run --no-cache … connect` when the persistent venv can't be resolved, so
+    it is never worse than before. Returns True if the helper launched.
 
     The caller (the /agent-install route) shuts the bridge down right after, so the
     waiter's connect finds the loopback port free and the new bridge binds it."""
@@ -234,19 +278,16 @@ def spawn_detached_reconnect() -> bool:
     py = _waiter_python()
     if pipx is None or py is None:
         return False
-    # --no-cache is REQUIRED: without it `pipx run` re-uses its cached (~14-day)
-    # run-venv and re-runs the STALE build, so "update the agent" would redeploy
-    # the old version forever (the reported stuck-at-vX bug). Mirrors
-    # connect.py:run_agent_in_wsl, which forces it for connect/serve/resurrect.
-    reconnect = [*pipx, "run", "--no-cache", AGENT_PKG, "connect", "--yes", "--no-login"]
+    connect_args = ["connect", "--yes", "--no-login"]
     # Target the SAME runtime that was originally connected — otherwise a host with
     # both runtimes installed would hit connect's "multiple runtimes — pass
     # --runtime" abort, finish without starting a bridge, and (since we shut the old
     # one down) leave chat dead.
     rt = prefs.get_runtime()
     if rt:
-        reconnect += ["--runtime", rt]
-    cmd = [py, "-c", _RECONNECT_WAITER, str(os.getpid()), *reconnect]
+        connect_args += ["--runtime", rt]
+    cfg = json.dumps({"pipx": pipx, "pkg": AGENT_PKG, "connect_args": connect_args})
+    cmd = [py, "-c", _RECONNECT_WAITER, str(os.getpid()), cfg]
     return _spawn_detached(cmd, "self-update.log")
 
 

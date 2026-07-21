@@ -56,7 +56,11 @@ nothing to mean the most-recent / active run.
   device, not in this chat. This holds in EVERY case: **working normally** (relay
   the run the client started) · **no device on the account** (`sr.py research`
   does NOT fail silently — it returns the pair-a-device step; relay it and walk
-  them through pairing) · **skill genuinely broken** (`scripts/sr.py` missing / it
+  them through pairing) · **the account HAS computers but none is the obvious one**
+  (several linked, none online/selected → the client returns a "which computer
+  should run this?" list; relay it — the user replies "use <name>", which the
+  client remembers — NEVER the pair/install step, they already have computers) ·
+  **skill genuinely broken** (`scripts/sr.py` missing / it
   errors / the bridge keeps failing → tell the user the skill isn't correctly
   installed, fix by re-running `connect`, and **STOP**). The same rule applies to
   status / podcast / list / links / devices: run the client, relay its output — do
@@ -170,7 +174,7 @@ cancels. Never send the bare "yes" back into `do`.
 | "remove / uninstall / disconnect Super Research entirely" | **confirm** ("just sign out, or fully remove skill + bridge?"), then `pipx run superresearch-agent disconnect --yes` (FULL teardown), then tell them to run **/reload-skills** so `/sr` unregisters. Do NOT use the runtime's own skill-removal (leaves the bridge running) or `sr.py logout` (sign-out only). |
 | "host the backend on this PC", "install Super Research here", "no devices — set one up" | **confirm**, then `sr.py install`, then guide pairing |
 | "what version?" | `sr.py version` (shows the SKILL version only; nudges when a newer skill version is available. The backend's version lives in the app's Settings → About — don't mention the backend here) |
-| "update", "update the skill", "update yourself" (colloquial "update the agent" too) | **confirm**, then `sr.py update` (updates the Super Research **skill** — this chat's scripts + bridge; briefly restarts). This is the ONLY thing the runtime updates. |
+| "update", "update the skill", "update yourself" (colloquial "update the agent" too) | **confirm**, then `sr.py update` (updates the Super Research **skill** — this chat's scripts + bridge). It returns a do-not-relay finish script — FOLLOW IT: wait for the bridge to restart, verify the new version with `sr.py version` (retry a few times while it restarts), then run **/reload-skills ONCE**, then post one "✓ updated to vX" line. Do NOT improvise your own recovery. This is the ONLY thing the runtime updates. |
 | "update Super Research", "update the backend", "update the research computer" | the runtime does NOT update the backend — tell them to run `superresearch --update` on the Research computer **or** update it from the app (Settings → About / the update notification). `sr.py do "<message>"` returns this exact redirect. |
 | just `/sr`, "what can you do?", "help" | `sr.py status-account` → welcome (see **A bare `/sr`**) |
 
@@ -260,17 +264,24 @@ never `retry`, never a question back to the user.
 - **install** → confirm first. Installs the backend on the connected device (turns
   that PC into a Research Computer) — then guide pairing (`superresearch --pair` on that
   PC → 8-char code → you run `device-add`; they finish API-key + browser-login on
-  the PC). Use when `research` reports "no devices yet".
+  the PC). Use ONLY when `research` reports "no devices yet" (reason `no_devices`) —
+  NOT when it returns a "which computer?" list (the account already has computers;
+  relay the list and let the user pick with "use <name>").
 - **version / update** → `version` relays the SKILL version only (never mention a
   backend version — the app's Settings → About owns that) and nudges
   only when a newer **skill** version is available. `update` (alias `update-skill`;
   NL also handles "upgrade"/"update the skill"/colloquial "update the agent")
-  updates the Super Research **skill** — this chat's scripts + bridge — confirm;
-  the bridge briefly restarts. It's the ONLY thing the runtime updates. The
-  runtime does NOT update the **backend** — if the user asks to update Super
-  Research / the backend, tell them to run `superresearch --update` on the Research
-  computer **or** update it from the app (Settings → About / the update
-  notification; the app also notifies when a backend update is available).
+  updates the Super Research **skill** — this chat's scripts + bridge — confirm
+  first. `update` restarts the bridge on the new version and returns a **do-not-relay
+  finish script**: follow it exactly — (1) wait ~25s, (2) run `version` and retry a
+  few times until it reports the NEW version, (3) run **/reload-skills once** so the
+  refreshed `/sr` scripts load, (4) post one "✓ updated to vX and reloaded" line.
+  Do NOT invent your own multi-step recovery — the update is self-verifying now.
+  It's the ONLY thing the runtime updates. The runtime does NOT update the
+  **backend** — if the user asks to update Super Research / the backend, tell them to
+  run `superresearch --update` on the Research computer **or** update it from the app
+  (Settings → About / the update notification; the app also notifies when a backend
+  update is available).
 
 ## Devices & Research Computers
 

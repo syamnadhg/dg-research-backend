@@ -110,10 +110,13 @@ def test_spawn_detached_reconnect_builds_pipx_connect(tmp_path, monkeypatch):
     cmd = seen["cmd"]
     assert cmd[0] == "python3" and "-c" in cmd                # waiter runs under a stable python
     assert str(__import__("os").getpid()) in cmd              # waits for THIS bridge pid
-    # …then reconnects from the latest published agent. --no-cache is REQUIRED:
-    # without it pipx re-runs its cached (stale) run-venv → the stuck-at-vX bug.
-    assert cmd[-7:] == ["pipx", "run", "--no-cache", "superresearch-agent",
-                        "connect", "--yes", "--no-login"]
+    # The waiter carries a JSON config: it upgrades the PERSISTENT install
+    # (`pipx install --force`) then connects from it (durable ONLOGON launcher),
+    # falling back inside the waiter to the ephemeral `pipx run --no-cache` path.
+    cfg = json.loads(cmd[-1])
+    assert cfg["pipx"] == ["pipx"]
+    assert cfg["pkg"] == "superresearch-agent"
+    assert cfg["connect_args"] == ["connect", "--yes", "--no-login"]  # no runtime pin here
 
 
 def test_spawn_detached_reconnect_targets_recorded_runtime(tmp_path, monkeypatch):
@@ -127,7 +130,14 @@ def test_spawn_detached_reconnect_targets_recorded_runtime(tmp_path, monkeypatch
     monkeypatch.setattr(selfupdate.subprocess, "Popen",
                         lambda cmd, **kw: seen.update(cmd=cmd) or types.SimpleNamespace())
     assert selfupdate.spawn_detached_reconnect() is True
-    assert seen["cmd"][-2:] == ["--runtime", "hermes"]
+    cfg = json.loads(seen["cmd"][-1])
+    assert cfg["connect_args"][-2:] == ["--runtime", "hermes"]
+
+
+def test_reconnect_waiter_compiles():
+    # The waiter is an embedded `-c` string; a typo would only surface at runtime
+    # during a real self-update. Compile it here so it's regression-guarded.
+    compile(selfupdate._RECONNECT_WAITER, "<reconnect-waiter>", "exec")
 
 
 def test_spawn_detached_reconnect_no_pipx(monkeypatch):

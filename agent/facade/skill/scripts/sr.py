@@ -59,7 +59,7 @@ from pathlib import Path
 # silently (live 2026-07-02: a stale copy predating the podcast MEDIA: fix
 # kept sending bare audio paths). Bumped together with pyproject.toml —
 # guarded by tests/test_sr_skip_agents.py::test_skill_build_matches_package_version.
-_SKILL_BUILD = "0.1.26"
+_SKILL_BUILD = "0.1.27"
 
 _TIMEOUT = 30
 # By-title run resolution scans the newest N runs (status / podcast / list / the
@@ -644,6 +644,33 @@ def cmd_device_remove(args) -> int:
     ])
 
 
+def _pick_device_lines(body: dict, reason: str) -> list[str]:
+    """Chat lines for the 'which computer should run this?' ask — the account HAS
+    research computers, it just needs to be told which (a multi-device account with
+    no single online default). Renders the device list the bridge attached to the
+    error; falls back to a /devices fetch for an older bridge that didn't. The user
+    replies "use <name>" (→ device-use, which persists the choice)."""
+    devices = body.get("devices")
+    if not isinstance(devices, list) or not devices:
+        code, b2 = _get("/devices")
+        devices = b2.get("devices", []) if (code == 200 and isinstance(b2, dict)) else []
+    devices = [d for d in devices if isinstance(d, dict) and (d.get("name") or d.get("hostname") or d.get("id"))]
+    if not devices:
+        # No reachable devices after all → the pair/install step (older bridge path).
+        return ["Paste the access code from your Research Computer first.", "", *_SETUP_NODE_LINES]
+    if reason == "stale_selection":
+        lead = "The computer you last used isn’t reachable anymore — pick another:"
+    else:
+        lead = f"You have {len(devices)} research computers — which should run this?"
+    lines = [lead]
+    for d in devices:
+        online = d.get("online")
+        dot = " · online" if online is True else (" · offline" if online is False else "")
+        lines.append(f"  • {_dev_label(d)}{dot}")
+    lines.append(f'Just say: use “{_dev_label(devices[0])}”.')
+    return lines
+
+
 def cmd_research(args) -> int:
     payload: dict = {"topic": args.topic}
     if args.device:
@@ -700,14 +727,25 @@ def cmd_research(args) -> int:
             return _emit(body, args.json, [
                 "You're not signed in yet — tell me to log you in and I'll send a link.",
             ], _fail_code(code))
-        # Signed in but no device on the account yet → guide connecting one, plainly.
+        # Signed in but the run couldn't be routed to a device. Tell the two cases
+        # apart by the bridge's machine-readable `reason` (NOT an English substring —
+        # "no device selected" and "no devices yet" both contain "no device", so the
+        # old substring test mis-sent a MULTI-device account to the "install a backend
+        # here" prompt). no_devices → pair/install one; no_selection/stale_selection →
+        # the account HAS computers, ask which. Older bridge (no reason): infer from text.
         err = str(body.get("error", "")).lower()
-        if "no device" in err:
+        reason = body.get("reason")
+        if not reason:
+            reason = ("no_devices" if ("no devices yet" in err or "grab the pair code" in err)
+                      else ("no_selection" if "no device" in err else ""))
+        if reason == "no_devices":
             return _emit(body, args.json, [
                 "Paste the access code from your Research Computer first.",
                 "",
                 *_SETUP_NODE_LINES,
             ], _fail_code(code))
+        if reason in ("no_selection", "stale_selection"):
+            return _emit(body, args.json, _pick_device_lines(body, reason), _fail_code(code))
         return _emit(body, args.json, [f"✗ couldn't start: {body.get('error', code)}"], _fail_code(code))
     dev = _device_names().get(body.get("deviceId") or "", body.get("deviceId") or "")
     where = f" on {dev}" if dev else ""
@@ -1073,10 +1111,34 @@ def cmd_update(args) -> int:
         cur = body.get("current") or ""
         return _emit(body, args.json,
                      [f"✓ The skill is already up to date{(' (v' + cur + ')') if cur else ''}."])
-    return _emit(body, args.json, [
-        "⬆️ Updating the Super Research skill (scripts + bridge) to the latest version.",
-        "The bridge briefly restarts on the new version — say “version” in a bit to confirm.",
-    ])
+    # Seamless finish: the bridge restarts on the new version in the background;
+    # hand the assistant a DETERMINISTIC verify→reload→confirm script so it doesn't
+    # improvise multi-step recovery (the reported friction) and the user gets ONE
+    # clean confirmation. The reload step runs the runtime's OWN skill-reload (Hermes
+    # /reload-skills) — the one thing the skill can't self-trigger — so it cooperates
+    # with the runtime instead of fighting it.
+    finish = [
+        "The Super Research update is now running: a detached helper is upgrading the "
+        "package and restarting the bridge on the new version. Finish it cleanly, in "
+        "THIS order — act SILENTLY, do not narrate these steps:",
+        "1. Wait ~30 seconds for the new bridge to come up (the package upgrade can "
+        "briefly leave the bridge unreachable — that's expected).",
+        "2. Run the Super Research `version` command. If it errors (bridge still "
+        "restarting / unreachable) or still reports the OLD version, wait ~15s and "
+        "retry — up to 6 times (~90s total) before giving up.",
+        "3. Once `version` reports the NEW version, run your runtime's skill-reload "
+        "command ONCE (Hermes: /reload-skills) so the refreshed /sr scripts are picked "
+        "up. Skip this if your runtime has no reload command. NOTE: before the reload, "
+        "`version` may warn that “this chat's scripts are older” — that is EXPECTED and "
+        "the reload fixes it; do NOT run “update” again (no update loop).",
+        "4. Then post ONE line to the user: “✓ Super Research updated to v<version> and "
+        "reloaded.” If after the retries it still shows the old version, tell the user "
+        "the update didn’t take and to say “update” again.",
+    ]
+    return _emit(body, args.json,
+                 ["⬆️ Updating Super Research to the latest version — the bridge restarts on "
+                  "the new version in a few seconds. I’ll confirm here once it’s live."]
+                 + _agent_directive_block(finish))
 
 
 def cmd_install(args) -> int:

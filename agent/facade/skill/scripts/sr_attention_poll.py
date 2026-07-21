@@ -37,11 +37,13 @@ mints each phase's permanent share; this script just renders + de-dups.
 
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -49,6 +51,36 @@ from pathlib import Path
 
 _TIMEOUT = 30  # the bridge may mint a phase's SR share on this call (FE round-trip)
 _STATE_FILE = Path(__file__).with_name(".sr_stream_state.json")
+
+# On the BASELINE tick (watchdog just armed) a completion is announced only when
+# it's this recent — so arming while an OLD finished run sits in the /updates
+# window doesn't replay a stale 🎉, but a run that finished just before the first
+# tick (watchdog armed late — e.g. after an update/restart) still gets announced.
+_RECENT_COMPLETION_MS = 6 * 3600 * 1000  # 6h
+
+
+def _now_ms() -> float:
+    return time.time() * 1000
+
+
+def _run_epoch_ms(run: dict) -> "float | None":
+    """`updatedAt` as epoch millis. Firestore hands it back as an ISO-8601 string
+    (timestampValue); a numeric millis is also accepted. None when absent/unparseable
+    (→ callers treat it as NOT recent, the safe/quiet direction)."""
+    v = run.get("updatedAt")
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return float(v)
+    if isinstance(v, str) and v:
+        try:
+            return dt.datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp() * 1000
+        except Exception:
+            return None
+    return None
+
+
+def _is_recent_completion(run: dict, now_ms: float) -> bool:
+    ms = _run_epoch_ms(run)
+    return ms is not None and (now_ms - ms) < _RECENT_COMPLETION_MS
 
 # Statuses that are genuinely "stuck mid-flight" — the only blockers worth raising
 # on the BASELINE tick. A long-dead errored run is history the user already saw.
@@ -233,18 +265,25 @@ def _ended_line(run: dict) -> str:
             "Say “retry” to resume, or start a new research.")
 
 
-def compute(runs: list, prior_state: dict, *, baseline: bool = False) -> tuple[list[str], dict]:
+def compute(runs: list, prior_state: dict, *, baseline: bool = False,
+            now_ms: "float | None" = None) -> tuple[list[str], dict]:
     """Pure core (unit-tested): (chat lines to post, new state to persist).
 
     Quiet by design: per-phase progress is NEVER pushed (that's on-demand via
     `status`). The only run-progress message posted proactively is the ONE
-    completion banner + all SR links, emitted when the run's final phase lands.
-    Each phase is still tracked in `announced` (silently) so the completion fires
-    exactly once and is never replayed; a needs-attention blocker and an
-    ended-early notice are the other two proactive messages. ``baseline=True``
-    (first tick after arming) records the current phase state SILENTLY so a
-    pre-existing run isn't announced as if it just finished — but still raises a
-    blocker on a run that is stuck RIGHT NOW."""
+    completion banner + all SR links, emitted when the run reaches its terminal
+    ``completed`` STATUS — NOT off a single phase's ``final`` flag: a run with its
+    last phase disabled (e.g. email off) still completes and must announce, and a
+    phase seen earlier as non-final must still trigger the banner when the run
+    finishes. Completion is tracked via the per-run ``completed`` flag so it fires
+    exactly once and survives across ticks (the state file outlives a bridge
+    restart). A needs-attention blocker and an ended-early notice are the other two
+    proactive messages. ``baseline=True`` (first tick after arming) stays SILENT for
+    pre-existing progress — but STILL announces a RECENT completion (a run that
+    finished right before a late/first tick, e.g. the watchdog armed after an
+    update/restart) and still raises a blocker on a run stuck RIGHT NOW."""
+    if now_ms is None:
+        now_ms = _now_ms()
     out: list[str] = []
     new_state: dict = {}
     for run in runs:
@@ -252,17 +291,25 @@ def compute(runs: list, prior_state: dict, *, baseline: bool = False) -> tuple[l
         if not rid:
             continue
         prior = prior_state.get(rid, {})
+        # Track seen phases silently (per-phase progress is on-demand only); kept so
+        # a manual `status` and the state shape stay stable, not used to gate the
+        # completion announce anymore.
         announced = set(prior.get("announced", []))
         for pu in run.get("phaseUpdates", []) or []:
             p = pu.get("phase")
-            if p is None or p in announced:
-                continue
-            # Proactively announce ONLY the final, all-links completion message —
-            # never per-phase progress (the user gets that on demand via `status`).
-            # Non-final / skipped phases are tracked silently so completion fires once.
-            if not baseline and pu.get("final"):
+            if p is not None:
+                announced.add(p)
+
+        # ONE proactive completion announce, driven by the run's terminal status.
+        # Fires exactly once (tracked via `completed`); on a baseline tick only a
+        # RECENT completion posts (an old finished run in the window on first arm
+        # stays quiet, but is still marked so it never replays later).
+        completed_announced = bool(prior.get("completed"))
+        run_completed = run.get("status") == "completed"
+        if run_completed and not completed_announced:
+            if not baseline or _is_recent_completion(run, now_ms):
                 out.extend(_final_lines(run))
-            announced.add(p)
+            completed_announced = True
 
         needs = bool(run.get("needsAttention"))
         attention = run.get("attention") or ""
@@ -274,12 +321,11 @@ def compute(runs: list, prior_state: dict, *, baseline: bool = False) -> tuple[l
                 out.append(_attention_line(run))
 
         # Ended early — stopped / cancelled from the app or chat (NOT a normal
-        # finish, which is the 🎉 final-phase line above). Announce ONCE so a chat
-        # user who stops from the web app isn't left hanging. Gated on `prior`
-        # (we tracked this run while it was live, so this is a real transition,
-        # not an old terminal run surfacing) and never on the baseline tick.
-        had_final = any((pu.get("final") for pu in run.get("phaseUpdates", []) or []))
-        ended = (not _is_active(run)) and not had_final
+        # finish, which is status=="completed" → the 🎉 banner above). Announce ONCE
+        # so a chat user who stops from the web app isn't left hanging. Gated on
+        # `prior` (we tracked this run while it was live, so this is a real
+        # transition, not an old terminal run surfacing) and never on baseline.
+        ended = (not _is_active(run)) and not run_completed
         prior_ended = bool(prior.get("ended"))
         if ended and not prior_ended and not baseline and prior:
             out.append(_ended_line(run))
@@ -289,6 +335,7 @@ def compute(runs: list, prior_state: dict, *, baseline: bool = False) -> tuple[l
             "needs": needs,
             "attention": attention,
             "ended": ended,
+            "completed": completed_announced,
         }
     return out, new_state
 
@@ -410,9 +457,18 @@ def main(origin: dict | None = None) -> int:
     # announce and nothing is running (a later research re-arms a fresh watchdog);
     # a run watchdog stops once this chat has runs but NONE are live and there's
     # nothing new to post. Never tear down on an empty window or while still posting.
+    #
+    # RACE GUARD: do NOT tear down on the same tick we announced a sign-in that
+    # AUTO-STARTED a run — the new run is often not visible in /updates yet
+    # (Firestore lag), so no_active is a false "nothing to do" that would delete the
+    # very watchdog that must stream (and announce completion for) that run. Keep it
+    # alive; the `runs and not out` path below tears it down once the run is observed
+    # and finishes.
     if origin:
         no_active = not any(_is_active(r) for r in runs)
-        if (announced_login and no_active) or (runs and not out and no_active):
+        login_autostarted = bool(signed_in.get("autoStarted")) if isinstance(signed_in, dict) else False
+        login_done_idle = announced_login and no_active and not login_autostarted
+        if login_done_idle or (runs and not out and no_active):
             _teardown(origin)
     return 0
 
