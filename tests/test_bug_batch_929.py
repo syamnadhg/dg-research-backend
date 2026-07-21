@@ -279,10 +279,12 @@ def test_launch_sites_reset_persisted_agent_status():
     # #929 (review-hardened): the "running" reset lives at each agent's
     # LAUNCH site — a phase-entry write stranded never-launched agents on a
     # persisted "running" when the user stopped during the sequential
-    # launch window.
-    assert '_write_agent_terminal_status("chatgpt", "running")' in _P2
-    assert '_write_agent_terminal_status("claude", "running")' in _P2
-    assert '_write_agent_terminal_status("gemini", "running")' in _P2
+    # launch window. force=True (org-PR#3 review): the reset is a LEGITIMATE
+    # skipped/errored -> running transition, so it must bypass the
+    # _write_agent_terminal_status guard that blocks the stale retry-intake path.
+    assert '_write_agent_terminal_status("chatgpt", "running", force=True)' in _P2
+    assert '_write_agent_terminal_status("claude", "running", force=True)' in _P2
+    assert '_write_agent_terminal_status("gemini", "running", force=True)' in _P2
     assert '_write_agent_terminal_status(_stale_ag, "running")' not in _P2
 
 

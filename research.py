@@ -8271,7 +8271,7 @@ def _do_agent_terminal_status_write(agent_key: str, status: str):
     _set_research_doc(_fb_uid, _fb_research_id, {"agents": {ak: {"status": status}}}, merge=True)
 
 
-def _write_agent_terminal_status(agent_key: str, status: str):
+def _write_agent_terminal_status(agent_key: str, status: str, force: bool = False):
     """Persist a per-agent terminal status to the root research doc so the
     listing-page tile + chat phase icons + in-chat config icons all stay
     consistent across browser reloads. Volatile signals (FE alerts,
@@ -8327,11 +8327,24 @@ def _write_agent_terminal_status(agent_key: str, status: str):
     # the poisoning at its source (both the sync record AND the Firestore
     # write below). Terminal↔terminal transitions (errored→complete, etc.)
     # are unaffected.
-    if status == "running":
+    # A terminal "skipped" is protected the SAME way — but ONLY against the
+    # stale retry-intake path (force=False). A stale Retry on a skipped card
+    # (esp. a hands-off HV/Cloudflare auto-skip, whose results status
+    # "skipped_auto_hv" isn't in the hard-retry veto set) would poison the
+    # persisted status to "running" — defeating the veto and RE-NAVIGATING the
+    # verification-walled surface (violates the hands-off directive), and
+    # reverting the greyed skipped tile on reload (#722/#921 tile consistency).
+    # BUT there IS one legitimate skipped→running transition: the #929
+    # launch-site reset in run_phase2 relaunches a previously skipped/errored
+    # agent (checkpoint resume / "Retry Phase 2") and MUST clear its stale grey
+    # tile — those callers pass force=True to bypass this guard. The blanket
+    # guard (without force) would re-introduce #929 "bug 0" (relaunched agent
+    # stuck grey through the fresh attempt), so the distinction is load-bearing.
+    if status == "running" and not force:
         _cur = (_agent_status_by_rid.get(_fb_research_id, {}) or {}).get((agent_key or "").lower())
-        if _cur == "complete":
+        if _cur in ("complete", "skipped"):
             log(f"[{agent_key}] Ignoring transient 'running' status write — agent "
-                "already recorded 'complete' (stale retry on a resolved card)", "INFO")
+                f"already recorded '{_cur}' (stale retry on a resolved card)", "INFO")
             return
     # #722 Bug A: record synchronously (BEFORE the async write) so a
     # concurrent save_meta() rebuild re-stamps this status onto its agents
@@ -35798,7 +35811,9 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         # Claude skipped pre-login stayed grey after resume). Launch-site, not
         # phase-entry, so an early Stop can't strand a never-launched agent on
         # a persisted "running". Same transient value the Retry-intake writes.
-        _write_agent_terminal_status("chatgpt", "running")
+        # force=True: this is a legitimate relaunch reset, so it must override a
+        # stale "skipped"/"errored" (the guard blocks only the stale retry path).
+        _write_agent_terminal_status("chatgpt", "running", force=True)
         # 2026-07-06 bot-score work: REUSE the warm Phase-1 ChatGPT tab instead
         # of opening a second one. Every cold top-level chatgpt.com load is a
         # Cloudflare-scored event; P1 already paid it and left a warm,
@@ -35960,7 +35975,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         log("\n--- 2B: Claude Deep Research ---")
         emit_event("agent_progress", phase=2, agent="claude", status="starting", progress="Opening Claude with Opus 4.8 (Max effort + Adaptive Thinking) + Research tools...")
         # #929: launch-site persisted-status reset — see the 2A note.
-        _write_agent_terminal_status("claude", "running")
+        _write_agent_terminal_status("claude", "running", force=True)
         for attempt in range(2):
             if attempt > 0:
                 log("[2B] Retrying Claude (fresh tab)...", "WARN")
@@ -36069,7 +36084,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         log("\n--- 2C: Gemini Deep Research (submit + let it plan) ---")
         emit_event("agent_progress", phase=2, agent="gemini", status="starting", progress="Opening Gemini and submitting research brief...")
         # #929: launch-site persisted-status reset — see the 2A note.
-        _write_agent_terminal_status("gemini", "running")
+        _write_agent_terminal_status("gemini", "running", force=True)
         gemini_page, gemini_setup_ok = await start_agent_no_gemini_wait(
             browser, cua_client, "https://gemini.google.com",
             PROMPT_GEMINI_DEEP_RESEARCH,

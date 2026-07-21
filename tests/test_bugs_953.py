@@ -327,11 +327,47 @@ def test_skip_never_clobbers_a_recorded_done_result():
 def test_running_status_cannot_overwrite_complete():
     # ROOT of the retry-then-skip destruction (audit #953-3/#953-5): the retry
     # intake's transient 'running' write must never poison a completed agent's
-    # persisted status — that shared map is what two guards read.
+    # persisted status — that shared map is what two guards read. The guard also
+    # protects a terminal "skipped" (org-PR#3 review): a stale Retry on a
+    # hands-off HV auto-skip would otherwise re-navigate the walled surface and
+    # revert the greyed tile.
     src = inspect.getsource(research._write_agent_terminal_status)
-    assert 'if status == "running":' in src
-    assert '_cur == "complete"' in src
-    assert "return" in src.split('if status == "running":')[1][:400]
+    assert 'if status == "running" and not force:' in src
+    assert '_cur in ("complete", "skipped")' in src
+    assert "return" in src.split('if status == "running" and not force:')[1][:400]
+
+
+def test_running_write_refused_over_terminal_status(monkeypatch):
+    # Behavioral: a transient "running" write must not poison a terminal
+    # "complete" OR "skipped" in the shared _agent_status_by_rid map (the guard
+    # returns before recording), while a legitimate "errored"->"running"
+    # badge-clear still lands. Stub the Firebase globals so the function gets
+    # past its no-Firestore early-return (8315), and neuter the async write.
+    monkeypatch.setattr(research, "_firebase_db", object(), raising=False)
+    monkeypatch.setattr(research, "_fb_uid", "uid-test", raising=False)
+    monkeypatch.setattr(research, "_fb_research_id", "rid-test", raising=False)
+    monkeypatch.setattr(research, "_set_research_doc", lambda *a, **k: None, raising=False)
+    for terminal in ("complete", "skipped"):
+        research._agent_status_by_rid.clear()
+        research._record_terminal_status(
+            research._agent_status_by_rid, "rid-test", "gemini", terminal)
+        research._write_agent_terminal_status("gemini", "running")
+        assert research._agent_status_by_rid["rid-test"]["gemini"] == terminal
+    # errored -> running is still allowed (the badge-clear the guard was built for)
+    research._agent_status_by_rid.clear()
+    research._record_terminal_status(
+        research._agent_status_by_rid, "rid-test", "gemini", "errored")
+    research._write_agent_terminal_status("gemini", "running")
+    assert research._agent_status_by_rid["rid-test"]["gemini"] == "running"
+    # force=True (the #929 launch-site relaunch reset) MUST override a stale
+    # "skipped"/"errored" — else a resumed/re-run agent stays grey (#929 bug 0).
+    for terminal in ("skipped", "errored", "complete"):
+        research._agent_status_by_rid.clear()
+        research._record_terminal_status(
+            research._agent_status_by_rid, "rid-test", "gemini", terminal)
+        research._write_agent_terminal_status("gemini", "running", force=True)
+        assert research._agent_status_by_rid["rid-test"]["gemini"] == "running"
+    research._agent_status_by_rid.clear()
 
 
 def test_hard_retry_guard_catches_inflight_completion():
