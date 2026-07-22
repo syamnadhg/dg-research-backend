@@ -50548,11 +50548,11 @@ def _supervisor_installed() -> bool:
     import subprocess as _sp
     plat = _supervisor_platform()
     try:
-        if plat == "macos":
+        if plat == "Darwin":
             return _SUPERVISOR_PLIST_PATH.exists()
-        if plat == "linux":
+        if plat == "Linux":
             return _SUPERVISOR_UNIT_PATH.exists()
-        if plat == "windows":
+        if plat == "Windows":
             r = _sp.run(["schtasks", "/Query", "/TN", _SUPERVISOR_TASK_NAME],
                         capture_output=True, text=True, timeout=15,
                         creationflags=_PS_NO_WINDOW)
@@ -50584,20 +50584,20 @@ def _restart_supervisor() -> "tuple[bool, str]":
     if not _supervisor_installed():
         return False, "not installed"
     try:
-        if plat == "macos":
+        if plat == "Darwin":
             label = f"gui/{_os.getuid()}/{_SUPERVISOR_PLIST_LABEL}"
             r = _sp.run(["launchctl", "kickstart", "-k", label],
                         capture_output=True, text=True, timeout=30)
             if r.returncode != 0:
                 return False, (r.stderr or r.stdout or "kickstart non-zero").strip()[:160]
             return True, "restarted"
-        if plat == "linux":
+        if plat == "Linux":
             r = _sp.run(["systemctl", "--user", "restart", _SUPERVISOR_UNIT_NAME],
                         capture_output=True, text=True, timeout=30)
             if r.returncode != 0:
                 return False, (r.stderr or r.stdout or "restart non-zero").strip()[:160]
             return True, "restarted"
-        if plat == "windows":
+        if plat == "Windows":
             # /End is best-effort: the task may be idle, which returns non-zero.
             try:
                 _sp.run(["schtasks", "/End", "/TN", _SUPERVISOR_TASK_NAME],

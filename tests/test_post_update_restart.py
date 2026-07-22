@@ -132,10 +132,14 @@ def test_restart_supervisor_refuses_when_not_installed(monkeypatch):
     assert ok is False and "not installed" in msg
 
 
+# _supervisor_platform() returns the capitalized platform.system() values
+# ("Darwin"/"Linux"/"Windows") — the restart code branches on exactly those, so
+# the test must monkeypatch the SAME convention (a lowercase stub silently
+# matched no branch and gave false-green coverage for a dead --restart).
 @pytest.mark.parametrize("plat,expect_any", [
-    ("macos", ["kickstart"]),          # -k force-restarts an already-loaded job
-    ("linux", ["restart"]),            # `enable --now` is a NO-OP when running
-    ("windows", ["/Run"]),             # /Create never touches the live process
+    ("Darwin", ["kickstart"]),         # -k force-restarts an already-loaded job
+    ("Linux", ["restart"]),            # `enable --now` is a NO-OP when running
+    ("Windows", ["/Run"]),             # /Create never touches the live process
 ])
 def test_restart_supervisor_uses_a_real_restart_verb(monkeypatch, plat, expect_any):
     monkeypatch.setattr(research, "_supervisor_installed", lambda: True)
@@ -153,7 +157,7 @@ def test_restart_supervisor_uses_a_real_restart_verb(monkeypatch, plat, expect_a
 
     import subprocess
     monkeypatch.setattr(subprocess, "run", _fake_run)
-    if plat == "macos":
+    if plat == "Darwin":
         monkeypatch.setattr(research.os, "getuid", lambda: 501, raising=False)
     ok, msg = research._restart_supervisor()
     flat = " ".join(" ".join(c) for c in seen)
@@ -163,7 +167,7 @@ def test_restart_supervisor_uses_a_real_restart_verb(monkeypatch, plat, expect_a
 
 def test_restart_supervisor_reports_failure(monkeypatch):
     monkeypatch.setattr(research, "_supervisor_installed", lambda: True)
-    monkeypatch.setattr(research, "_supervisor_platform", lambda: "linux")
+    monkeypatch.setattr(research, "_supervisor_platform", lambda: "Linux")
 
     class _R:
         returncode = 1
@@ -178,7 +182,7 @@ def test_restart_supervisor_reports_failure(monkeypatch):
 
 def test_restart_supervisor_never_raises(monkeypatch):
     monkeypatch.setattr(research, "_supervisor_installed", lambda: True)
-    monkeypatch.setattr(research, "_supervisor_platform", lambda: "linux")
+    monkeypatch.setattr(research, "_supervisor_platform", lambda: "Linux")
 
     import subprocess
 
