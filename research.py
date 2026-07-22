@@ -48927,6 +48927,7 @@ def _arm_supervisor_macos() -> "tuple[bool, int | None, str, int]":
     plist to /root/Library/... and leave it un-managed by the actual user."""
     import subprocess as _sp
     import os as _os
+    import time as _time
 
     if _os.geteuid() == 0:
         return False, None, "refuse: do not run under sudo (user agent must be in your own home)", 0
@@ -49008,6 +49009,14 @@ def _arm_supervisor_macos() -> "tuple[bool, int | None, str, int]":
     domain = f"gui/{uid}"
     label = f"{domain}/{_SUPERVISOR_PLIST_LABEL}"
 
+    def _job_loaded() -> bool:
+        """True while launchd still knows the label (bootout is ASYNC)."""
+        try:
+            return _sp.run(["launchctl", "print", label],
+                           capture_output=True, text=True, timeout=10).returncode == 0
+        except Exception:
+            return False
+
     # Bootout first (idempotent — clears any prior install). Errors ignored.
     try:
         _sp.run(["launchctl", "bootout", label],
@@ -49015,15 +49024,31 @@ def _arm_supervisor_macos() -> "tuple[bool, int | None, str, int]":
     except Exception:
         pass
 
+    # …then WAIT for the teardown to actually land. `bootout` returns before the
+    # job is gone, so firing `bootstrap` straight after races it and fails with
+    # "service already bootstrapped"/EBUSY — which is exactly why `--resurrect`
+    # blew up when On-Startup was ALREADY running (the one command a user runs
+    # right after an update). Poll up to ~6s; a still-loaded job is handled below.
+    for _ in range(30):
+        if not _job_loaded():
+            break
+        _time.sleep(0.2)
+
     # Bootstrap into gui/$uid so the agent runs in the Aqua session (Chrome
     # needs that scope for display + clipboard).
     try:
         r = _sp.run(["launchctl", "bootstrap", domain, str(_SUPERVISOR_PLIST_PATH)],
                     capture_output=True, text=True, timeout=15)
         if r.returncode != 0:
-            return False, None, f"bootstrap failed: {(r.stderr or r.stdout).strip()[:120]}", 0
+            # Only a REAL failure if the job isn't loaded. If it is (the bootout
+            # hadn't drained, or another arm won the race), the plist on disk is
+            # already the fresh one and the `kickstart -k` below force-restarts
+            # the job onto it — so treat that as success instead of a hard error.
+            if not _job_loaded():
+                return False, None, f"bootstrap failed: {(r.stderr or r.stdout).strip()[:120]}", 0
     except Exception as e:
-        return False, None, f"bootstrap exception: {e}", 0
+        if not _job_loaded():
+            return False, None, f"bootstrap exception: {e}", 0
 
     # Enable + kickstart (best-effort — bootstrap usually starts the job,
     # kickstart forces a run regardless).
@@ -50517,6 +50542,80 @@ def _apply_supervisor_respawn_policy() -> "tuple[bool, str]":
         return False, f"PS error: {e}"
 
 
+def _supervisor_installed() -> bool:
+    """Whether the always-on supervisor is pinned on this machine (launchd agent /
+    systemd --user unit / Scheduled Task). Cheap + best-effort; False on any doubt."""
+    import subprocess as _sp
+    plat = _supervisor_platform()
+    try:
+        if plat == "macos":
+            return _SUPERVISOR_PLIST_PATH.exists()
+        if plat == "linux":
+            return _SUPERVISOR_UNIT_PATH.exists()
+        if plat == "windows":
+            r = _sp.run(["schtasks", "/Query", "/TN", _SUPERVISOR_TASK_NAME],
+                        capture_output=True, text=True, timeout=15,
+                        creationflags=_PS_NO_WINDOW)
+            return r.returncode == 0
+    except Exception:
+        return False
+    return False
+
+
+def _restart_supervisor() -> "tuple[bool, str]":
+    """Restart an ALREADY-INSTALLED supervisor so it re-execs the code on disk.
+
+    This is the post-update step: `pipx upgrade` / `--update` / the web installer
+    all replace the package, but the RUNNING supervisor keeps the old code in
+    memory until it is cycled. Each platform needs a real restart — the arm/install
+    calls are NOT enough on their own:
+
+      • macOS   — `launchctl kickstart -k` (the -k kills then restarts the job).
+                  `bootstrap` alone errors when the job is already loaded.
+      • Linux   — `systemctl --user restart`. `enable --now` is a no-op on an
+                  already-running unit, so it would keep serving the OLD code.
+      • Windows — `schtasks /End` then `/Run`. `/Create /F` rewrites the task
+                  definition but never touches the running process.
+
+    Returns (ok, message). Never raises."""
+    import subprocess as _sp
+    import os as _os
+    plat = _supervisor_platform()
+    if not _supervisor_installed():
+        return False, "not installed"
+    try:
+        if plat == "macos":
+            label = f"gui/{_os.getuid()}/{_SUPERVISOR_PLIST_LABEL}"
+            r = _sp.run(["launchctl", "kickstart", "-k", label],
+                        capture_output=True, text=True, timeout=30)
+            if r.returncode != 0:
+                return False, (r.stderr or r.stdout or "kickstart non-zero").strip()[:160]
+            return True, "restarted"
+        if plat == "linux":
+            r = _sp.run(["systemctl", "--user", "restart", _SUPERVISOR_UNIT_NAME],
+                        capture_output=True, text=True, timeout=30)
+            if r.returncode != 0:
+                return False, (r.stderr or r.stdout or "restart non-zero").strip()[:160]
+            return True, "restarted"
+        if plat == "windows":
+            # /End is best-effort: the task may be idle, which returns non-zero.
+            try:
+                _sp.run(["schtasks", "/End", "/TN", _SUPERVISOR_TASK_NAME],
+                        capture_output=True, text=True, timeout=20,
+                        creationflags=_PS_NO_WINDOW)
+            except Exception:
+                pass
+            r = _sp.run(["schtasks", "/Run", "/TN", _SUPERVISOR_TASK_NAME],
+                        capture_output=True, text=True, timeout=20,
+                        creationflags=_PS_NO_WINDOW)
+            if r.returncode != 0:
+                return False, (r.stderr or r.stdout or "schtasks /Run non-zero").strip()[:160]
+            return True, "restarted"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    return False, f"unsupported platform ({plat})"
+
+
 def _arm_supervisor_quiet() -> "tuple[bool, int | None, str, int]":
     """Dispatcher — routes to `_arm_supervisor_quiet_windows`,
     `_arm_supervisor_macos`, or `_arm_supervisor_linux`. Returns the same
@@ -51141,6 +51240,50 @@ def run_resurrect():
         ("python research.py --retire", "disable On Startup"),
         ("python research.py agent connect", "drive Super Research from chat (Hermes / OpenClaw)"),
     ])
+
+
+def run_restart():
+    """`superresearch --restart` — cycle the running backend onto the code that is
+    currently ON DISK. This is the missing step after ANY update route: `--update`,
+    a bare `pipx upgrade`, or the superresearch.io installer all replace the
+    package, but the live process keeps the old build in memory until restarted.
+
+    Deliberately NOT `--retire` + `--resurrect`: retire REMOVES On Startup (a
+    teardown, not a restart), so that pairing left users disabling always-on just to
+    pick up an update. This keeps the pin and restarts in place.
+
+    With always-on installed → restart the supervisor (launchctl kickstart -k /
+    systemctl --user restart / schtasks /End+/Run). Without it there is nothing
+    supervised to cycle, so point at the manual path instead of failing."""
+    _branded_header("recursus", _BOLD + _ACCENT, "return · restart Super Research")
+    installed = _sr_version()
+    running = _running_version()
+
+    if not _supervisor_installed():
+        print("  On Startup isn't set up on this machine — nothing supervised to restart.")
+        if running:
+            print(f"  {_c(_DIM, 'Stop the running backend, then start it again:')}  {_c(_BOLD, _PROG + ' --serve')}")
+        else:
+            print(f"  {_c(_DIM, 'Start the backend with')}  {_c(_BOLD, _PROG + ' --serve')}"
+                  f"  {_c(_DIM, '(or')} {_c(_BOLD, _PROG + ' --resurrect')} {_c(_DIM, 'for always-on).')}")
+        print()
+        return
+
+    if running and running != installed:
+        print(f"  Running  {_c(_DIM, 'v' + running)}  →  installed  {_c(_BOLD + _OK, 'v' + installed)}")
+    else:
+        print(f"  Restarting the backend  {_c(_DIM, '(v' + installed + ')')}")
+
+    ok, msg = _restart_supervisor()
+    if not ok:
+        print(f"  {_c(_WARN, '⚠')}  Couldn't restart the supervisor: {msg}")
+        print(f"  {_c(_DIM, 'Fallback:')}  {_c(_BOLD, _PROG + ' --retire')}  {_c(_DIM, 'then')}  {_c(_BOLD, _PROG + ' --resurrect')}")
+        print()
+        return
+
+    print(f"  {_c(_OK, '✓')}  Backend restarted on v{installed}.")
+    print(f"  {_c(_DIM, 'It reconnects in a few seconds — the device goes green in the app when it is live.')}")
+    print()
 
 
 def run_retire():
@@ -51958,6 +52101,8 @@ def run_commands_help():
     _section("Lifecycle (supervised auto-restart)", [
         ("python research.py --resurrect",
          "Install OS-native supervisor — auto-start at login + restart on crash"),
+        ("python research.py --restart",
+         "Restart the backend onto a newly installed version (the step after --update / pipx upgrade); keeps On Startup on"),
         ("python research.py --retire",
          "Disable On Startup — removes the supervisor; foreground --serve unchanged"),
         ("python research.py --unpair",
@@ -52380,6 +52525,105 @@ def _sr_version() -> str:
         return "(source checkout)"
 
 
+# Version of the backend the CURRENTLY-RUNNING serve process is executing. The
+# installed version (wheel metadata) tells you what's on disk; this tells you what
+# is actually live. They diverge the moment a package upgrade lands — by ANY route
+# (`--update`, a bare `pipx upgrade`, or the web installer) — because the running
+# process keeps its old code in memory until it is restarted. Without this the
+# update looks finished while the old build is still serving.
+_RUNNING_VERSION_PATH = _STATE_DIR / "running-version.json"
+
+
+def _write_running_version() -> None:
+    """Record what this serve process is running. Best-effort — never blocks serve."""
+    try:
+        _STATE_DIR.mkdir(parents=True, exist_ok=True)
+        _RUNNING_VERSION_PATH.write_text(
+            json.dumps({"version": _sr_version(), "pid": os.getpid(),
+                        "started_at": time.time()}),
+            encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _running_version() -> "str | None":
+    """Version of the live serve process, or None when nothing is running / unknown.
+    A recorded PID that is no longer alive means the marker is stale → None."""
+    try:
+        data = json.loads(_RUNNING_VERSION_PATH.read_text(encoding="utf-8"))
+        ver, pid = data.get("version"), data.get("pid")
+        if not ver or not isinstance(pid, int):
+            return None
+        if not _pid_alive(pid):
+            return None
+        return str(ver)
+    except Exception:
+        return None
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            h = ctypes.windll.kernel32.OpenProcess(0x00100000, 0, pid)  # SYNCHRONIZE
+            if not h:
+                return False
+            ctypes.windll.kernel32.CloseHandle(h)
+            return True
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, OSError, Exception):
+        return False
+
+
+def _restart_pending() -> "tuple[str, str] | None":
+    """(running_version, installed_version) when a newer build is installed than the
+    one actually serving — i.e. an update landed and the backend still needs a
+    restart. None when nothing is running, versions match, or we can't tell."""
+    running = _running_version()
+    if not running:
+        return None
+    installed = _sr_version()
+    if not installed or installed.startswith("("):     # source checkout
+        return None
+    if running == installed:
+        return None
+    return running, installed
+
+
+def _restart_hint_lines() -> list:
+    """The one place that words the post-update restart. Used by --update, --version
+    and the generic nudge so the instruction never drifts between them."""
+    if _supervisor_installed():
+        cmd = f"{_PROG} --restart"
+        why = "always-on is set up, so this cycles the supervisor onto the new build"
+    else:
+        cmd = f"{_PROG} --serve"
+        why = "stop the running backend, then start it again"
+    return [
+        f"  {_c(_WARN, '⚠')}  Update installed, but the RUNNING backend is still the old build.",
+        f"  {_c(_DIM, 'Restart it:')}  {_c(_BOLD, cmd)}   {_c(_DIM, '(' + why + ')')}",
+    ]
+
+
+def _warn_if_restart_pending() -> None:
+    """Print the restart nudge when a newer build is installed than the one serving.
+    Called from the CLI dispatch so it surfaces no matter HOW the update arrived —
+    `--update`, a bare `pipx upgrade`, or the superresearch.io installer."""
+    try:
+        pend = _restart_pending()
+        if not pend:
+            return
+        running, installed = pend
+        print()
+        print(f"  {_c(_WARN, '⚠')}  Running v{running}  →  installed v{installed}")
+        for line in _restart_hint_lines()[1:]:
+            print(line)
+        print()
+    except Exception:
+        pass
+
+
 def _is_source_checkout() -> bool:
     """True when running from a dev source tree (vs a pipx/pip-installed build).
     Mirrors the agent front-door heuristic: the in-tree agent package exists only
@@ -52738,7 +52982,17 @@ def _self_update() -> int:
         print(f"  Updating Super Research  {_c(_DIM, '(current: v' + cur + ')')}")
     if state == "started":
         print(f"  {_c(_OK, '✓')}  Update running — completes a moment after this exits.")
-        print(f"  {_c(_DIM, 'Confirm with')}  {_c(_BOLD, _PROG + ' --version')}  {_c(_DIM, 'in ~20s. If On Startup was on, then')}  {_c(_BOLD, _PROG + ' --resurrect')}{_c(_DIM, '.')}")
+        print()
+        # The restart is REQUIRED, not optional: the live process keeps the old
+        # build in memory until it is cycled. (The old copy said "confirm with
+        # --version", which reports the INSTALLED build — so it reads as success
+        # while the old code is still serving. Never use it as the confirmation.)
+        print(f"  {_c(_BOLD, 'Then restart the backend')} {_c(_DIM, '— it keeps running the OLD build until you do:')}")
+        if _supervisor_installed():
+            print(f"      {_c(_BOLD, _PROG + ' --restart')}   {_c(_DIM, '(~20s after this exits; keeps On Startup on)')}")
+        else:
+            print(f"      {_c(_BOLD, _PROG + ' --serve')}   {_c(_DIM, '(stop the running backend first)')}")
+        print(f"  {_c(_DIM, 'Confirmation is the device going green in the app — not')} {_c(_BOLD, '--version')}{_c(_DIM, ', which reports the installed build.')}")
         print()
         return 0
     print(f"  {_c(_WARN, '⚠')}  Couldn't start the update. Run:  {_c(_BOLD, 'pipx upgrade superresearch')}")
@@ -52854,6 +53108,10 @@ def main():
         help="Enable On Startup: auto-start the backend at login and keep it running in the background")
     parser.add_argument("--retire", action="store_true",
         help="Disable On Startup: remove the auto-start scheduled task and stop the background backend")
+    parser.add_argument("--restart", action="store_true",
+        help="Restart the running backend so it picks up a newly installed version "
+             "(the step after --update / pipx upgrade / the web installer). Keeps On "
+             "Startup enabled — unlike --retire, which removes it.")
     parser.add_argument("--unpair", action="store_true",
         help="Fully disconnect this machine from Super Research (inverse of --pair): deletes token + device doc + local config")
     parser.add_argument("--deep", action="store_true",
@@ -52883,6 +53141,18 @@ def main():
 
     if args.show_version:
         print(f"  {_c(_BOLD + _ACCENT, 'Super')} {_c(_BOLD, 'Research')}  {_c(_BOLD, 'v' + _sr_version())}")
+        # This line reports the INSTALLED build. If a different build is actually
+        # serving, say so right here — otherwise --version reads as "update done"
+        # while the old code is still live (the exact trap the old --update copy
+        # walked users into).
+        try:
+            _pend = _restart_pending()
+        except Exception:
+            _pend = None
+        if _pend:
+            _run_v, _inst_v = _pend
+            print(f"  {_c(_WARN, '⚠')}  {_c(_DIM, 'but the backend is still SERVING')} {_c(_BOLD, 'v' + _run_v)}"
+                  f"  {_c(_DIM, '— restart to apply:')}  {_c(_BOLD, _PROG + ' --restart')}")
         try:
             _newer = _newer_version_notice()
         except Exception:
@@ -52890,6 +53160,16 @@ def main():
         if _newer:
             print(f"  {_c(_OK, '⬆')}  {_c(_DIM, 'v' + _newer + ' available — run')}  {_c(_BOLD, _PROG + ' --update')}")
         return 0
+
+    # Post-update restart nudge. Surfaces on ordinary commands so an update that
+    # arrived by ANY route — `--update`, a bare `pipx upgrade`, or the
+    # superresearch.io installer — can't sit silently applied-but-not-live.
+    # Skipped where it would be noise or wrong: the serve/daemon processes are the
+    # thing being restarted, --restart/--update/--retire/--unpair speak for
+    # themselves, and --version prints its own (richer) variant above.
+    if not (args.serve or args.daemon_loop or args.restart or args.update
+            or args.retire or args.unpair or args.resurrect):
+        _warn_if_restart_pending()
 
     # Load .dg-supervisor.env BEFORE subcommand dispatch so every subcommand
     # (--serve, --daemon-loop, --resurrect, etc.) inherits the same values.
@@ -52929,6 +53209,10 @@ def main():
         run_resurrect()
         return
 
+    if args.restart:
+        run_restart()
+        return
+
     if args.retire:
         run_retire()
         return
@@ -52959,6 +53243,10 @@ def main():
         return
 
     if args.serve:
+        # Stamp what this process is actually running, so any later CLI call can
+        # tell "a newer build is installed but the OLD one is still serving"
+        # (see _restart_pending) no matter how the update arrived.
+        _write_running_version()
         asyncio.run(run_server(_resolved_port))
         return
 
