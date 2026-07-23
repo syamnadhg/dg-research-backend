@@ -290,6 +290,42 @@ def test_teardown_removes_cron_shim_and_state(tmp_path, monkeypatch):
     assert json.loads(jobs.read_text("utf-8"))["jobs"] == []
 
 
+def test_cron_entry_present_confirms_from_jobs_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(poll, "_hermes_home", lambda: tmp_path)
+    assert poll._cron_entry_present("sr-stream-x") is False       # no jobs file → absent
+    (tmp_path / "cron").mkdir()
+    jobs = tmp_path / "cron" / "jobs.json"
+    jobs.write_text(json.dumps({"jobs": [{"name": "sr-stream-x"}]}), "utf-8")
+    assert poll._cron_entry_present("sr-stream-x") is True        # present
+    assert poll._cron_entry_present("sr-stream-y") is False       # a different job → absent
+    jobs.write_text("not json", "utf-8")
+    assert poll._cron_entry_present("sr-stream-x") is True        # unreadable → assume present (keep shim)
+
+
+def test_teardown_keeps_shim_when_cron_removal_unconfirmed(tmp_path, monkeypatch):
+    # The orphan guard: if the cron entry is still present after the removal attempt
+    # (a racing gateway save re-added it / jobs.json unreadable), the shim + state are
+    # KEPT — deleting them would turn the surviving job into "Script not found" spam.
+    monkeypatch.setattr(poll, "_hermes_home", lambda: tmp_path)
+    origin = {"platform": "telegram", "chat_id": "111"}
+    slug = poll._origin_slug(origin)
+    (tmp_path / "cron").mkdir()
+    jobs = tmp_path / "cron" / "jobs.json"
+    jobs.write_text(json.dumps({"jobs": [{"id": "2", "name": f"sr-stream-{slug}"}]}), "utf-8")
+    (tmp_path / "scripts").mkdir()
+    shim = tmp_path / "scripts" / f"sr_poll_{slug}.py"
+    shim.write_text("x", "utf-8")
+    state = tmp_path / f".sr_poll_{slug}.state.json"
+    state.write_text("{}", "utf-8")
+    monkeypatch.setattr(poll, "_state_path", lambda o: state)
+    # Simulate a removal that doesn't stick (gateway clobbered our edit) — the job
+    # stays in jobs.json, so _cron_entry_present() still sees it.
+    monkeypatch.setattr(poll, "_remove_cron_entry", lambda name: False)
+    poll._teardown(origin)
+    assert shim.exists() and state.exists()  # kept — no orphan; a later tick retries
+    assert json.loads(jobs.read_text("utf-8"))["jobs"][0]["name"] == f"sr-stream-{slug}"
+
+
 def _main_with(monkeypatch, *, runs, lines, origin):
     monkeypatch.setattr(poll, "_get_updates", lambda o=None: runs)
     monkeypatch.setattr(poll, "_load_state", lambda path=None: {})  # not baseline

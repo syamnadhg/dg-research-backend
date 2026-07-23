@@ -125,3 +125,22 @@ def test_label_default_and_rename(monkeypatch, tmp_path):
     # an empty/blank label falls back to the default — never an empty row label
     prefs.save({**prefs.load(), "agentLabel": ""})
     assert prefs.get_label() == "Super Agent"
+
+
+def test_set_label_if_unset_seeds_default_but_never_clobbers(monkeypatch, tmp_path):
+    _isolate(monkeypatch, tmp_path)
+    # No label yet → seeds the runtime's own name.
+    assert prefs.set_label_if_unset("Rocky") is True
+    assert prefs.get_label() == "Rocky"
+    # A label already present → left untouched (a re-connect/update must not override
+    # a name the user picked, nor re-stamp on top of an earlier seed).
+    assert prefs.set_label_if_unset("Buddy") is False
+    assert prefs.get_label() == "Rocky"
+    # A blank/whitespace candidate never writes.
+    prefs.save({k: v for k, v in prefs.load().items() if k != "agentLabel"})  # clear it
+    assert prefs.set_label_if_unset("   ") is False
+    assert prefs.get_label() == "Super Agent"
+    # A blank existing label is treated as unset → seeding is allowed.
+    prefs.save({**prefs.load(), "agentLabel": ""})
+    assert prefs.set_label_if_unset("Rocky") is True
+    assert prefs.get_label() == "Rocky"

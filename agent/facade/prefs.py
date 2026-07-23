@@ -214,3 +214,21 @@ def set_label(label: str) -> None:
         prefs = load()
         prefs[_LABEL] = label
         save(prefs)
+
+
+def set_label_if_unset(label: str) -> bool:
+    """Seed the agent's display label ONLY if the user hasn't already chosen one
+    (the pref is absent/empty). Returns True if it wrote. Lets `connect` default the
+    label to the runtime's own name (e.g. "Rocky") without ever clobbering a label
+    the user set — and an FE rename lives on the Firestore doc, which always wins
+    regardless (see bridge._write_agent_session_connected)."""
+    if not (isinstance(label, str) and label.strip()):
+        return False
+    with _lock:
+        prefs = load()
+        cur = prefs.get(_LABEL)
+        if isinstance(cur, str) and cur.strip():
+            return False
+        prefs[_LABEL] = label.strip()
+        save(prefs)
+        return True

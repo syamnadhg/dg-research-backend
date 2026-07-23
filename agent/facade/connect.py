@@ -456,6 +456,10 @@ def install(runtime: str, *, dest: Path | None = None, home: Path | None = None)
     # Only a runtime whose /sr skill can arm a chat cron needs the watchdog script.
     if PROFILES[runtime].has_chat_armable_scheduler and dest is None:
         _install_stream_script(home)
+        # Self-heal: sweep any per-chat watchdog cron whose shim is gone (a run's
+        # teardown lost the jobs.json race, or a pre-fix bridge stranded it) so it
+        # stops firing "Script not found" every tick. Preserves live shims + their jobs.
+        _sweep_orphan_stream_crons(home)
     return target
 
 
@@ -467,6 +471,69 @@ def _frontmatter_name(skill_md: Path) -> str | None:
         return None
     m = re.search(r"^name:\s*(\S+)\s*$", text[:500], re.MULTILINE)
     return m.group(1) if m else None
+
+
+# Persona keys that are generic placeholders, not a distinguishing name — fall back
+# to the plain default rather than surfacing e.g. "Default"/"Assistant" as the agent.
+_GENERIC_PERSONA_NAMES = frozenset({"default", "assistant", "hermes", "openclaw",
+                                    "agent", "bot", "ai", "chatbot", "super agent"})
+
+
+def _yaml_scalar_under(text: str, section: str, key: str) -> str | None:
+    """Read a scalar ``key:`` nested one level under a top-level ``section:`` in
+    simple YAML, WITHOUT a YAML dependency (the agent ships stdlib-only). Scans lines:
+    enters the block at a column-0 ``section:`` line, reads its indented ``key:``
+    lines, and leaves at the next column-0 key. Strips an inline ``# comment`` (only
+    on an unquoted value) and surrounding quotes. Returns None if not found. NOT a
+    general parser — just enough for a known flat scalar (e.g. display.personality)."""
+    in_section = False
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if not line[0].isspace():                       # a column-0 (top-level) key
+            in_section = re.match(rf"{re.escape(section)}\s*:", line) is not None
+            continue
+        if in_section:
+            m = re.match(rf"\s+{re.escape(key)}\s*:\s*(.+?)\s*$", line)
+            if m:
+                val = m.group(1).strip()
+                if val[:1] in ("'", '"'):            # quoted scalar (maybe + trailing comment)
+                    end = val.find(val[0], 1)
+                    val = val[1:end] if end != -1 else val[1:]
+                else:                                 # bare scalar → drop an inline comment
+                    val = val.split("#", 1)[0].strip()
+                return val or None
+    return None
+
+
+def runtime_display_name(runtime: str, home: Path | None = None) -> str | None:
+    """Best-effort human name for the connected runtime, used to LABEL the agent in
+    the app instead of the generic "Super Agent" — so a user who adds several agents
+    can tell them apart. Hermes: the active persona key from
+    ``<HOME>/.hermes/config.yaml`` (``display.personality``, e.g. ``rocky`` → "Rocky").
+    Returns None — the caller then keeps the plain default — for an unknown runtime,
+    an unreadable/absent config, or a generic placeholder persona. Never raises."""
+    if runtime != "hermes":
+        return None  # OpenClaw has no comparable single-persona name → keep the default
+    cfg = (home or Path.home()) / ".hermes" / "config.yaml"
+    try:
+        # errors="ignore" + the wide except keep the "never raises" contract: a persona
+        # prompt saved in a legacy codepage (cp1252 em-dash / smart quotes) must not crash
+        # connect — we only need the ASCII `display.personality` key, which survives.
+        text = cfg.read_text(encoding="utf-8", errors="ignore")
+    except (OSError, ValueError):
+        return None
+    raw = _yaml_scalar_under(text, "display", "personality")
+    if not raw:
+        return None
+    name = re.sub(r"[_-]+", " ", raw).strip()
+    if not name or name.lower() in _GENERIC_PERSONA_NAMES:
+        return None
+    # Title-case only an all-lowercase key ("rocky" → "Rocky"); preserve capitalization
+    # a persona author deliberately chose ("JARVIS", "McKay").
+    if not any(c.isupper() for c in name):
+        name = name.title()
+    return name[:60]
 
 
 def _prune_legacy_installs(parent: Path) -> None:
@@ -496,6 +563,10 @@ _STREAM_SCRIPT = "sr_attention_poll.py"
 # skill as cron job "sr-update-notice", schedule "every 1d"; posts only when a
 # newer skill version is published; self-removes after a disconnect).
 _CRON_SCRIPTS = (_STREAM_SCRIPT, "sr_update_notice.py")
+
+# A per-chat watchdog shim `sr.py arm-stream` generates: sr_poll_<slug>.py. Its cron
+# job (`sr-stream-<slug>`) stores this bare filename in its `script` field.
+_POLL_SHIM_RE = re.compile(r"sr_poll_[A-Za-z0-9_]+\.py")
 
 
 def hermes_scripts_dir(home: Path | None = None) -> Path:
@@ -610,6 +681,50 @@ def _remove_stream_cron(home: Path | None) -> bool:
         return False
     # Confirm the removal stuck (a racing gateway save could have re-added it).
     return _stream_jobs_present(jobs_file) is False
+
+
+def _sweep_orphan_stream_crons(home: Path | None) -> int:
+    """Drop any per-chat watchdog cron whose generated shim is GONE from
+    HERMES_HOME/scripts/ — a ``sr-stream-<slug>`` job (script ``sr_poll_<slug>.py``)
+    left behind when a run's teardown deleted the shim but a racing gateway save
+    clobbered the matching jobs.json edit (see sr_attention_poll._teardown). Such a
+    job fires every tick erroring "Script not found". Runs on every (re)connect /
+    self-update so a stuck orphan self-heals on the next skill deploy — including one
+    stranded by a bridge version PREDATING the teardown fix. Precise + safe: removes
+    ONLY sr_poll_*.py jobs whose script file is ABSENT — never the shared ``sr-stream``
+    / ``sr-update-notice`` jobs (their scripts are always re-copied), never a job whose
+    shim still exists (a live run's watchdog), never a non-watchdog job. Atomic +
+    best-effort; returns the number of orphans removed."""
+    jobs_file = (home or Path.home()) / ".hermes" / "cron" / "jobs.json"
+    scripts = hermes_scripts_dir(home)
+    try:
+        data = json.loads(jobs_file.read_text("utf-8"))
+    except (OSError, ValueError):
+        return 0
+    jobs = data.get("jobs") if isinstance(data, dict) else None
+    if not isinstance(jobs, list):
+        return 0
+
+    def _is_orphan_shim_job(job: object) -> bool:
+        if not isinstance(job, dict):
+            return False
+        script = job.get("script")
+        if not (isinstance(script, str) and _POLL_SHIM_RE.fullmatch(script)):
+            return False
+        return not (scripts / script).is_file()  # shim gone → orphan
+
+    kept = [j for j in jobs if not _is_orphan_shim_job(j)]
+    removed = len(jobs) - len(kept)
+    if not removed:
+        return 0
+    data["jobs"] = kept
+    try:
+        tmp = jobs_file.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data), "utf-8")
+        os.replace(tmp, jobs_file)
+    except OSError:
+        return 0
+    return removed
 
 
 def _normalize_modes(target: Path) -> None:

@@ -217,12 +217,43 @@ def _remove_cron_entry(job_name: str) -> bool:
         return False
 
 
+def _cron_entry_present(job_name: str) -> bool:
+    """Whether a job named ``job_name`` is currently in <HERMES_HOME>/cron/jobs.json.
+    A missing jobs.json → False (nothing references the shim). An unreadable / oddly
+    shaped file → True: we can't confirm the job is gone, so the caller must treat it
+    as STILL PRESENT and keep the shim (deleting it would orphan the job into a
+    "Script not found" spam). Lets _teardown gate the shim delete on a confirmed-clean
+    cron store."""
+    path = _hermes_home() / "cron" / "jobs.json"
+    if not path.is_file():
+        return False
+    try:
+        data = json.loads(path.read_text("utf-8"))
+    except Exception:
+        return True
+    jobs = data.get("jobs") if isinstance(data, dict) else None
+    if not isinstance(jobs, list):
+        return True
+    return any(isinstance(j, dict) and j.get("name") == job_name for j in jobs)
+
+
 def _teardown(origin: dict) -> None:
     """Stop this chat's watchdog for good: drop its cron entry, then delete its
     generated shim + de-dup state. Scoped (per-chat) only — never the shared,
-    account-wide watchdog (its sr_attention_poll.py is used by every chat)."""
+    account-wide watchdog (its sr_attention_poll.py is used by every chat).
+
+    The shim + state are deleted ONLY once the cron entry is CONFIRMED gone. If the
+    removal didn't stick — a racing gateway save re-added it, or jobs.json is
+    momentarily unreadable — the shim is KEPT so the still-present job keeps running a
+    script that EXISTS (it exits quietly and re-tries this teardown next tick),
+    instead of firing "Script not found" into chat every minute. Mirrors
+    connect._remove_stream_cron's keep-the-script-until-confirmed contract; a stubborn
+    leftover is swept by the next `agent connect`/update (connect._sweep_orphan_stream_crons)."""
     slug = _origin_slug(origin)
-    _remove_cron_entry(f"sr-stream-{slug}")
+    job_name = f"sr-stream-{slug}"
+    _remove_cron_entry(job_name)
+    if _cron_entry_present(job_name):
+        return  # cron still there → keep the shim so it can't orphan; retry next tick
     for p in (_hermes_home() / "scripts" / f"sr_poll_{slug}.py", _state_path(origin)):
         try:
             p.unlink()

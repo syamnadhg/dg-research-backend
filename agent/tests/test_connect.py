@@ -290,6 +290,144 @@ def test_remove_stream_cron_drops_per_chat_jobs(tmp_path):
     assert names == ["memory-dreaming"]  # every watchdog job swept, user job kept
 
 
+def test_sweep_orphan_stream_crons_drops_only_shimless_jobs(tmp_path):
+    # Self-heal: a per-chat `sr-stream-<slug>` cron whose generated shim is GONE is an
+    # orphan (fires "Script not found" every tick) → swept. A cron whose shim is still
+    # on disk (a live run's watchdog), the shared `sr-stream` / `sr-update-notice`
+    # jobs, and unrelated user jobs are ALL preserved.
+    import json
+    scripts = tmp_path / ".hermes" / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "sr_poll_telegram_live00.py").write_text("# live shim\n", encoding="utf-8")  # present
+    cron = tmp_path / ".hermes" / "cron"
+    cron.mkdir(parents=True)
+    (cron / "jobs.json").write_text(json.dumps({
+        "jobs": [
+            {"name": "memory-dreaming", "enabled": False},
+            {"name": "sr-stream", "script": "sr_attention_poll.py"},         # shared → keep
+            {"name": "sr-update-notice", "script": "sr_update_notice.py"},   # daily → keep
+            {"name": "sr-stream-telegram_live00", "script": "sr_poll_telegram_live00.py"},  # shim present → keep
+            {"name": "sr-stream-telegram_gone11", "script": "sr_poll_telegram_gone11.py"},  # shim gone → ORPHAN
+        ],
+        "updated_at": 5,
+    }), encoding="utf-8")
+    assert connect._sweep_orphan_stream_crons(tmp_path) == 1
+    data = json.loads((cron / "jobs.json").read_text(encoding="utf-8"))
+    names = [j["name"] for j in data["jobs"]]
+    assert "sr-stream-telegram_gone11" not in names           # orphan swept
+    assert "sr-stream-telegram_live00" in names               # live run's job kept
+    assert {"sr-stream", "sr-update-notice", "memory-dreaming"} <= set(names)  # bundle + user jobs kept
+    assert data["updated_at"] == 5                            # sibling top-level keys untouched
+    assert connect._sweep_orphan_stream_crons(tmp_path) == 0  # idempotent — nothing left to sweep
+
+
+def test_sweep_orphan_stream_crons_safe_when_missing_or_malformed(tmp_path):
+    assert connect._sweep_orphan_stream_crons(tmp_path) == 0  # no jobs.json → no-op
+    cron = tmp_path / ".hermes" / "cron"
+    cron.mkdir(parents=True)
+    (cron / "jobs.json").write_text("not json", encoding="utf-8")
+    assert connect._sweep_orphan_stream_crons(tmp_path) == 0  # unreadable → no-op, no raise
+    assert (cron / "jobs.json").read_text(encoding="utf-8") == "not json"  # left as-is
+
+
+def test_install_sweeps_orphan_stream_cron(tmp_path):
+    # End-to-end: a standard-path (re)connect / self-update self-heals a stranded
+    # per-chat watchdog cron whose shim is gone — the exact live orphan-spam bug
+    # (sr-stream-telegram-e639c4e3bb → sr_poll_telegram_e639c4e3bb.py "Script not found").
+    import json
+    cron = tmp_path / ".hermes" / "cron"
+    cron.mkdir(parents=True)
+    (cron / "jobs.json").write_text(json.dumps({
+        "jobs": [
+            {"name": "memory-dreaming"},
+            {"name": "sr-stream-telegram_e639c4e3bb", "script": "sr_poll_telegram_e639c4e3bb.py"},
+        ],
+    }), encoding="utf-8")
+    connect.install("hermes", home=tmp_path)  # connect never wrote that shim → orphan
+    names = [j["name"] for j in json.loads((cron / "jobs.json").read_text(encoding="utf-8"))["jobs"]]
+    assert "sr-stream-telegram_e639c4e3bb" not in names  # orphan swept on connect
+    assert "memory-dreaming" in names                    # user job preserved
+
+
+def test_install_preserves_live_shims(tmp_path):
+    # A reconnect / self-update must NOT wipe a live run's watchdog shim + de-dup
+    # state (an update shouldn't kill the watchdog mid-run). connect only re-copies
+    # the shared bundle scripts into HERMES_HOME/scripts — never the generated shims,
+    # and the orphan-sweep only touches CRON entries whose shim is absent.
+    connect.install("hermes", home=tmp_path)
+    scripts = tmp_path / ".hermes" / "scripts"
+    shim = scripts / "sr_poll_telegram_live99.py"
+    shim.write_text("# live shim\n", encoding="utf-8")
+    state = scripts / ".sr_poll_telegram_live99.state.json"
+    state.write_text("{}", encoding="utf-8")
+    connect.install("hermes", home=tmp_path)  # re-connect (the self-update path)
+    assert shim.is_file() and state.is_file()  # live watchdog survives the redeploy
+
+
+# ── runtime display name: label the agent with its own name, not "Super Agent" ──
+
+def _write_hermes_config(home, body: str) -> None:
+    hd = home / ".hermes"
+    hd.mkdir(parents=True, exist_ok=True)
+    (hd / "config.yaml").write_text(body, encoding="utf-8")
+
+
+def test_runtime_display_name_reads_hermes_personality(tmp_path):
+    # The active persona key under display: is the runtime's own name.
+    _write_hermes_config(tmp_path, (
+        "model:\n  timeout: 30\n"
+        "display:\n  compact: true\n  personality: rocky\n  resume_display: full\n"
+        "personalities:\n  rocky: \"You are Rocky.\"\n"
+    ))
+    assert connect.runtime_display_name("hermes", home=tmp_path) == "Rocky"
+
+
+def test_runtime_display_name_normalizes_and_rejects_generic(tmp_path):
+    _write_hermes_config(tmp_path, "display:\n  personality: my_helper_bot\n")
+    assert connect.runtime_display_name("hermes", home=tmp_path) == "My Helper Bot"
+    _write_hermes_config(tmp_path, 'display:\n  personality: "aria"  # active\n')
+    assert connect.runtime_display_name("hermes", home=tmp_path) == "Aria"  # quotes + inline comment stripped
+    for generic in ("default", "assistant", "Hermes", "agent"):
+        _write_hermes_config(tmp_path, f"display:\n  personality: {generic}\n")
+        assert connect.runtime_display_name("hermes", home=tmp_path) is None  # placeholder → keep default
+
+
+def test_runtime_display_name_survives_non_utf8_config(tmp_path):
+    # A persona prompt saved in a legacy codepage (cp1252 em-dash 0x97, smart quotes)
+    # must NOT crash `agent connect` (UnicodeDecodeError is a ValueError, not OSError).
+    # The ASCII display.personality key still resolves.
+    hd = tmp_path / ".hermes"
+    hd.mkdir(parents=True)
+    raw = (b"display:\n  personality: rocky\n"
+           b"personalities:\n  rocky: \"Loyal \x97 sharp \x93brilliant\x94.\"\n")  # cp1252 bytes
+    (hd / "config.yaml").write_bytes(raw)
+    assert connect.runtime_display_name("hermes", home=tmp_path) == "Rocky"  # no raise, name intact
+
+
+def test_runtime_display_name_preserves_deliberate_capitalization(tmp_path):
+    for key, expect in [("rocky", "Rocky"), ("JARVIS", "JARVIS"), ("McKay", "McKay"), ("aria", "Aria")]:
+        _write_hermes_config(tmp_path, f"display:\n  personality: {key}\n")
+        assert connect.runtime_display_name("hermes", home=tmp_path) == expect
+
+
+def test_runtime_display_name_none_when_absent_or_not_hermes(tmp_path):
+    assert connect.runtime_display_name("hermes", home=tmp_path) is None  # no config.yaml
+    _write_hermes_config(tmp_path, "display:\n  compact: true\n")           # no personality key
+    assert connect.runtime_display_name("hermes", home=tmp_path) is None
+    _write_hermes_config(tmp_path, "display:\n  personality: rocky\n")
+    assert connect.runtime_display_name("openclaw", home=tmp_path) is None  # openclaw → keep default
+
+
+def test_yaml_scalar_under_scopes_to_the_section():
+    text = ("top: 1\n"
+            "other:\n  personality: wrong\n"          # same key, different section → ignored
+            "display:\n  compact: true\n  personality: rocky  # comment\n"
+            "next:\n  personality: also_wrong\n")
+    assert connect._yaml_scalar_under(text, "display", "personality") == "rocky"
+    assert connect._yaml_scalar_under(text, "display", "missing") is None
+    assert connect._yaml_scalar_under(text, "absent", "personality") is None
+
+
 def test_uninstall_keeps_script_when_cron_removal_unconfirmed(tmp_path):
     # The spam guard: if the watchdog cron job removal can't be CONFIRMED (jobs.json
     # corrupt/unreadable), disconnect KEEPS the watchdog script so a surviving job

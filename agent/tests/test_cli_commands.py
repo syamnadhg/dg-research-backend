@@ -1020,3 +1020,24 @@ def test_cmd_home_when_fresh_runs_connect(monkeypatch):
     assert cli.cmd_home(ns) == 0
     assert routed == ["connect"]
     assert ns.runtime is None and ns.dest is None  # cmd_home supplied the omitted defaults
+
+
+# ── #4: connect seeds the agent label from the runtime's own name ──────────────
+
+def test_record_runtime_seeds_label_from_runtime_name(monkeypatch):
+    calls = {}
+    monkeypatch.setattr(cli.prefs, "set_runtime", lambda *a, **k: calls.setdefault("runtime", (a, k)))
+    monkeypatch.setattr(cli.connect, "runtime_display_name", lambda rt, home: "Rocky")
+    monkeypatch.setattr(cli.prefs, "set_label_if_unset", lambda name: calls.setdefault("label", name))
+    cli._record_runtime(connect.Target("hermes", "local", Path("/home/u")))
+    assert calls["label"] == "Rocky"          # detected name seeded as the default label
+    assert calls["runtime"][0][0] == "hermes"  # runtime still recorded
+
+
+def test_record_runtime_skips_label_when_no_name(monkeypatch):
+    calls = {}
+    monkeypatch.setattr(cli.prefs, "set_runtime", lambda *a, **k: None)
+    monkeypatch.setattr(cli.connect, "runtime_display_name", lambda rt, home: None)
+    monkeypatch.setattr(cli.prefs, "set_label_if_unset", lambda name: calls.setdefault("label", name))
+    cli._record_runtime(connect.Target("openclaw", "local", Path("/home/u")))
+    assert "label" not in calls  # no detected name → never touches the label (keeps default)

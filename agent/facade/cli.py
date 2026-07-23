@@ -300,6 +300,13 @@ def _record_runtime(chosen: connect.Target) -> None:
     handed off to the in-distro connect, which records its own prefs there)."""
     prefs.set_runtime(chosen.runtime, home=str(chosen.home),
                       location=chosen.location)
+    # Default the agent's app label to the runtime's OWN name (e.g. Hermes persona
+    # "rocky" → "Rocky") so a user with several agents isn't staring at a wall of
+    # identical "Super Agent" rows. Best-effort + never clobbers a label the user
+    # set; an FE rename on the doc always wins.
+    name = connect.runtime_display_name(chosen.runtime, chosen.home)
+    if name:
+        prefs.set_label_if_unset(name)
 
 
 def _install_step(chosen: connect.Target, dest_override: Path | None, *,
