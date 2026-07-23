@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "superresearch-agent"
-version = "0.1.28"
+version = "0.1.29"
 description = "Install Super Research into a chat runtime (Hermes / OpenClaw) with `pipx run superresearch-agent connect` — an account-authed loopback bridge that drives the user's own Super Research from chat."
 readme = "README.md"
 requires-python = ">=3.11"
