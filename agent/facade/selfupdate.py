@@ -8,8 +8,10 @@ Two pieces:
     it costs at most one short network call per day and can never block or break a
     command. (`latest_on_pypi` is generic and still used for backend INSTALL.)
   • a detached reconnect — "update the agent" upgrades the PERSISTENT install
-    (`pipx install --force superresearch-agent`) and reconnects from it, ONCE the
-    current bridge process exits (so the new bridge can bind the freed port). The
+    (`pipx upgrade`, falling back to `pipx install --force`; upgrade is in-place so
+    it works on a uv-backed pipx, which refuses --force's venv recreate) and
+    reconnects from it, ONCE the current bridge process exits (so the new bridge can
+    bind the freed port). The
     persistent install is what makes updates STICK: the ONLOGON launcher pins
     sys.path to the interpreter that ran `connect`, and a `pipx run` venv is
     ephemeral (pipx evicts it), so a launcher pinned there goes stale and a reboot
@@ -181,13 +183,26 @@ def installed_entry():
     except Exception:
         return None
 # 1) Upgrade the PERSISTENT install so the launcher pins to a durable venv.
+#    `pipx upgrade` is IN-PLACE (works on a uv-backed pipx — the fix for the live
+#    failure); `pipx install --force` RECREATES the venv, which a uv-backed pipx
+#    refuses ("A virtual environment already exists ... Use --clear"), so it's only a
+#    fallback for a standard pipx. We deliberately do NOT `pipx uninstall` + reinstall
+#    as a further fallback: uninstall would delete the durable venv, and if the
+#    reinstall then fails (a transient PyPI/network blip in this detached window) the
+#    host is left with NO install — worse than keeping the old build. If both attempts
+#    fail, the caller falls through to the NON-destructive `pipx run --no-cache`
+#    reconnect below (durable venv untouched; a later --update retries cleanly).
 entry = None
-try:
-    r = subprocess.run(pipx + ["install", "--force", pkg], timeout=600)
-    if r.returncode == 0:
-        entry = installed_entry()
-except Exception:
-    entry = None
+def _do_upgrade():
+    for argv in (pipx + ["upgrade", pkg], pipx + ["install", "--force", pkg]):
+        try:
+            if subprocess.run(argv, timeout=600).returncode == 0:
+                return True
+        except Exception:
+            pass
+    return False
+if _do_upgrade():
+    entry = installed_entry()
 # 2) Connect from the persistent install if resolved; else the ephemeral pipx-run
 #    fallback (never worse than before). Both redeploy the skill + re-pin the
 #    launcher + start the new bridge.

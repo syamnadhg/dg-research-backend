@@ -114,8 +114,8 @@ def test_spawn_detached_reconnect_builds_pipx_connect(tmp_path, monkeypatch):
     assert cmd[0] == "python3" and "-c" in cmd                # waiter runs under a stable python
     assert str(__import__("os").getpid()) in cmd              # waits for THIS bridge pid
     # The waiter carries a JSON config: it upgrades the PERSISTENT install
-    # (`pipx install --force`) then connects from it (durable ONLOGON launcher),
-    # falling back inside the waiter to the ephemeral `pipx run --no-cache` path.
+    # (pipx upgrade → --force → uninstall+install, uv-backed-pipx safe) then connects
+    # from it (durable ONLOGON launcher), falling back to `pipx run --no-cache`.
     cfg = json.loads(cmd[-1])
     assert cfg["pipx"] == ["pipx"]
     assert cfg["pkg"] == "superresearch-agent"
@@ -241,6 +241,19 @@ def test_reconnect_waiter_compiles():
     # The waiter is an embedded `-c` string; a typo would only surface at runtime
     # during a real self-update. Compile it here so it's regression-guarded.
     compile(selfupdate._RECONNECT_WAITER, "<reconnect-waiter>", "exec")
+
+
+def test_reconnect_waiter_upgrade_is_uv_pipx_safe():
+    # A uv-backed pipx REFUSES `install --force` on an existing venv ("use --clear"),
+    # so the waiter tries `upgrade` (in-place) FIRST, then --force for a standard pipx.
+    src = selfupdate._RECONNECT_WAITER
+    assert '"upgrade", pkg' in src             # in-place upgrade tried first (uv-safe)
+    assert '"install", "--force", pkg' in src  # then force (standard pipx)
+    assert "_do_upgrade" in src
+    # It must NEVER `pipx uninstall` in the upgrade path: a following install failure
+    # would delete the durable venv and strand the host with no install (a MAJOR
+    # regression the review caught). Both fail -> non-destructive pipx-run fallback.
+    assert '"uninstall"' not in src
 
 
 def test_spawn_detached_reconnect_no_pipx(monkeypatch):

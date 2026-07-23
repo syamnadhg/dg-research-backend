@@ -272,13 +272,21 @@ def test_remove_cron_entry_noop_when_missing_or_malformed(tmp_path, monkeypatch)
     assert poll._remove_cron_entry("sr-stream-x") is False        # unreadable → no-op
 
 
-def test_teardown_removes_cron_shim_and_state(tmp_path, monkeypatch):
+def test_teardown_removes_cron_but_keeps_shim(tmp_path, monkeypatch):
+    # A gateway-armed cron lives in the gateway's in-memory registry and gets
+    # re-persisted after any host-side jobs.json edit; a no_agent script can't call
+    # cronjob:delete. So teardown removes the cron entry (best-effort) but KEEPS the
+    # shim + state — a lingering / re-added cron then runs a script that EXISTS and
+    # exits silently, instead of firing "Script not found" every tick.
     monkeypatch.setattr(poll, "_hermes_home", lambda: tmp_path)
     origin = {"platform": "telegram", "chat_id": "111"}
     slug = poll._origin_slug(origin)
     (tmp_path / "cron").mkdir()
     jobs = tmp_path / "cron" / "jobs.json"
-    jobs.write_text(json.dumps({"jobs": [{"id": "2", "name": f"sr-stream-{slug}"}]}), "utf-8")
+    jobs.write_text(json.dumps({"jobs": [
+        {"id": "1", "name": "memory-dreaming"},
+        {"id": "2", "name": f"sr-stream-{slug}"},
+    ]}), "utf-8")
     (tmp_path / "scripts").mkdir()
     shim = tmp_path / "scripts" / f"sr_poll_{slug}.py"
     shim.write_text("x", "utf-8")
@@ -286,51 +294,33 @@ def test_teardown_removes_cron_shim_and_state(tmp_path, monkeypatch):
     state.write_text("{}", "utf-8")
     monkeypatch.setattr(poll, "_state_path", lambda o: state)
     poll._teardown(origin)
-    assert not shim.exists() and not state.exists()
-    assert json.loads(jobs.read_text("utf-8"))["jobs"] == []
+    assert shim.exists() and state.exists()  # NEVER deleted — no "Script not found" risk
+    names = [j["name"] for j in json.loads(jobs.read_text("utf-8"))["jobs"]]
+    assert names == ["memory-dreaming"]  # our cron removed (best-effort), user job kept
 
 
-def test_cron_entry_present_confirms_from_jobs_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(poll, "_hermes_home", lambda: tmp_path)
-    assert poll._cron_entry_present("sr-stream-x") is False       # no jobs file → absent
-    (tmp_path / "cron").mkdir()
-    jobs = tmp_path / "cron" / "jobs.json"
-    jobs.write_text(json.dumps({"jobs": [{"name": "sr-stream-x"}]}), "utf-8")
-    assert poll._cron_entry_present("sr-stream-x") is True        # present
-    assert poll._cron_entry_present("sr-stream-y") is False       # a different job → absent
-    jobs.write_text("not json", "utf-8")
-    assert poll._cron_entry_present("sr-stream-x") is True        # unreadable → assume present (keep shim)
-
-
-def test_teardown_keeps_shim_when_cron_removal_unconfirmed(tmp_path, monkeypatch):
-    # The orphan guard: if the cron entry is still present after the removal attempt
-    # (a racing gateway save re-added it / jobs.json unreadable), the shim + state are
-    # KEPT — deleting them would turn the surviving job into "Script not found" spam.
+def test_teardown_keeps_shim_even_when_cron_removal_fails(tmp_path, monkeypatch):
+    # If the cron removal can't stick (write fails / gateway race — simulated by a
+    # False return), teardown must not raise and must STILL leave the shim in place
+    # (a silent lingering cron, never a "Script not found" crash).
     monkeypatch.setattr(poll, "_hermes_home", lambda: tmp_path)
     origin = {"platform": "telegram", "chat_id": "111"}
     slug = poll._origin_slug(origin)
-    (tmp_path / "cron").mkdir()
-    jobs = tmp_path / "cron" / "jobs.json"
-    jobs.write_text(json.dumps({"jobs": [{"id": "2", "name": f"sr-stream-{slug}"}]}), "utf-8")
-    (tmp_path / "scripts").mkdir()
-    shim = tmp_path / "scripts" / f"sr_poll_{slug}.py"
-    shim.write_text("x", "utf-8")
-    state = tmp_path / f".sr_poll_{slug}.state.json"
-    state.write_text("{}", "utf-8")
-    monkeypatch.setattr(poll, "_state_path", lambda o: state)
-    # Simulate a removal that doesn't stick (gateway clobbered our edit) — the job
-    # stays in jobs.json, so _cron_entry_present() still sees it.
     monkeypatch.setattr(poll, "_remove_cron_entry", lambda name: False)
-    poll._teardown(origin)
-    assert shim.exists() and state.exists()  # kept — no orphan; a later tick retries
-    assert json.loads(jobs.read_text("utf-8"))["jobs"][0]["name"] == f"sr-stream-{slug}"
+    (tmp_path / "scripts").mkdir()
+    shim = tmp_path / "scripts" / f"sr_poll_{slug}.py"
+    shim.write_text("x", "utf-8")
+    monkeypatch.setattr(poll, "_state_path", lambda o: tmp_path / "st.json")
+    poll._teardown(origin)  # must not raise
+    assert shim.exists()
 
 
 def _main_with(monkeypatch, *, runs, lines, origin):
     monkeypatch.setattr(poll, "_get_updates", lambda o=None: runs)
     monkeypatch.setattr(poll, "_load_state", lambda path=None: {})  # not baseline
     monkeypatch.setattr(poll, "_save_state", lambda *a, **k: None)
-    monkeypatch.setattr(poll, "compute", lambda r, prior, baseline=False: (lines, {}))
+    monkeypatch.setattr(poll, "compute",
+                        lambda r, prior, baseline=False, suppress_replay=False: (lines, {}))
     torn = {}
     monkeypatch.setattr(poll, "_teardown", lambda o: torn.__setitem__("o", o))
     assert poll.main(origin) == 0
@@ -559,3 +549,68 @@ def test_teardown_on_login_with_nothing_to_stream(monkeypatch):
     monkeypatch.setattr(poll, "_teardown", lambda o: torn.__setitem__("v", True))
     poll.main(origin)
     assert torn["v"] is True
+
+
+# ── stale-result leak: a sign-in tick must not dump a PRIOR run's completion ──
+
+def test_compute_suppress_replay_hides_completion_but_marks_it_seen():
+    # suppress_replay (a sign-in tick): a recent prior completion is NOT posted, but
+    # is still marked completed so it can never replay on a later tick either.
+    now = 10_000_000_000
+    runs = [_run(status="completed", phase_updates=[
+        _pu(1, "Research Brief", [("Brief", "u-b", True)]),
+        _pu(5, "Delivery", [], final=True),
+    ])]
+    runs[0]["updatedAt"] = now - 60_000  # finished a minute ago → would normally post on baseline
+    msgs, state = poll.compute(runs, {}, baseline=True, now_ms=now, suppress_replay=True)
+    assert msgs == []                       # NOT dumped on the sign-in tick
+    assert state["r1"]["completed"] is True  # but marked seen → never replays later
+    # a normal later tick with that state stays silent (already completed)
+    assert poll.compute(runs, state, now_ms=now)[0] == []
+
+
+def test_main_signin_tick_does_not_replay_prior_completion(monkeypatch, capsys):
+    # THE #leak: reconnect + sign in for NEW work must announce ONLY the sign-in —
+    # not the LAST run's 🎉 results (Golden Retriever), which a fresh login-listener
+    # (no de-dup state after disconnect) would otherwise replay as a recent completion.
+    origin = {"platform": "telegram", "chat_id": "111"}
+    now = 10_000_000_000
+    prior_run = _run(rid="old", title="Golden Retriever", status="completed",
+                     phase_updates=[_pu(5, "Delivery", [("Doc", "u-doc", True)], final=True)])
+    prior_run["updatedAt"] = now - 60_000  # recent
+    si = {"ts": 7, "email": "e@x.y", "pendingTopic": "German Shepherd"}
+    monkeypatch.setattr(poll, "_get_updates", lambda o=None: ([prior_run], si))
+    monkeypatch.setattr(poll, "_load_state", lambda path=None: None)  # fresh (post-disconnect)
+    monkeypatch.setattr(poll, "_save_state", lambda *a, **k: None)
+    monkeypatch.setattr(poll, "_teardown", lambda o: None)
+    monkeypatch.setattr(poll, "_now_ms", lambda: now)
+    poll.main(origin)
+    out = capsys.readouterr().out
+    assert "Signed in as e@x.y" in out              # sign-in announced
+    assert "German Shepherd" in out                 # the pending topic offered
+    assert "Golden Retriever" not in out            # the LAST run's results are NOT dumped
+    assert "pipeline complete" not in out
+
+
+def test_compute_suppress_replay_still_announces_a_tracked_run_completion():
+    # suppress_replay must hide ONLY an untracked prior run (the leak). A run we were
+    # streaming live (prior state exists) still announces its completion even if a
+    # re-sign-in event lands on the exact tick it finishes — those are the results the
+    # user is actually waiting on. (Guards the over-suppression the review caught.)
+    prior = {"r1": {"announced": [1], "needs": False, "attention": "", "completed": False}}
+    runs = [_run(status="completed", phase_updates=[
+        _pu(1, "Research Brief", [("Brief", "u-b", True)]),
+        _pu(5, "Delivery", [], final=True)])]
+    msgs, state = poll.compute(runs, prior, baseline=False, suppress_replay=True)
+    blob = "\n".join(msgs)
+    assert "pipeline complete" in blob and "u-b" in blob  # tracked completion NOT suppressed
+    assert state["r1"]["completed"] is True
+
+
+def test_compute_suppress_replay_still_announces_a_tracked_run_stop():
+    # Same for a stop/cancel of a tracked run on a sign-in tick — the ended branch
+    # must not be suppressed (it already only fires for runs we tracked live).
+    prior = {"r1": {"announced": [], "needs": False, "attention": "", "ended": False}}
+    runs = [_run(status="cancelled")]
+    msgs, _ = poll.compute(runs, prior, baseline=False, suppress_replay=True)
+    assert any("stopped" in m for m in msgs)

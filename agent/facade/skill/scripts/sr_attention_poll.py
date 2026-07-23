@@ -168,14 +168,17 @@ def _save_state(state: dict, path: Path | None = None) -> None:
         pass  # best-effort; a missed save just re-announces next tick (rare)
 
 
-# ── strict run-linked teardown ───────────────────────────────────────────────
-# The watchdog is a recurring Hermes cron job (`sr-stream-<slug>`, every 1m). It
-# must STOP — and clean up its own cron entry + shim + state — once this chat has
-# no live work left, so it never lingers polling forever or, worse, fires after
-# `disconnect` deleted its script (the "Script not found" chat spam). We can't
-# call Hermes's agent-only `cronjob` tool from here, so we remove our OWN entry
-# from the cron's data file (`<HERMES_HOME>/cron/jobs.json`, which Hermes re-reads
-# every tick) — only the entry we created, matched by name; never touching others.
+# ── run-linked teardown ──────────────────────────────────────────────────────
+# The watchdog is a recurring Hermes cron job (`sr-stream-<slug>`, every 1m). When
+# this chat has no live work left it should stop, so it best-effort removes its OWN
+# entry (matched by name) from the cron data file (`<HERMES_HOME>/cron/jobs.json`,
+# which Hermes re-reads each tick) — we can't call Hermes's agent-only `cronjob`
+# tool from a no_agent script. It deliberately does NOT delete the generated shim:
+# the gateway holds the cron in an in-memory registry and can re-persist it after a
+# host-side edit, and deleting the shim would then make the re-added cron fire
+# "Script not found" every tick (the spam bug). Keeping the shim means a lingering /
+# re-added cron just runs it and exits silently. Full cleanup (shim included) is
+# `agent disconnect`'s job; `agent connect`'s sweep clears legacy shim-less orphans.
 
 # Runs still in flight (or stuck awaiting the user) — work the watchdog must keep
 # streaming. Everything else (completed / errored-and-done / cancelled) is terminal.
@@ -217,48 +220,22 @@ def _remove_cron_entry(job_name: str) -> bool:
         return False
 
 
-def _cron_entry_present(job_name: str) -> bool:
-    """Whether a job named ``job_name`` is currently in <HERMES_HOME>/cron/jobs.json.
-    A missing jobs.json → False (nothing references the shim). An unreadable / oddly
-    shaped file → True: we can't confirm the job is gone, so the caller must treat it
-    as STILL PRESENT and keep the shim (deleting it would orphan the job into a
-    "Script not found" spam). Lets _teardown gate the shim delete on a confirmed-clean
-    cron store."""
-    path = _hermes_home() / "cron" / "jobs.json"
-    if not path.is_file():
-        return False
-    try:
-        data = json.loads(path.read_text("utf-8"))
-    except Exception:
-        return True
-    jobs = data.get("jobs") if isinstance(data, dict) else None
-    if not isinstance(jobs, list):
-        return True
-    return any(isinstance(j, dict) and j.get("name") == job_name for j in jobs)
-
-
 def _teardown(origin: dict) -> None:
-    """Stop this chat's watchdog for good: drop its cron entry, then delete its
-    generated shim + de-dup state. Scoped (per-chat) only — never the shared,
-    account-wide watchdog (its sr_attention_poll.py is used by every chat).
+    """Stop this chat's watchdog: best-effort remove its cron entry from jobs.json.
 
-    The shim + state are deleted ONLY once the cron entry is CONFIRMED gone. If the
-    removal didn't stick — a racing gateway save re-added it, or jobs.json is
-    momentarily unreadable — the shim is KEPT so the still-present job keeps running a
-    script that EXISTS (it exits quietly and re-tries this teardown next tick),
-    instead of firing "Script not found" into chat every minute. Mirrors
-    connect._remove_stream_cron's keep-the-script-until-confirmed contract; a stubborn
-    leftover is swept by the next `agent connect`/update (connect._sweep_orphan_stream_crons)."""
-    slug = _origin_slug(origin)
-    job_name = f"sr-stream-{slug}"
-    _remove_cron_entry(job_name)
-    if _cron_entry_present(job_name):
-        return  # cron still there → keep the shim so it can't orphan; retry next tick
-    for p in (_hermes_home() / "scripts" / f"sr_poll_{slug}.py", _state_path(origin)):
-        try:
-            p.unlink()
-        except OSError:
-            pass
+    Deliberately does NOT delete the generated shim (sr_poll_<slug>.py) or its state.
+    A gateway-armed cron lives in the gateway's IN-MEMORY registry and gets
+    RE-PERSISTED to jobs.json after any host-side edit (a no_agent script can't call
+    the gateway's agent-only cronjob:delete). If we deleted the shim, a re-added cron
+    would fire "Script not found" into chat every minute — the exact spam bug. Keeping
+    the shim means a lingering / re-added cron just runs it and exits SILENTLY (the
+    de-dup state below already marks everything seen). The cron is fully cleared by
+    `agent disconnect` (which also stops the bridge) or the next time the gateway
+    reloads jobs.json without it (e.g. a gateway restart after a host removal stuck);
+    `agent connect`'s orphan-sweep also drops any shim-less leftover from older builds.
+
+    Scoped (per-chat) only — never the shared account-wide watchdog."""
+    _remove_cron_entry(f"sr-stream-{_origin_slug(origin)}")
 
 
 def _title(run: dict) -> str:
@@ -297,7 +274,7 @@ def _ended_line(run: dict) -> str:
 
 
 def compute(runs: list, prior_state: dict, *, baseline: bool = False,
-            now_ms: "float | None" = None) -> tuple[list[str], dict]:
+            now_ms: "float | None" = None, suppress_replay: bool = False) -> tuple[list[str], dict]:
     """Pure core (unit-tested): (chat lines to post, new state to persist).
 
     Quiet by design: per-phase progress is NEVER pushed (that's on-demand via
@@ -335,10 +312,17 @@ def compute(runs: list, prior_state: dict, *, baseline: bool = False,
         # Fires exactly once (tracked via `completed`); on a baseline tick only a
         # RECENT completion posts (an old finished run in the window on first arm
         # stays quiet, but is still marked so it never replays later).
+        # ``suppress_replay`` (a sign-in tick): a FRESH watchdog armed for a sign-in
+        # must NOT dump a PRIOR run's results — the user signing in for new work isn't
+        # waiting on the LAST run (its results were already emailed/posted). Gated on
+        # ``not prior``: only an UNTRACKED run (no prior state — the leak case) is
+        # suppressed; a run we were streaming LIVE (prior state exists) still announces
+        # its completion even if a re-sign-in lands on the same tick.
         completed_announced = bool(prior.get("completed"))
         run_completed = run.get("status") == "completed"
         if run_completed and not completed_announced:
-            if not baseline or _is_recent_completion(run, now_ms):
+            suppressed = suppress_replay and not prior
+            if (not baseline or _is_recent_completion(run, now_ms)) and not suppressed:
                 out.extend(_final_lines(run))
             completed_announced = True
 
@@ -358,6 +342,10 @@ def compute(runs: list, prior_state: dict, *, baseline: bool = False,
         # transition, not an old terminal run surfacing) and never on baseline.
         ended = (not _is_active(run)) and not run_completed
         prior_ended = bool(prior.get("ended"))
+        # No suppress_replay gate here: this branch ALREADY requires ``prior`` (a run
+        # we tracked live) + ``not baseline``, so it can never surface an untracked
+        # prior run on a fresh sign-in — and a tracked run that stopped should still
+        # be announced even on a sign-in tick.
         if ended and not prior_ended and not baseline and prior:
             out.append(_ended_line(run))
 
@@ -474,7 +462,11 @@ def main(origin: dict | None = None) -> int:
     # ticks) is NOT a real run-baseline — without this, the first authed tick after
     # sign-in would replay an OLD finished/stuck run as if it just happened.
     seen_runs_before = any(not str(k).startswith("__") for k in pdict)
-    run_lines, new_state = compute(runs, pdict, baseline=not seen_runs_before)
+    # On a sign-in tick, suppress any prior-run completion/ended replay — a fresh
+    # login-listener must announce ONLY the sign-in (+ an auto-started run), never
+    # dump the LAST run's results (the #leak the user hit reconnecting for new work).
+    run_lines, new_state = compute(runs, pdict, baseline=not seen_runs_before,
+                                   suppress_replay=announced_login)
     out += run_lines
     # compute() rebuilds new_state from runs only, so re-stamp the de-dup key (and
     # drop __login_wait__ now that we're authed).
