@@ -29,9 +29,11 @@ CUA_MODEL = os.environ.get("CUA_MODEL", "claude-sonnet-4-6")
 # pro-tier detection, etc.). Used to follow CUA_MODEL by accident
 # (those call sites read CUA_MODEL even though they don't drive the
 # browser); now decoupled so CUA + vision can evolve independently.
-# Sonnet 4.6 supports vision and is the right cost/quality balance for
-# moderate-stakes single-shot reads.
-VISION_LIGHT_MODEL = os.environ.get("VISION_LIGHT_MODEL", "claude-sonnet-4-6")
+# Bumped 2026-07-22 to Sonnet 5 (from 4.6) — current-gen Sonnet, better
+# vision quality at the same tier for these moderate-stakes single-shot
+# reads. Decoupled from CUA_MODEL, which stays on 4.6 (the Anthropic-
+# recommended Computer-Use model); this is the vision light tier only.
+VISION_LIGHT_MODEL = os.environ.get("VISION_LIGHT_MODEL", "claude-sonnet-5")
 
 # Vision — high-stakes / retry-after-failure path. Opus 4.8 is the
 # current Anthropic flagship (supersedes 4.7) with the highest-fidelity

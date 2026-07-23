@@ -103,12 +103,11 @@ ACT_REPEAT_LIMIT = 3
 # Cost coefficients for rough $/run estimates ($/Mtok). Used by
 # VisionMetrics.estimated_cost_usd for surfacing in run analytics, not
 # for billing. Refresh against the current Anthropic pricing page when
-# the underlying MODEL_* constant changes — the figures below were set
-# against Opus 4.7 / Sonnet 4.6; the dict keys flow from the imported
-# constants (now Opus 4.8 default) so the lookup still works, but the
-# coefficient values may drift from actuals until they get re-pinned.
-_COST_PER_MTOK_INPUT = {MODEL_SONNET: 3.00, MODEL_OPUS: 15.00}
-_COST_PER_MTOK_OUTPUT = {MODEL_SONNET: 15.00, MODEL_OPUS: 75.00}
+# the underlying MODEL_* constant changes — re-pinned 2026-07-22 to Opus
+# 4.8 ($5 / $25 per Mtok) and Sonnet ($3 / $15). The dict keys flow from
+# the imported constants so the lookup still works across model swaps.
+_COST_PER_MTOK_INPUT = {MODEL_SONNET: 3.00, MODEL_OPUS: 5.00}
+_COST_PER_MTOK_OUTPUT = {MODEL_SONNET: 15.00, MODEL_OPUS: 25.00}
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -631,6 +630,24 @@ def default_client() -> VisionClient:
     if _default is None:
         _default = VisionClient()
     return _default
+
+
+def reset_default_metrics() -> None:
+    """Reset the process-wide singleton's per-run VisionMetrics at a pipeline-run
+    boundary. VisionMetrics is built ONCE in VisionClient.__init__ and its
+    call_count is the per-run budget gate (>= DEFAULT_CALL_BUDGET → BudgetExceeded);
+    the long-lived `--serve` worker reuses this process across every run, so
+    without a reset the count accumulates SINCE BOOT and the whole Vision tier
+    silently goes dark (falls through to CUA) once the cumulative cap trips. The
+    reset makes call_count / token / latency counters genuinely per-run, matching
+    VisionMetrics' own docstring ("Reset via reset() between runs").
+
+    NO-OP when the singleton was never constructed — it deliberately does NOT
+    call default_client(), so the off path (Vision never touched) stays
+    byte-identical to the pre-Vision pipeline and no client is created just to
+    reset an empty ledger."""
+    if _default is not None:
+        _default.metrics.reset()
 
 
 # ─────────────────────────────────────────────────────────────────────────

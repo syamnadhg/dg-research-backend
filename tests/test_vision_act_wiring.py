@@ -8,12 +8,31 @@ tests/test_vision_engine.py."""
 from __future__ import annotations
 
 import inspect
+import re
 
 import research
 
 
 def _src(fn):
     return inspect.getsource(fn)
+
+
+def _all_hotspot_id_literals():
+    """Every ``hotspot_id="..."`` string literal in research.py source.
+
+    This is the drift guard's ground truth. It is deliberately a SUPERSET of the
+    _shadow_observed_cua dispatch sites (it also catches _observe_dom_success
+    ids) — harvesting every literal cannot miss a newly-wired site the way a
+    fixed per-call text window can, so a hotspot added without a curated hint
+    fails the guard below instead of silently degrading to a bare context_hint
+    at runtime."""
+    return set(re.findall(r'hotspot_id="([^"]+)"', inspect.getsource(research)))
+
+
+# Hotspots intentionally wired WITHOUT a curated hint. Empty today — every
+# dispatched/observed hotspot carries one. Only add an id here WITH a written
+# reason, and prefer writing the hint over allowlisting.
+_HINTLESS_ALLOWLIST: set[str] = set()
 
 
 def _dispatch_blocks(src):
@@ -107,12 +126,39 @@ def test_p2_share_sites_carry_missions():
 
 # ── hints for the new hotspots ───────────────────────────────────────────────
 
-def test_new_extraction_hotspots_have_hints():
-    for hs in ("2c", "2d-nav", "2d-copy", "publish-claude"):
-        hint = research._HOTSPOT_VISION_HINTS.get(hs)
-        assert hint, f"missing _HOTSPOT_VISION_HINTS entry for {hs}"
-        assert hint.get("context_hint") and hint.get("expected_outcome")
-        assert hint.get("success_signals")
+def test_every_hotspot_literal_has_a_curated_hint():
+    """Drift guard: EVERY hotspot_id wired into research.py must carry a curated
+    _HOTSPOT_VISION_HINTS entry (or be explicitly allowlisted). Iterates the real
+    source literals rather than a hand-maintained id list, so a new dispatch that
+    forgets its hint fails here — the failure mode the earlier fixed-list test
+    (2c/2d-nav/2d-copy/publish-claude only) could not catch."""
+    ids = _all_hotspot_id_literals()
+    # Vacuous-pass guard: if the harvester silently breaks (regex/source drift),
+    # fail loudly instead of green-on-empty. ~33 unique dispatch/observe ids today.
+    assert len(ids) >= 30, (
+        f"harvester found only {len(ids)} hotspot_id literals (expected ~33) — "
+        "the regex or the dispatch wiring drifted; fix the guard before trusting it."
+    )
+    missing = sorted(
+        hs for hs in ids
+        if hs not in _HINTLESS_ALLOWLIST
+        and not (research._HOTSPOT_VISION_HINTS.get(hs) or {}).get("context_hint")
+    )
+    assert not missing, (
+        f"hotspot_ids wired with NO curated _HOTSPOT_VISION_HINTS entry: {missing}. "
+        "Add a desktop-Chrome target hint that AGREES with the canonical CUA "
+        "mission for that site (a divergent hint corrupts promotion data), or add "
+        "the id to _HINTLESS_ALLOWLIST with a written reason."
+    )
+
+
+def test_all_curated_hints_are_well_formed():
+    """Every entry that exists must be complete — a half-filled hint (missing
+    expected_outcome or success_signals) is as useless to Vision as no hint."""
+    for hs, hint in research._HOTSPOT_VISION_HINTS.items():
+        assert hint.get("context_hint"), f"{hs}: empty/missing context_hint"
+        assert hint.get("expected_outcome"), f"{hs}: empty/missing expected_outcome"
+        assert hint.get("success_signals"), f"{hs}: empty/missing success_signals"
 
 
 def test_2d_nav_hint_targets_last_artifact_only():

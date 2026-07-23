@@ -13896,7 +13896,276 @@ _HOTSPOT_VISION_HINTS = {
         ),
         "success_signals": ["a Stop button replaces Send", "the message posts and a response starts"],
     },
+    # P2 setup / polling act-tier hotspots (Track-B #839). Full canonical CUA
+    # mission also passed via mission_prompt at each site; these are the short
+    # target descriptors merged into flow_context.
+    "setup-dr": {
+        "expected_outcome": "Deep Research / Research mode is active (its pill highlighted; Gemini placeholder reads \"What do you want to research?\") and the composer input is focused with nothing typed.",
+        "context_hint": (
+            "Enable Deep Research / Research mode in the chat composer, then click the "
+            "message input to FOCUS it (the brief is pasted by code afterward; this "
+            "fires only because Playwright-direct setup failed). Reach the toggle via "
+            "the composer's '+' / Tools menu (a '+' or wrench/sliders button beside the "
+            "input), a 'Deep research' / 'Research' pill near the composer, the sidebar "
+            "(ChatGPT), or the model selector (a REQUIRED setup step for Claude; a "
+            "last-resort discovery path for ChatGPT). ChatGPT: activate 'Deep "
+            "research'. Gemini: open the '+' ('Upload & tools') menu and click 'Deep "
+            "Research' (top level, or under 'More tools'); a merely-visible chip is NOT "
+            "proof it is armed — it is ON only when the placeholder reads 'What do you "
+            "want to research?' (chat mode = 'Ask Gemini'), so do NOT re-toggle a pill "
+            "that is already active. Claude: set the model to Opus + Max effort + "
+            "Adaptive thinking, then enable the 'Research' tool. Do NOT type, paste, "
+            "compose, or send anything; do NOT click Send/Submit; do NOT attach files "
+            "(Claude); never click the microphone or the Stop/stop-generating button. "
+            "If the mode is already active, just focus the input; if Deep "
+            "Research/Research cannot be found or enabled, say so — do not guess."
+        ),
+        "success_signals": [
+            "an active/highlighted 'Deep research' or 'Research' pill near the composer (Gemini: composer placeholder reads 'What do you want to research?', not 'Ask Gemini')",
+            "Claude only: the model button shows Opus (+ Max effort)",
+            "the composer input focused / caret blinking with nothing typed and no message sent"
+        ],
+    },
+    "validate-setup": {
+        "expected_outcome": "the platform's Deep Research / model+tools state is confirmed ACTIVE for the target agent (or the one wrong knob is fixed), and Vision SAYS 'verified' or 'fixed'",
+        "context_hint": (
+            "Verify the platform is armed for Deep Research for {label} and fix ONLY "
+            "what is wrong — this is click-only, do NOT type. On ChatGPT: the 'Deep "
+            "research' pill/badge near the composer must be visible AND highlighted and "
+            "the input focused; if it is off, open the '+'/tools menu and click 'Deep "
+            "research', then focus the input. On Gemini: the SINGLE reliable proof is "
+            "the composer PLACEHOLDER — it must read 'What do you want to research?' "
+            "(Deep Research ON), NOT 'Ask Gemini' (off); a merely-visible 'Deep "
+            "research' chip is NOT proof, so if the placeholder still says 'Ask Gemini' "
+            "click the chip ONCE and RE-CHECK the placeholder. On Claude: the "
+            "model-selector button at the bottom of the composer must read 'Opus …' (it "
+            "also shows the effort, e.g. 'Max', on the button itself), and the priority "
+            "knob — the 'Research' tool — must be ON (an active/highlighted pill or "
+            "chip, or a checkmark beside 'Research' in the '+' tools menu); also click "
+            "the X on any stale attachment chip in the composer. Do NOT type, paste, "
+            "send, or compose anything; do NOT attach new files; do NOT open Claude's "
+            "model popover or chase the Effort/Adaptive-thinking submenu when the model "
+            "button already shows Opus; do NOT treat Gemini's present-but-unpressed "
+            "chip as active. Say 'verified'/'fixed' on success, or 'failed: <what you "
+            "see>' only if the tool is genuinely unavailable."
+        ),
+        "success_signals": [
+            "ChatGPT: a highlighted 'Deep research' pill near the composer with the input focused",
+            "Gemini: the composer placeholder reads 'What do you want to research?' (not 'Ask Gemini')",
+            "Claude: the model button shows 'Opus …' and the 'Research' tool is active, with no stale attachment chip"
+        ],
+    },
+    "inline-type": {
+        "expected_outcome": "the short reference research prompt is typed into the message composer but left UNSENT (it stays sitting in the input box)",
+        "context_hint": (
+            "Type a short research INSTRUCTION into the message composer, then STOP "
+            "without sending. Target the main message input at the BOTTOM of the "
+            "desktop conversation view (the wide composer text field with a 'Message…' "
+            "/ 'Ask anything' / 'Reply to Claude…' placeholder on chatgpt.com or "
+            "claude.ai — this hotspot only ever fires on ChatGPT/Claude, never Gemini). "
+            "Click into it and TYPE a prompt that refers to the attached brief — ask it "
+            "to perform deep research on the topic described in the attached brief, in "
+            "Deep Research mode, and produce a comprehensive report with citations. "
+            "Then STOP: do NOT click Send (the up-arrow / paper-plane submit button), "
+            "do NOT press Enter, and do NOT click the attached brief chip/tile, the "
+            "model selector, or the Deep-Research mode toggle. Sending is a separate "
+            "later step."
+        ),
+        "success_signals": [
+            "the typed reference prompt text visible sitting INSIDE the composer input",
+            "no new user message bubble in the thread — nothing was sent",
+            "the attached/pasted brief chip/tile still shown in/above the composer"
+        ],
+    },
+    "poll-stuck-arbiter": {
+        "expected_outcome": "a stuck-vs-slow verdict is returned as a final line: 'CONCLUSION: stuck' or 'CONCLUSION: working' (no click made)",
+        "context_hint": (
+            "READ-ONLY — do NOT click, type, submit, or dismiss anything; this is a "
+            "look-only verdict. A deep-research agent has shown NO new output to our "
+            "scrapers for several minutes; decide whether it is GENUINELY STUCK or "
+            "merely SLOW by looking at the page (the report body and the end of the AI "
+            "response, not the top). Answer 'CONCLUSION: working' if you see "
+            "SUBSTANTIAL research output — a populated report, many sources/citations, "
+            "long generated text — even with a spinner still running, OR a "
+            "counter/progress indicator actively climbing, OR PLAN ACTIVITY (a research "
+            "plan being drafted or already drafted, a streaming plan outline, a plan "
+            "with a 'Start research' button, an active stop/streaming control); plan "
+            "generation legitimately takes 10+ minutes with zero sources, so planning "
+            "is NOT stuck. Answer 'CONCLUSION: stuck' ONLY if there is essentially no "
+            "real research output AND no plan activity — an empty / placeholder / "
+            "loading skeleton (e.g. 'Preparing…') that looks frozen. If unsure, answer "
+            "'CONCLUSION: working'. Do NOT click the 'Start research' button, do NOT "
+            "touch the Stop / stop-generating square or the microphone in the composer, "
+            "do NOT scroll-to-fix — observe and report only."
+        ),
+        "success_signals": [
+            "a final line reading exactly 'CONCLUSION: stuck' or 'CONCLUSION: working'",
+            "the verdict grounded in the visible page: substantial report/sources/long text or climbing counter or plan-generation activity => working",
+            "an empty/placeholder/frozen skeleton with no plan activity => stuck",
+            "no click, type, or dismiss action taken (read-only)"
+        ],
+    },
+    # P3 / NotebookLM act-tier hotspots (#839). Agree with PROMPT_NOTEBOOKLM_* /
+    # make_prompt_audio_* — the act loop also gets those full missions verbatim.
+    "nlm-create-upload": {
+        "expected_outcome": "a NEW NotebookLM notebook is created and its first source file is uploading — the file shows as a row in the notebook's Sources panel",
+        "context_hint": (
+            "Create a NEW NotebookLM notebook and upload its FIRST source file. On the "
+            "NotebookLM home page click the 'Create'/'New notebook' control (the '+ "
+            "Create'/'Create new notebook' button or tile) to open a fresh notebook, "
+            "then in the add-source dialog choose 'Upload files' / the file-drop area "
+            "and click that upload control — the OS file dialog is auto-handled and the "
+            "single file is already selected, so you only click; you never browse the "
+            "filesystem. Do NOT type or paste any filename, path, or text (the file "
+            "dialog is auto-answered — just click upload); do NOT choose a text-paste "
+            "or link/URL source-input option instead of the 'Upload files' / file-drop "
+            "area; do NOT open an existing recent-notebook card on the home page — you "
+            "must create a NEW notebook; do NOT add more than the single file."
+        ),
+        "success_signals": [
+            "a new notebook workspace is open (an 'Untitled notebook' /notebook/ page, not the home-page notebook grid)",
+            "the uploaded file appears as a source row in the left Sources panel (a processing spinner or a document icon), no text/link source card"
+        ],
+    },
+    "nlm-add-source": {
+        "expected_outcome": "the source file is added to the already-open notebook — a new source row appears in NotebookLM's Sources panel",
+        "context_hint": (
+            "Add ONE source file to the NotebookLM notebook that is ALREADY open. The "
+            "target is the 'Add source' button (or the '+' add-source control) in the "
+            "Sources panel on the LEFT; click it, then in the add-source dialog click "
+            "the 'Upload' / 'Upload files' / choose-file / upload area. The OS file "
+            "dialog is auto-handled and the file is pre-selected — do NOT type a file "
+            "path, do NOT drive the native OS dialog, just click the Add source / "
+            "Upload affordance. Add EXACTLY this one file: the moment its source row "
+            "appears you are done, so do NOT keep re-clicking Add source hunting for "
+            "more files, do NOT create a second notebook, and do NOT type or paste "
+            "anything."
+        ),
+        "success_signals": [
+            "an add-source / Upload dialog open (an 'Upload files' or file-upload area)",
+            "a new source row for the uploaded file appearing in the Sources panel"
+        ],
+    },
+    "nlm-rename": {
+        "expected_outcome": "the notebook's title bar at the top now shows ONLY the new research title, with the old \"Untitled notebook\" text fully replaced (not appended to) and the field no longer in edit mode",
+        "context_hint": (
+            "Rename the NotebookLM notebook. The target is the notebook TITLE at the "
+            "TOP of the page (usually reads \"Untitled notebook\", or the current name) — "
+            "click it once to enter the editable title field. You MUST clear the "
+            "existing text FIRST: TRIPLE-CLICK the title field to select the whole "
+            "value (this input IGNORES Ctrl+A), then type the new name and press Enter. "
+            "Do NOT just start typing without selecting — typing appends onto the old "
+            "text and produces a mangled title like \"Untitled notebookNew Name\". Do NOT "
+            "click the Sources panel, the Studio cards, or the Share button, and do NOT "
+            "touch the microphone or stop button in the bottom chat composer. Rename "
+            "the title field only. If a CAPTCHA / login / verification gate appears, "
+            "stop."
+        ),
+        "success_signals": [
+            "the title at the top shows the new name as a single clean string",
+            "no leftover 'Untitled notebook' and no doubled/appended text",
+            "the title field is committed (no longer in edit mode / caret gone)"
+        ],
+    },
+    "nlm-verify-sources": {
+        "expected_outcome": "a read-only source-health verdict is produced — either 'ALL OK', or 'FAILED: <filename>[, <filename>]' naming by exact filename every source shown in a red/error (failed-import) state — with nothing clicked or changed on the page",
+        "context_hint": (
+            "READ-ONLY — do NOT click, type, delete, retry, generate, or change "
+            "anything; only observe and report a verdict. On NotebookLM's Sources panel "
+            "(left side of the desktop Chrome window), read each uploaded source row by "
+            "its filename and judge its health: a HEALTHY row shows a normal document "
+            "icon / checkbox; a FAILED row shows an error state — a red icon, red text, "
+            "or an error/warning/retry badge (wording like \"couldn't be added\" / "
+            "\"failed\" / \"error\"). Let any row still showing a processing spinner settle "
+            "for a few seconds before judging. Then report EVERY failed source by its "
+            "exact filename, or say 'ALL OK' if all are healthy — never 'FAILED: none'. "
+            "Do NOT click a source row, its checkbox, its Retry / three-dot (⋮) menu, "
+            "or the 'Add source' / '+' control — a stray click here misfires (e.g. "
+            "fires a retry or creates a duplicate source); this hotspot's read-only "
+            "contract is the #839 act-tier lesson."
+        ),
+        "success_signals": [
+            "the Sources panel (left) listing each expected source as a row with its filename",
+            "each row's health read from its icon — a normal document icon/checkbox (healthy) vs a red / error / warning / retry badge (failed)",
+            "no click, edit, or menu opened — only a spoken verdict whose last line is exactly 'ALL OK' or 'FAILED: <filename>[, <filename>]'"
+        ],
+    },
+    "nlm-reupload": {
+        "expected_outcome": "the ONE named failed NotebookLM source is re-imported and finishes processing with no red error icon",
+        "context_hint": (
+            "Repair the ONE NotebookLM source that failed to import (the failed "
+            "filename arrives in the run detail). In the Sources panel (the source "
+            "list, NOT the Studio audio cards), find the row whose filename matches and "
+            "that shows a red/error icon. PREFER its non-destructive in-place retry: a "
+            "'Retry' / 'Try again' / 'Re-import' action on that row or inside its "
+            "3-dot/⋮ menu — click that and you are done. ONLY if there is no retry "
+            "option, open THAT source's 3-dot/⋮ menu, Remove/Delete it, then click 'Add "
+            "source' / '+' and the Upload / upload-files area (the OS file dialog "
+            "auto-selects the file). Touch ONLY the one named failed source — do NOT "
+            "remove, click, or retry any healthy source, do NOT type or paste anything "
+            "(the file dialog is auto-handled), and do NOT generate audio or anything "
+            "else."
+        ),
+        "success_signals": [
+            "the named source's row no longer shows a red/error icon or a spinner",
+            "that source appears as a normal, processed source in the Sources panel",
+            "no leftover Add-source / upload dialog is open"
+        ],
+    },
+    "audio-generate": {
+        "expected_outcome": "exactly ONE NotebookLM audio overview starts generating with the requested Format/Length (default Deep Dive / Long) — a single new audio card shows a 'Generating…' progress indicator",
+        "context_hint": (
+            "Generate EXACTLY ONE NotebookLM Audio Overview with the requested "
+            "Format/Length (default Deep Dive / Long) in the Studio panel on the RIGHT. "
+            "If the Audio Overview customize panel is ALREADY OPEN (a Format selector "
+            "is visible), go straight to it: set the Format dropdown + the Length "
+            "dropdown, then click that panel's Generate button ONCE — this is the FINAL "
+            "click. If the panel is NOT open, first click ONLY the gear / 'Customise' "
+            "arrow / three-dot control ON the Audio Overview card to open it, confirm "
+            "the Format selector appears, then set Format/Length and Generate once. Do "
+            "NOT click the Audio Overview card body, its title text, thumbnail, or play "
+            "area; do NOT click any Generate/Create on the card before the customize "
+            "panel is open; do NOT click an already-existing audio entry's play button "
+            "or row; and after the single Generate click do NOT click ANYTHING (not the "
+            "new/generating card, not a play/verify/open/Interactive-mode/Join/Share "
+            "control) — one stray click fires an undeletable DEFAULT-audio duplicate."
+        ),
+        "success_signals": [
+            "a 'Generating…' / loading / progress indicator on a new audio card",
+            "exactly ONE audio entry in the Studio panel (no duplicate default audio)",
+            "the customize panel's Generate button was clicked once, then no further clicks"
+        ],
+    },
+    "audio-check": {
+        "expected_outcome": "an honest 'audio complete' verdict only when the audio overview card itself shows a finished player with no progress indicator",
+        "context_hint": (
+            "READ ONLY — do NOT click ANYTHING on this NotebookLM page: not the audio "
+            "overview card, its title, thumbnail, or play control, and not any audio "
+            "entry in the Studio panel. A single click fires NotebookLM's one-click "
+            "DEFAULT audio = an unwanted DUPLICATE that cannot be undone (a failure). "
+            "You are only OBSERVING — there is no action to verify. Just LOOK at the "
+            "audio overview CARD in the Studio panel (right side — the card you "
+            "generated): a progress bar, 'Generating…' text, or a spinner ON the card "
+            "itself → say 'still generating'; a completed audio player with play + "
+            "download controls AND no progress indicator on the card → say 'audio "
+            "complete'. IGNORE sidebars, banners, source-list spinners, and page-level "
+            "loading — ambient progress on unrelated UI is a false positive; only the "
+            "audio card's OWN state counts. Report the verdict using the literal phrase "
+            "'audio complete' or 'still generating'."
+        ),
+        "success_signals": [
+            "a completed audio player with play + download controls on the audio overview card AND no progress bar/spinner on that card (→ audio complete)",
+            "a progress bar / 'Generating…' text / spinner on the card itself (→ still generating)"
+        ],
+    },
 }
+
+# Act-path twins of the observe-path p3-* keys — the SAME desktop UI, so they
+# share ONE hint (single source of truth; a shared reference keeps them from
+# silently diverging the way separate copies did). nlm-share ↔ the miss-path
+# NotebookLM share fallback; audio-download ↔ the act-path audio .m4a download.
+_HOTSPOT_VISION_HINTS["nlm-share"] = _HOTSPOT_VISION_HINTS["p3-share"]
+_HOTSPOT_VISION_HINTS["audio-download"] = _HOTSPOT_VISION_HINTS["p3-audio-download"]
 
 
 def _attempts_for_hotspot(hotspot_id: str, platform: str) -> int:
@@ -40045,6 +40314,19 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     # per-drop-path disarms keep it clean within a run. Also covers resume
     # re-entries (a stale pre-crash deadline must not ride the checkpoint back).
     _disarm_registry("__all__")
+    # Same cross-run-wipe cluster: Vision's per-run budget/telemetry lives on
+    # vision.default_client()'s singleton VisionMetrics, which the long-lived
+    # --serve worker reuses across runs. Left un-reset, call_count accumulates
+    # since boot and trips the per-run budget gate permanently (the tier then
+    # goes dark, falling through to CUA for the process lifetime). Reset it so
+    # the budget + analytics are genuinely per-run. No-op + no client
+    # construction when Vision was never touched (off path stays byte-identical);
+    # never let a Vision hiccup break a run, hence the guard.
+    if _vision is not None:
+        try:
+            _vision.reset_default_metrics()
+        except Exception:
+            pass
     # Clear dedup cache — stale keys from a prior run in the same process
     # would otherwise suppress early events in this run.
     _last_progress.clear()
