@@ -183,3 +183,56 @@ def test_start_detached_routes_to_launchctl_start_on_macos(monkeypatch):
     monkeypatch.setattr(autostart, "_exec", lambda argv: calls.append(argv) or (True, ""))
     autostart.start_detached()
     assert calls[-1] == ["launchctl", "start", autostart.LAUNCHD_LABEL]
+
+
+# ── restart(): the post-update cycle (mirrors the backend's _restart_supervisor) ─
+
+def test_restart_refuses_when_not_installed(monkeypatch):
+    monkeypatch.setattr(autostart, "is_installed", lambda task_name=autostart.TASK_NAME: False)
+    ok, msg = autostart.restart()
+    assert ok is False and "not installed" in msg
+
+
+def test_restart_uses_systemctl_restart_on_linux(monkeypatch):
+    # `start` is a no-op on a running unit — a real restart is the ONLY thing that
+    # swaps the live code after an upgrade.
+    monkeypatch.setattr(autostart, "is_installed", lambda task_name=autostart.TASK_NAME: True)
+    monkeypatch.setattr(autostart.sys, "platform", "linux")
+    calls = []
+    monkeypatch.setattr(autostart, "_exec", lambda argv: calls.append(argv) or (True, ""))
+    ok, _ = autostart.restart()
+    assert ok is True
+    assert calls[-1] == ["systemctl", "--user", "restart", autostart.SYSTEMD_UNIT]
+
+
+def test_restart_uses_kickstart_on_macos(monkeypatch):
+    monkeypatch.setattr(autostart, "is_installed", lambda task_name=autostart.TASK_NAME: True)
+    monkeypatch.setattr(autostart.sys, "platform", "darwin")
+    monkeypatch.setattr(autostart.os, "getuid", lambda: 501, raising=False)
+    calls = []
+    monkeypatch.setattr(autostart, "_exec", lambda argv: calls.append(argv) or (True, ""))
+    ok, _ = autostart.restart()
+    assert ok is True
+    flat = " ".join(calls[-1])
+    assert "launchctl" in flat and "kickstart" in flat and "-k" in flat
+    assert f"gui/501/{autostart.LAUNCHD_LABEL}" in flat
+
+
+def test_restart_uses_end_then_run_on_windows(monkeypatch):
+    # /Create rewrites the definition but never touches the live process; only
+    # /End+/Run cycles it. /End is non-zero on an idle task (no instance to end) —
+    # so restart() MUST return /Run's result, not /End's. Differentiate the stub so
+    # a refactor that returned /End's result would fail here.
+    monkeypatch.setattr(autostart, "is_installed", lambda task_name=autostart.TASK_NAME: True)
+    monkeypatch.setattr(autostart.sys, "platform", "win32")
+    calls = []
+
+    def _exec(argv):
+        calls.append(argv)
+        return (False, "no running instance") if "/End" in argv else (True, "")
+    monkeypatch.setattr(autostart, "_exec", _exec)
+    ok, _ = autostart.restart()
+    assert ok is True, "restart must report /Run's result, not /End's non-zero"
+    verbs = [c[1] for c in calls]  # schtasks <verb> ...
+    assert "/End" in verbs and "/Run" in verbs
+    assert verbs.index("/End") < verbs.index("/Run")  # End before Run

@@ -158,6 +158,31 @@ def test_cmd_retire_success_and_other_error_both_return_0(monkeypatch):
     assert cli.cmd_retire(_ns()) == 0  # surfaces a warn but still returns 0
 
 
+def test_cmd_restart_refuses_when_nothing_pinned(monkeypatch):
+    monkeypatch.setattr(cli.autostart, "is_installed", lambda: False)
+    assert cli.cmd_restart(_ns()) == 1  # nothing to restart → point at resurrect
+
+
+def test_cmd_restart_cycles_the_bridge(monkeypatch):
+    monkeypatch.setattr(cli.autostart, "is_installed", lambda: True)
+    monkeypatch.setattr(cli.autostart, "restart", lambda: (True, "restarted"))
+    monkeypatch.setattr(cli, "_wait_bridge_up", lambda *a, **k: True)
+    assert cli.cmd_restart(_ns()) == 0
+
+
+def test_cmd_restart_reports_restart_failure(monkeypatch):
+    monkeypatch.setattr(cli.autostart, "is_installed", lambda: True)
+    monkeypatch.setattr(cli.autostart, "restart", lambda: (False, "systemctl error"))
+    assert cli.cmd_restart(_ns()) == 1
+
+
+def test_cmd_restart_delegates_to_wsl(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(cli, "_delegate_lifecycle", lambda sub, extra, **k: seen.update(sub=sub) or 0)
+    assert cli.cmd_restart(cli.build_parser().parse_args(["restart"])) == 0
+    assert seen["sub"] == "restart"  # a WSL runtime restarts inside the distro
+
+
 def test_cmd_disconnect_removes_skill_and_signs_out(monkeypatch):
     home = Path("C:/Users/me")
     removed = []

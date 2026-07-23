@@ -31,7 +31,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-from . import __version__, config, prefs
+from . import __version__, autostart, config, prefs
 
 AGENT_PKG = "superresearch-agent"
 BACKEND_PKG = "superresearch"
@@ -146,6 +146,7 @@ import os, sys, time, json, subprocess
 from pathlib import Path
 pid = int(sys.argv[1]); cfg = json.loads(sys.argv[2])
 pipx = cfg["pipx"]; pkg = cfg["pkg"]; connect_args = cfg["connect_args"]
+restart_args = cfg.get("restart_args") or []
 def alive(p):
     if sys.platform == "win32":
         import ctypes
@@ -192,6 +193,18 @@ except Exception:
 #    launcher + start the new bridge.
 if entry:
     subprocess.run([entry] + connect_args)
+    # 3) On a SUPERVISED host, cycle the bridge via its supervisor so the running
+    #    process re-execs the new venv. connect re-pins the launcher/unit, but its
+    #    `start` step is a NO-OP when the supervisor already relaunched the OLD
+    #    bridge (systemd Restart=always / launchd KeepAlive) — only a real restart
+    #    swaps the live code. Without this the update "succeeds" but stays vX (the
+    #    reported bug). Skipped (restart_args empty) on an unsupervised foreground
+    #    serve, where the reconnect above binds the freed port directly.
+    if restart_args:
+        try:
+            subprocess.run([entry] + restart_args)
+        except Exception:
+            pass
 else:
     subprocess.run(pipx + ["run", "--no-cache", pkg] + connect_args)
 '''
@@ -212,6 +225,29 @@ def _waiter_python() -> "str | None":
     the ephemeral `pipx run` venv interpreter (which could be evicted while the
     waiter sleeps). Falls back to the current interpreter."""
     return shutil.which("python3") or shutil.which("python") or sys.executable
+
+
+def _cgroup_escape_prefix() -> "list[str]":
+    """Prefix that runs the detached waiter OUTSIDE the bridge's process group.
+
+    On Linux the bridge runs as a systemd --user service's MAIN process, so a
+    plain detached child lives in the SAME cgroup — when the bridge exits (and the
+    self-update restarts the unit), systemd's default KillMode=control-group reaps
+    the child before it can upgrade (the live symptom: an empty self-update.log +
+    the bridge stuck on the old version). `systemd-run --user --collect` runs the
+    waiter in its OWN transient scope so it survives the bridge's death and the
+    supervisor restart. Empty list off-Linux, without systemd-run, or with no user
+    manager reachable (macOS/Windows detached children already survive) — so it is
+    never worse than before."""
+    if not sys.platform.startswith("linux"):
+        return []
+    exe = shutil.which("systemd-run")
+    if not exe:
+        return []
+    # A user manager must be reachable, else `systemd-run --user` errors out.
+    if not (os.environ.get("XDG_RUNTIME_DIR") or os.environ.get("DBUS_SESSION_BUS_ADDRESS")):
+        return []
+    return [exe, "--user", "--collect", "--quiet", "--"]
 
 
 def agent_resolvable() -> bool:
@@ -272,8 +308,11 @@ def spawn_detached_reconnect() -> bool:
     `pipx run --no-cache … connect` when the persistent venv can't be resolved, so
     it is never worse than before. Returns True if the helper launched.
 
-    The caller (the /agent-install route) shuts the bridge down right after, so the
-    waiter's connect finds the loopback port free and the new bridge binds it."""
+    The caller (the /agent-install route) shuts the bridge down right after. On an
+    unsupervised foreground serve the waiter's connect then binds the freed port;
+    on a SUPERVISED host it instead cycles the bridge via `agent restart` (the
+    supervisor owns the port, so a reconnect can't rebind it). The waiter is run
+    cgroup-escaped on Linux so systemd can't reap it when the unit restarts."""
     pipx = _pipx_cmd()
     py = _waiter_python()
     if pipx is None or py is None:
@@ -286,8 +325,19 @@ def spawn_detached_reconnect() -> bool:
     rt = prefs.get_runtime()
     if rt:
         connect_args += ["--runtime", rt]
-    cfg = json.dumps({"pipx": pipx, "pkg": AGENT_PKG, "connect_args": connect_args})
-    cmd = [py, "-c", _RECONNECT_WAITER, str(os.getpid()), cfg]
+    # Cycle the supervisor onto the new venv ONLY when one is pinned. A foreground
+    # serve has no supervisor — there the reconnect's own `serve` binds the port.
+    supervised = autostart.is_installed()
+    restart_args = ["restart"] if supervised else []
+    cfg = json.dumps({"pipx": pipx, "pkg": AGENT_PKG, "connect_args": connect_args,
+                      "restart_args": restart_args})
+    # Escape the cgroup ONLY when supervised — that's the only case where systemd's
+    # KillMode reaps the waiter as the bridge exits. On an unsupervised foreground
+    # serve there's no service cgroup, so a plain detached child survives AND its
+    # output still lands in self-update.log (systemd-run would divert it to the
+    # journal).
+    escape = _cgroup_escape_prefix() if supervised else []
+    cmd = escape + [py, "-c", _RECONNECT_WAITER, str(os.getpid()), cfg]
     return _spawn_detached(cmd, "self-update.log")
 
 

@@ -95,10 +95,10 @@ class TestLifecycleWaiter:
                 pass  # resolve() edge cases shouldn't fail the assertion
 
     def test_spawn_detached_aborts_cleanly_without_pipx(self, monkeypatch):
-        # With no pipx resolvable, spawning must return False (caller then prints
-        # the manual command) — never raise.
+        # With no pipx resolvable, spawning must return None (falsy — caller then
+        # prints the manual command) — never raise.
         monkeypatch.setattr(research, "_pipx_cmd", lambda: None)
-        assert research._spawn_detached_lifecycle("uninstall") is False
+        assert research._spawn_detached_lifecycle("uninstall") is None
 
 
 # ─── Daemon-loop orphan-sweep — the offline-after-pair ROOT-CAUSE invariant ──
@@ -296,7 +296,7 @@ class TestSelfUpdateIdempotent:
         monkeypatch.setattr(research, "_sr_version", lambda: cur)
         monkeypatch.setattr(research, "_latest_on_pypi", lambda *, force=False: latest)
 
-        def _spawn(action):
+        def _spawn(action, **kw):
             spawned.append(action)
             return True
 
@@ -335,7 +335,7 @@ class TestSelfUpdateIdempotent:
         monkeypatch.setattr(research, "_is_source_checkout", lambda: False)
         monkeypatch.setattr(research, "_pipx_cmd", lambda: ["pipx"])
         monkeypatch.setattr(research, "_sr_version", lambda: "0.1.5")
-        monkeypatch.setattr(research, "_spawn_detached_lifecycle", lambda a: True)
+        monkeypatch.setattr(research, "_spawn_detached_lifecycle", lambda a, **kw: True)
 
         def _latest(*, force=False):
             seen["force"] = force

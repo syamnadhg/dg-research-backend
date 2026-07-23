@@ -789,6 +789,35 @@ def cmd_resurrect(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_restart(args: argparse.Namespace) -> int:
+    """Restart the background bridge so it picks up an upgraded package (the agent
+    twin of the backend `--restart`). The account session, skill, and login pin are
+    left intact — this only cycles the running process onto the code on disk. The
+    self-update flow calls this after a `pipx install --force`; it's also the manual
+    fix when a bridge is stuck on an old build. WSL-aware."""
+    rc = _delegate_lifecycle("restart", [], label="Restart")
+    if rc is not None:
+        return rc
+    if not connect.is_continued():
+        b.header("recursus", "restart the background bridge",
+                 tagline_color=branding._BOLD + branding._ACCENT)
+    if not autostart.is_installed():
+        b.warn("Nothing to restart — the bridge isn't pinned to login.")
+        b.dim("Pin + start it:  python research.py agent resurrect")
+        return 1
+    ok, out = autostart.restart()
+    if not ok:
+        b.no(f"Couldn't restart the bridge: {out}")
+        b.dim("Try: python research.py agent retire   then   python research.py agent resurrect")
+        return 1
+    if _wait_bridge_up():
+        b.ok("Bridge restarted")
+    else:
+        b.warn("Restart issued, but the bridge isn't answering yet — give it a few seconds.")
+        b.dim("Check it: python research.py agent status")
+    return 0
+
+
 def _retire_bridge() -> None:
     """Stop a running background bridge + remove its logon autostart pin — the core
     of `agent retire`, shared with `disconnect`'s optional full-teardown step.
@@ -1598,6 +1627,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("retire", parents=[common],
                    help="stop the bridge AND unpin it from login startup (won't return until 'resurrect')"
                    ).set_defaults(func=cmd_retire)
+    sub.add_parser("restart", parents=[common],
+                   help="restart the background bridge (pick up an upgraded package; keeps the login pin)"
+                   ).set_defaults(func=cmd_restart)
 
     sub.add_parser("version", parents=[common],
                    help="show the agent + Super Research backend versions"

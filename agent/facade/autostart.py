@@ -22,6 +22,7 @@ validated end-to-end on a live Linux/macOS host.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -170,6 +171,14 @@ def _win_start(exe: str | None = None, launcher: Path | None = None) -> tuple[bo
     return True, ""
 
 
+def _win_restart(task_name: str = TASK_NAME) -> tuple[bool, str]:
+    # /End is best-effort — the task may be idle (no instance to end), which
+    # returns non-zero; only /Run's result matters. /Create /F rewrites the task
+    # definition but never touches the live process, so a real restart needs /Run.
+    _exec(["schtasks", "/End", "/TN", task_name])
+    return _exec(["schtasks", "/Run", "/TN", task_name])
+
+
 # ── Linux: systemd --user service ─────────────────────────────────────────────
 
 def systemd_unit_path() -> Path:
@@ -237,6 +246,13 @@ def _linux_start() -> tuple[bool, str]:
     return _exec(systemctl_argv("start", SYSTEMD_UNIT))
 
 
+def _linux_restart() -> tuple[bool, str]:
+    # `restart` cycles the running unit onto the code on disk. `start` is a NO-OP
+    # when the unit is already running (Restart=always keeps it up), so it would
+    # keep serving the OLD build after a pipx upgrade.
+    return _exec(systemctl_argv("restart", SYSTEMD_UNIT))
+
+
 # ── macOS: launchd LaunchAgent ───────────────────────────────────────────────
 
 def launchd_plist_path() -> Path:
@@ -298,6 +314,14 @@ def _darwin_status() -> tuple[bool, str]:
 
 def _darwin_start() -> tuple[bool, str]:
     return _exec(launchctl_argv("start", LAUNCHD_LABEL))
+
+
+def _darwin_restart() -> tuple[bool, str]:
+    # `kickstart -k` kills then restarts the loaded job in one atomic step, so the
+    # bridge re-execs the code on disk. `launchctl start` alone doesn't cycle a
+    # KeepAlive job that's already up (it stays on the OLD build after an upgrade).
+    label = f"gui/{os.getuid()}/{LAUNCHD_LABEL}"
+    return _exec(launchctl_argv("kickstart", "-k", label))
 
 
 # ── dispatch (public API) ─────────────────────────────────────────────────────
@@ -372,4 +396,22 @@ def start_detached(exe: str | None = None, launcher: Path | None = None) -> tupl
         return _linux_start()
     if is_macos():
         return _darwin_start()
+    return _unsupported()
+
+
+def restart(task_name: str = TASK_NAME) -> tuple[bool, str]:
+    """Restart the ALREADY-PINNED background bridge so it re-execs the code on
+    disk — the post-update step. A pipx upgrade replaces the package, but the
+    running bridge keeps the OLD code in memory until it is cycled, and
+    `start_detached` alone can't do it: `systemctl start` / `launchctl start` are
+    no-ops on an already-running unit. Mirrors the backend's `_restart_supervisor`.
+    Refuses (False, "not installed") when nothing is pinned. Never raises."""
+    if not is_installed(task_name):
+        return False, "not installed"
+    if is_windows():
+        return _win_restart(task_name)
+    if is_linux():
+        return _linux_restart()
+    if is_macos():
+        return _darwin_restart()
     return _unsupported()

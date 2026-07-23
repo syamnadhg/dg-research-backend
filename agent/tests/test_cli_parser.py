@@ -122,6 +122,12 @@ def test_resurrect_and_retire_parse():
     assert cli.build_parser().parse_args(["retire"]).func is cli.cmd_retire
 
 
+def test_restart_parses():
+    # The post-update cycle verb — must resolve so the self-update helper can call
+    # `agent restart` from the persistent install.
+    assert cli.build_parser().parse_args(["restart"]).func is cli.cmd_restart
+
+
 def test_autostart_subcommand_removed():
     # `autostart` was renamed to resurrect/retire — the old verb is gone.
     with pytest.raises(SystemExit):

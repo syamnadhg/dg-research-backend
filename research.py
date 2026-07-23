@@ -4893,15 +4893,21 @@ def _handle_update_command(data: dict, device_id: str, loop) -> None:
         return
 
     # Decide + spawn the detached upgrade (does NOT print / exit — we own the exit).
-    res = _perform_self_update(force_check=True)
+    # restart_after: unlike the CLI (where the user runs `--restart`), the app has
+    # no way to trigger a restart, so the upgrade waiter must cycle the supervisor
+    # itself — cgroup-escaped so systemd can't reap it when the daemon-loop dies.
+    # Without this the update "starts" but the version never bumps → the app times
+    # out with "taking longer than expected".
+    res = _perform_self_update(force_check=True, restart_after=True)
     _write_update_status(device_id, {"state": res["state"], "current": res.get("current"),
                                      "latest": res.get("latest"), "reason": res.get("reason", "")})
     if res["state"] == "started":
         # Only NOW that an upgrade is actually launched do we stop this worker's own
         # run (gracefully, keeping partial results). Never stop a run for a no-op
         # update (already/failed/unsupported) — that would abort an in-flight run
-        # for nothing. Sibling workers were just terminated by
-        # _spawn_detached_lifecycle so pipx can rebuild the shared venv.
+        # for nothing. (On Windows the daemon-loop + sibling workers were killed to
+        # free the venv; off-Windows they stay alive and `superresearch --restart`
+        # cycles the whole supervisor onto the new venv at the end.)
         if local_busy and loop is not None:
             try:
                 loop.call_soon_threadsafe(_controls.request_stop)
@@ -4910,7 +4916,14 @@ def _handle_update_command(data: dict, device_id: str, loop) -> None:
                 log(f"[device-cmds] UPDATE: request_stop dispatch failed: {_rs}", "WARN")
         log(f"[device-cmds] UPDATE: upgrade launched ({res.get('current')} → "
             f"{res.get('latest') or 'latest'}); exiting so pipx can rebuild the venv")
-        _schedule_server_exit("device-update", delay_sec=1.5)
+        # PROTECT the upgrade waiter from the pre-exit child-reap: off-Linux it's a
+        # direct child of this worker, and reaping it would SIGKILL it before it
+        # upgrades + restarts (so the version would never bump — the very bug this
+        # path fixes). On Linux systemd-run already re-parented it; protect is a
+        # harmless no-op there.
+        _wpid = res.get("waiter_pid")
+        _schedule_server_exit("device-update", delay_sec=1.5,
+                              protect_pids=({_wpid} if _wpid else None))
     else:
         log(f"[device-cmds] UPDATE: no upgrade ({res['state']}: {res.get('reason')})")
 
@@ -7699,12 +7712,48 @@ def _clear_current_run_id_best_effort(reason: str) -> None:
         )
 
 
-def _schedule_server_exit(source: str, delay_sec: float = 3.0):
+def _reap_child_processes(source: str, protect_pids=None) -> int:
+    """Kill this process's child tree (patchright node driver + chromium, etc.)
+    before an os._exit so the supervisor respawn starts clean. Returns the count
+    killed. ``protect_pids`` are excluded — used to spare a detached upgrade waiter
+    that must outlive us (off-Linux it's a direct child; reaping it would abort the
+    update). Never raises."""
+    _protect = set(protect_pids or ())
+    killed_n = 0
+    try:
+        import psutil as _ps
+        me = _ps.Process(os.getpid())
+        for child in me.children(recursive=True):
+            if child.pid in _protect:
+                continue  # e.g. the detached upgrade waiter — must outlive us
+            try:
+                child.kill()
+                killed_n += 1
+            except (_ps.NoSuchProcess, _ps.AccessDenied):
+                pass
+        if killed_n:
+            log(f"[{source}] Reaped {killed_n} child process(es) before exit", "INFO")
+    except Exception as _ps_err:
+        try:
+            log(f"[{source}] Child-process sweep failed (non-fatal): {_ps_err}", "WARN")
+        except Exception:
+            pass
+    return killed_n
+
+
+def _schedule_server_exit(source: str, delay_sec: float = 3.0, protect_pids=None):
     """Schedule a one-shot daemon thread that calls os._exit(0) after a short
     delay, giving the pipeline time to emit pipeline_stopped + close the
     browser cleanly. Idempotent: if the same run is stopped via BOTH the
     Firestore command listener AND the HTTP endpoint, we only spawn one
     exit thread. Called from whichever stop transport fires first.
+
+    ``protect_pids`` — child PIDs to EXCLUDE from the pre-exit reap. The remote
+    update path spawns a detached upgrade waiter that is (off-Linux) a direct child
+    of this worker; without protection the reap below SIGKILLs it before it can run
+    `pipx upgrade` + `superresearch --restart`, so the update never applies (the
+    version-never-bumps bug). The waiter is childless when the reap fires (it's in
+    its wait-for-parent sleep), so excluding its own PID is sufficient.
 
     2026-05-21: reap child PIDs (patchright node driver + chromium)
     BEFORE os._exit. Pre-fix, `os._exit(0)` left the patchright node
@@ -7744,24 +7793,9 @@ def _schedule_server_exit(source: str, delay_sec: float = 3.0):
         # this, the patchright node-driver + chromium subprocesses persist
         # past os._exit and orphan into the user's process list (memory
         # entry `project_queue_bug_investigation.md` documents this exact
-        # failure mode from 2026-04-29).
-        try:
-            import psutil as _ps
-            me = _ps.Process(_os.getpid())
-            killed_n = 0
-            for child in me.children(recursive=True):
-                try:
-                    child.kill()
-                    killed_n += 1
-                except (_ps.NoSuchProcess, _ps.AccessDenied):
-                    pass
-            if killed_n:
-                log(f"[{source}] Reaped {killed_n} child process(es) before exit", "INFO")
-        except Exception as _ps_err:
-            try:
-                log(f"[{source}] Child-process sweep failed (non-fatal): {_ps_err}", "WARN")
-            except Exception:
-                pass
+        # failure mode from 2026-04-29). protect_pids spares the detached
+        # upgrade waiter (see the docstring).
+        _reap_child_processes(source, protect_pids)
         # Any remaining delay budget after the grace + sweep (typically 0
         # since 2s grace + sub-second sweep already consumed delay_sec=3).
         _t.sleep(max(0, delay_sec - 2.0))
@@ -52822,6 +52856,54 @@ def _pipx_cmd() -> "list[str] | None":
     return None
 
 
+def _cgroup_escape_prefix() -> "list[str]":
+    """Prefix that runs a detached helper OUTSIDE the supervisor's cgroup.
+
+    The APP-DRIVEN update runs from inside a serve worker, a child of the
+    --daemon-loop that IS the systemd unit's main process. When the upgrade kills
+    the daemon-loop (so pipx can rebuild the venv) and the helper then restarts the
+    unit, systemd's default KillMode=control-group would reap the helper mid-flight
+    — the same cgroup trap the agent bridge hits (the update "starts" but the
+    version never bumps → the app's 'taking longer than expected'). `systemd-run
+    --user --collect` runs it in its OWN transient scope so it survives. Empty list
+    off-Linux, without systemd-run, or with no user manager reachable (the CLI
+    `--update` already runs outside the cgroup, in the user's terminal) — never
+    worse than before."""
+    import shutil as _shutil
+    if not sys.platform.startswith("linux"):
+        return []
+    exe = _shutil.which("systemd-run")
+    if not exe:
+        return []
+    if not (os.environ.get("XDG_RUNTIME_DIR") or os.environ.get("DBUS_SESSION_BUS_ADDRESS")):
+        return []
+    return [exe, "--user", "--collect", "--quiet", "--"]
+
+
+def _installed_sr_entry() -> "str | None":
+    """Path to the persistently-installed `superresearch` console script (so the
+    post-upgrade restart runs the NEW build). Prefer the pipx shim on PATH; else
+    resolve it under the pipx venvs dir. None if it can't be located."""
+    import shutil as _shutil
+    shim = _shutil.which("superresearch")
+    if shim:
+        return shim
+    pipx = _pipx_cmd()
+    if pipx is None:
+        return None
+    try:
+        r = subprocess.run([*pipx, "environment", "--value", "PIPX_LOCAL_VENVS"],
+                           capture_output=True, text=True, timeout=30)
+        venvs = (r.stdout or "").strip()
+        if r.returncode != 0 or not venvs:
+            return None
+        rel = ("Scripts", "superresearch.exe") if sys.platform == "win32" else ("bin", "superresearch")
+        cand = Path(venvs).joinpath("superresearch", *rel)
+        return str(cand) if cand.exists() else None
+    except Exception:
+        return None
+
+
 # Detached lifecycle waiter (run by a NON-venv Python): waits for THIS process
 # to exit, then runs `pipx <action> superresearch`. Required because
 # `--update`/`--uninstall` run from the very venv pipx must rebuild/delete — on
@@ -52829,7 +52911,15 @@ def _pipx_cmd() -> "list[str] | None":
 # a half-deleted venv husk + a WinError-5 traceback when uninstall ran inline.
 _LIFECYCLE_WAITER = r'''
 import os, sys, time, subprocess
-pid = int(sys.argv[1]); cmd = sys.argv[2:]
+pid = int(sys.argv[1]); rest = sys.argv[2:]
+# rest = [<pipx cmd...>] optionally followed by "--then--" <restart cmd...>. The
+# restart cmd (e.g. `superresearch --restart`) cycles the SUPERVISOR onto the
+# freshly-rebuilt venv — Restart=always alone races the rebuild and would relaunch
+# the OLD in-memory build, so the app-driven update needs an explicit restart.
+if "--then--" in rest:
+    _i = rest.index("--then--"); cmd = rest[:_i]; after = rest[_i + 1:]
+else:
+    cmd = rest; after = []
 def _alive(p):
     if sys.platform == "win32":
         import ctypes
@@ -52850,7 +52940,14 @@ for _ in range(120):  # wait up to ~60s for the launcher to exit
         break
     time.sleep(0.5)
 time.sleep(2)  # grace for the OS to release the venv's file handles
-subprocess.run(cmd)
+rc = subprocess.run(cmd).returncode
+# Only cycle the supervisor if the upgrade itself succeeded — never restart onto a
+# half-built venv.
+if after and rc == 0:
+    try:
+        subprocess.run(after)
+    except Exception:
+        pass
 '''
 
 
@@ -52873,27 +52970,27 @@ def _path_python() -> "str | None":
     return cands[0] if cands else None
 
 
-def _spawn_detached_lifecycle(action: str) -> bool:
+def _spawn_detached_lifecycle(action: str, *, restart_after: bool = False) -> "int | None":
     """Stop any running supervisor/workers, then spawn a DETACHED waiter that
     runs `pipx <action> superresearch` once THIS process exits. `action` is
-    'uninstall' or 'upgrade'. Returns True if the waiter was launched."""
+    'uninstall' or 'upgrade'. Returns the spawned waiter's PID (truthy) on success,
+    or None if it couldn't launch. The PID lets the caller PROTECT the waiter from
+    its own `_schedule_server_exit` child-reap (see restart_after below).
+
+    ``restart_after`` (app-driven remote update only): after a successful upgrade,
+    also cycle the supervisor onto the new venv via `superresearch --restart`, and
+    run the waiter cgroup-escaped so systemd can't reap it mid-restart. The CLI
+    `--update` leaves this False — it runs outside the cgroup and hands the restart
+    to the user (the `--restart` advice it prints).
+
+    IMPORTANT: the caller that then calls `_schedule_server_exit` MUST pass this
+    PID as `protect_pids` — that helper reaps ALL child processes before exiting,
+    and off-Linux (no systemd-run re-parenting) the waiter is a direct child that
+    would otherwise be SIGKILLed before it ever runs the upgrade."""
     pipx = _pipx_cmd()
     py = _path_python()
     if pipx is None or py is None:
-        return False
-    # Free the venv: kill any leftover daemon-loop / --serve workers (NOT self) —
-    # they'd otherwise keep the venv's files open and pipx would still fail. The
-    # detached waiter handles the LAST holder (this process) by waiting for it.
-    try:
-        self_pid = os.getpid()
-        victims = [pid for pid, _cmd, role in _enumerate_research_py_procs()
-                   if pid != self_pid and role in ("daemon-loop", "serve")]
-        if victims:
-            _kill_pids(victims)
-            print(f"  Stopped {len(victims)} running backend process(es) so the "
-                  f"{action} can complete.")
-    except Exception:
-        pass
+        return None
     log_path = _STATE_DIR / f"{action}.log"
     logf = subprocess.DEVNULL
     try:
@@ -52901,29 +52998,80 @@ def _spawn_detached_lifecycle(action: str) -> bool:
         logf = open(log_path, "ab")
     except Exception:
         pass
-    cmd = [py, "-c", _LIFECYCLE_WAITER, str(os.getpid()), *pipx, action, "superresearch"]
+    waiter_argv = [str(os.getpid()), *pipx, action, "superresearch"]
+    escape: list[str] = []
+    entry = None
+    if restart_after and action == "upgrade":
+        # Cycle the whole supervisor (incl. the daemon-loop) onto the rebuilt venv.
+        entry = _installed_sr_entry()
+        if entry:
+            waiter_argv += ["--then--", entry, "--restart"]
+            escape = _cgroup_escape_prefix()  # survive the daemon-loop's death
+        else:
+            # Can't locate the `superresearch` console script → we cannot cycle the
+            # supervisor onto the new build. The upgrade still lands (applied on the
+            # next natural restart/reboot), but we must NOT free the venv below —
+            # killing the daemon-loop with no way to relaunch it would strand the
+            # machine offline. Surface it so the operator isn't left guessing.
+            log("[device-cmds] UPDATE: couldn't resolve the 'superresearch' console "
+                "script — upgrading in place, but the running build won't cycle until "
+                "the next restart.", "WARN")
+    cmd = escape + [py, "-c", _LIFECYCLE_WAITER, *waiter_argv]
     creationflags = 0
     kwargs: dict = {}
     if sys.platform == "win32":
         creationflags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
     else:
         kwargs["start_new_session"] = True
+    # Spawn the waiter BEFORE freeing the venv. Two reasons: (a) if the launch
+    # fails we must NOT have already torn the backend down (leave it serving so the
+    # caller can report "failed" cleanly, not strand the machine offline); (b) on a
+    # systemd host, killing the daemon-loop tears its cgroup down — the escaped
+    # waiter must already be running in its own scope before that happens.
+    waiter_pid: "int | None" = None
     try:
-        subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT,
-                         stdin=subprocess.DEVNULL, creationflags=creationflags, **kwargs)
-        return True
+        _proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT,
+                                 stdin=subprocess.DEVNULL, creationflags=creationflags, **kwargs)
+        waiter_pid = _proc.pid
     except Exception as e:
         print(f"  Could not launch the background {action} helper: {e}")
-        return False
+        return None
     finally:
         if logf is not subprocess.DEVNULL:
             try:
                 logf.close()
             except Exception:
                 pass
+    # Free the venv: kill any leftover daemon-loop / --serve workers (NOT self) —
+    # on WINDOWS they'd keep the venv's files open and pipx would fail. The detached
+    # waiter handles the LAST holder (this process) by waiting for it.
+    #
+    # SKIP this on the restart_after (remote) path off-Windows: Unix lets pipx
+    # rebuild a venv whose files are still open, so the kill isn't needed there —
+    # and killing the daemon-loop (the systemd unit's MAIN process) would tear its
+    # cgroup down, SIGTERM-ing the very worker still writing updateStatus. Leaving
+    # it alive lets this handler finish; `superresearch --restart` cycles the whole
+    # supervisor onto the new venv at the end.
+    #
+    # On Windows the kill IS needed (file lock) — but ONLY when we're going to
+    # restart (entry resolved). With no restart to relaunch it, killing the
+    # daemon-loop would leave the box offline until the next logon, so don't.
+    free_venv = (not restart_after) or (sys.platform == "win32" and bool(entry))
+    if free_venv:
+        try:
+            self_pid = os.getpid()
+            victims = [pid for pid, _cmd, role in _enumerate_research_py_procs()
+                       if pid != self_pid and role in ("daemon-loop", "serve")]
+            if victims:
+                _kill_pids(victims)
+                print(f"  Stopped {len(victims)} running backend process(es) so the "
+                      f"{action} can complete.")
+        except Exception:
+            pass
+    return waiter_pid
 
 
-def _perform_self_update(*, force_check: bool = True) -> dict:
+def _perform_self_update(*, force_check: bool = True, restart_after: bool = False) -> dict:
     """Headless core of the self-update — shared by the `superresearch --update`
     CLI (_self_update) AND the app-driven remote "update" device command. Decides
     whether to upgrade and, if so, SPAWNS the detached pipx-upgrade waiter — but
@@ -52940,7 +53088,10 @@ def _perform_self_update(*, force_check: bool = True) -> dict:
         failed      — pipx missing, or the detached launch failed
     `force_check` bypasses the 24h cache for a fresh PyPI read (an explicit
     "update now" must not decide off a stale cache); `latest` is None only when
-    PyPI is unreachable, in which case we PROCEED rather than strand the update."""
+    PyPI is unreachable, in which case we PROCEED rather than strand the update.
+    `restart_after` (remote/app path): after a successful upgrade, cycle the
+    supervisor onto the new venv (cgroup-escaped) so the version actually bumps —
+    the CLI leaves this False and prints the `--restart` step for the user."""
     cur = _sr_version()
     if _is_source_checkout():
         return {"state": "unsupported", "current": cur, "latest": None,
@@ -52951,8 +53102,13 @@ def _perform_self_update(*, force_check: bool = True) -> dict:
     latest = _latest_on_pypi(force=force_check)
     if latest and not _version_gt(latest, cur):
         return {"state": "already", "current": cur, "latest": latest, "reason": ""}
-    if _spawn_detached_lifecycle("upgrade"):
-        return {"state": "started", "current": cur, "latest": latest, "reason": ""}
+    waiter_pid = _spawn_detached_lifecycle("upgrade", restart_after=restart_after)
+    if waiter_pid:
+        # Surface the waiter PID so the caller can protect it from
+        # _schedule_server_exit's child-reap (off-Linux the waiter is a direct child;
+        # the reap would SIGKILL it before the upgrade runs).
+        return {"state": "started", "current": cur, "latest": latest, "reason": "",
+                "waiter_pid": waiter_pid}
     return {"state": "failed", "current": cur, "latest": latest,
             "reason": "couldn't launch the background upgrade"}
 

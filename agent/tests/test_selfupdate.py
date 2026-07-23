@@ -99,6 +99,9 @@ def test_spawn_detached_reconnect_builds_pipx_connect(tmp_path, monkeypatch):
     monkeypatch.setattr(selfupdate, "_pipx_cmd", lambda: ["pipx"])
     monkeypatch.setattr(selfupdate, "_waiter_python", lambda: "python3")
     monkeypatch.setattr(selfupdate.prefs, "get_runtime", lambda: None)  # no recorded runtime
+    # Isolate the inner waiter command: no cgroup-escape prefix, unsupervised host.
+    monkeypatch.setattr(selfupdate, "_cgroup_escape_prefix", lambda: [])
+    monkeypatch.setattr(selfupdate.autostart, "is_installed", lambda: False)
     seen = {}
 
     def fake_popen(cmd, **kw):
@@ -117,6 +120,9 @@ def test_spawn_detached_reconnect_builds_pipx_connect(tmp_path, monkeypatch):
     assert cfg["pipx"] == ["pipx"]
     assert cfg["pkg"] == "superresearch-agent"
     assert cfg["connect_args"] == ["connect", "--yes", "--no-login"]  # no runtime pin here
+    # Unsupervised (no login pin) → the reconnect binds the freed port itself, so
+    # there's no supervisor to restart.
+    assert cfg["restart_args"] == []
 
 
 def test_spawn_detached_reconnect_targets_recorded_runtime(tmp_path, monkeypatch):
@@ -126,12 +132,109 @@ def test_spawn_detached_reconnect_targets_recorded_runtime(tmp_path, monkeypatch
     monkeypatch.setattr(selfupdate, "_pipx_cmd", lambda: ["pipx"])
     monkeypatch.setattr(selfupdate, "_waiter_python", lambda: "python3")
     monkeypatch.setattr(selfupdate.prefs, "get_runtime", lambda: "hermes")
+    monkeypatch.setattr(selfupdate, "_cgroup_escape_prefix", lambda: [])
+    monkeypatch.setattr(selfupdate.autostart, "is_installed", lambda: False)
     seen = {}
     monkeypatch.setattr(selfupdate.subprocess, "Popen",
                         lambda cmd, **kw: seen.update(cmd=cmd) or types.SimpleNamespace())
     assert selfupdate.spawn_detached_reconnect() is True
     cfg = json.loads(seen["cmd"][-1])
     assert cfg["connect_args"][-2:] == ["--runtime", "hermes"]
+
+
+def test_spawn_detached_reconnect_supervised_cycles_the_supervisor(tmp_path, monkeypatch):
+    # On a SUPERVISED host the reconnect can't rebind the port (the supervisor owns
+    # it + Restart=always relaunches the OLD build), so the waiter must cycle it via
+    # `agent restart` after the upgrade — the fix for "said updated but stayed vX".
+    monkeypatch.setattr(selfupdate.config, "store_dir", lambda: tmp_path)
+    monkeypatch.setattr(selfupdate, "_pipx_cmd", lambda: ["pipx"])
+    monkeypatch.setattr(selfupdate, "_waiter_python", lambda: "python3")
+    monkeypatch.setattr(selfupdate.prefs, "get_runtime", lambda: None)
+    monkeypatch.setattr(selfupdate, "_cgroup_escape_prefix", lambda: [])
+    monkeypatch.setattr(selfupdate.autostart, "is_installed", lambda: True)  # pinned
+    seen = {}
+    monkeypatch.setattr(selfupdate.subprocess, "Popen",
+                        lambda cmd, **kw: seen.update(cmd=cmd) or types.SimpleNamespace())
+    assert selfupdate.spawn_detached_reconnect() is True
+    cfg = json.loads(seen["cmd"][-1])
+    assert cfg["restart_args"] == ["restart"]
+
+
+def test_spawn_detached_reconnect_escapes_cgroup_on_linux(tmp_path, monkeypatch):
+    # On Linux the waiter must run OUTSIDE the bridge's systemd cgroup, or it's
+    # reaped when the unit restarts (the empty self-update.log symptom).
+    monkeypatch.setattr(selfupdate.config, "store_dir", lambda: tmp_path)
+    monkeypatch.setattr(selfupdate, "_pipx_cmd", lambda: ["pipx"])
+    monkeypatch.setattr(selfupdate, "_waiter_python", lambda: "python3")
+    monkeypatch.setattr(selfupdate.prefs, "get_runtime", lambda: None)
+    monkeypatch.setattr(selfupdate.autostart, "is_installed", lambda: True)
+    monkeypatch.setattr(selfupdate, "_cgroup_escape_prefix",
+                        lambda: ["systemd-run", "--user", "--collect", "--quiet", "--"])
+    seen = {}
+    monkeypatch.setattr(selfupdate.subprocess, "Popen",
+                        lambda cmd, **kw: seen.update(cmd=cmd) or types.SimpleNamespace())
+    assert selfupdate.spawn_detached_reconnect() is True
+    cmd = seen["cmd"]
+    assert cmd[:5] == ["systemd-run", "--user", "--collect", "--quiet", "--"]
+    assert "python3" in cmd and "-c" in cmd  # the waiter still runs, just re-parented
+
+
+def test_cgroup_escape_prefix_linux_with_systemd_run(monkeypatch):
+    monkeypatch.setattr(selfupdate.sys, "platform", "linux")
+    monkeypatch.setattr(selfupdate.shutil, "which",
+                        lambda n: "/usr/bin/systemd-run" if n == "systemd-run" else None)
+    monkeypatch.setitem(selfupdate.os.environ, "XDG_RUNTIME_DIR", "/run/user/1000")
+    pre = selfupdate._cgroup_escape_prefix()
+    assert pre[:2] == ["/usr/bin/systemd-run", "--user"] and pre[-1] == "--"
+
+
+def test_cgroup_escape_prefix_empty_off_linux(monkeypatch):
+    monkeypatch.setattr(selfupdate.sys, "platform", "win32")
+    assert selfupdate._cgroup_escape_prefix() == []
+
+
+def test_cgroup_escape_prefix_empty_without_systemd_run(monkeypatch):
+    monkeypatch.setattr(selfupdate.sys, "platform", "linux")
+    monkeypatch.setattr(selfupdate.shutil, "which", lambda n: None)
+    assert selfupdate._cgroup_escape_prefix() == []
+
+
+def test_cgroup_escape_prefix_empty_without_user_manager(monkeypatch):
+    # systemd-run present but no reachable user bus → `systemd-run --user` errors,
+    # so we must not emit the prefix.
+    monkeypatch.setattr(selfupdate.sys, "platform", "linux")
+    monkeypatch.setattr(selfupdate.shutil, "which",
+                        lambda n: "/usr/bin/systemd-run" if n == "systemd-run" else None)
+    monkeypatch.delitem(selfupdate.os.environ, "XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delitem(selfupdate.os.environ, "DBUS_SESSION_BUS_ADDRESS", raising=False)
+    assert selfupdate._cgroup_escape_prefix() == []
+
+
+def test_spawn_detached_reconnect_unsupervised_does_not_escape(tmp_path, monkeypatch):
+    # On an unsupervised foreground serve there's no systemd service cgroup to
+    # escape, so we must NOT wrap in systemd-run (which would divert the waiter's
+    # output to the journal, leaving self-update.log empty). Even if systemd-run is
+    # available, the escape is gated on being supervised.
+    monkeypatch.setattr(selfupdate.config, "store_dir", lambda: tmp_path)
+    monkeypatch.setattr(selfupdate, "_pipx_cmd", lambda: ["pipx"])
+    monkeypatch.setattr(selfupdate, "_waiter_python", lambda: "python3")
+    monkeypatch.setattr(selfupdate.prefs, "get_runtime", lambda: None)
+    monkeypatch.setattr(selfupdate.autostart, "is_installed", lambda: False)  # unsupervised
+    monkeypatch.setattr(selfupdate, "_cgroup_escape_prefix",
+                        lambda: ["systemd-run", "--user", "--collect", "--quiet", "--"])
+    seen = {}
+    monkeypatch.setattr(selfupdate.subprocess, "Popen",
+                        lambda cmd, **kw: seen.update(cmd=cmd) or types.SimpleNamespace())
+    assert selfupdate.spawn_detached_reconnect() is True
+    assert seen["cmd"][0] == "python3", "no cgroup-escape on an unsupervised host"
+
+
+def test_reconnect_waiter_runs_restart_after_connect():
+    # The waiter must cycle the supervisor (restart_args) after connecting from the
+    # persistent install — the load-bearing fix. Guard the embedded source.
+    src = selfupdate._RECONNECT_WAITER
+    assert "restart_args" in src
+    assert "[entry] + restart_args" in src
 
 
 def test_reconnect_waiter_compiles():
