@@ -580,6 +580,80 @@ def _audio_duration_sec(path) -> int:
     return 0
 
 
+def _ffmpeg_bin() -> str | None:
+    """Resolve the ffmpeg binary, tolerating a bare launchd/service PATH.
+
+    Same rationale as _ffprobe_bin() — the macOS LaunchAgent's PATH lacks
+    /opt/homebrew/bin, so a bare `subprocess.run(["ffmpeg",…])` raises
+    FileNotFoundError. Returns an absolute path when found, else None (the
+    mp3 transcode is best-effort: a missing ffmpeg falls back to delivering
+    the original .m4a). ffmpeg is NOT a hard dependency of the BE — the
+    video encode is FE-side — so None is an expected, handled outcome."""
+    p = shutil.which("ffmpeg")
+    if p:
+        return p
+    for cand in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg",
+                 "/usr/bin/ffmpeg"):
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
+def _transcode_audio_to_mp3(src: "Path") -> "Path":
+    """Transcode a NotebookLM Audio Overview to a streamable CBR mp3.
+
+    NotebookLM serves the podcast as an .m4a whose `moov` atom sits at the
+    END of the file, so a CLOUD-hosted agent that STREAMS the URL (rather
+    than fully downloading first) can't begin playback. A plain constant-
+    bitrate mp3 is progressively streamable everywhere, so EVERY agent can
+    stream it regardless of transport.
+
+    Best-effort and non-raising: on a missing ffmpeg, a non-zero exit, or
+    any exception, returns the ORIGINAL path unchanged so the podcast is
+    never lost (the .m4a still plays via download-then-play in the web app /
+    chat / Rocky). On success returns the mp3 path AND deletes the source
+    .m4a so exactly one file remains in podcasts/ — save_meta globs the dir
+    and a lingering .m4a would double-count the podcast (same stem ⇒ dup id).
+
+    Idempotent: an input already ending in .mp3 (a Downloads-folder fallback
+    grab, or a future NLM format change) is returned untouched. `-map_metadata
+    0` carries any embedded title/metadata across; `-vn` drops a stray cover-
+    art image stream that would otherwise break the mp3 mux."""
+    src = Path(str(src))
+    if src.suffix.lower() == ".mp3":
+        return src
+    ffmpeg = _ffmpeg_bin()
+    if not ffmpeg:
+        log("[Phase3] ffmpeg not found — delivering the original "
+            f"{src.suffix} podcast (a cloud-hosted agent may be unable to "
+            "stream it; the web app / chat still play it fine)", "WARN")
+        return src
+    dst = src.with_suffix(".mp3")
+    try:
+        r = subprocess.run(
+            [ffmpeg, "-y", "-i", str(src), "-vn", "-map_metadata", "0",
+             "-c:a", "libmp3lame", "-b:a", "160k", str(dst)],
+            capture_output=True, text=True, timeout=600,
+            creationflags=_PS_NO_WINDOW)
+        if r.returncode == 0 and dst.exists() and dst.stat().st_size > 0:
+            try:
+                src.unlink(missing_ok=True)
+            except OSError:
+                pass
+            log(f"[Phase3] Transcoded podcast to streamable mp3: {dst.name}")
+            return dst
+        log(f"[Phase3] ffmpeg mp3 transcode failed (rc={r.returncode}) — "
+            f"delivering original {src.suffix}: {(r.stderr or '')[-200:]}", "WARN")
+    except Exception as e:
+        log(f"[Phase3] ffmpeg mp3 transcode error ({type(e).__name__}: {e}) "
+            f"— delivering original {src.suffix}", "WARN")
+    try:
+        dst.unlink(missing_ok=True)  # never leave a partial/broken mp3 behind
+    except OSError:
+        pass
+    return src
+
+
 def _read_user_scope_env(name: str) -> str:
     """Read a Windows User-scope env var via PowerShell. Empty string
     on non-Windows or failure. Persistent across shells — settable
@@ -38792,7 +38866,7 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                    progress="Downloading audio file from NotebookLM…")
         _stop_d, _task_d = start_narration_ticker(
             3, "notebooklm",
-            "Downloading audio overview .m4a from NotebookLM",
+            "Downloading audio overview from NotebookLM",
             interval=20)
         try:
             # 2026-05-14: length-aware download prompt — CUA targets the
@@ -38880,6 +38954,20 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             fail_phase(3, "Couldn't save the audio file",
                        "NotebookLM finished the audio but we couldn't download it. Retry to try again, or Skip it.",
                        agent="notebooklm")
+
+    # ── Transcode to a streamable mp3 (2026-07-23) ──
+    # NotebookLM's .m4a keeps its moov atom at the end of the file, so a
+    # cloud-hosted agent that STREAMS the URL can't start playback. Convert
+    # to a plain CBR mp3 (progressively streamable everywhere) so EVERY agent
+    # can stream it. Best-effort: a missing ffmpeg / failed encode delivers
+    # the original .m4a unchanged. to_thread keeps the event loop (heartbeat)
+    # ticking during the encode; reassigning audio_path means the duration
+    # probe, Storage upload, Firestore audios doc, save_meta scan, and the
+    # returned path all operate on the mp3. Downstream mime handling is
+    # extension-driven (Storage content-type, /audio server, bridge), so no
+    # other change is needed; old runs stay .m4a and still resolve correctly.
+    if audio_path and audio_path.exists():
+        audio_path = await asyncio.to_thread(_transcode_audio_to_mp3, audio_path)
 
     # Strict-keep cleanup (moved 2026-05-02). Was inside the poll loop at
     # the audio-complete detection point — but cleanup-before-download is
@@ -39905,7 +39993,20 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
     podcasts = []
     pod_dir = queue_dir / "podcasts"
     if pod_dir.exists():
+        # De-dup by stem, preferring the streamable .mp3 over a same-stem .m4a.
+        # _transcode_audio_to_mp3 deletes the source .m4a on success, so the
+        # happy path already has one file per stem — but if that unlink lost a
+        # rare race (a Windows AV/indexer lock on the just-downloaded file),
+        # BOTH would linger and the id=stem entries would collide. Prefer the
+        # mp3 (what actually got uploaded to Storage + the Firestore audios
+        # doc) so meta.json can't double-count. Format-agnostic: a stem with a
+        # single file (any extension, incl. legacy m4a runs) is unaffected.
+        _by_stem: dict[str, Path] = {}
         for f in pod_dir.glob("*.*"):
+            prev = _by_stem.get(f.stem)
+            if prev is None or (prev.suffix.lower() != ".mp3" and f.suffix.lower() == ".mp3"):
+                _by_stem[f.stem] = f
+        for f in sorted(_by_stem.values(), key=lambda p: p.name):
             # tinytag primary / ffprobe fallback — see _audio_duration_sec.
             dur_sec = _audio_duration_sec(f)
             mins, secs = divmod(dur_sec, 60)

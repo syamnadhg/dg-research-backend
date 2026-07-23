@@ -387,7 +387,8 @@ def _autostart_worker(state: BridgeState, sess: AccountSession, topic: str,
 
 
 def _audio_file_url(links: Any) -> str:
-    """The DIRECT podcast media URL — ``links.audio_file`` (a public Storage .m4a).
+    """The DIRECT podcast media URL — ``links.audio_file`` (a public Storage
+    audio file: .mp3 for runs from 2026-07-23 on, .m4a for older ones).
 
     NOT ``links.audio`` / ``links.notebooklm``: those hold the NotebookLM notebook
     WEB PAGE, not a media file (verified against research.py + firestore.ts).
@@ -406,8 +407,9 @@ def _audio_ext_and_mime(url: str) -> tuple[str, str]:
     """Pick a file extension + MIME for a podcast audio URL.
 
     The Storage object name carries the real extension before the query string
-    (…/audio_overview.m4a?alt=media&token=…); default to .m4a (NotebookLM's Audio
-    Overview format) when none is recognizable.
+    (…/audio_overview.mp3?alt=media&token=… for current runs, .m4a for older
+    ones); default to .m4a (NotebookLM's native Audio Overview format) when
+    none is recognizable.
     """
     path = urlsplit(url).path.lower()
     for ext, mime in _AUDIO_EXT_MIME.items():
