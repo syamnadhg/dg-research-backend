@@ -1,23 +1,26 @@
-"""tools/bump_agent_version.py — the agent version-bump helper.
+"""tools/bump_version.py — the agent + BE version-bump helper.
 
 The agent version must move in lockstep across pyproject / _SKILL_BUILD /
 __init__ fallback (see the tool's docstring for WHY _SKILL_BUILD can't just read
-the package metadata). Hand-editing the three is how they drift — and how the same
-bump got authored twice from two machines. These tests pin the helper's behavior on
-THROWAWAY trees; they never touch the real repo files.
+the package metadata); the BE version is a single pyproject line whose bump must
+re-seed the release-dep guard snapshot. Hand-editing these is how they drift — and
+how the same bump got authored twice from two machines. These tests pin the helper's
+behavior on THROWAWAY trees; they never touch the real repo files.
 """
 from __future__ import annotations
 
 import importlib.util
+import json
+import shutil
 from pathlib import Path
 
 import pytest
 
-_TOOL = Path(__file__).resolve().parents[1] / "tools" / "bump_agent_version.py"
+_TOOL = Path(__file__).resolve().parents[1] / "tools" / "bump_version.py"
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location("bump_agent_version_under_test", _TOOL)
+    spec = importlib.util.spec_from_file_location("bump_version_under_test", _TOOL)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -168,6 +171,86 @@ def test_check_detects_a_half_bumped_init(tmp_path):
                  encoding="utf-8")
     ok, _ = bump_mod.check_lockstep(root)
     assert not ok
+
+
+# ── BE (superresearch) bump + release-dep guard re-seed ──────────────────────
+
+def _make_be_tree(tmp_path: Path, version: str = "0.1.8",
+                  deps=("anthropic>=0.85", "requests>=2.32")) -> Path:
+    """A throwaway tree with a root pyproject + a REAL copy of the release-dep
+    guard, so bump_be can load + re-seed the guard against THIS tree (not the repo)."""
+    (tmp_path / "tests").mkdir(parents=True, exist_ok=True)
+    dep_lines = "\n".join(f'    "{d}",' for d in deps)
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\n"
+        'name = "superresearch"\n'
+        f'version = "{version}"\n'
+        "dependencies = [\n" + dep_lines + "\n]\n",
+        encoding="utf-8")
+    real_guard = Path(__file__).resolve().parents[1] / "tests" / "test_release_dep_version_guard.py"
+    shutil.copy(real_guard, tmp_path / "tests" / "test_release_dep_version_guard.py")
+    return tmp_path
+
+
+def test_bump_be_rewrites_version_and_reseeds(tmp_path):
+    root = _make_be_tree(tmp_path, "0.1.8")
+    notes = bump_mod.bump_be("0.1.9", root=root)
+    assert bump_mod.read_be_version(root) == ["0.1.9"]
+    snap = json.loads((root / "tests" / "released_deps.json").read_text(encoding="utf-8"))
+    assert snap["version"] == "0.1.9"          # snapshot moved with the version
+    ok, msgs = bump_mod.check_be(root)
+    assert ok, "\n".join(msgs)                 # the canonical guard now passes
+    assert any("re-seeded" in n for n in notes)
+
+
+def test_bump_be_is_idempotent(tmp_path):
+    root = _make_be_tree(tmp_path, "0.1.8")
+    bump_mod.bump_be("0.1.9", root=root)
+    notes = bump_mod.bump_be("0.1.9", root=root)   # again
+    assert any("unchanged" in n for n in notes)
+    assert bump_mod.read_be_version(root) == ["0.1.9"]
+
+
+def test_bump_be_rejects_a_bad_version(tmp_path):
+    root = _make_be_tree(tmp_path, "0.1.8")
+    with pytest.raises(ValueError):
+        bump_mod.bump_be("v0.1.9", root=root)
+    assert bump_mod.read_be_version(root) == ["0.1.8"]  # untouched
+
+
+def test_bump_be_refuses_ambiguous_version_lines(tmp_path):
+    # A stray column-0 `version = ` in another table must make the bump refuse,
+    # not rewrite both — the anchor can't tell them apart.
+    root = _make_be_tree(tmp_path, "0.1.8")
+    p = root / "pyproject.toml"
+    p.write_text(p.read_text(encoding="utf-8") + '\n[tool.other]\nversion = "9.9.9"\n',
+                 encoding="utf-8")
+    with pytest.raises(ValueError):
+        bump_mod.bump_be("0.1.9", root=root)
+
+
+def test_check_be_detects_a_stale_snapshot(tmp_path):
+    # Deps unchanged but the version moved without a re-seed → the guard must fail.
+    root = _make_be_tree(tmp_path, "0.1.8")
+    bump_mod.reseed_released_deps(root)            # snapshot pinned at 0.1.8
+    p = root / "pyproject.toml"
+    p.write_text(p.read_text(encoding="utf-8").replace('version = "0.1.8"', 'version = "0.1.9"'),
+                 encoding="utf-8")
+    ok, msgs = bump_mod.check_be(root)
+    assert not ok and any("guard" in m.lower() for m in msgs)
+
+
+def test_main_requires_an_action():
+    with pytest.raises(SystemExit):
+        bump_mod.main([])   # no --agent/--be/--check
+
+
+def test_main_check_covers_agent_and_be(capsys):
+    # Against the REAL repo (in lockstep + guard-clean after this release bump).
+    assert bump_mod.main(["--check"]) == 0
+    out = capsys.readouterr().out
+    assert "agent version lockstep OK" in out
+    assert "BE release-dep guard OK" in out
 
 
 # ── Windows-console safety (a real crash hit while building this) ────────────

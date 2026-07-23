@@ -1,23 +1,30 @@
 #!/usr/bin/env python3
-"""Bump the Super Research AGENT version everywhere it must move together.
+"""Bump the Super Research versions everywhere they must move together.
 
-The agent version lives in THREE files that must never drift:
+Handles BOTH published packages (they version independently):
 
+AGENT (``superresearch-agent``) — THREE files that must never drift:
   1. ``agent/pyproject.toml``              ``[project] version``   — the PUBLISHED version
   2. ``agent/facade/skill/scripts/sr.py``  ``_SKILL_BUILD``        — the "which copy am I" stamp
   3. ``agent/facade/__init__.py``          ``__version__`` fallback — used only when the
      installed package metadata is unavailable (i.e. a source checkout)
+  ...plus the byte-identical hosted twin the web app serves
+  (``research-app/web/public/.well-known/skills/sr/scripts/sr.py``), refreshed by the
+  FE's own ``scripts/sync-agent-skill.mjs``.
 
-...plus the byte-identical hosted twin the web app serves
-(``research-app/web/public/.well-known/skills/sr/scripts/sr.py``), refreshed by the
-FE's own ``scripts/sync-agent-skill.mjs``.
+BE (``superresearch``) — the ROOT ``pyproject.toml`` ``[project] version`` (the sole BE
+version source), PLUS a re-seed of ``tests/released_deps.json`` (the release-dep guard
+snapshot, whose recorded version must match the new one — see
+``tests/test_release_dep_version_guard.py``).
 
-Hand-editing four places is exactly how they drift — and how the same bump got done
-twice from two machines. One command instead::
+Hand-editing these is exactly how they drift — and how the same bump got done twice
+from two machines. One command instead::
 
-    python tools/bump_agent_version.py 0.1.29        # bump all three + sync the twin
-    python tools/bump_agent_version.py --check       # verify lockstep (exit 1 on drift)
-    python tools/bump_agent_version.py 0.1.29 --no-sync   # skip the FE twin sync
+    python tools/bump_version.py --agent 0.1.29 --be 0.1.9   # bump both (independent versions)
+    python tools/bump_version.py --agent 0.1.29              # agent only (+ sync the twin)
+    python tools/bump_version.py --be 0.1.9                  # BE only (+ re-seed the guard)
+    python tools/bump_version.py --check                     # verify agent lockstep + BE guard
+    python tools/bump_version.py --agent 0.1.29 --no-sync    # skip the FE twin sync
 
 WHY ``_SKILL_BUILD`` CANNOT JUST READ THE PACKAGE METADATA
 ----------------------------------------------------------
@@ -113,6 +120,89 @@ def check_lockstep(root: Path = _REPO_ROOT) -> tuple[bool, list[str]]:
     return True, [f"agent version lockstep OK: {everything.pop()}", *msgs]
 
 
+# ── BE (superresearch) — root pyproject version + release-dep guard snapshot ───
+# The BE version is a SINGLE source (root pyproject [project].version). Anchored to
+# column-0 so it can only ever match the [project] table's declaration, not a
+# `version = ` inside another table.
+_BE_PYPROJECT = Path("pyproject.toml")
+_BE_VERSION_RE = re.compile(r'^(version\s*=\s*")([^"]+)(")', re.M)
+
+
+def read_be_version(root: Path = _REPO_ROOT) -> list[str]:
+    """Every ``^version = "…"`` literal in the root pyproject (should be exactly one)."""
+    path = root / _BE_PYPROJECT
+    if not path.exists():
+        return []
+    text, _ = _read(path)
+    return [m.group(2) for m in _BE_VERSION_RE.finditer(text)]
+
+
+def _load_release_guard(root: Path):
+    """Load tests/test_release_dep_version_guard.py FROM ``root`` so its own
+    ``_REPO_ROOT`` (derived from its __file__) points at ``root`` — its ``_seed`` /
+    check then act on THIS tree (the real repo, or a throwaway test tree)."""
+    import importlib.util
+    guard_path = root / "tests" / "test_release_dep_version_guard.py"
+    if not guard_path.exists():
+        raise FileNotFoundError(f"missing {guard_path} (the release-dep guard)")
+    spec = importlib.util.spec_from_file_location("_sr_release_guard", guard_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def reseed_released_deps(root: Path = _REPO_ROOT) -> None:
+    """Re-seed tests/released_deps.json to the CURRENT pyproject (version + dep
+    hash), reusing the guard's own canonical seed so the snapshot can never diverge
+    from what the guard recomputes."""
+    _load_release_guard(root)._seed()
+
+
+def bump_be(new_version: str, root: Path = _REPO_ROOT) -> list[str]:
+    """Rewrite the root pyproject [project].version to ``new_version`` and re-seed
+    the release-dep guard snapshot in the same shot. Idempotent; preserves line
+    endings. Raises if the version declaration is missing or ambiguous (>1 match)."""
+    if not valid_version(new_version):
+        raise ValueError(f"not a valid version string: {new_version!r}")
+    path = root / _BE_PYPROJECT
+    if not path.exists():
+        raise FileNotFoundError(f"missing {_BE_PYPROJECT} (run from the backend repo root)")
+    text, _nl = _read(path)
+    olds = [m.group(2) for m in _BE_VERSION_RE.finditer(text)]
+    if not olds:
+        raise ValueError(f"no [project].version matched in {_BE_PYPROJECT}")
+    if len(olds) > 1:
+        raise ValueError(f"{len(olds)} version= lines matched in {_BE_PYPROJECT} — ambiguous")
+    notes: list[str] = []
+    new_text = _BE_VERSION_RE.sub(lambda m: f"{m.group(1)}{new_version}{m.group(3)}", text)
+    if new_text == text:
+        notes.append(f"  BE pyproject       already {new_version} (unchanged)")
+    else:
+        _write(path, new_text)
+        notes.append(f"  BE pyproject       {olds[0]} -> {new_version}  ({_BE_PYPROJECT.as_posix()})")
+    reseed_released_deps(root)
+    notes.append(f"  released_deps.json re-seeded to {new_version} (dep guard)")
+    return notes
+
+
+def check_be(root: Path = _REPO_ROOT) -> tuple[bool, list[str]]:
+    """(ok, messages). Runs the canonical release-dep guard: the pyproject version
+    must match the snapshot when deps are unchanged (and be bumped when they change)."""
+    vs = read_be_version(root)
+    if not vs:
+        return False, ["no [project].version found in pyproject.toml"]
+    if len(vs) > 1:
+        return False, [f"pyproject has {len(vs)} version= lines: {', '.join(vs)}"]
+    try:
+        guard = _load_release_guard(root)
+        guard.test_dependency_change_requires_version_bump()
+    except AssertionError as e:
+        return False, ["BE release-dep guard FAILED:", f"  {e}"]
+    except (OSError, FileNotFoundError) as e:
+        return False, [f"BE guard could not run: {e}"]
+    return True, [f"BE release-dep guard OK: version={vs[0]}"]
+
+
 def bump(new_version: str, root: Path = _REPO_ROOT) -> list[str]:
     """Rewrite every declaration to `new_version`. Returns per-file change notes.
     Idempotent: a file already at the target is reported as unchanged."""
@@ -173,14 +263,17 @@ def sync_fe_twin(root: Path = _REPO_ROOT) -> tuple[bool, str]:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
-        prog="bump_agent_version.py",
-        description="Bump the agent version in pyproject + _SKILL_BUILD + __init__, "
-                    "then re-sync the hosted skill twin.")
-    ap.add_argument("version", nargs="?", help="new version, e.g. 0.1.29")
+        prog="bump_version.py",
+        description="Bump the agent version (pyproject + _SKILL_BUILD + __init__ + FE twin) "
+                    "and/or the BE version (pyproject + release-dep guard snapshot).")
+    ap.add_argument("--agent", metavar="VERSION",
+                    help="new AGENT version, e.g. 0.1.29 (bumps all 3 sites + syncs the FE twin)")
+    ap.add_argument("--be", metavar="VERSION",
+                    help="new BE (superresearch) version, e.g. 0.1.9 (+ re-seeds released_deps.json)")
     ap.add_argument("--check", action="store_true",
-                    help="verify all declarations agree; exit 1 on drift")
+                    help="verify agent lockstep AND the BE release-dep guard; exit 1 on drift")
     ap.add_argument("--no-sync", action="store_true",
-                    help="skip the FE hosted-twin sync")
+                    help="skip the FE hosted-twin sync (agent bump only)")
     args = ap.parse_args(argv)
 
     # Windows consoles default to cp1252, which cannot encode check/warn glyphs
@@ -194,35 +287,56 @@ def main(argv: list[str] | None = None) -> int:
             pass
 
     if args.check:
+        a_ok, a_msgs = check_lockstep()
+        b_ok, b_msgs = check_be()
+        print("\n".join([*a_msgs, "", *b_msgs]))
+        return 0 if (a_ok and b_ok) else 1
+
+    if not args.agent and not args.be:
+        ap.error("give --agent VERSION and/or --be VERSION, or --check")
+
+    for which, ver in (("agent", args.agent), ("BE", args.be)):
+        if ver is not None and not valid_version(ver):
+            print(f"ERROR: not a valid {which} version string: {ver!r}", file=sys.stderr)
+            return 2
+
+    rc = 0
+    if args.agent:
+        try:
+            notes = bump(args.agent)
+        except (ValueError, FileNotFoundError) as e:
+            print(f"ERROR (agent): {e}", file=sys.stderr)
+            return 2
+        print(f"agent version -> {args.agent}")
+        print("\n".join(notes))
+        if not args.no_sync:
+            ok, msg = sync_fe_twin()
+            print(("OK:   " if ok else "WARN: ") + msg)
         ok, msgs = check_lockstep()
         print("\n".join(msgs))
-        return 0 if ok else 1
+        rc = rc or (0 if ok else 1)
 
-    if not args.version:
-        ap.error("give a version to bump to, or --check")
-    if not valid_version(args.version):
-        print(f"ERROR: not a valid version string: {args.version!r}", file=sys.stderr)
-        return 2
+    if args.be:
+        try:
+            notes = bump_be(args.be)
+        except (ValueError, FileNotFoundError) as e:
+            print(f"ERROR (BE): {e}", file=sys.stderr)
+            return 2
+        print(f"BE version -> {args.be}")
+        print("\n".join(notes))
+        ok, msgs = check_be()
+        print("\n".join(msgs))
+        rc = rc or (0 if ok else 1)
 
-    try:
-        notes = bump(args.version)
-    except (ValueError, FileNotFoundError) as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        return 2
-    print(f"agent version -> {args.version}")
-    print("\n".join(notes))
-
-    if not args.no_sync:
-        ok, msg = sync_fe_twin()
-        print(("OK:   " if ok else "WARN: ") + msg)
-
-    ok, msgs = check_lockstep()
-    print("\n".join(msgs))
-    if not ok:
-        return 1
-    print("\nNext: commit agent/ (+ the web twin if it changed), rebuild the agent "
-          "wheel (`cd agent && uv build --out-dir dist`), then publish.")
-    return 0
+    if rc == 0:
+        bits = []
+        if args.agent:
+            bits.append("agent/ (+ web twin) — rebuild `cd agent && python -m build --wheel`")
+        if args.be:
+            bits.append("pyproject.toml + tests/released_deps.json — rebuild the compiled wheels "
+                        "(`python tools/build_compiled.py`, + WSL for linux)")
+        print("\nNext: commit " + "; ".join(bits) + ", then publish.")
+    return rc
 
 
 if __name__ == "__main__":
