@@ -614,3 +614,65 @@ def test_compute_suppress_replay_still_announces_a_tracked_run_stop():
     runs = [_run(status="cancelled")]
     msgs, _ = poll.compute(runs, prior, baseline=False, suppress_replay=True)
     assert any("stopped" in m for m in msgs)
+
+
+# ── #arming: keep the watchdog alive across the sign-in → run-start handoff ────
+
+def test_main_keeps_alive_when_signin_offers_a_pending_run(monkeypatch):
+    # "Continue with X? Reply yes to start" — the run isn't in /updates yet. The
+    # watchdog must NOT tear down (else the run starts unstreamed and its completion
+    # is never posted — the gap the user hit); it stays alive, silently, awaiting it.
+    origin = {"platform": "telegram", "chat_id": "c1"}
+    si = {"ts": 1, "email": "e@x.y", "pendingTopic": "German Shepherd"}
+    saved = {}
+    monkeypatch.setattr(poll, "_get_updates", lambda o=None: ([], si))
+    monkeypatch.setattr(poll, "_load_state", lambda p=None: None)
+    monkeypatch.setattr(poll, "_save_state", lambda s, p=None: saved.__setitem__("s", s))
+    torn = {"v": False}
+    monkeypatch.setattr(poll, "_teardown", lambda o: torn.__setitem__("v", True))
+    poll.main(origin)
+    assert torn["v"] is False                                   # NOT torn down — awaiting the run
+    assert saved["s"].get("__await_run__") == poll._AWAIT_RUN_LIMIT
+
+
+def test_main_streams_the_offered_run_once_it_starts(monkeypatch):
+    # Next tick: the offered run is now live → keep streaming, clear the await counter.
+    origin = {"platform": "telegram", "chat_id": "c1"}
+    saved = {}
+    monkeypatch.setattr(poll, "_load_state",
+                        lambda p=None: {"__await_run__": 5, "__signed_in_ts__": 1})
+    monkeypatch.setattr(poll, "_get_updates",
+                        lambda o=None: ([{"runId": "r1", "status": "ongoing"}], None))
+    monkeypatch.setattr(poll, "_save_state", lambda s, p=None: saved.__setitem__("s", s))
+    torn = {"v": False}
+    monkeypatch.setattr(poll, "_teardown", lambda o: torn.__setitem__("v", True))
+    poll.main(origin)
+    assert torn["v"] is False                     # active run → keep streaming
+    assert "__await_run__" not in saved["s"]      # cleared — normal streaming took over
+
+
+def test_main_await_expires_then_tears_down(monkeypatch):
+    # The offer was abandoned (no run ever appeared); the last await tick decrements
+    # to 0 → give up + tear down (don't linger polling forever).
+    origin = {"platform": "telegram", "chat_id": "c1"}
+    monkeypatch.setattr(poll, "_load_state", lambda p=None: {"__await_run__": 1})
+    monkeypatch.setattr(poll, "_get_updates", lambda o=None: ([], None))
+    monkeypatch.setattr(poll, "_save_state", lambda s, p=None: None)
+    torn = {"v": False}
+    monkeypatch.setattr(poll, "_teardown", lambda o: torn.__setitem__("v", True))
+    poll.main(origin)
+    assert torn["v"] is True                      # await hit 0 with no run → torn down
+
+
+def test_main_keeps_alive_across_multiple_await_ticks(monkeypatch):
+    # A mid-countdown tick with no run + no sign-in must decrement and stay alive.
+    origin = {"platform": "telegram", "chat_id": "c1"}
+    saved = {}
+    monkeypatch.setattr(poll, "_load_state", lambda p=None: {"__await_run__": 8})
+    monkeypatch.setattr(poll, "_get_updates", lambda o=None: ([], None))
+    monkeypatch.setattr(poll, "_save_state", lambda s, p=None: saved.__setitem__("s", s))
+    torn = {"v": False}
+    monkeypatch.setattr(poll, "_teardown", lambda o: torn.__setitem__("v", True))
+    poll.main(origin)
+    assert torn["v"] is False
+    assert saved["s"].get("__await_run__") == 7    # ticked down, still waiting

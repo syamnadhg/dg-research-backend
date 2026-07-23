@@ -92,6 +92,13 @@ _LIVE_STUCK = ("queued", "ongoing", "paused_backend_restart", "paused_backend_re
 # past the ~15-min sign-in TTL) so a sign-in that never completes can't poll forever.
 _LOGIN_WAIT_LIMIT = 18
 
+# After a sign-in that OFFERED a pending research ("reply yes to start") or is
+# AUTO-STARTING one, the run isn't in /updates yet — keep the watchdog alive this
+# many silent minute-ticks so it streams the run the moment it appears, instead of
+# tearing down and missing the completion (the "run finished, no ping" gap). Bounded
+# so an abandoned offer can't keep a watchdog polling forever.
+_AWAIT_RUN_LIMIT = 20
+
 
 def _base() -> str:
     raw = os.environ.get("SUPER_AGENT_BRIDGE_PORT", "9876")
@@ -472,26 +479,45 @@ def main(origin: dict | None = None) -> int:
     # drop __login_wait__ now that we're authed).
     if si_ts is not None:
         new_state["__signed_in_ts__"] = si_ts
+
+    # ── keep the watchdog alive across the sign-in → run-start handoff ──────────
+    # A sign-in that OFFERED a pending research ("reply yes to start") or is
+    # AUTO-STARTING one has a run that isn't in /updates yet. Without this the
+    # watchdog tears down as "idle", the run then starts with nothing streaming it,
+    # and its completion is never posted (the gap the user hit). Keep it alive —
+    # SILENTLY (no active run → no output → no spam) — until the run appears or the
+    # bounded wait expires. ``__await_run__`` carries the countdown across the
+    # one-shot signedIn event; a live run zeroes it (normal streaming takes over).
+    si = signed_in if isinstance(signed_in, dict) else {}
+    no_active = not any(_is_active(r) for r in runs)
+    autostarted = bool(si.get("autoStarted"))
+    prev_await = int(pdict.get("__await_run__", 0) or 0)
+    if not no_active:
+        awaiting = 0                                  # a run is live → normal streaming
+    elif announced_login and (autostarted or bool((si.get("pendingTopic") or "").strip())):
+        awaiting = _AWAIT_RUN_LIMIT                    # sign-in started/offered a run → wait for it
+    elif prev_await > 0:
+        awaiting = prev_await - 1                      # still waiting for the run to appear
+    else:
+        awaiting = 0
+    if awaiting > 0:
+        new_state["__await_run__"] = awaiting
+
     _save_state(new_state, state_file)
     if out:
         print("\n".join(out))
 
-    # Strict teardown (scoped only): a login-listener stops once it has made its one
-    # announce and nothing is running (a later research re-arms a fresh watchdog);
-    # a run watchdog stops once this chat has runs but NONE are live and there's
-    # nothing new to post. Never tear down on an empty window or while still posting.
-    #
-    # RACE GUARD: do NOT tear down on the same tick we announced a sign-in that
-    # AUTO-STARTED a run — the new run is often not visible in /updates yet
-    # (Firestore lag), so no_active is a false "nothing to do" that would delete the
-    # very watchdog that must stream (and announce completion for) that run. Keep it
-    # alive; the `runs and not out` path below tears it down once the run is observed
-    # and finishes.
-    if origin:
-        no_active = not any(_is_active(r) for r in runs)
-        login_autostarted = bool(signed_in.get("autoStarted")) if isinstance(signed_in, dict) else False
-        login_done_idle = announced_login and no_active and not login_autostarted
-        if login_done_idle or (runs and not out and no_active):
+    # Teardown (scoped only): a login-listener stops once it has made its announce
+    # and nothing is running; a run watchdog stops once this chat's runs are all
+    # terminal and there's nothing new to post; an offered/auto run that never
+    # appeared (the await countdown just hit 0) is given up on. Suppressed WHILE
+    # awaiting (awaiting > 0). Never tear down while still posting. _teardown keeps the
+    # shim (a re-added cron then runs a script that exists → no "Script not found"
+    # spam); the cron entry itself is best-effort removed.
+    if origin and awaiting <= 0:
+        login_done_idle = announced_login and no_active and not autostarted
+        await_expired = prev_await > 0 and no_active   # offered/auto run never started → give up
+        if login_done_idle or await_expired or (runs and not out and no_active):
             _teardown(origin)
     return 0
 
