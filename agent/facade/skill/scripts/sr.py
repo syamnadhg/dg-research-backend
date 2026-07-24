@@ -70,13 +70,29 @@ _TIMEOUT = 30
 # Mirrors the bridge's /updates limit cap (bridge.py `_updates`).
 _LOOKUP_LIMIT = 100
 
+# The human setup page (full walkthrough + the pro-account note). A markdown
+# hyperlink so it lands as a clickable label in chat, not a bare URL. Kept
+# distinct from the install.ps1/.sh SCRIPT URLs below.
+_INSTALL_PAGE_URL = "https://superresearch.io/install"
+# Conditional lead ("don't have one?") so it reads gracefully even where the
+# caller already told a user WITH a backend to just paste their pair code
+# (reason=no_devices = no *paired* device, which includes an installed-but-
+# unpaired machine — that user pairs, they don't reinstall).
+_INSTALL_PAGE_LINE = (
+    "Don't have your own Research Computer yet? Set one up — full walkthrough: "
+    f"[superresearch.io/install]({_INSTALL_PAGE_URL})."
+)
+
 # How to install Super Research on a fresh Research Computer (no backend yet):
 # the SAME one-line installer the web app's "Set up your own Research Computer"
 # tile uses (auto-installs Python + pipx + superresearch), then `--pair`. Kept in
 # ONE place so the `devices`-empty and `research`-no-device prompts stay identical
 # + in sync with the web app. (Older builds said `pipx install superresearch`.)
 _SETUP_NODE_LINES = [
-    "No backend on that machine yet? Run one line there (pick your OS):",
+    _INSTALL_PAGE_LINE,
+    "It runs the research on a machine of yours (your PC / Mac / Linux box).",
+    "",
+    "Quick start — run one line there (pick your OS):",
     "```",
     "irm https://superresearch.io/install.ps1 | iex      # Windows",
     "curl -fsSL https://superresearch.io/install.sh | sh  # macOS / Linux",
@@ -196,7 +212,9 @@ def _fmt_sr_links(sr_links: dict) -> list[str]:
     for key in ("podcast", "brief", "chatgpt", "gemini", "claude"):
         url = sr_links.get(key)
         if url:
-            out.append(f"  🔒 {_SR_LINK_LABELS.get(key, key)}: {url}")
+            # Markdown hyperlink so the chat shows a clickable LABEL, not the raw
+            # URL — relay it as printed (the runtime renders `[text](url)`).
+            out.append(f"  🔒 [{_SR_LINK_LABELS.get(key, key)}]({url})")
     return out
 
 
@@ -219,7 +237,9 @@ def _fmt_phase_updates(phase_updates: list) -> list[str]:
             if not url:
                 continue
             glyph = "🔒" if lk.get("permanent") else "🔗"
-            out.append(f"     {glyph} {lk.get('label') or 'link'}: {url}")
+            # Markdown hyperlink (clickable label, no raw-URL clutter) — same
+            # shape the streaming watchdog posts so status + completion match.
+            out.append(f"     {glyph} [{lk.get('label') or 'link'}]({url})")
     return out
 
 
@@ -320,7 +340,8 @@ def _resolve_device_arg(arg: str) -> tuple[dict | None, list[str]]:
     devices = body.get("devices", [])
     if not devices:
         return None, ["No devices connected yet — paste the access code from the computer "
-                      "running Super Research and I’ll connect it."]
+                      "running Super Research and I’ll connect it.",
+                      "", _INSTALL_PAGE_LINE]
     a = arg.strip().lower()
     for d in devices:
         if a == (d.get("id") or "").lower():
@@ -544,6 +565,7 @@ def cmd_status_account(args) -> int:
         if not _has_device():
             lines.append("No device connected yet — paste the access code from your "
                          "Research Computer and I’ll connect it.")
+            lines += ["", _INSTALL_PAGE_LINE]
     elif body.get("remoteLogin") == "pending":
         # A sign-in is mid-flight: approve it in the browser and the bridge
         # captures it automatically (no second command needed) — #848.

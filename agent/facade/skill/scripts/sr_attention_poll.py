@@ -263,7 +263,9 @@ def _final_lines(run: dict) -> list[str]:
                 continue
             seen.add(url)
             glyph = "🔒" if lk.get("permanent") else "🔗"
-            lines.append(f"   {glyph} {lk.get('label') or 'link'}: {url}")
+            # Markdown hyperlink (clickable label, no raw-URL clutter) — matches
+            # sr.py's on-demand status/links so both surfaces look identical.
+            lines.append(f"   {glyph} [{lk.get('label') or 'link'}]({url})")
     return lines
 
 

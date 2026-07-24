@@ -311,7 +311,9 @@ code — they read it to you and you run `device-add`.
 ## Which link to share
 
 `sr.py status` lists each **finished** phase with its link(s) — both kinds are safe
-to hand out; relay them as the client prints:
+to hand out; relay them **as the client prints** — each is a `[Label](url)` markdown
+hyperlink, so hand them over as clickable labels, **not** expanded to raw URLs (this
+holds whether the user asks for one link or all of them):
 - **🔒 SR permanent links** — **Brief (P1)**, the **ChatGPT / Gemini / Claude
   reports (P2)**, and the **Podcast (P3 audio overview)**. Same links embedded in
   the delivered Google Doc: they never expire and survive "Revoke All Shares".

@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import threading
 import time
 import uuid
@@ -438,7 +439,8 @@ def _is_allowed_audio_url(url: str) -> bool:
 
 
 def _prune_podcast_dir(dest_dir: Path, *, keep_name: str) -> None:
-    """Bound the on-disk podcast cache: drop any file older than
+    """Bound the on-disk podcast cache: drop any file — or title-named delivery
+    SUBDIR (see ``_podcast_delivery_copy``) — older than
     ``_PODCAST_MAX_AGE_SECONDS`` (age-only — pruning by run prefix could delete a
     concurrent download's just-finished file). Best-effort — never raises."""
     now = time.time()
@@ -449,9 +451,13 @@ def _prune_podcast_dir(dest_dir: Path, *, keep_name: str) -> None:
     for p in entries:
         try:
             # Never touch the keep file or an in-flight .part.
-            if p.name == keep_name or p.suffix == ".part" or not p.is_file():
+            if p.name == keep_name or p.suffix == ".part":
                 continue
-            if (now - p.stat().st_mtime) > _PODCAST_MAX_AGE_SECONDS:
+            if (now - p.stat().st_mtime) <= _PODCAST_MAX_AGE_SECONDS:
+                continue
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)  # aged delivery-copy subdir
+            elif p.is_file():
                 p.unlink(missing_ok=True)
         except OSError:
             continue
@@ -496,6 +502,34 @@ def _download_podcast_audio(url: str, dest_dir: Path, rid: str) -> tuple[Path, i
         tmp.unlink(missing_ok=True)  # never leave a partial .part behind
         raise
     return final, size
+
+
+def _podcast_delivery_copy(cache_path: Path, title: str, ext: str) -> Path:
+    """Return a DELIVERY path whose basename is the research title.
+
+    A forwarded audio message shows the file's basename, and the on-disk cache
+    name is the ugly ``<rid>-<url-hash>.mp3`` (keyed that way so an identical URL
+    is an instant cache hit). Copy the cached bytes into a SUBDIR keyed by the
+    unique cache stem (``<rid>-<url-hash>/<Title>.mp3``) and hand that back — the
+    chat then shows the clean title, while the enclosing dir keeps deliveries for
+    DIFFERENT runs that happen to share a title from ever colliding on one path
+    (two same-titled runs would otherwise race on a single shared file, and the
+    gateway reads ``localPath`` only later — so the loser's bytes could be sent).
+    The cache file is left untouched (dedup + re-ask speed preserved); the subdir
+    is age-pruned like any podcast file. Best-effort: on any copy failure fall
+    back to the cache path itself, so the podcast is never broken for a cosmetic
+    reason.
+    """
+    try:
+        stem_dir = cache_path.parent / cache_path.stem  # unique per (rid, url)
+        target = stem_dir / _safe_filename(title, ext)
+        if target == cache_path:
+            return cache_path
+        stem_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(cache_path, target)
+        return target
+    except OSError:
+        return cache_path
 
 
 class RemoteFlow:
@@ -1992,12 +2026,15 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 log.warning("podcast download failed for %s (%s)", rid, type(e).__name__)
                 self._json(502, {"error": "couldn't fetch the podcast audio — try again"})
                 return
+            # Serve under a human, title-based basename (the chat shows a
+            # forwarded file's basename, not the ugly rid-hashed cache name).
+            delivery = _podcast_delivery_copy(path, title, ext)
             log.info("podcast audio ready for %s (%d bytes)", rid, size)
             self._json(200, {
                 "ready": True,
                 "runId": rid,
                 "title": title,
-                "localPath": str(path),
+                "localPath": str(delivery),
                 "filename": _safe_filename(title, ext),
                 "mime": mime,
                 "sizeBytes": size,

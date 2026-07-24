@@ -199,7 +199,7 @@ _M4A = ("https://firebasestorage.googleapis.com/v0/b/x/o/"
         "audio%2Fu1%2Fr%2Faudio_overview.m4a?alt=media&token=secret-abc")
 
 
-def test_podcast_route_downloads_and_hides_token(live, monkeypatch):
+def test_podcast_route_downloads_and_hides_token(live, monkeypatch, tmp_path):
     base, _ = live
     FakeFS.research_doc = {
         "id": "agent-1", "title": "Tesla 2025 Outlook", "status": "completed",
@@ -212,7 +212,9 @@ def test_podcast_route_downloads_and_hides_token(live, monkeypatch):
 
     def fake_dl(url, dest_dir, rid):
         captured["url"] = url
-        return (dest_dir / f"{rid}-deadbeef.m4a", 4096)
+        cache = tmp_path / f"{rid}-deadbeef.m4a"  # the ugly rid-hashed cache name
+        cache.write_bytes(b"x" * 4096)
+        return (cache, 4096)
 
     monkeypatch.setattr(bridge, "_download_podcast_audio", fake_dl)
     r = requests.get(base + "/research/agent-1/podcast")
@@ -222,7 +224,12 @@ def test_podcast_route_downloads_and_hides_token(live, monkeypatch):
     assert out["title"] == "Tesla 2025 Outlook"
     assert out["filename"] == "Tesla 2025 Outlook.m4a"  # human filename from the title
     assert out["mime"] == "audio/mp4"
-    assert out["localPath"].endswith("agent-1-deadbeef.m4a")
+    # localPath is served under a TITLE-based basename (what the chat shows), NOT
+    # the rid-hashed cache name — inside a per-run subdir so same-titled runs
+    # can't collide — and the delivery copy holds the same bytes.
+    assert os.path.basename(out["localPath"]) == "Tesla 2025 Outlook.m4a"
+    assert os.path.basename(os.path.dirname(out["localPath"])) == "agent-1-deadbeef"
+    assert (tmp_path / "agent-1-deadbeef" / "Tesla 2025 Outlook.m4a").read_bytes() == b"x" * 4096
     # it resolved links.audio_file (the media file), NOT links.audio (the NLM page)
     assert "audio_overview.m4a" in captured["url"]
     # the long-lived Storage download token NEVER leaves the host
@@ -397,3 +404,51 @@ def test_safe_filename():
     assert bridge._safe_filename("日本語のタイトル", ".m4a") == "日本語のタイトル.m4a"  # unicode preserved
     assert bridge._safe_filename("", ".m4a") == "Podcast.m4a"
     assert bridge._safe_filename("   ", ".mp3") == "Podcast.mp3"
+
+
+def test_podcast_delivery_copy_names_by_title(tmp_path):
+    # Delivery copy carries a human, title-based basename inside a per-run subdir
+    # (keyed by the unique cache stem); the rid-hashed cache file is left in place
+    # (dedup + instant re-ask), and the bytes match.
+    cache = tmp_path / "agent-7-abc1234567.mp3"
+    cache.write_bytes(b"audio-bytes")
+    out = bridge._podcast_delivery_copy(cache, "Mars: Water?", ".mp3")
+    assert out.name == "Mars Water.mp3"                 # reserved chars stripped, no rid-hash
+    assert out.parent.name == "agent-7-abc1234567"      # per-run subdir → no same-title collision
+    assert out.read_bytes() == b"audio-bytes"
+    assert cache.exists()                                # cache untouched
+
+
+def test_podcast_delivery_copy_same_title_different_runs_dont_collide(tmp_path):
+    # Two DIFFERENT runs with an IDENTICAL title must resolve to DIFFERENT paths
+    # (the same-title race the reviewer caught) — the per-run subdir guarantees it.
+    a = tmp_path / "agent-1-aaaaaaaaaa.mp3"; a.write_bytes(b"AAAA")
+    b = tmp_path / "agent-2-bbbbbbbbbb.mp3"; b.write_bytes(b"BBBB")
+    pa = bridge._podcast_delivery_copy(a, "Same Title", ".mp3")
+    pb = bridge._podcast_delivery_copy(b, "Same Title", ".mp3")
+    assert pa != pb
+    assert pa.name == pb.name == "Same Title.mp3"        # same clean chat name…
+    assert pa.read_bytes() == b"AAAA" and pb.read_bytes() == b"BBBB"  # …different bytes, no clobber
+
+
+def test_podcast_delivery_copy_falls_back_on_error(tmp_path):
+    # A missing copy SOURCE must never break the podcast — fall back to the cache
+    # path itself (still a valid, servable file in the real flow) and never raise.
+    missing = tmp_path / "agent-9-xxxxxxxxxx.mp3"  # deliberately not written
+    assert bridge._podcast_delivery_copy(missing, "Whatever", ".mp3") == missing
+
+
+def test_prune_removes_aged_delivery_subdir_keeps_recent(tmp_path):
+    # The title-named delivery SUBDIR is age-pruned like a file: an aged one is
+    # rmtree'd, a recent one survives (bounds disk once the flat cache ages out).
+    aged = tmp_path / "agent-1-oldhash"; aged.mkdir()
+    (aged / "Old Run.m4a").write_bytes(b"x")
+    recent = tmp_path / "agent-2-newhash"; recent.mkdir()
+    (recent / "New Run.m4a").write_bytes(b"x")
+    keep = tmp_path / "agent-3-keep.m4a"; keep.write_bytes(b"x")
+    past = time.time() - bridge._PODCAST_MAX_AGE_SECONDS - 10
+    os.utime(aged, (past, past))
+    bridge._prune_podcast_dir(tmp_path, keep_name=keep.name)
+    assert not aged.exists()      # aged subdir gone
+    assert recent.exists()        # recent subdir survives
+    assert keep.exists()          # cache file untouched

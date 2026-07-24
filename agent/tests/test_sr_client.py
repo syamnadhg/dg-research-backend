@@ -417,6 +417,9 @@ def test_research_no_devices_shows_pair_prompt(monkeypatch, capsys):
     assert sr.main(["research", "Pitbull"]) != 0
     out = capsys.readouterr().out
     assert "Paste the access code" in out and "install.ps1" in out
+    # the human setup-page hyperlink is offered too (markdown link target —
+    # distinct from the install.ps1/.sh script URLs)
+    assert "(https://superresearch.io/install)" in out
 
 
 def test_research_multi_device_asks_which_not_pair(monkeypatch, capsys):
@@ -721,13 +724,14 @@ def test_status_shows_sr_and_platform_links_but_hides_tokenized_audio(bridge_por
     }
     assert sr.main(["status", "agent-d"]) == 0
     out = capsys.readouterr().out
-    # 🔒 permanent SR links for the brief + reports + podcast.
+    # 🔒 permanent SR links for the brief + reports + podcast — as clickable
+    # `[Label](url)` markdown hyperlinks (label shown, raw URL hidden).
     assert "Phase 1 (Research Brief) complete" in out
-    assert "🔒 Brief: " in out and "/shared/doc/SHARE-B" in out
-    assert "/shared/doc/SHARE-C" in out      # ChatGPT report (SR share, not chatgpt.com)
-    assert "/shared/podcast/SHARE-P" in out  # podcast SR share
+    assert "🔒 [Brief](" in out and "/shared/doc/SHARE-B)" in out
+    assert "/shared/doc/SHARE-C)" in out      # ChatGPT report (SR share, not chatgpt.com)
+    assert "/shared/podcast/SHARE-P)" in out  # podcast SR share
     # 🔗 the real final Google Doc link now surfaces (shareable — opens signed out).
-    assert "🔗 Google Doc: " in out and "docs.google.com/document/d/final" in out
+    assert "🔗 [Google Doc](" in out and "docs.google.com/document/d/final)" in out
     # But the tokenized Storage audio URL must NEVER reach chat (not in any phase plan).
     assert "token=" not in out and "firebasestorage" not in out
 
