@@ -205,6 +205,29 @@ def test_cmd_disconnect_removes_skill_and_signs_out(monkeypatch):
     assert cleared["v"] is True  # …and forgot the runtime → bare `agent` re-onboards
 
 
+def test_cmd_disconnect_next_shows_reload_in_chat_group(monkeypatch, capsys):
+    # A removed Hermes skill must surface /reload-skills in the grouped 'Next'
+    # (its in-chat section) so /sr UNregisters — symmetric with connect, where
+    # the reload REgisters /sr. The chat step must be as visible as connect's.
+    home = Path("C:/Users/me")
+    monkeypatch.setattr(cli.connect, "detect_targets",
+                        lambda: [connect.Target("hermes", "local", home)])
+    monkeypatch.setattr(cli.prefs, "get_runtime", lambda: "hermes")
+    monkeypatch.setattr(cli.prefs, "get_runtime_home", lambda: str(home))
+    monkeypatch.setattr(cli.connect, "uninstall", lambda rt, **kw: True)
+    monkeypatch.setattr(cli, "_logout_session", lambda: False)
+    monkeypatch.setattr(cli.prefs, "clear_runtime", lambda: None)
+    monkeypatch.setattr(cli.autostart, "is_installed", lambda: False)
+    monkeypatch.setattr(cli, "_bridge_up", lambda: False)
+    assert cli.cmd_disconnect(_ns()) == 0
+    out = capsys.readouterr().out
+    assert "/reload-skills" in out           # the reload step is shown…
+    assert "unregisters" in out              # …tied to /sr unregistering…
+    assert "in your chat" in out             # …in the grouped in-chat section
+    # and no stale prefix leaked into the terminal commands
+    assert "research.py agent" not in out
+
+
 def test_cmd_disconnect_keeps_unrelated_runtime_pref(monkeypatch):
     # `disconnect openclaw` while HERMES is the recorded runtime must not forget
     # hermes — only the covered runtime is cleared.
@@ -372,7 +395,8 @@ def test_connect_wsl_pipx_bootstrap_fails_falls_back_to_manual(monkeypatch, caps
     out = capsys.readouterr().out
     assert rc == 0 and ran == []                        # didn't attempt the in-WSL run
     assert "Couldn't install pipx" in out
-    assert "research.py agent connect" in out           # backend-checkout fallback
+    assert "pipx install ./agent" in out                # backend-checkout fallback (install, not source-run)
+    assert "superresearch-agent connect" in out
 
 
 def test_connect_wsl_bootstraps_pipx_then_runs(monkeypatch):

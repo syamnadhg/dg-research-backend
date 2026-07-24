@@ -108,7 +108,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     # the task exists, so is_installed() is True and the tip is skipped.)
     if not autostart.is_installed():
         b.dim("Tip: run the bridge in the background + on every login instead  →  "
-              "python research.py agent resurrect")
+              "superresearch-agent resurrect")
     bridge.serve()
     return 0
 
@@ -214,7 +214,7 @@ def cmd_connect(args: argparse.Namespace) -> int:
         if _warn_unreachable_wsl("connect"):
             return 1
         b.no("No chat runtime found (looked for ~/.hermes, ~/.openclaw on this host and in WSL).")
-        b.dim("Install Hermes or OpenClaw first, then re-run:  python research.py agent connect")
+        b.dim("Install Hermes or OpenClaw first, then re-run:  superresearch-agent connect")
         b.dim("A runtime inside a container or a separate VM isn't auto-detected — and a")
         b.dim("  loopback-only bridge needs host networking / a published port to reach it;")
         b.dim("  point connect at it explicitly with  --dest <path-to-skills-dir>  if so.")
@@ -348,7 +348,7 @@ def _startup_step(*, explicit: bool | None = None, assume_yes: bool = False) -> 
     ``explicit`` (--startup/--no-startup) or ``assume_yes`` skip the prompt."""
     if not autostart.supported():
         b.warn(f"Run-on-startup pinning isn't available on this host ({connect.host_os_label()}).")
-        b.dim("Start the bridge yourself:  python research.py agent serve")
+        b.dim("Start the bridge yourself:  superresearch-agent serve")
         return False
     b.dim(f"Pins a background bridge that starts on every login (a {autostart.kind_label()}).")
     if not _decide(explicit, assume_yes, "Run on startup? (background, every login)", default=True):
@@ -357,7 +357,7 @@ def _startup_step(*, explicit: bool | None = None, assume_yes: bool = False) -> 
     ok, out = autostart.install()
     if not ok:
         b.warn(f"Couldn't pin startup: {out}")
-        b.dim("Start it yourself:  python research.py agent serve")
+        b.dim("Start it yourself:  superresearch-agent serve")
         return False
     started, serr = autostart.start_detached()
     # WAIT for it to actually bind before claiming success — else the very next
@@ -367,10 +367,10 @@ def _startup_step(*, explicit: bool | None = None, assume_yes: bool = False) -> 
         b.ok(f"Pinned to startup ({autostart.kind_label()}) + started in the background.")
     elif started:
         b.warn(f"Pinned to startup ({autostart.kind_label()}) — launched, but it's not answering yet.")
-        b.dim("Give it a few seconds; if sign-in says it's not running, run: python research.py agent status")
+        b.dim("Give it a few seconds; if sign-in says it's not running, run: superresearch-agent status")
     else:
         b.warn(f"Pinned to startup, but couldn't start it now: {serr}")
-        b.dim("It starts at your next login (or run: python research.py agent serve).")
+        b.dim("It starts at your next login (or run: superresearch-agent serve).")
     return True
 
 
@@ -388,7 +388,7 @@ def _signin_step(*, explicit: bool | None = None, assume_yes: bool = False,
     only when ACTUALLY signed in here (so a relayed link returns 'started')."""
     if not _bridge_up():
         b.dim("Bridge isn't running yet — start it first, then sign in:")
-        b.dim("  python research.py agent serve   (or: agent resurrect)")
+        b.dim("  superresearch-agent serve   (or: agent resurrect)")
         b.dim("then:  agent login   (or  /sr login  from your chat).")
         return False
     prompt = ("Sign in now? (relays a link to approve)" if noninteractive
@@ -412,7 +412,7 @@ def _connect_next(*, runtime: str, logged_in: bool, startup_pinned: bool) -> lis
     """Closing 'Next' actions, split into terminal commands vs in-chat slash
     commands, and varied by what the user chose (sign-in + startup state) and the
     runtime (the reload step only applies where skills don't auto-watch)."""
-    p = "python research.py agent "
+    p = "superresearch-agent "
     terminal: list[tuple[str, str]] = []
     if logged_in:
         terminal.append((p + "logout", "sign out / switch the account the agent uses"))
@@ -467,8 +467,9 @@ def _print_wsl_manual(distro: str, cmd: str) -> None:
     b.line("    " + b.c(branding._BOLD + branding._ACCENT, f"wsl -d {distro}"))
     b.line("    " + b.c(branding._BOLD + branding._ACCENT, cmd))
     b.dim("  Needs uv in the distro (https://astral.sh/uv). Before the package is on")
-    b.dim("  PyPI, a backend checkout works too — run INSIDE the distro:")
-    b.dim("      python research.py agent connect")
+    b.dim("  PyPI, install the agent from a backend checkout instead — INSIDE the distro:")
+    b.dim("      pipx install ./agent   then   superresearch-agent connect")
+    b.dim("  (install it — don't source-run: a pipx install pins a stable launcher.)")
     b.dim("  The bridge then runs in WSL with your runtime.")
 
 
@@ -701,9 +702,8 @@ def cmd_disconnect(args: argparse.Namespace) -> int:
                 reload_hints.add(hint)
     if not removed_any:
         b.dim("No Super Research skill was installed (nothing to remove).")
-    else:
-        for hint in sorted(reload_hints):
-            b.dim(f"     Run {hint} in your chat so /sr unregisters.")
+    # The reload step (so /sr UNregisters) is surfaced in the grouped 'Next'
+    # block at the end — symmetric with connect, where reload registers /sr.
 
     # ── [2/2] Sign out ────────────────────────────────────────────────────────
     b.step(2, 2, "Sign out")
@@ -752,10 +752,17 @@ def cmd_disconnect(args: argparse.Namespace) -> int:
     # Suggest `retire` ONLY when a running bridge was deliberately kept — never when
     # it was just torn down, and never when there was nothing to tear down (a stale
     # 'retire' hint when the bridge is already gone reads as unfinished cleanup).
-    nexts = [("python research.py agent connect", "reconnect a runtime")]
+    terminal_nexts = [("superresearch-agent connect", "reconnect a runtime")]
     if kept_bridge:
-        nexts.append(("python research.py agent retire", "stop the background bridge + remove it from login startup"))
-    b.next_actions(nexts)
+        terminal_nexts.append(("superresearch-agent retire", "stop the background bridge + remove it from login startup"))
+    # A removed skill still lingers in the runtime's chat until it reloads its
+    # skill scan (Hermes caches it; OpenClaw auto-watches → reload_hint None → no
+    # step). Show the reload in the same grouped 'Next' as connect, so the
+    # unregister step is as visible as the register step was — grouped so the
+    # user can tell the in-chat action apart from the terminal ones.
+    chat_nexts = [(h, "run in chat so /sr unregisters") for h in sorted(reload_hints)]
+    b.next_grouped([("in this terminal", terminal_nexts),
+                    ("in your chat (Hermes / OpenClaw)", chat_nexts)])
     return 0
 
 
@@ -772,12 +779,12 @@ def cmd_resurrect(args: argparse.Namespace) -> int:
     # `agent serve` instead of erroring out under a "run on every login" banner.
     if not autostart.supported():
         b.warn(f"Run-on-startup pinning isn't available on this host ({connect.host_os_label()}).")
-        b.dim("Run the bridge in this terminal instead:  python research.py agent serve")
+        b.dim("Run the bridge in this terminal instead:  superresearch-agent serve")
         return 0
     ok, out = autostart.install()
     if not ok:
         b.no(f"Couldn't pin startup: {out}")
-        b.dim("Run it yourself:  python research.py agent serve")
+        b.dim("Run it yourself:  superresearch-agent serve")
         return 1
     b.ok(f"Pinned to login ({autostart.kind_label()})")
     started, serr = autostart.start_detached()
@@ -785,13 +792,13 @@ def cmd_resurrect(args: argparse.Namespace) -> int:
         b.ok("Bridge started in the background")
     elif started:
         b.warn("Bridge launched, but it's not answering yet — give it a few seconds.")
-        b.dim("Check it: python research.py agent status")
+        b.dim("Check it: superresearch-agent status")
     else:
         b.warn(f"Pinned, but couldn't start it now: {serr}")
-        b.dim("It starts at your next login (or run: python research.py agent serve).")
+        b.dim("It starts at your next login (or run: superresearch-agent serve).")
     b.next_actions([
-        ("python research.py agent status", "check the bridge + session"),
-        ("python research.py agent retire", "stop the background bridge + remove it from login startup"),
+        ("superresearch-agent status", "check the bridge + session"),
+        ("superresearch-agent retire", "stop the background bridge + remove it from login startup"),
     ])
     return 0
 
@@ -810,18 +817,18 @@ def cmd_restart(args: argparse.Namespace) -> int:
                  tagline_color=branding._BOLD + branding._ACCENT)
     if not autostart.is_installed():
         b.warn("Nothing to restart — the bridge isn't pinned to login.")
-        b.dim("Pin + start it:  python research.py agent resurrect")
+        b.dim("Pin + start it:  superresearch-agent resurrect")
         return 1
     ok, out = autostart.restart()
     if not ok:
         b.no(f"Couldn't restart the bridge: {out}")
-        b.dim("Try: python research.py agent retire   then   python research.py agent resurrect")
+        b.dim("Try: superresearch-agent retire   then   superresearch-agent resurrect")
         return 1
     if _wait_bridge_up():
         b.ok("Bridge restarted")
     else:
         b.warn("Restart issued, but the bridge isn't answering yet — give it a few seconds.")
-        b.dim("Check it: python research.py agent status")
+        b.dim("Check it: superresearch-agent status")
     return 0
 
 
@@ -855,8 +862,8 @@ def cmd_retire(args: argparse.Namespace) -> int:
     b.dim("Your account session + the chat skill are untouched "
           "(use agent disconnect to remove those).")
     b.next_actions([
-        ("python research.py agent resurrect", "run the bridge in the background + on every login"),
-        ("python research.py agent serve", "run the bridge here in this terminal (foreground)"),
+        ("superresearch-agent resurrect", "run the bridge in the background + on every login"),
+        ("superresearch-agent serve", "run the bridge here in this terminal (foreground)"),
     ])
     return 0
 
@@ -868,7 +875,7 @@ def cmd_login(args: argparse.Namespace) -> int:
     if rc is not None:
         return rc
     if not _bridge_up():
-        b.no("Bridge isn't running.  Start it:  python research.py agent serve  "
+        b.no("Bridge isn't running.  Start it:  superresearch-agent serve  "
              "(or: agent resurrect)")
         return 1
     if not getattr(args, "local", False):
@@ -982,11 +989,11 @@ def cmd_status(_args: argparse.Namespace) -> int:
             # A sign-in is mid-flight; the bridge auto-captures on approval (#848).
             b.warn("Account: sign-in in progress — approve it in your browser; you'll connect automatically.")
         elif st.get("remoteLogin") in ("error", "expired"):
-            b.warn("Account: last sign-in didn't complete  →  python research.py agent login")
+            b.warn("Account: last sign-in didn't complete  →  superresearch-agent login")
         else:
-            b.warn("Account: not signed in  →  python research.py agent login")
+            b.warn("Account: not signed in  →  superresearch-agent login")
     else:
-        b.no("Bridge: not running  →  python research.py agent serve  (or: agent resurrect)")
+        b.no("Bridge: not running  →  superresearch-agent serve  (or: agent resurrect)")
         sess = AccountSession.load()
         if sess:
             b.dim(f"Account: stored session for {sess.email or sess.uid} (start the bridge to validate)")
@@ -1001,7 +1008,7 @@ def cmd_status(_args: argparse.Namespace) -> int:
     if autostart.is_installed():
         b.ok(f"Autostart: pinned to login ({autostart.TASK_NAME})")
     else:
-        b.dim("Autostart: not pinned  →  python research.py agent resurrect")
+        b.dim("Autostart: not pinned  →  superresearch-agent resurrect")
     print()
     return 0 if bridge_up else 1
 
@@ -1137,7 +1144,7 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
 
     health = _bridge_get("/healthz")
     if health is None:
-        _doctor_row("bridge", False, "down (run: python research.py agent serve)")
+        _doctor_row("bridge", False, "down (run: superresearch-agent serve)")
         sess = AccountSession.load()
         _doctor_row("account", bool(sess),
                     "stored session present — start the bridge to validate" if sess
@@ -1150,7 +1157,7 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
     if st.get("authed"):
         _doctor_row("account", True, str(st.get("email") or st.get("uid")))
     else:
-        _doctor_row("account", False, "not signed in (run: python research.py agent login)")
+        _doctor_row("account", False, "not signed in (run: superresearch-agent login)")
     print()
     return 0
 
@@ -1443,7 +1450,7 @@ def cmd_stop(_args: argparse.Namespace) -> int:
         print(f"{_OK} Bridge stopping.")
         if autostart.is_installed():
             b.dim("It's pinned to startup, so it returns on your next login "
-                  "(remove the pin with: python research.py agent retire).")
+                  "(remove the pin with: superresearch-agent retire).")
         return 0
     print(f"{_NO} couldn't stop the bridge: {_err(res)}")
     return 1
