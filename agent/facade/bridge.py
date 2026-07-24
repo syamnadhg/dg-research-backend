@@ -91,6 +91,19 @@ _ALLOWED_AUDIO_HOST_SUFFIXES = (".storage.googleapis.com",)
 _ORIGIN_MAX = 128
 
 
+def _mask_email(who: str) -> str:
+    """Mask an email for LOGS — keep the first char + domain (``a***@gmail.com``) so
+    a line still identifies the account at a glance without writing the full address
+    to disk. A bare uid (no ``@``) passes through unchanged — a Firebase uid isn't
+    PII. LOGS ONLY; the loopback JSON responses still carry the real email (the
+    client needs it to show "signed in as …")."""
+    who = who or ""
+    if "@" not in who:
+        return who
+    local, _, domain = who.partition("@")
+    return f"{local[:1]}***@{domain}" if local else f"***@{domain}"
+
+
 def _clean_origin(raw: Any) -> dict[str, str] | None:
     """Normalize a chat origin to short trimmed strings, or None unless BOTH
     platform and chat_id are present (the minimum to scope updates to one chat).
@@ -729,7 +742,7 @@ def _write_agent_session_connected(sess: AccountSession, *, clear_revoked: bool)
             # omitting it on the automatic paths leaves the stored value intact).
             fields["revoked"] = False
         fs.upsert_agent_session(sess.uid, sid, fields)
-        log.info("agent session %s connected for %s", sid, sess.email or sess.uid)
+        log.info("agent session %s connected for %s", sid, _mask_email(sess.email or sess.uid))
     except Exception as e:  # never logs the exception value (token-leak safe)
         log.warning("agent session connect-write failed (non-fatal): %s", type(e).__name__)
 
@@ -1233,7 +1246,7 @@ def _advance_remote_flow(state: BridgeState) -> str | None:
             # exactly as before. With a topic + autostart off, OFFER to continue.
             base_ev["pendingTopic"] = topic
             state.set_signed_in(base_ev)
-        log.info("remote login connected as %s", sess.email or sess.uid)
+        log.info("remote login connected as %s", _mask_email(sess.email or sess.uid))
     elif status == devicelogin.EXPIRED:
         flow.state = "expired"
         log.info("remote login expired before approval")
@@ -1516,7 +1529,7 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             state.rotate_login_token()  # one-shot: the captured nonce can't be replayed
             # #790 identity row — explicit human sign-in, so clear any prior revoke.
             _write_agent_session_connected(sess, clear_revoked=True)
-            log.info("account session captured (local page) for %s", sess.email or sess.uid)
+            log.info("account session captured (local page) for %s", _mask_email(sess.email or sess.uid))
             self._json(200, {"ok": True, "uid": sess.uid, "email": sess.email})
 
         # ── remote login (device flow, §11a) ──

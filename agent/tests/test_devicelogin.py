@@ -60,3 +60,26 @@ def test_poll_http_error(mock_fe):
     base = mock_fe(poll_script=[(503, {"error": "later"})])
     with pytest.raises(DeviceLoginError):
         devicelogin.poll_once("PT", fe_base=base)
+
+
+def test_poll_transport_error_hides_polltoken(monkeypatch):
+    # #12: a requests transport error embeds the prepared URL — which carries
+    # ?pollToken=… — so poll_once must surface ONLY the exception type, never the
+    # token, and must not chain the tokened exception into a leakable traceback.
+    import requests
+
+    secret = "PT-SECRET-abc123"
+
+    def boom(*a, **k):
+        raise requests.ConnectionError(
+            "HTTPSConnectionPool(host='x'): Max retries exceeded with url: "
+            f"/api/agent/login/poll?pollToken={secret}")
+
+    monkeypatch.setattr(devicelogin.requests, "get", boom)
+    with pytest.raises(DeviceLoginError) as ei:
+        devicelogin.poll_once(secret, fe_base="https://x")
+    msg = str(ei.value)
+    assert secret not in msg                       # the token never reaches the message
+    assert ei.value.__cause__ is None              # not chained via `from e`
+    assert ei.value.__suppress_context__ is True   # context suppressed via `from None`
+    assert "ConnectionError" in msg                # the useful type name IS surfaced

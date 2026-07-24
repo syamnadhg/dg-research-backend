@@ -398,6 +398,15 @@ def test_audio_ext_and_mime():
     assert bridge._audio_ext_and_mime("https://x/y/no-ext?alt=media") == (".m4a", "audio/mp4")
 
 
+def test_mask_email_hides_full_address_keeps_uid():
+    # #11: logs mask the account email (keep first char + domain), but a bare uid
+    # (no @) isn't PII and passes through so the log line still identifies the account.
+    assert bridge._mask_email("hungrygoldendog@gmail.com") == "h***@gmail.com"
+    assert bridge._mask_email("firebase-uid-xyz") == "firebase-uid-xyz"
+    assert bridge._mask_email("@nolocal.com") == "***@nolocal.com"
+    assert bridge._mask_email("") == ""
+
+
 def test_safe_filename():
     assert bridge._safe_filename("Tesla 2025: Outlook", ".m4a") == "Tesla 2025 Outlook.m4a"  # ':' stripped
     assert bridge._safe_filename("a/b\\c:d?", ".m4a") == "abcd.m4a"  # reserved chars stripped

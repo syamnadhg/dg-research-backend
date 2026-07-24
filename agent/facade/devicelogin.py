@@ -91,7 +91,11 @@ def poll_once(poll_token: str, *, fe_base: str | None = None) -> dict[str, Any]:
             _login_url("poll", fe_base), params={"pollToken": poll_token}, timeout=_POLL_TIMEOUT
         )
     except requests.RequestException as e:
-        raise DeviceLoginError(f"poll could not reach the sign-in broker: {e}") from e
+        # Never interpolate `e`: a requests transport error embeds the prepared URL,
+        # which carries ?pollToken=… — so only the exception TYPE is safe to surface.
+        # `from None` (not `from e`) so a traceback can't leak the tokened URL via the
+        # chained __cause__/__context__ either.
+        raise DeviceLoginError(f"poll could not reach the sign-in broker: {type(e).__name__}") from None
     # The FE returns 410 Gone for an expired/unknown pollToken — treat as expired.
     if resp.status_code == 410:
         return {"status": EXPIRED}
