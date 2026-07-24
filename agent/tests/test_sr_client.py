@@ -160,14 +160,16 @@ def test_login_copy_does_not_demand_login_done():
 def test_prepare_stream_arm_account_wide_without_origin(monkeypatch):
     # #851 item 3: with no chat origin in env, arming falls back to the shared
     # account-wide watchdog directive (no per-chat shim write); rc ok, fixed
-    # dedupable job name, and the self-teardown promise in the copy.
+    # dedupable job name. The copy is now imperative + persistent (ROUND 6): it
+    # tells the AI to create it and NOT skip because no run looks active yet.
     for v in ("HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID", "HERMES_SESSION_THREAD_ID"):
         monkeypatch.delenv(v, raising=False)
     lines, payload, rc = sr._prepare_stream_arm()
     assert rc == 0 and payload["scoped"] is False
     blob = "\n".join(lines)
     assert "cronjob: create" in blob and 'name="sr-stream"' in blob
-    assert "auto-removes when the run finishes" in blob
+    assert "no run looks active" in blob           # anti-skip: arm even when idle
+    assert "agent disconnect" in blob              # persistent — removed only on disconnect
 
 
 def test_status_account_inflight_signin_hint(monkeypatch, capsys):
@@ -861,6 +863,25 @@ def test_arm_stream_scoped_writes_shim(tmp_path, monkeypatch, capsys):
     assert "import sr_attention_poll" in shim
     assert "'platform': 'whatsapp'" in shim and "'chat_id': '4477@c.us'" in shim
     assert "main(origin=ORIGIN)" in shim
+
+
+def test_prepare_stream_arm_scoped_is_imperative_and_persistent(tmp_path, monkeypatch):
+    # ROUND 6 fix: the scoped directive (what a real chat uses) must be imperative
+    # and must NOT let the AI skip arming when no run looks active yet — the live bug
+    # was the AI answering "no active runs to monitor" and never creating the cron,
+    # so a just-fired run (not in /updates for a few seconds) finished unwatched with
+    # no 🎉. Also describe the persistent watchdog (removed only on disconnect).
+    (tmp_path / "sr_attention_poll.py").write_text("# watchdog\n", encoding="utf-8")
+    monkeypatch.setattr(sr, "_scripts_dir", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "111")
+    monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
+    lines, payload, rc = sr._prepare_stream_arm()
+    assert rc == 0 and payload["scoped"] is True
+    blob = "\n".join(lines)
+    assert "cronjob: create" in blob and payload["name"] in blob
+    assert "no run looks active" in blob      # anti-skip: arm even when idle
+    assert "agent disconnect" in blob         # persistent — no self-teardown
 
 
 def test_arm_stream_slug_matches_watchdog(tmp_path):

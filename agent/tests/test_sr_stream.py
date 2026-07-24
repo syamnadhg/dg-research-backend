@@ -327,10 +327,14 @@ def _main_with(monkeypatch, *, runs, lines, origin):
     return torn
 
 
-def test_main_self_teardown_when_all_terminal(monkeypatch):
+def test_main_persists_when_all_terminal(monkeypatch):
+    # Persistent watchdog: a completed run + nothing new must NOT tear the watchdog
+    # down — it keeps ticking silently and streams the NEXT run. (Re-arming on every
+    # fire was unreliable: the chat AI skipped arming when no run looked active.)
+    # Only `agent disconnect` removes it.
     origin = {"platform": "telegram", "chat_id": "111"}
     torn = _main_with(monkeypatch, runs=[{"runId": "r1", "status": "completed"}], lines=[], origin=origin)
-    assert torn.get("o") == origin  # done + nothing new → stop + clean up
+    assert "o" not in torn  # NOT torn down — persists to stream future runs
 
 
 def test_main_no_teardown_while_active(monkeypatch):
@@ -414,7 +418,10 @@ def test_main_announces_signed_in_once_then_dedups(monkeypatch, capsys):
     assert "Signed in" not in capsys.readouterr().out
 
 
-def test_main_tears_down_after_signed_in_when_idle(monkeypatch):
+def test_main_persists_after_signed_in_when_idle(monkeypatch):
+    # Persistent: a sign-in announce with nothing running no longer tears the
+    # watchdog down — it stays armed so a run fired later streams immediately
+    # (no re-arm needed). Removed only by `agent disconnect`.
     origin = {"platform": "telegram", "chat_id": "111"}
     monkeypatch.setattr(poll, "_get_updates",
                         lambda o=None: ([], {"ts": 1, "email": "e@x.y", "pendingTopic": ""}))
@@ -423,7 +430,7 @@ def test_main_tears_down_after_signed_in_when_idle(monkeypatch):
     torn = {}
     monkeypatch.setattr(poll, "_teardown", lambda o: torn.__setitem__("o", o))
     poll.main(origin)
-    assert torn.get("o") == origin  # one announce + nothing running → login-listener stops
+    assert "o" not in torn  # stays armed (persistent)
 
 
 def test_main_keeps_running_after_signed_in_if_a_run_is_active(monkeypatch):
@@ -449,6 +456,38 @@ def test_tick_unauthed_waits_then_gives_up(monkeypatch, tmp_path):
         assert "o" not in torn  # still within the wait window → stay armed, silent
     poll._tick_unauthed(origin, sf)  # one past the limit
     assert torn.get("o") == origin  # a sign-in that never completes can't poll forever
+
+
+def test_tick_unauthed_persists_a_signed_in_watchdog(monkeypatch, tmp_path):
+    # A watchdog that was ALREADY signed in (a run tracked in state) must NOT be torn
+    # down by a 401 outage (web-app logout / revoked-token mid-run) — it persists
+    # silently (a 200 resumes; a revoke re-arms later). Only a genuine never-signed-in
+    # listener is bounded. (Persistent-watchdog invariant, ROUND 6.)
+    origin = {"platform": "telegram", "chat_id": "111"}
+    sf = tmp_path / "st.json"
+    sf.write_text(json.dumps({"r1": {"completed": True}, "__signed_in_ts__": 9}), "utf-8")
+    torn = {}
+    monkeypatch.setattr(poll, "_teardown", lambda o: torn.__setitem__("o", o))
+    for _ in range(poll._LOGIN_WAIT_LIMIT + 5):  # well past the never-signed-in limit
+        poll._tick_unauthed(origin, sf)
+    assert "o" not in torn  # signed-in watchdog persists through sustained 401s
+    assert "__login_wait__" not in json.loads(sf.read_text("utf-8"))  # counter never started
+
+
+def test_main_authed_tick_clears_login_wait(monkeypatch, tmp_path):
+    # A successful (authed, 200) tick must DROP any accumulated __login_wait__ so
+    # transient 401s never accumulate toward the never-signed-in give-up on a live
+    # watchdog. This is the crux of "no wrongful teardown of a live watchdog".
+    origin = {"platform": "telegram", "chat_id": "111"}
+    sf = tmp_path / "st.json"
+    sf.write_text(json.dumps({"__login_wait__": 17}), "utf-8")
+    monkeypatch.setattr(poll, "_state_path", lambda o: sf)
+    monkeypatch.setattr(poll, "_get_updates",
+                        lambda o=None: ([{"runId": "r1", "status": "ongoing"}], None))
+    poll.main(origin)
+    saved = json.loads(sf.read_text("utf-8"))
+    assert "__login_wait__" not in saved  # cleared on the authed tick
+    assert "r1" in saved                  # normal streaming state persisted
 
 
 def test_main_reserved_only_state_is_baseline_not_a_replay(monkeypatch, capsys):
@@ -537,9 +576,10 @@ def test_teardown_not_on_autostart_login_tick(monkeypatch):
     assert torn["v"] is False
 
 
-def test_teardown_on_login_with_nothing_to_stream(monkeypatch):
-    # Sign-in that did NOT auto-start a run (needs a device) + nothing active →
-    # the login listener has done its job and tears down (a later research re-arms).
+def test_no_teardown_on_login_with_nothing_to_stream(monkeypatch):
+    # Persistent: sign-in that didn't auto-start a run (needs a device) + nothing
+    # active used to tear the login-listener down; now it PERSISTS (armed + silent)
+    # so the eventual run streams without a re-arm. (Removed only by disconnect.)
     origin = {"platform": "telegram", "chat_id": "c1"}
     signed_in = {"ts": 1, "needsDevice": True}
     monkeypatch.setattr(poll, "_get_updates", lambda o=None: ([], signed_in))
@@ -548,7 +588,7 @@ def test_teardown_on_login_with_nothing_to_stream(monkeypatch):
     torn = {"v": False}
     monkeypatch.setattr(poll, "_teardown", lambda o: torn.__setitem__("v", True))
     poll.main(origin)
-    assert torn["v"] is True
+    assert torn["v"] is False  # persists — no self-teardown
 
 
 # ── stale-result leak: a sign-in tick must not dump a PRIOR run's completion ──
@@ -616,12 +656,16 @@ def test_compute_suppress_replay_still_announces_a_tracked_run_stop():
     assert any("stopped" in m for m in msgs)
 
 
-# ── #arming: keep the watchdog alive across the sign-in → run-start handoff ────
+# ── persistence across the sign-in → run-start handoff ─────────────────────────
+# Supersedes the old __await_run__ keep-alive: the watchdog now never self-tears-
+# down, so the sign-in→run gap (a just-fired run not yet in /updates) is covered for
+# free. Re-arming on every fire was the unreliable part — the chat AI skipped arming
+# whenever no run looked active yet.
 
 def test_main_keeps_alive_when_signin_offers_a_pending_run(monkeypatch):
     # "Continue with X? Reply yes to start" — the run isn't in /updates yet. The
-    # watchdog must NOT tear down (else the run starts unstreamed and its completion
-    # is never posted — the gap the user hit); it stays alive, silently, awaiting it.
+    # persistent watchdog stays armed regardless (it never self-tears-down), so the
+    # run streams the moment it appears — the gap the user hit.
     origin = {"platform": "telegram", "chat_id": "c1"}
     si = {"ts": 1, "email": "e@x.y", "pendingTopic": "German Shepherd"}
     saved = {}
@@ -631,12 +675,14 @@ def test_main_keeps_alive_when_signin_offers_a_pending_run(monkeypatch):
     torn = {"v": False}
     monkeypatch.setattr(poll, "_teardown", lambda o: torn.__setitem__("v", True))
     poll.main(origin)
-    assert torn["v"] is False                                   # NOT torn down — awaiting the run
-    assert saved["s"].get("__await_run__") == poll._AWAIT_RUN_LIMIT
+    assert torn["v"] is False                    # NOT torn down — persists to stream the run
+    assert "__await_run__" not in saved["s"]     # no keep-alive counter — persistence replaces it
 
 
 def test_main_streams_the_offered_run_once_it_starts(monkeypatch):
-    # Next tick: the offered run is now live → keep streaming, clear the await counter.
+    # The offered run is now live → keep streaming (still no teardown). A stale
+    # __await_run__ left by an older build is simply ignored (compute rebuilds state
+    # from runs), so it never resurfaces in the persisted state.
     origin = {"platform": "telegram", "chat_id": "c1"}
     saved = {}
     monkeypatch.setattr(poll, "_load_state",
@@ -648,31 +694,4 @@ def test_main_streams_the_offered_run_once_it_starts(monkeypatch):
     monkeypatch.setattr(poll, "_teardown", lambda o: torn.__setitem__("v", True))
     poll.main(origin)
     assert torn["v"] is False                     # active run → keep streaming
-    assert "__await_run__" not in saved["s"]      # cleared — normal streaming took over
-
-
-def test_main_await_expires_then_tears_down(monkeypatch):
-    # The offer was abandoned (no run ever appeared); the last await tick decrements
-    # to 0 → give up + tear down (don't linger polling forever).
-    origin = {"platform": "telegram", "chat_id": "c1"}
-    monkeypatch.setattr(poll, "_load_state", lambda p=None: {"__await_run__": 1})
-    monkeypatch.setattr(poll, "_get_updates", lambda o=None: ([], None))
-    monkeypatch.setattr(poll, "_save_state", lambda s, p=None: None)
-    torn = {"v": False}
-    monkeypatch.setattr(poll, "_teardown", lambda o: torn.__setitem__("v", True))
-    poll.main(origin)
-    assert torn["v"] is True                      # await hit 0 with no run → torn down
-
-
-def test_main_keeps_alive_across_multiple_await_ticks(monkeypatch):
-    # A mid-countdown tick with no run + no sign-in must decrement and stay alive.
-    origin = {"platform": "telegram", "chat_id": "c1"}
-    saved = {}
-    monkeypatch.setattr(poll, "_load_state", lambda p=None: {"__await_run__": 8})
-    monkeypatch.setattr(poll, "_get_updates", lambda o=None: ([], None))
-    monkeypatch.setattr(poll, "_save_state", lambda s, p=None: saved.__setitem__("s", s))
-    torn = {"v": False}
-    monkeypatch.setattr(poll, "_teardown", lambda o: torn.__setitem__("v", True))
-    poll.main(origin)
-    assert torn["v"] is False
-    assert saved["s"].get("__await_run__") == 7    # ticked down, still waiting
+    assert "__await_run__" not in saved["s"]      # stale leftover dropped from persisted state

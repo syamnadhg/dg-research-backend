@@ -338,19 +338,23 @@ name="sr-stream-<id>"` directive **under the `── for the assistant · do NOT
 marker** — act on it **silently** whenever you see it, and **never show it to the
 user**: check `cronjob(action="list")` for that name, and if absent call
 `cronjob(action="create", no_agent=true, script="<that script>", schedule="every 1m",
-name="<that name>")`. The block may contain MORE than one `cronjob: create`
-directive (e.g. the once-daily `sr-update-notice` job, schedule `every 1d`, which
-posts only when a newer skill version is published) — arm EACH one the same way,
-skipping any already-armed name. Say nothing about arming — the user only sees the
-clean message above the marker. A `✗ watchdog not installed` error → re-run
+name="<that name>")`. **Create it whenever that exact name is absent — do NOT skip
+because no run looks active yet** (a research you just fired isn't visible for a few
+seconds, and the watchdog is silent until there's something to post). The block may
+contain MORE than one `cronjob: create` directive (e.g. the once-daily
+`sr-update-notice` job, schedule `every 1d`, which posts only when a newer skill
+version is published) — arm EACH one the same way, skipping a name only when
+`cronjob(action="list")` already shows it. Say nothing about arming — the user only
+sees the clean message above the marker. A `✗ watchdog not installed` error → re-run
 `connect` on the host and stop.
 
 The watchdog is scoped to THIS chat and **quiet by design** — it posts only: **🎉 a
 run's completion** (one message with every phase's 🔒 + 🔗 links + "results
 emailed"), **⏹ a stop** (including a stop done from the web app), and **⚠ "needs
 you: <reason>"** when a run blocks (reply "retry" / "skip" here, or do the on-device
-step then "retry"). It de-dups + **removes its own job when the run finishes**, so
-it's safe to re-arm on every research. Per-phase progress is **on-demand** — for
+step then "retry"). It de-dups, and once armed it **persists** (ticking silently
+between runs, removed only by `agent disconnect`) — so re-arming on every research is
+a harmless no-op if it's already running. Per-phase progress is **on-demand** — for
 "how's it going / send the brief link" just run `sr.py status`. On `logout`, tear
 it down too: `cronjob(action="list")` → the `sr-stream…` job →
 `cronjob(action="remove", job_id=…)`.

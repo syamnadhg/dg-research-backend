@@ -92,13 +92,6 @@ _LIVE_STUCK = ("queued", "ongoing", "paused_backend_restart", "paused_backend_re
 # past the ~15-min sign-in TTL) so a sign-in that never completes can't poll forever.
 _LOGIN_WAIT_LIMIT = 18
 
-# After a sign-in that OFFERED a pending research ("reply yes to start") or is
-# AUTO-STARTING one, the run isn't in /updates yet — keep the watchdog alive this
-# many silent minute-ticks so it streams the run the moment it appears, instead of
-# tearing down and missing the completion (the "run finished, no ping" gap). Bounded
-# so an abandoned offer can't keep a watchdog polling forever.
-_AWAIT_RUN_LIMIT = 20
-
 
 def _base() -> str:
     raw = os.environ.get("SUPER_AGENT_BRIDGE_PORT", "9876")
@@ -175,17 +168,20 @@ def _save_state(state: dict, path: Path | None = None) -> None:
         pass  # best-effort; a missed save just re-announces next tick (rare)
 
 
-# ── run-linked teardown ──────────────────────────────────────────────────────
-# The watchdog is a recurring Hermes cron job (`sr-stream-<slug>`, every 1m). When
-# this chat has no live work left it should stop, so it best-effort removes its OWN
-# entry (matched by name) from the cron data file (`<HERMES_HOME>/cron/jobs.json`,
-# which Hermes re-reads each tick) — we can't call Hermes's agent-only `cronjob`
-# tool from a no_agent script. It deliberately does NOT delete the generated shim:
-# the gateway holds the cron in an in-memory registry and can re-persist it after a
-# host-side edit, and deleting the shim would then make the re-added cron fire
-# "Script not found" every tick (the spam bug). Keeping the shim means a lingering /
-# re-added cron just runs it and exits silently. Full cleanup (shim included) is
-# `agent disconnect`'s job; `agent connect`'s sweep clears legacy shim-less orphans.
+# ── login-listener give-up teardown ───────────────────────────────────────────
+# The watchdog is a recurring Hermes cron job (`sr-stream-<slug>`, every 1m). Once
+# armed it PERSISTS and streams every run for the chat (see main()'s tail) — the
+# ONLY time it self-removes is the never-signed-in give-up: a login-listener armed
+# at `/sr login` that never authenticates (401 forever) is bounded (_tick_unauthed),
+# else it would poll forever. That give-up best-effort removes its OWN entry (matched
+# by name) from the cron data file (`<HERMES_HOME>/cron/jobs.json`, which Hermes
+# re-reads each tick) — a no_agent script can't call Hermes's agent-only `cronjob`
+# tool. It deliberately does NOT delete the generated shim: the gateway holds the
+# cron in an in-memory registry and can re-persist it after a host-side edit, and
+# deleting the shim would then make the re-added cron fire "Script not found" every
+# tick (the old spam bug). Keeping the shim means a lingering / re-added cron just
+# runs it and exits silently. Full cleanup (shim included) is `agent disconnect`'s
+# job; `agent connect`'s sweep clears legacy shim-less orphans.
 
 # Runs still in flight (or stuck awaiting the user) — work the watchdog must keep
 # streaming. Everything else (completed / errored-and-done / cancelled) is terminal.
@@ -228,7 +224,10 @@ def _remove_cron_entry(job_name: str) -> bool:
 
 
 def _teardown(origin: dict) -> None:
-    """Stop this chat's watchdog: best-effort remove its cron entry from jobs.json.
+    """Give up a never-signed-in login-listener: best-effort remove its cron entry
+    from jobs.json. This is the ONLY self-removal path — an armed, signed-in watchdog
+    persists and streams every run (see main()); only a login that never completes is
+    torn down here (via _tick_unauthed) so it can't poll forever.
 
     Deliberately does NOT delete the generated shim (sr_poll_<slug>.py) or its state.
     A gateway-armed cron lives in the gateway's IN-MEMORY registry and gets
@@ -415,10 +414,23 @@ def _tick_unauthed(origin: dict | None, state_file: Path) -> int:
     forever. Bounds SCOPED watchdogs only; the shared account-wide watchdog
     (origin=None) is never self-removed (its script serves every chat), so it just
     no-ops here and keeps polling — acceptable since the modern gateway always
-    supplies an origin (so login-listeners are scoped + bounded)."""
+    supplies an origin (so login-listeners are scoped + bounded).
+
+    The bounded give-up is ONLY for a genuine PRE-sign-in listener. A watchdog that
+    was ALREADY signed in (a run tracked in state, or a sign-in event seen) must
+    PERSIST through a 401 — auth was lost mid-life (a web-app logout, a token that
+    can't refresh, a revoked session), NOT "never signed in". Tearing it down here
+    would drop the 🎉 for a run that completes during the outage; instead stay silent
+    + alive (a 200 tick resumes streaming, and a genuine revoke re-arms on the next
+    research). A revoked idle watchdog then just polls silently — the same cost as
+    any idle persistent watchdog — until `agent disconnect`."""
     if not origin:
         return 0
     prior = _load_state(state_file) or {}
+    signed_in_before = ("__signed_in_ts__" in prior
+                        or any(not str(k).startswith("__") for k in prior))
+    if signed_in_before:
+        return 0  # persist — never tear down a watchdog that was streaming
     waited = int(prior.get("__login_wait__", 0) or 0) + 1
     if waited > _LOGIN_WAIT_LIMIT:
         _teardown(origin)
@@ -446,7 +458,13 @@ def main(origin: dict | None = None) -> int:
         if getattr(e, "code", None) == 401:
             return _tick_unauthed(origin, state_file)
         return 0
-    except (urllib.error.URLError, OSError, ValueError):
+    except Exception:
+        # ANY other fetch failure must stay silent + rc 0. This is a persistent cron
+        # (it now ticks forever until `agent disconnect`), and a non-zero exit trips
+        # Hermes's per-minute cron-error alert EVERY tick. Covers the common
+        # bridge-down modes (URLError / OSError / timeout) AND a malformed/truncated
+        # loopback response — http.client.BadStatusLine / IncompleteRead subclass
+        # HTTPException, NOT OSError, so a narrow tuple would let them escape.
         return 0
     # Back-compat unpack: real fetch returns (runs, signedIn); a test/monkeypatch or
     # an older shim may hand back just the runs list.
@@ -480,45 +498,22 @@ def main(origin: dict | None = None) -> int:
     if si_ts is not None:
         new_state["__signed_in_ts__"] = si_ts
 
-    # ── keep the watchdog alive across the sign-in → run-start handoff ──────────
-    # A sign-in that OFFERED a pending research ("reply yes to start") or is
-    # AUTO-STARTING one has a run that isn't in /updates yet. Without this the
-    # watchdog tears down as "idle", the run then starts with nothing streaming it,
-    # and its completion is never posted (the gap the user hit). Keep it alive —
-    # SILENTLY (no active run → no output → no spam) — until the run appears or the
-    # bounded wait expires. ``__await_run__`` carries the countdown across the
-    # one-shot signedIn event; a live run zeroes it (normal streaming takes over).
-    si = signed_in if isinstance(signed_in, dict) else {}
-    no_active = not any(_is_active(r) for r in runs)
-    autostarted = bool(si.get("autoStarted"))
-    prev_await = int(pdict.get("__await_run__", 0) or 0)
-    if not no_active:
-        awaiting = 0                                  # a run is live → normal streaming
-    elif announced_login and (autostarted or bool((si.get("pendingTopic") or "").strip())):
-        awaiting = _AWAIT_RUN_LIMIT                    # sign-in started/offered a run → wait for it
-    elif prev_await > 0:
-        awaiting = prev_await - 1                      # still waiting for the run to appear
-    else:
-        awaiting = 0
-    if awaiting > 0:
-        new_state["__await_run__"] = awaiting
-
     _save_state(new_state, state_file)
     if out:
         print("\n".join(out))
 
-    # Teardown (scoped only): a login-listener stops once it has made its announce
-    # and nothing is running; a run watchdog stops once this chat's runs are all
-    # terminal and there's nothing new to post; an offered/auto run that never
-    # appeared (the await countdown just hit 0) is given up on. Suppressed WHILE
-    # awaiting (awaiting > 0). Never tear down while still posting. _teardown keeps the
-    # shim (a re-added cron then runs a script that exists → no "Script not found"
-    # spam); the cron entry itself is best-effort removed.
-    if origin and awaiting <= 0:
-        login_done_idle = announced_login and no_active and not autostarted
-        await_expired = prev_await > 0 and no_active   # offered/auto run never started → give up
-        if login_done_idle or await_expired or (runs and not out and no_active):
-            _teardown(origin)
+    # Persistent watchdog: once armed it NEVER self-removes. It ticks silently
+    # (empty stdout = no chat spam) and streams every run for this chat until
+    # `agent disconnect` removes it. This deliberately drops the old
+    # run-completion teardown AND the sign-in→run keep-alive: re-arming depended on
+    # the chat AI acting on a directive at every fire, and it SKIPPED whenever no
+    # run looked active yet (a just-started run isn't in /updates for a few
+    # seconds) — so completions went unposted. Persisting also collapses the
+    # teardown machinery we kept patching: no teardown → no re-added-cron
+    # "Script not found" spam, and no torn-down-before-the-run-appeared gap. The
+    # ONLY self-removal left is the never-signed-in give-up in _tick_unauthed
+    # (a login-listener that never authenticates must not poll forever); once
+    # signed in, a 200 response resets that and the watchdog persists.
     return 0
 
 

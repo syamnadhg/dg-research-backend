@@ -1176,10 +1176,11 @@ def _prepare_stream_arm() -> tuple[list[str], dict, int]:
     caller wraps them via ``_agent_directive_block`` so the ``cronjob: create …``
     syntax never reaches the user) that arm it. Writes a shim that bakes in this
     chat's origin (the cron can't take args or read the session env). The watchdog
-    SELF-REMOVES once the chat's runs finish, so it's safe to (re-)emit on every
-    research start — the gateway dedups by the fixed job name. No chat origin
-    (older gateway) → the shared account-wide watchdog. A shim-write error → a
-    single ✗ line + rc=1 (the caller drops it on the auto-arm paths)."""
+    PERSISTS once armed (removed only by `agent disconnect`), so re-emitting on every
+    research start is safe — the gateway dedups by the fixed job name, so a re-issue
+    when it's already armed is a no-op. No chat origin (older gateway) → the shared
+    account-wide watchdog. A shim-write error → a single ✗ line + rc=1 (the caller
+    drops it on the auto-arm paths)."""
     origin = _origin_from_env()
     if origin is None:
         payload = {"script": "sr_attention_poll.py", "name": "sr-stream",
@@ -1187,14 +1188,17 @@ def _prepare_stream_arm() -> tuple[list[str], dict, int]:
         # ASSISTANT-ONLY directive lines — the caller wraps them under the
         # do-not-relay marker, so the user never sees this cronjob syntax.
         return ([
-            "Arm this chat's live-progress watchdog with your cronjob tool — skip "
-            "if it's already armed, or if your runtime has no cronjob tool (it "
-            "auto-removes when the run finishes):",
+            "Arm this chat's live-progress watchdog NOW with your cronjob tool so run "
+            "progress and the 🎉 completion post here on their own:",
             '  cronjob: create no_agent=true schedule="every 1m" '
             'script="sr_attention_poll.py" name="sr-stream"',
-            "Also arm the once-daily skill-update notice (skip if already armed; "
-            "it posts only when a newer skill version is published and removes "
-            "itself after a disconnect):",
+            "Create it now. Skip ONLY if your cronjob tool already lists a job named "
+            "sr-stream (then leave that one — do not duplicate) or if your runtime has "
+            "no cronjob tool. Do NOT skip just because no run looks active yet — a "
+            "just-started run isn't visible for a few seconds; once armed the watchdog "
+            "persists and streams every run until `agent disconnect`.",
+            "Arm the once-daily skill-update notice the same way (skip only if a job "
+            "named sr-update-notice is already listed):",
             '  cronjob: create no_agent=true schedule="every 1d" '
             'script="sr_update_notice.py" name="sr-update-notice"',
         ], payload, 0)
@@ -1207,14 +1211,17 @@ def _prepare_stream_arm() -> tuple[list[str], dict, int]:
     payload = {"script": script_name, "name": job_name, "schedule": "every 1m",
                "scoped": True, "origin": origin}
     return ([
-        "Arm this chat's live-progress watchdog with your cronjob tool — first "
-        "check it isn't already armed; it streams only THIS chat's runs and "
-        "auto-removes when they finish:",
+        "Arm this chat's live-progress watchdog NOW with your cronjob tool so run "
+        "progress and the 🎉 completion post to this chat on their own:",
         f'  cronjob: create no_agent=true schedule="every 1m" '
         f'script="{script_name}" name="{job_name}"',
-        "Also arm the once-daily skill-update notice (skip if already armed; "
-        "it posts only when a newer skill version is published and removes "
-        "itself after a disconnect):",
+        "Create it now. Skip ONLY if your cronjob tool already lists a job with this "
+        "exact name (then leave that one — do not duplicate) or if your runtime has "
+        "no cronjob tool. Do NOT skip just because no run looks active yet — a "
+        "just-started run isn't visible for a few seconds; once armed the watchdog "
+        "persists and streams every run for this chat until `agent disconnect`.",
+        "Arm the once-daily skill-update notice the same way (skip only if a job "
+        "named sr-update-notice is already listed):",
         '  cronjob: create no_agent=true schedule="every 1d" '
         'script="sr_update_notice.py" name="sr-update-notice"',
     ], payload, 0)
