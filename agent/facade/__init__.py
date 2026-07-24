@@ -19,7 +19,7 @@ Hard boundaries (the "nothing breaks" contract):
 # Reported by `agent --version` + `agent doctor`. Read from the installed
 # package metadata so it never drifts from pyproject's version (when run via
 # pipx / a pip install); falls back to the literal when run from a source
-# checkout (`python research.py agent …`, not installed as a distribution).
+# checkout (`python -m facade.cli …`, not installed as a distribution).
 try:
     from importlib.metadata import PackageNotFoundError, version as _pkg_version
 

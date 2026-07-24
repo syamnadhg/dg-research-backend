@@ -111,7 +111,7 @@ user, don't ask for confirmation), then tell them you're doing the one-time setu
 pipx run --no-cache superresearch-agent connect
 ```
 
-(or `python research.py agent connect` from a backend checkout). It installs the
+It installs the
 `/sr` skill, **starts the bridge, and pins it to start on every login (autostart)**,
 then prints the reload-skills + sign-in next step. Relay that. Then the user runs
 **/reload-skills** once so `/sr` registers (OpenClaw auto-loads it). So a
