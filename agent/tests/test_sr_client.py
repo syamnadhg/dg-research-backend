@@ -417,9 +417,9 @@ def test_research_no_devices_shows_pair_prompt(monkeypatch, capsys):
     assert sr.main(["research", "Pitbull"]) != 0
     out = capsys.readouterr().out
     assert "Paste the access code" in out and "install.ps1" in out
-    # the human setup-page hyperlink is offered too (markdown link target —
-    # distinct from the install.ps1/.sh script URLs)
-    assert "(https://superresearch.io/install)" in out
+    # the human setup-page URL is offered too as a bare URL (NOT Markdown); the
+    # trailing newline distinguishes it from the install.ps1/.sh script URLs
+    assert "https://superresearch.io/install\n" in out
 
 
 def test_research_multi_device_asks_which_not_pair(monkeypatch, capsys):
@@ -523,6 +523,23 @@ def test_install_backend_helper_fails(bridge_port, monkeypatch, capsys):
     monkeypatch.setattr(bridge.selfupdate, "spawn_detached_backend_install", lambda: False)
     assert sr.main(["install"]) == 1
     assert "pipx" in capsys.readouterr().out.lower()
+
+
+def test_setup_lines_have_no_code_fences():
+    # SMS / plain-text relays can't render Markdown — a ``` fence shows literal
+    # backticks. The install commands are 6-space-indented instead (matching
+    # sr_attention_poll._signed_in_line's style).
+    assert "```" not in sr._SETUP_NODE_LINES
+    assert any(ln.startswith("      irm ") for ln in sr._SETUP_NODE_LINES)
+    assert any(ln.startswith("      curl ") for ln in sr._SETUP_NODE_LINES)
+
+
+def test_install_backend_output_has_no_code_fences(bridge_port, monkeypatch, capsys):
+    monkeypatch.setattr(bridge, "_backend_cli", lambda: None)
+    monkeypatch.setattr(bridge.selfupdate, "spawn_detached_backend_install", lambda: True)
+    assert sr.main(["install"]) == 0
+    out = capsys.readouterr().out
+    assert "```" not in out and "      superresearch --pair" in out
 
 
 def test_status_account_prompts_available_skill_update(bridge_port, monkeypatch, capsys):
@@ -724,14 +741,14 @@ def test_status_shows_sr_and_platform_links_but_hides_tokenized_audio(bridge_por
     }
     assert sr.main(["status", "agent-d"]) == 0
     out = capsys.readouterr().out
-    # 🔒 permanent SR links for the brief + reports + podcast — as clickable
-    # `[Label](url)` markdown hyperlinks (label shown, raw URL hidden).
+    # 🔒 permanent SR links for the brief + reports + podcast — channel-neutral
+    # `Label: url` (bare URL auto-links everywhere; NO hard-coded Markdown).
     assert "Phase 1 (Research Brief) complete" in out
-    assert "🔒 [Brief](" in out and "/shared/doc/SHARE-B)" in out
-    assert "/shared/doc/SHARE-C)" in out      # ChatGPT report (SR share, not chatgpt.com)
-    assert "/shared/podcast/SHARE-P)" in out  # podcast SR share
+    assert "🔒 Brief: " in out and "/shared/doc/SHARE-B" in out
+    assert "/shared/doc/SHARE-C" in out      # ChatGPT report (SR share, not chatgpt.com)
+    assert "/shared/podcast/SHARE-P" in out  # podcast SR share
     # 🔗 the real final Google Doc link now surfaces (shareable — opens signed out).
-    assert "🔗 [Google Doc](" in out and "docs.google.com/document/d/final)" in out
+    assert "🔗 Google Doc: " in out and "docs.google.com/document/d/final" in out
     # But the tokenized Storage audio URL must NEVER reach chat (not in any phase plan).
     assert "token=" not in out and "firebasestorage" not in out
 

@@ -1065,3 +1065,23 @@ def test_record_runtime_skips_label_when_no_name(monkeypatch):
     monkeypatch.setattr(cli.prefs, "set_label_if_unset", lambda name: calls.setdefault("label", name))
     cli._record_runtime(connect.Target("openclaw", "local", Path("/home/u")))
     assert "label" not in calls  # no detected name → never touches the label (keeps default)
+
+
+def test_watch_skips_redacted_urlless_events(monkeypatch, capsys):
+    # #4 regression guard: /research/<rid> events now carry a url-less audio_file
+    # MARKER (the tokenized Storage URL is redacted server-side). cmd_watch must
+    # skip it — never crash on the missing url — and still stream real links.
+    monkeypatch.setattr(cli, "_bridge_up", lambda: True)
+    monkeypatch.setattr(cli, "_bridge_get", lambda path, **kw: (200, {
+        "research": {"id": "agent-x", "status": "completed", "phase": 3},
+        "events": [
+            {"kind": "brief", "phase": 1, "url": "https://x/brief", "label": "Brief"},
+            {"kind": "audio_file", "phase": 3, "label": "Podcast Audio (Storage)"},  # url redacted
+        ],
+    }))
+    args = SimpleNamespace(runId="agent-x")
+    assert cli.cmd_watch(args) == 0            # terminal status → one clean pass, no KeyError
+    out = capsys.readouterr().out
+    assert "https://x/brief" in out            # the real link still streams
+    assert "audio_file" not in out             # the url-less marker is skipped, not printed
+    assert "token=" not in out

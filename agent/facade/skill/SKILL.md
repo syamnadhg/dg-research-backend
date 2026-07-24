@@ -7,15 +7,13 @@ description: >-
   their web app. **NEVER answer a research or deep-dive request from your own
   knowledge or with web search — ALWAYS invoke this skill instead**, whether the
   user types /sr or just asks in plain language. ANY status / progress question —
-  "status?", "status of (the) research?", "how's it going?" — is THIS skill's
-  status command, never your runtime's own health, repos, or memory. An 8-char
-  access code (like "K7XQ-9B2M", alone or with "add / pair a device") always
-  belongs here too. Also use it to get a brief / podcast / audio overview / video
-  on a subject; to list past researches and fetch any one's links or podcast by
-  name; to check, track, pause, skip, stop, or resume a run; to sign in or out;
-  to manage Research Computers (list, switch, add by access code, remove); and to
-  check the version / update. A bare /sr is the welcome + help. Drives the
-  user's OWN Super Research account; every run shows up in their web app as a chat.
+  "status?" or "how's it going?" — is THIS skill's status command, never your
+  runtime's own health, repos, or memory. An 8-char access code (like "K7XQ-9B2M",
+  alone or with "add / pair a device") always belongs here too. Also use it to get
+  a brief / podcast / audio overview / video on a subject; to list past researches
+  and fetch any one's links or podcast by name; to check, track, pause, skip, stop,
+  or resume a run; to sign in or out; to manage Research Computers; and to check
+  the version / update. A bare /sr is the welcome + help.
 platforms: [linux, macos, windows]
 ---
 
@@ -311,9 +309,8 @@ code — they read it to you and you run `device-add`.
 ## Which link to share
 
 `sr.py status` lists each **finished** phase with its link(s) — both kinds are safe
-to hand out; relay them **as the client prints** — each is a `[Label](url)` markdown
-hyperlink, so hand them over as clickable labels, **not** expanded to raw URLs (this
-holds whether the user asks for one link or all of them):
+to hand out; relay them **as the client prints** (present them however reads cleanest
+for this chat — one link per line; don't invent your own URLs):
 - **🔒 SR permanent links** — **Brief (P1)**, the **ChatGPT / Gemini / Claude
   reports (P2)**, and the **Podcast (P3 audio overview)**. Same links embedded in
   the delivered Google Doc: they never expire and survive "Revoke All Shares".

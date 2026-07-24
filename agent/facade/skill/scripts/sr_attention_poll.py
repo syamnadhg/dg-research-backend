@@ -263,9 +263,11 @@ def _final_lines(run: dict) -> list[str]:
                 continue
             seen.add(url)
             glyph = "🔒" if lk.get("permanent") else "🔗"
-            # Markdown hyperlink (clickable label, no raw-URL clutter) — matches
-            # sr.py's on-demand status/links so both surfaces look identical.
-            lines.append(f"   {glyph} [{lk.get('label') or 'link'}]({url})")
+            # Channel-neutral label + bare URL. This message is posted DIRECTLY to
+            # the origin channel (no_agent cron — no runtime to reformat), and that
+            # channel may be SMS/plain-text, so NO Markdown: `[x](y)` would show as
+            # literal brackets there. A bare URL auto-links everywhere.
+            lines.append(f"   {glyph} {lk.get('label') or 'link'}: {url}")
     return lines
 
 

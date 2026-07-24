@@ -76,11 +76,12 @@ def test_final_message_includes_sr_and_platform_links():
     ])]
     blob = "\n".join(poll.compute(runs, {})[0])
     assert "pipeline complete" in blob and "emailed" in blob
-    # markdown hyperlinks (clickable label, raw URL hidden) — same shape as sr.py
-    assert "🔒 [Podcast](https://sr.io/shared/podcast/P)" in blob
-    assert "🔗 [NotebookLM](https://notebooklm.google.com/n/1)" in blob
-    assert "🔗 [YouTube](https://youtu.be/abc)" in blob
-    assert "🔗 [Google Doc](https://docs.google.com/d/x)" in blob
+    # channel-neutral label + bare URL (this is a no_agent DIRECT post — may land on
+    # SMS/plain-text, so NO Markdown; a bare URL auto-links everywhere)
+    assert "🔒 Podcast: https://sr.io/shared/podcast/P" in blob
+    assert "🔗 NotebookLM: https://notebooklm.google.com/n/1" in blob
+    assert "🔗 YouTube: https://youtu.be/abc" in blob
+    assert "🔗 Google Doc: https://docs.google.com/d/x" in blob
 
 
 def test_skipped_phase_is_silent_but_recorded():

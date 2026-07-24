@@ -427,6 +427,42 @@ def _safe_filename(title: str, ext: str) -> str:
     return (cleaned[:80] or "Podcast") + ext
 
 
+# Link kinds whose value is a tokenized Storage download URL (…?alt=media&token=…).
+# The token must NEVER leave the host or land in chat history — _research_podcast
+# fetches the media host-side and hands back only a local path. So the bridge never
+# emits it in ANY client response either. But sr.py / cli.py's `podcast` run-picker
+# keys off the mere PRESENCE of an audio_file entry (to prefer a run that already
+# has audio), so responses KEEP the kind marker and drop only the url value.
+_TOKENIZED_LINK_KINDS = frozenset({"audio_file"})
+
+
+def _redact_media_urls(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Copy a flattened-links list with the tokenized Storage URL removed from any
+    media entry (kind in ``_TOKENIZED_LINK_KINDS``), keeping the kind marker — the
+    podcast run-pick needs it — and every other link untouched."""
+    out: list[dict[str, Any]] = []
+    for e in events:
+        if isinstance(e, dict) and e.get("kind") in _TOKENIZED_LINK_KINDS:
+            e = {k: v for k, v in e.items() if k != "url"}
+        out.append(e)
+    return out
+
+
+def _redact_doc_media(doc: dict) -> dict:
+    """A shallow copy of a run doc safe to return to a client: the tokenized
+    Storage audio URL (``links.audio_file``) dropped. ``links.audio`` /
+    ``links.notebooklm`` stay — those hold the PUBLIC NotebookLM page, not a media
+    file. Returns the doc unchanged when there's nothing to redact."""
+    if not isinstance(doc, dict):
+        return doc
+    links = doc.get("links")
+    if not isinstance(links, dict) or not any(k in links for k in _TOKENIZED_LINK_KINDS):
+        return doc
+    clean = dict(doc)
+    clean["links"] = {k: v for k, v in links.items() if k not in _TOKENIZED_LINK_KINDS}
+    return clean
+
+
 def _is_allowed_audio_url(url: str) -> bool:
     """True only for an https Firebase/GCS Storage URL. The audio URL comes from
     the (account-scoped) research doc, so a doctored value is at most self-SSRF —
@@ -1657,7 +1693,11 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             except FirestoreError as e:
                 self._firestore_502(e)
                 return
-            self._json(200, {"researches": rows})
+            # Drop the tokenized Storage audio URL from every row (same class as the
+            # /updates + /research redaction) so the bridge never emits it anywhere.
+            # cli's run list/podcast-pick read only title/status/phase (podcast-pick
+            # goes through /updates), so this has zero consumer impact.
+            self._json(200, {"researches": [_redact_doc_media(r) for r in rows]})
 
         def _decorate_devices(self, devs: list[dict[str, Any]], uid: str, selected: str | None):
             """Add the authoritative owned/selected flags the client can't infer.
@@ -1970,8 +2010,11 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # `phaseUpdates` = the per-phase plan (permanent SR links + platform-only
             # links for NotebookLM/YouTube/final Doc) — what `status` should render.
             self._json(200, {
-                "research": doc,
-                "events": runview.flatten_links(doc.get("links")),
+                # Redact the tokenized Storage audio URL from both the raw doc and
+                # the flattened events — it must never reach a chat client (the
+                # media itself is served by /research/<rid>/podcast as a local file).
+                "research": _redact_doc_media(doc),
+                "events": _redact_media_urls(runview.flatten_links(doc.get("links"))),
                 "srLinks": sr,
                 "phaseUpdates": _phase_updates(doc, sr),
             })
@@ -2119,7 +2162,9 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                     # #N in line" from this (#890; absent once the run starts).
                     "queuePosition": r.get("queuePosition"),
                     "updatedAt": r.get("updatedAt"),
-                    "links": runview.flatten_links(r.get("links")),
+                    # Tokenized Storage audio URL redacted (kind marker kept for the
+                    # podcast run-pick); it must never reach a chat client.
+                    "links": _redact_media_urls(runview.flatten_links(r.get("links"))),
                     "srLinks": sr,
                     "phaseUpdates": phase_updates,
                     # The live pipeline config (which phases are on/off) so a chat
@@ -2144,8 +2189,15 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 ev = state.take_signed_in()
                 if isinstance(ev, dict):
                     ev_origin = ev.get("origin")
+                    # An ORIGIN-LESS sign-in event (a connect-CLI / --pair login that
+                    # confirms in the TERMINAL, started from no chat) must NOT be handed
+                    # to a SCOPED chat watchdog: with several channels armed
+                    # (telegram/whatsapp/sms), whichever polled first would announce
+                    # "signed in" in the WRONG chat. Deliver it only to the legacy
+                    # account-wide (unscoped) watchdog; a scoped watchdog announces ONLY
+                    # the sign-in its own chat initiated (origin match).
                     deliver = (
-                        not ev_origin
+                        (not ev_origin and not scope_chat)
                         or (scope_chat and isinstance(ev_origin, dict)
                             and (ev_origin.get("platform") or "").strip().lower() == want_platform
                             and (ev_origin.get("chat_id") or "").strip() == want_chat)

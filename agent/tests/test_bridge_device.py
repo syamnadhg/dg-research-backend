@@ -429,6 +429,58 @@ def test_updates_and_status_carry_permanent_sr_links(live):
     assert one["srLinks"]["podcast"].endswith("/shared/podcast/SP")
 
 
+# ── #4 token hardening: the tokenized Storage audio URL never leaves the bridge ──
+
+_TOKENIZED_AUDIO = ("https://firebasestorage.googleapis.com/v0/b/x/o/"
+                    "audio%2Fu1%2Fr%2Fov.m4a?alt=media&token=secret-xyz")
+
+
+def test_status_redacts_tokenized_audio_url(live):
+    base, _ = live
+    FakeFS.researches = {"r1": {"id": "r1", "status": "completed", "phase": 3, "links": {
+        "audio": {"url": "https://notebooklm.google.com/notebook/pub", "phase": 3},
+        "audio_file": {"url": _TOKENIZED_AUDIO, "label": "Podcast Audio (Storage)", "phase": 3},
+        "brief": {"url": "https://x/brief", "phase": 1},
+    }}}
+    r = requests.get(base + "/research/r1")
+    assert r.status_code == 200
+    # the token appears NOWHERE in the response body
+    assert "token=" not in r.text and "secret-xyz" not in r.text
+    body = r.json()
+    # the raw doc no longer carries links.audio_file; the public NLM page + brief stay
+    assert "audio_file" not in body["research"]["links"]
+    assert body["research"]["links"]["audio"]["url"].startswith("https://notebooklm")
+    assert body["research"]["links"]["brief"]["url"] == "https://x/brief"
+    # events keep the audio_file KIND marker (podcast run-pick needs it) but no url
+    ev = {e["kind"]: e for e in body["events"]}
+    assert "audio_file" in ev and "url" not in ev["audio_file"]
+    assert ev["brief"]["url"] == "https://x/brief"  # a public link keeps its url
+
+
+def test_updates_redacts_tokenized_audio_url_keeps_kind(live):
+    base, _ = live
+    FakeFS.researches = {"r1": {"id": "r1", "status": "completed", "phase": 3, "topic": "T",
+                                "links": {"audio_file": {"url": _TOKENIZED_AUDIO, "phase": 3}}}}
+    r = requests.get(base + "/updates")
+    assert "token=" not in r.text and "secret-xyz" not in r.text
+    run = next(x for x in r.json()["runs"] if x["runId"] == "r1")
+    # the run-pick predicate (sr.py / cli.py cmd_podcast) still finds it by kind…
+    assert any(lk.get("kind") == "audio_file" for lk in run["links"])
+    # …but the tokenized url is gone from every audio_file entry
+    assert all("url" not in lk for lk in run["links"] if lk.get("kind") == "audio_file")
+
+
+def test_researches_list_redacts_tokenized_audio_url(live):
+    base, _ = live
+    FakeFS.researches = {"r1": {"id": "r1", "status": "completed",
+                                "links": {"audio_file": {"url": _TOKENIZED_AUDIO}}}}
+    r = requests.get(base + "/researches")
+    assert r.status_code == 200
+    assert "token=" not in r.text and "secret-xyz" not in r.text
+    row = next(x for x in r.json()["researches"] if x["id"] == "r1")
+    assert "audio_file" not in row.get("links", {})
+
+
 # ── /device/pair + /device/remove (forwarded to the web app as the user) ──
 
 def test_device_pair_forwards_and_autoselects_first_device(live, monkeypatch):
@@ -794,6 +846,29 @@ def test_updates_signed_in_scoped_to_origin(monkeypatch):
         hit = requests.get(base + "/updates?via=agent&platform=telegram&chat=111").json()
         assert hit["signedIn"]["email"] == "e@x.y"
         assert "signedIn" not in requests.get(base + "/updates?via=agent&platform=telegram&chat=111").json()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_updates_originless_signin_not_claimed_by_scoped_watchdog(monkeypatch):
+    # A connect-CLI / --pair login has NO chat origin (it confirms in the TERMINAL,
+    # not from any chat). It must NOT be handed to a SCOPED chat watchdog — else,
+    # with several channels armed (telegram/whatsapp/sms), whichever polled first
+    # would announce "signed in" in the WRONG chat. A scoped watchdog leaves it
+    # untouched; only the account-wide (unscoped) watchdog claims it.
+    base, state, httpd = _live_with_state(monkeypatch)
+    try:
+        state.set_signed_in({"ts": 42, "email": "e@x.y", "uid": "u1",
+                             "pendingTopic": "", "origin": None})
+        # a SCOPED telegram watchdog must NOT get it — and must NOT consume it
+        assert "signedIn" not in requests.get(base + "/updates?via=agent&platform=telegram&chat=111").json()
+        # a SCOPED whatsapp watchdog likewise leaves it for the account-wide one
+        assert "signedIn" not in requests.get(base + "/updates?via=agent&platform=whatsapp&chat=222").json()
+        # the account-wide (unscoped) watchdog still claims it, then it clears
+        hit = requests.get(base + "/updates?via=agent").json()
+        assert hit["signedIn"]["email"] == "e@x.y"
+        assert "signedIn" not in requests.get(base + "/updates?via=agent").json()
     finally:
         httpd.shutdown()
         httpd.server_close()

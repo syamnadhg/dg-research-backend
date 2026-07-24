@@ -1387,10 +1387,16 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     print("    (paused — watching idles until it resumes; Ctrl-C to stop)")
                 last_status = status
             for e in res[1].get("events", []):
-                key = (e["kind"], e["url"])
+                # A redacted media marker (e.g. audio_file, whose tokenized Storage
+                # URL the bridge strips) has no url — it's not a shareable link, so
+                # skip it. Use .get throughout: never assume every event has a url.
+                url = e.get("url")
+                if not url:
+                    continue
+                key = (e.get("kind"), url)
                 if key not in seen:
                     seen.add(key)
-                    print(f"  🔗 {e.get('label') or e['kind']}: {e['url']}")
+                    print(f"  🔗 {e.get('label') or e.get('kind')}: {url}")
             if runview.is_terminal(status):
                 print(f"{_OK} run {rid} {status}.")
                 return 0

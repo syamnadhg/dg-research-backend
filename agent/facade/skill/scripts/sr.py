@@ -74,13 +74,13 @@ _LOOKUP_LIMIT = 100
 # hyperlink so it lands as a clickable label in chat, not a bare URL. Kept
 # distinct from the install.ps1/.sh SCRIPT URLs below.
 _INSTALL_PAGE_URL = "https://superresearch.io/install"
-# Conditional lead ("don't have one?") so it reads gracefully even where the
-# caller already told a user WITH a backend to just paste their pair code
-# (reason=no_devices = no *paired* device, which includes an installed-but-
-# unpaired machine — that user pairs, they don't reinstall).
+# Bare URL (auto-links on every channel — NO Markdown, which would hard-code a
+# rich-text channel assumption). Conditional lead ("don't have one?") so it reads
+# gracefully even where the caller already told a user WITH a backend to just
+# paste their pair code (reason=no_devices = no *paired* device, which includes an
+# installed-but-unpaired machine — that user pairs, they don't reinstall).
 _INSTALL_PAGE_LINE = (
-    "Don't have your own Research Computer yet? Set one up — full walkthrough: "
-    f"[superresearch.io/install]({_INSTALL_PAGE_URL})."
+    f"Don't have your own Research Computer yet? Set one up — full walkthrough: {_INSTALL_PAGE_URL}"
 )
 
 # How to install Super Research on a fresh Research Computer (no backend yet):
@@ -93,11 +93,12 @@ _SETUP_NODE_LINES = [
     "It runs the research on a machine of yours (your PC / Mac / Linux box).",
     "",
     "Quick start — run one line there (pick your OS):",
-    "```",
-    "irm https://superresearch.io/install.ps1 | iex      # Windows",
-    "curl -fsSL https://superresearch.io/install.sh | sh  # macOS / Linux",
-    "superresearch --pair",
-    "```",
+    # Indent (not ``` fences) so the commands stay readable on plain-text
+    # channels too — an SMS/relay that can't render Markdown would otherwise show
+    # literal backticks. Matches sr_attention_poll._signed_in_line's 6-space style.
+    "      irm https://superresearch.io/install.ps1 | iex      # Windows",
+    "      curl -fsSL https://superresearch.io/install.sh | sh  # macOS / Linux",
+    "      superresearch --pair",
     "It installs Super Research and prints an 8-char access code — read it to me.",
 ]
 
@@ -212,9 +213,11 @@ def _fmt_sr_links(sr_links: dict) -> list[str]:
     for key in ("podcast", "brief", "chatgpt", "gemini", "claude"):
         url = sr_links.get(key)
         if url:
-            # Markdown hyperlink so the chat shows a clickable LABEL, not the raw
-            # URL — relay it as printed (the runtime renders `[text](url)`).
-            out.append(f"  🔒 [{_SR_LINK_LABELS.get(key, key)}]({url})")
+            # Channel-neutral (label + bare URL): the raw URL auto-links on every
+            # channel (Telegram/WhatsApp/SMS/…), and the runtime is free to render
+            # it as a clickable label where it can. We do NOT emit Markdown here —
+            # that would hard-code a rich-text channel assumption into the skill.
+            out.append(f"  🔒 {_SR_LINK_LABELS.get(key, key)}: {url}")
     return out
 
 
@@ -237,9 +240,8 @@ def _fmt_phase_updates(phase_updates: list) -> list[str]:
             if not url:
                 continue
             glyph = "🔒" if lk.get("permanent") else "🔗"
-            # Markdown hyperlink (clickable label, no raw-URL clutter) — same
-            # shape the streaming watchdog posts so status + completion match.
-            out.append(f"     {glyph} [{lk.get('label') or 'link'}]({url})")
+            # Channel-neutral label + bare URL (no Markdown — see _fmt_sr_links).
+            out.append(f"     {glyph} {lk.get('label') or 'link'}: {url}")
     return out
 
 
@@ -1184,9 +1186,9 @@ def cmd_install(args) -> int:
     return _emit(body, args.json, [
         "⬇️ Installing Super Research on this device in the background.",
         "When it finishes, pair it — run this on that PC:",
-        "```",
-        "superresearch --pair",
-        "```",
+        # Indent (not ``` fences) — plain-text/SMS relays can't render Markdown
+        # and would show literal backticks. Matches _SETUP_NODE_LINES' style.
+        "      superresearch --pair",
         "It shows an 8-char code; read it to me and I’ll add it.",
         "(Then finish the API-key + browser-login steps on the PC and it’s ready.)",
     ])

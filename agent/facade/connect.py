@@ -245,8 +245,23 @@ def wsl_running_distros() -> list[str]:
 
 
 def wsl_root(distro: str) -> Path:
-    """The Windows UNC mount point for a WSL distro's filesystem."""
-    return Path(rf"\\wsl.localhost\{distro}")
+    r"""The Windows UNC mount point for a WSL distro's filesystem.
+
+    Newer Windows (10 2004+ / 11) mounts at ``\\wsl.localhost\<distro>``; older
+    builds only expose the legacy ``\\wsl$\<distro>``. Prefer the modern form,
+    fall back to legacy only when it's the mount that actually resolves — else a
+    perfectly-running distro on an older host reads as "no runtime". Only ever
+    reached for RUNNING distros (detect_wsl_targets gates on wsl_running_distros),
+    so the .exists() probe can't wedge on a stopped distro's auto-starting mount."""
+    modern = Path(rf"\\wsl.localhost\{distro}")
+    try:
+        if not modern.exists():
+            legacy = Path(rf"\\wsl$\{distro}")
+            if legacy.exists():
+                return legacy
+    except OSError:
+        pass
+    return modern
 
 
 def wsl_user_homes(distro: str, root: Path | None = None) -> list[Path]:
