@@ -20791,6 +20791,9 @@ async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None,
     }
 
 
+_p1_src_dbg_dumped = False  # one-shot guard for the #P1-src-dbg panel DOM capture
+
+
 async def scrape_chatgpt_activity_panel_tracking(page):
     """Walk ChatGPT Deep Research's *open* activity side panel for live
     progress data — steps checklist, section headings, source URLs,
@@ -20960,6 +20963,32 @@ async def scrape_chatgpt_activity_panel_tracking(page):
             out.searches = best;
         } catch (e) {}
 
+        // #P1-src-dbg (2026-07-23): the Pro+Extended-Thinking panel opens and
+        // its step rows parse, but source_urls comes back EMPTY throughout the
+        // run — this panel renders its sources some other way than the old
+        // Deep Research external-<a href> list (verified from backend.log:
+        // "panel tracking (P1): 0 URLs, 2 steps"). Capture how THIS panel
+        // structures its sources so the extraction can be fixed from the real
+        // DOM, never guessed. Bounded; only computed when we truly have a panel
+        // (real text) but zero source urls — costs nothing on the happy path.
+        try {
+            if (out.source_urls.length === 0 && out.partial_text_len > 150) {
+                out.dbg_panel_tag = (panel.tagName || '') + '|' +
+                    String(panel.className || '').slice(0, 160);
+                out.dbg_anchors = [];
+                panel.querySelectorAll('a, [role="link"], button, cite, [data-url], [data-href]').forEach(a => {
+                    if (out.dbg_anchors.length >= 80) return;
+                    const href = a.getAttribute('href') || a.getAttribute('data-href') ||
+                                 a.getAttribute('data-url') || '';
+                    const txt = (a.innerText || a.getAttribute('aria-label') || a.title || '').trim().slice(0, 90);
+                    if (!href && !txt) return;
+                    out.dbg_anchors.push(a.tagName + ' [' + String(a.className || '').slice(0, 60) +
+                                         '] href=' + String(href).slice(0, 220) + ' :: ' + txt);
+                });
+                out.dbg_html = String(panel.outerHTML || '').slice(0, 60000);
+            }
+        } catch (e) {}
+
         return out;
     }"""
     try:
@@ -21018,6 +21047,34 @@ async def scrape_chatgpt_activity_panel_tracking(page):
     )
     if not has_data:
         return None
+    # #P1-src-dbg: one-shot ground-truth capture. When the panel opened and
+    # parsed step rows but produced ZERO source urls (the reported P1 raw-
+    # activity-empty symptom), dump the panel's real DOM + an anchor/button/
+    # cite inventory so the source extraction can be corrected from what the
+    # Pro+Extended-Thinking panel actually renders — not a blind selector
+    # guess. Fires at most once per process; writes next to backend.log so it
+    # survives whichever way the run was launched.
+    global _p1_src_dbg_dumped
+    if (not _p1_src_dbg_dumped and res.get("dbg_html")
+            and not res.get("source_urls") and res.get("steps")):
+        try:
+            _dbg_dir = os.path.expanduser("~/.super-research/logs")
+            os.makedirs(_dbg_dir, exist_ok=True)
+            _dbg_path = os.path.join(_dbg_dir, "p1_activity_panel_dump.html")
+            with open(_dbg_path, "w", encoding="utf-8") as _f:
+                _f.write(res.get("dbg_html") or "")
+            log(f"[P1-src-dbg] panel open + {len(res.get('steps', []))} steps but 0 source "
+                f"urls — dumped panel DOM ({len(res.get('dbg_html') or '')} chars) to {_dbg_path} "
+                f"(panel={res.get('dbg_panel_tag', '?')}); "
+                f"{len(res.get('dbg_anchors') or [])} anchor/button/cite candidates:", "INFO")
+            for _a in (res.get("dbg_anchors") or [])[:80]:
+                log(f"[P1-src-dbg]   {_a}", "INFO")
+            _p1_src_dbg_dumped = True
+        except Exception as _dbe:
+            log(f"[P1-src-dbg] capture failed: {_dbe}", "DEBUG")
+    # Strip debug-only keys so they never bleed into the merged progress/emit.
+    for _dk in ("dbg_html", "dbg_anchors", "dbg_panel_tag"):
+        res.pop(_dk, None)
     return res
 
 
