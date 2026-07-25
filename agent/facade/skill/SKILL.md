@@ -196,13 +196,13 @@ it back so a mis-transcription is caught); too garbled to read → ask.
 
 When you send a sign-in link (for "log me in", OR for a research the user asked
 while signed out), send the user **one** message: the click-to-approve link the
-client returned. The client also prints the watchdog-arming directive **under the
-`── for the assistant · do NOT relay ──` marker** — call your **cronjob tool** with
-exactly those args **silently**, in the same turn, so the bridge can post a
-proactive "✓ Signed in" here on its own. **Do NOT send a second message about
-arming, and do NOT re-paste the sign-in link** (that duplicate is the bug this
-avoids). No cronjob tool in your runtime → skip the block; the follow-up below
-still works.
+client returned. The client arms this chat's live-updates watchdog **itself** so the
+bridge can post a proactive "✓ Signed in" here on its own — there is normally
+**nothing for you to do**. Only if the client prints a directive **under the
+`── for the assistant · do NOT relay ──` marker** (a fallback path) do you call your
+**cronjob tool** with exactly those args **silently**, in the same turn. **Do NOT
+send a second message about arming, and do NOT re-paste the sign-in link** (that
+duplicate is the bug this avoids).
 
 The proactive announce is best-effort, so **never wait on it and never say "what
 should I continue?"**. The moment the user replies **anything** ("done",
@@ -234,10 +234,10 @@ never `retry`, never a question back to the user.
   never refuse it or point the user at an account/profile menu. Removes the agent
   from their account (keeps the skill + bridge).
 - **research** → relay the clean "🚀 Started …" message (names the run by title +
-  device). The arming directive is under the do-not-relay marker — **arm the
-  watchdog silently** (see **Streaming**) so completion + any blocker posts here on
-  its own. Arm it **every** time a run starts; never mention it or paste the
-  `cronjob:` line.
+  device). The client arms the watchdog **itself** so completion + any blocker posts
+  here on its own — normally nothing for you to do. Only act on a directive if one
+  appears under the do-not-relay marker (fallback — see **Streaming**); never mention
+  arming or paste the `cronjob:` line.
 - **status** → relay the **current phase**, the **⚙ Phases** line (which phases are
   on / OFF), each finished phase's 🔒 link, and any **⚠ Needs you** blocker.
 - **podcast** → **relay the output verbatim.** It prints a short title line + a
@@ -326,26 +326,21 @@ isn't there yet → that phase hasn't finished; say so and offer to check again.
 raw audio file (the client filters it out; don't dig one out of raw JSON); the
 podcast goes out as native audio via `podcast`, or as its 🔒 SR link.
 
-## Streaming a run's progress (arm the watchdog)
+## Streaming a run's progress (the watchdog)
 
-**Only if your runtime can schedule a recurring background job from chat** — Hermes
-exposes a `cronjob` tool you call directly. If yours has no such chat-armable
-scheduler (e.g. OpenClaw), **skip this section** and just run `sr.py status` /
-`updates` when the user asks. Both `sr.py research` **and** `sr.py login` prepare
-this chat's watchdog and print the exact `cronjob: create … script="sr_poll_<id>.py"
-name="sr-stream-<id>"` directive **under the `── for the assistant · do NOT relay ──`
-marker** — act on it **silently** whenever you see it, and **never show it to the
-user**: check `cronjob(action="list")` for that name, and if absent call
-`cronjob(action="create", no_agent=true, script="<that script>", schedule="every 1m",
-name="<that name>")`. **Create it whenever that exact name is absent — do NOT skip
-because no run looks active yet** (a research you just fired isn't visible for a few
-seconds, and the watchdog is silent until there's something to post). The block may
-contain MORE than one `cronjob: create` directive (e.g. the once-daily
-`sr-update-notice` job, schedule `every 1d`, which posts only when a newer skill
-version is published) — arm EACH one the same way, skipping a name only when
-`cronjob(action="list")` already shows it. Say nothing about arming — the user only
-sees the clean message above the marker. A `✗ watchdog not installed` error → re-run
-`connect` on the host and stop.
+Both `sr.py research` **and** `sr.py login` **arm this chat's live-updates watchdog
+themselves** — the client writes the recurring job straight into the runtime's cron
+store, so it does **not** depend on you calling any tool. **Normally there is nothing
+for you to do here — just relay the clean message.** Only as a FALLBACK (a legacy
+runtime the client can't write to) does it instead print a `cronjob: create …
+script="sr_poll_<id>.py" name="sr-stream-<id>"` directive **under the
+`── for the assistant · do NOT relay ──` marker** — if you see that, act on it
+**silently** and **never show it to the user**: check `cronjob(action="list")` for
+that name, and if absent call `cronjob(action="create", no_agent=true,
+script="<that script>", schedule="* * * * *", name="<that name>")`. **Create it
+whenever that exact name is absent — do NOT skip because no run looks active yet.**
+Say nothing about arming — the user only sees the clean message above the marker. A
+`✗ watchdog not installed` error → re-run `connect` on the host and stop.
 
 The watchdog is scoped to THIS chat and **quiet by design** — it posts only: **🎉 a
 run's completion** (one message with every phase's 🔒 + 🔗 links + "results

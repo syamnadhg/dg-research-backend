@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """sr_attention_poll.py — the Super Research streaming watchdog (chat push).
 
-Runs as a Hermes `no_agent` cron job (created by the /sr skill via the gateway's
-`cronjob` tool, bound to the originating chat via deliver="origin"). Each tick it
+Runs as a Hermes `no_agent` cron job that the /sr skill arms DETERMINISTICALLY by
+writing the job row straight into <HERMES_HOME>/cron/jobs.json (the gateway's
+`cronjob` tool is only a legacy fallback), bound to the originating chat via
+deliver="origin". Each tick it
 asks the loopback bridge for the AGENT-started runs (`/updates?via=agent` — so
 web-app runs never clutter the chat) and prints — VERBATIM, for the chat — only
 what is NEW since the last tick. It is deliberately QUIET: it does NOT narrate
@@ -175,13 +177,14 @@ def _save_state(state: dict, path: Path | None = None) -> None:
 # at `/sr login` that never authenticates (401 forever) is bounded (_tick_unauthed),
 # else it would poll forever. That give-up best-effort removes its OWN entry (matched
 # by name) from the cron data file (`<HERMES_HOME>/cron/jobs.json`, which Hermes
-# re-reads each tick) — a no_agent script can't call Hermes's agent-only `cronjob`
-# tool. It deliberately does NOT delete the generated shim: the gateway holds the
-# cron in an in-memory registry and can re-persist it after a host-side edit, and
-# deleting the shim would then make the re-added cron fire "Script not found" every
-# tick (the old spam bug). Keeping the shim means a lingering / re-added cron just
-# runs it and exits silently. Full cleanup (shim included) is `agent disconnect`'s
-# job; `agent connect`'s sweep clears legacy shim-less orphans.
+# re-reads each tick and is the durable single source of truth — a host-side removal
+# STICKS; there is no in-memory registry that re-adds it). It deliberately does NOT
+# delete the generated shim: this removal is UNLOCKED (no `.jobs.lock` flock), so a
+# concurrent gateway save between our read and replace could still carry the entry
+# through; if we'd deleted the shim, that surviving cron would fire "Script not found"
+# every tick (the old spam bug). Keeping the shim means a lingering cron just runs it
+# and exits silently. Full cleanup (shim included) is `agent disconnect`'s job;
+# `agent connect`'s sweep clears legacy shim-less orphans.
 
 # Runs still in flight (or stuck awaiting the user) — work the watchdog must keep
 # streaming. Everything else (completed / errored-and-done / cancelled) is terminal.
@@ -230,15 +233,14 @@ def _teardown(origin: dict) -> None:
     torn down here (via _tick_unauthed) so it can't poll forever.
 
     Deliberately does NOT delete the generated shim (sr_poll_<slug>.py) or its state.
-    A gateway-armed cron lives in the gateway's IN-MEMORY registry and gets
-    RE-PERSISTED to jobs.json after any host-side edit (a no_agent script can't call
-    the gateway's agent-only cronjob:delete). If we deleted the shim, a re-added cron
-    would fire "Script not found" into chat every minute — the exact spam bug. Keeping
-    the shim means a lingering / re-added cron just runs it and exits SILENTLY (the
-    de-dup state below already marks everything seen). The cron is fully cleared by
-    `agent disconnect` (which also stops the bridge) or the next time the gateway
-    reloads jobs.json without it (e.g. a gateway restart after a host removal stuck);
-    `agent connect`'s orphan-sweep also drops any shim-less leftover from older builds.
+    jobs.json is the durable store (Hermes re-reads it each tick — a host removal
+    sticks), but this removal is UNLOCKED, so a concurrent gateway save between our
+    read and replace could carry the entry through. If we deleted the shim, that
+    surviving cron would fire "Script not found" into chat every minute — the exact
+    spam bug. Keeping the shim means a lingering cron just runs it and exits SILENTLY
+    (the de-dup state below already marks everything seen). The cron is fully cleared
+    by `agent disconnect` (which also stops the bridge); `agent connect`'s orphan-sweep
+    also drops any shim-less leftover from older builds.
 
     Scoped (per-chat) only — never the shared account-wide watchdog."""
     _remove_cron_entry(f"sr-stream-{_origin_slug(origin)}")

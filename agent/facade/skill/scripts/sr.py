@@ -49,7 +49,13 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
+
+try:
+    import fcntl  # POSIX advisory file lock. The Hermes host is always POSIX;
+except ImportError:  # None elsewhere (e.g. a Windows test import) → lock-free write.
+    fcntl = None
 
 # The version of the agent package THIS script copy shipped with. The runtime
 # executes its own installed COPY of this file (HERMES_HOME/scripts), which a
@@ -473,6 +479,156 @@ def _write_poll_shim(scripts_dir: Path, name: str, origin: dict) -> str | None:
     return None
 
 
+# ── deterministic watchdog arming ─────────────────────────────────────────────
+# The watchdog cron USED to be armed by the chat AI acting on a `cronjob: create`
+# directive this skill printed. That was the recurring failure: a non-deterministic
+# LLM armed it inconsistently, so run progress + the 🎉 completion + the "✓ signed
+# in" announce (all ride this one cron) silently never posted. But this skill runs
+# as a FOREGROUND chat subprocess, so it knows the chat origin (_origin_from_env)
+# AND can reach the runtime's cron store — it arms the job ITSELF by writing the row
+# straight into <HERMES_HOME>/cron/jobs.json, the exact shape the runtime's own
+# cronjob tool produces. Verified against the live Hermes engine: the scheduler
+# re-reads jobs.json every tick (no in-memory registry), a hand-written no_agent +
+# schedule row is picked up and fires, and deliver="origin" with a baked origin
+# routes each tick's output to the arming chat. No LLM in the arming loop.
+
+
+def _cron_jobs_file() -> Path:
+    """<HERMES_HOME>/cron/jobs.json — the runtime's durable cron store, a sibling of
+    the scripts dir where this skill's watchdog + shims live."""
+    return _scripts_dir().parent / "cron" / "jobs.json"
+
+
+def _cron_now() -> str:
+    """An ISO timestamp for cron bookkeeping. Used as ``next_run_at`` so the job is
+    due on the very next tick — NOT a time in the past, which the runtime would
+    fast-forward (skip) once it falls outside the catch-up grace window."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _build_stream_cron_job(script_name: str, job_name: str, origin: dict | None,
+                           schedule: dict) -> dict:
+    """A well-formed Hermes cron-job row (mirrors cron.jobs.create_job's shape).
+    ``deliver="origin"`` + the baked ``origin`` routes each tick's output to the
+    chat that armed it (resolved at fire time from ``job["origin"]``); no origin →
+    ``"local"`` (the caller only writes directly when an origin is present, so this
+    branch stays correct). ``next_run_at`` ≈ now so it's due within the scheduler's
+    grace window and fires on the very next tick; ``repeat.times=None`` = forever,
+    so mark_job_run never auto-removes it."""
+    now = _cron_now()
+    return {
+        "id": uuid.uuid4().hex[:12],   # REQUIRED — subscripted in Hermes' due-scan
+        "name": job_name,
+        "prompt": "",
+        "skills": [],
+        "skill": None,
+        "model": None,
+        "provider": None,
+        "base_url": None,
+        "script": script_name,
+        "no_agent": True,              # the script IS the job — no LLM, no tokens
+        "context_from": None,
+        "schedule": schedule,
+        "schedule_display": schedule.get("display", ""),
+        "repeat": {"times": None, "completed": 0},
+        "enabled": True,
+        "state": "scheduled",
+        "paused_at": None,
+        "paused_reason": None,
+        "created_at": now,
+        "next_run_at": now,
+        "last_run_at": None,
+        "last_status": None,
+        "last_error": None,
+        "last_delivery_error": None,
+        "deliver": "origin" if origin else "local",
+        "origin": origin,
+        "enabled_toolsets": None,
+        "workdir": None,
+    }
+
+
+def _arm_stream_cron(script_name: str, job_name: str, origin: dict | None,
+                     schedule: dict) -> bool:
+    """Write the watchdog cron row into <HERMES_HOME>/cron/jobs.json deterministically
+    — no dependence on the chat AI issuing cronjob:create. Idempotent BY NAME: a
+    RUNNABLE job of this name is left untouched, and a disabled/paused one is revived
+    in place rather than duplicated (create has no dedupe, so a blind re-append would
+    accumulate duplicates → the runtime's later name lookups raise
+    AmbiguousJobReference). Serialized against the gateway via the
+    same advisory flock (<cron>/.jobs.lock) and written atomically (temp + replace),
+    mirroring cron.jobs. Returns True when the job is present after the call (added
+    or already there); False on any failure, so the caller can fall back to the AI
+    directive."""
+    jobs_file = _cron_jobs_file()
+    cron_dir = jobs_file.parent
+    lock_fd = None
+    try:
+        cron_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            lock_fd = open(cron_dir / ".jobs.lock", "a+", encoding="utf-8")
+        except OSError:
+            lock_fd = None  # best-effort; proceed without the cross-process lock
+        if lock_fd is not None and fcntl is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            except OSError:
+                pass
+        try:
+            data = json.loads(jobs_file.read_text("utf-8"))
+        except FileNotFoundError:
+            data = {"jobs": []}
+        except (OSError, ValueError):
+            return False
+        if not isinstance(data, dict) or not isinstance(data.get("jobs"), list):
+            return False
+        existing = next((j for j in data["jobs"]
+                         if isinstance(j, dict) and j.get("name") == job_name), None)
+        if existing is not None:
+            # Present — but "present" only counts as ARMED if it can actually run. A
+            # disabled/paused row is skipped by the runtime's due-scan before any
+            # next-run recovery, so treating it as armed would leave the chat silent
+            # with no way back (a re-arm would keep finding it). Revive it in place
+            # instead of appending a duplicate (duplicates break name lookups).
+            if existing.get("enabled", True) and existing.get("state") != "paused":
+                return True  # genuinely armed — idempotent no-op
+            existing.update({"enabled": True, "state": "scheduled", "paused_at": None,
+                             "paused_reason": None,
+                             "next_run_at": _cron_now()})  # due now, inside the grace window
+        else:
+            data["jobs"].append(_build_stream_cron_job(script_name, job_name, origin, schedule))
+        tmp = jobs_file.with_suffix(".json.sr-tmp")
+        tmp.write_text(json.dumps(data), "utf-8")
+        try:
+            os.chmod(tmp, 0o600)  # the cron store is owner-only; os.replace carries
+        except OSError:           # the temp file's mode onto jobs.json
+            pass
+        os.replace(tmp, jobs_file)  # atomic; Hermes re-reads jobs.json each tick
+        return True
+    except OSError:
+        return False
+    finally:
+        if lock_fd is not None:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            lock_fd.close()
+
+
+# INTERVAL, deliberately — not a cron expression. Both persist identically (the
+# runtime stores whatever we write and re-reads it each tick), but a cron-expr
+# schedule needs the runtime's OPTIONAL croniter dependency: without it, next-run
+# computation returns None, so the job would fire ONCE and then go permanently
+# silent — the exact failure this fix exists to eliminate, in an unrecoverable form
+# (a re-arm is idempotent, so it would find the broken row and leave it). An
+# interval schedule never touches croniter, so it ticks forever either way.
+_STREAM_SCHEDULE = {"kind": "interval", "minutes": 1, "display": "every 1m"}
+_UPDATE_NOTICE_SCHEDULE = {"kind": "interval", "minutes": 1440, "display": "every 1440m"}
+
+
 # ── commands ────────────────────────────────────────────────────────────────
 
 def cmd_login(args) -> int:
@@ -491,7 +647,7 @@ def cmd_login(args) -> int:
     # Arm THIS chat's watchdog so the moment the browser approval is captured the
     # bridge's "✓ signed in" lands here on its own — no need to poll for completion.
     arm_lines, _payload, arm_rc = _prepare_stream_arm()
-    if arm_rc == 0:
+    if arm_rc == 0 and arm_lines:
         lines += _agent_directive_block(arm_lines)
     return _emit(body, args.json, lines)
 
@@ -733,7 +889,7 @@ def cmd_research(args) -> int:
                 # a fresh flow, which would void the link they're about to approve).
                 _post("/login/remote/pending", stash)
                 lines = ["You're almost signed in — finish in your browser and I'll pick this up."]
-                if arm_rc == 0:
+                if arm_rc == 0 and arm_lines:
                     lines += _agent_directive_block(arm_lines)
                 return _emit(body, args.json, lines, _fail_code(code))
             # No flow yet: start one carrying the topic, hand back the click-to-approve
@@ -745,7 +901,7 @@ def cmd_research(args) -> int:
                     "You're not signed in yet. Log in here and I'll pick this up:",
                     f"  {link}",
                 ]
-                if arm_rc == 0:
+                if arm_rc == 0 and arm_lines:
                     lines += _agent_directive_block(arm_lines)
                 return _emit({**body, "verifyUrl": link}, args.json, lines, _fail_code(code))
             return _emit(body, args.json, [
@@ -778,11 +934,12 @@ def cmd_research(args) -> int:
         "I’ll post here when it’s done — and if it ever needs you. Ask how it’s going anytime.",
     ]
     # Auto-arm THIS chat's run-scoped streaming watchdog so progress posts without
-    # the user asking — emit the cronjob directive inline (the gateway dedups by the
-    # fixed job name; the watchdog self-removes when the run finishes). On a prep
+    # the user asking — _prepare_stream_arm writes the cron row into jobs.json itself
+    # (idempotent), so nothing needs the AI here; arm_lines is empty on success and
+    # only carries a fallback directive if the direct write couldn't run. On a prep
     # error, skip silently: the run is fine and `status` still works.
     arm_lines, _payload, arm_rc = _prepare_stream_arm()
-    if arm_rc == 0:
+    if arm_rc == 0 and arm_lines:
         lines += _agent_directive_block(arm_lines)
     return _emit(body, args.json, lines)
 
@@ -1194,68 +1351,85 @@ def cmd_install(args) -> int:
     ])
 
 
-def _prepare_stream_arm() -> tuple[list[str], dict, int]:
-    """Prepare THIS chat's run-scoped streaming watchdog and return
-    ``(lines, payload, rc)`` — ``lines`` are ASSISTANT-ONLY directive lines (the
-    caller wraps them via ``_agent_directive_block`` so the ``cronjob: create …``
-    syntax never reaches the user) that arm it. Writes a shim that bakes in this
-    chat's origin (the cron can't take args or read the session env). The watchdog
-    PERSISTS once armed (removed only by `agent disconnect`), so re-emitting on every
-    research start is safe — the gateway dedups by the fixed job name, so a re-issue
-    when it's already armed is a no-op. No chat origin (older gateway) → the shared
-    account-wide watchdog. A shim-write error → a single ✗ line + rc=1 (the caller
-    drops it on the auto-arm paths)."""
-    origin = _origin_from_env()
-    if origin is None:
-        payload = {"script": "sr_attention_poll.py", "name": "sr-stream",
-                   "schedule": "every 1m", "scoped": False}
-        # ASSISTANT-ONLY directive lines — the caller wraps them under the
-        # do-not-relay marker, so the user never sees this cronjob syntax.
-        return ([
-            "Arm this chat's live-progress watchdog NOW with your cronjob tool so run "
-            "progress and the 🎉 completion post here on their own:",
-            '  cronjob: create no_agent=true schedule="every 1m" '
-            'script="sr_attention_poll.py" name="sr-stream"',
-            "Create it now. Skip ONLY if your cronjob tool already lists a job named "
-            "sr-stream (then leave that one — do not duplicate) or if your runtime has "
-            "no cronjob tool. Do NOT skip just because no run looks active yet — a "
-            "just-started run isn't visible for a few seconds; once armed the watchdog "
-            "persists and streams every run until `agent disconnect`.",
-            "Arm the once-daily skill-update notice the same way (skip only if a job "
-            "named sr-update-notice is already listed):",
-            '  cronjob: create no_agent=true schedule="every 1d" '
-            'script="sr_update_notice.py" name="sr-update-notice"',
-        ], payload, 0)
-    slug = _origin_slug(origin)
-    script_name = f"sr_poll_{slug}.py"
-    job_name = f"sr-stream-{slug}"
-    err = _write_poll_shim(_scripts_dir(), script_name, origin)
-    if err:
-        return ([f"✗ {err}"], {"error": err}, 1)
-    payload = {"script": script_name, "name": job_name, "schedule": "every 1m",
-               "scoped": True, "origin": origin}
-    return ([
+def _stream_arm_directive_lines(script_name: str, job_name: str) -> list[str]:
+    """ASSISTANT-ONLY fallback directive: ask the runtime's cronjob tool to arm the
+    watchdog. Only used when the deterministic jobs.json write can't run (legacy
+    no-origin gateway) or fails (unusual layout / permissions) — the caller wraps
+    these under the do-not-relay marker so the user never sees the cronjob syntax."""
+    return [
         "Arm this chat's live-progress watchdog NOW with your cronjob tool so run "
-        "progress and the 🎉 completion post to this chat on their own:",
+        "progress and the 🎉 completion post here on their own:",
         f'  cronjob: create no_agent=true schedule="every 1m" '
         f'script="{script_name}" name="{job_name}"',
         "Create it now. Skip ONLY if your cronjob tool already lists a job with this "
         "exact name (then leave that one — do not duplicate) or if your runtime has "
         "no cronjob tool. Do NOT skip just because no run looks active yet — a "
         "just-started run isn't visible for a few seconds; once armed the watchdog "
-        "persists and streams every run for this chat until `agent disconnect`.",
+        "persists and streams every run until `agent disconnect`.",
         "Arm the once-daily skill-update notice the same way (skip only if a job "
         "named sr-update-notice is already listed):",
         '  cronjob: create no_agent=true schedule="every 1d" '
         'script="sr_update_notice.py" name="sr-update-notice"',
-    ], payload, 0)
+    ]
+
+
+def _prepare_stream_arm() -> tuple[list[str], dict, int]:
+    """Arm THIS chat's run-scoped streaming watchdog and return ``(lines, payload,
+    rc)``. On the modern path (a chat origin is known) this WRITES the cron job row
+    straight into jobs.json (``_arm_stream_cron`` — idempotent, deterministic) and
+    returns EMPTY ``lines`` (nothing for the AI to do). ``lines`` are non-empty only
+    on the fallback paths: a legacy no-origin gateway, or a failed direct write —
+    then they're ASSISTANT-ONLY cronjob directives the caller wraps via
+    ``_agent_directive_block``. Writes a shim that bakes in this chat's origin (the
+    cron can't take args or read the session env). The watchdog PERSISTS once armed
+    (removed only by `agent disconnect`); arming is idempotent, so re-running on every
+    research start / login is a safe no-op. A shim-write error → a single ✗ line +
+    rc=1 (the caller drops it on the auto-arm paths)."""
+    origin = _origin_from_env()
+    if origin is None:
+        # Legacy gateway with no chat origin: can't write a delivering job (an
+        # origin-less job drops / mis-routes), so fall back to the AI cronjob
+        # directive for the shared account-wide watchdog.
+        payload = {"script": "sr_attention_poll.py", "name": "sr-stream",
+                   "schedule": _STREAM_SCHEDULE["display"], "scoped": False,
+                   "armed": False}
+        return (_stream_arm_directive_lines("sr_attention_poll.py", "sr-stream"),
+                payload, 0)
+    slug = _origin_slug(origin)
+    script_name = f"sr_poll_{slug}.py"
+    job_name = f"sr-stream-{slug}"
+    err = _write_poll_shim(_scripts_dir(), script_name, origin)
+    if err:
+        return ([f"✗ {err}"], {"error": err}, 1)
+    # Deterministic arm: write the cron rows straight into jobs.json. This skill runs
+    # in-chat so it has the origin + reach to the cron store — no dependence on the AI
+    # calling cronjob:create (the recurring miss). Idempotent by name.
+    armed = _arm_stream_cron(script_name, job_name, origin, _STREAM_SCHEDULE)
+    # The once-daily update notice rides the same deterministic arm (best-effort: its
+    # result doesn't gate the fallback below — only the watchdog's does, since a missed
+    # update NOTICE is cosmetic while a missed watchdog is the bug we're fixing).
+    _arm_stream_cron("sr_update_notice.py", "sr-update-notice", origin,
+                     _UPDATE_NOTICE_SCHEDULE)
+    payload = {"script": script_name, "name": job_name,
+               "schedule": _STREAM_SCHEDULE["display"],
+               "scoped": True, "origin": origin, "armed": armed}
+    if armed:
+        return ([], payload, 0)  # armed silently — nothing for the AI to do
+    # Couldn't write jobs.json (unusual layout / permissions) → fall back to asking
+    # the AI to arm via its cronjob tool (the legacy, less-reliable path).
+    return (_stream_arm_directive_lines(script_name, job_name), payload, 0)
 
 
 def cmd_arm_stream(args) -> int:
-    """Prepare THIS chat's streaming watchdog and tell the agent how to arm it.
-    (Research auto-emits the same directive; this is the explicit/standalone form.)"""
+    """Arm THIS chat's streaming watchdog. Normally the skill arms it itself (a direct
+    jobs.json write); research / login auto-arm the same way. This is the explicit
+    standalone form."""
     lines, payload, rc = _prepare_stream_arm()
-    if rc == 0:
+    if rc == 0 and not lines:
+        # Armed deterministically (direct jobs.json write) — nothing for the AI to do.
+        lines = ["✓ Live updates are on for this chat — run progress and the "
+                 "completion will post here on their own."]
+    elif rc == 0:
         lines = _agent_directive_block(lines)
     return _emit(payload, args.json, lines, rc)
 
@@ -1271,15 +1445,14 @@ _STREAM_STALE_SEC = 180
 
 def _stream_health_lines(runs: list) -> list[str]:
     """Deterministic watchdog self-heal. The streaming watchdog — the thing that
-    posts '⚠ needs you' / '🎉 done' WITHOUT being asked — is armed by the chat
-    AI acting on a directive printed at research-fire; if that one message is
-    missed (or the cron job was removed), the chat goes silent and a blocked
-    run just sits until the user happens to ask for status (live 2026-07-02:
-    'ChatGPT stopped responding' surfaced only on a manual ask, ~50 min late).
-    Every armed tick rewrites the watchdog's state file, so a missing/stale
-    file while an agent-fired run is live == not ticking → re-emit the arming
-    directive so the AI re-arms right from this status/updates reply. Silent
-    on any doubt — never nag a healthy chat.
+    posts '⚠ needs you' / '🎉 done' WITHOUT being asked — is armed by the skill
+    writing the cron row into jobs.json (see _prepare_stream_arm); if that job is
+    somehow removed out-of-band, the chat goes silent and a blocked run just sits
+    until the user happens to ask for status (live 2026-07-02: 'ChatGPT stopped
+    responding' surfaced only on a manual ask, ~50 min late). Every armed tick
+    rewrites the watchdog's state file, so a missing/stale file while an agent-fired
+    run is live == not ticking → re-run the (idempotent) arm right from this
+    status/updates reply. Silent on any doubt — never nag a healthy chat.
 
     Review catch: only counts runs THIS chat's watchdog would actually stream
     (chatOrigin matches this chat — the same platform+chat scope the per-chat
@@ -1309,8 +1482,10 @@ def _stream_health_lines(runs: list) -> list[str]:
         state = _scripts_dir() / name
         if state.exists() and (time.time() - state.stat().st_mtime) < _STREAM_STALE_SEC:
             return []  # ticking — healthy, say nothing
+        # Re-arm deterministically (idempotent — a no-op if the cron is already
+        # present). Only the fallback paths return directive lines to relay.
         arm_lines, _payload, rc = _prepare_stream_arm()
-        return _agent_directive_block(arm_lines) if rc == 0 else []
+        return _agent_directive_block(arm_lines) if (rc == 0 and arm_lines) else []
     except Exception:
         return []
 

@@ -6,6 +6,7 @@ proving the chat slash-command path works over the loopback HTTP contract.
 """
 
 import importlib.util
+import os
 import re
 import threading
 import time
@@ -552,15 +553,19 @@ def test_status_account_prompts_available_skill_update(bridge_port, monkeypatch,
     assert "backend" not in out.lower()  # no backend-update nag from the runtime
 
 
-def test_research_then_status(bridge_port, capsys):
+def test_research_then_status(bridge_port, capsys, monkeypatch):
+    # No chat origin in env → the account-wide FALLBACK arm path: the client can't
+    # write a delivering job (no origin), so it emits the AI cronjob directive under
+    # the do-not-relay marker — the human "Started" line ABOVE it, the cronjob syntax
+    # BELOW it (AI arms silently, user sees a clean message). (The primary in-chat
+    # path — a direct jobs.json write — is covered by the arm-stream tests.)
+    for v in ("HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID", "HERMES_SESSION_THREAD_ID"):
+        monkeypatch.delenv(v, raising=False)
     assert sr.main(["research", "Tesla 2025"]) == 0
     out = capsys.readouterr().out
     assert "Started" in out and "Tesla 2025" in out
     assert "My PC" in out          # the device is shown by NAME, not its id
     assert "agent-" not in out      # no raw run-id leaks into chat (I4)
-    # The streaming cronjob directive is hidden under the do-not-relay marker:
-    # the human "Started" line is ABOVE it, the cronjob syntax BELOW it (so the
-    # AI arms silently and the user sees a clean message — no clutter).
     assert sr._AGENT_ONLY_MARKER in out
     assert out.index("Started") < out.index(sr._AGENT_ONLY_MARKER)
     assert "cronjob: create" in out
@@ -865,44 +870,177 @@ def test_research_without_origin_env_omits_chat_origin(bridge_port, monkeypatch,
 
 def test_arm_stream_scoped_writes_shim(tmp_path, monkeypatch, capsys):
     # With a chat origin in the env, arm-stream writes a per-chat shim that bakes
-    # the origin in + delegates to the shared watchdog, and prints the exact
-    # script + job name to arm.
-    (tmp_path / "sr_attention_poll.py").write_text("# watchdog\n", encoding="utf-8")
-    monkeypatch.setattr(sr, "_scripts_dir", lambda: tmp_path)
+    # the origin in + delegates to the shared watchdog, and returns the scoped
+    # script + job name (+ armed=True: the cron row was written into jobs.json).
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "sr_attention_poll.py").write_text("# watchdog\n", encoding="utf-8")
+    monkeypatch.setattr(sr, "_scripts_dir", lambda: scripts)
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "whatsapp")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "4477@c.us")
     monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
     import json
     assert sr.main(["--json", "arm-stream"]) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["scoped"] is True
+    assert payload["scoped"] is True and payload["armed"] is True
     assert payload["script"].startswith("sr_poll_whatsapp_") and payload["script"].endswith(".py")
     assert payload["name"].startswith("sr-stream-whatsapp_")
     assert payload["origin"] == {"platform": "whatsapp", "chat_id": "4477@c.us"}
     # the shim landed beside the watchdog and imports it with the origin baked in
-    shim = (tmp_path / payload["script"]).read_text(encoding="utf-8")
+    shim = (scripts / payload["script"]).read_text(encoding="utf-8")
     assert "import sr_attention_poll" in shim
     assert "'platform': 'whatsapp'" in shim and "'chat_id': '4477@c.us'" in shim
     assert "main(origin=ORIGIN)" in shim
 
 
-def test_prepare_stream_arm_scoped_is_imperative_and_persistent(tmp_path, monkeypatch):
-    # ROUND 6 fix: the scoped directive (what a real chat uses) must be imperative
-    # and must NOT let the AI skip arming when no run looks active yet — the live bug
-    # was the AI answering "no active runs to monitor" and never creating the cron,
-    # so a just-fired run (not in /updates for a few seconds) finished unwatched with
-    # no 🎉. Also describe the persistent watchdog (removed only on disconnect).
-    (tmp_path / "sr_attention_poll.py").write_text("# watchdog\n", encoding="utf-8")
-    monkeypatch.setattr(sr, "_scripts_dir", lambda: tmp_path)
+def test_prepare_stream_arm_scoped_writes_cron_job_deterministically(tmp_path, monkeypatch):
+    # #944 fix: the scoped arm (what a real chat uses) now writes the watchdog cron
+    # row straight into <HERMES_HOME>/cron/jobs.json — NO dependence on the AI calling
+    # cronjob:create (the recurring miss where a just-fired run, not yet in /updates,
+    # finished unwatched with no 🎉). It returns EMPTY directive lines (nothing for the
+    # AI) and a well-formed no_agent cron-expr job delivering to the arming chat.
+    import json
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "sr_attention_poll.py").write_text("# watchdog\n", encoding="utf-8")
+    monkeypatch.setattr(sr, "_scripts_dir", lambda: scripts)
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "111")
     monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
     lines, payload, rc = sr._prepare_stream_arm()
-    assert rc == 0 and payload["scoped"] is True
+    assert rc == 0 and payload["scoped"] is True and payload["armed"] is True
+    assert lines == []  # armed silently — nothing for the AI to relay or act on
+    jobs = json.loads((tmp_path / "cron" / "jobs.json").read_text("utf-8"))["jobs"]
+    stream = [j for j in jobs if j["name"] == payload["name"]]
+    assert len(stream) == 1
+    job = stream[0]
+    assert job["no_agent"] is True and job["script"] == payload["script"]
+    # INTERVAL, not a cron expr: a cron-expr schedule needs the runtime's OPTIONAL
+    # croniter dep — without it next-run computation returns None, so the watchdog
+    # would fire once then go permanently silent (unrecoverable, since re-arm is
+    # idempotent). Interval never touches croniter.
+    assert job["schedule"] == {"kind": "interval", "minutes": 1, "display": "every 1m"}
+    assert job["deliver"] == "origin"
+    assert job["origin"] == {"platform": "telegram", "chat_id": "111"}
+    assert job["enabled"] is True and job["repeat"] == {"times": None, "completed": 0}
+    assert isinstance(job["id"], str) and job["id"]  # REQUIRED — subscripted in the due-scan
+    # the reported schedule must not drift from the one actually written
+    assert payload["schedule"] == job["schedule"]["display"] == "every 1m"
+    # the once-daily update notice rides the same deterministic arm
+    assert any(j["name"] == "sr-update-notice" and j["no_agent"] for j in jobs)
+
+
+def test_arm_stream_cron_idempotent_by_name(tmp_path, monkeypatch):
+    # create has NO dedupe, so a blind re-append on every research/login would
+    # accumulate duplicate jobs → the runtime's later name lookups raise
+    # AmbiguousJobReference. Re-arming the same name must be a no-op.
+    import json
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    monkeypatch.setattr(sr, "_scripts_dir", lambda: scripts)
+    origin = {"platform": "telegram", "chat_id": "111"}
+    sched = {"kind": "cron", "expr": "* * * * *", "display": "* * * * *"}
+    assert sr._arm_stream_cron("sr_poll_x.py", "sr-stream-x", origin, sched) is True
+    assert sr._arm_stream_cron("sr_poll_x.py", "sr-stream-x", origin, sched) is True
+    jobs = json.loads((tmp_path / "cron" / "jobs.json").read_text("utf-8"))["jobs"]
+    assert sum(1 for j in jobs if j["name"] == "sr-stream-x") == 1
+
+
+def test_arm_stream_cron_revives_a_paused_watchdog(tmp_path, monkeypatch):
+    # A disabled/paused job of the same name is NOT "already armed" — the runtime's
+    # due-scan skips disabled jobs before any next-run recovery, so treating it as
+    # armed would leave the chat silent with no way back (every re-arm would keep
+    # finding it). Revive it in place; never duplicate it.
+    import json
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (tmp_path / "cron").mkdir()
+    (tmp_path / "cron" / "jobs.json").write_text(json.dumps({"jobs": [{
+        "id": "old1", "name": "sr-stream-x", "script": "sr_poll_x.py", "no_agent": True,
+        "enabled": False, "state": "paused", "paused_at": "2026-01-01T00:00:00+00:00",
+        "paused_reason": "manual", "next_run_at": None,
+    }]}), encoding="utf-8")
+    monkeypatch.setattr(sr, "_scripts_dir", lambda: scripts)
+    origin = {"platform": "telegram", "chat_id": "111"}
+    assert sr._arm_stream_cron("sr_poll_x.py", "sr-stream-x", origin,
+                               sr._STREAM_SCHEDULE) is True
+    jobs = json.loads((tmp_path / "cron" / "jobs.json").read_text("utf-8"))["jobs"]
+    assert len(jobs) == 1                      # revived in place, not duplicated
+    job = jobs[0]
+    assert job["id"] == "old1"                 # same row
+    assert job["enabled"] is True and job["state"] == "scheduled"
+    assert job["paused_at"] is None and job["paused_reason"] is None
+    assert job["next_run_at"]                  # due now — not left None/stale
+
+
+def test_arm_stream_cron_keeps_jobs_file_owner_only(tmp_path, monkeypatch):
+    # The runtime keeps its cron store owner-only (it holds every job's chat routing
+    # metadata). os.replace carries the TEMP file's mode onto jobs.json, so the temp
+    # must be chmod 0600 before the swap or the write silently widens permissions.
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    monkeypatch.setattr(sr, "_scripts_dir", lambda: scripts)
+    assert sr._arm_stream_cron("sr_poll_x.py", "sr-stream-x",
+                               {"platform": "telegram", "chat_id": "111"},
+                               sr._STREAM_SCHEDULE) is True
+    jobs_file = tmp_path / "cron" / "jobs.json"
+    assert jobs_file.is_file()
+    if os.name == "posix":  # Windows doesn't model POSIX mode bits
+        assert jobs_file.stat().st_mode & 0o077 == 0  # no group/other access
+
+
+def test_arm_stream_cron_preserves_existing_jobs(tmp_path, monkeypatch):
+    # A host-side write must carry every OTHER job through untouched (mirrors the
+    # gateway's own load→append→save; never clobbers a user's crons).
+    import json
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (tmp_path / "cron").mkdir()
+    (tmp_path / "cron" / "jobs.json").write_text(
+        json.dumps({"jobs": [{"id": "keep1", "name": "morning-briefing"}], "updated_at": "x"}),
+        encoding="utf-8")
+    monkeypatch.setattr(sr, "_scripts_dir", lambda: scripts)
+    origin = {"platform": "telegram", "chat_id": "111"}
+    sched = {"kind": "cron", "expr": "* * * * *", "display": "* * * * *"}
+    assert sr._arm_stream_cron("sr_poll_x.py", "sr-stream-x", origin, sched) is True
+    data = json.loads((tmp_path / "cron" / "jobs.json").read_text("utf-8"))
+    names = {j["name"] for j in data["jobs"]}
+    assert names == {"morning-briefing", "sr-stream-x"}
+    assert data["updated_at"] == "x"  # untouched top-level keys preserved
+
+
+def test_prepare_stream_arm_falls_back_to_directive_when_write_fails(tmp_path, monkeypatch):
+    # If the direct jobs.json write can't run (odd layout / permissions), arming
+    # falls back to the AI cronjob directive so a run still gets streamed.
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "sr_attention_poll.py").write_text("# watchdog\n", encoding="utf-8")
+    monkeypatch.setattr(sr, "_scripts_dir", lambda: scripts)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "111")
+    monkeypatch.setattr(sr, "_arm_stream_cron", lambda *a, **k: False)
+    lines, payload, rc = sr._prepare_stream_arm()
+    assert rc == 0 and payload["armed"] is False
     blob = "\n".join(lines)
     assert "cronjob: create" in blob and payload["name"] in blob
     assert "no run looks active" in blob      # anti-skip: arm even when idle
     assert "agent disconnect" in blob         # persistent — no self-teardown
+
+
+def test_arm_stream_command_confirms_when_armed_silently(tmp_path, monkeypatch, capsys):
+    # The explicit `arm-stream` command, when it arms via the direct write, gives the
+    # user a friendly confirmation and never leaks cronjob syntax / the do-not-relay
+    # marker.
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "sr_attention_poll.py").write_text("# watchdog\n", encoding="utf-8")
+    monkeypatch.setattr(sr, "_scripts_dir", lambda: scripts)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "111")
+    assert sr.main(["arm-stream"]) == 0
+    out = capsys.readouterr().out
+    assert "Live updates are on" in out
+    assert "cronjob: create" not in out and sr._AGENT_ONLY_MARKER not in out
 
 
 def test_arm_stream_slug_matches_watchdog(tmp_path):

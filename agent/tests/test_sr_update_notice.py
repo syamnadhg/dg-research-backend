@@ -112,10 +112,14 @@ def test_bridge_recovery_resets_strikes(tmp_path, monkeypatch, capsys):
     capsys.readouterr()
 
 
-def test_arm_directive_ships_with_the_stream_arm():
-    # The daily job arms via the same do-not-relay block as the streaming
-    # watchdog — both branches of _prepare_stream_arm carry its directive.
+def test_update_notice_armed_alongside_the_stream_watchdog():
+    # The daily update-notice job is armed together with the streaming watchdog:
+    # the deterministic path writes it straight into jobs.json (_arm_stream_cron),
+    # and the fallback directive still carries its cronjob line.
     sr_path = Path(__file__).resolve().parents[1] / "facade" / "skill" / "scripts" / "sr.py"
     src = sr_path.read_text(encoding="utf-8")
-    assert src.count('script="sr_update_notice.py" name="sr-update-notice"') == 2
+    # deterministic arm: a direct jobs.json write for the update-notice job
+    assert '"sr_update_notice.py", "sr-update-notice"' in src
+    # fallback directive (legacy / write-failed path) still arms it via the AI's tool
+    assert 'script="sr_update_notice.py" name="sr-update-notice"' in src
     assert 'schedule="every 1d"' in src
