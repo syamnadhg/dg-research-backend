@@ -868,6 +868,46 @@ def test_research_without_origin_env_omits_chat_origin(bridge_port, monkeypatch,
     assert "chatOrigin" not in FakeFS.researches[rid]
 
 
+def test_podcast_too_large_sends_the_link_not_a_media_line(monkeypatch, capsys):
+    # An oversized podcast is REFUSED by the chat platform at send time and the runtime
+    # then degrades to printing the path as text (live 2026-07-26: an 89 MB show came
+    # back as a dead file path). When the bridge says it can't be sent, we must hand
+    # over the permanent link and emit NO MEDIA: line — a MEDIA: line here would
+    # reproduce the exact failure.
+    monkeypatch.setattr(sr, "_fetch_runs",
+                        lambda **kw: (200, {}, [{"runId": "agent-1", "title": "Long Show",
+                                                 "links": [{"kind": "audio_file"}]}]))
+    monkeypatch.setattr(sr, "_get", lambda path, timeout=None: (200, {
+        "ready": True, "runId": "agent-1", "title": "Long Show", "tooLarge": True,
+        "sizeBytes": 94 * 1024 * 1024, "shareUrl": "https://superresearch.io/shared/doc/pod1",
+    }))
+    assert sr.main(["podcast"]) == 0
+    out = capsys.readouterr().out
+    assert "MEDIA:" not in out                       # the whole point
+    assert "https://superresearch.io/shared/doc/pod1" in out
+    assert "Long Show" in out and "too long to send" in out
+    assert ".super-agent" not in out                 # no local path leaks into chat
+
+
+def test_podcast_passes_the_chat_platform_so_the_ceiling_is_channel_aware(monkeypatch, capsys):
+    # Upload ceilings belong to the PLATFORM (Telegram 50 MB vs WhatsApp ~16 MB), so
+    # the bridge has to be told where this podcast is headed.
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "whatsapp")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "4477@c.us")
+    seen = {}
+    monkeypatch.setattr(sr, "_fetch_runs",
+                        lambda **kw: (200, {}, [{"runId": "agent-1", "title": "S",
+                                                 "links": [{"kind": "audio_file"}]}]))
+
+    def fake_get(path, timeout=None):
+        seen["path"] = path
+        return (200, {"ready": True, "title": "S", "localPath": "/tmp/S.mp3"})
+
+    monkeypatch.setattr(sr, "_get", fake_get)
+    assert sr.main(["podcast"]) == 0
+    assert "platform=whatsapp" in seen["path"]
+
+
 def test_arm_stream_scoped_writes_shim(tmp_path, monkeypatch, capsys):
     # With a chat origin in the env, arm-stream writes a per-chat shim that bakes
     # the origin in + delegates to the shared watchdog, and returns the scoped

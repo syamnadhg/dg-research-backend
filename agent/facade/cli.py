@@ -1341,6 +1341,15 @@ def cmd_podcast(args: argparse.Namespace) -> int:
         print(f"{_NO} {_err(res)}")
         return 1
     out = res[1]
+    if out.get("tooLarge"):
+        # Past every chat platform's upload ceiling even re-encoded — there is no
+        # local file to print, so show the permanent link instead of "→ None".
+        print(f"{_OK} Podcast “{out.get('title')}” is too large to send as a file "
+              f"({out.get('sizeBytes', 0):,} bytes).")
+        share = out.get("shareUrl")
+        print(f"     Listen here: {share}" if share
+              else "     Ask for the run's links to get the podcast link.")
+        return 0
     print(f"{_OK} Podcast “{out.get('title')}” → {out.get('localPath')}")
     print(f"     {out.get('sizeBytes', 0):,} bytes · {out.get('mime')} · send as a native audio message")
     return 0

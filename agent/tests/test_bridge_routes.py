@@ -5,9 +5,11 @@ and skill call instead of refreshing the token themselves.
 """
 
 import os
+import subprocess
 import threading
 import time
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -234,6 +236,205 @@ def test_podcast_route_downloads_and_hides_token(live, monkeypatch, tmp_path):
     assert "audio_overview.m4a" in captured["url"]
     # the long-lived Storage download token NEVER leaves the host
     assert "token=" not in r.text and "audioUrl" not in out
+
+
+def _oversized_doc():
+    return {
+        "id": "agent-big", "title": "Long Show", "status": "completed",
+        "links": {"audio_file": {"url": _M4A, "label": "Podcast Audio (Storage)", "phase": 3}},
+    }
+
+
+def test_podcast_over_platform_ceiling_is_shrunk_for_delivery(live, monkeypatch, tmp_path):
+    # A file past the platform's upload ceiling is REFUSED at send time and the
+    # runtime silently degrades to printing the path as text (live 2026-07-26: an
+    # 89 MB overview arrived as a dead path). Anything oversized must be re-encoded
+    # before we hand back a path.
+    base, _ = live
+    FakeFS.research_doc = _oversized_doc()
+    big = bridge._DELIVERY_MAX_BYTES + 1
+
+    def fake_dl(url, dest_dir, rid):
+        cache = tmp_path / f"{rid}-deadbeef.m4a"
+        cache.write_bytes(b"x" * 16)
+        return (cache, big)
+
+    def fake_shrink(cache_path, ceiling):
+        small = cache_path.with_name(cache_path.stem + bridge._SHRINK_SUFFIX)
+        small.write_bytes(b"y" * 32)
+        return small
+
+    monkeypatch.setattr(bridge, "_download_podcast_audio", fake_dl)
+    monkeypatch.setattr(bridge, "_shrink_for_delivery", fake_shrink)
+    out = requests.get(base + "/research/agent-big/podcast").json()
+    assert out["ready"] is True and not out.get("tooLarge")
+    assert out["sizeBytes"] == 32                    # the SHRUNK size, not the original
+    assert out["mime"] == "audio/mpeg"               # re-encoded to mp3
+    assert out["localPath"].endswith("Long Show.mp3")  # still title-named for the chat
+    assert out["localPath"] != str(tmp_path / "agent-big-deadbeef.m4a")
+
+
+def test_podcast_that_cannot_be_shrunk_returns_link_not_a_dead_path(live, monkeypatch, tmp_path):
+    # No ffmpeg / still too big → NEVER hand back a path the platform will refuse.
+    # The permanent link keeps the podcast reachable.
+    base, _ = live
+    FakeFS.research_doc = _oversized_doc()
+
+    def fake_dl(url, dest_dir, rid):
+        cache = tmp_path / f"{rid}-deadbeef.m4a"
+        cache.write_bytes(b"x" * 16)
+        return (cache, bridge._DELIVERY_MAX_BYTES + 1)
+
+    monkeypatch.setattr(bridge, "_download_podcast_audio", fake_dl)
+    monkeypatch.setattr(bridge, "_shrink_for_delivery", lambda p, c: None)
+    monkeypatch.setattr(bridge, "_sr_links", lambda doc: {"podcast": "https://superresearch.io/shared/doc/pod1"})
+    out = requests.get(base + "/research/agent-big/podcast").json()
+    assert out["tooLarge"] is True
+    assert "localPath" not in out                    # nothing that could be sent + fail
+    assert out["shareUrl"] == "https://superresearch.io/shared/doc/pod1"
+
+
+def test_podcast_too_large_mints_the_share_when_absent(live, monkeypatch, tmp_path):
+    # _sr_links only READS what's on the doc; the podcast share is written by the P5
+    # delivery step. A run asked about before P5 (or started from the web app) would
+    # otherwise hand back an EMPTY link — i.e. nothing at all.
+    base, _ = live
+    FakeFS.research_doc = _oversized_doc()
+
+    def fake_dl(url, dest_dir, rid):
+        cache = tmp_path / f"{rid}-deadbeef.m4a"
+        cache.write_bytes(b"x" * 16)
+        return (cache, bridge._DELIVERY_MAX_BYTES + 1)
+
+    monkeypatch.setattr(bridge, "_download_podcast_audio", fake_dl)
+    monkeypatch.setattr(bridge, "_shrink_for_delivery", lambda p, c: None)
+    monkeypatch.setattr(bridge, "_sr_links", lambda doc: {})          # nothing minted yet
+    monkeypatch.setattr(bridge, "_mint_sr",
+                        lambda sess, rid, title: {"podcast": "https://superresearch.io/shared/doc/minted"})
+    out = requests.get(base + "/research/agent-big/podcast").json()
+    assert out["tooLarge"] is True
+    assert out["shareUrl"] == "https://superresearch.io/shared/doc/minted"
+
+
+def test_delivery_ceiling_is_per_channel(live, monkeypatch, tmp_path):
+    # The ceiling belongs to the destination platform: a file that is fine on
+    # Telegram is refused on WhatsApp. The route must honour ?platform=.
+    base, _ = live
+    FakeFS.research_doc = _oversized_doc()
+    seen = {}
+
+    def fake_dl(url, dest_dir, rid):
+        cache = tmp_path / f"{rid}-deadbeef.m4a"
+        cache.write_bytes(b"x" * 16)
+        return (cache, 20 * 1024 * 1024)          # 20 MB: fits Telegram, not WhatsApp
+
+    monkeypatch.setattr(bridge, "_download_podcast_audio", fake_dl)
+    monkeypatch.setattr(bridge, "_shrink_for_delivery",
+                        lambda p, c: seen.__setitem__("ceiling", c))
+    # Telegram: 20 MB is under its ceiling → delivered untouched, never re-encoded.
+    out = requests.get(base + "/research/agent-big/podcast?platform=telegram").json()
+    assert "ceiling" not in seen and out["localPath"].endswith("Long Show.m4a")
+    # WhatsApp: the SAME file is over its ceiling → shrink attempted with ITS ceiling.
+    requests.get(base + "/research/agent-big/podcast?platform=whatsapp")
+    assert seen["ceiling"] == bridge._DELIVERY_LIMITS["whatsapp"]
+
+
+def test_sms_never_attaches_audio(live, monkeypatch, tmp_path):
+    # An MMS carrier cannot carry an overview at any bitrate — go straight to the
+    # link rather than burning a multi-minute encode that will be refused anyway.
+    base, _ = live
+    FakeFS.research_doc = _oversized_doc()
+    called = {"n": 0}
+
+    def fake_dl(url, dest_dir, rid):
+        cache = tmp_path / f"{rid}-deadbeef.m4a"
+        cache.write_bytes(b"x" * 16)
+        return (cache, 1024)                       # tiny — but still undeliverable
+    monkeypatch.setattr(bridge, "_download_podcast_audio", fake_dl)
+    monkeypatch.setattr(bridge, "_shrink_for_delivery",
+                        lambda p, c: called.__setitem__("n", called["n"] + 1))
+    monkeypatch.setattr(bridge, "_sr_links", lambda doc: {"podcast": "https://superresearch.io/s/x"})
+    out = requests.get(base + "/research/agent-big/podcast?platform=sms").json()
+    assert out["tooLarge"] is True and called["n"] == 0
+    assert out["shareUrl"] == "https://superresearch.io/s/x"
+
+
+def test_shrink_bitrate_scales_to_the_channel_ceiling():
+    # A tight ceiling must lower the rate rather than emit a fixed guess that still
+    # overshoots; and anything needing less than the speech floor gets the link.
+    half_hour, hour = 1800.0, 3600.0
+    tele = bridge._shrink_bitrate_kbps(bridge._DELIVERY_LIMITS["telegram"], half_hour)
+    whats = bridge._shrink_bitrate_kbps(bridge._DELIVERY_LIMITS["whatsapp"], half_hour)
+    assert tele == bridge._SHRINK_MAX_KBPS          # roomy → stay transparent
+    assert bridge._SHRINK_MIN_KBPS <= whats < tele  # tight → scale down, not below floor
+    # A full hour simply cannot fit WhatsApp's cap above the speech floor — that must
+    # yield None (→ permanent link), never a knowingly-too-big or unlistenable encode.
+    assert bridge._shrink_bitrate_kbps(bridge._DELIVERY_LIMITS["whatsapp"], hour) is None
+    assert bridge._shrink_bitrate_kbps(bridge._DELIVERY_LIMITS["telegram"], None) \
+        == bridge._SHRINK_MAX_KBPS                  # no probe → default, size-checked after
+
+
+def test_podcast_under_ceiling_is_never_re_encoded(live, monkeypatch, tmp_path):
+    # The common case must stay untouched: no ffmpeg cost, original bytes delivered.
+    base, _ = live
+    FakeFS.research_doc = _oversized_doc()
+    called = {"n": 0}
+
+    def fake_dl(url, dest_dir, rid):
+        cache = tmp_path / f"{rid}-deadbeef.m4a"
+        cache.write_bytes(b"x" * 4096)
+        return (cache, 4096)
+
+    monkeypatch.setattr(bridge, "_download_podcast_audio", fake_dl)
+    monkeypatch.setattr(bridge, "_shrink_for_delivery",
+                        lambda p: called.__setitem__("n", called["n"] + 1))
+    out = requests.get(base + "/research/agent-big/podcast").json()
+    assert called["n"] == 0 and out["mime"] == "audio/mp4"
+    assert out["localPath"].endswith("Long Show.m4a")
+
+
+def test_shrink_for_delivery_without_ffmpeg_is_none(tmp_path, monkeypatch):
+    # ffmpeg is optional for the agent — its absence must degrade to the link path,
+    # never raise.
+    monkeypatch.setattr(bridge, "_ffmpeg_bin", lambda: None)
+    src = tmp_path / "a.m4a"
+    src.write_bytes(b"x" * 16)
+    assert bridge._shrink_for_delivery(src, bridge._DELIVERY_MAX_BYTES) is None
+
+
+def test_shrink_for_delivery_rejects_a_result_still_over_the_ceiling(tmp_path, monkeypatch):
+    # A re-encode that is STILL too big must not be handed back — the platform would
+    # refuse it exactly like the original.
+    src = tmp_path / "a.m4a"
+    src.write_bytes(b"x" * 16)
+    monkeypatch.setattr(bridge, "_ffmpeg_bin", lambda: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(bridge, "_audio_duration_seconds", lambda p: None)
+
+    def fake_run(cmd, **kw):
+        Path(cmd[-1]).write_bytes(b"z" * (bridge._DELIVERY_MAX_BYTES + 1))
+        return SimpleNamespace(returncode=0, stderr=b"")
+
+    monkeypatch.setattr(bridge.subprocess, "run", fake_run)
+    assert bridge._shrink_for_delivery(src, bridge._DELIVERY_MAX_BYTES) is None
+    assert not list(tmp_path.glob("a-*" + bridge._SHRINK_SUFFIX))   # partial cleaned up
+
+
+@pytest.mark.skipif(bridge._ffmpeg_bin() is None, reason="ffmpeg not installed")
+def test_shrink_for_delivery_really_encodes_with_ffmpeg(tmp_path, monkeypatch):
+    # Runs the REAL argv. A fully-mocked subprocess can't catch an argv defect, and
+    # one bit us: ffmpeg picks its muxer from the output EXTENSION, and the temp is
+    # named "*.part" (required by _prune_podcast_dir's in-flight guard), which claims
+    # no muxer — so without an explicit "-f mp3" every encode aborted and the shrink
+    # silently degraded to link-only.
+    ff = bridge._ffmpeg_bin()
+    src = tmp_path / "src.m4a"
+    subprocess.run([ff, "-y", "-nostdin", "-f", "lavfi", "-i",
+                    "sine=frequency=440:duration=3", str(src)],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120, check=True)
+    out = bridge._shrink_for_delivery(src, bridge._DELIVERY_MAX_BYTES)
+    assert out is not None and out.exists() and out.stat().st_size > 0
+    assert out.suffix == ".mp3" and out.read_bytes()[:2] in (b"ID", b"\xff\xfb", b"\xff\xf3", b"\xff\xfa")
+    assert not list(tmp_path.glob("*.part"))       # temp cleaned up on success
 
 
 def test_podcast_not_ready_409(live):

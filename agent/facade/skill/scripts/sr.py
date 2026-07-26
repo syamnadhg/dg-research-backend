@@ -1003,10 +1003,30 @@ def cmd_podcast(args) -> int:
     rid = run.get("runId")
     # The bridge downloads the audio to a local file (a long audio overview can
     # take a few seconds) → allow more time than the default request timeout.
-    code, b2 = _get(f"/research/{urllib.parse.quote(rid, safe='')}/podcast", timeout=180)
+    # Tell the bridge which chat this is headed to: upload ceilings are the
+    # PLATFORM's and differ by an order of magnitude (Telegram 50 MB vs WhatsApp
+    # ~16 MB), so a file that is fine here is refused there.
+    origin = _origin_from_env() or {}
+    platform = (origin.get("platform") or "").strip()
+    q = f"?platform={urllib.parse.quote(platform, safe='')}" if platform else ""
+    code, b2 = _get(f"/research/{urllib.parse.quote(rid, safe='')}/podcast{q}", timeout=180)
     if code != 200:
         return _emit(b2, args.json, [f"✗ {b2.get('error', code)}"], _fail_code(code))
     title = b2.get("title") or "Podcast"
+    if b2.get("tooLarge"):
+        # Past the chat platform's upload ceiling even after re-encoding. Sending a
+        # path here would be worse than useless: the platform refuses the upload and
+        # the runtime degrades to printing the path as text (live 2026-07-26 — an
+        # 89-minute overview came back as a dead file path). Hand over the permanent
+        # link instead, which plays in the browser and never expires.
+        share = b2.get("shareUrl") or ""
+        lines = [f"🎧 {title}"]
+        if share:
+            lines += ["It's too long to send as a file here — listen at:", f"  {share}"]
+        else:
+            lines.append("It's too long to send as a file here — ask for the links "
+                         "and I'll get you the podcast link.")
+        return _emit(b2, args.json, lines)
     # Emit a short caption + an explicit MEDIA:<path> tag on its own line. The
     # runtime's gateway extracts MEDIA: tags into its AUDIO partition, which
     # delivers the file as native PLAYABLE audio (Telegram sendAudio for

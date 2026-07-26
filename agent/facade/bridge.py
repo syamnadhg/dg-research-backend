@@ -22,6 +22,7 @@ import os
 import re
 import secrets
 import shutil
+import subprocess
 import threading
 import time
 import uuid
@@ -67,6 +68,40 @@ _MAX_BODY_BYTES = 1 << 20  # 1 MiB
 _PODCAST_DIR_NAME = "podcasts"
 _PODCAST_MAX_BYTES = 200 * 1024 * 1024  # 200 MiB — generous for a long audio overview
 _PODCAST_MAX_AGE_SECONDS = 7 * 24 * 60 * 60  # prune cached audio older than a week
+# A chat platform rejects an upload past its own ceiling (Telegram's bot API caps a
+# single file at 50 MB). When that happens the runtime does NOT surface an error —
+# it quietly falls back to printing the file PATH as text, so the user is handed a
+# dead path instead of audio (live 2026-07-26: an 89 MB, 48-minute overview; the
+# same failure sat in the logs on 07-22 and 07-24). Stay under the smallest common
+# ceiling with room for multipart overhead, and shrink anything above it.
+_DELIVERY_MAX_BYTES = 45 * 1024 * 1024
+# Per-channel upload ceilings — the limit belongs to the PLATFORM, not to us, and
+# they differ by an order of magnitude. Using one global number means a file that is
+# fine on Telegram is silently refused on WhatsApp (and the runtime then degrades to
+# printing the path). Values sit under each platform's documented cap with room for
+# the multipart envelope. 0 = never attach: an MMS carrier cannot carry an overview
+# at any bitrate, so those always get the permanent link instead.
+_DELIVERY_LIMITS = {
+    "telegram": 45 * 1024 * 1024,   # bot API: 50 MB per upload
+    "whatsapp": 14 * 1024 * 1024,   # ~16 MB media cap
+    "imessage": 45 * 1024 * 1024,   # relays vary; stay at the conservative end
+    "discord": 7 * 1024 * 1024,     # 8 MB on an unboosted server
+    "sms": 0,
+    "twilio": 0,
+}
+# Re-encode targets for an oversized overview. The source is a two-voice CONVERSATION
+# carried at music-grade settings, so mono speech bitrates are transparent here. The
+# rate is derived from the channel's ceiling and the actual duration (below); these
+# just bound it — 64k is indistinguishable for speech, and below 32k a two-voice mix
+# starts to smear, so anything that would need less than the floor gets the link.
+_SHRINK_MAX_KBPS = 64
+_SHRINK_MIN_KBPS = 32
+_SHRINK_HEADROOM = 0.90  # container overhead + the platform's multipart envelope
+_SHRINK_SUFFIX = "-small.mp3"
+# ffmpeg/ffprobe are NOT hard dependencies of the agent (the podcast normally arrives
+# already encoded). Probe the usual install roots too: a launchd/systemd child can
+# inherit a minimal PATH that omits /usr/local/bin and Homebrew's prefix.
+_FFMPEG_FALLBACK_DIRS = ("/usr/local/bin", "/opt/homebrew/bin", "/usr/bin")
 _AUDIO_EXT_MIME = {
     ".m4a": "audio/mp4",
     ".mp4": "audio/mp4",
@@ -551,6 +586,133 @@ def _download_podcast_audio(url: str, dest_dir: Path, rid: str) -> tuple[Path, i
         tmp.unlink(missing_ok=True)  # never leave a partial .part behind
         raise
     return final, size
+
+
+def _media_tool_bin(name: str) -> str | None:
+    """Path to an ffmpeg-family binary, or None when it isn't installed.
+
+    Both are OPTIONAL here (the podcast normally arrives already encoded), so every
+    caller must degrade rather than fail. Probes the usual install roots as well as
+    PATH: a launchd/systemd child can inherit a minimal PATH that omits /usr/local/bin
+    and Homebrew's prefix."""
+    found = shutil.which(name)
+    if found:
+        return found
+    for root in _FFMPEG_FALLBACK_DIRS:
+        cand = os.path.join(root, name)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def _ffmpeg_bin() -> str | None:
+    return _media_tool_bin("ffmpeg")
+
+
+def _ffprobe_bin() -> str | None:
+    return _media_tool_bin("ffprobe")
+
+
+def _delivery_ceiling(platform: str | None) -> int:
+    """The upload ceiling for the chat platform this podcast is headed to.
+
+    An unknown / absent platform keeps the historical Telegram-shaped default rather
+    than the strictest one: over-shrinking every unknown caller would cost quality on
+    the common path, and the post-encode size check still guarantees we never hand
+    back something the platform will refuse."""
+    key = (platform or "").strip().lower()
+    if key in _DELIVERY_LIMITS:
+        return _DELIVERY_LIMITS[key]
+    return _DELIVERY_MAX_BYTES
+
+
+def _audio_duration_seconds(path: Path) -> float | None:
+    """Length of an audio file via ffprobe, or None when it can't be determined."""
+    probe = _ffprobe_bin()
+    if probe is None:
+        return None
+    try:
+        out = subprocess.run(
+            [probe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, timeout=60,
+        )
+        if out.returncode != 0:
+            return None
+        seconds = float((out.stdout or "").strip())
+        return seconds if seconds > 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _shrink_bitrate_kbps(ceiling: int, duration_s: float | None) -> int | None:
+    """The mono bitrate that fits ``ceiling``, or None if even the floor won't.
+
+    Derived from the real duration so a tight channel (WhatsApp) gets a rate that
+    actually fits rather than a fixed guess that still overshoots. Without a duration
+    probe, try the transparent default and let the post-encode size check decide."""
+    if not duration_s or duration_s <= 0:
+        return _SHRINK_MAX_KBPS
+    kbps = int((ceiling * _SHRINK_HEADROOM * 8) / duration_s / 1000)
+    if kbps < _SHRINK_MIN_KBPS:
+        return None  # would have to go below speech-usable quality — send the link
+    return min(kbps, _SHRINK_MAX_KBPS)
+
+
+def _shrink_for_delivery(cache_path: Path, ceiling: int) -> Path | None:
+    """Re-encode an oversized overview to a mono MP3 that fits ``ceiling``.
+
+    Returns the smaller file, or None when it can't be produced (no ffmpeg, the encode
+    failed, the required bitrate would fall below the speech floor, or the result is
+    STILL over the ceiling) — the caller then hands back the permanent link instead of
+    a file the platform will refuse.
+
+    Cached beside the original as ``<stem>-<kbps>k-small.mp3``; the bitrate is in the
+    name so two channels with different ceilings never serve each other's file. The
+    original is KEPT — it is the download cache's dedup key and remains the full-quality
+    answer for every other consumer (the web app streams the untouched Storage object).
+    """
+    ff = _ffmpeg_bin()
+    if ff is None:
+        return None
+    kbps = _shrink_bitrate_kbps(ceiling, _audio_duration_seconds(cache_path))
+    if kbps is None:
+        return None
+    small = cache_path.with_name(f"{cache_path.stem}-{kbps}k{_SHRINK_SUFFIX}")
+    if small.exists() and 0 < small.stat().st_size <= ceiling:
+        return small  # cache hit
+    # The temp MUST keep the `.part` suffix — that is `_prune_podcast_dir`'s in-flight
+    # guard. ffmpeg picks its muxer from the output EXTENSION, and nothing claims
+    # `.part`, so the container has to be named explicitly with `-f mp3`; without it
+    # every encode aborts with "Unable to choose an output format" and the shrink
+    # silently degrades to link-only.
+    tmp = small.with_name(f"{small.name}.{uuid.uuid4().hex[:8]}.part")
+    no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if os.name == "nt" else 0
+    try:
+        proc = subprocess.run(
+            [ff, "-y", "-nostdin", "-i", str(cache_path), "-vn", "-map_metadata", "0",
+             "-ac", "1", "-c:a", "libmp3lame", "-b:a", f"{kbps}k", "-f", "mp3", str(tmp)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=900,
+            creationflags=no_window,
+        )
+        if proc.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
+            # Surface WHY: a silent None here is indistinguishable from "no ffmpeg",
+            # and the failure only shows up as a podcast that never plays.
+            tail = (proc.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+            log.warning("podcast shrink failed (rc=%s): %s", proc.returncode,
+                        tail[-1][:200] if tail else "no stderr")
+            return None
+        if tmp.stat().st_size > ceiling:
+            return None  # even re-encoded it won't fit — fall back to the link
+        tmp.replace(small)
+        return small
+    except (OSError, subprocess.SubprocessError):
+        return None
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)  # no-op once renamed
+        except OSError:
+            pass
 
 
 def _podcast_delivery_copy(cache_path: Path, title: str, ext: str) -> Path:
@@ -2082,6 +2244,41 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 log.warning("podcast download failed for %s (%s)", rid, type(e).__name__)
                 self._json(502, {"error": "couldn't fetch the podcast audio — try again"})
                 return
+            # A file past the platform ceiling is REFUSED at send time and the
+            # runtime silently degrades to printing the path as text — so shrink it
+            # here rather than hand back something that can't be delivered. The
+            # ceiling belongs to the destination chat (?platform=…), not to us.
+            ceiling = _delivery_ceiling(
+                (parse_qs(urlsplit(self.path).query).get("platform") or [""])[0])
+            if size > ceiling:
+                smaller = _shrink_for_delivery(path, ceiling) if ceiling > 0 else None
+                if smaller is None:
+                    # Can't be made deliverable — answer with the permanent link so
+                    # the user still gets the podcast, instead of a dead path. MINT it
+                    # if it isn't on the doc yet: `_sr_links` only READS what's already
+                    # there, and the podcast share is written by the P5 delivery step —
+                    # so a run asked about before P5 (or started from the web app) would
+                    # otherwise hand back an empty link, i.e. nothing at all.
+                    sr = _sr_links(doc)
+                    if not sr.get("podcast"):
+                        fresh = _mint_sr(sess, rid, title)
+                        if fresh:
+                            sr = {**sr, **fresh}
+                    log.info("podcast too large to send for %s (%d bytes) — link only",
+                             rid, size)
+                    self._json(200, {
+                        "ready": True,
+                        "runId": rid,
+                        "title": title,
+                        "tooLarge": True,
+                        "sizeBytes": size,
+                        "shareUrl": sr.get("podcast") or "",
+                    })
+                    return
+                log.info("podcast shrunk for delivery for %s (%d → %d bytes)",
+                         rid, size, smaller.stat().st_size)
+                path, ext, mime = smaller, ".mp3", "audio/mpeg"
+                size = smaller.stat().st_size
             # Serve under a human, title-based basename (the chat shows a
             # forwarded file's basename, not the ugly rid-hashed cache name).
             delivery = _podcast_delivery_copy(path, title, ext)
