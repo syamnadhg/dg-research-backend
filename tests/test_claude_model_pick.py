@@ -146,3 +146,67 @@ def test_step1b_selector_handles_menuitemradio_and_fixed_popover():
         "the picker/trigger-read must use getClientRects() for visibility so "
         "fixed-position popovers aren't filtered by offsetParent (#744)."
     )
+
+
+def test_already_at_floor_still_upgrades_to_a_newer_opus():
+    """2026-07-26 — "at or above the floor" is not "the latest".
+
+    `model_ok` (trigger >= floor) skipped Step 1B entirely, so once Claude.ai
+    showed the floor version the picker never opened and a newer flagship was
+    never selected: P2 kept running Opus 4.8 through the whole Opus-5 rollout,
+    even though P2_MODEL_POLICY says pick "highest". The already-open popover
+    must be probed and a STRICTLY higher Opus selected.
+    """
+    src = inspect.getsource(research.setup_claude_dr)
+    assert "_probe_opus_js" in src, (
+        "an already-acceptable model must still probe the open popover for a "
+        "newer Opus — otherwise the pipeline pins itself to the floor forever."
+    )
+    up = src.find("Step 1B*: already")
+    assert up != -1, "the upgrade branch must exist and be logged"
+    # It must be reached exactly when the model is ALREADY ok (the branch the
+    # old code short-circuited), i.e. the else of `if not model_ok`.
+    assert src.find("if not model_ok") < up, (
+        "the upgrade probe belongs on the already-ok path, not the pick path."
+    )
+
+
+def test_upgrade_only_fires_on_a_strictly_higher_version():
+    """The #744 re-click loop must stay dead: an upgrade may never re-select the
+    version already showing on the trigger. Strictly-greater is what guarantees
+    that structurally, so the comparison must not be a plain >=."""
+    src = inspect.getsource(research.setup_claude_dr)
+    assert "> model_trigger_ver + 0.001" in src, (
+        "the upgrade must require a STRICTLY higher version than the trigger "
+        "(a >= comparison would re-click the current model and revive #744)."
+    )
+    # The click itself must go through the single existing picker, so there is
+    # exactly one code path that can ever select a model.
+    up = src.find("Step 1B*: already")
+    assert "_pick_opus_js" in src[up:up + 2500], (
+        "the upgrade must select via _pick_opus_js, not a second bespoke clicker."
+    )
+
+
+def test_upgrade_probe_never_breaks_an_acceptable_run():
+    """A probe failure is advisory: the model is already >= floor, so a failed
+    upgrade must never fail the setup."""
+    src = inspect.getsource(research.setup_claude_dr)
+    up = src.find("Step 1B*: already")
+    tail = src[up:up + 2600]
+    assert "except Exception" in tail, "the upgrade probe must be wrapped"
+    assert "return False" not in tail, (
+        "an upgrade failure must NOT abort setup — the current model is already "
+        "acceptable and the run should proceed."
+    )
+
+
+def test_progress_copy_does_not_pin_a_model_version():
+    """The canned P2 progress line hardcoded "Opus 4.8" while the runtime picks
+    the highest offered — so it misreported the model for the entire rollout."""
+    line = [s for s in research.AGENT_PHASE_FLOWS.get(("claude", 2), [])
+            if "Opening Claude" in s]
+    assert line, "the claude P2 progress hint must still exist"
+    assert "4.8" not in line[0], (
+        "progress copy must not pin a model version — it goes stale silently."
+    )

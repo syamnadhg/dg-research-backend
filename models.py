@@ -35,12 +35,14 @@ CUA_MODEL = os.environ.get("CUA_MODEL", "claude-sonnet-4-6")
 # recommended Computer-Use model); this is the vision light tier only.
 VISION_LIGHT_MODEL = os.environ.get("VISION_LIGHT_MODEL", "claude-sonnet-5")
 
-# Vision — high-stakes / retry-after-failure path. Opus 4.8 is the
-# current Anthropic flagship (supersedes 4.7) with the highest-fidelity
-# vision input. Reserved for the vision tier-2 verifier's escalation
-# branch where we'd rather pay 5x to get the right answer than retry
-# Sonnet repeatedly.
-VISION_HEAVY_MODEL = os.environ.get("VISION_HEAVY_MODEL", "claude-opus-4-8")
+# Vision — high-stakes / retry-after-failure path. Opus 5 is the current
+# Anthropic flagship (supersedes 4.8) with the highest-fidelity vision
+# input. Reserved for the vision tier-2 verifier's escalation branch
+# where we'd rather pay 5x to get the right answer than retry Sonnet
+# repeatedly. Bumped 2026-07-26 (4.8 → 5), following the same hand-bump
+# as VISION_LIGHT_MODEL; this constant is NOT auto-refreshed — the
+# Phoenix model policy governs the P2 web-UI pick, not our API models.
+VISION_HEAVY_MODEL = os.environ.get("VISION_HEAVY_MODEL", "claude-opus-5")
 
 # Narrator — per-agent narration during pipeline runs. As of 2026-05-28
 # Gemini 3.5 Flash (GEMINI_TEXT) is the primary; Haiku 4.5 here is the
@@ -60,16 +62,18 @@ TITLE_HAIKU = os.environ.get("TITLE_MODEL", "claude-haiku-4-5")
 # General-purpose text — research summary, URL extraction from Gemini
 # Deep Research page, narrator fallback when Haiku is unavailable.
 # `gemini-2.5-flash` hard-deprecates 2026-06-17 on the generativelanguage
-# API path (Vertex extended to 2026-10-16). `gemini-3.5-flash` is GA
-# (released Google I/O 2026) and the drop-in successor — same speed
-# class, same multimodal support, frontier-class agentic performance.
-GEMINI_TEXT = os.environ.get("GEMINI_TEXT_MODEL", "gemini-3.5-flash")
+# API path (Vertex extended to 2026-10-16). `gemini-3.6-flash` is the
+# current GA Flash (verified against the live model list 2026-07-26 —
+# 3.6 ships without a `-preview` suffix, unlike 3-flash / 3.1-flash-live)
+# and a drop-in successor to 3.5 — same speed class, same multimodal
+# support. Bumped 2026-07-26 (3.5 → 3.6).
+GEMINI_TEXT = os.environ.get("GEMINI_TEXT_MODEL", "gemini-3.6-flash")
 
 # Vision narrator (narrate.py) — agent-side screenshot panel reader.
 # Multimodal Gemini call (image + structured-output schema). Same model
 # family as GEMINI_TEXT but kept as its own env var so the narrator can
 # be tuned independently from text-only summary/extractor sites.
-GEMINI_NARRATE = os.environ.get("GEMINI_NARRATE_MODEL", "gemini-3.5-flash")
+GEMINI_NARRATE = os.environ.get("GEMINI_NARRATE_MODEL", "gemini-3.6-flash")
 
 # Vision narrator fallback — Gemini Pro hedge against a Flash-specific
 # outage. Kept on 2.5-pro pending 3.x-pro reaching GA (3.1-pro is still

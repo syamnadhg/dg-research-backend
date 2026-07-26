@@ -16131,7 +16131,9 @@ AGENT_PHASE_FLOWS: dict[tuple[str, int], list[str]] = {
         "50m+: Finalizing the report with citations",
     ],
     ("claude", 2): [
-        "0-60s: Opening Claude with Opus 4.8 (Max effort + Adaptive Thinking) + Research tools",
+        # Version-free on purpose: the runtime picks the highest Opus offered, so a
+        # pinned number here would misreport the moment the family moves on.
+        "0-60s: Opening Claude with the latest Opus (Max effort + Adaptive Thinking) + Research tools",
         "60s-3m: Loading the brief and planning the research scope",
         "3-15m: Conducting web searches and reading sources, artifact preview building",
         "15-40m: Building the artifact with research findings and citations",
@@ -22803,7 +22805,7 @@ async def extract_source_urls_via_vision(page, agent_key: str,
     )
 
     # Model resolved from models.GEMINI_NARRATE (env override:
-    # GEMINI_NARRATE_MODEL). Default GA target 2026-05: gemini-3.5-flash.
+    # GEMINI_NARRATE_MODEL) — see there for the current GA default.
     model = GEMINI_NARRATE
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
            f"{model}:generateContent?key={api_key}")
@@ -32360,10 +32362,17 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
         # open the popover ONCE to set Effort=Max + Thinking ON via DOM. The
         # user asked for this to be done seamlessly by DOM ("like gemini");
         # CUA's screenshots kept collapsing the Effort submenu. The model PICK
-        # (Step 1B) is the only sub-step gated to "not already >= 4.8" — opening
-        # the popover to set the quality knobs is safe (we always Escape after,
-        # and we never re-click a correct model option, so the #744 loop can't
-        # recur).
+        # (Step 1B) is the only sub-step gated to "not already >= floor" —
+        # opening the popover to set the quality knobs is safe (we always
+        # Escape after, and we never re-click a correct model option, so the
+        # #744 loop can't recur).
+        # (2026-07-26) "at or above the floor" is NOT the same as "the latest".
+        # Claude.ai defaults to the previous flagship, so once the trigger read
+        # >= floor this skipped the picker entirely and the account stayed on the
+        # OLD model for good — the family shipped Opus 5 and P2 kept running 4.8.
+        # Step 1B* below fixes that: while the popover is open ANYWAY, upgrade to
+        # a STRICTLY higher Opus when one is offered. Strictly-higher is what
+        # keeps #744 dead — the currently-selected option can never be re-clicked.
         model_trigger_ver = await page.evaluate("""() => {
             const verOf = t => { const m = (t || '').match(/opus[^0-9]*([0-9]+(?:\\.[0-9]+)?)/i); return m ? parseFloat(m[1]) : null; };
             const vis = el => el.getClientRects().length > 0;   // fixed-position triggers have offsetParent === null
@@ -32431,6 +32440,34 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
             return null;
         }"""
 
+        # Read-only companion to _pick_opus_js: what is the highest Opus the OPEN
+        # popover offers, and did we see any Opus rows at all? `n` separates "the
+        # menu hasn't mounted yet" (retry) from "mounted, nothing newer" (the
+        # common case — return immediately, no added latency on the happy path).
+        # Clicks nothing; the upgrade click goes through _pick_opus_js so there is
+        # exactly ONE code path that ever selects a model.
+        _probe_opus_js = """() => {
+            const vis = el => el.getClientRects().length > 0;
+            const menus = [...document.querySelectorAll('[role="menu"], [role="listbox"], [role="dialog"]')]
+                .filter(vis);
+            const roots = menus.length ? menus : [document.body];
+            const seen = new Set();
+            const items = roots.flatMap(m => [...m.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"], [role="option"], button, a, li, div, span')])
+                .filter(el => vis(el) && !seen.has(el) && seen.add(el));
+            const verOf = t => {
+                const m = (t || '').match(/opus[^0-9]*([0-9]+(?:\\.[0-9]+)?)/i);
+                return m ? parseFloat(m[1]) : null;
+            };
+            let n = 0, highest = null;
+            for (const el of items) {
+                const v = verOf((el.textContent || '').trim());
+                if (v === null) continue;
+                n += 1;
+                if (highest === null || v > highest) highest = v;
+            }
+            return {n: n, highest: highest};
+        }"""
+
         # ── Step 1A: open the model popover ONCE (model pick if needed +
         #              ALWAYS to reach the Effort submenu / Thinking toggle) ──
         dropdown_clicked = await page.evaluate("""() => {
@@ -32476,6 +32513,48 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
                         pass
                     return False
                 await asyncio.sleep(0.6)
+            else:
+                # ── Step 1B*: already >= floor — upgrade if the family moved on ──
+                # The floor means "acceptable", not "latest". Claude.ai keeps the
+                # account on the previous flagship, so without this the pipeline
+                # would sit on the floor version forever (P2 ran Opus 4.8 for the
+                # whole Opus-5 rollout). The popover is already open for Effort/
+                # Thinking, so this costs one read; we only click when a STRICTLY
+                # higher Opus exists, which is also what makes re-clicking the
+                # current model (#744's loop) impossible by construction.
+                try:
+                    _probe = None
+                    for _attempt in range(3):
+                        _probe = await page.evaluate(_probe_opus_js)
+                        # n == 0 means the menu hasn't mounted yet — retry. Any
+                        # rows at all means the answer is trustworthy: return
+                        # immediately so the common "nothing newer" path adds
+                        # no latency.
+                        if (_probe or {}).get("n"):
+                            break
+                        await asyncio.sleep(0.4)
+                    _offered = (_probe or {}).get("highest")
+                    if (isinstance(_offered, (int, float))
+                            and _offered > model_trigger_ver + 0.001):
+                        # Select it through the ONE picker that exists, with the
+                        # floor raised to the newer version so nothing else can win.
+                        _up = await page.evaluate(_pick_opus_js, {"floor": _offered, "pin": None})
+                        if _up:
+                            opus_selected = _up
+                            log(f"[setup_claude_dr] Step 1B* UPGRADE: Opus "
+                                f"{model_trigger_ver} → {_offered} ({_up})")
+                            await asyncio.sleep(0.6)
+                        else:
+                            log(f"[setup_claude_dr] Step 1B* : Opus {_offered} offered but "
+                                f"not clickable — staying on {model_trigger_ver}", "WARN")
+                    elif _offered is not None:
+                        log(f"[setup_claude_dr] Step 1B*: Opus {model_trigger_ver} is already "
+                            f"the highest offered ({_offered}) — no re-pick (#744)")
+                except Exception as _ue:
+                    # Advisory only: a probe failure must never break a run that
+                    # already has an acceptable model.
+                    log(f"[setup_claude_dr] Step 1B* upgrade probe errored "
+                        f"({type(_ue).__name__}) — keeping Opus {model_trigger_ver}", "WARN")
 
             # ── Step 1C: open the Effort submenu ───────────────────────
             # 2026-05-28: claude.ai split the old single "Opus 4.7 Adaptive"
