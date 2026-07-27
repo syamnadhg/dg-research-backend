@@ -1883,6 +1883,11 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             for d in devs:
                 d["owned"] = d.get("ownerUid") == uid
                 d["selected"] = d.get("id") == selected and selected is not None
+                # Same freshness rule the run-routing path already applies to
+                # these very rows. Without it every client shows a device list
+                # with no indication of which machine is actually on, so a user
+                # picks a sleeping one and their research silently never starts.
+                d["online"] = _device_is_online(d)
             return devs
 
         def _devices(self) -> None:

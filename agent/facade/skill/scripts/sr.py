@@ -598,7 +598,11 @@ def _arm_stream_cron(script_name: str, job_name: str, origin: dict | None,
                              "next_run_at": _cron_now()})  # due now, inside the grace window
         else:
             data["jobs"].append(_build_stream_cron_job(script_name, job_name, origin, schedule))
-        tmp = jobs_file.with_suffix(".json.sr-tmp")
+        # Per-process temp name. Several writers touch this file — this arming
+        # path on every send, plus the watchdog's and update-notice teardowns —
+        # and a single shared temp name lets two of them interleave write and
+        # rename, so one publishes the other's half-written jobs list.
+        tmp = jobs_file.with_suffix(".json.sr-tmp.%d" % os.getpid())
         tmp.write_text(json.dumps(data), "utf-8")
         try:
             os.chmod(tmp, 0o600)  # the cron store is owner-only; os.replace carries

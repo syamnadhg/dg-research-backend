@@ -51,6 +51,11 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+try:
+    import fcntl  # POSIX advisory file lock. The Hermes host is always POSIX;
+except ImportError:  # None elsewhere (e.g. a Windows test import) → lock-free write.
+    fcntl = None
+
 _TIMEOUT = 30  # the bridge may mint a phase's SR share on this call (FE round-trip)
 _STATE_FILE = Path(__file__).with_name(".sr_stream_state.json")
 
@@ -178,17 +183,23 @@ def _save_state(state: dict, path: Path | None = None) -> None:
 # else it would poll forever. That give-up best-effort removes its OWN entry (matched
 # by name) from the cron data file (`<HERMES_HOME>/cron/jobs.json`, which Hermes
 # re-reads each tick and is the durable single source of truth — a host-side removal
-# STICKS; there is no in-memory registry that re-adds it). It deliberately does NOT
-# delete the generated shim: this removal is UNLOCKED (no `.jobs.lock` flock), so a
-# concurrent gateway save between our read and replace could still carry the entry
-# through; if we'd deleted the shim, that surviving cron would fire "Script not found"
-# every tick (the old spam bug). Keeping the shim means a lingering cron just runs it
-# and exits silently. Full cleanup (shim included) is `agent disconnect`'s job;
-# `agent connect`'s sweep clears legacy shim-less orphans.
+# STICKS; there is no in-memory registry that re-adds it). The removal now takes the
+# same `.jobs.lock` flock as sr.py's arming writer, so a concurrent gateway save can
+# no longer be lost between our read and our replace. It still deliberately does NOT
+# delete the generated shim: should an entry survive anyway, a shim-less cron would
+# fire "Script not found" every tick (the old spam bug), whereas a lingering cron
+# with its shim intact just runs it and exits silently. Full cleanup (shim
+# included) is `agent disconnect`'s job; `agent connect`'s sweep clears legacy
+# shim-less orphans.
 
 # Runs still in flight (or stuck awaiting the user) — work the watchdog must keep
 # streaming. Everything else (completed / errored-and-done / cancelled) is terminal.
-_ACTIVE = ("queued", "ongoing", "paused_backend_restart", "paused_backend_restart_failed")
+# "paused" belongs here: a run the user paused themselves is still theirs and
+# still going. Omitting it made the watchdog treat a deliberate pause as the
+# run ending, so within one tick they were told — unprompted — that research
+# they had just paused had "stopped".
+_ACTIVE = ("queued", "ongoing", "paused", "paused_backend_restart",
+           "paused_backend_restart_failed")
 
 
 def _is_active(run: dict) -> bool:
@@ -206,24 +217,51 @@ def _remove_cron_entry(job_name: str) -> bool:
     untouched. Returns True if an entry was removed. No-op (False) if the file is
     absent / unreadable / has no such job — so an already-clean state is harmless."""
     path = _hermes_home() / "cron" / "jobs.json"
+    # Take the SAME advisory lock sr.py's arming writer takes, for the whole
+    # read-modify-write. Unlocked, a gateway save landing between our read and
+    # our replace is silently discarded — we would publish a jobs list built
+    # from a snapshot that is already stale, dropping somebody else's job.
+    lock_fd = None
     try:
-        data = json.loads(path.read_text("utf-8"))
-    except Exception:
-        return False
-    jobs = data.get("jobs") if isinstance(data, dict) else None
-    if not isinstance(jobs, list):
-        return False
-    kept = [j for j in jobs if not (isinstance(j, dict) and j.get("name") == job_name)]
-    if len(kept) == len(jobs):
-        return False
-    data["jobs"] = kept
+        lock_fd = open(path.parent / ".jobs.lock", "a+", encoding="utf-8")
+    except OSError:
+        lock_fd = None  # best-effort; proceed without the cross-process lock
+    if lock_fd is not None and fcntl is not None:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        except OSError:
+            pass
     try:
-        tmp = path.with_suffix(".json.sr-tmp")
-        tmp.write_text(json.dumps(data), "utf-8")
-        os.replace(tmp, path)  # atomic; Hermes re-reads jobs.json each tick
-        return True
-    except Exception:
-        return False
+        try:
+            data = json.loads(path.read_text("utf-8"))
+        except Exception:
+            return False
+        jobs = data.get("jobs") if isinstance(data, dict) else None
+        if not isinstance(jobs, list):
+            return False
+        kept = [j for j in jobs
+                if not (isinstance(j, dict) and j.get("name") == job_name)]
+        if len(kept) == len(jobs):
+            return False
+        data["jobs"] = kept
+        try:
+            # Per-process temp name — see the matching note in sr.py's arming
+            # writer. A shared name lets two writers interleave and publish a
+            # half-written jobs list.
+            tmp = path.with_suffix(".json.sr-tmp.%d" % os.getpid())
+            tmp.write_text(json.dumps(data), "utf-8")
+            os.replace(tmp, path)  # atomic; Hermes re-reads jobs.json each tick
+            return True
+        except Exception:
+            return False
+    finally:
+        if lock_fd is not None:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            lock_fd.close()
 
 
 def _teardown(origin: dict) -> None:
