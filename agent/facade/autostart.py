@@ -22,12 +22,18 @@ validated end-to-end on a live Linux/macOS host.
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import subprocess
 import sys
+import time
+import urllib.request
 from pathlib import Path
 
 from . import config
+
+log = logging.getLogger(__name__)
 
 TASK_NAME = "SuperAgentBridge"                    # Windows Scheduled Task name
 SYSTEMD_UNIT = "super-agent-bridge.service"       # Linux systemd --user unit
@@ -124,6 +130,77 @@ def _exec(argv: list[str]) -> tuple[bool, str]:
     return proc.returncode == 0, out.strip()
 
 
+# ── talking to the live bridge ────────────────────────────────────────────────
+# A restart has to cycle whatever process HOLDS THE PORT, which is often not the
+# thing the service manager launched (on Windows, connect/resurrect start the
+# bridge with a detached Popen). These probes reach that process directly.
+#
+# Stdlib only, deliberately: this module's sole local import is `config` (it runs
+# from a generated launcher and from the service manager), so it must not need
+# `requests`, and importing `bridge` here would be both heavy and circular-ish.
+
+
+def _healthz(timeout: float = 2.0) -> dict | None:
+    """The live bridge's ``/healthz`` body, or None when nothing there is ours.
+
+    Marker-checked (``{"ok": true, "version": …}``) for exactly the reason
+    ``cli._bridge_up`` and ``bridge._port_holder_is_bridge`` are: a foreign server
+    squatting the port must never read as the bridge — whatever this says yes to
+    is what we go on to POST ``/shutdown`` at."""
+    try:
+        with urllib.request.urlopen(config.bridge_origin() + "/healthz", timeout=timeout) as r:
+            body = json.loads(r.read().decode("utf-8", "ignore"))
+    except Exception:  # noqa: BLE001 - any transport/parse failure means "not our bridge"
+        return None
+    if isinstance(body, dict) and body.get("ok") is True and "version" in body:
+        return body
+    return None
+
+
+def _post_shutdown(timeout: float = 10.0) -> None:
+    """Ask the live bridge to stop — the same call `agent retire` makes.
+
+    Best-effort: connection-refused just means it is already gone, and the bridge
+    may well die mid-response (it answers 200, then stops serving on a thread).
+    The method MUST be an explicit POST — a bare ``urlopen(url)`` sends GET, which
+    ``/shutdown`` answers 404, and every restart would then sit out the stop
+    timeout waiting for a bridge nobody asked to stop."""
+    req = urllib.request.Request(
+        config.bridge_origin() + "/shutdown", data=b"{}", method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        urllib.request.urlopen(req, timeout=timeout).close()
+    except Exception:  # noqa: BLE001 - already down, or it died answering; both fine
+        pass
+
+
+def _wait_gone(timeout: float) -> bool:
+    """True once nothing answers ``/healthz``, plus a grace for the OS to release
+    the loopback socket — mirroring the self-update waiter's own exit poll +
+    2s port grace. Deliberately NOT a ``bind()`` probe: Windows SO_REUSEADDR
+    semantics make a successful bind an ambiguous signal."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _healthz() is None:
+            time.sleep(2)
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def _wait_healthz(timeout: float) -> dict | None:
+    """The ``/healthz`` body of a bridge that comes up within ``timeout``, else
+    None. A launch that was merely *attempted* leaves nothing here."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        body = _healthz()
+        if body is not None:
+            return body
+        time.sleep(0.5)
+    return None
+
+
 # ── Windows: Scheduled Task (validated) ──────────────────────────────────────
 
 def run_command(exe: str | None = None, launcher: Path | None = None) -> str:
@@ -171,12 +248,71 @@ def _win_start(exe: str | None = None, launcher: Path | None = None) -> tuple[bo
     return True, ""
 
 
+_STOP_WAIT_SECONDS = 45.0   # for the old bridge to let go of the port
+_START_WAIT_SECONDS = 45.0   # for a new one to answer /healthz
+
+
 def _win_restart(task_name: str = TASK_NAME) -> tuple[bool, str]:
-    # /End is best-effort — the task may be idle (no instance to end), which
-    # returns non-zero; only /Run's result matters. /Create /F rewrites the task
-    # definition but never touches the live process, so a real restart needs /Run.
-    _exec(["schtasks", "/End", "/TN", task_name])
-    return _exec(["schtasks", "/Run", "/TN", task_name])
+    """Cycle the bridge onto the code on disk, and only claim success if it did.
+
+    Stops the LISTENER rather than the scheduled-task instance. The bridge that is
+    actually running is usually NOT one the scheduler launched — `agent connect`
+    and `agent resurrect` both start it with a detached Popen (`_win_start`), which
+    Task Scheduler has no handle on — so `schtasks /End` has nothing to end. And
+    `/Run` exits 0 for merely ATTEMPTING a launch. Together those two reported a
+    confident success while the very same process kept serving the very same code.
+
+    The wait between stop and start is load-bearing: a second instance started
+    while the old one still owns the port finds it taken, recognises the holder as
+    a bridge and returns (``bridge.serve``) — leaving the OLD code serving with
+    /Run's exit code still saying 0.
+    """
+    before = _healthz()
+
+    # Refresh the launcher BEFORE stopping anything: the agent dir moves on a pipx
+    # upgrade, which is precisely when a restart gets called, and doing it here
+    # means an unwritable store dir aborts with the old bridge still serving.
+    try:
+        write_launcher()
+    except OSError as e:
+        return False, f"couldn't refresh the bridge launcher: {e}"
+
+    # A scheduler-launched instance, if there happens to be one. Still best-effort
+    # (an idle task legitimately returns non-zero) but no longer the only stop
+    # path, so its failures are now diagnosable rather than merely swallowed.
+    ended_ok, ended_out = _exec(["schtasks", "/End", "/TN", task_name])
+    if not ended_ok:
+        log.debug("schtasks /End: %s", ended_out)
+
+    # Only ask the holder to stop once we have PROVEN it is our bridge — a blind
+    # POST would fire /shutdown at whatever unrelated local service owns the port.
+    if before is not None:
+        _post_shutdown()
+        if not _wait_gone(_STOP_WAIT_SECONDS):
+            return False, f"the bridge on port {config.BRIDGE_PORT} did not stop"
+
+    ok, out = _exec(["schtasks", "/Run", "/TN", task_name])
+    if not ok:
+        return False, out or "schtasks /Run failed"
+
+    after = _wait_healthz(_START_WAIT_SECONDS)
+    if after is None:
+        # /IT tasks need an interactive session, and the scheduler can decline for
+        # reasons it doesn't report. Fall back to the detached start that
+        # connect/resurrect already depend on, rather than leaving the host with no
+        # bridge at all.
+        started, serr = _win_start()
+        if started:
+            after = _wait_healthz(_START_WAIT_SECONDS)
+        if after is None:
+            return False, f"restart issued but no bridge came back ({serr or 'no listener'})"
+
+    # Same version is NOT a failure — restarting onto identical code is legitimate
+    # (a config change, an operator cycling it) — but it's worth a log line, since
+    # after an upgrade it means the new build isn't what came back.
+    if before and before.get("version") == after.get("version"):
+        log.info("bridge restarted; version unchanged (%s)", after.get("version"))
+    return True, "restarted"
 
 
 # ── Linux: systemd --user service ─────────────────────────────────────────────
@@ -404,8 +540,13 @@ def restart(task_name: str = TASK_NAME) -> tuple[bool, str]:
     disk — the post-update step. A pipx upgrade replaces the package, but the
     running bridge keeps the OLD code in memory until it is cycled, and
     `start_detached` alone can't do it: `systemctl start` / `launchctl start` are
-    no-ops on an already-running unit. Mirrors the backend's `_restart_supervisor`.
-    Refuses (False, "not installed") when nothing is pinned. Never raises."""
+    no-ops on an already-running unit. Mirrors the backend's `_restart_supervisor`
+    (whose Windows branch still has the `/End`+`/Run` defect fixed here — see
+    `_win_restart`).
+
+    Refuses (False, "not installed") when nothing is pinned. Never raises. On
+    Windows it now returns False rather than reporting a success it can't back up:
+    `_win_restart` confirms a bridge is actually listening afterwards."""
     if not is_installed(task_name):
         return False, "not installed"
     if is_windows():

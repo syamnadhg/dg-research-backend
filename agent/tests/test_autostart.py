@@ -218,21 +218,212 @@ def test_restart_uses_kickstart_on_macos(monkeypatch):
     assert f"gui/501/{autostart.LAUNCHD_LABEL}" in flat
 
 
-def test_restart_uses_end_then_run_on_windows(monkeypatch):
-    # /Create rewrites the definition but never touches the live process; only
-    # /End+/Run cycles it. /End is non-zero on an idle task (no instance to end) —
-    # so restart() MUST return /Run's result, not /End's. Differentiate the stub so
-    # a refactor that returned /End's result would fail here.
+# ── Windows restart ───────────────────────────────────────────────────────────
+# These are stubbed and platform-monkeypatched, which is the only thing runnable
+# off Windows — and they therefore CANNOT prove anything about real `schtasks`
+# behaviour. The gate for that is the manual procedure in the handoff doc: watch
+# the port owner's PID across a restart. What these pin is the decision logic:
+# who gets asked to stop, in what order, and when success may be claimed.
+#
+# The shape calls four things the old single test didn't stub; leaving any of them
+# live would sleep ~90s and spawn a real detached bridge, so `_win_env` stubs all
+# of them by default and each test overrides only what it is about.
+
+def _win_env(monkeypatch, *, healthz, run_ok=True, start_ok=True):
+    """Put `restart()` on the Windows branch with every side effect stubbed.
+
+    `healthz` is called with no args and returns the /healthz body (or None) — a
+    list lets a test script "answers, then stops answering". Returns the recorded
+    schtasks argv list plus a dict of what else was called."""
     monkeypatch.setattr(autostart, "is_installed", lambda task_name=autostart.TASK_NAME: True)
     monkeypatch.setattr(autostart.sys, "platform", "win32")
+    seen = {"shutdown": 0, "start": 0, "launcher": 0, "launcher_before_run": None}
     calls = []
 
     def _exec(argv):
         calls.append(argv)
-        return (False, "no running instance") if "/End" in argv else (True, "")
+        if "/End" in argv:
+            return False, "no running instance"   # idle task — must not decide the result
+        if "/Run" in argv:
+            if seen["launcher_before_run"] is None:
+                seen["launcher_before_run"] = seen["launcher"] > 0
+            return run_ok, "" if run_ok else "access denied"
+        return True, ""
+
+    def _start(exe=None, launcher=None):
+        seen["start"] += 1
+        return start_ok, "" if start_ok else "spawn failed"
+
     monkeypatch.setattr(autostart, "_exec", _exec)
-    ok, _ = autostart.restart()
-    assert ok is True, "restart must report /Run's result, not /End's non-zero"
+    monkeypatch.setattr(autostart, "_healthz", lambda timeout=2.0: healthz())
+    monkeypatch.setattr(autostart, "_post_shutdown",
+                        lambda timeout=10.0: seen.__setitem__("shutdown", seen["shutdown"] + 1))
+    monkeypatch.setattr(autostart, "_win_start", _start)
+    monkeypatch.setattr(autostart, "write_launcher",
+                        lambda agentdir=None: seen.__setitem__("launcher", seen["launcher"] + 1))
+    # The waits stay REAL functions over the stubbed _healthz — that's the ordering
+    # logic under test. Shrink their deadlines rather than stubbing them out, and
+    # drop the sleeps; with the deadlines still at 45s a give-up path would spin for
+    # 90 wall-clock seconds per test.
+    monkeypatch.setattr(autostart, "_STOP_WAIT_SECONDS", 0.2)
+    monkeypatch.setattr(autostart, "_START_WAIT_SECONDS", 0.2)
+    monkeypatch.setattr(autostart.time, "sleep", lambda s: None)
+    return calls, seen
+
+
+def _scripted(*bodies):
+    """A `_healthz` stub that returns each body in turn, then repeats the last."""
+    seq = list(bodies)
+
+    def _next():
+        return seq.pop(0) if len(seq) > 1 else seq[0]
+    return _next
+
+
+_LIVE = {"ok": True, "version": "0.1.29"}
+_NEW = {"ok": True, "version": "0.1.30"}
+
+
+def test_win_restart_stops_the_listener_then_confirms_a_new_one(monkeypatch):
+    # The happy path: our bridge is up, so it's asked to stop, and success is only
+    # claimed once something is answering /healthz again.
+    calls, seen = _win_env(monkeypatch, healthz=_scripted(_LIVE, None, _NEW))
+    ok, msg = autostart.restart()
+    assert (ok, msg) == (True, "restarted")
+    assert seen["shutdown"] == 1, "the live bridge must be asked to shut down"
     verbs = [c[1] for c in calls]  # schtasks <verb> ...
     assert "/End" in verbs and "/Run" in verbs
-    assert verbs.index("/End") < verbs.index("/Run")  # End before Run
+    assert verbs.index("/End") < verbs.index("/Run"), "End before Run"
+    assert ok is True, "restart must not report /End's non-zero as the result"
+
+
+def test_win_restart_never_posts_shutdown_at_a_foreign_port_holder(monkeypatch):
+    # /healthz without our marker = someone else owns the port. Firing /shutdown at
+    # an unrelated local service would be the worst possible bug here, so the POST
+    # is gated on having PROVEN it's ours. Starting is still attempted.
+    calls, seen = _win_env(monkeypatch, healthz=_scripted(None, None, _NEW))
+    ok, _ = autostart.restart()
+    assert seen["shutdown"] == 0, "must not POST /shutdown at a non-bridge holder"
+    assert ok is True
+    assert any("/Run" in c for c in calls)
+
+
+def test_win_restart_does_not_run_while_the_old_bridge_still_answers(monkeypatch):
+    # The core of the old bug: /Run against a still-owned port launches an instance
+    # that sees the port taken and exits, leaving the OLD code serving while
+    # schtasks exits 0. So /Run must not be issued until the port is free.
+    calls, seen = _win_env(monkeypatch, healthz=lambda: _LIVE)   # never goes away
+    ok, msg = autostart.restart()
+    assert ok is False
+    assert "did not stop" in msg
+    assert seen["shutdown"] == 1
+    assert not any("/Run" in c for c in calls), "/Run must wait for the port to free"
+
+
+def test_win_restart_falls_back_to_detached_start_when_the_scheduler_declines(monkeypatch):
+    # /Run reports "attempted" and can still start nothing (an /IT task needs an
+    # interactive session). Rather than leave the host bridgeless, fall back to the
+    # same detached start connect/resurrect use.
+    # Nothing answers after /Run until the fallback start has actually run.
+    state = {"started": False, "first": True}
+
+    def _healthz():
+        if state["started"]:
+            return _NEW
+        if state["first"]:              # the pre-existing bridge, once
+            state["first"] = False
+            return _LIVE
+        return None                     # stopped, and /Run brings nothing up
+
+    calls, seen = _win_env(monkeypatch, healthz=_healthz)
+
+    def _start(exe=None, launcher=None):
+        state["started"] = True
+        seen["start"] += 1
+        return True, ""
+    monkeypatch.setattr(autostart, "_win_start", _start)
+    ok, msg = autostart.restart()
+    assert (ok, msg) == (True, "restarted")
+    assert state["started"] is True, "must fall back to the detached start"
+    assert any("/Run" in c for c in calls)
+
+
+def test_win_restart_reports_failure_when_no_bridge_comes_back(monkeypatch):
+    # Never claim success without a live listener — not even when both the
+    # scheduler and the fallback were "issued" without error.
+    _calls, seen = _win_env(monkeypatch, healthz=_scripted(_LIVE, None), start_ok=True)
+    ok, msg = autostart.restart()
+    assert ok is False
+    assert "no bridge came back" in msg
+    assert seen["start"] == 1, "the fallback start must have been attempted"
+
+
+def test_win_restart_surfaces_a_failed_run(monkeypatch):
+    _calls, _seen = _win_env(monkeypatch, healthz=_scripted(_LIVE, None), run_ok=False)
+    ok, msg = autostart.restart()
+    assert ok is False
+    assert "access denied" in msg
+
+
+def test_win_restart_refreshes_the_launcher_before_running_the_task(monkeypatch):
+    # A pipx upgrade moves the agent dir, and the launcher bakes that path in at
+    # write time — so /Run would re-exec a stale launcher. Writing it BEFORE the
+    # stop also means an unwritable store dir aborts with the old bridge intact.
+    calls, seen = _win_env(monkeypatch, healthz=_scripted(_LIVE, None, _NEW))
+    autostart.restart()
+    assert seen["launcher"] >= 1, "the launcher must be refreshed"
+    assert seen["launcher_before_run"] is True, "refresh must precede /Run"
+    run_at = [i for i, c in enumerate(calls) if "/Run" in c]
+    assert run_at, "/Run should have been issued"
+
+
+def test_win_restart_aborts_without_stopping_when_the_launcher_cannot_be_written(monkeypatch):
+    calls, seen = _win_env(monkeypatch, healthz=_scripted(_LIVE))
+
+    def _boom(agentdir=None):
+        raise OSError("read-only store")
+    monkeypatch.setattr(autostart, "write_launcher", _boom)
+    ok, msg = autostart.restart()
+    assert ok is False
+    assert "launcher" in msg
+    assert seen["shutdown"] == 0, "must not stop a working bridge it can't replace"
+    assert calls == [], "must not touch the scheduler either"
+
+
+def test_win_restart_same_version_is_still_success(monkeypatch):
+    # Restarting onto identical code is legitimate (config change, operator cycle).
+    _calls, _seen = _win_env(monkeypatch, healthz=_scripted(_LIVE, None, _LIVE))
+    ok, msg = autostart.restart()
+    assert (ok, msg) == (True, "restarted")
+
+
+def test_healthz_requires_the_bridge_marker(monkeypatch):
+    # Same rule as cli._bridge_up / bridge._port_holder_is_bridge: a foreign server
+    # answering 200 on the port is NOT our bridge.
+    import io
+
+    bodies = {}
+    monkeypatch.setattr(autostart.urllib.request, "urlopen",
+                        lambda url, timeout=None: io.BytesIO(bodies["b"]))
+    for raw, want in ((b'{"ok": true, "version": "1"}', True),
+                      (b'{"ok": true}', False),            # no version
+                      (b'{"version": "1"}', False),        # no ok
+                      (b'["not", "a", "dict"]', False),
+                      (b'<html>nginx</html>', False)):     # not even JSON
+        bodies["b"] = raw
+        assert (autostart._healthz() is not None) is want, raw
+
+
+def test_post_shutdown_uses_post_not_get(monkeypatch):
+    # A bare urlopen(url) sends GET, which /shutdown answers 404 — the restart
+    # would then always time out waiting for a bridge nobody asked to stop.
+    seen = {}
+
+    def _urlopen(req, timeout=None):
+        seen["method"] = req.get_method()
+        seen["url"] = req.full_url
+        raise OSError("connection refused")   # best-effort: must be swallowed
+    monkeypatch.setattr(autostart.urllib.request, "urlopen", _urlopen)
+    autostart._post_shutdown()
+    assert seen["method"] == "POST"
+    assert seen["url"].endswith("/shutdown")
