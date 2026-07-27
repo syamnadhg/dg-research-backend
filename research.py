@@ -10579,6 +10579,16 @@ async def _cua_login_call(page, platform: str, cua_client, heavy: bool = False) 
             cua_client.messages.create,
             model=(VISION_HEAVY_MODEL if heavy else VISION_LIGHT_MODEL),
             max_tokens=8,
+            # Thinking MUST be explicit. On the 5-series models an omitted
+            # `thinking` runs adaptive thinking (on 4.6/4.8 it meant NO thinking),
+            # and max_tokens caps thinking + reply TOGETHER — so this 8-token
+            # budget can be spent entirely on thinking and come back with zero
+            # text blocks. Both callers here read a ONE-WORD verdict, and an
+            # empty read is indistinguishable from a negative answer, so the
+            # failure is silent and fails closed. Disabled is accepted because we
+            # set no effort (defaults to `high`); it is rejected only at
+            # xhigh/max.
+            thinking={"type": "disabled"},
             messages=[{
                 "role": "user",
                 "content": [
@@ -10687,6 +10697,10 @@ async def _probe_cua_available(cua_client) -> None:
             cua_client.messages.create,
             model=VISION_LIGHT_MODEL,
             max_tokens=1,
+            # Keep this a pure liveness ping: the 5-series models think by
+            # default when `thinking` is omitted, which would bill reasoning
+            # tokens on a probe whose only question is "does the key work".
+            thinking={"type": "disabled"},
             messages=[{"role": "user", "content": "ping"}],
         )
     except Exception as e:
@@ -11279,6 +11293,16 @@ async def _cua_pro_tier_call(page, platform: str, cua_client, heavy: bool = Fals
             cua_client.messages.create,
             model=(VISION_HEAVY_MODEL if heavy else VISION_LIGHT_MODEL),
             max_tokens=8,
+            # Thinking MUST be explicit. On the 5-series models an omitted
+            # `thinking` runs adaptive thinking (on 4.6/4.8 it meant NO thinking),
+            # and max_tokens caps thinking + reply TOGETHER — so this 8-token
+            # budget can be spent entirely on thinking and come back with zero
+            # text blocks. Both callers here read a ONE-WORD verdict, and an
+            # empty read is indistinguishable from a negative answer, so the
+            # failure is silent and fails closed. Disabled is accepted because we
+            # set no effort (defaults to `high`); it is rejected only at
+            # xhigh/max.
+            thinking={"type": "disabled"},
             messages=[{
                 "role": "user",
                 "content": [

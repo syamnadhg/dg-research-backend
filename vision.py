@@ -392,6 +392,15 @@ class VisionClient:
                     self._client.messages.create(
                         model=model,
                         max_tokens=512,
+                        # Explicit: the 5-series models think by default when
+                        # `thinking` is omitted, and max_tokens bounds thinking
+                        # + output together. This call FORCES a propose_action
+                        # tool call, so a budget partly spent on reasoning can
+                        # return no tool_use block — which _parse_response reads
+                        # as declare_failure while still consuming a per-run
+                        # budget slot. Keeps the tier byte-identical to the
+                        # behaviour it was tuned and measured against.
+                        thinking={"type": "disabled"},
                         system=_SYSTEM_PROMPT,
                         tools=[_PROPOSE_ACTION_TOOL],
                         tool_choice={"type": "tool", "name": "propose_action"},
