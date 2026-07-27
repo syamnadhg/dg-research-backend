@@ -43,6 +43,11 @@ logs/
 # anything worth keeping graduates to a real file in the repo root.
 scratch/
 
+# Running sr.py straight from this checkout (rather than a deployed Hermes
+# layout) makes _scripts_dir() fall back to the bundle itself, so the watchdog
+# arming writes its cron store here. Real hosts write to HERMES_HOME/cron.
+agent/facade/skill/cron/
+
 # Vision fixtures — hotspot screenshots may contain authed-session UI
 # (email addresses, account chips). Captured locally during E2E via
 # `python vision_test.py --capture NAME` (manual) AND auto-harvested
