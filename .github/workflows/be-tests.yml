@@ -15,6 +15,14 @@ name: Backend Tests
 # are listed per-directory: a bare `requirements.txt` filter matches ONLY the root
 # file, so `agent/requirements.txt` needs its own line or a dependency bump there
 # would land without ever running the tests that depend on it.
+#
+# The two trigger lists must stay IDENTICAL. This file is itself a trigger path so
+# that narrowing the gate — dropping the agent step, moving the Python version,
+# trimming a filter — is a change the gate runs on; it was in `push` but missing
+# from `pull_request`, so exactly that edit could be reviewed with no CI at all.
+# test_ci_gate_covers_both_suites.py now compares the lists per-trigger rather than
+# grepping the whole file, which is why the asymmetry survived a guard that already
+# asserted these filters existed.
 on:
   push:
     paths:
@@ -31,6 +39,7 @@ on:
       - "pyproject.toml"
       - "agent/requirements.txt"
       - "agent/pyproject.toml"
+      - ".github/workflows/be-tests.yml"
   workflow_dispatch: {}
 
 jobs:

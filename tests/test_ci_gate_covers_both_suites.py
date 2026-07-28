@@ -18,6 +18,13 @@ picks up agent/pyproject.toml's ``testpaths`` and puts agent/ on ``sys.path`` so
 ``import facade`` works. Dropping the working-directory silently turns the step
 into a re-run of the root suite, so it is pinned too.
 
+A second review pass found the same failure shape in the TRIGGERS: the workflow
+listed itself under `push` but not under `pull_request`, so a PR whose only change
+was to this file — narrowing the gate, dropping the agent step, moving the Python
+version — was reviewable with no CI run at all. The filters are therefore checked
+per-trigger and pinned equal, not grepped from the whole file; a whole-file grep
+sees a filter that exists under either trigger and calls it covered.
+
 Parsed as text, not YAML: PyYAML is not a declared dependency of this package,
 and the assertions are about literal step content anyway.
 """
@@ -76,16 +83,93 @@ def test_agent_dependencies_are_installed() -> None:
     )
 
 
-@pytest.mark.parametrize("path_filter", ["agent/requirements.txt", "agent/pyproject.toml"])
-def test_agent_dependency_files_are_trigger_paths(path_filter: str) -> None:
+def _trigger_paths(trigger: str) -> list[str]:
+    """The `paths:` filters declared under one trigger (`push` / `pull_request`).
+
+    Per-trigger, deliberately. The earlier version of this guard substring-matched
+    the whole file, which cannot tell WHICH trigger a filter belongs to — and that
+    is precisely how the asymmetry below slipped review: `.github/workflows/
+    be-tests.yml` was listed under `push` only, so a whole-file grep for it passed
+    while pull requests editing the gate ran nothing.
+
+    Hand-parsed by indentation (PyYAML is not a dependency of this package, per the
+    module docstring). Structure assumed: `on:` at column 0, triggers at 2, `paths:`
+    at 4, list items at 6.
+    """
+    out: list[str] = []
+    in_on = in_trigger = in_paths = False
+    for raw in _workflow_text().splitlines():
+        line = raw.rstrip()
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent == 0:
+            in_on, in_trigger, in_paths = stripped == "on:", False, False
+        elif indent == 2 and in_on:
+            # `workflow_dispatch: {}` has a value, so match on the key alone.
+            in_trigger = stripped.split(":", 1)[0] == trigger
+            in_paths = False
+        elif indent == 4 and in_trigger:
+            in_paths = stripped == "paths:"
+        elif indent >= 6 and in_paths and stripped.startswith("- "):
+            out.append(stripped[2:].strip().strip('"').strip("'"))
+    return out
+
+
+# Every filter both triggers must carry. The workflow file itself is on the list:
+# narrowing the gate is the change that most needs the gate to run.
+REQUIRED_PATH_FILTERS = (
+    "**.py",
+    "requirements.txt",
+    "pyproject.toml",
+    "agent/requirements.txt",
+    "agent/pyproject.toml",
+    ".github/workflows/be-tests.yml",
+)
+
+
+@pytest.mark.parametrize("trigger", ["push", "pull_request"])
+def test_the_trigger_paths_were_actually_parsed(trigger: str) -> None:
+    """Guard against the guard: a layout change that breaks parsing must fail loudly.
+
+    Without this, `_trigger_paths` returning [] would make the subset assertions
+    below vacuous in the one direction that matters — and this whole file exists
+    because a vacuously-passing gate is worse than no gate.
+    """
+    assert len(_trigger_paths(trigger)) >= 5, (
+        f"parsed only {_trigger_paths(trigger)!r} under `{trigger}:` — the indentation "
+        "assumptions in _trigger_paths no longer match be-tests.yml."
+    )
+
+
+@pytest.mark.parametrize("trigger", ["push", "pull_request"])
+@pytest.mark.parametrize("path_filter", REQUIRED_PATH_FILTERS)
+def test_required_trigger_paths_are_present_on_both_triggers(trigger: str, path_filter: str) -> None:
     """A bare `requirements.txt` filter matches ONLY the root file.
 
     Without an explicit entry, bumping an agent dependency lands with no CI run
     at all — the one change most likely to break the suite is the one change
-    that doesn't trigger it.
+    that doesn't trigger it. GitHub path filters do not treat `requirements.txt`
+    as matching nested files.
     """
-    assert f'"{path_filter}"' in _workflow_text(), (
-        f"{path_filter} is not in the workflow's trigger paths, so editing it alone "
-        "runs no tests. GitHub path filters do not treat 'requirements.txt' as "
-        "matching nested files."
+    assert path_filter in _trigger_paths(trigger), (
+        f"{path_filter!r} is missing from the `{trigger}:` trigger paths, so a change "
+        f"touching only that file runs no tests on {trigger}."
+    )
+
+
+def test_push_and_pull_request_watch_the_same_paths() -> None:
+    """Asymmetry between the two lists is a silent coverage hole, so pin equality.
+
+    The subset checks above only enforce the filters known TODAY; this catches the
+    next one added to one trigger and forgotten on the other — the actual mistake,
+    which is one of omission rather than of getting a filter wrong.
+    """
+    push, pull = _trigger_paths("push"), _trigger_paths("pull_request")
+    assert set(push) == set(pull), (
+        "be-tests.yml triggers disagree — push-only: "
+        f"{sorted(set(push) - set(pull))}, pull_request-only: {sorted(set(pull) - set(push))}. "
+        "A path watched on push but not on pull_request means the change can be "
+        "REVIEWED with no CI and only tested once it has already landed."
     )

@@ -179,6 +179,22 @@ from pathlib import Path
 pid = int(sys.argv[1]); cfg = json.loads(sys.argv[2])
 pipx = cfg["pipx"]; pkg = cfg["pkg"]; connect_args = cfg["connect_args"]
 restart_args = cfg.get("restart_args") or []
+# Heartbeat straight INTO the log file, not via stdout. Under the cgroup escape
+# systemd-run diverts stdout to the journal, so a print would leave self-update.log
+# empty — indistinguishable from "the waiter never started", which is the one thing
+# the log has to be able to tell us. Writing the path directly makes an EMPTY log a
+# positive signal: no heartbeat means no waiter, full stop. Best-effort and never
+# raises: diagnostics must not be able to break the update they are reporting on.
+_log = cfg.get("log")
+def note(msg):
+    if not _log:
+        return
+    try:
+        with open(_log, "a", encoding="utf-8") as fh:
+            fh.write("[waiter %s] %s\n" % (time.strftime("%H:%M:%S"), msg))
+    except Exception:
+        pass
+note("started (pid %d), waiting for bridge pid %d to exit" % (os.getpid(), pid))
 def alive(p):
     if sys.platform == "win32":
         import ctypes
@@ -233,6 +249,8 @@ def _do_upgrade():
     return False
 if _do_upgrade():
     entry = installed_entry()
+note("upgrade %s; persistent entry %s" % ("ok" if entry else "did not resolve",
+                                          entry or "<none> -> pipx run fallback"))
 # 2) Connect from the persistent install if resolved; else the ephemeral pipx-run
 #    fallback (never worse than before). Both redeploy the skill + re-pin the
 #    launcher + start the new bridge.
@@ -252,6 +270,7 @@ if entry:
             pass
 else:
     subprocess.run(pipx + ["run", "--no-cache", pkg] + connect_args)
+note("finished")
 '''
 
 
@@ -270,6 +289,13 @@ def _waiter_python() -> "str | None":
     the ephemeral `pipx run` venv interpreter (which could be evicted while the
     waiter sleeps). Falls back to the current interpreter."""
     return shutil.which("python3") or shutil.which("python") or sys.executable
+
+
+# How long to wait for the cgroup-escape front-end to report whether systemd
+# ACCEPTED the transient unit. `systemd-run` submits and exits in milliseconds, so
+# this ceiling only bounds the pathological case; it is the longest the
+# /agent-install response can be delayed by the confirmation.
+_ESCAPE_CONFIRM_SECS = 5.0
 
 
 def _cgroup_escape_prefix() -> "list[str]":
@@ -324,10 +350,19 @@ def agent_resolvable() -> bool:
         return False
 
 
-def _spawn_detached(cmd: list, log_name: str) -> bool:
+def _spawn_detached(cmd: list, log_name: str, *, confirm_exit: "float | None" = None) -> bool:
     """Launch `cmd` fully detached (survives this process), logging to
     ~/.super-agent/<log_name>. Returns True if it launched. Stdlib only;
-    cross-platform (Windows DETACHED_PROCESS / POSIX start_new_session)."""
+    cross-platform (Windows DETACHED_PROCESS / POSIX start_new_session).
+
+    `confirm_exit` is for a launcher FRONT-END — a command that submits work and
+    exits immediately, so its exit STATUS is the only report of whether the work
+    was accepted (`systemd-run`, below). With it set, wait up to that many seconds
+    and return False if the front-end exited NON-ZERO. A process still running at
+    the deadline counts as launched: that is the normal case for the long-lived
+    waiter, and it is why this is opt-in rather than the default — polling a child
+    that by design outlives us would turn every spawn into a timeout.
+    """
     logf = subprocess.DEVNULL
     try:
         config.store_dir().mkdir(parents=True, exist_ok=True)
@@ -341,17 +376,28 @@ def _spawn_detached(cmd: list, log_name: str) -> bool:
     else:
         kwargs["start_new_session"] = True
     try:
-        subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT,
-                         stdin=subprocess.DEVNULL, creationflags=creationflags, **kwargs)
-        return True
+        proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, creationflags=creationflags, **kwargs)
     except Exception:
         return False
     finally:
         if logf is not subprocess.DEVNULL:
             try:
-                logf.close()
+                logf.close()  # the child holds its own dup of the fd
             except Exception:
                 pass
+    if confirm_exit is None:
+        return True
+    deadline = time.monotonic() + confirm_exit
+    while time.monotonic() < deadline:
+        try:
+            rc = proc.poll()
+        except Exception:
+            return True  # can't tell — never report a launch as failed on our own error
+        if rc is not None:
+            return rc == 0
+        time.sleep(0.05)
+    return True
 
 
 def spawn_detached_reconnect() -> bool:
@@ -367,7 +413,9 @@ def spawn_detached_reconnect() -> bool:
     unsupervised foreground serve the waiter's connect then binds the freed port;
     on a SUPERVISED host it instead cycles the bridge via `agent restart` (the
     supervisor owns the port, so a reconnect can't rebind it). The waiter is run
-    cgroup-escaped on Linux so systemd can't reap it when the unit restarts."""
+    cgroup-escaped on Linux so systemd can't reap it when the unit restarts — and
+    the escape is CONFIRMED accepted before being trusted, falling back to a plain
+    detached child if systemd rejects the transient unit."""
     pipx = _pipx_cmd()
     py = _waiter_python()
     if pipx is None or py is None:
@@ -384,16 +432,39 @@ def spawn_detached_reconnect() -> bool:
     # serve has no supervisor — there the reconnect's own `serve` binds the port.
     supervised = autostart.is_installed()
     restart_args = ["restart"] if supervised else []
+    # `log`: the waiter appends its own heartbeat here so an empty self-update.log
+    # means "never started" rather than "started and said nothing" — see the note()
+    # helper in the waiter. Resolved HERE because the waiter is stdlib-only and has
+    # no access to config.store_dir().
+    try:
+        log_path = str(config.store_dir() / "self-update.log")
+    except Exception:
+        log_path = None
     cfg = json.dumps({"pipx": pipx, "pkg": AGENT_PKG, "connect_args": connect_args,
-                      "restart_args": restart_args})
+                      "restart_args": restart_args, "log": log_path})
     # Escape the cgroup ONLY when supervised — that's the only case where systemd's
     # KillMode reaps the waiter as the bridge exits. On an unsupervised foreground
     # serve there's no service cgroup, so a plain detached child survives AND its
     # output still lands in self-update.log (systemd-run would divert it to the
     # journal).
     escape = _cgroup_escape_prefix() if supervised else []
-    cmd = escape + [py, "-c", _RECONNECT_WAITER, str(os.getpid()), cfg]
-    return _spawn_detached(cmd, "self-update.log")
+    waiter = [py, "-c", _RECONNECT_WAITER, str(os.getpid()), cfg]
+    # CONFIRM, don't assume. `systemd-run` submits a transient unit and exits — it is
+    # a front-end, not the waiter — so a bare Popen success only means the FRONT-END
+    # started. If systemd then rejects the job (unreachable bus, no user manager
+    # despite XDG_RUNTIME_DIR existing, a broken systemd-run), the old code still
+    # reported success: /agent-install shut the bridge down, nothing upgraded, and
+    # the supervisor brought it back on the OLD version — the same "said updated but
+    # stayed vX" symptom this module's docstring describes, reached by a different
+    # route. Because the front-end exits immediately its exit status is observable,
+    # so a non-zero one means the escape is unusable: fall through to the plain
+    # detached child (the pre-escape behaviour, which merely risks the cgroup reap
+    # instead of guaranteeing no update at all). `--quiet` still lets the rejection
+    # reason through on stderr, which lands in self-update.log above the retry.
+    if escape and _spawn_detached(escape + waiter, "self-update.log",
+                                  confirm_exit=_ESCAPE_CONFIRM_SECS):
+        return True
+    return _spawn_detached(waiter, "self-update.log")
 
 
 def spawn_detached_backend_install() -> bool:

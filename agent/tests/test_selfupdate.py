@@ -184,23 +184,115 @@ def test_spawn_detached_reconnect_supervised_cycles_the_supervisor(tmp_path, mon
     assert cfg["restart_args"] == ["restart"]
 
 
-def test_spawn_detached_reconnect_escapes_cgroup_on_linux(tmp_path, monkeypatch):
-    # On Linux the waiter must run OUTSIDE the bridge's systemd cgroup, or it's
-    # reaped when the unit restarts (the empty self-update.log symptom).
+_ESCAPE = ["systemd-run", "--user", "--collect", "--quiet", "--"]
+
+
+def _escaped_host(tmp_path, monkeypatch, *, escape=None):
+    """A supervised Linux host where the cgroup escape is available."""
     monkeypatch.setattr(selfupdate.config, "store_dir", lambda: tmp_path)
     monkeypatch.setattr(selfupdate, "_pipx_cmd", lambda: ["pipx"])
     monkeypatch.setattr(selfupdate, "_waiter_python", lambda: "python3")
     monkeypatch.setattr(selfupdate.prefs, "get_runtime", lambda: None)
     monkeypatch.setattr(selfupdate.autostart, "is_installed", lambda: True)
     monkeypatch.setattr(selfupdate, "_cgroup_escape_prefix",
-                        lambda: ["systemd-run", "--user", "--collect", "--quiet", "--"])
+                        lambda: list(_ESCAPE if escape is None else escape))
+
+
+def test_spawn_detached_reconnect_escapes_cgroup_on_linux(tmp_path, monkeypatch):
+    # On Linux the waiter must run OUTSIDE the bridge's systemd cgroup, or it's
+    # reaped when the unit restarts (the empty self-update.log symptom).
+    _escaped_host(tmp_path, monkeypatch)
     seen = {}
+    # poll() -> 0: systemd ACCEPTED the transient unit. The front-end is now
+    # confirmed rather than assumed, so the fake has to answer for it.
     monkeypatch.setattr(selfupdate.subprocess, "Popen",
-                        lambda cmd, **kw: seen.update(cmd=cmd) or types.SimpleNamespace())
+                        lambda cmd, **kw: seen.update(cmd=cmd)
+                        or types.SimpleNamespace(poll=lambda: 0))
     assert selfupdate.spawn_detached_reconnect() is True
     cmd = seen["cmd"]
-    assert cmd[:5] == ["systemd-run", "--user", "--collect", "--quiet", "--"]
+    assert cmd[:5] == _ESCAPE
     assert "python3" in cmd and "-c" in cmd  # the waiter still runs, just re-parented
+
+
+def test_a_rejected_cgroup_escape_falls_back_to_a_plain_detached_child(tmp_path, monkeypatch):
+    """systemd-run exiting NON-ZERO must not be reported as a launched update.
+
+    `systemd-run` submits a transient unit and exits, so a bare Popen success only
+    proves the FRONT-END started. When systemd then rejects the job (unreachable
+    bus, no user manager despite the runtime dir existing), the old code returned
+    True: /agent-install shut the bridge down, nothing upgraded, and the supervisor
+    restored the OLD version — "said updated but stayed vX" by a second route.
+    The escape is an optimisation against the cgroup reap, so losing it must
+    degrade to the pre-escape behaviour, never abort the update.
+    """
+    _escaped_host(tmp_path, monkeypatch)
+    calls: list = []
+
+    def fake_popen(cmd, **kw):
+        calls.append(cmd)
+        # First attempt is the escaped one and is rejected; the fallback is the
+        # long-lived waiter, which is still running when we look (poll -> None).
+        return types.SimpleNamespace(poll=lambda: 1 if len(calls) == 1 else None)
+
+    monkeypatch.setattr(selfupdate.subprocess, "Popen", fake_popen)
+    assert selfupdate.spawn_detached_reconnect() is True
+    assert len(calls) == 2, "a rejected escape must be retried unescaped"
+    assert calls[0][:5] == _ESCAPE
+    assert calls[1][0] == "python3", "the fallback must run the waiter directly"
+    assert calls[1][:5] != _ESCAPE
+
+
+def test_the_unescaped_spawn_is_not_polled_for_an_exit_status(tmp_path, monkeypatch):
+    """The waiter OUTLIVES us by design, so confirming its exit would always time out.
+
+    Only the front-end is confirmed. This pins the asymmetry: a fake whose poll()
+    raises proves the unescaped path never consults it.
+    """
+    _escaped_host(tmp_path, monkeypatch, escape=[])  # unsupervised-equivalent: no escape
+
+    def boom():
+        raise AssertionError("the plain detached waiter must not be polled")
+
+    monkeypatch.setattr(selfupdate.subprocess, "Popen",
+                        lambda cmd, **kw: types.SimpleNamespace(poll=boom))
+    assert selfupdate.spawn_detached_reconnect() is True
+
+
+def test_a_still_running_front_end_counts_as_launched(tmp_path, monkeypatch):
+    """Never report a launch as failed just because confirmation timed out.
+
+    A front-end that hasn't exited yet has not been rejected. Returning False here
+    would spawn a redundant SECOND waiter, and two waiters racing the same pipx
+    venv is worse than the reap this escape exists to avoid.
+    """
+    _escaped_host(tmp_path, monkeypatch)
+    monkeypatch.setattr(selfupdate, "_ESCAPE_CONFIRM_SECS", 0.1)
+    calls: list = []
+    monkeypatch.setattr(selfupdate.subprocess, "Popen",
+                        lambda cmd, **kw: calls.append(cmd)
+                        or types.SimpleNamespace(poll=lambda: None))
+    assert selfupdate.spawn_detached_reconnect() is True
+    assert len(calls) == 1, "a slow front-end is not a rejection — no fallback spawn"
+
+
+def test_the_waiter_heartbeats_into_the_log_file_itself(tmp_path, monkeypatch):
+    """Under the escape, stdout goes to the JOURNAL — so the log path is passed in.
+
+    Without a heartbeat written directly to the file, an empty self-update.log is
+    ambiguous between "the waiter never started" and "it started and said nothing",
+    and that distinction is the whole diagnostic value of the file.
+    """
+    _escaped_host(tmp_path, monkeypatch)
+    seen = {}
+    monkeypatch.setattr(selfupdate.subprocess, "Popen",
+                        lambda cmd, **kw: seen.update(cmd=cmd)
+                        or types.SimpleNamespace(poll=lambda: 0))
+    assert selfupdate.spawn_detached_reconnect() is True
+    cfg = json.loads(seen["cmd"][-1])
+    assert cfg["log"] == str(tmp_path / "self-update.log")
+    # The waiter must WRITE to that path, not print — print lands in the journal.
+    assert 'open(_log, "a"' in selfupdate._RECONNECT_WAITER
+    assert "note(" in selfupdate._RECONNECT_WAITER
 
 
 def test_cgroup_escape_prefix_linux_with_systemd_run(monkeypatch, tmp_path):
