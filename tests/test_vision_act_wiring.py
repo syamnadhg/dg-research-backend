@@ -326,10 +326,18 @@ def test_p3_read_only_sites_never_execute():
 # ── P2 DR-setup path (#709 composer-placeholder requirement) ─────────────────
 
 def test_setup_fallback_wrapped_with_placeholder_hint():
-    (blk,) = _block_for(_src(research.start_agent_no_gemini_wait), "setup-dr")
-    assert "mission_prompt=" in blk
-    # #709: DR-active is judged by the composer placeholder, never a pill state.
-    assert "placeholder" in blk.lower()
+    # TWO setup-dr sites since 2026-07-27: the original Playwright-failed fallback,
+    # and the dropped-send re-submit escalation (which replaced the fail-open
+    # "sending anyway (2D verifies the plan)"). EVERY one must carry the contract.
+    blks = _block_for(_src(research.start_agent_no_gemini_wait), "setup-dr")
+    assert len(blks) >= 2, (
+        "the dropped-send re-submit path must also escalate to the CUA setup tier "
+        "rather than sending with Deep Research off"
+    )
+    for blk in blks:
+        assert "mission_prompt=" in blk
+        # #709: DR-active is judged by the composer placeholder, never a pill state.
+        assert "placeholder" in blk.lower()
 
 
 def test_validate_setup_wrapped_no_success_text():

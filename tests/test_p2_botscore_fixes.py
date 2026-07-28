@@ -60,14 +60,42 @@ def test_no_claude_cycle2_reload_in_poll_loop():
         "no DNS-retry state may survive in the poll loop — the machinery "
         "existed only for the removed reload."
     )
-    # The ONLY reload left in the poll loop is the session-expiry re-auth
-    # branch (fires only after a confirmed logged-out detection + user Retry).
-    assert src.count('.reload(') == 1, (
-        "exactly one reload may remain in poll_all_agents_round_robin — the "
-        "session-expiry re-auth branch. Any other mid-run reload is a "
-        "regression of the 2026-07-06 removal."
+    # Exactly THREE reloads may exist, and each must be an explicitly-gated recovery
+    # in a terminal branch — never the periodic/prophylactic reload this test was
+    # written for:
+    #   1. the session-expiry re-auth branch (confirmed logout + user Retry),
+    #   2. the error-verdict rescue (2026-07-27), and
+    #   3. the confirmed-stuck rescue (2026-07-28).
+    # (2) and (3) share ONE latch, so an agent gets at most a single reload per phase.
+    assert src.count('.reload(') == 3, (
+        "only the session-expiry re-auth reload plus the error-verdict and "
+        "confirmed-stuck rescues may reload in the poll loop. A FOURTH reload — "
+        "especially one on the normal polling path — is a regression of the "
+        "2026-07-06 removal."
     )
-    assert "Reload after re-auth failed" in src  # …and it is that branch.
+    assert "Reload after re-auth failed" in src            # branch 1
+    # Branches 2 + 3 share the latch, so the two rescues cannot both fire.
+    assert src.count("_reload_rescue_used") >= 4, (
+        "both rescues must read AND set the same one-shot latch"
+    )
+    # Both rescues live in terminal branches — the ones that would otherwise drop the
+    # agent or raise a card — never on the normal polling path.
+    assert "CUA arbiter: CONFIRMED STUCK" in src and "if is_error:" in src
+    # The rescue must never touch Gemini: its SPA does not restore the conversation
+    # on reload, it lands on the empty home (#897a) — reloading it to "rescue" it
+    # would destroy the run.
+    assert "RELOAD_SAFE" in src and "name in RELOAD_SAFE" in src
+    assert 'RELOAD_SAFE = {"ChatGPT", "Claude"}' in src, (
+        "the reload rescue must stay opt-IN per agent; Gemini must not be included"
+    )
+    # And it must run AFTER the salvage extract, because a mid-run reload can blank
+    # the conversation — the very hazard that got the old reload removed.
+    _err = src[src.index("if is_error:"):]
+    assert _err.index("Salvage extract during error verdict failed") \
+        < _err.index("_reload_rescue_used"), (
+        "the error-verdict reload must come after the salvage extract, or a blanking "
+        "reload destroys the partial output being kept"
+    )
 
 
 def test_claude_artifact_panel_still_opens_in_place():

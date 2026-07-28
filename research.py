@@ -3975,6 +3975,10 @@ _heartbeat_failures = 0
 # on change (see _heartbeat_loop / _device_version_fields).
 _last_published_version_fields: "dict | None" = None
 _version_publish_next_ms = 0
+# One-shot latch: the waiter's update outcome is published exactly once per serve
+# (see _consume_pending_update_result — the sentinel is deleted on read, so this is
+# belt-and-braces against a retry loop re-reading a file that is already gone).
+_update_result_published = False
 # #717 — per-worker liveness pulse, bumped every iteration of
 # _firebase_reconnect_loop (which runs on ALL workers). /api/health surfaces it
 # as `lastTickAt` so the supervisor watchdog can spot a wedged event loop on ANY
@@ -4520,6 +4524,7 @@ async def _heartbeat_loop():
     # rejects `global X` if X has already been read in this scope.
     global _last_heartbeat_at_ms, _heartbeat_failures, _firebase_db, _firebase_down_reason
     global _last_published_version_fields, _version_publish_next_ms
+    global _update_result_published
     while True:
         try:
             # Update top-level `devices/{deviceId}` — BE is signed in as
@@ -4583,6 +4588,33 @@ async def _heartbeat_loop():
                         # persistent 403 retries every ~5 min, not every tick.
                         _version_publish_next_ms = _now_ms + 300_000
                         log(f"[heartbeat] version-signal publish skipped ({_vf_err})", "DEBUG")
+
+                # One-shot: report the outcome of an app-driven update that ran while
+                # this backend was down. Deliberately here rather than at boot — the
+                # heartbeat write above just proved Firestore is reachable, and this
+                # loop is already worker-1-only (single publisher). Ordered AFTER the
+                # version publish so `version` is the post-upgrade one.
+                if not _update_result_published:
+                    try:
+                        _ur = await asyncio.to_thread(_consume_pending_update_result)
+                        if _ur is None:
+                            _update_result_published = True  # nothing to report, ever
+                        elif await asyncio.to_thread(_write_update_status, device_id, _ur):
+                            # Only NOW is it safe to drop the sentinel and stop trying:
+                            # it was the only copy of this outcome.
+                            await asyncio.to_thread(_discard_pending_update_result)
+                            _update_result_published = True
+                            log(f"[update] published pending outcome: state="
+                                f"{_ur.get('state')} current={_ur.get('current')}"
+                                + (f" reason={_ur.get('reason')}" if _ur.get("reason") else ""),
+                                "INFO" if _ur.get("state") == "installed" else "WARN")
+                        else:
+                            # Write failed (rules lag / transient). Keep the sentinel and
+                            # the latch clear so the next heartbeat tick retries.
+                            log("[update] pending outcome not published yet — "
+                                "retrying on the next heartbeat", "WARN")
+                    except Exception as _ur_err:
+                        log(f"[update] pending-outcome publish skipped ({_ur_err})", "WARN")
         except Exception as e:
             _heartbeat_failures += 1
             # #738: the dominant failure is asyncio.TimeoutError, whose str()
@@ -4870,16 +4902,92 @@ async def _revoked_recovery_loop():
 _device_cmd_watch = None  # Firestore Watch handle; kept for lifetime cleanup
 
 
-def _write_update_status(device_id: str, status: dict) -> None:
+def _write_update_status(device_id: str, status: dict) -> bool:
     """Best-effort write of a remote-update outcome to the device doc so the app
     can render it (the same channel as the version signal). `at` is stamped here.
-    Never raises — a rules gap / offline write must not break the listener."""
+    Never raises — a rules gap / offline write must not break the listener.
+
+    Returns True when the write landed. Callers that hold the ONLY copy of an outcome
+    (the heartbeat's sentinel publish) must not discard it on a failed write."""
     try:
         _firebase_db.collection("devices").document(device_id).update({
             "updateStatus": {**status, "at": int(time.time() * 1000)},
         })
+        return True
     except Exception as e:
         log(f"[device-cmds] update-status write skipped: {e}", "DEBUG")
+        return False
+
+
+def _consume_pending_update_result() -> "dict | None":
+    """Read + delete the detached waiter's outcome sentinel and translate it into an
+    `updateStatus` payload. Returns None when no app-driven update ran.
+
+    This is the ONLY path by which a failed self-update can ever reach the app.
+    `_perform_self_update` returns "started" *before* pipx runs — its state enum has
+    no value for "the upgrade ran and failed" because by then the reporting worker
+    has already exited so the venv can be rebuilt. The waiter learns the exit code
+    but holds no credentials, so it leaves the answer on disk (see _LIFECYCLE_WAITER)
+    and whichever backend comes up next publishes it. Pre-fix, a nonzero pipx exit
+    was silent and the About row span until the app's own 5-minute timeout.
+
+    Does NOT delete on success — the caller discards it only once the app has been
+    told, via `_discard_pending_update_result`. This asymmetry is deliberate: the
+    sentinel is the ONLY copy of the outcome, so deleting it before the publish landed
+    would lose the very thing the feature exists to deliver. A MALFORMED sentinel is
+    dropped here, because there is nothing to publish and it must not retry forever.
+    Never raises — a bad sentinel must not block startup."""
+    try:
+        if not _UPDATE_RESULT_PATH.exists():
+            return None
+    except Exception:
+        return None
+    raw: dict = {}
+    try:
+        raw = json.loads(_UPDATE_RESULT_PATH.read_text(encoding="utf-8")) or {}
+    except Exception as _pe:
+        log(f"[update] unreadable update-result sentinel ({_pe}) — discarding", "WARN")
+        _discard_pending_update_result()
+        return None
+    if not raw or raw.get("action") != "upgrade":
+        _discard_pending_update_result()  # nothing publishable — don't retry forever
+        return None
+    running = _sr_version()
+    want = (raw.get("latest") or "").strip()
+    was = (raw.get("current") or "").strip()
+    rc = raw.get("rc")
+    if rc == 0:
+        # pipx succeeded. Confirm against the version we're actually RUNNING rather
+        # than trusting the exit code: a clean upgrade whose restart leg never landed
+        # leaves the old build in memory, so the new files are on disk but the process
+        # serving the app is still the old one. Report that as installed-but-
+        # NEEDS-RESTART rather than a flat failure — the upgrade did land, and the
+        # remedy is a restart, which is exactly what the app's fallback Restart button
+        # issues (the `restart` device command).
+        if want and running == was and want != was:
+            return {"state": "installed", "current": running, "latest": want,
+                    "needsRestart": True,
+                    "reason": f"v{want} is installed but the backend is still running "
+                              f"v{running} — restart it to finish"}
+        return {"state": "installed", "current": running,
+                "latest": want or running, "needsRestart": False, "reason": ""}
+    # Nonzero exit — surface the real pipx error, not just "failed". The tail is what
+    # names the actual cause (e.g. a uv backend that couldn't be resolved).
+    tail = " ".join((raw.get("log_tail") or "").split())
+    reason = f"pipx upgrade failed (exit {rc if rc is not None else 'unknown'})"
+    if tail:
+        reason = f"{reason}: {tail[:400]}"
+    return {"state": "failed", "current": running, "latest": want or None,
+            "reason": reason}
+
+
+def _discard_pending_update_result() -> None:
+    """Drop the waiter's sentinel. Split from the read so the outcome is only thrown
+    away once the app has actually been told (see _consume_pending_update_result)."""
+    try:
+        _UPDATE_RESULT_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def _handle_check_update_command(device_id: str) -> None:
@@ -5091,7 +5199,7 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                     doc.reference.update({"processed": True})
                 except Exception as _de:
                     log(f"[device-cmds] processed-marker write failed for {doc.id}: {_de}", "DEBUG")
-            elif action in ("update", "check-update") and WORKER_ID != 1:
+            elif action in ("update", "check-update", "restart") and WORKER_ID != 1:
                 # Only worker 1 ACTS on `update` / `check-update`. A sibling worker
                 # must NOT delete the doc here — deleting it before worker 1's
                 # Firestore stream delivers the ADDED could drop the command with no
@@ -5670,6 +5778,52 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                 # + versionCheckedAt. Benign (no restart); single-actor like update.
                 if WORKER_ID == 1:
                     _handle_check_update_command(device_id)
+                continue
+
+            if action == "restart":
+                # App-driven plain restart (About-page fallback Restart button). Exists
+                # for ONE case: an upgrade whose files landed but whose restart leg
+                # didn't, so the process serving the app is still the old build
+                # (updateStatus.needsRestart). Cycling the worker makes the supervisor
+                # respawn it from the rebuilt venv.
+                #
+                # Deliberately NOT hard_reset: that sweeps Firestore, cancels the
+                # active run and drains the queue. This is the narrow "finish the
+                # update" action, so it refuses while a run is in progress rather than
+                # silently destroying it — the version bump can wait for an idle moment.
+                #
+                # WORKER 1 ONLY (gated above with update/check-update, same delete-race
+                # reason). Worker 1 owns the heartbeat + version publish, so cycling it
+                # is what makes the app see the new version. A sibling worker keeps the
+                # old build in memory until it next cycles naturally — acceptable for a
+                # rare fallback, and strictly better than hard_reset's collateral.
+                # SUPERVISED-ONLY, same reason `update` refuses: this exits the
+                # worker, and if no OS supervisor (launchd / systemd / Scheduled Task)
+                # is there to relaunch it, a foreground `--serve` never comes back and
+                # the machine is stranded offline by a button press.
+                if not _detect_supervised():
+                    log("[device-cmds] RESTART: not supervised (no OS auto-start) — "
+                        "refusing; nothing would relaunch the backend", "WARN")
+                    _write_update_status(device_id, {
+                        "state": "failed", "current": _sr_version(), "latest": None,
+                        "reason": "not supervised — restart it on the machine"})
+                    continue
+                _r_busy = bool(_QUEUE_STATE.get("running"))
+                try:
+                    _rq = _QUEUE_STATE.get("queue_ref")
+                    if _rq is not None and _rq.qsize() > 0:
+                        _r_busy = True
+                except Exception:
+                    pass
+                if _r_busy:
+                    log("[device-cmds] RESTART: deferred — a run is in progress", "WARN")
+                    _write_update_status(device_id, {
+                        "state": "deferred", "current": _sr_version(), "latest": None,
+                        "reason": "a research run is in progress"})
+                    continue
+                log("[device-cmds] RESTART: cycling this worker so the supervisor "
+                    "respawns it on the installed build")
+                _schedule_server_exit("device-restart", delay_sec=1.5)
                 continue
 
             # Unknown action — already logged above and the doc is
@@ -15884,6 +16038,41 @@ def _emit_chat_mode_alert(platform_l: str, auto_skip_deadline=None):
     )
 
 
+def _park_chat_mode_decision(platform_l: str, label: str, *, why: str) -> None:
+    """Park the NON-BLOCKING chat-mode keep/skip decision for a P2 agent, then let
+    the caller send.
+
+    Gap #1's contract: submit the brief in chat mode NOW (the Send path is
+    mode-agnostic — the pill state decides DR-vs-chat), PARK the decision, and fall
+    through. The old blocking gate froze the single sequential P2 setup coroutine and
+    starved siblings for up to 30 min. `actual="chat"` with
+    `user_acknowledged_chat=False` is what stops the completion ladder green-ticking
+    a fast chat answer as a Deep Research report (#709).
+
+    Shared by BOTH the pre-send gate and the dropped-send RE-SUBMIT recovery. The
+    re-submit path used to just log "sending anyway (2D verifies the plan)" and send
+    — but 2D contains no DR predicate of any kind (it only waits for and clicks
+    'Start research'), so that justification was never implemented and the run went
+    to chat mode silently. Observed 2026-07-27 on `agent-18df1b0011fc4625`: DR
+    measured OFF at 14:47:08, submitted at 14:47:11, no plan ever appeared, CUA burned
+    3 recovery attempts over ~6 min, and the run finished 2/3. Routing both paths
+    through one helper is what keeps them from drifting apart again."""
+    window_sec = float(os.environ.get("DG_CHATMODE_SEC", "1800"))
+    deadline_ms = int((time.time() + window_sec) * 1000)
+    _runtime.agent_modes[platform_l] = {
+        "requested": "research", "actual": "chat",
+        "user_acknowledged_chat": False,
+    }
+    # arm_registry=False stays: the round-robin parked-decision resolver is the
+    # firer (the deadline on the card is only the FE countdown).
+    _emit_chat_mode_alert(platform_l, auto_skip_deadline=deadline_ms)
+    _controls.chat_mode_pending[platform_l] = {
+        "since": time.time(), "timeout": window_sec}
+    log(f"[{label}] chat_mode NON-BLOCKING ({why}) — submitting brief in chat mode + "
+        f"parking keep/skip (no pipeline pause); window={window_sec}s "
+        f"deadline_ms={deadline_ms}", "WARN")
+
+
 def _emit_claude_chat_mode_alert():
     """Back-compat shim — #709 generalized this into _emit_chat_mode_alert."""
     _emit_chat_mode_alert("claude")
@@ -22395,8 +22584,49 @@ async def verify_gemini_generating(page) -> bool:
         return False
 
 
+def _claude_conversation_url(page) -> bool:
+    """True when the tab is on an actual Claude conversation (`/chat/<uuid>`).
+
+    A real submit NAVIGATES claude.ai/new → /chat/<uuid>. While the tab is still on
+    /new (or the root, or the chat list) nothing has been sent, so no amount of DOM
+    activity is evidence that Claude is generating. Kept separate from the DOM probe
+    so both the verifier and the poll loop can gate on the same fact."""
+    try:
+        u = (page.url or "").split("?", 1)[0].split("#", 1)[0].rstrip("/").lower()
+    except Exception:
+        return True  # unreadable URL must not gate — fall back to the DOM probe
+    if not u:
+        return True
+    return "/chat/" in u or "/project/" in u
+
+
 async def verify_claude_generating(page) -> bool:
-    """Check if Claude is actively generating — broad stop button + animation detection."""
+    """Check if Claude is actively generating — URL gate, then broad stop button +
+    animation detection.
+
+    THE URL GATE IS LOAD-BEARING. Without it this function returned True on ANY
+    button whose aria-label/title/text merely contained "stop", or ANY visible
+    element matching [class*=animate|spin|pulse|loading|streaming] with a running
+    animation — none of which implies a send ever landed. On 2026-07-27 it reported
+    `[2B] ✓ Verified — actively generating` and the system called the agent healthy
+    for 8m18s while claude.ai sat on https://claude.ai/new behind a "We couldn't
+    connect to Claude" banner with brief.md still unsent in the composer: `frames`
+    stayed on /new, `text_len` stayed at exactly 74 across both polls, sources=0,
+    steps=0. Only a CUA screenshot eventually caught it, by which point the agent
+    was dropped from rotation and needed a manual hard retry.
+
+    A generating Claude is ALWAYS on a conversation URL, so the gate cannot produce a
+    false negative — it only removes a class of false positive."""
+    if not _claude_conversation_url(page):
+        # Deliberately not silent: "not yet generating" alone would hide the fact
+        # that nothing was ever sent, which is a different problem with a different fix.
+        try:
+            _u = page.url
+        except Exception:
+            _u = "?"
+        log(f"[Claude] not generating — tab is not on a conversation yet (url={_u}); "
+            "the send never landed", "WARN")
+        return False
     try:
         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         await asyncio.sleep(0.3)
@@ -24008,12 +24238,12 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
             browser, cua_client, "https://claude.ai/new",
             PROMPT_CLAUDE_DEEP_RESEARCH,
             p2_claude_setup_directive(),
-            brief_text, "2C-retry", "Claude", verbose, brief_path=brief_path,
+            brief_text, "2B-retry", "Claude", verbose, brief_path=brief_path,
             source_paths=source_paths, reuse_page=reuse_page)
         if not _setup_ok:
             return (new_page, False)
         verified = await wait_until_verified(
-            verify_claude_generating, new_page, "2C-retry",
+            verify_claude_generating, new_page, "2B-retry",
             browser=browser, cua_client=cua_client,
             max_retries=15, interval=3, verbose=verbose)
         return (new_page, verified)
@@ -24023,7 +24253,7 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
             browser, cua_client, "https://gemini.google.com",
             PROMPT_GEMINI_DEEP_RESEARCH,
             "Enable Deep Research mode in Gemini. Do NOT type — just set up and focus input. Say 'ready for paste'.",
-            brief_text, "2B-retry", "Gemini", verbose, brief_path=brief_path,
+            brief_text, "2C-retry", "Gemini", verbose, brief_path=brief_path,
             source_paths=source_paths, reuse_page=reuse_page)
         if not _setup_ok:
             return (new_page, False)
@@ -24044,7 +24274,7 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
             # plan bubble's Start stays grayed forever, so stop waiting for it.
             if await _gemini_research_started(new_page):
                 _auto_started = True
-                log("[2B-retry] Gemini auto-started its research (no Start click needed)", "INFO")
+                log("[2C-retry] Gemini auto-started its research (no Start click needed)", "INFO")
                 break
             try:
                 clicked = await new_page.evaluate(_GEMINI_CLICK_START_JS)
@@ -24094,7 +24324,7 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
         # #953: an auto-started research needs no click — treat it as started so
         # the fresh retry isn't failed while it's genuinely researching.
         if _auto_started:
-            log("[2B-retry] Gemini researching after auto-start — handing to round-robin", "INFO")
+            log("[2C-retry] Gemini researching after auto-start — handing to round-robin", "INFO")
             return (new_page, True)
         if not start_clicked:
             # The user-retry's fresh chat ALSO failed to produce a startable plan
@@ -24104,7 +24334,7 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
                 fail_agent("gemini", *_GEMINI_CANT_START)  # #63: centralized copy
             return (new_page, False)
         verified = await wait_until_verified(
-            verify_gemini_generating, new_page, "2B-retry",
+            verify_gemini_generating, new_page, "2C-retry",
             browser=browser, cua_client=cua_client,
             max_retries=15, interval=3, verbose=verbose)
         return (new_page, verified)
@@ -25289,6 +25519,21 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
         "Gemini": extract_gemini_response,
         "Claude": extract_claude_response,
     }
+    # Used by the reload rescues (error-verdict and confirmed-stuck branches) to
+    # decide whether a reloaded page actually came back generating. Referenced by
+    # BRANCH, not line number — line refs rot, and a stale one already sent one
+    # diagnosis down the wrong path this cycle.
+    verify_fns = {
+        "ChatGPT": verify_chatgpt_generating,
+        "Gemini": verify_gemini_generating,
+        "Claude": verify_claude_generating,
+    }
+    # Agents whose conversation SURVIVES a reload, so the error-verdict rescue may
+    # re-navigate them. GEMINI IS DELIBERATELY EXCLUDED: its SPA no longer restores
+    # the conversation on reload, it lands on the empty home (#897a — the same reason
+    # the periodic Gemini refresh was deleted). Reloading Gemini to rescue it would
+    # destroy the very run being rescued.
+    RELOAD_SAFE = {"ChatGPT", "Claude"}
     # CUA completion check: first at 5 min (MIN_WAIT), then every 5 min.
     # 2026-04-25: dropped from 20→5 to mirror P1 cadence (catches fast finishers).
     _min_agent_wait = int(os.environ.get("MIN_AGENT_WAIT_MIN", "5")) * 60
@@ -25997,9 +26242,29 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # can run from scratch. hard_retry_count starts at 0 since
             # there was no prior attempt counted.
             if _agent_name not in pending:
-                log(f"[{_agent_name}] Hard retry requested for agent that failed pre-pending — seeding pending stub", "INFO")
+                # Recover the agent's still-open tab so Gap #3's warm-tab reuse can
+                # engage. An agent DROPPED from rotation (e.g. the CUA ERROR verdict)
+                # hands its page to `results[name]["page"]` and is never closed, so the
+                # warm, challenge-passed tab is usually still alive. Seeding
+                # "page": None unconditionally is what forced the 2026-07-27 Claude
+                # hard retry onto a COLD claude.ai load — a Cloudflare bot-score event,
+                # the same cost that made P1/P2 share one ChatGPT tab — even though
+                # reuse was already wired and platform-aware: it keys on p["page"],
+                # which the stub had erased. Falls back to a fresh tab if the page is
+                # gone, and hard retry #2 still forces a clean slate.
+                _stub_page = None
+                try:
+                    _prev = results.get(_agent_name) or {}
+                    _cand = _prev.get("page")
+                    if _cand is not None and not _cand.is_closed():
+                        _stub_page = _cand
+                except Exception:
+                    _stub_page = None
+                log(f"[{_agent_name}] Hard retry requested for agent that failed "
+                    f"pre-pending — seeding pending stub"
+                    f"{' (recovered its still-open tab)' if _stub_page else ''}", "INFO")
                 pending[_agent_name] = {
-                    "page": None,
+                    "page": _stub_page,
                     "url": "",
                     "start_time": time.time(),
                     "done_count": 0,
@@ -27655,7 +27920,39 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 if _confirmed_stuck:
                     p["stuck_warned_at"] = time.time()
                     p["stuck_alerted_at"] = time.time()
-                    log(f"[{name}] CUA arbiter: CONFIRMED STUCK — raising [Retry][Skip] card", "WARN")
+                    log(f"[{name}] CUA arbiter: CONFIRMED STUCK", "WARN")
+                    # Try a reload FIRST — a confirmed-stuck page is the one state where
+                    # re-navigating costs nothing, because the alternative is a card the
+                    # user has to answer (or a 30-min auto-skip). The research itself
+                    # runs platform-side; the tab is only a view onto it. Bounded the
+                    # same three ways as the error-verdict rescue: once per agent per
+                    # phase (SHARED latch, so an agent can't get two reloads), only for
+                    # agents whose conversation survives a reload (never Gemini — its
+                    # SPA lands on the empty home, #897a), and only here, never on the
+                    # normal polling path. A recovered agent raises NO card at all.
+                    if (name in RELOAD_SAFE and not p.get("_reload_rescue_used")
+                            and p.get("page") is not None):
+                        p["_reload_rescue_used"] = True
+                        log(f"[{name}] stuck — reloading the tab once before carding it", "WARN")
+                        _unstuck = False
+                        try:
+                            await p["page"].reload(wait_until="domcontentloaded", timeout=30000)
+                            await asyncio.sleep(5)
+                            _unstuck = bool(await verify_fns[name](p["page"]))
+                        except Exception as _sr_err:
+                            log(f"[{name}] stuck-reload failed ({_sr_err}) — carding", "WARN")
+                        if _unstuck:
+                            p["last_growth_time"] = time.time()
+                            p["last_heartbeat"] = time.time()
+                            p["stuck_alerted_at"] = 0.0  # match the retract path's type
+                            log(f"[{name}] recovered after reload — still generating, no "
+                                "card raised (silent self-heal)", "INFO")
+                            continue
+                        log(f"[{name}] still stuck after the reload — raising the "
+                            "[Retry][Skip] card", "WARN")
+                    else:
+                        log(f"[{name}] raising the [Retry][Skip] card (no reload rescue "
+                            f"available for this agent)", "WARN")
                     # #955 Phase 2: ARM the auto-skip deadline on the card itself
                     # (epoch-ms — the FE <AutoSkipCountdown> counts down to this
                     # exact value). _fire_due_autoskips fires it off the SAME
@@ -28261,6 +28558,54 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         label=name, verbose=verbose) or ""
                 except Exception as _e_err:
                     log(f"[{name}] Salvage extract during error verdict failed: {_e_err}", "WARN")
+
+                # ── Reload rescue (ONE per agent per phase) ──────────────────────
+                # Before this, an ERROR verdict was terminal: salvage + fail card +
+                # drop, with no page action of any kind. Nothing in the whole poll
+                # loop could reload or re-navigate — every navigation site in the
+                # module is login, Cloudflare, post-completion extraction, or Gemini
+                # *setup*. So on 2026-07-27 Claude was dropped over a TRANSIENT "We
+                # couldn't connect to Claude. Please check your network connection and
+                # try again." banner, which forced a manual hard retry that then cost
+                # a cold tab and ~20 minutes.
+                #
+                # DELIBERATELY AFTER THE SALVAGE. A mid-run reload can BLANK the
+                # claude.ai conversation — that is exactly why the old cycle-2
+                # prophylaxis reload was removed (#953 / 2026-07-06) — so reloading
+                # first would risk destroying the partial output we are about to keep.
+                # Salvaging first makes the rescue free: worst case we drop with the
+                # same text we would have had anyway.
+                #
+                # Safe because it is bounded three ways: once per agent per phase,
+                # only for agents whose conversation survives a reload (never
+                # Gemini), and only in the error branch — never the normal poll path.
+                # A recovered agent raises NO alert: silent self-heal.
+                if (name in RELOAD_SAFE and not p.get("_reload_rescue_used")
+                        and p.get("page") is not None):
+                    p["_reload_rescue_used"] = True
+                    log(f"[{name}] error verdict — reloading the tab once to rule out "
+                        "a transient page-level failure before dropping the agent "
+                        f"(partial output already salvaged: {len(_err_text)} chars)", "WARN")
+                    _rescued = False
+                    try:
+                        await p["page"].reload(wait_until="domcontentloaded", timeout=30000)
+                        await asyncio.sleep(5)  # let the SPA rehydrate the conversation
+                        # verify_*_generating gates on being on a real conversation
+                        # URL, so a reload that lands blank cannot read as rescued.
+                        _rescued = bool(await verify_fns[name](p["page"]))
+                    except Exception as _rl_err:
+                        log(f"[{name}] error-verdict reload failed ({_rl_err}) — "
+                            "continuing to the drop path", "WARN")
+                    if _rescued:
+                        # Reset the growth clock: what stalled was the broken page,
+                        # not the research.
+                        p["last_heartbeat"] = time.time()
+                        p["last_growth_time"] = time.time()
+                        log(f"[{name}] recovered after reload — still generating, "
+                            "keeping it in rotation (no alert: silent self-heal)", "INFO")
+                        continue
+                    log(f"[{name}] still not generating after the reload — dropping "
+                        "from rotation", "WARN")
                 if not p.get("failed_alert_emitted"):
                     fail_agent(agent_key_err,
                                f"{name} reported an error",
@@ -33588,6 +33933,12 @@ async def ensure_deep_mode_active(page, platform, label, reactivate=True) -> dic
             if selfheal and selfheal.is_enabled():
                 await _selfheal_shadow_observe(page, "chatgpt.enable_deep_research",
                                                outcome_pass=bool(state.get("active")))
+            # Log the POSITIVE outcome too. This probe used to log only when it found
+            # DR off, so silence meant either "passed" or "never ran" — which made
+            # every "DR was fine here" inference unfalsifiable when reading incidents
+            # back (2026-07-27 review). One line per call removes the ambiguity.
+            log(f"[{label}] ChatGPT DR pre-send check: active={bool(state.get('active'))}"
+                f" reactivate={reactivate}", "DEBUG")
             return {"platform": "chatgpt", "active": bool(state.get("active"))}
         if platform_l == "gemini":
             # 2026-05-29 (#709): return the REAL state (was always active=True),
@@ -33625,6 +33976,9 @@ async def ensure_deep_mode_active(page, platform, label, reactivate=True) -> dic
             if selfheal and selfheal.is_enabled():
                 await _selfheal_shadow_observe(page, "gemini.enable_deep_research",
                                                outcome_pass=active)
+            # Positive branch logged too — see the ChatGPT note above.
+            log(f"[{label}] Gemini DR pre-send check: active={active} "
+                f"reactivate={reactivate} placeholder={st.get('placeholder')!r}", "DEBUG")
             return {"platform": "gemini", "active": active}
         if platform_l == "claude":
             # Check BOTH: high-tier Opus model AND Research tool are on.
@@ -33713,6 +34067,10 @@ async def ensure_deep_mode_active(page, platform, label, reactivate=True) -> dic
                                                outcome_pass=bool(state.get("researchOn")))
                 await _selfheal_shadow_observe(page, "claude.select_model",
                                                outcome_pass=bool(state.get("hasExtended")))
+            # Positive branch logged too — see the ChatGPT note above.
+            log(f"[{label}] Claude DR pre-send check: active={ok} reactivate={reactivate}"
+                f" extended={bool(state.get('hasExtended'))}"
+                f" research={bool(state.get('researchOn'))}", "DEBUG")
             return {"platform": "claude", "active": ok,
                     "hasExtended": bool(state.get("hasExtended")),
                     "researchOn": bool(state.get("researchOn"))}
@@ -35093,8 +35451,51 @@ async def _gemini_adopt_lost_conversation(page, pasted_text: str, label: str):
       //    when present, else a no-anchors proxy SCOPED to conversations-list
       //    (an unscoped a[href*="/app/"] would let a stray /app/ link elsewhere
       //    on the page suppress the expand — adversarial-review finding).
-      const rec = q('[data-test-id="expandable-section-toggle"],'
-                    + ' button[aria-label="Toggle Recent" i]');
+      //
+      //    IDENTIFY THE SECTION, DON'T TAKE THE FIRST TOGGLE. `data-test-id=
+      //    "expandable-section-toggle"` is NOT unique — the rail renders
+      //    Notebooks above Recent and both carry it. querySelector with a
+      //    selector LIST returns the first match in DOCUMENT ORDER (it does not
+      //    prefer the earlier selector), so the old single-q() grabbed
+      //    NOTEBOOKS every time: it read Notebooks' aria-expanded, clicked
+      //    Notebooks, and left Recent collapsed with its conversation anchors
+      //    out of the DOM — the sidebar read empty through the whole refresh
+      //    budget and dropped-send recovery re-submitted into a blank home
+      //    instead of adopting. Proven by the rail-diag captured at failure
+      //    (2026-07-20 + 2026-07-27): testid "expandable-section-toggle" with
+      //    aria-label "Toggle Notebooks", and the one expanded
+      //    "expandable-section-content" holding "New notebook". Match the
+      //    toggle by its OWN label/text, and never accept the Notebooks one.
+      const recentish = (el) => {
+        const s = ((el.getAttribute('aria-label') || '') + ' '
+                   + (el.textContent || '')).toLowerCase();
+        return /recent/.test(s) && !/notebook/.test(s);
+      };
+      let rec = null;
+      for (const t of document.querySelectorAll(
+              '[data-test-id="expandable-section-toggle"],'
+              + ' button[aria-label*="Recent" i]')) {
+        if (recentish(t)) { rec = t; break; }
+      }
+      // Last resort for LABEL DRIFT (a toggle with no aria-label/text): identify the
+      // SECTION instead. Key on its data-test-id — live capture 2026-07-28 shows
+      // `notebooks-expandable-section` and `chats-expandable-section` — and only fall
+      // back to text that STARTS with "Recent" (the header renders before the rows).
+      // Deliberately NOT a /notebook/ test against the section's whole textContent:
+      // that text includes the chat TITLES ("RecentOne UI Bug Research Research…"),
+      // so a conversation merely titled "Notebook…" would have made us reject the
+      // real Recent section and give up.
+      if (!rec) {
+        for (const sec of document.querySelectorAll('expandable-section')) {
+          const sid = (sec.getAttribute('data-test-id') || '').toLowerCase();
+          if (sid.includes('notebook')) continue;
+          const stext = (sec.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+          if (!(sid.includes('chat') || sid.includes('recent')
+                || stext.startsWith('recent'))) continue;
+          const t = sec.querySelector('[data-test-id="expandable-section-toggle"], button');
+          if (t) { rec = t; break; }
+        }
+      }
       if (rec) {
         const exp = rec.getAttribute('aria-expanded');
         const hasConvos = !!q('conversations-list a[href*="/app/"]');
@@ -35190,8 +35591,14 @@ async def _gemini_adopt_lost_conversation(page, pasted_text: str, label: str):
             _diag = await page.evaluate(_SIDEBAR_DIAG_JS)
         except Exception:
             _diag = "<diag failed>"
+        # Report the RELOAD count, not the probe count. The loop probes
+        # `_refresh_budget` times but reloads one fewer (the last pass has nothing
+        # left to freshen), so the old wording claimed 5 refreshes where the log
+        # above shows 4 — a one-off discrepancy that cost real time to reconcile
+        # when reading these incidents back.
         log(f"[{label}] sidebar probe: no recent conversation entry after "
-            f"{_refresh_budget} refresh(es) — rail-diag: {str(_diag)[:900]}", "WARN")
+            f"{max(_refresh_budget - 1, 0)} refresh(es) / {_refresh_budget} probe(s)"
+            f" — rail-diag: {str(_diag)[:900]}", "WARN")
         return page, False
     # Check the top one or two OWNED entries — a concurrent worker's similar-
     # titled chat can land ABOVE ours and pass the title-level ownership gate,
@@ -35330,15 +35737,21 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     attach them natively alongside the brief; Gemini gets their text pasted
     (it silently drops file uploads). Empty/None = legacy behavior.
 
-    reuse_page (2026-07-06 bot-score work, ChatGPT/2A only): an already-open,
+    reuse_page (2026-07-06 bot-score work; ChatGPT/2A originally, ALL THREE agents
+    since Gap #3 on 2026-07-15 — see the platform-aware branches below): an already-open,
     still-warm tab on this platform (the Phase-1 ChatGPT tab). When given, we
     REUSE it — client-side "New chat" instead of `new_tab(url)` — because every
     cold top-level load of chatgpt.com is a Cloudflare bot-score event, and P2
     was paying a second one per run (plus holding two ChatGPT surfaces) right
     after P1 already established a warm, challenge-passed tab. The reuse path
     falls back to a same-tab goto, and any failure falls all the way back to
-    the fresh-tab path — behavior-identical worst case. Retries/hard-retries
-    pass None (fresh tab), so recovery still gets a clean slate.
+    the fresh-tab path — behavior-identical worst case.
+
+    Hard retries DO reuse now (Gap #3 reversed the old "retries always pass None"
+    stance): the caller threads the agent's own warm tab and keeps a clean-slate
+    escape hatch on hard retry #2. This docstring claimed the opposite long after
+    that changed, which sent the 2026-07-27 cold-tab diagnosis down the wrong path —
+    the actual gap was the pre-pending stub erasing p["page"].
 
     Two-layer setup for reliability:
     1. Playwright clicks known selectors (fast, deterministic when UI is stable)
@@ -35827,20 +36240,9 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             # Tentative: actual=chat but NOT acknowledged — the park gates
             # finalization (#709 premature green-tick of the fast chat answer)
             # until the user consents.
-            _chat_mode_window_sec = float(os.environ.get("DG_CHATMODE_SEC", "1800"))
-            _chat_mode_deadline_ms = int((time.time() + _chat_mode_window_sec) * 1000)
-            _runtime.agent_modes[platform_l] = {
-                "requested": "research", "actual": "chat",
-                "user_acknowledged_chat": False,
-            }
-            # arm_registry=False stays: the round-robin parked-decision resolver
-            # is the firer (the deadline on the card is only the FE countdown).
-            _emit_chat_mode_alert(platform_l, auto_skip_deadline=_chat_mode_deadline_ms)
-            _controls.chat_mode_pending[platform_l] = {
-                "since": time.time(), "timeout": _chat_mode_window_sec}
-            log(f"[{label}] chat_mode NON-BLOCKING — submitting brief in chat mode + "
-                f"parking keep/skip (no pipeline pause); window={_chat_mode_window_sec}s "
-                f"deadline_ms={_chat_mode_deadline_ms}", "WARN")
+            _park_chat_mode_decision(
+                platform_l, label,
+                why="Layer 1 + Layer 2 + pre-send re-activation all failed")
             # fall through to the Send block → return page, True (parked in the
             # round-robin, which finalizes on Continue or discards on Skip/timeout)
         else:
@@ -36248,14 +36650,84 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                     # appears, and 2D burns its whole plan-wait + CUA budget on
                     # a research that never existed. Re-arm via the same
                     # pre-send helper the normal path uses (paste → ensure →
-                    # send order mirrors it). Fail-open on a measurement miss,
-                    # matching the normal pre-send path — 2D verifies the plan.
+                    # send order mirrors it).
+                    #
+                    # 2026-07-27: this used to log "sending anyway (2D verifies
+                    # the plan)" and send. That justification was never true —
+                    # the 2D block has NO DR predicate at all, it only waits for
+                    # and clicks 'Start research' — so a measured-OFF re-submit
+                    # went to chat mode silently. Observed cost on
+                    # agent-18df1b0011fc4625: DR read active=False at 14:47:08,
+                    # submitted 14:47:11, no plan ever produced, CUA recovery
+                    # exhausted 3 attempts over ~6 min, run finished 2/3.
+                    # setup_gemini_dr's whole contract is "return False so the
+                    # caller's CUA fallback kicks in instead of letting the run
+                    # proceed silently in chat mode" — so honour it here: try the
+                    # CUA setup tier, RE-MEASURE, and only if it is still off park
+                    # the same non-blocking keep/skip gate the pre-send path uses.
+                    # Never a silent chat-mode research.
                     try:
                         _dr_st = await ensure_deep_mode_active(page, platform, label)
                         if not _dr_st.get("active", True):
                             log(f"[{label}] Deep Research still OFF after re-arm "
-                                f"(attempt {_att}/{_max_attempts}) — sending "
-                                "anyway (2D verifies the plan)", "WARN")
+                                f"(attempt {_att}/{_max_attempts}) — escalating to "
+                                "the CUA setup tier before re-submitting", "WARN")
+
+                            async def _resubmit_dr_cua():
+                                return await agent_loop(
+                                    cua_client, browser, prompt_system, prompt_user,
+                                    model=CUA_MODEL, max_iterations=8, verbose=verbose)
+
+                            try:
+                                await _shadow_observed_cua(
+                                    page, hotspot_id="setup-dr", phase=2,
+                                    platform=platform_l,
+                                    current_step="setup_deep_research_mode",
+                                    context_hint=(
+                                        "A dropped send reverted the composer to chat "
+                                        "mode. Re-enable Deep Research for Gemini. DR is "
+                                        "ON only when the composer placeholder reads "
+                                        "'What do you want to research?' (chat mode = "
+                                        "'Ask Gemini'); a visible DR chip alone is NOT "
+                                        "proof — don't toggle a pill that's already "
+                                        "active."),
+                                    expected_outcome=("Deep Research mode is active and "
+                                                      "the input is focused (not typed)"),
+                                    cua_coro_factory=_resubmit_dr_cua,
+                                    mission_prompt=f"{prompt_system}\n\nTASK: {prompt_user}",
+                                    act_timeout_s=120.0)
+                            except Exception as _ce:
+                                log(f"[{label}] DR CUA re-arm raised (non-fatal): {_ce}",
+                                    "DEBUG")
+                            # RE-VERIFY. The CUA tier's own result is not
+                            # trustworthy as proof (that is exactly the
+                            # "proceeding anyway" hole on the first-pass path);
+                            # only a fresh DOM measurement counts.
+                            try:
+                                _dr_st = await ensure_deep_mode_active(page, platform, label)
+                            except Exception:
+                                pass
+                            if _dr_st.get("active", True):
+                                log(f"[{label}] Deep Research recovered by the CUA "
+                                    "setup tier — re-submitting as a real research")
+                            elif (_att >= _max_attempts
+                                    and platform_l not in _controls.chat_mode_pending):
+                                # Park ONLY once, and only after the attempts are
+                                # genuinely spent. This loop runs 3×, so parking on
+                                # first sight would emit three chat-mode cards for one
+                                # agent (a duplicate-alert bug) AND ask the user to
+                                # decide while we were still going to retry the enable
+                                # ladder twice more. The membership check is the
+                                # authoritative de-dupe — the marker survives even a
+                                # hard-retry rebuild of the pending entry.
+                                _park_chat_mode_decision(
+                                    platform_l, label,
+                                    why=f"dropped-send re-submit: DR still off after "
+                                        f"{_max_attempts} re-arm + CUA attempts")
+                            else:
+                                log(f"[{label}] Deep Research still off (attempt "
+                                    f"{_att}/{_max_attempts}) — will re-arm again on "
+                                    "the next attempt", "WARN")
                     except Exception as _dre:
                         log(f"[{label}] DR re-arm raised (non-fatal): {_dre}", "DEBUG")
                     log(f"[{label}] Gemini URL still bare, no error yet — re-submitting "
@@ -53377,8 +53849,12 @@ def _pipx_cmd() -> "list[str] | None":
     PATH; else the shim in the pip --user script dir that `pipx ensurepath` only
     wired for FUTURE shells; else a PATH python's `-m pipx`."""
     import shutil as _shutil
-    if _shutil.which("pipx"):
-        return ["pipx"]
+    # Absolute, not the bare name: this list gets baked into the DETACHED waiter's
+    # argv, and the waiter runs with a PATH we deliberately widen (see
+    # _lifecycle_env). A bare "pipx" would be re-resolved against that wider PATH
+    # and could pick a DIFFERENT pipx than the one this process validated.
+    if _which_pipx := _shutil.which("pipx"):
+        return [_which_pipx]
     # The install one-liner puts pipx there with `pip install --user`, whose
     # script dir is OFF the default PATH until a NEW shell picks up
     # `pipx ensurepath` — so a machine that DID install via the one-liner can have
@@ -53460,6 +53936,13 @@ def _installed_sr_entry() -> "str | None":
         return None
 
 
+# Where the detached waiter leaves the upgrade's real outcome for the NEXT backend
+# to publish. The handoff has to go through disk: the waiter has no credentials (it
+# runs on a non-venv python so it can survive the venv rebuild) and the backend that
+# would have reported is deliberately dead while the rebuild happens. See
+# _LIFECYCLE_WAITER and _consume_pending_update_result.
+_UPDATE_RESULT_PATH = _STATE_DIR / "update_result.json"
+
 # Detached lifecycle waiter (run by a NON-venv Python): waits for THIS process
 # to exit, then runs `pipx <action> superresearch`. Required because
 # `--update`/`--uninstall` run from the very venv pipx must rebuild/delete — on
@@ -53497,6 +53980,44 @@ for _ in range(120):  # wait up to ~60s for the launcher to exit
     time.sleep(0.5)
 time.sleep(2)  # grace for the OS to release the venv's file handles
 rc = subprocess.run(cmd).returncode
+# Record the outcome BEFORE the restart. This process is the only thing that ever
+# learns whether the upgrade actually worked, and it cannot tell the app directly:
+# it runs on a NON-venv python by design, so it has no firebase-admin and no
+# credentials. Without this sentinel a nonzero pipx exit is invisible — the app was
+# already told "started" before pipx even ran, so it spins until its own timeout.
+# Written BEFORE the restart on purpose: `--then--` cycles the supervisor, and a
+# post-restart write would race the new backend's read of this same file.
+_res = os.environ.get("DG_LIFECYCLE_RESULT") or ""
+if _res:
+    try:
+        import json, tempfile
+        _tail = ""
+        if rc != 0:
+            # The waiter's stdout+stderr are already teed to this log by the
+            # spawner, so the real pipx error text is sitting in it. Carry the tail
+            # so the app can show WHY, not just "failed".
+            try:
+                with open(os.environ.get("DG_LIFECYCLE_LOG") or "", "rb") as _f:
+                    try:
+                        _f.seek(-4096, 2)
+                    except Exception:
+                        _f.seek(0)
+                    _tail = _f.read().decode("utf-8", "replace").strip()[-1200:]
+            except Exception:
+                pass
+        _payload = {"action": os.environ.get("DG_LIFECYCLE_ACTION") or "upgrade",
+                    "rc": rc, "at": int(time.time() * 1000),
+                    "current": os.environ.get("DG_LIFECYCLE_FROM") or "",
+                    "latest": os.environ.get("DG_LIFECYCLE_TO") or "",
+                    "restarting": bool(after) and rc == 0,
+                    "log_tail": _tail}
+        _fd, _tmp = tempfile.mkstemp(dir=os.path.dirname(_res) or ".",
+                                     prefix=".update-result-", suffix=".tmp")
+        with os.fdopen(_fd, "w") as _f:
+            json.dump(_payload, _f)
+        os.replace(_tmp, _res)  # atomic — the reader never sees a partial file
+    except Exception:
+        pass
 # Only cycle the supervisor if the upgrade itself succeeded — never restart onto a
 # half-built venv.
 if after and rc == 0:
@@ -53526,7 +54047,75 @@ def _path_python() -> "str | None":
     return cands[0] if cands else None
 
 
-def _spawn_detached_lifecycle(action: str, *, restart_after: bool = False) -> "int | None":
+def _lifecycle_path_dirs() -> "list[str]":
+    """Standard homes for `uv` and the pipx shim, in priority order — prepended to
+    the detached waiter's PATH by `_lifecycle_env`. These are the two tools the
+    upgrade shells out to; a supervisor's own PATH is far narrower."""
+    home = os.path.expanduser("~")
+    if sys.platform == "win32":
+        local = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+        return [
+            os.path.join(home, ".local", "bin"),        # uv's own installer + pipx
+            os.path.join(local, "Programs", "uv"),
+            os.path.join(local, "uv", "bin"),
+            os.path.join(home, ".cargo", "bin"),        # `cargo install uv`
+        ]
+    return [
+        "/opt/homebrew/bin",                            # Apple-silicon Homebrew
+        "/usr/local/bin",                               # Intel Homebrew + manual installs
+        os.path.join(home, ".local", "bin"),            # uv's own installer + pipx
+        os.path.join(home, ".cargo", "bin"),
+    ]
+
+
+def _lifecycle_env(**extra: "str | None") -> dict:
+    """Environment for the detached upgrade/uninstall waiter.
+
+    THE WAITER MUST NOT INHERIT THE SUPERVISOR'S PATH UNCHANGED. pipx records the
+    backend a venv was BUILT with in `pipx_metadata.json` and replays it on every
+    upgrade — and for an EXISTING venv that recorded value beats both `--backend`
+    and `PIPX_DEFAULT_BACKEND`: pipx 1.16's `_resolve_backend_for_venv` forces
+    `cli_backend = None` ("Ignoring --backend=… for existing venv … Run `pipx
+    reinstall`") and `resolve_backend_name`'s precedence is then metadata > env.
+    So a uv-built venv constructs `UvBackend()` unconditionally, and pipx locates
+    uv ONLY through `shutil.which("uv")` (`backends/uv.py:find_uv_binary` — the
+    bundled-extra branch aside, there is no env-var override). **PATH is the only
+    lever there is**, which is why neither workaround pipx's own error message
+    suggests would have helped here.
+
+    That is exactly what broke the app-driven update on a supervised macOS host:
+    the LaunchAgent exports `PATH=/usr/local/bin:/usr/bin:/bin`, Homebrew's uv
+    lives in `/opt/homebrew/bin`, and the waiter inherited that PATH — so `pipx
+    upgrade` died with "The uv backend was requested but the 'uv' executable could
+    not be found" while the SAME command run by hand from a login shell succeeded
+    four minutes later (Research Computer, 2026-07-27: pipx logs 11:09:13 and
+    11:12:32 raised PipxError with "Backend resolved to pip (auto-pip)"; 11:16:58
+    logged "auto-path" → "using path uv 0.11.29 from /opt/homebrew/bin/uv" → rc 0).
+    Prepending the standard uv/pipx homes makes the detached upgrade resolve its
+    backend the way the user's own shell does.
+
+    `extra` carries the waiter's out-of-band parameters (result-file path, log
+    path, version pair). Env rather than argv: argv is world-readable in the
+    process list, and it keeps the waiter's positional contract (`pid [pipx…]
+    [--then-- restart…]`) unchanged."""
+    env = dict(os.environ)
+    parts: list[str] = []
+    seen: set[str] = set()
+    for d in [*_lifecycle_path_dirs(), *(env.get("PATH") or os.defpath).split(os.pathsep)]:
+        if not d or d in seen:
+            continue
+        seen.add(d)
+        parts.append(d)
+    env["PATH"] = os.pathsep.join(parts)
+    for k, v in extra.items():
+        if v is not None:
+            env[k] = str(v)
+    return env
+
+
+def _spawn_detached_lifecycle(action: str, *, restart_after: bool = False,
+                              current: "str | None" = None,
+                              latest: "str | None" = None) -> "int | None":
     """Stop any running supervisor/workers, then spawn a DETACHED waiter that
     runs `pipx <action> superresearch` once THIS process exits. `action` is
     'uninstall' or 'upgrade'. Returns the spawned waiter's PID (truthy) on success,
@@ -53554,6 +54143,13 @@ def _spawn_detached_lifecycle(action: str, *, restart_after: bool = False) -> "i
         logf = open(log_path, "ab")
     except Exception:
         pass
+    # Drop any sentinel left by an EARLIER update before this one can write its own.
+    # A stale file would otherwise be republished as this attempt's outcome (and, if
+    # the waiter dies before writing, would report the wrong result entirely).
+    try:
+        _UPDATE_RESULT_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
     waiter_argv = [str(os.getpid()), *pipx, action, "superresearch"]
     escape: list[str] = []
     entry = None
@@ -53572,6 +54168,26 @@ def _spawn_detached_lifecycle(action: str, *, restart_after: bool = False) -> "i
             log("[device-cmds] UPDATE: couldn't resolve the 'superresearch' console "
                 "script — upgrading in place, but the running build won't cycle until "
                 "the next restart.", "WARN")
+    # PATH widened so pipx can resolve its recorded backend, plus the waiter's
+    # out-of-band parameters (see _lifecycle_env). The result sentinel is what makes
+    # a FAILED upgrade reportable at all — `_perform_self_update` has already
+    # returned "started" by the time pipx runs.
+    env = _lifecycle_env(
+        DG_LIFECYCLE_RESULT=str(_UPDATE_RESULT_PATH) if action == "upgrade" else None,
+        DG_LIFECYCLE_LOG=str(log_path),
+        DG_LIFECYCLE_ACTION=action,
+        DG_LIFECYCLE_FROM=current,
+        DG_LIFECYCLE_TO=latest,
+    )
+    if escape:
+        # systemd-run does NOT hand our environment to the transient unit — it gets
+        # the user manager's, which is the very narrow PATH we just widened. Forward
+        # the keys explicitly, spliced in before the trailing `--`.
+        _fwd = ("PATH", "DG_LIFECYCLE_RESULT", "DG_LIFECYCLE_LOG",
+                "DG_LIFECYCLE_ACTION", "DG_LIFECYCLE_FROM", "DG_LIFECYCLE_TO")
+        escape = (escape[:-1]
+                  + [f"--setenv={k}={env[k]}" for k in _fwd if env.get(k)]
+                  + escape[-1:])
     cmd = escape + [py, "-c", _LIFECYCLE_WAITER, *waiter_argv]
     creationflags = 0
     kwargs: dict = {}
@@ -53587,7 +54203,8 @@ def _spawn_detached_lifecycle(action: str, *, restart_after: bool = False) -> "i
     waiter_pid: "int | None" = None
     try:
         _proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT,
-                                 stdin=subprocess.DEVNULL, creationflags=creationflags, **kwargs)
+                                 stdin=subprocess.DEVNULL, env=env,
+                                 creationflags=creationflags, **kwargs)
         waiter_pid = _proc.pid
     except Exception as e:
         print(f"  Could not launch the background {action} helper: {e}")
@@ -53658,7 +54275,8 @@ def _perform_self_update(*, force_check: bool = True, restart_after: bool = Fals
     latest = _latest_on_pypi(force=force_check)
     if latest and not _version_gt(latest, cur):
         return {"state": "already", "current": cur, "latest": latest, "reason": ""}
-    waiter_pid = _spawn_detached_lifecycle("upgrade", restart_after=restart_after)
+    waiter_pid = _spawn_detached_lifecycle("upgrade", restart_after=restart_after,
+                                           current=cur, latest=latest)
     if waiter_pid:
         # Surface the waiter PID so the caller can protect it from
         # _schedule_server_exit's child-reap (off-Linux the waiter is a direct child;

@@ -20,6 +20,7 @@ matched nothing would otherwise make this test pass forever.
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,14 +47,37 @@ _SCAN_SUFFIXES = {".py", ".md", ".toml", ".yml", ".yaml", ".json", ".txt", ".sh"
 
 
 def _source_files() -> list[Path]:
-    out: list[Path] = []
+    """Files IN THE TREE — git-tracked when git is available, else a filtered walk.
+
+    Tracked-only is the point, not an optimisation. This guard exists so a real
+    address can't be committed where an auditor would read it; a gitignored runtime
+    artifact is not in the tree and cannot leak. A bare filesystem walk conflated the
+    two and flagged `queues/_pending_queue.json` — live run state holding a genuine
+    account address, ignored via `.gitignore:34 queues/*`. That made the test pass in
+    CI (clean checkout, no run state) and fail on any machine that had actually run the
+    pipeline, which is the worst possible failure mode for a guard: it cries wolf
+    exactly where the tree is fine.
+
+    The walk is kept as a fallback so a source tarball (no .git) still gets scanned.
+    """
+    try:
+        out = subprocess.run(["git", "-C", str(ROOT), "ls-files", "-z"],
+                             capture_output=True, text=True, timeout=60, check=True)
+        names = [n for n in out.stdout.split("\0") if n]
+        if names:
+            return [ROOT / n for n in names
+                    if Path(n).suffix.lower() in _SCAN_SUFFIXES and (ROOT / n).is_file()]
+    except Exception:
+        pass  # not a git checkout (or git unavailable) — fall back to the walk
+    files: list[Path] = []
     for p in ROOT.rglob("*"):
         if not p.is_file() or p.suffix.lower() not in _SCAN_SUFFIXES:
             continue
-        if any(part in _SKIP_DIRS or part.endswith(".egg-info") for part in p.relative_to(ROOT).parts):
+        rel = p.relative_to(ROOT).parts
+        if any(part in _SKIP_DIRS or part.endswith(".egg-info") for part in rel):
             continue
-        out.append(p)
-    return out
+        files.append(p)
+    return files
 
 
 def test_the_scan_actually_covers_the_tree() -> None:

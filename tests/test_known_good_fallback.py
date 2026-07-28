@@ -40,7 +40,10 @@ def test_pin_forces_repick_even_when_model_already_ok():
 def test_fallback_runs_before_the_chat_mode_gate_and_is_single_shot():
     src = inspect.getsource(research.start_agent_no_gemini_wait)
     fb = src.find("known-good fallback")
-    gate = src.find("_emit_chat_mode_alert(platform_l")
+    # The park itself now lives in _park_chat_mode_decision (shared with the
+    # dropped-send re-submit recovery); the CALL SITE is what has to sit after the
+    # fallback, so anchor the ordering on that.
+    gate = src.find("_park_chat_mode_decision(")
     assert fb != -1 and gate != -1 and fb < gate, (
         "the known-good fallback must run BEFORE the chat-mode gate fires."
     )

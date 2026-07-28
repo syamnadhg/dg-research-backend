@@ -102,15 +102,33 @@ def test_repaste_ladder_rearms_deep_research_before_resubmit():
     )
 
 
-def test_repaste_ladder_rearm_is_fail_open():
-    # A measurement miss must not block the send (2D verifies the plan
-    # downstream) — matches the normal pre-send path's contract.
+def test_repaste_ladder_rearm_escalates_then_parks_never_sends_silently():
+    """2026-07-27: this path used to be FAIL-OPEN, justified as "2D verifies the
+    plan". It does not — the 2D block has no DR predicate of any kind, it only waits
+    for and clicks 'Start research'. So a measured-OFF re-submit went to chat mode
+    with nothing downstream to catch it (agent-18df1b0011fc4625: DR off at 14:47:08,
+    submitted 14:47:11, no plan, CUA exhausted 3 attempts, run finished 2/3).
+
+    The contract now: re-arm → CUA setup tier → RE-MEASURE → park the non-blocking
+    keep/skip gate if still off. Still never blocks the send; it just stops the run
+    silently pretending to be a Deep Research."""
     ladder = _ladder_region()
-    i_ensure = ladder.index("ensure_deep_mode_active(")
-    tail = ladder[i_ensure:]
-    assert "sending" in tail and "anyway" in tail, (
-        "an inactive-after-re-arm state logs + proceeds (fail-open)"
+    tail = ladder[ladder.index("ensure_deep_mode_active("):]
+    # The false justification must be gone.
+    assert "2D verifies the plan" not in tail, (
+        "the '2D verifies the plan' claim is not implemented anywhere — 2D has no DR "
+        "predicate; it must not be used to justify sending with DR off"
     )
+    # Escalate to the CUA setup tier…
+    assert 'hotspot_id="setup-dr"' in tail, "no CUA setup escalation on the retry path"
+    # …then RE-MEASURE (the CUA tier's own result is not proof — that is exactly the
+    # "proceeding anyway" hole on the first-pass path).
+    assert tail.count("ensure_deep_mode_active(") >= 2, (
+        "DR must be re-measured after the CUA setup tier, not assumed fixed"
+    )
+    # …and park the SAME gate the pre-send path uses, rather than inventing one.
+    assert "_park_chat_mode_decision(" in tail
+    # Measurement failures still must not block the send.
     assert "DR re-arm raised (non-fatal)" in tail
 
 

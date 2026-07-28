@@ -70,13 +70,18 @@ class TestPerformSelfUpdate:
         monkeypatch.setattr(research, "_sr_version", lambda: "0.1.5")
         monkeypatch.setattr(research, "_latest_on_pypi", lambda *, force=False: "0.1.6")
 
-        def _spawn(action, *, restart_after=False):
+        def _spawn(action, *, restart_after=False, current=None, latest=None):
             seen["restart_after"] = restart_after
+            seen["versions"] = (current, latest)
             return 7777
         monkeypatch.setattr(research, "_spawn_detached_lifecycle", _spawn)
         res = research._perform_self_update(restart_after=True)
         assert seen["restart_after"] is True, "restart_after must propagate to the spawner"
         assert res["state"] == "started" and res["waiter_pid"] == 7777
+        # The version pair must reach the spawner too — it's what the waiter records
+        # in its outcome sentinel, and what lets the consumer tell "installed" from
+        # "installed but still running the old build".
+        assert seen["versions"] == ("0.1.5", "0.1.6")
         # And the CLI default must NOT request a restart.
         research._perform_self_update()
         assert seen["restart_after"] is False
@@ -96,10 +101,15 @@ class TestPipxCmdDiscovery:
         monkeypatch.setattr(shutil, "which", lambda _n: None)
         monkeypatch.setattr(research.os.path, "expanduser", lambda p: str(home))
 
-    def test_prefers_shim_on_path(self, monkeypatch):
+    def test_prefers_shim_on_path_as_an_absolute_path(self, monkeypatch):
+        # ABSOLUTE, not the bare name. This list is baked into the detached waiter's
+        # argv, and the waiter runs with a deliberately WIDENED PATH (_lifecycle_env
+        # prepends /opt/homebrew/bin et al so pipx can resolve its uv backend). A
+        # bare "pipx" would be re-resolved against that wider PATH and could pick a
+        # different pipx — with a different venv home — than the one we validated.
         import shutil
         monkeypatch.setattr(shutil, "which", lambda n: "/usr/bin/pipx" if n == "pipx" else None)
-        assert research._pipx_cmd() == ["pipx"]
+        assert research._pipx_cmd() == ["/usr/bin/pipx"]
 
     def test_finds_macos_user_shim_off_path(self, monkeypatch, tmp_path):
         self._no_path_pipx(monkeypatch, tmp_path)
@@ -365,8 +375,12 @@ class TestRestartAfterUpgrade:
         self._popen(monkeypatch, seen=seen)
         assert research._spawn_detached_lifecycle("upgrade", restart_after=True) == self.WAITER_PID
         cmd = seen["cmd"]
-        # cgroup-escaped
-        assert cmd[:5] == ["systemd-run", "--user", "--collect", "--quiet", "--"]
+        # cgroup-escaped. `--setenv=` flags are spliced in before the `--` separator:
+        # systemd-run hands the transient unit the USER MANAGER's environment, not
+        # ours, so the widened PATH has to be passed explicitly (see _lifecycle_env).
+        assert cmd[:4] == ["systemd-run", "--user", "--collect", "--quiet"]
+        _sep = cmd.index("--")
+        assert all(a.startswith("--setenv=") for a in cmd[4:_sep]), cmd[4:_sep]
         # runs the waiter, which upgrades then restarts the installed build
         assert "--then--" in cmd
         tail = cmd[cmd.index("--then--") + 1:]
@@ -633,3 +647,106 @@ class TestLifecycleHelpers:
         monkeypatch.setattr(shutil, "which", lambda n: None)
         monkeypatch.setattr(research, "_pipx_cmd", lambda: None)
         assert research._installed_sr_entry() is None
+
+
+# ── The uv-backend PATH trap (Research Computer, 2026-07-27) ───────────────────
+
+class TestLifecycleEnvPath:
+    """The app-driven update hung forever because the detached upgrade inherited the
+    supervisor's PATH. pipx replays the backend recorded in `pipx_metadata.json` on
+    every upgrade, and for an EXISTING venv that recorded value beats both
+    `--backend` and `PIPX_DEFAULT_BACKEND` (pipx 1.16 forces `cli_backend = None`
+    with "Ignoring --backend=… for existing venv"; precedence is metadata > env).
+    pipx then finds uv only via `shutil.which("uv")` — there is no env override. So
+    a uv-built venv under a LaunchAgent exporting
+    `PATH=/usr/local/bin:/usr/bin:/bin` could never see Homebrew's
+    /opt/homebrew/bin/uv, and died with "the 'uv' executable could not be found"
+    while the same command in a login shell succeeded. PATH is the only lever."""
+
+    def test_prepends_the_uv_homes_ahead_of_the_inherited_path(self, monkeypatch):
+        monkeypatch.setattr(research.sys, "platform", "darwin")
+        monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin:/bin")  # the LaunchAgent's
+        got = research._lifecycle_env()["PATH"].split(":")
+        assert "/opt/homebrew/bin" in got, "Homebrew uv would still be invisible"
+        assert got.index("/opt/homebrew/bin") < got.index("/usr/bin")
+
+    def test_keeps_the_inherited_path_entries(self, monkeypatch):
+        monkeypatch.setattr(research.sys, "platform", "darwin")
+        monkeypatch.setenv("PATH", "/opt/custom/bin:/usr/bin")
+        got = research._lifecycle_env()["PATH"].split(":")
+        assert "/opt/custom/bin" in got and "/usr/bin" in got
+
+    def test_no_duplicate_path_entries(self, monkeypatch):
+        # /usr/local/bin is in BOTH our prepend list and the LaunchAgent PATH.
+        monkeypatch.setattr(research.sys, "platform", "darwin")
+        monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin:/bin")
+        got = research._lifecycle_env()["PATH"].split(":")
+        assert len(got) == len(set(got)), got
+
+    def test_windows_uses_windows_homes(self, monkeypatch):
+        monkeypatch.setattr(research.sys, "platform", "win32")
+        dirs = research._lifecycle_path_dirs()
+        assert any("uv" in d for d in dirs)
+        assert not any(d.startswith("/opt/homebrew") for d in dirs)
+
+    def test_extras_land_in_the_env_and_none_is_dropped(self, monkeypatch):
+        env = research._lifecycle_env(DG_LIFECYCLE_TO="0.1.11", DG_LIFECYCLE_FROM=None)
+        assert env["DG_LIFECYCLE_TO"] == "0.1.11"
+        assert "DG_LIFECYCLE_FROM" not in env
+
+    def test_spawn_passes_the_widened_env_to_popen(self, monkeypatch, tmp_path):
+        """The whole fix is inert unless Popen actually receives env=."""
+        monkeypatch.setattr(research, "_STATE_DIR", tmp_path)
+        monkeypatch.setattr(research, "_UPDATE_RESULT_PATH", tmp_path / "update_result.json")
+        monkeypatch.setattr(research, "_pipx_cmd", lambda: ["/usr/bin/pipx"])
+        monkeypatch.setattr(research, "_path_python", lambda: "/usr/bin/python3")
+        monkeypatch.setattr(research, "_cgroup_escape_prefix", lambda: [])
+        monkeypatch.setattr(research.sys, "platform", "darwin")
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        seen = {}
+
+        class _P:
+            pid = 4242
+
+            def __init__(self, cmd, **kw):
+                seen["cmd"], seen["kw"] = cmd, kw
+
+        monkeypatch.setattr(research.subprocess, "Popen", _P)
+        monkeypatch.setattr(research, "_enumerate_research_py_procs", lambda: [])
+        assert research._spawn_detached_lifecycle("upgrade", current="0.1.9",
+                                                 latest="0.1.10") == 4242
+        env = seen["kw"]["env"]
+        assert "/opt/homebrew/bin" in env["PATH"].split(":")
+        assert env["DG_LIFECYCLE_FROM"] == "0.1.9" and env["DG_LIFECYCLE_TO"] == "0.1.10"
+        assert env["DG_LIFECYCLE_RESULT"].endswith("update_result.json")
+
+    def test_systemd_run_gets_explicit_setenv(self, monkeypatch, tmp_path):
+        """systemd-run does NOT hand our environment to the transient unit — it gets
+        the user manager's, i.e. the very narrow PATH we just widened. Without an
+        explicit --setenv the Linux escape path would silently drop the fix."""
+        monkeypatch.setattr(research, "_STATE_DIR", tmp_path)
+        monkeypatch.setattr(research, "_UPDATE_RESULT_PATH", tmp_path / "update_result.json")
+        monkeypatch.setattr(research, "_pipx_cmd", lambda: ["/usr/bin/pipx"])
+        monkeypatch.setattr(research, "_path_python", lambda: "/usr/bin/python3")
+        monkeypatch.setattr(research, "_installed_sr_entry", lambda: "/usr/local/bin/superresearch")
+        monkeypatch.setattr(research, "_cgroup_escape_prefix",
+                            lambda: ["/usr/bin/systemd-run", "--user", "--collect", "--quiet", "--"])
+        monkeypatch.setattr(research.sys, "platform", "linux")
+        seen = {}
+
+        class _P:
+            pid = 7
+            def __init__(self, cmd, **kw):
+                seen["cmd"] = cmd
+
+        monkeypatch.setattr(research.subprocess, "Popen", _P)
+        monkeypatch.setattr(research, "_enumerate_research_py_procs", lambda: [])
+        research._spawn_detached_lifecycle("upgrade", restart_after=True,
+                                           current="0.1.9", latest="0.1.10")
+        cmd = seen["cmd"]
+        setenvs = [a for a in cmd if a.startswith("--setenv=")]
+        assert any(a.startswith("--setenv=PATH=") for a in setenvs), cmd
+        assert any(a.startswith("--setenv=DG_LIFECYCLE_RESULT=") for a in setenvs), cmd
+        # …and they must sit BEFORE the `--` separator, else systemd-run treats them
+        # as arguments to the command rather than its own flags.
+        assert cmd.index("--") > max(cmd.index(a) for a in setenvs)

@@ -32,6 +32,11 @@ MOD_SRC = inspect.getsource(research)
 FAIL_AGENT_SRC = inspect.getsource(research.fail_agent)
 HV_FINALIZE_SRC = inspect.getsource(research._hv_auto_skip_finalize)
 START_AGENT_SRC = inspect.getsource(research.start_agent_no_gemini_wait)
+# The chat-mode park was extracted into a helper so the pre-send gate and the
+# dropped-send re-submit recovery share ONE mechanism (2026-07-27) — the behaviour
+# these tests pin now spans both, so read them together.
+START_AGENT_SRC_WITH_PARK = (START_AGENT_SRC
+                             + inspect.getsource(research._park_chat_mode_decision))
 
 
 # ── Phase-gated per-agent error id ────────────────────────────────────────────
@@ -151,9 +156,9 @@ def test_chat_mode_gate_is_non_blocking():
     # sequential setup coroutine + starved siblings for up to 30 min). It submits
     # the brief in chat mode, records chat_mode_pending, and falls through — so
     # start_agent has NO request_pause / await_agent_decision for chat_mode.
-    assert 'request_pause(f"{platform_l}_chat_mode")' not in START_AGENT_SRC
-    assert "await_agent_decision(platform_l" not in START_AGENT_SRC
-    assert "chat_mode_pending[platform_l]" in START_AGENT_SRC
+    assert 'request_pause(f"{platform_l}_chat_mode")' not in START_AGENT_SRC_WITH_PARK
+    assert "await_agent_decision(platform_l" not in START_AGENT_SRC_WITH_PARK
+    assert "chat_mode_pending[platform_l]" in START_AGENT_SRC_WITH_PARK
 
 
 def test_chat_mode_marker_popped_on_send_failure():

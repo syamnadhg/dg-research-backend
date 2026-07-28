@@ -144,9 +144,14 @@ def test_gemini_retry_repastes_when_composer_empty():
         "re-clicking Send against it is a guaranteed no-op (all 3 incident "
         "retries were no-ops)"
     )
-    block = src[src.index("Gemini URL still bare, no error yet") - 2500:
-                src.index("Gemini URL still bare, no error yet")]
-    assert "verified_paste_brief" in block, (
+    # Anchor on ORDERING, not a fixed byte window: the block between the
+    # empty-composer detection and the re-submit has since grown (the DR re-arm now
+    # escalates to the CUA setup tier and re-measures), and a magic -2500 lookback
+    # silently stopped covering the paste.
+    i_empty = src.index("composer is EMPTY on retry")
+    i_resend = src.index("Gemini URL still bare, no error yet")
+    assert i_empty < i_resend, "the empty-composer check must precede the re-submit"
+    assert "verified_paste_brief" in src[i_empty:i_resend], (
         "on an empty composer the loop must re-paste the brief BEFORE re-sending"
     )
 
