@@ -10,6 +10,33 @@ CLI and the chat skill both call it over HTTP — they never refresh themselves.
   * exposes the account operations: /status /researches /devices /research.
 
 Bound to 127.0.0.1 only; every request is Host- and (for writes) Origin-checked.
+
+TRUST MODEL — stated rather than implied, because the implication is easy to
+read the wrong way. The complete write-authorization model is:
+
+    loopback bind  +  Host allow-list (``_host_ok``)  +  Origin check (``_origin_ok``)
+
+There is NO per-caller authentication on any route. Every process running as
+any user on this host can therefore POST to all of them, including the
+privileged ones — ``/device/remove``, ``/shutdown``, ``/install-backend`` and
+``/agent-install`` (which reaches ``selfupdate``'s install-and-exec path). That
+is a deliberate choice for the single-user Research computer this runs on: the
+two callers are the host CLI and the chat skill, and requiring a key exchange
+would mean a bare ``superresearch-agent status`` could not work.
+
+Two things this model is NOT, so nobody over-trusts it:
+
+  * ``secrets.compare_digest`` on ``loginToken`` (``_login_callback``) is not a
+    caller credential. It is a one-shot CSRF nonce for the browser sign-in page,
+    and ``GET /login/config`` hands it to any local caller that asks. It stops a
+    cross-origin page replaying a capture; it authenticates nobody.
+  * Loopback is not a user boundary. On a shared or multi-user host every local
+    account reaches this port, so the assumption above stops holding — gating the
+    privileged routes behind a 0600 token file is tracked separately.
+
+``_origin_ok`` returning True for an ABSENT Origin is intentional and required:
+non-browser callers (the CLI) send no Origin header, while any browser write
+carries one and is checked against the actual bound port.
 """
 
 from __future__ import annotations

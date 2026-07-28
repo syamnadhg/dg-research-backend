@@ -20,6 +20,25 @@ PROJECT_ID: str = os.environ.get("SUPER_AGENT_PROJECT_ID", "super-research-49281
 # Public Web API key. NOT a secret — it is the same value shipped in the web
 # app's client bundle and in research-automate/auth/v2_flow.py. It only
 # identifies the project to securetoken.googleapis.com / identitytoolkit.
+#
+# What actually protects the data this key can address is FIRESTORE RULES, and
+# nothing else — App Check is NOT enforced on any of these paths, so do not
+# reason about this key as if it were. The relevant guarantees, in the FE repo's
+# `firestore.rules` (super-research-frontend):
+#
+#   devices/{deviceId}          read requires auth AND owner/sharer/synthetic-uid
+#                               membership; create + delete are admin-SDK only.
+#   .../pending/{secretHash}    `allow get: if true` but `allow list: if false`,
+#                               and the path segment is sha256(pollSecret) whose
+#                               source lives admin-only under _internal/ — so the
+#                               custom-token inbox can be fetched only by someone
+#                               who already knows the secret, and never enumerated.
+#                               All writes are admin-SDK only.
+#   _internal/{document=**}     read+write denied to every client unconditionally.
+#
+# i.e. holding this key gets an unauthenticated caller no reads, no writes, and
+# no enumeration. If App Check is ever actually turned on, say so here; until
+# then this comment is the whole story.
 WEB_API_KEY: str = os.environ.get(
     "SUPER_AGENT_WEB_API_KEY", "AIzaSyDTjXwU_uOwGrsuf7nuJTfQAZg4dTjSAMk"
 )

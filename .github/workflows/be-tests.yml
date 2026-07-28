@@ -1,25 +1,36 @@
 name: Backend Tests
 
-# Runs the pytest suite on every backend change so a regression is caught before
+# Runs BOTH pytest suites on every backend change so a regression is caught before
 # merge — the BE counterpart to the FE's firestore-rules gate, satisfying the
-# git-workflow "verify CI passes after every push" rule.
+# git-workflow "verify CI passes after every push" rule. Two suites, because the
+# repo holds two packages: `superresearch` (root tests/) and `superresearch-agent`
+# (agent/tests/). A gate that runs one and reports for both is worse than no gate.
 #
 # Pytest only (no ruff gate): the repo intentionally ships NO [tool.ruff] config
 # (see pyproject.toml) and carries a large pre-existing style baseline, so a full
 # `ruff check` would be all-noise. Lint is enforced per-change locally, not in CI.
 
+# `**.py` covers agent/ too, so an agent-only edit fires this workflow — which is
+# exactly why the agent suite has to run below. The requirements/pyproject entries
+# are listed per-directory: a bare `requirements.txt` filter matches ONLY the root
+# file, so `agent/requirements.txt` needs its own line or a dependency bump there
+# would land without ever running the tests that depend on it.
 on:
   push:
     paths:
       - "**.py"
       - "requirements.txt"
       - "pyproject.toml"
+      - "agent/requirements.txt"
+      - "agent/pyproject.toml"
       - ".github/workflows/be-tests.yml"
   pull_request:
     paths:
       - "**.py"
       - "requirements.txt"
       - "pyproject.toml"
+      - "agent/requirements.txt"
+      - "agent/pyproject.toml"
   workflow_dispatch: {}
 
 jobs:
@@ -40,3 +51,19 @@ jobs:
 
       - name: Run tests
         run: python -m pytest tests/ -q
+
+      # The agent is a SECOND package with its own suite, its own dependency file
+      # and its own pytest config — root `pytest tests/` never enters agent/, so
+      # without this step editing agent/facade/*.py fired the workflow above and
+      # reported green while running none of that file's tests.
+      #
+      # `working-directory: agent` is load-bearing twice over: it picks up
+      # agent/pyproject.toml's `testpaths`, and `python -m` puts agent/ on sys.path
+      # so `import facade` resolves. Deps are installed explicitly rather than
+      # relying on the root file happening to carry compatible floors for them.
+      - name: Install agent dependencies
+        run: pip install -r agent/requirements.txt
+
+      - name: Run agent tests
+        run: python -m pytest tests -q
+        working-directory: agent

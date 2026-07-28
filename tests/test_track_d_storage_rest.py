@@ -8,10 +8,8 @@ download-token URL construction.
 from __future__ import annotations
 
 import importlib
-from pathlib import Path
 
 import requests
-import pytest
 
 research = importlib.import_module("research")
 

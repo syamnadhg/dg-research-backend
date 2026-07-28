@@ -8,6 +8,25 @@ first claim until a Reset Pair Code event rotates it.
 Alphabet: 31 characters — digits 2-9 (8) + uppercase A-Z minus I, L, O (23).
 Excludes 0 (zero) and 1 (one) so they can't be confused with O and I/L
 when typed by a human reading their phone.
+
+Why 8 chars is enough despite the code being PERMANENT (no TTL shrinks the
+window): 31^8 ≈ 8.5e11, i.e. ~39.6 bits, which is not on its own a
+brute-force-resistant secret. What makes it safe is that guessing is throttled
+and authenticated, both of which live in the FE repo, not here:
+
+  * ``POST /api/devices/claim`` rejects an unauthenticated caller outright
+    (``verifyRequest`` → 401), so an attacker needs a real Firebase account
+    before they can submit a single guess;
+  * every attempt then passes ``checkAndIncrement("claim:<uid>", 5, 5*60*1000)``
+    — 5 tries per 5 minutes per uid, a rolling window stored in Firestore at
+    ``_internal/rate_limits/entries/{key}`` (denied to all clients by rules, so
+    the counter can't be cleared) rather than in memory, which on Cloud Run
+    would reset on every cold start and never be shared across instances.
+
+At one guess per minute per account, exhausting the space takes ~1.6 million
+years, so the entropy is not the limiting factor. If that throttle is ever
+removed, this code needs a TTL — it only has to survive the seconds between the
+BE terminal printing it and the user typing it into the Account page.
 """
 
 from __future__ import annotations

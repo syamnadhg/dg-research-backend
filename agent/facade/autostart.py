@@ -322,6 +322,21 @@ def systemd_unit_path() -> Path:
 
 
 def systemd_unit_source(exe: str | None = None, launcher: Path | None = None) -> str:
+    """The `systemd --user` unit text.
+
+    `Environment=XDG_RUNTIME_DIR` is load-bearing for SELF-UPDATE, not cosmetic.
+    ``selfupdate._cgroup_escape_prefix()`` only emits its `systemd-run --user`
+    wrapper when a user bus looks reachable, and a unit's environment is not the
+    login shell's. Without the escape the update waiter stays in this unit's
+    cgroup and systemd's default KillMode=control-group reaps it the instant the
+    bridge exits — exactly the documented failure (an empty self-update.log and a
+    bridge stuck on the old version). The user manager normally exports this
+    variable to its own units already; stating it makes the dependency explicit
+    and covers a host where it isn't propagated. `%U` is the unit owner's numeric
+    uid, expanded by systemd, and /run/user/$UID is systemd's own default. If a
+    host puts the runtime dir elsewhere, the escape degrades to a plain detached
+    child rather than failing (see the isdir guard in _cgroup_escape_prefix).
+    """
     e = exe or sys.executable
     p = str(launcher or launcher_path())
     return (
@@ -332,6 +347,7 @@ def systemd_unit_source(exe: str | None = None, launcher: Path | None = None) ->
         "[Service]\n"
         "Type=simple\n"
         f'ExecStart="{e}" "{p}"\n'  # quoted — systemd splits on spaces otherwise
+        'Environment="XDG_RUNTIME_DIR=/run/user/%U"\n'
         "Restart=always\n"
         "RestartSec=5\n"
         "\n"

@@ -602,7 +602,9 @@ def test_audio_ext_and_mime():
 def test_mask_email_hides_full_address_keeps_uid():
     # #11: logs mask the account email (keep first char + domain), but a bare uid
     # (no @) isn't PII and passes through so the log line still identifies the account.
-    assert bridge._mask_email("hungrygoldendog@gmail.com") == "h***@gmail.com"
+    # RFC 2606 reserved domain — the assertion only needs a multi-char local part,
+    # and a realistic-looking personal address is what a future PII grep stops on.
+    assert bridge._mask_email("someone@example.com") == "s***@example.com"
     assert bridge._mask_email("firebase-uid-xyz") == "firebase-uid-xyz"
     assert bridge._mask_email("@nolocal.com") == "***@nolocal.com"
     assert bridge._mask_email("") == ""

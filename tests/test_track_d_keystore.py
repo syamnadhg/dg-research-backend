@@ -14,7 +14,6 @@ load-bearing property; most of the test surface exercises that.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pytest
 

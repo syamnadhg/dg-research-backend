@@ -273,6 +273,38 @@ return await run_pipeline(
 
 Phase 5 (Google Doc creation + email delivery) is owned by the frontend. After P4 success, the FE picks up all accumulated links from the `pipeline_events` Firestore subcollection, creates the Doc via the Docs API, sends the email via Resend, and emits its own `phase_complete phase=5` event so the P5 dropdown populates uniformly with every other phase. BE has no Doc/email code path. See FE README + ARCHITECTURE for details on that side.
 
+## Package distribution + supply chain
+
+Two packages ship from this repo, both to public PyPI:
+
+| Package | Contents | Installed by | Updated by |
+|---|---|---|---|
+| `superresearch` | the backend (`research.py` and friends) | `pipx install superresearch` | `superresearch --update`, or the app's Settings → About |
+| `superresearch-agent` | the chat bridge + `/sr` skill (`agent/facade/`) | `pipx run superresearch-agent connect` | `agent/facade/selfupdate.py`'s detached reconnect |
+
+**This is a code-execution supply chain, and it is worth being explicit about
+the surface.** The agent self-update resolves *latest from the configured index*
+— `pipx upgrade`, then `pipx install --force`, then `pipx run --no-cache` as the
+non-destructive fallback — and the fetched code runs on the host at the next
+update. The route that triggers it, `POST /agent-install`, is unauthenticated on
+loopback (see the TRUST MODEL block in `agent/facade/bridge.py`). None of the
+three invocations pins a version, hash, or index URL.
+
+Deliberately unpinned, for two reasons: `pipx upgrade` resolves to *latest*, so
+it cannot downgrade unless the index itself is manipulated; and hardcoding
+`--index-url https://pypi.org/simple` would break any host that legitimately
+sits behind an internal mirror or proxy. That trade — resolver flexibility over
+redirect protection — is a choice, not an oversight, and the protection it gives
+up is real. Revisit it if these ever ship to hosts we do not control.
+
+What actually holds the line is therefore **publish rights on PyPI**. Both
+projects must keep 2FA enforced on every account with upload permission, and the
+owner list is the security boundary for every host running the agent — treat
+adding a maintainer as a production access grant. Record the current owner set
+with the DGOPS ticket that grants it.
+
+---
+
 ## Config
 
 Stored in `{queue_dir}/config.json`:

@@ -126,7 +126,6 @@ def _inline_do_cancel(col_ref, queue_store, research_store,
         if start_doc_id is not None:
             col_ref.document(start_doc_id).delete()
     # Always flip status (the convergence the fix introduces).
-    from google.cloud.firestore import DELETE_FIELD as _DF
     # Direct write into the fake research store keyed by rid — caller
     # supplies the store so we don't have to mock _update_research_doc.
     if rid in research_store:

@@ -19,6 +19,30 @@ def test_version_gt():
     assert not selfupdate.version_gt("1.0", "1.0.0")
 
 
+def test_version_gt_ranks_a_prerelease_below_its_own_final_release():
+    """The RC-to-final case: digits are identical, so without prerelease ranking
+    somebody running 0.2.0rc1 is never told 0.2.0 shipped."""
+    for rc in ("0.2.0rc1", "0.2.0b2", "0.2.0a1", "0.2.0.dev3", "0.2.0-rc1", "0.2.0.rc1"):
+        assert selfupdate.version_gt("0.2.0", rc), f"{rc} should rank below 0.2.0"
+        assert not selfupdate.version_gt(rc, "0.2.0"), f"{rc} must not rank above 0.2.0"
+    # A prerelease is still newer than an older FINAL release.
+    assert selfupdate.version_gt("0.2.0rc1", "0.1.9")
+    # ...and prereleases of the same version are deliberately not ordered.
+    assert not selfupdate.version_gt("0.2.0rc2", "0.2.0rc1")
+
+
+def test_version_gt_never_invents_an_update_from_an_odd_suffix():
+    """One-directional guarantee: may miss an update, must never manufacture one.
+
+    `.post1` is the trap — it is NEWER than its base, so treating every
+    non-numeric suffix as a prerelease would nudge a post-release user
+    'forward' onto the older plain version on every single command.
+    """
+    assert not selfupdate.version_gt("1.0.0", "1.0.0.post1")
+    assert not selfupdate.version_gt("1.0.0", "1.0.0+local.build")
+    assert not selfupdate.version_gt("1.0.0", "1.0.0zzz")
+
+
 class _FakeResp:
     def __init__(self, payload):
         self._p = payload
@@ -179,13 +203,43 @@ def test_spawn_detached_reconnect_escapes_cgroup_on_linux(tmp_path, monkeypatch)
     assert "python3" in cmd and "-c" in cmd  # the waiter still runs, just re-parented
 
 
-def test_cgroup_escape_prefix_linux_with_systemd_run(monkeypatch):
+def test_cgroup_escape_prefix_linux_with_systemd_run(monkeypatch, tmp_path):
     monkeypatch.setattr(selfupdate.sys, "platform", "linux")
     monkeypatch.setattr(selfupdate.shutil, "which",
                         lambda n: "/usr/bin/systemd-run" if n == "systemd-run" else None)
-    monkeypatch.setitem(selfupdate.os.environ, "XDG_RUNTIME_DIR", "/run/user/1000")
+    # A REAL directory: the runtime dir is now existence-checked, and this test
+    # ran off a hardcoded /run/user/1000 that exists on no dev machine.
+    monkeypatch.setitem(selfupdate.os.environ, "XDG_RUNTIME_DIR", str(tmp_path))
     pre = selfupdate._cgroup_escape_prefix()
     assert pre[:2] == ["/usr/bin/systemd-run", "--user"] and pre[-1] == "--"
+
+
+def test_cgroup_escape_prefix_ignores_a_runtime_dir_that_does_not_exist(monkeypatch, tmp_path):
+    """A stale/clobbered XDG_RUNTIME_DIR must degrade, not fail the spawn.
+
+    The unit now sets Environment=XDG_RUNTIME_DIR=/run/user/%U, and a unit-level
+    Environment= overrides the manager's. On a host whose runtime dir is
+    elsewhere that value is present but dead — emitting the prefix would point
+    `systemd-run --user` at a bus that isn't there and kill the update entirely,
+    which is strictly worse than the plain detached child we fall back to.
+    """
+    monkeypatch.setattr(selfupdate.sys, "platform", "linux")
+    monkeypatch.setattr(selfupdate.shutil, "which",
+                        lambda n: "/usr/bin/systemd-run" if n == "systemd-run" else None)
+    monkeypatch.setitem(selfupdate.os.environ, "XDG_RUNTIME_DIR", str(tmp_path / "gone"))
+    monkeypatch.delitem(selfupdate.os.environ, "DBUS_SESSION_BUS_ADDRESS", raising=False)
+    assert selfupdate._cgroup_escape_prefix() == []
+
+
+def test_cgroup_escape_prefix_still_works_off_the_dbus_address_alone(monkeypatch, tmp_path):
+    """DBUS_SESSION_BUS_ADDRESS is an independent signal — a missing runtime dir
+    must not veto it, or a host that exports only the bus address loses the escape."""
+    monkeypatch.setattr(selfupdate.sys, "platform", "linux")
+    monkeypatch.setattr(selfupdate.shutil, "which",
+                        lambda n: "/usr/bin/systemd-run" if n == "systemd-run" else None)
+    monkeypatch.setitem(selfupdate.os.environ, "XDG_RUNTIME_DIR", str(tmp_path / "gone"))
+    monkeypatch.setitem(selfupdate.os.environ, "DBUS_SESSION_BUS_ADDRESS", "unix:path=/x/bus")
+    assert selfupdate._cgroup_escape_prefix()[:2] == ["/usr/bin/systemd-run", "--user"]
 
 
 def test_cgroup_escape_prefix_empty_off_linux(monkeypatch):

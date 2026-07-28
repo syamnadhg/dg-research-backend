@@ -103,6 +103,19 @@ def test_systemd_unit_source_shape():
     assert "Restart=always" in src and "WantedBy=default.target" in src
 
 
+def test_systemd_unit_exports_the_runtime_dir_self_update_depends_on():
+    """selfupdate._cgroup_escape_prefix() returns [] with no XDG_RUNTIME_DIR, and a
+    unit's environment is not the login shell's. Losing this line puts the update
+    waiter back in the bridge's cgroup, where KillMode=control-group reaps it as
+    the bridge exits — an empty self-update.log and a bridge stuck on the old
+    version, with nothing in CI to notice."""
+    src = autostart.systemd_unit_source(exe="/usr/bin/python3", launcher="/home/u/l.py")
+    assert 'Environment="XDG_RUNTIME_DIR=/run/user/%U"' in src
+    # Must sit under [Service]; systemd ignores Environment= in [Unit]/[Install].
+    service_block = src.split("[Service]", 1)[1].split("[Install]", 1)[0]
+    assert "Environment=" in service_block
+
+
 def test_systemd_unit_source_quotes_paths_with_spaces():
     # systemd splits ExecStart on whitespace unless quoted — a spaced venv/home
     # path must stay one argument.

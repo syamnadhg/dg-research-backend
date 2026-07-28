@@ -25,7 +25,6 @@ Run via:
 import asyncio
 import os
 import sys
-import pytest
 
 # Hack: make research.py importable. The script is at the repo root.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

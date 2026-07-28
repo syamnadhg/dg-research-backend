@@ -21,6 +21,14 @@ Two pieces:
     there — `pipx run` reuses its ~14-day cached venv and would re-run the STALE
     build), so it is never worse than before. Mirrors the backend's proven
     `_spawn_detached_lifecycle` / `_LIFECYCLE_WAITER` pattern (research.py).
+
+SUPPLY CHAIN: all three install invocations below resolve *latest from the
+configured index* — unpinned by version, hash, and index URL — and the fetched
+code then executes on the host. `POST /agent-install` reaches this path without
+authentication (see bridge.py's TRUST MODEL). The reasoning for leaving it
+unpinned, and what carries the risk instead (PyPI publish rights), is in
+ARCHITECTURE.md § "Package distribution + supply chain". Read it before adding
+a fourth install call here.
 """
 from __future__ import annotations
 
@@ -45,12 +53,31 @@ def _cache_path() -> Path:
     return config.store_dir() / ".version_check.json"
 
 
+# PEP 440 prerelease spellings, normalised (trailing digits stripped). `post` is
+# deliberately ABSENT: a post-release is NEWER than its base, so ranking it lower
+# would invent an update that doesn't exist — see version_gt's fail-safe rule.
+_PRERELEASE_MARKERS = ("a", "b", "c", "rc", "alpha", "beta", "pre", "dev")
+
+
 def version_gt(a: str, b: str) -> bool:
-    """True iff version `a` is strictly newer than `b`. Numeric-tolerant
-    (1.0.10 > 1.0.9); non-numeric suffixes are ignored. Returns False on any parse
-    error so a weird version string can never spam an upgrade nudge."""
-    def parse(v: str) -> list:
-        out = []
+    """True iff version `a` is strictly newer than `b`.
+
+    Numeric-tolerant (1.0.10 > 1.0.9). A PEP 440 prerelease sorts BELOW its own
+    final release (0.2.0rc1 < 0.2.0): the digits alone are identical, so without
+    this an RC-to-final bump reads as "no update available" and anyone running an
+    RC never gets nudged onto the release. Prereleases of the same version are
+    NOT ordered against each other (rc1 vs rc2 compares equal) — PyPI's
+    ``info.version`` never offers a prerelease as latest, so RC-to-final is the
+    only case that reaches here.
+
+    Every other unparseable thing keeps the old "ignore the suffix" behaviour
+    rather than being ranked lower, and any parse error returns False. The rule
+    is one-directional: this function may fail to report an update, but it must
+    never manufacture one — a false nudge spams every command.
+    """
+    def parse(v: str) -> tuple:
+        nums: list = []
+        final = 1  # 1 = a real release; 0 = prerelease, which sorts below it
         for chunk in str(v).split("."):
             digits = ""
             for ch in chunk:
@@ -58,14 +85,17 @@ def version_gt(a: str, b: str) -> bool:
                     digits += ch
                 else:
                     break
-            out.append(int(digits) if digits else 0)
-        return out
+            suffix = chunk[len(digits):].lstrip("-_").lower()
+            if suffix.rstrip("0123456789") in _PRERELEASE_MARKERS:
+                final = 0
+            nums.append(int(digits) if digits else 0)
+        return nums, final
     try:
-        pa, pb = parse(a), parse(b)
-        n = max(len(pa), len(pb))  # zero-pad so 1.0.0 == 1.0 (no false nag)
-        pa += [0] * (n - len(pa))
-        pb += [0] * (n - len(pb))
-        return pa > pb
+        (na, fa), (nb, fb) = parse(a), parse(b)
+        n = max(len(na), len(nb))  # zero-pad so 1.0.0 == 1.0 (no false nag)
+        na += [0] * (n - len(na))
+        nb += [0] * (n - len(nb))
+        return (na, fa) > (nb, fb)
     except Exception:
         return False
 
@@ -260,7 +290,17 @@ def _cgroup_escape_prefix() -> "list[str]":
     if not exe:
         return []
     # A user manager must be reachable, else `systemd-run --user` errors out.
-    if not (os.environ.get("XDG_RUNTIME_DIR") or os.environ.get("DBUS_SESSION_BUS_ADDRESS")):
+    # XDG_RUNTIME_DIR only counts if the directory actually EXISTS. The unit sets
+    # it explicitly (autostart.systemd_unit_source) and a unit-level Environment=
+    # overrides whatever the manager exported, so on a host that keeps its runtime
+    # dir off systemd's default path the variable would be present but wrong.
+    # Emitting the prefix then points `systemd-run --user` at a dead bus and the
+    # spawn fails outright; returning [] falls back to the plain detached child,
+    # which is the pre-existing behaviour and merely degrades.
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime_dir and not os.path.isdir(runtime_dir):
+        runtime_dir = None
+    if not (runtime_dir or os.environ.get("DBUS_SESSION_BUS_ADDRESS")):
         return []
     return [exe, "--user", "--collect", "--quiet", "--"]
 

@@ -22,7 +22,6 @@ import inspect
 import re
 from pathlib import Path
 
-import pytest
 
 
 _RESEARCH_PY = Path(__file__).resolve().parent.parent / "research.py"

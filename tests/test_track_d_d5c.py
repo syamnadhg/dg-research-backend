@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import importlib
 
-import pytest
 
 # Import via importlib so we can reload between tests if needed
 research = importlib.import_module("research")
@@ -153,7 +152,8 @@ class TestVersionNotice:
         assert research._version_gt("garbage", "0.1.1") is False  # never raises
 
     def test_cache_hit_newer_returns_latest(self, tmp_path, monkeypatch):
-        import json, time
+        import json
+        import time
         monkeypatch.setattr(research, "_STATE_DIR", tmp_path)
         monkeypatch.setattr(research, "_is_source_checkout", lambda: False)
         monkeypatch.setattr(research, "_sr_version", lambda: "0.1.1")
@@ -163,7 +163,8 @@ class TestVersionNotice:
         assert research._check_newer_version() == "0.1.2"
 
     def test_cache_hit_same_version_returns_none(self, tmp_path, monkeypatch):
-        import json, time
+        import json
+        import time
         monkeypatch.setattr(research, "_STATE_DIR", tmp_path)
         monkeypatch.setattr(research, "_is_source_checkout", lambda: False)
         monkeypatch.setattr(research, "_sr_version", lambda: "0.1.2")
@@ -201,7 +202,8 @@ class TestVersionNotice:
     def test_latest_on_pypi_cache_hit_returns_raw(self, tmp_path, monkeypatch):
         # Returns the RAW latest regardless of the installed version (vs
         # _check_newer_version which only returns it when strictly newer).
-        import json, time
+        import json
+        import time
         monkeypatch.setattr(research, "_STATE_DIR", tmp_path)
         monkeypatch.setattr(research, "_is_source_checkout", lambda: False)
         (tmp_path / ".version_check.json").write_text(
@@ -211,7 +213,8 @@ class TestVersionNotice:
 
     def test_latest_on_pypi_force_bypasses_cache(self, tmp_path, monkeypatch):
         # A forced lookup ignores a fresh 24h cache and re-hits the network.
-        import json, time
+        import json
+        import time
         import urllib.request as _u
         monkeypatch.setattr(research, "_STATE_DIR", tmp_path)
         monkeypatch.setattr(research, "_is_source_checkout", lambda: False)
@@ -237,7 +240,8 @@ class TestVersionNotice:
     def test_latest_on_pypi_force_failure_preserves_cache(self, tmp_path, monkeypatch):
         # A forced fetch that FAILS (offline) must NOT clobber a prior good value
         # with "" — else the CLI + FE "update available" nudge goes silent for 24h.
-        import json, time
+        import json
+        import time
         import urllib.request as _u
         monkeypatch.setattr(research, "_STATE_DIR", tmp_path)
         monkeypatch.setattr(research, "_is_source_checkout", lambda: False)

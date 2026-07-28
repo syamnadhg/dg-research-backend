@@ -7,7 +7,6 @@ network-dependent; integration-test it elsewhere.
 
 from __future__ import annotations
 
-import re
 
 import pytest
 

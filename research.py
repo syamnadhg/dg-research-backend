@@ -11709,10 +11709,18 @@ _BAD_URL_PATTERNS = [
 # Default deny-list — tightened to DG-specific hostnames after PR review
 # C5 (Copilot). Previously included blanket suffix entries (`web.app`,
 # `firebaseapp.com`) which would block legitimate research sources hosted
-# on Firebase Hosting. Operators can extend via DG_SECURITY_DENY_HOSTS
-# env var (comma-separated) without code changes — addresses J1's "next
-# adjacent leak" concern, where a new internal app deployed to a TLD not
-# in the list would silently authenticate again. The audit-log event
+# on Firebase Hosting. Operators can adjust the list via the
+# DG_SECURITY_DENY_HOSTS env var (comma-separated) without code changes —
+# addresses J1's "next adjacent leak" concern, where a new internal app
+# deployed to a TLD not in the list would silently authenticate again.
+#
+# ⚠ THAT VAR REPLACES THIS LIST, IT DOES NOT ADD TO IT. Setting it to the
+# one new host you care about silently drops all three defaults below —
+# including dg-security-monitor.web.app, the actual 2026-05-05 incident
+# vector. Always re-state the defaults alongside your additions. Making the
+# var additive is a behaviour change tracked separately; the code, the
+# docstring on _read_security_deny_hosts and this comment are at least all
+# saying the same thing now. The audit-log event
 # payload (security_blocked_navigation) includes the requesting page's
 # referrer so post-hoc audit can answer "which page tried to navigate?"
 # — the early-warning signal Jason flagged.
@@ -11729,10 +11737,15 @@ _SECURITY_DENY_HOSTS_DEFAULT = (
 
 
 def _read_security_deny_hosts() -> tuple:
-    """Read deny-list at module load. DG_SECURITY_DENY_HOSTS env var
-    (comma-separated) overrides the default list entirely. Operators
-    can extend without code change. Restart --serve for changes to take
-    effect."""
+    """Read deny-list at module load.
+
+    DG_SECURITY_DENY_HOSTS (comma-separated) REPLACES the default list
+    entirely — it is not additive. An operator who sets it to a single new
+    internal host loses distributedglobal.com, dg-eng.com and the
+    dg-security-monitor.web.app incident vector in the same breath, so any
+    value must re-state the defaults it still wants. Restart --serve for
+    changes to take effect.
+    """
     raw = os.environ.get("DG_SECURITY_DENY_HOSTS", "").strip()
     if raw:
         return tuple(h.strip().lower() for h in raw.split(",") if h.strip())
@@ -47556,7 +47569,7 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
         print()
         print(f"  {_c(_DIM, 'Device id  ·')}  {_c(_BOLD, result['device_id'])}")
         print()
-        # Banner: "✓ Linked to Rocky (rocky@gmail.com)" when we have both;
+        # Banner: "✓ Linked to <name> (user@example.com)" when we have both;
         # falls back to label-only, then email-only, then "your account".
         if owner_label and owner_email:
             _linked_to = f"{_c(_BOLD, owner_label)} {_c(_DIM, '(' + owner_email + ')')}"
