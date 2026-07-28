@@ -65,7 +65,7 @@ except ImportError:  # None elsewhere (e.g. a Windows test import) → lock-free
 # silently (live 2026-07-02: a stale copy predating the podcast MEDIA: fix
 # kept sending bare audio paths). Bumped together with pyproject.toml —
 # guarded by tests/test_sr_skip_agents.py::test_skill_build_matches_package_version.
-_SKILL_BUILD = "0.1.29"
+_SKILL_BUILD = "0.1.30"
 
 _TIMEOUT = 30
 # By-title run resolution scans the newest N runs (status / podcast / list / the
