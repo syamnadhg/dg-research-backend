@@ -12,6 +12,7 @@ Locks the guards the adversarial review + the design called out:
 from __future__ import annotations
 
 import importlib
+import os
 
 research = importlib.import_module("research")
 
@@ -663,24 +664,32 @@ class TestLifecycleEnvPath:
     /opt/homebrew/bin/uv, and died with "the 'uv' executable could not be found"
     while the same command in a login shell succeeded. PATH is the only lever."""
 
+    # These four patch sys.platform to simulate macOS, but os.pathsep is NOT
+    # patched with it — it stays the HOST's. So the separator has to come from
+    # os.pathsep on both sides (building the fake PATH and splitting the result),
+    # exactly as _lifecycle_env does. Hardcoding ":" passed on macOS/Linux and
+    # broke on Windows, where ";"-joined output split on ":" shredded the drive
+    # letters in os.path.join(home, ...) — and test_no_duplicate_path_entries
+    # went one worse, passing VACUOUSLY off those shredded fragments.
     def test_prepends_the_uv_homes_ahead_of_the_inherited_path(self, monkeypatch):
         monkeypatch.setattr(research.sys, "platform", "darwin")
-        monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin:/bin")  # the LaunchAgent's
-        got = research._lifecycle_env()["PATH"].split(":")
+        # the LaunchAgent's
+        monkeypatch.setenv("PATH", os.pathsep.join(["/usr/local/bin", "/usr/bin", "/bin"]))
+        got = research._lifecycle_env()["PATH"].split(os.pathsep)
         assert "/opt/homebrew/bin" in got, "Homebrew uv would still be invisible"
         assert got.index("/opt/homebrew/bin") < got.index("/usr/bin")
 
     def test_keeps_the_inherited_path_entries(self, monkeypatch):
         monkeypatch.setattr(research.sys, "platform", "darwin")
-        monkeypatch.setenv("PATH", "/opt/custom/bin:/usr/bin")
-        got = research._lifecycle_env()["PATH"].split(":")
+        monkeypatch.setenv("PATH", os.pathsep.join(["/opt/custom/bin", "/usr/bin"]))
+        got = research._lifecycle_env()["PATH"].split(os.pathsep)
         assert "/opt/custom/bin" in got and "/usr/bin" in got
 
     def test_no_duplicate_path_entries(self, monkeypatch):
         # /usr/local/bin is in BOTH our prepend list and the LaunchAgent PATH.
         monkeypatch.setattr(research.sys, "platform", "darwin")
-        monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin:/bin")
-        got = research._lifecycle_env()["PATH"].split(":")
+        monkeypatch.setenv("PATH", os.pathsep.join(["/usr/local/bin", "/usr/bin", "/bin"]))
+        got = research._lifecycle_env()["PATH"].split(os.pathsep)
         assert len(got) == len(set(got)), got
 
     def test_windows_uses_windows_homes(self, monkeypatch):
@@ -702,7 +711,7 @@ class TestLifecycleEnvPath:
         monkeypatch.setattr(research, "_path_python", lambda: "/usr/bin/python3")
         monkeypatch.setattr(research, "_cgroup_escape_prefix", lambda: [])
         monkeypatch.setattr(research.sys, "platform", "darwin")
-        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        monkeypatch.setenv("PATH", os.pathsep.join(["/usr/bin", "/bin"]))  # host separator
         seen = {}
 
         class _P:
@@ -716,7 +725,7 @@ class TestLifecycleEnvPath:
         assert research._spawn_detached_lifecycle("upgrade", current="0.1.9",
                                                  latest="0.1.10") == 4242
         env = seen["kw"]["env"]
-        assert "/opt/homebrew/bin" in env["PATH"].split(":")
+        assert "/opt/homebrew/bin" in env["PATH"].split(os.pathsep)
         assert env["DG_LIFECYCLE_FROM"] == "0.1.9" and env["DG_LIFECYCLE_TO"] == "0.1.10"
         assert env["DG_LIFECYCLE_RESULT"].endswith("update_result.json")
 
