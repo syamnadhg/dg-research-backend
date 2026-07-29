@@ -273,6 +273,26 @@ return await run_pipeline(
 
 Phase 5 (Google Doc creation + email delivery) is owned by the frontend. After P4 success, the FE picks up all accumulated links from the `pipeline_events` Firestore subcollection, creates the Doc via the Docs API, sends the email via Resend, and emits its own `phase_complete phase=5` event so the P5 dropdown populates uniformly with every other phase. BE has no Doc/email code path. See FE README + ARCHITECTURE for details on that side.
 
+## Lint + CI gates
+
+`.github/workflows/be-tests.yml` runs both pytest suites (root `tests/` and
+`agent/tests/` — two packages, two suites) plus a scoped **correctness lint floor**:
+`E9` + the `F82x` name-error family, with `--ignore-noqa` so a comment cannot
+silence a crash. **Style lint stays local and is not a CI gate** — that is
+deliberate; nothing fails a build over formatting.
+
+The ruleset and the reason for each exclusion live in the `[tool.ruff]` block of
+the root `pyproject.toml` (DGOPS-9508) — single source of truth, not restated here.
+Two things to know before touching it: the ruff **version** is pinned as tightly as
+the ruleset, because `select` fixes which rules run but not what they find; and
+`research.py` must never go back to `from prompts import *`, which blinds F821
+across the whole file (it degrades to the much weaker F405 — two guaranteed-crash
+defects had been hiding in that gap). `tests/test_no_unresolvable_names.py` guards
+both that and the one name-error shape ruff has no rule for: a nested function used
+above its own `def`.
+
+---
+
 ## Package distribution + supply chain
 
 Two packages ship from this repo, both to public PyPI:
@@ -283,25 +303,77 @@ Two packages ship from this repo, both to public PyPI:
 | `superresearch-agent` | the chat bridge + `/sr` skill (`agent/facade/`) | `pipx run superresearch-agent connect` | `agent/facade/selfupdate.py`'s detached reconnect |
 
 **This is a code-execution supply chain, and it is worth being explicit about
-the surface.** The agent self-update resolves *latest from the configured index*
-— `pipx upgrade`, then `pipx install --force`, then `pipx run --no-cache` as the
+the surface.** The agent self-update resolves from the configured index —
+`pipx upgrade`, then `pipx install --force`, then `pipx run --no-cache` as the
 non-destructive fallback — and the fetched code runs on the host at the next
 update. The route that triggers it, `POST /agent-install`, is unauthenticated on
-loopback (see the TRUST MODEL block in `agent/facade/bridge.py`). None of the
-three invocations pins a version, hash, or index URL.
+loopback (see the TRUST MODEL block in `agent/facade/bridge.py`).
 
-Deliberately unpinned, for two reasons: `pipx upgrade` resolves to *latest*, so
-it cannot downgrade unless the index itself is manipulated; and hardcoding
-`--index-url https://pypi.org/simple` would break any host that legitimately
-sits behind an internal mirror or proxy. That trade — resolver flexibility over
-redirect protection — is a choice, not an oversight, and the protection it gives
-up is real. Revisit it if these ever ship to hosts we do not control.
+### DGOPS-9507 decision — floor by version, do not pin the index
 
-What actually holds the line is therefore **publish rights on PyPI**. Both
-projects must keep 2FA enforced on every account with upload permission, and the
-owner list is the security boundary for every host running the agent — treat
-adding a maintainer as a production access grant. Record the current owner set
-with the DGOPS ticket that grants it.
+Hash and index-URL pinning stay declined. A **version floor** was added, because
+the three invocations do not behave alike and the difference is measurable:
+
+| Invocation | Kind of resolve | Can it install an OLDER build? | Floored |
+|---|---|---|---|
+| `pipx upgrade <pkg>` | in-place | **No** | no, deliberately |
+| `pipx install --force <pkg>` | recreates the venv | **Yes** | yes |
+| `pipx run --no-cache <pkg>` | ephemeral venv | **Yes** | yes |
+
+Measured against an index whose newest release was *older* than the installed
+one: `pip install --upgrade` (what `pipx upgrade` runs) reported "Requirement
+already satisfied" and kept the newer build, while a fresh venv install from the
+same index took the older one.
+
+⚠ The rationale recorded here previously credited that non-downgrade property to
+**all three** invocations. It belongs to one. Both fallbacks are fresh resolves,
+so they have no prior version to be protected by — which is the gap the floor
+closes.
+
+`pipx upgrade` stays unfloored for a second, independent reason: pipx **silently
+discards** a constraint passed to it. `pipx upgrade 'pkg>=0.1.31'` exits 0
+reporting "already at latest version 0.1.30", so a floor there would read as
+protection in a diff and do nothing on the host.
+
+The floor is `>=` the version currently running, so an update can never move a
+host backwards while re-installing the same version stays possible (repairing a
+half-broken venv is a supported use of `--update`). Mechanism, the fail-closed
+safety argument, and why the pre-flight must resolve the *same* spec as the
+detached waiter are all at `_agent_floor_spec()` in `agent/facade/selfupdate.py`;
+`agent/tests/test_selfupdate_version_floor.py` holds the invariants.
+`spawn_detached_backend_install()` is deliberately not floored — a first install
+onto a host with no backend has no prior version to walk backwards from.
+
+**Why the index pin stays declined.** It breaks any host legitimately behind an
+internal mirror, which is a supported configuration. And what it defends against
+is *local* index redirection — a poisoned `PIP_INDEX_URL`, `pip.conf`, or process
+environment. Every one of those requires write access to the user's home
+directory or to the launching environment, and an attacker holding that can
+already replace the agent's console script or its venv outright. The pin protects
+nothing that is not already lost, at a real cost to mirror hosts. The version
+floor, by contrast, costs a mirror host nothing: it still resolves normally, it
+just cannot serve a downgrade.
+
+Hash pinning was declined as mechanically disproportionate, not merely tedious:
+pip's `--require-hashes` demands every requirement pinned with `==` and hashed,
+transitive dependencies included, so `pipx install <pkg>` would error under it.
+Adopting it means restructuring all three calls onto a hash-pinned requirements
+file and regenerating it every release.
+
+### What actually holds the line: publish rights on the index
+
+The floor bounds *direction* — a host cannot be walked backwards — but it does not
+authenticate the publisher, so a compromised account can still ship a higher
+version. Both projects must keep 2FA enforced on every account with upload
+permission, and the owner list is the security boundary for every host running
+the agent: treat adding a maintainer as a production access grant, and re-check
+the list at each release rather than on discovery.
+
+The authoritative list is PyPI's own *Collaborators* page per project — not this
+file. Naming individuals here would go stale the moment someone joins or leaves,
+and a stale access-control record is worse than a pointer to a live one. The
+current owner set at the time of the decision is recorded on DGOPS-9507; each
+subsequent grant belongs on the ticket that authorises it.
 
 ---
 
@@ -515,8 +587,9 @@ When the `--daemon-loop` supervisor respawns `--serve` after a crash, queue rehy
 
 | Previous status | Action |
 |-----------------|--------|
-| `queued` | Re-enqueued into `_job_queue` with original topic + pipelineConfig |
-| `ongoing` | Marked `status:"paused_backend_restart"` with summary "Backend restarted mid-run — hit Resume to pick up from the last checkpoint." |
+| `queued` | Re-enqueued into the in-memory queue with original topic + pipelineConfig |
+| `ongoing`, **supervised** device with on-disk artifacts | Auto-resumed: re-enqueued with `resume_dir` from the checkpoint, no user action needed |
+| `ongoing`, otherwise | Marked `status:"paused_backend_restart"` with summary "Backend restarted mid-run — hit Resume to pick up from the last checkpoint." |
 | Persist failure (Firestore write fails on shutdown handover) | Marked `status:"paused_backend_restart_failed"` + `lastError` field with the actual exception. FE renders red error banner instead of green checkpoint banner. (2026-04-30 `6545335`.) |
 
 **Per-worker rehydration + dead-worker abandonment (#966 / #64, 2026-07).** Rehydration now runs **per-worker** rather than whole-fleet, so a single respawned worker in a multi-worker fleet self-heals its own in-flight run without disturbing its siblings (#966/GAP1). Separately, an **abandonment backstop** covers a run stranded on a **permanently-dead** worker (one that never comes back): the run is marked `paused_backend_restart` (surfacing the same Resume affordance) instead of hanging `ongoing` forever (#64). The self-heal watchdog no longer fires a T1 push notification and surfaces one honest Resume card (no misleading 2-min wait).
@@ -524,6 +597,13 @@ When the `--daemon-loop` supervisor respawns `--serve` after a crash, queue rehy
 Frontend renders the new status as a phaseAlert at the last-known phase:
 - `[Resume from checkpoint]` → calls `POST /api/pipeline?action=resume&id={backendRunId}` → backend enqueues job with `resume_dir=queue`; `run_pipeline` uses `detect_resume_phase()` to skip to the right phase.
 - `[Discard + start new]` → clears the alert locally; queue directory stays on disk as a backup.
+
+⚠ The supervised auto-resume row was inert until DGOPS-9508 — it reached the worker
+queue by a bare name belonging to another scope, so it raised `NameError` and the
+caller's broad `except Exception` abandoned the whole block, taking the
+`paused_backend_restart` fallback with it. It now goes through
+`_QUEUE_STATE["queue_ref"]` (the same remedy the device-command listener uses) and
+falls back to `paused_backend_restart` when that is not yet populated.
 
 Checkpoints that survive the crash, all under `queues/{run}/`: `documents/*.md`, `delivery.json`, `links.json`, `podcasts/*.m4a`, `checkpoint.json`, `phase2_complete.marker`. Missing state (browser + CUA session) is re-created by the resume run. (The legacy `tracks/*.json` per-agent scrape snapshots were removed alongside the tracks/ directory tree on 2026-04-29 — `documents/*.md` is the single source for Phase 2 output now.)
 
