@@ -20,6 +20,9 @@ floor to stay meaningful:
 """
 from __future__ import annotations
 
+import re
+import shutil
+import subprocess
 import tomllib
 from pathlib import Path
 
@@ -70,6 +73,56 @@ def test_root_and_agent_agree() -> None:
     )
     assert root.get("ignore", []) == agent.get("ignore", [])
     assert _ruff_pin(CONFIGS["root"]) == _ruff_pin(CONFIGS["agent"])
+
+
+def _installed_ruff_version() -> str | None:
+    """Version of the ruff a bare `ruff check` here would actually run, or None when
+    ruff is not available at all. Metadata first (how CI and the dev extra install
+    it), then the console script, so a PATH-only install is still seen."""
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+
+        try:
+            return version("ruff")
+        except PackageNotFoundError:
+            pass
+    except Exception:
+        pass
+    exe = shutil.which("ruff")
+    if not exe:
+        return None
+    try:
+        out = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"(\d+\.\d+\.\d+)", out.stdout or "")
+    return m.group(1) if m else None
+
+
+def test_the_installed_ruff_matches_the_declared_pin() -> None:
+    """The pin only reproduces anything if the ruff actually RUNNING is the pinned one.
+
+    Every other test here checks what the config DECLARES. Nothing checked what the
+    environment PROVIDES, and that gap was live: measured on this repo, the declared
+    pin was 0.16.0 while the interpreter running the suite had ruff 0.15.16, so a
+    local `python -m ruff check` reported a clean tree at a version CI never used.
+    That is the same version-dependent disagreement this ticket set out to remove —
+    just relocated from the ruleset to the binary, where it is harder to see because
+    the output still says "All checks passed!".
+
+    Skipped when ruff is absent: a plain `pytest` run on a machine that never
+    installed the dev extras is not a lint failure.
+    """
+    declared = _ruff_pin(CONFIGS["root"])
+    assert declared, "root pyproject.toml does not pin ruff exactly"
+    installed = _installed_ruff_version()
+    if installed is None:
+        pytest.skip("ruff is not installed in this environment — nothing to compare")
+    assert installed == declared, (
+        f"installed ruff {installed} != declared pin {declared}. A local run measures "
+        f"a different rule implementation than CI, so 'ruff clean' here is not the "
+        f"same claim CI makes. Fix with: pip install ruff=={declared}"
+    )
 
 
 @pytest.mark.parametrize("name", list(CONFIGS))
