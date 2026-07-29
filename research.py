@@ -44807,8 +44807,12 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
                                     try: p_signal.unlink()
                                     except Exception: pass
                                 # DGOPS-9508: reach the in-memory queue via
-                                # _QUEUE_STATE["queue_ref"] (set in run_server at
-                                # research.py:~45292), NOT the bare name `_job_queue`.
+                                # _QUEUE_STATE["queue_ref"] — assigned unconditionally
+                                # right after `_job_queue = asyncio.Queue()` near the
+                                # top of run_server, so it is populated before every
+                                # rehydrate call site — NOT the bare `_job_queue`.
+                                # (No line number on purpose: the previous note here
+                                # cited one that had drifted ~70 lines.)
                                 # This function is at MODULE scope while `_job_queue`
                                 # is a LOCAL of run_server, so the bare name raised
                                 # NameError here — the SAME bug already fixed at
