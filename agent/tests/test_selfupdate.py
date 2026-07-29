@@ -393,8 +393,14 @@ def test_reconnect_waiter_upgrade_is_uv_pipx_safe():
     # A uv-backed pipx REFUSES `install --force` on an existing venv ("use --clear"),
     # so the waiter tries `upgrade` (in-place) FIRST, then --force for a standard pipx.
     src = selfupdate._RECONNECT_WAITER
-    assert '"upgrade", pkg' in src             # in-place upgrade tried first (uv-safe)
-    assert '"install", "--force", pkg' in src  # then force (standard pipx)
+    assert '"upgrade", pkg' in src              # in-place upgrade tried first (uv-safe)
+    # `spec`, not `pkg`, since DGOPS-9507: --force recreates the venv, so it is a
+    # fresh resolve and takes the version floor, while `upgrade` deliberately stays
+    # on the bare name (pipx discards a constraint passed there). The ORDER this test
+    # exists to pin is unchanged. See test_selfupdate_version_floor.py, which asserts
+    # the same thing against the argv the waiter actually executes rather than its
+    # source text — this line only guards the uv-safe ordering.
+    assert '"install", "--force", spec' in src  # then force (standard pipx)
     assert "_do_upgrade" in src
     # It must NEVER `pipx uninstall` in the upgrade path: a following install failure
     # would delete the durable venv and strand the host with no install (a MAJOR

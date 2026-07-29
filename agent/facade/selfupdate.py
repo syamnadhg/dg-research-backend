@@ -22,13 +22,16 @@ Two pieces:
     build), so it is never worse than before. Mirrors the backend's proven
     `_spawn_detached_lifecycle` / `_LIFECYCLE_WAITER` pattern (research.py).
 
-SUPPLY CHAIN: all three install invocations below resolve *latest from the
-configured index* — unpinned by version, hash, and index URL — and the fetched
-code then executes on the host. `POST /agent-install` reaches this path without
-authentication (see bridge.py's TRUST MODEL). The reasoning for leaving it
-unpinned, and what carries the risk instead (PyPI publish rights), is in
-ARCHITECTURE.md § "Package distribution + supply chain". Read it before adding
-a fourth install call here.
+SUPPLY CHAIN (DGOPS-9507): the install invocations below fetch code from the
+configured index that then EXECUTES on the host, and `POST /agent-install` reaches
+this path without caller authentication (see bridge.py's TRUST MODEL). They stay
+unpinned by hash and by INDEX URL — an internal mirror is a supported
+configuration — but they are floored by VERSION, so an update can never move the
+host backwards. Which calls carry the floor, and why two deliberately do not, is
+at `_agent_floor_spec()` below. The recorded decision and what carries the
+residual risk instead (publish rights on the index) are in ARCHITECTURE.md
+§ "Package distribution + supply chain". Read it before adding another install
+call here.
 """
 from __future__ import annotations
 
@@ -179,6 +182,11 @@ from pathlib import Path
 pid = int(sys.argv[1]); cfg = json.loads(sys.argv[2])
 pipx = cfg["pipx"]; pkg = cfg["pkg"]; connect_args = cfg["connect_args"]
 restart_args = cfg.get("restart_args") or []
+# Version-floored requirement (DGOPS-9507, see _agent_floor_spec). `pkg` stays the
+# bare name — pipx needs it as the venv/app identity, and only the FRESH-resolve
+# calls take the spec. Falls back to the bare name so a cfg written by an older
+# build can still drive this waiter.
+spec = cfg.get("spec") or pkg
 # Heartbeat straight INTO the log file, not via stdout. Under the cgroup escape
 # systemd-run diverts stdout to the journal, so a print would leave self-update.log
 # empty — indistinguishable from "the waiter never started", which is the one thing
@@ -238,9 +246,18 @@ def installed_entry():
 #    host is left with NO install — worse than keeping the old build. If both attempts
 #    fail, the caller falls through to the NON-destructive `pipx run --no-cache`
 #    reconnect below (durable venv untouched; a later --update retries cleanly).
+#    DGOPS-9507: only the --force attempt is version-floored. `upgrade` takes a
+#    package NAME and pipx silently discards a constraint passed there, so a floor
+#    on it would look like protection and provide none — it needs none anyway,
+#    because pip --upgrade will not install lower than what is already there.
+#    --force RECREATES the venv, making it a fresh resolve with no prior version to
+#    protect, which is exactly what the floor covers. A floor that cannot be
+#    satisfied fails this attempt WITHOUT destroying the durable venv (pipx will
+#    not remove a venv it did not create in this session), so the worst case is the
+#    host staying on the build it already had.
 entry = None
 def _do_upgrade():
-    for argv in (pipx + ["upgrade", pkg], pipx + ["install", "--force", pkg]):
+    for argv in (pipx + ["upgrade", pkg], pipx + ["install", "--force", spec]):
         try:
             if subprocess.run(argv, timeout=600).returncode == 0:
                 return True
@@ -269,9 +286,51 @@ if entry:
         except Exception:
             pass
 else:
-    subprocess.run(pipx + ["run", "--no-cache", pkg] + connect_args)
+    # The version floor goes in `--spec`, NOT the positional. `pipx run`'s
+    # positional is the APP name (that is how it decides which console script to
+    # execute), so passing a requirement string there relies on pipx parsing the
+    # package name back out of it — undocumented behaviour that differs by pipx
+    # version. `--spec <requirement> <app>` is the documented pair and keeps the
+    # app identity explicit.
+    subprocess.run(pipx + ["run", "--no-cache", "--spec", spec, pkg] + connect_args)
 note("finished")
 '''
+
+
+def _agent_floor_spec() -> str:
+    """`superresearch-agent>=<running version>` — the monotonicity floor (DGOPS-9507).
+
+    A self-update must never move the host BACKWARDS onto an older build. Which of
+    the calls in this module need the floor is not uniform, and the difference is
+    measurable rather than a judgement call:
+
+      • `pipx upgrade` does NOT need it and must not carry it. It runs
+        `pip install --upgrade PACKAGE`, which leaves a newer installed version
+        alone when the index's latest is older ("Requirement already satisfied"),
+        so it cannot be walked backwards. And pipx SILENTLY DROPS a constraint
+        passed to `upgrade` — `pipx upgrade 'pkg>=0.1.31'` exits 0 reporting
+        "already at latest version 0.1.30" — so a floor there is not merely
+        redundant, it is theatre that reads as protection.
+      • `pipx install --force` and `pipx run` DO need it. Both are FRESH resolves —
+        --force recreates the venv, run builds an ephemeral one — so neither has a
+        prior version to be protected by, and each installs whatever the index
+        calls latest, an older build included.
+
+    `>=` and not `==`: re-installing the SAME version has to stay possible, because
+    repairing a half-broken venv is a supported use of --update.
+
+    Deliberately NOT an `--index-url` pin. A mirror host still resolves normally;
+    it just cannot serve a downgrade. That keeps the mirror configuration working,
+    which is why the index pin was declined on DGOPS-9507 in the first place.
+
+    Fails CLOSED, and that is safe here: pipx refuses to remove a venv it did not
+    create in the same session, so an unsatisfiable floor exits non-zero with the
+    durable venv untouched — the host keeps running the build it already had. The
+    pre-flight (`agent_resolvable`) applies this same spec BEFORE the bridge shuts
+    down, so the normal outcome is /agent-install declining the update outright
+    rather than a bridge that never comes back.
+    """
+    return f"{AGENT_PKG}>={__version__}"
 
 
 def _pipx_cmd() -> "list[str] | None":
@@ -338,12 +397,20 @@ def agent_resolvable() -> bool:
     pipx is broken — instead of shutting the bridge down into a dead end. Uses
     `--no-cache` so it validates the SAME fresh build the reconnect will run (a
     cached run-venv would false-pass on the stale version, hiding a broken/absent
-    new release right up until the bridge is already shutting down)."""
+    new release right up until the bridge is already shutting down).
+
+    DGOPS-9507: it resolves against the SAME version floor the waiter will use, and
+    that has to stay true. A pre-flight that resolves UNFLOORED while the waiter
+    resolves floored would pass here, let /agent-install shut the bridge down, and
+    then fail every install attempt in the detached waiter — turning a clean refusal
+    into a host with no bridge. Checking the floor here is what makes fail-closed
+    safe: the refusal happens while the current bridge is still alive."""
     pipx = _pipx_cmd()
     if pipx is None:
         return False
     try:
-        r = subprocess.run([*pipx, "run", "--no-cache", AGENT_PKG, "--version"],
+        r = subprocess.run([*pipx, "run", "--no-cache", "--spec", _agent_floor_spec(),
+                            AGENT_PKG, "--version"],
                            capture_output=True, text=True, timeout=180)
         return r.returncode == 0
     except Exception:
@@ -440,7 +507,12 @@ def spawn_detached_reconnect() -> bool:
         log_path = str(config.store_dir() / "self-update.log")
     except Exception:
         log_path = None
-    cfg = json.dumps({"pipx": pipx, "pkg": AGENT_PKG, "connect_args": connect_args,
+    # `spec` is the version floor (DGOPS-9507). Resolved HERE, not in the waiter:
+    # the waiter is stdlib-only and cannot import `__version__` from the package it
+    # is about to replace — and reading it after the upgrade would compare the new
+    # build against itself, which is no floor at all.
+    cfg = json.dumps({"pipx": pipx, "pkg": AGENT_PKG, "spec": _agent_floor_spec(),
+                      "connect_args": connect_args,
                       "restart_args": restart_args, "log": log_path})
     # Escape the cgroup ONLY when supervised — that's the only case where systemd's
     # KillMode reaps the waiter as the bridge exits. On an unsupervised foreground
@@ -472,7 +544,15 @@ def spawn_detached_backend_install() -> bool:
     superresearch``) in a detached process — the bridge keeps running (the backend
     is a SEPARATE package, no restart) and the multi-minute install doesn't block
     the HTTP response. Returns True if the install launched. Pairing (stages 2-5:
-    API keys + browser logins) is interactive on the host afterwards."""
+    API keys + browser logins) is interactive on the host afterwards.
+
+    Deliberately NOT version-floored, unlike the agent calls above (DGOPS-9507).
+    The floor there is a MONOTONICITY guard — never move this host backwards from
+    the build it is running — and that has no meaning here: this is a first install
+    of a DIFFERENT package onto a host that has none, so there is no prior version
+    to be walked backwards from. The only floor available would be a literal minimum
+    hardcoded in this file, which buys nothing the agent floor buys and goes stale on
+    every backend release. Left unfloored on purpose, not by omission."""
     pipx = _pipx_cmd()
     if pipx is None:
         return False
