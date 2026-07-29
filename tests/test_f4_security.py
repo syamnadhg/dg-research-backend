@@ -95,25 +95,82 @@ class TestReadDenyHosts:
         result = _read_security_deny_hosts()
         assert result == _SECURITY_DENY_HOSTS_DEFAULT
 
-    def test_env_override_replaces_defaults(self, monkeypatch):
+    def test_env_extends_defaults_rather_than_replacing_them(self, monkeypatch):
+        """DGOPS-9505 inverted this contract, so the assertion is inverted too.
+
+        The previous version of this test asserted `"dg-eng.com" not in result`
+        — it pinned the replace semantics deliberately, which is why the
+        behaviour change had to be its own reviewed unit rather than a quiet
+        edit under a test documenting the opposite intent.
+        """
         monkeypatch.setenv("DG_SECURITY_DENY_HOSTS", "internal.dg.com,other-app.run.app")
-        from research import _read_security_deny_hosts
+        from research import _read_security_deny_hosts, _SECURITY_DENY_HOSTS_DEFAULT
         result = _read_security_deny_hosts()
-        assert result == ("internal.dg.com", "other-app.run.app")
-        # Defaults are NOT mixed in — env override is total.
-        assert "dg-eng.com" not in result
+        assert result == (*_SECURITY_DENY_HOSTS_DEFAULT, "internal.dg.com", "other-app.run.app")
+        # Defaults come first, so a host matching both reports the default pattern.
+        assert result[:len(_SECURITY_DENY_HOSTS_DEFAULT)] == _SECURITY_DENY_HOSTS_DEFAULT
 
-    def test_env_override_strips_whitespace_and_lowercases(self, monkeypatch):
+    @pytest.mark.parametrize("env_value", [
+        "internal.dg.com",                       # the natural single-host use
+        "distributedglobal.com",                 # re-stating one default
+        "a,b,c,d,e",                             # several additions
+        "  ",                                    # whitespace-only
+        ",,,",                                   # separators only
+        "DG-ENG.COM",                            # a default in a different case
+    ])
+    def test_the_2026_05_05_incident_vector_can_never_be_dropped(self, monkeypatch, env_value):
+        """The regression that actually matters, so it gets its own test.
+
+        Every default must survive ANY value of the variable. This is the one
+        assertion that would have caught the original bug, and it is
+        parametrized rather than single-cased because the failure was not about
+        a malformed value — it was about the most ordinary value there is.
+        """
+        monkeypatch.setenv("DG_SECURITY_DENY_HOSTS", env_value)
+        from research import _read_security_deny_hosts, _SECURITY_DENY_HOSTS_DEFAULT
+        result = _read_security_deny_hosts()
+        for host in _SECURITY_DENY_HOSTS_DEFAULT:
+            assert host in result, (
+                f"DG_SECURITY_DENY_HOSTS={env_value!r} dropped the default {host!r}. "
+                "The defaults are a floor — see DGOPS-9505."
+            )
+        assert "dg-security-monitor.web.app" in result
+
+    def test_env_additions_strip_whitespace_and_lowercase(self, monkeypatch):
         monkeypatch.setenv("DG_SECURITY_DENY_HOSTS", "  Internal.DG.com  , Other.RUN.app , ")
-        from research import _read_security_deny_hosts
+        from research import _read_security_deny_hosts, _SECURITY_DENY_HOSTS_DEFAULT
         result = _read_security_deny_hosts()
-        assert result == ("internal.dg.com", "other.run.app")
+        assert result == (*_SECURITY_DENY_HOSTS_DEFAULT, "internal.dg.com", "other.run.app")
 
-    def test_env_override_filters_empty_tokens(self, monkeypatch):
+    def test_env_additions_filter_empty_tokens(self, monkeypatch):
         monkeypatch.setenv("DG_SECURITY_DENY_HOSTS", ",,host1,,,host2,")
-        from research import _read_security_deny_hosts
+        from research import _read_security_deny_hosts, _SECURITY_DENY_HOSTS_DEFAULT
         result = _read_security_deny_hosts()
-        assert result == ("host1", "host2")
+        assert result == (*_SECURITY_DENY_HOSTS_DEFAULT, "host1", "host2")
+
+    def test_a_default_restated_in_the_env_is_not_duplicated(self, monkeypatch):
+        """Re-stating defaults was the documented workaround under the old
+        semantics, so plenty of environments will still do it. It must be a
+        no-op, not a list with repeats that the match loop walks twice."""
+        monkeypatch.setenv("DG_SECURITY_DENY_HOSTS",
+                           "dg-eng.com,distributedglobal.com,new.host")
+        from research import _read_security_deny_hosts, _SECURITY_DENY_HOSTS_DEFAULT
+        result = _read_security_deny_hosts()
+        assert len(result) == len(set(result))
+        assert result == (*_SECURITY_DENY_HOSTS_DEFAULT, "new.host")
+
+    def test_narrowing_is_impossible_by_design(self, monkeypatch):
+        """There is no supported way to end up with fewer hosts than the
+        defaults. Narrowing would mean permitting navigation to DG's own
+        properties, which is what F4 exists to prevent; the only escape hatch
+        is the loud, startup-logged DG_SECURITY_DENY_LIST_ENABLED=0 kill
+        switch, which is a separate variable and not this one's problem."""
+        from research import _read_security_deny_hosts, _SECURITY_DENY_HOSTS_DEFAULT
+        for attempt in ("", "   ", "-dg-eng.com", "!distributedglobal.com", "none", "[]"):
+            monkeypatch.setenv("DG_SECURITY_DENY_HOSTS", attempt)
+            result = _read_security_deny_hosts()
+            assert len(result) >= len(_SECURITY_DENY_HOSTS_DEFAULT)
+            assert set(_SECURITY_DENY_HOSTS_DEFAULT).issubset(set(result))
 
 
 # ─────────────────────────────────────────────────────────────────────

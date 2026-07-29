@@ -11868,16 +11868,24 @@ _BAD_URL_PATTERNS = [
 # addresses J1's "next adjacent leak" concern, where a new internal app
 # deployed to a TLD not in the list would silently authenticate again.
 #
-# ⚠ THAT VAR REPLACES THIS LIST, IT DOES NOT ADD TO IT. Setting it to the
-# one new host you care about silently drops all three defaults below —
-# including dg-security-monitor.web.app, the actual 2026-05-05 incident
-# vector. Always re-state the defaults alongside your additions. Making the
-# var additive is a behaviour change tracked in DGOPS-9505; the code, the
-# docstring on _read_security_deny_hosts and this comment are at least all
-# saying the same thing now. The audit-log event
-# payload (security_blocked_navigation) includes the requesting page's
-# referrer so post-hoc audit can answer "which page tried to navigate?"
-# — the early-warning signal Jason flagged.
+# THAT VAR EXTENDS THIS LIST; IT CANNOT SHRINK IT (DGOPS-9505). It used to
+# REPLACE the defaults, so setting it to the one new host you cared about
+# silently dropped all three below — including dg-security-monitor.web.app,
+# the actual 2026-05-05 incident vector. That failure was silent, it landed on
+# incident-response tooling, and it arrived exactly when someone reached for
+# the var for the first time: mid-incident. Since SECURITY_SCRUB_MODE was
+# removed in DGOPS-7451 this deny-list is the ONLY load-bearing F4 defense, so
+# the defaults are now a floor.
+#
+# There is deliberately NO way to narrow the list. Narrowing means allowing the
+# pipeline to navigate to DG's own properties, which is the entire thing F4
+# exists to prevent — so the only escape hatch is the total kill switch
+# DG_SECURITY_DENY_LIST_ENABLED=0 below, which is loud, documented, and logged
+# at startup rather than silently reshaping the list.
+#
+# The audit-log event payload (security_blocked_navigation) includes the
+# requesting page's referrer so post-hoc audit can answer "which page tried to
+# navigate?" — the early-warning signal Jason flagged.
 #
 # Examples of TLDs to watch when expanding the list: *.web.app /
 # *.firebaseapp.com / *.appspot.com / *.run.app / Vercel preview URLs /
@@ -11891,19 +11899,32 @@ _SECURITY_DENY_HOSTS_DEFAULT = (
 
 
 def _read_security_deny_hosts() -> tuple:
-    """Read deny-list at module load.
+    """Read the deny-list at module load: defaults ALWAYS apply, env EXTENDS.
 
-    DG_SECURITY_DENY_HOSTS (comma-separated) REPLACES the default list
-    entirely — it is not additive. An operator who sets it to a single new
-    internal host loses distributedglobal.com, dg-eng.com and the
-    dg-security-monitor.web.app incident vector in the same breath, so any
-    value must re-state the defaults it still wants. Restart --serve for
-    changes to take effect.
+    DG_SECURITY_DENY_HOSTS (comma-separated) adds hosts to
+    ``_SECURITY_DENY_HOSTS_DEFAULT``; it cannot remove any of them. Before
+    DGOPS-9505 it replaced them wholesale, so `DG_SECURITY_DENY_HOSTS=one.host`
+    silently discarded distributedglobal.com, dg-eng.com and the
+    dg-security-monitor.web.app incident vector in the same breath — a silent
+    downgrade of the only load-bearing F4 defense, triggered by the most
+    natural possible use of the variable.
+
+    Ordering is defaults-then-additions with duplicates dropped, so the tuple
+    reads the way an operator wrote it and `_matches_security_deny_host`
+    reports the default pattern rather than an alias when both would match.
+
+    To disable the deny-list entirely, use DG_SECURITY_DENY_LIST_ENABLED=0 —
+    that is the only supported way to end up with fewer hosts than the
+    defaults, and it is logged loudly at startup. Restart --serve for changes
+    to take effect.
     """
     raw = os.environ.get("DG_SECURITY_DENY_HOSTS", "").strip()
-    if raw:
-        return tuple(h.strip().lower() for h in raw.split(",") if h.strip())
-    return _SECURITY_DENY_HOSTS_DEFAULT
+    extra = [h.strip().lower() for h in raw.split(",") if h.strip()] if raw else []
+    merged: list = []
+    for host in (*_SECURITY_DENY_HOSTS_DEFAULT, *extra):
+        if host not in merged:
+            merged.append(host)
+    return tuple(merged)
 
 
 _SECURITY_DENY_HOSTS = _read_security_deny_hosts()
@@ -21609,6 +21630,19 @@ class Browser:
                 await self.context.route("**/*", _security_deny_route)
             except Exception as _re:
                 log(f"[security] failed to install route deny-list: {_re}", "WARN")
+            # State the EFFECTIVE list, not just that a list exists (DGOPS-9505).
+            # An operator setting DG_SECURITY_DENY_HOSTS previously had no way to
+            # see what they had actually ended up with, which is what let a
+            # silent replace go unnoticed; now the defaults-plus-additions
+            # result is in the log next to the run it protected.
+            try:
+                _extra = [h for h in _SECURITY_DENY_HOSTS
+                          if h not in _SECURITY_DENY_HOSTS_DEFAULT]
+                log(f"[security] route deny-list active — {len(_SECURITY_DENY_HOSTS)} "
+                    f"host(s): {', '.join(_SECURITY_DENY_HOSTS)}"
+                    + (f"  (+{len(_extra)} from DG_SECURITY_DENY_HOSTS)" if _extra else ""))
+            except Exception:
+                pass
         else:
             log("[security] route deny-list DISABLED via "
                 "DG_SECURITY_DENY_LIST_ENABLED=0 — M4 F4 defense is OFF",
