@@ -11872,7 +11872,7 @@ _BAD_URL_PATTERNS = [
 # one new host you care about silently drops all three defaults below —
 # including dg-security-monitor.web.app, the actual 2026-05-05 incident
 # vector. Always re-state the defaults alongside your additions. Making the
-# var additive is a behaviour change tracked separately; the code, the
+# var additive is a behaviour change tracked in DGOPS-9505; the code, the
 # docstring on _read_security_deny_hosts and this comment are at least all
 # saying the same thing now. The audit-log event
 # payload (security_blocked_navigation) includes the requesting page's

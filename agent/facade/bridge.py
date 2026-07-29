@@ -32,7 +32,7 @@ Two things this model is NOT, so nobody over-trusts it:
     cross-origin page replaying a capture; it authenticates nobody.
   * Loopback is not a user boundary. On a shared or multi-user host every local
     account reaches this port, so the assumption above stops holding — gating the
-    privileged routes behind a 0600 token file is tracked separately.
+    privileged routes behind a 0600 token file is tracked in DGOPS-9504.
 
 ``_origin_ok`` returning True for an ABSENT Origin is intentional and required:
 non-browser callers (the CLI) send no Origin header, while any browser write
