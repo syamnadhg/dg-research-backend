@@ -83,6 +83,31 @@ def test_agent_dependencies_are_installed() -> None:
     )
 
 
+def test_the_correctness_lint_floor_runs_in_ci() -> None:
+    """DGOPS-9508: undefined names + syntax errors are gated, not trusted.
+
+    Style lint stays local by design; this is only the crash floor. `--ignore-noqa`
+    is part of the contract — without it a `# noqa` on the offending line turns a
+    genuine NameError back into a green check. The pinned install matters for the
+    same reason the ruleset does: rule implementations move between ruff releases.
+    """
+    runs = _run_steps()
+    floor = [r for r in runs if "ruff check" in r and "--select" in r]
+    assert floor, (
+        "be-tests.yml no longer runs the scoped `ruff check --select ...` floor, so "
+        "undefined names are caught only if someone happens to lint locally."
+    )
+    for rule in ("E9", "F821"):
+        assert any(rule in r for r in floor), f"{rule} dropped out of the floor: {floor!r}"
+    assert any("--ignore-noqa" in r for r in floor), (
+        f"the floor lost `--ignore-noqa`, so a comment can now hide a crash: {floor!r}"
+    )
+    assert any("ruff==" in r for r in runs if "pip install" in r), (
+        "ruff is installed unpinned in CI — the gate's verdict would depend on "
+        "release timing rather than on the code."
+    )
+
+
 def _trigger_paths(trigger: str) -> list[str]:
     """The `paths:` filters declared under one trigger (`push` / `pull_request`).
 

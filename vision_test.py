@@ -46,7 +46,7 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 
-import vision
+import vision  # noqa: E402  (must follow the sys.path bootstrap above)
 
 FIXTURES_DIR = _HERE / "tests" / "fixtures" / "vision"
 

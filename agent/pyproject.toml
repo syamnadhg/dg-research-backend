@@ -16,7 +16,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
-    "ruff>=0.5",
+    # Pinned exactly, and to the SAME version as the root dev extra — see
+    # DGOPS-9508 there. Two ruff versions across the two packages would make the
+    # repo-root count irreproducible even with both rulesets pinned.
+    "ruff==0.16.0",
 ]
 
 [project.scripts]
@@ -39,6 +42,24 @@ facade = ["web/*.html", "web/icons/*.png", "skill/SKILL.md", "skill/scripts/sr.p
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+# DGOPS-9508: the agent needs its OWN `select` even though the root pyproject.toml
+# now pins one. Ruff resolves config per file by walking up to the nearest
+# pyproject.toml that HAS a [tool.ruff] table — this one — so without a `select`
+# here the agent tree would keep inheriting ruff's version-dependent defaults
+# while the root tree was pinned, and `ruff check .` from the repo root would
+# report a number produced by two different rulesets.
+#
+# Kept as a duplicate rather than `extend = "../pyproject.toml"` on purpose:
+# `superresearch-agent` publishes as its own package, and a relative extend path
+# dangles the moment this file is linted outside the monorepo (an unpacked sdist,
+# a vendored copy). The values MUST match the root exactly, and
+# tests/test_ruff_config_is_pinned.py (root suite) asserts they do, so the
+# duplication cannot drift silently. Rationale for every entry lives in the root
+# pyproject.toml — edit there first.
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+ignore = ["E701", "E702"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

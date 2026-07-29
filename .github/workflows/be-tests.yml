@@ -6,9 +6,11 @@ name: Backend Tests
 # repo holds two packages: `superresearch` (root tests/) and `superresearch-agent`
 # (agent/tests/). A gate that runs one and reports for both is worse than no gate.
 #
-# Pytest only (no ruff gate): the repo intentionally ships NO [tool.ruff] config
-# (see pyproject.toml) and carries a large pre-existing style baseline, so a full
-# `ruff check` would be all-noise. Lint is enforced per-change locally, not in CI.
+# STYLE lint stays local, not a CI gate — that policy is unchanged and deliberate.
+# DGOPS-9508 added one narrow exception: a CORRECTNESS floor (syntax errors +
+# undefined names, run with a pinned ruff). Those are latent crashes rather than
+# style opinions, and two of them had been sitting in the tree unnoticed. Nothing
+# here fails a build over formatting.
 
 # `**.py` covers agent/ too, so an agent-only edit fires this workflow — which is
 # exactly why the agent suite has to run below. The requirements/pyproject entries
@@ -57,6 +59,18 @@ jobs:
       # only needs the packages importable — no `patchright install chrome`.
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      # Pinned exactly, matching both pyproject.toml dev extras — an unpinned
+      # install would let rule implementations move on ruff's release cadence, so
+      # CI and a developer's machine could disagree about a clean tree.
+      - name: Install ruff (pinned)
+        run: pip install ruff==0.16.0
+
+      # Syntax errors and undefined names ONLY — deliberately not a full lint run.
+      # `--ignore-noqa` is load-bearing: a `# noqa` on the offending line would
+      # otherwise silence a genuine NameError and leave this step green.
+      - name: Lint — correctness floor (must be zero)
+        run: ruff check . --select E9,F821,F822,F823,F811,F402 --ignore-noqa
 
       - name: Run tests
         run: python -m pytest tests/ -q

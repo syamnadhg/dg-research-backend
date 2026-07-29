@@ -14,8 +14,6 @@ Usage:
     python scripts/dump_push_audit.py --limit 50
 """
 import argparse
-import json
-import os
 import sys
 from pathlib import Path
 
@@ -55,11 +53,11 @@ def main():
     print(f"  dataControls.pushEnabled: {prefs.get('dataControls', {}).get('pushEnabled')}")
     notif_prefs = prefs.get("notifications", {}) or {}
     if notif_prefs:
-        print(f"  notifications (per-event channel prefs):")
+        print("  notifications (per-event channel prefs):")
         for evt_type, val in sorted(notif_prefs.items()):
             print(f"    {evt_type:<28} {val}")
     else:
-        print(f"  notifications: <empty — defaults will apply>")
+        print("  notifications: <empty — defaults will apply>")
     api_keys = prefs.get("apiKeys", {}) or {}
     if api_keys:
         print(f"  apiKeys present: {sorted(api_keys.keys())}")
@@ -69,7 +67,7 @@ def main():
     tokens_snap = db.collection("users").document(uid) \
         .collection("fcm_tokens").get()
     tokens = list(tokens_snap)
-    print(f"═════ FCM tokens ═════")
+    print("═════ FCM tokens ═════")
     print(f"  total registered: {len(tokens)}")
     for i, doc in enumerate(tokens, 1):
         data = doc.to_dict() or {}

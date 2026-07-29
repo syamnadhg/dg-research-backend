@@ -443,8 +443,8 @@ def test_poll_agent_decision_is_nonblocking_single_check():
     src = inspect.getsource(research.PipelineControls.poll_agent_decision)
     # No actual await statement (the docstring may NAME await_agent_decision);
     # it must also not be a coroutine (def, not async def).
-    code = "".join(l for l in src.splitlines(keepends=True)
-                   if not l.lstrip().startswith(('"', "#")))
+    code = "".join(ln for ln in src.splitlines(keepends=True)
+                   if not ln.lstrip().startswith(('"', "#")))
     assert "await " not in code, "poll_agent_decision must not await (non-blocking)"
     assert "async def poll_agent_decision" not in src
     assert 'return "pending"' in src

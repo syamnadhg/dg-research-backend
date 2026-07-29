@@ -89,7 +89,12 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
-    "ruff>=0.5",
+    # DGOPS-9508: ruff is pinned EXACTLY, not floored. A floor reproduces the
+    # ruleset but not the count — rule implementations change between releases,
+    # and `ruff>=0.5` is how one machine reported 235 findings while another
+    # reported 2609 on the same commit. Bumping this is a deliberate act: run
+    # `ruff check .` before and after, and record any new findings on a ticket.
+    "ruff==0.16.0",
 ]
 
 [project.urls]
@@ -113,7 +118,51 @@ packages = ["auth", "scripts"]
 # (research.py _seed_env_file_if_missing reads it from Path(__file__).parent/"scripts").
 scripts = ["dg-supervisor.env.example"]
 
-# NOTE: intentionally NO [tool.ruff] / [tool.pytest.ini_options] here. The repo
-# has run ruff + pytest on their defaults (no root config) — adding tool config
-# would silently change linting/test behavior across the whole tree. Packaging
-# stays purely additive. The agent keeps its own config in agent/pyproject.toml.
+# NOTE: still intentionally NO [tool.pytest.ini_options] here — the root suite
+# runs on pytest's defaults and adding config would change collection across the
+# whole tree. The agent keeps its own pytest config in agent/pyproject.toml.
+#
+# DGOPS-9508 — the ruleset is pinned because "ruff clean" was not a falsifiable
+# claim without it. With no `select`, the count is whatever the installed ruff
+# defaults to: the same commit measured 2609 findings on ruff 0.16.0's bare
+# defaults and 235 under `E4,E7,E9,F`. A PR description had claimed "ruff clean"
+# off the narrower number. The set below is the one the tree was written against,
+# and with the two exclusions noted under [tool.ruff.lint] the count is now 0.
+#
+# Not selected (what bare 0.16.0 adds), because each is noise against a
+# deliberate idiom rather than a latent defect: BLE001 blind-except (1381) and
+# S110 try-except-pass (496) — the pipeline degrades rather than crash a
+# multi-hour run; PLW1510 subprocess-run-without-check (90) — return codes are
+# checked where they matter; I001 unsorted-imports (95) — import blocks are
+# grouped by meaning with comments. Revisit any of them as a deliberate burn-down,
+# never as a side effect of upgrading ruff.
+#
+# ⚠ The ruff VERSION is pinned in [project.optional-dependencies] dev. `select`
+# alone does not fix the count — rule implementations change between releases, so
+# the pin and the ruleset only work as a pair.
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# Explicit, NOT inherited. Deleting this line silently re-arms the version drift
+# described above; tests/test_ruff_config_is_pinned.py fails if it goes missing.
+select = ["E4", "E7", "E9", "F"]
+
+# E701/E702 (137 findings) are a deliberate compact-statement style used
+# throughout — `if not x: return`, `try: p.unlink()` / `except Exception: pass`,
+# `a = 1; b = 2`. Reformatting 137 lines would produce a large diff with no
+# behavioural value while fighting the house style, so they are excluded for the
+# same reason BLE001 is: a rule the code deliberately violates everywhere is
+# permanent noise, not a finding.
+ignore = ["E701", "E702"]
+
+# NO per-file-ignores, deliberately. There was one: research.py used to do
+# `from prompts import *`, which blinds ruff to undefined names across the whole
+# file (it cannot resolve the import, so `F821 undefined-name` degrades to the
+# far weaker `F405 may-be-undefined` — 86 findings in which a real typo was
+# indistinguishable from a prompt constant). Two guaranteed crashes were hiding
+# in that pile. The star import is now an explicit 33-name list, so F821 genuinely
+# covers all ~54k lines of research.py and no exclusion is needed. Verified by
+# injecting a typo'd constant: F821 catches it now and did not before.
+# tests/test_no_unresolvable_names.py keeps a star import from coming back.

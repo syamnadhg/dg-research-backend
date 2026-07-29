@@ -57,7 +57,51 @@ import argparse
 import subprocess
 import collections
 from pathlib import Path
-from prompts import *
+# Explicit, NOT `from prompts import *` (DGOPS-9508). A star import blinds ruff to
+# undefined names in this whole file: it cannot resolve the import, so it downgrades
+# every unresolved global from `F821 undefined-name` to the far weaker
+# `F405 may-be-undefined` — 86 findings in which a real typo was indistinguishable
+# from a prompt constant. Two guaranteed crashes were sitting in that pile (a
+# NameError that broke supervised boot auto-resume outright, and an
+# UnboundLocalError on resume-at-Phase-5). Listing the names restores real F821
+# coverage across all 54k lines, so the next one fails the lint floor instead of
+# reaching a user. Keep this list exhaustive: an unused entry trips F401 and a
+# missing one trips F821, so both directions are caught mechanically.
+from prompts import (
+    PROMPT_ATTACH_PDF,
+    PROMPT_CHATGPT_DEEP_RESEARCH,
+    PROMPT_CHATGPT_DISABLE_DR,
+    PROMPT_CHATGPT_DOWNLOAD_MD,
+    PROMPT_CLAUDE_DEEP_RESEARCH,
+    PROMPT_CLAUDE_DOWNLOAD_MD,
+    PROMPT_CLICK_SEND,
+    PROMPT_COPY_ARTIFACT_CHATGPT,
+    PROMPT_COPY_ARTIFACT_CLAUDE,
+    PROMPT_DIAGNOSE,
+    PROMPT_FIX_ISSUE,
+    PROMPT_GEMINI_COPY_CONTENTS,
+    PROMPT_GEMINI_DEEP_RESEARCH,
+    PROMPT_GEMINI_START_RESEARCH,
+    PROMPT_NAVIGATE_CLAUDE_FINAL_ARTIFACT,
+    PROMPT_NOTEBOOKLM_RENAME,
+    PROMPT_NOTEBOOKLM_REUPLOAD,
+    PROMPT_NOTEBOOKLM_UPLOAD,
+    PROMPT_NOTEBOOKLM_VERIFY_SOURCES,
+    PROMPT_OPEN_CHATGPT_SOURCE_PANEL,
+    PROMPT_OPEN_CLAUDE_SOURCE_ARTIFACT,
+    PROMPT_PUBLISH_CLAUDE,
+    PROMPT_PUBLISH_CLAUDE_ARTIFACT,
+    PROMPT_SCRAPE_CLAUDE_ARTIFACT_TRACKING,
+    PROMPT_SELECT_PRO,
+    PROMPT_SHARE_GEMINI,
+    PROMPT_SUBMIT_FALLBACK,
+    PROMPT_VALIDATE_CHATGPT_SETUP,
+    PROMPT_VALIDATE_CLAUDE_SETUP,
+    PROMPT_VALIDATE_GEMINI_SETUP,
+    make_prompt_audio_check,
+    make_prompt_audio_download,
+    make_prompt_audio_generate,
+)
 from datetime import datetime
 # Central model registry — single source of truth for every Claude/Gemini
 # model used by the BE. Bumping any model = edit one constant in models.py
@@ -5928,7 +5972,7 @@ def get_expected_minutes(phase: int) -> int:
 # audios/{id} doc points at the partial blob. Anything that uploads to
 # Storage on the user's behalf should bracket the call with this
 # counter — only audio uploads do today (album-art is FE-side).
-import threading as _threading
+import threading as _threading  # noqa: E402
 _inflight_uploads_lock = _threading.Lock()
 _inflight_uploads = 0
 
@@ -20579,15 +20623,15 @@ def _is_sources_not_document(text, *, platform="generic"):
     checkbox_lines = len(re.findall(r'(?m)^\s*[-*]?\s*\[[ xX]\]\s+\S', text))
     reading_lines = len(re.findall(
         r'(?im)^\s*(?:reading|checking|analyzing|searching)\s+(?:source\s+)?\d+', text))
-    total_nonempty = max(1, len([l for l in text.splitlines() if l.strip()]))
+    total_nonempty = max(1, len([ln for ln in text.splitlines() if ln.strip()]))
     checklist_ratio = checkbox_lines / total_nonempty
     if (checkbox_lines >= 4 or reading_lines >= 4) and headings < 2 and len(text) < 5000 \
             and (checkbox_lines < 4 or checklist_ratio > 0.15 or reading_lines >= 4):
         return True
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     url_only = sum(
-        1 for l in lines
-        if re.match(r'^\d+[\.\)]?\s*(?:https?://|[a-z0-9.-]+\.[a-z]{2,}/)', l, re.I))
+        1 for ln in lines
+        if re.match(r'^\d+[\.\)]?\s*(?:https?://|[a-z0-9.-]+\.[a-z]{2,}/)', ln, re.I))
     if url_only >= 8 and headings < 2 and 800 <= len(text) <= 3000:
         return True
     return False
@@ -41149,6 +41193,27 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     except Exception as e:
         log(f"[dispatcher] Failed to start: {e}", "WARN")
 
+    # ── Helper: update delivery.json incrementally (frontend reads this for live links) ──
+    # DGOPS-9508: defined HERE, above the `if resume_dir:` block, not further down
+    # beside its first success-path use. `update_delivery` is a LOCAL of
+    # run_pipeline, so every reference in this function resolves to this binding —
+    # and the `start_phase == 5` resume branch below calls it ~365 lines BEFORE the
+    # old definition site, then `return`s, so that def was never reached and the
+    # call raised UnboundLocalError every time. It read as a NameError-shaped
+    # crash ("Pipeline job error: cannot access local variable ...") that aborted
+    # the resume AFTER phase_complete had already been emitted, so beDone /
+    # currentPhase=5 never landed and the FE-P5 trigger never posted. The closure
+    # reads `queue_dir` + `topic` at CALL time, so hoisting the def above their
+    # assignments is safe — only the call sites need them bound, and they are.
+    def update_delivery(**new_fields):
+        d_path = queue_dir / "delivery.json"
+        d = json.loads(d_path.read_text(encoding="utf-8")) if d_path.exists() else {
+            "topic": topic, "status": "ongoing", "brief_url": "", "research_links": {},
+            "notebook_url": "", "audio_url": "", "youtube_url": "", "doc_url": "", "email_sent": False,
+        }
+        d.update(new_fields)
+        d_path.write_text(json.dumps(d, indent=2), encoding="utf-8")
+
     # ── Determine queue directory + start phase ──
     if resume_dir:
         queue_dir = Path(resume_dir)
@@ -41568,16 +41633,6 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     # from checkpoint. P4 path also sets `audio_overview_url = ""` so the
     # variable is always defined regardless of which branch P3 takes.
     audio_overview_url = cp.get("audio_overview_url", "")
-
-    # ── Helper: update delivery.json incrementally (frontend reads this for live links) ──
-    def update_delivery(**new_fields):
-        d_path = queue_dir / "delivery.json"
-        d = json.loads(d_path.read_text(encoding="utf-8")) if d_path.exists() else {
-            "topic": topic, "status": "ongoing", "brief_url": "", "research_links": {},
-            "notebook_url": "", "audio_url": "", "youtube_url": "", "doc_url": "", "email_sent": False,
-        }
-        d.update(new_fields)
-        d_path.write_text(json.dumps(d, indent=2), encoding="utf-8")
 
     # #910: a resumed run is ongoing again. Clear a stale local "paused"
     # (login-interrupt / in-process pause) so _plan_pipeline_auto_retry's
@@ -44193,7 +44248,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     if _ao_url:
                         audio_overview_url = _ao_url
                         emit_validated_link(3, "notebooklm", _ao_url, "Audio Overview", link_kind="audio")
-                        if validate_link("notebooklm", _ao_url) and not any(l.get("url") == _ao_url for l in _p3_links):
+                        if validate_link("notebooklm", _ao_url) and not any(_lk.get("url") == _ao_url for _lk in _p3_links):
                             _p3_links.append({"label": "Audio Overview", "url": _ao_url, "verified": True})
                     if audio_path:
                         log(f"Phase 3: audio recovered on auto-retry {_audio_auto_retries}/{_AUDIO_MAX_AUTO_RETRIES}", "INFO")
@@ -44751,7 +44806,25 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
                                 if p_signal.exists():
                                     try: p_signal.unlink()
                                     except Exception: pass
-                                if _safe_enqueue(_job_queue, {
+                                # DGOPS-9508: reach the in-memory queue via
+                                # _QUEUE_STATE["queue_ref"] (set in run_server at
+                                # research.py:~45292), NOT the bare name `_job_queue`.
+                                # This function is at MODULE scope while `_job_queue`
+                                # is a LOCAL of run_server, so the bare name raised
+                                # NameError here — the SAME bug already fixed at
+                                # research.py:~5405 for the device-cmd listener, and
+                                # worse in this spot: the caller's `except Exception`
+                                # logs one "Queue rehydration failed" WARN and abandons
+                                # the whole block, so neither the auto-resume nor the
+                                # paused_backend_restart fallback fired for ANY run.
+                                # Masked from the linter by `from prompts import *`,
+                                # which downgrades every unresolved global to F405.
+                                _qref = _QUEUE_STATE.get("queue_ref")
+                                if _qref is None:
+                                    log("Rehydrate: no in-memory queue_ref yet (boot race) — "
+                                        f"cannot auto-resume {research_id[:24]}…, falling through "
+                                        "to paused_backend_restart", "WARN")
+                                elif _safe_enqueue(_qref, {
                                     "topic": topic,
                                     "email": "",  # delivery prefs are on disk in delivery.json
                                     "config": cfg,
