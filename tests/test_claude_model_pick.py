@@ -90,34 +90,38 @@ def test_step1_does_not_repick_already_correct_model():
     )
 
 
-def test_step1_sets_effort_and_thinking_via_dom():
-    """#745: Effort=Max + the Thinking toggle are now set via DOM (not left to
-    CUA, whose screenshots collapsed the submenu). The model popover opens ONCE
-    regardless of model correctness (branch on dropdown_clicked, NOT model_ok),
-    the Effort submenu is opened to reach the toggle, and the toggle is matched
-    by its REAL label "thinking" (the old page-wide "adaptive thinking" search
-    missed it because the label changed AND it ran on a collapsed submenu)."""
+def test_step1_sets_effort_via_dom():
+    """#745: Effort=Max is set via DOM, not left to CUA (whose screenshots kept
+    collapsing the Effort submenu).
+
+    REVISED 2026-07-30. This used to also assert that the popover opens
+    unconditionally — branching on `dropdown_clicked`, never on `model_ok` — so
+    the Thinking toggle got re-asserted every run. Opus 5 removed that toggle,
+    and the trigger already displays the effort ("Opus 5 Max"), so opening the
+    popover when both facts are already known was pure cost: it logged "NOT
+    re-picking" and then opened the model menu anyway, and handed the quality
+    knobs to the CUA validate layer, which clicked in a second time. Whether the
+    popover opens is now a DECISION, and a source-text assertion cannot check a
+    decision — `tests/test_claude_popover_skip.py` drives the real coroutine for
+    that. What stays here is the DOM-not-CUA structure the ticket asked for.
+    """
     src = inspect.getsource(research.setup_claude_dr)
-    # The popover open + knob-setting branch on dropdown_clicked, not model_ok,
-    # so Effort/Thinking are set even when the model is already Opus 4.8.
     assert "if dropdown_clicked:" in src, (
-        "Step 1A must open the popover and branch on dropdown_clicked so the "
-        "Effort/Thinking knobs run regardless of model correctness (#745)."
+        "Step 1A must still branch on dropdown_clicked once it decides to open "
+        "the popover (#745)."
     )
-    assert "_think = await page.evaluate" in src, (
-        "a dedicated Thinking-toggle step (_think) must exist (#745)."
+    assert "_eff_opened = await page.evaluate" in src, (
+        "the Effort submenu must still be opened via DOM, not left to CUA (#745)."
     )
-    assert "t === 'thinking'" in src, (
-        "the Thinking toggle must be matched by its real label 'thinking', not "
-        "only the stale 'adaptive thinking' (#745)."
+    assert "'max effort'" in src, (
+        "Effort=Max must still be selected via DOM (#745)."
     )
-    # The Effort submenu must be opened BEFORE toggling Thinking (selecting an
-    # effort radio can collapse the submenu the toggle lives in).
+    # The Effort submenu must be opened BEFORE anything nested inside it is
+    # touched (selecting an effort radio can collapse the submenu).
     eff_idx = src.find("_eff_opened = await page.evaluate")
-    think_idx = src.find("_think = await page.evaluate")
-    assert eff_idx != -1 and eff_idx < think_idx, (
-        "the Effort submenu (Step 1C) must open before the Thinking toggle so "
-        "the toggle is reachable (#745)."
+    set_idx = src.find("'max effort'")
+    assert eff_idx != -1 and eff_idx < set_idx, (
+        "the Effort submenu must open before Max is selected inside it (#745)."
     )
 
 

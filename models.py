@@ -105,8 +105,18 @@ GEMINI_NARRATE_FALLBACK = os.environ.get("GEMINI_NARRATE_FALLBACK_MODEL", "gemin
 #               is None and there is nothing to bump today.
 P2_MODEL_POLICY = {
     "claude": {
+        # (2026-07-30) `thinking` is FALSE on purpose, not an oversight. Opus 5
+        # dropped the separate Thinking toggle that Opus 4.x carried inside the
+        # Effort submenu — effort IS the reasoning lever now. While this stayed
+        # True, setup opened the model popover on EVERY run purely to reach a
+        # control that no longer exists, logged "Step 1D WARN: 'Thinking' toggle
+        # not found", then handed the quality knobs to the CUA validate layer —
+        # which is the second model-menu interaction users reported as "it opens
+        # the model selector twice". Consumers read this key, never a literal:
+        # research.py gates Step 1D on it and skips the advisory that would
+        # otherwise report thinking as permanently unconfirmed.
         "family": "opus", "floor": 4.8, "pick": "highest",
-        "effort": "max", "thinking": True, "tool": "research",
+        "effort": "max", "thinking": False, "tool": "research",
     },
     "gemini": {
         "family": "flash", "floor": 3.5, "pick": "highest",
@@ -317,14 +327,25 @@ def pick_highest_model(labels, family: str, floor=None, reject=()):
 
 def p2_claude_setup_directive() -> str:
     """The CUA user-instruction that drives Claude's P2 setup (model + effort +
-    thinking + Research tool). Single source replacing the byte-identical
-    literal previously duplicated at two research.py call sites. Derives the
-    version numbers from the policy floor so a floor bump updates one place."""
-    fam = P2_MODEL_POLICY["claude"]["family"].capitalize()  # "Opus"
-    cur, prev = p2_claude_ver(), p2_claude_prev_ver()
+    Research tool). Single source replacing the byte-identical literal
+    previously duplicated at two research.py call sites. Derives the version
+    numbers and the effort label from the policy so a bump updates one place.
+
+    (2026-07-30) The floor is a MINIMUM, and the wording now says so. Naming a
+    single version and asking the agent to "select" it made a higher model read
+    as wrong: on an account already on Opus 5, a directive built around 4.8 led
+    the agent to conclude "this is NOT Opus 4.8, so I need to fix it" and click
+    into the model menu before self-correcting. `thinking` is deliberately gone
+    — see the note on P2_MODEL_POLICY["claude"]."""
+    pol = p2_labels("claude")
+    fam = str(pol.get("family", "opus")).capitalize()          # "Opus"
+    effort = str(pol.get("effort", "max")).capitalize()        # "Max"
+    cur = p2_claude_ver()
     return (
-        f"Select {fam} {cur} + Max effort + Adaptive Thinking + Research tool "
-        f"(if {fam} {cur} isn't offered, pick the highest {fam} available — never "
-        f"downgrade to {prev} when {cur} exists). Do NOT type — just set up and "
-        f"focus input. Say 'ready for paste'."
+        f"Ensure the model is {fam} {cur} OR NEWER, with {effort} effort, and the "
+        f"Research tool ON. If it already shows {fam} {cur} or any higher {fam}, "
+        f"LEAVE THE MODEL ALONE — do not open the model menu. Only change the "
+        f"model if it is below {fam} {cur} or is not {fam} at all, and then pick "
+        f"the highest {fam} offered. Do NOT type — just set up and focus input. "
+        f"Say 'ready for paste'."
     )

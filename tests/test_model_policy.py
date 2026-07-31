@@ -12,19 +12,57 @@ import json
 import models
 
 
-# The CUA directive that was previously duplicated byte-for-byte at
-# research.py:18555 (2C-retry) and :26894 (2B main). p2_claude_setup_directive()
-# MUST reproduce it exactly so de-duplicating the two call sites is a no-op.
-_LEGACY_CLAUDE_DIRECTIVE = (
-    "Select Opus 4.8 + Max effort + Adaptive Thinking + Research tool "
-    "(if Opus 4.8 isn't offered, pick the highest Opus available — never "
-    "downgrade to 4.7 when 4.8 exists). Do NOT type — just set up and focus "
-    "input. Say 'ready for paste'."
-)
+# The byte-identity pin that used to live here is gone ON PURPOSE (2026-07-30).
+# It existed to prove that routing two duplicated literals through
+# p2_claude_setup_directive() changed nothing — a refactor guard, and it did its
+# job. Keeping it would now pin a directive that is actively wrong: it named a
+# single version and told the agent to "select" it, so on an account already
+# running Opus 5 the agent reasoned "this is NOT Opus 4.8, so I need to fix it"
+# and clicked into the model menu. What matters is no longer byte-identity but
+# the CONTRACT below: derived from policy, floor stated as a floor, and an
+# explicit instruction to leave a higher model alone.
 
 
-def test_claude_setup_directive_byte_identical():
-    assert models.p2_claude_setup_directive() == _LEGACY_CLAUDE_DIRECTIVE
+def test_claude_setup_directive_is_derived_from_policy():
+    d = models.p2_claude_setup_directive()
+    cur = models.p2_claude_ver()
+    fam = models.P2_MODEL_POLICY["claude"]["family"].capitalize()
+    effort = models.P2_MODEL_POLICY["claude"]["effort"].capitalize()
+    assert f"{fam} {cur}" in d, "the family + floor must come from the policy"
+    assert f"{effort} effort" in d, "the effort label must come from the policy"
+    assert models.P2_MODEL_POLICY["claude"]["tool"].capitalize() + " tool" in d
+
+
+def test_claude_setup_directive_states_the_floor_as_a_minimum():
+    """The regression this replaces: naming one version made a HIGHER model read
+    as wrong, which is what sent the agent into the model menu needlessly."""
+    d = models.p2_claude_setup_directive()
+    cur = models.p2_claude_ver()
+    assert "OR NEWER" in d, "the floor must be expressed as a minimum, not a target"
+    assert "LEAVE THE MODEL ALONE" in d, (
+        "an at-or-above model must be explicitly declared correct — without this "
+        "the agent 'fixes' a model that is already right"
+    )
+    assert "do not open the model menu" in d.lower()
+    # The leave-alone must be CONDITIONAL. An unconditional "leave the model
+    # alone" reads as "never touch the model", which would strand an account on
+    # Sonnet or a below-floor Opus forever — the opposite failure, and one that
+    # the presence checks above cannot distinguish on their own.
+    cond = d.find("If it already shows")
+    leave = d.find("LEAVE THE MODEL ALONE")
+    assert cond != -1, "the leave-alone instruction must carry its condition"
+    assert cond < leave, "the condition must precede the instruction it guards"
+    assert f"below {models.P2_MODEL_POLICY['claude']['family'].capitalize()} {cur}" in d, (
+        "there must still be an explicit escape hatch for a genuinely wrong "
+        "model, or a below-floor account can never be corrected"
+    )
+
+
+def test_claude_setup_directive_no_longer_asks_for_a_thinking_toggle():
+    """Opus 5 removed it. Asking for a control that cannot be found is what made
+    the DOM path fail every run and hand over to CUA."""
+    d = models.p2_claude_setup_directive().lower()
+    assert "thinking" not in d
 
 
 def test_floors_match_code_defaults():
@@ -43,10 +81,16 @@ def test_version_helpers_render_like_the_ui():
 def test_labels_carry_the_thinking_and_tool_policy():
     claude = models.p2_labels("claude")
     assert claude["effort"] == "max"
-    assert claude["thinking"] is True
+    # FALSE on purpose since 2026-07-30: Opus 5 dropped the separate Thinking
+    # toggle that Opus 4.x carried inside the Effort submenu — effort IS the
+    # reasoning lever there now. While this was True, setup opened the model
+    # popover on every run purely to reach a control that no longer exists.
+    # Flipping it back must reopen that path, which test_claude_popover_skip.py
+    # pins behaviourally.
+    assert claude["thinking"] is False
     assert claude["tool"] == "research"
     gemini = models.p2_labels("gemini")
-    assert gemini["thinking"] == "extended"
+    assert gemini["thinking"] == "extended"   # Gemini still has one
     assert "pro" in gemini["reject"] and "lite" in gemini["reject"]
 
 

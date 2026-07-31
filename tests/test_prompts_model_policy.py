@@ -38,10 +38,28 @@ def test_claude_validate_prompt_derives_version_from_policy():
 
 def test_validate_user_msg_derives_version_from_policy():
     # The CUA validate user-message in research.py routes the version through
-    # p2_claude_ver() too (not a hardcoded "Opus 4.8").
+    # p2_claude_ver() and the effort label through p2_labels (not literals).
     src = inspect.getsource(research.validate_setup_with_cua)
-    assert "Verify Opus {p2_claude_ver()} + Max effort + Adaptive thinking + Research tool" in src
+    assert "p2_claude_ver()" in src, "the validate user_msg must derive the version"
+    assert "p2_labels('claude')" in src, "and the effort label"
     assert '"Verify Opus 4.8 +' not in src, "the validate user_msg must not keep a hardcoded 4.8"
+
+
+def test_validate_user_msg_treats_the_floor_as_a_floor():
+    """2026-07-30. "Verify Opus 4.8" on an account already running Opus 5 made
+    the validator reason "this is NOT Opus 4.8, so I need to fix it" and click
+    into the model menu before self-correcting a step later — the second
+    model-menu interaction reported as "the modal selector opens twice"."""
+    src = inspect.getsource(research.validate_setup_with_cua)
+    assert "OR NEWER" in src, "a higher Opus must be stated as correct"
+    assert "leave it alone" in src, (
+        "the validator must be told not to touch an at-or-above model — without "
+        "this it opens the model menu on a healthy page"
+    )
+    assert "Adaptive thinking" not in src, (
+        "Opus 5 has no Thinking toggle; asking the validator to confirm one "
+        "guarantees a false negative on the quality knobs"
+    )
 
 
 def test_default_floor_renders_the_legacy_literals():

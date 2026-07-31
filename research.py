@@ -14243,8 +14243,10 @@ _HOTSPOT_VISION_HINTS = {
             "Research' (top level, or under 'More tools'); a merely-visible chip is NOT "
             "proof it is armed — it is ON only when the placeholder reads 'What do you "
             "want to research?' (chat mode = 'Ask Gemini'), so do NOT re-toggle a pill "
-            "that is already active. Claude: set the model to Opus + Max effort + "
-            "Adaptive thinking, then enable the 'Research' tool. Do NOT type, paste, "
+            "that is already active. Claude: the model must be Opus with Max effort "
+            "— if it already reads Opus, LEAVE IT ALONE (a higher Opus is correct, and "
+            "there is no separate thinking toggle on the current model) — then enable "
+            "the 'Research' tool. Do NOT type, paste, "
             "compose, or send anything; do NOT click Send/Submit; do NOT attach files "
             "(Claude); never click the microphone or the Stop/stop-generating button. "
             "If the mode is already active, just focus the input; if Deep "
@@ -16388,7 +16390,7 @@ PHASE_FLOW_CONTEXT = {
         "attach PDFs, submit the brief prompt, then ~10-20 min of reasoning "
         "+ writing while the frontend token-streams the output."),
     2: ("Phase 2 is parallel deep research. ChatGPT Deep Research, Gemini "
-        "Deep Research, and Claude Adaptive Thinking + Research tools run "
+        "Deep Research, and Claude's Research tool on max effort run "
         "at the same time with the same brief. Each crawls 40-60+ sources "
         "and produces an independent 5-15k-word markdown report. Runs "
         "30-90 min; per-agent sources, sections, and thinking stream live."),
@@ -16424,7 +16426,7 @@ AGENT_PHASE_FLOWS: dict[tuple[str, int], list[str]] = {
     ("claude", 2): [
         # Version-free on purpose: the runtime picks the highest Opus offered, so a
         # pinned number here would misreport the moment the family moves on.
-        "0-60s: Opening Claude with the latest Opus (Max effort + Adaptive Thinking) + Research tools",
+        "0-60s: Opening Claude with the latest Opus (Max effort) + Research tools",
         "60s-3m: Loading the brief and planning the research scope",
         "3-15m: Conducting web searches and reading sources, artifact preview building",
         "15-40m: Building the artifact with research findings and citations",
@@ -23831,13 +23833,16 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                              and _merged_partial_len < 500)
                     if is_et:
                         # Agent-specific label: ChatGPT kept "Extended Thinking",
-                        # Claude renamed to "Adaptive Thinking", Gemini uses
-                        # "Planning" (pre-research planning step). Emitting the
-                        # wrong label on Claude misleads users into thinking a
-                        # deprecated setting is on.
+                        # Gemini uses "Planning" (pre-research planning step).
+                        # Emitting the wrong label on Claude misleads users into
+                        # thinking a deprecated setting is on — which is exactly
+                        # why this is now plain "Thinking" (2026-07-30): Opus 5
+                        # dropped the separate Adaptive Thinking toggle, so
+                        # naming it would advertise a control that no longer
+                        # exists. Effort is the reasoning lever there now.
                         _nk = normalize_agent_key(label)
                         _think_label = (
-                            "Adaptive Thinking" if _nk == "claude" else
+                            "Thinking" if _nk == "claude" else
                             "Planning" if _nk == "gemini" else
                             "Extended Thinking"
                         )
@@ -32732,22 +32737,33 @@ async def setup_gemini_dr(page, pin_model=None) -> bool:
 
 
 async def setup_claude_dr(page, pin_model=None) -> bool:
-    """Enable Claude Opus 4.8 + Max Effort + Thinking + Research tool via
-    direct Playwright selectors. As of 2026-05-28 the claude.ai UI splits
-    these across the model popover + the tools menu:
-        1. Model dropdown        → Opus 4.8
+    """Enable Claude Opus (>= the policy floor) + Max Effort + Research tool via
+    direct Playwright selectors. As of 2026-05-28 the claude.ai UI splits these
+    across the model popover + the tools menu:
+        1. Model dropdown        → highest Opus offered, floor from policy
         2. Effort submenu        → Max          (inside the model popover)
-        3. Thinking toggle       → on           (inside the Effort submenu)
-        4. Research tool         → on (inside the "+" tools menu)
-    The model popover is opened ONCE per call: the model PICK runs only when
-    the trigger isn't already Opus >= 4.8 (#744 — never re-click a correct
-    model), but the Effort=Max + Thinking=on knobs are set via DOM on every
-    call (#745 — the user wanted these done seamlessly by DOM rather than CUA,
-    whose screenshots kept collapsing the Effort submenu). Effort/Thinking are
-    quality knobs (best-effort: WARN on miss). Correctness gates are the model
-    + Research tool — those hard-return False on miss. The CUA fallback lives
-    one layer up in setup_agent + validate_setup_with_cua so this routine can
-    fail fast without fighting the DOM."""
+        3. Research tool         → on (inside the "+" tools menu)
+    Every number and label above comes from P2_MODEL_POLICY["claude"], never a
+    literal here.
+
+    THE POPOVER IS NOW OPENED ONLY WHEN IT HAS SOMETHING TO DO (2026-07-30).
+    It used to open on every call because the Thinking toggle lived inside the
+    Effort submenu and had to be re-asserted (#745). Opus 5 removed that toggle,
+    and the model-selector trigger already displays the effort ("Opus 5 Max") —
+    so when the trigger reads a model at/above the floor AND the target effort,
+    both knobs are confirmed without touching the UI and Step 1A is skipped.
+    That is what stopped the run from logging "NOT re-picking" and then opening
+    the model menu anyway, and from handing the quality knobs to the CUA
+    validate layer, which produced a second model-menu interaction.
+    The skip requires POSITIVE reads of both facts; any uncertainty falls
+    through and opens the popover exactly as before.
+
+    The model PICK still runs only when the trigger isn't already at/above the
+    floor (#744 — never re-click a correct model). Effort is a quality knob
+    (best-effort: WARN on miss). Correctness gates are the model + Research tool
+    — those hard-return False on miss. The CUA fallback lives one layer up in
+    setup_agent + validate_setup_with_cua so this routine can fail fast without
+    fighting the DOM."""
     try:
         await asyncio.sleep(2)
 
@@ -32810,6 +32826,12 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
         # this floor only refuses anything below it. Injected into the picker JS
         # below so a floor bump touches one place, not ~3 scattered literals.
         _claude_floor = p2_floor("claude")
+        # Effort + thinking come from the SAME policy dict as the floor, so the
+        # quality knobs can never drift from it. `thinking` is False since Opus 5
+        # removed the toggle — see the note on P2_MODEL_POLICY["claude"].
+        _cl_pol = p2_labels("claude")
+        _claude_effort = _cl_pol.get("effort")            # "max"
+        _claude_wants_thinking = bool(_cl_pol.get("thinking"))
 
         # ── Step 1: model = Opus >= floor, Effort = Max, Thinking toggle ON ──
         # (#744) Read the model-selector TRIGGER first — it shows BOTH the
@@ -32833,17 +32855,39 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
         # Step 1B* below fixes that: while the popover is open ANYWAY, upgrade to
         # a STRICTLY higher Opus when one is offered. Strictly-higher is what
         # keeps #744 dead — the currently-selected option can never be re-clicked.
-        model_trigger_ver = await page.evaluate("""() => {
+        _trigger_read = await page.evaluate("""(effortWord) => {
             const verOf = t => { const m = (t || '').match(/opus[^0-9]*([0-9]+(?:\\.[0-9]+)?)/i); return m ? parseFloat(m[1]) : null; };
             const vis = el => el.getClientRects().length > 0;   // fixed-position triggers have offsetParent === null
             // The trigger lives OUTSIDE any open popover — exclude menu/
             // listbox/dialog descendants so a stale option can't be read.
             const btns = [...document.querySelectorAll('button, [role="button"]')]
                 .filter(b => vis(b) && !b.closest('[role="menu"], [role="listbox"], [role="dialog"]'));
-            let best = null;
-            for (const b of btns) { const v = verOf(b.textContent); if (v !== null && (best === null || v > best)) best = v; }
-            return best;
-        }""")
+            let best = null, bestText = '';
+            for (const b of btns) {
+                const t = b.textContent || '';
+                const v = verOf(t);
+                if (v !== null && (best === null || v > best)) { best = v; bestText = t; }
+            }
+            // (2026-07-30) The SAME trigger that carries the model also carries
+            // the effort — it reads "Opus 5 Max" — so effort is knowable WITHOUT
+            // opening the popover. Read it only off the winning button's text,
+            // never page-wide: this account's plan chip also says "Max", and a
+            // document-wide scan would report effort-is-set on every page.
+            // Token-split rather than a constructed RegExp on purpose — a lone
+            // \\b inside a non-raw Python string once became a literal backspace
+            // and silently disabled a gate for months (see the #913 note).
+            let effort = null;
+            if (best !== null && effortWord) {
+                const toks = bestText.toLowerCase().split(/[^a-z0-9.]+/);
+                if (toks.indexOf(String(effortWord).toLowerCase()) !== -1) effort = effortWord;
+            }
+            return { ver: best, effort: effort, trigger_text: bestText.replace(/\\s+/g, ' ').trim().slice(0, 120) };
+        }""", _claude_effort)
+        model_trigger_ver = _trigger_read.get("ver") if isinstance(_trigger_read, dict) else _trigger_read
+        # Effort read straight off the trigger. Only ever a POSITIVE signal: when
+        # it is None we fall through to the popover exactly as before, so an
+        # unrecognised trigger layout degrades to today's behaviour, never worse.
+        _trigger_effort_ok = bool(isinstance(_trigger_read, dict) and _trigger_read.get("effort"))
         # Phoenix known-good fallback: when pin_model is set (the latest model
         # just failed Deep-Research verification), FORCE a re-pick to that exact
         # version — even if the trigger already shows a higher Opus (that higher
@@ -32929,8 +32973,25 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
         }"""
 
         # ── Step 1A: open the model popover ONCE (model pick if needed +
-        #              ALWAYS to reach the Effort submenu / Thinking toggle) ──
-        dropdown_clicked = await page.evaluate("""() => {
+        #              to reach the Effort submenu when it is still needed) ──
+        # (2026-07-30) It used to open on EVERY run, unconditionally, because the
+        # Thinking toggle lived behind it. Opus 5 removed that toggle, and the
+        # trigger already exposes the effort ("Opus 5 Max"), so when the model is
+        # at/above the floor AND the trigger already shows the target effort there
+        # is nothing left behind the popover to set. Opening it anyway is what
+        # made the log say "NOT re-picking" and then immediately open the model
+        # menu — and what invited the CUA validate layer in to "fix" the quality
+        # knobs, producing the second interaction. Every conjunct is a POSITIVE
+        # read; any uncertainty falls through and opens the popover as before.
+        _skip_popover = bool(model_ok and _trigger_effort_ok and not _claude_wants_thinking)
+        if _skip_popover:
+            # Read off the trigger, not assumed: this is the same evidence the
+            # popover path would have produced, without touching the UI.
+            _effort_confirmed = True
+            log(f"[setup_claude_dr] Step 1A SKIPPED: trigger already reads "
+                f"{_trigger_read.get('trigger_text')!r} — model >= floor and effort "
+                f"'{_claude_effort}' both confirmed without opening the popover")
+        dropdown_clicked = False if _skip_popover else await page.evaluate("""() => {
             const btns = [...document.querySelectorAll('button, [role="button"]')]
                 .filter(b => b.getClientRects().length > 0 && !b.closest('[role="menu"], [role="listbox"], [role="dialog"]'));
             // The model-selector trigger shows the currently-selected model name.
@@ -33045,7 +33106,13 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
                     # Thinking" — that old label is why the page-wide search
                     # missed it) and lives in the just-opened Effort submenu.
                     # State-aware: only click when it reads off.
-                    _think = await page.evaluate("""() => {
+                    # (2026-07-30) POLICY-GATED. Opus 5 removed this toggle, so
+                    # with `thinking: False` the probe is skipped rather than
+                    # hunting a control that cannot exist and WARNing on every
+                    # run. Kept rather than deleted because the policy dict is
+                    # the lever: an older Opus, or a future model that reinstates
+                    # the toggle, re-arms this by flipping one value.
+                    _think = {} if not _claude_wants_thinking else await page.evaluate("""() => {
                         const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
                         const vis = el => el.getClientRects().length > 0;
                         const isThinking = el => {
@@ -33076,7 +33143,12 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
                         if (!isOn(sw)) { sw.click(); return { found: true, toggled: true }; }
                         return { found: true, toggled: false };
                     }""")
-                    if not _think.get("found"):
+                    if not _claude_wants_thinking:
+                        # No toggle on this model family — nothing to confirm and
+                        # nothing wrong. Deliberately silent: a WARN here is what
+                        # made a healthy run look broken every single time.
+                        pass
+                    elif not _think.get("found"):
                         log("[setup_claude_dr] Step 1D WARN: 'Thinking' toggle not found in Effort submenu — UI moved/relabelled it", "WARN")
                     else:
                         _thinking_confirmed = True  # found ⇒ ON (just-toggled or already-on)
@@ -33121,14 +33193,16 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
                 await asyncio.sleep(0.3)
             except Exception:
                 pass
-        else:
-            # Couldn't open the popover. If the model is already >= 4.8 the run
-            # is still correct (model is the only hard gate here); the Effort/
-            # Thinking quality knobs fall to the CUA validate layer. If the model
-            # is NOT >= 4.8 and we can't even open the picker, the selector list
-            # is stale — fail fast to the CUA fallback.
+        elif not _skip_popover:
+            # Couldn't open the popover. (A deliberate skip is NOT this branch —
+            # there the knobs were already confirmed off the trigger, and warning
+            # about a popover we chose not to open would be a false alarm.)
+            # If the model is already >= floor the run is still correct (model is
+            # the only hard gate here); the Effort quality knob falls to the CUA
+            # validate layer. If the model is NOT >= floor and we can't even open
+            # the picker, the selector list is stale — fail fast to the CUA fallback.
             if model_ok:
-                log("[setup_claude_dr] Step 1A WARN: couldn't open model popover to set Effort/Thinking — model already Opus >= 4.8; CUA validate will confirm the quality knobs", "WARN")
+                log(f"[setup_claude_dr] Step 1A WARN: couldn't open model popover to set Effort — model already Opus >= {_claude_floor}; CUA validate will confirm the quality knobs", "WARN")
             else:
                 log("[setup_claude_dr] Step 1A FAIL: model popover button not found — selector list likely stale", "WARN")
                 return False
@@ -33361,7 +33435,20 @@ async def validate_setup_with_cua(browser, cua_client, page, platform, label, ve
     user_msg_map = {
         "chatgpt": "Verify Deep Research mode is ACTIVE in ChatGPT. Fix if not. Do not type.",
         "gemini": "Verify Gemini Deep Research is ACTIVE — the composer placeholder MUST read 'What do you want to research?' (NOT 'Ask Gemini'). A merely-visible chip is NOT enough proof. Fix if not. Do not type.",
-        "claude": f"Verify Opus {p2_claude_ver()} + Max effort + Adaptive thinking + Research tool are ON in Claude. Clear any stale attachments. Do not type.",
+        # (2026-07-30) The floor is a MINIMUM. "Verify Opus 4.8" on an account
+        # already running Opus 5 made the validator reason "this is NOT Opus
+        # 4.8, so I need to fix it" and click into the model menu before
+        # self-correcting a step later — the second model-menu interaction users
+        # saw as "the modal selector opens twice". State the floor as a floor,
+        # and say explicitly that a higher model must be left alone. `Adaptive
+        # thinking` is gone with the toggle itself — see P2_MODEL_POLICY.
+        "claude": (
+            f"Verify Claude is on Opus {p2_claude_ver()} OR NEWER, with "
+            f"{str(p2_labels('claude').get('effort', 'max')).capitalize()} effort, "
+            f"and the Research tool ON. A HIGHER Opus is correct — if the model "
+            f"already reads Opus {p2_claude_ver()} or above, leave it alone and do "
+            f"NOT open the model menu. Clear any stale attachments. Do not type."
+        ),
     }
     sys_prompt = validator_map.get(platform.lower())
     user_prompt = user_msg_map.get(platform.lower())
@@ -37091,10 +37178,13 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         log(f"\n[Startup gap] Waiting {_p2_stagger_sec}s before opening Claude...")
         await asyncio.sleep(_p2_stagger_sec)
 
-    # ── Step 2 (2B): Claude — Opus 4.8 + Max effort + Adaptive Thinking + Research tool ──
+    # ── Step 2 (2B): Claude — Opus (>= policy floor) + Max effort + Research tool ──
     if enabled_agents is None or "claude" in enabled_agents:
         log("\n--- 2B: Claude Deep Research ---")
-        emit_event("agent_progress", phase=2, agent="claude", status="starting", progress="Opening Claude with Opus 4.8 (Max effort + Adaptive Thinking) + Research tools...")
+        # Version-free like the Phase-2 timeline copy above: the runtime picks the
+        # highest Opus offered, so a pinned "4.8" here misreports the moment the
+        # family moves on — and it did, the account has been on Opus 5.
+        emit_event("agent_progress", phase=2, agent="claude", status="starting", progress="Opening Claude with the latest Opus (Max effort) + Research tools...")
         # #929: launch-site persisted-status reset — see the 2A note.
         _write_agent_terminal_status("claude", "running", force=True)
         for attempt in range(2):
@@ -37122,7 +37212,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         if verified_c:
             emit_event("agent_progress", phase=2, agent="claude", status="generating",
                        stage="researching",
-                       progress="Claude Adaptive Thinking started and verified")
+                       progress="Claude deep research started and verified")
             log("[2B] Claude is running ✓")
             await inject_agent_observer(claude_page, "claude")
         else:
