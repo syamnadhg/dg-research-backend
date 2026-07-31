@@ -67,7 +67,11 @@ def test_l1_stuck_threshold_is_15_min():
 
 
 def test_l3_unacted_grace_is_30_min():
-    assert '"DG_AUTO_SKIP_UNACTED_SEC", "1800"' in _POLL
+    # 2026-07-31: moved to module scope (auto_skip_unacted_sec) so Phase 3's
+    # link-failure card reads the SAME budget — it previously had none at all and
+    # blocked the run forever. Value unchanged; asserted by calling it.
+    assert research.auto_skip_unacted_sec() == 1800
+    assert "AUTO_SKIP_UNACTED_SEC = auto_skip_unacted_sec()" in _POLL
 
 
 # ── B2: planning counts as active ────────────────────────────────────────────

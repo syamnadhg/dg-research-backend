@@ -42,10 +42,11 @@ def _pipeline_src() -> str:
 
 
 def _link_extract_skip_branch() -> str:
-    """The `if decision == "skip":` body inside the P3 link-extract loop."""
+    """The `if decision in ("skip", "timeout"):` body inside the P3 link-extract
+    loop. Anchored on the emit rather than on log copy, which moves."""
     src = _pipeline_src()
-    i = src.index("Phase 3 link extraction: user skipped")
-    return src[i - 400:i + 1400]
+    i = src.index('if decision in ("skip", "timeout"):')
+    return src[i:i + 3600]
 
 
 def test_the_link_extract_skip_emits_a_terminal_phase_skipped():
@@ -91,16 +92,16 @@ def test_the_link_extract_skip_uses_a_flag_the_terminal_gate_reads():
     the whole fix."""
     src = _pipeline_src()
     branch = _link_extract_skip_branch()
-    assert "_p3_link_user_skipped = True" in branch
+    assert "_p3_link_skipped = True" in branch
     assert "_p3_audio_user_skipped = True" not in branch, (
         "_p3_audio_user_skipped is re-initialised after the link-extract loop — "
         "setting it here would be a no-op by the time the gate reads it"
     )
     # Initialised BEFORE the loop, and re-initialised nowhere after it.
-    init = src.index("_p3_link_user_skipped = False")
-    skip = src.index("_p3_link_user_skipped = True")
+    init = src.index("_p3_link_skipped = False")
+    skip = src.index("_p3_link_skipped = True")
     assert init < skip, "the flag must be initialised before the loop that sets it"
-    assert src.count("_p3_link_user_skipped = False") == 1, (
+    assert src.count("_p3_link_skipped = False") == 1, (
         "exactly one initialisation — a second one after the loop would clobber it"
     )
 
@@ -118,7 +119,7 @@ def test_the_terminal_gate_will_not_emit_phase_complete_after_a_link_skip():
     # The `if (...)` immediately preceding the emit, as a single normalised line.
     gate = " ".join(src[max(0, i - 600):i].split())
     for conjunct in ("not _p3_audio_user_skipped", "not _p3_login_skipped",
-                     "not _p3_link_user_skipped", "not _controls.is_stop()"):
+                     "not _p3_link_skipped", "not _controls.is_stop()"):
         assert conjunct in gate, (
             f"the phase_complete gate must include `{conjunct}` — without it a "
             "skip still reports the phase as completed (#100)"

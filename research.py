@@ -15167,6 +15167,23 @@ _active_decisions: set = set()
 _active_decision_agents: dict = {}
 
 
+def auto_skip_unacted_sec() -> int:
+    """How long an unanswered [Retry][Skip] card is given before it auto-skips.
+
+    Hoisted to module scope 2026-07-31 so BOTH ends of the alert taxonomy read
+    ONE value. They were previously incoherent in opposite directions: Phase 2
+    retracted its card in 0 seconds (the exit sweep finalized on the same tick it
+    was raised) while Phase 3's link-failure card blocked forever (its wait used
+    the 24-hour `await_phase_decision` default and its emitter stamped no
+    deadline at all). Same alert system, opposite failure modes, both wrong.
+
+    Read LIVE from the env on every call rather than captured at import — that
+    preserves the round-robin's existing semantics, and it means a test can
+    monkeypatch the window without reloading the module.
+    """
+    return int(os.environ.get("DG_AUTO_SKIP_UNACTED_SEC", "1800"))
+
+
 def _disarm_registry(agent_or_all):
     """#955 Phase 2: drop armed auto-skip deadlines so the round-robin firer
     (_fire_due_autoskips) can't skip an agent whose card was already resolved
@@ -16586,7 +16603,7 @@ def _brief_send_fail_copy(platform: str, *, rejected: bool = False) -> "tuple[st
 
 def fail_agent(agent_key: str, title: str, details: str = "", skip_only: bool = False,
                phase: "int | None" = None, auto_skip_deadline: "float | None" = None,
-               recoverability: "str | None" = None):
+               recoverability: "str | None" = None, arm_registry: bool = True):
     """Template B: per-agent error alert (Phase 2 in the common case). Emits
     pipeline_error scoped to one agent with [Retry, Skip]. NO Stop. #955: the
     single "Retry" restarts the agent (close tab + re-run setup) — the only
@@ -16651,12 +16668,19 @@ def fail_agent(agent_key: str, title: str, details: str = "", skip_only: bool = 
     # the silent-retry budget) — emit_decision honors an explicit override even
     # with an intent set, so the card is un-auto-skippable AND the FE can never
     # swallow it into the quiet-infra banner (it gates on recoverability!="blocker").
+    # 2026-07-31: `arm_registry` passthrough. A caller whose OWN wait loop is the
+    # firer (design G(ii)) passes False: the deadline is stamped on the event so
+    # the FE renders a real countdown, but no registry entry is created for
+    # _fire_due_autoskips. That firer deliberately skips parked agents, so an
+    # armed entry for one would be dead weight that could still fire later if the
+    # park were ever cleared without disarming. The mid-run agent_error card is
+    # exactly this case — the parked-decision resolver owns its timeout.
     emit_decision(phase=_eff_phase, agent=agent_key,
                   intent=("agent_failed_handsoff" if skip_only else "agent_failed"),
                   facts={"title": title, "details": details, "agent": agent_key},
                   alert_id=_agent_error_alert_id(agent_key, _eff_phase),
                   auto_skip_deadline=(None if skip_only else auto_skip_deadline),
-                  recoverability=recoverability)
+                  recoverability=recoverability, arm_registry=arm_registry)
     # 2026-07-13: stamp the emit so the caller's GENERIC "didn't start" card
     # doesn't fire seconds later and OVERWRITE this (same alert_id) with a
     # less specific message — the 03:42 run persisted "Couldn't send the
@@ -25749,6 +25773,44 @@ async def _resolve_parked_agent_decision(kind, action, p, name, key, elapsed,
         # or 30-min-regraced) session.
         return "continue"
 
+    # ── Mid-run agent error: retry = HARD retry; timeout = honest auto-skip ──
+    # 2026-07-31. The other parked kinds take a SOFT action on Retry (reload,
+    # re-extract, nudge) because their page is still healthy. This one's page is
+    # showing a failure state, so a nudge recovers nothing — the corpus recovery
+    # was `RETRY_AGENT mode=hard` → "Hard retry successful ✓" → 61,023 chars.
+    #
+    # Re-arming the marker rather than restarting inline is deliberate: the
+    # loop-top hard-retry consumer skips PARKED agents without consuming (so the
+    # soft resolvers keep their markers), and it carries every race guard that
+    # path needs — the completion race, the mid-completion window, the
+    # Skip-supersedes-Retry rule, the retry cap. The park is cleared by the
+    # caller before we get here, so the marker is picked up on the next tick with
+    # all of that intact. Same "re-arm the marker path" idiom the skip branch
+    # already uses.
+    if kind == "agent_error":
+        if _retry:
+            log(f"[{name}] error card retried — re-arming a HARD retry (a soft "
+                "nudge cannot recover a page in a failure state)", "INFO")
+            _controls.request_retry_agent_hard(key)
+            return "continue"
+        # timeout → NOW the "went unanswered" copy is true: the card really did
+        # sit for the full window. Finalize through the one auto-skip shape, with
+        # the honest mid-run reason rather than the "couldn't start" default.
+        _ae_reason, _ae_copy, _ae_why = autoskip_reason_for_status(
+            (results.get(name) or {}).get("status", "agent_error"))
+        log(f"[{name}] error card sat unanswered for the full window — "
+            f"auto-skipping ({_ae_why})", "WARN")
+        await _finalize_agent_autoskip(
+            browser, p.get("page"), key, name,
+            reason=_ae_reason, copy_key=_ae_copy, why=_ae_why,
+            partial=(results.get(name) or {}).get("text", "") or "",
+            url=p.get("url", ""), elapsed_sec=int(elapsed),
+            results=results, results_name=name)
+        _disarm_registry(key)
+        if name in pending:
+            del pending[name]
+        return "continue"
+
     # ── Playwright-path empty extraction: retry = re-run the tier ladder ──
     if kind == "extract_empty_pw":
         if _retry:
@@ -25949,7 +26011,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
     STUCK_NO_GROWTH_SEC = int(os.environ.get("DG_STUCK_NO_GROWTH_SEC", "900"))       # L1: 15 min flat → CUA arbiter → [Retry][Skip] card
     STUCK_MIN_ELAPSED_SEC = int(os.environ.get("DG_STUCK_MIN_ELAPSED_SEC", "600"))   # never stuck-check in the first 10 min
     STUCK_WARN_THROTTLE_SEC = int(os.environ.get("DG_STUCK_WARN_THROTTLE_SEC", "600"))  # ≥10 min between arbiter probes / re-warns
-    AUTO_SKIP_UNACTED_SEC = int(os.environ.get("DG_AUTO_SKIP_UNACTED_SEC", "1800"))  # L3: 30 min after the card sits unacted → auto-skip THIS agent
+    AUTO_SKIP_UNACTED_SEC = auto_skip_unacted_sec()  # L3: 30 min after the card sits unacted → auto-skip THIS agent (module-level so P3 shares the value)
     PER_AGENT_HARD_CAP_SEC = int(os.environ.get("DG_PER_AGENT_HARD_CAP_SEC", "5400"))  # L3: 90 min absolute per-agent ceiling → auto-skip
 
     pending = {}
@@ -26062,6 +26124,26 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             _produced_output = bool(_fin_r.get("text")) or _fin_st in (
                 "done", "complete", "completed", "done_partial", "partial")
             if _produced_output:
+                continue
+            # 2026-07-31: never finalize an agent whose card is STILL LIVE.
+            #
+            # This sweep is the reason a Retry/Skip card could be raised and
+            # destroyed in the same second. It ran at loop exit and finalized
+            # anything unresolved with NO deadline test whatsoever — verified: no
+            # reference to AUTO_SKIP_UNACTED_SEC, no timestamp, no deadline. The
+            # mid-run error path now parks instead of dropping, which keeps the
+            # loop alive and hands the timeout to the parked-decision resolver;
+            # this guard is the second half, so a card that is still inside its
+            # window survives a sweep triggered by a SIBLING agent finishing.
+            #
+            # It is a backstop, not a timer: by the time the loop legitimately
+            # exits, every park has either been resolved or timed out. If one is
+            # somehow still parked here, leaving the card up is the correct
+            # failure mode — it is what the user is being asked to act on.
+            if (pending.get(_fin_name) or {}).get("awaiting_decision"):
+                log(f"[{_fin_name}] exit sweep: card still live (parked, awaiting "
+                    "the user) — NOT auto-skipping; the parked resolver owns its "
+                    "deadline", "INFO")
                 continue
             # Target: an UNRESOLVED failure with no output. fail_agent persisted
             # 'errored' (setup fail, signed-out, hard-retry-exhausted), or the
@@ -28999,11 +29081,43 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         continue
                     log(f"[{name}] still not generating after the reload — dropping "
                         "from rotation", "WARN")
+                # 2026-07-31 — THE 0-SECOND CARD RETRACTION.
+                #
+                # This branch used to raise the Retry/Skip card and then
+                # `del pending[name]`. When this was the last polling agent, that
+                # emptied `pending`, the round-robin exited on the same tick, and
+                # the exit sweep (_finalize_unresolved_autoskips) auto-skipped the
+                # agent immediately — logging "its Retry/Skip alert went
+                # unanswered" about a card that had existed for ZERO seconds.
+                # Observed: persisted 14:36:55, cleared 14:36:55. The user got 0
+                # of the configured 1800 s.
+                #
+                # It cost a whole leg. The corpus has the counter-example: the
+                # identical phase2_agent_claude_error card stood for 63 s on an
+                # earlier run, the user clicked Retry, and the agent recovered to
+                # status=done with 61,023 chars.
+                #
+                # Fix: PARK the agent instead of dropping it — the codebase's own
+                # idiom for "this agent is waiting on a human" (session_expiry,
+                # extract_empty_pw, claude_2artifact_hf all use it). The agent
+                # stays in `pending`, so the loop keeps ticking and the other
+                # agents keep polling, while the parked-decision resolver checks
+                # for a decision once per tick and applies the park timeout.
+                #
+                # The deadline is stamped on the card with `arm_registry=False`:
+                # the FE renders a countdown to the same epoch the park will
+                # expire at, but no registry entry is created — _fire_due_autoskips
+                # deliberately skips parked agents (line ~26141), so an armed
+                # entry would be dead weight that could still fire if the park
+                # were ever cleared without disarming. One timer, one actor.
+                _ae_window = AUTO_SKIP_UNACTED_SEC
                 if not p.get("failed_alert_emitted"):
                     fail_agent(agent_key_err,
                                f"{name} reported an error",
                                (f"{name} showed a 'research failed' error and we kept "
-                                "what little it produced. Retry to run it fresh, or Skip it."))
+                                "what little it produced. Retry to run it fresh, or Skip it."),
+                               auto_skip_deadline=(time.time() + _ae_window) * 1000,
+                               arm_registry=False)
                     p["failed_alert_emitted"] = True
                 results[name] = {
                     "status": "agent_error",
@@ -29012,7 +29126,12 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     "page": p["page"],
                     "elapsed_sec": int(elapsed),
                 }
-                del pending[name]
+                p["awaiting_decision"] = {
+                    "kind": "agent_error", "key": agent_key_err,
+                    "since": time.time(), "timeout": _ae_window,
+                }
+                log(f"[{name}] parked kind=agent_error — its Retry/Skip card has "
+                    f"{int(_ae_window / 60)} min before auto-skip; siblings keep polling", "INFO")
                 continue
 
             if is_generating and not is_done:
@@ -44370,11 +44489,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                                      "url": "", "page": None}
             # Sub-step 3a: Upload to NotebookLM
             _p3a_user_skipped = False
-            # Set when the user picks Skip on the link-extract failure card. Kept
-            # separate from `_p3_audio_user_skipped` (which is re-initialised
-            # after the link-extract block) and read by the terminal gate so the
-            # phase reports a SKIP rather than a green "notebook created".
-            _p3_link_user_skipped = False
+            # Set when the link-extract failure card ends in a skip — either the
+            # user clicking Skip or the card going unanswered for its full
+            # auto-skip window. Kept separate from `_p3_audio_user_skipped`
+            # (which is re-initialised after the link-extract block) and read by
+            # the terminal gate so the phase reports a SKIP rather than a green
+            # "notebook created".
+            _p3_link_skipped = False
             # 2026-05-07 (Bug A1): narrow-retry budget for the upload step.
             # When run_phase3_upload silently completes with a bogus URL
             # (e.g. CUA returned 'blocked: Google Sign-in' because the user
@@ -44462,6 +44583,25 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     # sign-in redirect — name the real cause so the card is
                     # actionable (and re-verify for real on the next gate).
                     _nb_wall = await _page_shows_login_wall(getattr(browser, "page", None))
+                    # 2026-07-31 — the OTHER end of the 0-second retraction.
+                    #
+                    # Phase 2 retracted its Retry/Skip card in 0 seconds; Phase 3
+                    # never retracted this one. `await_phase_decision` defaults to
+                    # a 24-hour timeout and the emitter stamped no deadline at
+                    # all, so an unattended link failure hung the run until the
+                    # outer watchdog killed it — with no countdown shown, because
+                    # there was nothing to count down to. Same alert system,
+                    # opposite failure modes, both wrong.
+                    #
+                    # 0 here means "wait indefinitely", and there are two cases
+                    # where that is still correct:
+                    #   * a SIGN-IN WALL. The taxonomy classes a login card as a
+                    #     blocker — the user CAN resolve it, so it must never
+                    #     auto-fire. Auto-skipping someone's notebook because they
+                    #     were away from a sign-in prompt is the wrong trade.
+                    #   * auto-skip turned OFF in settings. Every other auto-skip
+                    #     honours that switch; this one must too.
+                    _nb_skip_in = 0.0
                     if _nb_wall:
                         _controls.cookie_trust_broken.add("notebooklm")
                         log(f"[NotebookLM] shows {_nb_wall} — Google session expired (stale cookie)", "WARN")
@@ -44473,13 +44613,27 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                             agent="notebooklm",
                         )
                     else:
+                        if _runtime.auto_skip_stuck:
+                            _nb_skip_in = float(auto_skip_unacted_sec())
+                        # `arm_registry=False`: the wait below IS the firer
+                        # (design G(ii)). The round-robin registry firer only
+                        # fires agents inside its own `pending` set, which a P3
+                        # phase card never enters, so an armed entry would just be
+                        # a stale row. The deadline still rides the EVENT, so the
+                        # FE counts down to the same moment this wait expires.
+                        _nb_deadline_kw = (
+                            {"auto_skip_deadline": (time.time() + _nb_skip_in) * 1000,
+                             "arm_registry": False}
+                            if _nb_skip_in else {})
                         fail_phase(
                             phase=3,
                             error="Couldn't get the NotebookLM link",
                             reason="NotebookLM finished but we couldn't get its share link. Retry to try again, or Skip it.",
                             agent="notebooklm",
+                            **_nb_deadline_kw,
                         )
-                    decision = await _controls.await_phase_decision(3)
+                    decision = await _controls.await_phase_decision(
+                        3, timeout=(_nb_skip_in if _nb_skip_in else 86400.0))
                     if decision == "retry":
                         # 2026-05-07 (Bug A1): if the URL we have isn't even on
                         # the NotebookLM domain (sign-in redirect, blank, etc.),
@@ -44524,7 +44678,14 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         log("Phase 3 link extraction: user requested retry", "INFO")
                         emit_event("phase_restart", phase=3, reason="user_retry_link_extract", attempt=0)
                         continue
-                    if decision == "skip":
+                    if decision in ("skip", "timeout"):
+                        # `timeout` reaches here ONLY when a deadline was armed
+                        # above (a recoverable link failure with auto-skip on), so
+                        # it means the card sat for its full window unanswered.
+                        # Pre-fix it fell through to the terminate path below,
+                        # which with the 24-hour default was unreachable — the run
+                        # just hung instead.
+                        _nb_auto = decision == "timeout"
                         # 2026-07-31 (owner-reported): this branch used to just
                         # blank the URL and break. That made it the ONLY skip
                         # branch in the whole pipeline that emitted no terminal
@@ -44542,14 +44703,17 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         # never obtained, instead of the greyed-out skip they
                         # asked for. P4 also wasn't cascaded off, so FE-P4 was
                         # triggered for a podcast that does not exist.
-                        log("Phase 3 link extraction: user skipped — proceeding without notebook URL", "INFO")
+                        log(f"Phase 3 link extraction: "
+                            f"{'card unanswered for its full window — auto-skipping' if _nb_auto else 'user skipped'}"
+                            f" — proceeding without notebook URL", "INFO")
                         notebook_url = ""
                         emit_event("phase_skipped", phase=3,
-                                   reason="user_skip_at_link_extract")
+                                   reason=("auto_skip_link_unanswered" if _nb_auto
+                                           else "user_skip_at_link_extract"))
                         # NB: a dedicated flag, NOT `_p3_audio_user_skipped` —
                         # that one is re-initialised to False a few lines below
                         # this loop, which would silently undo the fix.
-                        _p3_link_user_skipped = True
+                        _p3_link_skipped = True
                         _controls.skipped_phases.add(4)
                         break
                     log(f"Phase 3 link extraction: user {decision} — terminating pipeline", "INFO")
@@ -44798,11 +44962,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # their own terminal event (phase_skipped:3 / pipeline_stopped).
             # 2026-07-31: TWO flags joined them, and they are different bugs.
             #
-            # `_p3_link_user_skipped` was the owner-reported one — a Skip on the
+            # `_p3_link_skipped` was the owner-reported one — a Skip on the
             # link-extract failure card emitted no terminal event at all, so it
             # fell through to here and produced a green phase_complete claiming a
             # notebook that was never obtained ("instead of greyed out skip, it
-            # got the completed status").
+            # got the completed status"). It now also covers that card being
+            # auto-skipped after going unanswered for its full window.
             #
             # `_p3a_user_skipped` is the sibling, found in adversarial review of
             # that fix. A Skip on the P3 UPLOAD-timeout card does emit
@@ -44814,7 +44979,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # exactly ONE terminal event" are different guarantees, and only the
             # second one is what the user sees.
             if (not _p3_audio_user_skipped and not _p3_login_skipped
-                    and not _p3_link_user_skipped
+                    and not _p3_link_skipped
                     and not _p3a_user_skipped
                     and not _controls.is_stop()):
                 emit_event("phase_complete", phase=3, durationSec=int(time.time() - _p3_start), links=_p3_links,

@@ -153,8 +153,14 @@ def test_stuck_constants_defaults():
     # #929 (2026-07-09): 600→900 / 1200→1800 after a live false alarm on a
     # healthy >10-min Gemini plan (carded at 10 min, auto-skipped at +20).
     assert 'DG_STUCK_NO_GROWTH_SEC", "900"' in _POLL
-    assert 'DG_AUTO_SKIP_UNACTED_SEC", "1800"' in _POLL
     assert 'DG_PER_AGENT_HARD_CAP_SEC", "5400"' in _POLL
+    # 2026-07-31: the unacted grace moved to module scope (research.py
+    # auto_skip_unacted_sec) so Phase 2 and Phase 3 share ONE budget — Phase 2
+    # was retracting its card in 0s while Phase 3 blocked forever. The VALUE is
+    # unchanged; asserted by CALLING it rather than by grepping for the literal,
+    # which is both stronger and location-independent.
+    assert research.auto_skip_unacted_sec() == 1800
+    assert "AUTO_SKIP_UNACTED_SEC = auto_skip_unacted_sec()" in _POLL
 
 
 # ── Layer-3 auto-skip backstop ───────────────────────────────────────────────
