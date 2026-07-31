@@ -130,5 +130,73 @@
       "vision",
       "cua"
     ]
+  },
+  "notebooklm.open_share_dialog": {
+    "platform": "notebooklm",
+    "intent_id": "open_share_dialog",
+    "type": "select",
+    "irreversible": false,
+    "region": "document",
+    "outcome_predicate": "nlm_share_dialog:open",
+    "signal_hints": {
+      "accessible_name": "share",
+      "role": [
+        "button"
+      ]
+    },
+    "tier_sequence": [
+      "registry",
+      "builtin",
+      "heal",
+      "vision",
+      "cua"
+    ]
+  },
+  "notebooklm.set_public_access": {
+    "platform": "notebooklm",
+    "intent_id": "set_public_access",
+    "type": "select",
+    "irreversible": false,
+    "region": "dialog",
+    "outcome_predicate": "nlm_access:anyone_with_link",
+    "signal_hints": {
+      "accessible_name": "notebook access",
+      "role": [
+        "button",
+        "combobox",
+        "listbox",
+        "menuitem",
+        "option"
+      ],
+      "value_contains": "anyone with the link"
+    },
+    "tier_sequence": [
+      "registry",
+      "builtin",
+      "heal",
+      "vision",
+      "cua"
+    ]
+  },
+  "notebooklm.copy_share_link": {
+    "platform": "notebooklm",
+    "intent_id": "copy_share_link",
+    "type": "select",
+    "irreversible": false,
+    "region": "dialog",
+    "outcome_predicate": "nlm_clipboard:notebook_url",
+    "signal_hints": {
+      "accessible_name": "copy link",
+      "role": [
+        "button"
+      ]
+    },
+    "tier_sequence": [
+      "registry",
+      "builtin",
+      "heal",
+      "vision",
+      "cua"
+    ]
   }
 }

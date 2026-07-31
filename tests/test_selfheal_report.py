@@ -144,9 +144,33 @@ def test_main_no_log_is_graceful(tmp_path, monkeypatch, capsys):
 
 
 def test_report_constants_match_runtime_contracts():
-    # the report's local copies must not drift from selfheal's truth
+    # The intent list must cover the runtime manifest EXACTLY — every wired
+    # intent gets a report row, and a row for an intent that no longer exists
+    # would silently render "(not observed)" forever.
     assert set(report.INTENTS) == set(selfheal.load_intents())
-    assert set(report.PLATFORMS) == set(selfheal.PLATFORMS)
+
+
+def test_report_platforms_are_the_research_platforms_not_every_platform():
+    """2026-07-31: report.PLATFORMS is deliberately NARROWER than
+    selfheal.PLATFORMS, and that is a decision, not drift.
+
+    The two DoD rows it feeds — "probe deployed on all 3 platforms" and
+    "a heal shadowed per platform" — measure the P2 setup rollout, where all
+    three research agents run on every single run. NotebookLM's intents live in
+    Phase 3, which runs once per run and only when Phase 2 actually produced
+    documents, so counting it would flip a green DoD amber for a reason that has
+    nothing to do with probe coverage.
+
+    Pinned both ways so neither half can rot: it must stay a strict subset of
+    the runtime platform vocabulary (so a typo or a removed platform fails), and
+    it must be exactly the research three (so a future platform is a deliberate
+    edit here rather than an accidental inclusion).
+    """
+    assert set(report.PLATFORMS) < set(selfheal.PLATFORMS)
+    assert set(report.PLATFORMS) == {"chatgpt", "gemini", "claude"}
+    # Every reported intent's platform must be a known runtime platform, even
+    # the ones excluded from the DoD rows.
+    assert {i.split(".", 1)[0] for i in report.INTENTS} <= set(selfheal.PLATFORMS)
 
 
 def test_report_px4_drift_section_renders_verdicts():

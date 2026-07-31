@@ -57,6 +57,7 @@ import argparse
 import subprocess
 import collections
 from pathlib import Path
+from urllib.parse import urlparse
 # Explicit, NOT `from prompts import *` (DGOPS-9508). A star import blinds ruff to
 # undefined names in this whole file: it cannot resolve the import, so it downgrades
 # every unresolved global from `F821 undefined-name` to the far weaker
@@ -8563,7 +8564,8 @@ def _record_terminal_status(store: dict, rid: str, key, status: str) -> None:
     bucket[key] = status
 
 
-def _do_agent_terminal_status_write(agent_key: str, status: str):
+def _do_agent_terminal_status_write(agent_key: str, status: str,
+                                    reason: str = "", detail: str = ""):
     """Inner sync write — kept separate so the public _write_*
     helpers can fire-and-forget on a daemon thread, avoiding the
     event-loop blocking that B2 (research.py:1046) called out for
@@ -8574,10 +8576,23 @@ def _do_agent_terminal_status_write(agent_key: str, status: str):
     # deviceId (deviceUpdatingFor's payload clause REQUIRES it — a raw dict
     # 403s even with a fresh token) AND gets the gRPC 403 self-heal.
     ak = (agent_key or "").lower()
-    _set_research_doc(_fb_uid, _fb_research_id, {"agents": {ak: {"status": status}}}, merge=True)
+    _payload: dict = {"status": status}
+    # 2026-07-31: persist WHY, not just WHAT. The durable record was
+    # `{"status": "skipped", "completionTimeSec": 2841}` — status and a
+    # stopwatch, nothing else — so after a browser reload the FE had no
+    # material from which to say anything but the bare word "skipped", even for
+    # a 47-minute leg that failed on the platform's side. Volatile event detail
+    # covers the live session; these two fields cover every reload after it.
+    # Written only when supplied, so no existing caller's payload changes shape.
+    if reason:
+        _payload["statusReason"] = reason
+    if detail:
+        _payload["statusDetail"] = detail
+    _set_research_doc(_fb_uid, _fb_research_id, {"agents": {ak: _payload}}, merge=True)
 
 
-def _write_agent_terminal_status(agent_key: str, status: str, force: bool = False):
+def _write_agent_terminal_status(agent_key: str, status: str, force: bool = False,
+                                 reason: str = "", detail: str = ""):
     """Persist a per-agent terminal status to the root research doc so the
     listing-page tile + chat phase icons + in-chat config icons all stay
     consistent across browser reloads. Volatile signals (FE alerts,
@@ -8660,7 +8675,7 @@ def _write_agent_terminal_status(agent_key: str, status: str, force: bool = Fals
     try:
         _threading.Thread(
             target=_do_agent_terminal_status_write,
-            args=(agent_key, status),
+            args=(agent_key, status, reason, detail),
             name=f"agent-status-{(agent_key or '').lower()}-{status}",
             daemon=True,
         ).start()
@@ -11867,12 +11882,72 @@ async def resume_browser_from_checkpoint(browser, queue_dir):
 
 # ── Link Validation — single source of truth for URL correctness ─────────────
 
+# ── NotebookLM host — shape-tested, because Google renames it ────────────────
+# 2026-07-30 incident (7 consecutive Phase-3 failures, 6 orphaned notebooks,
+# zero podcasts): Google started serving notebooks from `notebook.google.com`
+# — the same host without the "lm". Every gate on the P3 path tested the
+# literal string `notebooklm.google.com`, so on the same afternoon:
+#   * the share-dialog DOM read (`input[value*="notebooklm"]`) stopped matching,
+#   * the clipboard read stopped matching — the CORRECT link was on the
+#     clipboard the whole time and was thrown away by the containment guard,
+#   * the CUA fallback's success signal became unsatisfiable, and
+#   * this validator rejected every notebook the pipeline built.
+# Audio, P4 and P5 are all hard-gated behind that last check, so one renamed
+# hostname took the entire back half of the pipeline down.
+#
+# The fix is a SHAPE test, not a longer list of literals. A notebook URL is
+# "some Google host serving /notebook/<id>" — that survives the NEXT rename
+# with no code change, no data file and no feature flag, which is the point:
+# the old design guaranteed a total P3 outage on any host change, and Google
+# has now demonstrated it will make one. Still strict where it matters — the
+# `/notebook/<id>` path shape rejects the NotebookLM home page, a sign-in
+# redirect, and every other Google product.
+_NLM_NOTEBOOK_PATH_RE = re.compile(r"^/notebook/[^/\s?#]+")
+
+
+def is_notebooklm_url(u: str) -> bool:
+    """True when `u` is a NotebookLM *notebook* URL, on any host Google serves
+    NotebookLM from (notebooklm.google.com, notebook.google.com, whatever is
+    next). See the comment above for why this is a shape test and not a
+    hostname literal."""
+    if not u or not isinstance(u, str):
+        return False
+    try:
+        p = urlparse(u.strip())
+    except Exception:
+        return False
+    if p.scheme not in ("http", "https"):
+        return False
+    host = (p.hostname or "").lower()
+    if not (host == "google.com" or host.endswith(".google.com")):
+        return False
+    return bool(_NLM_NOTEBOOK_PATH_RE.match(p.path or ""))
+
+
+# The same predicate for in-page JS. Kept as a JS *expression* (an arrow
+# function) so every share-dialog read channel shares one definition instead of
+# re-spelling the host inline — re-spelling is exactly how the four gates above
+# drifted apart. Deliberately regex-free: a lone backslash in a non-raw Python
+# string silently became a literal backspace once before (#913) and disabled a
+# JS gate for months.
+_JS_IS_NLM_URL = """((s) => {
+    if (!s) return false;
+    try {
+        const u = new URL(String(s).trim());
+        if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+        const h = (u.hostname || '').toLowerCase();
+        if (h !== 'google.com' && !h.endsWith('.google.com')) return false;
+        return u.pathname.startsWith('/notebook/') && u.pathname.length > '/notebook/'.length;
+    } catch (e) { return false; }
+})"""
+
+
 # Per-platform patterns that indicate a REAL public/shareable link (not a page URL)
 _LINK_VALIDATORS = {
     "chatgpt": lambda u: "chatgpt.com/share/" in u,
     "gemini":  lambda u: ("gemini.google.com/share" in u or "g.co/gemini" in u),
     "claude":  lambda u: ("claude.site/artifacts/" in u or "claude.site/" in u),
-    "notebooklm": lambda u: "notebooklm.google.com/notebook/" in u,
+    "notebooklm": is_notebooklm_url,
     "youtube": lambda u: ("youtu.be/" in u or "youtube.com/watch?v=" in u),
     # Require the `/document/d/` doc-id segment — `/document/` alone
     # matches the home page (`/document/u/0/?usp=docs_home`), the create
@@ -12001,6 +12076,9 @@ _SECURITY_GOOGLE_AUTH_COOKIE_NAMES = (
 _SECURITY_PRESERVE_PLATFORM_DOMAINS = (
     "gemini.google.com",
     "notebooklm.google.com",
+    # 2026-07-30: Google began serving notebooks from the lm-less host. Both are
+    # live; a session on either is the same legitimately-paired NotebookLM login.
+    "notebook.google.com",
     "studio.youtube.com",
     "chatgpt.com",
     "claude.ai",
@@ -12912,15 +12990,28 @@ async def _set_nlm_public_and_get_link(page, label):
     """Shared helper: inside an open NotebookLM share dialog,
     set Notebook access → 'Anyone with the link', copy/get the link, click Save.
 
-    Returns a tuple (url, public_verified) — `public_verified` is True only
-    when the dialog DOM confirms the access dropdown reads "Anyone with the
-    link" before save. NotebookLM private and public URLs share the same
-    `/notebook/{id}` shape, so URL format alone can't tell them apart — DOM
-    verification is the only way to know the link is genuinely shareable.
-    Phase 3's caller treats `public_verified=False` as a soft failure (still
-    returns the URL so the run can continue, but logs prominently)."""
+    Returns a tuple (url, public_verified, access_set).
+
+    `public_verified` is True only when the dialog DOM confirms the access
+    dropdown reads "Anyone with the link" before save. NotebookLM private and
+    public URLs share the same `/notebook/{id}` shape, so URL format alone can't
+    tell them apart — DOM verification is the only way to know the link is
+    genuinely shareable. Phase 3's caller treats `public_verified=False` as a
+    soft failure (still returns the URL so the run can continue, but logs
+    prominently).
+
+    `access_set` (2026-07-31) is the POSITIVE signal that this helper actually
+    clicked an "Anyone with the link" option. It exists because
+    `public_verified` cannot carry that weight: it is a deliberately strict
+    own-text read and it has been False on every run in the corpus, so gating
+    anything on it means gating on a constant. `access_set`, by contrast, is
+    True on a healthy run and False exactly when the access control or its
+    option list has moved — which is the case where a vision escalation is
+    worth its cost, and the case that otherwise shipped a PRIVATE link with no
+    signal anywhere."""
     url = ""
     public_verified = False
+    access_set = False
     try:
         # Step 1: Find "Notebook access" section and change to public
         # NLM share dialog shows "Notebook access" with a dropdown (not "Restricted")
@@ -12958,7 +13049,7 @@ async def _set_nlm_public_and_get_link(page, label):
         if changed == 'opened':
             await asyncio.sleep(1)
             # Select "Anyone with the link" from dropdown/options
-            await page.evaluate("""() => {
+            _picked = await page.evaluate("""() => {
                 const options = document.querySelectorAll(
                     '[role="option"], [role="menuitem"], [role="menuitemradio"], li, label'
                 );
@@ -12972,15 +13063,38 @@ async def _set_nlm_public_and_get_link(page, label):
                 return '';
             }""")
             await asyncio.sleep(1)
-            log(f"[{label}] Set Notebook access to 'Anyone with the link'")
+            # 2026-07-31: report the option pick, not just the dropdown open. The
+            # old log claimed "Set Notebook access to 'Anyone with the link'"
+            # unconditionally once the dropdown opened, whether or not the option
+            # was ever found — so a restructured option list read in the log as a
+            # success. Distinguishing them matters because the two failures need
+            # different fixes and only one of them risks shipping a PRIVATE link.
+            if _picked == "selected":
+                access_set = True
+                log(f"[{label}] Set Notebook access to 'Anyone with the link'")
+            else:
+                log(f"[{label}] access dropdown opened but no 'Anyone with the "
+                    f"link' option was found — the link may stay private", "WARN")
+        else:
+            # Silent before this: if the access control itself couldn't be found
+            # the helper went straight to reading the link, so the log showed a
+            # link with no hint that access had never been touched.
+            log(f"[{label}] could not find the 'Notebook access' control — "
+                f"access was NOT changed; the link may be private", "WARN")
 
-        # Step 2: Get the shareable link
-        link = await page.evaluate("""() => {
-            // Check input fields for the URL
-            const inputs = document.querySelectorAll('input[readonly], input[value*="notebooklm"]');
+        # Step 2: Get the shareable link.
+        # 2026-07-30: the selector used to be `input[value*="notebooklm"]`, i.e.
+        # it hardcoded the hostname into the SELECTOR as well as the guard — so
+        # when Google renamed the host it could not even find the field to read.
+        # Both now go through _JS_IS_NLM_URL: look at any readonly/text input,
+        # and accept whatever host Google is serving notebooks from today.
+        link = await page.evaluate("""(isNb) => {
+            const inputs = document.querySelectorAll(
+                'input[readonly], input[type="text"], input[type="url"], textarea'
+            );
             for (const inp of inputs) {
                 const val = inp.value || '';
-                if (val.includes('notebooklm.google.com')) return val;
+                if (isNb(val)) return val;
             }
             // Try clicking "Copy link" button
             const btns = document.querySelectorAll('button');
@@ -12992,14 +13106,17 @@ async def _set_nlm_public_and_get_link(page, label):
                 }
             }
             return '';
-        }""")
+        }""", _JS_IS_NLM_URL)
         if link == 'clipboard':
             await asyncio.sleep(0.5)
             clip = get_clipboard()
-            if clip and "notebooklm.google.com" in clip:
-                url = clip
-        elif link and "notebooklm.google.com" in link:
-            url = link
+            if is_notebooklm_url(clip or ""):
+                url = (clip or "").strip()
+            elif clip:
+                log(f"[{label}] 'Copy link' clicked but the clipboard held no notebook "
+                    f"URL ({(clip or '')[:60]!r})", "WARN")
+        elif is_notebooklm_url(link or ""):
+            url = (link or "").strip()
 
         # Step 3a: DOM-verify the access dropdown reads "Anyone with the
         # link" BEFORE we save. We require a STRICT signal — either:
@@ -13066,9 +13183,57 @@ async def _set_nlm_public_and_get_link(page, label):
             log(f"[{label}] Public share DOM-verified — link is shareable")
         else:
             log(f"[{label}] Public share NOT DOM-verified — returned link may be private", "WARN")
+        # Phoenix PX-0 shadow observation for the P3 share dialog (2026-07-31).
+        # Selector rot here was invisible for the entire life of the corpus:
+        # `Public share DOM-verified` never once logged, and the tab-URL fallback
+        # covered for it on 100% of runs until a platform change made it fatal.
+        # These two observations put the dialog's own controls under the same
+        # watch the P2 setup intents get. Read-only, flag-gated (default OFF),
+        # and each predicate is the SAME value the live code just computed — no
+        # second source of truth.
+        if selfheal and selfheal.is_enabled():
+            await _selfheal_shadow_observe(page, "notebooklm.set_public_access",
+                                           outcome_pass=bool(public_verified))
+            await _selfheal_shadow_observe(page, "notebooklm.copy_share_link",
+                                           outcome_pass=is_notebooklm_url(url))
     except Exception as e:
         log(f"[{label}] NLM public share flow: {e}", "WARN")
-    return url, public_verified
+    return url, public_verified, access_set
+
+
+async def _dismiss_stale_overlay(page, label: str = "NotebookLM") -> None:
+    """Clear a leftover Angular-Material CDK backdrop before clicking.
+
+    2026-07-31: three consecutive share attempts each burned the FULL 30 s
+    Playwright click timeout with the call log reading
+    `<div class="cdk-overlay-backdrop …"> … intercepts pointer events` while the
+    Share button itself was "visible, enabled and stable". A dead overlay from a
+    previous dialog was sitting on top of a perfectly clickable button, and
+    every retry re-hit it — 90 s per link-extract cycle, on top of the CUA
+    mission. Escape first (the supported dismissal), then verify; only if the
+    backdrop survives do we remove it, which is a last resort but strictly
+    better than a guaranteed timeout.
+    """
+    _SEL = ".cdk-overlay-backdrop-showing, .cdk-overlay-dark-backdrop"
+    try:
+        if not await page.query_selector(_SEL):
+            return
+        await page.keyboard.press("Escape")
+        await asyncio.sleep(0.4)
+        if not await page.query_selector(_SEL):
+            log(f"[{label}] cleared a stale modal backdrop with Escape", "INFO")
+            return
+        removed = await page.evaluate(
+            """(sel) => {
+                let n = 0;
+                for (const el of document.querySelectorAll(sel)) { el.remove(); n++; }
+                return n;
+            }""", _SEL)
+        if removed:
+            log(f"[{label}] removed {removed} stale modal backdrop(s) that were "
+                f"swallowing clicks", "WARN")
+    except Exception as _oe:
+        log(f"[{label}] stale-overlay dismissal skipped: {_oe}", "DEBUG")
 
 
 async def extract_notebooklm_url(browser, cua_client=None, verbose=False, **_):
@@ -13079,74 +13244,167 @@ async def extract_notebooklm_url(browser, cua_client=None, verbose=False, **_):
     public-share (Anyone with the link). Without DOM verification, the URL
     could be a private notebook link, which would 404 or "Request access"
     for anyone but the owner downstream in Phase 5's email/Doc.
+
+    2026-07-31 — TWO STRUCTURAL FIXES here, both from the 7-failure post-mortem:
+      1. The DOM attempt and the CUA fallback used to share ONE try/except, so
+         when `share_btn.click()` raised (the CDK-backdrop timeout above) the
+         `except` swallowed it and the CUA fallback INSIDE the try never ran at
+         all — the attempt degraded straight to the tab URL. They are now
+         separate: a DOM failure is exactly what the fallback exists for.
+      2. The CUA is no longer asked to read the URL back. It has no instrument
+         to do that (no address bar in the app, no scratch text field), and the
+         live capture shows it clicking `Copy link` successfully at iteration 2
+         and then burning all eight remaining iterations hunting for somewhere
+         to paste — while the correct link sat on the clipboard, which WE can
+         read. The mission now ends at the copy and we read the clipboard.
     """
     page = browser.page
     url = await browser.current_url() or ""
     public_verified = False
+    # False until the DOM helper actually clicks an "Anyone with the link"
+    # option. Starting False means a share flow that never ran at all escalates
+    # to vision rather than silently shipping a private notebook.
+    access_set = False
+    _dom_err = ""
     try:
         # Click Share button to open dialog
+        await _dismiss_stale_overlay(page)
         share_btn = await page.query_selector(
             'button[aria-label*="Share"], button[aria-label*="share"], '
             '[class*="share"] button'
         )
+        _dialog_seen = False
         if share_btn:
-            await share_btn.click()
+            # Bounded: the default 30 s left three attempts × 30 s of dead wait
+            # in the failure corpus. If the click can't land in 8 s the DOM path
+            # is not going to work on this render and the CUA fallback is the
+            # cheaper answer.
+            await share_btn.click(timeout=8000)
             await asyncio.sleep(2)
-            link, dom_verified = await _set_nlm_public_and_get_link(page, "NotebookLM")
+            _dialog_seen = bool(await page.query_selector(
+                '[role="dialog"], [role="alertdialog"], mat-dialog-container'))
+            link, dom_verified, dom_access_set = await _set_nlm_public_and_get_link(
+                page, "NotebookLM")
             if link:
                 url = link
             public_verified = bool(dom_verified)
+            access_set = bool(dom_access_set)
             # Close dialog
             await page.keyboard.press("Escape")
             await asyncio.sleep(0.5)
-        # CUA fallback if DOM didn't work
-        if not url or "notebooklm.google.com/notebook" not in url:
-            if cua_client:
-                _nlm_share_mission = (
-                    "Click the Share button. In the share dialog, change 'Notebook access' to "
-                    "'Anyone with the link'. Then click 'Copy link' to get the URL. Click Save. "
-                    "Tell me the EXACT URL.")
-
-                async def _nlm_share_cua():
-                    return await agent_loop(cua_client, browser,
-                        "Share this NotebookLM notebook publicly.",
-                        _nlm_share_mission,
-                        model=CUA_MODEL, max_iterations=10, verbose=verbose)
-
-                # #839 act tier: DOM-primary already ran; this is the fallback.
-                # A Vision success must put the notebook URL in the returned text
-                # (mission's "Tell me the EXACT URL" → declare_success reason) or
-                # on the clipboard — both read below. public_verified stays False
-                # on this path (only the DOM helper can confirm access), same as
-                # the CUA contract.
-                result = await _shadow_observed_cua(
-                    page, hotspot_id="nlm-share", phase=3, platform="notebooklm",
-                    current_step="share_set_public_get_link",
-                    context_hint="the DOM share attempt didn't yield a public link — click "
-                                 "Share, set 'Notebook access' to 'Anyone with the link', Copy "
-                                 "link, Save, and report the notebooklm.google.com/notebook URL",
-                    expected_outcome="a public notebooklm.google.com/notebook share URL",
-                    cua_coro_factory=_nlm_share_cua,
-                    mission_prompt=_nlm_share_mission) or {}
-                m = re.search(r'https://notebooklm\.google\.com/notebook/[^\s]+', (result.get("text") or ""))
-                if m:
-                    url = m.group(0)
-                else:
-                    clip = get_clipboard()
-                    if clip and "notebooklm.google.com" in clip:
-                        url = clip
-                # CUA path doesn't expose the share-state DOM, so we can't
-                # DOM-verify. Treat as unverified — the run still emits the
-                # link, but downstream consumers know it might be private.
+        else:
+            # 2026-07-31 (adversarial review): this branch did not exist. A
+            # rotated Share selector produced NO log line, no error, and no
+            # escalation — the quietest possible failure, on the one control the
+            # whole share flow depends on. The notebook was then never made
+            # public and the run still shipped its link, because `url` is seeded
+            # from the tab URL which is itself shape-valid. Treat it as a DOM
+            # failure so the vision fallback (whose mission IS "click Share, set
+            # access, copy link") gets its turn.
+            _dom_err = "share button not found (selector rotated?)"
+            log(f"[NotebookLM] {_dom_err} — trying the vision fallback", "WARN")
+        # Selfheal observation moved OUT of `if share_btn:` — inside it, the
+        # watcher added to catch Share-button rot could never observe the rot,
+        # because a missing button skipped the observation entirely.
+        if selfheal and selfheal.is_enabled():
+            await _selfheal_shadow_observe(
+                page, "notebooklm.open_share_dialog", outcome_pass=_dialog_seen)
     except Exception as e:
-        log(f"[NotebookLM] Share dialog failed: {e}", "WARN")
+        _dom_err = f"{type(e).__name__}: {e}"
+        log(f"[NotebookLM] DOM share attempt failed ({_dom_err}) — trying the "
+            f"vision fallback", "WARN")
+    # CUA fallback if DOM didn't work. Deliberately OUTSIDE the try above.
+    #
+    # TWO triggers — "we have no notebook URL" and "we did not set access".
+    #
+    # The first alone is NOT enough, which is the subtle part: `url` is seeded
+    # from the tab URL, and on a notebook page the tab URL IS a notebook URL. So
+    # once the host check stopped being a hostname literal, a URL-shape-only gate
+    # would mean this fallback could never fire again. It fired at all in the
+    # failure corpus only because the renamed host failed the literal — by
+    # accident. `not access_set` is what makes it fire for a real reason: the
+    # dialog was never reached, or was reached and no "Anyone with the link"
+    # option could be clicked. Without it a restructured access control ships a
+    # PRIVATE link and the recipient of the Phase-5 email gets "Request access"
+    # instead of a notebook, silently.
+    #
+    # `access_set` and NOT `public_verified`: the latter is a deliberately strict
+    # own-text read that has been False on every run in the corpus, so escalating
+    # on it would escalate on every single run forever. `access_set` is True on a
+    # healthy run, so this stays bounded — a vision mission costs only when the
+    # share dialog has actually changed.
+    #
+    # `_dom_err` deliberately does NOT appear here. Every path that sets it —
+    # Share button missing, click timeout, a raise before the helper returns —
+    # also leaves `access_set` False, so it would be redundant; and its ONE
+    # unique case (the trailing Escape throwing after the helper already
+    # succeeded) is a case where escalating would burn a vision mission for
+    # nothing. It is still carried into `error` for diagnostics.
+    if cua_client and (not is_notebooklm_url(url) or not access_set):
+        try:
+            _nlm_share_mission = (
+                "Click the Share button. In the share dialog, change 'Notebook access' to "
+                "'Anyone with the link'. Then click 'Copy link'. Click Save if a Save or "
+                "Done button is present. That is the whole task — you do NOT need to read "
+                "the URL back and you must NOT try to paste it anywhere: I read the "
+                "clipboard myself. Once 'Copy link' has been clicked, report done. If the "
+                "full URL happens to be visible on screen, include it in your answer.")
+
+            async def _nlm_share_cua():
+                return await agent_loop(cua_client, browser,
+                    "Share this NotebookLM notebook publicly.",
+                    _nlm_share_mission,
+                    model=CUA_MODEL, max_iterations=10, verbose=verbose)
+
+            # #839 act tier: DOM-primary already ran; this is the fallback.
+            # A Vision success puts the notebook URL on the CLIPBOARD (primary,
+            # read below) and possibly also in the returned text (bonus).
+            # public_verified stays False on this path (only the DOM helper can
+            # confirm access), same as the CUA contract.
+            result = await _shadow_observed_cua(
+                page, hotspot_id="nlm-share", phase=3, platform="notebooklm",
+                current_step="share_set_public_get_link",
+                context_hint="the DOM share attempt didn't yield a public link — click "
+                             "Share, set 'Notebook access' to 'Anyone with the link', then "
+                             "Copy link and Save. Do not try to read the URL back.",
+                expected_outcome="'Copy link' has been clicked with access set to "
+                                 "'Anyone with the link'",
+                cua_coro_factory=_nlm_share_cua,
+                mission_prompt=_nlm_share_mission) or {}
+            # Clipboard FIRST — it is the channel the mission actually populates.
+            clip = get_clipboard()
+            if is_notebooklm_url(clip or ""):
+                url = (clip or "").strip()
+                log(f"[NotebookLM] share link read from the clipboard: {url}")
+            else:
+                # Bonus channel: the URL may be quoted in the vision answer.
+                for _cand in re.findall(r'https?://[^\s<>"\')]+', (result.get("text") or "")):
+                    if is_notebooklm_url(_cand):
+                        url = _cand
+                        log(f"[NotebookLM] share link read from the vision answer: {url}")
+                        break
+        except Exception as e:
+            log(f"[NotebookLM] vision share fallback failed: {type(e).__name__}: {e}", "WARN")
     # Fallback to current tab URL
-    if not url or "notebooklm.google.com/notebook" not in url:
+    if not is_notebooklm_url(url):
         url = await browser.current_url() or ""
     # verified = NotebookLM URL shape + DOM-confirmed public access. URL
     # alone is not sufficient since private/public share the same shape.
-    verified = ("notebooklm.google.com/notebook" in url) and public_verified
-    return LinkResult(url=url, label="NotebookLM Notebook", platform="notebooklm", verified=verified)
+    _shape_ok = is_notebooklm_url(url)
+    verified = _shape_ok and public_verified
+    # 2026-07-31: populate `error` on the miss path. It was ALWAYS empty, which
+    # is why the caller's warning rendered as "falling back to tab URL: " with
+    # nothing after the colon on 35/35 occurrences in the corpus — the one log
+    # line that should have named this bug named nothing.
+    _err = ""
+    if not _shape_ok:
+        _err = (f"no notebook URL on any read channel "
+                f"(share DOM, clipboard, vision); tab URL was "
+                f"{url[:100] or '<blank>'}")
+        if _dom_err:
+            _err += f"; DOM share attempt: {_dom_err}"
+    return LinkResult(url=url, label="NotebookLM Notebook", platform="notebooklm",
+                      verified=verified, error=_err)
 
 
 
@@ -13164,11 +13422,30 @@ async def extract_with_retry(
 ) -> "LinkResult":
     """Run a link extractor up to `max_retries` times, validating each URL.
     Emits link_extracting / link_extract_retry / link_extracted / link_extraction_failed.
-    Returns LinkResult with verified=True on success; otherwise verified=False + error."""
+    Returns LinkResult with verified=True on success; otherwise verified=False + error.
+
+    2026-07-31 — every event here now carries `description`, and each attempt
+    also emits `agent_progress`. Reason: link extraction is a MULTI-MINUTE step
+    (a P3 share cycle is ~33 s of real work, ×3 attempts, plus a 10-iteration
+    vision mission), and it emitted nothing the phase tile reads. The FE's last
+    known state was whatever the phase had said before it started, so a failing
+    Phase 3 sat on "Setting notebook to 'Anyone with the link'…" for four
+    minutes and then went quiet — the reported "stuck at copy notebook, never
+    goes to the podcast" symptom. `link_extracting`/`link_extract_retry` DID
+    reach the FE but with no `description`, so the step row rendered the raw
+    event NAME. Both halves are fixed here: readable copy, and a status the
+    phase tile actually surfaces.
+    """
     last_err = ""
+    _label_h = _agent_display_name(agent) if agent else "the agent"
     for attempt in range(1, max_retries + 1):
+        _desc = (f"Reading {_label_h}'s share link…" if attempt == 1
+                 else f"Reading {_label_h}'s share link — attempt {attempt} of {max_retries}…")
         emit_event("link_extracting", phase=phase, agent=agent,
-                   attempt=attempt, maxAttempts=max_retries)
+                   attempt=attempt, maxAttempts=max_retries,
+                   description=_desc)
+        emit_event("agent_progress", phase=phase, agent=agent,
+                   status="extracting", stage="link", progress=_desc)
         log(f"[{agent}] Link extract attempt {attempt}/{max_retries}")
         try:
             result = await extractor_fn(browser, cua_client=cua_client, **kwargs)
@@ -13191,7 +13468,9 @@ async def extract_with_retry(
         log(f"[{agent}] Attempt {attempt}/{max_retries} failed: {last_err}", "WARN")
         if attempt < max_retries:
             emit_event("link_extract_retry", phase=phase, agent=agent,
-                       attempt=attempt, maxAttempts=max_retries, error=last_err)
+                       attempt=attempt, maxAttempts=max_retries, error=last_err,
+                       description=(f"Couldn't read {_label_h}'s share link "
+                                    f"({attempt}/{max_retries}) — retrying…"))
             await asyncio.sleep(retry_delay)
     # All retries exhausted. Include a human-readable description so the
     # frontend step list shows something meaningful ("Couldn't extract link
@@ -13199,6 +13478,16 @@ async def extract_with_retry(
     # alert panel has content to render if a caller routes this as a
     # terminal failure rather than proceeding to wait_for_agent_decision.
     log(f"[link_extract] {agent}: failed after {max_retries} attempts ({last_err})", "WARN")
+    # 2026-07-31: actually emit the terminal event the docstring has always
+    # promised. Without it the FE's step list simply stopped mid-extraction and
+    # the tile kept its pre-extraction copy — the run looked frozen rather than
+    # failed. This is informational only (no `actions`), so it is NOT an alert
+    # and cannot double up with the caller's fail_phase card; the caller still
+    # owns the user-facing Retry/Skip decision.
+    emit_event("link_extraction_failed", phase=phase, agent=agent,
+               attempt=max_retries, maxAttempts=max_retries, error=last_err,
+               description=(f"Couldn't read {_label_h}'s share link after "
+                            f"{max_retries} attempts."))
     return LinkResult(url="", label=kwargs.get("label", ""),
                       platform=agent, verified=False, error=last_err)
 
@@ -13713,7 +14002,15 @@ def emit_event(event_type, phase=None, agent=None, **data):
             # to pass reason — without it, persistence would silently
             # drop and we'd regress to the pre-F2 bug.
             if data.get("reason"):
-                _write_agent_terminal_status(agent, "skipped")
+                # 2026-07-31: forward reason + detail so the durable record can
+                # explain the skip after a reload, not just record that one
+                # happened. `detail` is present on auto-skips (the finalizer's
+                # sentence); a plain user Skip has none and the FE derives copy
+                # from the reason slug, so an absent detail is normal.
+                _write_agent_terminal_status(
+                    agent, "skipped",
+                    reason=str(data.get("reason") or ""),
+                    detail=str(data.get("detail") or ""))
     except Exception:
         # Status persistence is best-effort — never let it break event
         # emission (which is the critical path for FE state updates).
@@ -14086,8 +14383,15 @@ _HOTSPOT_VISION_HINTS = {
             "dropdown — set it to 'Anyone with the link', then 'Copy link' and Save. Click the "
             "Share button / the access dropdown / Copy link — not the source list or the Studio cards."
         ),
+        # 2026-07-31: the third signal used to read "…+ a notebooklm.google.com
+        # URL", so the moment Google renamed the host the vision fallback could
+        # not self-report success either — every gate in this path, including
+        # this one, was pinned to a hostname literal. The signal is now the
+        # observable ACTION (the copy landed), which is also all we need: we
+        # read the clipboard ourselves.
         "success_signals": ["a Share dialog with a 'Notebook access' dropdown",
-                            "an 'Anyone with the link' option", "a Copy link button + a notebooklm.google.com URL"],
+                            "an 'Anyone with the link' option",
+                            "a Copy link button that has been clicked (a 'Link copied' confirmation)"],
     },
     # P2 extraction-ladder hotspots (#839 act-tier re-wrap of the #777-dropped
     # trio + the publish fallback). Hints agree with PROMPT_COPY_ARTIFACT_CHATGPT /
@@ -16534,7 +16838,7 @@ _HOST_DENYLIST = frozenset({
     "chatgpt.com", "openai.com", "chat.openai.com", "oaiusercontent.com",
     "claude.ai", "anthropic.com",
     "gemini.google.com", "bard.google.com",
-    "notebooklm.google.com",
+    "notebooklm.google.com", "notebook.google.com",
 })
 
 
@@ -21390,7 +21694,7 @@ class Browser:
         "docs.google.com", "drive.google.com",
         "accounts.google.com", "myaccount.google.com",
         "mail.google.com",
-        "notebooklm.google.com",
+        "notebooklm.google.com", "notebook.google.com",
         "studio.youtube.com", "youtube.com",
         "google.com",
     })
@@ -25768,15 +26072,21 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             )
             if not _needs_finalize:
                 continue
-            log(f"[{_fin_name}] Auto-skip finalize — startup failed and its "
+            # 2026-07-31: pick the HONEST reason instead of calling everything a
+            # startup failure. The reason string reaches the FE verbatim, so a
+            # wrong one here is a wrong story in the phase dropdown AND in the
+            # durable record. See autoskip_reason_for_status for the rationale.
+            _fin_reason, _fin_copy, _fin_why = autoskip_reason_for_status(_fin_st)
+            log(f"[{_fin_name}] Auto-skip finalize — {_fin_why} and its "
                 "Retry/Skip alert went unanswered; greying the tile + closing "
-                "the tab so it matches a normal skip (bug 2.5).", "WARN")
+                f"the tab so it matches a normal skip (bug 2.5). "
+                f"[status={_fin_st or '?'} persisted={_fin_persisted or '?'}]", "WARN")
             # #955: one finalize shape for every auto-skip (agent_skipped greys
             # the tile + clears the card and durable mirror; notice explains WHY).
             await _finalize_agent_autoskip(
                 browser, _fin_agent.get("page"), _fin_key, _fin_name,
-                reason="auto_skip_setup_failed",
-                copy_key="setup_failed",
+                reason=_fin_reason,
+                copy_key=_fin_copy,
                 url=_fin_r.get("url", "") or _fin_agent.get("url", ""),
                 elapsed_sec=int(_fin_r.get("elapsed_sec", 0) or 0),
                 results=results, results_name=_fin_name)
@@ -34470,6 +34780,42 @@ async def _close_skipped_agent_tab(browser, page, platform_key: str, label: str,
         log(f"[{label}] Skip: couldn't close the {platform_key} tab: {_ce}", "WARN")
 
 
+def autoskip_reason_for_status(results_status: str) -> tuple:
+    """Classify an unresolved agent's result status into
+    ``(reason, copy_key, why)`` for the exit-sweep auto-skip finalize.
+
+    2026-07-31. Every unresolved finalize used to report `auto_skip_setup_failed`
+    / "startup failed", whatever had actually happened. The observed cost: a
+    Claude leg that was verified running at roll-call, ran a live Deep Research
+    for 41 minutes, and then failed on claude.ai's side was reported to the user
+    as "couldn't start". That is not just untidy copy — it points the user at
+    their own login and setup when nothing there was wrong, and (because the
+    reason slug is what reaches the FE) it is why the phase dropdown could only
+    ever render the bare word "skipped" for that run.
+
+    Three real outcomes:
+      * never started      — `failed_setup` / `not_verified` (also the default
+                             for an unrecognised status, since "we don't know"
+                             is closer to a setup problem than to a claim that
+                             the research ran).
+      * failed mid-run     — `agent_error`: the agent WAS verified running and
+                             its research then failed platform-side.
+      * retried, no output — the hard-retry statuses.
+
+    Pure and module-level on purpose: the caller is a closure inside
+    ``poll_all_agents_round_robin``, which a test cannot drive, so the decision
+    lives somewhere a test can call it directly.
+    """
+    st = (results_status or "").lower()
+    if st == "agent_error":
+        return ("auto_skip_agent_error", "mid_run_failed",
+                "its research failed on the platform's side partway through")
+    if st in ("hard_retry_failed", "hard_retry_exhausted_dead_tab"):
+        return ("auto_skip_hard_retry_exhausted", "hard_retry_exhausted",
+                "was retried and still produced no report")
+    return ("auto_skip_setup_failed", "setup_failed", "couldn't start")
+
+
 def _autoskip_details(copy_key: str, name: str, why: str = "") -> str:
     """#955: single source for the auto-skip informational notice. One entry
     per finalize site, byte-identical to the pre-refactor inline copies —
@@ -34482,6 +34828,20 @@ def _autoskip_details(copy_key: str, name: str, why: str = "") -> str:
         return (f"{name} couldn't start (a platform-side setup or "
                 f"delivery problem) and its Retry/Skip alert wasn't "
                 f"answered {_tail}")
+    # 2026-07-31: `setup_failed` used to be the copy for EVERY unresolved
+    # finalize, including agents that started cleanly, were verified running at
+    # roll-call, and then died on the platform's side mid-research. One observed
+    # run had Claude verified running, research live for 41 minutes, and the card
+    # still told the user "couldn't start". That is not a nicety: it points the
+    # user at their login/setup when the actual cause was claude.ai failing
+    # server-side, and it is the reason the phase dropdown could only ever say
+    # the bare word "skipped".
+    if copy_key == "mid_run_failed":
+        return (f"{name} started fine but its research failed on the platform's "
+                f"side partway through, and its Retry/Skip alert wasn't "
+                f"answered {_tail}")
+    if copy_key == "hard_retry_exhausted":
+        return (f"{name} was retried and still couldn't produce a report {_tail}")
     if copy_key == "hard_cap_parked":
         return (f"{name} sat on an unanswered alert past the time "
                 f"limit {_tail}")
@@ -34519,11 +34879,20 @@ async def _finalize_agent_autoskip(browser, page, key: str, name: str, *,
             "status": "auto_skipped", "text": partial,
             "url": url, "page": None, "elapsed_sec": int(elapsed_sec),
         }
+    _detail = _autoskip_details(copy_key, name, why)
+    # 2026-07-31: carry the human-readable WHY on `agent_skipped` itself, not
+    # only on the companion notice. The notice is a dismissible banner; the
+    # phase dropdown reads the agent's own detail row, and it had nothing to
+    # read, so every auto-skip rendered as the bare word "Skipped" no matter how
+    # much the backend actually knew. Sending the sentence means the dropdown
+    # stays honest for reasons the FE has never heard of — a new auto-skip path
+    # explains itself without an FE release, which is the same reason the
+    # NotebookLM host became a shape test.
     emit_event("agent_skipped", phase=phase, agent=key,
-               reason=reason, partial_chars=len(partial))
+               reason=reason, partial_chars=len(partial), detail=_detail)
     emit_event("pipeline_warning", phase=phase, agent=key,
                error=f"{name} skipped automatically",
-               details=_autoskip_details(copy_key, name, why),
+               details=_detail,
                actions=[], alert_id=f"agent_{key}_autoskip",
                auto_clear_on_resume=True)
     try:
@@ -38989,15 +39358,31 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
             try:
                 log("NotebookLM: opening share dialog to set 'Anyone with link'...")
                 nlm_share_res = await extract_notebooklm_url(browser, cua_client=cua_client, verbose=verbose)
-                if nlm_share_res.verified and nlm_share_res.url:
+                # 2026-07-31: this used to require `verified`, i.e. URL shape AND
+                # a DOM-confirmed "Anyone with the link". `Public share
+                # DOM-verified` has NEVER once appeared in the corpus, so the
+                # extracted share URL was discarded on 100% of runs and the tab
+                # URL was a silent crutch on every "successful" Phase 3. When the
+                # share affordance changed, the crutch was all that was left —
+                # which is how a hostname rename became a total outage.
+                # The recovery loop in run_pipeline already accepts shape-only
+                # (with a WARN); this is the same rule, so the primary path is no
+                # longer STRICTER than its own fallback. `public_verified` stays
+                # a separate, honest signal — logged, not gating.
+                if is_notebooklm_url(nlm_share_res.url):
                     notebook_url = nlm_share_res.url
-                    log(f"NotebookLM public share OK: {notebook_url}")
+                    if nlm_share_res.verified:
+                        log(f"NotebookLM public share OK (DOM-verified): {notebook_url}")
+                    else:
+                        log(f"NotebookLM share link OK but public access NOT DOM-verified "
+                            f"— the link may be private: {notebook_url}", "WARN")
                     # Track-B success-path observe (P3 notebook public share).
                     _observe_dom_success(browser.page, hotspot_id="p3-share", phase=3,
                                          platform="notebooklm", current_step="open_share_set_public_get_link",
                                          dom_ground_truth=_gt_from_box(None, url=notebook_url))
                 else:
-                    log(f"NotebookLM public share uncertain — falling back to tab URL: {nlm_share_res.error}", "WARN")
+                    log(f"NotebookLM public share uncertain — falling back to tab URL "
+                        f"'{notebook_url}': {nlm_share_res.error or 'no reason reported'}", "WARN")
                     # Track-B: observe on the FALLBACK path too. The share FLOW ran
                     # (dialog opened) even when the public link wasn't verified, so
                     # Vision's read is just as valid a sample. Gating the observe on
@@ -39010,7 +39395,7 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
                 log(f"NotebookLM public share flow error: {e} — falling back to tab URL", "WARN")
             log(f"NotebookLM: {notebook_url}")
             # Emit notebook link immediately — frontend shows it without waiting for phase end
-            if notebook_url and "notebooklm.google.com/notebook" in notebook_url:
+            if is_notebooklm_url(notebook_url):
                 emit_validated_link(3, "notebooklm", notebook_url, "NotebookLM Notebook")
             break  # Successful upload — exit retry loop
         except Exception as e:
@@ -39885,14 +40270,22 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                 await asyncio.sleep(2)
 
             # Step 3: Use shared helper for NLM public access + get link + Save.
-            # Helper returns (url, public_verified). Audio share doesn't have
-            # a separate downstream consumer that gates on public_verified —
-            # we still log it for diagnostic purposes and proceed.
-            audio_overview_url, audio_public_verified = await _set_nlm_public_and_get_link(page, "Audio")
+            # Helper returns (url, public_verified, access_set). Audio share
+            # doesn't have a separate downstream consumer that gates on
+            # public_verified — we still log both signals for diagnostics and
+            # proceed. `access_set` is the one that distinguishes "we set access
+            # but couldn't confirm it" from "we never found the control", which
+            # matters here too: the audio link goes into the Doc and the email.
+            (audio_overview_url, audio_public_verified,
+             audio_access_set) = await _set_nlm_public_and_get_link(page, "Audio")
             if audio_public_verified:
                 log("[Audio] Public share DOM-verified")
+            elif audio_access_set:
+                log("[Audio] access set to 'Anyone with the link' but not "
+                    "DOM-confirmed — audio link may be private", "WARN")
             else:
-                log("[Audio] Public share NOT DOM-verified — audio link may be private", "WARN")
+                log("[Audio] access was NOT set (control or option not found) — "
+                    "audio link is likely private", "WARN")
 
             if not audio_overview_url:
                 # Fallback: NLM emits the same /notebook/{id} URL whether
@@ -39902,7 +40295,7 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                 # renders the audio row as a Play button + Open-in-NLM link).
                 try:
                     current_url = await browser.current_url()
-                    if "notebooklm.google.com/notebook" in current_url:
+                    if is_notebooklm_url(current_url):
                         audio_overview_url = current_url
                 except Exception:
                     pass
@@ -43747,7 +44140,6 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # having to click "Skip P3" on a misleading "Phase 2 produced no
         # documents" alert.
         _p3_already_skipped = (3 in skip_phases)
-        _p3gate_skipped = False
         _p3gate_attempt = 0
         while not has_results and not _p3_already_skipped:
             _p3gate_attempt += 1
@@ -43823,9 +44215,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # await_phase_decision(3) already consumed the skip flag, so
                 # re-add it to the set. The Phase 3 entry block below reads
                 # consume_phase_skip(3) and will short-circuit past the upload
-                # step when the flag is present.
+                # step when the flag is present — that set IS the mechanism.
+                # (A `_p3gate_skipped = True` local used to be set here as well
+                # and was never read by anything; removed 2026-07-31 rather than
+                # left to imply a second, non-existent channel.)
                 _controls.skipped_phases.add(3)
-                _p3gate_skipped = True
                 break
             # stop / timeout → end the run
             log(f"Phase 3 gate: user {gate_decision} — terminating pipeline", "INFO")
@@ -43976,6 +44370,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                                      "url": "", "page": None}
             # Sub-step 3a: Upload to NotebookLM
             _p3a_user_skipped = False
+            # Set when the user picks Skip on the link-extract failure card. Kept
+            # separate from `_p3_audio_user_skipped` (which is re-initialised
+            # after the link-extract block) and read by the terminal gate so the
+            # phase reports a SKIP rather than a green "notebook created".
+            _p3_link_user_skipped = False
             # 2026-05-07 (Bug A1): narrow-retry budget for the upload step.
             # When run_phase3_upload silently completes with a bogus URL
             # (e.g. CUA returned 'blocked: Google Sign-in' because the user
@@ -44052,7 +44451,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     # If the link turns out to be private, downstream Doc/email
                     # consumers will surface the auth error to the recipient,
                     # which is the only context where it actually matters.
-                    if nb_res.verified or (nb_res.url and "notebooklm.google.com/notebook" in nb_res.url):
+                    if nb_res.verified or is_notebooklm_url(nb_res.url):
                         notebook_url = nb_res.url
                         if not nb_res.verified:
                             log("[NotebookLM] URL-shape OK but public-share NOT DOM-verified — "
@@ -44097,7 +44496,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         # browser.new_tab(...) on every entry, so no manual
                         # cleanup is needed between attempts.
                         _url_looks_like_notebook = bool(
-                            notebook_url and "notebooklm.google.com" in notebook_url
+                            is_notebooklm_url(notebook_url)
                         )
                         if (not _url_looks_like_notebook
                                 and _p3_upload_attempt < _P3_UPLOAD_MAX_REATTEMPTS):
@@ -44126,8 +44525,32 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         emit_event("phase_restart", phase=3, reason="user_retry_link_extract", attempt=0)
                         continue
                     if decision == "skip":
+                        # 2026-07-31 (owner-reported): this branch used to just
+                        # blank the URL and break. That made it the ONLY skip
+                        # branch in the whole pipeline that emitted no terminal
+                        # event and set no skip flag — all thirteen others emit
+                        # phase_skipped. The consequences, in order:
+                        #   * with notebook_url empty the audio block is skipped
+                        #     entirely, so `_p3_audio_user_skipped` stayed False,
+                        #   * the no-audio auto-retry loop is `while notebook_url`
+                        #     so it never ran either,
+                        #   * and the terminal gate therefore saw BOTH flags
+                        #     False and emitted phase_complete:3 with the summary
+                        #     "NotebookLM notebook created".
+                        # So a user who hit Skip on a NotebookLM link failure got
+                        # a GREEN, completed Phase 3 claiming a notebook that was
+                        # never obtained, instead of the greyed-out skip they
+                        # asked for. P4 also wasn't cascaded off, so FE-P4 was
+                        # triggered for a podcast that does not exist.
                         log("Phase 3 link extraction: user skipped — proceeding without notebook URL", "INFO")
                         notebook_url = ""
+                        emit_event("phase_skipped", phase=3,
+                                   reason="user_skip_at_link_extract")
+                        # NB: a dedicated flag, NOT `_p3_audio_user_skipped` —
+                        # that one is re-initialised to False a few lines below
+                        # this loop, which would silently undo the fix.
+                        _p3_link_user_skipped = True
+                        _controls.skipped_phases.add(4)
                         break
                     log(f"Phase 3 link extraction: user {decision} — terminating pipeline", "INFO")
                     emit_event("pipeline_stopped", phase=3, reason=f"user_{decision}_link_extract")
@@ -44373,7 +44796,26 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # #899: a login-pause skip (or a stop) must not read as a green
             # "NotebookLM notebook created" — those paths already emitted
             # their own terminal event (phase_skipped:3 / pipeline_stopped).
+            # 2026-07-31: TWO flags joined them, and they are different bugs.
+            #
+            # `_p3_link_user_skipped` was the owner-reported one — a Skip on the
+            # link-extract failure card emitted no terminal event at all, so it
+            # fell through to here and produced a green phase_complete claiming a
+            # notebook that was never obtained ("instead of greyed out skip, it
+            # got the completed status").
+            #
+            # `_p3a_user_skipped` is the sibling, found in adversarial review of
+            # that fix. A Skip on the P3 UPLOAD-timeout card does emit
+            # phase_skipped:3 (line ~44346) — so it looked correct — but it was
+            # missing from this gate, so the phase then ALSO emitted
+            # phase_complete:3: a double terminal event that flips the tile from
+            # greyed-skipped back to green and overwrites the durable phase
+            # status skipped→complete. "Emits a terminal event" and "emits
+            # exactly ONE terminal event" are different guarantees, and only the
+            # second one is what the user sees.
             if (not _p3_audio_user_skipped and not _p3_login_skipped
+                    and not _p3_link_user_skipped
+                    and not _p3a_user_skipped
                     and not _controls.is_stop()):
                 emit_event("phase_complete", phase=3, durationSec=int(time.time() - _p3_start), links=_p3_links,
                     summary=f"NotebookLM notebook created{', audio generated' if audio_path else ''}{', audio link extracted' if audio_overview_url else ''}")

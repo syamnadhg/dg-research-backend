@@ -148,13 +148,29 @@ def test_failed_gemini_is_registered_in_agents_for_finalization():
 
 def test_round_robin_finalizes_unresolved_failures_as_clean_skips():
     src = inspect.getsource(research.poll_all_agents_round_robin)
-    block = src[src.index("async def _finalize_unresolved_autoskips"):]
+    # Bounded to the EXIT-SWEEP closure only. The next closure
+    # (_fire_due_autoskips) and the parked hard-cap branch legitimately carry
+    # their own single reasons — they each represent exactly one outcome — so an
+    # unbounded slice would make the no-hardcoded-reason assertion below fail on
+    # code that is correct.
+    _start = src.index("async def _finalize_unresolved_autoskips")
+    block = src[_start:src.index("async def _fire_due_autoskips", _start)]
     # Respects the user's auto-skip setting (OFF → leave the card up).
     assert "if not _runtime.auto_skip_stuck:" in block
     # #955: greys the tile + closes the tab + drops the notice via the ONE
-    # _finalize_agent_autoskip helper, with the honest setup-fail reason.
+    # _finalize_agent_autoskip helper.
     assert "_finalize_agent_autoskip(" in block
-    assert 'reason="auto_skip_setup_failed"' in block
+    # 2026-07-31: the reason is no longer a literal — which reason is honest
+    # depends on how the agent died, and a source-text assertion cannot check a
+    # decision. The classifier is module-level so it can be driven for real;
+    # what this pins is that the sweep routes through it rather than hardcoding
+    # one reason for every outcome again.
+    assert "autoskip_reason_for_status(_fin_st)" in block
+    assert 'reason="auto_skip' not in block, (
+        "the exit sweep must not hardcode a single auto-skip reason — that is "
+        "how a 41-minute mid-run platform failure got reported as 'startup "
+        "failed' with no way for the FE to say anything but 'skipped'"
+    )
     _fin = inspect.getsource(research._finalize_agent_autoskip)
     assert 'emit_event("agent_skipped"' in _fin
     assert "_close_skipped_agent_tab" in _fin

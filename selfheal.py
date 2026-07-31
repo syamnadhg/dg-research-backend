@@ -50,7 +50,13 @@ from typing import Any, Callable, Optional
 logger = logging.getLogger(__name__)
 
 # ── Vocabulary (the contract's closed sets) ──────────────────────────────────
-PLATFORMS = ("chatgpt", "gemini", "claude")
+# 2026-07-31: `notebooklm` joins the set. The subsystem was P2-only, and the P3
+# NotebookLM share dialog is exactly the surface that needed it — Google
+# restructured it and the share-link extractor (which had a 0/44 all-time
+# success rate, silently propped up by a tab-URL fallback) went from quietly
+# broken to visibly fatal, taking audio, P4 and P5 down for 7 consecutive runs.
+# Nothing in the pipeline was watching that dialog's selectors.
+PLATFORMS = ("chatgpt", "gemini", "claude", "notebooklm")
 INTENT_TYPES = ("toggle", "select")
 # Tier ordering (DOM → Vision → CUA, plus the registry fast-path and the
 # heuristic heal). The literal order is the resolve sequence.
@@ -237,6 +243,65 @@ _INTENTS: dict[str, dict[str, Any]] = {
         "signal_hints": {"accessible_name": "model", "role": ["button"], "value_matches": "opus"},
         "tier_sequence": list(KNOWN_TIERS),
     },
+    # ── P3 / NotebookLM share flow (2026-07-31) ──────────────────────────────
+    # The three controls the notebook link depends on. All are `select`, not
+    # `toggle`: none of them has an OFF state that a mis-click could switch off,
+    # so the decide_toggle firewall does not apply and would only block them.
+    #
+    # These are deliberately NOT the fix for the 2026-07-30 outage — that was a
+    # hostname literal, and the fix for it is a URL *shape* test in research.py
+    # that needs no manifest, no flag and no registry. These cover the OTHER
+    # half the post-mortem found: the share dialog's own selectors, which had
+    # never worked and had no watcher, so their rot was invisible until a
+    # platform change made it fatal.
+    "notebooklm.open_share_dialog": {
+        "platform": "notebooklm",
+        "intent_id": "open_share_dialog",
+        "type": "select",
+        "irreversible": False,
+        "region": "document",
+        "outcome_predicate": "nlm_share_dialog:open",
+        "signal_hints": {
+            "accessible_name": "share",
+            "role": ["button"],
+        },
+        "tier_sequence": list(KNOWN_TIERS),
+    },
+    "notebooklm.set_public_access": {
+        "platform": "notebooklm",
+        "intent_id": "set_public_access",
+        "type": "select",
+        "irreversible": False,
+        "region": "dialog",
+        # Authoritative signal is the access trigger's OWN text reading "anyone
+        # with the link" — the same strict own-text read research.py uses,
+        # because a Material dropdown nests its option list inside the trigger
+        # and a descendant-inclusive read matches the un-chosen options too.
+        "outcome_predicate": "nlm_access:anyone_with_link",
+        "signal_hints": {
+            "accessible_name": "notebook access",
+            "role": ["button", "combobox", "listbox", "menuitem", "option"],
+            "value_contains": "anyone with the link",
+        },
+        "tier_sequence": list(KNOWN_TIERS),
+    },
+    "notebooklm.copy_share_link": {
+        "platform": "notebooklm",
+        "intent_id": "copy_share_link",
+        "type": "select",
+        "irreversible": False,
+        "region": "dialog",
+        # The outcome is CLIPBOARD state, not DOM state: NotebookLM shows no
+        # readable link field in the restructured dialog, so "did this work?"
+        # can only be answered by reading the clipboard back and shape-testing
+        # it. That is what research.py's caller does.
+        "outcome_predicate": "nlm_clipboard:notebook_url",
+        "signal_hints": {
+            "accessible_name": "copy link",
+            "role": ["button"],
+        },
+        "tier_sequence": list(KNOWN_TIERS),
+    },
 }
 
 
@@ -322,6 +387,19 @@ REGIONS: dict[str, dict[str, Any]] = {
         "scopeSel": "",
         "scopeClimb": 0,
         "candSel": 'button, [role="button"], a, [role="menuitem"], [role="menuitemradio"], [role="option"]',
+    },
+    # 2026-07-31 — the P3 NotebookLM share dialog. Scoped to the open dialog so a
+    # probe of "the access dropdown" cannot match the notebook page behind it
+    # (the source list and the Studio cards are full of buttons). Includes
+    # `input`/`textarea` in candSel because a share dialog's payload is often a
+    # readonly link FIELD rather than a control — reading that field is half of
+    # what this intent family exists to keep working.
+    "dialog": {
+        "scopeSel": '[role="dialog"], [role="alertdialog"], mat-dialog-container',
+        "scopeClimb": 0,
+        "candSel": ('button, [role="button"], [role="combobox"], [role="listbox"], '
+                    '[role="menuitem"], [role="menuitemradio"], [role="option"], '
+                    'input, textarea'),
     },
 }
 

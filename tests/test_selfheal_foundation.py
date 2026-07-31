@@ -58,12 +58,60 @@ def _run(coro):
 
 
 # ── 1. Intent / outcome contracts ─────────────────────────────────────────────
-def test_six_intents_cover_the_p2_surfaces():
-    it = selfheal.load_intents()
-    assert set(it) == {
+def test_the_p2_setup_surfaces_are_all_covered():
+    """The original PX-0 guarantee: both setup levers on all three research
+    platforms. A SUBSET assertion, not equality — see the next test for why."""
+    assert {
         f"{p}.{i}"
         for p in ("chatgpt", "gemini", "claude")
         for i in ("enable_deep_research", "select_model")
+    } <= set(selfheal.load_intents())
+
+
+def test_the_p3_notebooklm_share_surfaces_are_covered():
+    """2026-07-31. PX-0 was P2-only, and the surface that then broke was P3's.
+
+    Google restructured the NotebookLM share dialog; the DOM link read, the
+    clipboard read and the vision fallback all stopped working, and Phase 3
+    failed 7 consecutive times with no podcast, no P4 and no P5. Nothing had
+    ever observed those selectors — `Public share DOM-verified` logged ZERO
+    times in the entire corpus, because the tab-URL fallback silently covered
+    for the extractor on 100% of runs.
+
+    These three intents are the watch that was missing. They are NOT the fix for
+    that outage (the fix is a URL shape test in research.py, which needs no
+    manifest and no flag) — they cover the dialog's own controls, whose rot was
+    invisible until a platform change made it fatal.
+    """
+    it = selfheal.load_intents()
+    for key in ("notebooklm.open_share_dialog",
+                "notebooklm.set_public_access",
+                "notebooklm.copy_share_link"):
+        assert key in it, f"{key} must be wired — P3's share dialog needs a watcher"
+        assert it[key]["platform"] == "notebooklm"
+        # `select`, never `toggle`: none of these controls has an OFF state, so
+        # the decide_toggle firewall does not apply to them and would only ever
+        # block a legitimate heal.
+        assert it[key]["type"] == "select"
+    # The share controls live INSIDE the dialog. Probing the whole document
+    # would put the notebook page's source list and Studio cards — dozens of
+    # buttons — in the candidate pool for "the access dropdown".
+    assert it["notebooklm.set_public_access"]["region"] == "dialog"
+    assert it["notebooklm.copy_share_link"]["region"] == "dialog"
+
+
+def test_the_intent_set_is_exactly_what_is_wired():
+    """Equality guard: the manifest must hold the P2 six plus the P3 three and
+    nothing else, so a stray or half-deleted entry fails here rather than
+    quietly shipping."""
+    assert set(selfheal.load_intents()) == {
+        f"{p}.{i}"
+        for p in ("chatgpt", "gemini", "claude")
+        for i in ("enable_deep_research", "select_model")
+    } | {
+        "notebooklm.open_share_dialog",
+        "notebooklm.set_public_access",
+        "notebooklm.copy_share_link",
     }
 
 
@@ -76,7 +124,11 @@ def test_every_intent_is_schema_valid():
         assert isinstance(it["outcome_predicate"], str) and it["outcome_predicate"]
         assert isinstance(it["signal_hints"], dict)
         assert it["tier_sequence"] and all(t in selfheal.KNOWN_TIERS for t in it["tier_sequence"])
-        assert it["irreversible"] is False  # none of the 6 P2 setup intents send/publish
+        # None of the wired intents sends, publishes, or deletes: the P2 six are
+        # setup levers and the P3 three open a dialog / pick an access level /
+        # copy a link. An irreversible intent would need a different guard
+        # entirely, so this is a floor on what may be added, not a tally.
+        assert it["irreversible"] is False
         assert it["region"] in selfheal.REGIONS
 
 

@@ -6,8 +6,8 @@ Summarises what the PX-0 shadow layer observed, per (platform, intent):
   * how many WOULD-HEAL opportunities were seen (predicate failed → PX-2 would
     attempt a heal here),
   * probe coverage (how many DOM elements probe_region returned).
-Then checks the PX-0 Definition of Done: all 6 P2 intents
-observed, probe deployed on all 3 platforms, ≥1 heal shadowed per platform.
+Then checks the PX-0 Definition of Done: every wired intent observed, probe
+deployed on all 3 research platforms, >=1 heal shadowed per platform.
 
 It parses the structured JSONL the pipeline already emits
 (``logs/selfheal_shadow.jsonl``) — purely read-only, so it can never affect a
@@ -25,8 +25,10 @@ import os
 import sys
 from collections import defaultdict
 
-# The 6 P2 intents PX-0 wires + the 3 platforms (kept local so the report has no
-# import dependency on the runtime module — it can run anywhere the log lands).
+# Every intent PX-0 wires + the platforms they cover (kept local so the report
+# has no import dependency on the runtime module — it can run anywhere the log
+# lands). A test pins this against selfheal.load_intents(), so the two cannot
+# drift.
 INTENTS = (
     "chatgpt.enable_deep_research",
     "gemini.enable_deep_research",
@@ -34,7 +36,18 @@ INTENTS = (
     "chatgpt.select_model",
     "gemini.select_model",
     "claude.select_model",
+    # 2026-07-31 — the P3 NotebookLM share dialog joined the watch after a
+    # platform change to it took audio, P4 and P5 down for 7 consecutive runs
+    # while nothing was observing its selectors.
+    "notebooklm.open_share_dialog",
+    "notebooklm.set_public_access",
+    "notebooklm.copy_share_link",
 )
+# The three RESEARCH platforms. Deliberately NOT extended with notebooklm: the
+# DoD rows below ("all three platforms seen", "a heal shadowed per platform")
+# measure the P2 setup rollout, where all three agents run every time. P3 runs
+# once per run and only when Phase 2 produced documents, so folding it in would
+# turn a green DoD amber for a reason that has nothing to do with coverage.
 PLATFORMS = ("chatgpt", "gemini", "claude")
 
 
@@ -122,6 +135,9 @@ def summarize(records: list[dict]) -> dict:
         "intents_seen": sorted(intents_seen),
         "heals_by_platform": heals_by_platform,
         "dod": {
+            # Key name kept as-is (it is a stable JSON contract the report
+            # consumers read); the SET it checks grew from 6 to all wired
+            # intents on 2026-07-31.
             "all_six_intents": set(INTENTS).issubset(intents_seen),
             "all_three_platforms": set(PLATFORMS).issubset(platforms_seen),
             "heal_shadowed_per_platform": all(heals_by_platform[p] > 0 for p in PLATFORMS),
@@ -147,7 +163,7 @@ def format_report(summary: dict) -> str:
         pct = (100.0 * s["pass"] / n) if n else 0.0
         avg = (s["probe_sum"] / n) if n else 0.0
         lines.append(f"{intent:<34}{n:>5}{s['pass']:>6}{pct:>6.0f}%{s['would_heal']:>7}{avg:>8.1f}")
-    # any intents in the log that aren't one of the 6 expected
+    # any intents in the log that aren't one of the expected set
     extra = [i for i in summary["intents_seen"] if i not in INTENTS]
     for intent in extra:
         s = summary["per_intent"][intent]
@@ -155,7 +171,7 @@ def format_report(summary: dict) -> str:
     lines.append("-" * 68)
     dod = summary["dod"]
     lines.append("PX-0 Definition of Done:")
-    lines.append(f"  [{'x' if dod['all_six_intents'] else ' '}] all 6 P2 intents observed")
+    lines.append(f"  [{'x' if dod['all_six_intents'] else ' '}] all {len(INTENTS)} wired intents observed")
     lines.append(f"  [{'x' if dod['all_three_platforms'] else ' '}] probe deployed on all 3 platforms")
     heals = ", ".join(f"{p}:{summary['heals_by_platform'][p]}" for p in PLATFORMS)
     lines.append(f"  [{'x' if dod['heal_shadowed_per_platform'] else ' '}] >=1 heal shadowed per platform ({heals})")
