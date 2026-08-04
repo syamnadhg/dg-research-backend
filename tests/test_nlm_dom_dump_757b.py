@@ -103,9 +103,17 @@ def test_wired_at_all_three_anomalous_zero_sites():
 
 def test_dumps_are_gated_on_the_anomalous_zero_path():
     # Each dump must sit BEHIND its anomalous-count guard, never unconditional.
+    #
+    # 2026-08-04: the post-generate gate gained the in-flight count. Five
+    # seconds after Generate the healthy state is 0 READY cards + 1 generating —
+    # a generating audio has no <artifact-library-item> yet — so the ready-only
+    # test fired this WARN dump on every healthy run, which is how a canary
+    # stops being read. The gate's SHAPE is asserted structurally in
+    # test_nlm_audio_inflight_wave5b.py; this stays a wiring check.
     src = _p3_src()
     pairs = [
-        ("if post_gen_cards == 0:", '_dump_nlm_audio_dom(browser.page, "post-generate")'),
+        ("if post_gen_cards == 0 and post_gen_generating == 0:",
+         '_dump_nlm_audio_dom(browser.page, "post-generate")'),
         ("if not dom_complete:", '_dump_nlm_audio_dom(browser.page, "cua-complete-dom-missed")'),
         ("if total_count == 0:", '_dump_nlm_audio_dom(browser.page, "post-cleanup")'),
     ]

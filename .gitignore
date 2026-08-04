@@ -57,3 +57,7 @@ agent/facade/skill/cron/
 tests/fixtures/vision/*.png
 tests/fixtures/vision/*.json
 tests/fixtures/vision/auto/
+
+# macOS Finder metadata and per-machine agent settings — local noise.
+.DS_Store
+.claude/

@@ -142,6 +142,11 @@ def _setup_sources():
         inspect.getsource(fn)
         for fn in (
             research.setup_chatgpt_dr,
+            # Wave 4: the ChatGPT effort-tier pick moved out of setup_chatgpt_dr
+            # into its own helper (it also runs on the already-active branch,
+            # where setup returns before Step 3), and it carries that intent's
+            # shadow-observe call with it.
+            research._chatgpt_p2_effort_tier,
             research.setup_gemini_dr,
             research.setup_claude_dr,
             research.ensure_deep_mode_active,

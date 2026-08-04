@@ -161,6 +161,17 @@ def test_loop_threads_key_and_holder_into_every_call_site():
 
 def test_loop_resets_downgrade_flag_on_recovery_anti_latch():
     """On a recovered narration the loop resets the err_holder downgrade flag so
-    a later regression re-logs (anti-latch — the old _gemini_err_logged reset)."""
-    assert '_narrator_err_holder = {"gemini_downgrade_logged": False}' in _LOOP_SRC
+    a later regression re-logs (anti-latch — the old _gemini_err_logged reset).
+
+    ⚠ "Recovered" means GEMINI answered, not that the tick produced text. The
+    tick produces text on Haiku, which is the state the downgrade log reports,
+    so an unconditional reset re-armed the log every tick — 1125 copies of one
+    warning in the live corpus. The gate itself is pinned structurally in
+    test_narrator_gemini_diagnosis.py; this only holds the anti-latch, which is
+    still the point of the reset.
+    """
+    assert '"gemini_downgrade_logged": False' in _LOOP_SRC
     assert '_narrator_err_holder["gemini_downgrade_logged"] = False' in _LOOP_SRC
+    assert '_narrator_err_holder.get("last_vendor") == "gemini"' in _LOOP_SRC, (
+        "the reset is no longer conditioned on Gemini having answered"
+    )

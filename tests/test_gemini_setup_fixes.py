@@ -38,6 +38,7 @@ import re
 import sys
 from unittest import mock
 
+from conftest import code_only_deep
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -239,8 +240,14 @@ def _make_model_pick_eval(opened, picked, tl_seq, ext_picked, mode_txt):
                     "clicked": bool(picked)}
         if "thinking level" in js:             # Step 3a: open Thinking submenu
             return next(tl_iter)
-        if "startsWith('extended')" in js:     # Step 3b: pick Extended
-            return ext_picked
+        if "extendedRadio" in js:              # Step 3b: pick the thinking row
+            # ⚠ HONOUR THE ARGUMENT. The thinking word is now passed in from
+            # policy rather than frozen into the JS, so a double that returned
+            # `ext_picked` regardless would keep passing if the call site
+            # stopped passing the word at all — the real page would then match
+            # nothing and Extended would silently never be selected.
+            think = (a[0] if a else "") or ""
+            return ext_picked if (think and think in (ext_picked or "")) else ""
         if "aria-label" in js:                 # verify: read the mode button
             return mode_txt
         if "bard-mode-menu-button" in js:      # reopen guard
@@ -350,11 +357,22 @@ class TestGeminiModelPickSourceContract:
             "word 'extended')")
         assert "t.length >= 60" in src, "container-node guard"
 
-    def test_919_reopen_retry_hovers_flash_row(self):
-        src = self._src()
-        assert "hoverFlashRow" in src, (
+    def test_919_reopen_retry_hovers_the_row_the_ranker_picked(self):
+        """Same #919 requirement — hover before hunting the submenu — but the
+        hover must follow the RANKER's decision rather than re-deciding with a
+        second copy of the model policy. It used to match /\\bflash\\b/ while
+        excluding /lite|\\bpro\\b|deep think/: a frozen family+reject list in a
+        page.evaluate string, which a rename would strand while the ranker
+        itself kept working."""
+        src = code_only_deep(self._src())
+        assert "hoverPickedRow" in src, (
             "row-nested Thinking submenus only render on hover of the "
             "selected model row — the reopen-retry must hover first")
+        assert "_hover_picked_row_js, picked" in src, (
+            "the hover target must be the row the ranker actually clicked")
+        for literal in ("flash", "lite", "deep think"):
+            assert literal not in src.lower().split("_hover_picked_row_js")[1][:900], (
+                f"model policy literal {literal!r} is back in the hover helper")
 
     def test_919_menu_dump_on_every_miss(self):
         src = self._src()
@@ -394,8 +412,10 @@ class TestGeminiDirectExtendedFallbackFlow:
 
         def fake_eval(js, *a, **k):
             if "directExtended" in js:
-                return "extended thinking"
-            if "menuDump" in js or "hoverFlashRow" in js:
+                # Honour the argument for the same reason the radio double does.
+                think = (a[0] if a else "") or ""
+                return f"{think} thinking" if think else ""
+            if "menuDump" in js or "hoverPickedRow" in js:
                 return None
             return base(js, *a, **k)
 

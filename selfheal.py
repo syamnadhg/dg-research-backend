@@ -215,12 +215,22 @@ _INTENTS: dict[str, dict[str, Any]] = {
         "type": "select",
         "irreversible": False,
         "region": "composer",
-        # DETECT-ONLY: ChatGPT exposes NO P2 model/effort lever today. The
-        # predicate is "a model selector is ABSENT"; if one ever appears that is a
-        # capability change → escalate, not a churn to silently heal. (The model
-        # PICK side is owned by model_refresh; this contract only watches the DOM.)
-        "outcome_predicate": "chatgpt_model_selector:absent",
-        "signal_hints": {"accessible_name": "model", "role": ["button"], "detect_only": True},
+        # (2026-08-03) Was "chatgpt_model_selector:absent" + detect_only, on the
+        # belief that ChatGPT exposes no P2 model/effort lever. The live capture
+        # disproves it: a composer pill opens a menu of `menuitemradio` rows
+        # (Instant 5.5 / Medium / High / Extra High / Pro). So the predicate was
+        # asserting the ABSENCE of something that is there, and the shadow layer
+        # was logging a hardcoded pass for it — every sample it produced was
+        # noise. The real outcome is the one the DOM tier verifies: the trigger's
+        # own label names the target EFFORT TIER.
+        #
+        # ⚠ A TIER, NOT A MODEL. Effort and model share one menu here and most
+        # rows carry no version at all, so "highest number offered" — the rule for
+        # Claude and Gemini — would pick `Instant 5.5` over `Pro`, i.e. the
+        # highest number is the lowest tier. The tier word comes from
+        # models.P1_MODEL_POLICY (one home, read by both phases).
+        "outcome_predicate": "chatgpt_trigger:tier_selected",
+        "signal_hints": {"accessible_name": "model", "role": ["button"], "value_contains": "pro"},
         "tier_sequence": list(KNOWN_TIERS),
     },
     "gemini.select_model": {
@@ -239,7 +249,10 @@ _INTENTS: dict[str, dict[str, Any]] = {
         "type": "select",
         "irreversible": False,
         "region": "composer",
-        "outcome_predicate": "claude_trigger_verOf:>=floor",
+        # (2026-08-01) Was "claude_trigger_verOf:>=floor". The floor is gone —
+        # selection is family + highest-offered — so the outcome this intent
+        # watches is "the trigger names the family", with no version to compare.
+        "outcome_predicate": "claude_trigger:family_selected",
         "signal_hints": {"accessible_name": "model", "role": ["button"], "value_matches": "opus"},
         "tier_sequence": list(KNOWN_TIERS),
     },

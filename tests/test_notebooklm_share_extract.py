@@ -74,6 +74,9 @@ class _Handle:
                 'cdk-overlay-backdrop-showing"></div> intercepts pointer events')
 
 
+_PHRASE_PUBLIC = "Anyone with the link"
+
+
 class ScriptedPage:
     """Dispatches page.evaluate on distinctive fragments of the real JS.
 
@@ -84,7 +87,8 @@ class ScriptedPage:
     def __init__(self, *, share_click_boom=False, dom_link="",
                  public_verified=False, dialog_after_click=True,
                  overlay_present=False, share_btn_missing=False,
-                 access_control_found=True, access_option_found=True):
+                 access_control_found=True, access_option_found=True,
+                 access_already_public=False):
         # ONE ordered trace across keyboard + evaluate + clicks. Presence alone
         # is not enough: the flow presses Escape anyway when it closes the share
         # dialog, so "Escape was pressed" is true even if the pre-click dismissal
@@ -103,6 +107,7 @@ class ScriptedPage:
         self._share_btn_missing = share_btn_missing
         self._access_control_found = access_control_found
         self._access_option_found = access_option_found
+        self._access_already_public = access_already_public
 
     async def query_selector(self, sel):
         if "cdk-overlay-backdrop" in sel:
@@ -125,7 +130,36 @@ class ScriptedPage:
         if "anyone with the link" in js and "opt.click()" in js:
             return "selected" if self._access_option_found else ""
         if "isNb(val)" in js:                                # the link read
-            return self._dom_link
+            # ⭐ 2026-08-03: this double used to answer with a bare string, and
+            # every test in this file passed on that answer — while the REAL
+            # page could not answer at all. The predicate was handed to
+            # `page.evaluate` as an ARGUMENT, so `isNb` arrived in the page as a
+            # string and `isNb(val)` threw on the first input it reached. The
+            # double was simulating a branch that had never executed.
+            #
+            # A double is only evidence if it answers the way the page does, so
+            # the shape lives here now: {url, via}. `via` is the channel, and
+            # naming it is what lets a caller tell "no dialog was open" from "an
+            # open dialog with no link in it".
+            if self._dom_link == "clipboard":
+                return {"url": "clipboard", "via": "copy"}
+            if self._dom_link:
+                return {"url": self._dom_link, "via": "input"}
+            return {"url": "", "via": "no_link_in_dialog"}
+        # ⚠ BEFORE the PHRASE branch. The access diagnostic also mentions the
+        # phrase, so ordering it after would hand it a bare bool, `.get` would
+        # raise, the helper's try/except would swallow it and the already-public
+        # path would be untestable — silently. Keyed on TRIGGERS, which only the
+        # diagnostic defines. The returned SHAPE is the one the real JS produces
+        # (proved against a DOM in test_nlm_access_already_public.py).
+        if "const TRIGGERS =" in js:                         # access diagnostic
+            return {"already": self._access_already_public,
+                    "dialog": self._dialog_after_click,
+                    "rows": 0 if self._access_already_public else 2,
+                    "sample": [] if self._access_already_public
+                              else ["Restricted", "Only people I choose"],
+                    "access": _PHRASE_PUBLIC if self._access_already_public
+                              else "Restricted"}
         if "PHRASE" in js:                                   # public-access verify
             return self._public_verified
         if "'save'" in js or "=== 'save'" in js:             # Save/Done

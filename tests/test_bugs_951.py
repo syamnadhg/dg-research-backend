@@ -88,8 +88,10 @@ def test_doc_panel_still_gated_on_no_stop_button():
 
 def test_extended_verify_is_authoritative_mode_button_not_the_click():
     src = inspect.getsource(research._gemini_select_flash_model)
-    # The authoritative signal is the mode button reading 'extended'.
-    assert "_mode_shows_extended" in src and '"extended" in (_m or "").lower()' in src, (
+    # The authoritative signal is the mode button reading the thinking word.
+    # That word now comes from policy rather than being frozen here, so the
+    # anchor is the read itself, not the literal it used to compare against.
+    assert "_mode_shows_extended" in src and '_gm_think in (_m or "").lower()' in src, (
         "verification must read the mode button, not trust the click's return"
     )
 
@@ -114,9 +116,11 @@ def test_extended_retries_until_it_sticks():
         "a bounded verify+retry loop must re-pick Extended when the mode button "
         "still doesn't show it"
     )
-    # The retry reopens the menu, re-hovers the Flash row (row-nested submenus
-    # only render on hover), then re-clicks Extended.
-    for anchor in ("_reopen_js", "_hover_flash_row_js", "_click_ext_radio_js"):
+    # The retry reopens the menu, re-hovers the row the ranker picked (row-nested
+    # submenus only render on hover), then re-clicks the thinking row. The hover
+    # helper no longer carries its own frozen family+reject list, so it is
+    # anchored by name AND by being handed the ranker's answer.
+    for anchor in ("_reopen_js", "_hover_picked_row_js, picked", "_click_ext_radio_js"):
         assert anchor in src, f"retry must re-drive the pick via {anchor}"
     # A confirmed stick breaks the loop; exhaustion is logged honestly.
     assert "after retry" in src and "extended-retry-exhausted" in src

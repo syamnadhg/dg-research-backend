@@ -42,11 +42,20 @@ def _pipeline_src() -> str:
 
 
 def _link_extract_skip_branch() -> str:
-    """The `if decision in ("skip", "timeout"):` body inside the P3 link-extract
-    loop. Anchored on the emit rather than on log copy, which moves."""
+    """The skip body inside the P3 link-extract loop.
+
+    2026-08-02: the condition it used to anchor on was `decision in ("skip",
+    "timeout")`, which could not tell the 30-minute countdown the FE showed
+    from `await_phase_decision`'s 24-hour outer backstop — so a sign-in wall
+    and an auto-skip-OFF card, which arm nothing, both auto-skipped after a
+    weekend. The branch now takes three outcomes — a user Skip, an ARMED
+    timeout, and the unarmed 24-hour backstop — each with its own reason and all
+    three sharing this one skip-and-continue exit."""
     src = _pipeline_src()
-    i = src.index('if decision in ("skip", "timeout"):')
-    return src[i:i + 3600]
+    i = src.index('if decision == "skip" or _nb_auto or _nb_backstop:')
+    # Ends on the cascade, not on `break`: this source is NOT comment-stripped
+    # and the branch's own explanation contains the word "break".
+    return src[i:src.index("_controls.skipped_phases.add(4)", i) + 40]
 
 
 def test_the_link_extract_skip_emits_a_terminal_phase_skipped():

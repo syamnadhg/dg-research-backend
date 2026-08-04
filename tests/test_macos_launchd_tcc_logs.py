@@ -37,9 +37,14 @@ def test_macos_log_dir_is_library_logs_not_script_dir():
 
 def test_macos_plist_template_still_wires_log_dir():
     # The template must keep deriving both std paths from log_dir, so the
-    # relocation actually reaches the plist.
-    assert "{log_dir / 'supervisor.out.log'}" in MAC_SRC
-    assert "{log_dir / 'supervisor.err.log'}" in MAC_SRC
+    # relocation actually reaches the plist. They now go through the XML escaper
+    # first (every interpolated value derives from $HOME, and an `&` in a home
+    # path writes a plist launchd cannot parse), so the derivation is asserted at
+    # the escape site rather than inside the template.
+    assert "out_log = _x(log_dir / 'supervisor.out.log')" in MAC_SRC
+    assert "err_log = _x(log_dir / 'supervisor.err.log')" in MAC_SRC
+    assert "<string>{out_log}</string>" in MAC_SRC
+    assert "<string>{err_log}</string>" in MAC_SRC
     assert "<key>StandardOutPath</key>" in MAC_SRC
     assert "<key>StandardErrorPath</key>" in MAC_SRC
 

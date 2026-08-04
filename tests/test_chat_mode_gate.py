@@ -12,6 +12,7 @@ import inspect
 
 import research
 import prompts
+from conftest import code_only
 
 
 def test_chat_mode_alert_is_platform_parameterized():
@@ -86,17 +87,68 @@ def test_validate_setup_returns_ok_and_confirmed_tuple():
 
 
 def test_claude_gate_keys_on_positive_confirmation_not_loose_ok():
-    """#744: the Claude chat-mode gate must OR the POSITIVE `cua_confirmed`
-    signal, NOT the loose `cua_ok` (which is also True on ambiguous/error and
-    would let a real chat-mode degradation slip through silently, #709)."""
-    mod_src = inspect.getsource(research)
-    assert 'cua_ok, cua_confirmed = await validate_setup_with_cua(' in mod_src, (
-        "the call site must unpack the (ok, confirmed) tuple (#744)."
+    """#744: the Claude chat-mode gate must OR a POSITIVE confirmation, NOT the
+    loose `cua_ok` (which is also True on ambiguous/error and would let a real
+    chat-mode degradation slip through silently, #709).
+
+    Wave 4 widened WHERE that positive confirmation may come from — the CUA
+    validator's verified/fixed verdict OR the setup ladder's own outcome probe —
+    so the assertion is re-pointed at `setup_confirmed`. What may NOT change is
+    the shape: a positive signal is OR-ed in, and the loose ok never is.
+    """
+    mod_src = code_only(inspect.getsource(research))
+    assert "_confirmed = await validate_setup_with_cua(" in mod_src, (
+        "the call site must still unpack the (ok, confirmed) tuple (#744)."
     )
     assert ('research_ok = bool((mode_state or {}).get("researchOn")) '
-            "or bool(cua_confirmed)") in mod_src, (
-        "the Claude gate must OR the positive cua_confirmed, not researchOn alone (#744)."
+            "or bool(setup_confirmed)") in mod_src, (
+        "the Claude gate must OR a positive confirmation, not researchOn alone (#744)."
     )
     assert 'or bool(cua_ok)' not in mod_src, (
         "the gate must NOT key on the loose cua_ok (True on ambiguous/error) (#744)."
+    )
+
+
+def test_positive_confirmation_accepts_either_source_and_only_positive_ones():
+    """`setup_confirmed` is the successor to `cua_confirmed`: it must be true for
+    a positive CUA verdict OR a verified ladder, and for nothing else.
+
+    The failure this guards is specific. The ladder can now SKIP the CUA
+    validation rung, so `_cua_verdict['confirmed']` is simply absent on the happy
+    path — and a `.get(..., True)`-style default there would hand the chat-mode
+    gate a fabricated confirmation on every run where the validator never spoke.
+    """
+    mod_src = code_only(inspect.getsource(research))
+    assert ('setup_confirmed = bool(_cua_verdict.get("confirmed")) '
+            'or bool(_ladder.get("verified"))') in mod_src, (
+        "setup_confirmed must be the OR of the CUA verdict and the ladder's "
+        "verified flag — and must default to absent-is-false."
+    )
+    # The "validation failed — proceeding anyway" warning must live INSIDE the
+    # rung that produces the verdict. Hoisting it back out re-introduces the
+    # question of what `ok` defaults to when the rung never ran, and the only
+    # available default (True) then reads as a verdict nobody gave.
+    rung = code_only(inspect.getsource(research))
+    idx = rung.index("async def _rung_cua_validate():")
+    body = rung[idx:idx + 900]
+    assert "if not _ok:" in body and "CUA validation failed" in body, (
+        "the failed-validation warning belongs to the rung, not to the caller"
+    )
+
+
+def test_bringing_the_agent_tab_to_front_no_longer_rides_on_the_skippable_rung():
+    """`validate_setup_with_cua` opens with `switch_to_page(page)`, and the brief
+    is typed/pasted into that tab afterwards. Once the ladder can SKIP that rung,
+    the focus guarantee has to be stated where it is needed rather than inherited
+    from a surface that may not run."""
+    src = code_only(inspect.getsource(research.start_agent_no_gemini_wait))
+    # ⚠ Scoped to the window between the DOM setup and the ladder. A bare
+    # "appears somewhere in the function" assertion passes on the switch_to_page
+    # in the REUSE-PAGE branch a thousand lines earlier — a mutation that deleted
+    # the new one survived exactly that way.
+    _, _, after_setup = src.partition('log(f"[{label}] Playwright-direct setup OK")')
+    window, _, _ = after_setup.partition("_ladder = await _run_intent_ladder(")
+    assert "await browser.switch_to_page(page)" in window, (
+        "the agent tab must be brought to front between the DOM setup and the "
+        "ladder, independently of whether the validation rung runs"
     )

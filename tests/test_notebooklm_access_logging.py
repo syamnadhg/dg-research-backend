@@ -31,10 +31,12 @@ class _Keyboard:
 class _AccessPage:
     """Scripted page for the access-setting half of the share dialog."""
 
-    def __init__(self, *, control_found: bool, option_found: bool):
+    def __init__(self, *, control_found: bool, option_found: bool,
+                 already_public: bool = False):
         self.keyboard = _Keyboard()
         self._control_found = control_found
         self._option_found = option_found
+        self._already_public = already_public
 
     async def query_selector(self, sel):
         return None
@@ -46,6 +48,18 @@ class _AccessPage:
             return "selected" if self._option_found else ""
         if "isNb(val)" in js:
             return ""
+        # ⚠ BEFORE the PHRASE branch — the access diagnostic names the phrase
+        # too, and answering it with a bare bool would make `.get` raise inside
+        # the helper's try/except, so the already-public path would be untestable
+        # and the failure path would lose its detail, both silently.
+        if "const TRIGGERS =" in js:
+            return {"already": self._already_public,
+                    "dialog": self._control_found,
+                    "rows": 0 if self._already_public else 2,
+                    "sample": [] if self._already_public
+                              else ["Restricted", "Only people I choose"],
+                    "access": "Anyone with the link" if self._already_public
+                              else "Restricted"}
         if "PHRASE" in js:
             return False
         if "'save'" in js:
@@ -77,14 +91,34 @@ def test_a_missing_access_control_is_reported_not_silent(capsys):
 
 
 def test_an_opened_dropdown_with_no_matching_option_is_not_reported_as_success(capsys):
+    """⚠ 2026-08-04: this now requires the notebook NOT to be already public.
+    "No option to click" has two causes and only one of them is a failure — see
+    the sibling test below and test_nlm_access_already_public.py."""
     _run(_AccessPage(control_found=True, option_found=False), None)
     out = capsys.readouterr().out
-    assert "no 'Anyone with the link' option was found" in out
-    assert "may be private" in out
+    assert "no 'Anyone with the link' option to click" in out
+    assert "may genuinely be private" in out
     assert "Set Notebook access to 'Anyone with the link'" not in out, (
         "the success line used to fire whether or not the option was clicked — "
         "a restructured option list read as a success in the log"
     )
+    assert "option-rows=2" in out and "Restricted" in out, (
+        "the failure must name what WAS on screen, or the next run re-derives it"
+    )
+
+
+def test_an_already_public_notebook_is_not_one_of_the_failure_shapes(capsys):
+    """The third outcome, added after a live run reported a public link private.
+
+    The access opener only fires on a control reading "Restricted"/"Private", so
+    re-sharing an already-public notebook leaves nothing to click BY DESIGN. That
+    is a success, and it must not borrow either failure's copy."""
+    _run(_AccessPage(control_found=True, option_found=False, already_public=True),
+         None)
+    out = capsys.readouterr().out
+    assert "already reads 'Anyone with the link'" in out
+    assert "may be private" not in out
+    assert "could not find the 'Notebook access' control" not in out
 
 
 def test_a_real_access_change_still_logs_the_success_line(capsys):

@@ -75,20 +75,60 @@ class El {
     for (const k of this.children) k.parent = this;
   }
   getAttribute(n) { return (n in this._attrs) ? this._attrs[n] : null; }
+  // Production MARKS an element it has identified in JS so Playwright can aim a
+  // real, trusted click at it — the search has to happen in JS (ordered hooks,
+  // safety exclusions) while the press has to happen in the browser. Without
+  // these the marking JS throws and the test reads as a broken selector.
+  setAttribute(n, v) { this._attrs[n] = String(v); }
+  removeAttribute(n) { delete this._attrs[n]; }
+  hasAttribute(n) { return n in this._attrs; }
   get textContent() { return this._text + this.children.map(c => c.textContent).join(''); }
   get innerText() { return this.textContent; }
+  // Own text vs descendant text is a DISTINCTION production depends on: a
+  // Material dropdown parks its open option list INSIDE the trigger, so reading
+  // innerText on the trigger finds "Anyone with the link" in a row nobody
+  // selected. The share-dialog checks therefore walk childNodes and take only
+  // TEXT_NODEs. Without this the shim reported every element as having no own
+  // text, so an already-public trigger and a restricted one looked identical.
+  get childNodes() {
+    const out = [];
+    if (this._text) out.push({ nodeType: 3, nodeValue: this._text });
+    for (const k of this.children) out.push(k);
+    return out;
+  }
+  get nodeType() { return 1; }
   get classList() {
     const cls = String(this._attrs['class'] || '').split(/\s+/);
     return { contains: (c) => cls.includes(c) };
   }
   get className() { return this._attrs['class'] || ''; }
   click() { CLICKS.push(this.getAttribute('aria-label') || this.textContent || this.tagName); }
+  // `x`/`y` place the box. They default to 10,10 (on-screen) so every existing
+  // fixture keeps its old geometry, and they exist because "on screen" is not a
+  // question a size can answer: NotebookLM parks a full-size button at x=-36,
+  // where a rect-size gate and offsetParent both say clickable and it is not.
   getBoundingClientRect() {
     const w = 'w' in this._attrs ? +this._attrs.w : 100;
     const h = 'h' in this._attrs ? +this._attrs.h : 24;
-    return { width: w, height: h, left: 10, top: 10, right: 10 + w, bottom: 10 + h };
+    const x = 'x' in this._attrs ? +this._attrs.x : 10;
+    const y = 'y' in this._attrs ? +this._attrs.y : 10;
+    return { width: w, height: h, left: x, top: y, right: x + w, bottom: y + h };
   }
   getClientRects() { return [this.getBoundingClientRect()]; }
+  // The other visibility idiom in this codebase. Production JS uses BOTH
+  // `getClientRects().length` and `!el.offsetParent` as its "is this on screen"
+  // gate, and a shim that left offsetParent undefined made every element read
+  // as hidden — so the model rankers, which gate on it first, would skip every
+  // row and "pass" a test by selecting nothing. Root has no parent, matching
+  // the browser (a detached or display:none node has none either); mark a node
+  // `hidden` to simulate that for a node that does have one.
+  // Hiding PROPAGATES, as it does in a browser: a node inside a hidden subtree
+  // has no offsetParent either. Without that, a fixture could hide a container
+  // and its rows would still read as on-screen.
+  get offsetParent() {
+    for (let n = this; n; n = n.parent) if (n.getAttribute('hidden') !== null) return null;
+    return this.parent;
+  }
   dispatchEvent() { CLICKS.push(this.getAttribute('aria-label') || this.textContent || this.tagName); return true; }
   descendants() { return this.children.flatMap(c => [c, ...c.descendants()]); }
   matches(sel) {
@@ -129,6 +169,12 @@ function matchOne(el, p) {
   return matchSimple(el, p);
 }
 function matchSimple(el, p) {
+  // The universal selector. Production reaches for it when it has to walk a
+  // container it cannot name a tag for — the NotebookLM "Generating Audio
+  // Overview…" placeholder, whose tag is not in any capture. Without this the
+  // shim returned zero matches for `*`, which reads exactly like a selector
+  // that cannot match and would let a broken counter pass.
+  if (p === '*') return true;
   // Tag + any mix of .class / #id / [attr] — `.font-claude-message` scoping is
   // load-bearing in the Claude artifact path (pass 1 is assistant-scoped), so a shim
   // that silently failed every class selector would take the wrong branch.
@@ -159,15 +205,27 @@ function matchSimple(el, p) {
   }
   return true;
 }
+// `repeat` expands one child spec into N siblings. Production carries an
+// 8000-node ceiling above which the ChatGPT panel walk abandons a root
+// unscanned, and a fixture that has to CROSS that ceiling cannot be shipped
+// node-by-node — the JSON would be a 400 KB argv, near the OS limit. Expanding
+// inside node keeps the payload small and the fixture honest.
 function build(spec) {
   const attrs = {};
   for (const [k, v] of Object.entries(spec.attrs || {})) if (v !== null) attrs[k] = v;
-  return new El(spec.tag, attrs, spec.text || '', (spec.kids || []).map(build));
+  const kids = [];
+  for (const k of (spec.kids || [])) {
+    for (let i = 0; i < (k.repeat || 1); i++) kids.push(build(k));
+  }
+  return new El(spec.tag, attrs, spec.text || '', kids);
 }
 let ROOT = null;
 globalThis.document = {
   querySelectorAll: (s) => ROOT.querySelectorAll(s),
   querySelector: (s) => ROOT.querySelector(s),
+  // `document.body` is the picker's fallback root for "no menu has mounted
+  // yet". Without it that branch throws instead of exercising the fallback.
+  get body() { return ROOT; },
 };
 globalThis.getComputedStyle = () => ({ display: 'block', visibility: 'visible', opacity: '1' });
 globalThis.window = { innerWidth: 1440, innerHeight: 900 };
@@ -181,9 +239,16 @@ globalThis.__run = (spec, fn, arg) => {
 """
 
 
-def el(tag, attrs=None, text="", kids=None):
-    """Build a DOM spec node. `w`/`h` attrs set the bounding box."""
-    return {"tag": tag, "attrs": attrs or {}, "text": text, "kids": kids or []}
+def el(tag, attrs=None, text="", kids=None, repeat=1):
+    """Build a DOM spec node. `w`/`h` attrs set the bounding box.
+
+    `repeat` clones this node into N identical siblings when it is built — for
+    fixtures that must exceed a production node ceiling.
+    """
+    spec = {"tag": tag, "attrs": attrs or {}, "text": text, "kids": kids or []}
+    if repeat != 1:
+        spec["repeat"] = repeat
+    return spec
 
 
 def run_js(spec, fn_src: str, arg=None) -> dict:

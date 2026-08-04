@@ -27,6 +27,7 @@ import json
 import pytest
 
 import research
+from conftest import code_only
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -330,3 +331,177 @@ def test_heal_is_throttled_and_latches_structural():
     assert "403 (deviceMemberOf)" not in src, (
         "heal must not hard-code '(deviceMemberOf)' as the cause (#720)."
     )
+
+
+# ── the diagnosis must come from the outcome, not from a guess ─────────────
+#
+# 2026-08-04, from the live corpus. All 34 heals in it printed
+# `likely cause: token+config deviceId AGREE — deviceOwnership / doc-deviceId
+# mismatch` — a document problem. About half of them were then cleared by the
+# re-mint, which a document problem cannot be. The deviceIds agreeing rules the
+# write-side payload clause OUT; it says nothing about which of the survivors is
+# at fault, and naming one sent every reader at the wrong thing.
+#
+# The retry IS the experiment, so both of its outcomes are now logged. The
+# corpus recorded only that a heal was ATTEMPTED, so establishing whether any of
+# the 34 worked meant pairing timestamps against the caller's degrade line by
+# hand.
+
+def _agreeing_creds():
+    """Token and config carry the SAME deviceId — the branch every live denial
+    lands in, and the one that used to assert a document mismatch."""
+    return _FakeCreds(token=_mk_token({"deviceId": "cfg-device-xyz", "ownerUid": "u1"}))
+
+
+def test_a_heal_that_worked_reports_a_stale_credential(monkeypatch, capsys):
+    creds = _agreeing_creds()
+    monkeypatch.setattr(research, "_firebase_db", _FakeDb(creds))
+    calls = {"n": 0}
+
+    def op():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionDenied("Missing or insufficient permissions.")
+        return "ok"
+
+    assert research._grpc_write_with_heal(op, what="flip queued→ongoing abc…") == "ok"
+    out = capsys.readouterr().out
+    assert "cleared by the re-minted token" in out, (
+        "a heal that worked leaves no record of having worked — which is why "
+        "nobody could tell 34 attempts from 34 failures")
+    assert "stale" in out
+    assert "re-pair" not in out, (
+        "a denial a re-mint fixed must never be reported as needing a re-pair")
+
+
+def test_a_heal_that_failed_rules_the_credential_out(monkeypatch, capsys):
+    creds = _agreeing_creds()
+    monkeypatch.setattr(research, "_firebase_db", _FakeDb(creds))
+
+    def op():
+        raise PermissionDenied("Missing or insufficient permissions.")
+
+    with pytest.raises(PermissionDenied):
+        research._grpc_write_with_heal(op, what="flip queued→ongoing abc…")
+    out = capsys.readouterr().out
+    assert "did NOT clear" in out, "an unhealed denial says nothing about itself"
+    assert "WARN" in out, "an unhealed denial is not an INFO"
+    assert "a stale credential was not the cause" in out
+
+
+def test_the_agreeing_branch_no_longer_asserts_a_document_mismatch(monkeypatch, capsys):
+    """⭐ The finding itself. The one certainty is what has been ruled OUT."""
+    creds = _agreeing_creds()
+    monkeypatch.setattr(research, "_firebase_db", _FakeDb(creds))
+    calls = {"n": 0}
+
+    def op():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionDenied("Missing or insufficient permissions.")
+        return "ok"
+
+    research._grpc_write_with_heal(op, what="flip queued→ongoing abc…")
+    attempt = [ln for ln in capsys.readouterr().out.splitlines()
+               if "likely cause" in ln]
+    assert len(attempt) == 1, attempt
+    assert "deviceOwnership / doc-deviceId mismatch" not in attempt[0], (
+        "the attempt line still names a document mismatch as THE cause, on the "
+        "very path where a token re-mint then fixes it")
+    assert "payload clause is satisfied" in attempt[0], (
+        "it must still say what the agreeing deviceIds actually rule out")
+
+
+def test_a_token_missing_the_claim_is_still_diagnosed_up_front(monkeypatch, capsys):
+    """The two branches that CAN be decided before the retry still are — the
+    change is only to the branch where the evidence does not decide."""
+    creds = _FakeCreds(token=_mk_token({"ownerUid": "u1"}),
+                       token_after_refresh=_mk_token({"deviceId": "cfg-device-xyz"}))
+    monkeypatch.setattr(research, "_firebase_db", _FakeDb(creds))
+    calls = {"n": 0}
+
+    def op():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionDenied("Missing or insufficient permissions.")
+        return "ok"
+
+    research._grpc_write_with_heal(op, what="t")
+    out = capsys.readouterr().out
+    assert "token MISSING deviceId claim" in out
+
+
+def test_a_mismatched_deviceid_is_still_diagnosed_up_front(monkeypatch, capsys):
+    creds = _FakeCreds(token=_mk_token({"deviceId": "claim-abc", "ownerUid": "u1"}))
+    monkeypatch.setattr(research, "_firebase_db", _FakeDb(creds))
+    monkeypatch.setattr(research, "_config_device_id_uncached", lambda: "cfg-different")
+
+    def op():
+        raise PermissionDenied("Missing or insufficient permissions.")
+
+    with pytest.raises(PermissionDenied):
+        research._grpc_write_with_heal(op, what="t")
+    out = capsys.readouterr().out
+    assert "token/config deviceId MISMATCH" in out and "re-pair" in out
+
+
+def test_an_unhealed_denial_is_visible_before_the_latch_ever_fires(monkeypatch, capsys):
+    """⚠ Why this is per-occurrence. `_grpc_heal_consec_fail` is global and any
+    successful write resets it — and the heartbeat succeeds constantly. The live
+    corpus holds 16 unhealed denials and ZERO structural latches, so the ERROR
+    that was meant to carry this never printed once."""
+    creds = _agreeing_creds()
+    monkeypatch.setattr(research, "_firebase_db", _FakeDb(creds))
+    monkeypatch.setattr(research, "_GRPC_HEAL_COOLDOWN_S", 0.0, raising=False)
+
+    def denied():
+        raise PermissionDenied("Missing or insufficient permissions.")
+
+    with pytest.raises(PermissionDenied):
+        research._grpc_write_with_heal(denied, what="t")
+    research._grpc_write_with_heal(lambda: "ok", what="t")   # a heartbeat lands
+    with pytest.raises(PermissionDenied):
+        research._grpc_write_with_heal(denied, what="t")
+
+    out = capsys.readouterr().out
+    assert research._grpc_heal_structural is False, "precondition: the latch never fired"
+    assert out.count("did NOT clear") == 2, (
+        "each unhealed denial must report itself; the latch cannot be relied on")
+    assert "STRUCTURAL" not in out
+
+
+def test_the_latch_line_is_not_doubled_by_the_per_occurrence_warn(monkeypatch, capsys):
+    """The escalation says everything the per-occurrence line does. Printing
+    both on the same denial is how a real signal starts reading as noise."""
+    creds = _FakeCreds(token=_mk_token({"deviceId": "claim-abc", "ownerUid": "u1"}))
+    monkeypatch.setattr(research, "_firebase_db", _FakeDb(creds))
+    monkeypatch.setattr(research, "_config_device_id_uncached", lambda: "cfg-different")
+    monkeypatch.setattr(research, "_GRPC_HEAL_COOLDOWN_S", 0.0, raising=False)
+
+    def op():
+        raise PermissionDenied("Missing or insufficient permissions.")
+
+    for _ in range(research._GRPC_HEAL_STRUCTURAL_AFTER):
+        with pytest.raises(PermissionDenied):
+            research._grpc_write_with_heal(op, what="t")
+
+    out = capsys.readouterr().out
+    latch = [ln for ln in out.splitlines() if "STRUCTURAL" in ln]
+    assert len(latch) == 1, latch
+    # The denial that latched reports once, not twice.
+    assert out.count("did NOT clear") == research._GRPC_HEAL_STRUCTURAL_AFTER - 1
+
+
+def test_the_flip_degrade_leads_with_the_root_cause():
+    """The masking is real and stays: google-cloud-firestore turns a denied read
+    inside a transaction into "The transaction has no transaction ID, so it
+    cannot be rolled back". Appending the root was not enough — the line still
+    OPENED with the rollback artifact, and every occurrence in the corpus reads
+    that way."""
+    src = code_only(inspect.getsource(research.run_server))
+    assert 'f"Failed to flip queued→ongoing for {research_id_val}: {_head}"' in src, (
+        "the flip degrade no longer leads with the root cause")
+    assert 'f"Failed to flip queued→ongoing for {research_id_val}: {e}"' not in src, (
+        "the wrapper's rollback message is back in front of the real fault")
+    head = src.split("_head =", 1)[1].split("\n", 1)[0]
+    assert "_root" in head, "the head must be built from the root, not from the wrapper"

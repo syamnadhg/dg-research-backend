@@ -150,17 +150,35 @@ def test_the_js_predicate_matches_the_python_one_and_has_no_backslashes():
     assert "google.com" in js
     assert "endsWith('.google.com')" in js
     assert "'/notebook/'" in js
-    # And it is an expression (passed as an argument to page.evaluate), not a
-    # statement — so it must be parenthesised.
+    # And it is an expression — it is EMBEDDED into a larger arrow function by
+    # string concatenation, so it must be parenthesised to be assignable.
+    # (It used to be described here as "passed as an argument to page.evaluate".
+    # It was, and that is exactly why the read it belonged to never ran: an
+    # argument is serialized, so the page received the text of a function rather
+    # than a function.)
     assert js.strip().startswith("(") and js.strip().endswith(")")
 
 
 def test_the_share_dialog_dom_read_no_longer_filters_by_hostname():
     """The old selector was `input[value*="notebooklm"]`, i.e. the hostname was
     part of the SELECTOR. After the rename it could not locate the field at all,
-    so widening only the value guard would have left this channel dead."""
+    so widening only the value guard would have left this channel dead.
+
+    ⭐ 2026-08-03 — this guard was VACUOUS in the most literal way available. It
+    asserted `_JS_IS_NLM_URL` appears in the function, and it did: as the second
+    argument to `page.evaluate`, the one construct that guaranteed the read
+    could never execute. The name being present was the bug. So the assertion is
+    re-pointed at the constant that embeds the predicate, and the behaviour it
+    was always trying to state — that any Google host serving `/notebook/{id}`
+    is accepted — is proved by EXECUTING the read in test_nlm_panels_wave5.py.
+    """
     src = code_only(research._set_nlm_public_and_get_link)
     assert 'input[value*="notebooklm"]' not in src
-    assert "_JS_IS_NLM_URL" in src, (
-        "the DOM link read must go through the shared JS predicate"
+    assert "page.evaluate(_NLM_SHARE_LINK_READ_JS," in src, (
+        "the DOM link read must go through the constant that embeds the "
+        "shared predicate"
+    )
+    assert research._JS_IS_NLM_URL in research._NLM_SHARE_LINK_READ_JS, (
+        "…and that constant must embed the ONE predicate definition rather than "
+        "re-spelling the host"
     )

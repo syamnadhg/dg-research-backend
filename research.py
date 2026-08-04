@@ -116,13 +116,22 @@ from models import (
     TITLE_HAIKU,
     GEMINI_TEXT,
     GEMINI_NARRATE,
-    p2_floor,
+    p1_words,
+    has_term,
+    has_thinking_control,
+    pick_effort_tier,
+    overlay_path,
+    p2_family,
     p2_known_good,
     p2_labels,
-    p2_claude_ver,
     p2_claude_setup_directive,
+    p2_claude_validate_directive,
     parse_family_version,
+    reject_terms,
+    model_probe_due,
+    record_probe,
     record_known_good,
+    stepped_back_to,
 )
 
 # Vision tier-2 module (shadow-eval today, tier-2 promotion per hotspot
@@ -2538,8 +2547,9 @@ def get_clipboard():
             # stderr) — that's the intended "" result, not a tool failure.
             # Without this branch we'd cascade to xclip and, on a Wayland-only
             # box without xclip, fire a spurious tool-missing WARN on every
-            # extraction (because clear_clipboard() runs immediately before
-            # get_clipboard() at every call site).
+            # extraction (an armed clipboard — see _arm_clipboard — is EMPTY
+            # until the copy lands, so the empty read is the common case here,
+            # not the exceptional one).
             if cmd[0] == "wl-paste" and result.returncode == 1:
                 return ""
         except FileNotFoundError:
@@ -2553,9 +2563,12 @@ def get_clipboard():
 def clear_clipboard():
     """Clear the OS clipboard. Silent no-op on failure.
 
-    Used to prevent stale text from a prior run / prior phase being returned
-    by extractors that race a fresh copy against an old clipboard. Same
-    platform branching as get_clipboard()."""
+    Used to prevent stale text being returned by extractors that race a fresh
+    copy against an old clipboard. Same platform branching as get_clipboard().
+
+    Called at run start (the cross-RUN channel) and, via _arm_clipboard(),
+    immediately before every action that is supposed to copy (the same-RUN
+    channel — see that helper for why the run-start clear cannot cover it)."""
     if sys.platform == "win32":
         try:
             subprocess.run(
@@ -2588,6 +2601,163 @@ def clear_clipboard():
             continue
         except Exception:
             return
+
+
+def _arm_clipboard():
+    """Empty the clipboard immediately BEFORE an action that should copy.
+
+    Every share extractor reads the clipboard as its last resort, and each one
+    accepts whatever it finds provided the text merely LOOKS like that
+    platform's share URL. A run produces several share links in sequence, so
+    the shape test cannot tell this agent's link from the one the previous
+    agent copied twenty seconds ago — both pass. Arming is what makes the
+    difference readable: an empty clipboard cannot impersonate a copy, so
+    anything present afterwards was put there by the action we just took.
+
+    The run-start clear does NOT cover this. It closes the cross-RUN channel
+    only (yesterday's link surviving in the OS clipboard); by the time the
+    second extractor runs, the contaminating value was written by this same
+    run, minutes after that clear.
+
+    Placement is the whole point, and it is not always next to the read: when
+    the copy happens inside a vision mission, the only moment at which "the
+    clipboard is empty" implies "nothing has been copied yet" is BEFORE the
+    mission starts, not before the read that follows it.
+
+    Pairs with _read_clipboard_after_copy(); the two are meaningless apart."""
+    clear_clipboard()
+
+
+async def _read_clipboard_after_copy(accept=None, *, tries=4, delay=0.25):
+    """Read the clipboard after a copy, and return (accepted, seen).
+
+    Polls, because the clipboard write is not synchronous with the click that
+    triggers it — on an armed clipboard a single immediate read returns "" for
+    a copy that lands 200 ms later, which before arming was masked by the stale
+    value that happened to be sitting there.
+
+    `accept` is the caller's own shape test. Polling continues until a value
+    PASSES it, so a value that is merely present is never mistaken for the copy
+    we asked for, and the caller never has to re-test what it gets back.
+
+    `accepted` is "" when nothing passed. `seen` is the last non-empty value
+    observed regardless — callers that want to report what the clipboard held
+    instead need it, and reporting it is how a changed copy button gets noticed.
+
+    REQUIRES an _arm_clipboard() call before the copying action. Without one
+    this helper is exactly as wrong as a bare get_clipboard(): it cannot tell a
+    fresh copy from a stale one, because at the OS level there is no
+    difference."""
+    seen = ""
+    for i in range(max(1, int(tries))):
+        if i:
+            await asyncio.sleep(delay)
+        clip = (get_clipboard() or "").strip()
+        if not clip:
+            continue
+        seen = clip
+        if accept is None or accept(clip):
+            return clip, seen
+    return "", seen
+
+
+# ── The DOM attempt ledger ───────────────────────────────────────────────────
+# One canonical, greppable line per DOM attempt, plus a verdict at the end of
+# the run.
+#
+# Why a ledger and not just the prose already around each tier: those lines say
+# what happened at that moment, and they are correct. What they cannot do is
+# answer "did the DOM layer work this run?" — that needs someone to read
+# thousands of lines across three phases and correlate a setup step with the
+# vision mission that quietly rescued it two minutes later. The whole reason the
+# 2026-08 audit found three broken surfaces at once is that the answer had been
+# sitting in the corpus for months, spelled out in prose, unread.
+#
+#   grep '\[dom\]'          every attempt, one line each
+#   grep '\[dom-summary\]'  the verdict, and every miss with its evidence
+#
+# The field order is FIXED so two runs can be diffed against each other, and so
+# a miss can be counted rather than described.
+_DOM_ATTEMPTS: list = []
+
+# Outcomes that mean the DOM layer did the job. `already` counts: finding the
+# control on target and NOT touching it is the best possible result, not a
+# skipped attempt — treating it as a miss would make a healthy run look broken,
+# which is the reporting bug this ledger exists to stop repeating.
+_DOM_OK = ("already", "verified")
+
+
+def _dom_reset():
+    """Start a run with an empty ledger. Called where the run begins, so a
+    long-lived worker cannot carry the previous run's verdict into this one."""
+    _DOM_ATTEMPTS.clear()
+
+
+def _dom_note(intent: str, outcome: str, *, phase: int = 0, via: str = "",
+              press: str = "", ms=None, detail: str = "") -> str:
+    """Record one DOM attempt and echo it in the canonical shape.
+
+    `intent`   what was being achieved, e.g. "chatgpt.select_model" — the same
+               vocabulary as the self-heal contract, so a miss here names the
+               thing to go and fix.
+    `outcome`  one of the closed set in _DOM_OK plus: no_target, unverified,
+               unsure, missed, error.
+    `via`      which candidate hook answered — the next rotation is then a
+               one-line diagnosis instead of a hunt.
+    `press`    how the element was pressed (playwright / pointer / none).
+    `detail`   the evidence, on a miss. Kept short; the full dumps stay where
+               they are.
+
+    Returns `outcome` so a call site can be a single expression.
+    """
+    rec = {"phase": int(phase or 0), "intent": intent, "outcome": outcome,
+           "via": via or "", "press": press or "", "ms": ms,
+           "detail": (detail or "")[:400]}
+    _DOM_ATTEMPTS.append(rec)
+    bits = [f"[dom] p{rec['phase']} {intent}: {outcome}"]
+    if via:
+        bits.append(f"via={via}")
+    if press:
+        bits.append(f"press={press}")
+    if ms is not None:
+        try:
+            bits.append(f"ms={int(ms)}")
+        except Exception:
+            pass
+    if detail:
+        bits.append(f"— {rec['detail']}")
+    log(" ".join(bits), "INFO" if outcome in _DOM_OK else "WARN")
+    return outcome
+
+
+def _dom_summary(tag: str = "") -> dict:
+    """The verdict. Emitted at the end of the run, and safe to call twice.
+
+    Deliberately prints the MISSES in full even when everything else passed: a
+    summary that only counts is a summary nobody can act on, and acting on it is
+    the entire point of asking for it.
+    """
+    total = len(_DOM_ATTEMPTS)
+    ok = [r for r in _DOM_ATTEMPTS if r["outcome"] in _DOM_OK]
+    missed = [r for r in _DOM_ATTEMPTS if r["outcome"] not in _DOM_OK]
+    head = f"[dom-summary]{(' ' + tag) if tag else ''}"
+    if not total:
+        log(f"{head} no DOM attempts were recorded this run", "WARN")
+        return {"total": 0, "ok": 0, "missed": 0}
+    log(f"{head} {len(ok)}/{total} DOM intents handled without escalating "
+        f"({len(missed)} missed)", "INFO" if not missed else "WARN")
+    for r in _DOM_ATTEMPTS:
+        mark = "✓" if r["outcome"] in _DOM_OK else "✗"
+        line = (f"{head}   {mark} p{r['phase']} {r['intent']}: {r['outcome']}"
+                f"{(' via=' + r['via']) if r['via'] else ''}"
+                f"{(' press=' + r['press']) if r['press'] else ''}")
+        if r["detail"]:
+            line += f" — {r['detail']}"
+        log(line, "INFO" if r["outcome"] in _DOM_OK else "WARN")
+    if missed:
+        log(f"{head} each ✗ above is a place vision had to step in; the detail "
+            f"names what the page showed instead", "WARN")
+    return {"total": total, "ok": len(ok), "missed": len(missed)}
 
 
 # Canonical agent/platform key the frontend uses in details[<key>]. Matches the
@@ -3968,7 +4138,16 @@ def _grpc_write_with_heal(op, *, what: str):
             cause = (f"token/config deviceId MISMATCH ({tok_did!r} != {cfg_did!r}) — "
                      "write-side payload clause; force-refresh CANNOT fix, re-pair")
         else:
-            cause = "token+config deviceId AGREE — deviceOwnership / doc-deviceId mismatch"
+            # ⛔ This branch used to ASSERT "deviceOwnership / doc-deviceId
+            # mismatch", and it is the branch every denial in the live corpus
+            # lands in — 34 heals, all diagnosed as a document problem. Roughly
+            # half of them were then cleared by the re-mint two lines below,
+            # which a document mismatch cannot be. The deviceIds agreeing rules
+            # the payload clause OUT; it says nothing about what is left. Naming
+            # one of the survivors sent every reader at the wrong thing.
+            cause = ("token+config deviceId AGREE — the write-side payload clause is "
+                     "satisfied, so the denial is upstream of it; the retry below "
+                     "decides between a stale credential and a doc/ownership mismatch")
         # #728: this is a SELF-HEALING retry — on basically every run's first
         # user-tree write the freshly-minted/cached synth token lags the
         # deviceId-claim propagation (most often the `queued→ongoing` flip's
@@ -3986,24 +4165,50 @@ def _grpc_write_with_heal(op, *, what: str):
             f"force-refresh deviceId={healed_did!r}.",
             "INFO",
         )
+        # ⭐ The retry is the EXPERIMENT, so its result is the diagnosis. Both
+        # outcomes are logged, because "we attempted a heal" was all the corpus
+        # ever recorded: reconstructing whether any of 34 heals worked meant
+        # pairing timestamps against the caller's own degrade line by hand.
         try:
             result = op()  # retry with the freshly-minted token
             with _grpc_heal_lock:
                 _grpc_heal_consec_fail = 0
+            log(
+                f"[grpc-heal] {what}: cleared by the re-minted token — the cached "
+                f"credential was stale. The device doc and the deviceId claim were "
+                f"both fine.",
+                "INFO",
+            )
             return result
-        except Exception:
+        except Exception as _retry_e:
             with _grpc_heal_lock:
                 _grpc_heal_consec_fail += 1
-                if (_grpc_heal_consec_fail >= _GRPC_HEAL_STRUCTURAL_AFTER
-                        and not _grpc_heal_structural):
+                _consec = _grpc_heal_consec_fail
+                _latched = (_consec >= _GRPC_HEAL_STRUCTURAL_AFTER
+                            and not _grpc_heal_structural)
+                if _latched:
                     _grpc_heal_structural = True
                     log(
-                        f"[grpc-heal] STRUCTURAL: {_grpc_heal_consec_fail} consecutive "
+                        f"[grpc-heal] STRUCTURAL: {_consec} consecutive "
                         f"heals failed to clear the synth-user 403 ({cause}). A force-"
                         f"refresh cannot fix this — re-pair required. Suppressing further "
                         f"force-refreshes until a write succeeds.",
                         "ERROR",
                     )
+            if not _latched:
+                # ⚠ Per-occurrence, because the latch above almost never fires:
+                # `_grpc_heal_consec_fail` is global and reset by ANY successful
+                # write, and the heartbeat succeeds constantly — 16 unhealed
+                # denials in the live corpus produced ZERO structural latches. So
+                # this line is the only place an unhealed denial says what it
+                # ruled out. The latch policy is deliberately left alone; making
+                # it fire is a separate decision about telling a user to re-pair.
+                log(
+                    f"[grpc-heal] {what}: the re-minted token did NOT clear the "
+                    f"denial ({type(_retry_e).__name__}) — so a stale credential "
+                    f"was not the cause. Remaining: {cause}. This write degraded.",
+                    "WARN",
+                )
             raise
 
 
@@ -4024,6 +4229,11 @@ _version_publish_next_ms = 0
 # (see _consume_pending_update_result — the sentinel is deleted on read, so this is
 # belt-and-braces against a retry loop re-reading a file that is already gone).
 _update_result_published = False
+# While an upgrade helper is genuinely alive, the interim backend republishes an
+# "installing" status on this cadence. Slow on purpose: it exists so the app can
+# tell "still working" from "came back on the old version", not to animate a bar.
+_UPDATE_LIVE_REPUBLISH_MS = 20_000
+_update_live_next_ms = 0
 # #717 — per-worker liveness pulse, bumped every iteration of
 # _firebase_reconnect_loop (which runs on ALL workers). /api/health surfaces it
 # as `lastTickAt` so the supervisor watchdog can spot a wedged event loop on ANY
@@ -4569,6 +4779,7 @@ async def _heartbeat_loop():
     # rejects `global X` if X has already been read in this scope.
     global _last_heartbeat_at_ms, _heartbeat_failures, _firebase_db, _firebase_down_reason
     global _last_published_version_fields, _version_publish_next_ms
+    global _update_live_next_ms
     global _update_result_published
     while True:
         try:
@@ -4643,7 +4854,32 @@ async def _heartbeat_loop():
                     try:
                         _ur = await asyncio.to_thread(_consume_pending_update_result)
                         if _ur is None:
-                            _update_result_published = True  # nothing to report, ever
+                            # None means either "no update ever ran here" or "one is
+                            # still in flight". Only the FIRST may latch: an upgrade
+                            # whose waiter is still working is common on the CLI path
+                            # (the supervisor relaunches us while pipx runs), and
+                            # latching there would throw away the verdict we exist
+                            # to deliver.
+                            if not await asyncio.to_thread(_update_report_pending):
+                                _update_result_published = True  # nothing to report, ever
+                            else:
+                                # STILL WORKING. Say so, on a slow repeat. This
+                                # backend is the interim one the supervisor relaunched
+                                # on the OLD build while pipx runs, so from the app's
+                                # side the device is back, on the same version, still
+                                # advertising the same pending release — which is
+                                # indistinguishable from a failed update unless
+                                # something alive says otherwise. This is that
+                                # something.
+                                _live = await asyncio.to_thread(_update_in_flight)
+                                if _live and _now_ms >= _update_live_next_ms:
+                                    _update_live_next_ms = _now_ms + _UPDATE_LIVE_REPUBLISH_MS
+                                    await asyncio.to_thread(
+                                        _write_update_status, device_id,
+                                        {"state": "installing",
+                                         "current": _live.get("current") or "",
+                                         "latest": _live.get("latest") or "",
+                                         "reason": ""})
                         elif await asyncio.to_thread(_write_update_status, device_id, _ur):
                             # Only NOW is it safe to drop the sentinel and stop trying:
                             # it was the only copy of this outcome.
@@ -4984,7 +5220,7 @@ def _consume_pending_update_result() -> "dict | None":
     Never raises — a bad sentinel must not block startup."""
     try:
         if not _UPDATE_RESULT_PATH.exists():
-            return None
+            return _update_intent_verdict()
     except Exception:
         return None
     raw: dict = {}
@@ -4999,22 +5235,45 @@ def _consume_pending_update_result() -> "dict | None":
         return None
     running = _sr_version()
     want = (raw.get("latest") or "").strip()
-    was = (raw.get("current") or "").strip()
     rc = raw.get("rc")
     if rc == 0:
-        # pipx succeeded. Confirm against the version we're actually RUNNING rather
-        # than trusting the exit code: a clean upgrade whose restart leg never landed
-        # leaves the old build in memory, so the new files are on disk but the process
-        # serving the app is still the old one. Report that as installed-but-
-        # NEEDS-RESTART rather than a flat failure — the upgrade did land, and the
-        # remedy is a restart, which is exactly what the app's fallback Restart button
-        # issues (the `restart` device command).
-        if want and running == was and want != was:
-            return {"state": "installed", "current": running, "latest": want,
+        # pipx succeeded. Whether a RESTART is still owed is a question about the
+        # process answering the app, and that process is this one — the heartbeat
+        # that publishes this verdict is worker 1's — so it is asked of our own
+        # boot version.
+        #
+        # It used to be asked of `_sr_version()`, which reads wheel metadata off
+        # DISK. That is the new version the instant pipx finishes, in this very
+        # process, so `running == was` could never be true and the needs-restart
+        # branch was unreachable: every upgrade whose restart leg never ran
+        # reported "Updated ✓", the About row then published the new number, and
+        # the machine served the old build with nothing anywhere saying so. The
+        # fallback Restart button renders on this verdict alone, so it was dead
+        # code too.
+        served = _serving_version()
+        if want and served == want:
+            return {"state": "installed", "current": served,
+                    "latest": want, "needsRestart": False, "reason": ""}
+        # The waiter cycles the supervisor AFTER writing this sentinel, so a read
+        # landing in that window would see the old build and cry restart at a
+        # restart already in progress. `restarting` records whether a cycle was
+        # even issued; while one is and it is young, there is nothing to report
+        # yet — the sentinel stays put and the next heartbeat asks again.
+        # `0 <=` on purpose. A bare `< SETTLE` is satisfied by any NEGATIVE age,
+        # so a clock stepped backwards between the waiter's write and this read —
+        # an NTP correction, a VM snapshot restore — would suppress the outcome on
+        # every tick forever, and nothing else re-reads it to a conclusion.
+        _settling = int(time.time() * 1000) - _rec_at(raw)
+        if raw.get("restarting") and 0 <= _settling < _RESTART_SETTLE_MS:
+            return None
+        if want and served and served != want:
+            return {"state": "installed", "current": served, "latest": want,
                     "needsRestart": True,
                     "reason": f"v{want} is installed but the backend is still running "
-                              f"v{running} — restart it to finish"}
-        return {"state": "installed", "current": running,
+                              f"v{served} — restart it to finish"}
+        # No live marker to read (nothing serving yet, or a stale one): the files
+        # landed and we cannot say more than that.
+        return {"state": "installed", "current": served or running,
                 "latest": want or running, "needsRestart": False, "reason": ""}
     # Nonzero exit — surface the real pipx error, not just "failed". The tail is what
     # names the actual cause (e.g. a uv backend that couldn't be resolved).
@@ -5026,13 +5285,175 @@ def _consume_pending_update_result() -> "dict | None":
             "reason": reason}
 
 
+def _update_report_pending() -> bool:
+    """Whether an app-driven update still owes the app an answer — a result the
+    publish hasn't landed yet, or a launch record whose waiter is still working.
+    The heartbeat uses it to tell "nothing to report" apart from "not yet"; getting
+    those two confused is how a verdict gets dropped on the floor."""
+    for p in (_UPDATE_RESULT_PATH, _UPDATE_INTENT_PATH):
+        try:
+            if p.exists():
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _discard_update_intent() -> None:
+    """Drop ONLY the launch record.
+
+    For the caller that is about to replace it and has no business touching the
+    result sentinel — that sentinel is the single copy of an outcome, and there
+    are windows in which it holds one the app has not been shown yet."""
+    try:
+        _UPDATE_INTENT_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def _discard_pending_update_result() -> None:
-    """Drop the waiter's sentinel. Split from the read so the outcome is only thrown
-    away once the app has actually been told (see _consume_pending_update_result)."""
+    """Drop the waiter's sentinel AND the launch record. Split from the read so the
+    outcome is only thrown away once the app has actually been told (see
+    _consume_pending_update_result). Both go together: leaving the intent behind
+    would republish the same update as a failure on the next startup."""
     try:
         _UPDATE_RESULT_PATH.unlink(missing_ok=True)
     except Exception:
         pass
+    _discard_update_intent()
+
+
+# How long after the waiter is gone we still give the machine before calling an
+# unreported update dead. Covers the ordinary case where the waiter's restart leg
+# has cycled the supervisor and this process came up before the result file's write
+# was visible — small, because the waiter writes it BEFORE the restart.
+_UPDATE_INTENT_GRACE_MS = 30_000
+
+# How long a `--then--` restart leg gets to cycle the supervisor before its absence
+# counts as "it never happened". The sentinel is written BEFORE the restart is
+# issued, so without this every successful update would flash a Restart button
+# during the seconds the cycle takes.
+_RESTART_SETTLE_MS = 90_000
+
+# Past this, a launch record's `waiter_pid` is a number rather than a process, and
+# is not believed however alive that number looks. Generous on purpose — the point
+# is to bound pid REUSE, not to time-limit an upgrade — and the same eight hours the
+# worker lock already uses for the identical hazard. A record older than this is
+# treated as abandoned so the real verdict finally gets published.
+_UPDATE_INTENT_MAX_AGE_MS = _WORKER_LOCK_PID_REUSE_MAX_AGE_MS
+
+
+def _read_update_intent() -> "dict | None":
+    """The launch record for an in-flight/just-finished upgrade, or None. A record
+    that is unreadable or isn't an upgrade is DELETED here rather than returned —
+    there is nothing publishable in it and it must not be re-read forever."""
+    try:
+        if not _UPDATE_INTENT_PATH.exists():
+            return None
+        raw = json.loads(_UPDATE_INTENT_PATH.read_text(encoding="utf-8")) or {}
+        if isinstance(raw, dict) and raw.get("action") == "upgrade":
+            return raw
+    except Exception:
+        pass
+    try:
+        _UPDATE_INTENT_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return None
+
+
+def _rec_at(raw: dict) -> int:
+    """A record's `at` stamp in ms, or 0 when it is anything but a number.
+
+    `int(raw.get("at") or 0)` looks equivalent and is not: `_read_update_intent`
+    only deletes records that fail to PARSE, so `{"action": "upgrade",
+    "at": "soon"}` survives it and that expression raises ValueError. The heartbeat
+    swallows the exception and returns None while `_update_report_pending()` stays
+    true, so the verdict is never published, never latched, and the record is never
+    deleted — on every tick and every boot, forever. 0 is the recovering answer:
+    it ages the record straight past every ceiling, so the verdict publishes and
+    the record is cleaned up."""
+    at = raw.get("at")
+    return at if isinstance(at, int) and not isinstance(at, bool) else (
+        int(at) if isinstance(at, float) else 0)
+
+
+def _update_in_flight() -> "dict | None":
+    """The launch record of an upgrade whose helper is STILL RUNNING, else None.
+
+    "Still running" is process liveness, not elapsed time. The pid is stamped by
+    the waiter itself — the spawner's `Popen.pid` names the `systemd-run`
+    front-end on Linux, which exits in milliseconds — so an unclaimed record means
+    nothing ever picked the work up, which is a failure rather than progress.
+
+    But liveness alone is a claim about a NUMBER, and numbers get reused. A record
+    left behind by a waiter that was killed (the machine slept, the box was
+    rebooted because the row looked stuck, an AV product took the detached python)
+    keeps naming a pid that Windows in particular hands out again within minutes.
+    Believing it forever is not a stalled update, it is a wedged machine: the real
+    verdict is never published, the heartbeat pulses "installing" every 20s, that
+    pulse is exactly what tells the app to keep trusting the backend, and every
+    later Update tap is answered "one is already running". Nothing but deleting the
+    file by hand recovers.
+
+    So the pid is only believed while the record is young enough for the pid to
+    still plausibly be the same process. This is the same guard, and the same
+    reasoning, as the worker lock's pid-reuse ceiling."""
+    raw = _read_update_intent()
+    if not raw:
+        return None
+    pid = raw.get("waiter_pid")
+    if not (isinstance(pid, int) and pid > 0 and _pid_alive(pid)):
+        return None
+    age = int(time.time() * 1000) - _rec_at(raw)
+    return raw if age <= _UPDATE_INTENT_MAX_AGE_MS else None
+
+
+def _update_intent_verdict() -> "dict | None":
+    """The outcome when the waiter left NO result at all.
+
+    A waiter that ran and failed writes a result; this covers the waiter that never
+    got to. It is not hypothetical — the oldest instances of "clicked Update,
+    nothing happened" are five commands whose worker was killed mid-launch, so
+    there was no pipx run, no log line, and nothing on the device doc. The app spun
+    until its own timeout and the user was told nothing.
+
+    Liveness, not a timer, decides. While the waiter's process is alive the upgrade
+    is simply still going, however long it takes — an elapsed-time rule would have
+    to be longer than the slowest legitimate install (so it reports nothing useful)
+    or shorter (so it reports failures that aren't). Once the process is GONE and
+    no result exists, the question is settled, and two different versions answer
+    two different halves of it: what is INSTALLED says whether the files landed,
+    and what is SERVING says whether anything picked them up. This function reached
+    for the installed one alone, and since that is already the new version the
+    moment pipx finishes, it reported `needsRestart: False` for the one case it
+    exists to describe — a waiter killed after the install and before the restart,
+    where the restart provably never ran.
+
+    Never raises — this runs on the heartbeat path."""
+    raw = _read_update_intent()
+    if not raw:
+        return None
+    if _update_in_flight():
+        return None  # still upgrading — say nothing rather than guess
+    if int(time.time() * 1000) - _rec_at(raw) < _UPDATE_INTENT_GRACE_MS:
+        return None
+    installed = _sr_version()
+    served = _serving_version()
+    want = (raw.get("latest") or "").strip()
+    was = (raw.get("current") or "").strip()
+    if want and installed == want:
+        # The files landed. The waiter died without reporting, so its restart leg
+        # never ran either — if something is still serving the old build, say so
+        # instead of calling it done.
+        needs = bool(served and served != want)
+        return {"state": "installed", "current": served or installed, "latest": want,
+                "needsRestart": needs,
+                "reason": (f"v{want} is installed but the backend is still running "
+                           f"v{served} — restart it to finish") if needs else ""}
+    return {"state": "failed", "current": served or installed, "latest": want or None,
+            "reason": "the background upgrade stopped without reporting back"
+                      + (f" — still on v{was}" if was and installed == was else "")}
 
 
 def _handle_check_update_command(device_id: str) -> None:
@@ -5088,6 +5509,29 @@ def _handle_update_command(data: dict, device_id: str, loop) -> None:
                                          "latest": None, "reason": "not the device owner"})
         return
 
+    # 1b. ALREADY RUNNING. Two clicks three minutes apart is what actually happened
+    #     on 2026-07-27 (two Firestore command docs, two upgrades), and it is the
+    #     natural response to a row that looks stuck. A second attempt clears the
+    #     first one's launch record and result sentinel and races a second pipx over
+    #     the same venv — so the first waiter's outcome, when it lands, is published
+    #     as the second attempt's. Answer the click instead of acting on it.
+    #
+    #     `force` overrides it, and that is not a convenience. Everything this guard
+    #     rests on — a pid that is alive and a record that is young — can be true of
+    #     a process that is not ours, and when it is, this branch answers every
+    #     future update with "one is already running" and nothing the user can reach
+    #     changes that. "Update anyway" is the escape, so it is read BEFORE the
+    #     guard rather than three steps after it.
+    _forced = bool(data.get("force"))
+    if (_live := _update_in_flight()) and not _forced:
+        log("[device-cmds] UPDATE: one is already running — reporting progress "
+            "instead of starting a second")
+        _write_update_status(device_id, {
+            "state": "installing", "current": _live.get("current") or cur,
+            "latest": _live.get("latest") or None, "reason": ""})
+        return
+    _clear_stuck_record = bool(_live and _forced)
+
     # 2. Supervised-only: the upgrade kills THIS worker + the daemon-loop, so an OS
     #    supervisor (Scheduled Task / launchd / systemd) must exist to relaunch the
     #    BE on the rebuilt venv. Check that artifact directly — it's the source of
@@ -5104,7 +5548,7 @@ def _handle_update_command(data: dict, device_id: str, loop) -> None:
     #    gates the defer decision; `local_busy` is THIS worker's own run — the only
     #    one we can stop gracefully (sibling workers are separate processes,
     #    terminated by the venv rebuild like any update).
-    force = bool(data.get("force"))
+    force = _forced
     local_busy = bool(_QUEUE_STATE.get("running"))
     try:
         _qr = _QUEUE_STATE.get("queue_ref")
@@ -5118,6 +5562,19 @@ def _handle_update_command(data: dict, device_id: str, loop) -> None:
         _write_update_status(device_id, {"state": "deferred", "current": cur,
                                          "latest": None, "reason": "a research run is in progress"})
         return
+
+    # Only NOW clear the record the force overrode — past every guard that can
+    # still decline, and immediately before the spawn that replaces it. Clearing
+    # it up at the guard looked equivalent and was not: on a path that then
+    # refuses (unsupervised, or a run in progress) it would have thrown away a
+    # record with nothing put in its place. And only the LAUNCH record: the result
+    # sentinel is the single copy of an outcome, and during the restart settle
+    # window — 90 seconds in which the app is deliberately shown nothing, which is
+    # exactly when someone taps "Update anyway" — an unpublished success is
+    # sitting in it.
+    if _clear_stuck_record:
+        log("[device-cmds] UPDATE: forced past an in-flight record — discarding it")
+        _discard_update_intent()
 
     # Decide + spawn the detached upgrade (does NOT print / exit — we own the exit).
     # restart_after: unlike the CLI (where the user runs `--restart`), the app has
@@ -11112,14 +11569,33 @@ async def _chatgpt_extended_pro_confirm(page) -> str:
 
     Excludes [role=menu|listbox|dialog] descendants so an OPEN model-picker
     listing 'Instant'/'Pro'/'Auto' OPTIONS can't be misread as the active mode
-    (mirrors the Claude model-trigger read)."""
+    (mirrors the Claude model-trigger read).
+
+    ⭐ (2026-08-01) NO MODEL NAME OR VERSION. The word sets come from
+    models.P1_MODEL_POLICY so a platform rename is one policy edit with a test,
+    not a regex buried in this page.evaluate string. ⚠ Deliberately NOT loosened
+    while moving them: the high-effort marker still requires a thinking word AND
+    a tier word in the SAME short element. Accepting a bare thinking word would
+    make a future free-tier 'Extended' mode read as success — exactly the
+    silent-downgrade this function exists to catch. What changed is that the two
+    words no longer have to appear in the frozen order 'Extended Pro', so
+    'Pro Reasoning' or 'Pro (extended)' keeps working."""
+    _p1 = {k: p1_words("chatgpt", k) for k in
+           ("tier_words", "thinking_words", "downgrade_words", "upgrade_verbs")}
     try:
-        res = await page.evaluate("""() => {
+        res = await page.evaluate("""(P) => {
             const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
             const vis = el => el.getClientRects().length > 0;
             const inOverlay = el => !!el.closest('[role="menu"], [role="listbox"], [role="dialog"]');
-            const verbRe = /\\b(upgrade|subscribe|get|try)\\b/i;
-            const extRe = /extended\\s*pro/i;
+            // Word-set helpers. Split on non-word chars and compare TOKENS rather
+            // than building a RegExp per word: a lone \\b inside a non-raw Python
+            // string once became a literal backspace and silently disabled a gate
+            // for months (the #913 note), and this string is interpolated.
+            const toks = s => norm(s).toLowerCase().split(/[^a-z0-9+]+/).filter(Boolean);
+            const anyOf = (s, words) => { const t = toks(s); return (words || []).some(w => t.indexOf(w) !== -1); };
+            const hasVerb = s => anyOf(s, P.upgrade_verbs);
+            // A high-effort marker = a thinking word AND a tier word together.
+            const isMark = s => anyOf(s, P.thinking_words) && anyOf(s, P.tier_words) && !hasVerb(s);
             // The model / thinking-mode trigger button (NOT the menu items).
             const clickables = [...document.querySelectorAll('button, [role="button"]')]
                 .filter(el => vis(el) && !inOverlay(el));
@@ -11130,18 +11606,51 @@ async def _chatgpt_extended_pro_confirm(page) -> str:
             });
             const trigText = mtrig ? norm(mtrig.textContent) : '';
             const trig = trigText.toLowerCase();
-            // 'Extended Pro' marker anywhere in the page chrome (a short chip/pill,
-            // not a paragraph, not inside an open menu/overlay).
-            const extMark = [...document.querySelectorAll('*')]
+            // ⛔ SCOPED, never widened. The mode marker is COMPOSER CHROME — the
+            // model/effort pill, or the trigger itself. Scanning
+            // document.querySelectorAll('*') let any short text on the page
+            // satisfy the two-word rule: a sidebar conversation titled "Pro
+            // reasoning tips" is 18 chars, visible, outside every overlay, and
+            // carries a thinking word AND a tier word, so the confirm answered
+            // 'extended' while Instant/Auto was the live mode. Masking a real
+            // downgrade is the one failure this function exists to prevent, and
+            // a false 'extended' is strictly worse than no marker at all — with
+            // no marker we still fall through to the trigger's own evidence.
+            // Ordered candidate roots, most specific first.
+            const markRoots = [];
+            if (mtrig) markRoots.push(mtrig);
+            // Reach the composer FROM the composer. `document.querySelector('form')`
+            // returns the page's FIRST form, which on a chat page is as likely to
+            // be a sidebar search box as the thing holding the model pill — the
+            // same "first match in document order" mistake the scoping is fixing.
+            // Ordered candidates: the prompt box's own form, then its nearest
+            // form-ish ancestor, then any form at all.
+            const promptBox = document.querySelector(
+                '#prompt-textarea, [contenteditable="true"], textarea');
+            const composer = (promptBox && promptBox.closest('form'))
+                || (promptBox && promptBox.closest('[data-type="unified-composer"], [class*="composer" i]'))
+                || document.querySelector('form');
+            if (composer) markRoots.push(composer);
+            const seenMark = new Set();
+            const markCands = [];
+            for (const root of markRoots) {
+                for (const el of [root, ...root.querySelectorAll(
+                        'button, [role="button"], [role="radio"], span, div, p')]) {
+                    if (seenMark.has(el)) continue;
+                    seenMark.add(el);
+                    markCands.push(el);
+                }
+            }
+            const extMark = markCands
                 .filter(el => vis(el) && !inOverlay(el))
                 .find(el => {
                     const t = norm(el.textContent);
                     if (!t || t.length > 24) return false;
-                    return extRe.test(t);
+                    return isMark(t);
                 });
-            const hasExtended = extRe.test(trigText) || !!extMark;
-            const hasPro = /\\b(pro|plus)\\b/.test(trig) && !verbRe.test(trig);
-            const hasInstant = /\\b(instant|auto|fast|standard)\\b/.test(trig);
+            const hasExtended = isMark(trigText) || !!extMark;
+            const hasPro = anyOf(trig, P.tier_words) && !hasVerb(trig);
+            const hasInstant = anyOf(trig, P.downgrade_words);
             return { trigText: trigText.slice(0, 50), hasExtended, hasPro, hasInstant,
                      extText: extMark ? norm(extMark.textContent).slice(0, 40) : '',
                      // #766: dump the marker's tag + class so the next E2E can
@@ -11151,7 +11660,7 @@ async def _chatgpt_extended_pro_confirm(page) -> str:
                      extTag: extMark ? (extMark.tagName || '').toLowerCase() : '',
                      extCls: extMark ? norm((extMark.className && extMark.className.toString)
                          ? extMark.className.toString() : '').slice(0, 80) : '' };
-        }""")
+        }""", _p1)
     except Exception as e:
         log(f"[p1:extended_pro_confirm] DOM read failed: {e}", "INFO")
         return "unsure"
@@ -11232,6 +11741,593 @@ _CHATGPT_FOCUS_COMPOSER_END_JS = r"""() => {
     } catch (e) {}
     return { ok: true, textLen };
 }"""
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ChatGPT DOM tier — the `builtin` rung of the self-heal contract
+# ─────────────────────────────────────────────────────────────────────────────
+# Two intents live here: `chatgpt.select_model` (the effort tier) and
+# `chatgpt.enable_deep_research` (the composer tool). Both follow the same
+# three-step shape the design rule asks for:
+#
+#   1. READ FIRST. If the outcome already holds, do nothing — a click on an
+#      already-selected control is not a no-op on this platform (clicking the
+#      selected Deep Research ADDS A SECOND ONE).
+#   2. ORDERED CANDIDATE HOOKS, each verified before it is used. Never a widened
+#      selector: widening is what let a sidebar title satisfy the P1 high-effort
+#      confirm, and here it would let ChatGPT's SUGGESTION STRIP — chips that
+#      mimic the tool names with different text ("Search the web" vs the menu's
+#      "Web search") and a different class — absorb the click while the tool is
+#      silently never enabled.
+#   3. VERIFY THE OUTCOME, never the click. `el.click()` returning without
+#      throwing proves only that an element existed.
+#
+# Hooks below are the ones observed on the live composer 2026-08-02, ordered
+# most-durable-first (role/name/testid before class, per the self-heal contract's
+# strategy ranking).
+# ═════════════════════════════════════════════════════════════════════════════
+
+# The model/effort trigger. `__composer-pill` is the only hook the live capture
+# gave us, and it is a CLASS — the weakest, most rotation-prone signal there is —
+# so it sits LAST, behind two semantic patterns that cost nothing to try.
+_CHATGPT_MODEL_TRIGGER_GROUPS = [
+    {"name": "testid", "sel": 'button[data-testid*="model" i], [role="button"][data-testid*="model" i]'},
+    {"name": "aria", "sel": 'button[aria-label*="model" i], [role="button"][aria-label*="model" i]'},
+    {"name": "pill", "sel": 'button.__composer-pill, [role="button"].__composer-pill'},
+]
+
+# The model menu's rows. Captured as `menuitemradio` (Instant 5.5 / Medium /
+# High / Extra High / Pro) with a `menuitem` "other models" entry beneath them.
+#
+# ⚠ ORDERED, not merged, and the trade-off is deliberate. Merging the two would
+# make the pick survive an effort row that turned into a plain `menuitem` — but
+# it would also put the "other models" ENTRY in the same ranking pool as the
+# effort tiers, where a submenu opener called something like "GPT-5.6 Pro" both
+# names the tier and carries a version, so it would outrank the real `Pro` row
+# and be clicked to open a submenu rather than select anything. The capture says
+# the effort rows are radios; keeping them in their own first group follows the
+# capture, and the cost of being wrong is one wasted DOM pass before the
+# Vision/CUA rung runs exactly as it does today.
+#
+# The third group is the tools menu's lesson brought over: that overlay's rows
+# turned out to be plain DIVs whose ONLY hook is `__menu-item`, and the same
+# component library renders both menus. It sits LAST because a role is a more
+# durable signal than a class whenever a role is present — and it can only ever
+# be reached when neither role group matched anything at all, which is precisely
+# the state the live log recorded.
+_CHATGPT_MODEL_ROW_GROUPS = [
+    {"name": "radio", "sel": '[role="menuitemradio"]'},
+    {"name": "menuitem", "sel": '[role="menuitem"], [role="option"]'},
+    {"name": "menu-item-class", "sel": ".__menu-item"},
+]
+
+# The tools ("+") menu's rows. ⭐ The capture is why this list starts with a
+# class: the rows are plain DIVs with NO role, NO aria-label and NO data-testid,
+# and the menu is not in a portal, not `[role=menu]`, not `[data-state=open]`.
+# The previous selector set was role-based only, so it could not match a single
+# row and Step 2 had been falling through to the CUA fallback on every run.
+# `button, a, li` is deliberately NOT in here: those are what the suggestion
+# strip is made of.
+_CHATGPT_TOOL_ROW_GROUPS = [
+    {"name": "menu-item-class", "sel": ".__menu-item"},
+    {"name": "role", "sel": '[role="menuitemradio"], [role="menuitem"], [role="option"]'},
+]
+
+# Read the model/effort trigger's own label. Returns {found, via, text}.
+#
+# ⛔ `avoid` is a SAFETY exclusion, not a convenience one. The Deep-Research pill
+# and the model pill are both `__composer-pill` buttons sitting side by side in
+# the composer, and clicking the DR pill does not open a menu — it ADDS A SECOND
+# DEEP RESEARCH. There is no structural discriminator between them in the capture
+# (same tag, same class, same parent), so the tool's own policy label is the only
+# thing that tells them apart, and getting it wrong is destructive rather than
+# merely unhelpful. The word comes from P2_MODEL_POLICY, never a literal.
+_CHATGPT_MODEL_TRIGGER_JS = r"""(P) => {
+    const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+    const vis = el => el.getClientRects().length > 0 || !!el.offsetParent;
+    const inOverlay = el => !!el.closest('[role="menu"], [role="listbox"], [role="dialog"]');
+    const avoid = (P.avoid || '').toLowerCase();
+    for (const g of (P.groups || [])) {
+        for (const el of document.querySelectorAll(g.sel)) {
+            if (!vis(el) || inOverlay(el)) continue;
+            const t = norm(el.textContent);
+            // A trigger is a short chip. The cap also keeps a wrapper whose
+            // textContent concatenates the whole composer from posing as one.
+            if (!t || t.length > 40) continue;
+            if (avoid && t.toLowerCase().indexOf(avoid) !== -1) continue;
+            return { found: true, via: g.name, text: t.slice(0, 60) };
+        }
+    }
+    return { found: false, via: '', text: '' };
+}"""
+
+# The attribute the marker below stamps on the element Python is about to click.
+# It exists because the SEARCH has to happen in JS — the ordered hook groups and
+# the `avoid` guard live there — while the CLICK has to happen in Playwright.
+_SR_CLICK_MARK = "data-sr-click-target"
+
+# Mark the model trigger for a REAL click. Same search as the read above.
+#
+# ⭐ 2026-08-04, from the one live attempt in the corpus: the old version ended
+# `try { el.click(); } ... return { opened: true }` — and reported `opened` for a
+# menu that never opened, because a synthetic el.click() dispatches a click event
+# and nothing else. ChatGPT's composer menus are React overlays whose trigger
+# listens on POINTERDOWN; a click event alone never reaches that handler. The log
+# reads exactly that way: "opening the model menu" then "did not mount any rows",
+# one second apart, and Vision had to do the work.
+#
+# The tools menu two steps away has never had this problem, and the difference is
+# the whole diagnosis: it locates its button with page.query_selector and clicks
+# it with Playwright — a real, trusted press. This marks the element so the same
+# real press can be aimed at a trigger that only JS can safely identify.
+#
+# It also violated the rule written at the top of this block in its own words:
+# step 3, verify the OUTCOME, never the click. `el.click()` returning without
+# throwing proves only that an element existed.
+_CHATGPT_MARK_MODEL_TRIGGER_JS = r"""(P) => {
+    const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+    const vis = el => el.getClientRects().length > 0 || !!el.offsetParent;
+    const inOverlay = el => !!el.closest('[role="menu"], [role="listbox"], [role="dialog"]');
+    const avoid = (P.avoid || '').toLowerCase();
+    for (const el of document.querySelectorAll('[' + P.attr + ']')) {
+        el.removeAttribute(P.attr);
+    }
+    for (const g of (P.groups || [])) {
+        for (const el of document.querySelectorAll(g.sel)) {
+            if (!vis(el) || inOverlay(el)) continue;
+            const t = norm(el.textContent);
+            if (!t || t.length > 40) continue;
+            if (avoid && t.toLowerCase().indexOf(avoid) !== -1) continue;
+            el.setAttribute(P.attr, P.value);
+            return { marked: true, via: g.name, text: t.slice(0, 60),
+                     expanded: el.getAttribute('aria-expanded') };
+        }
+    }
+    return { marked: false, via: '', reason: 'no_trigger' };
+}"""
+
+# Take the marker back off. Always runs, so a failed click cannot leave a stray
+# attribute for the next pass to aim at.
+_SR_UNMARK_JS = r"""(P) => {
+    let n = 0;
+    for (const el of document.querySelectorAll('[' + P.attr + ']')) {
+        el.removeAttribute(P.attr); n++;
+    }
+    return n;
+}"""
+
+# The last-resort press: the full pointer chain, dispatched at the element's own
+# centre. Same technique as the activity-panel opener, and for the same reason —
+# it is what reaches a handler bound to pointerdown. Used only when Playwright
+# could not click the marked element at all (detached, covered, off-screen).
+_SR_POINTER_PRESS_JS = r"""(P) => {
+    const el = document.querySelector('[' + P.attr + ']');
+    if (!el) return { pressed: false, reason: 'marker_gone' };
+    const r = el.getBoundingClientRect();
+    const x = r.left + r.width / 2, y = r.top + r.height / 2;
+    const opts = { bubbles: true, cancelable: true, view: window,
+                   clientX: x, clientY: y, button: 0 };
+    try {
+        el.dispatchEvent(new MouseEvent('pointerdown', opts));
+        el.dispatchEvent(new MouseEvent('mousedown', opts));
+        el.dispatchEvent(new MouseEvent('pointerup', opts));
+        el.dispatchEvent(new MouseEvent('mouseup', opts));
+        el.dispatchEvent(new MouseEvent('click', opts));
+    } catch (e) { return { pressed: false, reason: 'dispatch_threw' }; }
+    return { pressed: true };
+}"""
+
+# What was actually on screen when no row could be found. Item-9's lesson applied
+# one surface over: "the menu did not mount any rows" names no cause, and the
+# next person to look at it has to guess between a rotated hook, a menu that
+# never opened, and a menu that opened somewhere this search cannot see.
+_CHATGPT_MENU_DIAG_JS = r"""(P) => {
+    const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+    const per = [];
+    for (const g of (P.groups || [])) {
+        let all = 0, shown = 0;
+        for (const el of document.querySelectorAll(g.sel)) {
+            all++;
+            if (el.offsetParent) shown++;
+        }
+        per.push({ name: g.name, all: all, visible: shown });
+    }
+    const overlays = [];
+    for (const sel of ['[role="menu"]', '[role="listbox"]',
+                       '[data-radix-popper-content-wrapper]',
+                       '[data-state="open"]', '.__menu-item']) {
+        const n = document.querySelectorAll(sel).length;
+        if (n) overlays.push(sel + '=' + n);
+    }
+    let expanded = null;
+    const marked = document.querySelector('[' + P.attr + ']');
+    if (marked) expanded = marked.getAttribute('aria-expanded');
+    const sample = [];
+    for (const el of document.querySelectorAll(
+            '[role="menu"] *, [data-radix-popper-content-wrapper] *, .__menu-item')) {
+        if (!el.offsetParent) continue;
+        const t = norm(el.textContent);
+        if (!t || t.length > 60) continue;
+        if (sample.indexOf(t) === -1) sample.push(t);
+        if (sample.length >= 8) break;
+    }
+    return { per: per, overlays: overlays, expanded: expanded, sample: sample };
+}"""
+
+# Snapshot a menu's VISIBLE rows through the ordered hook groups. The first group
+# that yields any row wins, and its name comes back so the log records which hook
+# the live UI answered on (the next rotation is then a one-line diagnosis).
+_CHATGPT_MENU_ROWS_JS = r"""(P) => {
+    const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+    for (const g of (P.groups || [])) {
+        const rows = [];
+        for (const el of document.querySelectorAll(g.sel)) {
+            if (!el.offsetParent) continue;
+            const t = norm(el.textContent);
+            if (!t) continue;
+            rows.push(t.slice(0, 120));
+        }
+        if (rows.length) return { via: g.name, rows };
+    }
+    return { via: '', rows: [] };
+}"""
+
+# Click one snapshotted row. Ranking happens in python BETWEEN two evaluates, so
+# the index is re-resolved here against the same filter and the label is
+# re-checked before the click: if the menu re-rendered in that gap the index now
+# points at a different row, and clicking by position alone is exactly the
+# mis-click the leaf/wrapper work was about. IDENTITY DECIDES, not position.
+#
+# 2026-08-04: this MARKS the row rather than clicking it, for the same reason the
+# trigger does — the press itself is a real Playwright click. A menu row is the
+# safer of the two cases (React's onClick does see a synthetic click event), but
+# leaving one of a pair of presses synthetic means the next miss has two possible
+# explanations again, and the identity re-check below is unaffected either way.
+_CHATGPT_CLICK_ROW_JS = r"""(P) => {
+    const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+    for (const el of document.querySelectorAll('[' + P.attr + ']')) {
+        el.removeAttribute(P.attr);
+    }
+    const g = (P.groups || []).filter(x => x.name === P.via)[0];
+    if (!g) return { clicked: false, reason: 'group_gone' };
+    const rows = [];
+    for (const el of document.querySelectorAll(g.sel)) {
+        if (!el.offsetParent) continue;
+        if (!norm(el.textContent)) continue;
+        rows.push(el);
+    }
+    const el = rows[P.index];
+    if (!el) return { clicked: false, reason: 'index_gone' };
+    const t = norm(el.textContent).slice(0, 120);
+    if (t !== P.expect) return { clicked: false, reason: 'label_changed', text: t.slice(0, 60) };
+    el.setAttribute(P.attr, P.value);
+    return { clicked: true, text: t.slice(0, 60) };
+}"""
+
+
+async def _sr_real_click(page, value: str, *, tag: str, timeout_ms: int = 4000,
+                         hover_first: bool = False) -> str:
+    """Press the element the JS just marked, the way a person would.
+
+    Returns 'playwright' | 'pointer' | '' — the technique that landed, so the
+    log records which rung answered and a rotation is a one-line diagnosis.
+
+    Ordered, and the order is the point. Playwright's click is a TRUSTED press
+    at real coordinates: it scrolls the element into view, waits for it to be
+    actionable, and produces the full pointerdown/mouseup/click sequence a React
+    overlay's trigger is listening for. The dispatched chain below reaches a
+    handler too, but it cannot scroll, cannot wait, and is not trusted — so it is
+    the fallback, not the default.
+
+    The marker is always removed, including when the press throws: a stray
+    attribute left on the page is something the NEXT pass would aim at.
+    """
+    sel = f'[{_SR_CLICK_MARK}="{value}"]'
+    how = ""
+    try:
+        if hover_first:
+            # A SUBMENU trigger is opened by the pointer arriving on it, not by a
+            # press — that is how the component library implements a nested menu,
+            # and it is why Claude's Effort submenu answered "Max not found" nine
+            # times in the corpus while reporting that it had been clicked. A real
+            # hover costs nothing when the control also responds to a click.
+            try:
+                await page.hover(sel, timeout=timeout_ms)
+                await asyncio.sleep(0.25)
+            except Exception as _he:
+                log(f"{tag} hover on the marked element failed "
+                    f"({type(_he).__name__})", "DEBUG")
+        try:
+            await page.click(sel, timeout=timeout_ms)
+            how = "playwright"
+        except Exception as _pe:
+            log(f"{tag} real click on the marked element failed ({type(_pe).__name__}) "
+                f"— falling back to a dispatched pointer chain", "INFO")
+            try:
+                res = await page.evaluate(_SR_POINTER_PRESS_JS,
+                                          {"attr": _SR_CLICK_MARK})
+                if isinstance(res, dict) and res.get("pressed"):
+                    how = "pointer"
+                else:
+                    log(f"{tag} pointer chain did not press "
+                        f"(reason={(res or {}).get('reason')})", "INFO")
+            except Exception as _de:
+                log(f"{tag} pointer chain errored ({_de})", "INFO")
+    finally:
+        try:
+            await page.evaluate(_SR_UNMARK_JS, {"attr": _SR_CLICK_MARK})
+        except Exception:
+            pass
+    return how
+
+
+def _p1_tier_mission() -> str:
+    """The one-line USER message that rides alongside PROMPT_SELECT_PRO.
+
+    It said "Select ChatGPT Pro model with Extended Thinking" — a third copy of
+    the phantom-toggle instruction, sitting right next to the system prompt that
+    had just been cleaned of it, and the one the agent reads LAST. The caller
+    greps its answer for "no pro" / "not available", so that contract is spelled
+    out here rather than assumed.
+    """
+    tier = (p1_words("chatgpt", "tier_words") or ["pro"])[0].capitalize()
+    extra = ("" if has_thinking_control("chatgpt", 1) else
+             " There is no separate thinking toggle — the tier IS the reasoning level.")
+    return (f"Select ChatGPT's {tier} tier in the model picker.{extra} "
+            f"Say 'no pro available' if it is not offered.")
+
+
+def _chatgpt_tier_policy() -> tuple:
+    """(tier_words, upgrade_verbs, tool_word) for the ChatGPT DOM tier.
+
+    ⭐ ONE home for the tier words even though two phases read them. The pill and
+    the menu are the SAME control in P1 and P2 — the capture's headline is that
+    ChatGPT puts effort and model in one list — so a second copy under
+    P2_MODEL_POLICY would be a frozen duplicate of a live policy, which is the
+    shape that let Gemini's hover helper drift away from its own ranker.
+    """
+    tiers = p1_words("chatgpt", "tier_words")
+    verbs = p1_words("chatgpt", "upgrade_verbs")
+    # ⛔ The tool word is DEFAULTED here, not at one call site. It is what keeps
+    # the picker from mistaking the Deep-Research pill for the model pill, and an
+    # empty policy value would turn that guard off silently — the one guard whose
+    # failure mode is destructive rather than merely unhelpful.
+    tool = str((p2_labels("chatgpt") or {}).get("tool") or "").strip().lower()
+    return tiers, verbs, (tool or "deep research")
+
+
+async def _chatgpt_read_effort_tier(page):
+    """Read the ChatGPT model/effort trigger. Returns {found, via, text,
+    on_target} — `on_target` is True only when the trigger's own label names the
+    policy tier AND is not an upgrade CTA. Never raises."""
+    tiers, verbs, tool = _chatgpt_tier_policy()
+    try:
+        res = await page.evaluate(_CHATGPT_MODEL_TRIGGER_JS,
+                                  {"groups": _CHATGPT_MODEL_TRIGGER_GROUPS, "avoid": tool})
+    except Exception as e:
+        log(f"[p2:chatgpt-model] trigger read failed ({e})", "INFO")
+        return {"found": False, "via": "", "text": "", "on_target": False}
+    if not isinstance(res, dict):
+        return {"found": False, "via": "", "text": "", "on_target": False}
+    txt = str(res.get("text") or "")
+    res["on_target"] = bool(
+        res.get("found") and has_term(txt, tiers) and not has_term(txt, verbs))
+    return res
+
+
+async def _chatgpt_select_effort_tier(page, *, label="ChatGPT", phase=1) -> str:
+    """Ledgered entry point for the effort-tier picker below.
+
+    A wrapper rather than a `_dom_note` at each `return`, because the picker has
+    eleven exits and the one that gets missed is always the one that matters.
+    Wrapping cannot drift: every exit, including a raise, lands here.
+    """
+    trace: dict = {}
+    t0 = time.time()
+    try:
+        verdict = await _chatgpt_pick_effort_tier(page, label=label, phase=phase,
+                                                  _trace=trace)
+    except Exception as _e:
+        _dom_note("chatgpt.select_model", "error", phase=phase,
+                  via=trace.get("via", ""), press=trace.get("press", ""),
+                  ms=(time.time() - t0) * 1000,
+                  detail=f"{type(_e).__name__}: {_e}")
+        raise
+    _dom_note("chatgpt.select_model",
+              # `selected` is this picker's word for the ledger's `verified`;
+              # one vocabulary across platforms is what makes the summary
+              # countable rather than merely readable.
+              "verified" if verdict == "selected" else verdict,
+              phase=phase, via=trace.get("via", ""), press=trace.get("press", ""),
+              ms=(time.time() - t0) * 1000, detail=trace.get("detail", ""))
+    return verdict
+
+
+async def _chatgpt_pick_effort_tier(page, *, label="ChatGPT", phase=1,
+                                    _trace=None) -> str:
+    """The `builtin` rung of `chatgpt.select_model` — pick the policy EFFORT TIER
+    from ChatGPT's model menu and prove the trigger actually moved.
+
+    Verdicts (the caller's ladder keys on these, so they are a closed set):
+      * ``already``     — the trigger already names the tier; NOTHING was clicked.
+      * ``selected``    — a row was clicked and the trigger now names the tier.
+      * ``no_target``   — the menu mounted and offered no row naming the tier.
+                          This is the honest no-subscription signal; the caller
+                          falls through to the surface that owns that verdict
+                          rather than settling for a lower tier here.
+      * ``unverified``  — a row was clicked and the trigger did NOT move. Never
+                          reported as success: "the click didn't throw" is not
+                          evidence, and a silent downgrade reported as a pick is
+                          the single worst outcome this whole path can produce.
+      * ``unsure``      — nothing readable/openable. Degrades to today's
+                          behaviour (the Vision/CUA rung runs).
+
+    Runs in BOTH phases against the same control. In P2 it is almost always a
+    read-and-return: ChatGPT persists the tier per account, so P1 has already
+    put the pill on target and this opens no menu at all. That is the #744
+    invariant — never open a popover you have nothing to do in.
+    """
+    tiers, verbs, _tool = _chatgpt_tier_policy()
+    tag = f"[p{phase}:chatgpt-model]"
+    tr = _trace if _trace is not None else {}
+    if not tiers:
+        tr["detail"] = "no tier words configured"
+        return "unsure"
+    pre = await _chatgpt_read_effort_tier(page)
+    tr["via"] = pre.get("via") or ""
+    tr["detail"] = f"trigger read {str(pre.get('text'))[:40]!r}"
+    if pre.get("on_target"):
+        log(f"{tag} trigger already reads {pre.get('text')!r} (via {pre.get('via')}) — "
+            f"nothing to select, menu not opened")
+        return "already"
+    log(f"{tag} trigger reads {pre.get('text')!r} (found={pre.get('found')}, "
+        f"via={pre.get('via') or '-'}) — opening the model menu")
+
+    async def _escape():
+        """Leave no popover sitting over the composer (the #744 invariant)."""
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
+
+    try:
+        opened = await page.evaluate(_CHATGPT_MARK_MODEL_TRIGGER_JS,
+                                     {"groups": _CHATGPT_MODEL_TRIGGER_GROUPS,
+                                      "avoid": _tool, "attr": _SR_CLICK_MARK,
+                                      "value": "model-trigger"})
+    except Exception as e:
+        log(f"{tag} could not locate the model trigger ({e})", "INFO")
+        return "unsure"
+    if not (isinstance(opened, dict) and opened.get("marked")):
+        log(f"{tag} no model trigger to open "
+            f"(reason={(opened or {}).get('reason')}) — leaving it to the next rung", "INFO")
+        return "unsure"
+    tr["via"] = opened.get("via") or tr.get("via", "")
+    how = await _sr_real_click(page, "model-trigger", tag=tag)
+    tr["press"] = how or "none"
+    if not how:
+        log(f"{tag} the model trigger could not be pressed at all — leaving it "
+            f"to the next rung", "INFO")
+        return "unsure"
+
+    # POLL, don't sleep once. The old single 0.8 s wait had to be right about an
+    # animation AND about a page that was nine seconds old, and when it was wrong
+    # the verdict was indistinguishable from a rotated hook. Waiting for the
+    # outcome is also what makes "opened" mean the menu is open: until a row is
+    # readable, nothing has been established except that a press landed.
+    rows, via, snap = [], "", {}
+    for _attempt in range(10):
+        if _attempt:
+            await asyncio.sleep(0.35)
+        try:
+            snap = await page.evaluate(_CHATGPT_MENU_ROWS_JS,
+                                       {"groups": _CHATGPT_MODEL_ROW_GROUPS}) or {}
+        except Exception as e:
+            log(f"{tag} model-menu row read failed ({e})", "INFO")
+            await _escape()
+            return "unsure"
+        rows = list(snap.get("rows") or [])
+        via = snap.get("via") or ""
+        if rows:
+            break
+    if not rows:
+        # Say what was there. "No rows" alone cannot tell a rotated hook from a
+        # menu that never opened, and the corpus has exactly one occurrence of
+        # this line with nothing else to read alongside it.
+        diag = {}
+        try:
+            diag = await page.evaluate(_CHATGPT_MENU_DIAG_JS,
+                                       {"groups": _CHATGPT_MODEL_ROW_GROUPS,
+                                        "attr": _SR_CLICK_MARK}) or {}
+        except Exception:
+            pass
+        tr["detail"] = (f"no rows mounted; aria-expanded={diag.get('expanded')!r}, "
+                        f"hooks={diag.get('per')}, overlays={diag.get('overlays')}")
+        log(f"{tag} model menu mounted no rows within 3.5s after a {how} press on "
+            f"the trigger (via {opened.get('via')}, aria-expanded="
+            f"{diag.get('expanded')!r}) — hooks {diag.get('per')}, overlays "
+            f"{diag.get('overlays')}, nearby text "
+            f"{json.dumps((diag.get('sample') or [])[:6], ensure_ascii=False)} "
+            f"— leaving it to the next rung", "WARN")
+        await _escape()
+        return "unsure"
+    log(f"{tag} model menu opened via a {how} press and offered {len(rows)} rows "
+        f"via {via}: {json.dumps([r[:32] for r in rows[:8]], ensure_ascii=False)}")
+    tr["via"] = f"{opened.get('via')}/{via}"
+    tr["detail"] = f"{len(rows)} rows: {json.dumps([r[:24] for r in rows[:5]], ensure_ascii=False)}"
+
+    pick = pick_effort_tier(rows, tiers, verbs)
+    if not pick:
+        # ⛔ Deliberately NOT "take the best row we can find". Nothing on the menu
+        # names the tier, which on this platform means the subscription does not
+        # offer it — and quietly selecting the next tier down would mask exactly
+        # the downgrade the caller's escalation exists to surface.
+        #
+        # …but `no_target` is a STRONG claim — the caller reads it as "this
+        # account has no Pro" — and it must not rest on the weakest hook. The
+        # class group is a fallback shared with the TOOLS menu, whose rows
+        # ("Deep research Get a detailed report") name no tier either, so a
+        # class-group read that finds no tier cannot tell "no Pro on this plan"
+        # from "that was the wrong menu". Say `unsure` and let the next rung
+        # answer, which is what it is for.
+        if via == "menu-item-class":
+            log(f"{tag} no row names the '{tiers[0]}' tier, but the rows came from "
+                f"the class fallback — that may not be the model menu at all, so "
+                f"this is NOT a no-Pro verdict", "WARN")
+            await _escape()
+            return "unsure"
+        log(f"{tag} no row names the '{tiers[0]}' tier — not settling for a lower "
+            f"one; the no-tier verdict goes to the caller", "WARN")
+        await _escape()
+        return "no_target"
+    try:
+        clicked = await page.evaluate(_CHATGPT_CLICK_ROW_JS,
+                                      {"groups": _CHATGPT_MODEL_ROW_GROUPS, "via": via,
+                                       "index": pick["index"], "expect": pick["label"],
+                                       "attr": _SR_CLICK_MARK, "value": "model-row"})
+    except Exception as e:
+        log(f"{tag} row click errored ({e})", "INFO")
+        await _escape()
+        return "unsure"
+    if not (isinstance(clicked, dict) and clicked.get("clicked")):
+        log(f"{tag} did not click {pick['label'][:40]!r} "
+            f"(reason={(clicked or {}).get('reason')})", "INFO")
+        await _escape()
+        return "unsure"
+    if not await _sr_real_click(page, "model-row", tag=tag):
+        log(f"{tag} the {pick['label'][:40]!r} row could not be pressed", "INFO")
+        await _escape()
+        return "unsure"
+    await asyncio.sleep(1.2)
+    await _escape()
+    post = await _chatgpt_read_effort_tier(page)
+    if post.get("on_target"):
+        log(f"{tag} selected {pick['label'][:40]!r} — trigger now reads "
+            f"{post.get('text')!r} ✓")
+        tr["detail"] = f"picked {pick['label'][:40]!r}"
+        return "selected"
+    # The click landed on something; the trigger did not move. Say so.
+    log(f"{tag} clicked {pick['label'][:40]!r} but the trigger still reads "
+        f"{post.get('text')!r} — NOT claiming the tier was selected", "WARN")
+    tr["detail"] = (f"pressed {pick['label'][:32]!r}; trigger still reads "
+                    f"{str(post.get('text'))[:32]!r}")
+    return "unverified"
+
+
+def _toggle_decision(target_active, opposite_confirmed) -> str:
+    """The #709 pre-act firewall: 'skip' | 'act' | 'ambiguous'.
+
+    Delegates to ``selfheal.decide_toggle`` — the one implementation — and keeps
+    the identical rule inline for the case where that module is absent. A guard
+    that disappears with an optional import is not a guard: the failure it
+    prevents (clicking an already-active toggle) is destructive on ChatGPT, where
+    a second click ADDS a second Deep Research rather than removing the first.
+    """
+    if selfheal is not None:
+        return selfheal.decide_toggle(target_active, opposite_confirmed)
+    if target_active:
+        return "skip"
+    return "act" if opposite_confirmed else "ambiguous"
 
 
 async def _chatgpt_clear_deep_research(browser, cua_client=None, verbose=False) -> str:
@@ -11372,9 +12468,17 @@ async def _chatgpt_clear_deep_research(browser, cua_client=None, verbose=False) 
                         const a = norm(b.getAttribute('aria-label'));
                         const t = norm(b.textContent);
                         if (a.includes('file') || a.includes('attach')) return false;  // never a PDF card
+                        // ⛔ A REMOVE VERB ONLY. `a.includes('deep research')` used
+                        // to sit in this list, and the DR token's own control is
+                        // labelled exactly that — so the clause that was meant to
+                        // find a remove affordance matched the PILL ITSELF, and
+                        // clicking the pill is the one thing that must never
+                        // happen here: on the current UI it ADDS A SECOND Deep
+                        // Research instead of removing the first. The whole
+                        // Backspace-first design (Strategy A) exists because of
+                        // that, and this leg was quietly able to undo it.
                         return a.includes('remove') || a.includes('close') ||
                                a.includes('turn off') || a.includes('deselect') ||
-                               a.includes('deep research') ||
                                t === '×' || t === 'x';
                     });
                     if (btn) { btn.click(); return true; }
@@ -11940,6 +13044,114 @@ _JS_IS_NLM_URL = """((s) => {
         return u.pathname.startsWith('/notebook/') && u.pathname.length > '/notebook/'.length;
     } catch (e) { return false; }
 })"""
+
+# ⚠ NEITHER `offsetParent !== null` NOR "the rect is not 0×0" means clickable.
+# NotebookLM parks `button[aria-label="Chat options"]` at x=-36 with a full-size
+# rect and a live offsetParent — and it matches an `aria-label*="options"` query,
+# which is one of the hooks the audio ⋮ search uses. The honest test is the point
+# a click would actually land on: an element whose CENTRE is outside the viewport
+# cannot be clicked, however healthy its rect looks.
+_NLM_ONSCREEN_JS = r"""
+    const onScreen = (el) => {
+        if (!el || !el.getBoundingClientRect) return false;
+        const r = el.getBoundingClientRect();
+        if (r.width < 8 || r.height < 8) return false;
+        const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+        const W = (window.innerWidth || 0), H = (window.innerHeight || 0);
+        if (cx < 0 || cy < 0) return false;
+        if (W && cx > W) return false;
+        if (H && cy > H) return false;
+        return true;
+    };
+"""
+
+# ⚠ Material icon ligatures BLEED into innerText. The audio card's ⋮ menu reads
+# `share Share`, `edit Rename`, `save_alt Download`, `info_spark View prompt and
+# sources`, `delete Delete`. The two regexes the NotebookLM click helper already
+# carries — doubled leading token, and snake_case icon name — catch the first,
+# third and fourth by luck. They cannot catch `edit Rename`: the ligature and the
+# label are different words, and no regex can tell that apart from a real
+# two-word label without guessing.
+#
+# So the primary strip is STRUCTURAL: subtract the text of every icon element
+# inside the row. The regexes stay as the fallback for markup that does not tag
+# its icons. This matters because `Delete` sits two rows under `Download` in that
+# menu, and a row read as its icon name is a row identified by position instead.
+_NLM_LABEL_JS = r"""
+    const ICON_SEL = 'mat-icon, .material-icons, .material-icons-extended, ' +
+        '[class*="material-symbols"], [class*="google-symbols"]';
+    const nlmLabel = (el) => {
+        let t = el.innerText || el.textContent || '';
+        if (el.querySelectorAll) {
+            for (const ic of el.querySelectorAll(ICON_SEL)) {
+                const it = ic.innerText || ic.textContent || '';
+                if (!it) continue;
+                const i = t.indexOf(it);
+                if (i !== -1) t = t.slice(0, i) + ' ' + t.slice(i + it.length);
+            }
+        }
+        t = t.replace(/\s+/g, ' ').trim();
+        t = t.replace(/^([\w]+)\s+(?=\1\b)/i, '');
+        t = t.replace(/^[a-z]+(?:_[a-z]+)+\s+/, '');
+        return t;
+    };
+"""
+
+
+# ⚠ A JS FUNCTION CANNOT BE PASSED AS A page.evaluate ARGUMENT. Arguments are
+# serialized, so `page.evaluate(js, _JS_IS_NLM_URL)` delivers the predicate as a
+# STRING and `isNb(val)` throws "isNb is not a function" on the first input the
+# loop reaches. That is what the share-link read did, and the throw did not stop
+# at the read: it escaped to the helper's own `except`, so the public-access
+# verify AND the Save click after it never ran either, on every run since the
+# rename fix landed. The only way to share one definition across the boundary is
+# to EMBED it in the source — hence the concatenation below rather than an arg.
+#
+# A source-text test passes against either form, which is why this survived. The
+# guard for it executes the JS.
+_NLM_SHARE_LINK_READ_JS = r"""(P) => {
+    const isNb = """ + _JS_IS_NLM_URL + r""";""" + _NLM_ONSCREEN_JS + r"""
+    const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+    const roots = [];
+    for (const sel of (P.scopes || [])) {
+        for (const d of document.querySelectorAll(sel)) {
+            const r = d.getBoundingClientRect();
+            if (r.width > 200 && r.height > 100) roots.push(d);
+        }
+    }
+    // READS may range over the whole page — every candidate is gated by isNb, so
+    // the worst case is finding the notebook's own link somewhere else, which is
+    // the same link. CLICKS may not: bringing this block back to life turns a
+    // document-wide "any button whose text contains copy" search into a real
+    // click for the first time, and outside the dialog that is a stray press on
+    // whatever the notebook happens to render. So the copy fallback below stays
+    // inside the dialog roots, and reports `no_dialog` instead of guessing.
+    for (const root of roots.concat([document])) {
+        for (const inp of root.querySelectorAll(
+                'input[readonly], input[type="text"], input[type="url"], textarea')) {
+            const val = inp.value || inp.getAttribute('value') || '';
+            if (isNb(val)) return { url: val, via: 'input' };
+        }
+    }
+    for (const root of roots) {
+        for (const b of root.querySelectorAll('button, [role="button"]')) {
+            if (!onScreen(b)) continue;
+            const t = norm(b.innerText || b.textContent || '').toLowerCase();
+            if (!t) continue;
+            if (t.indexOf('copy link') !== -1 ||
+                (t.indexOf('copy') !== -1 && t.indexOf('copy all') === -1)) {
+                try { b.click(); } catch (e) { return { url: '', via: 'copy_threw' }; }
+                return { url: 'clipboard', via: 'copy' };
+            }
+        }
+    }
+    return { url: '', via: roots.length ? 'no_link_in_dialog' : 'no_dialog' };
+}"""
+
+# The dialog roots the read above searches, and the same list the NotebookLM
+# click helper already scopes to. One home so a Material dialog rename moves
+# both.
+_NLM_DIALOG_SCOPES = ['[role="dialog"]', 'mat-dialog-container', '[class*="dialog"]']
 
 
 # Per-platform patterns that indicate a REAL public/shareable link (not a page URL)
@@ -12741,6 +13953,14 @@ async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Rese
                 # could click a code-block "Copy code" button or a social-
                 # share icon, both of which can spawn new tabs that
                 # `gemini.google.com` allowlist permits.
+                #
+                # 2026-08-04: armed before the click, not read blind after it.
+                # Phase 2 runs Gemini alongside Claude and NotebookLM and every
+                # one of them copies a share link; "contains gemini and share"
+                # is satisfied by a Gemini link this run already produced, so
+                # without the arm a re-entry here could re-publish the earlier
+                # link as this attempt's result.
+                _arm_clipboard()
                 try:
                     await page.evaluate("""() => {
                         const dlg = document.querySelector(
@@ -12773,8 +13993,9 @@ async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Rese
                     await asyncio.sleep(0.5)
                 except Exception:
                     pass
-                clip = get_clipboard()
-                if "gemini" in clip and "share" in clip:
+                clip, _ = await _read_clipboard_after_copy(
+                    lambda c: "gemini" in c and "share" in c)
+                if clip:
                     url = clip
             await page.keyboard.press("Escape")
             await asyncio.sleep(0.5)
@@ -12786,6 +14007,12 @@ async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Rese
             # the page never getting to even check the clipboard.
             last_stage = "cua_fallback"
             cua_attempted = True
+            # Armed HERE, before the mission — the mission is what copies, and
+            # this is the last moment at which an empty clipboard proves the
+            # link we read afterwards came from it. Covers the timeout salvage
+            # read below too, which is the one most exposed: it fires precisely
+            # when we do not know how far the mission got.
+            _arm_clipboard()
             try:
                 result = await asyncio.wait_for(
                     agent_loop(cua_client, browser,
@@ -12803,14 +14030,16 @@ async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Rese
                 if m:
                     url = m.group(0)
                 else:
-                    clip = get_clipboard()
-                    if clip and ("gemini" in clip or "g.co" in clip) and "share" in clip:
+                    clip, _ = await _read_clipboard_after_copy(
+                        lambda c: ("gemini" in c or "g.co" in c) and "share" in c)
+                    if clip:
                         url = clip
             except asyncio.TimeoutError:
                 log(f"[{label}] CUA fallback exceeded 90s — using best-effort URL", "WARN")
                 # Salvage: maybe CUA copied to clipboard before the timeout.
-                clip = get_clipboard()
-                if clip and ("gemini" in clip or "g.co" in clip) and "share" in clip:
+                clip, _ = await _read_clipboard_after_copy(
+                    lambda c: ("gemini" in c or "g.co" in c) and "share" in c)
+                if clip:
                     url = clip
         # Tight public-link gate: Gemini's Share & Export flow produces URLs on
         # gemini.google.com/share/ or g.co/gemini/... — require one of those
@@ -12934,6 +14163,11 @@ async def extract_share_link_claude(browser, cua_client, label="Claude Deep Rese
             # blow the inline 90s outer budget at the call-site.
             last_stage = "cua_fallback"
             cua_attempted = True
+            # Armed before the mission for the same reason as Gemini's, and it
+            # bites harder here: `"claude." in clip` is satisfied by ANY Claude
+            # URL, including the one publish_open_claude_artifact copied a
+            # moment ago on the path that brought us here.
+            _arm_clipboard()
             try:
                 async def _publish_share_cua():
                     return await asyncio.wait_for(
@@ -12965,13 +14199,14 @@ async def extract_share_link_claude(browser, cua_client, label="Claude Deep Rese
                 if m:
                     url = m.group(0)
                 else:
-                    clip = get_clipboard()
-                    if clip and "claude." in clip:
+                    clip, _ = await _read_clipboard_after_copy(
+                        lambda c: "claude." in c)
+                    if clip:
                         url = clip
             except asyncio.TimeoutError:
                 log(f"[{label}] CUA fallback exceeded 90s — using best-effort URL", "WARN")
-                clip = get_clipboard()
-                if clip and "claude." in clip:
+                clip, _ = await _read_clipboard_after_copy(lambda c: "claude." in c)
+                if clip:
                     url = clip
         # Tight public-link gate: Claude has a reliable Publish flow, so only a
         # claude.site/ URL counts as verified. A bare claude.ai/chat/... URL is
@@ -12984,6 +14219,54 @@ async def extract_share_link_claude(browser, cua_client, label="Claude Deep Rese
         return LinkResult(url=url, label=label, platform="claude",
                           error=f"{last_stage}: {type(e).__name__}: {e}",
                           cua_attempted=cua_attempted)
+
+
+# Read-only. Runs when no "Anyone with the link" option could be clicked, and
+# answers the question the old warning left open: was there nothing to click
+# because the notebook is ALREADY public, or because the dialog we were aiming at
+# was never on screen? Those need opposite responses — the first is a success and
+# the second is a broken selector — and a warning that cannot tell them apart
+# reported a public link as "likely private" for the whole life of the corpus.
+#
+# Separate from the strict `public_verified` read below on purpose: that one is
+# deliberately narrow and is the value the caller gates on. This one only ever
+# feeds a log line and a ledger outcome.
+_NLM_ACCESS_DIAG_JS = """() => {
+    const PHRASE = 'anyone with the link';
+    const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+    const vis = el => { const r = el.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0; };
+    // Own text only — an OPEN option list is a child of its trigger, so reading
+    // innerText would find the phrase in a row nobody has selected.
+    const ownText = (el) => {
+        let s = '';
+        for (const n of el.childNodes) if (n.nodeType === 3) s += n.nodeValue || '';
+        return s.toLowerCase();
+    };
+    const dlg = document.querySelector('[role="dialog"]');
+    const scope = dlg || document.body;
+    const TRIGGERS = '[role="combobox"], [aria-haspopup="listbox"], button[aria-expanded], select';
+    let already = false;
+    for (const t of scope.querySelectorAll(TRIGGERS)) {
+        if (ownText(t).includes(PHRASE)) { already = true; break; }
+    }
+    if (!already) {
+        const sel = scope.querySelector(
+            '[aria-selected="true"], [aria-checked="true"], [data-selected="true"]');
+        if (sel && norm(sel.innerText).toLowerCase().includes(PHRASE)) already = true;
+    }
+    const rows = [...scope.querySelectorAll(
+            '[role="option"], [role="menuitem"], [role="menuitemradio"], li')]
+        .filter(vis).map(r => norm(r.innerText).slice(0, 40)).filter(Boolean);
+    const trig = scope.querySelector(TRIGGERS);
+    return {
+        already: already,
+        dialog: !!dlg,
+        rows: rows.length,
+        sample: rows.slice(0, 4),
+        access: norm(trig ? trig.innerText : '').slice(0, 60),
+    };
+}"""
 
 
 async def _set_nlm_public_and_get_link(page, label):
@@ -13012,6 +14295,10 @@ async def _set_nlm_public_and_get_link(page, label):
     url = ""
     public_verified = False
     access_set = False
+    already_public = False
+    # Bound before the try: the ledger detail below reads it, and an exception
+    # thrown before Step 2 must not turn a share failure into a NameError.
+    _read_channel = ""
     try:
         # Step 1: Find "Notebook access" section and change to public
         # NLM share dialog shows "Notebook access" with a dropdown (not "Restricted")
@@ -13073,8 +14360,34 @@ async def _set_nlm_public_and_get_link(page, label):
                 access_set = True
                 log(f"[{label}] Set Notebook access to 'Anyone with the link'")
             else:
-                log(f"[{label}] access dropdown opened but no 'Anyone with the "
-                    f"link' option was found — the link may stay private", "WARN")
+                # 2026-08-04: SAY WHAT WAS ON SCREEN. "no option was found — the
+                # link may stay private" was emitted about a notebook that had
+                # been made public eight minutes earlier by this same helper, and
+                # it named neither of the two causes it could have been.
+                _diag = {}
+                try:
+                    _diag = await page.evaluate(_NLM_ACCESS_DIAG_JS) or {}
+                except Exception as _de:
+                    log(f"[{label}] access diagnostic skipped "
+                        f"({type(_de).__name__})", "DEBUG")
+                if _diag.get("already"):
+                    # ⭐ Finding the control already on target and not touching it
+                    # is the BEST outcome, not a failure — the same rule the DOM
+                    # ledger applies everywhere else. The access opener only fires
+                    # on a control reading "Restricted"/"Private", so on a
+                    # second share of an already-public notebook there is by
+                    # design nothing left to click.
+                    access_set = True
+                    already_public = True
+                    log(f"[{label}] Notebook access already reads 'Anyone with the "
+                        f"link' — nothing to change")
+                else:
+                    log(f"[{label}] no 'Anyone with the link' option to click, and "
+                        f"the control does not already read it — "
+                        f"dialog={'yes' if _diag.get('dialog') else 'NO'} "
+                        f"option-rows={_diag.get('rows', '?')} "
+                        f"control={_diag.get('access') or '(none found)'} "
+                        f"rows={_diag.get('sample') or []}", "WARN")
         else:
             # Silent before this: if the access control itself couldn't be found
             # the helper went straight to reading the link, so the log showed a
@@ -13088,33 +14401,32 @@ async def _set_nlm_public_and_get_link(page, label):
         # when Google renamed the host it could not even find the field to read.
         # Both now go through _JS_IS_NLM_URL: look at any readonly/text input,
         # and accept whatever host Google is serving notebooks from today.
-        link = await page.evaluate("""(isNb) => {
-            const inputs = document.querySelectorAll(
-                'input[readonly], input[type="text"], input[type="url"], textarea'
-            );
-            for (const inp of inputs) {
-                const val = inp.value || '';
-                if (isNb(val)) return val;
-            }
-            // Try clicking "Copy link" button
-            const btns = document.querySelectorAll('button');
-            for (const b of btns) {
-                const txt = (b.innerText || '').toLowerCase();
-                if (txt.includes('copy link') || (txt.includes('copy') && !txt.includes('copy all'))) {
-                    b.click();
-                    return 'clipboard';
-                }
-            }
-            return '';
-        }""", _JS_IS_NLM_URL)
+        #
+        # 2026-08-03: …and that fix never once executed, because the predicate
+        # was handed over as a page.evaluate ARGUMENT. See the constant.
+        #
+        # Armed BEFORE the evaluate, not before the read below it: the copy
+        # fallback lives INSIDE this JS (it clicks "Copy link" and returns the
+        # 'clipboard' sentinel), so by the time we get the sentinel back the
+        # copy has already happened and it is too late to clear.
+        _arm_clipboard()
+        _read = await page.evaluate(_NLM_SHARE_LINK_READ_JS,
+                                    {"scopes": _NLM_DIALOG_SCOPES}) or {}
+        link = (_read.get("url") or "")
+        # The channel is worth a line of its own: `no_dialog` says the share
+        # dialog was never open when we read, which is a different failure from
+        # an open dialog with no link in it, and the two need different fixes.
+        _read_channel = str(_read.get("via", "") or "")
+        log(f"[{label}] share-link read: via={_read_channel!r} "
+            f"{'link found' if link else 'no link'}", "DEBUG")
         if link == 'clipboard':
             await asyncio.sleep(0.5)
-            clip = get_clipboard()
-            if is_notebooklm_url(clip or ""):
-                url = (clip or "").strip()
-            elif clip:
+            clip, seen = await _read_clipboard_after_copy(is_notebooklm_url)
+            if clip:
+                url = clip
+            elif seen:
                 log(f"[{label}] 'Copy link' clicked but the clipboard held no notebook "
-                    f"URL ({(clip or '')[:60]!r})", "WARN")
+                    f"URL ({seen[:60]!r})", "WARN")
         elif is_notebooklm_url(link or ""):
             url = (link or "").strip()
 
@@ -13179,10 +14491,24 @@ async def _set_nlm_public_and_get_link(page, label):
             return '';
         }""")
         await asyncio.sleep(1)
+        # ⛔ Three outcomes, not two. The old pair warned "returned link may be
+        # private" on the SUCCESSFUL path too — the strict own-text read has been
+        # False on every run in the corpus, so the warning fired one second after
+        # "Set Notebook access to 'Anyone with the link'" and said the opposite.
+        # A warning that is wrong on the healthy path is one nobody reads on the
+        # unhealthy one.
         if public_verified:
             log(f"[{label}] Public share DOM-verified — link is shareable")
+        elif already_public:
+            log(f"[{label}] Public share: the control already read 'Anyone with "
+                f"the link' — no change needed")
+        elif access_set:
+            log(f"[{label}] Public share: the option was clicked but the dialog "
+                f"did not confirm it back. The strict check is inconclusive here, "
+                f"not negative — the link is most likely public")
         else:
-            log(f"[{label}] Public share NOT DOM-verified — returned link may be private", "WARN")
+            log(f"[{label}] Public share NEITHER set nor verified — the returned "
+                f"link may genuinely be private", "WARN")
         # Phoenix PX-0 shadow observation for the P3 share dialog (2026-07-31).
         # Selector rot here was invisible for the entire life of the corpus:
         # `Public share DOM-verified` never once logged, and the tab-URL fallback
@@ -13198,6 +14524,25 @@ async def _set_nlm_public_and_get_link(page, label):
                                            outcome_pass=is_notebooklm_url(url))
     except Exception as e:
         log(f"[{label}] NLM public share flow: {e}", "WARN")
+    # Two separate intents, deliberately. Reporting them as one would hide the
+    # case this helper exists to surface: a link read successfully off a notebook
+    # whose access was never changed is a PRIVATE link, and the recipient of the
+    # Phase-5 email gets "Request access" instead of a notebook.
+    _dom_note("notebooklm.set_public_access",
+              ("already" if already_public else "verified") if access_set else "missed",
+              phase=3,
+              detail="already 'Anyone with the link'" if already_public else
+                     ("" if access_set else
+                      "no 'Anyone with the link' option was clicked"))
+    # The read CHANNEL is the diagnosis. `no_dialog` says the share dialog was
+    # never on screen when we read, which is a broken opener; an open dialog with
+    # no link in it is a moved field. Recording only "no URL" made those two the
+    # same line, and the next run had to re-derive which it was.
+    _dom_note("notebooklm.copy_share_link",
+              "verified" if is_notebooklm_url(url) else "missed", phase=3,
+              detail="" if is_notebooklm_url(url) else
+                     f"no notebook URL obtained (read channel: "
+                     f"{_read_channel or 'unknown'})")
     return url, public_verified, access_set
 
 
@@ -13361,6 +14706,12 @@ async def extract_notebooklm_url(browser, cua_client=None, verbose=False, **_):
             # read below) and possibly also in the returned text (bonus).
             # public_verified stays False on this path (only the DOM helper can
             # confirm access), same as the CUA contract.
+            #
+            # Armed before the mission: the DOM attempt that just failed may
+            # itself have clicked "Copy link" successfully, and a notebook URL
+            # it left behind would pass the shape test below whether or not the
+            # mission ever managed to copy anything.
+            _arm_clipboard()
             result = await _shadow_observed_cua(
                 page, hotspot_id="nlm-share", phase=3, platform="notebooklm",
                 current_step="share_set_public_get_link",
@@ -13372,9 +14723,9 @@ async def extract_notebooklm_url(browser, cua_client=None, verbose=False, **_):
                 cua_coro_factory=_nlm_share_cua,
                 mission_prompt=_nlm_share_mission) or {}
             # Clipboard FIRST — it is the channel the mission actually populates.
-            clip = get_clipboard()
-            if is_notebooklm_url(clip or ""):
-                url = (clip or "").strip()
+            clip, _ = await _read_clipboard_after_copy(is_notebooklm_url)
+            if clip:
+                url = clip
                 log(f"[NotebookLM] share link read from the clipboard: {url}")
             else:
                 # Bonus channel: the URL may be quoted in the vision answer.
@@ -14302,6 +15653,38 @@ _HOTSPOT_TO_OP = {
 # Vision call aims at the SAME element CUA does — a divergent hint corrupts the
 # promotion data. 7c/7c-p1 ↔ PROMPT_OPEN_CHATGPT_SOURCE_PANEL,
 # 7d ↔ PROMPT_OPEN_CLAUDE_SOURCE_ARTIFACT.
+
+
+def _p1_select_pro_hotspot() -> dict:
+    """The `1a-select-pro` hint, rendered from the SAME policy value
+    PROMPT_SELECT_PRO uses — see models.has_thinking_control.
+
+    "MUST agree with the canonical CUA prompt" (the note above) was enforced by
+    hand, and the two had already drifted from reality together: both told the
+    agent to select "Pro WITH Extended Thinking" on a platform whose menu has no
+    separate thinking control at all. Rendering both from one policy value is
+    what makes the agreement structural instead of aspirational.
+    """
+    tier = (p1_words("chatgpt", "tier_words") or ["pro"])[0].capitalize()
+    if has_thinking_control("chatgpt", 1):
+        target = f"the {tier} model WITH its thinking / extended-reasoning toggle enabled"
+        signals = [f"the model name shows {tier}", "a thinking / reasoning indicator"]
+    else:
+        target = (f"the {tier} option. There is NO separate thinking toggle here — the "
+                  f"effort level and the model are the SAME menu, so do not look for one")
+        signals = [f"the model name shows {tier}"]
+    return {
+        "expected_outcome": f"ChatGPT's {tier} tier is the selected model",
+        "context_hint": (
+            f"Open ChatGPT's model picker (the pill next to the composer / the model "
+            f"name) and select {target}. If it is already active, do NOT re-click it. "
+            f"Close the picker popover after. If there is no {tier} option, say so — "
+            f"never guess."
+        ),
+        "success_signals": signals,
+    }
+
+
 _HOTSPOT_VISION_HINTS = {
     "7c-p1": {
         "expected_outcome": "ChatGPT's activity side panel (step list + source URLs) slides open on the right",
@@ -14440,15 +15823,12 @@ _HOTSPOT_VISION_HINTS = {
     # P1 + P2-polling hotspots (#839 act-tier). The full canonical CUA mission
     # is also passed to the act loop via mission_prompt at each site; these
     # hints are the short target descriptor merged into flow_context.
-    "1a-select-pro": {
-        "expected_outcome": "ChatGPT Pro + Extended Thinking is the selected model",
-        "context_hint": (
-            "Open ChatGPT's model picker (top-left model name) and select the Pro model "
-            "WITH Extended Thinking. If the correct model is already active, do NOT re-click "
-            "it. Close the picker popover after. If there is no Pro option, say so — never guess."
-        ),
-        "success_signals": ["the model name shows Pro", "an Extended Thinking / thinking indicator"],
-    },
+    # ⚠ Built from models.has_thinking_control, not written out — this hint and
+    # PROMPT_SELECT_PRO are the two texts a Vision actor reads for this hotspot,
+    # and they BOTH used to demand an "Extended Thinking" control that ChatGPT
+    # does not have (effort and model are one menu). Two copies of a claim is two
+    # places for it to rot, so both render from the one policy value.
+    "1a-select-pro": _p1_select_pro_hotspot(),
     "1a-attach-pdf": {
         "expected_outcome": "the brief PDF is attached to the ChatGPT composer",
         "context_hint": (
@@ -15182,6 +16562,97 @@ def auto_skip_unacted_sec() -> int:
     monkeypatch the window without reloading the module.
     """
     return int(os.environ.get("DG_AUTO_SKIP_UNACTED_SEC", "1800"))
+
+
+def unacted_window_sec(auto_skip_on: bool) -> float:
+    """How long an unanswered [Retry][Skip] card gets, honouring the setting.
+
+    2026-08-02. The pair to `is_armed_timeout` below: this arms the window,
+    that reads whether it fired. `0.0` means "no deadline" — the card waits for
+    a human, not a timer — and every consumer must treat a 0 window as "never
+    auto-skip", not as "auto-skip immediately".
+
+    Hoisted so the two ends cannot drift again. Phase 2's mid-run error park
+    armed `AUTO_SKIP_UNACTED_SEC` unconditionally while Phase 3's link card,
+    added in the SAME commit, gated its window on the flag — so the identical
+    situation auto-skipped in one phase and waited in the other, and the phase
+    that ignored the setting also showed a countdown to a fire the setting says
+    can never happen.
+    """
+    return float(auto_skip_unacted_sec()) if auto_skip_on else 0.0
+
+
+def is_armed_timeout(decision: str, armed_sec) -> bool:
+    """Did this decision wait expire against a deadline we ACTUALLY armed?
+
+    2026-08-02. An expired wait means "nobody answered inside the window we
+    promised" — but only when a window was promised. Every decision wait also
+    carries an outer backstop (`await_phase_decision`'s 24-hour default), and
+    the backstop returns the SAME `"timeout"` string, so `decision ==
+    "timeout"` alone cannot tell "the 30-minute countdown the FE showed you
+    elapsed" from "nobody was at the keyboard for a day".
+
+    Conflating the two auto-skipped exactly the cases that deliberately arm
+    nothing: a sign-in wall (the taxonomy classes a login card as a BLOCKER —
+    the user can resolve it, so it must never auto-fire) and auto-skip switched
+    off in Settings. Both were listed, in a comment, as the reason the arming
+    code exists — and both were then violated by the one condition that read
+    the result.
+
+    Deliberately a named predicate rather than an inline `and`: it is the exact
+    boolean that was wrong, and a boolean can only be tested by calling it.
+    """
+    return decision == "timeout" and float(armed_sec or 0) > 0
+
+
+def park_window_elapsed(parked, now=None) -> bool:
+    """Has a parked agent's own decision window run out?
+
+    2026-08-02, third member of the window family (`unacted_window_sec` arms,
+    `is_armed_timeout` reads a phase wait, this reads an agent park). A window
+    of exactly **0 means NO DEADLINE** — the card waits for a human — which is
+    what the mid-run error park sets when auto-skip is off. The comparison it
+    replaces was `(now - since) >= _parked.get("timeout", 300)`, and `>= 0` is
+    true on the very first tick: the park that exists to wait for a person
+    would have auto-skipped instantly, which is worse than the bug it fixed.
+
+    An ABSENT `timeout` keeps the historical 300-second default, so the four
+    other park kinds are unaffected.
+    """
+    d = parked or {}
+    win = float(d.get("timeout", 300) or 0)
+    if win <= 0:
+        return False
+    _now = time.time() if now is None else now
+    return (_now - float(d.get("since", 0) or 0)) >= win
+
+
+def inflight_looks_done(p) -> bool:
+    """Do this live `pending` entry's poll signals say the agent is finishing?
+
+    The loop-top hard-retry consumer uses this to drop a Retry that raced a
+    completion — the 2026-07-13 incident where a Retry consumed at the exact
+    second extraction recorded 101k chars closed the finished tab and destroyed
+    the run. The done-marker/extraction window spans minutes and the recorded
+    result appears only at its END, so the live readings are the only evidence.
+    """
+    return (float(p.get("done_marker_first_at", 0) or 0) > 0
+            or int(p.get("done_count", 0) or 0) > 0)
+
+
+def void_completion_signals(p) -> None:
+    """Erase those readings, for a page we now KNOW is in a failure state.
+
+    2026-08-02, the other half of `inflight_looks_done`. One CUA "done" needs
+    two to confirm, so a single reading from the tick before an error verdict
+    survives into the park — and because the error path now parks instead of
+    dropping the entry, the guard above saw it and silently swallowed the
+    user's Retry: card retracted, nothing restarted, auto-skipped 30 minutes
+    later with no second card. Paired with the reader so the two field names
+    cannot drift apart.
+    """
+    p["done_count"] = 0
+    p["done_marker_first_at"] = 0.0
 
 
 def _disarm_registry(agent_or_all):
@@ -17167,6 +18638,71 @@ def _compact_event_for_narration(e: dict) -> str:
     return " | ".join(parts)
 
 
+def _gemini_error_detail(resp) -> str:
+    """The reason Google gave for refusing a call, as one line.
+
+    The body is the ONLY place the cause lives. `API key not valid`,
+    `models/<name> is not found` and `Invalid JSON payload received. Unknown
+    name "thinkingConfig"` are all HTTP 400 on this endpoint, so a message built
+    from the status alone cannot tell an expired key from a renamed model from a
+    payload the API version stopped accepting — which is why 1125 identical
+    warnings in the live corpus never once said what was wrong.
+
+    Falls back to the raw body, then to a plain statement that there wasn't one,
+    so this never returns an empty string that reads as "no error".
+    """
+    try:
+        err = ((resp.json() or {}).get("error") or {})
+    except Exception:
+        err = {}
+    message = str(err.get("message") or "").strip()
+    reason = ""
+    fields = []
+    for detail in (err.get("details") or []):
+        if not isinstance(detail, dict):
+            continue
+        if detail.get("reason") and not reason:
+            reason = str(detail["reason"])
+        # ⭐ The field is the whole answer for INVALID_ARGUMENT. Google's
+        # top-level message for it is the useless "Request contains an invalid
+        # argument."; the offending field name lives one level down in a
+        # BadRequest detail, and reading only `reason` left the live corpus
+        # saying nothing more than the status code did.
+        for viol in (detail.get("fieldViolations") or []):
+            if not isinstance(viol, dict):
+                continue
+            name = str(viol.get("field") or "").strip()
+            desc = str(viol.get("description") or "").strip()
+            if name or desc:
+                fields.append(f"{name}: {desc}" if name and desc else (name or desc))
+    if message:
+        status = str(err.get("status") or "").strip()
+        tag = "/".join(p for p in (status, reason) if p)
+        head = f"{tag}: {message[:160]}" if tag else message[:160]
+        return f"{head} [{'; '.join(fields)[:200]}]" if fields else head
+    body = " ".join(str(getattr(resp, "text", "") or "").split())
+    return body[:160] or "(no error body)"
+
+
+def _gemini_empty_reason(payload: dict) -> str:
+    """Why a 200 came back with no text: the finish reason, or a block reason.
+
+    A refusal and an empty success are different faults with different fixes —
+    a blocked prompt is ours to change, a token budget spent on thinking is a
+    config value — and the old single message described neither.
+    """
+    try:
+        cand = ((payload or {}).get("candidates") or [{}])[0] or {}
+        finish = str(cand.get("finishReason") or "").strip()
+        block = str(((payload or {}).get("promptFeedback") or {})
+                    .get("blockReason") or "").strip()
+    except Exception:
+        finish = block = ""
+    parts = [p for p in (f"finishReason={finish}" if finish else "",
+                         f"blockReason={block}" if block else "") if p]
+    return ", ".join(parts) or "no finishReason and no blockReason"
+
+
 def _call_text_narrator(
     system: str,
     user_msg: str,
@@ -17190,6 +18726,14 @@ def _call_text_narrator(
     text is running on Haiku, without log spam. Pass err_holder=None to
     suppress the downgrade log entirely (best-effort callers with no loop to
     dedupe over, e.g. the async alert-copy upgrade).
+
+    `err_holder["last_vendor"]` is set to "gemini" or "haiku" on every success,
+    and it is what the caller must consult before clearing the downgrade flag.
+    Clearing it on any successful tick re-arms the log every tick, because the
+    tick is succeeding on HAIKU — the state the log exists to report. The
+    downgrade line also carries what the API SAID (see `_gemini_error_detail`):
+    a message built from the status code alone cannot separate an invalid key
+    from a renamed model, and both are HTTP 400 here.
 
     Hoisted to module scope (was the `_call_narrator` closure inside
     `_narrator_loop`) so both the narrator loop and the async alert-copy
@@ -17218,6 +18762,16 @@ def _call_text_narrator(
             log(msg, "WARN")
             err_holder["gemini_downgrade_logged"] = True
 
+    def _won(vendor: str) -> None:
+        # Which vendor actually produced the text. The narrator loop clears the
+        # downgrade flag when a tick succeeds, and a tick succeeds on HAIKU —
+        # so without this the "log once" above resets every tick and the single
+        # line becomes one per tick. Measured on the live corpus: 1125 copies of
+        # the same warning across two logs, and no successful Gemini call in any
+        # of them.
+        if err_holder is not None:
+            err_holder["last_vendor"] = vendor
+
     if use_gemini and gemini_key:
         url_primary = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -17240,24 +18794,57 @@ def _call_text_narrator(
             sc = resp.status_code
             if sc == 429:
                 return "", 429  # let outer loop back off
-            try:
-                j = resp.json()
-                text = (j.get("candidates", [{}])[0]
-                         .get("content", {})
-                         .get("parts", [{}])[0]
-                         .get("text", ""))
-                text = (text or "").strip()
-                if text and sc == 200:
-                    return text, 200
-                # empty / non-200 — fall through to Haiku
-                _note_downgrade(f"[narrator] Gemini Flash sc={sc} (empty or non-200) "
-                                f"— falling back to Haiku 4.5")
-            except Exception:
-                _note_downgrade(f"[narrator] Gemini Flash parse failed sc={sc} "
-                                f"— falling back to Haiku 4.5")
+            if sc != 200:
+                # ⭐ SAY WHAT GOOGLE SAID. The old line was
+                # "Gemini Flash sc=400 (empty or non-200)", which repeats the
+                # status and adds nothing — and the cause was sitting in `resp`
+                # the whole time. "API key not valid", "models/… is not found"
+                # and "Unknown name in generationConfig" are ALL HTTP 400 here,
+                # so the status alone cannot tell an expired key from a renamed
+                # model. Measured against the live endpoint: a bad key returns
+                # 400 INVALID_ARGUMENT / API_KEY_INVALID.
+                #
+                # ⚠ Decided BEFORE parsing, deliberately. A refusal that arrives
+                # as an HTML error page (a 502 from a proxy) is still a refusal;
+                # reporting it as "we could not read the body" would describe the
+                # parser instead of the fault.
+                _note_downgrade(
+                    f"[narrator] Gemini {GEMINI_TEXT} refused the call — "
+                    f"HTTP {sc} {_gemini_error_detail(resp)} — narration is "
+                    f"running on {NARRATOR_HAIKU} until this is fixed")
+            else:
+                try:
+                    j = resp.json()
+                    # ⚠ Tolerant of an EMPTY candidates list, not just a missing
+                    # text field. A safety block returns `candidates: []` with the
+                    # reason in promptFeedback — chaining `[0]` on it raises, and
+                    # the run would be told "we could not read the body" about the
+                    # one case `_gemini_empty_reason` exists to explain.
+                    cand = (j.get("candidates") or [{}])[0] or {}
+                    parts = (cand.get("content") or {}).get("parts") or [{}]
+                    text = ((parts[0] or {}).get("text") or "").strip()
+                    if text:
+                        _won("gemini")
+                        return text, 200
+                    # A 200 with no text is a different fault from a refusal:
+                    # the request was accepted and the model returned nothing
+                    # (a safety block, or the token budget spent on thinking).
+                    # Collapsing the two into one message is how 1125 warnings
+                    # said nothing anyone could act on.
+                    _note_downgrade(
+                        f"[narrator] Gemini {GEMINI_TEXT} returned 200 with no "
+                        f"text ({_gemini_empty_reason(j)}) — narration is "
+                        f"running on {NARRATOR_HAIKU} until this is fixed")
+                except Exception as _parse_e:
+                    _note_downgrade(f"[narrator] Gemini {GEMINI_TEXT} sent a 200 "
+                                    f"body we could not read "
+                                    f"({type(_parse_e).__name__}) — falling back "
+                                    f"to {NARRATOR_HAIKU}")
         except Exception as _gemini_e:
-            _note_downgrade(f"[narrator] Gemini Flash error ({type(_gemini_e).__name__}: "
-                            f"{str(_gemini_e)[:120]}) — falling back to Haiku 4.5")
+            _note_downgrade(f"[narrator] Gemini {GEMINI_TEXT} error "
+                            f"({type(_gemini_e).__name__}: "
+                            f"{str(_gemini_e)[:120]}) — falling back to "
+                            f"{NARRATOR_HAIKU}")
         # fall through to Haiku fallback
 
     # Haiku 4.5 fallback — cross-vendor hedge for Google regional outages.
@@ -17280,6 +18867,7 @@ def _call_text_narrator(
                 getattr(b, "text", "") for b in resp.content
                 if getattr(b, "type", "") == "text"
             )
+            _won("haiku")
             return (txt or "").strip(), 200
         except _anth.RateLimitError:
             return "", 429
@@ -17345,7 +18933,7 @@ async def _narrator_loop(phase: int):
     # Reset on recovery (anti-latch) below. Replaces the old
     # `nonlocal _gemini_err_logged` closure flag now that the narrator brain
     # is hoisted to module scope (shared with the async alert-copy upgrade).
-    _narrator_err_holder = {"gemini_downgrade_logged": False}
+    _narrator_err_holder = {"gemini_downgrade_logged": False, "last_vendor": ""}
 
     async def _realistic_fallback(akey: str, ph: int, elapsed_sec: float,
                                    last_status: str = "", *,
@@ -17524,11 +19112,17 @@ async def _narrator_loop(phase: int):
                     _err_logged = True
                 continue
             # Reset both err flags once we recover so a later regression re-logs.
-            # The err_holder downgrade flag also resets so a transient Gemini
-            # blip doesn't latch-suppress the downgrade log for the rest of the
-            # phase (anti-latch — same intent as the old _gemini_err_logged).
             _err_logged = False
-            _narrator_err_holder["gemini_downgrade_logged"] = False
+            # ⛔ The downgrade flag resets only when GEMINI came back — not when
+            # the tick merely succeeded. A tick succeeds on Haiku, which is the
+            # very state the downgrade line reports, so clearing it here
+            # unconditionally turned "log once per phase" into "log every tick":
+            # 1125 copies of one warning across the live corpus, with no
+            # successful Gemini call anywhere in it. The anti-latch intent is
+            # preserved — a transient Gemini blip still re-arms the log the
+            # moment Gemini answers again.
+            if _narrator_err_holder.get("last_vendor") == "gemini":
+                _narrator_err_holder["gemini_downgrade_logged"] = False
             text = text.strip().strip('"').strip("`").strip()
             # SKIP escape hatch — model used the designated fallback signal
             # because data was too thin to narrate honestly. Replace with
@@ -18822,6 +20416,18 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
         // suffix does not. Match BOTH ASCII three-dot and Unicode \\u2026.
         const ELLIPSIS = /(?:\\.{3}|\\u2026)\\s*$/;
 
+        // A root with more than NODE_CAP descendants is abandoned unscanned —
+        // a deliberate cost ceiling on a long ChatGPT thread. Both walks did
+        // this SILENTLY, returning the same {found:false, candidates:0} as a
+        // page that was scanned and simply had no strip in it. So the caller's
+        // miss line asserted "strip not yet rendered or wording changed" on a
+        // page where neither had been established, and a thread that had grown
+        // past the ceiling looked identical to a wording change forever.
+        // DIAG carries what was actually seen back to the caller.
+        const NODE_CAP = 8000;
+        const DIAG = { roots: 0, walked: 0, cappedRoots: 0, maxNodes: 0,
+                       structuralCapped: false };
+
         // Specificity score for hit ranking. Layered to keep the 32c2957
         // "parent strip > badge child" guarantee while putting the live
         // ellipsis-bearing leaf above everything (it's the actual click
@@ -18849,7 +20455,10 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
             if (!root) return out;
             let nodes;
             try { nodes = root.querySelectorAll('*'); } catch (e) { return out; }
-            if (nodes.length > 8000) return out;
+            DIAG.roots++;
+            if (nodes.length > DIAG.maxNodes) DIAG.maxNodes = nodes.length;
+            if (nodes.length > NODE_CAP) { DIAG.cappedRoots++; return out; }
+            DIAG.walked += nodes.length;
             for (const el of nodes) {
                 const t = (el.innerText || el.textContent || '').trim();
                 if (!t || t.length < 4 || t.length > 300) continue;
@@ -18946,7 +20555,10 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
             const mainEl = document.querySelector('main') || document.body;
             let mnodes;
             try { mnodes = mainEl.querySelectorAll('*'); } catch (e) { mnodes = []; }
-            if (mnodes.length > 8000) mnodes = [];
+            if (mnodes.length > DIAG.maxNodes) DIAG.maxNodes = mnodes.length;
+            if (mnodes.length > NODE_CAP) {
+                DIAG.cappedRoots++; DIAG.structuralCapped = true; mnodes = [];
+            } else { DIAG.roots++; DIAG.walked += mnodes.length; }
             for (const el of mnodes) {
                 if (el.children.length > 2) continue;
                 const t = (el.innerText || el.textContent || '').trim();
@@ -19041,18 +20653,56 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
             } catch (e) {}
         }
         walk(document);
-        if (!hits.length) return { found: false, candidates: 0 };
+        if (!hits.length) return {
+            found: false, candidates: 0,
+            // "nothing matched" and "nothing was looked at" are different
+            // failures needing different fixes, and they were reported
+            // identically. `partial` is its own answer: some roots were
+            // scanned and some abandoned, so a wording change and an oversized
+            // thread are BOTH still live explanations.
+            reason: (DIAG.cappedRoots && !DIAG.walked) ? 'node_cap'
+                  : DIAG.cappedRoots ? 'node_cap_partial'
+                  : DIAG.roots ? 'no_match' : 'no_roots',
+            walked: DIAG.walked, maxNodes: DIAG.maxNodes,
+            cappedRoots: DIAG.cappedRoots, roots: DIAG.roots,
+            structuralCapped: DIAG.structuralCapped, nodeCap: NODE_CAP };
         // Parent strip (verb+count) wins over badge child (count-only) via
         // hitScore; ties broken by lowest-on-page, then shortest text.
         hits.sort((a, b) => (hitScore(b) - hitScore(a)) || (b.top - a.top) || (a.len - b.len));
         return clickAndReturn(hits[0].el, hits.length, 'global');
     }"""
+    # The miss diagnostic, kept across every context we try. Without this the
+    # function threw away everything the JS reported and returned a constant,
+    # so the caller could only guess why — and guessed wrong on an oversized
+    # thread, which is the one cause a longer run makes MORE likely.
+    _miss = {"found": False, "candidates": 0, "reason": "no_result", "contexts": 0}
+
+    def _keep(cand, ctx_label):
+        """Prefer the most actionable miss across host + frames.
+
+        A node-cap miss outranks a no-match miss: it names a concrete cause,
+        whereas 'nothing matched here' is the default answer from the twenty
+        frames that were never going to hold the strip anyway.
+        """
+        nonlocal _miss
+        seen = _miss.get("contexts", 0) + 1
+        if not isinstance(cand, dict):
+            _miss["contexts"] = seen
+            return
+        rank = {"node_cap": 3, "node_cap_partial": 2, "no_match": 1}
+        first = _miss.get("reason") == "no_result"
+        better = rank.get(cand.get("reason"), 0) > rank.get(_miss.get("reason"), 0)
+        if first or better:
+            _miss = {**cand, "found": False, "context": ctx_label}
+        _miss["contexts"] = seen
+
     try:
         res = await page.evaluate(JS, bool(skip_structural))
         if res and res.get("found"):
             return res
-    except Exception:
-        pass
+        _keep(res, "host")
+    except Exception as _he:
+        _miss["error"] = f"{type(_he).__name__}: {_he}"
     # #913: enumerate ALL frames — the DR card's iframe URL no longer matches
     # any fixed substring (live 2026-07-06: walked_hits=0 every P2 cycle while
     # CUA could SEE the strip; the old "deep_research|oaiusercontent" filter
@@ -19069,9 +20719,43 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
                 except Exception:
                     pass
                 return res
+            _keep(res, "frame")
     except Exception:
         pass
-    return {"found": False, "candidates": 0}
+    return _miss
+
+
+def _panel_miss_reason(res) -> str:
+    """One human line saying what the opener actually saw.
+
+    Replaces the caller's old assertion that the strip was "not yet rendered or
+    wording changed" — a sentence that named two causes on evidence for
+    neither, and was simply false whenever the walk had been abandoned.
+    """
+    res = res or {}
+    reason = res.get("reason") or "no_result"
+    cap = res.get("nodeCap")
+    biggest = res.get("maxNodes")
+    where = res.get("context", "?")
+    if reason == "node_cap":
+        return (f"the page was too large to scan — every root exceeded the "
+                f"{cap}-node ceiling (largest {biggest}), so NOTHING was "
+                f"examined; the strip may well be there")
+    if reason == "node_cap_partial":
+        return (f"partially scanned — {res.get('cappedRoots')} root(s) exceeded "
+                f"the {cap}-node ceiling (largest {biggest}) and were skipped, "
+                f"{res.get('walked')} nodes examined elsewhere with no match"
+                + (" (including the structural pass)"
+                   if res.get("structuralCapped") else ""))
+    if reason == "no_match":
+        return (f"scanned {res.get('walked')} nodes across {res.get('roots')} "
+                f"root(s) in {res.get('contexts')} context(s) and nothing "
+                f"matched — strip not yet rendered or wording changed")
+    if reason == "no_roots":
+        return "found no roots to scan at all — the thread DOM may not have mounted"
+    if res.get("error"):
+        return f"the DOM walk raised in the {where} context: {res['error']}"
+    return "no result came back from the DOM walk"
 
 
 async def _verify_chatgpt_panel_open(page):
@@ -23835,7 +25519,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                             _panel_dom_misses += 1
                             log(f"[{label}] panel DOM miss #{_panel_dom_misses} "
                                 f"(elapsed={elapsed_sec}s, walked_hits={cands}) — "
-                                f"strip not yet rendered or wording changed", "DEBUG")
+                                f"{_panel_miss_reason(res)}", "DEBUG")
                             if _panel_dom_misses in (2, 5):
                                 await _log_chatgpt_thread_snapshot(page, tag=f"p1-miss{_panel_dom_misses}")
                         elif res.get("alreadyExpanded"):
@@ -25891,8 +27575,17 @@ async def _resolve_parked_agent_decision(kind, action, p, name, key, elapsed,
             return "continue"
         # wait_longer / timeout → extend budget ONCE; after the 2nd unanswered
         # timeout, auto-skip instead of looping hard-fails forever.
+        #
+        # 2026-08-02: gated on the user's auto-skip setting, the fifth site in
+        # this family and the one nobody had noticed. This park carries a 300 s
+        # literal and its card is emitted with NO deadline, so with auto-skip OFF
+        # the user saw a Retry/Skip card with no countdown while a hidden ~10-min
+        # fuse burned down to a greyed tile and a closed tab. With the setting off
+        # we keep extending the budget and re-polling instead, so the card
+        # survives for a manual decision — the same stance the L3 hard cap and the
+        # registry firer already take.
         p["hf_timeouts"] = int(p.get("hf_timeouts", 0)) + 1
-        if p["hf_timeouts"] >= 2:
+        if p["hf_timeouts"] >= 2 and _runtime.auto_skip_stuck:
             log(f"[Claude] 2-artifact hard-fail timed out {p['hf_timeouts']}× without a "
                 "user decision — auto-skipping agent", "WARN")
             _hf_partial = ""
@@ -25918,8 +27611,18 @@ async def _resolve_parked_agent_decision(kind, action, p, name, key, elapsed,
             if name in pending:
                 del pending[name]
             return "continue"
-        # First timeout — extend budget and keep polling.
-        p["start_time"] = time.time() - (max_wait_min * 60) + (15 * 60)
+        if p["hf_timeouts"] < 2:
+            # First timeout — extend budget ONCE and keep polling.
+            p["start_time"] = time.time() - (max_wait_min * 60) + (15 * 60)
+            p["done_count"] = 0
+            p["cua_confirmed"] = False
+            return "continue"
+        # 2026-08-02: auto-skip OFF, and the one budget extension is already
+        # spent. Keep polling on the EXISTING clock — extending again would rewind
+        # `elapsed` to max_wait-15min on every 5-minute re-park, so the agent's own
+        # absolute limit could never be reached and an unattended run would loop
+        # here forever. The card is still up (nothing retracted it), so a manual
+        # Retry/Skip resolves it whenever the user gets to it.
         p["done_count"] = 0
         p["cua_confirmed"] = False
         return "continue"
@@ -26673,8 +28376,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # recorded-result check, close the tab, and destroy the run. The
             # live poll signals (`done_marker_first_at`, `done_count`) flag it.
             _p_inflight = pending.get(_agent_name) or {}
-            _inflight_done = (float(_p_inflight.get("done_marker_first_at", 0) or 0) > 0
-                              or int(_p_inflight.get("done_count", 0) or 0) > 0)
+            _inflight_done = inflight_looks_done(_p_inflight)
             # #953 (audit fold-in, race-safe): a Skip is a TERMINAL decision and
             # must supersede a co-queued Retry. When a parked agent is skipped
             # AND hard-retried in the same tick, the loop-top skip consumer
@@ -26710,6 +28412,12 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     _clear_pending_decision(_agent_key)
                 except Exception:
                     pass
+                # 2026-08-02: the card this just retracted is gone from the UI, so
+                # the "already raised it" latch must go with it. Leaving it set
+                # means a LATER failure on the same agent parks in silence — the
+                # error branch skips fail_agent entirely when the latch is on, so
+                # there would be a countdown running against no visible card.
+                _p_inflight["failed_alert_emitted"] = False
                 continue
             # 2026-04-25: when an agent failed pre-pending (setup/paste
             # failed during initial Phase 2 startup), `pending` won't have
@@ -27117,8 +28825,11 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 _pk_dec = _controls.poll_agent_decision(_pk_key)
                 if _pk_dec == "stop":
                     break
-                _pk_expired = (_pk_dec == "pending"
-                               and (time.time() - _parked.get("since", 0)) >= _parked.get("timeout", 300))
+                # 2026-08-02: a park window of 0 means NO DEADLINE (see
+                # park_window_elapsed) — the mid-run error park sets it when the
+                # user turned auto-skip OFF, and the old inline `>= timeout`
+                # comparison would have expired it on the very first tick.
+                _pk_expired = (_pk_dec == "pending" and park_window_elapsed(_parked))
                 if _pk_dec == "pending" and not _pk_expired:
                     continue  # still waiting on the user — do NOT block the loop
                 # A decision arrived (or the park window elapsed) — clear the
@@ -27884,7 +29595,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         p["chatgpt_panel_dom_misses"] = p.get("chatgpt_panel_dom_misses", 0) + 1
                         log(f"[ChatGPT] panel DOM miss #{p['chatgpt_panel_dom_misses']} "
                             f"(cycle={p.get('poll_cycles')}, walked_hits={cands}) — "
-                            f"strip not yet rendered or wording changed", "DEBUG")
+                            f"{_panel_miss_reason(res)}", "DEBUG")
                         if p["chatgpt_panel_dom_misses"] in (2, 6):
                             await _log_chatgpt_thread_snapshot(
                                 p["page"], tag=f"p2-miss{p['chatgpt_panel_dom_misses']}")
@@ -29110,14 +30821,39 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 # deliberately skips parked agents (line ~26141), so an armed
                 # entry would be dead weight that could still fire if the park
                 # were ever cleared without disarming. One timer, one actor.
-                _ae_window = AUTO_SKIP_UNACTED_SEC
+                #
+                # 2026-08-02 — the park must honour Settings → Pipeline →
+                # auto-skip. Arming AUTO_SKIP_UNACTED_SEC unconditionally meant a
+                # user who switched auto-skip OFF was shown a countdown to a fire
+                # their setting says can never happen, and the agent was dropped
+                # 30 minutes later anyway. Every sibling path honours the flag —
+                # the stuck card, the L3 hard cap, the registry firer, the exit
+                # sweep, and the P3 half of the very commit that introduced this
+                # one.
+                #
+                # With the flag OFF the window is 0, which the parked block reads
+                # as "no deadline, ever". We still PARK rather than dropping the
+                # agent. The first attempt at this fix did drop it — reasoning
+                # that a card with no timer needs no consumer, and that the two
+                # backend finalizers (_finalize_unresolved_autoskips,
+                # _fire_due_autoskips) both early-return when auto-skip is off so
+                # nothing could retract it. Both halves were true and the
+                # conclusion was still wrong: dropping the last polling agent
+                # empties `pending`, which exits the round-robin, which lets
+                # Phase 2 complete — and the WEB APP's phase_complete:2 handler
+                # rewrites every agent alert whose status is not clean to
+                # `type: "warn", actions: undefined`. The [Retry][Skip] buttons
+                # vanish. That is the 0-second retraction again, reached through a
+                # third actor in the other repo. Parking keeps `pending` non-empty,
+                # so the phase stays open and the card stays answerable.
+                _ae_window = unacted_window_sec(_runtime.auto_skip_stuck)
                 if not p.get("failed_alert_emitted"):
                     fail_agent(agent_key_err,
                                f"{name} reported an error",
                                (f"{name} showed a 'research failed' error and we kept "
                                 "what little it produced. Retry to run it fresh, or Skip it."),
-                               auto_skip_deadline=(time.time() + _ae_window) * 1000,
-                               arm_registry=False)
+                               **({"auto_skip_deadline": (time.time() + _ae_window) * 1000,
+                                   "arm_registry": False} if _ae_window else {}))
                     p["failed_alert_emitted"] = True
                 results[name] = {
                     "status": "agent_error",
@@ -29126,12 +30862,30 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     "page": p["page"],
                     "elapsed_sec": int(elapsed),
                 }
+                # 2026-08-02 — void the stale completion signals before parking.
+                #
+                # The CUA just said the page is in a FAILURE state, so any earlier
+                # "looks done" reading is void. This matters only because we PARK:
+                # dropping used to throw the whole dict away, and the loop-top
+                # hard-retry consumer reads exactly these two fields to decide a
+                # Retry is stale. A leftover done_count of 1 from the tick before
+                # the error (one CUA "done" needs two to confirm, so a single
+                # reading survives) made that consumer log "the agent already
+                # completed", retract the card, restart nothing, and auto-skip 30
+                # minutes later with no second card — the user's Retry silently
+                # swallowed by a guard meant for a completion race.
+                void_completion_signals(p)
                 p["awaiting_decision"] = {
                     "kind": "agent_error", "key": agent_key_err,
                     "since": time.time(), "timeout": _ae_window,
                 }
-                log(f"[{name}] parked kind=agent_error — its Retry/Skip card has "
-                    f"{int(_ae_window / 60)} min before auto-skip; siblings keep polling", "INFO")
+                log(f"[{name}] parked kind=agent_error — "
+                    + (f"its Retry/Skip card has {int(_ae_window / 60)} min before auto-skip"
+                       if _ae_window else
+                       "auto-skip is OFF, so its Retry/Skip card has no deadline and "
+                       "waits for you (the agent's absolute "
+                       f"{PER_AGENT_HARD_CAP_SEC // 60}-min limit is the only ceiling)")
+                    + "; siblings keep polling", "INFO")
                 continue
 
             if is_generating and not is_done:
@@ -31458,6 +33212,11 @@ async def publish_open_claude_artifact(page, browser, cua_client, verbose=False)
                     log(f"[Claude] Published artifact via DOM: {url}")
                     return url
                 # Try clicking "Copy link" button
+                # Armed inside the loop, once per attempt: this runs up to
+                # three times and attempt N must not accept what attempt N-1
+                # left on the clipboard — that is how a retry can "succeed"
+                # while the button it clicked did nothing.
+                _arm_clipboard()
                 copy_result = await page.evaluate("""() => {
                     const btns = document.querySelectorAll('button');
                     for (const b of btns) {
@@ -31471,8 +33230,9 @@ async def publish_open_claude_artifact(page, browser, cua_client, verbose=False)
                 }""")
                 if copy_result == 'copied':
                     await asyncio.sleep(0.5)
-                    clip = get_clipboard()
-                    if clip and 'claude.site' in clip:
+                    clip, _ = await _read_clipboard_after_copy(
+                        lambda c: 'claude.site' in c)
+                    if clip:
                         log(f"[Claude] Published artifact via clipboard: {clip}")
                         return clip
                 await asyncio.sleep(1)
@@ -31501,6 +33261,10 @@ async def publish_open_claude_artifact(page, browser, cua_client, verbose=False)
         # #839 act tier: on a Vision success the claude.site URL must land in
         # the returned text (the mission says "Tell me the EXACT URL" → it goes
         # into declare_success's reason) or on the clipboard — both read below.
+        # Armed before the mission: the DOM loop above clicked "Copy link" up
+        # to three times on its way here, so the clipboard is the LAST place
+        # that can be trusted to speak for the mission unless it is emptied.
+        _arm_clipboard()
         result = await _shadow_observed_cua(
             page, hotspot_id="publish-claude", phase=2, platform="claude",
             current_step="publish_open_artifact",
@@ -31519,8 +33283,8 @@ async def publish_open_claude_artifact(page, browser, cua_client, verbose=False)
             m = re.search(r'https://claude\.(?:site|ai)/[^\s]+', text)
         if m:
             return m.group(0)
-        clip = get_clipboard()
-        if clip and 'claude.site' in clip:
+        clip, _ = await _read_clipboard_after_copy(lambda c: 'claude.site' in c)
+        if clip:
             return clip
 
     return ""
@@ -31589,12 +33353,43 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
             log("Phase 1: HV gate could not be cleared — aborting phase", "ERROR")
             return None
 
+    # ── RUNG 1: the DOM tier. ──
+    # ⭐ (2026-08-03) The tier selection had NO DOM rung at all: it was a Vision/
+    # CUA mission or nothing, and the whole block was gated behind `if cua_client`
+    # — so on a host with no CUA key configured the P1 brief ran on whatever tier
+    # the account happened to be left on, silently. The picker below reads the
+    # trigger first and opens nothing when the pill is already on target, so the
+    # common case costs one page.evaluate.
+    #
+    # A POSITIVE, MECHANICALLY VERIFIED result is the only thing allowed to skip
+    # the rungs below it. `no_target` (nothing on the menu names the tier) does
+    # NOT short-circuit: that verdict belongs to the CUA path, which owns the
+    # no-subscription escalation, and a DOM miss must never be able to fabricate
+    # one. Every other verdict falls through to exactly today's behaviour.
+    _p1_tier = "unsure"
+    emit_event("agent_progress", phase=1, agent="chatgpt",
+               status="selecting_model",
+               progress="Selecting ChatGPT's highest reasoning tier…")
+    try:
+        _p1_tier = await _chatgpt_select_effort_tier(browser.page, label="ChatGPT", phase=1)
+    except Exception as _tse:
+        log(f"Phase 1: DOM tier picker errored ({_tse}) — falling through to Vision/CUA", "INFO")
+    _p1_tier_ok = _p1_tier in ("already", "selected")
+    # ⚠ Bound OUTSIDE the block below. It used to be defined inside it and read
+    # afterwards as `if cua_client and _pro_select_claimed` — safe only while the
+    # two conditions were the same one. Now that the DOM rung can skip the block
+    # with `cua_client` still set, an unbound name would raise there.
+    _pro_select_claimed = False  # #759: only DOM-confirm when the CUA path claimed Pro
+    if _p1_tier_ok:
+        log(f"Phase 1: model tier settled by the DOM rung ({_p1_tier}) — "
+            f"not running the Vision/CUA selector for it")
+
     # Select Pro model via CUA. Hard 180s ceiling — max_iterations=15 is
     # generous enough that a stuck CUA could loiter for many minutes
     # without this wait_for. If timed out, log + assume Pro is unavailable
     # so the rest of Phase 1 falls through gracefully (the pipeline still
     # gets an Extended Thinking attempt without the Pro model upgrade).
-    if cua_client:
+    if cua_client and not _p1_tier_ok:
         # DGOPS-7363 retry-aware Pro selection. Wrapped in a while-True so the
         # backstop alert's Retry button can re-run PROMPT_SELECT_PRO inline
         # after the user signs in with a Pro account. Exits the loop on:
@@ -31609,17 +33404,16 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
         # silently swallowing a genuine no-Pro.
         _pro_silent_retries = 0
         _PRO_SILENT_RETRY_MAX = 2
-        _pro_select_claimed = False  # #759: only DOM-confirm when CUA claimed Pro
         while True:
-            log("Selecting Pro + Extended Thinking...")
+            log("Selecting ChatGPT's highest reasoning tier via Vision/CUA...")
             emit_event("agent_progress", phase=1, agent="chatgpt",
                        status="selecting_model",
-                       progress="Selecting ChatGPT Pro with its latest thinking model…")
+                       progress="Selecting ChatGPT's highest reasoning tier…")
             try:
                 async def _select_pro_cua():
                     return await asyncio.wait_for(
                         agent_loop(cua_client, browser, PROMPT_SELECT_PRO,
-                            "Select ChatGPT Pro model with Extended Thinking. Say 'no pro available' if not found.",
+                            _p1_tier_mission(),   # policy-rendered; no phantom thinking toggle
                             model=CUA_MODEL, max_iterations=15, verbose=verbose),
                         timeout=180.0,
                     )
@@ -31633,10 +33427,13 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
                 # no-Pro verdict. Highest-risk act hotspot; default-off + CUA net.
                 result = await _shadow_observed_cua(
                     browser.page, hotspot_id="1a-select-pro", phase=1, platform="chatgpt",
-                    current_step="select_pro_extended_thinking",
-                    context_hint="select the ChatGPT Pro model with Extended Thinking via the "
-                                 "model picker; if there is no Pro option say so (don't guess)",
-                    expected_outcome="ChatGPT Pro + Extended Thinking is the active model",
+                    current_step="select_effort_tier",
+                    # ⚠ Rendered, not written out. _shadow_observed_cua APPENDS this
+                    # as "run detail" to the hotspot hint, so a phantom-toggle
+                    # instruction here reaches the Vision actor no matter how clean
+                    # the hint above it is — the fourth copy of the same sentence.
+                    context_hint=_p1_tier_mission() + " Use the model picker.",
+                    expected_outcome=_p1_select_pro_hotspot()["expected_outcome"],
                     cua_coro_factory=_select_pro_cua,
                     mission_prompt=PROMPT_SELECT_PRO,
                     act_timeout_s=150.0) or {"text": ""}
@@ -31725,6 +33522,16 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
     # a confirmed downgrade does ONE silent re-run of the selector; everything
     # else proceeds. No card/pause/badge — this is a quality knob (like Claude's
     # Effort/Thinking), WARN-only.
+    #
+    # ⚠ It does NOT run when the DOM rung settled the tier: `_pro_select_claimed`
+    # stays False on that path by construction. The confirm exists to check a
+    # PROSE claim ("no 'no pro' in the verdict") against the DOM; the DOM rung's
+    # verdict already IS a DOM read of the same trigger, so re-reading it would
+    # be the same evidence twice and a `downgrade` verdict there would fire a CUA
+    # re-select against a tier we just watched land.
+    if _p1_tier_ok:
+        log(f"[Phase1] Tier confirmed by the DOM rung ({_p1_tier}) — skipping the "
+            f"post-select confirm (it re-reads the same trigger)", "INFO")
     if cua_client and _pro_select_claimed:
         try:
             _epc = await _chatgpt_extended_pro_confirm(browser.page)
@@ -31738,7 +33545,7 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
                 async def _select_pro_rerun_cua():
                     return await asyncio.wait_for(
                         agent_loop(cua_client, browser, PROMPT_SELECT_PRO,
-                            "Select ChatGPT Pro model with Extended Thinking. Say 'no pro available' if not found.",
+                            _p1_tier_mission(),   # policy-rendered; no phantom thinking toggle
                             model=CUA_MODEL, max_iterations=15, verbose=verbose),
                         timeout=180.0,
                     )
@@ -31748,10 +33555,10 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
                 # invariants via PROMPT_SELECT_PRO.
                 await _shadow_observed_cua(
                     browser.page, hotspot_id="1a-select-pro", phase=1, platform="chatgpt",
-                    current_step="reselect_pro_after_downgrade",
-                    context_hint="post-select DOM confirm saw a non-Pro mode — re-select "
-                                 "ChatGPT Pro + Extended Thinking via the model picker",
-                    expected_outcome="ChatGPT Pro + Extended Thinking is the active model",
+                    current_step="reselect_effort_tier_after_downgrade",
+                    context_hint="post-select DOM confirm saw a non-Pro mode — re-select. "
+                                 + _p1_tier_mission(),
+                    expected_outcome=_p1_select_pro_hotspot()["expected_outcome"],
                     cua_coro_factory=_select_pro_rerun_cua,
                     mission_prompt=PROMPT_SELECT_PRO,
                     act_timeout_s=150.0)
@@ -32059,22 +33866,86 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
 
 # ── Playwright-direct platform setup (replaces vision-based CUA setup) ────────
 
-async def setup_chatgpt_dr(page) -> bool:
+async def setup_chatgpt_dr(page, allow_model_pick=False) -> bool:
     """Enable ChatGPT Deep Research mode via direct selectors. Returns True on success.
 
     Step-by-step logs emit on every branch so next run's log tells us
     exactly which step broke — previously this was one-line "setup failed"
     with no detail, leaving us guessing whether the + menu opened, whether
     the DR option was found, or whether verification landed.
+
+    ⭐ (2026-08-03) READ-FIRST. Step 0 asks whether Deep Research is ALREADY on
+    before touching anything. It is sticky per account, and
+    ``ensure_deep_mode_active`` re-enters this function whenever its own state
+    read comes back false — so the old unconditional "open the menu, click Deep
+    research" could arrive at an already-selected tool and click it, which on the
+    current UI ADDS A SECOND Deep Research rather than toggling it off. That is
+    the same firewall ``selfheal.decide_toggle`` was extracted for, and it is now
+    the first thing this function does.
+
+    ``allow_model_pick`` is the exact analogue of ``setup_claude_dr``'s
+    ``allow_probe``, and exists for the same reason. This function is re-entered
+    from ``ensure_deep_mode_active``'s PRE-SEND check and from the mid-run
+    recovery paths, where the composer already holds the brief — opening the
+    effort menu there is the #744 screenshot, a popover sitting over a loaded
+    composer seconds before send. Only the INITIAL P2 setup passes True.
     """
     try:
         await asyncio.sleep(2)
-        # Step 1: open the + / tools menu in the composer
+        _tiers, _verbs, _tool_word = _chatgpt_tier_policy()
+
+        async def _dr_state():
+            try:
+                return await page.evaluate(_CHATGPT_DR_ACTIVE_JS) or {}
+            except Exception as _se:
+                log(f"[setup_chatgpt_dr] composer probe failed ({_se})", "INFO")
+                return {}
+
+        # ── Step 0: the pre-act toggle guard (#709). ──
+        # `confirmed_off` is a POSITIVE off-signal, not merely "the predicate said
+        # false": the composer has to be READABLE (a placeholder came back) before
+        # an absent pill counts as evidence it is off.
+        #
+        # ⛔ ALL THREE DECISIONS ARE LOAD-BEARING, including `ambiguous`. The
+        # firewall's rule is that a toggle may only ever move a CONFIRMED-opposite
+        # control, and this platform is the strongest case for it: a click on an
+        # already-selected Deep Research does not toggle it off, it ADDS A SECOND
+        # ONE. An unreadable composer is not evidence of anything, so we decline
+        # to click and return False — which hands the intent to the ladder's next
+        # rung rather than gambling. The cost of that is one Vision/CUA fallback,
+        # i.e. exactly what this step did on every run before it worked at all.
+        _st0 = await _dr_state()
+        _confirmed_off = bool(_st0) and not _st0.get("active") and bool(_st0.get("placeholder"))
+        _toggle_dec = _toggle_decision(bool(_st0.get("active")), _confirmed_off)
+        if _toggle_dec == "skip":
+            log(f"[setup_chatgpt_dr] Step 0: Deep Research is ALREADY active "
+                f"(pill={_st0.get('pillText')!r} placeholder={_st0.get('placeholder')!r}) — "
+                f"NOT clicking the menu item (a second click adds a second Deep Research)")
+            if allow_model_pick:
+                await _chatgpt_p2_effort_tier(page)
+            return True
+        if _toggle_dec == "ambiguous":
+            log(f"[setup_chatgpt_dr] Step 0: cannot read the composer "
+                f"(state={_st0!r}) — declining to click Deep Research on an "
+                f"ambiguous read; the next rung takes it", "WARN")
+            return False
+        log(f"[setup_chatgpt_dr] Step 0: Deep Research not active "
+            f"(decision={_toggle_dec}, placeholder={(_st0 or {}).get('placeholder')!r}) — enabling it")
+
+        # Step 1: open the + / tools menu in the composer.
+        # Ordered hooks, most-durable first. The captured control is
+        # `button[data-testid="composer-plus-btn"]` with aria-label "Add files and
+        # more" — which is why the testid leads: the two aria patterns that used
+        # to run ahead of it match nothing on that label ("Attach" is absent, and
+        # `*="More"` is case-SENSITIVE so it misses "more"), and `*="Attach"`
+        # reaching a real attachment button would open a file chooser instead of
+        # the tools menu.
         menu_sel = None
-        for sel in ['button[aria-label*="Use a tool"]',
-                    'button[aria-label*="Attach"]',
-                    'button[data-testid="composer-plus-btn"]',
-                    'button[aria-label*="More"]']:
+        for sel in ['button[data-testid="composer-plus-btn"]',
+                    'button[aria-label*="Add files" i]',
+                    'button[aria-label*="Use a tool" i]',
+                    'button[aria-label*="Attach" i]',
+                    'button[aria-label*="more" i]']:
             try:
                 btn = await page.query_selector(sel)
                 if btn:
@@ -32089,62 +33960,93 @@ async def setup_chatgpt_dr(page) -> bool:
             return False
         log(f"[setup_chatgpt_dr] Step 1 OK: opened tools menu via {menu_sel}")
 
-        # Step 2: click "Deep research" option in the menu.
-        # 2026-05-29 (#709): the DOM Step 2 FAILed 100% of last E2E on every
-        # worker — the run only succeeded when the non-deterministic CUA
-        # fallback happened to recover it. ROOT CAUSE (user-captured live "+"
-        # dump): "Deep research" is a **role="menuitemradio"** with exact text
-        # "Deep research" and EMPTY aria-label + EMPTY data-testid — but the
-        # prior selector set was '[role="menuitem"], button, div[role="option"]'
-        # which OMITTED role="menuitemradio", so the item was never even a
-        # candidate. The text/`===` matching was fine; the element-role filter
-        # excluded it. (Siblings "Create image"/"Web search" are also radios,
-        # so we match EXACTLY "deep research", never a contains.) DR is
-        # top-level in "+" — no "More" submenu. role+text is the only signal
-        # (aria/testid empty), so that's what we pin; aria-label + starts-with
-        # are kept as defensive fallbacks for a future relabel/icon-prefix.
-        _dr_click_js = """() => {
-            const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-            const items = document.querySelectorAll(
-                '[role="menuitemradio"], [role="menuitem"], [role="option"], button, a, li');
-            // Pass 1 — the real, current shape: exact "deep research".
-            for (const el of items) {
-                if (!el.offsetParent) continue;
-                if (norm(el.textContent) === 'deep research' ||
-                    norm(el.getAttribute('aria-label')) === 'deep research') {
-                    el.click(); return true;
-                }
-            }
-            // Pass 2 — defensive: starts-with / contains for a future icon-
-            // prefixed or relabeled variant ("travel_exploreDeep research").
-            for (const el of items) {
-                if (!el.offsetParent) continue;
-                const t = norm(el.textContent);
-                const a = norm(el.getAttribute('aria-label'));
-                if (t.startsWith('deep research') || t.includes('deep research') ||
-                    a.startsWith('deep research')) {
-                    el.click(); return true;
-                }
-            }
-            return false;
-        }"""
-        clicked = await page.evaluate(_dr_click_js)
+        # Step 2: click the Deep-Research row in the menu.
+        #
+        # ⭐ (2026-08-03) SCOPED TO THE MENU'S OWN ROWS. The user-captured "+"
+        # menu is not a portal, not `[role=menu]`, not `[data-state=open]`: it
+        # renders inline in the body and its rows are plain DIVs with NO role, NO
+        # aria-label and NO data-testid — `class="group __menu-item gap-1.5"` is
+        # the only hook. So the prior role-based candidate set could not match a
+        # single row, Step 2 missed on every run, and the CUA fallback had been
+        # carrying this step for months.
+        #
+        # ⛔ The candidate set does NOT include `button, a, li` any more, and that
+        # is the safety half of the fix. ChatGPT renders a SUGGESTION STRIP whose
+        # chips carry near-identical labels with a DIFFERENT class ("Search the
+        # web" vs the menu's "Web search", "Create an image" vs "Create image").
+        # An unscoped element search reaches those chips, clicks one, and the tool
+        # is silently never enabled — a failure that looks exactly like success
+        # from here. Scoping IN to the menu's own rows excludes them structurally,
+        # rather than by naming them (a new chip label would re-open that hole).
+        #
+        # The target word is the policy's tool label, not a literal.
+        try:
+            _snap = await page.evaluate(_CHATGPT_MENU_ROWS_JS,
+                                        {"groups": _CHATGPT_TOOL_ROW_GROUPS})
+        except Exception as _me:
+            log(f"[setup_chatgpt_dr] Step 2: menu row read failed ({_me})", "WARN")
+            _snap = {}
+        _rows = list((_snap or {}).get("rows") or [])
+        _via = (_snap or {}).get("via") or ""
+        # Title and description are CONCATENATED in these rows ("Deep research Get
+        # a detailed report"), so the match is a prefix-or-word test, never `===`.
+        _idx = -1
+        for _i, _r in enumerate(_rows):
+            _rl = (_r or "").strip().lower()
+            if _rl.startswith(_tool_word) or has_term(_rl, [_tool_word]):
+                _idx = _i
+                break
+        clicked = False
+        if _idx >= 0:
+            try:
+                _res = await page.evaluate(_CHATGPT_CLICK_ROW_JS,
+                                           {"groups": _CHATGPT_TOOL_ROW_GROUPS, "via": _via,
+                                            "index": _idx, "expect": _rows[_idx],
+                                            "attr": _SR_CLICK_MARK, "value": "tool-row"})
+                clicked = bool(isinstance(_res, dict) and _res.get("clicked"))
+                if clicked:
+                    # The row is only MARKED at this point — see _sr_real_click.
+                    # A row that cannot be pressed is not a row that was clicked,
+                    # and reporting it as one is what sends the caller past its
+                    # own verification with nothing having happened.
+                    clicked = bool(await _sr_real_click(
+                        page, "tool-row", tag="[setup_chatgpt_dr]"))
+                    if not clicked:
+                        log(f"[setup_chatgpt_dr] Step 2: row {_rows[_idx][:40]!r} was "
+                            f"located but could not be pressed", "WARN")
+                else:
+                    log(f"[setup_chatgpt_dr] Step 2: row {_rows[_idx][:40]!r} not clicked "
+                        f"(reason={(_res or {}).get('reason')})", "WARN")
+            except Exception as _ce:
+                log(f"[setup_chatgpt_dr] Step 2: row click errored ({_ce})", "WARN")
+        else:
+            log(f"[setup_chatgpt_dr] Step 2: no '{_tool_word}' row among {len(_rows)} "
+                f"menu rows via {_via or '-'}: "
+                f"{json.dumps([r[:32] for r in _rows[:8]], ensure_ascii=False)}", "INFO")
         if not clicked:
             # One-shot diagnostic dump (mirrors #708 Step 3A) so the NEXT E2E
             # pins the exact menu-item structure instead of us guessing the
             # selector. Grep backend.log for "Step 2 menu-item dump".
             try:
+                # Diagnostic ONLY — this one stays document-wide on purpose (it
+                # has to be able to show us a control no selector reached), and
+                # it now reports `cls` because the live rows turned out to be
+                # class-only DIVs, which a role/aria/testid dump could not have
+                # revealed. Nothing here clicks.
                 dump = await page.evaluate("""() => {
                     const out = [];
                     for (const el of document.querySelectorAll(
-                            '[role="menuitem"], [role="menuitemradio"], [role="option"], button, a, li')) {
+                            '[role="menuitem"], [role="menuitemradio"], [role="option"], '
+                            + '.__menu-item, button, a, li')) {
                         if (!el.offsetParent) continue;
                         const t = (el.textContent || '').replace(/\\s+/g, ' ').trim();
                         const a = el.getAttribute('aria-label') || '';
                         if (!t && !a) continue;
+                        const c = (el.className && el.className.toString) ? el.className.toString() : '';
                         out.push({ role: el.getAttribute('role') || el.tagName.toLowerCase(),
                                    text: t.slice(0, 60), aria: a.slice(0, 60),
-                                   testid: el.getAttribute('data-testid') || '' });
+                                   testid: el.getAttribute('data-testid') || '',
+                                   cls: c.slice(0, 60) });
                     }
                     return out.slice(0, 30);
                 }""")
@@ -32159,44 +34061,62 @@ async def setup_chatgpt_dr(page) -> bool:
         log("[setup_chatgpt_dr] Step 2 OK: clicked Deep research menu option")
         await asyncio.sleep(1.5)
 
-        # Step 3: verify DR actually activated — look for the DR pill in the
-        # composer area (not anywhere in body text, which was the previous
-        # false-positive-prone check that matched tooltips and help labels).
-        active = await page.evaluate("""() => {
-            const composer = document.querySelector('form') || document.body;
-            // Prefer a visible pill/chip inside the composer
-            const chips = [...composer.querySelectorAll('button, [role="button"], span, div')];
-            for (const el of chips) {
-                if (!el.offsetParent) continue;
-                const t = (el.textContent || '').trim().toLowerCase();
-                if (t === 'deep research' || t === 'deep research off') {
-                    // Composer-level visible pill is the active-mode indicator
-                    return { ok: true, via: 'pill', text: el.textContent.trim().slice(0, 40) };
-                }
-            }
-            // Secondary signal: composer placeholder changes for DR mode
-            const ta = document.querySelector('#prompt-textarea, textarea, [contenteditable="true"]');
-            if (ta) {
-                const placeholder = (ta.getAttribute('placeholder') || ta.getAttribute('data-placeholder') || '').toLowerCase();
-                if (placeholder.includes('research')) {
-                    return { ok: true, via: 'placeholder', text: placeholder.slice(0, 60) };
-                }
-            }
-            return { ok: false };
-        }""")
-        if not active or not active.get("ok"):
-            log("[setup_chatgpt_dr] Step 3 FAIL: clicked DR but no pill/placeholder change visible after 1.5s — click may have been intercepted", "WARN")
+        # Step 3: verify DR actually activated.
+        #
+        # ⭐ THE SHARED DETECTOR, not a second opinion. This step used to carry
+        # its own inline check and the two had drifted apart in both directions:
+        # it demanded the pill's text be EXACTLY "deep research" (the shared
+        # detector allows the label to carry a suffix), and its placeholder
+        # signal tested for the word "research" when the real Deep-Research
+        # placeholder is "Get a detailed report" — which contains neither. So a
+        # correctly-enabled tool could verify as FAILED here and drop the run
+        # into the CUA fallback for nothing. `_CHATGPT_DR_ACTIVE_JS` is also the
+        # outcome predicate the self-heal contract declares for this intent, and
+        # the contract's rule is that predicates are reused, never duplicated.
+        active = await _dr_state()
+        if not active or not active.get("active"):
+            log("[setup_chatgpt_dr] Step 3 FAIL: clicked DR but the composer shows no "
+                "Deep-Research pill or placeholder after 1.5s "
+                f"(placeholder={(active or {}).get('placeholder')!r}) — click may have "
+                "been intercepted", "WARN")
             return False
-        log(f"[setup_chatgpt_dr] Step 3 OK: verified DR active via {active.get('via')} → {active.get('text')}")
-        if selfheal and selfheal.is_enabled():
-            # Detect-only: ChatGPT has no P2 model lever today; the probe captures
-            # the composer so the shadow report surfaces a model selector if one
-            # ever appears (→ escalate at PX-2, never silently heal).
-            await _selfheal_shadow_observe(page, "chatgpt.select_model", outcome_pass=True)
+        log(f"[setup_chatgpt_dr] Step 3 OK: verified DR active "
+            f"(pill={active.get('pillText')!r} placeholder={active.get('placeholder')!r})")
+        if allow_model_pick:
+            await _chatgpt_p2_effort_tier(page)
         return True
     except Exception as e:
         log(f"[setup_chatgpt_dr] exception: {e}", "WARN")
         return False
+
+
+async def _chatgpt_p2_effort_tier(page) -> str:
+    """Run the effort-tier picker on the P2 composer and shadow-log the intent.
+
+    ⭐ THE SAME CONTROL AS PHASE 1. The capture's headline for ChatGPT is that
+    effort and model are ONE menu, reached from the composer pill — so there is
+    no separate "P2 model lever" to build, and this is the P1 picker pointed at
+    the P2 page. In practice it opens nothing: ChatGPT persists the tier per
+    account, P1 already put the pill on target, so the read-first branch returns
+    ``already`` and the menu stays shut. That is deliberate — an extra popover
+    over the composer is the #744 complaint, not a feature.
+
+    Never raises and never gates: the P2 deliverable is Deep Research, and the
+    tier is a quality knob (the same status Claude's effort has).
+    """
+    try:
+        verdict = await _chatgpt_select_effort_tier(page, label="ChatGPT", phase=2)
+    except Exception as e:
+        log(f"[setup_chatgpt_dr] effort-tier pick errored ({e}) — non-fatal", "INFO")
+        verdict = "unsure"
+    if selfheal and selfheal.is_enabled():
+        # ⚠ outcome_pass is the REAL verdict now. This call used to pass a
+        # hardcoded True against a "a model selector is ABSENT" predicate, so the
+        # shadow log recorded a pass for an intent that was asserting something
+        # the live DOM disproves — every sample from it was noise.
+        await _selfheal_shadow_observe(page, "chatgpt.select_model",
+                                       outcome_pass=verdict in ("already", "selected"))
+    return verdict
 
 
 # Phoenix (model_refresh) — last-observed advisory thinking/effort confirmation
@@ -32212,6 +34132,12 @@ _P2_THINKING_STATE: dict = {}
 # the latest verified-working model as known_good (on-the-fly learning). Float
 # or None; process-local; last write wins.
 _P2_PICKED_VERSION: dict = {}
+
+# One-shot latch so a persistently unwritable state dir WARNs once per process
+# instead of on every setup. See the record_probe call site for why a silent
+# stamp failure matters: it turns the periodic model check into a per-run
+# popover, which is the #744 complaint.
+_PROBE_STAMP_WARNED = False
 
 
 async def _selfheal_shadow_observe(page, intent_id: str, *, outcome_pass) -> None:
@@ -32319,63 +34245,142 @@ async def _selfheal_try(page, intent_id: str, *, check_active, confirmed_off) ->
         return False
 
 
-# Phoenix (model_refresh) — Gemini "pick highest Flash" ranker. Mirrors
-# models.pick_highest_model (Python, unit-tested + reused by the canary): among
-# visible dropdown rows, reject Flash-Lite/Pro/Deep-Think FIRST, parse the Flash
-# version (row text is title+desc concatenated, so no trailing boundary after
-# "flash"), and pick the HIGHEST >= floor (tie → shortest text = leaf row). With
-# doClick it clicks the winner; otherwise it's a read-only shadow probe. Also
-# returns `legacy` = what the old frozen /3.5 flash/ match would have hit, for
-# the shadow-comparison log. NB: model_refresh "Phoenix", not the restart one.
-_GEMINI_FLASH_RANK_JS = """({floor, doClick, pin}) => {
+# Gemini "pick the newest Flash" ranker. Mirrors models.pick_highest_model
+# (Python, unit-tested): among visible dropdown rows, reject Flash-Lite / Pro /
+# Deep-Think FIRST, parse the version (row text is title+desc concatenated, so no
+# trailing boundary after the family word), and pick the HIGHEST offered
+# (tie → shortest text = leaf row). With doClick it clicks the winner; otherwise
+# it is a read-only probe.
+#
+# ⭐ NO FLOOR, NO FAMILY LITERAL (2026-08-01). "Highest offered" cannot pick a
+# downgrade, so a floor could only reject the row that should have won; and the
+# family word now comes from policy. `below` is the step-back tool used when the
+# newest model failed to enter Deep Research. A row naming the family with no
+# parseable version is a last-resort candidate so a version-less rename does not
+# empty the menu — but it is never a step-back target, since it cannot be proven
+# older than what just failed.
+_GEMINI_FLASH_RANK_JS = """({below, doClick, pin, fam, reject, triggerText}) => {
     const items = [...document.querySelectorAll(
         '[role="menuitem"], [role="menuitemradio"], [role="option"], button, a, li')];
-    const flashVer = t => { const m = t.match(/(\\d+(?:\\.\\d+)?)\\s*flash/i); return m ? parseFloat(m[1]) : null; };
-    let bestEl = null, best = '', bestV = -1, bestLen = Infinity, legacy = '';
+    const famRe = new RegExp(fam, 'i');
+    // ⭐ BOTH VERSION ORDERS, deliberately — see models.parse_family_version,
+    // which tries exactly these two patterns in exactly this order. Gemini ships
+    // number-first ("3.6 Flash") and Claude family-first ("Opus 5") TODAY, so a
+    // single-order parser is correct only until ITS OWN vendor renames. When that
+    // happens every row parses as version-less, the ranking collapses to the
+    // "shortest label" tie-break, and this selects an OLDER Flash while reporting
+    // success — a silent downgrade, and `version: null` also disarms the step-back.
+    const verFamFirst = new RegExp(fam + '[ ._/()-]{0,3}([0-9]+(?:\\\\.[0-9]+)?)', 'i');
+    const verNumFirst = new RegExp('([0-9]+(?:\\\\.[0-9]+)?)[ ._/()-]{0,3}' + fam, 'i');
+    const flashVer = t => {
+        const m = (t || '').match(verFamFirst) || (t || '').match(verNumFirst);
+        return m ? parseFloat(m[1]) : null;
+    };
+    // Character-level port of models.reject_matches — ONE definition of reject
+    // semantics, not a second opinion. A term matches at a word boundary on the
+    // left and, unless it ends in '*', on the right too:
+    //   'lite*' rejects "flash-litefastest" but not "elite"
+    //   'pro'   rejects " pro " but NOT "productivity"/"improve" — a substring
+    //           match there would bin a Flash row over a word in its blurb, and
+    //           if that bins every Flash row the run falls back to whatever the
+    //           dropdown defaulted to (the Gemini-Pro DR hang).
+    // Regex-free on purpose: this is a non-raw Python string, where a lone \\b
+    // once became a literal backspace and silently killed a gate (#913).
+    const isAlnum = c => !!c && ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'));
+    const rejected = (t) => {
+        for (let raw of (reject || [])) {
+            let term = String(raw).toLowerCase();
+            const prefix = term.endsWith('*');
+            if (prefix) term = term.slice(0, -1);
+            if (!term) continue;
+            let i = t.indexOf(term);
+            while (i !== -1) {
+                const leftOk = i === 0 || !isAlnum(t[i - 1]);
+                const end = i + term.length;
+                const rightOk = prefix || end >= t.length || !isAlnum(t[end]);
+                if (leftOk && rightOk) return true;
+                i = t.indexOf(term, i + 1);
+            }
+        }
+        return false;
+    };
+    // The dropdown TRIGGER names the current model too. With version-less rows
+    // now acceptable, on a rename day (no numbered rows anywhere) the shortest
+    // element containing the family word is plausibly the trigger itself —
+    // clicking it just shuts the menu while we report a successful pick.
+    const trig = (triggerText || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+    let bestEl = null, best = '', bestRank = null, bestLen = Infinity;
     for (const el of items) {
         if (!el.offsetParent) continue;
         const t = (el.textContent || '').trim().toLowerCase();
         if (!t) continue;
+        if (trig && t.replace(/\\s+/g, ' ') === trig) continue;   // never click the trigger
         // Reject siblings FIRST (order matters — "Flash-Lite" also has "flash").
-        if (t.includes('lite') || t.includes('deep think') || /\\bpro\\b/.test(t)) continue;
-        if (!legacy && /3\\.5\\s*flash/i.test(t)) legacy = t.slice(0, 40);
+        if (rejected(t)) continue;
         const v = flashVer(t);
-        if (v === null) continue;
-        if (pin != null) {
-            if (Math.abs(v - pin) > 0.001) continue;   // pin: exact known-good Flash version
-        } else if (floor != null && v < floor) continue;
-        if (v > bestV || (v === bestV && t.length < bestLen)) {
-            bestEl = el; best = t.slice(0, 40); bestV = v; bestLen = t.length;
+        if (v === null && !famRe.test(t)) continue;
+        let rank;
+        if (pin != null && v !== null && Math.abs(v - pin) <= 0.001) {
+            // ⭐ Exact known-good — outranks everything below, but as a RANK TIER,
+            // never a `break`. `items` is a document-wide query returned in
+            // document order, so the first element whose text carries the pinned
+            // version is routinely a wrapper li/a around the row (or an earlier
+            // page element naming that version). Clicking it does not change the
+            // model, yet clicked:true is returned and the caller logs a successful
+            // pick. Falling through applies the same shortest-text leaf preference
+            // the rest of this ranker uses — the same fix as in _pick_opus_js.
+            rank = [2, v];
+        } else {
+            if (pin != null || below != null) {
+                // Step-back: only rows strictly older than what just failed. When a
+                // pin was requested this is the FALLBACK for a pin that is no longer
+                // on the menu — see the same rule in _pick_opus_js.
+                const bound = below != null ? below : pin;
+                if (v === null || v >= bound - 0.001) continue;
+            }
+            rank = v === null ? [0, 0] : [1, v];
+        }
+        if (bestEl === null || rank[0] > bestRank[0] || (rank[0] === bestRank[0] && rank[1] > bestRank[1])
+                || (rank[0] === bestRank[0] && rank[1] === bestRank[1] && t.length < bestLen)) {
+            bestEl = el; best = t.slice(0, 40); bestRank = rank; bestLen = t.length;
         }
     }
     if (doClick && bestEl) bestEl.click();
-    return { pick: best, version: bestV, legacy, clicked: !!(doClick && bestEl) };
+    return { pick: best, version: bestRank && bestRank[0] ? bestRank[1] : null,
+             clicked: !!(doClick && bestEl) };
 }"""
 
 
-async def _gemini_select_flash_model(page, pin_model=None) -> bool:
-    """Pre-DR step: open the model dropdown and select the latest Flash.
+async def _gemini_select_flash_model(page, pin_model=None, step_below=None) -> bool:
+    """Pre-DR step: open the model dropdown and select the newest FLASH.
 
-    Why this matters: the pipeline runs Gemini Deep Research on 3.5 Flash
-    (user-validated 2026-05-26 — Flash completes cleanly and its done-state
-    becomes detectable after the periodic refresh, whereas 3.1 Pro DR ran
-    1-2h and needed manual "is it done?" nudges to unstick). If the composer
-    is left on whatever the dropdown defaults to, the DR job can run on the
-    wrong model — so we explicitly pick 3.5 Flash before enabling DR.
+    Why the family is Flash and not something "better": Flash Deep Research
+    completes cleanly and its done-state becomes detectable after the periodic
+    refresh, whereas Gemini Pro Deep Research ran 1-2h and needed manual "is it
+    done?" nudges to unstick (user-validated 2026-05-26). That family choice is
+    deliberate; the VERSION inside it is not pinned at all — we always take the
+    highest Flash the dropdown offers, so a release needs no code change.
 
     Approach: open the model button (data-test-id="bard-mode-menu-button"),
-    click the "3.5 Flash" row (rejecting Flash-Lite / Pro / Deep Think
-    siblings), then open the "Thinking level" submenu and click "Extended"
-    — the pipeline wants "Flash Extended", not the default "Standard".
-    Menu-row text is title+description concatenated ("3.5 FlashAll-around
-    help"), so the model match avoids a trailing word boundary.
-    Best-effort: if the dropdown rotated or 3.5 Flash isn't available,
-    return False — the caller enables DR anyway. The Extended step is
-    softer still: a miss only leaves the default thinking level (logged).
+    click the highest Flash row (rejecting the Flash-Lite / Pro / Deep Think
+    siblings named in the policy's `reject` list), then open the "Thinking level"
+    submenu and click "Extended" — the pipeline wants Flash Extended, not the
+    default "Standard". Menu-row text is title+description concatenated
+    ("3.5 FlashAll-around help"), so the match avoids a trailing word boundary.
+    Best-effort: if the dropdown rotated or no Flash is available, return False —
+    the caller enables DR anyway. The Extended step is softer still: a miss only
+    leaves the default thinking level (logged).
 
-    Returns True when 3.5 Flash is selected (Extended is set best-effort
+    Unlike Claude, this opens the dropdown on EVERY run, so the newest Flash
+    reaches the account without any probe cadence.
+
+    Returns True when a Flash row was selected (Extended is set best-effort
     within); False if the model couldn't be picked.
     """
+    # Clear first — same reason as setup_claude_dr: this is a process-global and
+    # the early-return paths below never write it, so a previous run's value
+    # would be read as "the version that just failed" by the step-back path.
+    _P2_PICKED_VERSION.pop("gemini", None)
     try:
         # Step 1: find the model dropdown button. Gemini's current UI uses
         # a button at the top of the chat header whose text is the current
@@ -32432,22 +34437,60 @@ async def _gemini_select_flash_model(page, pin_model=None) -> bool:
             return False
         await asyncio.sleep(0.8)
 
-        # Phoenix model_refresh — ACTIVATED (Phase B2): the version-ranker now
-        # picks AND clicks the highest Flash >= floor, superseding the frozen
-        # /3.5 flash/ literal. Behavior-identical TODAY (3.5 is the highest
-        # Flash) and auto-adapts the day a newer Flash ships. `legacy` records
-        # what the old frozen match would have hit, so the success log keeps the
-        # shadow-comparison trail and flags any divergence in an E2E.
+        # Pick + click the highest Flash the dropdown offers. Family and reject
+        # list come from policy; there is no version literal on either side, so
+        # the day a newer Flash ships this picks it with no code change. The old
+        # `legacy` shadow-comparison against a frozen /3.5 flash/ match is gone —
+        # it was log-only, and it was itself a pinned version.
+        _gm_family = p2_family("gemini") or "flash"
+        _gm_reject = reject_terms("gemini")
+        # The thinking-level word, from policy rather than four separate literals
+        # in the page.evaluate strings below. The advisory at the end of the P2
+        # leg ALREADY reads this key, so while the selectors hardcoded 'extended'
+        # a rename would have made the advisory report thinking as missing while
+        # every selector kept hunting the old word — the two halves disagreeing
+        # about what they are even looking for. Restricted to letters/digits/
+        # spaces for the same reason p2_family is: it is interpolated into page
+        # JS, and the overlay may supply any string.
+        # ⛔ Must be a STRING. The overlay schema admits `thinking` as bool OR str
+        # (the Claude entry uses it as a bool flag), so `{"thinking": true}` is a
+        # perfectly valid overlay — and `str(True).lower()` is "true", which sails
+        # through a character-class check. Every selector below would then hunt
+        # the word "true". Before this wave that key only fed an advisory; it now
+        # steers four selectors, so the type has to be checked, not just the
+        # characters.
+        _gm_think_raw = (p2_labels("gemini") or {}).get("thinking")
+        _gm_think = (_gm_think_raw.strip().lower()
+                     if isinstance(_gm_think_raw, str) else "")
+        if not re.fullmatch(r"[a-z0-9 ]+", _gm_think or ""):
+            _gm_think = "extended"     # the code default; see P2_MODEL_POLICY
+        # The trigger's own text, so the ranker can refuse to click it. Read
+        # before the menu opened would be ideal, but the dropdown is already
+        # open here — the trigger stays outside [role=menu], which is how we
+        # tell them apart.
         try:
-            _rank = await page.evaluate(
-                _GEMINI_FLASH_RANK_JS, {"floor": p2_floor("gemini"), "doClick": True, "pin": pin_model})
+            _gm_trigger = await page.evaluate("""(fam) => {
+                const famRe = new RegExp(fam, 'i');
+                const b = [...document.querySelectorAll('button, [role="button"]')]
+                    .filter(x => x.offsetParent
+                                 && !x.closest('[role="menu"], [role="listbox"], [role="dialog"]')
+                                 && famRe.test(x.textContent || ''))
+                    .sort((a, z) => (a.textContent || '').length - (z.textContent || '').length)[0];
+                return b ? (b.textContent || '').replace(/\\s+/g, ' ').trim() : '';
+            }""", _gm_family)
+        except Exception:
+            _gm_trigger = ""
+        try:
+            _rank = await page.evaluate(_GEMINI_FLASH_RANK_JS, {
+                "below": step_below, "doClick": True, "pin": pin_model,
+                "fam": _gm_family, "reject": _gm_reject, "triggerText": _gm_trigger})
         except Exception as _re:
             log(f"[setup_gemini_dr] model-pick: ranker eval errored ({_re})", "WARN")
             _rank = {}
         picked = ((_rank or {}).get("pick") or "") if (_rank or {}).get("clicked") else ""
-        _legacy = (_rank or {}).get("legacy") or ""
         if not picked:
-            log("[setup_gemini_dr] model-pick: no Flash >= floor found in dropdown — closing menu", "WARN")
+            log(f"[setup_gemini_dr] model-pick: no '{_gm_family}' row found in the dropdown "
+                f"(pin={pin_model!r} below={step_below!r}) — closing menu", "WARN")
             # Best-effort: close the open dropdown so the next step's + button
             # isn't sitting under an overlay.
             try:
@@ -32456,10 +34499,8 @@ async def _gemini_select_flash_model(page, pin_model=None) -> bool:
                 pass
             return False
         await asyncio.sleep(0.6)
-        _div = " — DIVERGES from legacy!" if (_legacy and picked != _legacy) else ""
-        log(f"[setup_gemini_dr] model-pick OK: ranker clicked '{picked}' "
-            f"(v{(_rank or {}).get('version')}, floor={p2_floor('gemini')}) | "
-            f"legacy /3.5 flash/ -> '{_legacy}'{_div}")
+        log(f"[setup_gemini_dr] model-pick OK: clicked the highest '{_gm_family}' offered — "
+            f"{picked!r} (v{(_rank or {}).get('version')})")
         # Record the selected Flash version for on-the-fly known-good learning.
         _P2_PICKED_VERSION["gemini"] = (_rank or {}).get("version")
 
@@ -32505,9 +34546,37 @@ async def _gemini_select_flash_model(page, pin_model=None) -> bool:
             }
             return false;
         }"""
-        # Direct 'Extended…' item INSIDE an open overlay menu (never bare page
-        # text — the closest() guard pins it to Angular Material's overlay).
-        _click_direct_ext_js = """() => { // directExtended
+        # Direct '<thinking word>…' item INSIDE an open overlay menu (never bare
+        # page text — the closest() guard pins it to Angular Material's overlay).
+        # This is the branch that carries the CAPTURED menu: 'Extended thinking
+        # Complex problem solving' is a peer row of the model rows, so no
+        # 'Thinking level' submenu exists to open and _click_tl_js correctly
+        # misses. ⭐ The word comes from policy, not a literal — the advisory at
+        # the end of the P2 leg already reads P2_MODEL_POLICY['gemini']
+        # ['thinking'], so a rename used to make the advisory report thinking as
+        # missing while every selector here still hunted the old word.
+        # Boundary-checked with string ops rather than a RegExp: `\\b` inside a
+        # non-raw Python string is the #913 literal-backspace trap, and the word
+        # is interpolated, so a built regex would also be an injection site.
+        _click_direct_ext_js = """(think) => { // directExtended
+            const isAlnum = c => !!c && ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'));
+            // ⚠ startsWith OR a both-boundaries match, exactly as the frozen
+            // /\\bextended\\b/ pair did. Menu rows are title+description
+            // CONCATENATED ('Extended thinkingComplex problem solving'), so
+            // there is NO right boundary after the word on the row we want —
+            // a boundaries-only test would reject the very row this selects,
+            // while startsWith alone would miss a 'Flash Extended' sibling.
+            const isWanted = (t, w) => {
+                if (!w) return false;
+                if (t.startsWith(w)) return true;
+                let i = t.indexOf(w);
+                while (i !== -1) {
+                    const end = i + w.length;
+                    if ((i === 0 || !isAlnum(t[i - 1])) && (end >= t.length || !isAlnum(t[end]))) return true;
+                    i = t.indexOf(w, i + 1);
+                }
+                return false;
+            };
             const items = document.querySelectorAll(
                 '[role="menuitem"], [role="menuitemradio"], ' +
                 '[role="menuitemcheckbox"], [role="option"], button, li');
@@ -32516,25 +34585,71 @@ async def _gemini_select_flash_model(page, pin_model=None) -> bool:
                 if (!el.closest('[role="menu"], [class*="menu-panel" i], .cdk-overlay-container')) continue;
                 const t = (el.textContent || '').trim().toLowerCase();
                 if (t.startsWith('standard') || t.length >= 60) continue;
-                if (/\\bextended\\b/.test(t)) {
+                if (isWanted(t, think)) {
                     el.click();
                     return t.slice(0, 40);
                 }
             }
             return '';
         }"""
-        _hover_flash_row_js = """() => { // hoverFlashRow
+        # The SUBMENU choice, once a 'Thinking level' trigger has opened one:
+        # pick the <thinking word> radio, never 'Standard'. Unscoped by design —
+        # the submenu is not always inside the overlay container the direct
+        # variant requires. ⭐ ONE definition: this was previously two
+        # byte-similar copies (an inline evaluate for the first attempt and this
+        # constant for the retries) that had to be kept in step by hand.
+        _click_ext_radio_js = """(think) => { // extendedRadio
+            const isAlnum = c => !!c && ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'));
+            // ⚠ startsWith OR a both-boundaries match, exactly as the frozen
+            // /\\bextended\\b/ pair did. Menu rows are title+description
+            // CONCATENATED ('Extended thinkingComplex problem solving'), so
+            // there is NO right boundary after the word on the row we want —
+            // a boundaries-only test would reject the very row this selects,
+            // while startsWith alone would miss a 'Flash Extended' sibling.
+            const isWanted = (t, w) => {
+                if (!w) return false;
+                if (t.startsWith(w)) return true;
+                let i = t.indexOf(w);
+                while (i !== -1) {
+                    const end = i + w.length;
+                    if ((i === 0 || !isAlnum(t[i - 1])) && (end >= t.length || !isAlnum(t[end]))) return true;
+                    i = t.indexOf(w, i + 1);
+                }
+                return false;
+            };
+            for (const el of document.querySelectorAll(
+                    '[role="menuitem"], [role="menuitemradio"], [role="option"], button, a, li')) {
+                if (!el.offsetParent) continue;
+                const t = (el.textContent || '').trim().toLowerCase();
+                if (t.startsWith('standard')) continue;
+                if (isWanted(t, think)) { el.click(); return t.slice(0, 40); }
+            }
+            return '';
+        }"""
+        # ⭐ NO FAMILY OR REJECT LITERAL. This used to hunt /\\bflash\\b/ while
+        # excluding /lite|\\bpro\\b|deep think/ — a second, frozen copy of the
+        # model policy living in a page.evaluate string, which is exactly what
+        # the family-only rule exists to prevent: a rename would leave the
+        # ranker picking the right row and this hovering nothing. It now hovers
+        # THE ROW THE RANKER JUST PICKED, passed in by text, so there is one
+        # decision about which model matters and this simply follows it.
+        # Shortest match wins for the same reason it does in the ranker: a
+        # wrapper's textContent also starts with the row's text.
+        _hover_picked_row_js = """(pickText) => { // hoverPickedRow
+            const want = (pickText || '').trim().toLowerCase();
+            if (!want) return '';
+            let bestEl = null, bestText = '';
             for (const el of document.querySelectorAll(
                     '[role="menuitem"], [role="menuitemradio"], [role="option"], li')) {
                 if (!el.offsetParent) continue;
                 const t = (el.textContent || '').trim().toLowerCase();
-                if (/\\bflash\\b/.test(t) && !/lite|\\bpro\\b|deep think/.test(t)) {
-                    try { el.dispatchEvent(new MouseEvent('mouseover', {bubbles:true})); } catch(e){}
-                    try { el.dispatchEvent(new MouseEvent('pointerover', {bubbles:true})); } catch(e){}
-                    return t.slice(0, 40);
-                }
+                if (!t || !t.startsWith(want)) continue;
+                if (bestEl === null || t.length < bestText.length) { bestEl = el; bestText = t; }
             }
-            return '';
+            if (!bestEl) return '';
+            try { bestEl.dispatchEvent(new MouseEvent('mouseover', {bubbles:true})); } catch(e){}
+            try { bestEl.dispatchEvent(new MouseEvent('pointerover', {bubbles:true})); } catch(e){}
+            return bestText.slice(0, 40);
         }"""
         _menu_dump_js = """() => { // menuDump
             const rows = [];
@@ -32565,48 +34680,36 @@ async def _gemini_select_flash_model(page, pin_model=None) -> bool:
         _gem_ext_confirmed = False  # Phoenix: advisory extended-thinking confirmation
         tl_opened = await page.evaluate(_click_tl_js)
         if not tl_opened:
-            _direct = await page.evaluate(_click_direct_ext_js)
+            _direct = await page.evaluate(_click_direct_ext_js, _gm_think)
             if _direct:
                 _gem_ext_confirmed = True
-                log(f"[setup_gemini_dr] model-pick: direct Extended item clicked "
+                log(f"[setup_gemini_dr] model-pick: direct {_gm_think} item clicked "
                     f"('{_direct}') — no Thinking-level submenu on this menu variant")
             else:
                 await _dump_thinking_menu("first-miss")
                 await page.evaluate(_reopen_js)
                 await asyncio.sleep(0.6)
-                _hovered = await page.evaluate(_hover_flash_row_js)
+                _hovered = await page.evaluate(_hover_picked_row_js, picked)
                 if _hovered:
                     await asyncio.sleep(0.5)
                 tl_opened = await page.evaluate(_click_tl_js)
                 if not tl_opened:
-                    _direct = await page.evaluate(_click_direct_ext_js)
+                    _direct = await page.evaluate(_click_direct_ext_js, _gm_think)
                     if _direct:
                         _gem_ext_confirmed = True
-                        log(f"[setup_gemini_dr] model-pick: direct Extended item "
+                        log(f"[setup_gemini_dr] model-pick: direct {_gm_think} item "
                             f"clicked after reopen+hover ('{_direct}')")
         if tl_opened:
             await asyncio.sleep(0.6)
-            ext_picked = await page.evaluate("""() => {
-                const items = document.querySelectorAll(
-                    '[role="menuitem"], [role="menuitemradio"], [role="option"], button, a, li');
-                for (const el of items) {
-                    if (!el.offsetParent) continue;
-                    const t = (el.textContent || '').trim().toLowerCase();
-                    if (t.startsWith('standard')) continue;
-                    if (t.startsWith('extended') || /\\bextended\\b/.test(t)) {
-                        el.click();
-                        return t.slice(0, 40);
-                    }
-                }
-                return '';
-            }""")
+            ext_picked = await page.evaluate(_click_ext_radio_js, _gm_think)
             await asyncio.sleep(0.5)
             if ext_picked:
                 _gem_ext_confirmed = True
-                log(f"[setup_gemini_dr] model-pick: Thinking level -> Extended ('{ext_picked}')")
+                log(f"[setup_gemini_dr] model-pick: Thinking level -> {_gm_think} ('{ext_picked}')")
             else:
                 await _dump_thinking_menu("extended-option-miss")
-                log("[setup_gemini_dr] model-pick: 'Extended' option not found — leaving default thinking level", "WARN")
+                log(f"[setup_gemini_dr] model-pick: '{_gm_think}' option not found — "
+                    "leaving default thinking level", "WARN")
         elif not _gem_ext_confirmed:
             await _dump_thinking_menu("final-miss")
             log("[setup_gemini_dr] model-pick: 'Thinking level' submenu not found — leaving default thinking level", "WARN")
@@ -32630,23 +34733,13 @@ async def _gemini_select_flash_model(page, pin_model=None) -> bool:
                 'button[data-test-id="bard-mode-menu-button"], bard-mode-menu-button button');
             return b ? ((b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '')).trim() : '';
         }"""
-        _click_ext_radio_js = """() => {
-            for (const el of document.querySelectorAll(
-                    '[role="menuitem"], [role="menuitemradio"], [role="option"], button, a, li')) {
-                if (!el.offsetParent) continue;
-                const t = (el.textContent || '').trim().toLowerCase();
-                if (t.startsWith('standard')) continue;
-                if (t.startsWith('extended') || /\\bextended\\b/.test(t)) { el.click(); return true; }
-            }
-            return false;
-        }"""
 
         async def _mode_shows_extended():
             try:
                 _m = await page.evaluate(_read_mode_js)
             except Exception:
                 _m = ""
-            return ("extended" in (_m or "").lower()), (_m or "")
+            return (_gm_think in (_m or "").lower()), (_m or "")
 
         _ext_ok, _mode_now = await _mode_shows_extended()
         if _ext_ok:
@@ -32661,21 +34754,21 @@ async def _gemini_select_flash_model(page, pin_model=None) -> bool:
                 log(f"[setup_gemini_dr] model-pick verify: Extended NOT stuck "
                     f"(mode reads '{_mode_now[:40]}') — retry {_et}/{_EXT_TRIES}", "WARN")
                 # Clean-slate the menu (an open leftover would make _reopen_js
-                # TOGGLE it shut), reopen, hover the Flash row so its
-                # Thinking-level submenu renders, then click Extended (submenu
-                # radio first, direct row as fallback).
+                # TOGGLE it shut), reopen, hover the row the ranker picked so a
+                # row-nested Thinking-level submenu renders, then click the
+                # thinking row (submenu radio first, direct row as fallback).
                 try:
                     await page.keyboard.press("Escape")
                     await asyncio.sleep(0.3)
                     await page.evaluate(_reopen_js)
                     await asyncio.sleep(0.6)
-                    await page.evaluate(_hover_flash_row_js)
+                    await page.evaluate(_hover_picked_row_js, picked)
                     await asyncio.sleep(0.5)
                     if await page.evaluate(_click_tl_js):
                         await asyncio.sleep(0.6)
-                        await page.evaluate(_click_ext_radio_js)
+                        await page.evaluate(_click_ext_radio_js, _gm_think)
                     else:
-                        await page.evaluate(_click_direct_ext_js)
+                        await page.evaluate(_click_direct_ext_js, _gm_think)
                     await asyncio.sleep(0.6)
                 except Exception as _ee:
                     log(f"[setup_gemini_dr] model-pick verify: retry {_et} click errored ({_ee})", "WARN")
@@ -32716,13 +34809,14 @@ async def _gemini_select_flash_model(page, pin_model=None) -> bool:
                 return b ? (b.textContent || '').trim() : '';
             }""")
             _trig_lc = (_trig or "").lower()
-            if "extended" in _trig_lc:
-                log(f"[setup_gemini_dr] model-pick verify: trigger now reads '{_trig[:40]}' (Flash Extended ✓)")
-            elif "flash" in _trig_lc:
+            if _gm_think in _trig_lc:
+                log(f"[setup_gemini_dr] model-pick verify: trigger now reads '{_trig[:40]}' "
+                    f"({_gm_family} {_gm_think} ✓)")
+            elif _gm_family in _trig_lc:
                 log(f"[setup_gemini_dr] model-pick verify: trigger reads '{_trig[:40]}' "
-                    "(Flash selected, Extended NOT active)", "WARN")
+                    f"({_gm_family} selected, {_gm_think} NOT active)", "WARN")
             else:
-                log(f"[setup_gemini_dr] model-pick verify: trigger does NOT show Flash "
+                log(f"[setup_gemini_dr] model-pick verify: trigger does NOT show {_gm_family} "
                     f"(reads '{_trig[:40]}') — pick may not have taken", "WARN")
         except Exception:
             pass
@@ -32785,7 +34879,69 @@ _GEMINI_DR_STATE_JS = """() => {
 }"""
 
 
-async def setup_gemini_dr(page, pin_model=None) -> bool:
+# ⭐ Claude's P2 mode state — "is the family selected AND the Research tool
+# on?" — as ONE module constant with TWO callers: the pre-send mode check in
+# `ensure_deep_mode_active` and the setup ladder's outcome probe.
+#
+# Hoisted out of the pre-send check rather than re-typed for the probe. Two
+# copies of a detector is exactly how the ChatGPT Step-3 verify drifted away
+# from the shared composer detector and started failing runs that had actually
+# succeeded — it ended up demanding an exact pill label and a placeholder word
+# that the real Deep-Research placeholder does not contain.
+#
+# ⚠ DOCUMENTED BRITTLE. claude.ai renders the Research pill without the
+# attributes `researchOn` keys on, so a True here is trustworthy and a False is
+# NOT — which is why the ladder probe maps a False to `unknown`, never to `off`.
+_CLAUDE_MODE_STATE_JS = """(fam) => {
+    const txt = (document.body.innerText || '').toLowerCase();
+    // 2026-05-28: the UI dropped the word "Extended" — the model
+    // button now reads "Opus 5 Max" and Adaptive shows as a
+    // "Thinking" toggle behind the popover. A body-wide "extended"
+    // scan was therefore ALWAYS false → a needless re-activation on
+    // EVERY Claude send (backend.log 49728). Read the model-selector
+    // button instead: the family showing == the high-tier model is
+    // active. (Adaptive/effort live behind the closed popover and are
+    // confirmed by the CUA validate layer, not gated here.)
+    //
+    // ⭐ FAMILY, NOT A VERSION FLOOR. This used to demand
+    // `verOf(trigger) >= floor`. Gating a PRE-SEND check on a version
+    // number means a platform rollback, an A-B bucket, or a
+    // version-less label reads as "mode regressed" and triggers a
+    // full re-setup — with the model popover opening seconds before
+    // the brief is sent. The family word is the durable signal.
+    const famRe = new RegExp(fam, 'i');
+    const upsellRe = /(upgrade|subscribe|unlock|try |get )/i;
+    // Read the composer's model-selector TRIGGER button only —
+    // EXCLUDE any option rendered inside an open dropdown/menu (a
+    // stale menu item while a different model is current would
+    // otherwise false-positive), and exclude upsell chips, which name
+    // the family without being evidence it is selected. The trigger
+    // lives outside any [role=menu]/[role=listbox]/[role=dialog].
+    // getClientRects() — the version check that used to sit here made
+    // an off-screen or hidden element harmless (it needed a number
+    // too); the family word alone does not, so a hidden marketing
+    // chip on a Sonnet account would now pass this gate.
+    const hasExtended = [...document.querySelectorAll('button, [role="button"]')]
+        .filter(b => b.getClientRects().length > 0
+                     && !b.closest('[role="menu"], [role="listbox"], [role="dialog"]'))
+        .some(b => { const t = b.textContent || '';
+                     return famRe.test(t) && !upsellRe.test(t); });
+    // Research tool shows as a magnifying-glass icon / label near composer.
+    const researchOn = Array.from(document.querySelectorAll('button, [role="button"]'))
+        .some(b => {
+            const t = (b.textContent || '').toLowerCase();
+            const a = (b.getAttribute('aria-label') || '').toLowerCase();
+            return (t.includes('research') || a.includes('research')) &&
+                   (b.getAttribute('aria-pressed') === 'true' ||
+                    b.getAttribute('data-state') === 'on' ||
+                    b.classList.contains('active') ||
+                    b.classList.contains('selected'));
+        });
+    return { hasExtended, researchOn };
+}"""
+
+
+async def setup_gemini_dr(page, pin_model=None, step_below=None) -> bool:
     """Enable Gemini Deep Research. Returns True only when DR is verified
     ACTIVE (pill visible + pressed/selected). Returns False otherwise so
     the caller's CUA fallback kicks in instead of letting the run proceed
@@ -32802,17 +34958,18 @@ async def setup_gemini_dr(page, pin_model=None) -> bool:
     silently shipped chat-mode briefs as Deep Research output. Strict
     verification is the cost of avoiding that class of bug.
 
-    2026-05-26: pre-selects "3.5 Flash" via _gemini_select_flash_model
-    before enabling DR (the pipeline runs Gemini DR on 3.5 Flash — see
-    that helper's docstring for why). Without an explicit pick, the
-    dropdown's default could carry the wrong model into the DR run.
+    2026-05-26: pre-selects the newest Flash via _gemini_select_flash_model
+    before enabling DR (the pipeline runs Gemini DR on the Flash family — see
+    that helper's docstring for why Flash and not Pro). Without an explicit
+    pick, the dropdown's default could carry the wrong model into the DR run.
     """
     try:
         await asyncio.sleep(2)
         # Best-effort: pick the latest Flash before opening + menu. Non-fatal if
         # it misses (run proceeds on whatever model the dropdown was on).
         # pin_model (Phoenix known-good fallback) forces an exact-version pick.
-        _gem_model_ok = await _gemini_select_flash_model(page, pin_model=pin_model)
+        _gem_model_ok = await _gemini_select_flash_model(
+            page, pin_model=pin_model, step_below=step_below)
         if selfheal and selfheal.is_enabled():
             await _selfheal_shadow_observe(page, "gemini.select_model", outcome_pass=_gem_model_ok)
         await asyncio.sleep(0.5)
@@ -33165,15 +35322,29 @@ async def setup_gemini_dr(page, pin_model=None) -> bool:
         return False
 
 
-async def setup_claude_dr(page, pin_model=None) -> bool:
-    """Enable Claude Opus (>= the policy floor) + Max Effort + Research tool via
+async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=False) -> bool:
+    """Enable Claude Opus (the newest offered) + Max Effort + Research tool via
     direct Playwright selectors. As of 2026-05-28 the claude.ai UI splits these
     across the model popover + the tools menu:
-        1. Model dropdown        → highest Opus offered, floor from policy
+        1. Model dropdown        → the HIGHEST Opus offered
         2. Effort submenu        → Max          (inside the model popover)
         3. Research tool         → on (inside the "+" tools menu)
-    Every number and label above comes from P2_MODEL_POLICY["claude"], never a
-    literal here.
+    Every label above comes from P2_MODEL_POLICY["claude"], and there is
+    deliberately NO version number anywhere in this function.
+
+    ⭐ FAMILY + HIGHEST-OFFERED (2026-08-01). The old rule was "Opus >= 4.8",
+    and `model_ok` meant "the trigger reads at least the floor". On an account
+    already above the floor that skipped the popover entirely, so the upgrade
+    probe (Step 1B*) could never run and the account stayed on its current model
+    for good — the exact way P2 sat on Opus 4.8 through the whole Opus-5
+    rollout. Now `model_ok` only means "the trigger names the family", the pick
+    is always the highest row offered, and `allow_probe` + the cadence below are
+    what make sure we periodically LOOK.
+
+    `allow_probe` is passed True ONLY by the initial P2 setup. The pre-send
+    re-activation path (ensure_deep_mode_active) passes it False on purpose:
+    opening the model popover seconds before the brief is sent is the stranded-
+    popover-over-the-composer failure from the #744 screenshot.
 
     THE POPOVER IS NOW OPENED ONLY WHEN IT HAS SOMETHING TO DO (2026-07-30).
     It used to open on every call because the Thinking toggle lived inside the
@@ -33193,6 +35364,12 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
     — those hard-return False on miss. The CUA fallback lives one layer up in
     setup_agent + validate_setup_with_cua so this routine can fail fast without
     fighting the DOM."""
+    # ⚠ Clear FIRST. `_P2_PICKED_VERSION` is a process-global that survives for
+    # the daemon's lifetime, and several paths below return before writing it
+    # (Step 1A FAIL, Step 1B FAIL, the outer except). A stale entry from a
+    # PREVIOUS run would then be read as "the version that just failed" by the
+    # step-back path and steer the retry off a number from another run.
+    _P2_PICKED_VERSION.pop("claude", None)
     try:
         await asyncio.sleep(2)
 
@@ -33250,14 +35427,13 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
             log(f"[setup_claude_dr] Step 0: Chat-tab guard errored "
                 f"(non-fatal, CUA validate will catch a wrong mode): {_ce}", "WARN")
 
-        # Never-downgrade version floor — single source of truth (P2_MODEL_POLICY
-        # in models.py). The runtime still auto-picks the HIGHEST Opus offered;
-        # this floor only refuses anything below it. Injected into the picker JS
-        # below so a floor bump touches one place, not ~3 scattered literals.
-        _claude_floor = p2_floor("claude")
-        # Effort + thinking come from the SAME policy dict as the floor, so the
-        # quality knobs can never drift from it. `thinking` is False since Opus 5
-        # removed the toggle — see the note on P2_MODEL_POLICY["claude"].
+        # The model FAMILY word — the only model identity in this function.
+        # Injected into every JS below so a rename is one policy edit, and so no
+        # version literal can creep back into a page.evaluate string.
+        _claude_family = p2_family("claude") or "opus"
+        # Effort + thinking come from the SAME policy dict, so the quality knobs
+        # can never drift from it. `thinking` is False since Opus 5 removed the
+        # toggle — see the note on P2_MODEL_POLICY["claude"].
         _cl_pol = p2_labels("claude")
         _claude_effort = _cl_pol.get("effort")            # "max"
         _claude_wants_thinking = bool(_cl_pol.get("thinking"))
@@ -33284,19 +35460,57 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
         # Step 1B* below fixes that: while the popover is open ANYWAY, upgrade to
         # a STRICTLY higher Opus when one is offered. Strictly-higher is what
         # keeps #744 dead — the currently-selected option can never be re-clicked.
-        _trigger_read = await page.evaluate("""(effortWord) => {
-            const verOf = t => { const m = (t || '').match(/opus[^0-9]*([0-9]+(?:\\.[0-9]+)?)/i); return m ? parseFloat(m[1]) : null; };
+        _trigger_read = await page.evaluate("""({effortWord, fam}) => {
+            const famRe = new RegExp(fam, 'i');
+            // The SAME two-order, adjacency-bounded parse as the picker and the
+            // probe. This is the FOURTH parsing site and the easiest to forget:
+            // its answer is `_cur`, the number Step 1B* compares the probe's
+            // `_offered` against. Leave it single-order and a renamed label makes
+            // the trigger read null while the probe still reads a version — "we
+            // cannot compare, so anything numbered counts as newer" — and the
+            // upgrade re-fires on every single run.
+            const verFamFirst = new RegExp(fam + '[ ._/()-]{0,3}([0-9]+(?:\\\\.[0-9]+)?)', 'i');
+            const verNumFirst = new RegExp('([0-9]+(?:\\\\.[0-9]+)?)[ ._/()-]{0,3}' + fam, 'i');
+            const verOf = t => {
+                const m = (t || '').match(verFamFirst) || (t || '').match(verNumFirst);
+                return m ? parseFloat(m[1]) : null;
+            };
+            // An upsell chip ("Try Opus 6", "Upgrade to Opus") names the family
+            // and a version without being the selected model. Reading one as the
+            // trigger used to only mis-LOG; now the value is learned and reused
+            // as the fallback pin target, so a poisoned read outlives the run.
+            const verbRe = /(upgrade|subscribe|unlock|try |get )/i;
             const vis = el => el.getClientRects().length > 0;   // fixed-position triggers have offsetParent === null
             // The trigger lives OUTSIDE any open popover — exclude menu/
             // listbox/dialog descendants so a stale option can't be read.
             const btns = [...document.querySelectorAll('button, [role="button"]')]
-                .filter(b => vis(b) && !b.closest('[role="menu"], [role="listbox"], [role="dialog"]'));
-            let best = null, bestText = '';
+                .filter(b => vis(b) && !b.closest('[role="menu"], [role="listbox"], [role="dialog"]'))
+                .filter(b => !verbRe.test(b.textContent || ''));
+            // ⛔ A version-LESS family word is only trusted from a button that is
+            // actually a MODEL CONTROL. Page-wide it is far too weak: on a
+            // Sonnet-only account a marketing chip ("Opus — included in Max",
+            // "Opus trial") would read as "the family is selected", setup would
+            // skip the picker AND report success, and the run would go out on
+            // Sonnet. A versioned read stays page-wide (that is long-standing
+            // behaviour and a bare version next to the family word is strong
+            // evidence); only the new, weaker signal is scoped.
+            const isModelCtl = b => {
+                const a = (b.getAttribute('aria-label') || '').toLowerCase();
+                const tid = (b.getAttribute('data-testid') || '').toLowerCase();
+                return a.includes('model') || tid.includes('model');
+            };
+            let best = null, bestText = '', famOnly = '';
             for (const b of btns) {
                 const t = b.textContent || '';
                 const v = verOf(t);
                 if (v !== null && (best === null || v > best)) { best = v; bestText = t; }
+                // Family word with NO version: the day the platform drops version
+                // numbers from the label, this is the only evidence the family is
+                // selected. Shortest such button wins (a leaf, not a wrapper).
+                if (v === null && famRe.test(t) && isModelCtl(b)
+                        && (!famOnly || t.length < famOnly.length)) famOnly = t;
             }
+            if (best === null && famOnly) bestText = famOnly;
             // (2026-07-30) The SAME trigger that carries the model also carries
             // the effort — it reads "Opus 5 Max" — so effort is knowable WITHOUT
             // opening the popover. Read it only off the winning button's text,
@@ -33306,26 +35520,42 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
             // \\b inside a non-raw Python string once became a literal backspace
             // and silently disabled a gate for months (see the #913 note).
             let effort = null;
-            if (best !== null && effortWord) {
+            if (bestText && effortWord) {
                 const toks = bestText.toLowerCase().split(/[^a-z0-9.]+/);
                 if (toks.indexOf(String(effortWord).toLowerCase()) !== -1) effort = effortWord;
             }
-            return { ver: best, effort: effort, trigger_text: bestText.replace(/\\s+/g, ' ').trim().slice(0, 120) };
-        }""", _claude_effort)
+            return { ver: best, fam: !!bestText,
+                     trigger_text: bestText.replace(/\\s+/g, ' ').trim().slice(0, 120),
+                     effort: effort };
+        }""", {"effortWord": _claude_effort, "fam": _claude_family})
         model_trigger_ver = _trigger_read.get("ver") if isinstance(_trigger_read, dict) else _trigger_read
         # Effort read straight off the trigger. Only ever a POSITIVE signal: when
         # it is None we fall through to the popover exactly as before, so an
         # unrecognised trigger layout degrades to today's behaviour, never worse.
         _trigger_effort_ok = bool(isinstance(_trigger_read, dict) and _trigger_read.get("effort"))
-        # Phoenix known-good fallback: when pin_model is set (the latest model
-        # just failed Deep-Research verification), FORCE a re-pick to that exact
-        # version — even if the trigger already shows a higher Opus (that higher
-        # model is the one that failed). A deliberate one-shot switch to a
-        # different model, NOT the #744 re-click-a-correct-model loop.
-        model_ok = (pin_model is None) and isinstance(model_trigger_ver, (int, float)) and model_trigger_ver >= _claude_floor
-        if pin_model is not None:
-            log(f"[setup_claude_dr] pin: forcing re-pick to Opus {pin_model} (known-good fallback)")
+        # Known-good fallback: when pin_model is set (the latest model just failed
+        # Deep-Research verification), FORCE a re-pick to a DIFFERENT model — even
+        # if the trigger already shows a higher Opus (that higher model is the one
+        # that failed). A deliberate one-shot switch, NOT the #744 loop.
+        #
+        # ⭐ `model_ok` = "the trigger names the family", NOT ">= some version".
+        # This is the whole family-only change: there is no number to compare
+        # against, so no constant can go stale, and a version-LESS label ("Opus
+        # Max") still counts as the family being selected.
+        _trigger_has_family = bool(isinstance(_trigger_read, dict) and _trigger_read.get("fam"))
+        model_ok = (pin_model is None and step_below is None) and _trigger_has_family
+        if pin_model is not None or step_below is not None:
+            log(f"[setup_claude_dr] step-back: re-picking away from the model that failed "
+                f"(pin={pin_model!r} below={step_below!r})")
         opus_selected = None
+        # The version we actually SELECTED. Kept separate from the trigger read so
+        # the learned known-good comes from a real pick, never from a page-wide
+        # scan that an upsell chip could poison.
+        _picked_version = None
+        # Did we CLICK a model this run? Effort is stored per model on this
+        # family, so a click invalidates any effort read taken off the trigger
+        # before it (see the Step 1C guard).
+        _model_changed = False
         # Phoenix model_refresh — advisory thinking/effort confirmation (never
         # gates; the caller surfaces a soft amber notice if a policy-required
         # knob couldn't be set). Initialized here because _think/_eff_set are
@@ -33335,60 +35565,125 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
         if model_ok:
             # Model already correct — record it but DO NOT re-pick (the #744
             # re-click loop). We still open the popover below for Effort/Thinking.
-            opus_selected = f"Opus {model_trigger_ver} (trigger — not re-picked)"
-            log(f"[setup_claude_dr] Step 1 OK: model already Opus {model_trigger_ver} (trigger) — NOT re-picking (#744)")
+            opus_selected = f"{_claude_family} {model_trigger_ver} (trigger — not re-picked)"
+            log(f"[setup_claude_dr] Step 1 OK: model already {_claude_family} "
+                f"v{model_trigger_ver} (trigger) — NOT re-picking (#744)")
 
-        # Step 1B picker (used only when the model is < 4.8). Scopes to the OPEN
-        # popover so the trigger button (showing the current model) is excluded;
-        # version-gates to >= 4.8 so it NEVER downgrades to 4.7; sees
-        # role="menuitemradio"/div options and uses getClientRects() so a
-        # fixed-position popover isn't filtered by offsetParent (#708/#744).
-        _pick_opus_js = """({floor, pin}) => {
+        # Step 1B picker. Scopes to the OPEN popover so the trigger button
+        # (showing the current model) is excluded; sees role="menuitemradio"/div
+        # options and uses getClientRects() so a fixed-position popover isn't
+        # filtered by offsetParent (#708/#744).
+        #
+        # ⭐ NO FLOOR. The rule is simply the HIGHEST family row offered — which
+        # by construction can never be a downgrade, because nothing else on the
+        # menu is higher. A floor could only ever reject the row that should have
+        # won. `below` is the opposite tool: the step-back path passes the version
+        # that just failed and takes the best row strictly beneath it, so the
+        # pipeline can retreat one release without any hardcoded "previous
+        # version". A family row with NO version is a valid last-resort candidate
+        # (a version-less rename must not empty the menu), but it is never a
+        # step-back target — we cannot prove it is below what just failed.
+        _pick_opus_js = """({pin, below, fam, triggerText}) => {
             const vis = el => el.getClientRects().length > 0;
+            const famRe = new RegExp(fam, 'i');
+            // ⭐ BOTH VERSION ORDERS, deliberately — see models.parse_family_version,
+            // which tries exactly these two patterns in exactly this order. Claude
+            // ships family-first ("Opus 5") and Gemini number-first ("3.6 Flash")
+            // TODAY, so a single-order parser is correct only until ITS OWN vendor
+            // renames. When that happens every row parses as version-less, the
+            // ranking collapses to the "shortest label" tie-break, and the picker
+            // selects an OLDER model while reporting success — a silent downgrade,
+            // which is the one outcome this whole path exists to prevent.
+            const verFamFirst = new RegExp(fam + '[ ._/()-]{0,3}([0-9]+(?:\\\\.[0-9]+)?)', 'i');
+            const verNumFirst = new RegExp('([0-9]+(?:\\\\.[0-9]+)?)[ ._/()-]{0,3}' + fam, 'i');
             const menus = [...document.querySelectorAll('[role="menu"], [role="listbox"], [role="dialog"]')]
                 .filter(vis);
             const roots = menus.length ? menus : [document.body];
             const seen = new Set();
             const items = roots.flatMap(m => [...m.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"], [role="option"], button, a, li, div, span')])
                 .filter(el => vis(el) && !seen.has(el) && seen.add(el));
+            const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
             const verOf = t => {
-                const m = (t || '').match(/opus[^0-9]*([0-9]+(?:\\.[0-9]+)?)/i);
+                const m = (t || '').match(verFamFirst) || (t || '').match(verNumFirst);
                 return m ? parseFloat(m[1]) : null;
             };
-            // Prefer leaf menu items over wrapper containers at the same
-            // version (shorter text = more specific element).
-            let best = null, bestV = -1, bestLen = Infinity;
+            // Without a floor the body fallback (used when no menu has mounted)
+            // would happily treat the TRIGGER BUTTON as a row and click it,
+            // which just toggles the popover shut while reporting success.
+            const trig = norm(triggerText);
+            let best = null, bestRank = null, bestLen = Infinity;
             for (const el of items) {
                 const t = (el.textContent || '').trim();
+                if (trig && norm(t) === trig) continue;        // never click the trigger
                 const v = verOf(t);
-                if (v === null) continue;
-                if (pin != null) {
-                    if (Math.abs(v - pin) > 0.001) continue;   // pin: target the exact known-good version
-                } else if (v < floor) continue;                // else only Opus >= floor — never downgrade
-                if (v > bestV || (v === bestV && t.length < bestLen)) {
-                    best = el; bestV = v; bestLen = t.length;
+                const isFam = v !== null || famRe.test(t);
+                if (!isFam) continue;
+                let rank;
+                if (pin != null && v !== null && Math.abs(v - pin) <= 0.001) {
+                    // ⭐ Exact known-good — outranks every other candidate, but as a
+                    // RANK TIER, never a `break`. `items` is document order,
+                    // ancestors first, so the FIRST element carrying the pinned
+                    // version is usually the menu's own wrapper (its textContent
+                    // concatenates every row). A click on an ancestor never reaches
+                    // the row's handler: the model does not change, yet this returns
+                    // truthy and the caller logs an upgrade and records a known-good.
+                    // Falling through keeps the shortest-text leaf preference the
+                    // rest of this function already applies.
+                    rank = [2, v];
+                } else {
+                    if (pin != null || below != null) {
+                        // ⭐ A PIN THAT IS NO LONGER ON THE MENU MUST NOT PARK THE RUN.
+                        // The learned known-good has no expiry, so weeks later the
+                        // platform may have retired it. Treating "exact pin absent"
+                        // as "nothing to pick" threw away a perfectly good older row
+                        // and sent the leg to the chat-mode gate — losing the retry
+                        // this whole path exists to provide. Fall back to the same
+                        // strictly-older rule the no-history route uses.
+                        const bound = below != null ? below : pin;
+                        if (v === null || v >= bound - 0.001) continue;
+                    }
+                    // Any version outranks no version; then higher wins; tie → shorter
+                    // text (a leaf menu item, not a wrapper listing several models).
+                    rank = v === null ? [0, 0] : [1, v];
+                }
+                if (best === null || rank[0] > bestRank[0] || (rank[0] === bestRank[0] && rank[1] > bestRank[1])
+                        || (rank[0] === bestRank[0] && rank[1] === bestRank[1] && t.length < bestLen)) {
+                    best = el; bestRank = rank; bestLen = t.length;
                 }
             }
-            if (best) { best.click(); return best.textContent.trim().slice(0, 60); }
+            if (best) {
+                best.click();
+                return { label: best.textContent.trim().slice(0, 60),
+                         version: bestRank[0] === 0 ? null : bestRank[1] };
+            }
             return null;
         }"""
 
-        # Read-only companion to _pick_opus_js: what is the highest Opus the OPEN
-        # popover offers, and did we see any Opus rows at all? `n` separates "the
-        # menu hasn't mounted yet" (retry) from "mounted, nothing newer" (the
-        # common case — return immediately, no added latency on the happy path).
-        # Clicks nothing; the upgrade click goes through _pick_opus_js so there is
-        # exactly ONE code path that ever selects a model.
-        _probe_opus_js = """() => {
+        # Read-only companion to _pick_opus_js: what is the highest family member
+        # the OPEN popover offers? Clicks nothing; the upgrade click goes through
+        # _pick_opus_js so there is exactly ONE code path that ever selects a model.
+        #
+        # ⛔ REQUIRES A MOUNTED MENU. The body fallback the picker keeps would let
+        # the trigger button itself count as a row — "highest offered == what we
+        # already have" — so a popover that mounts a beat slowly would report
+        # "nothing newer" and, under the weekly cadence, burn the whole interval's
+        # check on a no-op. `menu` tells the caller whether the answer is real.
+        _probe_opus_js = """({fam}) => {
             const vis = el => el.getClientRects().length > 0;
+            // Same two-order parse as the picker — they must agree on what a row
+            // is worth. A probe that could not read the renamed order would report
+            // "nothing newer offered" while the picker could have selected it, so
+            // the weekly upgrade would go quiet exactly when a release ships.
+            const verFamFirst = new RegExp(fam + '[ ._/()-]{0,3}([0-9]+(?:\\\\.[0-9]+)?)', 'i');
+            const verNumFirst = new RegExp('([0-9]+(?:\\\\.[0-9]+)?)[ ._/()-]{0,3}' + fam, 'i');
             const menus = [...document.querySelectorAll('[role="menu"], [role="listbox"], [role="dialog"]')]
                 .filter(vis);
-            const roots = menus.length ? menus : [document.body];
+            if (!menus.length) return {menu: false, n: 0, highest: null};
             const seen = new Set();
-            const items = roots.flatMap(m => [...m.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"], [role="option"], button, a, li, div, span')])
+            const items = menus.flatMap(m => [...m.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"], [role="option"], button, a, li, div, span')])
                 .filter(el => vis(el) && !seen.has(el) && seen.add(el));
             const verOf = t => {
-                const m = (t || '').match(/opus[^0-9]*([0-9]+(?:\\.[0-9]+)?)/i);
+                const m = (t || '').match(verFamFirst) || (t || '').match(verNumFirst);
                 return m ? parseFloat(m[1]) : null;
             };
             let n = 0, highest = null;
@@ -33398,7 +35693,7 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
                 n += 1;
                 if (highest === null || v > highest) highest = v;
             }
-            return {n: n, highest: highest};
+            return {menu: true, n: n, highest: highest};
         }"""
 
         # ── Step 1A: open the model popover ONCE (model pick if needed +
@@ -33412,36 +35707,65 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
         # menu — and what invited the CUA validate layer in to "fix" the quality
         # knobs, producing the second interaction. Every conjunct is a POSITIVE
         # read; any uncertainty falls through and opens the popover as before.
-        _skip_popover = bool(model_ok and _trigger_effort_ok and not _claude_wants_thinking)
+        #
+        # ⭐ (2026-08-01) …but skipping FOREVER is how the account gets stranded.
+        # With the floor gone, `model_ok` is just "the trigger names the family",
+        # so on a healthy account this skip would fire on every run and the
+        # highest-offered upgrade (Step 1B*) would never execute — the same
+        # stranding the floor used to cause, one step earlier. `_probe_due` is the
+        # weekly look: the popover opens on a cadence purely to see whether a
+        # newer family member has appeared. It runs on the pipeline's own
+        # authenticated page, so there is no separate canary process, no extra
+        # credentials, and the cost is one popover per platform per interval.
+        # ⛔ Only on the INITIAL setup call (allow_probe) — never on the pre-send
+        # re-activation, where an open popover lands over the composer.
+        _probe_due = bool(allow_probe and model_probe_due("claude"))
+        _skip_popover = bool(model_ok and _trigger_effort_ok
+                             and not _claude_wants_thinking and not _probe_due)
         if _skip_popover:
             # Read off the trigger, not assumed: this is the same evidence the
             # popover path would have produced, without touching the UI.
             _effort_confirmed = True
             log(f"[setup_claude_dr] Step 1A SKIPPED: trigger already reads "
-                f"{_trigger_read.get('trigger_text')!r} — model >= floor and effort "
-                f"'{_claude_effort}' both confirmed without opening the popover")
-        dropdown_clicked = False if _skip_popover else await page.evaluate("""() => {
+                f"{_trigger_read.get('trigger_text')!r} — family '{_claude_family}' and "
+                f"effort '{_claude_effort}' both confirmed without opening the popover")
+        elif _probe_due and model_ok and _trigger_effort_ok:
+            log(f"[setup_claude_dr] Step 1A: model+effort already confirmed off the "
+                f"trigger, but the periodic model-menu check is due — opening the "
+                f"popover once to look for a newer {_claude_family}")
+        dropdown_clicked = False if _skip_popover else await page.evaluate("""(fam) => {
             const btns = [...document.querySelectorAll('button, [role="button"]')]
                 .filter(b => b.getClientRects().length > 0 && !b.closest('[role="menu"], [role="listbox"], [role="dialog"]'));
+            const famRe = new RegExp(fam, 'i');
             // The model-selector trigger shows the currently-selected model name.
-            let trigger = btns.find(b => (b.textContent || '').toLowerCase().includes('opus'));
+            let trigger = btns.find(b => famRe.test(b.textContent || ''));
             if (!trigger) trigger = btns.find(b => {
                 const t = (b.textContent || '').toLowerCase();
                 return t.includes('sonnet') || t.includes('haiku') || t.includes('claude');
             });
             if (trigger) { trigger.click(); return true; }
             return false;
-        }""")
+        }""", _claude_family)
+        # The cadence clock is stamped on the ATTEMPT, not on a successful read.
+        # A success-only stamp would leave the check permanently due the moment
+        # the popover markup rotates, re-opening it on every run — one dead canary
+        # turning into a per-run regression.
+        _probe_saw_menu = False
         if dropdown_clicked:
             log("[setup_claude_dr] Step 1A OK: opened model popover")
             await asyncio.sleep(0.8)
-            # ── Step 1B: pick the strongest Opus (>= 4.8) — ONLY when the
-            #              model isn't already correct (no re-click, #744) ──
+            # ── Step 1B: pick the highest family member — ONLY when the model
+            #              isn't already correct (no re-click, #744) ──
+            _pick_args = {"pin": pin_model, "below": step_below, "fam": _claude_family,
+                          "triggerText": (_trigger_read or {}).get("trigger_text") or ""}
             if not model_ok:
                 try:
                     for _attempt in range(8):
-                        opus_selected = await page.evaluate(_pick_opus_js, {"floor": _claude_floor, "pin": pin_model})
-                        if opus_selected:
+                        _picked = await page.evaluate(_pick_opus_js, _pick_args)
+                        if _picked:
+                            opus_selected = _picked.get("label")
+                            _picked_version = _picked.get("version")
+                            _model_changed = True
                             break
                         await asyncio.sleep(0.4)
                 except Exception as _pe:
@@ -33451,9 +35775,12 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
                     log(f"[setup_claude_dr] Step 1B poll errored ({_pe}) — dismissing popover", "WARN")
                     opus_selected = None
                 if opus_selected:
-                    log(f"[setup_claude_dr] Step 1B OK: selected {opus_selected}")
+                    log(f"[setup_claude_dr] Step 1B OK: selected {opus_selected!r} "
+                        f"(v{_picked_version})")
                 else:
-                    log("[setup_claude_dr] Step 1B FAIL: Opus >= 4.8 option not found in popover after polling — rollout/A-B difference or 4.8 retired?", "WARN")
+                    log(f"[setup_claude_dr] Step 1B FAIL: no '{_claude_family}' option found in "
+                        f"the popover after polling (pin={pin_model!r} below={step_below!r}) — "
+                        f"rollout/A-B difference, or the family was renamed?", "WARN")
                     # Never strand an OPEN dropdown over the composer (the bug
                     # screenshot) — dismiss it before bailing to the CUA fallback.
                     try:
@@ -33464,47 +35791,58 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
                     return False
                 await asyncio.sleep(0.6)
             else:
-                # ── Step 1B*: already >= floor — upgrade if the family moved on ──
-                # The floor means "acceptable", not "latest". Claude.ai keeps the
-                # account on the previous flagship, so without this the pipeline
-                # would sit on the floor version forever (P2 ran Opus 4.8 for the
-                # whole Opus-5 rollout). The popover is already open for Effort/
-                # Thinking, so this costs one read; we only click when a STRICTLY
-                # higher Opus exists, which is also what makes re-clicking the
-                # current model (#744's loop) impossible by construction.
+                # ── Step 1B*: the family is right — is a NEWER one offered? ──
+                # This is the whole "most recent model of the family" guarantee.
+                # Claude.ai keeps an account on the previous flagship after a
+                # release, so without this the pipeline sits on whatever it landed
+                # on forever (it ran Opus 4.8 through the entire Opus-5 rollout).
+                # We click ONLY when a STRICTLY higher version exists, which is
+                # what makes re-clicking the current model (#744's loop)
+                # impossible by construction. `_probe_saw_menu` decides nothing
+                # here — it is telemetry for the cadence stamp.
                 try:
                     _probe = None
                     for _attempt in range(3):
-                        _probe = await page.evaluate(_probe_opus_js)
-                        # n == 0 means the menu hasn't mounted yet — retry. Any
-                        # rows at all means the answer is trustworthy: return
-                        # immediately so the common "nothing newer" path adds
-                        # no latency.
-                        if (_probe or {}).get("n"):
+                        _probe = await page.evaluate(_probe_opus_js, {"fam": _claude_family})
+                        # A mounted menu with rows is the only trustworthy answer;
+                        # anything else means "hasn't rendered yet" → retry.
+                        if (_probe or {}).get("menu") and (_probe or {}).get("n"):
                             break
                         await asyncio.sleep(0.4)
+                    _probe_saw_menu = bool((_probe or {}).get("menu") and (_probe or {}).get("n"))
                     _offered = (_probe or {}).get("highest")
-                    if (isinstance(_offered, (int, float))
-                            and _offered > model_trigger_ver + 0.001):
-                        # Select it through the ONE picker that exists, with the
-                        # floor raised to the newer version so nothing else can win.
-                        _up = await page.evaluate(_pick_opus_js, {"floor": _offered, "pin": None})
+                    # `model_trigger_ver` is None on a version-less label; any
+                    # numbered row then counts as newer (we can't compare, and a
+                    # named version is the more specific choice).
+                    _cur = model_trigger_ver if isinstance(model_trigger_ver, (int, float)) else None
+                    if isinstance(_offered, (int, float)) and (
+                            _cur is None or _offered > _cur + 0.001):
+                        # Select it through the ONE picker that exists, stepping
+                        # everything below the newer version out of contention.
+                        _up = await page.evaluate(
+                            _pick_opus_js, {**_pick_args, "pin": _offered, "below": None})
                         if _up:
-                            opus_selected = _up
-                            log(f"[setup_claude_dr] Step 1B* UPGRADE: Opus "
-                                f"{model_trigger_ver} → {_offered} ({_up})")
+                            opus_selected = _up.get("label")
+                            _picked_version = _up.get("version")
+                            _model_changed = True
+                            log(f"[setup_claude_dr] Step 1B* UPGRADE: {_claude_family} "
+                                f"{_cur} → {_offered} ({opus_selected!r})")
                             await asyncio.sleep(0.6)
                         else:
-                            log(f"[setup_claude_dr] Step 1B* : Opus {_offered} offered but "
-                                f"not clickable — staying on {model_trigger_ver}", "WARN")
+                            log(f"[setup_claude_dr] Step 1B*: {_claude_family} {_offered} offered "
+                                f"but not clickable — staying on {_cur}", "WARN")
                     elif _offered is not None:
-                        log(f"[setup_claude_dr] Step 1B*: Opus {model_trigger_ver} is already "
+                        log(f"[setup_claude_dr] Step 1B*: {_claude_family} {_cur} is already "
                             f"the highest offered ({_offered}) — no re-pick (#744)")
+                    elif not _probe_saw_menu:
+                        log(f"[setup_claude_dr] Step 1B*: model menu never mounted — cannot tell "
+                            f"whether a newer {_claude_family} exists; keeping {_cur}", "WARN")
                 except Exception as _ue:
                     # Advisory only: a probe failure must never break a run that
-                    # already has an acceptable model.
+                    # already has the right family selected.
                     log(f"[setup_claude_dr] Step 1B* upgrade probe errored "
-                        f"({type(_ue).__name__}) — keeping Opus {model_trigger_ver}", "WARN")
+                        f"({type(_ue).__name__}) — keeping {_claude_family} "
+                        f"{model_trigger_ver}", "WARN")
 
             # ── Step 1C: open the Effort submenu ───────────────────────
             # 2026-05-28: claude.ai split the old single "Opus 4.7 Adaptive"
@@ -33516,8 +35854,36 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
             # ran on a closed submenu and never found the toggle). Best-effort:
             # Effort/Thinking are quality knobs, not correctness gates, so a
             # miss here only WARNs — the CUA validate layer is the backstop.
+            #
+            # ⛔ SKIPPED on the periodic-probe path. When the popover was opened
+            # purely to look for a newer model and the trigger ALREADY showed the
+            # target effort, walking into the Effort submenu is exactly the
+            # pointless churn the 2026-07-30 change removed — and re-entering the
+            # submenu is how it ends up left open under the composer.
+            # ⚠ …but NOT when the probe just switched models. Claude stores
+            # effort PER MODEL, so the effort read off the trigger described the
+            # OLD model; skipping here would leave the newly-selected one on its
+            # default effort while telemetry reported effort confirmed. Effort is
+            # the reasoning lever on this family, so that is a silent quality
+            # downgrade for every run after the weekly upgrade.
+            _effort_already_known = bool(_probe_due and _trigger_effort_ok
+                                         and not _model_changed)
+            if _effort_already_known:
+                _effort_confirmed = True
+                log(f"[setup_claude_dr] Step 1C SKIPPED: effort '{_claude_effort}' already "
+                    f"read off the trigger — the popover is open only for the model check")
             try:
-                _eff_opened = await page.evaluate("""() => {
+                # 2026-08-04: MARK the Effort row, open it with a real hover +
+                # click, and verify the submenu MOUNTED. The old version clicked
+                # from inside page.evaluate and returned `true` for "a row was
+                # found" — so `_eff_opened` said yes on every run while the
+                # submenu stayed shut, and the corpus reads "Step 1C WARN: 'Max'
+                # effort not found in submenu" nine times against ONE success.
+                # Same defect as ChatGPT's model menu, same evidence, same fix.
+                _eff_marked = False if _effort_already_known else await page.evaluate("""(P) => {
+                    for (const el of document.querySelectorAll('[' + P.attr + ']')) {
+                        el.removeAttribute(P.attr);
+                    }
                     const els = [...document.querySelectorAll('[role="menuitem"], button, [role="option"], li')]
                         .filter(el => el.getClientRects().length > 0);
                     // The Effort row shows its current value + a submenu chevron.
@@ -33525,9 +35891,48 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
                         const t = (el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
                         return t === 'effort' || t.startsWith('effort');
                     });
-                    if (trigger) { trigger.click(); return true; }
+                    if (trigger) { trigger.setAttribute(P.attr, P.value); return true; }
                     return false;
-                }""")
+                }""", {"attr": _SR_CLICK_MARK, "value": "claude-effort"})
+                _eff_opened = False
+                if _eff_marked:
+                    _how = await _sr_real_click(page, "claude-effort",
+                                                tag="[setup_claude_dr]",
+                                                hover_first=True)
+                    # POLL for the submenu's own rows. "The trigger was pressed"
+                    # is not "the submenu is open", and the difference is the
+                    # nine WARNs: everything downstream searched a menu that had
+                    # never mounted and reported its own target missing.
+                    for _try in range(8):
+                        if _try:
+                            await asyncio.sleep(0.25)
+                        try:
+                            _sub = await page.evaluate("""() => {
+                                const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                                const out = [];
+                                for (const el of document.querySelectorAll(
+                                        '[role="menuitem"], [role="menuitemradio"], [role="option"], button, li')) {
+                                    if (!el.getClientRects().length) continue;
+                                    const t = norm(el.textContent);
+                                    if (!t || t.length > 24) continue;
+                                    if (out.indexOf(t) === -1) out.push(t);
+                                }
+                                return out.slice(0, 20);
+                            }""") or []
+                        except Exception:
+                            _sub = []
+                        if any(r in ("max", "max effort", "thinking", "low", "medium",
+                                     "high", "extra") for r in _sub):
+                            _eff_opened = True
+                            break
+                    if _eff_opened:
+                        log(f"[setup_claude_dr] Step 1C: Effort submenu opened via a "
+                            f"{_how or 'failed'} press")
+                    else:
+                        log(f"[setup_claude_dr] Step 1C WARN: the Effort row was pressed "
+                            f"({_how or 'no press landed'}) but no submenu mounted within "
+                            f"2s — visible short rows were "
+                            f"{json.dumps(_sub[:10], ensure_ascii=False)}", "WARN")
                 if _eff_opened:
                     await asyncio.sleep(0.5)
                     # ── Step 1D: toggle "Thinking" ON (inside the submenu) ──
@@ -33603,7 +36008,7 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
                         log(f"[setup_claude_dr] Step 1C OK: Effort '{_eff_set}'")
                     else:
                         log("[setup_claude_dr] Step 1C WARN: 'Max' effort not found in submenu — CUA validate will fix", "WARN")
-                else:
+                elif not _effort_already_known:
                     log("[setup_claude_dr] Step 1C WARN: Effort control not found (older UI / popover closed?) — CUA validate will fix", "WARN")
             except Exception as _ee:
                 log(f"[setup_claude_dr] Step 1C/1D errored: {_ee}", "WARN")
@@ -33626,15 +36031,36 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
             # Couldn't open the popover. (A deliberate skip is NOT this branch —
             # there the knobs were already confirmed off the trigger, and warning
             # about a popover we chose not to open would be a false alarm.)
-            # If the model is already >= floor the run is still correct (model is
-            # the only hard gate here); the Effort quality knob falls to the CUA
-            # validate layer. If the model is NOT >= floor and we can't even open
-            # the picker, the selector list is stale — fail fast to the CUA fallback.
+            # If the family is already selected the run is still correct (the
+            # family is the only hard gate here); the Effort quality knob falls to
+            # the CUA validate layer. If the family is NOT selected and we can't
+            # even open the picker, the selector list is stale — fail fast to CUA.
             if model_ok:
-                log(f"[setup_claude_dr] Step 1A WARN: couldn't open model popover to set Effort — model already Opus >= {_claude_floor}; CUA validate will confirm the quality knobs", "WARN")
+                log(f"[setup_claude_dr] Step 1A WARN: couldn't open model popover — the trigger "
+                    f"already reads '{_claude_family}' so the run is correct; CUA validate will "
+                    f"confirm the quality knobs", "WARN")
             else:
                 log("[setup_claude_dr] Step 1A FAIL: model popover button not found — selector list likely stale", "WARN")
                 return False
+        # Stamp the cadence clock for ANY run that tried to open the popover,
+        # including one where the button was missing. See record_probe: stamping
+        # only on success is what would turn a rotated popover into a per-run
+        # re-open, and the whole point of the cadence is a bounded cost.
+        if _probe_due:
+            # ⚠ A FAILED STAMP MUST NOT BE SILENT. record_probe swallows every
+            # write error (read-only home, full disk, bad perms) and returns
+            # False. With no stamp the check is due again next run — so the model
+            # popover would open on EVERY run, which is precisely the behaviour
+            # the 2026-07-30 skip was added to stop, reintroduced invisibly on
+            # exactly the machines whose disk state nobody can see. Log it once
+            # per process: enough to diagnose, not enough to spam.
+            global _PROBE_STAMP_WARNED
+            if not record_probe("claude", saw_menu=_probe_saw_menu) and not _PROBE_STAMP_WARNED:
+                _PROBE_STAMP_WARNED = True
+                log(f"[setup_claude_dr] could not record the model-check timestamp "
+                    f"({overlay_path()}) — the periodic check will be due "
+                    f"again next run, so the model popover will keep opening. Check that "
+                    f"the directory is writable.", "WARN")
 
         # ── Step 3: open tools menu and enable Research ────────────────
         # Precise selectors first — the old `button[aria-label*="+"]`
@@ -33821,10 +36247,18 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
         # the caller's soft notice (NOT part of the success contract — model +
         # research remain the only hard gates).
         _P2_THINKING_STATE["claude"] = {"effort": _effort_confirmed, "thinking": _thinking_confirmed}
-        # Record the selected model version for on-the-fly known-good learning
-        # (the trigger version when already-correct, else parsed from the pick).
+        # Record the selected model version for on-the-fly known-good learning.
+        # ⚠ PREFER THE PICK. The trigger read is a page-wide max over every
+        # visible button, so an upsell chip naming a model the account cannot
+        # actually use ("Try Opus 6") could be learned and then pinned to on a
+        # later fallback — a poisoned value that outlives the run. A version we
+        # clicked in the menu is ground truth; the trigger is only the backstop
+        # for the path where nothing was picked because nothing needed picking.
         _P2_PICKED_VERSION["claude"] = (
-            model_trigger_ver if model_ok else parse_family_version(opus_selected or "", "opus"))
+            _picked_version
+            if isinstance(_picked_version, (int, float))
+            else (parse_family_version(opus_selected or "", _claude_family)
+                  or (model_trigger_ver if model_ok else None)))
         # Success only when all three critical knobs are in place
         return bool(opus_selected) and bool(research_enabled)
     except Exception as e:
@@ -33840,6 +36274,160 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
         except Exception:
             pass
         return False
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# The setup ladder — ordered rungs, ONE outcome predicate, first winner stops it
+# ─────────────────────────────────────────────────────────────────────────────
+# Three surfaces can act on "Deep Research is on": the DOM tier, a Vision/CUA
+# setup mission, and a Vision/CUA validation that is allowed to FIX. They used to
+# run as a straight line rather than a ladder — the validation fired
+# unconditionally, after the outcome had already been decided — and both failure
+# directions were real:
+#
+#   * After the DOM tier WON, a second surface still opened the model menu. That
+#     is the "the model selector opens twice" report; the mitigation at the time
+#     was to reword the validator's prompt so it would leave the model alone,
+#     which asks a language model not to do the thing it is being pointed at.
+#   * After the DOM tier LOST, the setup mission and the validation ran
+#     back-to-back on the same control, and a CUA "fix" clicked an already-active
+#     Gemini Deep-Research pill and toggled it back OFF (#709).
+#
+# The ladder makes the sequence explicit: check the outcome, run rungs in order,
+# re-check after each, stop at the first rung that VERIFIES, and record what was
+# skipped and why. Only a POSITIVE reading may skip a rung — a predicate that
+# cannot tell (`unknown`) descends exactly as before, so a brittle read degrades
+# to today's behaviour instead of silently disarming a safety net.
+# ═════════════════════════════════════════════════════════════════════════════
+
+async def _dr_outcome_state(page, platform: str) -> str:
+    """Read-only "is Deep Research active?" → ``'on'`` | ``'off'`` | ``'unknown'``.
+
+    ⭐ TRI-STATE ON PURPOSE. A bool would force every unreadable composer to
+    answer "off", and "off" is the reading that lets a caller ACT. The three
+    platform probes have genuinely different confidence:
+
+      * chatgpt — the shared composer detector. A readable placeholder with no
+        Deep-Research pill is a positive OFF.
+      * gemini  — the composer PLACEHOLDER is authoritative (#709): "What do you
+        want to research?" is ON, "Ask Gemini" is OFF, and a merely-visible pill
+        is neither.
+      * claude  — the WHOLE intent, family AND Research tool, from the same
+        constant the pre-send check reads. Both halves are required because the
+        rung this reading can skip — the CUA validator — checks both, so
+        answering ``on`` from the tool alone would drop the model half of a
+        surface that was doing two jobs. ``researchOn`` is additionally
+        documented BRITTLE (the Research pill renders without the attributes the
+        detector keys on, so a TRUE state reads false), which is why a False here
+        is ``unknown`` and never ``off``.
+
+    Never raises; an unreadable page is ``unknown``.
+    """
+    p = (platform or "").lower()
+    try:
+        if p == "chatgpt":
+            st = await page.evaluate(_CHATGPT_DR_ACTIVE_JS) or {}
+            if st.get("active"):
+                return "on"
+            return "off" if st.get("placeholder") else "unknown"
+        if p == "gemini":
+            st = await page.evaluate(_GEMINI_DR_STATE_JS) or {}
+            if st.get("placeholderResearch"):
+                return "on"
+            if st.get("placeholderChat"):
+                return "off"
+            return "unknown"
+        if p == "claude":
+            st = await page.evaluate(_CLAUDE_MODE_STATE_JS, p2_family("claude") or "opus") or {}
+            # ⛔ Never 'off'. This detector's False is not evidence — see above.
+            return "on" if (st.get("hasExtended") and st.get("researchOn")) else "unknown"
+    except Exception as e:
+        log(f"[ladder] outcome probe for {p} failed ({e})", "INFO")
+    return "unknown"
+
+
+async def _run_intent_ladder(intent_key, rungs, *, verify, label=""):
+    """Run ORDERED rungs for one intent and stop at the first that VERIFIES.
+
+    ``rungs`` is a list of dicts:
+      ``{"tier": <name>, "run": <async no-arg callable>}`` — a rung to run, or
+      ``{"tier": <name>, "ran": True}``                    — a rung the caller
+          already ran itself (the DOM setup, whose failure has its own
+          human-verification consequence that must be handled at the call site).
+    Pre-run rungs come FIRST, since that is what "already ran" means in order.
+
+    ``verify`` is an async no-arg callable returning ``'on' | 'off' | 'unknown'``
+    (see :func:`_dr_outcome_state`). ONLY ``'on'`` stops the ladder — an
+    ``'unknown'`` descends, so a probe that cannot read the page can never
+    disarm a lower rung.
+
+    Returns ``{intent, verified, tier, ran, skipped, states}``. ``tier`` is the
+    rung that verified, or ``"already"`` when the outcome held before any rung
+    ran (nothing is executed in that case — the whole point of a ladder is that
+    an achieved outcome is not re-achieved).
+
+    Never raises: a rung that throws is logged, recorded, and the ladder
+    continues to the next one. A rung failing is what lower rungs are for.
+    """
+    tag = f"[{label}] " if label else ""
+    out = {"intent": intent_key, "verified": False, "tier": None,
+           "ran": [], "skipped": [], "states": []}
+
+    async def _state():
+        try:
+            return await verify()
+        except Exception as e:
+            log(f"{tag}[ladder:{intent_key}] outcome check errored ({e}) — treating as unknown", "INFO")
+            return "unknown"
+
+    # ⚠ The LEADING pre-run rungs are consumed before the first reading, and that
+    # single reading answers both questions at once: "does the outcome already
+    # hold?" and "did those rungs achieve it?" are the same question about the
+    # same page. Probing once for the pre-check and again for the pre-run rung
+    # cost an extra page read AND could log two different answers for one rung
+    # with nothing in between, which reads like a bug in the thing you are using
+    # to diagnose bugs.
+    #
+    # Crediting matters too: reporting "no rung ran" on the commonest path there
+    # is — the DOM setup succeeded and left the outcome satisfied — would be
+    # false, and this log line is the first thing read when working out which
+    # surface is carrying a platform.
+    start = 0
+    while start < len(rungs) and rungs[start].get("ran"):
+        out["ran"].append(rungs[start].get("tier") or f"rung{start}")
+        start += 1
+    st = await _state()
+    out["states"].append(st)
+    if st == "on":
+        out.update(verified=True, tier=(out["ran"][-1] if out["ran"] else "already"))
+        out["skipped"] = [r.get("tier") for r in rungs[start:]]
+        log(f"{tag}[ladder:{intent_key}] outcome satisfied at "
+            f"'{out['tier']}' — skipping {', '.join(out['skipped']) or 'nothing'}")
+        return out
+    for i in range(start, len(rungs)):
+        rung = rungs[i]
+        tier = rung.get("tier") or f"rung{i}"
+        if not rung.get("ran"):
+            runner = rung.get("run")
+            if runner is None:
+                continue
+            try:
+                await runner()
+            except Exception as e:
+                log(f"{tag}[ladder:{intent_key}] rung '{tier}' errored ({e}) — "
+                    f"continuing to the next rung", "WARN")
+        out["ran"].append(tier)
+        st = await _state()
+        out["states"].append(st)
+        if st == "on":
+            out.update(verified=True, tier=tier)
+            out["skipped"] = [r.get("tier") for r in rungs[i + 1:]]
+            log(f"{tag}[ladder:{intent_key}] verified at rung '{tier}' — "
+                f"skipping {', '.join(out['skipped']) or 'nothing (last rung)'}")
+            return out
+    log(f"{tag}[ladder:{intent_key}] no rung verified the outcome "
+        f"(ran: {', '.join(out['ran']) or '-'}, last read: {out['states'][-1]})", "WARN")
+    return out
 
 
 async def validate_setup_with_cua(browser, cua_client, page, platform, label, verbose=False):
@@ -33864,20 +36452,14 @@ async def validate_setup_with_cua(browser, cua_client, page, platform, label, ve
     user_msg_map = {
         "chatgpt": "Verify Deep Research mode is ACTIVE in ChatGPT. Fix if not. Do not type.",
         "gemini": "Verify Gemini Deep Research is ACTIVE — the composer placeholder MUST read 'What do you want to research?' (NOT 'Ask Gemini'). A merely-visible chip is NOT enough proof. Fix if not. Do not type.",
-        # (2026-07-30) The floor is a MINIMUM. "Verify Opus 4.8" on an account
-        # already running Opus 5 made the validator reason "this is NOT Opus
-        # 4.8, so I need to fix it" and click into the model menu before
-        # self-correcting a step later — the second model-menu interaction users
-        # saw as "the modal selector opens twice". State the floor as a floor,
-        # and say explicitly that a higher model must be left alone. `Adaptive
-        # thinking` is gone with the toggle itself — see P2_MODEL_POLICY.
-        "claude": (
-            f"Verify Claude is on Opus {p2_claude_ver()} OR NEWER, with "
-            f"{str(p2_labels('claude').get('effort', 'max')).capitalize()} effort, "
-            f"and the Research tool ON. A HIGHER Opus is correct — if the model "
-            f"already reads Opus {p2_claude_ver()} or above, leave it alone and do "
-            f"NOT open the model menu. Clear any stale attachments. Do not type."
-        ),
+        # ⭐ FAMILY ONLY, and it lives in models.py beside the SETUP directive so
+        # both CUA strings render from one policy. The two are deliberately
+        # different: setup runs after the DOM path FAILED (so it must open the
+        # menu and upgrade), this runs after the DOM path SUCCEEDED (so it must
+        # leave the model alone — opening the menu here is the second
+        # model-menu interaction users saw as "the selector opens twice").
+        # `Adaptive thinking` is gone with the toggle — see P2_MODEL_POLICY.
+        "claude": p2_claude_validate_directive(),
     }
     sys_prompt = validator_map.get(platform.lower())
     user_prompt = user_msg_map.get(platform.lower())
@@ -34575,45 +37157,11 @@ async def ensure_deep_mode_active(page, platform, label, reactivate=True) -> dic
                 f"reactivate={reactivate} placeholder={st.get('placeholder')!r}", "DEBUG")
             return {"platform": "gemini", "active": active}
         if platform_l == "claude":
-            # Check BOTH: high-tier Opus model AND Research tool are on.
-            # Floor from policy (single source of truth) — passed into the JS.
-            _cl_floor = p2_floor("claude")
-            _claude_state_js = """(floor) => {
-                const txt = (document.body.innerText || '').toLowerCase();
-                // 2026-05-28: the UI dropped the word "Extended" — the model
-                // button now reads "Opus 4.8 Max" and Adaptive shows as a
-                // "Thinking" toggle behind the popover. A body-wide "extended"
-                // scan was therefore ALWAYS false → a needless re-activation on
-                // EVERY Claude send (backend.log 49728). Read the model-selector
-                // button instead: Opus >= 4.8 showing == the high-tier model is
-                // active. (Adaptive/effort live behind the closed popover and are
-                // confirmed by the CUA validate layer, not gated here.)
-                const verOf = t => {
-                    const m = (t || '').match(/opus[^0-9]*([0-9]+(?:\\.[0-9]+)?)/i);
-                    return m ? parseFloat(m[1]) : null;
-                };
-                // Read the composer's model-selector TRIGGER button only —
-                // EXCLUDE any Opus option rendered inside an open dropdown/menu
-                // (a stale "Opus 4.8" menu item while the current model is 4.7
-                // would otherwise false-positive). The trigger lives outside any
-                // [role=menu]/[role=listbox]/[role=dialog] popover.
-                const hasExtended = [...document.querySelectorAll('button, [role="button"]')]
-                    .filter(b => !b.closest('[role="menu"], [role="listbox"], [role="dialog"]'))
-                    .some(b => { const v = verOf(b.textContent); return v !== null && v >= floor; });
-                // Research tool shows as a magnifying-glass icon / label near composer
-                const researchOn = Array.from(document.querySelectorAll('button, [role="button"]'))
-                    .some(b => {
-                        const t = (b.textContent || '').toLowerCase();
-                        const a = (b.getAttribute('aria-label') || '').toLowerCase();
-                        return (t.includes('research') || a.includes('research')) &&
-                               (b.getAttribute('aria-pressed') === 'true' ||
-                                b.getAttribute('data-state') === 'on' ||
-                                b.classList.contains('active') ||
-                                b.classList.contains('selected'));
-                    });
-                return { hasExtended, researchOn };
-            }"""
-            state = await page.evaluate(_claude_state_js, _cl_floor)
+            # Check BOTH: the model FAMILY is selected AND the Research tool is on.
+            # Family word from policy (single source of truth) — passed into the JS.
+            _cl_family = p2_family("claude") or "opus"
+            _claude_state_js = _CLAUDE_MODE_STATE_JS
+            state = await page.evaluate(_claude_state_js, _cl_family)
             if reactivate and (not state.get("hasExtended") or not state.get("researchOn")):
                 log(f"[{label}] Claude mode regressed before send "
                     f"(extended={state.get('hasExtended')}, research={state.get('researchOn')}) — re-activating", "WARN")
@@ -34622,7 +37170,7 @@ async def ensure_deep_mode_active(page, platform, label, reactivate=True) -> dic
                 # caller sees the actual final state, not the pre-fix one.
                 # If Step 3A/3B selectors are still broken, researchOn will
                 # remain False and the caller pauses for user decision.
-                state = await page.evaluate(_claude_state_js, _cl_floor)
+                state = await page.evaluate(_claude_state_js, _cl_family)
                 log(f"[{label}] Claude mode post-re-activate: "
                     f"extended={state.get('hasExtended')}, research={state.get('researchOn')}", "INFO")
                 # #744 self-documenting dump: when researchOn STILL reads False
@@ -36565,13 +39113,35 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             log(f"[{label}] Fresh-chat guard errored (continuing): {_fe}", "WARN")
 
     # LAYER 1: Playwright-direct setup first
+    #
+    # Ledgered HERE rather than inside each setup_* — this is the primary
+    # attempt, the one whose outcome answers "did the DOM layer do the job, or
+    # did vision have to". The recovery re-runs further down deliberately do NOT
+    # record: counting a rescue attempt as a separate DOM intent would make the
+    # summary read worse the harder the run had to work, which is backwards.
+    _setup_t0 = time.time()
     setup_ok = False
     if platform_l == "chatgpt":
-        setup_ok = await setup_chatgpt_dr(page)
+        # ⭐ The ONE call site allowed to touch the effort menu — the same rule
+        # as setup_claude_dr's allow_probe just below. This is initial setup:
+        # the composer is empty and an open popover is harmless. Every other
+        # setup_chatgpt_dr call is a pre-send or recovery re-run.
+        setup_ok = await setup_chatgpt_dr(page, allow_model_pick=True)
     elif platform_l == "gemini":
         setup_ok = await setup_gemini_dr(page)
     elif platform_l == "claude":
-        setup_ok = await setup_claude_dr(page)
+        # ⭐ The ONE call site allowed to run the periodic model-menu check.
+        # This is initial setup: the composer is empty, nothing has been sent,
+        # and an open popover is harmless. Every other setup_claude_dr call is a
+        # recovery/pre-send re-run where opening the model menu would land it
+        # over the composer (the #744 screenshot), so they all leave allow_probe
+        # at its default False.
+        setup_ok = await setup_claude_dr(page, allow_probe=True)
+    if platform_l in ("chatgpt", "gemini", "claude"):
+        _dom_note(f"{platform_l}.setup_deep_research",
+                  "verified" if setup_ok else "missed", phase=2,
+                  ms=(time.time() - _setup_t0) * 1000,
+                  detail="" if setup_ok else "vision/CUA setup fallback will run")
 
     # After Playwright tried to set up: if setup failed AND verification is now
     # visible (it can appear mid-setup when Claude's automation detection trips),
@@ -36592,7 +39162,27 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
 
     if setup_ok:
         log(f"[{label}] Playwright-direct setup OK")
-    else:
+
+    # ⚠ Explicit, because it used to be a SIDE EFFECT of the validation rung —
+    # which the ladder can now skip. `switch_to_page` also brings the tab to the
+    # front, and the brief-delivery legs below type and paste into it, so on the
+    # happy path (DOM setup wins, validation skipped) the focus guarantee would
+    # otherwise have quietly disappeared with the rung that used to provide it.
+    # Idempotent: this is already the active page on both entry paths.
+    try:
+        await browser.switch_to_page(page)
+    except Exception as _swe:
+        log(f"[{label}] could not bring the agent tab to front ({_swe})", "INFO")
+
+    # ── RUNGS 2 and 3, sequenced. ──
+    # See _run_intent_ladder: the rungs below only run while the outcome is NOT
+    # verified, and a rung that verifies stops the ladder. Rung 1 (the DOM setup
+    # above) is declared as already-run rather than driven from here, because its
+    # failure carries the human-verification consequence handled just above and a
+    # rung cannot return out of this function.
+    _cua_verdict = {}
+
+    async def _rung_cua_setup():
         # Playwright failed — try original CUA setup as a first fallback (tight iterations)
         log(f"[{label}] Playwright setup failed — CUA fallback setup (tight)...")
 
@@ -36600,10 +39190,10 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             return await agent_loop(cua_client, browser, prompt_system, prompt_user,
                 model=CUA_MODEL, max_iterations=8, verbose=verbose)
 
-        # #839 act tier: side-effect-only setup (result ignored — Layer-2
-        # validate_setup_with_cua below is the confirmation). #709: DR-active is
-        # judged by the composer PLACEHOLDER, never a pill-pressed heuristic —
-        # the context_hint encodes it so a Vision actor doesn't toggle a working
+        # #839 act tier: side-effect-only setup (result ignored — the ladder's
+        # own outcome probe is the confirmation). #709: DR-active is judged by
+        # the composer PLACEHOLDER, never a pill-pressed heuristic — the
+        # context_hint encodes it so a Vision actor doesn't toggle a working
         # DR off by misreading a merely-visible chip.
         _setup_placeholder_hint = {
             "gemini": "DR is ON only when the composer placeholder reads 'What do you "
@@ -36622,13 +39212,37 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             mission_prompt=f"{prompt_system}\n\nTASK: {prompt_user}",
             act_timeout_s=120.0)
 
-    # LAYER 2: CUA visual validation — confirms options are ACTUALLY active.
-    # cua_confirmed is True ONLY on a positive "verified"/"fixed" verdict (NOT
-    # ambiguous/error); the chat-mode gate below keys on it (#744).
-    log(f"[{label}] CUA validating setup state...")
-    cua_ok, cua_confirmed = await validate_setup_with_cua(browser, cua_client, page, platform, label, verbose)
-    if not cua_ok:
-        log(f"[{label}] CUA validation failed — proceeding anyway but agent may misbehave", "WARN")
+    async def _rung_cua_validate():
+        # CUA visual validation — confirms options are ACTUALLY active, and may FIX.
+        log(f"[{label}] CUA validating setup state...")
+        _ok, _confirmed = await validate_setup_with_cua(
+            browser, cua_client, page, platform, label, verbose)
+        _cua_verdict["ok"] = _ok
+        _cua_verdict["confirmed"] = _confirmed
+        if not _ok:
+            log(f"[{label}] CUA validation failed — proceeding anyway but agent may misbehave", "WARN")
+
+    _ladder = await _run_intent_ladder(
+        f"{platform_l}.enable_deep_research",
+        [{"tier": "builtin", "ran": True},
+         {"tier": "vision_cua", "run": (None if setup_ok else _rung_cua_setup)},
+         {"tier": "cua_validate", "run": _rung_cua_validate}],
+        verify=lambda: _dr_outcome_state(page, platform_l),
+        label=label)
+
+    # `cua_ok`'s only consumer was the "validation failed — proceeding anyway"
+    # warning, which now lives inside the rung that produces it. That removes the
+    # question of what it should default to when the rung never runs: a rung that
+    # did not run cannot have failed, and nothing has to encode that.
+    #
+    # ⭐ The chat-mode gate below asks "do we have a POSITIVE confirmation that
+    # Deep Research is on?" — it used to be able to get one only from the CUA
+    # validator, which is why that surface had to run even after the DOM tier had
+    # already won. The ladder's own outcome probe is the same kind of evidence
+    # (stronger, in fact: it is a mechanical read of the live composer rather
+    # than a model's prose), so either source satisfies it and the second surface
+    # is no longer needed to produce it.
+    setup_confirmed = bool(_cua_verdict.get("confirmed")) or bool(_ladder.get("verified"))
 
     # ── Brief delivery ──
     # ChatGPT + Claude accept .md file attachments in Deep Research mode and
@@ -36786,64 +39400,109 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             # was on (backend.log 22:39:47). The gate's own contract is "fire
             # only when Layer 1 + Layer 2 + re-activation ALL failed"; OR-ing
             # the Layer-2 confirmation makes the code match that contract.
-            # IMPORTANT: key on `cua_confirmed` (a POSITIVE "verified"/"fixed"
-            # verdict), NOT the looser `cua_ok` — `cua_ok` is also True on an
-            # ambiguous/errored validation, and trusting that would let a real
-            # chat-mode degradation slip through silently (#709). A positive
-            # visual confirmation is authoritative over the brittle DOM read.
-            research_ok = bool((mode_state or {}).get("researchOn")) or bool(cua_confirmed)
+            # IMPORTANT: key on `setup_confirmed` (a POSITIVE confirmation —
+            # either the CUA validator's "verified"/"fixed" verdict or the
+            # ladder's own outcome probe), NOT the looser `cua_ok`, which is also
+            # True on an ambiguous/errored validation; trusting that would let a
+            # real chat-mode degradation slip through silently (#709). A positive
+            # confirmation is authoritative over the brittle DOM read.
+            research_ok = bool((mode_state or {}).get("researchOn")) or bool(setup_confirmed)
         else:
             research_ok = bool((mode_state or {}).get("active"))
 
-        # ── Phoenix model_refresh — known-good fallback (auto-adopt + verify +
-        #    fallback) ──────────────────────────────────────────────────────
-        # If the LATEST model couldn't be verified into Deep Research, retry
-        # ONCE pinning the last known-good model (canary-recorded; else the
-        # policy floor = today's proven model) BEFORE the chat-mode gate fires.
-        # A newer model that doesn't yet support DR then degrades to a working
-        # older model instead of a Skip. Single-shot (straight-line, no loop);
-        # ChatGPT has no model lever → not eligible. The pinned re-pick reuses
-        # setup_*_dr so the #744/#751 popover/Escape invariants stay intact, and
-        # a failure here just falls through to the existing gate (worst case =
-        # today's Skip path).
+        # ── Step-back fallback: the newest model didn't reach Deep Research ──
+        # Retry ONCE on an OLDER model before the chat-mode gate fires, so a
+        # just-shipped release that doesn't support Deep Research yet degrades to
+        # a working model instead of a Skip. Single-shot (straight-line, no loop);
+        # ChatGPT has no model lever → not eligible. The re-pick reuses setup_*_dr
+        # so the #744/#751 popover/Escape invariants stay intact, and a failure
+        # here just falls through to the existing gate (worst case = today's Skip).
+        #
+        # ⭐ TWO WAYS TO NAME THE TARGET, NEITHER OF THEM A LITERAL.
+        #   • `pin`   — the learned known-good, used only when it is genuinely
+        #               BELOW the version that just failed.
+        #   • `below` — otherwise: "the highest row strictly older than the one
+        #               that failed", resolved from the live menu.
+        # The old code fell back to the policy floor (4.8). That was a frozen
+        # number AND it went to nothing on a fresh install once the floor was
+        # removed; `below` needs no history, so the very first run after an
+        # install can still step back.
         if not research_ok and platform_l in ("claude", "gemini"):
-            _kg = p2_known_good(platform_l) or p2_floor(platform_l)
             _failed = _P2_PICKED_VERSION.get(platform_l)
-            # Only retry when known-good is a DIFFERENT model than the one that
-            # just failed: re-pinning the SAME version can't help (it just
-            # failed) and would needlessly re-click an already-correct model
-            # (the #744-adjacent action). When known-good == the failed model
-            # (the common case — e.g. the floor IS what ran, the default with
-            # the kill-switch off), this is a TRUE no-op and control goes
-            # straight to the gate, exactly like pre-Phoenix.
-            _kg_differs = _kg is not None and not (
-                isinstance(_failed, (int, float)) and abs(float(_kg) - float(_failed)) < 0.001)
-            if _kg_differs:
-                log(f"[{label}] Phoenix: latest model (v{_failed}) unverified for Deep "
-                    f"Research — retrying once pinned to known-good {platform_l} v{_kg}", "WARN")
+            try:
+                _kg = p2_known_good(platform_l)
+            except Exception:
+                _kg = None      # a malformed overlay must never kill the retry
+            _failed_f = float(_failed) if isinstance(_failed, (int, float)) else None
+            # Only pin to known-good when it is a strictly OLDER model than the
+            # one that just failed: re-pinning the same version can't help (it
+            # just failed) and would needlessly re-click an already-correct model
+            # (the #744-adjacent action).
+            # ⚠ `_failed_f is None` is NOT "any pin is fine". With the failed
+            # version unknown we cannot prove the pin is older, so pinning could
+            # re-select the model that just failed and burn the single retry.
+            _pin = (_kg if isinstance(_kg, (int, float))
+                    and _failed_f is not None and _kg < _failed_f - 0.001 else None)
+            # `below` rides along WITH the pin, not instead of it: the picker
+            # prefers an exact pin match and falls back to the best strictly-older
+            # row when the pinned version is no longer on the menu (a learned
+            # known-good never expires, so weeks later it may simply be gone).
+            _below = _failed_f
+            if _pin is not None or _below is not None:
+                log(f"[{label}] step-back: {platform_l} v{_failed} did not verify into Deep "
+                    f"Research — retrying once on an older model "
+                    f"({'known-good v%s' % _pin if _pin is not None else 'the highest below v%s' % _below})",
+                    "WARN")
                 try:
                     if platform_l == "claude":
-                        await setup_claude_dr(page, pin_model=_kg)
+                        await setup_claude_dr(page, pin_model=_pin, step_below=_below)
                     else:
-                        await setup_gemini_dr(page, pin_model=_kg)
+                        await setup_gemini_dr(page, pin_model=_pin, step_below=_below)
                     # Measure WITHOUT the un-pinned re-activation (reactivate=False)
                     # so the pin HOLDS — the default ensure path re-runs setup
                     # unpinned, which would re-pick the highest (= the model that
                     # just failed) and silently undo the fallback.
                     mode_state = await ensure_deep_mode_active(page, platform, label, reactivate=False)
                     if platform_l == "claude":
-                        research_ok = bool((mode_state or {}).get("researchOn")) or bool(cua_confirmed)
+                        research_ok = bool((mode_state or {}).get("researchOn")) or bool(setup_confirmed)
                     else:
                         research_ok = bool((mode_state or {}).get("active"))
                 except Exception as _kge:
-                    log(f"[{label}] Phoenix known-good retry errored (non-fatal): {_kge}", "WARN")
+                    log(f"[{label}] step-back retry errored (non-fatal): {_kge}", "WARN")
                 if research_ok:
-                    _emit_model_drift_alert(
-                        platform_l,
-                        f"{_agent_name} used a known-good model (v{_kg}) for Deep Research",
-                        "The latest model couldn't be verified into Deep Research, so the "
-                        f"agent fell back to a known-good model (v{_kg}). The run continues normally.")
-                    log(f"[{label}] Phoenix: known-good fallback verified — proceeding on v{_kg}")
+                    # ⛔ "The retry worked" is NOT "a step-back happened", and the
+                    # notice may only claim what we can prove. The selectors POP
+                    # _P2_PICKED_VERSION on entry and write it only after a row is
+                    # actually clicked, so in the COMMON case — no row strictly
+                    # older than the one that failed, which is what a platform
+                    # offering one current family member plus rejected siblings
+                    # looks like — the re-pick early-returns, Deep Research is
+                    # enabled anyway and succeeds, and `_stepped_to` is None. The
+                    # user then read "used an older model (vNone)" while the
+                    # platform sat on exactly the model that had just failed:
+                    # a literal "vNone" in an amber notice, attached to a claim
+                    # that was false. Prove the retreat before reporting it.
+                    _stepped_to = _P2_PICKED_VERSION.get(platform_l)
+                    # `_below` IS `_failed_f` and `_pin` can only be set when
+                    # `_failed_f` is a number, so the guard above guarantees a
+                    # reachable step-back knows the version that failed.
+                    if stepped_back_to(_stepped_to, _failed_f):
+                        _emit_model_drift_alert(
+                            platform_l,
+                            f"{_agent_name} used an older model (v{_stepped_to}) for Deep Research",
+                            "The newest model couldn't be verified into Deep Research, so the "
+                            f"agent stepped back to v{_stepped_to}. The run continues normally.")
+                        log(f"[{label}] step-back verified — proceeding on v{_stepped_to}")
+                    else:
+                        # ⚠ States what was OBSERVED, not a cause. "No row was
+                        # clicked" is all we know: no older row on the menu is the
+                        # usual reason, but a selector miss or an exception looks
+                        # identical from here. Asserting the reason we did not
+                        # verify is the same mistake as the vNone notice.
+                        log(f"[{label}] Deep Research recovered without a model change"
+                            f" — the re-pick selected nothing below v{_failed} on "
+                            f"{platform_l} (no older row offered, or the re-pick "
+                            "missed), so no step-back is claimed")
 
         # ── Phoenix model_refresh — thinking-config telemetry (NO user alert) ──
         # When we're proceeding in RESEARCH mode but a policy thinking knob (Claude
@@ -38741,6 +41400,215 @@ async def _nlm_click_first(page, patterns):
         return ""
 
 
+# ── The audio card's ⋮ menu — scoped, never document-wide ──────────────
+#
+# ⛔ THE BUG THIS EXISTS TO KILL: the audio-share step opened a menu with a
+# document-wide `button[aria-label*="More"]` query and took the first visible
+# match. EVERY source row exposes exactly that button (chatgpt.md at y364,
+# claude.md at y406, gemini.md at y458), and the audio card's own kebab sits
+# BELOW them at y398 — so the first match is always a source row, and the menu
+# that opened was the one whose destructive item is "Remove source". The audio
+# kebab and a source kebab carry an IDENTICAL aria-label and near-identical x, so
+# no attribute and no coordinate can tell them apart. The container can:
+#     studio-panel → artifact-library → artifact-library-item → button[More]
+#
+# Scoping is stated as SCOPE IN, never EXCLUDE BY NAME. An exclusion list keyed
+# on source-row labels reopens the hole the day a source is named differently;
+# a container scope does not care what the rows are called.
+#
+# The first scope is the same population `_count_nlm_audio_cards` and
+# `_pick_nlm_audio_card` already count — a visible <artifact-library-item>
+# carrying the `audio_magic_eraser` ligature — so all three agree on what an
+# audio card is. WHICH audio card does not matter here: NotebookLM emits one
+# `/notebook/{id}` link for the notebook however you reach the share dialog, so
+# a duplicate changes nothing about the URL, only about whose menu opens.
+_NLM_AUDIO_MENU_SCOPES = [
+    {"name": "audio-card", "sel": "artifact-library-item", "needs": "audio_magic_eraser"},
+    {"name": "artifact-item", "sel": "studio-panel artifact-library artifact-library-item", "needs": ""},
+    {"name": "studio-panel", "sel": "studio-panel", "needs": ""},
+]
+
+# Ordered hooks within the scope. Exact label first so a rename to "More
+# options" degrades to the substring rung instead of silently matching nothing.
+_NLM_AUDIO_TRIGGER_SELS = [
+    'button[aria-label="More"]',
+    'button[aria-label*="more" i]',
+    'button[aria-haspopup="menu"]',
+]
+
+# ONE definition of "which button is the audio ⋮", shared by the opener and the
+# verifier. They MUST agree: the verifier's whole job is to ask whether the
+# button the opener clicked is now expanded, and if the two could resolve
+# differently that sentence would be about two different buttons.
+#
+# ⚠ The CONTAINER is deliberately not gated on visibility. Its job is
+# containment, and a Studio panel taller than the viewport has its centre below
+# the fold — gating it would reject the very page this is meant to work on. A
+# collapsed or hidden panel needs no special case either: its buttons inherit
+# zero rects and fail the gate that matters, which is the one on the button
+# being clicked.
+_NLM_FIND_AUDIO_TRIGGER_JS = r"""
+    const findTrigger = (P) => {
+        for (const g of (P.scopes || [])) {
+            for (const scope of document.querySelectorAll(g.sel)) {
+                if (g.needs) {
+                    const st = (scope.innerText || scope.textContent || '');
+                    if (st.indexOf(g.needs) === -1) continue;
+                }
+                for (const sel of (P.triggers || [])) {
+                    for (const btn of scope.querySelectorAll(sel)) {
+                        if (!onScreen(btn)) continue;
+                        return { btn: btn, via: g.name, hook: sel };
+                    }
+                }
+            }
+        }
+        return null;
+    };
+"""
+
+_NLM_OPEN_AUDIO_MENU_JS = (r"""(P) => {"""
+                           + _NLM_ONSCREEN_JS + _NLM_FIND_AUDIO_TRIGGER_JS + r"""
+    const hit = findTrigger(P);
+    if (!hit) return { opened: false, via: '', reason: 'no_scoped_trigger' };
+    // Read BEFORE the click so the answer describes the button we chose, not
+    // whatever the click re-rendered. The aria-label cannot carry this: a
+    // source row's kebab has the identical one, which is the whole reason the
+    // old query could not tell it had opened the wrong menu.
+    const inCard = !!hit.btn.closest('artifact-library-item');
+    const inStudio = !!hit.btn.closest('studio-panel');
+    try { hit.btn.click(); }
+    catch (e) { return { opened: false, via: hit.via, reason: 'click_threw' }; }
+    return { opened: true, via: hit.via, hook: hit.hook,
+             in_audio_card: inCard, in_studio: inStudio,
+             label: (hit.btn.getAttribute('aria-label') || '').slice(0, 40) };
+}""")
+
+# Positive proof that the trigger WE meant is the one that opened.
+#
+# ⚠ A COUNT IS NOT PROOF. "Something inside the Studio panel is expanded" is
+# also true when a section header in that panel was already open before we
+# touched anything — so a count would verify a click that did nothing. The
+# question has to be asked of the button itself, which is why the trigger is
+# re-resolved here through the shared finder rather than counted. The counts are
+# still returned, for the log: `outside` is what the old document-wide query was
+# always hitting, and seeing it non-zero names the failure.
+_NLM_AUDIO_MENU_VERIFY_JS = (r"""(P) => {"""
+                             + _NLM_ONSCREEN_JS + _NLM_FIND_AUDIO_TRIGGER_JS + r"""
+    const scopeSel = (P.scopes || []).map(g => g.sel).join(', ');
+    let inScope = 0, outside = 0;
+    for (const b of document.querySelectorAll('[aria-expanded="true"]')) {
+        if (scopeSel && b.closest(scopeSel)) inScope++; else outside++;
+    }
+    const hit = findTrigger(P);
+    return { in_scope: inScope, outside: outside,
+             trigger_found: !!hit,
+             trigger_expanded: !!hit && hit.btn.getAttribute('aria-expanded') === 'true' };
+}""")
+
+# Rows of an open Material menu, and the panels they live in.
+_NLM_MENU_PANEL_SCOPES = [
+    '[role="menu"]', '.mat-mdc-menu-panel', '.mat-menu-panel', '.cdk-overlay-pane',
+]
+_NLM_MENU_ROW_SEL = '[role="menuitem"], [role="menuitemradio"], [role="option"], button, li'
+
+# ⛔ Rows that must NEVER be clicked by a menu pick, whatever was asked for.
+# NotebookLM is detect-and-fail_phase only — the pipeline does not delete a card,
+# a source, or a notebook, ever. `Delete` sits two rows below `Download` in the
+# audio menu, so an off-by-two is not a failed download, it is a destroyed one.
+_NLM_MENU_DENY = ("delete", "remove", "trash", "discard")
+
+_NLM_MENU_PICK_JS = (r"""(P) => {""" + _NLM_ONSCREEN_JS + _NLM_LABEL_JS + r"""
+    const want = (P.want || []).map(s => String(s).toLowerCase());
+    const deny = (P.deny || []).map(s => String(s).toLowerCase());
+    const denied = (t) => deny.some(d => new RegExp('\\b' + d + '\\b', 'i').test(t));
+    let rows = [], via = '';
+    for (const sc of (P.scopes || [])) {
+        for (const panel of document.querySelectorAll(sc)) {
+            if (!onScreen(panel)) continue;
+            for (const el of panel.querySelectorAll(P.rowSel)) {
+                if (!onScreen(el)) continue;
+                const t = nlmLabel(el).toLowerCase();
+                if (!t) continue;
+                rows.push({ el: el, t: t });
+            }
+            if (rows.length) { via = sc; break; }
+        }
+        if (rows.length) break;
+    }
+    if (!rows.length) return { clicked: false, reason: 'no_menu_rows' };
+    const blocked = rows.filter(r => denied(r.t)).map(r => r.t.slice(0, 40));
+    const safe = rows.filter(r => !denied(r.t));
+    // Identity, never position: exact label first, then a prefix — a bare
+    // substring would let "Delete this share" answer a request for "share".
+    let hit = safe.filter(r => want.indexOf(r.t) !== -1)[0];
+    if (!hit) hit = safe.filter(r => want.some(w => r.t.indexOf(w) === 0))[0];
+    if (!hit) return { clicked: false, reason: 'no_match', via: via, blocked: blocked,
+                       rows: rows.map(r => r.t.slice(0, 40)) };
+    try { hit.el.click(); } catch (e) { return { clicked: false, reason: 'click_threw' }; }
+    return { clicked: true, label: hit.t.slice(0, 60), via: via, blocked: blocked };
+}""")
+
+
+async def _nlm_open_audio_menu(page, label="Audio") -> dict:
+    """Open the AUDIO card's ⋮ menu — and prove it was that one.
+
+    Returns {opened, verified, via, hook, reason, outside}. `verified` is the
+    only field a caller should act on: `opened` alone means a click landed, which
+    is precisely the claim the old document-wide query could make while having
+    opened a source row's menu.
+    """
+    try:
+        res = await page.evaluate(_NLM_OPEN_AUDIO_MENU_JS,
+                                  {"scopes": _NLM_AUDIO_MENU_SCOPES,
+                                   "triggers": _NLM_AUDIO_TRIGGER_SELS}) or {}
+    except Exception as _e:
+        return {"opened": False, "verified": False, "via": "",
+                "reason": f"evaluate_failed:{type(_e).__name__}", "outside": 0}
+    if not res.get("opened"):
+        return {**res, "opened": False, "verified": False, "outside": 0}
+    # POLL the verify rather than looking once after a fixed second. The verify
+    # itself is right — it re-resolves the trigger and asks THAT button — but a
+    # menu that mounts a moment late failed it, and the caller reads a failed
+    # verify as "a menu opened somewhere else", which is a different and more
+    # alarming thing than "not yet". Same fault the ChatGPT menus were fixed for.
+    chk = {}
+    for _try in range(5):
+        if _try:
+            await asyncio.sleep(0.25)
+        try:
+            chk = await page.evaluate(_NLM_AUDIO_MENU_VERIFY_JS,
+                                      {"scopes": _NLM_AUDIO_MENU_SCOPES,
+                                       "triggers": _NLM_AUDIO_TRIGGER_SELS}) or {}
+        except Exception as _e:
+            chk = {}
+            log(f"[{label}] audio ⋮ open-verify skipped: {_e}", "DEBUG")
+            break
+        if chk.get("trigger_expanded"):
+            break
+    verified = bool(chk.get("trigger_expanded"))
+    _dom_note("notebooklm.open_audio_menu", "verified" if verified else "missed",
+              phase=3, via=str(res.get("via") or ""),
+              detail=("" if verified else
+                      f"trigger_found={chk.get('trigger_found')} "
+                      f"expanded_outside_scope={chk.get('outside')} "
+                      f"hook={res.get('hook')!r}"))
+    return {**res, "verified": verified, "outside": int(chk.get("outside", 0) or 0),
+            "in_scope": int(chk.get("in_scope", 0) or 0)}
+
+
+async def _nlm_menu_pick(page, want, deny=_NLM_MENU_DENY) -> dict:
+    """Click one row of an open NotebookLM menu, by label, never by index."""
+    try:
+        return await page.evaluate(_NLM_MENU_PICK_JS,
+                                   {"scopes": _NLM_MENU_PANEL_SCOPES,
+                                    "rowSel": _NLM_MENU_ROW_SEL,
+                                    "want": list(want),
+                                    "deny": list(deny)}) or {}
+    except Exception as _e:
+        return {"clicked": False, "reason": f"evaluate_failed:{type(_e).__name__}"}
+
+
 async def _nlm_close_dialogs(page, label="NotebookLM"):
     """Best-effort close of any open NotebookLM modal (the FIFA source verify
     ran BEHIND a leftover Add-sources dialog). Close-button first, Escape
@@ -39652,8 +42520,11 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
     # come back as 0 prematurely.
     await asyncio.sleep(5)
     existing_cards = await _count_nlm_audio_cards(browser.page)
+    existing_generating = await _count_nlm_audio_generating(browser.page)
     already_generating = await _check_audio_generating(browser.page)
-    log(f"[Phase3] Pre-flight inventory: {existing_cards} audio card(s), generating={already_generating}")
+    log(f"[Phase3] Pre-flight inventory: {existing_cards} ready + "
+        f"{existing_generating} generating audio card(s), "
+        f"generating={already_generating}")
 
     # #778 (2026-06-03): counter-independent GENERATION POLICY — no fail_phase,
     # no delete. The NotebookLM notebook is created FRESH for THIS run (Phase 3
@@ -39900,10 +42771,16 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
     # in the panel before the count.
     await asyncio.sleep(5)
     post_gen_cards = await _count_nlm_audio_cards(browser.page)
-    log(f"[Phase3] Post-generate inventory: {post_gen_cards} audio card(s)")
-    if post_gen_cards == 0:
+    post_gen_generating = await _count_nlm_audio_generating(browser.page)
+    log(f"[Phase3] Post-generate inventory: {post_gen_cards} ready + "
+        f"{post_gen_generating} generating audio card(s)")
+    if post_gen_cards == 0 and post_gen_generating == 0:
         # #757-B capture: a card should exist right after Generate — 0 means the
         # counter selectors missed a live (in-flight) card. Dump it (read-only).
+        #
+        # Both counts, because five seconds after Generate the expected state is
+        # 0 ready + 1 generating — the ready-only test made a healthy run fire a
+        # WARN dump every time, which is the noise that hides a real anomaly.
         await _dump_nlm_audio_dom(browser.page, "post-generate")
     if post_gen_cards > 1:
         # #778 (2026-06-03): a duplicate slipped past prevention (the DOM
@@ -40021,7 +42898,14 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         # card; without it a normal single-audio run could trip the
         # check on the first poll when the card is still pending.
         if (time.time() - poll_start) >= 180:
-            _live_cards = await _count_nlm_audio_cards(browser.page)
+            _live_ready = await _count_nlm_audio_cards(browser.page)
+            # A duplicate spawned by a misclick starts as a PLACEHOLDER and only
+            # becomes an artifact-library-item minutes later, so a ready-only
+            # count surfaces it long after the fact — or, if both are still in
+            # flight, not at all. Counting both is safe here precisely because
+            # the action is log-once-and-continue: no fail, no delete.
+            _live_generating = await _count_nlm_audio_generating(browser.page)
+            _live_cards = _live_ready + _live_generating
             if _live_cards > 1 and not _dup_logged:
                 # #778 (2026-06-03): a duplicate is visible mid-poll. NO-DELETE
                 # + never-fail-on-dup: do NOT fail_phase (the old behavior wedged
@@ -40031,9 +42915,10 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                 # format + DOM order. Logged once so a long audio window doesn't
                 # repeat the same WARN every poll cycle.
                 _dup_logged = True
-                log(f"[Phase3] Mid-poll: {_live_cards} audio cards (duplicate) — "
-                    f"continuing; resilient download will target the requested one "
-                    f"(no-delete, no-fail)", "WARN")
+                log(f"[Phase3] Mid-poll: {_live_cards} audio cards "
+                    f"({_live_ready} ready + {_live_generating} generating, "
+                    f"duplicate) — continuing; resilient download will target "
+                    f"the requested one (no-delete, no-fail)", "WARN")
 
         # DOM-first: read the audio card directly. Avoids CUA's
         # page-wide-chrome confusion where unrelated NLM panel
@@ -40334,51 +43219,20 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
     if audio_done:
         try:
             page = browser.page
-            # Step 1: Open three-dots / options menu near the audio player
-            menu_opened = await page.evaluate("""() => {
-                // Look for three-dots / more options button near audio player
-                const menuBtns = document.querySelectorAll(
-                    'button[aria-label*="More"], button[aria-label*="more"], ' +
-                    'button[aria-label*="Options"], button[aria-label*="options"], ' +
-                    'button[aria-label*="Menu"], button[aria-label*="menu"], ' +
-                    '[class*="more"] button, [class*="menu"] button, ' +
-                    'button[data-testid*="more"], button[data-testid*="menu"]'
-                );
-                // Also look for ⋮ (vertical dots) button
-                for (const btn of menuBtns) {
-                    if (btn.offsetParent !== null) { btn.click(); return 'menu_opened'; }
-                }
-                // Fallback: look for button with dots icon/text
-                const allBtns = document.querySelectorAll('button');
-                for (const b of allBtns) {
-                    const txt = (b.innerText || '').trim();
-                    const label = (b.getAttribute('aria-label') || '').toLowerCase();
-                    if (txt === '⋮' || txt === '...' || txt === '⋯' ||
-                        label.includes('action') || label.includes('overflow')) {
-                        if (b.offsetParent !== null) { b.click(); return 'dots_opened'; }
-                    }
-                }
-                return '';
-            }""")
-            if menu_opened:
-                await asyncio.sleep(1)
-                # Step 2: Click "Share" from the menu
-                await page.evaluate("""() => {
-                    const items = document.querySelectorAll(
-                        '[role="menuitem"], [role="option"], li, button'
-                    );
-                    for (const item of items) {
-                        const txt = (item.innerText || item.textContent || '').toLowerCase().trim();
-                        if (txt === 'share' || txt === 'share notebook' || txt.startsWith('share')) {
-                            item.click();
-                            return 'share_clicked';
-                        }
-                    }
-                    return '';
-                }""")
-                await asyncio.sleep(2)
-            else:
-                # Fallback: try direct share button
+
+            async def _notebook_share_fallback(why: str):
+                """The notebook-level Share button.
+
+                Not a lesser path: NotebookLM emits the SAME `/notebook/{id}`
+                link whether you arrive via the audio card's ⋮ → Share or via
+                the notebook's own Share button (the comment on the URL fallback
+                below has said so since #778). So when the audio kebab cannot be
+                located inside the Studio panel, this is a correct answer — and
+                strictly better than the alternative the old code took, which was
+                to click the first `aria-label*="More"` on the page and hope.
+                """
+                log(f"[Audio] audio ⋮ not used ({why}) — using the notebook-level "
+                    f"Share button, which yields the same notebook link")
                 await page.evaluate("""() => {
                     const shareBtn = document.querySelector(
                         'button[aria-label*="Share"], button[aria-label*="share"]'
@@ -40387,6 +43241,39 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                     return '';
                 }""")
                 await asyncio.sleep(2)
+
+            # Step 1: open the AUDIO card's ⋮ menu — scoped into the Studio
+            # panel, and confirmed by aria-expanded landing inside that scope.
+            _menu = await _nlm_open_audio_menu(page)
+            if _menu.get("verified"):
+                log(f"[Audio] audio ⋮ opened via {_menu.get('via')!r} "
+                    f"({_menu.get('hook')!r})")
+                # Step 2: click Share from the menu we just opened, by label.
+                _pick = await _nlm_menu_pick(page, want=("share", "share notebook"))
+                if _pick.get("blocked"):
+                    log(f"[Audio] menu pick refused destructive row(s): "
+                        f"{_pick.get('blocked')}", "DEBUG")
+                if _pick.get("clicked"):
+                    await asyncio.sleep(2)
+                else:
+                    # ⚠ An open menu that we are walking away from is the exact
+                    # residue of the old bug — a live overlay sitting over the
+                    # page, one stray click from its own destructive row. Close
+                    # it before doing anything else.
+                    log(f"[Audio] no Share row in the audio ⋮ menu "
+                        f"({_pick.get('reason')}: {_pick.get('rows')}) — closing it", "WARN")
+                    await page.keyboard.press("Escape")
+                    await asyncio.sleep(0.5)
+                    await _notebook_share_fallback("no Share row in the audio menu")
+            else:
+                if _menu.get("opened"):
+                    # A click landed but nothing inside the Studio scope
+                    # expanded. Something else is open; do not leave it open.
+                    log(f"[Audio] a menu opened but not inside the Studio panel "
+                        f"(outside={_menu.get('outside')}) — closing it", "WARN")
+                    await page.keyboard.press("Escape")
+                    await asyncio.sleep(0.5)
+                await _notebook_share_fallback(_menu.get("reason") or "unverified")
 
             # Step 3: Use shared helper for NLM public access + get link + Save.
             # Helper returns (url, public_verified, access_set). Audio share
@@ -40400,11 +43287,18 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             if audio_public_verified:
                 log("[Audio] Public share DOM-verified")
             elif audio_access_set:
-                log("[Audio] access set to 'Anyone with the link' but not "
-                    "DOM-confirmed — audio link may be private", "WARN")
+                # Not a WARN. `access_set` is True when the option was clicked OR
+                # already read 'Anyone with the link'; either way access IS set,
+                # and the strict DOM confirm has been False on every run in the
+                # corpus, so warning here fired on the healthy path and told the
+                # reader a public link "may be private". The helper already logs
+                # which of the two it was.
+                log("[Audio] access is 'Anyone with the link'; the strict DOM "
+                    "confirm was inconclusive — proceeding")
             else:
-                log("[Audio] access was NOT set (control or option not found) — "
-                    "audio link is likely private", "WARN")
+                log("[Audio] access was NEITHER already public NOR set (control "
+                    "or option not found) — audio link may genuinely be private",
+                    "WARN")
 
             if not audio_overview_url:
                 # Fallback: NLM emits the same /notebook/{id} URL whether
@@ -40676,7 +43570,8 @@ def _nlm_notebook_id(url: str) -> str:
 # post-generate / mid-poll checks — all fail_phase loud if the count is wrong,
 # letting the user clean up manually (per the hard no-delete constraint).
 #
-# All three count the SAME population — visible <artifact-library-item> elements
+# _count_nlm_audio_cards / _count_nlm_deep_dive_cards / _check_audio_complete_dom
+# all count the SAME population — visible <artifact-library-item> elements
 # whose text carries the "audio_magic_eraser" Material-icon ligature — pinned
 # from the #757-B dom-dump (2026-06-03). The OLD guessed selectors
 # ([role=article]/[class*=audio-card]/[data-testid*=audio] + an <audio> element +
@@ -40687,12 +43582,26 @@ def _nlm_notebook_id(url: str) -> str:
 # string leaves both innerText AND textContent), all three break together and
 # revert to 0 — fail-OPEN (healthy runs proceed, dups slip) — and the read-only
 # _dump_nlm_audio_dom on the zero-path is the canary to re-pin them.
+#
+# _count_nlm_audio_generating counts a DIFFERENT population on purpose: the
+# in-flight placeholder, which by construction has no artifact-library-item yet.
+# The two are complements, not variants — "how many audio overviews exist right
+# now" is their sum, and reading either one alone is what made P3 report zero
+# cards with a generation visibly running.
 
 async def _count_nlm_audio_cards(page) -> int:
-    """Count visible audio-overview cards in the NLM Studio panel.
+    """Count visible READY audio-overview cards in the NLM Studio panel.
 
-    Returns the total number of audio entries (in-flight + completed).
-    Read-only — never clicks anything. Returns 0 on any DOM exception.
+    READY, not total. This docstring used to promise "in-flight + completed",
+    and the markup makes that impossible: while NotebookLM is generating there
+    is a "Generating Audio Overview…" placeholder and NO <artifact-library-item>
+    at all — the item is what appears when generation FINISHES. So this returned
+    0 with an audio overview visibly generating on screen, and the post-generate
+    log said "0 audio card(s)" while the panel said otherwise.
+
+    In-flight entries are counted by _count_nlm_audio_generating(); callers that
+    mean "how many audio overviews exist right now" need both. Read-only — never
+    clicks anything. Returns 0 on any DOM exception.
     """
     try:
         return await page.evaluate("""() => {
@@ -40715,9 +43624,63 @@ async def _count_nlm_audio_cards(page) -> int:
             items.forEach((el) => {
                 if (el.offsetParent === null) return;
                 const t = (el.innerText || el.textContent || '');
+                // Excluded so this counter and _count_nlm_audio_generating stay
+                // DISJOINT. Callers add them, and today nothing satisfies both
+                // (a generating entry has no artifact-library-item at all). The
+                // day NotebookLM renders one as a skeleton row it would, and
+                // the sum would report one audio overview as two — a false
+                // duplicate WARN, from the very fix that exists to stop the
+                // count disagreeing with the screen.
+                if (/generating audio overview/i.test(t)) return;
                 if (t.includes('audio_magic_eraser')) count++;
             });
             return count;
+        }""") or 0
+    except Exception:
+        return 0
+
+
+async def _count_nlm_audio_generating(page) -> int:
+    """Count audio overviews currently GENERATING in the NLM Studio panel.
+
+    The population _count_nlm_audio_cards structurally cannot see: while in
+    flight NotebookLM renders a "Generating Audio Overview…" placeholder inside
+    .artifact-library-container and no <artifact-library-item> exists yet
+    (pinned in _check_audio_complete_dom from the #757-B dom-dump).
+
+    Counted by finding the DEEPEST elements carrying that phrase rather than by
+    a tag name, because the placeholder's tag is not in the corpus and guessing
+    one is how the previous generation of these selectors came to match nothing.
+    Deepest-only matters: every ancestor of a placeholder also contains the
+    phrase, so counting all matches would multiply one placeholder by its depth.
+
+    Falls back to 1 when the container names the placeholder but no single
+    element resolves as its owner — the phrase being present is already proof
+    that at least one is generating, and reporting 0 there would reproduce
+    exactly the contradiction this helper exists to remove.
+
+    Read-only. Returns 0 on any DOM exception.
+    """
+    try:
+        return await page.evaluate("""() => {
+            const cont = document.querySelector(
+                'artifact-library, .artifact-library-container') || document.body;
+            const RE = /generating audio overview/i;
+            if (!RE.test(cont.innerText || cont.textContent || '')) return 0;
+            let n = 0;
+            for (const el of cont.querySelectorAll('*')) {
+                if (el.offsetParent === null) continue;
+                if (!RE.test(el.innerText || el.textContent || '')) continue;
+                let deeper = false;
+                for (const kid of el.children) {
+                    if (RE.test(kid.innerText || kid.textContent || '')) {
+                        deeper = true;
+                        break;
+                    }
+                }
+                if (!deeper) n++;
+            }
+            return n || 1;
         }""") or 0
     except Exception:
         return 0
@@ -41766,7 +44729,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         os.environ["DG_RUN_ID"] = str(run_id)
     # Defensive: clear the OS clipboard at run start. Several share-link
     # extractors (NotebookLM, ChatGPT share-URL, Claude artifact copy)
-    # fall back to reading the clipboard via get_clipboard() when DOM
+    # fall back to reading the clipboard (_read_clipboard_after_copy) when DOM
     # selectors miss. The OS clipboard is process-global and persists
     # across runs on every platform — a stale share URL from a prior
     # run sitting in the clipboard could be accepted as THIS run's link
@@ -41774,7 +44737,14 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     # (The original YouTube-specific rationale is gone — P4 is now FE-
     # owned and uses the YouTube Data API, no clipboard extraction —
     # but the bleed risk for the remaining BE extractors stands.)
+    # This closes the cross-RUN channel ONLY. The same-run channel — one
+    # agent's share link being read back as the next agent's — is closed by
+    # _arm_clipboard() at each copy site, and cannot be closed from here:
+    # the contaminating value does not exist yet when this line runs.
     clear_clipboard()
+    # Start the DOM ledger empty so a long-lived worker cannot carry the
+    # previous run's verdict into this one.
+    _dom_reset()
     brief_artifact = None  # Set after Phase 1 completes
     # Validate email early (email is the user's Google account email from frontend)
     if email:
@@ -44593,8 +47563,16 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     # there was nothing to count down to. Same alert system,
                     # opposite failure modes, both wrong.
                     #
-                    # 0 here means "wait indefinitely", and there are two cases
-                    # where that is still correct:
+                    # 0 here means "no auto-skip armed" — no countdown is stamped
+                    # on the card and none is shown. The wait still falls back to
+                    # `await_phase_decision`'s 24-hour outer backstop, which
+                    # returns the SAME "timeout" string, so the decision handler
+                    # below has to tell the two apart: an ARMED expiry is an
+                    # auto-skip, an unarmed one is `link_unresolved_backstop` —
+                    # the phase is skipped either way (the run must still deliver)
+                    # but only the armed one claims a window the user configured.
+                    # Until 2026-08-02 there was no such separation and 0 was
+                    # reported as an auto-skip after 24 h. Two cases arm nothing:
                     #   * a SIGN-IN WALL. The taxonomy classes a login card as a
                     #     blocker — the user CAN resolve it, so it must never
                     #     auto-fire. Auto-skipping someone's notebook because they
@@ -44613,8 +47591,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                             agent="notebooklm",
                         )
                     else:
-                        if _runtime.auto_skip_stuck:
-                            _nb_skip_in = float(auto_skip_unacted_sec())
+                        _nb_skip_in = unacted_window_sec(_runtime.auto_skip_stuck)
                         # `arm_registry=False`: the wait below IS the firer
                         # (design G(ii)). The round-robin registry firer only
                         # fires agents inside its own `pending` set, which a P3
@@ -44678,14 +47655,36 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         log("Phase 3 link extraction: user requested retry", "INFO")
                         emit_event("phase_restart", phase=3, reason="user_retry_link_extract", attempt=0)
                         continue
-                    if decision in ("skip", "timeout"):
-                        # `timeout` reaches here ONLY when a deadline was armed
-                        # above (a recoverable link failure with auto-skip on), so
-                        # it means the card sat for its full window unanswered.
-                        # Pre-fix it fell through to the terminate path below,
-                        # which with the 24-hour default was unreachable — the run
-                        # just hung instead.
-                        _nb_auto = decision == "timeout"
+                    # 2026-08-02 — a timeout is an AUTO-SKIP only if an auto-skip
+                    # was actually armed.
+                    #
+                    # This used to read `decision in ("skip", "timeout")` and set
+                    # `_nb_auto = decision == "timeout"`, under a comment asserting
+                    # that `timeout` could only arrive with a deadline set. It
+                    # could not: when `_nb_skip_in` is 0 the wait still falls back
+                    # to the 24-hour backstop, and the backstop returns the same
+                    # string. So the two cases that deliberately arm NOTHING — a
+                    # sign-in wall (a blocker, which the taxonomy says must never
+                    # auto-fire) and auto-skip switched OFF in Settings — were both
+                    # reported as "card unanswered for its full window", a window
+                    # nobody set, under a reason slug the FE renders as an
+                    # auto-skip.
+                    #
+                    # Three outcomes now, three reasons. The unarmed expiry still
+                    # ENDS the wait — the module's standing invariant is that no
+                    # path waits unboundedly for a human — but it ends it by
+                    # skipping the phase and letting the run finish, not by
+                    # stopping the run. An earlier version of this fix emitted
+                    # `pipeline_stopped` + `return` here; that returns out of
+                    # run_pipeline ABOVE the terminal handoff, so a run whose P1
+                    # and P2 had fully succeeded lost its Google Doc, its email and
+                    # its P3 checkpoint — total loss where the bug it replaced at
+                    # least delivered. Skipping keeps the three reports, the Doc
+                    # and the email, and `link_unresolved_backstop` tells the truth
+                    # about which of the three things happened.
+                    _nb_auto = is_armed_timeout(decision, _nb_skip_in)
+                    _nb_backstop = decision == "timeout" and not _nb_auto
+                    if decision == "skip" or _nb_auto or _nb_backstop:
                         # 2026-07-31 (owner-reported): this branch used to just
                         # blank the URL and break. That made it the ONLY skip
                         # branch in the whole pipeline that emitted no terminal
@@ -44703,12 +47702,17 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         # never obtained, instead of the greyed-out skip they
                         # asked for. P4 also wasn't cascaded off, so FE-P4 was
                         # triggered for a podcast that does not exist.
-                        log(f"Phase 3 link extraction: "
-                            f"{'card unanswered for its full window — auto-skipping' if _nb_auto else 'user skipped'}"
-                            f" — proceeding without notebook URL", "INFO")
+                        log("Phase 3 link extraction: "
+                            + ("card unanswered for its full window — auto-skipping"
+                               if _nb_auto else
+                               "no auto-skip was armed and the card sat to the 24-hour "
+                               "backstop — moving on without deciding for the user"
+                               if _nb_backstop else "user skipped")
+                            + " — proceeding without notebook URL", "INFO")
                         notebook_url = ""
                         emit_event("phase_skipped", phase=3,
                                    reason=("auto_skip_link_unanswered" if _nb_auto
+                                           else "link_unresolved_backstop" if _nb_backstop
                                            else "user_skip_at_link_extract"))
                         # NB: a dedicated flag, NOT `_p3_audio_user_skipped` —
                         # that one is re-initialised to False a few lines below
@@ -44716,6 +47720,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         _p3_link_skipped = True
                         _controls.skipped_phases.add(4)
                         break
+                    # Only a real Stop reaches here now — `timeout` is handled
+                    # above, so `user_{decision}_link_extract` can no longer read
+                    # "user_timeout", which was never something the user did.
                     log(f"Phase 3 link extraction: user {decision} — terminating pipeline", "INFO")
                     emit_event("pipeline_stopped", phase=3, reason=f"user_{decision}_link_extract")
                     return
@@ -45080,6 +48087,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         except Exception as _trig_err:
             log(f"FE trigger dispatch failed (non-fatal): {_trig_err}", "WARN")
         log(f"\n{'='*60}")
+        _dom_summary("run complete")
+        log(f"\n{'='*60}")
         log("BE PIPELINE COMPLETE — through Phase 3 (FE owns Phases 4 + 5)")
         log(f"  NotebookLM: {notebook_url or 'N/A'}")
         log(f"  Audio Overview: {audio_overview_url or 'N/A'}")
@@ -45087,6 +48096,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         log(f"{'='*60}")
 
     except KeyboardInterrupt:
+        # The verdict is worth MORE on a run that ended early, not less — that
+        # is the run someone is about to go and diagnose.
+        _dom_summary("run interrupted")
         log("Interrupted — progress saved to checkpoint", "WARN")
         raise
     except Exception as e:
@@ -45094,6 +48106,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # whatever phase context we have so the frontend can route the
         # error to the correct phase tile instead of silently dropping it.
         import traceback
+        _dom_summary("run failed")
         log(f"Fatal: {e}", "ERROR")
         traceback.print_exc()
         # _runtime.phase is the most-recently-entered phase — use it as
@@ -46118,10 +49131,17 @@ async def run_server(port=8000):
             # 403 (the flip's research-doc update was denied — see the
             # deviceUpdatingFor self-heal fix). Log __cause__/__context__ so any
             # future flip failure is diagnosable instead of misleading.
+            # ⚠ Lead with the ROOT. Appending it was not enough: the line opened
+            # with "The transaction has no transaction ID, so it cannot be rolled
+            # back", which is an artifact of the rollback and not a fault anyone
+            # can act on, and the PermissionDenied that actually happened sat at
+            # the end past a device id. Every occurrence in the live corpus reads
+            # that way.
             _root = getattr(e, "__cause__", None) or getattr(e, "__context__", None)
+            _head = f"{type(_root).__name__}: {_root}" if _root is not None else str(e)
             log(
-                f"Failed to flip queued→ongoing for {research_id_val}: {e}"
-                + (f" | root: {_root!r}" if _root is not None else ""),
+                f"Failed to flip queued→ongoing for {research_id_val}: {_head}"
+                + (f" | surfaced as: {e}" if _root is not None else ""),
                 "WARN",
             )
             return None
@@ -50793,6 +53813,16 @@ def _arm_supervisor_macos() -> "tuple[bool, int | None, str, int]":
     (Vision, CUA, API key) live in `.dg-supervisor.env` and are loaded by
     Python via `--env-file` before subcommand dispatch.
 
+    That PATH is EVERY CHILD'S PATH, which is why it is built from
+    `_lifecycle_path_dirs()` rather than written as a literal. It used to read
+    `/usr/local/bin:/usr/bin:/bin`, which has no `/opt/homebrew/bin` — so on
+    Apple silicon the supervisor and everything under it could not see Homebrew's
+    tools. That is what broke the app-driven update (pipx replays the venv's
+    recorded uv backend and can only locate uv via PATH), and it had already
+    broken `ffprobe` once before and been patched point-wise. Fixing it here fixes
+    the class; `_lifecycle_env` still widens the detached waiter's PATH because a
+    plist written by an older build is still out there on real machines.
+
     EUID guard: refuses to install if running under sudo — would write the
     plist to /root/Library/... and leave it un-managed by the actual user."""
     import subprocess as _sp
@@ -50833,9 +53863,20 @@ def _arm_supervisor_macos() -> "tuple[bool, int | None, str, int]":
     except Exception as e:
         return False, None, f"could not create dirs: {e}", 0
 
-    python_exe = sys.executable
-    script_path = _launcher_path()
-    env_file = _SUPERVISOR_ENV_FILE_DEFAULT_PATH
+    # Every value below is interpolated into XML and every one of them derives
+    # from $HOME, so an `&` or `<` anywhere in the user's home path writes a plist
+    # launchd cannot parse — the job never loads and the device simply never comes
+    # online, with no error the user would connect to their username.
+    def _x(v) -> str:
+        return (str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+    python_exe = _x(sys.executable)
+    script_path = _x(_launcher_path())
+    env_file = _x(_SUPERVISOR_ENV_FILE_DEFAULT_PATH)
+    supervisor_path = _x(_supervisor_path_value())
+    work_dir = _x(script_dir)
+    out_log = _x(log_dir / 'supervisor.out.log')
+    err_log = _x(log_dir / 'supervisor.err.log')
     plist_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -50851,7 +53892,7 @@ def _arm_supervisor_macos() -> "tuple[bool, int | None, str, int]":
     <string>{env_file}</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>{script_dir}</string>
+  <string>{work_dir}</string>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -50859,13 +53900,13 @@ def _arm_supervisor_macos() -> "tuple[bool, int | None, str, int]":
   <key>ThrottleInterval</key>
   <integer>10</integer>
   <key>StandardOutPath</key>
-  <string>{log_dir / 'supervisor.out.log'}</string>
+  <string>{out_log}</string>
   <key>StandardErrorPath</key>
-  <string>{log_dir / 'supervisor.err.log'}</string>
+  <string>{err_log}</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/usr/local/bin:/usr/bin:/bin</string>
+    <string>{supervisor_path}</string>
   </dict>
 </dict>
 </plist>
@@ -51099,7 +54140,13 @@ def _arm_supervisor_linux() -> "tuple[bool, int | None, str, int]":
     _shell_wayland = (os.environ.get("WAYLAND_DISPLAY") or "").strip()
     _shell_xauth   = (os.environ.get("XAUTHORITY") or "").strip()
     _shell_xdg_rt  = (os.environ.get("XDG_RUNTIME_DIR") or "").strip()
-    env_lines = []
+    # PATH first: a systemd --user unit that states none inherits the manager's
+    # narrow default, which has neither ~/.local/bin nor ~/.cargo/bin — the two
+    # places uv actually installs itself on Linux. Same root cause as the macOS
+    # plist, same fix, one shared list. Stated explicitly rather than left to
+    # PassEnvironment, which loses the race against the graphical session for the
+    # same reason DISPLAY does (see below).
+    env_lines = [f'Environment="PATH={_supervisor_path_value()}"']
     if _shell_disp:
         env_lines.append(f'Environment="DISPLAY={_shell_disp}"')
     if _shell_wayland:
@@ -51108,7 +54155,10 @@ def _arm_supervisor_linux() -> "tuple[bool, int | None, str, int]":
         env_lines.append(f'Environment="XAUTHORITY={_shell_xauth}"')
     if _shell_xdg_rt:
         env_lines.append(f'Environment="XDG_RUNTIME_DIR={_shell_xdg_rt}"')
-    if not env_lines:
+    # NB: PATH is unconditionally present now, so the "did we capture anything?"
+    # check has to count the DISPLAY lines specifically — `if not env_lines` would
+    # silently never fire again and the reboot-safety warning would be lost.
+    if len(env_lines) == 1:
         log("[supervisor-linux] no DISPLAY in the calling shell — unit "
             "will rely on PassEnvironment only. If browser launch fails "
             "post-reboot, re-run --resurrect from a graphical-session "
@@ -54395,12 +57445,34 @@ def _sr_version() -> str:
         return "(source checkout)"
 
 
-# Version of the backend the CURRENTLY-RUNNING serve process is executing. The
-# installed version (wheel metadata) tells you what's on disk; this tells you what
-# is actually live. They diverge the moment a package upgrade lands — by ANY route
-# (`--update`, a bare `pipx upgrade`, or the web installer) — because the running
-# process keeps its old code in memory until it is restarted. Without this the
-# update looks finished while the old build is still serving.
+# What THIS process is executing, frozen at import.
+#
+# `_sr_version()` cannot answer that question later: it is `importlib.metadata`,
+# which re-reads the dist-info off disk, so it flips to the NEW number the instant
+# pipx finishes — inside a process that is still running the old code. Read once,
+# before any upgrade can land, and it is exact for the life of the process.
+#
+# This is the honest source for "does the backend still owe a restart", and the
+# marker file below is not, for a reason that only shows up on multi-worker hosts:
+# it is a single path with no worker id and every `--serve` writes it, so it names
+# whichever worker started LAST, while the verdict is published by worker 1's
+# heartbeat. A worker that crashed and was respawned onto the new venv would stamp
+# it and worker 1 would report "Updated ✓" while still serving the old build.
+try:
+    _BOOT_VERSION: "str | None" = _sr_version()
+except Exception:  # pragma: no cover - metadata unreadable; degrade to "can't tell"
+    _BOOT_VERSION = None
+
+
+def _serving_version() -> "str | None":
+    """The version the process answering the app is executing."""
+    return _BOOT_VERSION
+
+
+# Version of the backend the CURRENTLY-RUNNING serve process is executing, as seen
+# from ANOTHER process (a CLI invocation) — which is the one thing `_BOOT_VERSION`
+# cannot tell you. Still used by `_restart_pending`, which runs from `--version` /
+# `--update` and has to ask about a process that is not itself.
 _RUNNING_VERSION_PATH = _STATE_DIR / "running-version.json"
 
 
@@ -54751,6 +57823,14 @@ def _installed_sr_entry() -> "str | None":
 # _LIFECYCLE_WAITER and _consume_pending_update_result.
 _UPDATE_RESULT_PATH = _STATE_DIR / "update_result.json"
 
+# Written when the waiter is LAUNCHED, so an update that dies before it can leave a
+# result is still reportable. The result sentinel above only covers a waiter that
+# lived long enough to write one — and the oldest recorded instances of this bug are
+# precisely the ones where it did not: five `update` commands on 07-21..07-24 whose
+# worker was killed mid-launch, leaving no pipx run, no log line and no status at
+# all. See `_update_intent_verdict`.
+_UPDATE_INTENT_PATH = _STATE_DIR / "update_intent.json"
+
 # Detached lifecycle waiter (run by a NON-venv Python): waits for THIS process
 # to exit, then runs `pipx <action> superresearch`. Required because
 # `--update`/`--uninstall` run from the very venv pipx must rebuild/delete — on
@@ -54759,6 +57839,24 @@ _UPDATE_RESULT_PATH = _STATE_DIR / "update_result.json"
 _LIFECYCLE_WAITER = r'''
 import os, sys, time, subprocess
 pid = int(sys.argv[1]); rest = sys.argv[2:]
+# CLAIM the launch record before anything else. The spawner cannot record a
+# trustworthy pid: on Linux the upgrade is submitted through `systemd-run`, a
+# FRONT-END that exits in milliseconds, so `Popen.pid` names a process that is
+# already dead — and the liveness check that decides "the upgrade helper stopped
+# without reporting back" would then declare every Linux update failed about
+# thirty seconds in, while pipx is still installing. Only this process knows which
+# pid is actually doing the work, so only this process writes it.
+_intent = os.environ.get("DG_LIFECYCLE_INTENT") or ""
+if _intent:
+    try:
+        import json as _json
+        with open(_intent, "r", encoding="utf-8") as _f:
+            _rec = _json.load(_f)
+        _rec["waiter_pid"] = os.getpid()
+        with open(_intent, "w", encoding="utf-8") as _f:
+            _json.dump(_rec, _f)
+    except Exception:
+        pass
 # rest = [<pipx cmd...>] optionally followed by "--then--" <restart cmd...>. The
 # restart cmd (e.g. `superresearch --restart`) cycles the SUPERVISOR onto the
 # freshly-rebuilt venv — Restart=always alone races the rebuild and would relaunch
@@ -54876,6 +57974,43 @@ def _lifecycle_path_dirs() -> "list[str]":
     ]
 
 
+def _supervisor_path_value() -> str:
+    """PATH to bake into the OS supervisor (launchd plist / systemd unit).
+
+    This is not just the supervisor's PATH — it is EVERY CHILD'S PATH: the
+    daemon-loop, the serve workers, the browser tooling they shell out to, and the
+    detached update waiter. It used to be the literal `/usr/local/bin:/usr/bin:/bin`
+    on macOS and unset on Linux (leaving systemd's equally narrow default), neither
+    of which contains `/opt/homebrew/bin` or `~/.local/bin`.
+
+    That single omission is the root cause of the app-driven update never
+    completing: pipx replays the backend recorded in the venv's metadata, and for a
+    uv-built venv it can locate uv ONLY through PATH — so `pipx upgrade` died with
+    "the 'uv' executable could not be found" while the identical command from a
+    login shell succeeded minutes later. The same gap had already broken `ffprobe`
+    once and been patched at that one call site. Deriving it from the same list the
+    waiter uses fixes the class instead of the instance.
+
+    The tool homes come FIRST and the system dirs last — the same order a login
+    shell ends up with once `brew shellenv` has run, which is the order under which
+    every one of these tools was installed and is expected to resolve. Be clear
+    about what that trades away: a user-writable directory ahead of /usr/bin means
+    anything dropped in `~/.local/bin` shadows the OS copy for every supervised
+    child. That is accepted deliberately, because the alternative — system first —
+    reintroduces the exact bug, resolving a system tool the user never installed in
+    preference to the one they did. The supervisor's own interpreter is immune
+    either way: the plist and the unit both exec an ABSOLUTE python path."""
+    system = ["/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+    parts: list[str] = []
+    seen: set[str] = set()
+    for d in [*_lifecycle_path_dirs(), *system]:
+        if not d or d in seen:
+            continue
+        seen.add(d)
+        parts.append(d)
+    return os.pathsep.join(parts)
+
+
 def _lifecycle_env(**extra: "str | None") -> dict:
     """Environment for the detached upgrade/uninstall waiter.
 
@@ -54921,6 +58056,115 @@ def _lifecycle_env(**extra: "str | None") -> dict:
     return env
 
 
+def _pipx_recorded_backend() -> "str | None":
+    """The build backend pipx recorded in OUR venv's metadata, lowercased.
+
+    Read from `pipx_metadata.json` rather than asked of pipx, because this has to
+    answer the question pipx will answer at upgrade time and pipx offers no way to
+    query it. None when the file is missing or unreadable (a source checkout, a
+    pip install, an older pipx) — every caller treats that as "can't tell" and
+    proceeds, since guessing wrong here must never block a working update."""
+    pipx = _pipx_cmd()
+    if pipx is None:
+        return None
+    try:
+        r = subprocess.run([*pipx, "environment", "--value", "PIPX_LOCAL_VENVS"],
+                           capture_output=True, text=True, timeout=30)
+        venvs = (r.stdout or "").strip()
+        if r.returncode != 0 or not venvs:
+            return None
+        meta = json.loads((Path(venvs) / "superresearch" / "pipx_metadata.json")
+                          .read_text(encoding="utf-8"))
+        backend = meta.get("backend")
+        return str(backend).strip().lower() if backend else None
+    except Exception:
+        return None
+
+
+def _pipx_bundles_uv() -> bool:
+    """Whether pipx can reach uv WITHOUT going through PATH.
+
+    `pipx install pipx[uv]`, `uv tool install pipx` and similar put the `uv` PyPI
+    distribution alongside pipx, and pipx's `find_uv_binary` asks that package for
+    the binary before it ever consults PATH. On such a host the preflight below
+    would refuse an upgrade pipx would complete perfectly well, and tell the user
+    to install a uv they already have. So: ask pipx's OWN interpreter whether the
+    module imports.
+
+    Fails closed on "don't know" (returns False) only in the sense that it declines
+    to vouch — the caller's own guard is the fail-open one."""
+    pipx = _pipx_cmd()
+    if not pipx:
+        return False
+    import shutil as _shutil
+    py: "str | None" = None
+    if len(pipx) >= 3 and pipx[1] == "-m":
+        py = pipx[0]
+    else:
+        # A console-script shim names its interpreter in the shebang. `#!/usr/bin/
+        # env python3` needs the second token resolved; anything else is absolute.
+        try:
+            with open(pipx[0], "rb") as _fh:
+                first = _fh.readline(512).decode("utf-8", "replace").strip()
+            if first.startswith("#!"):
+                toks = first[2:].strip().split()
+                if toks:
+                    py = (_shutil.which(toks[1]) if (len(toks) > 1
+                          and os.path.basename(toks[0]) == "env") else toks[0])
+        except Exception:
+            py = None
+    if not py:
+        return False
+    try:
+        return subprocess.run([py, "-c", "import uv"], capture_output=True,
+                              timeout=20).returncode == 0
+    except Exception:
+        return False
+
+
+def _upgrade_preflight() -> "str | None":
+    """Why the upgrade would fail, checked BEFORE anything is torn down — or None
+    when it looks runnable.
+
+    Everything after `_perform_self_update` returns "started" is postmortem by
+    construction: the worker has to exit so pipx can rebuild the venv it is running
+    from, and the detached waiter holds no credentials, so the best the reporting
+    path can ever do is explain a failure that already happened. This is the only
+    check that PREVENTS the downtime instead of narrating it, and it costs one
+    `which` against the environment the waiter will actually get.
+
+    It answers exactly the failure that was observed: pipx replays the backend
+    recorded in the venv's metadata, and for a uv-built venv it resolves uv ONLY
+    through PATH — so a supervisor whose PATH lacks Homebrew produced "the 'uv'
+    executable could not be found", a five-minute spinner in the app, and a
+    backend that came back on the old version. Neither `--backend pip` nor
+    `PIPX_DEFAULT_BACKEND` can help: pipx nulls the CLI flag for an existing venv
+    and ranks metadata above the environment. PATH is the only lever, so PATH is
+    what gets checked.
+
+    Deliberately narrow, and ONE condition rather than the two it is tempting to
+    write. `uv` is the only recorded backend with a binary that has to be findable
+    on PATH — `pip` lives inside the venv, and anything we cannot name (an older
+    pipx, a pip install, a source checkout, a backend that does not exist yet) is
+    let through, because a preflight that guesses is a preflight that blocks
+    working updates. A second "is it a backend I recognise?" guard in front of this
+    one would be unreachable, and unreachable guards read as protection."""
+    if _pipx_recorded_backend() != "uv":
+        return None
+    import shutil as _shutil
+    # `path=` is the whole point: the question is not whether uv is on OUR PATH —
+    # a login shell finds it fine, which is exactly why this was so confusing —
+    # but whether it is on the PATH the detached waiter will run with.
+    if _shutil.which("uv", path=_lifecycle_env().get("PATH")):
+        return None
+    if _pipx_bundles_uv():
+        return None  # pipx ships its own uv and never consults PATH for it
+    return ("this install was built with the 'uv' backend and 'uv' isn't on "
+            "the background service's PATH, so the upgrade would fail before it "
+            "started — install uv where the service can see it, or re-run "
+            "`superresearch --resurrect` to refresh the service's PATH")
+
+
 def _spawn_detached_lifecycle(action: str, *, restart_after: bool = False,
                               current: "str | None" = None,
                               latest: "str | None" = None) -> "int | None":
@@ -54953,11 +58197,13 @@ def _spawn_detached_lifecycle(action: str, *, restart_after: bool = False,
         pass
     # Drop any sentinel left by an EARLIER update before this one can write its own.
     # A stale file would otherwise be republished as this attempt's outcome (and, if
-    # the waiter dies before writing, would report the wrong result entirely).
-    try:
-        _UPDATE_RESULT_PATH.unlink(missing_ok=True)
-    except Exception:
-        pass
+    # the waiter dies before writing, would report the wrong result entirely). The
+    # launch record goes with it for the same reason.
+    for _stale in (_UPDATE_RESULT_PATH, _UPDATE_INTENT_PATH):
+        try:
+            _stale.unlink(missing_ok=True)
+        except Exception:
+            pass
     waiter_argv = [str(os.getpid()), *pipx, action, "superresearch"]
     escape: list[str] = []
     entry = None
@@ -54982,6 +58228,7 @@ def _spawn_detached_lifecycle(action: str, *, restart_after: bool = False,
     # returned "started" by the time pipx runs.
     env = _lifecycle_env(
         DG_LIFECYCLE_RESULT=str(_UPDATE_RESULT_PATH) if action == "upgrade" else None,
+        DG_LIFECYCLE_INTENT=str(_UPDATE_INTENT_PATH) if action == "upgrade" else None,
         DG_LIFECYCLE_LOG=str(log_path),
         DG_LIFECYCLE_ACTION=action,
         DG_LIFECYCLE_FROM=current,
@@ -54991,7 +58238,7 @@ def _spawn_detached_lifecycle(action: str, *, restart_after: bool = False,
         # systemd-run does NOT hand our environment to the transient unit — it gets
         # the user manager's, which is the very narrow PATH we just widened. Forward
         # the keys explicitly, spliced in before the trailing `--`.
-        _fwd = ("PATH", "DG_LIFECYCLE_RESULT", "DG_LIFECYCLE_LOG",
+        _fwd = ("PATH", "DG_LIFECYCLE_RESULT", "DG_LIFECYCLE_INTENT", "DG_LIFECYCLE_LOG",
                 "DG_LIFECYCLE_ACTION", "DG_LIFECYCLE_FROM", "DG_LIFECYCLE_TO")
         escape = (escape[:-1]
                   + [f"--setenv={k}={env[k]}" for k in _fwd if env.get(k)]
@@ -55003,6 +58250,28 @@ def _spawn_detached_lifecycle(action: str, *, restart_after: bool = False,
         creationflags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
     else:
         kwargs["start_new_session"] = True
+    # Record that an upgrade is IN FLIGHT — BEFORE the spawn, because the waiter's
+    # first act is to stamp its own pid into this file and it must find it there.
+    # Written without a pid on purpose: `Popen.pid` is not the worker on Linux (the
+    # upgrade is submitted through `systemd-run`, a front-end that exits at once),
+    # and a dead pid here would make every Linux update read as abandoned. No pid
+    # therefore means "nothing has claimed this yet", which is exactly right —
+    # including when the waiter never starts at all.
+    #
+    # If the waiter dies without leaving a result — killed by a supervisor sweep,
+    # reaped, crashed — this file is the only thing left that knows an update was
+    # ever attempted, and without it the app has nothing to show but a spinner. See
+    # `_update_intent_verdict`.
+    if action == "upgrade":
+        try:
+            _UPDATE_INTENT_PATH.write_text(json.dumps({
+                "action": "upgrade", "waiter_pid": None,
+                "at": int(time.time() * 1000),
+                "current": current or "", "latest": latest or "",
+            }), encoding="utf-8")
+        except Exception as _ie:
+            log(f"[update] couldn't record the upgrade attempt ({_ie}) — a failure "
+                f"that never reaches the waiter's own report will stay silent", "WARN")
     # Spawn the waiter BEFORE freeing the venv. Two reasons: (a) if the launch
     # fails we must NOT have already torn the backend down (leave it serving so the
     # caller can report "failed" cleanly, not strand the machine offline); (b) on a
@@ -55016,6 +58285,13 @@ def _spawn_detached_lifecycle(action: str, *, restart_after: bool = False,
         waiter_pid = _proc.pid
     except Exception as e:
         print(f"  Could not launch the background {action} helper: {e}")
+        # Nothing will ever claim the record we just wrote, and the caller is about
+        # to report this failure synchronously — leaving it would republish the same
+        # attempt as a mystery failure on the next startup.
+        try:
+            _UPDATE_INTENT_PATH.unlink(missing_ok=True)
+        except Exception:
+            pass
         return None
     finally:
         if logf is not subprocess.DEVNULL:
@@ -55083,6 +58359,12 @@ def _perform_self_update(*, force_check: bool = True, restart_after: bool = Fals
     latest = _latest_on_pypi(force=force_check)
     if latest and not _version_gt(latest, cur):
         return {"state": "already", "current": cur, "latest": latest, "reason": ""}
+    # LAST POINT OF NO RETURN. Past here the caller exits so pipx can rebuild the
+    # venv, and no honest outcome can reach the app until a new backend comes up.
+    # Refuse now, while we can still answer.
+    if blocked := _upgrade_preflight():
+        log(f"[update] refusing before shutdown: {blocked}", "WARN")
+        return {"state": "failed", "current": cur, "latest": latest, "reason": blocked}
     waiter_pid = _spawn_detached_lifecycle("upgrade", restart_after=restart_after,
                                            current=cur, latest=latest)
     if waiter_pid:
@@ -55133,6 +58415,13 @@ def _self_update() -> int:
         print(f"  {_c(_DIM, 'Confirmation is the device going green in the app — not')} {_c(_BOLD, '--version')}{_c(_DIM, ', which reports the installed build.')}")
         print()
         return 0
+    # Print the REASON when there is one. The bare "run pipx upgrade" line below is
+    # actively wrong advice for the pre-flight refusal — that is the very command
+    # that would fail, for a reason the user can't see from its output.
+    if _reason := res.get("reason"):
+        print(f"  {_c(_WARN, '⚠')}  Couldn't start the update — {_reason}")
+        print()
+        return 1
     print(f"  {_c(_WARN, '⚠')}  Couldn't start the update. Run:  {_c(_BOLD, 'pipx upgrade superresearch')}")
     print()
     return 1

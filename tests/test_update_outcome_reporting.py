@@ -22,7 +22,10 @@ import os
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
+
+from conftest import serving_version
 
 research = importlib.import_module("research")
 
@@ -33,15 +36,20 @@ def _run_waiter(tmp_path: Path, *, pipx_body: str, restart: bool = False) -> dic
     fake_pipx.write_text("#!/usr/bin/env python3\n" + textwrap.dedent(pipx_body))
     fake_pipx.chmod(0o755)
 
+    result = tmp_path / "update_result.json"
     restart_marker = tmp_path / "restart-ran"
+    # The restart leg records whether the sentinel was ALREADY on disk when it
+    # ran. Without that there is nothing to assert ordering on: both artifacts
+    # exist at the end whichever order produced them.
     fake_sr = tmp_path / "fake-superresearch"
     fake_sr.write_text(
         "#!/usr/bin/env python3\n"
-        f"open({str(restart_marker)!r}, 'w').write('yes')\n"
+        "import os\n"
+        f"open({str(restart_marker)!r}, 'w').write("
+        f"'yes' if os.path.exists({str(result)!r}) else 'no')\n"
     )
     fake_sr.chmod(0o755)
 
-    result = tmp_path / "update_result.json"
     log = tmp_path / "upgrade.log"
 
     # A child we reap first, so its pid is gone by the time the waiter probes it.
@@ -65,6 +73,7 @@ def _run_waiter(tmp_path: Path, *, pipx_body: str, restart: bool = False) -> dic
                        stdout=fh, stderr=subprocess.STDOUT, env=env, timeout=120,
                        check=False)
     out = {"result": None, "restarted": restart_marker.exists(),
+           "saw_result": restart_marker.read_text() if restart_marker.exists() else None,
            "log": log.read_text(errors="replace")}
     if result.exists():
         out["result"] = json.loads(result.read_text())
@@ -105,10 +114,18 @@ class TestWaiterWritesItsOutcome:
 
     def test_sentinel_is_written_before_the_restart(self, tmp_path):
         """Ordering matters: `--then--` cycles the supervisor, so a sentinel written
-        AFTER the restart would race the new backend's read of that same file."""
+        AFTER the restart would race the new backend's read of that same file.
+
+        The restart script REPORTS whether the sentinel existed when it ran. It
+        used to assert only that both artifacts exist at the end, which is true in
+        either order — verified by reordering the waiter so the restart leg runs
+        first: the old assertion still passed."""
         got = _run_waiter(tmp_path, pipx_body="print('ok')", restart=True)
-        # The restart script can only have observed the file if it already existed.
-        assert got["result"] is not None and got["restarted"]
+        assert got["restarted"], "the --then-- restart leg did not run"
+        assert got["saw_result"] == "yes", (
+            "the restart ran BEFORE the sentinel was written — the new backend can "
+            "race the write it is supposed to read"
+        )
 
     def test_no_result_env_means_no_sentinel(self, tmp_path):
         """The uninstall path passes no DG_LIFECYCLE_RESULT — it must not leave an
@@ -154,6 +171,7 @@ class TestConsumePendingUpdateResult:
         self._write(tmp_path, monkeypatch, {
             "action": "upgrade", "rc": 0, "current": "0.1.9", "latest": "0.1.10"})
         monkeypatch.setattr(research, "_sr_version", lambda: "0.1.10")
+        serving_version(monkeypatch, "0.1.10")
         st = research._consume_pending_update_result()
         assert st == {"state": "installed", "current": "0.1.10",
                       "latest": "0.1.10", "needsRestart": False, "reason": ""}
@@ -162,18 +180,97 @@ class TestConsumePendingUpdateResult:
         """pipx said OK but the restart leg never landed, so the new files are on disk
         while the process serving the app is still the old build. Reported as
         installed-but-needs-restart rather than a flat failure: the upgrade DID land,
-        and the remedy is the `restart` command the app's fallback button issues."""
+        and the remedy is the `restart` command the app's fallback button issues.
+
+        The two versions have to come from two different places, and this test used
+        to take both from one. `_sr_version()` reads wheel metadata off DISK, so it
+        is ALREADY 0.1.10 the instant pipx finishes — inside this very process. A
+        fixture that stubs it to 0.1.9 to mean "still running the old build" is
+        describing a state that cannot occur, so the branch it exercised was
+        unreachable in production and the Restart button it renders was dead code.
+        What is installed comes from the disk; what is SERVING comes from the
+        marker `--serve` stamps."""
         self._write(tmp_path, monkeypatch, {
             "action": "upgrade", "rc": 0, "current": "0.1.9", "latest": "0.1.10"})
-        monkeypatch.setattr(research, "_sr_version", lambda: "0.1.9")
+        monkeypatch.setattr(research, "_sr_version", lambda: "0.1.10")
+        serving_version(monkeypatch, "0.1.9")
         st = research._consume_pending_update_result()
         assert st["state"] == "installed" and st["needsRestart"] is True
         assert "restart" in st["reason"].lower()
+        assert "0.1.9" in st["reason"], "say which build is still serving"
+
+    def test_a_restart_already_under_way_is_not_reported_as_owing_one(self, tmp_path,
+                                                                     monkeypatch):
+        """The sentinel is written BEFORE the waiter cycles the supervisor, so a
+        heartbeat landing in that window sees the old build still serving. Without
+        a settle window every successful update would flash a Restart button for
+        the seconds the cycle takes — and the row's own copy would contradict the
+        version bump arriving right behind it."""
+        self._write(tmp_path, monkeypatch, {
+            "action": "upgrade", "rc": 0, "current": "0.1.9", "latest": "0.1.10",
+            "restarting": True, "at": int(time.time() * 1000)})
+        monkeypatch.setattr(research, "_sr_version", lambda: "0.1.10")
+        serving_version(monkeypatch, "0.1.9")
+        assert research._consume_pending_update_result() is None
+
+    def test_a_clock_stepped_backwards_does_not_suppress_the_outcome(self, tmp_path,
+                                                                     monkeypatch):
+        """The settle window is bounded at BOTH ends. A bare `< SETTLE` is
+        satisfied by any negative age, so an NTP correction or a VM snapshot
+        restore landing between the waiter's write and this read would return None
+        on every tick forever — and nothing else re-reads this to a conclusion, so
+        the outcome is simply never published."""
+        self._write(tmp_path, monkeypatch, {
+            "action": "upgrade", "rc": 0, "current": "0.1.9", "latest": "0.1.10",
+            "restarting": True, "at": int(time.time() * 1000) + 3600_000})
+        monkeypatch.setattr(research, "_sr_version", lambda: "0.1.10")
+        serving_version(monkeypatch, "0.1.9")
+        assert research._consume_pending_update_result() is not None, (
+            "a clock that jumped backwards silenced the report permanently"
+        )
+
+    def test_a_stamp_that_is_not_a_number_cannot_wedge_the_report(self, tmp_path,
+                                                                  monkeypatch):
+        """`int(raw["at"])` on a record that PARSED but carries junk raises, the
+        heartbeat swallows it, and because the file is still there the pending
+        check stays true — so the verdict is never published, never latched, and
+        the record is never deleted, on every tick and every boot."""
+        for junk in ("soon", None, [1], {"a": 1}):
+            self._write(tmp_path, monkeypatch, {
+                "action": "upgrade", "rc": 0, "current": "0.1.9", "latest": "0.1.10",
+                "restarting": True, "at": junk})
+            monkeypatch.setattr(research, "_sr_version", lambda: "0.1.10")
+            serving_version(monkeypatch, "0.1.9")
+            assert research._consume_pending_update_result() is not None, junk
+
+    def test_a_restart_that_never_finished_is_reported_once_the_window_passes(
+            self, tmp_path, monkeypatch):
+        """Guard against the guard: waiting forever would restore the silence."""
+        stale = int(time.time() * 1000) - research._RESTART_SETTLE_MS - 1000
+        self._write(tmp_path, monkeypatch, {
+            "action": "upgrade", "rc": 0, "current": "0.1.9", "latest": "0.1.10",
+            "restarting": True, "at": stale})
+        monkeypatch.setattr(research, "_sr_version", lambda: "0.1.10")
+        serving_version(monkeypatch, "0.1.9")
+        assert research._consume_pending_update_result()["needsRestart"] is True
 
     def test_a_normal_success_does_not_ask_for_a_restart(self, tmp_path, monkeypatch):
         self._write(tmp_path, monkeypatch, {
             "action": "upgrade", "rc": 0, "current": "0.1.9", "latest": "0.1.10"})
         monkeypatch.setattr(research, "_sr_version", lambda: "0.1.10")
+        serving_version(monkeypatch, "0.1.10")
+        assert research._consume_pending_update_result()["needsRestart"] is False
+
+    def test_nothing_serving_is_not_evidence_of_a_missing_restart(self, tmp_path,
+                                                                  monkeypatch):
+        """No marker means nothing is serving yet — a machine mid-cycle, or one
+        whose worker has not come back. That is an absence of evidence, and turning
+        it into a Restart prompt would put one on screen during every ordinary
+        supervisor relaunch."""
+        self._write(tmp_path, monkeypatch, {
+            "action": "upgrade", "rc": 0, "current": "0.1.9", "latest": "0.1.10"})
+        monkeypatch.setattr(research, "_sr_version", lambda: "0.1.10")
+        serving_version(monkeypatch, None)
         assert research._consume_pending_update_result()["needsRestart"] is False
 
     def test_reading_does_NOT_delete_so_a_failed_publish_can_retry(self, tmp_path, monkeypatch):
@@ -194,11 +291,22 @@ class TestConsumePendingUpdateResult:
 
     def test_the_publisher_discards_only_after_a_successful_write(self):
         """Ordering guard on the heartbeat: publish, THEN discard, THEN latch. Any other
-        order can drop an outcome on a transient write failure."""
+        order can drop an outcome on a transient write failure.
+
+        Anchored on the OUTCOME publish, not on the first `_write_update_status`
+        in the block. The liveness pulse added later calls the same function
+        earlier in the same slice, so a bare `.index(...)` started matching the
+        pulse — after which moving the discard ahead of the real publish still
+        satisfied the comparison. Verified by injecting exactly that reordering."""
         src = inspect.getsource(research._heartbeat_loop)
         blk = src[src.index("_update_result_published"):]
-        i_write = blk.index("_write_update_status")
-        i_discard = blk.index("_discard_pending_update_result")
+        publish = "elif await asyncio.to_thread(_write_update_status, device_id, _ur):"
+        i_write = blk.find(publish)
+        assert i_write > -1, (
+            "the outcome publish was reworded — this guard is now anchored on "
+            "nothing and would pass on any ordering"
+        )
+        i_discard = blk.index("_discard_pending_update_result", i_write)
         i_latch = blk.index("_update_result_published = True", i_write)
         assert i_write < i_discard < i_latch, (
             "must be write -> discard -> latch; anything else can lose the outcome"

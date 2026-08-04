@@ -6,7 +6,7 @@ versus 2609 under ruff 0.16.0's bare defaults, on the same commit. "ruff clean"
 was not a falsifiable claim, and a PR description had already asserted it off the
 narrower number.
 
-Three things have to hold for the count to stay reproducible, and one for the
+Three things have to hold for the count to stay reproducible, and two for the
 floor to stay meaningful:
 
   * `select` is spelled out — ruff resolves config per file to the nearest
@@ -14,12 +14,18 @@ floor to stay meaningful:
   * the two copies agree, or a repo-root run mixes two rulesets;
   * ruff itself is pinned exactly, since rule implementations move between
     releases;
-  * and E9 + the F82x name-error family can never be switched off. Those are
+  * E9 + the F82x name-error family can never be switched off. Those are
     latent crashes, not style opinions — unlike the style exclusions, which are
-    judgement calls anyone may revisit.
+    judgement calls anyone may revisit;
+  * and no FILE may be carved out of the run. Rule codes were the only thing
+    checked here at first, which left a second, quieter switch: one line of
+    `exclude = ["research.py"]` under [tool.ruff] and the CI floor prints "All
+    checks passed!" over the very file the ticket was about, with every test in
+    this module still green. Reproduced against real ruff.
 """
 from __future__ import annotations
 
+import fnmatch
 import re
 import shutil
 import subprocess
@@ -35,10 +41,28 @@ CONFIGS = {"root": ROOT / "pyproject.toml", "agent": ROOT / "agent" / "pyproject
 PROTECTED_RULES = ("E9", "F821", "F822", "F823", "F811", "F402")
 
 
-def _lint(path: Path) -> dict:
+def _cfg(path: Path) -> dict:
     assert path.exists(), f"{path} is missing"
-    cfg = tomllib.loads(path.read_text(encoding="utf-8"))
-    return cfg.get("tool", {}).get("ruff", {}).get("lint", {})
+    return tomllib.loads(path.read_text(encoding="utf-8"))
+
+
+def _lint(path: Path) -> dict:
+    return _cfg(path).get("tool", {}).get("ruff", {}).get("lint", {})
+
+
+def _swallows(pattern: str, rule: str) -> bool:
+    """Does an ignore entry switch `rule` off?
+
+    Ruff matches rule codes by PREFIX, so `ignore = ["F8"]` kills F821/F822/F823
+    without naming any of them — the shape a plausible-looking diff hides in. The
+    reverse direction matters too: `per-file-ignores` may carry a longer code
+    than the one being protected.
+
+    Module-level so the guard and the guard-the-guard exercise the same code. As
+    an assertion written inline it was re-implemented by its own test, which then
+    passed on Python's semantics no matter what the real check did.
+    """
+    return rule.startswith(pattern) or pattern.startswith(rule)
 
 
 def _ruff_pin(path: Path) -> str | None:
@@ -151,14 +175,143 @@ def test_correctness_rules_cannot_be_switched_off() -> None:
                 f"{name}: nothing in select={select!r} covers {rule}"
             )
             for pattern in (*ignore, *per_file):
-                assert not (rule.startswith(pattern) or pattern.startswith(rule)), (
+                assert not _swallows(pattern, rule), (
                     f"{name}: {pattern!r} switches off {rule}, which is a latent "
                     "crash rather than a style opinion"
                 )
 
 
 def test_the_prefix_check_would_catch_a_swallowing_pattern() -> None:
-    """Guard the guard — the test above passes by finding nothing."""
-    rule, pattern = "F821", "F8"
-    assert rule.startswith(pattern), "prefix matching no longer detects `ignore = [\"F8\"]`"
-    assert not ("F821".startswith("E7") or "E7".startswith("F821")), "unrelated codes must not match"
+    """Guard the guard — the test above passes by finding nothing.
+
+    It calls `_swallows`, the same function the guard calls. The earlier version
+    restated the prefix logic inline, so it asserted a property of Python rather
+    than of the guard: weakening the real check to `pattern != rule` left both
+    tests green while `ignore = ["F8"]` sailed through.
+    """
+    assert _swallows("F8", "F821"), 'the guard no longer detects `ignore = ["F8"]`'
+    assert _swallows("F821", "F821"), "an exact ignore is still an ignore"
+    assert _swallows("F821", "F8"), "a per-file ignore longer than the rule still swallows it"
+    assert not _swallows("E7", "F821"), "unrelated codes must not match"
+
+
+# ── Nothing may be carved out of the run ─────────────────────────────────────
+
+def _shipped_paths(name: str) -> set:
+    """Repo-relative .py paths this config governs that MUST stay linted.
+
+    Two groups, both derived from the file rather than listed here so the set
+    cannot fall behind a packaging change:
+
+      * what actually ships — [tool.setuptools] py-modules + packages, which is
+        the code whose latent NameError reaches a user;
+      * the suite next to it — a crash hiding in a test is a test that proves
+        nothing, and excluding tests/ is the cheapest way to turn a red floor
+        green.
+    """
+    base = CONFIGS[name].parent
+    cfg = _cfg(CONFIGS[name]).get("tool", {}).get("setuptools", {})
+    out = set()
+    for mod in cfg.get("py-modules", []):
+        p = base / f"{mod}.py"
+        if p.exists():
+            out.add(p.relative_to(base).as_posix())
+    for pkg in [*cfg.get("packages", []), "tests"]:
+        for p in (base / pkg).rglob("*.py"):
+            out.add(p.relative_to(base).as_posix())
+    return out
+
+
+def _exclusion_patterns(name: str) -> list:
+    """Every place ruff accepts a file-exclusion pattern, per config.
+
+    `lint.exclude` sits alongside the two top-level keys because it removes a
+    file from LINTING specifically, which is the whole of what the floor is.
+    """
+    ruff = _cfg(CONFIGS[name]).get("tool", {}).get("ruff", {})
+    return [
+        *ruff.get("exclude", []),
+        *ruff.get("extend-exclude", []),
+        *ruff.get("lint", {}).get("exclude", []),
+    ]
+
+
+def _excluded_by(pattern: str, paths) -> list:
+    """Which of `paths` a ruff exclude pattern removes.
+
+    Ruff's patterns are gitignore-style and match a path or any directory on the
+    way to it, so `["auth"]`, `["auth/*"]`, `["*.py"]` and `["research.py"]` all
+    have to register. fnmatch's `*` crossing `/` is what makes the directory
+    forms work here.
+    """
+    pat = pattern.strip().rstrip("/")
+    hit = []
+    for path in paths:
+        parts = path.split("/")
+        prefixes = ["/".join(parts[: i + 1]) for i in range(len(parts))]
+        if any(fnmatch.fnmatch(c, pat) for c in (*prefixes, parts[-1])):
+            hit.append(path)
+    return sorted(hit)
+
+
+@pytest.mark.parametrize("name", list(CONFIGS))
+def test_no_shipped_file_can_be_excluded_from_the_lint(name: str) -> None:
+    """⛔ The second switch. Every other test here reads rule CODES.
+
+    `exclude = ["research.py"]` under [tool.ruff] — cover story: "54k lines, slow
+    to lint" — leaves select, ignore and per-file-ignores untouched, so all of
+    them stay green, while `ruff check . --select E9,F821,… --ignore-noqa` goes
+    from reporting the undefined name to printing "All checks passed!". Verified
+    against real ruff. That is the exact NameError class DGOPS-9508 existed for.
+    """
+    paths = _shipped_paths(name)
+    assert paths, f"{name}: no source files resolved — this guard would be vacuous"
+    for pattern in _exclusion_patterns(name):
+        gone = _excluded_by(pattern, paths)
+        assert not gone, (
+            f"{name} pyproject.toml excludes {pattern!r} from ruff, which removes "
+            f"{len(gone)} file(s) from the CI correctness floor — starting with "
+            f"{gone[:3]}. The lint would still print 'All checks passed!' with an "
+            f"undefined name in them. Exclusions belong to style rules, and the "
+            f"floor is not a style rule."
+        )
+
+
+@pytest.mark.parametrize("name", list(CONFIGS))
+def test_the_protected_set_covers_everything_that_ships(name: str) -> None:
+    """⚠ "Non-empty" is not "complete", and the difference is exploitable.
+
+    With no exclusions configured today, the loop in the test above never
+    executes, so a `_shipped_paths` that quietly stopped collecting the root
+    modules would go unnoticed — until someone added `exclude = ["research.py"]`
+    later and the guard waved it through. Found by mutation: dropping the
+    py-modules read left `tests/` in the set and every assertion green.
+
+    Each declared module and package must contribute at least one path, and the
+    declaration is read from pyproject rather than listed here.
+    """
+    base = CONFIGS[name].parent
+    setup = _cfg(CONFIGS[name]).get("tool", {}).get("setuptools", {})
+    paths = _shipped_paths(name)
+    for mod in setup.get("py-modules", []):
+        if (base / f"{mod}.py").exists():
+            assert f"{mod}.py" in paths, f"{name}: shipped module {mod}.py is unprotected"
+    for pkg in [*setup.get("packages", []), "tests"]:
+        if not (base / pkg).is_dir():
+            continue
+        assert any(p.startswith(f"{pkg}/") for p in paths), (
+            f"{name}: nothing under {pkg}/ is protected from a lint exclusion")
+
+
+def test_the_exclusion_check_would_catch_a_real_exclude() -> None:
+    """Guard the guard, through `_excluded_by` — the function the guard calls.
+
+    Each pattern below is one someone would plausibly write, and each must
+    register; the last two must not, or the guard fires on unrelated entries and
+    gets deleted for being noisy.
+    """
+    paths = {"research.py", "auth/keystore.py", "tests/test_x.py"}
+    for pattern in ("research.py", "*.py", "auth", "auth/", "auth/*", "research*", "tests"):
+        assert _excluded_by(pattern, paths), f"{pattern!r} no longer registers as an exclusion"
+    assert not _excluded_by("build", paths)
+    assert not _excluded_by("*.md", paths)

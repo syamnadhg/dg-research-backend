@@ -5,16 +5,19 @@ All Claude Computer Use API (CUA) system prompts and task prompts.
 Imported by research.py — edit prompts here, logic stays in research.py.
 """
 
-from models import p2_claude_major, p2_claude_prev_ver, p2_claude_ver
+from models import p1_select_pro_directive, p2_family, p2_labels
 
-# Claude P2 model-version tokens — derived from the central P2_MODEL_POLICY
-# (models.py) so the model names baked into the CUA prompts below track the
-# policy floor instead of being hand-edited here. Default floor 4.8 →
-# _OPUS="4.8", _OPUS_PREV="4.7", _OPUS_MAJOR="4" (byte-identical to the prior
-# literals). NB: this is the model_refresh "Phoenix", NOT the daemon-restart one.
-_OPUS = p2_claude_ver()
-_OPUS_PREV = p2_claude_prev_ver()
-_OPUS_MAJOR = p2_claude_major()
+# ⭐ FAMILY ONLY — no model VERSION appears in any prompt in this file, and none
+# may be added back. Owner directive 2026-07-31: "only model family is gonna be
+# there and both dom and CUA (fallback) must auto heal on every model release."
+#
+# These used to be _OPUS / _OPUS_PREV / _OPUS_MAJOR rendered from a policy floor
+# of 4.8. Even derived from a constant they rotted as TEXT: telling the agent to
+# "pick Opus 4.8" on an account already running Opus 5 made it reason "this is
+# NOT Opus 4.8, so I need to fix it" and open the model menu — the second
+# model-menu interaction users reported as "the selector opens twice".
+_OPUS = p2_family("claude").capitalize() or "Opus"                     # "Opus"
+_CL_EFFORT = str(p2_labels("claude").get("effort", "max")).capitalize()  # "Max"
 
 SYSTEM_BASE = (
     "You are an expert browser automation agent. You control a browser via mouse clicks, "
@@ -51,17 +54,23 @@ PROMPT_DETECT_CHATGPT_PRO = SYSTEM_BASE + """
 
 Screenshot of ChatGPT (chatgpt.com), user is logged in.
 
+Match on the WORD "Pro", never on a model version number — the version changes
+with every release and is irrelevant to which plan the account is on.
+
 Look ONLY for these PRO subscription signals:
-- Current model label visible at top contains "Pro" — e.g. "GPT-5 Pro", "Pro mode", "o1 pro", "ChatGPT Pro"
+- The current model label ends in (or contains) the word "Pro" — the part before it is a model name and does not matter
 - Account/profile menu shows "Pro" plan label
-- Model selector (if open) lists "Pro" / "GPT-5 Pro" / "Pro mode" as a selectable option
+- Model selector (if open) lists an option whose label contains "Pro" (e.g. "… Pro" / "Pro mode")
 - "Pro" badge near the avatar / sidebar account area
 
 Look ONLY for these FREE subscription signals:
-- Current model label is "ChatGPT" with no Pro/Plus suffix, "GPT-5", "GPT-4o", "GPT-4o mini", "Auto"
+- The current model label has NO "Pro"/"Plus" in it (a bare product name, a bare version number, "Auto", or "Mini")
 - Prominent "Upgrade to Pro" / "Get Pro" / "Try Pro" call-to-action button (not buried in a settings page)
 - Visible label "Free" / "Free plan" near the avatar
-- Model selector (if open) lists ONLY Free / Plus / Auto / Mini — no Pro option
+- Model selector (if open) lists no option containing "Pro"
+
+IMPORTANT: "Upgrade to Pro" / "Get Pro" / "Try Pro" contain the word "Pro" but
+are the OPPOSITE of a Pro signal — a call to action is not a plan label.
 
 Reply with EXACTLY one word, no punctuation:
 PRO    — any PRO signal is clearly visible
@@ -69,17 +78,20 @@ FREE   — a FREE signal is clearly visible AND no PRO signals
 UNSURE — mixed/hidden signals, or you cannot tell from this screenshot"""
 
 
-PROMPT_DETECT_CLAUDE_PRO = SYSTEM_BASE + """
+PROMPT_DETECT_CLAUDE_PRO = SYSTEM_BASE + f"""
 
 Screenshot of Claude (claude.ai), user is logged in.
 
+Match on the model FAMILY word, never on a version number — the version changes
+with every release and is irrelevant to which plan the account is on.
+
 Look ONLY for these PRO subscription signals:
-- Model selector / message header shows "Opus" — e.g. "Opus 4.8", "Opus 4.7", "Claude Opus"
+- Model selector / message header shows "{_OPUS}", with or without a version number after it
 - Account/profile menu shows "Pro" / "Max" / "Team" / "Enterprise" plan label
 - "Research" tool toggle is selectable in the composer (paid feature)
 
 Look ONLY for these FREE subscription signals:
-- Model selector shows ONLY "Sonnet" or "Haiku", no Opus option visible
+- Model selector shows ONLY "Sonnet" or "Haiku", no {_OPUS} option visible
 - Prominent "Upgrade to Pro" / "Try Pro" call-to-action button (not buried)
 - Visible label "Free" / "Free plan" near the avatar
 - "Pro" upsell banner across the top of the page
@@ -94,15 +106,19 @@ PROMPT_DETECT_GEMINI_PRO = SYSTEM_BASE + """
 
 Screenshot of Gemini (gemini.google.com), user is logged in.
 
+Match on the tier WORDS ("Advanced" / "Pro" / "Deep Think" / "Flash"), never on a
+version number — the version changes with every release and is irrelevant to
+which plan the account is on.
+
 Look ONLY for these PRO subscription signals:
-- Top-left product label reads "Gemini Advanced", "Gemini Pro", "Gemini 2.5 Pro", or "Gemini 2.5 Deep Think"
-- Model selector (if open) lists "2.5 Pro" / "Deep Think" / "Advanced" as available
+- Top-left product label contains "Advanced", "Pro", or "Deep Think" (any version number before or after those words is irrelevant)
+- Model selector (if open) lists an option containing "Pro" / "Deep Think" / "Advanced"
 - Account chip shows "Advanced" / "Pro" subscription label
 
 Look ONLY for these FREE subscription signals:
 - Top-left product label reads only "Gemini" with no Advanced/Pro suffix
 - Prominent "Get Gemini Advanced" / "Try Advanced" / "Upgrade" call-to-action (not buried)
-- Model selector lists only "2.5 Flash" / standard models, no Pro/Deep Think options
+- Model selector lists only "Flash" / standard models, no Pro/Deep Think options
 - Free-plan upsell banner across top
 
 Reply with EXACTLY one word, no punctuation:
@@ -113,9 +129,12 @@ UNSURE — mixed/hidden signals, or you cannot tell from this screenshot"""
 
 # ── Phase 1: ChatGPT Brief Generation ─────────────────────────────────────────
 
-PROMPT_SELECT_PRO = SYSTEM_BASE + """
-
-Task: Select ChatGPT Pro (or "GPT-5 Pro" / "Pro mode") in the model selector. If an Extended Thinking toggle is visible, enable it. Do NOT type a message. After Pro is selected, make sure the model-selector menu/popover is CLOSED (it usually closes itself on selection; if it's still open, press Escape or click empty space once) so it can't sit over the message composer. When Pro is confirmed selected and the picker is closed, say "Pro mode selected"."""
+# ⭐ RENDERED FROM POLICY, like the two Claude directives below it. The tier word
+# and the upgrade-verb CTAs come from P1_MODEL_POLICY, and the thinking-toggle
+# sentence appears only when models.has_thinking_control() says the platform has
+# one. ChatGPT does not — effort and model are a single menu — so this prompt
+# used to send every agent hunting a control that does not exist.
+PROMPT_SELECT_PRO = SYSTEM_BASE + "\n\n" + p1_select_pro_directive()
 
 PROMPT_CHATGPT_DISABLE_DR = SYSTEM_BASE + """
 
@@ -229,7 +248,7 @@ Your task: Configure Claude for research. Nothing else.
 
 Steps:
 1. Look at the Claude.ai page.
-2. Click the model selector and pick "Opus {_OPUS}". In that SAME popover: open the "Effort" submenu and choose "Max", and turn the "Adaptive thinking" toggle ON. (Older UI may show a single "Opus {_OPUS_PREV} Adaptive" option instead — pick that if {_OPUS}/Effort aren't present.)
+2. MODEL: the model must be {_OPUS} — the VERSION NUMBER DOES NOT MATTER, and a higher number is always better. Open the model selector ONCE and pick the HIGHEST-numbered {_OPUS} in the list; if the highest {_OPUS} is the one already selected, close the menu without clicking it. In that SAME popover, if an "Effort" submenu is present, choose "{_CL_EFFORT}". If the menu will not open but the button already reads "{_OPUS} …", that is fine — leave the model as it is and go to step 3.
 3. Click the "+" or tools menu near the input; enable the "Research" mode/tool.
 4. Close the menu (Escape) and click the message input area to focus it.
 5. Say "ready for paste" and STOP.
@@ -241,7 +260,7 @@ ABSOLUTELY FORBIDDEN — ZERO TOLERANCE:
 - DO NOT send anything.
 - DO NOT click Send / Submit.
 - DO NOT attach any files.
-- If Opus {_OPUS} + Max effort + Adaptive thinking are already set: say "ready for paste" immediately and STOP.
+- If the model button already reads the HIGHEST "{_OPUS}" on offer with {_CL_EFFORT} effort, and Research is on: say "ready for paste" immediately and STOP.
 - If Research mode toggle is already on: leave it alone.
 - If options are unavailable: say "partial setup" and STOP.
 
@@ -259,6 +278,7 @@ Check the screenshot:
 
 If both true: say "setup verified" and STOP.
 If Deep research is off: open the "+" / tools menu, click "Deep research", click the input to focus, then say "setup fixed" and STOP.
+CRITICAL — only click "Deep research" if it is genuinely OFF. In the current ChatGPT UI clicking it while it is already selected ADDS A SECOND Deep Research instead of doing nothing, and there is no way to click it back off. If you are not certain it is off, treat it as on and say "setup verified".
 If Deep research is unavailable or blocked: say "setup failed: <describe exactly what you see>" and STOP."""
 
 
@@ -306,7 +326,7 @@ PROMPT_VALIDATE_CLAUDE_SETUP = SYSTEM_BASE + f"""
 Your task: Verify Claude is ready for Deep Research and fix ONLY what is wrong. The ONE thing that matters is the Research tool — everything else is secondary.
 
 Read the composer. Do NOT open the model popover unless step 1 explicitly tells you to.
-1. MODEL: the model-selector button (bottom of the composer) shows the current model. If it reads "Opus {_OPUS}" — or any "Opus {_OPUS_MAJOR}.x" — the model is FINE; do nothing to it. That button ALSO shows the effort (e.g. "Max") right on it. DO NOT open the model popover, and DO NOT try to expand the "Effort" or "Adaptive thinking" submenu — those are quality knobs, NOT requirements, and clicking a submenu that won't expand only wastes turns. ONLY touch the model if the button shows Sonnet/Haiku with no Opus at all: then open it once, pick "Opus {_OPUS}", and close it.
+1. MODEL: the model-selector button (bottom of the composer) shows the current model. If it reads "{_OPUS}" followed by ANY version number — or "{_OPUS}" with no number at all — the model is FINE; do nothing to it. The version number is irrelevant here and a higher one is always correct. That button ALSO shows the effort (e.g. "{_CL_EFFORT}") right on it. DO NOT open the model popover, and DO NOT try to expand the "Effort" submenu — those are quality knobs, NOT requirements, and clicking a submenu that won't expand only wastes turns. ONLY touch the model if the button shows Sonnet/Haiku with no {_OPUS} at all: then open it once, pick the highest-numbered "{_OPUS}", and close it.
 2. RESEARCH TOOL (the priority — this is what actually matters): is "Research" / "Deep research" enabled near the composer (an active/highlighted pill or chip, or a checkmark beside "Research" in the "+" tools menu)? If you cannot tell from the current view, open the "+" / tools menu and look. If Research is OFF, turn it ON. If it is already ON, leave it.
 3. ATTACHMENTS: if a stale attachment is already visible in the composer, click its X to remove it.
 4. Click the input area to focus it.
@@ -923,6 +943,15 @@ Steps:
 1. Locate the correct audio entry in the Studio panel.
 2. On THAT entry, open its three-dot menu (or find its download affordance).
 3. Click Download. Say "downloaded" when the download begins.
+
+That three-dot menu reads Share / Rename / Download / View prompt and sources /
+Delete, in that order.
+DANGER: Delete is TWO ROWS BELOW Download in that menu.
+Read a row's text before you click it, and click the one that says Download.
+NEVER click Delete, Remove or Trash in this menu, for any reason — deleting an
+audio overview cannot be undone, and that file is what the whole run is for.
+If you cannot read the rows clearly, close the menu and say
+"abort: cannot read menu" rather than clicking by position.
 
 {v['ambiguity_rule']}"""
 

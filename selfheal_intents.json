@@ -71,13 +71,13 @@
     "type": "select",
     "irreversible": false,
     "region": "composer",
-    "outcome_predicate": "chatgpt_model_selector:absent",
+    "outcome_predicate": "chatgpt_trigger:tier_selected",
     "signal_hints": {
       "accessible_name": "model",
       "role": [
         "button"
       ],
-      "detect_only": true
+      "value_contains": "pro"
     },
     "tier_sequence": [
       "registry",
@@ -115,7 +115,7 @@
     "type": "select",
     "irreversible": false,
     "region": "composer",
-    "outcome_predicate": "claude_trigger_verOf:>=floor",
+    "outcome_predicate": "claude_trigger:family_selected",
     "signal_hints": {
       "accessible_name": "model",
       "role": [
