@@ -12,6 +12,14 @@ which puts the agent package on sys.path and calls the `serve` entry point, so t
 bridge resumes cleanly after a reboot (the account session + device selection persist
 in keyring + prefs).
 
+⚠ THE LAUNCHER MUST NEVER POINT INTO PIPX'S RUN CACHE. `pipx run superresearch-agent
+connect` — the documented from-chat install — executes out of an EPHEMERAL venv that
+pipx evicts (~14 days). Pinning the interpreter and sys.path there produces exactly
+the reported symptom: the bridge comes back on an old build, or after eviction does
+not come back at all, because both the interpreter path and the package path are
+gone. So every pin resolves the DURABLE install (pipx's local venvs dir) first, and
+`install()` REFUSES rather than writing a launcher it knows will rot.
+
 The per-OS argv / unit / plist are built by pure functions (unit-testable); only
 install / uninstall / status / start_detached shell out.
 
@@ -25,6 +33,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -38,6 +47,11 @@ log = logging.getLogger(__name__)
 TASK_NAME = "SuperAgentBridge"                    # Windows Scheduled Task name
 SYSTEMD_UNIT = "super-agent-bridge.service"       # Linux systemd --user unit
 LAUNCHD_LABEL = "io.superresearch.agent-bridge"   # macOS launchd LaunchAgent label
+
+# The distribution name, and the name pipx gives the durable venv it installs into.
+# Defined HERE rather than in selfupdate because selfupdate imports this module (the
+# reverse import would be circular) — selfupdate re-exports it as AGENT_PKG.
+PKG_NAME = "superresearch-agent"
 
 
 # ── platform ───────────────────────────────────────────────────────────────────
@@ -64,24 +78,335 @@ def platform_label() -> str:
     return sys.platform
 
 
+# ── where the DURABLE install lives ──────────────────────────────────────────
+# pipx keeps two completely different venv trees and the difference is the whole
+# bug: PIPX_LOCAL_VENVS/<pkg> is the persistent install `pipx install` creates and
+# `pipx upgrade` maintains, while PIPX_VENV_CACHEDIR holds the throwaway venvs
+# `pipx run` builds and evicts. A login pin is only as durable as the paths baked
+# into it, so it must resolve the former and must never resolve the latter.
+
+_pipx_values: "dict[str, str | None]" = {}
+
+
+def _pipx_argv() -> "list[str] | None":
+    """How to invoke pipx: the PATH shim, else `python -m pipx`.
+
+    Every lookup is guarded. `shutil.which` is not as inert as it looks — it takes
+    a platform-specific branch and can raise on a malformed PATH — and this sits on
+    the path-resolution route that `agent_dir()` and therefore every launcher write
+    goes through. Failing to find pipx must degrade to "can't tell", never take
+    down the caller."""
+    try:
+        if exe := shutil.which("pipx"):
+            return [exe]
+        py = shutil.which("python3") or shutil.which("python") or sys.executable
+    except Exception:  # noqa: BLE001 - unknowable environment; degrade, don't raise
+        return None
+    return [py, "-m", "pipx"] if py else None
+
+
+def _pipx_value(name: str) -> "str | None":
+    """`pipx environment --value <NAME>`, or None when pipx is absent or can't
+    answer — every caller degrades rather than failing.
+
+    ONLY SUCCESSES ARE MEMOISED. A failure is usually transient (a cold
+    `python -m pipx` that overran the timeout, a momentarily busy machine), and
+    caching one would make a healthy host look pipx-less for the rest of the
+    process: `durable_venv()` returns None, pinning refuses, the bootstrap
+    reinstalls over a perfectly good venv, and even after that succeeds the
+    re-check reads the same poisoned answer and reports the install unresolvable.
+    A repeated subprocess on a genuinely broken host is the cheaper mistake."""
+    if _pipx_values.get(name):
+        return _pipx_values[name]
+    argv = _pipx_argv()
+    if argv is None:
+        return None
+    try:
+        r = subprocess.run([*argv, "environment", "--value", name],
+                           capture_output=True, text=True, timeout=30)
+        out = (r.stdout or "").strip()
+    except Exception:  # noqa: BLE001 - no pipx / broken pipx: treat as unknown
+        return None
+    if r.returncode != 0 or not out:
+        return None
+    _pipx_values[name] = out
+    return out
+
+
+_uv_cache: "dict[str, str | None]" = {}
+
+
+def _uv_cache_dir() -> "str | None":
+    """`uv cache dir`, or None when uv isn't installed or can't answer.
+
+    Load-bearing, not defensive. When uv is present pipx uses it as the install
+    backend by DEFAULT, and a uv-backed `pipx run` does not touch
+    PIPX_VENV_CACHEDIR at all — it executes out of uv's own archive store:
+
+        ~/.cache/uv/archive-v0/<hash>/lib/python3.13/site-packages/facade/…
+        ~/.cache/uv/archive-v0/<hash>/bin/python
+
+    Measured, not assumed (pipx 1.16.5 + uv 0.9): the pip backend puts the same
+    run under `<PIPX_HOME>/.cache/<digest>`, so a check that only knows pipx's
+    cache reads uv's as DURABLE and pins it — which is the stale-launcher bug
+    itself, on the configuration most machines are now in.
+
+    Memoises successes only, for the reason spelled out in `_pipx_value`."""
+    if _uv_cache.get("dir"):
+        return _uv_cache["dir"]
+    try:
+        exe = shutil.which("uv")
+    except Exception:  # noqa: BLE001 - malformed PATH; degrade, don't raise
+        return None
+    if not exe:
+        return None
+    try:
+        r = subprocess.run([exe, "cache", "dir"], capture_output=True, text=True,
+                           timeout=30)
+        out = (r.stdout or "").strip()
+    except Exception:  # noqa: BLE001 - broken uv: treat as unknown
+        return None
+    if r.returncode != 0 or not out:
+        return None
+    _uv_cache["dir"] = out
+    return out
+
+
+def _under(child: Path, parent: "Path | None") -> bool:
+    if parent is None:
+        return False
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except Exception:  # noqa: BLE001 - unrelated trees / unresolvable path
+        return False
+
+
+def is_ephemeral(path: Path) -> bool:
+    """True when ``path`` lives in a venv the tooling will EVICT (a `run` cache).
+
+    TWO cache roots, because there are two backends and the one in use is the one
+    we are least likely to be told about. `pipx run` lands in PIPX_VENV_CACHEDIR
+    under the pip backend and in uv's archive store under the uv backend — and uv
+    is the DEFAULT whenever uv is installed. Asking only pipx therefore answers
+    "durable" for the majority configuration and pins an evictable path, which is
+    the entire bug this module exists to stop.
+
+    Containment is the authoritative answer, but only when it says YES. A "no" is
+    not conclusive: hosts routinely have two pipxes (a brew one on PATH and a
+    `python -m pipx`, or a `PIPX_HOME` exported in the shell that ran `pipx run`
+    but not in ours), and the one we can reach reports a different cache root
+    than the one we are running out of. So the name check gets to answer too.
+
+    That check is deliberately narrow — it wants BOTH a cache-ish component and a
+    tool-ish one — because a false positive (refusing to pin a perfectly good
+    source checkout or a dev venv) breaks the install flow outright, while a
+    false negative only leaves today's behaviour. `uv` is matched as a whole path
+    component, not as a substring, so an ordinary directory that merely contains
+    those two letters cannot trip it."""
+    for root in (_pipx_value("PIPX_VENV_CACHEDIR"), _uv_cache_dir()):
+        if root and _under(path, Path(root)):
+            return True
+    parts = [p.lower() for p in path.resolve().parts]
+    # Being inside pipx's PERSISTENT tree is equally authoritative in the other
+    # direction, and it is answered from the path rather than by asking pipx:
+    # the ask returns None on exactly the hosts where the name check below is in
+    # charge, so an escape built on it evaporates when it is most needed.
+    # Reproduced before writing this: with PIPX_HOME under ~/.cache and pipx
+    # unreachable, a real durable install answered "evictable" — which makes
+    # `install()` refuse and leaves that user with no login pin at all.
+    #
+    # pipx's persistent tree is always `<PIPX_HOME>/venvs/<pkg>` and its run cache
+    # is always `<PIPX_HOME>/.cache/<hash>`, disjoint by construction, so a
+    # `venvs` COMPONENT is a durable install however the home was configured.
+    # Whole component, not a substring: `<cache>/pipx/venvs-old/<hash>` is a
+    # leftover cache tree, not an install.
+    if any(p == "venvs" for p in parts):
+        return False
+    has_cache = any(p in ("cache", ".cache", "caches") for p in parts)
+    has_tool = any("pipx" in p for p in parts) or any(p == "uv" for p in parts)
+    return has_cache and has_tool
+
+
+def durable_venv() -> "Path | None":
+    """pipx's persistent venv for this package, or None if it isn't installed."""
+    venvs = _pipx_value("PIPX_LOCAL_VENVS")
+    if not venvs:
+        return None
+    p = Path(venvs) / PKG_NAME
+    return p if p.is_dir() else None
+
+
+def _venv_site_packages(venv: Path) -> "Path | None":
+    """The site-packages inside ``venv`` that actually holds our package. Verified
+    by the presence of `facade`, not by path shape: an empty or half-built venv
+    must not be reported as a durable home."""
+    roots = [venv / "Lib" / "site-packages"] if is_windows() else []
+    roots += sorted(venv.glob("lib/python*/site-packages"))
+    roots += sorted(venv.glob("Lib/site-packages"))
+    for r in roots:
+        if (r / "facade").is_dir():
+            return r
+    return None
+
+
+def _ver_tuple(v: str) -> tuple:
+    """`"0.1.31"` -> `(0, 1, 31)`; anything unparseable in a segment stops it."""
+    out = []
+    for chunk in (v or "").split("."):
+        digits = ""
+        for ch in chunk:
+            if not ch.isdigit():
+                break
+            digits += ch
+        out.append(int(digits or 0))
+    return tuple(out)
+
+
+def _ver_ge(a: str, b: str) -> bool:
+    """Is version `a` at least version `b`?
+
+    Both sides are ZERO-PADDED to the same length first, because tuples of
+    different lengths do not compare the way versions do: `(0, 2) < (0, 2, 0)`,
+    so `0.2` and `0.2.0` — the same release — would read as one being behind the
+    other and the caller would tear down a perfectly good install on every
+    connect to "fix" it. `selfupdate.version_gt` pads for the same reason.
+
+    Separate from that function on purpose, and not worth unifying: it compares
+    an INDEX version against ours and has to reason about pre-release markers,
+    while this only answers "is the copy on disk behind the copy running", where
+    both sides are builds we shipped. Keeping it here also keeps this module
+    importable with nothing but the stdlib, which is what lets the generated
+    launcher use it."""
+    ta, tb = _ver_tuple(a), _ver_tuple(b)
+    n = max(len(ta), len(tb))
+    return ta + (0,) * (n - len(ta)) >= tb + (0,) * (n - len(tb))
+
+
+def _installed_version(site_packages: Path) -> "str | None":
+    """The version of OUR distribution inside ``site_packages``, from the
+    dist-info directory name. Read off the filesystem rather than imported:
+    `facade.__version__` is `importlib.metadata` against the RUNNING
+    interpreter, so importing it would report the version we already know
+    instead of the one sitting in the directory we are asking about."""
+    stem = PKG_NAME.replace("-", "_") + "-"
+    for d in site_packages.glob(stem + "*.dist-info"):
+        v = d.name[len(stem):-len(".dist-info")]
+        if v:
+            return v
+    return None
+
+
+def durable_is_current() -> bool:
+    """Whether the durable install is at least as new as the code running now.
+
+    A durable pin is only worth having if it points at a build that is not
+    BEHIND us. `pipx run superresearch-agent connect` — the documented from-chat
+    install — fetches the newest agent and then asks this module where to pin it;
+    if some older `pipx install` is still on the machine, redirecting to it would
+    silently downgrade the user with the very command that exists to bring them
+    up to date, and permanently, since login starts that copy from then on.
+
+    Unreadable version => treated as CURRENT. A wrong "stale" verdict tears down
+    a working install on every connect; a wrong "current" verdict is only
+    today's behaviour."""
+    venv = durable_venv()
+    sp = _venv_site_packages(venv) if venv else None
+    if sp is None:
+        return False
+    there = _installed_version(sp)
+    if not there:
+        return True
+    return _ver_ge(there, _running_version())
+
+
+def _running_version() -> str:
+    """The version of the code executing right now. Imported lazily: `__init__`
+    is this package's own module, and importing it at module scope would run the
+    package initialiser while the package is still being imported."""
+    from . import __version__
+    return __version__
+
+
+def durable_agent_dir() -> "Path | None":
+    """site-packages of the DURABLE install — what the launcher should put on
+    sys.path. None when there is no durable install worth pointing at, which
+    includes one that is OLDER than the copy running (see
+    `durable_is_current`)."""
+    venv = durable_venv()
+    if venv is None or not durable_is_current():
+        return None
+    return _venv_site_packages(venv)
+
+
+def durable_python(*, windowless: bool = False) -> "str | None":
+    """The DURABLE venv's interpreter — what the service manager should exec.
+
+    Pinning `sys.executable` is half the stale-launcher bug: under `pipx run` that
+    interpreter is inside the evictable cache too, so an evicted cache leaves the
+    LaunchAgent/unit/task exec'ing a path that no longer exists and the bridge
+    simply never comes back.
+
+    Held to the same currency rule as `durable_agent_dir`, and that pairing is
+    the point: an interpreter from one build with another build's site-packages
+    injected ahead of it is a combination nobody tests."""
+    venv = durable_venv()
+    if venv is None or not durable_is_current():
+        return None
+    names = (["pythonw.exe", "python.exe"] if windowless else ["python.exe"]) \
+        if is_windows() else ["python3", "python"]
+    sub = "Scripts" if is_windows() else "bin"
+    for n in names:
+        cand = venv / sub / n
+        if cand.exists():
+            return str(cand)
+    return None
+
+
 # ── shared launcher (every OS runs this) ─────────────────────────────────────
 
 def agent_dir() -> Path:
     """The dir that contains the ``facade`` package (so ``import facade`` works
-    even when the service launches with a cwd like C:\\Windows\\System32 or /)."""
-    return Path(__file__).resolve().parent.parent
+    even when the service launches with a cwd like C:\\Windows\\System32 or /).
+
+    Prefers the DURABLE install whenever the copy we are running from is one pipx
+    will evict. Running from a source checkout or from the durable venv itself
+    returns that, unchanged — the redirect is scoped to the cache case."""
+    here = Path(__file__).resolve().parent.parent
+    if not is_ephemeral(here):
+        return here
+    return durable_agent_dir() or here
+
+
+def pin_target_is_durable() -> bool:
+    """Whether a pin written right now would survive a pipx cache eviction —
+    i.e. `agent_dir()` resolved to something outside the run cache."""
+    return not is_ephemeral(agent_dir())
 
 
 def pythonw_exe() -> str:
     """No-console interpreter (pythonw.exe) sibling of the current interpreter on
     Windows; sys.executable elsewhere (POSIX has no windowless variant — the
-    service manager detaches it)."""
+    service manager detaches it). Resolves the DURABLE venv's interpreter first
+    when we're running out of pipx's evictable run cache."""
+    if is_ephemeral(Path(sys.executable)):
+        if dur := durable_python(windowless=True):
+            return dur
     cur = Path(sys.executable)
     if cur.name.lower() == "python.exe":
         sib = cur.parent / "pythonw.exe"
         if sib.exists():
             return str(sib)
     return str(cur)
+
+
+def service_python() -> str:
+    """The interpreter a Linux/macOS service unit should exec. Same durability
+    rule as `pythonw_exe`, without the Windows windowless dance."""
+    if is_ephemeral(Path(sys.executable)):
+        if dur := durable_python():
+            return dur
+    return sys.executable
 
 
 def launcher_path() -> Path:
@@ -105,8 +430,26 @@ def launcher_source(agentdir: Path | None = None) -> str:
 
 
 def write_launcher(agentdir: Path | None = None) -> Path:
-    """Write (refresh) the launcher script; return its path."""
+    """Write (refresh) the launcher script; return its path.
+
+    Declines to overwrite an existing launcher with an evictable path. The guard
+    lives HERE rather than at the call sites because the call sites are exactly
+    where it gets missed: `_win_restart` checked before its own refresh and then
+    fell through to `_win_start`, whose first act is an unconditional
+    `write_launcher()` — so the path the guard exists to keep out got written by
+    the fallback of the function that guarded against it. `_write_systemd_unit`
+    and `_darwin_install` had the same shape. One check on the writer covers all
+    four, and an explicit ``agentdir`` still wins (callers that pass one have
+    already decided what they are pinning).
+
+    Writing the FIRST launcher is still allowed even when only a cache path is
+    available: something that works until eviction beats nothing at all, and
+    `install()` separately refuses to pin it, so this cannot quietly become the
+    login configuration."""
     p = launcher_path()
+    if agentdir is None and p.exists() and not pin_target_is_durable():
+        log.debug("keeping the existing launcher: nothing durable to point it at")
+        return p
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(launcher_source(agentdir), encoding="utf-8")
     return p
@@ -272,6 +615,14 @@ def _win_restart(task_name: str = TASK_NAME) -> tuple[bool, str]:
     # Refresh the launcher BEFORE stopping anything: the agent dir moves on a pipx
     # upgrade, which is precisely when a restart gets called, and doing it here
     # means an unwritable store dir aborts with the old bridge still serving.
+    #
+    # …but only when the refresh would be an improvement. Invoked as `pipx run
+    # superresearch-agent restart` with no durable install to resolve, this would
+    # overwrite a perfectly good pin with cache paths — turning a working login
+    # launcher into one that rots. Leaving the existing pin alone is strictly
+    # better: the restart below still cycles the bridge. That decision now lives
+    # inside `write_launcher`, so the `_win_start` fallback further down honours
+    # it too — it used to write the cache path this branch had just refused.
     try:
         write_launcher()
     except OSError as e:
@@ -337,7 +688,7 @@ def systemd_unit_source(exe: str | None = None, launcher: Path | None = None) ->
     host puts the runtime dir elsewhere, the escape degrades to a plain detached
     child rather than failing (see the isdir guard in _cgroup_escape_prefix).
     """
-    e = exe or sys.executable
+    e = exe or service_python()
     p = str(launcher or launcher_path())
     return (
         "[Unit]\n"
@@ -416,7 +767,7 @@ def _xml_escape(s: str) -> str:
 
 
 def launchd_plist_source(exe: str | None = None, launcher: Path | None = None) -> str:
-    e = _xml_escape(exe or sys.executable)
+    e = _xml_escape(exe or service_python())
     p = _xml_escape(str(launcher or launcher_path()))
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -498,9 +849,23 @@ def kind_label() -> str:
     return "service"
 
 
+_EPHEMERAL_REFUSAL = (
+    "the running copy is in pipx's evictable run cache and there is no durable "
+    "install to pin to — install it first: pipx install " + PKG_NAME
+)
+
+
 def install(task_name: str = TASK_NAME) -> tuple[bool, str]:
     """Pin the bridge to start on login — Windows Scheduled Task / Linux systemd
-    --user / macOS launchd. (``task_name`` only affects the Windows task name.)"""
+    --user / macOS launchd. (``task_name`` only affects the Windows task name.)
+
+    REFUSES when the only paths available are inside pipx's run cache. A pin
+    written there reports success, works until the cache is evicted, and then
+    resurrects an old bridge or none at all — a failure that surfaces weeks later
+    on a reboot, with nothing on screen tying it back to this moment. Refusing
+    here is the whole point of the check: the caller installs durably and retries."""
+    if not pin_target_is_durable():
+        return False, _EPHEMERAL_REFUSAL
     if is_windows():
         write_launcher()
         return _exec(install_argv(task_name))

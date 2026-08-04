@@ -250,6 +250,13 @@ def _win_env(monkeypatch, *, healthz, run_ok=True, start_ok=True):
     schtasks argv list plus a dict of what else was called."""
     monkeypatch.setattr(autostart, "is_installed", lambda task_name=autostart.TASK_NAME: True)
     monkeypatch.setattr(autostart.sys, "platform", "win32")
+    # The restart now checks whether the pin it would refresh is DURABLE. That probe
+    # shells out to pipx, which is neither what these tests are about nor safe here:
+    # `sys.platform` is faked to win32 on a real POSIX box, so anything reaching
+    # `shutil.which` takes the win32 branch and dies in `_winapi`. Answering "a
+    # normal install" keeps the refresh behaviour these tests pin. The durability
+    # check itself is covered in test_durable_install.py.
+    monkeypatch.setattr(autostart, "pin_target_is_durable", lambda: True)
     seen = {"shutdown": 0, "start": 0, "launcher": 0, "launcher_before_run": None}
     calls = []
 

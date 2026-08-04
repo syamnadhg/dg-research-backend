@@ -8,16 +8,16 @@ version only, never by index URL, so an internal mirror keeps working.
 Which calls take the floor is not uniform, and the asymmetry is the whole point of
 this file. Measured against pipx 1.16.3:
 
-  * `pipx upgrade` must NOT take it. pipx silently DISCARDS a constraint passed to
-    `upgrade`: `pipx upgrade 'pkg>=0.1.31'` exits 0 reporting "already at latest
-    version 0.1.30". A floor there reads as protection and provides none. It needs
-    none either — `pip install --upgrade` against an index whose newest release is
-    older than the installed one reports "Requirement already satisfied" and leaves
-    the newer build in place.
-  * `pipx install --force` and `pipx run` MUST take it. Both are fresh resolves
-    (--force recreates the venv, run builds an ephemeral one), and a fresh install
-    from that same older-only index gets the OLDER version — there is no prior
-    version for it to be protected by.
+  * The agent's replacement `pipx install` and the ephemeral `pipx run` MUST take
+    it. Both are fresh resolves — the update now REMOVES the old venv before
+    installing, and run builds a throwaway one — so neither has a prior version to
+    be protected by, and each would happily install whatever an older-only index
+    calls latest. (`pipx upgrade` used to be the first attempt and deliberately
+    carried no floor, because pipx silently DISCARDS a constraint passed to it. It
+    is gone: an in-place upgrade layers over the old venv.)
+  * The ROLLBACK install takes `==<prev>`, not the floor. It is a return to a known
+    build, and `>=prev` would re-resolve straight back to the release that just
+    failed.
   * `pipx install <backend>` must not take it: a first install of a different
     package onto a host that has none has no prior version to walk backwards from.
 
@@ -153,20 +153,123 @@ def test_the_preflight_and_the_waiter_resolve_the_same_spec(floored, tmp_path, m
         "the waiter still needs the BARE package name as the venv/app identity; "
         "the spec is carried separately"
     )
+    # The rollback target. Resolved HERE for the same reason the spec is — the
+    # waiter is stdlib-only and cannot import __version__ from the package it is
+    # about to delete, and reading it afterwards would compare the new build
+    # against itself. Without it a failed clean install has nothing to restore,
+    # which is the whole safety argument for removing the old venv first.
+    assert cfg["prev"] == FLOOR_VERSION, (
+        f"the waiter cannot roll back — no previous version was carried: {cfg!r}"
+    )
 
 
 # ── the waiter, executed for real ─────────────────────────────────────────────
 
+# The fake MODELS pipx; it does not merely log it. That matters because the defect
+# this file now has to catch is one only a modelled pipx can express: a plain
+# `pipx install` over a venv that still exists prints "already seems to be
+# installed" and EXITS 0. A double that returns a scripted code and touches no
+# state cannot tell that apart from a real install — which is how the old "a failed
+# uninstall is followed by a forced install" test passed while asserting a recovery
+# real pipx could never reach.
+#
+# Behaviour taken from pipx 1.16.5, measured (scratchpad review notes):
+#   environment --value X   -> the venvs root
+#   install <req>           -> venv exists: rc 0 and NOTHING changes; else install
+#   install --force <req>   -> (re)install in place, restoring a missing script
+#   uninstall <pkg>         -> remove the venv tree
+#   list --json             -> the version actually on disk
+#   run …                   -> exit code only
+# `FAKE_PIPX_LIES` names subcommands that exit 0 and change nothing — the shape of
+# every "pipx said it worked" defect in this file, expressed once.
+#
+# `FAKE_RC_<SUB>` still forces a failure, and a forced failure leaves the disk
+# alone — which is also what real pipx does, since it refuses to remove a venv it
+# did not create in the same session. It may be a COMMA-SEPARATED sequence consumed
+# one entry per call of that subcommand (the last entry repeats), because a run can
+# issue several `install` calls with opposite intent — the replacement, the retry
+# after a removal, and the rollback — and a single rc for all three cannot tell
+# "the replacement worked" from "the rollback rescued us".
 _FAKE_PIPX = r'''
-import json, os, sys
+import json, os, shutil, sys
+from pathlib import Path
 argv = sys.argv[1:]
-with open(os.environ["FAKE_PIPX_LOG"], "a", encoding="utf-8") as fh:
+log = os.environ["FAKE_PIPX_LOG"]
+venvs = Path(os.environ["FAKE_PIPX_VENVS"])
+pkg = os.environ["FAKE_PIPX_PKG"]
+with open(log, "a", encoding="utf-8") as fh:
     fh.write(json.dumps(argv) + "\n")
+
+venv = venvs / pkg
+rel = ("Scripts", pkg + ".exe") if sys.platform == "win32" else ("bin", pkg)
+entry = venv.joinpath(*rel)
+marker = venv / "INSTALLED_VERSION"
+
+def satisfies(latest, req):
+    """Whether this fake index's `latest` satisfies a `>=` requirement."""
+    if ">=" not in req:
+        return True
+    floor = req.split(">=", 1)[1].strip()
+    def t(v):
+        out = []
+        for chunk in (v or "").split("."):
+            d = ""
+            for ch in chunk:
+                if not ch.isdigit():
+                    break
+                d += ch
+            out.append(int(d or 0))
+        return tuple(out)
+    n = max(len(t(latest)), len(t(floor)))
+    return t(latest) + (0,) * (n - len(t(latest))) >= t(floor) + (0,) * (n - len(t(floor)))
+def wanted(req):
+    """What the index would resolve `req` to. `==X` is exact; anything else takes
+    whatever this fake index calls latest."""
+    if "==" in req:
+        return req.split("==", 1)[1].strip()
+    return os.environ.get("FAKE_PIPX_LATEST", "")
+
+def place(req):
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    entry.write_text("", encoding="utf-8")
+    entry.chmod(0o755)
+    marker.write_text(wanted(req), encoding="utf-8")
+
 if argv[:1] == ["environment"]:
-    sys.stdout.write(os.environ.get("FAKE_PIPX_VENVS", ""))
+    sys.stdout.write(str(venvs))
     sys.exit(0)
-sub = argv[0] if argv else ""
-sys.exit(int(os.environ.get("FAKE_RC_" + sub.upper(), "0")))
+sub = (argv[0] if argv else "").upper()
+seen = 0
+with open(log, encoding="utf-8") as fh:
+    for line in fh:
+        prior = json.loads(line)
+        if prior[:1] and prior[0].upper() == sub:
+            seen += 1
+seen -= 1  # our own line is already in the log
+codes = [c for c in os.environ.get("FAKE_RC_" + sub, "0").split(",") if c != ""]
+rc = int(codes[min(seen, len(codes) - 1)]) if codes else 0
+# A resolver REFUSES a requirement it cannot satisfy. Without this the double
+# would install a build below the floor and exit 0 — a resolve real pipx cannot
+# perform, so any test built on it would be testing the double. Skipped when the
+# index is deliberately modelled as broken.
+if rc == 0 and sub in ("INSTALL", "RUN") and not os.environ.get("FAKE_PIPX_DOWNGRADES"):
+    if not satisfies(wanted(argv[-1]), argv[-1]):
+        sys.stderr.write("ERROR: No matching distribution found\n")
+        sys.exit(1)
+lies = os.environ.get("FAKE_PIPX_LIES", "").upper().split(",")
+if rc == 0 and sub not in lies:
+    if sub == "INSTALL":
+        if "--force" in argv or not venv.is_dir():
+            place(argv[-1])
+        # else: the real no-op — "already seems to be installed", exit 0.
+    elif sub == "UNINSTALL":
+        shutil.rmtree(venv, ignore_errors=True)
+if sub == "LIST":
+    ver = marker.read_text(encoding="utf-8").strip() if marker.exists() else ""
+    body = {"venvs": {pkg: {"metadata": {"main_package": {"package_version": ver}}}}} \
+        if ver else {"venvs": {}}
+    sys.stdout.write(json.dumps(body))
+sys.exit(rc)
 '''
 
 
@@ -178,22 +281,42 @@ def _dead_pid() -> int:
     return p.pid
 
 
-def _run_waiter(tmp_path, *, rcs: dict, make_entry: bool) -> list:
-    """Execute `_RECONNECT_WAITER` against a fake pipx; return the argv it built.
+def _venv_paths(tmp_path):
+    venvs = tmp_path / "venvs"
+    pkg = selfupdate.AGENT_PKG
+    rel = ("Scripts", pkg + ".exe") if sys.platform == "win32" else ("bin", pkg)
+    return venvs, venvs.joinpath(pkg, *rel), venvs / pkg / "INSTALLED_VERSION"
 
-    `make_entry` controls whether the persistent console script exists, which is
-    what decides between the entry path and the ephemeral `pipx run` fallback.
+
+def _run_waiter(tmp_path, *, rcs: dict, make_entry: bool = False, prev: str = "1.2.3",
+                latest: str = FLOOR_VERSION, installed: str | None = None,
+                venv_only: bool = False, lies: str = "",
+                downgrades: bool = False) -> list:
+    """Execute `_RECONNECT_WAITER` against the modelled pipx; return its argv log.
+
+    `make_entry` seeds a durable install that already exists — the console script
+    plus the version marker `pipx list` reads back. `installed` overrides which
+    version that pre-existing install is (default: `prev`, i.e. the build we are
+    running). `venv_only` seeds the venv DIRECTORY without the console script,
+    which is the half-broken state a part-way uninstall leaves behind.
+
+    `latest` is what this fake index resolves the floored spec to. Setting it
+    BELOW the floor models an index that answers with a stale build — the case an
+    exit code cannot see and the post-condition can.
+
+    `rcs` maps a pipx subcommand to the exit code the fake should return, so a
+    test can fail exactly one leg.
     """
     fake = tmp_path / "fakepipx.py"
     fake.write_text(_FAKE_PIPX, encoding="utf-8")
     log = tmp_path / "pipx-argv.jsonl"
-    venvs = tmp_path / "venvs"
-
+    venvs, entry, marker = _venv_paths(tmp_path)
     pkg = selfupdate.AGENT_PKG
-    rel = ("Scripts", pkg + ".exe") if sys.platform == "win32" else ("bin", pkg)
-    entry = venvs.joinpath(pkg, *rel)
-    if make_entry:
+
+    if make_entry or venv_only:
         entry.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(installed or prev, encoding="utf-8")
+    if make_entry:
         entry.write_text("", encoding="utf-8")
         entry.chmod(0o755)
 
@@ -201,11 +324,14 @@ def _run_waiter(tmp_path, *, rcs: dict, make_entry: bool) -> list:
         "pipx": [sys.executable, str(fake)],
         "pkg": pkg,
         "spec": EXPECTED_SPEC,
+        "prev": prev,
         "connect_args": ["connect", "--yes", "--no-login"],
         "restart_args": [],
         "log": str(tmp_path / "self-update.log"),
     })
-    env = {**os.environ, "FAKE_PIPX_LOG": str(log), "FAKE_PIPX_VENVS": str(venvs)}
+    env = {**os.environ, "FAKE_PIPX_LOG": str(log), "FAKE_PIPX_VENVS": str(venvs),
+           "FAKE_PIPX_PKG": pkg, "FAKE_PIPX_LATEST": latest, "FAKE_PIPX_LIES": lies,
+           "FAKE_PIPX_DOWNGRADES": "1" if downgrades else ""}
     for sub, rc in rcs.items():
         env["FAKE_RC_" + sub.upper()] = str(rc)
 
@@ -219,37 +345,207 @@ def _run_waiter(tmp_path, *, rcs: dict, make_entry: bool) -> list:
         if log.exists() else []
 
 
-def test_the_waiter_never_floors_upgrade(tmp_path):
-    """Passing the floor here would be silently discarded by pipx — protection that
-    looks real in a diff and does nothing on the host."""
-    calls = _run_waiter(tmp_path, rcs={"upgrade": 0}, make_entry=True)
-    upgrades = [c for c in calls if c[:1] == ["upgrade"]]
-    assert upgrades, f"the waiter never tried `pipx upgrade`: {calls!r}"
-    for argv in upgrades:
-        assert argv == ["upgrade", selfupdate.AGENT_PKG], (
-            f"`pipx upgrade` carries a version constraint pipx will drop: {argv!r}"
-        )
+def _connect_runs(calls: list) -> list:
+    """The ephemeral CONNECT fallback only. The fetchability probe issues a `run`
+    too (`… --version`), so a bare "was there a run?" no longer distinguishes
+    them — and conflating the two would make the fallback assertions pass on the
+    probe."""
+    return [c for c in calls if c[:1] == ["run"] and "connect" in c]
 
 
-def test_the_waiter_floors_the_force_install(tmp_path):
-    """--force RECREATES the venv, so it is a fresh resolve with no prior version to
-    protect. This is the call the floor exists for."""
-    calls = _run_waiter(tmp_path, rcs={"upgrade": 1, "install": 0}, make_entry=True)
+def test_the_waiter_replaces_the_install_rather_than_layering(tmp_path):
+    """"Update" has to mean the same thing as "install".
+
+    An in-place `pipx upgrade` LAYERS the new distribution over the old venv, so a
+    module the release deleted stays importable and a half-written venv stays
+    half-written. `install --force` does not: it reinstalls the distribution and
+    its dependencies, restoring even a missing console script."""
+    calls = _run_waiter(tmp_path, rcs={"install": 0}, make_entry=True)
+    subs = [c[0] for c in calls if c[:1] != ["environment"]]
+    assert "upgrade" not in subs, f"an in-place upgrade layers over the old venv: {calls!r}"
+    _, _, marker = _venv_paths(tmp_path)
+    assert marker.read_text(encoding="utf-8").strip() == FLOOR_VERSION, (
+        f"the version on disk never moved: {calls!r}"
+    )
+
+
+def test_the_healthy_path_never_deletes_the_install(tmp_path):
+    """Uninstall-first is the destructive order and the ONLY one that can leave a
+    host with no agent, so it must not be on the path every update takes.
+    Measured: `install --force` reinstalls in place, and pipx refuses to remove a
+    venv it did not create in the same session — so a failure there leaves the
+    previous agent installed and working."""
+    calls = _run_waiter(tmp_path, rcs={"install": 0}, make_entry=True)
+    assert not [c for c in calls if c[:1] == ["uninstall"]], (
+        f"a healthy update tore the install down first: {calls!r}"
+    )
+
+
+def test_the_waiter_floors_the_replacement_install(tmp_path):
+    """A forced install is a FRESH resolve with no prior version to be protected
+    by, so it is exactly the call the floor exists for (DGOPS-9507)."""
+    calls = _run_waiter(tmp_path, rcs={"install": 0}, make_entry=True)
     installs = [c for c in calls if c[:1] == ["install"]]
-    assert installs, (
-        f"`pipx upgrade` failed but the --force fallback never ran: {calls!r}"
-    )
+    assert installs, f"the replacement install never ran: {calls!r}"
     assert installs[0] == ["install", "--force", EXPECTED_SPEC], (
-        f"the --force install resolves unfloored: {installs[0]!r}"
+        f"the replacement install is not the floored forced install: {installs[0]!r}"
     )
+
+
+def test_an_install_that_exits_0_and_leaves_nothing_is_not_a_success(tmp_path):
+    """The defect at the centre of this rewrite.
+
+    pipx exits 0 for things that changed nothing — measured: a plain install over
+    an existing venv prints "already seems to be installed" and returns 0, and it
+    does so even when that venv has no console script left in it. So an exit code
+    was never evidence that anything happened. Here the install claims success and
+    leaves the half-broken venv exactly as it found it; the waiter must read the
+    disk back, refuse to call it a success, and both attempt the recovery and put
+    chat back up. Before the post-condition it logged "upgrade ok" and reconnected
+    from an install that does not exist."""
+    calls = _run_waiter(tmp_path, rcs={"install": 0}, venv_only=True,
+                        prev="1.2.3", lies="install")
+    assert [c for c in calls if c[:1] == ["uninstall"]], (
+        f"it accepted an install that changed nothing: {calls!r}"
+    )
+    assert _connect_runs(calls), (
+        f"nothing usable was installed, yet chat was never brought back: {calls!r}"
+    )
+
+
+def test_an_index_that_answers_below_the_floor_is_not_a_success(tmp_path):
+    """The other half of the post-condition, and it is DEFENCE, not a live bug.
+
+    A resolver honouring `>=<the version we are running>` cannot hand back
+    anything older, so this needs an index modelled as broken — a mirror that
+    ignores the constraint. That is the whole reason the check reads the disk
+    instead of the exit code: a tool reporting success for something it did not do
+    is not hypothetical here, it is measured behaviour of the adjacent form of the
+    same command. `downgrades=True` says out loud that the scenario needs a pipx
+    misbehaving, rather than hiding it in a double that quietly ignores its
+    arguments."""
+    calls = _run_waiter(tmp_path, rcs={"install": 0}, make_entry=True,
+                        prev="1.2.3", latest="1.0.0", downgrades=True)
+    assert [c for c in calls if c[:1] == ["list"]], (
+        f"nothing ever read back which version landed: {calls!r}"
+    )
+    assert [c for c in calls if c[:1] == ["uninstall"]], (
+        f"it accepted an install that moved the host backwards: {calls!r}"
+    )
+
+
+def test_reinstalling_the_same_version_is_still_a_success(tmp_path):
+    """Guard against the guard: the floor is `>=`, deliberately — repairing a
+    half-broken venv means installing the version already recorded, and demanding
+    a strictly higher number would make every repair report as a failure.
+
+    Both numbers are the FLOOR here, which is what production looks like: the
+    spec is `pkg>=<the version we are running>` and `prev` is that same version.
+    The harness defaults them apart only so a rollback is identifiable in the
+    argv log."""
+    calls = _run_waiter(tmp_path, rcs={"install": 0}, make_entry=True,
+                        prev=FLOOR_VERSION, latest=FLOOR_VERSION)
+    assert not [c for c in calls if c[:1] == ["uninstall"]], (
+        f"a legitimate same-version repair was treated as a failure: {calls!r}"
+    )
+
+
+def test_the_post_condition_does_not_claim_to_detect_a_stalled_upgrade(tmp_path):
+    """State the LIMIT, so nobody builds on a guarantee that isn't there.
+
+    The waiter is told `>=<the version we are running>` and never the target
+    number — nobody knows it until the index is asked — so "the same version is
+    still installed" and "a repair reinstalled the same version" are the same
+    observation, and it must accept both. Detecting a stalled upgrade needs the
+    version the app compared against, which is the backend's job (it holds the
+    before/after pair) and is covered on that side."""
+    calls = _run_waiter(tmp_path, rcs={"install": 0}, make_entry=True,
+                        prev="1.2.3", lies="install")
+    assert not [c for c in calls if c[:1] == ["uninstall"]], (
+        f"the waiter invented a verdict it has no way to reach: {calls!r}"
+    )
+
+
+def test_a_half_broken_venv_is_repaired(tmp_path):
+    """A venv whose console script is gone — an earlier uninstall that hit a
+    locked file part-way — is still in pipx's way: a plain install no-ops on it
+    and rc 0 comes back anyway. Deciding "is one installed" from the SCRIPT meant
+    this host got no uninstall, no forced install and no rollback, and stayed
+    wedged forever. The forced install repairs it outright."""
+    _, entry, _ = _venv_paths(tmp_path)
+    calls = _run_waiter(tmp_path, rcs={"install": 0}, venv_only=True)
+    assert entry.exists(), f"the script-less venv was never repaired: {calls!r}"
+    assert not _connect_runs(calls), (
+        f"it fell back to an ephemeral run with a repaired install present: {calls!r}"
+    )
+
+
+def test_the_plain_install_is_only_issued_once_the_venv_is_gone(tmp_path):
+    """A plain `pipx install` over a venv that still exists is a no-op that
+    reports success, so it is only ever meaningful after a REMOVAL succeeded.
+    Here the uninstall fails, and the plain form must not be reached — reaching it
+    would produce exactly the false "upgrade ok" this file exists to prevent."""
+    calls = _run_waiter(tmp_path, rcs={"install": 1, "uninstall": 1}, make_entry=True)
+    assert not [c for c in calls if c[:1] == ["install"] and "--force" not in c], (
+        f"issued a plain install over a venv that is still there: {calls!r}"
+    )
+
+
+def test_the_destructive_order_is_gated_on_the_replacement_being_fetchable(tmp_path):
+    """Deleting the working install and then discovering the index is unreachable
+    is the one failure with no way back — the rollback needs the same network the
+    install just failed on. So the removal is not attempted until a real fetch of
+    the replacement has succeeded."""
+    calls = _run_waiter(tmp_path, rcs={"install": 1, "run": 1}, make_entry=True)
+    assert not [c for c in calls if c[:1] == ["uninstall"]], (
+        f"tore down the install with no way to replace it: {calls!r}"
+    )
+    _, entry, _ = _venv_paths(tmp_path)
+    assert entry.exists(), "the previous agent was destroyed by a failed update"
+
+
+def test_a_first_install_removes_nothing(tmp_path):
+    """With no durable venv there is nothing to remove, and issuing `uninstall`
+    anyway would make every fresh install log a spurious failure."""
+    calls = _run_waiter(tmp_path, rcs={"install": 0}, make_entry=False)
+    assert not [c for c in calls if c[:1] == ["uninstall"]], (
+        f"uninstalled a package that was never installed: {calls!r}"
+    )
+
+
+def test_a_failed_replacement_restores_the_version_we_were_running(tmp_path):
+    """The reason the destructive branch is survivable. Without this the host is
+    left with NO agent once a removal succeeds and the install after it does not.
+
+    Pinned with `==`: this is a rollback to a known build, not an update, and
+    `>=prev` would re-resolve to the very release that just failed to install."""
+    calls = _run_waiter(tmp_path, rcs={"install": "1,1,0"}, make_entry=True, prev="1.2.3")
+    installs = [c for c in calls if c[:1] == ["install"]]
+    assert installs[-1] == ["install", "--force", f"{selfupdate.AGENT_PKG}==1.2.3"], (
+        f"the restore is not pinned to the version we were running: {installs!r}"
+    )
+    _, entry, marker = _venv_paths(tmp_path)
+    assert entry.exists() and marker.read_text(encoding="utf-8").strip() == "1.2.3", (
+        f"the rollback did not actually put the old build back: {calls!r}"
+    )
+
+
+def test_a_rollback_only_ever_targets_the_version_we_were_running(tmp_path):
+    """`prev` is the build this host is executing right now, so restoring it can
+    never introduce something it has not run. With no `prev` in the cfg — which is
+    what an older build writes — there is nothing honest to fall back to, and
+    guessing would install a version nobody asked for."""
+    calls = _run_waiter(tmp_path, rcs={"install": 1}, make_entry=False, prev="")
+    installs = [c for c in calls if c[:1] == ["install"]]
+    assert len(installs) == 1, f"restored a version it was never told about: {calls!r}"
 
 
 def test_the_waiter_ephemeral_fallback_carries_the_floor_in_spec(tmp_path):
     """The last-resort path fetches AND executes in one step, so there is no
     after-fetch gap to verify in — the floor at resolve time is the only guard
     available here."""
-    calls = _run_waiter(tmp_path, rcs={"upgrade": 1, "install": 1}, make_entry=False)
-    runs = [c for c in calls if c[:1] == ["run"]]
+    calls = _run_waiter(tmp_path, rcs={"install": 1}, make_entry=False)
+    runs = _connect_runs(calls)
     assert runs, f"both upgrades failed but the ephemeral fallback never ran: {calls!r}"
     argv = runs[0]
     assert "--spec" in argv, f"the ephemeral fallback resolves unfloored: {argv!r}"
@@ -268,8 +564,8 @@ def test_the_waiter_skips_the_fallback_once_the_persistent_entry_resolves(tmp_pa
     """Guard against the guard: if `make_entry=True` did not actually change the
     waiter's branch, the fallback test above would be asserting on the only path
     the waiter ever takes and would pass for the wrong reason."""
-    calls = _run_waiter(tmp_path, rcs={"upgrade": 0}, make_entry=True)
-    assert not [c for c in calls if c[:1] == ["run"]], (
+    calls = _run_waiter(tmp_path, rcs={"install": 0}, make_entry=True)
+    assert not _connect_runs(calls), (
         f"the persistent entry resolved yet the ephemeral fallback still ran: {calls!r}"
     )
 
@@ -331,4 +627,35 @@ def test_the_floor_is_resolved_before_the_upgrade_not_after(floored, tmp_path, m
     assert "__version__" not in selfupdate._RECONNECT_WAITER, (
         "the waiter must not derive the floor itself — it is stdlib-only and cannot "
         "import from the package it is replacing"
+    )
+
+
+def test_a_restored_install_is_what_the_waiter_reconnects_from(tmp_path):
+    """A rollback that worked leaves a perfectly good durable install on disk.
+
+    Resolving the entry point only on SUCCESS threw that away and sent the waiter
+    to the ephemeral fallback — which resolves the floored spec straight back to
+    the release that just refused to install. If that release is the problem (a
+    broken wheel, a yanked version), the fallback fails too and the host has no
+    bridge, with a working install sitting right there. Reconnecting from the
+    restored build is the entire point of restoring it.
+
+    Only a pipx double that MODELS the venv can prove this: with one that merely
+    logs argv, the seeded console script survives every scripted failure, so the
+    entry resolves whether the rollback worked or not and the test cannot fail."""
+    calls = _run_waiter(tmp_path, rcs={"install": "1,1,0"}, make_entry=True, prev="1.2.3")
+    installs = [c for c in calls if c[:1] == ["install"]]
+    assert len(installs) >= 2, f"the rollback never ran: {calls!r}"
+    assert not _connect_runs(calls), (
+        f"it fell back to an ephemeral run with a durable install available: {calls!r}"
+    )
+
+
+def test_a_rollback_that_failed_does_send_it_to_the_fallback(tmp_path):
+    """Guard against the guard for the test above: if the modelled uninstall did
+    not really delete the entry, that test would be asserting on a durable install
+    nothing had touched."""
+    calls = _run_waiter(tmp_path, rcs={"install": 1}, make_entry=True, prev="1.2.3")
+    assert _connect_runs(calls), (
+        f"nothing durable survived, yet chat was never brought back up: {calls!r}"
     )

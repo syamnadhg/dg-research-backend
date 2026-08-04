@@ -7,20 +7,22 @@ Two pieces:
   • version notice — a pip-style "a newer AGENT is on PyPI" nudge, cached 24h so
     it costs at most one short network call per day and can never block or break a
     command. (`latest_on_pypi` is generic and still used for backend INSTALL.)
-  • a detached reconnect — "update the agent" upgrades the PERSISTENT install
-    (`pipx upgrade`, falling back to `pipx install --force`; upgrade is in-place so
-    it works on a uv-backed pipx, which refuses --force's venv recreate) and
-    reconnects from it, ONCE the current bridge process exits (so the new bridge can
-    bind the freed port). The
-    persistent install is what makes updates STICK: the ONLOGON launcher pins
-    sys.path to the interpreter that ran `connect`, and a `pipx run` venv is
-    ephemeral (pipx evicts it), so a launcher pinned there goes stale and a reboot
-    resurrects the OLD bridge (the "said updated but stayed vX / reboot brought the
-    old one back" bug). If the persistent venv can't be resolved it falls back to
-    the ephemeral `pipx run --no-cache` reconnect (`--no-cache` is load-bearing
-    there — `pipx run` reuses its ~14-day cached venv and would re-run the STALE
-    build), so it is never worse than before. Mirrors the backend's proven
-    `_spawn_detached_lifecycle` / `_LIFECYCLE_WAITER` pattern (research.py).
+  • a detached reconnect — "update the agent" REPLACES the persistent install
+    (remove the old venv, then install the new one cleanly, restoring the previous
+    version if the install fails) and reconnects from it, ONCE the current bridge
+    process exits (so the new bridge can bind the freed port). The persistent
+    install is what makes updates STICK: the ONLOGON launcher pins sys.path and the
+    interpreter to wherever the code that ran `connect` lived, and a `pipx run` venv
+    is ephemeral (pipx evicts it), so a launcher pinned there goes stale and a
+    reboot resurrects the OLD bridge — or, after eviction, nothing at all (the
+    "said updated but stayed vX / reboot brought the old one back" bug). Two things
+    stop that now: `ensure_durable_install` puts a real install on the machine
+    BEFORE anything is pinned, and `autostart.install` refuses to write a pin whose
+    paths sit in the cache. If the persistent venv still can't be resolved the
+    ephemeral `pipx run --no-cache` reconnect keeps chat alive (`--no-cache` is
+    load-bearing there — `pipx run` reuses its ~14-day cached venv and would re-run
+    the STALE build). Mirrors the backend's proven `_spawn_detached_lifecycle` /
+    `_LIFECYCLE_WAITER` pattern (research.py).
 
 SUPPLY CHAIN (DGOPS-9507): the install invocations below fetch code from the
 configured index that then EXECUTES on the host, and `POST /agent-install` reaches
@@ -46,7 +48,7 @@ from pathlib import Path
 
 from . import __version__, autostart, config, prefs
 
-AGENT_PKG = "superresearch-agent"
+AGENT_PKG = autostart.PKG_NAME   # single definition; autostart owns it (see there)
 BACKEND_PKG = "superresearch"
 _CACHE_TTL = 86400  # 24h — one PyPI call per package per day at most
 _PYPI = "https://pypi.org/pypi/{pkg}/json"
@@ -169,13 +171,15 @@ def agent_update_available(*, force: bool = False) -> "str | None":
 # Mirrors research.py's _LIFECYCLE_WAITER so the freed loopback port lets the NEW
 # bridge bind.
 #
-# Why upgrade a persistent install (not just `pipx run`): the ONLOGON launcher
-# (autostart.py) pins sys.path to the dir of whatever interpreter ran `connect`.
-# A `pipx run` venv is EPHEMERAL — pipx evicts it — so a launcher pinned there
-# goes stale and a reboot resurrects the OLD bridge (the "still v0.1.25 after
-# update / reboot brought the old one back" bug). `pipx install --force` pins the
-# launcher to a DURABLE venv. If that can't be resolved we fall back to the
-# original ephemeral `pipx run --no-cache` path, so this is never worse than before.
+# Why replace a persistent install (not just `pipx run`): the ONLOGON launcher
+# (autostart.py) pins sys.path AND the interpreter to wherever the code that ran
+# `connect` lived. A `pipx run` venv is EPHEMERAL — pipx evicts it — so a launcher
+# pinned there goes stale and a reboot resurrects the OLD bridge, or after the
+# eviction nothing at all (the "still v0.1.25 after update / reboot brought the old
+# one back" bug). A clean `pipx install` gives the launcher a DURABLE venv. If that
+# can't be resolved we fall back to the ephemeral `pipx run --no-cache` path, which
+# keeps chat alive — and autostart refuses to PIN to it, so the fallback can no
+# longer bake the cache into the login launcher.
 _RECONNECT_WAITER = r'''
 import os, sys, time, json, subprocess
 from pathlib import Path
@@ -187,6 +191,11 @@ restart_args = cfg.get("restart_args") or []
 # calls take the spec. Falls back to the bare name so a cfg written by an older
 # build can still drive this waiter.
 spec = cfg.get("spec") or pkg
+# The version we are running: both the floor a successful install has to clear
+# and the build a failed one rolls back to. One value, because it is one fact.
+# Absent in a cfg written by an older build, in which case the floor check
+# abstains rather than inventing a verdict.
+floor = (cfg.get("prev") or "").strip()
 # Heartbeat straight INTO the log file, not via stdout. Under the cgroup escape
 # systemd-run diverts stdout to the journal, so a print would leave self-update.log
 # empty — indistinguishable from "the waiter never started", which is the one thing
@@ -223,50 +232,151 @@ for _ in range(120):  # wait up to ~60s for the bridge to exit
         break
     time.sleep(0.5)
 time.sleep(2)  # grace for the OS to release the loopback port
-def installed_entry():
-    """Path to the persistently-installed agent console script, or None."""
+def _local_venvs():
+    """pipx's persistent venv root, or None."""
     try:
         r = subprocess.run(pipx + ["environment", "--value", "PIPX_LOCAL_VENVS"],
                            capture_output=True, text=True, timeout=30)
-        venvs = (r.stdout or "").strip()
-        if r.returncode != 0 or not venvs:
-            return None
-        rel = ("Scripts", pkg + ".exe") if sys.platform == "win32" else ("bin", pkg)
-        cand = Path(venvs).joinpath(pkg, *rel)
-        return str(cand) if cand.exists() else None
+        out = (r.stdout or "").strip()
+        return out if (r.returncode == 0 and out) else None
     except Exception:
         return None
-# 1) Upgrade the PERSISTENT install so the launcher pins to a durable venv.
-#    `pipx upgrade` is IN-PLACE (works on a uv-backed pipx — the fix for the live
-#    failure); `pipx install --force` RECREATES the venv, which a uv-backed pipx
-#    refuses ("A virtual environment already exists ... Use --clear"), so it's only a
-#    fallback for a standard pipx. We deliberately do NOT `pipx uninstall` + reinstall
-#    as a further fallback: uninstall would delete the durable venv, and if the
-#    reinstall then fails (a transient PyPI/network blip in this detached window) the
-#    host is left with NO install — worse than keeping the old build. If both attempts
-#    fail, the caller falls through to the NON-destructive `pipx run --no-cache`
-#    reconnect below (durable venv untouched; a later --update retries cleanly).
-#    DGOPS-9507: only the --force attempt is version-floored. `upgrade` takes a
-#    package NAME and pipx silently discards a constraint passed there, so a floor
-#    on it would look like protection and provide none — it needs none anyway,
-#    because pip --upgrade will not install lower than what is already there.
-#    --force RECREATES the venv, making it a fresh resolve with no prior version to
-#    protect, which is exactly what the floor covers. A floor that cannot be
-#    satisfied fails this attempt WITHOUT destroying the durable venv (pipx will
-#    not remove a venv it did not create in this session), so the worst case is the
-#    host staying on the build it already had.
-entry = None
+def installed_entry():
+    """Path to the persistently-installed agent console script, or None."""
+    venvs = _local_venvs()
+    if not venvs:
+        return None
+    rel = ("Scripts", pkg + ".exe") if sys.platform == "win32" else ("bin", pkg)
+    cand = Path(venvs).joinpath(pkg, *rel)
+    return str(cand) if cand.exists() else None
+def venv_present():
+    """Whether pipx's venv DIRECTORY for us exists — a different question from
+    installed_entry(), and the one that decides what pipx will do next.
+
+    A venv whose console script is gone (an earlier uninstall that hit a locked
+    file part-way is the way this happens) is still in pipx's way: a plain
+    install no-ops on it. Deciding "is one installed" from the script therefore
+    skipped the repair on exactly the machines that needed it."""
+    venvs = _local_venvs()
+    return bool(venvs) and Path(venvs).joinpath(pkg).is_dir()
+def installed_version():
+    """The version pipx reports as installed, or None if it can't say."""
+    try:
+        r = subprocess.run(pipx + ["list", "--json"],
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            return None
+        v = json.loads(r.stdout or "{}").get("venvs", {}).get(pkg) or {}
+        return ((v.get("metadata") or {}).get("main_package") or {}).get("package_version")
+    except Exception:
+        return None
+def _ver(v):
+    out = []
+    for chunk in (v or "").split("."):
+        digits = ""
+        for ch in chunk:
+            if not ch.isdigit():
+                break
+            digits += ch
+        out.append(int(digits or 0))
+    return tuple(out)
+def usable_install():
+    """Whether what is on disk NOW is something we would be happy to run.
+
+    This is the post-condition, and it exists because a pipx exit code is not
+    one. Measured against real pipx: `pipx install <spec>` over an existing venv
+    prints "already seems to be installed" and exits 0 — so every "the upgrade
+    succeeded" this waiter has ever logged after a failed uninstall was a plain
+    install that did nothing. Asking the disk instead of the exit code is the
+    difference between reporting an update and performing one.
+
+    Both halves matter: the console script catches the half-broken venv (rc 0,
+    still no script), the version catches an index that answered BELOW the floor.
+    An unreadable version is treated as fine — refusing on it would trigger a
+    destructive repair over a bookkeeping hiccup.
+
+    What it deliberately does NOT claim: that the version moved. The waiter is
+    given `>=<the build we are running>` and never the target number, so "the
+    upgrade stalled" and "a repair reinstalled the same version" are the same
+    observation here and both have to pass. The before/after comparison belongs
+    to the backend, which is the side that holds both numbers."""
+    if installed_entry() is None:
+        return False
+    v = installed_version()
+    return not (v and floor) or _ver(v) >= _ver(floor)
+# 1) Replace the PERSISTENT install. Not `pipx upgrade`: an in-place upgrade
+#    LAYERS the new distribution over the old venv, so a module the release
+#    deleted stays importable and a half-written venv stays half-written.
+#
+#    `pipx install --force` is the primary path, and the reasoning is measured
+#    rather than inherited. Against real pipx 1.16.5:
+#      • a plain `pipx install <spec>` over an existing venv prints "already
+#        seems to be installed" and EXITS 0. It is not a clean install with a
+#        safety catch, it is a no-op that reports success — including over a
+#        venv whose console script is missing, which is the state a half-failed
+#        uninstall leaves behind.
+#      • `--force` reinstalls the distribution and its dependencies in place, so
+#        nothing from the old build survives that pip/uv tracked, and it repairs
+#        the script-less venv the plain form cannot touch.
+#      • and on FAILURE it is the non-destructive one: pipx explicitly refuses to
+#        remove a venv it did not create in the same session ("Not removing
+#        existing venv … because it was not created in this session"), so a
+#        network blip mid-window leaves the previous agent installed and working.
+#
+#    Uninstall-first is therefore the RECOVERY order, not the clean one — it is
+#    the only thing that clears an obstruction `--force` could not overwrite, and
+#    it is also the only order that can leave the host with no agent at all. So
+#    it is gated on proof that the replacement is actually fetchable, and
+#    followed by a rollback to the build we were running (`prev`).
+#
+#    DGOPS-9507: every call here is a FRESH resolve with no prior version to be
+#    protected by, so each carries the version floor. The rollback is pinned with
+#    `==` on purpose — it is a return to a known build, not an update.
+def _run(argv):
+    try:
+        return subprocess.run(argv, timeout=600).returncode == 0
+    except Exception:
+        return False
+def _fetchable():
+    """Can the replacement actually be downloaded and run, right now?
+
+    Asked only before the destructive branch. Deleting the working install and
+    then discovering the index is unreachable is the one failure mode with no
+    way back — the rollback needs the same network the install just failed on.
+    This is the same check /agent-install pre-flights with, repeated here
+    because minutes have passed since then.
+
+    It is not free, and `--no-cache` does not mean what it sounds like. Measured
+    against pipx 1.16.5, it means "do not REUSE a cached run-venv", and what
+    happens next depends on the backend: under **pip** the probe builds a new
+    entry in PIPX_VENV_CACHEDIR and LEAVES it there; under **uv** it builds in a
+    temp dir and deletes it on exit. So the pip case costs a cache entry per
+    probe. Acceptable here — the entry is the version we were trying to install,
+    not an older one, so a later `pipx run` replaying it cannot walk the host
+    backwards, and the cleaner removes it on disconnect. Worth knowing before
+    adding another one of these to a path that runs often."""
+    return _run(pipx + ["run", "--no-cache", "--spec", spec, pkg, "--version"])
 def _do_upgrade():
-    for argv in (pipx + ["upgrade", pkg], pipx + ["install", "--force", spec]):
-        try:
-            if subprocess.run(argv, timeout=600).returncode == 0:
-                return True
-        except Exception:
-            pass
+    if _run(pipx + ["install", "--force", spec]) and usable_install():
+        return True
+    note("the forced install did not leave a usable install")
+    if venv_present() and _fetchable() and _run(pipx + ["uninstall", pkg]):
+        # The venv is gone now, so a plain install is a real install.
+        if _run(pipx + ["install", spec]) and usable_install():
+            return True
+    note("clean install failed")
+    if floor and _run(pipx + ["install", "--force", "%s==%s" % (pkg, floor)]) \
+            and installed_entry():
+        note("restored the previous version (%s)" % floor)
     return False
-if _do_upgrade():
-    entry = installed_entry()
-note("upgrade %s; persistent entry %s" % ("ok" if entry else "did not resolve",
+_upgraded = _do_upgrade()
+#    Resolve the entry point regardless of the OUTCOME. A rollback that succeeded
+#    leaves a perfectly good durable install on disk, and skipping this on failure
+#    would send the waiter to the ephemeral fallback — which resolves the floored
+#    spec straight back to the release that just refused to install. Reconnecting
+#    from the restored build is the whole point of restoring it.
+entry = installed_entry()
+note("upgrade %s; persistent entry %s" % ("ok" if _upgraded else "FAILED",
                                           entry or "<none> -> pipx run fallback"))
 # 2) Connect from the persistent install if resolved; else the ephemeral pipx-run
 #    fallback (never worse than before). Both redeploy the skill + re-pin the
@@ -331,6 +441,69 @@ def _agent_floor_spec() -> str:
     rather than a bridge that never comes back.
     """
     return f"{AGENT_PKG}>={__version__}"
+
+
+def ensure_durable_install() -> "tuple[bool, str]":
+    """Make sure a DURABLE pipx install exists before anything gets pinned to it.
+
+    `pipx run superresearch-agent connect` is the documented from-chat install, and
+    it executes out of a venv pipx evicts. Pinning the login launcher at that
+    moment bakes both the interpreter path and the package path into a directory
+    with a ~14-day life expectancy — which is why the bridge "starts on an old
+    version", or after eviction does not start at all. So: before pinning, put a
+    real install on the machine and pin THAT.
+
+    Returns (ok, note). Already-durable is a no-op success — and "durable" now
+    excludes an install OLDER than this code, because `agent_dir()` declines to
+    redirect to one (see `autostart.durable_is_current`). That is the layer the
+    check belongs at: gating HERE would not help, since the caller only reaches
+    this function when the pin target already failed the durability test.
+
+    The install is CLEAN, not layered: any existing durable venv is removed first,
+    so what the launcher points at is exactly this release. Safe to remove first
+    here in a way it is not in the detached updater — this runs in the FOREGROUND
+    with the user watching, and if it fails nothing has been torn down except an
+    install that was already too old to pin to.
+
+    `--force` on the install, and it is not belt-and-braces. Measured against
+    real pipx: `pipx install <spec>` over a venv that still exists prints
+    "already seems to be installed" and EXITS 0 — so if the uninstall above was
+    the one that failed (a Windows file lock on a supervisor-relaunched bridge is
+    the realistic cause), a plain install would report success having changed
+    nothing, and we would pin the stale copy while telling the user we replaced
+    it. `--force` reinstalls in place instead, and pipx refuses to delete a venv
+    it did not create in the same session, so a failure leaves the old install
+    working rather than leaving the host with none."""
+    if autostart.pin_target_is_durable():
+        return True, ""
+    pipx = _pipx_cmd()
+    if pipx is None:
+        return False, "pipx not found"
+    if autostart.durable_venv() is not None:
+        try:
+            subprocess.run([*pipx, "uninstall", AGENT_PKG], capture_output=True,
+                           text=True, timeout=600)
+        except Exception:  # noqa: BLE001 - best-effort; the install below is what counts
+            pass
+    try:
+        r = subprocess.run([*pipx, "install", "--force", _agent_floor_spec()],
+                           capture_output=True, text=True, timeout=600)
+    except Exception as e:  # noqa: BLE001 - surface the reason, never raise into connect
+        return False, str(e)
+    if r.returncode != 0:
+        tail = (r.stderr or r.stdout or "").strip().splitlines()
+        return False, (tail[-1][:200] if tail else "pipx install failed")
+    if not autostart.pin_target_is_durable():
+        # pipx exited 0 but we still can't resolve a durable package dir — pinning
+        # now would write the cache path anyway, which is the exact bug. Say so.
+        return False, "installed, but its package directory couldn't be resolved"
+    # The run-cache copy is now dead weight, and a ~14-day-old one is worse than
+    # that: `pipx run` reuses it, so a later bootstrap would replay a build older
+    # than the install we just made. Dropping it is what makes "no cache needed"
+    # true rather than merely intended. Deferred until this process exits — we are
+    # running out of the very venv being removed.
+    spawn_detached_cache_clear()
+    return True, "installed a durable copy to pin to"
 
 
 def _pipx_cmd() -> "list[str] | None":
@@ -469,7 +642,7 @@ def _spawn_detached(cmd: list, log_name: str, *, confirm_exit: "float | None" = 
 
 def spawn_detached_reconnect() -> bool:
     """Spawn a DETACHED process that, once THIS (bridge) process exits, upgrades the
-    PERSISTENT agent install (`pipx install --force superresearch-agent`) and
+    PERSISTENT agent install (remove the old venv, then a clean `pipx install`) and
     reconnects from it — fetching the latest agent from PyPI, redeploying the skill,
     re-pinning the ONLOGON launcher to the DURABLE venv (so a reboot comes back on
     the new version), and starting the new bridge. Falls back to the ephemeral
@@ -511,8 +684,14 @@ def spawn_detached_reconnect() -> bool:
     # the waiter is stdlib-only and cannot import `__version__` from the package it
     # is about to replace — and reading it after the upgrade would compare the new
     # build against itself, which is no floor at all.
+    # `prev` is the build we are running, and it answers two questions with one
+    # value: the rollback target if the install fails, and the floor a successful
+    # install has to clear before the waiter will call it a success (an exit code
+    # will not tell it — see `usable_install`). Read here for the same reason
+    # `spec` is: the waiter is stdlib-only and cannot import __version__ from a
+    # package it is in the middle of replacing.
     cfg = json.dumps({"pipx": pipx, "pkg": AGENT_PKG, "spec": _agent_floor_spec(),
-                      "connect_args": connect_args,
+                      "prev": __version__, "connect_args": connect_args,
                       "restart_args": restart_args, "log": log_path})
     # Escape the cgroup ONLY when supervised — that's the only case where systemd's
     # KillMode reaps the waiter as the bridge exits. On an unsupervised foreground
@@ -565,8 +744,21 @@ def spawn_detached_backend_install() -> bool:
 # would replay the STALE build (the same cache trap the self-update path fixes) —
 # "removed" wouldn't mean removed. Runs AFTER exit because the venv is in use
 # while disconnect (itself a `pipx run …`) is running. Surgical: only removes
-# cache entries whose name contains "superresearch"; never touches other tools'
-# caches, never raises.
+# cache entries that CONTAIN our package; never touches other tools' caches,
+# never raises.
+#
+# Identified by contents, not by name, because pipx names a run-venv after a
+# truncated sha256 of the spec and nothing else — real examples from pipx
+# 1.16.5: `aa2125a9e139d3c`, `6b504b0006266e7`. A filter looking for
+# "superresearch" in the directory name matches none of them, so the cleaner it
+# guarded deleted nothing at all while reporting that it had.
+#
+# Scope is pipx's OWN run cache, deliberately. A uv-backed pipx runs out of uv's
+# archive store instead, and that store does not have the staleness problem this
+# cleaner exists for: `uv tool run --from <spec>` re-resolves against the index
+# every time, where pipx's cached run-venv is reused as-is for ~14 days. Reaching
+# into uv's content-addressed, hard-linked archive by hand would risk other
+# tools' environments to fix a problem it does not have.
 _CACHE_CLEAR_WAITER = r'''
 import os, sys, time, shutil
 from pathlib import Path
@@ -591,11 +783,25 @@ for _ in range(120):  # wait up to ~60s for disconnect to exit
         break
     time.sleep(0.5)
 time.sleep(2)  # grace for the OS to release the venv's files
+def is_ours(entry):
+    """A run-venv that has OUR package installed in it. Mirrors the shape
+    autostart._venv_site_packages looks for, on both venv layouts."""
+    try:
+        if not entry.is_dir():
+            return False
+        if (entry / "Lib" / "site-packages" / "facade").is_dir():
+            return True
+        for sp in entry.glob("lib/python*/site-packages"):
+            if (sp / "facade").is_dir():
+                return True
+    except Exception:
+        pass
+    return False
 try:
     root = Path(cachedir)
     if root.is_dir():
         for entry in root.iterdir():
-            if "superresearch" in entry.name.lower():
+            if is_ours(entry):
                 shutil.rmtree(entry, ignore_errors=True)
 except Exception:
     pass

@@ -389,23 +389,50 @@ def test_reconnect_waiter_compiles():
     compile(selfupdate._RECONNECT_WAITER, "<reconnect-waiter>", "exec")
 
 
-def test_reconnect_waiter_upgrade_is_uv_pipx_safe():
-    # A uv-backed pipx REFUSES `install --force` on an existing venv ("use --clear"),
-    # so the waiter tries `upgrade` (in-place) FIRST, then --force for a standard pipx.
+def test_reconnect_waiter_replaces_rather_than_layering():
+    """The update REPLACES the distribution; it does not layer over it.
+
+    Two earlier rules in this file were both wrong about the same tool, and the
+    corrections were measured against real pipx 1.16.5 rather than argued:
+
+      * "a plain install refuses an existing venv" — it does not. It prints
+        "already seems to be installed" and EXITS 0, so the primary path was a
+        no-op that reported success and the `--force` recovery behind it was
+        unreachable by construction.
+      * "a uv-backed pipx refuses --force" — it does not. `--force` reinstalls in
+        place on a uv-backed venv, restores a missing console script, and on
+        failure leaves the previous install untouched, because pipx will not
+        delete a venv it did not create in the same session.
+
+    So `--force` is the SAFE primary path and uninstall-first is the destructive
+    recovery — the reverse of what this test used to assert. Behavioural coverage
+    (the argv the waiter executes, the post-condition, the rollback) lives in
+    test_selfupdate_version_floor.py against a pipx double that models the venv;
+    this only guards the shape so the strategy cannot be quietly reverted."""
     src = selfupdate._RECONNECT_WAITER
-    assert '"upgrade", pkg' in src              # in-place upgrade tried first (uv-safe)
-    # `spec`, not `pkg`, since DGOPS-9507: --force recreates the venv, so it is a
-    # fresh resolve and takes the version floor, while `upgrade` deliberately stays
-    # on the bare name (pipx discards a constraint passed there). The ORDER this test
-    # exists to pin is unchanged. See test_selfupdate_version_floor.py, which asserts
-    # the same thing against the argv the waiter actually executes rather than its
-    # source text — this line only guards the uv-safe ordering.
-    assert '"install", "--force", spec' in src  # then force (standard pipx)
-    assert "_do_upgrade" in src
-    # It must NEVER `pipx uninstall` in the upgrade path: a following install failure
-    # would delete the durable venv and strand the host with no install (a MAJOR
-    # regression the review caught). Both fail -> non-destructive pipx-run fallback.
-    assert '"uninstall"' not in src
+    assert '_run(pipx + ["install", "--force", spec])' in src, (
+        "the primary install must be the forced one — a plain install over an "
+        "existing venv exits 0 and changes nothing"
+    )
+    assert '"upgrade", pkg' not in src, "an in-place upgrade layers over the old venv"
+    assert "_do_upgrade" in src and "usable_install" in src, (
+        "the outcome must be read off the disk, not off an exit code"
+    )
+    # Removing is survivable only because both of these hold.
+    assert "_fetchable()" in src, (
+        "the destructive branch must not run until the replacement is known to be "
+        "downloadable — the rollback needs the same network"
+    )
+    assert 'cfg.get("prev")' in src, (
+        "a failed install must restore the version we were running"
+    )
+    # The PIN, spelled out. A bare `"==" in src` is satisfied by `returncode == 0`
+    # and half a dozen other lines in this payload, so it passed just as happily
+    # against `>=`, which re-resolves straight back to the release that just
+    # failed — the one thing the rollback must not do.
+    assert '"%s==%s" % (pkg, floor)' in src, (
+        "the rollback lost its exact pin and will re-resolve to the failed release"
+    )
 
 
 def test_spawn_detached_reconnect_no_pipx(monkeypatch):

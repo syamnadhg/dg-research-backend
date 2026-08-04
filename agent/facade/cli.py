@@ -340,6 +340,24 @@ def _install_step(chosen: connect.Target, dest_override: Path | None, *,
     return target
 
 
+def _pin_startup() -> tuple[bool, str]:
+    """Pin the login launcher, materialising a DURABLE install first if the only
+    thing we could otherwise pin is pipx's evictable run cache.
+
+    Every pin path goes through here. `pipx run superresearch-agent connect` — the
+    documented from-chat install — runs from a venv pipx throws away, so a pin
+    written straight from it works right up until the eviction and then resurrects
+    an old bridge or none. `autostart.install()` refuses that; this is the step
+    that makes the refusal actionable instead of a dead end."""
+    if not autostart.pin_target_is_durable():
+        from . import selfupdate
+        with b.spinner("Installing Super Research Agent (so startup survives updates)"):
+            ok, note = selfupdate.ensure_durable_install()
+        if not ok:
+            return False, f"couldn't install a permanent copy to pin to: {note}"
+    return autostart.install()
+
+
 def _startup_step(*, explicit: bool | None = None, assume_yes: bool = False) -> bool:
     """[3/4] Offer to pin + start the background bridge so it returns after a
     reboot — a Scheduled Task (Windows), systemd --user unit (Linux), or launchd
@@ -354,7 +372,7 @@ def _startup_step(*, explicit: bool | None = None, assume_yes: bool = False) -> 
     if not _decide(explicit, assume_yes, "Run on startup? (background, every login)", default=True):
         b.dim("Skipped — start it yourself when ready (see Next).")
         return False
-    ok, out = autostart.install()
+    ok, out = _pin_startup()
     if not ok:
         b.warn(f"Couldn't pin startup: {out}")
         b.dim("Start it yourself:  superresearch-agent serve")
@@ -781,7 +799,7 @@ def cmd_resurrect(args: argparse.Namespace) -> int:
         b.warn(f"Run-on-startup pinning isn't available on this host ({connect.host_os_label()}).")
         b.dim("Run the bridge in this terminal instead:  superresearch-agent serve")
         return 0
-    ok, out = autostart.install()
+    ok, out = _pin_startup()
     if not ok:
         b.no(f"Couldn't pin startup: {out}")
         b.dim("Run it yourself:  superresearch-agent serve")
