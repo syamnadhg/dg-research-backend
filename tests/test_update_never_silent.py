@@ -35,7 +35,21 @@ from conftest import code_only_deep, serving_version as _serving
 
 class TestUpgradePreflight:
 
-    WAITER_PATH = "/opt/homebrew/bin:/usr/bin"
+    # Joined with os.pathsep rather than a literal ":" — the double below splits it
+    # the way shutil.which does, and that separator is ";" on Windows, where a
+    # colon-joined literal collapses to ONE unmatchable entry.
+    #
+    # Be precise about what that broke, because the shape matters more than the
+    # count: it did NOT redden the class. Measured, exactly ONE case failed
+    # (test_allows_a_uv_venv_whose_uv_is_reachable, the only one asserting uv IS
+    # found). The other _wire-based cases all expect the refusal and got it — for
+    # the wrong reason. A PATH the double can never match makes "uv is missing"
+    # unfalsifiable, so those tests passed while asserting nothing, which is the
+    # failure this fixture's own docstring warns about two lines below. The single
+    # red test was the only visible symptom of four silently vacuous ones.
+    #
+    # Identical string on macOS and Linux, so this changes nothing there.
+    WAITER_PATH = os.pathsep.join(["/opt/homebrew/bin", "/usr/bin"])
     SHELL_PATH = "/usr/bin"
 
     def _wire(self, monkeypatch, *, backend, uv_on_path):
@@ -479,6 +493,19 @@ class TestSpawnBeforeFreeingTheVenv:
 
 # ── The supervisor's PATH is every child's PATH ───────────────────────────────
 
+def _local_bin() -> str:
+    """`~/.local/bin`, built the way `_lifecycle_path_dirs` builds it.
+
+    Deliberately NOT `os.path.expanduser("~/.local/bin")`: expanduser substitutes
+    the `~` and leaves the rest of the string untouched, so on Windows it returns
+    a path whose separators are mixed, while the product joins the components and
+    gets native ones. The two are the same string on POSIX — which is exactly why
+    comparing against the expanduser form passed on macOS and could only ever fail
+    here. The assertion is about which directory is on PATH, so it has to be built
+    the same way the value under test is."""
+    return os.path.join(os.path.expanduser("~"), ".local", "bin")
+
+
 class TestSupervisorPath:
 
     def test_it_carries_the_tool_homes_the_upgrade_needs(self, monkeypatch):
@@ -488,7 +515,7 @@ class TestSupervisorPath:
             "the supervisor still cannot see Homebrew — the update fails before it "
             "starts, and so does anything else that shells out to a brew tool"
         )
-        assert os.path.expanduser("~/.local/bin") in got
+        assert _local_bin() in got
 
     def test_the_tool_homes_come_first(self, monkeypatch):
         """Login-shell order, deliberately. System-first would resolve a system copy
@@ -498,7 +525,7 @@ class TestSupervisorPath:
         monkeypatch.setattr(research.sys, "platform", "darwin")
         got = research._supervisor_path_value().split(os.pathsep)
         assert got.index("/opt/homebrew/bin") < got.index("/usr/bin")
-        assert got.index(os.path.expanduser("~/.local/bin")) < got.index("/usr/bin")
+        assert got.index(_local_bin()) < got.index("/usr/bin")
 
     def test_no_duplicates(self, monkeypatch):
         monkeypatch.setattr(research.sys, "platform", "darwin")

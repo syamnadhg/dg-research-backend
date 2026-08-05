@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import importlib
 
+import pytest
+
 
 # Import via importlib so we can reload between tests if needed
 research = importlib.import_module("research")
@@ -87,11 +89,25 @@ class TestLifecycleWaiter:
         if py is not None:
             from pathlib import Path as _P
             assert _P(py).exists()
-            # Must NOT be this process's (venv) python — that's the whole point.
+            # Must NOT be this process's (venv) python — that's the whole point:
+            # the detached waiter has to outlive the venv pipx is about to delete
+            # and rebuild.
+            #
+            # This used to sit inside `try/except Exception: pass`, to tolerate
+            # resolve() edge cases. AssertionError IS an Exception, so the except
+            # swallowed the assertion itself and the check could never fail — the
+            # test asserted nothing while reading as coverage of the one invariant
+            # it is named for. Narrow the tolerance to the OS errors resolve() can
+            # actually raise, and let a real mismatch through.
             try:
-                assert _P(py).resolve() != _P(research.sys.executable).resolve()
-            except Exception:
-                pass  # resolve() edge cases shouldn't fail the assertion
+                resolved = _P(py).resolve()
+                mine = _P(research.sys.executable).resolve()
+            except OSError:
+                pytest.skip("resolve() failed on this filesystem")
+            assert resolved != mine, (
+                f"_path_python() returned this process's own interpreter ({resolved}). "
+                f"The self-update waiter would die with the venv it is rebuilding."
+            )
 
     def test_spawn_detached_aborts_cleanly_without_pipx(self, monkeypatch):
         # With no pipx resolvable, spawning must return None (falsy — caller then
