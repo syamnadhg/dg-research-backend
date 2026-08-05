@@ -57935,22 +57935,68 @@ if after and rc == 0:
 
 
 def _path_python() -> "str | None":
-    """A NON-venv Python on PATH, to run the detached lifecycle waiter (which
-    must outlive this process — the venv python is about to be deleted/rebuilt).
-    Never sys.executable (that IS the venv python)."""
+    """A Python that will OUTLIVE the venv this process is running from.
+
+    The detached lifecycle waiter keeps running while pipx deletes and rebuilds
+    that venv, so the interpreter it is launched with has to live somewhere pipx
+    is not about to remove.
+
+    ⭐ Selection is by LOCATION, not by interpreter identity. The previous version
+    compared `Path(exe).resolve()` against `Path(sys.executable).resolve()` — but
+    on POSIX a venv's python is a SYMLINK to its base, so both sides resolve to
+    the same real binary and EVERY candidate was rejected. The unguarded
+    `return cands[0]` fallback then supplied the answer, which was right only by
+    luck: with the venv's own bin on PATH — which is exactly what `activate`
+    does — it returned the venv python itself, the one thing this function exists
+    to avoid and the one thing its docstring already forbade. Reproduced
+    2026-08-05; it also meant the accompanying guard failed on any POSIX box
+    while passing on Windows, where venvs COPY python.exe instead of symlinking.
+
+    Order: a PATH candidate outside the venv, then the interpreter the venv was
+    BUILT from (outside it by definition, and the only safe answer when every
+    PATH name points back inside), then None. None is honest — the caller treats
+    it as "cannot spawn" and prints the manual command, which beats handing the
+    waiter an interpreter that is about to be deleted underneath it.
+    """
     import shutil as _shutil
-    try:
-        me = Path(sys.executable).resolve()
-    except Exception:
-        me = None
-    cands = [exe for _c in ("py", "python", "python3") if (exe := _shutil.which(_c))]
-    for exe in cands:
+
+    # The venv pipx is about to rebuild. Empty when this is not a venv at all, in
+    # which case nothing is being deleted and any candidate will do.
+    doomed: "list[Path]" = []
+    if sys.prefix != sys.base_prefix:
+        doomed.append(Path(sys.prefix))
         try:
-            if me is None or Path(exe).resolve() != me:
-                return exe
-        except Exception:
+            doomed.append(Path(sys.prefix).resolve())
+        except OSError:
+            pass
+
+    def _is_doomed(exe: str) -> bool:
+        # BOTH the literal path and the resolved one: the literal catches the
+        # venv's own `bin/python` (whose resolve() points harmlessly outside),
+        # and the resolved one catches a symlink from elsewhere INTO the venv.
+        here = [Path(exe)]
+        try:
+            here.append(Path(exe).resolve())
+        except OSError:
+            pass
+        return any(p == d or d in p.parents for p in here for d in doomed)
+
+    for _c in ("py", "python", "python3"):
+        exe = _shutil.which(_c)
+        if exe and not _is_doomed(exe):
             return exe
-    return cands[0] if cands else None
+
+    if doomed:
+        base = Path(sys.base_prefix)
+        for rel in (("bin", "python3"), ("bin", "python"),
+                    ("python.exe",), ("Scripts", "python.exe")):
+            cand = base.joinpath(*rel)
+            try:
+                if cand.exists() and not _is_doomed(str(cand)):
+                    return str(cand)
+            except OSError:
+                continue
+    return None
 
 
 def _lifecycle_path_dirs() -> "list[str]":

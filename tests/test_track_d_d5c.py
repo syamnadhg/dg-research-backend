@@ -16,6 +16,9 @@ test_pair_prompt.py for the new `TestSaveApiKeyLocal` coverage.
 from __future__ import annotations
 
 import importlib
+import os
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -85,27 +88,34 @@ class TestLifecycleWaiter:
 
     def test_path_python_is_non_venv_when_possible(self):
         py = research._path_python()
-        # Either None (no python on PATH — unusual) or a real, non-venv python.
+        # Either None (nothing safe exists — the caller prints the manual
+        # command) or a real interpreter outside the venv pipx will rebuild.
         if py is not None:
             from pathlib import Path as _P
             assert _P(py).exists()
-            # Must NOT be this process's (venv) python — that's the whole point:
-            # the detached waiter has to outlive the venv pipx is about to delete
-            # and rebuild.
+            # ⚠ LOCATION, not realpath identity. The previous form compared
+            # `_P(py).resolve()` against `sys.executable.resolve()` — and on
+            # POSIX a venv's python is a SYMLINK to its base, so both sides
+            # resolve to the same real binary and the assertion fired on
+            # perfectly safe answers. Measured 2026-08-05: it failed on this Mac
+            # AND in the CI condition (no venv, actions/setup-python, where PATH's
+            # python IS the running one), and passed only on Windows, whose venvs
+            # COPY python.exe rather than symlinking it. A guard that is green on
+            # exactly one platform is not a guard.
             #
-            # This used to sit inside `try/except Exception: pass`, to tolerate
-            # resolve() edge cases. AssertionError IS an Exception, so the except
-            # swallowed the assertion itself and the check could never fail — the
-            # test asserted nothing while reading as coverage of the one invariant
-            # it is named for. Narrow the tolerance to the OS errors resolve() can
-            # actually raise, and let a real mismatch through.
+            # What actually matters is where the returned interpreter LIVES: it
+            # must not be inside the directory pipx is about to delete.
+            if research.sys.prefix == research.sys.base_prefix:
+                return          # not a venv — nothing is going to be deleted
             try:
-                resolved = _P(py).resolve()
-                mine = _P(research.sys.executable).resolve()
+                venv = _P(research.sys.prefix).resolve()
+                cand = _P(py)
+                inside = venv == cand or venv in cand.parents \
+                    or venv == cand.resolve() or venv in cand.resolve().parents
             except OSError:
                 pytest.skip("resolve() failed on this filesystem")
-            assert resolved != mine, (
-                f"_path_python() returned this process's own interpreter ({resolved}). "
+            assert not inside, (
+                f"_path_python() returned an interpreter inside the venv ({py}). "
                 f"The self-update waiter would die with the venv it is rebuilding."
             )
 
@@ -364,3 +374,139 @@ class TestSelfUpdateIdempotent:
         monkeypatch.setattr(research, "_latest_on_pypi", _latest)
         research._self_update()
         assert seen.get("force") is True
+
+
+# ─── _path_python() drives the waiter's interpreter choice ────────────────────
+#
+# Reproduced 2026-08-05. The old selection compared RESOLVED interpreters:
+#
+#     me = Path(sys.executable).resolve()
+#     for exe in cands:
+#         if Path(exe).resolve() != me: return exe
+#     return cands[0] if cands else None
+#
+# On POSIX a venv's python is a SYMLINK to its base, so `me` IS the base and
+# every PATH candidate from that same base got rejected. The unguarded fallback
+# then supplied the answer. With the venv's own bin on PATH — what `activate`
+# does — that fallback returned the venv python itself:
+#
+#     PATH = <venv>/bin  ->  _path_python() -> <venv>/bin/python      # doomed
+#
+# which is what the docstring already forbade. The waiter would die with the venv
+# pipx was rebuilding: backend down, not upgraded.
+#
+# These build a synthetic venv rather than leaning on the one the suite happens
+# to run in, so they assert the same thing on macOS, Linux and Windows — and in
+# CI, where there is no venv at all. That matters here: the guard they replace
+# passed on exactly one platform.
+
+class TestPathPythonPicksASurvivor:
+    _BIN = "Scripts" if sys.platform == "win32" else "bin"
+    _EXE = "python.exe" if sys.platform == "win32" else "python3"
+
+    def _interpreter(self, root, link_to=None):
+        """A findable, executable python at the platform's venv layout.
+
+        ⚠ `link_to` matters. A real POSIX venv SYMLINKS its python to the base
+        interpreter, so `resolve()` on it lands OUTSIDE the venv — which is
+        exactly why the literal-path check exists and why a fixture built from
+        plain files cannot see it. Verified by mutation: with plain files,
+        deleting the literal check survived. Windows venvs copy the exe, so the
+        plain file is the faithful shape there.
+        """
+        d = root / self._BIN
+        d.mkdir(parents=True, exist_ok=True)
+        exe = d / self._EXE
+        if link_to is not None and sys.platform != "win32":
+            exe.symlink_to(link_to)
+        else:
+            exe.write_text("")
+            exe.chmod(0o755)
+        return exe
+
+    def _layout(self, tmp_path, monkeypatch, *, path_dirs, base_has_python=True):
+        venv = tmp_path / "venv"
+        base = tmp_path / "base"
+        if base_has_python:
+            self._interpreter(base)
+            self._interpreter(venv, link_to=base / self._BIN / self._EXE)
+        else:
+            # Nothing to point at — a dangling symlink is not a findable python,
+            # and this case is about there being no survivor at all.
+            self._interpreter(venv)
+        monkeypatch.setattr(research.sys, "prefix", str(venv))
+        monkeypatch.setattr(research.sys, "base_prefix", str(base))
+        monkeypatch.setenv("PATH", os.pathsep.join(str(p) for p in path_dirs(venv, base)))
+        return venv, base
+
+    def test_an_activated_venv_never_yields_the_doomed_interpreter(self, tmp_path, monkeypatch):
+        """⭐ The reproduction. Every PATH name points back inside the venv."""
+        venv, _ = self._layout(tmp_path, monkeypatch,
+                               path_dirs=lambda v, b: [v / self._BIN])
+        got = research._path_python()
+        assert got is not None, "a safe interpreter exists (the base) and was not found"
+        p = Path(got)
+        assert venv not in p.parents and p != venv, (
+            f"returned {got}, which is inside the venv pipx is about to delete")
+
+    def test_it_falls_back_to_the_interpreter_the_venv_was_built_from(self, tmp_path, monkeypatch):
+        """The base interpreter is outside the venv by definition, so it survives
+        the rebuild — and it is the only safe answer once PATH is exhausted."""
+        _, base = self._layout(tmp_path, monkeypatch,
+                               path_dirs=lambda v, b: [v / self._BIN])
+        assert Path(research._path_python()).parent.parent == base
+
+    def test_a_safe_path_candidate_wins_over_the_base_fallback(self, tmp_path, monkeypatch):
+        """PATH first, base last: a system python already on PATH is the cheaper
+        and more predictable answer, and the fallback is a last resort."""
+        safe = tmp_path / "usr"
+        self._interpreter(safe)
+        venv, base = self._layout(
+            tmp_path, monkeypatch,
+            path_dirs=lambda v, b: [safe / self._BIN, v / self._BIN])
+        assert Path(research._path_python()).parent == safe / self._BIN
+
+    def test_none_when_every_candidate_is_doomed(self, tmp_path, monkeypatch):
+        """⛔ None is the honest answer, and the caller already handles it by
+        printing the manual command. Returning a doomed interpreter instead —
+        which is what the old fallback did — takes the backend down mid-upgrade
+        and does not upgrade it."""
+        self._layout(tmp_path, monkeypatch,
+                     path_dirs=lambda v, b: [v / self._BIN], base_has_python=False)
+        assert research._path_python() is None
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink semantics")
+    def test_a_symlink_pointing_into_the_venv_is_rejected(self, tmp_path, monkeypatch):
+        """A wrapper on PATH that RESOLVES into the venv.
+
+        Built as a `--copies` venv on purpose: its interpreter is a real file
+        inside the venv, which is what `python -m venv --copies`, uv, and Windows
+        all produce. In that shape the literal path of the wrapper is innocent and
+        only resolving it shows where it lands — the mirror of the default POSIX
+        venv, where the literal path is the guilty one and resolve() points
+        harmlessly out. Both checks are load-bearing, each for one of these two.
+        """
+        venv, base = tmp_path / "venv", tmp_path / "base"
+        real_inside = self._interpreter(venv)          # --copies: a real binary
+        self._interpreter(base)
+        hop = tmp_path / "hop" / self._BIN
+        hop.mkdir(parents=True, exist_ok=True)
+        (hop / self._EXE).symlink_to(real_inside)
+        monkeypatch.setattr(research.sys, "prefix", str(venv))
+        monkeypatch.setattr(research.sys, "base_prefix", str(base))
+        monkeypatch.setenv("PATH", os.pathsep.join([str(hop), str(base / self._BIN)]))
+        got = research._path_python()
+        assert Path(got).resolve().parent.parent == base, (
+            f"followed a symlink into the doomed venv: {got}")
+
+    def test_a_process_outside_any_venv_takes_the_first_candidate(self, tmp_path, monkeypatch):
+        """⚠ The CI condition — actions/setup-python, no venv, and PATH's python
+        IS the running interpreter. Nothing is being deleted, so that is a fine
+        answer; the OLD guard called it a failure and would have gone red on
+        every CI run."""
+        here = tmp_path / "sys"
+        self._interpreter(here)
+        monkeypatch.setattr(research.sys, "prefix", str(tmp_path / "same"))
+        monkeypatch.setattr(research.sys, "base_prefix", str(tmp_path / "same"))
+        monkeypatch.setenv("PATH", str(here / self._BIN))
+        assert Path(research._path_python()).parent == here / self._BIN
