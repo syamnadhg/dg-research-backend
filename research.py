@@ -6308,6 +6308,34 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                 # is what makes the app see the new version. A sibling worker keeps the
                 # old build in memory until it next cycles naturally — acceptable for a
                 # rare fallback, and strictly better than hard_reset's collateral.
+                # OWNER-ONLY defense-in-depth, mirroring `_handle_update_command`.
+                #
+                # ⭐ 2026-08-05: this guard was missing. `restart` is process-lifecycle
+                # control over the owner's paired backend, and the Firestore rule lets
+                # any authorized device member — a sharer, not just the owner — create
+                # a command document with their own submittedBy. So a sharer could
+                # remotely cycle the owner's backend, while the sibling `update`
+                # command, which is the same class of primitive, refused them. The two
+                # now agree.
+                #
+                # Same shape as update's: one device-doc read, refuse on mismatch, and
+                # a read FAILURE refuses rather than falling open — a guard that
+                # degrades to "allow" when it cannot check is not a guard.
+                try:
+                    _rdev = (_firebase_db.collection("devices")
+                             .document(device_id).get().to_dict() or {})
+                except Exception as _re:
+                    log(f"[device-cmds] RESTART: device read failed ({_re}) — refusing",
+                        "WARN")
+                    continue
+                _rowner = _rdev.get("ownerUid")
+                if _rowner and data.get("submittedBy") and data["submittedBy"] != _rowner:
+                    log("[device-cmds] RESTART: refusing — submittedBy is not the "
+                        "device owner", "WARN")
+                    _write_update_status(device_id, {
+                        "state": "failed", "current": _sr_version(), "latest": None,
+                        "reason": "not the device owner"})
+                    continue
                 # SUPERVISED-ONLY, same reason `update` refuses: this exits the
                 # worker, and if no OS supervisor (launchd / systemd / Scheduled Task)
                 # is there to relaunch it, a foreground `--serve` never comes back and
@@ -23108,6 +23136,10 @@ async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None,
 
 
 _p1_src_dbg_dumped = False  # one-shot guard for the #P1-src-dbg panel DOM capture
+# #P2-panel-dbg (DGOPS-9614): bounded to two dumps per process, and the previous
+# sample's signature so "identical to last time" is decidable at all.
+_p2_panel_dbg_dumps = 0
+_p2_panel_last_fp = None
 
 
 async def scrape_chatgpt_activity_panel_tracking(page):
@@ -23287,8 +23319,30 @@ async def scrape_chatgpt_activity_panel_tracking(page):
         // structures its sources so the extraction can be fixed from the real
         // DOM, never guessed. Bounded; only computed when we truly have a panel
         // (real text) but zero source urls — costs nothing on the happy path.
+        // #P2-panel-dbg (DGOPS-9614, 2026-08-05): a per-sample FINGERPRINT of the
+        // panel node, always computed because it is cheap and it is the thing that
+        // settles the open question. The second-phase tracker reports the same
+        // counts sample after sample while the platform's own end-of-run summary
+        // says it did far more. Two possible causes, opposite fixes: the panel is
+        // changing and our extraction misses the new rows, or we are re-reading a
+        // detached node that stopped updating. If this fingerprint MOVES while the
+        // counts do not, it is the first; if it is identical, it is the second.
         try {
-            if (out.source_urls.length === 0 && out.partial_text_len > 150) {
+            out.dbg_fp = {
+                tag: (panel.tagName || '') + '|' + String(panel.className || '').slice(0, 70),
+                kids: panel.childElementCount,
+                textlen: (panel.innerText || '').length,
+                anchors: panel.querySelectorAll('a[href]').length,
+                rows: panel.querySelectorAll('li, [role="listitem"]').length,
+            };
+        } catch (e) {}
+
+        try {
+            // ⚠ Gate widened from "zero sources" to "we have a real panel". The old
+            // gate could not fire for DGOPS-9614, whose whole symptom is a NON-zero
+            // count that never moves — so the one run that could answer it produced
+            // nothing. The caller decides what to keep; this only makes it available.
+            if (out.partial_text_len > 150) {
                 out.dbg_panel_tag = (panel.tagName || '') + '|' +
                     String(panel.className || '').slice(0, 160);
                 out.dbg_anchors = [];
@@ -23388,8 +23442,36 @@ async def scrape_chatgpt_activity_panel_tracking(page):
             _p1_src_dbg_dumped = True
         except Exception as _dbe:
             log(f"[P1-src-dbg] capture failed: {_dbe}", "DEBUG")
+    # #P2-panel-dbg (DGOPS-9614): the counts freeze. Log the fingerprint on EVERY
+    # sample — that sequence is the evidence — and dump the panel's DOM the first
+    # two times a sample is identical to the one before it, so the two candidate
+    # causes can be told apart from a single run rather than a second one.
+    global _p2_panel_dbg_dumps, _p2_panel_last_fp
+    try:
+        _fp = res.get("dbg_fp") or {}
+        _counts = (len(res.get("source_urls") or []), len(res.get("steps") or []),
+                   len(res.get("sections") or []), int(res.get("searches", 0) or 0))
+        _sig = (_counts, _fp.get("kids"), _fp.get("textlen"),
+                _fp.get("anchors"), _fp.get("rows"))
+        log(f"[P2-panel-dbg] urls/steps/sections/searches={_counts} "
+            f"node={_fp.get('tag', '?')} kids={_fp.get('kids')} "
+            f"textlen={_fp.get('textlen')} anchors={_fp.get('anchors')} "
+            f"rows={_fp.get('rows')}", "INFO")
+        if (_p2_panel_last_fp is not None and _sig == _p2_panel_last_fp
+                and _p2_panel_dbg_dumps < 2 and res.get("dbg_html")):
+            _d = os.path.expanduser("~/.super-research/logs")
+            os.makedirs(_d, exist_ok=True)
+            _p2_panel_dbg_dumps += 1
+            _pth = os.path.join(_d, f"p2_panel_dump_{_p2_panel_dbg_dumps}.html")
+            with open(_pth, "w", encoding="utf-8") as _f:
+                _f.write(res.get("dbg_html") or "")
+            log(f"[P2-panel-dbg] sample identical to the previous one — dumped panel "
+                f"DOM ({len(res.get('dbg_html') or '')} chars) to {_pth}", "INFO")
+        _p2_panel_last_fp = _sig
+    except Exception as _pdbe:
+        log(f"[P2-panel-dbg] capture skipped: {_pdbe}", "DEBUG")
     # Strip debug-only keys so they never bleed into the merged progress/emit.
-    for _dk in ("dbg_html", "dbg_anchors", "dbg_panel_tag"):
+    for _dk in ("dbg_html", "dbg_anchors", "dbg_panel_tag", "dbg_fp"):
         res.pop(_dk, None)
     return res
 
@@ -39987,6 +40069,17 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                     # CUA setup tier, RE-MEASURE, and only if it is still off park
                     # the same non-blocking keep/skip gate the pre-send path uses.
                     # Never a silent chat-mode research.
+                    #
+                    # ⭐ 2026-08-05: the paragraph above was the INTENT and the code
+                    # only honoured it on the LAST attempt. Attempts 1 and 2 logged
+                    # "still off — will re-arm again", then fell straight through to
+                    # the re-submit below and sent anyway. The send returns a plain
+                    # chat answer, and `_gemini_landed` accepts the resulting
+                    # conversation URL as success — so the run proceeds on a chat
+                    # answer dressed as recovered research, which is the exact
+                    # outcome this block exists to prevent. `_dr_ok_for_submit`
+                    # carries the measurement out to the send gate.
+                    _dr_ok_for_submit = True
                     try:
                         _dr_st = await ensure_deep_mode_active(page, platform, label)
                         if not _dr_st.get("active", True):
@@ -40045,12 +40138,25 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                                     platform_l, label,
                                     why=f"dropped-send re-submit: DR still off after "
                                         f"{_max_attempts} re-arm + CUA attempts")
+                                _dr_ok_for_submit = False
                             else:
                                 log(f"[{label}] Deep Research still off (attempt "
                                     f"{_att}/{_max_attempts}) — will re-arm again on "
                                     "the next attempt", "WARN")
+                                _dr_ok_for_submit = False
                     except Exception as _dre:
+                        # ⚠ A RAISE is not a measurement. We do not know whether Deep
+                        # Research is on, so this deliberately leaves the send enabled
+                        # — the previous behaviour — rather than parking a run that
+                        # may be perfectly healthy. Only a measurement that actually
+                        # read "off" blocks the send.
                         log(f"[{label}] DR re-arm raised (non-fatal): {_dre}", "DEBUG")
+                    if not _dr_ok_for_submit:
+                        log(f"[{label}] NOT re-submitting on attempt "
+                            f"{_att}/{_max_attempts} — Deep Research measured off, and "
+                            f"a send now returns a plain chat answer that would be "
+                            f"accepted as the recovered research run", "WARN")
+                        continue
                     log(f"[{label}] Gemini URL still bare, no error yet — re-submitting "
                         f"(attempt {_att}/{_max_attempts})", "WARN")
                     try:

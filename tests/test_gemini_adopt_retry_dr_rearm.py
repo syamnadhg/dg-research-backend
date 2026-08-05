@@ -109,9 +109,22 @@ def test_repaste_ladder_rearm_escalates_then_parks_never_sends_silently():
     with nothing downstream to catch it (agent-18df1b0011fc4625: DR off at 14:47:08,
     submitted 14:47:11, no plan, CUA exhausted 3 attempts, run finished 2/3).
 
-    The contract now: re-arm → CUA setup tier → RE-MEASURE → park the non-blocking
-    keep/skip gate if still off. Still never blocks the send; it just stops the run
-    silently pretending to be a Deep Research."""
+    ⛔ 2026-08-05 — THIS TEST WAS WRONG, and its own docstring is why the defect
+    survived it. It used to end: "Still never blocks the send; it just stops the run
+    silently pretending to be a Deep Research." Those two clauses contradict each
+    other. Sending with Deep Research MEASURED OFF *is* the run silently pretending
+    to be a Deep Research: the send returns a plain chat answer and `_gemini_landed`
+    accepts the resulting conversation URL as success.
+
+    So the test asserted the escalate/re-measure/park machinery was present and then
+    explicitly permitted the send anyway — encoding the bug as the contract. The
+    machinery only ever changed the outcome on the FINAL attempt; attempts 1 and 2
+    logged "will re-arm again" and fell through to the send.
+
+    The contract now: re-arm → CUA setup tier → RE-MEASURE → and if it is still off,
+    DO NOT SEND on this attempt. Park the non-blocking keep/skip gate once the
+    attempts are spent. A measurement that RAISED is not a measurement, so it still
+    permits the send — only a reading of "off" blocks it."""
     ladder = _ladder_region()
     tail = ladder[ladder.index("ensure_deep_mode_active("):]
     # The false justification must be gone.
@@ -130,6 +143,53 @@ def test_repaste_ladder_rearm_escalates_then_parks_never_sends_silently():
     assert "_park_chat_mode_decision(" in tail
     # Measurement failures still must not block the send.
     assert "DR re-arm raised (non-fatal)" in tail
+
+    # ⭐ And the send is GATED on the measurement. This is the assertion the old
+    # version of this test refused to make, which is why the fall-through lived.
+    assert "_dr_ok_for_submit = False" in tail, (
+        "nothing carries the 'still off' measurement out to the send gate"
+    )
+    assert "if not _dr_ok_for_submit:" in tail, (
+        "the re-submit is not gated on the measurement — attempts before the last "
+        "one will send a plain chat answer that reads as recovered research"
+    )
+    # The gate must sit BEFORE the re-submit, not after it.
+    assert tail.index("if not _dr_ok_for_submit:") \
+        < tail.index("Gemini URL still bare, no error yet — re-submitting"), (
+        "the gate runs after the send, which gates nothing"
+    )
+
+
+def test_a_still_off_measurement_skips_the_attempt_rather_than_sending():
+    """Both non-recovered branches must set the gate — the park branch on the final
+    attempt AND the 'will re-arm again' branch on the earlier ones. The earlier ones
+    are the whole defect: parking already existed, the fall-through did not."""
+    tail = _ladder_region()
+    tail = tail[tail.index("ensure_deep_mode_active("):]
+    park = tail.index("_park_chat_mode_decision(")
+    rearm = tail.index("will re-arm again on")
+    gate = tail.index("if not _dr_ok_for_submit:")
+    # One assignment after the park, one after the re-arm log, both before the gate.
+    assert tail.count("_dr_ok_for_submit = False") == 2, (
+        "exactly two branches measured DR as off; both must block the send"
+    )
+    assert park < gate and rearm < gate
+
+
+def test_a_raised_measurement_still_permits_the_send():
+    """⚠ Deliberate asymmetry, and it must not be 'tidied' into symmetry: a raise
+    tells us nothing about Deep Research, so refusing there would park runs that are
+    perfectly healthy. Only a reading of 'off' blocks."""
+    tail = _ladder_region()
+    exc = tail[tail.index("DR re-arm raised (non-fatal)"):]
+    gate = exc[:exc.index("if not _dr_ok_for_submit:")]
+    assert "_dr_ok_for_submit = False" not in gate, (
+        "the except branch now blocks the send; a measurement failure is not a "
+        "measurement of 'off'"
+    )
+    assert "_dr_ok_for_submit = True" in _ladder_region(), (
+        "the gate must default to permitting the send"
+    )
 
 
 def test_repaste_ladder_rearm_runs_after_paste_like_normal_path():

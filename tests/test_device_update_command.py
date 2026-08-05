@@ -12,9 +12,11 @@ Locks the guards the adversarial review + the design called out:
 from __future__ import annotations
 
 import importlib
+import inspect
 import os
 
 research = importlib.import_module("research")
+from conftest import code_only  # noqa: E402
 
 
 # ── _perform_self_update: the headless decision core ──────────────────────────
@@ -759,3 +761,70 @@ class TestLifecycleEnvPath:
         # …and they must sit BEFORE the `--` separator, else systemd-run treats them
         # as arguments to the command rather than its own flags.
         assert cmd.index("--") > max(cmd.index(a) for a in setenvs)
+
+
+# ── The `restart` command is owner-only too ───────────────────────────────────
+#
+# Raised on the open backend PR. `restart` is process-lifecycle control over the
+# owner's paired backend, and the Firestore rule lets any AUTHORIZED DEVICE MEMBER
+# — a sharer, not only the owner — create a command document carrying their own
+# submittedBy. So a sharer could remotely cycle the owner's backend, while the
+# sibling `update` command, which is the same class of primitive, refused them.
+#
+# The two commands now agree. Asserted structurally because the branch lives
+# inside the command listener rather than in a callable of its own; the assertions
+# below are about ORDER and about failing closed, which is where this kind of
+# guard actually goes wrong.
+
+def _restart_branch() -> str:
+    """The restart branch, up to the point of no return.
+
+    Taken from the command listener rather than the server: the branch lives in
+    the listener, and reading it from the wrong function is how a guard test ends
+    up asserting against source that never contained the code.
+    """
+    src = code_only(inspect.getsource(research._start_device_command_listener))
+    i0 = src.index('if action == "restart":')
+    return src[i0:src.index('_schedule_server_exit("device-restart"')]
+
+
+def test_restart_refuses_a_non_owner():
+    branch = _restart_branch()
+    assert "ownerUid" in branch, (
+        "the restart branch never reads the device owner — a sharer can cycle the "
+        "owner's backend, which the sibling update command refuses"
+    )
+    assert 'data.get("submittedBy")' in branch
+    assert "not the device owner" in branch
+
+
+def test_the_owner_check_runs_before_anything_irreversible():
+    """Order is the whole point: a guard that runs after the exit is scheduled
+    guards nothing, and the supervised/busy checks are cheaper to reach."""
+    branch = _restart_branch()
+    assert branch.index("ownerUid") < branch.index("_detect_supervised()"), (
+        "ownership must be settled before the supervised check, matching update"
+    )
+
+
+def test_a_failed_device_read_refuses_rather_than_falling_open():
+    """⚠ The failure mode that makes a guard worthless. If the device document
+    cannot be read we do not know who owns it, so the only safe answer is to
+    refuse — a check that degrades to 'allow' when it cannot check is not a
+    check. Mirrors the update command, which refuses on the same failure."""
+    branch = _restart_branch()
+    read_fail = branch[branch.index("device read failed"):]
+    assert "continue" in read_fail[:200], (
+        "a device-read failure falls through to the restart instead of refusing"
+    )
+
+
+def test_restart_and_update_agree_on_the_owner_rule():
+    """Both are remote lifecycle control over the same process. If one refuses a
+    sharer and the other does not, the stricter one is decoration."""
+    upd = code_only(inspect.getsource(research._handle_update_command))
+    branch = _restart_branch()
+    for token in ("ownerUid", 'data.get("submittedBy")', "not the device owner"):
+        assert token in upd and token in branch, (
+            f"{token!r} is in only one of the two lifecycle commands"
+        )
