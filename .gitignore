@@ -61,3 +61,14 @@ tests/fixtures/vision/auto/
 # macOS Finder metadata and per-machine agent settings — local noise.
 .DS_Store
 .claude/
+
+# uv lockfiles — deliberately NOT tracked. Neither package resolves dependencies
+# from a lock at build time: the wheels inherit Requires-Dist from
+# pyproject.toml's [project].dependencies (via `pip wheel . --no-deps`), and the
+# dependency set is already pinned and guarded by tests/released_deps.json +
+# tests/test_release_dep_version_guard.py. So a tracked lock would add churn on
+# every machine without protecting anything the guard does not already cover.
+# Ignored rather than left merely untracked because they existed on the Mac but
+# not on the Windows box, which is one stray `git add` away from a divergence.
+uv.lock
+agent/uv.lock
