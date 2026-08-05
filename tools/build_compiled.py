@@ -18,7 +18,7 @@ PIPELINE
        research.py  ->  _sr_core.<abi>.pyd     (RENAMED — so a readable
                                                 research.py launcher shim can
                                                 coexist; see SHIM below)
-       models/prompts/vision/narrate.py -> <name>.<abi>.pyd
+       models/prompts/vision/narrate/selfheal.py -> <name>.<abi>.pyd
    research.py is replaced by a tiny readable launcher shim that re-exports
    `main` from _sr_core (keeps `superresearch` = research:main, `python
    research.py …`, and the windowless pythonw supervisor re-exec all working —
@@ -26,11 +26,21 @@ PIPELINE
 4. Repack (regenerates RECORD) and retag the wheel platform + python-minor
    specific (cp<ver>-cp<ver>-<platform>).
 
-SCOPE (v1): the 5 top-level modules are compiled (the 2.1 MB core + the prompt
-IP). auth/ (small pairing/keystore plumbing against documented Firebase
-endpoints) and scripts/ stay as source for now — compiling package submodules
-has a PyInit symbol-name subtlety to validate first. Set --compile-auth to
-opt in once that's verified.
+SCOPE: every first-party top-level module is compiled (the pipeline core, the prompt
+IP, and the self-heal machinery) — i.e. all of `py-modules` in pyproject.toml.
+auth/ (small pairing/keystore plumbing against documented Firebase endpoints) and
+scripts/ stay as source deliberately — compiling package submodules has a PyInit
+symbol-name subtlety to validate first. Set --compile-auth to opt in once that's
+verified.
+
+Do NOT put a module count or a file size in prose anywhere in this file. Both drifted
+once already — the scope note kept counting the modules after a sixth was added and
+left uncompiled, and the compile banner kept quoting a core size the file had long
+outgrown. Numbers in comments have no authority behind them and nothing re-checks
+them. TOP_MODULES below is the only authority for what is compiled, the core's size
+is measured at build time, and tests/test_compiled_wheel_covers_every_module.py
+fails if either kind of number reappears here (including in a comment explaining
+this rule — it matches patterns, not intent).
 
 USAGE
 -----
@@ -55,14 +65,28 @@ REPO = Path(__file__).resolve().parent.parent  # tools/ -> repo root
 
 # First-party top-level modules to compile. research.py is special (renamed to
 # _sr_core so the readable launcher shim can keep the `research` name).
-TOP_MODULES = ["models", "prompts", "vision", "narrate"]
+#
+# This list must stay in step with `[tool.setuptools] py-modules` in
+# pyproject.toml — anything listed there and NOT here is packed into the wheel as
+# readable source. `selfheal` was exactly that: it was added to py-modules on
+# 2026-06-22, four days after this script was written, and shipped in the clear in
+# every wheel from then until 0.1.12 because nobody came back to this line.
+# tests/test_compiled_wheel_covers_every_module.py now fails if the two drift.
+TOP_MODULES = ["models", "prompts", "vision", "narrate", "selfheal"]
 AUTH_SUBMODULES = ["v2_flow", "keystore", "credentials", "pairing"]
 
-# Local-only admin/diagnostic scripts that sit in scripts/ but must NEVER ship in a
-# wheel. They're untracked, so a clean clone (e.g. the Mac build) doesn't have them —
-# shipping them from a working-tree build (Win/Linux) makes those wheels cosmetically
-# differ from the Mac one. Dropped from the unpacked tree so EVERY wheel (compiled +
-# the source fallback, every OS) is byte-consistent.
+# Admin/diagnostic scripts that sit in scripts/ but must NEVER ship in a wheel.
+#
+# The original rationale here said these were untracked, so the drop existed only to
+# stop a working-tree build (Win/Linux) from differing cosmetically against a clean
+# clone (Mac). That stopped being true on 2026-07-08, when both files were committed
+# under an unrelated change — nothing re-checked the claim, so the comment quietly
+# decayed into misdirection.
+#
+# What is actually true now: pyproject declares `packages = ["scripts"]`, so EVERY
+# .py added to scripts/ is packed into the wheel automatically, and this hardcoded
+# tuple is the ONLY thing keeping these two out. Add a new admin script to scripts/
+# and it ships, readable, unless you also add it here.
 DROP_FROM_WHEEL = ("scripts/dump_push_audit.py", "scripts/admin_cleanup_stale_ongoing.py")
 
 SHIM = '''#!/usr/bin/env python3
@@ -190,6 +214,21 @@ def main() -> None:
     print(f"[build] work={work}")
 
     # 1. source wheel (for metadata / entry_points / dist-info)
+    #
+    # Clear ./build first. `pip wheel <REPO>` drives setuptools IN-TREE, and
+    # setuptools' build_py copies declared modules into ./build/lib but NEVER prunes
+    # entries that are no longer declared — bdist_wheel then packs that whole
+    # directory. So a module renamed or dropped from py-modules keeps shipping, as
+    # readable source, from a stale copy that no longer has an on-disk counterpart.
+    # Nothing downstream can catch it: the wheel builds, installs and imports under
+    # the retired name, and the compile step never sees the file because it is not in
+    # TOP_MODULES. Deleting the directory costs one rebuild of files we are about to
+    # recompile anyway.
+    stale_build = REPO / "build"
+    if stale_build.exists():
+        print(f"[build] clearing stale {stale_build} (setuptools never prunes it)")
+        shutil.rmtree(stale_build, ignore_errors=True)
+
     (work / "src").mkdir()
     print("[build] building source wheel …")
     run([sys.executable, "-m", "pip", "wheel", str(REPO), "--no-deps", "-w", str(work / "src")])
@@ -222,7 +261,8 @@ def main() -> None:
     # 3a. research.py -> _sr_core.<abi>.pyd, then replace research.py with the shim
     core_src = comp / "_sr_core.py"
     shutil.copy(tree / "research.py", core_src)
-    print("[build] compiling research.py -> _sr_core (the 2.1MB core — slow, ~5-6 min) …")
+    core_mb = core_src.stat().st_size / (1024 * 1024)
+    print(f"[build] compiling research.py -> _sr_core ({core_mb:.1f} MB core — slow) …")
     nuitka_module(core_src, comp)
     core_pyd = find_artifact(comp, "_sr_core")
     shutil.copy(core_pyd, tree / core_pyd.name)
