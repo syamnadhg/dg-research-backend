@@ -4225,9 +4225,18 @@ _heartbeat_failures = 0
 # on change (see _heartbeat_loop / _device_version_fields).
 _last_published_version_fields: "dict | None" = None
 _version_publish_next_ms = 0
-# One-shot latch: the waiter's update outcome is published exactly once per serve
-# (see _consume_pending_update_result — the sentinel is deleted on read, so this is
-# belt-and-braces against a retry loop re-reading a file that is already gone).
+# One-shot latch: the waiter's update outcome is published exactly once per serve.
+#
+# ⚠ NOT because the sentinel is consumed on read. `_consume_pending_update_result`
+# deliberately does NOT delete a valid sentinel — it is the only copy of the
+# outcome, so it survives until the publish has actually landed and the caller
+# discards it. This latch is what stops a SECOND publish once the app has been
+# told, which is a different job from cleaning the file up.
+#
+# It is also set on ABSENCE, but only when nothing is pending: an upgrade whose
+# waiter is still running writes its sentinel after the package manager finishes,
+# so absence on one heartbeat is not proof that no outcome will arrive. See the
+# heartbeat's `_update_report_pending` gate.
 _update_result_published = False
 # While an upgrade helper is genuinely alive, the interim backend republishes an
 # "installing" status on this cadence. Slow on purpose: it exists so the app can

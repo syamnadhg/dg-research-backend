@@ -30,7 +30,15 @@ NODE = shutil.which("node")
 
 
 def _string_literals(fn):
-    """Every str constant in `fn`, as the VALUES Python produces — not source text."""
+    """The parsed AST of `fn`, for callers that walk it looking for str constants.
+
+    ⚠ Returns the TREE, not the literals — the name is historical. `js_constant`
+    and `evaluate_js` each do their own walk and read `ast.Constant` values, and
+    that is where the property this helper exists for comes from: a constant read
+    off the tree is the VALUE Python produces, with escapes already resolved,
+    rather than the source text between the quotes. Reading the source text is
+    what makes a JS payload full of backslashes impossible to match reliably.
+    """
     return ast.parse(textwrap.dedent(inspect.getsource(fn)))
 
 
