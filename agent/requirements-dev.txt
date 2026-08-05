@@ -7,4 +7,9 @@
 
 -r requirements.txt
 pytest>=8
-ruff>=0.5
+# Pinned EXACTLY, and to the same version as agent/pyproject.toml [dev] and the
+# repo root — see DGOPS-9508 there. This file advertises itself as mirroring
+# pyproject, so a floor here (it was `ruff>=0.5`) hands anyone who follows the
+# documented `pip install -r` path an unpinned ruff, and the repo-root lint count
+# stops being reproducible across machines — the exact thing the pin exists to stop.
+ruff==0.16.0
