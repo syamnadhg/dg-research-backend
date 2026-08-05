@@ -58114,6 +58114,31 @@ def _pipx_bundles_uv() -> bool:
         except Exception:
             py = None
     if not py:
+        # The shebang branch cannot work on Windows: `_pipx_cmd()` hands back
+        # `pipx.EXE`, a PE binary whose first bytes are "MZ", so `startswith("#!")`
+        # is never true and `py` stays None. That left this function structurally
+        # unable to return True on Windows, which quietly turns the caller's
+        # deliberately fail-OPEN guard into a fail-CLOSED one: a host where pipx
+        # bundles uv gets `--update` and the app's Update button refused outright,
+        # with a message telling the user to install a uv they already have.
+        #
+        # So ask pipx itself where it keeps its venvs and use pipx's own
+        # interpreter. Anything unexpected leaves `py` None and we return False
+        # exactly as before — this branch can only ADD a True, never remove one,
+        # so the worst case is the behaviour that shipped before the preflight.
+        try:
+            env = subprocess.run([*pipx, "environment", "--value", "PIPX_LOCAL_VENVS"],
+                                 capture_output=True, text=True, timeout=20)
+            if env.returncode == 0 and env.stdout.strip():
+                venv = Path(env.stdout.strip()) / "pipx"
+                for rel in (("Scripts", "python.exe"), ("bin", "python3"), ("bin", "python")):
+                    cand = venv.joinpath(*rel)
+                    if cand.exists():
+                        py = str(cand)
+                        break
+        except Exception:
+            py = None
+    if not py:
         return False
     try:
         return subprocess.run([py, "-c", "import uv"], capture_output=True,

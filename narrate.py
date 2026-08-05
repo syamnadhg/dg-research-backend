@@ -328,14 +328,32 @@ def _crop_right_fraction(png: bytes, frac: float) -> bytes:
 
 
 def _read_user_scope_env_safe(name: str) -> str:
+    """Read a Windows User-scope env var via PowerShell. "" off Windows or on failure.
+
+    The twin of research.py's `_read_user_scope_env`, and it MUST carry the same
+    CREATE_NO_WINDOW flag. The serve worker is spawned console-less on purpose, so
+    Windows hands any console child a brand-new VISIBLE console — without the flag
+    this pops a black window on the user's desktop on every narrate tick, for the
+    whole run, in a product whose supervisor runs under pythonw precisely to stay
+    invisible. Every other powershell/schtasks/wmic spawn in the codebase already
+    passes it; this one was missed.
+
+    It matters more in the compiled wheel than it looks. narrate.py's preferred key
+    lookup is `from research import resolve_gemini_api_key`, but in the wheel
+    research.py is only the launcher shim and does not export that name — the import
+    raises, is swallowed, and THIS fallback becomes the sole Gemini key lookup. So
+    the path runs for anyone whose key lives in Firestore or User-scope rather than
+    the serve process's own environment, not just for users with no key at all."""
     if sys.platform != "win32":
         return ""
     try:
         import subprocess
+        no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
         r = subprocess.run(
             ["powershell.exe", "-NoProfile", "-Command",
              f"[System.Environment]::GetEnvironmentVariable('{name}','User')"],
-            capture_output=True, text=True, timeout=5)
+            capture_output=True, text=True, timeout=5,
+            creationflags=no_window)
         return r.stdout.strip()
     except Exception:
         return ""
