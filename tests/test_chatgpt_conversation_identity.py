@@ -19,8 +19,9 @@ WHAT ACTUALLY HAPPENED (and it is not what the first read said):
     mouse drove the tab (07:02:04). By 07:04:00 the page was showing a completed
     23-minute report on an unrelated topic.
   * `links.json` recorded `/c/6a72ce1e-…`. ChatGPT encodes creation time in the
-    id's first group: that decodes to 2026-08-04 22:46:06 — the previous
-    evening. The P1 conversation `6a733ef8` decodes to 2026-08-05 06:47:36,
+    id's first group: that decodes to 2026-08-05 05:46:06Z — the previous
+    evening in the operator's timezone. The P1 conversation `6a733ef8` decodes to
+    2026-08-05 13:47:36Z,
     matching the observed P1 start to the second, which is what validates the
     method rather than assuming it.
   * Nothing downstream compared anything. `"chatgpt.com/c/" in url` was used at
@@ -40,7 +41,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -52,8 +53,18 @@ from _domshim import NODE, el, evaluate_js, run_js
 from conftest import code_only_deep
 
 # The two REAL conversation ids from the incident.
-STALE = "https://chatgpt.com/c/6a72ce1e-2284-83ea-abcb-acdf3db558b0"   # 2026-08-04 22:46:06
-FRESH = "https://chatgpt.com/c/6a733ef8-1111-2222-3333-444444444444"   # 2026-08-05 06:47:36
+STALE = "https://chatgpt.com/c/6a72ce1e-2284-83ea-abcb-acdf3db558b0"   # 2026-08-05 05:46:06Z
+FRESH = "https://chatgpt.com/c/6a733ef8-1111-2222-3333-444444444444"   # 2026-08-05 13:47:36Z
+# ⚠ Deliberately NAIVE, i.e. local — do not "fix" this to UTC. It mirrors what
+# production does: a run id carries `_%Y%m%d_%H%M%S` stamped by the machine in its
+# own zone, and `_run_start_epoch` reads it back with a naive `strptime`. Pinning
+# this to UTC makes the test disagree with the code it is testing, which is exactly
+# what happened on the first attempt at the timezone fix above — two tests that
+# compare a decoded directory stamp against this constant started failing.
+#
+# The distinction that matters: the ChatGPT conversation id encodes a true UTC
+# instant, so the assertion above must name UTC. A run-id directory name encodes a
+# LOCAL wall clock, so this must not.
 RUN_START = datetime(2026, 8, 5, 6, 47, 15).timestamp()
 
 needs_node = pytest.mark.skipif(NODE is None, reason="node required to run page JS")
@@ -62,12 +73,26 @@ needs_node = pytest.mark.skipif(NODE is None, reason="node required to run page 
 # ── The decoder, against ground truth ─────────────────────────────────────
 
 def test_the_decoder_reproduces_both_incident_timestamps():
-    """If this drifts, every other guard here is built on sand."""
-    def when(u):
-        return datetime.fromtimestamp(research._chatgpt_convo_epoch(u)) \
+    """If this drifts, every other guard here is built on sand.
+
+    ⚠ Asserted in UTC, and against the epoch itself. The first version formatted
+    with `datetime.fromtimestamp(...)` — LOCAL time — and compared it to strings
+    that were only correct in the timezone they were written in. It passed on the
+    machine that wrote it and failed in CI, which runs UTC: the same instant reads
+    as 22:46 on 4 August in one place and 05:46 on the 5th in the other.
+
+    A test whose verdict depends on where it runs is not a guard. The epoch is the
+    value the decoder actually returns, so that is what is pinned; the UTC
+    rendering is kept beside it because a bare integer is unreviewable.
+    """
+    assert research._chatgpt_convo_epoch(STALE) == 1785908766
+    assert research._chatgpt_convo_epoch(FRESH) == 1785937656
+
+    def when_utc(u):
+        return datetime.fromtimestamp(research._chatgpt_convo_epoch(u), timezone.utc) \
             .strftime("%Y-%m-%d %H:%M:%S")
-    assert when(STALE) == "2026-08-04 22:46:06"
-    assert when(FRESH) == "2026-08-05 06:47:36"
+    assert when_utc(STALE) == "2026-08-05 05:46:06"
+    assert when_utc(FRESH) == "2026-08-05 13:47:36"
 
 
 @pytest.mark.parametrize("url", [

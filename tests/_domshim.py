@@ -22,8 +22,10 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import os
 import shutil
 import subprocess
+import tempfile
 import textwrap
 from html.parser import HTMLParser
 
@@ -484,6 +486,18 @@ def run_js(spec, fn_src: str, arg=None) -> dict:
     """Run `fn_src` (a JS arrow/function expression) against `spec`.
 
     Returns {"ret": <return value>, "clicks": [labels...]}.
+
+    ⚠⚠ 2026-08-06 — THE SCRIPT GOES IN A FILE, NOT IN `node -e`. It used to be
+    passed as a single command-line argument, and Linux caps ONE argument at
+    128 KB (MAX_ARG_STRLEN) regardless of how much total argv room there is.
+    macOS is far more generous, so this passed locally and failed in CI with
+    `OSError: [Errno 7] Argument list too long` the moment a real captured panel
+    became the fixture: a 60 KB capture is a 79 KB spec, and the shim source is
+    added on top.
+    ⛔ The comment on `build()` had already flagged this exact ceiling — "the JSON
+    would be a 400 KB argv, near the OS limit" — and the `repeat` mechanism exists
+    to dodge it. Dodging a limit leaves it there for the next fixture; a temp file
+    removes it. Nothing here needs to be inline.
     """
     if NODE is None:
         raise RuntimeError("node is required to run page JS")
@@ -491,7 +505,11 @@ def run_js(spec, fn_src: str, arg=None) -> dict:
     argjs = "undefined" if arg is None else json.dumps(arg)
     js = (SHIM + "\nconsole.log(JSON.stringify(__run("
           + payload + ", " + fn_src.strip() + ", " + argjs + ")));\n")
-    p = subprocess.run([NODE, "-e", js], capture_output=True, text=True, timeout=60)
-    if p.returncode != 0:
-        raise AssertionError(f"node failed: {p.stderr}")
-    return json.loads(p.stdout.strip().splitlines()[-1])
+    with tempfile.TemporaryDirectory(prefix="sr_domshim_") as _d:
+        script = os.path.join(_d, "run.mjs" if "import " in js else "run.js")
+        with open(script, "w", encoding="utf-8") as _f:
+            _f.write(js)
+        p = subprocess.run([NODE, script], capture_output=True, text=True, timeout=60)
+        if p.returncode != 0:
+            raise AssertionError(f"node failed: {p.stderr}")
+        return json.loads(p.stdout.strip().splitlines()[-1])

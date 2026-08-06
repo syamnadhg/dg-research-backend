@@ -352,3 +352,39 @@ def test_geometry_stamping_leaves_a_deliberate_override_alone():
         {"tag": "section", "attrs": {}, "text": "",
          "kids": [{"tag": "div", "attrs": {"x": "-999"}, "text": "", "kids": []}]})
     assert spec["kids"][0]["attrs"]["x"] == "-999"
+
+
+# ── The harness must not depend on how much fits in a command line ───────────
+
+def test_the_shim_never_passes_the_script_as_a_command_line_argument():
+    """⚠ CI-only failure, 2026-08-06: `OSError: [Errno 7] Argument list too long`.
+
+    `run_js` embedded the shim source and the whole spec into a single `node -e`
+    argument. Linux caps ONE argument at 128 KB regardless of total argv room;
+    macOS is far more generous, so every one of these passed locally and five
+    failed on the runner. The huge-panel fixtures in the sibling suite are 455 KB
+    and 207 KB of JSON — nowhere near fitting.
+
+    The fix writes the script to a temp file, which removes the dependency on any
+    limit rather than staying under a particular one. Asserted on the call shape,
+    because the failure cannot be reproduced on this platform: the guard has to be
+    "no payload in argv", not "payload is small enough".
+    """
+    from conftest import code_only
+    import _domshim
+    src = code_only(_domshim.run_js)
+    assert '"-e"' not in src and "'-e'" not in src, "the script is back in argv"
+    assert "TemporaryDirectory" in src
+    assert "subprocess.run([NODE, script]" in src
+
+
+def test_a_spec_far_larger_than_a_command_line_still_runs():
+    """The size that broke CI, executed end to end. 200k of JSON is past every
+    single-argument limit on every platform this suite runs on."""
+    big = {"tag": "div", "attrs": {}, "text": "", "kids": [
+        {"tag": "span", "attrs": {"data-i": str(i), "class": "x" * 40},
+         "text": f"row {i}", "kids": []} for i in range(3000)]}
+    import json as _json
+    assert len(_json.dumps(big)) > 200_000
+    r = run_js(big, "() => document.querySelectorAll('span').length")
+    assert r["ret"] == 3000
