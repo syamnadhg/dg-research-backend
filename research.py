@@ -5513,6 +5513,52 @@ def _write_update_status(device_id: str, status: dict) -> bool:
         return False
 
 
+def _update_failure_reason(raw: dict) -> str:
+    """The one sentence the app shows for an upgrade that did not work.
+
+    Extracted because it is a DECISION and not formatting: a plain nonzero exit, a
+    timeout, and a timeout whose kill could not be confirmed each need a DIFFERENT
+    repair from the operator, and inlined at its only call site nothing could pin
+    which one of the three a given sentinel produces.
+
+    A timeout is deliberately not described as an exit status — "exit 124" reads as
+    the package manager choosing to fail, when in fact nothing ever answered. And it
+    says the install may be half-finished, because pipx upgrades IN PLACE: a package
+    manager stopped part-way can leave the venv neither the old build nor the new
+    one, and no exit code anywhere records that. An unconfirmed kill earns the extra
+    sentence because a survivor can hold the venv open and make the repair itself
+    fail — the one case where the answer is a reboot rather than another attempt."""
+    if not raw.get("timed_out"):
+        rc = raw.get("rc")
+        return f"pipx upgrade failed (exit {rc if rc is not None else 'unknown'})"
+    reason = ("the upgrade was still running after 20 minutes and was stopped — the "
+              "install may be half-finished, so run `superresearch --update` on that "
+              "computer")
+    if raw.get("orphaned"):
+        reason += (" (a process from the upgrade survived being stopped; reboot that "
+                   "computer if the repair fails too)")
+    return reason
+
+
+def _update_diag_from(raw: dict) -> dict:
+    """The waiter's own journal + log tail, as `updateStatus` keys.
+
+    Shared by every verdict that carries evidence, so a new one cannot silently ship
+    without it — which is exactly what happened to the needs-restart verdict: the
+    waiter was changed to carry its tail on success FOR that case, and the only
+    branch that attached anything was the failure one, so the change was inert.
+
+    Prefers what the waiter captured (it read those files while they were still its
+    own, before any later attempt could clear them) and falls back to reading them
+    here when it left nothing behind."""
+    diag: dict = {}
+    if raw.get("journal"):
+        diag["journal"] = str(raw["journal"])[-6000:]
+    if raw.get("log_tail"):
+        diag["logTail"] = str(raw["log_tail"])[-4000:]
+    return diag or _update_diagnostics()
+
+
 def _consume_pending_update_result() -> "dict | None":
     """Read + delete the detached waiter's outcome sentinel and translate it into an
     `updateStatus` payload. Returns None when no app-driven update ran.
@@ -5580,10 +5626,16 @@ def _consume_pending_update_result() -> "dict | None":
         if raw.get("restarting") and 0 <= _settling < _RESTART_SETTLE_MS:
             return None
         if want and served and served != want:
+            # ⭐ The evidence rides along HERE, not only on the failure path. This is
+            # the confusing outcome the waiter's always-carry-the-tail change was
+            # made for — pipx reported success while the version did not move — and
+            # attaching it only to `state: failed` left exactly this case with
+            # nothing to look at, so the change had no effect at all.
             return {"state": "installed", "current": served, "latest": want,
                     "needsRestart": True,
                     "reason": f"v{want} is installed but the backend is still running "
-                              f"v{served} — restart it to finish"}
+                              f"v{served} — restart it to finish",
+                    **_update_diag_from(raw)}
         # No live marker to read (nothing serving yet, or a stale one): the files
         # landed and we cannot say more than that.
         return {"state": "installed", "current": served or running,
@@ -5591,27 +5643,11 @@ def _consume_pending_update_result() -> "dict | None":
     # Nonzero exit — surface the real pipx error, not just "failed". The tail is what
     # names the actual cause (e.g. a uv backend that couldn't be resolved).
     tail = " ".join((raw.get("log_tail") or "").split())
-    # A timeout is not an exit status — say so, because "exit 124" reads like the
-    # package manager chose to fail when in fact nothing ever answered.
-    if raw.get("timed_out"):
-        reason = "the upgrade was still running after 20 minutes and was stopped"
-    else:
-        reason = f"pipx upgrade failed (exit {rc if rc is not None else 'unknown'})"
+    reason = _update_failure_reason(raw)
     if tail:
         reason = f"{reason}: {tail[:400]}"
-    # The waiter's own journal and full tail travel with the outcome so the app can
-    # show the whole story rather than the one truncated sentence in `reason`. Prefer
-    # what the waiter captured — it read the files while they were still its own —
-    # and fall back to reading them here if it left nothing.
-    diag = {}
-    if raw.get("journal"):
-        diag["journal"] = str(raw["journal"])[-6000:]
-    if raw.get("log_tail"):
-        diag["logTail"] = str(raw["log_tail"])[-4000:]
-    if not diag:
-        diag = _update_diagnostics()
     return {"state": "failed", "current": running, "latest": want or None,
-            "reason": reason, **diag}
+            "reason": reason, **_update_diag_from(raw)}
 
 
 def _update_report_pending() -> bool:
@@ -60721,22 +60757,133 @@ time.sleep(2)  # grace for the OS to release the venv's file handles
 # blocks, this process holds the only knowledge of the outcome and publishes
 # nothing, so the app spins until its own timeout with no reason to show. Twenty
 # minutes is far above a real install and far below "forever".
-# On timeout: kill the tree, then report it as a FAILURE with a distinguishable
+# On timeout: kill the whole TREE, then report it as a FAILURE with a distinguishable
 # reason, because an update that never finished is not an update that succeeded.
+#
+# ⭐⭐ 2026-08-06 — WHY THE TREE AND NOT THE CHILD. `subprocess.run(timeout=)` kills
+# only the process it started, and the process it starts here is a FRONT-END: pipx
+# shells out to pip or uv, so the thing actually holding the network read / the lock
+# / the venv is a GRANDCHILD, and it keeps running after the timeout "handled" it.
+# On Windows that is not untidy, it is the husk this whole waiter exists to prevent:
+# `free_venv` is true there, so the daemon-loop has already been killed and the
+# restart leg is skipped on a nonzero rc — leaving the box offline with a surviving
+# grandchild holding the venv's DLLs open, which is exactly what makes the NEXT
+# repair attempt fail too. So: own the group, then kill the group, then PROVE it is
+# gone, and journal it either way — an orphan we could not reap is the single most
+# useful thing the next operator can be told.
 _TIMEOUT_S = 1200
+
+
+def _kill_tree(proc, pgid):
+    """SIGTERM then SIGKILL the package manager AND its descendants.
+
+    Returns True only when nothing of the tree is left. POSIX: the child was spawned
+    with `start_new_session`, so it leads its own group and killing that group cannot
+    reach us — and once the group is empty `killpg` raises ProcessLookupError, which
+    is the only real PROOF available. The direct child has to be reaped before that
+    probe, because a zombie keeps its group alive and would read as a survivor.
+    Windows has no such group: `taskkill /T` walking the parent-child chain is the
+    best available, so 'clean' there means the child itself is gone."""
+    if sys.platform == "win32":
+        try:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=120)
+        except Exception:
+            try:
+                proc.kill()  # taskkill absent/blocked — at least drop the front-end
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=30)
+        except Exception:
+            pass
+        return proc.poll() is not None
+    import signal as _signal
+    if pgid == os.getpgid(0):
+        # ⛔ REFUSE. The child did not get its own session after all, so this group is
+        # OURS — killing it would take this waiter down before it could publish
+        # anything, turning a reported timeout back into the silent hang the whole
+        # sentinel exists to end. Settle for the front-end and say so honestly.
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            pass
+        return False
+    for _sig in (_signal.SIGTERM, _signal.SIGKILL):
+        try:
+            os.killpg(pgid, _sig)
+        except ProcessLookupError:
+            break  # group already empty
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=10)  # reap, so the probe below sees a real absence
+        except Exception:
+            pass
+    if proc.poll() is None:
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except Exception:
+        return False  # cannot see it, cannot claim it is gone
+    return False
+
+
 _note("package_manager_start", cmd=cmd, timeout_s=_TIMEOUT_S)
 _timed_out = False
+_orphaned = False
+_spawn_kw = {}
+if sys.platform == "win32":
+    _spawn_kw["creationflags"] = 0x00000200  # CREATE_NEW_PROCESS_GROUP
+else:
+    # Makes the child a session AND group leader: its pgid is its own pid, the group
+    # contains only its descendants, and a Ctrl-C in the launching terminal cannot
+    # reach it either.
+    _spawn_kw["start_new_session"] = True
 try:
-    rc = subprocess.run(cmd, timeout=_TIMEOUT_S).returncode
-except subprocess.TimeoutExpired:
-    _timed_out = True
-    rc = 124  # conventional timeout code, and never a real pipx exit status
-    _note("package_manager_timeout", after_s=_TIMEOUT_S)
+    _proc = subprocess.Popen(cmd, **_spawn_kw)
 except Exception as _pe:
     rc = 125
     _note("package_manager_error", error=str(_pe)[:200])
 else:
-    _note("package_manager_done", rc=rc)
+    # Read the group id while the child is CERTAINLY alive — after it is reaped
+    # `getpgid` raises, and we would have nothing left to aim at. It equals the pid
+    # for a session leader; the fallback covers a platform that ignored the request.
+    _pgid = _proc.pid
+    try:
+        _pgid = os.getpgid(_proc.pid)
+    except Exception:
+        pass
+    try:
+        rc = _proc.wait(timeout=_TIMEOUT_S)
+        _note("package_manager_done", rc=rc)
+    except subprocess.TimeoutExpired:
+        _timed_out = True
+        rc = 124  # conventional timeout code, and never a real pipx exit status
+        _note("package_manager_timeout", after_s=_TIMEOUT_S, pid=_proc.pid,
+              pgid=_pgid)
+        _orphaned = not _kill_tree(_proc, _pgid)
+        # ⛔ Say plainly that the install was interrupted MID-FLIGHT. pipx upgrades
+        # in place, so a package manager stopped part-way can leave the venv neither
+        # the old build nor the new one, and no exit code anywhere records that. The
+        # operator repair is the same either way (`superresearch --update` on the
+        # machine) but they can only choose it if someone tells them.
+        _note("venv_may_be_inconsistent", killed_tree=not _orphaned,
+              repair="run superresearch --update on this machine")
+        if _orphaned:
+            _note("package_manager_orphan", pid=_proc.pid, pgid=_pgid,
+                  detail="a process from the upgrade survived the kill and may still "
+                         "hold the venv open")
+    except Exception as _we:
+        rc = 125
+        _note("package_manager_error", error=str(_we)[:200])
 # Record the outcome BEFORE the restart. This process is the only thing that ever
 # learns whether the upgrade actually worked, and it cannot tell the app directly:
 # it runs on a NON-venv python by design, so it has no firebase-admin and no
@@ -60779,6 +60926,11 @@ if _res:
                     "latest": os.environ.get("DG_LIFECYCLE_TO") or "",
                     "restarting": bool(after) and rc == 0,
                     "timed_out": _timed_out,
+                    # A kill we could not confirm changes the operator's repair — a
+                    # surviving process can hold the venv open and make the next
+                    # attempt fail the same way — so it travels as its own field
+                    # rather than only as a line inside the journal.
+                    "orphaned": _orphaned,
                     "journal": _journal,
                     "log_tail": _tail}
         _fd, _tmp = tempfile.mkstemp(dir=os.path.dirname(_res) or ".",
@@ -60797,8 +60949,14 @@ if after and rc == 0:
     except Exception as _re:
         _note("restart_failed", error=str(_re)[:200])
 elif after:
-    _note("restart_skipped", rc=rc, reason="upgrade did not succeed")
-_note("waiter_exit", rc=rc, timed_out=_timed_out)
+    # Deliberately NOT attempted after a timeout either, even though the box may be
+    # offline until it is: pipx upgrades in place, so the venv we would be starting
+    # could be half-written, and off-Windows the daemon-loop is still alive and
+    # SERVING — cycling it onto a half-built venv would break a working machine to
+    # chase a broken update. The honest failure plus the repair line beats that.
+    _note("restart_skipped", rc=rc, timed_out=_timed_out,
+          reason="upgrade did not succeed")
+_note("waiter_exit", rc=rc, timed_out=_timed_out, orphaned=_orphaned)
 '''
 
 
@@ -61128,10 +61286,8 @@ def _spawn_detached_lifecycle(action: str, *, restart_after: bool = False,
     if pipx is None or py is None:
         return None
     log_path = _STATE_DIR / f"{action}.log"
-    logf = subprocess.DEVNULL
     try:
         _STATE_DIR.mkdir(parents=True, exist_ok=True)
-        logf = open(log_path, "ab")
     except Exception:
         pass
     # Drop any sentinel left by an EARLIER update before this one can write its own.
@@ -61142,11 +61298,27 @@ def _spawn_detached_lifecycle(action: str, *, restart_after: bool = False,
     # while the waiter runs, so without this the next attempt's steps would be read
     # as a continuation of the last one's — and the whole point of it is to say
     # where THIS attempt stopped.
-    for _stale in (_UPDATE_RESULT_PATH, _UPDATE_INTENT_PATH, _UPDATE_JOURNAL_PATH):
+    # ⛔ AND THE LOG, which is the file every one of those reasons was written about:
+    # it is opened append-only below and the waiter publishes its TAIL as this
+    # attempt's evidence, so leaving it would hand the user the PREVIOUS attempt's
+    # error as the explanation for this one — in the diagnostics and in the single
+    # sentence `reason` they actually read. Cleared BEFORE the handle is opened,
+    # because an unlink after the open writes into an inode nothing can read back
+    # (POSIX) or fails outright (Windows).
+    for _stale in (_UPDATE_RESULT_PATH, _UPDATE_INTENT_PATH, _UPDATE_JOURNAL_PATH,
+                   log_path):
         try:
             _stale.unlink(missing_ok=True)
         except Exception:
             pass
+    logf = subprocess.DEVNULL
+    try:
+        # "wb", not "ab": belt and braces with the unlink above, which a Windows box
+        # will refuse while a previous waiter still holds the file open. Truncating
+        # at open means a clear the OS declined cannot silently become an append.
+        logf = open(log_path, "wb")
+    except Exception:
+        pass
     waiter_argv = [str(os.getpid()), *pipx, action, "superresearch"]
     escape: list[str] = []
     entry = None

@@ -12,12 +12,15 @@ hang, the package manager has a ceiling so a hang becomes a reported failure, an
 no-sentinel verdict — the branch a hang actually lands in — carries the journal.
 """
 import ast
+import subprocess
+import sys
+from pathlib import Path
 import json
 
 import pytest
 
 import research
-from conftest import code_only
+from conftest import code_only, serving_version
 
 
 WAITER = research._LIFECYCLE_WAITER
@@ -42,7 +45,9 @@ def test_the_waiter_uses_only_the_standard_library():
             imported.update(a.name.split(".")[0] for a in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.add(node.module.split(".")[0])
-    allowed = {"os", "sys", "time", "subprocess", "json", "tempfile", "ctypes"}
+    # `signal` joined them with the process-tree kill: killing a process GROUP needs
+    # the signal numbers, and it is as much stdlib as the rest.
+    allowed = {"os", "sys", "time", "subprocess", "json", "tempfile", "ctypes", "signal"}
     assert imported <= allowed, f"non-stdlib import in the waiter: {imported - allowed}"
 
 
@@ -51,7 +56,7 @@ def test_the_journal_is_written_before_the_step_that_can_hang():
     journaled, a hang leaves no record of reaching it."""
     src = code_only(WAITER)
     start = src.index('_note("package_manager_start"')
-    run = src.index("subprocess.run(cmd, timeout=")
+    run = src.index("subprocess.Popen(cmd,")
     assert start < run, "the start is journaled after the call it describes"
 
 
@@ -92,8 +97,9 @@ def test_the_log_tail_is_carried_even_on_success():
 
 def test_the_outcome_carries_the_journal_and_the_timeout_flag():
     src = code_only(WAITER)
-    i = src.index("_payload = {")
-    payload = src[i:i + 700]
+    # Bounded by the write that follows it rather than a character count, so growing
+    # the payload cannot silently move a field out of the window being checked.
+    payload = src[src.index("_payload = {"):src.index("_fd, _tmp =")]
     assert '"journal": _journal' in payload
     assert '"timed_out": _timed_out' in payload
 
@@ -126,7 +132,97 @@ def test_a_new_attempt_truncates_the_previous_journal():
     steps read as a continuation of this one's."""
     src = code_only(research._spawn_detached_lifecycle)
     i = src.index("for _stale in (")
-    assert "_UPDATE_JOURNAL_PATH" in src[i:i + 200]
+    assert "_UPDATE_JOURNAL_PATH" in src[i:i + 220]
+
+
+class TestTheLogBelongsToOneAttempt:
+    """⭐ The log is the file every reason for truncating the journal was written
+    about, and it was the one left alone. It is opened append-only and its TAIL is
+    published as this attempt's evidence, so a retry handed the user the PREVIOUS
+    attempt's error as the explanation for this one — in the diagnostics and in the
+    single sentence they actually read."""
+
+    @staticmethod
+    def _spawn(monkeypatch, tmp_path, *, popen):
+        monkeypatch.setattr(research, "_STATE_DIR", tmp_path)
+        monkeypatch.setattr(research, "_pipx_cmd", lambda: ["pipx"])
+        monkeypatch.setattr(research, "_path_python", lambda: sys.executable)
+        monkeypatch.setattr(research, "_enumerate_research_py_procs", lambda: [])
+        monkeypatch.setattr(subprocess, "Popen", popen)
+        try:
+            return research._spawn_detached_lifecycle("upgrade", current="0.1.12",
+                                                      latest="0.1.13")
+        finally:
+            research._ALWAYS_PROTECTED_PIDS.discard(4242)
+
+    def test_the_helper_starts_with_an_empty_log(self, tmp_path, monkeypatch):
+        log = tmp_path / "upgrade.log"
+        log.write_text("ERROR: no matching distribution for superresearch==0.1.11\n",
+                       encoding="utf-8")
+        seen = {}
+
+        class _Proc:
+            pid = 4242
+
+        def _popen(cmd, **kw):
+            # Read it at the moment the helper is launched — that is the state the
+            # helper will publish the tail of, and the only moment worth asserting on.
+            seen["log"] = log.read_text(encoding="utf-8") if log.exists() else None
+            return _Proc()
+
+        assert self._spawn(monkeypatch, tmp_path, popen=_popen) == 4242
+        assert seen["log"] == "", \
+            "the previous attempt's error is still there to be republished as this one's"
+
+    def test_the_stale_log_goes_even_if_it_cannot_be_reopened(self, tmp_path, monkeypatch):
+        """Windows refuses to unlink a file another process still holds open, and it
+        equally refuses to truncate one — so the clear cannot rest on either step
+        alone. With the open refused, the file must still be gone."""
+        import builtins
+        log = tmp_path / "upgrade.log"
+        log.write_text("ERROR: from the attempt before last\n", encoding="utf-8")
+        real_open = builtins.open
+
+        def _refuse(file, *a, **kw):
+            if str(file).endswith("upgrade.log"):
+                raise PermissionError("being used by another process")
+            return real_open(file, *a, **kw)
+
+        monkeypatch.setattr(builtins, "open", _refuse)
+
+        class _Proc:
+            pid = 4242
+
+        assert self._spawn(monkeypatch, tmp_path,
+                           popen=lambda cmd, **kw: _Proc()) == 4242
+        assert not log.exists(), "a stale log survived a refused open"
+
+    def test_the_open_truncates_even_if_the_unlink_is_refused(self, tmp_path,
+                                                              monkeypatch):
+        """The mirror of the test above, and the reason there are two steps rather
+        than one: with the unlink refused — a Windows box whose previous helper still
+        holds the file — the open itself has to be what empties it."""
+        log = tmp_path / "upgrade.log"
+        log.write_text("ERROR: from the attempt before last\n", encoding="utf-8")
+        real_unlink = Path.unlink
+
+        def _refuse(self, *a, **kw):
+            if str(self).endswith("upgrade.log"):
+                raise PermissionError("being used by another process")
+            return real_unlink(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "unlink", _refuse)
+        seen = {}
+
+        class _Proc:
+            pid = 4242
+
+        def _popen(cmd, **kw):
+            seen["log"] = log.read_text(encoding="utf-8") if log.exists() else None
+            return _Proc()
+
+        assert self._spawn(monkeypatch, tmp_path, popen=_popen) == 4242
+        assert seen["log"] == "", "the unlink was refused and nothing else cleared it"
 
 
 # ── Publishing the evidence ──────────────────────────────────────────────────
@@ -195,18 +291,91 @@ def test_the_no_sentinel_verdict_carries_the_diagnostics():
 
 def test_a_failed_sentinel_prefers_what_the_helper_captured():
     """The helper read those files while they were still its own. Falling back to
-    reading them here covers a helper that left none."""
-    src = code_only(research._consume_pending_update_result)
-    assert 'raw.get("journal")' in src
-    assert "_update_diagnostics()" in src
+    reading them here covers a helper that left none.
+
+    CALLED, not grepped: the preference is now an extracted decision, so the test
+    can watch it choose instead of confirming that the words appear."""
+    out = research._update_diag_from({"journal": "from-the-helper", "log_tail": "tail"})
+    assert out == {"journal": "from-the-helper", "logTail": "tail"}
+
+
+def test_an_empty_sentinel_falls_back_to_reading_the_files(tmp_path, monkeypatch):
+    """The helper that never got far enough to capture anything is the hang case —
+    the one that most needs the fallback."""
+    monkeypatch.setattr(research, "_UPDATE_JOURNAL_PATH", tmp_path / "j.jsonl")
+    monkeypatch.setattr(research, "_STATE_DIR", tmp_path)
+    (tmp_path / "j.jsonl").write_text('{"t":1,"step":"waiter_started"}\n', encoding="utf-8")
+    out = research._update_diag_from({"journal": "", "log_tail": ""})
+    assert "waiter_started" in out["journal"]
 
 
 def test_a_timeout_gets_its_own_sentence_not_an_exit_code():
     """"exit 124" reads as though the package manager chose to fail, when in fact
     nothing ever answered."""
-    src = code_only(research._consume_pending_update_result)
-    i = src.index('raw.get("timed_out")')
-    assert "20 minutes" in src[i:i + 300]
+    timed_out = research._update_failure_reason({"rc": 124, "timed_out": True})
+    assert "20 minutes" in timed_out
+    assert "124" not in timed_out
+    plain = research._update_failure_reason({"rc": 1, "timed_out": False})
+    assert plain == "pipx upgrade failed (exit 1)"
+
+
+def test_a_timeout_says_the_install_may_be_half_finished():
+    """pipx upgrades IN PLACE, so a package manager stopped part-way leaves the venv
+    neither build. The user cannot choose the repair unless they are told."""
+    reason = research._update_failure_reason({"rc": 124, "timed_out": True})
+    assert "half-finished" in reason and "superresearch --update" in reason
+
+
+def test_an_unconfirmed_kill_asks_for_a_reboot_instead():
+    """A survivor holds the venv open and makes the repair fail the same way, so this
+    is the one case where another attempt is the wrong advice."""
+    reason = research._update_failure_reason({"rc": 124, "timed_out": True,
+                                              "orphaned": True})
+    assert "reboot" in reason
+    assert "reboot" not in research._update_failure_reason({"rc": 124, "timed_out": True})
+
+
+class TestTheSuccessThatDidNotTakeCarriesEvidenceToo:
+    """⭐ The waiter was changed to carry its log tail on SUCCESS, for one specific
+    outcome: pipx reports success and the version does not move. The only branch that
+    attached anything was the failure one, so that change was INERT — the confusing
+    case it was made for still arrived with nothing to look at.
+
+    (The commit describing it therefore claimed a behaviour the code did not have,
+    which is the more expensive half of the defect.)"""
+
+    @staticmethod
+    def _sentinel(tmp_path, monkeypatch, payload):
+        p = tmp_path / "update_result.json"
+        p.write_text(json.dumps(payload), encoding="utf-8")
+        monkeypatch.setattr(research, "_UPDATE_RESULT_PATH", p)
+
+    def test_installed_but_still_serving_the_old_build(self, tmp_path, monkeypatch):
+        self._sentinel(tmp_path, monkeypatch, {
+            "action": "upgrade", "rc": 0, "current": "0.1.12", "latest": "0.1.13",
+            "journal": '{"t":9.4,"step":"restart_issued"}\n',
+            "log_tail": "installed package superresearch 0.1.13",
+        })
+        monkeypatch.setattr(research, "_sr_version", lambda: "0.1.13")
+        serving_version(monkeypatch, "0.1.12")
+        st = research._consume_pending_update_result()
+        assert st["needsRestart"] is True
+        assert "restart_issued" in st["journal"], \
+            "the one outcome the carried tail exists for still has no evidence"
+        assert "installed package" in st["logTail"]
+
+    def test_a_healthy_update_stays_clean(self, tmp_path, monkeypatch):
+        """No evidence fields on a success that worked — an empty "Show details" is a
+        different claim from "nothing was captured", and the row must not offer one."""
+        self._sentinel(tmp_path, monkeypatch, {
+            "action": "upgrade", "rc": 0, "current": "0.1.12", "latest": "0.1.13",
+            "journal": '{"t":9.4,"step":"restart_issued"}\n', "log_tail": "installed",
+        })
+        monkeypatch.setattr(research, "_sr_version", lambda: "0.1.13")
+        serving_version(monkeypatch, "0.1.13")
+        st = research._consume_pending_update_result()
+        assert st == {"state": "installed", "current": "0.1.13", "latest": "0.1.13",
+                      "needsRestart": False, "reason": ""}
 
 
 def test_the_journal_path_sits_beside_the_other_update_state():
