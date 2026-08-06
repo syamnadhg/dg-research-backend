@@ -105,8 +105,22 @@ def test_brief_copy_has_no_duplicated_inline_literals():
 
 def test_all_four_brief_sites_use_the_helper():
     src = _module_src()
-    # 2 default + 2 rejected calls (definition line uses `def`, not a call).
-    assert src.count("fail_agent(platform_l, *_brief_send_fail_copy(platform))") == 2
+    # 3 default + 2 rejected calls (definition line uses `def`, not a call).
+    # 2026-08-05: 2 -> 3 default. The ChatGPT post-send landing assertion is a
+    # fifth brief-fail site — a send that never entered a conversation of this
+    # run is a failed send, and it must speak with the same voice as the others.
+    # 2026-08-05 (second wave): 2 -> 4 rejected. The PRE-send identity gate adds two
+    # more — one for "new-chat recovery could not reach a fresh composer" and one for
+    # "recovered, but the brief went with the old thread". Both are a brief that never
+    # reached the agent, so both speak with the same voice; the point of the count is
+    # that no site hand-rolls its own copy.
+    # 2026-08-05 (review pass, f8): those two collapsed into ONE call inside
+    # `_refuse_foreign_chatgpt_tab`, and it uses the DEFAULT body — the card had been
+    # telling the user the upload was bounced on a path where the brief never left our
+    # side. So default 3 -> 4 and rejected 4 -> 2, and the two that stayed `rejected`
+    # are the genuine ones: the attach chip and the pasted chip both vanished at send
+    # time and re-attaching failed.
+    assert src.count("fail_agent(platform_l, *_brief_send_fail_copy(platform))") == 4
     assert src.count(
         "fail_agent(platform_l, *_brief_send_fail_copy(platform, rejected=True))"
     ) == 2

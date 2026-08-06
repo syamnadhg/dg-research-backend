@@ -126,7 +126,9 @@ def test_step1_sets_effort_via_dom():
     # the submenu is polled for. The old anchor clicked from inside the page and
     # called that "opened" — nine "Max not found" WARNs in the corpus against one
     # success say it never was.
-    eff_idx = src.find("_eff_marked = False if _effort_already_known")
+    # 2026-08-05 (review, f3): `_eff_marked` became `_eff_mark`, a dict, so the marker
+    # can report the row it chose and the anchor-shaped candidates it refused.
+    eff_idx = src.find("_eff_mark = {} if _effort_already_known")
     set_idx = src.find("'max effort'")
     assert eff_idx != -1 and eff_idx < set_idx, (
         "the Effort submenu must open before Max is selected inside it (#745)."

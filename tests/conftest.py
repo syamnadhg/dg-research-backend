@@ -19,6 +19,15 @@ import pytest
 # Force OFF at collection time — before any test module imports `research`.
 os.environ["DG_ALERT_AI_COPY"] = "0"
 
+# Same reason, different flag: `FORCE_COLOR` makes `_USE_COLOR` true even when
+# stdout is a pipe, which is precisely the case under pytest. Several CI images
+# and dev shells export it globally, and every assertion that compares a `_c()`
+# result to plain text would then see ANSI escapes. Colour is a display
+# decision, never test input — pin it off for the whole suite. Tests that need
+# it on pass the value into `_color_decision` directly or set it on a
+# subprocess env (see tests/test_cli_color_decision.py).
+os.environ.pop("FORCE_COLOR", None)
+
 
 def serving_version(monkeypatch, version: "str | None"):
     """Say what the process publishing the update verdict is executing.

@@ -54,7 +54,13 @@ _SRC = Path(research.__file__).read_text(encoding="utf-8")
 # assertions match wherever the logic now lives.
 _POLL = (inspect.getsource(research.poll_all_agents_round_robin)
          + "\n" + inspect.getsource(research._resolve_parked_agent_decision))
-_GEM = inspect.getsource(research.start_agent_no_gemini_wait)
+# 2026-08-05 (review pass, f12): the two ChatGPT foreign-tab refusals moved OUT of
+# start_agent_no_gemini_wait into `_refuse_foreign_chatgpt_tab` so the decision could
+# finally be EXECUTED by a test — nothing in this suite runs the 700-line send
+# function, and mutation proved a dropped `not` there was invisible. Concatenate both,
+# same reason as _POLL above: the platform-name rule must follow the logic.
+_GEM = (inspect.getsource(research.start_agent_no_gemini_wait)
+        + "\n" + inspect.getsource(research._refuse_foreign_chatgpt_tab))
 _P2 = inspect.getsource(research.run_phase2)
 _RUNPIPE = inspect.getsource(research.run_pipeline)
 _FAIL_AGENT = inspect.getsource(research.fail_agent)
@@ -303,7 +309,23 @@ def test_brief_fail_copy_uses_platform_not_label():
     # PASS the display name to it. The platform-name rule is enforced by (a) all
     # four sites passing `platform`, never `label`, and (b) the helper using the
     # {platform} placeholder.
-    assert _GEM.count("_brief_send_fail_copy(platform") == 4
+    # 2026-08-05: 4 -> 5 — the ChatGPT post-send landing assertion. A send that
+    # never entered a conversation created by THIS run is a failed send, so it
+    # joins the same copy helper and the same platform-name rule.
+    # 2026-08-05 (second wave): 5 -> 7 — the PRE-send identity gate. Refusing to send
+    # into a conversation that predates the run fails the leg two ways (recovery could
+    # not reach a fresh composer / it did but the brief stayed with the old thread),
+    # and both are a brief that never reached the agent.
+    # 2026-08-05 (second wave): 5 -> 7. The PRE-send identity gate contributes ONE
+    # (a refusal that ends the leg — its two branches were collapsed after mutation
+    # testing showed the flag choosing between them carried no behaviour), and the
+    # setup-side twin contributes one more: when DR setup fails AND the tab is on a
+    # dated conversation, the vision/CUA rung must not be pointed at it.
+    # 2026-08-05 (review pass, f8+f12): 7 -> 6. Those two became ONE call, in the
+    # extracted `_refuse_foreign_chatgpt_tab` (see _GEM above) — and it now uses the
+    # DEFAULT body, because on that path nothing was ever uploaded for the surface to
+    # bounce. 5 sites in the send function + 1 in the helper.
+    assert _GEM.count("_brief_send_fail_copy(platform") == 6
     assert "_brief_send_fail_copy(label" not in _GEM
     assert "brief to {label}" not in _GEM
     _copy_src = inspect.getsource(research._brief_send_fail_copy)

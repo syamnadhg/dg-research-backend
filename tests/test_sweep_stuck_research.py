@@ -75,7 +75,16 @@ class _FakeCol:
         self._store = store
         self._fail_set = set(fail_doc_ids or [])
 
-    def where(self, _field, _op, _value):
+    def where(self, *args, filter=None):
+        """Mirrors the REAL Firestore signature — the `filter=` keyword form.
+
+        ⚠ Positional args are REFUSED, not merely accepted. The library still
+        takes them, with a `UserWarning: Detected filter using positional
+        arguments` that printed into `--serve`'s banner; a fake that tolerated
+        both forms would let a call site quietly regress and stay green.
+        """
+        assert not args, f"use where(filter=FieldFilter(...)), not {args!r}"
+        assert filter is not None, "where() called with no filter at all"
         # Return all docs (test fixtures pre-filter by deviceId).
         snaps = [
             _FakeSnap(did, dict(p), self._store, fail_on_update=(did in self._fail_set))

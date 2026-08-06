@@ -177,6 +177,18 @@ async def narrate_panel(
     if now - _M.last_call_ts < MIN_GAP_S:
         _M.skipped_cooldown += 1
         return None
+    # ⚠ 2026-08-06 — a zero budget means SWITCHED OFF, not USED UP. The vision
+    # narrator is retired (see PHASE_BUDGET above: it defaults to 0 unless
+    # DG_VISION_NARRATE is set), and this branch was logging an exhaustion
+    # WARNING on every single call for a feature nobody enabled — 42 of them in
+    # one run. The log-once guard below could never suppress them either: it
+    # compares the call counter against the budget, and on this path the counter
+    # is never incremented, so `0 == 0` held on every call. A retired feature
+    # must be silent, otherwise its noise gets read as a live fault — which is
+    # exactly how these got mistaken for the text narrator's own budget.
+    if PHASE_BUDGET <= 0:
+        _M.skipped_budget += 1
+        return None
     if _M.calls_this_phase >= PHASE_BUDGET:
         _M.skipped_budget += 1
         if _M.calls_this_phase == PHASE_BUDGET:
@@ -264,14 +276,25 @@ def _call_gemini(api_key: str, model: str, png: bytes, user_msg: str) -> dict:
         "systemInstruction": {"parts": [{"text": _SYSTEM_PROMPT}]},
         "generationConfig": {
             "temperature": 0.1,
-            "maxOutputTokens": 600,
+            # 2026-08-05: 600 → 1400. The ceiling was sized for a request that
+            # disabled thinking, and thinking is no longer disabled — see below.
+            "maxOutputTokens": 1400,
             "responseMimeType": "application/json",
             "responseSchema": _RESPONSE_SCHEMA,
-            # Disable thinking — for narration we want all 600 tokens to go
-            # to the structured JSON output, not internal reasoning. With
-            # thinking ON (Gemini 2.5 default), JSON output sometimes gets
-            # truncated mid-field, returning partial responses.
-            "thinkingConfig": {"thinkingBudget": 0},
+            # ⚠ 2026-08-05 — `thinkingConfig: {"thinkingBudget": 0}` REMOVED.
+            # The live endpoint rejects it with HTTP 400 INVALID_ARGUMENT, and
+            # names no field, so the fault was only findable by differential: the
+            # vision-URL extractor sends the same model and path WITHOUT this
+            # field and gets 200 in the same process where every request carrying
+            # it fails. All four builders that had it are now clean; this module
+            # keeps its own literal config because it also sends a responseSchema.
+            #
+            # The original reason for disabling thinking was real — with thinking
+            # ON, structured JSON could truncate mid-field — so the budget above
+            # rose to cover reasoning plus the schema. `DG_GEMINI_THINKING_BUDGET`
+            # re-enables the field for anyone testing a model that accepts it;
+            # this module deliberately does NOT read it, since a truncated
+            # responseSchema is a worse failure here than a slow one.
         },
     }
     t0 = time.time()

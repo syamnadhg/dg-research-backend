@@ -146,31 +146,62 @@ def test_2a_passes_warm_tab_and_guards_the_close():
 
 
 def test_chatgpt_force_new_chat_functional():
+    # 2026-08-05: the double now HONOURS its arguments. The function makes two
+    # distinct evaluate calls — a marker pass that takes the click-mark attribute
+    # and returns the matched selector, and a composer probe that returns
+    # {composer, msgs} — and the press itself moved to _sr_real_click. A double
+    # that answered `self._click_ok` to both could not tell them apart, so the
+    # emptiness check below would have had nothing to fail against.
     class FakePage:
-        def __init__(self, url, click_ok=True, url_after="https://chatgpt.com/"):
+        def __init__(self, url, marked=True, url_after="https://chatgpt.com/",
+                     msgs=0, composer=True):
             self.url = url
-            self._click_ok = click_ok
+            self._marked = marked
             self._url_after = url_after
+            self._msgs = msgs
+            self._composer = composer
+            self.pressed = 0
 
-        async def evaluate(self, _js):
-            if self._click_ok:
-                self.url = self._url_after
-            return self._click_ok
+        async def evaluate(self, js, arg=None):
+            if arg is not None:                     # the marker pass
+                assert arg == research._SR_CLICK_MARK
+                return '[data-testid="create-new-chat-button"]' if self._marked else ""
+            return {"composer": self._composer, "msgs": self._msgs}
+
+    async def _press(page, value, *, tag, **kw):
+        page.pressed += 1
+        page.url = page._url_after
+        return "playwright"
 
     async def _run(page):
-        return await research._chatgpt_force_new_chat(page, "2A")
+        _real = research._sr_real_click
+        research._sr_real_click = _press
+        try:
+            return await research._chatgpt_force_new_chat(page, "2A")
+        finally:
+            research._sr_real_click = _real
 
-    # Happy path: /c/<id> conversation → New-chat click → fresh composer.
-    assert asyncio.run(_run(FakePage("https://chatgpt.com/c/abc123"))) is True
-    # Already fresh (P1 skipped upstream check let it through) → True, no click.
-    assert asyncio.run(_run(FakePage("https://chatgpt.com/"))) is True
+    # Happy path: /c/<id> conversation → New-chat press → fresh EMPTY composer.
+    p = FakePage("https://chatgpt.com/c/abc123")
+    assert asyncio.run(_run(p)) is True
+    assert p.pressed == 1, "the New-chat control must be pressed, not JS-clicked"
+    # Already fresh (P1 skipped upstream check let it through) → True, no press.
+    p = FakePage("https://chatgpt.com/")
+    assert asyncio.run(_run(p)) is True
+    assert p.pressed == 0
     # Not a ChatGPT tab at all → False (caller opens a fresh tab).
     assert asyncio.run(_run(FakePage("https://claude.ai/new"))) is False
-    # Click found nothing → False (caller falls back to same-tab goto).
-    assert asyncio.run(_run(FakePage("https://chatgpt.com/c/abc", click_ok=False))) is False
-    # Clicked but the SPA never left the conversation → False.
+    # Nothing to mark → False (caller falls back to same-tab goto).
+    assert asyncio.run(_run(FakePage("https://chatgpt.com/c/abc", marked=False))) is False
+    # Pressed but the SPA never left the conversation → False.
     assert asyncio.run(_run(FakePage(
         "https://chatgpt.com/c/abc", url_after="https://chatgpt.com/c/abc"))) is False
+    # ⭐ 2026-08-05: a bare composer on a URL with no /c/ is NOT proof of a fresh
+    # chat — the selector is true on every signed-in surface that has one. A tab
+    # holding messages must be refused even though the old check passed it.
+    assert asyncio.run(_run(FakePage("https://chatgpt.com/", msgs=12))) is False
+    # …and no composer at all (a /gpts or auth interstitial) stays refused.
+    assert asyncio.run(_run(FakePage("https://chatgpt.com/", composer=False))) is False
 
 
 # ── 2b. Gap #3: hard-retry reuses the warm tab (same-tab New chat) ───────────

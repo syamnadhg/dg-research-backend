@@ -43,7 +43,12 @@ import research
 _POPOVER_OPEN_MARK = "trigger.click()"           # Step 1A: clicks the model trigger
 _PICK_OPUS_MARK = "{pin, below, fam, triggerText}"   # Step 1B: the picker
 _PROBE_MARK = "menu: false"                      # Step 1B*: the read-only probe
-_EFFORT_SUBMENU_MARK = "t === 'effort'"          # Step 1C: MARKS the Effort row
+# 2026-08-05 (review, f3): was `t === 'effort'`, a fragment of the old predicate. The
+# candidate set is now filtered for anchors first — `li` is in it and claude.ai wraps
+# conversation links in one, so a thread titled "Effort…" was reachable by a REAL
+# press, which on a link navigates. The redundant equality went with the rewrite
+# (`startsWith('effort')` always subsumed it).
+_EFFORT_SUBMENU_MARK = "const linky = el =>"     # Step 1C: MARKS the Effort row
 _SUBMENU_ROWS_MARK = "t.length > 24"             # Step 1C: did the submenu mount?
 _THINKING_MARK = "isThinking"                    # Step 1D: the Thinking toggle probe
 _EFFORT_SET_MARK = "'max effort'"                # Step 1C': selects Max
@@ -181,7 +186,15 @@ class ScriptedPage:
             # the whole fix, and the double has to feel it: an element that was
             # never marked is an element Playwright's selector cannot find.
             self.effort_marked = "setAttribute(P.attr, P.value)" in script
-            return True
+            # 2026-08-05: the script now reports WHAT it marked and what it refused,
+            # so the caller can log a rejected sidebar link. `True` no longer
+            # satisfies it — a double that kept returning a bare bool would make
+            # `_eff_marked` read False and every Step 1C test fail for the wrong
+            # reason. The real filtering is exercised against the DOM shim in
+            # test_drift_review_0805.py; here the double only has to answer in the
+            # right SHAPE.
+            return {"marked": self.effort_marked, "text": "effort max",
+                    "rejected": []}
         if _SUBMENU_ROWS_MARK in script:
             # 2026-08-04: the submenu now has to be SEEN, not assumed. Marking
             # the Effort row and pressing it is not evidence that a nested menu

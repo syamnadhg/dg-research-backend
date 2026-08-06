@@ -25,8 +25,82 @@ import json
 import shutil
 import subprocess
 import textwrap
+from html.parser import HTMLParser
 
 NODE = shutil.which("node")
+
+# Elements that never have children or a closing tag. Pushing one onto the stack
+# would swallow every following sibling as its child, which silently changes
+# `childElementCount` — the exact property the panel's leaf scan branches on.
+_VOID_TAGS = frozenset({
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+    "meta", "param", "source", "track", "wbr",
+})
+
+
+class _SpecBuilder(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self._root = {"tag": "div", "attrs": {}, "text": "", "kids": []}
+        self._stack = [self._root]
+
+    def handle_starttag(self, tag, attrs):
+        node = {"tag": tag, "attrs": {k: ("" if v is None else v) for k, v in attrs},
+                "text": "", "kids": []}
+        self._stack[-1]["kids"].append(node)
+        if tag not in _VOID_TAGS:
+            self._stack.append(node)
+
+    def handle_startendtag(self, tag, attrs):
+        self._stack[-1]["kids"].append(
+            {"tag": tag, "attrs": {k: ("" if v is None else v) for k, v in attrs},
+             "text": "", "kids": []})
+
+    def handle_endtag(self, tag):
+        # Walk back to the nearest matching open tag. A stray close tag (common in
+        # a truncated capture) must not pop an unrelated ancestor.
+        for i in range(len(self._stack) - 1, 0, -1):
+            if self._stack[i]["tag"] == tag:
+                del self._stack[i:]
+                return
+
+    def handle_data(self, data):
+        if data.strip():
+            self._stack[-1]["text"] += data
+
+    def result(self):
+        kids = self._root["kids"]
+        return kids[0] if len(kids) == 1 else self._root
+
+
+def spec_from_html(html: str) -> dict:
+    """Turn captured markup into a shim spec, so a REAL capture can be replayed
+    through the real page JS.
+
+    Why this exists: the panel-counts defect could not be diagnosed from the
+    repository, because the activity panel only exists while a phase is in
+    flight. The run now writes the panel's markup to disk mid-flight, and this is
+    what lets a test execute the production extractor against that document
+    instead of against a fixture someone hand-built to match their own theory of
+    the markup. A hand-built fixture can only confirm what its author already
+    believed.
+
+    Two honest limitations, both irrelevant to counting and both worth knowing
+    before trusting this for something else:
+
+    * Text interleaved between child elements is collected onto the parent, so a
+      node's own text always precedes its children's. `textContent` and the
+      block-aware `innerText` still aggregate correctly; only the ORDER of a
+      parent's own text relative to its children is lost.
+    * A truncated capture parses as far as it can. Unclosed tags are closed at
+      EOF, so the tail of the tree is shallower than the real page — which means
+      counts read off a truncated document are FLOORS. Check the capture is whole
+      before treating any number from it as exact.
+    """
+    p = _SpecBuilder()
+    p.feed(html)
+    p.close()
+    return p.result()
 
 
 def _string_literals(fn):
@@ -65,13 +139,29 @@ def evaluate_js(fn, *, contains: str = "") -> str:
 
 
 def js_constant(fn, name: str) -> str:
-    """The value of a `name = \"\"\"...\"\"\"` JS constant assigned inside `fn`."""
+    """The value of a `name = \"\"\"...\"\"\"` JS constant assigned inside `fn`.
+
+    ⭐ 2026-08-05 — a COMPOSED constant resolves to its runtime value. The ChatGPT row
+    JS is now `r\"\"\"…\"\"\" + _CHATGPT_ROW_FILTER_JS + r\"\"\"…\"\"\"`, because the read and
+    the click must embed one shared filter rather than two copies that happen to agree
+    (the copies not agreeing is what let a sidebar conversation link be pressed on
+    2026-08-05). The AST walk below only ever matched a bare `ast.Constant`, so every
+    test that fed one of those constants to node started failing with "not found" —
+    which reads exactly like a renamed constant rather than a changed shape.
+
+    A module attribute is preferred when `fn` is a module and carries the name: that is
+    the value production actually hands to `page.evaluate`, escapes and concatenation
+    already resolved. The AST walk stays for constants assigned INSIDE a function,
+    where there is no attribute to read.
+    """
+    if isinstance(getattr(fn, name, None), str):
+        return getattr(fn, name)
     for node in ast.walk(_string_literals(fn)):
         if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
             for t in node.targets:
                 if isinstance(t, ast.Name) and t.id == name:
                     return node.value.value
-    raise AssertionError(f"{name} not found in {fn.__name__}")
+    raise AssertionError(f"{name} not found in {getattr(fn, '__name__', fn)}")
 
 SHIM = r"""
 const CLICKS = [];
@@ -90,8 +180,71 @@ class El {
   setAttribute(n, v) { this._attrs[n] = String(v); }
   removeAttribute(n) { delete this._attrs[n]; }
   hasAttribute(n) { return n in this._attrs; }
+  // ⭐ 2026-08-05 — `disabled` REFLECTS as a boolean PROPERTY on form controls,
+  // and production reads `el.disabled`, never getAttribute('disabled'). Without
+  // this getter the property was always undefined, so a fixture marking a button
+  // disabled read as enabled and a "disabled controls are skipped" test passed
+  // whether or not the check existed. A fixture only proves something if it
+  // answers the way the real thing does.
+  //
+  // HTML semantics, deliberately: the ATTRIBUTE'S PRESENCE is what disables —
+  // `disabled="false"` is still disabled in a browser. `aria-disabled` is the
+  // opposite (a string that must equal "true"), and production tests it
+  // separately for exactly that reason.
+  get disabled() { return 'disabled' in this._attrs; }
+  // ⭐ 2026-08-06 — `dataset` was missing entirely, and production reads
+  // `el.dataset.state` to decide whether a menu row is already selected. Any JS
+  // reaching that line threw `Cannot read properties of undefined`, so the branch
+  // was unreachable under the shim and no test could cover it — the Claude effort
+  // picker had never been executed here at all. Mirrors the browser: `data-*`
+  // becomes camelCase, and a missing attribute reads `undefined` rather than
+  // throwing.
+  get dataset() {
+    const out = {};
+    for (const [k, v] of Object.entries(this._attrs)) {
+      if (!k.startsWith('data-')) continue;
+      out[k.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = v;
+    }
+    return out;
+  }
   get textContent() { return this._text + this.children.map(c => c.textContent).join(''); }
-  get innerText() { return this.textContent; }
+  // ⭐ 2026-08-06 — production captures a panel with `panel.outerHTML` and then
+  // reports how much of it it retained. Without this getter that read was `''`,
+  // the reported full length was 0, and a test replaying a real capture could not
+  // see the truncation AT ALL — the same silent-truncation failure the production
+  // fix was written for, reproduced inside the harness meant to catch it.
+  // Attribute order follows insertion, which is what a browser does too.
+  get outerHTML() {
+    const attrs = Object.entries(this._attrs)
+      .map(([k, v]) => ' ' + k + '="' + String(v).replace(/"/g, '&quot;') + '"').join('');
+    const tag = this.tagName.toLowerCase();
+    return '<' + tag + attrs + '>' + this._text
+      + this.children.map(c => c.outerHTML).join('') + '</' + tag + '>';
+  }
+  // ⭐ 2026-08-05 — `innerText` is LINE-AWARE in a browser; `textContent` is not.
+  // The shim returned the concatenation for both, and that silently disarmed every
+  // production regex anchored on a word boundary or a line. Measured case: the
+  // ChatGPT panel renders "Searching 1 website" and "14 more" in sibling divs, and
+  // the source-count regex is /(\d+)\s+(?:websites?|…)\b/ — against the concatenated
+  // "…1 websitedocs.nvidia.com…" the trailing \b cannot match, so the count came back
+  // 0 and a test asserting "we read the source count" would pass against an
+  // extraction that reads nothing.
+  //
+  // Block-level children get a newline between them, inline ones do not — the same
+  // distinction the browser makes, and the one the regexes were written against.
+  get innerText() {
+    const BLOCK = new Set(['DIV', 'P', 'SECTION', 'ARTICLE', 'LI', 'UL', 'OL', 'TR',
+                           'TD', 'TH', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'HEADER',
+                           'FOOTER', 'NAV', 'ASIDE', 'MAIN', 'FORM', 'FIGURE',
+                           'BLOCKQUOTE', 'PRE', 'HR', 'BR', 'TABLE', 'DL', 'DT', 'DD']);
+    let s = this._text;
+    for (const c of this.children) {
+      const t = c.innerText;
+      if (BLOCK.has(c.tagName)) { if (s && !s.endsWith('\n')) s += '\n'; s += t + '\n'; }
+      else s += t;
+    }
+    return s;
+  }
   // Own text vs descendant text is a DISTINCTION production depends on: a
   // Material dropdown parks its open option list INSIDE the trigger, so reading
   // innerText on the trigger finds "Anyone with the link" in a row nobody
@@ -105,11 +258,23 @@ class El {
     return out;
   }
   get nodeType() { return 1; }
+  // Production reads it on the panel fingerprint and on the leaf test in the
+  // activity walker; without it both were `undefined`, which compares false
+  // against every number and silently made a leaf filter reject everything.
+  get childElementCount() { return this.children.length; }
   get classList() {
     const cls = String(this._attrs['class'] || '').split(/\s+/);
     return { contains: (c) => cls.includes(c) };
   }
   get className() { return this._attrs['class'] || ''; }
+  // ⭐ 2026-08-05 — `a.href` is a resolved-URL PROPERTY in a browser, and production
+  // reads the property (`const h = a.href || ''`) rather than the attribute. Without
+  // this it was undefined, so every source-URL walk in the codebase collected NOTHING
+  // against a fixture full of anchors — and a "we extract the panel's sources" test
+  // would pass whether or not the extraction worked. Fixtures here carry absolute
+  // hrefs, so returning the attribute is the resolved value.
+  get href() { return this._attrs['href'] || ''; }
+  get title() { return this._attrs['title'] || ''; }
   click() { CLICKS.push(this.getAttribute('aria-label') || this.textContent || this.tagName); }
   // `x`/`y` place the box. They default to 10,10 (on-screen) so every existing
   // fixture keeps its old geometry, and they exist because "on screen" is not a
@@ -122,7 +287,16 @@ class El {
     const y = 'y' in this._attrs ? +this._attrs.y : 10;
     return { width: w, height: h, left: x, top: y, right: x + w, bottom: y + h };
   }
-  getClientRects() { return [this.getBoundingClientRect()]; }
+  // ⭐ 2026-08-05 — `hidden` must suppress THIS too, not only `offsetParent`. A
+  // browser returns ZERO rects for anything in a `display:none` subtree, and half
+  // the production JS in this repo gates on `getClientRects().length` while the
+  // other half gates on `offsetParent`. With only the latter honoured, a fixture
+  // that hid a menu still had every row read as on-screen — so a "the hidden
+  // popover's rows are skipped" test passed against code that never skipped them.
+  getClientRects() {
+    for (let n = this; n; n = n.parent) if (n.getAttribute('hidden') !== null) return [];
+    return [this.getBoundingClientRect()];
+  }
   // The other visibility idiom in this codebase. Production JS uses BOTH
   // `getClientRects().length` and `!el.offsetParent` as its "is this on screen"
   // gate, and a shim that left offsetParent undefined made every element read
@@ -137,6 +311,13 @@ class El {
     for (let n = this; n; n = n.parent) if (n.getAttribute('hidden') !== null) return null;
     return this.parent;
   }
+  // ⭐ 2026-08-05 — production CLIMBS with `el.parentElement`, not `el.parent`, and
+  // the shim only exposed the latter. So every climb-to-a-panel-sized-ancestor walk
+  // stopped dead after one step on `undefined` — including the ChatGPT activity
+  // panel's own root finder, whose `activityRoot` therefore came back null and made
+  // the whole walker return zeros. A fixture that cannot answer the way the browser
+  // does turns a passing test into no test at all.
+  get parentElement() { return this.parent; }
   dispatchEvent() { CLICKS.push(this.getAttribute('aria-label') || this.textContent || this.tagName); return true; }
   descendants() { return this.children.flatMap(c => [c, ...c.descendants()]); }
   matches(sel) {
@@ -186,7 +367,14 @@ function matchSimple(el, p) {
   // Tag + any mix of .class / #id / [attr] — `.font-claude-message` scoping is
   // load-bearing in the Claude artifact path (pass 1 is assistant-scoped), so a shim
   // that silently failed every class selector would take the wrong branch.
-  const m = p.match(/^([a-zA-Z-]*)((?:[.#][A-Za-z0-9_-]+|\[[^\]]*\])*)$/);
+  // ⭐ 2026-08-05 — the tag part accepts DIGITS. It was `[a-zA-Z-]*`, so `h1`, `h2`,
+  // `h3`, `td`… — every tag whose name carries a number — silently matched nothing.
+  // Consequence measured on the ChatGPT panel walker: its section-heading extraction
+  // (`panel.querySelectorAll('h1, h2, h3')`) had never once been exercised by a test,
+  // and a fixture with a heading in it reported zero sections exactly like the live
+  // panel that genuinely has none. Two very different states, one indistinguishable
+  // result.
+  const m = p.match(/^([a-zA-Z][a-zA-Z0-9-]*)?((?:[.#][A-Za-z0-9_-]+|\[[^\]]*\])*)$/);
   if (!m) return false;
   if (m[1] && el.tagName !== m[1].toUpperCase()) return false;
   for (const cls of (m[2].match(/\.[A-Za-z0-9_-]+/g) || [])) {
@@ -245,6 +433,39 @@ globalThis.__run = (spec, fn, arg) => {
   return { ret, clicks: CLICKS };
 };
 """
+
+
+def stamp_panel_geometry(spec, *, w=520, h=800, x=900, y=0,
+                         kid_w=300, kid_h=40, kid_y=50) -> dict:
+    """Give a captured subtree the geometry it demonstrably had, in place.
+
+    Captured markup carries no layout, and every panel-root selector in this repo
+    gates on `getBoundingClientRect()` — width, height, and position relative to
+    the viewport's midpoint. Without geometry the shim's defaults put every node
+    at the LEFT edge, so the panel finder rejects all of them and the extractor
+    returns its empty result. That reads exactly like a broken extractor.
+
+    What is asserted here is not invented: the capture IS the right-hand panel's
+    own `outerHTML`, so every node in it was inside a panel-sized element on the
+    right of the viewport. The root gets panel dimensions; descendants get a
+    small-but-visible box so they pass visibility checks without themselves
+    qualifying as the panel and out-ranking the root.
+
+    Existing `w`/`h`/`x`/`y` attributes are left alone, so a fixture can still pin
+    one element off-screen deliberately.
+    """
+    def _walk(node, depth):
+        a = node["attrs"]
+        if depth == 0:
+            a.update({"w": str(w), "h": str(h), "x": str(x), "y": str(y)})
+        else:
+            for k, v in (("w", kid_w), ("h", kid_h), ("x", x), ("y", kid_y)):
+                a.setdefault(k, str(v))
+        for kid in node["kids"]:
+            _walk(kid, depth + 1)
+
+    _walk(spec, 0)
+    return spec
 
 
 def el(tag, attrs=None, text="", kids=None, repeat=1):

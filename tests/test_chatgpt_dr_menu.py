@@ -94,7 +94,12 @@ def test_hidden_rows_are_not_candidates():
     spec = el("body", {}, "", [
         el("div", {"class": "__menu-item", "hidden": ""}, "Deep research Get a detailed report"),
     ])
-    assert _rows(spec) == {"via": "", "rows": []}
+    out = _rows(spec)
+    # 2026-08-05: the read now also reports what it threw away and which census it
+    # applied, so assert the two fields the on-screen gate governs rather than the
+    # whole dict — a diagnostic field is not a behaviour change.
+    assert out["rows"] == []
+    assert out["via"] == ""
 
 
 def test_the_click_is_by_identity_not_position():

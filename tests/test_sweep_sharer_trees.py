@@ -76,7 +76,16 @@ class _FakeResearchCol:
         self._store = store
         self._fail = fail_query
 
-    def where(self, _field, _op, _value):
+    def where(self, *args, filter=None):
+        """Mirrors the REAL Firestore signature — the `filter=` keyword form.
+
+        ⚠ Positional args are REFUSED, not merely accepted. The library still
+        takes them, with a `UserWarning: Detected filter using positional
+        arguments` that printed into `--serve`'s banner; a fake that tolerated
+        both forms would let a call site quietly regress and stay green.
+        """
+        assert not args, f"use where(filter=FieldFilter(...)), not {args!r}"
+        assert filter is not None, "where() called with no filter at all"
         if self._fail:
             raise RuntimeError("simulated PERMISSION_DENIED on query")
         snaps = [
