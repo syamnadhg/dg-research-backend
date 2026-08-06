@@ -5591,11 +5591,27 @@ def _consume_pending_update_result() -> "dict | None":
     # Nonzero exit — surface the real pipx error, not just "failed". The tail is what
     # names the actual cause (e.g. a uv backend that couldn't be resolved).
     tail = " ".join((raw.get("log_tail") or "").split())
-    reason = f"pipx upgrade failed (exit {rc if rc is not None else 'unknown'})"
+    # A timeout is not an exit status — say so, because "exit 124" reads like the
+    # package manager chose to fail when in fact nothing ever answered.
+    if raw.get("timed_out"):
+        reason = "the upgrade was still running after 20 minutes and was stopped"
+    else:
+        reason = f"pipx upgrade failed (exit {rc if rc is not None else 'unknown'})"
     if tail:
         reason = f"{reason}: {tail[:400]}"
+    # The waiter's own journal and full tail travel with the outcome so the app can
+    # show the whole story rather than the one truncated sentence in `reason`. Prefer
+    # what the waiter captured — it read the files while they were still its own —
+    # and fall back to reading them here if it left nothing.
+    diag = {}
+    if raw.get("journal"):
+        diag["journal"] = str(raw["journal"])[-6000:]
+    if raw.get("log_tail"):
+        diag["logTail"] = str(raw["log_tail"])[-4000:]
+    if not diag:
+        diag = _update_diagnostics()
     return {"state": "failed", "current": running, "latest": want or None,
-            "reason": reason}
+            "reason": reason, **diag}
 
 
 def _update_report_pending() -> bool:
@@ -5764,9 +5780,55 @@ def _update_intent_verdict() -> "dict | None":
                 "needsRestart": needs,
                 "reason": (f"v{want} is installed but the backend is still running "
                            f"v{served} — restart it to finish") if needs else ""}
+    # ⭐ 2026-08-06 — THIS is the branch the reported "update hangs forever" lands
+    # in, and until now it published a sentence and nothing else. The waiter's
+    # journal is the only artefact a hung or killed upgrade can leave behind, so
+    # carry it here: this is the one path where there is no sentinel to carry it
+    # for us, and therefore the one path where the diagnostic actually matters.
     return {"state": "failed", "current": served or installed, "latest": want or None,
             "reason": "the background upgrade stopped without reporting back"
-                      + (f" — still on v{was}" if was and installed == was else "")}
+                      + (f" — still on v{was}" if was and installed == was else ""),
+            **_update_diagnostics()}
+
+
+def _update_diagnostics(*, journal_lines: int = 60, tail_chars: int = 4000) -> dict:
+    """The waiter's journal and log tail, bounded, for publishing to the app.
+
+    Read from disk rather than passed in, because the caller that needs this most —
+    the no-sentinel verdict — has nothing to pass: the waiter never got far enough
+    to write one. Returns `{}` when there is nothing to report, so a caller can
+    splat it unconditionally without inventing empty fields on a healthy update.
+
+    ⚠ Bounded twice over. This lands in a Firestore document field, and a
+    package-manager log can be megabytes; an unbounded read would fail the write
+    and take the whole status update with it — losing the outcome to the act of
+    explaining it. Both limits count from the END, because the last thing that
+    happened is what says where it stopped.
+    """
+    out: dict = {}
+    try:
+        if _UPDATE_JOURNAL_PATH.exists():
+            lines = _UPDATE_JOURNAL_PATH.read_text(
+                encoding="utf-8", errors="replace").splitlines()
+            if lines:
+                out["journal"] = "\n".join(lines[-journal_lines:])[-6000:]
+                out["journalLines"] = len(lines)
+    except Exception:
+        pass
+    try:
+        _lp = _STATE_DIR / "upgrade.log"
+        if _lp.exists():
+            with open(_lp, "rb") as _f:
+                try:
+                    _f.seek(-(tail_chars * 2), 2)
+                except Exception:
+                    _f.seek(0)
+                _t = _f.read().decode("utf-8", "replace").strip()[-tail_chars:]
+            if _t:
+                out["logTail"] = _t
+    except Exception:
+        pass
+    return out
 
 
 def _handle_check_update_command(device_id: str) -> None:
@@ -60560,6 +60622,12 @@ _UPDATE_RESULT_PATH = _STATE_DIR / "update_result.json"
 # worker was killed mid-launch, leaving no pipx run, no log line and no status at
 # all. See `_update_intent_verdict`.
 _UPDATE_INTENT_PATH = _STATE_DIR / "update_intent.json"
+# The waiter's step-by-step journal. Separate from the outcome sentinel ON PURPOSE:
+# the sentinel is written only once the package manager has RETURNED, so the one
+# failure that most needs evidence — an upgrade that never finishes — could never
+# produce one. The journal is appended as each step begins, so it survives a hang,
+# a SIGKILL, and a machine that slept through the whole thing.
+_UPDATE_JOURNAL_PATH = _STATE_DIR / "update_journal.jsonl"
 
 # Detached lifecycle waiter (run by a NON-venv Python): waits for THIS process
 # to exit, then runs `pipx <action> superresearch`. Required because
@@ -60569,6 +60637,34 @@ _UPDATE_INTENT_PATH = _STATE_DIR / "update_intent.json"
 _LIFECYCLE_WAITER = r'''
 import os, sys, time, subprocess
 pid = int(sys.argv[1]); rest = sys.argv[2:]
+# ── Progress journal ────────────────────────────────────────────────────────
+# ⭐⭐ 2026-08-06 — WHY THIS EXISTS. The reported failure is "the app-driven update
+# hangs forever", and until now that produced NO evidence whatsoever: the only
+# write this script made was the outcome sentinel AFTER the package manager
+# returned, so a package manager that never returns left nothing at all — no
+# outcome, no timings, no indication of how far it got. The one thing the operator
+# needed to root-cause it was the one thing that could not survive it.
+#
+# So: an append-only journal, written at every step, BEFORE the step that can
+# hang. Stdlib only and no credentials, same as the rest of this script — it is a
+# plain file, and whichever backend comes up next carries it to the app.
+#
+# Append, never rewrite: a crash mid-journal must leave the earlier lines intact.
+_jrnl = os.environ.get("DG_LIFECYCLE_JOURNAL") or ""
+_t0 = time.time()
+def _note(step, **kw):
+    if not _jrnl:
+        return
+    try:
+        import json as _j
+        rec = {"t": round(time.time() - _t0, 2), "step": step}
+        rec.update(kw)
+        with open(_jrnl, "a", encoding="utf-8") as _f:
+            _f.write(_j.dumps(rec) + "\n")
+    except Exception:
+        pass
+_note("waiter_started", pid=os.getpid(), watching=pid,
+      python=sys.executable, platform=sys.platform)
 # CLAIM the launch record before anything else. The spawner cannot record a
 # trustworthy pid: on Linux the upgrade is submitted through `systemd-run`, a
 # FRONT-END that exits in milliseconds, so `Popen.pid` names a process that is
@@ -60610,12 +60706,37 @@ def _alive(p):
         return False
     except PermissionError:
         return True
+_note("waiting_for_launcher_exit", cmd=cmd, restart=after)
+_waited = 0.0
 for _ in range(120):  # wait up to ~60s for the launcher to exit
     if not _alive(pid):
         break
-    time.sleep(0.5)
+    time.sleep(0.5); _waited += 0.5
+_note("launcher_gone" if not _alive(pid) else "launcher_still_alive",
+      waited_s=_waited)
 time.sleep(2)  # grace for the OS to release the venv's file handles
-rc = subprocess.run(cmd).returncode
+# ⭐ A CEILING, because the reported symptom is a hang. `subprocess.run(cmd)` with
+# no timeout is an unbounded wait on a package manager that can block on a network
+# read, a lock, or a credential prompt that nobody will ever answer — and while it
+# blocks, this process holds the only knowledge of the outcome and publishes
+# nothing, so the app spins until its own timeout with no reason to show. Twenty
+# minutes is far above a real install and far below "forever".
+# On timeout: kill the tree, then report it as a FAILURE with a distinguishable
+# reason, because an update that never finished is not an update that succeeded.
+_TIMEOUT_S = 1200
+_note("package_manager_start", cmd=cmd, timeout_s=_TIMEOUT_S)
+_timed_out = False
+try:
+    rc = subprocess.run(cmd, timeout=_TIMEOUT_S).returncode
+except subprocess.TimeoutExpired:
+    _timed_out = True
+    rc = 124  # conventional timeout code, and never a real pipx exit status
+    _note("package_manager_timeout", after_s=_TIMEOUT_S)
+except Exception as _pe:
+    rc = 125
+    _note("package_manager_error", error=str(_pe)[:200])
+else:
+    _note("package_manager_done", rc=rc)
 # Record the outcome BEFORE the restart. This process is the only thing that ever
 # learns whether the upgrade actually worked, and it cannot tell the app directly:
 # it runs on a NON-venv python by design, so it has no firebase-admin and no
@@ -60627,25 +60748,38 @@ _res = os.environ.get("DG_LIFECYCLE_RESULT") or ""
 if _res:
     try:
         import json, tempfile
+        # ⚠ 2026-08-06 — the tail used to be carried ONLY when rc != 0. The
+        # confusing report is an update that claims success while the version does
+        # not move, and for exactly that case there was no evidence at all. Always
+        # carry it: it costs a bounded read and it is the difference between
+        # diagnosing the next one and asking for another reproduction.
         _tail = ""
-        if rc != 0:
-            # The waiter's stdout+stderr are already teed to this log by the
-            # spawner, so the real pipx error text is sitting in it. Carry the tail
-            # so the app can show WHY, not just "failed".
-            try:
-                with open(os.environ.get("DG_LIFECYCLE_LOG") or "", "rb") as _f:
-                    try:
-                        _f.seek(-4096, 2)
-                    except Exception:
-                        _f.seek(0)
-                    _tail = _f.read().decode("utf-8", "replace").strip()[-1200:]
-            except Exception:
-                pass
+        try:
+            with open(os.environ.get("DG_LIFECYCLE_LOG") or "", "rb") as _f:
+                try:
+                    _f.seek(-8192, 2)
+                except Exception:
+                    _f.seek(0)
+                _tail = _f.read().decode("utf-8", "replace").strip()[-4000:]
+        except Exception:
+            pass
+        # The journal travels with the outcome, so the app has the step timings
+        # without needing a second channel. Bounded from the END — the last steps
+        # are the interesting ones — and it is the tail that says where a hang was.
+        _journal = ""
+        try:
+            if _jrnl:
+                with open(_jrnl, "r", encoding="utf-8", errors="replace") as _f:
+                    _journal = "".join(_f.readlines()[-60:])[-6000:]
+        except Exception:
+            pass
         _payload = {"action": os.environ.get("DG_LIFECYCLE_ACTION") or "upgrade",
                     "rc": rc, "at": int(time.time() * 1000),
                     "current": os.environ.get("DG_LIFECYCLE_FROM") or "",
                     "latest": os.environ.get("DG_LIFECYCLE_TO") or "",
                     "restarting": bool(after) and rc == 0,
+                    "timed_out": _timed_out,
+                    "journal": _journal,
                     "log_tail": _tail}
         _fd, _tmp = tempfile.mkstemp(dir=os.path.dirname(_res) or ".",
                                      prefix=".update-result-", suffix=".tmp")
@@ -60657,10 +60791,14 @@ if _res:
 # Only cycle the supervisor if the upgrade itself succeeded — never restart onto a
 # half-built venv.
 if after and rc == 0:
+    _note("restart_issued", cmd=after)
     try:
         subprocess.run(after)
-    except Exception:
-        pass
+    except Exception as _re:
+        _note("restart_failed", error=str(_re)[:200])
+elif after:
+    _note("restart_skipped", rc=rc, reason="upgrade did not succeed")
+_note("waiter_exit", rc=rc, timed_out=_timed_out)
 '''
 
 
@@ -61000,7 +61138,11 @@ def _spawn_detached_lifecycle(action: str, *, restart_after: bool = False,
     # A stale file would otherwise be republished as this attempt's outcome (and, if
     # the waiter dies before writing, would report the wrong result entirely). The
     # launch record goes with it for the same reason.
-    for _stale in (_UPDATE_RESULT_PATH, _UPDATE_INTENT_PATH):
+    # The journal is truncated here too, and for the same reason: it is APPEND-only
+    # while the waiter runs, so without this the next attempt's steps would be read
+    # as a continuation of the last one's — and the whole point of it is to say
+    # where THIS attempt stopped.
+    for _stale in (_UPDATE_RESULT_PATH, _UPDATE_INTENT_PATH, _UPDATE_JOURNAL_PATH):
         try:
             _stale.unlink(missing_ok=True)
         except Exception:
@@ -61030,6 +61172,10 @@ def _spawn_detached_lifecycle(action: str, *, restart_after: bool = False,
     env = _lifecycle_env(
         DG_LIFECYCLE_RESULT=str(_UPDATE_RESULT_PATH) if action == "upgrade" else None,
         DG_LIFECYCLE_INTENT=str(_UPDATE_INTENT_PATH) if action == "upgrade" else None,
+        # Journaled for EVERY action, not only an upgrade: a `--restart` that never
+        # comes back is as opaque as an upgrade that never finishes, and the journal
+        # is the only thing either of them can leave behind.
+        DG_LIFECYCLE_JOURNAL=str(_UPDATE_JOURNAL_PATH),
         DG_LIFECYCLE_LOG=str(log_path),
         DG_LIFECYCLE_ACTION=action,
         DG_LIFECYCLE_FROM=current,
@@ -61039,7 +61185,13 @@ def _spawn_detached_lifecycle(action: str, *, restart_after: bool = False,
         # systemd-run does NOT hand our environment to the transient unit — it gets
         # the user manager's, which is the very narrow PATH we just widened. Forward
         # the keys explicitly, spliced in before the trailing `--`.
+        # ⛔ Every out-of-band parameter the waiter reads MUST be listed here or it
+        # is silently absent on Linux only — systemd-run hands the transient unit
+        # the user manager's environment, not ours. A journal variable missing from
+        # this tuple would make the diagnostic dead on exactly the platform where
+        # the extra indirection makes it hardest to reproduce.
         _fwd = ("PATH", "DG_LIFECYCLE_RESULT", "DG_LIFECYCLE_INTENT", "DG_LIFECYCLE_LOG",
+                "DG_LIFECYCLE_JOURNAL",
                 "DG_LIFECYCLE_ACTION", "DG_LIFECYCLE_FROM", "DG_LIFECYCLE_TO")
         escape = (escape[:-1]
                   + [f"--setenv={k}={env[k]}" for k in _fwd if env.get(k)]

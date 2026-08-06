@@ -162,6 +162,12 @@ def _update_sentinels_never_touch_the_real_home(tmp_path_factory, monkeypatch):
     # developer's real ~/.super-research again — the exact failure it prevents.
     monkeypatch.setattr(research, "_UPDATE_RESULT_PATH", d / "update_result.json")
     monkeypatch.setattr(research, "_UPDATE_INTENT_PATH", d / "update_intent.json")
+    # 2026-08-06: the upgrade helper's step journal joins them, and it is the one
+    # most worth redirecting — the spawner TRUNCATES it before each attempt, so a
+    # test exercising the real spawner would delete the developer's own record of
+    # the last real update. Found by a test asserting the journal sits beside the
+    # other update state, which it did not while this line was missing.
+    monkeypatch.setattr(research, "_UPDATE_JOURNAL_PATH", d / "update_journal.jsonl")
     # The live-serve marker joins them for the same reason: `_restart_pending`
     # reads it, so leaving it pointed at the real home would make a test's answer
     # depend on whether the developer happens to have a backend running.
