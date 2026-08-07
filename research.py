@@ -54826,6 +54826,59 @@ def _pair_patch_device(
     return False
 
 
+def _cancel_unclaimed_pair(device_id: "str | None", poll_secret: str) -> str:
+    """Undo an initiate-pair that never got claimed, and say what happened.
+
+    By the time the pair code is on screen the server has already created three
+    things: the device doc, the pollSecretHash entry, and the synthetic Firebase
+    Auth user. Abandoning the flow here used to leave all three behind — the doc
+    surfaced later as a stale `awaiting-initial-claim` tile, and the auth user
+    surfaced nowhere at all, which is how orphaned machine logins piled up
+    unnoticed for months. `expireAt` is a DOCUMENT sweeper; it cannot see the
+    login, so it is the backstop for a process that gets killed mid-pair, not
+    the plan.
+
+    Deliberately NOT `_cleanup_partial_pair`: that one needs an idToken we do not
+    have before the exchange, and it wipes the keystore + research_config.json,
+    which at this point still belong to whatever pairing was here before.
+
+    Returns "nothing" | "cancelled" | "claimed" | "failed" — the outcome, so
+    callers and tests can distinguish "there was nothing to undo" from "we tried
+    and could not". Never raises: every caller is already on a failure path.
+    """
+    if not device_id:
+        # initiate-pair itself never returned, so nothing exists server-side.
+        return "nothing"
+    from auth import v2_flow as _v2f
+
+    try:
+        outcome = _v2f.cancel_pair_remote(
+            device_id=device_id, poll_secret=poll_secret
+        )
+    except Exception as e:  # defence in depth — the helper already swallows
+        log(f"[pair] cancel-pair raised unexpectedly: {e}", "WARN")
+        outcome = "failed"
+
+    if outcome == "cancelled":
+        log("Cleaned up the unclaimed pair — no device was added.", "INFO")
+    elif outcome == "claimed":
+        # The claim landed while we were failing. That is a real device with a
+        # real owner, so the server correctly refuses to delete it for us.
+        log(
+            "The code was claimed before this failed — the device exists. "
+            f"Run `{_PROG} --unpair` to remove it.",
+            "WARN",
+        )
+    else:
+        log(
+            f"Could not clean up the unclaimed pair (deviceId={device_id[:12]}…). "
+            "It expires on its own; remove it from Account → Manage devices "
+            "if it lingers.",
+            "WARN",
+        )
+    return outcome
+
+
 def _cleanup_partial_pair(device_id: str) -> None:
     """Reverse a partially-completed pair when the user Ctrl+Cs (or the
     flow errors out) between Stage 1 exchange and Stage 5 completion.
@@ -55430,10 +55483,16 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
     # captured_device_id is set immediately after a successful exchange
     # so the try/finally cleanup at the bottom of this function can
     # reverse a partial pair if the user Ctrl+Cs between Stage 1 and
-    # Stage 5. Stays None when we never got past polling — the device
-    # doc's 24h initiate-pair TTL handles that case server-side.
+    # Stage 5.
     captured_device_id: "str | None" = None
     pair_completed = False
+
+    def _cancel_unclaimed() -> None:
+        # `captured["device_id"]` is set by _on_code, i.e. the moment the server
+        # has actually created something — which is earlier than the exchange and
+        # is exactly the window these handlers cover.
+        _cancel_unclaimed_pair(captured.get("device_id"), poll_secret)
+
     try:
         try:
             _init_spinner["ctx"] = _sync_spinner_ctx("Requesting a pair code")
@@ -55451,6 +55510,7 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
                 _stop_init_spinner()
         except v2_flow.PollTimeout:
             print()
+            _cancel_unclaimed()
             _pt("polling timed out — re-run --pair to start fresh", "ERROR")
             return
         except v2_flow.InitiatePairError as e:
@@ -55460,10 +55520,12 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
             return
         except KeyboardInterrupt:
             print()
-            log("Cancelled before exchange — nothing to clean up server-side.", "WARN")
+            _cancel_unclaimed()
+            log("Cancelled before exchange.", "WARN")
             return
         except Exception as e:
             print()
+            _cancel_unclaimed()
             _pt(f"unexpected error: {e}", "ERROR")
             return
         # Past this point we have a live device entry in Firestore that

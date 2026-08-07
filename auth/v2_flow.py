@@ -5,6 +5,9 @@ This module owns:
   that BE stores locally + the hash it sends to the FE Cloud Function so
   sharers can't read the customToken from the device doc.
 - `initiate_pair_remote` — POST to /api/devices/initiate-pair (unauth).
+- `cancel_pair_remote` — POST to /api/devices/cancel-pair (unauth, proves
+  itself with the pollSecret preimage), so a pair abandoned before the claim
+  does not leave a stale device doc and an invisible machine login behind.
 - `poll_pending_token` — anonymous Firestore REST GET on
   `devices/{deviceId}/pending/{pollSecretHash}` to pick up the
   customToken once the owner has claimed the code from the FE.
@@ -148,6 +151,54 @@ def initiate_pair_remote(
     if "deviceId" not in data or "pairCode" not in data:
         raise InitiatePairError(f"initiate-pair response missing fields: {data}")
     return {"deviceId": data["deviceId"], "pairCode": data["pairCode"]}
+
+
+def cancel_pair_remote(
+    *,
+    device_id: str,
+    poll_secret: str,
+    timeout: float = 10.0,
+) -> str:
+    """POST /api/devices/cancel-pair — undo an initiate-pair nobody claimed.
+
+    `initiate_pair_remote` creates three server-side things before the human
+    has typed anything: the synthetic Firebase Auth user, the pollSecretHash
+    entry, and the device doc. If we then give up — Ctrl+C, poll timeout — all
+    three survive. The device doc shows up in the app as a stale tile; the auth
+    user shows up nowhere at all, which is why orphaned logins piled up unnoticed
+    for months. The `expireAt` TTL is a document sweeper and cannot see the
+    login, so it is the backstop for a process that gets killed, not the plan.
+
+    The pollSecret preimage is the credential — we have no Firebase identity
+    yet, and only this process knows the secret whose hash we sent at initiate.
+
+    Returns one of:
+      "cancelled"  — server confirmed the pair is gone
+      "claimed"    — someone completed the claim; the device is real now and was
+                     deliberately left alone (use --unpair to remove it)
+      "failed"     — anything else; caller should tell the user, not retry silently
+
+    Never raises: every caller is already on an error/cancel path, and a failure
+    to clean up must not replace the message explaining why we are cleaning up.
+    """
+    url = f"{FE_BASE_URL}/api/devices/cancel-pair"
+    try:
+        resp = requests.post(
+            url,
+            json={"deviceId": device_id, "pollSecret": poll_secret},
+            timeout=timeout,
+        )
+    except requests.RequestException as e:
+        log.debug("cancel_pair_remote: network error %s", e)
+        return "failed"
+    if resp.status_code == 409:
+        return "claimed"
+    if not resp.ok:
+        log.debug(
+            "cancel_pair_remote: HTTP %s %s", resp.status_code, resp.text[:200]
+        )
+        return "failed"
+    return "cancelled"
 
 
 # ─── Anonymous Firestore polling for the pending-token subdoc ──────────
