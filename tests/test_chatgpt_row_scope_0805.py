@@ -964,9 +964,19 @@ def test_reject_off_topic_text_is_the_only_place_the_decision_is_made():
     files ended up with no check at all."""
     from conftest import code_only  # type: ignore
     src = code_only(Path(research.__file__).read_text(encoding="utf-8"))
-    # `text_is_off_topic` is consulted by the helper and by nothing else in P2.
-    assert src.count("text_is_off_topic(") == 2, (
-        "expected the definition plus exactly one caller (reject_off_topic_text)")
+    # `text_is_off_topic` is consulted by the two DECIDERS and by nothing else:
+    # `reject_off_topic_text`, which gates what reaches disk, and (2026-08-06)
+    # `title_refusal_verdict`, which decides whether a refused title is worth
+    # telling the user about. Both are named functions with their own tests; a
+    # THIRD caller would mean the predicate had been inlined at a call site
+    # again, which is the shape that produced the original defect.
+    assert src.count("text_is_off_topic(") == 3, (
+        "expected the definition plus exactly two callers "
+        "(reject_off_topic_text, title_refusal_verdict)")
+    for caller in ("reject_off_topic_text", "title_refusal_verdict"):
+        body = src[src.index(f"def {caller}("):]
+        body = body[:body.index("\ndef ", 1)]
+        assert "text_is_off_topic(" in body, caller
 
 
 # ─────────────────────────────────────────────────────────────────────────────

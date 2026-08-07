@@ -1472,6 +1472,56 @@ def resolve_gemini_api_key():
 # gap with a tight 1-2 sentence LLM-generated summary, written via the
 # existing _update_firestore_research path. Fire-and-forget on a daemon
 # thread so the pipeline never waits on the LLM call.
+def title_refusal_verdict(title: str, topic: str, corpus: str) -> str:
+    """What to do with a generated title that shares no word with the topic.
+
+    Returns one of:
+      "accept"        — write it;
+      "refuse_silent" — keep the topic-derived name, say nothing to the user;
+      "refuse_loud"   — keep it AND raise a card, because the corpus agrees the
+                        run went off-topic.
+
+    ⭐⭐ 2026-08-06 — CORROBORATE BEFORE YOU ACCUSE. The tripwire below was built
+    after a run whose notebook ended up titled "Golden Retriever Health, Breeding,
+    and Ownership Evidence" on a topic about NVIDIA agent security, and refusing
+    that title is exactly right. But it judged drift from THE TITLE ALONE, and on
+    2026-08-06 it fired on:
+
+        REFUSING the generated title 'NVIDIA Agent Stack Architecture And
+        Security Boundaries' — it shares none of the topic's distinctive terms
+        (nemoclaw, nemohermes, nemotron, openshell).
+
+    NVIDIA is the vendor of Nemotron. The sources were docs.nvidia.com and
+    build.nvidia.com. The corpus had already been through `apply_off_topic_sweep`
+    and passed — no "OFF-TOPIC text REJECTED" line anywhere in the run. So the
+    loud path fired on a three-to-seven-word string, the one artefact too short
+    to be evidence, while the artefact that IS evidence had already voted.
+
+    And the alert it raised was worse than useless: the phase was already
+    Complete, the heal had already worked, and the card carried a Skip button
+    that had nothing left to skip.
+
+    A pure function of its three inputs so both polarities are testable without a
+    thread, a browser or Firestore. Refusing the title never depends on the
+    corpus — that half was always right and is unchanged. Only the ALERT does.
+    """
+    _t = (title or "").strip()
+    if not _t:
+        return "accept"
+    anchors = topic_anchors(topic)
+    if len(anchors) < _TOPIC_GUARD_MIN_ANCHORS:
+        # Not a guardable topic. Same abstain rule as `text_is_off_topic`.
+        return "accept"
+    low = _t.lower()
+    if any(a in low for a in anchors):
+        return "accept"
+    # The title is anchor-free. Ask the corpus, which is the only witness with
+    # enough text to be believed. `text_is_off_topic` abstains (False) on a short
+    # or unguardable corpus, so an un-corroborated refusal routes to silent —
+    # the project's standing asymmetry, everything uncertain stays quiet.
+    return "refuse_loud" if text_is_off_topic(corpus or "", topic) else "refuse_silent"
+
+
 def _refresh_research_title_async(topic, brief_text="", findings_text=""):
     """Spawn a daemon thread that refines Research.title post-research.
 
@@ -1493,7 +1543,14 @@ def _refresh_research_title_async(topic, brief_text="", findings_text=""):
     """
     _topic = (topic or "").strip()[:200]
     _brief = (brief_text or "").strip()[:600]
-    _findings = (findings_text or "").strip()[:5000]
+    # ⚠ TWO different strings, deliberately. `_findings` is the LLM's prompt
+    # material and stays capped. `_corpus` is the evidence the drift check is
+    # corroborated against, and it must NOT be capped: `text_is_off_topic`
+    # abstains below `_TOPIC_GUARD_MIN_CHARS` (20_000), so passing the 5_000-char
+    # sample would make the corroboration abstain on every run and silently turn
+    # every refusal into a silent one — a guard that always agrees is not a guard.
+    _corpus = (findings_text or "").strip()
+    _findings = _corpus[:5000]
     if not _topic and not _brief and not _findings:
         return
 
@@ -1541,24 +1598,52 @@ def _refresh_research_title_async(topic, brief_text="", findings_text=""):
             # far too short for the length threshold, so the check is applied
             # directly rather than through `text_is_off_topic`.
             if text:
-                _t_anchors = topic_anchors(_topic)
-                if (len(_t_anchors) >= _TOPIC_GUARD_MIN_ANCHORS
-                        and not any(a in text.lower() for a in _t_anchors)):
-                    log(f"[title-refresh] REFUSING the generated title {text!r} — it "
-                        f"shares none of the topic's distinctive terms "
-                        f"({', '.join(_t_anchors[:6])}). Our own findings-based "
-                        f"titler just told us the corpus is not about the topic.",
-                        "ERROR")
-                    try:
-                        emit_event("pipeline_warning", phase=2,
-                                   error="The findings may not match your topic",
-                                   details=(f"We named this research from its own findings "
-                                            f"and got \"{text}\", which does not mention "
-                                            f"your topic at all. One of the agents may have "
-                                            f"reported on something else — worth checking "
-                                            f"before the audio is generated."))
-                    except Exception:
-                        pass
+                _verdict = title_refusal_verdict(text, _topic, _corpus)
+                if _verdict != "accept":
+                    _t_anchors = topic_anchors(_topic)
+                    # The heal itself is IDENTICAL on both refusal paths, and it
+                    # is the part that was never in doubt: drop the title, keep
+                    # the topic-derived name, which is what `smart_title` reads
+                    # and what P3 types into the notebook.
+                    if _verdict == "refuse_loud":
+                        log(f"[title-refresh] REFUSING the generated title {text!r} — it "
+                            f"shares none of the topic's distinctive terms "
+                            f"({', '.join(_t_anchors[:6])}), AND neither does the "
+                            f"corpus it was written from. The research went "
+                            f"off-topic.", "ERROR")
+                        try:
+                            emit_event(
+                                "pipeline_warning", phase=2,
+                                # `message=`, not `error=`: the web app's warning
+                                # branch reads message/warning and falls back to
+                                # the literal string "Backend warning", which is
+                                # what the user saw on the card.
+                                message="The findings may not match your topic",
+                                details=(f"We named this research from its own findings "
+                                         f"and got \"{text}\", which does not mention "
+                                         f"your topic at all — and neither does the "
+                                         f"research it was written from. One of the "
+                                         f"agents may have reported on something else."),
+                                # Explicit empty list, not omitted: the web app
+                                # invents a [Skip] for a phase alert whose actions
+                                # are undefined, and phase 2 is already Complete
+                                # by the time this can fire — there is nothing to
+                                # skip. `[]` means "informational", and it is what
+                                # every other warning in this file already passes.
+                                actions=[], alert_id="phase2_topic_mismatch",
+                                alertType="warn", dismissible=True)
+                        except Exception:
+                            pass
+                    else:
+                        # ⭐ SILENT. The corpus passed the topic guard, so this is
+                        # our own summariser choosing a vendor-level name — a
+                        # naming quirk, not drift. Nothing for a human to do, so
+                        # nothing is shown. Logged, because "the title we picked
+                        # was thrown away" should still be greppable.
+                        log(f"[title-refresh] keeping the topic-derived name: the "
+                            f"generated title {text!r} shares none of the topic's "
+                            f"distinctive terms ({', '.join(_t_anchors[:6])}), but "
+                            f"the corpus does — no alert raised.", "WARN")
                     text = ""
             if text:
                 _update_firestore_research({"title": text, "updatedAt": int(time.time() * 1000)})
@@ -11197,7 +11282,8 @@ class PipelineControls:
             return True
         return False
 
-    async def interruptible_sleep(self, seconds, check_interval=10, skip_phase=None):
+    async def interruptible_sleep(self, seconds, check_interval=10, skip_phase=None,
+                                  retry_phase=None):
         """Sleep in small increments, checking stop/pause every check_interval seconds.
         Returns 'stop' if stopped, 'pause' if paused, None if sleep completed normally.
 
@@ -11206,7 +11292,14 @@ class PipelineControls:
         self.skipped_phases) during the wait. Default None preserves the prior
         behavior for every existing caller (no 'skip' return). Used by the P3
         no-audio auto-retry loop so a Skip click breaks the 5-min wait instead of
-        being ignored until the wait elapses."""
+        being ignored until the wait elapses.
+
+        2026-08-06: `retry_phase` — the same treatment for RETRY_PHASE(N), which
+        this wait could not hear at all. The user pressed Retry on a phase-3 card,
+        the backend logged the command, and the sleep carried on for another three
+        and a half minutes with nothing acknowledging it. CONSUMES the request when
+        it fires, so a stale flag cannot be cashed later by a soft-warn and restart
+        a phase nobody asked to restart."""
         elapsed = 0
         while elapsed < seconds:
             chunk = min(check_interval, seconds - elapsed)
@@ -11220,6 +11313,12 @@ class PipelineControls:
                 try:
                     if int(skip_phase) in self.skipped_phases:
                         return "skip"
+                except (TypeError, ValueError):
+                    pass
+            if retry_phase is not None:
+                try:
+                    if self.consume_retry_phase(int(retry_phase)):
+                        return "retry"
                 except (TypeError, ValueError):
                     pass
         return None
@@ -14903,9 +15002,35 @@ _NLM_ACCESS_DIAG_JS = """() => {
         for (const n of el.childNodes) if (n.nodeType === 3) s += n.nodeValue || '';
         return s.toLowerCase();
     };
-    const dlg = document.querySelector('[role="dialog"]');
+    // ⭐ 2026-08-06 — SIZE-GATE THE DIALOG. This took the first `[role="dialog"]`
+    // in the document with no gate at all, while the sibling that READS the link
+    // (`_NLM_SHARE_LINK_READ_JS`) requires >200x100. That disagreement produced a
+    // pair of log lines one second apart that could not both be true —
+    // `dialog=yes … option-rows=0` from here and `via='no_dialog'` from there —
+    // and it was byte-identical in two runs seven hours apart, so it is a stable
+    // zero-sized element on the page, not residue from a closed dialog.
+    let dlg = null;
+    for (const d of document.querySelectorAll('[role="dialog"]')) {
+        const r = d.getBoundingClientRect();
+        if (r.width > 200 && r.height > 100) { dlg = d; break; }
+    }
     const scope = dlg || document.body;
     const TRIGGERS = '[role="combobox"], [aria-haspopup="listbox"], button[aria-expanded], select';
+    // ⭐ 2026-08-06 — THE ACCESS CONTROL IS NOT THE FIRST COMBOBOX. A Google-style
+    // share surface puts the PEOPLE PICKER first, and `scope.querySelector` takes
+    // whichever comes first in document order — so the diagnostic reported
+    // `control=Search results`, the picker's own listbox label, and every
+    // conclusion drawn from it was about the wrong control. Same
+    // first-match-wins shape as the drift bugs already fixed elsewhere here.
+    const ACCESS_WORDS = /anyone with the link|restricted|only people|not shared|private|anyone/i;
+    const accessTrigger = () => {
+        const all = [...scope.querySelectorAll(TRIGGERS)].filter(vis);
+        // Name the control by what it SAYS, and fall back to document order only
+        // when nothing says anything recognisable.
+        return all.find(t => ACCESS_WORDS.test(norm(t.innerText)))
+            || all.find(t => ACCESS_WORDS.test(norm(t.getAttribute('aria-label'))))
+            || all[0] || null;
+    };
     let already = false;
     for (const t of scope.querySelectorAll(TRIGGERS)) {
         if (ownText(t).includes(PHRASE)) { already = true; break; }
@@ -14918,13 +15043,20 @@ _NLM_ACCESS_DIAG_JS = """() => {
     const rows = [...scope.querySelectorAll(
             '[role="option"], [role="menuitem"], [role="menuitemradio"], li')]
         .filter(vis).map(r => norm(r.innerText).slice(0, 40)).filter(Boolean);
-    const trig = scope.querySelector(TRIGGERS);
+    const trig = accessTrigger();
     return {
         already: already,
         dialog: !!dlg,
         rows: rows.length,
         sample: rows.slice(0, 4),
         access: norm(trig ? trig.innerText : '').slice(0, 60),
+        // How the control was chosen, so a future `control=` that looks wrong is
+        // one grep rather than a code read.
+        accessBy: trig ? (ACCESS_WORDS.test(norm(trig.innerText)) ? 'text'
+                          : ACCESS_WORDS.test(norm(trig.getAttribute('aria-label')))
+                            ? 'aria' : 'first')
+                       : 'none',
+        triggers: [...scope.querySelectorAll(TRIGGERS)].filter(vis).length,
     };
 }"""
 
@@ -15047,6 +15179,13 @@ async def _set_nlm_public_and_get_link(page, label):
                         f"dialog={'yes' if _diag.get('dialog') else 'NO'} "
                         f"option-rows={_diag.get('rows', '?')} "
                         f"control={_diag.get('access') or '(none found)'} "
+                        # 2026-08-06: HOW the control was chosen. `by=first` means
+                        # nothing on the surface named an access level and this is
+                        # simply the first combobox in document order — which is
+                        # how a run came to report control='Search results', the
+                        # people picker's listbox label.
+                        f"by={_diag.get('accessBy', '?')} "
+                        f"of={_diag.get('triggers', '?')} "
                         f"rows={_diag.get('sample') or []}", "WARN")
         else:
             # Silent before this: if the access control itself couldn't be found
@@ -15611,6 +15750,51 @@ _VERIFY_PASTE_JS = """() => {
     return best;
 }"""
 
+# ⭐⭐ 2026-08-06 — THE OTHER HALF OF THE NORMALIZATION, and its absence made a
+# perfect paste unpassable.
+#
+# `_VERIFY_PASTE_JS` above strips this character class from the composer BEFORE
+# it measures. `_verify_paste_landed` then divided that stripped count by
+# `len(brief_text)` — the RAW brief, whitespace included. A markdown brief is
+# ~16% whitespace (blank lines between 109 sections, table padding, list
+# indents), so the ratio for a COMPLETE paste tops out around 0.84 and the 0.90
+# gate can never be met. Live 2026-08-06, and it is the whole of that finding:
+# clipboard 53968/63954 (84%), chunked-clipboard 53968/63954 (84%), keyboard
+# 53968/63954 (84%) — the SAME number on three independent channels, which is
+# the signature of a measurement fault rather than a transport one. Then the CUA
+# fallback pasted a SECOND copy on top and was accepted at 107936/63954 = 169%,
+# so Gemini received the brief twice.
+#
+# Both sides of the comparison must be normalized the same way. Kept as a module
+# constant + helper rather than an inline expression so a test can assert the two
+# classes agree, character for character, instead of restating one of them.
+# Written as explicit escapes, and as JAVASCRIPT's `\s` set rather than Python's:
+# Python's `\s` also matches \x1c-\x1f and \x85, which the JS above leaves IN the
+# composer count. Reaching for Python's shorthand would strip characters from the
+# brief that were never stripped from the reading — a smaller copy of the same bug.
+_PASTE_WS_RE = re.compile(
+    "[\u200b\ufeff\t\n\r\f\v\u0020\u00a0\u1680"
+    "\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]"
+)
+
+
+# Where "the composer holds more than one brief" starts. Deliberately well above
+# 1.0: a composer legitimately carries a little chrome of its own (Gemini's
+# placeholder run-in, ChatGPT's DR pill), and a brief pasted ONCE plus chrome
+# must never be called a duplicate. One-and-a-half copies cannot be chrome.
+_PASTE_DUPLICATE_RATIO = 1.5
+
+
+def paste_compare_len(text: str) -> int:
+    """Length of `text` counted the way `_VERIFY_PASTE_JS` counts the composer.
+
+    The JS strips `[\\u200b\\ufeff\\s]`; this strips the same set. Anything that
+    compares a composer reading against a brief MUST run the brief through here
+    first — the two numbers are otherwise in different units.
+    """
+    return len(_PASTE_WS_RE.sub("", text or ""))
+
+
 # Claude attachment-count probe — large pastes auto-convert into one tile.
 _CLAUDE_ATTACH_COUNT_JS = """() => {
     const tiles = document.querySelectorAll(
@@ -15674,8 +15858,21 @@ async def _verify_paste_landed(page, brief_text, platform, label, source="dom"):
     plat = platform.lower()
     try:
         content_len = await page.evaluate(_VERIFY_PASTE_JS)
-        expected = len(brief_text)
+        # Same units on both sides — see `paste_compare_len`. `content_len` has
+        # already had this class stripped by the JS; the brief must have it
+        # stripped too or a complete paste reads as a 16%-short one.
+        expected = paste_compare_len(brief_text)
         ratio = content_len / expected if expected > 0 else 0
+        # A composer holding materially MORE than one brief is a duplicate paste,
+        # not a good one — the 2026-08-06 run's CUA fallback appended a second
+        # copy and the bare `ratio >= 0.90` gate waved 169% through. Say so. The
+        # ratio fix above is what stops it happening; this is what makes it
+        # visible if it ever does again.
+        if ratio >= _PASTE_DUPLICATE_RATIO:
+            log(f"[{label}] Paste verify ({source}): the composer holds "
+                f"{content_len} chars against a {expected}-char brief "
+                f"({ratio:.0%}) — this looks like MORE THAN ONE copy of the "
+                f"brief, so the agent may be reading it twice", "WARN")
         if plat == "claude" and ratio < 0.90:
             try:
                 attach_count = await page.evaluate(_CLAUDE_ATTACH_COUNT_JS)
@@ -15700,15 +15897,18 @@ async def _verify_paste_landed(page, brief_text, platform, label, source="dom"):
             except Exception:
                 pass
         if ratio >= 0.90:
-            log(f"[{label}] Brief pasted ✓ ({source}, {content_len}/{expected} chars, {ratio:.0%})")
+            log(f"[{label}] Brief pasted ✓ ({source}, {content_len}/{expected} "
+                f"non-whitespace chars, {ratio:.0%})")
             return True
         # ⭐ 2026-08-05 — EMPTY and TRUNCATED need OPPOSITE fixes (a dead key
         # mapping vs a chunk size), and "0%" described both. Say which.
         if content_len == 0:
             log(f"[{label}] Paste verify ({source}): the composer is EMPTY — "
-                f"nothing was pasted at all (expected {expected} chars)", "WARN")
+                f"nothing was pasted at all (expected {expected} "
+                f"non-whitespace chars)", "WARN")
         else:
-            log(f"[{label}] Paste verify ({source}): {content_len}/{expected} chars ({ratio:.0%})", "WARN")
+            log(f"[{label}] Paste verify ({source}): {content_len}/{expected} "
+                f"non-whitespace chars ({ratio:.0%})", "WARN")
     except Exception as e:
         log(f"[{label}] Paste verify error ({source}): {e}", "WARN")
     return False
@@ -20589,6 +20789,34 @@ _LOGIN_HOST_NEGATIVES = (
 # "Login required" noise.
 
 
+# ⭐⭐ 2026-08-06 — ONE CEILING FOR THE SOURCE LIST, AND IT WAS SIZED BELOW THE PANEL.
+#
+# The 2026-08-06 run's ChatGPT activity panel held 142 distinct non-platform URLs
+# in a single sample (157 anchors, 154 rows, captured to
+# `p2_panel_dump_2.html`). Every walker truncated its OWN sample to 50 BEFORE the
+# cross-sample union ever saw it, and the panel had gone from 3 anchors to 157 in
+# one 45-second sample — so 92 sources were discarded at the door and no later
+# tick could recover them. The card read "50 sources" all run.
+#
+# ⛔ AND THE OBVIOUS FIX WAS THE WRONG ONE. "Keep the newest 50" was proposed and
+# is measurably WORSE on this very panel: the head is the topic's primary
+# evidence (github.com/NVIDIA/NemoClaw, docs.nvidia.com/nemoclaw/…,
+# github.com/NVIDIA/OpenShell/releases) and the tail is where the search drifted
+# (goodreads "august releases", a games round-up, a book-blog). Document order in
+# this panel is roughly relevance order. So the direction stays head-first and the
+# CEILING moves instead — which is the thing that was actually binding.
+#
+# 200 keeps a real bound (a pathological panel still cannot blow up a Firestore
+# doc: 200 URLs is ~20 KB against a 1 MB limit) while sitting comfortably above
+# every panel size this project has measured.
+#
+# ⚠ The JavaScript walkers cannot import this. They carry the literal, and
+# `tests/test_source_cap_0806.py` asserts every one of them equals this value —
+# that test is the only thing keeping the two sides in step, so do not delete it
+# in favour of a comment.
+_SOURCE_LIST_CAP = 200
+
+
 async def scrape_progress_chatgpt(page):
     """Scrape ChatGPT's current research progress (Playwright JS — zero CUA cost).
     Returns rich data for web app: status, thinking steps, sources, sections, text length.
@@ -20684,7 +20912,7 @@ async def scrape_progress_chatgpt(page):
                 if (href.startsWith('http') && !href.includes('chatgpt.com') && !href.includes('openai.com') && !href.includes('chat.openai') && !href.includes('oaiusercontent') && href.length < 500)
                     srcSet.add(href);
             });
-            r.source_urls = Array.from(srcSet).slice(0, 50);
+            r.source_urls = Array.from(srcSet).slice(0, 200);
             r.sources = r.source_urls.length;
             // Response sections (host page headings)
             const headings = document.querySelectorAll('[data-message-author-role="assistant"] h1, [data-message-author-role="assistant"] h2, [data-message-author-role="assistant"] h3');
@@ -20779,7 +21007,7 @@ async def scrape_progress_chatgpt(page):
                         h.includes('oaiusercontent') || h.includes('chat.openai')) return;
                     srcSet.add(h);
                 });
-                out.source_urls = Array.from(srcSet).slice(0, 50);
+                out.source_urls = Array.from(srcSet).slice(0, 200);
                 out.sections = Array.from(root.querySelectorAll('h1, h2, h3'))
                     .map(h => (h.innerText || '').trim().slice(0, 80))
                     .filter(s => s.length > 1);
@@ -20794,7 +21022,7 @@ async def scrape_progress_chatgpt(page):
                         if u not in seen_h:
                             seen_h.add(u); unioned_h.append(u)
                     if len(unioned_h) > result.get("sources", 0):
-                        result["source_urls"] = unioned_h[:50]
+                        result["source_urls"] = unioned_h[:_SOURCE_LIST_CAP]
                         result["sources"] = len(result["source_urls"])
                 if hp.get("steps") and len(hp["steps"]) > len(result.get("steps") or []):
                     result["steps"] = hp["steps"]
@@ -20828,7 +21056,7 @@ async def scrape_progress_chatgpt(page):
                             seen_il.add(u)
                             unioned_il.append(u)
                     if len(unioned_il) > result.get("sources", 0):
-                        result["source_urls"] = unioned_il[:50]
+                        result["source_urls"] = unioned_il[:_SOURCE_LIST_CAP]
                         result["sources"] = len(result["source_urls"])
                 if int(il.get("searches", 0) or 0) > int(result.get("searches", 0) or 0):
                     result["searches"] = int(il.get("searches", 0) or 0)
@@ -20843,271 +21071,279 @@ async def scrape_progress_chatgpt(page):
             log(f"ChatGPT inline activity sweep skipped: {_ile}", "DEBUG")
 
         # ---- Iframe scrape (Deep Research content lives here as of 2026)
+        # 2026-08-06: candidates come from `_chatgpt_surface_frame_targets`. This
+        # scrape feeds narration AND `last_growth_len`/`last_growth_sources`,
+        # which arm the never-grew veto — so a frame list that misses the real
+        # surface can make a working run look like it never produced anything.
         try:
-            for frame in page.frames:
+            # ⛔ NARROW ON PURPOSE. This walker does not only read — it
+            # CLICKS (the plan-item live row, the Cited-sources expander), and a
+            # synthetic click into a surface we have never clicked is how the
+            # 2026-08-06 second run acquired a panel failure that took two
+            # analyses to argue about. Readers get the wide list; clickers do not.
+            for frame in _chatgpt_surface_frame_targets(
+                    page, include_blank=False)[1:]:
                 try:
-                    src = (frame.url or "").lower()
-                except Exception:
-                    continue
-                if not src:
-                    continue
-                # Match any OpenAI DR sandbox iframe (URL substring varies)
-                if ("deep_research" in src or "oaiusercontent" in src or "web-sandbox.oaiusercontent" in src):
+                    dr = await frame.evaluate("""() => {
+                        const d = {
+                            steps: [], source_urls: [], sections: [],
+                            partial_text_len: 0, progress: '', thinking: '',
+                            is_active: false, is_done: false
+                        };
+                        // 1. Steps: DR shows an activity/timeline panel
+                        const stepEls = document.querySelectorAll(
+                            '[class*="step"], [class*="activity"], [class*="timeline"] li, ' +
+                            '[data-step], [class*="research-step"], ' +
+                            'li[class*="activity"], [role="listitem"]'
+                        );
+                        d.steps = Array.from(stepEls).map(e => (e.innerText || '').trim().substring(0, 180))
+                                                     .filter(s => s.length > 3).slice(-12);
+                        // 2. Sources: DR shows a source list — collect http links inside iframe
+                        const srcSet = new Set();
+                        document.querySelectorAll('a[href^="http"]').forEach(a => {
+                            const h = a.href || '';
+                            if (h.length < 500 &&
+                                !h.includes('chatgpt.com') && !h.includes('openai.com') &&
+                                !h.includes('oaiusercontent')) srcSet.add(h);
+                        });
+                        d.source_urls = Array.from(srcSet).slice(0, 200);
+                        // 3. Headings in the DR report
+                        const hs = document.querySelectorAll('h1, h2, h3');
+                        d.sections = Array.from(hs).map(h => (h.innerText || '').trim().substring(0, 80))
+                                                   .filter(s => s.length > 1);
+                        // 4. Partial text — use body text as proxy
+                        d.partial_text_len = (document.body?.innerText || '').length;
+                        // 5. Activity detection inside iframe
+                        const bodyLower = (document.body?.innerText || '').toLowerCase();
+                        const activeKws = ['researching', 'searching', 'reading', 'analyzing',
+                                           'sources found', 'sources and counting', 'browsing'];
+                        d.is_active = activeKws.some(kw => bodyLower.includes(kw));
+                        // 6. Completion indicators inside iframe
+                        const doneKws = ['research completed', 'finished research',
+                                         'deep research completed'];
+                        d.is_done = doneKws.some(kw => bodyLower.includes(kw));
+                        // 7. Latest step as progress
+                        if (d.steps.length > 0) d.progress = d.steps[d.steps.length - 1];
+                        return d;
+                    }""")
+                    if dr:
+                        # Additive merge: iframe data is rich for DR content,
+                        # but host-panel sweep above already collected steps/
+                        # sources from the host page side. Last-write-wins
+                        # would clobber 12 host-panel rows with 8 iframe rows.
+                        if dr.get("partial_text_len", 0) > result.get("partial_text_len", 0):
+                            result["partial_text_len"] = dr["partial_text_len"]
+                        # Sources: union (preserve order, capped at `_SOURCE_LIST_CAP`)
+                        iframe_srcs = dr.get("source_urls") or []
+                        if iframe_srcs:
+                            seen_i = set(result.get("source_urls") or [])
+                            unioned_i = list(result.get("source_urls") or [])
+                            for u in iframe_srcs:
+                                if u not in seen_i:
+                                    seen_i.add(u); unioned_i.append(u)
+                            if len(unioned_i) > len(result.get("source_urls") or []):
+                                result["source_urls"] = unioned_i[:_SOURCE_LIST_CAP]
+                                result["sources"] = len(result["source_urls"])
+                        # Steps: union by [:80] dedupe key (keep last 15)
+                        if dr.get("steps"):
+                            existing_steps = result.get("steps") or []
+                            seen_s = set(s[:80] for s in existing_steps)
+                            merged_steps = list(existing_steps)
+                            for s in dr["steps"]:
+                                k = s[:80]
+                                if k not in seen_s:
+                                    seen_s.add(k); merged_steps.append(s)
+                            result["steps"] = merged_steps[-15:]
+                            if dr.get("progress"):
+                                # 2026-04-29: keep host-panel progress when
+                                # present — the host strip's "Focusing on X"
+                                # / "224 searches" line is canonical for FE
+                                # narration. Only fall through to iframe
+                                # progress when host produced nothing.
+                                cur = result.get("progress") or ""
+                                if not cur:
+                                    result["progress"] = dr["progress"]
+                        # Sections: union (exact-string dedup since headings)
+                        if dr.get("sections"):
+                            existing_sec = result.get("sections") or []
+                            seen_sec = set(existing_sec)
+                            merged_sec = list(existing_sec)
+                            for s in dr["sections"]:
+                                if s not in seen_sec:
+                                    seen_sec.add(s); merged_sec.append(s)
+                            if len(merged_sec) > len(existing_sec):
+                                result["sections"] = merged_sec
+                        # Status override from iframe signals
+                        if dr.get("is_active"):
+                            result["dr_active"] = True
+                        if dr.get("is_done"):
+                            result["dr_done_text"] = True
+                except Exception as _ie:
+                    log(f"ChatGPT DR iframe evaluate skipped: {_ie}", "DEBUG")
+                # ── Actively expand the "Cited sources" panel ──
+                # ChatGPT DR collapses the sources list by default — the
+                # `<a href>` nodes inside it are NOT rendered until the
+                # user clicks the panel. The default scrape above misses
+                # those links and undercounts sources (often 0–3 instead
+                # of 10–20). On by default — opt out via
+                # DG_SOURCE_PANEL_EXPAND=0/false/no. Wrapped in try/except
+                # so any failure silently keeps the partial result we
+                # already collected.
+                if os.environ.get("DG_SOURCE_PANEL_EXPAND", "1").lower() not in ("0", "false", "no"):
                     try:
-                        dr = await frame.evaluate("""() => {
-                            const d = {
-                                steps: [], source_urls: [], sections: [],
-                                partial_text_len: 0, progress: '', thinking: '',
-                                is_active: false, is_done: false
-                            };
-                            // 1. Steps: DR shows an activity/timeline panel
-                            const stepEls = document.querySelectorAll(
-                                '[class*="step"], [class*="activity"], [class*="timeline"] li, ' +
-                                '[data-step], [class*="research-step"], ' +
-                                'li[class*="activity"], [role="listitem"]'
-                            );
-                            d.steps = Array.from(stepEls).map(e => (e.innerText || '').trim().substring(0, 180))
-                                                         .filter(s => s.length > 3).slice(-12);
-                            // 2. Sources: DR shows a source list — collect http links inside iframe
-                            const srcSet = new Set();
-                            document.querySelectorAll('a[href^="http"]').forEach(a => {
-                                const h = a.href || '';
-                                if (h.length < 500 &&
-                                    !h.includes('chatgpt.com') && !h.includes('openai.com') &&
-                                    !h.includes('oaiusercontent')) srcSet.add(h);
-                            });
-                            d.source_urls = Array.from(srcSet).slice(0, 50);
-                            // 3. Headings in the DR report
-                            const hs = document.querySelectorAll('h1, h2, h3');
-                            d.sections = Array.from(hs).map(h => (h.innerText || '').trim().substring(0, 80))
-                                                       .filter(s => s.length > 1);
-                            // 4. Partial text — use body text as proxy
-                            d.partial_text_len = (document.body?.innerText || '').length;
-                            // 5. Activity detection inside iframe
-                            const bodyLower = (document.body?.innerText || '').toLowerCase();
-                            const activeKws = ['researching', 'searching', 'reading', 'analyzing',
-                                               'sources found', 'sources and counting', 'browsing'];
-                            d.is_active = activeKws.some(kw => bodyLower.includes(kw));
-                            // 6. Completion indicators inside iframe
-                            const doneKws = ['research completed', 'finished research',
-                                             'deep research completed'];
-                            d.is_done = doneKws.some(kw => bodyLower.includes(kw));
-                            // 7. Latest step as progress
-                            if (d.steps.length > 0) d.progress = d.steps[d.steps.length - 1];
-                            return d;
+                        click_res = await frame.evaluate("""() => {
+                            const candidates = document.querySelectorAll('button, [role="button"]');
+                            for (const b of candidates) {
+                                const t = (b.textContent || '').trim().toLowerCase();
+                                const al = (b.getAttribute('aria-label') || '').toLowerCase();
+                                const isSourcesLabel =
+                                    t === 'sources' || t === 'cited sources' ||
+                                    /^\\d+\\s+sources?$/.test(t) ||
+                                    al.includes('cited source') || al === 'sources';
+                                if (!isSourcesLabel) continue;
+                                const expanded = b.getAttribute('aria-expanded');
+                                if (expanded === 'true') {
+                                    return { clicked: false, alreadyExpanded: true, label: t || al };
+                                }
+                                b.click();
+                                return { clicked: true, label: t || al };
+                            }
+                            return { clicked: false, found: false };
                         }""")
-                        if dr:
-                            # Additive merge: iframe data is rich for DR content,
-                            # but host-panel sweep above already collected steps/
-                            # sources from the host page side. Last-write-wins
-                            # would clobber 12 host-panel rows with 8 iframe rows.
-                            if dr.get("partial_text_len", 0) > result.get("partial_text_len", 0):
-                                result["partial_text_len"] = dr["partial_text_len"]
-                            # Sources: union (preserve order, cap 50)
-                            iframe_srcs = dr.get("source_urls") or []
-                            if iframe_srcs:
-                                seen_i = set(result.get("source_urls") or [])
-                                unioned_i = list(result.get("source_urls") or [])
-                                for u in iframe_srcs:
-                                    if u not in seen_i:
-                                        seen_i.add(u); unioned_i.append(u)
-                                if len(unioned_i) > len(result.get("source_urls") or []):
-                                    result["source_urls"] = unioned_i[:50]
-                                    result["sources"] = len(result["source_urls"])
-                            # Steps: union by [:80] dedupe key (keep last 15)
-                            if dr.get("steps"):
+                        if click_res and click_res.get("clicked"):
+                            # Lazy render needs a beat. 1.0s is generous —
+                            # the list either appears immediately or the
+                            # panel was already populated.
+                            await asyncio.sleep(1.0)
+                            try:
+                                dr2 = await frame.evaluate("""() => {
+                                    const srcSet = new Set();
+                                    document.querySelectorAll('a[href^="http"]').forEach(a => {
+                                        const h = a.href || '';
+                                        if (h.length < 500 &&
+                                            !h.includes('chatgpt.com') && !h.includes('openai.com') &&
+                                            !h.includes('oaiusercontent')) srcSet.add(h);
+                                    });
+                                    return { source_urls: Array.from(srcSet).slice(0, 200) };
+                                }""")
+                                if dr2 and dr2.get("source_urls"):
+                                    # Union (preserve order) instead of replace —
+                                    # the panel may render different URLs than the
+                                    # pre-click DOM scrape (different ordering or
+                                    # subset). Strict `>` would skip cases where
+                                    # post-click count ties pre-click but the URLs
+                                    # are objectively different.
+                                    seen_u = set(result.get("source_urls") or [])
+                                    unioned = list(result.get("source_urls") or [])
+                                    for u in dr2["source_urls"]:
+                                        if u not in seen_u:
+                                            seen_u.add(u)
+                                            unioned.append(u)
+                                    if len(unioned) > result.get("sources", 0):
+                                        result["source_urls"] = unioned[:_SOURCE_LIST_CAP]
+                                        result["sources"] = len(result["source_urls"])
+                            except Exception as _re2:
+                                log(f"ChatGPT sources-panel re-scrape skipped: {_re2}", "DEBUG")
+                    except Exception as _se:
+                        log(f"ChatGPT sources-panel expand skipped: {_se}", "DEBUG")
+                # ── 2026-04-26 (v2): plan-checklist DOM walker + live-row click ──
+                # ChatGPT DR's plan checklist uses Tailwind <div>s (not role=checkbox /
+                # data-testid=task / bare <li>) so the v1 selectors missed iteration 1.
+                # v2: walk the checklist via verb-prefix + svg[class*=check|spin] heuristic,
+                # populate result.steps[] (full plan list, last 15) and result.progress
+                # (active-row label) directly. Click the live row IF NOT already
+                # aria-expanded, then re-scrape URLs scoped to the expanded subtree
+                # (no global host-page sweep). Opt out via DG_PLAN_ITEM_EXPAND=0.
+                if os.environ.get("DG_PLAN_ITEM_EXPAND", "1").lower() not in ("0", "false", "no"):
+                    try:
+                        walk = await frame.evaluate("""() => {
+                            const out = { steps: [], live_label: '', clicked: false, already_expanded: false };
+                            const VERB = /^(thinking|reasoning|searching|looking|browsing|investigating|analyzing|reading|exploring|checking|visiting|researching|confirming|summari[zs]ing|synthesi[zs]ing|drafting|finali[zs]ing)\\b/i;
+                            const all = Array.from(document.querySelectorAll('div, li, [role="listitem"], button, [role="button"]'));
+                            const rows = [];
+                            for (const el of all) {
+                                const t = (el.innerText || '').trim();
+                                if (!t || t.length < 4 || t.length > 220) continue;
+                                const hasCheck = !!el.querySelector('svg[class*="check"], svg[data-icon*="check"]');
+                                const hasSpin  = !!el.querySelector('svg[class*="spin"], svg[class*="loader"], [class*="animate-spin"]');
+                                const verbHit  = VERB.test(t);
+                                if (!verbHit && !hasCheck && !hasSpin) continue;
+                                const key = t.slice(0, 60);
+                                if (rows.find(r => r.key === key)) continue;
+                                rows.push({ el, t, hasCheck, hasSpin, verbHit, key });
+                            }
+                            out.steps = rows.map(r => r.t.slice(0, 200)).slice(-15);
+                            const live = rows.find(r => r.hasSpin) ||
+                                         rows.find(r => r.verbHit && !r.hasCheck);
+                            if (live) {
+                                out.live_label = live.t.slice(0, 160);
+                                const expanded = live.el.getAttribute('aria-expanded');
+                                if (expanded === 'true') {
+                                    out.already_expanded = true;
+                                } else {
+                                    live.el.click();
+                                    out.clicked = true;
+                                }
+                            }
+                            return out;
+                        }""")
+                        if walk:
+                            # Additive: union plan-item steps with whatever
+                            # the iframe walker + host-panel sweep already
+                            # collected. live_label is the active row, so
+                            # it typically wins for `progress` but only if
+                            # richer than what's there.
+                            if walk.get("steps"):
                                 existing_steps = result.get("steps") or []
                                 seen_s = set(s[:80] for s in existing_steps)
                                 merged_steps = list(existing_steps)
-                                for s in dr["steps"]:
+                                for s in walk["steps"]:
                                     k = s[:80]
                                     if k not in seen_s:
                                         seen_s.add(k); merged_steps.append(s)
                                 result["steps"] = merged_steps[-15:]
-                                if dr.get("progress"):
-                                    # 2026-04-29: keep host-panel progress when
-                                    # present — the host strip's "Focusing on X"
-                                    # / "224 searches" line is canonical for FE
-                                    # narration. Only fall through to iframe
-                                    # progress when host produced nothing.
-                                    cur = result.get("progress") or ""
-                                    if not cur:
-                                        result["progress"] = dr["progress"]
-                            # Sections: union (exact-string dedup since headings)
-                            if dr.get("sections"):
-                                existing_sec = result.get("sections") or []
-                                seen_sec = set(existing_sec)
-                                merged_sec = list(existing_sec)
-                                for s in dr["sections"]:
-                                    if s not in seen_sec:
-                                        seen_sec.add(s); merged_sec.append(s)
-                                if len(merged_sec) > len(existing_sec):
-                                    result["sections"] = merged_sec
-                            # Status override from iframe signals
-                            if dr.get("is_active"):
-                                result["dr_active"] = True
-                            if dr.get("is_done"):
-                                result["dr_done_text"] = True
-                    except Exception as _ie:
-                        log(f"ChatGPT DR iframe evaluate skipped: {_ie}", "DEBUG")
-                    # ── Actively expand the "Cited sources" panel ──
-                    # ChatGPT DR collapses the sources list by default — the
-                    # `<a href>` nodes inside it are NOT rendered until the
-                    # user clicks the panel. The default scrape above misses
-                    # those links and undercounts sources (often 0–3 instead
-                    # of 10–20). On by default — opt out via
-                    # DG_SOURCE_PANEL_EXPAND=0/false/no. Wrapped in try/except
-                    # so any failure silently keeps the partial result we
-                    # already collected.
-                    if os.environ.get("DG_SOURCE_PANEL_EXPAND", "1").lower() not in ("0", "false", "no"):
-                        try:
-                            click_res = await frame.evaluate("""() => {
-                                const candidates = document.querySelectorAll('button, [role="button"]');
-                                for (const b of candidates) {
-                                    const t = (b.textContent || '').trim().toLowerCase();
-                                    const al = (b.getAttribute('aria-label') || '').toLowerCase();
-                                    const isSourcesLabel =
-                                        t === 'sources' || t === 'cited sources' ||
-                                        /^\\d+\\s+sources?$/.test(t) ||
-                                        al.includes('cited source') || al === 'sources';
-                                    if (!isSourcesLabel) continue;
-                                    const expanded = b.getAttribute('aria-expanded');
-                                    if (expanded === 'true') {
-                                        return { clicked: false, alreadyExpanded: true, label: t || al };
-                                    }
-                                    b.click();
-                                    return { clicked: true, label: t || al };
-                                }
-                                return { clicked: false, found: false };
-                            }""")
-                            if click_res and click_res.get("clicked"):
-                                # Lazy render needs a beat. 1.0s is generous —
-                                # the list either appears immediately or the
-                                # panel was already populated.
+                            if walk.get("live_label"):
+                                cur = result.get("progress") or ""
+                                if not cur or len(walk["live_label"]) > len(cur) * 0.5:
+                                    result["progress"] = walk["live_label"]
+                            if walk.get("clicked"):
+                                log(f'[ChatGPT] plan-item live-row clicked: "{walk.get("live_label","")}"')
                                 await asyncio.sleep(1.0)
+                            if walk.get("clicked") or walk.get("already_expanded"):
                                 try:
-                                    dr2 = await frame.evaluate("""() => {
+                                    dr3 = await frame.evaluate("""() => {
+                                        const expanded = document.querySelector('[aria-expanded="true"]');
+                                        const root = expanded || document;
                                         const srcSet = new Set();
-                                        document.querySelectorAll('a[href^="http"]').forEach(a => {
+                                        root.querySelectorAll('a[href^="http"]').forEach(a => {
                                             const h = a.href || '';
                                             if (h.length < 500 &&
                                                 !h.includes('chatgpt.com') && !h.includes('openai.com') &&
                                                 !h.includes('oaiusercontent')) srcSet.add(h);
                                         });
-                                        return { source_urls: Array.from(srcSet).slice(0, 50) };
+                                        return { source_urls: Array.from(srcSet).slice(0, 200) };
                                     }""")
-                                    if dr2 and dr2.get("source_urls"):
-                                        # Union (preserve order) instead of replace —
-                                        # the panel may render different URLs than the
-                                        # pre-click DOM scrape (different ordering or
-                                        # subset). Strict `>` would skip cases where
-                                        # post-click count ties pre-click but the URLs
-                                        # are objectively different.
-                                        seen_u = set(result.get("source_urls") or [])
-                                        unioned = list(result.get("source_urls") or [])
-                                        for u in dr2["source_urls"]:
-                                            if u not in seen_u:
-                                                seen_u.add(u)
-                                                unioned.append(u)
-                                        if len(unioned) > result.get("sources", 0):
-                                            result["source_urls"] = unioned[:50]
+                                    if dr3 and dr3.get("source_urls"):
+                                        seen3 = set(result.get("source_urls") or [])
+                                        unioned3 = list(result.get("source_urls") or [])
+                                        for u in dr3["source_urls"]:
+                                            if u not in seen3:
+                                                seen3.add(u)
+                                                unioned3.append(u)
+                                        if len(unioned3) > len(result.get("source_urls") or []):
+                                            result["source_urls"] = unioned3[:_SOURCE_LIST_CAP]
                                             result["sources"] = len(result["source_urls"])
-                                except Exception as _re2:
-                                    log(f"ChatGPT sources-panel re-scrape skipped: {_re2}", "DEBUG")
-                        except Exception as _se:
-                            log(f"ChatGPT sources-panel expand skipped: {_se}", "DEBUG")
-                    # ── 2026-04-26 (v2): plan-checklist DOM walker + live-row click ──
-                    # ChatGPT DR's plan checklist uses Tailwind <div>s (not role=checkbox /
-                    # data-testid=task / bare <li>) so the v1 selectors missed iteration 1.
-                    # v2: walk the checklist via verb-prefix + svg[class*=check|spin] heuristic,
-                    # populate result.steps[] (full plan list, last 15) and result.progress
-                    # (active-row label) directly. Click the live row IF NOT already
-                    # aria-expanded, then re-scrape URLs scoped to the expanded subtree
-                    # (no global host-page sweep). Opt out via DG_PLAN_ITEM_EXPAND=0.
-                    if os.environ.get("DG_PLAN_ITEM_EXPAND", "1").lower() not in ("0", "false", "no"):
-                        try:
-                            walk = await frame.evaluate("""() => {
-                                const out = { steps: [], live_label: '', clicked: false, already_expanded: false };
-                                const VERB = /^(thinking|reasoning|searching|looking|browsing|investigating|analyzing|reading|exploring|checking|visiting|researching|confirming|summari[zs]ing|synthesi[zs]ing|drafting|finali[zs]ing)\\b/i;
-                                const all = Array.from(document.querySelectorAll('div, li, [role="listitem"], button, [role="button"]'));
-                                const rows = [];
-                                for (const el of all) {
-                                    const t = (el.innerText || '').trim();
-                                    if (!t || t.length < 4 || t.length > 220) continue;
-                                    const hasCheck = !!el.querySelector('svg[class*="check"], svg[data-icon*="check"]');
-                                    const hasSpin  = !!el.querySelector('svg[class*="spin"], svg[class*="loader"], [class*="animate-spin"]');
-                                    const verbHit  = VERB.test(t);
-                                    if (!verbHit && !hasCheck && !hasSpin) continue;
-                                    const key = t.slice(0, 60);
-                                    if (rows.find(r => r.key === key)) continue;
-                                    rows.push({ el, t, hasCheck, hasSpin, verbHit, key });
-                                }
-                                out.steps = rows.map(r => r.t.slice(0, 200)).slice(-15);
-                                const live = rows.find(r => r.hasSpin) ||
-                                             rows.find(r => r.verbHit && !r.hasCheck);
-                                if (live) {
-                                    out.live_label = live.t.slice(0, 160);
-                                    const expanded = live.el.getAttribute('aria-expanded');
-                                    if (expanded === 'true') {
-                                        out.already_expanded = true;
-                                    } else {
-                                        live.el.click();
-                                        out.clicked = true;
-                                    }
-                                }
-                                return out;
-                            }""")
-                            if walk:
-                                # Additive: union plan-item steps with whatever
-                                # the iframe walker + host-panel sweep already
-                                # collected. live_label is the active row, so
-                                # it typically wins for `progress` but only if
-                                # richer than what's there.
-                                if walk.get("steps"):
-                                    existing_steps = result.get("steps") or []
-                                    seen_s = set(s[:80] for s in existing_steps)
-                                    merged_steps = list(existing_steps)
-                                    for s in walk["steps"]:
-                                        k = s[:80]
-                                        if k not in seen_s:
-                                            seen_s.add(k); merged_steps.append(s)
-                                    result["steps"] = merged_steps[-15:]
-                                if walk.get("live_label"):
-                                    cur = result.get("progress") or ""
-                                    if not cur or len(walk["live_label"]) > len(cur) * 0.5:
-                                        result["progress"] = walk["live_label"]
-                                if walk.get("clicked"):
-                                    log(f'[ChatGPT] plan-item live-row clicked: "{walk.get("live_label","")}"')
-                                    await asyncio.sleep(1.0)
-                                if walk.get("clicked") or walk.get("already_expanded"):
-                                    try:
-                                        dr3 = await frame.evaluate("""() => {
-                                            const expanded = document.querySelector('[aria-expanded="true"]');
-                                            const root = expanded || document;
-                                            const srcSet = new Set();
-                                            root.querySelectorAll('a[href^="http"]').forEach(a => {
-                                                const h = a.href || '';
-                                                if (h.length < 500 &&
-                                                    !h.includes('chatgpt.com') && !h.includes('openai.com') &&
-                                                    !h.includes('oaiusercontent')) srcSet.add(h);
-                                            });
-                                            return { source_urls: Array.from(srcSet).slice(0, 50) };
-                                        }""")
-                                        if dr3 and dr3.get("source_urls"):
-                                            seen3 = set(result.get("source_urls") or [])
-                                            unioned3 = list(result.get("source_urls") or [])
-                                            for u in dr3["source_urls"]:
-                                                if u not in seen3:
-                                                    seen3.add(u)
-                                                    unioned3.append(u)
-                                            if len(unioned3) > len(result.get("source_urls") or []):
-                                                result["source_urls"] = unioned3[:50]
-                                                result["sources"] = len(result["source_urls"])
-                                    except Exception as _re3:
-                                        log(f"ChatGPT plan-item re-scrape skipped: {_re3}", "DEBUG")
-                        except Exception as _pe:
-                            log(f"ChatGPT plan-item walker skipped: {_pe}", "DEBUG")
-                    break
+                                except Exception as _re3:
+                                    log(f"ChatGPT plan-item re-scrape skipped: {_re3}", "DEBUG")
+                    except Exception as _pe:
+                        log(f"ChatGPT plan-item walker skipped: {_pe}", "DEBUG")
+                # ⛔ NO `break`. It used to end this body, inside the URL
+                # substring `if`, stopping at the FIRST matching frame — which on
+                # 2026-08-06 was the connector shell, an empty document, while
+                # the surface sat in the `about:blank` frame behind it. Every
+                # merge in this body is a max-or-union (see the "last-write-wins
+                # would clobber" note above), so visiting all candidates cannot
+                # lose what an earlier one found.
         except Exception as _fe:
             log(f"ChatGPT frames iteration skipped: {_fe}", "DEBUG")
 
@@ -21279,7 +21515,7 @@ _CHATGPT_INLINE_ACTIVITY_JS = """() => {
         seenUrl.add(h);
         out.source_urls.push(h);
     });
-    out.source_urls = out.source_urls.slice(0, 50);
+    out.source_urls = out.source_urls.slice(0, 200);
     // Aggregate counts — max wins so transient lower reads don't shrink.
     try {
         const re = /(\\d+)\\s+(?:websites?|sources?|searches?|sites?|results?|citations?)\\b/gi;
@@ -21315,6 +21551,46 @@ _CHATGPT_INLINE_ACTIVITY_JS = """() => {
 # selector sweep keeps a relaxed width gate + the text gate (it has no
 # header anchor, so the text floor still guards against random asides).
 _CHATGPT_SIDE_PANEL_JS = """() => {
+    // ⭐⭐ 2026-08-06 (run 2) — THE PANEL THAT WAS NEVER OPENED. This probe is the
+    // anti-toggle PRE-CHECK: when it says "open", the poller latches
+    // `chatgpt_activity_panel_open` and never calls the opener again for the
+    // whole phase. On the 21:00 run it said open on its very first P2 sample and
+    // the sources panel was consequently never clicked:
+    //   [21:17:30] activity already open (shape=side) at elapsed=204s — no click needed
+    //   [21:17:31] panel tracking (shape=side): 0 URLs, 0 steps, 1 sections, searches=0
+    //   ...and 0/0/0 on every sample to the end of the phase. ChatGPT finished
+    //   with sources=0.
+    // The node the reader landed on one second later was
+    //   DIV|flex w-full flex-col gap-1 empty:hidden items-end rtl:items-start
+    // — a right-aligned USER TURN wrapper. `items-end` is why it sits in the
+    // right half and passes the geometry, and nothing here asked whether a
+    // conversation turn can be an activity panel.
+    //
+    // ⚠ WHICH element and WHICH context actually satisfied it on that run is NOT
+    // established, and cannot be: this returned a bare boolean and logged
+    // nothing, while the opener's success line has printed clickedTag + frameUrl
+    // since #913. That asymmetry is half the defect. It now returns IDENTITY, so
+    // the next occurrence is one grep instead of an argument.
+    const isTurn = (n) => {
+        // A conversation turn is never the activity panel. Cheap, absolute, and
+        // it is the arm that would have refused the observed node.
+        try {
+            return !!(n.closest('[data-message-author-role], [data-testid^="conversation-turn"], article')
+                      || n.querySelector('[data-message-author-role]'));
+        } catch (e) { return false; }
+    };
+    const ident = (n, why) => ({
+        why: why,
+        tag: (n.tagName || '') + (n.getAttribute('role') ? '[' + n.getAttribute('role') + ']' : ''),
+        cls: (n.getAttribute('class') || '').slice(0, 80),
+        // How many external links the candidate holds. The real panel is a list
+        // of sources; a chrome element is not. Reported, not gated — a freshly
+        // opened panel is legitimately empty, and gating here would restart the
+        // toggle storm #913 exists to prevent.
+        anchors: n.querySelectorAll('a[href^="http"]').length,
+        rows: n.querySelectorAll('li').length,
+        len: ((n.innerText || '').trim()).length,
+    });
     // Signature A — header-anchored right-side panel: "Activity · Ns"
     // (P1 Pro/ET, user screenshot 2026-07-07) or "Deep research execution
     // plan" (P2 DR, CUA transcript 2026-07-06 21:59). Header text anchors
@@ -21336,8 +21612,9 @@ _CHATGPT_SIDE_PANEL_JS = """() => {
                 if (r.width >= 200 && r.width <= window.innerWidth * 0.6
                         && r.height >= 150
                         && r.right > window.innerWidth * 0.55) {
-                    if (!node.querySelector('#prompt-textarea, form textarea, [data-testid*="composer" i]')) {
-                        return true;
+                    if (!node.querySelector('#prompt-textarea, form textarea, [data-testid*="composer" i]')
+                            && !isTurn(node)) {
+                        return ident(node, 'sigA:' + t.slice(0, 30));
                     }
                 }
                 node = node.parentElement;
@@ -21361,11 +21638,12 @@ _CHATGPT_SIDE_PANEL_JS = """() => {
                 const inner = (el.innerText || '').trim();
                 if (inner.length < 50) continue;
                 if (el.querySelector('#prompt-textarea, form textarea, [data-testid*="composer" i]')) continue;
-                return true;
+                if (isTurn(el)) continue;
+                return ident(el, 'sigB:' + sel);
             }
         } catch (e) {}
     }
-    return false;
+    return null;
 }"""
 
 
@@ -21380,10 +21658,18 @@ async def _chatgpt_activity_state(page):
     clicking (never click when a shape is already open — the status line is
     a TOGGLE, and blind re-clicks close it) and AFTER clicking (either
     shape counts as verified open)."""
-    out = {"side_panel": False, "inline_expanded": False, "thread_len": 0}
+    out = {"side_panel": False, "inline_expanded": False, "thread_len": 0,
+           # 2026-08-06: WHAT satisfied it, and WHERE. The pre-check used to
+           # return a bare boolean and log nothing, so a false positive that
+           # cost a whole phase could not be diagnosed from any log — while the
+           # opener it suppresses has printed clickedTag + frameUrl since #913.
+           "side_panel_id": None, "side_panel_ctx": ""}
     try:
-        if await page.evaluate(_CHATGPT_SIDE_PANEL_JS):
+        _hit = await page.evaluate(_CHATGPT_SIDE_PANEL_JS)
+        if _hit:
             out["side_panel"] = True
+            out["side_panel_id"] = _hit if isinstance(_hit, dict) else {}
+            out["side_panel_ctx"] = "host"
     except Exception:
         pass
     try:
@@ -21397,8 +21683,18 @@ async def _chatgpt_activity_state(page):
         try:
             for frame in [f for f in page.frames if f != page.main_frame][:20]:
                 try:
-                    if await frame.evaluate(_CHATGPT_SIDE_PANEL_JS):
+                    _fh = await frame.evaluate(_CHATGPT_SIDE_PANEL_JS)
+                    if _fh:
                         out["side_panel"] = True
+                        out["side_panel_id"] = _fh if isinstance(_fh, dict) else {}
+                        # ⚠ Frame geometry is FRAME-relative, so "right half of
+                        # the viewport" and "at most 60% of it" mean almost
+                        # nothing inside a small frame. Recording the context is
+                        # what makes that visible when it next misfires.
+                        try:
+                            out["side_panel_ctx"] = (frame.url or "about:blank")[:60]
+                        except Exception:
+                            out["side_panel_ctx"] = "frame"
                         break
                 except Exception:
                     continue
@@ -21597,7 +21893,7 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
         // DIAG carries what was actually seen back to the caller.
         const NODE_CAP = 8000;
         const DIAG = { roots: 0, walked: 0, cappedRoots: 0, maxNodes: 0,
-                       structuralCapped: false };
+                       structuralCapped: false, prose: 0 };
 
         // Specificity score for hit ranking. Layered to keep the 32c2957
         // "parent strip > badge child" guarantee while putting the live
@@ -21647,6 +21943,37 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
                 const matchesStatus   = STATUS_LINE.test(t) && t.length <= 60;
                 if (!matchesCount && !matchesVerb && !matchesEllipsis
                         && !matchesCompleted && !matchesStatus) continue;
+                // ⭐⭐ 2026-08-06 — THE STRIP IS NEVER IN THE REPORT. Twelve
+                // presses in one phase (and five in the morning run) landed on
+                // a MARKDOWN TABLE CELL of ChatGPT's own output:
+                //   documents/chatgpt.md:574
+                //     | Complex reasoning | 2-3 | 4 | 5 vendor-intended | ... |
+                //   (05:35 run) | ... | Small reasoning safety classifier | ... |
+                // Both clear STATUS_LINE's optional 1-12-char prefix and both
+                // sit under its 60-char cap, so the weakest tier ranked them
+                // 3.2 — above verb+count — and once the live strip was gone
+                // they were the top-ranked hit on the whole document.
+                //
+                // Placed in findHitsIn, not in one pass: the structural pass
+                // already excludes composer/header/nav subtrees and PASS 1 and
+                // PASS 2 do not, which is the same one-of-several-paths shape
+                // that keeps producing these. This arm applies to every pass.
+                let inProse = false;
+                try {
+                    // A table cell, a code block, or a link is never the strip.
+                    // The link arm is the sidebar-conversation lesson from the
+                    // drift wave: pressing an <a> navigates.
+                    if (el.closest('table, td, th, code, pre, a[href]')) inProse = true;
+                    // The rendered response body. Only the two WEAKEST tiers are
+                    // refused here — a completed strip or a live ellipsis line
+                    // carries evidence prose cannot fake, so if one ever renders
+                    // inside the markdown container it still counts.
+                    if (!inProse && !matchesEllipsis && !matchesCount && !matchesCompleted
+                            && el.closest('.markdown, [class*="markdown"], [class*="prose"]')) {
+                        inProse = true;
+                    }
+                } catch (e) { inProse = false; }
+                if (inProse) { DIAG.prose = (DIAG.prose || 0) + 1; continue; }
                 const r = el.getBoundingClientRect();
                 if (r.width === 0 || r.height === 0) continue;
                 out.push({ el, top: r.top, len: t.length,
@@ -21836,7 +22163,11 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
                   : DIAG.roots ? 'no_match' : 'no_roots',
             walked: DIAG.walked, maxNodes: DIAG.maxNodes,
             cappedRoots: DIAG.cappedRoots, roots: DIAG.roots,
-            structuralCapped: DIAG.structuralCapped, nodeCap: NODE_CAP };
+            structuralCapped: DIAG.structuralCapped, nodeCap: NODE_CAP,
+            // 2026-08-06: how many candidates were refused for being report
+            // prose. A run that presses nothing and a run that refused fifty
+            // table cells are different situations and used to log identically.
+            prose: DIAG.prose || 0 };
         // Parent strip (verb+count) wins over badge child (count-only) via
         // hitScore; ties broken by lowest-on-page, then shortest text.
         hits.sort((a, b) => (hitScore(b) - hitScore(a)) || (b.top - a.top) || (a.len - b.len));
@@ -21896,6 +22227,52 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
     return _miss
 
 
+# How many verified-failed presses the ChatGPT P2 activity panel gets before the
+# poller stops trying. Phase 1 has had a ceiling of 3 since #913
+# (`_panel_reopens`) and Claude P2 has the same (`claude_panel_reopens`, visible
+# in the 2026-08-06 log as "click budget 1/3"). ChatGPT P2 was the only re-opener
+# in the file with no ceiling at all, and it pressed the same wrong element
+# twelve times across nineteen minutes.
+_CHATGPT_PANEL_CLICK_BUDGET = 3
+
+# How many consecutive EMPTY reads of a panel we never clicked open before the
+# reader is believed over the pre-check. Two, not one: a real panel is sparse for
+# its first sample or two, and #913 removed the old text floor precisely because
+# bouncing a sparse-but-real panel restarted the toggle storm.
+_CHATGPT_PANEL_BARE_LIMIT = 2
+
+
+def _chatgpt_panel_stand_down_reason(p: dict, label: str) -> str:
+    """Why the ChatGPT P2 poller should stop re-opening the activity panel.
+
+    Returns a human sentence, or "" to keep trying. A pure function of the poll
+    state so the polarity is testable without a browser — the previous
+    stand-down lived inline and was keyed on the anchor LABEL reading "research
+    complete", a condition that by construction cannot fire when the anchor is
+    the wrong node.
+
+    Mutates `p` only to record the label it compared against, which is what makes
+    "the same wrong element twice" observable at all.
+    """
+    prev = p.get("chatgpt_last_panel_label")
+    p["chatgpt_last_panel_label"] = label
+    # ⚠ Counts PRESSES THAT VERIFIED NOTHING, not `chatgpt_panel_dom_misses`,
+    # which also counts cycles where the walker found no candidate at all. Those
+    # are benign — early in a run the strip has simply not rendered yet, and
+    # budgeting them would stop the poller before the panel ever exists. What
+    # needs a ceiling is pressing something and watching nothing happen.
+    presses = int(p.get("chatgpt_panel_click_misses", 0) or 0)
+    if presses >= _CHATGPT_PANEL_CLICK_BUDGET:
+        return (f"{presses} presses verified nothing open "
+                f"(budget {_CHATGPT_PANEL_CLICK_BUDGET})")
+    if label and prev == label:
+        # Pressing the same element again cannot produce a different result,
+        # and the panel-open state is re-checked every cycle anyway — so this
+        # costs nothing to obey and saves the rest of the phase.
+        return f"the same element answered twice in a row: {label[:60]!r}"
+    return ""
+
+
 def _panel_miss_reason(res) -> str:
     """One human line saying what the opener actually saw.
 
@@ -21919,9 +22296,15 @@ def _panel_miss_reason(res) -> str:
                 + (" (including the structural pass)"
                    if res.get("structuralCapped") else ""))
     if reason == "no_match":
+        _pr = int(res.get("prose") or 0)
         return (f"scanned {res.get('walked')} nodes across {res.get('roots')} "
                 f"root(s) in {res.get('contexts')} context(s) and nothing "
-                f"matched — strip not yet rendered or wording changed")
+                f"matched — strip not yet rendered or wording changed"
+                # 2026-08-06: "nothing matched" and "everything that matched was
+                # the agent's own report" are different pages and used to read
+                # the same. Twelve presses landed on a markdown table cell.
+                + (f" ({_pr} candidate(s) refused for being report prose)"
+                   if _pr else ""))
     if reason == "no_roots":
         return "found no roots to scan at all — the thread DOM may not have mounted"
     if res.get("error"):
@@ -22089,7 +22472,7 @@ async def scrape_progress_gemini(page):
                 for (const u of r._panel_sources) srcSet.add(u);
                 delete r._panel_sources;
             }
-            r.source_urls = Array.from(srcSet).slice(0, 50);
+            r.source_urls = Array.from(srcSet).slice(0, 200);
             r.sources = r.source_urls.length;
             // Response sections
             const headings = document.querySelectorAll(
@@ -22290,7 +22673,7 @@ async def scrape_progress_claude(page):
             document.querySelectorAll('[class*="research"] a[href*="http"], [data-testid*="research"] a[href*="http"]').forEach(a => {
                 if (a.href?.startsWith('http') && !a.href.includes('claude.')) srcSet.add(a.href);
             });
-            r.source_urls = Array.from(srcSet).slice(0, 50);
+            r.source_urls = Array.from(srcSet).slice(0, 200);
             r.sources = r.source_urls.length;
             // Text-derived count from "N sources and counting" — kept SEPARATE
             // from r.sources because there are no URLs to attribute. Without
@@ -22491,13 +22874,190 @@ SCRAPE_FNS = {
 #   Gemini : no Start-research AND no Stop AND
 #            (Share/Export visible OR (partial>5000 AND no active keywords))
 
+def _chatgpt_surface_frame_targets(page, *, include_blank=True):
+    """`include_blank=False` restores the pre-2026-08-06 reach (the DR sandbox
+    URL substrings only).
+
+    ⭐⭐ WIDENING SHARED REACH IS A CHANGE TO EVERY CALLER, and on 2026-08-06 I
+    made it a default. Five consumers changed behaviour at once, and one of them
+    — `scrape_progress_chatgpt` — CLICKS inside the frames it walks. So a fix
+    aimed at the completion detector started dispatching synthetic clicks into a
+    surface nothing had ever clicked before, on every poll tick, and the next run
+    produced a panel failure nobody could attribute with confidence.
+    ⛔ The lesson is not "the wider list was wrong" — it demonstrably fixed the
+    33-minute blind run. It is that reach must be chosen BY THE CALLER, so a
+    reader can see more without a clicker also reaching further.
+    """
+    """Every browsing context ChatGPT's Deep Research surface can occupy.
+
+    ⭐⭐ 2026-08-06 — THE FILTER THAT NEVER VISITED THE FRAME. `#913` already
+    learned this once, for the activity-panel opener: "the DR card's iframe URL no
+    longer matches any fixed substring (live 2026-07-06: walked_hits=0 every P2
+    cycle while CUA could SEE the strip; the old `deep_research|oaiusercontent`
+    filter simply never visited the frame that renders it)". That fix was made in
+    ONE consumer. Five others kept the substring list, and on 2026-08-06 the
+    completion detector was one of them:
+
+        frames: [ chatgpt.com/c/<id>,
+                  chatgpt.com/backend-api/sentinel/frame.html,
+                  connector-openai-deep-research.web-sandbox.oaiusercontent.com,
+                  about:blank ]
+
+    The old filter matched the CONNECTOR SHELL (it contains "oaiusercontent"),
+    evaluated it, found nothing, and `break`ed — so `about:blank`, where the
+    surface actually lived, was never visited. Same tick, same page: the panel
+    tracker (which walks every frame) read 26 source URLs while the detector read
+    `sources: 0`. 33 minutes of `no_done_marker` on a finished report.
+
+    So this accepts the DR sandbox substrings AND the shapes a URL filter cannot
+    describe — `about:`, `blob:`, and empty — exactly as
+    `_claude_artifact_frame_targets` already does for Claude's srcdoc artifacts.
+    Bounded to 20 frames, the same bound the panel walkers use.
+    """
+    targets = [page]
+    try:
+        for frame in page.frames:
+            if len(targets) > 20:
+                break
+            try:
+                if frame is page.main_frame:
+                    continue
+                src = (frame.url or "").lower()
+            except Exception:
+                continue
+            _sandbox = ("deep_research" in src
+                        or "oaiusercontent" in src
+                        or "web-sandbox.oaiusercontent" in src)
+            _blank = (src.startswith("about:") or src.startswith("blob:")
+                      or src == "")
+            if _sandbox or (include_blank and _blank):
+                targets.append(frame)
+    except Exception:
+        pass
+    return targets
+
+
+# ⭐ ONE payload, run in EVERY context — see `_chatgpt_surface_frame_targets`.
+# It used to be two: a rich probe inlined in the host branch and a thin one in
+# the iframe branch that computed only `thoughtFor` and `researchDone`. The two
+# markers added 2026-07-13 *specifically for the finished-canvas layout* —
+# `completedChip` and `docPanelAffordances` — existed on the host path only, so
+# even a widened frame filter could not have seen the markers that layout renders.
+# A guard on one of two paths to the same sink; the recurring shape in this file.
+#
+# Module-level rather than inlined so a test can execute it against a captured
+# DOM. While it lived inside the function body it had never once been run by a
+# test, which is how a probe that reads an empty document survived two E2E runs.
+_CHATGPT_DONE_PROBE_JS = """() => {
+    let hasStop = !!document.querySelector(
+        'button[aria-label="Stop generating"], button[aria-label*="Stop"], ' +
+        'button[data-testid="stop-button"], button[data-testid*="stop"]'
+    );
+    if (!hasStop) {
+        for (const b of document.querySelectorAll('button')) {
+            const t = (b.textContent || '').trim().toLowerCase();
+            const al = (b.getAttribute('aria-label') || '').toLowerCase();
+            if (t === 'stop' || t === 'stop generating' || t === 'stop research' ||
+                al.includes('stop')) { hasStop = true; break; }
+        }
+    }
+    const bl = (document.body?.innerText || '');
+    // "Thought for X seconds" badge — renders only AFTER thinking
+    // phase completes. With Stop button gone + this badge present,
+    // we're as confident as we can be that DR is fully settled.
+    const thoughtFor = /thought for\\s+\\d/i.test(bl);
+    // 2026-04-26 backup: same modern marker Claude uses. Covers the case
+    // where ChatGPT renames the badge or runs a non-thinking-mode DR
+    // variant where "Thought for X" never appears. Either signal counts.
+    // ⚠ This is the LOOSE marker — it is why Python only lets it count in the
+    // main frame. See `detect_completion_chatgpt`.
+    const researchDone = /research\\s+complete(?:d)?(?:[\\s·•—\\-]+\\d[\\d,]*\\s+sources?)?/i.test(bl);
+    // 2026-07-13: the completed chip lives in a node innerText
+    // EXCLUDES (collapsed drawer header / virtualized) — textContent
+    // includes hidden nodes, and the anchored tails make it done-only
+    // ("Researching · Xm" is the mid-run form; "completed in Xm" /
+    // "complete · N citations" render only when DR has finished).
+    const btc = (document.body?.textContent || '');
+    const completedChip =
+        /research\\s+complete(?:d)?\\s+in\\s+\\d+\\s*[hms]/i.test(btc) ||
+        /research\\s+complete(?:d)?\\s*[·•]\\s*\\d[\\d,]*\\s+(?:citations?|sources?)/i.test(btc);
+    // 2026-07-13 (rev 2, user-directed): the finished DR document/
+    // canvas panel's HEADER STRIP carries a DOWNLOAD button — that
+    // swap (Researching panel → Document panel with a download
+    // affordance) IS the done signal; no need to open or scroll the
+    // document. The DOWNLOAD BUTTON ALONE is sufficient.
+    //
+    // rev 1 (same day) required download AND an expand/enlarge button,
+    // but ChatGPT's real canvas header is download + SHARE (not
+    // download + expand — live screenshot 2026-07-13), so the AND
+    // missed every finished canvas: the detector logged "doc-panel
+    // affordances all missing" at the SAME tick the CUA screenshot read
+    // "download (↓) and share/expand buttons — no stop button", and the
+    // poller burned 17+ min scroll-checking a document that was done.
+    // Also dropped the r.left >= 22%vw right-docked floor: when DR
+    // finishes on the canvas layout the document is NEAR-FULL-WIDTH
+    // (only the thin icon rail to its left), so a left-position floor
+    // excluded the very layout this signal is for. Right-edge anchor +
+    // min width + tall + header-only + the (pre-checked) no-stop gate
+    // keep it specific to the finished document surface.
+    const vw = window.innerWidth || document.documentElement.clientWidth;
+    const vh = window.innerHeight || document.documentElement.clientHeight;
+    let docPanelAffordances = false;
+    let panelLen = 0;
+    for (const el of document.querySelectorAll('div, aside, section')) {
+        const r = el.getBoundingClientRect();
+        if (r.width < 380) continue;            // a real panel, not a toolbar/widget
+        if (r.right < vw - 40) continue;        // anchored to the right edge (canvas / doc panel)
+        if (r.height < vh * 0.5) continue;      // tall — a document surface
+        let hasDl = false;
+        for (const b of el.querySelectorAll('button, [role="button"]')) {
+            const br = b.getBoundingClientRect();
+            if (br.top > r.top + 96) continue;      // header strip only
+            const t = ((b.getAttribute('aria-label') || '') + ' ' +
+                       (b.getAttribute('title') || '') + ' ' +
+                       (b.getAttribute('data-testid') || '')).toLowerCase();
+            if (/download/.test(t)) { hasDl = true; break; }
+        }
+        if (hasDl) {
+            docPanelAffordances = true;
+            // ⭐ 2026-08-06: MEASURE THE SURFACE WE JUST FOUND. `assistantLen`
+            // below reads the conversation turn, and on the canvas layout there
+            // is no assistant turn in this document at all — which is how
+            // `text_len` reported 0 on a page carrying a finished report. The
+            // caller's 2-cycle flatness gate needs a number that moves.
+            panelLen = Math.max(panelLen, (el.innerText || '').length);
+            break;
+        }
+    }
+    const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
+    const assistantLen = msgs.length ? msgs[msgs.length - 1].innerText.length : 0;
+    // Sources count: external citation links anywhere in THIS document.
+    const sources = document.querySelectorAll('a[href^="http"][target="_blank"]').length;
+    // Steps: research card list items (the rotating step list)
+    const steps = document.querySelectorAll(
+        '[class*="research"] li, [class*="step"], [class*="task"]'
+    ).length;
+    return { hasStop, thoughtFor, researchDone, completedChip, docPanelAffordances,
+             assistantLen, panelLen, bodyLen: bl.length, sources, steps, vw, vh };
+}"""
+
+# A non-main context must be a real surface before its download-button scan may
+# call the run finished. The geometry inside a frame is FRAME-relative, so
+# `r.right >= vw - 40` and `r.height >= vh * 0.5` are trivially true inside a
+# 200x100 telemetry blank — and a false done publishes a report. The main frame
+# is exempt: it is the surface by definition, and gating it would change the
+# behaviour of the marker that has been shipping since 2026-07-13.
+_CHATGPT_FRAME_SURFACE_MIN_VW = 600
+_CHATGPT_FRAME_SURFACE_MIN_VH = 400
+
+
 async def detect_completion_chatgpt(page):
     """ChatGPT Deep Research completion detector. Playwright-only.
     Returns (done, reason, snap) where snap = {text_len, sources, steps}.
 
     2026-04-25 strictness rewrite: detector returns done=True ONLY when:
-      • Stop button is gone (host AND iframe)
-      • "Thought for X seconds" badge present (definitive done marker)
+      • Stop button is gone (every context)
+      • a done marker is present
     The previous `partial_len > 5000` fallback was a known false-positive
     path (fired mid-stream during long research). Removed entirely. The
     caller is responsible for the 2-cycle flatness gate (text/sources/steps
@@ -22506,173 +23066,102 @@ async def detect_completion_chatgpt(page):
 
     2026-07-13 (two E2E runs, detector blind past completion — 10 min on
     the chip layout, 30+ min on the canvas layout until the user stopped):
-      • completedChip: the "Research completed in Xm · N citations" chip
-        that replaces "Researching…" is matched on body.TEXTCONTENT — it
-        was visibly on the page (our own panel tracker used it as a click
-        anchor) while the innerText regex missed it: ChatGPT keeps it in a
-        collapsed/virtualized node that innerText excludes. Anchored forms
-        only ("in Xm" / "· N citations|sources") so report prose about
-        completed research can't false-positive.
-      • docPanelAffordances (user-directed): when DR finishes on the canvas
-        layout, the Researching side panel (progress bar + stop) is
-        REPLACED by a Document panel whose header carries download +
-        expand/enlarge buttons — that swap IS the done signal; no need to
-        open or scroll the document. Geometry-scoped scan (right-docked
-        panel, header strip), both buttons required, never overrides an
-        explicit stop button."""
+    added `completedChip` (matched on textContent, which includes the
+    collapsed/virtualized node innerText excludes) and `docPanelAffordances`
+    (the Researching panel being REPLACED by a Document panel with a download
+    button in its header IS the done signal). Both live in
+    `_CHATGPT_DONE_PROBE_JS`, with their full rationale.
+
+    2026-08-06 — RUN THE SAME PROBE IN EVERY CONTEXT, AND COMBINE. See
+    `_chatgpt_surface_frame_targets` for the 33-minute blind run that forced
+    this. Three rules govern the combination:
+
+      • `hasStop` is a VETO and counts from anywhere — a stop button in any
+        context means the run is live.
+      • Every done marker counts from anywhere EXCEPT `researchDone`, the loose
+        `/research complete/i` innerText form, which stays main-frame-only. The
+        canvas frame holds the report *prose*, and a report about research may
+        well contain that phrase; the anchored `completedChip` forms carry a
+        duration or a citation count and cannot.
+      • `docPanelAffordances` from a non-main context additionally requires that
+        context to be a real surface (see `_CHATGPT_FRAME_SURFACE_MIN_VW`).
+
+    The reason string names the context that supplied the marker, so the next
+    drift is one grep rather than a code read.
+    """
     try:
-        host = await page.evaluate("""() => {
-            let hasStop = !!document.querySelector(
-                'button[aria-label="Stop generating"], button[aria-label*="Stop"], ' +
-                'button[data-testid="stop-button"], button[data-testid*="stop"]'
-            );
-            if (!hasStop) {
-                for (const b of document.querySelectorAll('button')) {
-                    const t = (b.textContent || '').trim().toLowerCase();
-                    if (t === 'stop' || t === 'stop generating' || t === 'stop research') {
-                        hasStop = true; break;
-                    }
-                }
-            }
-            const bl = (document.body?.innerText || '');
-            // "Thought for X seconds" badge — renders only AFTER thinking
-            // phase completes. With Stop button gone + this badge present,
-            // we're as confident as we can be that DR is fully settled.
-            const thoughtFor = /thought for\\s+\\d/i.test(bl);
-            // 2026-04-26 backup: same modern marker Claude uses. Covers the case
-            // where ChatGPT renames the badge or runs a non-thinking-mode DR
-            // variant where "Thought for X" never appears. Either signal counts.
-            const researchDone = /research\\s+complete(?:d)?(?:[\\s·•—\\-]+\\d[\\d,]*\\s+sources?)?/i.test(bl);
-            // 2026-07-13: the completed chip lives in a node innerText
-            // EXCLUDES (collapsed drawer header / virtualized) — textContent
-            // includes hidden nodes, and the anchored tails make it done-only
-            // ("Researching · Xm" is the mid-run form; "completed in Xm" /
-            // "complete · N citations" render only when DR has finished).
-            const btc = (document.body?.textContent || '');
-            const completedChip =
-                /research\\s+complete(?:d)?\\s+in\\s+\\d+\\s*[hms]/i.test(btc) ||
-                /research\\s+complete(?:d)?\\s*[·•]\\s*\\d[\\d,]*\\s+(?:citations?|sources?)/i.test(btc);
-            // 2026-07-13 (rev 2, user-directed): the finished DR document/
-            // canvas panel's HEADER STRIP carries a DOWNLOAD button — that
-            // swap (Researching panel → Document panel with a download
-            // affordance) IS the done signal; no need to open or scroll the
-            // document. The DOWNLOAD BUTTON ALONE is sufficient.
-            //
-            // rev 1 (same day) required download AND an expand/enlarge button,
-            // but ChatGPT's real canvas header is download + SHARE (not
-            // download + expand — live screenshot 2026-07-13), so the AND
-            // missed every finished canvas: the detector logged "doc-panel
-            // affordances all missing" at the SAME tick the CUA screenshot read
-            // "download (↓) and share/expand buttons — no stop button", and the
-            // poller burned 17+ min scroll-checking a document that was done.
-            // Also dropped the r.left >= 22%vw right-docked floor: when DR
-            // finishes on the canvas layout the document is NEAR-FULL-WIDTH
-            // (only the thin icon rail to its left), so a left-position floor
-            // excluded the very layout this signal is for. Right-edge anchor +
-            // min width + tall + header-only + the (pre-checked) no-stop gate
-            // keep it specific to the finished document surface.
-            const vw = window.innerWidth || document.documentElement.clientWidth;
-            const vh = window.innerHeight || document.documentElement.clientHeight;
-            let docPanelAffordances = false;
-            for (const el of document.querySelectorAll('div, aside, section')) {
-                const r = el.getBoundingClientRect();
-                if (r.width < 380) continue;            // a real panel, not a toolbar/widget
-                if (r.right < vw - 40) continue;        // anchored to the right edge (canvas / doc panel)
-                if (r.height < vh * 0.5) continue;      // tall — a document surface
-                let hasDl = false;
-                for (const b of el.querySelectorAll('button, [role="button"]')) {
-                    const br = b.getBoundingClientRect();
-                    if (br.top > r.top + 96) continue;      // header strip only
-                    const t = ((b.getAttribute('aria-label') || '') + ' ' +
-                               (b.getAttribute('title') || '') + ' ' +
-                               (b.getAttribute('data-testid') || '')).toLowerCase();
-                    if (/download/.test(t)) { hasDl = true; break; }
-                }
-                if (hasDl) { docPanelAffordances = true; break; }
-            }
-            const doneMarker = thoughtFor || researchDone || completedChip || docPanelAffordances;
-            const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
-            const hostLen = msgs.length ? msgs[msgs.length-1].innerText.length : 0;
-            // Sources count: external citation links anywhere on the page
-            const sources = document.querySelectorAll('a[href^="http"][target="_blank"]').length;
-            // Steps: research card list items (the rotating step list)
-            const steps = document.querySelectorAll(
-                '[class*="research"] li, [class*="step"], [class*="task"]'
-            ).length;
-            return { hasStop, thoughtFor, researchDone, completedChip,
-                     docPanelAffordances, doneMarker, hostLen, sources, steps };
-        }""")
+        targets = _chatgpt_surface_frame_targets(page)
+        readings = []
+        for target in targets:
+            is_host = target is page
+            try:
+                data = await target.evaluate(_CHATGPT_DONE_PROBE_JS)
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            try:
+                ctx = "host" if is_host else ((target.url or "about:blank")[:60])
+            except Exception:
+                ctx = "host" if is_host else "frame"
+            readings.append((ctx, is_host, data))
+        if not readings:
+            return (False, "detect_error: no evaluable context", {})
 
-        iframe_stop = False
-        iframe_thought = False
-        iframe_len = 0
-        iframe_sources = 0
-        iframe_steps = 0
-        try:
-            for frame in page.frames:
-                try:
-                    src = (frame.url or "").lower()
-                except Exception:
-                    continue
-                if not src:
-                    continue
-                if ("deep_research" in src or "oaiusercontent" in src):
-                    try:
-                        data = await frame.evaluate("""() => {
-                            let hasStop = false;
-                            for (const b of document.querySelectorAll('button')) {
-                                const t = (b.textContent || '').trim().toLowerCase();
-                                const al = (b.getAttribute('aria-label') || '').toLowerCase();
-                                if (t === 'stop' || t === 'stop research' ||
-                                    al.includes('stop')) { hasStop = true; break; }
-                            }
-                            const bl = (document.body?.innerText || '');
-                            const thoughtFor = /thought for\\s+\\d/i.test(bl);
-                            const researchDone = /research\\s+complete(?:d)?(?:[\\s·•—\\-]+\\d[\\d,]*\\s+sources?)?/i.test(bl);
-                            const doneMarker = thoughtFor || researchDone;
-                            const sources = document.querySelectorAll(
-                                'a[href^="http"][target="_blank"]'
-                            ).length;
-                            const steps = document.querySelectorAll(
-                                '[class*="research"] li, [class*="step"], [class*="task"]'
-                            ).length;
-                            return { hasStop, thoughtFor, researchDone, doneMarker, len: bl.length, sources, steps };
-                        }""")
-                        if data:
-                            iframe_stop = bool(data.get("hasStop"))
-                            iframe_thought = bool(data.get("doneMarker"))
-                            iframe_len = int(data.get("len") or 0)
-                            iframe_sources = int(data.get("sources") or 0)
-                            iframe_steps = int(data.get("steps") or 0)
-                    except Exception:
-                        pass
+        def _num(d, key):
+            try:
+                return int(d.get(key) or 0)
+            except Exception:
+                return 0
+
+        def _surface(is_host, d):
+            """May this context's doc-panel scan speak for the whole run?"""
+            return is_host or (_num(d, "vw") >= _CHATGPT_FRAME_SURFACE_MIN_VW
+                               and _num(d, "vh") >= _CHATGPT_FRAME_SURFACE_MIN_VH)
+
+        has_stop = any(bool(d.get("hasStop")) for _c, _h, d in readings)
+
+        # (marker name, does this reading carry it) — first hit names the reason.
+        marker_from = ""
+        which_marker = ""
+        for name, pred in (
+            ("thought_for", lambda h, d: bool(d.get("thoughtFor"))),
+            ("completed_chip", lambda h, d: bool(d.get("completedChip"))),
+            ("doc_panel_affordances",
+             lambda h, d: bool(d.get("docPanelAffordances")) and _surface(h, d)),
+            ("research_complete", lambda h, d: h and bool(d.get("researchDone"))),
+        ):
+            for ctx, is_host, d in readings:
+                if pred(is_host, d):
+                    which_marker, marker_from = name, ctx
                     break
-        except Exception:
-            pass
+            if which_marker:
+                break
+        has_done_marker = bool(which_marker)
 
-        has_stop = host["hasStop"] or iframe_stop
-        # done_marker = Thought-for badge OR "Research complete" innerText OR
-        # (2026-07-13) the completed chip via textContent OR the Document-
-        # panel header affordances. Any is enough — non-thinking DR variants
-        # don't produce the badge, the chip hides from innerText, and the
-        # canvas layout may carry NO text marker at all (30-min blind run).
-        has_done_marker = bool(host.get("doneMarker")) or iframe_thought
-        which_marker = ("thought_for" if host.get("thoughtFor") or iframe_thought
-                        else "research_complete" if host.get("researchDone")
-                        else "completed_chip" if host.get("completedChip")
-                        else "doc_panel_affordances" if host.get("docPanelAffordances")
-                        else "")
-        partial_len = max(int(host.get("hostLen") or 0), iframe_len)
-        sources = max(int(host.get("sources") or 0), iframe_sources)
-        steps = max(int(host.get("steps") or 0), iframe_steps)
+        # `text_len` is what the caller's flatness gate watches. A non-main
+        # context IS the surface, so its whole body counts there; in the main
+        # frame the body would drag in the sidebar's conversation list, so only
+        # the assistant turn and the document panel do.
+        partial_len = 0
+        sources = 0
+        steps = 0
+        for _ctx, is_host, d in readings:
+            lens = [_num(d, "assistantLen"), _num(d, "panelLen")]
+            if not is_host:
+                lens.append(_num(d, "bodyLen"))
+            partial_len = max([partial_len] + lens)
+            sources = max(sources, _num(d, "sources"))
+            steps = max(steps, _num(d, "steps"))
         snap = {"text_len": partial_len, "sources": sources, "steps": steps}
 
+        ctxs = ",".join(c for c, _h, _d in readings)
         if has_stop:
             return (False, f"stop_btn_present (text={partial_len}, src={sources}, st={steps})", snap)
         if not has_done_marker:
             return (False, "no_done_marker (Thought-for badge, Research-complete text, "
-                           "completed chip AND doc-panel affordances all missing)", snap)
-        return (True, f"no_stop + done_marker={which_marker}", snap)
+                           f"completed chip AND doc-panel affordances all missing; ctx={ctxs})", snap)
+        return (True, f"no_stop + done_marker={which_marker} ctx={marker_from}", snap)
     except Exception as e:
         return (False, f"detect_error: {e}", {})
 
@@ -24177,7 +24666,7 @@ async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None,
                 });
                 out.steps = out.steps.slice(-15);
                 out.sections = out.sections.slice(0, 20);
-                out.source_urls = out.source_urls.slice(0, 50);
+                out.source_urls = out.source_urls.slice(0, 200);
                 return out;
             }""")
         except Exception as _we:
@@ -24234,7 +24723,7 @@ async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None,
         return None
 
     # Prefer DOM-walker output; fall back to regex on plain text only when walker empty.
-    urls = walker["source_urls"] or list(dict.fromkeys(re.findall(r'https?://[^\s)>\]"]+', content or "")))[:50]
+    urls = walker["source_urls"] or list(dict.fromkeys(re.findall(r'https?://[^\s)>\]"]+', content or "")))[:_SOURCE_LIST_CAP]
     steps = walker["steps"] or re.findall(r'(?:^|\n)\s*(?:\d+[\.\)]\s*|[-•]\s+)(.{10,200})', content or "")
     sections = walker["sections"] or re.findall(r'(?:^|\n)#{1,3}\s+(.{3,80})', content or "")
     if not sections:
@@ -24253,7 +24742,7 @@ async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None,
         "phase": "researching",
         "progress": (steps[-1] if steps else f"Tracking {len(urls)} sources from artifact"),
         "sources": max(len(domains), len(urls)),
-        "source_urls": urls[:50],
+        "source_urls": urls[:_SOURCE_LIST_CAP],
         "sections": sections[:15],
         "steps": steps[:15],
         "tool_uses": [f"Analyzing: {s[:80]}" for s in sections[:5]],
@@ -24577,6 +25066,30 @@ async def scrape_chatgpt_activity_panel_tracking(page):
             const t = (h.innerText || '').trim();
             if (t && t.length > 1 && t.length < 120) out.sections.push(t);
         });
+        // ⭐ 2026-08-06 — THE PANEL DOES HAVE GROUPS; THEY ARE JUST NOT HEADINGS.
+        // The finding was "sections=0 on every sample", and the note above is
+        // right that zero headings is the correct count for this markup. But the
+        // panel is not ungrouped: the captured DOM carries exactly two group
+        // labels, and they are what a reader would call its sections —
+        //   <div class="text-token-text-secondary mb-3 text-[1.05rem] font-medium">
+        //     …<span class="min-w-0 truncate">Pro thinking</span>
+        //   <div class="… font-medium">…<span>Sources</span> · <span>168</span>
+        // So the panel reported no structure at all while carrying two labels
+        // that describe it. `font-medium` is worth trusting here because it is
+        // rare in this subtree — the 154 source rows use font-semibold and
+        // font-normal, never font-medium.
+        //
+        // Additive: the heading scan above is untouched, `dbg_headings` still
+        // reports the raw heading count, and the bounds and dedupe below are the
+        // same ones. A future build that renders real headings gains both.
+        try {
+            panel.querySelectorAll('[class*="font-medium"]').forEach(g => {
+                const t = (g.innerText || '').replace(/\\s+/g, ' ').trim();
+                if (!t || t.length < 2 || t.length > 60) return;
+                if (/https?:\\/\\//.test(t)) return;   // a source row, not a label
+                if (out.sections.indexOf(t) === -1) out.sections.push(t);
+            });
+        } catch (e) {}
         out.sections = out.sections.slice(0, 20);
 
         // URL list — every external <a>. Exclude the platform's OWN pages
@@ -24634,8 +25147,8 @@ async def scrape_chatgpt_activity_panel_tracking(page):
             if (_title.length > 200) _title = _title.slice(0, 200);
             out.source_items.push({ url: h, title: _title });
         });
-        out.source_urls = out.source_urls.slice(0, 50);
-        out.source_items = out.source_items.slice(0, 50);
+        out.source_urls = out.source_urls.slice(0, 200);
+        out.source_items = out.source_items.slice(0, 200);
 
         // Aggregate search count — ChatGPT renders strings like
         // "193 searches" / "33 sources" in the panel header or near the
@@ -25957,82 +26470,82 @@ async def verify_chatgpt_generating(page) -> bool:
             return True
 
         # ── DR iframe walk ──
-        # Deep Research renders inside cross-origin oaiusercontent sandbox.
-        # Walk frames, look for deep_research/oaiusercontent URL match, then
-        # check for stop button / active keywords / partial content inside.
+        # Deep Research renders inside a sandboxed frame. 2026-08-06: the frame
+        # list comes from `_chatgpt_surface_frame_targets` rather than a local
+        # URL-substring copy — this gate decides "is ChatGPT still generating",
+        # and a filter that skips the `about:blank` surface answers it from an
+        # empty document. Same defect the completion detector carried.
         try:
-            for frame in page.frames:
+            for frame in _chatgpt_surface_frame_targets(page)[1:]:
                 try:
-                    src = (frame.url or "").lower()
+                    active = await frame.evaluate("""() => {
+                        // Any stop button
+                        for (const b of document.querySelectorAll('button')) {
+                            const t = (b.textContent || '').trim().toLowerCase();
+                            const al = (b.getAttribute('aria-label') || '').toLowerCase();
+                            if (t === 'stop' || t === 'stop research' ||
+                                al.includes('stop')) return true;
+                        }
+                        // Spinner / progress
+                        if (document.querySelector(
+                            '[role="progressbar"], [class*="progress"], [class*="spinner"], ' +
+                            '[class*="loading"], [data-is-streaming="true"]'
+                        )) return true;
+                        // 2026-05-14: CSS-animation fallback (mirrors verify_gemini /
+                        // verify_claude). ChatGPT DR's "Researching..." state has
+                        // animated text-shimmer + dot-flashing inside the iframe
+                        // that don't always have a [class*="spinner"] marker at
+                        // the exact poll moment — without this fallback the
+                        // iframe walk returned false during legitimate research
+                        // and the outer loop spawned a 2nd tab. E2E 2026-05-14:
+                        // CUA had clicked Start research and the iframe was
+                        // visibly rendering when this returned false 15×.
+                        // 2026-05-14 (refined): use getAnimations() + playState ===
+                        // 'running' to avoid false-positives from completed
+                        // animations whose CSS animationName remains set.
+                        const animated = document.querySelectorAll(
+                            '[class*="animate"], [class*="spin"], [class*="pulse"], [class*="loading"], [class*="streaming"]'
+                        );
+                        for (const el of animated) {
+                            if (el.offsetParent === null) continue;
+                            if (typeof el.getAnimations !== 'function') continue;
+                            const anims = el.getAnimations();
+                            if (anims.some(a => a.playState === 'running')) return true;
+                        }
+                        const bl = (document.body?.innerText || '').toLowerCase();
+                        // 2026-05-14 (post-E2E): the post-Start status bar inside
+                        // the DR iframe shows literal "Researching..." (with
+                        // ellipsis) while research is active. The ellipsis is
+                        // what makes this safe — bare "researching" would
+                        // false-positive on narrative prose, but the ellipsis
+                        // pattern is the live status indicator, not story text.
+                        // Must beat the 'thought for ' short-circuit below.
+                        if (bl.includes('researching...')) return true;
+                        // "Thought for X seconds" badge persists while DR
+                        // continues — it's NOT a definitive done signal. With
+                        // stop button + spinner + CSS animation all negative
+                        // above, treat the iframe as settled. Keyword fallthrough
+                        // intentionally not re-added: inside the DR iframe, body
+                        // text IS the rendered brief itself (could legitimately
+                        // contain "after reading sources" / "searching the web"),
+                        // and any keyword match would re-introduce the same
+                        // false-positive class as the deleted length>200 fallback.
+                        // 2026-05-24: same regex tightening as host path —
+                        // require a digit after "thought for " to lock to badge
+                        // format and not match narrative prose.
+                        if (/thought for\\s+\\d/i.test(bl)) return false;
+                        return false;
+                    }""")
+                    if active:
+                        return True
                 except Exception:
-                    continue
-                if not src:
-                    continue
-                if ("deep_research" in src or "oaiusercontent" in src):
-                    try:
-                        active = await frame.evaluate("""() => {
-                            // Any stop button
-                            for (const b of document.querySelectorAll('button')) {
-                                const t = (b.textContent || '').trim().toLowerCase();
-                                const al = (b.getAttribute('aria-label') || '').toLowerCase();
-                                if (t === 'stop' || t === 'stop research' ||
-                                    al.includes('stop')) return true;
-                            }
-                            // Spinner / progress
-                            if (document.querySelector(
-                                '[role="progressbar"], [class*="progress"], [class*="spinner"], ' +
-                                '[class*="loading"], [data-is-streaming="true"]'
-                            )) return true;
-                            // 2026-05-14: CSS-animation fallback (mirrors verify_gemini /
-                            // verify_claude). ChatGPT DR's "Researching..." state has
-                            // animated text-shimmer + dot-flashing inside the iframe
-                            // that don't always have a [class*="spinner"] marker at
-                            // the exact poll moment — without this fallback the
-                            // iframe walk returned false during legitimate research
-                            // and the outer loop spawned a 2nd tab. E2E 2026-05-14:
-                            // CUA had clicked Start research and the iframe was
-                            // visibly rendering when this returned false 15×.
-                            // 2026-05-14 (refined): use getAnimations() + playState ===
-                            // 'running' to avoid false-positives from completed
-                            // animations whose CSS animationName remains set.
-                            const animated = document.querySelectorAll(
-                                '[class*="animate"], [class*="spin"], [class*="pulse"], [class*="loading"], [class*="streaming"]'
-                            );
-                            for (const el of animated) {
-                                if (el.offsetParent === null) continue;
-                                if (typeof el.getAnimations !== 'function') continue;
-                                const anims = el.getAnimations();
-                                if (anims.some(a => a.playState === 'running')) return true;
-                            }
-                            const bl = (document.body?.innerText || '').toLowerCase();
-                            // 2026-05-14 (post-E2E): the post-Start status bar inside
-                            // the DR iframe shows literal "Researching..." (with
-                            // ellipsis) while research is active. The ellipsis is
-                            // what makes this safe — bare "researching" would
-                            // false-positive on narrative prose, but the ellipsis
-                            // pattern is the live status indicator, not story text.
-                            // Must beat the 'thought for ' short-circuit below.
-                            if (bl.includes('researching...')) return true;
-                            // "Thought for X seconds" badge persists while DR
-                            // continues — it's NOT a definitive done signal. With
-                            // stop button + spinner + CSS animation all negative
-                            // above, treat the iframe as settled. Keyword fallthrough
-                            // intentionally not re-added: inside the DR iframe, body
-                            // text IS the rendered brief itself (could legitimately
-                            // contain "after reading sources" / "searching the web"),
-                            // and any keyword match would re-introduce the same
-                            // false-positive class as the deleted length>200 fallback.
-                            // 2026-05-24: same regex tightening as host path —
-                            // require a digit after "thought for " to lock to badge
-                            // format and not match narrative prose.
-                            if (/thought for\\s+\\d/i.test(bl)) return false;
-                            return false;
-                        }""")
-                        if active:
-                            return True
-                    except Exception:
-                        pass
-                    break
+                    pass
+                # ⛔ NO `break` HERE. It used to sit at the end of this body,
+                # inside the URL-substring `if`, so the walk stopped at the FIRST
+                # matching frame. With the candidate list widened, keeping it
+                # would only change WHICH single frame gets asked — and on
+                # 2026-08-06 the first match was the connector shell, which
+                # answers from an empty document. Ask all of them.
         except Exception:
             pass
         return False
@@ -26508,18 +27021,11 @@ async def inject_chatgpt_dr_iframe_observer(page) -> bool:
     Gated by DG_CHATGPT_IFRAME_OBSERVER=1 (off by default — opt-in).
     Returns True if injected, False if no DR iframe found / inject failed.
     """
-    target_frame = None
-    for frame in page.frames:
-        try:
-            src = (frame.url or "").lower()
-        except Exception:
-            continue
-        if not src:
-            continue
-        if ("deep_research" in src or "oaiusercontent" in src
-                or "web-sandbox.oaiusercontent" in src):
-            target_frame = frame
-            break
+    # 2026-08-06: same candidate list as every other ChatGPT frame consumer —
+    # see `_chatgpt_surface_frame_targets`. Off by default, but a private copy of
+    # the URL substrings is exactly how the completion detector went blind.
+    _cands = _chatgpt_surface_frame_targets(page)[1:]
+    target_frame = _cands[0] if _cands else None
     if not target_frame:
         return False
 
@@ -26741,7 +27247,7 @@ async def extract_source_urls_via_vision(page, agent_key: str,
             continue
         seen.add(u)
         filtered.append(u)
-    return filtered[:50]
+    return filtered[:_SOURCE_LIST_CAP]
 
 
 class _BriefStreamStalled(Exception):
@@ -27217,7 +27723,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                                     _prev = _by_url.get(_it["url"]) or {}
                                     _title = (_it.get("title") or _prev.get("title") or "").strip()
                                     _by_url[_it["url"]] = {"url": _it["url"], "title": _title}
-                                progress["source_items"] = list(_by_url.values())[:50]
+                                progress["source_items"] = list(_by_url.values())[:_SOURCE_LIST_CAP]
                             _ps = int(_pd.get("searches", 0) or 0)
                             if _ps > int(progress.get("searches", 0) or 0):
                                 progress["searches"] = _ps
@@ -31301,7 +31807,8 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     pass
             if (name == "ChatGPT" and _cgpt_gate_ok and
                     not p.get("chatgpt_activity_panel_open") and
-                    not p.get("chatgpt_done_chip_anchor")):
+                    not p.get("chatgpt_done_chip_anchor") and
+                    not p.get("chatgpt_panel_stand_down")):
                 try:
                     # #913 anti-toggle: the strip/status line is a TOGGLE.
                     # Never click while a shape is already open — the
@@ -31312,9 +31819,22 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     if _st_pre.get("side_panel") or _st_pre.get("inline_expanded"):
                         p["chatgpt_activity_panel_open"] = True
                         p["chatgpt_panel_dom_misses"] = 0
+                        # A verified open clears the press history: the budget bounds a
+                        # RUN of failures, not the phase.
+                        p["chatgpt_panel_click_misses"] = 0
+                        p["chatgpt_last_panel_label"] = None
                         _shape = "side" if _st_pre.get("side_panel") else "inline"
+                        _sid = _st_pre.get("side_panel_id") or {}
                         log(f"[ChatGPT] activity already open (shape={_shape}) at "
-                            f"elapsed={int(elapsed)}s — no click needed")
+                            f"elapsed={int(elapsed)}s — no click needed"
+                            # 2026-08-06: name it. This decision suppresses the
+                            # opener for the rest of the phase; on the 21:00 run
+                            # it was wrong and the log could not say why.
+                            + (f" [{_sid.get('why','?')} {_sid.get('tag','?')} "
+                               f"anchors={_sid.get('anchors','?')} "
+                               f"rows={_sid.get('rows','?')} "
+                               f"ctx={_st_pre.get('side_panel_ctx') or '?'}]"
+                               if _sid else ""))
                         res = None
                     else:
                         res = await _open_chatgpt_activity_panel(
@@ -31350,6 +31870,10 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     elif res.get("alreadyExpanded"):
                         p["chatgpt_activity_panel_open"] = True
                         p["chatgpt_panel_dom_misses"] = 0
+                        # A verified open clears the press history: the budget bounds a
+                        # RUN of failures, not the phase.
+                        p["chatgpt_panel_click_misses"] = 0
+                        p["chatgpt_last_panel_label"] = None
                         log(f"[ChatGPT] activity panel already expanded at "
                             f"elapsed={int(elapsed)}s — label: \"{res.get('label','')[:80]}\"")
                         _observe_dom_success(p["page"], hotspot_id="7c", phase=2,
@@ -31365,7 +31889,16 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                         or _st_post.get("inline_expanded"))
                         if verified:
                             p["chatgpt_activity_panel_open"] = True
+                            # A press we watched mount a shape is proof of a real
+                            # panel — the bare-read override must never overturn
+                            # THAT, only a latch the pre-check set on its own.
+                            p["chatgpt_panel_click_verified"] = True
+                            p["chatgpt_panel_bare_reads"] = 0
                             p["chatgpt_panel_dom_misses"] = 0
+                            # A verified open clears the press history: the budget bounds a
+                            # RUN of failures, not the phase.
+                            p["chatgpt_panel_click_misses"] = 0
+                            p["chatgpt_last_panel_label"] = None
                             _shape = "side" if _st_post.get("side_panel") else "inline"
                             log(f"[ChatGPT] activity opened via DOM at "
                                 f"elapsed={int(elapsed)}s — shape={_shape} "
@@ -31378,13 +31911,31 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                                  dom_ground_truth=_dom_gt_from_res(res))
                         else:
                             p["chatgpt_panel_dom_misses"] = p.get("chatgpt_panel_dom_misses", 0) + 1
+                            p["chatgpt_panel_click_misses"] = p.get(
+                                "chatgpt_panel_click_misses", 0) + 1
+                            # ⭐ 2026-08-06: say WHAT was pressed, not just what
+                            # we hoped it was. The success line has printed
+                            # clickedTag + frameUrl since #913; the miss line
+                            # dropped both, so twelve presses were logged
+                            # without ever naming the element — and the element
+                            # was the whole story (a markdown table cell in the
+                            # agent's own report, in the about:blank frame).
                             log(f"[ChatGPT] DOM clicked but neither panel nor inline "
                                 f"drawer verified — miss #{p['chatgpt_panel_dom_misses']} "
                                 f"(anchor={res.get('anchor', res.get('scope', '?'))} "
+                                f"clickedTag={res.get('clickedTag','?')} "
+                                f"frame={res.get('frameUrl','host')} "
                                 f"label=\"{res.get('label','')[:60]}\")", "WARN")
                             if p["chatgpt_panel_dom_misses"] in (2, 6):
                                 await _log_chatgpt_thread_snapshot(
                                     p["page"], tag=f"p2-miss{p['chatgpt_panel_dom_misses']}")
+                            _stand_down = _chatgpt_panel_stand_down_reason(
+                                p, res.get("label") or "")
+                            if _stand_down:
+                                p["chatgpt_panel_stand_down"] = _stand_down
+                                log(f"[ChatGPT] standing down from re-opening the "
+                                    f"activity panel — {_stand_down}. Source counts "
+                                    f"stop updating; completion is unaffected.", "INFO")
                     else:
                         p["chatgpt_panel_dom_misses"] = p.get("chatgpt_panel_dom_misses", 0) + 1
                         log(f"[ChatGPT] panel found but click failed — "
@@ -31484,7 +32035,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                 _prev = _by_url.get(_it["url"]) or {}
                                 _title = (_it.get("title") or _prev.get("title") or "").strip()
                                 _by_url[_it["url"]] = {"url": _it["url"], "title": _title}
-                            progress["source_items"] = list(_by_url.values())[:50]
+                            progress["source_items"] = list(_by_url.values())[:_SOURCE_LIST_CAP]
                         # Searches count — take max so transient lower
                         # reads don't shrink the chip.
                         _ps = int(panel_data.get("searches", 0) or 0)
@@ -31508,6 +32059,37 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                             f"{len(panel_data.get('steps', []))} steps, "
                             f"{len(panel_data.get('sections', []))} sections, "
                             f"searches={panel_data.get('searches', 0)}")
+                        # ⭐⭐ 2026-08-06 — LET THE READER OVERTURN THE PRE-CHECK.
+                        # The anti-toggle pre-check latches
+                        # `chatgpt_activity_panel_open` for the phase, and the
+                        # ONLY thing that can clear it calls the same predicate
+                        # that set it — so a false positive re-confirms itself
+                        # forever. On the 21:00 run it did: five consecutive
+                        # samples of "0 URLs, 0 steps, searches=0" from a node
+                        # that was a conversation turn, and nothing fed that back.
+                        # The reader had the disproof in its hands every cycle.
+                        #
+                        # Empty ONCE is normal (a freshly opened panel is sparse,
+                        # which is exactly why #913 removed the text floor).
+                        # Empty repeatedly, on a panel we never clicked open, is
+                        # not — so require a run of them AND that we never
+                        # verified a click, then drop the latch and let the
+                        # opener try. It re-checks before clicking, so a panel
+                        # that IS open cannot be toggled shut by this.
+                        _bare = (not panel_data.get("source_urls")
+                                 and not panel_data.get("steps")
+                                 and not int(panel_data.get("searches", 0) or 0))
+                        p["chatgpt_panel_bare_reads"] = (
+                            p.get("chatgpt_panel_bare_reads", 0) + 1 if _bare else 0)
+                        if (p["chatgpt_panel_bare_reads"] >= _CHATGPT_PANEL_BARE_LIMIT
+                                and p.get("chatgpt_activity_panel_open")
+                                and not p.get("chatgpt_panel_click_verified")):
+                            p["chatgpt_activity_panel_open"] = False
+                            p["chatgpt_panel_bare_reads"] = 0
+                            log(f"[ChatGPT] the panel we never clicked has read "
+                                f"empty {_CHATGPT_PANEL_BARE_LIMIT}x — it is not "
+                                f"the sources panel; clearing the flag so the "
+                                f"opener runs", "WARN")
                 except Exception as _e:
                     log(f"[ChatGPT] activity panel scrape failed: {_e}", "DEBUG")
                 p["last_chatgpt_panel_scrape"] = time.time()
@@ -31627,7 +32209,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                 if u not in seen_v:
                                     seen_v.add(u); unioned_v.append(u)
                             if len(unioned_v) > len(existing):
-                                progress["source_urls"] = unioned_v[:50]
+                                progress["source_urls"] = unioned_v[:_SOURCE_LIST_CAP]
                                 progress["sources"] = len(progress["source_urls"])
                                 log(f"[{name}] vision-urls extracted {len(_vu)} URLs "
                                     f"(DOM had {len(existing)}, union now "
@@ -32118,7 +32700,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 # post-completion card empty.
                 try:
                     _runtime.agent_progress_snapshots[agent_key] = {
-                        "source_urls": list(progress.get("source_urls", []) or [])[:50],
+                        "source_urls": list(progress.get("source_urls", []) or [])[:_SOURCE_LIST_CAP],
                         "sections":    list(progress.get("sections", []) or [])[:20],
                         "steps":       list(progress.get("steps", []) or [])[:15],
                         "searches":    int(progress.get("searches", 0) or 0),
@@ -33226,23 +33808,14 @@ def _chatgpt_dr_frame_targets(page):
     HTML→MD scrape returned 0 chars — the chain fell through to CUA
     (Tier 3) which doesn't work on Wayland. Iterating frames here lets
     Tier 1 and Tier 2 actually reach the DR DOM.
+
+    2026-08-06: delegates to `_chatgpt_surface_frame_targets`. It used to carry
+    its own copy of the URL-substring list, and that list cannot describe an
+    `about:blank`-mounted surface — the extraction tiers were as blind to the
+    2026-08-06 canvas as the completion detector was, which is why that run fell
+    all the way to the CUA download tier for a report sitting in a frame.
     """
-    targets = [page]
-    try:
-        for frame in page.frames:
-            try:
-                src = (frame.url or "").lower()
-            except Exception:
-                continue
-            if not src:
-                continue
-            if ("deep_research" in src
-                    or "oaiusercontent" in src
-                    or "web-sandbox.oaiusercontent" in src):
-                targets.append(frame)
-    except Exception:
-        pass
-    return targets
+    return _chatgpt_surface_frame_targets(page)
 
 
 async def _extract_html_to_md_anyframe(page, selectors, label):
@@ -43183,7 +43756,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                                status=_snap.get("status", "generating"),
                                progress=_progress,
                                sources=_sources,
-                               source_urls=(_snap.get("source_urls", []) or [])[:50],
+                               source_urls=(_snap.get("source_urls", []) or [])[:_SOURCE_LIST_CAP],
                                partial_text_len=_partial,
                                steps=_steps[-3:] if _steps else [],
                                thinking=(_snap.get("thinking") or "")[:300])
@@ -43523,7 +44096,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                                status=_gm_status, stage="planning",
                                progress=_gm.get("progress") or "Gemini drafting research plan...",
                                sources=int(_gm.get("sources", 0) or 0),
-                               source_urls=(_gm.get("source_urls", []) or [])[:50],
+                               source_urls=(_gm.get("source_urls", []) or [])[:_SOURCE_LIST_CAP],
                                partial_text_len=int(_gm.get("partial_text_len", 0) or 0),
                                steps=(_gm.get("steps") or [])[-3:],
                                plan=(_gm.get("plan") or "")[:500])
@@ -43970,7 +44543,8 @@ def _build_phase2_to_phase3_handoff(results: dict, queue_dir) -> None:
 # census, rename) so the happy path needs NO vision at all; the CUA missions
 # remain as the fallback tier, now with per-file DOM verification.
 
-_NLM_CLICK_JS = """(patterns) => {""" + _NLM_ONSCREEN_JS + """
+_NLM_CLICK_JS = """(patterns) => {
+    const MARK = \"""" + _SR_CLICK_MARK + """\";""" + _NLM_ONSCREEN_JS + """
     // Click the first button-ish element matching a pattern. PATTERN ORDER IS
     // AUTHORITATIVE (review r2): the pattern loop is outermost, so a specific
     // pattern ('add source') is exhausted page-wide before a generic one
@@ -44013,23 +44587,96 @@ _NLM_CLICK_JS = """(patterns) => {""" + _NLM_ONSCREEN_JS + """
                 if (ad === 'true') continue;
                 const { aria, txt } = norm(el);
                 if (re.test(aria) || re.test(txt)) {
-                    el.click();
-                    return (aria || txt).slice(0, 80);
+                    // ⭐⭐ 2026-08-06 — PREFER THE LEAF. `textContent` on a
+                    // container is the concatenation of everything inside it, so
+                    // the Add-sources DROPZONE matches /upload file/i through its
+                    // own children and — because `querySelectorAll` returns
+                    // DOCUMENT order, and an ancestor always precedes its
+                    // descendants — wins before the "Upload files" chip is ever
+                    // examined. The live proof is the label the run logged,
+                    // exactly 80 characters of concatenated child text:
+                    //   'or drop your filespdf, images, docs, audio, and
+                    //    moreuploadUpload fileslinkvideo_'
+                    // 3 of 3 uploads, in two independent runs.
+                    let best = el;
+                    try {
+                        for (const inner of el.querySelectorAll(
+                                'button, [role="button"], label[for]')) {
+                            if (!onScreen(inner) || inner.disabled) continue;
+                            const n2 = norm(inner);
+                            if (re.test(n2.aria) || re.test(n2.txt)) { best = inner; break; }
+                        }
+                    } catch (e) {}
+                    const b = norm(best);
+                    // ⭐ MARK, DO NOT CLICK. A synthetic `el.click()` inside
+                    // page.evaluate carries no USER ACTIVATION, and a native file
+                    // chooser is gated on exactly that — so this could never have
+                    // opened one however well it aimed. The rest of this codebase
+                    // presses through `_sr_real_click`; the NotebookLM tier was
+                    // the only DOM path that never adopted it.
+                    best.setAttribute(MARK, 'nlm-click');
+                    return { label: (b.aria || b.txt).slice(0, 80),
+                             tag: (best.tagName || '') };
                 }
             }
         }
     }
-    return '';
+    return null;
 }"""
 
 
-async def _nlm_click_first(page, patterns):
-    """DOM-click the first NotebookLM control matching any regex pattern.
-    Returns the matched label text ('' = nothing matched). Best-effort."""
+# How long Playwright's trusted press gets on a NotebookLM control before the
+# dispatched-pointer fallback takes over.
+#
+# ⭐ 2026-08-06 — A NEW TIER MUST SIT ABOVE THE OLD ONE, NOT REPLACE IT. This path
+# used a synthetic in-page click, which worked for the notebook-create control and
+# could never work for a file chooser. Swapping it wholesale for the trusted press
+# bought the chooser and cost two 4-second stalls on controls the old way handled:
+#   [21:36:18] real click on the marked element failed (TimeoutError) - falling back
+#   [21:36:24] real click on the marked element failed (TimeoutError) - falling back
+# Same outcome, eight seconds slower, and a new warning in a log we read for signal.
+# So the press stays first — it is the only rung that can open a chooser — but it
+# gives up fast, which turns a replacement back into a ladder.
+_NLM_PRESS_TIMEOUT_MS = 1200
+
+
+async def _nlm_click_first(page, patterns, *, expect_chooser=False):
+    """Press the first NotebookLM control matching any regex pattern.
+
+    Returns the matched label text ('' = nothing matched). Best-effort.
+
+    2026-08-06: the JS MARKS and Playwright PRESSES (`_sr_real_click`) instead of
+    calling `el.click()` inside the page. Two independent reasons, either
+    sufficient on its own: a synthetic click carries no user activation, so it
+    can never open a native file chooser; and it does not scroll, does not wait
+    for actionability, and is not a trusted event sequence.
+
+    `expect_chooser=True` arms Playwright's file-chooser wait AROUND the press,
+    which is what turns "the chooser never opened" from an inference into a
+    fact — and gives the caller the chooser to set files on. The label comes
+    back with a "|chooser" suffix when one actually opened.
+    """
     try:
-        return (await page.evaluate(_NLM_CLICK_JS, list(patterns))) or ""
+        picked = await page.evaluate(_NLM_CLICK_JS, list(patterns))
     except Exception:
         return ""
+    if not isinstance(picked, dict) or not picked.get("label"):
+        return ""
+    label = str(picked.get("label") or "")
+    try:
+        if expect_chooser:
+            try:
+                async with page.expect_file_chooser(timeout=6000):
+                    await _sr_real_click(page, "nlm-click", tag="[NotebookLM]",
+                                         timeout_ms=_NLM_PRESS_TIMEOUT_MS)
+                return f"{label}|chooser"
+            except Exception:
+                return label
+        await _sr_real_click(page, "nlm-click", tag="[NotebookLM]",
+                             timeout_ms=_NLM_PRESS_TIMEOUT_MS)
+    except Exception:
+        pass
+    return label
 
 
 # ── The audio card's ⋮ menu — scoped, never document-wide ──────────────
@@ -44377,9 +45024,30 @@ async def _nlm_dom_add_files(browser, page, paths, label="NotebookLM"):
         fired_any = False
         for p in paths:
             browser.set_upload_file(p)
+            # ⭐ 2026-08-06 — RE-OPEN THE PICKER BETWEEN FILES. Setting a file on
+            # the revealed input CLOSES the Add-sources dialog, so the next
+            # iteration found no Upload control and the loop broke: the 21:00 run
+            # got gemini.md through and abandoned the other two to the CUA in the
+            # same second. The dialog is cheap to re-open and a no-op when it is
+            # already up.
+            if fired_any:
+                try:
+                    await _nlm_click_first(page, (
+                        r"^add source", r"\badd sources?\b", r"upload sources?"))
+                    await asyncio.sleep(1.5)
+                except Exception:
+                    pass
+            # 2026-08-06: arm Playwright's chooser wait AROUND the press. The
+            # global handler below can only answer a chooser that opened; this is
+            # what makes "it opened" an observation rather than an inference, and
+            # a synthetic in-page click could never have produced one at all.
             clicked = await _nlm_click_first(page, (
                 r"upload file", r"choose file", r"select file", r"\bbrowse\b",
-                r"\bupload\b"))
+                r"\bupload\b"), expect_chooser=True)
+            if clicked.endswith("|chooser"):
+                clicked = clicked[: -len("|chooser")]
+                log(f"[{label}] DOM upload: file chooser opened from "
+                    f"{clicked!r} — the global handler is answering it")
             if not clicked:
                 browser.clear_upload_file()
                 log(f"[{label}] DOM upload: no Upload control found for "
@@ -45098,6 +45766,151 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
 
 # ── Phase 3 (audio): Audio Overview Generation ───────────────────────────────
 
+# ── The audio the pipeline could not find ────────────────────────────────────
+# Magic bytes, because the file we are looking for HAS NO EXTENSION.
+_AUDIO_MAGIC = (
+    (b"ID3", ".mp3"),
+    (b"\xff\xfb", ".mp3"), (b"\xff\xf3", ".mp3"), (b"\xff\xf2", ".mp3"),
+    (b"RIFF", ".wav"),
+    (b"\x1a\x45\xdf\xa3", ".webm"),
+    (b"OggS", ".ogg"),
+)
+
+
+def _audio_kind(path) -> str:
+    """The extension this file's CONTENT says it should have, or "".
+
+    ⛔ 2026-08-06 (review) — THE FIRST VERSION OF THIS WOULD HAVE CALLED A HOLIDAY
+    VIDEO AN AUDIO FILE. `ftyp` at offset 4 is ISO-BMFF, which covers mp4, mov,
+    heic and m4a alike; a bare `RIFF` covers wav, avi and webp alike. Combined
+    with a recursive scan of the user's Downloads folder and a `shutil.move`,
+    that could have taken someone's photo or video and published it as the
+    podcast. The brand and the RIFF form are checked now, so only audio answers.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(16)
+    except Exception:
+        return ""
+    if not head:
+        return ""
+    if len(head) >= 12 and head[4:8] == b"ftyp":
+        # The four-byte major brand decides. M4A/M4B are audio; mp42, isom, qt
+        # and heic are containers that usually are not — and "usually" is not
+        # good enough when the next step moves the file.
+        return ".m4a" if head[8:12] in (b"M4A ", b"M4B ") else ""
+    if head.startswith(b"RIFF"):
+        return ".wav" if len(head) >= 12 and head[8:12] == b"WAVE" else ""
+    for sig, ext in _AUDIO_MAGIC:
+        if head.startswith(sig):
+            return ext
+    return ""
+
+
+# A file the browser is still writing is not a file we may take.
+_INCOMPLETE_SUFFIXES = (".crdownload", ".part", ".download", ".tmp", ".partial")
+
+
+def _is_settled(path, *, pause_s=1.0) -> bool:
+    """True when the file has stopped being written to.
+
+    Two stats a second apart: an in-flight download grows between them. Without
+    it, the 30-second event wait can expire while Chrome is still writing and the
+    fallback moves the file out from under the writer — on a slow connection,
+    that would be this run's OWN audio.
+    """
+    try:
+        a = Path(path).stat()
+        time.sleep(pause_s)
+        b = Path(path).stat()
+    except Exception:
+        return False
+    return a.st_size == b.st_size and a.st_mtime == b.st_mtime and b.st_size > 0
+
+
+def _find_recent_audio(dirs, *, min_bytes=4096):
+    """The newest real audio file across `dirs`, identified by CONTENT.
+
+    Each entry is `(path, recursive, max_age_s, may_move)`. Per-directory policy,
+    not one blanket sweep: Playwright's own artifacts directory is ours to
+    recurse and to move from; the user's Downloads folder is neither.
+
+    ⭐⭐ 2026-08-06 — THE DOWNLOAD SUCCEEDED AND WE COULD NOT SEE IT. Chrome's own
+    history records the audio completing at 21:43:40 and the vision agent said so
+    too. The page-scoped event never reached us, so the fallback ran — and it
+    globbed `*.mp3 *.wav *.m4a *.webm` under `~/Downloads` while Playwright had
+    saved the file into its OWN artifacts directory, under a GUID, with no
+    extension at all. Two independent reasons it could never match.
+    ⛔ So: no extension filter. Match on mtime, confirm on magic bytes, take the
+    name from what the bytes say it is.
+    """
+    best = None
+    now = time.time()
+    for entry in dirs:
+        try:
+            d, recursive, age, may_move = entry
+            if not d or not Path(d).exists():
+                continue
+            it = Path(d).rglob("*") if recursive else Path(d).glob("*")
+            for f in it:
+                try:
+                    if not f.is_file() or f.name.startswith("."):
+                        continue
+                    if f.suffix.lower() in _INCOMPLETE_SUFFIXES:
+                        continue
+                    st = f.stat()
+                    if (now - st.st_mtime) > age or st.st_size < min_bytes:
+                        continue
+                    if best is not None and st.st_mtime <= best[0]:
+                        continue
+                    if not _audio_kind(f):
+                        continue
+                    best = (st.st_mtime, f, _audio_kind(f), may_move)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    if best is None:
+        return (None, "", False)
+    return (best[1], best[2], best[3])
+
+
+def _audio_search_plan(browser):
+    """Where to look for the podcast, and what we are allowed to do there.
+
+    (path, recursive, max_age_s, may_move). Playwright's artifacts directory is
+    ours: recurse it, give it the full window, move from it. The human Downloads
+    folder is not: top level only, a tight window, and COPY — never take a file
+    out of somebody's Downloads because it happened to be recent and audio.
+    """
+    plan = [(p, True, 300, True) for p in _playwright_download_dirs(browser)]
+    plan += [(Path.home() / "Downloads", False, 120, False),
+             (Path("D:/Downloads"), False, 120, False)]
+    return plan
+
+
+def _playwright_download_dirs(browser):
+    """Where Playwright puts a download when nobody calls `save_as`: a
+    GUID-named, extensionless file under `playwright-artifacts-*` in the system
+    temp dir — invisible to any glob that assumes a Downloads folder."""
+    out = []
+    try:
+        _ctx = getattr(getattr(browser, "page", None), "context", None)
+        _impl = getattr(_ctx, "_impl_obj", None)
+        for attr in ("_download_dir", "_artifacts_dir"):
+            _d = getattr(_impl, attr, None)
+            if _d:
+                out.append(Path(str(_d)))
+    except Exception:
+        pass
+    try:
+        import tempfile as _tf
+        out.extend(Path(_tf.gettempdir()).glob("playwright-artifacts-*"))
+    except Exception:
+        pass
+    return out
+
+
 async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose=False, podcast_length="long", prefer_existing_audio: bool = False):
     """Phase 3 (step b): Generate audio overview in NotebookLM + share public.
 
@@ -45787,22 +46600,34 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             log("Download event not received — checking common download dirs...", "WARN")
             # Silent: the Downloads-folder scan below has its own fail_phase
             # if it also turns up empty.
-            # Fallback: scan common download locations
-            for dl_dir in [Path.home() / "Downloads", Path("D:/Downloads")]:
-                if not dl_dir.exists():
-                    continue
-                for ext in ("*.mp3", "*.wav", "*.m4a", "*.webm"):
-                    for f in sorted(dl_dir.glob(ext), key=lambda f: f.stat().st_mtime, reverse=True):
-                        if (time.time() - f.stat().st_mtime) < 120:  # Created in last 2 min
-                            dest = queue_dir / "podcasts" / f.name
-                            shutil.move(str(f), str(dest))
-                            audio_path = dest
-                            log(f"Audio found in {dl_dir.name}: {f.name}")
-                            break
-                    if audio_path:
-                        break
-                if audio_path:
-                    break
+            # Fallback: scan by CONTENT, not by extension — see `_find_recent_audio`.
+            _found, _ext, _may_move = _find_recent_audio(_audio_search_plan(browser))
+            if _found is not None and not _is_settled(_found):
+                log(f"Audio candidate {_found.name} is still being written — "
+                    f"leaving it alone", "WARN")
+                _found = None
+            if _found is not None:
+                _suffix_ok = _found.suffix.lower() in (
+                    ".m4a", ".m4b", ".mp3", ".wav", ".webm", ".ogg")
+                dest = (queue_dir / "podcasts"
+                        / (_found.name if _suffix_ok else _found.name + _ext))
+                try:
+                    # ⛔ COPY out of the user's Downloads, MOVE only out of
+                    # Playwright's own artifacts directory. Taking a file from
+                    # somebody's Downloads folder because it was recent and
+                    # happened to be audio is not ours to do.
+                    if _may_move:
+                        shutil.move(str(_found), str(dest))
+                    else:
+                        shutil.copy2(str(_found), str(dest))
+                    audio_path = dest
+                    log(f"Audio recovered by content from {_found.parent.name} "
+                        f"({_ext}, {dest.stat().st_size} bytes, "
+                        f"{'moved' if _may_move else 'copied'}) — the download "
+                        f"event never reached us")
+                except Exception as _mv:
+                    log(f"Audio found at {_found} but could not be taken: {_mv}",
+                        "WARN")
 
         try:
             browser.page.remove_listener("download", _on_download)
@@ -47022,7 +47847,7 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
             sections = [s for s in sections if s not in ("ChatGPT Deep Research", "Gemini Deep Research", "Claude Deep Research")]
             # Extract source URLs from markdown links and references
             urls = re.findall(r'https?://[^\s\)\]\"\'>]+', content)
-            unique_urls = list(dict.fromkeys(urls))[:50]  # Dedupe, cap at 50
+            unique_urls = list(dict.fromkeys(urls))[:_SOURCE_LIST_CAP]  # Dedupe, cap at the shared ceiling
             # Build/update agent entry. unique_urls is already capped at 50.
             existing = agents.get(platform, {})
             # 2026-05-04: pull the runtime per-agent progress snapshot so
@@ -50597,6 +51422,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                                      "after 3 attempts. The notebook link is still delivered in your report and email; the "
                                      "YouTube upload step is skipped. Re-run this research if you want to retry the audio."),
                             alertType="warn", dismissible=True,
+                            # 2026-08-06: explicit "no buttons". This one is
+                            # agent-scoped, so the web app's agent panel already
+                            # defaults to none — but the PHASE panel invents a
+                            # [Skip] from an undefined `actions`, and a card that
+                            # relies on which panel happens to render it is one
+                            # refactor from growing a button. Say it here.
+                            actions=[],
                             alert_id=f"phase3_audio_giveup_{int(time.time())}",
                         )
                     except Exception:
@@ -50618,7 +51450,37 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # #778: skip_phase=3 so a Skip click breaks the wait immediately
                 # instead of being ignored until the full 5 min elapses.
                 _interrupt = await _controls.interruptible_sleep(
-                    _AUDIO_RETRY_INTERVAL_SEC, check_interval=10, skip_phase=3)
+                    _AUDIO_RETRY_INTERVAL_SEC, check_interval=10, skip_phase=3,
+                    # ⭐⭐ 2026-08-06 — THE RETRY THE WAIT COULD NOT HEAR. The user
+                    # pressed Retry on the phase-3 card; the backend logged
+                    # "Command received: RETRY_PHASE phase=3" and then went on
+                    # sleeping, because this wait watched only stop / skip /
+                    # pause. The app sat on "restarting" with nothing to
+                    # acknowledge it, the paused chrome latched, and the user
+                    # eventually pressed Stop. The retry it was already going to
+                    # perform in five minutes was the very thing being asked for.
+                    # ⛔ And leaving the flag unconsumed is its own bug: a later
+                    # soft-warn can cash it and restart a phase nobody asked to
+                    # restart. Consume it HERE, where it means something.
+                    retry_phase=3)
+                if _interrupt == "retry":
+                    # ⛔⛔ NO `continue` HERE, and the first version of this fix had
+                    # one. `continue` restarts the while loop — jumping straight
+                    # PAST the retry attempt at the bottom of this body — so the
+                    # press announced "restarting the audio attempt now", spent an
+                    # auto-retry slot, and began another five-minute sleep having
+                    # run nothing. Three presses would exhaust the budget with
+                    # `run_phase3_audio` never called once. Fall through instead:
+                    # every branch below tests `_interrupt` against a different
+                    # value, so control lands on the attempt, which is what was
+                    # asked for.
+                    log("Phase 3: retry requested during the no-audio wait — "
+                        "restarting the audio attempt now", "INFO")
+                    emit_event("phase_restart", phase=3, reason="user_retry_audio_missing",
+                               attempt=_audio_auto_retries)
+                    # A person asking for a retry must not spend one of the three
+                    # UNATTENDED attempts; give the slot back.
+                    _audio_auto_retries = max(0, _audio_auto_retries - 1)
                 if _interrupt == "stop":
                     log("Phase 3: stop during no-audio retry wait — aborting", "INFO")
                     return
@@ -50636,7 +51498,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     if _controls.is_stop():
                         return
 
-                emit_event("phase_restart", phase=3, reason="auto_retry_audio_missing", attempt=_audio_auto_retries)
+                if _interrupt != "retry":
+                    # The user-retry path already emitted its own restart above.
+                    emit_event("phase_restart", phase=3, reason="auto_retry_audio_missing", attempt=_audio_auto_retries)
                 try:
                     _p3_audio = await _await_phase_with_active_deadline(
                         3, PHASE_3_AUDIO_MAX_MIN,
@@ -51796,6 +52660,35 @@ async def run_server(port=8000):
     _QUEUE_STATE["queue_ref"] = _job_queue
     _QUEUE_STATE["recompute_fn"] = None  # set below after defining helper
 
+    def _flip_txn_stage(tx, root) -> str:
+        """Which Firestore RPC was refused — the one thing 20 logged failures
+        never said.
+
+        The library masks a denial inside a transaction as "the transaction has
+        no transaction ID, so it cannot be rolled back", which describes the
+        rollback and not the fault. But that message is itself the evidence:
+        `Transaction._id` is set only AFTER BeginTransaction returns, so an
+        absent id means BeginTransaction is what was refused — before any
+        document was read or written, and therefore upstream of every rule
+        predicate about deviceId or ownership. An id that IS present narrows it
+        to the read or the commit instead.
+
+        Kept a named function, not an f-string at the call site, so the polarity
+        can be tested without provoking a real denial.
+        """
+        try:
+            began = getattr(tx, "_id", None) is not None
+        except Exception:
+            return "stage=unknown (transaction object unreadable)"
+        if not began:
+            return ("stage=BeginTransaction — no transaction id was ever issued, "
+                    "so the denial is on opening the transaction itself, not on "
+                    "the document read or the write payload")
+        _dbg = getattr(root, "debug_error_string", "") or ""
+        return ("stage=read_or_commit — the transaction opened, so the denial is "
+                "on the document"
+                + (f" | grpc={str(_dbg)[:200]}" if _dbg else ""))
+
     def _flip_queued_to_ongoing(uid_val, research_id_val):
         """Worker pickup: flip status from queued → ongoing and clear queue
         fields. Transactional — only flips if current status is "queued",
@@ -51832,8 +52725,26 @@ async def run_server(port=8000):
             # transaction's first READ fail deviceMemberOf → google-cloud-firestore
             # masks it as "transaction has no transaction ID". Heal re-mints a
             # claim-bearing token and re-runs with a FRESH transaction object.
+            #
+            # ⚠ 2026-08-06 — THAT DIAGNOSIS IS NOT WHAT THE LIBRARY DOES, and the
+            # heal's own output says so: "the re-minted token did NOT clear the
+            # denial — so a stale credential was not the cause", 20 occurrences
+            # across the corpus and not one success. Reading the installed
+            # google-cloud-firestore: `_Transactional._pre_commit` calls
+            # `transaction._begin(...)` EAGERLY, `_begin` issues a real
+            # BeginTransaction RPC and only sets `self._id` afterwards, and
+            # `_rollback` opens with `if not self.in_progress: raise ValueError`
+            # where `in_progress` is `self._id is not None`. A denied READ, a
+            # denied COMMIT and a denied ROLLBACK all leave `_id` set and would
+            # surface as a bare PermissionDenied — so the ValueError we see can
+            # only come from BeginTransaction ITSELF being denied, before any
+            # document is touched. That is upstream of every rule predicate the
+            # heal reasons about, which is exactly why re-minting cannot help.
+            # `_flip_tx` is captured so the except block can report whether an id
+            # was ever obtained, and turn that reading into proof next run.
+            _flip_tx = _firebase_db.transaction()
             outcome = _grpc_write_with_heal(
-                lambda: _flip_txn(_firebase_db.transaction()),
+                lambda: _flip_txn(_flip_tx),
                 what=f"flip queued→ongoing {research_id_val[:8]}…",
             )
             if outcome.startswith("skipped"):
@@ -51858,10 +52769,16 @@ async def run_server(port=8000):
             _head = f"{type(_root).__name__}: {_root}" if _root is not None else str(e)
             log(
                 f"Failed to flip queued→ongoing for {research_id_val}: {_head}"
-                + (f" | surfaced as: {e}" if _root is not None else ""),
+                + (f" | surfaced as: {e}" if _root is not None else "")
+                + f" | {_flip_txn_stage(locals().get('_flip_tx'), _root)}",
                 "WARN",
             )
-            return None
+            # ⚠ NOT None. `None` read as "legacy success — proceed", so on every
+            # run in this corpus the caller's terminal-status bail was silently
+            # switched off: a run cancelled or watchdog-stopped between dequeue
+            # and pickup would have launched a browser anyway. "We could not
+            # evaluate the flip" is a third answer and the caller now asks again.
+            return "error"
 
     def _recompute_queue_positions():
         """After a job finishes, shift remaining queued jobs' positions up by
@@ -52715,6 +53632,30 @@ async def run_server(port=8000):
                 "completed",
             }
             should_run = True
+            # ⚠ 2026-08-06 — "COULD NOT EVALUATE" IS NOT "PROCEED". The flip has
+            # failed on every run in this corpus (20 occurrences, zero successes),
+            # and it returned None, which fell straight through to should_run=True
+            # — so the terminal-status bail below has been switched off the whole
+            # time. A plain read answers the same question without a transaction,
+            # and the transaction is the thing being denied.
+            if flip_outcome == "error":
+                try:
+                    _snap = (_firebase_db.collection("users").document(job.get("uid"))
+                             .collection("researches").document(job.get("research_id"))
+                             .get())
+                    _cur = ((_snap.to_dict() or {}).get("status")
+                            if _snap.exists else None)
+                    if _cur:
+                        flip_outcome = f"skipped({_cur})"
+                        log(f"[flip] the transaction was refused; a plain read says "
+                            f"status={_cur!r} — deciding from that", "INFO")
+                    else:
+                        log("[flip] the transaction was refused and the doc could "
+                            "not be read either — proceeding, as before", "WARN")
+                except Exception as _fe:
+                    log(f"[flip] the transaction was refused and the fallback "
+                        f"read also failed ({type(_fe).__name__}) — "
+                        f"proceeding, as before", "WARN")
             if flip_outcome and flip_outcome.startswith("skipped(") and flip_outcome.endswith(")"):
                 actual_status = flip_outcome[len("skipped("):-1]
                 if actual_status in BAIL_STATUSES:

@@ -55,6 +55,27 @@ from conftest import code_only, code_only_deep, js_code_only
 needs_node = pytest.mark.skipif(NODE is None, reason="node required to run page JS")
 
 
+def _click(spec, patterns):
+    """Run `_NLM_CLICK_JS` and report what it returned AND what it marked.
+
+    2026-08-06: the helper stopped calling `el.click()` in the page — a synthetic
+    click carries no user activation and so could never open the native file
+    chooser these uploads need. It now MARKS the element and Playwright presses
+    it. `marks` is counted from the document afterwards, independently of the
+    return value, so "it picked something" and "it marked exactly that one" stay
+    separate observations.
+    """
+    composed = (
+        "(patterns) => { const r = (" + research._NLM_CLICK_JS + ")(patterns); "
+        "return { r: r, marks: document.querySelectorAll('["
+        + research._SR_CLICK_MARK + "]').length }; }"
+    )
+    out = run_js(spec, composed, list(patterns))
+    raw = out["ret"] or {}
+    return {"ret": raw.get("r"), "marks": raw.get("marks", 0),
+            "clicks": out.get("clicks", [])}
+
+
 # ── (a) the accelerator ───────────────────────────────────────────────────
 
 def test_no_bare_control_accelerator_survives_anywhere():
@@ -182,10 +203,10 @@ def test_an_off_canvas_control_cannot_win_the_upload_match():
         el("button", {"aria-label": "Upload file", "x": "-400", "w": "120", "h": "40"}, ""),
         el("button", {"aria-label": "Upload file", "x": "40", "w": "120", "h": "40"}, ""),
     ])
-    out = run_js(spec, research._NLM_CLICK_JS, ["upload file"])
-    assert out["ret"] == "Upload file"
+    out = _click(spec, ["upload file"])
+    assert out["ret"] and out["ret"]["label"] == "Upload file"
     # Exactly one click, and on the on-screen one.
-    assert len(out["clicks"]) == 1
+    assert out["marks"] == 1, "exactly one element must be marked"
 
 
 @needs_node
@@ -200,11 +221,11 @@ def test_a_disabled_control_cannot_win_the_upload_match(attr):
                       "w": "120", "h": "40"}, ""),
         el("button", {"aria-label": "Upload file (live)", "w": "120", "h": "40"}, ""),
     ])
-    out = run_js(spec, research._NLM_CLICK_JS, ["upload file"])
-    assert out["ret"] == "Upload file (live)", (
+    out = _click(spec, ["upload file"])
+    assert out["ret"] and out["ret"]["label"] == "Upload file (live)", (
         f"the {attr} control won the match and was pressed with no effect"
     )
-    assert len(out["clicks"]) == 1
+    assert out["marks"] == 1, "exactly one element must be marked"
 
 
 @needs_node
@@ -214,7 +235,10 @@ def test_a_label_for_a_hidden_input_is_now_a_candidate():
     spec = el("body", {}, "", [
         el("label", {"for": "f", "w": "120", "h": "40"}, "Upload file"),
     ])
-    assert run_js(spec, research._NLM_CLICK_JS, ["upload file"])["ret"] == "Upload file"
+    out = _click(spec, ["upload file"])
+    assert out["ret"] and out["ret"]["label"] == "Upload file"
+    assert out["ret"]["tag"] == "LABEL"
+    assert out["marks"] == 1
 
 
 @needs_node
@@ -225,8 +249,8 @@ def test_pattern_order_is_still_authoritative():
         el("button", {"aria-label": "Upload something else", "w": "120", "h": "40"}, ""),
         el("button", {"aria-label": "Add source", "w": "120", "h": "40"}, ""),
     ])
-    out = run_js(spec, research._NLM_CLICK_JS, ["^add source", r"\bupload\b"])
-    assert out["ret"] == "Add source"
+    out = _click(spec, ["^add source", r"\bupload\b"])
+    assert out["ret"] and out["ret"]["label"] == "Add source"
 
 
 @needs_node
@@ -237,9 +261,9 @@ def test_a_dialog_scoped_candidate_still_wins_within_a_pattern():
             el("button", {"aria-label": "Upload file", "w": "120", "h": "40"}, ""),
         ]),
     ])
-    out = run_js(spec, research._NLM_CLICK_JS, ["upload file"])
-    assert out["ret"] == "Upload file"
-    assert len(out["clicks"]) == 1
+    out = _click(spec, ["upload file"])
+    assert out["ret"] and out["ret"]["label"] == "Upload file"
+    assert out["marks"] == 1, "exactly one element must be marked"
 
 
 def test_the_chooser_fallback_rechecks_for_the_hidden_input():

@@ -47,7 +47,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import research  # noqa: E402
 
-CGPT_SRC = inspect.getsource(research.detect_completion_chatgpt)
+# 2026-08-06: the probe JS moved OUT of the function body into a module
+# constant, so every context (main frame and each candidate iframe) runs the
+# IDENTICAL payload — the asymmetry between a rich host probe and a thin iframe
+# one is what left `completedChip` and `docPanelAffordances` on one path only.
+# These source-shape guards follow the JS to where it now lives; the assertions
+# themselves are unchanged and still describe the markers this ticket added.
+CGPT_SRC = research._CHATGPT_DONE_PROBE_JS
+CGPT_FN_SRC = inspect.getsource(research.detect_completion_chatgpt)
 GEM_SRC = inspect.getsource(research.detect_completion_gemini)
 POLL_SRC = inspect.getsource(research.poll_all_agents_round_robin)
 
@@ -68,7 +75,7 @@ def test_chatgpt_completed_chip_forms_are_anchored():
     # Both anchored forms; a bare "research completed" in report PROSE must
     # not satisfy the chip (textContent scans hidden text, so the anchor
     # tails are the only guard against prose false-positives).
-    assert "in\\\\s+\\\\d+\\\\s*[hms]" in CGPT_SRC, (
+    assert "in\\s+\\d+\\s*[hms]" in CGPT_SRC, (
         "chip form 1 must anchor on 'in Xm' (e.g. 'Research completed in 10m')"
     )
     assert "citations?|sources?" in CGPT_SRC, (
@@ -91,7 +98,7 @@ def test_chatgpt_doc_panel_affordances_marker():
         "right-edge anchor + min-height keep it specific to a document panel"
     )
     assert "/download/.test(t)" in _blk
-    assert "if (hasDl) { docPanelAffordances = true; break; }" in _blk, (
+    assert "if (hasDl) {" in _blk and "docPanelAffordances = true;" in _blk, (
         "the download button ALONE flips the done signal"
     )
     # The expand requirement AND the right-dock left floor are both gone —
@@ -101,20 +108,48 @@ def test_chatgpt_doc_panel_affordances_marker():
 
 
 def test_chatgpt_done_marker_includes_new_signals():
-    assert ("thoughtFor || researchDone || completedChip || docPanelAffordances"
-            in CGPT_SRC), (
-        "doneMarker must accept the chip and the doc-panel affordances — "
-        "the canvas layout carries NO text marker at all (30-min blind run)"
-    )
+    # 2026-08-06: this used to assert the JS source read
+    # `thoughtFor || researchDone || completedChip || docPanelAffordances`.
+    # The combination moved into Python so a frame can be allowed to contribute
+    # some markers and not others, so the guard is now the BEHAVIOUR: each
+    # marker alone, in the main frame, must be enough. Executing it is strictly
+    # stronger than matching the old expression — that string was satisfied by
+    # any function that merely contained it.
+    import asyncio
+
+    def _reading(**over):
+        base = {"hasStop": False, "thoughtFor": False, "researchDone": False,
+                "completedChip": False, "docPanelAffordances": False,
+                "assistantLen": 0, "panelLen": 0, "bodyLen": 0,
+                "sources": 0, "steps": 0, "vw": 1440, "vh": 900}
+        base.update(over)
+        return base
+
+    class _Page:
+        def __init__(self, payload):
+            self._payload = payload
+            self.url = "https://chatgpt.com/c/x"
+            self.main_frame = self
+            self.frames = [self]
+
+        async def evaluate(self, js, arg=None):
+            return dict(self._payload)
+
+    for marker in ("thoughtFor", "researchDone", "completedChip",
+                   "docPanelAffordances"):
+        done, reason, _snap = asyncio.run(
+            research.detect_completion_chatgpt(_Page(_reading(**{marker: True}))))
+        assert done is True, f"{marker} alone did not read as done: {reason}"
+
     # Reason strings distinguish which marker fired (log-greppable).
-    assert "completed_chip" in CGPT_SRC
-    assert "doc_panel_affordances" in CGPT_SRC
+    assert "completed_chip" in CGPT_FN_SRC
+    assert "doc_panel_affordances" in CGPT_FN_SRC
 
 
 def test_chatgpt_stop_button_still_vetoes():
     # The affordance markers must not outrank a live stop button.
-    idx_stop = CGPT_SRC.index("if has_stop:")
-    idx_marker = CGPT_SRC.index("if not has_done_marker:")
+    idx_stop = CGPT_FN_SRC.index("if has_stop:")
+    idx_marker = CGPT_FN_SRC.index("if not has_done_marker:")
     assert idx_stop < idx_marker
 
 

@@ -155,10 +155,17 @@ def test_two_urls_differing_only_by_tracking_tag_collapse_to_one():
 # ── Sections: zero was always the right answer ───────────────────────────────
 
 def test_the_panel_holds_no_headings_at_all(grown):
-    """So `sections=0` is correct output, not a parse gap. This is the assertion
-    that should stop the ticket being re-raised."""
+    """So a heading count of zero is correct output, not a parse gap. This is the
+    assertion that should stop the ticket being re-raised.
+
+    2026-08-06: the `sections == []` half moved. No headings is still true and is
+    still what `dbg_headings` reports — but "no headings" turned out not to mean
+    "no structure": the panel carries two group labels ("Pro thinking",
+    "Sources · N") and now reports them. `tests/test_panel_sections_0806.py` owns
+    that behaviour; this test keeps the heading fact it was written for."""
     assert grown.get("dbg_headings") == 0
-    assert (grown.get("sections") or []) == []
+    # Whatever `sections` now contains, none of it came from a heading element.
+    assert not any(s.lower().startswith("h1") for s in (grown.get("sections") or []))
 
 
 def test_headings_are_reported_separately_from_sections():

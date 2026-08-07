@@ -415,19 +415,19 @@ TITLE_SRC = code_only(research._refresh_research_title_async)
 
 
 def test_the_generated_title_is_checked_against_the_topic():
-    assert "topic_anchors(" in TITLE_SRC, (
+    assert "title_refusal_verdict(" in TITLE_SRC, (
         "our own findings-based titler had the answer and wrote it out as the "
         "run's name"
     )
 
 
 def test_the_check_runs_before_the_firestore_write():
-    assert TITLE_SRC.index("topic_anchors(") < TITLE_SRC.index(
+    assert TITLE_SRC.index("title_refusal_verdict(") < TITLE_SRC.index(
         '_update_firestore_research({"title"')
 
 
 def test_a_drifted_title_is_refused_not_merely_logged():
-    tail = TITLE_SRC[TITLE_SRC.index("topic_anchors("):]
+    tail = TITLE_SRC[TITLE_SRC.index("title_refusal_verdict("):]
     branch = tail[:tail.index('_update_firestore_research({"title"')]
     assert 'text = ""' in branch, (
         "refusing the write keeps the title derived from the user's own input"
@@ -435,16 +435,43 @@ def test_a_drifted_title_is_refused_not_merely_logged():
 
 
 def test_the_operator_is_told_before_phase_three_spends_the_audio_time():
-    tail = TITLE_SRC[TITLE_SRC.index("topic_anchors("):]
-    branch = tail[:tail.index('_update_firestore_research({"title"')]
-    assert "emit_event(" in branch and "pipeline_warning" in branch
+    """2026-08-06: REWRITTEN. This used to assert only that the emit was PRESENT
+    somewhere in the refusal branch, and that is precisely what pinned the bug —
+    the emit was unconditional, so a title-only mismatch on a perfectly on-topic
+    corpus raised a card, on a phase already marked Complete, carrying a Skip
+    that had nothing to skip. The operator must still be told when the CORPUS is
+    off-topic; the assertion is now about which branch the emit sits in."""
+    assert research.title_refusal_verdict(
+        NOTEBOOK_TITLE, TOPIC, "golden retriever " * 3000) == "refuse_loud"
+    tail = TITLE_SRC[TITLE_SRC.index('"refuse_loud"'):]
+    branch = tail[:tail.index("else:")]
+    assert "emit_event(" in branch and "pipeline_warning" in branch, (
+        "the loud path is the corpus-also-failed path — that is the shape with "
+        "no innocent explanation, and it is what this guard was built for"
+    )
+
+
+def test_a_title_only_mismatch_raises_nothing(monkeypatch):
+    """The owner's finding, as a behaviour. The corpus is plainly on topic; the
+    title is a vendor-level summary of it. Nothing for a human to do."""
+    assert research.title_refusal_verdict(
+        "NVIDIA Agent Stack Architecture And Security Boundaries",
+        TOPIC,
+        ("Nemotron and NemoClaw deployment notes. " * 800)) == "refuse_silent"
 
 
 def test_the_title_check_honours_the_same_abstain_rule():
     """A title is far too short for the length floor, so the anchor test is
     applied directly — but the minimum-anchors rule still has to hold, or an
-    unguardable topic starts refusing perfectly good titles."""
-    assert "_TOPIC_GUARD_MIN_ANCHORS" in TITLE_SRC
+    unguardable topic starts refusing perfectly good titles.
+
+    2026-08-06: asserted by EXECUTION now that the decision is a function. The
+    old source-shape check would have passed against a constant that was merely
+    mentioned."""
+    assert research.title_refusal_verdict(
+        "Some Entirely Unrelated Title",
+        "best practices for team retrospectives",
+        "x" * 30_000) == "accept"
 
 
 def test_the_incident_title_would_have_been_refused():

@@ -44,11 +44,13 @@ import research  # noqa: E402
 # ── Bug 1: ChatGPT download-icon completion signal ───────────────────────────
 
 def test_doc_panel_fires_on_download_alone_not_download_and_expand():
-    src = inspect.getsource(research.detect_completion_chatgpt)
+    # 2026-08-06: the probe JS moved into the module constant so every browsing
+    # context runs the same payload — see `_CHATGPT_DONE_PROBE_JS`.
+    src = research._CHATGPT_DONE_PROBE_JS
     i = src.index("let docPanelAffordances")
     block = src[i:i + 1600]
     # The download button ALONE flips the signal (no more AND-expand).
-    assert "if (hasDl) { docPanelAffordances = true; break; }" in block, (
+    assert "if (hasDl) {" in block and "docPanelAffordances = true;" in block, (
         "the finished-canvas download button alone must be the done signal — "
         "ChatGPT's header is download + SHARE, so requiring an expand button "
         "missed every finished canvas"
@@ -60,7 +62,9 @@ def test_doc_panel_fires_on_download_alone_not_download_and_expand():
 
 
 def test_doc_panel_geometry_drops_the_right_dock_left_floor():
-    src = inspect.getsource(research.detect_completion_chatgpt)
+    # 2026-08-06: the probe JS moved into the module constant so every browsing
+    # context runs the same payload — see `_CHATGPT_DONE_PROBE_JS`.
+    src = research._CHATGPT_DONE_PROBE_JS
     i = src.index("let docPanelAffordances")
     block = src[i:i + 1600]
     # The near-full-width canvas layout has the document starting just right of

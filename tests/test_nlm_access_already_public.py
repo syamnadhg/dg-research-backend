@@ -45,7 +45,16 @@ _PHRASE = "Anyone with the link"
 
 
 def _dialog(*kids):
-    return el("body", {}, "", [el("div", {"role": "dialog"}, "", list(kids))])
+    # 2026-08-06: the dialog is given a real size. The diagnostic now requires
+    # >200x100 — the same gate its sibling link-reader has always applied — after
+    # a zero-sized `[role="dialog"]` on the live page produced `dialog=yes` from
+    # here and `no_dialog` from the reader one second later, byte-identical in
+    # two runs seven hours apart. A size-less fixture is the phantom, not a
+    # dialog.
+    return el("body", {}, "", [
+        el("div", {"role": "dialog", "w": "600", "h": "400", "x": "100", "y": "50"},
+           "", list(kids)),
+    ])
 
 
 # ── the JS, executed ─────────────────────────────────────────────────────────
@@ -131,9 +140,12 @@ def test_the_diagnostic_prefers_the_dialog_over_the_whole_page():
     """Scoped, so a stale value elsewhere on the page cannot answer for the
     dialog — the document-wide read is what made the audio kebab destructive."""
     spec = el("body", {}, "", [
-        el("div", {"role": "combobox"}, _PHRASE),           # page chrome, not the dialog
-        el("div", {"role": "dialog"}, "", [
-            el("div", {"role": "combobox"}, "Restricted"),
+        el("div", {"role": "combobox", "w": "300", "h": "40"},
+           _PHRASE),                                        # page chrome, not the dialog
+        # Real dimensions: the diagnostic now requires a dialog to be one.
+        el("div", {"role": "dialog", "w": "600", "h": "400", "x": "100", "y": "50"}, "", [
+            el("div", {"role": "combobox", "w": "300", "h": "40",
+                       "x": "120", "y": "200"}, "Restricted"),
         ]),
     ])
     got = run_js(spec, research._NLM_ACCESS_DIAG_JS)["ret"]
