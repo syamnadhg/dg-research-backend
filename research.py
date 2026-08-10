@@ -62073,13 +62073,34 @@ def _kill_tree(proc, pgid):
             pass
     if proc.poll() is None:
         return False
-    try:
-        os.killpg(pgid, 0)
-    except ProcessLookupError:
-        return True
-    except Exception:
-        return False  # cannot see it, cannot claim it is gone
-    return False
+    # POLL the emptiness probe; do not ask it once. SIGKILL delivery and reaping
+    # are asynchronous — the signal returns as soon as it is queued, and the
+    # kernel takes the descendants down and reaps them afterwards. Asking
+    # immediately therefore sees a group that is dying but not yet empty, and on
+    # a loaded machine that is the ORDINARY outcome, not a rare one.
+    #
+    # Reporting False there is not a harmless conservatism. It publishes
+    # `package_manager_orphan` — "a process from the upgrade survived the kill
+    # and may still hold the venv open" — and tells the operator their venv may
+    # be inconsistent, about a kill that in fact worked and finished
+    # milliseconds later. A path whose entire job is telling the operator the
+    # truth about a failed upgrade must not invent a second failure. CI caught
+    # this: the same commit passed on one runner and failed on a busier one,
+    # while the test's own 8-second wait confirmed the descendant really did die.
+    #
+    # Bounded, so a group that genuinely will not die is still reported as
+    # orphaned — which is the honest answer, and the one this exists to give.
+    _deadline = time.time() + 10.0
+    while True:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True  # the group is empty — the only real proof available
+        except Exception:
+            return False  # cannot see it, cannot claim it is gone
+        if time.time() >= _deadline:
+            return False
+        time.sleep(0.1)
 
 
 _note("package_manager_start", cmd=cmd, timeout_s=_TIMEOUT_S)

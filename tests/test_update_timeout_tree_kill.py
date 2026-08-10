@@ -261,7 +261,12 @@ def _kill_tree_from_waiter(os_stub):
     tree = _ast.parse(WAITER)
     fn = next(n for n in tree.body
               if isinstance(n, _ast.FunctionDef) and n.name == "_kill_tree")
-    ns: dict = {"os": os_stub, "sys": sys, "subprocess": subprocess}
+    # `time` belongs here for the same reason `os` does: the function polls the
+    # group-emptiness probe rather than asking it once, because a kill is
+    # asynchronous and the immediate answer is "still dying" on any loaded
+    # machine. Leaving it out does not make the test stricter — it makes the
+    # function raise NameError before reaching the branch under test.
+    ns: dict = {"os": os_stub, "sys": sys, "subprocess": subprocess, "time": time}
     exec(compile(_ast.Module(body=[fn], type_ignores=[]), "<waiter>", "exec"), ns)
     return ns["_kill_tree"]
 
@@ -440,3 +445,83 @@ def test_the_waiter_claims_the_launch_record_before_anything_else(tmp_path):
     _records, _payload, _log = _run_waiter(tmp_path, [sys.executable, str(pm)])
     rec = json.loads((tmp_path / "intent.json").read_text(encoding="utf-8"))
     assert isinstance(rec["waiter_pid"], int) and rec["waiter_pid"] > 0
+
+
+# ── the probe polls; it does not ask once (CI, 2026-08-10) ──────────────────
+
+class _Reaped:
+    """A front-end that has already exited and been reaped.
+
+    That is the state `_kill_tree` is in by the time it probes the group: the
+    direct child must be reaped first, because a zombie keeps the group alive and
+    would read as a survivor. So the only question left is the descendants."""
+
+    def __init__(self, pid):
+        self.pid = pid
+
+    def wait(self, timeout=None):
+        return 0
+
+    def poll(self):
+        return 0
+
+    def kill(self):
+        pass
+
+
+def test_a_group_that_empties_A_MOMENT_LATER_is_still_a_clean_kill():
+    """THE CI FLAKE, and the production defect under it.
+
+    SIGKILL returns as soon as the signal is queued; the kernel takes the
+    descendants down and reaps them afterwards. Asking `killpg(pgid, 0)` in the
+    instant after therefore sees a group that is dying but not yet empty — and on
+    a loaded machine that is the ORDINARY outcome, not a rare one. The same
+    commit passed on one runner and failed on a busier one, while the test's own
+    eight-second wait confirmed the descendant really had died.
+
+    Reporting "orphaned" there is not harmless conservatism: it publishes "a
+    process from the upgrade survived the kill and may still hold the venv open"
+    and tells the operator their venv may be inconsistent — about a kill that
+    worked. A path whose whole job is telling the truth about a failed upgrade
+    must not invent a second failure on top of it.
+    """
+    # The stub's killpg is replaced below, so the constructor argument is only
+    # there to satisfy its signature — nothing ever raises it.
+    stub = _OsStub(killpg_error=ProcessLookupError(), own_pgid=4242)
+    calls = {"n": 0}
+
+    def _killpg(pgid, sig):
+        if sig == 0:
+            calls["n"] += 1
+            if calls["n"] < 3:      # still dying on the first two probes
+                return None
+            raise ProcessLookupError()
+        return None
+
+    stub.killpg = _killpg
+    assert _kill_tree_from_waiter(stub)(_Reaped(9999), 5555) is True, (
+        "a group that empties a moment after the kill is a CLEAN kill"
+    )
+    assert calls["n"] >= 3, "the probe must be polled, not asked once"
+
+
+def test_a_group_that_never_empties_is_STILL_reported_as_orphaned():
+    """The polarity, and the reason the poll is bounded.
+
+    Waiting forever for a group that will not die turns a reported failure into
+    the silent hang this whole sentinel exists to end. A tree that genuinely
+    survives must still be named — that is the honest answer, and the operator
+    can only act on it if someone says it."""
+    stub = _OsStub(killpg_error=ProcessLookupError(), own_pgid=4242)
+    stub.killpg = lambda pgid, sig: None   # never raises → the group is never empty
+    started = time.time()
+    assert _kill_tree_from_waiter(stub)(_Reaped(9999), 5555) is False
+    assert time.time() - started < 60, "the wait must be bounded, not indefinite"
+
+
+def test_the_probe_loop_is_bounded_in_the_source():
+    """Pins the bound itself. The two tests above pass with any deadline at all,
+    including one long enough to strand the update path for an hour."""
+    src = WAITER[WAITER.index("def _kill_tree"):]
+    src = src[:src.index("\n_note(")] if "\n_note(" in src else src
+    assert "time.time() + 10.0" in src, src[-600:]
