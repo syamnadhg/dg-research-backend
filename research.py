@@ -27390,6 +27390,43 @@ def _classify_completion_verdict(cua_text: str) -> str:
     return "generating"
 
 
+async def _page_is_dead(page):
+    """Why this page can no longer be producing anything, or None if it is alive.
+
+    "Not generating" has two causes that look identical to every DOM selector and
+    to a screenshot: the answer FINISHED, or the page is GONE. The completion path
+    treated them as one, and on 2026-08-09 a ChatGPT tab that had navigated to
+    `about:blank` was declared complete after 3289 seconds — the visual check was
+    asked to confirm and reported, accurately, that it could see no chat interface,
+    no composer, no Stop button and no response. Every one of those is absent on a
+    dead page and present on a finished one, and the check had no way to say so:
+    anything that was not "still generating" fell through to "complete".
+
+    So this answers the third question. It is deliberately about the PAGE and not
+    the content — an empty answer is a different bug with a different fix, and
+    conflating them is what produced a 55-minute run that ended in 0 chars.
+    """
+    try:
+        if page.is_closed():
+            return "the tab has been closed"
+    except Exception:
+        return "the tab is gone"
+    try:
+        url = (page.url or "").strip()
+    except Exception:
+        return "the tab has no address"
+    # `about:blank` is the shape the live failure took. Treat any non-http surface
+    # the same way: a research agent's answer never lives on one.
+    if not url or url.startswith("about:") or url.startswith("chrome-error"):
+        return f"the tab is at {url or 'no address'}"
+    try:
+        if not await page.evaluate("() => !!(document && document.body)"):
+            return "the document has no body"
+    except Exception as exc:
+        return f"the document cannot be read ({type(exc).__name__})"
+    return None
+
+
 async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                           browser=None, cua_client=None, verbose=False, phase=2):
     """Poll page until response is complete. Smart: uses CUA to check if DOM selectors fail."""
@@ -28032,6 +28069,22 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
         generating = await verify_fn(page)
 
         if not generating:
+            # Is the page GONE, rather than finished? Checked here, before anything
+            # downstream can read "not generating" as "done" — the visual confirm
+            # below, and the final DOM double-check after it, both accept a dead
+            # page otherwise, and the visual one actively argues for it (a blank
+            # screen has no Stop button and no loading indicator).
+            #
+            # Returning False rather than raising: it is the established "abort this
+            # poll, not complete" signal in this function, the caller already handles
+            # it, and a dead tab is exactly the situation where the retry machinery
+            # above us is the right owner.
+            _dead = await _page_is_dead(page)
+            if _dead:
+                log(f"[{label}] the page is gone — {_dead}. Not treating this as a "
+                    f"finished answer (elapsed {int(time.time() - wait_start)}s)", "ERROR")
+                return False
+
             consecutive_not_generating += 1
 
             # First "not generating" could be a DOM selector issue or a
