@@ -45830,7 +45830,40 @@ _AUDIO_MAGIC = (
 )
 
 
-def _audio_kind(path) -> str:
+def _is_audio_only(path) -> bool | None:
+    """True when ffprobe finds an audio stream and no video stream.
+
+    False when it ran and the answer was no — a video, or bytes it cannot read as
+    media at all. None ONLY when ffprobe itself is unavailable, which is a
+    different situation and gets a different answer at the call site.
+
+    The honest discriminator between a podcast and a holiday video, which is what
+    the ISO-BMFF major brand was being asked — and failing — to answer.
+    """
+    probe = _ffprobe_bin()
+    if probe is None:
+        return None
+    try:
+        out = subprocess.run(
+            [probe, "-v", "error", "-show_entries", "stream=codec_type",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    # ffprobe RAN. A non-zero exit or no streams means it could not read this as
+    # media — that is a real answer ("not usable audio"), not an absence of one.
+    # Collapsing the two is how a truncated download, or a stub of zero bytes
+    # behind an mp4 header, would be published as somebody's podcast.
+    if out.returncode != 0:
+        return False
+    kinds = {ln.strip() for ln in (out.stdout or "").splitlines() if ln.strip()}
+    if not kinds:
+        return False
+    return ("audio" in kinds) and ("video" not in kinds)
+
+
+def _audio_kind(path, *, trusted=False) -> str:
     """The extension this file's CONTENT says it should have, or "".
 
     ⛔ 2026-08-06 (review) — THE FIRST VERSION OF THIS WOULD HAVE CALLED A HOLIDAY
@@ -45839,6 +45872,25 @@ def _audio_kind(path) -> str:
     with a recursive scan of the user's Downloads folder and a `shutil.move`,
     that could have taken someone's photo or video and published it as the
     podcast. The brand and the RIFF form are checked now, so only audio answers.
+
+    ⭐⭐ 2026-08-09 — AND THEN IT REJECTED THE PODCAST. Chrome's own history records
+    the audio overview completing at 23:03:01, 3,487,728 bytes, state=1, straight
+    into Playwright's artifacts directory. The scan ran 34 seconds later, walked
+    that directory, found the file — and threw it away, because the major brand was
+    not literally `M4A `. NotebookLM serves a generic ISO brand. The run then
+    reported "audio file missing" and retried against a notebook that had already
+    produced it. The 08-06 hardening fixed the half it could see (extension, dirs)
+    and made the other half stricter than the real artifact.
+
+    The brand was never the right question. "Is this a video?" is, and ffprobe
+    answers it — so a generic ISO container is accepted when the file has an audio
+    stream and no video stream.
+
+    `trusted` is the second half. Playwright's artifacts directory contains only
+    what THIS run downloaded; the user's Downloads folder is where the holiday
+    video lives. So an unprobeable generic container is accepted from the first and
+    never from the second — the 08-06 hazard was always about the user's files, and
+    that guard stays exactly as strict as it was.
     """
     try:
         with open(path, "rb") as fh:
@@ -45848,10 +45900,26 @@ def _audio_kind(path) -> str:
     if not head:
         return ""
     if len(head) >= 12 and head[4:8] == b"ftyp":
-        # The four-byte major brand decides. M4A/M4B are audio; mp42, isom, qt
-        # and heic are containers that usually are not — and "usually" is not
-        # good enough when the next step moves the file.
-        return ".m4a" if head[8:12] in (b"M4A ", b"M4B ") else ""
+        # M4A/M4B say audio outright, wherever they came from.
+        if head[8:12] in (b"M4A ", b"M4B "):
+            return ".m4a"
+        # Anything else ISO-BMFF (isom, mp42, dash, qt, heic…) needs PROOF, and
+        # only a positive one counts. ffprobe saying "I cannot read this" is a no,
+        # not a maybe — an earlier draft treated it as a maybe and accepted a
+        # zero-filled mp4 stub out of the trusted directory, which is the holiday
+        # video hazard wearing a different hat. The existing 08-06 test caught it.
+        proof = _is_audio_only(path)
+        if proof is True:
+            return ".m4a"
+        if proof is None and trusted:
+            # ffprobe is not installed at all. The file is still ours by
+            # construction — this directory holds only what this run downloaded —
+            # so accept it rather than repeat the 08-09 outage. P3 needs ffmpeg to
+            # transcode anyway, so a box without it has a louder problem than this.
+            log("[Audio] ffprobe unavailable — accepting the downloaded container "
+                "on directory trust alone", "WARN")
+            return ".m4a"
+        return ""
     if head.startswith(b"RIFF"):
         return ".wav" if len(head) >= 12 and head[8:12] == b"WAVE" else ""
     for sig, ext in _AUDIO_MAGIC:
@@ -45916,9 +45984,14 @@ def _find_recent_audio(dirs, *, min_bytes=4096):
                         continue
                     if best is not None and st.st_mtime <= best[0]:
                         continue
-                    if not _audio_kind(f):
+                    # `may_move` already encodes the trust this needs: it is True
+                    # only for Playwright's own artifacts directory, which contains
+                    # nothing but what this run downloaded. The user's Downloads
+                    # folder is may_move=False and stays under the strict rule.
+                    kind = _audio_kind(f, trusted=may_move)
+                    if not kind:
                         continue
-                    best = (st.st_mtime, f, _audio_kind(f), may_move)
+                    best = (st.st_mtime, f, kind, may_move)
                 except Exception:
                     continue
         except Exception:
