@@ -46593,6 +46593,74 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         emit_event("agent_progress", phase=3, agent="notebooklm",
                    status="downloading", stage="podcast",
                    progress="Downloading audio file from NotebookLM…")
+
+        # ── DOM rung: open the audio card's ⋮ and click Download BY LABEL ──
+        #
+        # This existed and was wired to exactly one thing. `_nlm_open_audio_menu`
+        # and `_nlm_menu_pick` were built for this menu — the deny-list comment
+        # names the download case explicitly ("`Delete` sits two rows below
+        # `Download`, so an off-by-two is not a failed download, it is a destroyed
+        # one") — and then only Share ever called them. The download, the step that
+        # actually blocks the pipeline, stayed vision-only: a model clicking a
+        # coordinate, a 30s wait, and a Downloads-folder scan.
+        #
+        # 2026-08-09 is what that costs. The model reported "the download has been
+        # initiated" and the menu did close, but no download event fired and no file
+        # existed anywhere on disk. Thirty seconds later the DOM rung opened the very
+        # same menu successfully for Share:
+        #     [dom] p3 notebooklm.open_audio_menu: verified via=audio-card
+        # The deterministic path was available the whole time and nothing called it.
+        #
+        # Same shape as every other rung here: DOM first, CUA only if it misses.
+        # Never by index — `Delete` is two rows away, so an ordinal click is one
+        # layout change from destroying the user's audio instead of saving it.
+        _dl_via_dom = False
+        try:
+            _dl_menu = await _nlm_open_audio_menu(browser.page)
+            if _dl_menu.get("verified"):
+                _dl_pick = await _nlm_menu_pick(browser.page, want=("download",))
+                if _dl_pick.get("blocked"):
+                    log(f"[Audio] download pick refused destructive row(s): "
+                        f"{_dl_pick.get('blocked')}", "WARN")
+                elif _dl_pick.get("clicked"):
+                    _dl_via_dom = True
+                    log(f"[dom] p3 notebooklm.download_audio: verified "
+                        f"via={_dl_pick.get('via')!r}")
+                else:
+                    log(f"[dom] p3 notebooklm.download_audio: missed "
+                        f"({_dl_pick.get('reason', 'no Download row')}) — CUA will drive it",
+                        "WARN")
+                    await _nlm_close_dialogs(browser.page, label="Audio")
+            else:
+                log(f"[dom] p3 notebooklm.download_audio: menu not opened "
+                    f"({_dl_menu.get('why', 'unknown')}) — CUA will drive it", "WARN")
+        except Exception as _dl_dom_err:
+            log(f"[dom] p3 notebooklm.download_audio: errored "
+                f"({type(_dl_dom_err).__name__}) — CUA will drive it", "WARN")
+
+        # A DOM click lands immediately; give the event a short window before
+        # paying for a vision agent. Bounded low on purpose — this is the happy
+        # path, and 8s of waiting is cheaper than 8 CUA iterations.
+        #
+        # This must NOT return early. Everything after the download block still has
+        # to run — the mp3 transcode, the panel cleanup, and the share-link extract
+        # that the podcast delivery depends on. An early return here would trade a
+        # missing file for a missing link, which is the same outage wearing a
+        # different message. So it only records that the click landed, and the
+        # existing 30s wait below collects the event either way.
+        _dl_seen = False
+        if _dl_via_dom:
+            try:
+                await asyncio.wait_for(asyncio.shield(download_future), timeout=8)
+                _dl_seen = download_future.done() and download_future.result() is not None
+                if _dl_seen:
+                    log("[Phase3] audio downloaded by the DOM rung — not running the visual agent")
+            except asyncio.TimeoutError:
+                log("[dom] p3 notebooklm.download_audio: clicked but no download event "
+                    "in 8s — falling through to the visual agent", "WARN")
+            except Exception:
+                pass
+
         _stop_d, _task_d = start_narration_ticker(
             3, "notebooklm",
             "Downloading audio overview from NotebookLM",
@@ -46616,7 +46684,11 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             # them intact and only drives the download click. #778: target ONLY
             # the requested card (target_ordinal), never another entry's
             # play/menu, never navigate away. 'abort:' is diagnostic-only below.
-            _dl_result = await _shadow_observed_cua(
+            # Skipped entirely when the DOM rung already produced the file. Not just
+            # a saving: a second driver on a menu whose `Delete` row sits two below
+            # `Download` is a real hazard, and re-clicking Download would leave a
+            # duplicate for the dup-count guards to trip over.
+            _dl_result = None if _dl_seen else await _shadow_observed_cua(
                 browser.page, hotspot_id="audio-download", phase=3, platform="notebooklm",
                 current_step="download_audio_overview",
                 context_hint=("download the completed audio overview via its ⋮/three-dot "
