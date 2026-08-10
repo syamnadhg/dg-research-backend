@@ -55,8 +55,15 @@ jobs:
           python-version: "3.13"
           cache: "pip"
 
-      # The suite is fully mocked (no real browser / network / Firestore), so it
-      # only needs the packages importable — no `patchright install chrome`.
+      # The suite drives no real browser, network or Firestore — so no
+      # `patchright install chrome`. It DOES need ffmpeg/ffprobe: the audio
+      # sniffer asks a probe whether a file is audio-with-no-video, and the tests
+      # that matter most build REAL media to ask it with. Without ffmpeg those
+      # tests SKIP, which is how a suite that was written precisely because
+      # "stubs cannot prove this" ran green here for a fortnight proving nothing.
+      - name: Install ffmpeg (the audio sniffer probes with it)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
       - name: Install dependencies
         run: pip install -r requirements.txt
 

@@ -73,6 +73,23 @@ def real_video_with_audio(tmp_path_factory):
     return p
 
 
+
+def _probe_says(monkeypatch, *, returncode=0, stdout=""):
+    """Pin BOTH halves of the probe: that a probe exists, and what it answered.
+
+    Patching only `subprocess.run` is not enough — `_is_audio_only` returns early
+    when `_ffprobe_bin()` finds nothing, so on a machine without ffmpeg the fake
+    is never reached and the test silently exercises the no-tool path instead of
+    the one it names. That is exactly how two of these passed locally and failed
+    on a runner with no ffmpeg installed.
+    """
+    class _R:
+        pass
+    _R.returncode = returncode
+    _R.stdout = stdout
+    monkeypatch.setattr(R, "_ffprobe_bin", lambda: "/nonexistent/ffprobe")
+    monkeypatch.setattr(R.subprocess, "run", lambda *a, **k: _R())
+
 # ── the file the pipeline actually threw away ───────────────────────────────
 
 @requires_ffmpeg
@@ -128,11 +145,16 @@ def test_the_video_really_does_carry_an_audio_track(real_video_with_audio):
 
 # ── bytes that are not media at all ─────────────────────────────────────────
 
-def test_a_zero_filled_mp4_stub_is_refused_even_when_trusted(tmp_path):
+def test_a_zero_filled_mp4_stub_is_refused_even_when_trusted(tmp_path, monkeypatch):
     """An earlier draft of the fix accepted this. ffprobe could not read it, that
     was treated as "cannot say", and directory trust let it through — which is the
     holiday-video hazard wearing a different hat. ffprobe RAN and said no; that is
-    an answer, not an absence of one. The 08-06 suite caught this draft."""
+    an answer, not an absence of one. The 08-06 suite caught this draft.
+
+    The probe is simulated rather than assumed present: a real ffprobe exits
+    non-zero on these bytes, and this test is about what we DO with that answer.
+    The real-ffprobe version of the same claim is above, under the marker."""
+    _probe_says(monkeypatch, returncode=1)
     p = tmp_path / "stub"
     p.write_bytes(b"\x00\x00\x00\x20ftypmp42" + b"\x00" * 8192)
     assert R._audio_kind(p, trusted=True) == ""
@@ -218,11 +240,7 @@ def test_a_probe_that_reports_NO_STREAMS_is_a_no(monkeypatch, tmp_path):
     Driven by faking the probe result rather than trying to author a valid MP4 with
     zero streams — the branch under test is the tri-state logic, not ffprobe.
     """
-    class _R:
-        returncode = 0
-        stdout = ""
-
-    monkeypatch.setattr(R.subprocess, "run", lambda *a, **k: _R())
+    _probe_says(monkeypatch, returncode=0, stdout="")
     p = tmp_path / "nostreams"
     p.write_bytes(b"\x00\x00\x00\x20ftypmp42" + b"\x00" * 8192)
     assert R._is_audio_only(p) is False, "no streams means no, not maybe"

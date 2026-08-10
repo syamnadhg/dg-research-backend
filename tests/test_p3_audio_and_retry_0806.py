@@ -102,15 +102,46 @@ class TestFindingTheDownloadNobodyCouldSee:
         (MP4_VIDEO, "an mp4 video"), (HEIC, "an iPhone photo"),
         (WEBP, "a webp image"), (AVI, "an avi video"),
     ])
-    def test_a_container_that_is_not_audio_is_refused(self, tmp_path, data, what):
+    def test_a_container_that_is_not_audio_is_refused(self, tmp_path, data, what,
+                                                      monkeypatch):
         # ⛔ Review finding. The first version keyed on `ftyp` at offset 4 and a
         # bare `RIFF`, which match mp4, mov, heic, avi and webp — and the next
         # step MOVED the file. Someone's holiday video could have been published
         # as the podcast.
+        #
+        # The probe is pinned, because otherwise this test asserts something that
+        # is only true on machines that HAVE ffprobe. `_audio_kind` deliberately
+        # falls back to directory trust when no probe exists, so on a bare runner
+        # a video stub in the artifacts directory IS accepted — by design, and
+        # covered by its own test below. Pinning the probe here keeps this test
+        # about the refusal, on every machine, instead of about the toolchain.
+        class _R:
+            returncode = 1
+            stdout = ""
+        monkeypatch.setattr(research, "_ffprobe_bin", lambda: "/nonexistent/ffprobe")
+        monkeypatch.setattr(research.subprocess, "run", lambda *a, **k: _R())
+
         _write(tmp_path, "recent-download", data)
         assert research._audio_kind(tmp_path / "recent-download") == "", what
         assert research._find_recent_audio(
             [(tmp_path, True, 300, True)]) == (None, "", False), what
+
+    def test_without_a_probe_the_trusted_directory_is_believed(self, tmp_path,
+                                                               monkeypatch):
+        """The documented other half, stated out loud rather than left to whichever
+        machine happens to run the suite.
+
+        With no ffprobe, an unrecognised container out of Playwright's OWN
+        artifacts directory is accepted — that directory holds only what this run
+        downloaded, and refusing there is what caused the 08-09 outage. The user's
+        Downloads folder gets no such benefit, which is the guard that actually
+        protects somebody's holiday video."""
+        monkeypatch.setattr(research, "_ffprobe_bin", lambda: None)
+        _write(tmp_path, "recent-download", MP4_VIDEO)
+        found, ext, _mv = research._find_recent_audio([(tmp_path, True, 300, True)])
+        assert found is not None and ext == ".m4a"
+        assert research._find_recent_audio(
+            [(tmp_path, False, 300, False)]) == (None, "", False)
 
     def test_a_part_file_is_never_taken(self, tmp_path):
         _write(tmp_path, "podcast.m4a.crdownload", M4A)
