@@ -107,8 +107,8 @@ def test_the_destructive_guard_is_carried_not_bypassed():
     assert 'if _dl_pick.get("blocked"):' in rung, (
         "the destructive-row check must test the pick result, not a constant"
     )
-    assert "download pick refused destructive" in rung, (
-        "a refused destructive row must be logged, or the guard is silent"
+    assert "download menu skipped destructive row" in rung, (
+        "the skipped destructive rows must be logged, or the guard is silent"
     )
 
 
@@ -229,3 +229,81 @@ def test_a_dom_exception_cannot_take_phase_3_down():
         f"the rung must catch Exception so a DOM error falls through to the visual "
         f"agent; it catches {caught or 'nothing'}"
     )
+
+
+# ── the duplicate download (e2e 2026-08-10) ─────────────────────────────────
+#
+# The run worked and downloaded the podcast TWICE. Both halves of the skip were
+# wrong, and each on its own is enough to produce it.
+
+
+def test_blocked_does_not_gate_the_click():
+    """`_nlm_menu_pick` returns `blocked` ALONGSIDE `clicked: true` — it is the list
+    of denied rows it filtered out and skipped, not a refusal. The audio menu always
+    contains Delete, so `blocked` is ALWAYS non-empty.
+
+    The first version of this rung tested `blocked` first and treated it as failure:
+
+        [01:20:44] [dom] p3 notebooklm.open_audio_menu: verified via=audio-card
+        [01:20:44] [WARN] [Audio] download pick refused destructive row(s): ['delete']
+
+    …so the rung clicked Download, reported failure, and the visual agent clicked
+    Download again. `clicked` is the only field that says what happened.
+    """
+    block = _download_block()
+    rung = block[block.index("_dl_via_dom = False"):block.index("_stop_d, _task_d = start_narration_ticker")]
+    code = "\n".join(l for l in rung.splitlines() if not l.lstrip().startswith("#"))
+
+    # The blocked branch must not be on the same if/elif chain as the click.
+    assert "elif _dl_pick.get(\"clicked\")" not in code, (
+        "`blocked` and `clicked` must be independent — an elif makes an always-present "
+        "blocked list suppress a successful click"
+    )
+    assert 'if _dl_pick.get("clicked"):' in code, (
+        "the click must be tested on its own"
+    )
+    # And blocked must be advisory: logged, never a reason to abandon the click.
+    bi = code.index('if _dl_pick.get("blocked"):')
+    ci = code.index('if _dl_pick.get("clicked"):')
+    assert bi < ci, "log the skipped rows, then act on the click"
+    between = code[bi:ci]
+    assert "_dl_via_dom = True" not in between and "return" not in between, between
+
+
+def test_the_skip_accepts_a_file_on_disk_not_only_the_event():
+    """The Playwright `download` event has NEVER reached us from NotebookLM — logged
+    twice, "the download event never reached us", both times with the file sitting
+    complete in Playwright's artifacts directory.
+
+    So gating the agent-skip on the event alone guarantees the agent runs after a
+    good DOM click. The evidence must be the event OR a settled file, which are the
+    same two channels the capture below already uses.
+    """
+    block = _download_block()
+    wait = block[block.index("_dl_seen = False"):block.index("_stop_d, _task_d = start_narration_ticker")]
+    assert "_find_recent_audio" in wait, (
+        "the skip must also accept a file appearing on disk — the download event is "
+        "not delivered by NotebookLM"
+    )
+    assert "_is_settled" in wait, (
+        "a file still being written is a download in flight, not a finished one"
+    )
+    assert "download_future.done()" in wait, "the event remains a valid signal too"
+
+
+def test_the_evidence_wait_is_bounded():
+    """A wait with no deadline would hang phase 3 whenever the click missed, which is
+    worse than the duplicate it replaced."""
+    block = _download_block()
+    wait = block[block.index("_dl_seen = False"):block.index("_stop_d, _task_d = start_narration_ticker")]
+    assert "_dl_deadline" in wait and "time.time() <" in wait, wait
+
+
+def test_a_missed_click_still_reaches_the_visual_agent():
+    """Polarity. If no file ever appears, the agent MUST still run — otherwise this
+    change trades a duplicate download for no download at all."""
+    block = _download_block()
+    wait = block[block.index("_dl_seen = False"):block.index("_stop_d, _task_d = start_narration_ticker")]
+    assert "falling through to the visual agent" in wait
+    # `_dl_seen` starts False and is only ever set on evidence.
+    assert wait.lstrip().startswith("_dl_seen = False"), wait[:80]

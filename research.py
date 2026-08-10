@@ -46692,10 +46692,18 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             _dl_menu = await _nlm_open_audio_menu(browser.page)
             if _dl_menu.get("verified"):
                 _dl_pick = await _nlm_menu_pick(browser.page, want=("download",))
+                # `blocked` is ADVISORY — the denied rows the picker filtered out
+                # and skipped — and it is returned ALONGSIDE `clicked: true`. The
+                # audio menu always contains Delete, so it is always non-empty.
+                # Treating it as a failure (as the first version of this rung did)
+                # meant the rung clicked Download, reported failure, and the visual
+                # agent then clicked Download again: two files, one run. `clicked`
+                # is the only field that says what happened. The share flow below
+                # has always read it this way.
                 if _dl_pick.get("blocked"):
-                    log(f"[Audio] download pick refused destructive row(s): "
-                        f"{_dl_pick.get('blocked')}", "WARN")
-                elif _dl_pick.get("clicked"):
+                    log(f"[Audio] download menu skipped destructive row(s): "
+                        f"{_dl_pick.get('blocked')}", "DEBUG")
+                if _dl_pick.get("clicked"):
                     _dl_via_dom = True
                     log(f"[dom] p3 notebooklm.download_audio: verified "
                         f"via={_dl_pick.get('via')!r}")
@@ -46721,18 +46729,39 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         # missing file for a missing link, which is the same outage wearing a
         # different message. So it only records that the click landed, and the
         # existing 30s wait below collects the event either way.
+        # Wait for EVIDENCE that a download actually started, then skip the agent.
+        #
+        # The Playwright `download` event is NOT that evidence on its own. It has
+        # never once reached us from NotebookLM — 2026-08-09 and again on 08-10, both
+        # logged "the download event never reached us" while the file sat complete in
+        # Playwright's artifacts directory. Gating the skip on the event therefore
+        # guarantees the agent runs after a perfectly good DOM click, which is the
+        # second half of how one run produced two files.
+        #
+        # So the test is the event OR a settled file on disk — the same two channels
+        # the capture below already uses. `_is_settled` matters: a file still growing
+        # is a download in flight, and treating it as done is how the fallback moves
+        # a partial file out from under Chrome.
         _dl_seen = False
         if _dl_via_dom:
-            try:
-                await asyncio.wait_for(asyncio.shield(download_future), timeout=8)
-                _dl_seen = download_future.done() and download_future.result() is not None
-                if _dl_seen:
-                    log("[Phase3] audio downloaded by the DOM rung — not running the visual agent")
-            except asyncio.TimeoutError:
-                log("[dom] p3 notebooklm.download_audio: clicked but no download event "
-                    "in 8s — falling through to the visual agent", "WARN")
-            except Exception:
-                pass
+            _dl_deadline = time.time() + 25
+            while time.time() < _dl_deadline:
+                if download_future.done() and download_future.result() is not None:
+                    _dl_seen = True
+                    break
+                try:
+                    _cand, _, _ = _find_recent_audio(_audio_search_plan(browser))
+                    if _cand is not None and _is_settled(_cand):
+                        _dl_seen = True
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(1.5)
+            if _dl_seen:
+                log("[Phase3] audio downloaded by the DOM rung — not running the visual agent")
+            else:
+                log("[dom] p3 notebooklm.download_audio: clicked but no file appeared "
+                    "in 25s — falling through to the visual agent", "WARN")
 
         _stop_d, _task_d = start_narration_ticker(
             3, "notebooklm",
