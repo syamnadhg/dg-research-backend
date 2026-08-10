@@ -179,10 +179,23 @@ class TestTheUsersDownloadsAreNotOursToTake:
             assert age <= 120, "keep the human folder's window tight"
 
     def test_the_call_site_copies_when_it_may_not_move(self):
+        """Anchored on the RECOVERY call site, not on the first `_find_recent_audio(`
+        in the function.
+
+        This used to take the first occurrence and slice a fixed 1400-char window.
+        A second, earlier call was later added — the DOM rung waits for a file to
+        appear before deciding whether the visual agent is still needed — and the
+        window then landed on that detection loop, which has no copy/move at all.
+        The property below was still true; only the locator had rotted. So find the
+        site by what makes it the recovery site: it is the one that assigns
+        `audio_path`.
+        """
         src = inspect.getsource(research.run_phase3_audio)
-        i = src.index("_find_recent_audio(")
-        block = src[i:i + 1400]
-        assert "if _may_move:" in block and "shutil.copy2" in block
+        i = src.index("_found, _ext, _may_move = _find_recent_audio(")
+        block = src[i:src.index("audio_path = dest", i) + 200]
+        assert "if _may_move:" in block, block[:400]
+        assert "shutil.copy2" in block, block[:400]
+        assert "shutil.move" in block, "the artifacts dir is still ours to move from"
 
     def test_the_call_site_refuses_an_unsettled_file(self):
         src = inspect.getsource(research.run_phase3_audio)
@@ -212,6 +225,7 @@ class TestTheFallbackLooksWherePlaywrightPuts_It:
         assert "_audio_search_plan(browser)" in src
         assert "_find_recent_audio(" in src
 
+
     def test_no_extension_glob_survives_on_that_path(self):
         src = inspect.getsource(research.run_phase3_audio)
         i = src.index("Download event not received")
@@ -222,10 +236,20 @@ class TestTheFallbackLooksWherePlaywrightPuts_It:
             )
 
     def test_the_destination_gains_the_sniffed_extension(self):
+        """Anchored on the RECOVERY call site — the one that assigns `audio_path` —
+        rather than on the first `_find_recent_audio(` plus a 700-char window.
+
+        A second, earlier call was later added (the DOM rung waits for a file to
+        appear before deciding whether the visual agent is still needed), and the
+        window then landed on that detection loop, which names no destination. The
+        property is unchanged: a GUID-named, extensionless artifact has to arrive
+        carrying the extension its BYTES earned, or ffmpeg cannot read it.
+        """
         src = inspect.getsource(research.run_phase3_audio)
-        i = src.index("_find_recent_audio(")
-        block = src[i:i + 700]
-        assert "_found.suffix" in block and "_ext" in block
+        i = src.index("_found, _ext, _may_move = _find_recent_audio(")
+        block = src[i:src.index("audio_path = dest", i) + 200]
+        assert "_found.suffix" in block, block[:400]
+        assert "_found.name + _ext" in block, block[:400]
 
 
 class TestTheWaitCanHearARetry:
