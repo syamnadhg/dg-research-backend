@@ -525,3 +525,33 @@ def test_the_probe_loop_is_bounded_in_the_source():
     src = WAITER[WAITER.index("def _kill_tree"):]
     src = src[:src.index("\n_note(")] if "\n_note(" in src else src
     assert "time.time() + 10.0" in src, src[-600:]
+
+
+def test_the_probe_loop_does_not_BUSY_SPIN_while_it_waits():
+    """It sleeps between probes. Without that it is a tight loop on `killpg`,
+    burning a core for up to the whole deadline — on a machine already loaded
+    enough that the descendants have not been reaped yet, which is the only
+    situation this loop ever runs in.
+
+    Measured, not read: the group here empties after a WALL-CLOCK delay rather
+    than after a fixed number of calls, so the probe count is a direct reading of
+    how often the loop asks. Paced at 0.1s that is a handful; spinning, it is
+    tens of thousands — and a source assertion for a `sleep` would pass on a loop
+    that slept in the wrong place."""
+    stub = _OsStub(killpg_error=ProcessLookupError(), own_pgid=4242)
+    calls = {"n": 0}
+    empty_at = time.time() + 0.35
+
+    def _killpg(pgid, sig):
+        if sig == 0:
+            calls["n"] += 1
+            if time.time() < empty_at:
+                return None
+            raise ProcessLookupError()
+        return None
+
+    stub.killpg = _killpg
+    assert _kill_tree_from_waiter(stub)(_Reaped(9999), 5555) is True
+    assert 2 <= calls["n"] < 50, (
+        f"probed {calls['n']} times in ~0.35s — the loop is spinning, not pacing"
+    )
