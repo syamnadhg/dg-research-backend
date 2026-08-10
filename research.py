@@ -27415,9 +27415,14 @@ async def _page_is_dead(page):
         url = (page.url or "").strip()
     except Exception:
         return "the tab has no address"
-    # `about:blank` is the shape the live failure took. Treat any non-http surface
-    # the same way: a research agent's answer never lives on one.
-    if not url or url.startswith("about:") or url.startswith("chrome-error"):
+    # `about:blank` is the shape the live failure took. Any non-http surface gets
+    # the same answer: a research agent's answer never lives on one, and every
+    # platform this polls is https. Written as "must be http(s)" rather than as a
+    # list of bad prefixes because the list was the bug in miniature — it named
+    # `about:` and `chrome-error` and silently passed `chrome://`, `file://`,
+    # `data:` and `blob:`, each of which is just as dead and none of which anyone
+    # would think to add until it appeared in a log.
+    if not url or not url.startswith(("http://", "https://")):
         return f"the tab is at {url or 'no address'}"
     try:
         if not await page.evaluate("() => !!(document && document.body)"):
@@ -46719,40 +46724,42 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             log(f"[dom] p3 notebooklm.download_audio: errored "
                 f"({type(_dl_dom_err).__name__}) — CUA will drive it", "WARN")
 
-        # A DOM click lands immediately; give the event a short window before
-        # paying for a vision agent. Bounded low on purpose — this is the happy
-        # path, and 8s of waiting is cheaper than 8 CUA iterations.
+        # ── did the click actually download something? ──
         #
-        # This must NOT return early. Everything after the download block still has
-        # to run — the mp3 transcode, the panel cleanup, and the share-link extract
-        # that the podcast delivery depends on. An early return here would trade a
-        # missing file for a missing link, which is the same outage wearing a
-        # different message. So it only records that the click landed, and the
-        # existing 30s wait below collects the event either way.
-        # Wait for EVIDENCE that a download actually started, then skip the agent.
-        #
-        # The Playwright `download` event is NOT that evidence on its own. It has
-        # never once reached us from NotebookLM — 2026-08-09 and again on 08-10, both
-        # logged "the download event never reached us" while the file sat complete in
-        # Playwright's artifacts directory. Gating the skip on the event therefore
-        # guarantees the agent runs after a perfectly good DOM click, which is the
-        # second half of how one run produced two files.
+        # Wait for EVIDENCE, then skip the vision agent. The Playwright `download`
+        # event is NOT that evidence on its own: it has never once reached us from
+        # NotebookLM — 2026-08-09 and again on 08-10, both logged its absence while
+        # the finished file sat in Playwright's artifacts directory. Gating the skip
+        # on the event alone therefore guarantees the agent runs after a perfectly
+        # good DOM click, which is the second half of how one run produced two files.
         #
         # So the test is the event OR a settled file on disk — the same two channels
-        # the capture below already uses. `_is_settled` matters: a file still growing
-        # is a download in flight, and treating it as done is how the fallback moves
-        # a partial file out from under Chrome.
+        # the collection step below already uses. `_is_settled` is load-bearing: a
+        # file still growing is a download in flight, and calling it done is how the
+        # fallback moves a partial file out from under Chrome.
+        #
+        # This does NOT return early, whatever it finds. Everything past the download
+        # block still has to run — the mp3 transcode, the panel cleanup, and the
+        # share-link extract the podcast delivery depends on. An early return here
+        # would trade a missing file for a missing link: the same outage wearing a
+        # different message.
+        #
+        # WHICH channel answered is kept, not just whether one did. The collection
+        # step waits on the download event, and the event is the one that never
+        # comes — so on the happy path that wait is a guaranteed 30 seconds of
+        # nothing, after we have already held the finished file in our hand.
         _dl_seen = False
+        _dl_evidence = ""
         if _dl_via_dom:
             _dl_deadline = time.time() + 25
             while time.time() < _dl_deadline:
                 if download_future.done() and download_future.result() is not None:
-                    _dl_seen = True
+                    _dl_seen, _dl_evidence = True, "event"
                     break
                 try:
                     _cand, _, _ = _find_recent_audio(_audio_search_plan(browser))
                     if _cand is not None and _is_settled(_cand):
-                        _dl_seen = True
+                        _dl_seen, _dl_evidence = True, "file"
                         break
                 except Exception:
                     pass
@@ -46812,9 +46819,18 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         finally:
             await stop_narration_ticker(_stop_d, _task_d)
 
-        # Wait up to 30s for download event
+        # Wait for the download event — unless a settled file on disk has already
+        # answered the same question. NotebookLM has never delivered this event
+        # (08-09 and 08-10 both logged its absence beside a complete file), so
+        # waiting the full 30s on the one path where we KNOW the download finished
+        # is 30s of dead time on every healthy run. Not zero: the event may still
+        # be a tick behind the file, and if it lands, `audio_path` comes straight
+        # from Playwright with no scan at all. When it doesn't, the timeout falls
+        # into the very same scan that would have run at 30s, having found the same
+        # file — the fallback below is unchanged and still owns every other path.
+        _dl_wait_s = 0.5 if _dl_evidence == "file" else 30
         try:
-            audio_path = await asyncio.wait_for(download_future, timeout=30)
+            audio_path = await asyncio.wait_for(download_future, timeout=_dl_wait_s)
             # Track-B success-path observe (P3 audio download). Page still alive here
             # (before the download-listener teardown). Post-download screenshot, so
             # action agreement is noisier — boolean ground-truth, action-only scoring.

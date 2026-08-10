@@ -307,3 +307,75 @@ def test_a_missed_click_still_reaches_the_visual_agent():
     assert "falling through to the visual agent" in wait
     # `_dl_seen` starts False and is only ever set on evidence.
     assert wait.lstrip().startswith("_dl_seen = False"), wait[:80]
+
+
+# ── the 30s the happy path was still paying (self-review, 2026-08-10) ────────
+
+def _collect_block() -> str:
+    """The download-event collection step, after the vision agent."""
+    start = SRC.index("        _dl_wait_s = ")
+    return SRC[start:SRC.index("        except asyncio.TimeoutError", start)]
+
+
+def _evidence_block() -> str:
+    """The evidence wait that decides whether the vision agent runs."""
+    block = _download_block()
+    return block[block.index("_dl_seen = False"):
+                 block.index("_stop_d, _task_d = start_narration_ticker")]
+
+
+def test_the_evidence_CHANNEL_is_recorded_not_just_that_there_was_evidence():
+    """Knowing a file exists is not the same as knowing the event fired, and the
+    step below waits on the event. Collapsing both into one boolean is what made
+    the wait unavoidable."""
+    wait = _evidence_block()
+    assert '_dl_evidence = True, "event"' in wait.replace("_dl_seen, ", ""), wait
+    assert '_dl_evidence = True, "file"' in wait.replace("_dl_seen, ", ""), wait
+
+
+def test_a_file_already_on_disk_does_not_buy_a_30_second_wait_for_an_event():
+    """THE finding. NotebookLM has never sent the download event — the comment in
+    research.py records its absence on 08-09 and again on 08-10 — so once a
+    settled file has been found, `wait_for(download_future, 30)` is thirty
+    seconds of certain nothing on every healthy run, after the file is already
+    in hand. It then times out into a scan that finds the file we already found.
+    """
+    block = _collect_block()
+    assert '_dl_wait_s = 0.5 if _dl_evidence == "file" else 30' in block, block
+    assert "timeout=_dl_wait_s" in block, (
+        "the computed wait has to be the one actually used"
+    )
+
+
+def test_the_wait_is_not_zero_even_when_the_file_is_found():
+    """A real short wait, not a skip. The event can be a tick behind the file,
+    and if it lands `audio_path` comes straight from Playwright with no scan at
+    all — so the cheap path is still reachable."""
+    block = _collect_block()
+    assert "0.5" in block and "timeout=0" not in block, block
+
+
+def test_every_other_path_still_waits_the_full_30_seconds():
+    """Polarity, and the half a one-sided test would miss. When the DOM rung
+    missed and the vision agent drove the download, nothing has proved a file
+    exists — shortening the wait there would race the agent's own download and
+    turn a working path into a scan-only one."""
+    block = _collect_block()
+    assert "else 30" in block, block
+    assert '_dl_evidence = ""' in _evidence_block(), (
+        "the default must be the empty channel, so a run with no DOM rung "
+        "cannot fall into the shortened wait"
+    )
+
+
+def test_the_fallback_scan_is_unchanged_and_still_owns_the_miss():
+    """The shortened wait is only safe because it lands in the SAME fallback that
+    ran at 30s. If the timeout branch stopped scanning, this would trade 30s for
+    a lost podcast."""
+    # Anchored FROM the shortened wait, not from the first `except
+    # asyncio.TimeoutError` in the file — there is an unrelated one in phase 1,
+    # and matching it read a completely different function.
+    at = SRC.index("        _dl_wait_s = ")
+    after = SRC[SRC.index("        except asyncio.TimeoutError", at):][:4000]
+    assert "_find_recent_audio(_audio_search_plan(browser))" in after, after[:400]
+    assert "_is_settled(" in after, "a partial file must still be left alone"

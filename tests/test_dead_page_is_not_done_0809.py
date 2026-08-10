@@ -103,6 +103,16 @@ def test_the_reason_names_what_is_wrong_rather_than_just_failing():
     (_Page(url="about:srcdoc"), "another about: surface"),
     (_Page(url="chrome-error://chromewebdata/"), "a navigation error page"),
     (_Page(body=False), "a document with no body"),
+    # ⭐ 2026-08-10 (self-review). The first version listed the bad prefixes —
+    # `about:` and `chrome-error` — and let every other non-http surface through
+    # while its own docstring promised "any non-http surface". These five are the
+    # ones the list silently passed. It is the same defect the check exists to
+    # fix, one level up: an enumeration of the failures somebody had already seen.
+    (_Page(url="chrome://new-tab-page"), "an internal chrome page"),
+    (_Page(url="file:///Users/x/tmp.html"), "a local file"),
+    (_Page(url="data:text/html,<p>x"), "a data URL"),
+    (_Page(url="blob:https://chatgpt.com/abc-123"), "a blob URL"),
+    (_Page(url="view-source:https://chatgpt.com/c/abc"), "a view-source surface"),
 ])
 def test_every_shape_of_gone_is_refused(page, what):
     assert _dead(page) is not None, what
@@ -139,6 +149,19 @@ def test_a_live_page_is_not_refused(url):
 
 def test_a_live_page_is_not_refused_merely_for_a_long_url_or_query():
     assert _dead(_Page(url="https://chatgpt.com/c/abc?utm_source=x#frag")) is None
+
+
+def test_the_rule_is_MUST_BE_HTTP_not_a_list_of_known_bad_prefixes():
+    """The polarity that keeps the broadened check honest.
+
+    Written as "must be http(s)" the guard is closed by construction: a surface
+    nobody has thought of yet is refused, because it is not an answer page. Any
+    future edit back toward a prefix list re-opens exactly the hole above, and
+    this is the pair that says so — an unknown scheme is dead, and plain http is
+    not (the local bridge and the emulator both serve it)."""
+    assert _dead(_Page(url="wss://example.invalid/socket")) is not None
+    assert _dead(_Page(url="devtools://devtools/bundled/x.html")) is not None
+    assert _dead(_Page(url="http://localhost:8765/x")) is None
 
 
 # ── the guard is actually WIRED into the completion path ────────────────────
