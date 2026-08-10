@@ -52474,6 +52474,103 @@ async def _reconcile_dead_worker_runs(tree_uid: str, dead_ids: "set[int]") -> in
     return marked
 
 
+# How long a graceful shutdown gets after a stop signal before it is forced.
+# Long enough for uvicorn to drain and the pipeline to emit its stopped event,
+# short enough that nobody reaches for `kill -9` and orphans a browser.
+_STOP_GRACE_S = 8.0
+
+# Which stop signal arrived, if any — read after the server loop returns so the
+# conventional 128+signum exit code survives the graceful path.
+_server_stop_signal = {"n": None}
+
+
+async def _arm_stop_signals(server, port):
+    """Make Ctrl+C stop the server, say so, and never hang.
+
+    ⭐ 2026-08-10. The banner has always promised "Stop: Ctrl+C" and the code
+    relied entirely on uvicorn's own handler to deliver it. On the owner's machine
+    that promise failed repeatedly — Ctrl+C did nothing, and neither did a direct
+    SIGINT — while the identical build honoured a real Ctrl+C in every environment
+    it could be reproduced in (both under a controlling tty and without one, with
+    and without the logging pipeline, on this build and on the one before it).
+
+    The cause was never found. What WAS established is that the failure is silent:
+    nothing anywhere printed a single line when the signal was sent, so there was
+    no way to tell "the signal never arrived" from "it arrived and something
+    swallowed it". A stop path with no evidence is unfixable by anyone, which is
+    why this exists whether or not it turns out to be the cure.
+
+    Three things, in order of how much they matter:
+
+    1. It LOGS on arrival, before doing anything else. That single line settles the
+       question the next time this happens.
+    2. It sets the same flag uvicorn's handler sets, so the ordinary graceful
+       shutdown still runs and nothing about the existing path changes.
+    3. It backstops. If the graceful shutdown has not finished within
+       `_STOP_GRACE_S`, the process is reaped and exited through the same helper
+       the Stop button uses — which kills the patchright driver and Chromium
+       first, so a forced stop cannot leave the orphans that hold the profile
+       lock. A second Ctrl+C skips the wait entirely, which is what everyone
+       expects a second press to do.
+
+    Installed AFTER uvicorn is serving, deliberately: uvicorn assigns its handlers
+    when `serve()` begins, so anything installed earlier is simply overwritten.
+    Waiting on `server.started` makes that ordering deterministic rather than a
+    sleep-and-hope."""
+    import signal as _sig
+    import threading as _th
+
+    for _ in range(2400):                      # ~120s ceiling; startup is ~2s
+        if getattr(server, "started", False):
+            break
+        await asyncio.sleep(0.05)
+
+    _pressed = {"n": 0}
+
+    def _on_stop(signum, _frame):
+        _pressed["n"] += 1
+        # Remember WHICH signal, so the process can still exit 128+signum below.
+        # Letting uvicorn's own handler run used to yield 130 on Ctrl+C; handling
+        # it here made the shutdown graceful and the exit code 0, which is a
+        # different statement to anything watching (a supervisor keyed on
+        # SuccessfulExit reads 0 as "it meant to stop"). Behaviour that was not
+        # asked to change does not change.
+        _server_stop_signal["n"] = signum
+        try:
+            name = _sig.Signals(signum).name
+        except Exception:
+            name = str(signum)
+        if _pressed["n"] >= 2:
+            log(f"[serve] {name} again — exiting now", "WARN")
+            _schedule_server_exit(f"signal-{name}-immediate", delay_sec=0)
+            return
+        log(f"[serve] stop requested ({name}) — shutting down", "INFO")
+        server.should_exit = True
+        # Daemon thread: this runs INSIDE a signal handler, where doing real work
+        # is how you deadlock. It only waits and then calls the same exit helper
+        # the Stop button uses.
+        def _backstop():
+            for _ in range(int(_STOP_GRACE_S * 10)):
+                if getattr(server, "force_exit", False) or _pressed["n"] >= 2:
+                    return
+                time.sleep(0.1)
+            log(f"[serve] graceful shutdown did not finish in {_STOP_GRACE_S:.0f}s "
+                f"— forcing exit", "WARN")
+            _schedule_server_exit(f"signal-{name}-forced", delay_sec=0)
+        _th.Thread(target=_backstop, daemon=True,
+                   name="serve-stop-backstop").start()
+
+    installed = []
+    for _s in (_sig.SIGINT, _sig.SIGTERM):
+        try:
+            _sig.signal(_s, _on_stop)
+            installed.append(_sig.Signals(_s).name)
+        except Exception as _se:                # non-main thread, or a platform
+            log(f"[serve] could not arm {_s}: {_se}", "DEBUG")
+    if installed:
+        log(f"[serve] stop signals armed ({', '.join(installed)}) on :{port}", "DEBUG")
+
+
 async def run_server(port=8000):
     """Start FastAPI server for real-time web app streaming."""
     from fastapi import FastAPI
@@ -54901,6 +54998,9 @@ async def run_server(port=8000):
     config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info",
                             log_config=_uvicorn_log_config())
     server = uvicorn.Server(config)
+    # Ctrl+C is the only stop this screen advertises; it does not get to be
+    # best-effort. See `_arm_stop_signals`.
+    _stop_arm_task = asyncio.create_task(_arm_stop_signals(server, port))
     try:
         await server.serve()
     except OSError as _bind_err:
@@ -54921,7 +55021,16 @@ async def run_server(port=8000):
             print(f"  {_c(_WARN, '⚠')}  Port {port} was taken at bind time — not started.")
             raise SystemExit(3) from _bind_err
         raise
+    else:
+        # Graceful stop via a signal: keep the conventional exit code (130 for
+        # Ctrl+C, 143 for SIGTERM). uvicorn's own handler produced 130 before
+        # this path existed, and a supervisor may key on it.
+        _sig_n = _server_stop_signal.get("n")
+        if _sig_n:
+            log(f"[serve] stopped by signal {_sig_n} — exiting {128 + _sig_n}", "DEBUG")
+            raise SystemExit(128 + _sig_n)
     finally:
+        _stop_arm_task.cancel()
         worker_task.cancel()
         if heartbeat_task:
             heartbeat_task.cancel()
