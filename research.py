@@ -52666,6 +52666,89 @@ _STOP_GRACE_S = 8.0
 # conventional 128+signum exit code survives the graceful path.
 _server_stop_signal = {"n": None}
 
+# How often the stop handlers are re-asserted, for as long as the server runs.
+#
+# ⭐ 2026-08-11. Installing them once is not enough. A live serve that had been
+# up for four hours and had finished a run was measured in both directions: a
+# direct SIGTERM logged, drained and exited in ~3s, while a direct SIGINT to the
+# same process did nothing at all — no line, no shutdown, still answering HTTP on
+# its port two milliseconds later. Same handler, same install, same loop. So the
+# handler was never wrong; SIGINT's DISPOSITION had been reset out from under it
+# somewhere in the run, and it stayed reset for the rest of the process's life.
+#
+# Nothing in this repo, and nothing in any of its Python dependencies, sets
+# SIGINT to SIG_IGN — so whatever does it is native and cannot be reached from
+# here. Re-asserting is what keeps the banner's "Stop: Ctrl+C" true regardless.
+# It does not cure the cause; it bounds the damage to one period, and the drift
+# line it prints is what will finally name the culprit.
+_STOP_REARM_S = 5.0
+
+
+def _stop_handler_description(sig_mod, current) -> str:
+    """Name whatever `getsignal` handed back, for the drift log line.
+
+    The entire value of that line is naming the culprit the next time this
+    happens, so the cases have to stay distinguishable: "being discarded" and
+    "back to the OS default" are different bugs with different suspects.
+
+    ⭐ `None` is the interesting one. `signal.getsignal` returns it when the
+    disposition was set from OUTSIDE Python — i.e. by native code — which is
+    precisely the shape of the failure this was written for."""
+    _absent = object()          # never equal to `current`, so a signal module
+                                # missing one of these can't match by accident
+    if current is getattr(sig_mod, "SIG_IGN", _absent):
+        return "SIG_IGN — the signal was being discarded"
+    if current is getattr(sig_mod, "SIG_DFL", _absent):
+        return "SIG_DFL — back to the OS default"
+    if current is getattr(sig_mod, "default_int_handler", _absent):
+        return "default_int_handler — Python's own"
+    if current is None:
+        return "not set from Python — installed by native code"
+    return getattr(current, "__qualname__", None) or repr(current)
+
+
+def _assert_stop_handlers(sig_mod, signums, handler, reported, announce=True):
+    """(Re-)install `handler` for each of `signums`; say so if it had drifted.
+
+    ⭐ The install is UNCONDITIONAL, and that is the fix. `getsignal` reports
+    Python's own RECORD of the handler, and when the disposition is changed
+    below that record the record still reads as ours — that is what a `None`
+    return means. So a check-then-install sees "already correct", repairs
+    nothing, and leaves Ctrl+C dead. The comparison here only decides whether
+    to LOG; the install happens either way.
+
+    `reported` carries the once-per-signal guard between calls, so a permanent
+    drift costs one line rather than one every few seconds. `announce` is off
+    for the first install, where the handler being someone else's is not drift
+    — it is uvicorn's, exactly as expected.
+
+    Returns the names actually installed."""
+    installed = []
+    for _s in signums:
+        try:
+            name = sig_mod.Signals(_s).name
+        except Exception:
+            name = str(_s)
+        try:
+            current = sig_mod.getsignal(_s)
+        except Exception:
+            current = None
+        if announce and current is not handler and ("drift", _s) not in reported:
+            reported.add(("drift", _s))
+            log(f"[serve] {name} was no longer ours "
+                f"({_stop_handler_description(sig_mod, current)}) — restoring it. "
+                f"Stop was being ignored until now.", "WARN")
+        try:
+            sig_mod.signal(_s, handler)
+            installed.append(name)
+        except Exception as _se:            # non-main thread, or a platform
+            if ("fail", _s) not in reported:
+                reported.add(("fail", _s))
+                # ⚠ WARN, not DEBUG. This being a whisper is why the failure
+                # survived three attempts: there was never a line to find.
+                log(f"[serve] could not arm {name}: {_se}", "WARN")
+    return installed
+
 
 async def _arm_stop_signals(server, port):
     """Make Ctrl+C stop the server, say so, and never hang.
@@ -52683,7 +52766,19 @@ async def _arm_stop_signals(server, port):
     swallowed it". A stop path with no evidence is unfixable by anyone, which is
     why this exists whether or not it turns out to be the cure.
 
-    Three things, in order of how much they matter:
+    ⭐ 2026-08-11 — THE CAUSE, MEASURED. The evidence line above did its job. A
+    serve that had been up four hours and had finished a run was probed in both
+    directions: SIGTERM logged, drained and exited in ~3s, and SIGINT to the same
+    process did nothing whatsoever — no line, no shutdown, still serving HTTP two
+    milliseconds later, and no backstop thread, so the handler had not run at all.
+    Identical handler, one install, one loop. That rules out the terminal (the
+    probe never touched it), delivery (unblocked and not pending) and uvicorn's
+    own handler (it never saw a stop either — the listening socket stayed open).
+    What is left is that SIGINT's DISPOSITION was reset during the run and stayed
+    reset. Nothing in this repo or its Python dependencies does that, so the
+    culprit is native and out of reach from here.
+
+    Four things now, in order of how much they matter:
 
     1. It LOGS on arrival, before doing anything else. That single line settles the
        question the next time this happens.
@@ -52695,6 +52790,11 @@ async def _arm_stop_signals(server, port):
        first, so a forced stop cannot leave the orphans that hold the profile
        lock. A second Ctrl+C skips the wait entirely, which is what everyone
        expects a second press to do.
+    4. It HOLDS. The handlers are re-asserted every `_STOP_REARM_S` for the life
+       of the server, unconditionally, and the first time one is found to have
+       drifted it says so and names what it drifted to. That is what makes the
+       banner's promise survive whatever the run does, and what will identify
+       the native caller doing it.
 
     Installed AFTER uvicorn is serving, deliberately: uvicorn assigns its handlers
     when `serve()` begins, so anything installed earlier is simply overwritten.
@@ -52743,15 +52843,27 @@ async def _arm_stop_signals(server, port):
         _th.Thread(target=_backstop, daemon=True,
                    name="serve-stop-backstop").start()
 
-    installed = []
-    for _s in (_sig.SIGINT, _sig.SIGTERM):
-        try:
-            _sig.signal(_s, _on_stop)
-            installed.append(_sig.Signals(_s).name)
-        except Exception as _se:                # non-main thread, or a platform
-            log(f"[serve] could not arm {_s}: {_se}", "DEBUG")
+    _signums = (_sig.SIGINT, _sig.SIGTERM)
+    _reported = set()
+    # First install: whatever is there now is uvicorn's, which is expected and
+    # not drift, so it is not announced.
+    installed = _assert_stop_handlers(_sig, _signums, _on_stop, _reported,
+                                      announce=False)
     if installed:
         log(f"[serve] stop signals armed ({', '.join(installed)}) on :{port}", "DEBUG")
+
+    # Then hold them, for the life of the server. See `_STOP_REARM_S`: one
+    # install was measured to be insufficient — SIGINT's disposition was reset
+    # underneath it mid-run and stayed reset.
+    #
+    # ⛔ `_on_stop` is built ONCE, above, and re-installed as the SAME object.
+    # Rebuilding it per pass would hand every re-assert a fresh `_pressed`
+    # counter, and a second Ctrl+C would never reach the immediate-exit branch —
+    # it would keep re-entering the graceful path that the second press exists
+    # to escape. Re-arming must restore the stop path, not reset its state.
+    while True:
+        await asyncio.sleep(_STOP_REARM_S)
+        _assert_stop_handlers(_sig, _signums, _on_stop, _reported)
 
 
 async def run_server(port=8000):

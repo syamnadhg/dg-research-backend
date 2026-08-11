@@ -167,7 +167,10 @@ def test_the_handlers_are_armed_AFTER_uvicorn_is_serving():
     body = _src_of("_arm_stop_signals")
     assert 'getattr(server, "started", False)' in body
     at = body.index('getattr(server, "started", False)')
-    armed = body.index("_sig.signal(_s, _on_stop)")
+    # 2026-08-11: the install moved into `_assert_stop_handlers` so it could be
+    # re-run on a timer and, more importantly, CALLED by a test. Anchor on the
+    # call, not on the `signal.signal(...)` line that no longer lives here.
+    armed = body.index("_assert_stop_handlers(")
     assert at < armed, "the wait must come before the install"
 
 
@@ -185,10 +188,15 @@ def test_both_stop_signals_are_armed():
 
 def test_arming_failure_is_survivable():
     """`signal.signal` raises off the main thread. A serve that refuses to start
-    because it could not arm a convenience is worse than one you stop with kill."""
-    body = _src_of("_arm_stop_signals")
-    at = body.index("_sig.signal(_s, _on_stop)")
-    assert "except Exception" in body[at - 200:at + 300]
+    because it could not arm a convenience is worse than one you stop with kill.
+
+    2026-08-11: the install moved into `_assert_stop_handlers`, so this reads the
+    helper now. The behaviour — including that the failure is a WARN rather than
+    the DEBUG whisper that hid it for three attempts — is asserted for real by
+    calling the function in test_serve_stop_rearm_0811.py."""
+    body = _src_of("_assert_stop_handlers")
+    at = body.index("sig_mod.signal(_s, handler)")
+    assert "except Exception" in body[at - 100:at + 300]
 
 
 def test_it_is_actually_wired_into_run_server():
