@@ -506,10 +506,25 @@ def test_the_bootstrap_install_is_forced(monkeypatch):
     )
 
 
-def test_ensure_durable_install_replaces_a_stale_durable_copy(tmp_path, monkeypatch):
-    """An older durable install is worse than none: pinning to it is how the bridge
-    "starts on an old version" even after the cache problem is solved. Remove it,
-    then install — the same clean-install rule the updater follows."""
+def test_ensure_durable_install_replaces_a_stale_durable_copy_without_removing_it_first(
+        tmp_path, monkeypatch):
+    """An older durable install is worse than none — pinning to it is how the bridge
+    "starts on an old version" even after the cache problem is solved. It still has
+    to be REPLACED rather than removed-then-replaced.
+
+    This test used to assert `["uninstall", "install"]`, and the review of this PR
+    was right to call that out. `--force` reinstalls in place, and pipx refuses to
+    delete a venv it did not create in the same session, so a failed `--force`
+    leaves the old install working. Uninstalling first throws that away: the
+    detached waiter's own rationale calls uninstall-first "the RECOVERY order, not
+    the clean one" and "the only order that can leave the host with no agent at
+    all", which is why `_do_upgrade` only reaches for it after `--force` has
+    already failed and `_fetchable()` has proved a replacement is obtainable.
+
+    The consequence was not hypothetical. On install failure `cli._pin_startup`
+    returns before `autostart.install()`, so the EXISTING pin survives pointing at
+    the venv that was just deleted — login regresses from starting an old bridge to
+    starting nothing at all."""
     from facade import selfupdate
     durable = iter([False, True])
     monkeypatch.setattr(selfupdate.autostart, "pin_target_is_durable",
@@ -518,7 +533,26 @@ def test_ensure_durable_install_replaces_a_stale_durable_copy(tmp_path, monkeypa
     seen = _pipx_recorder(monkeypatch, selfupdate)
     assert selfupdate.ensure_durable_install()[0] is True
     subs = [c[1] for c in seen]
-    assert subs == ["uninstall", "install"], f"not a clean replacement: {seen!r}"
+    assert subs == ["install"], f"nothing may be torn down first: {seen!r}"
+    assert "--force" in seen[0], (
+        f"without --force this is a no-op that reports success: {seen[0]!r}"
+    )
+
+
+def test_a_failed_install_leaves_the_existing_durable_copy_alone(tmp_path, monkeypatch):
+    """The whole point of the ordering. A stale-but-working bridge must survive a
+    transient index failure, because the startup pin still points at it."""
+    from facade import selfupdate
+    monkeypatch.setattr(selfupdate.autostart, "pin_target_is_durable", lambda: False)
+    monkeypatch.setattr(selfupdate.autostart, "durable_venv", lambda: tmp_path)
+    seen = _pipx_recorder(monkeypatch, selfupdate, rc=1,
+                          err="ERROR: Could not find a version that satisfies")
+    ok, reason = selfupdate.ensure_durable_install()
+    assert ok is False
+    assert reason, "a failure has to carry pipx's reason to the user"
+    assert not any(c[1] == "uninstall" for c in seen), (
+        f"a failed install must not have destroyed the previous one: {seen!r}"
+    )
 
 
 def test_ensure_durable_install_reports_a_failed_install(monkeypatch):

@@ -273,6 +273,80 @@ class TestConsumePendingUpdateResult:
         serving_version(monkeypatch, None)
         assert research._consume_pending_update_result()["needsRestart"] is False
 
+    def test_an_unknown_pypi_latest_still_asks_for_the_restart_it_owes(self, tmp_path,
+                                                                       monkeypatch):
+        """The gap the review of this PR found, and it is the ORDINARY state on the
+        CLI update path rather than an edge case.
+
+        `_perform_self_update` proceeds when `_latest_on_pypi()` returns None —
+        deliberately, so an unreachable index does not strand the update — and the
+        waiter then writes `latest: ""`. `force=True` makes None easy to get: it
+        bypasses the cache READ and does not fall back to the cached value when the
+        fetch misses its timeout. Both version comparisons here used to require a
+        non-empty `latest`, so an empty one skipped them both and fell through to a
+        payload that published the served version as `current`, the on-disk version
+        as `latest`, and needsRestart False — reporting the drift and denying it at
+        the same time.
+
+        What the user saw was a false success, not a degraded one. The heartbeat
+        publishes the DISK version, the app drops an outcome whose `latest` equals
+        that published version, and the About row latched "Updated ✓" while the
+        machine served the old build. The fallback Restart control renders on this
+        verdict alone, so there was no in-app way back.
+
+        And on `superresearch --update` the restart leg does not have to fail for
+        this to happen: the spawner frees the venv, the supervisor relaunches a
+        worker before pipx has run, and that worker boots the old build — the state
+        `test_a_live_waiter_is_left_alone` already calls routine."""
+        self._write(tmp_path, monkeypatch, {
+            "action": "upgrade", "rc": 0, "current": "0.1.9", "latest": ""})
+        monkeypatch.setattr(research, "_sr_version", lambda: "0.1.10")
+        serving_version(monkeypatch, "0.1.9")
+        out = research._consume_pending_update_result()
+        assert out["needsRestart"] is True, out
+        # The version on disk is what pipx just installed, so it is the honest
+        # target to name — publishing the served version as `latest` is what let the
+        # app conclude there was nothing left to do.
+        assert out["latest"] == "0.1.10", out
+        assert out["current"] == "0.1.9", out
+
+    def test_an_unknown_latest_that_already_matches_is_still_a_success(self, tmp_path,
+                                                                      monkeypatch):
+        """The over-correction guard. Treating an empty `latest` as "always restart"
+        would put a Restart prompt on screen after every successful CLI update on a
+        host that could not reach the index — the machine is already serving the new
+        build and there is nothing owed."""
+        self._write(tmp_path, monkeypatch, {
+            "action": "upgrade", "rc": 0, "current": "0.1.9", "latest": ""})
+        monkeypatch.setattr(research, "_sr_version", lambda: "0.1.10")
+        serving_version(monkeypatch, "0.1.10")
+        out = research._consume_pending_update_result()
+        assert out["needsRestart"] is False, out
+        assert out["reason"] == "", out
+
+    def test_an_unknown_latest_that_already_matches_reports_at_once(self, tmp_path,
+                                                                    monkeypatch):
+        """Why the SUCCESS comparison had to move off `latest` too, not just the
+        drift one — a mutation pass caught this, the two-comparison fix alone did
+        not cover it.
+
+        The success return sits ABOVE the restart settle window. Leave it gated on a
+        known `latest` and an offline update whose restart DID complete falls past it
+        into the window, which sees `restarting` and returns None — so the outcome
+        the user is waiting on is withheld for the length of the window even though
+        the machine is already serving the new build and there is nothing left to
+        say. Everything about that state is known at this point; making it wait is
+        the same "reported nothing" shape this whole verdict exists to remove."""
+        self._write(tmp_path, monkeypatch, {
+            "action": "upgrade", "rc": 0, "current": "0.1.9", "latest": "",
+            "restarting": True, "at": int(time.time() * 1000)})
+        monkeypatch.setattr(research, "_sr_version", lambda: "0.1.10")
+        serving_version(monkeypatch, "0.1.10")
+        out = research._consume_pending_update_result()
+        assert out is not None, "a finished restart was withheld for the settle window"
+        assert out["needsRestart"] is False, out
+        assert out["latest"] == "0.1.10", out
+
     def test_reading_does_NOT_delete_so_a_failed_publish_can_retry(self, tmp_path, monkeypatch):
         """The sentinel is the ONLY copy of the outcome. Deleting it on read meant a
         single Firestore hiccup lost the answer forever — the exact thing this feature

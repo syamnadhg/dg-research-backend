@@ -459,32 +459,37 @@ def ensure_durable_install() -> "tuple[bool, str]":
     check belongs at: gating HERE would not help, since the caller only reaches
     this function when the pin target already failed the durability test.
 
-    The install is CLEAN, not layered: any existing durable venv is removed first,
-    so what the launcher points at is exactly this release. Safe to remove first
-    here in a way it is not in the detached updater — this runs in the FOREGROUND
-    with the user watching, and if it fails nothing has been torn down except an
-    install that was already too old to pin to.
-
     `--force` on the install, and it is not belt-and-braces. Measured against
     real pipx: `pipx install <spec>` over a venv that still exists prints
-    "already seems to be installed" and EXITS 0 — so if the uninstall above was
-    the one that failed (a Windows file lock on a supervisor-relaunched bridge is
-    the realistic cause), a plain install would report success having changed
-    nothing, and we would pin the stale copy while telling the user we replaced
-    it. `--force` reinstalls in place instead, and pipx refuses to delete a venv
-    it did not create in the same session, so a failure leaves the old install
-    working rather than leaving the host with none."""
+    "already seems to be installed" and EXITS 0 — so a plain install would report
+    success having changed nothing, and we would pin the stale copy while telling
+    the user we replaced it. `--force` reinstalls in place instead, and pipx
+    refuses to delete a venv it did not create in the same session, so a failure
+    leaves the old install working rather than leaving the host with none.
+
+    ⛔ THERE IS NO UNINSTALL FIRST, and the reason is written out in the detached
+    waiter a few hundred lines up: uninstall-first "is the RECOVERY order, not the
+    clean one", and "the only order that can leave the host with no agent at all".
+    `_do_upgrade` therefore runs `--force` first and reaches for `uninstall` only
+    after `--force` has already failed AND `_fetchable()` has proved a replacement
+    is obtainable, with a floor-pinned rollback behind it. This function used to
+    uninstall unconditionally, two lines above a docstring crediting `--force`
+    with leaving the old install working — a property the uninstall voided. If the
+    install then failed, `cli._pin_startup` returns before `autostart.install()`,
+    so the EXISTING pin survives pointing at the venv just deleted, and login
+    regresses from starting an old bridge to starting nothing.
+
+    Not preflighting-and-restoring instead: that puts a `pipx run --no-cache`
+    resolve into the foreground connect path, which costs minutes and, per
+    `_fetchable`'s own note, leaks a run-cache entry per probe under the pip
+    backend. The only thing dropping the uninstall gives up is clearing an
+    obstruction `--force` cannot overwrite — a Windows file lock — and a lock
+    fails the uninstall too, so that recovery was always theoretical."""
     if autostart.pin_target_is_durable():
         return True, ""
     pipx = _pipx_cmd()
     if pipx is None:
         return False, "pipx not found"
-    if autostart.durable_venv() is not None:
-        try:
-            subprocess.run([*pipx, "uninstall", AGENT_PKG], capture_output=True,
-                           text=True, timeout=600)
-        except Exception:  # noqa: BLE001 - best-effort; the install below is what counts
-            pass
     try:
         r = subprocess.run([*pipx, "install", "--force", _agent_floor_spec()],
                            capture_output=True, text=True, timeout=600)

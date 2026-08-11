@@ -5695,9 +5695,28 @@ def _consume_pending_update_result() -> "dict | None":
         # fallback Restart button renders on this verdict alone, so it was dead
         # code too.
         served = _serving_version()
-        if want and served == want:
+        # `want` is what PyPI reported, and the waiter writes it EMPTY whenever
+        # `_latest_on_pypi()` returned None — which it does by design rather than
+        # strand the update, and which `force=True` makes easy to hit because it
+        # bypasses the cache read and does not fall back to the cached value when
+        # the fetch misses its timeout. Both comparisons below used to be gated on
+        # `want` being non-empty, so an unknown latest skipped them and fell
+        # through to a return that published the served version as `current`, the
+        # on-disk version as `latest`, and `needsRestart: False` — stating the
+        # drift and denying it in the same payload. The app then latched
+        # "Updated ✓" (its outcome helper drops a result whose latest equals the
+        # published device version, and the heartbeat publishes the DISK version),
+        # while the machine served the old build with no in-app way back: the
+        # fallback Restart control renders on this verdict alone.
+        #
+        # The version on disk IS what pipx just installed, so it is the honest
+        # target when PyPI could not be reached. Neither branch is gated on `want`
+        # any more; `served` being unknown still means no restart is owed, which is
+        # a separate pinned property.
+        target = want or running
+        if target and served == target:
             return {"state": "installed", "current": served,
-                    "latest": want, "needsRestart": False, "reason": ""}
+                    "latest": target, "needsRestart": False, "reason": ""}
         # The waiter cycles the supervisor AFTER writing this sentinel, so a read
         # landing in that window would see the old build and cry restart at a
         # restart already in progress. `restarting` records whether a cycle was
@@ -5710,21 +5729,23 @@ def _consume_pending_update_result() -> "dict | None":
         _settling = int(time.time() * 1000) - _rec_at(raw)
         if raw.get("restarting") and 0 <= _settling < _RESTART_SETTLE_MS:
             return None
-        if want and served and served != want:
+        if target and served and served != target:
             # ⭐ The evidence rides along HERE, not only on the failure path. This is
             # the confusing outcome the waiter's always-carry-the-tail change was
             # made for — pipx reported success while the version did not move — and
             # attaching it only to `state: failed` left exactly this case with
             # nothing to look at, so the change had no effect at all.
-            return {"state": "installed", "current": served, "latest": want,
+            return {"state": "installed", "current": served, "latest": target,
                     "needsRestart": True,
-                    "reason": f"v{want} is installed but the backend is still running "
+                    "reason": f"v{target} is installed but the backend is still running "
                               f"v{served} — restart it to finish",
                     **_update_diag_from(raw)}
         # No live marker to read (nothing serving yet, or a stale one): the files
-        # landed and we cannot say more than that.
+        # landed and we cannot say more than that. Reaching here with a KNOWN served
+        # version now means it agrees with the target — the drift case above owns
+        # the disagreement whether or not PyPI answered.
         return {"state": "installed", "current": served or running,
-                "latest": want or running, "needsRestart": False, "reason": ""}
+                "latest": target, "needsRestart": False, "reason": ""}
     # Nonzero exit — surface the real pipx error, not just "failed". The tail is what
     # names the actual cause (e.g. a uv backend that couldn't be resolved).
     tail = " ".join((raw.get("log_tail") or "").split())
