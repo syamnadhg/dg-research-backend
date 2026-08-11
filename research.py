@@ -5991,6 +5991,23 @@ def _handle_update_command(data: dict, device_id: str, loop) -> None:
          active run first (keeps partial results), mirroring hard_reset.
     Outcomes are written to `updateStatus` for the app; success is also observable
     via the heartbeat `version` bumping once the BE respawns on the new build."""
+    # ⭐ 2026-08-11 (review). CLEAR THE ONE-SHOT LATCH. The heartbeat sets
+    # `_update_result_published` on ABSENCE — "nothing to report, ever" — which is
+    # correct for a process that boots with no update in flight, and wrong the
+    # moment an update command arrives afterwards. The waiter then writes its
+    # result and the heartbeat never looks again, so the verdict is dropped by the
+    # very mechanism built to deliver it.
+    #
+    # This matters most in the case the feature exists for: when the restart leg
+    # fails, THIS process keeps serving, so there is no fresh boot to reset the
+    # latch and the app is left on "started" or its own timeout forever.
+    #
+    # An update command is a runtime event, so the latch is a per-attempt fact,
+    # not a per-process one. Reset it here, before any guard — a refused command
+    # writes an updateStatus too, and that write must not be suppressed either.
+    global _update_result_published
+    _update_result_published = False
+
     cur = _sr_version()
     # 1. Owner-only + read busy-state in one device-doc fetch.
     try:
@@ -6816,8 +6833,35 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                     log(f"[device-cmds] RESTART: device read failed ({_re}) — refusing",
                         "WARN")
                     continue
+                # ⭐ 2026-08-11 (review). This refused only when BOTH fields were
+                # present AND differed — so a command document with no
+                # `submittedBy` at all fell straight through and got its restart.
+                # That is the exact fail-open this guard was written to complain
+                # about two commits earlier: a check that degrades to "allow" when
+                # it cannot evaluate is not a check. Identity is now REQUIRED, and
+                # absence is refused with its own reason so the operator can tell
+                # "not the owner" from "no identity at all".
                 _rowner = _rdev.get("ownerUid")
-                if _rowner and data.get("submittedBy") and data["submittedBy"] != _rowner:
+                _rsub = data.get("submittedBy")
+                # `submittedBy` is REQUIRED. Every command the app writes carries
+                # it (`writeDeviceCommand` sets it unconditionally), so its absence
+                # means a document this backend has no business trusting.
+                if not _rsub:
+                    log("[device-cmds] RESTART: refusing — the command carries no "
+                        "submittedBy, so ownership cannot be checked", "WARN")
+                    _write_update_status(device_id, {
+                        "state": "failed", "current": _sr_version(), "latest": None,
+                        "reason": "could not verify device ownership"})
+                    continue
+                # ⚠ A MISSING `ownerUid` is deliberately still allowed, and the
+                # review's suggestion to refuse there is NOT taken. Owner-unlink
+                # DELETES that field — it is how a machine is handed on — so
+                # refusing would invent a new restriction on unlinked devices that
+                # nobody asked for, to protect an owner-only field that does not
+                # exist on those devices. The hole was the missing `submittedBy`,
+                # which is now closed; this half would have been a behaviour change
+                # dressed as a security fix.
+                if _rowner and _rsub != _rowner:
                     log("[device-cmds] RESTART: refusing — submittedBy is not the "
                         "device owner", "WARN")
                     _write_update_status(device_id, {
@@ -15162,7 +15206,25 @@ async def _set_nlm_public_and_get_link(page, label):
                 except Exception as _de:
                     log(f"[{label}] access diagnostic skipped "
                         f"({type(_de).__name__})", "DEBUG")
-                if _diag.get("already"):
+                # ⛔ 2026-08-11 (review). REQUIRE THE DIALOG. The diagnostic scopes
+                # its search to `dlg || document.body`, so with no
+                # sufficiently-sized dialog on screen it reads the WHOLE PAGE —
+                # and any stray "Anyone with the link" text anywhere on it
+                # promoted `already`, set access_set, and suppressed the CUA
+                # fallback. The result is a PRIVATE link handed to a recipient who
+                # gets "Request access", which is the one outcome this whole
+                # helper exists to prevent.
+                #
+                # This is the third time a document-wide fallback has done real
+                # damage here: the ChatGPT row search matched `.__menu-item`
+                # page-wide and pressed a sidebar link, and the panel-source
+                # filter substring-matched a whole URL. The diagnostic already
+                # reports `dialog`; nothing was reading it.
+                if _diag.get("already") and not _diag.get("dialog"):
+                    log(f"[{label}] access diagnostic saw 'Anyone with the link' "
+                        f"but NO share dialog was on screen — refusing to treat "
+                        f"the page as already public; the fallback will run", "WARN")
+                if _diag.get("already") and _diag.get("dialog"):
                     # ⭐ Finding the control already on target and not touching it
                     # is the BEST outcome, not a failure — the same rule the DOM
                     # ledger applies everywhere else. The access opener only fires
@@ -46015,6 +46077,15 @@ def _audio_search_plan(browser):
     out of somebody's Downloads because it happened to be recent and audio.
     """
     plan = [(p, True, 300, True) for p in _playwright_download_dirs(browser)]
+    # ⛔ 2026-08-11 (review). Temp artifact directories that are NOT this
+    # context's are still worth SCANNING — on a host where the context reports a
+    # directory we would otherwise never look at a sibling worker's, and the
+    # 08-09 outage was caused by not finding a file that existed. But they are
+    # emphatically not ours to MOVE from: the newer file there may be another
+    # run's podcast, mid-download, and `shutil.move` would take it. So: recurse,
+    # same window, may_move=False — which also keeps them under the strict
+    # content rule, since `_find_recent_audio` derives its trust from may_move.
+    plan += [(p, True, 300, False) for p in _playwright_foreign_artifact_dirs(browser)]
     plan += [(Path.home() / "Downloads", False, 120, False),
              (Path("D:/Downloads"), False, 120, False)]
     return plan
@@ -46034,9 +46105,55 @@ def _playwright_download_dirs(browser):
                 out.append(Path(str(_d)))
     except Exception:
         pass
+    # ⛔ 2026-08-11 (review). The temp-wide glob below returned EVERY
+    # `playwright-artifacts-*` directory on the host, and `_find_recent_audio`
+    # treats each as trusted AND movable — "this directory holds only what this
+    # run downloaded" is the entire basis for both. With two workers downloading
+    # on one host that is false: the newer file could belong to the other run,
+    # and `shutil.move` would take it out from under them. The trust half got
+    # worse on 08-10, when a missing ffprobe started accepting an unrecognised
+    # container purely on directory trust.
+    #
+    # So the context's OWN directories are authoritative when it reports any, and
+    # the glob is only a fallback for the case it does not. Even then the extra
+    # directories are handed back separately, so the caller can scan them without
+    # claiming they are ours to move.
+    # ⚠ Returns ONLY what the context reported — possibly nothing. An earlier
+    # draft fell back to the temp-wide glob here, which put the same directory in
+    # `_audio_search_plan` TWICE with contradictory may_move flags (movable from
+    # this helper, scan-only from the foreign one), so whether a file was copied
+    # or MOVED depended on list order. Foreign directories have exactly one route
+    # into the plan, and it is the scan-only one.
+    #
+    # The cost when the context reports nothing: a file found only in a temp
+    # artifacts directory is COPIED rather than moved. It is still found, which is
+    # the thing the 08-09 outage was about, and copying is the safe direction.
+    return out
+
+
+def _playwright_foreign_artifact_dirs(browser):
+    """Temp `playwright-artifacts-*` directories that are NOT this context's.
+
+    Kept separate from `_playwright_download_dirs` so the caller has to decide,
+    explicitly, whether a directory it does not own may be moved from. The answer
+    is always no.
+    """
+    own = set()
+    try:
+        _ctx = getattr(getattr(browser, "page", None), "context", None)
+        _impl = getattr(_ctx, "_impl_obj", None)
+        for attr in ("_download_dir", "_artifacts_dir"):
+            _d = getattr(_impl, attr, None)
+            if _d:
+                own.add(Path(str(_d)))
+    except Exception:
+        pass
+    out = []
     try:
         import tempfile as _tf
-        out.extend(Path(_tf.gettempdir()).glob("playwright-artifacts-*"))
+        for _d in Path(_tf.gettempdir()).glob("playwright-artifacts-*"):
+            if not any(_d == _o or _d in _o.parents for _o in own):
+                out.append(_d)
     except Exception:
         pass
     return out

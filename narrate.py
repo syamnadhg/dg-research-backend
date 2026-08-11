@@ -152,6 +152,20 @@ async def narrate_panel(
       1. cooldown -- never within MIN_GAP_S of the last call.
       2. budget   -- never more than PHASE_BUDGET per phase.
     """
+    # ⛔ 2026-08-11 (review). FIRST, before anything else. This check used to sit
+    # below the credential resolution, which imports research and does an
+    # env/Firestore lookup — so with the budget at its DEFAULT of zero, a narrator
+    # that is retired still paid for that work on every single call. A guard whose
+    # entire purpose is "do nothing" cannot live after the doing.
+    #
+    # Side effect, and an improvement: `skipped_budget` now counts the
+    # zero-budget case even when no key is configured. Previously the missing-key
+    # return fired first, so the budget — the actual reason the narrator is off —
+    # went unrecorded on exactly the machines where it was off for both reasons.
+    if PHASE_BUDGET <= 0:
+        _M.skipped_budget += 1
+        return None
+
     # Prefer the user's Account-page key (Firestore apiKeys.gemini) over
     # any env. Late import to dodge the research↔narrate cycle —
     # narrate is imported by research.py, so by the time
@@ -186,9 +200,6 @@ async def narrate_panel(
     # is never incremented, so `0 == 0` held on every call. A retired feature
     # must be silent, otherwise its noise gets read as a live fault — which is
     # exactly how these got mistaken for the text narrator's own budget.
-    if PHASE_BUDGET <= 0:
-        _M.skipped_budget += 1
-        return None
     if _M.calls_this_phase >= PHASE_BUDGET:
         _M.skipped_budget += 1
         if _M.calls_this_phase == PHASE_BUDGET:

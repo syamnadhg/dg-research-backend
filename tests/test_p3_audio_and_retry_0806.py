@@ -196,9 +196,34 @@ class TestTheUsersDownloadsAreNotOursToTake:
         return research._audio_search_plan(object())
 
     def test_playwright_dirs_may_be_moved_from(self, tmp_path, monkeypatch):
-        pw = [e for e in self._plan(tmp_path, monkeypatch) if e[3] is True]
+        """OUR OWN context directory is movable and recursed — that is what makes
+        the recovery work. Driven through a browser double that reports a context
+        directory, because `object()` cannot produce the production condition."""
+        own = tmp_path / "ctx-downloads"
+        own.mkdir()
+        plan = research._audio_search_plan(_browser_with_ctx(own))
+        pw = [e for e in plan if e[3] is True]
         assert pw, "nothing is movable — the recovery cannot work"
         assert all(e[1] is True for e in pw), "our own dir should be recursed"
+        assert own in [e[0] for e in pw]
+
+    def test_a_SIBLING_runs_artifact_dir_is_scanned_but_never_moved_from(
+            self, tmp_path, monkeypatch):
+        """⛔ The concurrent-run hazard the old fixture could not see. Another
+        worker's `playwright-artifacts-*` may hold a newer audio file that is
+        mid-download; `shutil.move` would take it. Scanned, so a file that exists
+        is still found — never moved, so it is never stolen."""
+        import tempfile as _tf
+        monkeypatch.setattr(_tf, "tempdir", str(tmp_path))
+        own = tmp_path / "ctx-downloads"
+        own.mkdir()
+        foreign = tmp_path / "playwright-artifacts-OTHERRUN"
+        foreign.mkdir()
+        plan = research._audio_search_plan(_browser_with_ctx(own))
+        entry = next(e for e in plan if e[0] == foreign)
+        assert entry[3] is False, "a sibling run's directory is not ours to move from"
+        assert entry[1] is True, "still recurse it — the file may genuinely be there"
+        assert next(e for e in plan if e[0] == own)[3] is True
 
     def test_the_human_downloads_folder_is_copy_only(self):
         home = [e for e in self._plan()
@@ -233,6 +258,33 @@ class TestTheUsersDownloadsAreNotOursToTake:
         assert "_is_settled(_found)" in src
 
 
+def _browser_with_ctx(dirpath):
+    """A browser double whose context reports its own download directory.
+
+    ⭐ 2026-08-11. The two tests below used `object()`, so the context lookup
+    yielded nothing and the temp-wide glob was the ONLY source of playwright
+    directories. That made them assert a production property through a fixture
+    that cannot produce the production condition — and it hid the concurrent-run
+    hazard entirely: every temp `playwright-artifacts-*` on the host was being
+    treated as this run's own, trusted and MOVABLE, so a sibling worker's podcast
+    could be moved out from under it mid-download.
+    """
+    class _Impl:
+        _download_dir = str(dirpath)
+        _artifacts_dir = None
+
+    class _Ctx:
+        _impl_obj = _Impl()
+
+    class _Page:
+        context = _Ctx()
+
+    class _Browser:
+        page = _Page()
+
+    return _Browser()
+
+
 class TestTheFallbackLooksWherePlaywrightPuts_It:
 
     def test_the_temp_artifacts_dirs_are_included(self, tmp_path, monkeypatch):
@@ -245,7 +297,14 @@ class TestTheFallbackLooksWherePlaywrightPuts_It:
         monkeypatch.setattr(_tf, "tempdir", str(tmp_path))
         art = tmp_path / "playwright-artifacts-S5S7O0"
         art.mkdir()
-        assert art in research._playwright_download_dirs(object())
+        # Still collected — not finding a file that exists is what caused the
+        # 08-09 outage. It moved seam: `_playwright_download_dirs` now returns
+        # only what the CONTEXT reported (movable, trusted), and a temp directory
+        # that is not ours arrives through the foreign helper as scan-only. The
+        # search plan is where both meet, so assert there.
+        plan_paths = [e[0] for e in research._audio_search_plan(object())]
+        assert art in plan_paths, plan_paths
+        assert art in research._playwright_foreign_artifact_dirs(object())
 
     def test_a_browser_without_a_context_is_survivable(self):
         # It is called on the failure path, where the page may already be gone.
