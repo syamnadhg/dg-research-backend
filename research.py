@@ -54895,12 +54895,39 @@ async def run_server(port=8000):
     # tore the banner in half — observed live. It runs before the strip now:
     # the finding it reports is about the port, which the strip is about to
     # print, so earlier is also the more useful place for it.
+    #
+    # This used to be advisory: it noticed the port was busy, said "binding
+    # anyway", and left uvicorn to fail with a raw errno. It knew, and let the
+    # confusing failure happen regardless. It now RESOLVES the conflict — see
+    # `_reclaim_port` — clearing a stale copy of ourselves and refusing, by name,
+    # for anything that is not ours.
     try:
-        if not await asyncio.to_thread(_wait_for_port_free, port, 6.0):
-            log(f"Port {port} looks busy at the pre-bind probe — binding anyway; "
-                f"uvicorn will surface a real conflict if one exists.", "WARN")
-    except Exception:
-        pass
+        _port_state, _port_holders_found = await asyncio.to_thread(_reclaim_port, port)
+    except Exception as _pe:
+        log(f"[serve] port check failed ({_pe}) — continuing to bind", "WARN")
+        _port_state, _port_holders_found = "free", []
+
+    if _port_state == "foreign":
+        _who = "; ".join(
+            f"pid {h['pid']} ({h['name']}{': ' + h['cmd'][:70] if h['cmd'] else ''})"
+            for h in _port_holders_found) or "an unidentified process"
+        print(f"[serve] bind refused: port {port} is in use by {_who}",
+              file=sys.stderr, flush=True)
+        print(f"\n  {_c(_ERR, '⛔')}  Port {port} is already in use by something "
+              f"that is not Super Research.")
+        print(f"      {_who}")
+        print(f"      Stop it, or start this backend on another port.\n")
+        raise SystemExit(3)
+
+    if _port_state == "stuck":
+        _pids = ", ".join(str(h["pid"]) for h in _port_holders_found) or "unknown"
+        print(f"[serve] bind refused: port {port} did not come free (EADDRINUSE)",
+              file=sys.stderr, flush=True)
+        print(f"\n  {_c(_ERR, '⛔')}  Port {port} is still held after stopping the "
+              f"earlier backend (pid {_pids}).")
+        print(f"      Nothing was started. Check with:  "
+              f"lsof -nP -iTCP:{port} -sTCP:LISTEN\n")
+        raise SystemExit(3)
     _paired_uid_now = load_paired_uid()
     _device_id_now = load_device_id() or ""
     # Pull owner identity + device metadata from the device doc, not
@@ -58649,6 +58676,163 @@ def _kill_pids_windows(pids: list[int]) -> int:
         except Exception:
             pass
     return killed
+
+
+def _looks_like_our_backend(cmdline: str) -> bool:
+    """Whether a command line is another copy of THIS backend.
+
+    Deliberately narrow. Everything below can end a process, and the difference
+    between "a stale copy of me" and "something else the user is running" is the
+    only thing standing between reclaiming a port and killing their work. A bare
+    "python" match, or a match on the port alone, would not be that difference.
+    """
+    toks = cmdline.split() if isinstance(cmdline, str) else list(cmdline or [])
+    toks = [str(x) for x in toks]
+    if "--serve" not in toks:
+        return False
+
+    # The PROGRAM being run has to be ours, not merely a word on the line. A
+    # substring test called `grep --serve research.py` one of our backends —
+    # harmless in that instance, and exactly the shape of false positive that
+    # ends someone else's process when it does hold the port.
+    # LOWERCASED. On macOS the framework interpreter's real basename is
+    # "Python", capital P — a case-sensitive check read our own backend as a
+    # stranger and refused to reclaim its port.
+    base = [os.path.basename(x).lower() for x in toks]
+    is_python = any(b.startswith("python") or b.startswith("pypy") for b in base)
+    runs_script = any(b == "research.py" for b in base)
+    runs_console = any(b == "superresearch" for b in base)
+    return (is_python and runs_script) or runs_console
+
+
+def _port_holders(port: int) -> list:
+    """Listening processes on `port`, each tagged with whether it is ours.
+
+    Two sources because neither is reliable alone: psutil's `net_connections`
+    raises AccessDenied on macOS without root even for the caller's own sockets,
+    and `lsof` is not installed on every Linux image. Whichever answers, answers.
+    """
+    import os as _os
+    me = _os.getpid()
+    found: dict = {}
+
+    try:
+        import psutil as _ps
+        for conn in _ps.net_connections(kind="inet"):
+            if conn.status != _ps.CONN_LISTEN or not conn.laddr:
+                continue
+            if conn.laddr.port != port or not conn.pid or conn.pid == me:
+                continue
+            found.setdefault(conn.pid, None)
+    except Exception:
+        pass
+
+    if not found:
+        try:
+            out = subprocess.run(
+                ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+                capture_output=True, text=True, timeout=10)
+            for line in (out.stdout or "").split():
+                try:
+                    pid = int(line.strip())
+                except ValueError:
+                    continue
+                if pid and pid != me:
+                    found.setdefault(pid, None)
+        except Exception:
+            pass
+
+    holders = []
+    for pid in found:
+        name, cmd, argv = "?", "", []
+        try:
+            import psutil as _ps
+            proc = _ps.Process(pid)
+            name = proc.name()
+            argv = proc.cmdline()
+            cmd = " ".join(argv)
+        except Exception:
+            pass
+        # argv, not the joined string: a path containing a space would split
+        # into tokens that match nothing, and this decides whether we signal.
+        holders.append({"pid": pid, "name": name, "cmd": cmd,
+                        "ours": _looks_like_our_backend(argv or cmd)})
+    return holders
+
+
+def _reclaim_port(port: int, settle_s: float = 12.0):
+    """Make `port` bindable, or explain precisely why it cannot be.
+
+    ⭐ 2026-08-10. Closing a terminal tab does NOT stop this backend — it loses
+    its terminal, reparents to init and keeps the socket. The next `--serve`
+    then failed to bind, and said so only through uvicorn's raw
+    "[Errno 48] error while attempting to bind" buried in the boot output. The
+    operator's reasonable reading was that serve had "just shut down by itself",
+    and the cure — find and kill an invisible process — was neither suggested
+    nor discoverable. It cost most of an afternoon across three separate boots.
+
+    So a stale copy of OURSELVES is now cleared automatically: stopped the same
+    graceful way the supervisor stops it, escalated only if that does not take,
+    and re-probed rather than assumed. Anything that is NOT ours is never
+    touched — it is named, with its pid and command, and we refuse. Taking a
+    port from a process we cannot identify is not ours to do, and "it was on my
+    port" is not a justification anyone would accept afterwards.
+
+    Returns (state, holders) where state is one of:
+      free      — nothing was holding it
+      reclaimed — a stale copy of ours was stopped and the port came back
+      foreign   — something else holds it; caller must refuse
+      stuck     — ours, but it would not let go
+    """
+    import signal as _sig   # NOT module-level in this file; `_kill_tree` imports
+                           # its own for the same reason. Missing it here failed
+                           # as a swallowed NameError, so the stale backend was
+                           # never signalled and the reclaim reported "stuck".
+    import time as _t
+
+    if _wait_for_port_free(port, 0.5):
+        return "free", []
+
+    holders = _port_holders(port)
+    ours = [h for h in holders if h["ours"]]
+    foreign = [h for h in holders if not h["ours"]]
+
+    if foreign:
+        return "foreign", foreign
+    if not ours:
+        # Nothing identifiable: could be a socket in TIME_WAIT after a hard kill,
+        # which clears on its own. Wait it out rather than guess at a pid.
+        return ("free", []) if _wait_for_port_free(port, settle_s) else ("stuck", [])
+
+    for h in ours:
+        log(f"[serve] port {port} is held by an earlier backend (pid {h['pid']}) "
+            f"— stopping it", "WARN")
+        try:
+            os.kill(h["pid"], _sig.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except Exception as _ke:
+            log(f"[serve] could not signal pid {h['pid']}: {_ke}", "WARN")
+
+    if _wait_for_port_free(port, settle_s):
+        log(f"[serve] port {port} reclaimed from the earlier backend", "INFO")
+        return "reclaimed", ours
+
+    for h in ours:
+        log(f"[serve] pid {h['pid']} did not stop — escalating", "WARN")
+        try:
+            os.kill(h["pid"], _sig.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except Exception:
+            pass
+
+    # A killed listener leaves the socket in TIME_WAIT briefly; that is not a
+    # failure, it is the kernel finishing up.
+    if _wait_for_port_free(port, settle_s):
+        log(f"[serve] port {port} reclaimed after a forced stop", "WARN")
+        return "reclaimed", ours
+    return "stuck", ours
 
 
 def _wait_for_port_free(port: int, max_wait_s: float = 10.0) -> bool:

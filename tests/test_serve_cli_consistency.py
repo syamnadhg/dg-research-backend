@@ -81,10 +81,16 @@ def test_the_crown_is_printed_exactly_once():
 
 
 def test_the_port_probe_cannot_split_the_banner():
-    """The advisory pre-bind probe used to sit between the identity strip and the
+    """The pre-bind probe used to sit between the identity strip and the
     "Listening for pipeline jobs" footer, so its WARN tore the banner in half.
-    It must now precede the strip."""
-    probe = _lineno_of("_wait_for_port_free")
+    It must still precede the strip.
+
+    The probe is no longer advisory — it resolves the conflict rather than
+    logging "binding anyway" and letting uvicorn fail with a raw errno — so the
+    anchor is `_reclaim_port`. The invariant is unchanged and matters more now:
+    it can print several lines (stopping an earlier backend, or refusing by pid),
+    and all of them belong above the strip."""
+    probe = _lineno_of("asyncio.to_thread(_reclaim_port")
     strip = _lineno_of("_render_context_strip(_ctx_rows_serve)")
     footer = _lineno_of("Listening for pipeline jobs")
     assert probe < strip < footer
