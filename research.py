@@ -47025,9 +47025,27 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                 log("[Audio] access is 'Anyone with the link'; the strict DOM "
                     "confirm was inconclusive — proceeding")
             else:
-                log("[Audio] access was NEITHER already public NOR set (control "
-                    "or option not found) — audio link may genuinely be private",
-                    "WARN")
+                # The control was not found. That IS worth a WARN — it is how
+                # selector rot on this dialog gets noticed, and `_dom_note`
+                # records it as `missed` so the run summary still shows it.
+                #
+                # But it used to end "audio link may genuinely be private", and
+                # that was a claim about privacy with nothing behind it. The
+                # audio's Share dialog and the notebook's emit the SAME
+                # /notebook/{id} URL — the fallback directly below depends on
+                # exactly that — so whether the link is public was already
+                # settled by the notebook share step earlier in this run, which
+                # logs its own verdict. Two e2e runs showed the pair that makes
+                # this misleading: `set_public_access: verified` on the notebook
+                # at one timestamp and `missed` on the audio at another, and the
+                # only line the operator reads said the link might be private
+                # while it demonstrably was not.
+                #
+                # So: report the control, not a guess about the outcome.
+                log("[Audio] the audio Share dialog's access control was not "
+                    "found — access for this notebook is whatever the notebook "
+                    "share step set (see its own line above); this link is the "
+                    "same /notebook/ URL", "WARN")
 
             if not audio_overview_url:
                 # Fallback: NLM emits the same /notebook/{id} URL whether
