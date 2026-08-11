@@ -160,10 +160,15 @@ def test_download_dirs_returns_only_what_the_context_reported():
     glob made that false: with two workers on one host the newer file can be the
     other run's, and `shutil.move` would take it mid-download."""
     body = code_only(_fn("_playwright_download_dirs"))
-    assert "gettempdir" not in body, (
-        "the temp-wide glob must not be reachable from the MOVABLE list"
-    )
     assert "_download_dir" in body and "_artifacts_dir" in body
+    # ⚠ This originally asserted `gettempdir` was absent here. That pinned the
+    # FIRST version of the fix, which was inert: those private attributes do not
+    # exist in the installed Playwright, so the function returned nothing and our
+    # own directory was classified as a stranger's. The glob is back, but GATED —
+    # a temp directory is claimed only when it is the only one on the host.
+    assert "len(_dirs) == 1" in body, (
+        "a temp directory may be claimed only when no sibling run could own it"
+    )
 
 
 def test_foreign_dirs_are_a_separate_function():
@@ -247,3 +252,62 @@ def test_the_deferred_findings_are_recorded_somewhere_a_reader_will_look():
     """Nine of the fourteen are not fixed. That is a decision, and a decision with
     no record is indistinguishable from an oversight three weeks later."""
     assert "deliberately NOT" in __doc__ or "NOT" in __doc__
+
+
+# ── the SECOND pass: the first fix was inert, and undid an outage fix ───────
+
+def test_a_lone_artifacts_directory_is_ours(tmp_path, monkeypatch):
+    """⛔ THE REGRESSION THE E2E CAUGHT. The attribute probe returns nothing on the
+    installed Playwright — `_download_dir`/`_artifacts_dir` do not exist there — so
+    the first version of this fix classified our OWN directory as foreign. Two
+    consequences, both the opposite of what its commit claimed: the multi-worker
+    protection never engaged, and `trusted` (derived from may_move) went
+    permanently False, which disables the ffprobe-absent acceptance in
+    `_audio_kind` and reinstates the 2026-08-09 outage on any machine without
+    ffmpeg.
+
+    Proof it was real: the two runs before the change logged "moved", the run
+    after logged "copied", on a host with no sibling worker at all.
+
+    With ONE directory there is no sibling to confuse it with."""
+    import tempfile as _tf
+    monkeypatch.setattr(_tf, "tempdir", str(tmp_path))
+    only = tmp_path / "playwright-artifacts-ONLYONE"
+    only.mkdir()
+    assert R._playwright_download_dirs(object()) == [only]
+    assert R._playwright_foreign_artifact_dirs(object()) == []
+
+
+def test_two_artifacts_directories_are_claimed_by_nobody(tmp_path, monkeypatch):
+    """The case the hazard is actually about. With two we cannot tell ours apart,
+    so none is claimed — every one goes through the scan-only path and nothing is
+    moved out from under a sibling run."""
+    import tempfile as _tf
+    monkeypatch.setattr(_tf, "tempdir", str(tmp_path))
+    a = tmp_path / "playwright-artifacts-AAA"; a.mkdir()
+    b = tmp_path / "playwright-artifacts-BBB"; b.mkdir()
+    assert R._playwright_download_dirs(object()) == []
+    assert sorted(R._playwright_foreign_artifact_dirs(object())) == sorted([a, b])
+
+
+def test_the_lone_directory_is_MOVABLE_and_TRUSTED_in_the_plan(tmp_path, monkeypatch):
+    """The whole point. may_move=True is what restores the pre-change behaviour,
+    and `_find_recent_audio` reads may_move as its trust signal — which is what
+    keeps the ffprobe-absent acceptance alive on a machine without ffmpeg."""
+    import tempfile as _tf
+    monkeypatch.setattr(_tf, "tempdir", str(tmp_path))
+    only = tmp_path / "playwright-artifacts-ONLYONE"
+    only.mkdir()
+    plan = R._audio_search_plan(object())
+    entry = next(e for e in plan if e[0] == only)
+    assert entry[3] is True, "a lone artifacts directory must stay movable/trusted"
+
+
+def test_no_duplicate_when_the_lone_directory_is_claimed(tmp_path, monkeypatch):
+    """The foreign helper must subtract what the owner helper claimed, or the same
+    directory reaches the plan twice with contradictory flags."""
+    import tempfile as _tf
+    monkeypatch.setattr(_tf, "tempdir", str(tmp_path))
+    (tmp_path / "playwright-artifacts-ONLYONE").mkdir()
+    paths = [p for p, *_ in R._audio_search_plan(object())]
+    assert len(paths) == len(set(paths)), paths

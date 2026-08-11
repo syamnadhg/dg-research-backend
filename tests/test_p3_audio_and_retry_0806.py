@@ -304,7 +304,12 @@ class TestTheFallbackLooksWherePlaywrightPuts_It:
         # search plan is where both meet, so assert there.
         plan_paths = [e[0] for e in research._audio_search_plan(object())]
         assert art in plan_paths, plan_paths
-        assert art in research._playwright_foreign_artifact_dirs(object())
+        # It is the ONLY artifacts directory here, so it is claimed as ours —
+        # movable and trusted, which is what keeps the ffprobe-absent acceptance
+        # alive on a machine without ffmpeg. A second directory would make both
+        # unclaimable; that case has its own test.
+        assert art in research._playwright_download_dirs(object())
+        assert research._playwright_foreign_artifact_dirs(object()) == []
 
     def test_a_browser_without_a_context_is_survivable(self):
         # It is called on the failure path, where the page may already be gone.

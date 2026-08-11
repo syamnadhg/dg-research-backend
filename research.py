@@ -46118,17 +46118,38 @@ def _playwright_download_dirs(browser):
     # the glob is only a fallback for the case it does not. Even then the extra
     # directories are handed back separately, so the caller can scan them without
     # claiming they are ours to move.
-    # ⚠ Returns ONLY what the context reported — possibly nothing. An earlier
-    # draft fell back to the temp-wide glob here, which put the same directory in
-    # `_audio_search_plan` TWICE with contradictory may_move flags (movable from
-    # this helper, scan-only from the foreign one), so whether a file was copied
-    # or MOVED depended on list order. Foreign directories have exactly one route
-    # into the plan, and it is the scan-only one.
+    if out:
+        return out
+
+    # ⛔ 2026-08-11, SECOND PASS. The attribute probe above returns NOTHING on the
+    # installed Playwright — `_download_dir` and `_artifacts_dir` do not exist in
+    # patchright or playwright at this version (grep: zero hits). The first
+    # version of this function treated that empty result as authoritative, so
+    # every artifacts directory became "foreign", and two things followed that the
+    # commit message claimed the opposite of:
     #
-    # The cost when the context reports nothing: a file found only in a temp
-    # artifacts directory is COPIED rather than moved. It is still found, which is
-    # the thing the 08-09 outage was about, and copying is the safe direction.
-    return out
+    #   * the multi-worker protection never engaged, because our OWN directory was
+    #     the one being classified as somebody else's;
+    #   * `_find_recent_audio` derives trust from may_move, so trusted went
+    #     permanently False — which disables the ffprobe-absent acceptance in
+    #     `_audio_kind` and REINSTATES the 2026-08-09 outage on any machine
+    #     without ffmpeg. Exactly the outage that fallback exists to prevent.
+    #
+    # The e2e caught it: the two runs before this change logged "moved", the run
+    # after logged "copied", on a host with no sibling worker at all.
+    #
+    # So identify ourselves by the one discriminator that actually holds. With a
+    # SINGLE artifacts directory on the host there is no sibling run to confuse it
+    # with, and it is ours — trusted and movable, exactly as before. With more than
+    # one we genuinely cannot tell, so none of them is claimed and they all go
+    # through the scan-only path, which is where the hazard was real in the first
+    # place.
+    try:
+        import tempfile as _tf
+        _dirs = sorted(Path(_tf.gettempdir()).glob("playwright-artifacts-*"))
+    except Exception:
+        return []
+    return _dirs if len(_dirs) == 1 else []
 
 
 def _playwright_foreign_artifact_dirs(browser):
@@ -46146,6 +46167,12 @@ def _playwright_foreign_artifact_dirs(browser):
             _d = getattr(_impl, attr, None)
             if _d:
                 own.add(Path(str(_d)))
+    except Exception:
+        pass
+    # Whatever `_playwright_download_dirs` claims is ours is excluded here, so no
+    # directory can reach the search plan twice with contradictory move flags.
+    try:
+        own.update(_playwright_download_dirs(browser))
     except Exception:
         pass
     out = []
