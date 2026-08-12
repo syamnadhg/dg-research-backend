@@ -243,10 +243,15 @@ def test_no_branch_in_the_wait_loop_skips_the_deadline_test():
 
 def test_the_token_ceiling_covers_reasoning_plus_a_list_of_urls():
     """narrate.py needed 1400 for one sentence once thinking stopped being
-    disabled. A list of full URLs cannot be smaller than that."""
+    disabled. A list of full URLs cannot be smaller than that.
+
+    2026-08-12: the literal became a named constant when the read timeout was
+    paired to it (test_vision_url_budget_0812). Resolved through the constant so
+    this still reads the value the request actually sends."""
     src = code_only(inspect.getsource(research))
-    ceiling = int(re.search(r'"maxOutputTokens": (\d+),\s*\n\s*"responseMimeType": "application/json",'
-                            r'\s*\n\s*"responseSchema": _VISION_URL_SCHEMA', src).group(1))
+    name = re.search(r'"maxOutputTokens": (\w+),\s*\n\s*"responseMimeType": "application/json",'
+                     r'\s*\n\s*"responseSchema": _VISION_URL_SCHEMA', src).group(1)
+    ceiling = getattr(research, name)
     assert ceiling > 1400, (
         f"vision-urls asks for a list of URLs on {ceiling} tokens while narrate "
         f"needs 1400 for a sentence — this is the 08-11 truncation"

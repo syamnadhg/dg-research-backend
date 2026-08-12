@@ -27359,6 +27359,29 @@ _VISION_URL_PROMPT = (
     "no URLs visible (return empty list)."
 )
 
+# ⭐ 2026-08-12 — THE OUTPUT BUDGET AND THE READ TIMEOUT ARE ONE DECISION.
+# Yesterday's fix raised the budget here from 800 and left the clock at 10s, and
+# that pairing is not arbitrary: at 800 tokens the answer arrived CLIPPED, which
+# is itself proof it arrived inside ten seconds. Tripling what the model has to
+# write without touching how long we wait for it turned a truncated-but-delivered
+# response into a timed-out one — the same lost sources, a new cause, introduced
+# by the repair.
+#
+# The floor below is the invariant worth keeping, not the arithmetic: assume the
+# Flash tier emits no fewer than _VISION_URL_MIN_TOKENS_PER_SEC and require the
+# timeout to cover the WHOLE budget at that rate. 800/100 = 8s is why the
+# original pairing worked; 2400/100 = 24s is why it stopped. A test asserts the
+# relation, so raising one of these again without the other fails in the suite
+# instead of in a run.
+#
+# Sized generously rather than tightly on purpose. The caller is ONE-SHOT per
+# agent — `vision_urls_done` is set on failure too — so a timeout costs the run
+# every source in that panel with no retry to recover them, while the cost of
+# waiting is one stretched round-robin leg inside a 120-second poll interval.
+_VISION_URL_MIN_TOKENS_PER_SEC = 100
+_VISION_URL_MAX_TOKENS = int(os.environ.get("DG_VISION_URL_MAX_TOKENS", "2400"))
+_VISION_URL_TIMEOUT_S = float(os.environ.get("DG_VISION_URL_TIMEOUT_S", "30.0"))
+
 # Confidence assigned to URLs recovered from a response that ran out of tokens.
 # Above the 0.4 floor because a model that wrote out whole URLs demonstrably read
 # the panel; below the 0.7 the prompt reserves for a clean read, because we never
@@ -27459,7 +27482,9 @@ async def extract_source_urls_via_vision(page, agent_key: str,
             # 08-11 died mid-object — "Expecting property name enclosed in
             # double quotes: line 7 column 1" is what a clipped array looks like
             # — and every source in the panel was lost with it.
-            "maxOutputTokens": 2400,
+            # Read this together with the timeout it is paired to — see
+            # _VISION_URL_MAX_TOKENS.
+            "maxOutputTokens": _VISION_URL_MAX_TOKENS,
             "responseMimeType": "application/json",
             "responseSchema": _VISION_URL_SCHEMA,
         },
@@ -27468,7 +27493,7 @@ async def extract_source_urls_via_vision(page, agent_key: str,
     def _sync_call():
         try:
             import requests as _req
-            resp = _req.post(url, json=payload, timeout=10.0)
+            resp = _req.post(url, json=payload, timeout=_VISION_URL_TIMEOUT_S)
             if resp.status_code != 200:
                 log(f"[{agent_key}] vision-urls http {resp.status_code}: "
                     f"{resp.text[:140]}", "WARN")
