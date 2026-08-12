@@ -32915,6 +32915,27 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                  and since_warn > STUCK_WARN_THROTTLE_SEC
                                  and not status_is_active)
             if _active_no_growth:
+                # ⭐ 2026-08-12 — THE THROTTLE HELD ONLY WHILE IT WAS NOT NEEDED.
+                # `since_warn` is the whole re-probe throttle, and `stuck_warned_at`
+                # was stamped ONLY on the CONFIRMED-STUCK path below; the WORKING
+                # branch was expected to throttle itself by rewinding the growth
+                # clock instead (the note in the probe's except-block says so).
+                # But that rewind is capped at _ARBITER_MAX_WORKING_RESETS. Once
+                # the extensions are spent the clock is never reset again, so
+                # `no_growth_secs` stays permanently above STUCK_NO_GROWTH_SEC —
+                # and with `stuck_warned_at` still 0.0, `since_warn` is the whole
+                # run. Every gate in `_active_no_growth` is then true on EVERY
+                # tick: the 08-11 ChatGPT freeze took verdicts #1 and #2 fifteen
+                # minutes apart and then ran 28 probes in 31 minutes, none of
+                # which could reset the clock or raise a card. The safety limit
+                # engaging is exactly what removed the throttle.
+                #
+                # Stamped at ENTRY, before the verdict, so it holds for every
+                # outcome — stuck, working, reset-refused, and the CUA probe
+                # raising. The confirmed-stuck path below re-stamps it; that is
+                # now redundant and kept deliberately, so this line moving can
+                # never leave the card path unthrottled.
+                p["stuck_warned_at"] = time.time()
                 log(f"[{name}] No observed growth for {int(no_growth_secs/60)}m "
                     f"(elapsed {int(elapsed/60)}m) — CUA arbiter deciding stuck-vs-slow", "WARN")
                 _stuck_mission = (
@@ -32964,8 +32985,12 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     # WORKING verdict (FIFA run: the 15:17 arbiter pushed the
                     # next completion check from ~15:17 to 15:22, part of the
                     # anomalous 23m→33m gap on an already-complete report).
-                    # Arbiter re-probe throttling comes from the WORKING
-                    # branch's growth-clock reset below, not from this key.
+                    # Arbiter re-probe throttling comes from `stuck_warned_at`,
+                    # stamped at probe entry above, not from this key. It used
+                    # to be delegated to the WORKING branch's growth-clock reset
+                    # below — which stops resetting after
+                    # _ARBITER_MAX_WORKING_RESETS and left the probe running
+                    # every tick from then on (08-11).
                 except Exception as _spe:
                     log(f"[{name}] Stuck-arbiter CUA probe failed ({_spe}) — treating as "
                         "WORKING (conservative; no false card / auto-skip)", "WARN")
@@ -33029,8 +33054,11 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     # comes, _fire_due_autoskips auto-skips after AUTO_SKIP_UNACTED_SEC.
                 else:
                     # CUA saw real output the scraper couldn't (cross-origin
-                    # iframe etc.). Reset the growth clock so we neither re-probe
-                    # every tick nor ever false-alert (the 2026-04-28 class).
+                    # iframe etc.). Reset the growth clock so we never
+                    # false-alert (the 2026-04-28 class). Re-probe spacing is
+                    # NOT this reset's job any more — it never was on a leg that
+                    # had spent its extensions, which is how 08-11 got 28 probes
+                    # in 31 minutes. `stuck_warned_at` at probe entry owns it.
                     #
                     # ⭐ 2026-08-05 — "STOPPED GROWING" AND "NEVER GREW ONCE" ARE
                     # NOT THE SAME FAILURE, and this branch treated them as one.
