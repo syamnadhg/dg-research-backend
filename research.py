@@ -27333,13 +27333,29 @@ async def extract_source_urls_via_vision(page, agent_key: str,
     return filtered[:_SOURCE_LIST_CAP]
 
 
+# Below this, a stalled screen has nothing worth continuing with. Same figure as
+# the safety-net's `_SAFETY_NET_MIN_BRIEF_LEN` extract-accept gate, deliberately:
+# the two answer the same question ("is this a brief or a streaming stub?") and
+# letting them drift would offer the user a salvage the extractor then rejects.
+_MIN_SALVAGEABLE_BRIEF_LEN = 2000
+
+
 class _BriefStreamStalled(Exception):
     """Raised by poll_until_done when ChatGPT's brief stream goes flat on
     text + sources + steps for STALL_THRESHOLD_SEC. Distinct from a wall-
     clock timeout so the P1 caller can show stall-specific copy
     ('ChatGPT stream stalled — text + sources flat for 20 min') instead
-    of the legacy 'Brief generation timed out after 45 min' message."""
-    pass
+    of the legacy 'Brief generation timed out after 45 min' message.
+
+    ⭐ `text_len` — how much brief text was on screen when the stream went
+    flat. It is carried because the caller's offer to the user DEPENDS on it:
+    the salvage action extracts whatever streamed, so offering it against an
+    empty screen produces a 0-char brief and the false "no brief generated"
+    failure. Defaults to 0, which is the safe reading (offer nothing)."""
+
+    def __init__(self, message: str = "", text_len: int = 0):
+        super().__init__(message)
+        self.text_len = int(text_len or 0)
 
 
 def _cua_affirms(cua_text: str, key: str) -> bool:
@@ -27407,9 +27423,42 @@ def _cua_denies(cua_text: str, key: str) -> bool:
     return bool(re.match(r"(no\b|not\b|none\b|nope\b|n/a\b)", tail))
 
 
+# ChatGPT's thinking-time header, which renders ONLY once the model has finished
+# thinking — the strongest DONE marker on the page.
+#
+# ⭐ 2026-08-11 — WHY THIS IS A PATTERN AND NOT A LITERAL. The done-marker list
+# below was written 2026-06-02 with the single literal "thought for". ChatGPT has
+# since relabelled it: the live page now reads "Worked for 9m". Nothing in this
+# repo knew that string, so on 2026-08-11 a brief that was COMPLETE at 62492
+# chars kept polling for 40 more minutes — the vision check read the screen
+# correctly every time ("no stop button", "Worked for 9m" visible) and the
+# classifier had no rule that matched, so it fell through to the ambiguous
+# default and answered "generating". The run only moved when the owner pressed a
+# button. (Independent corroboration that the label changed, from a day earlier:
+# `queues/Worked_for_10m_32s_20260810_205153` — a run whose TITLE was scraped as
+# "Worked for 10m 32s".)
+#
+# The time unit is REQUIRED, deliberately. Without it "worked for 3 teams" in the
+# report's own prose reads as a completion marker; with it, only the header form
+# matches. The verb family is small and closed on purpose — this is a page label,
+# not free text, and a wider pattern would trade this bug for a false-complete,
+# which is the strictly worse failure (see the cost asymmetry below).
+_THINKING_TIME_HEADER = re.compile(
+    r"\b(?:thought|worked|reasoned|researched)\s+for\s+\d+\s*"
+    r"(?:hours|hour|hrs|hr|h|minutes|minute|mins|min|m|seconds|second|secs|sec|s)\b")
+
+
 def _classify_completion_verdict(cua_text: str) -> str:
     """#753 — interpret a safety-net CUA diagnosis of whether a response is
-    done. Returns "complete" or "generating".
+    done. Returns "complete", "generating", or "ambiguous".
+
+    ⭐ "ambiguous" means NO signal was found in either direction — it is not a
+    reading of the screen, it is the absence of one. Callers must treat it as
+    "keep waiting" (the cost asymmetry below is unchanged), but they must SAY SO
+    distinctly: for two months this case was folded into "generating" and logged
+    as "CUA confirms still generating", which is a claim the parser never made.
+    That wording is precisely what hid the 2026-08-11 relabel — the log asserted
+    a positive observation where the truth was "I recognised nothing."
 
     ROOT CAUSE this fixes (logs 05:05/06:31/09:10 worker-1, 05:07/06:34/09:08
     worker-2): the safety-net CUA prompt's PRIMARY directive is "if a Stop
@@ -27466,11 +27515,16 @@ def _classify_completion_verdict(cua_text: str) -> str:
                             "is complete", "fully visible", "fully rendered",
                             "completed rendering", "finished rendering",
                             "done rendering", "report is complete",
-                            "brief is complete", "report complete",
-                            "thought for")):
+                            "brief is complete", "report complete")):
         return "complete"
-    # Ambiguous — never early-exit on a fuzzy verdict; keep polling.
-    return "generating"
+    # The thinking-time header, matched as a shape rather than one literal.
+    # See `_THINKING_TIME_HEADER` — the literal is what rotted.
+    if _THINKING_TIME_HEADER.search(t):
+        return "complete"
+    # Nothing recognised in either direction. Behaviourally this still means
+    # "keep polling" — but it is reported as what it is, so the next label
+    # change shows up as a line in the log instead of a 40-minute hang.
+    return "ambiguous"
 
 
 async def _page_is_dead(page):
@@ -28442,7 +28496,17 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     # "complete" and made the pipeline extract an in-flight brief.
                     _sn_verdict = _classify_completion_verdict(_sn_text)
                     _sn_is_complete = (_sn_verdict == "complete")
-                    _sn_is_generating = (_sn_verdict == "generating")
+                    # "ambiguous" keeps polling exactly like "generating" — the
+                    # cost asymmetry is unchanged — but it is NOT the same
+                    # statement, and conflating them is what let a vendor label
+                    # change cost 40 minutes with a log that read as healthy.
+                    _sn_is_generating = _sn_verdict in ("generating", "ambiguous")
+                    if _sn_verdict == "ambiguous":
+                        log(f"[{label}] Safety-net CUA verdict UNRECOGNISED — no "
+                            f"generating signal and no completion marker in its read. "
+                            f"Treating as still-generating and continuing to poll, but "
+                            f"this is the shape a changed page label makes: "
+                            f"text={(_sn_text or '')[:200]!r}", "WARN")
                     # #755 — DETERMINISTIC stop-button VETO over the fuzzy CUA read.
                     # The safety-net only fires because the DOM detector is signalling
                     # "generating"; #753 hardened the CUA *text* parse, but when the
@@ -28473,14 +28537,65 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                             f"vetoing the false-complete and continuing to poll", "WARN")
                         _sn_is_complete = False
                         _sn_is_generating = True
+                    # ⭐ 2026-08-11 — LABEL-FREE COMPLETION. The counterpart to the
+                    # veto above, and the reason a renamed page label can no longer
+                    # cost a stall window.
+                    #
+                    # Reaching here with an "ambiguous" verdict means the vision
+                    # model looked and recognised NOTHING — no stop button, no
+                    # finalizing indicator, and no phrase we know for "done". That
+                    # is exactly what a relabel looks like, and wording alone can
+                    # never resolve it. So decide from state instead, using only
+                    # facts this pipeline measures itself:
+                    #
+                    #   * the DOM's own reason for saying "generating" is SOFT — a
+                    #     residual CSS animation, not a Stop button. The #755 note
+                    #     above already records that every genuine success came in
+                    #     this shape (33024 and 68349 chars via a lingering
+                    #     animation); it just never acted on it.
+                    #   * there is a real brief's worth of text, not a stub.
+                    #   * text AND sources AND steps have ALL been flat for the
+                    #     full safety-net window. A Deep Research run that is still
+                    #     working grows sources or steps even while text doesn't —
+                    #     which is the same multi-signal argument the 20-minute
+                    #     stall surface is built on, applied 15 minutes earlier.
+                    #   * the tab is alive, so "no stop button" means finished and
+                    #     not gone (the 2026-08-09 about:blank failure, where a dead
+                    #     page was declared complete after 3289s).
+                    #
+                    # A positively-observed "still generating" is NEVER overridden —
+                    # if the model says it sees generation, it is believed. This
+                    # only decides the case where nothing was recognised at all,
+                    # which previously fell through to a 20-minute wait and a card.
+                    if (not _sn_is_complete and _sn_verdict == "ambiguous"
+                            and not _hard_stop_signal
+                            and last_seen_len >= _SAFETY_NET_MIN_BRIEF_LEN
+                            and stall_window_start is not None
+                            and (time.time() - stall_window_start) >= SAFETY_NET_CUA_SEC):
+                        _lf_dead = await _page_is_dead(page)
+                        if _lf_dead:
+                            log(f"[{label}] Safety-net: nothing recognised and the page "
+                                f"is not usable ({_lf_dead}) — NOT calling that complete", "WARN")
+                        else:
+                            _lf_flat = int(time.time() - stall_window_start)
+                            log(f"[{label}] Safety-net: no completion WORDING recognised, but "
+                                f"the state says done — {last_seen_len} chars with text, sources "
+                                f"and steps all flat for {_lf_flat}s, no Stop button "
+                                f"(DOM reason='{_diag_reason}'), page alive. Treating as "
+                                f"complete without relying on any page label.", "WARN")
+                            _sn_is_complete = True
+                            _sn_is_generating = False
                     if _sn_is_complete:
                         _elapsed = int(time.time() - wait_start)
                         log(f"[{label}] Safety-net CUA confirms response complete ✓ "
                             f"({_elapsed}s) — DOM detector was the false-positive")
                         return True
                     if _sn_is_generating:
-                        log(f"[{label}] Safety-net CUA confirms still generating — "
-                            f"re-arm safety-net (stall window UNTOUCHED), continue poll")
+                        log(f"[{label}] "
+                            + ("Safety-net CUA confirms still generating"
+                               if _sn_verdict == "generating"
+                               else "Safety-net CUA read nothing conclusive (see above)")
+                            + " — re-arm safety-net (stall window UNTOUCHED), continue poll")
                         # #753: do NOT reset stall_window_start — the stall
                         # surface reads it, and resetting made the 20-min
                         # _BriefStreamStalled card unreachable on a persistent
@@ -28513,7 +28628,8 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                 raise _BriefStreamStalled(
                     f"phase {phase} response stalled "
                     f"(text={last_seen_len}, sources={last_seen_sources}, "
-                    f"steps={last_seen_steps_sig}; flat for {_stall}s)"
+                    f"steps={last_seen_steps_sig}; flat for {_stall}s)",
+                    text_len=last_seen_len,
                 )
 
         elapsed_min = int(time.time() - wait_start) // 60
@@ -36247,17 +36363,50 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
         log(f"Phase 1: brief stream stalled — {_bs}", "WARN")
         _runtime.unregister_page("chatgpt", final_status="stalled")
         retries_left_p1s = max(0, 2 - _retry_count)
+        # ⭐ 2026-08-11 — "Skip" was a lie on this card, and the copy promised
+        # something the code does not do.
+        #
+        # There is no such thing as skipping phase 1: phase 2 attaches brief.md
+        # to every agent, so a run without a brief cannot continue. What the
+        # skip branch ACTUALLY does is fall through and extract whatever has
+        # streamed so far. On 2026-08-11 that was the right outcome and rescued
+        # the run — the brief was complete (65707 chars); only the completion
+        # DETECTOR was wrong — but the owner pressed a button labelled "Skip"
+        # that said it would let them "write your own", and got a finished
+        # brief and a seamless phase 2 instead. A control whose label and
+        # behaviour disagree is worse than a missing control.
+        #
+        # So the action is named for what it does, and it is only OFFERED when
+        # it can work. Against an empty screen the same button yields a 0-char
+        # brief and the false "no brief generated" failure, which is how this
+        # path has burned runs before.
+        _p1s_salvageable = int(getattr(_bs, "text_len", 0) or 0) >= _MIN_SALVAGEABLE_BRIEF_LEN
+        _p1s_actions = []
+        if retries_left_p1s > 0:
+            _p1s_actions.append({"id": "retry", "label": "Retry", "style": "primary",
+                                 "command": {"action": "retry_phase", "phase": 1}})
+        if _p1s_salvageable:
+            _p1s_actions.append({"id": "skip", "label": "Use what's on screen",
+                                 "style": "default",
+                                 "command": {"action": "skip_phase", "phase": 1}})
         fail_phase(1,
                    "ChatGPT stopped responding",
-                   "ChatGPT stalled while writing the brief. Retry to start the brief over, or Skip and write your own.",
+                   ("ChatGPT stopped updating while writing the brief, but "
+                    f"{int(getattr(_bs, 'text_len', 0) or 0):,} characters are already on screen. "
+                    "Retry starts the brief over. Use what's on screen keeps that text "
+                    "and continues to the research phase."
+                    if _p1s_salvageable else
+                    "ChatGPT stalled before producing a usable brief. Retry starts it over — "
+                    "the run cannot continue without a brief."),
                    agent="chatgpt",
-                   can_retry=retries_left_p1s > 0)
-        if retries_left_p1s > 0:
+                   can_retry=retries_left_p1s > 0,
+                   actions=_p1s_actions)
+        if retries_left_p1s > 0 or _p1s_salvageable:
             p1s_decision = await _controls.await_phase_decision(1)
             log(f"Phase 1 stall decision: {p1s_decision}")
             if p1s_decision == "stop":
                 return None
-            if p1s_decision == "retry":
+            if p1s_decision == "retry" and retries_left_p1s > 0:
                 try:
                     emit_event("phase_restart", phase=1,
                                reason="user_retry_brief_stall",
@@ -36267,7 +36416,10 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
                 return await run_phase1(browser, cua_client, topic, pdf_paths,
                                         verbose=verbose, feedback=feedback,
                                         _retry_count=_retry_count + 1)
-            # skip → fall through and extract whatever streamed
+            # "Use what's on screen" → fall through and extract what streamed.
+            # Only reachable when the card offered it, i.e. there IS enough text;
+            # a retry arriving with no retries left (a stale card in a reopened
+            # tab) falls through here too rather than recursing past the cap.
         completed = False
     # Unregister once brief is done (also covers stall-skip fall-through;
     # idempotent — safe to call even if already unregistered above).

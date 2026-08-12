@@ -74,17 +74,27 @@ def test_paraphrased_done_without_keyphrase_stays_generating():
     # clear complete signal, we keep waiting rather than risk extracting an
     # in-flight brief. A real complete in the wild carries the instructed phrase
     # (see the two tests above). False-generating is the safe error here.
-    assert _v("Looks done to me, the text seems all there.") == "generating"
+    # 2026-08-11: the verdict for an unrecognised read is now reported as
+    # "ambiguous" rather than asserted as "generating". The BEHAVIOUR this test
+    # protects — never early-exit on a fuzzy read — is unchanged, so it is now
+    # asserted as "not complete" rather than against the label.
+    assert _v("Looks done to me, the text seems all there.") != "complete"
 
 
 # ── Ambiguous / empty → keep waiting (never early-exit on a fuzzy read) ───────
-def test_ambiguous_defaults_to_generating():
+def test_a_hedged_read_is_a_POSITIVE_generating_signal():
+    # "not sure" is an explicit hedge the prompt asks for, so this is a real
+    # reading of the screen — distinct from recognising nothing at all.
     assert _v("I'm not sure what state this is in.") == "generating"
 
 
-def test_empty_defaults_to_generating():
-    assert _v("") == "generating"
-    assert _v(None) == "generating"
+def test_empty_is_ambiguous_and_still_keeps_waiting():
+    # Empty means the parser saw NOTHING, which is not the same claim as "I
+    # looked and it is still generating" — conflating the two is what hid a
+    # vendor label change for 40 minutes on 2026-08-11.
+    assert _v("") == "ambiguous"
+    assert _v(None) == "ambiguous"
+    assert _v("") != "complete"       # the behaviour that matters: keep waiting
 
 
 # ── Hardening edge cases (review r1/r2) ───────────────────────────────────────
@@ -130,8 +140,10 @@ def test_thought_for_with_stop_button_is_generating():
 def test_completed_n_sources_activity_label_is_not_complete():
     # review r2 / Fix A: a stale activity-step label like "completed 47 sources"
     # must NOT read as done (bare "completed" was dropped from the signals).
+    # (2026-08-11: asserts "not complete" — a stale step label recognises as
+    # nothing, which now reports as "ambiguous" and still keeps polling.)
     assert _v("No stop button visible. Activity shows: completed 47 sources, "
-              "completed 3 steps.") == "generating"
+              "completed 3 steps.") != "complete"
 
 
 # ── Guard: the 20-min stall surface stays reachable (timer decouple) ──────────

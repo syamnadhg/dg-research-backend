@@ -243,7 +243,10 @@ def test_delegation_did_not_change_the_hardened_parser_behaviour():
     assert research._classify_completion_verdict("stop button: yes") == "generating"
     assert research._classify_completion_verdict("still generating") == "generating"
     assert research._classify_completion_verdict("i cannot tell") == "generating"
-    assert research._classify_completion_verdict("") == "generating"
+    # 2026-08-11: an EMPTY read recognises nothing, so it reports "ambiguous".
+    # Behaviour is identical (the caller keeps polling); only the claim changed.
+    assert research._classify_completion_verdict("") == "ambiguous"
+    assert research._classify_completion_verdict("") != "complete"
     assert research._classify_completion_verdict("response complete") == "complete"
     assert research._classify_completion_verdict(
         "stop button: no. the response is complete.") == "complete"
