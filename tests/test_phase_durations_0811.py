@@ -93,6 +93,27 @@ def test_an_unreadable_directory_does_not_raise(tmp_path):
     assert research._run_started_ms(tmp_path / "does_not_exist") > 0
 
 
+def test_a_path_that_cannot_even_be_built_does_not_raise():
+    """⭐ The previous test does not reach the except at all — a missing path
+    answers `exists()` False without erroring, so `except: pass` was never
+    exercised and a mutant that re-raised there survived. This argument fails
+    inside the try, where a real stat error would.
+
+    It matters because this helper runs on the meta-writing path of every phase
+    completion, including the daemon thread Phase 3 spawns. An exception here
+    would take out the run's whole record over a filesystem hiccup."""
+    assert research._run_started_ms(object()) > 0
+
+
+def test_the_run_start_is_stable_when_asked_twice(run_dir):
+    """It reads timestamps that never move, so it answers the same every time.
+    That is what makes the once-only `if "id" not in meta` guard belt-and-braces
+    rather than load-bearing — worth pinning, since the old `now` version had
+    the opposite property."""
+    d, _ = run_dir
+    assert research._run_started_ms(d) == research._run_started_ms(d)
+
+
 def test_it_accepts_a_string_path_too(run_dir):
     """Call sites pass `queue_dir` in whatever form they hold it."""
     d, started_ms = run_dir

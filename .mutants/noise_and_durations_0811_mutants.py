@@ -106,9 +106,15 @@ MUTANTS = [
     ("D5", "over", "seconds are used as milliseconds — every run starts in 1970",
      [("                stamps.append(int(p.stat().st_mtime * 1000))",
        "                stamps.append(int(p.stat().st_mtime))")]),
-    ("D6", "over", "a later write re-stamps the run start, dragging the phases forward",
-     [('    if "id" not in meta:\n        meta["id"] = queue_dir.name',
-       '    if True:\n        meta["id"] = queue_dir.name')]),
+    # D6 removed as an EQUIVALENT mutant, deliberately and with the reasoning
+    # left here rather than the mutant quietly deleted. It replaced the
+    # once-only `if "id" not in meta:` guard with `if True:` — a real defect
+    # while createdAt was `now`, because every later write dragged the run
+    # start forward and with it every backfilled phase. Against the fix it
+    # changes nothing: `_run_started_ms` reads file timestamps that do not
+    # move, so re-stamping writes the same value. That idempotence is the
+    # point, and it is pinned by `test_the_run_start_is_stable_when_asked_twice`
+    # instead of by a mutant that can never die.
     ("D7", "over", "later phases stop chaining off the previous completion",
      [('        if p_idx > 0 and len(phases) > 0 and phases[-1].get("completedAt"):\n'
        '            start = phases[-1]["completedAt"]\n', "")]),
