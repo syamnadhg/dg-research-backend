@@ -41,6 +41,7 @@ Fixes verified here (BE side):
 """
 
 import inspect
+import re
 import sys
 from pathlib import Path
 
@@ -192,9 +193,30 @@ def test_claude_hard_fail_auto_skip_finalizes():
 # ── C2: hands-off salvage guards ─────────────────────────────────────────────
 
 def test_l3_auto_skip_salvage_respects_hv_blocked():
-    idx = _POLL.index("Auto-skip salvage extract failed")
-    block = _POLL[idx - 1600:idx]
-    assert "hv_blocked" in block
+    """Every auto-skip salvage sits behind the hands-off wall check.
+
+    2026-08-12: was a fixed 1600-char lookback from the first match, and the
+    frozen-page salvage fix (which added a log line and a comment above each
+    call) pushed the guard out of the window while leaving it exactly where it
+    was. Anchored to the branch instead, and checked at BOTH sites rather than
+    whichever one `.index` happened to land on — the count is what would catch
+    a third salvage site being added without the guard."""
+    hits = [m.start() for m in re.finditer("Auto-skip salvage extract failed", _POLL)]
+    assert len(hits) == 3, (
+        "the number of auto-skip salvage sites changed — two in the poller "
+        "(the unacted-card firer and the 90-minute ceiling) and one in the "
+        "parked-decision resolver"
+    )
+    for idx in hits:
+        before = _POLL[:idx]
+        assert "_controls.hv_blocked" in before
+        guard = before.rindex("_controls.hv_blocked")
+        # Everything between the NEAREST wall check and this salvage: it has to
+        # contain the extraction that check is guarding, and nothing that would
+        # mean the check belongs to some other site further up.
+        span = before[guard:]
+        assert "extract_fns[" in span
+        assert "_controls.hv_blocked" not in span[len("_controls.hv_blocked"):]
 
 
 def test_hard_fail_salvage_respects_hv_blocked():

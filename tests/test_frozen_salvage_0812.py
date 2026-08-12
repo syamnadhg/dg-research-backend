@@ -38,11 +38,18 @@ DOM-tier-only, and the exact call shape Phase 1 uses on every run. Cheap salvage
 still happens, so a partial report is still mined; only the tiers that go
 hunting for a finished document are dropped.
 
-Applied at BOTH auto-skip salvage sites. The unacted-card firer runs the same
-ladder off copy that literally reads "stayed frozen with no response", and it
-carries a second cost the hard-cap site does not: its own comment explains that
-a user Retry or Skip landing mid-salvage has to win, and a six-minute ladder
-leaves that decision unserved for six minutes.
+Applied at BOTH auto-skip salvage sites in the poller. The unacted-card firer
+runs the same ladder off copy that literally reads "stayed frozen with no
+response", and it carries a second cost the hard-cap site does not: its own
+comment explains that a user Retry or Skip landing mid-salvage has to win, and a
+six-minute ladder leaves that decision unserved for six minutes.
+
+Two further auto-skip salvages are deliberately left alone, both because they
+run only on a PARKED leg: the poller's parked hard cap and
+`_resolve_parked_agent_decision`'s unanswered-timeout path. A parked leg
+`continue`s above the growth checkpoint every tick, so its clock stops the
+moment it parks — the decision would read "the page stopped" off a leg that is
+only waiting for the user.
 """
 import ast
 import asyncio
@@ -224,6 +231,21 @@ def test_the_other_five_sites_still_get_the_whole_ladder():
             assert isinstance(kw.get(arg), ast.Name) and kw[arg].id == arg, (
                 f"a non-auto-skip extraction site had its {arg} made conditional"
             )
+
+
+def test_the_parked_resolvers_own_salvage_is_excluded_for_the_same_reason():
+    """There is a fourth auto-skip salvage, outside the poller entirely:
+    `_resolve_parked_agent_decision`'s unanswered-timeout path for Claude's
+    two-artifact card. It is excluded on the same grounds as the parked hard
+    cap — it only ever runs on a parked leg, whose growth clock stopped when it
+    parked — and it keeps the whole ladder."""
+    src = code_only(research._resolve_parked_agent_decision)
+    assert "_frozen_to_a_working_scraper" not in src
+    at = src.index("extract_fns[name](")
+    assert "browser=browser, cua_client=cua_client," in src[at:at + 200]
+    assert "hv_blocked" in src[max(0, at - 500):at], (
+        "the resolver's salvage lost its hands-off wall check"
+    )
 
 
 def test_the_parked_resolver_is_reached_before_the_growth_bookkeeping():

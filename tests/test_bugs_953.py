@@ -515,8 +515,12 @@ def test_empty_cua_timeout_retracts_card_and_closes_tab():
 def test_parked_hard_cap_still_bites():
     # Review fold-in #5: the 90-min per-agent ceiling must fire even while
     # parked (a re-parking kind must not ride past it).
+    # 2026-08-12: was a fixed 2000-char window, and a comment added at this exact
+    # site (recording why the parked resolver is deliberately NOT frozen-aware)
+    # pushed the finalize reason out of it while leaving the code identical.
+    # Bounded at the resolver's next branch instead of by character count.
     i = POLL_SRC.index('_parked = p.get("awaiting_decision")')
-    blk = POLL_SRC[i:i + 2000]
+    blk = POLL_SRC[i:POLL_SRC.index("_pk_dec = _controls.poll_agent_decision", i)]
     assert "PER_AGENT_HARD_CAP_SEC" in blk
     assert "auto_skip_hard_cap" in blk
 
