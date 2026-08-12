@@ -58,7 +58,7 @@ import subprocess
 import collections
 import logging          # only to reshape uvicorn's own records — see _uvicorn_log_config
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 # ── gRPC's own C++ logger must not narrate into our terminal ────────────────
 # Observed live in a `--serve` capture, three times, one of them landing between
@@ -13954,10 +13954,73 @@ _NLM_DIALOG_SCOPES = ['[role="dialog"]', 'mat-dialog-container', '[class*="dialo
 
 
 # Per-platform patterns that indicate a REAL public/shareable link (not a page URL)
+# (host, path-prefix) pairs that make a URL a PUBLIC share link, per platform.
+#
+# ⭐ 2026-08-11. Every agent in the 2026-08-11 e2e published successfully and
+# every link was thrown away, because these shapes were written against hosts the
+# vendors have since moved off:
+#
+#   Gemini published  https://share.gemini.google/G85YKq3hPsyG
+#     — a NEW HOST. The old rule wanted `gemini.google.com/share`, and the DOM
+#       read only queried `input[value*=...]` for the old hosts, so the link was
+#       never even read off the dialog.
+#   Claude published  https://claude.ai/public/artifacts/<id>
+#     — the old rule wanted `claude.site`, so the URL WAS read and then silently
+#       rejected. The run reported "unverified" with an empty reason.
+#
+# The result was a finished report whose three links pointed at private
+# conversation URLs that only the run's own account can open.
+#
+# ⭐ MATCHED ON HOST, not by substring. `"gemini.google.com/share" in url` is the
+# same mistake that discarded 56% of the activity panel's sources on 2026-08-06,
+# when a filter substring-matched the whole URL and ChatGPT's outbound links
+# carry `?utm_source=chatgpt.com`. A query string must never be able to satisfy
+# a host rule. Old and new forms are both listed because both ship at once.
+_PUBLIC_SHARE_SHAPES = {
+    "chatgpt": ((("chatgpt.com",), "/share/"),),
+    "gemini":  ((("gemini.google.com",), "/share"),
+                (("g.co",), "/gemini"),
+                (("share.gemini.google",), "/")),
+    "claude":  ((("claude.site",), "/"),
+                (("claude.ai",), "/public/")),
+}
+
+
+def _is_public_share_url(platform: str, url: str) -> bool:
+    """Is `url` a public share link for `platform`?
+
+    Host must MATCH (exactly, or as a subdomain), and the path must start with
+    the platform's share prefix AND carry something after it — `/share` with no
+    id is the dialog, not a link.
+    """
+    shapes = _PUBLIC_SHARE_SHAPES.get((platform or "").lower().replace(" ", ""))
+    if not shapes or not url:
+        return False
+    try:
+        parts = urlsplit(url.strip())
+    except Exception:
+        return False
+    if parts.scheme not in ("http", "https"):
+        return False
+    host = (parts.hostname or "").lower()
+    path = parts.path or "/"
+    for hosts, prefix in shapes:
+        if not any(host == h or host.endswith("." + h) for h in hosts):
+            continue
+        if not path.startswith(prefix):
+            continue
+        # something must follow the prefix — otherwise this is the share
+        # surface itself, not a link to anything.
+        if path.rstrip("/") == prefix.rstrip("/"):
+            continue
+        return True
+    return False
+
+
 _LINK_VALIDATORS = {
-    "chatgpt": lambda u: "chatgpt.com/share/" in u,
-    "gemini":  lambda u: ("gemini.google.com/share" in u or "g.co/gemini" in u),
-    "claude":  lambda u: ("claude.site/artifacts/" in u or "claude.site/" in u),
+    "chatgpt": lambda u: _is_public_share_url("chatgpt", u),
+    "gemini":  lambda u: _is_public_share_url("gemini", u),
+    "claude":  lambda u: _is_public_share_url("claude", u),
     "notebooklm": is_notebooklm_url,
     "youtube": lambda u: ("youtu.be/" in u or "youtube.com/watch?v=" in u),
     # Require the `/document/d/` doc-id segment — `/document/` alone
@@ -14764,7 +14827,14 @@ async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Rese
 
             # Look for shareable link in modal
             last_stage = "link_lookup"
-            link_el = await page.query_selector('input[value*="g.co/gemini"]')
+            # ⭐ 2026-08-11: `share.gemini.google` is where Gemini now puts these.
+            # With only the two older selectors this read matched nothing, so the
+            # published link was never taken off the dialog at all — the run then
+            # reported "unverified" with an empty reason and shipped the private
+            # chat URL instead. Ordered newest-first; all three still ship.
+            link_el = await page.query_selector('input[value*="share.gemini.google"]')
+            if not link_el:
+                link_el = await page.query_selector('input[value*="g.co/gemini"]')
             if not link_el:
                 link_el = await page.query_selector('input[value*="gemini.google.com/share"]')
             if link_el:
@@ -14871,8 +14941,14 @@ async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Rese
         # share-dialog URL never sneaks through as verified. The Phase 2 outer
         # loop will fall back to the chat URL silently with verified=False when
         # this gate fails.
-        _lu = url.lower()
-        verified = ("gemini.google.com/share" in _lu) or ("g.co/gemini" in _lu)
+        # 2026-08-11: one authority — `_is_public_share_url`. This gate and
+        # `_LINK_VALIDATORS` used to be separate copies of the same idea, and
+        # they drifted: Claude's copy accepted a URL that the validator then
+        # rejected, so the link was captured and silently dropped downstream.
+        verified = _is_public_share_url("gemini", url)
+        if url and not verified:
+            log(f"[{label}] a link was read but is not a public share URL — "
+                f"{url[:120]}", "WARN")
         return LinkResult(url=url, label=label, platform="gemini", verified=verified,
                           cua_attempted=cua_attempted)
     except Exception as e:
@@ -15036,7 +15112,13 @@ async def extract_share_link_claude(browser, cua_client, label="Claude Deep Rese
         # claude.site/ URL counts as verified. A bare claude.ai/chat/... URL is
         # the user's own chat (not a public share) — the Phase 2 outer loop will
         # fall back to it silently with verified=False when this gate fails.
-        verified = "claude.site" in url.lower()
+        # 2026-08-11: same authority as every other gate. The old
+        # `"claude.site" in url` rejected the live `claude.ai/public/artifacts/…`
+        # that the Publish flow now produces — read, then dropped, silently.
+        verified = _is_public_share_url("claude", url)
+        if url and not verified:
+            log(f"[{label}] a link was read but is not a public share URL — "
+                f"{url[:120]}", "WARN")
         return LinkResult(url=url, label=label, platform="claude", verified=verified,
                           cua_attempted=cua_attempted)
     except Exception as e:
@@ -29218,9 +29300,23 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
                     except Exception:
                         pass
                 else:
-                    err = (link_res.error if link_res else "no result")
-                    log(f"[{name}] Inline share-link unverified ({err}, {_elapsed_share:.1f}s) "
-                        f"— falling back to conversation URL silently", "INFO")
+                    # ⭐ 2026-08-11: this line used to read
+                    #   "Inline share-link unverified (, 71.0s)"
+                    # — an empty reason, at INFO, for a run where the agent HAD
+                    # published successfully and the URL was thrown away by a
+                    # stale host rule. Nothing said which of the two happened
+                    # (no link found vs found-and-rejected), and nothing printed
+                    # the URL. Both cost the reader the answer, so both are here
+                    # now, and the level matches the consequence: the report goes
+                    # out linking to a conversation only this account can open.
+                    err = (link_res.error if link_res else "no result") or "no reason given"
+                    _got = (link_res.url if link_res else "") or ""
+                    log(f"[{name}] no public share link ({err}, {_elapsed_share:.1f}s) — "
+                        + (f"a URL was produced but did not pass the public-share "
+                           f"rules: {_got[:120]}" if _got
+                           else "the extractor returned no URL at all")
+                        + f". Falling back to the conversation URL, which is NOT "
+                          f"viewable by anyone else.", "WARN")
                 # Capture whether the inner extractor's CUA fallback already
                 # ran — Step 4b below skips when True to avoid a wonky-modal
                 # double-CUA pass (was a tab-spam contributor on Gemini's
@@ -50660,6 +50756,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # bug precisely because its BE + backfill labels already matched.
                 _p1_links = [{"label": "Read Brief report", "url": _in_app_brief_url, "verified": True, "primary": True}]
                 save_checkpoint(queue_dir, 1, topic=topic, brief_url=_in_app_brief_url)
+                # Same ordering rule as the extract branch below: record the
+                # terminal status BEFORE save_meta rebuilds the phases array
+                # from it, or an earlier fail_phase's "errored" is what lands
+                # on disk and nothing rewrites the file.
+                _write_phase_terminal_status(1, "complete")
                 save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip())
                 emit_event("phase_complete", phase=1,
                     durationSec=int(time.time() - _p1_start), links=_p1_links,
@@ -50704,12 +50805,22 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 _p1_links = [{"label": "Read Brief report", "url": _in_app_brief_url, "verified": True, "primary": True}]
                 save_checkpoint(queue_dir, 1, topic=topic, brief_url=_in_app_brief_url)
                 update_delivery(brief_url=_in_app_brief_url)
+                # ⭐ 2026-08-11 — ORDER IS THE FIX. `save_meta` rebuilds the whole
+                # `phases` array from the recorded terminal statuses, and this
+                # call used to sit BEFORE the "complete" was recorded. So when
+                # phase 1 had surfaced a stall card earlier in the run,
+                # `fail_phase` had already recorded "errored" — meta.json was
+                # written carrying it, and nothing rewrote the file afterwards.
+                # The 2026-08-11 run shipped a 64 KB brief with
+                # `phases[1].status = "errored"` and `durationSec: 0` on disk,
+                # while Firestore (written after) said complete. Recording first
+                # makes the file and the doc agree.
+                _write_phase_terminal_status(1, "complete")
                 save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip())
                 emit_event("phase_complete", phase=1, durationSec=int(time.time() - _p1_start),
                     links=_p1_links,
                     summary=f"Research brief generated ({brief_artifact.chars} chars, {len(brief_artifact.sections)} sections)")
                 _update_firestore_research({"phase": 1, "status": "ongoing", "links.phase1": _p1_links})
-                _write_phase_terminal_status(1, "complete")
                 # 2026-05-12: REMOVED `_write_agent_terminal_status("chatgpt", "complete")` —
                 # see _p1_skipped_after_error branch above for rationale
                 # (chatgpt slot is shared with P2).
