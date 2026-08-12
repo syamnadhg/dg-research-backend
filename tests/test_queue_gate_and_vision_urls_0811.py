@@ -50,6 +50,7 @@ WHAT THESE TESTS PIN
      named when the JSON does not parse.
   4. Whole URLs survive a truncated response; a clipped one never does.
 """
+import ast
 import inspect
 import io
 import functools
@@ -195,10 +196,46 @@ def test_every_prior_release_path_survives(release):
 
 
 def test_the_resume_and_errored_short_circuits_are_untouched():
-    """Both run before the wait and both prevent a circular deadlock."""
+    """Both run before the wait and both prevent a circular deadlock.
+
+    ⭐ Asserted on the CONDITIONS, not on the messages they log. The message
+    version of this passed against `if False:` — the log line sits inside the
+    disabled branch and goes on matching. That is the same trap that cost two
+    rounds on the Phase 1 completion guard."""
     src = gate_src()
+    assert 'if _current_job and (_current_job.get("research_id") or "") == _prid:' in src
+    assert "if _pdone <= 0:" in src
+    # and the branches still say what they do
     assert "matches last_completed_rid — resume path, skipping wait" in src
     assert "prior run errored — skipping FE-completion wait" in src
+
+
+def test_no_branch_in_the_wait_loop_skips_the_deadline_test():
+    """The deadline test is the last statement before the sleep, so anything
+    that `continue`s past it makes the gate un-expirable. Read off the syntax
+    tree: a textual search cannot tell a loop-level `continue` from one inside
+    a nested for-loop elsewhere in the function."""
+    fn = textwrap.dedent(gate_src())
+    tree = ast.parse(fn)
+    loops = [n for n in ast.walk(tree)
+             if isinstance(n, ast.While) and isinstance(n.test, ast.Constant)
+             and n.test.value is True]
+    assert len(loops) == 1, "expected exactly one `while True:` poll loop"
+    # `continue` statements belonging to THIS loop — not to any loop nested in it.
+    def owned_continues(node):
+        found = []
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.While, ast.For, ast.AsyncFor,
+                                  ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if isinstance(child, ast.Continue):
+                found.append(child)
+            found.extend(owned_continues(child))
+        return found
+    assert owned_continues(loops[0]) == [], (
+        "a `continue` in the poll loop can jump past the deadline test — on a "
+        "prior doc that keeps failing to read, the gate would never expire"
+    )
 
 
 # --------------------------------------------------------- vision URLs
@@ -234,6 +271,22 @@ def test_only_the_json_decode_is_caught_by_the_salvage_branch():
     """A network error must not be reported as a truncated response."""
     src = vision_src()
     assert "except ValueError as _je:" in src
+
+
+def test_the_handler_actually_calls_the_salvage():
+    """⭐ Every other test here exercises the helper directly, so all of them
+    still pass when the call site is replaced with an empty list — the helper
+    would be perfect and unreachable. Read the assignment off the syntax tree."""
+    tree = ast.parse(textwrap.dedent(vision_src()))
+    calls = [
+        getattr(n.value.func, "id", None)
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Assign)
+        and any(getattr(t, "id", "") == "_salvaged" for t in n.targets)
+    ]
+    assert calls == ["_salvage_urls_from_truncated_json"], (
+        f"_salvaged is built from {calls!r} — the recovery is not wired in"
+    )
 
 
 @pytest.mark.parametrize("text,expected", [

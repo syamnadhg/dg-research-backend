@@ -56,9 +56,10 @@ MUTANTS = [
        '                log(f"[queue-gate] prior run {_prid[:8]}… is "',
        "            if False:\n"
        '                log(f"[queue-gate] prior run {_prid[:8]}… is "')]),
-    ("X2", "over", "the deadline test lands after the sleep, so a failed read never reaches it",
-     [("                return\n            await asyncio.sleep(2)",
-       "                return\n            await asyncio.sleep(2)\n            continue")]),
+    ("X2", "over", "a failed read skips the deadline test, so the gate spins forever",
+     [('                log(f"[queue-gate] Firestore read failed: {e}", "WARN")',
+       '                log(f"[queue-gate] Firestore read failed: {e}", "WARN")\n'
+       "                await asyncio.sleep(2)\n                continue")]),
     ("X3", "over", "the terminal-status release is gone",
      [('                        log(f"[queue-gate] prior run terminal (status={status}) — dequeueing")\n'
        '                        _QUEUE_STATE.pop("gate_pending_job", None)\n'
@@ -78,8 +79,15 @@ MUTANTS = [
      [('                    log("[queue-gate] read denied (synth user) — releasing gate (Track D)", "DEBUG")\n'
        '                    _QUEUE_STATE.pop("gate_pending_job", None)\n'
        "                    return\n", "")]),
+    # NOTE the context: `if _controls.is_stop():` occurs dozens of times in this
+    # file and the first is ~40k lines above the gate. A bare anchor mutated a
+    # completely different function and this mutant "survived" without ever
+    # touching the code under test.
     ("X8", "over", "a cancel during the gate wait is ignored again",
-     [("                if _controls.is_stop():", "                if False:")]),
+     [("                if _controls.is_stop():\n"
+       '                    log("[queue-gate] stop requested during gate wait — releasing", "INFO")',
+       "                if False:\n"
+       '                    log("[queue-gate] stop requested during gate wait — releasing", "INFO")')]),
     ("X9", "over", "the resume-path short-circuit is gone — the gate waits on itself",
      [('        if _current_job and (_current_job.get("research_id") or "") == _prid:',
        "        if False:")]),
