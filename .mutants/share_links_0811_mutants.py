@@ -27,7 +27,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 RESEARCH = "research.py"
 
-SUITES = "tests/test_share_links_0811.py tests/test_gemini_share_preview_guard.py"
+# 2026-08-12: test_share_expectations_0811.py added. Re-anchoring E1 made it
+# apply again and it SURVIVED — not because the level is unguarded, but
+# because the assertion that guards it lives in that file and this harness
+# was not running it. A mutant can only die against a suite that is run.
+SUITES = ("tests/test_share_links_0811.py tests/test_gemini_share_preview_guard.py "
+          "tests/test_share_expectations_0811.py")
 
 MUTANTS = [
     # ── the hosts that rotted ───────────────────────────────────────────────
