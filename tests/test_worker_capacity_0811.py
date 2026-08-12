@@ -299,10 +299,19 @@ def test_the_defer_gate_entry_condition_is_unchanged():
 
 
 def test_the_defer_gate_still_defers_on_every_busy_signal():
+    """Read as ONE condition, not four substrings.
+
+    ⭐ The substring version of this test passed against a gate that had lost
+    `job_queue.qsize() > 0` entirely — the reason-selector `elif` a few lines
+    below still contained the same characters. Four separate `in` checks cannot
+    tell which occurrence they matched; the whole condition can."""
     src = _listener_src()
-    for signal in ('_resting', '_QUEUE_STATE.get("running")',
-                   'job_queue.qsize() > 0', '_pending_enq_read() > 0'):
-        assert signal in src, f"the busy check lost {signal}"
+    i = src.index("if (_resting")
+    cond = " ".join(src[i:src.index("):", i) + 1].split())
+    assert cond == (
+        'if (_resting or _QUEUE_STATE.get("running") '
+        'or job_queue.qsize() > 0 or _pending_enq_read() > 0)'
+    ), f"the busy check changed shape: {cond}"
 
 
 def test_the_settle_window_and_sibling_recheck_survive():
@@ -313,12 +322,32 @@ def test_the_settle_window_and_sibling_recheck_survive():
     assert "skipping queued write" in src
 
 
+def _rescan_src() -> str:
+    """The idle-rescan scan body — from its rest-drain log to its claim loop."""
+    src = module_src()
+    i = src.index("[idle-rescan] worker {WORKER_ID}: rest episode drained")
+    return src[i:src.index("for snap in candidates:", i)]
+
+
 def test_idle_rescan_still_sorts_fifo():
     """Stream order is by doc id, so without the sort the OLDEST orphan can sit
-    under a newer one forever."""
-    src = module_src()
+    under a newer one forever.
+
+    ⭐ Anchored inside the rescan and matched with its indentation. The loose
+    version of this passed against a deleted sort, because the START-LISTENER's
+    pre-query line — `_head_candidates.sort(key=_fifo_key)` — CONTAINS the
+    string `candidates.sort(key=_fifo_key)` as a suffix."""
+    src = _rescan_src()
     assert "def _fifo_key(_snap):" in src
-    assert "candidates.sort(key=_fifo_key)" in src
+    assert "\n        candidates.sort(key=_fifo_key)\n" in src
+
+
+def test_the_start_listeners_fifo_pre_query_also_survives():
+    """The other FIFO protection, and the one whose name masked the first.
+    Firestore delivers ADDED in doc-id order, so without this the oldest
+    submitted run is not the one that gets the free worker."""
+    src = module_src()
+    assert "_head_candidates.sort(key=_fifo_key)" in src
 
 
 def test_local_pending_owner_entries_still_keys_on_the_configured_count():
