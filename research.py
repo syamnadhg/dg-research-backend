@@ -48639,6 +48639,31 @@ def _extract_findings(md: str, source_urls: list) -> list:
     return findings
 
 
+def _run_started_ms(queue_dir) -> int:
+    """When the RUN began — not when meta.json first happened to be written.
+
+    ⭐ 2026-08-11. `createdAt` used to be stamped `now` on the first write, and
+    the first write is the END of Phase 1. Every backfilled phase takes its
+    start from `createdAt`, so Phase 1 was born already finished: the 11 August
+    run spent 14m33s on the Research Brief and recorded `durationSec: 0`. Not a
+    rounding error and not occasional — structurally guaranteed on every run,
+    for the one phase the owner waits through most visibly.
+
+    `config.json` and `owner.json` are written once, at queue-dir creation, and
+    never touched again, so the earlier of their timestamps is when the run
+    started. Falls back to now, which is exactly the old behaviour.
+    """
+    stamps = []
+    for name in ("config.json", "owner.json"):
+        try:
+            p = Path(queue_dir) / name
+            if p.exists():
+                stamps.append(int(p.stat().st_mtime * 1000))
+        except Exception:
+            pass
+    return min(stamps) if stamps else int(time.time() * 1000)
+
+
 def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
     """Save/update meta.json — powers ALL frontend components (graphs, analytics, tracking).
     Contains: Research object + per-agent stats + phase timeline + source references."""
@@ -48652,7 +48677,10 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
             pass
     if "id" not in meta:
         meta["id"] = queue_dir.name
-        meta["createdAt"] = int(time.time() * 1000)
+        # NOT `now` — see `_run_started_ms`. This value is the start of every
+        # phase that gets backfilled below, and the first write lands at the
+        # end of Phase 1.
+        meta["createdAt"] = _run_started_ms(queue_dir)
 
     # ── Scan documents/ for files ──
     docs = []
