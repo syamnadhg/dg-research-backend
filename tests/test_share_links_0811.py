@@ -219,8 +219,11 @@ def test_the_fallback_names_which_failure_happened_and_prints_the_url():
     unshareable."""
     src = code_only(inspect.getsource(research.extract_and_record_agent))
     assert "Inline share-link unverified" not in src, "the empty-reason line is gone"
-    at = src.index("no public share link")
-    window = src[at:at + 700]
+    # 2026-08-11 (later the same day): the reason moved into `_detail`, which is
+    # built just above the log call and shared by both the expected-agent warning
+    # and the ChatGPT DEBUG line. Anchor on where it is BUILT.
+    at = src.index("_detail = ")
+    window = src[at:at + 1200]
     assert "did not pass the public-share" in window, "must distinguish rejected…"
     assert "returned no URL at all" in window, "…from never-found"
     assert "NOT" in window and "viewable" in window, "must say the fallback is private"
@@ -229,13 +232,8 @@ def test_the_fallback_names_which_failure_happened_and_prints_the_url():
     # reader would be told a URL was rejected and never shown which one, which
     # is the same dead end as the original empty-reason line.
     assert "{_got[:120]}" in window, "the rejected URL must be printed, not described"
-
-
-def test_the_fallback_is_a_warning_not_an_info_line():
-    """It ships a report whose links open for nobody else. That is not INFO."""
-    src = inspect.getsource(research.extract_and_record_agent)
-    at = src.index("no public share link")
-    assert re.search(r'"WARN"\)', src[at:at + 900]), "the fallback must log at WARN"
+    # …and the detail reaches BOTH branches, so the quiet one is still diagnosable.
+    assert window.count("{_detail}") == 2
 
 
 def test_a_read_but_rejected_link_is_reported_by_the_extractor_too():

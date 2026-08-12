@@ -14028,6 +14028,23 @@ _PUBLIC_SHARE_SHAPES = {
 }
 
 
+# Which agents we EXPECT a public share link from, and therefore warn about
+# when one doesn't arrive.
+#
+# ChatGPT is deliberately absent. Its conversation URL is the intended outcome —
+# durable links reach the owner by email in the Google Doc, so a missing public
+# share there is the normal ending, not a fault. Warning on it every single run
+# is how a real regression gets lost: Gemini and Claude DID silently lose their
+# public links on 2026-08-11, and the line that should have said so would have
+# been sitting in a pile of identical noise from ChatGPT.
+_PUBLIC_SHARE_EXPECTED = ("gemini", "claude")
+
+
+def _public_share_is_expected(platform: str) -> bool:
+    """Should a missing public share link for `platform` be treated as a fault?"""
+    return (platform or "").strip().lower() in _PUBLIC_SHARE_EXPECTED
+
+
 def _is_public_share_url(platform: str, url: str) -> bool:
     """Is `url` a public share link for `platform`?
 
@@ -29408,12 +29425,20 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
                     # out linking to a conversation only this account can open.
                     err = (link_res.error if link_res else "no result") or "no reason given"
                     _got = (link_res.url if link_res else "") or ""
-                    log(f"[{name}] no public share link ({err}, {_elapsed_share:.1f}s) — "
-                        + (f"a URL was produced but did not pass the public-share "
-                           f"rules: {_got[:120]}" if _got
-                           else "the extractor returned no URL at all")
-                        + f". Falling back to the conversation URL, which is NOT "
-                          f"viewable by anyone else.", "WARN")
+                    _detail = (f"a URL was produced but did not pass the public-share "
+                               f"rules: {_got[:120]}" if _got
+                               else "the extractor returned no URL at all")
+                    if _public_share_is_expected(agent_key):
+                        log(f"[{name}] no public share link ({err}, {_elapsed_share:.1f}s) — "
+                            f"{_detail}. Falling back to the conversation URL, which is "
+                            f"NOT viewable by anyone else.", "WARN")
+                    else:
+                        # See `_PUBLIC_SHARE_EXPECTED`. Recorded, not raised: the
+                        # conversation URL is this agent's intended ending and the
+                        # owner gets durable links by email in the Google Doc.
+                        log(f"[{name}] using the conversation URL "
+                            f"({_elapsed_share:.1f}s) — no public share expected "
+                            f"from this agent ({_detail})", "DEBUG")
                 # Capture whether the inner extractor's CUA fallback already
                 # ran — Step 4b below skips when True to avoid a wonky-modal
                 # double-CUA pass (was a tab-spam contributor on Gemini's
@@ -46238,8 +46263,19 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
                     if nlm_share_res.verified:
                         log(f"NotebookLM public share OK (DOM-verified): {notebook_url}")
                     else:
-                        log(f"NotebookLM share link OK but public access NOT DOM-verified "
-                            f"— the link may be private: {notebook_url}", "WARN")
+                        # 2026-08-11: was a WARN saying "the link may be private".
+                        # It isn't — the share step ran and reported success, and
+                        # the owner confirms these notebooks come out public every
+                        # time. What failed is the READ-BACK: the control that used
+                        # to expose "Anyone with the link" no longer matches, and
+                        # the comment above records that `verified` has never once
+                        # been true in the corpus. A detector that is wrong on 100%
+                        # of runs must not speak in the voice of a broken feature,
+                        # so this states what actually happened and stays quiet.
+                        log(f"NotebookLM shared; could not read the sharing state back "
+                            f"(the confirmation control no longer matches — detector "
+                            f"gap, not evidence the link is private): {notebook_url}",
+                            "DEBUG")
                     # Track-B success-path observe (P3 notebook public share).
                     _observe_dom_success(browser.page, hotspot_id="p3-share", phase=3,
                                          platform="notebooklm", current_step="open_share_set_public_get_link",
@@ -51935,8 +51971,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     if nb_res.verified or is_notebooklm_url(nb_res.url):
                         notebook_url = nb_res.url
                         if not nb_res.verified:
-                            log("[NotebookLM] URL-shape OK but public-share NOT DOM-verified — "
-                                "downstream link may be private", "WARN")
+                            # Same false alarm as the primary path — see there.
+                            log("[NotebookLM] shared; sharing state could not be read "
+                                "back (detector gap, not evidence the link is private)",
+                                "DEBUG")
                         break
                     log(f"Phase 3: no verified NotebookLM URL after retries — awaiting user decision ({nb_res.error})", "ERROR")
                     # #893: a stale trusted Google cookie lands here as a
