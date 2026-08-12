@@ -5231,6 +5231,7 @@ async def _heartbeat_loop():
                 # queued even when worker 2 is idle and ready to take it.
                 # Heartbeat is the natural carrier (already running on
                 # worker 1 only, already updating allow-listed fields).
+                #
                 # 2026-08-11: publish RUNNING capacity, not configured
                 # profile count. See `_running_worker_capacity` — a
                 # foreground serve on a 2-profile device runs one worker
@@ -27341,6 +27342,36 @@ _VISION_URL_PROMPT = (
     "no URLs visible (return empty list)."
 )
 
+# Confidence assigned to URLs recovered from a response that ran out of tokens.
+# Above the 0.4 floor because a model that wrote out whole URLs demonstrably read
+# the panel; below the 0.7 the prompt reserves for a clean read, because we never
+# saw the model's own verdict — the `confidence` field is the LAST thing in the
+# schema and a truncated response stops before it.
+_VISION_URL_SALVAGE_CONFIDENCE = 0.5
+
+# Only a URL that reached its CLOSING quote. A clipped last entry
+# (`"https://example.com/artic`) has no closing quote and is skipped, which is
+# the same instruction the prompt gives the model about truncated text on screen.
+_VISION_URL_SALVAGE_RE = re.compile(r'"(https?://[^"\\\s]{4,500})"')
+
+
+def _salvage_urls_from_truncated_json(text: str) -> "list[str]":
+    """Whole URLs from a JSON response that stopped mid-object.
+
+    ⭐ 2026-08-11. The alternative is returning nothing, and returning nothing
+    is how the activity panel lost 56% of its sources on 08-06: one late failure
+    discarding an entire batch that was overwhelmingly fine. A response clipped
+    at the token ceiling still contains every URL the model finished writing.
+
+    Deliberately a scan for closed quoted strings rather than a partial-JSON
+    parser: it cannot half-read a URL, and everything it returns still goes
+    through the scheme / length / platform-domain filter that the parsed path
+    uses. Order is preserved and duplicates are left to that filter."""
+    if not text:
+        return []
+    return _VISION_URL_SALVAGE_RE.findall(text)
+
+
 _VISION_URL_SKIP_DOMAINS = (
     "chatgpt.com", "openai.com", "oaiusercontent",
     "claude.ai", "anthropic.com",
@@ -27402,7 +27433,16 @@ async def extract_source_urls_via_vision(page, agent_key: str,
         "systemInstruction": {"parts": [{"text": _VISION_URL_PROMPT}]},
         "generationConfig": {
             "temperature": 0.0,
-            "maxOutputTokens": 800,
+            # 2026-08-11: 800 → 2400. Same defect narrate.py fixed on 08-05 and
+            # this call site never got: the ceiling was sized for a request that
+            # disabled thinking, `thinkingConfig` was removed when the live
+            # endpoint started rejecting it, and reasoning tokens now come out of
+            # this budget. narrate.py needed 1400 for a sentence of prose; this
+            # returns a list of full URLs, which is far longer. Both runs on
+            # 08-11 died mid-object — "Expecting property name enclosed in
+            # double quotes: line 7 column 1" is what a clipped array looks like
+            # — and every source in the panel was lost with it.
+            "maxOutputTokens": 2400,
             "responseMimeType": "application/json",
             "responseSchema": _VISION_URL_SCHEMA,
         },
@@ -27417,13 +27457,29 @@ async def extract_source_urls_via_vision(page, agent_key: str,
                     f"{resp.text[:140]}", "WARN")
                 return [], 0.0
             j = resp.json()
-            text = (j.get("candidates", [{}])[0]
-                      .get("content", {}).get("parts", [{}])[0]
-                      .get("text", ""))
-            data = json.loads(text)
+            _cand = (j.get("candidates") or [{}])[0]
+            _finish = _cand.get("finishReason") or ""
+            text = (_cand.get("content", {}).get("parts", [{}])[0]
+                        .get("text", ""))
+            try:
+                data = json.loads(text)
+            except ValueError as _je:
+                # The answer was cut off, not malformed. Say which — the old
+                # line reported a parse error for what was really an exhausted
+                # token budget, and that reading sent the 08-11 investigation
+                # after the prompt instead of the ceiling.
+                _salvaged = _salvage_urls_from_truncated_json(text)
+                log(f"[{agent_key}] vision-urls response was not complete JSON "
+                    f"(finishReason={_finish or 'unset'}, {len(text)} chars): {_je} — "
+                    f"salvaged {len(_salvaged)} whole URLs from it", "WARN")
+                # A truncated object never reaches its trailing `confidence`
+                # field, so there is none to read. URLs the model finished
+                # writing are their own evidence that it could read the panel;
+                # they still pass the scheme/domain filter below like any other.
+                return _salvaged, (_VISION_URL_SALVAGE_CONFIDENCE if _salvaged else 0.0)
             return (data.get("urls") or []), float(data.get("confidence", 0) or 0)
         except Exception as e:
-            log(f"[{agent_key}] vision-urls call/parse error: {e}", "WARN")
+            log(f"[{agent_key}] vision-urls call error: {e}", "WARN")
             return [], 0.0
 
     try:
@@ -54063,7 +54119,22 @@ async def run_server(port=8000):
         STUCK_STATUS_RELEASE_MS = 5 * 60 * 1000
         _stuck_first_seen_ms: int = 0
         _stuck_status_signature: str = ""  # f"{status}|{feP5State}"
-        log(f"[queue-gate] waiting for prior run {_prid[:8]}… FE-P5 completion (fallback in {BE_PHASES_TIMEOUT_SEC}s)")
+        # 2026-08-11: say how long is ACTUALLY left, not the constant. The
+        # deadline is anchored to when the PRIOR run finished, not to when this
+        # gate opened — so on a device that has been idle for longer than the
+        # window (the normal case: the owner starts the next run hours later)
+        # it is already in the past. The old line announced a 4200s wait and
+        # the very next line, in the same second, announced that 4200s had
+        # elapsed. Both were false, and chasing them cost real time.
+        _gate_left_ms = deadline - int(time.time() * 1000)
+        if _gate_left_ms > 0:
+            log(f"[queue-gate] waiting for prior run {_prid[:8]}… FE-P5 completion "
+                f"(fallback in {int(_gate_left_ms / 1000)}s)")
+        else:
+            log(f"[queue-gate] prior run {_prid[:8]}… finished "
+                f"{int((int(time.time() * 1000) - _pdone) / 1000)}s ago, past its "
+                f"{BE_PHASES_TIMEOUT_SEC}s FE-P5 window — checking its status once, "
+                f"not waiting")
         # 2026-05-12: register the gate-pending job so cancel handlers can
         # see it. Without this, a cancel that arrives while the worker is
         # blocked in the gate wait silently no-ops — neither in job_queue
@@ -54085,10 +54156,6 @@ async def run_server(port=8000):
             except Exception:
                 pass
             now_ms = int(time.time() * 1000)
-            if now_ms >= deadline:
-                log(f"[queue-gate] FE never reported completed in {BE_PHASES_TIMEOUT_SEC}s — force-dequeueing")
-                _QUEUE_STATE.pop("gate_pending_job", None)
-                return
             try:
                 # 2026-05-11: offload the blocking Firestore .get() to a
                 # worker thread so the gate's 2s poll doesn't block the
@@ -54167,6 +54234,21 @@ async def run_server(port=8000):
                     _QUEUE_STATE.pop("gate_pending_job", None)
                     return
                 log(f"[queue-gate] Firestore read failed: {e}", "WARN")
+            # 2026-08-11: deadline check moved BELOW the status read. It used
+            # to be the first thing in the loop, so an already-expired deadline
+            # returned before the poll had read anything even once — the gate
+            # released without ever learning that the prior run was sitting
+            # right there at status="completed", and then reported the one
+            # thing it had not checked ("FE never reported completed"). Every
+            # earlier branch returns, and the read is wrapped, so this stays
+            # reachable on every path: no read, failed read, or non-terminal.
+            if now_ms >= deadline:
+                log(f"[queue-gate] prior run {_prid[:8]}… is "
+                    f"{int((now_ms - _pdone) / 1000)}s past its backend finish with no "
+                    f"terminal status seen (FE-P5 window {BE_PHASES_TIMEOUT_SEC}s) — "
+                    f"force-dequeueing")
+                _QUEUE_STATE.pop("gate_pending_job", None)
+                return
             await asyncio.sleep(2)
 
     async def _rescan_queue_for_unclaimed():
