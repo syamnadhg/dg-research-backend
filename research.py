@@ -27340,6 +27340,59 @@ async def extract_source_urls_via_vision(page, agent_key: str,
 _MIN_SALVAGEABLE_BRIEF_LEN = 2000
 
 
+def _state_says_brief_is_done(*, verdict: str, hard_stop_signal: bool,
+                              text_len: int, flat_sec: float,
+                              page_dead_reason, min_len: int,
+                              window_sec: float) -> bool:
+    """Is the brief finished, decided WITHOUT reading any page label?
+
+    ⭐ 2026-08-11. This exists because the alternative rotted. ChatGPT renamed
+    its finished-response header from "Thought for 1m 14s" to "Worked for 9m",
+    the done-marker list had only the old literal, and a brief that was complete
+    at 62492 chars polled for 40 more minutes and then waited on a human. Adding
+    the new word would only have moved the expiry date.
+
+    So when the vision read recognises NOTHING — no stop button, no finalizing
+    indicator, and no phrase we know for done, which is exactly the shape a
+    relabel makes — the answer comes from state this pipeline measures itself:
+
+      * `hard_stop_signal` — the DOM's own reason for saying "generating" is a
+        live Stop button rather than a residual animation. The #755 note in
+        `poll_until_done` already records that every genuine success arrived via
+        a lingering animation (33024 and 68349 chars) and never via a Stop
+        button; it simply never acted on it.
+      * `text_len` — a real brief's worth of text, not a streaming stub.
+      * `flat_sec` — text AND sources AND steps all flat for the full window. A
+        Deep Research run that is still working grows sources or steps even when
+        text does not; that is the same multi-signal argument the 20-minute
+        stall surface rests on, applied 15 minutes earlier.
+      * `page_dead_reason` — a closed or `about:blank` tab has no Stop button
+        either. Conflating "finished" with "gone" declared a run complete after
+        3289 seconds on 2026-08-09.
+
+    ⛔ `verdict != "ambiguous"` returns False, and that is the load-bearing
+    guard, not a formality. A positively observed "still generating" is BELIEVED
+    — state must never out-vote it, because the resulting false "complete"
+    extracts an in-flight brief and reports "no brief generated", which is the
+    strictly worse failure and the one #753 and #755 both exist to prevent.
+
+    Extracted as a function rather than left inline because an inline condition
+    can only be tested by reading the source, and a source test passes against a
+    guard that has been disabled — which is how five mutants survived the first
+    version of this fix."""
+    if verdict != "ambiguous":
+        return False
+    if hard_stop_signal:
+        return False
+    if text_len < min_len:
+        return False
+    if flat_sec < window_sec:
+        return False
+    if page_dead_reason:
+        return False
+    return True
+
+
 class _BriefStreamStalled(Exception):
     """Raised by poll_until_done when ChatGPT's brief stream goes flat on
     text + sources + steps for STALL_THRESHOLD_SEC. Distinct from a wall-
@@ -28567,24 +28620,33 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     # if the model says it sees generation, it is believed. This
                     # only decides the case where nothing was recognised at all,
                     # which previously fell through to a 20-minute wait and a card.
+                    # The page probe is async and costs a round trip, so it only
+                    # runs in the case that can possibly qualify: nothing
+                    # recognised, and no hard stop signal. `_state_says_brief_is_done`
+                    # remains the single authority — it re-checks both.
                     if (not _sn_is_complete and _sn_verdict == "ambiguous"
-                            and not _hard_stop_signal
-                            and last_seen_len >= _SAFETY_NET_MIN_BRIEF_LEN
-                            and stall_window_start is not None
-                            and (time.time() - stall_window_start) >= SAFETY_NET_CUA_SEC):
+                            and not _hard_stop_signal):
+                        _lf_flat = ((time.time() - stall_window_start)
+                                    if stall_window_start is not None else -1.0)
                         _lf_dead = await _page_is_dead(page)
-                        if _lf_dead:
-                            log(f"[{label}] Safety-net: nothing recognised and the page "
-                                f"is not usable ({_lf_dead}) — NOT calling that complete", "WARN")
-                        else:
-                            _lf_flat = int(time.time() - stall_window_start)
+                        if _state_says_brief_is_done(
+                                verdict=_sn_verdict,
+                                hard_stop_signal=_hard_stop_signal,
+                                text_len=last_seen_len,
+                                flat_sec=_lf_flat,
+                                page_dead_reason=_lf_dead,
+                                min_len=_SAFETY_NET_MIN_BRIEF_LEN,
+                                window_sec=SAFETY_NET_CUA_SEC):
                             log(f"[{label}] Safety-net: no completion WORDING recognised, but "
                                 f"the state says done — {last_seen_len} chars with text, sources "
-                                f"and steps all flat for {_lf_flat}s, no Stop button "
+                                f"and steps all flat for {int(_lf_flat)}s, no Stop button "
                                 f"(DOM reason='{_diag_reason}'), page alive. Treating as "
                                 f"complete without relying on any page label.", "WARN")
                             _sn_is_complete = True
                             _sn_is_generating = False
+                        elif _lf_dead:
+                            log(f"[{label}] Safety-net: nothing recognised and the page "
+                                f"is not usable ({_lf_dead}) — NOT calling that complete", "WARN")
                     if _sn_is_complete:
                         _elapsed = int(time.time() - wait_start)
                         log(f"[{label}] Safety-net CUA confirms response complete ✓ "

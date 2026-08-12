@@ -129,6 +129,16 @@ def test_the_caller_treats_ambiguous_as_keep_polling_and_says_which_it_was():
     )
     m = re.search(r'"Safety-net CUA confirms still generating"\s*\n?\s*if _sn_verdict == "generating"', src)
     assert m, "the positive claim must be conditioned on a positive verdict"
+    # The WARN that makes the next relabel visible must be guarded by the
+    # verdict itself. Asserting only that the message exists passed against a
+    # build where the branch was `if False:` — that mutant survived once.
+    assert 'if _sn_verdict == "ambiguous":' in src, (
+        "the unrecognised-read WARN must fire on the ambiguous verdict"
+    )
+    at = src.index('if _sn_verdict == "ambiguous":')
+    assert "UNRECOGNISED" in src[at:at + 400], (
+        "the guarded branch must be the one that logs the evidence"
+    )
 
 
 # ── 3b. the label-free rule: wording is a fast path, not the only path ──────
@@ -144,48 +154,78 @@ def _poll_src():
     return inspect.getsource(research.poll_until_done)
 
 
-def test_an_unrecognised_read_can_complete_from_state_alone():
-    src = _poll_src()
-    assert '_sn_verdict == "ambiguous"' in src, (
-        "the label-free path must key on 'recognised nothing', which is what a "
-        "renamed page label produces"
-    )
+# The 2026-08-11 run's own numbers, so "done" here means what it meant live.
+DONE = dict(verdict="ambiguous", hard_stop_signal=False, text_len=62492,
+            flat_sec=1224.0, page_dead_reason=None, min_len=2000, window_sec=300.0)
+
+
+def _done(**over):
+    return research._state_says_brief_is_done(**{**DONE, **over})
+
+
+def test_the_live_stall_state_now_reads_as_finished():
+    """The exact state at 16:13 on 2026-08-11, which polled for 40 more
+    minutes. If this returns False the hang is back."""
+    assert _done() is True
 
 
 def test_it_never_overrides_a_positively_observed_generating_read():
     """⭐ The dangerous over-correction. If the model SAYS it sees generation,
     state must not out-vote it — that reintroduces #753's false-complete, which
-    extracts an in-flight brief."""
-    src = _poll_src()
-    # Anchor on the CONDITION, not the bare phrase — the ambiguous log line
-    # above also contains it, and matching that instead passed against a build
-    # with no guard at all (caught by this test failing on its first run).
-    at = src.index('and _sn_verdict == "ambiguous"')
-    window = src[at:at + 400]
-    assert "not _hard_stop_signal" in window, (
-        "a hard Stop-button DOM signal must block the label-free completion"
-    )
-    # scoped to ambiguous only — a positively observed "generating" is believed
-    assert '_sn_verdict in ("generating"' not in window
+    extracts an in-flight brief and reports 'no brief generated'."""
+    assert _done(verdict="generating") is False
+    assert _done(verdict="complete") is False
 
 
-@pytest.mark.parametrize("condition,why", [
-    ("not _hard_stop_signal", "a live Stop button means it really is generating"),
-    ("last_seen_len >= _SAFETY_NET_MIN_BRIEF_LEN", "a stub is not a finished brief"),
-    ("stall_window_start is not None", "flatness must have actually started"),
-    ("SAFETY_NET_CUA_SEC", "flat for the full window, not for one poll"),
-    ("_page_is_dead", "a dead tab has no Stop button either (2026-08-09)"),
+def test_a_live_stop_button_blocks_it():
+    """The DOM saying 'generating' because of a real Stop button is not the
+    residual-animation case this rule is for."""
+    assert _done(hard_stop_signal=True) is False
+
+
+def test_a_streaming_stub_is_not_a_finished_brief():
+    assert _done(text_len=1999, min_len=2000) is False
+    assert _done(text_len=2000, min_len=2000) is True
+
+
+def test_it_requires_the_full_flat_window_not_one_poll():
+    """One flat poll is normal mid-stream; the window is what makes flatness
+    evidence."""
+    assert _done(flat_sec=299.0, window_sec=300.0) is False
+    assert _done(flat_sec=300.0, window_sec=300.0) is True
+
+
+def test_flatness_that_never_started_is_not_flatness():
+    """The caller passes -1 when no stall window is open — that must not read
+    as 'flat forever'."""
+    assert _done(flat_sec=-1.0) is False
+
+
+@pytest.mark.parametrize("reason", [
+    "the tab has been closed", "the tab is gone", "the tab has no address",
 ])
-def test_every_guard_on_the_label_free_path_is_present(condition, why):
-    assert condition in _poll_src(), why
-
-
-def test_a_dead_page_is_not_completion():
+def test_a_dead_page_is_never_completion(reason):
     """The 2026-08-09 failure in one line: 'not generating' has two causes, and
-    a page that navigated to about:blank was declared complete after 3289s."""
+    an about:blank tab was declared complete after 3289s. Every one of those
+    pages also has no Stop button."""
+    assert _done(page_dead_reason=reason) is False
+
+
+def test_the_call_site_delegates_instead_of_re_deciding():
+    """A second copy of this rule inline would drift from the tested one — the
+    three-hand-rolled-copies failure that cost a run on 2026-08-05."""
     src = _poll_src()
-    at = src.index("_lf_dead")
-    assert "NOT calling that complete" in src[at:at + 500]
+    assert "_state_says_brief_is_done(" in src
+    assert "page_dead_reason=_lf_dead" in src
+
+
+def test_the_call_site_probes_the_page_before_deciding():
+    """`page_dead_reason` is only meaningful if the caller actually asks."""
+    src = _poll_src()
+    at = src.index("_state_says_brief_is_done(")
+    assert "_lf_dead = await _page_is_dead(page)" in src[:at], (
+        "the page must be probed before the verdict, not after"
+    )
 
 
 def test_the_label_free_completion_says_why_it_decided():
@@ -229,7 +269,16 @@ def test_the_card_never_says_skip_and_never_promises_a_user_written_brief():
     import inspect
     src = inspect.getsource(research.run_phase1)
     assert "Skip and write your own" not in src
-    assert "Use what's on screen" in src
+    # ⭐ Assert the BUTTON LABEL, not the phrase. The card's body copy also
+    # contains "Use what's on screen", so a loose `in src` passed while the
+    # label itself had been mutated back to "Skip" — that mutant survived the
+    # first version of this suite.
+    assert '"label": "Use what\'s on screen"' in src
+    at = src.index('"action": "skip_phase", "phase": 1')
+    assert '"label": "Skip"' not in src[max(0, at - 300):at], (
+        "the phase-1 salvage button must never be labelled Skip — phase 2 "
+        "attaches brief.md to every agent, so phase 1 cannot be skipped"
+    )
 
 
 def test_the_salvage_action_is_only_offered_when_there_is_something_to_salvage():
