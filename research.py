@@ -30416,44 +30416,6 @@ def _sweep_foreign_chatgpt_tabs(pending: dict, results: dict) -> "list[str]":
     return dropped
 
 
-def _frozen_to_a_working_scraper(p: dict, frozen_sec: float) -> bool:
-    """True when we can read this page AND what we read has not moved in ages.
-
-    ⭐ 2026-08-12. Both auto-skip paths salvage by running the agent's full
-    extraction ladder, whose upper tiers are CUA missions: open the canvas,
-    click through to Export as Markdown, wait for a download event, then a
-    select-all-and-copy under a clipboard hijack. On 08-11 that ladder ran for
-    5m57s against a ChatGPT tab that had been byte-identical for 84 minutes —
-    195 seconds waiting for a download event that could not fire, 200 more on
-    the clipboard, and 0 of 21 selectors matched — for a report the page had
-    never finished writing. The vision agent had said so out loud five minutes
-    earlier.
-
-    ⛔ WHICH IS NOT THE SAME AS "THE SCRAPE READ NOTHING". It is nearly the
-    opposite, and getting it backwards would break the exact case those tiers
-    exist for. On 2026-04-28 a healthy ChatGPT run with 1,289 sources read 0
-    chars and 0 sources to every scraper we have — a cross-origin iframe with a
-    404 narrator — and its complete report came back through the CUA download
-    tier and nothing else. A leg that has never scraped one character is a leg
-    we are BLIND to, and the expensive tiers are the only channel we have left.
-    So the question is not whether the scrape is empty; it is whether the scrape
-    WORKS and is telling us the page stopped.
-
-    `last_growth_len` / `last_growth_sources` are the running maxima of what we
-    have observed, and `last_growth_time` is when either last rose. Both maxima
-    at zero means blind — answer False, spend the tiers. Otherwise the DOM is a
-    live window onto the page, and if nothing has come through it for
-    `frozen_sec` there is no finished report on the other side for a download
-    button to export.
-
-    Cheap salvage still runs either way: the caller drops to the extractors'
-    DOM tier rather than skipping salvage, so a partial report is still mined.
-    """
-    if not (p.get("last_growth_len", 0) or p.get("last_growth_sources", 0)):
-        return False
-    return (time.time() - p.get("last_growth_time", time.time())) >= frozen_sec
-
-
 async def poll_all_agents_round_robin(agents, browser, cua_client,
                                        max_wait_min=90, poll_interval=30, verbose=False):
     """Round-robin poll all verified agents until each completes or times out.
@@ -30517,15 +30479,6 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
     # extensions = 30 min of arbiter-granted grace, comfortably covering the
     # cross-origin-iframe false-positive class the branch exists for.
     _ARBITER_MAX_WORKING_RESETS = int(os.environ.get("DG_ARBITER_MAX_WORKING_RESETS", "2"))
-    # 2026-08-12: how long the scrape must have been completely flat before an
-    # auto-skip salvages with the DOM tier alone instead of the full ladder —
-    # see `_frozen_to_a_working_scraper`. Twice STUCK_NO_GROWTH_SEC, so it can
-    # only be reached AFTER the arbiter's extensions are exhausted (each one
-    # rewinds the clock by a full window) and another window has passed with
-    # nothing. A leg still producing anything at all resets it and keeps the
-    # whole ladder.
-    SALVAGE_FROZEN_SEC = int(os.environ.get("DG_SALVAGE_FROZEN_SEC",
-                                            str(STUCK_NO_GROWTH_SEC * 2)))
     AUTO_SKIP_UNACTED_SEC = auto_skip_unacted_sec()  # L3: 30 min after the card sits unacted → auto-skip THIS agent (module-level so P3 shares the value)
     PER_AGENT_HARD_CAP_SEC = int(os.environ.get("DG_PER_AGENT_HARD_CAP_SEC", "5400"))  # L3: 90 min absolute per-agent ceiling → auto-skip
 
@@ -30749,27 +30702,10 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 log(f"[{_nm}] Auto-skip — verification-walled tab, skipping partial "
                     "extraction (hands-off)", "WARN")
             else:
-                # Same frozen-page rule as the hard-cap salvage below, and this
-                # is the site that needs it MORE: the card whose deadline just
-                # expired says "stayed frozen with no response" in its own copy.
-                # It also has a second cost the other site does not — the
-                # re-validation under this block exists because a user Retry or
-                # Skip landing mid-salvage must win, and a six-minute ladder
-                # leaves that decision unserved for six minutes.
-                _fz = _frozen_to_a_working_scraper(_p, SALVAGE_FROZEN_SEC)
-                if _fz:
-                    log(f"[{_nm}] Auto-skip — the scrape reads this page "
-                        f"({_p.get('last_growth_len', 0)} chars / "
-                        f"{_p.get('last_growth_sources', 0)} sources) and it has not "
-                        f"changed in "
-                        f"{int((time.time() - _p.get('last_growth_time', time.time())) / 60)}m "
-                        f"— salvaging from the DOM alone", "WARN")
                 try:
                     await browser.switch_to_page(_p["page"])
                     _partial = await extract_fns[_nm](
-                        _p["page"],
-                        browser=None if _fz else browser,
-                        cua_client=None if _fz else cua_client,
+                        _p["page"], browser=browser, cua_client=cua_client,
                         label=_nm, verbose=verbose) or ""
                 except Exception as _fe:
                     log(f"[{_nm}] Auto-skip salvage extract failed: {_fe}", "WARN")
@@ -31682,13 +31618,6 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         "cap — auto-skipping (the card went unanswered too long)", "WARN")
                     p["awaiting_decision"] = None
                     _hc_partial = ""
-                    # 2026-08-12: deliberately NOT frozen-aware, unlike the other
-                    # two auto-skip salvages. A parked leg `continue`s from here
-                    # every tick, long before the growth checkpoint further down,
-                    # so `last_growth_time` stops advancing the moment it parks —
-                    # `_frozen_to_a_working_scraper` would read "the page stopped"
-                    # off a leg that is merely waiting for the user, and drop the
-                    # tiers on an agent that may well have finished while parked.
                     if _pk_key not in _controls.hv_blocked:
                         try:
                             await browser.switch_to_page(p["page"])
@@ -32972,29 +32901,10 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     log(f"[{name}] Auto-skip — verification-walled tab, "
                         "skipping partial extraction (hands-off)", "WARN")
                 else:
-                    # ⭐ 2026-08-12: a page the scraper can still read, and which
-                    # has not moved in SALVAGE_FROZEN_SEC, has no finished report
-                    # for the download / clipboard tiers to export — see
-                    # `_frozen_to_a_working_scraper` for why that is not the same
-                    # as "the scrape read nothing". Passing browser/cua_client as
-                    # None is the extractors' OWN switch for DOM-tier-only: it is
-                    # what Phase 1 hands them on every single run, so the cheap
-                    # path here is the most exercised path in the file, and a
-                    # partial report still gets mined.
-                    _as_frozen = _frozen_to_a_working_scraper(p, SALVAGE_FROZEN_SEC)
-                    if _as_frozen:
-                        log(f"[{name}] Auto-skip — the scrape reads this page "
-                            f"({p.get('last_growth_len', 0)} chars / "
-                            f"{p.get('last_growth_sources', 0)} sources) and it has not "
-                            f"changed in {int(no_growth_secs / 60)}m, so there is no "
-                            f"finished report for the download or clipboard tiers to "
-                            f"export — salvaging from the DOM alone", "WARN")
                     try:
                         await browser.switch_to_page(p["page"])
                         _as_partial = await extract_fns[name](
-                            p["page"],
-                            browser=None if _as_frozen else browser,
-                            cua_client=None if _as_frozen else cua_client,
+                            p["page"], browser=browser, cua_client=cua_client,
                             label=name, verbose=verbose) or ""
                     except Exception as _ase:
                         log(f"[{name}] Auto-skip salvage extract failed: {_ase}", "WARN")

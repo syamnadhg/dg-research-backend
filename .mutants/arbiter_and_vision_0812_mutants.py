@@ -1,19 +1,19 @@
-"""Mutation harness for the three fixes from the 2026-08-11 21:00 run.
+"""Mutation harness for the two fixes kept from the 2026-08-11 21:00 run.
 
-All three concern an agent whose page had stopped, and all three are the kind of
-change that is invisible when it goes wrong: an arbiter that probes too often
-costs money nobody is watching, a timeout that is too short loses sources
-silently, and a salvage that skips a tier looks exactly like a salvage that
-found nothing. So the over-corrections carry most of the weight here.
+Both concern an agent whose page had stopped, and both are the kind of change
+that is invisible when it goes wrong: an arbiter that probes too often costs
+money nobody is watching, and a timeout that is too short loses sources
+silently. So the over-corrections carry most of the weight here.
 
-The two that could do real damage:
+The one that could do real damage is throttling the arbiter into SILENCE, or
+delaying the card a stuck verdict produces. The detector's whole job is the
+first probe, and no throttle may touch it.
 
-  * Throttling the arbiter into silence, or delaying the card a stuck verdict
-    produces. The detector's whole job is the first probe.
-  * Dropping the CUA salvage tiers on a leg we are BLIND to rather than one we
-    can see has stopped. That is the 2026-04-28 case — 1,289 sources, 0/0 to
-    every scraper, report recovered by the download tier and nothing else — and
-    getting the predicate backwards would lose exactly those reports.
+A third fix — dropping the expensive salvage tiers on a page frozen for half an
+hour — was written, tested, and then DELIBERATELY REVERTED at the owner's call:
+it could only ever save time on a leg already being abandoned, and it was the
+one change in the wave that could cost a recoverable report. Its mutants are
+gone with it.
 
 Safety, learned from an earlier harness on this repo that adopted a mutant as
 its own baseline: refuses to start on a dirty tree, holds originals in memory
@@ -32,7 +32,6 @@ RESEARCH = "research.py"
 
 SUITES = ("tests/test_arbiter_throttle_0812.py "
           "tests/test_vision_url_budget_0812.py "
-          "tests/test_frozen_salvage_0812.py "
           "tests/test_queue_gate_and_vision_urls_0811.py")
 
 MUTANTS = [
@@ -153,78 +152,6 @@ MUTANTS = [
      [('                    (name == "ChatGPT" and p.get("chatgpt_activity_panel_open"))',
        '                    (name == "ChatGPT")')]),
 
-    # ═══════════ fix 3 — the salvage ladder on a page that stopped ═════════
-    ("F1", "under", "⭐ the hard-cap salvage runs the whole ladder again",
-     [("                            browser=None if _as_frozen else browser,\n"
-       "                            cua_client=None if _as_frozen else cua_client,",
-       "                            browser=browser,\n"
-       "                            cua_client=cua_client,")]),
-    ("F2", "under", "⭐ only one of the two sites was fixed — the unacted-card firer",
-     [("                        browser=None if _fz else browser,\n"
-       "                        cua_client=None if _fz else cua_client,",
-       "                        browser=browser,\n"
-       "                        cua_client=cua_client,")]),
-    ("F3", "over", "⛔ a page we are BLIND to is treated as frozen (the 2026-04-28 class)",
-     [('    if not (p.get("last_growth_len", 0) or p.get("last_growth_sources", 0)):\n        return False',
-       '    if not (p.get("last_growth_len", 0) or p.get("last_growth_sources", 0)):\n        return True')]),
-    ("F4", "over", "⛔ every auto-skip drops its tiers — the window collapses to nothing",
-     [("str(STUCK_NO_GROWTH_SEC * 2)", "str(0)")]),
-    ("F5", "over", "⛔ the freshness test is gone — a producing agent loses its ladder",
-     [('    return (time.time() - p.get("last_growth_time", time.time())) >= frozen_sec',
-       "    return True")]),
-    ("F6", "under", "the frozen window is a whole extra hour — never reached in a 90-min leg",
-     [("str(STUCK_NO_GROWTH_SEC * 2)", "str(STUCK_NO_GROWTH_SEC * 20)")]),
-    ("F7", "over", "an unknown growth timestamp reads as 1970, so every leg is frozen",
-     [('p.get("last_growth_time", time.time())) >= frozen_sec',
-       'p.get("last_growth_time", 0)) >= frozen_sec')]),
-    ("F8", "over", "readable now needs BOTH signals — a sources-only panel reads blind",
-     [('    if not (p.get("last_growth_len", 0) or p.get("last_growth_sources", 0)):',
-       '    if not (p.get("last_growth_len", 0) and p.get("last_growth_sources", 0)):')]),
-    ("F9", "over", "⛔ the decision raises on a half-built leg, taking the finalize with it",
-     [('    if not (p.get("last_growth_len", 0) or p.get("last_growth_sources", 0)):',
-       '    if not (int(p["last_growth_len"]) or int(p["last_growth_sources"])):')]),
-    ("F10", "over", "⛔ the user-skip salvage loses its tiers too",
-     [("                        _partial = await extract_fns[_agent_name](\n"
-       "                            p[\"page\"], browser=browser, cua_client=cua_client,",
-       "                        _partial = await extract_fns[_agent_name](\n"
-       "                            p[\"page\"], browser=None, cua_client=None,")]),
-    ("F11", "over", "⛔ the parked resolver's hard cap decides on a clock that stopped when it parked",
-     [("                            _hc_partial = await extract_fns[name](\n"
-       "                                p[\"page\"], browser=browser, cua_client=cua_client,",
-       "                            _hc_partial = await extract_fns[name](\n"
-       "                                p[\"page\"],\n"
-       "                                browser=None if _frozen_to_a_working_scraper(p, SALVAGE_FROZEN_SEC) else browser,\n"
-       "                                cua_client=None if _frozen_to_a_working_scraper(p, SALVAGE_FROZEN_SEC) else cua_client,")]),
-    ("F12", "over", "⛔ the hands-off wall check is bypassed at the firer",
-     [("            if _key in _controls.hv_blocked:", "            if False:")]),
-    ("F13", "over", "the salvage result is dropped on the floor at the hard cap",
-     [("                    partial=_as_partial, url=p.get(\"url\", \"\"),",
-       "                    partial=\"\", url=p.get(\"url\", \"\"),")]),
-    ("F14", "over", "the firer stops re-validating, so a user Retry during salvage is overridden",
-     [("            if _did not in _pending_decisions or _nm not in pending:", "            if False:")]),
-    ("F15", "over", "the 90-minute ceiling itself is moved",
-     [('PER_AGENT_HARD_CAP_SEC = int(os.environ.get("DG_PER_AGENT_HARD_CAP_SEC", "5400"))',
-       'PER_AGENT_HARD_CAP_SEC = int(os.environ.get("DG_PER_AGENT_HARD_CAP_SEC", "9999"))')]),
-    ("F16", "over", "the frozen branch salvages silently — indistinguishable from a failed one",
-     [('                    if _as_frozen:\n'
-       '                        log(f"[{name}] Auto-skip — the scrape reads this page "',
-       '                    if False:\n'
-       '                        log(f"[{name}] Auto-skip — the scrape reads this page "')]),
-    ("F17", "over", "⛔ ChatGPT's download tier stops honouring browser=None",
-     [("    if browser and cua_client:\n        md = await _extract_via_cua_download(",
-       "    if True:\n        md = await _extract_via_cua_download(")]),
-    ("F18", "over", "⛔ ChatGPT's clipboard tier stops honouring it either",
-     [('    if browser and cua_client:\n        async def _cgpt_t3_trigger():',
-       '    if True:\n        async def _cgpt_t3_trigger():')]),
-    ("F19", "over", "the tab is no longer focused before the DOM read",
-     [('                        await browser.switch_to_page(p["page"])\n'
-       "                        _as_partial = await extract_fns[name](",
-       "                        _as_partial = await extract_fns[name](")]),
-    ("F20", "over", "the salvage can take the run down instead of logging and moving on",
-     [("                    except Exception as _ase:\n"
-       '                        log(f"[{name}] Auto-skip salvage extract failed: {_ase}", "WARN")',
-       "                    except KeyboardInterrupt as _ase:\n"
-       '                        log(f"[{name}] Auto-skip salvage extract failed: {_ase}", "WARN")')]),
 ]
 
 
