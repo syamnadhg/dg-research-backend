@@ -120,11 +120,41 @@ def test_a_private_conversation_url_is_never_a_share_link(platform, url):
     ("gemini", "https://evil.example/gemini.google.com/share/1"),
     ("claude", "https://evil.example/?u=claude.site/artifacts/1"),
     ("chatgpt", "https://evil.example/#chatgpt.com/share/1"),
+    # ⭐ The ones that MATTER: the path also satisfies the prefix, so only the
+    # host check can reject them. Without these, degrading the host match to a
+    # substring survived every case above — the path guard was doing the work
+    # and the test proved nothing about the host rule.
+    ("gemini", "https://evil.example/share/abc?ref=gemini.google.com"),
+    ("claude", "https://evil.example/public/artifacts/1?ref=claude.ai"),
+    ("chatgpt", "https://evil.example/share/abc?ref=chatgpt.com"),
 ])
 def test_a_matching_string_somewhere_in_the_url_is_not_a_matching_host(platform, url):
     """⭐ The 2026-08-06 lesson, applied before it can bite again: ChatGPT tags
     outbound links with `?utm_source=chatgpt.com`, so any rule that greps the
     whole URL will match links it does not own."""
+    assert research._is_public_share_url(platform, url) is False
+
+
+@pytest.mark.parametrize("platform,url", [
+    ("gemini", "https://evilgemini.google.com/share/abc"),
+    ("claude", "https://notclaude.site/artifacts/abc"),
+    ("chatgpt", "https://fakechatgpt.com/share/abc"),
+])
+def test_a_lookalike_domain_is_not_a_subdomain(platform, url):
+    """`host.endswith("gemini.google.com")` is true for `evilgemini.google.com`.
+    The dot matters: only `x.gemini.google.com` is a subdomain."""
+    assert research._is_public_share_url(platform, url) is False
+
+
+@pytest.mark.parametrize("platform,url", [
+    ("claude", "ftp://claude.site/artifacts/abc"),
+    ("claude", "//claude.site/artifacts/abc"),
+    ("gemini", "file://share.gemini.google/abc"),
+])
+def test_only_http_and_https_can_be_a_share_link(platform, url):
+    """A real host on a scheme we never publish. The earlier `javascript:` case
+    was rejected by the HOST check (it parses to no host at all), so it never
+    exercised the scheme guard."""
     assert research._is_public_share_url(platform, url) is False
 
 
@@ -194,6 +224,11 @@ def test_the_fallback_names_which_failure_happened_and_prints_the_url():
     assert "did not pass the public-share" in window, "must distinguish rejected…"
     assert "returned no URL at all" in window, "…from never-found"
     assert "NOT" in window and "viewable" in window, "must say the fallback is private"
+    # ⭐ The URL itself must be INTERPOLATED, not just described. Asserting the
+    # sentence survived a mutant that deleted `{_got}` and kept the prose — the
+    # reader would be told a URL was rejected and never shown which one, which
+    # is the same dead end as the original empty-reason line.
+    assert "{_got[:120]}" in window, "the rejected URL must be printed, not described"
 
 
 def test_the_fallback_is_a_warning_not_an_info_line():
