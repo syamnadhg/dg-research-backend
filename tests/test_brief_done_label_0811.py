@@ -219,6 +219,37 @@ def test_the_call_site_delegates_instead_of_re_deciding():
     assert "page_dead_reason=_lf_dead" in src
 
 
+def test_the_decision_is_the_functions_answer_alone():
+    """⭐ Asserted on the SYNTAX TREE, not on a substring.
+
+    `if False and _state_says_brief_is_done(...)` disables the whole rule while
+    leaving every identifier a text search looks for exactly where it was — that
+    mutant survived two rounds of substring tests. Reading the `if` node makes
+    the shape itself the assertion: the guard must BE the call, so ANDing it
+    with anything at all changes the node type and fails here."""
+    import ast
+    import inspect
+    tree = ast.parse(inspect.getsource(research.poll_until_done))
+    shapes = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if isinstance(test, ast.Call) and getattr(test.func, "id", "") == _FN:
+            shapes.append("call")
+        elif isinstance(test, ast.BoolOp) and any(
+                isinstance(v, ast.Call) and getattr(v.func, "id", "") == _FN
+                for v in test.values):
+            shapes.append("weakened")
+    assert shapes == ["call"], (
+        f"the completion decision must be the function's answer alone, "
+        f"used exactly once; found {shapes}"
+    )
+
+
+_FN = "_state_says_brief_is_done"
+
+
 def test_the_call_site_probes_the_page_before_deciding():
     """`page_dead_reason` is only meaningful if the caller actually asks."""
     src = _poll_src()
