@@ -93,8 +93,12 @@ MUTANTS = [
        "        if False:")]),
 
     # ── the vision read ─────────────────────────────────────────────────────
+    # Re-anchored 2026-08-12: the call site's literal became a named constant when
+    # the read timeout was bound to it, so this mutant stopped applying at all —
+    # and an anchor that cannot apply is a guard that has silently stopped guarding.
     ("V1", "under", "the token ceiling goes back under narrate's — the truncation returns",
-     [('            "maxOutputTokens": 2400,', '            "maxOutputTokens": 800,')]),
+     [('_VISION_URL_MAX_TOKENS = int(os.environ.get("DG_VISION_URL_MAX_TOKENS", "2400"))',
+       '_VISION_URL_MAX_TOKENS = int(os.environ.get("DG_VISION_URL_MAX_TOKENS", "800"))')]),
     ("V2", "under", "a truncated response is called a parse error again",
      [('                log(f"[{agent_key}] vision-urls response was not complete JSON "\n'
        '                    f"(finishReason={_finish or \'unset\'}, {len(text)} chars): {_je} — "\n'

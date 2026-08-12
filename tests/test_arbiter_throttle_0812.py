@@ -182,9 +182,13 @@ def test_consecutive_probes_are_at_least_the_throttle_apart():
     probes = run_ticks(90)
     gaps = [b - a for a, b in zip(probes, probes[1:])]
     assert gaps, "no second probe in 90 minutes — the gate is off, not throttled"
-    assert min(gaps) >= const_default("STUCK_WARN_THROTTLE_SEC"), (
-        f"probes {min(gaps)}s apart, throttle is "
-        f"{const_default("STUCK_WARN_THROTTLE_SEC")}s: {probes}"
+    # Single quotes inside the f-string on purpose: nesting the same quote
+    # character is PEP 701 and only parses on 3.12+. The local venv is 3.14 so
+    # it ran fine here, while ruff targets py311 and the repo's correctness
+    # floor must be zero — so this reached CI as a syntax error, not a warning.
+    throttle = const_default('STUCK_WARN_THROTTLE_SEC')
+    assert min(gaps) >= throttle, (
+        f"probes {min(gaps)}s apart, throttle is {throttle}s: {probes}"
     )
 
 

@@ -67,14 +67,17 @@ MUTANTS = [
        '        verified = "claude.site" in url.lower()')]),
 
     # ── the evidence ────────────────────────────────────────────────────────
+    # Re-anchored 2026-08-12: the fallback log was split into an expected branch
+    # and a quiet branch when the per-agent share expectation landed, so both of
+    # these anchors moved and the mutants stopped applying.
     ("E1", "under", "the fallback is silent at INFO again",
-     [('                          f"viewable by anyone else.", "WARN")',
-       '                          f"viewable by anyone else.", "INFO")')]),
+     [('                            f"NOT viewable by anyone else.", "WARN")',
+       '                            f"NOT viewable by anyone else.", "INFO")')]),
     ("E2", "under", "the fallback no longer prints the URL it rejected",
-     [('                        + (f"a URL was produced but did not pass the public-share "\n'
-       '                           f"rules: {_got[:120]}" if _got',
-       '                        + (f"a URL was produced but did not pass the public-share "\n'
-       '                           f"rules" if _got')]),
+     [('                    _detail = (f"a URL was produced but did not pass the public-share "\n'
+       '                               f"rules: {_got[:120]}" if _got',
+       '                    _detail = (f"a URL was produced but did not pass the public-share "\n'
+       '                               f"rules" if _got')]),
     ("E3", "under", "the extractor stops reporting a read-but-rejected link (Claude)",
      [('        if url and not verified:\n'
        '            log(f"[{label}] a link was read but is not a public share URL — "\n'
