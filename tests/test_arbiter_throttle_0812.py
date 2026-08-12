@@ -224,6 +224,31 @@ def test_a_young_leg_is_never_probed():
     assert run_ticks(8, elapsed_at_start=60, no_growth_at_start=60) == []
 
 
+def test_the_warm_up_clause_is_currently_unreachable_and_why():
+    """⭐ Mutation found that deleting `elapsed > STUCK_MIN_ELAPSED_SEC` changes
+    NOTHING, and that is correct rather than a gap in the tests.
+
+    `last_growth_time` defaults to `p["start_time"]` and only ever moves
+    forward, and `elapsed` is measured from that same `start_time` — so
+    `no_growth_secs` can never exceed `elapsed`. While the warm-up is SHORTER
+    than the no-growth window, `no_growth_secs > 900` already implies
+    `elapsed > 900 > 600` and the second clause can never be the one that
+    decides.
+
+    Which is a fact about the two DEFAULTS, not about the code: both are
+    env-overridable per run, and an operator who sets DG_STUCK_NO_GROWTH_SEC
+    below DG_STUCK_MIN_ELAPSED_SEC makes the clause load-bearing again. So the
+    clause stays, and what is pinned here is the ordering that makes it
+    redundant today — if that ever inverts, this test says so instead of a
+    mutant quietly surviving.
+    """
+    assert const_default("STUCK_MIN_ELAPSED_SEC") < const_default("STUCK_NO_GROWTH_SEC")
+    assert "and elapsed > STUCK_MIN_ELAPSED_SEC" in arbiter_block()
+    src = poller_src()
+    assert 'p.setdefault("last_growth_time", p["start_time"])' in src
+    assert 'elapsed = time.time() - p["start_time"]' in src
+
+
 # ------------------------------------------ where the stamp had to go, and why
 
 
@@ -256,8 +281,15 @@ def test_the_stamp_precedes_the_cua_call():
 def test_the_probe_still_does_not_stamp_the_completion_clock():
     """2026-07-11: the arbiter used to stamp `last_cua_check`, deferring the
     real completion check by a whole interval on a WORKING verdict. The fix
-    above touches the neighbouring line's comment; it must not revive that."""
-    assert "last_cua_check" not in arbiter_block()
+    above rewrites the comment sitting right next to it; it must not revive it.
+
+    Checked across the WHOLE probe, not just its opening — `arbiter_block`
+    stops at the mission prompt, which is before the probe even runs, so a
+    stamp added next to the verdict was outside the window entirely."""
+    src = poller_src()
+    at = src.index("_active_no_growth = (")
+    probe = src[at:src.index("if _controls.consume_poke_agent", at)]
+    assert "last_cua_check" not in probe
 
 
 # -------------------------------------- everything the fix must not have moved
@@ -330,9 +362,15 @@ def test_user_actions_still_clear_the_throttle(restart):
     cleared throttle can't storm."""
     src = poller_src()
     at = src.index(restart)
-    window = src[at:at + 1400]
+    # ⛔ Bounded at the NEXT consumer, not by a character count. A 1400-char
+    # window from the poke branch runs straight into the wait-longer branch,
+    # which clears the same two keys — so deleting the clear from the poke
+    # branch alone left the assertion passing on its neighbour's code.
+    nxt = src.find("if _controls.consume_", at + len(restart))
+    window = src[at:nxt if nxt != -1 else at + 1400]
     assert 'p["stuck_warned_at"] = 0.0' in window
     assert 'p["last_growth_time"] = time.time()' in window
+    assert "_disarm_registry(agent_key_stuck)" in window
 
 
 def test_renewed_growth_still_clears_the_throttle():

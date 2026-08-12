@@ -147,7 +147,16 @@ def test_the_frozen_window_cannot_be_reached_before_the_arbiter_gives_up():
     frozen = re.search(r'SALVAGE_FROZEN_SEC = int\(os\.environ\.get\(\s*"DG_SALVAGE_FROZEN_SEC",\s*'
                        r'str\(STUCK_NO_GROWTH_SEC \* (\d+)\)\)\)', src)
     assert frozen, "SALVAGE_FROZEN_SEC is no longer derived from the no-growth window"
-    assert int(frozen.group(1)) >= 2
+    multiplier = int(frozen.group(1))
+    assert multiplier >= 2
+    no_growth = int(re.search(r'STUCK_NO_GROWTH_SEC = int\(os\.environ\.get\("DG_STUCK_NO_GROWTH_SEC", "(\d+)"\)\)',
+                              src).group(1))
+    cap = int(re.search(r'PER_AGENT_HARD_CAP_SEC = int\(os\.environ\.get\("DG_PER_AGENT_HARD_CAP_SEC", "(\d+)"\)\)',
+                        src).group(1))
+    assert no_growth * multiplier < cap, (
+        f"a {no_growth * multiplier}s frozen window inside a {cap}s ceiling can "
+        f"never be reached — the fix would be unreachable rather than off"
+    )
     resets = int(re.search(r'_ARBITER_MAX_WORKING_RESETS = int\(os\.environ\.get\("DG_ARBITER_MAX_WORKING_RESETS", "(\d+)"\)\)',
                            src).group(1))
     assert resets == 2, (
@@ -292,9 +301,37 @@ def test_both_sites_decide_with_the_shared_helper():
         )
 
 
+def gate_names() -> set:
+    """The local each site binds its decision to (`_as_frozen`, `_fz`)."""
+    return {c.keywords[1].value.test.id for c in frozen_aware_calls()}
+
+
 def test_the_frozen_branch_is_named_in_the_log_at_both_sites():
     """A salvage that silently does less is indistinguishable from a salvage
-    that failed. Both sites say which they did, and why."""
+    that failed. Both sites say which they did, and why.
+
+    Asserted on the CONDITION, not on the message. A first draft counted the
+    strings, and a mutant that turned the guard into `if False:` sailed through
+    it — the log line is still in the source, it just never runs. That is the
+    same trap that ate a guard assertion in the 08-11 wave."""
+    logged = set()
+    for node in ast.walk(poller_tree()):
+        if not (isinstance(node, ast.If) and isinstance(node.test, ast.Name)):
+            continue
+        if node.test.id not in gate_names():
+            continue
+        if any(getattr(c.func, "id", "") == "log"
+               for c in ast.walk(node) if isinstance(c, ast.Call)):
+            logged.add(node.test.id)
+    assert logged == gate_names(), (
+        f"a frozen-page salvage does less without saying so (announced: "
+        f"{sorted(logged)}, sites: {sorted(gate_names())})"
+    )
+
+
+def test_both_sites_report_what_they_could_see_and_for_how_long():
+    """The reason has to be in the line, or the next reader cannot tell a
+    deliberate cheap salvage from a broken one."""
     src = poller_src()
     assert src.count("salvaging from the DOM al") == 2
     for anchor in ("chars / ", "sources) and it has not "):
@@ -332,10 +369,26 @@ def test_the_tab_is_still_focused_before_the_dom_read():
 
 
 def test_the_salvage_still_cannot_take_the_run_down():
-    src = poller_src()
-    for anchor in ("_as_partial = await extract_fns[name](", "_partial = await extract_fns[_nm]("):
-        at = src.index(anchor)
-        assert "Auto-skip salvage extract failed" in src[at:at + 500]
+    """⛔ An exception here costs the run the salvage AND the finalize behind
+    it. Read off the handler rather than off the message it logs: narrowing
+    `except Exception` to something the page never raises leaves the log line
+    sitting there, looking exactly as reassuring as before."""
+    wanted = {id(c) for c in frozen_aware_calls()}
+    guarded = 0
+    for node in ast.walk(poller_tree()):
+        if not isinstance(node, ast.Try):
+            continue
+        if not any(id(c) in wanted for c in ast.walk(node) if isinstance(c, ast.Call)):
+            continue
+        guarded += 1
+        assert any(isinstance(h.type, ast.Name) and h.type.id == "Exception"
+                   for h in node.handlers), (
+            "a salvage site no longer catches Exception — a page error now "
+            "propagates out of the auto-skip"
+        )
+        assert any("Auto-skip salvage extract failed" in ast.dump(h)
+                   for h in node.handlers)
+    assert guarded == 2
 
 
 def test_the_unacted_firer_still_revalidates_after_the_salvage():

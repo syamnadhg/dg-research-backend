@@ -56,8 +56,20 @@ MUTANTS = [
        '            p["stuck_warned_at"] = time.time()\n            if _active_no_growth:\n')]),
     ("A5", "under", "the throttle clause is dropped from the gate — the stamp buys nothing",
      [("                                 and since_warn > STUCK_WARN_THROTTLE_SEC\n", "")]),
-    ("A6", "over", "the warm-up clause is dropped — a young agent gets probed",
-     [("                                 and elapsed > STUCK_MIN_ELAPSED_SEC\n", "")]),
+    # A6 was "the warm-up clause is dropped", and it SURVIVED — correctly.
+    # `last_growth_time` starts at `p["start_time"]` and only moves forward, and
+    # `elapsed` is measured from that same stamp, so `no_growth_secs` can never
+    # exceed `elapsed`; while the warm-up (600s) is shorter than the no-growth
+    # window (900s), the first clause always decides first and the second is
+    # unreachable. An equivalent mutant, not a hole — kept here as prose rather
+    # than deleted, because the equivalence is a property of the two DEFAULTS
+    # (both env-overridable) and not of the code. The ordering that makes it
+    # true is pinned by `test_the_warm_up_clause_is_currently_unreachable_and_why`.
+    # Replaced by the mutation that inverts that ordering, which is a real
+    # defect: a run tuned to alert sooner than its own warm-up.
+    ("A6", "over", "the no-growth window drops below the warm-up, so the warm-up starts deciding",
+     [('STUCK_NO_GROWTH_SEC = int(os.environ.get("DG_STUCK_NO_GROWTH_SEC", "900"))',
+       'STUCK_NO_GROWTH_SEC = int(os.environ.get("DG_STUCK_NO_GROWTH_SEC", "300"))')]),
     ("A7", "over", "⛔ the planning clause is dropped — the 2026-07-09 false card returns",
      [("                                 and not status_is_active)", ")")]),
     ("A8", "over", "the throttle is a day long — the arbiter never re-probes at all",
