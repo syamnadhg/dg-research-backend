@@ -242,6 +242,22 @@ _PROG = _prog_name()
 # is more noise than signal.
 WORKER_ID: int = 1
 
+# True only when this process was spawned as a member of the daemon-loop's
+# multi-worker fleet — i.e. `--worker-id` was passed on the command line.
+#
+# 2026-08-11: this is the discriminator the heartbeat needs and WORKER_ID is
+# not. WORKER_ID is 1 in three different situations that have three different
+# capacities: a foreground `--serve` the owner typed (1 slot), the supervised
+# SINGLE-worker child, which daemon-loop spawns WITHOUT --worker-id (1 slot),
+# and fleet member #1, which it spawns WITH `--worker-id 1` (N slots). Only
+# the third has siblings. `_detect_supervised()` cannot separate them either —
+# it probes whether the launchd/schtasks job EXISTS, so it answers True for a
+# foreground serve on a machine that also has On Startup enabled.
+#
+# Set once, next to WORKER_ID, from the presence of the flag rather than its
+# value (`--worker-id 1` is a fleet member; no flag is not).
+_FLEET_MEMBER: bool = False
+
 
 def _profile_dir(n: int) -> Path:
     """Browser profile dir for worker `n`. Worker 1 returns the legacy
@@ -4872,6 +4888,26 @@ def load_worker_count() -> int:
     return 1
 
 
+def _running_worker_capacity() -> int:
+    """How many runs THIS backend can actually take at once.
+
+    `load_worker_count()` answers a different question — how many browser
+    profiles are *configured* — and the two diverge whenever the owner runs a
+    foreground `--serve` on a multi-profile device: one process, one browser,
+    one slot, but a config that says 2. Publishing the configured number told
+    the app it had a free worker, so a second submit was sent straight through
+    instead of being shown as queued; the backend correctly deferred it, nobody
+    claimed it, and the app fell back to "Macbook isn't responding" over a Phase
+    0 tile it had minted itself (2026-08-11).
+
+    Only a fleet member has siblings, so only a fleet member may claim N.
+    Everything else — foreground serve, supervised single-worker — is 1.
+    """
+    if not _FLEET_MEMBER:
+        return 1
+    return load_worker_count()
+
+
 def _owner_worker_of(assigned) -> int:
     """Which worker owns a run, from its Firestore `assignedWorker` field.
 
@@ -5195,7 +5231,12 @@ async def _heartbeat_loop():
                 # queued even when worker 2 is idle and ready to take it.
                 # Heartbeat is the natural carrier (already running on
                 # worker 1 only, already updating allow-listed fields).
-                _wc_payload = load_worker_count()
+                # 2026-08-11: publish RUNNING capacity, not configured
+                # profile count. See `_running_worker_capacity` — a
+                # foreground serve on a 2-profile device runs one worker
+                # and used to advertise two, which is the whole reason a
+                # second submit stalled at Phase 0 instead of queueing.
+                _wc_payload = _running_worker_capacity()
                 await asyncio.wait_for(
                     asyncio.to_thread(
                         lambda: _firebase_db.collection("devices")
@@ -63836,11 +63877,12 @@ def main():
     parser.add_argument("--port", type=int, default=None,
         help="Server port. Default: 8000 for worker 1, 8000+(worker_id-1) for worker N. "
              "Pass explicitly only for non-default port mappings (testing / port collision recovery).")
-    parser.add_argument("--worker-id", type=int, default=1, dest="worker_id",
+    parser.add_argument("--worker-id", type=int, default=None, dest="worker_id",
         help="Worker slot index (1-based). Worker N uses _profile_dir(N) for its browser "
              "and binds port 8000+N-1 (unless --port overrides). Workers ≥2 are spawned by "
              "daemon-loop when research_config.json's workerCount > 1; set up via pair Stage 4's "
-             "multi-profile loop. Default: 1 (single-worker, backward compat).")
+             "multi-profile loop. Omitted = standalone serve, which runs one worker no matter "
+             "how many profiles are configured (WORKER_ID still resolves to 1).")
     parser.add_argument("--resurrect", action="store_true",
         help="Enable On Startup: auto-start the backend at login and keep it running in the background")
     parser.add_argument("--retire", action="store_true",
@@ -63963,8 +64005,11 @@ def main():
     # needing to know the global mapping. Stamp WORKER_ID module-global so
     # downstream code (pipeline launcher, pending-queue path, listener
     # claim, w1-only gates) can read it without plumbing.
-    global WORKER_ID
+    global WORKER_ID, _FLEET_MEMBER
     WORKER_ID = max(1, int(args.worker_id or 1))
+    # Presence, not value — see `_FLEET_MEMBER`. argparse's default is None
+    # precisely so "not passed" stays distinguishable from "--worker-id 1".
+    _FLEET_MEMBER = args.worker_id is not None
     _resolved_port = args.port if args.port is not None else (8000 + WORKER_ID - 1)
 
     if args.daemon_loop:
