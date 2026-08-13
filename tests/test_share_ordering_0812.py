@@ -214,15 +214,45 @@ def test_the_probe_sees_an_open_canvas():
                   list(research._CANVAS_ROOT_SELECTORS))["ret"] is True
 
 
+def _small_canvasish_dom(*, label=None):
+    """A node that MATCHES a canvas selector and is too small to be one.
+
+    ⭐ It has to be inside `main`, because `main [class*="canvas"]` is the
+    selector. The first version of this fixture put the node at body level, so
+    it matched nothing at all and the test passed without ever reaching the size
+    floor — which is why mutation found the floor unguarded. A negative test
+    that never touches the guard it names is worse than no test."""
+    kids = [el("button", attrs={"aria-label": label})] if label else []
+    return stamp_panel_geometry(
+        el("body", kids=[
+            el("main", kids=[
+                el("div", attrs={"class": "prose canvas-hint"}, kids=kids),
+            ]),
+        ]),
+        w=200, h=60, x=0, y=0, kid_w=200, kid_h=60)
+
+
 def test_the_probe_ignores_a_small_node_that_merely_says_canvas():
     """⛔ A response container can carry "canvas" in a class name. The size
     floor is what makes this specific to the full-page document view — without
     it the share step would start pressing close buttons inside the answer."""
-    spec = stamp_panel_geometry(
-        el("body", kids=[el("div", attrs={"class": "canvas-hint"})]),
-        w=40, h=20, x=0, y=0, kid_w=10, kid_h=10)
+    spec = _small_canvasish_dom()
+    # first: the fixture really does match the selector, so the floor is what
+    # rejects it and not the selector list.
+    assert run_js(spec, """(sels) => sels.some(
+        s => document.querySelectorAll(s).length > 0)""",
+        list(research._CANVAS_ROOT_SELECTORS))["ret"] is True
     assert run_js(spec, research._CANVAS_PROBE_JS,
                   list(research._CANVAS_ROOT_SELECTORS))["ret"] is False
+
+
+def test_a_close_button_in_a_small_canvasish_node_is_not_marked():
+    """The mark step carries its own floor, and needs its own test: a "Close"
+    control inside a chat-sized element is a control in somebody's ANSWER."""
+    spec = _small_canvasish_dom(label="Close")
+    out = run_js(spec, research._CANVAS_MARK_CLOSE_JS,
+                 [list(research._CANVAS_ROOT_SELECTORS), research._CANVAS_CLOSE_MARK])
+    assert out["ret"] == "", "a button inside a chat-sized node was marked for pressing"
 
 
 @pytest.mark.parametrize("label", [
