@@ -14408,6 +14408,118 @@ class LinkResult:
         return bool(self.url) and not self.error
 
 
+# The surfaces ChatGPT renders a finished document on. Deliberately the same
+# family the completion probe and the markdown extractor already use — a fifth
+# private list of canvas selectors is how these drift apart.
+_CANVAS_ROOT_SELECTORS = (
+    '[data-testid*="canvas"]',
+    'main [class*="canvas"]',
+    '[class*="artifact"]',
+)
+
+# Marks the control to press. JS never clicks it: a synthetic `el.click()` from
+# `page.evaluate` does not open (or close) a React overlay — measured 6/6
+# no-effect on this codebase's own panels. JS marks, Playwright presses.
+_CANVAS_CLOSE_MARK = "data-sr-canvas-close"
+
+_CANVAS_PROBE_JS = """(sels) => {
+    // A canvas is a LARGE mounted surface, not any node with "canvas" in a
+    // class name — response containers pick those up. The floor is what makes
+    // this specific to the full-page document view.
+    for (const sel of sels) {
+        for (const root of document.querySelectorAll(sel)) {
+            const r = root.getBoundingClientRect();
+            if (r.width >= 320 && r.height >= 240) return true;
+        }
+    }
+    return false;
+}"""
+
+_CANVAS_MARK_CLOSE_JS = """(args) => {
+    const [sels, mark] = args;
+    const closeish = (b) => {
+        const t = ((b.getAttribute('aria-label') || '') + ' ' +
+                   (b.getAttribute('title') || '') + ' ' +
+                   (b.getAttribute('data-testid') || '')).toLowerCase();
+        return /close|collapse|shrink|exit|minimi[sz]e|back to chat/.test(t);
+    };
+    for (const sel of sels) {
+        for (const root of document.querySelectorAll(sel)) {
+            const r = root.getBoundingClientRect();
+            if (r.width < 320 || r.height < 240) continue;
+            for (const b of root.querySelectorAll('button, [role="button"]')) {
+                if (!closeish(b)) continue;
+                b.setAttribute(mark, '1');
+                return sel;
+            }
+        }
+    }
+    return "";
+}"""
+
+
+async def _close_chatgpt_canvas(page) -> str:
+    """Close an open ChatGPT canvas. Returns how it closed, or "" if there was
+    nothing to close (or it would not close).
+
+    ⭐ 2026-08-12 — WHY THE SHARE STEP NEEDS THIS.
+
+    Extraction runs before share extraction, and ChatGPT's tier-1 extractor is a
+    vision mission whose FIRST instruction is "open the canvas" — it enlarges
+    the document to full page to reach the download control, and nothing ever
+    puts it back. `extract_share_link_chatgpt`'s close-first preamble was
+    written 2026-04-26, before that extractor existed: it closes `[role=
+    "dialog"]` and the citations panel, and the canvas is neither. So on
+    2026-08-12 the Share button sat underneath a full-page document, the DOM
+    click found nothing, and the vision fallback spent six iterations pressing
+    icons in the canvas header instead.
+
+    Two attempts, in order of specificity:
+      1. the canvas's own close control, marked in JS and PRESSED by Playwright
+         — a synthetic click from `page.evaluate` does not close a React
+         overlay, which this codebase measured 6/6 on its own panels;
+      2. Escape, which is layout-independent and is what a person would press.
+
+    Best-effort by construction: it reports what it did and never raises. A
+    canvas that will not close is not a reason to skip the share attempt — the
+    Playwright click below has its own 3-second fast-fail for exactly that.
+    """
+    try:
+        if not await page.evaluate(_CANVAS_PROBE_JS, list(_CANVAS_ROOT_SELECTORS)):
+            return ""
+    except Exception:
+        return ""
+
+    async def _still_open() -> bool:
+        try:
+            return bool(await page.evaluate(_CANVAS_PROBE_JS,
+                                            list(_CANVAS_ROOT_SELECTORS)))
+        except Exception:
+            return False
+
+    try:
+        hit = await page.evaluate(_CANVAS_MARK_CLOSE_JS,
+                                  [list(_CANVAS_ROOT_SELECTORS), _CANVAS_CLOSE_MARK])
+        if hit:
+            btn = await page.query_selector(f'[{_CANVAS_CLOSE_MARK}="1"]')
+            if btn is not None:
+                await btn.click(timeout=2000)
+                await asyncio.sleep(0.4)
+                if not await _still_open():
+                    return f"close control in {hit}"
+    except Exception:
+        pass
+
+    try:
+        await page.keyboard.press("Escape")
+        await asyncio.sleep(0.4)
+        if not await _still_open():
+            return "escape"
+    except Exception:
+        pass
+    return ""
+
+
 async def extract_share_link_chatgpt(browser, cua_client, label="Research Brief", verbose=False):
     """Extract shareable ChatGPT link: Share button → Create link → copy URL.
 
@@ -14437,6 +14549,18 @@ async def extract_share_link_chatgpt(browser, cua_client, label="Research Brief"
             await asyncio.sleep(0.5)
         except Exception:
             pass
+        # ⭐ 2026-08-12 — AND THE CANVAS, which the preamble above never covered.
+        # Markdown extraction runs first and its vision mission opens the canvas
+        # full-page to reach the download control; nothing puts it back. The
+        # Share button then sits underneath a full-page document. See
+        # `_close_chatgpt_canvas` for why this is a Playwright press.
+        try:
+            _canvas_closed = await _close_chatgpt_canvas(page)
+            if _canvas_closed:
+                log(f"[{label}] closed the open canvas before the share step "
+                    f"({_canvas_closed})")
+        except Exception as _cc:
+            log(f"[{label}] canvas close skipped: {_cc}", "DEBUG")
         # Step 1: Try Playwright — find share button
         share_btn = None
         for sel in ['button[aria-label="Share"]', '[data-testid="share-chat-button"]',
@@ -15153,15 +15277,37 @@ async def extract_share_link_claude(browser, cua_client, label="Claude Deep Rese
                     cua_coro_factory=_publish_share_cua,
                     mission_prompt=PROMPT_PUBLISH_CLAUDE,
                     act_timeout_s=40.0)  # bounded; the outer 90s wait_for is act-padded to fit CUA
+                # ⭐ 2026-08-12 — CLIPBOARD FIRST, PROSE SECOND.
+                #
+                # On 2026-08-12 this shipped a DEAD link:
+                #   https://claude.ai/public/artifacts/4e899beb…`
+                # — a real artifact id with a markdown backtick welded onto the
+                # end, because the vision model had written the URL inside a
+                # code span and `[^\s]+` runs to the next whitespace, not to the
+                # end of the URL. The correct link was already on the clipboard:
+                # the model had clicked Copy and said so.
+                #
+                # The order was the whole bug. Both readings were present, and
+                # the LESS reliable one won because it was tried first — prose
+                # is a transcription of the link, the clipboard IS the link.
+                # `_arm_clipboard()` above is what makes the clipboard
+                # trustworthy here: it was emptied before the mission, so
+                # anything in it now was put there by this mission.
+                #
+                # ⛔ Deliberately NOT adding URL validation or trimming. The
+                # owner's call, and the right one: `_is_public_share_url` below
+                # is already the single authority on whether a link is public,
+                # and a second cleanup step here would be a second place for the
+                # two to disagree — which is the defect this file keeps finding.
                 text = ((result or {}).get("text") or "")
-                m = re.search(r'https://claude\.(?:site|ai)/[^\s]+', text)
-                if m:
-                    url = m.group(0)
+                clip, _ = await _read_clipboard_after_copy(
+                    lambda c: "claude." in c)
+                if clip:
+                    url = clip
                 else:
-                    clip, _ = await _read_clipboard_after_copy(
-                        lambda c: "claude." in c)
-                    if clip:
-                        url = clip
+                    m = re.search(r'https://claude\.(?:site|ai)/[^\s]+', text)
+                    if m:
+                        url = m.group(0)
             except asyncio.TimeoutError:
                 log(f"[{label}] CUA fallback exceeded 90s — using best-effort URL", "WARN")
                 clip, _ = await _read_clipboard_after_copy(lambda c: "claude." in c)
@@ -36634,15 +36780,34 @@ async def publish_open_claude_artifact(page, browser, cua_client, verbose=False)
             # (extract_share_link_claude's 90s wait_for is act-padded to match);
             # this publish CUA is itself uncapped, so a small act cap protects it.
             act_timeout_s=40.0)
+        # ⭐ 2026-08-12 — CLIPBOARD FIRST, PROSE SECOND. Same defect as the twin
+        # in `extract_share_link_claude`, and THIS is the copy that shipped the
+        # dead link: this function is the PRIMARY path, and its caller accepts
+        # whatever it returns if it merely contains "claude." — so a mangled URL
+        # from here is never given the chance to fall through to the twin.
+        #
+        # `[^\s]+` swallowed a trailing markdown backtick off a URL the vision
+        # model had written inside a code span. The correct link was already on
+        # the clipboard, put there by the mission's own Copy click, and
+        # `_arm_clipboard()` above is what makes that readable as this mission's
+        # copy rather than a leftover.
+        #
+        # The clipboard shape test now asks the ONE authority instead of
+        # matching a host literal. `'claude.site' in c` was not a safety check,
+        # it was rot: Publish has produced `claude.ai/public/artifacts/…` since
+        # 2026-08, so the fallback would have REJECTED the live link even when
+        # the clipboard held it. Exactly the duplicated-predicate failure the
+        # 2026-08-11 share-link fix was written for, one layer down.
         text = (result or {}).get("text", "")
+        clip, _ = await _read_clipboard_after_copy(
+            lambda c: _is_public_share_url("claude", c))
+        if clip:
+            return clip
         m = re.search(r'https://claude\.site/artifacts/[a-f0-9-]+', text)
         if not m:
             m = re.search(r'https://claude\.(?:site|ai)/[^\s]+', text)
         if m:
             return m.group(0)
-        clip, _ = await _read_clipboard_after_copy(lambda c: 'claude.site' in c)
-        if clip:
-            return clip
 
     return ""
 
