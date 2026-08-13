@@ -253,46 +253,85 @@ def test_delegation_did_not_change_the_hardened_parser_behaviour():
 
 
 # ── The twin in poll_until_done ───────────────────────────────────────────
+#
+# ⭐ 2026-08-12 — THIS SECTION USED TO LIFT A SECOND PARSER, AND NOW ASSERTS
+# THERE ISN'T ONE.
+#
+# `poll_until_done`'s verify-False branch carried its own inline parse:
+# `has_stop` / `has_loading` / `has_response`, plus a greedy "response complete"
+# substring test and an assume-complete default. The tests below used to lift
+# those three expressions by AST and run them.
+#
+# That parser is gone. It was documented as safe because the branch does not
+# early-return — and that was true — but what it could never do is tell
+# "the model observed generation" apart from "the model recognised nothing", so
+# an unreadable screen came back as a positive observation of generation. On
+# 2026-08-12 that cost 44 minutes and ~40 vision calls against a brief that had
+# finished. The branch now routes through `_classify_completion_verdict`, which
+# is exactly what the old `test_the_twins_no_early_return_invariant_is_intact`
+# named as the precondition for restructuring it.
+#
+# So the property worth pinning changed shape: not "the twin's copy of the
+# predicate is correct" but "there is no copy". Two predicates that must agree
+# is the recurring defect in this file's own incident report.
 
-POLL_EXPRS = _assigned_exprs(research.poll_until_done,
-                             {"has_stop", "has_loading", "has_response"})
 
+def test_the_twin_has_no_parser_of_its_own_any_more():
+    """The lift that used to power this section, asserted as ABSENT.
 
-def _poll_verdict(diag_text: str) -> dict:
-    return _evaluate(POLL_EXPRS, diag_text)
-
-
-def test_the_twin_reads_forward_like_the_cua_actually_writes():
-    """It used to look for 'yes' BEFORE the keyword — the direction #753's
-    docstring records as broken, which biased this branch toward 'complete',
-    the dangerous side."""
-    assert _poll_verdict("stop button: yes")["has_stop"] is True
-    assert _poll_verdict("stop button: no")["has_stop"] is False
-
-
-def test_the_twin_no_longer_accepts_a_bare_completed():
-    """'Research completed in 23m · 68 citations' is a stale activity summary —
-    in the incident it belonged to a different conversation entirely."""
-    v = _poll_verdict('the response shows "research completed in 23m · 68 citations". '
-                      "is it complete? yes")
-    assert v["has_response"] is False, (
-        "a bare 'completed' still reads as a finished response"
+    A duplicated predicate is the shape of the 2026-08-05 incident this file
+    documents: one copy was loosened, the other was not, and the two disagreed
+    about the same sentence."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(research.poll_until_done)))
+    assigned = {t.id for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                for t in n.targets if isinstance(t, ast.Name)}
+    assert not ({"has_stop", "has_loading", "has_response"} & assigned), (
+        "an inline verdict parser came back into poll_until_done — it must use "
+        "_classify_completion_verdict, the same one the safety net uses"
     )
 
 
-def test_the_twin_still_recognises_a_real_completion():
-    assert _poll_verdict("response visible")["has_response"] is True
-    assert _poll_verdict("response complete: yes")["has_response"] is True
+def test_both_twins_call_the_same_hardened_parser():
+    """Positive half: absence is not enough, the shared parser must be wired in.
 
-
-def test_the_twins_no_early_return_invariant_is_intact():
-    """The twin's looseness is documented as safe ONLY because it falls through
-    to a DOM re-verify. If that ever becomes an early return, the compensating
-    control is gone."""
+    Counted, because the two arms of this function ask the same question about
+    the same screen and a single call would mean one of them regressed to
+    deciding on its own."""
     src = code_only(research.poll_until_done)
-    i = src.index("has_response =")
-    window = src[i:i + 1200]
-    assert "return True" not in window.split("if is_generating:")[0], (
-        "the fallback branch gained an early return — route it through "
-        "_classify_completion_verdict first"
+    assert src.count("_classify_completion_verdict(") == 2, (
+        "expected both the verify-False confirm and the safety net to route "
+        "through the hardened parser"
+    )
+
+
+def test_the_prod_answer_reads_as_not_generating_through_the_shared_parser():
+    """The 2026-08-05 answer, run through the parser the twin now uses.
+
+    Three explicit NOs and a stale activity summary. It must not read as
+    generation — and it must not read as completion either, because "research
+    completed in 23m" belonged to a different conversation."""
+    assert research._classify_completion_verdict(PROD_ANSWER) != "generating"
+    assert research._classify_completion_verdict(PROD_ANSWER) != "complete"
+
+
+def test_an_affirmed_stop_button_still_wins_through_the_shared_parser():
+    """The polarity that mattered, preserved across the delegation: the CUA
+    writes "Stop button: Yes", read FORWARD within the clause."""
+    assert research._classify_completion_verdict("stop button: yes") == "generating"
+    assert research._classify_completion_verdict(
+        "stop button: no. the response is complete.") == "complete"
+
+
+def test_the_twin_still_never_early_returns_on_a_vision_complete():
+    """The compensating control the old inline parser leaned on is still there.
+    A vision "complete" is not a return — the DOM has to agree on a re-verify
+    first, which is what blocks a wrong "complete" while a Stop button is up."""
+    # Anchored on CODE, not on the comment that labels it: `code_only` blanks
+    # comments precisely so an assertion cannot come to rest on prose.
+    src = code_only(research.poll_until_done)
+    i = src.index("_verdict = _classify_completion_verdict(")
+    window = src[i:src.index("still = await verify_fn(page)", i)]
+    assert "return True" not in window, (
+        "the confirm branch gained an early return — the DOM re-verify is the "
+        "only thing standing between a wrong 'complete' and an extracted stub"
     )

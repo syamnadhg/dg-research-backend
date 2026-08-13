@@ -133,19 +133,31 @@ def test_no_hand_written_copy_of_the_old_literal_survives():
 
 def test_every_page_side_badge_check_goes_through_the_shared_pattern():
     """The positive half: not just "the old literal is gone" but "the new one is
-    wired in, everywhere". Four call sites read this label in JS — the P2
-    completion probe, the host verify, its DR-iframe walk, and the diagnostic
-    twin — and each must substitute the shared pattern into its payload.
+    wired in, everywhere". Five payloads read this label in JS — the P2
+    completion probe, the host verify, its DR-iframe walk, the diagnostic twin,
+    and the corroborator probe — and each must substitute the shared pattern.
 
-    A count, because the failure this guards is a FIFTH copy being added by
-    hand, or one of the four quietly losing its substitution and shipping the
-    raw placeholder to the browser (which throws at `.test`, in production, on
-    a path that is wrapped in `except Exception: return False`)."""
+    Balanced rather than counted to a fixed number, so ADDING a sixth reader is
+    fine and forgetting its substitution is not. A payload that ships the raw
+    placeholder throws at `.test`/`.match` in the browser, in production, on
+    paths that are wrapped in `except Exception:` — so it would degrade
+    silently, which is this whole file's failure mode one layer down."""
     src = code_only_deep(Path(research.__file__).read_text(encoding="utf-8"))
-    uses = src.count("__DONE_BADGE_RE__.test(")
     subs = src.count('.replace("__DONE_BADGE_RE__", _THINKING_TIME_HEADER_JS)')
-    assert uses == 4, f"{uses} page-side badge checks — expected 4"
-    assert subs == 4, f"{subs} substitutions for {uses} uses — one payload ships raw"
+    in_js = src.count("__DONE_BADGE_RE__") - subs
+    assert subs >= 4, f"only {subs} substitutions — the wiring was removed"
+    assert in_js == subs, f"{in_js} JS readers but {subs} substitutions"
+
+
+def test_no_module_level_payload_ships_the_placeholder():
+    """The runtime half of the check above: what the module actually holds.
+
+    A source count can be satisfied by a substitution that runs on the wrong
+    string; this reads the values production hands to `page.evaluate`."""
+    for name in ("_CHATGPT_DONE_PROBE_JS", "_DONE_BADGE_PROBE_JS"):
+        payload = getattr(research, name)
+        assert "__DONE_BADGE_RE__" not in payload, f"{name} ships raw"
+        assert research._THINKING_TIME_HEADER_SRC in payload, f"{name} lost the pattern"
 
 
 def test_the_shared_source_is_not_a_bare_verb_list():

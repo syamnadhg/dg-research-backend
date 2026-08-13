@@ -27657,6 +27657,50 @@ def _state_says_brief_is_done(*, verdict: str, hard_stop_signal: bool,
     return True
 
 
+def _p1_stall_card_copy(*, contested: bool, salvageable: bool,
+                        text_len: int) -> "tuple[str, str]":
+    """The (title, body) for the phase-1 stall card. Two axes, four cells.
+
+    ⭐ 2026-08-12. `poll_until_done` now raises `_BriefStreamStalled` for a
+    SECOND reason, and the copy had exactly one sentence for both. The original
+    reads "ChatGPT stopped updating while writing the brief" — true of a frozen
+    stream, and a claim we specifically know may be FALSE of the new case, where
+    the DOM detector reports a finished answer and the visual check reports a
+    live Stop button. If the visual check is the one telling the truth, the page
+    never stopped at all.
+
+    The ACTIONS are identical in both (retry, or use what is on screen), which
+    is exactly why the sentence has to carry the difference — a card whose words
+    and whose state disagree is the failure the 2026-08-11 "Skip" relabel was
+    written for, one level up.
+
+    Extracted rather than left inline for the reason `_state_says_brief_is_done`
+    records: an inline branch can only be tested by reading the source, and a
+    source test passes against a branch that has been disabled.
+    """
+    chars = f"{int(text_len or 0):,}"
+    if contested:
+        if salvageable:
+            return ("Couldn't confirm ChatGPT finished",
+                    f"Two checks disagree about whether the brief is done — the page "
+                    f"structure says finished, the visual check still sees a stop "
+                    f"button. {chars} characters are on screen. Retry starts the brief "
+                    f"over. Use what's on screen keeps that text and continues to the "
+                    f"research phase.")
+        return ("Couldn't confirm ChatGPT finished",
+                "Two checks disagree about whether ChatGPT is still writing, and "
+                "there isn't enough on screen to use either way. Retry starts the "
+                "brief over — the run cannot continue without a brief.")
+    if salvageable:
+        return ("ChatGPT stopped responding",
+                f"ChatGPT stopped updating while writing the brief, but {chars} "
+                f"characters are already on screen. Retry starts the brief over. Use "
+                f"what's on screen keeps that text and continues to the research phase.")
+    return ("ChatGPT stopped responding",
+            "ChatGPT stalled before producing a usable brief. Retry starts it over — "
+            "the run cannot continue without a brief.")
+
+
 class _BriefStreamStalled(Exception):
     """Raised by poll_until_done when ChatGPT's brief stream goes flat on
     text + sources + steps for STALL_THRESHOLD_SEC. Distinct from a wall-
@@ -27668,11 +27712,23 @@ class _BriefStreamStalled(Exception):
     flat. It is carried because the caller's offer to the user DEPENDS on it:
     the salvage action extracts whatever streamed, so offering it against an
     empty screen produces a 0-char brief and the false "no brief generated"
-    failure. Defaults to 0, which is the safe reading (offer nothing)."""
+    failure. Defaults to 0, which is the safe reading (offer nothing).
 
-    def __init__(self, message: str = "", text_len: int = 0):
+    ⭐ `contested` — 2026-08-12. The SECOND way this exception is now raised:
+    not "nothing moved for 20 minutes" but "the two sensors disagree and the
+    disagreement did not resolve". The page has a live Stop button according to
+    the vision model and no Stop button according to the DOM, on every read, for
+    the whole confirm budget. The ACTIONS the caller offers are identical
+    (retry, or use what is on screen) — but the copy must not be, because
+    "ChatGPT stopped updating" is a false statement about a page that, if the
+    vision model is the one telling the truth, is still writing. Naming the
+    state honestly is the same rule the 2026-08-11 "Skip" fix was written for:
+    a control whose label and behaviour disagree is worse than no control."""
+
+    def __init__(self, message: str = "", text_len: int = 0, contested: bool = False):
         super().__init__(message)
         self.text_len = int(text_len or 0)
+        self.contested = bool(contested)
 
 
 def _cua_affirms(cua_text: str, key: str) -> bool:
@@ -27848,6 +27904,137 @@ def _classify_completion_verdict(cua_text: str) -> str:
     return "ambiguous"
 
 
+# The page-side half of the badge read, as a probe rather than a predicate: it
+# returns WHAT it matched so the log can quote it. `_chatgpt_done_badge` below
+# is the only caller.
+_DONE_BADGE_PROBE_JS = """() => {
+    const bl = (document.body?.innerText || '').toLowerCase();
+    const m = bl.match(__DONE_BADGE_RE__);
+    return m ? m[0] : "";
+}""".replace("__DONE_BADGE_RE__", _THINKING_TIME_HEADER_JS)
+
+
+async def _chatgpt_done_badge(page) -> str:
+    """The thinking-time header ON THE PAGE, or "" when it is not there.
+
+    ⭐ 2026-08-12 — THIS IS WHAT LETS THE PIPELINE STOP ASKING.
+
+    `poll_until_done`'s verify-False path used to escalate to a vision confirm
+    on every "the DOM says not generating" — and the vision model, given a
+    prompt it could not satisfy in that layout, answered "still generating" to a
+    finished brief roughly forty times over forty-four minutes. The design rule
+    that got lost is that vision exists to resolve DOM UNCERTAINTY. When the
+    page itself carries a positive completion trace, there is no uncertainty to
+    resolve and no confirm is owed.
+
+    The header is the right trace, and the only one used here:
+
+      * it renders ONLY after the model has finished thinking, so it is a
+        statement about this response rather than about the page furniture;
+      * it lives in the HOST document even when the answer itself is inside a
+        canvas or a DR sandbox frame, which is exactly the layout that made the
+        text-length signals unreadable on 2026-08-12;
+      * it is already the marker `_classify_completion_verdict` treats as
+        conclusive when the vision model reports seeing it — so believing it
+        when we can read it ourselves is not a new claim, it is the same claim
+        without the round trip.
+
+    ⛔ WHAT IS DELIBERATELY *NOT* A CORROBORATOR: "there is a lot of text on
+    screen". The build plan proposed `last_seen_len >= 2000` as an alternative,
+    and it is unsound in precisely the case the confirm exists for. If ChatGPT
+    renames its stop-button markup the DOM detector goes blind and starts
+    reporting "not generating" MID-STREAM — at which point there is plenty of
+    text, and a length corroborator would skip the confirm and extract an
+    in-flight brief. That is the #753 false-complete, reintroduced through the
+    front door. Length says a response is BIG; only the header says it is DONE.
+
+    ⚠ Reading the whole body means a header from an EARLIER turn in the same
+    conversation can match. That staleness is bounded by the caller's
+    precondition and not by this probe: it is only consulted after `verify_fn`
+    has returned False twice, i.e. with no stop button, no running animation and
+    no streaming attribute anywhere on the page. A second turn genuinely
+    mid-flight trips at least one of those. It is the same bound the host
+    detector's own badge short-circuit has always relied on.
+
+    Returns the matched text (for the log) rather than a bool, because a line
+    that says WHICH label it read is what makes the next vendor rename visible.
+    """
+    try:
+        hit = await page.evaluate(_DONE_BADGE_PROBE_JS)
+        if hit:
+            return str(hit)
+    except Exception:
+        # A page that cannot be read is not a page that says "done". Returning
+        # "" routes to the visual confirm, which is the correct fallback: no
+        # corroboration means the DOM is on its own.
+        return ""
+    # The DR sandbox frames, for the layouts that render the answer inside one.
+    # Empty for every non-ChatGPT platform, so this stays a no-op there.
+    try:
+        for frame in _chatgpt_surface_frame_targets(page)[1:]:
+            try:
+                hit = await frame.evaluate(_DONE_BADGE_PROBE_JS)
+                if hit:
+                    return str(hit)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return ""
+
+
+# ⭐ 2026-08-12 — THE PROMPT THAT COULD NOT BE ANSWERED.
+#
+# The mission this replaces read:
+#
+#   "Look at the BOTTOM of the chat (composer / end of response). Is there a
+#    Stop button visible? ... If a Stop button is visible anywhere, say 'still
+#    generating'. Only say 'response complete' if there is NO stop button AND
+#    the final paragraph of the response is visible."
+#
+# Three defects, and they compound:
+#
+#  1. COMPLETION IS AN AND. The model must see no stop button AND the final
+#     paragraph. On 2026-08-12 the answer was in a canvas with the Activity
+#     panel open over it, so the final paragraph was not visible ANYWHERE on
+#     screen — the right-hand branch was unsatisfiable no matter how finished
+#     the response was. The model reported, accurately, that it could see
+#     "Worked for 16m 26s" and no stop button, and then obeyed the instruction
+#     and said "still generating".
+#  2. THERE IS NO THIRD ANSWER. With only two verdicts offered, "I cannot tell"
+#     has to be spelled as one of them, and the safer-sounding one is "still
+#     generating" — so a failure to read the screen came back as a positive
+#     observation of generation, which is the exact confusion #753 was written
+#     to end on the sibling path.
+#  3. IT LOOKS ONLY AT THE BOTTOM. Every completion trace ChatGPT renders —
+#     the thinking-time header, a document card, a citations list — is at the
+#     TOP of the response.
+#
+# So: completion is a DISJUNCTION of layout-independent traces, any one of
+# which is sufficient; generation still OVERRIDES, because a positively
+# observed Stop button is the one thing that must always win; and "cannot
+# determine" is offered explicitly, named as useful, so the parser's
+# "ambiguous" verdict gets used for what it means instead of arriving
+# disguised as an observation.
+_CONFIRM_COMPLETION_MISSION = (
+    "You are checking whether ChatGPT has finished answering. The answer may be "
+    "an inline message, a document/canvas card, or partly hidden behind an open "
+    "'Activity' side panel — all of those are normal. Observe only; do not click "
+    "anything.\n"
+    "1) STILL WORKING — any ONE of these is enough: a filled-square Stop button "
+    "in the composer; a 'Researching…', 'Thinking' or 'Finalizing' status; a "
+    "spinner or a shimmering animated status line. If you see any of them, reply "
+    "'still generating' and name what you saw and where.\n"
+    "2) FINISHED — any ONE of these is enough: a time badge above the answer such "
+    "as 'Thought for 1m 14s' or 'Worked for 16m 26s'; a completed document or "
+    "canvas card; a sources/citations list; a composer sitting idle and ready for "
+    "input. If you see any of these and nothing from (1), reply 'response "
+    "complete' and name what you saw.\n"
+    "3) If you can see neither — the screen is blank, obscured, or you genuinely "
+    "cannot tell — reply 'cannot determine' and describe what IS on screen. Never "
+    "guess: 'cannot determine' is a valid and useful answer.")
+
+
 async def _page_is_dead(page):
     """Why this page can no longer be producing anything, or None if it is alive.
 
@@ -27947,6 +28134,43 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
     # SAFETY_NET_CUA_SEC while the stall window keeps accumulating to its 20-min
     # threshold.
     _safety_net_next_check = 0.0
+
+    # ── The visual-confirm budget (⭐ 2026-08-12) ─────────────────────────────
+    # Phase 1's brief finished at t=1014s and phase 2 started 44 minutes later.
+    # The DOM detector was RIGHT on every one of the ~40 reads in between. The
+    # code asked the vision model to confirm each one, with a prompt it could
+    # not satisfy in that layout (see `_CONFIRM_COMPLETION_MISSION`), and
+    # nothing bounded the disagreement: a "still generating" answer reset the
+    # DOM streak to zero and re-armed the check, so the two sensors argued at
+    # roughly one call a minute until a human intervened. One call ran 10.5
+    # minutes on its own.
+    #
+    # Nothing else in this function could have stopped it. The stall surface is
+    # in the OTHER arm of this `if` and is unreachable once the DOM says done;
+    # `max_wait_min` is accepted and never referenced (the outer deadline is a
+    # 60-minute advisory soft-warn that does not abort); and this call site,
+    # unlike its sibling at the activity-panel tier, had no timeout.
+    #
+    # Three bounds, each answering a different failure:
+    #   * BUDGET — at most this many confirms per poll, of ANY outcome. Caps
+    #     what the argument can cost.
+    #   * BACKOFF — each disagreement waits longer than the last, so a genuine
+    #     slow finish is still caught without paying for a tight loop.
+    #   * TIMEOUT — the call itself, matching the sibling at the panel tier.
+    #
+    # ⛔ The budget deliberately does NOT reset when the DOM flips back to
+    # "generating". That makes the ceiling a property of the whole poll — "this
+    # phase spends at most three confirms" — rather than of a streak that an
+    # oscillating page can restart at will, which is exactly how 44 minutes
+    # accumulated. The cost of that choice is that a page which genuinely
+    # resumes and then finishes gets its second completion decided by the DOM
+    # alone; the DOM is the correct owner of that decision here, and the
+    # safety-net twin below still covers the opposite error.
+    _CUA_CONFIRM_BUDGET = 3
+    _CUA_CONFIRM_BACKOFF = (60, 120, 240)
+    _CUA_CONFIRM_TIMEOUT_S = 120.0
+    cua_confirms_spent = 0    # confirms made on this path, whatever they returned
+    cua_stop_sightings = 0    # of those, ones that POSITIVELY affirmed a Stop button
 
     # 2026-05-06 (Stream 2 D2): no inner wall-clock cap. The outer
     # _await_phase_with_active_deadline at the call site is the sole
@@ -28559,10 +28783,68 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                 await asyncio.sleep(5)
                 continue
 
-            # After 2 consecutive "not generating" — ask CUA to verify
-            if not cua_checked and browser and cua_client:
+            # ── ⭐ 2026-08-12: CORROBORATE, DON'T CONFIRM ─────────────────────
+            # The DOM has now said "not generating" twice. Before spending a
+            # visual confirm on that, ask the page whether it AGREES: the
+            # thinking-time header renders only once the model has finished, and
+            # it sits in the host document even when the answer itself is in a
+            # canvas. When it is there, the DOM is not uncertain and there is
+            # nothing for vision to resolve — which is the whole design rule
+            # this restores. See `_chatgpt_done_badge`, including why "there is
+            # a lot of text on screen" is deliberately NOT a corroborator.
+            #
+            # This alone is what takes the 2026-08-12 incident from ~40 visual
+            # confirms to zero: the page was showing "Worked for 16m 26s" the
+            # entire time, and the vision model kept quoting it back while
+            # answering "still generating" because the prompt left it no way to
+            # say anything else.
+            _done_badge = await _chatgpt_done_badge(page)
+
+            # ── The confirm budget: decide, never loop ────────────────────────
+            _skip_confirm = ""
+            if _done_badge:
+                _skip_confirm = f"the page itself shows {_done_badge!r}"
+            elif cua_confirms_spent >= _CUA_CONFIRM_BUDGET:
+                # Budget spent. Which way it resolves depends on WHAT the
+                # confirms actually saw — polarity, not a bare call count.
+                #
+                # A bare cap would silently extract in the one case this check
+                # exists for: ChatGPT renames its stop-button markup, the DOM
+                # detector goes blind and starts reporting "not generating"
+                # mid-stream, and the vision model is the only sensor still
+                # telling the truth. So a confirm that POSITIVELY affirmed a
+                # Stop button every single time is not overruled — it is a real
+                # sensor conflict, and the honest move is to stop and ask,
+                # exactly as the stall surface does in the other arm.
+                if cua_stop_sightings >= _CUA_CONFIRM_BUDGET:
+                    log(f"[{label}] the DOM reports finished and the visual confirm "
+                        f"reported a live Stop button on all {cua_stop_sightings} reads "
+                        f"— the two sensors disagree and neither is winning. Surfacing "
+                        f"for a user decision rather than guessing (text={last_seen_len})",
+                        "WARN")
+                    raise _BriefStreamStalled(
+                        f"phase {phase} completion is contested "
+                        f"(DOM says finished; {cua_stop_sightings} visual reads saw a "
+                        f"live Stop button; text={last_seen_len})",
+                        text_len=last_seen_len,
+                        contested=True,
+                    )
+                _skip_confirm = (f"the visual confirm disagreed {cua_confirms_spent}× "
+                                 f"without once naming a Stop button")
+
+            if _skip_confirm and browser and cua_client:
+                log(f"[{label}] DOM says not generating and {_skip_confirm} — "
+                    f"no visual confirm needed "
+                    f"({cua_confirms_spent}/{_CUA_CONFIRM_BUDGET} spent this poll)")
+
+            # After 2 consecutive "not generating", with nothing corroborating
+            # it and budget left — ask the vision model.
+            if not _skip_confirm and not cua_checked and browser and cua_client:
                 agent_key = normalize_agent_key(label)
-                log(f"[{label}] DOM says not generating after {int(time.time() - wait_start)}s — scrolling + CUA visual confirm...")
+                cua_confirms_spent += 1
+                log(f"[{label}] DOM says not generating after {int(time.time() - wait_start)}s "
+                    f"and no completion trace is readable on the page — scrolling + visual "
+                    f"confirm {cua_confirms_spent}/{_CUA_CONFIRM_BUDGET}...")
                 await browser.switch_to_page(page)
                 try:
                     await page.evaluate("""() => {
@@ -28573,105 +28855,100 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     await asyncio.sleep(0.4)
                 except Exception:
                     pass
-                async def _p1_diag_cua():
-                    return await agent_loop(cua_client, browser, PROMPT_DIAGNOSE,
-                        "Look at the BOTTOM of the chat (composer / end of response). "
-                        "Is there a Stop button visible? Is there a loading animation or 'Researching...' indicator? "
-                        "If a Stop button is visible anywhere, say 'still generating'. "
-                        "Only say 'response complete' if there is NO stop button AND the final paragraph of the response is visible.",
-                        model=CUA_MODEL, max_iterations=3, verbose=verbose)
 
-                # #839 act tier (read_only): the verdict phrases ('still
-                # generating' / 'response complete') land in the returned text
-                # for the same parser below; a wrong "complete" stays blocked
-                # by the verify_fn DOM re-check (#753 twin note).
-                diag = await _shadow_observed_cua(
-                    page, hotspot_id="poll-diagnose", phase=phase,
-                    platform=agent_key,
-                    current_step="confirm_not_generating",
-                    context_hint="DOM said not-generating 2x — READ the bottom of the "
-                                 "chat: Stop button anywhere → say 'still generating'; "
-                                 "no Stop AND final paragraph visible → 'response complete'",
-                    expected_outcome="an honest 'still generating' or 'response complete' verdict",
-                    cua_coro_factory=_p1_diag_cua,
-                    mission_prompt=PROMPT_DIAGNOSE,
-                    read_only=True) or {"status": "error", "text": ""}
-                # CRITICAL: A structural CUA failure (workspace cap, 401, 529,
-                # etc.) returns {"status": "error", "text": str(exception)}.
-                # Previously that error text fell through the heuristic parse
-                # below and hit the "assume complete" default, silently
-                # advancing the phase on a dead CUA call. Now: skip CUA this
-                # tick, trust the DOM check on the next poll. The underlying
-                # Anthropic error has already been surfaced to the frontend
-                # via pipeline_error by agent_loop's own error handler.
-                if diag.get("status") == "error":
-                    log(f"[{label}] CUA diagnostic unavailable ({(diag.get('text') or '')[:80]}) — "
-                        f"falling back to DOM for this poll tick", "WARN")
+                async def _p1_diag_cua():
+                    # ⛔ THE TIMEOUT IS NOT OPTIONAL. Its sibling at the
+                    # activity-panel tier has wrapped at 120s since 2026-07; this
+                    # call never did, and on 2026-08-12 one diagnosis ran 10.5
+                    # minutes — a quarter of the whole stall — inside a loop that
+                    # had no other ceiling.
+                    return await asyncio.wait_for(
+                        agent_loop(cua_client, browser, PROMPT_DIAGNOSE,
+                            _CONFIRM_COMPLETION_MISSION,
+                            model=CUA_MODEL, max_iterations=3, verbose=verbose),
+                        timeout=_CUA_CONFIRM_TIMEOUT_S)
+
+                # #839 act tier (read_only): the verdict phrases land in the
+                # returned text for `_classify_completion_verdict` below, and
+                # read_only blocks every click — so this inspector can never
+                # touch the Stop button it is looking for.
+                try:
+                    diag = await _shadow_observed_cua(
+                        page, hotspot_id="poll-diagnose", phase=phase,
+                        platform=agent_key,
+                        current_step="confirm_not_generating",
+                        context_hint="DOM said not-generating 2× and no completion trace "
+                                     "was readable on the page — say what is on screen: "
+                                     "any working indicator → 'still generating'; any "
+                                     "finished trace → 'response complete'; if you cannot "
+                                     "tell → 'cannot determine'",
+                        expected_outcome="'still generating', 'response complete', or an "
+                                         "honest 'cannot determine'",
+                        cua_coro_factory=_p1_diag_cua,
+                        mission_prompt=PROMPT_DIAGNOSE,
+                        read_only=True) or {"status": "error", "text": ""}
+                except asyncio.TimeoutError:
+                    diag = {"status": "error",
+                            "text": f"timed out after {int(_CUA_CONFIRM_TIMEOUT_S)}s"}
+
+                # A structural CUA failure (workspace cap, 401, 529, the timeout
+                # above) returns {"status": "error", ...}, and `max_iterations`
+                # returns only the LAST text block — possibly mid-reasoning
+                # rather than a conclusion. Neither is a verdict, so neither is
+                # parsed: keep polling and let the DOM be re-checked next tick.
+                #
+                # It DID consume budget, deliberately. Three failed confirms is
+                # three chances to contradict the DOM that produced nothing, and
+                # the old code's `cua_checked = False; continue` had no counter
+                # at all — a CUA that errors every tick kept the loop alive
+                # forever with no evidence on either side.
+                if diag.get("status") in ("error", "max_iterations"):
+                    log(f"[{label}] visual confirm unavailable "
+                        f"(status={diag.get('status')}: {(diag.get('text') or '')[:80]}) — "
+                        f"keeping the DOM's answer under review, "
+                        f"{cua_confirms_spent}/{_CUA_CONFIRM_BUDGET} spent", "WARN")
                     cua_checked = False
                     await asyncio.sleep(poll_interval)
                     continue
-                diag_text = (diag.get("text") or "").lower()
+
+                diag_text = (diag.get("text") or "")
                 cua_checked = True
 
-                # Parse CUA response: look for the deterministic conclusion phrase.
-                # NOTE (#753): this verify-False sibling keeps its greedy
-                # "response complete" check + inverted Stop-button fallback + an
-                # assume-complete default. That is SAFE *only* because this path
-                # does NOT early-return on `is_complete` — it falls through to the
-                # DOM re-verify below (`still = await verify_fn(page); if not
-                # still: return True`), which blocks a wrong "complete" while the
-                # Stop button is still up. Do NOT add an early `return True` here
-                # without first routing this through _classify_completion_verdict
-                # (the safety-net's hardened parser) — otherwise the #753 bug
-                # reappears in this twin.
-                is_generating = False
-                is_complete = False
-                if "response complete" in diag_text:
-                    is_complete = True
-                elif "still generating" in diag_text:
-                    is_generating = True
-                elif "needs click" in diag_text:
-                    is_generating = True  # Needs intervention, not done yet
-                else:
-                    # Fallback: count YES/NO answers about stop button and loading.
-                    #
-                    # ⚠ 2026-08-05 — these two used to read BACKWARD from the
-                    # keyword (`diag_text.split("stop")[0][-30:]`), looking for a
-                    # 'yes' BEFORE it. That is the exact direction #753's docstring
-                    # records as broken: the CUA writes "Stop button: Yes", so a
-                    # genuinely-affirmed Stop button read as absent and pushed this
-                    # branch toward `is_complete` — the dangerous side. Both now use
-                    # the shared primitive, which reads forward within the clause.
-                    #
-                    # `has_response` no longer accepts a bare "completed": the same
-                    # trap the r2 review note in _classify_completion_verdict spells
-                    # out, and the 2026-08-05 CUA text ("Research completed in 23m ·
-                    # 68 citations") is precisely the shape it warns about — a stale
-                    # activity summary belonging to a DIFFERENT conversation.
-                    #
-                    # The documented invariant above still holds: this branch does
-                    # not early-return, the DOM re-verify below is what makes a
-                    # wrong "complete" recoverable.
-                    has_stop = (_cua_affirms(diag_text, "stop button")
-                                or _cua_affirms(diag_text, "stop:")
-                                or _cua_affirms(diag_text, "stop icon"))
-                    has_loading = (_cua_affirms(diag_text, "loading")
-                                   or _cua_affirms(diag_text, "spinner")
-                                   or _cua_affirms(diag_text, "animation"))
-                    has_response = "response visible" in diag_text or _cua_affirms(
-                        diag_text, "response complete")
-                    if has_stop or has_loading:
-                        is_generating = True
-                    elif has_response:
-                        is_complete = True
-                    else:
-                        is_complete = True  # noqa: F841 — default: if unclear, assume complete (don't get stuck); SAFE only via the verify_fn re-check below
+                # ⭐ ONE PARSER FOR BOTH TWINS. This branch used to keep its own
+                # inline parse — a greedy "response complete" substring test, an
+                # inverted Stop-button fallback, and an assume-complete default —
+                # justified by the fact that it does not early-return. The
+                # justification held; what it could not do is TELL THE
+                # DIFFERENCE between "the model observed generation" and "the
+                # model recognised nothing", so a screen it could not read came
+                # back as a positive observation of generation, and the log said
+                # "CUA says still generating" forty times about a finished brief.
+                # #753's note here named routing through the hardened classifier
+                # as the precondition for restructuring this block. This is that.
+                _verdict = _classify_completion_verdict(diag_text)
+                _stop_seen = (_cua_affirms(diag_text, "stop button")
+                              or _cua_affirms(diag_text, "stop:")
+                              or _cua_affirms(diag_text, "stop icon"))
+                if _stop_seen:
+                    cua_stop_sightings += 1
 
-                if is_generating:
-                    log(f"[{label}] CUA says still generating — continuing poll")
-                    consecutive_not_generating = 0
+                if _verdict == "generating":
+                    # ⛔ `consecutive_not_generating` is NOT reset here. Resetting
+                    # it is what made this unbounded: it sent the loop back to
+                    # "wait for two more DOM reads, then confirm again", forever,
+                    # with the disagreement itself leaving no trace. The
+                    # disagreement now has its own counter and its own ceiling.
                     cua_checked = False
-                    if "needs click" in diag_text:
+                    _backoff = _CUA_CONFIRM_BACKOFF[
+                        min(cua_confirms_spent, len(_CUA_CONFIRM_BACKOFF)) - 1]
+                    log(f"[{label}] visual confirm disagrees — it reports generation"
+                        + (" and names a live Stop button" if _stop_seen else
+                           " (no Stop button named)")
+                        + f" while the DOM says finished "
+                          f"[{cua_confirms_spent}/{_CUA_CONFIRM_BUDGET}, "
+                          f"stop sightings {cua_stop_sightings}] — "
+                          f"waiting {_backoff}s before re-reading", "WARN")
+                    if "needs click" in diag_text.lower():
                         async def _p1_fix_cua():
                             return await agent_loop(cua_client, browser, PROMPT_FIX_ISSUE,
                                 "Click whatever button needs clicking.", model=CUA_MODEL, max_iterations=5, verbose=verbose)
@@ -28685,12 +28962,34 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                             expected_outcome="the blocking button is clicked and generation resumes",
                             cua_coro_factory=_p1_fix_cua,
                             mission_prompt=PROMPT_FIX_ISSUE)
+                        # A short wait, not the backoff: the page was just
+                        # changed, so the next read is about the click's effect.
                         await asyncio.sleep(5)
                     else:
-                        await asyncio.sleep(poll_interval)
+                        await asyncio.sleep(_backoff)
                     continue
+
+                # "complete" and "ambiguous" BOTH fall through to the DOM
+                # re-verify below, and they are logged as the different
+                # statements they are.
+                #
+                # ⚠ This is where the two twins deliberately diverge, and the
+                # reason is which sensor is claiming what. In the safety net the
+                # DOM says GENERATING, so an unreadable screen leaves a live
+                # contradiction and "keep waiting" is the only safe reading. Here
+                # the DOM says FINISHED and nothing contradicts it: "I recognised
+                # nothing" is not evidence against a decision that has already
+                # been made correctly, and treating it as a veto is exactly what
+                # cost 44 minutes. The DOM re-verify below still has to agree
+                # before this returns True.
+                if _verdict == "complete":
+                    log(f"[{label}] visual confirm agrees the response is complete ✓")
                 else:
-                    log(f"[{label}] CUA confirms response complete ✓")
+                    log(f"[{label}] visual confirm recognised nothing conclusive — no "
+                        f"working indicator and no completion trace in its read. The DOM "
+                        f"has said finished {consecutive_not_generating}× and nothing "
+                        f"contradicts it, so the DOM decides. This is also the shape a "
+                        f"changed page label makes: text={diag_text[:200]!r}", "WARN")
 
             # Double-check DOM
             await asyncio.sleep(3)
@@ -28764,9 +29063,10 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     "If ANY of those are present, say exactly 'still generating' — this OVERRIDES everything else, "
                     "even if some text already looks rendered. "
                     "ONLY when NONE of those are present, look for COMPLETION TRACES: the STRONGEST is a "
-                    "'Thought for X min Y sec' label at the TOP of the latest response, just above the research "
-                    "content — it appears ONLY once ChatGPT has finished thinking, so scroll up to the start of the "
-                    "latest answer to check for it. Other traces: a fully rendered report/brief, a document or canvas "
+                    "time badge at the TOP of the latest response, just above the research content — it reads "
+                    "'Thought for 1m 14s' or 'Worked for 16m 26s' or 'Researched for 5m', and it appears ONLY "
+                    "once ChatGPT has finished thinking, so scroll up to the start of the latest answer to check "
+                    "for it. Other traces: a fully rendered report/brief, a document or canvas "
                     "card, a sources/citations list, a clearly-finished final paragraph. "
                     "Say exactly 'response complete' only if there is NO stop button, NO finalizing/loading indicator, "
                     "AND a finished response is visible (ideally with the 'Thought for …' header). "
@@ -28787,8 +29087,9 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     current_step="safety_net_completion_check",
                     context_hint="content flat 5+ min while detector says generating — "
                                  "READ the latest response: Stop/finalizing/loading → "
-                                 "'still generating'; finished brief with 'Thought for …' "
-                                 "header → 'response complete'; unsure → 'still generating'",
+                                 "'still generating'; finished brief with a "
+                                 "'Thought for …' / 'Worked for …' time badge → "
+                                 "'response complete'; unsure → 'still generating'",
                     expected_outcome="an honest 'still generating' or 'response complete' verdict",
                     cua_coro_factory=_sn_diag_cua,
                     mission_prompt=f"{PROMPT_DIAGNOSE}\n\nTASK: {_sn_mission}",
@@ -36769,15 +37070,13 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
             _p1s_actions.append({"id": "skip", "label": "Use what's on screen",
                                  "style": "default",
                                  "command": {"action": "skip_phase", "phase": 1}})
+        _p1s_title, _p1s_body = _p1_stall_card_copy(
+            contested=bool(getattr(_bs, "contested", False)),
+            salvageable=_p1s_salvageable,
+            text_len=int(getattr(_bs, "text_len", 0) or 0))
         fail_phase(1,
-                   "ChatGPT stopped responding",
-                   ("ChatGPT stopped updating while writing the brief, but "
-                    f"{int(getattr(_bs, 'text_len', 0) or 0):,} characters are already on screen. "
-                    "Retry starts the brief over. Use what's on screen keeps that text "
-                    "and continues to the research phase."
-                    if _p1s_salvageable else
-                    "ChatGPT stalled before producing a usable brief. Retry starts it over — "
-                    "the run cannot continue without a brief."),
+                   _p1s_title,
+                   _p1s_body,
                    agent="chatgpt",
                    can_retry=retries_left_p1s > 0,
                    actions=_p1s_actions)
