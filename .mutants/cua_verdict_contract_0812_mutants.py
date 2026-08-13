@@ -80,9 +80,8 @@ MUTANTS = [
      [('                    _sn_verdict = _cua_completion_report(_sn_text)["verdict"]',
        "                    _sn_verdict = _classify_completion_verdict(_sn_text)")]),
     ("U10", "under", "the contract stops naming 'unknown' as a real answer",
-     [('"'"'unknown'"'"' and '"'"'unsure'"'"' are real "\n'
-       '    "answers: use them rather than guessing.")',
-       'answer.")')]),
+     [("are real \"\n    \"answers: use them rather than guessing.\")",
+       "are real answers.\")")]),
 
     # ═══════════════════════════ OVER — overreach ══════════════════════════
     ("O1", "over", "⛔⛔ the prose fallback is deleted — every historical answer goes unparsed",
