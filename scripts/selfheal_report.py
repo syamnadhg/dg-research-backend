@@ -84,6 +84,7 @@ def summarize(records: list[dict]) -> dict:
     """Aggregate records into a pure, testable summary structure."""
     per_intent: dict[str, dict] = defaultdict(
         lambda: {"total": 0, "pass": 0, "would_heal": 0, "probe_sum": 0, "probe_max": 0,
+                 "empty_probe": 0, "resolver_blind": 0,
                  "resolver_seen": 0, "resolver_matched": 0, "heal_conf_sum": 0.0, "heal_conf_n": 0,
                  "heal_attempts": 0, "heal_acted": 0, "heal_ok": 0}
     )
@@ -94,23 +95,52 @@ def summarize(records: list[dict]) -> dict:
         s["total"] += 1
         if rec.get("outcome_pass") is True:
             s["pass"] += 1
-        if rec.get("would_heal") is True:
-            s["would_heal"] += 1
         pc = rec.get("probe_count")
         if isinstance(pc, int):
             s["probe_sum"] += pc
             s["probe_max"] = max(s["probe_max"], pc)
+        # ⭐ 2026-08-13 — count the observations that SAW NOTHING, separately and
+        # visibly. On the first real shadow run three of eleven records had
+        # probe_count 0 and the empty-string DOM fingerprint, and nothing in this
+        # report distinguished them from a region that was examined and found
+        # broken. Reported rather than dropped: a silently discarded sample reads
+        # as "covered everything" when it covered nothing.
+        # `probe_empty` is written explicitly by the observer; probe_count is the
+        # fallback for records logged before that field existed.
+        _blind = (rec.get("probe_empty") is True or pc == 0)
+        if _blind:
+            s["empty_probe"] += 1
+        # Discounted here as well as at the writer, so this report is correct
+        # against logs produced by the PREVIOUS observer — which wrote
+        # `would_heal: true` for blind samples. Re-reading old lines is the
+        # normal case for a shadow rollout: the whole point is to accumulate
+        # them over weeks, and a fix at the writer alone would leave every
+        # already-collected line misreported forever.
+        if rec.get("would_heal") is True and not _blind:
+            s["would_heal"] += 1
         # PX-2 telemetry. Shadow records (resolved_by="shadow") carry the heal
         # DECISION (did the resolver find a candidate?); heal records
         # (resolved_by="heal") carry the ACTIVATION outcome (acted/healed).
         if "heal_match_found" in rec:
-            s["resolver_seen"] += 1
-            if rec.get("heal_match_found") is True:
-                s["resolver_matched"] += 1
-            hc = rec.get("heal_confidence")
-            if isinstance(hc, (int, float)):
-                s["heal_conf_sum"] += float(hc)
-                s["heal_conf_n"] += 1
+            # ⭐ 2026-08-13 — a resolver result from an EMPTY probe is not a
+            # result. It was being folded into the match RATE, and the PX-4
+            # canary derives its verdict from that rate: two NotebookLM intents
+            # were reported as "DRIFT" on the first real shadow run purely
+            # because their dialog had already closed when they were observed.
+            # A false alarm on the one signal whose entire job is early warning
+            # is worse than no signal — it sends someone hunting selector rot
+            # that does not exist. Counted separately so the sample is visible
+            # rather than dropped.
+            if _blind:
+                s["resolver_blind"] += 1
+            else:
+                s["resolver_seen"] += 1
+                if rec.get("heal_match_found") is True:
+                    s["resolver_matched"] += 1
+                hc = rec.get("heal_confidence")
+                if isinstance(hc, (int, float)):
+                    s["heal_conf_sum"] += float(hc)
+                    s["heal_conf_n"] += 1
         if rec.get("resolved_by") == "heal":
             s["heal_attempts"] += 1
             if rec.get("acted") is True:
@@ -152,17 +182,24 @@ def format_report(summary: dict) -> str:
     lines.append("=" * 68)
     lines.append(f"records: {summary['records']}   platforms: {', '.join(summary['platforms_seen']) or '(none)'}")
     lines.append("")
-    lines.append(f"{'intent':<34}{'n':>5}{'pass':>6}{'pass%':>7}{'wheal':>7}{'probe~':>8}")
-    lines.append("-" * 68)
+    lines.append(f"{'intent':<34}{'n':>5}{'pass':>6}{'pass%':>7}{'wheal':>7}{'probe~':>8}{'blind':>7}")
+    lines.append("-" * 75)
     for intent in INTENTS:
         s = summary["per_intent"].get(intent)
         if not s:
-            lines.append(f"{intent:<34}{'-':>5}{'-':>6}{'-':>7}{'-':>7}{'-':>8}   (not observed)")
+            lines.append(f"{intent:<34}{'-':>5}{'-':>6}{'-':>7}{'-':>7}{'-':>8}{'-':>7}   (not observed)")
             continue
         n = s["total"]
         pct = (100.0 * s["pass"] / n) if n else 0.0
         avg = (s["probe_sum"] / n) if n else 0.0
-        lines.append(f"{intent:<34}{n:>5}{s['pass']:>6}{pct:>6.0f}%{s['would_heal']:>7}{avg:>8.1f}")
+        # `blind` = observations whose probe returned nothing. An intent that is
+        # ALL blind has never actually been watched, whatever its n says — which
+        # is how two dialog-scoped NotebookLM intents sat in this table looking
+        # observed while being observed after their dialog had closed.
+        blind = s["empty_probe"]
+        flag = "   ⚠ never observed" if n and blind == n else ""
+        lines.append(f"{intent:<34}{n:>5}{s['pass']:>6}{pct:>6.0f}%"
+                     f"{s['would_heal']:>7}{avg:>8.1f}{blind:>7}{flag}")
     # any intents in the log that aren't one of the expected set
     extra = [i for i in summary["intents_seen"] if i not in INTENTS]
     for intent in extra:
@@ -191,7 +228,8 @@ def format_report(summary: dict) -> str:
     # drift signal (robust to the noisy fingerprint). 'weak' can be benign (a control
     # that doesn't exist, e.g. ChatGPT has no P2 model picker). Floor mirrors
     # selfheal._DRIFT_CONF_FLOOR (kept inline so the report stays import-free).
-    drift_rows = [(i, s) for i in INTENTS if (s := summary["per_intent"].get(i)) and s["resolver_seen"]]
+    drift_rows = [(i, s) for i in INTENTS if (s := summary["per_intent"].get(i))
+                  and (s["resolver_seen"] or s["resolver_blind"])]
     if drift_rows:
         lines.append("")
         lines.append("PX-4 drift canary (anchor strength):")
@@ -201,7 +239,15 @@ def format_report(summary: dict) -> str:
             seen = s["resolver_seen"]
             fr = (s["resolver_matched"] / seen) if seen else 0.0
             mc = (s["heal_conf_sum"] / s["heal_conf_n"]) if s["heal_conf_n"] else 0.0
-            verdict = "DRIFT" if (seen and fr < 1.0) else ("weak" if mc < 0.35 else "stable")
+            # An intent with no OBSERVED samples has no anchor strength to
+            # report. Saying "DRIFT" there states a finding about a region
+            # nobody looked at.
+            if not seen:
+                verdict = "not observed"
+            elif fr < 1.0:
+                verdict = "DRIFT"
+            else:
+                verdict = "weak" if mc < 0.35 else "stable"
             lines.append(f"{intent:<34}{100.0 * fr:>6.0f}%{mc:>7.2f}  {verdict}")
     lines.append("=" * 68)
     return "\n".join(lines)

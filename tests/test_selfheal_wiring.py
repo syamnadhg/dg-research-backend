@@ -81,10 +81,32 @@ def test_shadow_observe_writes_a_record_with_outcome_and_probe(monkeypatch):
 
 
 def test_shadow_observe_failing_predicate_flags_would_heal(monkeypatch):
+    # ⭐ 2026-08-13 — this used to pass `FakePage([])`, an EMPTY probe, and assert
+    # would_heal was True. That is the defect the first real shadow run surfaced,
+    # written down as an expectation: three of eleven records probed nothing and
+    # counted as heals, and the report graded a DRIFT verdict off them. The
+    # property worth pinning is "a failing predicate over a region we ACTUALLY
+    # SAW flags a would-heal", so the page now returns something.
+    monkeypatch.setenv("DG_SELFHEAL_ENABLED", "1")
+    page = FakePage([{"role": "button", "accessible_name": "model", "text": "Model",
+                      "attrs": {}, "bounds": {"x": 0, "y": 0, "w": 10, "h": 10},
+                      "visible": True}])
+    asyncio.run(research._selfheal_shadow_observe(page, "claude.select_model", outcome_pass=False))
+    r = _read_shadow()[-1]
+    assert r["outcome_pass"] is False and r["would_heal"] is True
+    assert r["probe_empty"] is False
+
+
+def test_shadow_observe_does_not_flag_a_would_heal_it_could_not_see(monkeypatch):
+    """⛔ The companion, and the case that went wrong live. An empty probe means
+    the engine had nothing to look at — no drift was observed, because no
+    observation happened. See tests/test_selfheal_blind_probe_0813.py."""
     monkeypatch.setenv("DG_SELFHEAL_ENABLED", "1")
     asyncio.run(research._selfheal_shadow_observe(FakePage([]), "claude.select_model", outcome_pass=False))
     r = _read_shadow()[-1]
-    assert r["outcome_pass"] is False and r["would_heal"] is True
+    assert r["outcome_pass"] is False
+    assert r["would_heal"] is False
+    assert r["probe_empty"] is True
 
 
 def test_shadow_observe_resolves_and_acts_nothing(monkeypatch):

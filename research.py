@@ -15647,6 +15647,35 @@ async def _set_nlm_public_and_get_link(page, label):
         except Exception as _ve:
             log(f"[{label}] public-access DOM verify skipped: {_ve}", "DEBUG")
 
+        # ⭐ Phoenix PX-0 shadow observation — BEFORE the dialog is dismissed.
+        #
+        # 2026-08-13: these two ran AFTER Step 3b's Save/Done click, which closes
+        # the dialog. Both intents declare `region: "dialog"` in
+        # selfheal_intents.json, so `probe_region` had nothing to walk and every
+        # record came back `probe_count: 0` against the empty-string fingerprint.
+        # That is not a bad run — at that call site those two intents could NEVER
+        # produce a usable sample, however long shadow ran, so NotebookLM would
+        # never accumulate the evidence the whole shadow-first rollout exists to
+        # collect.
+        #
+        # Both predicates are already decided by here: `public_verified` comes
+        # from Step 3a's strict read above, and `url` was read further up. So
+        # moving the observation earlier costs one read-only DOM walk inside a
+        # dialog that is about to close anyway, and changes no verdict.
+        #
+        # Selector rot here was invisible for the entire life of the corpus:
+        # `Public share DOM-verified` never once logged, and the tab-URL fallback
+        # covered for it on 100% of runs until a platform change made it fatal.
+        # These two observations put the dialog's own controls under the same
+        # watch the P2 setup intents get. Read-only, flag-gated (default OFF),
+        # and each predicate is the SAME value the live code just computed — no
+        # second source of truth.
+        if selfheal and selfheal.is_enabled():
+            await _selfheal_shadow_observe(page, "notebooklm.set_public_access",
+                                           outcome_pass=bool(public_verified))
+            await _selfheal_shadow_observe(page, "notebooklm.copy_share_link",
+                                           outcome_pass=is_notebooklm_url(url))
+
         # Step 3b: Click Save/Done to apply the sharing change.
         await page.evaluate("""() => {
             const btns = document.querySelectorAll('button');
@@ -15678,19 +15707,9 @@ async def _set_nlm_public_and_get_link(page, label):
         else:
             log(f"[{label}] Public share NEITHER set nor verified — the returned "
                 f"link may genuinely be private", "WARN")
-        # Phoenix PX-0 shadow observation for the P3 share dialog (2026-07-31).
-        # Selector rot here was invisible for the entire life of the corpus:
-        # `Public share DOM-verified` never once logged, and the tab-URL fallback
-        # covered for it on 100% of runs until a platform change made it fatal.
-        # These two observations put the dialog's own controls under the same
-        # watch the P2 setup intents get. Read-only, flag-gated (default OFF),
-        # and each predicate is the SAME value the live code just computed — no
-        # second source of truth.
-        if selfheal and selfheal.is_enabled():
-            await _selfheal_shadow_observe(page, "notebooklm.set_public_access",
-                                           outcome_pass=bool(public_verified))
-            await _selfheal_shadow_observe(page, "notebooklm.copy_share_link",
-                                           outcome_pass=is_notebooklm_url(url))
+        # (The PX-0 shadow observations moved ABOVE the Save/Done click — see the
+        # note there. Observing a `region: "dialog"` intent after the dialog is
+        # dismissed can only ever record an empty probe.)
     except Exception as e:
         log(f"[{label}] NLM public share flow: {e}", "WARN")
     # Two separate intents, deliberately. Reporting them as one would hide the
@@ -37954,12 +37973,40 @@ async def _selfheal_shadow_observe(page, intent_id: str, *, outcome_pass) -> Non
         # nothing); the candidate lives in heal_* so the report can grade match
         # quality before activation.
         heal = selfheal.shadow_heal_decision(snap, intent)
+        # ⭐ 2026-08-13 — `would_heal` WAS `not ok`, and nothing else.
+        #
+        # An observation whose probe came back EMPTY looked identical in the log
+        # to one that examined the region and found it broken: both wrote
+        # `would_heal: true`. They are not the same claim. An empty probe means
+        # the engine had NOTHING TO LOOK AT — no drift was observed, because no
+        # observation happened.
+        #
+        # It surfaced on the first real shadow run (2026-08-13). Three of eleven
+        # records were `probe_count: 0` with `ui_fingerprint` da39a3ee5e6b — the
+        # SHA-1 of the empty string — and all three counted as heals. That number
+        # feeds `heals_by_platform`, which feeds the "≥1 heal shadowed per
+        # platform" Definition-of-Done gate: the gate that decides shadow has
+        # collected enough evidence to consider activation was about to be
+        # satisfied by three observations of a blank document.
+        #
+        # Same defect the note at the `chatgpt.select_model` call site records —
+        # "every sample from it was noise" — and the same lesson as the panel
+        # audit: A COUNT IS NOT PROOF.
+        #
+        # `heal_match_found` still carries whether the attempt would LAND; this
+        # only asserts that an attempt is a coherent thing to talk about.
+        _observed = bool(snap)
         selfheal.shadow_log({
             "platform": intent.get("platform") or intent_id.split(".", 1)[0],
             "intent": intent_id,
             "tier": "builtin",          # the existing DOM heuristic just ran
             "outcome_pass": ok,
-            "would_heal": not ok,       # PX-2 would attempt a heal at this point
+            # PX-2 would attempt a heal at this point — which requires having
+            # seen the region at all.
+            "would_heal": (not ok) and _observed,
+            # Explicit rather than left to be inferred from probe_count, because
+            # inferring it is exactly what nobody did for three records.
+            "probe_empty": not _observed,
             "probe_count": len(snap),
             "selector_or_box": None,    # shadow resolves/acts nothing
             "confidence": None,
