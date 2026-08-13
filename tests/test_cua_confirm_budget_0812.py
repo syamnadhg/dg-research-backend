@@ -222,9 +222,20 @@ class Harness:
         self._mp = monkeypatch
         self._install()
 
+    # A hard ceiling on iterations. ⭐ This is not defensive clutter — it is the
+    # assertion. Every failure in this file's incident is a failure to HALT, and
+    # a test for halting that hangs when it regresses is worse than no test:
+    # it turns a red suite into a wedged one. Raising here converts "runs
+    # forever" into a named failure, in the test, in under a second.
+    _MAX_READS = 500
+
     # ── the scripted DOM ──
     async def verify_fn(self, page):
         self.dom_reads += 1
+        if self.dom_reads > self._MAX_READS:
+            raise AssertionError(
+                f"poll_until_done did not terminate: {self.dom_reads} DOM reads, "
+                f"{self.confirms} visual confirms")
         return self.dom[min(self.dom_reads, len(self.dom)) - 1]
 
     def _install(self):

@@ -196,7 +196,16 @@ def tracked_dirty() -> list[str]:
 
 
 def run_tests() -> bool:
-    return sh([sys.executable, "-m", "pytest", *SUITES.split(), "-q"]).returncode == 0
+    """Green means the mutant SURVIVED. A hang counts as red, deliberately:
+    several mutants here remove a termination bound, and "the suite never
+    finished" is a kill, not an inconclusive result. The harness in the test
+    file has its own iteration ceiling so this backstop should never fire."""
+    try:
+        return subprocess.run(
+            [sys.executable, "-m", "pytest", *SUITES.split(), "-q"],
+            cwd=ROOT, capture_output=True, text=True, timeout=180).returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
 
 
 def main() -> int:
