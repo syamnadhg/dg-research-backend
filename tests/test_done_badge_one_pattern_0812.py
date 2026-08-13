@@ -82,6 +82,19 @@ PROSE = [
     "The committee reasoned for several pages that the merger was sound",
     # the shape closest to the badge: a bare number, no unit
     "worked for 3 teams across the region",
+    # ── the three below each pin ONE boundary of the pattern, and every one of
+    # them was found by mutation: the first draft of this file asserted only the
+    # cases above, and a pattern loosened at any of these three edges still
+    # passed. They are ordinary sentences in a research brief, which is the
+    # point — this pattern is read against the whole rendered report.
+    #
+    # the VERB family is closed. Opened to \w+, this reads as a finished header.
+    "The outage lasted for 3 hours before the feed recovered",
+    # the TRAILING boundary. Without it, "3 h" matches inside "3 hourly".
+    "The team worked for 3 hourly briefings that week",
+    # the LEADING boundary. Without it, "thought for 5 minutes" matches inside
+    # "rethought".
+    "He rethought for 5 minutes and changed his mind",
 ]
 
 
