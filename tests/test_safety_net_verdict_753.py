@@ -201,9 +201,19 @@ def test_safety_net_treats_max_iterations_like_error():
 def test_safety_net_uses_the_classifier():
     import inspect
     src = inspect.getsource(research.poll_until_done)
-    assert "_classify_completion_verdict(_sn_text)" in src, (
-        "the safety-net no longer routes its verdict through the hardened "
-        "classifier — the greedy 'response complete' parse may have crept back"
+    # 2026-08-12: the call site now reads `_cua_completion_report`, which reads
+    # the verdict CONTRACT first and falls back to this classifier when the
+    # model did not emit one. The property being pinned is unchanged — the
+    # safety net does not parse the answer itself — so it is asserted one level
+    # down as well, where the classifier now lives.
+    assert "_cua_completion_report(_sn_text)" in src, (
+        "the safety-net no longer routes its verdict through the shared reader "
+        "— the greedy 'response complete' parse may have crept back"
+    )
+    assert "_classify_completion_verdict(" in inspect.getsource(
+        research._cua_completion_report), (
+        "the hardened classifier is no longer the contract reader's fallback — "
+        "an answer without a VERDICT line would go unparsed"
     )
     # And the old inverted Stop-button check must be gone from the safety-net.
     assert '_sn_text.split("stop")' not in src, (

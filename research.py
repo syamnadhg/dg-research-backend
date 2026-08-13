@@ -28050,6 +28050,119 @@ def _classify_completion_verdict(cua_text: str) -> str:
     return "ambiguous"
 
 
+# ── The CUA verdict contract (⭐ 2026-08-12) ─────────────────────────────────
+#
+# WHY: every completion decision vision makes is read back out of FREE PROSE by
+# `_classify_completion_verdict`, which matches ~30 substrings. That parser is
+# the most-patched thing in this file and every patch has the same shape — a
+# phrase that meant the opposite of what the match assumed:
+#
+#   * #753: "response complete" ECHOED from the instruction, and in one case
+#     negated ("I would NOT say response complete"), read as done.
+#   * 2026-08-05: "progress bar" inside a sentence ENUMERATING it in order to
+#     DENY it ("No spinning ring, pulsing dot, or progress bar is visible"),
+#     read as generation. Cost a whole production run.
+#   * The hedge list still standing below: a careful, CORRECT answer — "the
+#     canvas is complete, though I can't tell whether more sources load below"
+#     — hits "can't tell" and reads as still generating.
+#
+# The common cause is not the individual keywords. It is that we ask a model to
+# REASON and then recover its conclusion by sniffing the reasoning. Prose is
+# where it thinks; it is not an answer channel.
+#
+# So the model now reasons freely and then states its conclusion on its own
+# lines, in a fixed shape, and those lines are what we read. The prose parser
+# stays as the FALLBACK — a model that ignores the format must still be
+# understood, and every historical read in the test corpus must keep resolving
+# the way it does today.
+#
+# ⭐ `STOP_BUTTON` is a separate field on purpose, not a detail of the verdict.
+# The confirm budget's polarity rule — three positive Stop sightings against a
+# DOM that says finished is a real sensor conflict, not noise — is what makes
+# bounding the loop safe at all, and it was previously derived by looking for
+# "yes" near the words "stop button" in prose. Under a contract that says
+# "EVIDENCE: a filled-square Stop button in the composer", that search finds
+# nothing. Asking for the field directly keeps the rule readable and makes it
+# stronger, since "unsure" is now expressible.
+_CUA_CONTRACT_BLOCK = (
+    "\nFinish your reply with EXACTLY these three lines, each on its own line, "
+    "nothing after them:\n"
+    "VERDICT: complete | generating | unknown\n"
+    "STOP_BUTTON: yes | no | unsure\n"
+    "EVIDENCE: <one short line naming what you actually saw>\n"
+    "Think it through first if that helps — the three lines just have to come "
+    "last. Pick exactly one value on each line. 'unknown' and 'unsure' are real "
+    "answers: use them rather than guessing.")
+
+# Anchored to the START OF A LINE, and horizontal whitespace only — `\s` would
+# span newlines and undo the anchoring. That anchoring is the point: an
+# instruction echoed mid-sentence ("I would reply 'VERDICT: complete'") does not
+# begin a line, so it cannot be mistaken for the conclusion. That exact echo is
+# the #753 defect.
+_CUA_VERDICT_LINE = re.compile(
+    r"^[^\S\n]*verdict[^\S\n]*[:=][^\S\n]*(complete|generating|unknown)\b",
+    re.I | re.M)
+_CUA_STOP_LINE = re.compile(
+    r"^[^\S\n]*stop[_ -]?button[^\S\n]*[:=][^\S\n]*(yes|no|unsure)\b",
+    re.I | re.M)
+
+
+def _cua_completion_report(cua_text: str) -> dict:
+    """Read a vision completion answer. Returns {verdict, stop_seen, source}.
+
+    `verdict` uses the existing vocabulary — "complete" / "generating" /
+    "ambiguous" — so callers are unchanged; the contract's "unknown" maps onto
+    "ambiguous", which is what it has always meant.
+
+    THE LAST matching line wins. A model that reasons out loud may name a
+    verdict on the way to a different conclusion, and the conclusion is the one
+    it wrote last. Combined with the line anchoring, that is what separates a
+    decision from a deliberation.
+
+    ⛔ A reported Stop button OVERRIDES a "complete" verdict, and that ordering
+    is load-bearing, not tidiness. The cost asymmetry every note in this file
+    rests on is unchanged: a false "generating" costs a poll interval, a false
+    "complete" extracts an in-flight response and reports "no brief generated".
+    An answer that says both is internally inconsistent, and the safe reading of
+    an inconsistent answer is the cheap one.
+
+    `source` is "contract" or "prose" so the log can say which channel decided.
+    A run whose confirms are all reading "prose" means the format is being
+    ignored and the fallback is carrying the feature — worth seeing before it
+    becomes an incident rather than after.
+    """
+    t = cua_text or ""
+    v_hits = _CUA_VERDICT_LINE.findall(t)
+    s_hits = _CUA_STOP_LINE.findall(t)
+    stop = s_hits[-1].lower() if s_hits else ""
+
+    if v_hits:
+        verdict = v_hits[-1].lower()
+        if verdict == "unknown":
+            verdict = "ambiguous"
+        source = "contract"
+    else:
+        # No contract line. Fall back to reading the prose exactly as before —
+        # every historical answer in the test corpus must keep resolving the way
+        # it does today, because that corpus IS the incident record.
+        verdict = _classify_completion_verdict(t)
+        source = "prose"
+
+    if stop:
+        stop_seen = (stop == "yes")
+    else:
+        # The pre-contract derivation, kept for the fallback path. Reads FORWARD
+        # within the clause — the CUA writes "Stop button: Yes". See
+        # `_cua_affirms` for the 2026-08-05 run this direction cost.
+        stop_seen = (_cua_affirms(t, "stop button")
+                     or _cua_affirms(t, "stop:")
+                     or _cua_affirms(t, "stop icon"))
+
+    if stop_seen and verdict != "generating":
+        verdict = "generating"
+    return {"verdict": verdict, "stop_seen": stop_seen, "source": source}
+
+
 # The page-side half of the badge read, as a probe rather than a predicate: it
 # returns WHAT it matched so the log can quote it. `_chatgpt_done_badge` below
 # is the only caller.
@@ -28178,7 +28291,8 @@ _CONFIRM_COMPLETION_MISSION = (
     "complete' and name what you saw.\n"
     "3) If you can see neither — the screen is blank, obscured, or you genuinely "
     "cannot tell — reply 'cannot determine' and describe what IS on screen. Never "
-    "guess: 'cannot determine' is a valid and useful answer.")
+    "guess: 'cannot determine' is a valid and useful answer."
+    + _CUA_CONTRACT_BLOCK)
 
 
 async def _page_is_dead(page):
@@ -29071,10 +29185,9 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                 # "CUA says still generating" forty times about a finished brief.
                 # #753's note here named routing through the hardened classifier
                 # as the precondition for restructuring this block. This is that.
-                _verdict = _classify_completion_verdict(diag_text)
-                _stop_seen = (_cua_affirms(diag_text, "stop button")
-                              or _cua_affirms(diag_text, "stop:")
-                              or _cua_affirms(diag_text, "stop icon"))
+                _report = _cua_completion_report(diag_text)
+                _verdict = _report["verdict"]
+                _stop_seen = _report["stop_seen"]
                 if _stop_seen:
                     cua_stop_sightings += 1
 
@@ -29129,13 +29242,15 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                 # cost 44 minutes. The DOM re-verify below still has to agree
                 # before this returns True.
                 if _verdict == "complete":
-                    log(f"[{label}] visual confirm agrees the response is complete ✓")
+                    log(f"[{label}] visual confirm agrees the response is complete ✓ "
+                        f"(via {_report['source']})")
                 else:
                     log(f"[{label}] visual confirm recognised nothing conclusive — no "
-                        f"working indicator and no completion trace in its read. The DOM "
-                        f"has said finished {consecutive_not_generating}× and nothing "
-                        f"contradicts it, so the DOM decides. This is also the shape a "
-                        f"changed page label makes: text={diag_text[:200]!r}", "WARN")
+                        f"working indicator and no completion trace in its read "
+                        f"(via {_report['source']}). The DOM has said finished "
+                        f"{consecutive_not_generating}× and nothing contradicts it, so "
+                        f"the DOM decides. This is also the shape a changed page label "
+                        f"makes: text={diag_text[:200]!r}", "WARN")
 
             # Double-check DOM
             await asyncio.sleep(3)
@@ -29217,7 +29332,8 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     "Say exactly 'response complete' only if there is NO stop button, NO finalizing/loading indicator, "
                     "AND a finished response is visible (ideally with the 'Thought for …' header). "
                     "If you are unsure, say 'still generating'. "
-                    "Remember: observe only — never click the Stop button or any control.")
+                    "Remember: observe only — never click the Stop button or any control."
+                    + _CUA_CONTRACT_BLOCK)
 
                 async def _sn_diag_cua():
                     return await agent_loop(cua_client, browser, PROMPT_DIAGNOSE,
@@ -29262,7 +29378,12 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     # for the full root-cause writeup — this replaced an inline
                     # parse that flipped a "Stop button: Yes" verdict to
                     # "complete" and made the pipeline extract an in-flight brief.
-                    _sn_verdict = _classify_completion_verdict(_sn_text)
+                    # ⭐ 2026-08-12: read the verdict CONTRACT first and fall
+                    # back to the prose parser. Both twins go through the same
+                    # reader for the same reason they go through the same
+                    # parser — two ways of understanding one answer is the
+                    # defect this whole area keeps producing.
+                    _sn_verdict = _cua_completion_report(_sn_text)["verdict"]
                     _sn_is_complete = (_sn_verdict == "complete")
                     # "ambiguous" keeps polling exactly like "generating" — the
                     # cost asymmetry is unchanged — but it is NOT the same

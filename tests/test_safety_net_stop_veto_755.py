@@ -119,7 +119,10 @@ def test_veto_preserves_the_753_classifier_and_stall_decouple():
     # The veto is ADDITIVE — it must sit on top of #753 (classifier + the
     # generating branch that does NOT reset stall_window_start), not replace it.
     src = _poll_src()
-    assert "_classify_completion_verdict(_sn_text)" in src, (
+    # 2026-08-12: the call site reads `_cua_completion_report`, which tries the
+    # verdict CONTRACT and falls back to the #753 classifier. Same layering
+    # claim, one level deeper.
+    assert "_cua_completion_report(_sn_text)" in src, (
         "#753 classifier was dropped — the veto must layer on top of it"
     )
     gen_branch = src.split("Safety-net CUA confirms still generating", 1)[1].split(

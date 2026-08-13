@@ -291,16 +291,29 @@ def test_the_twin_has_no_parser_of_its_own_any_more():
     )
 
 
-def test_both_twins_call_the_same_hardened_parser():
-    """Positive half: absence is not enough, the shared parser must be wired in.
+def test_both_twins_call_the_same_shared_reader():
+    """Positive half: absence is not enough, the shared reader must be wired in.
 
     Counted, because the two arms of this function ask the same question about
     the same screen and a single call would mean one of them regressed to
-    deciding on its own."""
+    deciding on its own.
+
+    2026-08-12: that reader is now `_cua_completion_report`, which takes the
+    model's VERDICT line when it emitted one and falls back to the hardened
+    prose classifier when it did not. `poll_until_done` itself must contain no
+    parsing at all."""
     src = code_only(research.poll_until_done)
-    assert src.count("_classify_completion_verdict(") == 2, (
+    assert src.count("_cua_completion_report(") == 2, (
         "expected both the verify-False confirm and the safety net to route "
-        "through the hardened parser"
+        "through the shared verdict reader"
+    )
+    assert "_classify_completion_verdict(" not in src, (
+        "a twin is calling the prose parser directly again, bypassing the "
+        "verdict contract"
+    )
+    assert "_classify_completion_verdict(" in code_only(
+        research._cua_completion_report), (
+        "the prose parser is no longer the contract reader's fallback"
     )
 
 
@@ -329,7 +342,7 @@ def test_the_twin_still_never_early_returns_on_a_vision_complete():
     # Anchored on CODE, not on the comment that labels it: `code_only` blanks
     # comments precisely so an assertion cannot come to rest on prose.
     src = code_only(research.poll_until_done)
-    i = src.index("_verdict = _classify_completion_verdict(")
+    i = src.index('_verdict = _report["verdict"]')
     window = src[i:src.index("still = await verify_fn(page)", i)]
     assert "return True" not in window, (
         "the confirm branch gained an early return — the DOM re-verify is the "
