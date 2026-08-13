@@ -205,11 +205,12 @@ class Harness:
     rules, the verdict parser, the backoff arithmetic, the exception.
     What is scripted: the DOM verdicts, the vision answers, and the clock."""
 
-    def __init__(self, monkeypatch, *, dom, vision, badge="",
+    def __init__(self, monkeypatch, *, dom, vision, badge="", text_len=None,
                  label="Phase1-followup", phase=1):
         self.dom = list(dom)               # verify_fn answers, in order
         self.vision = list(vision)         # what agent_loop returns, in order
         self.badge = badge
+        self.text_len = text_len           # None → no scrape at all
         self.label = label
         self.phase = phase
         self.dom_reads = 0
@@ -277,9 +278,32 @@ class Harness:
 
         mp.setattr(research, "log", lambda msg, level="INFO": self.logs.append(str(msg)))
         mp.setattr(research, "emit_event", lambda *a, **k: None)
-        # No scrape for this label, and none wanted: `last_seen_len` and the
-        # stall window belong to the OTHER arm of the loop.
-        mp.setattr(research, "SCRAPE_FNS", {})
+
+        if self.text_len is None:
+            # No scrape: `last_seen_len` and the stall window belong to the
+            # OTHER arm of the loop and are not what these tests are about.
+            mp.setattr(research, "SCRAPE_FNS", {})
+        else:
+            # Drive the real stall-tracking path so `last_seen_len` reaches the
+            # value the loop would actually hold. Needed to prove a NEGATIVE:
+            # that a large amount of text on screen does not, on its own, skip
+            # the visual confirm.
+            async def _scrape(page):
+                return {"partial_text_len": self.text_len, "sources": 0, "steps": []}
+            mp.setattr(research, "SCRAPE_FNS", {self.label: _scrape})
+            mp.setattr(research, "get_observer_state",
+                       lambda page: {"observer_text_len": self.text_len,
+                                     "observer_preview": "x" * 40})
+            # The activity-panel machinery is not under test here; its failures
+            # are caught locally in production too, but silencing it keeps the
+            # assertion about the corroborator rather than about a panel.
+            async def _state(page):
+                return {"side_panel": True, "inline_expanded": False}
+            mp.setattr(research, "_chatgpt_activity_state", _state)
+
+            async def _panel_track(page):
+                return None
+            mp.setattr(research, "scrape_chatgpt_activity_panel_tracking", _panel_track)
 
     def run(self, *, poll_interval=30):
         page = _LoopPage()
@@ -329,6 +353,54 @@ def test_without_a_corroborator_the_confirm_still_happens(monkeypatch):
     h = Harness(monkeypatch, dom=[False], vision=[COMPLETE], badge="")
     assert h.run() is True
     assert h.confirms == 1
+
+
+def test_a_long_response_does_not_skip_the_confirm(monkeypatch):
+    """⭐⭐ THE MUTANT THAT MUST DIE, AT THE CALL SITE.
+
+    `test_length_alone_is_never_a_corroborator` proves the probe ignores length.
+    This proves the LOOP does too — that nobody re-added a length signal beside
+    it, which is what the build plan originally proposed.
+
+    Why it matters: if ChatGPT renames its stop-button markup, the DOM detector
+    goes blind and reports "not generating" MID-STREAM. At that moment there is
+    a great deal of text on screen and no completion trace, and a length
+    corroborator would skip the confirm and extract an in-flight brief — the
+    #753 false-complete, arriving through the front door of its own fix.
+
+    Sixty thousand characters, no badge: the confirm must still be spent."""
+    h = Harness(monkeypatch, dom=[False], vision=[COMPLETE],
+                badge="", text_len=60000)
+    assert h.run() is True
+    assert h.confirms == 1, "a long response bought its way past the visual confirm"
+
+
+def test_a_long_response_with_a_badge_still_skips(monkeypatch):
+    """The control for the test above: with the same amount of text AND a
+    header, the confirm is skipped. So the test above is measuring the
+    corroborator and not merely the presence of a scrape."""
+    h = Harness(monkeypatch, dom=[False], vision=[COMPLETE],
+                badge=LIVE_BADGE, text_len=60000)
+    assert h.run() is True
+    assert h.confirms == 0
+
+
+def test_a_veto_does_not_erase_what_the_dom_already_said(monkeypatch):
+    """⛔ `consecutive_not_generating` counts how many times in a row the DOM
+    said finished. A vision disagreement does not change what the DOM said, so
+    zeroing that counter is a lie about the evidence — and it is the specific
+    line that made the 2026-08-12 loop unbounded: it sent the poll back to
+    "wait for two more DOM reads, then confirm again", forever, leaving the
+    disagreement itself with no trace anywhere.
+
+    Measured as the number of times the loop drops back into its 5-second
+    "wait for a second consecutive read" tick. That happens once, at the start.
+    A reset makes it happen again after every veto."""
+    h = Harness(monkeypatch, dom=[False], vision=[GENERATING_NO_STOP] * 9)
+    assert h.run() is True
+    assert h.sleeps.count(5) == 1, (
+        f"the DOM streak was restarted {h.sleeps.count(5) - 1}× — a veto is "
+        f"re-accumulating evidence the DOM had already given")
 
 
 def test_the_dom_must_still_agree_after_a_corroborated_skip(monkeypatch):
