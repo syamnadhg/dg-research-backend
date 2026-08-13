@@ -23172,6 +23172,41 @@ def _chatgpt_surface_frame_targets(page, *, include_blank=True):
 # Module-level rather than inlined so a test can execute it against a captured
 # DOM. While it lived inside the function body it had never once been run by a
 # test, which is how a probe that reads an empty document survived two E2E runs.
+
+
+# ⭐ 2026-08-12 — ONE SOURCE FOR THE THINKING-TIME BADGE, TWO ENGINES.
+#
+# ChatGPT's finished-response header ("Thought for 1m 14s", and since 2026-08 also
+# "Worked for 9m") is read in FIVE places: `_classify_completion_verdict` in
+# Python, and four page-side checks in JS. On 2026-08-11 the Python side was
+# widened from the single literal "thought for" to the verb family — and the four
+# JS copies were not. So the vision classifier could recognise "Worked for 16m 26s"
+# while `verify_chatgpt_generating`, looking at the SAME page, could not; that
+# split is what made the 2026-08-12 P1 run poll for 44 minutes past a finished
+# brief. Two spellings of one page label is the bug, so there is now one spelling.
+#
+# The source below is shared verbatim: `re.compile()` reads it as a Python pattern
+# and `new RegExp()`-equivalent literals read it as JS. Every construct in it
+# (`\b`, `(?:…)`, `\s`, `\d`, `+`, `*`) means the same thing in both engines, and
+# it contains no `/`, so it needs no re-escaping to sit inside a JS literal.
+#
+# ⛔ THE TIME UNIT IS LOAD-BEARING, and it is what makes widening the verb family
+# safe. "thought for 3" is vanishingly rare in prose, but a research brief writes
+# "worked for 3 years" and "researched for 5 months" as ordinary sentences — so
+# the moment the verb family widened, a unitless match would have turned the
+# report's own text into a completion marker. That is a false-COMPLETE, which
+# every note in this file records as the strictly worse failure.
+#
+# Full history and the cost-asymmetry argument: `_THINKING_TIME_HEADER`.
+_THINKING_TIME_HEADER_SRC = (
+    r"\b(?:thought|worked|reasoned|researched)\s+for\s+\d+\s*"
+    r"(?:hours|hour|hrs|hr|h|minutes|minute|mins|min|m|seconds|second|secs|sec|s)\b")
+
+# The same pattern as a JS regex literal, for the page-side checks that run inside
+# `page.evaluate`. Derived rather than retyped: a second hand-written copy is the
+# defect this constant exists to end.
+_THINKING_TIME_HEADER_JS = f"/{_THINKING_TIME_HEADER_SRC}/i"
+
 _CHATGPT_DONE_PROBE_JS = """() => {
     let hasStop = !!document.querySelector(
         'button[aria-label="Stop generating"], button[aria-label*="Stop"], ' +
@@ -23186,10 +23221,13 @@ _CHATGPT_DONE_PROBE_JS = """() => {
         }
     }
     const bl = (document.body?.innerText || '');
-    // "Thought for X seconds" badge — renders only AFTER thinking
-    // phase completes. With Stop button gone + this badge present,
-    // we're as confident as we can be that DR is fully settled.
-    const thoughtFor = /thought for\\s+\\d/i.test(bl);
+    // The thinking-time badge — renders only AFTER the thinking phase
+    // completes. With Stop button gone + this badge present, we're as
+    // confident as we can be that DR is fully settled.
+    // 2026-08-12: was the single literal /thought for\\s+\\d/i, which stopped
+    // matching when ChatGPT relabelled it "Worked for 9m". Now the shared
+    // pattern — see _THINKING_TIME_HEADER_SRC for why there is only one.
+    const thoughtFor = __DONE_BADGE_RE__.test(bl);
     // 2026-04-26 backup: same modern marker Claude uses. Covers the case
     // where ChatGPT renames the badge or runs a non-thinking-mode DR
     // variant where "Thought for X" never appears. Either signal counts.
@@ -23263,7 +23301,7 @@ _CHATGPT_DONE_PROBE_JS = """() => {
     ).length;
     return { hasStop, thoughtFor, researchDone, completedChip, docPanelAffordances,
              assistantLen, panelLen, bodyLen: bl.length, sources, steps, vw, vh };
-}"""
+}""".replace("__DONE_BADGE_RE__", _THINKING_TIME_HEADER_JS)
 
 # A non-main context must be a real surface before its download-button scan may
 # call the run finished. The geometry inside a frame is FRAME-relative, so
@@ -26677,19 +26715,22 @@ async def verify_chatgpt_generating(page) -> bool:
             // (P1 Pro) and DR (P2). With stop button + cards + CSS-animation
             // all negative above, this confirms the page is settled. Kept
             // outside the DR gate — it's a NEGATIVE (done) signal.
-            // 2026-05-24: tightened from `includes('thought for ')` to the
-            // canonical "thought for + whitespace + digit" regex used by
-            // detect_completion_chatgpt (research.py:12505/12546). The
-            // substring match could false-fire on assistant narrative like
-            // "I thought for a moment about Salaar..." and declare done
-            // prematurely if the earlier stop/animation checks happened to
-            // be momentarily negative between token batches. Requiring a
-            // digit immediately after "thought for " locks the match to
-            // the actual badge format ("Thought for 23 seconds", "Thought
-            // for 2 minutes"), not prose.
-            if (/thought for\\s+\\d/i.test(bl)) return false;
+            // 2026-05-24: tightened from `includes('thought for ')` to require
+            // a digit, so assistant narrative like "I thought for a moment
+            // about Salaar..." could not declare done prematurely when the
+            // earlier stop/animation checks happened to be momentarily
+            // negative between token batches.
+            // ⭐ 2026-08-12: and widened from that one verb to the shared
+            // pattern. This line is the reason the 2026-08-12 P1 run polled
+            // 44 minutes past a finished brief: the page read "Worked for 16m
+            // 26s", the vision classifier recognised it, and THIS check — the
+            // one the poll loop actually asks — did not. The unit is now
+            // required as well as the digit, which is what keeps "worked for
+            // 3 years" in the brief's own prose from reading as done.
+            // See _THINKING_TIME_HEADER_SRC.
+            if (__DONE_BADGE_RE__.test(bl)) return false;
             return !!document.querySelector('.result-streaming, [data-is-streaming="true"]');
-        }""")
+        }""".replace("__DONE_BADGE_RE__", _THINKING_TIME_HEADER_JS))
         if host_hit:
             return True
 
@@ -26755,11 +26796,13 @@ async def verify_chatgpt_generating(page) -> bool:
                         // and any keyword match would re-introduce the same
                         // false-positive class as the deleted length>200 fallback.
                         // 2026-05-24: same regex tightening as host path —
-                        // require a digit after "thought for " to lock to badge
-                        // format and not match narrative prose.
-                        if (/thought for\\s+\\d/i.test(bl)) return false;
+                        // require a digit to lock to badge format and not
+                        // match narrative prose. 2026-08-12: and the same
+                        // widening — see the host copy above and
+                        // _THINKING_TIME_HEADER_SRC.
+                        if (__DONE_BADGE_RE__.test(bl)) return false;
                         return false;
-                    }""")
+                    }""".replace("__DONE_BADGE_RE__", _THINKING_TIME_HEADER_JS))
                     if active:
                         return True
                 except Exception:
@@ -26849,9 +26892,9 @@ async def _verify_chatgpt_generating_diag(page) -> str:
                 if (bl.includes('researching...')) return "researching_ellipsis";
             }
 
-            if (/thought for\\s+\\d/i.test(bl)) return "";
+            if (__DONE_BADGE_RE__.test(bl)) return "";
             return document.querySelector('.result-streaming, [data-is-streaming="true"]') ? "data_streaming_attr" : "";
-        }""") or "no_hit"
+        }""".replace("__DONE_BADGE_RE__", _THINKING_TIME_HEADER_JS)) or "no_hit"
     except Exception as e:
         return f"diag_error:{type(e).__name__}"
 
@@ -27717,9 +27760,13 @@ def _cua_denies(cua_text: str, key: str) -> bool:
 # matches. The verb family is small and closed on purpose — this is a page label,
 # not free text, and a wider pattern would trade this bug for a false-complete,
 # which is the strictly worse failure (see the cost asymmetry below).
-_THINKING_TIME_HEADER = re.compile(
-    r"\b(?:thought|worked|reasoned|researched)\s+for\s+\d+\s*"
-    r"(?:hours|hour|hrs|hr|h|minutes|minute|mins|min|m|seconds|second|secs|sec|s)\b")
+#
+# ⭐ 2026-08-12 — the pattern itself now lives at `_THINKING_TIME_HEADER_SRC`,
+# shared with the four page-side JS checks. It was widened HERE on 2026-08-11 and
+# nowhere else, so for a day the vision classifier and the DOM detector read the
+# same page label with different vocabularies — which is what let a finished brief
+# poll for 44 more minutes on 2026-08-12. One label, one pattern.
+_THINKING_TIME_HEADER = re.compile(_THINKING_TIME_HEADER_SRC)
 
 
 def _classify_completion_verdict(cua_text: str) -> str:
