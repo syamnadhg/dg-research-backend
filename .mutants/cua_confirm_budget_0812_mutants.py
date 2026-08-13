@@ -163,9 +163,9 @@ MUTANTS = [
      [('    "as \'Thought for 1m 14s\' or \'Worked for 16m 26s\'; a completed document or "',
        '    "as \'Thought for 1m 14s\'; a completed document or "')]),
     ("O11", "over", "the no-click instruction is dropped — the inspector may press Stop",
-     [('"'"'Activity'"'"' side panel — all of those are normal. Observe only; do not click "\n'
-       '    "anything.\\n"',
-       '"'"'Activity'"'"' side panel — all of those are normal.\\n"')]),
+     [("side panel — all of those are normal. Observe only; do not click \"\n"
+       "    \"anything.\\n\"",
+       "side panel — all of those are normal.\\n\"")]),
 
     # ═══════════════════════ the contested card copy ═══════════════════════
     ("O12", "over", "⛔ the contested card claims the page stopped, which may be false",
