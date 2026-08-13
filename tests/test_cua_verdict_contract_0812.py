@@ -143,10 +143,20 @@ def test_an_echoed_instruction_does_not_beat_a_real_conclusion():
 
 def test_the_last_verdict_line_wins():
     """A model that reasons out loud may name a verdict on the way to a
-    different conclusion. The conclusion is the one it wrote last."""
-    reasoned = ("First read: VERDICT: generating\n"
+    different conclusion. The conclusion is the one it wrote last.
+
+    ⚠ BOTH lines have to be properly anchored for this to test anything. The
+    first draft wrote the earlier one as "First read: VERDICT: generating",
+    which does not begin a line — so there was only ever one match, first and
+    last were the same, and a mutation making FIRST win survived."""
+    reasoned = ("Initial impression, before scrolling:\n"
+                "VERDICT: generating\n"
                 "Then I scrolled up and found the time badge.\n"
                 "VERDICT: complete\nSTOP_BUTTON: no\nEVIDENCE: Worked for 9m")
+    assert len(research._CUA_VERDICT_LINE.findall(reasoned)) == 2, (
+        "the fixture only produces one anchored verdict — it cannot tell first "
+        "from last"
+    )
     assert _report(reasoned)["verdict"] == "complete"
 
 
@@ -200,8 +210,17 @@ def test_the_stop_field_is_read_even_when_the_verdict_line_is_missing():
 
 def test_the_pre_contract_stop_derivation_still_works():
     """The fallback path's own polarity, unchanged: the CUA writes "Stop button:
-    Yes" and it is read FORWARD within the clause."""
-    out = _report("Stop button: Yes. The composer shows a filled square.")
+    Yes" and it is read FORWARD within the clause.
+
+    ⚠ The affirmation must sit MID-LINE, or `_CUA_STOP_LINE` matches it and the
+    contract answers instead. The first draft put it at the start of the line,
+    so a mutation deleting the fallback derivation entirely survived — the test
+    named `_cua_affirms` and never reached it."""
+    answer = "Looking at the composer — Stop button: Yes, a filled square."
+    assert not research._CUA_STOP_LINE.findall(answer), (
+        "the fixture is being answered by the contract, not the fallback"
+    )
+    out = _report(answer)
     assert out["stop_seen"] is True
     assert out["verdict"] == "generating"
 
