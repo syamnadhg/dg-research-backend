@@ -139,8 +139,13 @@ MUTANTS = [
        '                if _verdict in ("generating", "ambiguous"):')]),
     ("O9", "over", "⛔ a positively observed Stop button no longer vetoes at all",
      [('                if _verdict == "generating":', "                if False:")]),
-    ("O10", "over", "⛔ the hardened parser is replaced by the greedy substring it replaced",
-     [("                _verdict = _classify_completion_verdict(diag_text)",
+    # 2026-08-12: re-anchored onto the verdict CONTRACT reader. The parse call
+    # moved from `_classify_completion_verdict(diag_text)` to
+    # `_cua_completion_report(diag_text)`, and the harness refused the stale
+    # anchor rather than mutating something else — which is the behaviour that
+    # made this rewire visible at all.
+    ("O10", "over", "⛔ the shared reader is replaced by the greedy substring it replaced",
+     [('                _verdict = _report["verdict"]',
        '                _verdict = ("complete" if "response complete" in diag_text.lower()\n'
        '                            else "generating")')]),
     ("U13", "under", "an error verdict is parsed as if it were a reading",
@@ -151,14 +156,18 @@ MUTANTS = [
     ("U14", "under", "⭐ the unanswerable AND is restored — completion needs the final paragraph",
      [('    "3) If you can see neither — the screen is blank, obscured, or you genuinely "\n'
        '    "cannot tell — reply \'cannot determine\' and describe what IS on screen. Never "\n'
-       '    "guess: \'cannot determine\' is a valid and useful answer.")',
+       '    "guess: \'cannot determine\' is a valid and useful answer."\n'
+       "    + _CUA_CONTRACT_BLOCK)",
        '    "Only say \'response complete\' if there is NO stop button AND the final "\n'
-       '    "paragraph of the response is visible.")')]),
+       '    "paragraph of the response is visible."\n'
+       "    + _CUA_CONTRACT_BLOCK)")]),
     ("U15", "under", "the third verdict is dropped — 'I cannot tell' has to be spelled as a verdict",
      [('    "3) If you can see neither — the screen is blank, obscured, or you genuinely "\n'
        '    "cannot tell — reply \'cannot determine\' and describe what IS on screen. Never "\n'
-       '    "guess: \'cannot determine\' is a valid and useful answer.")',
-       '    "")')]),
+       '    "guess: \'cannot determine\' is a valid and useful answer."\n'
+       "    + _CUA_CONTRACT_BLOCK)",
+       '    ""\n'
+       "    + _CUA_CONTRACT_BLOCK)")]),
     ("U16", "under", "the mission names only the old time badge",
      [('    "as \'Thought for 1m 14s\' or \'Worked for 16m 26s\'; a completed document or "',
        '    "as \'Thought for 1m 14s\'; a completed document or "')]),
