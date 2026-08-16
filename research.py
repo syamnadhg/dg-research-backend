@@ -5510,6 +5510,9 @@ async def _firebase_reconnect_loop():
     # run is active so we never os._exit a live browser (a local /api/runs submit
     # can start one even with Firestore down). (#718)
     pending_respawn = False
+    # When the deferral for in-flight web-app handoffs runs out. None while
+    # nothing is being waited on — see the idle branch below.
+    respawn_wait_until = None
     log("[reconnect] watcher armed (idle while Firestore healthy)", "DEBUG")
     while True:
         try:
@@ -5517,12 +5520,39 @@ async def _firebase_reconnect_loop():
             if _firebase_db is not None:
                 idx = 0
                 if pending_respawn and not _QUEUE_STATE.get("running"):
-                    log("[reconnect] run finished — clean respawn to re-bind Firestore listeners", "INFO")
-                    # Stagger the respawn by worker id so a shared blip doesn't
-                    # exit the whole fleet in lockstep (which would briefly drop
-                    # every worker → stale heartbeat → device flickers offline).
-                    # Worker 1 goes first, siblings follow 8s apart. (RC-29)
-                    _schedule_server_exit("firestore-reconnect", delay_sec=3.0 + (max(1, WORKER_ID) - 1) * 8.0)
+                    # ⛔ IDLE IS NOT THE SAME AS FINISHED. `running` flips false
+                    # in the worker's `finally`, which is BEFORE the two POSTs
+                    # that hand this run to the web app have returned — the phase
+                    # notice, and the P4/P5 trigger that carries the rest of the
+                    # run. Neither has a replay path behind it, and killing the
+                    # second one aborts the request, SIGTERMs ffmpeg and
+                    # terminalises the research as stopped.
+                    #
+                    # ⭐ Only the RESPAWN can do that. The in-place rebind that a
+                    # foreground serve takes is non-destructive — it swaps two
+                    # Firestore watches and never touches an outbound request —
+                    # so it is not deferred at all. The supervisor probe is
+                    # evaluated ONCE, on entry, rather than on every poll.
+                    _pending = _fe_handoff_pending()
+                    _was_waiting = respawn_wait_until is not None
+                    _action, respawn_wait_until = _decide_respawn_hold(
+                        _pending, respawn_wait_until, time.time(),
+                        _fe_respawn_wait_budget(),
+                        # Evaluated only on ENTRY, not on every poll — the probe
+                        # shells out to `ps`, and this branch is re-entered every
+                        # two seconds while holding.
+                        False if _was_waiting else _supervisor_is_my_parent(),
+                    )
+                    if _action == "hold":
+                        if not _was_waiting:
+                            log(f"[reconnect] run finished but {_pending} handoff(s) to the web app "
+                                "are still in flight — deferring the respawn", "INFO")
+                        await asyncio.sleep(2)
+                        continue
+                    if _action == "go_late":
+                        log(f"[reconnect] {_pending} handoff(s) still in flight at the deadline "
+                            "— respawning anyway", "WARN")
+                    await _recover_after_reconnect("run finished")
                     pending_respawn = False
                 await asyncio.sleep(5)
                 continue
@@ -5545,11 +5575,9 @@ async def _firebase_reconnect_loop():
                 # gave up and won't re-subscribe to the new client). (#718)
                 if _QUEUE_STATE.get("running"):
                     pending_respawn = True
-                    log("[reconnect] Firestore back, run active — rebuilt in-process; clean respawn deferred to idle to re-bind listeners", "INFO")
+                    log("[reconnect] Firestore back, run active — rebuilt in-process; listener recovery deferred to idle", "INFO")
                 else:
-                    log("[reconnect] Firestore reachable again — clean respawn to re-bind listeners", "INFO")
-                    # Stagger by worker id so the fleet doesn't exit in lockstep. (RC-29)
-                    _schedule_server_exit("firestore-reconnect", delay_sec=3.0 + (max(1, WORKER_ID) - 1) * 8.0)
+                    await _recover_after_reconnect("Firestore reachable again")
                 await asyncio.sleep(5)
             else:
                 if _firebase_down_reason == "revoked":
@@ -9351,6 +9379,249 @@ def _schedule_server_exit(source: str, delay_sec: float = 3.0, protect_pids=None
     _threading.Thread(target=_runner, daemon=True).start()
 
 
+# ── Outbound handoffs to the web app, and not exiting on top of them ────────
+#
+# ⛔ THE RISK. Two things this process hands to the web app have NO replay path
+# behind them: the phase-notice ask, and the P4/P5 trigger that drives a run to
+# completion when nobody has the app open. Both are fire-and-forget POSTs from
+# daemon threads. The respawn that follows a reconnect is scheduled the moment
+# the worker goes idle — which is a couple of seconds after those threads are
+# spawned — and `os._exit(0)` takes the whole process down with them mid-flight.
+#
+# In the owner's second end-to-end run the serve exited thirteen seconds after
+# handing off P4/P5. It survived only because the POST had already landed and
+# Cloud Run finished the work on its own. That is luck, not design.
+_fe_handoff_inflight = 0   # brief: the phase-notice asks
+_fe_drive_inflight = 0     # ⭐ the P4/P5 chain — an ENTIRE RUN lives inside it
+_fe_handoff_lock = None
+
+
+def _fe_handoff_begin(drive: bool = False) -> None:
+    """Mark an outbound POST to the web app as in flight. Never raises."""
+    global _fe_handoff_inflight, _fe_drive_inflight, _fe_handoff_lock
+    try:
+        import threading as _th
+        if _fe_handoff_lock is None:
+            _fe_handoff_lock = _th.Lock()
+        with _fe_handoff_lock:
+            if drive:
+                _fe_drive_inflight += 1
+            else:
+                _fe_handoff_inflight += 1
+    except Exception:
+        pass
+
+
+def _fe_handoff_end(drive: bool = False) -> None:
+    """Mark it finished. ⛔ Must be in a `finally` — a leaked count would defer
+    the respawn until the deadline on every single reconnect."""
+    global _fe_handoff_inflight, _fe_drive_inflight
+    try:
+        if _fe_handoff_lock is None:
+            return
+        with _fe_handoff_lock:
+            if drive:
+                _fe_drive_inflight = max(0, _fe_drive_inflight - 1)
+            else:
+                _fe_handoff_inflight = max(0, _fe_handoff_inflight - 1)
+    except Exception:
+        pass
+
+
+def _fe_handoff_pending() -> int:
+    """How many outbound handoffs, of either kind, have not finished."""
+    try:
+        if _fe_handoff_lock is None:
+            return _fe_handoff_inflight + _fe_drive_inflight
+        with _fe_handoff_lock:
+            return _fe_handoff_inflight + _fe_drive_inflight
+    except Exception:
+        return 0
+
+
+# How long a respawn will wait for a brief handoff before going anyway.
+#
+# ⛔ BOUNDED, and the bound is the load-bearing half. An unbounded wait turns one
+# wedged thread into a worker that never respawns and therefore never re-binds
+# its listeners — "online but deaf", which is the condition the respawn exists to
+# clear. Set above the worst honest case: three attempts at a 20-second timeout
+# with 2s and 4s of backoff between them.
+_FE_HANDOFF_WAIT_SEC = 90
+
+# ⭐⭐ And a far longer one for the P4/P5 drive, because that request is not a
+# notification — it IS the rest of the run.
+#
+# ⛔ The route wires `req.signal` to an abort handler that SIGTERMs the in-flight
+# ffmpeg child and writes `status: "stopped"`. So exiting this process while the
+# drive is connected does not merely lose a message: it kills the video encode
+# and terminalises the user's research as stopped. Ninety seconds would land
+# squarely in the middle of a long encode.
+#
+# Matched to the route's own Cloud Run ceiling, which is the point past which the
+# request cannot still be alive. Waiting that long costs a worker that does not
+# pick up new jobs meanwhile; not waiting costs the run in progress.
+_FE_DRIVE_WAIT_SEC = 3600
+
+
+def _fe_respawn_wait_budget() -> int:
+    """How long to hold a respawn for whatever is currently in flight."""
+    try:
+        return _FE_DRIVE_WAIT_SEC if _fe_drive_inflight else _FE_HANDOFF_WAIT_SEC
+    except Exception:
+        return _FE_HANDOFF_WAIT_SEC
+
+
+def _decide_respawn_hold(pending, wait_until, now, budget, supervised):
+    """⭐ Whether the reconnect respawn may go ahead, or must wait.
+
+    Pure, and separated out because the loop that consults it never returns —
+    nothing can execute it — and because every one of the three answers is a
+    different bug if it comes out wrong:
+
+      "go"      the ordinary case, and the ONLY one a foreground serve ever
+                takes: the in-place rebind swaps two Firestore watches and
+                touches no outbound request, so there is nothing to wait for.
+      "hold"    a respawn would land on top of a POST that hands this run to the
+                web app. The P4/P5 one is the dangerous one — the route aborts
+                when its client goes away, SIGTERMs ffmpeg and terminalises the
+                research as stopped.
+      "go_late" the deadline passed with something still in flight. ⛔ BOUNDED ON
+                PURPOSE: one wedged thread must not leave this worker
+                permanently deaf, which is the condition the respawn exists to
+                clear. The caller says so out loud before proceeding.
+
+    Returns `(action, wait_until)`.
+    """
+    if wait_until is None:
+        if pending and supervised:
+            return "hold", now + budget
+        return "go", None
+    if pending and now < wait_until:
+        return "hold", wait_until
+    if pending:
+        return "go_late", None
+    return "go", None
+
+
+def _supervisor_is_my_parent() -> bool:
+    """Whether the process that started THIS one is a daemon-loop supervisor.
+
+    ⭐ WHY THE EXISTING PROBE IS NOT THIS. `_enumerate_research_py_procs` is
+    filtered only by `pid != self_pid`, so every existing check answers "a
+    daemon-loop exists somewhere on this machine" — a machine-wide question. On
+    a laptop that runs the supervised fleet AND a foreground `--serve` at the
+    same time (which is exactly the owner's setup) that answer is TRUE for the
+    foreground session too, and acting on it `os._exit`s the very session it was
+    meant to protect. Nothing then restarts it: the supervisor it detected is not
+    its supervisor and has no idea it existed.
+
+    Parent ancestry is the question that was actually meant. `os.getppid()` is
+    cheap, needs no new dependency, and cannot be confused by a sibling.
+
+    ⛔ `--worker-id` cannot stand in for this: the supervised single worker is
+    spawned without the flag, so its absence proves nothing.
+
+    ⚠ On Windows a pid can be recycled, so this could in principle name an
+    unrelated process. The error would have to land on a recycled pid that is
+    ALSO running research.py with --daemon-loop, and it errs toward "supervised"
+    — the behaviour that has always shipped. Accepted rather than guarded.
+    """
+    try:
+        ppid = os.getppid()
+    except Exception:
+        return False
+    # 1 is init/launchd re-parenting after the real parent died; 0 is not a pid.
+    if ppid <= 1:
+        return False
+    try:
+        for pid, _cmd, role in _enumerate_research_py_procs():
+            if pid == ppid and role == "daemon-loop":
+                return True
+    except Exception as _e:
+        # Assume foreground. The failure mode of guessing "supervised" is an
+        # unrecoverable exit; of guessing "foreground" it is a stale listener
+        # that logs loudly. Only one of those is survivable.
+        log(f"[reconnect] supervisor probe failed ({_e}) — assuming foreground", "DEBUG")
+    return False
+
+
+# Set at boot by run_server. The reconnect loop cannot build this itself: it has
+# no access to the job queue, the event loop, or the paired identity, all of
+# which are locals of the boot path.
+_watch_rebinder = None
+
+
+def _rebind_firestore_watches(job_queue, loop, uid, device_id):
+    """Drop and re-attach the two long-lived Firestore watches. BLOCKING.
+
+    ⛔ MUST be called off the event loop — `unsubscribe()` is not async and does
+    not return promptly: it stops a background consumer thread and joins it for
+    up to a second per watch. Called inline it would stall every other coroutine,
+    including the heartbeat, which is how a reconnect turns into a device the
+    frontend reports as offline.
+
+    ⭐ The globals are nulled BETWEEN the unsubscribe and the re-attach, so a
+    failure part way through leaves no handle to a stream that is already dead —
+    a later shutdown would otherwise unsubscribe it a second time.
+    """
+    global _start_listener, _device_cmd_watch
+    old_start, old_dev = _start_listener, _device_cmd_watch
+    _start_listener = None
+    _device_cmd_watch = None
+    for label, handle in (("start", old_start), ("device-cmds", old_dev)):
+        if handle is None:
+            continue
+        try:
+            handle.unsubscribe()
+        except Exception as _e:
+            # A stream that was already torn down by the outage raises here, and
+            # that is the ordinary case rather than an error — the point of the
+            # unsubscribe is to be sure, not to be the first to notice.
+            log(f"[reconnect] {label} watch unsubscribe raised (continuing): {_e}", "DEBUG")
+    start_firestore_start_listener(job_queue, loop)
+    if uid and device_id:
+        _start_device_command_listener(uid, device_id, loop=loop)
+
+
+async def _recover_after_reconnect(reason: str) -> None:
+    """What to do once Firestore is reachable again and the worker is idle.
+
+    ⛔ THE BUG. This used to be `_schedule_server_exit` unconditionally, on the
+    reasoning that a clean respawn re-runs boot and re-wires every listener
+    deterministically. That reasoning holds only when something is going to start
+    us again. On a FOREGROUND `--serve` nothing is: `os._exit(0)` ends the
+    session the user is watching, their terminal returns to a prompt, and the
+    frontend's device tile simply ages into offline with no auto-recovery. The
+    owner's second end-to-end run ended exactly this way — three heartbeat write
+    timeouts, a rebuilt client, a deferred respawn, and then a serve that quit on
+    its own thirteen seconds after the run finished.
+
+    Supervised, the exit is still right: it is cheap, it is deterministic, and
+    the daemon-loop brings us straight back. Foreground, the listeners are
+    re-bound in place instead.
+    """
+    if _supervisor_is_my_parent():
+        log(f"[reconnect] {reason} — supervised, clean respawn to re-bind listeners", "INFO")
+        # Stagger by worker id so a shared blip doesn't exit the whole fleet in
+        # lockstep (which would briefly drop every worker → stale heartbeat →
+        # device flickers offline). Worker 1 goes first, siblings 8s apart. (RC-29)
+        _schedule_server_exit("firestore-reconnect", delay_sec=3.0 + (max(1, WORKER_ID) - 1) * 8.0)
+        return
+    if _watch_rebinder is None:
+        log("[reconnect] foreground serve and no rebinder registered — staying up; "
+            "new runs may not be picked up until this serve is restarted", "WARN")
+        return
+    try:
+        await asyncio.to_thread(_watch_rebinder)
+        log(f"[reconnect] {reason} — foreground serve, Firestore listeners re-bound in place", "INFO")
+    except Exception as _e:
+        # ⛔ LOG AND STAY UP. Exiting here would reintroduce the exact defect this
+        # function exists to remove, and would do it on the rarer path where it
+        # is hardest to reproduce.
+        log(f"[reconnect] listener re-bind failed ({_e}) — staying up; restart this "
+            "serve if new runs are not picked up", "WARN")
+
+
 def _emit_to_firestore(event):
     """Write event to Firestore pipeline_events subcollection.
 
@@ -9748,6 +10019,45 @@ def _fire_fe_p4_trigger(uid, research_id):
     return False
 
 
+def _summarize_notify_reply(body_text) -> str:
+    """Turn the notify route's answer into a line that says what was DELIVERED.
+
+    ⛔ 2026-08-16 — the caller used to print "delivered ✓" for any HTTP 200 and
+    then the first 120 characters of the body. Both halves were misleading in
+    the same direction. The route answered with the dedup keys of the notices it
+    had BUILT, so a call that reached zero devices and sent zero mail printed a
+    tick and a list of things that had not happened — which is what the serve
+    log said on the run the owner filed a report about.
+
+    The route now returns the real per-notice outcome. This renders it, and says
+    so plainly when it cannot: an answer it cannot parse is reported as
+    unparsed, never as success. A log line is the only view anyone has of this
+    path, so it must not be capable of overstating it.
+    """
+    try:
+        import json as _json
+        parsed = _json.loads(body_text or "")
+    except Exception:
+        return f"HTTP 200, unparsed reply ({str(body_text)[:80]})"
+    rows = parsed.get("delivered") if isinstance(parsed, dict) else None
+    if not isinstance(rows, list):
+        return f"HTTP 200, no delivery detail ({str(body_text)[:80]})"
+    if not rows:
+        # A legitimate answer: the phase produced nothing worth announcing.
+        return "no notices earned by this event"
+    parts = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        ch = row.get("channels") if isinstance(row.get("channels"), dict) else {}
+        on = ",".join(k for k in ("inApp", "push", "email") if ch.get(k) is True) or "none"
+        parts.append(
+            f"{row.get('dedupKey', '?')} pushed={row.get('pushed', '?')} "
+            f"emailed={row.get('emailed', '?')} channels={on}"
+        )
+    return "; ".join(parts) if parts else f"HTTP 200, no delivery detail ({str(body_text)[:80]})"
+
+
 def _post_fe_phase_notice(uid, research_id, phase, event_type, seq):
     """Ask the web app to deliver the notifications this phase earned.
 
@@ -9786,28 +10096,65 @@ def _post_fe_phase_notice(uid, research_id, phase, event_type, seq):
         return False
 
     def _ask():
+        # ⭐ Counted as an in-flight handoff for the WHOLE retry sequence, not
+        # per attempt: a respawn landing in the backoff between two attempts
+        # kills the notice just as dead as one landing mid-request. See
+        # `_fe_handoff_begin`.
+        _fe_handoff_begin()
         try:
-            import requests as _requests
-            from auth.v2_flow import FE_BASE_URL as _FE_BASE_URL
-            _resp = _requests.post(
-                f"{_FE_BASE_URL}/api/notify",
-                headers={"Authorization": f"Bearer {id_token}"},
-                json={"phaseNotice": {
-                    "kind": "phaseArtifacts",
-                    "ownerUid": uid,
-                    "researchId": research_id,
-                    "phase": phase,
-                    "eventType": event_type,
-                    "seq": seq,
-                }},
-                timeout=20,
-            )
-            if _resp.status_code == 200:
-                log(f"phase-notify: P{phase} {event_type} delivered ✓ ({_resp.text[:120]})")
-            else:
-                log(f"phase-notify: P{phase} HTTP {_resp.status_code} ({_resp.text[:160]})", "WARN")
-        except Exception as _e:
-            log(f"phase-notify: P{phase} dispatch failed ({_e})", "WARN")
+            _ask_with_retries()
+        finally:
+            _fe_handoff_end()
+
+    def _ask_with_retries():
+        # ⭐ RETRIED, because this is a single fire-and-forget POST and there is
+        # no replay path behind it. The web app's own notifier cannot cover the
+        # gap — needing an open tab is the entire reason this call exists — and
+        # the inbox reconcile only covers a run's COMPLETION, not the artifacts a
+        # phase produced along the way. So one blip on one request is that
+        # phase's notice gone for good.
+        #
+        # ⛔ Only the failures worth retrying. A 4xx means the request was
+        # refused on its merits — unauthorised device, malformed body, an event
+        # this side named that the web app could not match — and repeating it
+        # changes nothing except the load. A 5xx or a transport error is the
+        # transient case this exists for.
+        for _attempt in range(1, 4):
+            try:
+                import requests as _requests
+                from auth.v2_flow import FE_BASE_URL as _FE_BASE_URL
+                _resp = _requests.post(
+                    f"{_FE_BASE_URL}/api/notify",
+                    headers={"Authorization": f"Bearer {id_token}"},
+                    json={"phaseNotice": {
+                        "kind": "phaseArtifacts",
+                        "ownerUid": uid,
+                        "researchId": research_id,
+                        "phase": phase,
+                        "eventType": event_type,
+                        "seq": seq,
+                    }},
+                    timeout=20,
+                )
+                if _resp.status_code == 200:
+                    log(f"phase-notify: P{phase} {event_type} → {_summarize_notify_reply(_resp.text)}")
+                    return
+                if _resp.status_code < 500:
+                    log(f"phase-notify: P{phase} HTTP {_resp.status_code} ({_resp.text[:160]})", "WARN")
+                    return
+                _why = f"HTTP {_resp.status_code}"
+            except Exception as _e:
+                _why = str(_e)
+            if _attempt == 3:
+                log(f"phase-notify: P{phase} gave up after 3 attempts ({_why})", "WARN")
+                return
+            # Backoff, so a web app that is restarting is not hammered while it
+            # comes back. Bounded well inside the run — the notice is about a
+            # phase that has already finished, and arriving a few seconds late is
+            # the whole point of retrying at all.
+            _delay = 2 * _attempt
+            log(f"phase-notify: P{phase} attempt {_attempt} failed ({_why}) — retrying in {_delay}s", "WARN")
+            time.sleep(_delay)
 
     try:
         import threading as _threading
@@ -9856,6 +10203,19 @@ def _post_fe_p4p5_trigger(uid, research_id):
         return False
 
     def _drive():
+        # ⭐⭐ Counted as an in-flight DRIVE, not a brief handoff. This request is
+        # not a notification — it is the rest of the run, and the route wires
+        # `req.signal` to an abort handler that SIGTERMs the in-flight ffmpeg
+        # child and writes `status: "stopped"`. Exiting this process while it is
+        # connected kills the encode and terminalises the user's research. See
+        # `_FE_DRIVE_WAIT_SEC`.
+        _fe_handoff_begin(drive=True)
+        try:
+            _drive_once()
+        finally:
+            _fe_handoff_end(drive=True)
+
+    def _drive_once():
         try:
             import requests as _requests
             from auth.v2_flow import FE_BASE_URL as _FE_BASE_URL
@@ -57176,6 +57536,30 @@ async def run_server(port=8000):
                 )
         except Exception as _dce:
             log(f"[device-cmds] listener attach failed: {_dce}", "WARN")
+
+        # ⭐ REGISTERED AT BOOT, because the reconnect loop cannot build this
+        # itself. Re-binding the two long-lived watches needs the job queue, the
+        # event loop and the paired identity, and all three are locals of this
+        # boot path — which is precisely why the old recovery was a whole-process
+        # respawn: re-running boot was the only way anyone had to reach them.
+        #
+        # A closure keeps them without widening any signature, and it is what
+        # lets a FOREGROUND serve recover from a Firestore outage without exiting
+        # the session the user is sitting in front of. See
+        # `_recover_after_reconnect`.
+        try:
+            global _watch_rebinder
+            _rb_uid = load_paired_uid() or ""
+            _rb_device = load_device_id() or ""
+            _rb_loop = asyncio.get_event_loop()
+            _watch_rebinder = lambda: _rebind_firestore_watches(  # noqa: E731
+                _job_queue, _rb_loop, _rb_uid, _rb_device,
+            )
+        except Exception as _rbe:
+            # Not fatal: without a rebinder a foreground serve stays up with
+            # stale listeners and says so, which is strictly better than the
+            # os._exit it replaced.
+            log(f"[reconnect] could not register listener rebinder: {_rbe}", "WARN")
 
     # ── Beat 2 of the --serve banner: the identity strip ────────────────────
     # Shows which account this backend is paired to, where it's listening, and

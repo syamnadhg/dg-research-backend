@@ -90,12 +90,26 @@ def test_reconnect_loop_exists_and_is_tight_and_gated():
         "the reconnect loop must bump _last_loop_tick_ms each iteration so the "
         "watchdog has a per-worker pulse (#717)."
     )
-    # #718 — any reconnect schedules a CLEAN respawn so the fresh boot re-binds
-    # the Firestore listeners. The in-process client swap restores the heartbeat
-    # but leaves the old on_snapshot Watch streams dead on a sustained outage
-    # ("online but deaf"); a respawn makes listener health deterministic.
-    assert "_schedule_server_exit" in src, (
-        "a reconnect must schedule a clean respawn to re-bind listeners (#718)."
+    # #718 — any reconnect must RE-BIND the Firestore listeners. The in-process
+    # client swap restores the heartbeat but leaves the old on_snapshot Watch
+    # streams dead on a sustained outage ("online but deaf").
+    #
+    # ⚠ Re-anchored 2026-08-16, NOT relaxed. The recovery moved into
+    # `_recover_after_reconnect` because "clean respawn" is only correct when
+    # something is going to start us again: on a FOREGROUND --serve nothing is,
+    # so os._exit(0) ended the session the user was watching and the device tile
+    # simply aged into offline. The loop still triggers recovery; the branch that
+    # respawns now lives one function along, and is asserted there.
+    assert "_recover_after_reconnect(" in src, (
+        "a reconnect must trigger listener recovery (#718)."
+    )
+    rec = inspect.getsource(research._recover_after_reconnect)
+    assert "_schedule_server_exit" in rec, (
+        "a SUPERVISED worker must still take the clean respawn (#718)."
+    )
+    assert "_supervisor_is_my_parent()" in rec, (
+        "the respawn must be gated on there actually BEING a supervisor — a "
+        "foreground serve that os._exits is gone for good."
     )
     # …but the respawn must NOT os._exit an ACTIVE run — it's deferred to idle.
     assert '_QUEUE_STATE.get("running")' in src and "pending_respawn" in src, (
