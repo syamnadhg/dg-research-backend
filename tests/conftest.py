@@ -45,6 +45,39 @@ def serving_version(monkeypatch, version: "str | None"):
     monkeypatch.setattr(research, "_BOOT_VERSION", version)
 
 
+def apply_firestore_update(doc: dict, patch: dict) -> dict:
+    """Apply a Firestore `update()` patch to `doc` the way Firestore does.
+
+    ⭐ THE PART THAT IS EASY TO GET WRONG, and that the doubles in this suite got
+    wrong: a key containing a DOT is a path into a nested map, and Firestore
+    MERGES into that map. A key with no dot replaces its value outright — so a
+    whole nested map passed as one value deletes every key the new map omits.
+
+    That difference is the entire mechanism behind the refusal fix: writing
+    `updateStatus` as a map erased `needsRestart`, and writing
+    `updateStatus.state` leaves it alone. A double that applied the patch flat
+    would store a literal `"updateStatus.state"` key — which reads as a broken
+    handler, and invites "fixing" the assertion to match, at which point the
+    test certifies nothing about the merge it exists to prove.
+
+    ONE definition, because two doubles in this suite need it and they must not
+    disagree about what Firestore does. Mutates and returns `doc`."""
+    for key, value in patch.items():
+        if "." not in key:
+            doc[key] = value
+            continue
+        *parents, leaf = key.split(".")
+        node = doc
+        for part in parents:
+            nxt = node.get(part)
+            if not isinstance(nxt, dict):
+                nxt = {}
+                node[part] = nxt
+            node = nxt
+        node[leaf] = value
+    return doc
+
+
 def code_only(target) -> str:
     """Source of `target` (a function, or a source string) with `#` comments
     stripped and all other layout preserved byte-for-byte.

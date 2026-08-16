@@ -648,8 +648,12 @@ class TestSecondClickIsAnswered:
         monkeypatch.setattr(research, "_schedule_server_exit",
                             lambda *a, **k: seen.append("exit-scheduled"))
         monkeypatch.setattr(research, "_sr_version", lambda: "0.1.10")
+        # `**kw` so the stub keeps matching the real signature: refusals pass
+        # `merge=True` (dotted field paths, so a refusal cannot delete the
+        # `needsRestart` flag it never mentions). A positional-only stub raised
+        # TypeError from inside the handler, which reads like a handler bug.
         monkeypatch.setattr(research, "_write_update_status",
-                            lambda dev, st: seen.append(st) or True)
+                            lambda dev, st, **kw: seen.append(st) or True)
         monkeypatch.setattr(research, "_update_in_flight",
                             lambda: {"current": "0.1.10", "latest": "0.1.11"} if in_flight else None)
         monkeypatch.setattr(research, "_detect_supervised", lambda: True)

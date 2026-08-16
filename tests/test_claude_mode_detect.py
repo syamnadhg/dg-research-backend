@@ -45,7 +45,13 @@ def test_detector_reads_the_model_button_not_a_body_scan():
     assert "famRe.test(t)" in DETECTOR, (
         "the high-tier-model check must test the model button for the family word"
     )
-    assert "p2_family" in code_only_deep(research.ensure_deep_mode_active), (
+    # ⭐ `_p2_active_family` IS the central policy read — it returns
+    # `p2_family(platform)` unless THIS RUN proved the account's plan excludes
+    # that family, in which case it returns the policy's own fallback word. What
+    # this assertion exists to forbid is a LITERAL, and it still does; asking for
+    # the un-scoped reader by name would instead force the one shape that reads
+    # "mode regressed" on every pass of a correct fallback run.
+    assert "_p2_active_family" in code_only_deep(research.ensure_deep_mode_active), (
         "the family word must come from the central P2_MODEL_POLICY"
     )
 

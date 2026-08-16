@@ -1,14 +1,15 @@
 """#938 — sharer keys: a sharer's own API keys are used ONLY for runs THEY
 submit on a shared research computer.
 
-A sharer saves keys in THEIR OWN users/{sharerUid}/settings/prefs at
-apiKeys.byDevice.{deviceId}.{anthropic,gemini} (the settings/prefs read rule
-already allows the synth device user via deviceMemberOf — the sharer is in
-this device's sharedWith[]; the owner can never read them). At run start,
-run_pipeline binds the submitter uid BEFORE any key resolution; when the
-submitter isn't the device owner, _read_firestore_api_keys overlays the
-submitter's explicit per-device keys over the owner chain. Resolution per
-field: sharer byDevice > owner byDevice > owner flat > user-scope env >
+A sharer saves keys in THEIR OWN users/{sharerUid}/deviceKeys/{deviceId} —
+one document per computer, holding just {anthropic?, gemini?} for that
+machine. The rule lets this device read the doc named after its own deviceId
+claim, in a tree it is authorized for; their settings/prefs is NOT readable
+from here, and the owner can never read either. At run start, run_pipeline
+binds the submitter uid BEFORE any key resolution; when the submitter isn't
+the device owner, _read_firestore_api_keys overlays the submitter's explicit
+per-device keys over the owner chain. Resolution per field: sharer device doc
+> owner device doc > owner legacy byDevice > owner flat > user-scope env >
 os.environ. Sharer FLAT keys are deliberately ignored on someone else's
 computer, and the overlay is allowlisted to {anthropic, gemini}.
 
@@ -27,10 +28,10 @@ MODSRC = inspect.getsource(research)
 
 # ── _overlay_submitter_keys: pure merge semantics ─────────────────────────────
 
-def test_sharer_bydevice_outranks_owner_chain_per_field():
+def test_sharer_device_key_outranks_owner_chain_per_field():
     merged = {"anthropic": "sk-ant-owner", "gemini": "AIza-owner"}
-    sharer = {"byDevice": {"pc-abc123": {"anthropic": "sk-ant-sharer"}}}
-    out, fields = research._overlay_submitter_keys(merged, sharer, "pc-abc123")
+    sharer = {"anthropic": "sk-ant-sharer"}
+    out, fields = research._overlay_submitter_keys(merged, sharer)
     assert out["anthropic"] == "sk-ant-sharer", "sharer's per-device key must win"
     assert out["gemini"] == "AIza-owner", "fields the sharer didn't bring keep the owner chain"
     assert fields == ["anthropic"]
@@ -39,27 +40,29 @@ def test_sharer_bydevice_outranks_owner_chain_per_field():
 def test_sharer_flat_keys_are_ignored_on_someone_elses_computer():
     # Per-device is the explicit opt-in — a sharer's account-wide flat key
     # must never silently bill their account for runs on a shared computer.
-    merged = {"anthropic": "sk-ant-owner"}
-    sharer = {"anthropic": "sk-ant-sharer-flat", "gemini": "AIza-sharer-flat"}
-    out, fields = research._overlay_submitter_keys(merged, sharer, "pc-abc123")
-    assert out == {"anthropic": "sk-ant-owner"}
-    assert fields == []
+    # The read is what enforces it now: this machine may open exactly ONE
+    # document in the sharer's tree, and the flat keys are not in it.
+    reader = inspect.getsource(research._read_submitter_device_keys)
+    assert 'collection("deviceKeys")' in reader
+    assert 'document("prefs")' not in reader, \
+        "the sharer's prefs doc must not be read from someone else's computer"
+    assert 'collection("settings")' not in reader
 
 
-def test_sharer_other_device_entry_never_applies():
-    merged = {"anthropic": "sk-ant-owner"}
-    sharer = {"byDevice": {"other-device": {"anthropic": "sk-ant-sharer"}}}
-    out, fields = research._overlay_submitter_keys(merged, sharer, "pc-abc123")
-    assert out == {"anthropic": "sk-ant-owner"}
-    assert fields == []
+def test_sharer_other_device_doc_is_never_even_read():
+    # Scoping is the path, not a lookup: the deviceId in the read is this
+    # machine's, and the rule requires it to equal the token's own claim.
+    src = inspect.getsource(research._read_firestore_api_keys)
+    assert "_read_submitter_device_keys(submitter, did)" in src
 
 
 def test_overlay_is_allowlisted_to_anthropic_and_gemini():
-    # A stray byDevice field (e.g. deepgram) must never shadow the owner's
-    # value — the sharer overlay only carries the two user-facing keys.
+    # A stray field in the sharer's key doc (e.g. deepgram) must never shadow
+    # the owner's value — the sharer overlay only carries the two user-facing
+    # keys.
     merged = {"deepgram": "dg-owner"}
-    sharer = {"byDevice": {"pc": {"deepgram": "dg-sharer", "gemini": "AIza-s"}}}
-    out, fields = research._overlay_submitter_keys(merged, sharer, "pc")
+    sharer = {"deepgram": "dg-sharer", "gemini": "AIza-s"}
+    out, fields = research._overlay_submitter_keys(merged, sharer)
     assert out["deepgram"] == "dg-owner"
     assert out["gemini"] == "AIza-s"
     assert fields == ["gemini"]
@@ -68,34 +71,36 @@ def test_overlay_is_allowlisted_to_anthropic_and_gemini():
 
 def test_empty_sharer_value_never_shadows_owner():
     merged = {"anthropic": "sk-ant-owner"}
-    sharer = {"byDevice": {"pc": {"anthropic": "   "}}}
-    out, fields = research._overlay_submitter_keys(merged, sharer, "pc")
+    out, fields = research._overlay_submitter_keys(merged, {"anthropic": "   "})
     assert out["anthropic"] == "sk-ant-owner"
     assert fields == []
 
 
 def test_overlay_malformed_shapes_are_safe():
-    # The sharer's prefs doc is client-writable — never trust the shape.
+    # The sharer's key doc is client-writable — never trust the shape.
     merged = {"anthropic": "sk-ant-owner"}
-    assert research._overlay_submitter_keys(merged, None, "pc") == (merged, [])
-    assert research._overlay_submitter_keys(merged, {"byDevice": "nope"}, "pc") == (merged, [])
-    assert research._overlay_submitter_keys(merged, {"byDevice": {"pc": "nope"}}, "pc") == (merged, [])
-    assert research._overlay_submitter_keys(merged, {"byDevice": {"pc": {"anthropic": 123}}}, "pc") == (merged, [])
-    assert research._overlay_submitter_keys(None, {"byDevice": {"pc": {"gemini": "AIza-s"}}}, "pc") == ({"gemini": "AIza-s"}, ["gemini"])
-    assert research._overlay_submitter_keys(merged, {}, None) == (merged, [])
+    assert research._overlay_submitter_keys(merged, None) == (merged, [])
+    assert research._overlay_submitter_keys(merged, "nope") == (merged, [])
+    assert research._overlay_submitter_keys(merged, {"anthropic": 123}) == (merged, [])
+    # A doc carrying the OLD nested shape resolves to nothing rather than
+    # smuggling a dict in as a key value.
+    assert research._overlay_submitter_keys(
+        merged, {"byDevice": {"pc": {"anthropic": "sk-x"}}}) == (merged, [])
+    assert research._overlay_submitter_keys(
+        None, {"gemini": "AIza-s"}) == ({"gemini": "AIza-s"}, ["gemini"])
+    assert research._overlay_submitter_keys(merged, {}) == (merged, [])
 
 
 def test_overlay_strips_values_and_sorts_fields():
     out, fields = research._overlay_submitter_keys(
-        {}, {"byDevice": {"pc": {"gemini": " AIza-s ", "anthropic": " sk-a "}}}, "pc")
+        {}, {"gemini": " AIza-s ", "anthropic": " sk-a "})
     assert out == {"gemini": "AIza-s", "anthropic": "sk-a"}
     assert fields == ["anthropic", "gemini"], "sorted — stable log/attribution output"
 
 
 def test_overlay_does_not_mutate_the_input_merged_dict():
     merged = {"anthropic": "sk-ant-owner"}
-    research._overlay_submitter_keys(
-        merged, {"byDevice": {"pc": {"anthropic": "sk-ant-sharer"}}}, "pc")
+    research._overlay_submitter_keys(merged, {"anthropic": "sk-ant-sharer"})
     assert merged == {"anthropic": "sk-ant-owner"}
 
 
@@ -108,24 +113,101 @@ def test_reader_overlays_submitter_keys_only_when_submitter_differs():
 
 
 def test_reader_sharer_block_fails_open_to_owner_chain():
-    # A mid-run unshare 403s the sharer prefs read — that must degrade to
+    # A mid-run unshare 403s the sharer key read — that must degrade to
     # the owner chain, NOT bubble to the reader's outer except (which
     # returns {} and would nuke the owner keys too).
     src = inspect.getsource(research._read_firestore_api_keys)
     sharer_block = src.split("_overlay_submitter_keys(")[0]
     assert sharer_block.count("try:") >= 2, "sharer read needs its own inner try"
     assert "except Exception" in src.split("_overlay_submitter_keys(")[1]
-    helper = inspect.getsource(research._read_submitter_prefs_keys)
-    assert "except Exception" in helper, "prefs read itself is fail-open"
+    helper = inspect.getsource(research._read_submitter_device_keys)
+    assert "except Exception" in helper, "the key read itself is fail-open"
 
 
-def test_submitter_prefs_read_is_cached():
+class _BoomDb:
+    """A Firestore client that fails the moment it is touched."""
+
+    def collection(self, *_a, **_k):
+        raise RuntimeError("permission denied")
+
+
+class _CountingDb:
+    """Self-returning stub that counts how many reads actually happen."""
+
+    def __init__(self, payload):
+        self.reads = 0
+        self.payload = payload
+
+    def collection(self, _name):
+        return self
+
+    def document(self, _name):
+        return self
+
+    def get(self):
+        self.reads += 1
+        return self
+
+    @property
+    def exists(self):
+        return True
+
+    def to_dict(self):
+        return dict(self.payload)
+
+
+def _reset_memo():
+    research._SHARER_PREFS_CACHE.update(uid=None, keys=None, ts=0.0)
+
+
+def test_submitter_key_read_FAILS_OPEN(monkeypatch):
+    # Behavioural, not a grep for `except`. A harness mutant replaced the
+    # handler's body with `raise` and the source-level assertion still passed.
+    # A mid-run unshare 403s this read; degrading to the owner chain is the
+    # difference between a run that finishes on the owner's key and a run that
+    # dies with no key at all.
+    _reset_memo()
+    monkeypatch.setattr(research, "_firebase_db", _BoomDb())
+    try:
+        assert research._read_submitter_device_keys("sharer-alice", "pc-abc") == {}
+    finally:
+        _reset_memo()
+
+
+def test_submitter_key_read_is_cached(monkeypatch):
     # resolve_gemini_api_key has no cache (narrator re-resolves every ~6s
     # tick) — the 30s single-slot memo keeps sharer runs from doubling the
-    # per-resolve Firestore reads.
-    helper = inspect.getsource(research._read_submitter_prefs_keys)
-    assert "_SHARER_PREFS_CACHE" in helper
+    # per-resolve Firestore reads. Counted, not grepped: a memo whose lookup
+    # is dead still mentions the cache by name on every line it used to use.
+    _reset_memo()
+    db = _CountingDb({"anthropic": "sk-ant-sharer"})
+    monkeypatch.setattr(research, "_firebase_db", db)
+    try:
+        first = research._read_submitter_device_keys("sharer-alice", "pc-abc")
+        second = research._read_submitter_device_keys("sharer-alice", "pc-abc")
+        assert first == second == {"anthropic": "sk-ant-sharer"}
+        assert db.reads == 1, "the second resolve within the window must be served from the memo"
+        # A DIFFERENT submitter is a different answer and must not be served
+        # the previous one — the memo is single-slot, keyed by uid.
+        other = research._read_submitter_device_keys("sharer-bob", "pc-abc")
+        assert db.reads == 2
+        assert other == {"anthropic": "sk-ant-sharer"}
+    finally:
+        _reset_memo()
+
     assert research._SHARER_PREFS_TTL == 30.0
+
+
+def test_a_denied_read_is_memoised_too(monkeypatch):
+    # A revoked sharer must not retry the denied read on every narrator tick.
+    _reset_memo()
+    monkeypatch.setattr(research, "_firebase_db", _BoomDb())
+    try:
+        assert research._read_submitter_device_keys("sharer-alice", "pc-abc") == {}
+        assert research._SHARER_PREFS_CACHE["uid"] == "sharer-alice"
+        assert research._SHARER_PREFS_CACHE["ts"] > 0
+    finally:
+        _reset_memo()
 
 
 # ── submitter context: entry-only, change-triggered ──────────────────────────
@@ -364,3 +446,20 @@ def test_928_device_overlay_untouched():
     reader = inspect.getsource(research._read_firestore_api_keys)
     assert reader.index("_overlay_device_keys(") < reader.index("_overlay_submitter_keys("), \
         "owner chain resolves first; the sharer overlay applies on top"
+
+
+def test_sharer_prefs_doc_is_no_longer_read_anywhere():
+    # The finding: this machine is the OWNER's hardware, and it was reading
+    # the SHARER's whole prefs doc — every key they had saved for every
+    # computer, their pair-code-lock hash, their delivery address — to pick
+    # out the one key they had given THIS machine.
+    #
+    # There is exactly ONE prefs read left in the key path, and it happens
+    # before the submitter is even consulted — so it can only be the paired
+    # (owner) uid's.
+    src = inspect.getsource(research._read_firestore_api_keys)
+    assert src.count('document("prefs")') == 1
+    assert src.index('document("prefs")') < src.index("submitter = ")
+    assert "_read_submitter_device_keys" in src
+    assert not hasattr(research, "_read_submitter_prefs_keys"), \
+        "the sharer prefs reader must be gone, not merely unused"

@@ -40,7 +40,7 @@ import anthropic
 # overrides + rationale. Aliased locally so existing call sites continue
 # to read `MODEL_SONNET` / `MODEL_OPUS` without churn, while bumps land
 # centrally in models.py.
-from models import VISION_LIGHT_MODEL, VISION_HEAVY_MODEL
+from models import VISION_LIGHT_MODEL, VISION_HEAVY_MODEL, core_attr
 
 logger = logging.getLogger("vision")
 
@@ -315,14 +315,26 @@ class VisionClient:
     ) -> None:
         key = api_key
         if not key:
-            # Lazy import — research imports vision, so vision must import
-            # research lazily to avoid a circular import at module-load.
             # Routes through the canonical precedence chain (Firestore →
             # user-scope env → os.environ). Eliminates the two-ladder split
             # with research.py:25404 (which now also uses resolve_api_key).
+            #
+            # ⭐ Resolved via `models.core_attr`, NOT `from research import …`.
+            # In the compiled wheel research.py is a launcher shim exporting
+            # only `main` and the pipeline lives in `_sr_core`, so the direct
+            # import raised ImportError in every shipped build. It was swallowed
+            # by the except below, and key resolution fell through to the bare
+            # `os.environ` read — which is the ONLY other source here, because
+            # every production construction of this client passes no api_key.
+            # So on any machine whose Anthropic key was set in the app rather
+            # than in the supervisor's env file, the CUA last resort had no key
+            # at all, and said nothing about it. `core_attr` prefers an
+            # already-imported core, which also keeps the lazy-import property
+            # this comment used to be about (research imports vision).
             try:
-                from research import resolve_api_key as _resolve_api_key
-                key = _resolve_api_key()
+                _resolve_api_key = core_attr("resolve_api_key")
+                if _resolve_api_key is not None:
+                    key = _resolve_api_key()
             except Exception:
                 pass
         if not key:

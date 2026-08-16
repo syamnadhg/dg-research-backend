@@ -129,18 +129,24 @@ def test_no_python_module_hand_rolls_a_thinking_budget_any_more():
     # it out and require the rest of both modules to be clean. Counting instead
     # of excluding would pass on a build where the shared one was deleted and a
     # hand-rolled one added back.
-    assert "thinkingBudget" in code_only_deep(research._gemini_gen_config), (
+    #
+    # ⓘ 2026-08-13 — the shared builder MOVED to models.py, and the move is the
+    # point rather than a detail. narrate.py was the fifth site and could not
+    # share research.py's copy at all: it is compiled into the wheel alongside a
+    # `research.py` that is only a launcher shim, so importing from it raises
+    # there. models.py is the one module all of them already import.
+    assert "thinkingBudget" in code_only_deep(models.gemini_gen_config), (
         "the opt-in lever is gone from the shared builder — if that is deliberate, "
         "this test's whole shape needs revisiting"
     )
     # Excise the shared builder by LINE RANGE, not by substring: the two
     # strippers dedent differently, so a function's stripped text is not a
     # substring of its module's stripped text.
-    for mod in (research, narrate):
+    for mod in (research, narrate, models):
         lines = code_only_deep(inspect.getsource(mod)).splitlines()
-        if mod is research:
-            _, start = inspect.getsourcelines(research._gemini_gen_config)
-            span = len(inspect.getsourcelines(research._gemini_gen_config)[0])
+        if mod is models:
+            _, start = inspect.getsourcelines(models.gemini_gen_config)
+            span = len(inspect.getsourcelines(models.gemini_gen_config)[0])
             lines[start - 1:start - 1 + span] = []
         offenders = [(i + 1, ln) for i, ln in enumerate(lines)
                      if "thinkingBudget" in ln]
@@ -148,6 +154,21 @@ def test_no_python_module_hand_rolls_a_thinking_budget_any_more():
             f"{mod.__name__} hand-rolls the thinking budget outside the shared "
             f"builder, at line(s) {[n for n, _ in offenders]}"
         )
+
+
+def test_the_panel_narrator_opts_out_of_the_budget_rather_than_forgetting_it():
+    """⚠ The one call site that must NOT honour the env var, and the reason the
+    shared builder takes a flag instead of reading the variable unconditionally.
+
+    narrate.py sends a `responseSchema`; with thinking on, structured JSON can
+    truncate mid-field, which is a worse failure there than a slow one. Before
+    consolidation that refusal was expressed by simply not having the code —
+    silence. Consolidating without the flag would have converted a decision into
+    an accident, and nothing would have failed."""
+    assert "thinking_budget_env=False" in code_only(narrate._call_gemini), (
+        "the panel narrator no longer opts out of DG_GEMINI_THINKING_BUDGET — a "
+        "truncated responseSchema is now one env var away"
+    )
 
 
 @pytest.mark.parametrize("fn", [
@@ -190,13 +211,34 @@ def test_the_narrator_ceiling_rose_when_thinking_came_back_on():
     )
 
 
-def test_the_vision_narrator_ceiling_rose_too():
-    src = code_only(inspect.getsource(narrate))
-    i = src.index('"maxOutputTokens"')
-    val = src[i:i + 60]
-    assert "600" not in val, (
-        "narrate.py disabled thinking specifically so all 600 tokens went to the "
-        "structured JSON; with thinking on, 600 truncates it mid-field"
+def test_the_vision_narrator_ceiling_rose_too(monkeypatch):
+    """Read from the payload the module actually POSTS, not from its source.
+
+    ⓘ This used to `index('"maxOutputTokens"')` in narrate.py's text and check
+    the 60 characters after it. That stopped finding anything the moment the
+    literal dict became a call to the shared builder — and a source scan that
+    finds nothing is one edit away from an assertion that cannot fail. Building
+    the real request answers the same question and cannot be emptied by a
+    refactor."""
+    posted: list = []
+
+    class _R:
+        status_code = 200
+        text = "{}"
+
+        def json(self):
+            return {}
+
+    monkeypatch.setattr(narrate.requests, "post",
+                        lambda url, json=None, timeout=None:
+                        (posted.append(json), _R())[1])
+    narrate._call_gemini("k", "m", b"png", "u")
+
+    ceiling = posted[0]["generationConfig"]["maxOutputTokens"]
+    assert ceiling > 600, (
+        f"narrate.py asks for {ceiling} output tokens. It disabled thinking "
+        f"specifically so all 600 went to the structured JSON; with thinking on, "
+        f"600 truncates it mid-field"
     )
 
 

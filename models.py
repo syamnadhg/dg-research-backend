@@ -140,6 +140,25 @@ P2_MODEL_POLICY = {
         # otherwise report thinking as permanently unconfirmed.
         "family": "opus", "pick": "highest",
         "effort": "max", "thinking": False, "tool": "research",
+        # ⭐ (2026-08-14) The family to use when the account's plan does not
+        # include `family` at all. On a non-pro Claude account every Opus row in
+        # the model menu is a sales chip, so the picker correctly refuses all of
+        # them and setup FAILED — and the run then went out on whatever the menu
+        # happened to be defaulting to, at whatever effort that model was left
+        # on, with the CUA fallback still hunting for an Opus that does not
+        # exist. Sonnet was already what those runs used; it just arrived by
+        # accident instead of by choice, which is why the effort lever never ran.
+        #
+        # ⛔ A FAMILY, NOT A MODEL — the same standing rule as `family`. "Sonnet"
+        # keeps pointing at the newest Sonnet forever; "Sonnet 4.6" is a floor
+        # that rots in both directions. Everything downstream (highest-offered,
+        # the weekly probe, effort=max) is family-generic and applies unchanged.
+        #
+        # ⚠ This is a FALLBACK, never a preference: it is reached only when the
+        # DOM has proved the family is offered exclusively as sales prompts. A
+        # pro account never touches it — see the `chips` signal in
+        # research.py's _probe_opus_js for what "proved" means.
+        "free_family": "sonnet",
     },
     "gemini": {
         "family": "flash", "pick": "highest",
@@ -177,6 +196,141 @@ P2_MODEL_POLICY = {
 # failure this is meant to catch. What changed is that the two words no longer
 # have to appear in one frozen order ("Extended Pro"): any order matches, so a
 # rename to "Pro Reasoning" or "Pro (extended)" keeps working.
+
+# The sales verbs, in ONE place — read by `is_upsell` (which the P2 model
+# rankers and their JS ports use), by the ChatGPT tier picker's
+# `upgrade_verbs`, and by the CUA mission rendered from that key. Three
+# surfaces, one list, so none of them can develop its own idea of what a sales
+# prompt looks like.
+# ⭐ "unlock" joined on 2026-08-14. Three other guards in research.py already
+# treated it as a sales verb while this list did not, so "Unlock Opus 5.2" was a
+# chip that PARSED a version and outranked every genuine row — finding 2's exact
+# mechanism, using a word the codebase had already recognised elsewhere for
+# months. A shared list that is missing a member the unshared copies have is
+# worse than no sharing: it reads as settled.
+UPSELL_VERBS = ("upgrade", "subscribe", "unlock", "get", "try")
+
+# How far after the verb the noun may sit and still be the verb's object.
+# "Get Opus with Max" is 4; "Upgrade your plan to get Opus" is 17. Wide enough
+# for a preposition or two, far short of a sentence.
+UPSELL_WINDOW = 24
+
+
+# ── Reaching the pipeline core from a sibling module ────────────────────
+#
+# The pipeline lives in `research.py` in a source checkout and in
+# `_sr_core.<abi>.pyd` in the compiled wheel, where `research.py` is replaced by
+# a ~48-line launcher shim that exports only `main` (tools/build_compiled.py).
+# So `from research import <helper>` — which vision.py and narrate.py both used
+# to reach the canonical API-key resolvers — raises ImportError in every shipped
+# build, and both call sites swallowed it, so the failure was invisible and each
+# caller silently degraded to a bare `os.environ` read.
+#
+# Named in one place because the two names are one fact, and because a third
+# module reaching for a core helper must not have to rediscover this.
+CORE_MODULE_NAMES = ("research", "_sr_core")
+
+
+def core_attr(name: str):
+    """Return `name` from the pipeline core module, or None if it isn't there.
+
+    ⚠ Prefers a module that is ALREADY imported. By the time any sibling
+    module's runtime code asks for a core helper, the core is loaded, so this
+    costs a dict lookup — where importing `_sr_core` cold is a ~3s
+    native-extension load nobody should pay from inside a key lookup. The real
+    import is the fallback, for a genuinely standalone caller.
+
+    ⓘ Never raises and never reports failure: this is the same "best effort,
+    fall through to the next key source" contract the callers already had. What
+    changed is that the compiled build now HAS a next source that works.
+    """
+    import importlib
+    import sys
+
+    for mod_name in CORE_MODULE_NAMES:
+        try:
+            # ⚠ `getattr` is not safe by itself here. A module caught PARTWAY
+            # through its own import is already in sys.modules, and a module-level
+            # `__getattr__` (or a lazy-loader shim) can raise from it — which
+            # would propagate out of a best-effort lookup and take the caller's
+            # remaining key sources down with it.
+            fn = getattr(sys.modules.get(mod_name), name, None)
+        except Exception:
+            continue
+        if fn is not None:
+            return fn
+    for mod_name in CORE_MODULE_NAMES:
+        try:
+            fn = getattr(importlib.import_module(mod_name), name, None)
+        except Exception:
+            continue
+        if fn is not None:
+            return fn
+    return None
+
+
+def gemini_gen_config(*, temperature: float, max_tokens: int,
+                      thinking_budget_env: bool = True, **extra) -> dict:
+    """The shared `generationConfig` builder for every Gemini TEXT call.
+
+    ⓘ "Every Gemini call" would be overstating it: the vision-URL extractor
+    hand-builds its own, deliberately, and is pinned that way — it is the
+    200-vs-400 differential that identified the rejected thinking field in the
+    first place, so it has to stay an INDEPENDENT witness rather than share a
+    builder with the code it exonerates.
+
+    ⭐ WHY IT LIVES HERE and not in research.py. Four builders in research.py
+    were consolidated on 2026-08-05; narrate.py kept a fifth hand-rolled copy
+    and had to take the same fix by hand. It could not share the research.py
+    one — a compiled sibling cannot import from the core (see `core_attr`) — so
+    the shared home has to be a module both already import, which is this one.
+    research.py's `_gemini_gen_config` now delegates here.
+
+    ⚠ `thinking_budget_env=False` is the EXPLICIT OPT-OUT, and it exists
+    because consolidating naively would undo a deliberate refusal. The panel
+    narrator sends a `responseSchema`, and a truncated structured response is a
+    worse failure there than a slow one, so that call site deliberately does NOT
+    honour `DG_GEMINI_THINKING_BUDGET`. Silence would have made it honour it.
+
+    ⛔ `thinkingConfig` is OMITTED by default on purpose — the live endpoint
+    rejects `{"thinkingBudget": 0}` with HTTP 400 INVALID_ARGUMENT and names no
+    field. The env var re-enables it for whoever wants to test a future model
+    that accepts it. Thinking therefore being ON by default is why every caller
+    of this builder needs a token ceiling sized for reasoning plus the answer.
+    """
+    cfg = {"temperature": temperature, "maxOutputTokens": int(max_tokens)}
+    if thinking_budget_env:
+        _tb = os.environ.get("DG_GEMINI_THINKING_BUDGET", "").strip()
+        if _tb:
+            try:
+                cfg["thinkingConfig"] = {"thinkingBudget": int(_tb)}
+            except ValueError:
+                pass
+    cfg.update(extra)
+    return cfg
+
+
+def gemini_empty_reason(payload: dict) -> str:
+    """Why a 200 came back with no text: the finish reason, or a block reason.
+
+    A refusal and an empty success are different faults with different fixes — a
+    blocked prompt is ours to change, a token budget spent on thinking is a
+    config value — and a single "no text" message describes neither.
+
+    ⓘ Here rather than in research.py for the same reason `gemini_gen_config` is:
+    narrate.py needs it, and a compiled sibling cannot import from the core.
+    research.py's `_gemini_empty_reason` delegates."""
+    try:
+        cand = ((payload or {}).get("candidates") or [{}])[0] or {}
+        finish = str(cand.get("finishReason") or "").strip()
+        block = str(((payload or {}).get("promptFeedback") or {})
+                    .get("blockReason") or "").strip()
+    except Exception:
+        finish = block = ""
+    parts = [p for p in (f"finishReason={finish}" if finish else "",
+                         f"blockReason={block}" if block else "") if p]
+    return ", ".join(parts) or "no finishReason and no blockReason"
+
 P1_MODEL_POLICY = {
     "chatgpt": {
         # ⭐ (2026-08-03) ChatGPT has NO separate thinking control — effort and
@@ -205,8 +359,11 @@ P1_MODEL_POLICY = {
         # miss here only produces 'unsure', which proceeds (fail-open).
         "downgrade_words": ["instant", "auto", "fast", "standard"],
         # An "Upgrade to Pro" CTA contains the tier word without being evidence
-        # of it; these verbs disqualify a match.
-        "upgrade_verbs": ["upgrade", "subscribe", "get", "try"],
+        # of it; these verbs disqualify a match. ⚠ Not a second list — this IS
+        # `UPSELL_VERBS`, which `is_upsell` and the P2 model rankers also use,
+        # so the tier picker, the CUA mission rendered from these words, and the
+        # model rankers cannot drift apart on what a sales prompt looks like.
+        "upgrade_verbs": UPSELL_VERBS,
     },
 }
 
@@ -351,6 +508,10 @@ _MODEL_REFRESH_OVERLAY_PATH = Path(
 # code default always wins over a malformed override.
 _OVERLAY_LABEL_SCHEMA = {
     "family": str,
+    # Retunable for the same reason `family` is: the day a vendor renames its
+    # mid-tier the fallback has to follow without a release, or a non-pro
+    # account loses its only working model choice until one ships.
+    "free_family": str,
     "effort": str,
     "tool": str,
     "reject": list,
@@ -408,10 +569,37 @@ def p2_family(platform: str) -> str:
     inside the browser and take model selection down. Rejecting the value here
     (falling back to the code default) removes that whole class at the source,
     which is better than escaping it correctly at four call sites forever."""
-    raw = str(p2_labels(platform).get("family") or "").lower().strip()
+    return _family_word(platform, "family")
+
+
+def _family_word(platform: str, key: str) -> str:
+    """The shared read+sanitize behind `p2_family` and `p2_free_family`.
+
+    ⛔ ONE implementation on purpose. Both words are interpolated into
+    `new RegExp(...)` inside page.evaluate strings, so both need the identical
+    metacharacter rejection — and a second copy of that rule is exactly how the
+    fallback family ends up as the one unescaped path into the browser."""
+    raw = str(p2_labels(platform).get(key) or "").lower().strip()
     if raw and not re.fullmatch(r"[a-z0-9 ]+", raw):
-        raw = str(P2_MODEL_POLICY.get(platform, {}).get("family") or "").lower()
+        raw = str(P2_MODEL_POLICY.get(platform, {}).get(key) or "").lower()
     return raw
+
+
+def p2_free_family(platform: str) -> str:
+    """The family to fall back to when the account's plan does not include
+    `p2_family(platform)`. Empty string when the platform has no fallback.
+
+    ⛔ EMPTY WHEN IT EQUALS THE PRIMARY FAMILY, and that is not a formality. The
+    fallback's only trigger is "every row of family X is a sales chip"; if the
+    fallback IS X, the retry re-runs the same picker over the same refused rows
+    and the only thing that changes is that the failure takes two passes and
+    logs a family switch that did not happen. The overlay is user-editable, so
+    that configuration is one typo away and has to resolve to "no fallback".
+
+    ⚠ Sanitized exactly like `p2_family` — it reaches the same `new RegExp`
+    sites, so it carries the same injection surface."""
+    free = _family_word(platform, "free_family")
+    return "" if not free or free == p2_family(platform) else free
 
 
 def reject_terms(platform: str) -> list:
@@ -419,6 +607,24 @@ def reject_terms(platform: str) -> list:
     what the trailing `*` means."""
     v = p2_labels(platform).get("reject")
     return [str(r).lower() for r in v] if isinstance(v, (list, tuple)) else []
+
+
+def _ascii_alnum(ch) -> bool:
+    """The word-character test every mirrored matcher in this module uses.
+
+    ⭐ ASCII, because the JS port is ASCII (`c >= 'a' && c <= 'z' || …`) and
+    these are meant to be THE definition rather than a second opinion.
+    `str.isalnum()` is Unicode-aware, so on a CJK or accented UI the two
+    disagreed at exactly the boundary that decides a match: "…flash pro高度" is
+    NOT rejected in python ('高' is alnum, so the right boundary fails) but IS
+    rejected in the browser — and "…flashélite" is the mirror image. Every unit
+    test built on `pick_highest_model` was therefore certifying accept/reject
+    semantics the browser never ran.
+
+    Module level rather than nested, so `reject_matches` and `is_upsell` cannot
+    grow two answers to the same question. Every caller lowercases first, so
+    there is no uppercase branch to mirror."""
+    return bool(ch) and (("a" <= ch <= "z") or ("0" <= ch <= "9"))
 
 
 def reject_matches(text: str, terms) -> bool:
@@ -441,20 +647,7 @@ def reject_matches(text: str, terms) -> bool:
     disabled a gate for months (the #913 note).
     """
     t = (text or "").lower()
-
-    def _alnum(ch):
-        # ⭐ ASCII, because the JS port is ASCII (`c >= 'a' && c <= 'z' || …`)
-        # and this is supposed to be THE definition rather than a second
-        # opinion. `str.isalnum()` is Unicode-aware, so on a CJK or accented
-        # UI the two disagreed at exactly the boundary that decides a reject:
-        # "…flash pro高度" is NOT rejected here (python: '高' is alnum, so the
-        # right boundary fails) but IS rejected in the browser — and
-        # "…flashélite" is the mirror image. Every unit test built on
-        # pick_highest_model was therefore certifying accept/reject semantics
-        # the browser never ran, which is the exact failure this docstring
-        # claims was fixed. Both call sites lowercase first, so there is no
-        # uppercase branch to mirror.
-        return ("a" <= ch <= "z") or ("0" <= ch <= "9")
+    _alnum = _ascii_alnum
 
     for raw in terms or []:
         term = str(raw).lower()
@@ -550,18 +743,39 @@ def pick_effort_tier(labels, tier_words, upgrade_verbs=()):
     return best
 
 
-def p2_known_good(platform: str):
-    """The last verified-working model version for a platform (the C1 fallback
-    target when the latest can't be verified). None until a real run records
-    one (see record_known_good). Coerced to float so a stringly-typed overlay
-    value can't break the float comparisons in the picker JS."""
+def _known_good_key(platform: str, family: str = "") -> str:
+    """Which overlay field holds the known-good version for this family.
+
+    ⭐ THE VERSION IS ONLY MEANINGFUL INSIDE ITS FAMILY. "4.6" names a real
+    Sonnet and, on the same account, an Opus that may never have existed —
+    yet the overlay had ONE `known_good` slot per platform. Once a non-pro run
+    could verify and record, a later pro run's step-back would pin Opus to a
+    number learned from Sonnet, the picker would find no row within 0.001 of it,
+    and the single retry the step-back exists to provide would be spent looking
+    for a model that was never on the menu.
+
+    The primary family keeps the bare `known_good` key, so nothing already on
+    disk is stranded and no migration is needed; only additional families get a
+    suffix. `family` is already restricted to [a-z0-9 ] by `_family_word`, so
+    the only transform needed is spaces → underscore."""
+    fam = (family or "").strip().lower()
+    if not fam or fam == p2_family(platform):
+        return "known_good"
+    return "known_good_" + fam.replace(" ", "_")
+
+
+def p2_known_good(platform: str, family: str = ""):
+    """The last verified-working model version for a platform+family (the C1
+    fallback target when the latest can't be verified). None until a real run
+    records one (see record_known_good). Coerced to float so a stringly-typed
+    overlay value can't break the float comparisons in the picker JS."""
     # ⚠ isinstance, not `.get(platform, {})` and not `or {}`. The dict default
     # only fires when the KEY IS MISSING, and `or {}` only when the value is
     # FALSY — a hand-edited overlay whose platform maps to a truthy scalar
     # ({"claude": 4.8}) slips past both and `.get` raises AttributeError. This
     # reader's one caller is the step-back path, so the crash would land at
     # exactly the recovery moment and kill the agent instead of parking it.
-    raw = _platform_entry(platform).get("known_good")
+    raw = _platform_entry(platform).get(_known_good_key(platform, family))
     try:
         return float(raw) if raw is not None else None
     except (TypeError, ValueError):
@@ -645,10 +859,11 @@ def record_probe(platform: str, *, saw_menu: bool) -> bool:
         platform, last_probe=time.time(), last_probe_saw_menu=bool(saw_menu))
 
 
-def record_known_good(platform: str, version) -> bool:
+def record_known_good(platform: str, version, family: str = "") -> bool:
     """On-the-fly learning: record `version` as the last verified-working model
-    for `platform` so the pin fallback tracks the latest PROVEN model as
-    platforms advance.
+    for `platform` (within `family`) so the pin fallback tracks the latest
+    PROVEN model as platforms advance. See `_known_good_key` for why the family
+    is part of the identity and not a detail.
 
     ⛔ THIS IS NOT A PICKER FLOOR. It is only the target the pipeline pins to
     when the newest model fails to enter Deep Research. Using it as a floor
@@ -666,13 +881,14 @@ def record_known_good(platform: str, version) -> bool:
         return False
     if v <= 0:
         return False
-    cur = _platform_entry(platform).get("known_good")
+    key = _known_good_key(platform, family)
+    cur = _platform_entry(platform).get(key)
     try:
         if cur is not None and abs(float(cur) - v) < 0.001:
             return False  # unchanged — skip the write
     except (TypeError, ValueError):
         pass
-    return _merge_overlay_entry(platform, known_good=v)
+    return _merge_overlay_entry(platform, **{key: v})
 
 
 def parse_family_version(text: str, family: str):
@@ -758,12 +974,146 @@ def has_family(text: str, family: str) -> bool:
     return bool(family) and family.lower() in (text or "").lower()
 
 
-def pick_highest_model(labels, family: str, below=None, reject=()):
+# The one character JS calls whitespace and Python does not. `str.isspace()`
+# covers everything else JS's `\s` matches, and then some.
+# ⚠ Spelled as an ESCAPE deliberately — a literal BOM here is invisible in every
+# editor and diff, which is how a character like this survives review.
+_WS_EXTRA = "\ufeff"
+
+
+def _collapse_ws(s: str) -> str:
+    """Runs of whitespace → one space, over a set the JS ports match EXACTLY.
+
+    ⛔ `" ".join(s.split())` is NOT that set, and the difference is measurable.
+    Python treats `\\x1c`-`\\x1f` and `\\x85` as whitespace and JS does not; JS
+    treats `\\ufeff` (a BOM, which does turn up in page text) as whitespace and
+    Python does not. Since the upsell window is counted in CHARACTERS on the
+    collapsed string, a label padded with either class is an upsell to one
+    implementation and a model row to the other — so the mirror and the shipped
+    JS disagree about whether to click it. Measured, on the real ported code,
+    before this existed.
+
+    The union is the safe direction for both: `isspace()` here plus the BOM, and
+    JS's own `\\s` plus the separators and NEL it lacks. Character-level rather
+    than a regex, like everything else this file mirrors into embedded JS.
+    """
+    out: list = []
+    prev_ws = True                      # leading run is dropped, like .strip()
+    for ch in s or "":
+        if ch.isspace() or ch in _WS_EXTRA:
+            if not prev_ws:
+                out.append(" ")
+            prev_ws = True
+        else:
+            out.append(ch)
+            prev_ws = False
+    return "".join(out).rstrip()
+
+
+def is_upsell(text: str, noun: str, window: int = UPSELL_WINDOW) -> bool:
+    """Is this row a SALES PROMPT for `noun` rather than an offer of it?
+
+    ⭐ "Upgrade to Opus" and "Get Opus with Max" name the family exactly the way
+    a real menu row does, so every rule that decides a row is a candidate —
+    `has_family`, `parse_family_version` — says yes to both. Without this the
+    ranker treats a billing chip as a model and CLICKS it: the upsell surface
+    opens over the composer, the click returns truthy, and the caller reports a
+    successful model selection while the phase types into a page sitting behind
+    a modal. A version-less chip wins the shortest-label tie-break outright, and
+    a VERSIONED one ("Upgrade to Opus 5.2") is worse — it parses, so it competes
+    on rank with the real rows and can beat every one of them.
+
+    ⭐ VERB-THEN-NOUN WITHIN A WINDOW, not a bare verb test, and the difference
+    is what keeps this from emptying the menu. Row text here is title and
+    description CONCATENATED (`parse_family_version` documents that shape), so a
+    blurb reading "try our most capable model" would disqualify a genuine row
+    under a bare verb rule — the same silent-empty-menu failure the version-less
+    fallback exists to prevent. Requiring the noun to FOLLOW the verb also
+    leaves "Opus 5 — upgrade for more usage" selectable, which is correct: that
+    row is the model, with a sales tail.
+
+    ⚠ Residual, stated rather than papered over: a verb-less upsell ("Opus 5 ·
+    Max plan only") is not caught. Nothing in that text distinguishes it from a
+    row, so the verb is the honest boundary.
+
+    Deliberately regex-free, like `reject_matches`, and for the same reason —
+    this is mirrored into a non-raw Python string holding JS, where a lone \\b
+    once became a literal backspace and silently disabled a gate for months
+    (the #913 note).
+
+    ⚠ Whitespace is collapsed INSIDE this function rather than by its callers,
+    because the window is measured in characters: a row rendered across three
+    lines puts newlines and indentation between the verb and the noun, and the
+    same chip would be an upsell in one DOM and not in another. The JS port
+    collapses in the same place, over `_collapse_ws`'s character set rather than
+    each language's own idea of whitespace — see there.
+
+    ⭐⭐ A "FAMILY NAMED FIRST" EXEMPTION WAS TRIED AND REVERTED, 2026-08-14.
+    The idea was that a verb AFTER the first mention of the family describes a
+    row rather than selling one, so "Opus 5 — try Opus with extended thinking"
+    would stay selectable. It was written to answer a review concern that this
+    guard could discard a genuine row whose blurb happens to read
+    verb-then-family.
+
+    It was reverted because it demonstrably re-opened the blocking finding.
+    Driven through the SHIPPED picker JS, a menu of
+
+        ["Opus 5 · Upgrade to Opus Max for more usage", "Opus 4.5", "Sonnet 4.6"]
+
+    clicked the first row and returned it as a confirmed pick at version 5 — a
+    billing surface over the composer plus a FALSE SUCCESS, which the review
+    called the failure mode hardest to notice, and a poisoned version feeding
+    the known-good machinery. The concern it was answering was hypothetical; the
+    failure it caused was reproduced. Confirmed beats plausible.
+
+    ⚠ THE RESIDUAL THIS ACCEPTS, stated rather than papered over: a genuine row
+    whose description re-names the family within 24 characters after a sales
+    verb IS excluded, and if a lower row is present the picker takes it. What
+    makes that the better side of the trade is direction — excluding costs a
+    downgrade to a model that still works, while including costs a modal over
+    the composer and a run reporting success into it. Claude's observed row
+    copy ("Our most capable model") does not re-name the family, so the shape
+    is unattested; the one this prevents is the shipped defect.
+
+    ⚠ Other residuals: a verb-less upsell ("Opus 5 · Max plan only") is not
+    caught. Nothing in that text distinguishes it from a row, so the verb is
+    the honest boundary."""
+    t = _collapse_ws(text).lower()
+    n = _collapse_ws(noun).lower()
+    if not t or not n:
+        return False
+    for raw in UPSELL_VERBS:
+        verb = str(raw).lower()
+        if not verb:
+            continue
+        i = t.find(verb)
+        while i != -1:
+            end = i + len(verb)
+            left_ok = i == 0 or not _ascii_alnum(t[i - 1])
+            right_ok = end >= len(t) or not _ascii_alnum(t[end])
+            if left_ok and right_ok:
+                j = t.find(n, end)
+                if j != -1 and j - end <= window:
+                    return True
+            i = t.find(verb, i + 1)
+    return False
+
+
+def pick_highest_model(labels, family: str, below=None, reject=(), drop_upsell=False):
     """From candidate dropdown-row labels, pick the row with the HIGHEST
     <family> version, REJECTING (checked first) any label that hits a reject
     term per `reject_matches` — the same rule the JS ranker runs, so this is a
     real mirror rather than a second opinion. Tie-break: shortest label (prefer
     a leaf row over a wrapper that concatenates several models).
+
+    `drop_upsell=True` additionally discards sales prompts for the family per
+    `is_upsell` — see there for why a billing chip is otherwise indistinguishable
+    from a model row, and why the exclusion runs regardless of whether the chip
+    carries a version. ⚠ It is OPT-IN rather than always-on so this stays a true
+    mirror of every JS ranker that calls it: the Claude ranker ports the rule and
+    passes it, the Gemini one does not yet, and a default-on rule would put this
+    function's answer at odds with the browser's on the path that has not been
+    ported — which is exactly how the reject rule drifted the first time.
 
     ⭐ NO FLOOR PARAMETER. "Highest offered" already cannot pick a downgrade —
     nothing else on the menu is higher — so a floor could only ever REJECT the
@@ -788,6 +1138,12 @@ def pick_highest_model(labels, family: str, below=None, reject=()):
             continue
         if reject_matches(t, rej):
             continue
+        # BEFORE the version parse, deliberately. A versioned upsell
+        # ("Upgrade to Opus 5.2") parses, so a check placed after — or one
+        # reached only on the version-less branch — would let the worst case
+        # through: a chip that competes on rank with the real rows.
+        if drop_upsell and is_upsell(t, family):
+            continue
         v = parse_family_version(t, family)
         if v is None and not has_family(t, family):
             continue
@@ -807,7 +1163,57 @@ def pick_highest_model(labels, family: str, below=None, reject=()):
     return best
 
 
-def p2_claude_setup_directive() -> str:
+def upsell_warning(noun: str) -> str:
+    """The sentence that tells a browser-driving agent a sales chip is not a model.
+
+    ⭐ WHY THIS EXISTS. The DOM picker learned to refuse upsell chips; the CUA
+    missions did not, and CUA is what runs AFTER the DOM tier fails — which, on
+    an account whose plan does not include the family, is EVERY run. So the
+    mission that said "open the model menu and select the HIGHEST Opus it offers"
+    was pointing the agent at the only Opus-shaped things on the page: the chips.
+    Refusing them in the selectors and then instructing an agent to click them is
+    not a fix, it is a relocation.
+
+    ⛔ The second half is the part that is easy to leave out and the reason the
+    first half is not enough. Told only "ignore the chips", an agent that finds
+    NOTHING else matching the family keeps hunting — and the most Opus-looking
+    thing on the page is still the chip. It has to be told what the absence
+    MEANS: the plan does not include this family, so stop looking.
+
+    Rendered from `UPSELL_VERBS`, like the ChatGPT tier mission's own warning, so
+    the missions and the selectors can never develop separate ideas of what a
+    sales prompt looks like.
+    """
+    cta = " / ".join(f'"{v.capitalize()} to {noun}"' for v in UPSELL_VERBS[:2])
+    return (
+        f"Ignore any {cta} button or menu row — that is a sales prompt for a paid "
+        f"plan, NOT a model, and clicking it opens a billing page over the "
+        f"composer. If the only {noun} rows on offer are sales prompts like that, "
+        f"this account's plan does not include {noun}: leave the model exactly as "
+        f"it is and move on."
+    )
+
+
+def free_family_note(excluded: str, use_instead: str) -> str:
+    """The sentence a CUA mission needs when the run has DELIBERATELY switched to
+    the fallback family.
+
+    ⛔ NOT `upsell_warning(excluded)`, and the difference is the whole point.
+    That sentence ends "leave the model exactly as it is and move on", which is
+    correct when the mission's target IS the family being sold — and flatly
+    contradicts a mission whose job is to go select a different family. Handing
+    an agent two instructions that disagree about whether to touch the model is
+    how a setup pass ends in neither.
+    """
+    return (
+        f"This account's plan does not include {excluded}: every {excluded} row in "
+        f"the model menu is a sales prompt that opens a billing page, not a model. "
+        f"Do not click one and do not read one as {excluded} being available — "
+        f"{use_instead} is the correct model on this account."
+    )
+
+
+def p2_claude_setup_directive(family: str = "") -> str:
     """The CUA user-instruction that drives Claude's P2 setup (model + effort +
     Research tool). Single source replacing the byte-identical literal
     previously duplicated at two research.py call sites.
@@ -823,23 +1229,35 @@ def p2_claude_setup_directive() -> str:
     unlike the validate string it must keep an upgrade lever: opening the menu
     here is the whole point of the fallback. The validate string
     (research.py's user_msg_map) is the one that says "leave it alone", because
-    it runs after a DOM setup that already succeeded."""
+    it runs after a DOM setup that already succeeded.
+
+    `family` overrides the target family for THIS call. It is passed the run's
+    active family, which is the primary one on every pro account and the
+    fallback on an account whose plan excludes it. ⛔ Defaulting to "" rather
+    than to the policy word is deliberate: the caller must be able to say
+    "whatever policy says" without knowing what that is, and the default render
+    stays byte-identical to the pre-fallback text."""
     pol = p2_labels("claude")
-    fam = str(pol.get("family", "opus")).capitalize()          # "Opus"
+    primary = str(pol.get("family", "opus"))
+    fam = (str(family) or primary).capitalize()                # "Opus" / "Sonnet"
     effort = str(pol.get("effort", "max")).capitalize()        # "Max"
     tool = str(pol.get("tool", "research")).capitalize()       # "Research"
+    # Only on the fallback path, and only about the family we are NOT using.
+    swapped = "" if fam.lower() == primary.lower() else \
+        f"{free_family_note(primary.capitalize(), fam)} "
     return (
-        f"Ensure the model is {fam} with {effort} effort and the {tool} tool ON. "
+        f"{swapped}Ensure the model is {fam} with {effort} effort and the {tool} tool ON. "
         f"Model rule: the model must be {fam} — the VERSION NUMBER DOES NOT MATTER "
         f"and a higher one is always correct. Open the model menu ONCE and select "
         f"the HIGHEST {fam} it offers; if the highest {fam} is already the selected "
-        f"one, close the menu without clicking it. If the button already shows "
-        f"{fam} and the menu will not open, that is fine — leave the model as it "
-        f"is. Do NOT type — just set up and focus input. Say 'ready for paste'."
+        f"one, close the menu without clicking it. {upsell_warning(fam)} If the "
+        f"button already shows {fam} and the menu will not open, that is fine — "
+        f"leave the model as it is. Do NOT type — just set up and focus input. "
+        f"Say 'ready for paste'."
     )
 
 
-def p2_claude_validate_directive() -> str:
+def p2_claude_validate_directive(family: str = "") -> str:
     """The CUA user-instruction for the POST-SETUP validation pass on Claude.
 
     ⚠ The mirror image of p2_claude_setup_directive, and the difference is
@@ -854,15 +1272,27 @@ def p2_claude_validate_directive() -> str:
     into the menu before self-correcting a step later. Lives here, beside the
     setup directive, so both CUA strings render from one policy and a test can
     read the FINAL text rather than grepping an f-string split across source
-    lines."""
+    lines.
+
+    ⛔⛔ `family` MATTERS MOST HERE, more than in the setup string. This mission
+    fires after a successful setup and its rule is "only touch the model if it
+    is not <fam> at all" — with <fam> frozen to Opus, a run that deliberately
+    selected the fallback family satisfies that trigger on EVERY pass, and the
+    validator is then pointed at a menu whose only Opus rows are the sales chips
+    the DOM layer just finished refusing. The correct model would be undone by
+    the pass whose job is to confirm it."""
     pol = p2_labels("claude")
-    fam = str(pol.get("family", "opus")).capitalize()
+    primary = str(pol.get("family", "opus"))
+    fam = (str(family) or primary).capitalize()
     effort = str(pol.get("effort", "max")).capitalize()
     tool = str(pol.get("tool", "research")).capitalize()
+    swapped = "" if fam.lower() == primary.lower() else \
+        f"{free_family_note(primary.capitalize(), fam)} "
     return (
-        f"Verify Claude is on {fam} with {effort} effort and the {tool} tool ON. "
+        f"{swapped}Verify Claude is on {fam} with {effort} effort and the {tool} tool ON. "
         f"THE VERSION NUMBER DOES NOT MATTER: if the model button reads {fam} "
         f"followed by any number — or by no number at all — the model is correct, "
         f"so leave it alone and do NOT open the model menu. Only touch the model "
-        f"if it is not {fam} at all. Clear any stale attachments. Do not type."
+        f"if it is not {fam} at all. {upsell_warning(fam)} Clear any stale "
+        f"attachments. Do not type."
     )

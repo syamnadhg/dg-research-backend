@@ -41,7 +41,13 @@ import research
 # Distinctive fragments of the real scripts inside setup_claude_dr. Matching on
 # these is what makes "did the popover open?" observable.
 _POPOVER_OPEN_MARK = "trigger.click()"           # Step 1A: clicks the model trigger
-_PICK_OPUS_MARK = "{pin, below, fam, triggerText}"   # Step 1B: the picker
+# ⚠ NO CLOSING BRACE. This is an IDENTIFICATION mark, not a contract, and
+# pinning the full parameter list made it one: adding `verbs`/`upsellWindow` for
+# the upsell exclusion stopped it matching, so this double silently answered
+# every pick with "nothing clickable" and six tests failed for a reason that had
+# nothing to do with what they assert. The signature itself is pinned once, on
+# purpose, in test_known_good_fallback.
+_PICK_OPUS_MARK = "{pin, below, fam, triggerText"   # Step 1B: the picker
 _PROBE_MARK = "menu: false"                      # Step 1B*: the read-only probe
 # 2026-08-05 (review, f3): was `t === 'effort'`, a fragment of the old predicate. The
 # candidate set is now filtered for anchors first — `li` is in it and claude.ai wraps

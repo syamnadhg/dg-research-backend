@@ -37,7 +37,8 @@ def test_pin_forces_exact_version_in_pickers():
     # Claude picker + Gemini ranker both branch on `pin` to target an EXACT
     # version, distinct from the default "highest offered" path.
     sc = code_only(inspect.getsource(research.setup_claude_dr))
-    assert "Math.abs(v - pin)" in sc and "({pin, below, fam, triggerText})" in sc
+    assert "Math.abs(v - pin)" in sc and (
+        "({pin, below, fam, triggerText, verbs, upsellWindow})" in sc)
     js = research._GEMINI_FLASH_RANK_JS
     assert "Math.abs(v - pin)" in js and "{below, doClick, pin, fam, reject, triggerText}" in js
 
@@ -96,8 +97,16 @@ def test_a_malformed_overlay_cannot_kill_the_step_back():
     moment. A scalar where a dict belongs used to raise AttributeError straight
     through the agent launch."""
     src = code_only(inspect.getsource(research.start_agent_no_gemini_wait))
-    i = src.find("_kg = p2_known_good(platform_l)")
+    # ⭐ The read is family-scoped now — a version is meaningless without the
+    # family it belongs to, and this call sits on the recovery path where a
+    # cross-family pin would spend the one-shot retry on a row that was never on
+    # the menu. Matched on the prefix so the family argument can be spelled
+    # however the caller needs; the guard below is what this test is about.
+    i = src.find("_kg = p2_known_good(platform_l")
     assert i != -1
+    assert "_kg = p2_known_good(platform_l)" not in src, (
+        "the step-back pin must name the family it is pinning within"
+    )
     assert "try:" in src[max(0, i - 60):i], "the read must be guarded at the call site"
     # …and the reader itself must not blow up on a non-dict platform entry.
     import json as _json
@@ -156,7 +165,10 @@ def test_fallback_runs_before_the_chat_mode_gate_and_is_single_shot():
     assert 'platform_l in ("claude", "gemini")' in src
     # Fallback target: the learned known-good, else "the highest below the one
     # that failed". Never a literal, and never nothing.
-    assert "_kg = p2_known_good(platform_l)" in src
+    # Prefix-matched: the read carries the family it is pinning WITHIN (see
+    # test_a_malformed_overlay_cannot_kill_the_step_back), and what this line is
+    # asserting is that a learned value is consulted at all.
+    assert "_kg = p2_known_good(platform_l" in src
     assert "_below = _failed_f" in src
     # Single-shot: the fallback block must not introduce a retry LOOP construct
     # (it's a straight-line `if`). Guard on actual loop syntax, not the English

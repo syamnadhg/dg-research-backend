@@ -87,7 +87,17 @@ AUTH_SUBMODULES = ["v2_flow", "keystore", "credentials", "pairing"]
 # .py added to scripts/ is packed into the wheel automatically, and this hardcoded
 # tuple is the ONLY thing keeping these two out. Add a new admin script to scripts/
 # and it ships, readable, unless you also add it here.
-DROP_FROM_WHEEL = ("scripts/dump_push_audit.py", "scripts/admin_cleanup_stale_ongoing.py")
+#
+# ⭐ 2026-08-14 — `claude_popover_capture.py` joined them, and for a reason worth
+# stating: it is not merely useless in a wheel, it is BROKEN there. It does
+# `import research` and then reaches for `research.p2_family` / `research.Browser`
+# / `research.PROFILE_DIR`, and in the wheel `research` is the SHIM below, which
+# exports `main` and nothing else. Same root cause as the vision/narrate key
+# lookups fixed on 2026-08-13; this instance shipped in every wheel, failing with
+# an AttributeError the moment anyone ran it. A source-tree diagnostic has no
+# business in a user's install either way.
+DROP_FROM_WHEEL = ("scripts/dump_push_audit.py", "scripts/admin_cleanup_stale_ongoing.py",
+                   "scripts/claude_popover_capture.py")
 
 SHIM = '''#!/usr/bin/env python3
 """Launcher shim for the COMPILED Super Research build.

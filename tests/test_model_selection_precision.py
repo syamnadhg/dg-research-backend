@@ -145,7 +145,10 @@ def test_the_weekly_upgrade_end_to_end_selects_the_row_not_the_wrapper():
     wrapper and the account stayed on 4.8."""
     spec = _claude_menu_with_wrapper()
     probe = run_js(spec, _claude_probe_js(), {"fam": "opus"})
-    assert probe["ret"] == {"menu": True, "n": probe["ret"]["n"], "highest": 5.0}
+    # `chips` rides along on every probe result — it is what tells a plan limit
+    # from a rename one layer up. Zero here: this menu offers genuine rows.
+    assert probe["ret"] == {"menu": True, "n": probe["ret"]["n"], "highest": 5.0,
+                            "chips": 0, "chipsAny": False}
     offered = probe["ret"]["highest"]
     cur = 4.8
     assert offered > cur + 0.001, "the upgrade branch must be the one taken"

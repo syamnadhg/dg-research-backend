@@ -16,7 +16,7 @@ import inspect
 import os
 
 research = importlib.import_module("research")
-from conftest import code_only  # noqa: E402
+from conftest import apply_firestore_update, code_only  # noqa: E402
 
 
 # ── _perform_self_update: the headless decision core ──────────────────────────
@@ -163,7 +163,10 @@ class _FakeDocRef:
         return _Snap(data)
 
     def update(self, patch):
-        self._store.setdefault(self._path, {}).update(patch)
+        # Real Firestore semantics, dotted field paths included — see the note
+        # on the helper. Without them a refusal's `updateStatus.state` would be
+        # stored as a literal flat key and `_status()` would read an empty map.
+        apply_firestore_update(self._store.setdefault(self._path, {}), patch)
 
 
 class _FakeColl:

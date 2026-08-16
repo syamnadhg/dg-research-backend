@@ -92,13 +92,148 @@ def test_the_console_scan_can_actually_fire() -> None:
     assert not any(kw.arg == "creationflags" for kw in calls[0].keywords)
 
 
-def test_narrate_probe_matches_the_research_twin() -> None:
-    """The two implementations are copies of each other; they must not drift again."""
-    src = NARRATE.read_text(encoding="utf-8")
-    assert "CREATE_NO_WINDOW" in src, (
-        "narrate.py no longer references CREATE_NO_WINDOW — the User-scope env probe "
-        "is a twin of research.py's _read_user_scope_env and needs the same flag"
+RESEARCH = REPO / "research.py"
+
+# The two copies of the Windows User-scope env probe. They are twins by
+# intention, not by accident, and they have already drifted once — the
+# CREATE_NO_WINDOW flag went missing from the narrate side inside the very
+# commit that aligned them.
+_TWINS = (
+    (RESEARCH, "_read_user_scope_env"),
+    (NARRATE, "_read_user_scope_env_safe"),
+)
+
+
+def _powershell_probe(path: Path, func_name: str) -> "tuple[ast.Module, ast.AST, ast.Call]":
+    """The one `subprocess.run` inside a named function, with the module and
+    function nodes around it. Raises if either the function or the call is gone,
+    so a rename cannot quietly empty this guard."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+               and n.name == func_name), None)
+    assert fn is not None, f"{path.name} no longer defines {func_name}()"
+    calls = [c for c in ast.walk(fn) if isinstance(c, ast.Call)
+             and isinstance(c.func, ast.Attribute) and c.func.attr == "run"]
+    assert len(calls) == 1, (
+        f"{path.name}:{func_name}() has {len(calls)} subprocess.run calls, not 1 — "
+        f"this comparison no longer knows which one is the probe"
     )
+    return tree, fn, calls[0]
+
+
+def _shape(call: ast.Call) -> tuple:
+    """The comparable shape of a spawn: its argv with interpolations collapsed
+    to a placeholder, plus every keyword except the flags value.
+
+    Collapsing the f-string is what makes the two sides comparable at all —
+    one interpolates `name` into the PowerShell command, and the literal text
+    around it is the part that must not drift. The creationflags VALUE is
+    excluded here because the two sides reach it by different NAMES; it is
+    compared separately, after each name is resolved.
+    """
+    argv: list = []
+    first = call.args[0] if call.args else None
+    assert isinstance(first, ast.List), "the probe no longer passes a literal argv"
+    for el in first.elts:
+        if isinstance(el, ast.Constant):
+            argv.append(el.value)
+        elif isinstance(el, ast.JoinedStr):
+            argv.append("".join(
+                p.value if isinstance(p, ast.Constant) else "{}" for p in el.values))
+        else:
+            argv.append("<expr>")
+    kwargs = {}
+    for kw in call.keywords:
+        if kw.arg == "creationflags":
+            continue
+        kwargs[kw.arg] = (kw.value.value if isinstance(kw.value, ast.Constant)
+                          else "<expr>")
+    return tuple(argv), tuple(sorted(kwargs.items()))
+
+
+def test_narrate_probe_matches_the_research_twin() -> None:
+    """The two implementations are copies of each other; they must not drift again.
+
+    ⚠ This used to assert `"CREATE_NO_WINDOW" in src` — a substring that a
+    COMMENT satisfies, that says nothing about whether the flag reaches the
+    spawn, and that cannot see any other kind of divergence at all: a changed
+    PowerShell command, a different timeout, a dropped `capture_output`. It was
+    named for drift detection while being unable to detect drift. The reviewer
+    was right to call it out; this compares the two calls.
+    """
+    shapes = {}
+    for path, fn_name in _TWINS:
+        probe = _powershell_probe(path, fn_name)
+        shapes[path.name] = (_shape(probe[2]), _flags_source(*probe))
+    (a_name, a), (b_name, b) = shapes.items()
+    assert a == b, (
+        f"the User-scope env probes in {a_name} and {b_name} have drifted:\n"
+        f"  {a_name}: {a}\n  {b_name}: {b}"
+    )
+
+
+def _flags_source(tree: ast.Module, fn: ast.AST, call: ast.Call) -> "str | None":
+    """The `creationflags` expression, resolved one hop through whichever name
+    the call uses — a local inside the probe, or a module-level constant.
+
+    Necessary because the two twins spell the same value differently: research
+    hoists it into the module constant `_PS_NO_WINDOW` (it has many PowerShell
+    spawns), narrate binds a local `no_window` (it has one). Comparing the
+    spellings would fail on a difference that is not drift; resolving them
+    compares what each actually passes.
+
+    ⚠ Cannot be a runtime read: both evaluate to 0 off Windows, so every host in
+    CI would see "no flag" and "the right flag" as identical.
+    """
+    flags = next((kw for kw in call.keywords if kw.arg == "creationflags"), None)
+    if flags is None:
+        return None
+    if isinstance(flags.value, ast.Name):
+        want = flags.value.id
+        for scope in (fn, tree):
+            for node in ast.walk(scope):
+                if isinstance(node, ast.Assign) and any(
+                        isinstance(t, ast.Name) and t.id == want
+                        for t in node.targets):
+                    return ast.unparse(node.value)
+    return ast.unparse(flags.value)
+
+
+def test_both_twins_pass_a_no_window_flag() -> None:
+    """The specific drift that shipped. `_shape` excludes the flags VALUE so the
+    two sides may name it differently; that each one passes it is not optional,
+    because the serve worker is console-less and Windows hands any console child
+    a brand-new visible window without it."""
+    for path, fn_name in _TWINS:
+        src = _flags_source(*_powershell_probe(path, fn_name))
+        assert src is not None, (
+            f"{path.name}:{fn_name}() spawns PowerShell with no creationflags — one "
+            f"black window on the user's desktop per call"
+        )
+        assert "CREATE_NO_WINDOW" in src, (
+            f"{path.name}:{fn_name}() passes creationflags, but not the no-window "
+            f"flag: {src}"
+        )
+
+
+def test_the_twin_comparison_can_actually_fire() -> None:
+    """Guard against the guard, and the reason this rewrite exists: prove the
+    comparison FAILS on a divergence. The assertion it replaced passed against
+    a probe with the flag missing entirely."""
+    drifted = ast.parse(
+        "import subprocess\n"
+        "def probe(name):\n"
+        "    return subprocess.run(\n"
+        "        ['powershell.exe', '-NoProfile', '-Command',\n"
+        "         f\"[System.Environment]::GetEnvironmentVariable('{name}','Machine')\"],\n"
+        "        capture_output=True, text=True, timeout=9)\n"
+    )
+    call = next(c for c in ast.walk(drifted) if isinstance(c, ast.Call)
+                and isinstance(c.func, ast.Attribute) and c.func.attr == "run")
+    real = _shape(_powershell_probe(*_TWINS[0])[2])
+    assert _shape(call) != real, "the shape comparison cannot see a real divergence"
+    assert not any(kw.arg == "creationflags" for kw in call.keywords)
 
 
 # ── 2. pipx's bundled uv is reachable on Windows ──────────────────────────────

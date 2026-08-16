@@ -32,7 +32,9 @@ from typing import Any
 import requests
 
 # Central model registry — see research-automate/models.py.
-from models import GEMINI_NARRATE, GEMINI_NARRATE_FALLBACK
+from models import (GEMINI_NARRATE, GEMINI_NARRATE_FALLBACK, core_attr,
+                    gemini_empty_reason as _gemini_empty_reason,
+                    gemini_gen_config)
 
 logger = logging.getLogger("narrate")
 
@@ -167,13 +169,17 @@ async def narrate_panel(
         return None
 
     # Prefer the user's Account-page key (Firestore apiKeys.gemini) over
-    # any env. Late import to dodge the research↔narrate cycle —
-    # narrate is imported by research.py, so by the time
-    # narrate_panel runs, research.resolve_gemini_api_key is fully defined.
+    # any env. Resolved through `models.core_attr` rather than
+    # `from research import …` — the core is `_sr_core` in the compiled wheel
+    # and `research.py` there is a launcher shim that does not export this name,
+    # so the direct import raised in EVERY shipped build, was swallowed, and the
+    # Account-page key became unreachable. `core_attr` also dodges the
+    # research↔narrate cycle the late import was originally for: it reads an
+    # already-imported module first.
     api_key = ""
     try:
-        from research import resolve_gemini_api_key as _resolve
-        api_key = _resolve() or ""
+        _resolve = core_attr("resolve_gemini_api_key")
+        api_key = (_resolve() or "") if _resolve else ""
     except Exception:
         api_key = ""
     if not api_key:
@@ -285,28 +291,34 @@ def _call_gemini(api_key: str, model: str, png: bytes, user_msg: str) -> dict:
             ],
         }],
         "systemInstruction": {"parts": [{"text": _SYSTEM_PROMPT}]},
-        "generationConfig": {
-            "temperature": 0.1,
-            # 2026-08-05: 600 → 1400. The ceiling was sized for a request that
-            # disabled thinking, and thinking is no longer disabled — see below.
-            "maxOutputTokens": 1400,
-            "responseMimeType": "application/json",
-            "responseSchema": _RESPONSE_SCHEMA,
-            # ⚠ 2026-08-05 — `thinkingConfig: {"thinkingBudget": 0}` REMOVED.
-            # The live endpoint rejects it with HTTP 400 INVALID_ARGUMENT, and
-            # names no field, so the fault was only findable by differential: the
-            # vision-URL extractor sends the same model and path WITHOUT this
-            # field and gets 200 in the same process where every request carrying
-            # it fails. All four builders that had it are now clean; this module
-            # keeps its own literal config because it also sends a responseSchema.
-            #
-            # The original reason for disabling thinking was real — with thinking
-            # ON, structured JSON could truncate mid-field — so the budget above
-            # rose to cover reasoning plus the schema. `DG_GEMINI_THINKING_BUDGET`
-            # re-enables the field for anyone testing a model that accepts it;
-            # this module deliberately does NOT read it, since a truncated
-            # responseSchema is a worse failure here than a slow one.
-        },
+        # ⚠ 2026-08-05 — `thinkingConfig: {"thinkingBudget": 0}` REMOVED. The
+        # live endpoint rejects it with HTTP 400 INVALID_ARGUMENT, and names no
+        # field, so the fault was only findable by differential: the vision-URL
+        # extractor sends the same model and path WITHOUT this field and gets 200
+        # in the same process where every request carrying it fails.
+        #
+        # 2026-08-13 — and this is no longer a hand-rolled fifth copy. It was the
+        # one builder research.py's consolidation could not absorb (a compiled
+        # sibling cannot import from the core), so it sat here taking the same
+        # fixes by hand; the shared builder now lives in `models`, which both
+        # sides already import.
+        #
+        # ⛔ `thinking_budget_env=False` is the whole reason the shared builder
+        # takes that argument. The original reason for disabling thinking was
+        # real — with thinking ON, structured JSON could truncate mid-field — so
+        # the ceiling below covers reasoning PLUS the schema (600 → 1400 on
+        # 2026-08-05). `DG_GEMINI_THINKING_BUDGET` re-enables the rejected field
+        # for anyone testing a model that accepts it, and this module must not
+        # honour it: a truncated `responseSchema` is a worse failure here than a
+        # slow one. Consolidating without this flag would have silently handed
+        # that decision to an env var.
+        "generationConfig": gemini_gen_config(
+            temperature=0.1,
+            max_tokens=1400,
+            thinking_budget_env=False,
+            responseMimeType="application/json",
+            responseSchema=_RESPONSE_SCHEMA,
+        ),
     }
     t0 = time.time()
     try:
@@ -324,6 +336,17 @@ def _call_gemini(api_key: str, model: str, png: bytes, user_msg: str) -> dict:
         text = (j.get("candidates", [{}])[0]
                   .get("content", {}).get("parts", [{}])[0]
                   .get("text", ""))
+        if not (text or "").strip():
+            # ⭐ A 200 that carried no text is not a parse fault, and reporting it
+            # as one sends the next reader after the JSON decoder. The response
+            # already says why — `finishReason=MAX_TOKENS` means the budget went
+            # on reasoning (a config value, and the reason the ceiling above is
+            # 1400), `blockReason` means the prompt is ours to change. This was
+            # the last Gemini leg in the product still describing the parser
+            # instead of the cause.
+            return {"ok": False, "status": resp.status_code,
+                    "error": f"empty 200: {_gemini_empty_reason(j)}",
+                    "latency_ms": latency_ms}
         data = json.loads(text)
     except Exception as e:
         return {"ok": False, "status": resp.status_code,
@@ -372,17 +395,29 @@ def _read_user_scope_env_safe(name: str) -> str:
     invisible. Every other powershell/schtasks/wmic spawn in the codebase already
     passes it; this one was missed.
 
-    It matters more in the compiled wheel than it looks. narrate.py's preferred key
-    lookup is `from research import resolve_gemini_api_key`, but in the wheel
-    research.py is only the launcher shim and does not export that name — the import
-    raises, is swallowed, and THIS fallback becomes the sole Gemini key lookup. So
-    the path runs for anyone whose key lives in Firestore or User-scope rather than
-    the serve process's own environment, not just for users with no key at all."""
+    ⓘ It used to matter far more in the compiled wheel than it looks, and that is
+    now fixed rather than merely documented. The preferred lookup was
+    `from research import resolve_gemini_api_key`, but in the wheel research.py is
+    only the launcher shim and does not export that name — so the import raised,
+    was swallowed, and THIS fallback became the SOLE Gemini key lookup, off
+    Windows returning "" unconditionally. Anyone whose key lived in Firestore had
+    no narrator at all. The lookup now goes through `models.core_attr`, which
+    finds the core under either name, so this is back to being what it says it
+    is: the User-scope leg of the ladder."""
     if sys.platform != "win32":
         return ""
     try:
         import subprocess
-        no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        # The platform guard is mirrored from research.py's `_PS_NO_WINDOW`, and
+        # it is redundant HERE — the early return above means this line only ever
+        # runs on Windows. It is written anyway because the unguarded form is the
+        # shape the original was already fixed for: passing a non-zero
+        # `creationflags` off Windows raises `ValueError: creationflags is only
+        # supported on Windows platforms`, which once made every `--serve`
+        # respawn explode in the daemon loop. A twin that re-acquires a shape its
+        # original was repaired for is one early-return away from repeating it.
+        no_window = (getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                     if sys.platform == "win32" else 0)
         r = subprocess.run(
             ["powershell.exe", "-NoProfile", "-Command",
              f"[System.Environment]::GetEnvironmentVariable('{name}','User')"],

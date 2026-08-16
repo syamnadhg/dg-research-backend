@@ -94,7 +94,6 @@ from prompts import (
     PROMPT_CHATGPT_DEEP_RESEARCH,
     PROMPT_CHATGPT_DISABLE_DR,
     PROMPT_CHATGPT_DOWNLOAD_MD,
-    PROMPT_CLAUDE_DEEP_RESEARCH,
     PROMPT_CLAUDE_DOWNLOAD_MD,
     PROMPT_CLICK_SEND,
     PROMPT_COPY_ARTIFACT_CHATGPT,
@@ -118,8 +117,9 @@ from prompts import (
     PROMPT_SHARE_GEMINI,
     PROMPT_SUBMIT_FALLBACK,
     PROMPT_VALIDATE_CHATGPT_SETUP,
-    PROMPT_VALIDATE_CLAUDE_SETUP,
     PROMPT_VALIDATE_GEMINI_SETUP,
+    claude_deep_research_prompt,
+    claude_validate_setup_prompt,
     make_prompt_audio_check,
     make_prompt_audio_download,
     make_prompt_audio_generate,
@@ -137,12 +137,17 @@ from models import (
     TITLE_HAIKU,
     GEMINI_TEXT,
     GEMINI_NARRATE,
+    UPSELL_VERBS,
+    UPSELL_WINDOW,
+    gemini_empty_reason as _models_gemini_empty_reason,
+    gemini_gen_config as _models_gemini_gen_config,
     p1_words,
     has_term,
     has_thinking_control,
     pick_effort_tier,
     overlay_path,
     p2_family,
+    p2_free_family,
     p2_known_good,
     p2_labels,
     p2_claude_setup_directive,
@@ -205,6 +210,21 @@ if sys.stderr is not None:
 PROFILE_DIR = Path.home() / ".super-research" / "browser-profile"
 
 
+def _strip_exe(basename: str) -> str:
+    """`"superresearch.exe"` -> `"superresearch"`; everything else unchanged.
+
+    Windows names an installed console script `<pkg>.exe`, so every check that
+    compares a process basename against our script name has to come through
+    here or it can never match on the one platform that spells it differently.
+    Extracted because it was inlined in `_prog_name` and MISSING from
+    `_looks_like_our_backend` — where the consequence was a Windows backend
+    reading as a stranger, and the port-reclaim path refusing to boot rather
+    than reclaiming our own stale port.
+    """
+    b = basename or ""
+    return b[:-4] if b.lower().endswith(".exe") else b
+
+
 def _prog_name() -> str:
     """The command users should type to re-invoke this CLI, matching HOW the
     process was launched:
@@ -222,7 +242,7 @@ def _prog_name() -> str:
         base = Path(sys.argv[0] or "").name
     except Exception:
         return "python research.py"
-    stem = base[:-4] if base.lower().endswith(".exe") else base
+    stem = _strip_exe(base)
     return "superresearch" if stem.lower() == "superresearch" else "python research.py"
 
 
@@ -1083,8 +1103,32 @@ def get_env(name):
     return val
 
 
+def _read_device_key_doc(uid: str, device_id: str) -> dict:
+    """Read users/{uid}/deviceKeys/{device_id} — THIS machine's own BE keys.
+
+    One document per computer, and the rule lets a device read only the one
+    named after its own deviceId claim. That is what makes a SHARER's key for
+    this machine readable here without the rest of their prefs doc — their
+    account-wide keys, their pair-code-lock hash, their delivery address —
+    coming along with it.
+
+    Fail-open: any error returns {} so resolution degrades to the flat /
+    local chain instead of dying."""
+    if not uid or not device_id or _firebase_db is None:
+        return {}
+    try:
+        snap = _firebase_db.collection("users").document(uid) \
+            .collection("deviceKeys").document(device_id).get()
+        return (snap.to_dict() or {}) if snap.exists else {}
+    except Exception as e:
+        log(f"[_read_firestore_api_keys] device key doc read failed (non-fatal): {e}", "WARN")
+        return {}
+
+
 def _read_firestore_api_keys() -> dict:
-    """Best-effort read of users/{paired_uid}/settings/prefs → apiKeys.
+    """Best-effort read of the paired user's API keys — the account-wide ones
+    from users/{uid}/settings/prefs → apiKeys, and this machine's own from
+    users/{uid}/deviceKeys/{deviceId}.
     Returns dict of {gemini, anthropic, deepgram} strings (any subset),
     or empty dict if unpaired / Firestore unreachable / uid unknown.
 
@@ -1105,21 +1149,32 @@ def _read_firestore_api_keys() -> dict:
             # Firestore not initialized yet (e.g. startup path that
             # hasn't called initialize_firebase_admin). Skip quietly.
             return {}
+        did = load_device_id()
+        # Account-wide (legacy flat) keys — still in settings/prefs, which this
+        # machine may read because it BELONGS to this user. A missing prefs doc
+        # is no longer a reason to give up: the per-device doc below is a
+        # separate document and may well exist on its own.
+        keys = {}
         snap = _firebase_db.collection("users").document(uid) \
             .collection("settings").document("prefs").get()
-        if not snap.exists:
-            return {}
-        data = snap.to_dict() or {}
-        keys = data.get("apiKeys") or {}
-        did = load_device_id()
-        merged = _overlay_device_keys(keys, did)
+        if snap.exists:
+            keys = (snap.to_dict() or {}).get("apiKeys") or {}
+        # This machine's own key doc — the canonical home since the byDevice
+        # map moved out of prefs. Outranks anything the legacy map still holds.
+        device_doc = _read_device_key_doc(uid, did)
+        merged = _overlay_device_keys(keys, did, device_doc)
         # Observability (#928): name WHICH fields this device overrides —
         # field names only, values never logged. Change-only, so the 60s
-        # resolve cadence doesn't spam the log.
-        _dev = (keys.get("byDevice") or {}).get(did) if did else None
-        _dev_fields = sorted(
-            k for k, v in _dev.items() if isinstance(v, str) and v.strip()
-        ) if isinstance(_dev, dict) else []
+        # resolve cadence doesn't spam the log. Both homes count, so the line
+        # doesn't go quiet the moment a key migrates.
+        _dev_legacy = (keys.get("byDevice") or {}).get(did) if did else None
+        _dev_fields = sorted({
+            k
+            for src in (_dev_legacy, device_doc)
+            if isinstance(src, dict)
+            for k, v in src.items()
+            if isinstance(v, str) and v.strip()
+        })
         _prev = _DEVICE_KEY_OVERRIDE_MEMO.get("fields")
         if _dev_fields != _prev:
             _DEVICE_KEY_OVERRIDE_MEMO["fields"] = _dev_fields
@@ -1137,8 +1192,8 @@ def _read_firestore_api_keys() -> dict:
         s_fields = []
         if submitter and submitter != uid:
             try:
-                s_keys = _read_submitter_prefs_keys(submitter)
-                merged, s_fields = _overlay_submitter_keys(merged, s_keys, did)
+                s_keys = _read_submitter_device_keys(submitter, did)
+                merged, s_fields = _overlay_submitter_keys(merged, s_keys)
             except Exception:
                 s_fields = []
         if (s_fields, submitter) != (_SHARER_KEY_OVERRIDE_MEMO["fields"], _SHARER_KEY_OVERRIDE_MEMO["uid"]):
@@ -1158,19 +1213,27 @@ def _read_firestore_api_keys() -> dict:
 _DEVICE_KEY_OVERRIDE_MEMO = {"fields": None}
 
 
-def _overlay_device_keys(keys, device_id):
+def _overlay_device_keys(keys, device_id, device_doc=None):
     """Merge THIS device's per-device key overrides over the flat
     account-wide keys. Pure — unit-testable without Firestore.
 
-    #928 (2026-07-09): the FE Account page writes device-scoped keys at
-    apiKeys.byDevice.{deviceId}.{anthropic,gemini} (owner-only by the
-    settings/prefs write rule — sharers can't read or write them, unlike
-    the sharer-readable device doc). A device's own entry OUTRANKS the
-    flat account-wide key so each research computer can run its own key;
-    the flat keys stay as the account-wide fallback for devices without
-    an override, so pre-#928 installs keep working unchanged. An empty
-    per-device value never shadows a flat key (empties are filtered), so
-    clear-on-the-FE cleanly reverts this device to flat → local env.
+    #928 (2026-07-09): the FE Account page writes device-scoped keys the
+    research computer overlays over the flat account-wide key, so each
+    computer can run its own. The flat keys stay as the account-wide
+    fallback for devices without an override, so pre-#928 installs keep
+    working unchanged. An empty per-device value never shadows a flat key
+    (empties are filtered), so clear-on-the-FE cleanly reverts this device to
+    flat → local env.
+
+    THREE layers, lowest first:
+      1. flat account-wide keys from settings/prefs.apiKeys
+      2. the LEGACY apiKeys.byDevice.{deviceId} map, still in that same doc
+         for anyone who hasn't signed in since the move
+      3. `device_doc` — users/{uid}/deviceKeys/{deviceId}, the canonical home
+
+    Layer 3 outranks layer 2 because the FE writes only layer 3 now, and its
+    sign-in sweep deletes layer 2 once it has been copied across; a value
+    still in layer 2 during that window is by definition the older one.
 
     Strips + filters empty values so callers can treat any present key
     as authoritative."""
@@ -1185,6 +1248,10 @@ def _overlay_device_keys(keys, device_id):
             for k, v in dev.items():
                 if isinstance(v, str) and v.strip():
                     flat[k] = v.strip()
+    if isinstance(device_doc, dict):
+        for k, v in device_doc.items():
+            if isinstance(v, str) and v.strip():
+                flat[k] = v.strip()
     return flat
 
 
@@ -1193,21 +1260,25 @@ def _overlay_device_keys(keys, device_id):
 # overrides (names only, never values); `uid` = that submitter.
 _SHARER_KEY_OVERRIDE_MEMO = {"fields": None, "uid": None}
 
-# #938: only these fields may be overridden by a sharer — a stray byDevice
-# field (e.g. deepgram) must never shadow the owner's value.
+# #938: only these fields may be overridden by a sharer — a stray field in
+# their key doc (e.g. deepgram) must never shadow the owner's value.
 _SHARER_OVERRIDABLE_FIELDS = ("anthropic", "gemini")
 
 
-def _overlay_submitter_keys(merged, submitter_keys, device_id):
+def _overlay_submitter_keys(merged, submitter_keys):
     """#938: overlay the SUBMITTER's explicit per-device keys over the owner
     chain — a sharer's keys are used ONLY for runs THEY submit, and only on
     devices they explicitly configured. Pure — unit-testable without
     Firestore.
 
-    Only apiKeys.byDevice.{device_id}.{anthropic,gemini} applies: the
-    sharer's FLAT account-wide keys are deliberately ignored on someone
+    `submitter_keys` is the sharer's users/{uid}/deviceKeys/{deviceId} doc,
+    so it is ALREADY scoped to this computer — that scoping is now the read
+    itself rather than a lookup into a wider map, which is the whole point of
+    the move: this machine can no longer see the keys they gave any other.
+
+    Their FLAT account-wide keys are deliberately still ignored on someone
     else's computer (per-device is the explicit opt-in), and the field
-    allowlist keeps any other byDevice field from shadowing the owner's
+    allowlist keeps a stray field in that doc from shadowing the owner's
     value. Empty/whitespace values are filtered (a cleared FE field reverts
     to the owner chain); strings are stripped.
 
@@ -1215,19 +1286,16 @@ def _overlay_submitter_keys(merged, submitter_keys, device_id):
     the change-only names-never-values log + error-card attribution."""
     out = dict(merged or {})
     overridden = []
-    by_device = (submitter_keys or {}).get("byDevice")
-    if device_id and isinstance(by_device, dict):
-        dev = by_device.get(device_id)
-        if isinstance(dev, dict):
-            for k in _SHARER_OVERRIDABLE_FIELDS:
-                v = dev.get(k)
-                if isinstance(v, str) and v.strip():
-                    out[k] = v.strip()
-                    overridden.append(k)
+    if isinstance(submitter_keys, dict):
+        for k in _SHARER_OVERRIDABLE_FIELDS:
+            v = submitter_keys.get(k)
+            if isinstance(v, str) and v.strip():
+                out[k] = v.strip()
+                overridden.append(k)
     return out, sorted(overridden)
 
 
-# #938: 30s single-slot memo for the submitter prefs read.
+# #938: 30s single-slot memo for the submitter key read.
 # resolve_gemini_api_key() has no cache of its own (the narrator re-resolves
 # every ~6s tick), so without this a sharer run would double the per-resolve
 # Firestore reads. 30s still discovers a mid-run unshare (403 → fail-open to
@@ -1237,10 +1305,16 @@ _SHARER_PREFS_CACHE = {"uid": None, "keys": None, "ts": 0.0}
 _SHARER_PREFS_TTL = 30.0
 
 
-def _read_submitter_prefs_keys(submitter_uid):
-    """Read the SUBMITTER's users/{uid}/settings/prefs → apiKeys via the
-    same synth-device-user client (the settings/prefs read rule already
-    allows deviceMemberOf — the sharer is in this device's sharedWith[]).
+def _read_submitter_device_keys(submitter_uid, device_id):
+    """Read the SUBMITTER's users/{uid}/deviceKeys/{deviceId} via the same
+    synth-device-user client. The rule allows exactly this one document —
+    the deviceId in the path must equal this token's deviceId claim, and the
+    sharer must be in this device's sharedWith[].
+
+    Their settings/prefs is NOT readable from here any more, and that is the
+    point: it held their account-wide keys, their pair-code-lock hash and
+    their delivery address, and this machine belongs to someone else.
+
     Fail-open: any error returns {} so key resolution degrades to the owner
     chain instead of dying (mirrors the sharer-tree rehydration precedent)."""
     now = time.time()
@@ -1250,10 +1324,10 @@ def _read_submitter_prefs_keys(submitter_uid):
     keys = {}
     try:
         snap = _firebase_db.collection("users").document(submitter_uid) \
-            .collection("settings").document("prefs").get()
-        keys = ((snap.to_dict() or {}).get("apiKeys") or {}) if snap.exists else {}
+            .collection("deviceKeys").document(device_id).get()
+        keys = (snap.to_dict() or {}) if snap.exists else {}
     except Exception as se:
-        log(f"[_read_firestore_api_keys] sharer prefs read failed (non-fatal, owner-chain fallback): {se}", "WARN")
+        log(f"[_read_firestore_api_keys] sharer key doc read failed (non-fatal, owner-chain fallback): {se}", "WARN")
     _SHARER_PREFS_CACHE.update(uid=submitter_uid, keys=keys, ts=now)
     return keys
 
@@ -1737,7 +1811,18 @@ def _try_llm_title(topic, brief, findings=""):
         payload = {
             "contents": [{"role": "user", "parts": [{"text": user_msg}]}],
             "systemInstruction": {"parts": [{"text": system}]},
-            "generationConfig": _gemini_gen_config(temperature=0.3, max_tokens=120),
+            # 2026-08-13: 120 → 600. Thinking is ON here by default —
+            # `_gemini_gen_config` sends `thinkingConfig` only when the env
+            # override is exported, and OMITTING it is what the live endpoint
+            # accepts (see that builder). A ceiling sized for a non-thinking
+            # request gets spent on reasoning and returns HTTP 200 with
+            # `finishReason=MAX_TOKENS` and a candidate carrying no parts: the
+            # status check below passes, the .get() chain walks to "" without
+            # raising, and the title is silently never refreshed. The narrator
+            # took the same removal and went 200 → 800; this leg was raised only
+            # to 120. A title is 3-7 words, so the extra headroom is for the
+            # reasoning, not the answer.
+            "generationConfig": _gemini_gen_config(temperature=0.3, max_tokens=600),
         }
         resp = _requests.post(url, json=payload, timeout=8.0)
         # ⭐ 2026-08-05 — CHECK THE STATUS BEFORE PARSING. On a 400 the body is
@@ -1758,6 +1843,16 @@ def _try_llm_title(topic, brief, findings=""):
              .get("parts", [{}])[0]
              .get("text", "")
         )
+        # ⭐ SAY WHY A 200 CAME BACK EMPTY. This is the other half of the status
+        # check above: a refusal is now visible, but an ACCEPTED call that spent
+        # its whole budget thinking was not — same silent "" out of this
+        # function, and no line anywhere naming the cause. `_gemini_empty_reason`
+        # reads the finishReason/blockReason the response already carries, which
+        # separates "budget spent on reasoning" (a config value) from "the
+        # prompt was blocked" (ours to change).
+        if not (text or "").strip():
+            log(f"[title-refresh] Gemini {GEMINI_TEXT} returned no text — "
+                f"{_gemini_empty_reason(j)}", "WARN")
         return (text or "").strip()
     except Exception as e:
         try:
@@ -1919,6 +2014,13 @@ def _try_llm_summary(topic, brief, findings=""):
              .get("parts", [{}])[0]
              .get("text", "")
         )
+        # Same empty-200 blind spot as the title path — see the note there. 900
+        # tokens is enough headroom that MAX_TOKENS is unlikely here, which is
+        # exactly why the log matters: if it ever does fire, the reason is the
+        # only thing that distinguishes it from a blocked prompt.
+        if not (text or "").strip():
+            log(f"[summary] Gemini {GEMINI_TEXT} returned no text — "
+                f"{_gemini_empty_reason(j)}", "WARN")
         return (text or "").strip()
     except Exception as e:
         try:
@@ -5623,17 +5725,47 @@ async def _revoked_recovery_loop():
 _device_cmd_watch = None  # Firestore Watch handle; kept for lifetime cleanup
 
 
-def _write_update_status(device_id: str, status: dict) -> bool:
+def _write_update_status(device_id: str, status: dict, *, merge: bool = False) -> bool:
     """Best-effort write of a remote-update outcome to the device doc so the app
     can render it (the same channel as the version signal). `at` is stamped here.
     Never raises — a rules gap / offline write must not break the listener.
 
     Returns True when the write landed. Callers that hold the ONLY copy of an outcome
-    (the heartbeat's sentinel publish) must not discard it on a failed write."""
+    (the heartbeat's sentinel publish) must not discard it on a failed write.
+
+    ⭐ 2026-08-13 (review). `merge` decides whether keys the caller does NOT carry
+    survive, and the default is what caused the finding. A nested map passed as a
+    single field value REPLACES that map wholesale in Firestore — so every
+    `updateStatus` key absent from `status` is deleted, including `needsRestart`,
+    which is the only thing the About row renders the fallback Restart button
+    from. A refusal answering a Restart tap therefore deleted the control that
+    offered it, and because the identity guards refuse a SHARER, the flag it
+    erased belonged to the OWNER.
+
+    `merge=True` writes each key as its own dotted field path, which Firestore
+    merges into the existing map instead of replacing it. The rule for choosing:
+
+      * A caller REPORTING AN UPDATE'S OUTCOME replaces. It carries the whole
+        verdict, and a stale journal/log tail from a previous attempt must not
+        survive underneath a newer one.
+      * A caller REFUSING A REQUEST merges. It is reporting on the request, not
+        on the installed build, and it has no opinion about `needsRestart` or
+        `latest` — so it must not be able to lower either.
+
+    ⚠ Dotted paths make OMISSION meaningful, which is the point but changes what
+    a caller must write: a refusal that still passed `latest: None` would set the
+    field to null exactly as before. The refusal payloads drop the key instead."""
     try:
-        _firebase_db.collection("devices").document(device_id).update({
-            "updateStatus": {**status, "at": int(time.time() * 1000)},
-        })
+        _at = int(time.time() * 1000)
+        if merge:
+            # Keys here are in-tree literals (state/current/latest/reason), so no
+            # field-path escaping is needed; a key containing a dot or a
+            # backtick would need `FieldPath` and none exists.
+            payload = {f"updateStatus.{k}": v for k, v in status.items()}
+            payload["updateStatus.at"] = _at
+        else:
+            payload = {"updateStatus": {**status, "at": _at}}
+        _firebase_db.collection("devices").document(device_id).update(payload)
         return True
     except Exception as e:
         log(f"[device-cmds] update-status write skipped: {e}", "DEBUG")
@@ -6081,8 +6213,13 @@ def _handle_update_command(data: dict, device_id: str, loop) -> None:
     _owner = _dev.get("ownerUid")
     if _owner and data.get("submittedBy") and data["submittedBy"] != _owner:
         log("[device-cmds] UPDATE: refusing — submittedBy is not the device owner", "WARN")
+        # merge=True, same rule as the restart refusals: a REFUSAL reports on the
+        # request and must not be able to lower `needsRestart` or wipe `latest`.
+        # The clobber the review found on the restart branch is the same line of
+        # code reached from this button, so it is closed in the same pass rather
+        # than left one screen away.
         _write_update_status(device_id, {"state": "failed", "current": cur,
-                                         "latest": None, "reason": "not the device owner"})
+                                         "reason": "not the device owner"}, merge=True)
         return
 
     # 1b. ALREADY RUNNING. Two clicks three minutes apart is what actually happened
@@ -6116,8 +6253,9 @@ def _handle_update_command(data: dict, device_id: str, loop) -> None:
     if not _detect_supervised():
         log("[device-cmds] UPDATE: not supervised (no OS auto-start) — refusing remote update", "WARN")
         _write_update_status(device_id, {
-            "state": "failed", "current": cur, "latest": None,
-            "reason": "not supervised — run `superresearch --update` on the machine"})
+            "state": "failed", "current": cur,
+            "reason": "not supervised — run `superresearch --update` on the machine"},
+            merge=True)
         return
 
     # 3. Mid-run guard: defer unless forced. `busy` is device-wide (any worker) and
@@ -6136,7 +6274,8 @@ def _handle_update_command(data: dict, device_id: str, loop) -> None:
     if busy and not force:
         log("[device-cmds] UPDATE: deferred — a run is in progress (resend with force to override)")
         _write_update_status(device_id, {"state": "deferred", "current": cur,
-                                         "latest": None, "reason": "a research run is in progress"})
+                                         "reason": "a research run is in progress"},
+                             merge=True)
         return
 
     # Only NOW clear the record the force overrode — past every guard that can
@@ -6159,8 +6298,34 @@ def _handle_update_command(data: dict, device_id: str, loop) -> None:
     # Without this the update "starts" but the version never bumps → the app times
     # out with "taking longer than expected".
     res = _perform_self_update(force_check=True, restart_after=True)
-    _write_update_status(device_id, {"state": res["state"], "current": res.get("current"),
-                                     "latest": res.get("latest"), "reason": res.get("reason", "")})
+    # ⭐⭐ MERGE, not replace — finding 3's harm reached this write too, and it
+    # was missed because this is not a refusal branch and did not look like one.
+    #
+    # Only `started` is a real state transition. Everything else this returns —
+    # `already` (the newer build is on disk), `unsupported`, `pipx not found`,
+    # the preflight `failed` — is a report that NOTHING happened, and a replace
+    # there deletes `needsRestart`, which is the whole flag the Restart button is
+    # rendered from. The sequence that bites: an update lands its files, the
+    # restart leg dies, the heartbeat publishes `needsRestart: true` and consumes
+    # the only sentinel — then the user taps Update again to finish it, this
+    # returns `already` off the DISK version, and the button they were reaching
+    # for disappears while the machine keeps serving the old build. No path back
+    # except a manual restart, which is exactly the dead end the wave closed
+    # everywhere else.
+    #
+    # `started` still replaces: a launched upgrade supersedes whatever came
+    # before it, and a stale `needsRestart` surviving under a live update is the
+    # mirror-image bug.
+    if res["state"] == "started":
+        _write_update_status(device_id, {"state": "started",
+                                         "current": res.get("current"),
+                                         "latest": res.get("latest"),
+                                         "reason": res.get("reason", "")})
+    else:
+        _write_update_status(device_id, {"state": res["state"],
+                                         "current": res.get("current"),
+                                         "reason": res.get("reason", "")},
+                             merge=True)
     if res["state"] == "started":
         # Only NOW that an upgrade is actually launched do we stop this worker's own
         # run (gracefully, keeping partial results). Never stop a run for a no-op
@@ -6912,9 +7077,12 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                 if not _rsub:
                     log("[device-cmds] RESTART: refusing — the command carries no "
                         "submittedBy, so ownership cannot be checked", "WARN")
+                    # merge=True on every refusal below: this answers the TAP,
+                    # and it is not evidence about whether the installed build
+                    # still needs a restart. See `_write_update_status`.
                     _write_update_status(device_id, {
-                        "state": "failed", "current": _sr_version(), "latest": None,
-                        "reason": "could not verify device ownership"})
+                        "state": "failed", "current": _sr_version(),
+                        "reason": "could not verify device ownership"}, merge=True)
                     continue
                 # ⚠ A MISSING `ownerUid` is deliberately still allowed, and the
                 # review's suggestion to refuse there is NOT taken. Owner-unlink
@@ -6928,8 +7096,8 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                     log("[device-cmds] RESTART: refusing — submittedBy is not the "
                         "device owner", "WARN")
                     _write_update_status(device_id, {
-                        "state": "failed", "current": _sr_version(), "latest": None,
-                        "reason": "not the device owner"})
+                        "state": "failed", "current": _sr_version(),
+                        "reason": "not the device owner"}, merge=True)
                     continue
                 # SUPERVISED-ONLY, same reason `update` refuses: this exits the
                 # worker, and if no OS supervisor (launchd / systemd / Scheduled Task)
@@ -6939,8 +7107,9 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                     log("[device-cmds] RESTART: not supervised (no OS auto-start) — "
                         "refusing; nothing would relaunch the backend", "WARN")
                     _write_update_status(device_id, {
-                        "state": "failed", "current": _sr_version(), "latest": None,
-                        "reason": "not supervised — restart it on the machine"})
+                        "state": "failed", "current": _sr_version(),
+                        "reason": "not supervised — restart it on the machine"},
+                        merge=True)
                     continue
                 _r_busy = bool(_QUEUE_STATE.get("running"))
                 try:
@@ -6952,8 +7121,8 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                 if _r_busy:
                     log("[device-cmds] RESTART: deferred — a run is in progress", "WARN")
                     _write_update_status(device_id, {
-                        "state": "deferred", "current": _sr_version(), "latest": None,
-                        "reason": "a research run is in progress"})
+                        "state": "deferred", "current": _sr_version(),
+                        "reason": "a research run is in progress"}, merge=True)
                     continue
                 log("[device-cmds] RESTART: cycling this worker so the supervisor "
                     "respawns it on the installed build")
@@ -17213,8 +17382,8 @@ _HOTSPOT_VISION_HINTS = {
             "Research' (top level, or under 'More tools'); a merely-visible chip is NOT "
             "proof it is armed — it is ON only when the placeholder reads 'What do you "
             "want to research?' (chat mode = 'Ask Gemini'), so do NOT re-toggle a pill "
-            "that is already active. Claude: the model must be Opus with Max effort "
-            "— if it already reads Opus, LEAVE IT ALONE (a higher Opus is correct, and "
+            "that is already active. Claude: the model must be {claude_family} with Max effort "
+            "— if it already reads {claude_family}, LEAVE IT ALONE (a higher {claude_family} is correct, and "
             "there is no separate thinking toggle on the current model) — then enable "
             "the 'Research' tool. Do NOT type, paste, "
             "compose, or send anything; do NOT click Send/Submit; do NOT attach files "
@@ -17224,7 +17393,7 @@ _HOTSPOT_VISION_HINTS = {
         ),
         "success_signals": [
             "an active/highlighted 'Deep research' or 'Research' pill near the composer (Gemini: composer placeholder reads 'What do you want to research?', not 'Ask Gemini')",
-            "Claude only: the model button shows Opus (+ Max effort)",
+            "Claude only: the model button shows {claude_family} (+ Max effort)",
             "the composer input focused / caret blinking with nothing typed and no message sent"
         ],
     },
@@ -17240,21 +17409,21 @@ _HOTSPOT_VISION_HINTS = {
             "(Deep Research ON), NOT 'Ask Gemini' (off); a merely-visible 'Deep "
             "research' chip is NOT proof, so if the placeholder still says 'Ask Gemini' "
             "click the chip ONCE and RE-CHECK the placeholder. On Claude: the "
-            "model-selector button at the bottom of the composer must read 'Opus …' (it "
+            "model-selector button at the bottom of the composer must read '{claude_family} …' (it "
             "also shows the effort, e.g. 'Max', on the button itself), and the priority "
             "knob — the 'Research' tool — must be ON (an active/highlighted pill or "
             "chip, or a checkmark beside 'Research' in the '+' tools menu); also click "
             "the X on any stale attachment chip in the composer. Do NOT type, paste, "
             "send, or compose anything; do NOT attach new files; do NOT open Claude's "
             "model popover or chase the Effort/Adaptive-thinking submenu when the model "
-            "button already shows Opus; do NOT treat Gemini's present-but-unpressed "
+            "button already shows {claude_family}; do NOT treat Gemini's present-but-unpressed "
             "chip as active. Say 'verified'/'fixed' on success, or 'failed: <what you "
             "see>' only if the tool is genuinely unavailable."
         ),
         "success_signals": [
             "ChatGPT: a highlighted 'Deep research' pill near the composer with the input focused",
             "Gemini: the composer placeholder reads 'What do you want to research?' (not 'Ask Gemini')",
-            "Claude: the model button shows 'Opus …' and the 'Research' tool is active, with no stale attachment chip"
+            "Claude: the model button shows '{claude_family} …' and the 'Research' tool is active, with no stale attachment chip"
         ],
     },
     "inline-type": {
@@ -17466,6 +17635,40 @@ _HOTSPOT_VISION_HINTS = {
 # share ONE hint (single source of truth; a shared reference keeps them from
 # silently diverging the way separate copies did). nlm-share ↔ the miss-path
 # NotebookLM share fallback; audio-download ↔ the act-path audio .m4a download.
+_CLAUDE_FAMILY_TOKEN = "{claude_family}"
+
+
+def _sub_claude_family(hint: dict) -> dict:
+    """Render `{claude_family}` in a Vision hint with the family THIS run is on.
+
+    ⭐ WHY A TOKEN AND NOT A LITERAL. These hints are required to agree with the
+    canonical CUA prompts (see the catalog note) — that is what makes the
+    shadow-vs-CUA comparison meaningful. The prompts now render the family per
+    run, so a hint that says "Opus" while the prompt says "Sonnet" does not just
+    read oddly: it aims the two calls at different elements and quietly poisons
+    the promotion data the shadow tier exists to collect.
+
+    ⛔ `.replace`, never `.format`. The catalog also carries `{label}`, which no
+    caller substitutes — a formatter would raise KeyError on every hint that has
+    one, turning a cosmetic wording fix into a crash inside the Vision path.
+
+    Returns a NEW dict; the module catalog is never mutated (it is read once per
+    call and a run must not leave its family baked into the next one). No-op for
+    hints without the token, which is all of them but the two Claude ones."""
+    fam = (_p2_active_family("claude") or "opus").capitalize()
+    out = dict(hint)
+    ctx = out.get("context_hint")
+    if isinstance(ctx, str):
+        out["context_hint"] = ctx.replace(_CLAUDE_FAMILY_TOKEN, fam)
+    sigs = out.get("success_signals")
+    if isinstance(sigs, (list, tuple)):
+        out["success_signals"] = [
+            s.replace(_CLAUDE_FAMILY_TOKEN, fam) if isinstance(s, str) else s
+            for s in sigs
+        ]
+    return out
+
+
 _HOTSPOT_VISION_HINTS["nlm-share"] = _HOTSPOT_VISION_HINTS["p3-share"]
 _HOTSPOT_VISION_HINTS["audio-download"] = _HOTSPOT_VISION_HINTS["p3-audio-download"]
 
@@ -17572,7 +17775,16 @@ async def _shadow_observed_cua(
     # Enrich with the per-hotspot target description so Vision can locate the
     # element confidently (raises confidence / kills the edge-guessing). The
     # run-specific context_hint (elapsed/cycle/DOM-miss detail) is appended.
-    _hint = _HOTSPOT_VISION_HINTS.get(hotspot_id, {})
+    # ⭐ The Claude family word is substituted HERE, not baked into the catalog.
+    # The note above these hints requires them to agree with the canonical CUA
+    # prompts — and those now render the family per RUN, so a hint frozen at
+    # import would describe a different model than the prompt it is supposed to
+    # mirror on exactly the runs that fell back. `.replace`, not `.format`: the
+    # hints carry other braces ({label}) that a formatter would raise on.
+    # ⚠ Applied ON the read, same shape as the observe path below — the two are
+    # required to aim at the same target, and a substitution that sits a few
+    # lines away from its read is one refactor from being separated from it.
+    _hint = _sub_claude_family(_HOTSPOT_VISION_HINTS.get(hotspot_id, {}))
     _ctx_hint = (
         f"{_hint['context_hint']} (run detail: {context_hint})"
         if _hint.get("context_hint") else context_hint
@@ -17692,7 +17904,10 @@ def _observe_dom_success(page, *, hotspot_id, phase, platform, current_step,
     if _vision is None or not observe_success_enabled():
         return
     try:
-        _hint = _HOTSPOT_VISION_HINTS.get(hotspot_id, {})
+        # Same substitution as the shadow path — the success-path and miss-path
+        # calls are required to aim at the SAME target, so a family word applied
+        # to only one of them corrupts exactly the comparison they exist for.
+        _hint = _sub_claude_family(_HOTSPOT_VISION_HINTS.get(hotspot_id, {}))
         flow_ctx = {
             "workflow_name": hotspot_id,
             "phase": phase,
@@ -20384,16 +20599,15 @@ def _gemini_gen_config(*, temperature: float, max_tokens: int, **extra) -> dict:
     is why the narrator's own token ceiling had to rise — the original comment
     ("thinking eats the token budget leaving 2-3-word stubs") was describing a
     real effect, and the answer is a bigger ceiling, not a rejected request.
+
+    ⓘ 2026-08-13 — the body moved to `models.gemini_gen_config` so narrate.py's
+    fifth hand-rolled copy could share it. A compiled sibling cannot import from
+    this module (it is a launcher shim in the wheel), so `models` is the only
+    home both can reach. This stays as the name research.py's callers and tests
+    already use.
     """
-    cfg = {"temperature": temperature, "maxOutputTokens": int(max_tokens)}
-    _tb = os.environ.get("DG_GEMINI_THINKING_BUDGET", "").strip()
-    if _tb:
-        try:
-            cfg["thinkingConfig"] = {"thinkingBudget": int(_tb)}
-        except ValueError:
-            pass
-    cfg.update(extra)
-    return cfg
+    return _models_gemini_gen_config(
+        temperature=temperature, max_tokens=max_tokens, **extra)
 
 
 def _gemini_empty_reason(payload: dict) -> str:
@@ -20402,17 +20616,13 @@ def _gemini_empty_reason(payload: dict) -> str:
     A refusal and an empty success are different faults with different fixes —
     a blocked prompt is ours to change, a token budget spent on thinking is a
     config value — and the old single message described neither.
+
+    ⓘ The body moved to `models.gemini_empty_reason` so narrate.py's panel call
+    could name the same reasons; it was the last Gemini leg still reporting an
+    empty 200 as a parse fault. A compiled sibling cannot import from this
+    module, so `models` is the shared home. This name stays for its callers.
     """
-    try:
-        cand = ((payload or {}).get("candidates") or [{}])[0] or {}
-        finish = str(cand.get("finishReason") or "").strip()
-        block = str(((payload or {}).get("promptFeedback") or {})
-                    .get("blockReason") or "").strip()
-    except Exception:
-        finish = block = ""
-    parts = [p for p in (f"finishReason={finish}" if finish else "",
-                         f"blockReason={block}" if block else "") if p]
-    return ", ".join(parts) or "no finishReason and no blockReason"
+    return _models_gemini_empty_reason(payload)
 
 
 def _call_text_narrator(
@@ -29597,8 +29807,12 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
     if name == "Claude":
         new_page, _setup_ok = await start_agent_no_gemini_wait(
             browser, cua_client, "https://claude.ai/new",
-            PROMPT_CLAUDE_DEEP_RESEARCH,
-            p2_claude_setup_directive(),
+            # Rendered here, not imported: by the time a hard retry runs, an
+            # earlier pass may already have proved this account's plan excludes
+            # the primary family, and the CUA fallback must not be sent hunting
+            # for it again.
+            claude_deep_research_prompt(_p2_active_family("claude")),
+            p2_claude_setup_directive(_p2_active_family("claude")),
             brief_text, "2B-retry", "Claude", verbose, brief_path=brief_path,
             source_paths=source_paths, reuse_page=reuse_page)
         if not _setup_ok:
@@ -37941,6 +38155,45 @@ _P2_THINKING_STATE: dict = {}
 # or None; process-local; last write wins.
 _P2_PICKED_VERSION: dict = {}
 
+# Phoenix — the model FAMILY this run is actually on, per platform, when it is
+# NOT the policy's primary family. Written by setup_*_dr the moment the DOM
+# proves the account's plan excludes the primary family and the fallback is
+# selected instead; every downstream reader goes through `_p2_active_family`.
+#
+# ⭐ WHY A RUN-SCOPED DICT AND NOT THE OVERLAY. The overlay is disk state shared
+# by every run on this machine and every account those runs sign into. Writing
+# `family: sonnet` there because ONE non-pro account was seen would downgrade
+# the next pro run — permanently, silently, and with the model selection code
+# reporting complete success. The fallback is a fact about an ACCOUNT, and the
+# only thing here that is scoped to an account is the run.
+#
+# ⛔ ABSENT MEANS "THE POLICY FAMILY", never "unknown". Every reader falls back
+# to `p2_family`, so a run that never reached the detection behaves exactly as
+# it did before this existed — which is what keeps the fallback strictly
+# additive for the pro path.
+_P2_ACTIVE_FAMILY: dict = {}
+
+
+def _p2_active_family(platform: str) -> str:
+    """The family word THIS run should be reading and asserting on `platform`.
+
+    ⚠ Not a convenience wrapper. Six surfaces need this answer — the picker, the
+    pre-send re-activation check, the ladder's outcome probe, the two CUA
+    missions and the known-good ledger — and the failure when one of them keeps
+    its own idea is not cosmetic: `ensure_deep_mode_active` reads the family to
+    decide whether the model "regressed", so a reader still hardcoded to the
+    primary family sees a deliberate fallback pick as a regression and re-runs
+    the whole Claude setup before EVERY send, on every run, forever."""
+    p = (platform or "").lower()
+    fam = str(_P2_ACTIVE_FAMILY.get(p) or "").strip().lower()
+    # Only a family the policy actually names is honored. A stale value left by
+    # a previous policy edit must degrade to the primary family, not to a word
+    # that no longer means anything to the pickers it is interpolated into.
+    if fam and fam in (p2_family(p), p2_free_family(p)):
+        return fam
+    return p2_family(p)
+
+
 # One-shot latch so a persistently unwritable state dir WARNs once per process
 # instead of on every setup. See the record_probe call site for why a silent
 # stamp failure matters: it turns the periodic model check into a per-run
@@ -39158,6 +39411,73 @@ async def setup_gemini_dr(page, pin_model=None, step_below=None) -> bool:
         return False
 
 
+async def _claude_plan_limited(page, probe_js, probe_args) -> bool:
+    """Does the OPEN model menu prove this account's plan excludes the family?
+
+    True only for the one shape that can mean nothing else: family rows are
+    present, and EVERY one of them is a sales chip.
+
+    ⛔ THE THREE CASES ARE NOT INTERCHANGEABLE, which is why this reads `chips`
+    rather than "the picker found nothing":
+      * n > 0             — the family is genuinely offered; the picker missing
+                            it is a selector bug and must stay loud.
+      * n == 0, chips > 0 — the plan does not include the family. Permanent for
+                            this account; retrying it forever is the current bug.
+      * n == 0, chips == 0 — the family is not in this menu at all: a rename, a
+                            rollout difference, or a menu read mid-render. NOT a
+                            plan limit, and answering it with a family switch
+                            would hide a real regression behind a silent
+                            downgrade — the worst of the three outcomes.
+
+    ⚠ Retries for the same reason Step 1B* does: a menu one beat from finishing
+    its render reads as case three, and treating that as "no fallback needed" on
+    the first look costs the whole run. Never raises — an unreadable probe is
+    "not proved", which lands on today's behaviour.
+    """
+    for _attempt in range(3):
+        try:
+            probe = await page.evaluate(probe_js, probe_args) or {}
+        except Exception as exc:
+            log(f"[setup_claude_dr] Step 1B† plan probe errored "
+                f"({type(exc).__name__}) — not treating this as a plan limit", "WARN")
+            return False
+        # ⚠ `chipsAny`, NOT `chips`. The row-filtered count exists to be a
+        # sensible NUMBER; it is blind to a chip rendered as a plain div, and a
+        # verdict resting on it silently did nothing on that markup. The fact
+        # that a sales prompt was seen is the part this decision needs.
+        if probe.get("menu") and not probe.get("n") and probe.get("chipsAny"):
+            return True
+        # A mounted menu that already offers real rows answers the question in
+        # the negative — no amount of waiting turns those into chips.
+        if probe.get("menu") and probe.get("n"):
+            return False
+        await asyncio.sleep(0.4)
+    return False
+
+
+def _report_claude_plan_limit(excluded: str, using: str) -> None:
+    """Tell the user WHY this run is on a different model family — once.
+
+    ⛔ DELIBERATELY NOT AN ALERT, and not a new decision card. The user is not
+    being asked anything: the account's plan is a fact the run cannot change and
+    has already worked around. A blocking card here would also be the SECOND
+    thing to ask about one decision — Phase 0's pro_required card, with its
+    Continue-with-Free action, is where that question belongs, and re-asking it
+    mid-run is exactly the "user clicks Continue two or three times for what
+    they perceive as one decision" regression F3 removed.
+
+    Reuses the status the agent is already in, so the milestone stepper does not
+    move: this is a caption on the current step, not a new one."""
+    log(f"[setup_claude_dr] plan limit: {excluded} is not on this account's plan — "
+        f"running Claude on the {using} family instead", "INFO")
+    try:
+        emit_event("agent_progress", phase=2, agent="claude", status="starting",
+                   progress=f"Claude's plan doesn't include {excluded.capitalize()} — "
+                            f"using the latest {using.capitalize()} instead")
+    except Exception:
+        pass
+
+
 async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=False) -> bool:
     """Enable Claude Opus (the newest offered) + Max Effort + Research tool via
     direct Playwright selectors. As of 2026-05-28 the claude.ai UI splits these
@@ -39266,7 +39586,19 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
         # The model FAMILY word — the only model identity in this function.
         # Injected into every JS below so a rename is one policy edit, and so no
         # version literal can creep back into a page.evaluate string.
-        _claude_family = p2_family("claude") or "opus"
+        # ⭐ THE RUN'S family, not the policy's. On a pro account these are the
+        # same word and everything below behaves exactly as it did. On an
+        # account whose plan excludes the primary family, a prior pass in THIS
+        # run has already proved that from the DOM and recorded the fallback —
+        # and reading the policy here instead would send the step-back and the
+        # pre-send re-activation hunting for a family this account cannot select,
+        # undoing the fallback pick on the very next pass.
+        _claude_family = _p2_active_family("claude") or "opus"
+        # The family the policy WANTS, kept separate: the fallback is only ever
+        # entered from the primary, and the CUA missions have to be able to name
+        # the excluded family to tell the agent what the chips are.
+        _claude_primary = p2_family("claude") or "opus"
+        _claude_free_family = p2_free_family("claude")
         # Effort + thinking come from the SAME policy dict, so the quality knobs
         # can never drift from it. `thinking` is False since Opus 5 removed the
         # toggle — see the note on P2_MODEL_POLICY["claude"].
@@ -39296,7 +39628,13 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
         # Step 1B* below fixes that: while the popover is open ANYWAY, upgrade to
         # a STRICTLY higher Opus when one is offered. Strictly-higher is what
         # keeps #744 dead — the currently-selected option can never be re-clicked.
-        _trigger_read = await page.evaluate("""({effortWord, fam}) => {
+        # ⛔ HOISTED TO A NAME so the fallback path can re-ask this exact
+        # question about a DIFFERENT family. A second inline copy would be a
+        # fifth parsing site — and the trigger parser is already documented as
+        # "the FOURTH parsing site and the easiest to forget", whose answer
+        # decides whether an upgrade fires. Two copies drifting is not a
+        # hypothetical here; it is the failure this file keeps recording.
+        _TRIGGER_READ_JS = """({effortWord, fam}) => {
             const famRe = new RegExp(fam, 'i');
             // The SAME two-order, adjacency-bounded parse as the picker and the
             // probe. This is the FOURTH parsing site and the easiest to forget:
@@ -39363,7 +39701,9 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
             return { ver: best, fam: !!bestText,
                      trigger_text: bestText.replace(/\\s+/g, ' ').trim().slice(0, 120),
                      effort: effort };
-        }""", {"effortWord": _claude_effort, "fam": _claude_family})
+        }"""
+        _trigger_read = await page.evaluate(
+            _TRIGGER_READ_JS, {"effortWord": _claude_effort, "fam": _claude_family})
         model_trigger_ver = _trigger_read.get("ver") if isinstance(_trigger_read, dict) else _trigger_read
         # Effort read straight off the trigger. Only ever a POSITIVE signal: when
         # it is None we fall through to the popover exactly as before, so an
@@ -39424,7 +39764,7 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
         # version". A family row with NO version is a valid last-resort candidate
         # (a version-less rename must not empty the menu), but it is never a
         # step-back target — we cannot prove it is below what just failed.
-        _pick_opus_js = """({pin, below, fam, triggerText}) => {
+        _pick_opus_js = """({pin, below, fam, triggerText, verbs, upsellWindow}) => {
             const vis = el => el.getClientRects().length > 0;
             const famRe = new RegExp(fam, 'i');
             // ⭐ BOTH VERSION ORDERS, deliberately — see models.parse_family_version,
@@ -39448,6 +39788,57 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                 const m = (t || '').match(verFamFirst) || (t || '').match(verNumFirst);
                 return m ? parseFloat(m[1]) : null;
             };
+            // Character-level port of models.is_upsell — ONE definition of what
+            // a sales prompt looks like, not a second opinion. "Upgrade to Opus"
+            // names the family exactly as a real row does, so famRe and verOf
+            // both accept it; without this the ranker CLICKS the billing chip,
+            // the upsell surface opens over the composer, and the truthy return
+            // is reported as a successful model pick.
+            //
+            // VERB-THEN-FAMILY WITHIN A WINDOW, not a bare verb test: row text
+            // here is title+description concatenated, so "try our most capable
+            // model" would disqualify a genuine row and empty the menu.
+            // Regex-free, like the reject port in the Gemini ranker — this is a
+            // non-raw Python string, where a lone \\b once became a literal
+            // backspace and silently killed a gate (#913).
+            const isAlnum = c => !!c && ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'));
+            // Whitespace collapsed over the SAME set models._collapse_ws uses,
+            // NOT this language's own `\\s`. Python calls \\x1c-\\x1f and \\x85
+            // whitespace and JS does not; JS calls \\ufeff (a BOM, which does
+            // turn up in page text) whitespace and Python does not. The window
+            // below is counted in CHARACTERS on the collapsed string, so a label
+            // padded with either class was an upsell to one implementation and a
+            // model row to the other — measured on this exact pair, which is how
+            // a "character-for-character port" turned out not to be one.
+            const normU = s => (s || '').replace(/[\\s\\x1c-\\x1f\\x85\\ufeff]+/g, ' ').trim();
+            const isUpsell = (raw) => {
+                const s = normU(raw).toLowerCase(), n = normU(fam).toLowerCase();
+                if (!s || !n) return false;
+                // the first mention of the family is describing a row, not
+                // selling one — row text here is title+description concatenated,
+                // so "Opus 5 — try Opus with extended thinking" is a genuine row
+                // whose blurb happens to read verb-then-family-within-24.
+                // Without this the guard drops the HIGHEST real row and the
+                // picker clicks a lower model while reporting normally: the
+                // silent downgrade this path exists to prevent, reintroduced by
+                // its own guard.
+                for (const rawVerb of (verbs || [])) {
+                    const verb = String(rawVerb).toLowerCase();
+                    if (!verb) continue;
+                    let i = s.indexOf(verb);
+                    while (i !== -1) {
+                        const end = i + verb.length;
+                        const leftOk = i === 0 || !isAlnum(s[i - 1]);
+                        const rightOk = end >= s.length || !isAlnum(s[end]);
+                        if (leftOk && rightOk) {
+                            const j = s.indexOf(n, end);
+                            if (j !== -1 && j - end <= upsellWindow) return true;
+                        }
+                        i = s.indexOf(verb, i + 1);
+                    }
+                }
+                return false;
+            };
             // Without a floor the body fallback (used when no menu has mounted)
             // would happily treat the TRIGGER BUTTON as a row and click it,
             // which just toggles the popover shut while reporting success.
@@ -39456,6 +39847,11 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
             for (const el of items) {
                 const t = (el.textContent || '').trim();
                 if (trig && norm(t) === trig) continue;        // never click the trigger
+                // BEFORE the version parse, and unconditionally. A VERSIONED
+                // upsell ("Upgrade to Opus 5.2") parses, so a check reached
+                // only on the version-less branch would let the worst case
+                // through: a chip that outranks every genuine row on version.
+                if (isUpsell(t)) continue;
                 const v = verOf(t);
                 const isFam = v !== null || famRe.test(t);
                 if (!isFam) continue;
@@ -39509,7 +39905,7 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
         # already have" — so a popover that mounts a beat slowly would report
         # "nothing newer" and, under the weekly cadence, burn the whole interval's
         # check on a no-op. `menu` tells the caller whether the answer is real.
-        _probe_opus_js = """({fam}) => {
+        _probe_opus_js = """({fam, verbs, upsellWindow}) => {
             const vis = el => el.getClientRects().length > 0;
             // Same two-order parse as the picker — they must agree on what a row
             // is worth. A probe that could not read the renamed order would report
@@ -39519,7 +39915,12 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
             const verNumFirst = new RegExp('([0-9]+(?:\\\\.[0-9]+)?)[ ._/()-]{0,3}' + fam, 'i');
             const menus = [...document.querySelectorAll('[role="menu"], [role="listbox"], [role="dialog"]')]
                 .filter(vis);
-            if (!menus.length) return {menu: false, n: 0, highest: null};
+            // ⚠ `chips: 0` is not decoration — the shape must be the SAME on
+            // every return, because the caller's plan-limit rule reads three
+            // fields and a missing one is falsy in a way that happens to give
+            // the right answer today. "Right by accident" is what breaks when
+            // someone reorders the rule.
+            if (!menus.length) return {menu: false, n: 0, highest: null, chips: 0, chipsAny: false};
             const seen = new Set();
             const items = menus.flatMap(m => [...m.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"], [role="option"], button, a, li, div, span')])
                 .filter(el => vis(el) && !seen.has(el) && seen.add(el));
@@ -39527,14 +39928,79 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                 const m = (t || '').match(verFamFirst) || (t || '').match(verNumFirst);
                 return m ? parseFloat(m[1]) : null;
             };
-            let n = 0, highest = null;
+            // Same port, same reason, as the picker's — and it has to be here
+            // too or the two disagree in the one direction that costs a run
+            // every time. This probe counts only VERSIONED rows, so a
+            // version-less chip could never reach it; a versioned one
+            // ("Upgrade to Opus 5.2") would become `highest`, the caller would
+            // read a newer model as offered, and the picker — which now
+            // excludes it — would find nothing to click. That is not a silent
+            // no-op: it is "offered but not clickable" logged on every run,
+            // forever, with no version anywhere that can satisfy it.
+            const isAlnum = c => !!c && ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'));
+            // Same whitespace set as the picker's port and models._collapse_ws —
+            // see the picker for why JS's own `\\s` is the wrong set here.
+            const normU = s => (s || '').replace(/[\\s\\x1c-\\x1f\\x85\\ufeff]+/g, ' ').trim();
+            const isUpsell = (raw) => {
+                const s = normU(raw).toLowerCase(), nn = normU(fam).toLowerCase();
+                if (!s || !nn) return false;
+                for (const rawVerb of (verbs || [])) {
+                    const verb = String(rawVerb).toLowerCase();
+                    if (!verb) continue;
+                    let i = s.indexOf(verb);
+                    while (i !== -1) {
+                        const end = i + verb.length;
+                        const leftOk = i === 0 || !isAlnum(s[i - 1]);
+                        const rightOk = end >= s.length || !isAlnum(s[end]);
+                        if (leftOk && rightOk) {
+                            const j = s.indexOf(nn, end);
+                            if (j !== -1 && j - end <= upsellWindow) return true;
+                        }
+                        i = s.indexOf(verb, i + 1);
+                    }
+                }
+                return false;
+            };
+            // `chips` is the whole non-pro signal, and it is counted here rather
+            // than inferred by the caller because only this loop can tell the
+            // three cases apart:
+            //   n>0            — the family is genuinely offered
+            //   n==0, chips>0  — the family is offered ONLY as a sales prompt,
+            //                    i.e. this plan does not include it
+            //   n==0, chips==0 — the family is not in this menu at all (a
+            //                    rename, or a menu read mid-render)
+            // Reading "no rows" alone cannot separate a plan limit from a
+            // rollout change, and those want opposite responses: one is a
+            // permanent fact about the account, the other is a transient we must
+            // keep retrying and eventually shout about.
+            // ⛔⛔ TWO SIGNALS, AND THE VERDICT USES THE SECOND. `chips` counts
+            // chip ROWS and is telemetry; `chipsAny` is "a sales prompt was seen
+            // at all" and is what decides a plan limit. Measured 2026-08-14
+            // against this exact JS: with only the row-filtered count, a chip
+            // rendered as a plain <div> or <li> — both of which ARE in the item
+            // list above — reported `chips: 0`, so the whole fallback silently
+            // did nothing on that markup. A count that is right about the number
+            // and blind to the fact is worse than no count: the fact is the part
+            // a decision rests on.
+            let n = 0, highest = null, chips = 0, chipsAny = false;
             for (const el of items) {
-                const v = verOf((el.textContent || '').trim());
+                const raw = (el.textContent || '').trim();
+                if (isUpsell(raw)) {
+                    chipsAny = true;
+                    // Count ROWS, not every node whose text contains the chip:
+                    // the item list walks div/span too, so one chip is seen at
+                    // several depths and a naive count reads 5 for 1. Kept
+                    // separate precisely so this narrowing can never again
+                    // decide anything.
+                    if (el.matches('[role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"], [role="option"], button, a')) chips += 1;
+                    continue;
+                }
+                const v = verOf(raw);
                 if (v === null) continue;
                 n += 1;
                 if (highest === null || v > highest) highest = v;
             }
-            return {menu: true, n: n, highest: highest};
+            return {menu: true, n: n, highest: highest, chips: chips, chipsAny: chipsAny};
         }"""
 
         # ── Step 1A: open the model popover ONCE (model pick if needed +
@@ -39575,19 +40041,55 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
             log(f"[setup_claude_dr] Step 1A: model+effort already confirmed off the "
                 f"trigger, but the periodic model-menu check is due — opening the "
                 f"popover once to look for a newer {_claude_family}")
-        dropdown_clicked = False if _skip_popover else await page.evaluate("""(fam) => {
+        dropdown_clicked = False if _skip_popover else await page.evaluate("""(a) => {
+            const fam = a.fam, verbs = a.verbs || [], upsellWindow = a.upsellWindow || 24;
             const btns = [...document.querySelectorAll('button, [role="button"]')]
                 .filter(b => b.getClientRects().length > 0 && !b.closest('[role="menu"], [role="listbox"], [role="dialog"]'));
             const famRe = new RegExp(fam, 'i');
+            // ⭐ THE OPENER NEEDS THE UPSELL RULE TOO. It takes the FIRST visible
+            // button naming the family, in document order — and an "Upgrade to
+            // Opus" banner sitting above the composer names the family exactly
+            // the way the trigger does. Clicking it opens the billing surface
+            // over the composer.
+            //
+            // ⓘ This is not the blocking finding: the pick that follows finds
+            // only excluded chips inside whatever mounted, gives up, and Escapes
+            // — so nothing is ever REPORTED as a successful model selection. But
+            // the user still gets a payment modal in the middle of a run, and
+            // the guard existed one function away.
+            const isAlnum = c => !!c && ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'));
+            const normU = s => (s || '').replace(/[\\s\\x1c-\\x1f\\x85\\ufeff]+/g, ' ').trim();
+            const isUpsell = (raw) => {
+                const s = normU(raw).toLowerCase(), n = normU(fam).toLowerCase();
+                if (!s || !n) return false;
+                for (const rawVerb of verbs) {
+                    const verb = String(rawVerb).toLowerCase();
+                    if (!verb) continue;
+                    let i = s.indexOf(verb);
+                    while (i !== -1) {
+                        const end = i + verb.length;
+                        const leftOk = i === 0 || !isAlnum(s[i - 1]);
+                        const rightOk = end >= s.length || !isAlnum(s[end]);
+                        if (leftOk && rightOk) {
+                            const j = s.indexOf(n, end);
+                            if (j !== -1 && j - end <= upsellWindow) return true;
+                        }
+                        i = s.indexOf(verb, i + 1);
+                    }
+                }
+                return false;
+            };
+            const openable = btns.filter(b => !isUpsell(b.textContent || ''));
             // The model-selector trigger shows the currently-selected model name.
-            let trigger = btns.find(b => famRe.test(b.textContent || ''));
-            if (!trigger) trigger = btns.find(b => {
+            let trigger = openable.find(b => famRe.test(b.textContent || ''));
+            if (!trigger) trigger = openable.find(b => {
                 const t = (b.textContent || '').toLowerCase();
                 return t.includes('sonnet') || t.includes('haiku') || t.includes('claude');
             });
             if (trigger) { trigger.click(); return true; }
             return false;
-        }""", _claude_family)
+        }""", {"fam": _claude_family, "verbs": list(UPSELL_VERBS),
+               "upsellWindow": UPSELL_WINDOW})
         # The cadence clock is stamped on the ATTEMPT, not on a successful read.
         # A success-only stamp would leave the check permanently due the moment
         # the popover markup rotates, re-opening it on every run — one dead canary
@@ -39598,8 +40100,15 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
             await asyncio.sleep(0.8)
             # ── Step 1B: pick the highest family member — ONLY when the model
             #              isn't already correct (no re-click, #744) ──
+            # `verbs`/`upsellWindow` come from models.py rather than being
+            # written into the JS, so the browser and the Python mirror
+            # (`pick_highest_model(..., drop_upsell=True)`) read the SAME list.
+            # A literal here is how the reject rule drifted the first time.
             _pick_args = {"pin": pin_model, "below": step_below, "fam": _claude_family,
-                          "triggerText": (_trigger_read or {}).get("trigger_text") or ""}
+                          "triggerText": (_trigger_read or {}).get("trigger_text") or "",
+                          "verbs": list(UPSELL_VERBS), "upsellWindow": UPSELL_WINDOW}
+            _probe_args = {"fam": _claude_family, "verbs": list(UPSELL_VERBS),
+                           "upsellWindow": UPSELL_WINDOW}
             if not model_ok:
                 try:
                     for _attempt in range(8):
@@ -39616,6 +40125,64 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                     # FAIL branch below, which Escapes before returning False.
                     log(f"[setup_claude_dr] Step 1B poll errored ({_pe}) — dismissing popover", "WARN")
                     opus_selected = None
+                if not opus_selected and _claude_family == _claude_primary \
+                        and _claude_free_family:
+                    # ── Step 1B†: is this a PLAN LIMIT rather than a miss? ──
+                    # ⭐ "No family row was clickable" has two causes that want
+                    # opposite responses, and until now they were indistinguish-
+                    # able: a rollout/rename (transient — keep failing loudly so
+                    # it gets fixed) versus an account whose plan does not
+                    # include this family at all (permanent — nothing here will
+                    # ever change, and failing forever means every run goes out
+                    # on whatever the menu was left defaulting to, at whatever
+                    # effort that model happened to carry).
+                    #
+                    # The probe separates them from the DOM itself: family rows
+                    # present but ALL of them sales chips is the plan limit,
+                    # stated by the page rather than inferred from a tier
+                    # verdict a CUA pass guessed at. That matters — the tier
+                    # read fails open to "assume Pro", so it cannot be what
+                    # selects a model.
+                    #
+                    # ⛔ Guarded to the PRIMARY family: once we are already on
+                    # the fallback there is nothing further to fall back to, and
+                    # re-entering would re-open the same menu forever.
+                    _limited = await _claude_plan_limited(page, _probe_opus_js, _probe_args)
+                    if _limited:
+                        log(f"[setup_claude_dr] Step 1B†: every '{_claude_family}' row in the "
+                            f"menu is a sales prompt — this account's plan does not include "
+                            f"{_claude_family}. Falling back to the '{_claude_free_family}' "
+                            f"family (highest offered, same effort policy).", "INFO")
+                        _claude_family = _claude_free_family
+                        _pick_args = {**_pick_args, "fam": _claude_family,
+                                      "pin": None, "below": None}
+                        _probe_args = {**_probe_args, "fam": _claude_family}
+                        try:
+                            for _attempt in range(8):
+                                _picked = await page.evaluate(_pick_opus_js, _pick_args)
+                                if _picked:
+                                    opus_selected = _picked.get("label")
+                                    _picked_version = _picked.get("version")
+                                    _model_changed = True
+                                    break
+                                await asyncio.sleep(0.4)
+                        except Exception as _fe:
+                            log(f"[setup_claude_dr] Step 1B† fallback poll errored ({_fe})",
+                                "WARN")
+                            opus_selected = None
+                        if opus_selected:
+                            # ⚠ RECORDED BEFORE Step 1C runs and before this
+                            # function can return, because every later reader —
+                            # the pre-send re-activation, the ladder's outcome
+                            # probe, both CUA missions, the known-good ledger —
+                            # asks this dict which family to assert on. A pick
+                            # that is not recorded is a pick the very next pass
+                            # reads as a regression and undoes.
+                            _P2_ACTIVE_FAMILY["claude"] = _claude_family
+                            _report_claude_plan_limit(_claude_primary, _claude_family)
+                        else:
+                            log(f"[setup_claude_dr] Step 1B†: no '{_claude_free_family}' row was "
+                                f"clickable either — leaving the model untouched", "WARN")
                 if opus_selected:
                     log(f"[setup_claude_dr] Step 1B OK: selected {opus_selected!r} "
                         f"(v{_picked_version})")
@@ -39645,7 +40212,7 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                 try:
                     _probe = None
                     for _attempt in range(3):
-                        _probe = await page.evaluate(_probe_opus_js, {"fam": _claude_family})
+                        _probe = await page.evaluate(_probe_opus_js, _probe_args)
                         # A mounted menu with rows is the only trustworthy answer;
                         # anything else means "hasn't rendered yet" → retry.
                         if (_probe or {}).get("menu") and (_probe or {}).get("n"):
@@ -40367,7 +40934,12 @@ async def _dr_outcome_state(page, platform: str) -> str:
                 return "off"
             return "unknown"
         if p == "claude":
-            st = await page.evaluate(_CLAUDE_MODE_STATE_JS, p2_family("claude") or "opus") or {}
+            # ⚠ The RUN's family. Frozen to the policy word, this probe answers
+            # "unknown" for every pass of a run that deliberately fell back —
+            # and "unknown" is the reading that makes the ladder re-run the CUA
+            # validator it exists to skip.
+            st = await page.evaluate(
+                _CLAUDE_MODE_STATE_JS, _p2_active_family("claude") or "opus") or {}
             # ⛔ Never 'off'. This detector's False is not evidence — see above.
             return "on" if (st.get("hasExtended") and st.get("researchOn")) else "unknown"
     except Exception as e:
@@ -40476,7 +41048,15 @@ async def validate_setup_with_cua(browser, cua_client, page, platform, label, ve
     validator_map = {
         "chatgpt": PROMPT_VALIDATE_CHATGPT_SETUP,
         "gemini": PROMPT_VALIDATE_GEMINI_SETUP,
-        "claude": PROMPT_VALIDATE_CLAUDE_SETUP,
+        # ⛔⛔ RENDERED PER CALL with the run's family, not the import-time
+        # constant. This validator runs after the DOM setup SUCCEEDED, and its
+        # step 1 is "only touch the model if the button doesn't name <fam>". On
+        # a run that deliberately fell back, a constant frozen to the primary
+        # family makes that clause fire on the CORRECT model and sends the
+        # validator into the menu whose only primary-family rows are the sales
+        # chips the DOM layer just refused — the pass whose job is to confirm
+        # the model would be the pass that undoes it.
+        "claude": claude_validate_setup_prompt(_p2_active_family("claude")),
     }
     user_msg_map = {
         "chatgpt": "Verify Deep Research mode is ACTIVE in ChatGPT. Fix if not. Do not type.",
@@ -40488,7 +41068,10 @@ async def validate_setup_with_cua(browser, cua_client, page, platform, label, ve
         # leave the model alone — opening the menu here is the second
         # model-menu interaction users saw as "the selector opens twice").
         # `Adaptive thinking` is gone with the toggle — see P2_MODEL_POLICY.
-        "claude": p2_claude_validate_directive(),
+        # Same family, same reason — this string and the system prompt above go
+        # to ONE CUA call, so a family that reaches only one of them leaves the
+        # agent holding two instructions that disagree about the model.
+        "claude": p2_claude_validate_directive(_p2_active_family("claude")),
     }
     sys_prompt = validator_map.get(platform.lower())
     user_prompt = user_msg_map.get(platform.lower())
@@ -41388,13 +41971,26 @@ async def ensure_deep_mode_active(page, platform, label, reactivate=True) -> dic
         if platform_l == "claude":
             # Check BOTH: the model FAMILY is selected AND the Research tool is on.
             # Family word from policy (single source of truth) — passed into the JS.
-            _cl_family = p2_family("claude") or "opus"
+            # ⛔⛔ THE RUN'S family, not the policy's — this is the reader that
+            # made the fallback non-additive. `hasExtended` means "the trigger
+            # names the family we are supposed to be on". Asked about the
+            # primary family on a run that deliberately selected the fallback,
+            # it is False on a perfectly correct composer, so this branch reads
+            # "mode regressed" and re-runs the ENTIRE Claude setup before every
+            # single send — on every run, for the life of that account.
+            _cl_family = _p2_active_family("claude") or "opus"
             _claude_state_js = _CLAUDE_MODE_STATE_JS
             state = await page.evaluate(_claude_state_js, _cl_family)
             if reactivate and (not state.get("hasExtended") or not state.get("researchOn")):
                 log(f"[{label}] Claude mode regressed before send "
                     f"(extended={state.get('hasExtended')}, research={state.get('researchOn')}) — re-activating", "WARN")
                 await setup_claude_dr(page)
+                # ⚠ RE-READ the family too, not just the state. The setup we
+                # just ran is what discovers a plan limit, so on the first pass
+                # of a non-pro run the family it settled on is newer than the
+                # one this function read a moment ago — and re-checking with the
+                # stale word would report the fix it just made as still broken.
+                _cl_family = _p2_active_family("claude") or _cl_family
                 # E2 — re-evaluate AFTER the re-activation attempt so the
                 # caller sees the actual final state, not the pre-fix one.
                 # If Step 3A/3B selectors are still broken, researchOn will
@@ -43728,8 +44324,15 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
         # install can still step back.
         if not research_ok and platform_l in ("claude", "gemini"):
             _failed = _P2_PICKED_VERSION.get(platform_l)
+            # ⛔ The version that failed belongs to the family this run is on,
+            # and so must the pin we retreat to. Without the family, a run that
+            # fell back would pin to a number learned from the OTHER family —
+            # "4.6" names a real model in both and the same model in neither —
+            # and the single retry this path exists to provide would be spent
+            # hunting a row that was never on the menu.
+            _step_fam = _p2_active_family(platform_l)
             try:
-                _kg = p2_known_good(platform_l)
+                _kg = p2_known_good(platform_l, _step_fam)
             except Exception:
                 _kg = None      # a malformed overlay must never kill the retry
             _failed_f = float(_failed) if isinstance(_failed, (int, float)) else None
@@ -43822,7 +44425,11 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             # tracks the latest PROVEN model as platforms advance. Pure side-
             # channel (only the fallback TARGET; never the gates); no-op unless
             # DG_MODEL_REFRESH_ENABLED is armed.
-            record_known_good(platform_l, _P2_PICKED_VERSION.get(platform_l))
+            # Family-scoped for the same reason the pin read is — see the
+            # step-back note above. A Sonnet version written into the Opus slot
+            # is not a smaller mistake than reading it out of one.
+            record_known_good(platform_l, _P2_PICKED_VERSION.get(platform_l),
+                              _p2_active_family(platform_l))
             _tstate = _P2_THINKING_STATE.get(platform_l) or {}
             _pol = p2_labels(platform_l)
             _missing = []
@@ -44770,7 +45377,13 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         # Version-free like the Phase-2 timeline copy above: the runtime picks the
         # highest Opus offered, so a pinned "4.8" here misreports the moment the
         # family moves on — and it did, the account has been on Opus 5.
-        emit_event("agent_progress", phase=2, agent="claude", status="starting", progress="Opening Claude with the latest Opus (Max effort) + Research tools...")
+        # The family word comes from policy for the same reason the version was
+        # removed: a literal here is user-facing copy that goes stale silently.
+        emit_event("agent_progress", phase=2, agent="claude", status="starting",
+                   progress=f"Opening Claude with the latest "
+                            f"{(p2_family('claude') or 'Opus').capitalize()} "
+                            f"({str(p2_labels('claude').get('effort', 'max')).capitalize()} "
+                            f"effort) + Research tools...")
         # #929: launch-site persisted-status reset — see the 2A note.
         _write_agent_terminal_status("claude", "running", force=True)
         for attempt in range(2):
@@ -44780,8 +45393,10 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 except Exception: pass
             claude_page, _claude_setup_ok = await start_agent_no_gemini_wait(
                 browser, cua_client, "https://claude.ai/new",
-                PROMPT_CLAUDE_DEEP_RESEARCH,
-                p2_claude_setup_directive(),
+                # Re-rendered on EACH attempt: attempt 1's DOM setup is what
+                # discovers a plan limit, so attempt 2 must be told about it.
+                claude_deep_research_prompt(_p2_active_family("claude")),
+                p2_claude_setup_directive(_p2_active_family("claude")),
                 brief_text, "2B", "Claude", verbose, brief_path=brief_path,
                 source_paths=source_paths)
             if not _claude_setup_ok:
@@ -49850,6 +50465,16 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     # per-drop-path disarms keep it clean within a run. Also covers resume
     # re-entries (a stale pre-crash deadline must not ride the checkpoint back).
     _disarm_registry("__all__")
+    # Same cross-run-wipe cluster, and the one with the worst failure mode.
+    # `_P2_ACTIVE_FAMILY` records "this ACCOUNT's plan excludes the primary
+    # model family". The worker is long-lived and runs jobs sequentially, so
+    # without this wipe a single non-pro run teaches the process a fallback
+    # family that every LATER run inherits — including runs signed into a Pro
+    # account, which would then be steered onto the fallback family with model
+    # selection reporting complete success. A silent permanent downgrade
+    # triggered by one visit from a free account is far worse than re-deriving
+    # the fact, which costs one popover read on the runs that need it.
+    _P2_ACTIVE_FAMILY.clear()
     # Same cross-run-wipe cluster: Vision's per-run budget/telemetry lives on
     # vision.default_client()'s singleton VisionMetrics, which the long-lived
     # --serve worker reuses across runs. Left un-reset, call_count accumulates
@@ -56460,6 +57085,26 @@ async def run_server(port=8000):
         print(f"      Stop it, or start this backend on another port.\n")
         raise SystemExit(3)
 
+    if _port_state == "busy":
+        # Ours, and mid-flight. This is the one refusal that is NOT about
+        # identity — we know exactly what is there and that is why we leave it
+        # alone. Say what it is doing, so "in use" does not read as the same
+        # dead end the raw EADDRINUSE was.
+        _act = next((h.get("activity") or {} for h in _port_holders_found
+                     if h.get("activity")), {})
+        _pids = ", ".join(str(h["pid"]) for h in _port_holders_found) or "unknown"
+        _doing = "running a research" if _act.get("running") else "working"
+        _queued = int(_act.get("pending") or 0)
+        print(f"[serve] bind refused: port {port} is held by a working backend "
+              f"(pid {_pids})", file=sys.stderr, flush=True)
+        print(f"\n  {_c(_ERR, '⛔')}  Port {port} is already in use by a Super Research "
+              f"backend that is {_doing}.")
+        print(f"      pid {_pids}"
+              + (f" — {_queued} job(s) queued" if _queued else ""))
+        print(f"      Nothing was stopped. Wait for it to finish, or start this "
+              f"backend on another port.\n")
+        raise SystemExit(3)
+
     if _port_state == "stuck":
         _pids = ", ".join(str(h["pid"]) for h in _port_holders_found) or "unknown"
         print(f"[serve] bind refused: port {port} did not come free (EADDRINUSE)",
@@ -60239,7 +60884,17 @@ def _looks_like_our_backend(cmdline: str) -> bool:
     # LOWERCASED. On macOS the framework interpreter's real basename is
     # "Python", capital P — a case-sensitive check read our own backend as a
     # stranger and refused to reclaim its port.
-    base = [os.path.basename(x).lower() for x in toks]
+    #
+    # And `.exe` STRIPPED, for the same class of reason on the other platform.
+    # Windows installs the console script as `superresearch.exe`, which matched
+    # none of the three tests below — not `runs_console` (bare name), not
+    # `is_python`, not `runs_script`. A backend the user started the documented
+    # way therefore read as a STRANGER, so when it was later orphaned and still
+    # holding the port, the caller printed "already in use by something that is
+    # not Super Research" and refused to boot. Fail-safe, but a permanent
+    # refusal on the one platform where reclaiming is most needed. `_prog_name`
+    # (research.py:210) has always stripped it; this function never did.
+    base = [_strip_exe(os.path.basename(x).lower()) for x in toks]
     is_python = any(b.startswith("python") or b.startswith("pypy") for b in base)
     runs_script = any(b == "research.py" for b in base)
     runs_console = any(b == "superresearch" for b in base)
@@ -60319,10 +60974,20 @@ def _reclaim_port(port: int, settle_s: float = 12.0):
     port from a process we cannot identify is not ours to do, and "it was on my
     port" is not a justification anyone would accept afterwards.
 
+    ⭐ 2026-08-13 (review). Clearing a STALE copy of ourselves was the whole
+    point; clearing a WORKING one never was. Every holder that matched by name
+    was signalled with no test of whether it was doing anything, so a second
+    `--serve` — the command this product's own "Start it yourself" hint prints —
+    ended a run that was mid-flight and took its partial output with it. A
+    holder that is doing work is now refused like a foreign one: named, not
+    signalled. See `_port_backend_activity` for why the liveness probe sitting
+    just below this function is NOT the predicate for that question.
+
     Returns (state, holders) where state is one of:
       free      — nothing was holding it
       reclaimed — a stale copy of ours was stopped and the port came back
       foreign   — something else holds it; caller must refuse
+      busy      — ours, and running or queueing work; caller must refuse
       stuck     — ours, but it would not let go
     """
     import signal as _sig   # NOT module-level in this file; `_kill_tree` imports
@@ -60344,6 +61009,39 @@ def _reclaim_port(port: int, settle_s: float = 12.0):
         # Nothing identifiable: could be a socket in TIME_WAIT after a hard kill,
         # which clears on its own. Wait it out rather than guess at a pid.
         return ("free", []) if _wait_for_port_free(port, settle_s) else ("stuck", [])
+
+    # Ours by name — but not therefore ours to end. Ask the holder what it is
+    # doing before signalling it. One probe for the port, not per holder: they
+    # are all listening on the same socket, so at most one of them answers.
+    #
+    # ⛔ Deliberately NOT `_port_answers_health`. It reads the status code, and
+    # `/api/health` returns ok on every path, so it is equally true of the
+    # orphan this function exists to clear — gating on it would refuse every
+    # reclaim and delete the feature while reading like a safety fix.
+    #
+    # A holder that does not answer at all is still reclaimed: a wedged event
+    # loop is precisely the state the terminal-less orphan is in, and refusing
+    # there would put us back at the unexplained EADDRINUSE this replaced.
+    #
+    # ⭐⭐ BUT SILENCE IS ASKED MORE THAN ONCE, and this repo already knew why:
+    # `WATCHDOG_HANG_RUNNING_SEC = 420` exists because "runs can briefly block
+    # the loop", so a WORKING worker legitimately failing to answer for a few
+    # seconds is normal by this codebase's own standard. A single 3s probe that
+    # reads silence as idle therefore re-opens the finding for exactly the
+    # holders it matters most for — three hours into a run, one blocking
+    # section, killed. Retrying across the settle window costs nothing when the
+    # holder is genuinely dead (it never answers, and the caller was going to
+    # spend that time waiting for the port anyway) and is the difference between
+    # "not answering" and "not working" for one that is alive.
+    _activity = _probe_backend_activity_until_settled(port, settle_s)
+    if _backend_activity_is_work(_activity):
+        for h in ours:
+            h["activity"] = dict(_activity or {})
+        log(f"[serve] port {port} is held by a Super Research backend that is "
+            f"working (running={bool((_activity or {}).get('running'))} "
+            f"pending={(_activity or {}).get('pending', 0)}) — refusing to stop it",
+            "WARN")
+        return "busy", ours
 
     for h in ours:
         log(f"[serve] port {port} is held by an earlier backend (pid {h['pid']}) "
@@ -60408,7 +61106,13 @@ def _port_answers_health(port: "int | None", timeout: float = 1.5) -> bool:
     """True if http://127.0.0.1:<port>/api/health responds 2xx. Used by the
     pre-flight sweep to avoid reaping a worker that is currently serving — it
     may belong to a LIVE sibling supervisor (RC-2 collateral protection in the
-    degraded no-single-instance-lock case). stdlib only."""
+    degraded no-single-instance-lock case). stdlib only.
+
+    ⛔ This answers "is a process alive there", NOT "is it safe to stop". The
+    handler returns `{"status": "ok"}` on every path it can reach, so a 2xx is
+    equally true of a backend running a pipeline and of the abandoned orphan
+    `_reclaim_port` exists to clear. Where the question is whether stopping it
+    would destroy work, use `_port_backend_activity` — see the note there."""
     if not port:
         return False
     try:
@@ -60417,6 +61121,87 @@ def _port_answers_health(port: "int | None", timeout: float = 1.5) -> bool:
             return 200 <= getattr(r, "status", 200) < 300
     except Exception:
         return False
+
+
+def _port_backend_activity(port: "int | None", timeout: float = 3.0) -> "dict | None":
+    """What the backend on `port` says it is DOING, or None if nothing answered.
+
+    ⭐ The companion to `_port_answers_health`, and the difference between the
+    two is the whole reason this exists. That one reads the STATUS CODE, and
+    `/api/health` has exactly one return statement — `{"status": "ok", …}` — so
+    a 2xx proves a process is alive and nothing more. It is just as true of a
+    worker three hours into a research as of the terminal-less orphan we are
+    trying to clear, which means it cannot decide between them in either
+    direction: refusing on it would never reclaim anything.
+
+    The BODY is where the answer lives. `running` is this worker's live pipeline
+    and `pending` its queued jobs — the same two facts the `restart` and
+    `update` command handlers already refuse on, read from the same
+    `_QUEUE_STATE`/`_job_queue` pair. Reusing them keeps one definition of
+    "this backend is busy" instead of inventing a second.
+
+    Returns `{"running": bool, "pending": int}` when the answer parsed, else
+    None. ⚠ None means NOTHING ANSWERED — a wedged event loop, a half-dead
+    process, or something that is not us — it does not mean "idle", and a caller
+    must not read it as permission on its own evidence. stdlib only, matching
+    `_port_answers_health` and the supervisor's `_probe_worker_health`."""
+    if not port:
+        return None
+    try:
+        import urllib.request as _u
+        with _u.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=timeout) as r:
+            if not 200 <= getattr(r, "status", 200) < 300:
+                return None
+            body = json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(body, dict):
+        return None
+    try:
+        pending = int(body.get("pending") or 0)
+    except (TypeError, ValueError):
+        pending = 0
+    return {"running": bool(body.get("running")), "pending": pending}
+
+
+def _probe_backend_activity_until_settled(port: "int | None",
+                                          settle_s: float = 12.0,
+                                          attempts: int = 3) -> "dict | None":
+    """`_port_backend_activity`, retried until something answers or time is up.
+
+    ⭐ WHY RETRY AT ALL. A single probe conflates "not answering" with "not
+    working", and this codebase already documents that those differ: the
+    supervisor watchdog allows a mid-run worker **420 seconds** of silence
+    (`WATCHDOG_HANG_RUNNING_SEC`) on the stated grounds that "runs can briefly
+    block the loop". Against that, one 3-second probe deciding a quiet holder is
+    idle is not a liveness test — it is a coin toss weighted against the busiest
+    workers, which are the ones with the most to lose.
+
+    Stops at the FIRST answer, whatever it says: an explicit `running: false` is
+    a real reading and retrying it would only delay an idle reclaim.
+
+    ⚠ Retries do NOT make silence mean "busy". A holder that never answers is
+    still reclaimed — that is the wedged terminal-less orphan this whole feature
+    exists to clear, and refusing it would trade one silent failure for another.
+    """
+    deadline = time.monotonic() + max(0.0, settle_s)
+    for n in range(max(1, attempts)):
+        found = _port_backend_activity(port)
+        if found is not None:
+            return found
+        if n + 1 >= max(1, attempts) or time.monotonic() >= deadline:
+            break
+        time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+    return None
+
+
+def _backend_activity_is_work(activity: "dict | None") -> bool:
+    """Whether `_port_backend_activity`'s answer means "stopping this destroys
+    work". Split out from the probe so the DECISION is testable without a socket
+    — and so there is one place to look when the rule changes."""
+    if not activity:
+        return False
+    return bool(activity.get("running")) or (activity.get("pending") or 0) > 0
 
 
 def _parse_serve_port_from_cmd(cmd: str) -> "int | None":
@@ -63616,7 +64401,8 @@ def _device_version_fields(*, force: bool = False) -> dict:
         # pull" and hide the Check/Update control — distinct from a pipx build
         # that just hasn't reported its version yet (offline/just-started), which
         # is also version None but SHOULD keep Check.
-        return {"version": None, "updateAvailable": None, "sourceCheckout": True}
+        return {"version": None, "updateAvailable": None, "sourceCheckout": True,
+                "servingVersion": None}
     try:
         _v = _sr_version()
         version = _v if (_v and not _v.startswith("(")) else None
@@ -63626,7 +64412,32 @@ def _device_version_fields(*, force: bool = False) -> dict:
         update_available = _check_newer_version(force=force)  # newer-than-installed or None
     except Exception:
         update_available = None
-    return {"version": version, "updateAvailable": update_available, "sourceCheckout": False}
+    # ⭐⭐ THE TWO NUMBERS ARE NOT THE SAME NUMBER, and publishing only the first
+    # is what made the app's Restart button unreachable.
+    #
+    #   `version`        — what is ON DISK. `_sr_version()` re-reads the
+    #                      dist-info, so it flips to the new release THE INSTANT
+    #                      pipx finishes, inside a process still executing the
+    #                      old code.
+    #   `servingVersion` — what THIS PROCESS is executing, frozen at import.
+    #
+    # Between an install and a restart those disagree, and that disagreement IS
+    # the definition of "a restart is owed". With only the disk number published,
+    # the app compared it against the update target, found them equal, and
+    # concluded the update was finished — so it hid the Restart control at
+    # exactly the moment it was needed, and treated a successful restart (which
+    # moves nothing the app could see) as the backend failing to come back.
+    #
+    # ⭐ Published on the ordinary heartbeat rather than recorded once, which is
+    # what makes it self-correcting: the restarted process publishes its own boot
+    # version and the disagreement disappears with no one having to clear a flag.
+    # ⛔ Deliberately NOT folded into `updateStatus` — that record belongs to an
+    # update in flight, and a heartbeat writing into it would race the update it
+    # is describing.
+    _sv = _serving_version()
+    serving = _sv if (_sv and not _sv.startswith("(")) else None
+    return {"version": version, "updateAvailable": update_available,
+            "sourceCheckout": False, "servingVersion": serving}
 
 
 def _pipx_cmd() -> "list[str] | None":

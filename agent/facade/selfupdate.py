@@ -280,6 +280,22 @@ def _ver(v):
             digits += ch
         out.append(int(digits or 0))
     return tuple(out)
+def _ver_ge(a, b):
+    """Is version `a` at least version `b`? ZERO-PADDED to equal length first.
+
+    Tuples of different lengths do not compare the way versions do: `(0, 2) <
+    (0, 2, 0)`, so `0.2` and `0.2.0` — the same release — read as one being
+    behind the other. Here that verdict is not cosmetic: `usable_install()`
+    would call a perfectly good install unusable and send `_do_upgrade` on to
+    the destructive uninstall branch.
+
+    `autostart._ver_ge` pads for exactly this reason and this twin did not, so
+    the pair had already drifted. Not reachable while we only ever ship
+    3-segment versions — the padding is what keeps a 2-segment release from
+    making it reachable."""
+    x, y = _ver(a), _ver(b)
+    n = max(len(x), len(y))
+    return x + (0,) * (n - len(x)) >= y + (0,) * (n - len(y))
 def usable_install():
     """Whether what is on disk NOW is something we would be happy to run.
 
@@ -303,7 +319,7 @@ def usable_install():
     if installed_entry() is None:
         return False
     v = installed_version()
-    return not (v and floor) or _ver(v) >= _ver(floor)
+    return not (v and floor) or _ver_ge(v, floor)
 # 1) Replace the PERSISTENT install. Not `pipx upgrade`: an in-place upgrade
 #    LAYERS the new distribution over the old venv, so a module the release
 #    deleted stays importable and a half-written venv stays half-written.
@@ -322,6 +338,17 @@ def usable_install():
 #        remove a venv it did not create in the same session ("Not removing
 #        existing venv … because it was not created in this session"), so a
 #        network blip mid-window leaves the previous agent installed and working.
+#
+#    ⚠ THE VERSION IN THAT SENTENCE IS LOAD-BEARING, and two earlier comments
+#    contradicted each other about it while both citing "real pipx". Both were
+#    right about different builds: `install --force` over a UV-BACKED venv fails
+#    on pipx 1.14/1.15 and works from 1.16 (`PIPX_MIN_FOR_FORCE`). The old
+#    comment claiming --force cannot work on a uv backend was describing a pipx
+#    that has since been fixed; the measurement replacing it was taken on 1.16.5.
+#    Neither said which. On the older builds this ladder still recovers, because
+#    the uninstall-then-plain-install branch below is a real install — that is
+#    why the missing rung showed up in `ensure_durable_install`, which had no
+#    ladder at all, and not here.
 #
 #    Uninstall-first is therefore the RECOVERY order, not the clean one — it is
 #    the only thing that clears an obstruction `--force` could not overwrite, and
@@ -467,6 +494,15 @@ def ensure_durable_install() -> "tuple[bool, str]":
     refuses to delete a venv it did not create in the same session, so a failure
     leaves the old install working rather than leaving the host with none.
 
+    ⚠ `--force` is not universal, though, and that is the second rung. On a
+    UV-BACKED pipx it fails outright on 1.14/1.15 and only works from 1.16 —
+    a floor nothing here stated — and with a single rung those hosts came out of
+    this function with no durable install and therefore no login pin at all.
+    A `pipx upgrade` retry now follows a failed `--force`: non-destructive,
+    incapable of leaving the host agent-less, and reached only after the clean
+    path has already failed. The pipx version is reported on the failure message
+    as a WARNING, never enforced as a floor — see `_with_pipx_note`.
+
     ⛔ THERE IS NO UNINSTALL FIRST, and the reason is written out in the detached
     waiter a few hundred lines up: uninstall-first "is the RECOVERY order, not the
     clean one", and "the only order that can leave the host with no agent at all".
@@ -493,15 +529,85 @@ def ensure_durable_install() -> "tuple[bool, str]":
     try:
         r = subprocess.run([*pipx, "install", "--force", _agent_floor_spec()],
                            capture_output=True, text=True, timeout=600)
+    except subprocess.TimeoutExpired as e:
+        # ⛔ A TIMEOUT DOES NOT FALL THROUGH, and the asymmetry is deliberate.
+        # `subprocess.run` kills and reaps the pipx process before raising — but
+        # pipx delegates to a pip/uv GRANDCHILD inside the target venv, which
+        # survives orphaned. A network-stalled pip can resume minutes later and
+        # write into the same venv while a retry is mutating it, and pipx takes
+        # no cross-process lock, so a half-merged venv could still satisfy the
+        # durability check and get pinned. Nothing is lost by refusing: the
+        # failure this ladder exists for (uv-backed pipx 1.14/1.15) is a non-zero
+        # EXIT, never a timeout.
+        return False, _with_pipx_note(pipx, str(e)[:200] or "pipx install timed out")
     except Exception as e:  # noqa: BLE001 - surface the reason, never raise into connect
-        return False, str(e)
-    if r.returncode != 0:
+        # ⚠ Every OTHER exception falls through to rung 2 rather than returning.
+        # An OSError here is a rung-1 failure like any other and the
+        # non-destructive retry is exactly as applicable to it; returning early
+        # made the rescue reachable only from a non-zero EXIT CODE, which is a
+        # distinction the caller has no reason to care about. Unlike a timeout,
+        # nothing is left running behind it.
+        r = None
+        reason = str(e)[:200] or "pipx install raised"
+    if r is None:
+        pass                                    # the exception's reason stands
+    elif r.returncode != 0:
         tail = (r.stderr or r.stdout or "").strip().splitlines()
-        return False, (tail[-1][:200] if tail else "pipx install failed")
-    if not autostart.pin_target_is_durable():
+        reason = (tail[-1][:200] if tail else "pipx install failed")
+    elif not autostart.pin_target_is_durable():
         # pipx exited 0 but we still can't resolve a durable package dir — pinning
         # now would write the cache path anyway, which is the exact bug. Say so.
-        return False, "installed, but its package directory couldn't be resolved"
+        reason = "installed, but its package directory couldn't be resolved"
+    else:
+        reason = ""
+    if reason:
+        # ── Rung 2: a NON-DESTRUCTIVE retry, and the reason it exists ──────────
+        # `pipx install --force` over a UV-BACKED venv fails outright on pipx
+        # 1.14/1.15 and succeeds from 1.16. Nothing in this repo documented or
+        # enforced that floor, so on those hosts the single-rung path above left
+        # the user with NO durable install and therefore no login pin at all —
+        # `cli._pin_startup` returns before `autostart.install()`.
+        #
+        # `pipx upgrade` LAYERS the new distribution over the existing venv,
+        # which is exactly why it is not the primary path: a module the release
+        # deleted stays importable. But it is the one rung that works on those
+        # pipx versions, and it cannot leave the host with no agent — so it is
+        # safe to try after `--force` has already failed, and only then.
+        #
+        # ⛔ NOT an uninstall ladder. Uninstall-first is "the RECOVERY order, not
+        # the clean one" and "the only order that can leave the host with no
+        # agent at all" (see `_do_upgrade`); an earlier review round had this
+        # function uninstalling unconditionally and asked for its removal. Adding
+        # one back here would re-open exactly that finding.
+        #
+        # No `--spec`: `pipx upgrade` takes the app name and goes to latest, and
+        # LATEST CANNOT BE BACKWARDS — an upgrade never walks the venv down to an
+        # older release, so the `>=running` floor is satisfied by construction.
+        #
+        # ⭐ MEASURED, 2026-08-14, because a review asserted the opposite: that a
+        # uv backend re-resolves rather than preferring the installed candidate,
+        # so a host on a build newer than the index could be rewritten downwards.
+        # Tested against pipx 1.14, 1.15 and 1.16.0 with uv 0.12.1 as the backend,
+        # using a local index deliberately rolled BACK below the installed
+        # version — including the dev-build variant that claim named as the
+        # trigger. Every generation answered "already at latest version"; the
+        # downgrade never happened. `uv pip install -U` and `pip install -U`
+        # behave the same on the bare name. `_agent_floor_spec`'s docstring had
+        # already recorded this measurement; the claim was made without testing.
+        #
+        # ⓘ Even if a future backend did re-resolve, the gate below contains it:
+        # `pin_target_is_durable` requires installed >= running, so a backwards
+        # rewrite could not be accepted as success or pinned to.
+        try:
+            u = subprocess.run([*pipx, "upgrade", AGENT_PKG],
+                               capture_output=True, text=True, timeout=600)
+            upgraded = u.returncode == 0
+        except Exception:
+            upgraded = False
+        if upgraded and autostart.pin_target_is_durable():
+            spawn_detached_cache_clear()
+            return True, "upgraded the existing durable copy to pin to"
+        return False, _with_pipx_note(pipx, reason)
     # The run-cache copy is now dead weight, and a ~14-day-old one is worse than
     # that: `pipx run` reuses it, so a later bootstrap would replay a build older
     # than the install we just made. Dropping it is what makes "no cache needed"
@@ -519,6 +625,58 @@ def _pipx_cmd() -> "list[str] | None":
         return [exe]
     py = shutil.which("python3") or shutil.which("python") or sys.executable
     return [py, "-m", "pipx"] if py else None
+
+
+# The lowest pipx we have measured `install --force` to work on over a UV-backed
+# venv. 1.14 and 1.15 fail there; 1.16 succeeds. Stated here because it was
+# nowhere in the repo — the install path simply assumed it.
+PIPX_MIN_FOR_FORCE = "1.16"
+
+
+def _pipx_version(pipx: "list[str]") -> str:
+    """The installed pipx version as a bare string, or "" when it can't say.
+
+    ⚠ The first DIGIT-LEADING token, not simply the first token. Two reasons,
+    and the second is the one that matters: some builds print `pipx 1.16.5`, and
+    — measured — `version_gt` parses an unparseable string as `(0,)`, which
+    ranks BELOW every real version. So returning whatever came out of stdout
+    would turn any unexpected output into a confident "your pipx is too old",
+    which is a manufactured diagnosis attached to someone else's failure.
+    """
+    try:
+        r = subprocess.run([*pipx, "--version"],
+                           capture_output=True, text=True, timeout=60)
+    except Exception:
+        return ""
+    if r.returncode != 0:
+        return ""
+    for tok in (r.stdout or "").split():
+        if tok[:1].isdigit():
+            return tok
+    return ""
+
+
+def _with_pipx_note(pipx: "list[str]", reason: str) -> str:
+    """`reason`, plus the installed pipx version when it is below the tested floor.
+
+    ⚠ A WARNING, NEVER A BLOCK, and that is a deliberate call rather than
+    timidity. The floor is measured against the uv backend only; plenty of hosts
+    on an older pipx run the pip backend, where `install --force` works fine.
+    Refusing on the version would break those installs to prevent a failure they
+    would never have had. So the version is attached to a failure that has
+    ALREADY happened, where it is the one piece of context that turns "pipx
+    failed" into something the user can act on.
+
+    Asked only on the failure path — the happy path must not pay an extra pipx
+    round-trip. `version_gt` returns False on anything it cannot parse, so an
+    unreadable version yields no note rather than a wrong one.
+    """
+    v = _pipx_version(pipx)
+    if not v or not version_gt(PIPX_MIN_FOR_FORCE, v):
+        return reason
+    return (f"{reason} — pipx {v} is below the tested minimum "
+            f"{PIPX_MIN_FOR_FORCE}, on which `install --force` over a uv-backed "
+            f"venv fails; upgrading pipx clears this")
 
 
 def _waiter_python() -> "str | None":
@@ -758,6 +916,10 @@ def spawn_detached_backend_install() -> bool:
 # "superresearch" in the directory name matches none of them, so the cleaner it
 # guarded deleted nothing at all while reporting that it had.
 #
+# ⛔ WHICH contents matters as much as the decision to read them: the installed
+# DISTRIBUTION's metadata directory, never a top-level import name. See
+# `is_ours` for what reading a generic import name cost.
+#
 # Scope is pipx's OWN run cache, deliberately. A uv-backed pipx runs out of uv's
 # archive store instead, and that store does not have the staleness problem this
 # cleaner exists for: `uv tool run --from <spec>` re-resolves against the index
@@ -765,9 +927,17 @@ def spawn_detached_backend_install() -> bool:
 # into uv's content-addressed, hard-linked archive by hand would risk other
 # tools' environments to fix a problem it does not have.
 _CACHE_CLEAR_WAITER = r'''
-import os, sys, time, shutil
+import os, re, sys, time, shutil
 from pathlib import Path
 pid = int(sys.argv[1]); cachedir = sys.argv[2]
+# The DISTRIBUTION name, passed in so it has ONE definition (AGENT_PKG) rather
+# than a literal in an embedded string nothing imports. A cfg written by an
+# older build omits it; the literal fallback is the same value, never a wildcard.
+dist = sys.argv[3] if len(sys.argv) > 3 else "superresearch-agent"
+def _norm(s):
+    """PEP 503 normalization — runs of `-_.` collapse to one underscore."""
+    return re.sub(r"[-_.]+", "_", s or "").lower()
+dist_norm = _norm(dist)
 def alive(p):
     if sys.platform == "win32":
         import ctypes
@@ -789,16 +959,37 @@ for _ in range(120):  # wait up to ~60s for disconnect to exit
     time.sleep(0.5)
 time.sleep(2)  # grace for the OS to release the venv's files
 def is_ours(entry):
-    """A run-venv that has OUR package installed in it. Mirrors the shape
-    autostart._venv_site_packages looks for, on both venv layouts."""
+    """A run-venv with OUR DISTRIBUTION installed in it.
+
+    ⛔ Matched on the installed distribution's METADATA directory
+    (`superresearch_agent-<version>.dist-info`), NOT on a top-level `facade`
+    package directory. The only caller of this function `rmtree`s whatever it
+    says yes to, and `facade` is a generic name any project may ship — so a
+    stranger's cached run-venv that happened to contain a package called
+    `facade` was deleted by us, silently, on two different paths. A directory
+    that costs someone else their tool must be identified by something that is
+    ours alone, and the distribution name is that; the import name is not.
+
+    Both venv layouts, the same pair autostart._venv_site_packages looks at.
+
+    ⓘ Residual, and deliberately in the safe direction: a legacy
+    non-normalized metadata dir would read as NOT ours, leaving one stale cache
+    entry behind. That is a cache entry we fail to clear, never a directory we
+    wrongly delete.
+    """
     try:
         if not entry.is_dir():
             return False
-        if (entry / "Lib" / "site-packages" / "facade").is_dir():
-            return True
-        for sp in entry.glob("lib/python*/site-packages"):
-            if (sp / "facade").is_dir():
-                return True
+        roots = [entry / "Lib" / "site-packages"]
+        roots.extend(entry.glob("lib/python*/site-packages"))
+        for sp in roots:
+            for pattern in ("*.dist-info", "*.egg-info"):
+                for meta in sp.glob(pattern):
+                    # `{name}-{version}.dist-info`; a normalized name carries no
+                    # "-", and an egg-info may omit the version entirely.
+                    stem = meta.name.rsplit(".", 1)[0]
+                    if _norm(stem.split("-", 1)[0]) == dist_norm:
+                        return True
     except Exception:
         pass
     return False
@@ -839,5 +1030,5 @@ def spawn_detached_cache_clear() -> bool:
     py = _waiter_python()
     if not cachedir or py is None:
         return False
-    cmd = [py, "-c", _CACHE_CLEAR_WAITER, str(os.getpid()), cachedir]
+    cmd = [py, "-c", _CACHE_CLEAR_WAITER, str(os.getpid()), cachedir, AGENT_PKG]
     return _spawn_detached(cmd, "cache-clear.log")

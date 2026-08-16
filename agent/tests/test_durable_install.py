@@ -636,7 +636,7 @@ def test_a_successful_bootstrap_drops_the_run_cache(monkeypatch):
     assert cleared == [True], "the stale run-cache venv was left behind"
 
 
-def _run_cache_cleaner(cache_dir):
+def _run_cache_cleaner(cache_dir, pkg=None):
     """Execute the real `_CACHE_CLEAR_WAITER` payload against `cache_dir`.
 
     It ships as a `-c` STRING run by a foreign interpreter, so nothing in the
@@ -648,17 +648,36 @@ def _run_cache_cleaner(cache_dir):
     dead = subprocess.Popen([sys.executable, "-c", "pass"])
     dead.wait()
     from facade import selfupdate
-    subprocess.run([sys.executable, "-c", selfupdate._CACHE_CLEAR_WAITER,
-                    str(dead.pid), str(cache_dir)], timeout=120,
+    argv = [sys.executable, "-c", selfupdate._CACHE_CLEAR_WAITER,
+            str(dead.pid), str(cache_dir)]
+    if pkg is not None:
+        argv.append(pkg)
+    subprocess.run(argv, timeout=120,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def _cache_entry(root, name, *, ours, windows=False):
-    """A pipx run-venv, named the way pipx names them: a bare hash."""
+def _cache_entry(root, name, *, ours, windows=False, also_facade=False,
+                 dist=None):
+    """A pipx run-venv, named the way pipx names them: a bare hash.
+
+    ⚠ Identity is the installed DISTRIBUTION's metadata directory, not a
+    top-level import name. This fixture used to write a bare `facade` package
+    for "ours" and `black` for "theirs", which made the cleaner's old
+    `facade`-directory test look correct — while in reality it deleted any
+    stranger's cached venv that shipped a package by that generic name.
+    `also_facade` builds exactly that stranger.
+    """
     sp = (root / name / "Lib" / "site-packages") if windows else \
         (root / name / "lib" / "python3.13" / "site-packages")
     sp.mkdir(parents=True)
-    (sp / ("facade" if ours else "black")).mkdir()
+    if ours:
+        (sp / "facade").mkdir()
+        (sp / f"{(dist or 'superresearch_agent')}-0.1.32.dist-info").mkdir()
+    else:
+        (sp / "black").mkdir()
+        (sp / "black-24.1.0.dist-info").mkdir()
+        if also_facade:
+            (sp / "facade").mkdir()
     return root / name
 
 
@@ -693,6 +712,87 @@ def test_the_run_cache_cleaner_leaves_other_tools_alone(tmp_path):
     _run_cache_cleaner(cache)
     assert theirs.exists(), "it deleted another tool's cached venv"
     assert loose.exists(), "it deleted a file it does not own"
+
+
+def test_a_stranger_that_ships_a_facade_package_is_not_ours(tmp_path):
+    """The defect itself. `facade` is our IMPORT name, not our identity — it is a
+    generic word, and any project may ship a package called that. Deciding
+    ownership from it meant this rmtree loop deleted someone else's cached tool,
+    silently, on both paths that run the cleaner. Nothing distinguished the two
+    cases until this test existed, because the old fixture only ever put `facade`
+    in a venv it had already labelled ours."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    theirs = _cache_entry(cache, "c0ffee0000d3caf", ours=False, also_facade=True)
+    _run_cache_cleaner(cache)
+    assert theirs.exists(), (
+        "a stranger's cached venv was deleted because it happened to contain a "
+        "package called 'facade'"
+    )
+
+
+def test_the_backend_distribution_is_not_the_agent_distribution(tmp_path):
+    """`superresearch` and `superresearch-agent` are two published distributions
+    and the agent cleaner owns only one of them. A prefix match would take both."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    backend = _cache_entry(cache, "dd11ee22ff33445", ours=True, dist="superresearch")
+    _run_cache_cleaner(cache)
+    assert backend.exists(), "the agent's cleaner removed the BACKEND's cached venv"
+
+
+def test_the_dist_name_is_passed_in_but_the_fallback_still_matches(tmp_path):
+    """The waiter ships as a `-c` string spawned with argv, so an older caller can
+    still invoke it without the package argument. The literal fallback has to be
+    the same distribution — a wrong fallback silently stops the cleaner, and a
+    wildcard one would restore the bug this fix removed."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    passed = _cache_entry(cache, "1111111111aaaaa", ours=True)
+    _run_cache_cleaner(cache, pkg="superresearch-agent")
+    assert not passed.exists(), "the explicit package argument was not honoured"
+
+    fallback = _cache_entry(cache, "2222222222bbbbb", ours=True)
+    _run_cache_cleaner(cache)                      # no package argument at all
+    assert not fallback.exists(), "the no-argument fallback stopped matching us"
+
+
+def test_a_hyphenated_package_name_matches_the_normalized_metadata_dir(tmp_path):
+    """PEP 503: the caller passes the distribution as `superresearch-agent`,
+    while the metadata directory installers write is `superresearch_agent-…`.
+    Those are the same distribution, and the cleaner has to know it.
+
+    ⚠ The name of this test used to claim more than it checked — "a normalized
+    and an unnormalized agent dist BOTH match" — while only ever building the
+    underscored spelling. The hyphenated legacy metadata form
+    (`superresearch-agent-0.1.32.dist-info`) does NOT match, deliberately: the
+    version split would read it as the `superresearch` distribution, and the
+    fail-safe direction there is to leave a stale cache entry rather than risk
+    deleting the backend's. `test_the_legacy_metadata_spelling_fails_safe` below
+    pins that, rather than a name implying otherwise."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    underscored = _cache_entry(cache, "3333333333ccccc", ours=True,
+                               dist="superresearch_agent")
+    _run_cache_cleaner(cache, pkg="superresearch-agent")
+    assert not underscored.exists()
+
+
+def test_the_legacy_metadata_spelling_fails_safe(tmp_path):
+    """The acknowledged residual, pinned in the direction it actually falls. A
+    metadata dir written the pre-normalization way is left ALONE — one stale
+    cache entry, re-resolvable on the next run. The alternative reading of that
+    name is the `superresearch` BACKEND distribution, and deleting someone
+    else's venv is the failure this whole change removed."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    legacy = _cache_entry(cache, "4444444444ddddd", ours=True,
+                          dist="superresearch-agent")
+    _run_cache_cleaner(cache, pkg="superresearch-agent")
+    assert legacy.exists(), (
+        "the legacy spelling now matches — check it cannot also match the "
+        "backend distribution before calling that an improvement"
+    )
 
 
 def test_a_failed_bootstrap_leaves_the_cache_alone(monkeypatch):

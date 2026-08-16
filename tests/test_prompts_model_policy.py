@@ -115,9 +115,19 @@ def test_validate_user_msg_comes_from_the_policy_module():
     grep-the-source assertion silently passed or failed on where the author
     happened to wrap — it could not see the text the agent actually receives."""
     src = inspect.getsource(research.validate_setup_with_cua)
-    assert "p2_claude_validate_directive()" in src, (
+    assert "p2_claude_validate_directive(" in src, (
         "the validate user_msg must render from the policy module"
     )
+    # ⭐ …and it must render with the family THIS RUN is on, not the policy
+    # default. The validator's rule is "only touch the model if the button does
+    # not name <fam>": frozen to the primary family, that clause fires on the
+    # CORRECT model for every pass of a run that fell back to the fallback
+    # family, and sends the validator into a menu whose only primary-family rows
+    # are the sales chips the DOM layer just refused. Both the system prompt and
+    # the user message go to ONE call, so both have to learn the family.
+    for call in ("p2_claude_validate_directive(_p2_active_family(\"claude\"))",
+                 "claude_validate_setup_prompt(_p2_active_family(\"claude\"))"):
+        assert call in src, f"the validate CUA call must be family-scoped: missing {call}"
     assert "p2_claude_ver" not in src, "the version renderer is gone"
     d = models.p2_claude_validate_directive()
     fam = models.p2_family("claude").capitalize()

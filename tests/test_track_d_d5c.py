@@ -289,16 +289,51 @@ class TestVersionNotice:
     def test_device_version_fields_installed_with_update(self, monkeypatch):
         monkeypatch.setattr(research, "_is_source_checkout", lambda: False)
         monkeypatch.setattr(research, "_sr_version", lambda: "0.1.4")
+        monkeypatch.setattr(research, "_serving_version", lambda: "0.1.4")
         monkeypatch.setattr(research, "_check_newer_version", lambda *, force=False: "0.1.5")
         assert research._device_version_fields() == {
-            "version": "0.1.4", "updateAvailable": "0.1.5", "sourceCheckout": False}
+            "version": "0.1.4", "updateAvailable": "0.1.5", "sourceCheckout": False,
+            "servingVersion": "0.1.4"}
 
     def test_device_version_fields_current(self, monkeypatch):
         monkeypatch.setattr(research, "_is_source_checkout", lambda: False)
         monkeypatch.setattr(research, "_sr_version", lambda: "0.1.5")
+        monkeypatch.setattr(research, "_serving_version", lambda: "0.1.5")
         monkeypatch.setattr(research, "_check_newer_version", lambda *, force=False: None)
         assert research._device_version_fields() == {
-            "version": "0.1.5", "updateAvailable": None, "sourceCheckout": False}
+            "version": "0.1.5", "updateAvailable": None, "sourceCheckout": False,
+            "servingVersion": "0.1.5"}
+
+    def test_device_version_fields_report_disk_and_running_separately(self, monkeypatch):
+        """⭐⭐ THE WHOLE POINT OF THE SECOND NUMBER. `_sr_version()` re-reads the
+        package metadata, so it is the NEW release the instant an install lands —
+        inside a process still executing the old code. `_serving_version()` is
+        frozen at import and is what that process is really running.
+
+        Publishing only the first is what made the app's Restart control
+        unreachable: it compared the disk number against the update target, found
+        them equal (they are both metadata reads), and concluded the update had
+        finished while the machine served the old build."""
+        monkeypatch.setattr(research, "_is_source_checkout", lambda: False)
+        monkeypatch.setattr(research, "_sr_version", lambda: "0.1.5")      # on disk
+        monkeypatch.setattr(research, "_serving_version", lambda: "0.1.4")  # running
+        monkeypatch.setattr(research, "_check_newer_version", lambda *, force=False: None)
+        f = research._device_version_fields()
+        assert f["version"] == "0.1.5" and f["servingVersion"] == "0.1.4", (
+            "the two numbers must be published independently — collapsing them "
+            "is exactly the bug that hid the Restart button"
+        )
+
+    def test_a_source_label_never_leaks_into_the_running_version(self, monkeypatch):
+        """`_serving_version()` answers "(source checkout)" on a non-installed
+        tree, and a parenthesised label compared against a real version reads as
+        a permanent disagreement — i.e. a restart owed forever, on a machine that
+        can never satisfy it. Same normalisation `version` already has."""
+        monkeypatch.setattr(research, "_is_source_checkout", lambda: False)
+        monkeypatch.setattr(research, "_sr_version", lambda: "0.1.5")
+        monkeypatch.setattr(research, "_serving_version", lambda: "(source checkout)")
+        monkeypatch.setattr(research, "_check_newer_version", lambda *, force=False: None)
+        assert research._device_version_fields()["servingVersion"] is None
 
     def test_device_version_fields_source_checkout_no_prompt(self, monkeypatch):
         # A SOURCE CHECKOUT reports sourceCheckout=True + version None — even when
@@ -312,7 +347,8 @@ class TestVersionNotice:
         # _check_newer_version is short-circuited by the same gate; assert it too.
         assert research._check_newer_version() is None
         assert research._device_version_fields() == {
-            "version": None, "updateAvailable": None, "sourceCheckout": True}
+            "version": None, "updateAvailable": None, "sourceCheckout": True,
+            "servingVersion": None}
 
 
 class TestSelfUpdateIdempotent:

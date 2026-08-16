@@ -5,7 +5,13 @@ All Claude Computer Use API (CUA) system prompts and task prompts.
 Imported by research.py — edit prompts here, logic stays in research.py.
 """
 
-from models import p1_select_pro_directive, p2_family, p2_labels
+from models import (
+    free_family_note,
+    p1_select_pro_directive,
+    p2_family,
+    p2_labels,
+    upsell_warning,
+)
 
 # ⭐ FAMILY ONLY — no model VERSION appears in any prompt in this file, and none
 # may be added back. Owner directive 2026-07-31: "only model family is gonna be
@@ -17,6 +23,10 @@ from models import p1_select_pro_directive, p2_family, p2_labels
 # NOT Opus 4.8, so I need to fix it" and open the model menu — the second
 # model-menu interaction users reported as "the selector opens twice".
 _OPUS = p2_family("claude").capitalize() or "Opus"                     # "Opus"
+# The one sentence that stops a CUA mission clicking a billing chip. Rendered
+# from the same verb list the DOM picker refuses on, so the mission and the
+# selectors cannot drift apart about what a sales prompt is.
+_NO_UPSELL = upsell_warning(_OPUS)
 _CL_EFFORT = str(p2_labels("claude").get("effort", "max")).capitalize()  # "Max"
 
 SYSTEM_BASE = (
@@ -242,13 +252,36 @@ ABSOLUTELY FORBIDDEN — ZERO TOLERANCE:
 Once Deep Research pill is ACTIVE (visibly selected) and input is focused,
 your job is DONE."""
 
-PROMPT_CLAUDE_DEEP_RESEARCH = SYSTEM_BASE + f"""
+def _fam_bits(family: str = "") -> tuple:
+    """`(family word, the "we swapped families" sentence)` for a Claude prompt.
+
+    ⛔ THE PROMPTS BELOW ARE RENDERED AT IMPORT and the family is a RUN-SCOPED
+    fact, so a module constant cannot express both. Keeping the constants as the
+    DEFAULT render of these builders is what lets a run on the fallback family
+    hand the CUA layer a matching system prompt without changing a single
+    existing caller, test, or byte of the default text.
+
+    ⚠ The system prompt and the user directive go to the SAME CUA call. If only
+    one of them learns the family, they contradict each other about which model
+    is correct — the exact failure mode the family-only rewrite already produced
+    once (see test_claude_dr_prompt_agrees_with_the_directive_it_ships_with)."""
+    fam = (str(family) or _OPUS).capitalize()
+    swap = "" if fam.lower() == _OPUS.lower() else f"{free_family_note(_OPUS, fam)} "
+    return fam, swap
+
+
+def claude_deep_research_prompt(family: str = "") -> str:
+    """CUA system prompt for Claude P2 setup. Runs only after the DOM path
+    failed, so it keeps the upgrade lever (open the menu, take the highest)."""
+    fam, swap = _fam_bits(family)
+    no_upsell = upsell_warning(fam)
+    return SYSTEM_BASE + f"""
 
 Your task: Configure Claude for research. Nothing else.
 
 Steps:
 1. Look at the Claude.ai page.
-2. MODEL: the model must be {_OPUS} — the VERSION NUMBER DOES NOT MATTER, and a higher number is always better. Open the model selector ONCE and pick the HIGHEST-numbered {_OPUS} in the list; if the highest {_OPUS} is the one already selected, close the menu without clicking it. In that SAME popover, if an "Effort" submenu is present, choose "{_CL_EFFORT}". If the menu will not open but the button already reads "{_OPUS} …", that is fine — leave the model as it is and go to step 3.
+2. MODEL: {swap}the model must be {fam} — the VERSION NUMBER DOES NOT MATTER, and a higher number is always better. Open the model selector ONCE and pick the HIGHEST-numbered {fam} in the list; if the highest {fam} is the one already selected, close the menu without clicking it. {no_upsell} In that SAME popover, if an "Effort" submenu is present, choose "{_CL_EFFORT}". If the menu will not open but the button already reads "{fam} …", that is fine — leave the model as it is and go to step 3.
 3. Click the "+" or tools menu near the input; enable the "Research" mode/tool.
 4. Close the menu (Escape) and click the message input area to focus it.
 5. Say "ready for paste" and STOP.
@@ -260,11 +293,14 @@ ABSOLUTELY FORBIDDEN — ZERO TOLERANCE:
 - DO NOT send anything.
 - DO NOT click Send / Submit.
 - DO NOT attach any files.
-- If the model button already reads the HIGHEST "{_OPUS}" on offer with {_CL_EFFORT} effort, and Research is on: say "ready for paste" immediately and STOP.
+- If the model button already reads the HIGHEST "{fam}" on offer with {_CL_EFFORT} effort, and Research is on: say "ready for paste" immediately and STOP.
 - If Research mode toggle is already on: leave it alone.
 - If options are unavailable: say "partial setup" and STOP.
 
 Once model + Research mode are set and input is focused, your job is DONE. No exploration."""
+
+
+PROMPT_CLAUDE_DEEP_RESEARCH = claude_deep_research_prompt()
 
 # ── Verification & Diagnosis ──────────────────────────────────────────────────
 
@@ -321,18 +357,31 @@ ABSOLUTELY FORBIDDEN:
 - DO NOT treat a merely-visible chip as active — the placeholder is the proof."""
 
 
-PROMPT_VALIDATE_CLAUDE_SETUP = SYSTEM_BASE + f"""
+def claude_validate_setup_prompt(family: str = "") -> str:
+    """CUA system prompt for the POST-SETUP validation pass. Runs after the DOM
+    path SUCCEEDED, so its job is to leave a correct model alone.
+
+    ⛔⛔ Step 1's "only touch the model if…" clause used to name Sonnet/Haiku as
+    the wrong-model examples. That is only true while the target is Opus: on a
+    run that deliberately selected the fallback family the clause read "if the
+    button shows Sonnet with no Sonnet at all", which fires on the correct model
+    and sends the validator into the menu the DOM layer just refused. The
+    examples are gone; the rule is now stated against whichever family this run
+    is actually on."""
+    fam, swap = _fam_bits(family)
+    no_upsell = upsell_warning(fam)
+    return SYSTEM_BASE + f"""
 
 Your task: Verify Claude is ready for Deep Research and fix ONLY what is wrong. The ONE thing that matters is the Research tool — everything else is secondary.
 
 Read the composer. Do NOT open the model popover unless step 1 explicitly tells you to.
-1. MODEL: the model-selector button (bottom of the composer) shows the current model. If it reads "{_OPUS}" followed by ANY version number — or "{_OPUS}" with no number at all — the model is FINE; do nothing to it. The version number is irrelevant here and a higher one is always correct. That button ALSO shows the effort (e.g. "{_CL_EFFORT}") right on it. DO NOT open the model popover, and DO NOT try to expand the "Effort" submenu — those are quality knobs, NOT requirements, and clicking a submenu that won't expand only wastes turns. ONLY touch the model if the button shows Sonnet/Haiku with no {_OPUS} at all: then open it once, pick the highest-numbered "{_OPUS}", and close it.
+1. MODEL: {swap}the model-selector button (bottom of the composer) shows the current model. If it reads "{fam}" followed by ANY version number — or "{fam}" with no number at all — the model is FINE; do nothing to it. The version number is irrelevant here and a higher one is always correct. That button ALSO shows the effort (e.g. "{_CL_EFFORT}") right on it. DO NOT open the model popover, and DO NOT try to expand the "Effort" submenu — those are quality knobs, NOT requirements, and clicking a submenu that won't expand only wastes turns. ONLY touch the model if the button does not name "{fam}" anywhere at all: then open it once, pick the highest-numbered "{fam}", and close it. {no_upsell}
 2. RESEARCH TOOL (the priority — this is what actually matters): is "Research" / "Deep research" enabled near the composer (an active/highlighted pill or chip, or a checkmark beside "Research" in the "+" tools menu)? If you cannot tell from the current view, open the "+" / tools menu and look. If Research is OFF, turn it ON. If it is already ON, leave it.
 3. ATTACHMENTS: if a stale attachment is already visible in the composer, click its X to remove it.
 4. Click the input area to focus it.
 
 Decision:
-  → If the Research tool is ON (model shows Opus, input focused, no stale attachments): say "setup verified" and STOP.
+  → If the Research tool is ON (model shows {fam}, input focused, no stale attachments): say "setup verified" and STOP.
   → If you turned Research ON, removed an attachment, or fixed the model: say "setup fixed" and STOP.
   → If the Research tool is genuinely unavailable after checking the "+"/tools menu: say "setup failed: research tool not found" and STOP.
 
@@ -342,7 +391,10 @@ ABSOLUTELY FORBIDDEN:
 - DO NOT send any message.
 - DO NOT compose prompts.
 - DO NOT attach any new files.
-- DO NOT open the model popover or chase the Effort/Adaptive submenu when the model button already shows Opus."""
+- DO NOT open the model popover or chase the Effort/Adaptive submenu when the model button already shows {fam}."""
+
+
+PROMPT_VALIDATE_CLAUDE_SETUP = claude_validate_setup_prompt()
 
 
 PROMPT_CLICK_SEND = SYSTEM_BASE + """

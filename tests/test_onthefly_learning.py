@@ -20,8 +20,14 @@ def test_setup_records_selected_model_version():
 
 def test_caller_records_known_good_only_on_verified_run():
     src = inspect.getsource(research.start_agent_no_gemini_wait)
-    rec = src.find("record_known_good(platform_l, _P2_PICKED_VERSION.get(platform_l))")
+    rec = src.find("record_known_good(platform_l, _P2_PICKED_VERSION.get(platform_l)")
     assert rec != -1, "the caller must record the verified model as known-good."
+    # …under the family it was verified ON. One slot per platform meant a
+    # fallback-family run wrote into the slot the primary family's step-back
+    # reads back, so the learned value was worse than none.
+    assert "record_known_good(platform_l, _P2_PICKED_VERSION.get(platform_l))" not in src, (
+        "the learned version must be recorded against its family"
+    )
     # It must sit inside the `if research_ok …` block (only record a PROVEN
     # model), never on the failure/Skip path.
     guard = src.rfind('if research_ok and platform_l in ("claude", "gemini")', 0, rec)
