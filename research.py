@@ -9372,7 +9372,7 @@ def _emit_to_firestore(event):
     """
     global _fb_seq
     if not _firebase_db or not _fb_uid or not _fb_research_id:
-        return
+        return None
     new_seq = int(time.time() * 1000)
     if new_seq <= _fb_seq:
         new_seq = _fb_seq + 1
@@ -9390,8 +9390,15 @@ def _emit_to_firestore(event):
                 .collection("pipeline_events").add(_be_payload(doc_data)),
             what="emit_event",
         )
+        # ⭐ The seq is returned so the caller can NAME this event to the web
+        # app. Returning None on the bail and on failure is load-bearing: the
+        # module global keeps the PREVIOUS event's seq in both cases, and a
+        # caller that used it would point the notifier at a document that is
+        # not the one it just wrote.
+        return _fb_seq
     except Exception as e:
         log(f"Firestore emit failed: {e}", "WARN")
+        return None
 
 
 def update_link_in_firestore(kind: str, url: str, **fields):
@@ -9739,6 +9746,80 @@ def _fire_fe_p4_trigger(uid, research_id):
     except Exception as e:
         log(f"FE trigger: marker write failed: {e}", "WARN")
     return False
+
+
+def _post_fe_phase_notice(uid, research_id, phase, event_type, seq):
+    """Ask the web app to deliver the notifications this phase earned.
+
+    ⭐ WHY THE BACKEND HAS TO ASK. Every phase notification is dispatched by a
+    React component (`useGlobalPipelineNotifications`), so it needs an OPEN
+    BROWSER TAB. Close the tab and nothing fires — a per-research seq cursor
+    replays the events and delivers everything at once when the user comes
+    back. That is exactly what the owner reported on 2026-08-16: phase 1
+    arrived live, phase 2 arrived "after the end of the research", and nothing
+    had been lost. It had been deferred by twenty minutes because the tab was
+    closed. A run takes ninety minutes; nobody watches a tab for ninety
+    minutes.
+
+    ⛔ IDS ONLY. This sends the phase, the event type, and the sequence number
+    of the document just written. The route reads that document and composes
+    every word from what it actually says, so this side cannot announce a video
+    by claiming one exists — the event has to be there, with that type, that
+    phase and that seq. Same division that makes the sharer notice safe, one
+    step further: the caller does not even supply the facts.
+
+    Authenticated as the synth device user, whose uid deliberately never
+    matches the owner's; the route pairs it with authorizeSynthForResearch, the
+    same gate the autonomous P4/P5 trigger has used since #742.
+
+    Detached daemon thread with a short timeout: a notification is not worth
+    holding the worker's event loop for, and the run must finish whether or not
+    the web app answered. Best-effort; never raises.
+    """
+    if not uid or not research_id:
+        return False
+    id_token = _fresh_user_mode_id_token()
+    if not id_token:
+        # Not an error worth a WARN: an unpaired or revoked machine still runs,
+        # it just cannot ask. The browser's own notifier remains the backstop.
+        log("phase-notify: no synth id-token (creds revoked?) — skipping", "INFO")
+        return False
+
+    def _ask():
+        try:
+            import requests as _requests
+            from auth.v2_flow import FE_BASE_URL as _FE_BASE_URL
+            _resp = _requests.post(
+                f"{_FE_BASE_URL}/api/notify",
+                headers={"Authorization": f"Bearer {id_token}"},
+                json={"phaseNotice": {
+                    "kind": "phaseArtifacts",
+                    "ownerUid": uid,
+                    "researchId": research_id,
+                    "phase": phase,
+                    "eventType": event_type,
+                    "seq": seq,
+                }},
+                timeout=20,
+            )
+            if _resp.status_code == 200:
+                log(f"phase-notify: P{phase} {event_type} delivered ✓ ({_resp.text[:120]})")
+            else:
+                log(f"phase-notify: P{phase} HTTP {_resp.status_code} ({_resp.text[:160]})", "WARN")
+        except Exception as _e:
+            log(f"phase-notify: P{phase} dispatch failed ({_e})", "WARN")
+
+    try:
+        import threading as _threading
+        _threading.Thread(
+            target=_ask,
+            name=f"phase-notify-{research_id[:8]}-{phase}",
+            daemon=True,
+        ).start()
+    except Exception as _e:
+        log(f"phase-notify: could not spawn dispatch thread ({_e})", "WARN")
+        return False
+    return True
 
 
 def _post_fe_p4p5_trigger(uid, research_id):
@@ -16926,7 +17007,27 @@ def emit_event(event_type, phase=None, agent=None, **data):
     except Exception:
         pass
     # Write to Firestore (frontend real-time transport)
-    _emit_to_firestore(event)
+    _emitted_seq = _emit_to_firestore(event)
+    # ⭐ Ask the web app to notify — the ONE seam that makes a phase notification
+    # arrive with the app CLOSED.
+    #
+    # Every phase notice in the product is dispatched by a React component, so
+    # it needs an open browser tab. A run takes ninety minutes and nobody
+    # watches a tab for ninety minutes; the owner's whole request (2026-08-16)
+    # was to know where the run is without watching. This is the ask.
+    #
+    # ⛔ It sends IDS ONLY — the phase, the event type, and the seq of the
+    # document just written. The web app reads that document and composes every
+    # word from what it actually says, so this side cannot announce an artifact
+    # by claiming one exists. Phases 4 and 5 are not here: they are driven by
+    # the web app's own route, which notifies in-process.
+    if (event_type in ("phase_complete", "phase_skipped")
+            and isinstance(phase, int) and 1 <= phase <= 5
+            and _emitted_seq):
+        try:
+            _post_fe_phase_notice(_fb_uid, _fb_research_id, phase, event_type, _emitted_seq)
+        except Exception as _pn_e:
+            log(f"phase-notify dispatch failed (non-fatal): {_pn_e}", "WARN")
     # Drop into the narrator ring buffer (after Firestore so ordering
     # cannot drift between what the frontend sees and what the narrator
     # reasons from).
@@ -52233,7 +52334,20 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # decision (it has its own fail_phase + await_phase_decision
                 # when the paste step finds no content).
                 brief_artifact = BriefArtifact(text="", url="")
+                # ⭐ `skipped` is what stops the web app announcing "Brief
+                # ready" for a brief that does not exist. This branch sets an
+                # empty artifact, terminalizes the phase and writes the tile as
+                # "skipped" three lines down — but the event it sends is a plain
+                # phase_complete, and the notifier has nothing else to read: the
+                # summary is prose and phase 1 legitimately completes with no
+                # links (the resume-with-input regen path emits `links=[]`
+                # whenever no share URL was captured).
+                #
+                # ⛔ The event itself must still be emitted. Same contract as
+                # phase 5's P5-OFF twin: the tile would hang without it. Mark
+                # it; don't delete it.
                 emit_event("phase_complete", phase=1, durationSec=int(time.time() - _p1_start),
+                    skipped=True,
                     summary="Phase 1 skipped after error — no brief generated")
                 _update_firestore_research({"phase": 1, "status": "ongoing"})
                 # Tile/Icon Consistency (mirrors P2 at line ~19244): persist
@@ -53704,7 +53818,20 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         )
                     except Exception:
                         pass
-                    emit_event("phase_skipped", phase=3, reason="audio_unavailable_after_auto_retries")
+                    # ⭐ Carry the notebook. This branch is the ONLY way a
+                    # notebook that was built successfully reaches a terminal
+                    # phase-3 event that is not phase_complete — the warning
+                    # card right above says so in words ("continuing with the
+                    # notebook link only") — and until now the event dropped it,
+                    # so the web app announced a skipped phase and never the
+                    # thing the phase actually produced.
+                    #
+                    # ⛔ No other phase_skipped:3 emit carries links, and that is
+                    # load-bearing: the notifier keys the notebook notice off
+                    # their presence, so a config skip or a user Skip cannot
+                    # announce a notebook that the run never made.
+                    emit_event("phase_skipped", phase=3, reason="audio_unavailable_after_auto_retries",
+                               links=_p3_links)
                     _p3_audio_user_skipped = True
                     _controls.skipped_phases.add(4)
                     break
