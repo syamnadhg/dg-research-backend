@@ -170,7 +170,11 @@ def test_the_handlers_are_armed_AFTER_uvicorn_is_serving():
     # 2026-08-11: the install moved into `_assert_stop_handlers` so it could be
     # re-run on a timer and, more importantly, CALLED by a test. Anchor on the
     # call, not on the `signal.signal(...)` line that no longer lives here.
-    armed = body.index("_assert_stop_handlers(")
+    # 2026-08-17: it moved one level again, behind `_hold_stop_signals`, which
+    # installs the handler AND keeps the signal deliverable. The invariant under
+    # test never changed — only the name of the thing being called after the
+    # wait.
+    armed = body.index("_hold_stop_signals(")
     assert at < armed, "the wait must come before the install"
 
 

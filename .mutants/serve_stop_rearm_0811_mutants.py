@@ -19,9 +19,15 @@ handler installed?", and it restores the exact bug — because `getsignal` repor
 Python's own record, which stays correct when the disposition is changed below
 it.
 
-Safety, learned from an earlier harness on this repo that adopted a mutant as
-its own baseline: refuses to start on a dirty tree, holds originals in memory
-only, restores in `finally`, and re-checks `git status` at the end.
+Safety, learned from an earlier harness on this repo that adopted a mutant as its
+own baseline: holds originals in memory only, restores in `finally`, and diffs the
+source BYTES at the end. ⛔ 2026-08-17 — that byte diff replaced a `git status`
+check, which refused to run on an uncommitted wave and would have reported the
+same "dirty" with a mutant still in the source.
+
+⚠ Run it with `.venv/bin/python`, not a bare `python3`: `run_tests` uses
+`sys.executable`, and the system interpreter cannot import this suite's deps — the
+baseline goes RED for a reason that has nothing to do with the code.
 
     .venv/bin/python .mutants/serve_stop_rearm_0811_mutants.py
 """
@@ -49,14 +55,14 @@ MUTANTS = [
     # ── the handlers must be HELD, not installed once ───────────────────────
     ("C2", "under", "the re-assert loop is gone; one install again",
      [("    while True:\n        await asyncio.sleep(_STOP_REARM_S)\n"
-       "        _assert_stop_handlers(_sig, _signums, _on_stop, _reported)",
+       "        _hold_stop_signals(_sig, _signums, _on_stop, _reported)",
        "    return")],
      BOTH_SUITES),
     ("C3", "under", "the loop runs once and stops",
      [("    while True:\n        await asyncio.sleep(_STOP_REARM_S)\n"
-       "        _assert_stop_handlers(_sig, _signums, _on_stop, _reported)",
+       "        _hold_stop_signals(_sig, _signums, _on_stop, _reported)",
        "    await asyncio.sleep(_STOP_REARM_S)\n"
-       "    _assert_stop_handlers(_sig, _signums, _on_stop, _reported)")],
+       "    _hold_stop_signals(_sig, _signums, _on_stop, _reported)")],
      BOTH_SUITES),
     ("C4", "under", "only SIGINT is held, so a supervisor's SIGTERM rots",
      [("    _signums = (_sig.SIGINT, _sig.SIGTERM)",
@@ -84,17 +90,17 @@ MUTANTS = [
     # ── over-corrections ────────────────────────────────────────────────────
     ("C9", "over", "the handler is rebuilt per pass, resetting the press counter",
      [("    while True:\n        await asyncio.sleep(_STOP_REARM_S)\n"
-       "        _assert_stop_handlers(_sig, _signums, _on_stop, _reported)",
+       "        _hold_stop_signals(_sig, _signums, _on_stop, _reported)",
        "    while True:\n        await asyncio.sleep(_STOP_REARM_S)\n"
        "        def _fresh(signum, _frame, _h=_on_stop):\n"
        "            return _h(signum, _frame)\n"
-       "        _assert_stop_handlers(_sig, _signums, _fresh, _reported)")],
+       "        _hold_stop_signals(_sig, _signums, _fresh, _reported)")],
      BOTH_SUITES),
     ("C10", "over", "the first install announces drift, crying wolf every startup",
-     [("    installed = _assert_stop_handlers(_sig, _signums, _on_stop, _reported,\n"
-       "                                      announce=False)",
-       "    installed = _assert_stop_handlers(_sig, _signums, _on_stop, _reported,\n"
-       "                                      announce=True)")],
+     [("    installed, freed = _hold_stop_signals(_sig, _signums, _on_stop, _reported,\n"
+       "                                          announce=False)",
+       "    installed, freed = _hold_stop_signals(_sig, _signums, _on_stop, _reported,\n"
+       "                                          announce=True)")],
      BOTH_SUITES),
     ("C11", "over", "the once-per-signal guard is dropped — a WARN every few seconds forever",
      [('            reported.add(("drift", _s))', '            pass')],
@@ -108,10 +114,11 @@ MUTANTS = [
      [("    installed = []\n    for _s in signums:", "    installed = []\n    raise RuntimeError('boom')\n    for _s in signums:")],
      BOTH_SUITES),
     ("C14", "over", "re-asserting every 100ms — two syscalls a tick, forever",
-     [("_STOP_REARM_S = 5.0", "_STOP_REARM_S = 0.1")],
+     # 2026-08-17: the period came down 5.0 → 1.0, so this anchor went stale.
+     [("_STOP_REARM_S = 1.0", "_STOP_REARM_S = 0.02")],
      BOTH_SUITES),
     ("C15", "over", "the period exceeds the grace window, so a drift outlives a stop",
-     [("_STOP_REARM_S = 5.0", "_STOP_REARM_S = 20.0")],
+     [("_STOP_REARM_S = 1.0", "_STOP_REARM_S = 20.0")],
      BOTH_SUITES),
 ]
 
@@ -120,9 +127,23 @@ def sh(cmd: list[str], cwd: Path = ROOT) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
 
 
-def tracked_dirty() -> list[str]:
-    out = sh(["git", "status", "--porcelain", "--", "research.py", "tests"]).stdout
-    return [ln for ln in out.splitlines() if ln and not ln.startswith("?? ")]
+# ⛔ 2026-08-17 — GIT IS THE WRONG CLEANLINESS CHECK, and it cost a run to learn
+# it twice. `git status` says "dirty" for an UNCOMMITTED wave, where every file
+# is legitimately modified — so it refused to start at the one moment it was
+# needed (verifying five anchors this file had just had to re-point). Worse, it
+# would report exactly the same thing with a mutant still in the source, which is
+# the single failure this check exists to catch. Snapshot the BYTES instead: that
+# answers "did MY edits come back", which is the actual question.
+_SNAPSHOT_FILES = ["research.py"]
+
+
+def snapshot() -> dict[str, str]:
+    return {f: (ROOT / f).read_text(encoding="utf-8") for f in _SNAPSHOT_FILES}
+
+
+def drifted(before: dict[str, str]) -> list[str]:
+    return [f for f, text in before.items()
+            if (ROOT / f).read_text(encoding="utf-8") != text]
 
 
 def run_tests(target: str) -> bool:
@@ -131,11 +152,7 @@ def run_tests(target: str) -> bool:
 
 
 def main() -> int:
-    dirty = tracked_dirty()
-    if dirty:
-        print("Tracked files are modified. Commit or stash first — a harness that starts\n"
-              "dirty cannot tell its own restore from your edits.\n" + "\n".join(dirty))
-        return 2
+    before = snapshot()
 
     for target in {m[4] for m in MUTANTS}:
         print(f"baseline {target}… ", end="", flush=True)
@@ -165,7 +182,7 @@ def main() -> int:
         finally:
             path.write_text(original, encoding="utf-8")
 
-    leftover = tracked_dirty()
+    leftover = drifted(before)
     if leftover:
         print("\n⛔ THE TREE DID NOT COME BACK CLEAN — a mutant may still be in your source:\n"
               + "\n".join(leftover))

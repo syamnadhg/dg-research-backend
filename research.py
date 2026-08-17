@@ -55836,7 +55836,12 @@ _server_stop_signal = {"n": None}
 # here. Re-asserting is what keeps the banner's "Stop: Ctrl+C" true regardless.
 # It does not cure the cause; it bounds the damage to one period, and the drift
 # line it prints is what will finally name the culprit.
-_STOP_REARM_S = 5.0
+# ⭐ 2026-08-17: 5.0 → 1.0. This period IS the worst case a user experiences as
+# "I pressed Ctrl+C and nothing happened" — the repair, and the delivery of a
+# press that was already swallowed, both wait for the next pass. Five seconds of
+# that is indistinguishable from broken, which is precisely the report. The pass
+# costs one sigaction and two mask reads, so once a second is free.
+_STOP_REARM_S = 1.0
 
 
 def _stop_handler_description(sig_mod, current) -> str:
@@ -55905,6 +55910,85 @@ def _assert_stop_handlers(sig_mod, signums, handler, reported, announce=True):
     return installed
 
 
+def _signal_name(sig_mod, signum):
+    try:
+        return sig_mod.Signals(signum).name
+    except Exception:
+        return str(signum)
+
+
+def _unblock_stop_signals(sig_mod, signums, reported):
+    """Make sure a stop signal can ARRIVE, not merely be handled once it does.
+
+    ⛔⛔ 2026-08-17 — THE GAP THE RE-ASSERT LOOP CANNOT REACH. Re-installing a
+    handler is powerless against a BLOCKED signal. A blocked SIGINT is not
+    discarded: it sits PENDING indefinitely, so the press is swallowed while
+    `getsignal` still reports our handler and every re-assert pass reports
+    success. From outside, that is indistinguishable from the disposition reset
+    this loop was built for — no line, no shutdown, and a process that stays
+    perfectly healthy afterwards. The owner hit exactly that on an idle serve:
+    three presses, no line of any kind, and the same process went on to claim and
+    run a job a minute later.
+
+    Unblocking a signal that is already pending delivers it IMMEDIATELY, so a
+    press that was swallowed still stops the server — one re-assert period late
+    rather than never.
+
+    ⛔ Called AFTER the handler is installed, never before. Unblocking first would
+    deliver a pending signal to whatever the disposition had drifted to, which in
+    the SIG_DFL case is an ungraceful kill of the very process we are trying to
+    shut down cleanly.
+
+    Returns the names it had to unblock (empty on Windows, which has no mask)."""
+    freed = []
+    try:
+        # Blocking the empty set is the documented way to READ the mask.
+        blocked = sig_mod.pthread_sigmask(sig_mod.SIG_BLOCK, [])
+    except Exception:
+        return freed                        # Windows, or a stripped signal module
+    stuck = [_s for _s in signums if _s in blocked]
+    if not stuck:
+        return freed
+    try:
+        pending = sig_mod.sigpending()
+    except Exception:
+        pending = set()
+    for _s in stuck:
+        name = _signal_name(sig_mod, _s)
+        freed.append(name)
+        if ("blocked", _s) not in reported:
+            reported.add(("blocked", _s))
+            # ⭐ The line that names this class. "Blocked" and "blocked AND
+            # already pending" are different facts: the second one means a press
+            # really did happen and was sitting in the queue unheard.
+            _waiting = (" and already pending — a stop had been pressed and "
+                        "swallowed") if _s in pending else ""
+            log(f"[serve] {name} was BLOCKED{_waiting} — unblocking it. "
+                f"Stop could not arrive until now.", "WARN")
+    try:
+        sig_mod.pthread_sigmask(sig_mod.SIG_UNBLOCK, stuck)
+    except Exception as _me:
+        if ("unblock", tuple(stuck)) not in reported:
+            reported.add(("unblock", tuple(stuck)))
+            log(f"[serve] could not unblock {', '.join(freed)}: {_me}", "WARN")
+    return freed
+
+
+def _hold_stop_signals(sig_mod, signums, handler, reported, announce=True):
+    """One pass of holding the stop path open, end to end.
+
+    Two independent things have to be true for Ctrl+C to work, and the loop had
+    only ever asserted one of them: the signal must be OURS when it arrives
+    (handler installed, unconditionally) AND it must be able to arrive at all
+    (not blocked). Order is load-bearing — see `_unblock_stop_signals`.
+
+    Returns (installed_names, unblocked_names)."""
+    installed = _assert_stop_handlers(sig_mod, signums, handler, reported,
+                                      announce=announce)
+    freed = _unblock_stop_signals(sig_mod, signums, reported)
+    return installed, freed
+
+
 async def _arm_stop_signals(server, port):
     """Make Ctrl+C stop the server, say so, and never hang.
 
@@ -55950,6 +56034,21 @@ async def _arm_stop_signals(server, port):
        drifted it says so and names what it drifted to. That is what makes the
        banner's promise survive whatever the run does, and what will identify
        the native caller doing it.
+    5. ⛔⛔ 2026-08-17 — it also keeps the signal DELIVERABLE, which items 1-4
+       cannot. The owner pressed Ctrl+C three times on an idle serve and got no
+       line of any kind, and the same process went on to claim and run a job a
+       minute later — so the handler had not run and nothing was wedged. A
+       handler that is installed and a signal that can arrive are two different
+       properties, and a BLOCKED signal fails the second one while passing every
+       check the first four make: it is not discarded but held PENDING, so
+       `getsignal` still reports us and every re-assert pass reports success.
+       `_unblock_stop_signals` closes that, and unblocking a pending signal
+       delivers it at once — so a swallowed press still stops the server, one
+       re-assert period late rather than never.
+       ⚠ Whether that is what happened to the owner is NOT yet measured; the
+       process was gone before it could be probed. This is the one mechanism the
+       loop structurally could not repair, and either way it now prints the
+       truth the next time.
 
     Installed AFTER uvicorn is serving, deliberately: uvicorn assigns its handlers
     when `serve()` begins, so anything installed earlier is simply overwritten.
@@ -56001,11 +56100,15 @@ async def _arm_stop_signals(server, port):
     _signums = (_sig.SIGINT, _sig.SIGTERM)
     _reported = set()
     # First install: whatever is there now is uvicorn's, which is expected and
-    # not drift, so it is not announced.
-    installed = _assert_stop_handlers(_sig, _signums, _on_stop, _reported,
-                                      announce=False)
+    # not drift, so it is not announced. The mask IS checked from the very first
+    # pass — a signal blocked before we ever got here is blocked for the life of
+    # the process otherwise.
+    installed, freed = _hold_stop_signals(_sig, _signums, _on_stop, _reported,
+                                          announce=False)
     if installed:
         log(f"[serve] stop signals armed ({', '.join(installed)}) on :{port}", "DEBUG")
+    if freed:
+        log(f"[serve] {', '.join(freed)} had to be unblocked at arm time", "WARN")
 
     # Then hold them, for the life of the server. See `_STOP_REARM_S`: one
     # install was measured to be insufficient — SIGINT's disposition was reset
@@ -56018,7 +56121,7 @@ async def _arm_stop_signals(server, port):
     # to escape. Re-arming must restore the stop path, not reset its state.
     while True:
         await asyncio.sleep(_STOP_REARM_S)
-        _assert_stop_handlers(_sig, _signums, _on_stop, _reported)
+        _hold_stop_signals(_sig, _signums, _on_stop, _reported)
 
 
 async def run_server(port=8000):

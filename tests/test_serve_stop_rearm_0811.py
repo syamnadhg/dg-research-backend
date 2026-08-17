@@ -349,8 +349,14 @@ def test_the_press_still_records_which_signal_arrived(monkeypatch, logged):
 
 def test_the_rearm_period_is_a_sane_length():
     """It bounds how long Ctrl+C can be dead after a drift, so it has to be
-    short — and it costs two syscalls a pass, so it need not be shorter."""
-    assert 1.0 <= research._STOP_REARM_S <= 30.0, research._STOP_REARM_S
+    short — and it costs two syscalls a pass, so it need not be shorter.
+
+    ⭐ 2026-08-17: the ceiling came down from 30s to 2s. This period is exactly
+    how long a user stands there thinking the stop is broken — and a swallowed
+    press is only delivered on the next pass, so it is also how long a real
+    Ctrl+C can appear to do nothing. The owner's report was three presses into a
+    five-second window."""
+    assert 0.25 <= research._STOP_REARM_S <= 2.0, research._STOP_REARM_S
     assert research._STOP_REARM_S < research._STOP_GRACE_S, (
         "a re-assert must land well inside the grace window"
     )
