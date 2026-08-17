@@ -33573,6 +33573,24 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                    status="generating", stage="researching",
                                    progress="Gemini Deep Research plan created and started")
                         log("[2D] Gemini is researching ✓ (confirmed on round-robin re-check)")
+                        # ⭐ 2026-08-17 — retract the plan-stall card HERE too.
+                        # 2D stopped retracting on a click that merely returned
+                        # true (it claimed a start the verify disagreed with six
+                        # seconds later), which left one gap: a click that DID
+                        # work but verified a beat too late. This is where that
+                        # verification lands, so it is where the card's claim
+                        # becomes true. Same alert_id, so it is the same
+                        # retraction and a no-op if 2D already did it.
+                        try:
+                            emit_event("pipeline_warning", phase=2, agent="gemini",
+                                       error="Gemini's research plan started",
+                                       details="Gemini recovered and began its deep research.",
+                                       actions=[],
+                                       alert_id=_agent_error_alert_id("gemini", 2),
+                                       auto_clear_on_resume=True)
+                            _clear_pending_decision("gemini")
+                        except Exception:
+                            pass
                         try:
                             await inject_agent_observer(p["page"], "gemini")
                         except Exception:
@@ -35524,6 +35542,22 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 is_done = verdict == "done"
                 is_generating = verdict == "generating"
                 is_error = verdict == "error"
+                # ⛔⛔ 2026-08-17 — `needs_click` WAS PARSED AND THEN DROPPED.
+                # The prompt mandates this verdict, the regex above captures it,
+                # a variable holds it — and no branch ever acted on it, so it
+                # collapsed into "none of the above", which the caller reads as
+                # keep-waiting. During the 90-minute Gemini loss the vision tier
+                # said, in as many words, "This is the NEEDS_CLICK state — a
+                # 'Start research' button is visible and needs to be clicked",
+                # and the run did nothing with it. Re-arm the late-Start watch:
+                # the leg that owns pressing it is already bounded, enabled-only
+                # and took-checked, so this hands the verdict to the one place
+                # equipped to act on it rather than clicking from here.
+                if verdict == "needs_click" and name.lower() == "gemini":
+                    if not p.get("gemini_watch_start"):
+                        log(f"[{name}] CUA says the run still NEEDS a Start click "
+                            f"— re-arming the late-Start watch", "WARN")
+                    p["gemini_watch_start"] = True
             else:
                 still_running_phrases = (
                     "still in progress", "still running", "still researching",
@@ -47586,7 +47620,16 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                         log("[2D] CUA recovery: 'Start research' appeared after re-draft — clicked ✓")
                         # #929 (B4iii gap): same retraction as the other
                         # success paths — was missing here too.
-                        _retract_plan_alert("CUA recovery re-draft")
+                        #
+                        # ⛔ 2026-08-17 — but NOT from here any more. The card it
+                        # withdraws says "Gemini recovered and began its deep
+                        # research", and a click that returned true is not that
+                        # evidence: in the live run this retraction fired at
+                        # 08:51:26 and the verify disagreed six seconds later, so
+                        # the user's only actionable surface was taken away from a
+                        # run that was already dead. The retraction now happens
+                        # where the claim can be proven — the verified_b block
+                        # below.
                         await asyncio.sleep(5)
                         break
                     await asyncio.sleep(5)
@@ -47697,12 +47740,40 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                                 # Gemini leg watches for a late 'Start research'
                                 # (slow plan) and clicks it; a verified-running
                                 # probe clears the watch (auto-started case).
-                                "gemini_watch_start": bool(_streaming_handoff)}
+                                #
+                                # ⛔⛔ 2026-08-17 — AND THE CASE IT WAS MISSING,
+                                # which cost a whole agent. `start_clicked and not
+                                # verified_b` is the single most obvious state in
+                                # which a 'Start research' button may still need
+                                # pressing: we pressed it and could not confirm it
+                                # took. Two live runs ended there — the click
+                                # reported success, the verify disagreed, and
+                                # because only the streaming path armed this
+                                # watch, nobody ever pressed again. The round-robin
+                                # then read `start_research_btn_visible
+                                # (pre-research)` once a minute for NINETY MINUTES
+                                # and auto-skipped, salvaging the plan instead of
+                                # a research. Five earlier runs were fine for one
+                                # reason: their click verified, so neither flag
+                                # was ever set.
+                                #
+                                # ⭐ Nothing new is trusted here. The watch's own
+                                # (a)/(b)/(c) ladder is already bounded,
+                                # enabled-only so it cannot spam a grayed button,
+                                # and took-checked on the following leg. This
+                                # arms machinery that was already correct.
+                                "gemini_watch_start": bool(
+                                    _streaming_handoff
+                                    or (start_clicked and not verified_b))}
         if verified_b:
             emit_event("agent_progress", phase=2, agent="gemini", status="generating",
                        stage="researching",
                        progress="Gemini Deep Research plan created and started")
             log("[2D] Gemini is researching ✓")
+            # The one place the plan-stall card's claim ("Gemini recovered and
+            # began its deep research") is actually true. Idempotent — a no-op
+            # when an earlier path already retracted it.
+            _retract_plan_alert("verified running")
             await inject_agent_observer(gemini_page, "gemini")
         elif _streaming_handoff:
             log("[2D] Gemini streaming hand-off — round-robin takes it from here")

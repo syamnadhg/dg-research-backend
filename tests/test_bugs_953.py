@@ -110,7 +110,19 @@ def test_fail_agent_guarded_by_final_streaming_probe():
 def test_handoff_registers_watch_flag_not_failure():
     # The hand-off is healthy: agent registered with gemini_watch_start=True,
     # plan alert retracted, and NO scary "may not be running" warn.
-    assert '"gemini_watch_start": bool(_streaming_handoff)' in P2_SRC
+    #
+    # 2026-08-17 RE-ANCHORED, invariant unchanged. The streaming hand-off still
+    # arms the watch; the condition simply gained a second, equally obvious
+    # trigger — we pressed Start and could not confirm it took. That state armed
+    # nothing before, and two live runs died in it: the DOM read
+    # `start_research_btn_visible (pre-research)` once a minute for ninety
+    # minutes while nobody pressed the button.
+    assert '"gemini_watch_start": bool(' in P2_SRC
+    _arm = P2_SRC[P2_SRC.index('"needs_start_verify": bool(start_clicked'):][:2600]
+    assert "_streaming_handoff" in _arm, "the streaming hand-off must still arm it"
+    assert "start_clicked and not verified_b" in _arm, (
+        "an unverified Start click must arm it too"
+    )
     assert '_retract_plan_alert("streaming hand-off")' in P2_SRC
     assert "streaming hand-off — round-robin takes it from here" in P2_SRC
 

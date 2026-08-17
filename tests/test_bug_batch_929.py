@@ -125,9 +125,25 @@ def test_poke_and_wait_longer_disarm_auto_skip():
 def test_2d_cua_recovery_retracts_early_card():
     # The shared retraction helper runs on the main-loop click AND both
     # CUA-recovery success paths (pre-fix only the main loop retracted).
+    #
+    # 2026-08-17 RE-ANCHORED, invariant unchanged and strengthened. The intent
+    # here is "the re-draft path must not leave a stale [Retry][Skip] card on a
+    # recovered Gemini", and it still holds — but the retraction moved OFF the
+    # re-draft click. That click returning true is not evidence the research
+    # began: in a live run this exact call fired at 08:51:26 and the running
+    # verify disagreed six seconds later, so the card was withdrawn from a run
+    # that never started and the owner lost their only actionable surface for
+    # ninety minutes. The re-draft path still flows into the verified block, so
+    # it is still covered — only now by evidence rather than by a click's return
+    # value.
     assert _P2.count("_retract_plan_alert(") >= 4  # def + 3 call sites
     assert '_retract_plan_alert("CUA recovery")' in _P2
-    assert '_retract_plan_alert("CUA recovery re-draft")' in _P2
+    assert '_retract_plan_alert("verified running")' in _P2, (
+        "the re-draft path's retraction must be gated on a verified start"
+    )
+    assert '_retract_plan_alert("CUA recovery re-draft")' not in _P2, (
+        "retracting on the click alone claims a start nothing has confirmed"
+    )
 
 
 # ── B5: 2D streaming hold-off ────────────────────────────────────────────────
