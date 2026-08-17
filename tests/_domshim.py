@@ -421,6 +421,18 @@ let ROOT = null;
 globalThis.document = {
   querySelectorAll: (s) => ROOT.querySelectorAll(s),
   querySelector: (s) => ROOT.querySelector(s),
+  // ⭐ 2026-08-17 — `getElementById` was missing, and the ChatGPT picker walk is
+  // built on it: a menu row carries `aria-controls` naming the submenu it owns,
+  // and resolving that id is what makes "these rows belong to the control I just
+  // pressed" a fact rather than a guess about document order. Without this the
+  // walk threw and no test could reach the branch at all — the same shape as the
+  // `dataset` and `parentElement` gaps recorded above, where a missing shim
+  // member turned a passing test into no test.
+  //
+  // Browser semantics: FIRST match in document order, null when absent. Returning
+  // the last (or throwing on a duplicate) would hide exactly the ambiguity the
+  // production code is entitled to assume the browser resolves this way.
+  getElementById: (id) => ROOT.querySelectorAll('[id="' + id + '"]')[0] || null,
   // `document.body` is the picker's fallback root for "no menu has mounted
   // yet". Without it that branch throws instead of exercising the fallback.
   get body() { return ROOT; },

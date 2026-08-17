@@ -357,7 +357,7 @@ ABSOLUTELY FORBIDDEN:
 - DO NOT treat a merely-visible chip as active — the placeholder is the proof."""
 
 
-def claude_validate_setup_prompt(family: str = "") -> str:
+def claude_validate_setup_prompt(family: str = "", effort_ok: bool = True) -> str:
     """CUA system prompt for the POST-SETUP validation pass. Runs after the DOM
     path SUCCEEDED, so its job is to leave a correct model alone.
 
@@ -367,15 +367,45 @@ def claude_validate_setup_prompt(family: str = "") -> str:
     button shows Sonnet with no Sonnet at all", which fires on the correct model
     and sends the validator into the menu the DOM layer just refused. The
     examples are gone; the rule is now stated against whichever family this run
-    is actually on."""
+    is actually on.
+
+    ⭐⭐ 2026-08-17 — `effort_ok` MAKES THE EFFORT BAN CONDITIONAL, and both
+    directions matter. The ban existed because the Effort submenu would not
+    expand ("clicking a submenu that won't expand only wastes turns") — it was a
+    workaround for a defect, not a statement about what this pass should do. And
+    while it stood, NOTHING could repair a missed effort: the setup ladder's
+    outcome check had no effort term so it never descended here, and if it had,
+    this prompt forbade the fix. Lifting either one alone is worse than lifting
+    neither — a ladder that descends to a rung under orders not to help spends
+    money and changes nothing.
+
+    ⚠ Still off by default. On the ordinary run the DOM layer has already set the
+    tier, and sending the validator looking would reopen the "model selector
+    opens twice" report for no gain. This is permission granted exactly when the
+    run already knows the tier is unset."""
     fam, swap = _fam_bits(family)
     no_upsell = upsell_warning(fam)
+    effort_clause = (
+        f'That button ALSO shows the effort (e.g. "{_CL_EFFORT}") right on it. '
+        f'DO NOT open the model popover, and DO NOT try to expand the "Effort" '
+        f"submenu — those are quality knobs, NOT requirements, and clicking a "
+        f"submenu that won't expand only wastes turns."
+        if effort_ok else
+        f'That button ALSO shows the effort right on it, and on THIS run it does '
+        f'NOT read "{_CL_EFFORT}" — the automated pass could not set it. Fix that: '
+        f'open the model popover, open the "Effort" submenu, choose "{_CL_EFFORT}", '
+        f"and close both. If the submenu will not open on the first try, leave it "
+        f"and move on — say so in your answer rather than spending more turns.")
+    forbid_effort = (
+        f"\n- DO NOT open the model popover or chase the Effort/Adaptive submenu "
+        f"when the model button already shows {fam}."
+        if effort_ok else "")
     return SYSTEM_BASE + f"""
 
 Your task: Verify Claude is ready for Deep Research and fix ONLY what is wrong. The ONE thing that matters is the Research tool — everything else is secondary.
 
 Read the composer. Do NOT open the model popover unless step 1 explicitly tells you to.
-1. MODEL: {swap}the model-selector button (bottom of the composer) shows the current model. If it reads "{fam}" followed by ANY version number — or "{fam}" with no number at all — the model is FINE; do nothing to it. The version number is irrelevant here and a higher one is always correct. That button ALSO shows the effort (e.g. "{_CL_EFFORT}") right on it. DO NOT open the model popover, and DO NOT try to expand the "Effort" submenu — those are quality knobs, NOT requirements, and clicking a submenu that won't expand only wastes turns. ONLY touch the model if the button does not name "{fam}" anywhere at all: then open it once, pick the highest-numbered "{fam}", and close it. {no_upsell}
+1. MODEL: {swap}the model-selector button (bottom of the composer) shows the current model. If it reads "{fam}" followed by ANY version number — or "{fam}" with no number at all — the model is FINE; do nothing to it. The version number is irrelevant here and a higher one is always correct. {effort_clause} ONLY touch the model if the button does not name "{fam}" anywhere at all: then open it once, pick the highest-numbered "{fam}", and close it. {no_upsell}
 2. RESEARCH TOOL (the priority — this is what actually matters): is "Research" / "Deep research" enabled near the composer (an active/highlighted pill or chip, or a checkmark beside "Research" in the "+" tools menu)? If you cannot tell from the current view, open the "+" / tools menu and look. If Research is OFF, turn it ON. If it is already ON, leave it.
 3. ATTACHMENTS: if a stale attachment is already visible in the composer, click its X to remove it.
 4. Click the input area to focus it.
@@ -390,8 +420,7 @@ ABSOLUTELY FORBIDDEN:
 - DO NOT paste any text.
 - DO NOT send any message.
 - DO NOT compose prompts.
-- DO NOT attach any new files.
-- DO NOT open the model popover or chase the Effort/Adaptive submenu when the model button already shows {fam}."""
+- DO NOT attach any new files.{forbid_effort}"""
 
 
 PROMPT_VALIDATE_CLAUDE_SETUP = claude_validate_setup_prompt()

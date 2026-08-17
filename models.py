@@ -364,6 +364,27 @@ P1_MODEL_POLICY = {
         # so the tier picker, the CUA mission rendered from these words, and the
         # model rankers cannot drift apart on what a sales prompt looks like.
         "upgrade_verbs": UPSELL_VERBS,
+        # ⭐⭐ (2026-08-17, from a live capture) THE MENU IS TWO LEVELS NOW.
+        # The tier rows did not disappear and they did not become a slider — they
+        # moved one level down. The picker opens the pill and sees three rows,
+        # `Advanced / Model … / Effort …`, none of which names a tier, so it
+        # correctly reports "no row names 'pro'" and stops at the front door.
+        #
+        # Two words get it the rest of the way. `effort_row_words` names the row
+        # whose submenu holds `Instant / Medium / High / Extra High / Pro`;
+        # `advanced_words` names the toggle that reveals that row when the menu
+        # opens in its compact state. Both live here rather than in the page
+        # script for the same reason every other word does: a rename is then one
+        # policy edit with a test behind it, not a regex buried in a JS string.
+        #
+        # ⚠ The compact/expanded state PERSISTS PER ACCOUNT, so neither entry
+        # state is the "normal" one and both have to work. Matching is by the
+        # row's own leading label, never by the whole row text — the row reads
+        # "EffortInstant" (label plus current value concatenated), so a whole-text
+        # equality test would break the moment the effort changes, which is
+        # precisely the thing this path exists to change.
+        "effort_row_words": ["effort"],
+        "advanced_words": ["advanced"],
     },
 }
 
@@ -1257,7 +1278,7 @@ def p2_claude_setup_directive(family: str = "") -> str:
     )
 
 
-def p2_claude_validate_directive(family: str = "") -> str:
+def p2_claude_validate_directive(family: str = "", effort_ok: bool = True) -> str:
     """The CUA user-instruction for the POST-SETUP validation pass on Claude.
 
     ⚠ The mirror image of p2_claude_setup_directive, and the difference is
@@ -1288,6 +1309,18 @@ def p2_claude_validate_directive(family: str = "") -> str:
     tool = str(pol.get("tool", "research")).capitalize()
     swapped = "" if fam.lower() == primary.lower() else \
         f"{free_family_note(primary.capitalize(), fam)} "
+    # ⭐ Matches the system prompt's `effort_ok`. The two strings go to ONE CUA
+    # call, so a permission granted in one and withheld in the other leaves the
+    # agent holding instructions that disagree — the same failure the family word
+    # was moved here to prevent.
+    if not effort_ok:
+        return (
+            f"{swapped}Claude is on {fam} with the {tool} tool, but the effort is "
+            f"NOT {effort} and the automated pass could not set it. Open the model "
+            f"popover, open the Effort submenu, choose {effort}, and close both. "
+            f"Leave the model alone — it is already correct. If the submenu will "
+            f"not open on the first try, say so and stop rather than retrying. "
+            f"Do not type.")
     return (
         f"{swapped}Verify Claude is on {fam} with {effort} effort and the {tool} tool ON. "
         f"THE VERSION NUMBER DOES NOT MATTER: if the model button reads {fam} "

@@ -125,9 +125,20 @@ def test_validate_user_msg_comes_from_the_policy_module():
     # family, and sends the validator into a menu whose only primary-family rows
     # are the sales chips the DOM layer just refused. Both the system prompt and
     # the user message go to ONE call, so both have to learn the family.
-    for call in ("p2_claude_validate_directive(_p2_active_family(\"claude\"))",
-                 "claude_validate_setup_prompt(_p2_active_family(\"claude\"))"):
-        assert call in src, f"the validate CUA call must be family-scoped: missing {call}"
+    # ⚠ RE-ANCHORED 2026-08-17: both calls now also carry `effort_ok`, so they
+    # wrap across lines. Anchored on the call plus its family argument within a
+    # window, rather than on one unbroken source string — a pin a line wrap can
+    # break is a pin that eventually gets deleted instead of fixed.
+    for call in ("p2_claude_validate_directive(", "claude_validate_setup_prompt("):
+        at = src.find(call)
+        assert at != -1, f"the validate CUA call must render from policy: {call}"
+        assert '_p2_active_family("claude")' in src[at:at + 140], (
+            f"the validate CUA call must be family-scoped: {call}")
+        # ⭐ And BOTH must carry the same effort permission. They go to ONE CUA
+        # call: a system prompt that forbids the Effort submenu beside a user
+        # message that demands it leaves the agent to pick one arbitrarily.
+        assert "effort_ok=" in src[at:at + 200], (
+            f"the validate CUA call must pass the effort permission: {call}")
     assert "p2_claude_ver" not in src, "the version renderer is gone"
     d = models.p2_claude_validate_directive()
     fam = models.p2_family("claude").capitalize()

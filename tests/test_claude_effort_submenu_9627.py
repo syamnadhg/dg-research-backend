@@ -67,8 +67,28 @@ def _menu(labels, *, with_trigger=False, role="menu"):
             "text": "", "kids": rows}
 
 
-def _run(spec):
-    return (run_js(spec, _pick_js()) or {}).get("ret") or {}
+# ⚠ RE-ANCHORED 2026-08-17. The picker takes params now (the trigger and option
+# test ids come from policy, never from a literal in the page script) and it MARKS
+# the row for a real Playwright press instead of calling `el.click()` from inside
+# `page.evaluate`. That synthetic click was the last one left in a menu path in
+# this file, and the component library binds its rows on pointerdown — the same
+# defect, twice paid for, that this repo removed from ChatGPT's model trigger and
+# from this step's own submenu opener.
+#
+# ⭐ These fixtures deliberately carry NO option test ids, so every case below
+# still exercises the TEXT fallback and the ligature handling it exists for. The
+# test id path is covered separately.
+PARAMS = {"trigTestid": research._CLAUDE_EFFORT_TRIGGER_TESTID,
+          "optTestid": "", "attr": research._SR_CLICK_MARK,
+          "value": "claude-effort-option"}
+
+# What a successful pick now reports. `marked` means "this row is the one, press
+# it"; the caller presses and then verifies it became checked.
+PICKED = ("marked", "max (already)")
+
+
+def _run(spec, params=None):
+    return (run_js(spec, _pick_js(), params or PARAMS) or {}).get("ret") or {}
 
 
 # ── The defect, reproduced and fixed against the measured labels ─────────────
@@ -78,7 +98,7 @@ def test_the_max_row_is_found_despite_its_icon_ligature():
     'max\\ue08f\\ue03b'."""
     got = _run({"tag": "body", "attrs": {}, "text": "",
                 "kids": [_menu(LIVE_SUBMENU_LABELS)]})
-    assert got.get("set") in ("max", "max (already)"), got
+    assert got.get("set") in PICKED, got
 
 
 def test_the_ligature_is_what_broke_it():
@@ -89,7 +109,7 @@ def test_the_ligature_is_what_broke_it():
     assert "Max" in plain
     got = _run({"tag": "body", "attrs": {}, "text": "",
                 "kids": [_menu(plain)]})
-    assert got.get("set") in ("max", "max (already)")
+    assert got.get("set") in PICKED
 
 
 @pytest.mark.parametrize("glyphs", ["", "", "", "",
@@ -99,7 +119,7 @@ def test_any_private_use_glyph_is_tolerated(glyphs):
     free to renumber its glyphs between releases."""
     got = _run({"tag": "body", "attrs": {}, "text": "",
                 "kids": [_menu(["Low", "High", f"Max{glyphs}"])]})
-    assert got.get("set") in ("max", "max (already)"), (glyphs, got)
+    assert got.get("set") in PICKED, (glyphs, got)
 
 
 # ── Scoping: the submenu is a sibling menu, and the popover has its own rows ──
@@ -115,7 +135,7 @@ def test_the_picker_scopes_to_the_menu_without_the_trigger():
     got = _run(spec)
     assert got.get("scoped") is True
     assert got.get("menus") == 2
-    assert got.get("set") in ("max", "max (already)")
+    assert got.get("set") in PICKED
 
 
 def test_the_trigger_row_itself_is_never_mistaken_for_the_tier():
@@ -150,13 +170,19 @@ def test_a_bare_max_elsewhere_on_the_page_is_never_pressed():
         _menu(["Opus 5For complex tasks"], with_trigger=True),
         _menu(LIVE_SUBMENU_LABELS),
     ]}
-    out = run_js(spec, _pick_js()) or {}
+    out = run_js(spec, _pick_js(), PARAMS) or {}
     got, clicks = out.get("ret") or {}, out.get("clicks") or []
-    assert got.get("set") == "max", got
-    assert "DECOY-outside-any-menu" not in clicks, (
-        f"pressed the page-level decoy instead of the submenu row: {clicks}")
-    assert any("" in c for c in clicks), (
-        f"the submenu's own Max row was not the thing clicked: {clicks}")
+    assert got.get("set") == "marked", got
+    # ⭐ RE-ANCHORED 2026-08-17: identity now comes from the row the picker
+    # REPORTS it chose. The old form asserted on the click list, which cannot
+    # survive the move to marking — and marking is the fix, not a refactor.
+    assert "max" in (got.get("picked") or ""), got
+    assert "decoy" not in (got.get("picked") or "").lower(), got
+    # ⛔ AND THE PAGE SCRIPT CLICKED NOTHING. This is the regression guard for the
+    # synthetic press: `pick.click()` reported success against a page that had not
+    # changed, because this component library binds its rows on pointerdown.
+    assert clicks == [], (
+        f"the page script clicked something instead of marking it: {clicks}")
 
 
 def test_helper_prose_is_still_refused():

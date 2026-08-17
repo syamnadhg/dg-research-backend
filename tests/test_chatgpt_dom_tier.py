@@ -1054,20 +1054,29 @@ def test_gemini_keys_on_the_placeholder_not_the_pill():
     assert _probe("gemini", {"pillVisible": True, "pressed": True}) == "unknown"
 
 
-def test_claude_needs_both_halves_of_the_intent_and_never_reads_off():
+def test_claude_needs_ALL_THREE_halves_of_the_intent_and_never_reads_off():
     """⛔ Two rules at once.
 
-    BOTH halves: the rung this reading can skip is the CUA validator, which
-    checks the model AND the Research tool. Answering `on` from the tool alone
-    would silently drop the model half of a surface that was doing two jobs.
+    EVERY half: the rung this reading can skip is the CUA validator, which checks
+    the model, the Research tool AND the effort tier. Answering `on` from fewer
+    would silently drop one of the jobs that surface was doing.
 
     And never `off`: claude.ai renders the Research pill without the attributes
     the detector keys on, so a TRUE state reads false — a False is the absence of
     evidence, not evidence of absence.
+
+    ⚠ RE-ANCHORED 2026-08-17. `effortOk` is the third term, and its absence is
+    exactly what let a run log `select_effort_tier: missed via=none — wanted
+    'max'` and then, one line later, `outcome satisfied at 'builtin' — skipping
+    vision_cua, cua_validate`. Nothing downstream could repair it because nothing
+    downstream ran.
     """
-    assert _probe("claude", {"hasExtended": True, "researchOn": True}) == "on"
-    assert _probe("claude", {"hasExtended": True, "researchOn": False}) == "unknown"
-    assert _probe("claude", {"hasExtended": False, "researchOn": True}) == "unknown"
+    ok = {"hasExtended": True, "researchOn": True, "effortOk": True}
+    assert _probe("claude", ok) == "on"
+    assert _probe("claude", {**ok, "researchOn": False}) == "unknown"
+    assert _probe("claude", {**ok, "hasExtended": False}) == "unknown"
+    # ⭐ The new one. Model right, tool on, tier unverified → descend.
+    assert _probe("claude", {**ok, "effortOk": False}) == "unknown"
     assert _probe("claude", {}) == "unknown"
 
 

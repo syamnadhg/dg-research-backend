@@ -83,12 +83,22 @@ def test_detector_only_reads_visible_buttons():
     display:none marketing chip on a Sonnet account would now pass the gate and
     the run would go out in chat mode believing the model was right.
 
-    ⚠ Scoped to the `hasExtended` clause. The whole-constant read would also be
-    satisfied by any other visibility filter in the file, which is exactly how
-    the previous version of this test went vacuous."""
-    clause = DETECTOR[DETECTOR.index("const hasExtended"):DETECTOR.index("const researchOn")]
+    ⚠ Scoped to the candidate list the family read draws from. The whole-constant
+    read would also be satisfied by any other visibility filter in the file,
+    which is exactly how the previous version of this test went vacuous.
+
+    ⚠ RE-ANCHORED 2026-08-17. The detector now KEEPS the winning button instead
+    of answering yes/no from a `.some(...)`, because the trigger's own label
+    carries the effort as well as the family. The filter therefore moved from the
+    `hasExtended` expression onto the `btns` list it selects from — the property
+    is unchanged, its home is not, and a pin on the old location would have gone
+    green against a detector that had stopped filtering."""
+    clause = DETECTOR[DETECTOR.index("const btns"):DETECTOR.index("const hasExtended")]
     assert "b.getClientRects().length > 0" in clause, (
         "the family read must be restricted to visible buttons"
+    )
+    assert '!b.closest(\'[role="menu"]' in clause, (
+        "and must still exclude options rendered inside an open popover"
     )
 
 
@@ -101,8 +111,118 @@ def test_detector_excludes_upsell_chips():
     )
 
 
-def test_the_detector_still_reports_both_halves():
-    """The ladder probe requires BOTH — the rung it can skip (the CUA validator)
-    checks the model and the Research tool, so a probe that answered from one
-    would drop the other half of a surface doing two jobs."""
-    assert "return { hasExtended, researchOn };" in DETECTOR
+def test_the_detector_reports_all_THREE_halves():
+    """The ladder probe requires every knob the rung it can skip would have
+    checked. The CUA validator looks at the model, the Research tool AND the
+    effort tier, so a probe answering from fewer drops one of them silently.
+
+    ⚠ RE-ANCHORED 2026-08-17: effort was the missing third. Its absence is why a
+    run could log `select_effort_tier: missed` and, one line later, `outcome
+    satisfied at 'builtin' — skipping vision_cua, cua_validate`.
+    """
+    assert "return { hasExtended, researchOn, effortOk };" in DETECTOR
+
+
+def _detect(trigger_label, *, elsewhere=(), effort_word="max", fam="opus"):
+    """Run the real detector against a composer, through the node shim."""
+    from _domshim import el, run_js
+    kids = [el("button", {"data-testid": "model-selector-dropdown",
+                          "aria-label": f"Model: {trigger_label}"}, trigger_label)]
+    kids.extend(el("div", {}, t) for t in elsewhere)
+    return run_js(el("body", {}, kids=kids), DETECTOR,
+                  {"fam": fam, "effortWord": effort_word,
+                   "trigTestid": "model-selector-dropdown"})["ret"]
+
+
+def test_the_effort_is_read_off_the_TRIGGER_and_nowhere_else():
+    """⛔⛔ This account's PLAN CHIP also says "Max". A page-wide scan for the word
+    would report effort-is-set on every page — worse than not reading it at all,
+    because it re-arms the exact false confirmation the third term was added to
+    prevent, while looking like a working check.
+
+    ⚠ REWRITTEN after a mutation survivor. The first version asserted that
+    `document.querySelectorAll` did NOT appear in the clause — and the mutant
+    reached for `document.body.innerText` instead, so the guard never fired. A
+    blocklist of ways to read the page cannot be complete; running the detector
+    against a page that HAS the decoy can.
+    """
+    out = _detect("Opus 5", elsewhere=["Max", "Your plan: Max", "Max effort"])
+    assert out["hasExtended"] is True, "the family is still on the trigger"
+    assert out["effortOk"] is False, (
+        "the effort was read from somewhere other than the trigger"
+    )
+
+
+def test_the_effort_reads_true_when_the_TRIGGER_carries_it():
+    out = _detect("Opus 5 Max")
+    assert out["hasExtended"] is True and out["effortOk"] is True
+
+
+def test_a_missing_trigger_cannot_report_an_effort():
+    # No family, no trigger, so nothing to read the tier off — and the answer must
+    # be False rather than inherited from the page.
+    out = _detect("Sonnet 5 Max", fam="opus", elsewhere=["Max"])
+    assert out["hasExtended"] is False
+    assert out["effortOk"] is False
+
+
+def test_an_upsell_chip_naming_the_family_is_not_a_trigger():
+    # The test id is a NAME, not evidence of the family — so the word is still
+    # demanded, and an upsell still disqualifies.
+    out = _detect("Upgrade to Opus", elsewhere=["Max"])
+    assert out["hasExtended"] is False
+    assert out["effortOk"] is False
+
+
+def test_no_effort_word_configured_reports_False_rather_than_guessing():
+    out = _detect("Opus 5 Max", effort_word="")
+    assert out["hasExtended"] is True
+    assert out["effortOk"] is False
+
+
+def test_a_trailing_ICON_GLYPH_cannot_make_an_empty_word_read_as_set():
+    """⛔ What the `&& ew` guard on the effort read is actually for.
+
+    The live trigger ends in a chevron ICON — the capture shows an icon span
+    inside the button, and icon fonts render into the Unicode private-use area.
+    A trailing non-alphanumeric makes the token split emit an EMPTY token, and
+    `indexOf('')` finds it. Without the guard, an unconfigured effort word would
+    read as a SET tier: a false confirmation, and the one direction this term
+    must never fail in.
+
+    ⚠ HONEST HISTORY, because the first version of this comment overclaimed. A
+    `.filter(Boolean)` was added here as a "fix" and announced as a real bug
+    found by mutation. It was not a bug: the guard already covered it, and the
+    two were redundant — which is exactly why NEITHER could be killed while the
+    other stood. Measured: the false reading needs BOTH removed. The filter is
+    gone and this test pins the remaining guard.
+    """
+    out = _detect("Opus 5 ", effort_word="")
+    assert out["hasExtended"] is True, "the family is still readable"
+    assert out["effortOk"] is False, (
+        "an unconfigured effort word must never read as a set tier"
+    )
+
+
+def test_the_glyph_does_not_break_a_REAL_effort_word_either():
+    # The control: stripping the empty token must not cost a genuine match.
+    out = _detect("Opus 5 Max ", effort_word="max")
+    assert out["effortOk"] is True
+
+
+def test_the_effort_term_is_reported_not_self_gated():
+    """One detector, two policies. The PRE-SEND check must not gate on effort —
+    doing so re-runs the whole Claude setup, model popover and all, seconds
+    before the brief is submitted — while the setup LADDER must. So the script
+    reports the term and each caller decides."""
+    import inspect
+    src = inspect.getsource(research)
+    ladder = src[src.index("async def _dr_outcome_state"):]
+    ladder = ladder[:ladder.index("async def _run_intent_ladder")]
+    assert 'st.get("effortOk")' in ladder, "the ladder must require the effort term"
+
+    presend = src.index("Claude mode regressed before send")
+    window = src[presend - 1200:presend]
+    assert "effortOk" not in window, (
+        "the pre-send gate must NOT require effort — see the note in the detector"
+    )

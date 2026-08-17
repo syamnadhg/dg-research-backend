@@ -12900,6 +12900,10 @@ async def _chatgpt_extended_pro_confirm(page) -> str:
     'Pro Reasoning' or 'Pro (extended)' keeps working."""
     _p1 = {k: p1_words("chatgpt", k) for k in
            ("tier_words", "thinking_words", "downgrade_words", "upgrade_verbs")}
+    # The tool word, so the trigger fallback below can tell the model pill from
+    # the Deep-Research pill sitting beside it. Same source as the tier picker's,
+    # never a literal — the two must not drift on what "the other pill" is.
+    _p1["avoid"] = _chatgpt_tier_policy()[2]
     try:
         res = await page.evaluate("""(P) => {
             const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
@@ -12917,11 +12921,35 @@ async def _chatgpt_extended_pro_confirm(page) -> str:
             // The model / thinking-mode trigger button (NOT the menu items).
             const clickables = [...document.querySelectorAll('button, [role="button"]')]
                 .filter(el => vis(el) && !inOverlay(el));
-            const mtrig = clickables.find(b => {
+            // ⛔ 2026-08-17 — THIS READ WAS RETURNING NOTHING. It looked for a
+            // control whose `data-testid` or `aria-label` contains "model", and
+            // the redesigned composer labels nothing that way: the live log reads
+            // `trig='' extended=False pro=False instant=False`, so every branch
+            // below was deciding from an empty string. With the trigger unread
+            // the function could only ever answer from the marker scan, which is
+            // the weaker of its two evidence sources and the one it is careful
+            // to treat as a hint.
+            //
+            // The named lookup stays FIRST — it is exact where it applies, and
+            // an older layout (or a rollback) still answers it. The fallback is
+            // the same identification rule the tier picker uses: a short composer
+            // chip that owns a popup menu and is not the tool pill. `avoid` is a
+            // SAFETY exclusion here for the same reason it is there — the
+            // Deep-Research pill sits beside this one and reads like a chip too.
+            let mtrig = clickables.find(b => {
                 const a = (b.getAttribute('aria-label') || '').toLowerCase();
                 const tid = (b.getAttribute('data-testid') || '').toLowerCase();
                 return tid.includes('model') || a.includes('model');
             });
+            if (!mtrig) {
+                const avoid = norm(P.avoid || '').toLowerCase();
+                mtrig = clickables.find(b => {
+                    if (b.getAttribute('aria-haspopup') !== 'menu') return false;
+                    const t = norm(b.textContent);
+                    if (!t || t.length > 40) return false;
+                    return !(avoid && t.toLowerCase().indexOf(avoid) !== -1);
+                });
+            }
             const trigText = mtrig ? norm(mtrig.textContent) : '';
             const trig = trigText.toLowerCase();
             // ⛔ SCOPED, never widened. The mode marker is COMPOSER CHROME — the
@@ -12959,7 +12987,26 @@ async def _chatgpt_extended_pro_confirm(page) -> str:
                     markCands.push(el);
                 }
             }
-            const extMark = markCands
+            // ⛔⛔ 2026-08-17 — WHILE THE PICKER IS OPEN, DO NOT TRUST THE MARKER
+            // SCAN. The capture shows the composer mounts a hidden MEASURING
+            // STRIP for the whole label set while the menu is up — every tier
+            // name, and among them the literal string "Pro Extended". Those spans
+            // are 12 characters, sit outside every overlay, and return real
+            // client rects, so they satisfy this scan's two-word rule exactly.
+            // The result would be a permanent 'extended' verdict regardless of
+            // the live mode — which is not a missed detection but an INVERTED
+            // one, and masking a real downgrade is the single thing this function
+            // exists to prevent.
+            //
+            // ⓘ Not a live fault today: the confirm runs after the picker has
+            // been dismissed, and the strip is absent from the closed capture.
+            // Guarded anyway because the cost is one attribute read and the
+            // failure mode is silent. The trigger's own text is unaffected and
+            // remains the primary evidence either way.
+            const pickerOpen = clickables.some(b =>
+                b.getAttribute('aria-haspopup') === 'menu' &&
+                b.getAttribute('aria-expanded') === 'true');
+            const extMark = pickerOpen ? null : markCands
                 .filter(el => vis(el) && !inOverlay(el))
                 .find(el => {
                     const t = norm(el.textContent);
@@ -13365,11 +13412,25 @@ _CHATGPT_MENU_ROWS_JS = r"""(P) => {
     // `seen_used` is returned so the CLICK can re-resolve its index against the
     // exact same set — including when the advisory pass was switched off. A boolean
     // would be one more thing to interpret; the list itself cannot be misread.
+    // ⭐ 2026-08-17 — SCOPE, when the caller has an exact container to read.
+    // The tier rows now live in a submenu the caller has already opened and whose
+    // id it holds, so it can hand over the one element the rows may come from.
+    // Document-wide reads are what this file's whole comment history is about;
+    // when an exact scope is available, "the first group that matches ANYWHERE"
+    // is a worse question than "what is in THIS menu".
+    //
+    // ⛔ A scope that has gone away is NOT silently widened to the document. That
+    // would turn a vanished submenu into a read of whatever else is on screen,
+    // which is the mis-aim this parameter exists to prevent; the caller gets an
+    // empty answer and its own "no rows" path, which already says so honestly.
+    const root = P.scope ? document.getElementById(P.scope) : document;
+    if (P.scope && !root) return { via: '', rows: [], rejected: 0, seen_used: [],
+                                   scope_gone: true };
     const _scan = (seen) => {
         let rejected = 0;
         for (const g of (P.groups || [])) {
             const rows = [];
-            for (const el of document.querySelectorAll(g.sel)) {
+            for (const el of root.querySelectorAll(g.sel)) {
                 const t = norm(el.textContent).slice(0, 120);
                 if (!_rowOk(el, t, seen)) { if (t) rejected++; continue; }
                 rows.push(t);
@@ -13424,8 +13485,14 @@ _CHATGPT_CLICK_ROW_JS = r"""(P) => {
     }
     const g = (P.groups || []).filter(x => x.name === P.via)[0];
     if (!g) return { clicked: false, reason: 'group_gone' };
+    // Same scope the READ used, for the same reason the filter is shared verbatim:
+    // the index was ranked against one set of rows and must be resolved against
+    // that same set. Re-resolving a scoped index against the document would point
+    // at a different row entirely.
+    const root = P.scope ? document.getElementById(P.scope) : document;
+    if (P.scope && !root) return { clicked: false, reason: 'scope_gone' };
     const rows = [];
-    for (const el of document.querySelectorAll(g.sel)) {
+    for (const el of root.querySelectorAll(g.sel)) {
         if (!_rowOk(el, norm(el.textContent).slice(0, 120), P.seen || [])) continue;
         rows.push(el);
     }
@@ -13435,6 +13502,172 @@ _CHATGPT_CLICK_ROW_JS = r"""(P) => {
     if (t !== P.expect) return { clicked: false, reason: 'label_changed', text: t.slice(0, 60) };
     el.setAttribute(P.attr, P.value);
     return { clicked: true, text: t.slice(0, 60) };
+}"""
+
+
+# ⭐⭐ 2026-08-17 — WALK THE PICKER DOWN TO THE TIER ROWS. One step per call, so
+# every press is a real Playwright press and python re-reads the page between
+# them; a page script that did the whole walk itself would be back to the
+# synthetic-click problem the marking machinery exists to solve.
+#
+# WHAT THE LIVE CAPTURE ACTUALLY SHOWED, because the report that reached us was
+# "the effort selector is a slider now" and that is not what has to be driven:
+# the menu grew a level. The tier rows are still `menuitemradio` rows reading
+# `Instant / Medium / High / Extra High / Pro`, one submenu down, behind a row
+# labelled "Effort" that is itself only shown in the menu's EXPANDED state. The
+# picker opened the pill, read `Advanced / Model … / Effort …`, found no row
+# naming the tier and stopped — correctly, by its own rules. Nothing was broken
+# except that it had no way to walk in. The slider is the same setting rendered a
+# second way for the compact state; driving it would mean inferring the tier from
+# a position, and the rows name it outright.
+#
+# States, in the order they are reached:
+#   `no_menu`     — nothing open that we can identify as the picker.
+#   `advanced`    — the expand toggle is marked; press it and call again.
+#   `effort`      — the row owning the tier submenu is marked; press, call again.
+#   `open`        — the submenu is open. `submenu` is its id; rows live there.
+#   `no_effort`   — the picker is open and expanded and offers no such row.
+#
+# ⛔ FINDING THE MENU: `aria-controls` FIRST, the testid only as a corroborator.
+# The pill we pressed carries `aria-controls` pointing at exactly the menu it
+# opened, which is an unforgeable link between the thing we clicked and the thing
+# we are about to read. Every mis-click in this file's history came from picking
+# a container by name or by document order and hoping; a testid is just a nicer
+# name. The testid is tried first only because it is cheap and specific, and the
+# id link is what makes a wrong answer impossible rather than unlikely.
+#
+# ⛔⛔ CONTAINMENT IS AN ABSOLUTE GATE, and it is not defensive programming — the
+# capture shows the failure. In the COMPACT state the Effort row is still in the
+# DOM, still returns a non-empty `getClientRects()`, and sits at coordinates
+# BELOW the menu's own bottom edge: it is rendered and then clipped out of the
+# panel. `offsetParent` and rect-emptiness both say "visible". Marking it and
+# handing those coordinates to a real press would click whatever is behind the
+# menu — dismissing the picker at best, pressing a page control at worst. So a
+# row is only ever marked when its box lies inside the menu's box, and the
+# expand toggle is pressed first to bring it there.
+# Is the composer's picker still open? The TRIGGER'S OWN STATE is the authority —
+# counting visible `[role=menu]` elements would also count the tools menu, a
+# tooltip's portal, or a stale wrapper, and the question being asked is
+# specifically "did the thing I opened close again".
+#
+# ⛔ Same identification rule and same `avoid` exclusion as every other reader
+# here: a short composer chip that is not the Deep-Research pill. A fourth way of
+# recognising this control is a fourth thing to drift.
+_CHATGPT_PICKER_OPEN_JS = r"""(P) => {
+    const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+    const vis = el => el.getClientRects().length > 0;
+    const avoid = (P.avoid || '').toLowerCase();
+    for (const b of document.querySelectorAll(
+            '[aria-haspopup="menu"][aria-expanded="true"]')) {
+        if (!vis(b)) continue;
+        if (b.closest('[role="menu"], [role="listbox"], [role="dialog"]')) continue;
+        const t = norm(b.textContent);
+        if (!t || t.length > 40) continue;
+        if (avoid && t.toLowerCase().indexOf(avoid) !== -1) continue;
+        return { open: true, trigger: t.slice(0, 40) };
+    }
+    // The container is a corroborator only, for a layout whose trigger stops
+    // reflecting its state. A visible picker with no expanded trigger is still an
+    // overlay sitting over the composer.
+    if (P.menuTestid) {
+        for (const el of document.querySelectorAll(
+                '[data-testid="' + P.menuTestid + '"]')) {
+            if (vis(el)) return { open: true, trigger: '' };
+        }
+    }
+    return { open: false, trigger: '' };
+}"""
+
+_CHATGPT_PICKER_NAV_JS = r"""(P) => {
+    const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+    const low = s => norm(s).toLowerCase();
+    const vis = el => el.getClientRects().length > 0;
+    const words = (list) => (list || []).map(w => String(w).toLowerCase());
+    // The row's OWN leading label, not its whole text. A row reads "EffortInstant"
+    // — the label plus the value it currently holds — so matching whole text would
+    // bind the selector to the very setting it exists to change.
+    const leadLabel = (el) => {
+        for (const n of el.querySelectorAll('*')) {
+            let t = '';
+            for (const c of n.childNodes) if (c.nodeType === 3) t += c.nodeValue;
+            t = low(t);
+            if (t) return t;
+        }
+        return low(el.textContent);
+    };
+    const hasWord = (s, list) => {
+        const toks = low(s).split(/[^a-z0-9+]+/).filter(Boolean);
+        return words(list).some(w => toks.indexOf(w) !== -1);
+    };
+    const inside = (el, root) => {
+        const a = el.getBoundingClientRect(), b = root.getBoundingClientRect();
+        if (!a.width || !a.height) return false;
+        // A tolerance of 1px absorbs sub-pixel layout, nothing more.
+        return a.top >= b.top - 1 && a.bottom <= b.bottom + 1 &&
+               a.left >= b.left - 1 && a.right <= b.right + 1;
+    };
+
+    for (const el of document.querySelectorAll('[' + P.attr + ']')) {
+        el.removeAttribute(P.attr);
+    }
+
+    // ── locate the picker ──────────────────────────────────────────────────
+    let menu = null, via = '';
+    if (P.menuTestid) {
+        for (const el of document.querySelectorAll('[data-testid="' + P.menuTestid + '"]')) {
+            if (vis(el)) { menu = el; via = 'testid'; break; }
+        }
+    }
+    if (!menu) {
+        // The trigger we pressed names its own popup. Same identification rule as
+        // the trigger reader: a short chip that is not the tool pill.
+        const avoid = low(P.avoid || '');
+        for (const b of document.querySelectorAll('[aria-haspopup="menu"][aria-expanded="true"][aria-controls]')) {
+            if (!vis(b)) continue;
+            const t = norm(b.textContent);
+            if (!t || t.length > 40) continue;
+            if (avoid && t.toLowerCase().indexOf(avoid) !== -1) continue;
+            const m = document.getElementById(b.getAttribute('aria-controls'));
+            if (m && vis(m)) { menu = m; via = 'aria-controls'; break; }
+        }
+    }
+    if (!menu) return { state: 'no_menu', via: '' };
+
+    // ── already open? the row owning the submenu says so itself ────────────
+    const rows = [...menu.querySelectorAll('[role="menuitem"]')].filter(vis);
+    const effortRow = rows.find(r => r.getAttribute('aria-haspopup') === 'menu' &&
+                                     hasWord(leadLabel(r), P.effortWords));
+    if (effortRow && effortRow.getAttribute('aria-expanded') === 'true') {
+        const sub = effortRow.getAttribute('aria-controls');
+        if (sub && document.getElementById(sub)) {
+            return { state: 'open', via: via, submenu: sub,
+                     label: norm(effortRow.textContent).slice(0, 40) };
+        }
+    }
+    if (effortRow && inside(effortRow, menu)) {
+        effortRow.setAttribute(P.attr, P.value);
+        return { state: 'effort', via: via,
+                 label: norm(effortRow.textContent).slice(0, 40) };
+    }
+
+    // ── not reachable yet: expand. The toggle has no popup of its own, which
+    //    is what separates it from the submenu rows beside it. ──────────────
+    const toggle = rows.find(r => !r.getAttribute('aria-haspopup') &&
+                                  r.hasAttribute('aria-expanded') &&
+                                  hasWord(leadLabel(r), P.advancedWords));
+    if (toggle && toggle.getAttribute('aria-expanded') !== 'true' && inside(toggle, menu)) {
+        toggle.setAttribute(P.attr, P.value);
+        return { state: 'advanced', via: via,
+                 label: norm(toggle.textContent).slice(0, 40) };
+    }
+
+    // Say which of the two it was: a picker with no such row at all, and a picker
+    // whose row is present but clipped out of reach, want different next moves.
+    return { state: 'no_effort', via: via,
+             clipped: !!effortRow,
+             expanded: toggle ? toggle.getAttribute('aria-expanded') : null,
+             rows: rows.filter(r => inside(r, menu))
+                       .map(r => norm(r.textContent).slice(0, 32)).slice(0, 8) };
 }"""
 
 
@@ -13577,6 +13810,95 @@ async def _chatgpt_select_effort_tier(page, *, label="ChatGPT", phase=1) -> str:
     return verdict
 
 
+# The picker container's own testid, as captured live 2026-08-17. A corroborator
+# only — `aria-controls` off the trigger is the load-bearing link. See the nav
+# script for why a name is weaker than an id.
+_CHATGPT_PICKER_MENU_TESTID = "composer-intelligence-picker-content"
+
+
+async def _chatgpt_open_effort_submenu(page, *, tag, trace=None) -> str:
+    """Walk the already-open picker down to the submenu holding the tier rows.
+    Returns that submenu's element id, or ``""`` when there is nothing to walk
+    into (which includes every older layout, where the rows are already flat).
+
+    One press per iteration, re-reading the page in between, because each press
+    changes what the next step even is. The nav script marks; the press is a real
+    Playwright press; nothing here decides anything from a click that "did not
+    throw" — that equivalence is what this whole file's marking machinery exists
+    to refuse.
+
+    ⛔ HOVER FOR THE SUBMENU ROW, PRESS FOR THE TOGGLE. A nested menu opens on the
+    pointer ARRIVING, not on a click; the corpus already paid for that lesson on
+    Claude's Effort submenu, which reported nine successful clicks and nine
+    missing menus. `_sr_real_click` does both when asked, and asking costs a
+    quarter-second on a control that would have answered a click anyway.
+
+    Never raises: every failure returns "" and the caller falls through to the
+    rungs it already had.
+    """
+    effort_words = p1_words("chatgpt", "effort_row_words")
+    advanced_words = p1_words("chatgpt", "advanced_words")
+    _tiers, _verbs, tool = _chatgpt_tier_policy()
+    tr = trace if trace is not None else {}
+    if not effort_words:
+        # No word, no walk. Not a failure — it is how a platform that has not
+        # grown a second level opts out, and it must not read as one.
+        return ""
+    params = {"menuTestid": _CHATGPT_PICKER_MENU_TESTID,
+              "effortWords": effort_words, "advancedWords": advanced_words,
+              "avoid": tool, "attr": _SR_CLICK_MARK, "value": "picker-step"}
+    seen_states: list = []
+    for _step in range(6):
+        try:
+            st = await page.evaluate(_CHATGPT_PICKER_NAV_JS, params) or {}
+        except Exception as e:
+            log(f"{tag} could not read the picker's structure ({e})", "INFO")
+            return ""
+        if not isinstance(st, dict):
+            return ""
+        state = str(st.get("state") or "")
+        if state == "open":
+            sub = str(st.get("submenu") or "")
+            if sub:
+                log(f"{tag} walked into the {str(st.get('label'))[:24]!r} submenu "
+                    f"(found the picker via {st.get('via')}) — the tier rows are there")
+                tr["detail"] = f"submenu via {st.get('via')}"
+            return sub
+        if state not in ("advanced", "effort"):
+            # Say WHICH dead end. "The picker offers no effort row" and "the row
+            # is there but clipped out of the panel" have different next moves,
+            # and one log line that cannot tell them apart is how the last two
+            # rotations each cost a run to diagnose.
+            if state == "no_effort":
+                log(f"{tag} the picker offers no row naming "
+                    f"{effort_words[0]!r} (clipped={st.get('clipped')}, "
+                    f"expanded={st.get('expanded')!r}, reachable rows "
+                    f"{json.dumps(st.get('rows') or [], ensure_ascii=False)})", "INFO")
+            elif state == "no_menu":
+                log(f"{tag} no open picker to walk — leaving the rows as they were",
+                    "INFO")
+            return ""
+        # ⛔ A step that does not move the picker must not be pressed forever. Two
+        # attempts at the same state is a retry; a third is a loop, and a loop
+        # here is a loop of REAL CLICKS on a live page.
+        seen_states.append(state)
+        if seen_states.count(state) > 2:
+            log(f"{tag} the picker did not advance past {state!r} after two "
+                f"presses — leaving it to the next rung", "WARN")
+            tr["detail"] = f"stuck at {state}"
+            return ""
+        how = await _sr_real_click(page, "picker-step", tag=tag,
+                                   hover_first=(state == "effort"))
+        if not how:
+            log(f"{tag} the {state!r} step could not be pressed", "INFO")
+            return ""
+        # Let the submenu mount. The loop re-reads rather than trusting the press.
+        await asyncio.sleep(0.45)
+    log(f"{tag} gave up walking the picker after {len(seen_states)} presses "
+        f"({', '.join(seen_states)})", "WARN")
+    return ""
+
+
 async def _chatgpt_pick_effort_tier(page, *, label="ChatGPT", phase=1,
                                     _trace=None) -> str:
     """The `builtin` rung of `chatgpt.select_model` — pick the policy EFFORT TIER
@@ -13618,11 +13940,43 @@ async def _chatgpt_pick_effort_tier(page, *, label="ChatGPT", phase=1,
         f"via={pre.get('via') or '-'}) — opening the model menu")
 
     async def _escape():
-        """Leave no popover sitting over the composer (the #744 invariant)."""
-        try:
-            await page.keyboard.press("Escape")
-        except Exception:
-            pass
+        """Leave no popover sitting over the composer (the #744 invariant).
+
+        ⛔⛔ 2026-08-17 — ONE ESCAPE IS NO LONGER ENOUGH, and this is #751 all over
+        again on the other platform. That ticket reads: "a SINGLE Escape closed
+        only the inner Effort submenu, leaving the PARENT model popover open over
+        the composer — the restructure added the nested submenu but kept the single
+        Escape." The walk above has just given ChatGPT's picker the same nested
+        shape, and every one of this function's exits dismissed with one press.
+        An open picker over the composer is what triggers the #744 re-click loop
+        on pre-send re-activation, and it covers the tools menu and the input.
+
+        ⭐ PRESSED UNTIL IT IS ACTUALLY SHUT, not a fixed number of times. A blind
+        double-press would close the nested case and would also send a second
+        Escape into a UI where nothing is open — cheap on this page today, but it
+        is a keystroke aimed at whatever happens to be focused, and the count
+        would have to be revised again the next time a level is added. Reading the
+        trigger's own state costs one evaluate and cannot be wrong about how many
+        levels there were.
+        """
+        for _ in range(3):
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                return
+            await asyncio.sleep(0.2)
+            try:
+                st = await page.evaluate(
+                    _CHATGPT_PICKER_OPEN_JS,
+                    {"menuTestid": _CHATGPT_PICKER_MENU_TESTID,
+                     "avoid": _tool}) or {}
+            except Exception:
+                return
+            if not st.get("open"):
+                return
+        log(f"{tag} the picker is STILL open after three Escapes — leaving it "
+            f"rather than pressing blindly; the pre-send check will re-read it",
+            "WARN")
 
     try:
         opened = await page.evaluate(_CHATGPT_MARK_MODEL_TRIGGER_JS,
@@ -13707,6 +14061,72 @@ async def _chatgpt_pick_effort_tier(page, *, label="ChatGPT", phase=1,
     tr["detail"] = f"{len(rows)} rows: {json.dumps([r[:24] for r in rows[:5]], ensure_ascii=False)}"
 
     pick = pick_effort_tier(rows, tiers, verbs)
+
+    # ⭐⭐ 2026-08-17 — THE ROWS MAY BE ONE LEVEL DOWN. Only reached when the flat
+    # read found no tier, which is what keeps this change invisible to every
+    # layout that still lists the tiers directly: an older UI, a rollback, or an
+    # A-B bucket takes the branch above and never walks. The walk is the recovery
+    # path, not the new normal path, and it costs nothing on a menu that has
+    # nothing to walk into.
+    #
+    # ⛔ The re-read is SCOPED to the submenu the walk actually opened — and the
+    # reason is narrower than it first looks, which is worth saying because the
+    # obvious version of it is wrong. On the RADIO group scope changes nothing:
+    # the hook groups are ordered, `menuitemradio` matches only the submenu's
+    # rows, and the first group to yield anything wins, so the parent's rows are
+    # never in the pool. Where it earns its keep is the FALLBACK groups. If the
+    # tier rows ever stop being radios — the rotation the third group exists for
+    # — the read drops to `menuitem`, which matches the parent's rows too, and
+    # the parent's Effort row reads "EffortPro" once the tier is set: it NAMES
+    # the tier, it is short, and clicking it opens a submenu rather than
+    # selecting anything, while every downstream guard passes because it is the
+    # element that was ranked. Scope removes the question instead of surviving it.
+    _scope = ""
+    # ⛔⛔ Did we get all the way to the tier rows? `no_target` below is the
+    # "this account has no Pro" verdict and the caller acts on it as a fact about
+    # the SUBSCRIPTION. A walk that could not find the Effort row is a fact about
+    # OUR NAVIGATION, and reporting one as the other sends a perfectly good Pro
+    # account down the no-subscription path. This function's own comment already
+    # set the rule — "`no_target` is a STRONG claim … and it must not rest on the
+    # weakest hook" — and a failed walk is weaker than the class fallback it
+    # already refuses to claim from.
+    if not pick:
+        _scope = await _chatgpt_open_effort_submenu(page, tag=tag, trace=tr)
+        if _scope:
+            _sub_rows, _sub_via, _sub_snap = [], "", {}
+            for _attempt in range(8):
+                if _attempt:
+                    await asyncio.sleep(0.3)
+                try:
+                    _sub_snap = await page.evaluate(
+                        _CHATGPT_MENU_ROWS_JS,
+                        {"groups": _CHATGPT_MODEL_ROW_GROUPS, "seen": [],
+                         "scope": _scope}) or {}
+                except Exception as e:
+                    log(f"{tag} submenu row read failed ({e})", "INFO")
+                    break
+                _sub_rows = list(_sub_snap.get("rows") or [])
+                _sub_via = _sub_snap.get("via") or ""
+                if _sub_rows:
+                    break
+            if _sub_rows:
+                # ⚠ The census does NOT carry over. It was taken before the PILL
+                # was pressed, to tell menu rows from things already on screen —
+                # a question that is already answered by scoping to a submenu that
+                # did not exist then, and re-applying it would reject a tier row
+                # whose word happened to appear anywhere earlier.
+                rows, via, _seen_used = _sub_rows, _sub_via, []
+                log(f"{tag} the submenu offered {len(rows)} rows via {via}: "
+                    f"{json.dumps([r[:32] for r in rows[:8]], ensure_ascii=False)}")
+                tr["via"] = f"{opened.get('via')}/{via}(sub)"
+                tr["detail"] = (f"{len(rows)} submenu rows: "
+                                f"{json.dumps([r[:24] for r in rows[:5]], ensure_ascii=False)}")
+                pick = pick_effort_tier(rows, tiers, verbs)
+            elif (_sub_snap or {}).get("scope_gone"):
+                log(f"{tag} the submenu closed before its rows could be read", "INFO")
+            else:
+                log(f"{tag} the submenu opened but mounted no rows", "WARN")
+
     if not pick:
         # ⛔ Deliberately NOT "take the best row we can find". Nothing on the menu
         # names the tier, which on this platform means the subscription does not
@@ -13726,6 +14146,26 @@ async def _chatgpt_pick_effort_tier(page, *, label="ChatGPT", phase=1,
                 f"this is NOT a no-Pro verdict", "WARN")
             await _escape()
             return "unsure"
+        if via != "radio":
+            # ⛔⛔ `no_target` is the "this account has no Pro" verdict and the
+            # caller acts on it as a fact about the SUBSCRIPTION. Only claim it
+            # from something that was actually a TIER LIST. The capture says the
+            # tiers are `menuitemradio` rows — in the flat layout and in the
+            # submenu alike — while the two-level picker's STRUCTURAL rows
+            # (`Advanced`, `Model …`, `Effort …`) are plain `menuitem`. A read that
+            # answered on anything but the radio group therefore never looked at
+            # the tiers, and reporting a plan limit from it takes a perfectly good
+            # Pro account down the no-subscription path.
+            #
+            # ⚠ Deliberately conservative in ONE direction: if the tiers ever stop
+            # being radios we will say `unsure` where `no_target` was true, and a
+            # lower rung answers. That is this function's own stated preference —
+            # "Say `unsure` and let the next rung answer, which is what it is for."
+            log(f"{tag} no row names the '{tiers[0]}' tier, but the rows came from "
+                f"'{via}' rather than the tier radios — that was not the tier "
+                f"list, so this is NOT a no-Pro verdict", "WARN")
+            await _escape()
+            return "unsure"
         log(f"{tag} no row names the '{tiers[0]}' tier — not settling for a lower "
             f"one; the no-tier verdict goes to the caller", "WARN")
         await _escape()
@@ -13734,7 +14174,7 @@ async def _chatgpt_pick_effort_tier(page, *, label="ChatGPT", phase=1,
         clicked = await page.evaluate(_CHATGPT_CLICK_ROW_JS,
                                       {"groups": _CHATGPT_MODEL_ROW_GROUPS, "via": via,
                                        "index": pick["index"], "expect": pick["label"],
-                                       "seen": _seen_used,
+                                       "seen": _seen_used, "scope": _scope,
                                        "attr": _SR_CLICK_MARK, "value": "model-row"})
     except Exception as e:
         log(f"{tag} row click errored ({e})", "INFO")
@@ -39442,7 +39882,8 @@ _GEMINI_DR_STATE_JS = """() => {
 # ⚠ DOCUMENTED BRITTLE. claude.ai renders the Research pill without the
 # attributes `researchOn` keys on, so a True here is trustworthy and a False is
 # NOT — which is why the ladder probe maps a False to `unknown`, never to `off`.
-_CLAUDE_MODE_STATE_JS = """(fam) => {
+_CLAUDE_MODE_STATE_JS = """(P) => {
+    const fam = P.fam;
     const txt = (document.body.innerText || '').toLowerCase();
     // 2026-05-28: the UI dropped the word "Extended" — the model
     // button now reads "Opus 5 Max" and Adaptive shows as a
@@ -39471,11 +39912,56 @@ _CLAUDE_MODE_STATE_JS = """(fam) => {
     // an off-screen or hidden element harmless (it needed a number
     // too); the family word alone does not, so a hidden marketing
     // chip on a Sonnet account would now pass this gate.
-    const hasExtended = [...document.querySelectorAll('button, [role="button"]')]
+    const btns = [...document.querySelectorAll('button, [role="button"]')]
         .filter(b => b.getClientRects().length > 0
-                     && !b.closest('[role="menu"], [role="listbox"], [role="dialog"]'))
-        .some(b => { const t = b.textContent || '';
-                     return famRe.test(t) && !upsellRe.test(t); });
+                     && !b.closest('[role="menu"], [role="listbox"], [role="dialog"]'));
+    // ⭐ 2026-08-17 — KEEP THE WINNING BUTTON, don't just answer yes/no. The
+    // trigger's own label carries BOTH halves ("Model: Opus 5 Max"), so the
+    // effort is knowable from the same element that answers the family — and
+    // reading it anywhere else is wrong: this account's PLAN CHIP also says
+    // "Max", so a page-wide scan reports effort-is-set on every page.
+    // The captured test id is preferred where present; the text scan is the
+    // fallback, so an older layout answers exactly as it did before.
+    let trigger = null;
+    for (const b of btns) {
+        if (b.getAttribute('data-testid') === P.trigTestid) { trigger = b; break; }
+    }
+    if (!trigger) {
+        trigger = btns.find(b => { const t = b.textContent || '';
+                                   return famRe.test(t) && !upsellRe.test(t); });
+    } else {
+        // An id is a name, not evidence of the family. Still demand the word.
+        const t = (trigger.getAttribute('aria-label') || '') + ' ' + (trigger.textContent || '');
+        if (!famRe.test(t) || upsellRe.test(t)) trigger = null;
+    }
+    const hasExtended = !!trigger;
+    // ⚠ REPORTED, NOT GATED HERE. Two callers read this detector and they want
+    // different policies: the setup LADDER must descend when the effort is
+    // unconfirmed, while the PRE-SEND check must not — gating a pre-send on a
+    // quality knob re-runs the entire Claude setup, with the model popover
+    // opening seconds before the brief is submitted. One detector, two policies;
+    // a second detector is how the two drifted the first time.
+    let effortOk = false;
+    const ew = String(P.effortWord || '').toLowerCase();
+    if (trigger && ew) {
+        const label = (trigger.getAttribute('aria-label') || '') + ' '
+                    + (trigger.textContent || '');
+        // ⚠ `ew` IS ALREADY KNOWN NON-EMPTY — that is what the `&& ew` above is
+        // for, and it is the whole guard. It matters because this trigger's text
+        // ENDS IN AN ICON GLYPH (the capture shows a chevron span inside the
+        // button, and icon fonts render into the Unicode private-use area), so a
+        // trailing non-alphanumeric makes `split` emit an empty token — which
+        // `indexOf('')` would find. An empty effort word would then read as a SET
+        // tier, which is a false confirmation and the one direction this term must
+        // never fail in.
+        //
+        // ⛔ A `.filter(Boolean)` here was tried and REMOVED. It is a second guard
+        // against the same thing, so neither could be killed by mutation while the
+        // other stood — and this file's own rule applies: a line that cannot change
+        // an answer gets read as load-bearing by the next person and tested by
+        // nobody. One guard, with a test that fails if it goes.
+        effortOk = label.toLowerCase().split(/[^a-z0-9.]+/).indexOf(ew) !== -1;
+    }
     // Research tool shows as a magnifying-glass icon / label near composer.
     const researchOn = Array.from(document.querySelectorAll('button, [role="button"]'))
         .some(b => {
@@ -39487,8 +39973,165 @@ _CLAUDE_MODE_STATE_JS = """(fam) => {
                     b.classList.contains('active') ||
                     b.classList.contains('selected'));
         });
-    return { hasExtended, researchOn };
+    return { hasExtended, researchOn, effortOk };
 }"""
+
+
+# ⭐⭐ Claude's composer test ids, captured live 2026-08-17. The most durable hooks
+# either platform gives us: an exact name for the control AND one for every option
+# under it. They are tried first and the existing text searches remain as the
+# fallback, so an older layout is unaffected.
+_CLAUDE_MODEL_TRIGGER_TESTID = "model-selector-dropdown"
+_CLAUDE_EFFORT_TRIGGER_TESTID = "effort-menu-trigger"
+
+
+def _claude_effort_option_testid(effort: str) -> str:
+    """The option row's test id for a policy effort word.
+
+    ⚠ `xhigh`, not `extra`. The captured ids are `effort-option-low|medium|high|
+    xhigh|max` while the row LABELS read `Low / Medium / High / Extra / Max` — the
+    id and the visible word disagree for exactly one rung, and it is the rung
+    directly below the one we ask for. A caller that derived the id from the label
+    would silently address nothing on the only step where being one rung out
+    matters. Unknown words map to "" so the caller falls through to its text
+    search rather than addressing a test id that does not exist.
+    """
+    word = (effort or "").strip().lower()
+    known = {"low": "low", "medium": "medium", "high": "high",
+             "extra": "xhigh", "extra high": "xhigh", "xhigh": "xhigh",
+             "max": "max"}
+    slug = known.get(word)
+    return f"effort-option-{slug}" if slug else ""
+
+
+def _claude_effort_is_set(*, marked: bool, already: bool,
+                          pressed: bool, checked: bool) -> bool:
+    """Was Claude's effort tier ACTUALLY set? The four readings, one verdict.
+
+    ⭐ A pure function because the alternative did not survive mutation. The call
+    site used to clear a flag inside two nested `if not …:` branches, and a mutant
+    that turned the verification into `if False:` left the whole suite green — the
+    tests could see the read was mentioned, not that its answer decided anything.
+    Here the answer IS the return value, so a missing term is a wrong value.
+
+      * `marked`   — a row naming the wanted tier was found at all.
+      * `already`  — it was the selected one before we touched it. Cost-free and
+                     correct; nothing is pressed and nothing needs verifying.
+      * `pressed`  — a real, trusted press landed.
+      * `checked`  — and the row then READ as selected.
+
+    ⛔ `pressed` alone is never enough. "The click did not throw" as evidence of a
+    changed page is the equivalence that produced nine "'Max' not found" WARNs
+    against one success, and a report of a set tier from a page that had not moved.
+    """
+    if not marked:
+        return False
+    if already:
+        return True
+    return bool(pressed and checked)
+
+
+def _claude_validator_effort_ok(thinking_state) -> bool:
+    """Should the CUA validator be told the effort tier is already set?
+
+    Extracted from its call site so the POLARITY is testable. Inline it sat in a
+    900-line async function nothing in the suite executes, which is the shape
+    that has repeatedly let an inverted gate ship green.
+
+    ⭐ DEFAULTS TO TRUE — "assume it is fine". A platform that records nothing,
+    or a validate call arriving before any setup ran, then gets today's cheap
+    read-only pass. Defaulting the other way would send the validator into the
+    model popover on every run of every platform to buy nothing, and reopen the
+    "the model selector opens twice" report.
+    """
+    return bool((thinking_state or {}).get("effort", True))
+
+
+# Re-open the model popover with a REAL press on the test-id'd trigger, and
+# verify from the trigger's own `aria-expanded` that it actually opened.
+_CLAUDE_MARK_MODEL_TRIGGER_JS = r"""(P) => {
+    for (const el of document.querySelectorAll('[' + P.attr + ']')) {
+        el.removeAttribute(P.attr);
+    }
+    for (const el of document.querySelectorAll('[data-testid="' + P.testid + '"]')) {
+        if (!el.getClientRects().length) continue;
+        el.setAttribute(P.attr, P.value);
+        return { marked: true, expanded: el.getAttribute('aria-expanded'),
+                 label: (el.getAttribute('aria-label') || '').slice(0, 60) };
+    }
+    return { marked: false };
+}"""
+
+# Did the effort row actually become the selected one? Read by test id when the
+# platform offers it, else by the row's own text with the icon-font private-use
+# codepoints stripped — the glyphs that defeated an exact text match nine runs out
+# of ten ride on the SELECTED row, which is precisely the row this reads.
+_CLAUDE_EFFORT_CHECKED_JS = r"""(P) => {
+    const norm = s => (s || '')
+        .replace(/[\ue000-\uf8ff]/g, ' ')
+        .replace(/\s+/g, ' ').trim().toLowerCase();
+    const isOn = el => el.getAttribute('aria-checked') === 'true' ||
+                       el.dataset.state === 'checked' || el.dataset.state === 'on';
+    if (P.optTestid) {
+        const el = document.querySelector('[data-testid="' + P.optTestid + '"]');
+        if (el) return { found: true, checked: isOn(el), via: 'testid' };
+    }
+    for (const el of document.querySelectorAll(
+            '[role="menuitemradio"], [role="menuitem"], [role="option"]')) {
+        if (!el.getClientRects().length) continue;
+        if (norm(el.textContent) !== String(P.word || '')) continue;
+        return { found: true, checked: isOn(el), via: 'text' };
+    }
+    return { found: false, checked: false, via: '' };
+}"""
+
+_CLAUDE_TRIGGER_EXPANDED_JS = r"""(P) => {
+    const el = document.querySelector('[data-testid="' + P.testid + '"]');
+    if (!el) return { found: false };
+    return { found: true, expanded: el.getAttribute('aria-expanded') === 'true',
+             label: (el.getAttribute('aria-label') || '').slice(0, 60) };
+}"""
+
+
+async def _claude_reopen_model_popover(page) -> bool:
+    """Re-open Claude's model popover after a model pick closed it.
+
+    ⭐ Verifies the OUTCOME — the trigger's own `aria-expanded` — never the press.
+    "The click did not throw" is the equivalence this file has spent three waves
+    removing, and re-opening a popover is precisely a case where a press can land
+    on a control that is already busy and change nothing.
+
+    Returns False rather than raising: the caller's next step already knows how to
+    report an unconfirmed effort, and a failure here must not lose a run whose
+    model and research tool are both correct.
+    """
+    try:
+        marked = await page.evaluate(
+            _CLAUDE_MARK_MODEL_TRIGGER_JS,
+            {"testid": _CLAUDE_MODEL_TRIGGER_TESTID,
+             "attr": _SR_CLICK_MARK, "value": "claude-model-trigger"}) or {}
+    except Exception as e:
+        log(f"[setup_claude_dr] could not locate the model trigger to re-open ({e})",
+            "INFO")
+        return False
+    if not marked.get("marked"):
+        return False
+    # Already open is a success, and pressing anyway would CLOSE it — the one
+    # outcome this helper must never produce.
+    if str(marked.get("expanded")) == "true":
+        return True
+    if not await _sr_real_click(page, "claude-model-trigger", tag="[setup_claude_dr]"):
+        return False
+    for _try in range(8):
+        await asyncio.sleep(0.25)
+        try:
+            st = await page.evaluate(_CLAUDE_TRIGGER_EXPANDED_JS,
+                                     {"testid": _CLAUDE_MODEL_TRIGGER_TESTID}) or {}
+        except Exception:
+            return False
+        if st.get("expanded"):
+            return True
+    return False
 
 
 async def setup_gemini_dr(page, pin_model=None, step_below=None) -> bool:
@@ -40743,6 +41386,33 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                 _effort_via = "trigger"
                 log(f"[setup_claude_dr] Step 1C SKIPPED: effort '{_claude_effort}' already "
                     f"read off the trigger — the popover is open only for the model check")
+            # ⭐⭐ 2026-08-17 — PICKING THE MODEL CLOSES THE WHOLE POPOVER. Proven
+            # from a live capture: immediately after the Opus row is clicked the
+            # page has NO open overlay at all and the trigger is back to
+            # `aria-expanded="false"`. That is the entire content of the WARN this
+            # step has been emitting — "Effort control not found (older UI /
+            # popover closed?)" — and the question mark can come off: closed.
+            #
+            # Everything downstream then searched a popover that no longer
+            # existed, failed to find Effort, warned, and let the run continue at
+            # whatever effort the newly-selected model happened to default to,
+            # while reporting the model selection as a success. Effort is stored
+            # PER MODEL on this family, so the run after a model change is exactly
+            # the run whose effort is least likely to be right.
+            #
+            # Re-open rather than reorder. Setting effort BEFORE the model would
+            # also work and would save a popover, but only if an effort click
+            # leaves the popover up — which the capture does not settle, and
+            # guessing about it is how this step got here. Re-opening is correct
+            # under either behaviour.
+            if _model_changed and not _effort_already_known:
+                if await _claude_reopen_model_popover(page):
+                    log("[setup_claude_dr] Step 1C: re-opened the model popover — "
+                        "picking a model closes it, and Effort lives inside it")
+                else:
+                    log("[setup_claude_dr] Step 1C: the model popover could not be "
+                        "re-opened after the model change; effort stays as the new "
+                        "model's default and is NOT reported as confirmed", "WARN")
             try:
                 # 2026-08-04: MARK the Effort row, open it with a real hover +
                 # click, and verify the submenu MOUNTED. The old version clicked
@@ -40781,25 +41451,49 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                         || (el.closest && el.closest('a[href]'))
                         || (el.querySelector && el.querySelector('a[href]'));
                     const rejected = [];
-                    let trigger = null;
-                    for (const el of document.querySelectorAll(
-                            '[role="menuitem"], button, [role="option"], li')) {
-                        if (!el.getClientRects().length) continue;
-                        const t = norm(el.textContent);
-                        if (!t.startsWith('effort')) continue;
-                        // The Effort row shows its current value + a submenu chevron.
-                        if (linky(el)) { rejected.push(['link', t.slice(0, 60)]); continue; }
-                        if (t.length > 40) { rejected.push(['long', t.slice(0, 60)]); continue; }
-                        trigger = el;
-                        break;
+                    let trigger = null, via = '';
+                    // ⭐⭐ 2026-08-17 — THE TEST ID, FIRST. The comment below asked
+                    // for "container-scoping … it needs a live claude.ai capture
+                    // we do not have". The capture arrived, and it is better than
+                    // a container: the row carries `data-testid="effort-menu-
+                    // trigger"` and every option under it is likewise named. An
+                    // exact id retires this whole hazard class at once — no text
+                    // prefix, no length bound, no anchor arms, nothing that a
+                    // sidebar conversation or a markdown bullet can satisfy.
+                    if (P.testid) {
+                        for (const el of document.querySelectorAll(
+                                '[data-testid="' + P.testid + '"]')) {
+                            if (!el.getClientRects().length) continue;
+                            trigger = el; via = 'testid'; break;
+                        }
+                    }
+                    // The text search stays as the FALLBACK, unchanged, for an
+                    // older layout that predates the id. It keeps its guards: they
+                    // are what make it survivable, and it is now reached only when
+                    // the exact hook is absent.
+                    if (!trigger) {
+                        for (const el of document.querySelectorAll(
+                                '[role="menuitem"], button, [role="option"], li')) {
+                            if (!el.getClientRects().length) continue;
+                            const t = norm(el.textContent);
+                            if (!t.startsWith('effort')) continue;
+                            // The Effort row shows its current value + a submenu chevron.
+                            if (linky(el)) { rejected.push(['link', t.slice(0, 60)]); continue; }
+                            if (t.length > 40) { rejected.push(['long', t.slice(0, 60)]); continue; }
+                            trigger = el; via = 'text';
+                            break;
+                        }
                     }
                     if (trigger) {
                         trigger.setAttribute(P.attr, P.value);
-                        return {marked: true, text: norm(trigger.textContent).slice(0, 60),
+                        return {marked: true, via: via,
+                                text: norm(trigger.textContent).slice(0, 60),
                                 rejected: rejected.slice(0, 5)};
                     }
-                    return {marked: false, text: '', rejected: rejected.slice(0, 5)};
-                }""", {"attr": _SR_CLICK_MARK, "value": "claude-effort"}) or {}
+                    return {marked: false, via: '', text: '',
+                            rejected: rejected.slice(0, 5)};
+                }""", {"attr": _SR_CLICK_MARK, "value": "claude-effort",
+                       "testid": _CLAUDE_EFFORT_TRIGGER_TESTID}) or {}
                 _eff_marked = bool(_eff_mark.get("marked"))
                 if _eff_mark.get("rejected"):
                     log(f"[setup_claude_dr] Step 1C: refused "
@@ -40808,7 +41502,7 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                 _eff_opened = False
                 if _eff_marked:
                     log(f"[setup_claude_dr] Step 1C: marked the Effort row "
-                        f"{_eff_mark.get('text','')!r}")
+                        f"{_eff_mark.get('text','')!r} (via {_eff_mark.get('via')})")
                     _how = await _sr_real_click(page, "claude-effort",
                                                 tag="[setup_claude_dr]",
                                                 hover_first=True)
@@ -40999,7 +41693,7 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                     # popover, and the popover carries its own 'EffortMax' rows —
                     # so a page-wide scan is choosing between two menus. Scope to
                     # the menu that does NOT carry the Effort trigger.
-                    _eff_set = await page.evaluate("""() => {
+                    _eff_set = await page.evaluate("""(P) => {
                         // Icon-font ligatures land in the Unicode private-use area
                         // and are invisible in a screenshot but present in text.
                         const norm = s => (s || '')
@@ -41011,14 +41705,29 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                         // Falls back to the newest menu, then the document, so an
                         // older UI without the test id still resolves.
                         const scope = menus.find(m =>
-                                !m.querySelector('[data-testid="effort-menu-trigger"]'))
+                                !m.querySelector('[data-testid="' + P.trigTestid + '"]'))
                             || menus[menus.length - 1] || document;
                         const items = [...scope.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="option"], button, li, div')]
                             .filter(el => el.getClientRects().length > 0);
-                        // Still an EXACT match after stripping, so "Higher effort
-                        // means…" helper prose and a "Max Effort" blurb are both
-                        // still refused — only the glyphs stopped defeating it.
-                        let pick = items.find(el => norm(el.textContent) === 'max');
+                        // ⭐⭐ 2026-08-17 — THE OPTION'S OWN TEST ID, FIRST. Every
+                        // rung is named (`effort-option-low|medium|high|xhigh|max`),
+                        // which addresses the row directly instead of matching its
+                        // rendered text. That is what makes the whole ligature
+                        // problem below unreachable rather than merely handled: the
+                        // private-use glyphs that defeated an exact text match for
+                        // nine runs out of ten are not in an attribute.
+                        //
+                        // ⛔ Still scoped, and still checked against the submenu.
+                        // An id is a stronger name, not a container — and the
+                        // parent popover carries an 'EffortMax' row of its own.
+                        let pick = null;
+                        if (P.optTestid) {
+                            pick = items.find(el =>
+                                el.getAttribute('data-testid') === P.optTestid);
+                        }
+                        // The text search stays as the fallback for an older
+                        // layout, with its ligature stripping intact.
+                        if (!pick) pick = items.find(el => norm(el.textContent) === 'max');
                         if (!pick) pick = items.find(el => norm(el.textContent) === 'max effort');
                         if (!pick) {
                             return {set: null, scoped: scope !== document,
@@ -41028,27 +41737,94 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                         }
                         const already = pick.getAttribute('aria-checked') === 'true' ||
                                         pick.dataset.state === 'checked' || pick.dataset.state === 'on';
-                        if (!already) pick.click();
-                        return {set: already ? 'max (already)' : 'max',
+                        // ⛔ 2026-08-17 — MARK, DO NOT CLICK. This was the last
+                        // `el.click()` left in a menu path: a synthetic click
+                        // dispatches a click event and nothing else, and this
+                        // component library binds its rows on pointerdown. The
+                        // corpus already paid for the identical mistake twice —
+                        // ChatGPT's model trigger and this step's own submenu
+                        // opener — and both times the tell was the same, a report
+                        // of success from a page that had not changed.
+                        if (!already) pick.setAttribute(P.attr, P.value);
+                        return {set: already ? 'max (already)' : 'marked',
+                                already: already,
+                                // WHICH row was chosen, so the log names it and a
+                                // test can assert identity rather than "something
+                                // was chosen" — the distinction that let a decoy
+                                // outside every menu be pressed once before.
+                                picked: norm(pick.textContent).slice(0, 40),
+                                via: P.optTestid &&
+                                    pick.getAttribute('data-testid') === P.optTestid
+                                    ? 'testid' : 'text',
                                 scoped: scope !== document, menus: menus.length};
-                    }""") or {}
+                    }""", {"trigTestid": _CLAUDE_EFFORT_TRIGGER_TESTID,
+                           "optTestid": _claude_effort_option_testid(_claude_effort),
+                           "attr": _SR_CLICK_MARK,
+                           "value": "claude-effort-option"}) or {}
                     # The row report is what makes the next drift diagnosable from
                     # the log alone, instead of needing another capture.
                     if not _eff_set.get("set"):
-                        log(f"[setup_claude_dr] Step 1C: no 'Max' row in the "
-                            f"submenu — menus={_eff_set.get('menus')} "
+                        log(f"[setup_claude_dr] Step 1C: no {_claude_effort!r} row in "
+                            f"the submenu — menus={_eff_set.get('menus')} "
                             f"scoped={_eff_set.get('scoped')} rows="
                             f"{json.dumps(_eff_set.get('saw') or [], ensure_ascii=False)}",
                             "WARN")
+                    _eff_already = bool(_eff_set.get("already"))
+                    _eff_via_hook = _eff_set.get("via") or ""
+                    _eff_picked = str(_eff_set.get("picked") or "")
                     _eff_set = _eff_set.get("set")
+                    # ⭐⭐ RESTRUCTURED after a mutation survivor. This used to be
+                    # a chain of `if not …: _eff_set = None` clears, and a mutant
+                    # that neutered the verification left every test green: the
+                    # tests could see that the read was MENTIONED, not that its
+                    # answer decided anything. The verdict is now DERIVED from the
+                    # readings by a pure function, so removing a term changes a
+                    # value a unit test holds rather than deleting a statement
+                    # nothing observes. Same lesson as the last wave's C8/D1/D2.
+                    _eff_pressed, _eff_checked = False, False
+                    if _eff_set and not _eff_already:
+                        _eff_pressed = bool(await _sr_real_click(
+                            page, "claude-effort-option", tag="[setup_claude_dr]"))
+                        if _eff_pressed:
+                            await asyncio.sleep(0.4)
+                            _eff_ok = {}
+                            try:
+                                _eff_ok = await page.evaluate(
+                                    _CLAUDE_EFFORT_CHECKED_JS,
+                                    {"optTestid": _claude_effort_option_testid(
+                                        _claude_effort),
+                                     "word": str(_claude_effort or "").lower()}) or {}
+                            except Exception:
+                                _eff_ok = {}
+                            _eff_checked = bool(_eff_ok.get("checked"))
+                            if not _eff_checked:
+                                log(f"[setup_claude_dr] Step 1C WARN: pressed the "
+                                    f"{_claude_effort!r} row but it did not become "
+                                    f"the selected effort (read "
+                                    f"{_eff_ok.get('found') and 'unchecked' or 'nothing'})"
+                                    f" — NOT claiming the tier was set", "WARN")
+                        else:
+                            log(f"[setup_claude_dr] Step 1C WARN: the "
+                                f"{_claude_effort!r} row could not be pressed", "WARN")
+                    _eff_set = _claude_effort_is_set(
+                        marked=bool(_eff_set), already=_eff_already,
+                        pressed=_eff_pressed, checked=_eff_checked)
                     if _eff_set:
                         _effort_confirmed = True
                         _effort_via = "submenu"
-                        log(f"[setup_claude_dr] Step 1C OK: Effort '{_eff_set}'")
+                        log(f"[setup_claude_dr] Step 1C OK: Effort "
+                            f"{_claude_effort!r} "
+                            f"{'(already)' if _eff_already else 'selected'} "
+                            f"via {_eff_via_hook} (row {_eff_picked!r})")
                     else:
-                        log("[setup_claude_dr] Step 1C WARN: 'Max' effort not found in submenu — CUA validate will fix", "WARN")
+                        log(f"[setup_claude_dr] Step 1C WARN: effort "
+                            f"{_claude_effort!r} was NOT confirmed in the submenu "
+                            f"— the run proceeds at whatever the model's default "
+                            f"is, and reports it as unconfirmed", "WARN")
                 elif not _effort_already_known:
-                    log("[setup_claude_dr] Step 1C WARN: Effort control not found (older UI / popover closed?) — CUA validate will fix", "WARN")
+                    log("[setup_claude_dr] Step 1C WARN: Effort control not found "
+                        "(the popover closes when a model is picked — it should "
+                        "have been re-opened above) — reported as unconfirmed", "WARN")
             except Exception as _ee:
                 log(f"[setup_claude_dr] Step 1C/1D errored: {_ee}", "WARN")
             await asyncio.sleep(0.3)
@@ -41399,10 +42175,37 @@ async def _dr_outcome_state(page, platform: str) -> str:
             # "unknown" for every pass of a run that deliberately fell back —
             # and "unknown" is the reading that makes the ladder re-run the CUA
             # validator it exists to skip.
-            st = await page.evaluate(
-                _CLAUDE_MODE_STATE_JS, _p2_active_family("claude") or "opus") or {}
+            st = await page.evaluate(_CLAUDE_MODE_STATE_JS, {
+                "fam": _p2_active_family("claude") or "opus",
+                "effortWord": p2_labels("claude").get("effort") or "",
+                "trigTestid": _CLAUDE_MODEL_TRIGGER_TESTID}) or {}
             # ⛔ Never 'off'. This detector's False is not evidence — see above.
-            return "on" if (st.get("hasExtended") and st.get("researchOn")) else "unknown"
+            #
+            # ⭐⭐ 2026-08-17 — EFFORT IS THE THIRD HALF, and leaving it out is why
+            # a run could report success at an unverified reasoning tier. The
+            # docstring above already gives the rule this follows: both existing
+            # terms are required "because the rung this reading can skip — the CUA
+            # validator — checks both, so answering `on` from the tool alone would
+            # drop the model half of a surface that was doing two jobs." Effort was
+            # doing a third job and was not in the predicate, so a missed effort
+            # left the outcome satisfied and `vision_cua` + `cua_validate` were
+            # both skipped. The observed line reads:
+            #
+            #   select_effort_tier: missed via=none — wanted 'max'
+            #   [ladder:claude.enable_deep_research] outcome satisfied at 'builtin'
+            #                                       — skipping vision_cua, cua_validate
+            #
+            # ⛔ AND THE OTHER HALF HAD TO SHIP WITH IT. The validator's own prompt
+            # used to forbid touching effort, so descending here would have sent
+            # the run to a rung instructed not to help — cost with no repair. That
+            # ban was itself a workaround for the submenu that would not expand;
+            # with the submenu addressed by test id the premise is gone, and the
+            # prompt now permits the fix exactly when this term is what failed.
+            #
+            # Direction is safe either way: a False adds `unknown`, never `off`,
+            # so the worst case is a rung that runs when it need not have.
+            return ("on" if (st.get("hasExtended") and st.get("researchOn")
+                             and st.get("effortOk")) else "unknown")
     except Exception as e:
         log(f"[ladder] outcome probe for {p} failed ({e})", "INFO")
     return "unknown"
@@ -41506,6 +42309,16 @@ async def validate_setup_with_cua(browser, cua_client, page, platform, label, ve
                     an ambiguous or errored validation (ok=True, confirmed=False)
                     must NOT be treated as proof Deep Research is on, or a real
                     chat-mode degradation could slip through silently (#709)."""
+    # ⭐⭐ 2026-08-17 — DID THE DOM LAYER CONFIRM THE EFFORT TIER? This is what
+    # decides whether the validator is permitted to go and set it. Defaults to
+    # True — "assume it is fine" — so a platform that records nothing, or a call
+    # that arrives before the setup ran, gets today's cheap read-only pass rather
+    # than a speculative trip into the model popover on every run.
+    #
+    # ⛔ The permission has to be granted in BOTH strings or neither: they are
+    # sent to one CUA call, and an agent holding a system prompt that forbids the
+    # submenu and a user message that demands it will do something arbitrary.
+    _claude_effort_ok = _claude_validator_effort_ok(_P2_THINKING_STATE.get("claude"))
     validator_map = {
         "chatgpt": PROMPT_VALIDATE_CHATGPT_SETUP,
         "gemini": PROMPT_VALIDATE_GEMINI_SETUP,
@@ -41517,7 +42330,8 @@ async def validate_setup_with_cua(browser, cua_client, page, platform, label, ve
         # validator into the menu whose only primary-family rows are the sales
         # chips the DOM layer just refused — the pass whose job is to confirm
         # the model would be the pass that undoes it.
-        "claude": claude_validate_setup_prompt(_p2_active_family("claude")),
+        "claude": claude_validate_setup_prompt(_p2_active_family("claude"),
+                                               effort_ok=_claude_effort_ok),
     }
     user_msg_map = {
         "chatgpt": "Verify Deep Research mode is ACTIVE in ChatGPT. Fix if not. Do not type.",
@@ -41532,7 +42346,8 @@ async def validate_setup_with_cua(browser, cua_client, page, platform, label, ve
         # Same family, same reason — this string and the system prompt above go
         # to ONE CUA call, so a family that reaches only one of them leaves the
         # agent holding two instructions that disagree about the model.
-        "claude": p2_claude_validate_directive(_p2_active_family("claude")),
+        "claude": p2_claude_validate_directive(_p2_active_family("claude"),
+                                               effort_ok=_claude_effort_ok),
     }
     sys_prompt = validator_map.get(platform.lower())
     user_prompt = user_msg_map.get(platform.lower())
@@ -42441,7 +43256,14 @@ async def ensure_deep_mode_active(page, platform, label, reactivate=True) -> dic
             # single send — on every run, for the life of that account.
             _cl_family = _p2_active_family("claude") or "opus"
             _claude_state_js = _CLAUDE_MODE_STATE_JS
-            state = await page.evaluate(_claude_state_js, _cl_family)
+            # ⚠ The effort word rides along so the detector can REPORT it, but
+            # this gate deliberately ignores it — see the note in the script. A
+            # pre-send gate on a quality knob re-runs the whole setup, popover
+            # and all, seconds before the brief is submitted.
+            _claude_state_arg = {"fam": _cl_family,
+                                 "effortWord": p2_labels("claude").get("effort") or "",
+                                 "trigTestid": _CLAUDE_MODEL_TRIGGER_TESTID}
+            state = await page.evaluate(_claude_state_js, _claude_state_arg)
             if reactivate and (not state.get("hasExtended") or not state.get("researchOn")):
                 log(f"[{label}] Claude mode regressed before send "
                     f"(extended={state.get('hasExtended')}, research={state.get('researchOn')}) — re-activating", "WARN")
@@ -42456,7 +43278,8 @@ async def ensure_deep_mode_active(page, platform, label, reactivate=True) -> dic
                 # caller sees the actual final state, not the pre-fix one.
                 # If Step 3A/3B selectors are still broken, researchOn will
                 # remain False and the caller pauses for user decision.
-                state = await page.evaluate(_claude_state_js, _cl_family)
+                _claude_state_arg["fam"] = _cl_family
+                state = await page.evaluate(_claude_state_js, _claude_state_arg)
                 log(f"[{label}] Claude mode post-re-activate: "
                     f"extended={state.get('hasExtended')}, research={state.get('researchOn')}", "INFO")
                 # #744 self-documenting dump: when researchOn STILL reads False
