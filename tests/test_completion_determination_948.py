@@ -225,12 +225,22 @@ def test_tracker_halts_on_completed_chip_anchor():
 
 
 def test_tier3_escalation_respects_chip_flag():
-    i = POLL_SRC.index("DOM missed strip 2x")
-    cond = POLL_SRC[i - 700:i]
-    assert 'not p.get("chatgpt_done_chip_anchor")' in cond, (
+    # 2026-08-17: the escalation moved onto the shared `panel_cua_should_escalate`
+    # schedule (one flaky CUA click used to cost a whole phase of narration), so
+    # the old `not p.get(...)` clause and the "2x" log text are both gone. The
+    # invariant is unchanged and now stated more precisely: the chip flag must
+    # reach the schedule as its `blocked` argument, which is the one input that
+    # refuses regardless of miss counts or attempts.
+    i = POLL_SRC.index('op="open_activity_panel"')
+    cond = POLL_SRC[i - 900:i]
+    assert "panel_cua_should_escalate(" in cond
+    assert 'blocked=bool(p.get("chatgpt_done_chip_anchor"))' in cond, (
         "the CUA tier-3 panel hunt must not fire when the panel is "
         "legitimately gone (finished DR)"
     )
+    # And `blocked` must actually be a hard refusal in the schedule itself.
+    assert research.panel_cua_should_escalate(
+        dom_misses=99, attempts=0, panel_open=False, blocked=True) is False
 
 
 # ── CUA hint: completed states, no scroll-hunting ────────────────────────────

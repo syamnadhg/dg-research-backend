@@ -98,12 +98,25 @@ def test_recognition_needs_BOTH_the_program_and_the_serve_flag():
 
 # ── the four outcomes ───────────────────────────────────────────────────────
 
-def _fake(monkeypatch, *, free_after=0, holders=()):
+def _fake(monkeypatch, *, free_after=0, holders=(), activity=None):
     """Drive `_reclaim_port` without a real socket or real processes.
 
     `free_after` — how many probe calls until the port reads free (0 = already).
+    `activity`   — what the holder reports it is doing; None means idle.
     Signals are recorded, never sent: a test that actually kills things is a test
     nobody dares run.
+
+    ⛔ 2026-08-17 — THE ACTIVITY PROBE WAS NEVER FAKED, and these tests were
+    quietly reading the developer's own machine. `_reclaim_port` asks the holder
+    what it is doing over real HTTP on the real port, so with an actual serve up
+    on 8000 the reclaim correctly answered "busy" and two tests failed — during a
+    live end-to-end, which is exactly when a full suite gets run and exactly when
+    a false failure is most expensive. They had only ever passed because port 8000
+    happened to be free.
+
+    ⭐ It also hid a coverage hole: "ours, but WORKING, so refuse" is the branch
+    the code's own comment says was a reported bug (a second `--serve` ending a
+    run that was mid-flight), and nothing exercised it. See the busy test below.
     """
     state = {"probes": 0, "signalled": []}
 
@@ -113,6 +126,8 @@ def _fake(monkeypatch, *, free_after=0, holders=()):
 
     monkeypatch.setattr(R, "_wait_for_port_free", _probe)
     monkeypatch.setattr(R, "_port_holders", lambda port: list(holders))
+    monkeypatch.setattr(R, "_probe_backend_activity_until_settled",
+                        lambda port, settle_s=0.0: activity)
     monkeypatch.setattr(R.os, "kill", lambda pid, sig: state["signalled"].append((pid, sig)))
     return state
 
@@ -159,6 +174,48 @@ def test_a_MIXED_set_is_refused_whole_and_nothing_is_signalled(monkeypatch):
     state, _ = R._reclaim_port(8000)
     assert state == "foreign"
     assert st["signalled"] == []
+
+
+def test_ours_but_WORKING_is_refused_and_never_signalled(monkeypatch):
+    """⛔⛔ The branch nothing covered until 2026-08-17, and the one the source
+    says was a reported bug: every holder matching by name was signalled with no
+    test of whether it was doing anything, so a second `--serve` — the command
+    this product's own "Start it yourself" hint prints — ended a run that was
+    mid-flight and took its partial output with it.
+
+    It went uncovered because the activity probe was never faked: these tests read
+    the real port, so this branch only ever fired by accident, on a machine that
+    happened to have a live serve. Then it fired in the two tests that did NOT
+    want it, and in neither case did anything assert this behaviour.
+    """
+    st = _fake(monkeypatch, free_after=99, holders=[_ours(4242)],
+               activity={"running": True, "pending": 0})
+    state, holders = R._reclaim_port(8000)
+
+    assert state == "busy"
+    assert st["signalled"] == [], "a backend that is WORKING must never be signalled"
+    assert holders[0]["pid"] == 4242
+
+
+def test_a_working_holder_is_recognised_by_QUEUED_work_too(monkeypatch):
+    """Not just a live run — a backend with jobs waiting is also working, and
+    stopping it loses the queue."""
+    st = _fake(monkeypatch, free_after=99, holders=[_ours(4242)],
+               activity={"running": False, "pending": 3})
+    state, _ = R._reclaim_port(8000)
+    assert state == "busy"
+    assert st["signalled"] == []
+
+
+def test_an_IDLE_holder_is_still_reclaimed(monkeypatch):
+    """The polarity check for the two above. A holder that answers and says it is
+    doing nothing is the terminal-less orphan this feature exists to clear —
+    refusing there would delete the feature while reading like a safety fix."""
+    st = _fake(monkeypatch, free_after=1, holders=[_ours(4242)],
+               activity={"running": False, "pending": 0})
+    state, _ = R._reclaim_port(8000)
+    assert state == "reclaimed"
+    assert [p for p, _ in st["signalled"]] == [4242]
 
 
 def test_ours_but_immovable_is_reported_stuck_not_silently_ignored(monkeypatch):

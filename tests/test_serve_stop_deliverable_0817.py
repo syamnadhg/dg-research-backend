@@ -56,6 +56,10 @@ class _MaskSig:
 
     SIG_BLOCK = signal.SIG_BLOCK
     SIG_UNBLOCK = signal.SIG_UNBLOCK
+    # The startup probe picks its own signums off the module, so the stand-in has
+    # to carry them too.
+    SIGINT = signal.SIGINT
+    SIGTERM = signal.SIGTERM
     SIG_IGN = signal.SIG_IGN
     SIG_DFL = signal.SIG_DFL
     default_int_handler = signal.default_int_handler
@@ -348,6 +352,56 @@ def test_a_clean_startup_says_nothing_about_the_mask(monkeypatch, logged):
     _drive_arming(monkeypatch, sleeps=1, freed=())
 
     assert _warns(logged) == []
+
+
+# ── where the block came from ───────────────────────────────────────────────
+
+def test_the_startup_probe_names_an_inherited_block(logged):
+    """⭐ MEASURED IN A LIVE RUN, 2026-08-17: "SIGINT was BLOCKED — unblocking it"
+    at arm time. That confirmed the mechanism but not its origin: the arm-time
+    pass runs after Firestore, gRPC, four watchers and uvicorn, so it cannot tell
+    an inherited block from one this startup installs. Probing once at the
+    earliest point the app owns splits that in half."""
+    names = research._log_blocked_stop_signals_at(
+        "startup", _MaskSig(blocked=(signal.SIGINT,)))
+
+    assert names == ["SIGINT"]
+    assert any("already blocked at startup" in m for m in _warns(logged))
+
+
+def test_the_startup_probe_says_nothing_on_a_healthy_boot(logged):
+    """It runs on every single serve. A line on a clean boot would be noise that
+    teaches operators to skip the one that matters."""
+    assert research._log_blocked_stop_signals_at("startup", _MaskSig()) == []
+    assert _warns(logged) == []
+
+
+def test_the_startup_probe_does_NOT_repair(logged):
+    """⛔ Repairing here would DESTROY the evidence. If this pass silently
+    unblocked, the arm-time pass would find a clean mask and report nothing, and
+    the origin question would be unanswerable forever — which is the state this
+    bug survived four attempts in."""
+    sig = _MaskSig(blocked=(signal.SIGINT, signal.SIGTERM))
+
+    research._log_blocked_stop_signals_at("startup", sig)
+
+    assert sig.unblocked == [], "the startup probe must observe, never repair"
+    assert signal.SIGINT in sig.blocked
+
+
+def test_the_startup_probe_survives_a_platform_with_no_mask(logged):
+    assert research._log_blocked_stop_signals_at(
+        "startup", _MaskSig(mask_raises=True)) == []
+
+
+def test_the_startup_probe_is_actually_called_before_the_app_does_anything():
+    """A probe placed after Firestore and gRPC answers the wrong question."""
+    with open("research.py", encoding="utf-8") as fh:
+        src = fh.read()
+    at = src.index('_log_blocked_stop_signals_at("startup")')
+    boot = src.index('log(f"Starting API server on')
+    firestore = src.index("Connecting to Firestore", boot)
+    assert boot < at < firestore, "must sit at boot, ahead of the Firestore init"
 
 
 # ── the platform actually behaves the way the fix assumes ───────────────────

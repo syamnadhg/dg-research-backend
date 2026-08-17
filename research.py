@@ -23267,6 +23267,63 @@ async def _close_chatgpt_side_panel(page):
         return False
 
 
+"""How many CUA attempts an activity/artifact panel gets, and when.
+
+⛔⛔ 2026-08-17 — THE ONE-SHOT CAP COST A WHOLE PHASE OF NARRATION.
+
+Two consecutive live P1 runs, eleven hours apart, met the SAME ChatGPT UI: a
+past-tense step summary below the last user message ("Built the research brief",
+then "Clarified the research scope") with no ellipsis, no count and no matching
+verb. The DOM rung missed it in BOTH runs — it has never once matched this state.
+So the whole feature rests on the single CUA click, and the two runs diverged only
+in whether that one click landed:
+
+  * run A — CUA opened it, and the panel streamed 3 URLs / 17 searches for the
+    rest of the phase.
+  * run B — CUA reported "the click may not have registered", and that was that:
+    21 more DOM misses over ELEVEN MINUTES with no second attempt, an empty
+    activity drilldown in the app, and no sources.
+
+One flaky visual click is an ordinary event. Spending a phase's entire narration
+on it, while ten minutes of polling sit there doing nothing, is the defect. The
+thresholds below are spaced so a long phase gets three well-separated chances
+rather than a burst: with a 30s poll that is roughly the 1-minute, 3-minute and
+7-minute marks.
+"""
+_PANEL_CUA_RETRY_AT_MISSES = (2, 6, 14)
+# ⛔ DERIVED, never an independent literal. It began as `= 3` beside a 3-entry
+# table, which made the ceiling check and the table-bounds check numerically
+# identical — two guards that were each other's only protection, so mutation
+# testing could not kill either: delete one and the other silently covers for it.
+# This repo's rule is to remove the redundancy rather than test an unreachable
+# path, and deriving it also means the two can never drift apart.
+_PANEL_CUA_MAX_ATTEMPTS = len(_PANEL_CUA_RETRY_AT_MISSES)
+
+
+def panel_cua_should_escalate(*, dom_misses, attempts, panel_open, blocked=False):
+    """Should the panel opener escalate to CUA right now?
+
+    `blocked` is the caller's own "there is legitimately nothing to click"
+    signal — P2's completed-chip anchor, Claude's zero-artifact count. It is kept
+    separate from the counters so that a phase which SHOULD stay quiet cannot be
+    made noisy by the retry change.
+
+    ⭐ The attempt number selects its own threshold, so the retries are spaced by
+    DOM misses (i.e. by real elapsed polling) rather than firing back-to-back the
+    moment the previous one fails — which on a visual click is just the same
+    failure again a second later.
+    """
+    if panel_open:
+        return False
+    if blocked:
+        return False
+    # One bound, not two. It is both the attempt ceiling and the table bounds —
+    # see the constant above for why having them separately was untestable.
+    if attempts >= len(_PANEL_CUA_RETRY_AT_MISSES):
+        return False
+    return dom_misses >= _PANEL_CUA_RETRY_AT_MISSES[attempts]
+
+
 async def _log_chatgpt_thread_snapshot(page, tag=""):
     """#913 (instrument-with-logs directive): one compact structural line of
     the thread region below the last user message + the frame inventory, so
@@ -23279,28 +23336,71 @@ async def _log_chatgpt_thread_snapshot(page, tag=""):
             const r = u.getBoundingClientRect();
             if (r.bottom > lub) lub = r.bottom;
         });
+        // ⛔ 2026-08-17 — THIS LINE USED TO ANSWER NOTHING. Every one of the 18
+        // rows it could afford came back as the SAME text: a strip line is a
+        // stack of nested wrappers, all reporting identical innerText, so the
+        // whole budget was spent describing one line eighteen times. Two live
+        // misses were captured that way and neither could say what ELSE sits
+        // next to the strip — which is exactly what a wording-free matcher has
+        // to be built from, and the reason no such matcher exists yet. Dedupe by
+        // text and the budget describes the NEIGHBOURHOOD instead.
         const rows = [];
+        const seen = new Map();          // text -> row already recorded
+        let dupes = 0;
         for (const el of document.querySelectorAll('main *')) {
-            if (rows.length >= 18) break;
+            if (rows.length >= 20) break;
             if (el.children.length > 2) continue;
             const t = (el.innerText || '').trim();
             if (!t || t.length < 3 || t.length > 120) continue;
             const r = el.getBoundingClientRect();
             if (r.width === 0 || r.height === 0) continue;
             if (lub > 0 && (r.top < lub - 8 || r.top > lub + 700)) continue;
-            let anim = false;
+            const key = t.slice(0, 60);
+            // A shimmer lives on an inner span (animated gradient +
+            // background-clip:text), and rows with >2 children never get here —
+            // so asking only about THIS element reported anim:false on a line
+            // the vision tier described as shimmering. Ask the subtree too, and
+            // report the two answers separately: if `animKid` turns out to be
+            // the reliable one, "the shimmering line below the last user
+            // message" becomes the structural anchor that wording never was.
+            const shimmers = (n) => {
+                try {
+                    const cs = getComputedStyle(n);
+                    return (cs.animationName && cs.animationName !== 'none')
+                        || cs.webkitBackgroundClip === 'text'
+                        || cs.backgroundClip === 'text';
+                } catch (e) { return false; }
+            };
+            let anim = shimmers(el);
+            let animKid = false;
             try {
-                const cs = getComputedStyle(el);
-                anim = (cs.animationName && cs.animationName !== 'none')
-                    || cs.webkitBackgroundClip === 'text' || cs.backgroundClip === 'text';
+                for (const kid of el.querySelectorAll('*')) {
+                    if (shimmers(kid)) { animKid = true; break; }
+                }
             } catch (e) {}
+            if (seen.has(key)) {
+                // Keep the OUTERMOST occurrence (document order), but do not
+                // lose a shimmer that only the inner copy could see.
+                const prev = seen.get(key);
+                prev.anim = prev.anim || anim;
+                prev.animKid = prev.animKid || animKid;
+                dupes += 1;
+                continue;
+            }
             const btn = el.closest ? !!el.closest('button, [role="button"], [tabindex]') : false;
-            rows.push({ t: t.slice(0, 60), tag: el.tagName,
-                        ti: (el.getAttribute && el.getAttribute('data-testid')) || '',
-                        ax: (el.getAttribute && el.getAttribute('aria-expanded')) || '',
-                        y: Math.round(r.top), btn, anim });
+            const row = { t: key, tag: el.tagName,
+                          ti: (el.getAttribute && el.getAttribute('data-testid')) || '',
+                          ax: (el.getAttribute && el.getAttribute('aria-expanded')) || '',
+                          // First class token only. The full attribute is a wall
+                          // of hashed utility classes; the leading token is the
+                          // part that has ever been a usable hook.
+                          cl: ((el.className && el.className.split)
+                               ? el.className.split(/\\s+/)[0] : '').slice(0, 32),
+                          y: Math.round(r.top), btn, anim, animKid };
+            seen.set(key, row);
+            rows.push(row);
         }
-        return { lub: Math.round(lub), rows };
+        return { lub: Math.round(lub), rows, dupes };
     }"""
     try:
         snap = await page.evaluate(JS)
@@ -23315,7 +23415,9 @@ async def _log_chatgpt_thread_snapshot(page, tag=""):
         line = json.dumps({"snap": snap, "frames": frames}, ensure_ascii=True)
     except Exception:
         line = str(snap)[:1800]
-    log(f"[ChatGPT] panel-miss snapshot ({tag}): {line[:1800]}", "DEBUG")
+    # 1800 chars truncated mid-row and threw away the tail, which after the
+    # dedupe above is where the strip's neighbours now live.
+    log(f"[ChatGPT] panel-miss snapshot ({tag}): {line[:3500]}", "DEBUG")
 
 
 async def _open_chatgpt_activity_panel(page, skip_structural=False):
@@ -29747,17 +29849,24 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                         log(f"[{label}] activity panel open failed: {_pe}", "WARN")
                         _panel_dom_misses += 1
 
-                    # CUA tier-3 escalation after 2 DOM misses (capped at 1/call).
-                    if (not _panel_open_done
-                            and _panel_dom_misses >= 2
-                            and _panel_cua_attempts == 0
+                    # CUA tier-3 escalation, retried on a miss-count schedule.
+                    # See `panel_cua_should_escalate`: one flaky click used to
+                    # cost the phase its entire narration while ten minutes of
+                    # polling sat idle.
+                    if (panel_cua_should_escalate(
+                                dom_misses=_panel_dom_misses,
+                                attempts=_panel_cua_attempts,
+                                panel_open=_panel_open_done)
                             and cua_client and browser):
-                        log(f"[{label}] DOM missed strip 2x — escalating to CUA tier-3 "
-                            f"(elapsed={elapsed_sec}s)")
+                        _panel_cua_attempts += 1
+                        log(f"[{label}] DOM missed strip {_panel_dom_misses}x — "
+                            f"escalating to CUA tier-3 (attempt "
+                            f"{_panel_cua_attempts}/{_PANEL_CUA_MAX_ATTEMPTS}, "
+                            f"elapsed={elapsed_sec}s)")
                         emit_tier_transition(phase=phase, agent="chatgpt",
                             op="open_activity_panel_p1", from_tier="dom",
-                            to_tier="cua", reason="dom_2_misses")
-                        _panel_cua_attempts = 1
+                            to_tier="cua",
+                            reason=f"dom_misses_{_panel_dom_misses}")
                         async def _cgpt_p1_cua():
                             return await asyncio.wait_for(
                                 agent_loop(cua_client, browser,
@@ -34015,17 +34124,22 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 # historically mis-clicked the sidebar chat's ⋮ menu
                 # (Star/Rename/Delete popup). No card → just wait for the next
                 # tick; the DOM path opens it the moment it renders.
-                if (not p.get("artifact_panel_open")
-                        and p.get("claude_artifact_dom_misses", 0) >= 2
-                        and p.get("claude_artifact_cua_attempts", 0) == 0
+                # The artifact count stays LAST: it is an await, and the pure
+                # schedule check above short-circuits it on every quiet cycle.
+                if (panel_cua_should_escalate(
+                            dom_misses=p.get("claude_artifact_dom_misses", 0),
+                            attempts=p.get("claude_artifact_cua_attempts", 0),
+                            panel_open=bool(p.get("artifact_panel_open")))
                         and cua_client
                         and await _count_claude_artifacts(p["page"]) > 0):
-                    log(f"[Claude] DOM missed artifact 2x — escalating to CUA tier-3 "
-                        f"(cycle={p.get('poll_cycles')})")
+                    p["claude_artifact_cua_attempts"] = p.get("claude_artifact_cua_attempts", 0) + 1
+                    log(f"[Claude] DOM missed artifact "
+                        f"{p.get('claude_artifact_dom_misses', 0)}x — escalating to "
+                        f"CUA tier-3 (attempt {p['claude_artifact_cua_attempts']}"
+                        f"/{_PANEL_CUA_MAX_ATTEMPTS}, cycle={p.get('poll_cycles')})")
                     emit_tier_transition(phase=2, agent="claude",
                         op="open_artifact_1", from_tier="dom", to_tier="cua",
-                        reason="dom_2_misses")
-                    p["claude_artifact_cua_attempts"] = 1
+                        reason=f"dom_misses_{p.get('claude_artifact_dom_misses', 0)}")
                     async def _claude_p2_cua():
                         return await asyncio.wait_for(
                             agent_loop(cua_client, browser,
@@ -34256,20 +34370,26 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     log(f"[ChatGPT] activity panel open failed: {e}", "WARN")
                     p["chatgpt_panel_dom_misses"] = p.get("chatgpt_panel_dom_misses", 0) + 1
 
-                # CUA tier-3 escalation after 2 DOM misses (capped at 1/phase).
+                # CUA tier-3 escalation, retried on a miss-count schedule (see
+                # `panel_cua_should_escalate`).
                 # 2026-07-13: never escalate once the completed chip is the
-                # anchor — the panel is legitimately gone, not "missed".
-                if (not p.get("chatgpt_activity_panel_open")
-                        and not p.get("chatgpt_done_chip_anchor")
-                        and p.get("chatgpt_panel_dom_misses", 0) >= 2
-                        and p.get("chatgpt_panel_cua_attempts", 0) == 0
+                # anchor — the panel is legitimately gone, not "missed". That
+                # stays a hard block, so the retries below cannot make a phase
+                # that should be quiet start clicking.
+                if (panel_cua_should_escalate(
+                            dom_misses=p.get("chatgpt_panel_dom_misses", 0),
+                            attempts=p.get("chatgpt_panel_cua_attempts", 0),
+                            panel_open=bool(p.get("chatgpt_activity_panel_open")),
+                            blocked=bool(p.get("chatgpt_done_chip_anchor")))
                         and cua_client):
-                    log(f"[ChatGPT] DOM missed strip 2x — escalating to CUA tier-3 "
-                        f"(cycle={p.get('poll_cycles')})")
+                    p["chatgpt_panel_cua_attempts"] = p.get("chatgpt_panel_cua_attempts", 0) + 1
+                    log(f"[ChatGPT] DOM missed strip "
+                        f"{p.get('chatgpt_panel_dom_misses', 0)}x — escalating to "
+                        f"CUA tier-3 (attempt {p['chatgpt_panel_cua_attempts']}"
+                        f"/{_PANEL_CUA_MAX_ATTEMPTS}, cycle={p.get('poll_cycles')})")
                     emit_tier_transition(phase=2, agent="chatgpt",
                         op="open_activity_panel", from_tier="dom", to_tier="cua",
-                        reason="dom_2_misses")
-                    p["chatgpt_panel_cua_attempts"] = 1
+                        reason=f"dom_misses_{p.get('chatgpt_panel_dom_misses', 0)}")
                     async def _cgpt_p2_cua():
                         return await asyncio.wait_for(
                             agent_loop(cua_client, browser,
@@ -55974,6 +56094,31 @@ def _unblock_stop_signals(sig_mod, signums, reported):
     return freed
 
 
+def _log_blocked_stop_signals_at(where, sig_mod=None):
+    """Report — and do not touch — any stop signal that is already blocked.
+
+    ⭐ Deliberately does NOT repair. Repairing here would erase the evidence the
+    arm-time pass exists to collect: if this says "clean" and the arm-time pass
+    says "blocked", the block was installed by our own startup, and if BOTH say
+    blocked it was inherited from whatever launched us. Naming that is the whole
+    point, and the arm-time pass fixes it either way a second later.
+
+    Returns the names found blocked (for tests; the caller only wants the line).
+    """
+    import signal as _sig
+    sig_mod = sig_mod or _sig
+    try:
+        blocked = sig_mod.pthread_sigmask(sig_mod.SIG_BLOCK, [])
+    except Exception:
+        return []                            # Windows: no mask to inspect
+    names = [_signal_name(sig_mod, _s)
+             for _s in (sig_mod.SIGINT, sig_mod.SIGTERM) if _s in blocked]
+    if names:
+        log(f"[serve] {', '.join(names)} already blocked at {where} — inherited "
+            f"from whatever started this process, not installed by it.", "WARN")
+    return names
+
+
 def _hold_stop_signals(sig_mod, signums, handler, reported, announce=True):
     """One pass of holding the stop path open, end to end.
 
@@ -57959,6 +58104,13 @@ async def run_server(port=8000):
     # Banner shows localhost so users can copy-click; uvicorn still binds
     # to 0.0.0.0 below so the FE web app can reach this BE.
     log(f"Starting API server on http://localhost:{port}")
+    # ⭐ 2026-08-17 — WHERE THE BLOCK CAME FROM, asked once at the earliest point
+    # the app owns. The arm-time check runs AFTER Firestore, gRPC, four watchers
+    # and uvicorn, so on its own it cannot tell an INHERITED block (the launcher,
+    # the shell, the terminal) from one this startup installs. Two lines split
+    # that in half, and this mystery has already survived four attempts at it.
+    # Silent unless something is actually blocked — a healthy boot says nothing.
+    _log_blocked_stop_signals_at("startup")
     # #930: log the loaded build so "worker running stale code" is a one-grep
     # diagnosis from backend.log (2026-07-09: a worker up since the prior day
     # ran pre-fix code through a live E2E and the report read as a regression).
