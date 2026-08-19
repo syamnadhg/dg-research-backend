@@ -8056,6 +8056,15 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                 except Exception as _de:
                     log(f"[device-cmds] processed-marker write failed for {doc.id}: {_de}", "DEBUG")
             elif action in ("update", "check-update", "restart",
+                            # ⛔ AND `clear-logs`, for the identical reason. It
+                            # rmtrees the run folders and truncates the raw
+                            # tails; two workers doing that concurrently race
+                            # each other, and a sibling worker that fell to the
+                            # `else` would DELETE the command before worker 1's
+                            # stream ever delivered it — the feature would ship
+                            # dead on every multi-worker host with nothing
+                            # failing anywhere.
+                            "clear-logs",
                             SEND_LOGS_ACTION,
                             # ⛔⛔ THE LIMITED ACTION MUST BE IN THIS TUPLE. An
                             # action outside it falls to the `else` and is
@@ -8628,6 +8637,29 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                     log(f"[device-cmds] CLEAR_LOCAL_STORAGE: wiped {wiped} dir(s)")
                 continue
 
+            if action == "clear-logs":
+                # Settings → Manage Data → Clear logs, the LOCAL half. The app
+                # deletes this device's cloud bundles itself; only the machine
+                # can erase what is still on the machine, so the two halves are
+                # reported separately and neither pretends to be the other.
+                #
+                # Owner-only, and NOT by a check here: the command rule is
+                # default-closed — everything outside the one-item `check-update`
+                # allowlist requires `isDeviceOwner()` — so a sharer's create is
+                # rejected before this process ever sees a document.
+                #
+                # WORKER 1 ONLY, gated in the tuple above. See that block.
+                if WORKER_ID == 1:
+                    try:
+                        cleared = _clear_local_logs()
+                        log("[device-cmds] CLEAR_LOGS: "
+                            f"runs={cleared['runs']} sessions={cleared['sessions']} "
+                            f"tails={cleared['tails']} bundles={cleared['bundles']} "
+                            f"kept={cleared['kept']} failed={cleared['failed']}")
+                    except Exception as _cl_err:
+                        log(f"[device-cmds] CLEAR_LOGS failed: {_cl_err}", "WARN")
+                continue
+
             if action == "update":
                 # App-driven remote backend update (owner-only command). Single
                 # actor: only worker 1 executes it (it owns the heartbeat/version
@@ -9096,6 +9128,111 @@ def _bundle_source_is_allowed(path) -> bool:
         return True
     except Exception:
         return False
+
+
+def _clear_local_logs(root=None) -> dict:
+    """Erase everything on this machine that a support bundle would collect.
+
+    ⭐ THE SOURCES ARE NOT A GUESS, and that is the whole reason this lives
+    beside the collector instead of next to the command that calls it.
+    `_build_log_bundle` reads exactly three places — the `runs/` folders,
+    `_select_bundle_sessions()` and `_system_log_tails()` — so clearing those
+    three IS "there is nothing left here to send", and the test proves it by
+    BUILDING a bundle afterwards rather than by re-reading this list. A clear
+    defined by its own inventory drifts the moment the collector grows a fourth
+    source; one defined by the collector's output cannot.
+
+    ⛔ THE RAW TAILS ARE TRUNCATED, NEVER UNLINKED. The supervisor holds
+    `backend.log` open — `open(log_out_path, "ab")` in `_spawn_worker` — so
+    unlinking it leaves a live process appending to an inode with no name: the
+    bytes are still on the disk until the next restart, and every line written
+    after the press lands somewhere the user cannot reach. Append mode is
+    precisely what makes truncation the right answer instead: the next write
+    goes to the current end, which is now zero, so there is no NUL hole either.
+
+    ⛔ A RUN THAT IS STILL BEING WRITTEN INTO SURVIVES, and the liveness test is
+    `_prune_local_logs`'s, not a new one: the in-process sink list PLUS
+    `_folder_is_live`. The sink list alone only covers runs this worker armed,
+    and this command runs on worker 1 while worker 2 may own the live run — the
+    exact multi-worker hole mutation found in the prune. Inventing a third
+    notion of "active" here would reopen it.
+
+    Returns a count per source plus `failed`, because a partial clear reported as
+    a whole one is the same lie as a privacy button that says "cleared 4" while
+    four files survive.
+    """
+    base = Path(root) if root is not None else _logs_root()
+    out = {"runs": 0, "sessions": 0, "tails": 0, "bundles": 0,
+           "kept": 0, "failed": 0}
+
+    # ⛔⛔ THE PARKED ROWS GO FIRST, and the order is the whole point. The
+    # reconnect watcher calls `_drain_queued_log_bundle_rows()` on EVERY tick of
+    # EVERY worker, and a drain RE-CREATES the cloud row it publishes. The app
+    # deletes this device's cloud rows itself, so a drain landing after that
+    # sweep resurrects a bundle the person just cleared. Emptying this file
+    # before anything slower happens is what shrinks that window to nothing the
+    # device controls; doing it last would hold it open for the whole rmtree.
+    #
+    # ⛔ AND THE COPIES THIS MACHINE MADE OF ITSELF. `--send-logs` leaves a
+    # finished archive in `outgoing/` so a person with no network can attach it
+    # to an email. It is the same payload under a different name, in the same
+    # directory — a clear that skipped it would leave the entire bundle sitting
+    # on the disk it just promised to have emptied.
+    leftovers = []
+    pending = base / "pending-bundle-rows.jsonl"
+    if pending.exists():
+        leftovers.append(pending)
+    try:
+        leftovers.extend(sorted(p for p in (base / "outgoing").iterdir() if p.is_file()))
+    except OSError:
+        pass
+    for path in leftovers:
+        try:
+            path.unlink()
+            out["bundles"] += 1
+        except OSError as exc:
+            out["failed"] += 1
+            log(f"[clear-logs] leftover {path.name}: {exc}", "WARN")
+
+    live = {str(sink.dir) for sink in _RUN_LOG_SINKS}
+    runs_root = base / "runs"
+    try:
+        folders = sorted(p for p in runs_root.iterdir() if p.is_dir())
+    except OSError:
+        folders = []
+    for folder in folders:
+        if str(folder) in live or _folder_is_live(folder):
+            out["kept"] += 1
+            continue
+        try:
+            shutil.rmtree(folder)
+            out["runs"] += 1
+        except OSError as exc:
+            out["failed"] += 1
+            log(f"[clear-logs] run folder {folder.name}: {exc}", "WARN")
+
+    try:
+        session_files = sorted(p for p in (base / "sessions").iterdir() if p.is_file())
+    except OSError:
+        session_files = []
+    for path in session_files:
+        try:
+            path.unlink()
+            out["sessions"] += 1
+        except OSError as exc:
+            out["failed"] += 1
+            log(f"[clear-logs] session {path.name}: {exc}", "WARN")
+
+    for path in _system_log_tails(base):
+        try:
+            with open(path, "r+b") as fh:
+                fh.truncate(0)
+            out["tails"] += 1
+        except OSError as exc:
+            out["failed"] += 1
+            log(f"[clear-logs] tail {path.name}: {exc}", "WARN")
+
+    return out
 
 
 def _build_log_bundle(dest_path, support_code=None, now=None,
