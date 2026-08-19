@@ -783,7 +783,11 @@ def _post_batch(batch: "list[dict]") -> bool:
     headers = {"Content-Type": "application/json"}
     token = _id_token()
     if token:
-        headers["Authorization"] = f"Firebase {token}"
+        # ⛔ MEASURED 2026-08-18: this said `Firebase {token}`, and the route's
+        # verifier returns null unless the header starts with "Bearer ". So even
+        # a perfectly good token would have stored the batch as unverified. Every
+        # other authenticated caller in this codebase already uses Bearer.
+        headers["Authorization"] = f"Bearer {token}"
     resp = requests.post(url, headers=headers,
                          data=json.dumps({"v": CATALOGUE_VERSION, "events": batch}),
                          timeout=20)
@@ -792,9 +796,31 @@ def _post_batch(batch: "list[dict]") -> bool:
 
 def _id_token() -> "str | None":
     """An ID token if one happens to be available. ⭐ Optional by design: the
-    events worth having most exist precisely when no credential does."""
+    events worth having most exist precisely when no credential does.
+
+    ⛔⛔ MEASURED 2026-08-18: `auth.credentials` has no `current_id_token` and
+    never has — the module exports `RefreshTokenCredentials` and one private
+    constant. So this raised ImportError on every call, the bare `except`
+    swallowed it, and the result was byte-identical to the designed
+    no-credential case. Every batch this product has ever sent stored as
+    unverified, with no account attached, and nothing anywhere said so.
+
+    ⭐ A missing ACCESSOR and a missing CREDENTIAL are different failures and are
+    now reported differently. The token stays optional and this stays cheap: it
+    must never force a refresh and must never touch the keystore, because the
+    only accessor that exists (`_fresh_user_mode_id_token`) does both — a network
+    round-trip per flush, and a keystore wipe on revoke. Telemetry causing an
+    auth side effect would be far worse than telemetry being anonymous, which is
+    why wiring that one in is deliberately NOT the fix here."""
     try:
-        from auth.credentials import current_id_token
+        from auth.credentials import current_id_token  # type: ignore[attr-defined]
+    except Exception as exc:
+        # DEBUG, not silence. This is a build/wiring fault, not a signed-out
+        # machine, and it must be legible in the very log bundle a user sends.
+        log.debug("telemetry: no id-token accessor (%s) — batches will be "
+                  "anonymous", type(exc).__name__)
+        return None
+    try:
         return current_id_token()
     except Exception:
         return None

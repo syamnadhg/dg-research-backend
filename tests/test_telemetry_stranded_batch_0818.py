@@ -24,8 +24,22 @@ import json
 import time
 
 import pytest
+from conftest import code_only_deep
 
 import telemetry
+
+
+def _fn(name: str) -> str:
+    """The function's CODE, with comments and docstrings blanked.
+
+    ⛔ `inspect.getsource` was the first attempt and it failed on the notes this
+    very wave added — a test asserting the wrong scheme is absent matched the
+    comment explaining why it was removed. Prose is not the artifact under test.
+    """
+    src = code_only_deep(telemetry)
+    i = src.index(f"def {name}(")
+    nxt = src.find("\ndef ", i + 1)
+    return src[i:nxt if nxt != -1 else len(src)]
 
 
 def _events(n: int) -> str:
@@ -116,3 +130,40 @@ def test_a_live_siblings_batch_is_still_left_alone(spool):
     mine.write_text(_events(3), encoding="utf-8")
     if telemetry._pid_alive(os.getppid()):
         assert telemetry._adoptable(mine) is False
+
+
+# ── attribution: two bugs, stacked, both silent ──────────────────────────────
+
+def test_the_auth_scheme_is_the_one_the_route_accepts():
+    """⛔⛔ MEASURED: the sender said `Authorization: Firebase <token>` while the
+    route's verifier returns null unless the header starts with `Bearer `. So
+    even a perfect token stored the batch unverified, with no account on it.
+    Every other authenticated caller in this codebase already uses Bearer."""
+    src = _fn("_post_batch")
+    assert 'f"Bearer {token}"' in src
+    assert "Firebase {token}" not in src
+
+
+def test_a_missing_accessor_is_not_the_same_as_a_signed_out_machine(caplog):
+    """⛔⛔ `auth.credentials` has no `current_id_token` and never has. The bare
+    `except` swallowed the ImportError and returned None — byte-identical to the
+    designed no-credential case, which is why nobody noticed that every batch
+    this product ever sent was anonymous.
+
+    ⭐ The token stays OPTIONAL. What changed is that a wiring fault is now
+    legible in the very log bundle a user sends."""
+    import logging
+    with caplog.at_level(logging.DEBUG, logger=telemetry.log.name):
+        assert telemetry._id_token() is None
+    assert any("id-token accessor" in r.getMessage() for r in caplog.records), \
+        "a broken accessor is still indistinguishable from a signed-out machine"
+
+
+def test_the_token_path_never_forces_a_refresh_or_touches_the_keystore():
+    """⛔ The only accessor that exists (`_fresh_user_mode_id_token`) does both —
+    a network round trip per flush and a keystore wipe on revoke. Telemetry
+    causing an auth side effect would be far worse than telemetry being
+    anonymous, so wiring that one in is deliberately NOT the fix."""
+    src = _fn("_id_token")
+    assert "_fresh_user_mode_id_token" not in src
+    assert "keystore" not in src

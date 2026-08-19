@@ -42,7 +42,11 @@ CAT = "telemetry_catalogue.json"
 MUTATED_FILES = [SRC, CAT, "research.py"]
 
 T = "tests/test_telemetry_0818.py"
-ALL = [T]
+# ⛔ The 08-18 stranded-batch wave pinned the spool's recovery AND the two
+# attribution bugs. A harness scoped to its own file alone reported those as
+# suite gaps when the suite covers them — the harness had the gap.
+T_STRANDED = "tests/test_telemetry_stranded_batch_0818.py"
+ALL = [T, T_STRANDED]
 
 PY = str(ROOT / ".venv" / "bin" / "python")
 _TEST_TIMEOUT_S = 600
@@ -218,8 +222,15 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str], str]] = [
      [('        except BaseException as exc:', '        except Exception as exc:')], [T], SRC),
     ("D6", "under", "an ID token becomes mandatory, so the events worth having "
      "most — the ones from a machine that cannot sign in — never go",
-     [('    token = _id_token()\n    if token:\n        headers["Authorization"] = f"Firebase {token}"',
-       '    token = _id_token()\n    if not token:\n        return False\n    headers["Authorization"] = f"Firebase {token}"')], [T], SRC),
+     [('    token = _id_token()\n    if token:',
+       '    token = _id_token()\n    if not token:\n        return False\n    if True:')], [T], SRC),
+    ("D6b", "under", "⛔⛔ the auth scheme goes back to `Firebase`, which the "
+     "route's verifier does not accept — every batch stores unattributed",
+     [('        headers["Authorization"] = f"Bearer {token}"',
+       '        headers["Authorization"] = f"Firebase {token}"')], [T, T_STRANDED], SRC),
+    ("D6c", "under", "a missing id-token ACCESSOR goes back to being "
+     "indistinguishable from a signed-out machine",
+     [('        log.debug("telemetry: no id-token accessor (%s) — batches will be "\n                  "anonymous", type(exc).__name__)\n', '')], [T, T_STRANDED], SRC),
 
     # ══ transparency and the switch ═════════════════════════════════════
     ("M1", "under", "the local mirror stops being written, so the claim that a "
