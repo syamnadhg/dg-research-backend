@@ -113,6 +113,18 @@ class InitiatePairError(RuntimeError):
     """Raised when /api/devices/initiate-pair returns a non-2xx response."""
 
 
+def _install_uuid_best_effort() -> "str | None":
+    """The stable per-install id, or None if the keystore cannot give one.
+
+    Best-effort by design: a pairing must never fail because a correlation id
+    could not be read."""
+    try:
+        from .keystore import install_uuid
+        return str(install_uuid())
+    except Exception:
+        return None
+
+
 def initiate_pair_remote(
     *,
     poll_secret_hash: str,
@@ -132,6 +144,12 @@ def initiate_pair_remote(
         "machineName": machine_name,
         "hostname": hostname,
         "os": os_string,
+        # ⭐ The install id, published onto the device doc at pair time. It is
+        # written before any pairing and SURVIVES pairing, so it is the one thing
+        # that can join a support bundle or a telemetry batch sent while pairing
+        # was broken to the account that eventually owns this machine. Without it
+        # here, those arrive attributable to nobody and stay that way.
+        "installUuid": _install_uuid_best_effort(),
     }
     try:
         resp = requests.post(url, json=body, timeout=timeout)

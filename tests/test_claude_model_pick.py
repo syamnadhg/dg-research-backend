@@ -117,8 +117,16 @@ def test_step1_sets_effort_via_dom():
     assert "else await page.evaluate" in src, (
         "the Effort submenu must still be opened via DOM, not left to CUA (#745)."
     )
-    assert "'max effort'" in src, (
-        "Effort=Max must still be selected via DOM (#745)."
+    # ⚠ RE-ANCHORED 2026-08-17: was `'max effort'`, a literal tier in a selection
+    # path — the standing `family-only-models` rule forbids exactly that, and the
+    # test id beside it had already been derived from policy, so the two halves of
+    # one search disagreed for every tier but 'max'. The wanted word now comes in
+    # as `P.word`; `isWanted` is the comparator built from it.
+    assert "const isWanted = el =>" in src, (
+        "the Effort tier must still be selected via DOM (#745)."
+    )
+    assert 'want + ' in src and "P.word" in src, (
+        "and the tier it selects must come from the policy, not from a literal."
     )
     # The Effort submenu must be opened BEFORE anything nested inside it is
     # touched (selecting an effort radio can collapse the submenu).
@@ -128,8 +136,9 @@ def test_step1_sets_effort_via_dom():
     # success say it never was.
     # 2026-08-05 (review, f3): `_eff_marked` became `_eff_mark`, a dict, so the marker
     # can report the row it chose and the anchor-shaped candidates it refused.
+    # 2026-08-17: same re-anchor as above — the ordering invariant is unchanged.
     eff_idx = src.find("_eff_mark = {} if _effort_already_known")
-    set_idx = src.find("'max effort'")
+    set_idx = src.find("const isWanted = el =>")
     assert eff_idx != -1 and eff_idx < set_idx, (
         "the Effort submenu must open before Max is selected inside it (#745)."
     )

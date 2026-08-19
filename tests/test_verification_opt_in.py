@@ -199,8 +199,14 @@ def test_login_one_profile_supports_verify_modes():
     src = inspect.getsource(research._login_one_profile)
     assert "verify_mode" in src
     assert "Skip the verification step?" in src, "pair's ask-mode prompt"
-    # default answer (Enter) must mean SKIP — user direction 2026-07-02
-    assert '"verify" if ans in ("n", "no") else "skip"' in src
+    # default answer (Enter) must mean SKIP — user direction 2026-07-02.
+    # Re-anchored 2026-08-17: the prompt moved onto the one shared yes/no
+    # reader, where `default=True` IS that rule — and it is what renders the
+    # [Y/n] hint too, so the promise and the parse can no longer disagree.
+    # The old pin quoted `"verify" if ans in ("n","no") else "skip"`, which
+    # also silently read every unrecognised answer (a typo, "nope") as skip.
+    assert '_ask_yes_no("Skip the verification step?", default=True)' in src
+    assert 'mode = "skip" if _skip_verify else "verify"' in src
     # skip mode still runs the F4 security check (cookie read, no page loads)
     assert src.index('if mode == "skip"') < src.index("_verify_platform_logins")
     # skip mode records TRUTHFUL per-platform cookie presence — never a

@@ -55,9 +55,16 @@ _PROBE_MARK = "menu: false"                      # Step 1B*: the read-only probe
 # press, which on a link navigates. The redundant equality went with the rewrite
 # (`startsWith('effort')` always subsumed it).
 _EFFORT_SUBMENU_MARK = "const linky = el =>"     # Step 1C: MARKS the Effort row
-_SUBMENU_ROWS_MARK = "t.length > 24"             # Step 1C: did the submenu mount?
+# ⚠ RE-ANCHORED 2026-08-17. Both literals moved with the fix, and both moved for
+# the same reason: the gate used to walk the whole DOCUMENT for short rows (hence
+# `t.length > 24`) and the picker compared against a hardcoded `'max effort'`. The
+# gate now asks each OVERLAY separately — a portalled popper is last in document
+# order, so the sidebar filled the old 20-row cap and the submenu was never
+# reached — and the picker takes its tier from policy. `isRung` and `isWanted` are
+# each unique to their script.
+_SUBMENU_ROWS_MARK = "isRung"                    # Step 1C: did the submenu mount?
 _THINKING_MARK = "isThinking"                    # Step 1D: the Thinking toggle probe
-_EFFORT_SET_MARK = "'max effort'"                # Step 1C': selects Max
+_EFFORT_SET_MARK = "isWanted"                    # Step 1C': selects the tier
 _TRIGGER_READ_MARK = "trigger_text"              # Step 1: reads model + effort
 
 
@@ -208,12 +215,28 @@ class ScriptedPage:
             # to answer with the submenu's rows, and only once it has been
             # pressed. A double that answered before the press would agree with
             # exactly the code that failed nine times live.
-            return (["low", "medium", "high", "max", "thinking"]
-                    if self.presses else [])
+            #
+            # ⚠ 2026-08-17: the answer is now PER OVERLAY. The model popover is
+            # always up (it holds the trigger); the submenu appears beside it
+            # once pressed. Answering with a flat row list would let the shape
+            # that shipped the bug pass here.
+            popover = {"trigger": True, "option": False, "rungs": 0,
+                       "labels": ["opus 5for complex tasks", "effortmax"]}
+            if not self.presses:
+                return {"overlays": [popover]}
+            return {"overlays": [popover,
+                                 {"trigger": False, "option": True, "rungs": 5,
+                                  "labels": ["low", "medium", "highdefault",
+                                             "extra", "max"]}]}
         if _THINKING_MARK in script:
             return {"found": True, "toggled": False}
         if _EFFORT_SET_MARK in script:
-            return "max (already)"
+            # ⚠ 2026-08-17: a DICT, which is what production has read since the
+            # picker started reporting which row it chose. The bare string used
+            # to make `_eff_set.get(...)` raise straight into Step 1C's own
+            # `except`, so these tests could only ever see that the script RAN.
+            return {"set": "max (already)", "already": True, "via": "text",
+                    "picked": "max", "scoped": True, "menus": 2, "cands": 1}
         if "cowork" in script.lower():
             return self.chat_tab
         if "aria-label" in script and "cand.click()" in script:
@@ -363,7 +386,10 @@ def test_nothing_inside_the_submenu_is_touched_until_it_mounts(monkeypatch):
         async def evaluate(self, script, arg=None):
             if _SUBMENU_ROWS_MARK in script:
                 self.scripts.append(script)
-                return []
+                # Only the model popover is up — the overlay that HOLDS the
+                # Effort trigger. Nothing else mounted.
+                return {"overlays": [{"trigger": True, "option": False, "rungs": 0,
+                     "labels": ["opus 5for complex tasks", "effortmax"]}]}
             return await ScriptedPage.evaluate(self, script, arg)
 
     page = _NeverMounts("Opus 5 Max")
@@ -385,13 +411,49 @@ def test_a_submenu_that_takes_a_moment_is_still_used(monkeypatch):
                 self.scripts.append(script)
                 _Slow.reads += 1
                 if _Slow.reads < 3:
-                    return []
-                return ["low", "medium", "high", "max", "thinking"]
+                    return {"overlays": [{"trigger": True, "option": False, "rungs": 0,
+                     "labels": ["opus 5for complex tasks", "effortmax"]}]}
+                return {"overlays": [{"trigger": True, "option": False, "rungs": 0,
+                     "labels": ["opus 5for complex tasks", "effortmax"]},
+                                    {"trigger": False, "option": True, "rungs": 5,
+                     "labels": ["low", "medium", "highdefault", "extra", "max"]}]}
             return await ScriptedPage.evaluate(self, script, arg)
 
     page = _Slow("Opus 5 Max")
     _run(page)
     assert page.evaluated(_EFFORT_SET_MARK), "the submenu mounted late and was missed"
+
+
+def test_an_unrecognised_overlay_still_reaches_the_row_picker(monkeypatch):
+    """⭐⭐ 2026-08-17. The gate that shipped could VETO a picker that verifies its
+    own work, and did: it reported "submenu never mounted" while its own
+    diagnostic listed the submenu and all five rungs, so effort silently stayed
+    at the model's default for the whole phase.
+
+    An overlay that is not the model popover is up and nothing in it was
+    recognised. That describes the page; it does not settle the run. Step 1C' is
+    scoped to that same overlay and checks that the row became selected before
+    claiming anything, so it is allowed to try."""
+    monkeypatch.setitem(models.P2_MODEL_POLICY["claude"], "thinking", True)
+
+    class _Unrecognised(ScriptedPage):
+        async def evaluate(self, script, arg=None):
+            if _SUBMENU_ROWS_MARK in script:
+                self.scripts.append(script)
+                return {"overlays": [
+                    {"trigger": True, "option": False, "rungs": 0,
+                     "labels": ["opus 5for complex tasks", "effortmax"]},
+                    {"trigger": False, "option": False, "rungs": 0,
+                     "labels": ["niedrig", "mittel", "hoch"]}]}
+            return await ScriptedPage.evaluate(self, script, arg)
+
+    page = _Unrecognised("Opus 5 Max")
+    _run(page)
+    assert page.evaluated(_EFFORT_SET_MARK), (
+        "an unrecognised overlay must not veto the picker")
+    assert not page.evaluated(_THINKING_MARK), (
+        "but the Thinking search is page-wide and stays gated on a CONFIRMED "
+        "submenu — widening the effort attempt must not widen an unscoped click")
 
 
 # ── the thinking probe is gated, not deleted ──────────────────────────────

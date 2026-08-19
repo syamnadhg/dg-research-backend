@@ -865,6 +865,11 @@ class TestPairPromptOneKeyWithVerify:
             return fn(*args, **kwargs)
 
         monkeypatch.setattr("research.asyncio.to_thread", _dispatch)
+        # 2026-08-17: the save-anyway prompt moved onto the one shared yes/no
+        # reader, so what reaches to_thread is `_ask_yes_no_sync` and the
+        # `input` it calls is a plain builtin one frame deeper. Same four
+        # answers, same order — the dispatcher just no longer sees the last one.
+        monkeypatch.setattr("builtins.input", lambda _p="": inputs.pop(0))
         result = self._run(_pair_prompt_one_key_with_verify(
             "Anthropic", "sk-ant-...", "https://x",
             verifier=lambda k: "auth_failed",
@@ -885,6 +890,11 @@ class TestPairPromptOneKeyWithVerify:
             return fn(*args, **kwargs)
 
         monkeypatch.setattr("research.asyncio.to_thread", _dispatch)
+        # 2026-08-17: the save-anyway prompt moved onto the one shared yes/no
+        # reader, so what reaches to_thread is `_ask_yes_no_sync` and the
+        # `input` it calls is a plain builtin one frame deeper. Same four
+        # answers, same order — the dispatcher just no longer sees the last one.
+        monkeypatch.setattr("builtins.input", lambda _p="": inputs.pop(0))
         result = self._run(_pair_prompt_one_key_with_verify(
             "Anthropic", "sk-ant-...", "https://x",
             verifier=lambda k: "auth_failed",

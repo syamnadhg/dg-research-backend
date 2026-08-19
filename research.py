@@ -57,6 +57,10 @@ import argparse
 import subprocess
 import collections
 import logging          # only to reshape uvicorn's own records — see _uvicorn_log_config
+# The content-free tier. ⭐ Imports NOTHING from this file, so instrumenting a
+# call site can never create a circular import, and a telemetry failure can
+# never be in the path of the thing it measures — every entry point swallows.
+import telemetry as tm
 from pathlib import Path
 from urllib.parse import urlparse, urlsplit
 
@@ -2093,7 +2097,12 @@ def _shape_summary(text):
 
 def log(msg, level="INFO"):
     ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] [{level}] {msg}")
+    line = f"[{ts}] [{level}] {msg}"
+    print(line)
+    # ⭐ The printed format is byte-for-byte what it always was. The second
+    # sink is the armed per-run folder — see `_log_write_through`, which is a
+    # no-op when nothing is armed and can never recurse back through here.
+    _log_write_through(line, level)
 
 
 # #907: --login's profile pre-probe silences the Browser.start orphan-sweep
@@ -2105,6 +2114,828 @@ _BROWSER_SWEEP_QUIET = False
 def _sweep_log(msg, level="INFO"):
     if not _BROWSER_SWEEP_QUIET:
         log(msg, level)
+
+
+# ─── Where a run's own log actually lives ──────────────────────────────
+# ⛔⛔ 2026-08-18, MEASURED on a real 44 MB backend.log — 676,014 lines
+# covering 2026-07-19 → 08-05. A per-run support bundle CANNOT be cut out of
+# that file after the fact, and not for want of trying:
+#   • `log()` above stamps TIME ONLY, no date. Not one line in a multi-week
+#     file can be dated from its own text.
+#   • The run marker appears EIGHT times in 676k lines, and it fires at the
+#     Firestore claim rather than at dequeue — so "split on the marker" puts
+#     the boundary in the wrong place even when there is one.
+#   • 87.1% of the bytes are a single uvicorn access line, and most of the
+#     remainder is unstamped uvicorn output carrying no run identity at all.
+# So capture happens AT WRITE TIME, into a folder per run, or it does not
+# happen at all.
+#
+# ⭐⭐ AND THE META IS WRITTEN AT ARM, NOT AT DISARM. The incident this whole
+# wave exists for produced NO RUN — a paired machine whose DNS died. An index
+# built only when a run finishes is precisely the container that cannot hold
+# the case it was built for.
+import threading as _log_threading  # noqa: E402
+
+# Head cap, overflow-segment size, and how many segments survive. See
+# `_CappedLogWriter` for why this is not a stop-at-cap.
+RUN_LOG_MAX_BYTES = 32 * 1024 * 1024
+RUN_LOG_OVERFLOW_BYTES = 4 * 1024 * 1024
+RUN_LOG_OVERFLOW_KEEP = 2
+# Raw backend.log / backend.err.log rotation threshold (`_rotate_if_oversize`).
+RAW_LOG_ROTATE_BYTES = 64 * 1024 * 1024
+# Local retention. Deliberately ~2x the bundle's signed-off 30-runs/30-days
+# bounds, so raising the bundle bound later cannot discover that the device
+# already deleted what the new bound wants.
+LOCAL_RUNS_KEEP = 60
+LOCAL_SESSIONS_KEEP = 40
+LOCAL_LOG_MAX_AGE_DAYS = 30
+# How long a meta may claim "running" before a reader calls it a corpse. MUST
+# stay above the worker watchdog's own ACTIVE-time ceiling (5h) plus slack —
+# `test_run_dead_ceiling_clears_the_watchdog` pins the relationship, so bumping
+# the watchdog fails loudly here instead of silently relabelling live runs dead.
+RUN_LOG_DEAD_AFTER_SEC = 6 * 60 * 60
+# Bound on the per-run event mirror. Content-free (type/phase/agent only).
+RUN_LOG_EVENT_CAP = 2000
+
+# CSI + OSC. Deliberately NOT the only erasure `_visible_text` performs —
+# see the carriage-return note there.
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+# What may become a run-log folder key. Permissive-but-safe on purpose: the
+# strict `^chat_[0-9]{13}_[0-9]{1,6}$` shape belongs to the content-free
+# telemetry tier, and using it here would send every legacy / resumed run into
+# the `local_` bucket for no privacy gain — a folder name is not a wire field.
+_RUN_FOLDER_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# ⛔ AND an explicit deny for the `run_id` tail. `run_id` is
+# `f"{safe_name(topic)}_{YYYYMMDD_HHMMSS}"`, and a ONE-WORD topic survives
+# `safe_name` as bare alphanumerics — so the allow-list above would happily
+# accept `kalki_20260818_153044` as a folder key and put the topic in a
+# filename that ships inside a support bundle. Two independent guards.
+_RUN_ID_SUFFIX_RE = re.compile(r"_[0-9]{8}_[0-9]{6}$")
+
+
+def _logs_root() -> "Path":
+    """`~/.super-research/logs/` — the ONE log root.
+
+    Resolved through `_STATE_DIR` (defined further down this file, read at call
+    time) instead of re-deriving `Path.home()`, so this and the supervisor's own
+    `_log_dir` cannot drift into two different log directories."""
+    return _STATE_DIR / "logs"
+
+
+def _runs_log_root() -> "Path":
+    return _logs_root() / "runs"
+
+
+def _sessions_log_root() -> "Path":
+    return _logs_root() / "sessions"
+
+
+def _utc_iso(when=None) -> str:
+    """Full ISO-8601 UTC, seconds precision. The date `log()` never stamps."""
+    import datetime as _dt
+    t = when if when is not None else _dt.datetime.now(_dt.timezone.utc)
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _epoch_from_iso(text) -> float:
+    try:
+        import datetime as _dt
+        return _dt.datetime.strptime(str(text), "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=_dt.timezone.utc).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _visible_text(line: str) -> str:
+    """What the user actually SAW on that line.
+
+    Two erasures, and both are load-bearing:
+      • ANSI CSI/OSC — the pair/doctor UI is branded colour.
+      • CARRIAGE RETURNS. ⭐ `\\r` is not an escape sequence, so an ANSI-only
+        strip keeps every spinner frame. At ~10 frames/sec a two-minute pairing
+        wait writes 1,200 lines of the same word into the file a user sends —
+        the wave-1 wall (4,921 byte-identical lines) rebuilt by the tool meant
+        to fix it. Only the text after the last `\\r` was ever on screen.
+    """
+    text = line.split("\r")[-1] if "\r" in line else line
+    return _ANSI_RE.sub("", text).rstrip()
+
+
+class _CappedLogWriter:
+    """Append-only text writer with a HEAD + ROLLING-TAIL cap.
+
+    ⛔ NOT stop-at-cap, and that is the whole design. A wedged pairing's
+    diagnostic payload is its LAST line; a writer that stops at the cap throws
+    away exactly the half worth having. So the head stays (startup banner,
+    identity, the first failure), and the newest `keep` overflow segments stay.
+    Everything in the middle — which is where byte-identical retry floods live —
+    is what gets dropped."""
+
+    def __init__(self, primary, max_bytes=RUN_LOG_MAX_BYTES,
+                 segment_bytes=RUN_LOG_OVERFLOW_BYTES, keep=RUN_LOG_OVERFLOW_KEEP):
+        self.primary = Path(primary)
+        self.max_bytes = int(max_bytes)
+        self.segment_bytes = int(segment_bytes)
+        self.keep = max(1, int(keep))
+        self.dropped_segments = 0
+        self.lines = 0
+        self._in_overflow = False
+        self._seg_index = 0
+        self._seg_written = 0
+        self._live_segments: "list[int]" = []
+        self.primary.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(self.primary, "a", encoding="utf-8",
+                        errors="replace", buffering=1)
+        try:
+            self._written = self.primary.stat().st_size
+        except OSError:
+            self._written = 0
+
+    # ── paths ───────────────────────────────────────────────────────────
+    def segment_path(self, index: int) -> "Path":
+        return self.primary.with_name(f"{self.primary.name}.overflow{int(index)}")
+
+    def paths(self) -> "list[Path]":
+        """Primary first, then the surviving overflow segments oldest → newest.
+        This is what the bundle collector archives."""
+        return [self.primary] + [self.segment_path(i) for i in self._live_segments]
+
+    # ── writing ─────────────────────────────────────────────────────────
+    def write_line(self, text) -> None:
+        if self._fh is None:
+            return
+        line = str(text).rstrip("\n") + "\n"
+        n = len(line.encode("utf-8", "replace"))
+        try:
+            if self._in_overflow:
+                if self._seg_written and self._seg_written + n > self.segment_bytes:
+                    self._roll_segment()
+            elif self._written + n > self.max_bytes:
+                self._enter_overflow()
+            self._fh.write(line)
+            self.lines += 1
+            if self._in_overflow:
+                self._seg_written += n
+            else:
+                self._written += n
+        except Exception:
+            # A log writer that raises takes the run down with it. Never.
+            pass
+
+    def _open_segment(self, index: int) -> None:
+        self._seg_index = int(index)
+        self._seg_written = 0
+        path = self.segment_path(self._seg_index)
+        self._fh = open(path, "a", encoding="utf-8", errors="replace", buffering=1)
+        self._live_segments.append(self._seg_index)
+        while len(self._live_segments) > self.keep:
+            oldest = self._live_segments.pop(0)
+            try:
+                self.segment_path(oldest).unlink()
+            except OSError:
+                pass
+            self.dropped_segments += 1
+
+    def _enter_overflow(self) -> None:
+        nxt = 1
+        try:
+            self._fh.write(
+                f"--- head capped at {self.max_bytes} bytes; the newest "
+                f"{self.keep} x {self.segment_bytes}-byte tail segments continue in "
+                f"{self.segment_path(nxt).name} ---\n")
+        except Exception:
+            pass
+        self._close_handle()
+        self._in_overflow = True
+        self._open_segment(nxt)
+
+    def _roll_segment(self) -> None:
+        self._close_handle()
+        self._open_segment(self._seg_index + 1)
+
+    def _close_handle(self) -> None:
+        try:
+            if self._fh is not None:
+                self._fh.flush()
+                self._fh.close()
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        self._close_handle()
+        self._fh = None
+
+
+class _RunLogSink:
+    """One armed per-run log folder: `run.log` + `meta.json`, written live."""
+
+    def __init__(self, folder, research_id=None, attempt=0, parent_research_id=None,
+                 started_utc=None):
+        self.dir = Path(folder)
+        self.research_id = research_id
+        self.attempt = int(attempt or 0)
+        self.parent_research_id = parent_research_id
+        self.started_utc = started_utc or _utc_iso()
+        self.started_mono = time.monotonic()
+        self.counters = {"lines": 0, "warns": 0, "errors": 0, "eventsDropped": 0}
+        self.events: "list[dict]" = []
+        self.writer = _CappedLogWriter(self.dir / "run.log")
+        self.meta_path = self.dir / "meta.json"
+        self.write_meta("running")
+
+    # ── meta ────────────────────────────────────────────────────────────
+    def meta(self, status: str, **extra) -> dict:
+        data = {
+            "schema": 1,
+            "status": status,
+            "researchId": self.research_id,
+            "parentResearchId": self.parent_research_id,
+            "attempt": self.attempt,
+            "pid": os.getpid(),
+            "worker": WORKER_ID,
+            "build": _sr_version(),
+            "platform": sys.platform,
+            "startedUtc": self.started_utc,
+            "counters": dict(self.counters),
+            "events": len(self.events),
+        }
+        data.update(extra)
+        return data
+
+    def write_meta(self, status: str, **extra) -> None:
+        try:
+            _atomic_write_json(self.meta_path, self.meta(status, **extra))
+        except Exception:
+            pass
+
+    # ── capture ─────────────────────────────────────────────────────────
+    def note_line(self, line: str, level: str = "INFO") -> None:
+        self.counters["lines"] += 1
+        lvl = str(level).upper()
+        if lvl.startswith("WARN"):
+            self.counters["warns"] += 1
+        elif lvl in ("ERROR", "CRITICAL", "FATAL"):
+            self.counters["errors"] += 1
+        self.writer.write_line(line)
+
+    def note_event(self, event_type, phase=None, agent=None) -> None:
+        """Mirror ONE pipeline event. Names and numbers only — never `**data`."""
+        self.events.append({
+            "t": int(time.time() * 1000),
+            "type": str(event_type),
+            "phase": phase if isinstance(phase, int) else None,
+            "agent": str(agent) if agent else None,
+        })
+        if len(self.events) > RUN_LOG_EVENT_CAP:
+            half = len(self.events) // 2
+            del self.events[:half]
+            self.counters["eventsDropped"] += half
+
+    def finalize(self, status: str, **extra) -> None:
+        self.write_meta(status,
+                        endedUtc=_utc_iso(),
+                        durationSec=round(time.monotonic() - self.started_mono, 3),
+                        **extra)
+        try:
+            (self.dir / "events.json").write_text(
+                json.dumps(self.events, indent=1), encoding="utf-8")
+        except Exception:
+            pass
+        self.writer.close()
+
+
+# The sink STACK, not a singleton: run_pipeline awaits itself in the #725
+# crash-retry, so nesting is real. Each attempt gets its own folder and the
+# OUTER sink resumes the moment the inner one disarms.
+_RUN_LOG_SINKS: "list[_RunLogSink]" = []
+_RUN_LOG_LAST_DIR = None
+_RUN_LOG_TLS = _log_threading.local()
+
+
+def _active_run_sink():
+    return _RUN_LOG_SINKS[-1] if _RUN_LOG_SINKS else None
+
+
+def _log_write_through(line: str, level: str) -> None:
+    """Copy one already-formatted `log()` line into the armed run folder.
+
+    Reentrancy-flagged per THREAD: a failure inside the sink must not recurse
+    through `log()`, and a background thread's line must not be silenced just
+    because the pipeline thread happens to be mid-write."""
+    if getattr(_RUN_LOG_TLS, "busy", False):
+        return
+    sink = _RUN_LOG_SINKS[-1] if _RUN_LOG_SINKS else None
+    if sink is None:
+        return
+    _RUN_LOG_TLS.busy = True
+    try:
+        sink.note_line(line, level)
+    except Exception:
+        pass
+    finally:
+        _RUN_LOG_TLS.busy = False
+
+
+def _run_log_folder_name(research_id, started_utc, attempt=0) -> str:
+    """Folder key for one run's log directory.
+
+    ⛔ THERE IS NO `run_id` PARAMETER, and that absence is the design. `run_id`
+    is built from `safe_name(topic)` — it CARRIES THE USER'S TOPIC, and at the
+    worker's claim both names sit in scope one line apart. A topic in a folder
+    name would ship inside every support bundle. Unrepresentable beats
+    remembered."""
+    stamp = re.sub(r"[^0-9A-Za-z]", "", str(started_utc or ""))[:15] or "unknown"
+    rid = str(research_id or "")
+    safe = bool(_RUN_FOLDER_ID_RE.match(rid)) and not _RUN_ID_SUFFIX_RE.search(rid)
+    key = rid if safe else "local"
+    name = f"{key}_{stamp}"
+    if attempt:
+        name = f"{name}_retry{int(attempt)}"
+    return name
+
+
+def _derive_run_status(meta, now_epoch=None) -> str:
+    """What a run's `meta.json` MEANS when read back later.
+
+    A meta still saying "running" is either a live run or a corpse. ⛔ PID
+    liveness ALONE cannot tell them apart — pids recycle, and a recycled pid
+    relabels a dead run as running, which is how the run that died stays
+    invisible. So: dead if the pid is gone, dead ALSO if it started longer ago
+    than any run is permitted to last."""
+    status = str((meta or {}).get("status") or "") or "unknown"
+    if status != "running":
+        return status
+    pid = (meta or {}).get("pid")
+    started = _epoch_from_iso((meta or {}).get("startedUtc"))
+    now = time.time() if now_epoch is None else float(now_epoch)
+    pid_gone = not (isinstance(pid, int) and pid > 0 and _pid_alive(int(pid)))
+    aged_out = bool(started) and (now - started) > RUN_LOG_DEAD_AFTER_SEC
+    return "process-died" if (pid_gone or aged_out) else "running"
+
+
+def _patch_run_log_status(status: str, **extra) -> bool:
+    """Stamp a verdict onto the run meta a supervisor just killed.
+
+    ⭐ The worker watchdog cancels the pipeline task and AWAITS it before
+    raising, so by the time its handler runs the capture has already exited and
+    finalized. Patching the FOLDER is what makes the handler's verdict land at
+    all — a flag the handler sets on the sink would arrive after the write."""
+    sink = _active_run_sink()
+    if sink is not None:
+        target = sink.meta_path
+    elif _RUN_LOG_LAST_DIR is not None:
+        target = Path(_RUN_LOG_LAST_DIR) / "meta.json"
+    else:
+        return False
+    try:
+        data = json.loads(Path(target).read_text(encoding="utf-8"))
+        data["status"] = status
+        data.update(extra)
+        _atomic_write_json(Path(target), data)
+        return True
+    except Exception:
+        return False
+
+
+def _safe_mtime(path) -> float:
+    try:
+        return Path(path).stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _folder_is_live(path) -> bool:
+    """Is a run still being written into this folder — by ANY process?
+
+    ⛔ Found by mutation, 2026-08-18. The in-process sink list only covers runs
+    THIS process armed, and on a multi-worker host worker 2's prune reaches
+    worker 1's folders. Worse, a directory's mtime stops moving the moment
+    run.log exists — appends do not touch the directory — so a run that is
+    hours into real work looks ancient to every bound below. The meta is the
+    only cross-process answer, and `_derive_run_status` is what makes it one
+    (pid liveness plus the age ceiling, because pids recycle)."""
+    try:
+        meta = json.loads((Path(path) / "meta.json").read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return _derive_run_status(meta) == "running"
+
+
+def _prune_local_logs(runs_keep=LOCAL_RUNS_KEEP, sessions_keep=LOCAL_SESSIONS_KEEP,
+                      max_age_days=LOCAL_LOG_MAX_AGE_DAYS, now=None) -> "list[str]":
+    """Keep the per-run/per-session capture bounded. Returns what it removed.
+
+    ⛔ Without this the capture is a SECOND unbounded copy of a stream that has
+    no rotation anywhere — on a product measured at 44 MB of backend.log in 16
+    days. Bounds are ~2x the bundle's 30/30, so raising the bundle bound later
+    never finds the device already deleted what the new bound wants."""
+    removed: "list[str]" = []
+    now_t = time.time() if now is None else float(now)
+    cutoff = now_t - float(max_age_days) * 86400.0
+    live = {str(s.dir) for s in _RUN_LOG_SINKS}
+
+    runs_root = _runs_log_root()
+    try:
+        runs = [p for p in runs_root.iterdir() if p.is_dir()]
+    except OSError:
+        runs = []
+    runs.sort(key=_safe_mtime, reverse=True)
+    for i, path in enumerate(runs):
+        if str(path) in live or path.parent != runs_root:
+            continue
+        if _folder_is_live(path):
+            continue
+        if i >= int(runs_keep) or _safe_mtime(path) < cutoff:
+            shutil.rmtree(path, ignore_errors=True)
+            removed.append(str(path))
+
+    sessions_root = _sessions_log_root()
+    try:
+        files = [p for p in sessions_root.iterdir() if p.is_file()]
+    except OSError:
+        files = []
+    groups: "dict[str, list[Path]]" = {}
+    for path in files:
+        base = re.sub(r"\.overflow\d+$", "", path.name)
+        groups.setdefault(base, []).append(path)
+    order = sorted(groups.items(),
+                   key=lambda kv: max(_safe_mtime(p) for p in kv[1]), reverse=True)
+    for i, (_base, members) in enumerate(order):
+        newest = max(_safe_mtime(p) for p in members)
+        if i >= int(sessions_keep) or newest < cutoff:
+            for path in members:
+                if path.parent != sessions_root:
+                    continue
+                try:
+                    path.unlink()
+                    removed.append(str(path))
+                except OSError:
+                    pass
+    return removed
+
+
+class _RunLogCapture:
+    """Arm a per-run log folder for the duration of one pipeline attempt.
+
+    Never raises into the pipeline: if capture cannot be set up, the run runs.
+    A diagnostic that can break the thing it diagnoses is worse than none."""
+
+    def __init__(self, research_id=None, attempt=0):
+        self.research_id = research_id
+        self.attempt = int(attempt or 0)
+        self.sink = None
+
+    def __enter__(self):
+        # Re-entering the same object would push a SECOND sink and leave the
+        # first on the stack forever — every later line in the process would
+        # then write to a folder nothing will ever finalize.
+        if self.sink is not None:
+            return self.sink
+        try:
+            _prune_local_logs()
+        except Exception:
+            pass
+        try:
+            parent = _active_run_sink()
+            started = _utc_iso()
+            base = _run_log_folder_name(self.research_id, started, self.attempt)
+            root = _runs_log_root()
+            root.mkdir(parents=True, exist_ok=True)
+            folder = root / base
+            suffix = 2
+            while folder.exists():
+                folder = root / f"{base}-{suffix}"
+                suffix += 1
+            folder.mkdir(parents=True)
+            sink = _RunLogSink(
+                folder, research_id=self.research_id, attempt=self.attempt,
+                parent_research_id=(parent.research_id if parent is not None else None),
+                started_utc=started)
+            sink.writer.write_line("=== super research run ===")
+            sink.writer.write_line(
+                f"startedUtc={started} researchId={self.research_id} "
+                f"attempt={self.attempt} "
+                f"parentResearchId={parent.research_id if parent is not None else None}")
+            sink.writer.write_line(
+                f"build={_sr_version()} pid={os.getpid()} worker={WORKER_ID} "
+                f"python={sys.version.split()[0]} platform={sys.platform}")
+            _RUN_LOG_SINKS.append(sink)
+            self.sink = sink
+            tm.tm_emit(tm.Ev.RUN_STARTED,
+                       research_id=self.research_id, worker=WORKER_ID)
+        except Exception as exc:
+            self.sink = None
+            log(f"[run-log] capture unavailable for this run: {exc}", "WARN")
+        return self.sink
+
+    def __exit__(self, exc_type, exc, tb):
+        global _RUN_LOG_LAST_DIR
+        sink = self.sink
+        if sink is None:
+            return False
+        try:
+            if sink in _RUN_LOG_SINKS:
+                _RUN_LOG_SINKS.remove(sink)
+            if exc_type is None:
+                status = "complete"
+            elif issubclass(exc_type, asyncio.CancelledError):
+                status = "cancelled"
+            elif issubclass(exc_type, KeyboardInterrupt):
+                status = "interrupted"
+            else:
+                status = "errored"
+            extra = {}
+            if exc_type is not None:
+                extra["errorClass"] = exc_type.__name__
+            sink.finalize(status, **extra)
+            _RUN_LOG_LAST_DIR = sink.dir
+            # ⭐ THE OUTCOME SEAM. Not `teardown_firestore_run`, which was
+            # measured to be a context-free cleanup with nothing in scope — an
+            # event that says nothing. This block is the one place that sees
+            # EVERY run's terminal state, including the ones that die by
+            # exception, and it already has the id and the duration.
+            tm.tm_emit(tm.Ev.RUN_FINISHED,
+                       research_id=sink.research_id,
+                       outcome={"complete": tm.RunOutcome.COMPLETE,
+                                "errored": tm.RunOutcome.ERRORED,
+                                "cancelled": tm.RunOutcome.STOPPED,
+                                "interrupted": tm.RunOutcome.STOPPED}.get(
+                                    status, tm.RunOutcome.UNKNOWN),
+                       duration_ms=int(
+                           (time.monotonic() - sink.started_mono) * 1000))
+            tm.flush_in_background()
+        except Exception:
+            pass
+        return False
+
+
+# ── The interactive commands that reach no file at all ─────────────────
+# ⛔⛔ MEASURED: `--pair`, `--login` and `--doctor` print their branded UI with
+# bare `print()` (512 such sites in this file), and `log()`'s only sink under
+# them is a terminal that closes. The founding incident's pairing output existed
+# ONLY as a photograph the owner sent. The tee makes the photograph a file.
+class _SessionTee:
+    """Mirror one interactive command's own output into a session log.
+
+    Terminal output is byte-for-byte unchanged; the FILE gets the
+    ANSI-stripped, carriage-return-collapsed copy."""
+
+    def __init__(self, stream, writer):
+        self._stream = stream
+        self._writer = writer
+        self._buf = ""
+
+    def write(self, s):
+        n = self._stream.write(s)
+        try:
+            self._mirror(s)
+        except Exception:
+            pass
+        return n
+
+    def _mirror(self, s) -> None:
+        if not s:
+            return
+        self._buf += s
+        # A spinner that never emits a newline would otherwise grow this
+        # buffer forever; only the frame after the last `\r` was on screen.
+        if len(self._buf) > 4096 and "\r" in self._buf:
+            self._buf = self._buf.rsplit("\r", 1)[-1]
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            self._writer.write_line(_visible_text(line))
+
+    def flush(self):
+        try:
+            return self._stream.flush()
+        except Exception:
+            return None
+
+    def close_mirror(self) -> None:
+        try:
+            if self._buf.strip():
+                self._writer.write_line(_visible_text(self._buf))
+        except Exception:
+            pass
+        self._buf = ""
+
+    def __getattr__(self, name):
+        if name in ("_stream", "_writer", "_buf"):
+            raise AttributeError(name)
+        return getattr(self._stream, name)
+
+
+_PREV_EXCEPTHOOK = None
+_CRASH_HOOK_INSTALLED = False
+
+
+def _log_excepthook(exc_type, exc, tb) -> None:
+    """Route an uncaught traceback through `log()`.
+
+    ⛔ MEASURED: this file had NO excepthook, so a crash out of `--pair` reached
+    stderr and died with the window, and a crash inside `--serve` reached
+    backend.err.log — the half of the logs nobody thinks to ask for, where
+    22,758 lines were already sitting. `log()` puts it in backend.log, in the
+    armed run folder, and in the session file, with a timestamp on every line
+    so a multi-line record cannot become unparseable orphans.
+
+    Deliberately does NOT re-print through the default hook: that would print
+    the same traceback twice, which is the wall this wave exists to remove."""
+    try:
+        if issubclass(exc_type, KeyboardInterrupt):
+            if _PREV_EXCEPTHOOK is not None:
+                _PREV_EXCEPTHOOK(exc_type, exc, tb)
+            return
+        import traceback as _tb
+        text = "".join(_tb.format_exception(exc_type, exc, tb)).rstrip()
+        log("Unhandled exception — the command is stopping here:", "ERROR")
+        for line in (text.splitlines() or [""]):
+            log(line, "ERROR")
+    except Exception:
+        pass
+    if _PREV_EXCEPTHOOK is not None and _PREV_EXCEPTHOOK is not sys.__excepthook__:
+        try:
+            _PREV_EXCEPTHOOK(exc_type, exc, tb)
+        except Exception:
+            pass
+
+
+def _install_crash_log_hook() -> bool:
+    """Install `_log_excepthook` once, for EVERY command. Returns whether it
+    attached (a second call attaches nothing)."""
+    global _PREV_EXCEPTHOOK, _CRASH_HOOK_INSTALLED
+    if _CRASH_HOOK_INSTALLED:
+        return False
+    _PREV_EXCEPTHOOK = sys.excepthook
+    sys.excepthook = _log_excepthook
+    _CRASH_HOOK_INSTALLED = True
+    return True
+
+
+_SESSION_TEES: "list[_SessionTee]" = []
+
+
+def _session_command_name(args) -> "str | None":
+    """Which interactive command gets a session file. `--serve` does not: its
+    stdout is already redirected into backend.log by the supervisor."""
+    for flag in ("pair", "login", "doctor"):
+        if getattr(args, flag, False):
+            return flag
+    return None
+
+
+def _install_session_tee(command: str):
+    """Tee stdout+stderr of one interactive command into
+    `logs/sessions/{command}_{UTC}.log`. Returns the writer, or None."""
+    try:
+        started = _utc_iso()
+        stamp = re.sub(r"[^0-9A-Za-z]", "", started)[:15]
+        writer = _CappedLogWriter(
+            _sessions_log_root() / f"{command}_{stamp}.log",
+            max_bytes=RUN_LOG_MAX_BYTES, segment_bytes=RUN_LOG_OVERFLOW_BYTES,
+            keep=RUN_LOG_OVERFLOW_KEEP)
+        writer.write_line(f"=== super research session: {command} ===")
+        writer.write_line(
+            f"startedUtc={started} build={_sr_version()} pid={os.getpid()} "
+            f"python={sys.version.split()[0]} platform={sys.platform}")
+        for name in ("stdout", "stderr"):
+            stream = getattr(sys, name, None)
+            if stream is None:
+                continue
+            tee = _SessionTee(stream, writer)
+            setattr(sys, name, tee)
+            _SESSION_TEES.append(tee)
+        import atexit as _atexit
+        _atexit.register(_close_session_tees)
+        return writer
+    except Exception:
+        return None
+
+
+def _close_session_tees() -> None:
+    for tee in list(_SESSION_TEES):
+        try:
+            tee.close_mirror()
+            tee._writer.close()
+        except Exception:
+            pass
+    _SESSION_TEES.clear()
+
+
+def _rotate_if_oversize(path, max_bytes=RAW_LOG_ROTATE_BYTES, audit=None) -> int:
+    """Roll one raw log to `.1` once it passes `max_bytes`. Returns the rolled
+    size, or 0 for "left alone".
+
+    ⛔ Called at ALL THREE places this file opens a backend log, and the third
+    is the one that matters: `load_worker_count()` defaults to 1, so the default
+    install never enters the multi-worker branch. Rotation anchored only there
+    would have been a guard that cannot fire where most users live."""
+    try:
+        p = Path(path)
+        size = p.stat().st_size
+    except OSError:
+        return 0
+    if size <= int(max_bytes):
+        return 0
+    keep = p.with_name(p.name + ".1")
+    try:
+        if keep.exists():
+            keep.unlink()
+        os.replace(str(p), str(keep))
+        return int(size)
+    except OSError as exc:
+        # Windows refuses to rename a file another handle still holds open.
+        # Audited rather than silent — a log that stopped rotating is a log
+        # that will fill the disk quietly.
+        if audit is not None:
+            try:
+                audit(f"log rotation skipped for {p.name}: {exc}")
+            except Exception:
+                pass
+        return 0
+
+
+# ─── The stdlib loggers nobody was listening to ────────────────────────
+# ⛔⛔ 2026-08-17, MEASURED. Six modules in this process log through the
+# standard library rather than `log()` — auth/credentials, auth/keystore,
+# auth/v2_flow, vision, selfheal, narrate — and NOT ONE of them had a handler
+# anywhere. `_uvicorn_log_config` even said so out loud, in a comment claiming
+# "auth/ configures its own"; it does not, and never did.
+#
+# What that meant, checked against the real corpus rather than reasoned about:
+#   • WARNING and above fell through to `logging.lastResort`, which is a bare
+#     StreamHandler on STDERR with no timestamp and no level. 22,758 such lines
+#     sit in backend.err.log and backend-2.err.log — and ZERO of them are in
+#     backend.log, the file a user actually sends.
+#   • DEBUG and INFO were dropped on the floor. `poll_pending_token: transient
+#     HTTP error …` — the pairing poll's only account of a network failure —
+#     appears in no log on this machine, ever.
+#   • And the one line that would have diagnosed the new owner's whole outage,
+#     `refresh: network error … Failed to resolve 'securetoken.googleapis.com'`,
+#     was in the half of the logs nobody thinks to ask for.
+#
+# ⛔ `_uvicorn_log_config` could not have fixed this even if it had named them:
+# it is handed to `uvicorn.Config(log_config=…)` and therefore only exists
+# inside `--serve`. `--pair`, `--login` and `--doctor` configure no logging at
+# all. So the bridge is installed at the top of `main()`, for every command.
+#
+# ⭐ Bridging to `log()` rather than adding a second StreamHandler is the point:
+# one writer, one format, one stream, and a timestamp on every line — including
+# each line of a traceback, so a multi-line record cannot produce the
+# unparseable orphan lines this repo has been printing all along.
+_BRIDGED_LOGGERS = ("auth", "vision", "selfheal", "narrate", "telemetry")
+
+
+class _StdlibLogBridge(logging.Handler):
+    """Forward a stdlib `logging` record into `log()`, one line at a time."""
+
+    # research.py says WARN, the stdlib says WARNING. One vocabulary reaches
+    # the log or level filters stop working halfway down the file.
+    _LEVEL_NAMES = {
+        logging.DEBUG: "DEBUG",
+        logging.INFO: "INFO",
+        logging.WARNING: "WARN",
+        logging.ERROR: "ERROR",
+        logging.CRITICAL: "ERROR",
+    }
+
+    def emit(self, record):
+        try:
+            level = self._LEVEL_NAMES.get(record.levelno, "INFO")
+            text = f"[{record.name}] {record.getMessage()}"
+            if record.exc_info:
+                import traceback as _tb
+                text += "\n" + "".join(_tb.format_exception(*record.exc_info)).rstrip()
+            for line in (text.splitlines() or [""]):
+                log(line, level)
+        except Exception:
+            self.handleError(record)
+
+
+def _install_stdlib_log_bridge(names=_BRIDGED_LOGGERS) -> "list[str]":
+    """Give every one of our stdlib loggers somewhere to go. Returns the names
+    it attached to, so a test can assert coverage rather than trust the list.
+
+    Idempotent — a second call attaches nothing, which matters because `main()`
+    is not the only way into this file.
+
+    DEBUG deliberately: `log()` has no level filter at all, so every DEBUG line
+    written through it already prints. Holding these to INFO would be a SECOND
+    logging policy in the same process, and the whole reason this exists is
+    that a second policy is what swallowed 22,758 lines.
+    """
+    installed = []
+    for name in names:
+        lg = logging.getLogger(name)
+        if any(isinstance(h, _StdlibLogBridge) for h in lg.handlers):
+            continue
+        lg.addHandler(_StdlibLogBridge())
+        lg.setLevel(logging.DEBUG)
+        # Nothing upstream handles these, and lastResort is exactly what we are
+        # replacing. Explicit so a future root config cannot double-print them.
+        lg.propagate = False
+        installed.append(name)
+    return installed
 
 
 # ── Terminal colors (used by --pair for the branded UI) ──────────────────
@@ -2178,6 +3009,123 @@ _RESET    = "\033[0m"
 
 def _c(color: str, text: str) -> str:
     return f"{color}{text}{_RESET}" if _USE_COLOR else text
+
+
+# ─── The one yes/no prompt reader ──────────────────────────────
+# 2026-08-17. Before this, every interactive prompt in this file parsed its
+# own answer and no two did it the same way: `in ("y","yes")`, `in ("","y",
+# "yes")`, `"verify" if ans in ("n","no") else "skip"`. Five rule sets over
+# nine prompts, so one word meant different things at different prompts —
+# "nope" was a no at one and a yes at another — and any answer none of them
+# recognised was applied as the default without a word.
+#
+# THAT SILENCE IS THE DEFECT, not the parsing. A new owner answered
+# "Add another browser profile (profile 2)? [y/N]" with `2`, the number the
+# question had just used, and the loop exited printing nothing at all. They
+# asked for two concurrent run slots, got one, and setup then said Ready.
+#
+# So: one reader, one rule set, and it never decides in silence.
+#   • an answer it cannot read is named out loud and asked again
+#   • an answer it had to interpret is echoed back before it is acted on
+#   • the [y/N] hint is RENDERED FROM the default instead of being written
+#     beside it, so the promise and the parse cannot drift apart
+#
+# Callers declare their own extra words — `2` means yes only at a prompt that
+# just said "profile 2". A digit is never globally a yes: at "Remove the
+# Super Research backend?" it would have to mean something, and there is no
+# answer to what.
+_YES_WORDS = ("y", "ye", "yes", "yeah", "yeh", "yep", "yup", "ok", "okay", "sure")
+_NO_WORDS = ("n", "no", "nope", "nah", "naw")
+# Answers so canonical that echoing our reading of them back would be noise.
+_OBVIOUS_ANSWERS = ("y", "yes", "n", "no")
+
+
+def _ask_yes_no_sync(
+    question: str,
+    *,
+    default: bool,
+    yes_aliases: "tuple[str, ...]" = (),
+    no_aliases: "tuple[str, ...]" = (),
+    tries: int = 3,
+) -> bool:
+    """Ask `question` and return the answer. The ONLY yes/no reader in this file.
+
+    `default` is what an empty line (a bare Enter) means, and it also picks the
+    hint: True renders [Y/n], False renders [y/N]. Pass `yes_aliases` /
+    `no_aliases` for words this particular question makes meaningful — at
+    "add profile 3?" that is "3" for yes and "2" (keep what I have) for no.
+
+    An unreadable answer is reported and re-asked up to `tries` times rather
+    than being silently taken as the default. If stdin has nothing left to give
+    the retry raises EOFError, exactly as the first read would have, so callers
+    keep whatever non-interactive handling they already had.
+
+    Ctrl+C and EOF propagate untouched — every caller here treats them
+    differently and this reader has no business choosing for them.
+    """
+    hint = "[Y/n]" if default else "[y/N]"
+    prompt = f"  {_c(_ACCENT, '>')}  {question} {_c(_DIM, hint)}: "
+    yes = tuple(_YES_WORDS) + tuple(
+        a.strip().lower() for a in yes_aliases if str(a).strip())
+    # Yes wins a collision. Declaring one word both ways is a caller bug, and
+    # resolving it silently in favour of the more conservative reading would
+    # hide it; the echo below makes whichever way it went visible.
+    no = tuple(w for w in (tuple(_NO_WORDS) + tuple(
+        a.strip().lower() for a in no_aliases if str(a).strip())) if w not in yes)
+
+    for attempt in range(1, max(1, int(tries)) + 1):
+        raw = input(prompt)
+        ans = (raw or "").strip().lower()
+        if ans == "":
+            return default
+        if ans in yes or ans in no:
+            verdict = ans in yes
+            if ans not in _OBVIOUS_ANSWERS:
+                _read_as = "yes" if verdict else "no"
+                print(f"  {_c(_DIM, f'Read {raw.strip()!r} as {_read_as}.')}")
+            return verdict
+        if attempt < max(1, int(tries)):
+            print(
+                f"  {_c(_WARN, '!')}  Did not understand {raw.strip()!r}. "
+                f"Answer {_c(_BOLD, 'y')} or {_c(_BOLD, 'n')} "
+                f"{_c(_DIM, '(Enter alone means ' + ('yes' if default else 'no') + ')')}."
+            )
+
+    print(
+        f"  {_c(_WARN, '!')}  Still no answer I can read — taking the default: "
+        f"{_c(_BOLD, 'yes' if default else 'no')}."
+    )
+    return default
+
+
+async def _ask_yes_no(
+    question: str,
+    *,
+    default: bool,
+    yes_aliases: "tuple[str, ...]" = (),
+    no_aliases: "tuple[str, ...]" = (),
+    tries: int = 3,
+) -> bool:
+    """`_ask_yes_no_sync` off the event loop, so a prompt never blocks it."""
+    return await asyncio.to_thread(
+        _ask_yes_no_sync, question, default=default, yes_aliases=yes_aliases,
+        no_aliases=no_aliases, tries=tries)
+
+
+def _say_profile_capacity(count: int) -> None:
+    """Say out loud what a browser-profile add-loop settled on.
+
+    Both add-loops used to leave on a bare `break` and print nothing, so
+    declining — or being READ as declining — left no trace anywhere. A new
+    owner who meant to add a second profile watched the prompt disappear and
+    [5/5] Ready report success, with no line in the whole session naming the
+    capacity they actually ended up with.
+    """
+    n = max(1, int(count or 1))
+    profiles = "profile" if n == 1 else "profiles"
+    slots = "slot" if n == 1 else "slots"
+    print(f"  {_c(_DIM, f'Stopping at {n} browser {profiles} — {n} concurrent run {slots}.')}")
+    print(f"  {_c(_DIM, 'Add more any time with')}  {_c(_BOLD, _PROG + ' --login')}{_c(_DIM, '.')}")
 
 
 # ─── Cross-platform CLI nomenclature ──────────────────────────────────
@@ -2364,9 +3312,14 @@ def _uvicorn_log_config() -> dict:
     """
     return {
         "version": 1,
-        # Leave every logger we did not name alone: `auth/` configures its own,
-        # and `disable_existing_loggers` defaults to True, which would silence
-        # them as a side effect of formatting uvicorn.
+        # Leave every logger we did not name alone, and mind that this is the
+        # ONLY reason our own loggers survive: `disable_existing_loggers`
+        # defaults to True, which would silence them as a side effect of
+        # formatting uvicorn.
+        # ⛔ This used to read "`auth/` configures its own". It does not, and
+        # never did — see `_install_stdlib_log_bridge`, which is what actually
+        # gives auth/vision/selfheal/narrate a handler, and which runs for every
+        # command rather than only inside `--serve` the way this config does.
         "disable_existing_loggers": False,
         "formatters": {
             "dg": {
@@ -2672,8 +3625,30 @@ def _aegis_rune(supervised: bool, transition_to: str | None = None) -> str:
     return _c(_DIM, "◇ quiescens")
 
 
-def _aegis_pulse_line(worker_id, tick: int) -> str:
+def _outage_duration_text(seconds) -> str:
+    """`9s` / `4m12s` / `2h05m`. Rendered rather than raw so a log tail says how
+    long at a glance, and so one outage reads identically in every message."""
+    try:
+        s = max(0, int(float(seconds or 0)))
+    except (TypeError, ValueError):
+        s = 0
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+
+def _aegis_pulse_line(worker_id, tick: int, *, down_for=None) -> str:
     """The idle standing-watch pulse, returned as text so a test can assert it.
+
+    ⛔ 2026-08-17 — IT USED TO SAY "standing watch" NO MATTER WHAT. A new
+    owner's machine lost DNS for firestore.googleapis.com sixty seconds after
+    pairing, and this line went on claiming a watch was being kept, once a
+    minute, while the device was unreachable from the web app and every run
+    fired at it was being dropped. A liveness pulse that cannot report the one
+    condition which makes the process useless is not a liveness pulse. Pass
+    `down_for` (seconds) whenever the Firestore client is gone.
 
     ⚠ The glyph is ALWAYS `◆`. It used to alternate `◆`/`◇` so a tail of the log
     showed a faint pulse instead of flat repetition — but `_aegis_rune` above
@@ -2687,6 +3662,13 @@ def _aegis_pulse_line(worker_id, tick: int) -> str:
     capture; where colour is off the text is simply steady, which is honest,
     because the state IS steady and the timestamp already moves every minute.
     """
+    if down_for is not None:
+        # Neither vigilans nor quiescens — the watch is BROKEN, and the CLI's
+        # lexicon already spends `✗` on exactly that (--doctor's failure mark).
+        return (f"[aegis] worker {worker_id}: "
+                f"{_c(_ERR, '✗')} watch broken — no Firestore for "
+                f"{_outage_duration_text(down_for)}; the web app shows this "
+                f"computer offline and runs fired at it will not arrive")
     return (f"[aegis] worker {worker_id}: "
             f"{_c(_ACCENT if tick % 2 == 0 else _DIM, '◆')} standing watch")
 
@@ -4419,7 +5401,13 @@ def init_firebase():
         # getaddrinfo/DNS, ConnectionError, timeout, or a non-revoke 5xx
         # (RuntimeError). Token is still valid ("leaving keystore intact"), so
         # classify transient and let _firebase_reconnect_loop retry. (#717)
-        log(f"Firestore init: transient network error ({type(_net_err).__name__}: {_net_err}) — will retry", "WARN")
+        # "transient" is a CLASSIFICATION (as opposed to revoked) and it stays
+        # one — but it was also the word this line said out loud, 5,339 times
+        # in the live corpus, about outages that were nothing of the kind. The
+        # classification below is unchanged; the sentence no longer claims to
+        # know something it finds out later.
+        log(f"Firestore init: could not reach Google ({type(_net_err).__name__}: "
+            f"{_net_err}) — retrying", "WARN")
         _firebase_down_reason = "transient"
         return False
     if client is None:
@@ -4436,6 +5424,7 @@ def init_firebase():
         return False
     _firebase_db = client
     _firebase_down_reason = None
+    _clear_firestore_down()
     log(f"Firestore client initialized ✓ (install={install_uuid[:8]}…)")
     # #720: verify the gRPC client's freshly-minted idToken actually carries the
     # deviceId custom claim the user-tree rules require. A claim-propagation race
@@ -4565,12 +5554,33 @@ def _grpc_token_claims() -> dict:
     return _decode_jwt_claims(getattr(creds, "token", None)) if creds is not None else {}
 
 
-def _is_synth_permission_denied(exc: "BaseException | None") -> bool:
+def _is_synth_permission_denied(exc: "BaseException | None",
+                                *, ignore: "BaseException | None" = None) -> bool:
     """True if `exc` (walking __cause__/__context__) is a Firestore rules
     denial. Covers google.api_core.exceptions.PermissionDenied AND the
     transactional wrapper's "transaction has no transaction ID" ValueError
-    that masks a denied read inside `_flip_queued_to_ongoing`."""
-    seen: "set[int]" = set()
+    that masks a denied read inside `_flip_queued_to_ongoing`.
+
+    ⛔⛔ `ignore` EXISTS BECAUSE OF THE RETRY LADDER, and a test found it. Python
+    chains implicitly: anything raised inside an `except` block gets that block's
+    exception as its `__context__`. So when the heal retries a write and the
+    retry fails for an unrelated reason — the network dropping, a bug — the walk
+    reaches the ORIGINAL 403 through the context and calls it a rules denial.
+    Every failure on a retry path would classify as one, and the heal would spend
+    a securetoken round-trip on a network error.
+
+    Pass the exception the retry is being run FROM and the walk stops there. Not
+    `follow_context=False`: that would also lose the masked transactional denial
+    this function exists to catch, which arrives on exactly the same edge — the
+    distinction is WHICH denial, not which link.
+
+    ⛔ Seeding `ignore`'s ENTIRE chain was written first and then removed: a
+    retry's context always reaches the original exception OBJECT before anything
+    deeper in its chain, so the extra walk could never change an answer. Mutation
+    G7 is what proved it — the mutant that deleted the walk survived every test,
+    and this file's rule is to remove such a guard rather than test around it.
+    """
+    seen: "set[int]" = {id(ignore)} if ignore is not None else set()
     stack = [exc]
     while stack:
         e = stack.pop()
@@ -4619,6 +5629,50 @@ def _grpc_write_with_heal(op, *, what: str):
     except Exception as exc:
         if not _is_synth_permission_denied(exc):
             raise
+        # ⭐⭐ 2026-08-17 — RUNG 1: RETRY THE SAME TOKEN, IMMEDIATELY.
+        #
+        # This step exists because the old one-rung version could not answer the
+        # question it claimed to. Its own comment said "the retry is the
+        # EXPERIMENT, so its result is the diagnosis" — but that retry changed
+        # TWO things at once: it used a newly minted token AND it ran roughly a
+        # securetoken round-trip later. So "cleared by the re-minted token — the
+        # cached credential was stale" was never a measurement; a propagation
+        # race that resolved on its own during the round-trip produces the exact
+        # same line. Every run of the live corpus reports one of these on its
+        # first user-tree write and every one self-heals, which is precisely the
+        # shape a confounded experiment leaves behind.
+        #
+        # A plain retry changes NOTHING except that the first attempt already
+        # happened: same credential, same claims, no sleep, no securetoken POST.
+        # If it clears the denial, the credential was demonstrably not the cause
+        # and the token churn below was never needed. If it does not, the
+        # force-refresh rung runs and its success now MEANS something.
+        #
+        # ⛔ Deliberately ahead of the throttle. The throttle exists to protect
+        # securetoken from a 403 storm, and this rung never touches securetoken —
+        # so under throttle today the write simply degraded, where now it gets
+        # the one free attempt that may well be all it needed.
+        #
+        # Safe to re-run: a permission-denied write did not apply, and the
+        # transactional flip did not commit.
+        try:
+            result = op()
+            with _grpc_heal_lock:
+                _grpc_heal_consec_fail = 0
+                _grpc_heal_structural = False
+            log(
+                f"[grpc-heal] {what}: cleared by an IMMEDIATE retry on the SAME "
+                f"token — no refresh, no delay. The credential was NOT stale, so "
+                f"this denial was transient (claim/doc propagation), and no "
+                f"securetoken round-trip was spent on it.",
+                "INFO",
+            )
+            return result
+        except Exception as _plain_e:
+            # `ignore=exc`: the original 403 is this exception's implicit
+            # __context__, so without it EVERY retry failure reads as a denial.
+            if not _is_synth_permission_denied(_plain_e, ignore=exc):
+                raise
         # Throttle + structural latch under the lock so concurrent worker
         # threads can't all slip past the cooldown and fire simultaneous heals.
         with _grpc_heal_lock:
@@ -4681,9 +5735,10 @@ def _grpc_write_with_heal(op, *, what: str):
             with _grpc_heal_lock:
                 _grpc_heal_consec_fail = 0
             log(
-                f"[grpc-heal] {what}: cleared by the re-minted token — the cached "
-                f"credential was stale. The device doc and the deviceId claim were "
-                f"both fine.",
+                f"[grpc-heal] {what}: cleared by the RE-MINTED token after a plain "
+                f"retry on the same token had already failed — so the cached "
+                f"credential really was stale. The device doc and the deviceId "
+                f"claim were both fine.",
                 "INFO",
             )
             return result
@@ -4711,9 +5766,10 @@ def _grpc_write_with_heal(op, *, what: str):
                 # ruled out. The latch policy is deliberately left alone; making
                 # it fire is a separate decision about telling a user to re-pair.
                 log(
-                    f"[grpc-heal] {what}: the re-minted token did NOT clear the "
-                    f"denial ({type(_retry_e).__name__}) — so a stale credential "
-                    f"was not the cause. Remaining: {cause}. This write degraded.",
+                    f"[grpc-heal] {what}: neither a plain retry nor a re-minted "
+                    f"token cleared the denial ({type(_retry_e).__name__}) — so "
+                    f"neither a stale credential nor a transient race was the "
+                    f"cause. Remaining: {cause}. This write degraded.",
                     "WARN",
                 )
             raise
@@ -5465,7 +6521,128 @@ async def _heartbeat_loop():
                 log(f"[heartbeat] {_heartbeat_failures} consecutive failures — dropping client; reconnect loop will rebuild", "WARN")
                 _firebase_db = None
                 _firebase_down_reason = "transient"
+                # Start the outage clock HERE, not in the reconnect loop: this
+                # is the moment the client actually went away, and the pulse
+                # (every 60s) would otherwise report a duration up to a full
+                # reconnect tick short of the truth.
+                _mark_firestore_down()
         await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
+
+
+# ─── When a Firestore outage stops being a blip ────────────────────────
+# The reconnect ladder has always self-healed a blip in seconds (#717). What
+# it never did was SAY anything a person could act on when the outage was not
+# a blip. The live corpus holds 4,921 identical "[reconnect] Firestore still
+# unreachable — retrying init in 30s" lines and 5,339 "transient network
+# error" ones, and not one sentence anywhere naming DNS, a VPN, a proxy or a
+# firewall. A machine behind any of those retries forever while the banner
+# reads "standing watch" and the web app just says the device is offline.
+#
+# ⭐ TWO NUMBERS, AND THEY DO DIFFERENT JOBS. `SPEAKS_AFTER` is how long an
+# outage may last before we stop calling it a blip — comfortably past the
+# 5→5→10→30s ladder, so an ordinary network hiccup never triggers it.
+# `REPEAT` is why the notice is worth reading at all: the 30s retry line
+# already tracks the retrying, and a message printed 4,921 times is not a
+# message, it is wallpaper.
+FIRESTORE_OUTAGE_SPEAKS_AFTER_S = 60.0
+FIRESTORE_OUTAGE_REPEAT_S = 300.0
+FIRESTORE_HOST = "firestore.googleapis.com"
+
+# Epoch seconds when this process last had no Firestore client, or None while
+# healthy. Written at the two places the client can go away and cleared at the
+# one place it comes back, so every reader agrees on how long it has been out.
+_firestore_down_since_ts = None
+
+
+def _mark_firestore_down(now=None) -> None:
+    """Start the outage clock, if it is not already running.
+
+    Idempotent on purpose: the heartbeat's drop and the reconnect loop's first
+    look at a down client are both legitimate observers of the SAME outage,
+    and whichever gets there first is the one that has the right time.
+    """
+    global _firestore_down_since_ts
+    if _firestore_down_since_ts is None:
+        _firestore_down_since_ts = float(now if now is not None else time.time())
+        # ⛔⛔ INSIDE the edge branch, and that placement is the whole thing. The
+        # reconnect loop calls this on EVERY down tick — 4,921 times in the
+        # measured incident — so an emit on the call rather than the transition
+        # would flood the rate limit and evict the pairing events that explain
+        # the outage.
+        # ⛔ NO CAUSE IS CLAIMED HERE, and the first draft of this line claimed
+        # one — it read a `_firestore_down_reason` global that does not exist,
+        # which would have raised a NameError on the one code path that only
+        # runs while the product is already broken. Caught by this wave's own
+        # test. At mark time nothing knows WHY the client went away; the reason
+        # is the reconnect loop's knowledge, and the doctor's network verdict is
+        # what names DNS. Reporting a fabricated cause is worse than reporting
+        # none.
+        tm.tm_emit(tm.Ev.FIRESTORE_OUTAGE_STARTED, worker=WORKER_ID,
+                   error_class=(tm.ErrorClass.AUTH_REVOKED
+                                if globals().get("_firebase_down_reason") == "revoked"
+                                else None))
+
+
+def _clear_firestore_down() -> None:
+    """Stop the clock. Called from the one place a client is successfully built,
+    so a reconnect on ANY path — boot, heartbeat drop, respawn — ends the
+    outage exactly once."""
+    global _firestore_down_since_ts
+    if _firestore_down_since_ts is not None:
+        # Same edge discipline on the way back up: this is called from the one
+        # place a client is built, which happens on every reconnect attempt.
+        tm.tm_emit(tm.Ev.FIRESTORE_OUTAGE_ENDED, worker=WORKER_ID,
+                   duration_ms=int((time.time() - _firestore_down_since_ts) * 1000))
+    _firestore_down_since_ts = None
+
+
+def _firestore_outage_notice(*, down_for, attempts, last_spoken_ago,
+                             host=FIRESTORE_HOST,
+                             speaks_after_s=FIRESTORE_OUTAGE_SPEAKS_AFTER_S,
+                             repeat_s=FIRESTORE_OUTAGE_REPEAT_S) -> "list[str]":
+    """The lines to say about an ongoing outage, or `[]` to stay quiet.
+
+    Quiet while the outage is still short enough that the ladder will very
+    likely clear it, and quiet again for `repeat_s` after each time it has
+    been said. `last_spoken_ago` is None when it has not been said yet in
+    this outage.
+
+    Returns a LIST because `log()` is one `print` per call: a multi-line
+    string would leave every line after the first without a timestamp or a
+    level, which is precisely the sort of log nobody can grep.
+    """
+    try:
+        elapsed = float(down_for or 0)
+    except (TypeError, ValueError):
+        elapsed = 0.0
+    if elapsed < float(speaks_after_s):
+        return []
+    if last_spoken_ago is not None:
+        try:
+            if float(last_spoken_ago) < float(repeat_s):
+                return []
+        except (TypeError, ValueError):
+            return []
+    n = max(1, int(attempts or 1))
+    return [
+        f"[firestore] This machine cannot reach {host} — "
+        f"{_outage_duration_text(elapsed)} of failed reconnects "
+        f"({n} attempt{'' if n == 1 else 's'}).",
+        f"[firestore] While that is true the web app shows this computer "
+        f"offline and any research fired at it will not arrive here. Your "
+        f"pairing is fine — there is nothing to re-pair.",
+        f"[firestore] This is the network rather than Super Research: a VPN or "
+        f"corporate proxy, a firewall, or DNS (a Pi-hole or resolver that will "
+        f"not answer for {host}).",
+        f"[firestore] Check it with:  nslookup {host}  — then leave this "
+        f"running. It reconnects by itself within seconds of the network "
+        f"coming back; you do not need to restart anything.",
+        # ⭐ Owner, 2026-08-17: every failure a person can be left holding must
+        # also say how to hand it over. `--doctor` is named because it is the
+        # thing that turns "one of four suspects" into "this one".
+        f"[firestore] To find out WHICH of those it is, run  {_PROG} --doctor  "
+        f"on this machine. {_doctor_share_logs_line()}",
+    ]
 
 
 async def _firebase_reconnect_loop():
@@ -5506,6 +6683,11 @@ async def _firebase_reconnect_loop():
     global _last_loop_tick_ms, _firebase_down_reason
     BACKOFF = (5, 5, 10, 30)
     idx = 0
+    # The outage's own bookkeeping. `attempts` counts rebuild attempts rather
+    # than reusing `idx`, which stops climbing once the backoff caps — so the
+    # old retry line read the same at attempt 4 and attempt 4,921.
+    attempts = 0
+    spoke_at = None
     # After a reconnect, re-bind listeners via a clean respawn — deferred while a
     # run is active so we never os._exit a live browser (a local /api/runs submit
     # can start one even with Firestore down). (#718)
@@ -5519,6 +6701,20 @@ async def _firebase_reconnect_loop():
             _last_loop_tick_ms = int(time.time() * 1000)
             if _firebase_db is not None:
                 idx = 0
+                attempts = 0
+                spoke_at = None
+                # ⭐ Firestore is up on THIS worker, so this is the moment a
+                # parked bundle row can land. ⛔ Deliberately not hung off the
+                # outage-cleared edge: a `--send-logs` run from the terminal has
+                # no Firestore client at all, so it parks its row even when
+                # nothing was ever down — and an edge that never fires is no
+                # trigger. Runs on every worker, and costs one missing-file stat
+                # when there is nothing parked.
+                _drain_queued_log_bundle_rows()
+                # ⛔ Drains on EVERY worker. The worker-1 heartbeat loop is
+                # gated `WORKER_ID == 1`, so a worker-2 spool anchored there
+                # would never go out at all.
+                tm.flush_in_background()
                 if pending_respawn and not _QUEUE_STATE.get("running"):
                     # ⛔ IDLE IS NOT THE SAME AS FINISHED. `running` flips false
                     # in the worker's `finally`, which is BEFORE the two POSTs
@@ -5564,8 +6760,29 @@ async def _firebase_reconnect_loop():
                 continue
             # Down + transient → rebuild the client. Live refresh in a thread so
             # a slow/hung DNS resolve can't stall this loop.
+            #
+            # The clock is normally started by the heartbeat that dropped the
+            # client; this covers the cases with no drop to observe — a boot
+            # where init never succeeded, and workers 2+, which have no
+            # heartbeat of their own.
+            _mark_firestore_down()
+            attempts += 1
+            # Snapshot before the rebuild: a SUCCESSFUL init_firebase clears the
+            # clock, so this is the last moment the duration still exists.
+            _down_started = _firestore_down_since_ts
             ok = await asyncio.to_thread(init_firebase)
             if ok:
+                if spoke_at is not None:
+                    # We told the operator this machine was cut off. Say that it
+                    # is not, or the last word the log ever has on the subject
+                    # is the alarm.
+                    log(f"[firestore] Reachable again after "
+                        f"{_outage_duration_text(time.time() - (_down_started or time.time()))}"
+                        f" and {attempts} attempt{'' if attempts == 1 else 's'} — this "
+                        f"computer is back online in the web app. Nothing to do.",
+                        "INFO")
+                spoke_at = None
+                attempts = 0
                 idx = 0
                 # Client rebuilt in-process — heartbeat + writes resume now. Then
                 # re-bind listeners via a clean respawn (immediately if idle;
@@ -5586,7 +6803,21 @@ async def _firebase_reconnect_loop():
                     continue
                 wait = BACKOFF[min(idx, len(BACKOFF) - 1)]
                 idx += 1
-                log(f"[reconnect] Firestore still unreachable — retrying init in {wait}s", "WARN")
+                _down_for = (time.time() - _firestore_down_since_ts
+                             if _firestore_down_since_ts else 0.0)
+                # Naming the elapsed time and the attempt is what makes a blip
+                # and a dead network different lines instead of the same one.
+                log(f"[reconnect] Firestore unreachable for "
+                    f"{_outage_duration_text(_down_for)} (attempt {attempts}) — "
+                    f"retrying in {wait}s", "WARN")
+                _notice = _firestore_outage_notice(
+                    down_for=_down_for, attempts=attempts,
+                    last_spoken_ago=(None if spoke_at is None
+                                     else time.time() - spoke_at))
+                for _line in _notice:
+                    log(_line, "ERROR")
+                if _notice:
+                    spoke_at = time.time()
                 await asyncio.sleep(wait)
         except asyncio.CancelledError:
             return
@@ -6195,6 +7426,360 @@ def _handle_check_update_command(device_id: str) -> None:
         log(f"[device-cmds] check-update publish skipped: {e}", "DEBUG")
 
 
+# ─── send-logs: the device command behind the app's button ─────────────
+# ⭐ Consent and rate limiting live HERE, at the only chokepoint every trigger
+# shares, and not in the app's modal. A modal-only gate is bypassable by any
+# future command writer — and "any future command writer" includes the next
+# person to add a button.
+SEND_LOGS_COOLDOWN_SEC = 10 * 60
+# ⛔ ONE named constant for the upload ceiling, read by the local pre-check
+# below AND pinned against the storage rule by
+# `test_the_upload_ceiling_matches_the_storage_rule`. Without that pairing a
+# cap-403 is reachable, and the retry ladder treats a 403 as claim-propagation
+# — so a terminal refusal would be retried to exhaustion and then reported as a
+# transient failure.
+BUNDLE_UPLOAD_MAX_BYTES = 64 * 1024 * 1024
+# What the UNAUTHENTICATED route accepts. Smaller than the authenticated cap on
+# purpose — it is an open door, and the route enforces the same number on bytes
+# actually READ. ⚠ The platform's real request-body ceiling is unverified until
+# one staging call at ship time; that is declared debt, not an assumption.
+BUNDLE_INGEST_MAX_BYTES = 16 * 1024 * 1024
+# Crockford base32: no I, L, O or U, so a code read aloud over a support call
+# cannot come back as a different one.
+_SUPPORT_CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+_SUPPORT_CODE_RE = re.compile(r"^[0-9A-HJKMNP-TV-Z]{8}$")
+_SEND_LOGS_LOCK = _log_threading.Lock()
+_send_logs_inflight = False
+
+
+def _mint_support_code() -> str:
+    """Eight characters of Crockford base32 from the system CSPRNG.
+
+    ⭐ Unguessable on purpose: the code is the object folder name, so it is also
+    the read capability for an unpaired upload that no account owns yet."""
+    import secrets
+    return "".join(secrets.choice(_SUPPORT_CODE_ALPHABET) for _ in range(8))
+
+
+def _send_logs_stamp_path() -> "Path":
+    return _STATE_DIR / "send-logs-last.json"
+
+
+def _send_logs_cooldown_remaining(now=None, cooldown=SEND_LOGS_COOLDOWN_SEC) -> int:
+    """Seconds left before another bundle may be built.
+
+    ⛔ Read from a LOCAL file, never from Firestore. The machine this feature
+    exists for could not reach Firestore at all — a rate limit that needs the
+    network to evaluate stops working exactly when the button starts being
+    pressed."""
+    try:
+        stamp = json.loads(_send_logs_stamp_path().read_text(encoding="utf-8"))
+        last = float(stamp.get("at") or 0)
+    except Exception:
+        return 0
+    elapsed = (time.time() if now is None else float(now)) - last
+    return max(0, int(cooldown - elapsed))
+
+
+def _stamp_send_logs_attempt(now=None) -> None:
+    """Record the attempt BEFORE doing the work.
+
+    ⭐ Order is the guard: a process killed halfway through a bundle has already
+    spent its turn, so the next press is still refused. Stamping on success
+    would make "kill it and press again" an unlimited loop."""
+    try:
+        _atomic_write_json(_send_logs_stamp_path(),
+                           {"at": (time.time() if now is None else float(now))})
+    except Exception:
+        pass
+
+
+def _log_bundle_doc_path(owner_uid: str, code: str) -> str:
+    return f"users/{owner_uid}/logBundles/{code}"
+
+
+def _open_log_bundle_row(owner_uid: str, code: str, device_id: str,
+                         request_id: str = "") -> bool:
+    """Create the row, always at 'collecting'.
+
+    ⛔⛔ EVERY ROW STARTS HERE, and that is not a style choice — the rule only
+    permits a CREATE whose status is 'collecting'
+    (firestore.rules, the logBundles block). Three writers used to create rows
+    directly at 'failed' or 'done' and every one of them was denied in
+    production while both test suites stayed green: the rules suite proved the
+    guard, the backend suite proved the writer against a fake that accepts
+    anything, and nothing ran the writer against the rule. Measured against the
+    live emulator on 2026-08-18.
+
+    ⭐ It is also the more truthful shape. A refusal becomes "received, then
+    refused" rather than a verdict with no request in front of it, and a send
+    whose process dies mid-upload leaves a row that honestly says 'collecting'
+    instead of nothing at all."""
+    return _write_log_bundle_status(
+        owner_uid, code,
+        {"status": "collecting", "deviceId": device_id, "requestId": request_id},
+        create=True)
+
+
+def _write_log_bundle_status(owner_uid: str, code: str, patch: dict,
+                             create: bool = False) -> bool:
+    """Move the owner-only index row along. Best-effort by design: a status
+    write that fails must not abort an upload that is working.
+
+    ⛔ `create=True` is reserved for `_open_log_bundle_row`. Any other status
+    handed to it is refused by the rule, silently, and the caller sees only a
+    WARN — see that function."""
+    if not _firebase_db or not owner_uid or not code:
+        return False
+    from datetime import timedelta, timezone
+    body = dict(patch)
+    body["updatedAt"] = datetime.now(timezone.utc)
+    if create:
+        body.setdefault("code", code)
+        body.setdefault("createdAt", datetime.now(timezone.utc))
+        body.setdefault("expireAt",
+                        datetime.now(timezone.utc) + timedelta(days=BUNDLE_MAX_AGE_DAYS))
+        body.setdefault("buildId", _sr_version())
+    try:
+        ref = (_firebase_db.collection("users").document(owner_uid)
+               .collection("logBundles").document(code))
+        payload = _be_payload(body)
+        _grpc_write_with_heal(
+            (lambda: ref.set(payload)) if create else (lambda: ref.update(payload)),
+            what="log_bundle_status")
+        return True
+    except Exception as exc:
+        log(f"[send-logs] status write failed ({type(exc).__name__}) — the upload "
+            f"continues; the row will look stale", "WARN")
+        return False
+
+
+def _upload_log_bundle_via_storage_rest(local_path: "Path", owner_uid: str,
+                                        device_id: str, code: str) -> "str | None":
+    """Upload one support bundle. Returns the object path, or None.
+
+    Clones the audio REST path with two deliberate differences:
+      • Content-Type is set UNCONDITIONALLY. `requests` sends no content type for
+        a raw file body, and the storage rule pins it — so an omitted header
+        403s our own honest upload and the ladder retries a terminal error as a
+        transient one.
+      • The size is checked LOCALLY against the same constant the rule uses, so
+        a cap-403 is unreachable rather than merely unlikely.
+    """
+    import requests as _requests
+    import time as _t
+    from urllib.parse import quote as _quote
+
+    if not _SUPPORT_CODE_RE.match(str(code or "")):
+        log("[send-logs] refusing upload: support code is not the expected shape", "WARN")
+        return None
+    try:
+        size = Path(local_path).stat().st_size
+    except OSError as exc:
+        log(f"[send-logs] bundle unreadable: {exc}", "WARN")
+        return None
+    if size > BUNDLE_UPLOAD_MAX_BYTES:
+        log(f"[send-logs] bundle is {size} bytes, over the {BUNDLE_UPLOAD_MAX_BYTES} "
+            f"ceiling — refusing locally rather than taking a 403", "WARN")
+        return None
+
+    bucket = _resolve_storage_bucket()
+    if not bucket:
+        log("[send-logs] FIREBASE_STORAGE_BUCKET unresolved — cannot upload", "WARN")
+        return None
+    id_token = _fresh_user_mode_id_token()
+    if not id_token:
+        log("[send-logs] no usable ID token — the authenticated path is dead", "WARN")
+        return None
+
+    object_path = f"logs/{owner_uid}/{device_id}/{code}/bundle.zip"
+    upload_url = (
+        f"https://firebasestorage.googleapis.com/v0/b/{bucket}/o"
+        f"?uploadType=media&name={_quote(object_path, safe='')}"
+    )
+
+    def _do_upload(_id_token: str):
+        try:
+            with open(local_path, "rb") as fh:
+                return _requests.post(
+                    upload_url,
+                    headers={
+                        "Authorization": f"Firebase {_id_token}",
+                        "Content-Type": BUNDLE_CONTENT_TYPE,
+                    },
+                    data=fh,
+                    timeout=180,
+                )
+        except _requests.RequestException as exc:
+            log(f"[send-logs] upload network error: {exc}", "WARN")
+            return None
+
+    resp = _do_upload(id_token)
+    for _delay in _STORAGE_REST_RETRY_DELAYS:
+        _status = resp.status_code if resp is not None else None
+        if not _storage_rest_should_retry(_status):
+            break
+        _t.sleep(_delay)
+        _retry_token = _fresh_user_mode_id_token()
+        if not _retry_token:
+            break
+        log(f"[send-logs] transient upload outcome ({_status}) — re-minted token, "
+            f"retrying after {_delay:.1f}s")
+        resp = _do_upload(_retry_token)
+
+    if resp is None:
+        return None
+    if resp.status_code != 200:
+        log(f"[send-logs] upload failed: HTTP {resp.status_code} "
+            f"{str(resp.text)[:200]}", "ERROR")
+        return None
+    log(f"[send-logs] bundle uploaded ({size} bytes) → {object_path}")
+    return object_path
+
+
+def _parse_bundle_runs(data: dict, limited: bool) -> "int | None":
+    """How many runs this command asked for, or None meaning "refuse".
+
+    ⛔⛔ THE DEFAULT IS DECIDED BY THE ACTION NAME, not by the field. On the FULL
+    action an absent `runs` means "this machine's own cap" — that is what the
+    action means. On the LIMITED action the whole point is a number, so anything
+    unreadable REFUSES rather than falling back: falling back would resolve every
+    malformed request toward MORE collection than was agreed to, which is the one
+    direction this must never fail in.
+
+    ⭐ `bool` is checked before `int` because `True` IS an `int` in Python, and a
+    command carrying `runs: true` would otherwise be honoured as "1 run" — a
+    number nobody chose."""
+    raw = data.get("runs")
+    if not limited:
+        return BUNDLE_MAX_RUNS
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None
+    if raw < BUNDLE_MIN_RUNS:
+        return None
+    # Above the cap clamps DOWN — the safe direction — and `runsApplied` on the
+    # row then states what actually happened.
+    return min(int(raw), BUNDLE_MAX_RUNS)
+
+
+def _handle_send_logs_command(data: dict, device_id: str, limited: bool = False) -> None:
+    """Build and upload a support bundle for the app's Send Logs button.
+
+    Runs on a DAEMON THREAD, and that is new machinery rather than a copy of
+    something: the snapshot callback is synchronous, and a tens-of-seconds
+    inline upload would queue `restart` / `hard_reset` behind it and straight
+    into the 30-second stale reaper. The update handler delegates to a detached
+    PROCESS, so there is no in-repo thread precedent to imitate honestly.
+
+    Guards, in order, all refusing rather than proceeding on doubt:
+      1. the support code's shape (it is a path segment and a capability),
+      2. owner-only — refuse on a device read failure, refuse a missing
+         submitter, refuse a submitter who is not the owner,
+      3. consent — refuse unless the command carries consent == True,
+      4. cooldown, from a local stamp written BEFORE the work,
+      5. single-flight, so two presses cannot build two bundles at once.
+    """
+    global _send_logs_inflight
+    code = str(data.get("code") or "").strip().upper()
+    request_id = str(data.get("requestId") or "")[:64]
+    if not _SUPPORT_CODE_RE.match(code):
+        log("[send-logs] refusing: no valid support code in the command", "WARN")
+        return
+
+    try:
+        dev = _firebase_db.collection("devices").document(device_id).get().to_dict() or {}
+    except Exception as exc:
+        log(f"[send-logs] refusing: device read failed ({exc})", "WARN")
+        return
+    owner_uid = dev.get("ownerUid")
+    submitted_by = data.get("submittedBy")
+    if not owner_uid:
+        log("[send-logs] refusing: this device has no recorded owner", "WARN")
+        return
+    if not submitted_by:
+        log("[send-logs] refusing: the command names no submitter", "WARN")
+        return
+    if submitted_by != owner_uid:
+        log("[send-logs] refusing: submittedBy is not the device owner", "WARN")
+        return
+
+    # ⛔ SINK-SIDE CONSENT. The app shows a modal naming everything that leaves
+    # the machine, but a modal is a property of one caller. This is the property
+    # of the machine.
+    if data.get("consent") is not True:
+        log("[send-logs] refusing: the request carries no recorded consent", "WARN")
+        _open_log_bundle_row(owner_uid, code, device_id, request_id)
+        _write_log_bundle_status(owner_uid, code,
+                                {"status": "failed", "errorClass": "ConsentMissing"})
+        return
+
+    runs = _parse_bundle_runs(data, limited)
+    if runs is None:
+        log("[send-logs] refusing: the request named an unreadable number of runs",
+            "WARN")
+        _open_log_bundle_row(owner_uid, code, device_id, request_id)
+        _write_log_bundle_status(owner_uid, code,
+                                {"status": "failed", "errorClass": "RunsInvalid"})
+        return
+
+    remaining = _send_logs_cooldown_remaining()
+    if remaining:
+        log(f"[send-logs] refusing: another bundle was built recently "
+            f"({remaining}s left on the cooldown)", "WARN")
+        _open_log_bundle_row(owner_uid, code, device_id, request_id)
+        _write_log_bundle_status(owner_uid, code,
+                                {"status": "failed", "errorClass": "CooldownActive"})
+        return
+
+    with _SEND_LOGS_LOCK:
+        if _send_logs_inflight:
+            log("[send-logs] refusing: a bundle is already being built", "WARN")
+            return
+        _send_logs_inflight = True
+
+    def _work() -> None:
+        global _send_logs_inflight
+        try:
+            _stamp_send_logs_attempt()
+            _open_log_bundle_row(owner_uid, code, device_id, request_id)
+            dest = _logs_root() / "outgoing" / f"support-{code}{BUNDLE_SUFFIX}"
+            summary = _build_log_bundle(dest, support_code=code, max_runs=runs)
+            _write_log_bundle_status(owner_uid, code, {
+                "status": "uploading",
+                "runCount": int(summary["runCount"]),
+                "sessionCount": int(summary["sessionCount"]),
+                "sizeBytes": int(summary["sizeBytes"]),
+                # From the BUILDER, so a dropped max_runs= cannot leave this
+                # reading like a bound that was honoured.
+                "runsApplied": int(summary["maxRunsApplied"]),
+            })
+            object_path = _upload_log_bundle_via_storage_rest(
+                dest, owner_uid, device_id, code)
+            if object_path:
+                _write_log_bundle_status(owner_uid, code, {
+                    "status": "done", "objectPath": object_path,
+                    "runCount": int(summary["runCount"]),
+                    "sessionCount": int(summary["sessionCount"]),
+                    "sizeBytes": int(summary["sizeBytes"]),
+                    "runsApplied": int(summary["maxRunsApplied"]),
+                })
+            else:
+                _write_log_bundle_status(owner_uid, code, {
+                    "status": "failed", "errorClass": "UploadFailed"})
+        except Exception as exc:
+            log(f"[send-logs] bundle failed: {type(exc).__name__}: {exc}", "ERROR")
+            _write_log_bundle_status(owner_uid, code, {
+                "status": "failed", "errorClass": type(exc).__name__})
+        finally:
+            # ⭐ The local copy stays. It is the floor the whole design rests on:
+            # if nothing could be uploaded, the user still has a file to attach
+            # by hand, and `--doctor` prints where it is.
+            with _SEND_LOGS_LOCK:
+                _send_logs_inflight = False
+
+    _log_threading.Thread(target=_work, name="send-logs", daemon=True).start()
+
+
 def _handle_update_command(data: dict, device_id: str, loop) -> None:
     """App-driven remote backend update (owner-only `update` device command).
     Runs on WORKER_ID==1 only. Reuses `_perform_self_update`; forces THIS worker
@@ -6470,7 +8055,15 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                     doc.reference.update({"processed": True})
                 except Exception as _de:
                     log(f"[device-cmds] processed-marker write failed for {doc.id}: {_de}", "DEBUG")
-            elif action in ("update", "check-update", "restart") and WORKER_ID != 1:
+            elif action in ("update", "check-update", "restart",
+                            SEND_LOGS_ACTION,
+                            # ⛔⛔ THE LIMITED ACTION MUST BE IN THIS TUPLE. An
+                            # action outside it falls to the `else` and is
+                            # DELETED by every non-primary worker — so on a
+                            # multi-worker host worker 2 destroys the command
+                            # before worker 1 ever sees it, and the feature ships
+                            # dead with nothing failing anywhere.
+                            SEND_LOGS_LIMITED_ACTION) and WORKER_ID != 1:
                 # Only worker 1 ACTS on `update` / `check-update`. A sibling worker
                 # must NOT delete the doc here — deleting it before worker 1's
                 # Firestore stream delivers the ADDED could drop the command with no
@@ -7052,6 +8645,30 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                     _handle_check_update_command(device_id)
                 continue
 
+            if action in (SEND_LOGS_ACTION, SEND_LOGS_LIMITED_ACTION):
+                # App-driven support bundle (owner-only). Single actor: worker 1
+                # only, gated in the SAME tuple above — without that gate every
+                # non-1 worker races the archive build, and a sibling's
+                # tail-delete of the doc can be coalesced away inside a
+                # stream-resync window, dropping the command with no replay.
+                # Both failure modes are described in that block's own comments.
+                #
+                # The handler returns immediately and does the work on a daemon
+                # thread: this callback is synchronous, so a tens-of-seconds
+                # upload here would queue restart / hard_reset behind it and into
+                # the 30s stale reaper.
+                # ⭐ TWO ACTION NAMES, and that is the whole skew mechanism. A
+                # build that predates this feature does not recognise the limited
+                # one: it deletes the doc and matches no branch, so the outcome is
+                # "nothing left the machine" rather than "more left than the
+                # person agreed to". The app watches the command doc's deletion as
+                # the receipt and says so.
+                if WORKER_ID == 1:
+                    _handle_send_logs_command(
+                        data, device_id,
+                        limited=(action == SEND_LOGS_LIMITED_ACTION))
+                continue
+
             if action == "restart":
                 # App-driven plain restart (About-page fallback Restart button). Exists
                 # for ONE case: an upgrade whose files landed but whose restart leg
@@ -7293,6 +8910,362 @@ def _wait_for_uploads_to_settle(max_wait_s: float = 5.0, poll_s: float = 0.1) ->
         _t.sleep(poll_s)
     with _inflight_uploads_lock:
         return _inflight_uploads
+
+
+# ─── The support bundle ────────────────────────────────────────────────
+# What a user sends when they ask for help. ⭐ BOTH signed-off bounds apply as
+# an INTERSECTION, not as a "whichever is smaller" branch: a count has no time
+# bound (thirty runs can span a year) and an age bound has no size bound (a
+# busy fortnight can be hundreds). Drop everything past the age bound, then
+# keep the newest N of what is left.
+#
+# ⭐⭐ AND IT IS NOT ONLY RUNS. The founding incident produced NO RUN — a paired
+# machine whose Google DNS died — so a bundle organised purely per-run would
+# have contained zero evidence of the failure it exists to explain. Sessions
+# (pair/login/doctor) and byte-tails of the raw device logs ride along.
+def _bundle_contract() -> dict:
+    """The numbers and action names both repos must agree on.
+
+    ⭐ A FILE rather than two literals. The maximum slider position in the web
+    app sends the FULL action, which means "this machine's own cap" — so if the
+    two repos disagree about that number, the control's default position states
+    one thing and the machine does another, and nothing anywhere fails. Read at
+    import with a literal fallback, because a missing file must not stop a
+    backend from running."""
+    try:
+        return json.loads(
+            (Path(__file__).resolve().parent / "bundle-contract.json")
+            .read_text(encoding="utf-8"))
+    except Exception:
+        return {"maxRuns": 30, "maxAgeDays": 30, "minRuns": 1,
+                "actions": {"full": "send-logs", "limited": "send-logs-limited"}}
+
+
+_BUNDLE_CONTRACT = _bundle_contract()
+BUNDLE_MAX_RUNS = int(_BUNDLE_CONTRACT["maxRuns"])
+BUNDLE_MIN_RUNS = int(_BUNDLE_CONTRACT.get("minRuns", 1))
+SEND_LOGS_ACTION = str(_BUNDLE_CONTRACT["actions"]["full"])
+SEND_LOGS_LIMITED_ACTION = str(_BUNDLE_CONTRACT["actions"]["limited"])
+BUNDLE_MAX_AGE_DAYS = int(_BUNDLE_CONTRACT["maxAgeDays"])
+BUNDLE_MAX_BYTES = 128 * 1024 * 1024
+BUNDLE_SYSTEM_TAIL_BYTES = 5 * 1024 * 1024
+# ⚠ ZIP, not tar.gz. The plan said both in different places; zip wins because
+# the stated reason — a developer opening one run's log without unpacking a
+# whole stream — only holds for a random-access archive. So the upload content
+# type is `application/zip` everywhere, and `BUNDLE_CONTENT_TYPE` is the ONE
+# name the storage rule, the pre-check and the request header all read.
+BUNDLE_CONTENT_TYPE = "application/zip"
+BUNDLE_SUFFIX = ".zip"
+
+
+def _dir_size(path) -> int:
+    total = 0
+    try:
+        for p in Path(path).rglob("*"):
+            if p.is_file():
+                try:
+                    total += p.stat().st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
+
+
+def _scan_run_folders(root=None) -> "list[dict]":
+    """One row per run folder, read from `meta.json`.
+
+    ⛔ The metas ARE the index. A separate index file is a second source that
+    desyncs from the folders the moment one write fails — and the folder that
+    goes missing from a desynced index is the crashed one, because that is the
+    write that failed."""
+    base = Path(root) if root is not None else _runs_log_root()
+    rows = []
+    try:
+        folders = [p for p in base.iterdir() if p.is_dir()]
+    except OSError:
+        return rows
+    for folder in folders:
+        meta = {}
+        try:
+            meta = json.loads((folder / "meta.json").read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+        started = _epoch_from_iso(meta.get("startedUtc")) or _safe_mtime(folder)
+        rows.append({
+            "dir": folder,
+            "name": folder.name,
+            "startedEpoch": started,
+            "startedUtc": meta.get("startedUtc") or "",
+            "status": _derive_run_status(meta) if meta else "unknown",
+            "storedStatus": meta.get("status") or "unknown",
+            "researchId": meta.get("researchId"),
+            "parentResearchId": meta.get("parentResearchId"),
+            "attempt": meta.get("attempt", 0),
+            "durationSec": meta.get("durationSec"),
+            "counters": meta.get("counters") or {},
+            "events": meta.get("events", 0),
+            "worker": meta.get("worker"),
+            "build": meta.get("build"),
+            "sizeBytes": _dir_size(folder),
+        })
+    rows.sort(key=lambda r: r["startedEpoch"], reverse=True)
+    return rows
+
+
+def _select_bundle_runs(rows, max_runs=BUNDLE_MAX_RUNS,
+                        max_age_days=BUNDLE_MAX_AGE_DAYS, now=None) -> "list[dict]":
+    """Which runs go in the bundle. Pure: rows in, rows out, no filesystem —
+    so the entire retention policy is testable without building an archive.
+
+    ⛔ Never a branch that PICKS one bound. Both apply, always, in this order."""
+    cutoff = (time.time() if now is None else float(now)) - float(max_age_days) * 86400.0
+    fresh = [r for r in rows if float(r.get("startedEpoch") or 0) >= cutoff]
+    fresh.sort(key=lambda r: float(r.get("startedEpoch") or 0), reverse=True)
+    return fresh[:max(0, int(max_runs))]
+
+
+def _select_bundle_sessions(root=None, max_age_days=BUNDLE_MAX_AGE_DAYS,
+                            now=None) -> "list[list[Path]]":
+    """Session files, grouped with their overflow segments, age-bound ONLY.
+
+    ⭐ Counted separately from runs and deliberately not count-bound: the
+    founding incident's evidence is a pairing session, and it is precisely the
+    machine with no runs that has nothing else to send."""
+    base = Path(root) if root is not None else _sessions_log_root()
+    cutoff = (time.time() if now is None else float(now)) - float(max_age_days) * 86400.0
+    groups: "dict[str, list[Path]]" = {}
+    try:
+        files = [p for p in base.iterdir() if p.is_file()]
+    except OSError:
+        return []
+    for path in files:
+        groups.setdefault(re.sub(r"\.overflow\d+$", "", path.name), []).append(path)
+    out = []
+    for _base, members in groups.items():
+        if max(_safe_mtime(p) for p in members) >= cutoff:
+            out.append(sorted(members, key=lambda p: p.name))
+    out.sort(key=lambda members: max(_safe_mtime(p) for p in members), reverse=True)
+    return out
+
+
+def _system_log_tails(root=None) -> "list[Path]":
+    """The raw device logs, in the order a reader wants them.
+
+    Grandfathering: a machine that has been running since before per-run
+    capture existed has ALL of its history here and none of it in runs/. And
+    the uvicorn access/error stream lives nowhere else."""
+    base = Path(root) if root is not None else _logs_root()
+    wanted = []
+    try:
+        for path in sorted(base.iterdir()):
+            if not path.is_file():
+                continue
+            name = path.name
+            if re.match(r"^backend(-\d+)?\.(err\.)?log(\.1)?$", name) or \
+               re.match(r"^supervisor.*\.log(\.1)?$", name):
+                wanted.append(path)
+    except OSError:
+        pass
+    return wanted
+
+
+def _tail_bytes(path, limit=BUNDLE_SYSTEM_TAIL_BYTES) -> bytes:
+    """The last `limit` bytes, cut forward to the next newline so the first
+    line of the tail is a whole line rather than a fragment."""
+    try:
+        size = Path(path).stat().st_size
+        with open(path, "rb") as fh:
+            if size > limit:
+                fh.seek(size - limit)
+                chunk = fh.read()
+                nl = chunk.find(b"\n")
+                return chunk[nl + 1:] if 0 <= nl < len(chunk) - 1 else chunk
+            return fh.read()
+    except OSError:
+        return b""
+
+
+def _bundle_source_is_allowed(path) -> bool:
+    """⛔ THE COLLECTOR ALLOWLIST. Every byte in the archive comes from under
+    `~/.super-research/logs/`, and the consent screen's promise that we are not
+    collecting passwords, cookies or profile data is GATED on this holding. A
+    collector that can be pointed anywhere is a collector that eventually is."""
+    try:
+        Path(path).resolve().relative_to(_logs_root().resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _build_log_bundle(dest_path, support_code=None, now=None,
+                      max_runs=BUNDLE_MAX_RUNS, max_age_days=BUNDLE_MAX_AGE_DAYS,
+                      max_bytes=BUNDLE_MAX_BYTES) -> dict:
+    """Write the support bundle to `dest_path`. Returns a summary dict.
+
+    Order inside the archive is the order a reader needs it: the manifest and
+    the index first, then the newest run, then the rest newest-first, then
+    sessions, then the raw tails. The size cap drops from the OLD end, and the
+    newest run is added before the cap can bite — a bundle that dropped the run
+    the user is complaining about would be worse than no bundle."""
+    import zipfile as _zipfile
+
+    dest = Path(dest_path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    rows = _scan_run_folders()
+    selected = _select_bundle_runs(rows, max_runs=max_runs,
+                                   max_age_days=max_age_days, now=now)
+    sessions = _select_bundle_sessions(max_age_days=max_age_days, now=now)
+
+    written = 0
+    dropped_runs: "list[str]" = []
+    dropped_sessions: "list[str]" = []
+    refused: "list[str]" = []
+    included_runs: "list[str]" = []
+    session_count = 0
+
+    def _add_file(zf, source, arcname) -> bool:
+        """Allowlist, then write, then account. ⛔ There is deliberately NO
+        per-file size check here: the cap decides per RUN and per SESSION GROUP
+        above, and a second per-file check was proved unreachable by mutation —
+        dead code that reads as protection is worse than none."""
+        nonlocal written
+        src = Path(source)
+        if not _bundle_source_is_allowed(src):
+            refused.append(str(src))
+            return False
+        try:
+            size = src.stat().st_size
+        except OSError:
+            return False
+        try:
+            zf.write(str(src), arcname)
+        except OSError:
+            return False
+        written += size
+        return True
+
+    def _add_bytes(zf, data, arcname) -> None:
+        nonlocal written
+        zf.writestr(arcname, data)
+        written += len(data)
+
+    with _zipfile.ZipFile(dest, "w", compression=_zipfile.ZIP_DEFLATED) as zf:
+        index = [{k: v for k, v in row.items() if k != "dir"} for row in selected]
+        _add_bytes(zf, json.dumps({
+            "schema": 1,
+            "createdUtc": _utc_iso(),
+            "supportCode": support_code,
+            "build": _sr_version(),
+            "platform": sys.platform,
+            "installUuid": _install_uuid_best_effort(),
+            "bounds": {"maxRuns": int(max_runs), "maxAgeDays": int(max_age_days),
+                       "maxBytes": int(max_bytes),
+                       "systemTailBytes": BUNDLE_SYSTEM_TAIL_BYTES},
+            "runsOnDisk": len(rows),
+            "runsSelected": len(selected),
+        }, indent=1).encode("utf-8"), "manifest.json")
+        _add_bytes(zf, json.dumps(index, indent=1, default=str).encode("utf-8"),
+                   "index.json")
+
+        # ⛔ The cap decides per RUN, not per FILE. Found while driving the cap
+        # branch in CI: file-at-a-time, a folder's small meta.json fits and its
+        # 200 KB run.log does not — so the archive lists a run with no log in
+        # it, and the index says it is there. A run is whole or it is absent.
+        for position, row in enumerate(selected):
+            folder = Path(row["dir"])
+            newest = position == 0
+            try:
+                members = sorted(p for p in folder.rglob("*") if p.is_file())
+            except OSError:
+                members = []
+            folder_bytes = 0
+            for member in members:
+                try:
+                    folder_bytes += member.stat().st_size
+                except OSError:
+                    pass
+            if not newest and written + folder_bytes > int(max_bytes):
+                dropped_runs.append(row["name"])
+                continue
+            added_any = False
+            for member in members:
+                arc = f"runs/{row['name']}/{member.relative_to(folder).as_posix()}"
+                if _add_file(zf, member, arc):
+                    added_any = True
+            (included_runs if added_any else dropped_runs).append(row["name"])
+
+        # Sessions are grouped the same way, for the same reason: a session
+        # whose overflow tail is dropped is a session missing its ending, and
+        # the ending is the failure.
+        for members in sessions:
+            group_bytes = 0
+            for member in members:
+                try:
+                    group_bytes += member.stat().st_size
+                except OSError:
+                    pass
+            if written + group_bytes > int(max_bytes):
+                dropped_sessions.append(members[0].name)
+                continue
+            added_any = False
+            for member in members:
+                if _add_file(zf, member, f"sessions/{member.name}"):
+                    added_any = True
+            if added_any:
+                session_count += 1
+            else:
+                dropped_sessions.append(members[0].name)
+
+        for path in _system_log_tails():
+            if not _bundle_source_is_allowed(path):
+                refused.append(str(path))
+                continue
+            data = _tail_bytes(path)
+            if not data:
+                continue
+            if written + len(data) > int(max_bytes):
+                dropped_sessions.append(f"system/{path.name}")
+                continue
+            _add_bytes(zf, data, f"system/{path.name}")
+
+        _add_bytes(zf, json.dumps({
+            "runsIncluded": included_runs,
+            "runsDroppedForSize": dropped_runs,
+            "sessionsIncluded": session_count,
+            "droppedForSize": dropped_sessions,
+            "sourcesRefused": refused,
+            "uncompressedBytes": written,
+        }, indent=1).encode("utf-8"), "collected.json")
+
+    return {
+        "path": dest,
+        # ⭐ REPORTED BY THE BUILDER, not by whoever called it. The row's honesty
+        # depends on this being the bound the archive was actually cut with — if
+        # a caller's `max_runs=` kwarg is ever dropped, a value copied from the
+        # caller's own variable would still read as 30 while 30 runs shipped
+        # against a request for 3.
+        "maxRunsApplied": int(max_runs),
+        "sizeBytes": dest.stat().st_size if dest.exists() else 0,
+        "uncompressedBytes": written,
+        "runCount": len(included_runs),
+        "runsOnDisk": len(rows),
+        "sessionCount": session_count,
+        "droppedForSize": dropped_runs + dropped_sessions,
+        "sourcesRefused": refused,
+        "supportCode": support_code,
+    }
+
+
+def _install_uuid_best_effort() -> "str | None":
+    """The stable per-install id. ⭐ It is written before any pairing and
+    SURVIVES pairing, which is the only reason a bundle sent while pairing was
+    broken can be linked to the account once pairing works."""
+    try:
+        from auth.keystore import install_uuid
+        return install_uuid()
+    except Exception:
+        return None
 
 
 def _resolve_storage_bucket() -> str:
@@ -17637,6 +19610,13 @@ def emit_event(event_type, phase=None, agent=None, **data):
     """Emit a typed event to Firestore pipeline_events. (events.jsonl
     disk mirror was removed 2026-04-29 — Firestore is the single
     transport.)"""
+    # ⛔ THE TAP GOES ABOVE THE GUARD, and that placement is the point. A
+    # mirror behind `if not _tracks_dir: return` silently drops every event
+    # emitted outside a live Firestore run — including the ones from a run
+    # whose Firestore setup is the thing that failed. Keyed solely on
+    # sink-armed, and it forwards NAMES AND NUMBERS: never `**data`.
+    _run_sink_note_event(event_type, phase, agent)
+    _tm_note_event(event_type, phase, agent)
     if not _tracks_dir:
         return
     event = {
@@ -20727,11 +22707,6 @@ def _scrub_for_narrator(s: str) -> str:
 # ending with one of these as its last word is mid-sentence (e.g.
 # "Reading two sources from") — emit-time fragments worth rejecting so
 # the FE doesn't render a half-thought as the live agent line.
-_NARR_STOPWORD_TAILS = frozenset({
-    "from", "to", "of", "the", "with", "on", "in", "for", "and", "or",
-    "about", "by", "into", "over", "through", "as", "at",
-})
-
 # Refusal-style substrings — when present, the model is replying as a
 # chat assistant ("I don't have enough info, could you provide…") instead
 # of narrating. These leaked into the FE pre-2026-05-07 (screenshots
@@ -20768,19 +22743,57 @@ _HOST_DENYLIST = frozenset({
 })
 
 
+def _narration_last_sentence(s: str, limit: int | None = None) -> str:
+    """The longest prefix of `s` that ENDS a sentence, or "" if it has none.
+
+    ⭐⭐ 2026-08-17 — the owner's phase card showed five narration lines cut
+    mid-phrase ("ChatGPT is launching its deep", "Data thinness check: We"). Two
+    mechanisms produced them and this helper answers both:
+
+      * the narrator model returning a fragment, which the quality gate below
+        could not see because its length rule ANDed two conditions;
+      * a `[:140]` slice applied to the vision narration BEFORE that gate, so the
+        gate was inspecting damage the pipeline had just done rather than the
+        model's own output. A character count cannot know where a word ends.
+
+    A terminal mark is a '.' or '!' followed by end-of-string or whitespace — so
+    a hostname the narrator is told to cite ("docs.nvidia.com") is not mistaken
+    for the end of a sentence. '?' is not terminal here: the gate rejects
+    questions outright, and accepting one would smuggle it back in.
+
+    `limit` caps the returned length in characters, and it is the RIGHT way to
+    shorten narration: the answer is always a whole sentence or nothing, never a
+    word cut in half.
+    """
+    s = (s or "").strip()
+    if not s:
+        return ""
+    best = -1
+    for i, ch in enumerate(s):
+        if ch not in ".!":
+            continue
+        if i + 1 < len(s) and not s[i + 1].isspace():
+            continue
+        if limit is not None and i + 1 > limit:
+            break
+        best = i
+    return s[:best + 1].strip() if best >= 0 else ""
+
+
 def _is_acceptable_narration(s: str) -> bool:
     """Reject narration outputs that don't read as a single declarative
     sentence. Signals:
-    (1) under 5 words AND under 22 chars (catches 'Twenty', 'Engaged in')
-    (2) total length > 160 chars (prompt budget is 110/140 — overflow
+    (1) under 5 words OR under 22 chars (catches 'Twenty', 'Engaged in')
+    (2) NO COMPLETE SENTENCE IN IT — the 2026-08-17 report. A narration is
+        one declarative sentence and a sentence ends; a line that never
+        does was cut, wherever it was cut.
+    (3) total length > 160 chars (prompt budget is 110/140 — overflow
         signals the model is composing prose, not one sentence)
-    (3) `?` in the last 30 chars — declarative narrations don't end in
+    (4) `?` in the last 30 chars — declarative narrations don't end in
         a question
-    (4) leading WH-word (Could/Can/Would/Is/Are/...) — question shape
-    (5) refusal substrings ('I don't have', 'could you provide', ...) —
+    (5) leading WH-word (Could/Can/Would/Is/Are/...) — question shape
+    (6) refusal substrings ('I don't have', 'could you provide', ...) —
         the model is replying as a chat assistant, not narrating
-    (6) trailing stopword betraying a mid-sentence cut ('Reading two
-        sources from')
     (7) leading-tokenization artifact ('"d unambiguous...')
 
     On reject the caller should fall through to Tier-3 realistic
@@ -20790,7 +22803,19 @@ def _is_acceptable_narration(s: str) -> bool:
     if not s:
         return False
     words = s.split()
-    if len(words) < 5 and len(s) < 22:
+    # ⭐⭐ 2026-08-17 — WAS `and`, AND THAT IS THE HOLE THE OWNER PHOTOGRAPHED.
+    # Two guards joined by `and` mean neither can veto on its own, so a fragment
+    # that is short in WORDS but long enough in CHARACTERS sailed through:
+    # "ChatGPT is selecting its" is 4 words and 24 characters, and it was shown.
+    # Same defect shape as the two redundant guards this file removed in the
+    # 2026-08-06 wave — a condition that cannot change an answer alone.
+    if len(words) < 5 or len(s) < 22:
+        return False
+    # ⭐ A narration is ONE DECLARATIVE SENTENCE — that is what the prompt asks
+    # for, and a sentence ends. Without this, the only defence against a cut line
+    # is guessing from its last word, and the last word of "ChatGPT is launching
+    # its deep" is an ordinary adjective that no list could hold.
+    if not _narration_last_sentence(s):
         return False
     if len(s) > 160:
         return False
@@ -20803,9 +22828,19 @@ def _is_acceptable_narration(s: str) -> bool:
     for needle in _NARR_REFUSAL_SUBSTRINGS:
         if needle in s_lower:
             return False
-    last = words[-1].rstrip(".!,?:;").lower() if words else ""
-    if last in _NARR_STOPWORD_TAILS:
-        return False
+    # ⛔ 2026-08-17 — THE TRAILING-STOPWORD RULE IS GONE, and this is where it
+    # was. It guessed a mid-sentence cut from the last word against a list of
+    # seventeen prepositions, and the owner's screenshot is what a list of an
+    # open class lets through: "ChatGPT is launching its deep" ends on an
+    # ordinary adjective, and no list can hold those. Widening it to a closed
+    # word class was tried and then removed too — with the complete-sentence rule
+    # above, it can only ever fire on a line that rule has already refused, and a
+    # condition that cannot change an answer is one this file has repeatedly
+    # found being read as load-bearing and tested by nobody. Worse, it was
+    # actively WRONG on a properly ended sentence: the deterministic phase
+    # template reads "…verifying every agent is logged in." and 'in' was on the
+    # list, so the floor the whole fallback chain rests on failed its own gate.
+    # One guard, and a test that fails if it goes.
     # Leading-tokenization artifact — Haiku occasionally returns a
     # response that begins with a fragment like "d unambiguous..." or
     # "'s research..." when the system prompt contains quoted strings.
@@ -21927,7 +23962,9 @@ async def _narrator_loop(phase: int):
                 f"Phase {phase}: {phase_ctx} {style_note}\n\n"
                 "HARD CONSTRAINTS — your output is broadcast verbatim to a human "
                 "user with zero post-processing. Every word ships.\n\n"
-                "OUTPUT SHAPE: Exactly ONE sentence. <= 110 chars. Subject = the "
+                "OUTPUT SHAPE: Exactly ONE COMPLETE sentence ending in a period. "
+                "<= 110 chars. Never stop mid-clause — if it will not fit, "
+                "say less. Subject = the "
                 "pipeline OR a specific agent (ChatGPT/Gemini/Claude). Verb = "
                 "present-progressive (is reading, is mapping, is drafting). "
                 "Object = a concrete thing from the events. Period. End.\n\n"
@@ -22007,6 +24044,11 @@ async def _narrator_loop(phase: int):
             # narration frozen on stale text for minutes). Dedupe at emit
             # site means this template lands once per phase if Tier-2 stays
             # in refusal — subsequent ticks return clean output and resume.
+            # Trim to the last WHOLE sentence first: a model that adds a
+            # dangling clause after a good sentence should lose the clause, not
+            # the narration. Only a line with no complete sentence at all falls
+            # through to the deterministic template.
+            text = _narration_last_sentence(text) or text
             if text and not _is_acceptable_narration(text):
                 text = f"Super Research is in {_phase_short_label(phase)}."
             if text and text != last_narration:
@@ -22093,7 +24135,9 @@ async def _narrator_loop(phase: int):
                         f"agent is doing RIGHT NOW.\n\n"
                         "HARD CONSTRAINTS — your output is broadcast verbatim to a "
                         "human user with zero post-processing. Every word ships.\n\n"
-                        f"OUTPUT SHAPE: Exactly ONE sentence. <= 140 chars. Subject "
+                        f"OUTPUT SHAPE: Exactly ONE COMPLETE sentence ending in a period. "
+                        f"<= 140 chars. Never stop mid-clause — if it will "
+                        f"not fit, say less. Subject "
                         f"= {akey.upper()}. Verb = present-progressive (is reading, "
                         "is mapping, is drafting). Object = a concrete thing from "
                         "the events. Period. End.\n\n"
@@ -22176,8 +24220,10 @@ async def _narrator_loop(phase: int):
                     if _is_skip_token(a_text):
                         a_text = ""
                     # Quality gate — drop refusal text / fragments / overlength.
-                    elif a_text and not _is_acceptable_narration(a_text):
-                        a_text = ""
+                    else:
+                        a_text = _narration_last_sentence(a_text) or a_text
+                        if a_text and not _is_acceptable_narration(a_text):
+                            a_text = ""
                     # Empty result (Tier-2 refused, failed gate, or upstream
                     # error) → fall through to Tier-3 realistic fallback. Bypass
                     # the 60s warmup gate that applies to the no-events branch
@@ -23497,6 +25543,18 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
         const DIAG = { roots: 0, walked: 0, cappedRoots: 0, maxNodes: 0,
                        structuralCapped: false, prose: 0 };
 
+        // An animated gradient clipped to the text — how ChatGPT renders the
+        // live progress line. Shared by every reader below so the answer cannot
+        // differ between the one that decides and the one that reports.
+        const shimmers = (n) => {
+            try {
+                const cs = getComputedStyle(n);
+                return (cs.animationName && cs.animationName !== 'none')
+                    || cs.webkitBackgroundClip === 'text'
+                    || cs.backgroundClip === 'text';
+            } catch (e) { return false; }
+        };
+
         // Specificity score for hit ranking. Layered to keep the 32c2957
         // "parent strip > badge child" guarantee while putting the live
         // ellipsis-bearing leaf above everything (it's the actual click
@@ -23681,34 +25739,84 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
                     }
                     node = node.parentElement;
                 }
-                let anim = false;
+                // ⭐⭐ 2026-08-17 — THE SHIMMER LIVES ON AN INNER SPAN. Measured:
+                // the same strip line reported `anim:false` on itself and
+                // `animKid:true` on its subtree, and the vision tier had been
+                // describing it as shimmering all along. Checking only this
+                // element and its PARENT is how a wording-free anchor ended up
+                // depending on wording anyway. Bounded — rows with more than two
+                // children never reach here, so the subtree is a handful of nodes.
+                let anim = shimmers(el)
+                    || (el.parentElement ? shimmers(el.parentElement) : false);
+                if (!anim) {
+                    try {
+                        let seen = 0;
+                        for (const kid of el.querySelectorAll('*')) {
+                            if (++seen > 12) break;
+                            if (shimmers(kid)) { anim = true; break; }
+                        }
+                    } catch (e) {}
+                }
+                // ⭐⭐ CHATGPT NAMES THIS ROW. Captured live from a panel miss:
+                // `data-testid="cot-v5-pinned-row"` with the text on
+                // `cot-v5-pinned-row-content`. An exact name beats every heuristic
+                // below it, and the version digit is left free so a v6 still
+                // matches — the row is the same row.
+                let named = false;
                 try {
-                    const cs = getComputedStyle(el);
-                    anim = (cs.animationName && cs.animationName !== 'none')
-                        || cs.webkitBackgroundClip === 'text'
-                        || cs.backgroundClip === 'text';
-                    if (!anim && el.parentElement) {
-                        const cp = getComputedStyle(el.parentElement);
-                        anim = (cp.animationName && cp.animationName !== 'none')
-                            || cp.webkitBackgroundClip === 'text'
-                            || cp.backgroundClip === 'text';
-                    }
+                    named = !!el.closest('[data-testid^="cot-v"][data-testid*="pinned-row"]');
                 } catch (e) {}
-                if (!inter && !anim) continue;
+                if (!inter && !anim && !named) continue;
+                // Is the candidate inside the assistant's own turn? The captured
+                // chain puts the strip under `SECTION[data-testid=
+                // "conversation-turn-2"]`. This is what keeps a lone shimmer from
+                // qualifying: the composer's model chip ("Pro") also reported an
+                // animated descendant in the same capture, 400px lower and outside
+                // every turn.
+                let inTurn = false;
+                try {
+                    inTurn = !!el.closest('[data-testid^="conversation-turn"], '
+                                          + '[data-message-author-role="assistant"]');
+                } catch (e) {}
                 const wordy = COUNT.test(t) || VERB_ONLY.test(t)
                     || STATUS_LINE.test(t) || ELLIPSIS.test(t) || COMPLETED.test(t);
-                const score = (inter ? 3 : 0) + (anim ? 3 : 0) + (wordy ? 2 : 0)
-                    - (r.top - lub) / 1000;
-                structural.push({ el, score, len: t.length });
+                const score = (named ? 4 : 0) + (inter ? 3 : 0) + (anim ? 3 : 0)
+                    + (wordy ? 2 : 0) - (r.top - lub) / 1000;
+                structural.push({ el, score, len: t.length,
+                                  named, inter, anim, wordy, inTurn });
             }
-            if (structural.length) {
-                structural.sort((a, b) => (b.score - a.score) || (a.len - b.len));
-                if (structural[0].score >= 3) {
-                    const picked = clickAndReturn(structural[0].el,
-                                                  structural.length, 'structural');
-                    picked.anchor = 'structural';
-                    return picked;
-                }
+            // ⭐⭐ 2026-08-17 — THE GATE IS A PREDICATE, NOT A SUM. It used to be
+            // `score >= 3`, and 3 is exactly the weight of ONE signal while the
+            // distance penalty `-(top - lub)/1000` is ALWAYS subtracted. So a
+            // candidate carrying one signal could never clear the bar: the
+            // captured strips scored 2.960 and 2.896 and were both refused, and
+            // the only PASS 0 that ever fired in the corpus did so because its
+            // text happened to read "Searching the web" (+2 wordy). A structural
+            // anchor built to survive rewording was therefore decided by wording,
+            // silently, for as long as it has existed.
+            //
+            // ⛔ Not simply lowering the number: a bar below a single signal would
+            // bless any clickable row near the message. The evidence has to be
+            // named instead — and then the sum is free to do what it is good at,
+            // which is RANKING the qualifiers.
+            const qualifies = (h) => h.named           // ChatGPT's own name for it
+                || (h.anim && h.inTurn)                // the shimmer, contained
+                || (h.inter && h.anim)                 // the original two-signal rule
+                || (h.inter && h.wordy);               // clickable AND a known state
+            const ranked = structural.filter(qualifies);
+            if (ranked.length) {
+                // Sorted, then [0] — it used to rank the whole list and inspect
+                // only the top one, so a qualifying row sitting behind an
+                // unqualified higher scorer was never reached.
+                ranked.sort((a, b) => (b.score - a.score) || (a.len - b.len));
+                const picked = clickAndReturn(ranked[0].el,
+                                              structural.length, 'structural');
+                picked.anchor = 'structural';
+                picked.why = (ranked[0].named ? 'named' : '')
+                    + (ranked[0].anim ? '+anim' : '') + (ranked[0].inter ? '+inter' : '')
+                    + (ranked[0].wordy ? '+wordy' : '')
+                    + (ranked[0].inTurn ? '+turn' : '');
+                return picked;
             }
         }
 
@@ -34624,7 +36732,13 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     # mid-phase (the dedicated event stream Block 6 wired up).
                     # Same quality gate as the narrator loop — vision rarely
                     # fragments but the symmetric coverage is cheap.
-                    _vn_text = (_vision_narration_p2 or "")[:140]
+                    # ⛔⛔ 2026-08-17 — THIS SLICE RAN BEFORE THE GATE. `[:140]`
+                    # cuts wherever the 140th character lands, mid-word as often
+                    # as not, and the gate then inspected the damage instead of
+                    # the model's output — it can only see a fragment it did not
+                    # cause. Shortening by SENTENCE answers both: the result is a
+                    # whole sentence within the budget, or nothing.
+                    _vn_text = _narration_last_sentence(_vision_narration_p2, limit=140)
                     if _vn_text and _is_acceptable_narration(_vn_text):
                         try:
                             emit_event("agent_narration", phase=2,
@@ -40230,10 +42344,16 @@ _CLAUDE_EFFORT_CHECKED_JS = r"""(P) => {
         const el = document.querySelector('[data-testid="' + P.optTestid + '"]');
         if (el) return { found: true, checked: isOn(el), via: 'testid' };
     }
+    // The DEFAULT rung renders as e.g. 'HighDefault', so an exact match alone
+    // cannot read it back. Same tolerance the picker uses to choose the row —
+    // a verification that cannot see what the picker pressed is worse than no
+    // verification, because it reports a correct press as a failure.
+    const want = String(P.word || '').toLowerCase();
     for (const el of document.querySelectorAll(
             '[role="menuitemradio"], [role="menuitem"], [role="option"]')) {
         if (!el.getClientRects().length) continue;
-        if (norm(el.textContent) !== String(P.word || '')) continue;
+        const t = norm(el.textContent);
+        if (!want || (t !== want && t !== want + 'default')) continue;
         return { found: true, checked: isOn(el), via: 'text' };
     }
     return { found: false, checked: false, via: '' };
@@ -40245,6 +42365,133 @@ _CLAUDE_TRIGGER_EXPANDED_JS = r"""(P) => {
     return { found: true, expanded: el.getAttribute('aria-expanded') === 'true',
              label: (el.getAttribute('aria-label') || '').slice(0, 60) };
 }"""
+
+# ⭐⭐ 2026-08-17 — IS THE EFFORT SUBMENU UP? Asked of the OVERLAYS, not the page.
+#
+# The probe this replaces collected every short visible row in the DOCUMENT, capped
+# the list at 20, and declared the submenu mounted only if one of those 20 read like
+# an effort rung. Claude's submenu is a portalled popper appended at the END of
+# `<body>`, so it is last in document order — and the sidebar ("new", "projects",
+# "artifacts", "scheduled", "customize", "pinned", plus icon-only rows) fills the cap
+# long before the walk reaches it. The 2026-08-17 run proved it: the gate reported
+# "no submenu mounted" while its own diagnostic listed the submenu, five rows,
+# Low/Medium/HighDefault/Extra/Max. Effort was then left at the model's default and
+# the run reported the tier as unconfirmed.
+#
+# ⛔ A bigger cap would not have fixed it — document order is the defect, and the
+# sink is what needs guarding. This asks each visible overlay separately, so no
+# amount of sidebar can crowd the answer out. Same scoping rule Step 1C' already
+# uses to PICK the row: the submenu is the visible menu that does NOT contain the
+# Effort trigger; the parent popover carries its own 'EffortMax' row.
+_CLAUDE_EFFORT_SUBMENU_JS = r"""(P) => {
+    // Icon-font ligatures live in the private-use area and are invisible in a
+    // screenshot but present in text — strip them before comparing, exactly as
+    // the row picker does.
+    const norm = s => (s || '')
+        .replace(/[\ue000-\uf8ff]/g, ' ')
+        .replace(/\s+/g, ' ').trim().toLowerCase();
+    const RUNGS = ['low', 'medium', 'high', 'extra', 'max', 'xhigh'];
+    // 'HighDefault' is a real captured label — the default rung carries a suffix.
+    const isRung = t => RUNGS.indexOf(t) !== -1 ||
+                        RUNGS.some(r => t === r + 'default');
+    const out = {overlays: []};
+    const seen = new Set();
+    for (const c of document.querySelectorAll(
+            '[role="menu"], [data-radix-menu-content], '
+            + '[data-radix-popper-content-wrapper]')) {
+        if (!c.getClientRects().length) continue;
+        if (seen.has(c)) continue;
+        seen.add(c);
+        const rows = [...c.querySelectorAll(
+            '[role="menuitem"], [role="menuitemradio"], [role="option"], button, li')]
+            .filter(e => e.getClientRects().length);
+        const labels = rows.map(e => norm(e.textContent))
+                           .filter(t => t && t.length <= 24);
+        out.overlays.push({
+            trigger: !!(P.trigTestid &&
+                        c.querySelector('[data-testid="' + P.trigTestid + '"]')),
+            option: !!(P.optTestid &&
+                       c.querySelector('[data-testid="' + P.optTestid + '"]')),
+            rungs: labels.filter(isRung).length,
+            labels: labels.slice(0, 12),
+        });
+    }
+    return out;
+}"""
+
+
+def _gemini_plan_card_due(*, elapsed: float, wait_max_sec: float,
+                          alert_sec: float, regen_capped: bool,
+                          streaming_recent: bool, start_clicked: bool) -> bool:
+    """May the early [Retry][Skip] card fire yet?
+
+    ⛔ THE FALSE ALARM (owner's e2e, 2026-08-17). The card went up at 248s and
+    Gemini's plan arrived 25 seconds later; the very next line in the log was
+    "Still waiting for Gemini research plan... (248s / 300s)". We told the owner
+    Gemini could not start while we ourselves were still waiting patiently, with
+    52 seconds of our own budget left — and then retracted it 43 seconds later.
+    Owner: keep it non-blocking, which it is, but stop crying wolf.
+
+    ⭐⭐ The two numbers were configured INDEPENDENTLY: `GEMINI_PLAN_ALERT_SEC`
+    (240) and the loop's own `_start_wait_max_sec` (300). Nothing tied them, so
+    the alarm was free to drift in front of the patience it describes. Tying them
+    is the fix, and it is not a tuning change — an alert that fires while its own
+    caller intends to keep waiting is wrong at ANY pair of numbers.
+
+    ⭐ The REGEN arm is untouched and still fires the instant it is true: three
+    exhausted re-drafts is evidence of failure, not a timer, and #921 exists so
+    that evidence reaches the owner early instead of after a 17-minute ladder.
+
+    `streaming_recent` keeps its #929 meaning: a plan that is visibly still
+    generating is healthy-slow, and `start_clicked` means there is nothing to
+    alert about at all.
+    """
+    if start_clicked:
+        return False
+    if streaming_recent:
+        return False
+    if regen_capped:
+        return True
+    return elapsed >= max(float(alert_sec), float(wait_max_sec))
+
+
+def _claude_effort_submenu_verdict(probe) -> str:
+    """'open' | 'maybe' | 'closed' — one verdict from the overlay readings.
+
+    ⭐ Pure, because the gate it replaces could veto a working picker and no test
+    could see it: the old version's answer lived inside an 8-round poll in a
+    900-line async function. Here the answer IS the return value.
+
+      * 'open'   — an overlay that is NOT the parent popover carries the wanted
+                   option's test id, or two rows that read as effort rungs.
+      * 'maybe'  — some overlay other than the parent is up, but nothing in it
+                   was recognised. Worth attempting: Step 1C' is scoped and
+                   verifies its own press, so it can diagnose this far better
+                   than a gate that just says no.
+      * 'closed' — the only thing open is the popover holding the trigger, or
+                   nothing is open at all.
+
+    ⛔ TWO rungs, not one. A single 'max' anywhere in a stray overlay — a tooltip,
+    a toast — is not a menu. Two is enough to name this menu and still tolerate a
+    relabelled rung.
+    ⛔ The parent popover is excluded by the trigger, not by its rungs. It shows
+    the current value as its own 'EffortMax' row, and a future build that hangs
+    the option's test id on that row would otherwise satisfy this from a submenu
+    that never opened — the precise failure being fixed here, inverted.
+    """
+    overlays = [o for o in ((probe or {}).get("overlays") or [])
+                if isinstance(o, dict)]
+    candidates = [o for o in overlays if not o.get("trigger")]
+    for o in candidates:
+        if o.get("option"):
+            return "open"
+        try:
+            rungs = int(o.get("rungs") or 0)
+        except (TypeError, ValueError):
+            rungs = 0
+        if rungs >= 2:
+            return "open"
+    return "maybe" if candidates else "closed"
 
 
 async def _claude_reopen_model_popover(page) -> bool:
@@ -41600,7 +43847,13 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                     for (const el of document.querySelectorAll('[' + P.attr + ']')) {
                         el.removeAttribute(P.attr);
                     }
-                    const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    // Icon-font ligatures land in the private-use area: they are
+                    // invisible on screen but present in text, and they are why the
+                    // log read the row as 'effortmax' plus a stray glyph. It also
+                    // makes the length bound below measure real characters.
+                    const norm = s => (s || '')
+                        .replace(/[\\ue000-\\uf8ff]/g, ' ')
+                        .replace(/\\s+/g, ' ').trim().toLowerCase();
                     const linky = el => (el.tagName === 'A' && el.getAttribute('href'))
                         || (el.closest && el.closest('a[href]'))
                         || (el.querySelector && el.querySelector('a[href]'));
@@ -41638,13 +43891,47 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                             break;
                         }
                     }
+                    // ⭐ 2026-08-17 — THE ANCESTRY IS CAPTURED **HERE**, while the
+                    // row is in hand. The diagnostic below used to rebuild it by
+                    // re-reading the marker, and `_sr_real_click` removes that
+                    // marker in a `finally` — by contract, on every path. So the
+                    // half of the diagnostic that says WHAT WAS PRESSED could
+                    // never once produce data: it printed `"chain": []` and
+                    // `"marked": false` on every failure, including the run where
+                    // the press had landed on exactly the right row.
+                    const desc = el => {
+                        if (!el || !el.tagName) return null;
+                        const d = {tag: el.tagName.toLowerCase()};
+                        const r = el.getAttribute && el.getAttribute('role');
+                        if (r) d.role = r;
+                        if (el.id) d.id = String(el.id).slice(0, 40);
+                        const cls = String((el.getAttribute
+                                            && el.getAttribute('class')) || '')
+                            .trim().split(' ').filter(Boolean).slice(0, 3);
+                        if (cls.length) d.cls = cls.map(c => c.slice(0, 40));
+                        if (el.getAttributeNames) {
+                            for (const a of el.getAttributeNames()) {
+                                if (a.indexOf('data-radix') === 0 || a === 'data-state'
+                                    || a === 'data-side' || a.indexOf('data-testid') === 0) {
+                                    (d.data = d.data || {})[a] =
+                                        String(el.getAttribute(a)).slice(0, 40);
+                                }
+                            }
+                        }
+                        return d;
+                    };
                     if (trigger) {
                         trigger.setAttribute(P.attr, P.value);
+                        const chain = [];
+                        for (let el = trigger, i = 0; el && i < 8; i++, el = el.parentElement) {
+                            chain.push(desc(el));
+                        }
                         return {marked: true, via: via,
                                 text: norm(trigger.textContent).slice(0, 60),
+                                chain: chain,
                                 rejected: rejected.slice(0, 5)};
                     }
-                    return {marked: false, via: '', text: '',
+                    return {marked: false, via: '', text: '', chain: [],
                             rejected: rejected.slice(0, 5)};
                 }""", {"attr": _SR_CLICK_MARK, "value": "claude-effort",
                        "testid": _CLAUDE_EFFORT_TRIGGER_TESTID}) or {}
@@ -41653,7 +43940,8 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                     log(f"[setup_claude_dr] Step 1C: refused "
                         f"{len(_eff_mark['rejected'])} 'Effort…' candidate(s) — "
                         f"{json.dumps(_eff_mark['rejected'], ensure_ascii=False)}", "INFO")
-                _eff_opened = False
+                # 'open' | 'maybe' | 'closed' — see `_claude_effort_submenu_verdict`.
+                _eff_state, _eff_opened = "closed", False
                 if _eff_marked:
                     log(f"[setup_claude_dr] Step 1C: marked the Effort row "
                         f"{_eff_mark.get('text','')!r} (via {_eff_mark.get('via')})")
@@ -41664,45 +43952,52 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                     # is not "the submenu is open", and the difference is the
                     # nine WARNs: everything downstream searched a menu that had
                     # never mounted and reported its own target missing.
+                    #
+                    # ⭐⭐ 2026-08-17 — ASKED OF THE OVERLAYS, NOT THE DOCUMENT.
+                    # The previous poll listed every short visible row on the
+                    # page, capped it at 20, and looked for an effort word among
+                    # them. Claude's submenu is portalled to the END of `<body>`
+                    # and the sidebar fills the cap first, so on a real run the
+                    # gate answered "no submenu" while the diagnostic printed on
+                    # the very next line listed the submenu and all five of its
+                    # rungs. Effort silently stayed at the model's default.
+                    _eff_probe = {}
                     for _try in range(8):
                         if _try:
                             await asyncio.sleep(0.25)
                         try:
-                            _sub = await page.evaluate("""() => {
-                                const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-                                const out = [];
-                                for (const el of document.querySelectorAll(
-                                        '[role="menuitem"], [role="menuitemradio"], [role="option"], button, li')) {
-                                    if (!el.getClientRects().length) continue;
-                                    const t = norm(el.textContent);
-                                    if (!t || t.length > 24) continue;
-                                    if (out.indexOf(t) === -1) out.push(t);
-                                }
-                                return out.slice(0, 20);
-                            }""") or []
+                            _eff_probe = await page.evaluate(
+                                _CLAUDE_EFFORT_SUBMENU_JS,
+                                {"trigTestid": _CLAUDE_EFFORT_TRIGGER_TESTID,
+                                 "optTestid": _claude_effort_option_testid(
+                                     _claude_effort)}) or {}
                         except Exception:
-                            _sub = []
-                        if any(r in ("max", "max effort", "thinking", "low", "medium",
-                                     "high", "extra") for r in _sub):
-                            _eff_opened = True
+                            _eff_probe = {}
+                        _eff_state = _claude_effort_submenu_verdict(_eff_probe)
+                        if _eff_state == "open":
                             break
+                    _eff_opened = _eff_state == "open"
                     if not _eff_opened:
                         # ⭐ 2026-08-05 — SAY WHERE THE ROW WE PRESSED ACTUALLY LIVES.
                         # This step reports "'Max' not found in submenu" nine times
                         # against one success, and that message describes the search
                         # AFTER the press rather than the press itself — so it has
-                        # never once identified what was pressed. The scope fix this
-                        # needs (search the popover, not the page) cannot be written
-                        # without knowing the popover's own shape, and the popover
-                        # exists only mid-run.
+                        # never once identified what was pressed.
                         #
                         # ⛔ STRUCTURE ONLY — tags, roles, ids, a few class names, the
                         # framework's own state attributes. Deliberately NOT raw HTML
                         # and not element text beyond short control labels: the
                         # sidebar and the transcript are the user's own conversations,
                         # and a diagnostic has no business copying those into a log.
+                        #
+                        # ⛔ THE ANCESTRY IS NOT RE-READ HERE. It is carried down from
+                        # the marking pass above, because `_sr_real_click` removes the
+                        # marker in a `finally` — so the old `querySelector` on that
+                        # attribute was reading an element that is gone by contract,
+                        # and printed `"chain": [], "marked": false` on every single
+                        # failure regardless of what had been pressed.
                         try:
-                            _eff_dbg = await page.evaluate("""(P) => {
+                            _eff_dbg = await page.evaluate("""() => {
                                 const desc = el => {
                                     if (!el || !el.tagName) return null;
                                     const d = {tag: el.tagName.toLowerCase()};
@@ -41723,17 +44018,9 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                                     }
                                     return d;
                                 };
-                                const out = {chain: [], overlays: [], marked: false};
-                                // 1. The ancestry of the row we pressed. This alone
-                                //    separates "a real menu row" from "a sidebar link"
-                                //    from "a bullet in the assistant's own reply".
-                                let el = document.querySelector('[' + P.attr + ']');
-                                out.marked = !!el;
-                                for (let i = 0; el && i < 8; i++, el = el.parentElement) {
-                                    out.chain.push(desc(el));
-                                }
-                                // 2. Every visible overlay-shaped container, so the
-                                //    scope can be written against something real.
+                                const out = {overlays: []};
+                                // Every visible overlay-shaped container, so the
+                                // scope can be written against something real.
                                 const seen = new Set();
                                 for (const c of document.querySelectorAll(
                                         '[role="menu"], [role="dialog"], [role="listbox"], '
@@ -41754,20 +44041,35 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                                     });
                                 }
                                 return out;
-                            }""", {"attr": _SR_CLICK_MARK}) or {}
+                            }""") or {}
                         except Exception as _ed_e:
                             _eff_dbg = {"error": str(_ed_e)[:120]}
-                        log(f"[setup_claude_dr] Step 1C DIAG (submenu never mounted) — "
+                        if isinstance(_eff_dbg, dict):
+                            _eff_dbg["pressed_chain"] = _eff_mark.get("chain") or []
+                        log(f"[setup_claude_dr] Step 1C DIAG (submenu {_eff_state}) — "
                             f"{json.dumps(_eff_dbg, ensure_ascii=False)[:3000]}", "WARN")
                     if _eff_opened:
                         log(f"[setup_claude_dr] Step 1C: Effort submenu opened via a "
                             f"{_how or 'failed'} press")
+                    elif _eff_state == "maybe":
+                        # ⭐ PROCEED. An overlay other than the parent popover is up
+                        # and nothing in it was recognised — which is a description
+                        # of the page, not a verdict on the run. Step 1C' is scoped
+                        # to that same overlay and verifies its own press before
+                        # claiming anything, so letting it try converts a blind veto
+                        # into a named diagnosis. The gate must not be able to
+                        # overrule a picker that checks its own work.
+                        log(f"[setup_claude_dr] Step 1C: the Effort row was pressed "
+                            f"({_how or 'no press landed'}) and an overlay is open but "
+                            f"unrecognised — trying the submenu anyway; the row picker "
+                            f"verifies its own press", "WARN")
                     else:
                         log(f"[setup_claude_dr] Step 1C WARN: the Effort row was pressed "
                             f"({_how or 'no press landed'}) but no submenu mounted within "
-                            f"2s — visible short rows were "
-                            f"{json.dumps(_sub[:10], ensure_ascii=False)}", "WARN")
-                if _eff_opened:
+                            f"2s — visible overlays were "
+                            f"{json.dumps((_eff_probe or {}).get('overlays') or [], ensure_ascii=False)[:600]}",
+                            "WARN")
+                if _eff_state != "closed":
                     await asyncio.sleep(0.5)
                     # ── Step 1D: toggle "Thinking" ON (inside the submenu) ──
                     # #745: the toggle is labeled "Thinking" (NOT "Adaptive
@@ -41780,7 +44082,11 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                     # run. Kept rather than deleted because the policy dict is
                     # the lever: an older Opus, or a future model that reinstates
                     # the toggle, re-arms this by flipping one value.
-                    _think = {} if not _claude_wants_thinking else await page.evaluate("""() => {
+                    # ⛔ The Thinking search below is PAGE-WIDE, so it runs only
+                    # on a confirmed submenu. Widening the effort attempt to the
+                    # 'maybe' state must not also widen an unscoped click.
+                    _think_probed = bool(_claude_wants_thinking and _eff_opened)
+                    _think = {} if not _think_probed else await page.evaluate("""() => {
                         const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
                         const vis = el => el.getClientRects().length > 0;
                         const isThinking = el => {
@@ -41811,11 +44117,15 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                         if (!isOn(sw)) { sw.click(); return { found: true, toggled: true }; }
                         return { found: true, toggled: false };
                     }""")
-                    if not _claude_wants_thinking:
+                    if not _think_probed:
                         # No toggle on this model family — nothing to confirm and
                         # nothing wrong. Deliberately silent: a WARN here is what
                         # made a healthy run look broken every single time.
-                        pass
+                        if _claude_wants_thinking:
+                            log("[setup_claude_dr] Step 1D SKIPPED: the Effort "
+                                "submenu was not confirmed and the Thinking search "
+                                "is page-wide — it does not run against a page whose "
+                                "submenu may never have opened", "INFO")
                     elif not _think.get("found"):
                         log("[setup_claude_dr] Step 1D WARN: 'Thinking' toggle not found in Effort submenu — UI moved/relabelled it", "WARN")
                     else:
@@ -41853,15 +44163,40 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                         const norm = s => (s || '')
                             .replace(/[\\ue000-\\uf8ff]/g, ' ')
                             .replace(/\\s+/g, ' ').trim().toLowerCase();
-                        const menus = [...document.querySelectorAll('[role="menu"]')]
+                        const menus = [...document.querySelectorAll(
+                                '[role="menu"], [data-radix-menu-content]')]
                             .filter(el => el.getClientRects().length > 0);
-                        // The submenu is the visible menu WITHOUT the trigger in it.
-                        // Falls back to the newest menu, then the document, so an
-                        // older UI without the test id still resolves.
-                        const scope = menus.find(m =>
-                                !m.querySelector('[data-testid="' + P.trigTestid + '"]'))
-                            || menus[menus.length - 1] || document;
-                        const items = [...scope.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="option"], button, li, div')]
+                        // The submenu is a visible menu WITHOUT the trigger in it.
+                        // ⭐ 2026-08-17 — EVERY candidate is searched, not just the
+                        // first. `find` picked ONE menu and, if the row was not in
+                        // it, reported the row missing from a page that was showing
+                        // it — the same "chose the wrong sink" shape as the gate
+                        // above. Falls back to the newest menu, then the document,
+                        // so an older UI without the test id still resolves.
+                        const cands = menus.filter(m =>
+                            !m.querySelector('[data-testid="' + P.trigTestid + '"]'));
+                        // ⛔ 2026-08-17 — NO FALLBACK INTO THE TRIGGER'S OWN MENU.
+                        // This used to end `|| menus[menus.length - 1]`, which is
+                        // reached in exactly one situation: every visible menu
+                        // holds the Effort trigger, i.e. the submenu is NOT open.
+                        // The popover DISPLAYS the selected tier ('EffortMax' in
+                        // the live capture) and the row search includes `div`, so
+                        // the fallback would mark the element rendering that value
+                        // — pressing it re-opens the submenu and changes no tier,
+                        // and the caller would report the tier as set. Searching
+                        // nothing is the honest answer when nothing is open.
+                        const pools = cands.length
+                            ? cands
+                            : (menus.length ? [] : [document]);
+                        // ⛔ AND THE TEXT SEARCH IS OFF ON THE DOCUMENT. The last
+                        // pool exists for a layout with no menu-shaped container at
+                        // all; a test id is globally unique and safe to resolve
+                        // there, while matching a page-wide row by the word 'Max'
+                        // is the decoy press this file has already paid for once —
+                        // Claude's own reply renders list items reading exactly
+                        // that.
+                        const allowText = cands.length > 0;
+                        const rowsIn = c => [...c.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="option"], button, li, div')]
                             .filter(el => el.getClientRects().length > 0);
                         // ⭐⭐ 2026-08-17 — THE OPTION'S OWN TEST ID, FIRST. Every
                         // rung is named (`effort-option-low|medium|high|xhigh|max`),
@@ -41874,18 +44209,38 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                         // ⛔ Still scoped, and still checked against the submenu.
                         // An id is a stronger name, not a container — and the
                         // parent popover carries an 'EffortMax' row of its own.
-                        let pick = null;
-                        if (P.optTestid) {
-                            pick = items.find(el =>
-                                el.getAttribute('data-testid') === P.optTestid);
+                        // ⛔ 2026-08-17 — THE WANTED WORD COMES FROM THE POLICY.
+                        // This read 'max' as a literal while the test id beside it
+                        // was derived from the policy, so the two halves of one
+                        // search disagreed the moment the policy said anything but
+                        // 'max' — and the text half is exactly the half that runs on
+                        // the older layout with no ids. `family-only-models` is the
+                        // standing rule: no tier literals in a selection path.
+                        const want = String(P.word || '').toLowerCase();
+                        // 'HighDefault' is a real captured label: the default rung
+                        // carries a suffix, so an exact match alone cannot see it.
+                        const isWanted = el => {
+                            const t = norm(el.textContent);
+                            return !!want && (t === want || t === want + ' effort'
+                                              || t === want + 'default');
+                        };
+                        let pick = null, scope = null, items = [];
+                        for (const c of pools) {
+                            const rows = rowsIn(c);
+                            let hit = null;
+                            if (P.optTestid) {
+                                hit = rows.find(el =>
+                                    el.getAttribute('data-testid') === P.optTestid);
+                            }
+                            // The text search stays as the fallback for an older
+                            // layout, with its ligature stripping intact.
+                            if (!hit && allowText) hit = rows.find(isWanted);
+                            if (!items.length) items = rows;
+                            if (hit) { pick = hit; scope = c; items = rows; break; }
                         }
-                        // The text search stays as the fallback for an older
-                        // layout, with its ligature stripping intact.
-                        if (!pick) pick = items.find(el => norm(el.textContent) === 'max');
-                        if (!pick) pick = items.find(el => norm(el.textContent) === 'max effort');
                         if (!pick) {
-                            return {set: null, scoped: scope !== document,
-                                    menus: menus.length,
+                            return {set: null, scoped: cands.length > 0,
+                                    menus: menus.length, cands: cands.length,
                                     saw: items.map(el => norm(el.textContent))
                                         .filter(t => t && t.length <= 24).slice(0, 10)};
                         }
@@ -41900,7 +44255,7 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                         // opener — and both times the tell was the same, a report
                         // of success from a page that had not changed.
                         if (!already) pick.setAttribute(P.attr, P.value);
-                        return {set: already ? 'max (already)' : 'marked',
+                        return {set: already ? want + ' (already)' : 'marked',
                                 already: already,
                                 // WHICH row was chosen, so the log names it and a
                                 // test can assert identity rather than "something
@@ -41910,9 +44265,11 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                                 via: P.optTestid &&
                                     pick.getAttribute('data-testid') === P.optTestid
                                     ? 'testid' : 'text',
-                                scoped: scope !== document, menus: menus.length};
+                                scoped: scope !== document, menus: menus.length,
+                                cands: cands.length};
                     }""", {"trigTestid": _CLAUDE_EFFORT_TRIGGER_TESTID,
                            "optTestid": _claude_effort_option_testid(_claude_effort),
+                           "word": str(_claude_effort or "").lower(),
                            "attr": _SR_CLICK_MARK,
                            "value": "claude-effort-option"}) or {}
                     # The row report is what makes the next drift diagnosable from
@@ -47217,6 +49574,20 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         _stream_handoff_sec = int(os.environ.get("GEMINI_PLAN_STREAM_HANDOFF_SEC", "360"))
         _streaming_handoff = False
 
+        def _raise_plan_alert(where: str):
+            """Put the non-blocking [Retry][Skip] card up, once."""
+            nonlocal _plan_alert_emitted
+            if _plan_alert_emitted or _controls.is_stop():
+                return
+            _plan_alert_emitted = True
+            log(f"[2D] Plan not started after {int(time.time() - _loop_start)}s "
+                f"(regens={_regen_count}) — surfacing early [Retry][Skip] card "
+                f"({where}; non-blocking, recovery continues)", "WARN")
+            try:
+                fail_agent("gemini", *_GEMINI_CANT_START)  # #63: centralized copy
+            except Exception:
+                pass
+
         def _retract_plan_alert(where: str):
             # #921/#929: retract the early plan-stall card once the plan
             # recovers. The main-loop click path always did this; the two
@@ -47257,6 +49628,19 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                     "— handing off to recovery", "WARN")
                 break
             if _elapsed >= _start_wait_max_sec and not _streaming_recent:
+                # ⛔ THE CARD HAS TO GO UP HERE, not merely be allowed to. The
+                # timer arm is now tied to this same budget, and this break sits
+                # ABOVE the card block — so leaving it out would make that arm
+                # unreachable and quietly delete the #921 protection, which is
+                # the exact "a guard that can never fire" shape this file spent
+                # 2026-08-17 removing from two other steps.
+                if _gemini_plan_card_due(
+                        elapsed=_elapsed, wait_max_sec=_start_wait_max_sec,
+                        alert_sec=_PLAN_ALERT_SEC,
+                        regen_capped=_regen_cap_emitted,
+                        streaming_recent=_streaming_recent,
+                        start_clicked=bool(start_clicked)):
+                    _raise_plan_alert("our own plan-wait budget is spent")
                 break
             # #755: stop/pause-aware — a 10-min plan wait must honor Stop/Pause.
             if _controls.is_stop():
@@ -47410,23 +49794,17 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             # keep trying to self-heal, and the recovery path retracts this card
             # if a plan appears. Fires ONCE (idempotent alert_id agent_gemini_error;
             # the terminal fail_agent after the CUA ladder reuses the same id).
-            if (not start_clicked and not _plan_alert_emitted
-                    and not _controls.is_stop()
-                    and not _streaming_recent
-                    and (_regen_cap_emitted or _elapsed > _PLAN_ALERT_SEC)):
-                # #929 `not _streaming_recent`: a plan that is VISIBLY still
-                # generating is healthy-slow, not failed — carding it was the
-                # 2026-07-09 false alarm. The card now waits for the streaming
-                # evidence to go quiet (or the regen cap), so it still fires
-                # fast on the true plain-chat/DR-dropped stall.
-                _plan_alert_emitted = True
-                log(f"[2D] Plan not started after {_elapsed}s "
-                    f"(regens={_regen_count}) — surfacing early [Retry][Skip] card "
-                    "(non-blocking; recovery continues)", "WARN")
-                try:
-                    fail_agent("gemini", *_GEMINI_CANT_START)  # #63: centralized copy
-                except Exception:
-                    pass
+            # #929 `not _streaming_recent`: a plan that is VISIBLY still
+            # generating is healthy-slow, not failed — carding it was the
+            # 2026-07-09 false alarm. `_gemini_plan_card_due` also ties the
+            # timer arm to the loop's OWN patience, which is the 2026-08-17
+            # false alarm: the card cannot precede the wait it describes.
+            if _gemini_plan_card_due(
+                    elapsed=_elapsed, wait_max_sec=_start_wait_max_sec,
+                    alert_sec=_PLAN_ALERT_SEC, regen_capped=_regen_cap_emitted,
+                    streaming_recent=_streaming_recent,
+                    start_clicked=bool(start_clicked)):
+                _raise_plan_alert("plan clearly failed")
 
             # 2. Emit a Gemini planning heartbeat every ~15s so the frontend
             # shows smooth live motion while Gemini drafts the plan (was 60s,
@@ -55651,11 +58029,119 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # orphaned while the FE shows "stopped". `_crash_retries` increments
         # ONLY for browser crashes (a normal one-shot retry keeps it at 0 so a
         # later crash on the resumed run still gets its full budget).
-        await run_pipeline(topic=topic, email=email, verbose=verbose,
+        await run_pipeline_captured(topic=topic, email=email, verbose=verbose,
                            api_key=api_key, resume_dir=str(queue_dir),
                            config=config,
                            run_id=run_id, uid=uid, research_id=research_id,
                            _crash_retries=(_crash_retries + 1 if _is_browser_crash else _crash_retries))
+
+
+# ── Per-run log capture wraps the pipeline ─────────────────────
+# `run_pipeline` above is untouched; this is the only thing that arms the
+# per-run log folder around it. A wrapper rather than a `with` at the top of
+# the body for two measured reasons: the body is ~3,800 lines, and it has
+# several early returns ABOVE its main try, so a finally-based disarm would
+# leak an armed sink on exactly the failures worth capturing.
+#
+# ⛔ EVERY call site in this file goes through here — pinned by
+# `test_no_call_site_bypasses_the_capture`, because a new caller wired to
+# `run_pipeline` directly would get no folder and nothing would say so.
+async def run_pipeline_captured(*args, **kwargs):
+    _rid, _attempt = _run_pipeline_capture_key(args, kwargs)
+    with _RunLogCapture(research_id=_rid, attempt=_attempt):
+        return await run_pipeline(*args, **kwargs)
+
+
+def _run_pipeline_capture_key(args, kwargs) -> "tuple[str | None, int]":
+    """(research_id, attempt) for the folder, read off the REAL call.
+
+    Bound through `inspect.signature` against `run_pipeline` itself, so the
+    wrapper cannot drift from the parameter list it forwards, and so
+    `research_id` is found whether the caller passed it positionally or by
+    keyword. ⛔ `run_id` is deliberately not read here — see
+    `_run_log_folder_name`."""
+    try:
+        bound = _RUN_PIPELINE_SIG.bind(*args, **kwargs)
+        bound.apply_defaults()
+        return (bound.arguments.get("research_id"),
+                int(bound.arguments.get("_crash_retries") or 0))
+    except Exception:
+        return None, 0
+
+
+import inspect as _inspect_for_capture  # noqa: E402
+_RUN_PIPELINE_SIG = _inspect_for_capture.signature(run_pipeline)
+
+
+# ⛔⛔ THE EVENT NAMES ARE MEASURED, NOT ASSUMED. `emit_event("fail_phase")`
+# occurs ZERO times in this file — phase failures ride `emit_decision`, whose
+# default `event_name` is `pipeline_error`. Mapping the obvious name would have
+# captured no failures at all, and absence reads as health.
+_TM_EVENT_MAP = {
+    "phase_start": tm.Ev.PHASE_START,
+    "phase_complete": tm.Ev.PHASE_COMPLETE,
+    "phase_skipped": tm.Ev.PHASE_SKIPPED,
+    "agent_skipped": tm.Ev.AGENT_SKIPPED,
+    "pipeline_paused": tm.Ev.RUN_PAUSED,
+    "pipeline_resumed": tm.Ev.RUN_RESUMED,
+    "pipeline_stopped": tm.Ev.RUN_STOPPED,
+    "pipeline_error": tm.Ev.PIPELINE_ERROR,
+}
+
+
+def _tm_platform(agent) -> "object | None":
+    """An agent key to a Platform, failing CLOSED.
+
+    ⛔ `normalize_agent_key` passes through anything it does not recognise, so an
+    unmapped name must land on OTHER rather than reach the wire as itself."""
+    if not agent:
+        return None
+    key = str(agent).strip().lower()
+    return {
+        "chatgpt": tm.Platform.CHATGPT, "claude": tm.Platform.CLAUDE,
+        "gemini": tm.Platform.GEMINI, "notebooklm": tm.Platform.NOTEBOOKLM,
+        "youtube": tm.Platform.YOUTUBE, "docs": tm.Platform.GOOGLE_DOCS,
+        "google_docs": tm.Platform.GOOGLE_DOCS,
+    }.get(key, tm.Platform.OTHER)
+
+
+def _tm_note_event(event_type, phase=None, agent=None) -> None:
+    """`emit_event`'s tap into the content-free tier.
+
+    ⛔⛔ FORWARDS A LITERAL TUPLE — the event, the phase number, and an agent
+    mapped onto an enum. `**data` is structurally never passed, and
+    `test_the_tier1_tap_forwards_a_literal_tuple` pins that set, because
+    "temporarily" adding one field is how free text re-enters a content-free
+    path."""
+    mapped = _TM_EVENT_MAP.get(str(event_type))
+    if mapped is None:
+        return
+    fields = {}
+    if isinstance(phase, int):
+        fields["phase"] = phase
+    platform = _tm_platform(agent)
+    if platform is not None:
+        fields["platform"] = platform
+    rid = None
+    try:
+        sink = _active_run_sink()
+        rid = sink.research_id if sink is not None else None
+    except Exception:
+        rid = None
+    if rid:
+        fields["research_id"] = rid
+    tm.tm_emit(mapped, **fields)
+
+
+def _run_sink_note_event(event_type, phase=None, agent=None) -> None:
+    """`emit_event`'s tap into the armed run folder. Content-free by shape."""
+    sink = _active_run_sink()
+    if sink is None:
+        return
+    try:
+        sink.note_event(event_type, phase, agent)
+    except Exception:
+        pass
 
 
 # ── Server Mode (Web App API) ────────────────────────────────────────────────
@@ -57820,7 +60306,7 @@ async def run_server(port=8000):
                     # On breach we raise asyncio.TimeoutError, reusing the
                     # existing handler below unchanged.
                     _pipe_task = asyncio.ensure_future(
-                        run_pipeline(topic=job["topic"], email=job.get("email", ""),
+                        run_pipeline_captured(topic=job["topic"], email=job.get("email", ""),
                                      verbose=True, resume_dir=job.get("resume_dir"),
                                      config=job.get("config"), run_id=job.get("run_id"),
                                      uid=job.get("uid"), research_id=job.get("research_id"),
@@ -57868,6 +60354,9 @@ async def run_server(port=8000):
                 # next process.
                 hours = WORKER_OUTER_TIMEOUT_SEC // 3600
                 log(f"[worker-watchdog] Pipeline exceeded {hours}h ACTIVE-time ceiling (excludes paused / user-decision waits) — declaring stuck and scheduling restart", "ERROR")
+                # The verdict has to reach the run's own folder, or the bundle
+                # shows a run that merely "errored" with no cause named.
+                _patch_run_log_status("watchdog", watchdogCeilingSec=WORKER_OUTER_TIMEOUT_SEC)
                 try:
                     _controls.request_stop()
                 except Exception:
@@ -58366,7 +60855,13 @@ async def run_server(port=8000):
                 while True:
                     await asyncio.sleep(60)
                     if not _QUEUE_STATE.get("running"):
-                        log(_aegis_pulse_line(WORKER_ID, i))
+                        _cut_off = _firebase_db is None
+                        _since = _firestore_down_since_ts
+                        log(_aegis_pulse_line(
+                            WORKER_ID, i,
+                            down_for=((time.time() - _since) if _since else 0.0)
+                            if _cut_off else None,
+                        ), "WARN" if _cut_off else "INFO")
                         i += 1
             except asyncio.CancelledError:
                 return
@@ -58976,10 +61471,19 @@ def _fresh_user_mode_id_token() -> "str | None":
             pass  # re-read token ALSO revoked → genuine, fall through to wipe
         except Exception:
             return None  # transient on the retry — leave keystore intact
+        tm.tm_emit(tm.Ev.TOKEN_REFRESH_FAILED,
+                   error_class=tm.ErrorClass.AUTH_REVOKED)
         log("user-mode id-token: refresh token revoked — wiping keystore", "WARN")
         keystore.clear_all(iuid, reason="revoke")
         return None
     except Exception as e:
+        # ⭐ THE LINE THAT DIAGNOSED THE FOUNDING INCIDENT, and that nobody ever
+        # saw: `refresh: network error … Failed to resolve
+        # 'securetoken.googleapis.com'`. It reached bare stderr and no file. The
+        # class is derived from the exception TYPE — a message here carries a
+        # hostname, a path and a Firebase Web API key.
+        tm.tm_emit(tm.Ev.TOKEN_REFRESH_FAILED,
+                   error_class=tm.classify_exception(e))
         log(f"user-mode id-token: refresh failed: {e}", "WARN")
         return None
 
@@ -59409,18 +61913,14 @@ async def _pair_prompt_one_key_with_verify(
             f"{attempts}/{max_attempts}."
         )
         try:
-            ans = await asyncio.to_thread(
-                input,
-                f"  {_c(_ACCENT, '>')}  Save this key anyway "
-                f"{_c(_DIM, '[y/N]:')} ",
-            )
+            _save_anyway = await _ask_yes_no("Save this key anyway", default=False)
         except EOFError:
             print()
             return ""
         except KeyboardInterrupt:
             print()
             raise
-        if (ans or "").strip().lower() in ("y", "yes"):
+        if _save_anyway:
             print(
                 f"  {_c(_WARN, '⚠')}  Saving unverified key. "
                 f"{_c(_DIM, 'Jobs will fail-loud at first run if it remains invalid.')}"
@@ -59613,6 +62113,8 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
     import socket as _socket
     import platform as _platform
 
+    tm.tm_emit(tm.Ev.PAIR_STARTED, supervised=_detect_supervised())
+
     # Per-step timing instrumentation, kept at DEBUG so the user-facing
     # terminal stays clean. Set `DG_PAIR_TRACE=1` in the env to re-enable
     # the `[pair +X.XXs]` step prefix on stderr for diagnosis. The
@@ -59664,6 +62166,7 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
         formatted = (
             f"{pair_code[:4]}-{pair_code[4:]}" if len(pair_code) == 8 else pair_code
         )
+        tm.tm_emit(tm.Ev.PAIR_CODE_SHOWN)
         print()
         print(f"  {_c(_DIM, 'Pair code')}")
         print(f"  {_c(_BOLD + _ACCENT, formatted)}")
@@ -59680,7 +62183,12 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
             # the terminal honors color (matches F12 of the CLI audit).
             qr.print_ascii(tty=True, invert=bool(_USE_COLOR))
         except ImportError:
-            log("    qrcode lib missing — pip install -r requirements.txt", "WARN")
+            # Cosmetic only: the pair code is printed as text a few lines below,
+            # so nothing is lost and there is nothing for the reader to do. It
+            # used to be a WARN in the middle of the branded pairing screen
+            # carrying a remedy that cannot run on an installed copy.
+            log("    QR image skipped (the qrcode library is not installed) — "
+                "type the code below instead; nothing else is affected.", "INFO")
         except Exception as e:
             log(f"    QR render failed: {e}", "WARN")
         print()
@@ -59736,28 +62244,56 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
         except v2_flow.PollTimeout:
             print()
             _cancel_unclaimed()
-            _pt("polling timed out — re-run --pair to start fresh", "ERROR")
+            tm.tm_emit(tm.Ev.PAIR_FAILED, stage=1,
+                       error_class=tm.ErrorClass.TIMEOUT)
+            _pt("no answer within the pairing window — nothing was claimed, "
+                "so nothing was left half-paired.", "ERROR")
+            _pt("Two things produce this, and they need different fixes: "
+                "the code was never entered in the web app, or this machine "
+                "could not reach us while it waited.", "ERROR")
+            _pt(f"Enter the code faster and this works. If you did enter it, "
+                f"run  {_PROG} --doctor  — it names which host this machine "
+                f"cannot reach and why.", "ERROR")
+            _pt(_doctor_share_logs_line(), "ERROR")
             return
         except v2_flow.InitiatePairError as e:
             print()
-            _pt(f"could not contact backend: {e}", "ERROR")
-            log("  Check internet + that superresearch.io is reachable.", "ERROR")
+            tm.tm_emit(tm.Ev.PAIR_FAILED, stage=1,
+                       error_class=tm.classify_exception(e))
+            _pt(f"could not reach the pairing service "
+                f"({type(e).__name__}: {e}).", "ERROR")
+            _pt("Nothing was created, so there is nothing to clean up — this is "
+                "the network between this machine and us.", "ERROR")
+            _pt(f"Run  {_PROG} --doctor  to find out which host is unreachable "
+                f"and whether it is DNS, a VPN, a proxy or a firewall.", "ERROR")
+            _pt(_doctor_share_logs_line(), "ERROR")
             return
         except KeyboardInterrupt:
             print()
             _cancel_unclaimed()
+            tm.tm_emit(tm.Ev.PAIR_CANCELLED, stage=1)
             log("Cancelled before exchange.", "WARN")
             return
         except Exception as e:
             print()
             _cancel_unclaimed()
-            _pt(f"unexpected error: {e}", "ERROR")
+            # A raw exception string is not a diagnosis, and this is the one
+            # branch that by definition has no better one — so it says exactly
+            # that, and hands over the log rather than leaving a dead end.
+            tm.tm_emit(tm.Ev.PAIR_FAILED, stage=1,
+                       error_class=tm.classify_exception(e))
+            _pt(f"pairing stopped on an error we have no specific advice for "
+                f"({type(e).__name__}: {e}).", "ERROR")
+            _pt("Anything part-created has been reverted, so re-running "
+                f"{_PROG} --pair  is safe.", "ERROR")
+            _pt(_doctor_share_logs_line(), "ERROR")
             return
         # Past this point we have a live device entry in Firestore that
         # cleanup needs to revert if the flow doesn't finish.
         captured_device_id = result["device_id"]
 
         print()  # Clear the polling line.
+        tm.tm_emit(tm.Ev.PAIR_TOKEN_EXCHANGED, ok=True)
         _pt(f"exchange OK — deviceId={result['device_id'][:12]}… uid={result['uid'][:14]}…")
 
         # Initial save — uses the synth uid as paired_uid until the
@@ -60635,16 +63171,15 @@ async def _login_one_profile(profile_dir, cua_client, *, label, results, emit_ro
                 print(f"  {_c(_WARN, 'No session:')} {_c(_DIM, ', '.join(_absent))}")
             if _held and not _absent:
                 # Fully signed in — DEFAULT skip the re-open (keep session intact).
-                prompt = (f"  {_c(_ACCENT, '>')}  Looks signed in — re-open anyway "
-                          f"{_c(_DIM, '(usually to check / do Human Verifications, if any)')}? "
-                          f"{_c(_DIM, '[y/N]')}: ")
+                question = ("Looks signed in — re-open anyway "
+                            f"{_c(_DIM, '(usually to check / do Human Verifications, if any)')}?")
                 default_open = False
             else:
                 # Some/all signed out — DEFAULT open Chrome so the user can sign in.
-                prompt = f"  {_c(_ACCENT, '>')}  Open Chrome to sign in? {_c(_DIM, '[Y/n]')}: "
+                question = "Open Chrome to sign in?"
                 default_open = True
-            ans = (await asyncio.to_thread(input, prompt)).strip().lower()  # Ctrl+C = cancel
-            want_open = (ans in ("", "y", "yes")) if default_open else (ans in ("y", "yes"))
+            # Ctrl+C = cancel (propagates through the shared reader untouched).
+            want_open = await _ask_yes_no(question, default=default_open)
             if not want_open:
                 print(f"  {_c(_DIM, 'Left as-is — your sign-in is untouched.')}")
                 return "ok"
@@ -60663,10 +63198,9 @@ async def _login_one_profile(profile_dir, cua_client, *, label, results, emit_ro
             print(f"  {_c(_DIM, 'Optional: verify each sign-in with the automated browser (opens every')}")
             print(f"  {_c(_DIM, 'platform once). On a fresh profile this can trip bot checks — skipping')}")
             print(f"  {_c(_DIM, 'is recommended; runs recheck logins at phase time anyway.')}")
-            ans = (await asyncio.to_thread(
-                input, f"  {_c(_ACCENT, '>')}  Skip the verification step? {_c(_DIM, '[Y/n]')}: "
-            )).strip().lower()  # Ctrl+C propagates — universal cancel
-            mode = "verify" if ans in ("n", "no") else "skip"
+            # Ctrl+C propagates — universal cancel.
+            _skip_verify = await _ask_yes_no("Skip the verification step?", default=True)
+            mode = "skip" if _skip_verify else "verify"
         # Pin the answer for the [r] reopen-to-fix loop — re-asking there let a
         # habitual Enter (default skip) silently defeat the re-verify the user
         # explicitly chose one prompt earlier.
@@ -60832,15 +63366,21 @@ async def run_login_flow(
         next_n = base + 1
         while True:
             try:
-                ans = (await asyncio.to_thread(
-                    input,
-                    f"  {_c(_ACCENT, '>')}  Add another browser profile (profile {next_n})? {_c(_DIM, '[y/N]')}: ",
-                )).strip().lower()
+                _add_more = await _ask_yes_no(
+                    f"Add another browser profile (profile {next_n})?",
+                    default=False,
+                    # The question just named profile N, so N is a yes; the count
+                    # they already have reads as "keep what I have" — a no. Both
+                    # are echoed back before being acted on.
+                    yes_aliases=(str(next_n),),
+                    no_aliases=(str(next_n - 1),),
+                )
             except (EOFError, KeyboardInterrupt):
                 print()
                 log(f"login add-loop: cancel at profile {next_n} prompt — keeping workerCount={next_n - 1}", "INFO")
                 break
-            if ans not in ("y", "yes"):
+            if not _add_more:
+                _say_profile_capacity(next_n - 1)
                 break
             try:
                 results, status = await _do_profile(next_n, next_n)
@@ -60876,6 +63416,7 @@ async def run_login() -> None:
     after each profile it offers the pair-style "add another profile?" loop.
     Re-run whenever a session expires. No pairing required; runs from a source
     checkout or the installed command."""
+    tm.tm_emit(tm.Ev.LOGIN_STARTED)
     _branded_header("aditus", _BOLD + _ACCENT, "sign in on a real browser")
     print()
     print(f"  {_c(_DIM, 'We open your real Chrome — sign in to each platform (+ solve any check).')}")
@@ -60893,12 +63434,11 @@ async def run_login() -> None:
         print(f"  {_c(_DIM, '     --login pauses any ongoing research at a checkpoint and closes its browser.')}")
         print(f"  {_c(_DIM, '     Interrupted runs can be resumed from the app (Retry on the alert) after login.')}")
         try:
-            _ans = (await asyncio.to_thread(
-                input, f"  {_c(_ACCENT, '>')}  Continue anyway? {_c(_DIM, '[y/N]')}: ")).strip().lower()
+            _go_on = await _ask_yes_no("Continue anyway?", default=False)
         except (EOFError, KeyboardInterrupt):
             print()
             return
-        if _ans not in ("y", "yes"):
+        if not _go_on:
             print(f"  {_c(_DIM, 'Aborted. Stop the backend, then re-run')}  {_c(_BOLD, _PROG + ' --login')}{_c(_DIM, '.')}")
             return
         # #907: stamp the login marker BEFORE touching any Chrome so the
@@ -60977,6 +63517,8 @@ async def run_login() -> None:
         print(f"  {_c(_WARN, '⚠')}  {_c(_BOLD, 'Sign-in did not complete.')}")
         print(f"  {_c(_DIM, '     If Chrome kept looping the human-check, it is likely your network/IP')}")
         print(f"  {_c(_DIM, '     (VPN / datacenter). Try a residential, non-VPN connection and re-run.')}")
+    tm.tm_emit(tm.Ev.LOGIN_FINISHED, ok=bool(_any_ok),
+               count=len(_missing_names))
     print()
     print(f"  {_c(_ACCENT, 'Next')}")
     print(f"    {_c(_DIM, '›')} {_c(_BOLD, _PROG + ' --serve')}   {_c(_DIM, '# run the backend')}")
@@ -61017,6 +63559,7 @@ async def _continue_pair_stages_2_to_5(
     #       succeed, so an aborted login can't leave Firestore with
     #       supervised=true while platforms are half-logged-in.
     # ══════════════════════════════════════════════════════════════════════
+    tm.tm_emit(tm.Ev.PAIR_STAGE_REACHED, stage=2)
     _setup_step(2, 5, "On Startup")
     print(f"  {_c(_DIM, 'Keep the backend running in the background?')}")
     print(f"  {_c(_DIM, 'It will auto-start when you log in and stay alive through crashes')}")
@@ -61024,12 +63567,7 @@ async def _continue_pair_stages_2_to_5(
     print()
     enable_on_startup = False
     try:
-        _startup_typed = await asyncio.to_thread(
-            input, f"  {_c(_ACCENT, '>')}  Enable On Startup? {_c(_DIM, '[Y/n]')}: ",
-        )
-        _ans = _startup_typed.strip().lower()
-        if _ans in ("", "y", "yes"):
-            enable_on_startup = True
+        enable_on_startup = await _ask_yes_no("Enable On Startup?", default=True)
     except EOFError:
         # No stdin (piped / non-interactive) — keep the safe default (skip
         # arming) and continue, rather than aborting a scripted pair.
@@ -61071,6 +63609,7 @@ async def _continue_pair_stages_2_to_5(
     #       top of Stage 4) sees the new key. NOT written to .dg-supervisor
     #       .env — would create a 3rd source of truth and drift on rotation.
     # ══════════════════════════════════════════════════════════════════════
+    tm.tm_emit(tm.Ev.PAIR_STAGE_REACHED, stage=3)
     _setup_step(3, 5, "API keys")
     print(f"  {_c(_DIM, 'Anthropic powers the agents (CUA + Vision).  Gemini powers narration.')}")
     print(f"  {_c(_DIM, 'Already-set keys are detected and reused. Skip to set later via the web app.')}")
@@ -61090,6 +63629,7 @@ async def _continue_pair_stages_2_to_5(
     #       Uses CUA + Vision when Anthropic key was set in Stage 3 (above),
     #       or falls back to Playwright-only if user skipped.
     # ══════════════════════════════════════════════════════════════════════
+    tm.tm_emit(tm.Ev.PAIR_STAGE_REACHED, stage=4)
     _setup_step(4, 5, "Browser logins")
     print(f"  {_c(_DIM, 'We open your real Chrome — sign in to each platform (+ solve any check).')}")
     print(f"  {_c(_DIM, 'Your sign-ins are saved to the profile (verification optional afterwards).')}")
@@ -61277,15 +63817,21 @@ async def _continue_pair_stages_2_to_5(
         next_profile_n = 2
         while True:
             try:
-                ans = (await asyncio.to_thread(
-                    input,
-                    f"  {_c(_ACCENT, '>')}  Add another browser profile (profile {next_profile_n})? {_c(_DIM, '[y/N]')}: ",
-                )).strip().lower()
+                _add_more = await _ask_yes_no(
+                    f"Add another browser profile (profile {next_profile_n})?",
+                    default=False,
+                    # See the --login add-loop: the number the question just used
+                    # is a yes, the count already held is a no, and either reading
+                    # is echoed before it is acted on.
+                    yes_aliases=(str(next_profile_n),),
+                    no_aliases=(str(next_profile_n - 1),),
+                )
             except (EOFError, KeyboardInterrupt):
                 print("")
                 log(f"Multi-profile loop: Ctrl+C at profile {next_profile_n} prompt — keeping workerCount={next_profile_n - 1}", "INFO")
                 break
-            if ans not in ("y", "yes"):
+            if not _add_more:
+                _say_profile_capacity(next_profile_n - 1)
                 break
 
             prof_path = str(_profile_dir(next_profile_n))
@@ -61333,6 +63879,15 @@ async def _continue_pair_stages_2_to_5(
         print("")
 
     if not cancelled:
+        # ⭐⭐ THE DENOMINATOR. Without a completion event, PAIR_FAILED has nothing
+        # to be a fraction OF — and "no completions recorded" reads exactly like
+        # "nobody ever finishes pairing". `profiles` is the answer to the question
+        # the founding incident turned on: the owner wanted two concurrent run
+        # slots and got one, and [5/5] Ready reported success without ever naming
+        # the capacity.
+        tm.tm_emit(tm.Ev.PAIR_COMPLETED, stage=5,
+                   profiles=max(1, int(next_profile_n) - 1),
+                   supervised=bool(enable_on_startup))
         # ══════════════════════════════════════════════════════════════════════
         # [5/5] READY — pair is complete. If the user opted into On Startup
         #       back in step 2, arm the supervisor NOW (deferred from step 2).
@@ -61357,6 +63912,15 @@ async def _continue_pair_stages_2_to_5(
         else:
             print(f"  {_c(_WARN, '⚠')}  No platforms logged in yet")
             print(f"  {_c(_DIM, '     Sign in with')}  {_c(_BOLD, _PROG + ' --login')}  {_c(_DIM, '(a real browser), then')}  {_c(_BOLD, _PROG + ' --serve')}{_c(_DIM, '. No re-pair needed.')}")
+        # Ready used to report platforms and never capacity, so a user who
+        # asked for two concurrent slots and got one saw nothing but success.
+        # Read from disk rather than from the add-loop's counter: the loop only
+        # runs when profile 1 fully succeeded, and Ready runs regardless.
+        _ready_cap = max(1, int(load_worker_count() or 1))
+        _ready_profiles = "profile" if _ready_cap == 1 else "profiles"
+        _ready_slots = "slot" if _ready_cap == 1 else "slots"
+        print(f"  {_c(_OK, '✓')}  {_ready_cap} browser {_ready_profiles} "
+              f"{_c(_DIM, f'— {_ready_cap} concurrent run {_ready_slots}')}")
         print(f"  {_c(_OK, '✓')}  Browser closed")
 
         supervised_armed = False
@@ -63079,6 +65643,14 @@ def run_daemon_loop(port: int = 8000):
     _serve_log = _log_dir / "backend.log"
     _serve_err = _log_dir / "backend.err.log"
 
+    # Rotate BEFORE the pythonw tee below opens either file for append — a
+    # rename with our own handle already on it is the case Windows refuses.
+    # Silent here by necessity: `_sup_audit` does not exist yet and `log()`
+    # crashes under pythonw until the tee is in place, so the sizes are held
+    # and audited a few lines below.
+    _rotated_out = _rotate_if_oversize(_serve_log)
+    _rotated_err = _rotate_if_oversize(_serve_err)
+
     # When the Scheduled Task action runs the supervisor under pythonw.exe
     # (no-console interpreter — keeps the daemon-loop window from appearing
     # at logon), sys.stdout / sys.stderr are None and any print() inside
@@ -63116,6 +65688,12 @@ def run_daemon_loop(port: int = 8000):
             f"supervisor up: pid={os.getpid()} exe={Path(_sys.executable).name} "
             f"workerCount={load_worker_count()} port={port}"
         )
+        for _name, _rolled in (("backend.log", _rotated_out),
+                               ("backend.err.log", _rotated_err)):
+            if _rolled:
+                _sup_audit(f"rotated {_name} at {_rolled} bytes → {_name}.1")
+        for _stale in _prune_local_logs():
+            _sup_audit(f"pruned local log capture: {Path(_stale).name}")
     except Exception:
         pass
 
@@ -63241,10 +65819,13 @@ def run_daemon_loop(port: int = 8000):
             except Exception as _ie:
                 _missing.append(f"{_mod} ({_ie.__class__.__name__}: {_ie})")
         if _missing:
-            _req_path = _log_dir / "requirements.txt"
+            # The old line pointed at `{_log_dir}/requirements.txt` — a path
+            # that exists on no install of either kind, so the one instruction
+            # printed at the moment the product stopped working could not work.
             _msg = (
                 f"SUPERVISOR ABORT: {len(_missing)} required import(s) failed under "
-                f"{python_exe}. Run: \"{python_exe}\" -m pip install -r \"{_req_path}\". "
+                f"{python_exe}, so this machine cannot start. Repair it with: "
+                f"{_remedy_reinstall()}. "
                 f"Missing: " + "; ".join(_missing)
             )
             try:
@@ -63311,6 +65892,8 @@ def run_daemon_loop(port: int = 8000):
             # log it and try anyway (uvicorn will surface EADDRINUSE).
             if not _wait_for_port_free(w_port, max_wait_s=10.0):
                 log(f"[daemon-loop] worker {k}: port {w_port} still in use after 10s — spawning anyway", "WARN")
+            _rotate_if_oversize(log_out_path, audit=_sup_audit)
+            _rotate_if_oversize(log_err_path, audit=_sup_audit)
             try:
                 _out_fh = open(log_out_path, "ab")
                 _err_fh = open(log_err_path, "ab")
@@ -63644,6 +66227,12 @@ def run_daemon_loop(port: int = 8000):
     while True:
         try:
             log(f"[daemon-loop] Starting --serve (restart #{restarts})")
+            # ⭐ THE SITE THAT ACTUALLY MATTERS. `load_worker_count()` defaults
+            # to 1, so this loop — not the multi-worker branch — is where the
+            # default install lives. It also re-opens on every respawn, which
+            # makes rotation per-respawn for free.
+            _rotate_if_oversize(_serve_log, audit=_sup_audit)
+            _rotate_if_oversize(_serve_err, audit=_sup_audit)
             with open(_serve_log, "ab") as _out, open(_serve_err, "ab") as _err:
                 result = _subprocess.run(
                     [python_exe, script_path, "--serve", "--port", str(port)],
@@ -65517,6 +68106,58 @@ def run_doctor():
         _fb_ok = init_firebase()
     if _fb_ok:
         _ok("Firestore client", "user-mode (refresh-token credentials)")
+    elif _firebase_down_reason == "transient":
+        # ⛔⛔ 2026-08-17 — THIS BRANCH DID NOT EXIST, and its absence is what
+        # sent a real new owner in a circle. Their machine could not resolve
+        # firestore.googleapis.com; --doctor told them their token was revoked
+        # and to re-pair. Re-pairing cannot fix a network, and it spends the
+        # pairing they still had. `init_firebase` has always known the
+        # difference — it sets the reason authoritatively, from whether the
+        # live token refresh raised (network) or returned None (revoked) —
+        # and doctor simply never asked.
+        _fail(f"Cannot reach {FIRESTORE_HOST}",
+              "the network, not your pairing — nothing here needs re-pairing")
+
+        # ⭐ Then LOCALIZE it, rather than handing over a list of suspects. The
+        # probes only run on this branch, so a healthy machine pays nothing for
+        # them. Resolution and connection are asked separately because they have
+        # different causes and different fixes.
+        print()
+        print(f"  {_c(_BOLD, 'Network path')}")
+        print(f"  {_rule(max_width=58)}")
+        _probes = []
+        with _sync_spinner_ctx("Testing the hosts this machine needs"):
+            for _host, _why_host, _kind in _DOCTOR_NET_TARGETS:
+                _probes.append(_probe_host(_host))
+        for _p, (_h, _why_host, _kind) in zip(_probes, _DOCTOR_NET_TARGETS):
+            if _p["connected"]:
+                _ok(f"{_p['host']}", f"{_why_host} — resolves to {_p['addr']}, connects")
+            elif _p["resolved"]:
+                _fail(f"{_p['host']}",
+                      f"{_why_host} — resolves to {_p['addr']}, but the connection "
+                      f"was refused ({_p['connect_error']})")
+            else:
+                _fail(f"{_p['host']}",
+                      f"{_why_host} — the name could not be looked up "
+                      f"({_p['resolve_error']})")
+
+        _verdict = _network_verdict(_probes)
+        print()
+        print(f"  {_c(_BOLD, _verdict['headline'])}")
+        for _addr in _verdict["blocked_addrs"]:
+            print(f"  {_c(_DIM, 'Refusing address: ' + _addr + ':443')}")
+        for _act in _verdict["actions"]:
+            print(f"     {_c(_ACCENT, '→')} {_act}")
+        # ⛔ Say plainly that this is not ours to change. A diagnostic that
+        # implies it will fix a VPN is the same species of lie as the message
+        # that told them to re-pair.
+        print()
+        print(f"  {_c(_DIM, 'Super Research cannot change any of this for you — DNS, VPN,')}")
+        print(f"  {_c(_DIM, 'proxy and firewall settings belong to this machine and this')}")
+        print(f"  {_c(_DIM, 'network. Nothing is wrong with your install or your pairing.')}")
+        print(f"  {_c(_DIM, _doctor_share_logs_line())}")
+        manual_actions.extend(_verdict["actions"] or [
+            f"nslookup {FIRESTORE_HOST}   (then check VPN / proxy / firewall / DNS)"])
     else:
         _fail("Firestore init failed", "OS keystore empty or refresh token revoked")
         manual_actions.append("Run `python research.py --pair`")
@@ -65529,8 +68170,8 @@ def run_doctor():
         import patchright  # noqa: F401
         _ok("patchright package", "installed in active venv")
     except ImportError:
-        _fail("patchright not importable", "pip install -r requirements.txt")
-        manual_actions.append("pip install -r requirements.txt")
+        _fail("patchright not importable", _remedy_reinstall())
+        manual_actions.append(_remedy_reinstall())
     try:
         # All-semicolons probe so `python -c` parses on every platform
         # (compound try/except blocks with embedded \n break -c). If
@@ -65569,8 +68210,15 @@ def run_doctor():
             manual_actions.append("patchright install chrome")
             manual_actions.append(_chrome_install_hint())
         elif "modulenotfounderror" in _combined or "no module named" in _combined:
-            _fail("patchright module not importable in subprocess", "venv mismatch?")
-            manual_actions.append("source .venv/bin/activate && pip install -r requirements.txt")
+            # "venv mismatch?" — a question mark was the whole detail, and the
+            # remedy was POSIX-only shell on a product whose commonest new-owner
+            # platform is Windows. Say what was actually observed instead: the
+            # probe runs the SAME interpreter that just imported patchright
+            # successfully a few lines above, so a failure here is a broken or
+            # half-written install rather than the wrong environment.
+            _fail("patchright imports here but not in a fresh subprocess",
+                  f"same interpreter ({sys.executable}) — a partial or broken install")
+            manual_actions.append(_remedy_reinstall())
         else:
             _warn("Chromium launch test inconclusive",
                   (_stderr[:80] or _stdout[:80] or f"exit={_chromium_check.returncode}"))
@@ -65750,6 +68398,8 @@ def run_doctor():
     if issues_found == 0:
         print(f"  {_c(_OK + _BOLD, '✓  Healthy.')}  {_c(_DIM, 'All checks passed.')}")
     else:
+        tm.tm_emit(tm.Ev.DOCTOR_RUN, count=int(issues_found),
+                   supervised=_detect_supervised())
         print(f"  {_c(_BOLD, f'Found {issues_found} issue(s); applied {fixes_applied} auto-fix(es).')}")
         if manual_actions:
             print()
@@ -65927,6 +68577,472 @@ def _is_source_checkout() -> bool:
         return (Path(__file__).resolve().parent / "agent" / "facade" / "__main__.py").exists()
     except Exception:
         return False
+
+
+# ─── Where exactly the network path is broken ──────────────────────────
+# ⛔ 2026-08-17. A new owner's machine could not resolve firestore.googleapis.com.
+# `--doctor` told them their refresh token was revoked and to re-pair, which
+# cannot fix a network and spends the pairing they still had. Naming the real
+# fault was the first fix; this is the second, and the owner asked for it
+# directly: "so the doctor tells them the RIGHT solution".
+#
+# ⭐⭐ IT CANNOT FIX THIS, AND MUST NOT PRETEND TO. DNS resolvers, VPN clients,
+# corporate proxies and firewall rules are the user's own machine and network,
+# most of them need administrator rights, and none of them are ours to change.
+# What a diagnostic CAN do is stop handing over a list of five suspects and
+# instead say WHICH ONE — and where it cannot, hand over the log.
+#
+# The three hosts are the product's own dependencies, not arbitrary pings, so
+# the control costs nothing extra and its answer is directly relevant: two
+# Google API hostnames the pipeline cannot work without, and one non-Google host
+# it also needs. That third one is what separates "this machine has no working
+# DNS at all" from "something on this network answers for everything EXCEPT
+# Google's APIs" — which is the corporate-resolver and blocklist case, and the
+# single most likely cause of the outage that started all this.
+_DOCTOR_NET_TARGETS = (
+    (FIRESTORE_HOST, "the channel your machine and the web app talk over", "google"),
+    ("securetoken.googleapis.com", "the sign-in refresh your machine needs", "google"),
+    ("firebasestorage.googleapis.com",
+     "where your logs and podcasts are uploaded", "google"),
+    ("api.anthropic.com", "a non-Google host the pipeline also needs", "control"),
+)
+
+
+def _probe_host(host: str, port: int = 443, timeout: float = 4.0) -> dict:
+    """Resolve a hostname, then try to open a socket to it.
+
+    Two SEPARATE facts, reported separately, because they have different causes
+    and different fixes: a name that will not resolve is DNS, and a name that
+    resolves but will not connect is a firewall or a proxy. The old single
+    "could not reach" verdict could not tell them apart, so its advice had to
+    list both and commit to neither.
+    """
+    out = {"host": host, "resolved": False, "connected": False,
+           "addr": "", "resolve_error": "", "connect_error": ""}
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+        out["resolved"] = True
+        if infos:
+            out["addr"] = str(infos[0][4][0])
+    except Exception as exc:
+        out["resolve_error"] = f"{type(exc).__name__}: {exc}"
+        return out
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            out["connected"] = True
+    except Exception as exc:
+        out["connect_error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
+def _network_verdict(probes: "list[dict]") -> dict:
+    """Turn three probe results into ONE named fault, a headline, and actions.
+
+    Pure so it can be tested without a network — the probes are the only part
+    that touches one. Returns `kind`, `headline`, `actions` and `blocked_addrs`
+    (the resolved addresses of whatever refused a connection, which is exactly
+    what a corporate IT ticket has to name).
+    """
+    rows = [p for p in (probes or []) if isinstance(p, dict)]
+    if not rows:
+        return {"kind": "unknown", "headline": "No network probes ran.",
+                "actions": [], "blocked_addrs": []}
+
+    def group(kind):
+        return [p for p in rows
+                if next((t[2] for t in _DOCTOR_NET_TARGETS if t[0] == p.get("host")),
+                        "control") == kind]
+
+    google, control = group("google"), group("control")
+    g_res = [p for p in google if p.get("resolved")]
+    c_res = [p for p in control if p.get("resolved")]
+    unresolved = [p for p in rows if not p.get("resolved")]
+    unconnected = [p for p in rows if p.get("resolved") and not p.get("connected")]
+    blocked = [p.get("addr", "") for p in unconnected if p.get("addr")]
+
+    if not unresolved and not unconnected:
+        return {"kind": "ok",
+                "headline": "The network path is fine — every host this machine "
+                            "needs resolves and accepts a connection.",
+                "actions": [], "blocked_addrs": []}
+
+    if not g_res and not c_res:
+        return {
+            "kind": "no_dns",
+            "headline": "This machine has no working name resolution at all — "
+                        "not one of the hosts it needs could be looked up.",
+            "actions": [
+                "Check you are actually on a network (Wi-Fi joined, cable in).",
+                "If this is a hotel, cafe or campus network, open any web page "
+                "first — those networks hold you until you accept their terms.",
+                "If you are on a VPN, disconnect it and run this again.",
+            ],
+            "blocked_addrs": [],
+        }
+
+    if c_res and not g_res:
+        return {
+            "kind": "google_blocked",
+            "headline": "Name resolution works, but NOT for Google's APIs — "
+                        "something on this network answers for everything except "
+                        "the hosts Super Research needs.",
+            "actions": [
+                "This is nearly always a corporate DNS server, a VPN's resolver, "
+                "or a network-level blocker such as a Pi-hole.",
+                "Disconnect any VPN and run this again — that alone settles it.",
+                f"If you administer this network, allow {FIRESTORE_HOST} and "
+                f"securetoken.googleapis.com.",
+                "If someone else administers it, this is the sentence to send "
+                "them: name resolution for *.googleapis.com is not being answered "
+                "on this network.",
+            ],
+            "blocked_addrs": [],
+        }
+
+    if unconnected and not unresolved:
+        return {
+            "kind": "blocked_after_dns",
+            "headline": "The names resolve, so DNS is fine — but this machine "
+                        "cannot open a connection to them. Something is refusing "
+                        "the traffic, not the lookup.",
+            "actions": [
+                "That is a firewall or an intercepting proxy rather than DNS.",
+                "Disconnect any VPN and run this again.",
+                "If someone else administers this network, they need to allow "
+                "outbound TCP on port 443 to the addresses listed above.",
+            ],
+            "blocked_addrs": blocked,
+        }
+
+    return {
+        "kind": "partial",
+        "headline": "Some of the hosts this machine needs answer and some do not, "
+                    "so the fault is inside this network rather than at either end.",
+        "actions": [
+            "Disconnect any VPN and run this again — a split-tunnel VPN produces "
+            "exactly this pattern.",
+            "If it persists, the per-host detail above is what to send us.",
+        ],
+        "blocked_addrs": blocked,
+    }
+
+
+# ─── --send-logs: the hand-over that does not need the network to work ──
+# ⛔⛔ THE FOUNDING BLOCKER, and the reason this ladder exists. The machine that
+# started this wave was PAIRED, with Google DNS dead: securetoken, firestore and
+# firebasestorage were all unreachable, so the authenticated path was not slow,
+# it was gone. An unpaired-only fallback would have excluded exactly that case.
+#
+# So the order is: write the file locally FIRST and print where it is, then try
+# the authenticated upload, then fall back to our own host. The printed local
+# file is the floor, and it is the only rung that cannot fail.
+#
+# ⭐ Honest residual, stated in the copy rather than hidden: if ALL DNS is dead —
+# ours included — nothing live can send anything. The file on disk and the
+# doctor's network verdict are what the person is left holding, and that is a
+# real answer, unlike a spinner.
+
+# ⛔ The 30-day deletion promise is GATED. No bucket lifecycle rule exists in
+# any repo, so until one is applied and read back (the ship-time runbook step),
+# saying "deleted after 30 days" would be a lie of exactly the kind wave 1 spent
+# itself removing. Flip this in the SAME commit as the verified `gcloud storage
+# buckets describe` output, never before.
+BUNDLE_LIFECYCLE_VERIFIED = False
+
+
+def _send_logs_consent_lines(runs: int = BUNDLE_MAX_RUNS) -> "list[str]":
+    """Everything that leaves the machine, named. One line per fact.
+
+    ⭐ The run bounds and the raw device logs are listed SEPARATELY on purpose:
+    the runs obey 30-runs/30-days, and the raw logs are byte-tails with no age
+    bound at all — a machine that predates per-run capture has its whole history
+    only there. Folding them into one sentence would make the 30-day half a
+    claim about bytes it does not cover.
+    """
+    n = max(BUNDLE_MIN_RUNS, min(int(runs), BUNDLE_MAX_RUNS))
+    lines = [
+        f"at most {n} run{'' if n == 1 else 's'} from this machine — and only "
+        f"{'if it is' if n == 1 else 'those'} from the last "
+        f"{BUNDLE_MAX_AGE_DAYS} days",
+        "your research topics, and the titles of what each run produced",
+        "links that open your research results — anyone holding one can read them",
+        "the email address on your account",
+        "what the agent screens showed while a run was working",
+        "this computer's hostname and the account name you sign into it with",
+        "this device's own log files — the most recent few megabytes of each, "
+        "whatever their age",
+    ]
+    # ⛔⛔ EVERYTHING BELOW THE FIRST LINE IS UNAFFECTED BY THE NUMBER. The
+    # sessions are age-bound only and the raw tails have no bound at all, and
+    # those tails carry the same topics, result links and account email for the
+    # machine's whole history. Without this sentence, moving the number down
+    # reads as "less of everything leaves", which is the one thing it does not
+    # mean.
+    lines.append(
+        f"⚠ only the first line above is what the {n}-run choice changes — "
+        f"everything else leaves in full whatever number you pick")
+    if BUNDLE_LIFECYCLE_VERIFIED:
+        lines.append("and it is deleted automatically after 30 days")
+    return lines
+
+
+def _queued_bundle_rows_path() -> "Path":
+    return _logs_root() / "pending-bundle-rows.jsonl"
+
+
+def _queue_log_bundle_row(owner_uid: str, code: str, patch: dict,
+                          device_id: str = "") -> None:
+    """Park an index-row write that could not go out now.
+
+    ⭐ The row appears LATE rather than never. During the incident this feature
+    exists for, Firestore was unreachable — so the upload can succeed through
+    our own host while the row that names it cannot be written at all."""
+    try:
+        path = _queued_bundle_rows_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"ownerUid": owner_uid, "code": code,
+                                 "deviceId": device_id, "patch": patch,
+                                 "at": _utc_iso()}) + "\n")
+    except Exception:
+        pass
+
+
+def _drain_queued_log_bundle_rows() -> int:
+    """Try the parked row writes again. Returns how many landed.
+
+    Reads the whole file, rewrites what is still owed. Best-effort and silent
+    when there is nothing parked, because this runs at the top of every
+    command."""
+    path = _queued_bundle_rows_path()
+    try:
+        lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    except OSError:
+        return 0
+    if not lines or not _firebase_db:
+        return 0
+    still_owed, landed = [], 0
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue  # unparseable — drop it rather than retry forever
+        # ⛔ Replays the OPEN and then the patch, in that order. Replaying the
+        # patch alone as a create is what the rule refuses — the defect this
+        # helper existed to work around and was itself reproducing.
+        owner = row.get("ownerUid") or ""
+        code = row.get("code") or ""
+        if (_open_log_bundle_row(owner, code, row.get("deviceId") or "")
+                and _write_log_bundle_status(owner, code, row.get("patch") or {})):
+            landed += 1
+        else:
+            still_owed.append(line)
+    try:
+        if still_owed:
+            path.write_text("\n".join(still_owed) + "\n", encoding="utf-8")
+        else:
+            path.unlink()
+    except OSError:
+        pass
+    if landed:
+        log(f"[send-logs] {landed} parked bundle row(s) reached the account")
+    return landed
+
+
+def _post_bundle_to_ingest(local_path: "Path", code: str,
+                           email: "str | None" = None) -> "str | None":
+    """Last live rung: POST the bundle to our own host, unauthenticated.
+
+    ⛔ Reached for PAIRED machines too, not only unpaired ones. The founding
+    machine was paired and its Google DNS was dead, so gating this on "never
+    paired" would have excluded the one case it was built for."""
+    import requests as _requests
+    try:
+        from auth.v2_flow import FE_BASE_URL as _base
+    except Exception:
+        _base = "https://superresearch.io"
+    url = f"{_base.rstrip('/')}/api/logs/ingest"
+    try:
+        size = Path(local_path).stat().st_size
+    except OSError:
+        return None
+    if size > BUNDLE_INGEST_MAX_BYTES:
+        log(f"[send-logs] bundle is {size} bytes — over the {BUNDLE_INGEST_MAX_BYTES} "
+            f"ceiling the unauthenticated route accepts", "WARN")
+        return None
+    headers = {
+        "Content-Type": BUNDLE_CONTENT_TYPE,
+        "X-Support-Code": code,
+        "X-Install-Id": str(_install_uuid_best_effort() or ""),
+        "X-Build": _sr_version(),
+    }
+    if email:
+        headers["X-Contact-Email"] = email
+    try:
+        with open(local_path, "rb") as fh:
+            resp = _requests.post(url, headers=headers, data=fh, timeout=180)
+    except Exception as exc:
+        log(f"[send-logs] {url} unreachable: {type(exc).__name__}: {exc}", "WARN")
+        return None
+    if resp.status_code != 200:
+        log(f"[send-logs] ingest refused: HTTP {resp.status_code} "
+            f"{str(resp.text)[:200]}", "WARN")
+        return None
+    try:
+        return str((resp.json() or {}).get("supportCode") or code)
+    except Exception:
+        return code
+
+
+def cmd_send_logs(assume_yes: bool = False, email: "str | None" = None,
+                  runs: "int | None" = None) -> int:
+    """`superresearch --send-logs` — hand the logs over from the terminal.
+
+    Returns a process exit code. 0 means something landed OR the local file was
+    written, because the local file IS a successful outcome: it is what a person
+    attaches to an email when their network is the thing that is broken."""
+    _branded_header("nuntius", _BOLD + _ACCENT, "hand it over")
+    print()
+    print(f"  {_c(_BOLD, 'What leaves this machine')}")
+    n_runs = BUNDLE_MAX_RUNS if runs is None else max(
+        BUNDLE_MIN_RUNS, min(int(runs), BUNDLE_MAX_RUNS))
+    for line in _send_logs_consent_lines(n_runs):
+        print(f"    {_c(_DIM, '•')}  {line}")
+    print()
+    print(f"  {_c(_BOLD, 'What does not')}")
+    for line in ("passwords", "browser cookies or profiles", "your API keys"):
+        print(f"    {_c(_DIM, '•')}  {line}")
+    print()
+
+    if not assume_yes:
+        try:
+            if not _ask_yes_no_sync("Send this to the team?", default=False):
+                print(f"  {_c(_DIM, 'Nothing was sent.')}")
+                return 0
+        except (EOFError, KeyboardInterrupt):
+            print()
+            print(f"  {_c(_DIM, 'Nothing was sent.')}")
+            return 130
+
+    code = _mint_support_code()
+    dest = _logs_root() / "outgoing" / f"support-{code}{BUNDLE_SUFFIX}"
+
+    # ── Rung 0: the file. Always, first, and printed. ──
+    try:
+        summary = _build_log_bundle(dest, support_code=code, max_runs=n_runs)
+    except Exception as exc:
+        print(f"  {_c(_WARN, '⚠')}  Could not build the log bundle: {exc}")
+        print(f"  {_c(_DIM, 'The raw logs are still here:')}  "
+              f"{_c(_BOLD, str(_logs_root()))}")
+        return 1
+    _n_runs = summary["runCount"]
+    _n_sessions = summary["sessionCount"]
+    _n_bytes = summary["sizeBytes"]
+    print(f"  {_c(_OK, '✓')}  Bundle written  {_c(_BOLD, str(dest))}")
+    print(f"     {_c(_DIM, f'{_n_runs} run(s), {_n_sessions} session(s), {_n_bytes} bytes')}")
+    _n_dropped = len(summary["droppedForSize"])
+    if _n_dropped:
+        # ⛔ Never a silent truncation: a bundle that quietly dropped the run
+        # somebody is asking about reads as complete coverage.
+        print(f"     {_c(_DIM, f'{_n_dropped} older item(s) left out for size')}")
+    print()
+
+    landed_via = None
+    device_id = load_device_id()
+    id_token = _fresh_user_mode_id_token()
+    owner_uid = (_decode_jwt_claims(id_token) or {}).get("ownerUid") if id_token else None
+
+    # ── Rung 1: the authenticated upload. ──
+    if id_token and owner_uid and device_id:
+        object_path = _upload_log_bundle_via_storage_rest(dest, owner_uid, device_id, code)
+        if object_path:
+            landed_via = "your account"
+            patch = {"status": "done", "objectPath": object_path,
+                     "runCount": int(summary["runCount"]),
+                     "sessionCount": int(summary["sessionCount"]),
+                     "sizeBytes": int(summary["sizeBytes"])}
+            # ⛔⛔ THE ROW IS THE ONLY THING CLEAR SHARED LOGS CAN SEE. It walks
+            # rows, not objects — so a send whose row never lands leaves a
+            # readable bundle in the bucket that the privacy button cannot
+            # reach, on a product where no lifecycle rule exists yet. A terminal
+            # process has no Firestore client at all, so in practice both writes
+            # park and a serve process replays them.
+            if not (_open_log_bundle_row(owner_uid, code, device_id or "", "")
+                    and _write_log_bundle_status(owner_uid, code, patch)):
+                _queue_log_bundle_row(owner_uid, code, patch,
+                                      device_id=device_id or "")
+    elif not id_token:
+        print(f"  {_c(_DIM, 'This machine could not sign in, so the account route is')} "
+              f"{_c(_DIM, 'unavailable — trying our own host instead.')}")
+
+    # ── Rung 2: our own host, unauthenticated. Paired machines included. ──
+    if not landed_via:
+        _server_code = _post_bundle_to_ingest(dest, code, email=email)
+        if _server_code:
+            landed_via = "superresearch.io"
+            # ⛔ THE SERVER'S CODE WINS ON THIS PATH. There is no uid and no
+            # deviceId to scope an object under here, so a caller-chosen folder
+            # name would let anyone who learned a code overwrite the bundle it
+            # names — the route therefore mints its own and ignores ours.
+            # Printing the local one would send a person into a support
+            # conversation quoting a code that indexes nothing.
+            code = _server_code
+
+    print()
+    tm.tm_emit(tm.Ev.SEND_LOGS_RESULT, ok=bool(landed_via),
+               count=int(summary["runCount"]))
+    if landed_via:
+        print(f"  {_c(_OK, '✓')}  Sent via {_c(_BOLD, landed_via)}")
+        print(f"  {_c(_BOLD, 'Your support code is')}  {_c(_BOLD + _ACCENT, code)}")
+        print(f"  {_c(_DIM, 'Quote it to us and we can find your logs.')}")
+        return 0
+
+    print(f"  {_c(_WARN, '⚠')}  Nothing could be sent from this machine right now.")
+    print(f"  {_c(_DIM, 'That is usually the network itself — run')}  "
+          f"{_c(_BOLD, _PROG + ' --doctor')}  {_c(_DIM, 'to see which part.')}")
+    print(f"  {_c(_DIM, 'The bundle is on disk and can be attached to an email:')}")
+    print(f"     {_c(_BOLD, str(dest))}")
+    return 0
+
+
+def _doctor_share_logs_line() -> str:
+    """What to say when the diagnosis does not get them moving.
+
+    ⭐ Owner, 2026-08-17: every failure a person can be left holding should
+    point at the way to hand it over — "so the user would know that he can share
+    the logs on failure to the dev team and get it sorted".
+    ⭐ 2026-08-18, WAVE 2: the command now exists, so this line names it. Until
+    today it deliberately did NOT — naming a command that was not there is the
+    exact defect this wave set out to remove, and the test that pinned its
+    absence flips in this same commit, which is how it was designed to work.
+
+    The FILE is still named, and second: `--send-logs` needs a shell, and the
+    person reading this may not have one open. Report Bug stays as the third
+    route because it needs neither.
+    """
+    return (f"Still stuck? Run {_PROG} --send-logs to hand your logs to us, "
+            f"or send the file yourself — {_STATE_DIR / 'logs' / 'backend.log'} "
+            f"— or use Report Bug on the web app's Settings page.")
+
+
+def _remedy_reinstall() -> str:
+    """The command that actually repairs a broken install — for THIS install.
+
+    ⛔ 2026-08-17. Four separate messages prescribed `pip install -r
+    requirements.txt`, and a pipx install has no requirements.txt and never has
+    had one. The supervisor's abort was the worst of them: it built a path
+    under the LOG directory (`~/.super-research/logs/requirements.txt`), which
+    exists on no machine of either kind. So the one instruction printed at the
+    moment the product stopped working was guaranteed to fail, and then the
+    reader has no second idea.
+
+    ⭐ `--force` rather than a plain install: pipx treats re-installing an
+    already-present package as a no-op AND exits 0, so a plain install would
+    report success while changing nothing.
+    """
+    if _is_source_checkout():
+        return "pip install -r requirements.txt"
+    return "pipx install --force superresearch"
 
 
 def _version_gt(a: str, b: str) -> bool:
@@ -67146,10 +70262,10 @@ def _self_uninstall() -> int:
         print()
         return 1
     try:
-        ans = input(f"  Remove the Super Research backend?  {_c(_DIM, '[y/N]')} ").strip().lower()
+        _remove = _ask_yes_no_sync("Remove the Super Research backend?", default=False)
     except (EOFError, KeyboardInterrupt):
-        ans = ""
-    if ans not in ("y", "yes"):
+        _remove = False
+    if not _remove:
         print(f"  {_c(_DIM, 'Cancelled — nothing removed.')}")
         print()
         return 0
@@ -67166,6 +70282,22 @@ def _self_uninstall() -> int:
 
 
 def main():
+    # Before anything else can log: auth/, vision, selfheal and narrate all use
+    # the standard library, and without this their WARNINGs go to bare stderr
+    # and their DEBUG/INFO go nowhere. Applies to EVERY command — the uvicorn
+    # log config below only exists inside `--serve`.
+    _install_stdlib_log_bridge()
+    # And before anything can CRASH: this file had no excepthook at all, so an
+    # uncaught traceback out of any command reached a closing terminal or
+    # backend.err.log — never the file a user sends.
+    _install_crash_log_hook()
+    # ⛔⛔ THE FLUSH THAT CLOSES THE TWO CASES THAT OTHERWISE NEVER FIRE. A
+    # machine whose pairing SUCCEEDED but whose telemetry POST failed never
+    # pairs again, and a machine whose pairing FAILED runs `--doctor` next — so
+    # "retry on the next attempt of the same thing" has no trigger at all. Every
+    # command, on a daemon thread, bounded by its own deadline.
+    tm.flush_in_background()
+
     # Super Agent (chat-runtime bridge) — `python research.py agent <…>`
     # (or the flag-style alias `--agent`, consistent with --pair/--serve). Bare
     # `agent` / `--agent` with no subcommand is fine — the package defaults to a
@@ -67260,6 +70392,20 @@ def main():
         help="Diagnose + auto-repair common Super Research issues (pair state / Firebase / "
              "Chromium binary / supervisor unit / port 8000 / Linux DISPLAY propagation). "
              "First thing to run when something feels wrong. Non-destructive — never unpairs or deletes user data.")
+    parser.add_argument("--send-logs", action="store_true", dest="send_logs",
+        help="Package this machine's recent logs and hand them to the team. Shows "
+             "exactly what leaves before asking. Always writes a local copy first, "
+             "so it still gives you something to send when the network is the "
+             "problem.")
+    parser.add_argument("--yes", "-y", action="store_true", dest="assume_yes",
+        help="Skip the confirmation prompt on --send-logs (for scripted use).")
+    parser.add_argument("--runs", type=int, default=None, dest="send_logs_runs",
+        help=f"How many recent runs --send-logs should include (1-{BUNDLE_MAX_RUNS}). "
+             f"Default: all {BUNDLE_MAX_RUNS}. Sessions and this machine's own log "
+             f"files are included whatever you pick.")
+    parser.add_argument("--contact-email", default=None, dest="contact_email",
+        help="Optional address to reach you on if --send-logs cannot use your "
+             "account. Never verified, never used as an identifier.")
     parser.add_argument("--update", "--upgrade", action="store_true", dest="update",
         help="Update Super Research to the latest published version (via pipx). Alias: --upgrade.")
     parser.add_argument("--uninstall", action="store_true",
@@ -67268,6 +70414,14 @@ def main():
     parser.add_argument("--version", action="store_true", dest="show_version",
         help="Print the installed Super Research version (+ any available update) and exit.")
     args = parser.parse_args()
+
+    # ── Give the interactive commands a file of their own ────────────
+    # `--pair` / `--login` / `--doctor` print branded output through bare
+    # `print()`, so until now their entire account of a failure was whatever
+    # the user photographed before the window closed.
+    _session_cmd = _session_command_name(args)
+    if _session_cmd:
+        _install_session_tee(_session_cmd)
 
     if args.show_version:
         print(f"  {_c(_BOLD + _ACCENT, 'Super')} {_c(_BOLD, 'Research')}  {_c(_BOLD, 'v' + _sr_version())}")
@@ -67331,6 +70485,11 @@ def main():
     if args.uninstall:
         raise SystemExit(_self_uninstall())
 
+    if args.send_logs:
+        raise SystemExit(cmd_send_logs(assume_yes=bool(args.assume_yes),
+                                      email=args.contact_email,
+                                      runs=args.send_logs_runs))
+
     if args.doctor:
         run_doctor()
         return
@@ -67380,6 +70539,8 @@ def main():
         # tell "a newer build is installed but the OLD one is still serving"
         # (see _restart_pending) no matter how the update arrived.
         _write_running_version()
+        tm.tm_emit(tm.Ev.SERVE_STARTED, worker=WORKER_ID,
+                   supervised=_detect_supervised())
         # ⭐ 2026-08-05 — TAKE CHROMIUM WITH US ON A SUPERVISOR-INITIATED STOP.
         # `_schedule_server_exit` reaps this process's child tree before its
         # `os._exit`, but that only covers an in-process Stop. A SIGTERM from the
@@ -67403,7 +70564,7 @@ def main():
         log(f"Resuming from: {resume_path}")
         global _cli_mode
         _cli_mode = True
-        asyncio.run(run_pipeline(
+        asyncio.run(run_pipeline_captured(
             topic=args.topic or "", resume_dir=str(resume_path),
             verbose=args.verbose, api_key=args.api_key, email=args.email,
         ))
@@ -67419,7 +70580,7 @@ def main():
         log(f"PDFs: {[Path(p).name for p in args.pdf]}")
 
     _cli_mode = True
-    asyncio.run(run_pipeline(
+    asyncio.run(run_pipeline_captured(
         topic=args.topic, pdf_paths=args.pdf,
         brief_file=args.brief_file, verbose=args.verbose,
         api_key=args.api_key, email=args.email,

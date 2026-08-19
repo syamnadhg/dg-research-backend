@@ -142,7 +142,11 @@ def test_non_permission_error_reraises_without_refresh(monkeypatch):
 
 
 def test_permission_denied_force_refreshes_and_retries_once(monkeypatch):
-    # Stale token (no deviceId) → refresh mints a claim-bearing token → retry ok.
+    """⚠ RE-ANCHORED 2026-08-17. The ladder now has TWO rungs: a plain retry on
+    the SAME token first, then the force-refresh. The invariant is unchanged —
+    exactly ONE force-refresh, exactly one retry after it — but a denial that a
+    plain retry clears must never reach securetoken, so `op` has to fail twice
+    here to exercise the refresh at all."""
     creds = _FakeCreds(
         token=_mk_token({"ownerUid": "u1"}),  # NO deviceId — the bug
         token_after_refresh=_mk_token({"ownerUid": "u1", "deviceId": "cfg-device-xyz"}),
@@ -152,13 +156,146 @@ def test_permission_denied_force_refreshes_and_retries_once(monkeypatch):
 
     def op():
         calls["n"] += 1
-        if calls["n"] == 1:
+        if calls["n"] <= 2:
             raise PermissionDenied("Missing or insufficient permissions.")
         return "flipped"
 
     assert research._grpc_write_with_heal(op, what="flip") == "flipped"
     assert creds.refresh_calls == 1
-    assert calls["n"] == 2  # original + one retry
+    assert calls["n"] == 3  # original + plain retry + one post-refresh retry
+
+
+# ── the new first rung: same token, no refresh, no delay ────────────────────
+
+def test_a_plain_retry_clears_it_without_touching_securetoken(monkeypatch, capsys):
+    """⭐⭐ THE EXPERIMENT THE OLD LADDER COULD NOT RUN. Its one retry changed the
+    token AND let a securetoken round-trip elapse, so "cleared by the re-minted
+    token — the cached credential was stale" was never a measurement: a
+    propagation race resolving on its own produces the identical line. Every run
+    in the corpus logs one of these on its first user-tree write and every one
+    self-heals, which is exactly what a confounded experiment leaves behind.
+
+    This rung changes NOTHING but the fact that a first attempt happened."""
+    creds = _agreeing_creds()
+    monkeypatch.setattr(research, "_firebase_db", _FakeDb(creds))
+    calls = {"n": 0}
+
+    def op():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionDenied("Missing or insufficient permissions.")
+        return "ok"
+
+    assert research._grpc_write_with_heal(op, what="flip queued→ongoing abc…") == "ok"
+    assert creds.refresh_calls == 0, "a transient denial must not mint a token"
+    assert calls["n"] == 2
+    out = capsys.readouterr().out
+    assert "cleared by an IMMEDIATE retry on the SAME token" in out
+    assert "was NOT stale" in out
+    assert "re-minting token" not in out, (
+        "the heal-attempt line claims a diagnosis this path did not need")
+
+
+def test_the_plain_retry_runs_even_while_the_refresh_is_throttled(monkeypatch, capsys):
+    """⛔ The throttle protects securetoken, and this rung never touches it. Under
+    throttle the write used to degrade outright; now it still gets the one free
+    attempt that may be all it needed."""
+    creds = _agreeing_creds()
+    monkeypatch.setattr(research, "_firebase_db", _FakeDb(creds))
+    import time as _t
+    monkeypatch.setattr(research, "_grpc_heal_last_ts", _t.time(), raising=False)
+    calls = {"n": 0}
+
+    def op():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionDenied("Missing or insufficient permissions.")
+        return "ok"
+
+    assert research._grpc_write_with_heal(op, what="t") == "ok"
+    assert creds.refresh_calls == 0
+
+
+def test_a_plain_retry_success_clears_the_structural_latch(monkeypatch):
+    """A write that lands means the denial is resolved, whichever rung landed it.
+    Leaving the latch set would suppress every future force-refresh on the
+    strength of a problem that has already gone away."""
+    creds = _agreeing_creds()
+    monkeypatch.setattr(research, "_firebase_db", _FakeDb(creds))
+    monkeypatch.setattr(research, "_grpc_heal_structural", True, raising=False)
+    monkeypatch.setattr(research, "_grpc_heal_consec_fail", 2, raising=False)
+    calls = {"n": 0}
+
+    def op():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionDenied("Missing or insufficient permissions.")
+        return "ok"
+
+    assert research._grpc_write_with_heal(op, what="t") == "ok"
+    assert research._grpc_heal_structural is False
+    assert research._grpc_heal_consec_fail == 0
+    assert creds.refresh_calls == 0
+
+
+def test_a_fresh_masked_denial_on_the_retry_is_still_seen(monkeypatch, capsys):
+    """⛔ The counterweight to `ignore`. google-cloud-firestore turns a denied
+    read inside a transaction into a ValueError about a missing transaction ID,
+    reached through the SAME implicit-context edge that `ignore` exists to
+    discount. Excluding the original chain must not blind us to a NEW one, or
+    the flip — the write this whole heal was built for — stops healing."""
+    creds = _agreeing_creds()
+    monkeypatch.setattr(research, "_firebase_db", _FakeDb(creds))
+    calls = {"n": 0}
+
+    def op():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionDenied("Missing or insufficient permissions.")
+        if calls["n"] == 2:
+            # A genuinely new denial, masked exactly as the live one is.
+            try:
+                raise PermissionDenied("Missing or insufficient permissions.")
+            except PermissionDenied as inner:
+                raise ValueError(
+                    "The transaction has no transaction ID, so it cannot be "
+                    "rolled back") from inner
+        return "ok"
+
+    assert research._grpc_write_with_heal(op, what="flip queued→ongoing abc…") == "ok"
+    assert creds.refresh_calls == 1, "the second rung must still run"
+
+
+def test_the_ignored_chain_is_the_one_it_was_given():
+    """The helper itself, on the shape the ladder hands it."""
+    original = PermissionDenied("Missing or insufficient permissions.")
+    try:
+        try:
+            raise original
+        except PermissionDenied:
+            raise ValueError("network gone")
+    except ValueError as later:
+        assert research._is_synth_permission_denied(later) is True, (
+            "precondition: the implicit context DOES reach the original 403")
+        assert research._is_synth_permission_denied(later, ignore=original) is False
+
+
+def test_the_plain_retry_does_not_swallow_an_unrelated_error(monkeypatch):
+    """If the retry fails for some OTHER reason, that is the caller's problem to
+    see — not something to bury under a token refresh."""
+    creds = _agreeing_creds()
+    monkeypatch.setattr(research, "_firebase_db", _FakeDb(creds))
+    calls = {"n": 0}
+
+    def op():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionDenied("Missing or insufficient permissions.")
+        raise ValueError("network gone")
+
+    with pytest.raises(ValueError):
+        research._grpc_write_with_heal(op, what="t")
+    assert creds.refresh_calls == 0
 
 
 def test_throttle_blocks_second_refresh_within_cooldown(monkeypatch):
@@ -360,15 +497,17 @@ def test_a_heal_that_worked_reports_a_stale_credential(monkeypatch, capsys):
 
     def op():
         calls["n"] += 1
-        if calls["n"] == 1:
+        if calls["n"] <= 2:   # rung 1 (plain retry) must fail too
             raise PermissionDenied("Missing or insufficient permissions.")
         return "ok"
 
     assert research._grpc_write_with_heal(op, what="flip queued→ongoing abc…") == "ok"
     out = capsys.readouterr().out
-    assert "cleared by the re-minted token" in out, (
+    assert "cleared by the RE-MINTED token" in out, (
         "a heal that worked leaves no record of having worked — which is why "
         "nobody could tell 34 attempts from 34 failures")
+    assert "after a plain retry on the same token had already failed" in out, (
+        "⭐ and the claim is only earned once the plain rung has ruled itself out")
     assert "stale" in out
     assert "re-pair" not in out, (
         "a denial a re-mint fixed must never be reported as needing a re-pair")
@@ -384,9 +523,10 @@ def test_a_heal_that_failed_rules_the_credential_out(monkeypatch, capsys):
     with pytest.raises(PermissionDenied):
         research._grpc_write_with_heal(op, what="flip queued→ongoing abc…")
     out = capsys.readouterr().out
-    assert "did NOT clear" in out, "an unhealed denial says nothing about itself"
+    assert "neither a plain retry nor a re-minted token cleared" in out, (
+        "an unhealed denial says nothing about itself")
     assert "WARN" in out, "an unhealed denial is not an INFO"
-    assert "a stale credential was not the cause" in out
+    assert "neither a stale credential nor a transient race was the cause" in out
 
 
 def test_the_agreeing_branch_no_longer_asserts_a_document_mismatch(monkeypatch, capsys):
@@ -397,7 +537,7 @@ def test_the_agreeing_branch_no_longer_asserts_a_document_mismatch(monkeypatch, 
 
     def op():
         calls["n"] += 1
-        if calls["n"] == 1:
+        if calls["n"] <= 2:   # rung 1 (plain retry) must fail too
             raise PermissionDenied("Missing or insufficient permissions.")
         return "ok"
 
@@ -422,7 +562,7 @@ def test_a_token_missing_the_claim_is_still_diagnosed_up_front(monkeypatch, caps
 
     def op():
         calls["n"] += 1
-        if calls["n"] == 1:
+        if calls["n"] <= 2:   # rung 1 (plain retry) must fail too
             raise PermissionDenied("Missing or insufficient permissions.")
         return "ok"
 
@@ -465,7 +605,7 @@ def test_an_unhealed_denial_is_visible_before_the_latch_ever_fires(monkeypatch, 
 
     out = capsys.readouterr().out
     assert research._grpc_heal_structural is False, "precondition: the latch never fired"
-    assert out.count("did NOT clear") == 2, (
+    assert out.count("neither a plain retry nor a re-minted token cleared") == 2, (
         "each unhealed denial must report itself; the latch cannot be relied on")
     assert "STRUCTURAL" not in out
 
@@ -489,7 +629,8 @@ def test_the_latch_line_is_not_doubled_by_the_per_occurrence_warn(monkeypatch, c
     latch = [ln for ln in out.splitlines() if "STRUCTURAL" in ln]
     assert len(latch) == 1, latch
     # The denial that latched reports once, not twice.
-    assert out.count("did NOT clear") == research._GRPC_HEAL_STRUCTURAL_AFTER - 1
+    assert out.count("neither a plain retry nor a re-minted token cleared") == \
+        research._GRPC_HEAL_STRUCTURAL_AFTER - 1
 
 
 def test_the_flip_degrade_leads_with_the_root_cause():

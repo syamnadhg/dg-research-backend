@@ -47,9 +47,15 @@ def _pick_js() -> str:
 
     Located by a distinctive line rather than by index, so inserting another
     `page.evaluate` into that function cannot silently point this at the wrong JS.
+
+    ⚠ RE-ANCHORED 2026-08-17: this asked for "ue000" and TWO of the step's scripts
+    now strip the private-use range — the row MARKER gained it so the log stops
+    reporting the Effort row as 'effortmax<glyph>' and its 40-char bound measures
+    real characters. The invariant is unchanged, the literal stopped being unique.
+    `isWanted` is the picker's own comparator and exists nowhere else.
     """
     from _domshim import evaluate_js
-    return evaluate_js(research.setup_claude_dr, contains="ue000")
+    return evaluate_js(research.setup_claude_dr, contains="isWanted")
 
 
 def _menu(labels, *, with_trigger=False, role="menu"):
@@ -78,9 +84,14 @@ def _menu(labels, *, with_trigger=False, role="menu"):
 # ⭐ These fixtures deliberately carry NO option test ids, so every case below
 # still exercises the TEXT fallback and the ligature handling it exists for. The
 # test id path is covered separately.
+#
+# ⚠ 2026-08-17: `word` is new and REQUIRED. The picker used to compare against a
+# literal 'max' while the test id beside it was derived from policy, so the two
+# halves of one search disagreed the moment the policy asked for another tier —
+# and the text half is the half that runs on a layout with no ids.
 PARAMS = {"trigTestid": research._CLAUDE_EFFORT_TRIGGER_TESTID,
           "optTestid": "", "attr": research._SR_CLICK_MARK,
-          "value": "claude-effort-option"}
+          "word": "max", "value": "claude-effort-option"}
 
 # What a successful pick now reports. `marked` means "this row is the one, press
 # it"; the caller presses and then verifies it became checked.
@@ -147,8 +158,17 @@ def test_the_trigger_row_itself_is_never_mistaken_for_the_tier():
     got = _run(spec)
     assert got.get("set") is None
     # ⚠ The first draft ended this line with `or True`, which made it vacuous.
-    # The trigger must be SEEN (so we know the scan reached it) and REFUSED.
-    assert "effortmax" in (got.get("saw") or []), got.get("saw")
+    # The trigger had to be SEEN (so we knew the scan reached it) and REFUSED.
+    #
+    # ⚠ RE-ANCHORED 2026-08-17, to something STRICTLY STRONGER: the popover is no
+    # longer scanned at all, so there is nothing to refuse. It used to fall back
+    # to "the newest menu even if it holds the trigger", and the popover DISPLAYS
+    # the selected tier — a nested element reading exactly "Max" — so that
+    # fallback could mark the display and report a tier set from a page where the
+    # submenu had never opened. `saw` is empty because the search is, and the
+    # counts are what prove the page WAS read: one menu, none of it a candidate.
+    assert got.get("saw") == [], got.get("saw")
+    assert got.get("menus") == 1 and got.get("cands") == 0, got
 
 
 def test_a_bare_max_elsewhere_on_the_page_is_never_pressed():

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "maxRuns": 30,
+  "maxAgeDays": 30,
+  "minRuns": 1,
+  "actions": {
+    "full": "send-logs",
+    "limited": "send-logs-limited"
+  },
+  "_why": "Committed byte-identical to BOTH repos. The maximum slider position sends the FULL action, which every build understands and which means 'this machine's own cap' — so if the two repos disagree about that number, the slider's default position states one thing and the machine does another, with nothing failing anywhere. Each repo pins its own constant against its own copy; a cross-repo test compares the two files."
+}

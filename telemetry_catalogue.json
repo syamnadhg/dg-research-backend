@@ -1,0 +1,222 @@
+{
+  "enums": {
+    "ErrorClass": {
+      "AUTH_REVOKED": 13,
+      "BROWSER_CRASH": 11,
+      "CANCELLED": 10,
+      "CONFIG": 14,
+      "CONNECT_REFUSED": 2,
+      "DISK_FULL": 9,
+      "DNS": 1,
+      "HTTP_4XX": 5,
+      "HTTP_5XX": 6,
+      "NOT_FOUND": 8,
+      "PERMISSION": 7,
+      "RATE_LIMITED": 12,
+      "TIMEOUT": 4,
+      "TLS": 3,
+      "UNKNOWN": 0
+    },
+    "KeystoreBackend": {
+      "FILE_FALLBACK": 2,
+      "OS_KEYCHAIN": 1,
+      "OTHER": 0
+    },
+    "NetVerdict": {
+      "BLOCKED": 3,
+      "DNS_DEAD": 2,
+      "OK": 1,
+      "PARTIAL": 4,
+      "UNKNOWN": 0
+    },
+    "Platform": {
+      "CHATGPT": 1,
+      "CLAUDE": 2,
+      "GEMINI": 3,
+      "GOOGLE_DOCS": 6,
+      "NOTEBOOKLM": 4,
+      "OTHER": 0,
+      "YOUTUBE": 5
+    },
+    "Provider": {
+      "ANTHROPIC": 1,
+      "GEMINI": 2,
+      "OPENAI": 3,
+      "OTHER": 0
+    },
+    "RunOutcome": {
+      "COMPLETE": 1,
+      "ERRORED": 2,
+      "STOPPED": 3,
+      "UNKNOWN": 0
+    },
+    "VerifyStatus": {
+      "FREE": 2,
+      "MISSING": 3,
+      "NO_CHECK": 0,
+      "OK": 1
+    }
+  },
+  "eventFields": {
+    "AGENT_SKIPPED": [
+      "research_id",
+      "phase",
+      "platform"
+    ],
+    "DOCTOR_RUN": [
+      "count",
+      "net",
+      "supervised"
+    ],
+    "FIRESTORE_OUTAGE_ENDED": [
+      "worker",
+      "duration_ms",
+      "attempt"
+    ],
+    "FIRESTORE_OUTAGE_STARTED": [
+      "worker",
+      "error_class"
+    ],
+    "LOGIN_FINISHED": [
+      "ok",
+      "error_class",
+      "count"
+    ],
+    "LOGIN_STARTED": [],
+    "PAIR_CANCELLED": [
+      "stage"
+    ],
+    "PAIR_CODE_SHOWN": [],
+    "PAIR_COMPLETED": [
+      "duration_ms",
+      "profiles",
+      "supervised"
+    ],
+    "PAIR_FAILED": [
+      "stage",
+      "error_class",
+      "net"
+    ],
+    "PAIR_STAGE_REACHED": [
+      "stage"
+    ],
+    "PAIR_STARTED": [
+      "supervised"
+    ],
+    "PAIR_TOKEN_EXCHANGED": [
+      "ok",
+      "error_class"
+    ],
+    "PHASE_COMPLETE": [
+      "research_id",
+      "phase",
+      "platform",
+      "duration_ms"
+    ],
+    "PHASE_SKIPPED": [
+      "research_id",
+      "phase",
+      "platform"
+    ],
+    "PHASE_START": [
+      "research_id",
+      "phase",
+      "platform"
+    ],
+    "PIPELINE_ERROR": [
+      "research_id",
+      "phase",
+      "platform",
+      "error_class"
+    ],
+    "RUN_FINISHED": [
+      "research_id",
+      "outcome",
+      "duration_ms"
+    ],
+    "RUN_PAUSED": [
+      "research_id",
+      "phase"
+    ],
+    "RUN_RESUMED": [
+      "research_id",
+      "phase"
+    ],
+    "RUN_STARTED": [
+      "research_id",
+      "worker"
+    ],
+    "RUN_STOPPED": [
+      "research_id",
+      "phase"
+    ],
+    "SEND_LOGS_RESULT": [
+      "ok",
+      "error_class",
+      "count"
+    ],
+    "SERVE_STARTED": [
+      "worker",
+      "supervised"
+    ],
+    "TELEMETRY_DROPPED": [
+      "count"
+    ],
+    "TELEMETRY_INVALID": [
+      "count"
+    ],
+    "TOKEN_REFRESH_FAILED": [
+      "error_class"
+    ]
+  },
+  "events": {
+    "AGENT_SKIPPED": 44,
+    "DOCTOR_RUN": 60,
+    "FIRESTORE_OUTAGE_ENDED": 22,
+    "FIRESTORE_OUTAGE_STARTED": 21,
+    "LOGIN_FINISHED": 62,
+    "LOGIN_STARTED": 61,
+    "PAIR_CANCELLED": 12,
+    "PAIR_CODE_SHOWN": 3,
+    "PAIR_COMPLETED": 10,
+    "PAIR_FAILED": 11,
+    "PAIR_STAGE_REACHED": 6,
+    "PAIR_STARTED": 1,
+    "PAIR_TOKEN_EXCHANGED": 5,
+    "PHASE_COMPLETE": 42,
+    "PHASE_SKIPPED": 43,
+    "PHASE_START": 41,
+    "PIPELINE_ERROR": 48,
+    "RUN_FINISHED": 49,
+    "RUN_PAUSED": 45,
+    "RUN_RESUMED": 46,
+    "RUN_STARTED": 40,
+    "RUN_STOPPED": 47,
+    "SEND_LOGS_RESULT": 63,
+    "SERVE_STARTED": 20,
+    "TELEMETRY_DROPPED": 91,
+    "TELEMETRY_INVALID": 90,
+    "TOKEN_REFRESH_FAILED": 23
+  },
+  "fields": {
+    "attempt": "int",
+    "count": "int",
+    "duration_ms": "int",
+    "error_class": "ErrorClass",
+    "keystore": "KeystoreBackend",
+    "net": "NetVerdict",
+    "ok": "bool",
+    "outcome": "RunOutcome",
+    "phase": "int",
+    "platform": "Platform",
+    "profiles": "int",
+    "provider": "Provider",
+    "research_id": "str",
+    "stage": "int",
+    "supervised": "bool",
+    "verified": "bool",
+    "verify": "VerifyStatus",
+    "worker": "int"
+  },
+  "version": 1
+}

@@ -15,8 +15,10 @@ L2 fails in two directions and both are covered:
   a page with no canvas at all. This path runs on every ChatGPT extraction, so
   an over-eager close is a keystroke sent into every single run.
 
-Safety: refuses to start on a dirty tree, holds originals in memory only,
-restores in `finally`, re-checks `git status` at the end.
+Safety: holds originals in memory, restores in `finally`, and re-compares the
+bytes at the end. It does NOT consult git — this repo carries uncommitted
+waves for days, and a harness that refuses to run then is a harness that
+never runs.
 
     .venv/bin/python .mutants/share_ordering_0812_mutants.py
 """
@@ -116,8 +118,21 @@ MUTANTS = [
        "            btn = await page.query_selector(f'[{_CANVAS_CLOSE_MARK}=\"1\"]')\n"
        "            if btn is not None:\n"
        "                pass")]),
+    # ⛔⛔ RE-ANCHORED 2026-08-17. The anchor was the bare line
+    # `await page.keyboard.press("Escape")`, which occurs **23 times** in
+    # research.py — and this harness used `.replace(frm, to, 1)` behind an
+    # `if frm not in mutated` check, so for as long as it has existed it has been
+    # deleting the FIRST Escape in the file and reporting the result as a verdict
+    # on the canvas-close fallback. A stale anchor is not a survivor and it is
+    # not a kill either; it is a measurement of nothing. The strict `hits != 1`
+    # check added to the runner below makes this class impossible to reintroduce.
     ("C5", "under", "the Escape fallback is gone — a canvas with no close control stays open",
-     [('        await page.keyboard.press("Escape")\n', "")]),
+     [('        await page.keyboard.press("Escape")\n'
+       '        await asyncio.sleep(0.4)\n'
+       '        if not await _still_open():\n'
+       '            return "escape"\n',
+       '        if not await _still_open():\n'
+       '            return "escape"\n')]),
     ("C6", "under", "the label test matches nothing useful — Download and Share are the only buttons left",
      [("        return /close|collapse|shrink|exit|minimi[sz]e|back to chat/.test(t);",
        "        return /dismiss/.test(t);")]),
@@ -154,9 +169,19 @@ def sh(cmd: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
 
 
-def tracked_dirty() -> list[str]:
-    out = sh(["git", "status", "--porcelain", "--", "research.py", "tests"]).stdout
-    return [ln for ln in out.splitlines() if ln and not ln.startswith("?? ")]
+# ⛔ 2026-08-17 — CLEANLINESS IS A BYTE SNAPSHOT NOW, not `git status`.
+# The git check refuses to start on a dirty tree, and this repo carries whole
+# uncommitted waves for days — so the harness was unrunnable for exactly as long
+# as it most needed to run, which is how the broken C5 anchor above survived. The
+# property that actually matters is "the bytes I read at the start are the bytes
+# on disk at the end", and that is answerable without git.
+def snapshot() -> dict[str, str]:
+    return {RESEARCH: (ROOT / RESEARCH).read_text(encoding="utf-8")}
+
+
+def drifted(before: dict[str, str]) -> list[str]:
+    return [f for f, text in before.items()
+            if (ROOT / f).read_text(encoding="utf-8") != text]
 
 
 def run_tests() -> bool:
@@ -169,11 +194,7 @@ def run_tests() -> bool:
 
 
 def main() -> int:
-    dirty = tracked_dirty()
-    if dirty:
-        print("Tracked files are modified. Commit or stash first — a harness that starts\n"
-              "dirty cannot tell its own restore from your edits.\n" + "\n".join(dirty))
-        return 2
+    before = snapshot()
 
     print("baseline… ", end="", flush=True)
     if not run_tests():
@@ -188,9 +209,17 @@ def main() -> int:
         try:
             mutated = original
             for frm, to in edits:
-                if frm not in mutated:
-                    raise AssertionError(f"anchor not found: {frm[:70]!r}")
-                mutated = mutated.replace(frm, to, 1)
+                # ⛔ EXACTLY ONE. `if frm not in mutated` + `replace(…, 1)` is what
+                # let C5 mutate an unrelated line for months while printing a
+                # tidy "✓ killed".
+                if frm == to:
+                    raise AssertionError(
+                        f"replacement equals anchor — mutates nothing: {frm[:60]!r}")
+                hits = mutated.count(frm)
+                if hits != 1:
+                    raise AssertionError(
+                        f"anchor occurs {hits}x (needs exactly 1): {frm[:70]!r}")
+                mutated = mutated.replace(frm, to)
             path.write_text(mutated, encoding="utf-8")
             killed = not run_tests()
             print(f"{'✓ killed  ' if killed else '✗ SURVIVED'} {mid} [{direction}] {why}")
@@ -202,9 +231,10 @@ def main() -> int:
         finally:
             path.write_text(original, encoding="utf-8")
 
-    still_dirty = tracked_dirty()
-    if still_dirty:
-        print("\n⛔ the tree did not come back clean:\n" + "\n".join(still_dirty))
+    left = drifted(before)
+    if left:
+        print("\n⛔ THE TREE DID NOT COME BACK CLEAN — a mutant may still be in "
+              "your source:\n" + "\n".join(left))
         return 2
 
     print(f"\n{len(MUTANTS) - len(survivors)}/{len(MUTANTS)} killed")

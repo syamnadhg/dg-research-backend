@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import re
 import json
 import os
 import subprocess
@@ -433,9 +434,17 @@ class TestRestartCommand:
 
     def test_restart_is_worker_1_only(self):
         """Gated with update/check-update for the same delete-race reason: a sibling
-        worker deleting the doc first can drop the command with no replay."""
+        worker deleting the doc first can drop the command with no replay.
+
+        ⚠ 2026-08-18: `send-logs` joined the same tuple for the same two reasons,
+        so this pin now reads the MEMBERSHIP rather than the exact literal — a
+        future action joining the list must not break a test about restart."""
         src = inspect.getsource(research._start_device_command_listener)
-        assert 'elif action in ("update", "check-update", "restart") and WORKER_ID != 1:' in src
+        m = re.search(r"elif action in \(([^)]*)\) and WORKER_ID != 1:", src, re.S)
+        assert m, "the worker-1 gate moved"
+        gated = m.group(1)
+        for action in ("update", "check-update", "restart"):
+            assert f'"{action}"' in gated, f"{action} left the worker-1 gate"
 
     def test_restart_exits_the_worker_rather_than_hard_resetting(self):
         src = inspect.getsource(research._start_device_command_listener)

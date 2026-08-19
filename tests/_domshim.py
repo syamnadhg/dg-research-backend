@@ -13,6 +13,7 @@ test suite behind an `npm install` and a node_modules tree.
 
 Supports what the production selectors actually use: tag names, `[attr]`,
 `[attr="v"]`, `[attr*="v" i]`, comma selector lists, descendant combinators,
+`getComputedStyle` driven by `anim`/`clip` attributes,
 `textContent`/`innerText`, attribute reads, `getBoundingClientRect`, `closest`, and a
 click that records what was clicked.
 """
@@ -437,7 +438,20 @@ globalThis.document = {
   // yet". Without it that branch throws instead of exercising the fallback.
   get body() { return ROOT; },
 };
-globalThis.getComputedStyle = () => ({ display: 'block', visibility: 'visible', opacity: '1' });
+// ⭐ 2026-08-17 — THE SHIMMER IS A COMPUTED STYLE, and this returned a constant.
+// ChatGPT's live progress line is an animated gradient clipped to the text, and
+// the structural anchor that finds it reads exactly these three properties. With
+// a fixed object every candidate reported `anim:false`, so the shimmer branch was
+// unreachable under the shim and no test could tell a working anchor from one
+// that had never fired. Driven by attributes, like the geometry above: put
+// `anim="shimmer"` (or `clip="text"`) on a fixture node to make it shimmer.
+globalThis.getComputedStyle = (el) => {
+  const get = (n) => (el && el.getAttribute) ? (el.getAttribute(n) || '') : '';
+  const clip = get('clip');
+  return { display: 'block', visibility: 'visible', opacity: '1',
+           animationName: get('anim') || 'none',
+           backgroundClip: clip, webkitBackgroundClip: clip };
+};
 globalThis.window = { innerWidth: 1440, innerHeight: 900 };
 globalThis.PointerEvent = class { constructor(t) { this.type = t; } };
 globalThis.MouseEvent = class { constructor(t) { this.type = t; } };

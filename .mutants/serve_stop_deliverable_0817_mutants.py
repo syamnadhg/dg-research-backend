@@ -54,7 +54,14 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_NEW]),
     ("D3", "over", "⛔⛔ the mask READ becomes a mask WRITE — the two stop "
      "signals get BLOCKED by the function whose job is to free them",
-     [("        blocked = sig_mod.pthread_sigmask(sig_mod.SIG_BLOCK, [])",
+     # ⚠ RE-ANCHORED 2026-08-17: the mask READ line now occurs TWICE — the
+     # observe-only `_log_blocked_stop_signals_at` added later in the same wave
+     # reads it the same way, deliberately. The bare line therefore measured
+     # NOTHING (a stale anchor is not a survivor). The comment above the repair's
+     # read is unique to it.
+     [("        # Blocking the empty set is the documented way to READ the mask.\n"
+       "        blocked = sig_mod.pthread_sigmask(sig_mod.SIG_BLOCK, [])",
+       "        # Blocking the empty set is the documented way to READ the mask.\n"
        "        blocked = sig_mod.pthread_sigmask(sig_mod.SIG_BLOCK, signums)")],
      [T_NEW]),
     ("D4", "over", "the whole mask is freed, not just the stop signals — every "
