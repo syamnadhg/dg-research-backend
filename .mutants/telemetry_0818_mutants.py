@@ -31,6 +31,7 @@ in the file rather than the last.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -147,7 +148,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str], str]] = [
         if ok:''')], [T], SRC),
     ("S5", "under", "a failed delivery drops the owed events instead of merging "
      "them back",
-     [('        else:\n            _merge_back(claimed, path if ".sending." not in path.name else path)',
+     [('        else:\n            _merge_back(claimed, _unclaimed_name(path))',
        '        else:\n            pass')], [T], SRC),
     ("S6", "under", "the merge-back throws away whatever arrived while the "
      "delivery was in flight",
@@ -262,8 +263,16 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str], str]] = [
 
 def green(tests: list[str]) -> tuple[bool, bool]:
     try:
-        rc = subprocess.run([PY, "-m", "pytest", "-q", *tests], cwd=ROOT,
-                            capture_output=True, timeout=_TEST_TIMEOUT_S).returncode
+        # ⛔⛔ MEASURED 2026-08-18: a stale `__pycache__/*.pyc` served OLD bytecode
+        # for a source file that had already been fixed, and the measurement
+        # disagreed with the file for three rounds. In a harness that rewrites the
+        # source between every run, a cached module is not a nuisance — it is a
+        # kill or a survivor invented out of nothing. Three earlier waves had
+        # already learned this and set the flag; it was never propagated.
+        rc = subprocess.run([PY, "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider",
+                             *tests], cwd=ROOT, capture_output=True,
+                            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                            timeout=_TEST_TIMEOUT_S).returncode
         return rc == 0, False
     except subprocess.TimeoutExpired:
         return False, True

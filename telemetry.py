@@ -637,9 +637,31 @@ def _read_batch(claimed: Path,
     return batch, owed
 
 
+def _unclaimed_name(path: Path) -> Path:
+    """`pending-cli.sending.8538.jsonl` -> `pending-cli.jsonl`.
+
+    A stranded file is adopted UNDER ITS OWN NAME — nothing renames it, because
+    it is already claimed. So the place its events belong on a failed delivery is
+    the live spool, not the name they are sitting in."""
+    return path.with_name(re.sub(r"\.sending\.\d+(?=\.jsonl$)", "", path.name))
+
+
 def _merge_back(claimed: Path, path: Path) -> None:
     """Delivery failed: put the claimed events back in front of anything that
     arrived while we were trying."""
+    # ⛔⛔ MEASURED 2026-08-18, nine real events destroyed in one call. The caller
+    # passed `path if ".sending." not in path.name else path` — both arms of that
+    # ternary are `path`, so for an ADOPTED file, where `claimed` and `path` are
+    # the same file, this read the events, wrote them back into themselves, and
+    # then unlinked the file it had just written. Every stranded batch was
+    # destroyed by its first failed delivery.
+    #
+    # ⭐⭐ And it destroyed exactly the events worth having: a stranded file
+    # belongs to a process that DIED, and the trigger is delivery failing — which
+    # is the outage this system exists to report. The one guard that has to hold
+    # here is that a file is never merged into itself.
+    if claimed.resolve() == path.resolve():
+        return
     try:
         owed = claimed.read_text(encoding="utf-8")
     except OSError:
@@ -723,7 +745,7 @@ def flush(post=None, deadline_sec: float = FLUSH_DEADLINE_SEC,
                 pass
             landed += len(batch)
         else:
-            _merge_back(claimed, path if ".sending." not in path.name else path)
+            _merge_back(claimed, _unclaimed_name(path))
     return landed
 
 

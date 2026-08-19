@@ -1,0 +1,118 @@
+"""A batch its owner died holding must survive the delivery failing.
+
+⛔⛔ MEASURED 2026-08-18. A spool file is adopted UNDER ITS OWN NAME — nothing
+renames it, because it is already claimed. The failure path then called
+
+    _merge_back(claimed, path if ".sending." not in path.name else path)
+
+whose ternary has the SAME expression in both arms, so for an adopted file
+`claimed` and `path` were one file. `_merge_back` read it, wrote it back into
+itself, and unlinked the file it had just written. Nine real events, gone in one
+call.
+
+⭐⭐ It destroyed exactly the events worth keeping. A stranded file belongs to a
+process that DIED, and the trigger is delivery failing — which is the outage this
+whole system exists to report. The two things that had to be true for the data to
+be lost were the two things that are true during an incident.
+
+⛔ The first repro was WRONG and said the same thing for the wrong reason: events
+written without a `t` are age-expired and legitimately discarded, so the file
+vanished on a path that had nothing to do with this bug. Every fixture below
+carries a real timestamp.
+"""
+import json
+import time
+
+import pytest
+
+import telemetry
+
+
+def _events(n: int) -> str:
+    now = int(time.time() * 1000)
+    return "".join(json.dumps({"v": 1, "seq": i, "ev": 49, "t": now}) + "\n"
+                   for i in range(n))
+
+
+@pytest.fixture()
+def spool(tmp_path, monkeypatch):
+    monkeypatch.setenv("SR_TELEMETRY_DIR", str(tmp_path))
+    return tmp_path
+
+
+def test_a_stranded_batch_survives_a_failed_delivery(spool):
+    stranded = spool / "pending-cli.sending.999999.jsonl"
+    stranded.write_text(_events(9), encoding="utf-8")
+
+    assert telemetry.flush(post=lambda _b: False, deadline_sec=1.0) == 0
+
+    left = sorted(spool.glob("*.jsonl"))
+    surviving = sum(len(p.read_text(encoding="utf-8").splitlines()) for p in left)
+    assert surviving == 9, f"{surviving} of 9 events survived; files={[p.name for p in left]}"
+
+
+def test_the_recovered_batch_is_delivered_on_the_next_success(spool):
+    """Surviving on disk is only half of it — the events have to be reachable
+    again, which means landing under the UNCLAIMED name."""
+    (spool / "pending-cli.sending.999999.jsonl").write_text(_events(9), encoding="utf-8")
+    telemetry.flush(post=lambda _b: False, deadline_sec=1.0)
+
+    got: list = []
+    telemetry.flush(post=lambda b: (got.extend(b), True)[1], deadline_sec=1.0)
+    assert len(got) == 9
+    assert not list(spool.glob("*.jsonl"))
+
+
+def test_a_file_is_never_merged_into_itself(spool):
+    """The invariant, pinned directly — the call site is one refactor away from
+    handing the same path twice again."""
+    f = spool / "pending-cli.sending.999999.jsonl"
+    f.write_text(_events(9), encoding="utf-8")
+    telemetry._merge_back(f, f)
+    assert f.exists(), "merging a file into itself deleted it"
+    assert len(f.read_text(encoding="utf-8").splitlines()) == 9
+
+
+def test_the_adopted_name_resolves_to_the_live_spool(spool):
+    assert telemetry._unclaimed_name(
+        spool / "pending-cli.sending.8538.jsonl").name == "pending-cli.jsonl"
+    # Already unclaimed — must be left exactly alone.
+    assert telemetry._unclaimed_name(
+        spool / "pending-cli.jsonl").name == "pending-cli.jsonl"
+
+
+def test_an_ordinary_claimed_batch_still_merges_back(spool):
+    """The non-adopted path is the common one and must not regress."""
+    (spool / "pending-cli.jsonl").write_text(_events(4), encoding="utf-8")
+    telemetry.flush(post=lambda _b: False, deadline_sec=1.0)
+    left = sorted(spool.glob("*.jsonl"))
+    assert [p.name for p in left] == ["pending-cli.jsonl"]
+    assert len(left[0].read_text(encoding="utf-8").splitlines()) == 4
+
+
+def test_events_that_arrived_during_the_attempt_are_kept_behind_the_owed_ones(spool):
+    """Ordering is the reason _merge_back exists at all."""
+    stranded = spool / "pending-cli.sending.999999.jsonl"
+    stranded.write_text(json.dumps({"v": 1, "seq": 0, "ev": 49,
+                                    "t": int(time.time() * 1000)}) + "\n",
+                        encoding="utf-8")
+    live = spool / "pending-cli.jsonl"
+    live.write_text(json.dumps({"v": 1, "seq": 99, "ev": 41,
+                                "t": int(time.time() * 1000)}) + "\n",
+                    encoding="utf-8")
+
+    telemetry.flush(post=lambda _b: False, deadline_sec=1.0)
+
+    seqs = [json.loads(l)["seq"]
+            for l in live.read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert seqs == [0, 99], seqs
+
+
+def test_a_live_siblings_batch_is_still_left_alone(spool):
+    """⛔ The counterweight. Adoption must stay restricted to dead owners, or two
+    processes double-post the quietest thing in the product."""
+    import os
+    mine = spool / f"pending-cli.sending.{os.getppid()}.jsonl"
+    mine.write_text(_events(3), encoding="utf-8")
+    if telemetry._pid_alive(os.getppid()):
+        assert telemetry._adoptable(mine) is False
