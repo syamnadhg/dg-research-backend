@@ -47,8 +47,8 @@ QUALIFIES = """            const qualifies = (h) => h.named           // ChatGPT
 MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     ("P1", "under", "⭐⭐ THE ORIGINAL DEFECT — the sum is the gate again, and the "
      "bar equals one signal minus a penalty that is always subtracted",
-     [(QUALIFIES + """            const ranked = structural.filter(qualifies);""",
-       QUALIFIES + """            const ranked = structural.filter(h => h.score >= 3);""")],
+     [("            let ranked = structural.filter(qualifies);",
+       "            let ranked = structural.filter(h => h.score >= 3);")],
      [T_NEW]),
     ("P2", "over", "⛔⛔ everything qualifies — PASS 0 presses whatever sits "
      "nearest the last user message",
@@ -99,8 +99,8 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_NEW]),
     ("P10", "under", "the qualifiers are no longer filtered before ranking, so "
      "an unqualified higher scorer buries the strip beneath it",
-     [("            const ranked = structural.filter(qualifies);",
-       "            const ranked = structural.slice();")],
+     [("            let ranked = structural.filter(qualifies);",
+       "            let ranked = structural.slice();")],
      [T_NEW]),
     ("P11", "over", "⛔ the composer subtree stops being excluded — its own "
      "shimmering affordance becomes the strip",
@@ -126,11 +126,8 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_NEW]),
     ("P15", "under", "the pick stops saying WHICH signal carried it, which is "
      "exactly what no previous miss line could answer",
-     [("""                picked.why = (ranked[0].named ? 'named' : '')
-                    + (ranked[0].anim ? '+anim' : '') + (ranked[0].inter ? '+inter' : '')
-                    + (ranked[0].wordy ? '+wordy' : '')
-                    + (ranked[0].inTurn ? '+turn' : '');""",
-       "                picked.why = '';")],
+     [("            picked.why = (deferredStructural.named ? 'named' : '')",
+       "            picked.why = ''; const _dead = (")],
      [T_NEW]),
     ("P16", "over", "the nearest-wins ranking is dropped, so the strip from a "
      "previous turn can outrank the live one",

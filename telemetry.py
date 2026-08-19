@@ -325,6 +325,24 @@ def coerce_field(name: str, value: object) -> "int | bool | str | None":
 
 # ── Where events wait ───────────────────────────────────────────────────
 def _telemetry_dir() -> Path:
+    """Where events wait.
+
+    ⛔⛔ THE ENV OVERRIDE IS ISOLATION, NOT CONFIGURATION. Measured 2026-08-18 on
+    the developer's own machine: the suite had written 8,025 test events into the
+    REAL `~/.super-research/telemetry/`, and three were sitting in the pending
+    spool waiting to be POSTed to PRODUCTION the next time a human ran any
+    command — a fake install id and a synthetic research id, indistinguishable at
+    the sink from a real machine reporting real activity.
+
+    The suite's isolation fixture redirects the backend's state dir; this module
+    imports nothing from the backend (on purpose — a telemetry failure must never
+    sit in the path of the thing it measures), so that fixture could not see it.
+    A monkeypatch would not have been enough either: several tests spawn a real
+    second interpreter, and a patched function does not cross a process boundary.
+    An env var does."""
+    override = os.environ.get("SR_TELEMETRY_DIR", "").strip()
+    if override:
+        return Path(override)
     return Path.home() / ".super-research" / "telemetry"
 
 

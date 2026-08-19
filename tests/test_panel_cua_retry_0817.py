@@ -33,6 +33,8 @@ line. That is fixed too (see the snapshot tests at the bottom) so the next miss
 can answer it — guessing a matcher from two text samples is how the last DOM wave
 went wrong.
 """
+import re
+
 import research
 
 
@@ -40,6 +42,16 @@ READY = dict(dom_misses=2, attempts=0, panel_open=False)
 
 
 # ── the first attempt behaves exactly as it always did ──────────────────────
+
+def _fn(src: str, at: int) -> str:
+    """The whole function, not a fixed slice.
+
+    ⛔ These assertions used `src[at:at + 5000]`, so growing the snapshot by a
+    few fields pushed `cl:` and the truncation cap past the window and three
+    tests failed for a reason that had nothing to do with what they pin."""
+    nxt = re.search(r"\n(?:async def |def |class )", src[at + 10:])
+    return src[at:at + 10 + nxt.start()] if nxt else src[at:]
+
 
 def test_the_first_escalation_still_lands_on_the_second_miss():
     """The retry change must not move the first attempt. Everything about the
@@ -214,7 +226,7 @@ def test_the_snapshot_dedupes_by_text():
     from."""
     src = _src()
     at = src.index("async def _log_chatgpt_thread_snapshot")
-    body = src[at:at + 5000]
+    body = _fn(src, at)
     assert "seen" in body and "dupes" in body
     assert "seen.has(key)" in body
 
@@ -227,7 +239,7 @@ def test_the_snapshot_looks_for_a_shimmer_on_DESCENDANTS_too():
     becomes the structural anchor that wording never was."""
     src = _src()
     at = src.index("async def _log_chatgpt_thread_snapshot")
-    body = src[at:at + 5000]
+    body = _fn(src, at)
     assert "animKid" in body
     assert "el.querySelectorAll('*')" in body
 
@@ -235,7 +247,7 @@ def test_the_snapshot_looks_for_a_shimmer_on_DESCENDANTS_too():
 def test_the_snapshot_reports_a_class_hook():
     src = _src()
     at = src.index("async def _log_chatgpt_thread_snapshot")
-    body = src[at:at + 5000]
+    body = _fn(src, at)
     assert "cl:" in body
 
 
@@ -244,5 +256,5 @@ def test_the_snapshot_line_is_not_truncated_before_the_neighbours():
     old 1800-char cut discarded."""
     src = _src()
     at = src.index("async def _log_chatgpt_thread_snapshot")
-    body = src[at:at + 6000]
+    body = _fn(src, at)
     assert "line[:3500]" in body

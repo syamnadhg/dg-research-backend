@@ -25409,31 +25409,73 @@ async def _log_chatgpt_thread_snapshot(page, tag=""):
             // report the two answers separately: if `animKid` turns out to be
             // the reliable one, "the shimmering line below the last user
             // message" becomes the structural anchor that wording never was.
+            // ⛔ Same split as the decider — and it has to BE the same split, or
+            // the snapshot would keep reporting a shimmer the picker no longer
+            // sees and the two would disagree about the same row.
             const shimmers = (n) => {
                 try {
                     const cs = getComputedStyle(n);
-                    return (cs.animationName && cs.animationName !== 'none')
-                        || cs.webkitBackgroundClip === 'text'
+                    return !!cs.animationName && cs.animationName !== 'none'
+                        && cs.animationPlayState !== 'paused';
+                } catch (e) { return false; }
+            };
+            const clipped = (n) => {
+                try {
+                    const cs = getComputedStyle(n);
+                    return cs.webkitBackgroundClip === 'text'
                         || cs.backgroundClip === 'text';
                 } catch (e) { return false; }
             };
             let anim = shimmers(el);
+            let clip = clipped(el);
             let animKid = false;
             try {
                 for (const kid of el.querySelectorAll('*')) {
                     if (shimmers(kid)) { animKid = true; break; }
                 }
             } catch (e) {}
+            if (!clip) {
+                try {
+                    for (const kid of el.querySelectorAll('*')) {
+                        if (clipped(kid)) { clip = true; break; }
+                    }
+                } catch (e) {}
+            }
             if (seen.has(key)) {
                 // Keep the OUTERMOST occurrence (document order), but do not
                 // lose a shimmer that only the inner copy could see.
                 const prev = seen.get(key);
                 prev.anim = prev.anim || anim;
                 prev.animKid = prev.animKid || animKid;
+                prev.clip = prev.clip || clip;
                 dupes += 1;
                 continue;
             }
             const btn = el.closest ? !!el.closest('button, [role="button"], [tabindex]') : false;
+            // ⛔ The snapshot recorded anim, animKid, testid, aria, class and y —
+            // but NOT containment or interactivity, which are two of the four
+            // terms the picker actually turns on. The artifact whose only job is
+            // explaining a miss could not explain one: given a row it had chosen,
+            // the log could not say whether `inter`, `inTurn`, `named` or a dead
+            // gradient had carried it. Record what the decision is made of.
+            let inter = false, node = el;
+            for (let i = 0; i < 6 && node; i++) {
+                const role = node.getAttribute && node.getAttribute('role');
+                const ti2 = node.getAttribute && node.getAttribute('tabindex');
+                if (node.tagName === 'BUTTON' || role === 'button'
+                        || (ti2 !== null && ti2 !== undefined && parseInt(ti2, 10) >= 0)) {
+                    inter = true; break;
+                }
+                node = node.parentElement;
+            }
+            let inTurn = false, named = false;
+            try {
+                inTurn = !!el.closest('[data-testid^="conversation-turn"], '
+                                      + '[data-message-author-role="assistant"]');
+            } catch (e) {}
+            try {
+                named = !!el.closest('[data-testid^="cot-v"][data-testid*="pinned-row"]');
+            } catch (e) {}
             const row = { t: key, tag: el.tagName,
                           ti: (el.getAttribute && el.getAttribute('data-testid')) || '',
                           ax: (el.getAttribute && el.getAttribute('aria-expanded')) || '',
@@ -25442,7 +25484,8 @@ async def _log_chatgpt_thread_snapshot(page, tag=""):
                           // part that has ever been a usable hook.
                           cl: ((el.className && el.className.split)
                                ? el.className.split(/\\s+/)[0] : '').slice(0, 32),
-                          y: Math.round(r.top), btn, anim, animKid };
+                          y: Math.round(r.top), btn, anim, animKid,
+                          clip, inter, inTurn, named };
             seen.set(key, row);
             rows.push(row);
         }
@@ -25543,14 +25586,35 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
         const DIAG = { roots: 0, walked: 0, cappedRoots: 0, maxNodes: 0,
                        structuralCapped: false, prose: 0 };
 
-        // An animated gradient clipped to the text — how ChatGPT renders the
-        // live progress line. Shared by every reader below so the answer cannot
-        // differ between the one that decides and the one that reports.
+        // ⛔⛔ 2026-08-18 — TWO OF THE THREE ARMS WERE NOT ANIMATION AT ALL.
+        // `background-clip: text` is a static PAINT property: it says the fill is
+        // clipped to the glyphs, which is equally true of a gradient that has
+        // stopped. ChatGPT's completed thinking steps keep the gradient class and
+        // just stop moving, so the detector answered "shimmering" for a row the
+        // vision tier described, the same minute, as "shown in gray, not
+        // shimmering". `animationName !== 'none'` had the same hole from the other
+        // side: a finished or paused animation still has a name.
+        //
+        // A live line and a dead line were therefore indistinguishable to the one
+        // check whose entire job was telling them apart — which is why an anchor
+        // built to survive rewording still had to be rescued by wording.
+        //
+        // Split, not dropped. `shimmers` is now strictly "an animation is
+        // RUNNING on this node"; the static gradient clip becomes `clipped`, is
+        // reported, and can only ever decide when nothing strict qualifies — so
+        // today's reach is preserved exactly while the log finally names which of
+        // the two carried any given press.
         const shimmers = (n) => {
             try {
                 const cs = getComputedStyle(n);
-                return (cs.animationName && cs.animationName !== 'none')
-                    || cs.webkitBackgroundClip === 'text'
+                return !!cs.animationName && cs.animationName !== 'none'
+                    && cs.animationPlayState !== 'paused';
+            } catch (e) { return false; }
+        };
+        const clipped = (n) => {
+            try {
+                const cs = getComputedStyle(n);
+                return cs.webkitBackgroundClip === 'text'
                     || cs.backgroundClip === 'text';
             } catch (e) { return false; }
         };
@@ -25624,6 +25688,20 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
                     // The link arm is the sidebar-conversation lesson from the
                     // drift wave: pressing an <a> navigates.
                     if (el.closest('table, td, th, code, pre, a[href]')) inProse = true;
+                    // ⛔⛔ 2026-08-18 — THE COMPOSER AND THE PAGE CHROME WERE ONLY
+                    // EVER EXCLUDED BY PASS 0. While PASS 0 answered first that
+                    // was invisible; the moment it was demoted to a last resort,
+                    // the global walk became the first pass to see the whole
+                    // document, and a shimmering "Searching for updates..."
+                    // banner outside every conversation turn was pressed instead
+                    // of the strip. Caught by an existing PASS 0 test whose
+                    // fixture the reorder handed to a different pass.
+                    //
+                    // Safe for the dialog pass too: the activity strip has never
+                    // rendered inside a form, a header, a toolbar or a nav.
+                    if (!inProse && el.closest(
+                            'form, [data-testid*="composer" i], #prompt-textarea, '
+                            + 'header, [role="toolbar"], nav')) inProse = true;
                     // The rendered response body. Only the two WEAKEST tiers are
                     // refused here — a completed strip or a live ellipsis line
                     // carries evidence prose cannot fake, so if one ever renders
@@ -25708,6 +25786,27 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
                 if (r.bottom > lub) lub = r.bottom;
             });
         } catch (e) {}
+        // ⛔⛔ THE STRUCTURAL CANDIDATE IS HELD, NOT ACTED ON. Measured 2026-08-18
+        // against the owner's own corpus: the panel opened via DOM 13 times and
+        // EVERY ONE was `anchor=global clickedTag=P` on a live in-progress label
+        // ("Planning a research-based report..."). It has never once opened from
+        // a structural pick.
+        //
+        // ⭐⭐ AND THE REASON IS A FIX OF MINE. Before 2026-08-17 the PASS 0 gate
+        // was a score threshold that could never be met, so this pass always fell
+        // through to the global walk — the one that worked. Making the gate a
+        // predicate did exactly what it was meant to do, and thereby stole the
+        // decision from the only path with a success record: it now picks a
+        // COMPLETED thinking step (a DIV, past tense: "Structured security
+        // analysis") whose click does nothing, burns both CUA escalations, and
+        // the run narrates nothing for the rest of the phase.
+        //
+        // A guard that could not fire was load-bearing, because the fallback it
+        // suppressed was the thing that worked. So the structural pick is kept as
+        // a LAST resort — after the dialog pass and after the global walk — and
+        // the pass that has 13 successes gets to answer first.
+        let deferredStructural = null;
+        let deferredStructuralCount = 0;
         if (!skipStructural && lub > 0) {
             const structural = [];
             const mainEl = document.querySelector('main') || document.body;
@@ -25757,6 +25856,20 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
                         }
                     } catch (e) {}
                 }
+                // The static gradient clip, asked separately and over the same
+                // three places. It used to be folded into `anim`, which is how a
+                // finished step read as a live one.
+                let clip = clipped(el)
+                    || (el.parentElement ? clipped(el.parentElement) : false);
+                if (!clip) {
+                    try {
+                        let seen = 0;
+                        for (const kid of el.querySelectorAll('*')) {
+                            if (++seen > 12) break;
+                            if (clipped(kid)) { clip = true; break; }
+                        }
+                    } catch (e) {}
+                }
                 // ⭐⭐ CHATGPT NAMES THIS ROW. Captured live from a panel miss:
                 // `data-testid="cot-v5-pinned-row"` with the text on
                 // `cot-v5-pinned-row-content`. An exact name beats every heuristic
@@ -25766,7 +25879,10 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
                 try {
                     named = !!el.closest('[data-testid^="cot-v"][data-testid*="pinned-row"]');
                 } catch (e) {}
-                if (!inter && !anim && !named) continue;
+                // `clip` is admitted here purely so nothing that reached this
+                // list before still reaches it — the arm used to live inside
+                // `anim`. What changed is that it can no longer DECIDE alone.
+                if (!inter && !anim && !clip && !named) continue;
                 // Is the candidate inside the assistant's own turn? The captured
                 // chain puts the strip under `SECTION[data-testid=
                 // "conversation-turn-2"]`. This is what keeps a lone shimmer from
@@ -25780,10 +25896,12 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
                 } catch (e) {}
                 const wordy = COUNT.test(t) || VERB_ONLY.test(t)
                     || STATUS_LINE.test(t) || ELLIPSIS.test(t) || COMPLETED.test(t);
+                // A dead gradient is worth 1 against a running animation's 3:
+                // present, ranked, never mistaken for the live line.
                 const score = (named ? 4 : 0) + (inter ? 3 : 0) + (anim ? 3 : 0)
-                    + (wordy ? 2 : 0) - (r.top - lub) / 1000;
+                    + (wordy ? 2 : 0) + (clip ? 1 : 0) - (r.top - lub) / 1000;
                 structural.push({ el, score, len: t.length,
-                                  named, inter, anim, wordy, inTurn });
+                                  named, inter, anim, clip, wordy, inTurn });
             }
             // ⭐⭐ 2026-08-17 — THE GATE IS A PREDICATE, NOT A SUM. It used to be
             // `score >= 3`, and 3 is exactly the weight of ONE signal while the
@@ -25803,20 +25921,27 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
                 || (h.anim && h.inTurn)                // the shimmer, contained
                 || (h.inter && h.anim)                 // the original two-signal rule
                 || (h.inter && h.wordy);               // clickable AND a known state
-            const ranked = structural.filter(qualifies);
+            // ⭐ The weak tier exists only so this pass reaches exactly what it
+            // reached before the split. It is consulted when NOTHING carries a
+            // running animation, and whatever it picks is tagged `+clip` so the
+            // next miss line says out loud that a static gradient decided it.
+            const qualifiesWeak = (h) => (h.clip && h.inTurn) || (h.inter && h.clip);
+            let ranked = structural.filter(qualifies);
+            let weakTier = false;
+            if (!ranked.length) {
+                ranked = structural.filter(qualifiesWeak);
+                weakTier = ranked.length > 0;
+            }
             if (ranked.length) {
                 // Sorted, then [0] — it used to rank the whole list and inspect
                 // only the top one, so a qualifying row sitting behind an
                 // unqualified higher scorer was never reached.
                 ranked.sort((a, b) => (b.score - a.score) || (a.len - b.len));
-                const picked = clickAndReturn(ranked[0].el,
-                                              structural.length, 'structural');
-                picked.anchor = 'structural';
-                picked.why = (ranked[0].named ? 'named' : '')
-                    + (ranked[0].anim ? '+anim' : '') + (ranked[0].inter ? '+inter' : '')
-                    + (ranked[0].wordy ? '+wordy' : '')
-                    + (ranked[0].inTurn ? '+turn' : '');
-                return picked;
+                // Held for the fallback at the bottom. NOT clicked here — see the
+                // note where `deferredStructural` is declared.
+                deferredStructural = ranked[0];
+                deferredStructural.weak = weakTier;
+                deferredStructuralCount = structural.length;
             }
         }
 
@@ -25861,6 +25986,23 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
             } catch (e) {}
         }
         walk(document);
+        if (!hits.length && deferredStructural) {
+            // Everything with a success record has now declined. The structural
+            // pick is better than pressing nothing, and its `why` says which
+            // evidence carried it so a miss can be read afterwards.
+            const picked = clickAndReturn(deferredStructural.el,
+                                          deferredStructuralCount, 'structural');
+            picked.anchor = 'structural';
+            picked.why = (deferredStructural.named ? 'named' : '')
+                + (deferredStructural.anim ? '+anim' : '')
+                + (deferredStructural.inter ? '+inter' : '')
+                + (deferredStructural.wordy ? '+wordy' : '')
+                + (deferredStructural.clip ? '+clip' : '')
+                + (deferredStructural.inTurn ? '+turn' : '')
+                + (deferredStructural.weak ? '+staticonly' : '')
+                + '+lastresort';
+            return picked;
+        }
         if (!hits.length) return {
             found: false, candidates: 0,
             // "nothing matched" and "nothing was looked at" are different
@@ -68240,10 +68382,10 @@ def run_doctor():
             else:
                 _warn("Unit missing Environment=DISPLAY=...",
                       "browser may fail post-reboot — re-run --resurrect")
-                manual_actions.append("python research.py --resurrect  (from a graphical-session terminal)")
+                manual_actions.append(_remedy_resurrect() + "  — run it from a graphical-session terminal")
         else:
             _warn("Unit file not installed", "supervisor disabled")
-            manual_actions.append("python research.py --resurrect")
+            manual_actions.append(_remedy_resurrect())
         try:
             r = _sp.run(["systemctl", "--user", "is-active", _SUPERVISOR_UNIT_NAME],
                         capture_output=True, text=True, timeout=5)
@@ -68285,7 +68427,7 @@ def run_doctor():
                     manual_actions.append(f"launchctl bootstrap gui/$(id -u) {_SUPERVISOR_PLIST_PATH}  (was: {_le})")
         else:
             _warn("LaunchAgent plist not installed")
-            manual_actions.append("python research.py --resurrect")
+            manual_actions.append(_remedy_resurrect())
     else:  # Windows
         if _detect_supervised_windows():
             _ok("Scheduled Task installed", _SUPERVISOR_TASK_NAME)
@@ -68310,7 +68452,7 @@ def run_doctor():
                 pass
         else:
             _warn("Scheduled Task not installed")
-            manual_actions.append("python research.py --resurrect")
+            manual_actions.append(_remedy_resurrect())
     print()
 
     # ── [4] Process tree + port ──
@@ -68328,6 +68470,14 @@ def run_doctor():
         _ok("--serve running", f"PID {serve_pids[0]}")
     else:
         _fail("--serve not running", "no API server → FE will show offline")
+        # ⛔⛔ THIS FAILURE USED TO CARRY NO REMEDY AT ALL. The doctor told you the
+        # API server was not running and then never said how to start one — the
+        # only step listed came from the SUPERVISOR finding above, so `--resurrect`
+        # read as the single answer to a different question. Both ways out are
+        # named here, each with the one fact that decides between them, because
+        # "which of these do I want" is the actual question a reader has.
+        manual_actions.append(_remedy_serve())
+        manual_actions.append(_remedy_resurrect())
     # Port 8000 ownership
     if plat in ("Linux", "Darwin"):
         try:
@@ -68401,6 +68551,10 @@ def run_doctor():
         tm.tm_emit(tm.Ev.DOCTOR_RUN, count=int(issues_found),
                    supervised=_detect_supervised())
         print(f"  {_c(_BOLD, f'Found {issues_found} issue(s); applied {fixes_applied} auto-fix(es).')}")
+        # Two findings can legitimately prescribe the same command — a missing
+        # supervisor and a stopped server both end at `--resurrect`. Listing it
+        # twice makes a two-step list look like a four-step one.
+        manual_actions = _dedupe_actions(manual_actions)
         if manual_actions:
             print()
             print(f"  {_c(_BOLD, 'Manual steps still required:')}")
@@ -69023,6 +69177,44 @@ def _doctor_share_logs_line() -> str:
     return (f"Still stuck? Run {_PROG} --send-logs to hand your logs to us, "
             f"or send the file yourself — {_STATE_DIR / 'logs' / 'backend.log'} "
             f"— or use Report Bug on the web app's Settings page.")
+
+
+def _remedy_serve() -> str:
+    """Start the backend in this terminal, now."""
+    return ("python research.py --serve  — start it in this terminal now; "
+            "it stops when you close the window")
+
+
+def _remedy_resurrect() -> str:
+    """Install the background supervisor instead.
+
+    ⛔⛔ AUTHORED ONCE, ON PURPOSE. Two findings prescribe this command — a
+    missing supervisor and a stopped server — and on 2026-08-18 they each spelled
+    it out in their own words. The de-duplication compared whole strings, so two
+    phrasings of ONE command both survived and the reader was told to run
+    `--resurrect` twice in a three-step list. A remedy written in two places is a
+    remedy that will disagree with itself; the fix is one author, not a cleverer
+    comparison."""
+    return ("python research.py --resurrect  — install the background "
+            "supervisor, so the backend starts at login and restarts itself "
+            "after a crash, a logout or a reboot")
+
+
+def _dedupe_actions(actions: "list[str]") -> "list[str]":
+    """Keep the first occurrence of each step, in order.
+
+    Extracted so it can be CALLED by a test. The previous version was three lines
+    inline in `run_doctor`, and the test that was supposed to cover it asserted
+    the code existed rather than that a duplicate did not survive — so it passed
+    while the duplicate shipped."""
+    seen: "set[str]" = set()
+    out = []
+    for a in actions:
+        if a in seen:
+            continue
+        seen.add(a)
+        out.append(a)
+    return out
 
 
 def _remedy_reinstall() -> str:

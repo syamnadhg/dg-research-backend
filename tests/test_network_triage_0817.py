@@ -21,6 +21,8 @@ import inspect
 
 import pytest
 
+from conftest import code_only_deep
+
 import research
 
 
@@ -314,3 +316,80 @@ def test_the_outage_notice_points_at_the_thing_that_can_localize_it():
     blob = " ".join(lines)
     assert "--doctor" in blob
     assert "backend.log" in blob
+
+
+# ── a failure that names no way out is not a diagnosis ──────────────────────
+
+def test_a_stopped_server_now_tells_you_how_to_start_one():
+    """⛔⛔ MEASURED 2026-08-18 on the owner's own machine. The doctor reported
+    "--serve not running · no API server → FE will show offline" and appended NO
+    remedy at all. The single step it did list came from the SUPERVISOR finding
+    above it, so `--resurrect` read as the one answer to a different question —
+    and the reader was left holding the actual failure with nothing to do."""
+    src = code_only_deep(research.run_doctor)
+    i = src.index('"--serve not running"')
+    tail = src[i:i + 600]
+    assert "manual_actions.append" in tail, (
+        "the failure still carries no remedy")
+    # Named through the one author, not spelled out again here — see
+    # `test_a_command_can_only_be_worded_ONE_way`.
+    assert "_remedy_serve()" in tail and "_remedy_resurrect()" in tail, (
+        "both ways out have to be named; one of them is not a choice")
+
+
+def test_each_remedy_says_what_it_DOES_not_just_what_to_type():
+    """A command with no consequence attached asks the reader to guess which one
+    they want. Read from the remedy itself, which is where the wording lives."""
+    assert "stops when you close" in research._remedy_serve(), (
+        "nothing says what --serve costs")
+    assert "reboot" in research._remedy_resurrect(), (
+        "nothing says what --resurrect buys")
+
+
+def test_the_supervisor_finding_uses_the_same_author():
+    """⛔ Every platform branch, not just macOS. Linux and Windows used to append
+    a bare `python research.py --resurrect` with no explanation at all, so the
+    same finding read differently depending on the machine you were on."""
+    src = code_only_deep(research.run_doctor)
+    i = src.index('"LaunchAgent plist not installed"')
+    assert "_remedy_resurrect()" in src[i:i + 400]
+
+
+def test_one_command_prescribed_twice_is_listed_once():
+    """⛔⛔ THE TEST THAT WAS WRONG. Its first version asserted the de-duplication
+    CODE EXISTED, and passed while the duplicate shipped to the owner's terminal —
+    because the two findings spelled the same command out in their own words and a
+    whole-string comparison saw two different steps. Asserting a mechanism is
+    present is not asserting it works."""
+    out = research._dedupe_actions(["a", "b", "a", "c", "b"])
+    assert out == ["a", "b", "c"]
+
+
+def test_a_command_can_only_be_worded_ONE_way():
+    """The real fix. A remedy written in two places is a remedy that will
+    disagree with itself, and then no comparison can collapse it."""
+    src = code_only_deep(research)
+    assert 'manual_actions.append("python research.py --resurrect' not in src, (
+        "a hand-written --resurrect remedy is back; route it through "
+        "_remedy_resurrect() so every finding says the same sentence")
+    # Every branch that prescribes it — macOS, Linux, Windows, and the stopped
+    # server — must reach the one author.
+    assert src.count("_remedy_resurrect()") >= 4
+
+
+def test_no_two_manual_steps_name_the_same_command():
+    """The property the owner actually saw broken: three steps, two of them the
+    same command."""
+    import re as _re
+    steps = [research._remedy_resurrect(), research._remedy_serve(),
+             research._remedy_resurrect()]
+    deduped = research._dedupe_actions(steps)
+    commands = [_re.search(r"--[a-z-]+", s).group(0) for s in deduped]
+    assert len(commands) == len(set(commands)), (
+        f"the same command is listed twice: {commands}")
+
+
+def test_both_remedies_still_say_what_they_do():
+    assert "stops when you close" in research._remedy_serve()
+    assert "starts at login" in research._remedy_resurrect()
+    assert "restarts itself" in research._remedy_resurrect()

@@ -204,16 +204,25 @@ def test_a_plain_clickable_row_near_the_message_is_not_enough():
     assert got.get("anchor") != "structural", got
 
 
-def test_a_clickable_row_whose_text_names_a_known_state_still_qualifies():
-    """The original two-signal rule, preserved: this is the only PASS 0 shape
-    that has ever fired in the corpus and it must keep firing."""
+def test_a_clickable_row_whose_text_names_a_known_state_is_still_pressed():
+    """The original two-signal rule, preserved — but 2026-08-18 moved WHICH pass
+    gets there.
+
+    ⭐ `inter && wordy` is now structurally unreachable as a deciding arm, and
+    that is correct rather than broken: "wordy" is exactly what the global walk
+    matches on, so any row this arm would qualify is a row the pass with 13
+    recorded successes already handles. The arm stays as a last resort for the
+    case where the global walk is somehow blind. What must not change is that
+    this shape still gets PRESSED — so that is what this pins now, instead of
+    the anchor that used to report it."""
     row = el("section", {"data-testid": "conversation-turn-2", "w": "600",
                          "h": "40", "x": "300", "y": "250"},
              kids=[el("div", {"role": "button", "w": "300", "h": "24",
                               "x": "300", "y": "250"},
                       text="Searching the web")])
     got = _open(_page(row))
-    assert got.get("anchor") == "structural", got
+    assert got.get("clicked") is True, got
+    assert "Searching the web" in (got.get("label") or ""), got
 
 
 def test_the_composer_subtree_is_still_excluded():
@@ -260,8 +269,13 @@ def test_a_qualifying_row_behind_a_higher_scoring_reject_is_still_reached():
     while a bare shimmer inside the turn is 3. But the decoy sits outside every
     conversation turn — a page-chrome banner — so it must not be pressed, and the
     strip below it must still be found."""
+    # ⛔ The decoy used to read "Searching for updates..." — which is a WORDING
+    # match, so after 2026-08-18 demoted PASS 0 the global walk claimed it and
+    # this fixture silently stopped testing PASS 0's ranking. The decoy has to be
+    # invisible to every wording matcher for the structural ranking to be what
+    # answers here.
     decoy = el("div", {"anim": "shimmer", "w": "300", "h": "24", "x": "300",
-                       "y": "210"}, text="Searching for updates...")
+                       "y": "210"}, text="Update available")
     strip = _strip("Developed the security scope", y=306, named=False,
                    button=False)
     got = _open(_page(decoy, strip))
@@ -320,7 +334,7 @@ def test_the_distance_penalty_only_ranks():
     to decide whether anything qualifies at all."""
     pass0 = _code(_pass0(_src()))
     assert "- (r.top - lub) / 1000" in pass0
-    qual = pass0[pass0.index("const qualifies"):pass0.index("const ranked")]
+    qual = pass0[pass0.index("const qualifies"):pass0.index("let ranked")]
     assert "r.top" not in qual and "lub" not in qual, qual
 
 
@@ -335,3 +349,40 @@ def test_the_captured_test_id_is_matched_version_free():
     pass0 = _code(_pass0(_src()))
     assert 'data-testid^="cot-v"' in pass0
     assert "cot-v5" not in pass0, pass0
+
+
+# ── the reorder's blast radius, 2026-08-18 ───────────────────────────────────
+
+def test_the_global_walk_will_not_press_a_shimmering_banner_outside_the_thread():
+    """⛔⛔ The composer and the page chrome were excluded by PASS 0 ONLY. While
+    PASS 0 answered first that was invisible; demoting it to a last resort made
+    the global walk the first pass to see the whole document, and it pressed a
+    "Searching for updates..." banner sitting above every conversation turn.
+
+    Found by an existing PASS 0 test whose fixture the reorder quietly handed to
+    a different pass — which is the reason a suite gets re-run rather than
+    reasoned about."""
+    # ⛔ Placed BELOW the strip on purpose. Equal-scoring hits are broken by
+    # "bottom-most wins", so a banner above the thread loses that tiebreak on its
+    # own and the fixture proves nothing — the first version of this test passed
+    # with the exclusion deleted. A toast at the foot of the window is both the
+    # realistic shape and the one where only the exclusion can save the strip.
+    banner = el("header", {"w": "1440", "h": "40", "x": "0", "y": "700"},
+                kids=[el("div", {"anim": "shimmer", "w": "300", "h": "24",
+                                 "x": "300", "y": "705"},
+                         text="Searching for updates...")])
+    strip = _strip("Searching the web now...", y=306)
+    got = _open(_page(banner, strip))
+    assert "Searching the web now" in (got.get("label") or ""), got
+
+
+def test_the_global_walk_will_not_press_the_composer():
+    """The composer's own affordance reads exactly like a live strip."""
+    # Below the strip, where the composer actually sits — see the note above.
+    comp = el("form", {"data-testid": "composer-root", "w": "600", "h": "80",
+                       "x": "300", "y": "700"},
+              kids=[el("div", {"w": "300", "h": "24", "x": "300", "y": "705"},
+                       text="Searching for anything...")])
+    strip = _strip("Searching the web now...", y=306)
+    got = _open(_page(comp, strip))
+    assert "Searching the web now" in (got.get("label") or ""), got

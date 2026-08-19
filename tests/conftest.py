@@ -210,6 +210,22 @@ def _update_sentinels_never_touch_the_real_home(tmp_path_factory, monkeypatch):
     # writing to the real home — `_spawn_detached_lifecycle` creates `_STATE_DIR`
     # and opens `upgrade.log` inside it, which is the same class of leak.
     monkeypatch.setattr(research, "_STATE_DIR", d)
+    # ⛔⛔ AND THE TELEMETRY SPOOL, which does NOT go through `_STATE_DIR`.
+    # `telemetry.py` deliberately imports nothing from research — that is what
+    # keeps a telemetry failure out of the path of the thing it measures — so it
+    # derives its own directory from `Path.home()` and this fixture could not see
+    # it. MEASURED 2026-08-18: the suite had written 8,025 test events into the
+    # developer's REAL `~/.super-research/telemetry/`, and three of them were
+    # sitting in the pending spool waiting to be POSTed to PRODUCTION on the next
+    # command a human ran — a fake install id and a synthetic research id.
+    #
+    # This is the same failure this fixture's own docstring describes, one module
+    # over: isolation that each test has to remember is isolation the suite does
+    # not have.
+    # An ENV VAR rather than a monkeypatch, because several tests spawn a real
+    # second interpreter and a patched function does not cross a process
+    # boundary — the child would go straight back to the real home.
+    monkeypatch.setenv("SR_TELEMETRY_DIR", str(d / "telemetry"))
     yield
 
 
