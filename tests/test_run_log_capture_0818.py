@@ -803,6 +803,12 @@ def test_main_installs_the_crash_hook_for_every_command():
 class _Args:
     def __init__(self, **kw):
         self.pair = self.login = self.doctor = self.serve = False
+        # ⛔ `worker_id` belongs here now: it is what separates a supervised
+        # worker from a person running serve in a terminal. A namespace missing
+        # it would silently read as "not supervised", which is right for a real
+        # argparse result (default None) but should be explicit in a fixture.
+        self.worker_id = None
+        self.daemon_loop = False
         for k, v in kw.items():
             setattr(self, k, v)
 
@@ -813,8 +819,22 @@ def test_the_three_interactive_commands_get_a_session_file():
     assert research._session_command_name(_Args(doctor=True)) == "doctor"
 
 
-def test_serve_does_not_get_one_because_its_stdout_is_already_a_file():
-    assert research._session_command_name(_Args(serve=True)) is None
+def test_a_SUPERVISED_serve_does_not_get_one_but_a_MANUAL_one_does():
+    """⛔⛔ THIS ASSERTION WAS THE OTHER WAY ROUND, and its name carried the
+    premise: "because its stdout is already a file". That is true of a worker the
+    supervisor spawned — `_spawn_worker` opens backend-N.log and passes it as
+    stdout — and false of `python research.py --serve` in a terminal, which has no
+    supervisor and therefore no redirection at all.
+
+    Measured 2026-08-19: a manual foreground serve wrote NO serve-level log file
+    anywhere, so its startup, its device-command listener and its entire shutdown
+    tail lived only in scrollback and no support bundle could carry them. The test
+    was enshrining that, so it is inverted rather than relaxed — the supervised
+    half is the half that must still be None."""
+    assert research._session_command_name(_Args(serve=True, worker_id=1)) is None
+    assert research._session_command_name(_Args(serve=True, worker_id=4)) is None
+    assert research._session_command_name(_Args(serve=True)) == "serve"
+    assert research._session_command_name(_Args(daemon_loop=True)) is None
     assert research._session_command_name(_Args()) is None
 
 

@@ -2239,6 +2239,8 @@ class _CappedLogWriter:
         self.keep = max(1, int(keep))
         self.dropped_segments = 0
         self.lines = 0
+        # See write_line: `--serve` is multi-threaded and shares one writer.
+        self._lock = __import__("threading").RLock()
         self._in_overflow = False
         self._seg_index = 0
         self._seg_written = 0
@@ -2262,10 +2264,22 @@ class _CappedLogWriter:
 
     # ── writing ─────────────────────────────────────────────────────────
     def write_line(self, text) -> None:
+        """⛔⛔ LOCKED, because `--serve` now uses this writer and `--serve` is
+        MULTI-THREADED. The three interactive commands that used it before were
+        single-threaded, so the unlocked version was safe by accident. A serve
+        session has the device-command listener, the heartbeat loop and upload
+        threads all printing, and every one of them lands here: without the lock
+        two concurrent writes during a rollover interleave `self._written`,
+        `self._fh` and `self._live_segments`, and the failure is a log that
+        silently loses the lines around each rollover — the half you need."""
         if self._fh is None:
             return
         line = str(text).rstrip("\n") + "\n"
         n = len(line.encode("utf-8", "replace"))
+        with self._lock:
+            self._write_locked(line, n)
+
+    def _write_locked(self, line, n) -> None:
         try:
             if self._in_overflow:
                 if self._seg_written and self._seg_written + n > self.segment_bytes:
@@ -2776,11 +2790,32 @@ _SESSION_TEES: "list[_SessionTee]" = []
 
 
 def _session_command_name(args) -> "str | None":
-    """Which interactive command gets a session file. `--serve` does not: its
-    stdout is already redirected into backend.log by the supervisor."""
+    """Which command gets a log file of its own.
+
+    ⭐⭐ `--serve` IS ON THIS LIST NOW, and this docstring used to assert the
+    opposite: "`--serve` does not: its stdout is already redirected into
+    backend.log by the supervisor." True of a SUPERVISED worker. False of the
+    case a developer and an owner actually hit.
+
+    MEASURED 2026-08-19: `python research.py --serve` in a terminal has no
+    supervisor, so nothing redirects anything and the session wrote NO
+    serve-level log file at all. Startup, pairing, the device-command listener
+    and the entire shutdown tail existed only in terminal scrollback, and a
+    support bundle collected none of it — the same "logging into a void" shape as
+    wave 1's six modules. It is also why the e2e recording command had to wrap
+    serve in `tee` with a signal trap: there was nothing else to read.
+
+    ⛔ THE DISCRIMINATOR IS `--worker-id`, NOT `isatty()`. `_spawn_worker` always
+    passes it, so its ABSENCE means nobody upstream is capturing our stdout.
+    isatty() would also be false when the owner pipes to `tee` — and writing a
+    file there is RIGHT, not redundant: a pipe dies with its process group on
+    Ctrl+C, which is exactly the shutdown tail the file is for. `--daemon-loop`
+    is a different flag and keeps writing backend.log as it always has."""
     for flag in ("pair", "login", "doctor"):
         if getattr(args, flag, False):
             return flag
+    if getattr(args, "serve", False) and getattr(args, "worker_id", None) is None:
+        return "serve"
     return None
 
 
