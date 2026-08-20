@@ -45,6 +45,34 @@ import research
 
 BOTH = (signal.SIGINT, signal.SIGTERM)
 
+# ⚠ WINDOWS. The mask API is POSIX-only, and so are SIGUSR1/SIGCHLD. Reading any
+# of them at import time raises AttributeError during COLLECTION, and a
+# collection error is fatal to the whole run — this one file took the entire
+# backend suite from "5,624 passing" to zero tests executed on Windows.
+#
+# Skipping the file would have been the cheap fix and the wrong one: the product
+# path that matters most on Windows is the one where the mask API is ABSENT
+# (both callers read SIG_BLOCK inside a try and return empty), and that is
+# exercised here by `mask_raises`. So the goal is for this file to keep RUNNING
+# on Windows, minus only the handful of assertions that need a real kernel mask.
+#
+# The two SIG_* values are only ever compared against themselves through the
+# fake, so any distinct sentinel serves. The real constants are used wherever
+# they exist, so a POSIX run tests byte-for-byte what it tested before.
+HAS_MASK = hasattr(signal, "pthread_sigmask")
+_SIG_BLOCK = getattr(signal, "SIG_BLOCK", "<no SIG_BLOCK on this platform>")
+_SIG_UNBLOCK = getattr(signal, "SIG_UNBLOCK", "<no SIG_UNBLOCK on this platform>")
+
+# Two signals that are NOT stop signals, for proving the repair frees the stop
+# signals and leaves everything else alone. The identity does not matter — the
+# fake only ever tests set membership — but they must be real signums on this
+# platform and must not collide with SIGINT/SIGTERM.
+_OTHERS = [getattr(signal, _n) for _n in
+           ("SIGUSR1", "SIGCHLD", "SIGBREAK", "SIGILL", "SIGSEGV", "SIGFPE")
+           if hasattr(signal, _n) and getattr(signal, _n) not in BOTH]
+assert len(_OTHERS) >= 2, f"need two non-stop signals to test with, found {_OTHERS}"
+OTHER_A, OTHER_B = _OTHERS[0], _OTHERS[1]
+
 
 class _MaskSig:
     """Stand-in for the `signal` module with a controllable process mask.
@@ -54,8 +82,8 @@ class _MaskSig:
     nothing.
     """
 
-    SIG_BLOCK = signal.SIG_BLOCK
-    SIG_UNBLOCK = signal.SIG_UNBLOCK
+    SIG_BLOCK = _SIG_BLOCK
+    SIG_UNBLOCK = _SIG_UNBLOCK
     # The startup probe picks its own signums off the module, so the stand-in has
     # to carry them too.
     SIGINT = signal.SIGINT
@@ -80,9 +108,9 @@ class _MaskSig:
     def pthread_sigmask(self, how, sigs):
         if self._mask_raises:
             raise AttributeError("no pthread_sigmask on this platform")
-        if how == signal.SIG_BLOCK and not list(sigs):
+        if how == _SIG_BLOCK and not list(sigs):
             return set(self.blocked)        # a read, not a write
-        if how == signal.SIG_UNBLOCK:
+        if how == _SIG_UNBLOCK:
             if self._unblock_raises:
                 raise OSError("mask write refused")
             self.unblocked.append(tuple(sigs))
@@ -149,12 +177,12 @@ def test_an_unblocked_signal_is_left_completely_alone(logged):
 def test_only_the_stop_signals_are_freed(logged):
     """⛔ Unblocking the whole mask would hand the process every signal somebody
     else deliberately deferred — a stop fix has no business doing that."""
-    sig = _MaskSig(blocked=(signal.SIGINT, signal.SIGUSR1, signal.SIGCHLD))
+    sig = _MaskSig(blocked=(signal.SIGINT, OTHER_A, OTHER_B))
 
     research._unblock_stop_signals(sig, BOTH, set())
 
     assert sig.unblocked == [(signal.SIGINT,)]
-    assert signal.SIGUSR1 in sig.blocked and signal.SIGCHLD in sig.blocked
+    assert OTHER_A in sig.blocked and OTHER_B in sig.blocked
 
 
 def test_one_blocked_signal_does_not_drag_the_other_along(logged):
@@ -267,7 +295,7 @@ def test_the_handler_is_installed_BEFORE_the_signal_is_unblocked(logged):
             return super().signal(signum, handler)
 
         def pthread_sigmask(self, how, sigs):
-            if how == signal.SIG_UNBLOCK:
+            if how == _SIG_UNBLOCK:
                 order.append(("unblock", tuple(sigs)))
             return super().pthread_sigmask(how, sigs)
 
@@ -406,6 +434,10 @@ def test_the_startup_probe_is_actually_called_before_the_app_does_anything():
 
 # ── the platform actually behaves the way the fix assumes ───────────────────
 
+@pytest.mark.skipif(not HAS_MASK,
+                    reason="no process signal mask on this platform (Windows) — "
+                           "the premise this asserts cannot exist here, and the "
+                           "absent-mask path is covered by mask_raises above")
 def test_the_real_signal_module_delivers_a_pending_signal_on_unblock():
     """⭐ The load-bearing premise, asserted against the real kernel rather than
     a fake: a blocked signal is HELD, not dropped, and unblocking it delivers it
