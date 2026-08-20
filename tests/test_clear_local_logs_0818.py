@@ -294,8 +294,11 @@ def test_an_empty_log_root_is_zeroes_rather_than_an_exception():
     inside a Firestore snapshot callback where a raise would queue every later
     command behind it."""
     out = research._clear_local_logs()
+    # ⭐ Exact on purpose, and `telemetry` joined it on 2026-08-19: the spool and
+    # the sent-mirror live OUTSIDE `_logs_root()`, so the collector-defined clear
+    # structurally could not see them and 2.5 MB survived the button.
     assert out == {"runs": 0, "sessions": 0, "tails": 0, "bundles": 0,
-                   "kept": 0, "failed": 0}
+                   "telemetry": 0, "kept": 0, "failed": 0}
 
 
 def test_a_root_that_does_not_exist_at_all_is_survivable(tmp_path):

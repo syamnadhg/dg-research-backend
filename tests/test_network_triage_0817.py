@@ -225,15 +225,39 @@ def test_the_doctor_feeds_its_verdict_into_the_manual_steps():
 
 # ── the hand-over line ───────────────────────────────────────────────────────
 
-def test_the_share_logs_line_names_the_real_file():
-    """⭐ Read from the live state dir at CALL time, not baked in at import — the
-    suite relocates that dir, and this test only passes because the path follows
-    it. A hardcoded home path would have looked identical here and been wrong on
-    any machine whose state dir had moved."""
+def test_the_share_logs_line_names_no_raw_log_file():
+    """⛔⛔ INVERTED 2026-08-19, ON AN OWNER DECISION, and the reason is measured.
+
+    This used to assert the line named `~/.super-research/logs/backend.log` so a
+    person could "send the file yourself". On this machine that file is **44 MB**,
+    it is the ONE log that carries no dates at all, and it contains none of the
+    per-run folders and none of the session logs — while `--send-logs`, named one
+    clause earlier, writes ~600 KB with all three and prints where it put it. The
+    route existed to spare someone a terminal and spent that on the least useful
+    bytes on the disk. Report Bug already covers "no terminal".
+
+    ⭐ The ORIGINAL point of this test survives inverted: it existed because a
+    hardcoded home path would have looked identical here and been wrong on any
+    machine whose state dir had moved. Now no path may appear at all, which is the
+    strongest form of the same guard.
+    """
     line = research._doctor_share_logs_line()
-    assert line.count("backend.log") == 1
-    assert str(research._STATE_DIR) in line
-    assert str(research._STATE_DIR / "logs" / "backend.log") in line
+    assert "backend.log" not in line, (
+        "the hand-over line points at the raw 44 MB machine log again")
+    assert str(research._STATE_DIR) not in line, (
+        "the hand-over line has grown a filesystem path again; the command prints "
+        "the bundle's own path, so this line does not need to guess one")
+    assert "--send-logs" in line
+
+
+def test_the_command_still_prints_the_file_for_someone_with_no_network():
+    """⛔ THE HALF THAT MADE DROPPING THE ROUTE SAFE. The file is still offered —
+    by the command, which writes the bundle FIRST and prints its path whether or
+    not the upload lands. If that stops happening, a person with dead DNS is left
+    with nothing to attach and the line above has no fallback behind it."""
+    src = code_only_deep(inspect.getsource(research.cmd_send_logs))
+    assert "Bundle written" in src
+    assert "can be attached to an email" in src
 
 
 def test_the_share_logs_line_names_the_command_and_the_command_exists():
@@ -311,11 +335,17 @@ def test_the_pairing_catchall_admits_it_has_no_specific_advice():
 
 
 def test_the_outage_notice_points_at_the_thing_that_can_localize_it():
+    """⛔ The second assertion used to read `"backend.log" in blob`, and it only
+    passed because the notice appends `_doctor_share_logs_line()` — so it was
+    pinning a FILENAME through a line that happened to contain one. When the owner
+    dropped that file reference on 2026-08-19 this went red for a reason that had
+    nothing to do with what it is named after. What it actually means to check is
+    that the notice hands over a route, and `--send-logs` IS the route."""
     lines = research._firestore_outage_notice(
         down_for=600, attempts=12, last_spoken_ago=None)
     blob = " ".join(lines)
     assert "--doctor" in blob
-    assert "backend.log" in blob
+    assert "--send-logs" in blob
 
 
 # ── a failure that names no way out is not a diagnosis ──────────────────────

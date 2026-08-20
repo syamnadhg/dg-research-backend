@@ -27,8 +27,11 @@ signal and REORDERS two passes:
         what the pass can even see (it used to ride inside `anim`).
   M7  — the weak tier competes with the strict one instead of backstopping it,
         which is the original false-positive with extra steps.
-  M11 — the snapshot and the picker stop sharing a definition of shimmering, so
-        the log describes a row the picker never saw.
+  M11 — a private copy of `shimmers` reappears beside the shared one, which is
+        how the snapshot and the picker would come to describe different rows.
+        (Until 2026-08-19 this mutant gave the snapshot a loose copy directly;
+        the definitions are now a single spliced constant, so the only way back
+        to that divergence is a copy re-growing, and that is what it mutates.)
 
     python .mutants/p1_precedence_liveness_0818_mutants.py
 """
@@ -53,13 +56,20 @@ ALL = [T_NEW, T_DOM]
 PY = str(ROOT / ".venv" / "bin" / "python")
 _TEST_TIMEOUT_S = 180
 
-STRICT = """        const shimmers = (n) => {
-            try {
-                const cs = getComputedStyle(n);
-                return !!cs.animationName && cs.animationName !== 'none'
-                    && cs.animationPlayState !== 'paused';
-            } catch (e) { return false; }
-        };
+# ⭐⭐ 2026-08-19 — RE-ANCHORED ONTO THE SHARED CONSTANT. This used to be the
+# PICKER's private copy at eight-space indent. The P1 chip-row wave needed the same
+# predicate in a third walker, and rather than let a third copy exist the two were
+# extracted into `_CHATGPT_SHIMMER_JS_HELPERS` and spliced into all three sites —
+# so this text moved and M4/M6 matched zero times, which the anchor sweep caught
+# and the ratchet refused to excuse. The mutants are unchanged in intent; only the
+# indentation of their target moved.
+STRICT = """    const shimmers = (n) => {
+        try {
+            const cs = getComputedStyle(n);
+            return !!cs.animationName && cs.animationName !== 'none'
+                && cs.animationPlayState !== 'paused';
+        } catch (e) { return false; }
+    };
 """
 
 FALLBACK = """        if (!hits.length && deferredStructural) {"""
@@ -80,14 +90,14 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_NEW]),
     ("M4", "under", "⭐⭐ THE LIVENESS DEFECT RESTORED — the static gradient clip "
      "is back inside `shimmers`, so a completed gray step reads as shimmering",
-     [(STRICT, """        const shimmers = (n) => {
-            try {
-                const cs = getComputedStyle(n);
-                return (cs.animationName && cs.animationName !== 'none')
-                    || cs.webkitBackgroundClip === 'text'
-                    || cs.backgroundClip === 'text';
-            } catch (e) { return false; }
-        };
+     [(STRICT, """    const shimmers = (n) => {
+        try {
+            const cs = getComputedStyle(n);
+            return (cs.animationName && cs.animationName !== 'none')
+                || cs.webkitBackgroundClip === 'text'
+                || cs.backgroundClip === 'text';
+        } catch (e) { return false; }
+    };
 """)],
      [T_NEW]),
     ("M5", "over", "⛔ the clip arm is dropped from the prefilter as well, so "
@@ -98,7 +108,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     ("M6", "under", "a paused animation counts as running again — a finished "
      "step still has an animation name",
      [(STRICT, STRICT.replace("""&& cs.animationName !== 'none'
-                    && cs.animationPlayState !== 'paused';""",
+                && cs.animationPlayState !== 'paused';""",
                                 """&& cs.animationName !== 'none';"""))],
      [T_NEW]),
     ("M7", "over", "⛔ the weak tier stops backstopping and starts competing, "
@@ -123,21 +133,25 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [("                          clip, inter, inTurn, named };",
        "                          clip };")],
      [T_NEW]),
-    ("M11", "over", "⛔ the snapshot keeps the old loose definition while the "
-     "picker uses the strict one, so the log describes a row nobody chose",
-     [("""            const shimmers = (n) => {
-                try {
-                    const cs = getComputedStyle(n);
-                    return !!cs.animationName && cs.animationName !== 'none'
-                        && cs.animationPlayState !== 'paused';
-                } catch (e) { return false; }
-            };""",
+    # ⭐⭐ M11 REWRITTEN, BECAUSE ITS ORIGINAL PREMISE NO LONGER EXISTS. It used to
+    # give the SNAPSHOT a loose private copy while the picker kept the strict one,
+    # "so the log describes a row nobody chose". With a single shared definition the
+    # two cannot disagree, and inventing an anchor to keep the old mutant alive
+    # would have been a fake measurement. What replaces it is the hazard the
+    # extraction created: a private copy reappearing NEXT TO the shared one, which
+    # is how the divergence would come back.
+    ("M11", "over", "⛔ the snapshot re-grows its own private `shimmers`, so the "
+     "shared definition stops being the only one and the two can drift again",
+     [("""            let anim = shimmers(el);
+            let clip = clipped(el);""",
        """            const shimmers = (n) => {
                 try {
                     const cs = getComputedStyle(n);
                     return cs.backgroundClip === 'text';
                 } catch (e) { return false; }
-            };""")],
+            };
+            let anim = shimmers(el);
+            let clip = clipped(el);""")],
      [T_NEW]),
     ("M12", "under", "the dedupe drops a gradient only the inner copy saw, the "
      "same way it once dropped the shimmer",

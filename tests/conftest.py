@@ -11,8 +11,10 @@ import ast
 import inspect
 import io
 import os
+import sys
 import textwrap
 import tokenize
+from datetime import datetime
 
 import pytest
 
@@ -227,6 +229,73 @@ def _update_sentinels_never_touch_the_real_home(tmp_path_factory, monkeypatch):
     # boundary — the child would go straight back to the real home.
     monkeypatch.setenv("SR_TELEMETRY_DIR", str(d / "telemetry"))
     yield
+
+
+@pytest.fixture(autouse=True)
+def _the_date_marker_is_already_spent(monkeypatch):
+    """No test sees `log()`'s `[date]` line unless it asks to.
+
+    ⛔⛔ `_LOG_DATE_STAMPED` is a module global set by the FIRST `log()` call in a
+    process — so without this, exactly one test per pytest run would find an extra
+    line in its captured stdout, and WHICH one depends on collection order. 26 test
+    files capture output. That is the same order-dependent trap as
+    `_repeat_suppressors_start_fresh` below, one module over, and the same answer:
+    make it a property of the suite instead of something each test must remember.
+
+    ⭐ Set to TODAY rather than cleared, so the marker is already spent. The tests
+    that actually exercise it clear it themselves and run after this fixture, so
+    they win — see `test_log_noise_0819.py`.
+    """
+    import research
+    monkeypatch.setattr(research, "_LOG_DATE_STAMPED",
+                        datetime.now().strftime("%Y-%m-%d"), raising=True)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _repeat_suppressors_start_fresh():
+    """Every module-level `logquiet.Suppressor` forgets its topics per test.
+
+    ⛔⛔ MEASURED 2026-08-19. `telemetry._ID_TOKEN_QUIET` uses `logquiet.ONCE`,
+    which is per-PROCESS by design — and a pytest run is one process. So the first
+    test to exercise the missing-accessor path consumed the only emission, and
+    `test_a_missing_accessor_is_not_the_same_as_a_signed_out_machine` went red in
+    the FULL SUITE while passing on its own: the classic order-dependent failure,
+    arriving as a mysterious break in a file nobody had touched.
+
+    ⭐ DISCOVERED, NOT LISTED. A hand-maintained list of suppressors would drift
+    the moment a fourth flood gets a cadence — and it would be updated by the same
+    person who did not notice the ordering problem. Walking the first-party modules
+    already imported cannot drift.
+
+    Deliberately NOT a monkeypatch: these are module globals whose identity other
+    code closes over, so they are cleared in place and left in place.
+
+    ⛔ CLEARED ON SETUP ONLY, AND NOT ALSO ON TEARDOWN. The first version did both,
+    and mutation found that removing either half changed nothing — so neither half
+    was testable and the pair was a hiding place. Setup is the half that matters:
+    it guarantees a fresh start whatever ran before, including a topic tripped at
+    import time, which a teardown-only clear could never undo.
+
+    ⚠ THE COST, MEASURED AND ACCEPTED: rescanning every loaded module for every
+    test adds ~14s to a ~450s suite (3%). A session-cached list of suppressors, or
+    a registry inside `logquiet`, would both be faster — and both need a rule for
+    when the cache is stale that is hard to test, which is the shape of a guard
+    that silently stops firing. A scan cannot go stale.
+    """
+    import logquiet
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for mod in list(sys.modules.values()):
+        path = getattr(mod, "__file__", None) or ""
+        if not path.startswith(repo):
+            continue
+        try:
+            members = list(vars(mod).values())
+        except Exception:
+            continue
+        for value in members:
+            if isinstance(value, logquiet.Suppressor):
+                value.clear()
 
 
 def _clipboard_double(value):

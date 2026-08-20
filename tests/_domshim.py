@@ -14,8 +14,8 @@ test suite behind an `npm install` and a node_modules tree.
 Supports what the production selectors actually use: tag names, `[attr]`,
 `[attr="v"]`, `[attr*="v" i]`, comma selector lists, descendant combinators,
 `getComputedStyle` driven by `anim`/`clip` attributes,
-`textContent`/`innerText`, attribute reads, `getBoundingClientRect`, `closest`, and a
-click that records what was clicked.
+`textContent`/`innerText`, attribute reads, `getBoundingClientRect`, `closest`,
+`getAnimations()` (element and document), and a click that records what was clicked.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 from html.parser import HTMLParser
@@ -156,14 +157,48 @@ def js_constant(fn, name: str) -> str:
     the value production actually hands to `page.evaluate`, escapes and concatenation
     already resolved. The AST walk stays for constants assigned INSIDE a function,
     where there is no attribute to read.
+
+    ⭐⭐ 2026-08-19 — AND IT NOW FOLDS THAT CONCATENATION FOR IN-FUNCTION CONSTANTS
+    TOO, which is what the paragraph above only half delivered. When
+    `_CHATGPT_SHIMMER_JS_HELPERS` was extracted so three walkers could share one
+    definition of "shimmering", the picker's `JS = \"\"\"…\"\"\" + _CHATGPT_SHIMMER_JS_HELPERS
+    + \"\"\"…\"\"\"` stopped being an `ast.Constant` and eleven anchor tests failed with
+    "JS not found" — a message that reads like a renamed constant and has nothing to
+    do with the change. The shim's own rule applies to the shim: it only proves
+    something if it answers the way the real thing does, and production evaluates
+    the concatenation. `Name` operands are resolved against the module that defines
+    `fn`, so a shared constant is spliced here exactly as `page.evaluate` sees it.
     """
     if isinstance(getattr(fn, name, None), str):
         return getattr(fn, name)
+    owner = sys.modules.get(getattr(fn, "__module__", "") or "")
+
+    def _fold(node):
+        """The assigned value as a string, or None when it is not string-shaped."""
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left, right = _fold(node.left), _fold(node.right)
+            return None if left is None or right is None else left + right
+        if isinstance(node, ast.Name):
+            # A module-level JS fragment shared between call sites. Resolved from
+            # the live module rather than re-parsed, so escapes match production.
+            val = getattr(owner, node.id, None)
+            return val if isinstance(val, str) else None
+        return None
+
     for node in ast.walk(_string_literals(fn)):
-        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
-            for t in node.targets:
-                if isinstance(t, ast.Name) and t.id == name:
-                    return node.value.value
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == name for t in node.targets):
+            continue
+        folded = _fold(node.value)
+        if folded is not None:
+            return folded
+        raise AssertionError(
+            f"{name} in {getattr(fn, '__name__', fn)} is assigned something this "
+            f"shim cannot resolve to a string ({type(node.value).__name__}) — a "
+            f"test fed it to node and would have measured nothing")
     raise AssertionError(f"{name} not found in {getattr(fn, '__name__', fn)}")
 
 SHIM = r"""
@@ -279,6 +314,31 @@ class El {
   get href() { return this._attrs['href'] || ''; }
   get title() { return this._attrs['title'] || ''; }
   click() { CLICKS.push(this.getAttribute('aria-label') || this.textContent || this.tagName); }
+  // ⭐⭐ 2026-08-19 — THE WEB ANIMATIONS API, which this shim had no answer for
+  // at all. Every "is it still generating" probe in this repo ends at
+  // `el.getAnimations().some(a => a.playState === 'running')`, deliberately:
+  // a browser leaves `animationName` set on an element whose animation already
+  // FINISHED, so the computed style cannot tell a live spinner from dead chrome
+  // (the 2026-05-14 note on those probes says exactly this). Without this
+  // method every such probe threw `getAnimations is not a function` under the
+  // shim, so the tier could not be executed and only source text could be
+  // asserted about it — which is how a tier that matched CLASS names while
+  // Gemini animates by NAME survived two years of green tests.
+  //
+  // Driven by the same `anim` attribute `getComputedStyle` already reads, so one
+  // fixture describes both views of the element. `playstate` defaults to
+  // "running"; set `playstate="finished"` to express the persisted-but-dead
+  // animation these probes exist to reject. `effect.target` points back at the
+  // element, which is how `document.getAnimations()` callers get from an
+  // animation to its geometry.
+  getAnimations() {
+    const names = String(this._attrs['anim'] || '')
+      .split(/\s+/).filter(n => n && n !== 'none');
+    const state = this._attrs['playstate'] || 'running';
+    return names.map(n => ({
+      animationName: n, playState: state, effect: { target: this },
+    }));
+  }
   // `x`/`y` place the box. They default to 10,10 (on-screen) so every existing
   // fixture keeps its old geometry, and they exist because "on screen" is not a
   // question a size can answer: NotebookLM parks a full-size button at x=-36,
@@ -437,6 +497,12 @@ globalThis.document = {
   // `document.body` is the picker's fallback root for "no menu has mounted
   // yet". Without it that branch throws instead of exercising the fallback.
   get body() { return ROOT; },
+  // The document-wide view of the same API. Production reaches for it when the
+  // question is "is ANYTHING on this page still animating" and there is no
+  // class name worth selecting on — which is the only formulation that can find
+  // an animation whose name is the signal and whose class is meaningless.
+  // Document order, root first, exactly as a browser reports it.
+  getAnimations: () => [ROOT, ...ROOT.descendants()].flatMap(e => e.getAnimations()),
 };
 // ⭐ 2026-08-17 — THE SHIMMER IS A COMPUTED STYLE, and this returned a constant.
 // ChatGPT's live progress line is an animated gradient clipped to the text, and

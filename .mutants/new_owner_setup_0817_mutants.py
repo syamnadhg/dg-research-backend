@@ -53,7 +53,11 @@ T_SERVE = "tests/test_serve_cli_consistency.py"
 T_LOGIN = "tests/test_login_profile_flow.py"
 T_BRIDGE = "tests/test_stdlib_log_bridge_0817.py"
 T_DOC = "tests/test_doctor_network_truth_0817.py"
-ALL = [T_YN, T_OUT, T_PAIR, T_VERIFY, T_SERVE, T_LOGIN, T_BRIDGE, T_DOC]
+# ⛔ 2026-08-19 — the aegis pulse gained an emission cadence and an uptime. Those
+# properties are pinned in the log-noise file, and a harness that did not run it
+# would report all of them as suite gaps.
+T_NOISE = "tests/test_log_noise_0819.py"
+ALL = [T_YN, T_OUT, T_PAIR, T_VERIFY, T_SERVE, T_LOGIN, T_BRIDGE, T_DOC, T_NOISE]
 
 PY = str(ROOT / ".venv" / "bin" / "python")
 
@@ -274,19 +278,56 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      "a falsy check putting the lie straight back",
      [("    if down_for is not None:", "    if down_for:")],
      [T_OUT]),
+    # ⛔ F18-F20 RE-ANCHORED 2026-08-19. The pulse gained a widening emission
+    # cadence and an uptime, so the line grew a `{note}` suffix and the loop body
+    # de-indented one level out of its old `if not running:` block. Every premise
+    # is unchanged.
     ("F18", "under", "the broken pulse stops saying what it costs the user",
-     [("                f\"{_outage_duration_text(down_for)}; the web app shows this \"\n                f\"computer offline and runs fired at it will not arrive\")",
+     [("                f\"{_outage_duration_text(down_for)}; the web app shows this \"\n                f\"computer offline and runs fired at it will not arrive{note}\")",
        "                f\"{_outage_duration_text(down_for)}\")")],
-     [T_OUT]),
+     [T_OUT, T_NOISE]),
     ("F19", "under", "the broken pulse is logged at INFO, invisible in a level "
      "filter",
-     [("                        ), \"WARN\" if _cut_off else \"INFO\")",
-       "                        ), \"INFO\")")],
-     [T_OUT]),
+     [("                    ), \"WARN\" if _cut_off else \"INFO\")",
+       "                    ), \"INFO\")")],
+     [T_OUT, T_NOISE]),
     ("F20", "under", "the pulse loop stops reading the real client state",
-     [("                        _cut_off = _firebase_db is None",
-       "                        _cut_off = False")],
-     [T_OUT]),
+     [("                    _cut_off = _firebase_db is None",
+       "                    _cut_off = False")],
+     [T_OUT, T_NOISE]),
+    ("F20b", "under", "⛔⛔ the pulse loses its cadence and goes back to one line "
+     "a minute — 2,274 and 2,754 lines in the two real machine tails",
+     [("                    _emit, _dropped = _quiet.consider(\"aegis-pulse\", _state)",
+       "                    _emit, _dropped = True, 0")], [T_NOISE]),
+    ("F20c", "over", "⛔⛔ the TICK widens with the emission, so a broken watch is "
+     "reported up to an hour after Firestore goes — the alarm this loop exists for",
+     # ⛔ `await asyncio.sleep(60)` alone matches twice in research.py, so the
+     # anchor carries the line that follows it. A two-hit anchor measures nothing
+     # and reports a kill.
+     [("                    await asyncio.sleep(60)\n"
+       "                    if _QUEUE_STATE.get(\"running\"):",
+       "                    await asyncio.sleep(\n"
+       "                        60 * max(1, _quiet.seen(\"aegis-pulse\") // 5))\n"
+       "                    if _QUEUE_STATE.get(\"running\"):")],
+     [T_NOISE]),
+    ("F20d", "under", "a pipeline run resets the cadence, so every long run is "
+     "followed by another minutely burst",
+     [("                    if _QUEUE_STATE.get(\"running\"):",
+       "                    if _QUEUE_STATE.get(\"running\") and _quiet.consider(\n"
+       "                            \"aegis-pulse\", \"running\") and True:")],
+     [T_NOISE]),
+    ("F20e", "under", "the uptime clock never restarts, so a pulse reports an "
+     "uptime from before the outage it is meant to reveal",
+     [("                        _state_since = time.time()", "                        pass")],
+     [T_NOISE]),
+    ("F20f", "under", "the pulse stops carrying its uptime, so an hour-apart line "
+     "cannot tell a continuous watch from a restart",
+     [("                        up_for=None if _cut_off else (time.time() - _state_since),",
+       "                        up_for=None,")], [T_NOISE]),
+    ("F20g", "under", "a suppressed repeat is discarded instead of counted, so "
+     "'this happened 2,274 times' becomes 'this happened'",
+     [("                        suppressed=_dropped,", "                        suppressed=0,")],
+     [T_NOISE]),
 
     # ══ the retry line and the recovery line ═══════════════════════════
     ("F21", "under", "⛔ the retry line goes back to being identical at attempt "

@@ -110,7 +110,15 @@ superresearch = "research:main"
 # Flat layout — explicit lists (NOT auto-discovery) so we ship exactly the
 # pipeline modules + auth/scripts and never the agent/, tests/, logs/, queues/,
 # or runtime *.json/*.log files sitting in the repo root.
-py-modules = ["research", "models", "prompts", "vision", "narrate", "selfheal"]
+# ⛔⛔ `telemetry` was MISSING from this list from the day it was added
+# (2026-08-18) and research.py imports it at MODULE SCOPE, unguarded — so the
+# next wheel built from that tree would have died with `ModuleNotFoundError:
+# telemetry` before printing anything. Nothing failed: the two drift guards in
+# tests/test_compiled_wheel_covers_every_module.py compare THIS list against
+# TOP_MODULES, and a module absent from both satisfies them. The third guard —
+# every module research.py imports must be shipped — is now in that file too.
+py-modules = ["research", "models", "prompts", "vision", "narrate", "selfheal",
+              "telemetry", "logquiet"]
 packages = ["auth", "scripts"]
 
 [tool.setuptools.package-data]

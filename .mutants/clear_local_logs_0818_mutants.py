@@ -129,9 +129,12 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [("                if WORKER_ID == 1:\n                    try:\n                        cleared = _clear_local_logs()",
        "                if True:\n                    try:\n                        cleared = _clear_local_logs()")],
      [T_NEW]),
-    ("C15", "under", "the handler reports only three of the six counters, so a "
+    # ⛔ RE-ANCHORED 2026-08-19: a seventh counter (`telemetry`) joined the dict
+    # when the clear was extended past the collector's own sources.
+    ("C15", "under", "the handler reports only three of the seven counters, so a "
      "partial clear reads as total in the log",
      [("                            f\"tails={cleared['tails']} bundles={cleared['bundles']} \"\n"
+       "                            f\"telemetry={cleared['telemetry']} \"\n"
        "                            f\"kept={cleared['kept']} failed={cleared['failed']}\")",
        "                            f\"tails={cleared['tails']}\")")],
      [T_NEW]),

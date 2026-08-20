@@ -48,7 +48,11 @@ MUTATED_FILES = [SRC]
 
 T_BUNDLE = "tests/test_log_bundle_0818.py"
 T_CAP = "tests/test_run_log_capture_0818.py"
-ALL = [T_BUNDLE, T_CAP]
+# ⛔ 2026-08-19 — `_tail_bytes` was rewritten so its budget is spent on content
+# worth reading. The tests for that live in the log-noise file; a harness scoped
+# to its own two would report every one of them as a suite gap.
+T_NOISE = "tests/test_log_noise_0819.py"
+ALL = [T_BUNDLE, T_CAP, T_NOISE]
 
 PY = str(ROOT / ".venv" / "bin" / "python")
 _TEST_TIMEOUT_S = 600
@@ -155,16 +159,92 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [('        Path(path).resolve().relative_to(_logs_root().resolve())',
        '        Path(path).relative_to(_logs_root())')],
      [T_BUNDLE]),
+    # ⛔ B11/B12 RE-ANCHORED 2026-08-19. `_tail_bytes` was rewritten to walk
+    # backwards line by line so its budget is spent on content worth reading
+    # (91–95% of the two real machine tails were one health-probe line). Both
+    # PREMISES survive the rewrite and are re-expressed against the new shape.
     ("B11", "under", "⛔ the raw log is read from the HEAD, so the tail — where "
      "the failure is — is exactly what gets left out",
-     [('            if size > limit:\n                fh.seek(size - limit)',
-       '            if size > limit:\n                fh.seek(0)')],
-     [T_BUNDLE]),
+     [('    pos = size\n    partial = b""',
+       '    pos = min(size, _TAIL_CHUNK_BYTES)\n    partial = b""')],
+     [T_BUNDLE, T_NOISE]),
+    # ⛔ B12 RE-ANCHORED AGAIN, 2026-08-19, and the premise moved with the code.
+    # The byte-level "cut forward to the next newline" it used to pin no longer
+    # exists: the trim is line-wise now (see B11i for why), so whole lines are
+    # structural rather than recovered. The only remaining way to emit a fragment
+    # is for the backward walk to treat a chunk's leading partial line as whole.
     ("B12", "under", "the tail starts mid-line, so the first record a reader "
      "sees is a fragment",
-     [('                nl = chunk.find(b"\\n")\n                return chunk[nl + 1:] if 0 <= nl < len(chunk) - 1 else chunk',
-       '                return chunk')],
-     [T_BUNDLE]),
+     [('        partial = parts.pop(0) if pos > 0 else b""',
+       '        partial = b""')],
+     [T_BUNDLE, T_NOISE]),
+    ("B11b", "under", "⛔⛔ the read-time filter goes, so 91% of a 5 MiB budget "
+     "goes back to carrying the sentence 'a health probe succeeded'",
+     [('        if _drop_from_tail(line):', '        if False:')],
+     [T_NOISE]),
+    ("B11c", "under", "a run of byte-identical lines stops collapsing — one "
+     "repeated sentence was 95.7% of a real .err tail",
+     [('        if run_line is not None and line == run_line:',
+       '        if False:')], [T_NOISE]),
+    # ⛔ REWRITTEN 2026-08-19. The first version prepended `if line in {run_line}:`
+    # — which is the SAME comparison as the line it was meant to broaden, so it was
+    # an EQUIVALENT mutant and its survival said nothing about the suite. Comparing
+    # against every line kept so far is what actually expresses "non-adjacent".
+    ("B11d", "over", "⛔ NON-ADJACENT duplicates collapse too, which destroys a "
+     "timeline: 'A B A' becomes 'A B'",
+     [('        if run_line is not None and line == run_line:',
+       '        if line in set(out):')], [T_NOISE]),
+    ("B11e", "under", "⛔ the filtered tail stops admitting it was filtered, so a "
+     "reader concludes the health probes stopped — a diagnosis, and a wrong one",
+     [('            if stats.get("dropped") or stats.get("collapsed"):\n'
+       '                data = _tail_filter_header(path.name, stats) + data',
+       '            pass')], [T_NOISE]),
+    ("B11f", "under", "the scan is unbounded, so one oversized file can hold a "
+     "user's support bundle open indefinitely",
+     [('    scan_limit = max(limit, int(scan_limit))',
+       '    scan_limit = max(limit, 1 << 60)')], [T_NOISE]),
+    ("B11g", "under", "a truncated scan claims it reached the start of the file, "
+     "so a reader dates the history from where the tail happens to begin",
+     [('    stats["reachedStart"] = size <= scan_limit',
+       '    stats["reachedStart"] = True')], [T_NOISE]),
+    ("B11i", "under", "⛔⛔ the budget trim goes back to cutting BYTES, so the "
+     "oldest line can vanish while its 'repeated N more times' marker survives "
+     "pointing at whatever line is now above it — a fabricated count in a support "
+     "archive",
+     [('    total = sum(len(x) + 1 for x in newest_first)\n'
+       '    while total > limit and len(newest_first) > 1:\n'
+       '        total -= len(newest_first.pop()) + 1',
+       '    out = b"\\n".join(reversed(newest_first)) + b"\\n"\n'
+       '    if len(out) > limit:\n'
+       '        out = out[len(out) - limit:]\n'
+       '        nl = out.find(b"\\n")\n'
+       '        out = out[nl + 1:] if 0 <= nl < len(out) - 1 else out\n'
+       '        return out\n'
+       '    total = 0')], [T_NOISE]),
+    ("B11j", "under", "the orphaned-marker sweep goes, so a trim that removes a "
+     "collapsed run's copy leaves its count attached to the wrong line",
+     [('    while (len(newest_first) > 1\n'
+       '           and newest_first[-1].startswith(_TAIL_REPEAT_NOTE_PREFIX)):\n'
+       '        total -= len(newest_first.pop()) + 1', '    pass')], [T_NOISE]),
+    ("B11k", "over", "the trim keeps popping past the last line, so a file whose "
+     "newest line alone exceeds the budget contributes NOTHING",
+     [('    while total > limit and len(newest_first) > 1:',
+       '    while total > limit and len(newest_first) > 0:')], [T_NOISE]),
+    ("B11l", "under", "the marker prefix is spelled out again instead of derived "
+     "from the template, so the two can drift and the orphan check stops matching",
+     [('_TAIL_REPEAT_NOTE_PREFIX = _TAIL_REPEAT_NOTE.split(b"%")[0]',
+       '_TAIL_REPEAT_NOTE_PREFIX = b"[bundle] ^ the line above repeated "')],
+     [T_NOISE]),
+    ("B11m", "under", "the chunk-size clamp goes, so a chunk of 0 spins the "
+     "backward walk forever inside a user's support-bundle build",
+     [('        step = min(max(1, _TAIL_CHUNK_BYTES), pos, scan_limit - scanned)',
+       '        step = min(_TAIL_CHUNK_BYTES, pos, scan_limit - scanned)')],
+     [T_NOISE]),
+    ("B11h", "over", "the filter drops a FAILING health probe too — the endpoint "
+     "the worker watchdog uses to decide a worker is wedged",
+     [('    r\'"(?:GET|HEAD) /api/health(?:\\?[^"\\s]*)? HTTP/[0-9.]+" 2\\d\\d\\b\')',
+       '    r\'"(?:GET|HEAD) /api/health(?:\\?[^"\\s]*)? HTTP/[0-9.]+" \\d\\d\\d\\b\')')],
+     [T_NOISE]),
     ("B13", "under", "⛔ collected.json disappears, so silent truncation reads as "
      "complete coverage",
      [('        }, indent=1).encode("utf-8"), "collected.json")',

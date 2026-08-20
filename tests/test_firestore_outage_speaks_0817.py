@@ -318,9 +318,14 @@ def test_the_reconnect_loop_starts_the_clock_for_workers_with_no_heartbeat():
 
 
 def test_the_pulse_loop_passes_the_real_state():
+    """⛔ SLICED TO THE NEXT CONSTRUCT, NOT A BYTE WINDOW. This used to take the
+    first 1,200 bytes, and on 2026-08-19 the loop grew the comments explaining
+    its emission cadence — which pushed `down_for=` past the window and turned
+    this into a failure about slice arithmetic rather than about the pulse. A
+    fixed window silently stops covering the thing it names."""
     src = inspect.getsource(research)
-    loop = src[src.index("async def _aegis_pulse_loop():"):]
-    body = loop[:1200]
+    start = src.index("async def _aegis_pulse_loop():")
+    body = src[start:src.index("asyncio.create_task(_aegis_pulse_loop())", start)]
     assert "_firebase_db is None" in body
     assert "down_for=" in body
     assert '"WARN" if _cut_off else "INFO"' in body, (

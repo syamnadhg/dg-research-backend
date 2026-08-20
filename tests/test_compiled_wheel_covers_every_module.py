@@ -112,6 +112,114 @@ def test_selfheal_specifically_is_compiled() -> None:
     )
 
 
+def _first_party_top_level_imports(*sources: Path) -> "dict[str, str]":
+    """Module-scope imports of top-level first-party modules, name -> where.
+
+    ⛔⛔ 2026-08-19 — THE MISSING THIRD LEG, and it cost a launch-blocking hole.
+    `telemetry.py` was added on 2026-08-18 and `research.py` imports it at module
+    scope, unguarded — but it was in NEITHER py-modules NOR TOP_MODULES, and every
+    assertion in this file compares those two lists TO EACH OTHER. A module absent
+    from both satisfies the relationship perfectly. The next wheel would have
+    raised `ModuleNotFoundError: telemetry` before printing a single line, and the
+    only thing that would have caught it is running the wheel.
+
+    So the two declarations are now also checked against the SOURCE: whatever
+    research.py and the auth package actually import has to be shipped. Derived
+    with `ast`, never a list here, because a hardcoded list is maintained by the
+    same person who forgot the build script.
+
+    Module scope only. A guarded or function-local import is a deliberate optional
+    dependency and this must not start demanding those ship.
+    """
+    first_party = {
+        p.stem for p in REPO.glob("*.py")
+        if not p.name.startswith("test_") and p.name != "conftest.py"
+    }
+    found: "dict[str, str]" = {}
+    for src in sources:
+        tree = ast.parse(src.read_text(encoding="utf-8"))
+        for node in tree.body:            # top level ONLY
+            names: "list[str]" = []
+            if isinstance(node, ast.Import):
+                names = [a.name.split(".")[0] for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names = [node.module.split(".")[0]]
+            for name in names:
+                if name in first_party:
+                    found.setdefault(name, src.name)
+    return found
+
+
+def test_the_import_scan_actually_finds_something() -> None:
+    """Guard against the guard. A scan that matched nothing — a moved repo root,
+    an `ast` field rename — would make the assertion below vacuously true, which
+    is the precise shape of the bug it exists to catch."""
+    found = _first_party_top_level_imports(REPO / "research.py")
+    assert "telemetry" in found, (
+        "the scanner cannot see research.py's own module-scope imports")
+
+
+def _shipped_sources() -> "list[Path]":
+    """Every file whose module-scope imports must be satisfied by the wheel.
+
+    ⛔⛔ ONE DEFINITION, and it is here because of a mutation survivor. Narrowing
+    the assertion's own inline list to research.py alone changed nothing
+    observable — everything `auth/` imports today happens to be shipped — so the
+    coverage was resting on a coincidence, and a separate test that called the
+    scanner with its OWN list could not see the narrowing at all. Both the
+    assertion and the auth-is-covered test now read this, so shrinking it turns
+    two tests red instead of none."""
+    return [REPO / "research.py", *sorted((REPO / "auth").glob("*.py"))]
+
+
+def test_the_scan_reaches_the_auth_package_too() -> None:
+    """`auth/credentials.py` imports `logquiet` at module scope, and that is what
+    proves the package is in scope — not a comment saying it is."""
+    auth_sources = [p for p in _shipped_sources() if p.parent.name == "auth"]
+    assert auth_sources, (
+        "the auth package dropped out of the shipped-source list, so an auth "
+        "module could import something the wheel does not carry")
+    found = _first_party_top_level_imports(*auth_sources)
+    assert found.get("logquiet") == "credentials.py", (
+        f"the auth package is scanned but its imports are not seen: {found}")
+
+
+def test_a_guarded_or_function_local_import_is_not_demanded(tmp_path) -> None:
+    """⛔ FOUND BY MUTATION, THE OTHER DIRECTION. Widening the walk from
+    `tree.body` to `ast.walk` also survived, because nothing first-party is
+    currently imported optionally — so the "module scope only" rule was untested.
+    A guarded import is a deliberate optional dependency and must not start
+    demanding to ship."""
+    src = tmp_path / "probe.py"
+    src.write_text(
+        "def f():\n"
+        "    import selfheal\n"
+        "    return selfheal\n"
+        "try:\n"
+        "    import narrate\n"
+        "except Exception:\n"
+        "    narrate = None\n",
+        encoding="utf-8")
+    found = _first_party_top_level_imports(src)
+    assert "selfheal" not in found, "a function-local import was demanded"
+    assert "narrate" not in found, "a guarded import was demanded"
+    # …and the positive half, so this cannot pass by scanning nothing at all.
+    src.write_text("import selfheal\n", encoding="utf-8")
+    assert "selfheal" in _first_party_top_level_imports(src)
+
+
+def test_every_module_the_source_imports_is_shipped() -> None:
+    found = _first_party_top_level_imports(*_shipped_sources())
+    packed = set(_declared_py_modules())
+    missing = sorted(f"{name} (imported by {where})"
+                     for name, where in found.items() if name not in packed)
+    assert not missing, (
+        f"these modules are imported at MODULE SCOPE but pyproject's py-modules "
+        f"does not ship them: {missing}. An installed wheel raises "
+        f"ModuleNotFoundError on startup — before it can print anything."
+    )
+
+
 def test_nothing_is_compiled_that_is_not_shipped() -> None:
     """The other direction. Compiling a module that pyproject does not pack means
     the build spends minutes on a file that never reaches the wheel — a silently

@@ -1190,16 +1190,20 @@ mode (P2) OR Pro + Extended Thinking mode (P1). The target looks slightly
 different in each, but the click behavior and goal are identical.
 
 GOAL: Click the collapsed activity affordance attached to the most recent
-ChatGPT response so its research activity opens. The click opens a panel
-on the right:
-- Pro/Extended Thinking (P1): a NARROW panel (roughly a fifth of the
-  window) headed "Activity" with a small elapsed time (e.g. "Activity ·
-  8s"), an X close button, and an "Answer now" link. EARLY IN A RUN IT
-  SHOWS ONLY GRAY PLACEHOLDER/SKELETON BARS — that still counts as OPEN.
-- Deep Research (P2): a wider panel (e.g. "Deep research execution plan")
-  with a step list and source URLs.
-Rarely, an inline thoughts/activity section may expand directly below the
-clicked line instead. ANY of these outcomes is success.
+ChatGPT response so its research activity opens. WHERE IT OPENS DIFFERS BY
+MODE, and getting this wrong means clicking a working affordance over and
+over:
+- Pro/Extended Thinking (P1): the activity expands INLINE, directly under
+  the line you clicked — a row of small website chips, each a favicon plus
+  a domain (like "www.example.com"), usually a handful side by side and
+  often ending in a chip reading "N more". There is NO side panel in this
+  mode. Verified live 2026-08-19 from screenshots of a real run.
+- Deep Research (P2): a panel on the RIGHT (e.g. "Deep research execution
+  plan") with a step list and source URLs. A narrow panel headed
+  "Activity · <seconds>" showing only gray placeholder/skeleton bars also
+  counts as OPEN.
+ANY of these outcomes is success. Which one you get is decided by the page,
+not by you — do not keep clicking because you were expecting the other.
 
 WHERE IT IS:
 - Early in a response (thinking phase, 2026-07 UI): DIRECTLY BELOW the
@@ -1235,9 +1239,12 @@ Shape A — glowing inline label (P1 / Pro + Extended Thinking, most common):
   click target. Do NOT skip it as a "show reasoning" toggle.
 - The P2 Deep Research synthesis-stage verbs ("Confirming",
   "Summarizing", "Synthesizing", "Drafting", "Finalizing") used to be
-  listed here too. They were removed because the STRUCTURAL HINT below
-  (ellipsis suffix) is the reliable anchor for those — wording mutates
-  too fast to keep an exhaustive list in sync.
+  listed here too. They were removed because wording mutates too fast to
+  keep an exhaustive list in sync — the STRUCTURAL HINT below is the
+  anchor. That hint used to be the ellipsis suffix alone; since 2026-08-19
+  it is the SHIMMER, with the ellipsis demoted to a hint that holds in P2
+  and not in P1. The list above is therefore examples, not a whitelist:
+  a shimmering line whose words appear nowhere here is still the target.
 
 Shape B — count-badge strip (P2 / Deep Research):
 - A wider horizontal strip, still attached to the bottom of the latest
@@ -1249,24 +1256,40 @@ Shape B — count-badge strip (P2 / Deep Research):
 Either shape is a valid target. They behave the same on click.
 
 STRUCTURAL HINT (use this when verb wording is unfamiliar):
-- The live activity line ALWAYS ends with three dots / ellipsis ("...")
-  while the run is in progress. If you see a glowing/shimmering line
-  attached to the latest response that ends in `...`, that IS the click
-  target — even if the leading words aren't on the trigger-phrase list
-  above. The ellipsis suffix is the most reliable visual anchor; the
-  text in front of it mutates throughout the run, the dots do not.
-- The ellipsis line sits on a row with a small spinner/dot on the left
-  and (in P2 Deep Research) a "<N> searches" count badge plus a stop
-  button to its right. That whole row is the strip.
+- THE SHIMMER IS THE ANCHOR. If a line attached to the latest response has
+  a moving shine/glow sweeping across its text, that IS the click target,
+  whatever the words are. The wording is topic-specific and rewrites itself
+  every few seconds; the shimmer does not.
+- A trailing "..." is a STRONG extra hint when present, and in Deep
+  Research (P2) it usually is — a line like "Researching..." is the strip.
+  It is NOT required, and in Pro/Extended Thinking (P1) it is usually
+  ABSENT: real captured P1 labels include "Mapped security coverage",
+  "Compared security layers", "Searching the web" and "Searched 20
+  websites", none of them ending in dots. Never rule a shimmering line out
+  for lacking an ellipsis.
+- The line sits on a row with a small spinner/dot on the left and (in P2
+  Deep Research) a "<N> searches" count badge plus a stop button to its
+  right. That whole row is the strip.
 
 VERIFY STATE FIRST (do this BEFORE any click):
 - If ANY right-side panel is ALREADY visible — the narrow "Activity"
   panel (even if it only shows gray skeleton bars) OR a wider step-list
   panel — it is already open. Output exactly: "panel: already_open".
   DO NOT CLICK.
-- If an inline thoughts/activity section is ALREADY expanded below the
-  status line — it is already open. Output exactly: "panel: already_open".
-  DO NOT CLICK.
+- IN PRO / EXTENDED THINKING (P1) ONLY — when your task names that mode:
+  if a row of website chips (favicon + domain, possibly with an "N more"
+  chip) is ALREADY showing under the activity line, it is already open.
+  Output exactly: "panel: already_open". DO NOT CLICK.
+  THIS IS THE COMMON CASE IN P1: the page often expands the chips by
+  itself, and clicking then CLOSES them. On 2026-08-19 that happened
+  repeatedly on a live run — a click collapsed the chips and the next
+  click re-opened them, for four minutes. Look before you click.
+  IN DEEP RESEARCH (P2), chips alone are NOT enough: that mode is read
+  from the right-side panel, so keep looking for the panel and treat a
+  chip row as "not open yet".
+- If any inline thoughts/activity section is ALREADY expanded below the
+  status line — it is already open in either mode. Output exactly:
+  "panel: already_open". DO NOT CLICK.
 - If you cannot find ANY shimmering inline label OR count-badge strip
   attached to the latest response — output exactly: "panel: not_found".
   DO NOT CLICK.
@@ -1276,11 +1299,18 @@ ACTION (only if target is found AND nothing is open yet):
   click only. IT IS A TOGGLE — a second click would close what the first
   opened, so never click twice.
 - Wait ~1.5 seconds, then check for ANY of these outcomes:
-  a) the narrow "Activity · <seconds>" panel appeared on the right — even
+  a) a row of website chips (favicon + domain, maybe an "N more" chip)
+     appeared INLINE under the clicked line — the normal P1 outcome, and
+     in Deep Research (P2) keep looking for the panel instead, OR
+  b) the narrow "Activity · <seconds>" panel appeared on the right — even
      if it only contains gray placeholder/skeleton bars so far, OR
-  b) a wider side panel with numbered/bulleted steps and URL rows, OR
-  c) an inline section expanded directly below the clicked line.
+  c) a wider side panel with numbered/bulleted steps and URL rows, OR
+  d) any other inline section expanded directly below the clicked line.
 - If any appeared: output "panel: open".
+- If the chips or a panel DISAPPEARED because of your click, you closed
+  what was already open: click the SAME line once more to restore it, then
+  output "panel: open". Do not leave it closed, and do not click a third
+  time.
 - If you clicked and truly nothing changed: output "panel: click_failed".
 
 HARD CONSTRAINTS:
@@ -1297,7 +1327,10 @@ HARD CONSTRAINTS:
   response prose itself — the shimmer animation is what distinguishes the
   activity affordance from regular text.
 - DO NOT scroll unless the latest response's trailing edge is off-screen.
-- DO NOT click twice. ONE click only.
+- ONE click only — with exactly one exception, and it is the one above: if
+  your click visibly CLOSED the chips or a panel, one restoring click is
+  allowed and required. Never a third click, and never a second click
+  because you were hoping for a different shape of result.
 - Stop after 5 iterations regardless of outcome."""
 
 

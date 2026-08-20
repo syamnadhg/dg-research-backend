@@ -33,11 +33,33 @@ from typing import Any
 import google.auth.credentials
 import requests
 
+import logquiet
+
 from . import keystore
 
 log = logging.getLogger(__name__)
 
 _SECURE_TOKEN_URL = "https://securetoken.googleapis.com/v1/token"
+
+# ⛔⛔ MEASURED 2026-08-19. The network-error branch of `_do_refresh_exchange`
+# wrote a ~400-character WARNING on every single retry, and the retry ladder does
+# not stop while DNS is dead. The last 5 MiB of the two raw machine logs on the
+# developer's own box:
+#
+#   backend.err.log     5,047 of 10,581 lines  — 47.7%
+#   backend-2.err.log  13,479 of 14,083 lines  — 95.7%
+#
+# all one sentence. ⛔ And since 2026-08-17 this logger is BRIDGED into `log()`,
+# so the flood no longer stops at a file nobody sends: it now lands in
+# `backend.log` and in every per-run folder a support bundle collects. The bridge
+# fix was right and it made this worse, which is exactly when a repeat needs a
+# cadence rather than a deletion.
+#
+# Keyed on the exception CLASS, never on `str(exc)`: the message embeds the
+# resolver's own text, and anything that varies between otherwise-identical
+# failures would restart the cadence every time and suppress nothing.
+_REFRESH_NET_QUIET = logquiet.Suppressor()
+_REFRESH_NET_TOPIC = "refresh-network"
 
 # #720: in-process refresh lock shared by EVERY RefreshTokenCredentials
 # instance WITHIN ONE interpreter. Multiple independent refreshers rotate the
@@ -171,8 +193,23 @@ class RefreshTokenCredentials(google.auth.credentials.Credentials):
                 timeout=10,
             )
         except requests.RequestException as e:
-            log.warning("refresh: network error %s — leaving keystore intact", e)
+            emit, dropped = _REFRESH_NET_QUIET.consider(
+                _REFRESH_NET_TOPIC, type(e).__name__)
+            if emit:
+                log.warning("refresh: network error %s — leaving keystore "
+                            "intact%s (attempt %d)", e,
+                            logquiet.suppressed_note(dropped),
+                            _REFRESH_NET_QUIET.seen(_REFRESH_NET_TOPIC) + 1)
             raise
+
+        # ⛔⛔ RESET ON RECOVERY, and the boundary is the POST RETURNING — not a
+        # 2xx. This topic is "could we reach securetoken at all", so a 400
+        # TOKEN_EXPIRED proves the network is back just as well as a 200 does.
+        # Without this line a second outage hours later would be reported at
+        # whatever hourly cadence the FIRST outage had widened to, i.e. the new
+        # incident arrives up to an hour late — a suppressor hiding exactly the
+        # transition a reader came for.
+        _REFRESH_NET_QUIET.reset(_REFRESH_NET_TOPIC)
 
         if resp.status_code == 400:
             body = resp.json() if resp.content else {}

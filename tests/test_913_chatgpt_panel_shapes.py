@@ -41,6 +41,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 import research  # noqa: E402
 import prompts  # noqa: E402
+from _domshim import js_constant  # noqa: E402
 
 _SRC = Path(research.__file__).read_text(encoding="utf-8")
 
@@ -55,7 +56,17 @@ def test_opener_has_structural_pass0():
         "line sits directly below it and its wording mutates with progress")
     assert "picked.anchor = 'structural'" in src
     # never click bare prose: candidates need interactivity or shimmer
-    assert "animationName" in src and "backgroundClip" in src
+    #
+    # ⭐⭐ 2026-08-19 — ASSERTED AGAINST THE ASSEMBLED JS, NOT THE PYTHON SOURCE.
+    # `animationName` and `backgroundClip` used to sit literally in this function;
+    # the P1 chip-row wave needed the same predicate in a third walker, so the two
+    # existing copies became one spliced `_CHATGPT_SHIMMER_JS_HELPERS` and these
+    # two assertions started failing on a function whose behaviour had not changed
+    # by a character. Reading the value production hands to `page.evaluate` is both
+    # the fix and the stronger test: a shared fragment that stopped being spliced
+    # in would fail here, where a source-text scan would not have noticed.
+    js = js_constant(research._open_chatgpt_activity_panel, "JS")
+    assert "animationName" in js and "backgroundClip" in js
     assert "tabindex" in src.lower()
     # composer/header/toolbar subtrees excluded from candidates
     assert "composer" in src and "toolbar" in src

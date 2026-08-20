@@ -209,14 +209,29 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      "machine that reaches firestore but not storage gets the wrong diagnosis",
      [('    ("firebasestorage.googleapis.com",\n     "where your logs and podcasts are uploaded", "google"),\n', '')],
      [T_CLI]),
+    # ⛔ D2/D3 RE-ANCHORED 2026-08-19. The owner dropped the "send the file
+    # yourself — backend.log" route: 44 MB, undated, and missing every per-run
+    # folder, one clause after a command that writes 600 KB with all of it. Both
+    # premises survive; D3's no-shell route is now Report Bug alone.
     ("D2", "under", "the hand-over line stops naming the command that now exists",
-     [('    return (f"Still stuck? Run {_PROG} --send-logs to hand your logs to us, "',
+     [('    return (f"Still stuck? Run {_PROG} --send-logs — it packs your logs into one "',
        '    return (f"Still stuck? "')],
      [T_TRIAGE]),
     ("D3", "over", "⛔ the line names ONLY the command, so a reader with no shell "
      "open — and no idea what a shell is — has nothing left",
-     [('            f"or send the file yourself — {_STATE_DIR / \'logs\' / \'backend.log\'} "\n            f"— or use Report Bug on the web app\'s Settings page.")',
+     [('            f"No terminal? Use Report Bug on the web app\'s Settings page.")',
        '            f"and that is the only way.")')],
+     [T_TRIAGE]),
+    ("D3b", "over", "⛔ the raw 44 MB machine log is offered again as a thing to "
+     "email — undated, and carrying none of the per-run folders",
+     [('            f"No terminal? Use Report Bug on the web app\'s Settings page.")',
+       '            f"Or send {_STATE_DIR / \'logs\' / \'backend.log\'} yourself. "\n'
+       '            f"No terminal? Use Report Bug on the web app\'s Settings page.")')],
+     [T_TRIAGE]),
+    ("D3c", "under", "the command stops printing where it put the bundle, so the "
+     "route that replaced the file reference has nothing behind it",
+     [('    print(f"  {_c(_OK, \'✓\')}  Bundle written  {_c(_BOLD, str(dest))}")',
+       '    pass')],
      [T_TRIAGE]),
     ("D4", "under", "the command is dispatched after the doctor, so the person "
      "who just read the hand-over line and typed it lands on a doctor run",

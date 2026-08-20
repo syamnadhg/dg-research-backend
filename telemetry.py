@@ -41,9 +41,25 @@ import uuid
 from enum import Enum, IntEnum
 from pathlib import Path
 
+# ⭐ A stdlib-only leaf module, chosen precisely so that this file's rule — it
+# imports nothing from the backend, so a telemetry failure can never sit in the
+# path of the thing it measures — survives intact. `logquiet` imports `threading`
+# and nothing else, and touches no disk, no network and no environment.
+#
+# ⚠ Being precise about what that rule protects, because a module-level
+# `Suppressor(...)` construction below IS now in the import path: the rule is
+# about RUNTIME failure — a dead network, a missing credential, a full disk —
+# reaching the thing being measured. `logquiet` has no such surface. The only way
+# it can fail is a source error in this repo, which is a build fault the suite
+# catches loudly, and which is exactly the failure that SHOULD stop a start.
+import logquiet
+
 log = logging.getLogger("telemetry")
 
 CATALOGUE_VERSION = 1
+
+# The accessor fault is permanent within a process — see `_id_token`.
+_ID_TOKEN_QUIET = logquiet.Suppressor(logquiet.ONCE)
 
 # ── The one string shape allowed anywhere in this module ────────────────
 # Frontend mints `chat_${Date.now()}_${counter}`: 13 digits of epoch millis and
@@ -363,6 +379,13 @@ def sent_log_path() -> Path:
 
 
 SPOOL_MAX_LINES = 2000
+# Bound on the local mirror of everything sent — see `_mirror`. Deliberately
+# larger than the spool (the mirror is the audit trail, the spool is a queue) and
+# deliberately a BYTE cap rather than a line cap, because the spool's line cap
+# costs a full file read per event. No event count in this comment on purpose:
+# nothing would re-check it, and `test_the_mirror_holds_a_useful_number_of_events`
+# measures it against real envelopes instead.
+MIRROR_MAX_BYTES = 1024 * 1024
 EVENT_MAX_AGE_SEC = 30 * 86400
 FLUSH_DEADLINE_SEC = 5.0
 BATCH_MAX_EVENTS = 500
@@ -519,21 +542,107 @@ def _mirror(record: dict) -> None:
 
     ⭐ The transparency claim — "you can see exactly what leaves" — has to hold
     for `--pair` too, and under `--pair` the process's own logger reaches no
-    file at all. So the mirror is a FILE, not a log line."""
+    file at all. So the mirror is a FILE, not a log line.
+
+    ⛔⛔ AND IT WAS UNBOUNDED. `_trim_spool` bounds the pending spool; nothing
+    bounded this. MEASURED 2026-08-19 on the developer's own machine:
+    **2,568,739 bytes** of `sent.log` from a few days of use, growing forever,
+    outside `~/.super-research/logs/` where neither the bundle collector nor the
+    Clear-logs button could reach it. A transparency file that grows without
+    limit is a disk-filler with a good motive.
+
+    ⭐ THE TRIM IS BYTE-GATED, NOT LINE-GATED, and that is not a style choice.
+    `_trim_spool` reads and splits the whole file on EVERY event just to count
+    its lines; copying that here would put a megabyte-sized read in the path of
+    every event a run emits. `fh.tell()` in append mode is the new size for
+    free, so the common path stays one append.
+    """
     try:
         path = sent_log_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+            size = fh.tell()
+        if size > MIRROR_MAX_BYTES:
+            _trim_mirror(path)
     except Exception:
         pass
 
 
-def _trim_spool(path: Path) -> None:
-    """Bound one spool file: drop the OLDEST half and say so.
+def _trim_mirror(path: Path) -> None:
+    """Drop the OLDEST half of the mirror.
 
-    ⭐ Oldest-half rather than newest, because the newest events are the ones
-    describing whatever is going wrong right now."""
+    ⭐ Oldest-half, matching `_trim_spool`, and for the same reason: the newest
+    events describe whatever is going wrong right now.
+
+    ⛔ NO MARKER LINE IS APPENDED, and that is deliberate — the difference
+    between this file and the spool. Every line here is a record of something
+    that left (or is about to leave) this machine; a synthetic "N dropped"
+    envelope would be a line in "what left" that never left, which is the one
+    thing this file must not contain. The drop is visible without a marker
+    anyway: `seq` rises monotonically per session, so a gap at the head of the
+    file is the record of it.
+
+    ⛔⛔ THIS FILE IS SHARED BY EVERY PROCESS, unlike the spool — and a trim is a
+    read-then-rewrite, which is the exact collision `spool_path` was made
+    per-process to prevent. Two things follow, and they are different in kind:
+
+      • The file must NEVER be observed half-written. A truncate-and-rewrite
+        leaves a window where the mirror is a fragment, and a fragment of JSONL is
+        unreadable rather than short. So the rewrite goes to a per-PID temp file
+        and lands with `os.replace`, which is atomic.
+      • A line another process appends during the rewrite is still lost, and that
+        is ACCEPTED here where it was refused for the spool. The spool holds
+        events that have not been delivered, so losing one loses information
+        nobody else has; this file is a local copy of what already went, and it is
+        a BOUNDED copy by construction — the trim's whole job is to drop the
+        oldest half. Losing a few more at a trim boundary sits inside a limit that
+        was already stated, and it happens once per megabyte rather than once per
+        flush.
+    """
+    try:
+        # `errors="replace"` and not on the spool's read, deliberately: a single
+        # corrupt byte must not make this file un-trimmable, because un-trimmable
+        # is exactly the unbounded growth this function exists to stop. The line
+        # it mangles was already unreadable.
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return
+    if len(lines) < 2:
+        # One enormous line, or none. Splitting the "oldest half" of a single
+        # line would truncate a JSON record into something unparseable, so leave
+        # it: a caller that writes a 1 MiB event has a different bug.
+        return
+    keep = _oldest_half_dropped(lines)
+    tmp = path.with_name(f"{path.name}.trim.{os.getpid()}")
+    try:
+        tmp.write_text("\n".join(keep) + "\n", encoding="utf-8")
+        os.replace(str(tmp), str(path))
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _oldest_half_dropped(lines: "list[str]") -> "list[str]":
+    """The newer half of `lines` — i.e. the oldest half discarded.
+
+    ⭐ Newest-half-kept rather than newest-half-dropped, because the newest
+    events are the ones describing whatever is going wrong right now.
+
+    ⛔ ONE DEFINITION for both bounded files. The spool and the mirror do
+    different things afterwards — the spool appends a TELEMETRY_DROPPED envelope,
+    the mirror must not — but the POLARITY is one decision, and a second copy of
+    it is somewhere the "drops the newest half" mutant can survive by hiding in
+    whichever copy an assertion does not reach. Found exactly that way on
+    2026-08-19, when the mirror's trim made this line match twice.
+    """
+    return lines[len(lines) // 2:]
+
+
+def _trim_spool(path: Path) -> None:
+    """Bound one spool file: drop the OLDEST half and say so."""
     global _dropped
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -541,7 +650,7 @@ def _trim_spool(path: Path) -> None:
         return
     if len(lines) <= SPOOL_MAX_LINES:
         return
-    keep = lines[len(lines) // 2:]
+    keep = _oldest_half_dropped(lines)
     dropped = len(lines) - len(keep)
     _dropped += dropped
     keep.append(json.dumps(
@@ -817,8 +926,25 @@ def _id_token() -> "str | None":
     except Exception as exc:
         # DEBUG, not silence. This is a build/wiring fault, not a signed-out
         # machine, and it must be legible in the very log bundle a user sends.
-        log.debug("telemetry: no id-token accessor (%s) — batches will be "
-                  "anonymous", type(exc).__name__)
+        #
+        # ⛔⛔ MEASURED 2026-08-19, and the defect is mine, added the day before.
+        # `_id_token()` is called once per FLUSH, a flush happens on every event
+        # batch, and this line therefore appeared 412 times in a 1,367-line
+        # session log — 33.9% OF ITS BYTES. A wiring fault that either exists or
+        # does not, restated 412 times, in the file whose whole purpose is to
+        # carry the OTHER 66%.
+        #
+        # ⭐ ONCE, not less: `logquiet.ONCE` keyed on the exception class. A
+        # missing module cannot start existing mid-process, so the second copy
+        # of this line has never carried information — but a DIFFERENT failure
+        # class would, and keying on the class is what lets that one still
+        # speak.
+        emit, dropped = _ID_TOKEN_QUIET.consider(
+            "no-id-token-accessor", type(exc).__name__)
+        if emit:
+            log.debug("telemetry: no id-token accessor (%s) — batches will be "
+                      "anonymous%s", type(exc).__name__,
+                      logquiet.suppressed_note(dropped))
         return None
     try:
         return current_id_token()

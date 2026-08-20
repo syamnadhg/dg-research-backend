@@ -74,12 +74,26 @@ def test_a_last_resort_press_says_it_was_one():
 # ── what "live" is decided by ────────────────────────────────────────────────
 
 def _shimmer_bodies() -> list[str]:
-    """⛔ Both copies. Asserting against the whole file let a mutant strip the
+    """⛔ EVERY copy. Asserting against the whole file let a mutant strip the
     check out of the PICKER and still pass, because the snapshot's copy kept the
-    string alive — the survivor that found this."""
+    string alive — the survivor that found this.
+
+    ⭐⭐ 2026-08-19 — THE COUNT IS NOW 1, AND THAT IS THE HAZARD GONE RATHER THAN
+    THE GUARD WEAKENED. The predicate was duplicated because three walkers ask the
+    same question; this test existed to stop a mutant hiding in whichever copy the
+    assertion did not reach, and it had to be re-counted every time a walker was
+    added — the P1 chip-row wave was the third, and it turned this red. So the two
+    copies were extracted into `_CHATGPT_SHIMMER_JS_HELPERS` and spliced into all
+    three sites, verified by rebuilding each site's assembled JavaScript and
+    diffing it whitespace-normalised against the pre-extraction text: identical for
+    the picker, the snapshot and the inline walker alike. With ONE definition there
+    is no sibling to hide behind, so the exactness of this count is what keeps a
+    future fourth copy from quietly reopening the hiding place."""
     src = code_only_deep(research)
     bodies = re.findall(r"const shimmers = \(n\) => \{.*?\n *\};", src, re.S)
-    assert len(bodies) == 2, f"expected the picker and the snapshot, got {len(bodies)}"
+    assert len(bodies) == 1, (
+        f"expected ONE shared definition in _CHATGPT_SHIMMER_JS_HELPERS, got "
+        f"{len(bodies)} — a copy has reappeared and a mutant can hide in it")
     return bodies
 
 
@@ -96,9 +110,15 @@ def test_the_static_gradient_clip_is_not_evidence_of_life():
     for body in _shimmer_bodies():
         assert "backgroundClip" not in body and "webkitBackgroundClip" not in body, (
             "the static paint property is back inside the liveness check")
-    assert code_only_deep(research).count("const clipped = (n) =>") == 2, (
-        "the picker and the miss snapshot must split it the same way, or they "
-        "disagree about the same row")
+    assert code_only_deep(research).count("const clipped = (n) =>") == 1, (
+        "the split lives in _CHATGPT_SHIMMER_JS_HELPERS and every walker splices "
+        "the same one — a second definition means two of them can disagree about "
+        "the same row")
+    # …and all three walkers really do take it from there, or the shared constant
+    # would be a definition nothing uses while a private copy did the work.
+    src = code_only_deep(research)
+    assert src.count('""" + _CHATGPT_SHIMMER_JS_HELPERS + """') == 3, (
+        "the picker, the miss snapshot and the inline walker must all splice it")
 
 
 def test_the_clip_tier_cannot_outrank_a_running_shimmer():

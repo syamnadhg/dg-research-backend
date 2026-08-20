@@ -72,7 +72,8 @@ REPO = Path(__file__).resolve().parent.parent  # tools/ -> repo root
 # 2026-06-22, four days after this script was written, and shipped in the clear in
 # every wheel from then until 0.1.12 because nobody came back to this line.
 # tests/test_compiled_wheel_covers_every_module.py now fails if the two drift.
-TOP_MODULES = ["models", "prompts", "vision", "narrate", "selfheal"]
+TOP_MODULES = ["models", "prompts", "vision", "narrate", "selfheal",
+               "telemetry", "logquiet"]
 AUTH_SUBMODULES = ["v2_flow", "keystore", "credentials", "pairing"]
 
 # Admin/diagnostic scripts that sit in scripts/ but must NEVER ship in a wheel.

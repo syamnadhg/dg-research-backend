@@ -56,6 +56,12 @@ import research  # noqa: E402
 CGPT_SRC = research._CHATGPT_DONE_PROBE_JS
 CGPT_FN_SRC = inspect.getsource(research.detect_completion_chatgpt)
 GEM_SRC = inspect.getsource(research.detect_completion_gemini)
+# ⛔ 2026-08-19: ordering assertions must be taken on the LADDER, not on the
+# whole source. `.index('"start_research_btn_visible')` finds the DOCSTRING
+# occurrence, which sits above every return in this function — so
+# `i_start < i_share` was true no matter how the rungs were ordered. A
+# decorative assertion in the file whose whole subject is decision ORDER.
+GEM_LADDER = GEM_SRC[GEM_SRC.index('        text_len = int(data.get("textLen")'):]
 POLL_SRC = inspect.getsource(research.poll_all_agents_round_robin)
 
 
@@ -156,14 +162,15 @@ def test_chatgpt_stop_button_still_vetoes():
 # ── Gemini: done-only markers outrank the stale Start button ─────────────────
 
 def test_gemini_trio_outranks_stale_start_button():
-    # Decision order: explicit stop → trio/completion-line → weak running →
-    # visible Start gate → Share&Export.
-    i_stop = GEM_SRC.index('data.get("hasStopExplicit")')
-    i_trio = GEM_SRC.index('data.get("reportButtonTrio")')
-    i_chat = GEM_SRC.index('data.get("completedChatText")')
-    i_weak = GEM_SRC.index('"running_weak_signal')
+    # Decision order: VISIBLE stop → trio/completion-line → weak running →
+    # hidden stop → visible Start gate → Share&Export. (2026-08-19 split the
+    # stop signal in two; the ranks either side of it are unchanged.)
+    i_stop = GEM_LADDER.index('data.get("hasStopVisible")')
+    i_trio = GEM_LADDER.index('data.get("reportButtonTrio")')
+    i_chat = GEM_LADDER.index('data.get("completedChatText")')
+    i_weak = GEM_LADDER.index('"running_weak_signal')
     # return-form (the docstring also mentions the reason string).
-    i_start = GEM_SRC.index('return (False, "start_research_btn_visible')
+    i_start = GEM_LADDER.index('return (False, "start_research_btn_visible')
     assert i_stop < i_trio < i_chat < i_weak < i_start, (
         "the done-only markers (trio / completion chat line) must outrank "
         "the Start-button gate — the old plan bubble keeps its Start button "
@@ -180,14 +187,27 @@ def test_gemini_start_button_scan_requires_visibility():
 
 
 def test_gemini_explicit_stop_split_from_weak_signals():
-    assert "hasStopExplicit" in GEM_SRC and "hasRunningWeak" in GEM_SRC, (
-        "explicit stop buttons and weak running signals (streaming markers / "
-        "animation tier) must be separate flags — only the explicit stop may "
-        "veto the done-only markers"
-    )
-    # The animation tier feeds the WEAK flag, not the explicit one.
-    anim = GEM_SRC[GEM_SRC.index("getAnimations"):GEM_SRC.index("hasStartBtn")]
+    # 2026-08-19: THREE flags now, not two. A stop button that is present but
+    # invisible is a weak RUNNING signal, not a veto — Gemini's only stop control
+    # while researching is offsetParent null and 0×0, so ranking it as a veto
+    # would turn a 19-minute cosmetic lie into a 90-minute timeout. Executed
+    # against both live captures in tests/test_gemini_stop_split_0819.py.
+    for flag in ("hasStopVisible", "hasStopHidden", "hasRunningWeak"):
+        assert flag in GEM_SRC, (
+            f"{flag} is gone — the visible stop is the only veto, and the hidden "
+            "stop and the animation tier must stay below the done-only markers"
+        )
+    # The animation tier feeds the WEAK flag, not either stop flag.
+    # ⛔ Anchored on the tier's own first line, NOT on "getAnimations" — that word
+    # appears in the DOCSTRING, so the old slice started above the whole JS and
+    # spanned every scan in the function. It asserted "the animation tier sets
+    # hasRunningWeak" while measuring "somewhere in this function, something
+    # does".
+    anim = GEM_SRC[GEM_SRC.index("const RUN_RE"):GEM_SRC.index("let hasStartBtn")]
+    assert "getAnimations" in anim
     assert "hasRunningWeak = true" in anim
+    assert "hasStopVisible = true" not in anim
+    assert "hasStopHidden = true" not in anim
 
 
 def test_gemini_stale_override_is_logged():
@@ -199,11 +219,12 @@ def test_gemini_stale_override_is_logged():
 
 def test_gemini_share_export_alone_stays_weakest():
     # Share&Export-alone (bare 'share'/'export' text) keeps its old rank:
-    # BELOW the weak-running veto and the Start gate.
-    i_weak = GEM_SRC.index('"running_weak_signal')
-    i_start = GEM_SRC.index('"start_research_btn_visible')
-    i_share = GEM_SRC.index('"no_stop + share_export_visible"')
-    assert i_weak < i_share and i_start < i_share
+    # BELOW the weak-running veto, the hidden stop and the Start gate.
+    i_weak = GEM_LADDER.index('"running_weak_signal')
+    i_hidden = GEM_LADDER.index('"running_hidden_stop_btn')
+    i_start = GEM_LADDER.index('return (False, "start_research_btn_visible')
+    i_share = GEM_LADDER.index('"no_stop + share_export_visible"')
+    assert i_weak < i_share and i_hidden < i_share and i_start < i_share
 
 
 # ── Tracker: no click-loop into a finished document ──────────────────────────

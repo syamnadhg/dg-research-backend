@@ -61,6 +61,10 @@ import logging          # only to reshape uvicorn's own records — see _uvicorn
 # call site can never create a circular import, and a telemetry failure can
 # never be in the path of the thing it measures — every entry point swallows.
 import telemetry as tm
+# Repeat suppression for lines whose information content is one bit. Stdlib-only
+# leaf module, shared with telemetry.py and auth/credentials.py so that the three
+# floods measured on 2026-08-19 cannot each grow their own private policy.
+import logquiet
 from pathlib import Path
 from urllib.parse import urlparse, urlsplit
 
@@ -2095,8 +2099,49 @@ def _shape_summary(text):
     return s
 
 
+# ── Dating a line in a multi-week log ──────────────────────────────────
+# ⛔⛔ 2026-08-19, OWNER ASK, and the measurement behind it: `log()` stamps TIME
+# ONLY, so not one line in the 44 MB `backend.log` on this machine can be dated
+# from its own text — and that file spans 2026-07-19 → 08-05. A support
+# conversation about "the run that failed on Tuesday" had no way to find Tuesday.
+#
+# ⭐ A MARKER LINE, NOT A WIDER TIMESTAMP. Putting the date on every line costs
+# six characters × every line — 15% of a 44 MB file — and changes the ONE format
+# that `log()`, `_uvicorn_log_config` and the run/session capture all share, which
+# several tests pin deliberately. One line per day answers the same question: any
+# line is dated by the nearest `[date]` line above it.
+LOG_DATE_PREFIX = "[date]"
+# The date this process last announced. Compared without a lock: `log()` is called
+# from many threads and thousands of times per run, and the worst a race can do
+# here is print the same marker twice, which costs one duplicate line and misleads
+# nobody. A lock on every log call would cost more than the defect it prevents.
+_LOG_DATE_STAMPED = ""
+
+
+def _log_date_marker(day: str, ts: str) -> "str | None":
+    """The `[date]` line to emit before the next log line, or None.
+
+    Returns a line in EXACTLY `log()`'s own format, so `grep '^\\['` still sees
+    every line in the file — the four-formats-in-one-stream problem this repo
+    already fixed once must not come back through the fix for dating.
+    """
+    global _LOG_DATE_STAMPED
+    if day == _LOG_DATE_STAMPED:
+        return None
+    _LOG_DATE_STAMPED = day
+    return f"[{ts}] [INFO] {LOG_DATE_PREFIX} {day}"
+
+
 def log(msg, level="INFO"):
-    ts = datetime.now().strftime("%H:%M:%S")
+    # ⭐ ONE strftime for both halves. The printed line's format is unchanged
+    # byte-for-byte; the date is sliced off the same call rather than costing a
+    # second one on a path this hot.
+    _stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ts = _stamp[11:]
+    marker = _log_date_marker(_stamp[:10], ts)
+    if marker:
+        print(marker)
+        _log_write_through(marker, "INFO")
     line = f"[{ts}] [{level}] {msg}"
     print(line)
     # ⭐ The printed format is byte-for-byte what it always was. The second
@@ -3299,24 +3344,50 @@ def _setup_logo():
     )
 
 
+# ⛔⛔ ONE PATTERN, TWO READERS, AND THAT IS THE POINT. A successful health probe
+# is dropped in two places — as it is logged (`_DropHealthProbeAccessLines`,
+# below) and as a frozen log is read into a support bundle (`_tail_bytes`) — and
+# those two must not be able to disagree about what a probe line looks like. The
+# bytes version is COMPILED FROM THIS STRING rather than written out again, so
+# there is one definition and no sibling for a mutant to hide behind.
+#
+# ⭐ AND IT MATCHES A SHAPE, NOT A PATH. The path alone appears in lines that are
+# the whole reason a bundle exists: the worker watchdog's "/api/health
+# unreachable for 180s", `_probe_local_api`'s failure detail, a 500 from the
+# endpoint itself. `2\d\d` is what makes this a filter on "nothing happened"
+# rather than on a topic.
+_HEALTH_PROBE_ACCESS_PATTERN = (
+    r'"(?:GET|HEAD) /api/health(?:\?[^"\s]*)? HTTP/[0-9.]+" 2\d\d\b')
+_HEALTH_PROBE_ACCESS_RE = re.compile(_HEALTH_PROBE_ACCESS_PATTERN)
+_HEALTH_PROBE_ACCESS_RE_BYTES = re.compile(
+    _HEALTH_PROBE_ACCESS_PATTERN.encode("ascii"))
+
+
 class _DropHealthProbeAccessLines(logging.Filter):
-    """Keep `/api/health` out of uvicorn's access log.
+    """Keep SUCCESSFUL `/api/health` probes out of uvicorn's access log.
 
     The supervisor's health probe and the FE both poll that endpoint every few
     seconds, and a boot capture showed 17 consecutive
     `GET /api/health HTTP/1.1" 200 OK` lines — the single largest source of
-    noise in the terminal an operator is trying to read a run out of.
+    noise in the terminal an operator is trying to read a run out of. MEASURED
+    2026-08-19 against the real files: 74,836 of the 82,032 lines in the last
+    5 MiB of `backend.log` (91.3%) and 80,303 of 84,202 in `backend-2.log`
+    (95.4%) are that one line.
 
     Scoped as narrowly as it can be: ONLY the access logger gets this filter,
-    and only records whose rendered message names that one path. Every other
-    request still logs, and uvicorn's error/lifecycle records are untouched.
-    """
+    and only records matching the probe SHAPE. Every other request still logs,
+    and uvicorn's error/lifecycle records are untouched.
 
-    _PROBE_PATH = "/api/health"
+    ⛔ 2026-08-19 — IT USED TO DROP A FAILING PROBE TOO. The test was `"/api/health"
+    not in message`, so a 500 from the endpoint the worker watchdog uses to decide
+    a worker is wedged was silenced by the same rule as the 74,836 boring ones.
+    That is the noise filter deleting the signal: the only per-request account of
+    the endpoint whose failure force-respawns a worker.
+    """
 
     def filter(self, record) -> bool:
         try:
-            return self._PROBE_PATH not in record.getMessage()
+            return not _HEALTH_PROBE_ACCESS_RE.search(record.getMessage())
         except Exception:
             return True          # unformattable record — never swallow it
 
@@ -3674,7 +3745,8 @@ def _outage_duration_text(seconds) -> str:
     return f"{s // 3600}h{(s % 3600) // 60:02d}m"
 
 
-def _aegis_pulse_line(worker_id, tick: int, *, down_for=None) -> str:
+def _aegis_pulse_line(worker_id, tick: int, *, down_for=None, up_for=None,
+                      suppressed: int = 0) -> str:
     """The idle standing-watch pulse, returned as text so a test can assert it.
 
     ⛔ 2026-08-17 — IT USED TO SAY "standing watch" NO MATTER WHAT. A new
@@ -3694,18 +3766,38 @@ def _aegis_pulse_line(worker_id, tick: int, *, down_for=None) -> str:
 
     The pulse is kept and moved to COLOUR — the one true glyph alternating
     accent / dim. That reads in a terminal and in a `FORCE_COLOR=1 | tee`
-    capture; where colour is off the text is simply steady, which is honest,
-    because the state IS steady and the timestamp already moves every minute.
+    capture; where colour is off the text is simply steady.
+
+    ⛔⛔ 2026-08-19 — AND ONE A MINUTE WAS FAR TOO MANY. MEASURED: 231 of the
+    1,367 lines in a session log (9.8% of its bytes), and 2,274 / 2,754 lines in
+    the last 5 MiB of the two raw machine logs. The 2,274th restatement of "this
+    process is alive" is not liveness evidence, it is the reason the evidence
+    around it could not be read. `_aegis_pulse_loop` now applies
+    `logquiet.DEFAULT_CADENCE` — computed against those same two tails, 2,274
+    lines become 52 and 2,754 become 60.
+
+    ⭐ SO THE LINE HAD TO STOP BEING STEADY, and `up_for` is why. The old
+    argument for a repeating text was that `log()` stamps a fresh timestamp every
+    minute; once the lines are an hour apart, that stops answering the question a
+    reader actually has — "has it been up the whole time, or did it restart?".
+    Carrying the duration makes one sparse line say strictly more than sixty
+    dense ones did, and makes a restart visible as the duration resetting.
+    `suppressed` carries the rest: a dropped repeat is counted, never discarded.
     """
+    note = logquiet.suppressed_note(suppressed)
     if down_for is not None:
         # Neither vigilans nor quiescens — the watch is BROKEN, and the CLI's
         # lexicon already spends `✗` on exactly that (--doctor's failure mark).
         return (f"[aegis] worker {worker_id}: "
                 f"{_c(_ERR, '✗')} watch broken — no Firestore for "
                 f"{_outage_duration_text(down_for)}; the web app shows this "
-                f"computer offline and runs fired at it will not arrive")
+                f"computer offline and runs fired at it will not arrive{note}")
+    # `up_for is None` keeps the pre-cadence shape available: a caller that has
+    # no clock to offer still gets an honest line rather than a fabricated "0s".
+    held = "" if up_for is None else f" for {_outage_duration_text(up_for)}"
     return (f"[aegis] worker {worker_id}: "
-            f"{_c(_ACCENT if tick % 2 == 0 else _DIM, '◆')} standing watch")
+            f"{_c(_ACCENT if tick % 2 == 0 else _DIM, '◆')} standing "
+            f"watch{held}{note}")
 
 
 def _render_context_strip(items: list[tuple[str, str]]):
@@ -8690,6 +8782,7 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                         log("[device-cmds] CLEAR_LOGS: "
                             f"runs={cleared['runs']} sessions={cleared['sessions']} "
                             f"tails={cleared['tails']} bundles={cleared['bundles']} "
+                            f"telemetry={cleared['telemetry']} "
                             f"kept={cleared['kept']} failed={cleared['failed']}")
                     except Exception as _cl_err:
                         log(f"[device-cmds] CLEAR_LOGS failed: {_cl_err}", "WARN")
@@ -9137,20 +9230,257 @@ def _system_log_tails(root=None) -> "list[Path]":
     return wanted
 
 
-def _tail_bytes(path, limit=BUNDLE_SYSTEM_TAIL_BYTES) -> bytes:
-    """The last `limit` bytes, cut forward to the next newline so the first
-    line of the tail is a whole line rather than a fragment."""
+# How far back a tail read may scan looking for content worth carrying. Tied to
+# the rotation threshold on purpose: `_rotate_if_oversize` keeps a raw log under
+# `RAW_LOG_ROTATE_BYTES`, so a scan cap equal to it can always reach the start of
+# a file that has not rotated, and raising one without the other cannot silently
+# leave part of a legal file unreachable.
+TAIL_SCAN_MAX_BYTES = RAW_LOG_ROTATE_BYTES
+_TAIL_CHUNK_BYTES = 1024 * 1024
+_TAIL_REPEAT_NOTE = b"[bundle] ^ the line above then repeated %d more times"
+# The prefix that identifies one of our own collapse markers, so a marker whose
+# line was trimmed away can be recognised and removed with it. Derived from the
+# template rather than written out again — two spellings and the check silently
+# stops matching.
+_TAIL_REPEAT_NOTE_PREFIX = _TAIL_REPEAT_NOTE.split(b"%")[0]
+# ⭐ Built from `LOG_DATE_PREFIX`, not written out again: the writer and the reader
+# of this marker have to agree, and two spellings is how a reader silently stops
+# finding what a writer is still emitting.
+_LOG_DATE_MARKER_RE = re.compile(
+    re.escape(LOG_DATE_PREFIX.encode("ascii")) + rb" (\d{4}-\d{2}-\d{2})")
+
+
+def _drop_from_tail(line: bytes) -> bool:
+    """Whether one raw log line is worth none of a bundle's byte budget.
+
+    Exactly one rule, and it is the shape a SUCCESSFUL health probe makes — see
+    `_HEALTH_PROBE_ACCESS_PATTERN`, which this shares with the live log filter so
+    the two cannot drift. A failing probe is kept; so is every other line."""
+    return bool(_HEALTH_PROBE_ACCESS_RE_BYTES.search(line))
+
+
+def _tail_lines_newest_first(fh, size: int, scan_limit: int):
+    """Yield whole lines from the end of an open binary file, newest first.
+
+    Chunked backwards rather than `read()` + `splitlines()`, because the files
+    this reads are 39–44 MB on a real machine and only the last few MB of KEPT
+    content is wanted. Memory is bounded by one chunk plus the longest line."""
+    pos = size
+    partial = b""            # a line whose beginning lies further back
+    scanned = 0
+    while pos > 0 and scanned < scan_limit:
+        # ⛔ `max(1, …)` and NOT an `if step <= 0: return` guard. The while
+        # condition already makes `pos` and `scan_limit - scanned` at least 1, so
+        # such a guard could never fire — a dead branch that reads as protection,
+        # which is the exact defect class this wave exists for. What it was
+        # reaching for is real, though: a chunk size of 0 would spin forever, so
+        # the clamp lives where it can actually act.
+        step = min(max(1, _TAIL_CHUNK_BYTES), pos, scan_limit - scanned)
+        pos -= step
+        scanned += step
+        fh.seek(pos)
+        parts = (fh.read(step) + partial).split(b"\n")
+        # Unless this chunk starts at byte 0, its first element continues a line
+        # that begins further back and is not yet whole.
+        partial = parts.pop(0) if pos > 0 else b""
+        if parts and parts[-1] == b"":
+            # The newline this chunk ends on, not a line. True on the first pass
+            # for a file that ends in a newline, and on any pass whose successor
+            # happened to start exactly at a boundary.
+            parts.pop()
+        for line in reversed(parts):
+            yield line
+
+
+def _filter_tail_lines(lines, limit: int, stats: dict) -> "list[bytes]":
+    """Newest-first raw lines in, newest-first lines a bundle should carry out.
+
+    ⛔⛔ THE BUDGET IS SPENT ON DISTINCT CONTENT, and that is the whole change.
+    MEASURED 2026-08-19 on the developer's own frozen logs — every one of these
+    files stopped being written on 2026-08-05, so silencing a source cannot help
+    them and only a read-time rule can:
+
+        backend.log       74,836 / 82,032 lines = 91.3%  health probes
+        backend-2.log     80,303 / 84,202     = 95.4%  health probes
+        backend.err.log    5,047 / 10,581     = 47.7%  ONE repeated sentence
+        backend-2.err.log 13,479 / 14,083     = 95.7%  the same sentence
+
+    Two rules, and they are deliberately different in kind:
+      • `_drop_from_tail` DELETES a successful health probe. Nothing is lost:
+        the line records that nothing happened.
+      • A run of byte-identical lines COLLAPSES to one copy plus a count. That is
+        lossless, and it is general — it catches the refresh flood above, our own
+        aegis pulse, and whatever the next one turns out to be, without anybody
+        having to add a pattern for it.
+
+    ⭐ Dropping noise does not shrink the bundle so much as move it BACKWARDS IN
+    TIME: the same 5 MiB now reaches days further into the history a reader
+    actually wants.
+
+    Pure — `lines` is any iterable, so this is tested against a list with no file
+    on disk anywhere.
+    """
+    # ⛔ Both counters exist before anything is scanned. A caller that only saw
+    # the keys once something happened would need a `.get` at every read site,
+    # and the one that forgot would raise inside a support-bundle build.
+    stats.setdefault("dropped", 0)
+    stats.setdefault("collapsed", 0)
+    out: "list[bytes]" = []      # newest-first, same as the input
+    kept = 0
+    run_line: "bytes | None" = None
+    run_extra = 0
+
+    def _flush() -> None:
+        nonlocal run_line, run_extra, kept
+        if run_line is None:
+            return
+        if run_extra:
+            # Newest-first, so the marker precedes the copy it describes — which
+            # is chronologically correct once the list is reversed: the line,
+            # then the note that it went on repeating.
+            note = _TAIL_REPEAT_NOTE % run_extra
+            out.append(note)
+            kept += len(note) + 1
+            stats["collapsed"] = stats.get("collapsed", 0) + run_extra
+        out.append(run_line)
+        kept += len(run_line) + 1
+        run_line = None
+        run_extra = 0
+
+    for line in lines:
+        if _drop_from_tail(line):
+            stats["dropped"] = stats.get("dropped", 0) + 1
+            continue
+        if run_line is not None and line == run_line:
+            run_extra += 1
+            continue
+        _flush()
+        if kept >= limit:
+            # Already flushed and nothing is pending, so returning here cannot
+            # lose a collapsed run's count.
+            stats["keptBytes"] = kept
+            return out
+        run_line = line
+    _flush()
+    stats["keptBytes"] = kept
+    return out
+
+
+def _tail_bytes(path, limit=BUNDLE_SYSTEM_TAIL_BYTES, stats=None,
+                scan_limit=TAIL_SCAN_MAX_BYTES) -> bytes:
+    """The last `limit` bytes WORTH READING, whole lines only.
+
+    ⛔ It used to be the last `limit` bytes full stop, cut forward to the next
+    newline. On this machine that spent 91% of a 5 MiB budget on the sentence
+    "a health probe succeeded" — see `_filter_tail_lines` for the numbers and for
+    what replaced it.
+
+    `stats` is an optional dict this fills in (`dropped`, `collapsed`,
+    `keptBytes`, `scannedBytes`, `reachedStart`) so the bundle can SAY that a
+    tail was filtered. A filtered artifact that does not admit it is a false
+    statement about the machine — a reader would conclude the probes stopped.
+    """
+    limit = max(0, int(limit))
+    if stats is None:
+        stats = {}
+    stats.setdefault("dropped", 0)
+    stats.setdefault("collapsed", 0)
     try:
         size = Path(path).stat().st_size
-        with open(path, "rb") as fh:
-            if size > limit:
-                fh.seek(size - limit)
-                chunk = fh.read()
-                nl = chunk.find(b"\n")
-                return chunk[nl + 1:] if 0 <= nl < len(chunk) - 1 else chunk
-            return fh.read()
     except OSError:
         return b""
+    scan_limit = max(limit, int(scan_limit))
+    try:
+        with open(path, "rb") as fh:
+            newest_first = _filter_tail_lines(
+                _tail_lines_newest_first(fh, size, scan_limit), limit, stats)
+    except OSError:
+        return b""
+    stats["scannedBytes"] = min(size, scan_limit)
+    stats["reachedStart"] = size <= scan_limit
+    # ⛔⛔ THE ARCHIVE LOSES THIS AND NOTHING ELSE CARRIES IT. Tails go in via
+    # `zf.writestr`, which stamps the moment the BUNDLE was built, not the moment
+    # the log was last written — so a reader opening `system/backend.log` from a
+    # frozen machine sees today's date on a file that stopped moving weeks ago.
+    # This is reported for every tail, filtered or not, because it is the only
+    # answer available for files written before `[date]` markers existed.
+    try:
+        import datetime as _dt
+        stats["lastWrittenUtc"] = _utc_iso(_dt.datetime.fromtimestamp(
+            Path(path).stat().st_mtime, _dt.timezone.utc))
+    except (OSError, OverflowError, ValueError):
+        stats["lastWrittenUtc"] = ""
+    if not newest_first:
+        return b""
+    # ⛔⛔ TRIMMED LINE-WISE FROM THE OLD END, NOT BY BYTES — and an orphaned
+    # collapse marker is dropped with the line it describes.
+    #
+    # The flush can carry the total one line past the budget. Byte-trimming the
+    # front and cutting forward to the next newline (what this function always
+    # did) removes the OLDEST line — and if that line was a collapsed run's
+    # retained copy, its `^ the line above then repeated N more times` marker
+    # survives pointing at whatever line is now above it. That is a fabricated
+    # repeat count in a support archive: a marker that lies, in the wave whose
+    # whole subject is markers that lie. Line-wise trimming cannot cut a line in
+    # half either, so the whole-line property stops depending on a byte search.
+    #
+    # `> 1` keeps the newest line even when it alone exceeds the budget: a tail of
+    # nothing is worse than a tail slightly over.
+    total = sum(len(x) + 1 for x in newest_first)
+    while total > limit and len(newest_first) > 1:
+        total -= len(newest_first.pop()) + 1
+    while (len(newest_first) > 1
+           and newest_first[-1].startswith(_TAIL_REPEAT_NOTE_PREFIX)):
+        total -= len(newest_first.pop()) + 1
+    # ⛔⛔ THE DATE RANGE IS READ FROM WHAT SURVIVED, NOT FROM WHAT WAS SCANNED,
+    # and the difference is a header that lies. `_tail_filter_header` says "the
+    # [date] lines BELOW cover X … Y" — so if the range were collected during the
+    # walk, the trim above could remove the oldest marker and leave the header
+    # naming a date the reader cannot find. Reading the final list makes the claim
+    # true by construction. Newest-first, so the LAST marker is the oldest one,
+    # which is the date the top of the tail sits on.
+    for line in newest_first:
+        found = _LOG_DATE_MARKER_RE.search(line)
+        if found:
+            day = found.group(1).decode("ascii")
+            stats.setdefault("dateNewest", day)
+            stats["dateOldest"] = day
+    return b"\n".join(reversed(newest_first)) + b"\n"
+
+
+def _tail_dating_text(stats: dict) -> str:
+    """How to place this tail on a calendar, in words.
+
+    ⭐ TWO ANSWERS, AND THE WEAKER ONE IS ALWAYS AVAILABLE. `[date]` markers date
+    every line precisely but only exist in logs written after 2026-08-19; the
+    file's own last-write time dates the END of the tail and works on every file
+    that has ever existed. A reader gets whichever is there, named for what it is,
+    rather than a single sentence that is sometimes a guess."""
+    oldest, newest = stats.get("dateOldest", ""), stats.get("dateNewest", "")
+    written = stats.get("lastWrittenUtc", "")
+    if oldest and newest:
+        span = oldest if oldest == newest else f"{oldest} … {newest}"
+        return (f"Dates: the [date] lines below cover {span}; any line is dated by "
+                f"the nearest one above it.")
+    if written:
+        return (f"Dates: this file carries no [date] lines (it predates them), so "
+                f"only its last write is known — {written}. Lines above that are "
+                f"undated.")
+    return "Dates: unknown — no [date] lines, and the file's own timestamp was unreadable."
+
+
+def _tail_filter_header(name: str, stats: dict) -> bytes:
+    """Say what was removed, at the top of the tail it was removed from."""
+    return (
+        f"[bundle] {name}: this tail was filtered so its budget could reach "
+        f"further back. {int(stats.get('dropped', 0))} successful /api/health "
+        f"access lines removed (failing probes are kept); "
+        f"{int(stats.get('collapsed', 0))} consecutive duplicate lines collapsed "
+        f"into the counts marked below. Scanned "
+        f"{int(stats.get('scannedBytes', 0))} bytes"
+        f"{'' if stats.get('reachedStart') else ' (did not reach the start of the file)'}. "
+        f"{_tail_dating_text(stats)}\n"
+    ).encode("utf-8")
 
 
 def _bundle_source_is_allowed(path) -> bool:
@@ -9165,17 +9495,31 @@ def _bundle_source_is_allowed(path) -> bool:
         return False
 
 
-def _clear_local_logs(root=None) -> dict:
-    """Erase everything on this machine that a support bundle would collect.
+def _clear_local_logs(root=None, telemetry_root=None) -> dict:
+    """Erase what this machine keeps about itself: everything a support bundle
+    would collect, PLUS the local record of everything already sent.
 
-    ⭐ THE SOURCES ARE NOT A GUESS, and that is the whole reason this lives
-    beside the collector instead of next to the command that calls it.
+    ⭐ THE COLLECTOR'S SOURCES ARE NOT A GUESS, and that is the whole reason this
+    lives beside the collector instead of next to the command that calls it.
     `_build_log_bundle` reads exactly three places — the `runs/` folders,
     `_select_bundle_sessions()` and `_system_log_tails()` — so clearing those
     three IS "there is nothing left here to send", and the test proves it by
     BUILDING a bundle afterwards rather than by re-reading this list. A clear
     defined by its own inventory drifts the moment the collector grows a fourth
     source; one defined by the collector's output cannot.
+
+    ⛔⛔ AND THAT DEFINITION, ALONE, LEFT A FILE BEHIND. The invariant is now
+    "clear ⊇ what the collector reads", not "clear = what the collector reads",
+    because `telemetry.py` keeps its spool and its sent-mirror under
+    `~/.super-research/telemetry/` — OUTSIDE `_logs_root()`. The collector cannot
+    reach it (`_bundle_source_is_allowed` refuses anything outside the log root,
+    and that refusal is what the consent screen's promise is gated on), so the
+    collector-defined rule structurally could not see it either. MEASURED
+    2026-08-19: 2,568,739 bytes of `sent.log` — the itemised record of every
+    event this machine ever reported — surviving a button whose whole job is to
+    leave nothing behind. Clearing MORE than the collector reads is safe in a way
+    that collecting more would not be: it only ever deletes the user's own data,
+    at the user's own request.
 
     ⛔ THE RAW TAILS ARE TRUNCATED, NEVER UNLINKED. The supervisor holds
     `backend.log` open — `open(log_out_path, "ab")` in `_spawn_worker` — so
@@ -9198,7 +9542,7 @@ def _clear_local_logs(root=None) -> dict:
     """
     base = Path(root) if root is not None else _logs_root()
     out = {"runs": 0, "sessions": 0, "tails": 0, "bundles": 0,
-           "kept": 0, "failed": 0}
+           "telemetry": 0, "kept": 0, "failed": 0}
 
     # ⛔⛔ THE PARKED ROWS GO FIRST, and the order is the whole point. The
     # reconnect watcher calls `_drain_queued_log_bundle_rows()` on EVERY tick of
@@ -9228,6 +9572,35 @@ def _clear_local_logs(root=None) -> dict:
         except OSError as exc:
             out["failed"] += 1
             log(f"[clear-logs] leftover {path.name}: {exc}", "WARN")
+
+    # ⛔ The telemetry spool and mirror, second for the same reason the parked
+    # rows are first: a flush in flight can merge its batch back after a failed
+    # POST, so the sooner these go the smaller that window is. It is a window,
+    # not a hole — identical in kind to the drain race documented above, and the
+    # honest treatment is to name it rather than to claim the clear is atomic.
+    #
+    # ⛔ FILES BY NAME, and never `rmtree` on the directory. A clear that removes
+    # subdirectories it does not recognise is `_bundle_source_is_allowed`'s
+    # nightmare one level over — a sweep that can be pointed at anything.
+    tm_dir = (Path(telemetry_root) if telemetry_root is not None
+              else Path(tm.sent_log_path()).parent)
+    tm_targets = []
+    try:
+        if tm_dir.is_dir():
+            tm_targets = sorted(
+                p for p in tm_dir.iterdir()
+                if p.is_file() and (p.name == tm.sent_log_path().name
+                                    or p.name.startswith("pending-"))
+            )
+    except OSError:
+        tm_targets = []
+    for path in tm_targets:
+        try:
+            path.unlink()
+            out["telemetry"] += 1
+        except OSError as exc:
+            out["failed"] += 1
+            log(f"[clear-logs] telemetry {path.name}: {exc}", "WARN")
 
     live = {str(sink.dir) for sink in _RUN_LOG_SINKS}
     runs_root = base / "runs"
@@ -9295,6 +9668,10 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
     refused: "list[str]" = []
     included_runs: "list[str]" = []
     session_count = 0
+    # Per-tail record of what the read-time filter removed. Reported rather than
+    # assumed, because "91% of that file was noise" is a claim about the machine
+    # and the only honest place for it is beside the bytes it explains.
+    tail_stats: "dict[str, dict]" = {}
 
     def _add_file(zf, source, arcname) -> bool:
         """Allowlist, then write, then account. ⛔ There is deliberately NO
@@ -9393,9 +9770,17 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
             if not _bundle_source_is_allowed(path):
                 refused.append(str(path))
                 continue
-            data = _tail_bytes(path)
+            stats: dict = {}
+            data = _tail_bytes(path, stats=stats)
             if not data:
                 continue
+            # ⛔ SAY IT IN THE FILE, not only in the manifest. A reader who opens
+            # `system/backend.log` and finds no health probes in five megabytes
+            # would conclude the probes stopped — which is a diagnosis, and a
+            # wrong one. The header travels with the data it describes.
+            if stats.get("dropped") or stats.get("collapsed"):
+                data = _tail_filter_header(path.name, stats) + data
+            tail_stats[path.name] = stats
             if written + len(data) > int(max_bytes):
                 dropped_sessions.append(f"system/{path.name}")
                 continue
@@ -9407,6 +9792,7 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
             "sessionsIncluded": session_count,
             "droppedForSize": dropped_sessions,
             "sourcesRefused": refused,
+            "systemTailFilter": tail_stats,
             "uncompressedBytes": written,
         }, indent=1).encode("utf-8"), "collected.json")
 
@@ -20194,17 +20580,36 @@ def _p1_select_pro_hotspot() -> dict:
 
 
 _HOTSPOT_VISION_HINTS = {
+    # ⛔⛔ 2026-08-19 — THESE HINTS DESCRIBED A UI THAT NO LONGER EXISTS, and that
+    # is not a cosmetic complaint: `success_signals` is what the shadow observer
+    # scores a CUA attempt against, so a signal that cannot occur marks every
+    # correct attempt a failure. On the 19 August run CUA opened the drawer at
+    # 02:59:01 and described it accurately — "An inline activity section has
+    # expanded directly below the 'Searching the web' status line, showing the
+    # source URLs being searched" — against an instruction demanding "a right-side
+    # panel with a numbered step list + URL rows". Measured facts, from the owner's
+    # screenshots and the panel-miss snapshots of that phase:
+    #   * NO side panel in P1. The press expands an inline row of website chips
+    #     (favicon + domain) under the line, ending in an "N more" chip.
+    #   * NO ellipsis. Four labels captured, none ended in dots: "Mapped security
+    #     coverage", "Compared security layers", "Searching the web",
+    #     "Searched 20 websites". The wording is topic-specific and mutates; the
+    #     shimmer and the chip row are what do not.
+    # ⛔ 7c (P2) is UNCHANGED — its side panel opened normally on the same run
+    # (03:12:42, shape=side, 5 URLs) off a label that DID end in "...".
     "7c-p1": {
-        "expected_outcome": "ChatGPT's activity side panel (step list + source URLs) slides open on the right",
+        "expected_outcome": "a row of website chips (favicon + domain) expands inline under the shimmering activity line",
         "context_hint": (
-            "Open ChatGPT's activity panel (P1 Pro + Extended Thinking). The target is the "
-            "SHIMMERING / glowing inline activity label attached to the TRAILING (bottom) edge "
-            "of the LATEST assistant message — a short pill that pulses, text like "
-            "'Pro thinking…' / 'Reasoning…' / 'Searching…' usually ending in '...'. Click that "
-            "label once. It is NOT pinned to the top, NOT the Share button, NOT the model "
-            "selector/header, NOT the composer — do not click those."
+            "Open ChatGPT's research activity (P1 Pro + Extended Thinking). The target is the "
+            "SHIMMERING / glowing activity line just below the LAST SENT message — a single "
+            "short line whose text sweeps with a moving highlight. Its WORDING IS "
+            "TOPIC-SPECIFIC and changes every few seconds, so use the shimmer, not the words, "
+            "and do not expect a trailing '...'. Click that line once; it is a TOGGLE. It is "
+            "NOT pinned to the top, NOT the Share button, NOT the model selector/header, NOT "
+            "the composer — do not click those, and do not click a chip once they appear."
         ),
-        "success_signals": ["a side panel on the RIGHT (~30-40% width)", "a numbered/bulleted step list with source URL rows"],
+        "success_signals": ["a row of website chips (favicon + domain) directly under the activity line",
+                            "an inline expansion below the clicked line, not a side panel"],
     },
     "7c": {
         "expected_outcome": "the Deep Research activity/step-list side panel opens on the right",
@@ -24776,6 +25181,41 @@ async def scrape_progress_chatgpt(page):
                     if len(unioned_il) > result.get("sources", 0):
                         result["source_urls"] = unioned_il[:_SOURCE_LIST_CAP]
                         result["sources"] = len(result["source_urls"])
+                # ⭐⭐ 2026-08-19 — THE CHIP ROW BELONGS TO THE FINAL RESULT TOO, and
+                # leaving it out of this path was the worst thing the review of this
+                # wave found. The live walk merges the chips into `progress`, so the
+                # FE's activity popup would show eight domains all through the phase
+                # and then the EXTRACTED result — the payload the report and the
+                # source list are built from — would drop every one of them. Two
+                # views of one run disagreeing is exactly the class of bug this wave
+                # was opened for.
+                #
+                # ⛔ GAP-FILL ONLY, both halves. A finished response has rendered its
+                # real citation links, and a page URL is strictly better than the
+                # domain it lives on: `_merge_host_chips` skips a host already
+                # represented, and `_drop_covered_host_placeholders` removes a
+                # placeholder that a real page has since covered. So a chip survives
+                # here only when nothing better exists — which is the case that made
+                # the owner ask for the chips in the first place.
+                #
+                # ⛔ AND NO PRUNE CALL HERE, deliberately. `_merge_host_chips`
+                # refuses a host that is already represented, and nothing else in
+                # `result` is chip-derived — this dict is built fresh from the host
+                # scrape on every call, so there is no earlier poll for a
+                # placeholder to have arrived on. A prune here could not fire, and
+                # a guard that cannot fire is the exact defect this whole wave was
+                # opened to remove. The live walk DOES need it, because that list
+                # accumulates across polls; see `_drop_covered_host_placeholders`.
+                if il.get("source_hosts"):
+                    _pre_n = len(result.get("source_urls") or [])
+                    _merge_host_chips(result, il.get("source_hosts") or [])
+                    result["source_urls"] = (result.get("source_urls") or [])[:_SOURCE_LIST_CAP]
+                    result["sources"] = len(result["source_urls"])
+                    if len(result["source_urls"]) != _pre_n:
+                        log(f"[ChatGPT] inline chip row contributed "
+                            f"{len(result['source_urls']) - _pre_n} source(s) the "
+                            f"panel and the prose did not carry "
+                            f"({il.get('chips', 0)} chips seen)", "DEBUG")
                 if int(il.get("searches", 0) or 0) > int(result.get("searches", 0) or 0):
                     result["searches"] = int(il.get("searches", 0) or 0)
                 if int(il.get("partial_text_len", 0) or 0) > int(result.get("partial_text_len", 0) or 0):
@@ -25140,6 +25580,43 @@ async def scrape_progress_chatgpt(page):
 # The inline-turn sweep below is (a) the per-cycle narration source (status
 # line + counts are scrapeable in the turn regardless of panel state) and
 # (b) a defensive secondary "open" shape for future UI variants.
+# ⭐⭐ ONE DEFINITION OF "SHIMMERING", spliced into the three walkers that ask.
+# A shimmer is an animated gradient MASKED TO THE GLYPHS, and both halves are
+# required: the animation alone also describes the "Pro" badge (every panel-miss
+# snapshot of the 19 August run recorded it anim/animKid true, clip FALSE), while
+# the gradient alone survives on a FINISHED step that kept its class, which is the
+# 2026-08-18 defect that put `background-clip` inside `shimmers()` in the first
+# place.
+#
+# ⛔⛔ IT IS ONE CONSTANT BECAUSE DUPLICATES HIDE MUTANTS. There were two copies,
+# and a mutation survivor proved the hazard exactly: stripping the check out of the
+# PICKER still passed, because the SNAPSHOT's copy kept the asserted string alive
+# in the file. `test_p1_panel_precedence_0818` was written to close that by
+# counting the copies and checking each — a guard that has to be re-counted every
+# time a fourth walker needs the predicate, and this wave was the third. One
+# definition makes the count 1 and the hiding place gone.
+#
+# ⚠ The three call sites sat at three indentation depths. JS does not care, and
+# nothing may depend on it — the picker and the snapshot were verified
+# whitespace-identical to their previous copies after this was extracted.
+_CHATGPT_SHIMMER_JS_HELPERS = """
+    const shimmers = (n) => {
+        try {
+            const cs = getComputedStyle(n);
+            return !!cs.animationName && cs.animationName !== 'none'
+                && cs.animationPlayState !== 'paused';
+        } catch (e) { return false; }
+    };
+    const clipped = (n) => {
+        try {
+            const cs = getComputedStyle(n);
+            return cs.webkitBackgroundClip === 'text'
+                || cs.backgroundClip === 'text';
+        } catch (e) { return false; }
+    };
+"""
+
+
 _CHATGPT_INLINE_ACTIVITY_JS = """() => {
     // Scope: the LAST assistant turn. The status row + drawer render inside
     // the <article> turn wrapper but OUTSIDE [data-message-author-role], so
@@ -25147,15 +25624,53 @@ _CHATGPT_INLINE_ACTIVITY_JS = """() => {
     const main = document.querySelector('main') || document.body;
     const arts = main.querySelectorAll('article');
     let turn = arts.length ? arts[arts.length - 1] : null;
+    let scope = turn ? 'article' : '';
     if (!turn) {
         const asst = main.querySelectorAll('[data-message-author-role="assistant"]');
         turn = asst.length ? (asst[asst.length - 1].parentElement
                               || asst[asst.length - 1]) : null;
+        if (turn) scope = 'role-parent';
     }
     if (!turn) return null;
+    // ⛔⛔ 2026-08-19 — THE ARTICLE SCOPE IS NOT ALWAYS THERE, AND THE WALK DIED
+    // SILENTLY WHEN IT WASN'T. The 19 August P1 phase ran 13.7 minutes and logged
+    // ZERO `panel tracking (P1)` lines — the raw-activity popup the owner reported
+    // as empty. The panel-miss snapshots of that phase say why the article scope
+    // is not trustworthy: the very status line this walker exists to read was
+    // recorded with `inTurn: false` at 02:56:08 and 02:58:15 (its own
+    // `closest('[data-testid^="conversation-turn"], [data-message-author-role=
+    // "assistant"]')` came back null), and `inTurn: true` only from 03:00:06.
+    // So for the first minutes of a response the live line is NOT inside the
+    // last article, `arts[last]` is the USER's turn, and everything below is
+    // scanned in the wrong subtree.
+    //
+    // The geometry the snapshot and the opener walker BOTH already use is the
+    // reliable scope: whatever sits below the bottom of the last user message.
+    // Recorded here as a bound rather than a container, and applied ADDITIVELY —
+    // the article scope stays primary, so P2 (whose side panel and strip parse
+    // correctly today) is untouched; the geometric pass only runs when the
+    // article scope found nothing, which is exactly the case that was dying.
+    let lub = -1;
+    try {
+        main.querySelectorAll('[data-message-author-role="user"]').forEach(u => {
+            const r = u.getBoundingClientRect();
+            if (r.bottom > lub) lub = r.bottom;
+        });
+    } catch (e) {}
     const out = { steps: [], source_urls: [], sections: [], searches: 0,
                   partial_text_len: 0, progress: '', status_line: '',
-                  expanded: false };
+                  expanded: false,
+                  // The inline chip row: hostnames only, plus how many. See the
+                  // chip block below for why this is a SEPARATE fact from
+                  // `expanded` rather than folded into it.
+                  source_hosts: [], chips: 0, chip_row: false,
+                  // ⭐ Instrumented because "the walk produced nothing" was
+                  // indistinguishable from "there was nothing to produce" for a
+                  // whole phase. Cheap: counters already computed by the scan.
+                  dbg: { scope: scope, lub: Math.round(lub), turnTag: '',
+                         cands: 0, chipsProse: 0, statusFrom: '' } };
+    out.dbg.turnTag = (turn.tagName || '') + '|'
+                      + String(turn.className || '').split(/\\s+/)[0].slice(0, 24);
     const turnText = (turn.innerText || '').trim();
     out.partial_text_len = turnText.length;
     // Inline-expansion state — SECONDARY shape (ground truth 2026-07-07:
@@ -25167,6 +25682,31 @@ _CHATGPT_INLINE_ACTIVITY_JS = """() => {
     // forever. The ≥40-char text floor exists for P2: the DR card is an
     // iframe embed (its text is invisible to the host), so an "activity"-
     // classed host container around it must NOT count as expanded.
+    //
+    // ⛔⛔ 2026-08-19 — THIS DID NOT FIRE ONCE, AND IT IS WHY WE SPENT FOUR
+    // MINUTES CLOSING THE DRAWER WE HAD OPENED. P1's 2026-08 UI has no side
+    // panel at all: the live line expands an inline row of hostname chips whose
+    // container is `class="flex"` and whose text is a domain of a few
+    // characters. Every gate here refuses that — ≥60px tall, ≥120px wide,
+    // ≥40 chars, and a class/testid naming "thought" or "activity" — so
+    // `inline_expanded` was false against an already-open drawer, and the
+    // callers read that as "closed":
+    //   02:59:01 CUA opens the chip row · 02:59:32 "activity drawer collapsed
+    //   — will re-open" · then eight clicks to 03:03:22, each a TOGGLE.
+    // CUA watched us do it: "The click caused the website chips/badges below
+    // the 'Searched 20 websites' line to collapse/hide" (03:06:40) and "the
+    // second click just re-expanded the website chips dropdown again"
+    // (03:07:05). That is #913's toggle storm exactly, defeated by a verifier
+    // that cannot see the shape it is verifying.
+    //
+    // ⛔ IT IS NOT REPAIRED BY LOOSENING THESE GATES, and that matters: this
+    // predicate is shared with P2, whose panel DOES parse today (03:12:42,
+    // shape=side, 5 URLs), and whose iframe-embedded DR card is the reason for
+    // the 40-char floor. Loosening it here would let P2 latch "already open"
+    // on any small in-turn node and never click its strip — the 2026-08-06
+    // failure that cost a whole phase. So the chip row is recorded BELOW as its
+    // own fact, and only the P1 call sites treat it as open. `expanded` keeps
+    // its strict meaning for a genuine in-turn thoughts region.
     for (const el of turn.querySelectorAll(
             '[class*="thought" i], [class*="activity" i], [data-testid*="thought" i]')) {
         const r = el.getBoundingClientRect();
@@ -25176,44 +25716,153 @@ _CHATGPT_INLINE_ACTIVITY_JS = """() => {
     }
     // Live status line — anchored on structure/wording, closest below the
     // last user message. Same anchor family as the opener walker.
-    const COUNT = /\\b\\d+\\s+(?:searches?|sources?|results?|citations?)\\b/i;
+    // ⭐ 2026-08-19: `websites?` and `sites?` added. The 19 August P1 line read
+    // "Searched 20 websites" — measured, both in the opener's own label at
+    // 02:55:35 and in the owner's screenshot at 03:03 — and this alternation had
+    // neither word, while the aggregate-count regex forty lines below has had
+    // both since it shipped. So the walker's own two counters disagreed about
+    // what a count looks like, and the status line came back EMPTY for the whole
+    // search phase. `progress` then fell through to the last activity row, which
+    // by then was a bare hostname chip: the narration line the owner saw was
+    // "www.penligent.ai" where the page said "Searched 20 websites".
+    const COUNT = /\\b\\d+\\s+(?:websites?|sites?|searches?|sources?|results?|citations?)\\b/i;
     const STATUS_LINE = /^(?:[\\w.+-]{1,12}\\s+)?(?:thinking|reasoning|researching)\\b/i;
     const VERB = /^(?:checking|searching|looking|browsing|investigating|analyzing|reading|exploring|visiting|researching|thinking|reasoning|gathering|reviewing|consulting|comparing|evaluating|considering|drafting|writing|finalizing|finalising|summari[zs]ing|confirming|synthesi[zs]ing|thought)\\b/i;
+    // ⛔ 2026-08-19 — KEPT, AND DEMOTED FROM AN INVARIANT TO ONE TERM AMONG
+    // SEVERAL. The 2026-05-03 note in the opener walker calls the trailing
+    // ellipsis a structural anchor that "always" holds while a run streams.
+    // It holds for P2 — that run's DR strip opened off the label "Researching..."
+    // at 03:12:42 — and it is simply false for P1's 2026-08 UI, where not one
+    // label of a 13-minute phase ended in dots ("Mapped security coverage",
+    // "Compared security layers", "Searching the web", "Searched 20 websites").
+    // Deleting it would take P2's working anchor with it; relying on it alone is
+    // what left P1 with no status line. Hence the SHIMMER term below.
     const ELLIPSIS = /(?:\\.{3}|\\u2026)\\s*$/;
     const HOSTCHIP = /^[a-z0-9][a-z0-9.-]{2,60}\\.[a-z]{2,10}$/i;
+    // ⭐⭐ THE WORDING-FREE ANCHOR, and it must be the SAME SPLIT the opener and
+    // the panel-miss snapshot use, or the three would disagree about the same
+    // row. An animated gradient masked to the glyphs is what "shimmering" IS,
+    // and the owner's instruction for this fix was exactly that: no hardcoded
+    // labels, just open the shimmering line. Both terms are required —
+    // `animKid` alone also matched the "Pro" badge in every snapshot of the
+    // 19 August run (anim:false, animKid:true, clip:FALSE), and the status line
+    // was clip:true in all four.
+""" + _CHATGPT_SHIMMER_JS_HELPERS + """
+    const shimmerLine = (el) => {
+        let anim = shimmers(el), clip = clipped(el);
+        if (anim && clip) return true;
+        try {
+            for (const kid of el.querySelectorAll('*')) {
+                if (!anim && shimmers(kid)) anim = true;
+                if (!clip && clipped(kid)) clip = true;
+                if (anim && clip) return true;
+            }
+        } catch (e) {}
+        return false;
+    };
     let statusTop = Infinity;
     const seenStep = new Set();
+    // The chip row, keyed by hostname so a re-render cannot double-count it.
+    const chipTop = new Map();
+    const proseChips = new Set();
+    let lastVerbStep = '';
+    // ⛔ The article scope is primary; the geometric pass below the last user
+    // message runs ONLY when it yielded nothing. See the scope note at the top:
+    // additive, so P2's working parse is untouched.
     let nodes;
     try { nodes = turn.querySelectorAll('*'); } catch (e) { nodes = []; }
     if (nodes.length > 8000) nodes = [];
-    for (const el of nodes) {
+    const scanNodes = (list, inGeo) => {
+      for (const el of list) {
         if (el.children.length > 3) continue;
         const t = (el.innerText || '').trim();
         if (!t || t.length < 4 || t.length > 300) continue;
         if ((t.match(/\\n/g) || []).length > 3) continue;
         const r = el.getBoundingClientRect();
         if (r.width === 0 || r.height === 0) continue;
-        const isStatus = (STATUS_LINE.test(t) && t.length <= 60)
-                      || (ELLIPSIS.test(t) && t.length >= 8 && t.length <= 240)
-                      || (COUNT.test(t) && t.length <= 160);
-        if (isStatus && r.top < statusTop) {
+        // The geometric pass bounds itself the way the snapshot does: at or
+        // below the last user message, and not so far below that the composer
+        // and the footer disclaimer come along.
+        if (inGeo && lub > 0 && (r.top < lub - 8 || r.top > lub + 900)) continue;
+        out.dbg.cands += 1;
+        // ⚠ ONE `if` LADDER RATHER THAN AN `||` CHAIN, for two reasons that both
+        // bit the first draft. (a) `shimmerLine` walks the subtree calling
+        // getComputedStyle on every descendant, and in an `||` chain it ran for
+        // nearly every candidate — hundreds of style resolutions per poll — when
+        // the answer can only matter for a row ABOVE the best one so far, so the
+        // `r.top < statusTop` guard belongs BEFORE the call, not after it. (b) the
+        // diagnostic has to name the term that actually fired: derived afterwards
+        // it labelled a line matching both ELLIPSIS and COUNT as 'count' while
+        // ELLIPSIS was what accepted it, and a >160-char COUNT line as 'count'
+        // when the shimmer had carried it. A diagnostic that misattributes is
+        // worse than none, because it is the thing the next reader trusts.
+        let from = '';
+        if (STATUS_LINE.test(t) && t.length <= 60) from = 'word';
+        else if (ELLIPSIS.test(t) && t.length >= 8 && t.length <= 240) from = 'ellipsis';
+        else if (COUNT.test(t) && t.length <= 160) from = 'count';
+        else if (t.length <= 240 && r.top < statusTop && shimmerLine(el)) from = 'shimmer';
+        if (from && r.top < statusTop) {
             statusTop = r.top;
             out.status_line = t.slice(0, 200);
+            out.dbg.statusFrom = from;
         }
         // Activity rows: verb-prefixed leaves + hostname chips. Exclude the
         // response prose (.markdown) unless verb-gated — the drawer rows
         // render OUTSIDE the markdown body.
         const inProse = !!(el.closest && el.closest('.markdown'));
         const isChip = HOSTCHIP.test(t);
+        // ⭐⭐ THE CHIP ROW — measured, not guessed. The panel-miss snapshot of
+        // 03:00:06 recorded the whole thing: eight DIVs, `class="flex"`,
+        // `inTurn: true`, `anim: false`, text a bare hostname, laid out on two
+        // rows at y=278 and y=307 under a status line at y=242, plus a "13 more"
+        // affordance that is not a hostname and so is not counted. Structure
+        // only — no label, no class, no testid — because the shimmer label is
+        // topic-specific and this row is the one thing about the expanded state
+        // that is not.
+        if (isChip && !inProse) {
+            const host = t.toLowerCase();
+            if (!chipTop.has(host)) chipTop.set(host, Math.round(r.top));
+        }
         if ((VERB.test(t) && t.length >= 8) || (isChip && !inProse)) {
             if (inProse && !VERB.test(t)) continue;
             const k = t.slice(0, 80);
             if (!seenStep.has(k)) {
                 seenStep.add(k);
                 out.steps.push(t.slice(0, 220));
+                // Tracked separately so `progress` can prefer a real activity
+                // sentence over a hostname when no status line was found.
+                if (VERB.test(t)) lastVerbStep = t.slice(0, 220);
             }
+        } else if (isChip && inProse) {
+            // ⚠ A SET, not a counter. Both the article pass and the geometric
+            // pass can see the same citation, and an anchor and its own text
+            // node are two elements naming one host — a raw ++ reported 6 for
+            // three citations, which is the kind of diagnostic that sends the
+            // next reader hunting a duplication that does not exist. Distinct
+            // hostnames refused for being prose is also the more useful number.
+            proseChips.add(t.toLowerCase());
+        }
+      }
+    };
+    scanNodes(nodes, false);
+    if (!out.status_line && !chipTop.size && !out.steps.length && lub > 0) {
+        let geo;
+        try { geo = main.querySelectorAll('*'); } catch (e) { geo = []; }
+        if (geo.length && geo.length <= 8000) {
+            out.dbg.scope = scope + '+geo';
+            scanNodes(geo, true);
         }
     }
+    out.dbg.chipsProse = proseChips.size;
+    // ⚠ The LIST is capped; the COUNT is not. Reporting the post-cap length would
+    // make a 70-chip row read as 60, and this number is the one the log carries
+    // and the one the callers latch on.
+    out.source_hosts = [...chipTop.keys()].slice(0, 60);
+    out.chips = chipTop.size;
+    // ⛔ TWO, not one. A single hostname appears in ordinary prose and in a
+    // collapsed one-source citation; a ROW is the shape that only the expanded
+    // drawer has, and two is the smallest thing that can be a row.
+    out.chip_row = out.chips >= 2;
     out.steps = out.steps.slice(-15);
     // Source links inside the turn — unwrap the chatgpt.com redirector.
     const seenUrl = new Set();
@@ -25249,8 +25898,13 @@ _CHATGPT_INLINE_ACTIVITY_JS = """() => {
         if (t && t.length > 1 && t.length < 120) out.sections.push(t);
     });
     out.sections = out.sections.slice(0, 20);
-    const lastVerb = out.steps.length ? out.steps[out.steps.length - 1] : '';
-    out.progress = out.status_line || lastVerb;
+    // ⛔ 2026-08-19 — A HOSTNAME IS NOT A PROGRESS SENTENCE. This read the LAST
+    // step, and once the chip row rendered the last step was a domain, so the
+    // narration line became "www.penligent.ai". Prefer the status line, then the
+    // newest verb row, and only then whatever the newest row is — every term is
+    // a measurement, the order is which one a reader would rather be shown.
+    const lastStep = out.steps.length ? out.steps[out.steps.length - 1] : '';
+    out.progress = out.status_line || lastVerbStep || lastStep;
     return out;
 }"""
 
@@ -25381,7 +26035,12 @@ async def _chatgpt_activity_state(page):
            # return a bare boolean and log nothing, so a false positive that
            # cost a whole phase could not be diagnosed from any log — while the
            # opener it suppresses has printed clickedTag + frameUrl since #913.
-           "side_panel_id": None, "side_panel_ctx": ""}
+           "side_panel_id": None, "side_panel_ctx": "",
+           # 2026-08-19: the P1 inline chip row, reported as a FACT and never
+           # folded into `inline_expanded`. `_chatgpt_p1_activity_open` is the
+           # only thing that treats it as open; P2's call sites read it in the
+           # log and act on nothing. See `_CHATGPT_INLINE_ACTIVITY_JS`.
+           "inline_chip_row": False, "inline_chips": 0}
     try:
         _hit = await page.evaluate(_CHATGPT_SIDE_PANEL_JS)
         if _hit:
@@ -25395,6 +26054,8 @@ async def _chatgpt_activity_state(page):
         if isinstance(il, dict):
             out["inline_expanded"] = bool(il.get("expanded"))
             out["thread_len"] = int(il.get("partial_text_len", 0) or 0)
+            out["inline_chips"] = int(il.get("chips", 0) or 0)
+            out["inline_chip_row"] = bool(il.get("chip_row"))
     except Exception:
         pass
     if not out["side_panel"]:
@@ -25419,6 +26080,175 @@ async def _chatgpt_activity_state(page):
         except Exception:
             pass
     return out
+
+
+# The Python twin of `_CHATGPT_INLINE_ACTIVITY_JS`'s HOSTCHIP: anchored at both
+# ends so a sentence containing a domain can never pass for one.
+_HOST_CHIP_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{2,60}\.[a-z]{2,10}$", re.I)
+
+
+def _chatgpt_p1_activity_open(st):
+    """Is P1's activity open? — the P1-ONLY reading of `_chatgpt_activity_state`.
+
+    ⛔⛔ 2026-08-19: WHY THIS IS A SEPARATE PREDICATE AND NOT A LOOSER SHARED ONE.
+    P1's 2026-08 UI has no side panel; the live line expands an inline row of
+    hostname chips. `inline_expanded` cannot see that row (its gates want a
+    60px-tall region of ≥40 chars named "thought"/"activity"; the chips are
+    `class="flex"` and a domain long), so on the 19 August run the callers read
+    an OPEN drawer as closed and clicked the toggle eight times, closing it — CUA
+    watched us do it at 03:06:40 and 03:07:05. The 15-minute cost was CUA
+    escalations and dead narration.
+
+    The repair is scoped rather than shared because the same predicate guards P2,
+    whose side panel parses correctly today (03:12:42, shape=side, 5 URLs) and
+    whose iframe-embedded DR card is the whole reason for `inline_expanded`'s
+    text floor. A looser shared rule would let P2 latch "already open" on any
+    small in-turn node and never click its strip — the 2026-08-06 regression that
+    cost a phase its entire narration. So P2 keeps the strict pair, P1 adds the
+    chip row, and the chip count travels in the log either way.
+    """
+    st = st or {}
+    return bool(st.get("side_panel") or st.get("inline_expanded")
+                or st.get("inline_chip_row"))
+
+
+def _chatgpt_open_shape(st):
+    """Which shape satisfied the check — for the log line, never for a decision.
+
+    The order matters and is not cosmetic: a run where the side panel is open AND
+    a chip row is present is a side-panel run, because that is the shape the
+    walker will actually read from.
+    """
+    st = st or {}
+    if st.get("side_panel"):
+        return "side"
+    if st.get("inline_expanded"):
+        return "inline"
+    if st.get("inline_chip_row"):
+        return "chips"
+    return "none"
+
+
+def _merge_host_chips(res, hosts):
+    """Fold P1's hostname chips into a scrape result's source list, in place.
+
+    ⭐ THE OWNER'S ASK, and the reason it needs a function rather than a `+=`:
+    a chip is NOT a URL. The measured row is eight DIVs whose entire text is a
+    domain — `www.nvidia.com`, `github.com`, … — inside something clickable but
+    carrying no href, so a page address for the chip does not exist to be read.
+    Synthesising `https://<host>/` is honest about that: it names the site, which
+    is what the row names, and it is a link a reader can follow.
+
+    ⛔ AND IT IS DEDUPED BY HOST, NOT BY URL: a host already represented by ANY
+    url is not given a second, bare entry. That is only half of the problem,
+    because the lists ACCUMULATE across polls — a chip seen at minute two and the
+    real page read at minute nine arrive in that order — so the other half,
+    dropping the placeholder once a real page for its host lands, is
+    `_drop_covered_host_placeholders`, applied by the caller after its merge.
+    Both halves are needed or one source is counted twice, against a number the
+    owner compares with ChatGPT's own "Searched 20 websites".
+    """
+    if not isinstance(res, dict) or not hosts:
+        return res
+    urls = list(res.get("source_urls") or [])
+    items = list(res.get("source_items") or [])
+
+    def _host_of(u):
+        m = re.match(r"^https?://([^/?#]+)", str(u or ""), re.I)
+        return m.group(1).lower().rstrip(".") if m else ""
+
+    # A host is "already real" when some url for it names a path or a query —
+    # a bare `https://host/` is only the placeholder this function itself makes.
+    def _is_bare(u):
+        return bool(re.match(r"^https?://[^/?#]+/?$", str(u or ""), re.I))
+
+    have = {}
+    for u in urls:
+        h = _host_of(u)
+        if not h:
+            continue
+        have[h] = have.get(h, False) or not _is_bare(u)
+    added = []
+    added_hosts = set()
+    for host in hosts:
+        h = str(host or "").strip().lower().rstrip(".")
+        # ⛔ VALIDATED HERE TOO, not only in the JS. The row's last cell is an
+        # "N more" affordance and the walker's shape test could widen; "13 more"
+        # reaching this unchecked builds `https://13 more/`, which is a URL a
+        # reader can click and nothing can serve. Same pattern as HOSTCHIP.
+        if not h or not _HOST_CHIP_RE.match(h) or h in have:
+            continue
+        have[h] = False
+        url = "https://" + h + "/"
+        urls.append(url)
+        items.append({"url": url, "title": h})
+        added.append(url)
+        added_hosts.add(h)
+    if added:
+        res["source_urls"] = urls
+        res["source_items"] = items
+        res["chip_hosts_added"] = len(added)
+    # ⛔⛔ PROVENANCE, and it is not bookkeeping — it is the difference between a
+    # correct prune and a silent deletion of real data. `https://github.com/` is
+    # shaped exactly like the placeholder this function synthesises AND exactly
+    # like a genuine citation of a project's home page, and nothing about the
+    # string can tell them apart. Without this set the prune below would delete a
+    # homepage ChatGPT actually cited the moment any deeper page on that host
+    # arrived. Recorded as HOSTS on the result rather than a flag on each item,
+    # because the caller's own source_items merge rebuilds every entry as exactly
+    # {url, title} — a marker on the item would not survive one poll.
+    if added_hosts:
+        res["chip_hosts"] = sorted(set(res.get("chip_hosts") or []) | added_hosts)
+    return res
+
+
+def _drop_covered_host_placeholders(urls, items, chip_hosts):
+    """Drop chip-derived `https://host/` entries that a real page now covers.
+
+    The other half of `_merge_host_chips`. Order of arrival is the whole reason
+    this exists: the chip row names a site minutes before the panel or the
+    extraction names a page on it, and the caller's accumulator keeps both. One
+    source would then be listed twice and counted twice, against a number the
+    owner compares with ChatGPT's own "Searched N websites".
+
+    ⛔⛔ `chip_hosts` IS NOT OPTIONAL AND NOT BOOKKEEPING. `https://github.com/` is
+    shaped exactly like the placeholder `_merge_host_chips` synthesises AND exactly
+    like a genuine citation of a project's home page — no property of the string
+    separates them. A shape-only version of this function deleted the second kind:
+    cite `https://nvidia.com/` and `https://nvidia.com/blog/x` in one response and
+    the homepage citation vanished. So only a host this run actually took FROM A
+    CHIP can lose its bare entry, and every other bare URL is somebody's real
+    source and is left alone.
+
+    ⛔ A HOST WITH ONLY A PLACEHOLDER KEEPS IT. Dropping every bare domain would
+    delete the chips outright on a P1 run, where a bare domain is the only address
+    that exists — which is the data the owner asked to see. Returns new lists;
+    input order is preserved, because it is arrival order and the newest row is
+    what `progress` reads.
+    """
+    urls = list(urls or [])
+    items = list(items or [])
+    chips = {str(h or "").strip().lower().rstrip(".") for h in (chip_hosts or [])}
+    chips.discard("")
+    if not chips:
+        return urls, items
+
+    def _host_of(u):
+        m = re.match(r"^https?://([^/?#]+)", str(u or ""), re.I)
+        return m.group(1).lower().rstrip(".") if m else ""
+
+    def _is_bare(u):
+        return bool(re.match(r"^https?://[^/?#]+/?$", str(u or ""), re.I))
+
+    real = {_host_of(u) for u in urls if not _is_bare(u)}
+    real.discard("")
+    keep = [u for u in urls
+            if not (_is_bare(u) and _host_of(u) in chips and _host_of(u) in real)]
+    if len(keep) == len(urls):
+        return urls, items
+    kept = set(keep)
+    return keep, [it for it in items
+                  if not isinstance(it, dict) or it.get("url") in kept]
 
 
 async def _close_chatgpt_side_panel(page):
@@ -25584,20 +26414,7 @@ async def _log_chatgpt_thread_snapshot(page, tag=""):
             // ⛔ Same split as the decider — and it has to BE the same split, or
             // the snapshot would keep reporting a shimmer the picker no longer
             // sees and the two would disagree about the same row.
-            const shimmers = (n) => {
-                try {
-                    const cs = getComputedStyle(n);
-                    return !!cs.animationName && cs.animationName !== 'none'
-                        && cs.animationPlayState !== 'paused';
-                } catch (e) { return false; }
-            };
-            const clipped = (n) => {
-                try {
-                    const cs = getComputedStyle(n);
-                    return cs.webkitBackgroundClip === 'text'
-                        || cs.backgroundClip === 'text';
-                } catch (e) { return false; }
-            };
+""" + _CHATGPT_SHIMMER_JS_HELPERS + """
             let anim = shimmers(el);
             let clip = clipped(el);
             let animKid = false;
@@ -25735,15 +26552,30 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
         // P1-only list — the P2 synthesis-stage verbs (confirming, summarizing,
         // synthesizing, drafting, finalizing) added across commits c06a60e..
         // 9f4117c chased a moving target and never opened the P2 source panel
-        // reliably anyway. The new ELLIPSIS structural anchor handles all P2
-        // wording (live narration always ends in "..."); P1 verb wording is
-        // stable so this list stays.
+        // reliably anyway. The ELLIPSIS anchor handles most P2 wording; P1 verb
+        // wording is stable so this list stays.
         const VERB_ONLY = /^(thinking|reasoning|searching|looking|browsing|investigating|analyzing|reading|exploring|checking|visiting|researching)\\b/i;
-        // 2026-05-03 STRUCTURAL ANCHOR: the live in-tile glow line ALWAYS
-        // ends with ellipsis ("..." or U+2026 normalized) while the run is
-        // streaming. Verb wording mutates per stream (5 prior commits keep
-        // expanding the verb regex with no end in sight); the ellipsis
-        // suffix does not. Match BOTH ASCII three-dot and Unicode \\u2026.
+        // 2026-05-03 STRUCTURAL ANCHOR: the live in-tile glow line ends with an
+        // ellipsis ("..." or U+2026 normalized) while the run is streaming.
+        // Verb wording mutates per stream (5 prior commits keep expanding the
+        // verb regex with no end in sight). Match BOTH ASCII three-dot and
+        // Unicode \\u2026.
+        //
+        // ⛔⛔ 2026-08-19 — "ALWAYS" IS WHAT THIS COMMENT USED TO SAY, AND IT IS
+        // FALSE. Measured over one 13.7-minute P1 phase: not one label ended in
+        // dots — "Mapped security coverage", "Compared security layers",
+        // "Searching the web", "Searched 20 websites" (the last two confirmed
+        // against the owner's screenshots). The same run's P2 strip DID open off
+        // "Researching..." at 03:12:42, so this is not a dead anchor to delete —
+        // deleting it would take P2's working leg with it. It is an anchor whose
+        // stated universality was never true, and the cost of believing it was
+        // paid by the downstream verifier, not here: `ELLIPSIS` was one of only
+        // three ways `_CHATGPT_INLINE_ACTIVITY_JS` could recognise a status line,
+        // so P1's status line came back EMPTY all phase. That walker now has a
+        // shimmer term; this one already had STATUS_LINE and the structural
+        // shimmer pass, which is why the OPENER found the line every single time
+        // (anchor=structural at 02:56:08, anchor=global at 03:00:06). Finding it
+        // was never the problem. Verifying it was.
         const ELLIPSIS = /(?:\\.{3}|\\u2026)\\s*$/;
 
         // A root with more than NODE_CAP descendants is abandoned unscanned —
@@ -25776,20 +26608,7 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
         // reported, and can only ever decide when nothing strict qualifies — so
         // today's reach is preserved exactly while the log finally names which of
         // the two carried any given press.
-        const shimmers = (n) => {
-            try {
-                const cs = getComputedStyle(n);
-                return !!cs.animationName && cs.animationName !== 'none'
-                    && cs.animationPlayState !== 'paused';
-            } catch (e) { return false; }
-        };
-        const clipped = (n) => {
-            try {
-                const cs = getComputedStyle(n);
-                return cs.webkitBackgroundClip === 'text'
-                    || cs.backgroundClip === 'text';
-            } catch (e) { return false; }
-        };
+""" + _CHATGPT_SHIMMER_JS_HELPERS + """
 
         // Specificity score for hit ranking. Layered to keep the 32c2957
         // "parent strip > badge child" guarantee while putting the live
@@ -26572,6 +27391,24 @@ async def scrape_progress_gemini(page):
             // elements whose animations finished or never started, causing
             // persistent UI chrome (avatars, fade-ins) to read as active long
             // after generation completed.
+            //
+            // ⚠ 2026-08-19 — THIS TIER AND TIER 1 CARRY THE SAME TWO MISSES
+            // detect_completion_gemini was just fixed for, and they are LEFT
+            // ALONE ON PURPOSE. Tier 1's selector list is case-sensitive, so
+            // `aria-label="Stop response"` matches nothing; this tier selects on
+            // CLASS names while Gemini's live skeletons carry `pulse` in the
+            // ANIMATION NAME. Both misses are real. What is NOT measured is
+            // Gemini's DOM while it DRAFTS THE PLAN — and `isActive` feeds
+            // `status`, which the 2D plan-wait reads as its streaming clock
+            // (research.py ~51055): a status of 'generating' resets the clock and
+            // can flip `_streaming_handoff`, which SKIPS the CUA recovery ladder
+            // for a genuinely dead plan. So making this tier see more, off a
+            // capture taken while research was already running, would change
+            // the dead-plan recovery path on evidence that says nothing about
+            // it. The completion detector had two captures; this needs its own.
+            // ⇒ WANTED before touching this: a capture during PLAN DRAFTING
+            // (running animation names + visibility, and whether a stop-ish
+            // button exists), plus one of a FAILED plan.
             if (!isActive) {
                 const animated = document.querySelectorAll('[class*="animate"], [class*="spin"], [class*="pulse"], [class*="loading"]');
                 for (const el of animated) {
@@ -27468,7 +28305,7 @@ async def detect_completion_claude(page):
         return (False, f"detect_error: {e}", {})
 
 
-async def detect_completion_gemini(page):
+async def detect_completion_gemini(page, running_confirmed: bool = False):
     """Gemini Deep Research completion detector. Playwright-only.
     Returns (done, reason, snap) where snap = {text_len, sources, steps}.
 
@@ -27506,42 +28343,174 @@ async def detect_completion_gemini(page):
     everything; the weak running signals (streaming markers / animation
     tier) yield to the strong markers but still veto the weaker
     Share&Export-alone path. The Start scan also requires the button to be
-    VISIBLE (offsetParent) — a display:none leftover must not gate."""
+    VISIBLE (offsetParent) — a display:none leftover must not gate.
+
+    2026-08-19 (the 08-19 e2e: nineteen minutes of `start_research_btn_visible
+    (pre-research)` ten seconds after the log said "Clicked 'Start research' ✓
+    (confirmed it took)" and "Gemini is researching ✓"). The DECISION was right
+    every tick — no done-marker, no stop, no weak signal, so the ladder fell to
+    its last resort. The REASON was a lie, and the lie is what made a healthy
+    run look pre-research. Root cause was TWO independent misses, both in the
+    JS below and both fixed there with the captures that proved them:
+      • the stop scan was case-sensitive, so `aria-label="Stop response"` matched
+        nothing — and the button is INVISIBLE while running, so it had to be
+        split into a visible veto and a hidden weak signal rather than simply
+        made case-insensitive;
+      • the running-animation tier matched CLASS names while Gemini carries
+        `pulse` in the ANIMATION NAME.
+    `running_confirmed` closes the label itself, belt-and-braces: the caller
+    already knows whether a running-verify ever confirmed this agent, so the
+    last resort can stop asserting "pre-research" about a run that demonstrably
+    started. ⛔ It is deliberately NOT "we clicked Start" — that was TRUE in the
+    2026-08-17 ninety-minute failure too, where `pre-research` was the CORRECT
+    label; a confirmed RUNNING verify is the only fact that separates the two."""
     try:
         data = await page.evaluate("""() => {
-            let hasStopExplicit = false;
-            const stopSels = 'button[aria-label="Stop"], button[aria-label*="stop"], ' +
-                             'button[aria-label="Cancel"], button[title*="Stop"], ' +
-                             '[role="button"][aria-label*="stop" i]';
-            if (document.querySelector(stopSels)) hasStopExplicit = true;
-            if (!hasStopExplicit) {
-                for (const b of document.querySelectorAll('button, [role="button"]')) {
-                    const txt = (b.textContent || '').trim().toLowerCase();
-                    if (txt === 'stop' || txt === 'stop generating' || txt === 'cancel') {
-                        hasStopExplicit = true; break;
-                    }
+            // ⛔⛔ 2026-08-19 — THE STOP SIGNAL IS TWO SIGNALS, and reading it
+            // as one is what left this detector deaf for nineteen minutes. Two
+            // live captures of the same Gemini Deep Research conversation
+            // settled it (owner-run, 728×748 viewport):
+            //   DURING research — exactly ONE stop-ish control in the whole
+            //     document: <button aria-label="Stop response">, icon-only,
+            //     offsetParent null, 0×0. Capital S. CSS attribute matching is
+            //     case-SENSITIVE without the `i` flag, and of the selectors
+            //     this block used to carry only the last one had it — and that
+            //     one also demanded [role="button"], which a native <button>
+            //     does not have. So the scan matched NOTHING while CUA's own
+            //     screenshot described that button twice.
+            //   AFTER completion — nothing matches, because the button is GONE.
+            // ⭐⭐ BOTH OBVIOUS ONE-LINE FIXES WERE WRONG, IN OPPOSITE
+            // DIRECTIONS, and only the measurement could tell them apart.
+            // Adding `i` alone promotes a HIDDEN button to a veto that outranks
+            // every done-marker. Gating on visibility alone rejects the only
+            // running signal Gemini offers, because that button is invisible
+            // WHILE RUNNING. Hence the split:
+            //   hasStopVisible — case-insensitive AND visible ⇒ the hard veto
+            //     at the top of the ladder, semantics unchanged for every state
+            //     that already worked.
+            //   hasStopHidden  — present but 0×0 ⇒ a WEAK RUNNING signal, ranked
+            //     BELOW the done markers, so it can never outrank
+            //     report_button_trio. HANG-PROOF BY CONSTRUCTION: if some
+            //     future state leaves a hidden stop behind forever, the worst
+            //     it can cost is the weakest done rung (Share & Export alone),
+            //     never the run.
+            // ⭐ `offsetParent === null` also reports a position:fixed element
+            // as hidden. That error lands on the SAFE side here — a misread
+            // visible stop becomes a weak signal, never a veto — so the
+            // convention the Start scan below already uses is kept.
+            // ⭐ A WORD-BOUNDARY match, not a bare substring: "Stop response" and "Stop
+            // generating" match, a future "Stopwatch" does not. The veto is the
+            // one rung that can hold a FINISHED run hostage, so it is the one
+            // that should be narrow.
+            let hasStopVisible = false;
+            let hasStopHidden = false;
+            const STOP_RE = /\\bstop\\b/i;
+            for (const b of document.querySelectorAll('button, [role="button"]')) {
+                const al = b.getAttribute('aria-label') || '';
+                const ti = b.getAttribute('title') || '';
+                const txt = (b.textContent || '').trim().toLowerCase();
+                const isStop = STOP_RE.test(al) || STOP_RE.test(ti)
+                    || al.trim().toLowerCase() === 'cancel'
+                    || ti.trim().toLowerCase() === 'cancel'
+                    || txt === 'stop' || txt === 'stop generating' || txt === 'cancel';
+                if (!isStop) continue;
+                const rect = b.getBoundingClientRect();
+                if (b.offsetParent !== null && rect.width > 0 && rect.height > 0) {
+                    hasStopVisible = true; break;
                 }
+                hasStopHidden = true;
             }
             // Weak running signals — real streaming usually shows these, but
             // they persist/false-positive on finished chrome, so they must
             // not outrank the done-only markers (2026-07-13 split).
             let hasRunningWeak = false;
+            let runningWeakVia = '';
             if (document.querySelector(
                 '[data-is-streaming="true"], .loading-indicator, .streaming'
-            )) hasRunningWeak = true;
+            )) { hasRunningWeak = true; runningWeakVia = 'streaming-marker'; }
             // #897b: running-animation tier promoted into the completion
             // detector — with the composer collapsed there may be NO stop
-            // button while the DR spinner still runs. Same guards as
-            // scrape_progress_gemini: visible (offsetParent) + an animation
-            // actually RUNNING (playState), so persisted/finished animations
-            // on UI chrome can't hold completion hostage.
+            // button while the DR spinner still runs.
+            //
+            // ⛔⛔ 2026-08-19 — AND IT HAD BEEN LOOKING IN THE WRONG PLACE. It
+            // selected on CLASS names ([class*="pulse"] …). Gemini's live
+            // research skeletons are class="_index_0 item-line ng-star-inserted"
+            // and carry the word `pulse` in the ANIMATION NAME
+            // (_ngcontent-ng-c379413341_pulse). Four of them, visible, 634×14,
+            // repeating — the exact signal #897b promoted this tier to catch,
+            // and it saw none of them. A SECOND, INDEPENDENT miss: had this
+            // tier worked, the false `pre-research` below could never have been
+            // reached, stop button or no stop button.
+            //
+            // ⚠ AND "any running animation" IS NOT THE FIX. Gemini animates
+            // its background FOREVER: nl-blob/nl-bg-blob (morphBG/scaleBG/
+            // sweepBG) and gradient-strip (gradientScroll) are running, visible
+            // and enormous on a COMPLETED page. Unscoped, this flag would be
+            // permanently true and would veto the Share&Export done path for
+            // the rest of time. The old class selector was ACCIDENTALLY safe
+            // only because none of those class names contain
+            // animate/spin/pulse/loading — not a property to keep relying on.
+            //
+            // ⇒ Match the animation NAME and keep the visibility gate. Both
+            // captures were replayed row by row:
+            //   after completion — ZERO visible matches (mdc-circular-progress-
+            //     left-spin/right-spin DO contain "spin" but are 0×0; morphBG,
+            //     morphFG, gradientScroll, image-fade-on, apd-ring-fade-in and
+            //     both …-rotate names match nothing at all)
+            //   during research — exactly ONE (…_pulse, 634×14)
+            // The visibility gate is measured-sufficient, so nothing further is
+            // narrowed by guesswork. The matched name is REPORTED in the reason
+            // string instead: a future ambient animation that happens to be
+            // named "…pulse…" AND renders visibly would cost the weakest done
+            // rung and nothing else, and the log would name the culprit.
             if (!hasRunningWeak) {
-                const animated = document.querySelectorAll('[class*="animate"], [class*="spin"], [class*="pulse"], [class*="loading"]');
-                for (const el of animated) {
-                    if (el.offsetParent === null) continue;
-                    if (typeof el.getAnimations !== 'function') continue;
-                    const anims = el.getAnimations();
-                    if (anims.some(a => a.playState === 'running')) { hasRunningWeak = true; break; }
+                const RUN_RE = /pulse|spin|loading|shimmer/i;
+                let anims = [];
+                try {
+                    anims = (typeof document.getAnimations === 'function')
+                        ? document.getAnimations() : [];
+                } catch (e) { anims = []; }
+                for (const a of anims) {
+                    if (a.playState !== 'running') continue;
+                    const nm = String(a.animationName || '');
+                    if (!RUN_RE.test(nm)) continue;
+                    const el = a.effect && a.effect.target;
+                    if (!el || typeof el.getBoundingClientRect !== 'function') continue;
+                    // ⭐ THE RECT IS THE VISIBILITY GATE HERE, not offsetParent.
+                    // A browser returns an all-zero rect for anything in a
+                    // display:none subtree, so the two tests agree on every
+                    // state this tier can see — except position:fixed, which has
+                    // NO offsetParent and is perfectly visible. In a tier whose
+                    // whole job is noticing that something still moves, a guard
+                    // whose only distinct effect is a FALSE NEGATIVE is the wrong
+                    // guard. (The stop scan above keeps both, for the opposite
+                    // reason: there a misread lands on the safe side.)
+                    // Measured: mdc-circular-progress-left-spin/right-spin DO
+                    // match the name regex on a completed page and are 0×0.
+                    const r = el.getBoundingClientRect();
+                    if (r.width <= 0 || r.height <= 0) continue;
+                    hasRunningWeak = true;
+                    // ⭐ THE RESPONSE-REGION SCOPE IS REPORTED, NOT ENFORCED, and
+                    // that is a deliberate choice rather than a half-done one.
+                    // Scoping the SEARCH to model-response nodes was the obvious
+                    // belt-and-braces — but the ancestry of Gemini's `item-line`
+                    // skeletons is NOT in either capture, so a positive scope
+                    // could just as easily be a guard that cannot fire, which is
+                    // this file's most frequently repeated defect. The
+                    // visibility gate is measured-sufficient on its own (zero
+                    // visible matches after completion, exactly one during), so
+                    // the scope rides along as EVIDENCE: the reason string says
+                    // whether the winning animation was inside a response node,
+                    // and that is precisely the measurement someone needs to
+                    // turn it into a gate without guessing.
+                    let inResponse = false;
+                    try {
+                        inResponse = !!(el.closest && el.closest(
+                            'message-content, .model-response-text, model-response'));
+                    } catch (e) { inResponse = false; }
+                    runningWeakVia = 'anim:' + nm.slice(-32)
+                        + (inResponse ? ' in-response' : ' page-wide');
+                    break;
                 }
             }
 
@@ -27605,7 +28574,8 @@ async def detect_completion_gemini(page):
             const steps = document.querySelectorAll(
                 '[class*="research-step"], [class*="thought"]'
             ).length;
-            return { hasStopExplicit, hasRunningWeak, hasStartBtn, hasShareExport,
+            return { hasStopVisible, hasStopHidden, hasRunningWeak, runningWeakVia,
+                     hasStartBtn, hasShareExport,
                      reportButtonTrio, completedChatText, textLen, sources, steps };
         }""")
 
@@ -27614,29 +28584,50 @@ async def detect_completion_gemini(page):
         steps = int(data.get("steps") or 0)
         snap = {"text_len": text_len, "sources": sources, "steps": steps}
 
-        # 2026-07-13 decision order (stale-gate fix — see docstring):
-        #   explicit Stop → veto everything
+        # 2026-07-13 decision order (stale-gate fix — see docstring), with the
+        # 2026-08-19 stop split folded in:
+        #   VISIBLE Stop → veto everything
         #   trio / completion chat line → DONE (done-only UI; a lingering
-        #     plan-bubble Start button or a finished-chrome animation must
-        #     not hold these hostage — both E2E runs lost 10-14 min here)
-        #   weak running signals → veto the weaker paths below
-        #   visible Start button → pre-research gate
+        #     plan-bubble Start button, a finished-chrome animation or a HIDDEN
+        #     leftover stop must not hold these hostage — both 07-13 E2E runs
+        #     lost 10-14 min here)
+        #   weak running signals — the animation tier, then a HIDDEN stop →
+        #     veto the weaker paths below
+        #   visible Start button → pre-research gate (or, when a running-verify
+        #     already confirmed this agent, an honest stale-Start label)
         #   Share & Export alone → done (pre-2026-07 marker, weakest)
-        if data.get("hasStopExplicit"):
+        #
+        # ⛔ THE HIDDEN STOP BELONGS HERE AND NOWHERE HIGHER. Ranked above the
+        # done markers it would be the 90-minute timeout the 08-19 measurement
+        # caught before it shipped; ranked here the worst it can ever cost is
+        # the weakest done rung.
+        if data.get("hasStopVisible"):
             return (False, f"stop_btn_present (text={text_len})", snap)
         stale_bits = []
         if data.get("hasStartBtn"):
             stale_bits.append("stale start-btn overridden")
         if data.get("hasRunningWeak"):
             stale_bits.append("weak running-signal overridden")
+        if data.get("hasStopHidden"):
+            stale_bits.append("hidden stop-btn overridden")
         stale = f" ({'; '.join(stale_bits)})" if stale_bits else ""
         if data.get("reportButtonTrio"):
             return (True, f"no_stop + report_button_trio (Contents/Share & Export/Create){stale}", snap)
         if data.get("completedChatText"):
             return (True, f"no_stop + completed_chat_text{stale}", snap)
         if data.get("hasRunningWeak"):
-            return (False, f"running_weak_signal (text={text_len})", snap)
+            return (False, f"running_weak_signal ({data.get('runningWeakVia') or 'unnamed'}"
+                           f", text={text_len})", snap)
+        if data.get("hasStopHidden"):
+            return (False, f"running_hidden_stop_btn (text={text_len})", snap)
         if data.get("hasStartBtn"):
+            # ⭐ The verbatim string below stays EXACTLY as it was: on 2026-08-17
+            # it named this state correctly once a minute for ninety minutes,
+            # and that run is the reason `running_confirmed` gates it instead of
+            # replacing it.
+            if running_confirmed:
+                return (False, f"stale_start_btn_no_done_marker (running already "
+                               f"confirmed; text={text_len})", snap)
             return (False, "start_research_btn_visible (pre-research)", snap)
         if data.get("hasShareExport"):
             return (True, "no_stop + share_export_visible", snap)
@@ -28821,6 +29812,11 @@ async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None,
 
 
 _p1_src_dbg_dumped = False  # one-shot guard for the #P1-src-dbg panel DOM capture
+# 2026-08-19: last shape reported by the inline-walk diagnostic. A SIGNATURE, not
+# a counter — a walk that keeps failing the same way says so once, and a walk that
+# starts failing a NEW way says so immediately. Yesterday's 412-line DEBUG flood
+# is what this is guarding against.
+_p1_inline_dbg_sig = ""
 # #P2-panel-dbg (DGOPS-9614): bounded to two dumps per process, and the previous
 # sample's signature so "identical to last time" is decidable at all.
 _p2_panel_dbg_dumps = 0
@@ -29376,17 +30372,46 @@ async def scrape_chatgpt_activity_panel_tracking(page):
         except Exception as _ie:
             log(f"[ChatGPT] inline activity walker failed: {_ie}", "DEBUG")
             il = None
+        # 2026-08-19: `chips` joins the has-anything test. A P1 drawer that is
+        # open on its very first sample carries a chip row and NOTHING ELSE — no
+        # verb row has streamed yet — and the old test would have thrown that
+        # sample away, which is the one sample that proves the drawer is open.
         if il and (il.get("steps") or il.get("source_urls")
-                   or il.get("progress") or int(il.get("searches", 0) or 0)):
+                   or il.get("progress") or int(il.get("searches", 0) or 0)
+                   or int(il.get("chips", 0) or 0)):
             res = {
                 "steps": il.get("steps") or [],
                 "sections": il.get("sections") or [],
                 "source_urls": il.get("source_urls") or [],
+                "source_items": [],
                 "searches": int(il.get("searches", 0) or 0),
                 "partial_text_len": int(il.get("partial_text_len", 0) or 0),
                 "progress": il.get("progress") or "",
                 "panel_shape": "inline",
+                "chips": int(il.get("chips", 0) or 0),
+                "chip_row": bool(il.get("chip_row")),
+                "inline_dbg": il.get("dbg") or {},
             }
+            # Titles for the anchors the inline walker DID find, so a real page
+            # url is never demoted to a bare domain by arriving without one.
+            for _u in res["source_urls"]:
+                res["source_items"].append({"url": _u, "title": ""})
+            _merge_host_chips(res, il.get("source_hosts") or [])
+        elif il:
+            # ⭐ The walk produced nothing — say what it looked at. Sparse ON
+            # PURPOSE: the same instinct un-sparsely applied is what put 412
+            # identical DEBUG lines into yesterday's bundle, so this fires only
+            # when the shape of the answer CHANGES, not once per poll.
+            global _p1_inline_dbg_sig
+            _d = il.get("dbg") or {}
+            _sig = (f"{_d.get('scope', '?')}|{_d.get('turnTag', '?')}|"
+                    f"{_d.get('cands', 0)}|{_d.get('chipsProse', 0)}")
+            if _sig != _p1_inline_dbg_sig:
+                _p1_inline_dbg_sig = _sig
+                log(f"[ChatGPT] inline walk found nothing — scope="
+                    f"{_d.get('scope', '?')} turn={_d.get('turnTag', '?')} "
+                    f"lub={_d.get('lub', -1)} cands={_d.get('cands', 0)} "
+                    f"chips_in_prose={_d.get('chipsProse', 0)}", "DEBUG")
     if not res:
         return None
     has_data = (
@@ -30700,7 +31725,24 @@ async def _verify_chatgpt_generating_diag(page) -> str:
 
 
 async def verify_gemini_generating(page) -> bool:
-    """Check if Gemini is actively generating — broad stop button + animation detection."""
+    """Check if Gemini is actively generating — broad stop button + animation detection.
+
+    ⛔⛔ DO NOT ADD A VISIBILITY GATE TO THE BUTTON SCAN BELOW. It looks like the
+    obvious missing guard — the Start scans in scrape_progress_gemini and
+    detect_completion_gemini both have one, and this function has none — and
+    adding it would break the one Gemini probe that works. Measured 2026-08-19 on
+    a live Deep Research: the ONLY stop-ish control in the document while Gemini
+    researches is `<button aria-label="Stop response">` with offsetParent null
+    and a 0×0 box. This scan lowercases the attributes, so it matches that button
+    and returns True — which is why "[2D] Gemini is researching ✓" fires at all.
+    A visibility gate here would reject the only evidence there is, and 2D would
+    fall through to "may not be running" on every healthy run.
+
+    ⭐ The asymmetry is correct rather than sloppy: this function answers "is it
+    alive", where a hidden stop is good enough evidence, while
+    detect_completion_gemini answers "is it finished", where the same button must
+    never veto a done-marker. Same DOM fact, two different questions, two
+    different rankings — see the stop-split note in that detector."""
     try:
         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         await asyncio.sleep(0.3)
@@ -32191,7 +33233,12 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                 if (label in ("Phase1", "Phase1-followup") and _panel_open_done):
                     try:
                         _st_now = await _chatgpt_activity_state(page)
-                        if not (_st_now.get("side_panel") or _st_now.get("inline_expanded")):
+                        # ⛔⛔ 2026-08-19 — THIS LINE UN-LATCHED AN OPEN DRAWER. At
+                        # 02:59:32, 31 seconds after CUA opened the chip row, this
+                        # said "collapsed" and handed the toggle back to the
+                        # opener, which then clicked it eight times. The chip row
+                        # is what P1 opens, so P1 has to be able to see it.
+                        if not _chatgpt_p1_activity_open(_st_now):
                             _panel_reopens += 1
                             if _panel_reopens <= 3:
                                 _panel_open_done = False
@@ -32210,11 +33257,13 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                         # skeleton-only Activity panel it had already opened.
                         # NEVER click while a shape is open.
                         _st_pre = await _chatgpt_activity_state(page)
-                        if _st_pre.get("side_panel") or _st_pre.get("inline_expanded"):
+                        if _chatgpt_p1_activity_open(_st_pre):
                             _panel_open_done = True
-                            _shape = "side" if _st_pre.get("side_panel") else "inline"
-                            log(f"[{label}] activity already open (shape={_shape}) at "
-                                f"elapsed={elapsed_sec}s — no click needed")
+                            _shape = _chatgpt_open_shape(_st_pre)
+                            log(f"[{label}] activity already open (shape={_shape}"
+                                + (f", {_st_pre.get('inline_chips', 0)} chips"
+                                   if _shape == "chips" else "")
+                                + f") at elapsed={elapsed_sec}s — no click needed")
                             res = None
                         else:
                             res = await _open_chatgpt_activity_panel(
@@ -32240,11 +33289,10 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                         elif res.get("clicked"):
                             await asyncio.sleep(2.0)
                             _st_post = await _chatgpt_activity_state(page)
-                            verified = bool(_st_post.get("side_panel")
-                                            or _st_post.get("inline_expanded"))
+                            verified = _chatgpt_p1_activity_open(_st_post)
                             if verified:
                                 _panel_open_done = True
-                                _shape = "side" if _st_post.get("side_panel") else "inline"
+                                _shape = _chatgpt_open_shape(_st_post)
                                 log(f"[{label}] activity opened via DOM at "
                                     f"elapsed={elapsed_sec}s — shape={_shape} "
                                     f"anchor={res.get('anchor', res.get('scope', '?'))} "
@@ -32257,10 +33305,24 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                                                      dom_ground_truth=_dom_gt_from_res(res))
                             else:
                                 _panel_dom_misses += 1
-                                log(f"[{label}] DOM clicked but neither panel nor inline "
-                                    f"drawer verified — miss #{_panel_dom_misses} "
+                                # ⭐ THE CHIP DELTA, because "not verified" is
+                                # ambiguous in the one way that matters: the press
+                                # is a TOGGLE, so a miss can mean we failed to
+                                # open OR that we just CLOSED what was already
+                                # open. On 19 August it meant the second thing,
+                                # eight times, and no line said so. Diagnostic
+                                # only — a restoring click is a behaviour change
+                                # and does not belong in the same wave as the fix
+                                # that makes it unnecessary.
+                                _cb = int(_st_pre.get("inline_chips", 0) or 0)
+                                _ca = int(_st_post.get("inline_chips", 0) or 0)
+                                log(f"[{label}] DOM clicked but no activity shape "
+                                    f"verified — miss #{_panel_dom_misses} "
                                     f"(anchor={res.get('anchor', res.get('scope', '?'))} "
-                                    f"label=\"{res.get('label','')[:60]}\")", "WARN")
+                                    f"label=\"{res.get('label','')[:60]}\" "
+                                    f"chips {_cb}->{_ca}"
+                                    + (" ⛔ THE PRESS CLOSED AN OPEN DRAWER"
+                                       if _ca < _cb else "") + ")", "WARN")
                                 if _panel_dom_misses in (2, 5):
                                     await _log_chatgpt_thread_snapshot(page, tag=f"p1-miss{_panel_dom_misses}")
                         else:
@@ -32293,13 +33355,30 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                             return await asyncio.wait_for(
                                 agent_loop(cua_client, browser,
                                     PROMPT_OPEN_CHATGPT_SOURCE_PANEL,
+                                    # ⛔⛔ 2026-08-19 — REWRITTEN AGAINST THE LIVE UI.
+                                    # The old text promised a right-side "Activity ·
+                                    # <seconds>" panel. That panel is GONE from P1:
+                                    # the press expands a row of website chips under
+                                    # the line, in the conversation. CUA reported the
+                                    # truth twice while the instruction said otherwise
+                                    # ("An inline activity section has expanded ...
+                                    # showing the source URLs", 02:59:01), so the two
+                                    # verifiers disagreed about the same open drawer.
+                                    # Telling the model to expect a panel that cannot
+                                    # appear is an instruction to keep clicking.
                                     "Open the research activity for the latest response in "
                                     "this ChatGPT Pro/Thinking conversation: click the "
                                     "shimmering status line directly below the last sent "
-                                    "message. ONE click only — it is a toggle. Expected "
-                                    "result: a NARROW 'Activity · <seconds>' panel on the "
-                                    "right — even if it only shows gray skeleton bars, "
-                                    "that IS open. Never click 'Answer now' or the X.",
+                                    "message — whatever its wording, the shimmer is the "
+                                    "target. ONE click only — it is a toggle. Expected "
+                                    "result: a row of small website chips (favicon + "
+                                    "domain, e.g. a few site names side by side, possibly "
+                                    "ending in an 'N more' chip) appears INLINE directly "
+                                    "under that line. If those chips are ALREADY showing, "
+                                    "it is already open — do not click at all. A right-"
+                                    "side panel is a valid outcome too but is not what "
+                                    "this mode does any more. Never click 'Answer now', "
+                                    "the X, or a chip.",
                                     model=CUA_MODEL, max_iterations=5,
                                     verbose=verbose, target_page=page),
                                 timeout=120.0)
@@ -32369,6 +33448,27 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                                     _title = (_it.get("title") or _prev.get("title") or "").strip()
                                     _by_url[_it["url"]] = {"url": _it["url"], "title": _title}
                                 progress["source_items"] = list(_by_url.values())[:_SOURCE_LIST_CAP]
+                            # ⛔ AFTER both merges, never before: the placeholder
+                            # and the real page for a host arrive on different
+                            # polls, so the only list that can be cleaned is the
+                            # accumulated one. `sources` is recomputed here rather
+                            # than above because it is the number the owner
+                            # compares against ChatGPT's own "Searched N
+                            # websites", and a stale count is worse than none.
+                            # ⛔ The chip-host set accumulates too. A host taken
+                            # from a chip on poll 2 must still be prunable on
+                            # poll 12, when the panel finally yields a page on it —
+                            # and a bare URL this run never saw as a chip is
+                            # somebody's real homepage citation and is never touched.
+                            progress["chip_hosts"] = sorted(
+                                set(progress.get("chip_hosts") or [])
+                                | set(_pd.get("chip_hosts") or []))
+                            progress["source_urls"], progress["source_items"] = (
+                                _drop_covered_host_placeholders(
+                                    progress.get("source_urls") or [],
+                                    progress.get("source_items") or [],
+                                    progress["chip_hosts"]))
+                            progress["sources"] = len(progress.get("source_urls", []) or [])
                             _ps = int(_pd.get("searches", 0) or 0)
                             if _ps > int(progress.get("searches", 0) or 0):
                                 progress["searches"] = _ps
@@ -32380,7 +33480,13 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                                 log(f"[{label}] panel tracking (P1): "
                                     f"{len(_pd.get('source_urls', []) or [])} URLs, "
                                     f"{len(_pd.get('steps', []) or [])} steps, "
-                                    f"searches={_pd.get('searches', 0)}")
+                                    f"searches={_pd.get('searches', 0)} "
+                                    # shape + chips: the 19 August phase logged
+                                    # this line ZERO times in 13.7 minutes, so
+                                    # when it next goes quiet the shape it was
+                                    # reading has to be part of the record.
+                                    f"shape={_pd.get('panel_shape', '?')} "
+                                    f"chips={_pd.get('chips', 0)}")
                     except Exception as _pw:
                         log(f"[{label}] P1 panel walk failed: {_pw}", "DEBUG")
 
@@ -34814,6 +35920,15 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # slow plan) — the Gemini leg watches for a late 'Start research'
             # button and clicks it, or clears the watch once verified running.
             "gemini_watch_start": bool(agent.get("gemini_watch_start")),
+            # 2026-08-19: did ANY probe ever confirm this agent actually
+            # RUNNING? Read by detect_completion_gemini's last resort so it
+            # stops calling a started run "pre-research".
+            # ⛔ NOT "did we click Start". That was true in the 2026-08-17
+            # ninety-minute failure as well — the click reported success and the
+            # verify disagreed — and `pre-research` was the CORRECT label there.
+            # A confirmed running verify is the ONE fact that separates the run
+            # that started from the run that never did.
+            "gemini_running_confirmed": bool(agent.get("verified")),
         }
         # Register for mid-run input dispatcher
         platform_key = name.lower().replace(" ", "")
@@ -35991,6 +37106,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 try:
                     if await verify_gemini_generating(p["page"]):
                         p["needs_start_verify"] = False
+                        p["gemini_running_confirmed"] = True
                         emit_event("agent_progress", phase=2, agent="gemini",
                                    status="generating", stage="researching",
                                    progress="Gemini Deep Research plan created and started")
@@ -36044,6 +37160,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                    or await _gemini_research_started(p["page"]))
                     if _ws_running:
                         p["gemini_watch_start"] = False
+                        p["gemini_running_confirmed"] = True
                         log("[Gemini] Watch-start: research is running/complete "
                             "(auto-started without a Start click) — watch cleared ✓")
                         emit_event("agent_progress", phase=2, agent="gemini",
@@ -37161,6 +38278,22 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             no_growth_secs = time.time() - p["last_growth_time"]
             since_warn = time.time() - p["stuck_warned_at"]
             _active_statuses = ("planning", "thinking", "researching", "searching")
+            # ⛔⛔ 2026-08-19 — NOT ONE OF THOSE FOUR VALUES IS EVER PRODUCED. All
+            # three scrapers in SCRAPE_FNS emit exactly `generating`, `complete`,
+            # `idle` or `scrape_error`, so the status half of `status_is_active`
+            # below has never once been true for any platform: the ONLY live gate
+            # is `_scrape_phase == "planning"`. That is why the 08-19 e2e met the
+            # 15-minute no-growth arbiter while Gemini was researching perfectly
+            # happily, and it is a SEPARATE cause from the detector misses fixed
+            # in detect_completion_gemini the same day — the arbiter never reads
+            # the detector's verdict or its reason.
+            # ⛔ AND THE FIX IS NOT TO ADD "generating" HERE. The note below
+            # already explains why a broad liveness signal must not gate L1: the
+            # scraper reports movement off stale panel steps on a frozen page, so
+            # widening this list silences the stuck arbiter entirely — the
+            # promote-a-skipped-low-into-a-healthy-leg-killer shape. Left dead
+            # and documented on purpose; deciding what "active" should mean needs a
+            # judgement about which evidence is trustworthy, not a wider tuple.
             # #929: also honor the scraper's separate `phase` field — but ONLY
             # for "planning". Gemini's scraper never returns status="planning"
             # (its plan states read status='generating' with the planning
@@ -37666,8 +38799,16 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         await asyncio.sleep(0.4)  # let the virtualizer render the newly-visible range
                     except Exception:
                         pass
+                # 2026-08-19: Gemini's last-resort reason used to assert
+                # "pre-research" about a run whose start we had confirmed ten
+                # seconds earlier. The fact lives on the per-agent state, so it
+                # is passed here rather than re-derived from the DOM — a DOM
+                # re-derivation would be a fourth opinion about a question three
+                # probes have already answered.
+                _detect_kw = ({"running_confirmed": bool(p.get("gemini_running_confirmed"))}
+                              if name == "Gemini" else {})
                 try:
-                    dom_done, dom_reason, snap = await detect_fn(p["page"])
+                    dom_done, dom_reason, snap = await detect_fn(p["page"], **_detect_kw)
                 except Exception as _de:
                     log(f"[{name}] detect_completion error: {_de}", "WARN")
                     dom_done, dom_reason, snap = (False, f"detect_error: {_de}", {})
@@ -37680,10 +38821,17 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     # isn't confirming done, throttled to ~2 min so a long run
                     # doesn't spam backend.log. Makes "stuck despite complete" a
                     # one-grep root-cause from the log alone (distinguishes
-                    # stop_btn_present / animate-pulse vs no_done_marker vs the
-                    # empty-snapshot guard) — the old code logged nothing on the
-                    # persistent not-done path, which is why this stall needed a
-                    # code read to diagnose.
+                    # stop_btn_present / running_weak_signal / no_done_marker /
+                    # the empty-snapshot guard) — the old code logged nothing on
+                    # the persistent not-done path, which is why this stall
+                    # needed a code read to diagnose.
+                    # ⭐ 2026-08-19: Gemini's reasons now carry WHICH signal
+                    # spoke — `running_weak_signal (anim:…_pulse, …)`,
+                    # `running_hidden_stop_btn`, `stale_start_btn_no_done_marker`
+                    # — because the 08-19 stall was diagnosed from a reason
+                    # string that named a state the run had already disproved.
+                    # A reason that names its evidence is the difference between
+                    # a grep and a code read.
                     _nd_now = time.time()
                     if _nd_now - p.get("last_notdone_log_at", 0.0) >= 120:
                         p["last_notdone_log_at"] = _nd_now
@@ -37726,7 +38874,8 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                             f"in {_confirm_secs}s (skipping wait for next main-rotation tick)")
                         await asyncio.sleep(_confirm_secs)
                         try:
-                            dom_done2, dom_reason2, snap2 = await detect_fn(p["page"])
+                            dom_done2, dom_reason2, snap2 = await detect_fn(
+                                p["page"], **_detect_kw)
                         except Exception as _de2:
                             log(f"[{name}] fast-confirm detect_completion error: {_de2}", "WARN")
                             dom_done2, dom_reason2, snap2 = (False, f"detect_error: {_de2}", {})
@@ -61165,18 +62314,41 @@ async def run_server(port=8000):
         # which owns that decision so a test can assert it without a 60s wait.
         async def _aegis_pulse_loop():
             i = 0
+            # ⛔⛔ THE TICK STAYS AT 60s AND THE EMISSION WIDENS. Those are two
+            # different decisions and collapsing them would be a bug: the state
+            # check is what notices a broken watch, so slowing the TICK would
+            # delay the alarm this loop exists to raise. `Suppressor` restarts
+            # its cadence the moment the state string changes, so a transition
+            # up→down speaks on the very next tick however quiet it had become.
+            _quiet = logquiet.Suppressor()
+            _last_state = None
+            _state_since = time.time()
             try:
                 while True:
                     await asyncio.sleep(60)
-                    if not _QUEUE_STATE.get("running"):
-                        _cut_off = _firebase_db is None
-                        _since = _firestore_down_since_ts
-                        log(_aegis_pulse_line(
-                            WORKER_ID, i,
-                            down_for=((time.time() - _since) if _since else 0.0)
-                            if _cut_off else None,
-                        ), "WARN" if _cut_off else "INFO")
-                        i += 1
+                    if _QUEUE_STATE.get("running"):
+                        # A run is in flight and the job worker is already
+                        # chatty. Skipped WITHOUT consulting the suppressor, so a
+                        # two-hour run does not read as a state change and reset
+                        # the cadence back to one line a minute afterwards.
+                        continue
+                    _cut_off = _firebase_db is None
+                    _since = _firestore_down_since_ts
+                    _state = "down" if _cut_off else "up"
+                    if _state != _last_state:
+                        _last_state = _state
+                        _state_since = time.time()
+                    _emit, _dropped = _quiet.consider("aegis-pulse", _state)
+                    if not _emit:
+                        continue
+                    log(_aegis_pulse_line(
+                        WORKER_ID, i,
+                        down_for=((time.time() - _since) if _since else 0.0)
+                        if _cut_off else None,
+                        up_for=None if _cut_off else (time.time() - _state_since),
+                        suppressed=_dropped,
+                    ), "WARN" if _cut_off else "INFO")
+                    i += 1
             except asyncio.CancelledError:
                 return
         asyncio.create_task(_aegis_pulse_loop())
@@ -69338,17 +70510,29 @@ def _doctor_share_logs_line() -> str:
     point at the way to hand it over — "so the user would know that he can share
     the logs on failure to the dev team and get it sorted".
     ⭐ 2026-08-18, WAVE 2: the command now exists, so this line names it. Until
-    today it deliberately did NOT — naming a command that was not there is the
-    exact defect this wave set out to remove, and the test that pinned its
-    absence flips in this same commit, which is how it was designed to work.
+    then it deliberately did NOT — naming a command that was not there is the
+    exact defect that wave set out to remove.
 
-    The FILE is still named, and second: `--send-logs` needs a shell, and the
-    person reading this may not have one open. Report Bug stays as the third
-    route because it needs neither.
+    ⛔⛔ 2026-08-19, OWNER DECISION: THE MIDDLE ROUTE IS GONE. It read "or send the
+    file yourself — ~/.super-research/logs/backend.log", and that file is the
+    WORST answer available on three counts, measured on this machine:
+      • 44 MB — not emailable, and the one file that carries no dates at all;
+      • it is only the raw stdout capture. It contains NONE of the per-run folders
+        and NONE of the session logs, which are the evidence worth having;
+      • `--send-logs`, named one clause earlier, writes ~600 KB containing all
+        three and prints where it put it.
+    So the route existed to spare someone a terminal, and spent that on sending
+    the least useful bytes on the disk while omitting the best. Report Bug already
+    covers "no terminal", so dropping it loses no reach.
+
+    ⭐ AND THE FILE IS STILL OFFERED — by the command itself. `cmd_send_logs`
+    writes the bundle FIRST and prints its path whether or not the upload lands
+    ("Rung 0: the file. Always, first, and printed"), so a person with no network
+    is told what to attach without this line having to guess a path.
     """
-    return (f"Still stuck? Run {_PROG} --send-logs to hand your logs to us, "
-            f"or send the file yourself — {_STATE_DIR / 'logs' / 'backend.log'} "
-            f"— or use Report Bug on the web app's Settings page.")
+    return (f"Still stuck? Run {_PROG} --send-logs — it packs your logs into one "
+            f"file, sends it if it can, and prints where the file is if it cannot. "
+            f"No terminal? Use Report Bug on the web app's Settings page.")
 
 
 def _remedy_serve() -> str:

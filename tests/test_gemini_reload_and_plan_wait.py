@@ -113,7 +113,15 @@ def test_detector_has_guarded_running_animation_tier():
     # persisted/finished animations on UI chrome can't hold it hostage.
     assert "getAnimations" in DETECT_SRC
     assert "offsetParent" in DETECT_SRC
-    assert "playState === 'running'" in DETECT_SRC
+    assert "playState" in DETECT_SRC
+    # 2026-08-19: the tier now asks `document.getAnimations()` and matches the
+    # animation NAME — Gemini's live skeletons are class="…item-line…" and carry
+    # `pulse` in the name, so the old class-based selector saw four visibly
+    # pulsing rows as a still page. The guards this test was written for are
+    # unchanged in substance and are now EXECUTED against both live captures in
+    # tests/test_gemini_stop_split_0819.py, which is the only place a
+    # wrong-attribute selector can actually be caught.
+    assert "a.animationName" in DETECT_SRC
 
 
 def test_detector_still_gates_on_start_button():

@@ -46,7 +46,11 @@ T = "tests/test_telemetry_0818.py"
 # attribution bugs. A harness scoped to its own file alone reported those as
 # suite gaps when the suite covers them — the harness had the gap.
 T_STRANDED = "tests/test_telemetry_stranded_batch_0818.py"
-ALL = [T, T_STRANDED]
+# ⛔ 2026-08-19 — the log-noise wave bounded the mirror and put a cadence on the
+# accessor line. A harness scoped to its own file alone would report both as
+# suite gaps when the suite covers them; that was this harness's own lesson.
+T_NOISE = "tests/test_log_noise_0819.py"
+ALL = [T, T_STRANDED, T_NOISE]
 
 PY = str(ROOT / ".venv" / "bin" / "python")
 _TEST_TIMEOUT_S = 600
@@ -176,9 +180,51 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str], str]] = [
      "until the disk is the problem",
      [('    if len(lines) <= SPOOL_MAX_LINES:\n        return',
        '    if True:\n        return')], [T], SRC),
+    # ⛔ RE-ANCHORED 2026-08-19. This matched TWICE once the mirror grew a trim of
+    # its own — a duplicated policy is exactly where this mutant could have
+    # survived, in whichever copy the assertion did not reach. The polarity now
+    # has ONE definition and this anchors it, so both bounded files are covered.
     ("T2", "over", "⛔ the NEWEST half is dropped — exactly the events describing "
-     "whatever is going wrong right now",
-     [('    keep = lines[len(lines) // 2:]', '    keep = lines[:len(lines) // 2]')], [T], SRC),
+     "whatever is going wrong right now, in BOTH bounded files at once",
+     [('    return lines[len(lines) // 2:]', '    return lines[:len(lines) // 2]')],
+     [T, T_NOISE], SRC),
+    ("T8", "under", "⛔⛔ the sent-mirror is unbounded again — 2,568,739 bytes "
+     "measured on one machine, in a directory the Clear-logs button cannot reach",
+     [('        if size > MIRROR_MAX_BYTES:\n            _trim_mirror(path)',
+       '        pass')], [T_NOISE], SRC),
+    # ⛔ RE-ANCHORED: the trim became a temp-file + `os.replace` once it turned out
+    # this file is shared by every process while the spool is not.
+    ("T9", "over", "the mirror gains a synthetic dropped-count envelope, putting "
+     "a line in 'what left this machine' that never left",
+     [('    keep = _oldest_half_dropped(lines)\n    tmp = path.with_name(',
+       '''    keep = _oldest_half_dropped(lines)
+    keep.append(json.dumps(
+        _envelope({"ev": int(Ev.TELEMETRY_DROPPED), "d": {"count": 1}}),
+        separators=(",", ":")))
+    tmp = path.with_name(''')], [T_NOISE], SRC),
+    ("T10", "under", "the mirror trim reads the whole file on EVERY event, putting "
+     "a megabyte-sized read in the path of every event a run emits",
+     [('            size = fh.tell()', '            size = MIRROR_MAX_BYTES + 1')],
+     [T_NOISE], SRC),
+    ("T11", "under", "⛔⛔ the mirror is rewritten IN PLACE. This file is shared by "
+     "every process, so a reader can catch it mid-rewrite — and a fragment of "
+     "JSONL is unreadable rather than short",
+     [('    tmp = path.with_name(f"{path.name}.trim.{os.getpid()}")\n'
+       '    try:\n'
+       '        tmp.write_text("\\n".join(keep) + "\\n", encoding="utf-8")\n'
+       '        os.replace(str(tmp), str(path))',
+       '    try:\n'
+       '        path.write_text("\\n".join(keep) + "\\n", encoding="utf-8")')],
+     [T_NOISE], SRC),
+    ("T12", "under", "a failed trim leaves its temp file behind, so the directory "
+     "the Clear-logs button reports as empty accumulates one file per attempt",
+     [('    except OSError:\n        try:\n            tmp.unlink()\n'
+       '        except OSError:\n            pass',
+       '    except OSError:\n        pass')], [T_NOISE], SRC),
+    ("T13", "under", "two processes trimming at once write to the SAME temp name, "
+     "so one lands a file the other is still writing",
+     [('f"{path.name}.trim.{os.getpid()}"', 'f"{path.name}.trim"')],
+     [T_NOISE], SRC),
     ("T3", "under", "the drop is silent, so a count nobody can trust reads as a "
      "complete record",
      [('''    keep.append(json.dumps(
@@ -228,9 +274,23 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str], str]] = [
      "route's verifier does not accept — every batch stores unattributed",
      [('        headers["Authorization"] = f"Bearer {token}"',
        '        headers["Authorization"] = f"Firebase {token}"')], [T, T_STRANDED], SRC),
+    # ⛔ RE-ANCHORED 2026-08-19: the line gained a suppressed-count suffix and an
+    # emission gate when it turned out to be 33.9% of a session log's bytes. The
+    # premise is unchanged — deleting the line makes a build fault
+    # indistinguishable from a signed-out machine — so the mutant now removes the
+    # whole guarded emit rather than the bare `log.debug`.
     ("D6c", "under", "a missing id-token ACCESSOR goes back to being "
      "indistinguishable from a signed-out machine",
-     [('        log.debug("telemetry: no id-token accessor (%s) — batches will be "\n                  "anonymous", type(exc).__name__)\n', '')], [T, T_STRANDED], SRC),
+     [('''        if emit:
+            log.debug("telemetry: no id-token accessor (%s) — batches will be "
+                      "anonymous%s", type(exc).__name__,
+                      logquiet.suppressed_note(dropped))
+''', '')], [T, T_STRANDED, T_NOISE], SRC),
+    ("D6d", "under", "⛔⛔ the accessor line loses its cadence and goes back to "
+     "412 copies in one session log — 33.9% of its bytes",
+     [('        emit, dropped = _ID_TOKEN_QUIET.consider(\n'
+       '            "no-id-token-accessor", type(exc).__name__)',
+       '        emit, dropped = True, 0')], [T_NOISE], SRC),
 
     # ══ transparency and the switch ═════════════════════════════════════
     ("M1", "under", "the local mirror stops being written, so the claim that a "
