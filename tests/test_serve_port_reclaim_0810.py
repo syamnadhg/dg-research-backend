@@ -26,6 +26,7 @@ The tests for the second property are the ones worth having.
 """
 import ast
 import re
+import signal
 import sys
 from pathlib import Path
 
@@ -225,8 +226,20 @@ def test_ours_but_immovable_is_reported_stuck_not_silently_ignored(monkeypatch):
     state, _ = R._reclaim_port(8000)
     assert state == "stuck"
     sigs = [s for _, s in st["signalled"]]
-    assert len(sigs) == 2, f"expected TERM then KILL, got {sigs}"
-    assert sigs[0] != sigs[1], "escalation must be a different signal, not a repeat"
+    assert len(sigs) == 2, f"expected a stop then a forced stop, got {sigs}"
+    if hasattr(signal, "SIGKILL"):
+        assert sigs[0] != sigs[1], "escalation must be a different signal, not a repeat"
+    else:
+        # ⛔ WINDOWS. There is no signal harder than the first one: os.kill()
+        # maps everything except CTRL_*_EVENT onto TerminateProcess, so the
+        # forced stop IS SIGTERM again and "a different signal" cannot exist.
+        # What still must hold -- and what actually broke -- is that a SECOND,
+        # deliberate attempt happens at all. Naming _sig.SIGKILL raised
+        # AttributeError into a blanket except, so the escalation loop sent
+        # NOTHING while logging that it was escalating.
+        assert sigs[1] == signal.SIGTERM, (
+            f"the forced stop must still be sent on a platform with no "
+            f"SIGKILL, got {sigs}")
 
 
 def test_an_unidentifiable_holder_is_waited_out_not_killed(monkeypatch):

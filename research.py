@@ -67123,11 +67123,19 @@ def _reclaim_port(port: int, settle_s: float = 12.0):
     for h in ours:
         log(f"[serve] pid {h['pid']} did not stop — escalating", "WARN")
         try:
-            os.kill(h["pid"], _sig.SIGKILL)
+            # ⛔ Windows has no SIGKILL. Naming it directly raised
+            # AttributeError, which the blanket `except Exception` below then
+            # SWALLOWED — so this loop logged "escalating" and sent nothing at
+            # all. A stop that neither works nor says so is the exact bug this
+            # path exists to close, wearing a new hat.
+            # os.kill() on Windows maps any signal other than CTRL_*_EVENT onto
+            # TerminateProcess, so SIGTERM here IS the forced stop; there is no
+            # harder one to escalate to.
+            os.kill(h["pid"], getattr(_sig, "SIGKILL", _sig.SIGTERM))
         except ProcessLookupError:
             pass
-        except Exception:
-            pass
+        except Exception as _ke:
+            log(f"[serve] forced stop of pid {h['pid']} failed: {_ke}", "WARN")
 
     # A killed listener leaves the socket in TIME_WAIT briefly; that is not a
     # failure, it is the kernel finishing up.
