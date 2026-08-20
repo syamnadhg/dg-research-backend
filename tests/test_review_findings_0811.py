@@ -229,7 +229,7 @@ def test_the_budget_guard_is_the_first_thing_in_narrate_panel():
     env/Firestore lookup — so with the budget at its DEFAULT of zero, a retired
     narrator paid for that on every call. A guard whose whole purpose is "do
     nothing" cannot live after the doing."""
-    narrate = (Path(__file__).resolve().parents[1] / "narrate.py").read_text()
+    narrate = (Path(__file__).resolve().parents[1] / "narrate.py").read_text(encoding="utf-8")
     tree = ast.parse(narrate)
     fn = next(n for n in ast.walk(tree)
               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -241,7 +241,7 @@ def test_the_budget_guard_is_the_first_thing_in_narrate_panel():
 
 
 def test_the_guard_still_counts_the_skip():
-    narrate = (Path(__file__).resolve().parents[1] / "narrate.py").read_text()
+    narrate = (Path(__file__).resolve().parents[1] / "narrate.py").read_text(encoding="utf-8")
     at = narrate.index("PHASE_BUDGET <= 0")
     assert "skipped_budget" in narrate[at:at + 200]
 

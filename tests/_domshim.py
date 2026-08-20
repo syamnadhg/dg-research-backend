@@ -626,7 +626,14 @@ def run_js(spec, fn_src: str, arg=None) -> dict:
         script = os.path.join(_d, "run.mjs" if "import " in js else "run.js")
         with open(script, "w", encoding="utf-8") as _f:
             _f.write(js)
-        p = subprocess.run([NODE, script], capture_output=True, text=True, timeout=60)
+        # ⚠ encoding="utf-8" is NOT optional. `text=True` alone decodes with the
+        # LOCALE codec, which on Windows is cp1252 -- and node always emits UTF-8.
+        # Any fixture carrying a non-Latin-1 byte (a curly quote, an em dash, a
+        # CJK title in a captured source row) then died with UnicodeDecodeError
+        # inside subprocess's reader THREAD, so it surfaced as an unrelated-looking
+        # error on every test in the file rather than a decode failure.
+        p = subprocess.run([NODE, script], capture_output=True, text=True,
+                           encoding="utf-8", timeout=60)
         if p.returncode != 0:
             raise AssertionError(f"node failed: {p.stderr}")
         return json.loads(p.stdout.strip().splitlines()[-1])

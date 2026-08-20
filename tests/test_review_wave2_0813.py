@@ -572,6 +572,14 @@ def test_the_narrator_still_gives_up_when_no_key_exists_anywhere(monkeypatch) ->
     monkeypatch.setitem(sys.modules, "research", shim)
     monkeypatch.delitem(sys.modules, "_sr_core", raising=False)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    # ⛔ "nowhere" has to include the Windows User-scope environment. The lookup
+    # under test is `os.environ.get(...) or _read_user_scope_env_safe(...)`, and
+    # deleting only the process variable leaves the second source live: on a
+    # Windows box whose owner actually has a Gemini key saved, the key resolves,
+    # narrate runs on past the gate, and this test fails for a reason that has
+    # nothing to do with the code. It passed off Windows only because the probe
+    # returns "" there unconditionally -- machine configuration, not coverage.
+    monkeypatch.setattr(narrate, "_read_user_scope_env_safe", lambda _name: "")
     assert _narrate_reached_the_key(monkeypatch) is False
 
 

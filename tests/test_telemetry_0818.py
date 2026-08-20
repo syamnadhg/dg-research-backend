@@ -337,9 +337,20 @@ def test_the_kill_switch_is_env_only(monkeypatch):
     assert tm.flush(post=lambda batch: True) == 0
 
 
-def test_a_write_failure_never_raises_into_the_caller(monkeypatch):
+def test_a_write_failure_never_raises_into_the_caller(monkeypatch, tmp_path):
+    # ⛔ The unwritable path has to be unwritable EVERYWHERE.
+    # "/does/not/exist" only fails on POSIX, where / is not user-writable; on
+    # Windows it resolves to C:\does\not\exist, the writer's own
+    # mkdir(parents=True) HAPPILY CREATES IT, the write succeeds, and this
+    # returns True -- so the test both failed and left a directory at the
+    # drive root.
+    #
+    # A file standing where a directory must go is refused by every platform:
+    # mkdir cannot descend through it.
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_bytes(b"")
     monkeypatch.setattr(tm, "spool_path",
-                        lambda worker=None: Path("/does/not/exist/x.jsonl"))
+                        lambda worker=None: blocker / "sub" / "x.jsonl")
     assert tm.tm_emit(tm.Ev.LOGIN_STARTED) is False
 
 

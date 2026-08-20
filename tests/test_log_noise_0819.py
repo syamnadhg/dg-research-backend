@@ -679,8 +679,11 @@ def test_the_budget_bounds_what_is_kept():
 def test_a_tail_starts_at_a_whole_line_and_stays_bounded(tmp_path):
     """The pre-existing contract, re-pinned: this wave rewrote the reader."""
     p = tmp_path / "big.log"
-    p.write_text("".join(f"line {i:05d} padded out\n" for i in range(2000)),
-                 encoding="utf-8")
+    # ⚠ write_BYTES, not write_text: on Windows write_text translates
+    # \n to \r\n, so the fixture would not hold the bytes this test
+    # asserts on. The reader under test is byte-oriented by design.
+    p.write_bytes("".join(f"line {i:05d} padded out\n"
+                          for i in range(2000)).encode())
     tail = research._tail_bytes(p, limit=500).decode()
     assert tail.startswith("line ")
     assert tail.endswith("line 01999 padded out\n")
@@ -775,7 +778,10 @@ def test_the_step_cannot_be_zero(tmp_path):
 
 def test_a_file_smaller_than_the_budget_comes_back_whole(tmp_path):
     p = tmp_path / "small.log"
-    p.write_text("a\nb\nc\n", encoding="utf-8")
+    # ⚠ write_BYTES, not write_text: on Windows write_text translates
+    # \n to \r\n, so the fixture would not hold the bytes this test
+    # asserts on. The reader under test is byte-oriented by design.
+    p.write_bytes(b"a\nb\nc\n")
     assert research._tail_bytes(p, limit=1_000) == b"a\nb\nc\n"
 
 
@@ -854,7 +860,10 @@ def test_an_unfiltered_tail_gets_no_header(tmp_path, monkeypatch):
     root = tmp_path / "logs"
     (root / "runs").mkdir(parents=True)
     (root / "sessions").mkdir()
-    (root / "backend.log").write_text("clean\nlines\nonly\n", encoding="utf-8")
+    # ⚠ write_BYTES, not write_text: on Windows write_text translates
+    # \n to \r\n, so the fixture would not hold the bytes this test
+    # asserts on. The reader under test is byte-oriented by design.
+    (root / "backend.log").write_bytes(b"clean\nlines\nonly\n")
     monkeypatch.setattr(research, "_logs_root", lambda: root)
     dest = tmp_path / "b.zip"
     research._build_log_bundle(dest)

@@ -139,12 +139,19 @@ def test_a_vocabulary_free_topic_abstains_even_on_wildly_wrong_text():
     assert research.text_is_off_topic(GOLDEN, "best practices for retrospectives") is False
 
 
+# ids= is NOT cosmetic here. Without it pytest derives the case id from the
+# VALUE, and GOLDEN is a full document -- the id ran past 32,767 characters,
+# which is the hard ceiling Windows puts on a single environment variable. pytest
+# exports the current id as PYTEST_CURRENT_TEST, so every one of these cases
+# died in setup AND teardown with a ValueError that named the env var and never
+# mentioned the id. Naming the cases keeps the inputs identical and makes the
+# failure output readable on every platform.
 @pytest.mark.parametrize("text,topic", [
     ("", TOPIC),
     (None, TOPIC),
     (GOLDEN, ""),
     (GOLDEN, None),
-])
+], ids=["empty-text", "text-is-None", "empty-topic", "topic-is-None"])
 def test_missing_inputs_abstain(text, topic):
     assert research.text_is_off_topic(text, topic) is False
 

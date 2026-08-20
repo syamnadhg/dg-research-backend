@@ -234,8 +234,11 @@ def test_only_real_device_logs_are_collected(tmp_path):
 
 def test_a_tail_starts_at_a_whole_line(tmp_path):
     p = tmp_path / "big.log"
-    p.write_text("".join(f"line {i:05d} padded out\n" for i in range(2000)),
-                 encoding="utf-8")
+    # ⚠ write_BYTES, not write_text: on Windows write_text translates
+    # \n to \r\n, so the fixture would not hold the bytes this test
+    # asserts on. The reader under test is byte-oriented by design.
+    p.write_bytes("".join(f"line {i:05d} padded out\n"
+                          for i in range(2000)).encode())
     tail = research._tail_bytes(p, limit=500).decode()
     assert tail.startswith("line "), repr(tail[:40])
     assert tail.endswith("line 01999 padded out\n")
