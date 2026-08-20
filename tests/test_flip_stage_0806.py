@@ -147,6 +147,10 @@ class TestTheDiagnosisIsRecordedWhereTheNextReaderWillLookFirst:
         assert "re-minting cannot help" in block
 
     def test_the_stage_is_appended_to_the_failure_line(self):
+        # 2026-08-20: the line is DEBUG now and no longer calls a compensated
+        # no-op a failure — it has failed on every run in the corpus while the
+        # fallback read resolved the status every time. The STAGE still has to
+        # ride it, which is what this test is actually for.
         src = inspect.getsource(research)
-        i = src.index("Failed to flip queued→ongoing for")
+        i = src.index("could not open the queued→ongoing transaction")
         assert "_flip_txn_stage(" in src[i:i + 400]

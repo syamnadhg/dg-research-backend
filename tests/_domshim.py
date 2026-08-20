@@ -421,6 +421,22 @@ function matchOne(el, p) {
   return matchSimple(el, p);
 }
 function matchSimple(el, p) {
+  // ⭐⭐ 2026-08-20 — `:not(...)` IS A PRODUCTION SELECTOR HERE, and this shim
+  // could not match it at all. The pattern below never accepted a `:` so
+  // `matchSimple` returned false for the whole compound — which means every
+  // selector carrying a `:not()` matched NOTHING under the shim, silently. The
+  // Gemini source scan is one of them, so a test of it measured zero either way:
+  // the arm was dead in production AND unmatchable in the harness, and the two
+  // failures looked identical. Peeled off first, then the base is matched, then
+  // each excluded selector must NOT match.
+  const nots = [];
+  p = p.replace(/:not\(([^()]*)\)/g, (_m, inner) => { nots.push(inner); return ''; });
+  for (const n of nots) {
+    if (n.split(',').map(s => s.trim()).filter(Boolean)
+         .some(x => matchSimple(el, x))) return false;
+  }
+  // `a:not(x)` reduces to `a`; a bare `:not(x)` reduces to "anything not x".
+  if (p === '') p = '*';
   // The universal selector. Production reaches for it when it has to walk a
   // container it cannot name a tag for — the NotebookLM "Generating Audio
   // Overview…" placeholder, whose tag is not in any capture. Without this the
@@ -440,10 +456,19 @@ function matchSimple(el, p) {
   const m = p.match(/^([a-zA-Z][a-zA-Z0-9-]*)?((?:[.#][A-Za-z0-9_-]+|\[[^\]]*\])*)$/);
   if (!m) return false;
   if (m[1] && el.tagName !== m[1].toUpperCase()) return false;
-  for (const cls of (m[2].match(/\.[A-Za-z0-9_-]+/g) || [])) {
+  // ⛔⛔ 2026-08-20 — CLASSES AND IDS ARE SCANNED OUTSIDE THE BRACKETS ONLY.
+  // These two loops used to scan the whole qualifier string, so a DOT inside an
+  // attribute VALUE was read as a class selector: `[href*="accounts.google"]`
+  // was taken to also require `class="google"`, which nothing has, so the whole
+  // selector matched NOTHING. Silently — a production exclusion list that could
+  // never exclude anything looked identical to one that worked. Measured on the
+  // Gemini source scan, whose `:not([href*="accounts.google"])` and
+  // `:not([href*="google.com/gemini"])` both carry dots.
+  const bare = m[2].replace(/\[[^\]]*\]/g, '');
+  for (const cls of (bare.match(/\.[A-Za-z0-9_-]+/g) || [])) {
     if (!el.classList.contains(cls.slice(1))) return false;
   }
-  for (const id of (m[2].match(/#[A-Za-z0-9_-]+/g) || [])) {
+  for (const id of (bare.match(/#[A-Za-z0-9_-]+/g) || [])) {
     if (el.getAttribute('id') !== id.slice(1)) return false;
   }
   for (const raw of (m[2].match(/\[[^\]]*\]/g) || [])) {

@@ -39,7 +39,11 @@ ALL = [T_NEW]
 
 PY = str(ROOT / ".venv" / "bin" / "python")
 
+# 2026-08-20: the pair `animSelf && clipSelf` gained an arm — the 08-18 split had
+# never recombined the two halves of the shimmer on the same element, which is
+# what left the live P1 row unqualified for twelve minutes.
 QUALIFIES = """            const qualifies = (h) => h.named           // ChatGPT's own name for it
+                || (h.animSelf && h.clipSelf)          // a live shimmering text row
                 || (h.anim && h.inTurn)                // the shimmer, contained
                 || (h.inter && h.anim)                 // the original two-signal rule
                 || (h.inter && h.wordy);               // clickable AND a known state
@@ -107,8 +111,8 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      "shimmering affordance becomes the strip",
      [("""                if (el.closest && el.closest(
                         'form, [data-testid*="composer" i], #prompt-textarea, ' +
-                        'header, [role="toolbar"], nav')) continue;""",
-       "                if (false) continue;")],
+                        'header, [role="toolbar"], nav')) { DIAG.structProse++; continue; }""",
+       "                if (false) { DIAG.structProse++; continue; }")],
      [T_NEW]),
     ("P12", "under", "⛔ the caller's escape hatch is ignored: after two "
      "unverified presses PASS 0 must stand down so the wording passes and the "
@@ -117,13 +121,13 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_NEW]),
     ("P13", "over", "the band widens to the whole page, so a strip from an "
      "earlier turn — or anything else — is 'below the last user message'",
-     [("                if (r.top < lub - 8 || r.top > lub + 600) continue;",
-       "                if (r.top < lub - 8 || r.top > lub + 5000) continue;")],
+     [("                if (offTop < -8 || offTop > 600) { DIAG.structOffBand++; continue; }",
+       "                if (offTop < -8 || offTop > 5000) { DIAG.structOffBand++; continue; }")],
      [T_NEW]),
     ("P14", "under", "the band narrows below the measured distance — the strip "
      "sat 104px under the bubble",
-     [("                if (r.top < lub - 8 || r.top > lub + 600) continue;",
-       "                if (r.top < lub - 8 || r.top > lub + 60) continue;")],
+     [("                if (offTop < -8 || offTop > 600) { DIAG.structOffBand++; continue; }",
+       "                if (offTop < -8 || offTop > 60) { DIAG.structOffBand++; continue; }")],
      [T_NEW]),
     ("P15", "under", "the pick stops saying WHICH signal carried it, which is "
      "exactly what no previous miss line could answer",
@@ -132,8 +136,10 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_NEW]),
     ("P16", "over", "the nearest-wins ranking is dropped, so the strip from a "
      "previous turn can outrank the live one",
-     [("                ranked.sort((a, b) => (b.score - a.score) || (a.len - b.len));",
-       "                ranked.sort((a, b) => (a.len - b.len));")],
+     [("""                ranked.sort((a, b) => (Number(!!b.named) - Number(!!a.named))
+                                      || (b.score - a.score) || (a.len - b.len));""",
+       """                ranked.sort((a, b) => (Number(!!b.named) - Number(!!a.named))
+                                      || (a.len - b.len));""")],
      [T_NEW]),
 ]
 

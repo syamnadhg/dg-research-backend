@@ -640,9 +640,15 @@ def test_the_flip_degrade_leads_with_the_root_cause():
     OPENED with the rollback artifact, and every occurrence in the corpus reads
     that way."""
     src = code_only(inspect.getsource(research.run_server))
-    assert 'f"Failed to flip queued→ongoing for {research_id_val}: {_head}"' in src, (
+    # 2026-08-20: same requirement, new sentence. The line was de-escalated to
+    # DEBUG because the transaction is a compensated no-op (see the caller's
+    # fallback read), but it must still LEAD with the root cause rather than the
+    # rollback artifact — that is what this test exists to hold.
+    assert 'f"[flip] could not open the queued→ongoing transaction for "' in src, (
         "the flip degrade no longer leads with the root cause")
-    assert 'f"Failed to flip queued→ongoing for {research_id_val}: {e}"' not in src, (
-        "the wrapper's rollback message is back in front of the real fault")
+    assert '{_head}' in src.split("could not open the queued→ongoing", 1)[1][:400], (
+        "the root-cause head no longer rides the line")
+    assert "Failed to flip queued→ongoing" not in src, (
+        "the line is calling a compensated no-op a failure again")
     head = src.split("_head =", 1)[1].split("\n", 1)[0]
     assert "_root" in head, "the head must be built from the root, not from the wrapper"

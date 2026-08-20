@@ -102,8 +102,8 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_NEW]),
     ("M5", "over", "⛔ the clip arm is dropped from the prefilter as well, so "
      "rows that used to reach the ranking vanish silently",
-     [("                if (!inter && !anim && !clip && !named) continue;",
-       "                if (!inter && !anim && !named) continue;")],
+     [("                if (!inter && !anim && !clip && !named) { DIAG.structNoSignal++; continue; }",
+       "                if (!inter && !anim && !named) { DIAG.structNoSignal++; continue; }")],
      [T_NEW]),
     ("M6", "under", "a paused animation counts as running again — a finished "
      "step still has an animation name",

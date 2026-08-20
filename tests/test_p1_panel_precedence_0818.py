@@ -36,7 +36,14 @@ def _panel_js() -> str:
     whitespace by the time a test sees it."""
     src = code_only_deep(research)
     i = src.index("const structural = [];")
-    return src[i:i + 20000]
+    # ⛔ 2026-08-20 — ENDS AT A LANDMARK, NOT AT A CHARACTER COUNT. It used to
+    # take a fixed 20,000-char window, and `code_only_deep` blanks comments to
+    # WHITESPACE rather than removing them — so adding a long note anywhere inside
+    # the pass silently pushed real code out the far end and four tests failed
+    # claiming a landmark had been deleted. A slice with a length in it measures
+    # the length.
+    end = src.index("clickAndReturn(hits[0].el, hits.length, 'global')", i)
+    return src[i:end]
 
 
 # ── the pass that works answers first ────────────────────────────────────────
@@ -155,7 +162,12 @@ def test_the_qualifying_predicate_is_still_a_predicate():
 def test_the_prefilter_still_admits_everything_it_used_to():
     """`clip` was folded into `anim` before the split. If the prefilter forgot
     it, rows that used to reach the ranking would vanish silently."""
-    assert "if (!inter && !anim && !clip && !named) continue;" in _panel_js()
+    # 2026-08-20: the same prefilter, now counting what it throws away so a
+    # miss line can say "rows reached the band and every one failed the
+    # signal test" instead of the bare "nothing matched" that stood for
+    # eleven minutes of a live phase.
+    assert ("if (!inter && !anim && !clip && !named) "
+            "{ DIAG.structNoSignal++; continue; }") in _panel_js()
 
 
 # ── the miss snapshot can explain a miss ─────────────────────────────────────

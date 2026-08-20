@@ -26587,8 +26587,21 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
         // past the ceiling looked identical to a wording change forever.
         // DIAG carries what was actually seen back to the caller.
         const NODE_CAP = 8000;
+        // ⛔⛔ 2026-08-20 — AND THE CENSUS OF THE STRUCTURAL PASS, because
+        // twenty-one identical miss lines over eleven minutes could not
+        // distinguish "no candidate existed" from "a candidate existed and every
+        // gate rejected it". The live 08-19 P1 phase produced exactly that: the
+        // vision tier described the shimmering row on screen three separate
+        // times while this walk reported `nothing matched` every thirty seconds.
+        // `walked` and `prose` were the only two numbers the miss line carried,
+        // and neither of them is ever touched by PASS 0.
         const DIAG = { roots: 0, walked: 0, cappedRoots: 0, maxNodes: 0,
-                       structuralCapped: false, prose: 0 };
+                       structuralCapped: false, prose: 0,
+                       // PASS 0's own accounting: did it run, how many rows
+                       // reached its band, and what threw the rest out.
+                       structRan: false, structAnchor: '', structInBand: 0,
+                       structOffBand: 0, structShape: 0, structProse: 0,
+                       structNoSignal: 0, structQualified: 0, structVia: '' };
 
         // ⛔⛔ 2026-08-18 — TWO OF THE THREE ARMS WERE NOT ANIMATION AT ALL.
         // `background-clip: text` is a static PAINT property: it says the fill is
@@ -26799,6 +26812,8 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
         let deferredStructural = null;
         let deferredStructuralCount = 0;
         if (!skipStructural && lub > 0) {
+            DIAG.structRan = true;
+            DIAG.structAnchor = 'lub';
             const structural = [];
             const mainEl = document.querySelector('main') || document.body;
             let mnodes;
@@ -26808,15 +26823,31 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
                 DIAG.cappedRoots++; DIAG.structuralCapped = true; mnodes = [];
             } else { DIAG.roots++; DIAG.walked += mnodes.length; }
             for (const el of mnodes) {
-                if (el.children.length > 2) continue;
+                if (el.children.length > 2) { DIAG.structShape++; continue; }
                 const t = (el.innerText || el.textContent || '').trim();
-                if (!t || t.length < 3 || t.length > 200) continue;
+                if (!t || t.length < 3 || t.length > 200) { DIAG.structShape++; continue; }
                 const r = el.getBoundingClientRect();
-                if (r.width === 0 || r.height === 0) continue;
-                if (r.top < lub - 8 || r.top > lub + 600) continue;
+                if (r.width === 0 || r.height === 0) { DIAG.structShape++; continue; }
+                const offTop = r.top - lub;
+                if (offTop < -8 || offTop > 600) { DIAG.structOffBand++; continue; }
+                DIAG.structInBand++;
                 if (el.closest && el.closest(
                         'form, [data-testid*="composer" i], #prompt-textarea, ' +
-                        'header, [role="toolbar"], nav')) continue;
+                        'header, [role="toolbar"], nav')) { DIAG.structProse++; continue; }
+                // ⛔ 2026-08-20 — THE PROSE EXCLUSION BELONGS HERE TOO. Until now
+                // it lived only in `findHitsIn`, and the note there already says
+                // why that is the wrong place: "the same one-of-several-paths
+                // shape that keeps producing these". Removing the viewport band
+                // above widens what this pass can see, so the arm that stops it
+                // pressing a table cell in the agent's own report has to arrive
+                // in the same change — a shimmering skeleton inside a rendered
+                // table is exactly the thing a turn-relative band cannot exclude
+                // on geometry alone.
+                if (el.closest && el.closest(
+                        'table, td, th, code, pre, a[href], '
+                        + '.markdown, [class*="markdown"], [class*="prose"]')) {
+                    DIAG.structProse++; continue;
+                }
                 let inter = false, node = el;
                 for (let i = 0; i < 6 && node; i++) {
                     const role = node.getAttribute && node.getAttribute('role');
@@ -26836,6 +26867,16 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
                 // element and its PARENT is how a wording-free anchor ended up
                 // depending on wording anyway. Bounded — rows with more than two
                 // children never reach here, so the subtree is a handful of nodes.
+                // ⛔⛔ 2026-08-20 — THE SELF-ONLY READINGS, KEPT SEPARATE. The
+                // broadened `anim`/`clip` below ask "this element, its parent, or
+                // any of twelve children", which is what lets them find a shimmer
+                // that lives on an inner span. It is also what makes each of them
+                // useless as evidence on its own: the composer's model chip
+                // reports an animated DESCENDANT too, and that is precisely why
+                // the qualifier refuses a lone shimmer. The self-only pair does
+                // not have that problem, and nothing was asking for it.
+                const animSelf = shimmers(el);
+                const clipSelf = clipped(el);
                 let anim = shimmers(el)
                     || (el.parentElement ? shimmers(el.parentElement) : false);
                 if (!anim) {
@@ -26873,7 +26914,7 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
                 // `clip` is admitted here purely so nothing that reached this
                 // list before still reaches it — the arm used to live inside
                 // `anim`. What changed is that it can no longer DECIDE alone.
-                if (!inter && !anim && !clip && !named) continue;
+                if (!inter && !anim && !clip && !named) { DIAG.structNoSignal++; continue; }
                 // Is the candidate inside the assistant's own turn? The captured
                 // chain puts the strip under `SECTION[data-testid=
                 // "conversation-turn-2"]`. This is what keeps a lone shimmer from
@@ -26889,10 +26930,17 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
                     || STATUS_LINE.test(t) || ELLIPSIS.test(t) || COMPLETED.test(t);
                 // A dead gradient is worth 1 against a running animation's 3:
                 // present, ranked, never mistaken for the live line.
-                const score = (named ? 4 : 0) + (inter ? 3 : 0) + (anim ? 3 : 0)
-                    + (wordy ? 2 : 0) + (clip ? 1 : 0) - (r.top - lub) / 1000;
+                // ⭐ `named` IS NOT IN THIS SUM, deliberately. It is a TIER in
+                // the sort below, so four points here could not change any
+                // ordering — between two named rows it cancels, and against an
+                // unnamed one the tier has already decided. A term that cannot
+                // affect an outcome is the decorative-guard shape this file keeps
+                // removing, and mutation proved it: zeroing it changed nothing.
+                const score = (inter ? 3 : 0) + (anim ? 3 : 0)
+                    + (wordy ? 2 : 0) + (clip ? 1 : 0) - offTop / 1000;
                 structural.push({ el, score, len: t.length,
-                                  named, inter, anim, clip, wordy, inTurn });
+                                  named, inter, anim, clip, wordy, inTurn,
+                                  animSelf, clipSelf });
             }
             // ⭐⭐ 2026-08-17 — THE GATE IS A PREDICATE, NOT A SUM. It used to be
             // `score >= 3`, and 3 is exactly the weight of ONE signal while the
@@ -26908,7 +26956,33 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
             // bless any clickable row near the message. The evidence has to be
             // named instead — and then the sum is free to do what it is good at,
             // which is RANKING the qualifiers.
+            // ⛔⛔ 2026-08-20 — THE MEASURED GAP. A live P1 phase logged
+            // twenty-three misses and spent all three vision escalations while
+            // the row was on screen and shimmering, and the panel-miss snapshot
+            // said why in full, twice, five minutes apart:
+            //
+            //   the live line   anim(self)=TRUE  clip(self)=TRUE  animKid=true
+            //                   inter=false  inTurn=false  named=false
+            //   the disclaimer  anim=false clip=false animKid=false
+            //   the model chip  anim=false clip=false animKid=TRUE
+            //
+            // Every arm below was false for the row. `lub` was 202 the whole
+            // phase, so the band never came into it, and ChatGPT had stopped
+            // putting `cot-v*-pinned-row` and any turn container on that node —
+            // so `named` and `inTurn`, the two exact signals, were both gone.
+            //
+            // ⭐⭐ AND THE PAIR THAT WAS TRUE HAD NO ARM. The 08-18 split was
+            // right: a running animation ANYWHERE in the subtree matches the
+            // composer's model chip, and a static gradient matches a finished
+            // step, so neither half may decide alone. What it never did was
+            // recombine them ON THE SAME ELEMENT. A node whose own animation is
+            // running AND whose own text is clipped to a gradient is not a weak
+            // signal — it is the definition of a live shimmering text row, and in
+            // this capture it is the only node on the page that is both. The
+            // model chip fails it on `animSelf`; the finished step fails it on
+            // `animSelf`; a dead gradient fails it on `animSelf`.
             const qualifies = (h) => h.named           // ChatGPT's own name for it
+                || (h.animSelf && h.clipSelf)          // a live shimmering text row
                 || (h.anim && h.inTurn)                // the shimmer, contained
                 || (h.inter && h.anim)                 // the original two-signal rule
                 || (h.inter && h.wordy);               // clickable AND a known state
@@ -26923,11 +26997,29 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
                 ranked = structural.filter(qualifiesWeak);
                 weakTier = ranked.length > 0;
             }
+            DIAG.structQualified = ranked.length;
+            // Which arm carried the pick, so a wrong press names its own reason.
+            if (ranked.length) {
+                const h = ranked[0];
+                DIAG.structVia = [h.named ? 'named' : '',
+                                  (h.animSelf && h.clipSelf) ? 'shimmer-self' : '',
+                                  (h.anim && h.inTurn) ? 'anim+turn' : '',
+                                  h.inter ? 'inter' : ''].filter(Boolean).join('+');
+            }
             if (ranked.length) {
                 // Sorted, then [0] — it used to rank the whole list and inspect
                 // only the top one, so a qualifying row sitting behind an
                 // unqualified higher scorer was never reached.
-                ranked.sort((a, b) => (b.score - a.score) || (a.len - b.len));
+                // ⛔⛔ 2026-08-20 — AN EXACT NAME IS A TIER, NOT FOUR POINTS.
+                // `named` is worth 4 and so is `anim`(3)+`clip`(1), so once the
+                // pair got a qualifying arm the two tied — and the tie was broken
+                // by the distance penalty, i.e. by eighteen thousandths of a
+                // point of pixel offset. Found by mutation: a shimmering stranger
+                // outranked the row ChatGPT itself names. The comment on `named`
+                // has always said it "beats every heuristic below it"; this makes
+                // the sort agree with it, instead of hoping the arithmetic does.
+                ranked.sort((a, b) => (Number(!!b.named) - Number(!!a.named))
+                                      || (b.score - a.score) || (a.len - b.len));
                 // Held for the fallback at the bottom. NOT clicked here — see the
                 // note where `deferredStructural` is declared.
                 deferredStructural = ranked[0];
@@ -27010,7 +27102,17 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
             // 2026-08-06: how many candidates were refused for being report
             // prose. A run that presses nothing and a run that refused fifty
             // table cells are different situations and used to log identically.
-            prose: DIAG.prose || 0 };
+            prose: DIAG.prose || 0,
+            // 2026-08-20: PASS 0's own census. Without these the miss line's two
+            // numbers both came from the WORDING walk, so eleven minutes of
+            // "nothing matched" could not say whether the structural pass had
+            // even run — and on 08-19 it had not.
+            structRan: DIAG.structRan, structAnchor: DIAG.structAnchor,
+            structInBand: DIAG.structInBand, structOffBand: DIAG.structOffBand,
+            structShape: DIAG.structShape, structProse: DIAG.structProse,
+            structNoSignal: DIAG.structNoSignal,
+            structQualified: DIAG.structQualified,
+            structVia: DIAG.structVia };
         // Parent strip (verb+count) wins over badge child (count-only) via
         // hitScore; ties broken by lowest-on-page, then shortest text.
         hits.sort((a, b) => (hitScore(b) - hitScore(a)) || (b.top - a.top) || (a.len - b.len));
@@ -27147,12 +27249,46 @@ def _panel_miss_reason(res) -> str:
                 # the agent's own report" are different pages and used to read
                 # the same. Twelve presses landed on a markdown table cell.
                 + (f" ({_pr} candidate(s) refused for being report prose)"
-                   if _pr else ""))
+                   if _pr else "")
+                + _chatgpt_structural_census(res))
     if reason == "no_roots":
         return "found no roots to scan at all — the thread DOM may not have mounted"
     if res.get("error"):
         return f"the DOM walk raised in the {where} context: {res['error']}"
     return "no result came back from the DOM walk"
+
+
+def _chatgpt_structural_census(res) -> str:
+    """What the STRUCTURAL pass saw, appended to a miss line.
+
+    ⛔⛔ WHY THIS EXISTS. The 2026-08-19 P1 phase logged twenty-one identical
+    misses over eleven minutes — `scanned 862 nodes … nothing matched` — while the
+    vision tier described the shimmering row plainly visible on screen and spent
+    all three of its escalations pressing it. Both numbers in that sentence
+    (`walked`, `prose`) come from the WORDING walk; PASS 0 never touches either.
+    So the line could not distinguish the three states that matter:
+
+      * the pass never ran (its anchor was gone — the actual 08-19 cause),
+      * it ran and no row reached its band,
+      * it ran, rows reached the band, and every one failed the signal test.
+
+    Twenty-one lines, three possibilities, no way to tell. A miss line that
+    cannot name its own gate is how a viewport-relative anchor survived from
+    2026-07-07 to 2026-08-20.
+
+    Deliberately short: a per-tick DEBUG line is exactly where wave 2's log-flood
+    lesson applies, so this adds one clause, not a table."""
+    res = res or {}
+    if not res.get("structRan"):
+        return " · structural pass DID NOT RUN (no turn and no on-screen user message)"
+    bits = [f"anchor={res.get('structAnchor') or '?'}",
+            f"in-band={int(res.get('structInBand') or 0)}"]
+    for key, name in (("structOffBand", "off-band"), ("structProse", "prose"),
+                      ("structNoSignal", "no-signal"), ("structShape", "shape")):
+        n = int(res.get(key) or 0)
+        if n:
+            bits.append(f"{name}={n}")
+    return " · structural: " + ", ".join(bits)
 
 
 async def _verify_chatgpt_panel_open(page):
@@ -27300,21 +27436,66 @@ async def scrape_progress_gemini(page):
             document.querySelectorAll(
                 '.source-card, .citation, [data-source], .web-result, ' +
                 '.research-source, [class*="source"], [class*="citation"], ' +
-                'a[href*="http"]:not([href*="google.com/gemini"]):not([href*="accounts.google"])'
+                // ⭐ 2026-08-20 — `gemini.google` EXCLUDED HERE TOO. The panel
+                // walker below has always dropped Gemini's own URLs; this global
+                // arm did not, so the conversation's own link counted as a
+                // source. Two paths, one rule — the GUARD THE HOST lesson.
+                'a[href*="http"]:not([href*="google.com/gemini"])'
+                + ':not([href*="accounts.google"]):not([href*="gemini.google"])'
             ).forEach(s => {
-                const a = s.querySelector ? s.querySelector('a') : s;
+                // ⛔⛔ 2026-08-20 — THE BROADEST ARM OF THE SELECTOR ABOVE WAS
+                // DEAD. `a[href*="http"]…` matches ANCHORS, and this line then
+                // asked each anchor for a CHILD anchor — `querySelector` searches
+                // descendants only, so an <a> always answered null and every
+                // match was dropped. Only the container arms (.source-card,
+                // .citation, [class*="source"]…) could ever contribute a URL.
+                // Found by reading, after the 08-19 run reported sources=0 on an
+                // 82,817-character Gemini report; measured Gemini-only (this
+                // idiom appears once in the file).
+                // ⭐ The element itself when it IS the anchor, its descendant
+                // otherwise. Can only ADD sources, never remove one.
+                const a = (s.tagName === 'A') ? s
+                        : (s.querySelector ? s.querySelector('a') : s);
                 const href = a?.href || '';
-                if (href.startsWith('http') && href.length < 500) srcSet.add(href);
+                // ⛔⛔ 2026-08-20 — THE EXCLUSION IS ON THE RESOLVED URL, not on
+                // the selector. The `:not(...)` list guards only the ANCHOR arm;
+                // a container arm (.source-card, .citation, [class*="source"])
+                // resolves to its inner <a> and had no equivalent guard, so a
+                // `.source-card` wrapping accounts.google smuggled it in as a
+                // citation. Measured through the shim the moment the anchor arm
+                // started working. One rule, applied where the URL is — the same
+                // GUARD THE HOST lesson that cost 56% of the sources once.
+                // ⚠ THE BACKSLASHES ARE DOUBLED, and they must be: this JS
+                // lives in a NON-RAW Python string, so what is written here is
+                // not what reaches the browser. A single backslash before a dot
+                // is an invalid Python escape — it survives today with a
+                // DeprecationWarning and breaks outright on a later Python.
+                // Same trap the Gemini stop regex hit on 08-19, where a lone
+                // backslash-b became a literal BACKSPACE character and the
+                // word-boundary match silently matched nothing at all.
+                const SELF = /accounts\\.google|google\\.com\\/gemini|gemini\\.google/i;
+                if (href.startsWith('http') && href.length < 500
+                        && !SELF.test(href)) srcSet.add(href);
                 // No innerText fallback: titles like "Read on Bloomberg" can't
                 // be clicked and would inflate r.sources beyond what the FE
                 // filtered URL list shows.
             });
             // Union with the panel-walker's URL haul (above) so URLs found
             // only inside the right-side research panel still flow through.
+            let _panelSrcCount = 0;
             if (r._panel_sources) {
+                const _before = srcSet.size;
                 for (const u of r._panel_sources) srcSet.add(u);
+                _panelSrcCount = srcSet.size - _before;
                 delete r._panel_sources;
             }
+            // ⛔ PROVENANCE, because the count alone cannot be diagnosed. The
+            // 08-19 run reported Gemini sources as zero and there was no way to
+            // tell an empty page from a blind selector from a panel that never
+            // opened — the number is logged nowhere. `src_page` is the
+            // document-wide scan, `src_panel` the research-panel walker.
+            r.src_panel = _panelSrcCount;
+            r.src_page = srcSet.size - _panelSrcCount;
             r.source_urls = Array.from(srcSet).slice(0, 200);
             r.sources = r.source_urls.length;
             // Response sections
@@ -28303,6 +28484,12 @@ async def detect_completion_claude(page):
         return (True, f"no_stop + {which}{stale}", snap)
     except Exception as e:
         return (False, f"detect_error: {e}", {})
+
+
+#: The queued→ongoing transaction has been refused on every run in the corpus
+#: and the fallback read has resolved it every time. ONCE per process, keyed on
+#: the root cause's class, so a NEW failure class still speaks. See the call site.
+_FLIP_403_QUIET = logquiet.Suppressor(logquiet.ONCE)
 
 
 async def detect_completion_gemini(page, running_confirmed: bool = False):
@@ -38277,6 +38464,21 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         pass
             no_growth_secs = time.time() - p["last_growth_time"]
             since_warn = time.time() - p["stuck_warned_at"]
+            # 2026-08-20: Gemini's source count has never been logged, which is
+            # why "Gemini shows zero sources" could not be diagnosed from a run.
+            # ChatGPT and Claude each have a tracking line; this is Gemini's.
+            # ⭐ ON CHANGE ONLY — wave 2's flood lesson: a per-cycle restatement
+            # of an unchanging number is a true statement worth one bit.
+            if name == "Gemini" and scrape_ok:
+                _gsrc = (int(progress.get("sources", 0) or 0),
+                         int(progress.get("src_page", 0) or 0),
+                         int(progress.get("src_panel", 0) or 0),
+                         int(progress.get("searches", 0) or 0))
+                if _gsrc != p.get("gemini_src_last"):
+                    p["gemini_src_last"] = _gsrc
+                    log(f"[Gemini] source tracking: {_gsrc[0]} URLs "
+                        f"(page={_gsrc[1]}, panel={_gsrc[2]}, searches={_gsrc[3]})")
+
             _active_statuses = ("planning", "thinking", "researching", "searching")
             # ⛔⛔ 2026-08-19 — NOT ONE OF THOSE FOUR VALUES IS EVER PRODUCED. All
             # three scrapers in SCRAPE_FNS emit exactly `generating`, `complete`,
@@ -41401,8 +41603,24 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
                         timeout=8000)
                     log(f"[{label}] CUA panel-open recovery: final-report panel now mounted ✓")
                 except Exception:
-                    log(f"[{label}] CUA panel-open recovery ran but panel still not "
-                        f"detected — tiers will still attempt extraction", "WARN")
+                    # ⛔⛔ 2026-08-20 — THIS WARNED FOUR SECONDS BEFORE WE READ THE
+                    # REPORT OUT OF THAT PANEL. Live 08-19: this line at 19:41:12,
+                    # the vision tier reporting "I can see the artifact panel is
+                    # open on the right showing the research report" at 19:41:16,
+                    # and 39,831 characters extracted from it at 19:41:20. The
+                    # panel was open; our probe could not see it — the same
+                    # two-verifiers-two-definitions split that left the P1 row
+                    # unpressed, and the one that was wrong is the one that wrote
+                    # to the log. The owner read my report of this as a defect and
+                    # was right to push back.
+                    # ⭐ NOT silenced and the probe is NOT touched: a
+                    # probe-vs-reality disagreement is worth a record. DEBUG,
+                    # because what usually happens next is a successful
+                    # extraction, and the wording no longer asserts a shut panel.
+                    log(f"[{label}] the probe still cannot confirm the artifact "
+                        f"panel after CUA recovery — extraction tiers run anyway "
+                        f"and normally succeed; a probe gap, not a closed panel",
+                        "DEBUG")
             except asyncio.TimeoutError:
                 log(f"[{label}] CUA panel-open recovery timed out after 120s", "WARN")
             except Exception as _pe:
@@ -60825,12 +61043,37 @@ async def run_server(port=8000):
             # that way.
             _root = getattr(e, "__cause__", None) or getattr(e, "__context__", None)
             _head = f"{type(_root).__name__}: {_root}" if _root is not None else str(e)
-            log(
-                f"Failed to flip queued→ongoing for {research_id_val}: {_head}"
-                + (f" | surfaced as: {e}" if _root is not None else "")
-                + f" | {_flip_txn_stage(locals().get('_flip_tx'), _root)}",
-                "WARN",
-            )
+            # ⛔⛔ 2026-08-20 — THIS WAS A WARN FOR A WRITE THAT IS NEVER NEEDED.
+            # The comment on the caller's fallback says it plainly: this flip has
+            # failed on EVERY run in the corpus, twenty occurrences and zero
+            # successes — and the fallback plain-read has resolved the status
+            # every single time, because the app has already set it. So the run is
+            # never affected, and the operator was handed two WARNs and a
+            # paragraph of transaction diagnostics per run for a no-op.
+            #
+            # Owner, 2026-08-20, on this exact line: take care of the false alarm.
+            # The alerting rule this file already follows is "speak when a PERSON
+            # must act"; nobody can act on this and nothing is lost.
+            #
+            # ⭐ Kept at full detail, ONCE per process, keyed on the root cause's
+            # class — via the same `logquiet` primitive wave 2 added for the
+            # telemetry flood. The root cause is still unnamed, so the day it
+            # changes class the new one still speaks. What stops is the repetition
+            # (and the level: the caller downgrades this to DEBUG the moment its
+            # read resolves the status, which is the measured 100% case).
+            _emit_flip, _flip_dropped = _FLIP_403_QUIET.consider(
+                "flip-txn-refused", f"{type(_root).__name__ if _root else type(e).__name__}")
+            if _emit_flip:
+                log(
+                    f"[flip] could not open the queued→ongoing transaction for "
+                    f"{research_id_val}: {_head}"
+                    + (f" | surfaced as: {e}" if _root is not None else "")
+                    + f" | {_flip_txn_stage(locals().get('_flip_tx'), _root)}"
+                    + " | the caller falls back to a plain read; this is not a "
+                      "run-affecting failure"
+                    + logquiet.suppressed_note(_flip_dropped),
+                    "DEBUG",
+                )
             # ⚠ NOT None. `None` read as "legacy success — proceed", so on every
             # run in this corpus the caller's terminal-status bail was silently
             # switched off: a run cancelled or watchdog-stopped between dequeue

@@ -71,7 +71,8 @@ def _disclaimer():
               text="ChatGPT can make mistakes. Check important info.")
 
 
-def _strip(text, *, y, named=True, anim_on="kid", in_turn=True, button=True):
+def _strip(text, *, y, named=True, anim_on="kid", in_turn=True, button=True,
+           turn_y=None):
     """One strip row, as captured: a narrow chain whose text sits on the inner
     element and whose shimmer sits on a span below that."""
     inner_attrs = {"w": "300", "h": "24", "x": "300", "y": str(y)}
@@ -99,8 +100,16 @@ def _strip(text, *, y, named=True, anim_on="kid", in_turn=True, button=True):
         row_attrs["role"] = "button"
     node = el("div", row_attrs, kids=[inner])
     if in_turn:
+        # ⭐ 2026-08-20 — THE TURN'S POSITION IS ITS OWN KNOB NOW. It used to be
+        # pinned to the row's own y, which made the wrapper invisible to any test
+        # about distance: every row sat exactly at the top of its turn. The band
+        # is measured from the turn (the row and its container scroll together,
+        # the viewport does not), so a fixture that cannot move them apart cannot
+        # test the band at all.
         node = el("section", {"data-testid": "conversation-turn-2", "w": "600",
-                              "h": "200", "x": "300", "y": str(y)}, kids=[node])
+                              "h": "1800", "x": "300",
+                              "y": str(y if turn_y is None else turn_y)},
+                  kids=[node])
     return node
 
 
@@ -246,18 +255,48 @@ def test_skip_structural_still_skips_it():
 
 
 def test_a_strip_far_below_the_message_is_out_of_band():
-    """The band is what makes 'below the last user bubble' mean anything."""
-    got = _open(_page(_strip("Developed the security scope", y=1400)))
+    """The band is what makes "the first row of the turn" mean anything.
+
+    2026-08-20: measured from the TURN, not from the user bubble. A shimmering
+    row 1400px below the top of its own turn is somewhere inside the streamed
+    report, not the pinned row at the top of it — and unlike a viewport
+    measurement, that distance does not change when the page scrolls."""
+    got = _open(el("body", {"w": "1440", "h": "900", "x": "0", "y": "0"}, kids=[
+        el("main", {"w": "1440", "h": "900", "x": "0", "y": "0"}, kids=[
+            _user_bubble(),
+            # One turn, carrying its report — so the container itself is filtered
+            # by the 200-char leaf cap exactly as a live turn is, and the only
+            # candidate left is the row 1400px down inside the report.
+            el("section", {"data-testid": "conversation-turn-2", "w": "600",
+                           "h": "1800", "x": "300", "y": "200"},
+               text=("Report body, which on a live page runs to pages. " * 8),
+               kids=[el("div", {"anim": "shimmer", "role": "button", "w": "300",
+                                "h": "24", "x": "300", "y": "1600"},
+                        text="Developed the security scope")]),
+        ])]))
     assert got.get("anchor") != "structural", got
 
 
-# ── 3. The ranking, once several rows qualify ────────────────────────────────
+def test_the_stale_strip_from_an_earlier_turn_does_not_win():
+    """A completed turn leaves its old strip on the page; the live one belongs to
+    the newest turn.
 
-def test_the_nearest_strip_below_the_message_wins():
-    """A completed turn leaves its old strip on the page; the live one is the
-    one directly under the newest user bubble."""
-    got = _open(_page(_strip("Developed the security scope", y=242),
-                      _strip("Searched 24 websites", y=520)))
+    ⛔ 2026-08-20 — THE OLD FIXTURE COULD NOT HAPPEN. It put two assistant turns
+    back to back with no user message between them, which is the one arrangement
+    where "nearest to the bubble" and "inside the newest turn" disagree — so it
+    was measuring the fixture's own impossibility. A real page interleaves them,
+    and then both readings pick the same row, which is what this asserts."""
+    got = _open(el("body", {"w": "1440", "h": "900", "x": "0", "y": "0"}, kids=[
+        el("main", {"w": "1440", "h": "900", "x": "0", "y": "0"}, kids=[
+            # the previous exchange, still on the page above
+            el("div", {"data-message-author-role": "user", "w": "600", "h": "60",
+                       "x": "300", "y": "-400"}, text="an earlier question"),
+            _strip("Searched 24 websites", y=-340),
+            # the newest exchange
+            _user_bubble(),
+            _strip("Developed the security scope", y=242),
+            _disclaimer(), _model_chip(),
+        ])]))
     assert "Developed the security scope" in (got.get("label") or ""), got
 
 
@@ -333,9 +372,12 @@ def test_the_distance_penalty_only_ranks():
     """It stays in the score — nearest-wins is right — but it must not be able
     to decide whether anything qualifies at all."""
     pass0 = _code(_pass0(_src()))
-    assert "- (r.top - lub) / 1000" in pass0
+    # 2026-08-20: the same quantity, now named `offTop` (`r.top - lub`) so the
+    # census can report which gate rejected a row.
+    assert "- offTop / 1000" in pass0
+    assert "const offTop = r.top - lub;" in pass0
     qual = pass0[pass0.index("const qualifies"):pass0.index("let ranked")]
-    assert "r.top" not in qual and "lub" not in qual, qual
+    assert "r.top" not in qual and "lub" not in qual and "offTop" not in qual, qual
 
 
 def test_every_qualifying_row_is_considered_not_just_the_top_scorer():
