@@ -9238,6 +9238,36 @@ def _system_log_tails(root=None) -> "list[Path]":
 TAIL_SCAN_MAX_BYTES = RAW_LOG_ROTATE_BYTES
 _TAIL_CHUNK_BYTES = 1024 * 1024
 _TAIL_REPEAT_NOTE = b"[bundle] ^ the line above then repeated %d more times"
+#: For occurrences that were NOT adjacent. "then repeated" would be untrue of a
+#: message that recurs with other lines between, which is what a heartbeat does.
+_TAIL_KEYED_NOTE = b"[bundle] ^ this message occurred %d more times nearby"
+#: ⛔ The REMAINDER. A message held back at the end of the scan has no later copy
+#: to carry its count out on, so without this line those repeats would be dropped
+#: silently — which is the one thing the whole rule promises not to do. Caught by
+#: its own test: 40 held, only 32 accounted for.
+_TAIL_KEYED_TAIL_NOTE = (b"[bundle] %d further repeated lines were collapsed "
+                         b"across %d message(s) and are not shown individually")
+
+#: A log line's identity WITHOUT its timestamp. `[19:48:43] [INFO] text` -> `text`.
+_TAIL_TS_PREFIX = re.compile(rb"^\[[\d:]{5,8}\]\s*(?:\[[A-Z]+\]\s*)?")
+
+
+def _tail_msg_key(line: bytes) -> bytes:
+    """What makes two log lines the same EVENT rather than the same bytes.
+
+    ⛔⛔ MEASURED 2026-08-20 on a real support bundle, and it is why this exists:
+    `backend-2.log` carried 29,543 lines and only 2,340 distinct messages — 92.1%
+    of it was repetition the byte-identical rule could not see. 21,671 of those
+    lines were one heartbeat, and it defeats adjacency comparison TWICE over:
+
+      * every line carries its own timestamp, so no two are byte-identical, and
+      * the glyph ALTERNATES — `◆ standing watch` / `◇ standing watch` — so even
+        keying on the message would not find two in a row.
+
+    The docstring below used to claim the collapse "catches our own aegis pulse".
+    It never could. The principle was right and the comparison was wrong.
+    """
+    return _TAIL_TS_PREFIX.sub(b"", line).strip()
 # The prefix that identifies one of our own collapse markers, so a marker whose
 # line was trimmed away can be recognised and removed with it. Derived from the
 # template rather than written out again — two spellings and the check silently
@@ -9308,10 +9338,21 @@ def _filter_tail_lines(lines, limit: int, stats: dict) -> "list[bytes]":
     Two rules, and they are deliberately different in kind:
       • `_drop_from_tail` DELETES a successful health probe. Nothing is lost:
         the line records that nothing happened.
-      • A run of byte-identical lines COLLAPSES to one copy plus a count. That is
-        lossless, and it is general — it catches the refresh flood above, our own
-        aegis pulse, and whatever the next one turns out to be, without anybody
-        having to add a pattern for it.
+      • A run of byte-identical lines COLLAPSES to one copy plus a count. That
+        is lossless.
+      • ⛔⛔ AND THAT WAS NOT ENOUGH, though this docstring claimed it was. It
+        said the rule "catches our own aegis pulse", and it never could: every
+        line carries its own timestamp so no two are byte-identical, and the
+        pulse's glyph ALTERNATES (◆/◇) so no two are even the same message in a
+        row. Measured on a real bundle: 21,671 of `backend-2.log`'s 29,543 lines
+        were that one heartbeat, 94% of the whole bundle was these tails, and the
+        collapse had removed none of it. So repetition is now recognised by
+        MESSAGE (`_tail_msg_key`, timestamp stripped) at the widening cadence the
+        source-side fix already uses, and a kept copy carries the count of what
+        was collapsed near it. Still general: no pattern list, nothing named.
+      ⭐ The two rules are ordered deliberately — adjacency first, because its
+        note ("then repeated") says something stronger and true, and the keyed
+        rule only sees what adjacency did not.
 
     ⭐ Dropping noise does not shrink the bundle so much as move it BACKWARDS IN
     TIME: the same 5 MiB now reaches days further into the history a reader
@@ -9325,6 +9366,12 @@ def _filter_tail_lines(lines, limit: int, stats: dict) -> "list[bytes]":
     # and the one that forgot would raise inside a support-bundle build.
     stats.setdefault("dropped", 0)
     stats.setdefault("collapsed", 0)
+    stats.setdefault("throttled", 0)
+    # Per-message cadence, the same widening shape the source-side suppressor
+    # uses. Local to the call, so this stays pure and testable with no file.
+    _keyed = logquiet.Suppressor()
+    # Per-key repeats held back with no later copy to carry the count out on.
+    _unflushed: "dict[bytes, int]" = {}
     out: "list[bytes]" = []      # newest-first, same as the input
     kept = 0
     run_line: "bytes | None" = None
@@ -9360,8 +9407,30 @@ def _filter_tail_lines(lines, limit: int, stats: dict) -> "list[bytes]":
             # lose a collapsed run's count.
             stats["keptBytes"] = kept
             return out
+        # The keyed rule, after adjacency has had its say. A message the cadence
+        # is holding back is COUNTED, never discarded — the count rides the next
+        # copy that does get through, exactly as the source-side rule does it.
+        _k = _tail_msg_key(line)
+        _emit, _held = _keyed.consider(_k, b"seen")
+        if not _emit:
+            stats["throttled"] += 1
+            _unflushed[_k] = _unflushed.get(_k, 0) + 1
+            continue
+        if _held:
+            note = _TAIL_KEYED_NOTE % _held
+            out.append(note)
+            kept += len(note) + 1
+        _unflushed.pop(_k, None)
         run_line = line
     _flush()
+    # The remainder, in one line rather than one per message: a held repeat that
+    # never met another copy of itself still has to be reported, or the bundle
+    # would be quietly shorter than the truth.
+    _left = sum(_unflushed.values())
+    if _left:
+        note = _TAIL_KEYED_TAIL_NOTE % (_left, len(_unflushed))
+        out.append(note)
+        kept += len(note) + 1
     stats["keptBytes"] = kept
     return out
 
@@ -25631,6 +25700,36 @@ _CHATGPT_INLINE_ACTIVITY_JS = """() => {
                               || asst[asst.length - 1]) : null;
         if (turn) scope = 'role-parent';
     }
+    // ⛔⛔ 2026-08-20 — AND THE CONTAINER THE CHIPS ARE ACTUALLY IN. Neither arm
+    // above accepts `[data-testid^="conversation-turn"]`, so on a page whose turn
+    // is a SECTION with that testid and no assistant-role element this walker
+    // returned NULL and the caller read zero chips — while eight hostnames sat on
+    // screen. Measured in the 08-20 e2e, one second apart, from two probes on the
+    // same page:
+    //     21:46:35  miss #2 … chips 0->0
+    //     21:46:35  snapshot rows: docs.nvidia.com, hermes-agent.org,
+    //               developer.nvidia.com, github.com, www.nvidia.com,
+    //               build.nvidia.com, www.lasso.security, "16 more"
+    // Every one of those rows reported `inTurn: true` — which is THIS selector.
+    // So the opener and the reader disagreed about what a turn is, and only the
+    // reader's answer could stop the chips reaching the app.
+    //
+    // ⭐ LAST, not first. `article` has the success record and is left to answer
+    // ahead of this; the new arm only picks up pages the old two abandoned.
+    // ⭐ And it skips a turn holding the USER's own message: this testid is on
+    // user turns too, so on a page where the assistant's turn has not rendered
+    // yet the last match would be the brief we pasted.
+    if (!turn) {
+        try {
+            const secs = main.querySelectorAll('[data-testid^="conversation-turn"]');
+            for (let i = secs.length - 1; i >= 0; i--) {
+                if (secs[i].querySelector('[data-message-author-role="user"]')) continue;
+                turn = secs[i];
+                scope = 'turn-testid';
+                break;
+            }
+        } catch (e) {}
+    }
     if (!turn) return null;
     // ⛔⛔ 2026-08-19 — THE ARTICLE SCOPE IS NOT ALWAYS THERE, AND THE WALK DIED
     // SILENTLY WHEN IT WASN'T. The 19 August P1 phase ran 13.7 minutes and logged
@@ -26599,7 +26698,8 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
                        structuralCapped: false, prose: 0,
                        // PASS 0's own accounting: did it run, how many rows
                        // reached its band, and what threw the rest out.
-                       structRan: false, structAnchor: '', structInBand: 0,
+                       structRan: false, structAnchor: '', structSkip: '',
+                       structInBand: 0,
                        structOffBand: 0, structShape: 0, structProse: 0,
                        structNoSignal: 0, structQualified: 0, structVia: '' };
 
@@ -26811,6 +26911,14 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
         // the pass that has 13 successes gets to answer first.
         let deferredStructural = null;
         let deferredStructuralCount = 0;
+        // ⛔ WHICH reason, recorded. The census used to say "no turn and no
+        // on-screen user message" whenever this pass did not run — naming two
+        // causes on evidence for neither, which is the exact sin the miss-reason
+        // function above documents fixing. In the 08-20 e2e it printed that while
+        // every snapshot in the same run read `lub: 202`, so the stated cause was
+        // impossible and the real one (the caller asking to skip) went unsaid.
+        DIAG.structSkip = skipStructural ? 'caller asked to skip'
+                        : (lub > 0 ? '' : 'no user message on screen');
         if (!skipStructural && lub > 0) {
             DIAG.structRan = true;
             DIAG.structAnchor = 'lub';
@@ -27108,6 +27216,7 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
             // "nothing matched" could not say whether the structural pass had
             // even run — and on 08-19 it had not.
             structRan: DIAG.structRan, structAnchor: DIAG.structAnchor,
+            structSkip: DIAG.structSkip,
             structInBand: DIAG.structInBand, structOffBand: DIAG.structOffBand,
             structShape: DIAG.structShape, structProse: DIAG.structProse,
             structNoSignal: DIAG.structNoSignal,
@@ -27280,7 +27389,8 @@ def _chatgpt_structural_census(res) -> str:
     lesson applies, so this adds one clause, not a table."""
     res = res or {}
     if not res.get("structRan"):
-        return " · structural pass DID NOT RUN (no turn and no on-screen user message)"
+        why = res.get("structSkip") or "reason not recorded"
+        return f" · structural pass DID NOT RUN ({why})"
     bits = [f"anchor={res.get('structAnchor') or '?'}",
             f"in-band={int(res.get('structInBand') or 0)}"]
     for key, name in (("structOffBand", "off-band"), ("structProse", "prose"),

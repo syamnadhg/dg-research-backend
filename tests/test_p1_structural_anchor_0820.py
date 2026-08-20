@@ -266,6 +266,83 @@ class TestItStillRefusesTheAgentsOwnReport:
         assert got.get("clicked") is not True, got
 
 
+# ── 4b. the container the chips actually live in ────────────────────────────
+
+class TestTheInlineWalkerAcceptsATurnTestid:
+    """⛔⛔ From the 08-20 e2e. The scraper was never blind — fed the captured chip
+    row it returns 7 chips, 7 hostnames and drops "16 more". It just never RAN:
+    it resolves the turn as an <article> or an assistant-role element, and these
+    chips live under a SECTION carrying `data-testid="conversation-turn-2"`. No
+    article, no assistant role, so it returned null and the caller read zero.
+
+    The proof is one second wide, from two probes on the same page:
+        21:46:35  miss #2 … chips 0->0
+        21:46:35  snapshot: docs.nvidia.com, hermes-agent.org, github.com, …
+    Every one of those rows reported `inTurn: true` — which is that selector."""
+
+    HOSTS = ["docs.nvidia.com", "hermes-agent.org", "developer.nvidia.com",
+             "github.com", "www.nvidia.com", "build.nvidia.com",
+             "www.lasso.security", "16 more"]
+
+    def _kids(self):
+        rows = [el("div", {"class": "text-token-text-tertiary", "anim": "shimmer",
+                           "clip": "text", "w": "300", "h": "24", "x": "300",
+                           "y": "242"}, "Searching the web")]
+        rows += [el("div", {"class": "flex", "w": "140", "h": "22", "x": "300",
+                            "y": str(278 if i < 5 else 307)}, h)
+                 for i, h in enumerate(self.HOSTS)]
+        return rows
+
+    def _page(self, *kids):
+        return el("body", {"w": "1440", "h": "900"}, "", [
+            el("main", {"w": "1440", "h": "900"}, "", [
+                el("div", {"data-message-author-role": "user", "w": "600",
+                           "h": "60", "x": "300", "y": "142"}, "the brief"),
+                *kids])])
+
+    def _walk(self, spec):
+        return run_js(spec, research._CHATGPT_INLINE_ACTIVITY_JS)["ret"]
+
+    @needs_node
+    def test_a_section_turn_with_no_article_is_read(self):
+        out = self._walk(self._page(
+            el("section", {"data-testid": "conversation-turn-2", "w": "800",
+                           "h": "400", "x": "300", "y": "230"}, "", self._kids())))
+        assert out is not None, "the walker bailed out on the live shape"
+        assert out["chips"] == 7, out
+        assert out["chip_row"] is True, out
+        assert "docs.nvidia.com" in out["source_hosts"], out
+
+    @needs_node
+    def test_the_count_chip_is_not_a_hostname(self):
+        out = self._walk(self._page(
+            el("section", {"data-testid": "conversation-turn-2", "w": "800",
+                           "h": "400", "x": "300", "y": "230"}, "", self._kids())))
+        assert "16 more" not in out["source_hosts"], out["source_hosts"]
+
+    @needs_node
+    def test_a_turn_holding_the_users_own_message_is_refused(self):
+        """⭐ This testid is on USER turns too. Before the assistant's turn
+        renders, the last match would be the brief we pasted — and a brief full
+        of hostnames would be read as ChatGPT's sources."""
+        out = self._walk(self._page(
+            el("section", {"data-testid": "conversation-turn-1", "w": "800",
+                           "h": "80", "x": "300", "y": "150"}, "", [
+                el("div", {"data-message-author-role": "user", "w": "600",
+                           "h": "60", "x": "300", "y": "150"},
+                   "compare docs.example.com and github.com")])))
+        assert out is None, out
+
+    @needs_node
+    def test_an_article_still_answers_first(self):
+        """⭐ The new arm is LAST. `article` has the success record; this only
+        picks up pages the old two abandoned."""
+        out = self._walk(self._page(
+            el("article", {"data-testid": "conversation-turn-2", "w": "800",
+                           "h": "400", "x": "300", "y": "230"}, "", self._kids())))
+        assert out["dbg"]["scope"] == "article", out["dbg"]
+
+
 # ── 5. a miss now names its own gate ────────────────────────────────────────
 
 class TestAMissNamesTheGate:
@@ -273,6 +350,60 @@ class TestAMissNamesTheGate:
     def test_a_pass_that_never_ran_says_so(self):
         line = research._chatgpt_structural_census({"reason": "no_match"})
         assert "DID NOT RUN" in line, line
+
+    def test_it_names_ONE_cause_and_the_right_one(self):
+        """⛔⛔ My own line, and it committed the sin the function it lives in
+        documents fixing: it said "no turn and no on-screen user message" for
+        every non-run. In the 08-20 e2e it printed exactly that while every
+        snapshot in the same run read `lub: 202` — so the cause it named was
+        impossible, and the real one (the caller asking to skip) went unsaid."""
+        skipped = research._chatgpt_structural_census(
+            {"reason": "no_match", "structSkip": "caller asked to skip"})
+        no_anchor = research._chatgpt_structural_census(
+            {"reason": "no_match", "structSkip": "no user message on screen"})
+        assert "caller asked to skip" in skipped, skipped
+        assert "no user message on screen" in no_anchor, no_anchor
+        assert skipped != no_anchor
+        for line in (skipped, no_anchor):
+            assert "no turn" not in line, line
+
+    def test_an_unrecorded_reason_says_that_rather_than_guessing(self):
+        line = research._chatgpt_structural_census({"reason": "no_match"})
+        assert "not recorded" in line, line
+
+    @needs_node
+    def test_the_PAGE_actually_fills_the_reason_in(self):
+        """⛔⛔ Found by mutation, and it is the third time today: the two tests
+        above hand the renderer a `structSkip` themselves, so they pass whether or
+        not the page ever sets one. Pin the PRODUCER — that is the whole
+        `helper-pinned-caller-not` lesson, and I keep re-learning it.
+
+        Nothing clickable on the page, so the walk returns its miss diagnostic
+        rather than clicking and returning early."""
+        quiet = el("body", {"w": "1440", "h": "900", "x": "0", "y": "0"}, "", [
+            el("main", {"w": "1440", "h": "900", "x": "0", "y": "0"}, "", [
+                el("div", {"data-message-author-role": "user", "w": "600",
+                           "h": "60", "x": "300", "y": "142"}, "the brief"),
+                el("div", {"class": "markdown", "w": "800", "h": "600",
+                           "x": "300", "y": "260"},
+                   "Report body, which on a live page runs to pages. " * 8)])])
+        asked_to_skip = _open(quiet, skip_structural=True)
+        assert asked_to_skip.get("structSkip") == "caller asked to skip", asked_to_skip
+
+        off_screen = el("body", {"w": "1440", "h": "900", "x": "0", "y": "0"}, "", [
+            el("main", {"w": "1440", "h": "900", "x": "0", "y": "0"}, "", [
+                el("div", {"data-message-author-role": "user", "w": "600",
+                           "h": "60", "x": "300", "y": "-900"}, "scrolled away"),
+                el("div", {"class": "markdown", "w": "800", "h": "600",
+                           "x": "300", "y": "260"},
+                   "Report body, which on a live page runs to pages. " * 8)])])
+        scrolled = _open(off_screen)
+        assert scrolled.get("structSkip") == "no user message on screen", scrolled
+
+        # and the census renders each of them differently, end to end
+        a = research._chatgpt_structural_census(asked_to_skip)
+        b = research._chatgpt_structural_census(scrolled)
+        assert a != b and "not recorded" not in a and "not recorded" not in b, (a, b)
 
     def test_a_pass_that_ran_reports_its_band_and_what_it_threw_out(self):
         line = research._chatgpt_structural_census(

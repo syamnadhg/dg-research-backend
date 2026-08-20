@@ -123,7 +123,46 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
        "mapped|designed|compared|scoped|structured|developed)\\\\b/i;")],
      [T_NEW]),
 
+    # ══ the container the chips live in (08-20 e2e) ════════════════════════
+    ("T1", "under", "⭐⭐ THE 08-20 BUG — the inline walker stops accepting a "
+     "`conversation-turn` section, so on the page the chips actually render in it "
+     "returns null and the caller reads zero chips while eight hostnames are on "
+     "screen",
+     [("""    if (!turn) {
+        try {
+            const secs = main.querySelectorAll('[data-testid^="conversation-turn"]');""",
+       """    if (false) {
+        try {
+            const secs = main.querySelectorAll('[data-testid^="conversation-turn"]');""")],
+     [T_NEW]),
+    ("T2", "over", "⛔ the user's own turn is accepted, so before the assistant's "
+     "turn renders the brief WE pasted is read as ChatGPT's sources — a brief "
+     "full of hostnames would sail straight in",
+     [("                if (secs[i].querySelector('[data-message-author-role=\"user\"]')) continue;",
+       "                if (false) continue;")],
+     [T_NEW]),
+    ("T3", "over", "the new arm answers BEFORE `article`, stealing the decision "
+     "from the path with the success record",
+     [("    if (!turn) {\n        try {\n            const secs = main.querySelectorAll",
+       "    if (true) {\n        try {\n            const secs = main.querySelectorAll")],
+     [T_NEW]),
+
     # ══ the census — without it the next run says nothing again ═════════════
+    ("C7", "under", "⛔⛔ the census goes back to naming TWO causes on evidence "
+     "for neither — the exact sin the miss-reason function documents fixing, and "
+     "it printed an impossible one in the 08-20 run",
+     [('        why = res.get("structSkip") or "reason not recorded"\n'
+       '        return f" · structural pass DID NOT RUN ({why})"',
+       '        return " · structural pass DID NOT RUN (no turn and no '
+       'on-screen user message)"')],
+     [T_NEW]),
+    ("C8", "under", "the skip reason is never recorded, so the census can only "
+     "say it does not know",
+     [("        DIAG.structSkip = skipStructural ? 'caller asked to skip'\n"
+       "                        : (lub > 0 ? '' : 'no user message on screen');",
+       "        DIAG.structSkip = '';")],
+     [T_NEW]),
+
     ("C1", "under", "the miss line stops carrying the census, so twenty-three "
      "identical lines can once again mean three different pages",
      [("                + _chatgpt_structural_census(res))", "                )")],
@@ -131,7 +170,8 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     ("C2", "under", "a pass that never ran reports the same way as one that ran "
      "and found nothing",
      [('    if not res.get("structRan"):\n'
-       '        return " · structural pass DID NOT RUN (no turn and no on-screen user message)"',
+       '        why = res.get("structSkip") or "reason not recorded"\n'
+       '        return f" · structural pass DID NOT RUN ({why})"',
        '    if not res.get("structRan"):\n        return ""')],
      [T_NEW]),
     ("C3", "under", "the pass stops recording that it ran at all",
