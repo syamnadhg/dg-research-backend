@@ -293,6 +293,72 @@ above its own `def`.
 
 ---
 
+## Diagnostics: telemetry, log quieting, support bundles (2026-08 wave)
+
+⛔ **The problem all three solve.** A new owner's machine lost DNS for Google's
+hosts. Pairing failed, the reconnect ladder retried forever, the aegis pulse kept
+reporting "standing watch", and the only account of the failure anyone ever
+received was **a photograph of a terminal**. Nothing on that machine could report
+that it was in trouble, because nothing on any machine ever reported anything.
+
+### `telemetry.py` — the content-free tier
+
+What the team can see **without being sent anything**. The obvious design is a
+small JSON blob with the sensitive parts scrubbed on the way out; a scrubber leaks
+the first time somebody adds a field, and somebody always adds a field. So there
+is **no free text at all** — every field is an int, a bool, or an enum.
+`research_id` is the module's single string parameter and is regex-guarded to the
+shape the frontend actually mints (`chat_${Date.now()}_${counter}`). A research
+topic reaching this module is not a scrubbing miss, it is a `TypeError`.
+
+Spools to disk and flushes opportunistically, because **no transport works during
+the outage it exists to report**. Imports nothing first-party, so a telemetry
+failure can never sit in the path of the thing it is reporting on.
+
+### `logquiet.py` — repeat suppression, not silence
+
+**Measured, not reasoned about.** Three lines, one defect — a true statement
+restated until it destroyed the file it was written into:
+
+| Line | Share of the file it flooded |
+|---|---|
+| `telemetry: no id-token accessor …` | 412 of 1,367 lines — **33.9% of bytes** |
+| `[aegis] worker N: standing watch` | 2,274 of 2,754 lines in the last 5 MiB of two raw logs |
+| `refresh: network error … securetoken…` | 13,479 of 14,083 lines — **95.7%** |
+
+The first two together were **43.7% of the bytes** in the session log a user sends
+with `--send-logs`. Two sentences, half the evidence.
+
+⭐ **The fix is not silence, and that distinction is the whole design.** Every one
+of those lines is worth having **once** — the accessor line is the only account of
+a wiring fault that made every telemetry batch anonymous, and the refresh line is
+the single line that diagnosed a new owner's entire outage. What is worthless is
+the 412th copy. A suppressed repeat is therefore **counted, not discarded**, and
+the count rides the next line that does get emitted: a reader learns strictly more
+from `(+247 since the last of these)` than from 247 identical lines. Imports
+nothing first-party, for the same reason as `telemetry.py`.
+
+### Support bundles — quieted at source AND at read time
+
+`_build_log_bundle` assembles a zip; `_tail_bytes` reads the tail of each log
+**backwards from the end, on whole-line boundaries**, under a byte budget and a
+scan cap (`TAIL_SCAN_MAX_BYTES`, tied to `RAW_LOG_ROTATE_BYTES` so it can always
+reach the start of a file that has not rotated). Truncation is **reported** —
+`stats["reachedStart"] == False` — because a reader who cannot tell a tail from a
+whole file concludes the file begins where the tail begins.
+
+Net effect on a real bundle: **8.36 MB → 2.19 MB**, and the share taken up by the
+user's own run rose from **3.3% to 13.1%**. Same bundle, four times the signal.
+
+⚠ The reader is **byte**-oriented throughout. Fixtures in its tests are written
+with `write_bytes`, never `write_text`: on Windows `write_text` performs newline
+translation (LF becomes CRLF on the way to disk), so the fixture would not hold
+the bytes the assertions compare against.
+
+The frontend half — owner-only gating, modern-device gating, the consent copy, the
+support code, and the bucket lifecycle runbook — lives in the app repo's
+`ARCHITECTURE.md` under "Support logs".
+
 ## Package distribution + supply chain
 
 Two packages ship from this repo, both to public PyPI:
@@ -301,6 +367,61 @@ Two packages ship from this repo, both to public PyPI:
 |---|---|---|---|
 | `superresearch` | the backend (`research.py` and friends) | `pipx install superresearch` | `superresearch --update`, or the app's Settings → About |
 | `superresearch-agent` | the chat bridge + `/sr` skill (`agent/facade/`) | `pipx run superresearch-agent connect` | `agent/facade/selfupdate.py`'s detached reconnect |
+
+### What actually ships inside the `superresearch` wheel
+
+`superresearch` is **not** a source distribution. `tools/build_compiled.py` builds
+one platform wheel per OS + CPython minor, compiling the first-party modules to
+native extensions with Nuitka:
+
+| In the wheel | Form |
+|---|---|
+| `research.py` | a ~49-line readable **launcher shim**, nothing more |
+| `_sr_core` | the pipeline itself — `research.py` compiled |
+| `models`, `prompts`, `vision`, `narrate`, `selfheal`, `telemetry`, `logquiet` | compiled extensions |
+| `auth/`, `scripts/` | **source, deliberately** |
+
+**Eight** compiled modules. A wheel showing six or seven was built from a stale
+checkout. A `py3-none-any` wheel means the build fell back to source mode and
+must never be published. Nuitka sets `__file__` to the original `.py` name even
+for a compiled module, so `__file__` is not the signal that something compiled —
+the loader (`nuitka_module_loader`) and the absence of a `.py` on disk are.
+
+⛔ **Two lists have to agree, and for six weeks nothing made them.** pyproject's
+`py-modules` decides what is PACKED into the wheel; `TOP_MODULES` in the build
+script decides what is COMPILED. `selfheal.py` was added to the first and never
+the second, so ~1,160 lines of the self-healing selector engine shipped as
+readable source in every release from **0.1.2 through 0.1.11**. Nothing caught
+it: the build printed DONE, the wheel installed, the suite passed, and the build
+script's own docstring asserted the opposite. It was found only by reading a
+built wheel.
+
+`tests/test_compiled_wheel_covers_every_module.py` now pins the RELATIONSHIP
+(`py-modules ⊆ TOP_MODULES ∪ {shim}`) rather than a hardcoded list — a list would
+need editing by the same person who forgot the build script. It also pins the
+third leg the first two guards missed: *every module-scope first-party import
+must ship at all*. Both pre-existing guards compared those two lists only to each
+other, so a module missing from BOTH satisfied both — which is how `telemetry.py`
+came within one build of a `ModuleNotFoundError` before the first line of output.
+The guard parses with `ast`/`tomllib` and never regex: a regex cannot see a
+commented-out `# "selfheal",`, and that direction fails SILENTLY.
+
+One more packaging trap: setuptools' `build_py` copies declared modules into
+`build/lib` and never prunes, so a module renamed or dropped from `py-modules`
+keeps shipping from a stale copy with no on-disk counterpart. The build clears
+`build/` before packing.
+
+⛔ **Every platform wheel of a release publishes together.** `_latest_on_pypi`
+reads `info.version` — the **global** latest, platform-blind. The moment a version
+exists on PyPI without one platform's wheel, every host on that platform sees
+*latest > current*, passes its own last point of no return, shuts the backend down
+to free the venv, and runs an upgrade that cannot resolve a wheel: **backend down,
+not upgraded**. Neither installer catches it — `install.ps1` disables its platform
+guard when the latest release has no Windows wheel, and `install.sh` gates both
+its guard and its drift check on a variable that is empty in exactly that case.
+Stage all of a release's wheels into one directory and publish in a single
+command; `uv publish` does not recurse into subdirectories, so publishing from a
+tree that keeps one platform in a subfolder silently ships a partial release.
 
 **This is a code-execution supply chain, and it is worth being explicit about
 the surface.** The agent self-update resolves from the configured index —

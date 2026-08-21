@@ -27,6 +27,24 @@ Pairing-side data scope: this backend pairs to a single web-app account at a tim
 
 The supervisor (`--resurrect` / `--retire`) is cross-platform first-class on all three desktop OSes: Scheduled Task on Windows, launchd user agent on macOS (`~/Library/LaunchAgents/com.dgresearch.supervisor.plist`), systemd-user unit on Linux (`~/.config/systemd/user/dgresearch-supervisor.service`). All three share the same `--env-file` config flow (see [`.dg-supervisor.env`](#step-2-environment) below). Linux also requires `sudo loginctl enable-linger $USER` so the user-systemd manager survives logout; `--resurrect` probes and surfaces a WARN if Linger=no.
 
+### Python version — the installed build is per-CPython-minor
+
+**Python 3.11+ is the floor for a SOURCE checkout.** The published `superresearch`
+package is different: it ships **compiled** platform wheels (Nuitka), and a
+compiled extension is built against **one** CPython minor. So a release carries
+one wheel per platform + CPython minor, and pipx needs an interpreter matching
+one of them — "3.11+" is not sufficient on that path.
+
+The installer handles this for you: it reads the latest release's file list,
+derives which minors that platform has a wheel for, and installs (or fetches) a
+matching Python. You only need to care when installing by hand — check the
+filenames on PyPI and match the `cp3XX` tag. As of 0.1.13 that is Windows
+`cp314`, macOS `cp313` (arm64 only), Linux `cp312` (x86_64). Different minors
+across platforms are **expected**, not an inconsistency: each box builds on its
+own interpreter.
+
+A **source** checkout has no such constraint — it runs on any 3.11+.
+
 ## Before you start (prerequisites checklist)
 
 - **Python 3.11+** (`python --version`).

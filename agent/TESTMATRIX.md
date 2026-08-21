@@ -1,7 +1,7 @@
 # Super Agent — test matrix (P7)
 
 What each surface is covered by, and what only a live run can prove. Run the
-suite with `pytest` (652 tests; ruff clean). The bridge is the single owner of
+suite with `pytest` (862 tests; ruff clean). The bridge is the single owner of
 the account session — every CLI/skill command routes through it over loopback.
 
 ## Coverage
