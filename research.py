@@ -26604,6 +26604,80 @@ def panel_cua_should_escalate(*, dom_misses, attempts, panel_open, blocked=False
     return dom_misses >= _PANEL_CUA_RETRY_AT_MISSES[attempts]
 
 
+#: How long a never-opened panel must have been never-opened before the vision
+#: rescue is allowed to spend a call on it. Env-overridable like its neighbours.
+try:
+    _VISION_URL_CLOSED_PANEL_MIN_S = int(
+        os.environ.get("DG_VISION_URL_CLOSED_PANEL_MIN_S", "300"))
+except ValueError:
+    _VISION_URL_CLOSED_PANEL_MIN_S = 300
+
+
+def vision_url_rescue_should_run(*, agent, panel_open, elapsed_sec,
+                                 dom_source_count, open_attempts_burned=0,
+                                 dom_misses=0, ever_opened=False) -> tuple:
+    """Should the screenshot source-rescue run right now? Returns (bool, reason).
+
+    ⛔⛔ THE DEFECT THIS FIXES IS THE SIGNATURE ONE IN THIS FILE: the rescue was
+    gated on `artifact_panel_open`, i.e. on the very condition it exists to
+    rescue. Measured on this machine's own logs — `didn't stick` fired 28 times
+    against 23 `artifact panel opened`, and Claude's rescue succeeded 3 times
+    ever against ChatGPT's 9. The panel fails to open MORE often than it opens,
+    and every one of those runs was refused the only fallback it had left.
+
+    The three original arms are kept verbatim. The fourth is the never-opened
+    case, and it is deliberately narrow because it costs a model call:
+
+      * the panel has NEVER opened this phase — not merely closed right now. A
+        panel that opened earlier had its chance and took the first arm.
+      * the opener is out of road: its click budget is spent, or DOM misses have
+        passed the last CUA-escalation threshold. ⛔ Without this the rescue burns
+        its single shot on an early blank frame and then sets `vision_urls_done`,
+        so a panel that opens later never gets rescued at all — strictly worse
+        than doing nothing.
+      * past `_VISION_URL_CLOSED_PANEL_MIN_S`, so an early run is not screenshot
+        before Claude has rendered anything.
+      * DOM sources are still ZERO. A run that already has sources does not need
+        rescuing, and this is what bounds the cost to the failing runs only.
+
+    Because the caller sets `vision_urls_done` on both the success and failure
+    paths, this adds AT MOST ONE extra call per run.
+
+    ⚠ CLAUDE ONLY, and that is a decision rather than an oversight. The first
+    version of this arm covered ChatGPT too, and to do that it read three `p`
+    keys — `chatgpt_panel_reopens`, `chatgpt_activity_dom_misses`,
+    `_chatgpt_panel_ever_open` — that DO NOT EXIST. All three would have read
+    absent, so the arm would have concluded "opener still trying" forever: a
+    guard that cannot fire, added while fixing a guard that could not fire.
+    ChatGPT's real state lives under different names, its rescue already
+    succeeds three times as often, and nothing has been measured about its
+    never-opened case. Widening this to an unmeasured path is not a bug fix.
+
+    Pure and module-level: the caller is a closure inside
+    `poll_all_agents_round_robin`, which nothing in the suite executes, so a
+    predicate written inline there could only ever be source-scanned — and
+    mutation has already proved a source-scanned gate can ship inverted.
+    """
+    if agent in ("ChatGPT", "Claude") and panel_open:
+        return True, "panel-open"
+    if agent == "Gemini" and int(elapsed_sec or 0) > 120:
+        return True, "gemini-elapsed"
+    if agent != "Claude":
+        return False, "no-arm"
+    if ever_opened:
+        return False, "panel-opened-earlier"
+    if int(dom_source_count or 0) > 0:
+        return False, "dom-has-sources"
+    if int(elapsed_sec or 0) < _VISION_URL_CLOSED_PANEL_MIN_S:
+        return False, "too-early"
+    _out_of_road = (int(open_attempts_burned or 0) >= 3
+                    or int(dom_misses or 0) >= _PANEL_CUA_RETRY_AT_MISSES[-1])
+    if not _out_of_road:
+        return False, "opener-still-trying"
+    return True, (f"panel-never-opened, reopens={int(open_attempts_burned or 0)}/3, "
+                  f"dom_misses={int(dom_misses or 0)}, dom_sources=0")
+
+
 async def _log_chatgpt_thread_snapshot(page, tag=""):
     """#913 (instrument-with-logs directive): one compact structural line of
     the thread region below the last user message + the frame inventory, so
@@ -30558,6 +30632,54 @@ def merge_claude_sources(snap: dict, urls=None, hosts=None,
     return out
 
 
+def claude_sources_run_verdict(*, url_count, observed_count, panel_ever_opened,
+                               toggle_outcome) -> tuple:
+    """The one line that says whether a FINISHED Claude run gave us its sources.
+
+    Returns ``(message, level)``. This is the item's "one WARN for a never-opened
+    panel", moved to where it is actually owner-relevant — and the move is the
+    point, not a dodge.
+
+    A never-opened panel by itself is NOT owner-actionable: nothing in settings
+    or a retry addresses it, the report still extracts through an independent
+    path, and `note_line` folds every WARN into the per-run meta a support bundle
+    is triaged on — so a benign per-phase WARN makes an ordinary run look faulty.
+    What IS worth an owner's attention is the OUTCOME: a finished run whose
+    sources we do not have.
+
+    So the severity turns on the one distinction that has been invisible all
+    along — whether a zero is Claude's answer or our blindness:
+
+      * urls > 0                      → INFO. We have them.
+      * urls == 0, Claude said N > 0  → WARN. The number exists and the sources
+                                        do not; that gap is ours.
+      * urls == 0, the toggle said 0  → INFO. Claude genuinely had none. The
+                                        disclosure is authoritative here, and
+                                        this is the only reason it is worth
+                                        pressing at all.
+      * urls == 0, no number anywhere → WARN. We cannot tell an empty run from a
+                                        blind one, which is exactly the state 13
+                                        of 22 corpus runs ended in.
+    """
+    u = int(url_count or 0)
+    n = int(observed_count or 0)
+    tail = (f"(panel_ever_opened={bool(panel_ever_opened)}, "
+            f"toggle={toggle_outcome or 'not-read'})")
+    if u > 0:
+        return (f"[Claude] finished with {u} source urls "
+                f"(Claude's own count: {n or 'unknown'}) {tail}", "INFO")
+    if n > 0:
+        return (f"[Claude] finished with ZERO source urls while Claude reported "
+                f"{n} sources — the count is ours, the sources are not {tail}",
+                "WARN")
+    if toggle_outcome == "disabled":
+        return ("[Claude] finished with no sources, and its own disclosure says "
+                f"0 — an empty result, not a failed read {tail}", "INFO")
+    return ("[Claude] finished with ZERO sources from every tier and no count "
+            "from Claude either — an empty run and a blind read are "
+            f"indistinguishable here {tail}", "WARN")
+
+
 async def claude_finished_sources_read(page, p, snapshots, *,
                                        agent_key: str = "claude"):
     """Press Claude's sources disclosure ONCE, at the point the run is done.
@@ -30589,6 +30711,7 @@ async def claude_finished_sources_read(page, p, snapshots, *,
         return None
     msg, lvl = claude_sources_log_line(res)
     log(msg, lvl)
+    snap = None
     try:
         snap = (snapshots or {}).get(agent_key)
         if isinstance(snap, dict):
@@ -30601,6 +30724,19 @@ async def claude_finished_sources_read(page, p, snapshots, *,
                     f"snapshot ({before} -> {after})", "INFO")
     except Exception as e:
         log(f"[Claude] sources merge into snapshot skipped: {e}", "DEBUG")
+    # The run-level verdict, AFTER the merge so it judges the final numbers. This
+    # is the only place that can say whether a zero is Claude's answer or ours.
+    try:
+        _s = snap if isinstance(snap, dict) else {}
+        _vmsg, _vlvl = claude_sources_run_verdict(
+            url_count=len(_s.get("source_urls") or []),
+            observed_count=int(_s.get("observed_sources", 0) or 0),
+            panel_ever_opened=bool((p or {}).get("_claude_panel_ever_open")),
+            toggle_outcome=res.get("outcome"),
+        )
+        log(_vmsg, _vlvl)
+    except Exception as e:
+        log(f"[Claude] sources run verdict skipped: {e}", "DEBUG")
     return res
 
 
@@ -30613,6 +30749,16 @@ async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None,
     already_open=True: skip the click step (panel already open from prior poll)."""
     artifact_count = await _count_claude_artifacts(page)
     if artifact_count == 0:
+        # ⛔ THIS RETURN WAS COMPLETELY SILENT, and it is the earliest gate in the
+        # whole Claude tracking path — a wrong zero (selectors matched nothing on
+        # a page that does have a card) is byte-identical to a genuine zero, and
+        # both skipped the panel read, the CUA fallback and every log line with
+        # it. Measured: 28 of 147 tracking reads came back with no panel at all.
+        # The caller's DOM-miss counter is the only trace, and it is DEBUG.
+        # Saying so costs nothing and makes the difference diagnosable.
+        log("[Claude] artifact tracking skipped — the card count read 0 "
+            "(no card rendered yet, or the card selectors matched nothing)",
+            "DEBUG")
         return None
 
     content = ""
@@ -38665,8 +38811,18 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     except Exception:
                         pass
                     if artifact_data:
-                        p["claude_artifact_dom_misses"] = 0  # reset on success
+                        # ⛔⛔ THE RESET USED TO SIT HERE, one level out, so ANY
+                        # returned data — a checklist with steps and sections and
+                        # not one url — cleared the miss counter. That counter is
+                        # the sole input to `panel_cua_should_escalate`, so a
+                        # panel that reliably rendered its checklist and never a
+                        # citation DISARMED the escalation written for exactly
+                        # that case, on every cycle, forever. "Data came back" is
+                        # not "the read worked": what this path is trying to
+                        # obtain is SOURCES, and 74 of 78 reads in the corpus
+                        # returned exactly one url.
                         if artifact_data.get("source_urls"):
+                            p["claude_artifact_dom_misses"] = 0  # reset on a real read
                             for key in ("source_urls", "steps", "sections", "tool_uses"):
                                 if artifact_data.get(key):
                                     existing = progress.get(key, []) or []
@@ -38699,6 +38855,25 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                                      dom_ground_truth=_gt_from_box(
                                                          artifact_data.get("click_box"),
                                                          artifact_count=artifact_data.get("artifact_count")))
+                        else:
+                            # ⛔ THE QUIETEST OUTCOME IN THE PATH: the panel was
+                            # read, it returned steps and sections, and not one
+                            # source url — and nothing was logged at all. This is
+                            # the shape 74 of 78 corpus reads had, so it is the
+                            # NORMAL case, not an edge one.
+                            #
+                            # ⚠ The DOM-miss counter is deliberately NOT bumped
+                            # here. That counter drives the CUA tier-3, whose job
+                            # is to OPEN the panel — and the panel is open. The
+                            # rescue for "open but source-less" is the vision
+                            # pass, which already takes its panel-open arm.
+                            log(f"[Claude] artifact panel read returned no source "
+                                f"urls (steps={len(artifact_data.get('steps') or [])}, "
+                                f"sections={len(artifact_data.get('sections') or [])}, "
+                                f"layer={artifact_data.get('layer')}, "
+                                f"walker_root={artifact_data.get('walker_root') or 'none'}, "
+                                f"panel_open={_now_open}) — the checklist is not "
+                                f"the source list", "INFO")
                     else:
                         # No artifact detected — count as DOM miss for CUA escalation.
                         if not _now_open:
@@ -39233,16 +39408,37 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # Disabled by setting DG_VISION_URL_EXTRACT=0.
             if (os.environ.get("DG_VISION_URL_EXTRACT", "1") == "1"
                     and not p.get("vision_urls_done")):
-                _gate_ok = (
-                    (name == "ChatGPT" and p.get("chatgpt_activity_panel_open"))
-                    or (name == "Claude" and p.get("artifact_panel_open"))
-                    or (name == "Gemini" and elapsed > 120)
+                _panel_open_now = bool(
+                    p.get("chatgpt_activity_panel_open") if name == "ChatGPT"
+                    else p.get("artifact_panel_open"))
+                _gate_ok, _gate_why = vision_url_rescue_should_run(
+                    agent=name,
+                    panel_open=_panel_open_now,
+                    elapsed_sec=int(elapsed),
+                    dom_source_count=int(progress.get("sources", 0) or 0),
+                    # Claude's real poll-state keys. The never-opened arm is
+                    # Claude-only (see the predicate), so these are read
+                    # unconditionally rather than through an agent branch that
+                    # would need names ChatGPT does not have.
+                    open_attempts_burned=int(p.get("claude_panel_reopens", 0) or 0),
+                    dom_misses=int(p.get("claude_artifact_dom_misses", 0) or 0),
+                    ever_opened=bool(p.get("_claude_panel_ever_open")),
                 )
                 if _gate_ok:
+                    if _gate_why.startswith("panel-never-opened"):
+                        # The rescue firing on a never-opened panel is not
+                        # owner-actionable — but "ran and found nothing" and
+                        # "never ran" were indistinguishable before, and that is
+                        # the whole reason this line exists.
+                        log(f"[{name}] vision-urls rescue on a panel that never "
+                            f"opened ({_gate_why})", "INFO")
                     try:
                         _vu = await extract_source_urls_via_vision(
                             p["page"], normalize_agent_key(name),
                             last_dom_count=int(progress.get("sources", 0) or 0))
+                        if not _vu:
+                            log(f"[{name}] vision-urls found no urls "
+                                f"(gate={_gate_why})", "INFO")
                         if _vu:
                             existing = progress.get("source_urls") or []
                             seen_v = set(existing)

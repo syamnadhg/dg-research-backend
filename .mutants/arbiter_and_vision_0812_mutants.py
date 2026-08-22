@@ -32,7 +32,10 @@ RESEARCH = "research.py"
 
 SUITES = ("tests/test_arbiter_throttle_0812.py "
           "tests/test_vision_url_budget_0812.py "
-          "tests/test_queue_gate_and_vision_urls_0811.py")
+          "tests/test_queue_gate_and_vision_urls_0811.py "
+          # 2026-08-22: V11's subject moved into `vision_url_rescue_should_run`,
+          # and this is the suite that owns the predicate now.
+          "tests/test_claude_silent_gates_0822.py")
 
 MUTANTS = [
     # ══════════════════ fix 1 — the arbiter re-probe throttle ══════════════
@@ -148,9 +151,15 @@ MUTANTS = [
      [('                        p["vision_urls_done"] = True\n'
        "                    except Exception as _vue:",
        "                    except Exception as _vue:")]),
+    # 2026-08-22 — RE-ANCHORED, not rewritten. The gate this mutant attacks was an
+    # inline `_gate_ok` tuple; it is now the pure predicate
+    # `vision_url_rescue_should_run`, because gating the rescue on the panel being
+    # OPEN meant a never-opened panel — 28 of 147 reads in the corpus — was refused
+    # the only fallback it had. The mutant's intent is unchanged: drop the
+    # panel-open REQUIREMENT and a closed panel pays the full timeout.
     ("V11", "over", "the panel gate is dropped — a closed panel costs the full timeout",
-     [('                    (name == "ChatGPT" and p.get("chatgpt_activity_panel_open"))',
-       '                    (name == "ChatGPT")')]),
+     [('    if agent in ("ChatGPT", "Claude") and panel_open:',
+       '    if agent in ("ChatGPT", "Claude"):')]),
 
 ]
 

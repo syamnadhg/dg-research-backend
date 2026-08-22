@@ -613,6 +613,29 @@ class TestFinishedSourcesRead:
         assert snaps["claude"]["sources"] == 2
         assert snaps["claude"]["observed_sources"] == 553
 
+    def test_the_run_verdict_judges_the_merged_numbers(self):
+        """⛔ Mutation caught this: the verdict reading an EMPTY snapshot instead
+        of the merged one survived every other test. It has to judge the numbers
+        the panel read produced, or it reports the state before the read it is
+        summarising — and would call every run blind."""
+        page = _FakePage([_state(expanded=True, count=44,
+                                urls=[f"https://s{i}.com" for i in range(44)],
+                                hosts=[f"s{i}.com" for i in range(44)])])
+        snaps = {"claude": {"source_urls": [], "sources": 0,
+                            "observed_sources": 0}}
+        lines = []
+        orig = research.log
+        research.log = lambda m, lvl="INFO": lines.append((m, lvl))
+        try:
+            asyncio.run(research.claude_finished_sources_read(page, {}, snaps))
+        finally:
+            research.log = orig
+        verdicts = [(m, lvl) for m, lvl in lines if "finished with" in m]
+        assert verdicts, "the run verdict must be logged"
+        msg, lvl = verdicts[-1]
+        assert lvl == "INFO", msg
+        assert "44 source urls" in msg, msg
+
     def test_it_runs_at_most_once_per_run(self):
         page = _FakePage([_state(expanded=True)])
         p = {}
