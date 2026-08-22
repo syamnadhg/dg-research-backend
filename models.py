@@ -1130,11 +1130,19 @@ def pick_highest_model(labels, family: str, below=None, reject=(), drop_upsell=F
     `drop_upsell=True` additionally discards sales prompts for the family per
     `is_upsell` — see there for why a billing chip is otherwise indistinguishable
     from a model row, and why the exclusion runs regardless of whether the chip
-    carries a version. ⚠ It is OPT-IN rather than always-on so this stays a true
-    mirror of every JS ranker that calls it: the Claude ranker ports the rule and
-    passes it, the Gemini one does not yet, and a default-on rule would put this
-    function's answer at odds with the browser's on the path that has not been
-    ported — which is exactly how the reject rule drifted the first time.
+    carries a version.
+
+    ⚠ IT IS OPT-IN BECAUSE THE TWO RANKERS IT MIRRORS DO NOT AGREE — and NOTHING
+    CALLS THIS FROM THE BROWSER. A ranker is a JS string run through
+    `page.evaluate`, so the rule is hand-PORTED, never shared: `_pick_opus_js` in
+    research.py carries a character-level port of `is_upsell` and is handed this
+    module's `UPSELL_VERBS`/`UPSELL_WINDOW`, while the Gemini Flash ranker has no
+    upsell rule at all. Default-on would put the no-flag answer HERE at odds with
+    the browser on the un-ported path — exactly how the reject rule drifted the
+    first time — so the flag is what lets one function mirror either ranker.
+    (2026-08-21: this paragraph used to say "every JS ranker that calls it: the
+    Claude ranker ports the rule and passes it". Both halves were false. No JS
+    can call a Python function, and no production Python calls this at all.)
 
     ⭐ NO FLOOR PARAMETER. "Highest offered" already cannot pick a downgrade —
     nothing else on the menu is higher — so a floor could only ever REJECT the
@@ -1148,9 +1156,13 @@ def pick_highest_model(labels, family: str, below=None, reject=(), drop_upsell=F
     still selects something instead of emptying the menu.
 
     Returns {'index', 'version', 'label'} of the winner (version may be None),
-    or None. Mirror of the JS rankers in research.py, unit-tested here so the
+    or None.
+
+    ⚠ NO PRODUCTION CALLER — selection happens in the browser. This is the
+    executable SPEC the JS rankers are ported from, unit-tested here so the
     ranking ALGORITHM has real coverage (the live JS can't run without a
-    browser)."""
+    browser); `drop_upsell=True` is exercised only by tests. Read it as the
+    reference implementation, not as a code path a run goes through."""
     rej = [str(r).lower() for r in (reject or [])]
     best = None
     for i, raw in enumerate(labels):

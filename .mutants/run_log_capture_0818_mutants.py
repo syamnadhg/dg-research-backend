@@ -292,13 +292,13 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_CAP]),
     ("B3", "under", "the wrapper stops reading the real call, so every folder is "
      "named local_ and no run can be found by id",
-     [('        return (bound.arguments.get("research_id"),\n                int(bound.arguments.get("_crash_retries") or 0))',
-       '        return None, 0')],
+     [('        return (bound.arguments.get("research_id"),\n                int(bound.arguments.get("_crash_retries") or 0),\n                bound.arguments.get("uid") or None)',
+       '        return None, 0, None')],
      [T_CAP]),
     ("B4", "under", "the attempt counter is dropped, so a retry cannot be told "
      "from its parent",
-     [('                int(bound.arguments.get("_crash_retries") or 0))',
-       '                0)')],
+     [('                int(bound.arguments.get("_crash_retries") or 0),',
+       '                0,')],
      [T_CAP]),
     ("B5", "under", "the signature is bound against something other than the "
      "pipeline itself, so the wrapper can drift from what it forwards",

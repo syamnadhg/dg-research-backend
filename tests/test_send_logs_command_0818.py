@@ -241,9 +241,44 @@ def test_a_device_read_failure_refuses_rather_than_proceeds(db, monkeypatch):
                                            "sourcesRefused": []})
     monkeypatch.setattr(research, "_upload_log_bundle_via_storage_rest",
                         lambda *a, **k: "logs/x")
+    monkeypatch.setattr(research, "load_paired_uid", lambda: "user-rocky")
     research._handle_send_logs_command(_cmd(), "d-1")
-    assert db["_ops"] == [], (
+    assert not any(op[1].startswith("logs/") for op in db["_ops"]), (
         "it took the ownership answer from the command it was meant to check")
+    # ⭐ 08-21: it must still SAY SO. A bare return here is what the app reads as
+    # "this machine's software is out of date", so the refusal has to reach the
+    # one tree we still know — the uid stored locally at pair time.
+    row = db[f"users/user-rocky/logBundles/{CODE}"]
+    assert row["status"] == "failed"
+    assert row["errorClass"] == "DeviceReadFailed"
+
+
+def test_a_device_read_failure_with_no_local_pairing_stays_silent(
+        db, monkeypatch, capsys):
+    """⚠ Stated rather than papered over: with the device read down AND no uid on
+    disk there is no tree to write into, so this one case keeps the old silence.
+    Pinned so nobody later "fixes" it by inventing an owner.
+
+    ⭐ AND IT HAS TO SAY SO LOCALLY. This is the only path that refuses with
+    nothing the app can read, so the machine's own log is the only place the
+    reason survives. Without the line, the guard is unobservable — the
+    downstream writer rejects an empty uid too, so nothing distinguishes a
+    working guard from a redundant one."""
+    _run_sync(monkeypatch)
+
+    class _OnlyDeviceReadFails(_FakeDb):
+        def collection(self, name):
+            if name == "devices":
+                raise RuntimeError("firestore unreachable")
+            return _FakeCollection(self.sink, name)
+
+    monkeypatch.setattr(research, "_firebase_db", _OnlyDeviceReadFails(db))
+    monkeypatch.setattr(research, "load_paired_uid", lambda: None)
+    research._handle_send_logs_command(_cmd(), "d-1")
+    assert db["_ops"] == []
+    out = capsys.readouterr().out
+    assert "NO row" in out, out
+    assert "DeviceReadFailed" in out, out
 
 
 def test_a_command_naming_no_submitter_is_refused(db, monkeypatch, capsys):
@@ -252,9 +287,12 @@ def test_a_command_naming_no_submitter_is_refused(db, monkeypatch, capsys):
     wave 1, naming the actual failure is the point rather than a nicety."""
     _run_sync(monkeypatch)
     research._handle_send_logs_command(_cmd(submittedBy=None), "d-1")
-    assert db["_ops"] == []
+    assert not any(op[1].startswith("logs/") for op in db["_ops"])
     out = capsys.readouterr().out
     assert "names no submitter" in out, out
+    row = db[f"users/user-rocky/logBundles/{CODE}"]
+    assert row["status"] == "failed"
+    assert row["errorClass"] == "SubmitterMissing"
 
 
 def test_a_device_with_no_owner_says_THAT_rather_than_blaming_the_submitter(
@@ -271,10 +309,19 @@ def test_a_device_with_no_owner_says_THAT_rather_than_blaming_the_submitter(
 
 def test_a_sharer_is_refused_even_if_the_rules_let_the_doc_through(db, monkeypatch):
     """⛔ Defense in depth: rules lag deploy, and this one hands over the
-    contents of somebody else's machine."""
+    contents of somebody else's machine.
+
+    ⚠ AND THE ROW LANDS IN THE OWNER'S TREE, not the submitter's — the create
+    rule pins the tree to the device's ownerUid. So this refusal is a record for
+    the machine's owner, NOT a message to the sharer. Pinned here because
+    "the sharer now gets a truthful message" would be a false claim."""
     _run_sync(monkeypatch)
     research._handle_send_logs_command(_cmd(submittedBy="user-alice"), "d-1")
-    assert db["_ops"] == []
+    assert not any(op[1].startswith("logs/") for op in db["_ops"])
+    assert f"users/user-alice/logBundles/{CODE}" not in db
+    row = db[f"users/user-rocky/logBundles/{CODE}"]
+    assert row["status"] == "failed"
+    assert row["errorClass"] == "NotDeviceOwner"
 
 
 def test_a_device_with_no_recorded_owner_is_refused(db, monkeypatch):
@@ -362,13 +409,68 @@ def test_a_missing_or_corrupt_stamp_is_not_a_lockout():
 
 # ══ 6. single-flight ══════════════════════════════════════════════════
 def test_a_second_press_while_one_is_building_is_refused(db, monkeypatch):
+    """⭐⭐ THE ONE AN OWNER ACTUALLY REACHES. Press Send Logs, reload the page
+    while the bundle builds, press again. Worker 1 has already deleted the
+    command doc, so a silent refusal here is exactly the pair the app reads as
+    "this machine's software is older than this setting" — about a machine that
+    is current and is building the bundle right now."""
     _run_sync(monkeypatch)
     research._send_logs_inflight = True
     try:
         research._handle_send_logs_command(_cmd(), "d-1")
     finally:
         research._send_logs_inflight = False
-    assert db["_ops"] == []
+    assert not any(op[1].startswith("logs/") for op in db["_ops"]), (
+        "the second press built a bundle anyway")
+    row = db[f"users/user-rocky/logBundles/{CODE}"]
+    assert row["status"] == "failed"
+    assert row["errorClass"] == "AlreadyBuilding"
+
+
+def test_the_refusal_never_steals_the_other_thread_s_claim(db, monkeypatch):
+    """⛔ The single-flight branch must not clear a flag it did not set. The
+    tempting shape — refuse inside the `with`, then fall through to the reset in
+    `_work`'s finally — would release the FIRST press's claim."""
+    _run_sync(monkeypatch)
+    research._send_logs_inflight = True
+    try:
+        research._handle_send_logs_command(_cmd(), "d-1")
+        assert research._send_logs_inflight is True, (
+            "the refused second press released the running build's claim")
+    finally:
+        research._send_logs_inflight = False
+
+
+def test_a_refusal_row_is_CREATED_at_collecting_then_patched_to_failed(
+        db, monkeypatch):
+    """⛔⛔ THE RULE ONLY PERMITS A CREATE AT 'collecting'
+    (firestore.rules: `request.resource.data.status == 'collecting'`). A refusal
+    written as one `set(status='failed')` is refused by the server, the write is
+    best-effort, and the app is back to the silence this whole fix removes — and
+    the fake database here would accept it happily. So the ORDER is the property,
+    and it has to be asserted, not assumed."""
+    _run_sync(monkeypatch)
+    research._send_logs_inflight = True
+    try:
+        research._handle_send_logs_command(_cmd(), "d-1")
+    finally:
+        research._send_logs_inflight = False
+    path = f"users/user-rocky/logBundles/{CODE}"
+    mine = [op for op in db["_ops"] if op[1] == path]
+    assert [op[0] for op in mine] == ["set", "update"], mine
+    assert mine[0][2]["status"] == "collecting"
+    assert mine[1][2]["status"] == "failed"
+
+
+def test_the_single_flight_row_is_written_outside_the_lock(db, monkeypatch):
+    """⛔ A Firestore round-trip held under _SEND_LOGS_LOCK serialises the fast
+    path behind a network call. A source pin, because no black-box test can see
+    which side of a `with` a call sits on."""
+    src = inspect.getsource(research._handle_send_logs_command)
+    body = src.split("with _SEND_LOGS_LOCK:", 1)[1]
+    guarded = body.split("if _already_building:", 1)[0]
+    assert "_refuse_log_bundle_with_row" not in guarded, (
+        "the row write moved back inside the lock")
 
 
 def test_the_inflight_flag_is_released_even_when_the_build_explodes(db, monkeypatch):

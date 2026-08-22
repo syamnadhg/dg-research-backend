@@ -115,17 +115,17 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     # ══ owner-only, refusing on doubt ═══════════════════════════════════
     ("O1", "under", "a device read failure proceeds instead of refusing — the "
      "one moment the answer is unknown is the one moment it must not guess",
-     [('        log(f"[send-logs] refusing: device read failed ({exc})", "WARN")\n        return',
+     [('        _refuse_log_bundle_with_row(load_paired_uid() or "", code, device_id,\n                                    request_id, "DeviceReadFailed")\n        return',
        '        dev = {"ownerUid": data.get("submittedBy")}')],
      [T_SEND]),
     ("O2", "under", "a command naming no submitter is accepted",
-     [('    if not submitted_by:\n        log("[send-logs] refusing: the command names no submitter", "WARN")\n        return',
-       '    if False:\n        log("[send-logs] refusing: the command names no submitter", "WARN")\n        return')],
+     [('    if not submitted_by:\n        log("[send-logs] refusing: the command names no submitter", "WARN")',
+       '    if False:\n        log("[send-logs] refusing: the command names no submitter", "WARN")')],
      [T_SEND]),
     ("O3", "under", "⛔⛔ the owner check goes, so a SHARER can ship the contents "
      "of somebody else's machine",
-     [('    if submitted_by != owner_uid:\n        log("[send-logs] refusing: submittedBy is not the device owner", "WARN")\n        return',
-       '    if False:\n        log("[send-logs] refusing: submittedBy is not the device owner", "WARN")\n        return')],
+     [('    if submitted_by != owner_uid:\n        log("[send-logs] refusing: submittedBy is not the device owner", "WARN")',
+       '    if False:\n        log("[send-logs] refusing: submittedBy is not the device owner", "WARN")')],
      [T_SEND]),
     ("O4", "under", "a device with no recorded owner proceeds, and writes into "
      "whatever tree the command named",
@@ -165,8 +165,8 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
 
     # ══ single-flight ═══════════════════════════════════════════════════
     ("F1", "under", "two presses build two archives of the same machine at once",
-     [('        if _send_logs_inflight:\n            log("[send-logs] refusing: a bundle is already being built", "WARN")\n            return',
-       '        if False:\n            log("[send-logs] refusing: a bundle is already being built", "WARN")\n            return')],
+     [('        if _send_logs_inflight:\n            _already_building = True',
+       '        if False:\n            _already_building = True')],
      [T_SEND]),
     ("F2", "over", "the in-flight flag is never released, so ONE failure wedges "
      "the button for the life of the process",
@@ -185,13 +185,21 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      "refusal row is CREATED at 'failed', which the rule denies — so the app "
      "never sees the refusal and falls through to its two-minute quiet timeout, "
      "telling the user the machine did not answer while it is online and refused",
-     [('        _open_log_bundle_row(owner_uid, code, device_id, request_id)\n        _write_log_bundle_status(owner_uid, code,\n                                {"status": "failed", "errorClass": "ConsentMissing"})',
-       '        _write_log_bundle_status(owner_uid, code,\n                                {"status": "failed", "errorClass": "ConsentMissing",\n                                 "deviceId": device_id, "requestId": request_id},\n                                create=True)')],
+     [('    _open_log_bundle_row(owner_uid, code, device_id, request_id)\n    _write_log_bundle_status(owner_uid, code,\n                             {"status": "failed", "errorClass": error_class})',
+       '    _write_log_bundle_status(owner_uid, code,\n                             {"status": "failed", "errorClass": error_class,\n                              "deviceId": device_id, "requestId": request_id},\n                             create=True)')],
      [T_SEND]),
-    ("R1c", "under", "the cooldown refusal is created at a verdict for the same "
-     "reason, and is denied the same way",
-     [('        _open_log_bundle_row(owner_uid, code, device_id, request_id)\n        _write_log_bundle_status(owner_uid, code,\n                                {"status": "failed", "errorClass": "CooldownActive"})',
-       '        _write_log_bundle_status(owner_uid, code,\n                                {"status": "failed", "errorClass": "CooldownActive",\n                                 "deviceId": device_id, "requestId": request_id},\n                                create=True)')],
+    # ⛔ R1c's ORIGINAL FORM WAS RETIRED 2026-08-21, not weakened. It mutated the
+    # cooldown branch's own copy of the create-then-patch pair; that pair now has
+    # one definition in `_refuse_log_bundle_with_row`, so the old mutant became
+    # EQUIVALENT to R1b — a guaranteed kill measuring nothing. This is the other
+    # way the same helper can fail: patch a row that was never created. A patch
+    # against a missing document is a silent no-op, which is precisely the
+    # no-row silence the app prints as "your software is older than this
+    # setting".
+    ("R1c", "under", "the refusal row is never OPENED, only patched — so the "
+     "update lands on nothing and every refusal is invisible again",
+     [('    _open_log_bundle_row(owner_uid, code, device_id, request_id)\n    _write_log_bundle_status(owner_uid, code,',
+       '    _write_log_bundle_status(owner_uid, code,')],
      [T_SEND]),
     ("R1d", "over", "the open is allowed to carry any status, so the one clause "
      "that makes a row mean \"the machine started\" stops holding",

@@ -2389,12 +2389,13 @@ class _RunLogSink:
     """One armed per-run log folder: `run.log` + `meta.json`, written live."""
 
     def __init__(self, folder, research_id=None, attempt=0, parent_research_id=None,
-                 started_utc=None):
+                 started_utc=None, submitted_by=None):
         self.dir = Path(folder)
         self.research_id = research_id
         self.attempt = int(attempt or 0)
         self.parent_research_id = parent_research_id
         self.started_utc = started_utc or _utc_iso()
+        self.submitted_by = (str(submitted_by).strip() or None) if submitted_by else None
         self.started_mono = time.monotonic()
         self.counters = {"lines": 0, "warns": 0, "errors": 0, "eventsDropped": 0}
         self.events: "list[dict]" = []
@@ -2415,6 +2416,16 @@ class _RunLogSink:
             "build": _sr_version(),
             "platform": sys.platform,
             "startedUtc": self.started_utc,
+            # ⭐ WHO FIRED THIS RUN. Additive and advisory: it records what the
+            # queue document CLAIMED, which is what every existing consumer of
+            # submitter identity already trusts (`_set_run_submitter` picks the
+            # API key off the same value). `submitterSource` is what tells a
+            # later reader that a null is "nobody typed a uid" rather than
+            # "we lost it" — a local `--resume` or topic run has no cloud
+            # identity at all, and guessing the machine owner there would
+            # assert something the code does not know.
+            "submitterUid": self.submitted_by,
+            "submitterSource": "queue" if self.submitted_by else "local",
             "counters": dict(self.counters),
             "events": len(self.events),
         }
@@ -2639,9 +2650,15 @@ class _RunLogCapture:
     Never raises into the pipeline: if capture cannot be set up, the run runs.
     A diagnostic that can break the thing it diagnoses is worse than none."""
 
-    def __init__(self, research_id=None, attempt=0):
+    def __init__(self, research_id=None, attempt=0, submitted_by=None):
         self.research_id = research_id
         self.attempt = int(attempt or 0)
+        # ⛔ PASSED IN, NOT READ FROM `_RUN_SUBMITTER`. That global is bound
+        # inside `run_pipeline` (`_set_run_submitter`), which is AFTER the sink
+        # below has already written its first meta.json — so reading it here
+        # would stamp the PREVIOUS run's submitter and a mid-run crash would
+        # freeze that wrong value on disk.
+        self.submitted_by = submitted_by
         self.sink = None
 
     def __enter__(self):
@@ -2669,7 +2686,7 @@ class _RunLogCapture:
             sink = _RunLogSink(
                 folder, research_id=self.research_id, attempt=self.attempt,
                 parent_research_id=(parent.research_id if parent is not None else None),
-                started_utc=started)
+                started_utc=started, submitted_by=self.submitted_by)
             sink.writer.write_line("=== super research run ===")
             sink.writer.write_line(
                 f"startedUtc={started} researchId={self.research_id} "
@@ -7681,6 +7698,48 @@ def _write_log_bundle_status(owner_uid: str, code: str, patch: dict,
         return False
 
 
+def _refuse_log_bundle_with_row(owner_uid: str, code: str, device_id: str,
+                                request_id: str, error_class: str) -> None:
+    """Say a send-logs refusal WHERE THE APP CAN READ IT.
+
+    ⛔⛔ WHY THIS EXISTS. Worker 1 deletes the command document BEFORE dispatch,
+    so a handler that refuses and returns leaves the app with two observations:
+    the command is gone, and no row ever appeared. That pair is the app's proof
+    of a build too old to understand the request — `sendLogsCopy.ts` prints
+    "took the request but its software is older than this setting". The machine
+    was current and had simply refused for a reason it never reported, and the
+    person is sent to update a computer that needs no update.
+
+    ⭐ THE REACHABLE CASE IS NOT THE ONE WE FIRST NAMED. A non-owner cannot get
+    here at all — the queue rules keep send-logs out of the sharer allowlist and
+    the app hides the whole control from anyone who does not own the machine —
+    so the owner check below is defence in depth. What an OWNER reaches is the
+    single-flight refusal: press Send Logs, reload the page mid-build, press
+    again. The second press is refused with no row, and the app accuses the
+    machine of being out of date.
+
+    ⚠ THREE EARLY RETURNS STILL CANNOT HAVE A ROW, and that is stated rather
+    than papered over: a malformed support code has no document to write to (the
+    code IS the document id the app watches), and both "no owner recorded" cases
+    have no user tree to write into. The device-read failure recovers one of
+    them through the locally-stored paired uid — see its call site."""
+    if not owner_uid or not code:
+        # ⛔ SAY IT OUT LOUD. This is the one case where the machine knowingly
+        # refuses with NOTHING the app can read, so the app will fall through to
+        # its own verdict and may name the wrong cause. A silent `return` here
+        # made that indistinguishable from a refusal that was reported — and
+        # from nothing having happened at all. (The downstream writer also
+        # rejects an empty uid, so without this line the guard would be
+        # unobservable: a mutation harness cannot tell a redundant guard from a
+        # working one, and neither can a reader.)
+        log(f"[send-logs] refusing ({error_class}) with NO row — no owner tree "
+            f"is known, so the app cannot be told why", "WARN")
+        return
+    _open_log_bundle_row(owner_uid, code, device_id, request_id)
+    _write_log_bundle_status(owner_uid, code,
+                             {"status": "failed", "errorClass": error_class})
+
+
 def _upload_log_bundle_via_storage_rest(local_path: "Path", owner_uid: str,
                                         device_id: str, code: str) -> "str | None":
     """Upload one support bundle. Returns the object path, or None.
@@ -7805,6 +7864,13 @@ def _handle_send_logs_command(data: dict, device_id: str, limited: bool = False)
       3. consent — refuse unless the command carries consent == True,
       4. cooldown, from a local stamp written BEFORE the work,
       5. single-flight, so two presses cannot build two bundles at once.
+
+    ⛔ EVERY GUARD THAT CAN WRITE A ROW MUST WRITE ONE. Worker 1 deletes the
+    command document before dispatch, so a bare `return` here is indistinguishable
+    — from the app's side — from a build too old to understand the request, and
+    the app says so out loud. Only guard 1 and the "no recorded owner" case are
+    exempt, because neither has a document path to write to. See
+    `_refuse_log_bundle_with_row`.
     """
     global _send_logs_inflight
     code = str(data.get("code") or "").strip().upper()
@@ -7817,6 +7883,14 @@ def _handle_send_logs_command(data: dict, device_id: str, limited: bool = False)
         dev = _firebase_db.collection("devices").document(device_id).get().to_dict() or {}
     except Exception as exc:
         log(f"[send-logs] refusing: device read failed ({exc})", "WARN")
+        # ⭐ THE LOCAL PAIRED UID IS THE ONLY OWNER WE STILL KNOW. The tree the
+        # row lives in is pinned by the rules to the device doc's ownerUid, and
+        # that read is exactly what just failed — so use the uid written into
+        # this machine's own config at pair time. If the two ever disagree
+        # (ownership transferred), the rule refuses the write and we WARN; that
+        # is strictly better than the silence the app reads as "out of date".
+        _refuse_log_bundle_with_row(load_paired_uid() or "", code, device_id,
+                                    request_id, "DeviceReadFailed")
         return
     owner_uid = dev.get("ownerUid")
     submitted_by = data.get("submittedBy")
@@ -7825,9 +7899,16 @@ def _handle_send_logs_command(data: dict, device_id: str, limited: bool = False)
         return
     if not submitted_by:
         log("[send-logs] refusing: the command names no submitter", "WARN")
+        _refuse_log_bundle_with_row(owner_uid, code, device_id, request_id,
+                                    "SubmitterMissing")
         return
     if submitted_by != owner_uid:
         log("[send-logs] refusing: submittedBy is not the device owner", "WARN")
+        # ⚠ The row lands in the OWNER's tree, which is the only tree the rules
+        # permit — so this does not reach a non-owner submitter. It is here so
+        # the machine's refusal is never invisible, not as a message to them.
+        _refuse_log_bundle_with_row(owner_uid, code, device_id, request_id,
+                                    "NotDeviceOwner")
         return
 
     # ⛔ SINK-SIDE CONSENT. The app shows a modal naming everything that leaves
@@ -7835,34 +7916,45 @@ def _handle_send_logs_command(data: dict, device_id: str, limited: bool = False)
     # of the machine.
     if data.get("consent") is not True:
         log("[send-logs] refusing: the request carries no recorded consent", "WARN")
-        _open_log_bundle_row(owner_uid, code, device_id, request_id)
-        _write_log_bundle_status(owner_uid, code,
-                                {"status": "failed", "errorClass": "ConsentMissing"})
+        _refuse_log_bundle_with_row(owner_uid, code, device_id, request_id,
+                                    "ConsentMissing")
         return
 
     runs = _parse_bundle_runs(data, limited)
     if runs is None:
         log("[send-logs] refusing: the request named an unreadable number of runs",
             "WARN")
-        _open_log_bundle_row(owner_uid, code, device_id, request_id)
-        _write_log_bundle_status(owner_uid, code,
-                                {"status": "failed", "errorClass": "RunsInvalid"})
+        _refuse_log_bundle_with_row(owner_uid, code, device_id, request_id,
+                                    "RunsInvalid")
         return
 
     remaining = _send_logs_cooldown_remaining()
     if remaining:
         log(f"[send-logs] refusing: another bundle was built recently "
             f"({remaining}s left on the cooldown)", "WARN")
-        _open_log_bundle_row(owner_uid, code, device_id, request_id)
-        _write_log_bundle_status(owner_uid, code,
-                                {"status": "failed", "errorClass": "CooldownActive"})
+        _refuse_log_bundle_with_row(owner_uid, code, device_id, request_id,
+                                    "CooldownActive")
         return
 
+    # ⛔ THE FLAG IS READ AND SET UNDER THE LOCK; THE ROW IS WRITTEN OUTSIDE IT.
+    # A Firestore round-trip held under _SEND_LOGS_LOCK would serialise the
+    # fast-path press behind a network call, which reads as a stall rather than
+    # as an error. So the branch only records that it refused.
+    _already_building = False
     with _SEND_LOGS_LOCK:
         if _send_logs_inflight:
-            log("[send-logs] refusing: a bundle is already being built", "WARN")
-            return
-        _send_logs_inflight = True
+            _already_building = True
+        else:
+            _send_logs_inflight = True
+    if _already_building:
+        # ⭐ THE ONE AN OWNER ACTUALLY REACHES. Press, reload the page while the
+        # bundle builds, press again: the command doc is already deleted and no
+        # row was ever written, so the app told the person their software was
+        # out of date. It is current, and a bundle is being built right now.
+        log("[send-logs] refusing: a bundle is already being built", "WARN")
+        _refuse_log_bundle_with_row(owner_uid, code, device_id, request_id,
+                                    "AlreadyBuilding")
+        return
 
     def _work() -> None:
         global _send_logs_inflight
@@ -11023,10 +11115,19 @@ def start_firestore_start_listener(job_queue, loop):
                 except Exception:
                     pass
                 continue
-            # uid validation is enforced server-side by the Firestore queue
-            # rule (`submittedBy == request.auth.uid`) and the device-doc
-            # `sharedWith[]` check via `deviceWritingTo`. No additional
-            # BE-side gate needed here.
+            # ⛔ WHAT THE RULE PINS IS NOT WHAT WE JUST READ. The queue rule
+            # constrains `submittedBy == request.auth.uid`; the read above takes
+            # `uid`, which the rules leave entirely unconstrained. Membership IS
+            # enforced (`deviceWritingTo` checks the device doc's ownerUid /
+            # sharedWith[]), so a stranger cannot queue here — but `uid` itself
+            # is a CLAIM by a device member, not a verified identity.
+            # (2026-08-21: this comment used to assert the opposite, naming a
+            # rule that guards a different field.)
+            # It holds together today only because every writer sets both fields
+            # to the same value: the four `action: "start"` paths all go through
+            # the app's one payload builder. The guard that would make that an
+            # invariant instead of a habit — refusing a start doc whose two
+            # identity fields disagree — is deliberately NOT here yet.
             # Research-doc existence check — user may have deleted the chat
             # from the app between firing the research and us picking up the
             # queue doc. Without this, we'd run a full pipeline and try to
@@ -45110,14 +45211,14 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
             const isUpsell = (raw) => {
                 const s = normU(raw).toLowerCase(), n = normU(fam).toLowerCase();
                 if (!s || !n) return false;
-                // the first mention of the family is describing a row, not
-                // selling one — row text here is title+description concatenated,
-                // so "Opus 5 — try Opus with extended thinking" is a genuine row
-                // whose blurb happens to read verb-then-family-within-24.
-                // Without this the guard drops the HIGHEST real row and the
-                // picker clicks a lower model while reporting normally: the
-                // silent downgrade this path exists to prevent, reintroduced by
-                // its own guard.
+                // ⛔ NO "FAMILY NAMED FIRST" EXEMPTION, and this comment used to
+                // describe one that is not here. It was tried and REVERTED
+                // 2026-08-14 because it re-opened the blocking finding: driven
+                // through this very JS, a menu whose top row read
+                // "Opus 5 · Upgrade to Opus Max for more usage" was clicked and
+                // returned as a confirmed pick. So a genuine row whose blurb
+                // happens to read verb-then-family IS dropped here, on purpose.
+                // See models.is_upsell for the full account.
                 for (const rawVerb of (verbs || [])) {
                     const verb = String(rawVerb).toLowerCase();
                     if (!verb) continue;
@@ -45397,8 +45498,9 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
             # ── Step 1B: pick the highest family member — ONLY when the model
             #              isn't already correct (no re-click, #744) ──
             # `verbs`/`upsellWindow` come from models.py rather than being
-            # written into the JS, so the browser and the Python mirror
-            # (`pick_highest_model(..., drop_upsell=True)`) read the SAME list.
+            # written into the JS, so the browser and the Python spec
+            # (`is_upsell`, which the unit tests drive through
+            # `pick_highest_model(..., drop_upsell=True)`) read the SAME list.
             # A literal here is how the reject rule drifted the first time.
             _pick_args = {"pin": pin_model, "below": step_below, "fam": _claude_family,
                           "triggerText": (_trigger_read or {}).get("trigger_text") or "",
@@ -59838,26 +59940,33 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
 # `test_no_call_site_bypasses_the_capture`, because a new caller wired to
 # `run_pipeline` directly would get no folder and nothing would say so.
 async def run_pipeline_captured(*args, **kwargs):
-    _rid, _attempt = _run_pipeline_capture_key(args, kwargs)
-    with _RunLogCapture(research_id=_rid, attempt=_attempt):
+    _rid, _attempt, _submitter = _run_pipeline_capture_key(args, kwargs)
+    with _RunLogCapture(research_id=_rid, attempt=_attempt,
+                        submitted_by=_submitter):
         return await run_pipeline(*args, **kwargs)
 
 
-def _run_pipeline_capture_key(args, kwargs) -> "tuple[str | None, int]":
-    """(research_id, attempt) for the folder, read off the REAL call.
+def _run_pipeline_capture_key(args, kwargs) -> "tuple[str | None, int, str | None]":
+    """(research_id, attempt, submitter_uid) for the folder, read off the REAL call.
 
     Bound through `inspect.signature` against `run_pipeline` itself, so the
     wrapper cannot drift from the parameter list it forwards, and so
     `research_id` is found whether the caller passed it positionally or by
     keyword. ⛔ `run_id` is deliberately not read here — see
-    `_run_log_folder_name`."""
+    `_run_log_folder_name`.
+
+    ⭐ `uid` rides the same bind for the same reason: the dequeue site passes it
+    by keyword and the CLI sites do not pass it at all, so anything less than a
+    real signature bind would read None on one of the two shapes and nobody
+    would notice — an unattributed run looks exactly like a local one."""
     try:
         bound = _RUN_PIPELINE_SIG.bind(*args, **kwargs)
         bound.apply_defaults()
         return (bound.arguments.get("research_id"),
-                int(bound.arguments.get("_crash_retries") or 0))
+                int(bound.arguments.get("_crash_retries") or 0),
+                bound.arguments.get("uid") or None)
     except Exception:
-        return None, 0
+        return None, 0, None
 
 
 import inspect as _inspect_for_capture  # noqa: E402
@@ -66567,6 +66676,11 @@ WorkingDirectory={script_dir}
 ExecStart="{python_exe}" "{script_path}" --daemon-loop --env-file "{env_file}"
 Restart=always
 RestartSec=10
+# The PATH below is this service's AND every child it spawns. Tool homes come
+# first, so a binary in a user-writable dir such as ~/.local/bin resolves ahead
+# of the OS copy for all of them. That is deliberate: system-first resolved
+# tools the user never installed and broke app-driven updates. ExecStart above
+# is an absolute interpreter path and cannot be shadowed either way.
 {env_block}
 PassEnvironment=DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_RUNTIME_DIR
 

@@ -23,6 +23,7 @@ import os
 import re
 import textwrap
 import time
+from pathlib import Path
 
 import pytest
 
@@ -494,13 +495,118 @@ def test_no_call_site_bypasses_the_capture():
 
 def test_the_wrapper_reads_the_research_id_however_it_was_passed():
     kw = research._run_pipeline_capture_key((), {"topic": "t", "research_id": "chat_1_2"})
-    assert kw == ("chat_1_2", 0)
+    assert kw == ("chat_1_2", 0, None)
     # positional: topic, pdf_paths, brief_file, verbose, api_key, email,
     # resume_dir, config, run_id, uid, research_id
     pos = research._run_pipeline_capture_key(
         ("t", None, None, False, None, None, None, None, "run_id_here", None, "chat_3_4"),
         {})
-    assert pos == ("chat_3_4", 0)
+    assert pos == ("chat_3_4", 0, None)
+
+
+def test_the_wrapper_reads_the_submitter_however_it_was_passed():
+    """⭐ BOTH SHAPES, because the two live callers disagree: the dequeue site
+    passes `uid=` by keyword and `--resume` passes ten positionals. A lookup
+    that only handled one would read None on the other, and an unattributed run
+    is indistinguishable from a local one."""
+    kw = research._run_pipeline_capture_key(
+        (), {"topic": "t", "research_id": "chat_1_2", "uid": "UID_ALICE"})
+    assert kw == ("chat_1_2", 0, "UID_ALICE")
+    pos = research._run_pipeline_capture_key(
+        ("t", None, None, False, None, None, None, None, "run_id_here",
+         "UID_ALICE", "chat_3_4"), {})
+    assert pos == ("chat_3_4", 0, "UID_ALICE")
+
+
+def test_a_local_run_reports_no_submitter_rather_than_guessing_the_owner():
+    """⛔ The machine knows the uid it is PAIRED to, and that is not proof of who
+    typed the command. A local run must say "local", not name the owner."""
+    local = research._run_pipeline_capture_key((), {"topic": "t"})
+    assert local == (None, 0, None)
+
+
+def _captured_meta(monkeypatch, *args, **kwargs):
+    """Drive the REAL wrapper and hand back the meta.json it armed.
+
+    ⛔ DELIBERATELY DOES NOT MONKEYPATCH `_RUN_PIPELINE_SIG`. The sibling test
+    below replaces it with a three-parameter lambda, and a lambda with no `uid`
+    makes the bind return None for the submitter while the assertion still
+    passes — a green test measuring nothing. The bind has to run against the
+    real signature."""
+    seen = {}
+
+    async def _fake(*a, **k):
+        sink = research._active_run_sink()
+        seen["meta"] = json.loads(_read(sink.meta_path)) if sink else None
+        return "done"
+
+    monkeypatch.setattr(research, "run_pipeline", _fake)
+    asyncio.run(research.run_pipeline_captured(*args, **kwargs))
+    return seen["meta"]
+
+
+def test_a_queued_run_records_who_fired_it(monkeypatch):
+    """⭐ THE CONSUMER, fed exactly what the dequeue site feeds it (research.py
+    passes `uid=job.get("uid")` and `research_id=` by keyword)."""
+    meta = _captured_meta(monkeypatch, topic="t",
+                          research_id="chat_1755500000000_31", uid="UID_ALICE")
+    assert meta["submitterUid"] == "UID_ALICE"
+    assert meta["submitterSource"] == "queue"
+
+
+def test_a_local_cli_run_records_no_submitter(monkeypatch):
+    """Fed exactly what the `--resume`/topic CLI sites feed it: no uid at all."""
+    meta = _captured_meta(monkeypatch, topic="t", pdf_paths=None, brief_file=None,
+                          verbose=False, api_key=None, email=None)
+    assert meta["submitterUid"] is None
+    assert meta["submitterSource"] == "local"
+
+
+def test_a_local_run_does_not_inherit_a_previous_runs_submitter(monkeypatch):
+    """⛔⛔ THE ONE THAT KILLS THE TEMPTING IMPLEMENTATION. `_RUN_SUBMITTER` holds
+    exactly the wanted value but is bound INSIDE run_pipeline — after the sink
+    has already written meta.json. Reading it from the capture would stamp the
+    previous run's submitter and freeze it there on a crash."""
+    monkeypatch.setitem(research._RUN_SUBMITTER, "uid", "UID_STALE")
+    meta = _captured_meta(monkeypatch, topic="t")
+    assert meta["submitterUid"] is None, "it read the stale process-wide global"
+
+
+def test_a_crash_retry_stays_attributed(monkeypatch):
+    """The auto-retry recurses through the wrapper forwarding `uid=`, so attempt
+    2 of a run must not silently become unattributed."""
+    meta = _captured_meta(monkeypatch, topic="t",
+                          research_id="chat_1755500000000_32", uid="UID_ALICE",
+                          _crash_retries=1)
+    assert meta["attempt"] == 1
+    assert meta["submitterUid"] == "UID_ALICE"
+
+
+def test_the_new_keys_do_not_leak_into_the_bundle_index(monkeypatch):
+    """⛔ ADDITIVE MEANS INVISIBLE. `_scan_run_folders` builds the bundle's
+    index.json from a fixed row shape; if the new keys reached it, every support
+    bundle's index would change shape in the same commit."""
+    _captured_meta(monkeypatch, topic="t",
+                   research_id="chat_1755500000000_33", uid="UID_ALICE")
+    rows = research._scan_run_folders()
+    assert rows, "no run folder was scanned"
+    assert "submitterUid" not in rows[0]
+    assert "submitterSource" not in rows[0]
+
+
+def test_a_status_patch_preserves_the_submitter(monkeypatch):
+    """`_patch_run_log_status` is read-modify-write, so it must carry the key
+    through rather than rewriting meta.json from a fresh dict."""
+    _captured_meta(monkeypatch, topic="t",
+                   research_id="chat_1755500000000_34", uid="UID_ALICE")
+    folder = research._RUN_LOG_LAST_DIR
+    assert folder is not None
+    # Patches whatever `_RUN_LOG_LAST_DIR` points at — the shape the worker
+    # watchdog actually uses, which is after the capture has already exited.
+    assert research._patch_run_log_status("process-died") is True
+    meta = json.loads(_read(Path(folder) / "meta.json"))
+    assert meta["status"] == "process-died"
+    assert meta["submitterUid"] == "UID_ALICE"
 
 
 def test_the_wrapper_carries_the_crash_retry_count_as_the_attempt():
