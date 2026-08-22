@@ -27924,7 +27924,26 @@ async def scrape_progress_claude(page):
             // AND "Research complete · 553 sources · 24m 41s" (modern 2026).
             // 2026-05-04: also Claude's 2026-05+ "Boom! Research report is
             // ready" callout — long DR runs ship this instead of the prefix.
-            const doneM = bodyText.match(/research\\s+complete(?:d)?(?:\\s+in)?(?:[\\s·•—\\-]+\\d[\\d,]*\\s+sources?)?(?:[\\s·•—\\-]+\\d+(?:[hms]|\\s*(?:hour|min|sec)))?/i);
+            // ⭐ 2026-08-22 — the source count is now CAPTURED, not just matched.
+            // This regex has matched "Research complete · 553 sources · 24m 41s"
+            // since 2026-04-26 and thrown the 553 away every time, because the
+            // digits sat in a non-capturing group and the match was only ever
+            // read as a boolean. That number is the most authoritative source
+            // figure Claude ever prints — it is the FINAL count, where the
+            // ticker below is mid-run and disappears on completion — and 13 of
+            // 22 finished runs in this machine's own logs recorded ZERO sources
+            // while it was on the page.
+            //
+            // ⛔ The eight OTHER sites matching this shape were deliberately left
+            // as booleans. They are completion GATES, the anchored-vs-loose split
+            // between them is load-bearing (a stray edit there re-opens either a
+            // 24-minute blind window or a mid-run false COMPLETE), and the number
+            // is already available here — the one site that returns data. A
+            // capture whose only consumer is `if (m)` buys nothing and risks the
+            // gate.
+            const doneM = bodyText.match(/research\\s+complete(?:d)?(?:\\s+in)?(?:[\\s·•—\\-]+(\\d[\\d,]*)\\s+sources?)?(?:[\\s·•—\\-]+\\d+(?:[hms]|\\s*(?:hour|min|sec)))?/i);
+            const printedSrc = (doneM && doneM[1])
+                ? parseInt(doneM[1].replace(/,/g, ''), 10) : 0;
             const boomM = bodyText.match(/\\bBoom!\\s+(?:Your\\s+)?[Rr]esearch\\s+report\\s+is\\s+ready\\b/);
             const researchDone = !!(doneM || boomM);
 
@@ -27965,6 +27984,13 @@ async def scrape_progress_claude(page):
             // this split, the chip "5 src" disagreed with the empty URL list.
             // The watchdog can still consume r.observed_sources for liveness.
             r.observed_sources = liveSrcCount;
+            // The FINAL printed count, kept beside the ticker rather than folded
+            // into it. Two separate facts: the ticker proves the run is ALIVE
+            // (28115 reads it for exactly that), the printed total proves how
+            // many sources it ended with. Merging them would let a completed
+            // count masquerade as liveness and pin a finished run at
+            // "generating" forever.
+            r.printed_sources = printedSrc;
             // Mirror onto the unified `searches` field so the FE has one
             // consistent name across all three agents. Claude's UI conflates
             // searches and sources ("N sources and counting") but the FE
@@ -30022,6 +30048,560 @@ async def _log_claude_artifact_snapshot(page, tag=""):
     except Exception:
         line = str(snap)[:1800]
     log(f"[Claude] artifact-miss snapshot ({tag}): {line[:1800]}", "DEBUG")
+
+
+# ── Claude's "Gathered N sources" disclosure ─────────────────────────────────
+# ⭐⭐ WHY THIS EXISTS, measured from this machine's own logs on 2026-08-22 rather
+# than reasoned about. Across `~/.super-research/logs/e2e*.log` + `backend.log`,
+# 22 Claude runs reached `CONFIRMED DONE`:
+#   * 13 of them recorded ZERO sources — six on reports over 25,000 characters.
+#   * 74 of 78 `Artifact tracking:` reads returned exactly ONE url.
+#   * `walker_root=class` matched 0 times out of 147; the geometry fallback
+#     carries every read, so the class-anchored primary selector is dead.
+#   * `didn't stick` fired 28 times against 23 `artifact panel opened`.
+# The panel we DO open is the progress CHECKLIST, its rows are not anchors, and
+# the walker's sweep is `a[href^="http"]` — so it finds one stray anchor and
+# nothing else. The panel that actually enumerates the sources has never been
+# pressed. That is what these functions are for.
+#
+# ⭐ EVERY SELECTOR HERE IS KEYED TO A FACT MEASURED IN THE OWNER'S OWN BROWSER,
+# not to a guess:
+#   * the control is a <button> carrying `aria-expanded` whose visible label is
+#     "Gathered N sources" — role + text is the only stable handle it offers
+#   * it is `disabled` when N is 0, so a press that does nothing is a LEGITIMATE
+#     outcome and must not log like a failure
+#   * the count lives inside that label; there is no separate total element
+#   * there is NO data-testid and no data-* hook anywhere in that subtree, so a
+#     class-string selector would rot on the next Tailwind build
+#
+# ⛔ ROW SHAPE IS NOT A PRECONDITION, and that is the whole design. The sampled
+# conversation had 0 sources, so whether a row is an `<a href>` or a click-handler
+# button — and whether the list virtualises — CANNOT be answered from it: the
+# markup does not exist. So this collects anchors AND buttons, scrolls-and-
+# accumulates (correct either way), and REPORTS what it found on every run. The
+# unknown is an observation the code emits, never an assumption a selector encodes.
+#
+# ⛔⛔ SCOPE. `_count_claude_artifacts` and `_click_claude_artifact` are
+# deliberately UNTOUCHED. They feed extraction, publish, the poll loop and two
+# count gates, and an earlier version of this feature was REVERTED for reaching
+# into them. The guard that recorded that decision asked for the replacement to be
+# "deliberate and isolated, never a passenger on an unrelated fix" — this is that
+# isolated change. See tests/test_claude_health_and_sources_panel.py.
+#
+# ⚠ "Gathered N sources" also appears as a CHECKLIST ROW in the tracking panel
+# (ten CUA readings in the corpus describe it that way). A row is an li/div, so
+# requiring `button, [role="button"]` already excludes it — but the tag name is
+# logged anyway, because "we matched a row" and "we matched the control" are
+# different facts and the log is the only place that can tell them apart.
+
+#: The attribute value `_sr_real_click` aims at. Its own constant so the JS that
+#: stamps it and the Python that presses it cannot drift apart.
+_CLAUDE_SOURCES_CLICK_VALUE = "claude-sources-toggle"
+
+# THE FINDER, and it is one definition on purpose. `_count_claude_artifacts` and
+# `_click_claude_artifact` drifted apart in exactly this way (#736: the count
+# over-reported by one, the click's target index fell out of range) and the note
+# there says the selector must change in both places at once. A shared string is
+# the version of that rule an edit cannot forget — and the mutation harness for
+# this wave found the second copy the first time it ran, before it could drift.
+#
+# ⛔ SYNCHRONOUS ON PURPOSE, and this is load-bearing rather than stylistic:
+# `tests/_domshim.py` has no `setTimeout` and `run_js` JSON-stringifies the
+# return value, so an async page-JS body is not executable by the harness — it
+# could only ever be source-scanned, and this repo has shipped an inverted gate
+# that way before. Every wait, press and scroll lives in Python, which is also
+# the house "search in JS, press in Playwright" rule. The constraint and the
+# convention agree.
+_CLAUDE_SOURCES_FIND_JS = r"""
+    // ⛔ ONE digit, and commas. The capture script written to MEASURE this
+    // control demanded `\d{2,4}` and therefore reported "(none found)" while
+    // `Gathered 0 sources` sat in the DOM — a measurement tool carrying the same
+    // class of bug as the code it was measuring. A count regex that cannot see
+    // zero cannot tell "no sources" from "no control", which is the one
+    // distinction this whole path exists to make.
+    const GATHERED = /gathered\s+([\d,]+)\s+sources?/i;
+    // Fallback shape: a disclosure control whose label merely COUNTS sources
+    // ("12 sources"). Survives a reword of the verb — the likeliest part to rot —
+    // and still refuses anything that is not a disclosure control. Without the
+    // aria-expanded requirement this would also match the running ticker and the
+    // finished report card, neither of which opens a source list.
+    const BARE = /\b([\d,]+)\s+sources?\b/i;
+    const num = (s) => parseInt(String(s).replace(/,/g, ''), 10);
+    const labels = (el) => [
+        (el.textContent || '').replace(/\s+/g, ' ').trim(),
+        (el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim(),
+    ];
+    const find = () => {
+        const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+        for (const b of btns) {
+            for (const s of labels(b)) {
+                const m = s.match(GATHERED);
+                if (m) return { el: b, count: num(m[1]), shape: 'gathered' };
+            }
+        }
+        for (const b of btns) {
+            if (!b.hasAttribute('aria-expanded')) continue;
+            for (const s of labels(b)) {
+                const m = s.match(BARE);
+                if (m) return { el: b, count: num(m[1]), shape: 'bare-count' };
+            }
+        }
+        return null;
+    };
+    // The disclosed region: the control's own aria-controls when it offers one,
+    // else the nearest ancestor holding a list the control is not itself inside.
+    //
+    // ⛔ querySelectorALL, and a test caught this. `querySelector` returns the
+    // first match in DOCUMENT ORDER, and on the real page the first list under a
+    // shared ancestor is the progress CHECKLIST the toggle is a row of. With a
+    // single-match read the guard rejected that one list and abandoned the whole
+    // ancestor, walking straight past the source list sitting beside it. This is
+    // the exact selector-semantics class `_domshim` exists to catch.
+    const regionFor = (tog) => {
+        const cid = tog.getAttribute('aria-controls');
+        if (cid) {
+            const byId = document.getElementById(cid);
+            if (byId) return { el: byId, how: 'aria-controls' };
+        }
+        let n = tog.parentElement, hops = 0;
+        while (n && hops++ < 8) {
+            for (const l of n.querySelectorAll('ol, ul, [role="list"]')) {
+                if (!l.contains(tog)) return { el: l, how: 'ancestor-list' };
+            }
+            n = n.parentElement;
+        }
+        const par = tog.parentElement;
+        return par ? { el: par, how: 'parent' } : { el: null, how: 'none' };
+    };
+    // The scroll box: the region itself, or the first scrollable node in it.
+    const scrollBoxIn = (region) => {
+        for (const e of [region].concat(Array.from(region.querySelectorAll('*')))) {
+            if (+(e.scrollHeight || 0) > +(e.clientHeight || 0) + 4) return e;
+        }
+        return null;
+    };
+"""
+
+_CLAUDE_SOURCES_PROBE_JS = r"""(mark) => {""" + _CLAUDE_SOURCES_FIND_JS + r"""
+    const out = {found: false, count: 0, shape: '', tag: '', disabled: false,
+                 expanded: false, marked: false, region: 'none', rows: 0,
+                 links: 0, buttons: 0, scroll_h: 0, client_h: 0,
+                 scrollable: false, urls: [], hosts: [], row_sample: []};
+    const hit = find();
+    if (!hit) return out;
+    out.found = true;
+    out.count = hit.count;
+    out.shape = hit.shape;
+    out.tag = hit.el.tagName || '';
+    // HTML semantics, and they differ between the two: the `disabled`
+    // ATTRIBUTE's PRESENCE disables (so `disabled="false"` is still disabled),
+    // while `aria-disabled` is a string that must equal "true".
+    out.disabled = !!hit.el.disabled
+        || hit.el.getAttribute('aria-disabled') === 'true';
+    out.expanded = hit.el.getAttribute('aria-expanded') === 'true';
+    // Stamp for a REAL press. A synthetic el.click() dispatches a click event
+    // and nothing else; claude.ai's disclosures are React components whose
+    // trigger listens on pointerdown, and this codebase has already paid for
+    // that lesson once (see _SR_CLICK_MARK).
+    if (mark && !out.disabled && !out.expanded) {
+        try { hit.el.setAttribute(mark, "__VALUE__"); out.marked = true; } catch (e) {}
+    }
+
+    const found = regionFor(hit.el);
+    const region = found.el;
+    out.region = found.how;
+    if (!region) return out;
+
+    // ⛔ The CONTROL IS NOT A ROW. When the region falls back to the toggle's own
+    // parent there is no list to scope to, so the toggle itself sits among the
+    // candidates — and counting it would report `rows=1` for a panel that
+    // disclosed nothing, which reads as "we found a source" rather than "we
+    // found nothing". Its own label is also a source count, so it would have
+    // contributed a bogus host too.
+    const rowsOf = (r) => {
+        let rs = Array.from(r.querySelectorAll('li, [role="listitem"]'));
+        if (!rs.length) rs = Array.from(r.children || []);
+        return rs.filter(e => e !== hit.el && !e.contains(hit.el)
+                              && ((e.innerText || '').trim().length > 2));
+    };
+    // Read the scroll box DEFENSIVELY. A collapsed region reports 0/0 and a
+    // 5-row list reports scrollHeight == clientHeight — the measured state — so
+    // "not scrollable" is a legitimate answer here, never a failure.
+    out.scroll_h = +(region.scrollHeight || 0);
+    out.client_h = +(region.clientHeight || 0);
+    out.scrollable = !!scrollBoxIn(region);
+
+    const seenUrl = [], seenHost = [];
+    // Hosts come from ROW TEXT, and they stay hosts. A row with no anchor gives
+    // us a domain, not a link, and synthesising "https://" + domain would put a
+    // FABRICATED url into source_urls — which feeds the findings cards and the
+    // user-visible source list. A host count is a true fact; an invented url is
+    // not, and this file has already discarded 56% of a run's real sources by
+    // matching a whole url where it meant to match a host.
+    const HOST_RE = /\b([a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.[a-z]{2,})\b/i;
+    for (const a of region.querySelectorAll('a[href]')) {
+        const h = a.href || a.getAttribute('href') || '';
+        if (!/^https?:/i.test(h)) continue;
+        if (h.length >= 500) continue;
+        if (h.indexOf('claude.ai') !== -1 || h.indexOf('anthropic.com') !== -1) continue;
+        if (seenUrl.indexOf(h) === -1) seenUrl.push(h);
+    }
+    for (const r of rowsOf(region)) {
+        const t = (r.innerText || '').replace(/\s+/g, ' ').trim();
+        if (!t) continue;
+        out.rows += 1;
+        if (out.row_sample.length < 5) out.row_sample.push(t.slice(0, 90));
+        const m = t.match(HOST_RE);
+        if (m) {
+            const host = m[1].toLowerCase().replace(/^www\./, '').replace(/\.$/, '');
+            if (seenHost.indexOf(host) === -1) seenHost.push(host);
+        }
+    }
+    out.links = seenUrl.length;
+    out.buttons = region.querySelectorAll('button, [role="button"]').length;
+    out.urls = seenUrl.slice(0, 200);
+    out.hosts = seenHost.slice(0, 200);
+    return out;
+}""".replace("__VALUE__", _CLAUDE_SOURCES_CLICK_VALUE)
+
+
+#: The outcomes `read_claude_sources_panel` can report. A tuple rather than a set
+#: of scattered string literals because the whole point of the function is that
+#: these are DISTINCT — "the control says zero" and "the press did nothing" have
+#: opposite next moves, and the code this replaces could say neither.
+_CLAUDE_SOURCES_OUTCOMES = ("absent", "disabled", "already_open", "opened",
+                            "press_failed", "read_failed")
+
+
+async def _claude_sources_toggle_state(page):
+    """Read-only probe of Claude's "Gathered N sources" disclosure.
+
+    Presses nothing, so it is safe on every poll. Returns the probe dict, and an
+    ALL-FALSY dict on any evaluate failure — so a caller reads a failure as "no
+    control", never as a zero count. Those are different facts: ``found=False``
+    means we could not see the control, ``found=True, count=0`` means Claude
+    says there are no sources. Nothing downstream may conflate them.
+
+    ⚠ Deliberately does NOT press. The scraper must stay read-only for two
+    independent reasons: the control is a TOGGLE, so a press on an already-open
+    panel CLOSES it (the P1 lesson — a "miss" can mean we closed what was open);
+    and `scrape_progress_claude` routes its source count into
+    `if (!hasStop && liveSrcCount > 0) hasStop = true`, so anything that grows a
+    count on the scrape path can pin a finished run at "generating" forever.
+    """
+    try:
+        res = await page.evaluate(_CLAUDE_SOURCES_PROBE_JS, "")
+        return res if isinstance(res, dict) else {}
+    except Exception:
+        return {}
+
+
+async def read_claude_sources_panel(page, max_scrolls: int = 12,
+                                    settle_s: float = 0.25):
+    """Open Claude's sources disclosure and read its rows. One press, one read.
+
+    Always returns a dict carrying ``outcome`` (one of
+    ``_CLAUDE_SOURCES_OUTCOMES``) plus whatever was observed. It decides nothing
+    and logs nothing — `claude_sources_log_line` turns the result into a line,
+    so the severity decision sits in a pure function a test can call.
+
+    The outcomes, and why each is its own state rather than a bool:
+      ``absent``       no such control on the page. Expected early in a run.
+      ``disabled``     the control is there and says N == 0. NOT a failure —
+                       Claude is telling us there is nothing to read.
+      ``already_open`` found expanded; rows read without pressing anything.
+      ``opened``       pressed, the control's OWN aria-expanded went true.
+      ``press_failed`` enabled, pressed, never expanded. THIS is the failure,
+                       and it is the one the old code could not tell from
+                       either of the two above.
+      ``read_failed``  the evaluate itself threw.
+
+    ⭐ "It opened" is read from the control's own `aria-expanded`, never from
+    "rows came back". #914 paid for that distinction on this exact panel: a flag
+    inferred from "the scrape returned data" lied open for a panel the CUA had
+    closed, and the re-click was skipped forever.
+
+    ``rows_before``/``rows_after`` bracket the scroll-and-accumulate loop, so a
+    virtualising list shows up as after > before and a static one as equal. That
+    answers the row-shape and virtualisation questions from a real run instead
+    of from an empty panel, which cannot answer them at all.
+    """
+    try:
+        first = await page.evaluate(_CLAUDE_SOURCES_PROBE_JS,
+                                    _SR_CLICK_MARK)
+    except Exception as e:
+        return {"outcome": "read_failed", "error": str(e)[:160]}
+    if not isinstance(first, dict) or not first.get("found"):
+        return {"outcome": "absent"}
+    if first.get("disabled"):
+        return dict(first, outcome="disabled")
+
+    press = ""
+    if not first.get("expanded"):
+        if not first.get("marked"):
+            # The JS found the control but could not stamp it, so Playwright has
+            # nothing to aim at. Reporting this as a press failure is the honest
+            # answer — we did not press.
+            return dict(first, outcome="press_failed", press="unmarked")
+        press = await _sr_real_click(page, _CLAUDE_SOURCES_CLICK_VALUE,
+                                     tag="[Claude]")
+        # Poll for the control to report ITSELF open. A fixed sleep guesses; this
+        # waits exactly as long as it needs to and no longer.
+        opened = False
+        for _ in range(10):
+            await asyncio.sleep(0.2)
+            again = await _claude_sources_toggle_state(page)
+            if again.get("expanded"):
+                opened = True
+                break
+        if not opened:
+            return dict(first, outcome="press_failed", press=press or "none")
+
+    # Re-probe: a React re-render replaces the node, so the region and inventory
+    # must be read AFTER the disclosure settled, not from the pre-press snapshot.
+    cur = await _claude_sources_toggle_state(page)
+    if not cur.get("found"):
+        return dict(first, outcome="read_failed", press=press or "none",
+                    error="control vanished after opening")
+    res = dict(cur)
+    res["outcome"] = "already_open" if first.get("expanded") else "opened"
+    res["press"] = press or "none"
+    res["rows_before"] = int(cur.get("rows", 0) or 0)
+
+    # Scroll-and-accumulate. Correct whether or not the list virtualises, which
+    # is the point: at 5 rows the measured region reports scrollHeight ==
+    # clientHeight, so nothing about virtualisation can be inferred from a short
+    # list and the loop must simply be harmless when there is nothing to scroll.
+    urls = list(res.get("urls") or [])
+    hosts = list(res.get("hosts") or [])
+    samples = list(res.get("row_sample") or [])
+    scrolls = 0
+    if cur.get("scrollable"):
+        flat = 0
+        for i in range(max(0, int(max_scrolls))):
+            if flat >= 2:
+                break
+            try:
+                await page.evaluate(_CLAUDE_SOURCES_SCROLL_JS)
+            except Exception:
+                break
+            scrolls = i + 1
+            await asyncio.sleep(settle_s)
+            nxt = await _claude_sources_toggle_state(page)
+            grew = False
+            for u in (nxt.get("urls") or []):
+                if u not in urls:
+                    urls.append(u)
+                    grew = True
+            for h in (nxt.get("hosts") or []):
+                if h not in hosts:
+                    hosts.append(h)
+                    grew = True
+            for s in (nxt.get("row_sample") or []):
+                if s not in samples and len(samples) < 12:
+                    samples.append(s)
+            if int(nxt.get("rows", 0) or 0) > int(res.get("rows", 0) or 0):
+                res["rows"] = int(nxt.get("rows", 0) or 0)
+                grew = True
+            # Stop on two consecutive rounds that add nothing, rather than on a
+            # fixed count: a fixed count under-reads a long list and burns
+            # rounds on a short one.
+            flat = 0 if grew else flat + 1
+    res["urls"] = urls[:_SOURCE_LIST_CAP]
+    res["hosts"] = hosts[:_SOURCE_LIST_CAP]
+    res["row_sample"] = samples
+    res["links"] = len(res["urls"])
+    res["rows_after"] = int(res.get("rows", 0) or 0)
+    res["scrolls"] = scrolls
+    return res
+
+
+# Scroll the disclosed region by roughly one page. Separate from the probe so the
+# probe stays a pure READ — a function that both measures and mutates cannot be
+# used to check its own effect. It splices in the SAME finder, so the control and
+# region this scrolls are by construction the ones the probe measured; two copies
+# that merely happen to agree is the #736 defect.
+_CLAUDE_SOURCES_SCROLL_JS = r"""() => {""" + _CLAUDE_SOURCES_FIND_JS + r"""
+    const hit = find();
+    if (!hit) return {scrolled: false, reason: 'no-toggle'};
+    const region = regionFor(hit.el).el;
+    if (!region) return {scrolled: false, reason: 'no-region'};
+    const box = scrollBoxIn(region);
+    if (!box) return {scrolled: false, reason: 'not-scrollable'};
+    const step = Math.max(120, +(box.clientHeight || 0) * 0.8);
+    box.scrollTop = Math.min(+(box.scrollTop || 0) + step, +(box.scrollHeight || 0));
+    return {scrolled: true, top: +(box.scrollTop || 0)};
+}"""
+
+
+def claude_sources_log_line(res: dict) -> tuple:
+    """Turn one ``read_claude_sources_panel`` result into ``(message, level)``.
+
+    Pure and module-level on purpose: the poll leg that calls it is a closure
+    inside ``poll_all_agents_round_robin``, which nothing in the suite executes —
+    a severity decision written inline there could only ever be source-scanned,
+    and mutation has already proved that a source-scanned gate can ship inverted.
+
+    The severities ARE the item. ``disabled`` is INFO because Claude reporting
+    zero sources is an answer, not a fault, and `note_line` tallies WARN into the
+    per-run meta a support bundle is triaged on — a benign WARN makes an ordinary
+    run look faulty. Only a press that did not land, a read that threw, and an
+    opened-but-empty panel are owner-visible enough to warrant WARN.
+    """
+    r = res or {}
+    o = r.get("outcome") or "absent"
+    n = int(r.get("count", 0) or 0)
+    if o == "absent":
+        return ("[Claude] sources toggle not on the page", "DEBUG")
+    if o == "disabled":
+        return (f"[Claude] sources toggle reports {n} sources and is disabled — "
+                "nothing to read (Claude's answer, not a failure)", "INFO")
+    if o == "press_failed":
+        return (f"[Claude] sources toggle says {n} sources but never expanded "
+                f"(press={r.get('press') or 'none'}) — the source list was "
+                "not read", "WARN")
+    if o == "read_failed":
+        return (f"[Claude] sources toggle read failed: "
+                f"{r.get('error') or 'evaluate error'}", "WARN")
+    # opened / already_open — ONE line carrying every runtime observation the
+    # 0-source capture could not give us: whether rows are anchors or buttons,
+    # whether the list virtualises, and how the region was resolved.
+    detail = (f"[Claude] sources panel {o}: label={n} "
+              f"rows {r.get('rows_before', 0)}->{r.get('rows_after', 0)} "
+              f"links={r.get('links', 0)} buttons={r.get('buttons', 0)} "
+              f"hosts={len(r.get('hosts') or [])} "
+              f"region={r.get('region')} tag={r.get('tag')} "
+              f"shape={r.get('shape')} scrolls={r.get('scrolls', 0)} "
+              f"scrollable={bool(r.get('scrollable'))} "
+              f"box={r.get('scroll_h', 0)}/{r.get('client_h', 0)} "
+              f"press={r.get('press') or 'none'}")
+    if not (r.get("urls") or r.get("hosts") or r.get("rows_after")):
+        return (detail + " — opened but EMPTY", "WARN")
+    return (detail, "INFO")
+
+
+def claude_source_count(live: int = 0, printed: int = 0,
+                        toggle_label: int = 0, vision: int = 0) -> int:
+    """One source number from the union of every place Claude states it.
+
+    Claude prints its own source count in three separate surfaces, each blind in
+    a different way, and until now every one of them was matched with `.test()`
+    and the number thrown away:
+
+      ``live``          "N sources and counting" — the mid-run ticker. Gone the
+                        moment the run finishes.
+      ``printed``       "Research complete · N sources · 24m" — the final figure.
+                        Absent while the run is still going.
+      ``toggle_label``  "Gathered N sources" on the disclosure. Legitimately 0.
+
+    ``vision`` is the fourth input and not one of Claude's own: the Gemini panel
+    estimate already landing in `observed_sources`. It is folded in here so the
+    union cannot LOSE a number that field was already carrying.
+
+    The union is the maximum, because these are views of ONE quantity and each
+    can only UNDER-report — a surface that has not rendered reads 0, and none of
+    them can invent sources. Max is therefore the only combination that cannot
+    drop a number Claude actually gave us.
+
+    ⚠ This is `observed_sources`, NOT `sources`. `sources == len(source_urls)`
+    is load-bearing: the FE chip disagreed with an empty url list the last time
+    the two were merged. The frontend already takes the max of both fields, so
+    widening this one is enough to fix the displayed number without touching
+    that invariant — and without a frontend release.
+
+    ⚠ Per-call, deliberately NOT monotonic. A high-water mark cannot fall, so one
+    bad high read (a vision over-count, or a label belonging to a different turn
+    in the same document) would be permanent for the whole run.
+    """
+    def _n(v):
+        try:
+            i = int(v or 0)
+        except (TypeError, ValueError):
+            return 0
+        return i if i > 0 else 0
+    return max(_n(live), _n(printed), _n(toggle_label), _n(vision))
+
+
+def merge_claude_sources(snap: dict, urls=None, hosts=None,
+                         label_count: int = 0) -> dict:
+    """Fold a sources-panel read into the progress snapshot, in place.
+
+    ⚠ THE SNAPSHOT, not `progress`. `extract_and_record_agent` reads
+    `_runtime.agent_progress_snapshots[...]` — for the findings extraction and
+    for the completion emit's sourceUrls/sources — and that snapshot is written
+    once per poll cycle BEFORE the finished-run read happens. Merging into
+    `progress` alone would be dead by the time anything looked.
+
+    Dedupe keeps the FIRST-seen url, so a panel row already present from an
+    earlier cycle keeps its original form rather than being replaced by a
+    late duplicate. `sources` stays exactly `len(source_urls)`; the label count
+    goes to `observed_sources` through `claude_source_count`.
+    """
+    out = snap if isinstance(snap, dict) else {}
+    existing = list(out.get("source_urls") or [])
+    seen = set(existing)
+    for u in (urls or []):
+        if u and u not in seen:
+            seen.add(u)
+            existing.append(u)
+    out["source_urls"] = existing[:_SOURCE_LIST_CAP]
+    out["sources"] = len(out["source_urls"])
+    out["observed_sources"] = claude_source_count(
+        live=int(out.get("observed_sources", 0) or 0),
+        toggle_label=int(label_count or 0),
+    )
+    # Hosts are recorded as a COUNT, never expanded into urls. A row with no
+    # anchor gives a domain, not a link; synthesising one would put a fabricated
+    # url in front of the user.
+    if hosts:
+        out["source_hosts"] = len({h for h in hosts if h})
+    return out
+
+
+async def claude_finished_sources_read(page, p, snapshots, *,
+                                       agent_key: str = "claude"):
+    """Press Claude's sources disclosure ONCE, at the point the run is done.
+
+    Returns the panel result (or None when it was skipped), so a caller can log
+    a run-level outcome. The latch lives on ``p``, which is rebuilt per phase, so
+    "once" means once per RUN and not once per process — `--serve` runs many runs
+    in one process and a module global would silence every run after the first.
+
+    ⛔⛔ CALLED FROM BOTH EXTRACT SITES, and that is the whole reason this is a
+    function. ``extract_and_record_agent`` has TWO call sites for the same agent:
+    the Playwright-confirmed-done path and the CUA-confirmed-done path. Claude
+    reaching completion through the CUA never passes the first one — and the
+    corpus run this fix exists for ("5 URLs, 15 steps") went through exactly that
+    path, because only the CUA, which scrolls first, ever caught it. A read wired
+    to one site only would have been a guard that cannot fire on the runs it was
+    written for.
+
+    ⚠ Must run BEFORE ``extract_claude_response``, which closes the artifact
+    panel as its first act.
+    """
+    if p is None or p.get("_claude_sources_read_done"):
+        return None
+    p["_claude_sources_read_done"] = True
+    try:
+        res = await read_claude_sources_panel(page)
+    except Exception as e:
+        log(f"[Claude] sources panel read raised: {e}", "WARN")
+        return None
+    msg, lvl = claude_sources_log_line(res)
+    log(msg, lvl)
+    try:
+        snap = (snapshots or {}).get(agent_key)
+        if isinstance(snap, dict):
+            before = len(snap.get("source_urls") or [])
+            merge_claude_sources(snap, res.get("urls"), res.get("hosts"),
+                                 int(res.get("count", 0) or 0))
+            after = len(snap.get("source_urls") or [])
+            if after != before:
+                log(f"[Claude] sources panel added {after - before} urls to the "
+                    f"snapshot ({before} -> {after})", "INFO")
+    except Exception as e:
+        log(f"[Claude] sources merge into snapshot skipped: {e}", "DEBUG")
+    return res
 
 
 async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None,
@@ -37935,6 +38515,44 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     # Don't mask scrape failures — tell frontend the scrape degraded
                     log(f"[{name}] DOM scrape failed: {_scrape_err}", "WARN")
 
+            # ── Claude's source count, from the union of every place it is stated ──
+            # ⭐ READ-ONLY. The disclosure is a TOGGLE, so pressing it on the
+            # scrape path would close an already-open panel; the press happens
+            # once, at the confirmed-done read below. The union goes to
+            # `observed_sources` and NEVER to `sources` — `sources ==
+            # len(source_urls)` is load-bearing, and `liveSrcCount`'s own
+            # behavioural uses (the "still generating" test in particular) must
+            # keep reading the ticker text alone.
+            if name == "Claude" and scrape_ok:
+                try:
+                    _cl_tog = await _claude_sources_toggle_state(p["page"])
+                    progress["observed_sources"] = claude_source_count(
+                        live=int(progress.get("observed_sources", 0) or 0),
+                        printed=int(progress.get("printed_sources", 0) or 0),
+                        toggle_label=int(_cl_tog.get("count", 0) or 0)
+                        if _cl_tog.get("found") else 0,
+                    )
+                    # A signature, not a counter: the same shape says so once, a
+                    # NEW shape says so immediately. `found=False` and
+                    # `count=0` are different facts and both are printed.
+                    _cl_sig = (bool(_cl_tog.get("found")),
+                               int(_cl_tog.get("count", 0) or 0),
+                               bool(_cl_tog.get("disabled")),
+                               bool(_cl_tog.get("expanded")),
+                               int(progress.get("printed_sources", 0) or 0))
+                    if p.get("_claude_src_sig") != _cl_sig:
+                        p["_claude_src_sig"] = _cl_sig
+                        log(f"[Claude] source count: observed="
+                            f"{progress.get('observed_sources', 0)} "
+                            f"url={len(progress.get('source_urls') or [])} "
+                            f"ticker={int(progress.get('searches', 0) or 0)} "
+                            f"printed={int(progress.get('printed_sources', 0) or 0)} "
+                            f"toggle={'absent' if not _cl_tog.get('found') else _cl_tog.get('count')}"
+                            f" disabled={bool(_cl_tog.get('disabled'))}"
+                            f" expanded={bool(_cl_tog.get('expanded'))}", "DEBUG")
+                except Exception as _cl_se:
+                    log(f"[Claude] source-count union skipped: {_cl_se}", "DEBUG")
+
             # Claude artifact tracking — open the FIRST artifact and keep it open
             # so subsequent polls re-read live (URLs / steps / sections) without
             # re-clicking. Auto-close removed: the second artifact (final report) is
@@ -39380,6 +39998,13 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         f"(text={t1}, sources={s1}, steps={st1}, "
                         f"elapsed_since_marker={int(elapsed_done)}s). "
                         f"Starting extract_and_record (attempt {p['extraction_attempts']})")
+                    # Read Claude's sources disclosure while the run is finished
+                    # and the tab is still un-mutated. This has to happen BEFORE
+                    # extract_claude_response, whose first act is to close the
+                    # artifact panel. Mirrored at the CUA-confirmed-done site.
+                    if name == "Claude":
+                        await claude_finished_sources_read(
+                            p["page"], p, _runtime.agent_progress_snapshots)
                     _queue_dir = (Path(__file__).parent / "queues" / _tracks_dir.name) \
                                  if _tracks_dir else None
                     res = await extract_and_record_agent(
@@ -40016,6 +40641,16 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 # source of truth for save+emit (extract_and_record_agent),
                 # no inline duplication. Empty extractions still revert to
                 # polling (CUA likely misread completion).
+                #
+                # ⛔ The sources read is mirrored here deliberately, not by
+                # oversight at one site: Claude completing via the CUA never
+                # reaches the Playwright-confirmed path above, and the corpus run
+                # this read exists for went through THIS one. One-shot latched on
+                # `p`, so whichever path arrives first does the read and the other
+                # is a no-op.
+                if name == "Claude":
+                    await claude_finished_sources_read(
+                        p["page"], p, _runtime.agent_progress_snapshots)
                 _queue_dir = (Path(__file__).parent / "queues" / _tracks_dir.name) \
                              if _tracks_dir else None
                 res = await extract_and_record_agent(

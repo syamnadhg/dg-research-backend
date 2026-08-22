@@ -16,6 +16,25 @@ gates, and the live e2e showed the panel opening healthily at cycle 3 without an
 The defect it addressed costs degraded telemetry on roughly one run in twenty-one — not
 worth that blast radius alongside the fixes actually asked for. The live DOM findings
 are recorded in memory if it is ever re-added, as one isolated change.
+
+⭐⭐ 2026-08-22 — IT WAS RE-ADDED, AS THE ISOLATED CHANGE THIS ASKED FOR, and the
+guard below changed shape to match. What settled it was measurement rather than
+argument: across `~/.super-research/logs/e2e*.log` + `backend.log`, 13 of 22
+Claude runs that reached `CONFIRMED DONE` recorded ZERO sources — six of them on
+reports over 25,000 characters — and 74 of 78 `Artifact tracking:` reads returned
+exactly ONE url. So the price is not "one run in twenty-one"; it is most runs.
+
+The new read lives in `read_claude_sources_panel` /
+`_claude_sources_toggle_state` / `claude_finished_sources_read` and touches
+NEITHER of the two helpers this file protects — see
+tests/test_claude_sources_toggle_0822.py.
+
+⛔ The old assertion was `not hasattr(research, "_click_claude_sources_toggle")`.
+Keeping it would have been worse than deleting it: the new helpers carry
+different names, so it would have gone on passing while the feature it named
+shipped — a guard satisfied by a rename, which is the exact decorative-test shape
+this repo keeps paying for. What it was really protecting is ISOLATION, so that
+is what it now asserts.
 """
 
 from __future__ import annotations
@@ -122,9 +141,29 @@ def test_the_artifact_helpers_were_left_alone():
         assert "exclude_opener" not in src, f"{fn.__name__} regained the flag"
         assert "rename chat" not in src, f"{fn.__name__} regained the rename guard"
         assert "research panel" not in src, f"{fn.__name__} regained the panel selector"
-    assert not hasattr(research, "_click_claude_sources_toggle"), (
-        "the sources-toggle helper came back"
-    )
+    # 2026-08-22: the sources read is BACK, deliberately and in isolation. What
+    # this guard protects is that it stays isolated — so it now asserts what
+    # "isolated" means rather than that the feature is absent, which a rename
+    # would have satisfied while the feature shipped.
+    for fn in (research._count_claude_artifacts, research._click_claude_artifact):
+        src = inspect.getsource(fn)
+        low = src.lower()
+        assert "gathered" not in low, (
+            f"{fn.__name__} learned the sources-toggle label — the toggle read "
+            "must not reach into the artifact-card helpers"
+        )
+        assert "aria-expanded" not in low, (
+            f"{fn.__name__} grew a disclosure check; the sources read owns that"
+        )
+        assert research._CLAUDE_SOURCES_CLICK_VALUE not in src, (
+            f"{fn.__name__} is marking the sources toggle for a press"
+        )
+    # And the read must not have been implemented BY the count/click pair: its
+    # own entry points have to exist and be separate callables.
+    for name in ("_claude_sources_toggle_state", "read_claude_sources_panel",
+                 "claude_finished_sources_read"):
+        assert callable(getattr(research, name, None)), f"{name} is missing"
+    assert research._claude_sources_toggle_state is not research._count_claude_artifacts
 
 
 # ── warm-tab reuse must survive a drop-from-rotation ──────────────────────────

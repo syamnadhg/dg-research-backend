@@ -381,6 +381,24 @@ class El {
   // the whole walker return zeros. A fixture that cannot answer the way the browser
   // does turns a passing test into no test at all.
   get parentElement() { return this.parent; }
+  // ⭐ 2026-08-22 — the SCROLL BOX. Claude's sources list is an
+  // `ol role="list"` with `overflow-y-auto`, and whether it VIRTUALISES is an
+  // open question that can only be answered from a run with sources: the
+  // measured 5-row sample reported scrollHeight == clientHeight, which proves
+  // nothing either way. Production therefore scroll-and-accumulates, and a shim
+  // with no scroll box could not execute that loop at all — the accumulation
+  // would have shipped source-scanned, which is how this repo has already
+  // shipped an inverted gate.
+  //
+  // `sh`/`ch` drive it, matching the `w`/`h`/`x`/`y` idiom above, and default to
+  // EQUAL (600) so every existing fixture reads as not-scrollable — the common
+  // real case. A fixture declares a scrollable list by setting `sh` > `ch`.
+  // `scrollTop` is a real settable property because production writes it, and a
+  // getter-only member would have made the write a silent no-op.
+  get scrollHeight() { return 'sh' in this._attrs ? +this._attrs.sh : 600; }
+  get clientHeight() { return 'ch' in this._attrs ? +this._attrs.ch : 600; }
+  get scrollTop() { return +(this._attrs.st || 0); }
+  set scrollTop(v) { this._attrs.st = String(v); }
   dispatchEvent() { CLICKS.push(this.getAttribute('aria-label') || this.textContent || this.tagName); return true; }
   descendants() { return this.children.flatMap(c => [c, ...c.descendants()]); }
   matches(sel) {
@@ -390,6 +408,18 @@ class El {
     let n = this;
     while (n) { if (n.matches(sel)) return n; n = n.parent; }
     return null;
+  }
+  // ⭐ 2026-08-22 — `Node.contains`. Claude's sources disclosure resolves the
+  // list it discloses by walking ancestors for a list the CONTROL IS NOT INSIDE,
+  // and `!list.contains(toggle)` is the entire guard: without it the walk
+  // happily returns the list the toggle is a row of — the progress checklist,
+  // i.e. exactly the surface that read was written to stop reading. With this
+  // member missing the JS threw, so the branch was unreachable under the shim
+  // and no test could tell a working walk from one that had never run.
+  // Browser semantics: a node contains ITSELF.
+  contains(other) {
+    for (let n = other; n; n = n.parent) if (n === this) return true;
+    return false;
   }
   querySelectorAll(sel) { return this.descendants().filter(e => e.matches(sel)); }
   querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
