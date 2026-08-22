@@ -443,9 +443,8 @@ MUTANTS = [
     ("F11", "tools/build_compiled.py", "under",
      "the broken diagnostic ships in the wheel again — `import research` binds "
      "the shim and it AttributeErrors on first use",
-     [('DROP_FROM_WHEEL = ("scripts/dump_push_audit.py", "scripts/admin_cleanup_stale_ongoing.py",\n'
-       '                   "scripts/claude_popover_capture.py")',
-       'DROP_FROM_WHEEL = ("scripts/dump_push_audit.py", "scripts/admin_cleanup_stale_ongoing.py")')]),
+     [('                   "scripts/claude_popover_capture.py",',
+       '                   ')]),
     ("F12", "agent/facade/selfupdate.py", "under",
      "a rung-1 OSError returns early again, so the non-destructive rescue is "
      "reachable only from a non-zero exit code",

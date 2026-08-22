@@ -98,7 +98,12 @@ AUTH_SUBMODULES = ["v2_flow", "keystore", "credentials", "pairing"]
 # an AttributeError the moment anyone ran it. A source-tree diagnostic has no
 # business in a user's install either way.
 DROP_FROM_WHEEL = ("scripts/dump_push_audit.py", "scripts/admin_cleanup_stale_ongoing.py",
-                   "scripts/claude_popover_capture.py")
+                   "scripts/claude_popover_capture.py",
+                   # Support-side diagnostic: resolves a quoted support code to
+                   # the bundle on this machine. `import research` reaches the
+                   # SHIM in a wheel, so like its three siblings it is a
+                   # source-tree tool only.
+                   "scripts/find_support_bundle.py")
 
 SHIM = '''#!/usr/bin/env python3
 """Launcher shim for the COMPILED Super Research build.

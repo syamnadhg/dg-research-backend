@@ -7596,6 +7596,94 @@ _SEND_LOGS_LOCK = _log_threading.Lock()
 _send_logs_inflight = False
 
 
+#: Crockford's INPUT rule, and the only reason the alphabet drops these letters
+#: in the first place. ⛔⛔ MEASURED ON A REAL CODE, 2026-08-22: the owner read
+#: `1Z0FGVED` back as `1ZOFGVED` and it resolved to nothing. Dropping `O` from the
+#: alphabet does not stop a person writing one — it stops the code CONTAINING one,
+#: which is what makes the substitution safe. Without the map the omission buys
+#: nothing at all: it turns a recoverable mis-read into a hard refusal.
+#:
+#: `U` is left alone on purpose. Crockford excludes it to avoid accidental
+#: obscenity, not because it looks like something — there is no digit to map it
+#: to, and inventing one would silently accept a code that was never minted.
+_SUPPORT_CODE_CONFUSABLES = {"O": "0", "I": "1", "L": "1"}
+
+#: What people put between groups when they write a code down or read it back.
+_SUPPORT_CODE_SEPARATORS = " \t\r\n-_.·—–"
+
+
+def _normalize_support_code(raw) -> str:
+    """A support code as a person says it → the code as it was minted, or "".
+
+    Uppercases, drops the separators people insert, and maps the letters the
+    alphabet leaves out. Returns "" for anything that is still not a code, so
+    every caller keeps refusing on doubt rather than inventing a folder name.
+
+    ⛔⛔ THIS IS FOR LOOKING A CODE UP, NEVER FOR ACCEPTING ONE OFF THE WIRE.
+    Every support code inside this product is a RENDEZVOUS key minted by the
+    other side: the app mints it, writes the command carrying it, and watches
+    `users/{uid}/logBundles/{code}` for the row this machine writes back.
+    Normalising it here would write the row under a different id than the app is
+    watching — and the app reads a missing row as "this build is too old to
+    understand the request". So `_handle_log_bundle_command` and
+    `_upload_log_bundle_via_storage_rest` keep matching EXACTLY, and
+    `test_the_two_wire_boundaries_stay_exact` holds them to it.
+    """
+    s = "".join(ch for ch in str(raw or "").upper()
+                if ch not in _SUPPORT_CODE_SEPARATORS)
+    s = "".join(_SUPPORT_CODE_CONFUSABLES.get(ch, ch) for ch in s)
+    return s if _SUPPORT_CODE_RE.match(s) else ""
+
+
+def find_local_support_bundle(raw_code, root=None) -> dict:
+    """Find the archive a quoted support code names, on this machine.
+
+    `--send-logs` writes every bundle to `outgoing/support-<CODE>.zip` and leaves
+    it there, so the machine that sent one can still produce it from the code
+    alone — which is the answer a person actually needs when they read a code
+    back over a call and it does not resolve.
+
+    Returns `{"typed", "code", "remapped", "path", "sizeBytes", "searched",
+    "available"}`. `code` is "" when the input is not a code at all even after
+    normalising, and `path` is "" when nothing on this machine carries that code.
+    `available` lists what IS here, so the reply is "not this one, and here is
+    what is" rather than a bare no.
+
+    ⭐ `remapped` names the letters that were actually substituted, and it is
+    empty when only case or separators changed. A caller that announced the
+    letter rule on every normalisation would be claiming a substitution that did
+    not happen — the species of untrue copy this wave exists to remove.
+    """
+    base = Path(root) if root is not None else (_logs_root() / "outgoing")
+    code = _normalize_support_code(raw_code)
+    out = {"typed": str(raw_code or ""), "code": code,
+           "remapped": [f"{k}→{v}" for k, v in _SUPPORT_CODE_CONFUSABLES.items()
+                        if k in str(raw_code or "").upper()],
+           "path": "", "sizeBytes": 0, "searched": str(base), "available": []}
+    try:
+        found = sorted(p for p in base.iterdir()
+                       if p.is_file() and p.name.startswith("support-")
+                       and p.name.endswith(BUNDLE_SUFFIX))
+    except OSError:
+        return out
+    out["available"] = [p.name[len("support-"):-len(BUNDLE_SUFFIX)] for p in found]
+    # ⛔ NO `if not code: return` FAST PATH. Mutation showed one could not change
+    # the answer — an empty code looks for `support-.zip`, which nothing can ever
+    # mint — so it was a guard that could not fire, and this repo has shipped
+    # enough of those. The listing above is built either way, deliberately: a
+    # reply of "that is not a code, and here is what this machine does have" is
+    # more use than a bare refusal.
+    for p in found:
+        if p.name == f"support-{code}{BUNDLE_SUFFIX}":
+            out["path"] = str(p)
+            try:
+                out["sizeBytes"] = p.stat().st_size
+            except OSError:
+                pass
+            break
+    return out
+
+
 def _mint_support_code() -> str:
     """Eight characters of Crockford base32 from the system CSPRNG.
 
