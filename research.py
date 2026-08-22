@@ -71234,7 +71234,10 @@ def run_doctor():
         print(f"  {_c(_DIM, 'Super Research cannot change any of this for you — DNS, VPN,')}")
         print(f"  {_c(_DIM, 'proxy and firewall settings belong to this machine and this')}")
         print(f"  {_c(_DIM, 'network. Nothing is wrong with your install or your pairing.')}")
-        print(f"  {_c(_DIM, _doctor_share_logs_line())}")
+        # ⭐ The hand-over line used to be printed HERE and only here. It now
+        # closes every doctor run — see the summary — so repeating it in this
+        # branch would put it on the page twice for the one fault that already
+        # had it.
         manual_actions.extend(_verdict["actions"] or [
             f"nslookup {FIRESTORE_HOST}   (then check VPN / proxy / firewall / DNS)"])
     else:
@@ -71497,6 +71500,23 @@ def run_doctor():
             print(f"  {_c(_BOLD, 'Manual steps still required:')}")
             for i, a in enumerate(manual_actions, 1):
                 print(f"    {_c(_ACCENT, f'{i}.')} {a.replace('python research.py', _PROG)}")
+    # ⛔⛔ THE HAND-OVER, ON EVERY RUN, and it used to live inside ONE branch:
+    # the transient-Firestore one. So a machine whose Chromium would not launch,
+    # whose supervisor was missing, or whose refresh token was revoked read a
+    # diagnosis and reached the end of the page with nothing to do next. The
+    # owner's ask was "every failure a person can be left holding should point at
+    # the way to hand it over", and a network fault is one failure out of a dozen
+    # this command reports.
+    #
+    # ⭐ INCLUDING `✓ Healthy`, which is the case a person is MOST stuck in: they
+    # ran this because something is wrong, and the answer was that nothing here
+    # is. That is exactly when the logs are the next move, and the line opens
+    # "Still stuck?" — which is a question only that reader is being asked.
+    #
+    # Printed here rather than in each branch because two authors of one sentence
+    # is how `--resurrect` came to be prescribed twice in a three-step list.
+    print()
+    print(f"  {_c(_DIM, _doctor_share_logs_line())}")
     print()
 
 
