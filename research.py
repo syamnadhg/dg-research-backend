@@ -9369,8 +9369,24 @@ _TAIL_KEYED_NOTE = b"[bundle] ^ this message occurred %d more times nearby"
 #: to carry its count out on, so without this line those repeats would be dropped
 #: silently — which is the one thing the whole rule promises not to do. Caught by
 #: its own test: 40 held, only 32 accounted for.
-_TAIL_KEYED_TAIL_NOTE = (b"[bundle] %d further repeated lines were collapsed "
-                         b"across %d message(s) and are not shown individually")
+#:
+#: ⭐ IT LEADS WITH A FIXED PHRASE, and the count comes after it. The other two
+#: markers both open `[bundle] ^ `, so a prefix derived the usual way
+#: (`.split(b"%")[0]`) would be `[bundle] ` and match all three — and this one has
+#: to be told apart from them by `_tail_bytes`, which must not trim it away.
+_TAIL_KEYED_TAIL_PREFIX = b"[bundle] not shown individually: "
+_TAIL_KEYED_TAIL_NOTE = (_TAIL_KEYED_TAIL_PREFIX +
+                         b"%d further repeated lines across %d message(s) that "
+                         b"the scan ended still holding")
+
+#: The three ways a line leaves a tail, named once. ⛔⛔ THE GATE AND THE HEADER
+#: USED TO CARRY THEIR OWN LISTS AND BOTH LISTS WERE SHORT BY ONE — the keyed rule,
+#: which is the one that removes the most. Measured on this machine's frozen logs
+#: 2026-08-22: `backend-2.log` dropped 627,284 · collapsed 0 · **throttled 24,386**,
+#: and the header it shipped with said "0 consecutive duplicate lines collapsed"
+#: and stopped. A fourth rule added without a fourth sentence now fails a test
+#: rather than shipping 24,386 unreported lines in a file somebody sent us.
+_TAIL_REMOVAL_KINDS = ("dropped", "collapsed", "throttled")
 
 #: A log line's identity WITHOUT its timestamp. `[19:48:43] [INFO] text` -> `text`.
 _TAIL_TS_PREFIX = re.compile(rb"^\[[\d:]{5,8}\]\s*(?:\[[A-Z]+\]\s*)?")
@@ -9397,6 +9413,15 @@ def _tail_msg_key(line: bytes) -> bytes:
 # template rather than written out again — two spellings and the check silently
 # stops matching.
 _TAIL_REPEAT_NOTE_PREFIX = _TAIL_REPEAT_NOTE.split(b"%")[0]
+_TAIL_KEYED_NOTE_PREFIX = _TAIL_KEYED_NOTE.split(b"%")[0]
+#: ⛔⛔ EVERY marker that describes the line ABOVE it, so the trim below removes it
+#: when that line goes. It knew only the adjacency one, and the keyed one is
+#: reachable: MEASURED 2026-08-22 on a 300-line heartbeat fixture, at budgets of
+#: 1500 / 2500 / 4000 bytes the tail's FIRST line came back as
+#: `[bundle] ^ this message occurred 14 more times nearby` — sitting above an
+#: unrelated real event, attributing a heartbeat's repeat count to it. That is the
+#: fabricated count this sweep exists to prevent, in the marker it did not know.
+_TAIL_ANCHORED_NOTE_PREFIXES = (_TAIL_REPEAT_NOTE_PREFIX, _TAIL_KEYED_NOTE_PREFIX)
 # ⭐ Built from `LOG_DATE_PREFIX`, not written out again: the writer and the reader
 # of this marker have to agree, and two spellings is how a reader silently stops
 # finding what a writer is still emitting.
@@ -9518,6 +9543,24 @@ def _filter_tail_lines(lines, limit: int, stats: dict) -> "list[bytes]":
         run_line = None
         run_extra = 0
 
+    def _remainder() -> None:
+        """The repeats the scan ended still holding, in one line.
+
+        ⛔⛔ CALLED ON BOTH EXITS, and it used to run only after the loop finished
+        naturally — which is not the exit a real log takes. MEASURED 2026-08-22 on
+        this machine's own `backend.log`: at a 200 KB budget the scan ends at the
+        cutoff holding 6,286 repeats and reported NONE of them. The whole contract
+        of the keyed rule is that a held copy is counted, never discarded, and the
+        budget was quietly exempt from it.
+        """
+        nonlocal kept
+        left = sum(_unflushed.values())
+        if not left:
+            return
+        note = _TAIL_KEYED_TAIL_NOTE % (left, len(_unflushed))
+        out.append(note)
+        kept += len(note) + 1
+
     for line in lines:
         if _drop_from_tail(line):
             stats["dropped"] = stats.get("dropped", 0) + 1
@@ -9528,7 +9571,9 @@ def _filter_tail_lines(lines, limit: int, stats: dict) -> "list[bytes]":
         _flush()
         if kept >= limit:
             # Already flushed and nothing is pending, so returning here cannot
-            # lose a collapsed run's count.
+            # lose a collapsed run's count — and `_remainder` is what stops it
+            # losing a KEYED one, which for years it did.
+            _remainder()
             stats["keptBytes"] = kept
             return out
         # The keyed rule, after adjacency has had its say. A message the cadence
@@ -9550,11 +9595,7 @@ def _filter_tail_lines(lines, limit: int, stats: dict) -> "list[bytes]":
     # The remainder, in one line rather than one per message: a held repeat that
     # never met another copy of itself still has to be reported, or the bundle
     # would be quietly shorter than the truth.
-    _left = sum(_unflushed.values())
-    if _left:
-        note = _TAIL_KEYED_TAIL_NOTE % (_left, len(_unflushed))
-        out.append(note)
-        kept += len(note) + 1
+    _remainder()
     stats["keptBytes"] = kept
     return out
 
@@ -9576,8 +9617,11 @@ def _tail_bytes(path, limit=BUNDLE_SYSTEM_TAIL_BYTES, stats=None,
     limit = max(0, int(limit))
     if stats is None:
         stats = {}
-    stats.setdefault("dropped", 0)
-    stats.setdefault("collapsed", 0)
+    # ⛔ Every removal kind exists before anything is scanned, from the one list —
+    # a file this returns early on (unreadable, empty) still has to answer the
+    # header's questions with a number rather than a KeyError.
+    for _kind in _TAIL_REMOVAL_KINDS:
+        stats.setdefault(_kind, 0)
     try:
         size = Path(path).stat().st_size
     except OSError:
@@ -9620,11 +9664,24 @@ def _tail_bytes(path, limit=BUNDLE_SYSTEM_TAIL_BYTES, stats=None,
     # `> 1` keeps the newest line even when it alone exceeds the budget: a tail of
     # nothing is worse than a tail slightly over.
     total = sum(len(x) + 1 for x in newest_first)
+    # ⛔⛔ THE REMAINDER LINE IS NOT LOG CONTENT AND MUST NOT BE TRIMMED LIKE IT.
+    # `_filter_tail_lines` appends it LAST, which is the OLDEST end — exactly where
+    # the trim below starts eating. So the one line that reports what the budget
+    # cost was itself the first thing the budget removed, and fixing the filter
+    # without this does not deliver: measured, the note was absent from every tail
+    # whose budget bound. Detached here, re-attached below, ~100 bytes against a
+    # 5 MiB budget.
+    _remainder_note = None
+    if newest_first and newest_first[-1].startswith(_TAIL_KEYED_TAIL_PREFIX):
+        _remainder_note = newest_first.pop()
+        total -= len(_remainder_note) + 1
     while total > limit and len(newest_first) > 1:
         total -= len(newest_first.pop()) + 1
     while (len(newest_first) > 1
-           and newest_first[-1].startswith(_TAIL_REPEAT_NOTE_PREFIX)):
+           and newest_first[-1].startswith(_TAIL_ANCHORED_NOTE_PREFIXES)):
         total -= len(newest_first.pop()) + 1
+    if _remainder_note is not None:
+        newest_first.append(_remainder_note)
     # ⛔⛔ THE DATE RANGE IS READ FROM WHAT SURVIVED, NOT FROM WHAT WAS SCANNED,
     # and the difference is a header that lies. `_tail_filter_header` says "the
     # [date] lines BELOW cover X … Y" — so if the range were collected during the
@@ -9662,16 +9719,47 @@ def _tail_dating_text(stats: dict) -> str:
     return "Dates: unknown — no [date] lines, and the file's own timestamp was unreadable."
 
 
+def _tail_removed_anything(stats: dict) -> bool:
+    """Whether this tail is a filtered one at all.
+
+    ⛔⛔ THE GATE THAT DECIDES WHETHER THE HEADER IS ATTACHED, and it used to read
+    `dropped or collapsed` — so a file whose ONLY filtering was the keyed rule
+    shipped a filtered tail with no admission anywhere in it. Reads the same list
+    the header does, so the two cannot disagree about what counts as removal."""
+    return any(int(stats.get(k) or 0) for k in _TAIL_REMOVAL_KINDS)
+
+
 def _tail_filter_header(name: str, stats: dict) -> bytes:
-    """Say what was removed, at the top of the tail it was removed from."""
+    """Say what was removed, at the top of the tail it was removed from.
+
+    ⛔⛔ ONE SENTENCE PER REMOVAL KIND, AND THERE ARE THREE. It named two, and the
+    missing one is the rule that removes the most. MEASURED 2026-08-22 on this
+    machine's frozen logs, which are the ones a support bundle actually carries:
+
+        backend.log      dropped 621,067 · collapsed      4 · throttled 48,630
+        backend-2.log    dropped 627,284 · collapsed      0 · throttled 24,386
+        backend.err.log  dropped       0 · collapsed  3,905 · throttled  4,750
+
+    The header on `backend-2.log` read "0 consecutive duplicate lines collapsed"
+    — true, and the reason it is misleading: 24,386 lines had been removed by the
+    rule it did not mention, so the one number a reader was given was the only
+    one that was zero."""
     return (
         f"[bundle] {name}: this tail was filtered so its budget could reach "
         f"further back. {int(stats.get('dropped', 0))} successful /api/health "
         f"access lines removed (failing probes are kept); "
-        f"{int(stats.get('collapsed', 0))} consecutive duplicate lines collapsed "
-        f"into the counts marked below. Scanned "
-        f"{int(stats.get('scannedBytes', 0))} bytes"
+        f"{int(stats.get('collapsed', 0))} consecutive duplicate lines collapsed; "
+        f"{int(stats.get('throttled', 0))} further repeats of a message that "
+        f"recurred with other lines between them were held back the same way. "
+        f"Scanned {int(stats.get('scannedBytes', 0))} bytes"
         f"{'' if stats.get('reachedStart') else ' (did not reach the start of the file)'}. "
+        # ⛔ WHICH WINDOW THESE NUMBERS DESCRIBE. They count the whole scan; the
+        # `[bundle]` notes in the body only mark what the byte budget had room to
+        # keep, so the two will not add up and a reader should not expect them to.
+        # Without this clause the previous wording ("collapsed into the counts
+        # marked below") claimed they would.
+        f"Those counts cover the whole scan; the [bundle] notes below mark the "
+        f"part of it the budget had room to keep. "
         f"{_tail_dating_text(stats)}\n"
     ).encode("utf-8")
 
@@ -9971,7 +10059,7 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
             # `system/backend.log` and finds no health probes in five megabytes
             # would conclude the probes stopped — which is a diagnosis, and a
             # wrong one. The header travels with the data it describes.
-            if stats.get("dropped") or stats.get("collapsed"):
+            if _tail_removed_anything(stats):
                 data = _tail_filter_header(path.name, stats) + data
             tail_stats[path.name] = stats
             if written + len(data) > int(max_bytes):

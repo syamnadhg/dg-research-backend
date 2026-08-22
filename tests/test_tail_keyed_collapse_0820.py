@@ -117,8 +117,15 @@ class TestNothingWorthReadingIsLost:
         # ⛔ Plus the REMAINDER. A message held back at the end of the scan has no
         # later copy to ride out on — 8 of 40 went unaccounted until this test
         # said so, which is the exact failure the contract forbids.
-        counted += sum(int(b.split(b"] ")[1].split(b" further")[0])
-                       for b in notes if b"further repeated" in b)
+        #
+        # ⭐ 2026-08-22: parsed off `_TAIL_KEYED_TAIL_PREFIX` rather than off the
+        # first `] `. The remainder note grew a fixed opening phrase so
+        # `_tail_bytes` can tell it apart from the two markers that describe the
+        # line above them — all three used to begin `[bundle] `, which is what a
+        # positional split was really keying on.
+        counted += sum(
+            int(b.split(research._TAIL_KEYED_TAIL_PREFIX)[1].split(b" further")[0])
+            for b in notes if b.startswith(research._TAIL_KEYED_TAIL_PREFIX))
         assert counted == stats["throttled"], (counted, stats["throttled"])
 
     def test_the_remainder_is_reported_even_with_no_later_copy(self):

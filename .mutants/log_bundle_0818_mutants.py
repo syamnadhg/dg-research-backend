@@ -52,7 +52,11 @@ T_CAP = "tests/test_run_log_capture_0818.py"
 # worth reading. The tests for that live in the log-noise file; a harness scoped
 # to its own two would report every one of them as a suite gap.
 T_NOISE = "tests/test_log_noise_0819.py"
-ALL = [T_BUNDLE, T_CAP, T_NOISE]
+# ⛔ 2026-08-22 — wave 4 made the filtered tail account for all three kinds of
+# removal, on both exits, under the byte budget. Same three functions, so the
+# same three mutants above have to be able to see it.
+T_HONEST = "tests/test_bundle_tail_honesty_0822.py"
+ALL = [T_BUNDLE, T_CAP, T_NOISE, T_HONEST]
 
 PY = str(ROOT / ".venv" / "bin" / "python")
 _TEST_TIMEOUT_S = 600
@@ -196,9 +200,9 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
        '        if line in set(out):')], [T_NOISE]),
     ("B11e", "under", "⛔ the filtered tail stops admitting it was filtered, so a "
      "reader concludes the health probes stopped — a diagnosis, and a wrong one",
-     [('            if stats.get("dropped") or stats.get("collapsed"):\n'
+     [('            if _tail_removed_anything(stats):\n'
        '                data = _tail_filter_header(path.name, stats) + data',
-       '            pass')], [T_NOISE]),
+       '            pass')], [T_NOISE, T_HONEST]),
     ("B11f", "under", "the scan is unbounded, so one oversized file can hold a "
      "user's support bundle open indefinitely",
      [('    scan_limit = max(limit, int(scan_limit))',
@@ -211,8 +215,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      "oldest line can vanish while its 'repeated N more times' marker survives "
      "pointing at whatever line is now above it — a fabricated count in a support "
      "archive",
-     [('    total = sum(len(x) + 1 for x in newest_first)\n'
-       '    while total > limit and len(newest_first) > 1:\n'
+     [('    while total > limit and len(newest_first) > 1:\n'
        '        total -= len(newest_first.pop()) + 1',
        '    out = b"\\n".join(reversed(newest_first)) + b"\\n"\n'
        '    if len(out) > limit:\n'
@@ -224,8 +227,8 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     ("B11j", "under", "the orphaned-marker sweep goes, so a trim that removes a "
      "collapsed run's copy leaves its count attached to the wrong line",
      [('    while (len(newest_first) > 1\n'
-       '           and newest_first[-1].startswith(_TAIL_REPEAT_NOTE_PREFIX)):\n'
-       '        total -= len(newest_first.pop()) + 1', '    pass')], [T_NOISE]),
+       '           and newest_first[-1].startswith(_TAIL_ANCHORED_NOTE_PREFIXES)):\n'
+       '        total -= len(newest_first.pop()) + 1', '    pass')], [T_NOISE, T_HONEST]),
     ("B11k", "over", "the trim keeps popping past the last line, so a file whose "
      "newest line alone exceeds the budget contributes NOTHING",
      [('    while total > limit and len(newest_first) > 1:',
