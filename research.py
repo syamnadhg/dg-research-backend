@@ -35761,11 +35761,20 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
             # in-memory progress snapshot (already deduped).
             try:
                 _src_urls = list(getattr(_runtime, "agent_progress_snapshots", {}).get(agent_key, {}).get("source_urls", []) or [])
-                if _src_urls:
+                # ⛔ NO LONGER GATED ON THE PANEL LIST. `if _src_urls:` meant a
+                # report full of citations produced no findings whenever the
+                # panel scrape came back empty — which is most Claude runs. The
+                # report is the other input now, so the only thing that can
+                # make findings impossible is having no report.
+                if md_content:
                     _findings = _extract_findings(md_content, _src_urls)
                     if _findings:
                         _runtime.agent_findings[agent_key] = _findings
-                        log(f"[{name}] Extracted {len(_findings)} cited-source findings")
+                        _from_panel = sum(
+                            1 for f in _findings if f.get("url") in set(_src_urls))
+                        log(f"[{name}] Extracted {len(_findings)} cited-source "
+                            f"findings (panel {_from_panel}, "
+                            f"report {len(_findings) - _from_panel})")
             except Exception as _ef:
                 log(f"[{name}] findings extraction failed: {_ef}", "DEBUG")
         except Exception as e:
@@ -48844,6 +48853,17 @@ def autoskip_reason_for_status(results_status: str) -> tuple:
       * failed mid-run     — `agent_error`: the agent WAS verified running and
                              its research then failed platform-side.
       * retried, no output — the hard-retry statuses.
+      * tab lost           — `browser_crashed` / `wrong_conversation` / `empty`.
+
+    2026-08-22 — the fourth outcome, and the reason it is not an unknown. All
+    three of those statuses are written ONLY while iterating `pending`, and
+    `pending` is seeded solely for agents whose page survived 2A/2B/2C setup. So
+    STARTUP SUCCEEDING IS A PRECONDITION for any of them existing — a crashed
+    tab, a tab that drifted into someone else's conversation, and an extraction
+    that came back empty all describe an agent that was up and running. Routing
+    them through the "couldn't start" default is the same defect the 2026-07-31
+    note below describes, in three statuses that note did not enumerate: it
+    points the user at their own login when nothing there was wrong.
 
     Pure and module-level on purpose: the caller is a closure inside
     ``poll_all_agents_round_robin``, which a test cannot drive, so the decision
@@ -48856,6 +48876,14 @@ def autoskip_reason_for_status(results_status: str) -> tuple:
     if st in ("hard_retry_failed", "hard_retry_exhausted_dead_tab"):
         return ("auto_skip_hard_retry_exhausted", "hard_retry_exhausted",
                 "was retried and still produced no report")
+    if st in ("browser_crashed", "wrong_conversation", "empty"):
+        return ("auto_skip_tab_lost", "tab_lost",
+                "started and ran, then we lost the tab we were reading it through")
+    # ⚠ The default stays "couldn't start", deliberately. It is the honest answer
+    # for "" / None / a status this function has never seen: an unknown is closer
+    # to a setup problem than to a CLAIM that the research ran and died, which
+    # would be a fabricated story. Only statuses proved to require a live page
+    # get moved out of it.
     return ("auto_skip_setup_failed", "setup_failed", "couldn't start")
 
 
@@ -48888,6 +48916,13 @@ def _autoskip_details(copy_key: str, name: str, why: str = "") -> str:
     if copy_key == "hard_cap_parked":
         return (f"{name} sat on an unanswered alert past the time "
                 f"limit {_tail}")
+    # 2026-08-22. Note this one deliberately DROPS the "and its Retry/Skip alert
+    # wasn't answered" clause every neighbour carries: a crashed tab emits a
+    # passive recovery banner and no decision card at all, so claiming the user
+    # ignored an alert would be a second false statement layered on the first.
+    if copy_key == "tab_lost":
+        return (f"{name} started and ran, but its browser tab was lost before "
+                f"we could read the report {_tail}")
     if copy_key == "stuck":
         return f"{name} {why} {_tail}"
     if copy_key == "hv_wall":
@@ -56509,6 +56544,63 @@ _FIND_SENT_TAIL_RE = re.compile(r'(?:[.!?]\s|\n\n|\n#{1,4}\s)', re.MULTILINE)
 _FIND_SENT_HEAD_RE = re.compile(r'(?:[.!?]\s|\n\n|\n#{1,4}\s)', re.MULTILINE)
 _FIND_HEADING_RE = re.compile(r'^#{2,4}\s+(.{2,80})$', re.MULTILINE)
 _FIND_MD_LINK_RE = re.compile(r'\[([^\]]{1,200})\]\(([^)]+)\)')
+#: Bare URLs in a report. Hoisted out of `save_meta` (which harvests the same
+#: markdown for `sourceUrls`) so one definition serves both — the two disagreeing
+#: about what a URL is would put a source in the list and not in the findings.
+_FIND_BARE_URL_RE = re.compile(r'https?://[^\s\)\]\"\'>]+')
+#: Query keys dropped before comparing two URLs. Ported from the JS `cleanUrl`
+#: the panel scrape already applies, so a panel row and the report's own citation
+#: of the same page compare EQUAL — otherwise `?utm_source=chatgpt.com` makes one
+#: page into two findings.
+_FIND_TRACKING_PREFIX = "utm_"
+
+
+def _find_normalize_url(u: str) -> str:
+    """A comparison key for two URLs that mean the same page.
+
+    Lowercases the host, drops `www.`, strips only the `utm_*` family from the
+    query and keeps everything else — a bare "drop the query" would merge two
+    genuinely different pages on a site that paginates or filters there.
+
+    Returns the input unchanged when it cannot be parsed: an unparseable string
+    is still a valid dedupe key for itself, and dropping it would be worse.
+    """
+    try:
+        from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+        s = urlsplit(u)
+        host = (s.hostname or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        if s.port:
+            host = f"{host}:{s.port}"
+        q = urlencode([(k, v) for k, v in parse_qsl(s.query, keep_blank_values=True)
+                       if not k.lower().startswith(_FIND_TRACKING_PREFIX)])
+        path = s.path.rstrip("/") or "/"
+        return urlunsplit((s.scheme.lower(), host, path, q, s.fragment))
+    except Exception:
+        return u
+
+
+def _find_is_platform_host(u: str) -> bool:
+    """Is this URL one of the agents' own pages rather than a research source?
+
+    ⚠ SUFFIX-aware, unlike the bare `host in _HOST_DENYLIST` membership tests
+    elsewhere. Those are fed hosts the panel scrape already normalised; a report
+    cites whatever the agent wrote, which includes `cdn.openai.com` and
+    `files.oaiusercontent.com` — subdomains an exact-set test lets straight
+    through. This is the same "guard the HOST, not the whole URL" rule that a
+    substring filter here once broke by discarding 56% of a run's sources.
+    """
+    try:
+        from urllib.parse import urlsplit
+        host = (urlsplit(u).hostname or "").lower()
+    except Exception:
+        return False
+    if not host:
+        return False
+    if host.startswith("www."):
+        host = host[4:]
+    return any(host == d or host.endswith("." + d) for d in _HOST_DENYLIST)
 
 
 def _extract_findings(md: str, source_urls: list) -> list:
@@ -56534,9 +56626,76 @@ def _extract_findings(md: str, source_urls: list) -> list:
 
     Caps result list at 12 per agent. Order = first-mention order in
     the markdown, deduped by URL.
+
+    ⭐⭐ 2026-08-22 — THE REPORT IS NOW AN INPUT, not just a haystack. This used
+    to take its candidate list solely from `source_urls`, i.e. the panel scrape,
+    and return `[]` the moment that list was empty — so a Claude report carrying
+    forty markdown citations produced NO findings at all, and the Findings tab
+    fell back to bare section headings for a document full of sources. Measured:
+    13 of 22 finished Claude runs in this machine's logs recorded zero panel
+    sources, and `save_meta` was meanwhile harvesting that same report's URLs
+    into `sourceUrls` — the two halves of one agent entry disagreeing about
+    whether the run had sources.
+
+    Candidates are now the UNION of the panel list and the report's own URLs
+    (markdown-link targets plus bare), deduped on a normalised key so
+    `?utm_source=…` does not make one page into two.
+
+    ⭐ And the order changed with it. The docstring has always claimed
+    "first-mention order in the markdown"; the loop actually walked panel order,
+    so the 12-cap took the first twelve PANEL rows regardless of whether the
+    report cited them. Sorting by position of first mention makes the claim true
+    and makes the cap select the twelve most prominently cited sources.
     """
-    if not md or not source_urls:
+    if not md:
         return []
+    # Report-derived candidates. Platform chrome is dropped by HOST — the
+    # agents cite their own CDNs, and an exact-host membership test lets
+    # `cdn.openai.com` through.
+    #
+    # ⭐ ONE SCAN, and mutation is why. This first ran `_FIND_MD_LINK_RE` over the
+    # markdown as well, on the reasonable-sounding theory that a report which
+    # LINKS rather than pastes needs its link targets read separately. Deleting
+    # that scan changed no test, so it was measured instead of argued: because
+    # `_FIND_BARE_URL_RE` already stops at `)`, `]`, `"`, `'` and `>`, it finds
+    # every markdown target the link regex does — and on the two forms where they
+    # differ the link regex is WORSE, yielding `https://ex.com/a "Nice Title"`
+    # for a titled link and `<https://ex.com/x>` for an angle-bracketed one. The
+    # first of those passes the http check and would have been emitted to the
+    # user as a URL with a title glued to it. A redundant scan that can only make
+    # the answer worse is not belt-and-braces.
+    _report = _FIND_BARE_URL_RE.findall(md)
+    # ⛔ TWO FORMS PER SOURCE, and a test caught why one is not enough. Dedupe
+    # keeps the panel's cleaner URL, but the snippet is located by a LITERAL
+    # `md.find`. So when the report spells the same page differently
+    # (`https://www.Example.com/a` against the panel's `https://example.com/a`)
+    # a single-form merge is strictly worse than no merge at all: the report's
+    # own form is discarded as a duplicate, the surviving panel form is not
+    # present in the text, and the finding vanishes. `emit` is what the user
+    # sees; `lookup` is whatever actually appears in the report.
+    _by_key: dict = {}
+    _order: list = []
+    for u in list(source_urls or []) + _report:
+        u = (u or "").strip().rstrip('.,;:)')
+        if not u.lower().startswith(("http://", "https://")):
+            continue
+        if _find_is_platform_host(u):
+            continue
+        k = _find_normalize_url(u)
+        if k not in _by_key:
+            _by_key[k] = {"emit": u, "lookup": u if md.find(u) >= 0 else ""}
+            _order.append(k)
+        elif not _by_key[k]["lookup"] and md.find(u) >= 0:
+            _by_key[k]["lookup"] = u
+    _candidates = [_by_key[k] for k in _order if _by_key[k]["lookup"]]
+    if not _candidates:
+        return []
+    # First-MENTION order, which is what the docstring has always promised and
+    # the panel-ordered loop never delivered.
+    _candidates.sort(key=lambda c: md.find(c["lookup"]))
+    _candidates = _candidates[:_SOURCE_LIST_CAP]
+    source_urls = [c["lookup"] for c in _candidates]
+    _emit_for = {c["lookup"]: c["emit"] for c in _candidates}
     findings: list = []
     seen_urls: set = set()
     # Pre-scan headings so we can find the nearest preceding heading
@@ -56589,7 +56748,10 @@ def _extract_findings(md: str, source_urls: list) -> list:
             except Exception:
                 title = ""
         title = title[:80]
-        findings.append({"url": url, "snippet": snippet, "sourceTitle": title})
+        # Emit the canonical form (the panel's, when it supplied one), not the
+        # spelling that happened to be in the prose.
+        findings.append({"url": _emit_for.get(url, url), "snippet": snippet,
+                         "sourceTitle": title})
         if len(findings) >= 12:
             break
     return findings
@@ -56699,7 +56861,7 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
             # Filter out the file header we added
             sections = [s for s in sections if s not in ("ChatGPT Deep Research", "Gemini Deep Research", "Claude Deep Research")]
             # Extract source URLs from markdown links and references
-            urls = re.findall(r'https?://[^\s\)\]\"\'>]+', content)
+            urls = _FIND_BARE_URL_RE.findall(content)
             unique_urls = list(dict.fromkeys(urls))[:_SOURCE_LIST_CAP]  # Dedupe, cap at the shared ceiling
             # Build/update agent entry. unique_urls is already capped at 50.
             existing = agents.get(platform, {})
@@ -59461,7 +59623,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     try:
                         if _agent_lc not in (getattr(_runtime, "agent_findings", {}) or {}):
                             _src_urls = list(getattr(_runtime, "agent_progress_snapshots", {}).get(_agent_lc, {}).get("source_urls", []) or [])
-                            if _src_urls:
+                            # Same de-gating as the primary site: this backstop
+                            # exists for resume/re-finalize, exactly when the
+                            # snapshot ring may have been cleared — so keying it
+                            # on the panel list made it useless in the one case
+                            # it was written for.
+                            if _agent_md:
                                 _findings = _extract_findings(_agent_md, _src_urls)
                                 if _findings:
                                     _runtime.agent_findings[_agent_lc] = _findings

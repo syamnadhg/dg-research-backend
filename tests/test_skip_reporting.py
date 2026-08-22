@@ -240,11 +240,51 @@ def test_an_exhausted_hard_retry_reports_as_one():
 
 def test_an_unknown_status_defaults_to_setup_failed_not_to_a_claim_it_ran():
     """"We don't know" is closer to a setup problem than to asserting the
-    research ran and died — the latter would be a fabricated story."""
-    for st in ("", None, "something_new", "empty", "browser_crashed"):
+    research ran and died — the latter would be a fabricated story.
+
+    ⛔ 2026-08-22 — `empty` and `browser_crashed` WERE IN THIS LIST and should
+    never have been: they are not unknowns. Both are written only while iterating
+    `pending`, which is seeded solely for agents whose page survived setup, so
+    startup succeeding is a PRECONDITION for either of them existing. This test
+    was pinning the defect — the same "couldn't start" lie the 2026-07-31 split
+    was written to end, in statuses that split did not enumerate. They moved to
+    the sibling below; the genuine unknowns stay here."""
+    for st in ("", None, "something_new"):
         reason, copy_key, _ = research.autoskip_reason_for_status(st)
         assert reason == "auto_skip_setup_failed", st
         assert copy_key == "setup_failed", st
+
+
+def test_a_lost_tab_is_not_reported_as_a_startup_failure():
+    """The three statuses that require a LIVE page to have existed.
+
+    A crashed tab, a tab that drifted into a conversation predating the run, and
+    an extraction that came back empty all describe an agent that started fine.
+    Telling that user their agent "couldn't start" points them at their own login
+    and setup when nothing there was wrong — and the reason slug reaches the FE
+    verbatim, so a wrong one here is a wrong story in the phase dropdown and in
+    the durable record."""
+    for st in ("browser_crashed", "wrong_conversation", "empty",
+               "BROWSER_CRASHED"):
+        reason, copy_key, why = research.autoskip_reason_for_status(st)
+        assert reason == "auto_skip_tab_lost", st
+        assert copy_key == "tab_lost", st
+        assert "couldn't start" not in why, st
+        text = research._autoskip_details(copy_key, "Claude", why)
+        assert "couldn't start" not in text, st
+        assert "started and ran" in text, st
+        # A crashed tab raises no decision card, so the neighbours' "and its
+        # Retry/Skip alert wasn't answered" clause would be a second false claim.
+        assert "wasn't answered" not in text, st
+
+
+def test_the_startup_statuses_still_say_startup():
+    """The other half of the split: moving three statuses out must not take the
+    genuine startup failures with them."""
+    for st in ("failed_setup", "not_verified"):
+        reason, copy_key, why = research.autoskip_reason_for_status(st)
+        assert reason == "auto_skip_setup_failed", st
+        assert why == "couldn't start", st
 
 
 def test_status_is_matched_case_insensitively():
