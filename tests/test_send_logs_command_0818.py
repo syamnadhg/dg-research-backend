@@ -409,11 +409,14 @@ def test_a_missing_or_corrupt_stamp_is_not_a_lockout():
 
 # ══ 6. single-flight ══════════════════════════════════════════════════
 def test_a_second_press_while_one_is_building_is_refused(db, monkeypatch):
-    """⭐⭐ THE ONE AN OWNER ACTUALLY REACHES. Press Send Logs, reload the page
-    while the bundle builds, press again. Worker 1 has already deleted the
-    command doc, so a silent refusal here is exactly the pair the app reads as
-    "this machine's software is older than this setting" — about a machine that
-    is current and is building the bundle right now."""
+    """⚠ A RACE, NOT A DOUBLE-PRESS, and I had this wrong at first. `_work`
+    stamps the cooldown as its first act and the cooldown check runs BEFORE this
+    one, so a person pressing again seconds later is refused as CooldownActive —
+    which always wrote a row. This branch is reachable by two tabs inside that
+    millisecond window, and PERMANENTLY on a machine that cannot write the stamp
+    file, because `_stamp_send_logs_attempt` swallows its own failure and leaves
+    single-flight as the only guard. Either way a silent refusal here is the pair
+    the app reads as "this machine's software is older than this setting"."""
     _run_sync(monkeypatch)
     research._send_logs_inflight = True
     try:

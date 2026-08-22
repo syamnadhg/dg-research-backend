@@ -7710,13 +7710,30 @@ def _refuse_log_bundle_with_row(owner_uid: str, code: str, device_id: str,
     was current and had simply refused for a reason it never reported, and the
     person is sent to update a computer that needs no update.
 
-    ⭐ THE REACHABLE CASE IS NOT THE ONE WE FIRST NAMED. A non-owner cannot get
-    here at all — the queue rules keep send-logs out of the sharer allowlist and
-    the app hides the whole control from anyone who does not own the machine —
-    so the owner check below is defence in depth. What an OWNER reaches is the
-    single-flight refusal: press Send Logs, reload the page mid-build, press
-    again. The second press is refused with no row, and the app accuses the
-    machine of being out of date.
+    ⭐ WHICH REFUSALS ARE ACTUALLY REACHABLE, measured rather than assumed —
+    because the first two answers I gave were both wrong.
+
+      • A non-owner cannot get here AT ALL. Three gates: the queue rules keep
+        send-logs out of the sharer allowlist, the app filters the picker to
+        devices it owns, and the whole section hides itself when that list is
+        empty. So the owner check below is defence in depth, not a live path.
+
+      • THE DEVICE-READ FAILURE is the one an owner really reaches — a Firestore
+        read hiccup on the machine, nothing to do with the person. It had no row
+        and no recoverable owner, so it was the quietest failure we had.
+
+      • SINGLE-FLIGHT IS A RACE, not a double-press. I claimed a person could
+        reach it by reloading mid-build and pressing again; they cannot.
+        `_work` stamps the cooldown as its first act, milliseconds after the
+        lock is released, and the cooldown check runs BEFORE this one — so a
+        second press seconds later is refused as CooldownActive, which always
+        wrote a row. It becomes reachable two ways: two tabs pressing inside
+        that millisecond window, and — permanently — on a machine where the
+        stamp file cannot be written, since `_stamp_send_logs_attempt` swallows
+        its own failure and leaves single-flight as the only guard.
+
+    So the row matters most for the read failure; the rest is making sure no
+    refusal can ever be silent again, whatever its odds today.
 
     ⚠ THREE EARLY RETURNS STILL CANNOT HAVE A ROW, and that is stated rather
     than papered over: a malformed support code has no document to write to (the
@@ -7947,10 +7964,11 @@ def _handle_send_logs_command(data: dict, device_id: str, limited: bool = False)
         else:
             _send_logs_inflight = True
     if _already_building:
-        # ⭐ THE ONE AN OWNER ACTUALLY REACHES. Press, reload the page while the
-        # bundle builds, press again: the command doc is already deleted and no
-        # row was ever written, so the app told the person their software was
-        # out of date. It is current, and a bundle is being built right now.
+        # ⚠ A RACE, NOT A DOUBLE-PRESS — see this function's docstring. The
+        # cooldown stamp lands milliseconds into the build and is checked above,
+        # so a human pressing again is refused as CooldownActive. This is
+        # reachable by two tabs inside that window, and permanently on a machine
+        # that cannot write the stamp file at all.
         log("[send-logs] refusing: a bundle is already being built", "WARN")
         _refuse_log_bundle_with_row(owner_uid, code, device_id, request_id,
                                     "AlreadyBuilding")

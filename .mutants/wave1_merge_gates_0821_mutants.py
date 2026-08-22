@@ -7,10 +7,15 @@ control from anyone who does not own the machine. Three gates, not one.
 
 ⭐⭐ AND THE REACHABLE CASE WAS RIGHT NEXT TO IT. Worker 1 deletes the command
 document before dispatch, so ANY silent refusal is the pair the app reads as
-"took the request but its software is older than this setting". The one an OWNER
-reaches: press Send Logs, reload the page mid-build, press again — refused by
-single-flight, no row, and the app accuses a machine that is building the bundle
-at that moment. The device-read failure reaches it too.
+"took the request but its software is older than this setting".
+
+⚠ AND I NAMED THE WRONG ONE TWICE. Not single-flight: `_work` stamps the cooldown
+milliseconds into the build and the cooldown check runs first, so a human
+pressing again is refused as CooldownActive, which always wrote a row. The
+genuinely reachable silent refusal is the DEVICE-READ FAILURE — a Firestore
+hiccup on the machine, with no row and, until now, no recoverable owner tree.
+Single-flight is a two-tab race, plus a permanent path on any machine that cannot
+write the stamp file (that write swallows its own failure).
 
 ⛔ THE OVER-CORRECTIONS ARE THE REAL RISK HERE, because "always write a row" is
 one step from "write a row somewhere it does not belong":
