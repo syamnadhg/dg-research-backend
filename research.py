@@ -7752,9 +7752,23 @@ def _refuse_log_bundle_with_row(owner_uid: str, code: str, device_id: str,
         log(f"[send-logs] refusing ({error_class}) with NO row — no owner tree "
             f"is known, so the app cannot be told why", "WARN")
         return
-    _open_log_bundle_row(owner_uid, code, device_id, request_id)
-    _write_log_bundle_status(owner_uid, code,
-                             {"status": "failed", "errorClass": error_class})
+    # ⛔⛔ PARK IT IF IT CANNOT GO OUT NOW, and this is not belt-and-braces — it
+    # is what makes this fix work AT ALL in the case it was written for.
+    # `DeviceReadFailed` means a Firestore read just raised, and the write below
+    # goes through THE SAME client, channel and credential. So the write that is
+    # supposed to break the silence fails for the same reason the read did, and
+    # both writers are best-effort: they WARN and return False. Dropping it there
+    # would leave exactly the silence this helper exists to remove — a fix whose
+    # own headline case cannot deliver.
+    #
+    # ⭐ The machinery already exists and is the CLI's convention: park the patch
+    # on disk and let `_drain_queued_log_bundle_rows()` replay it. That runs on
+    # every tick of the always-armed reconnect watcher, and it replays the OPEN
+    # before the patch — a create at 'failed' is what the rule refuses.
+    patch = {"status": "failed", "errorClass": error_class}
+    if not (_open_log_bundle_row(owner_uid, code, device_id, request_id)
+            and _write_log_bundle_status(owner_uid, code, patch)):
+        _queue_log_bundle_row(owner_uid, code, patch, device_id=device_id)
 
 
 def _upload_log_bundle_via_storage_rest(local_path: "Path", owner_uid: str,

@@ -253,6 +253,65 @@ def test_a_device_read_failure_refuses_rather_than_proceeds(db, monkeypatch):
     assert row["errorClass"] == "DeviceReadFailed"
 
 
+def test_a_device_read_failure_PARKS_the_row_when_the_write_fails_too(
+        db, monkeypatch, tmp_path):
+    """⛔⛔ THE ONE THE FIRST DRAFT OF THIS FIX COULD NOT DELIVER, and the test
+    above could not see it.
+
+    `DeviceReadFailed` means a Firestore READ just raised. The row that is
+    supposed to break the silence goes out through THE SAME client, channel and
+    credential — so it fails for the same reason, and both writers are
+    best-effort: they WARN and return False. The refusal was then dropped
+    forever and the app was back to guessing "your software is out of date".
+
+    ⛔ AND THE SIBLING TEST ABOVE IS BLIND TO IT BY CONSTRUCTION: its fake raises
+    only for `collection("devices")` and hands back a working collection for
+    `users`. Production has no per-collection dispatch — when Firestore is
+    unreachable, it is unreachable for both. This one fails EVERY collection,
+    which is the shape production actually has, and asserts the write is PARKED
+    for the reconnect watcher to replay."""
+    _run_sync(monkeypatch)
+
+    class _EverythingFails(_FakeDb):
+        def collection(self, name):
+            raise RuntimeError("firestore unreachable")
+
+    monkeypatch.setattr(research, "_firebase_db", _EverythingFails(db))
+    monkeypatch.setattr(research, "load_paired_uid", lambda: "user-rocky")
+    parked = []
+    monkeypatch.setattr(research, "_queue_log_bundle_row",
+                        lambda owner, code, patch, device_id="":
+                        parked.append((owner, code, patch, device_id)))
+    research._handle_send_logs_command(_cmd(), "d-1")
+    assert parked, (
+        "the refusal was dropped: the row write goes through the same client "
+        "whose read just failed, so it has to be parked for the drain")
+    owner, code, patch, device_id = parked[0]
+    assert owner == "user-rocky"
+    assert code == CODE
+    assert patch["status"] == "failed"
+    assert patch["errorClass"] == "DeviceReadFailed"
+    assert device_id == "d-1"
+
+
+def test_a_refusal_that_lands_first_time_is_NOT_parked(db, monkeypatch):
+    """Accept polarity. Parking every refusal would make the reconnect watcher
+    replay writes that already succeeded, and the drain replays create-then-patch
+    — so a row that is already `failed` would be re-created and refused, warning
+    on every tick forever."""
+    _run_sync(monkeypatch)
+    parked = []
+    monkeypatch.setattr(research, "_queue_log_bundle_row",
+                        lambda *a, **k: parked.append(a))
+    research._send_logs_inflight = True
+    try:
+        research._handle_send_logs_command(_cmd(), "d-1")
+    finally:
+        research._send_logs_inflight = False
+    assert db[f"users/user-rocky/logBundles/{CODE}"]["status"] == "failed"
+    assert parked == [], "a write that landed was parked as well"
+
+
 def test_a_device_read_failure_with_no_local_pairing_stays_silent(
         db, monkeypatch, capsys):
     """⚠ Stated rather than papered over: with the device read down AND no uid on

@@ -185,8 +185,8 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      "refusal row is CREATED at 'failed', which the rule denies — so the app "
      "never sees the refusal and falls through to its two-minute quiet timeout, "
      "telling the user the machine did not answer while it is online and refused",
-     [('    _open_log_bundle_row(owner_uid, code, device_id, request_id)\n    _write_log_bundle_status(owner_uid, code,\n                             {"status": "failed", "errorClass": error_class})',
-       '    _write_log_bundle_status(owner_uid, code,\n                             {"status": "failed", "errorClass": error_class,\n                              "deviceId": device_id, "requestId": request_id},\n                             create=True)')],
+     [('    if not (_open_log_bundle_row(owner_uid, code, device_id, request_id)\n            and _write_log_bundle_status(owner_uid, code, patch)):',
+       '    if not _write_log_bundle_status(owner_uid, code,\n                                   {**patch, "deviceId": device_id,\n                                    "requestId": request_id}, create=True):')],
      [T_SEND]),
     # ⛔ R1c's ORIGINAL FORM WAS RETIRED 2026-08-21, not weakened. It mutated the
     # cooldown branch's own copy of the create-then-patch pair; that pair now has
@@ -198,8 +198,8 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     # setting".
     ("R1c", "under", "the refusal row is never OPENED, only patched — so the "
      "update lands on nothing and every refusal is invisible again",
-     [('    _open_log_bundle_row(owner_uid, code, device_id, request_id)\n    _write_log_bundle_status(owner_uid, code,',
-       '    _write_log_bundle_status(owner_uid, code,')],
+     [('    if not (_open_log_bundle_row(owner_uid, code, device_id, request_id)\n            and _write_log_bundle_status(owner_uid, code, patch)):',
+       '    if not (_write_log_bundle_status(owner_uid, code, patch)\n            and True):')],
      [T_SEND]),
     ("R1d", "over", "the open is allowed to carry any status, so the one clause "
      "that makes a row mean \"the machine started\" stops holding",
