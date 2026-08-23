@@ -8,12 +8,20 @@ checkout under ~/Downloads, the agent died at spawn-init with exit code 78
 (EX_CONFIG), EMPTY logs, and a 10s respawn loop — the device never came online
 after --pair even though pairing itself succeeded.
 
-Fix: `_arm_supervisor_macos` writes supervisor logs to ~/Library/Logs/
-SuperResearch (platform-canonical, always launchd-openable) instead of
-script_dir/logs. Installed (pipx) builds benefit too — script_dir/logs sat
-inside site-packages, where an `--update` reinstall wiped them. The function
-also WARNs when the checkout itself is under a TCC-protected folder (the
+Fix: `_arm_supervisor_macos` writes supervisor logs somewhere launchd can
+always open, and not inside the install — `script_dir/logs` sat in
+site-packages, where an `--update` reinstall wiped them. The function also
+WARNs when the checkout itself is under a TCC-protected folder (the
 python-attributed reads there still need a one-time per-binary grant).
+
+⚠ THE ASSERTION BELOW USED TO NAME ~/Library/Logs/SuperResearch, and that was a
+literal standing in for a contract. It has moved to `_supervisor_log_dir()`
+(2026-08-22, wave 5) because the old location met both constraints above and a
+third nobody had checked: `--send-logs` collects `supervisor*.log` from the log
+root, so a support bundle from a machine that never came online carried ZERO
+bytes of the one file that says why. The properties are what this file pins now
+— TCC-safe, outside the install, and collectable — which is strictly more than
+the path was.
 
 Run:  pytest tests/test_macos_launchd_tcc_logs.py -v
 """
@@ -29,10 +37,31 @@ import research
 MAC_SRC = inspect.getsource(research._arm_supervisor_macos)
 
 
-def test_macos_log_dir_is_library_logs_not_script_dir():
-    assert 'Path.home() / "Library" / "Logs" / "SuperResearch"' in MAC_SRC
+def test_macos_log_dir_is_one_launchd_can_open():
+    """⛔⛔ THE CONSTRAINT, not a path. launchd's own open cannot enter a
+    protected folder whatever the user grants."""
+    assert "log_dir = _supervisor_log_dir()" in MAC_SRC
     # The old TCC-broken location must be gone.
     assert 'log_dir = script_dir / "logs"' not in MAC_SRC
+    parts = research._supervisor_log_dir().parts
+    for protected in ("Downloads", "Desktop", "Documents"):
+        assert protected not in parts, f"{protected} is TCC-gated for launchd"
+
+
+def test_macos_log_dir_is_outside_the_install():
+    """`<install>/logs` is site-packages for a pipx build, and an `--update`
+    reinstall deletes it — the evidence for the failure the update was meant
+    to fix."""
+    install = os.path.realpath(os.path.dirname(research.__file__))
+    got = os.path.realpath(str(research._supervisor_log_dir()))
+    assert not got.startswith(install + os.sep) and got != install
+
+
+def test_macos_log_dir_is_one_the_support_bundle_collects():
+    """⭐ THE PROPERTY THE OLD PATH DID NOT HAVE, and the reason it moved. A log
+    launchd can open, that survives an update, and that no support call has ever
+    seen is two thirds of a fix."""
+    assert research._supervisor_log_dir() == research._logs_root()
 
 
 def test_macos_plist_template_still_wires_log_dir():
