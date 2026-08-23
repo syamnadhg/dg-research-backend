@@ -2982,6 +2982,22 @@ def _rotate_if_oversize(path, max_bytes=RAW_LOG_ROTATE_BYTES, audit=None) -> int
 # unparseable orphan lines this repo has been printing all along.
 _BRIDGED_LOGGERS = ("auth", "vision", "selfheal", "narrate", "telemetry")
 
+# ⛔⛔ AND ONE LOGGER THAT IS NOT OURS. When a Firestore listener's consumer
+# thread ends, `google.api_core.bidi` is the ONLY thing anywhere that says so —
+#     Thread-ConsumeBidirectionalStream caught unexpected exception … will exit.
+# Four of those sit in this machine's `backend.err.log` and not one is in
+# `backend.log`, so the single notice that Start and Stop have stopped arriving
+# lands in the half of the logs a person is never asked to send. Bridging it is
+# the whole difference between a support bundle that can explain a silent
+# machine and one that cannot.
+#
+# ⚠ AT ITS OWN LEVEL, and that is not the second policy the block above warns
+# against. Ours are bridged at DEBUG because every line they write is wanted;
+# this one logs "waiting for recv." once per message received. WARNING keeps
+# exactly the set that reaches stderr today — no more, no less — and only
+# changes which file it lands in.
+_BRIDGED_VENDOR_LOGGERS = {"google.api_core.bidi": logging.WARNING}
+
 
 class _StdlibLogBridge(logging.Handler):
     """Forward a stdlib `logging` record into `log()`, one line at a time."""
@@ -3009,7 +3025,8 @@ class _StdlibLogBridge(logging.Handler):
             self.handleError(record)
 
 
-def _install_stdlib_log_bridge(names=_BRIDGED_LOGGERS) -> "list[str]":
+def _install_stdlib_log_bridge(names=_BRIDGED_LOGGERS,
+                               vendor=None) -> "list[str]":
     """Give every one of our stdlib loggers somewhere to go. Returns the names
     it attached to, so a test can assert coverage rather than trust the list.
 
@@ -3020,14 +3037,20 @@ def _install_stdlib_log_bridge(names=_BRIDGED_LOGGERS) -> "list[str]":
     written through it already prints. Holding these to INFO would be a SECOND
     logging policy in the same process, and the whole reason this exists is
     that a second policy is what swallowed 22,758 lines.
+
+    `vendor` maps a third-party logger to the level to bridge it AT, because
+    that reasoning does not carry across the repo boundary: their DEBUG is their
+    own transport chatter, not an account of this product.
     """
     installed = []
-    for name in names:
+    if vendor is None:
+        vendor = _BRIDGED_VENDOR_LOGGERS
+    for name, level in [*((n, logging.DEBUG) for n in names), *vendor.items()]:
         lg = logging.getLogger(name)
         if any(isinstance(h, _StdlibLogBridge) for h in lg.handlers):
             continue
         lg.addHandler(_StdlibLogBridge())
-        lg.setLevel(logging.DEBUG)
+        lg.setLevel(level)
         # Nothing upstream handles these, and lastResort is exactly what we are
         # replacing. Explicit so a future root config cannot double-print them.
         lg.propagate = False
@@ -4440,6 +4463,90 @@ _fb_uid = None          # Per-run: user ID for Firestore path
 _fb_research_id = None  # Per-run: research ID for Firestore path
 _fb_seq = 0             # Per-run: last-emitted seq (monotonic guard; ms-based)
 _fb_listener = None     # Per-run: command listener unsubscribe handle
+
+
+# ── Firestore listener liveness ──────────────────────────────────────────────
+#
+# ⛔⛔ ONE THROW OUT OF A SNAPSHOT CALLBACK ENDS THAT LISTENER FOR GOOD, and this
+# process is never told. MEASURED against the real library (google-api-core
+# 2.x, `BackgroundConsumer._thread_main`): the callback is invoked from the
+# consumer thread, an escaping exception is caught THERE, logged once, and the
+# thread returns — so the watch stops delivering, its `_on_fatal_exception` is
+# unset, the bidi RPC is never closed, and `_on_rpc_done` never fires. Nothing
+# downstream of us observes any of it. The three watches this affects are the
+# ones that carry a person's Start, their Stop, and every device command.
+#
+# It is not hypothetical: `backend.err.log` on this machine carries
+#     Thread-ConsumeBidirectionalStream caught unexpected exception
+#     'NoneType' object is not callable and will exit.
+# with `watch.py:572 push → self._snapshot_callback(...)` as the last frame,
+# plus three more consumer deaths raised inside the library itself.
+#
+# So there are two halves and they fix different failures:
+#   `_guard_snapshot` stops OUR bug from ending a listener. It cannot help with
+#       the three deaths raised before our callback is reached.
+#   `_watch_is_dead` + the re-arm in `_firebase_reconnect_loop` recover a watch
+#       that stopped for ANY reason, which is the only cover the library-side
+#       deaths have. Recovery used to require `_firebase_db` to have gone None
+#       as well; a watch that dies while the client stays healthy had no path
+#       back short of the process restarting for some unrelated reason.
+
+
+def _guard_snapshot(callback, label: str):
+    """Wrap a Firestore snapshot callback so a raise cannot end the listener.
+
+    ⭐ THE BOUNDARY, NOT THE BODY. The wrap is at the registration site rather
+    than around each change, because the thing being protected is the handover
+    to the library's thread — one seam, three callers, and no re-indentation of
+    an 800-line handler.
+
+    ⚠ Be honest about the cost: the rest of THAT snapshot is lost. Its docs are
+    not marked processed, so a later re-attach replays them; that is a worse
+    outcome than handling them and a far better one than the listener never
+    delivering anything again. The line says which listener and prints the
+    traceback through `log()`, because the library's own account of it goes to a
+    logger this file had never bridged.
+    """
+    def _guarded(*args):
+        try:
+            callback(*args)
+        except Exception:
+            import traceback as _tb
+            log(f"[watch:{label}] handler raised — this update was dropped, but the "
+                f"listener is still attached. Runs and commands that arrived with it "
+                f"are replayed on the next re-attach:", "ERROR")
+            for _line in "".join(_tb.format_exc()).rstrip().splitlines():
+                log(f"[watch:{label}] {_line}", "ERROR")
+    return _guarded
+
+
+def _watch_is_dead(handle) -> bool:
+    """True when `handle` is a Firestore watch that has stopped delivering.
+
+    `Watch.is_active` is the library's own public answer (`self._consumer is not
+    None and self._consumer.is_active`, which bottoms out at "is the consumer
+    thread alive"), so a dead thread and a closed watch both read False.
+
+    ⛔ False for `None` on purpose. A watch that was never attached, or one this
+    process deliberately unsubscribed and nulled, is not a fault to recover from
+    — only a handle we still hold that has quietly stopped is. Anything without
+    an `is_active` at all is likewise left alone: a test double or a future
+    library shape must not be able to trigger an endless re-arm.
+    """
+    if handle is None:
+        return False
+    try:
+        active = getattr(handle, "is_active", None)
+        if active is None:
+            return False
+        return not bool(active)
+    except Exception:
+        # ⛔ The read itself has to be inside the try, not just the truth test.
+        # `is_active` is a PROPERTY on the real Watch, and `getattr`'s default
+        # only covers AttributeError — anything else it raises comes straight
+        # back out and would end the loop that called us to keep things alive.
+        return False
+
 
 # Shared queue state: mutated by the job worker in run_server, read by the
 # Firestore start listener (module-level function) so queued research docs
@@ -6859,6 +6966,14 @@ async def _firebase_reconnect_loop():
                 # gated `WORKER_ID == 1`, so a worker-2 spool anchored there
                 # would never go out at all.
                 tm.flush_in_background()
+                # ⛔⛔ THE CLIENT BEING UP IS NOT THE SAME AS THE LISTENERS BEING
+                # UP, and this loop used to treat them as one thing: everything
+                # below only ever ran when `_firebase_db` had gone None. A watch
+                # whose consumer thread ended while the client stayed healthy —
+                # the exact shape in `backend.err.log` — left this branch taken
+                # on every pass, the heartbeat writing, the device reading
+                # ONLINE in the web app, and Start and Stop going nowhere.
+                await _rearm_dead_watches_if_any()
                 if pending_respawn and not _QUEUE_STATE.get("running"):
                     # ⛔ IDLE IS NOT THE SAME AS FINISHED. `running` flips false
                     # in the worker's `finally`, which is BEFORE the two POSTs
@@ -9151,7 +9266,7 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
             # can be slotted in as elif branches.
 
     try:
-        _device_cmd_watch = col_ref.on_snapshot(_on_snap)
+        _device_cmd_watch = col_ref.on_snapshot(_guard_snapshot(_on_snap, "device-cmds"))
         log(f"Device command listener started for device {device_id[:24]}…")
     except Exception as e:
         log(f"Could not start device command listener: {e}", "WARN")
@@ -11942,7 +12057,7 @@ def start_firestore_start_listener(job_queue, loop):
                     _enqueue_with_position_refresh(t, e, c, r, u, ri, bt, us, ul)
             )
 
-    _start_listener = col_ref.on_snapshot(on_snapshot)
+    _start_listener = col_ref.on_snapshot(_guard_snapshot(on_snapshot, "start"))
     log(f"Firestore start listener active on {listener_label}")
 
 
@@ -12490,6 +12605,101 @@ def _rebind_firestore_watches(job_queue, loop, uid, device_id):
     start_firestore_start_listener(job_queue, loop)
     if uid and device_id:
         _start_device_command_listener(uid, device_id, loop=loop)
+
+
+# A watch that comes back dead would otherwise be re-armed on every pass of a
+# 5-second loop. The gap is a floor on how often we may try, not a delay before
+# the first attempt — the first one is immediate.
+_WATCH_REARM_MIN_GAP_SEC = 60
+_watch_rearm_last_at = 0.0
+
+
+def _dead_watch_names() -> "list[str]":
+    """Which long-lived Firestore watches have stopped delivering.
+
+    ⛔ Reads the module globals rather than taking handles, because the whole
+    question is about the handles this process still believes are attached."""
+    return [name for name, handle in (("start", _start_listener),
+                                      ("device-cmds", _device_cmd_watch),
+                                      ("commands", _fb_listener))
+            if _watch_is_dead(handle)]
+
+
+def _rearm_dead_watches(names, loop) -> "list[str]":
+    """Re-attach the named watches. BLOCKING — call it OFF the event loop.
+
+    Returns the names it re-attached, which is not always what it was asked for:
+    `start` and `device-cmds` are rebound together through the one tested path,
+    and either of them needs the rebinder a serve boot registers.
+
+    ⭐ Re-attaching is also how the missed work comes back. Firestore replays
+    every unprocessed doc as ADDED on a fresh attach, so the runs and commands
+    that arrived while the watch was dead are delivered by the re-arm itself —
+    the stale gates upstream decide which of them are still worth acting on.
+
+    ⚠ Non-destructive by construction: this swaps Firestore watches and touches
+    no outbound request, which is why it is safe mid-run where the respawn that
+    used to be the only recovery is not.
+    """
+    global _fb_listener
+    done: list[str] = []
+    if "start" in names or "device-cmds" in names:
+        if _watch_rebinder is None:
+            log("[watch] a long-lived listener has stopped and no rebinder is "
+                "registered — restart the backend to pick up new runs", "WARN")
+        else:
+            try:
+                _watch_rebinder()
+                done.extend(n for n in ("start", "device-cmds") if n in names)
+            except Exception as _e:
+                log(f"[watch] re-arming the start/device listeners failed: {_e}", "WARN")
+    if "commands" in names:
+        # The per-run listener is not part of the rebinder's pair — it is created
+        # per research and torn down with it, so it re-arms from the run context
+        # that is still live in the module globals.
+        _uid, _rid = _fb_uid, _fb_research_id
+        if not (_uid and _rid and _controls):
+            log("[watch] the command listener has stopped but this run is already "
+                "torn down — nothing to re-attach", "DEBUG")
+        else:
+            _old, _fb_listener = _fb_listener, None
+            try:
+                if _old is not None:
+                    _old.unsubscribe()
+            except Exception as _e:
+                log(f"[watch] command-listener unsubscribe raised (continuing): {_e}", "DEBUG")
+            try:
+                _start_command_listener(_uid, _rid, loop)
+                done.append("commands")
+            except Exception as _e:
+                log(f"[watch] re-arming the command listener failed: {_e}", "WARN")
+    return done
+
+
+async def _rearm_dead_watches_if_any() -> "list[str]":
+    """The reconnect loop's per-pass check. Returns the names re-attached."""
+    global _watch_rearm_last_at
+    dead = _dead_watch_names()
+    if not dead:
+        return []
+    now = time.time()
+    if now - _watch_rearm_last_at < _WATCH_REARM_MIN_GAP_SEC:
+        return []
+    _watch_rearm_last_at = now
+    # ⭐ Say it plainly and say it BEFORE the repair. This is the one line that
+    # explains a machine that answered every health check and still never
+    # started the run someone asked for.
+    log(f"[watch] {', '.join(dead)} stopped delivering while this computer stayed "
+        f"online — re-attaching so Start and Stop work again", "WARN")
+    try:
+        back = await asyncio.to_thread(_rearm_dead_watches, dead,
+                                       asyncio.get_running_loop())
+    except Exception as _e:
+        log(f"[watch] re-arm failed ({_e}) — retrying on the next pass", "WARN")
+        return []
+    if back:
+        log(f"[watch] {', '.join(back)} re-attached", "INFO")
+    return back
 
 
 async def _recover_after_reconnect(reason: str) -> None:
@@ -14008,7 +14218,7 @@ def _start_command_listener(uid, research_id, loop):
             except Exception:
                 pass
 
-    _fb_listener = col_ref.on_snapshot(on_snapshot)
+    _fb_listener = col_ref.on_snapshot(_guard_snapshot(on_snapshot, "commands"))
 
 
 def _start_cli_command_reader(loop):

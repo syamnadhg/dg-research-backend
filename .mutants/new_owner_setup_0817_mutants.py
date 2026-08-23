@@ -413,9 +413,15 @@ MUTANTS += [
      [("_BRIDGED_LOGGERS = (\"auth\", \"vision\", \"selfheal\", \"narrate\", \"telemetry\")",
        "_BRIDGED_LOGGERS = (\"auth\",)")],
      [T_BRIDGE]),
+    # ⛔ B3 RE-ANCHORED 2026-08-22. The installer gained a second, third-party
+    # logger with a level of its own (`google.api_core.bidi` at WARNING — the
+    # only thing that says a Firestore listener has died), so the level is no
+    # longer one `setLevel` line. The PREMISE is unchanged: hold OUR loggers
+    # above DEBUG and the pairing poll's only account of a network failure
+    # disappears again.
     ("B3", "under", "⛔ the level goes to INFO, so the pairing poll's only "
      "account of a network failure disappears again",
-     [("        lg.setLevel(logging.DEBUG)", "        lg.setLevel(logging.INFO)")],
+     [("((n, logging.DEBUG) for n in names)", "((n, logging.INFO) for n in names)")],
      [T_BRIDGE]),
     ("B4", "under", "not idempotent — a second call doubles every line",
      [("        if any(isinstance(h, _StdlibLogBridge) for h in lg.handlers):\n            continue",

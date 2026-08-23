@@ -41,11 +41,17 @@ import research
 ROOT = Path(research.__file__).resolve().parent
 
 
+ALL_BRIDGED = (*research._BRIDGED_LOGGERS, *research._BRIDGED_VENDOR_LOGGERS)
+
+
 @pytest.fixture(autouse=True)
 def _fresh_bridge():
-    """Detach, run, re-attach — so ordering between tests cannot decide a result."""
+    """Detach, run, re-attach — so ordering between tests cannot decide a result.
+
+    ⛔ The vendor logger is detached too. It was left out at first and the
+    install test then depended on which test had run before it."""
     saved = {}
-    for name in research._BRIDGED_LOGGERS:
+    for name in ALL_BRIDGED:
         lg = logging.getLogger(name)
         saved[name] = (list(lg.handlers), lg.level, lg.propagate)
         lg.handlers = [h for h in lg.handlers
@@ -116,8 +122,8 @@ def test_the_modules_still_have_no_logging_config_of_their_own():
 
 def test_install_attaches_to_every_named_logger():
     installed = research._install_stdlib_log_bridge()
-    assert set(installed) == set(research._BRIDGED_LOGGERS)
-    for name in research._BRIDGED_LOGGERS:
+    assert set(installed) == set(ALL_BRIDGED)
+    for name in ALL_BRIDGED:
         lg = logging.getLogger(name)
         assert any(isinstance(h, research._StdlibLogBridge) for h in lg.handlers)
 
