@@ -2231,6 +2231,43 @@ def _runs_log_root() -> "Path":
     return _logs_root() / "runs"
 
 
+def _supervisor_log_dir() -> "Path":
+    """Where the OS supervisor's OWN stdout and stderr go.
+
+    ⛔⛔ IT WAS NOT THIS, AND THAT MADE A BACKGROUND FAILURE UNREACHABLE. macOS
+    wrote to `~/Library/Logs/SuperResearch/` and Linux to `<install>/logs/`, and
+    `--send-logs` collects `supervisor*.log` from `_logs_root()` — so a support
+    bundle from a machine that never came online carried ZERO bytes of the one
+    file that says why. On Linux it was worse than absent: `<install>/logs` is
+    inside site-packages for a pipx install, so every `--update` deleted it.
+
+    ⭐ THE TWO CONSTRAINTS THIS PATH HAS TO MEET, both learned the hard way:
+
+      * launchd opens StandardOutPath/StandardErrorPath ITSELF, before exec, and
+        that open is attributed to launchd rather than to the target binary — so
+        no TCC grant the user can give will let it into a protected folder
+        (~/Downloads, ~/Desktop, ~/Documents, iCloud). A source checkout in
+        ~/Downloads made the agent die at spawn-init: exit 78 EX_CONFIG, EMPTY
+        logs, respawn every 10s, device never online after --pair (2026-07-19).
+      * It must not sit inside the install, or an update erases the evidence.
+
+    `~/.super-research/logs` meets both — a dot-directory in $HOME is not TCC
+    protected, and nothing about an install touches it — and it is where every
+    other log this product writes already lives. Derived from `_logs_root()` so
+    the collector and the writer cannot drift apart again.
+    """
+    return _logs_root()
+
+
+# Where older builds put them. READ-ONLY, and only so `--doctor` can still
+# diagnose a machine that has not re-run `--resurrect` since. Nothing collects
+# from here: widening the bundle's allowlist is what the consent screen's
+# promise about passwords, cookies and profile data is gated on.
+def _legacy_supervisor_log_dirs() -> "list[Path]":
+    return [Path.home() / "Library" / "Logs" / "SuperResearch",
+            Path(__file__).parent / "logs"]
+
+
 def _sessions_log_root() -> "Path":
     return _logs_root() / "sessions"
 
@@ -67854,16 +67891,13 @@ def _arm_supervisor_macos() -> "tuple[bool, int | None, str, int]":
     _seed_env_file_if_missing()
 
     script_dir = Path(__file__).parent
-    # Supervisor logs live in ~/Library/Logs (platform-canonical), NOT
-    # script_dir/logs. launchd opens StandardOutPath/StandardErrorPath ITSELF
-    # before exec — that open is attributed to launchd, not the target binary,
-    # so no user TCC grant can allow it into a protected folder (~/Downloads,
-    # ~/Desktop, ~/Documents, iCloud). A source checkout in ~/Downloads made
-    # the agent die at spawn-init (exit 78 EX_CONFIG, EMPTY logs, respawn
-    # every 10s — device never online after --pair; live incident 2026-07-19).
-    # Installed (pipx) builds benefit too: script_dir/logs sat inside
-    # site-packages, where an `--update` reinstall wiped them.
-    log_dir = Path.home() / "Library" / "Logs" / "SuperResearch"
+    # ⛔⛔ THIS USED TO BE ~/Library/Logs/SuperResearch — platform-canonical,
+    # safe from TCC, safe from an update, and NOT COLLECTED BY ANYTHING. The
+    # bundle takes `supervisor*.log` from `_logs_root()`, so the one file that
+    # explains a machine which never came online reached no support call ever.
+    # `_supervisor_log_dir()` keeps both original constraints and puts it where
+    # the collector already looks; the reasoning is written out there.
+    log_dir = _supervisor_log_dir()
     # Python-attributed ops (reading research.py, the WorkingDirectory) in a
     # TCC-protected folder still need a one-time per-binary grant — surface it
     # loudly instead of letting the agent die silently at first spawn.
@@ -68139,9 +68173,13 @@ def _arm_supervisor_linux() -> "tuple[bool, int | None, str, int]":
             "logout.", "WARN")
 
     script_dir = Path(__file__).parent
-    log_dir = script_dir / "logs"
+    # ⛔⛔ THIS USED TO BE `script_dir / "logs"`, which for a pipx install is
+    # INSIDE site-packages: every `--update` reinstall deleted the supervisor's
+    # own output, and the bundle never collected it in the first place. macOS
+    # had already moved off that path for the same reason; Linux had not.
+    log_dir = _supervisor_log_dir()
     try:
-        log_dir.mkdir(exist_ok=True)
+        log_dir.mkdir(parents=True, exist_ok=True)
         _SUPERVISOR_UNIT_PATH.parent.mkdir(parents=True, exist_ok=True)
     except Exception as e:
         return False, None, f"could not create dirs: {e}", 0
@@ -71875,8 +71913,27 @@ def run_doctor():
     if daemon_pids:
         _ok("daemon-loop running", f"PID {daemon_pids[0]}")
     else:
-        _warn("daemon-loop not running",
-              "supervisor inactive — see Supervisor section above")
+        # ⛔⛔ "SEE THE SUPERVISOR SECTION ABOVE" WAS A DEAD END. On a machine
+        # whose backend dies at spawn and is respawned every ten seconds, that
+        # section reports the plist present and launchctl bootstrapped — both
+        # true — so the reader was sent to a section that says nothing is wrong.
+        # The evidence exists and nothing had ever read it: whatever launchd or
+        # systemd captured on the way down, which for a spawn-time death is the
+        # only record, because our own logging never got to start.
+        _ev = _supervisor_evidence()
+        if _ev["lines"]:
+            _fail("daemon-loop not running",
+                  "the supervisor started it and it exited — its own last words:")
+            for _evl in _ev["lines"]:
+                print(f"       {_c(_DIM, _evl[:160])}")
+            if _ev["legacy"]:
+                _legacy_note = ("     That log is in an older build's location, so "
+                                "--send-logs cannot include it.")
+                print(f"  {_c(_DIM, _legacy_note)}")
+                manual_actions.append(_remedy_resurrect())
+        else:
+            _warn("daemon-loop not running",
+                  f"nothing in {_supervisor_log_dir() / 'supervisor.err.log'} either")
     if serve_pids:
         _ok("--serve running", f"PID {serve_pids[0]}")
     else:
@@ -73506,6 +73563,58 @@ def _search_path_report(env_path=None, would_bake=None,
     if env_path != would_bake:
         lines.append(f"[path] a supervisor installed by this build would use: {would_bake}")
     return lines
+
+
+def _supervisor_evidence(*, log_dir=None, legacy_dirs=None, max_lines=6,
+                         max_bytes=8000) -> dict:
+    """The last thing the OS supervisor's own stderr said, if it said anything.
+
+    Returns `{"path": str, "legacy": bool, "lines": [str]}` — `path` empty when
+    there is nothing to show.
+
+    ⛔⛔ WHY THIS IS THE ONLY EVIDENCE THERE IS. "Enable On Startup?" defaults to
+    yes, so the common install has no terminal at all: everything this product
+    writes about a failure goes to a file nobody has been told to open. And when
+    the failure is the supervised process dying at spawn — a missing dependency,
+    a TCC refusal, an unparseable plist — it dies BEFORE our own logging exists,
+    so `backend.log` has nothing either. What launchd or systemd captured on the
+    way down is the whole record.
+
+    ⭐ The legacy directories are read but never collected. A machine that has
+    not re-run `--resurrect` since this moved still writes to the old place, and
+    a diagnostic that could not see it would be useless on exactly the installs
+    that predate the fix. Reading is not collecting: the bundle's allowlist is
+    unchanged, because that allowlist is what the consent screen's promise about
+    passwords, cookies and profile data is gated on.
+    """
+    out = {"path": "", "legacy": False, "lines": []}
+    dirs = [(Path(log_dir) if log_dir is not None else _supervisor_log_dir(), False)]
+    for d in (legacy_dirs if legacy_dirs is not None else _legacy_supervisor_log_dirs()):
+        dirs.append((Path(d), True))
+    for d, is_legacy in dirs:
+        try:
+            p = d / "supervisor.err.log"
+            if not p.is_file():
+                continue
+            with open(p, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                fh.seek(max(0, size - int(max_bytes)))
+                blob = fh.read()
+        except OSError:
+            continue
+        text = blob.decode("utf-8", errors="replace")
+        # ⛔ Drop the first line when the read started mid-file: a truncated
+        # first record reads as a different error than the one that happened.
+        rows = text.splitlines()[1 if size > int(max_bytes) else 0:]
+        rows = [r.rstrip() for r in rows if r.strip()]
+        if not rows:
+            continue
+        out["path"] = str(p)
+        out["legacy"] = is_legacy
+        out["lines"] = rows[-int(max_lines):]
+        return out
+    return out
 
 
 def _search_path_findings(*, shell_path, supervisor_path, would_bake,

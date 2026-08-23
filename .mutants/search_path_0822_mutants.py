@@ -134,8 +134,8 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_PATH]),
     ("R6", "under", "the report becomes one multi-line string, so every line "
      "after the first loses its timestamp and its level",
-     [('    return lines\n\n\ndef _search_path_findings',
-       '    return ["\\n".join(lines)]\n\n\ndef _search_path_findings')],
+     [('    return lines\n\n\ndef _supervisor_evidence',
+       '    return ["\\n".join(lines)]\n\n\ndef _supervisor_evidence')],
      [T_PATH]),
     ("R7", "under", "it reports on a fixed path instead of the one this process "
      "is really using",
