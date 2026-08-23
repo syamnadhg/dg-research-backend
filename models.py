@@ -177,6 +177,38 @@ P2_MODEL_POLICY = {
         # `reject_matches()` is the single implementation; the JS ranker uses a
         # character-level port of it rather than a second set of regexes.
         "reject": ["lite*", "deep think", "pro"],
+        # ⭐⭐ THE SALES NOUNS ARE PLAN NAMES HERE, NOT THE FAMILY WORD — and
+        # that is the whole reason this key exists instead of the Claude
+        # ranker's rule being copied across. `is_upsell` looks for a sales VERB
+        # followed by a NOUN within a short window, and the two vendors put a
+        # different noun next to the verb:
+        #
+        #   Claude   "Upgrade to Opus"                  → verb, then the FAMILY
+        #   Gemini   "Upgrade to Google AI Ultra …"     → verb, then the PLAN
+        #
+        # So keying Gemini on `family` would ask for "upgrade" followed by
+        # "flash" inside 24 characters, which the vendor's own copy does not
+        # produce — the guard would match nothing and read as shipped.
+        #
+        # ⛔ BARE "advanced" IS DELIBERATELY ABSENT, though research.py's
+        # pre-flight blocker regex carries it. That regex tests a whole
+        # CLICKABLE looking for a billing surface; this one tests a MODEL ROW
+        # whose text is title+description concatenated, where "try advanced
+        # reasoning" is ordinary blurb. Gemini has no `free_family`, so a guard
+        # that empties the menu does not fall back to a smaller model — it
+        # leaves the run on whatever the dropdown defaulted to, which is the
+        # Gemini-Pro Deep Research hang the family choice exists to avoid.
+        "upsell_nouns": ["google ai", "gemini advanced", "google one",
+                         "advanced plan", "pro plan"],
+        # ⚠ SHADOW FIRST, ON PURPOSE. The nouns above are read from our own
+        # prior art (research.py's blocker regex), not from a captured Gemini
+        # menu — nobody has measured a sales row in THIS dropdown. Shipping the
+        # skip on an unmeasured pattern risks exactly the failure the note above
+        # describes, and its symptom is a multi-hour hang rather than an error.
+        # While this is True the ranker COMPUTES the verdict and the caller LOGS
+        # it, without changing which row is clicked; flipping it to False is the
+        # whole of enforcement, and the tests for both halves already exist.
+        "upsell_shadow": True,
         "thinking": "extended", "tool": "deep research",
     },
     "chatgpt": {
@@ -628,6 +660,33 @@ def reject_terms(platform: str) -> list:
     what the trailing `*` means."""
     v = p2_labels(platform).get("reject")
     return [str(r).lower() for r in v] if isinstance(v, (list, tuple)) else []
+
+
+def upsell_nouns(platform: str) -> list:
+    """The PLAN nouns whose appearance just after a sales verb marks a row as an
+    advert on this platform, lowercased.
+
+    Empty for a platform that has no entry — and an empty list means "no advert
+    rule", never "use the family word". A silent fall back to the family would
+    reinstate the exact mismatch `P2_MODEL_POLICY["gemini"]["upsell_nouns"]`
+    documents: a guard that reads as shipped and matches nothing."""
+    v = p2_labels(platform).get("upsell_nouns")
+    if not isinstance(v, (list, tuple)):
+        return []
+    return [str(n).lower().strip() for n in v if str(n).strip()]
+
+
+def upsell_shadow(platform: str) -> bool:
+    """True while the advert rule is measured but NOT enforced on this platform.
+
+    Defaults to True for a platform that carries `upsell_nouns` without saying,
+    because the failure direction is asymmetric: shadow costs a log line, and
+    enforcing an unmeasured pattern on a platform with no `free_family` costs a
+    multi-hour hang. A platform with no nouns has nothing to shadow."""
+    v = p2_labels(platform).get("upsell_shadow")
+    if isinstance(v, bool):
+        return v
+    return bool(upsell_nouns(platform))
 
 
 def _ascii_alnum(ch) -> bool:
@@ -1120,17 +1179,46 @@ def is_upsell(text: str, noun: str, window: int = UPSELL_WINDOW) -> bool:
     return False
 
 
-def pick_highest_model(labels, family: str, below=None, reject=(), drop_upsell=False):
+def is_upsell_any(text: str, nouns, window: int = UPSELL_WINDOW) -> bool:
+    """`is_upsell` against SEVERAL nouns — true when any one of them matches.
+
+    ⭐ Exists because the noun that follows the sales verb is vendor-specific:
+    Claude names the model family, Google names the subscription plan, and a
+    plan has several names in circulation at once ("Google AI Pro", "Gemini
+    Advanced", "Google One"). One noun cannot cover that, and a second matcher
+    would be a second opinion about what a sales prompt looks like.
+
+    ⛔ AN EMPTY `nouns` IS FALSE, never a fall back to some default noun. The
+    caller that passes nothing has no advert rule configured, and inventing one
+    here is how a platform silently acquires a guard nobody measured.
+
+    Deliberately a loop over `is_upsell` rather than a merged scan: the window,
+    the boundary test and the whitespace collapse then have exactly one
+    definition, which is the property the JS ports are checked against."""
+    if not text or not nouns:
+        return False
+    for n in nouns:
+        if is_upsell(text, str(n), window):
+            return True
+    return False
+
+
+def pick_highest_model(labels, family: str, below=None, reject=(), drop_upsell=False,
+                       sale_nouns=None):
     """From candidate dropdown-row labels, pick the row with the HIGHEST
     <family> version, REJECTING (checked first) any label that hits a reject
     term per `reject_matches` — the same rule the JS ranker runs, so this is a
     real mirror rather than a second opinion. Tie-break: shortest label (prefer
     a leaf row over a wrapper that concatenates several models).
 
-    `drop_upsell=True` additionally discards sales prompts for the family per
-    `is_upsell` — see there for why a billing chip is otherwise indistinguishable
-    from a model row, and why the exclusion runs regardless of whether the chip
-    carries a version.
+    `drop_upsell=True` additionally discards sales prompts per `is_upsell` — see
+    there for why a billing chip is otherwise indistinguishable from a model
+    row, and why the exclusion runs regardless of whether the chip carries a
+    version. The noun it keys on is `family` by default (the Claude ranker's
+    rule); pass `sale_nouns` to key on PLAN names instead (the Gemini ranker's
+    rule — see `P2_MODEL_POLICY["gemini"]["upsell_nouns"]` for why the two
+    vendors need different nouns). `sale_nouns` is named apart from the
+    `upsell_nouns` accessor on purpose so neither can shadow the other here.
 
     ⚠ IT IS OPT-IN BECAUSE THE TWO RANKERS IT MIRRORS DO NOT AGREE — and NOTHING
     CALLS THIS FROM THE BROWSER. A ranker is a JS string run through
@@ -1175,7 +1263,8 @@ def pick_highest_model(labels, family: str, below=None, reject=(), drop_upsell=F
         # ("Upgrade to Opus 5.2") parses, so a check placed after — or one
         # reached only on the version-less branch — would let the worst case
         # through: a chip that competes on rank with the real rows.
-        if drop_upsell and is_upsell(t, family):
+        if drop_upsell and (is_upsell_any(t, sale_nouns) if sale_nouns
+                            else is_upsell(t, family)):
             continue
         v = parse_family_version(t, family)
         if v is None and not has_family(t, family):

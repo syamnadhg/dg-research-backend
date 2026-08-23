@@ -666,4 +666,11 @@ def run_js(spec, fn_src: str, arg=None) -> dict:
                            encoding="utf-8", timeout=60)
         if p.returncode != 0:
             raise AssertionError(f"node failed: {p.stderr}")
-        return json.loads(p.stdout.strip().splitlines()[-1])
+        # ⛔ `.split("\n")`, NOT `.splitlines()`. Python splits on \x1c-\x1f,
+        # \x85,   and   as well as \n; node's `console.log` emits only
+        # \n. A returned string carrying any of the others — and page text
+        # legitimately does; the upsell window is measured over exactly that
+        # character set — was cut in half here, so the caller got a
+        # JSONDecodeError pointing at the middle of its own fixture. Measured
+        # 2026-08-22 on a menu row padded with \x85.
+        return json.loads(p.stdout.strip().split("\n")[-1])

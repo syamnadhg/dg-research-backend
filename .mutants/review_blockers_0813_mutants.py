@@ -138,7 +138,8 @@ MUTANTS = [
        '                          "verbs": [], "upsellWindow": UPSELL_WINDOW}')]),
     ("M10", "models.py", "under",
      "the python mirror stops excluding chips",
-     [("        if drop_upsell and is_upsell(t, family):\n            continue\n", "")]),
+     [("        if drop_upsell and (is_upsell_any(t, sale_nouns) if sale_nouns\n"
+       "                            else is_upsell(t, family)):\n            continue\n", "")]),
     ("M11", "models.py", "under",
      "the mirror's boundary check is dropped",
      [("            left_ok = i == 0 or not _ascii_alnum(t[i - 1])\n"
@@ -154,8 +155,10 @@ MUTANTS = [
     ("M14", "models.py", "over",
      "⛔ the exclusion becomes default-on, so the un-ported Gemini ranker and "
      "this mirror answer differently",
-     [("def pick_highest_model(labels, family: str, below=None, reject=(), drop_upsell=False):",
-       "def pick_highest_model(labels, family: str, below=None, reject=(), drop_upsell=True):")]),
+     [("def pick_highest_model(labels, family: str, below=None, reject=(), drop_upsell=False,\n"
+       "                       sale_nouns=None):",
+       "def pick_highest_model(labels, family: str, below=None, reject=(), drop_upsell=True,\n"
+       "                       sale_nouns=None):")]),
     ("M15", "models.py", "under",
      "the verb list forks from the one the tier picker and the mission read",
      [('        "upgrade_verbs": UPSELL_VERBS,', '        "upgrade_verbs": ["upgrade"],')]),

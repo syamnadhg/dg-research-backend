@@ -162,6 +162,8 @@ from models import (
     p2_claude_validate_directive,
     parse_family_version,
     reject_terms,
+    upsell_nouns as _models_upsell_nouns,
+    upsell_shadow as _models_upsell_shadow,
     model_probe_due,
     record_probe,
     record_known_good,
@@ -44804,7 +44806,8 @@ async def _selfheal_try(page, intent_id: str, *, check_active, confirmed_off) ->
 # parseable version is a last-resort candidate so a version-less rename does not
 # empty the menu — but it is never a step-back target, since it cannot be proven
 # older than what just failed.
-_GEMINI_FLASH_RANK_JS = """({below, doClick, pin, fam, reject, triggerText}) => {
+_GEMINI_FLASH_RANK_JS = """({below, doClick, pin, fam, reject, triggerText,
+                             nouns, verbs, upsellWindow, dropUpsell}) => {
     const items = [...document.querySelectorAll(
         '[role="menuitem"], [role="menuitemradio"], [role="option"], button, a, li')];
     const famRe = new RegExp(fam, 'i');
@@ -44849,19 +44852,84 @@ _GEMINI_FLASH_RANK_JS = """({below, doClick, pin, fam, reject, triggerText}) => 
         }
         return false;
     };
+    // Character-level port of models.is_upsell_any — ONE definition of what a
+    // sales prompt looks like, shared with the Claude ranker's port and with
+    // the Python mirror, not a third opinion.
+    //
+    // ⭐⭐ THE NOUNS ARE PLAN NAMES, NOT THE FAMILY WORD, and that is the
+    // difference between a guard and a no-op. Claude sells with the family next
+    // to the verb ("Upgrade to Opus"); Google sells with the PLAN next to it
+    // ("Upgrade to Google AI Ultra"), and the model name, when the row carries
+    // one at all, sits further along in the concatenated description. Keying
+    // this on `fam` would ask for "upgrade" followed by "flash" inside the
+    // window, which Google's copy does not produce — it would match nothing and
+    // still read as shipped. The nouns come from policy for the same reason the
+    // family and the reject terms do.
+    //
+    // Whitespace is collapsed HERE, over the SAME set models._collapse_ws uses
+    // rather than this language's own \\s: Python calls \\x1c-\\x1f and \\x85
+    // whitespace and JS does not, JS calls \\ufeff (a BOM, which does turn up in
+    // page text) whitespace and Python does not, and the window below is
+    // counted in CHARACTERS on the collapsed string. Regex-free boundaries for
+    // the #913 reason the rest of this file states.
+    const normU = s => (s || '').replace(/[\\s\\x1c-\\x1f\\x85\\ufeff]+/g, ' ').trim();
+    const isUpsell = (raw) => {
+        const s = normU(raw).toLowerCase();
+        if (!s) return false;
+        for (const rawNoun of (nouns || [])) {
+            const n = normU(rawNoun).toLowerCase();
+            if (!n) continue;
+            for (const rawVerb of (verbs || [])) {
+                const verb = String(rawVerb).toLowerCase();
+                if (!verb) continue;
+                let i = s.indexOf(verb);
+                while (i !== -1) {
+                    const end = i + verb.length;
+                    const leftOk = i === 0 || !isAlnum(s[i - 1]);
+                    const rightOk = end >= s.length || !isAlnum(s[end]);
+                    if (leftOk && rightOk) {
+                        const j = s.indexOf(n, end);
+                        if (j !== -1 && j - end <= upsellWindow) return true;
+                    }
+                    i = s.indexOf(verb, i + 1);
+                }
+            }
+        }
+        return false;
+    };
     // The dropdown TRIGGER names the current model too. With version-less rows
     // now acceptable, on a rename day (no numbered rows anywhere) the shortest
     // element containing the family word is plausibly the trigger itself —
     // clicking it just shuts the menu while we report a successful pick.
     const trig = (triggerText || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-    let bestEl = null, best = '', bestRank = null, bestLen = Infinity;
+    let bestEl = null, best = '', bestRank = null, bestLen = Infinity, bestAdv = false;
+    const adverts = [];
     for (const el of items) {
         if (!el.offsetParent) continue;
         const t = (el.textContent || '').trim().toLowerCase();
         if (!t) continue;
         if (trig && t.replace(/\\s+/g, ' ') === trig) continue;   // never click the trigger
+        // ⭐ SCORED BEFORE `rejected`, SKIPPED AFTER IT, and the split is the
+        // point of shadow mode. Most of Google's sales copy names a plan whose
+        // own name contains "pro", so the reject list already bins it — and if
+        // adverts were only counted on rows that survived reject, the very
+        // measurement this ships to collect would report near zero and be read
+        // as "no adverts in this menu". Counting first records what the advert
+        // rule WOULD have caught; the skip below still runs after reject so the
+        // live ordering ("Flash-Lite" also contains "flash") is untouched.
+        const adv = isUpsell(el.textContent || '');
+        if (adv && adverts.length < 8) adverts.push(t.slice(0, 60));
         // Reject siblings FIRST (order matters — "Flash-Lite" also has "flash").
         if (rejected(t)) continue;
+        // ⚠ WHILE `dropUpsell` IS FALSE THIS ROW IS STILL ELIGIBLE. That is
+        // deliberate: the nouns above are unmeasured against a real Gemini
+        // menu, this platform has no `free_family` to fall back to, and a guard
+        // that empties the menu here does not produce an error — it leaves the
+        // run on whatever the dropdown defaulted to, which on Gemini Pro is a
+        // 1-2h Deep Research hang. `advertPick` below reports when the winner
+        // WOULD have been dropped, which is the number that decides whether
+        // this flips.
+        if (dropUpsell && adv) continue;
         const v = flashVer(t);
         if (v === null && !famRe.test(t)) continue;
         let rank;
@@ -44888,12 +44956,82 @@ _GEMINI_FLASH_RANK_JS = """({below, doClick, pin, fam, reject, triggerText}) => 
         if (bestEl === null || rank[0] > bestRank[0] || (rank[0] === bestRank[0] && rank[1] > bestRank[1])
                 || (rank[0] === bestRank[0] && rank[1] === bestRank[1] && t.length < bestLen)) {
             bestEl = el; best = t.slice(0, 40); bestRank = rank; bestLen = t.length;
+            bestAdv = adv;
         }
     }
     if (doClick && bestEl) bestEl.click();
+    // `advertPick` is the ONE number that decides whether the rule flips on.
+    // `adverts` is a bounded sample for reading the vendor's actual copy back
+    // out of a log — 60 chars each so a row's plan phrase survives the slice,
+    // 8 rows because that is already more than a Gemini model menu holds.
     return { pick: best, version: bestRank && bestRank[0] ? bestRank[1] : null,
-             clicked: !!(doClick && bestEl) };
+             clicked: !!(doClick && bestEl),
+             advertPick: !!(bestEl && bestAdv), adverts };
 }"""
+
+
+def _gemini_advert_rule() -> "tuple[list, bool]":
+    """The advert nouns for the Gemini ranker, and whether to ACT on them.
+
+    ⭐ A FUNCTION, not two lines inside `_gemini_select_flash_model`, because
+    nothing can execute that coroutine without a live page — and "enforce a rule
+    nobody has measured, on the one platform with no fallback family" is the
+    single most expensive thing in this fix to get wrong. Inline, the only
+    available pin would be reading its source, and this wave already recorded
+    five mutants walking through exactly that kind of pin.
+
+    ⛔ NO NOUNS MEANS NO RULE, in both halves of the answer. A platform with
+    nothing configured must not end up enforcing an empty rule (which skips
+    nothing but reads as guarded) nor inherit a noun from somewhere else."""
+    nouns = _models_upsell_nouns("gemini")
+    return nouns, bool(nouns) and not _models_upsell_shadow("gemini")
+
+
+def _gemini_advert_lines(rank, *, live: bool, nouns) -> "list[tuple[str, str]]":
+    """What to say about the ranker's advert scan. Returns (level, message) pairs.
+
+    ⭐ A FUNCTION AND NOT AN INLINE BLOCK because `_gemini_select_flash_model`
+    cannot be executed by a test — it needs a live page — and this wave already
+    paid for that lesson twice: a decision written inline is pinned by reading
+    its source, and mutation walks straight through such a pin. The caller now
+    only logs what this returns.
+
+    ⚠ SILENT WHEN THE RANKER DID NOT RUN. `rank` is `{}` after an eval error,
+    and reporting "0 sales rows" for a menu that was never read would be the
+    same class of untruth as the source count that said zero on our behalf. The
+    scan reports a denominator only when there is one, and the eval error has
+    its own line."""
+    if not nouns:
+        return []
+    if not isinstance(rank, dict) or "adverts" not in rank:
+        return []
+    adverts = rank.get("adverts") or []
+    lines: "list[tuple[str, str]]" = []
+    mode = "enforced" if live else "shadow (not acted on)"
+    if adverts:
+        _sample = " | ".join(str(a) for a in adverts[:4])
+        lines.append(("INFO",
+                      f"[setup_gemini_dr] advert-scan ({mode}): {len(adverts)} row(s) in "
+                      f"the model menu read as a sales prompt — {_sample}"))
+    else:
+        lines.append(("INFO",
+                      f"[setup_gemini_dr] advert-scan ({mode}): no row in the model menu "
+                      f"reads as a sales prompt"))
+    if rank.get("advertPick"):
+        if live:
+            # Unreachable by construction — the ranker skips advert rows while
+            # `dropUpsell` is true — so if it ever fires, the port and the flag
+            # have come apart and the log is the only place that would show it.
+            lines.append(("WARN",
+                          "[setup_gemini_dr] advert-scan: the advert rule is ENFORCED yet "
+                          "the clicked row still scores as a sales prompt — the ranker and "
+                          "the flag disagree"))
+        else:
+            lines.append(("WARN",
+                          "[setup_gemini_dr] advert-scan: the row this run CLICKED reads as "
+                          "a sales prompt. The rule is in shadow, so the click stood — if "
+                          "this run's model selection misbehaved, this is the reason"))
+    return lines
 
 
 async def _gemini_select_flash_model(page, pin_model=None, step_below=None) -> bool:
@@ -44989,6 +45127,7 @@ async def _gemini_select_flash_model(page, pin_model=None, step_below=None) -> b
         # it was log-only, and it was itself a pinned version.
         _gm_family = p2_family("gemini") or "flash"
         _gm_reject = reject_terms("gemini")
+        _gm_nouns, _gm_advert_live = _gemini_advert_rule()
         # The thinking-level word, from policy rather than four separate literals
         # in the page.evaluate strings below. The advisory at the end of the P2
         # leg ALREADY reads this key, so while the selectors hardcoded 'extended'
@@ -45028,10 +45167,15 @@ async def _gemini_select_flash_model(page, pin_model=None, step_below=None) -> b
         try:
             _rank = await page.evaluate(_GEMINI_FLASH_RANK_JS, {
                 "below": step_below, "doClick": True, "pin": pin_model,
-                "fam": _gm_family, "reject": _gm_reject, "triggerText": _gm_trigger})
+                "fam": _gm_family, "reject": _gm_reject, "triggerText": _gm_trigger,
+                "nouns": _gm_nouns, "verbs": list(UPSELL_VERBS),
+                "upsellWindow": UPSELL_WINDOW, "dropUpsell": _gm_advert_live})
         except Exception as _re:
             log(f"[setup_gemini_dr] model-pick: ranker eval errored ({_re})", "WARN")
             _rank = {}
+        for _al in _gemini_advert_lines(_rank, live=_gm_advert_live,
+                                        nouns=_gm_nouns):
+            log(_al[1], _al[0])
         picked = ((_rank or {}).get("pick") or "") if (_rank or {}).get("clicked") else ""
         if not picked:
             log(f"[setup_gemini_dr] model-pick: no '{_gm_family}' row found in the dropdown "
