@@ -21063,6 +21063,14 @@ def emit_event(event_type, phase=None, agent=None, **data):
                 "actions": data.get("actions"),
                 "dismissible": data.get("dismissible", True),
                 "alert_id": data.get("alert_id"),
+                # ⛔ CARRIED, because the ONLY quiet card that reaches this seam
+                # is one somebody force-mirrored on purpose. `force_mirror` is
+                # for a card that is quiet BY DESIGN and must still survive a
+                # cold open — the login interrupt, where nothing errored — so a
+                # mirror that dropped the flag rebuilt it as a red ✖ on a run
+                # that had not failed. Written as a plain bool so the FE's
+                # `quiet === true` test cannot be satisfied by a stray string.
+                "quiet": bool(data.get("quiet")),
                 # Unified-decision fields (2026-07-14) — carried so the FE
                 # countdown + command-ack survive a cold chat-open.
                 "recoverability": data.get("recoverability"),
