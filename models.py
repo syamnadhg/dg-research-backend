@@ -1223,14 +1223,31 @@ def pick_highest_model(labels, family: str, below=None, reject=(), drop_upsell=F
     ⚠ IT IS OPT-IN BECAUSE THE TWO RANKERS IT MIRRORS DO NOT AGREE — and NOTHING
     CALLS THIS FROM THE BROWSER. A ranker is a JS string run through
     `page.evaluate`, so the rule is hand-PORTED, never shared: `_pick_opus_js` in
-    research.py carries a character-level port of `is_upsell` and is handed this
-    module's `UPSELL_VERBS`/`UPSELL_WINDOW`, while the Gemini Flash ranker has no
-    upsell rule at all. Default-on would put the no-flag answer HERE at odds with
-    the browser on the un-ported path — exactly how the reject rule drifted the
-    first time — so the flag is what lets one function mirror either ranker.
+    research.py carries a character-level port of `is_upsell`, and the Gemini
+    Flash ranker now carries one of `is_upsell_any`. Both are handed this
+    module's `UPSELL_VERBS`/`UPSELL_WINDOW`, and they still disagree twice over:
+
+      * the NOUN differs. Claude keys on the model family ("Upgrade to Opus");
+        Gemini keys on the subscription PLAN ("Upgrade to Google AI Ultra"),
+        because that is the word its vendor puts next to the verb. One default
+        noun cannot be right for both, which is what `sale_nouns` answers;
+      * the Gemini port is in SHADOW. `P2_MODEL_POLICY["gemini"]
+        ["upsell_shadow"]` is True, so that ranker SCORES every row and acts on
+        none of them, while the Claude ranker skips. A default-on flag here
+        would therefore contradict the live browser behaviour on that platform
+        specifically — which is exactly how the reject rule drifted the first
+        time.
+
+    So the flag is still what lets one function mirror either ranker. ⭐ REVISIT
+    THIS THE DAY `upsell_shadow` GOES FALSE: at that point both rankers enforce,
+    only the noun differs, and default-on plus a required `sale_nouns` may be the
+    honest shape. `tests/test_wave1_merge_gates_0821.py` fails on that day on
+    purpose.
     (2026-08-21: this paragraph used to say "every JS ranker that calls it: the
     Claude ranker ports the rule and passes it". Both halves were false. No JS
-    can call a Python function, and no production Python calls this at all.)
+    can call a Python function, and no production Python calls this at all.
+    2026-08-22: it then said the Gemini ranker "has no upsell rule at all",
+    which stopped being true the day that rule was ported.)
 
     ⭐ NO FLOOR PARAMETER. "Highest offered" already cannot pick a downgrade —
     nothing else on the menu is higher — so a floor could only ever REJECT the

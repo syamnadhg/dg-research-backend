@@ -80,18 +80,54 @@ def test_nothing_in_production_calls_the_model_helper():
         f"says it has none: {offenders}")
 
 
-def test_only_the_claude_ranker_ports_the_upsell_rule():
-    """⭐ THE FALSIFIABLE HALF. The flag is opt-in *because* the two rankers
-    disagree. The day the Gemini ranker ports the rule, that reasoning is stale
-    and the default should be revisited — so this fails then, deliberately."""
+def test_both_rankers_port_the_rule_and_still_disagree():
+    """⭐ THE FALSIFIABLE HALF, AND IT ALREADY FIRED ONCE.
+
+    This used to assert the Gemini ranker had NO upsell rule, and said in its own
+    docstring that the day somebody ported one, `drop_upsell`'s opt-in reasoning
+    would be stale and this test should fail. That day was 2026-08-22. The rule
+    was ported — and the reasoning survives for a DIFFERENT pair of reasons,
+    which is what this now pins:
+
+      * the two ports key on different NOUNS (family vs subscription plan),
+        because that is the word each vendor puts next to the verb;
+      * the Gemini port is in SHADOW, so it scores and does not act, while the
+        Claude port skips.
+
+    Either one alone makes a default-on flag contradict the browser. The next
+    tripwire is `upsell_shadow` going False.
+    """
     claude_js = _js_constant(research.setup_claude_dr, "_pick_opus_js")
     gemini_js = research._GEMINI_FLASH_RANK_JS
     assert "isUpsell" in claude_js, (
         "the Claude picker no longer carries the upsell port the docstring "
         "credits it with")
-    assert "isUpsell" not in gemini_js, (
-        "the Gemini ranker now has an upsell rule — `drop_upsell`'s opt-in "
-        "reasoning and the docstring that explains it both need revisiting")
+    assert "isUpsell" in gemini_js, (
+        "the Gemini ranker's upsell port is gone — the docstring credits it "
+        "with one")
+    # The nouns really are different, and neither is the other's.
+    assert models.upsell_nouns("gemini"), "the Gemini nouns are gone"
+    assert models.p2_family("gemini") not in models.upsell_nouns("gemini"), (
+        "the Gemini ranker is keying on the family word again, which its own "
+        "vendor's sales copy does not produce — see upsell_nouns")
+    assert models.upsell_nouns("claude") == [], (
+        "Claude has acquired plan nouns — if both rankers now key the same way, "
+        "`sale_nouns` and this paragraph both need revisiting")
+
+
+def test_the_default_is_revisited_when_the_gemini_rule_goes_live():
+    """⭐ THE NEXT TRIPWIRE. While Gemini shadows, a default-on `drop_upsell`
+    would contradict the browser on that platform. When the shadow is lifted,
+    both rankers enforce, only the noun differs, and the default deserves a
+    fresh decision — so this fails on that day, deliberately."""
+    assert models.upsell_shadow("gemini") is True, (
+        "the Gemini advert rule is now ENFORCED. `drop_upsell`'s opt-in default "
+        "and the paragraph in pick_highest_model that explains it were written "
+        "for the shadow period — revisit both, then re-point this test")
+    doc = _without_historical_notes(models.pick_highest_model.__doc__ or "")
+    assert "SHADOW" in doc, (
+        "the docstring no longer names the shadow as a reason the flag is "
+        "opt-in, so a reader cannot tell why the default is what it is")
 
 
 def test_the_claude_port_is_handed_this_modules_word_list():
