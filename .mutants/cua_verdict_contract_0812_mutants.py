@@ -39,28 +39,35 @@ SUITES = ("tests/test_cua_verdict_contract_0812.py "
 MUTANTS = [
     # ═════════════════════ UNDER — back to sniffing prose ══════════════════
     ("U1", "under", "⭐ the contract is never read — every answer goes through the keyword parser",
-     [("    v_hits = _CUA_VERDICT_LINE.findall(t)", "    v_hits = []")]),
+     # ⛔⛔ RE-ANCHORED 2026-08-23. Wave 7 extracted this reader into
+     # `_verdict_line_re` / `_last_verdict` so every verifier shares one, and
+     # doing so stranded six anchors in the harness that PROVES the contract
+     # works — in the exact area the refactor claimed to strengthen.
+     [("    verdict = _last_verdict(t, _CUA_VERDICT_LINE)", '    verdict = ""')]),
     ("U2", "under", "⭐ prose is consulted FIRST, so a hedge still vetoes a stated verdict",
-     [('    if v_hits:\n'
-       '        verdict = v_hits[-1].lower()\n'
+     # RE-ANCHORED 2026-08-23 onto the extracted reader (see U1).
+     [('    if verdict:\n'
        "        if verdict == \"unknown\":\n"
        '            verdict = "ambiguous"\n'
        '        source = "contract"',
        '    if _classify_completion_verdict(t) == "generating":\n'
        '        verdict = "generating"\n'
        '        source = "contract"\n'
-       "    elif v_hits:\n"
-       "        verdict = v_hits[-1].lower()\n"
+       "    elif verdict:\n"
        "        if verdict == \"unknown\":\n"
        '            verdict = "ambiguous"\n'
        '        source = "contract"')]),
     ("U3", "under", "⛔ the line anchor is dropped — an echoed instruction decides again (#753)",
-     [(r'    r"^[^\S\n]*verdict[^\S\n]*[:=][^\S\n]*(complete|generating|unknown)\b",'
-       "\n    re.I | re.M)",
-       r'    r"verdict[^\S\n]*[:=][^\S\n]*(complete|generating|unknown)\b",'
-       "\n    re.I)")]),
+     # RE-ANCHORED 2026-08-23: the pattern is BUILT now, so dropping the anchor
+     # means dropping it for every field at once — a bigger version of the same
+     # defect, and the reason one shared reader was worth extracting.
+     [('        r"^[^\\S\\n]*" + field + r"[^\\S\\n]*[:=][^\\S\\n]*(" + "|".join(values) + r")\\b",\n'
+       "        re.I | re.M)",
+       '        r"" + field + r"[^\\S\\n]*[:=][^\\S\\n]*(" + "|".join(values) + r")\\b",\n'
+       "        re.I)")]),
     ("U4", "under", "the FIRST verdict wins — a deliberation outranks the conclusion",
-     [("        verdict = v_hits[-1].lower()", "        verdict = v_hits[0].lower()")]),
+     # RE-ANCHORED 2026-08-23: choosing among matches moved into `_last_verdict`.
+     [('    return hits[-1].lower() if hits else ""', '    return hits[0].lower() if hits else ""')]),
     ("U5", "under", "'unknown' stops mapping onto the existing vocabulary",
      [('        if verdict == "unknown":\n            verdict = "ambiguous"', "")]),
     ("U6", "under", "the confirm mission stops asking for the contract",
@@ -98,10 +105,13 @@ MUTANTS = [
        '                     or _cua_affirms(t, "stop icon"))',
        "        stop_seen = False")]),
     ("O5", "over", "the STOP_BUTTON line is never read — the polarity rule goes blind",
-     [("    s_hits = _CUA_STOP_LINE.findall(t)", "    s_hits = []")]),
+     # RE-ANCHORED 2026-08-23 onto the extracted reader (see U1).
+     [('    stop = _last_verdict(t, _CUA_STOP_LINE)', '    stop = ""')]),
     ("O6", "over", "a bare verdict word with no label counts — prose starts deciding again",
-     [(r'    r"^[^\S\n]*verdict[^\S\n]*[:=][^\S\n]*(complete|generating|unknown)\b",',
-       r'    r"^[^\S\n]*(?:verdict[^\S\n]*[:=][^\S\n]*)?(complete|generating|unknown)\b",')]),
+     # RE-ANCHORED 2026-08-23: the label is now the `field` argument, so making
+     # it optional makes every contract field label-optional at once.
+     [('        r"^[^\\S\\n]*" + field + r"[^\\S\\n]*[:=][^\\S\\n]*(" + "|".join(values) + r")\\b",',
+       '        r"^[^\\S\\n]*(?:" + field + r"[^\\S\\n]*[:=][^\\S\\n]*)?(" + "|".join(values) + r")\\b",')]),
     ("O7", "over", "the source label is a constant — a run carried by the fallback looks healthy",
      [('        source = "prose"', '        source = "contract"')]),
 ]
