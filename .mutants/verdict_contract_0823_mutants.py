@@ -155,8 +155,19 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     ("M1", "under", "⛔⛔ the one-word cap on the LOGIN check is lifted — nothing "
      "fails, and a prefix read that was sound only because the model could not "
      "write prose starts reading reasoning",
-     [("            max_tokens=8,\n            # Thinking MUST be explicit. On the 5-series models an omitted",
-       "            max_tokens=1024,\n            # Thinking MUST be explicit. On the 5-series models an omitted")],
+     # ⛔ ANCHOR WIDENED 2026-08-23: the two one-word verifiers are BYTE-IDENTICAL
+     # from `try:` down through `max_tokens=8`, so the obvious anchor matched
+     # twice and the harness reported it rather than measuring — which is the
+     # sweep's own rule working. The `)` that closes the login prompt is the
+     # nearest line that belongs to only one of them.
+     [("    )\n    try:\n        resp = await asyncio.to_thread(\n"
+       "            cua_client.messages.create,\n"
+       "            model=(VISION_HEAVY_MODEL if heavy else VISION_LIGHT_MODEL),\n"
+       "            max_tokens=8,\n",
+       "    )\n    try:\n        resp = await asyncio.to_thread(\n"
+       "            cua_client.messages.create,\n"
+       "            model=(VISION_HEAVY_MODEL if heavy else VISION_LIGHT_MODEL),\n"
+       "            max_tokens=1024,\n")],
      [T_VERDICT]),
 ]
 

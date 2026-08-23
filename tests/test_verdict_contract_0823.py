@@ -64,6 +64,29 @@ class TestTheSharedReader:
         assert research._last_verdict(
             text, research._CUA_CONCLUSION_LINE) == "needs_click"
 
+    def test_the_stop_field_is_read_at_its_LAST_statement_too(self):
+        # ⛔ FOUND BY MUTATION 2026-08-23. Every last-match assertion here and
+        # in the 0812 suite drove the VERDICT field; nothing drove STOP_BUTTON,
+        # so reading it at its first statement survived a green suite.
+        #
+        # It is not a lesser field. A reported Stop button OVERRIDES a
+        # "complete" verdict, so a model that says "STOP_BUTTON: yes" while
+        # reasoning and then corrects itself to "STOP_BUTTON: no" would pin the
+        # run as still generating forever — and the correction is the answer.
+        text = "STOP_BUTTON: yes\nOn reflection —\nSTOP_BUTTON: no"
+        assert research._last_verdict(text, research._CUA_STOP_LINE) == "no"
+
+    def test_and_the_completion_report_carries_that_through(self):
+        # ⭐ THE HELPER IS NOT THE CONSUMER. `_last_verdict` taking the last
+        # statement means nothing if `_cua_completion_report` reads the field
+        # some other way — which is this repo's most repeated defect.
+        out = research._cua_completion_report(
+            "STOP_BUTTON: yes\nVERDICT: complete\nSTOP_BUTTON: no")
+        assert out["stop_seen"] is False, (
+            "the report read the stop field at its first statement")
+        assert out["verdict"] == "complete", (
+            "a retracted stop sighting still vetoed a complete verdict")
+
     def test_leading_horizontal_space_is_allowed(self):
         assert research._last_verdict(
             "   \tCONCLUSION: error", research._CUA_CONCLUSION_LINE) == "error"
