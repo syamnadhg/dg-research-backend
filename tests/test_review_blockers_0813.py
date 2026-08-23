@@ -756,6 +756,48 @@ def test_the_js_port_and_the_python_definition_agree(label, expected):
         f"models.is_upsell says upsell={expected}")
 
 
+@pytestmark_node
+@pytest.mark.parametrize("label,expected", _FAMILY_CORPUS)
+def test_the_PROBE_reads_the_corpus_the_same_way_the_picker_does(label, expected):
+    """⛔⛔ FOUND BY MUTATION 2026-08-23, and it is the reason the mutants were
+    deliberately spread across the copies.
+
+    This filter now exists FOUR times in research.py — the picker, this probe,
+    the dropdown-click path and the Gemini ranker wave 6 ported it to. Every
+    corpus test above drives the PICKER. The probe had exactly one label,
+    "Upgrade to Opus 5.2", whose verb and family word sit four characters
+    apart — so unbounding the proximity window changed nothing it asserted, and
+    a mutant that binned every genuine row survived against a green suite.
+
+    The two are byte-identical and MUST agree: the probe deciding a row is an
+    upsell while the picker does not is precisely the "offered but not
+    clickable" loop this file was written to close, in reverse."""
+    out = _probe(_menu(label))
+    if expected:
+        # An upsell row raises neither the count nor the version, and IS counted
+        # as a chip — which is the signal that tells a plan limit apart from a
+        # rename. Every upsell row can be judged this way, versioned or not.
+        assert out["n"] == 0, (
+            f"the probe counted {label!r} as an offered model but "
+            f"models.is_upsell says it is an upsell")
+        assert out["chips"] >= 1, f"{label!r} was dropped without being counted as a chip"
+        return
+    # ⚠ THE OTHER HALF NEEDS A VERSION, and the first draft of this test did
+    # not — it failed on "Opus", "Regetopus" and the plan-upsell row, all of
+    # which the probe drops for having no version to RANK rather than for being
+    # upsells. That is a different exclusion and asserting it here would have
+    # pinned the wrong mechanism. The picker's corpus test does not hit this
+    # because it measures a CLICK, which needs no version.
+    if not any(c.isdigit() for c in label):
+        assert out["chips"] == 0, (
+            f"the probe treated {label!r} as a sales chip — it has no version, "
+            f"so it should be dropped as unrankable, not excluded as an upsell")
+        return
+    assert out["n"] >= 1, (
+        f"the probe excluded {label!r} but models.is_upsell says it is a "
+        f"genuine row — this is 'offered but not clickable' in reverse")
+
+
 def test_the_corpus_covers_both_verdicts_in_the_browser():
     """A filter that accidentally emptied one side of `_FAMILY_CORPUS` would
     leave the agreement test passing while checking one polarity."""
