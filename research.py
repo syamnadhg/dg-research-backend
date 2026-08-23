@@ -34484,12 +34484,53 @@ _CUA_CONTRACT_BLOCK = (
 # instruction echoed mid-sentence ("I would reply 'VERDICT: complete'") does not
 # begin a line, so it cannot be mistaken for the conclusion. That exact echo is
 # the #753 defect.
-_CUA_VERDICT_LINE = re.compile(
-    r"^[^\S\n]*verdict[^\S\n]*[:=][^\S\n]*(complete|generating|unknown)\b",
-    re.I | re.M)
-_CUA_STOP_LINE = re.compile(
-    r"^[^\S\n]*stop[_ -]?button[^\S\n]*[:=][^\S\n]*(yes|no|unsure)\b",
-    re.I | re.M)
+def _verdict_line_re(field: str, *values: str) -> "re.Pattern":
+    r"""Build the reader for ONE field of a stated-conclusion contract.
+
+    ⭐⭐ ONE READER FOR EVERY VERIFIER. Each property below is a defect this
+    file has already paid for, and each was fixed in ONE reader while the
+    others kept the old shape:
+
+      * ANCHORED to the start of a line (`^` with `re.M`). An instruction
+        echoed mid-sentence — "I would reply 'VERDICT: complete'" — does not
+        begin a line, so it cannot be mistaken for the conclusion. That echo
+        is #753.
+      * HORIZONTAL whitespace only. `\s` spans newlines and would quietly
+        undo the anchoring written beside it.
+      * Case-insensitive, because a contract that says the value in capitals
+        and a reader that matches lower case agree only by accident.
+
+    `field` is a regex fragment, not a literal — `stop[_ -]?button` has to
+    tolerate the three spellings models actually write.
+
+    ⛔ The reader does NOT choose among matches; `_last_verdict` does, and it
+    takes the LAST. A model that reasons out loud names values on the way to
+    its conclusion, and the conclusion is the one it wrote last.
+    """
+    return re.compile(
+        r"^[^\S\n]*" + field + r"[^\S\n]*[:=][^\S\n]*(" + "|".join(values) + r")\b",
+        re.I | re.M)
+
+
+def _last_verdict(text: str, pattern: "re.Pattern") -> str:
+    r"""The last stated value for a contract field, lower-cased, or "".
+
+    ⭐ LAST, not first — see `_verdict_line_re`. The prompts that mandate these
+    lines also PRINT the whole menu of legal values above the answer, so the
+    first match in a reply that quotes its instructions is the first item on
+    that menu rather than anything the model decided.
+    """
+    hits = pattern.findall(text or "")
+    return hits[-1].lower() if hits else ""
+
+
+_CUA_VERDICT_LINE = _verdict_line_re("verdict", "complete", "generating", "unknown")
+_CUA_STOP_LINE = _verdict_line_re("stop[_ -]?button", "yes", "no", "unsure")
+# The diagnose mission states its answer under a DIFFERENT keyword and a
+# different vocabulary — deliberately, because it answers a different question
+# (what is on screen) than the completion verifier (is it finished).
+_CUA_CONCLUSION_LINE = _verdict_line_re(
+    "conclusion", "generating", "done", "needs_click", "error")
 
 
 def _cua_completion_report(cua_text: str) -> dict:
@@ -34517,12 +34558,10 @@ def _cua_completion_report(cua_text: str) -> dict:
     becomes an incident rather than after.
     """
     t = cua_text or ""
-    v_hits = _CUA_VERDICT_LINE.findall(t)
-    s_hits = _CUA_STOP_LINE.findall(t)
-    stop = s_hits[-1].lower() if s_hits else ""
+    verdict = _last_verdict(t, _CUA_VERDICT_LINE)
+    stop = _last_verdict(t, _CUA_STOP_LINE)
 
-    if v_hits:
-        verdict = v_hits[-1].lower()
+    if verdict:
         if verdict == "unknown":
             verdict = "ambiguous"
         source = "contract"
@@ -40916,14 +40955,33 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             #   3. Stop-button-visible always vetos (per prompt decision rule).
             #   4. Default to still-generating on ambiguity (one extra CUA
             #      check is far cheaper than a zero-char extraction).
-            verdict_match = re.search(
-                r'conclusion\s*:\s*(generating|done|needs_click|error)',
-                diag_text,
-            )
+            # ⛔⛔ 2026-08-23 — THIS READER NEVER GOT THE CONTRACT'S DISCIPLINE.
+            # It was `re.search(r'conclusion\s*:\s*(...)')`: unanchored, and
+            # FIRST match wins. The prompt above says "the LAST line of your
+            # response must be exactly one of" and then PRINTS ALL FOUR VALUES,
+            # each on its own `CONCLUSION:` line — so a reply that quotes its
+            # instructions, or reasons aloud before deciding, was read as the
+            # first item on that menu rather than as the answer. That is the
+            # #753 shape exactly, one function over from where it was fixed.
+            #
+            # ⭐ Cost, stated honestly rather than inflated: GENERATING heads
+            # the list and is also the no-match default, so the likeliest
+            # misread turns a DONE into another poll — cheap. The one that is
+            # not cheap is NEEDS_CLICK, which re-arms the late-Start watch.
+            #
+            # The unanchored search stays as the FALLBACK so no answer that
+            # resolves today resolves differently, including the `CONCLUSION:`
+            # and its value split across two lines.
+            verdict = _last_verdict(diag_text, _CUA_CONCLUSION_LINE)
+            if not verdict:
+                _loose = re.search(
+                    r'conclusion\s*:\s*(generating|done|needs_click|error)',
+                    diag_text,
+                )
+                verdict = _loose.group(1) if _loose else ""
 
             is_error = False
-            if verdict_match:
-                verdict = verdict_match.group(1)
+            if verdict:
                 is_done = verdict == "done"
                 is_generating = verdict == "generating"
                 is_error = verdict == "error"
