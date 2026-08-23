@@ -40,7 +40,14 @@ def test_pin_forces_exact_version_in_pickers():
     assert "Math.abs(v - pin)" in sc and (
         "({pin, below, fam, triggerText, verbs, upsellWindow})" in sc)
     js = research._GEMINI_FLASH_RANK_JS
-    assert "Math.abs(v - pin)" in js and "{below, doClick, pin, fam, reject, triggerText}" in js
+    # ⚠ The PARAMETERS, not the frozen parameter LIST. This used to assert the
+    # exact destructuring literal, so adding an argument to the ranker failed a
+    # test about `pin` with a diff about something else entirely (2026-08-22,
+    # the advert nouns). What matters is that each named input reaches the
+    # ranker and that `pin` still drives an exact-version branch.
+    assert "Math.abs(v - pin)" in js
+    for _param in ("below", "doClick", "pin", "fam", "reject", "triggerText"):
+        assert _param in js.split("=>")[0], _param
 
 
 def test_below_selects_strictly_older_in_both_pickers():
