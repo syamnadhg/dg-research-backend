@@ -40964,10 +40964,17 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # first item on that menu rather than as the answer. That is the
             # #753 shape exactly, one function over from where it was fixed.
             #
-            # ⭐ Cost, stated honestly rather than inflated: GENERATING heads
-            # the list and is also the no-match default, so the likeliest
-            # misread turns a DONE into another poll — cheap. The one that is
-            # not cheap is NEEDS_CLICK, which re-arms the late-Start watch.
+            # ⭐ Cost, stated honestly. That rationale used to read "GENERATING
+            # heads the list, so the likeliest misread turns a DONE into another
+            # poll" — which was a property of the FIRST-match reader being
+            # removed, left standing beside the LAST-match reader that replaced
+            # it. Corrected 2026-08-23. Under the new reader the exposure moves
+            # the other way and downward: a mid-sentence echo ("this is not the
+            # NEEDS_CLICK state") no longer decides anything, so the expensive
+            # misreads — a spurious `error` that drops the agent, a spurious
+            # `needs_click` that re-arms the late-Start watch — get rarer, not
+            # commoner. What remains is a reply that states two anchored
+            # conclusions and means the last, which is what the prompt asks for.
             #
             # The unanchored search stays as the FALLBACK so no answer that
             # resolves today resolves differently, including the `CONCLUSION:`
