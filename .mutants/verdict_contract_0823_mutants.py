@@ -147,9 +147,15 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_COMPLETION]),
     ("C2", "under", "the stop-button field is read at its FIRST statement, so a "
      "model that corrects itself is heard saying the opposite",
+     # ⛔⛔ TEST LIST CORRECTED 2026-08-23, and I had written the lesson down an
+     # hour earlier on the frontend: adding the test that kills a mutant does
+     # nothing if the MUTANT does not run it. C2 survived a second time against
+     # a suite written specifically to kill it, because it listed only the 0812
+     # file. A survivor is a question about the harness as often as about the
+     # code.
      [("    stop = _last_verdict(t, _CUA_STOP_LINE)",
        "    stop = (_CUA_STOP_LINE.findall(t) or [\"\"])[0].lower()")],
-     [T_COMPLETION]),
+     [T_VERDICT, T_COMPLETION]),
 
     # ── the two verifiers that are safe by construction ──────────────────────
     ("M1", "under", "⛔⛔ the one-word cap on the LOGIN check is lifted — nothing "
