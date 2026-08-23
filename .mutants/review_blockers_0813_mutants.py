@@ -43,8 +43,9 @@ MUTANTS = [
     # ═══════════ finding 1 — a second --serve must not end a live run ═══════
     ("R1", "research.py", "under",
      "⭐ the busy guard is gone — the finding, restored verbatim",
-     [("    _activity = _port_backend_activity(port)\n"
-       "    if _backend_activity_is_work(_activity):", "    if False:")]),
+     # RE-ANCHORED 08-23: the probe is now retried across the settle window.
+     [('    _activity = _probe_backend_activity_until_settled(port, settle_s)\n'
+       '    if _backend_activity_is_work(_activity):', '    if False:')]),
     ("R2", "research.py", "under",
      "`running` no longer counts as work — only a queued job would refuse",
      [('    return bool(activity.get("running")) or (activity.get("pending") or 0) > 0',
@@ -70,10 +71,11 @@ MUTANTS = [
     ("R7", "research.py", "over",
      "⛔ THE REVIEW'S LITERAL SUGGESTION — gate on the liveness probe. Health "
      "answers ok unconditionally, so this refuses EVERY reclaim",
-     [("    _activity = _port_backend_activity(port)\n"
-       "    if _backend_activity_is_work(_activity):",
-       "    _activity = _port_backend_activity(port)\n"
-       "    if _port_answers_health(port):")]),
+     # RE-ANCHORED 08-23, same move as R1.
+     [('    _activity = _probe_backend_activity_until_settled(port, settle_s)\n'
+       '    if _backend_activity_is_work(_activity):',
+       '    _activity = _probe_backend_activity_until_settled(port, settle_s)\n'
+       '    if _port_answers_health(port):')]),
     ("R8", "research.py", "over",
      "⛔ every holder we recognise is refused — reclaim disabled outright",
      [("    if _backend_activity_is_work(_activity):", "    if True:")]),
@@ -102,26 +104,114 @@ MUTANTS = [
        "                const isFam = v !== null || (famRe.test(t) && !isUpsell(t));")]),
     ("M3", "research.py", "under",
      "the verb boundary is dropped, so 'regetopus' reads as a sales prompt",
-     [("                        const leftOk = i === 0 || !isAlnum(s[i - 1]);\n"
-       "                        const rightOk = end >= s.length || !isAlnum(s[end]);\n"
-       "                        if (leftOk && rightOk) {\n"
-       "                            const j = s.indexOf(n, end);",
-       "                        if (true) {\n"
-       "                            const j = s.indexOf(n, end);")]),
+     # ⛔⛔ RE-ANCHORED 08-23. THREE BYTE-IDENTICAL COPIES of this filter now
+     # live in research.py — the picker, the probe and the dropdown click —
+     # plus a fourth in the Gemini ranker, so the old one-line anchors matched
+     # 2-3x and measured nothing. Each mutant below is now pinned to a
+     # DIFFERENT copy on purpose: the suite only ever exercised one, and a
+     # copy nothing measures will now show up as a SURVIVOR rather than as
+     # silence.
+     # M3 → the PICKER copy.
+     [('            // a "character-for-character port" turned out not to be one.\n'
+       "            const normU = s => (s || '').replace(/[\\\\s\\\\x1c-\\\\x1f\\\\x85\\\\ufeff]+/g, ' ').trim();\n"
+       '            const isUpsell = (raw) => {\n'
+       '                const s = normU(raw).toLowerCase(), n = normU(fam).toLowerCase();\n'
+       '                if (!s || !n) return false;\n'
+       '                // ⛔ NO "FAMILY NAMED FIRST" EXEMPTION, and this comment used to\n'
+       '                // describe one that is not here. It was tried and REVERTED\n'
+       '                // 2026-08-14 because it re-opened the blocking finding: driven\n'
+       '                // through this very JS, a menu whose top row read\n'
+       '                // "Opus 5 · Upgrade to Opus Max for more usage" was clicked and\n'
+       '                // returned as a confirmed pick. So a genuine row whose blurb\n'
+       '                // happens to read verb-then-family IS dropped here, on purpose.\n'
+       '                // See models.is_upsell for the full account.\n'
+       '                for (const rawVerb of (verbs || [])) {\n'
+       '                    const verb = String(rawVerb).toLowerCase();\n'
+       '                    if (!verb) continue;\n'
+       '                    let i = s.indexOf(verb);\n'
+       '                    while (i !== -1) {\n'
+       '                        const end = i + verb.length;\n'
+       '                        const leftOk = i === 0 || !isAlnum(s[i - 1]);\n'
+       '                        const rightOk = end >= s.length || !isAlnum(s[end]);\n'
+       '                        if (leftOk && rightOk) {\n'
+       '                            const j = s.indexOf(n, end);\n',
+       '            // a "character-for-character port" turned out not to be one.\n'
+       "            const normU = s => (s || '').replace(/[\\\\s\\\\x1c-\\\\x1f\\\\x85\\\\ufeff]+/g, ' ').trim();\n"
+       '            const isUpsell = (raw) => {\n'
+       '                const s = normU(raw).toLowerCase(), n = normU(fam).toLowerCase();\n'
+       '                if (!s || !n) return false;\n'
+       '                // ⛔ NO "FAMILY NAMED FIRST" EXEMPTION, and this comment used to\n'
+       '                // describe one that is not here. It was tried and REVERTED\n'
+       '                // 2026-08-14 because it re-opened the blocking finding: driven\n'
+       '                // through this very JS, a menu whose top row read\n'
+       '                // "Opus 5 · Upgrade to Opus Max for more usage" was clicked and\n'
+       '                // returned as a confirmed pick. So a genuine row whose blurb\n'
+       '                // happens to read verb-then-family IS dropped here, on purpose.\n'
+       '                // See models.is_upsell for the full account.\n'
+       '                for (const rawVerb of (verbs || [])) {\n'
+       '                    const verb = String(rawVerb).toLowerCase();\n'
+       '                    if (!verb) continue;\n'
+       '                    let i = s.indexOf(verb);\n'
+       '                    while (i !== -1) {\n'
+       '                        const end = i + verb.length;\n'
+       '                        if (true) {\n'
+       '                            const j = s.indexOf(n, end);\n')]),
     ("M4", "research.py", "under",
      "the proximity window is unbounded — any verb anywhere bins a real row",
-     [("                            if (j !== -1 && j - end <= upsellWindow) return true;",
-       "                            if (j !== -1) return true;")]),
+     # RE-ANCHORED 08-23 → the PROBE copy (see M3's note).
+     [("            // Same whitespace set as the picker's port and models._collapse_ws —\n"
+       "            // see the picker for why JS's own `\\\\s` is the wrong set here.\n"
+       "            const normU = s => (s || '').replace(/[\\\\s\\\\x1c-\\\\x1f\\\\x85\\\\ufeff]+/g, ' ').trim();\n"
+       '            const isUpsell = (raw) => {\n'
+       '                const s = normU(raw).toLowerCase(), nn = normU(fam).toLowerCase();\n'
+       '                if (!s || !nn) return false;\n'
+       '                for (const rawVerb of (verbs || [])) {\n'
+       '                    const verb = String(rawVerb).toLowerCase();\n'
+       '                    if (!verb) continue;\n'
+       '                    let i = s.indexOf(verb);\n'
+       '                    while (i !== -1) {\n'
+       '                        const end = i + verb.length;\n'
+       '                        const leftOk = i === 0 || !isAlnum(s[i - 1]);\n'
+       '                        const rightOk = end >= s.length || !isAlnum(s[end]);\n'
+       '                        if (leftOk && rightOk) {\n'
+       '                            const j = s.indexOf(nn, end);\n'
+       '                            if (j !== -1 && j - end <= upsellWindow) return true;\n',
+       "            // Same whitespace set as the picker's port and models._collapse_ws —\n"
+       "            // see the picker for why JS's own `\\\\s` is the wrong set here.\n"
+       "            const normU = s => (s || '').replace(/[\\\\s\\\\x1c-\\\\x1f\\\\x85\\\\ufeff]+/g, ' ').trim();\n"
+       '            const isUpsell = (raw) => {\n'
+       '                const s = normU(raw).toLowerCase(), nn = normU(fam).toLowerCase();\n'
+       '                if (!s || !nn) return false;\n'
+       '                for (const rawVerb of (verbs || [])) {\n'
+       '                    const verb = String(rawVerb).toLowerCase();\n'
+       '                    if (!verb) continue;\n'
+       '                    let i = s.indexOf(verb);\n'
+       '                    while (i !== -1) {\n'
+       '                        const end = i + verb.length;\n'
+       '                        const leftOk = i === 0 || !isAlnum(s[i - 1]);\n'
+       '                        const rightOk = end >= s.length || !isAlnum(s[end]);\n'
+       '                        if (leftOk && rightOk) {\n'
+       '                            const j = s.indexOf(nn, end);\n'
+       '                            if (j !== -1) return true;\n')]),
     ("M5", "research.py", "under",
      "the probe stops excluding chips — 'offered but not clickable', forever",
+     # RE-ANCHORED 08-23: the branch grew a chip COUNT, so `continue` is no
+     # longer the next line.
      [("                const raw = (el.textContent || '').trim();\n"
-       "                if (isUpsell(raw)) continue;\n"
-       "                const v = verOf(raw);",
+       '                if (isUpsell(raw)) {\n',
        "                const raw = (el.textContent || '').trim();\n"
-       "                const v = verOf(raw);")]),
+       '                if (false) {\n')]),
     ("M6", "research.py", "over",
      "⛔ the family word alone disqualifies a row — the menu is always empty",
-     [("            const isUpsell = (raw) => {", "            const isUpsell = (raw) => { return true;")]),
+     # RE-ANCHORED 08-23 → the DROPDOWN-CLICK copy (see M3's note).
+     [('            // the guard existed one function away.\n'
+       "            const isAlnum = c => !!c && ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'));\n"
+       "            const normU = s => (s || '').replace(/[\\\\s\\\\x1c-\\\\x1f\\\\x85\\\\ufeff]+/g, ' ').trim();\n"
+       '            const isUpsell = (raw) => {\n',
+       '            // the guard existed one function away.\n'
+       "            const isAlnum = c => !!c && ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'));\n"
+       "            const normU = s => (s || '').replace(/[\\\\s\\\\x1c-\\\\x1f\\\\x85\\\\ufeff]+/g, ' ').trim();\n"
+       '            const isUpsell = (raw) => { return true;\n')]),
     ("M7", "research.py", "over",
      "⛔ THE REVIEW'S SECOND SUGGESTION — a version-less row can no longer be "
      "picked, so a rename empties the menu",
@@ -129,9 +219,54 @@ MUTANTS = [
        "                const isFam = v !== null;")]),
     ("M8", "research.py", "over",
      "⛔ a bare verb test — a genuine row whose blurb says 'try' is binned",
-     [("                            const j = s.indexOf(n, end);\n"
-       "                            if (j !== -1 && j - end <= upsellWindow) return true;",
-       "                            return true;")]),
+     # RE-ANCHORED 08-23 → the PICKER copy (see M3's note).
+     [('            // a "character-for-character port" turned out not to be one.\n'
+       "            const normU = s => (s || '').replace(/[\\\\s\\\\x1c-\\\\x1f\\\\x85\\\\ufeff]+/g, ' ').trim();\n"
+       '            const isUpsell = (raw) => {\n'
+       '                const s = normU(raw).toLowerCase(), n = normU(fam).toLowerCase();\n'
+       '                if (!s || !n) return false;\n'
+       '                // ⛔ NO "FAMILY NAMED FIRST" EXEMPTION, and this comment used to\n'
+       '                // describe one that is not here. It was tried and REVERTED\n'
+       '                // 2026-08-14 because it re-opened the blocking finding: driven\n'
+       '                // through this very JS, a menu whose top row read\n'
+       '                // "Opus 5 · Upgrade to Opus Max for more usage" was clicked and\n'
+       '                // returned as a confirmed pick. So a genuine row whose blurb\n'
+       '                // happens to read verb-then-family IS dropped here, on purpose.\n'
+       '                // See models.is_upsell for the full account.\n'
+       '                for (const rawVerb of (verbs || [])) {\n'
+       '                    const verb = String(rawVerb).toLowerCase();\n'
+       '                    if (!verb) continue;\n'
+       '                    let i = s.indexOf(verb);\n'
+       '                    while (i !== -1) {\n'
+       '                        const end = i + verb.length;\n'
+       '                        const leftOk = i === 0 || !isAlnum(s[i - 1]);\n'
+       '                        const rightOk = end >= s.length || !isAlnum(s[end]);\n'
+       '                        if (leftOk && rightOk) {\n'
+       '                            const j = s.indexOf(n, end);\n'
+       '                            if (j !== -1 && j - end <= upsellWindow) return true;\n',
+       '            // a "character-for-character port" turned out not to be one.\n'
+       "            const normU = s => (s || '').replace(/[\\\\s\\\\x1c-\\\\x1f\\\\x85\\\\ufeff]+/g, ' ').trim();\n"
+       '            const isUpsell = (raw) => {\n'
+       '                const s = normU(raw).toLowerCase(), n = normU(fam).toLowerCase();\n'
+       '                if (!s || !n) return false;\n'
+       '                // ⛔ NO "FAMILY NAMED FIRST" EXEMPTION, and this comment used to\n'
+       '                // describe one that is not here. It was tried and REVERTED\n'
+       '                // 2026-08-14 because it re-opened the blocking finding: driven\n'
+       '                // through this very JS, a menu whose top row read\n'
+       '                // "Opus 5 · Upgrade to Opus Max for more usage" was clicked and\n'
+       '                // returned as a confirmed pick. So a genuine row whose blurb\n'
+       '                // happens to read verb-then-family IS dropped here, on purpose.\n'
+       '                // See models.is_upsell for the full account.\n'
+       '                for (const rawVerb of (verbs || [])) {\n'
+       '                    const verb = String(rawVerb).toLowerCase();\n'
+       '                    if (!verb) continue;\n'
+       '                    let i = s.indexOf(verb);\n'
+       '                    while (i !== -1) {\n'
+       '                        const end = i + verb.length;\n'
+       '                        const leftOk = i === 0 || !isAlnum(s[i - 1]);\n'
+       '                        const rightOk = end >= s.length || !isAlnum(s[end]);\n'
+       '                        if (leftOk && rightOk) {\n'
+       '                            return true;\n')]),
     ("M9", "research.py", "under",
      "the verb list is never passed, so the browser excludes nothing",
      [('                          "verbs": list(UPSELL_VERBS), "upsellWindow": UPSELL_WINDOW}',
@@ -164,7 +299,10 @@ MUTANTS = [
      [('        "upgrade_verbs": UPSELL_VERBS,', '        "upgrade_verbs": ["upgrade"],')]),
     ("M16", "models.py", "under",
      "whitespace is no longer collapsed, so a row split across lines escapes",
-     [('    t = " ".join((text or "").split()).lower()', '    t = (text or "").lower()')]),
+     # RE-ANCHORED 08-23: the collapse moved into `_collapse_ws`, which is now
+     # shared with the JS port — so the mutant has to remove BOTH calls.
+     [('    t = _collapse_ws(text).lower()\n    n = _collapse_ws(noun).lower()',
+       '    t = (text or \"\").lower()\n    n = (noun or \"\").lower()')]),
 
     # ═══════════ finding 3 — a refusal must not lower needsRestart ══════════
     ("S1", "research.py", "under",
@@ -177,7 +315,11 @@ MUTANTS = [
        '                        "reason": "a research run is in progress"})')]),
     ("S3", "research.py", "under",
      "the not-the-owner restart refusal replaces — a sharer erases the owner's flag",
-     [('                        "reason": "not the device owner"}, merge=True)',
+     # RE-ANCHORED 08-23: the same refusal line now exists on the update button
+     # too, so the one-liner matched twice. Pinned to the RESTART branch.
+     [('                        "state": "failed", "current": _sr_version(),\n'
+       '                        "reason": "not the device owner"}, merge=True)',
+       '                        "state": "failed", "current": _sr_version(),\n'
        '                        "reason": "not the device owner"})')]),
     ("S4", "research.py", "under",
      "the no-identity restart refusal replaces",

@@ -45,23 +45,17 @@ def _sweep():
 # detection resolved them. ⛔ Which is the lesson for this list: an entry here
 # says "this mutant measures nothing", and two of the original seventeen were
 # saying it about the TOOL rather than about the mutant.
-KNOWN_STALE = {
-    ("free_family_fallback_0814_mutants.py", "C3"),
-    ("free_family_fallback_0814_mutants.py", "C6"),
-    ("free_family_fallback_0814_mutants.py", "C7"),
-    ("free_family_fallback_0814_mutants.py", "M2"),
-    ("review_blockers_0813_mutants.py", "R1"),
-    ("review_blockers_0813_mutants.py", "R7"),
-    ("review_blockers_0813_mutants.py", "M3"),
-    ("review_blockers_0813_mutants.py", "M4"),
-    ("review_blockers_0813_mutants.py", "M5"),
-    ("review_blockers_0813_mutants.py", "M6"),
-    ("review_blockers_0813_mutants.py", "M8"),
-    ("review_blockers_0813_mutants.py", "M16"),
-    ("review_blockers_0813_mutants.py", "S3"),
-    ("review_wave2_0813_mutants.py", "T3"),
-    ("review_wave2_0813_mutants.py", "F5"),
-}
+# ✅ EMPTIED 2026-08-23. All fifteen re-anchored, and three of them were more
+# than drift: the Claude upsell filter now exists in FOUR byte-identical copies
+# (the picker, the probe, the dropdown click, and the Gemini ranker wave 6
+# ported it to), so five one-line anchors matched 2-3x. Those mutants are now
+# spread deliberately ACROSS the copies — the suite only ever exercised one, and
+# a copy nothing measures will show up as a SURVIVOR instead of as silence.
+#
+# ⛔ The list stays here, empty. Deleting it would delete the ratchet: the two
+# assertions below are what make a NEW stale anchor fail immediately and a FIXED
+# one fail until it is taken off the list. Neither may pass unnoticed.
+KNOWN_STALE: "set[tuple[str, str]]" = set()
 
 
 def test_the_sweep_can_actually_see_the_harnesses():

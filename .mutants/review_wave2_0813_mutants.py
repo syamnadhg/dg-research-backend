@@ -99,7 +99,12 @@ MUTANTS = [
     ("T3", "research.py", "under",
      "the log fires but drops the reason, so a spent budget and a blocked "
      "prompt read identically",
-     [('                f"{_gemini_empty_reason(j)}", "WARN")',
+     # RE-ANCHORED 08-23: the summary path grew the same log line, so the
+     # one-liner matched twice. Pinned to the TITLE-REFRESH call by its own
+     # preceding line.
+     [('            log(f"[title-refresh] Gemini {GEMINI_TEXT} returned no text — "\n'
+       '                f"{_gemini_empty_reason(j)}", "WARN")',
+       '            log(f"[title-refresh] Gemini {GEMINI_TEXT} returned no text — "\n'
        '                f"(no text)", "WARN")')]),
     ("T4", "research.py", "over",
      "⛔ the empty-200 log fires on EVERY call, including every success — the "
@@ -405,12 +410,17 @@ MUTANTS = [
     ("F5", "research.py", "under",
      "the JS collapse reverts to its own `\\s`, so the shipped picker and the "
      "mirror disagree again on what counts as whitespace",
-     [("            const normU = s => (s || '').replace(/[\\\\s\\\\x1c-\\\\x1f\\\\x85\\\\ufeff]+/g, ' ').trim();\n"
-       "            const isUpsell = (raw) => {\n"
-       "                const s = normU(raw).toLowerCase(), n = normU(fam).toLowerCase();",
+     # ⛔ RE-ANCHORED 08-23: this collapse now exists FOUR times — the Claude
+     # picker, probe and dropdown, plus the Gemini ranker wave 6 ported it to.
+     # Pinned to the PICKER by its own comment line.
+     [('            // a "character-for-character port" turned out not to be one.\n'
+       "            const normU = s => (s || '').replace(/[\\\\s\\\\x1c-\\\\x1f\\\\x85\\\\ufeff]+/g, ' ').trim();\n"
+       '            const isUpsell = (raw) => {\n'
+       '                const s = normU(raw).toLowerCase(), n = normU(fam).toLowerCase();\n',
+       '            // a "character-for-character port" turned out not to be one.\n'
        "            const normU = s => (s || '').replace(/\\\\s+/g, ' ').trim();\n"
-       "            const isUpsell = (raw) => {\n"
-       "                const s = normU(raw).toLowerCase(), n = normU(fam).toLowerCase();")]),
+       '            const isUpsell = (raw) => {\n'
+       '                const s = normU(raw).toLowerCase(), n = normU(fam).toLowerCase();\n')]),
     ("F6", "research.py", "under",
      "⭐ the activity probe goes back to ONE attempt — a mid-run worker that "
      "blocks its loop for a moment is killed, which this repo's own 420s "

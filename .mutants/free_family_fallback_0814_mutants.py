@@ -174,8 +174,10 @@ MUTANTS = [
     ("C3", "research.py", "under",
      "the ladder's outcome probe asks about the policy family, so it answers "
      "'unknown' every pass and the CUA validator it exists to skip runs anyway",
-     [('                _CLAUDE_MODE_STATE_JS, _p2_active_family("claude") or "opus") or {}',
-       '                _CLAUDE_MODE_STATE_JS, p2_family("claude") or "opus") or {}')]),
+     # ⛔ RE-ANCHORED 08-23: the probe's arguments moved into a dict literal on
+     # their own line, so the old one-line call no longer exists.
+     [('                "fam": _p2_active_family("claude") or "opus",',
+       '                "fam": p2_labels("claude").get("family") or "opus",')]),
     ("C4", "research.py", "under",
      "⛔ the step-back pin is read from the primary family's slot again — a "
      "version learned on one family, hunted for on the other",
@@ -191,13 +193,17 @@ MUTANTS = [
      "⛔⛔ the validate CUA mission freezes to the policy family again — its "
      "'only touch the model if it is not <fam>' clause then fires on the "
      "CORRECT model and sends the agent back into the chip menu",
-     [('        "claude": p2_claude_validate_directive(_p2_active_family("claude")),',
-       '        "claude": p2_claude_validate_directive(),')]),
+     # RE-ANCHORED 08-23: the call gained `effort_ok=`, so it wraps two lines.
+     [('        "claude": p2_claude_validate_directive(_p2_active_family("claude"),\n'
+       '                                               effort_ok=_claude_effort_ok),',
+       '        "claude": p2_claude_validate_directive(effort_ok=_claude_effort_ok),')]),
     ("C7", "research.py", "under",
      "the validate SYSTEM prompt freezes while its user message does not — one "
      "CUA call holding two instructions that disagree about the model",
-     [('        "claude": claude_validate_setup_prompt(_p2_active_family("claude")),',
-       '        "claude": claude_validate_setup_prompt(),')]),
+     # RE-ANCHORED 08-23: same shape as C6.
+     [('        "claude": claude_validate_setup_prompt(_p2_active_family("claude"),\n'
+       '                                               effort_ok=_claude_effort_ok),',
+       '        "claude": claude_validate_setup_prompt(effort_ok=_claude_effort_ok),')]),
     ("C8", "research.py", "under",
      "the retry's CUA setup mission freezes, so the pass that follows a proved "
      "plan limit is sent hunting for the excluded family again",
@@ -242,19 +248,19 @@ MUTANTS = [
     ("M2", "models.py", "under",
      "⛔ the validate directive ignores the family it is handed — the mission "
      "that runs after a SUCCESSFUL setup is the one that undoes it",
+     # ⛔ RE-ANCHORED 08-23: an `effort_ok` branch was inserted between the
+     # assignments and the return, so the tail of the old anchor no longer
+     # follows its head. Stops at `swapped`, which is still what carries the
+     # family into BOTH returns.
      [('    fam = (str(family) or primary).capitalize()\n'
        '    effort = str(pol.get("effort", "max")).capitalize()\n'
        '    tool = str(pol.get("tool", "research")).capitalize()\n'
        '    swapped = "" if fam.lower() == primary.lower() else \\\n'
-       '        f"{free_family_note(primary.capitalize(), fam)} "\n'
-       '    return (\n'
-       '        f"{swapped}Verify Claude is on {fam}',
+       '        f"{free_family_note(primary.capitalize(), fam)} "\n',
        '    fam = primary.capitalize()\n'
        '    effort = str(pol.get("effort", "max")).capitalize()\n'
        '    tool = str(pol.get("tool", "research")).capitalize()\n'
-       '    swapped = ""\n'
-       '    return (\n'
-       '        f"{swapped}Verify Claude is on {fam}')]),
+       '    swapped = ""\n')]),
     ("M3", "models.py", "over",
      "⛔ the switched-family sentence is added on the PRO render too, telling a "
      "paid account its plan excludes the model it is running",
