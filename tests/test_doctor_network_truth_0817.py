@@ -160,10 +160,28 @@ def test_a_genuine_revoke_still_says_re_pair():
     assert "--pair" in revoked
 
 
-def test_the_two_branches_cannot_both_fire():
+def test_the_branches_cannot_both_fire():
+    """⛔ WAS "the TWO branches" — 2026-08-22, wave 5 added a third, for an
+    install that cannot import its own code. What has to hold is unchanged and
+    is not the COUNT: they are one `elif` chain, so exactly one can run, and the
+    revoked branch stays last because it is the `else`.
+
+    The count is pinned to the reasons `init_firebase` can actually set, so a
+    fourth classification with no branch here — which would fall into `else` and
+    tell the person to re-pair — fails this instead of shipping."""
     block = _doctor_firestore_block()
-    assert block.count("elif _firebase_down_reason") == 1
+    reasons = set(re.findall(r'_firebase_down_reason = "([a-z_]+)"',
+                             inspect.getsource(research.init_firebase)))
+    # `revoked` is the trailing `else`, which is why it has no `elif` of its own.
+    named = {r for r in reasons if f'== "{r}"' in block} | {"revoked"}
+    assert named >= reasons, (
+        f"init_firebase sets {sorted(reasons)} and the doctor names "
+        f"{sorted(named)}; anything it does not name falls into the else, which "
+        f"tells the person to re-pair")
     assert block.index(_NET_HEAD) < block.index(_REV_HEAD)
+    assert block.count("if _firebase_down_reason") == block.count(
+        "elif _firebase_down_reason"), (
+        "a bare `if` here would let two branches fire for one reason")
 
 
 def test_the_patchright_failure_stops_asking_the_reader_a_question():

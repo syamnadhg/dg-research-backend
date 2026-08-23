@@ -347,7 +347,16 @@ def test_init_no_longer_asserts_transience_it_has_not_earned():
         "the revoked-vs-transient classification routes ALL recovery; rewording "
         "the sentence must not take the classification with it"
     )
-    assert src.count('_firebase_down_reason = "transient"') == 2, (
-        "one for the import path, one for the network path — a third would be a "
-        "new caller nobody has judged"
+    # ⛔ WAS 2, NOW 1 — 2026-08-22, wave 5. The import path used to set
+    # "transient" as well, under the comment "import hiccup — let reconnect
+    # retry", and a missing package is not a hiccup: it sent a broken install
+    # into a ladder that could not succeed and a doctor branch that blamed the
+    # network. It sets "broken_install" now, so exactly ONE caller in this
+    # function claims transience — the network one. A second would be a new
+    # caller nobody has judged.
+    assert src.count('_firebase_down_reason = "transient"') == 1, (
+        "only the network path may claim transience"
+    )
+    assert src.count('_firebase_down_reason = "broken_install"') == 1, (
+        "the import path must classify itself, not borrow the network's word"
     )

@@ -310,9 +310,16 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
        "                        60 * max(1, _quiet.seen(\"aegis-pulse\") // 5))\n"
        "                    if _QUEUE_STATE.get(\"running\"):")],
      [T_NOISE]),
+    # ⛔ F20d RE-ANCHORED 2026-08-22. Its anchor was a bare
+    # `if _QUEUE_STATE.get("running"):` at one indent, and wave 5's broken-install
+    # stand-down added a second line identical to it — so the anchor matched twice
+    # and measured nothing. Widened with the `await asyncio.sleep(60)` above it,
+    # the same prefix F20c already uses; the premise is unchanged.
     ("F20d", "under", "a pipeline run resets the cadence, so every long run is "
      "followed by another minutely burst",
-     [("                    if _QUEUE_STATE.get(\"running\"):",
+     [("                    await asyncio.sleep(60)\n"
+       "                    if _QUEUE_STATE.get(\"running\"):",
+       "                    await asyncio.sleep(60)\n"
        "                    if _QUEUE_STATE.get(\"running\") and _quiet.consider(\n"
        "                            \"aegis-pulse\", \"running\") and True:")],
      [T_NOISE]),

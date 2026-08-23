@@ -4458,6 +4458,16 @@ _firebase_db = None     # Firestore client (module-level, init once)
 #                 _firebase_reconnect_loop retries init_firebase on a tight backoff.
 #   "revoked"   → refresh token rejected (Reset Pair Code / keystore wiped).
 #                 _revoked_recovery_loop owns recovery (customToken relink).
+#   "broken_install" → this build cannot import its own code. ⛔⛔ IT USED TO SAY
+#                 "transient" here, with the comment "import hiccup — let
+#                 reconnect retry", and a missing file is not a hiccup: the
+#                 ladder then ran 5→10→30s for as long as the machine was on,
+#                 saying "could not reach Google — retrying" about a network
+#                 that was fine. Worse, `--doctor` reads this field, so the one
+#                 command a stuck person is told to run answered "Cannot reach
+#                 firestore.googleapis.com" and then probed the network, found
+#                 it healthy, and handed over NO action at all.
+#                 `_firebase_reconnect_loop` stands down and says the remedy.
 _firebase_down_reason = None
 _fb_uid = None          # Per-run: user ID for Firestore path
 _fb_research_id = None  # Per-run: research ID for Firestore path
@@ -5630,8 +5640,15 @@ def init_firebase():
     try:
         from auth import v2_flow, keystore as _ks
     except ImportError as e:
-        log(f"Firestore init: auth/ package import failed: {e}", "ERROR")
-        _firebase_down_reason = "transient"  # import hiccup — let reconnect retry
+        # ⛔⛔ THIS IS NOT A HICCUP. The line it replaces classified a missing
+        # first-party package as "transient" and let the reconnect ladder retry
+        # it forever, which cannot put a file back. Every consumer of that field
+        # then answered the wrong question: the ladder blamed the network, and
+        # the doctor blamed the network and then reported the network healthy.
+        log(f"Firestore init: this build cannot import its own auth package "
+            f"({type(e).__name__}: {e}) — the install on this computer is "
+            f"incomplete, and retrying cannot complete it.", "ERROR")
+        _firebase_down_reason = "broken_install"
         return False
     install_uuid = _ks.install_uuid()
     if _ks.try_recover(install_uuid) is None:
@@ -6799,6 +6816,19 @@ FIRESTORE_OUTAGE_SPEAKS_AFTER_S = 60.0
 FIRESTORE_OUTAGE_REPEAT_S = 300.0
 FIRESTORE_HOST = "firestore.googleapis.com"
 
+# How often a stood-down backend re-checks whether its own install came back.
+#
+# ⚠ THE ONE HONEST TENSION IN THIS FIX. "Terminal" is the right word for what a
+# person is told — retrying cannot put a missing file back, and saying otherwise
+# is what made the old behaviour a lie. But a backend has two ways to acquire
+# the file WITHOUT anyone touching it: the person runs the repair command, and
+# an `--update` that was mid-flight when this process looked finishes replacing
+# site-packages. Both deserve to heal on their own, and ten minutes is slow
+# enough that nobody reads it as a retry ladder and fast enough that a repair
+# does not need a restart on top of it. The message says so out loud rather than
+# leaving a re-check nobody was told about.
+FIRESTORE_BROKEN_INSTALL_RECHECK_S = 600.0
+
 # Epoch seconds when this process last had no Firestore client, or None while
 # healthy. Written at the two places the client can go away and cleared at the
 # one place it comes back, so every reader agrees on how long it has been out.
@@ -6896,6 +6926,38 @@ def _firestore_outage_notice(*, down_for, attempts, last_spoken_ago,
     ]
 
 
+def _broken_install_notice(remedy=None,
+                           recheck_s=FIRESTORE_BROKEN_INSTALL_RECHECK_S) -> "list[str]":
+    """What to say when this build cannot import its own code.
+
+    ⛔⛔ WHAT IT REPLACES: "could not reach Google — retrying", once every thirty
+    seconds, for as long as the machine stayed on. Every word of that was wrong.
+    The network was fine, Google was fine, the pairing was fine, and the retry
+    could never succeed — a package that is not on disk does not arrive because
+    something asked for it again.
+
+    ⭐ So this names the fault, names the command that repairs it, and says what
+    happens after they run it, because the third of those is what decides whether
+    they also have to know about restarting a backend.
+
+    A LIST because `log()` is one print per call: a multi-line string leaves
+    every line after the first with no timestamp and no level.
+    """
+    remedy = remedy or _remedy_reinstall()
+    minutes = max(1, int(float(recheck_s) // 60))
+    return [
+        "[install] This backend cannot import part of itself, so it cannot "
+        "reach the web app at all. Your network is fine and your pairing is "
+        "fine — the install on this computer is incomplete.",
+        f"[install] Repair it with:  {remedy}",
+        f"[install] Retrying cannot fix this, so this backend has stopped "
+        f"trying. It re-checks every {minutes} minute"
+        f"{'' if minutes == 1 else 's'}, so once you have run that it comes "
+        f"back on its own — you do not have to restart anything.",
+        f"[install] {_doctor_share_logs_line()}",
+    ]
+
+
 async def _firebase_reconnect_loop():
     """Self-heal a DROPPED Firestore client after a transient network/DNS blip
     — the autopilot fix for the 2026-05-31 incident where a `getaddrinfo`
@@ -6939,6 +7001,11 @@ async def _firebase_reconnect_loop():
     # old retry line read the same at attempt 4 and attempt 4,921.
     attempts = 0
     spoke_at = None
+    # A broken install is said ONCE and re-checked slowly. Two clocks because
+    # they answer different questions: whether the person has already been told,
+    # and when this process last looked to see if the file came back.
+    broken_spoken_at = None
+    broken_last_try = 0.0
     # After a reconnect, re-bind listeners via a clean respawn — deferred while a
     # run is active so we never os._exit a live browser (a local /api/runs submit
     # can start one even with Firestore down). (#718)
@@ -7015,6 +7082,39 @@ async def _firebase_reconnect_loop():
                 # Genuine revoke — _revoked_recovery_loop owns this. Stay idle
                 # (but keep ticking liveness) so recovery isn't double-driven.
                 idx = 0
+                await asyncio.sleep(5)
+                continue
+            if _firebase_down_reason == "broken_install":
+                # ⛔⛔ STAND DOWN, AND SAY WHY ONCE. This is the branch the whole
+                # fix exists for: below it is a ladder that says "could not reach
+                # Google — retrying" every thirty seconds, and against a missing
+                # package every word of that is false and every attempt is
+                # certain to fail. Said once rather than on a repeat timer,
+                # because unlike an outage this does not clear on its own.
+                idx = 0
+                attempts = 0
+                if broken_spoken_at is None:
+                    for _line in _broken_install_notice():
+                        log(_line, "ERROR")
+                    broken_spoken_at = time.time()
+                if time.time() - broken_last_try < FIRESTORE_BROKEN_INSTALL_RECHECK_S:
+                    await asyncio.sleep(5)
+                    continue
+                broken_last_try = time.time()
+                if await asyncio.to_thread(init_firebase):
+                    # ⭐ Say that it is fixed. The alarm above is the last word
+                    # this log has on the subject otherwise, and a person who
+                    # repaired it would have no way to tell from here.
+                    log("[install] The missing package is back — this computer is "
+                        "online in the web app again. Nothing to do.", "INFO")
+                    broken_spoken_at = None
+                    # Same deferral as a reconnect: the rebind is harmless
+                    # mid-run, the respawn is not, and a local /api/runs submit
+                    # can start a run with no Firestore at all.
+                    if _QUEUE_STATE.get("running"):
+                        pending_respawn = True
+                    else:
+                        await _recover_after_reconnect("the install was repaired")
                 await asyncio.sleep(5)
                 continue
             # Down + transient → rebuild the client. Live refresh in a thread so
@@ -71483,6 +71583,18 @@ def run_doctor():
         _fb_ok = init_firebase()
     if _fb_ok:
         _ok("Firestore client", "user-mode (refresh-token credentials)")
+    elif _firebase_down_reason == "broken_install":
+        # ⛔⛔ THIS BRANCH DID NOT EXIST, and its absence made the doctor lie the
+        # same way the reconnect ladder did. A machine whose `auth/` package will
+        # not import classified as "transient", so this command answered "Cannot
+        # reach firestore.googleapis.com — the network, not your pairing", ran
+        # the host probes, found every one of them healthy, and printed "The
+        # network path is fine" with an EMPTY action list. A diagnosis, a
+        # contradiction of the diagnosis, and nothing to do.
+        _fail("This install is incomplete",
+              "part of the backend is missing — the network and the pairing "
+              "are both fine")
+        manual_actions.append(_remedy_reinstall())
     elif _firebase_down_reason == "transient":
         # ⛔⛔ 2026-08-17 — THIS BRANCH DID NOT EXIST, and its absence is what
         # sent a real new owner in a circle. Their machine could not resolve
