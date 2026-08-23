@@ -64126,6 +64126,17 @@ async def run_server(port=8000):
             log(f"[build] {_build}")
     except Exception:
         pass
+    # ⛔⛔ THE SEARCH PATH, ONCE PER BOOT, and it had never been written down
+    # anywhere. Every subprocess this worker starts inherits it, the supervisor
+    # bakes it tool-homes-first on purpose, and until now a support bundle from a
+    # machine where the wrong `ffmpeg` won contained nothing that could show it.
+    # Next to `[build]` because they answer the same kind of question: what is
+    # this worker actually running.
+    try:
+        for _pl in _search_path_report():
+            log(_pl)
+    except Exception:
+        pass
     # The six-line route table that used to print here moved to `--help`'s
     # "Local API" section (`_LOCAL_API_ROUTES`). It was a REFERENCE pushed
     # through the timestamped logger — `[HH:MM:SS] [INFO]   GET /api/runs …` —
@@ -67882,6 +67893,12 @@ def _arm_supervisor_macos() -> "tuple[bool, int | None, str, int]":
     script_path = _x(_launcher_path())
     env_file = _x(_SUPERVISOR_ENV_FILE_DEFAULT_PATH)
     supervisor_path = _x(_supervisor_path_value())
+    # ⛔ SAY WHAT IS BEING BAKED IN, at the one moment it is decided. This is
+    # EVERY supervised child's search path, the tool homes go first on purpose,
+    # and the only record of which value a machine actually got used to be the
+    # plist itself — which nothing collects.
+    log(f"[resurrect] baking search path into the LaunchAgent: "
+        f"{_supervisor_path_value()}")
     work_dir = _x(script_dir)
     out_log = _x(log_dir / 'supervisor.out.log')
     err_log = _x(log_dir / 'supervisor.err.log')
@@ -68155,6 +68172,10 @@ def _arm_supervisor_linux() -> "tuple[bool, int | None, str, int]":
     # PassEnvironment, which loses the race against the graphical session for the
     # same reason DISPLAY does (see below).
     env_lines = [f'Environment="PATH={_supervisor_path_value()}"']
+    # Same reason as the macOS plist: this is every supervised child's search
+    # path, and the unit file is not something a support bundle collects.
+    log(f"[resurrect] baking search path into the systemd unit: "
+        f"{_supervisor_path_value()}")
     if _shell_disp:
         env_lines.append(f'Environment="DISPLAY={_shell_disp}"')
     if _shell_wayland:
@@ -71805,6 +71826,46 @@ def run_doctor():
             manual_actions.append(_remedy_resurrect())
     print()
 
+    # ── [3b] Search path ──
+    #
+    # ⛔⛔ THIS COMMAND ONLY EVER LOOKED AT DISPLAY. The supervisor bakes a search
+    # path with the tool homes FIRST — a stated trade, and it stands — which
+    # means anything dropped in a user-writable directory shadows the OS copy for
+    # every supervised child. Nothing logged the baked value and nothing here
+    # asked about it, so a shadowed audio binary presented as a phase-3 failure
+    # that happened ONLY under the supervisor and was undiagnosable from a
+    # support bundle.
+    #
+    # ⭐⭐ AND ASKING `shutil.which` FROM HERE IS THE WRONG QUESTION. This command
+    # runs in a login shell, whose path is not the one a supervised child gets.
+    # The two answers are compared below, because a tool that resolves
+    # differently in each IS the "works in my terminal, fails as a service"
+    # report, already localized.
+    print(f"  {_c(_BOLD, 'Search path')}")
+    print(f"  {_rule(max_width=58)}")
+    # ⭐⭐ EVERY DECISION IS IN `_search_path_findings`, and this only renders
+    # them. `run_doctor` cannot be executed in a test — it opens a Firestore
+    # client, imports patchright and spawns a 60-second Chromium probe — so a
+    # section written inline here can only ever be pinned by looking at its
+    # source. Mutation showed exactly what that is worth: five separate mutants
+    # gutted the branches and every source pin still passed, because the strings
+    # they looked for survived the gutting.
+    _spf = _search_path_findings(
+        shell_path=os.environ.get("PATH", ""),
+        supervisor_path=_installed_supervisor_path(),
+        would_bake=_supervisor_path_value(),
+        platform=plat)
+    for _lvl, _label, _detail in _spf["rows"]:
+        if _lvl == "ok":
+            _ok(_label, _detail)
+        elif _lvl == "warn":
+            _warn(_label, _detail)
+        else:
+            _note = f"     {_label}" + (f"  {_detail}" if _detail else "")
+            print(f"  {_c(_DIM, _note)}")
+    manual_actions.extend(_spf["actions"])
+    print()
+
     # ── [4] Process tree + port ──
     print(f"  {_c(_BOLD, 'Process tree')}")
     print(f"  {_rule(max_width=58)}")
@@ -73340,6 +73401,170 @@ def _supervisor_path_value() -> str:
         seen.add(d)
         parts.append(d)
     return os.pathsep.join(parts)
+
+
+# The binaries this product resolves BY NAME rather than by absolute path, so
+# these are exactly the ones a search-path ordering can decide. Read off the
+# `shutil.which("…")` call sites; a test holds the two lists together.
+_PATH_SENSITIVE_TOOLS = ("ffmpeg", "ffprobe", "uv", "pipx")
+
+
+def _which_all(tool: str, path: str) -> "list[str]":
+    """Every directory on `path` that provides `tool`, in resolution order.
+
+    ⭐ `shutil.which` answers only the FIRST, which is what runs — and the
+    diagnosis a support bundle needs is the rest of the list, because a second
+    copy further along is the difference between "not installed" and "the wrong
+    one wins". Deliberately not `shutil.which(mode=…)` in a loop: that cannot
+    report the losers at all.
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+    for d in (path or "").split(os.pathsep):
+        # ⛔ An empty entry means the CURRENT DIRECTORY to the shell, and this
+        # report must not say a tool was found because the person happened to be
+        # standing next to a file with that name.
+        if not d:
+            continue
+        cand = os.path.join(d, tool)
+        for c in ((cand, cand + ".exe", cand + ".cmd", cand + ".bat")
+                  if sys.platform == "win32" else (cand,)):
+            # ⛔ NO try/except HERE, and it is not an oversight. `os.path.isfile`
+            # and `os.access` both absorb OSError and ValueError internally and
+            # answer False — including for a path with an embedded null. A guard
+            # around them could not fire, which mutation proved by surviving one
+            # written to test it.
+            if os.path.isfile(c) and os.access(c, os.X_OK) and c not in seen:
+                seen.add(c)
+                found.append(c)
+                break
+    return found
+
+
+def _installed_supervisor_path() -> str:
+    """The search path the INSTALLED supervisor entry really exports, or "".
+
+    ⛔⛔ NOT `_supervisor_path_value()`, and the difference is the whole point.
+    That function is what THIS build would write. The entry sitting on disk may
+    have been written by an older one — the value was a literal
+    `/usr/local/bin:/usr/bin:/bin` until 2026-08, with no `/opt/homebrew/bin` in
+    it — and until someone re-runs `--resurrect`, every supervised child is
+    still using the old one. Reading the file is the only way to know.
+
+    "" when nothing is installed, when the file cannot be parsed, or on Windows,
+    where the Scheduled Task bakes no path at all and the child inherits.
+    """
+    plat = _supervisor_platform()
+    try:
+        if plat == "Darwin":
+            if not _SUPERVISOR_PLIST_PATH.exists():
+                return ""
+            import plistlib
+            with open(_SUPERVISOR_PLIST_PATH, "rb") as fh:
+                data = plistlib.load(fh)
+            return str((data.get("EnvironmentVariables") or {}).get("PATH") or "")
+        if plat == "Linux":
+            if not _SUPERVISOR_UNIT_PATH.exists():
+                return ""
+            text = _SUPERVISOR_UNIT_PATH.read_text(encoding="utf-8", errors="replace")
+            m = re.search(r'^Environment="PATH=([^"]*)"', text, re.MULTILINE)
+            return m.group(1) if m else ""
+    except Exception:
+        return ""
+    return ""
+
+
+def _search_path_report(env_path=None, would_bake=None,
+                        tools=_PATH_SENSITIVE_TOOLS) -> "list[str]":
+    """What this process will actually find, as lines for the log.
+
+    ⛔⛔ NOTHING LOGGED THIS. The supervisor bakes a search path with the tool
+    homes FIRST — a deliberate trade, written down in `_supervisor_path_value`,
+    which accepts that anything dropped in a user-writable directory shadows the
+    OS copy for every supervised child. The trade stands. What did not exist was
+    any way to SEE it after the fact: the baked value appeared in no log, and the
+    doctor only ever looked at DISPLAY. So a shadowed audio binary presented as a
+    phase-3 failure that happened only under the supervisor and could not be
+    diagnosed from a support bundle at all.
+
+    A LIST because `log()` is one print per call.
+    """
+    env_path = os.environ.get("PATH", "") if env_path is None else env_path
+    would_bake = _supervisor_path_value() if would_bake is None else would_bake
+    lines = [f"[path] this process searches: {env_path or '(nothing — PATH is empty)'}"]
+    for tool in tools:
+        hits = _which_all(tool, env_path)
+        if not hits:
+            lines.append(f"[path] {tool}: not on this path")
+        elif len(hits) == 1:
+            lines.append(f"[path] {tool}: {hits[0]}")
+        else:
+            # ⭐ THE LINE THAT DIAGNOSES THE FAILURE. Naming the loser is what
+            # turns "the audio step behaves differently under the supervisor"
+            # into one readable fact.
+            lines.append(f"[path] {tool}: {hits[0]}  (shadows {', '.join(hits[1:])})")
+    if env_path != would_bake:
+        lines.append(f"[path] a supervisor installed by this build would use: {would_bake}")
+    return lines
+
+
+def _search_path_findings(*, shell_path, supervisor_path, would_bake,
+                          platform="", tools=_PATH_SENSITIVE_TOOLS) -> dict:
+    """Everything the doctor's search-path section decides, as data.
+
+    Returns `{"rows": [(level, label, detail), …], "actions": [str, …]}` with
+    level in `ok` / `warn` / `note`. `run_doctor` only renders it.
+
+    ⭐⭐ SEPARATE BECAUSE `run_doctor` CANNOT BE RUN. It opens a Firestore
+    client, imports patchright and spawns a 60-second Chromium probe, so a
+    section written inline can only be pinned by reading its source — and
+    mutation showed what that is worth: five mutants gutted the branches one by
+    one, and every source pin still passed, because the strings they searched for
+    survived the gutting.
+
+    ⭐⭐ AND THE COMPARISON IS THE POINT. `--doctor` runs in a login shell whose
+    path is NOT the one a supervised child gets. Resolving a tool here and
+    reporting it answers a different question from the one being asked; a tool
+    that resolves differently in each is the "works in my terminal, fails as a
+    service" report, already localized to one binary.
+    """
+    rows: list[tuple[str, str, str]] = []
+    actions: list[str] = []
+    if supervisor_path and supervisor_path != would_bake:
+        # The entry on disk predates this build. Every supervised child keeps
+        # using the old value until it is rewritten — which is one command.
+        rows.append(("warn", "Supervisor search path is out of date",
+                     "written by an older build — supervised runs use the old one"))
+        actions.append(_remedy_resurrect())
+    elif supervisor_path:
+        rows.append(("ok", "Supervisor search path", "matches this build"))
+    elif platform == "Windows":
+        rows.append(("note", "The Scheduled Task bakes no search path — the "
+                             "child inherits yours.", ""))
+    else:
+        rows.append(("note", "No supervisor installed, so nothing is baked. "
+                             "Showing this shell.", ""))
+    effective = supervisor_path or shell_path
+    for tool in tools:
+        hits = _which_all(tool, effective)
+        shell_hits = _which_all(tool, shell_path)
+        if not hits:
+            # ⚠ A NOTE, NOT A FAULT. Every tool here is optional — tinytag is the
+            # primary duration probe, the mp3 transcode falls back to the
+            # original file, and uv/pipx matter only during an update. Counting
+            # these would put an issue on the summary line of a healthy machine.
+            rows.append(("note", f"{tool}: not on this path "
+                                 f"(optional — only used when it is)", ""))
+        elif len(hits) > 1:
+            rows.append(("warn", f"{tool} is shadowed",
+                         f"{hits[0]} wins over {', '.join(hits[1:])}"))
+        elif supervisor_path and shell_hits and hits[0] != shell_hits[0]:
+            rows.append(("warn", f"{tool} differs under the supervisor",
+                         f"background runs use {hits[0]}, this terminal uses "
+                         f"{shell_hits[0]}"))
+        else:
+            rows.append(("ok", tool, hits[0]))
+    return {"rows": rows, "actions": actions}
 
 
 def _lifecycle_env(**extra: "str | None") -> dict:
