@@ -64,6 +64,50 @@ class TestTrailingPunctuationOnASourceUrl:
         assert offenders == [], offenders
 
 
+class TestTheReportCaptureDoesNotTruncateFirst:
+    """⛔⛔ THE TRIMMER COULD NOT REACH THE REPORT-EXTRACTED HALF.
+
+    `_FIND_BARE_URL_RE` excluded `)` from the match, so a parenthesised path was
+    truncated at CAPTURE time — before any trimming ran, and no later trimming
+    can undo it. So the fix for the rstrip defect covered the panel-supplied
+    urls and left the report ones exactly as broken. Found by the completeness
+    critic, after the first fix was already committed.
+
+    The layering is now capture-greedily, trim-by-balance.
+    """
+
+    def test_a_parenthesised_path_survives_the_capture(self):
+        found = research._FIND_BARE_URL_RE.findall(
+            "See https://en.wikipedia.org/wiki/Mercury_(planet) for more.")
+        assert found == ["https://en.wikipedia.org/wiki/Mercury_(planet)"]
+
+    def test_and_the_trimmer_keeps_it_whole(self):
+        found = [research._find_trim_trailing_punct(u)
+                 for u in research._FIND_BARE_URL_RE.findall(
+                     "See https://en.wikipedia.org/wiki/Mercury_(planet) for more.")]
+        assert found == ["https://en.wikipedia.org/wiki/Mercury_(planet)"]
+
+    def test_a_sentence_bracket_is_still_dropped(self):
+        # The reason `)` was excluded in the first place — handled one layer
+        # down now, by balance rather than by exclusion.
+        found = [research._find_trim_trailing_punct(u)
+                 for u in research._FIND_BARE_URL_RE.findall(
+                     "(see https://example.com/a) and more")]
+        assert found == ["https://example.com/a"]
+
+    def test_the_other_delimiters_are_untouched(self):
+        # Guard against the guard: widening the class must not have emptied it.
+        for probe, want in [
+            ('<a href="https://example.com/c">x', ["https://example.com/c"]),
+            ("[https://example.com/d]", ["https://example.com/d"]),
+            ("https://example.com/e https://example.com/f",
+             ["https://example.com/e", "https://example.com/f"]),
+        ]:
+            got = [research._find_trim_trailing_punct(u)
+                   for u in research._FIND_BARE_URL_RE.findall(probe)]
+            assert got == want, (probe, got)
+
+
 class TestTheDoctorHandsOverOnEveryPath:
     """⛔ The hand-over line claimed to close every doctor run, and one early
     return skipped it — the unsupported-platform branch, whose reader is the
@@ -80,12 +124,21 @@ class TestTheDoctorHandsOverOnEveryPath:
     def test_and_it_is_the_only_early_return(self):
         # ⭐ Guard against the guard: a SECOND early return added later would
         # reintroduce the same gap somewhere this test does not look.
-        src = _source_of(research.run_doctor)
-        body = src[src.index("):") + 2:]
-        returns = re.findall(r"^\s{4}return\b", body, re.M)
-        assert len(returns) <= 1, (
-            f"run_doctor grew {len(returns)} top-level returns; each one needs "
-            f"the hand-over, and only the first is covered here"
+        # ⛔⛔ THIS GUARD COULD NOT FIRE, and cross-verification caught it. The
+        # regex was `^\s{4}return\b` — a return indented exactly four spaces,
+        # i.e. an UNCONDITIONAL one at the top of the body. Every real early
+        # return sits inside an `if` at eight, INCLUDING the one this test was
+        # written about: measured against the live file it counted zero, so
+        # `<= 1` passed vacuously and a second early return would have too.
+        # Parsed rather than pattern-matched now, so indentation cannot hide one.
+        import ast, textwrap
+        tree = ast.parse(textwrap.dedent(_source_of(research.run_doctor)))
+        fn = tree.body[0]
+        returns = [n for n in ast.walk(fn) if isinstance(n, ast.Return)]
+        assert len(returns) == 1, (
+            f"run_doctor has {len(returns)} returns; every one needs the "
+            f"hand-over before it, and only the unsupported-platform branch is "
+            f"covered by the test above"
         )
 
 

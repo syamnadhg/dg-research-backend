@@ -7908,6 +7908,17 @@ def find_local_support_bundle(raw_code, root=None) -> dict:
     alone — which is the answer a person actually needs when they read a code
     back over a call and it does not resolve.
 
+    ⛔⛔ AND THE SCRIPT THAT CALLS THIS IS NOT IN THE WHEEL. `scripts/
+    find_support_bundle.py` is on `DROP_FROM_WHEEL`, for a reason that holds:
+    `import research` reaches the launcher SHIM in a wheel build, not this
+    module. Every sender is a wheel install, so the convenience wrapper cannot
+    run on the machine that has the bundle — only in a source tree. Said out
+    loud 2026-08-24 because the paragraph above reads as a promise to the person
+    on the call, and what actually serves them is the PATH `--send-logs` prints
+    at the end of a successful send. This function is reachable from a source
+    tree and from tests; treat the script as a support-side tool, not a
+    user-facing recovery route, until it is made shim-safe.
+
     Returns `{"typed", "code", "remapped", "path", "sizeBytes", "searched",
     "available"}`. `code` is "" when the input is not a code at all even after
     normalising, and `path` is "" when nothing on this machine carries that code.
@@ -57312,7 +57323,14 @@ _FIND_MD_LINK_RE = re.compile(r'\[([^\]]{1,200})\]\(([^)]+)\)')
 #: Bare URLs in a report. Hoisted out of `save_meta` (which harvests the same
 #: markdown for `sourceUrls`) so one definition serves both — the two disagreeing
 #: about what a URL is would put a source in the list and not in the findings.
-_FIND_BARE_URL_RE = re.compile(r'https?://[^\s\)\]\"\'>]+')
+# ⛔ `)` IS CAPTURED, THEN TRIMMED BY BALANCE — not excluded here. Excluding it
+# truncated a legitimately parenthesised path at CAPTURE time
+# (`.../wiki/Mercury_(planet)` -> `.../wiki/Mercury_(planet`), which no later
+# trimming can undo, so the report-extracted half of the fix for that defect
+# could not reach it. Capturing greedily and letting
+# `_find_trim_trailing_punct` drop only an UNBALANCED bracket handles both
+# shapes: "(see https://x.com/a)" still yields `https://x.com/a`.
+_FIND_BARE_URL_RE = re.compile(r'https?://[^\s\]\"\'>]+')
 #: Query keys dropped before comparing two URLs. Ported from the JS `cleanUrl`
 #: the panel scrape already applies, so a panel row and the report's own citation
 #: of the same page compare EQUAL — otherwise `?utm_source=chatgpt.com` makes one
