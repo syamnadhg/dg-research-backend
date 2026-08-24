@@ -4531,9 +4531,20 @@ _fb_listener = None     # Per-run: command listener unsubscribe handle
 # with `watch.py:572 push → self._snapshot_callback(...)` as the last frame,
 # plus three more consumer deaths raised inside the library itself.
 #
+# ⛔⛔ AND THAT FIRST ONE IS LIBRARY-SIDE TOO — corrected 2026-08-24 by
+# cross-verification. It reads as ours because our callback is named in the
+# frame, but the raise is `self._snapshot_callback` being NONE at the moment it
+# is called: `Watch.close()` had already unset it, and calling None raises
+# inside watch.py before any wrapper of ours is entered. So all FOUR logged
+# deaths are raised before our code runs, and `_guard_snapshot` fixes none of
+# them. The original note said the guard covered "the case", which would send
+# the next reader to the wrong half.
+#
 # So there are two halves and they fix different failures:
-#   `_guard_snapshot` stops OUR bug from ending a listener. It cannot help with
-#       the three deaths raised before our callback is reached.
+#   `_guard_snapshot` stops OUR bug from ending a listener. It is a guard
+#       against a fault that has NOT been observed — worth keeping, because the
+#       cost of that fault is a person's Stop never arriving, but it is not what
+#       any of the four logged deaths needed and must not be credited with them.
 #   `_watch_is_dead` + the re-arm in `_firebase_reconnect_loop` recover a watch
 #       that stopped for ANY reason, which is the only cover the library-side
 #       deaths have. Recovery used to require `_firebase_db` to have gone None
@@ -31160,8 +31171,22 @@ def merge_claude_sources(snap: dict, urls=None, hosts=None,
     # Hosts are recorded as a COUNT, never expanded into urls. A row with no
     # anchor gives a domain, not a link; synthesising one would put a fabricated
     # url in front of the user.
+    #
+    # ⛔⛔ RENAMED 2026-08-24, AND THE OLD NAME WAS A TYPE COLLISION. This wrote
+    # an INT to `source_hosts` — the same key the ChatGPT inline-chip path
+    # carries a LIST of hostnames under, which `_merge_host_chips` iterates. The
+    # two never met, so nothing broke; routing a Claude snapshot through that
+    # helper would have iterated an integer. Two paths, one key, opposite types
+    # and opposite decisions about the same question (ChatGPT DOES synthesise
+    # `https://<host>/`, with its own reasoning). Named for what it holds.
+    #
+    # ⭐ AND IT NOW HAS A READER. Found by cross-verification as a value written
+    # every run and consumed by nothing: the completion emit and meta.json
+    # forwarded neither, and the next poll cycle overwrote the snapshot. A count
+    # nobody reads cannot tell anyone that the panel held eight domains and no
+    # links — which is the one thing it exists to say.
     if hosts:
-        out["source_hosts"] = len({h for h in hosts if h})
+        out["source_host_count"] = len({h for h in hosts if h})
     return out
 
 
@@ -57681,6 +57706,13 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
                 "findings": _findings if _findings else (sections[:3] if sections else []),
                 "searches": int(_snap.get("searches", 0) or existing.get("searches", 0) or 0),
                 "observedSources": int(_snap.get("observed_sources", 0) or existing.get("observedSources", 0) or 0),
+                # ⭐ The panel rows that named a DOMAIN and carried no link.
+                # Nonzero beside `sources: 0` is the difference between "Claude
+                # cited nothing" and "Claude cited eight sites we could not turn
+                # into urls" — which is exactly the distinction the zero-source
+                # investigation needed and did not have.
+                "sourceHostCount": int(_snap.get("source_host_count", 0)
+                                       or existing.get("sourceHostCount", 0) or 0),
                 "progressHistory": _down_hist,
             }
         # #722 Bug A: carry the per-agent terminal status (written by
@@ -72870,6 +72902,23 @@ def cmd_send_logs(assume_yes: bool = False, email: "str | None" = None,
             # names — the route therefore mints its own and ignores ours.
             # Printing the local one would send a person into a support
             # conversation quoting a code that indexes nothing.
+            #
+            # ⛔⛔ AND THE ARCHIVE ON DISK HAS TO FOLLOW. Until 2026-08-24 only
+            # the printed code changed: the zip stayed named under the LOCAL
+            # code we had just discarded, so `find_support_bundle.py <CODE>`
+            # — the script whose whole job is to locate it, run with the code
+            # support just quoted back — found nothing on the machine that sent
+            # it. Found by cross-verification. Renaming is best effort: the
+            # bundle already reached the server, so a failure here must not turn
+            # a successful send into an error.
+            if _server_code and _server_code != code:
+                _renamed = dest.with_name(f"support-{_server_code}{BUNDLE_SUFFIX}")
+                try:
+                    dest.replace(_renamed)
+                    dest = _renamed
+                except Exception as _exc:
+                    log(f"[send-logs] sent as {_server_code} but could not rename "
+                        f"the local archive from {dest.name}: {_exc}", "WARN")
             code = _server_code
 
     print()

@@ -467,6 +467,15 @@ UPSELL_CORPUS = [
     ("Opus 5 — try Opus with extended thinking", True),
     ("Opus 5 — get the most out of Opus", True),
     ("Opus 5 · Upgrade to Opus Max for more usage", True),
+    # ⚠⚠ ASTRAL CHARACTERS, added 2026-08-24 by cross-verification. The 24-char
+    # window is counted in CODE POINTS here and in UTF-16 CODE UNITS in every JS
+    # port, so each emoji between the verb and the noun costs 1 on this side and
+    # 2 on that one. Below the divergence threshold both agree, and that is the
+    # point of pinning it: the anti-drift test drives BOTH implementations over
+    # this row, so the day the counting rule changes on either side it says so
+    # rather than the browser quietly reading a sales row as a model.
+    ("Upgrade \U0001F680\U0001F680 to Opus", True),
+    ("Upgrade to Opus \U0001F680\U0001F680 5", True),
     # ⭐ Whitespace parity with the JS port, both directions. Python's
     # `str.isspace()` and JS's `\s` disagree on these two classes, and the window
     # is counted in CHARACTERS — so before `_collapse_ws` existed, each of these

@@ -1157,7 +1157,22 @@ def is_upsell(text: str, noun: str, window: int = UPSELL_WINDOW) -> bool:
 
     ⚠ Other residuals: a verb-less upsell ("Opus 5 · Max plan only") is not
     caught. Nothing in that text distinguishes it from a row, so the verb is
-    the honest boundary."""
+    the honest boundary.
+
+    ⚠⚠ AND THE WINDOW IS MEASURED IN A UNIT THE JS PORTS DO NOT SHARE. Python
+    counts CODE POINTS (`str.find`, `len`); every JS port counts UTF-16 CODE
+    UNITS (`indexOf`, `.length`), so each astral character between the verb and
+    the noun — an emoji in a styled sales row — costs 1 here and 2 there. At 24
+    characters it takes twelve of them to change an answer, which is why the
+    shared corpus agrees today and why this is recorded rather than "fixed":
+    making Python count UTF-16 units would be a real change to the executable
+    spec for a shape neither vendor has been observed to ship, and making JS
+    count code points needs a per-character walk on every menu row.
+
+    ⭐ WHAT IS DONE ABOUT IT: the corpus in `tests/` now carries an astral case,
+    so the day the two implementations disagree the anti-drift test says so
+    instead of the browser quietly reading a sales row as a model. Found by
+    cross-verification 2026-08-24."""
     t = _collapse_ws(text).lower()
     n = _collapse_ws(noun).lower()
     if not t or not n:

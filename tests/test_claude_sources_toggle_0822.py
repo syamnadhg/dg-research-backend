@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import inspect
+import io
 
 from _domshim import el, js_constant, run_js
 
@@ -445,7 +446,22 @@ class TestMergeIntoSnapshot:
         snap = {"source_urls": []}
         research.merge_claude_sources(snap, [], ["a.com", "b.com", "a.com"])
         assert snap["source_urls"] == []
-        assert snap["source_hosts"] == 2
+        # ⛔ RENAMED 2026-08-24 by cross-verification. This wrote an INT to
+        # `source_hosts` — the same key the ChatGPT inline-chip path carries a
+        # LIST of hostnames under, which `_merge_host_chips` iterates. The two
+        # never met, so nothing broke; routing a Claude snapshot through that
+        # helper would have iterated an integer.
+        assert snap["source_host_count"] == 2
+        assert "source_hosts" not in snap, (
+            "the int is back under the key the chip path uses for a list")
+
+    def test_the_host_count_reaches_a_reader(self):
+        """⭐ It was written every run and consumed by nothing — the completion
+        emit and meta.json forwarded neither, and the next poll cycle overwrote
+        the snapshot. A count nobody reads cannot say that the panel held eight
+        domains and no links, which is the one thing it exists to say."""
+        src = io.open(research.__file__, encoding="utf-8").read()
+        assert '"sourceHostCount": int(_snap.get("source_host_count", 0)' in src
 
     def test_the_url_list_is_capped(self):
         snap = {"source_urls": []}
