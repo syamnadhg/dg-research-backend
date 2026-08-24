@@ -57295,6 +57295,25 @@ _FIND_BARE_URL_RE = re.compile(r'https?://[^\s\)\]\"\'>]+')
 _FIND_TRACKING_PREFIX = "utm_"
 
 
+
+def _find_trim_trailing_punct(u: str) -> str:
+    """Drop sentence punctuation a report glued to the end of a url.
+
+    ⛔ A CLOSING BRACKET IS NOT ALWAYS PUNCTUATION. `rstrip('.,;:)')` was
+    applied to EVERY candidate, including the panel's own already-clean urls,
+    and it truncates a legitimately parenthesised path —
+    `…/wiki/Mercury_(planet)` became `…/wiki/Mercury_(planet`. The lookup still
+    matched (a prefix of the text) so a finding was still emitted, carrying a
+    url that 404s: worse than dropping it, because it looks right.
+
+    ⭐ So a `)` is only punctuation when it has no `(` to close. Everything else
+    in the set is unambiguous and is stripped as before.
+    """
+    u = (u or "").rstrip('.,;:')
+    while u.endswith(')') and u.count('(') < u.count(')'):
+        u = u[:-1].rstrip('.,;:')
+    return u
+
 def _find_normalize_url(u: str) -> str:
     """A comparison key for two URLs that mean the same page.
 
@@ -57416,7 +57435,7 @@ def _extract_findings(md: str, source_urls: list) -> list:
     _by_key: dict = {}
     _order: list = []
     for u in list(source_urls or []) + _report:
-        u = (u or "").strip().rstrip('.,;:)')
+        u = _find_trim_trailing_punct((u or "").strip())
         if not u.lower().startswith(("http://", "https://")):
             continue
         if _find_is_platform_host(u):
@@ -71844,6 +71863,15 @@ def run_doctor():
         _fail(f"Platform unsupported ({sys.platform})", "Only Windows / macOS / Linux desktop.")
         print()
         print(f"  {_c(_DIM, 'Cannot continue diagnostics on this platform.')}")
+        # ⛔ THE HAND-OVER RUNS HERE TOO. This is the ONE early return in
+        # run_doctor, and it skipped the closing line that tells a person what
+        # to do next — so the reader who most needs it (nothing here can be
+        # diagnosed at all) reached the end of the page with no next step. The
+        # commit that added the hand-over said it "closes every doctor run";
+        # this branch is what made that untrue.
+        print()
+        print(f"  {_c(_DIM, _doctor_share_logs_line())}")
+        print()
         return
     _ok(f"Platform: {plat}")
 

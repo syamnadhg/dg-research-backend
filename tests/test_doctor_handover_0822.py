@@ -53,8 +53,31 @@ def test_the_doctor_ends_every_run_with_the_hand_over():
 
 def test_the_hand_over_is_printed_once_and_not_per_fault():
     """⛔ Two authors of one sentence is how `--resurrect` came to be prescribed
-    twice in a three-step list — the defect `_dedupe_actions` exists for."""
-    assert _doctor().count("_doctor_share_logs_line()") == 1
+    twice in a three-step list — the defect `_dedupe_actions` exists for.
+
+    ⭐ TWO SITES, NOT ONE, SINCE 2026-08-24 — and they cannot both run. Cross-
+    verification found the unsupported-platform branch RETURNING before the
+    closing line, so the one reader who can be told least else reached the end
+    of the page with no next step, under a commit that said the hand-over
+    "closes every doctor run". That branch is an early return, so a run reaches
+    exactly one of the two. The count is pinned at two rather than relaxed, so
+    a THIRD copy — the per-fault repetition this test exists to prevent —
+    still fails.
+    """
+    assert _doctor().count("_doctor_share_logs_line()") == 2
+
+
+def test_the_second_site_is_the_unsupported_branch_and_it_RETURNS():
+    """⭐ What makes two copies safe is that the first one exits. If that
+    `return` were ever dropped, the branch would fall through to the second and
+    print the hand-over twice on one page — the exact defect above."""
+    src = _doctor()
+    branch = src[src.index('if plat == "Unsupported"'):]
+    branch = branch[:branch.index('_ok(f"Platform:')]
+    assert "_doctor_share_logs_line()" in branch, (
+        "the unsupported-platform branch returns without the hand-over")
+    assert "\n        return" in branch, (
+        "the unsupported branch no longer returns, so both copies now print")
 
 
 def test_the_network_branch_no_longer_carries_its_own_copy():
@@ -72,8 +95,11 @@ def test_the_hand_over_comes_after_the_verdict_not_before_it():
     """It answers "what now", so it has to follow both the healthy verdict and
     the issue count — not sit in the middle of the checks."""
     src = _doctor()
-    assert src.index(CALL) > src.index("'✓  Healthy.'")
-    assert src.index(CALL) > src.index("Manual steps still required")
+    # ⭐ The LAST occurrence: the first belongs to the unsupported-platform
+    # early return, which never reaches a verdict at all.
+    end = src.rindex(CALL)
+    assert end > src.index("'✓  Healthy.'")
+    assert end > src.index("Manual steps still required")
 
 
 def test_a_healthy_machine_is_offered_it_too():
@@ -83,10 +109,10 @@ def test_a_healthy_machine_is_offered_it_too():
     outside the `else` that follows it."""
     src = _doctor()
     healthy = src.index("if issues_found == 0:")
-    assert src.index(CALL) > healthy
+    assert src.rindex(CALL) > healthy
     # …and not inside the else, which is where "only when something is wrong"
     # would put it.
-    else_block = src[src.index("        tm.tm_emit(tm.Ev.DOCTOR_RUN"):src.index(CALL)]
+    else_block = src[src.index("        tm.tm_emit(tm.Ev.DOCTOR_RUN"):src.rindex(CALL)]
     assert "_doctor_share_logs_line" not in else_block
 
 
