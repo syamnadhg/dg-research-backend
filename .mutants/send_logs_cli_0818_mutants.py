@@ -235,17 +235,18 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_TRIAGE]),
     ("D4", "under", "the command is dispatched after the doctor, so the person "
      "who just read the hand-over line and typed it lands on a doctor run",
-     [('    if args.send_logs:\n        raise SystemExit(cmd_send_logs(assume_yes=bool(args.assume_yes),\n                                      email=args.contact_email,\n                                      runs=args.send_logs_runs))\n\n    if args.doctor:\n        run_doctor()\n        return',
-       '    if args.doctor:\n        run_doctor()\n        return\n\n    if args.send_logs:\n        raise SystemExit(cmd_send_logs(assume_yes=bool(args.assume_yes),\n                                      email=args.contact_email,\n                                      runs=args.send_logs_runs))')],
+     [('    if args.send_logs:\n        raise SystemExit(cmd_send_logs(assume_yes=bool(args.assume_yes),\n                                      select=bool(args.send_logs_select),\n                                      email=args.contact_email,\n                                      runs=args.send_logs_runs))\n\n    if args.doctor:\n        run_doctor()\n        return',
+       '    if args.doctor:\n        run_doctor()\n        return\n\n    if args.send_logs:\n        raise SystemExit(cmd_send_logs(assume_yes=bool(args.assume_yes),\n                                      select=bool(args.send_logs_select),\n                                      email=args.contact_email,\n                                      runs=args.send_logs_runs))')],
      [T_CLI]),
     ("D5", "under", "⛔ the terminal's --runs never reaches the builder, so the "
      "flag is accepted and ignored",
-     [('        summary = _build_log_bundle(dest, support_code=code, max_runs=n_runs)',
-       '        summary = _build_log_bundle(dest, support_code=code)')],
+     [('        summary = _build_log_bundle(dest, support_code=code, max_runs=n_runs,\n                                    only_runs=only_runs)',
+       '        summary = _build_log_bundle(dest, support_code=code,\n                                    only_runs=only_runs)')],
      [T_CLI]),
     ("D6", "under", "the terminal's consent screen describes a number it will not "
      "use",
-     [('    for line in _send_logs_consent_lines(n_runs):', '    for line in _send_logs_consent_lines():')],
+     [('    for line in _send_logs_consent_lines(\n            len(only_runs) if only_runs is not None else n_runs,\n            chosen_exactly=only_runs is not None):',
+       '    for line in _send_logs_consent_lines():')],
      [T_CLI]),
 ]
 

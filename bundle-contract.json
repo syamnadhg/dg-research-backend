@@ -1,11 +1,12 @@
 {
-  "version": 1,
+  "version": 2,
   "maxRuns": 30,
   "maxAgeDays": 30,
   "minRuns": 1,
   "actions": {
     "full": "send-logs",
-    "limited": "send-logs-limited"
+    "limited": "send-logs-limited",
+    "selected": "send-logs-selected"
   },
-  "_why": "Committed byte-identical to BOTH repos. The maximum slider position sends the FULL action, which every build understands and which means 'this machine's own cap' — so if the two repos disagree about that number, the slider's default position states one thing and the machine does another, with nothing failing anywhere. Each repo pins its own constant against its own copy; a cross-repo test compares the two files."
+  "_why": "Committed byte-identical to BOTH repos, and pinned by SHA-256 in BOTH test suites — the cross-repo comparison resolves the sibling repo as a directory and SKIPS in CI, so a content digest on each side is what makes a one-sided edit fail in that repo's own workflow. Changing anything here is a four-file edit: both copies and both digests. v2 (2026-08-24) adds the `selected` action: the ACTION NAME is the entire version-skew mechanism, because a build that predates a control deletes the command it does not recognise and matches no dispatch branch — so the failure is 'nothing left the machine' rather than 'thirty runs left against a request for two'. Over-collection is the harm here, so the failure has to point that way. Reusing `send-logs-limited` with a new field would have failed the OTHER way: the older handler reads only `runs` and would ignore an unknown selection, collecting the newest N. `maxRuns` is also the maximum slider position the app can send, so if the two repos disagree about it a control states one thing and the machine does another with nothing failing anywhere."
 }

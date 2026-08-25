@@ -547,11 +547,75 @@ def _captured_meta(monkeypatch, *args, **kwargs):
 
 def test_a_queued_run_records_who_fired_it(monkeypatch):
     """⭐ THE CONSUMER, fed exactly what the dequeue site feeds it (research.py
-    passes `uid=job.get("uid")` and `research_id=` by keyword)."""
+    passes `uid=job.get("uid")`, `research_id=` and `_submitted_by=` by keyword).
+
+    ⛔⛔ REWRITTEN 2026-08-24, AND THE OLD VERSION WAS THE WHOLE PROBLEM. It
+    passed `uid=` alone and asserted the run was attributed — which is exactly
+    what the code did, and exactly what made the stamp untrustworthy: `uid` is
+    a claim the Firestore rules never check. The test agreed with the code and
+    both were wrong about what the value MEANT. Attribution now needs the
+    rules-pinned writer to agree with the tree."""
     meta = _captured_meta(monkeypatch, topic="t",
-                          research_id="chat_1755500000000_31", uid="UID_ALICE")
+                          research_id="chat_1755500000000_31", uid="UID_ALICE",
+                          _submitted_by="UID_ALICE")
     assert meta["submitterUid"] == "UID_ALICE"
     assert meta["submitterSource"] == "queue"
+
+
+def test_a_tree_uid_alone_attributes_nobody(monkeypatch):
+    """⛔ THE FIELD THE RULES DO NOT GUARD CANNOT GRANT A PERMISSION ON ITS OWN.
+
+    This is the pre-Wave-8 shape and it is EVERY run on disk today: a start doc
+    (or a build) that carried `uid` and no pinned writer. It still runs; it is
+    simply attributable to nobody, so no app-side selection can name it."""
+    meta = _captured_meta(monkeypatch, topic="t",
+                          research_id="chat_1755500000000_35", uid="UID_ALICE")
+    assert meta["submitterUid"] is None
+    assert meta["submitterSource"] == "unclaimed"
+
+
+def test_two_identities_that_disagree_attribute_nobody(monkeypatch):
+    """⛔⛔ FAIL CLOSED. A writer naming somebody else's tree is the one shape the
+    rules PERMIT and nothing legitimate produces on a start doc. If this resolved
+    to either name, a sharer's two-run pick could collect the owner's machine."""
+    meta = _captured_meta(monkeypatch, topic="t",
+                          research_id="chat_1755500000000_36", uid="UID_ALICE",
+                          _submitted_by="UID_MALLORY")
+    assert meta["submitterUid"] is None
+    assert meta["submitterSource"] == "disputed"
+
+
+@pytest.mark.parametrize("tree,claim,expect", [
+    (None, None, (None, "local")),
+    ("", "", (None, "local")),
+    ("U1", "U1", ("U1", "queue")),
+    ("  U1  ", "U1", ("U1", "queue")),
+    ("U1", None, (None, "unclaimed")),
+    ("U1", "", (None, "unclaimed")),
+    (None, "U1", (None, "disputed")),
+    ("U1", "U2", (None, "disputed")),
+])
+def test_the_resolver_grants_only_on_agreement(tree, claim, expect):
+    """The whole policy as a truth table — pure, so the rule can be read in one
+    place instead of inferred from a capture."""
+    assert research._resolve_run_submitter(tree, claim) == expect
+
+
+def test_the_claim_never_reaches_the_pipeline(monkeypatch):
+    """⛔ `_submitted_by` is the WRAPPER's argument. Forwarding it into
+    `run_pipeline` would be a TypeError on every queued run — the signature has
+    no such parameter — so the pop is load-bearing, not tidiness."""
+    seen = {}
+
+    async def _fake(*a, **k):
+        seen["kwargs"] = dict(k)
+        return "done"
+
+    monkeypatch.setattr(research, "run_pipeline", _fake)
+    asyncio.run(research.run_pipeline_captured(
+        topic="t", uid="UID_ALICE", _submitted_by="UID_ALICE"))
+    assert "_submitted_by" not in seen["kwargs"]
+    assert seen["kwargs"].get("uid") == "UID_ALICE"
 
 
 def test_a_local_cli_run_records_no_submitter(monkeypatch):
@@ -573,32 +637,84 @@ def test_a_local_run_does_not_inherit_a_previous_runs_submitter(monkeypatch):
 
 
 def test_a_crash_retry_stays_attributed(monkeypatch):
-    """The auto-retry recurses through the wrapper forwarding `uid=`, so attempt
-    2 of a run must not silently become unattributed."""
+    """The auto-retry recurses through the wrapper, so attempt 2 of a run must
+    not silently become unattributed."""
     meta = _captured_meta(monkeypatch, topic="t",
                           research_id="chat_1755500000000_32", uid="UID_ALICE",
-                          _crash_retries=1)
+                          _submitted_by="UID_ALICE", _crash_retries=1)
     assert meta["attempt"] == 1
     assert meta["submitterUid"] == "UID_ALICE"
 
 
-def test_the_new_keys_do_not_leak_into_the_bundle_index(monkeypatch):
-    """⛔ ADDITIVE MEANS INVISIBLE. `_scan_run_folders` builds the bundle's
-    index.json from a fixed row shape; if the new keys reached it, every support
-    bundle's index would change shape in the same commit."""
+def test_the_retry_reads_the_claim_off_the_armed_sink(monkeypatch):
+    """⛔⛔ THE RETRY FIRES FROM INSIDE `run_pipeline`, WHERE THE CLAIM IS GONE —
+    the wrapper popped it. `_run_submitted_by()` is the only thing that still
+    holds it, and it works because the retry runs inside the outer `with`.
+
+    Drives the REAL helper against a REAL armed sink rather than asserting the
+    call site's source text: a source pin would pass against the comment."""
+    seen = {}
+
+    async def _fake(*a, **k):
+        seen["mid_run"] = research._run_submitted_by()
+        return "done"
+
+    monkeypatch.setattr(research, "run_pipeline", _fake)
+    asyncio.run(research.run_pipeline_captured(
+        topic="t", research_id="chat_1755500000000_37", uid="UID_ALICE",
+        _submitted_by="UID_ALICE"))
+    assert seen["mid_run"] == "UID_ALICE"
+    # …and it is not a global that survives the run.
+    assert research._run_submitted_by() is None
+
+
+def test_the_new_keys_do_not_leak_into_the_bundle_index(monkeypatch, tmp_path):
+    """⛔⛔ THE PIN MOVED FROM THE ROW TO THE ARCHIVE, ON PURPOSE.
+
+    It used to assert `_scan_run_folders` carried no submitter at all. Wave 8
+    needs it on the row — that is where the intersection reads it — so keeping
+    the old assertion would have meant a second meta read per folder for a
+    property nobody wanted. What actually mattered was never the row: it was
+    that a uid must not travel inside a support bundle. index.json is the thing
+    that ships, so index.json is where the pin belongs.
+
+    ⭐ Asserted against the REAL archive, not against `_INDEX_PRIVATE_KEYS`. A
+    constant can be correct while the comprehension that reads it is not."""
+    import zipfile
+
     _captured_meta(monkeypatch, topic="t",
-                   research_id="chat_1755500000000_33", uid="UID_ALICE")
+                   research_id="chat_1755500000000_33", uid="UID_ALICE",
+                   _submitted_by="UID_ALICE")
     rows = research._scan_run_folders()
     assert rows, "no run folder was scanned"
-    assert "submitterUid" not in rows[0]
-    assert "submitterSource" not in rows[0]
+    assert rows[0]["submitterUid"] == "UID_ALICE", "the row must carry it"
+    assert rows[0]["submitterSource"] == "queue"
+
+    dest = tmp_path / "b.zip"
+    research._build_log_bundle(dest, support_code="ABCD2345")
+    with zipfile.ZipFile(dest) as zf:
+        index = json.loads(zf.read("index.json").decode("utf-8"))
+    assert index, "the archive's index was empty — this proves nothing"
+    for entry in index:
+        assert "submitterUid" not in entry
+        assert "submitterSource" not in entry
+    assert "UID_ALICE" not in zf_index_text(dest), "a uid reached the archive index"
+
+
+def zf_index_text(dest) -> str:
+    """index.json as raw text — a key-name check would miss a uid smuggled in
+    as a VALUE under some other key."""
+    import zipfile
+    with zipfile.ZipFile(dest) as zf:
+        return zf.read("index.json").decode("utf-8")
 
 
 def test_a_status_patch_preserves_the_submitter(monkeypatch):
     """`_patch_run_log_status` is read-modify-write, so it must carry the key
     through rather than rewriting meta.json from a fresh dict."""
     _captured_meta(monkeypatch, topic="t",
-                   research_id="chat_1755500000000_34", uid="UID_ALICE")
+                   research_id="chat_1755500000000_34", uid="UID_ALICE",
+                   _submitted_by="UID_ALICE")
     folder = research._RUN_LOG_LAST_DIR
     assert folder is not None
     # Patches whatever `_RUN_LOG_LAST_DIR` points at — the shape the worker
@@ -611,6 +727,145 @@ def test_a_status_patch_preserves_the_submitter(monkeypatch):
 
 def test_the_wrapper_carries_the_crash_retry_count_as_the_attempt():
     assert research._run_pipeline_capture_key((), {"topic": "t", "_crash_retries": 2})[1] == 2
+
+
+# ── Wave 8 · the claim sites ───────────────────────────────────────────
+# ⛔ SOURCE PINS, and only because there is no other reach. `_job_worker` and the
+# idle rescan are closures inside `run_server`; there is no seam to call. Every
+# one below reads COMMENT-STRIPPED source, because the comments beside these
+# lines quote the very keyword being asserted.
+
+@pytest.mark.parametrize("data,expect", [
+    ({}, None),
+    ({"uid": "U1"}, None),
+    ({"submittedBy": "U1"}, None),
+    ({"uid": "U1", "submittedBy": "U1"}, None),
+    ({"uid": "U1", "submittedBy": " U1 "}, None),
+    ({"uid": "U1", "submittedBy": "U2"}, ("U1", "U2")),
+    ({"uid": " U1 ", "submittedBy": "U2"}, ("U1", "U2")),
+    (None, None),
+])
+def test_only_a_real_disagreement_is_a_conflict(data, expect):
+    """⛔ ABSENT IS NOT DISAGREEING. A legacy start doc names no writer, and
+    refusing it would refuse every run written by a build older than this one."""
+    assert research._start_doc_identity_conflict(data) == expect
+
+
+def test_a_legacy_meta_scans_as_unknown_not_as_queued(tmp_path, monkeypatch):
+    """⛔⛔ FOUND BY MUTATION. Every run folder on every machine today was written
+    by a build that had no submitter field at all, so `meta.get("submitterSource")`
+    is None for all of them. Defaulting that to "queue" — the one value that
+    grants attribution — would hand every historical run to whoever asked.
+
+    The uid is absent too, so the grant would resolve to None either way TODAY.
+    The pin is on the SOURCE because that is the field a later reader branches
+    on, and a wrong default here is a live grant the moment anything reads it."""
+    root = tmp_path / "runs"
+    folder = root / "chat_1755500000000_90_20260819T000000"
+    folder.mkdir(parents=True)
+    (folder / "meta.json").write_text(json.dumps({
+        "schema": 1, "status": "complete", "researchId": "chat_1755500000000_90",
+        "startedUtc": "2026-08-19T00:00:00Z", "build": "0.1.13",
+    }), encoding="utf-8")
+    rows = research._scan_run_folders(root=root)
+    assert len(rows) == 1
+    assert rows[0]["submitterUid"] is None
+    assert rows[0]["submitterSource"] == "unknown", (
+        "a meta with no source key must not read as a queued — i.e. attributable — run")
+
+
+def test_the_refusal_decides_and_says_why(caplog):
+    """The decision half, driven for real — including that a refusal is never
+    silent, because a queue doc that vanishes with no line is indistinguishable
+    from one that was never written."""
+    caplog.clear()
+    assert research._start_doc_identity_refused(
+        {"uid": "U1", "submittedBy": "U2", "researchId": "chat_1_1"},
+        "start-listener") is True
+    assert research._start_doc_identity_refused({"uid": "U1"}, "start-listener") is False
+    assert research._start_doc_identity_refused(
+        {"uid": "U1", "submittedBy": "U1"}, "start-listener") is False
+
+
+def test_the_refusal_names_neither_person_in_full(capsys):
+    """⛔ A uid is an account identifier and this line goes to backend.log, which
+    ships in every owner bundle. Both are truncated, and the label says which
+    claim site refused so two identical sentences cannot be confused."""
+    capsys.readouterr()
+    research._start_doc_identity_refused(
+        {"uid": "UID_ALICE_FULL", "submittedBy": "UID_MALLORY_FULL",
+         "researchId": "chat_1755500000000_9"}, "idle-rescan")
+    out = capsys.readouterr().out
+    assert "[idle-rescan]" in out
+    assert "UID_ALICE_FULL" not in out and "UID_MALLORY_FULL" not in out
+    assert "UID_ALIC" in out and "UID_MALL" in out
+
+
+def _refusal_branches(fn) -> list:
+    """Every `if _start_doc_identity_refused(...)` in `fn`, as AST If nodes.
+
+    ⛔⛔ AST, NOT A SUBSTRING COUNT, AND MUTATION IS WHY. The first version of
+    this test counted calls to the guard. A mutant that left the call in place
+    and neutered its branch (`if False:`) SURVIVED — the call was still there,
+    the count was still two, and nothing refused anything. A call is not a
+    branch, and only the tree can tell them apart."""
+    import ast as _ast
+    tree = _ast.parse(textwrap.dedent(inspect.getsource(fn)))
+    out = []
+    for node in _ast.walk(tree):
+        if not isinstance(node, _ast.If):
+            continue
+        test = node.test
+        if (isinstance(test, _ast.Call)
+                and isinstance(test.func, _ast.Name)
+                and test.func.id == "_start_doc_identity_refused"):
+            out.append(node)
+    return out
+
+
+@pytest.mark.parametrize("fn_name", ["start_firestore_start_listener", "run_server"])
+def test_both_claim_sites_refuse_the_same_divergence(fn_name):
+    """⭐⭐ ONE DEFINITION, TWO CALLERS. A refusal at the listener only is not a
+    refusal — the idle rescan sweeps up exactly the documents the listener
+    declined, so the run would start a minute later instead.
+
+    Asserts the guard is the CONDITION of a branch that abandons the document:
+    a bare call, or a branch that falls through, refuses nothing."""
+    import ast as _ast
+    branches = _refusal_branches(getattr(research, fn_name))
+    assert len(branches) == 1, f"{fn_name} must gate exactly one claim on the guard"
+    body = branches[0].body
+    assert any(isinstance(n, _ast.Continue) for n in body), (
+        f"{fn_name}'s refusal must abandon the document, not fall through")
+    assert any(isinstance(n, _ast.Try) for n in body), (
+        f"{fn_name}'s refusal must delete the queue doc, or it replays forever")
+
+
+def test_the_pinned_writer_reaches_the_job_at_every_claim_site():
+    """⛔ A CLAIM SITE THAT DROPS IT PRODUCES AN UNATTRIBUTED RUN, which looks
+    exactly like a legacy start doc — silent, and wrong in the safe direction,
+    which is precisely why nothing would ever report it."""
+    from conftest import code_only_deep
+    listener = code_only_deep(research.start_firestore_start_listener)
+    server = code_only_deep(research.run_server)
+    assert '"submitted_by": sb' in listener, "the start listener's enqueue"
+    assert '"submitted_by": str(d.get("submittedBy") or "").strip()' in server, \
+        "the idle rescan's enqueue"
+    assert '_submitted_by=job.get("submitted_by")' in server, "the dequeue site"
+
+
+def test_the_supervised_auto_resume_carries_it_too():
+    """The disk-resume path has no queue document left; the research doc it is
+    rehydrating from is the only writer still on record."""
+    from conftest import code_only_deep
+    src = code_only_deep(research._rehydrate_ongoing_for_tree)
+    assert '"submitted_by": str(' in src and 'data.get("submittedBy")' in src
+
+
+def test_the_crash_retry_forwards_the_claim():
+    from conftest import code_only_deep
+    src = code_only_deep(research.run_pipeline)
+    assert "_submitted_by=_run_submitted_by()" in src
 
 
 def test_the_wrappers_signature_cannot_drift_from_the_body():

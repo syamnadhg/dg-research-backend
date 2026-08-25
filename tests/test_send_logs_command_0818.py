@@ -160,22 +160,68 @@ def _cmd(**over):
 
 
 # ══ 1. the worker gate and the dispatch land together ══════════════════
-def test_send_logs_is_in_the_worker_skip_tuple():
-    """⛔ Without this, every non-1 worker races the build AND can tail-delete
-    the command doc into a stream-resync coalesce."""
+# Every send-logs action name, by CONSTANT. A literal here would go stale the
+# moment the contract file renames one and the test would still read as passing.
+_SEND_LOGS_ACTION_CONSTANTS = (
+    "SEND_LOGS_ACTION",
+    "SEND_LOGS_LIMITED_ACTION",
+    "SEND_LOGS_SELECTED_ACTION",
+)
+
+
+def _worker_skip_tuple() -> str:
     src = inspect.getsource(research._start_device_command_listener)
     m = re.search(r'elif action in \(([^)]*)\) and WORKER_ID != 1:', src, re.S)
     assert m, "the worker-1 gate moved — re-anchor this pin"
-    # Both action names, by constant. A literal here would go stale the moment
-    # the contract file renames one, and the test would still read as passing.
-    assert "SEND_LOGS_ACTION" in m.group(1), m.group(1)
-    assert "SEND_LOGS_LIMITED_ACTION" in m.group(1), m.group(1)
+    return m.group(1)
+
+
+def test_send_logs_is_in_the_worker_skip_tuple():
+    """⛔ Without this, every non-1 worker races the build AND can tail-delete
+    the command doc into a stream-resync coalesce.
+
+    ⛔⛔ AND THIS USED TO BE A CONTAINMENT CHECK ON TWO NAMES, which is a guard
+    that cannot notice the mistake it exists for. The mistake is one of OMISSION:
+    a new action added to the dispatch and forgotten here ships dead on every
+    multi-worker host with nothing failing anywhere — and a test that asks "are
+    these two present?" passes happily with a third one missing. It now walks the
+    action vocabulary, so adding a name to the contract and not to this tuple is
+    what goes red."""
+    tuple_src = _worker_skip_tuple()
+    for name in _SEND_LOGS_ACTION_CONSTANTS:
+        assert name in tuple_src, (
+            f"{name} is missing from the worker-1 skip tuple, so every non-primary "
+            f"worker DELETES that command before worker 1 can see it")
+
+
+def test_every_send_logs_action_constant_is_covered_by_that_check():
+    """⛔ The guard above is only as complete as its list. This is what makes a
+    FOURTH action name fail rather than quietly sit outside both."""
+    live = {n for n in dir(research)
+            if n.startswith("SEND_LOGS_") and n.endswith("_ACTION")}
+    assert live == set(_SEND_LOGS_ACTION_CONSTANTS), (
+        f"the action vocabulary changed: {sorted(live)}. Add the new name to "
+        f"_SEND_LOGS_ACTION_CONSTANTS, to the worker skip tuple and to the "
+        f"dispatch tuple — all three, or it ships dead.")
+
+
+def _dispatch_tuple() -> str:
+    src = inspect.getsource(research._start_device_command_listener)
+    m = re.search(r'if action in \(([^)]*?)\):\n\s+# App-driven support bundle',
+                  src, re.S)
+    assert m, "the send-logs dispatch branch moved — re-anchor this pin"
+    return m.group(1)
 
 
 def test_the_dispatch_branch_runs_on_worker_one_only():
+    tuple_src = _dispatch_tuple()
+    for name in _SEND_LOGS_ACTION_CONSTANTS:
+        assert name in tuple_src, (
+            f"{name} reaches no dispatch branch, so the command is deleted and "
+            f"the app reads the silence as a build too old to understand it")
     src = inspect.getsource(research._start_device_command_listener)
-    i = src.index("if action in (SEND_LOGS_ACTION, SEND_LOGS_LIMITED_ACTION):")
-    branch = src[i:i + 1600]
+    i = src.index("# App-driven support bundle")
+    branch = src[i:i + 1800]
     assert "if WORKER_ID == 1:" in branch
     assert "_handle_send_logs_command(" in branch
 
@@ -236,6 +282,7 @@ def test_a_device_read_failure_refuses_rather_than_proceeds(db, monkeypatch):
                         lambda dest, **k: {"path": dest, "sizeBytes": 1,
                                            "runCount": 0, "sessionCount": 0,
                                            "maxRunsApplied": 30,
+                                           "machineIncluded": True,
                                            "uncompressedBytes": 1,
                                            "droppedForSize": [],
                                            "sourcesRefused": []})
@@ -425,6 +472,7 @@ def test_a_second_request_inside_the_window_is_refused(db, monkeypatch, tmp_path
                         lambda dest, **k: {"path": dest, "sizeBytes": 100,
                                            "runCount": 1, "sessionCount": 0,
                                            "maxRunsApplied": 30,
+                                           "machineIncluded": True,
                                            "uncompressedBytes": 100,
                                            "droppedForSize": [],
                                            "sourcesRefused": []})
@@ -555,6 +603,7 @@ def test_the_row_walks_collecting_uploading_done(db, monkeypatch):
                         lambda dest, **k: {"path": dest, "sizeBytes": 712345,
                                            "runCount": 3, "sessionCount": 1,
                                            "maxRunsApplied": 30,
+                                           "machineIncluded": True,
                                            "uncompressedBytes": 9_000_000,
                                            "droppedForSize": [],
                                            "sourcesRefused": []})
@@ -576,6 +625,7 @@ def test_the_row_carries_an_expiry_and_a_build(db, monkeypatch):
                         lambda dest, **k: {"path": dest, "sizeBytes": 1,
                                            "runCount": 0, "sessionCount": 0,
                                            "maxRunsApplied": 30,
+                                           "machineIncluded": True,
                                            "uncompressedBytes": 1,
                                            "droppedForSize": [],
                                            "sourcesRefused": []})
@@ -599,6 +649,7 @@ def test_a_failed_status_write_does_not_abort_a_working_upload(db, monkeypatch):
                         lambda dest, **k: {"path": dest, "sizeBytes": 1,
                                            "runCount": 0, "sessionCount": 0,
                                            "maxRunsApplied": 30,
+                                           "machineIncluded": True,
                                            "uncompressedBytes": 1,
                                            "droppedForSize": [],
                                            "sourcesRefused": []})
@@ -737,7 +788,8 @@ def test_the_local_bundle_survives_a_failed_upload(db, monkeypatch):
         Pathdest.write_bytes(b"PK-bundle")
         built["path"] = Pathdest
         return {"path": Pathdest, "sizeBytes": 9, "runCount": 0,
-                "sessionCount": 0, "uncompressedBytes": 9,
+                "sessionCount": 0, "uncompressedBytes": 9, "maxRunsApplied": 30,
+                "machineIncluded": True,
                 "droppedForSize": [], "sourcesRefused": []}
 
     monkeypatch.setattr(research, "_build_log_bundle", _build)
@@ -791,6 +843,7 @@ class TestRunCount:
             seen.update(k)
             return {"path": dest, "sizeBytes": 1, "runCount": 2, "sessionCount": 0,
                     "maxRunsApplied": k.get("max_runs"), "uncompressedBytes": 1,
+                    "machineIncluded": k.get("include_machine", True),
                     "droppedForSize": [], "sourcesRefused": []}
 
         monkeypatch.setattr(research, "_build_log_bundle", _build)
@@ -813,6 +866,7 @@ class TestRunCount:
                             lambda dest, **k: {"path": dest, "sizeBytes": 1,
                                                "runCount": 2, "sessionCount": 0,
                                                "maxRunsApplied": 4,
+                                               "machineIncluded": True,
                                                "uncompressedBytes": 1,
                                                "droppedForSize": [],
                                                "sourcesRefused": []})
@@ -850,15 +904,17 @@ class TestRunCount:
         every non-primary worker — so on a multi-worker host worker 2 destroys
         the command before worker 1 sees it, and the feature ships dead with
         nothing failing anywhere."""
-        src = inspect.getsource(research._start_device_command_listener)
-        m = re.search(r"elif action in \(([^)]*)\) and WORKER_ID != 1:", src, re.S)
-        assert m, "the worker-1 gate moved"
-        assert "SEND_LOGS_LIMITED_ACTION" in m.group(1), m.group(1)
+        assert "SEND_LOGS_LIMITED_ACTION" in _worker_skip_tuple()
 
-    def test_both_actions_reach_the_handler_and_only_one_is_limited(self):
+    def test_each_action_reaches_the_handler_under_its_own_flag(self):
+        """⛔ Exactly one flag per action, and neither flag true for the full one.
+        Two flags true at once would be a selection carried on an action whose
+        older handler ignores it — the over-collection this vocabulary exists to
+        make unreachable."""
         src = inspect.getsource(research._start_device_command_listener)
-        assert "if action in (SEND_LOGS_ACTION, SEND_LOGS_LIMITED_ACTION):" in src
         assert "limited=(action == SEND_LOGS_LIMITED_ACTION)" in src
+        assert "selected=(action == SEND_LOGS_SELECTED_ACTION)" in src
+        assert research.SEND_LOGS_LIMITED_ACTION != research.SEND_LOGS_SELECTED_ACTION
 
     def test_the_two_repos_agree_on_the_cap_and_the_action_names(self):
         """⛔ The maximum slider position sends the FULL action, which means

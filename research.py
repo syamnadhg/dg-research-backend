@@ -2424,17 +2424,92 @@ class _CappedLogWriter:
         self._fh = None
 
 
+def _resolve_run_submitter(tree_uid, claimed_by) -> "tuple[str | None, str]":
+    """Who a run is ATTRIBUTABLE to, from the two identity fields a start doc carries.
+
+    ⛔⛔ 2026-08-24 — THIS USED TO READ THE WRONG FIELD, and the wrong one is the
+    only one the rules do not guard. A start document carries `uid` (the tree the
+    run executes in) and `submittedBy` (the writer). `firestore.rules` pins
+    `submittedBy == request.auth.uid` on the device queue and says nothing at all
+    about `uid` — so the value this stamped was a CLAIM by a device member, not a
+    verified identity. Wave 8 turns this stamp into a permission (whose bundle may
+    carry this run), and a permission may not rest on an unpinned field.
+
+    ⭐ SO IT IS AN AGREEMENT, NOT A PICK. Attribution is granted only when the
+    pinned writer and the executing tree are the same person. Everything else
+    resolves to None and says which kind of nothing it is:
+
+        local      no cloud identity at all — a `--resume` or topic run
+        unclaimed  a tree, but no pinned writer (a legacy start doc, or any
+                   build older than this one — every run on disk today)
+        disputed   both present and different, or a writer with no tree
+
+    ⛔ `disputed` is not a theoretical shape: the rules PERMIT it, and the
+    owner-control path writes exactly that divergence deliberately — on a
+    `cancel` doc, never a start. It fails closed here regardless.
+    """
+    tree = (str(tree_uid).strip() if tree_uid else "")
+    claim = (str(claimed_by).strip() if claimed_by else "")
+    if not tree and not claim:
+        return None, "local"
+    if claim and claim == tree:
+        return claim, "queue"
+    if not claim:
+        return None, "unclaimed"
+    return None, "disputed"
+
+
+def _start_doc_identity_conflict(data) -> "tuple[str, str] | None":
+    """(tree uid, pinned writer) when a queue START doc's two identities
+    disagree, else None.
+
+    ⭐⭐ ONE DEFINITION, TWO CLAIM SITES. The start listener is not the only
+    thing that claims a queue document — the idle rescan sweeps up the ones it
+    missed, which is precisely the path a doc the listener declined would take.
+    A refusal implemented at one claim site and not the other is not a refusal;
+    it is a delay.
+
+    ⛔ Absent is not disagreeing. A start doc that names no writer is a legacy
+    or pre-Wave-8 shape and must still run — it simply ends up attributable to
+    nobody, which `_resolve_run_submitter` calls `unclaimed`."""
+    uid = str((data or {}).get("uid") or "").strip()
+    claimed = str((data or {}).get("submittedBy") or "").strip()
+    if uid and claimed and uid != claimed:
+        return uid, claimed
+    return None
+
+
+def _start_doc_identity_refused(data, where: str) -> bool:
+    """True when this START doc must not be claimed. Logs the reason.
+
+    ⭐ THE DECISION AND ITS SENTENCE TOGETHER, because the two claim sites had
+    begun to carry a copy of each. A refusal whose message is written twice
+    drifts, and the drifted one is always the path nobody exercises."""
+    conflict = _start_doc_identity_conflict(data)
+    if conflict is None:
+        return False
+    log(f"[{where}] refusing start — identity fields disagree "
+        f"(uid={conflict[0][:8]}… submittedBy={conflict[1][:8]}…), "
+        f"rid={str((data or {}).get('researchId') or '')[:8]}…", "WARN")
+    return True
+
+
 class _RunLogSink:
     """One armed per-run log folder: `run.log` + `meta.json`, written live."""
 
     def __init__(self, folder, research_id=None, attempt=0, parent_research_id=None,
-                 started_utc=None, submitted_by=None):
+                 started_utc=None, submitted_by=None, claimed_by=None):
         self.dir = Path(folder)
         self.research_id = research_id
         self.attempt = int(attempt or 0)
         self.parent_research_id = parent_research_id
         self.started_utc = started_utc or _utc_iso()
         self.submitted_by = (str(submitted_by).strip() or None) if submitted_by else None
+        self.claimed_by = (str(claimed_by).strip() or None) if claimed_by else None
+        # Resolved ONCE, at arm time, from the pair — so a mid-run crash freezes
+        # the same verdict on disk that a clean exit would have written.
+        self.submitter_uid, self.submitter_source = _resolve_run_submitter(
+            self.submitted_by, self.claimed_by)
         self.started_mono = time.monotonic()
         self.counters = {"lines": 0, "warns": 0, "errors": 0, "eventsDropped": 0}
         self.events: "list[dict]" = []
@@ -2455,16 +2530,16 @@ class _RunLogSink:
             "build": _sr_version(),
             "platform": sys.platform,
             "startedUtc": self.started_utc,
-            # ⭐ WHO FIRED THIS RUN. Additive and advisory: it records what the
-            # queue document CLAIMED, which is what every existing consumer of
-            # submitter identity already trusts (`_set_run_submitter` picks the
-            # API key off the same value). `submitterSource` is what tells a
-            # later reader that a null is "nobody typed a uid" rather than
-            # "we lost it" — a local `--resume` or topic run has no cloud
-            # identity at all, and guessing the machine owner there would
-            # assert something the code does not know.
-            "submitterUid": self.submitted_by,
-            "submitterSource": "queue" if self.submitted_by else "local",
+            # ⭐ WHO FIRED THIS RUN — and, since Wave 8, whose support bundle
+            # may carry it. It is granted only when the rules-pinned writer and
+            # the executing tree agree; see `_resolve_run_submitter` for why the
+            # obvious single field is the wrong one. `submitterSource` is what
+            # tells a later reader which KIND of nothing a null is: a local run
+            # with no cloud identity, a start doc that named no writer, or two
+            # fields that disagreed. Guessing the machine owner for any of them
+            # would assert something the code does not know.
+            "submitterUid": self.submitter_uid,
+            "submitterSource": self.submitter_source,
             "counters": dict(self.counters),
             "events": len(self.events),
         }
@@ -2520,9 +2595,140 @@ _RUN_LOG_SINKS: "list[_RunLogSink]" = []
 _RUN_LOG_LAST_DIR = None
 _RUN_LOG_TLS = _log_threading.local()
 
+# ─── Lines that belong to the MACHINE, not to whatever run is armed ────
+# ⛔⛔ 2026-08-24, AND THE FIRST DESIGN OF THIS WAS WRONG. The plan called for
+# tagging every line with its run and sending untagged ones to the machine log —
+# on the premise that a machine runs two researches at once, so one run's folder
+# holds another's lines. MEASURED ON THE REAL CORPUS, that premise is false:
+# `_job_worker` awaits ONE pipeline at a time and every worker is a separate
+# PROCESS, so two runs cannot share a sink stack. Across 1,821 lines in five run
+# folders there is not one foreign researchId, topic, submitter or queue line.
+#
+# ⛔ And the tagging design would have cost more than it bought, twice over:
+#   • The per-run Firestore command listener runs on a thread the google SDK
+#     creates, which no context can reach — so every `Command received: STOP`,
+#     the child-process reap and the exit line would have left the folder. One
+#     run on this machine has NOTHING ELSE describing how it ended.
+#   • `_clear_local_logs` runs on that same kind of thread and reads the
+#     process-global sink list to spare live folders. Moving that registry into
+#     a context would make a clear-logs command arriving mid-run DELETE the
+#     folder of the run currently writing to it.
+#
+# ⭐ So the registry stays process-global and the default is unchanged: a line
+# from anywhere still reaches the armed run. What changed is an explicit OPT-OUT
+# for the handful of standing loops whose lines are about the machine or about
+# OTHER PEOPLE — measured at 400 of those 1,821 lines, 398 of them one repeated
+# telemetry sentence.
+#
+# ⛔ WHAT IS DELIBERATELY *NOT* MARKED, because each one explains a run's fate
+# and the run's folder is where that belongs: the Firestore reconnect loop (an
+# outage is why commands stopped arriving), the revoked-credential loop, the
+# device-command listener (a hard reset is why the run died), and the worker
+# watchdog. Silence about why a run ended is the failure this whole capture
+# exists to prevent.
+import contextvars as _log_contextvars  # noqa: E402
+import contextlib as _log_contextlib  # noqa: E402
+
+_LOG_SCOPE_MACHINE = "machine"
+_LOG_SCOPE = _log_contextvars.ContextVar("sr_log_scope", default="")
+
+
+@_log_contextlib.contextmanager
+def _machine_log_scope():
+    """Lines written inside this block reach the machine log only.
+
+    ⭐ A CONTEXT, NOT A FLAG. `contextvars` follows an `await` and an
+    `asyncio.to_thread` hop without being threaded through a parameter, and a
+    raw thread starts with a fresh empty context — which is exactly the right
+    default here, because a raw thread the pipeline spawns is doing the run's
+    work and should keep writing to the run.
+
+    ⛔ Reset via the token rather than set-to-empty: nesting is possible (a
+    marked loop calling a marked helper) and a set-to-empty inner exit would
+    un-mark the outer block for the rest of its life."""
+    token = _LOG_SCOPE.set(_LOG_SCOPE_MACHINE)
+    try:
+        yield
+    finally:
+        _LOG_SCOPE.reset(token)
+
+
+@_log_contextlib.contextmanager
+def _run_log_scope():
+    """Undo a machine marking for one block — this line IS about the armed run.
+
+    ⛔⛔ FOUND WHILE REVIEWING MY OWN FIX, 2026-08-24. Marking the start listener
+    is what stops other people's topics reaching a run folder — but that same
+    callback handles `cancel`, and four of its branches log the reason the
+    CURRENTLY RUNNING job is being stopped. Marking the callback would have taken
+    those lines out of the folder of the run they explain, which is precisely the
+    harm the whole reframe of this wave was written to avoid. The exclusion was
+    about to reintroduce it one function later.
+
+    ⭐ Kept as a named block rather than "just don't mark the listener": the
+    listener's OTHER lines really are somebody else's business, and the choice
+    has to be per-line because the callback serves two masters."""
+    token = _LOG_SCOPE.set("")
+    try:
+        yield
+    finally:
+        _LOG_SCOPE.reset(token)
+
+
+def _log_about_the_armed_run(msg, level="INFO") -> None:
+    """Write one line to the armed run's folder from inside a machine-scoped
+    block. The single seam for the exception above, so `grep` finds every line
+    that claims to be about the run rather than about the machine."""
+    with _run_log_scope():
+        log(msg, level)
+
+
+def _machine_logged(fn):
+    """Decorator form: every line this function writes is the machine's.
+
+    ⭐ A DECORATOR RATHER THAN A `with` AROUND EACH BODY, for two reasons that
+    are both about review. These are standing loops whose bodies are hundreds of
+    lines; wrapping them re-indents everything and buries the one-line decision
+    in a whitespace diff. And `grep '@_machine_logged'` then returns the COMPLETE
+    list of exclusions, which is the thing a reader needs to audit — the set is
+    the policy, and a policy spread across indentation is one nobody can check."""
+    import functools as _ft
+    # ⛔ `inspect`, not `asyncio` — `asyncio.iscoroutinefunction` is deprecated
+    # on the 3.14 this repo runs and slated for removal in 3.16, and it emitted
+    # a DeprecationWarning on every import of this module.
+    import inspect as _ins
+    if _ins.iscoroutinefunction(fn):
+        @_ft.wraps(fn)
+        async def _async_scoped(*args, **kwargs):
+            with _machine_log_scope():
+                return await fn(*args, **kwargs)
+        return _async_scoped
+
+    @_ft.wraps(fn)
+    def _scoped(*args, **kwargs):
+        with _machine_log_scope():
+            return fn(*args, **kwargs)
+    return _scoped
+
 
 def _active_run_sink():
     return _RUN_LOG_SINKS[-1] if _RUN_LOG_SINKS else None
+
+
+def _run_submitted_by() -> "str | None":
+    """The rules-pinned writer of the run currently armed, or None.
+
+    ⭐ THE SINK IS THE ONLY THING THAT STILL HOLDS IT. `run_pipeline_captured`
+    pops the claim before delegating, so the pipeline body — which is where the
+    crash-retry recurses from — never sees it. The retry fires from inside the
+    body's `finally`, which is INSIDE the wrapper's `with`, so the outer sink is
+    still armed and still carries the value the first attempt was armed with.
+
+    ⛔ Not `_RUN_SUBMITTER`: that global holds the executing TREE, is bound after
+    the sink is written, and survives between runs — three separate reasons it
+    would hand back the wrong person here."""
+    sink = _active_run_sink()
+    return getattr(sink, "claimed_by", None) if sink is not None else None
 
 
 def _log_write_through(line: str, level: str) -> None:
@@ -2530,7 +2736,14 @@ def _log_write_through(line: str, level: str) -> None:
 
     Reentrancy-flagged per THREAD: a failure inside the sink must not recurse
     through `log()`, and a background thread's line must not be silenced just
-    because the pipeline thread happens to be mid-write."""
+    because the pipeline thread happens to be mid-write.
+
+    ⭐ THE ONE EXCLUSION IS EXPLICIT. Everything still reaches the armed run
+    except what a standing machine-concern loop deliberately wrapped — see
+    `_machine_log_scope`, and the list of loops that are NOT wrapped, which is
+    the more important half."""
+    if _LOG_SCOPE.get() == _LOG_SCOPE_MACHINE:
+        return
     if getattr(_RUN_LOG_TLS, "busy", False):
         return
     sink = _RUN_LOG_SINKS[-1] if _RUN_LOG_SINKS else None
@@ -2689,7 +2902,8 @@ class _RunLogCapture:
     Never raises into the pipeline: if capture cannot be set up, the run runs.
     A diagnostic that can break the thing it diagnoses is worse than none."""
 
-    def __init__(self, research_id=None, attempt=0, submitted_by=None):
+    def __init__(self, research_id=None, attempt=0, submitted_by=None,
+                 claimed_by=None):
         self.research_id = research_id
         self.attempt = int(attempt or 0)
         # ⛔ PASSED IN, NOT READ FROM `_RUN_SUBMITTER`. That global is bound
@@ -2698,6 +2912,10 @@ class _RunLogCapture:
         # would stamp the PREVIOUS run's submitter and a mid-run crash would
         # freeze that wrong value on disk.
         self.submitted_by = submitted_by
+        # ⛔ THE RULES-PINNED HALF, and it rides beside the tree uid rather than
+        # replacing it — the resolver needs BOTH to tell "no writer was named"
+        # from "the writer named someone else's tree".
+        self.claimed_by = claimed_by
         self.sink = None
 
     def __enter__(self):
@@ -2725,7 +2943,8 @@ class _RunLogCapture:
             sink = _RunLogSink(
                 folder, research_id=self.research_id, attempt=self.attempt,
                 parent_research_id=(parent.research_id if parent is not None else None),
-                started_utc=started, submitted_by=self.submitted_by)
+                started_utc=started, submitted_by=self.submitted_by,
+                claimed_by=self.claimed_by)
             sink.writer.write_line("=== super research run ===")
             sink.writer.write_line(
                 f"startedUtc={started} researchId={self.research_id} "
@@ -3037,6 +3256,10 @@ _BRIDGED_LOGGERS = ("auth", "vision", "selfheal", "narrate", "telemetry")
 # changes which file it lands in.
 _BRIDGED_VENDOR_LOGGERS = {"google.api_core.bidi": logging.WARNING}
 
+# Bridged loggers whose lines are about the MACHINE and never about a run — see
+# `_machine_log_scope`, and the emit() comment for why this tuple stays at one.
+_MACHINE_ONLY_BRIDGED = ("telemetry",)
+
 
 class _StdlibLogBridge(logging.Handler):
     """Forward a stdlib `logging` record into `log()`, one line at a time."""
@@ -3058,8 +3281,23 @@ class _StdlibLogBridge(logging.Handler):
             if record.exc_info:
                 import traceback as _tb
                 text += "\n" + "".join(_tb.format_exception(*record.exc_info)).rstrip()
-            for line in (text.splitlines() or [""]):
-                log(line, level)
+            # ⭐⭐ MEASURED: 398 of one run folder's 911 lines — 43.7% — were a
+            # single telemetry sentence, restated once per flush tick by a thread
+            # that has nothing to do with the run. Marked HERE rather than in
+            # telemetry.py because the handler already runs on the emitting
+            # thread and this keeps the machine-scope mechanism in one module.
+            #
+            # ⛔ ONLY telemetry, and the other four are the reason to be careful:
+            # `auth`, `vision`, `selfheal` and `narrate` are all things a RUN
+            # does, and `google.api_core.bidi` is bridged specifically so a
+            # bundle can explain a listener that died mid-run. Widening this
+            # tuple would undo the wave that put them there.
+            scope = (_machine_log_scope()
+                     if record.name.split(".")[0] in _MACHINE_ONLY_BRIDGED
+                     else _log_contextlib.nullcontext())
+            with scope:
+                for line in (text.splitlines() or [""]):
+                    log(line, level)
         except Exception:
             self.handleError(record)
 
@@ -5283,6 +5521,12 @@ def _local_pending_owner_entries() -> "list[dict]":
     return out
 
 
+# ⭐⭐ MARKED AT THE FUNCTION, NOT AT ITS FOUR SPAWN SITES. All four raw threads
+# that publish queue positions share this one target, and a marking repeated four
+# times is a marking that will be three times somewhere. Its lines are about
+# OTHER PEOPLE'S queued runs — uid, runId and a 60-character topic per entry —
+# so they have no business in whichever run happens to be armed.
+@_machine_logged
 def _recompute_deferred_queue_positions() -> None:
     """Re-write `queuePosition` / `queuedBehindRunId` / `queuedBehindTitle`
     on every research doc whose queue entry is still deferred in
@@ -6664,6 +6908,10 @@ def _detect_supervised_windows() -> bool:
         return False
 
 
+# Machine liveness only. Quiet on a healthy device and chatty on a failing one
+# — which is precisely the device that files a bundle, so the exclusion earns
+# itself on exactly the machines this feature exists for.
+@_machine_logged
 async def _heartbeat_loop():
     """Write lastHeartbeat to the top-level `devices/{deviceId}` doc every
     HEARTBEAT_INTERVAL_SEC so the frontend can show Online/Offline status
@@ -6760,6 +7008,25 @@ async def _heartbeat_loop():
                         # persistent 403 retries every ~5 min, not every tick.
                         _version_publish_next_ms = _now_ms + 300_000
                         log(f"[heartbeat] version-signal publish skipped ({_vf_err})", "DEBUG")
+
+                # Which runs this machine still holds logs for, per submitter.
+                # ⭐ HERE rather than at run teardown, and the reason is what the
+                # publish costs: a directory walk plus one `meta.json` read per
+                # folder. Doing it inline when a run finalizes would put that on
+                # the pipeline task at the exact moment the process is finishing
+                # a run. The function self-throttles to a minute, so a picker is
+                # at most sixty seconds behind the disk — which is well inside
+                # the time it takes a person to notice a run failed and go
+                # looking for the button.
+                #
+                # ⛔ In a thread: it is blocking Firestore I/O and this loop owns
+                # the liveness write. A slow publish must not delay a heartbeat
+                # and flip the device offline in the app.
+                try:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(_publish_run_log_index), timeout=15.0)
+                except Exception as _ri_err:
+                    log(f"[heartbeat] run-index publish skipped ({_ri_err})", "DEBUG")
 
                 # One-shot: report the outcome of an app-driven update that ran while
                 # this backend was down. Deliberately here rather than at boot — the
@@ -7973,33 +8240,156 @@ def _send_logs_stamp_path() -> "Path":
     return _STATE_DIR / "send-logs-last.json"
 
 
-def _send_logs_cooldown_remaining(now=None, cooldown=SEND_LOGS_COOLDOWN_SEC) -> int:
-    """Seconds left before another bundle may be built.
+# ⛔⛔ THE COOLDOWN WAS ONE UNKEYED TIMESTAMP PER OS USER, and that was fine only
+# while exactly one person could press the button. The moment a sharer can send,
+# an unkeyed stamp means their press refuses the OWNER for ten minutes and the
+# owner's refuses theirs — two people locking each other out of the one control
+# that explains a broken machine.
+#
+# ⭐ SO: a per-submitter window, plus a machine FLOOR. The per-person window is
+# what stops one person hammering it; the floor is what stops N sharers turning
+# "one bundle per ten minutes" into N bundles per ten minutes, since the archive
+# build and the upload are the machine's resources, not theirs.
+#
+# ⚠ The floor is deliberately much shorter than the per-person window. It is a
+# concurrency bound, not a fairness one: making it equal would recreate exactly
+# the shared lockout this fixes.
+SEND_LOGS_MACHINE_FLOOR_SEC = 60
+
+
+def _send_logs_cooldown_remaining(now=None, cooldown=SEND_LOGS_COOLDOWN_SEC,
+                                  uid=None,
+                                  floor=SEND_LOGS_MACHINE_FLOOR_SEC) -> int:
+    """Seconds left before `uid` may build another bundle.
 
     ⛔ Read from a LOCAL file, never from Firestore. The machine this feature
     exists for could not reach Firestore at all — a rate limit that needs the
     network to evaluate stops working exactly when the button starts being
-    pressed."""
+    pressed.
+
+    ⭐ BACK-COMPAT IN BOTH DIRECTIONS. A stamp written by an older build carries
+    only `at`, and it is honoured as the machine floor rather than ignored — a
+    downgrade must not hand somebody a free press. A stamp written by this build
+    keeps `at` too, so a DOWNGRADE still sees a cooldown instead of none."""
     try:
         stamp = json.loads(_send_logs_stamp_path().read_text(encoding="utf-8"))
-        last = float(stamp.get("at") or 0)
     except Exception:
         return 0
-    elapsed = (time.time() if now is None else float(now)) - last
-    return max(0, int(cooldown - elapsed))
+    if not isinstance(stamp, dict):
+        return 0
+    at = (time.time() if now is None else float(now))
+    try:
+        machine_last = float(stamp.get("at") or 0)
+    except (TypeError, ValueError):
+        machine_last = 0.0
+    remaining = max(0, int(float(floor) - (at - machine_last)))
+    per_uid = stamp.get("perUid")
+    key = str(uid or "")
+    if key and isinstance(per_uid, dict):
+        try:
+            mine = float(per_uid.get(key) or 0)
+        except (TypeError, ValueError):
+            mine = 0.0
+        remaining = max(remaining, int(float(cooldown) - (at - mine)))
+    elif not key:
+        # No submitter named: the terminal path and any legacy caller. Fall back
+        # to the whole window on the machine stamp, which is what they had.
+        remaining = max(remaining, int(float(cooldown) - (at - machine_last)))
+    return max(0, remaining)
 
 
-def _stamp_send_logs_attempt(now=None) -> None:
+# How many submitters' timestamps the stamp file keeps. A device is capped at
+# ~28 sharers by the 1 KB custom-claims token budget, so this holds every one of
+# them with room to spare — and it bounds a file that would otherwise grow by an
+# entry per account that has ever touched the machine.
+SEND_LOGS_STAMP_UIDS = 40
+
+
+def _stamp_send_logs_attempt(now=None, uid=None) -> None:
     """Record the attempt BEFORE doing the work.
 
     ⭐ Order is the guard: a process killed halfway through a bundle has already
     spent its turn, so the next press is still refused. Stamping on success
-    would make "kill it and press again" an unlimited loop."""
+    would make "kill it and press again" an unlimited loop.
+
+    ⛔ READ-MODIFY-WRITE, so one person's press does not erase everyone else's
+    window — which a fresh dict would, silently, and in the direction that lets
+    people press more often rather than less."""
+    at = (time.time() if now is None else float(now))
     try:
-        _atomic_write_json(_send_logs_stamp_path(),
-                           {"at": (time.time() if now is None else float(now))})
+        existing = json.loads(_send_logs_stamp_path().read_text(encoding="utf-8"))
+        per_uid = dict(existing.get("perUid") or {}) if isinstance(existing, dict) else {}
+    except Exception:
+        per_uid = {}
+    key = str(uid or "")
+    if key:
+        per_uid[key] = at
+    if len(per_uid) > SEND_LOGS_STAMP_UIDS:
+        # Oldest first — an account that has not pressed in months is the one
+        # whose window matters least.
+        per_uid = dict(sorted(per_uid.items(), key=lambda kv: kv[1],
+                              reverse=True)[:SEND_LOGS_STAMP_UIDS])
+    try:
+        # `at` stays at the top level: it is the machine floor AND what an older
+        # build reads, so removing it would hand a downgraded machine a free press.
+        _atomic_write_json(_send_logs_stamp_path(), {"at": at, "perUid": per_uid})
     except Exception:
         pass
+
+
+_RUN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,95}$")
+
+
+def _parse_include_machine(data: dict) -> bool:
+    """Did the person ASK for this computer's own logs as well?
+
+    ⛔⛔ 2026-08-25, OWNER'S CALL, AND IT IS A BETTER DEFAULT THAN THE ONE I
+    BUILT. The first version bundled the machine-level material into every
+    OWNER's send automatically — pairing and sign-in sessions, the raw device
+    tails — on the reasoning that an owner is entitled to their own machine's
+    logs. They are; but "entitled to" is not "asked for", and defaulting to the
+    larger bundle is the one direction this whole wave is supposed to fail in.
+    It is now a tick-box under the run list, unticked.
+
+    ⭐ AND READING IT OFF THE COMMAND IS RIGHT HERE, which is the opposite of the
+    call made for `consent`. That flag is a claim about what a person was shown,
+    so a caller could forge it; this one can only ever make the bundle SMALLER,
+    because it is ANDed with ownership at the call site. A sharer who sets it
+    gets nothing extra.
+
+    ⛔ Identity against `True`, like the consent check: `1`, `"true"` and a
+    missing field all resolve to False, which collects less. An app build that
+    predates the box therefore gets runs-only rather than the whole machine."""
+    return data.get("includeMachine") is True
+
+
+def _parse_bundle_run_names(data: dict) -> "list[str] | None":
+    """The run folders this command selected, or None meaning "refuse".
+
+    ⛔⛔ REFUSES RATHER THAN FALLING BACK, on the rule this file already states:
+    "falling back would resolve every malformed request toward MORE collection
+    than was agreed to". An unreadable selection resolved to "everything" is the
+    one outcome that must be unreachable.
+
+    ⭐ AN EMPTY LIST IS VALID and is NOT the same as an absent one. The owner who
+    ticks nothing is asking for the machine-level bundle — the pairing-failure
+    case, which is exactly when there are no runs to tick.
+
+    ⛔ The shape check is not path defence — a name never becomes a path
+    component; it is matched against scanned folder rows and an unknown name
+    simply resolves to nothing. It is here so a request carrying a megabyte of
+    junk is refused before it reaches the disk at all."""
+    raw = data.get("runNames")
+    if raw is None or isinstance(raw, (str, bytes)) or not isinstance(raw, list):
+        return None
+    if len(raw) > RUN_INDEX_MAX:
+        return None
+    out = []
+    for item in raw:
+        if not isinstance(item, str) or not _RUN_NAME_RE.match(item):
+            return None
+        out.append(item)
+    return out
 
 
 def _log_bundle_doc_path(owner_uid: str, code: str) -> str:
@@ -8007,7 +8397,8 @@ def _log_bundle_doc_path(owner_uid: str, code: str) -> str:
 
 
 def _open_log_bundle_row(owner_uid: str, code: str, device_id: str,
-                         request_id: str = "") -> bool:
+                         request_id: str = "",
+                         machine_included: bool = True) -> bool:
     """Create the row, always at 'collecting'.
 
     ⛔⛔ EVERY ROW STARTS HERE, and that is not a style choice — the rule only
@@ -8025,7 +8416,15 @@ def _open_log_bundle_row(owner_uid: str, code: str, device_id: str,
     instead of nothing at all."""
     return _write_log_bundle_status(
         owner_uid, code,
-        {"status": "collecting", "deviceId": device_id, "requestId": request_id},
+        {"status": "collecting", "deviceId": device_id, "requestId": request_id,
+         # ⛔⛔ THE ROW STATES ITS OWN SCOPE, and the rule reads it. A row landing
+         # in a tree the device does not OWN is accepted only when it says it
+         # carries no machine-level material — so a device leaking a
+         # whole-machine bundle into a sharer's tree has to write a falsehood
+         # into a document we keep, rather than doing it silently. It is set on
+         # CREATE and frozen by the update rule, because otherwise a device could
+         # open honestly and flip it once the object had landed.
+         "machineIncluded": bool(machine_included)},
         create=True)
 
 
@@ -8063,7 +8462,8 @@ def _write_log_bundle_status(owner_uid: str, code: str, patch: dict,
 
 
 def _refuse_log_bundle_with_row(owner_uid: str, code: str, device_id: str,
-                                request_id: str, error_class: str) -> None:
+                                request_id: str, error_class: str,
+                                machine_included: bool = True) -> None:
     """Say a send-logs refusal WHERE THE APP CAN READ IT.
 
     ⛔⛔ WHY THIS EXISTS. Worker 1 deletes the command document BEFORE dispatch,
@@ -8130,7 +8530,8 @@ def _refuse_log_bundle_with_row(owner_uid: str, code: str, device_id: str,
     # every tick of the always-armed reconnect watcher, and it replays the OPEN
     # before the patch — a create at 'failed' is what the rule refuses.
     patch = {"status": "failed", "errorClass": error_class}
-    if not (_open_log_bundle_row(owner_uid, code, device_id, request_id)
+    if not (_open_log_bundle_row(owner_uid, code, device_id, request_id,
+                                machine_included=machine_included)
             and _write_log_bundle_status(owner_uid, code, patch)):
         _queue_log_bundle_row(owner_uid, code, patch, device_id=device_id)
 
@@ -8243,7 +8644,8 @@ def _parse_bundle_runs(data: dict, limited: bool) -> "int | None":
     return min(int(raw), BUNDLE_MAX_RUNS)
 
 
-def _handle_send_logs_command(data: dict, device_id: str, limited: bool = False) -> None:
+def _handle_send_logs_command(data: dict, device_id: str, limited: bool = False,
+                              selected: bool = False) -> None:
     """Build and upload a support bundle for the app's Send Logs button.
 
     Runs on a DAEMON THREAD, and that is new machinery rather than a copy of
@@ -8254,11 +8656,26 @@ def _handle_send_logs_command(data: dict, device_id: str, limited: bool = False)
 
     Guards, in order, all refusing rather than proceeding on doubt:
       1. the support code's shape (it is a path segment and a capability),
-      2. owner-only — refuse on a device read failure, refuse a missing
-         submitter, refuse a submitter who is not the owner,
+      2. WHO — refuse on a device read failure, refuse a missing submitter,
+         and refuse a submitter who is neither the owner nor (on the SELECTED
+         action only) somebody the device is shared with,
       3. consent — refuse unless the command carries consent == True,
-      4. cooldown, from a local stamp written BEFORE the work,
-      5. single-flight, so two presses cannot build two bundles at once.
+      4. the run selection's shape, on the selected action,
+      5. cooldown, per submitter with a machine floor,
+      6. single-flight, so two presses cannot build two bundles at once.
+
+    ⭐⭐ WHAT THE THIRD ACTION CHANGES, AND THE ONE THING IT DOES NOT. A sharer
+    may now ask — that is the whole wave — but WHAT they get is decided here and
+    not by the request: a sharer's bundle is the runs attributed to them and
+    nothing else, and the machine-level material (pairing and login sessions, the
+    raw device tails) is owner-only. Measured on one real machine: `backend.log`
+    carries 18 distinct research ids and 15 topics against 5 run folders on disk,
+    so that material is not a bigger version of the runs — it is everything the
+    machine has ever done, for everyone who uses it.
+
+    ⛔ `include_machine` is therefore DERIVED, never read off the command. A flag
+    the app sets is a flag a future caller can set differently; the same
+    reasoning that put the consent check at this sink rather than in the modal.
 
     ⛔ EVERY GUARD THAT CAN WRITE A ROW MUST WRITE ONE. Worker 1 deletes the
     command document before dispatch, so a bare `return` here is indistinguishable
@@ -8297,38 +8714,102 @@ def _handle_send_logs_command(data: dict, device_id: str, limited: bool = False)
         _refuse_log_bundle_with_row(owner_uid, code, device_id, request_id,
                                     "SubmitterMissing")
         return
-    if submitted_by != owner_uid:
+    # ⭐⭐ WHOSE TREE THE ROW LIVES IN, decided once and used by every refusal
+    # below. On the legacy actions it is the owner's, unchanged. On the selected
+    # action it is the SUBMITTER's — which is the only tree a sharer can read,
+    # and therefore the only place a refusal aimed at them is not a soliloquy.
+    is_owner = submitted_by == owner_uid
+    row_uid = submitted_by if selected else owner_uid
+    # ⛔⛔ WHAT THE BUNDLE MAY CONTAIN, DECIDED ONCE. Two conditions, and both are
+    # load-bearing: the machine-level material is the OWNER's (a sharer setting
+    # the flag gets nothing extra), and even the owner has to ask for it. The
+    # legacy actions are unchanged — `send-logs` MEANS "this machine's own cap",
+    # so a build sending one is asking for the whole machine by definition.
+    machine_wanted = (is_owner and _parse_include_machine(data)) if selected else True
+
+    if not is_owner and not selected:
         log("[send-logs] refusing: submittedBy is not the device owner", "WARN")
         # ⚠ The row lands in the OWNER's tree, which is the only tree the rules
-        # permit — so this does not reach a non-owner submitter. It is here so
-        # the machine's refusal is never invisible, not as a message to them.
+        # permit for these actions — so this does not reach a non-owner
+        # submitter. It is here so the machine's refusal is never invisible, not
+        # as a message to them.
         _refuse_log_bundle_with_row(owner_uid, code, device_id, request_id,
                                     "NotDeviceOwner")
         return
+
+    if not is_owner:
+        # ⛔⛔ DEFENCE IN DEPTH, AND NOT DECORATION. The Firestore rule gates the
+        # command's CREATE on device membership, but rules deploy separately from
+        # code and this machine has no way to know which ruleset is live. A
+        # sharer who is no longer shared with must not be able to reach the disk
+        # because a stale ruleset let their write through.
+        shared = dev.get("sharedWith")
+        if not isinstance(shared, list) or submitted_by not in shared:
+            log("[send-logs] refusing: submitter is neither the owner nor a "
+                "sharer of this device", "WARN")
+            _refuse_log_bundle_with_row(row_uid, code, device_id, request_id,
+                                        "NotDeviceMember",
+                                        machine_included=machine_wanted)
+            return
 
     # ⛔ SINK-SIDE CONSENT. The app shows a modal naming everything that leaves
     # the machine, but a modal is a property of one caller. This is the property
     # of the machine.
     if data.get("consent") is not True:
         log("[send-logs] refusing: the request carries no recorded consent", "WARN")
-        _refuse_log_bundle_with_row(owner_uid, code, device_id, request_id,
-                                    "ConsentMissing")
+        _refuse_log_bundle_with_row(row_uid, code, device_id, request_id,
+                                    "ConsentMissing",
+                                    machine_included=machine_wanted)
         return
 
     runs = _parse_bundle_runs(data, limited)
     if runs is None:
         log("[send-logs] refusing: the request named an unreadable number of runs",
             "WARN")
-        _refuse_log_bundle_with_row(owner_uid, code, device_id, request_id,
-                                    "RunsInvalid")
+        _refuse_log_bundle_with_row(row_uid, code, device_id, request_id,
+                                    "RunsInvalid",
+                                    machine_included=machine_wanted)
         return
 
-    remaining = _send_logs_cooldown_remaining()
+    only_runs = None
+    if selected:
+        only_runs = _parse_bundle_run_names(data)
+        if only_runs is None:
+            log("[send-logs] refusing: the request named an unreadable run "
+                "selection", "WARN")
+            _refuse_log_bundle_with_row(row_uid, code, device_id, request_id,
+                                        "RunsInvalid",
+                                        machine_included=machine_wanted)
+            return
+        # ⛔⛔ NOBODY MAY BUILD AN EMPTY ARCHIVE, and since the machine material
+        # became a tick-box this is no longer a sharer-only case. An empty pick
+        # with the box unticked would upload a zip containing three JSON files
+        # and hand back a support code that explains nothing — which is worse
+        # than a refusal, because the person believes they have sent something.
+        #
+        # ⭐ The pairing-failure case still works, and this is how it reads on
+        # screen now: no runs to tick, so the person ticks the box instead. That
+        # is a deliberate act rather than a default, which is the whole change.
+        if not only_runs and not machine_wanted:
+            log("[send-logs] refusing: no runs selected and the machine's own "
+                "logs were not asked for — there is nothing to send", "WARN")
+            _refuse_log_bundle_with_row(row_uid, code, device_id, request_id,
+                                        "NothingSelected",
+                                        machine_included=machine_wanted)
+            return
+
+    # ⛔⛔ PER SUBMITTER, WITH A MACHINE FLOOR — and it is load-bearing only now
+    # that two people can press the button. The stamp was ONE unkeyed timestamp
+    # per OS user, so the moment a sharer could send, their press would refuse
+    # the owner for ten minutes and the owner's would refuse theirs. The floor is
+    # what stops N sharers from turning "one bundle per ten minutes" into N.
+    remaining = _send_logs_cooldown_remaining(uid=submitted_by)
     if remaining:
         log(f"[send-logs] refusing: another bundle was built recently "
             f"({remaining}s left on the cooldown)", "WARN")
-        _refuse_log_bundle_with_row(owner_uid, code, device_id, request_id,
-                                    "CooldownActive")
+        _refuse_log_bundle_with_row(row_uid, code, device_id, request_id,
+                                    "CooldownActive",
+                                    machine_included=machine_wanted)
         return
 
     # ⛔ THE FLAG IS READ AND SET UNDER THE LOCK; THE ROW IS WRITTEN OUTSIDE IT.
@@ -8348,19 +8829,40 @@ def _handle_send_logs_command(data: dict, device_id: str, limited: bool = False)
         # reachable by two tabs inside that window, and permanently on a machine
         # that cannot write the stamp file at all.
         log("[send-logs] refusing: a bundle is already being built", "WARN")
-        _refuse_log_bundle_with_row(owner_uid, code, device_id, request_id,
-                                    "AlreadyBuilding")
+        _refuse_log_bundle_with_row(row_uid, code, device_id, request_id,
+                                    "AlreadyBuilding",
+                                    machine_included=machine_wanted)
         return
 
+    # Bundle administration: support codes, owner uids, object paths. It runs on
+    # its own raw thread — which starts with an empty context — so the marking
+    # has to be here rather than on the listener that dispatched it.
+    @_machine_logged
     def _work() -> None:
         global _send_logs_inflight
         try:
-            _stamp_send_logs_attempt()
-            _open_log_bundle_row(owner_uid, code, device_id, request_id)
+            _stamp_send_logs_attempt(uid=submitted_by)
+            _open_log_bundle_row(row_uid, code, device_id, request_id,
+                                 machine_included=machine_wanted)
             dest = _logs_root() / "outgoing" / f"support-{code}{BUNDLE_SUFFIX}"
-            summary = _build_log_bundle(dest, support_code=code, max_runs=runs)
-            _write_log_bundle_status(owner_uid, code, {
+            # ⛔⛔ DERIVED HERE, NOT READ OFF THE COMMAND. A sharer gets the runs
+            # attributed to them and nothing else; the machine-level material —
+            # pairing and login sessions, the raw device tails — is the owner's,
+            # because it is everything the machine has ever done for everyone who
+            # uses it. Same reasoning as the sink-side consent check: a flag the
+            # app sets is a flag a future caller can set differently.
+            summary = _build_log_bundle(
+                dest, support_code=code, max_runs=runs,
+                only_runs=only_runs,
+                requester_uid=(submitted_by if selected else None),
+                include_machine=machine_wanted)
+            _write_log_bundle_status(row_uid, code, {
                 "status": "uploading",
+                # ⛔ THE UPDATE RULE FREEZES THIS FIELD and `shapeOk` requires
+                # it, so a patch that omits it is refused — the row would stall
+                # at 'collecting' forever and the app would call the machine
+                # silent.
+                "machineIncluded": bool(summary["machineIncluded"]),
                 "runCount": int(summary["runCount"]),
                 "sessionCount": int(summary["sessionCount"]),
                 "sizeBytes": int(summary["sizeBytes"]),
@@ -8369,22 +8871,25 @@ def _handle_send_logs_command(data: dict, device_id: str, limited: bool = False)
                 "runsApplied": int(summary["maxRunsApplied"]),
             })
             object_path = _upload_log_bundle_via_storage_rest(
-                dest, owner_uid, device_id, code)
+                dest, row_uid, device_id, code)
             if object_path:
-                _write_log_bundle_status(owner_uid, code, {
+                _write_log_bundle_status(row_uid, code, {
                     "status": "done", "objectPath": object_path,
+                    "machineIncluded": bool(summary["machineIncluded"]),
                     "runCount": int(summary["runCount"]),
                     "sessionCount": int(summary["sessionCount"]),
                     "sizeBytes": int(summary["sizeBytes"]),
                     "runsApplied": int(summary["maxRunsApplied"]),
                 })
             else:
-                _write_log_bundle_status(owner_uid, code, {
-                    "status": "failed", "errorClass": "UploadFailed"})
+                _write_log_bundle_status(row_uid, code, {
+                    "status": "failed", "errorClass": "UploadFailed",
+                    "machineIncluded": machine_wanted})
         except Exception as exc:
             log(f"[send-logs] bundle failed: {type(exc).__name__}: {exc}", "ERROR")
-            _write_log_bundle_status(owner_uid, code, {
-                "status": "failed", "errorClass": type(exc).__name__})
+            _write_log_bundle_status(row_uid, code, {
+                "status": "failed", "errorClass": type(exc).__name__,
+                "machineIncluded": machine_wanted})
         finally:
             # ⭐ The local copy stays. It is the floor the whole design rests on:
             # if nothing could be uploaded, the user still has a file to attach
@@ -8687,7 +9192,13 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                             # multi-worker host worker 2 destroys the command
                             # before worker 1 ever sees it, and the feature ships
                             # dead with nothing failing anywhere.
-                            SEND_LOGS_LIMITED_ACTION) and WORKER_ID != 1:
+                            SEND_LOGS_LIMITED_ACTION,
+                            # ⛔ AND SO MUST THE SELECTED ONE, for the same
+                            # reason and with the same silence. The test that
+                            # guards this tuple was a CONTAINMENT check on two
+                            # names — it would have passed with this line
+                            # missing. It is now exhaustive.
+                            SEND_LOGS_SELECTED_ACTION) and WORKER_ID != 1:
                 # Only worker 1 ACTS on `update` / `check-update`. A sibling worker
                 # must NOT delete the doc here — deleting it before worker 1's
                 # Firestore stream delivers the ADDED could drop the command with no
@@ -9293,7 +9804,8 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                     _handle_check_update_command(device_id)
                 continue
 
-            if action in (SEND_LOGS_ACTION, SEND_LOGS_LIMITED_ACTION):
+            if action in (SEND_LOGS_ACTION, SEND_LOGS_LIMITED_ACTION,
+                          SEND_LOGS_SELECTED_ACTION):
                 # App-driven support bundle (owner-only). Single actor: worker 1
                 # only, gated in the SAME tuple above — without that gate every
                 # non-1 worker races the archive build, and a sibling's
@@ -9314,7 +9826,8 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                 if WORKER_ID == 1:
                     _handle_send_logs_command(
                         data, device_id,
-                        limited=(action == SEND_LOGS_LIMITED_ACTION))
+                        limited=(action == SEND_LOGS_LIMITED_ACTION),
+                        selected=(action == SEND_LOGS_SELECTED_ACTION))
                 continue
 
             if action == "restart":
@@ -9585,16 +10098,59 @@ def _bundle_contract() -> dict:
             (Path(__file__).resolve().parent / "bundle-contract.json")
             .read_text(encoding="utf-8"))
     except Exception:
-        return {"maxRuns": 30, "maxAgeDays": 30, "minRuns": 1,
-                "actions": {"full": "send-logs", "limited": "send-logs-limited"}}
+        return dict(BUNDLE_CONTRACT_FALLBACK)
 
 
-_BUNDLE_CONTRACT = _bundle_contract()
-BUNDLE_MAX_RUNS = int(_BUNDLE_CONTRACT["maxRuns"])
+# ⛔⛔ THE FALLBACK IS WHAT EVERY INSTALLED BUILD ACTUALLY READS. Measured: the
+# 0.1.13 wheel contains no .json entries at all — `pyproject` packs `scripts` as
+# package-data and nothing else, and the compiled builder only ever DELETES
+# files. So the file above exists for source checkouts and for the cross-repo
+# comparison; this literal is the contract in the field.
+#
+# ⭐ NAMED AND MODULE-LEVEL rather than inline in the `except`, so the drift
+# guard can read it without `ast.literal_eval` on a function body — and so the
+# guard can compare the UNION of both key sets. The old guard iterated the
+# FALLBACK's keys, which is exactly why `version` sat outside it: a key added to
+# the file was invisible.
+#
+# ⛔ `_why` is deliberately NOT here. It is documentation for a human opening the
+# JSON, it is hundreds of bytes, and duplicating prose is how prose drifts. The
+# guard exempts this one key BY NAME so the exemption is a decision on record
+# rather than an accident of which side happens to be iterated.
+BUNDLE_CONTRACT_FALLBACK = {
+    "version": 2,
+    "maxRuns": 30,
+    "maxAgeDays": 30,
+    "minRuns": 1,
+    "actions": {"full": "send-logs", "limited": "send-logs-limited",
+                "selected": "send-logs-selected"},
+}
+BUNDLE_CONTRACT_DOC_KEYS = ("_why",)
+
+# ⛔⛔ MERGED OVER THE FALLBACK, NOT INDEXED RAW. The try/except above covers a
+# missing or unparseable file — it does NOT cover a file that parses into a
+# different SHAPE. Indexing `["actions"]["full"]` at module scope means a
+# contract whose `actions` was renamed or nested differently raises KeyError
+# during import and takes the whole backend down on every source checkout, with
+# no fallback reached. A merge cannot do that.
+_BUNDLE_CONTRACT = {**BUNDLE_CONTRACT_FALLBACK, **_bundle_contract()}
+_BUNDLE_CONTRACT_ACTIONS = {**BUNDLE_CONTRACT_FALLBACK["actions"],
+                            **(_BUNDLE_CONTRACT.get("actions")
+                               if isinstance(_BUNDLE_CONTRACT.get("actions"), dict)
+                               else {})}
+BUNDLE_MAX_RUNS = int(_BUNDLE_CONTRACT.get("maxRuns", 30))
 BUNDLE_MIN_RUNS = int(_BUNDLE_CONTRACT.get("minRuns", 1))
-SEND_LOGS_ACTION = str(_BUNDLE_CONTRACT["actions"]["full"])
-SEND_LOGS_LIMITED_ACTION = str(_BUNDLE_CONTRACT["actions"]["limited"])
-BUNDLE_MAX_AGE_DAYS = int(_BUNDLE_CONTRACT["maxAgeDays"])
+SEND_LOGS_ACTION = str(_BUNDLE_CONTRACT_ACTIONS["full"])
+SEND_LOGS_LIMITED_ACTION = str(_BUNDLE_CONTRACT_ACTIONS["limited"])
+# ⛔⛔ A THIRD NAME, NOT A NEW FIELD ON AN OLD ONE. `_parse_bundle_runs` reads
+# only `runs`; a build one release behind would ignore an unknown selection and
+# collect the newest N — the person picks two runs and thirty leave. The action
+# NAME is the entire skew mechanism: an older worker deletes a command it does
+# not recognise and matches no dispatch branch, so the failure is "nothing left
+# the machine". Over-collection is the harm, so the failure has to point away
+# from it.
+SEND_LOGS_SELECTED_ACTION = str(_BUNDLE_CONTRACT_ACTIONS["selected"])
+BUNDLE_MAX_AGE_DAYS = int(_BUNDLE_CONTRACT.get("maxAgeDays", 30))
 BUNDLE_MAX_BYTES = 128 * 1024 * 1024
 BUNDLE_SYSTEM_TAIL_BYTES = 5 * 1024 * 1024
 # ⚠ ZIP, not tar.gz. The plan said both in different places; zip wins because
@@ -9656,9 +10212,154 @@ def _scan_run_folders(root=None) -> "list[dict]":
             "worker": meta.get("worker"),
             "build": meta.get("build"),
             "sizeBytes": _dir_size(folder),
+            # ⛔⛔ ON THE ROW, NEVER IN THE ARCHIVE. Wave 8 needs these to decide
+            # whose selection may name this folder, and the row is the only place
+            # a caller already has the meta open. But index.json is BUILT from
+            # this row and index.json SHIPS — so both keys are excluded there by
+            # `_INDEX_PRIVATE_KEYS`, and the pin that used to sit on this row now
+            # sits on the index, where the disclosure actually is.
+            "submitterUid": meta.get("submitterUid"),
+            "submitterSource": meta.get("submitterSource") or "unknown",
         })
     rows.sort(key=lambda r: r["startedEpoch"], reverse=True)
     return rows
+
+
+# Row keys that must never reach the bundle's index.json. A uid is an account
+# identifier: it is the one thing in the row that names a PERSON rather than a
+# run, and the archive already travels to us with the owner's consent for the
+# machine, not with every submitter's consent for their identity.
+_INDEX_PRIVATE_KEYS = ("dir", "submitterUid", "submitterSource")
+
+
+# ─── Telling the app which runs this machine still holds ───────────────
+# ⛔⛔ THE APP CANNOT KNOW THIS, AND THAT IS THE WHOLE REASON THIS EXISTS. The
+# owner decided (2026-08-23) that runs whose logs are gone are HIDDEN from the
+# picker rather than greyed out — "the list shows only what can actually be
+# sent". Nothing in Firestore knows what is on that disk: local retention is 60
+# runs / 30 days, the research documents outlive it, and a machine that was
+# reset keeps none of them. So the machine has to say.
+#
+# ⭐⭐ IT PUBLISHES IDS, NEVER LABELS. There is no topic and no title anywhere in
+# a run folder — not in `meta.json`, not in `events.json` — and that absence is
+# deliberate: `_run_log_folder_name` has no `run_id` parameter precisely so a
+# topic cannot reach a folder name. The app already holds the titles, in its own
+# research documents, and joins them on `researchId`. So no topic ever leaves the
+# machine through this channel, and the picker still reads like a list of
+# researches rather than a list of directory names.
+#
+# ⭐ ONE DOCUMENT PER SUBMITTER, IN THAT SUBMITTER'S OWN TREE. A field on the
+# device document would be readable by EVERY sharer (firestore.rules pins device
+# reads to owner + sharedWith + the device itself), so one sharer would learn
+# every other sharer's run history. `users/{uid}/deviceRunLogs/{deviceId}` is
+# scoped by construction, reuses the `deviceWritingTo` family the device already
+# writes research documents through, and needs no new rule family — only a new
+# match block.
+#
+# ⛔ Unattributed runs are published to NOBODY. Every run folder in the field
+# today is unattributed, so on day one this list is empty for everyone — which is
+# the accepted consequence of not backfilling, and why `--send-logs --select` at
+# the terminal shows the owner every run regardless.
+RUN_INDEX_MAX = LOCAL_RUNS_KEEP
+RUN_INDEX_PUBLISH_INTERVAL_MS = 60_000
+_run_index_published: "dict[str, str]" = {}
+_run_index_next_ms = 0
+
+
+def _run_index_entry(row) -> dict:
+    """One published run descriptor. Every field typed and bounded, because the
+    rule that accepts this document will be held to the standard the logBundles
+    rule set: a key list alone does not deliver "this cannot carry content"."""
+    return {
+        "name": str(row.get("name") or "")[:96],
+        "researchId": str(row.get("researchId") or "")[:64],
+        "startedUtc": str(row.get("startedUtc") or "")[:32],
+        "status": str(row.get("status") or "unknown")[:24],
+        "sizeBytes": int(row.get("sizeBytes") or 0),
+        "attempt": int(row.get("attempt") or 0),
+    }
+
+
+def _run_index_by_submitter(rows) -> "dict[str, dict]":
+    """The per-submitter payloads a scan implies. Pure: rows in, documents out.
+
+    ⛔ Newest first and then truncated, so what a bound removes is the oldest —
+    the opposite direction was measured wrong once already in this file, on the
+    source cap, and the comment there is explicit that truncation DIRECTION
+    matters as much as the number."""
+    grouped: "dict[str, list]" = {}
+    for row in rows:
+        uid = row.get("submitterUid")
+        if not uid:
+            continue
+        grouped.setdefault(str(uid), []).append(row)
+    out = {}
+    for uid, items in grouped.items():
+        items.sort(key=lambda r: float(r.get("startedEpoch") or 0), reverse=True)
+        out[uid] = {
+            "runs": [_run_index_entry(r) for r in items[:RUN_INDEX_MAX]],
+            "truncated": len(items) > RUN_INDEX_MAX,
+        }
+    return out
+
+
+def _publish_run_log_index(force=False, now_ms=None) -> "dict[str, bool]":
+    """Write each submitter's "runs this machine still holds" document.
+
+    Returns {uid: written}. Best-effort throughout: a machine that cannot
+    publish is a machine whose picker is empty, which fails toward offering
+    nothing rather than toward offering something it cannot send.
+
+    ⭐ CHANGE-GATED AND THROTTLED, copying the version-signal block in the
+    heartbeat: only write when a submitter's list actually differs, and at most
+    once a minute. The scan is a directory walk plus a `meta.json` read per
+    folder, which is why it is not on the 5-second tick.
+
+    ⛔⛔ AND IT MUST WRITE THE EMPTIES. A submitter whose last run was just pruned
+    needs their document to become an empty list — otherwise the picker keeps
+    offering a run whose logs are gone, which is the precise thing the owner's
+    hidden-not-greyed decision was meant to prevent. So the previously-published
+    set is tracked, and a uid that drops out of the scan is published once more
+    as empty rather than simply skipped."""
+    global _run_index_next_ms
+    if not _firebase_db:
+        return {}
+    stamp = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    if not force and stamp < _run_index_next_ms:
+        return {}
+    _run_index_next_ms = stamp + RUN_INDEX_PUBLISH_INTERVAL_MS
+
+    device_id = load_device_id()
+    if not device_id:
+        return {}
+    payloads = _run_index_by_submitter(_scan_run_folders())
+    # A uid we published to before and that has no runs now still needs one
+    # final, empty write — see the docstring.
+    for uid in list(_run_index_published):
+        payloads.setdefault(uid, {"runs": [], "truncated": False})
+
+    written: "dict[str, bool]" = {}
+    for uid, payload in payloads.items():
+        fingerprint = json.dumps(payload, sort_keys=True)
+        if not force and _run_index_published.get(uid) == fingerprint:
+            continue
+        try:
+            _firebase_db.collection("users").document(uid) \
+                .collection("deviceRunLogs").document(device_id) \
+                .set(_be_payload({
+                    "runs": payload["runs"],
+                    "truncated": payload["truncated"],
+                    "updatedAt": _utc_iso(),
+                }))
+            _run_index_published[uid] = fingerprint
+            written[uid] = True
+        except Exception as exc:
+            # ⚠ DEBUG, not WARN. Until the rule ships this is a 403 on every
+            # machine, once a minute — and a WARN that fires on every healthy
+            # device is how a log stops being read.
+            log(f"[run-index] publish skipped for {uid[:8]}…: {exc}", "DEBUG")
+            written[uid] = False
+    return written
 
 
 def _select_bundle_runs(rows, max_runs=BUNDLE_MAX_RUNS,
@@ -10288,24 +10989,108 @@ def _clear_local_logs(root=None, telemetry_root=None) -> dict:
     return out
 
 
+def _pick_selected_runs(rows, only_runs, requester_uid=None,
+                        max_runs=BUNDLE_MAX_RUNS) -> "tuple[list, dict]":
+    """The rows an EXPLICIT selection resolves to, plus what it could not have.
+
+    Pure: rows in, rows out, no filesystem — so the whole selection policy is
+    testable without building an archive, exactly like `_select_bundle_runs`.
+
+    ⛔⛔ IT FAILS CLOSED ON ATTRIBUTION, AND THAT IS NOT THEORETICAL. Not one run
+    folder on any machine in the field records a submitter: the field landed
+    2026-08-21 and the shipped wheel has zero occurrences of it. So "unknown
+    submitter" is the COMMON case today, and treating it as "matches whoever
+    asked" would hand a sharer's two-run selection the entire machine. A row
+    whose `submitterUid` is None matches nobody.
+
+    ⛔ NO AGE BOUND HERE, deliberately. The on-disk retention and the bundle's
+    age bound are the same 30 days, so anything still on disk is inside the
+    window by construction — and re-applying it could only ever drop a run the
+    person explicitly ticked, silently. The COUNT bound is kept, because it is
+    the signed-off ceiling on how much one bundle carries, and what it removes
+    is reported rather than dropped quietly.
+
+    ⛔ Names are matched against the scanned rows, never joined onto a path. A
+    name that is not a real folder resolves to nothing; there is no traversal to
+    defend against because the caller's string never becomes a path component.
+    """
+    by_name = {str(r.get("name")): r for r in rows}
+    picked, missing, refused = [], [], []
+    seen: "set[str]" = set()
+    for raw in (only_runs or []):
+        name = str(raw)
+        if name in seen:
+            continue
+        seen.add(name)
+        row = by_name.get(name)
+        if row is None:
+            missing.append(name)
+            continue
+        if requester_uid is not None and row.get("submitterUid") != requester_uid:
+            # ⚠ Counted, not named. The count tells support that a selection was
+            # narrowed; naming the folders would tell the REQUESTER which runs on
+            # this machine belong to somebody else.
+            refused.append(name)
+            continue
+        picked.append(row)
+    picked.sort(key=lambda r: float(r.get("startedEpoch") or 0), reverse=True)
+    cap = max(0, int(max_runs))
+    over = [r["name"] for r in picked[cap:]]
+    return picked[:cap], {
+        "runsRequested": len(seen),
+        "runsNotOnDisk": missing,
+        "runsNotAttributed": len(refused),
+        "runsOverCap": over,
+    }
+
+
 def _build_log_bundle(dest_path, support_code=None, now=None,
                       max_runs=BUNDLE_MAX_RUNS, max_age_days=BUNDLE_MAX_AGE_DAYS,
-                      max_bytes=BUNDLE_MAX_BYTES) -> dict:
+                      max_bytes=BUNDLE_MAX_BYTES,
+                      only_runs=None, requester_uid=None,
+                      include_machine=True) -> dict:
     """Write the support bundle to `dest_path`. Returns a summary dict.
 
     Order inside the archive is the order a reader needs it: the manifest and
     the index first, then the newest run, then the rest newest-first, then
     sessions, then the raw tails. The size cap drops from the OLD end, and the
     newest run is added before the cap can bite — a bundle that dropped the run
-    the user is complaining about would be worse than no bundle."""
+    the user is complaining about would be worse than no bundle.
+
+    ⭐ `only_runs` — folder names the person actually ticked. `None` means the
+    old behaviour, the newest N inside the age bound, and that is what the
+    terminal and every pre-Wave-8 caller still get.
+
+    ⭐ `requester_uid` — scope the selection to runs attributed to this person.
+    `None` means "no attribution filter", which is the OWNER AT THE MACHINE: they
+    already hold every one of these files on their own disk, so filtering grants
+    nothing and would only hide the unattributed runs from the one person who
+    can act on them.
+
+    ⛔⛔ `include_machine=False` is what makes a sharer's bundle honest. MEASURED
+    on this machine: `backend.log` carries 18 distinct research ids and 15 topics
+    in queue paths while only 5 run folders exist — so the machine-level material
+    is not a smaller version of the runs, it is a superset of every run the
+    machine has ever seen, belonging to everyone who uses it. A per-run selection
+    that shipped it anyway would be a consent screen describing something else.
+
+    ⛔ EVERY BOUND THIS FUNCTION APPLIED IS REPORTED BY THIS FUNCTION, on
+    `maxRunsApplied`'s rule: a caller that forgets to pass a keyword must not be
+    able to produce a summary that reads as though it had."""
     import zipfile as _zipfile
 
     dest = Path(dest_path)
     dest.parent.mkdir(parents=True, exist_ok=True)
     rows = _scan_run_folders()
-    selected = _select_bundle_runs(rows, max_runs=max_runs,
-                                   max_age_days=max_age_days, now=now)
-    sessions = _select_bundle_sessions(max_age_days=max_age_days, now=now)
+    if only_runs is None:
+        selected = _select_bundle_runs(rows, max_runs=max_runs,
+                                       max_age_days=max_age_days, now=now)
+        selection_report = {}
+    else:
+        selected, selection_report = _pick_selected_runs(
+            rows, only_runs, requester_uid=requester_uid, max_runs=max_runs)
+    sessions = (_select_bundle_sessions(max_age_days=max_age_days, now=now)
+                if include_machine else [])
 
     written = 0
     dropped_runs: "list[str]" = []
@@ -10345,7 +11130,8 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
         written += len(data)
 
     with _zipfile.ZipFile(dest, "w", compression=_zipfile.ZIP_DEFLATED) as zf:
-        index = [{k: v for k, v in row.items() if k != "dir"} for row in selected]
+        index = [{k: v for k, v in row.items() if k not in _INDEX_PRIVATE_KEYS}
+                 for row in selected]
         _add_bytes(zf, json.dumps({
             "schema": 1,
             "createdUtc": _utc_iso(),
@@ -10358,6 +11144,12 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
                        "systemTailBytes": BUNDLE_SYSTEM_TAIL_BYTES},
             "runsOnDisk": len(rows),
             "runsSelected": len(selected),
+            # What this archive is: a whole-machine bundle, or one person's
+            # selection. A reader who cannot tell them apart will read a short
+            # bundle as a broken machine.
+            "selectionApplied": only_runs is not None,
+            "requesterScoped": requester_uid is not None,
+            "machineIncluded": bool(include_machine),
         }, indent=1).encode("utf-8"), "manifest.json")
         _add_bytes(zf, json.dumps(index, indent=1, default=str).encode("utf-8"),
                    "index.json")
@@ -10411,7 +11203,14 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
             else:
                 dropped_sessions.append(members[0].name)
 
-        for path in _system_log_tails():
+        # ⛔⛔ THE HALF A RUN SELECTION CANNOT BOUND. Measured on this machine:
+        # backend.log carries 18 distinct research ids and 15 topics in queue
+        # paths against 5 run folders on disk. These tails are not a smaller
+        # version of the runs — they are a superset of everything the machine has
+        # ever done, for everyone who uses it. So a bundle scoped to one person's
+        # runs must not carry them at all; there is no filter that would make it
+        # honest, only omission.
+        for path in (_system_log_tails() if include_machine else []):
             if not _bundle_source_is_allowed(path):
                 refused.append(str(path))
                 continue
@@ -10439,6 +11238,11 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
             "sourcesRefused": refused,
             "systemTailFilter": tail_stats,
             "uncompressedBytes": written,
+            "machineIncluded": bool(include_machine),
+            # Empty when no selection was made. Present and specific when one
+            # was, because "you ticked six and got four" is a fact the person
+            # is owed and only this function knows.
+            **selection_report,
         }, indent=1).encode("utf-8"), "collected.json")
 
     return {
@@ -10449,6 +11253,15 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
         # caller's own variable would still read as 30 while 30 runs shipped
         # against a request for 3.
         "maxRunsApplied": int(max_runs),
+        # ⛔ ON THE SAME PROVENANCE RULE AS `maxRunsApplied`, and for a sharper
+        # reason. A run-selection keyword that a caller forgets is ACCEPTED AND
+        # IGNORED — every existing test stub for this function is `lambda dest,
+        # **k`, so a dropped selection is invisible to all of them and the
+        # default is the newest thirty. The builder says what it actually did.
+        "selectionApplied": only_runs is not None,
+        "requesterScoped": requester_uid is not None,
+        "machineIncluded": bool(include_machine),
+        **selection_report,
         "sizeBytes": dest.stat().st_size if dest.exists() else 0,
         "uncompressedBytes": written,
         "runCount": len(included_runs),
@@ -10945,6 +11758,18 @@ def start_firestore_start_listener(job_queue, loop):
     col_ref = _firebase_db.collection("devices").document(did).collection("queue")
     listener_label = f"devices/{did[:8]}…/queue/"
 
+    # ⛔⛔ THE CROSS-PERSON PATH, AND THE ONE MARKING THAT IS ACTUALLY A PRIVACY
+    # FIX RATHER THAN NOISE CONTROL. This callback sees every submission to this
+    # device from every person who shares it, and logs each one with its topic
+    # and its submitter — while some OTHER person's run is armed. That is the one
+    # shape a sharer's bundle must never carry, and it is why the exclusion
+    # mechanism earns its keep even though the measured pollution is telemetry.
+    #
+    # ⚠ Covers the deferred `queueowners-defer` threads too, but only because
+    # their target is separately marked: a raw thread starts with an EMPTY
+    # context, so this block does not reach them. That is the correct default —
+    # a raw thread the pipeline spawns is doing the run's work.
+    @_machine_logged
     def on_snapshot(_col_snapshot, changes, _read_time):
         for change in changes:
             if change.type.name != 'ADDED':
@@ -11182,7 +12007,7 @@ def start_firestore_start_listener(job_queue, loop):
                 # gate_pending_job marker closes this gap.
                 gate_pending = _QUEUE_STATE.get("gate_pending_job") or {}
                 if gate_pending.get("research_id") == target_rid:
-                    log(f"Cancel: target {target_rid[:8]}… is in gate wait — requesting stop + flipping status{' (owner '+_oc+')' if _oc else ''}", "INFO")
+                    _log_about_the_armed_run(f"Cancel: target {target_rid[:8]}… is in gate wait — requesting stop + flipping status{' (owner '+_oc+')' if _oc else ''}")
                     loop.call_soon_threadsafe(_controls.request_stop)
                     if _firebase_db:
                         from google.cloud.firestore import DELETE_FIELD as _DF
@@ -11200,7 +12025,7 @@ def start_firestore_start_listener(job_queue, loop):
                         pass
                     continue
                 if current.get("research_id") == target_rid:
-                    log(f"Cancel: target {target_rid[:8]}… is the running job — requesting stop + scheduling exit{' (owner '+_oc+')' if _oc else ''}", "INFO")
+                    _log_about_the_armed_run(f"Cancel: target {target_rid[:8]}… is the running job — requesting stop + scheduling exit{' (owner '+_oc+')' if _oc else ''}")
                     loop.call_soon_threadsafe(_controls.request_stop)
                     run_id = current.get("run_id") or ""
                     if run_id:
@@ -11244,7 +12069,7 @@ def start_firestore_start_listener(job_queue, loop):
                         # the sync path.
                         gate_pending_now = _QUEUE_STATE.get("gate_pending_job") or {}
                         if gate_pending_now.get("research_id") == rid:
-                            log(f"Cancel: target {rid[:8]}… moved to gate wait between listener checks — requesting stop{' (owner '+oc+')' if oc else ''}", "INFO")
+                            _log_about_the_armed_run(f"Cancel: target {rid[:8]}… moved to gate wait between listener checks — requesting stop{' (owner '+oc+')' if oc else ''}")
                             _controls.request_stop()
                             if _firebase_db:
                                 from google.cloud.firestore import DELETE_FIELD as _DF
@@ -11271,7 +12096,7 @@ def start_firestore_start_listener(job_queue, loop):
                         # current_job here closes that window.
                         current_now = _QUEUE_STATE.get("current_job") or {}
                         if current_now.get("research_id") == rid:
-                            log(f"Cancel: target {rid[:8]}… popped to current_job between listener checks — routing to stop+exit{' (owner '+oc+')' if oc else ''}", "INFO")
+                            _log_about_the_armed_run(f"Cancel: target {rid[:8]}… popped to current_job between listener checks — routing to stop+exit{' (owner '+oc+')' if oc else ''}")
                             _controls.request_stop()
                             run_id_now = current_now.get("run_id") or ""
                             if run_id_now:
@@ -11579,6 +12404,10 @@ def start_firestore_start_listener(job_queue, loop):
             if action != "start":
                 continue
             uid = data.get("uid", "")
+            # The rules-pinned writer. `uid` above is a CLAIM (see the block
+            # under the required-field gate); this is the one the queue rule
+            # constrains to `request.auth.uid`.
+            submitted_by = str(data.get("submittedBy") or "").strip()
             research_id = data.get("researchId", "")
             topic = data.get("topic", "").strip()
             email = data.get("email", "")
@@ -11609,9 +12438,33 @@ def start_firestore_start_listener(job_queue, loop):
             # rule that guards a different field.)
             # It holds together today only because every writer sets both fields
             # to the same value: the four `action: "start"` paths all go through
-            # the app's one payload builder. The guard that would make that an
-            # invariant instead of a habit — refusing a start doc whose two
-            # identity fields disagree — is deliberately NOT here yet.
+            # the app's one payload builder.
+            #
+            # ⭐ 2026-08-24 — THE GUARD THIS COMMENT SAID WAS MISSING IS NOW HERE,
+            # and it is START-ONLY on purpose. The owner-control path writes
+            # `uid: <sharer>` with `submittedBy: <owner>` DELIBERATELY, and that
+            # divergence is live — but it does so on a `cancel` doc, which never
+            # reaches this point (the `action != "start"` continue is above).
+            # A blanket equality clause anywhere higher would break stop/cancel.
+            #
+            # ⛔ A DIVERGENT START DOC IS A TREE THE WRITER DOES NOT OWN. The run
+            # would execute in someone else's tree — their sharer keys, their
+            # research documents, their status writes — on the say-so of a field
+            # the rules never checked. An absent `submittedBy` is NOT this case:
+            # a legacy start doc names no writer at all, and that resolves to an
+            # unattributed run rather than a refused one.
+            #
+            # ⚠ Refused the same way its two sibling gates refuse (delete + WARN,
+            # no research-doc write). Whether any of the three should also tell
+            # the person watching is a real question, and it is the SAME question
+            # for all three — answering it for this one alone would leave the
+            # branch beside it silent and make the inconsistency look deliberate.
+            if _start_doc_identity_refused(data, "start-listener"):
+                try:
+                    doc.reference.delete()
+                except Exception:
+                    pass
+                continue
             # Research-doc existence check — user may have deleted the chat
             # from the app between firing the research and us picking up the
             # queue doc. Without this, we'd run a full pipeline and try to
@@ -12177,12 +13030,16 @@ def start_firestore_start_listener(job_queue, loop):
             # lives inside run_server's closure scope.
             # Default-arg capture avoids the lambda-in-loop closure bug.
             def _enqueue_with_position_refresh(
-                t, e, c, r, u, ri, bt, us, ul,
+                t, e, c, r, u, ri, bt, us, ul, sb,
             ):
                 if _safe_enqueue(job_queue,
                         {"topic": t, "email": e, "config": c, "run_id": r,
                          "uid": u, "research_id": ri, "brief_text": bt,
-                         "user_sources": us, "user_links": ul},
+                         "user_sources": us, "user_links": ul,
+                         # Carried so the run's own log folder can record the
+                         # PINNED writer. Read at the dequeue, not here — the
+                         # job dict is the only thing that survives the hop.
+                         "submitted_by": sb},
                         source="start-listener"):
                     _recompute = _QUEUE_STATE.get("recompute_fn")
                     if _recompute is not None:
@@ -12214,8 +13071,8 @@ def start_firestore_start_listener(job_queue, loop):
                     # fire because no put landed on the queue.
                     _pending_enq_dec()
             loop.call_soon_threadsafe(
-                lambda t=topic, e=email, c=config, r=run_id, u=uid, ri=research_id, bt=brief_text, us=user_sources, ul=user_links:
-                    _enqueue_with_position_refresh(t, e, c, r, u, ri, bt, us, ul)
+                lambda t=topic, e=email, c=config, r=run_id, u=uid, ri=research_id, bt=brief_text, us=user_sources, ul=user_links, sb=submitted_by:
+                    _enqueue_with_position_refresh(t, e, c, r, u, ri, bt, us, ul, sb)
             )
 
     _start_listener = col_ref.on_snapshot(_guard_snapshot(on_snapshot, "start"))
@@ -61765,6 +62622,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                            api_key=api_key, resume_dir=str(queue_dir),
                            config=config,
                            run_id=run_id, uid=uid, research_id=research_id,
+                           # ⛔ THE RETRY MUST CARRY IT TOO. Attempt 2 arms its
+                           # OWN folder, so a dropped writer here would leave the
+                           # retry — the attempt most likely to be the one worth
+                           # sending — attributable to nobody.
+                           _submitted_by=_run_submitted_by(),
                            _crash_retries=(_crash_retries + 1 if _is_browser_crash else _crash_retries))
 
 
@@ -61779,14 +62641,32 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
 # `test_no_call_site_bypasses_the_capture`, because a new caller wired to
 # `run_pipeline` directly would get no folder and nothing would say so.
 async def run_pipeline_captured(*args, **kwargs):
+    # ⛔ POPPED, NOT FORWARDED, and it is deliberately not a `run_pipeline`
+    # parameter. The pipeline body has no use for the pinned writer — only the
+    # capture does — and adding an unused parameter to a 3,800-line signature
+    # to carry one diagnostic field is how a signature stops describing its
+    # function. It rides the WRAPPER because the wrapper is the consumer.
+    #
+    # ⚠ A caller that forgets it resolves to `unclaimed`, i.e. attributable to
+    # NOBODY. That is the safe direction and it is the point: an unattributed
+    # run cannot be put in anyone's support bundle. The two call sites that must
+    # pass it are pinned by test, because a silently-dropped kwarg would look
+    # exactly like a legacy start doc.
+    _claimed = kwargs.pop("_submitted_by", None)
     _rid, _attempt, _submitter = _run_pipeline_capture_key(args, kwargs)
     with _RunLogCapture(research_id=_rid, attempt=_attempt,
-                        submitted_by=_submitter):
+                        submitted_by=_submitter, claimed_by=_claimed):
         return await run_pipeline(*args, **kwargs)
 
 
 def _run_pipeline_capture_key(args, kwargs) -> "tuple[str | None, int, str | None]":
-    """(research_id, attempt, submitter_uid) for the folder, read off the REAL call.
+    """(research_id, attempt, TREE uid) for the folder, read off the REAL call.
+
+    ⛔ THE THIRD VALUE IS THE TREE, NOT THE SUBMITTER — renamed here 2026-08-24
+    because calling it the submitter is what let it be stamped as one. `uid` says
+    whose Firestore tree the run executes in; it is a claim the queue rules never
+    check. The rules-pinned writer arrives separately, as the wrapper's
+    `_submitted_by`, and `_resolve_run_submitter` needs both.
 
     Bound through `inspect.signature` against `run_pipeline` itself, so the
     wrapper cannot drift from the parameter list it forwards, and so
@@ -62124,6 +63004,17 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
                                     "resume_dir": str(queue_dir),
                                     "uid": tree_uid,
                                     "research_id": research_id,
+                                    # ⛔ NO QUEUE DOC EXISTS HERE — it was deleted
+                                    # when the run was first claimed, so the only
+                                    # writer still on record is the research doc's
+                                    # own. It sits in the tree being scanned, so it
+                                    # attributes an owner's or a sharer's own run
+                                    # correctly and refuses to attribute anything
+                                    # else. Absent on an old doc ⇒ `unclaimed`,
+                                    # i.e. sendable from the terminal but not from
+                                    # the app — the fail-closed direction.
+                                    "submitted_by": str(
+                                        data.get("submittedBy") or "").strip(),
                                 }, source="rehydrate-supervised-auto-resume"):
                                     rehydrated += 1
                                     auto_resumed = True
@@ -62674,6 +63565,10 @@ async def run_server(port=8000):
     ORPHAN_SWEEP_MIN_AGE_SEC = 300
     ORPHAN_SWEEP_IN_FLIGHT_STATUSES = {"ongoing", "queued"}
 
+    # Its one line is a verdict about OTHER runs' queue directories
+    # ("purged N orphan(s)") — measured landing inside two of the five run
+    # folders on this machine, describing neither of them.
+    @_machine_logged
     async def _orphan_sweep_loop():
         import shutil as _shutil
         while True:
@@ -62748,6 +63643,8 @@ async def run_server(port=8000):
     # latency is fine for a rare abandonment. Worker-1 only; mark-only.
     DEAD_WORKER_RECONCILE_INTERVAL_SEC = 90
 
+    # Reconciles runs owned by OTHER workers — by definition never this one's.
+    @_machine_logged
     async def _dead_worker_reconcile_loop():
         while True:
             try:
@@ -63747,6 +64644,17 @@ async def run_server(port=8000):
                     pass
                 continue
 
+            # ⭐ THE SECOND CLAIM SITE, refusing the same divergence the listener
+            # refuses — see `_start_doc_identity_conflict`. This sweep exists to
+            # pick up documents the listener did not take, so a doc the listener
+            # declined arrives here next; without this the refusal is a delay.
+            if _start_doc_identity_refused(d, "idle-rescan"):
+                try:
+                    await asyncio.to_thread(snap.reference.delete)
+                except Exception:
+                    pass
+                continue
+
             run_id = f"{safe_name(topic)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             log(f"[idle-rescan] worker {WORKER_ID}: picking up orphan {research_id[:8]}… ({topic[:40]}) submittedBy={(d.get('submittedBy') or '?')[:8]}")
 
@@ -63791,6 +64699,7 @@ async def run_server(port=8000):
                 "brief_text": (d.get("briefText") or "").strip(),
                 "user_sources": d.get("userSources") or [],
                 "user_links": d.get("userLinks") or [],
+                "submitted_by": str(d.get("submittedBy") or "").strip(),
             }, source="idle-rescan")
             # Real-time deferred-doc renumber (2026-05-22): the just-
             # claimed orphan was at some position N in the global FIFO
@@ -64074,6 +64983,7 @@ async def run_server(port=8000):
                                      verbose=True, resume_dir=job.get("resume_dir"),
                                      config=job.get("config"), run_id=job.get("run_id"),
                                      uid=job.get("uid"), research_id=job.get("research_id"),
+                                     _submitted_by=job.get("submitted_by"),
                                      brief_text=job.get("brief_text", ""),
                                      user_sources=job.get("user_sources") or [],
                                      user_links=job.get("user_links") or []))
@@ -64624,6 +65534,9 @@ async def run_server(port=8000):
         # so a tail of any worker's log shows liveness. The pulse itself now
         # alternates COLOUR rather than the glyph — see `_aegis_pulse_line`,
         # which owns that decision so a test can assert it without a 60s wait.
+        # Supervision pulse: a fixed-cadence heartbeat about the machine's own
+        # watch state, with no run in it at any point.
+        @_machine_logged
         async def _aegis_pulse_loop():
             i = 0
             # ⛔⛔ THE TICK STAYS AT 60s AND THE EMISSION WIDENS. Those are two
@@ -64677,6 +65590,10 @@ async def run_server(port=8000):
         # The rescan it calls is idempotent + CAS-safe (last_update_time
         # precondition) and self-gates on idle/exit/single-worker/FE-gate, so
         # concurrent timers across N workers are safe — at most one wins each doc.
+        # ⛔ THE CROSS-PERSON ONE ON THE SWEEP SIDE. It claims orphans belonging
+        # to anyone who shares this device and logs each pickup with that
+        # person's topic and submitter — a sharer's bundle must not carry those.
+        @_machine_logged
         async def _idle_rescan_loop():
             # Base + per-worker jitter so N workers don't scan in lockstep (no
             # thundering-herd of empty-queue reads). ~15-25s recovery latency is
@@ -72684,7 +73601,8 @@ def _network_verdict(probes: "list[dict]") -> dict:
 BUNDLE_LIFECYCLE_VERIFIED = False
 
 
-def _send_logs_consent_lines(runs: int = BUNDLE_MAX_RUNS) -> "list[str]":
+def _send_logs_consent_lines(runs: int = BUNDLE_MAX_RUNS,
+                             chosen_exactly: bool = False) -> "list[str]":
     """Everything that leaves the machine, named. One line per fact.
 
     ⭐ The run bounds and the raw device logs are listed SEPARATELY on purpose:
@@ -72692,12 +73610,31 @@ def _send_logs_consent_lines(runs: int = BUNDLE_MAX_RUNS) -> "list[str]":
     bound at all — a machine that predates per-run capture has its whole history
     only there. Folding them into one sentence would make the 30-day half a
     claim about bytes it does not cover.
+
+    ⭐⭐ `chosen_exactly` is what `--select` sets, and the difference it makes is
+    a promise this command otherwise cannot keep. Without a selection the first
+    line has to say "at MOST n, and only those from the last 30 days" — a
+    ceiling, because the collector sorts age-eligible runs newest-first and takes
+    the top n, so a machine with fifty inside the window sends thirty. With a
+    selection the person named the runs, every name came from a list of what the
+    machine actually holds, and the count is exact. Saying "at most" there would
+    understate a request the person made precisely.
+
+    ⛔ AND THE AGE BOUND DROPS WITH IT, for the same reason: it can no longer
+    remove anything that was picked. Repeating it would describe a filter with
+    nothing left to filter.
     """
-    n = max(BUNDLE_MIN_RUNS, min(int(runs), BUNDLE_MAX_RUNS))
+    if chosen_exactly:
+        n = max(0, int(runs))
+        first = ("no runs — this machine's own log files only" if n == 0 else
+                 f"the {n} run{'' if n == 1 else 's'} you chose, and only those")
+    else:
+        n = max(BUNDLE_MIN_RUNS, min(int(runs), BUNDLE_MAX_RUNS))
+        first = (f"at most {n} run{'' if n == 1 else 's'} from this machine — and only "
+                 f"{'if it is' if n == 1 else 'those'} from the last "
+                 f"{BUNDLE_MAX_AGE_DAYS} days")
     lines = [
-        f"at most {n} run{'' if n == 1 else 's'} from this machine — and only "
-        f"{'if it is' if n == 1 else 'those'} from the last "
-        f"{BUNDLE_MAX_AGE_DAYS} days",
+        first,
         "your research topics, and the titles of what each run produced",
         "links that open your research results — anyone holding one can read them",
         "the email address on your account",
@@ -72713,6 +73650,9 @@ def _send_logs_consent_lines(runs: int = BUNDLE_MAX_RUNS) -> "list[str]":
     # reads as "less of everything leaves", which is the one thing it does not
     # mean.
     lines.append(
+        "⚠ only the first line above is what your choice changes — everything "
+        "else leaves in full whichever runs you pick"
+        if chosen_exactly else
         f"⚠ only the first line above is what the {n}-run choice changes — "
         f"everything else leaves in full whatever number you pick")
     if BUNDLE_LIFECYCLE_VERIFIED:
@@ -72828,19 +73768,136 @@ def _post_bundle_to_ingest(local_path: "Path", code: str,
         return code
 
 
+def _format_run_choice(index: int, row: dict) -> str:
+    """One numbered line in the terminal's run list.
+
+    ⛔⛔ NO TOPIC AND NO TITLE, and not because they are unavailable to a person
+    standing at their own machine — they hold every one of these files on their
+    own disk. It is because there is nowhere to READ one from. A run folder
+    carries no topic and no title: `_run_log_folder_name` has no `run_id`
+    parameter precisely so a topic cannot reach a folder name, and `meta.json`
+    and `events.json` carry neither. The only topic text anywhere in a run
+    folder is inside `run.log`, and a parser over user-controlled text feeding a
+    disclosure decision is exactly what this wave's design rejected.
+
+    ⭐ So the row is what the machine actually knows: when it started, how it
+    ended, and how big it is. That is enough to find "the one from Tuesday that
+    hung", which is the question somebody at a terminal is actually asking."""
+    started = str(row.get("startedUtc") or "")[:19].replace("T", " ") or "unknown time"
+    status = str(row.get("status") or "unknown")
+    size_kb = int(row.get("sizeBytes") or 0) // 1024
+    return f"{index:>3}. {started}  {status:<14} {size_kb:>6} KB"
+
+
+def _parse_run_choice(answer: str, count: int) -> "list[int] | None":
+    """Which of `count` numbered rows an answer names, or None meaning "unreadable".
+
+    ⛔⛔ REFUSES RATHER THAN GUESSING, on this file's own standing rule: a
+    malformed request must never resolve toward MORE collection than was agreed
+    to. `1,3` and `1 3` and `1, 3` all mean the same thing; `1-3` does NOT mean
+    a range here and is refused, because a person who meant "1 and 3" and typed
+    a dash would otherwise silently send 2 as well.
+
+    ⭐ `all` and an empty answer are both explicit and both mean something. Empty
+    is the machine-level bundle — the pairing-failure case, which is exactly when
+    there are no runs to choose from — and it is the DEFAULT because it is the
+    smallest thing the command can do.
+
+    Returns 0-based indices, de-duplicated, in the order the person typed them."""
+    text = (answer or "").strip().lower()
+    if not text:
+        return []
+    if text in ("all", "a", "*"):
+        return list(range(count))
+    out: "list[int]" = []
+    for token in re.split(r"[,\s]+", text):
+        if not token:
+            continue
+        if not token.isdigit():
+            return None
+        n = int(token)
+        if n < 1 or n > count:
+            return None
+        if (n - 1) not in out:
+            out.append(n - 1)
+    return out
+
+
+def _choose_runs_interactively(rows: "list[dict]") -> "list[str] | None":
+    """Print the numbered list and read a choice. None means "the person quit".
+
+    ⛔ THE OWNER AT THE MACHINE SEES EVERY RUN ON IT, including the ones no
+    account can be attributed to — which today is all of them, since no shipped
+    build recorded a submitter. They already hold these files on their own disk,
+    so listing them grants nothing; withholding them would only hide the machine's
+    whole history from the one person who can act on it."""
+    if not rows:
+        print(f"  {_c(_DIM, 'This machine is holding no run logs.')}")
+        return []
+    print()
+    print(f"  {_c(_BOLD, 'Runs this machine still has logs for')}")
+    for i, row in enumerate(rows, 1):
+        print(f"    {_c(_DIM, _format_run_choice(i, row))}")
+    print()
+    # ⛔⛔ BUILT OUTSIDE THE f-STRING, and this is a portability fix rather than a
+    # style one. A LINE BREAK inside an f-string replacement field is Python
+    # 3.12+ syntax; `pyproject` declares `requires-python = ">=3.11"`, so on the
+    # floor this repo supports the original form is a SyntaxError at IMPORT and
+    # the whole backend fails to start. Caught by ruff, which reported it as
+    # `invalid-syntax` rather than a lint — the delta that made the count 11.
+    _hint = ("Type numbers like  1,3  ·  [all] every run  ·  "
+             "[Enter] none, machine logs only")
+    print(f"    {_c(_DIM, _hint)}")
+    for _ in range(3):
+        try:
+            answer = input(f"  {_c(_ACCENT, '>')}  Choose ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        picked = _parse_run_choice(answer, len(rows))
+        if picked is not None:
+            # ⭐ ECHO WHAT WAS UNDERSTOOD, like the yes/no reader does. A silent
+            # interpretation is how "2" became a yes at a prompt that never
+            # offered it, which is the defect that produced that reader.
+            if picked:
+                print(f"     {_c(_DIM, f'Sending {len(picked)} run(s).')}")
+            else:
+                print(f"     {_c(_DIM, 'Sending no runs — this machine' + chr(39) + 's own logs only.')}")
+            return [str(rows[i].get("name")) for i in picked]
+        print(f"     {_c(_WARN, 'Numbers from the list, or ' + chr(39) + 'all' + chr(39) + ', or Enter for none.')}")
+    # ⛔ GIVES UP OUT LOUD rather than applying a default nobody chose — the same
+    # rule `_ask_yes_no_sync` gives up under, for the same reason.
+    print(f"  {_c(_WARN, '⚠')}  Could not read a choice. Nothing was sent.")
+    return None
+
+
 def cmd_send_logs(assume_yes: bool = False, email: "str | None" = None,
-                  runs: "int | None" = None) -> int:
+                  runs: "int | None" = None, select: bool = False) -> int:
     """`superresearch --send-logs` — hand the logs over from the terminal.
 
     Returns a process exit code. 0 means something landed OR the local file was
     written, because the local file IS a successful outcome: it is what a person
     attaches to an email when their network is the thing that is broken."""
     _branded_header("nuntius", _BOLD + _ACCENT, "hand it over")
+
+    # ⭐ THE CHOICE COMES BEFORE THE DISCLOSURE, on purpose. The consent screen
+    # names a number of runs, and until the person has chosen there is no number
+    # to name — printing "at most 30" and then asking for two would describe a
+    # bundle nobody is about to build.
+    only_runs: "list[str] | None" = None
+    if select:
+        chosen = _choose_runs_interactively(_scan_run_folders())
+        if chosen is None:
+            return 130
+        only_runs = chosen
+
     print()
     print(f"  {_c(_BOLD, 'What leaves this machine')}")
     n_runs = BUNDLE_MAX_RUNS if runs is None else max(
         BUNDLE_MIN_RUNS, min(int(runs), BUNDLE_MAX_RUNS))
-    for line in _send_logs_consent_lines(n_runs):
+    for line in _send_logs_consent_lines(
+            len(only_runs) if only_runs is not None else n_runs,
+            chosen_exactly=only_runs is not None):
         print(f"    {_c(_DIM, '•')}  {line}")
     print()
     print(f"  {_c(_BOLD, 'What does not')}")
@@ -72863,7 +73920,8 @@ def cmd_send_logs(assume_yes: bool = False, email: "str | None" = None,
 
     # ── Rung 0: the file. Always, first, and printed. ──
     try:
-        summary = _build_log_bundle(dest, support_code=code, max_runs=n_runs)
+        summary = _build_log_bundle(dest, support_code=code, max_runs=n_runs,
+                                    only_runs=only_runs)
     except Exception as exc:
         print(f"  {_c(_WARN, '⚠')}  Could not build the log bundle: {exc}")
         print(f"  {_c(_DIM, 'The raw logs are still here:')}  "
@@ -74620,6 +75678,11 @@ def main():
         help=f"How many recent runs --send-logs should include (1-{BUNDLE_MAX_RUNS}). "
              f"Default: all {BUNDLE_MAX_RUNS}. Sessions and this machine's own log "
              f"files are included whatever you pick.")
+    parser.add_argument("--select", action="store_true", dest="send_logs_select",
+        help="Choose which runs --send-logs includes, from a numbered list of "
+             "what this machine still has. Enter alone sends no runs — just this "
+             "computer's own log files, which is the whole evidence when a "
+             "pairing failure produced no run at all.")
     parser.add_argument("--contact-email", default=None, dest="contact_email",
         help="Optional address to reach you on if --send-logs cannot use your "
              "account. Never verified, never used as an identifier.")
@@ -74704,6 +75767,7 @@ def main():
 
     if args.send_logs:
         raise SystemExit(cmd_send_logs(assume_yes=bool(args.assume_yes),
+                                      select=bool(args.send_logs_select),
                                       email=args.contact_email,
                                       runs=args.send_logs_runs))
 

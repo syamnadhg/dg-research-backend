@@ -34,6 +34,12 @@ on:
       - "agent/requirements.txt"
       - "agent/requirements-dev.txt"
       - "agent/pyproject.toml"
+      # ⛔⛔ THE FILE THE GUARDS EXIST TO PROTECT WAS THE ONE FILE WHOSE CHANGE
+      # RAN NONE OF THEM. `bundle-contract.json` is committed byte-identical to
+      # the app repo and pinned by digest in both suites — and it matched no
+      # path filter here, so editing it alone triggered no backend workflow.
+      # Added 2026-08-24 alongside the digest pins.
+      - "bundle-contract.json"
       - ".github/workflows/be-tests.yml"
   pull_request:
     paths:
@@ -43,6 +49,12 @@ on:
       - "agent/requirements.txt"
       - "agent/requirements-dev.txt"
       - "agent/pyproject.toml"
+      # ⛔⛔ THE FILE THE GUARDS EXIST TO PROTECT WAS THE ONE FILE WHOSE CHANGE
+      # RAN NONE OF THEM. `bundle-contract.json` is committed byte-identical to
+      # the app repo and pinned by digest in both suites — and it matched no
+      # path filter here, so editing it alone triggered no backend workflow.
+      # Added 2026-08-24 alongside the digest pins.
+      - "bundle-contract.json"
       - ".github/workflows/be-tests.yml"
   workflow_dispatch: {}
 

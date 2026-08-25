@@ -144,9 +144,14 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [('        for members in sessions:\n            group_bytes = 0',
        '        for members in []:\n            group_bytes = 0')],
      [T_BUNDLE]),
+    # ⛔ RE-ANCHORED 2026-08-24: the loop grew an `include_machine` gate when the
+    # builder learned to cut a bundle scoped to one person's runs. The mutant is
+    # unchanged in meaning — it drops the tails for EVERY bundle, including the
+    # owner's — which is now also the accept-polarity pin for that gate.
     ("B6", "under", "the raw device tails are dropped, so a machine that has "
      "been running since before per-run capture existed sends no history",
-     [('        for path in _system_log_tails():', '        for path in []:')],
+     [('        for path in (_system_log_tails() if include_machine else []):',
+       '        for path in []:')],
      [T_BUNDLE]),
     ("B8", "under", "⛔⛔ the collected-file pattern widens to every .log, so the "
      "e2e transcripts and debugging dumps in that directory ship too",
@@ -262,10 +267,12 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [('BUNDLE_CONTENT_TYPE = "application/zip"', 'BUNDLE_CONTENT_TYPE = "application/gzip"')],
      [T_BUNDLE]),
     ("B16", "under", "the index carries the run folder's absolute path, which "
-     "names the operating-system account in the part a ticket quotes",
-     [('        index = [{k: v for k, v in row.items() if k != "dir"} for row in selected]',
+     "names the operating-system account in the part a ticket quotes — and, "
+     "since Wave 8, the SUBMITTER UID of every run in the archive",
+     [('        index = [{k: v for k, v in row.items() if k not in _INDEX_PRIVATE_KEYS}\n'
+       '                 for row in selected]',
        '        index = [dict(row) for row in selected]')],
-     [T_BUNDLE]),
+     [T_BUNDLE, T_CAP]),
     ("B17", "under", "the manifest stops naming the bounds it applied, so a "
      "reader cannot tell a small bundle from a truncated one",
      [('            "bounds": {"maxRuns": int(max_runs), "maxAgeDays": int(max_age_days),',

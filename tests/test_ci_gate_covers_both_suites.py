@@ -150,6 +150,12 @@ REQUIRED_PATH_FILTERS = (
     "pyproject.toml",
     "agent/requirements.txt",
     "agent/pyproject.toml",
+    # ⛔⛔ ADDED 2026-08-24, AND IT IS THE SAME FAILURE SHAPE THIS FILE WAS
+    # WRITTEN FOR. `bundle-contract.json` is committed byte-identical to the app
+    # repo; two suites pin it and a third compares the two copies. It matched no
+    # filter here, so the ONE file whose whole purpose is to be guarded was the
+    # one file whose change ran none of its guards. `**.py` does not match it.
+    "bundle-contract.json",
     ".github/workflows/be-tests.yml",
 )
 

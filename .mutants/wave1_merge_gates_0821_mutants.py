@@ -72,7 +72,8 @@ _HELPER_GUARD = """        log(f"[send-logs] refusing ({error_class}) with NO ro
         return"""
 
 _HELPER_PARK = """    patch = {"status": "failed", "errorClass": error_class}
-    if not (_open_log_bundle_row(owner_uid, code, device_id, request_id)
+    if not (_open_log_bundle_row(owner_uid, code, device_id, request_id,
+                                machine_included=machine_included)
             and _write_log_bundle_status(owner_uid, code, patch)):
         _queue_log_bundle_row(owner_uid, code, patch, device_id=device_id)"""
 
@@ -87,8 +88,12 @@ _NOT_OWNER = """        _refuse_log_bundle_with_row(owner_uid, code, device_id, 
 
 _BUILDING = """    if _already_building:"""
 
-_BUILDING_CALL = """        _refuse_log_bundle_with_row(owner_uid, code, device_id, request_id,
-                                    "AlreadyBuilding")
+# ⛔ RE-ANCHORED 2026-08-24 (Wave 8 command path: the row tree is the SUBMITTER's
+# on the scoped action, and every refusal now states whether it carries
+# machine-level material). Meaning unchanged.
+_BUILDING_CALL = """        _refuse_log_bundle_with_row(row_uid, code, device_id, request_id,
+                                    "AlreadyBuilding",
+                                    machine_included=machine_wanted)
         return"""
 
 _LOCK = """    _already_building = False
@@ -98,19 +103,20 @@ _LOCK = """    _already_building = False
         else:
             _send_logs_inflight = True"""
 
-_META_KEYS = """            "submitterUid": self.submitted_by,
-            "submitterSource": "queue" if self.submitted_by else "local","""
+_META_KEYS = """            "submitterUid": self.submitter_uid,
+            "submitterSource": self.submitter_source,"""
 
 _SINK_SET = """        self.submitted_by = (str(submitted_by).strip() or None) if submitted_by else None"""
 
-_CAP_PASS = """                started_utc=started, submitted_by=self.submitted_by)"""
+_CAP_PASS = """                started_utc=started, submitted_by=self.submitted_by,
+                claimed_by=self.claimed_by)"""
 
 _CAP_STORE = """        self.submitted_by = submitted_by"""
 
 _BIND = """                bound.arguments.get("uid") or None)"""
 
 _WRAP = """    with _RunLogCapture(research_id=_rid, attempt=_attempt,
-                        submitted_by=_submitter):"""
+                        submitted_by=_submitter, claimed_by=_claimed):"""
 
 _DOC_NOCALLER = """    ⚠ NO PRODUCTION CALLER — selection happens in the browser. This is the"""
 
@@ -227,7 +233,7 @@ MUTANTS: list[tuple[str, str, str, str, list[tuple[str, str]], list[str]]] = [
     ("A5", SRC, "over", "`submitterSource` is hardcoded, so a local run claims "
      "to have come from the queue and a null reads as a lost value rather than "
      "an absent one",
-     [(_META_KEYS, '            "submitterUid": self.submitted_by,\n'
+     [(_META_KEYS, '            "submitterUid": self.submitter_uid,\n'
                    '            "submitterSource": "queue",')],
      [T_NEW, T_CAP]),
     ("A6", SRC, "over", "⛔ a local run's missing submitter is filled in from the "
@@ -243,11 +249,22 @@ MUTANTS: list[tuple[str, str, str, str, list[tuple[str, str]], list[str]]] = [
      "submitter and a crash freezes that wrong value on disk",
      [(_CAP_STORE, '        self.submitted_by = _RUN_SUBMITTER.get("uid")')],
      [T_NEW, T_CAP]),
-    ("A8", SRC, "over", "the new keys leak into the bundle's run index, so every "
-     "support archive's index.json changes shape in the same commit",
-     [('            "startedUtc": meta.get("startedUtc") or "",',
-       '            "startedUtc": meta.get("startedUtc") or "",\n'
-       '            "submitterUid": meta.get("submitterUid"),')],
+    # ⛔⛔ A8 RE-POINTED 2026-08-24 BECAUSE ITS MUTANT BECAME THE SHIPPED DESIGN.
+    # It added `submitterUid` to the scan ROW, which was the defect when the row
+    # fed index.json directly. Wave 8 needs it on the row — that is where the
+    # server-side selection filter reads it — and moved the exclusion to the
+    # index itself. The old edit is now a duplicate key in a dict literal:
+    # behaviour unchanged, an equivalent mutant, a tripwire measuring nothing.
+    #
+    # ⭐ The PROPERTY it was written for is unchanged and still worth a mutant:
+    # a uid must not travel inside a support archive. So it now attacks the
+    # exclusion list rather than the row, and it is measured against a different
+    # pair of suites than the Wave 8 harness's version of the same idea.
+    ("A8", SRC, "over", "⛔⛔ the submitter uid leaks into the bundle's run index, "
+     "so every support archive carries an account identifier for every run in "
+     "it — disclosed under a consent screen that names no such thing",
+     [('_INDEX_PRIVATE_KEYS = ("dir", "submitterUid", "submitterSource")',
+       '_INDEX_PRIVATE_KEYS = ("dir",)')],
      [T_NEW, T_CAP]),
 
     # ══ the three comments that told a reader the opposite ══════════════

@@ -452,8 +452,8 @@ MUTANTS += [
      [T_BRIDGE]),
     ("B9", "under", "⛔ the record is printed as ONE multi-line line, which is "
      "how a log grows orphan lines with no timestamp and no level",
-     [("            for line in (text.splitlines() or [\"\"]):\n                log(line, level)",
-       "            log(text, level)")],
+     [("                for line in (text.splitlines() or [\"\"]):\n                    log(line, level)",
+       "                log(text, level)")],
      [T_BRIDGE]),
     ("B10", "under", "the logger name is dropped, so six modules share one "
      "stream with nothing to tell them apart",

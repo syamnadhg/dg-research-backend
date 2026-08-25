@@ -238,13 +238,34 @@ def test_the_queue_comment_no_longer_claims_the_rule_validates_uid():
 
 
 def test_the_start_path_still_reads_the_field_the_comment_describes():
-    """A comment about `uid` is only correct while the code reads `uid`. If the
-    read is ever moved to `submittedBy` — which is the real fix, deferred out of
-    this wave — this fails and takes the comment with it."""
-    src = inspect.getsource(research)
-    idx = src.find("WHAT THE RULE PINS IS NOT WHAT WE JUST READ")
+    """A comment about `uid` is only correct while the code reads `uid`.
+
+    ⛔⛔ THIS FIRED ON 2026-08-24 AND THE PREMISE WAS FINE — the window was not.
+    It looked 1,200 bytes back from the comment, and Wave 8 inserted the pinned
+    field's own read plus a refusal branch between the two, pushing `uid = …` out
+    of range. The read had not moved at all.
+
+    ⭐ So it now searches the FUNCTION rather than a byte window. A distance in
+    characters is not a relationship between two pieces of code, and a tripwire
+    that fires on unrelated insertions teaches people to widen it without
+    looking — which is how a real move would eventually get waved through.
+
+    ⭐ And the assertion grew a second half: Wave 8 made the start path read BOTH
+    fields, so "it still reads uid" is no longer enough to know the comment is
+    right. The tree read and the pinned read have to be distinguishable."""
+    from conftest import code_only
+    src = code_only(research.start_firestore_start_listener)
+    assert 'uid = data.get("uid", "")' in src, (
+        "the start path no longer reads `uid` for the executing tree — the "
+        "correction above it now describes something else")
+    assert 'submitted_by = str(data.get("submittedBy") or "").strip()' in src, (
+        "the pinned writer is no longer read, so the comment's contrast between "
+        "the two fields describes code that does not exist")
+
+    # And the comment must no longer claim the guard is missing: Wave 8 added it.
+    whole = inspect.getsource(research)
+    idx = whole.find("WHAT THE RULE PINS IS NOT WHAT WE JUST READ")
     assert idx > 0
-    before = src[max(0, idx - 1200):idx]
-    assert 'uid = data.get("uid", "")' in before, (
-        "the start path no longer reads `uid` — the correction above it now "
-        "describes something else")
+    assert "is deliberately NOT here yet" not in whole[idx:idx + 2000], (
+        "the guard exists now — a comment saying it does not is the same class "
+        "of defect this test was written for")

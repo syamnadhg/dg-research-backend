@@ -1129,6 +1129,13 @@ def test_clear_still_leaves_the_collector_with_nothing_to_send(tmp_path, monkeyp
 #  9. The bundle contract's silent fallback
 # ══════════════════════════════════════════════════════════════════════════
 
+# ⛔ THE DIGEST OF `bundle-contract.json`, pinned identically in the app repo.
+# The cross-repo comparison SKIPS in CI (it resolves the other repo as a
+# sibling directory and only one is checked out), so this is what makes a
+# one-sided edit fail in this repo's own workflow.
+BUNDLE_CONTRACT_SHA256 = "f6b3276e68b7af798c5dab6075672fa488956ed539efb5da9975124b7a997f85"
+
+
 def test_the_bundle_contract_fallback_matches_the_file_it_falls_back_from():
     """⛔ `bundle-contract.json` does NOT ship in the wheel — pyproject packs
     `scripts` as package-data and nothing else — so `_bundle_contract`'s
@@ -1136,17 +1143,100 @@ def test_the_bundle_contract_fallback_matches_the_file_it_falls_back_from():
     happen to agree today; nothing was checking. Editing the file without
     editing the fallback would change the slider's meaning on a source checkout
     and leave every wheel on the old numbers, silently, which is the exact
-    two-repos-disagree failure the file was created to prevent."""
-    src = inspect.getsource(research._bundle_contract)
-    literal = src[src.index("return {", src.index("except Exception:")):]
-    fallback = ast.literal_eval(literal[len("return "):literal.rindex("}") + 1])
+    two-repos-disagree failure the file was created to prevent.
+
+    ⛔⛔ AND IT USED TO ITERATE THE FALLBACK'S KEYS, which is a guard that can
+    only ever catch drift in ONE direction. A key added to the FILE was invisible
+    — measured: `version` and `_why` had been sitting outside this check since
+    the file was created, and `version` is precisely the key a contract bump
+    would use. It now walks the UNION of both key sets.
+
+    ⚠ `_why` is exempt BY NAME. It is documentation for whoever opens the JSON,
+    it is hundreds of bytes of prose, and duplicating prose is how prose drifts.
+    The exemption is a decision on record rather than an accident of which side
+    the loop happened to read."""
+    fallback = research.BUNDLE_CONTRACT_FALLBACK
     on_disk = json.loads(
         (Path(research.__file__).resolve().parent / "bundle-contract.json")
         .read_text(encoding="utf-8"))
-    for key in fallback:
+    doc_only = set(research.BUNDLE_CONTRACT_DOC_KEYS)
+    for key in (set(fallback) | set(on_disk)) - doc_only:
+        assert key in fallback, (
+            f"{key}: the file has it and the fallback does not — every installed "
+            f"build would read a contract missing this key")
+        assert key in on_disk, (
+            f"{key}: the fallback has it and the file does not — a source "
+            f"checkout would read a contract missing this key")
         assert fallback[key] == on_disk[key], (
             f"{key}: the wheel would read {fallback[key]!r} while a source "
             f"checkout reads {on_disk[key]!r}")
+    for key in doc_only:
+        assert key not in fallback, (
+            f"{key} is documentation and must not be duplicated into the literal")
+
+
+def test_the_selected_action_is_a_THIRD_NAME_not_a_field_on_an_old_one():
+    """⛔⛔ THE ACTION NAME IS THE ENTIRE VERSION-SKEW MECHANISM, and reusing an
+    existing one fails in the direction that must never fail.
+
+    `_parse_bundle_runs` reads exactly one field, `runs`. A build one release
+    behind would ignore an unknown selection field on `send-logs-limited` and
+    collect the newest N — the person ticks two runs and thirty leave. With a
+    name it does not recognise, an older worker deletes the command and matches
+    no dispatch branch, so the outcome is "nothing left the machine".
+
+    ⭐ Over-collection is the harm here, so the failure has to point the other
+    way — which is the same reasoning that produced `send-logs-limited` in the
+    first place, applied again."""
+    assert research.SEND_LOGS_SELECTED_ACTION == "send-logs-selected"
+    assert research.SEND_LOGS_SELECTED_ACTION != research.SEND_LOGS_ACTION
+    assert research.SEND_LOGS_SELECTED_ACTION != research.SEND_LOGS_LIMITED_ACTION
+
+    on_disk = json.loads(
+        (Path(research.__file__).resolve().parent / "bundle-contract.json")
+        .read_text(encoding="utf-8"))
+    assert on_disk["actions"]["selected"] == research.SEND_LOGS_SELECTED_ACTION
+    assert on_disk["version"] == 2, "a new action name is a contract version"
+
+
+def test_a_reshaped_contract_falls_back_instead_of_bricking_the_import():
+    """⛔⛔ THE TRY/EXCEPT DOES NOT COVER THIS. It catches a missing or
+    unparseable file; it does not catch a file that parses into a different
+    SHAPE. Indexing `["actions"]["full"]` at module scope meant a contract whose
+    `actions` was renamed or nested differently raised KeyError during import and
+    took the whole backend down on every source checkout — with the fallback
+    right there, unreached."""
+    merged = {**research.BUNDLE_CONTRACT_FALLBACK, **{"maxRuns": 7}}
+    assert merged["actions"]["full"] == "send-logs", (
+        "a partial contract must still resolve every key through the fallback")
+
+    # And the live constants are derived the merged way, not by raw indexing.
+    from conftest import code_only
+    src = code_only(inspect.getsource(research))
+    assert '_BUNDLE_CONTRACT["maxRuns"]' not in src, (
+        "a raw index on the parsed contract is an import-time crash surface")
+    assert '_BUNDLE_CONTRACT["actions"]["full"]' not in src
+
+
+def test_the_contract_file_is_pinned_by_content_so_a_ONE_SIDED_edit_fails_here():
+    """⛔⛔ THE CROSS-REPO GUARD NEVER RUNS IN CI. `test_the_two_repos_agree…`
+    resolves the app repo as a sibling directory and SKIPS when it is absent —
+    and the backend workflow checks out one repo, so it skips on every run. The
+    file the guards exist to protect was also outside the workflow's path
+    filters entirely.
+
+    ⭐ So the agreement is pinned by CONTENT HASH in BOTH suites. The frontend
+    asserts the same digest against its own copy, which means a one-sided edit
+    goes red in that repo's OWN CI with no second checkout involved. Changing the
+    contract is then a deliberate three-file edit — both copies and both
+    digests — which is exactly the ceremony a two-repo file deserves."""
+    import hashlib
+    raw = (Path(research.__file__).resolve().parent
+           / "bundle-contract.json").read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    assert digest == BUNDLE_CONTRACT_SHA256, (
+        "bundle-contract.json changed. Update BOTH repos' copies and BOTH "
+        f"digests. New digest: {digest}")
 
 
 # ══════════════════════════════════════════════════════════════════════════

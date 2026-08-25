@@ -55,6 +55,11 @@ ALL = [T_SEND, T_BUNDLE]
 PY = str(ROOT / ".venv" / "bin" / "python")
 _TEST_TIMEOUT_S = 600
 
+# ⛔ MANY ANCHORS BELOW WERE RE-POINTED 2026-08-24 by the Wave 8 command-path
+# rewrite (a third action name, a per-submitter cooldown, a row tree that is
+# the SUBMITTER's on the scoped action). Every mutant's MEANING is unchanged —
+# only the text it hangs on. A re-anchor that changes what a mutant measures is
+# a silent loss of coverage, so each was re-pointed at the same decision.
 MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
 
     # ══ the worker gate ═════════════════════════════════════════════════
@@ -65,8 +70,9 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     ("W1b", "under", "⛔⛔ the LIMITED action leaves the tuple, so it falls to the "
      "`else` and every non-primary worker DELETES the command before worker 1 "
      "sees it — the feature ships dead with nothing failing anywhere",
-     [('                            SEND_LOGS_LIMITED_ACTION) and WORKER_ID != 1:',
-       '                            ) and WORKER_ID != 1:')],
+     [('                            SEND_LOGS_LIMITED_ACTION,\n'
+       '                            # ⛔ AND SO MUST THE SELECTED ONE',
+       '                            # ⛔ AND SO MUST THE SELECTED ONE')],
      [T_SEND]),
     ("W2", "under", "the dispatch stops gating on worker 1, so every worker in "
      "the fleet builds its own archive of the same machine",
@@ -76,8 +82,8 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     ("W2b", "under", "⛔ the limited action is handled as an unlimited one, so the "
      "number the person chose is silently ignored on the ONE path that exists to "
      "honour it",
-     [('                        limited=(action == SEND_LOGS_LIMITED_ACTION))',
-       '                        limited=False)')],
+     [('                        limited=(action == SEND_LOGS_LIMITED_ACTION),',
+       '                        limited=False,')],
      [T_SEND]),
     ("W3", "over", "the handler runs inline on the snapshot callback, queueing "
      "restart and hard_reset behind a tens-of-seconds upload and into the 30s "
@@ -124,7 +130,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_SEND]),
     ("O3", "under", "⛔⛔ the owner check goes, so a SHARER can ship the contents "
      "of somebody else's machine",
-     [('    if submitted_by != owner_uid:\n        log("[send-logs] refusing: submittedBy is not the device owner", "WARN")',
+     [('    if not is_owner and not selected:\n        log("[send-logs] refusing: submittedBy is not the device owner", "WARN")',
        '    if False:\n        log("[send-logs] refusing: submittedBy is not the device owner", "WARN")')],
      [T_SEND]),
     ("O4", "under", "a device with no recorded owner proceeds, and writes into "
@@ -146,18 +152,18 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     # ══ the cooldown ════════════════════════════════════════════════════
     ("D1", "under", "the cooldown is not consulted, so the button is an "
      "unbounded upload loop",
-     [('    remaining = _send_logs_cooldown_remaining()\n    if remaining:',
+     [('    remaining = _send_logs_cooldown_remaining(uid=submitted_by)\n    if remaining:',
        '    remaining = 0\n    if remaining:')],
      [T_SEND]),
     ("D2", "under", "⛔⛔ the attempt is stamped AFTER the work, so killing the "
      "process mid-bundle and pressing again is an unlimited loop",
-     [('            _stamp_send_logs_attempt()\n            _open_log_bundle_row(owner_uid, code, device_id, request_id)',
-       '            _open_log_bundle_row(owner_uid, code, device_id, request_id)')],
+     [('            _stamp_send_logs_attempt(uid=submitted_by)\n            _open_log_bundle_row(row_uid,',
+       '            _open_log_bundle_row(row_uid,')],
      [T_SEND]),
     ("D3", "over", "an unreadable stamp fails CLOSED, so one bad write locks the "
      "button out permanently",
-     [('    except Exception:\n        return 0\n    elapsed =',
-       '    except Exception:\n        return int(cooldown)\n    elapsed =')],
+     [('    except Exception:\n        return 0\n    if not isinstance(stamp, dict):',
+       '    except Exception:\n        return int(cooldown)\n    if not isinstance(stamp, dict):')],
      [T_SEND]),
     ("D4", "under", "the cooldown window collapses to nothing",
      [('SEND_LOGS_COOLDOWN_SEC = 10 * 60', 'SEND_LOGS_COOLDOWN_SEC = 0')],
@@ -178,14 +184,18 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     ("R1", "under", "⛔⛔ the row is never opened, so every later update lands on a "
      "document that does not exist and the spinner never resolves even on a "
      "perfect upload",
-     [('            _open_log_bundle_row(owner_uid, code, device_id, request_id)\n            dest =',
+     [('            _open_log_bundle_row(row_uid, code, device_id, request_id,\n'
+       '                                 machine_included=machine_wanted)\n'
+       '            dest =',
        '            dest =')],
      [T_SEND]),
     ("R1b", "under", "⛔⛔ THE DEFECT THE EMULATOR CAUGHT ON 2026-08-18, RESTORED. A "
      "refusal row is CREATED at 'failed', which the rule denies — so the app "
      "never sees the refusal and falls through to its two-minute quiet timeout, "
      "telling the user the machine did not answer while it is online and refused",
-     [('    if not (_open_log_bundle_row(owner_uid, code, device_id, request_id)\n            and _write_log_bundle_status(owner_uid, code, patch)):',
+     [('    if not (_open_log_bundle_row(owner_uid, code, device_id, request_id,\n'
+       '                                machine_included=machine_included)\n'
+       '            and _write_log_bundle_status(owner_uid, code, patch)):',
        '    if not _write_log_bundle_status(owner_uid, code,\n                                   {**patch, "deviceId": device_id,\n                                    "requestId": request_id}, create=True):')],
      [T_SEND]),
     # ⛔ R1c's ORIGINAL FORM WAS RETIRED 2026-08-21, not weakened. It mutated the
@@ -198,23 +208,25 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     # setting".
     ("R1c", "under", "the refusal row is never OPENED, only patched — so the "
      "update lands on nothing and every refusal is invisible again",
-     [('    if not (_open_log_bundle_row(owner_uid, code, device_id, request_id)\n            and _write_log_bundle_status(owner_uid, code, patch)):',
+     [('    if not (_open_log_bundle_row(owner_uid, code, device_id, request_id,\n'
+       '                                machine_included=machine_included)\n'
+       '            and _write_log_bundle_status(owner_uid, code, patch)):',
        '    if not (_write_log_bundle_status(owner_uid, code, patch)\n            and True):')],
      [T_SEND]),
     ("R1d", "over", "the open is allowed to carry any status, so the one clause "
      "that makes a row mean \"the machine started\" stops holding",
-     [('        {"status": "collecting", "deviceId": device_id, "requestId": request_id},',
-       '        {"status": "done", "deviceId": device_id, "requestId": request_id},')],
+     [('        {"status": "collecting", "deviceId": device_id, "requestId": request_id,',
+       '        {"status": "done", "deviceId": device_id, "requestId": request_id,')],
      [T_SEND]),
     ("R2", "under", "the uploading step is never reported, so the app jumps from "
      "collecting to done and a slow upload looks like a hang",
-     [('            _write_log_bundle_status(owner_uid, code, {\n                "status": "uploading",',
-       '            _write_log_bundle_status(owner_uid, code, {\n                "unused": "uploading",')],
+     [('            _write_log_bundle_status(row_uid, code, {\n                "status": "uploading",',
+       '            _write_log_bundle_status(row_uid, code, {\n                "unused": "uploading",')],
      [T_SEND]),
     ("R3", "under", "⛔ a failed upload writes no failure, so the row sits at "
      "uploading forever and absence reads as patience",
-     [('                _write_log_bundle_status(owner_uid, code, {\n                    "status": "failed", "errorClass": "UploadFailed"})',
-       '                pass')],
+     [('                _write_log_bundle_status(row_uid, code, {\n                    "status": "failed", "errorClass": "UploadFailed",',
+       '                _unused = ({\n                    "status": "failed", "errorClass": "UploadFailed",')],
      [T_SEND]),
     ("R4", "under", "the row loses its expiry, so it outlives the 30-day promise "
      "the consent screen makes",
@@ -227,12 +239,12 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_SEND]),
     ("R6", "under", "the request nonce is dropped, so the app cannot tell a "
      "stale row from the one it just asked for",
-     [('        {"status": "collecting", "deviceId": device_id, "requestId": request_id},',
-       '        {"status": "collecting", "deviceId": device_id},')],
+     [('        {"status": "collecting", "deviceId": device_id, "requestId": request_id,',
+       '        {"status": "collecting", "deviceId": device_id, "requestId": "",')],
      [T_SEND]),
     ("R7", "under", "an exception in the worker writes no failure at all",
-     [('            _write_log_bundle_status(owner_uid, code, {\n                "status": "failed", "errorClass": type(exc).__name__})',
-       '            pass')],
+     [('            _write_log_bundle_status(row_uid, code, {\n                "status": "failed", "errorClass": type(exc).__name__,',
+       '            _unused = ({\n                "status": "failed", "errorClass": type(exc).__name__,')],
      [T_SEND]),
 
     # ══ the upload ══════════════════════════════════════════════════════
@@ -290,8 +302,8 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_SEND]),
     ("N6", "under", "⛔⛔ the bound never reaches the builder, so the slider is "
      "decorative and 30 runs leave against a record of 5",
-     [('            summary = _build_log_bundle(dest, support_code=code, max_runs=runs)',
-       '            summary = _build_log_bundle(dest, support_code=code)')],
+     [('                dest, support_code=code, max_runs=runs,',
+       '                dest, support_code=code,')],
      [T_SEND]),
     ("N7", "under", "⭐ the row reports the CALLER's number instead of the "
      "builder's, so a dropped max_runs= leaves the row reading like a bound that "
@@ -313,13 +325,13 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     ("Q1", "under", "⛔⛔ the copy stops saying the number governs ONE line, so "
      "moving it down reads as \"less of everything leaves\" — while the raw tails "
      "still ship the same topics, links and account email at full history",
-     [('    lines.append(\n        f"⚠ only the first line above is what the {n}-run choice changes — "\n        f"everything else leaves in full whatever number you pick")',
+     [('    lines.append(\n        "⚠ only the first line above is what your choice changes — everything "\n        "else leaves in full whichever runs you pick"\n        if chosen_exactly else\n        f"⚠ only the first line above is what the {n}-run choice changes — "\n        f"everything else leaves in full whatever number you pick")',
        '    pass')],
      [T_SEND]),
     ("Q2", "under", "the first line drops the age bound, so \"30 runs\" reads as a "
      "promise of 30",
-     [('        f"at most {n} run{\'\' if n == 1 else \'s\'} from this machine — and only "\n        f"{\'if it is\' if n == 1 else \'those\'} from the last "\n        f"{BUNDLE_MAX_AGE_DAYS} days",',
-       '        f"the last {n} runs from this machine",')],
+     [('        first = (f"at most {n} run{\'\' if n == 1 else \'s\'} from this machine — and only "\n                 f"{\'if it is\' if n == 1 else \'those\'} from the last "\n                 f"{BUNDLE_MAX_AGE_DAYS} days")',
+       '        first = f"the last {n} runs from this machine"')],
      [T_SEND]),
     ("Q3", "under", "the singular case reads \"1 runs\"",
      [("f\"at most {n} run{'' if n == 1 else 's'} from this machine — and only \"",

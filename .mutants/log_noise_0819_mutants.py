@@ -342,8 +342,8 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str], str]] = [
     # ══ the bundle contract's silent fallback ═══════════════════════════
     ("K1", "under", "the wheel's literal fallback drifts from the file every "
      "source checkout reads, silently changing what the slider's top position means",
-     [('        return {"maxRuns": 30, "maxAgeDays": 30, "minRuns": 1,',
-       '        return {"maxRuns": 10, "maxAgeDays": 30, "minRuns": 1,')], [T], RES),
+     [('    "maxRuns": 30,\n    "maxAgeDays": 30,',
+       '    "maxRuns": 10,\n    "maxAgeDays": 30,')], [T], RES),
 ]
 
 _MUTATED_TESTS = {m[5] for m in MUTANTS if m[5].startswith("tests/")}
