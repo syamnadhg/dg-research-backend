@@ -120,6 +120,27 @@ def test_the_plan_says_the_machines_own_logs_are_not_included(wire) -> None:
     assert "NOT included" in out
 
 
+def test_the_plan_does_not_promise_a_retention_nothing_keeps(wire) -> None:
+    """⛔⛔ THE APP REFUSES THIS SENTENCE ON PURPOSE and says so twice in
+    `sendLogsCopy.ts`: no bucket lifecycle rule exists, so "deleted after 30
+    days" is a promise nothing keeps. This surface shipped it anyway on its
+    first day, in three places — an untrue retention claim on the one screen
+    whose entire job is to be true about what leaves somebody's computer.
+
+    ⭐ Asserted as an ABSENCE across the whole output, because this is the kind
+    of sentence a future edit re-adds while "improving the copy". It arrives
+    with the rule (wave 8M), not before it."""
+    _, out = _run(_args())
+    for claim in ("30 days", "thirty days", "deleted after"):
+        assert claim not in out.lower(), f"promises a retention nothing keeps: {claim}"
+
+
+def test_the_plan_still_says_who_can_read_them(wire) -> None:
+    """Dropping the false half must not drop the true half with it."""
+    _, out = _run(_args())
+    assert "Only Super Research support can read them" in out
+
+
 def test_asking_for_the_machines_own_logs_says_what_they_are(wire) -> None:
     """⛔ "also include the computer's own logs" is not informed consent. That
     material covers every run the machine has ever done for everyone who uses
@@ -451,6 +472,22 @@ def test_every_refusal_the_machine_can_write_has_a_sentence() -> None:
                 "RunsInvalid", "SubmitterMissing", "DeviceReadFailed",
                 "UploadFailed"}
     assert expected <= _failure_keys(CLI_SRC)
+
+
+def test_neither_client_carries_the_retention_promise_in_source() -> None:
+    """⛔ Both clients said it, and both were wrong the same way. Pinned at the
+    SOURCE as well as in the output, because the two files are separate copies
+    (the chat client is stdlib-only and cannot import the other) — so a fix in
+    one is not a fix in the other, which is exactly how it got in twice."""
+    for name, src in (("cli.py", CLI_SRC), ("sr.py", SR_SRC)):
+        body = src.split("def cmd_send_logs(", 1)[1]
+        # ⛔ COMMENTS STRIPPED FIRST. The comment explaining WHY the sentence is
+        # absent contains the sentence, so a raw search fails on the very fix it
+        # is guarding — which it did, on the first run. This is the Python twin
+        # of the FE suite's `codeOnly`.
+        code = "\n".join(ln.split("#", 1)[0] for ln in body.splitlines())
+        for claim in ("kept for 30 days", "deleted after 30"):
+            assert claim not in code, f"{name} promises a retention nothing keeps"
 
 
 def test_no_sentence_is_empty() -> None:

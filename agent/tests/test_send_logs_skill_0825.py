@@ -111,9 +111,25 @@ def test_the_plan_names_the_count_and_the_weight(wire, capsys) -> None:
     assert "1.5 MB" in out
 
 
-def test_the_plan_says_how_long_they_are_kept(wire, capsys) -> None:
+def test_the_plan_does_not_promise_a_retention_nothing_keeps(wire, capsys) -> None:
+    """⛔⛔ THE APP REFUSES THIS SENTENCE ON PURPOSE, and says so twice in
+    `sendLogsCopy.ts`: no bucket lifecycle rule exists, so "deleted after 30
+    days" is a promise nothing keeps. This surface shipped it anyway on its
+    first day — an untrue retention claim on the one screen whose entire job is
+    to be true about what leaves somebody's computer.
+
+    ⭐ Asserted as an ABSENCE, across the whole output, because the sentence is
+    the kind a future edit re-adds while "improving the copy". It arrives with
+    the rule (wave 8M), not before it."""
     _, out = _run(_args(), capsys)
-    assert "30 days" in out
+    for claim in ("30 days", "thirty days", "deleted after"):
+        assert claim not in out.lower(), f"promises a retention nothing keeps: {claim}"
+
+
+def test_the_plan_still_says_who_can_read_them(wire, capsys) -> None:
+    """Dropping the false half must not drop the true half with it."""
+    _, out = _run(_args(), capsys)
+    assert "Only Super Research support can read them" in out
 
 
 def test_the_plan_says_the_machines_own_logs_are_not_included(wire, capsys) -> None:

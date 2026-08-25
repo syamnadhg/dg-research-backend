@@ -1258,9 +1258,12 @@ def cmd_send_logs(args) -> int:
                          "run it has ever done, for everyone who uses it.")
         else:
             lines.append("That computer’s own logs are not included.")
+        # ⛔⛔ NO "kept for 30 days" HERE EITHER. The web app refuses that
+        # sentence for a measured reason (`sendLogsCopy.ts`, twice): no bucket
+        # lifecycle rule exists, so it is a promise nothing keeps. It arrives
+        # with the rule — wave 8M.
         lines.append(f"That’s {len(names)} run(s), about {_size_words(total)}. "
-                     "They’re kept for 30 days and only Super Research support "
-                     "can read them.")
+                     "Only Super Research support can read them.")
         lines.append("Say yes and I’ll send them.")
         return _emit({**body, "wouldSend": names, "includeMachine": machine},
                      args.json, lines)

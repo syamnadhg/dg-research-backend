@@ -408,10 +408,10 @@ MUTANTS = [
        '                         "run it has ever done, for everyone who uses it.")',
        '            lines.append("Plus that computer’s own logs.")')]),
     ("H5", SR, "under",
-     "the plan stops saying how long the logs are kept and who can read them",
+     "the plan stops saying the size and who can read the logs — the two facts "
+     "a person weighs the decision against",
      [('        lines.append(f"That’s {len(names)} run(s), about {_size_words(total)}. "\n'
-       '                     "They’re kept for 30 days and only Super Research support "\n'
-       '                     "can read them.")',
+       '                     "Only Super Research support can read them.")',
        '        lines.append(f"That’s {len(names)} run(s).")')]),
     ("H6", SR, "under",
      "⛔ the assistant is no longer told not to poll, so a chat runtime checks "
@@ -489,6 +489,16 @@ MUTANTS = [
      [('            # Always the machine the list came from — see above.\n'
        '            "deviceId": device_id,',
        '            "deviceId": args.device or "",')]),
+    ("R1", CLI, "over",
+     "⛔⛔ the terminal promises logs are deleted after 30 days — a retention "
+     "nothing keeps, on the one screen whose job is to be true",
+     [('    print("Only Super Research support can read them.")',
+       '    print("Logs are kept for 30 days and are only readable by support.")')]),
+    ("R2", SR, "over",
+     "the same untrue retention promise in chat, where it is relayed to the "
+     "person as our own words",
+     [('                     "Only Super Research support can read them.")',
+       '                     "They are kept for 30 days and only support can read them.")')]),
     ("X2", SR, "over",
      "the same gap in chat: the plan describes one computer and the send "
      "re-resolves to whichever is selected when it lands",

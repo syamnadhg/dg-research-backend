@@ -1747,7 +1747,14 @@ def cmd_send_logs(args: argparse.Namespace) -> int:
               "run it has ever done, for everyone who uses it.")
     else:
         print("That computer's own logs are NOT included.")
-    print("Logs are kept for 30 days and are only readable by Super Research support.")
+    # ⛔⛔ NO "DELETED AFTER 30 DAYS" LINE, AND THAT IS DELIBERATE. The web app
+    # refuses to say it for a measured reason — `sendLogsCopy.ts` states it
+    # twice: no bucket lifecycle rule exists, so the sentence would be a promise
+    # nothing keeps. This surface said it anyway when it was first written, in
+    # three places, which made an untrue retention claim in the one screen whose
+    # whole job is to be true about what leaves a computer. It arrives with the
+    # rule, not before it — see wave 8M.
+    print("Only Super Research support can read them.")
 
     # ⛔ The plan above is printed unconditionally; only the ASKING is skipped.
     if not _decide(None, bool(args.yes), "Send these logs?", default=False):
