@@ -293,6 +293,77 @@ above its own `def`.
 
 ---
 
+## Module boundaries — what may be added to `research.py`
+
+> **A new subsystem goes in a new module. Only work that belongs to the existing
+> phase-by-phase flow lands in `research.py`.**
+
+That is a standing rule, not an aspiration, and it is written here because until
+now it existed **only in a closed Jira comment** (DGOPS-9506, closed will-not-do
+2026-08-05). A rule nobody reading this repo can find is not a rule.
+
+**Why the file is not being split.** What could be extracted already has been —
+seven subsystems live in their own modules:
+
+| module | subsystem |
+|---|---|
+| `models.py` | model policy: family-only ranking, no version literals |
+| `prompts.py` | the CUA prompt for each phase |
+| `vision.py` | the vision client and the tier-2 acting path |
+| `narrate.py` | the panel narrator |
+| `selfheal.py` | the self-healing selector engine |
+| `telemetry.py` | the content-free diagnostics tier |
+| `logquiet.py` | log quieting |
+
+*(`vision_test.py` is a fixture-replay tool run by hand, not a subsystem.)*
+
+What remains in `research.py` is one procedural pipeline, phase by phase, plus
+the API server that drives it. Splitting *that* does not produce modules; it produces fragments that
+only ever call each other in one order and share all of their mutable state
+(pipeline controls, the automation ledger, learned known-good model versions, the
+self-heal counters, the job queue, clipboard arming — all module-level, all
+written from several phases). And no test can protect the refactor: a pure code
+move has no behavioural change to assert on, so the suite cannot tell a correct
+split from a subtly wrong one. Real verification is a live run of roughly an hour
+against paid third-party services.
+
+**⚠ The honest counterweight, measured 2026-08-25 rather than recalled.**
+
+| | lines |
+|---|---|
+| `research.py` when DGOPS-9506 was filed (2026-07-28) | 54,626 |
+| at the will-not-do decision (2026-08-05) | ~58,800 |
+| **today (2026-08-25)** | **75,965** |
+| the seven sibling modules, between them | 7,119 |
+
+So the file has grown by roughly **29%** in the twenty days since the decision,
+and holds **91%** of the non-test Python in this repo. An unbounded trajectory is
+a real objection and none of the reasoning above answers it.
+
+**What the rule has actually delivered.** Five sibling modules existed at the
+decision; `telemetry.py` (2026-08-18) and `logquiet.py` (2026-08-19) were both
+created after it, by this rule, for work that would previously have landed in
+`research.py`. The rule bounds *new* subsystems and does nothing about growth
+inside the existing flow — which is where the 17,000 lines came from. Both
+statements are true and neither cancels the other.
+
+**Revisit the decision if any of these becomes true**
+
+- A second engineer edits `research.py` regularly. Single-author work has been
+  hiding what would otherwise be constant merge pain.
+- A genuinely separable subsystem is identified inside the remaining flow — one
+  with its own state and a narrow interface, not just a contiguous block of lines.
+- The live end-to-end run stops being the primary verification, which removes the
+  "no test can protect the refactor" objection.
+
+**Practical consequence for packaging.** `research.py` is a compiled module in
+the published wheel, so any extraction changes what gets built and must be paired
+with a wheel rebuild across the full platform set — see *Package distribution +
+supply chain* below, and note that the compile list and the wheel manifest fail
+in opposite directions, so a module missing from both satisfies both.
+
+---
+
 ## Diagnostics: telemetry, log quieting, support bundles (2026-08 wave)
 
 ⛔ **The problem all three solve.** A new owner's machine lost DNS for Google's
