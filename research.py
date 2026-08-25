@@ -8856,6 +8856,25 @@ def _handle_send_logs_command(data: dict, device_id: str, limited: bool = False,
                 only_runs=only_runs,
                 requester_uid=(submitted_by if selected else None),
                 include_machine=machine_wanted)
+            # ⛔⛔ THE MACHINE'S OWN LOG SAID "received" AND "bundle uploaded (N
+            # bytes)" AND NOTHING ELSE. Eleven facts went to Firestore and one
+            # reached the log — so the artefact a support engineer opens FIRST,
+            # the log the person just sent, was the only place that could not say
+            # what was in the archive sitting next to it. Found while verifying a
+            # real field bundle.
+            #
+            # ⭐ HERE, BEFORE THE UPLOAD, NOT AFTER IT. The local copy is kept on
+            # purpose — it is the floor the whole design rests on — so a build
+            # that succeeds and an upload that fails still has to leave a record
+            # of what the file on disk contains.
+            #
+            # ⛔ APP-TRIGGERED PATH ONLY, and that is measured rather than
+            # assumed. `log()` prints AND writes through; a worker's stdout is
+            # redirected into `backend.log`, which is what puts this line in the
+            # next bundle. A terminal `--send-logs` has nothing armed and its
+            # stdout is the terminal, so the same call there would add an
+            # unstyled line under the pretty summary and persist nothing at all.
+            log(_send_logs_summary_line(summary))
             _write_log_bundle_status(row_uid, code, {
                 "status": "uploading",
                 # ⛔ THE UPDATE RULE FREEZES THIS FIELD and `shapeOk` requires
@@ -11271,6 +11290,68 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
         "sourcesRefused": refused,
         "supportCode": support_code,
     }
+
+
+def _send_logs_summary_line(summary: dict) -> str:
+    """One line naming everything the archive turned out to contain.
+
+    ⛔⛔ WHY THIS EXISTS. Every field below was already computed and already
+    written to Firestore, and the MACHINE'S OWN log said only "received" and
+    "bundle uploaded (N bytes)". So the first artefact a support engineer opens —
+    the log the person just sent — was the one place that could not say what was
+    in the archive next to it. Found while verifying a real field bundle: the row
+    had eleven facts, the log had one.
+
+    ⭐ THE CLEAN CASE STAYS SHORT. Only the counts that always mean something are
+    unconditional; requested-vs-delivered, over-cap, dropped and refused appear
+    only when they are non-zero, because a line that always ends in four zeroes
+    is a line people stop reading. That is this project's own log-noise finding
+    applied to its newest log line rather than discovered on it later.
+
+    ⭐ AND IT READS THE SUMMARY, NOT THE REQUEST. Same provenance rule as
+    `maxRunsApplied` and `selectionApplied`: the builder says what it did. A line
+    assembled from the caller's own variables would report the bound that was
+    ASKED for, which is exactly the discrepancy somebody reads this line to find.
+    """
+    n_runs = int(summary.get("runCount") or 0)
+    on_disk = int(summary.get("runsOnDisk") or 0)
+    parts = [
+        f"{n_runs} run{'' if n_runs == 1 else 's'} of {on_disk} on disk",
+        f"{int(summary.get('sessionCount') or 0)} session(s)",
+        f"machine={'yes' if summary.get('machineIncluded') else 'no'}",
+        f"{int(summary.get('sizeBytes') or 0)} bytes "
+        f"({int(summary.get('uncompressedBytes') or 0)} raw)",
+        f"cap {int(summary.get('maxRunsApplied') or 0)}",
+    ]
+    # ⭐ Whether a SELECTION was honoured at all, which is the one boolean a
+    # dropped `only_runs=` kwarg silently flips — and every test stub for the
+    # builder is `lambda dest, **k`, so nothing else would notice.
+    if summary.get("selectionApplied"):
+        asked = int(summary.get("runsRequested") or 0)
+        # ⛔ "asked for 6" beside a leading "3 runs", not "picked 6" — the reader
+        # should not have to connect two numbers to see that three are missing.
+        parts.append(f"asked for {asked}" if asked != n_runs else "picked, all present")
+    else:
+        parts.append("no selection — newest N")
+    if summary.get("requesterScoped"):
+        parts.append("scoped to the submitter")
+    for key, word in (("runsNotOnDisk", "not on disk"),
+                      ("runsNotAttributed", "not attributed"),
+                      ("runsOverCap", "over cap")):
+        # ⛔ ZERO IS THE NORMAL CASE AND SAYS NOTHING. A non-zero one is the whole
+        # reason somebody is reading: `runsNotAttributed` in particular means the
+        # picker offered a run the machine then refused to hand over.
+        n = int(summary.get(key) or 0)
+        if n:
+            parts.append(f"{n} {word}")
+    line = f"[send-logs] built {summary.get('supportCode') or '?'}: " + ", ".join(parts)
+    dropped = summary.get("droppedForSize") or []
+    if dropped:
+        line += f" · dropped for size: {', '.join(str(d) for d in dropped)}"
+    refused = summary.get("sourcesRefused") or []
+    if refused:
+        line += f" · refused: {', '.join(str(r) for r in refused)}"
+    return line
 
 
 def _install_uuid_best_effort() -> "str | None":
