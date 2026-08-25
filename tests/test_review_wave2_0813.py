@@ -326,9 +326,19 @@ def test_the_panel_narrator_names_why_a_200_came_back_empty(monkeypatch) -> None
     assert "parse:" not in out["error"]
 
 
-def test_a_blocked_prompt_reads_differently_from_a_spent_budget(monkeypatch) -> None:
+def test_a_blocked_prompt_surfaces_its_reason_through_the_narrate_call(monkeypatch) -> None:
     """Two faults, two fixes: a blocked prompt is ours to change, a spent budget
-    is a config value."""
+    is a config value.
+
+    ⛔⛔ RENAMED 2026-08-25. This shared a name with the log-side test 130 lines
+    above, so Python bound the name to THIS one and the earlier test was never
+    collected — it had not run since the day it was written. Same failure this
+    repo has now had three times; here CI was the thing that caught it, and had
+    been failing on it since 2026-08-24 (ruff F811, which the correctness floor
+    selects precisely because a shadowed test is a silent loss of coverage).
+    The two are genuinely different subjects: that one reads the LOG line, this
+    one reads what the narrate call returns.
+    """
     out = _narrate_call(monkeypatch, {"candidates": [{}],
                                       "promptFeedback": {"blockReason": "SAFETY"}})
     assert out["ok"] is False and "SAFETY" in out["error"]
