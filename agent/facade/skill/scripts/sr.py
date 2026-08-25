@@ -1121,9 +1121,10 @@ _SEND_LOGS_FAILURES = {
                         "a bug on our side, please report it",
     "DeviceReadFailed": "that computer could not look itself up, which usually "
                         "means it has lost its connection",
+    # ⛔ NOT `--doctor` — it prints no bundle path. See the note in cli.py.
     "UploadFailed": "the bundle was built but could not be uploaded — it is "
-                    "still on that computer, and running “superresearch "
-                    "--doctor” there prints where",
+                    "still on that computer, under its Super Research logs "
+                    "folder",
 }
 
 _SEND_LOGS_UNKNOWN = ("that computer refused the request and gave a reason we "
@@ -1258,6 +1259,13 @@ def cmd_send_logs(args) -> int:
                          "run it has ever done, for everyone who uses it.")
         else:
             lines.append("That computer’s own logs are not included.")
+        # ⛔⛔ The three facts the app's modal names and this plan did not — see
+        # the note beside the same lines in cli.py. Only topics and titles were
+        # conveyed, by the run list itself.
+        lines.append("Also going, from the runs picked: links that open those "
+                     "results — anyone holding one can read them; the email "
+                     "address on the account; and what the agent screens showed "
+                     "while those runs were working.")
         # ⛔⛔ NO "kept for 30 days" HERE EITHER. The web app refuses that
         # sentence for a measured reason (`sendLogsCopy.ts`, twice): no bucket
         # lifecycle rule exists, so it is a promise nothing keeps. It arrives

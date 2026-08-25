@@ -120,6 +120,19 @@ def test_the_plan_says_the_machines_own_logs_are_not_included(wire) -> None:
     assert "NOT included" in out
 
 
+def test_the_plan_names_everything_the_apps_modal_names(wire) -> None:
+    """⛔⛔ THE HEADER CLAIMS THIS PLAN IS THE MODAL'S EQUIVALENT, so it has to
+    name what the modal names. The app's consent list has four things that
+    always leave; only the first — topics and titles — was conveyed here, by
+    the run list itself. A claim of equivalence that is not equivalent is
+    exactly the forging this surface exists to prevent, and it reaches a fleet
+    sharer confirming in chat."""
+    _, out = _run(_args())
+    assert "anyone holding one can read them" in out, "the shareable result links"
+    assert "email address" in out, "the account email"
+    assert "agent screens showed" in out, "what the screens showed while running"
+
+
 def test_the_plan_does_not_promise_a_retention_nothing_keeps(wire) -> None:
     """⛔⛔ THE APP REFUSES THIS SENTENCE ON PURPOSE and says so twice in
     `sendLogsCopy.ts`: no bucket lifecycle rule exists, so "deleted after 30
@@ -359,7 +372,11 @@ def test_a_finished_bundle_says_when_the_machines_own_logs_went_too(wire) -> Non
     wire.row = {"status": "done", "runCount": 1, "sizeBytes": 10,
                 "machineIncluded": True}
     _, out = _run(_args(no_wait=False, wait=5, machine=True))
-    assert "this computer's own logs" in out
+    # ⛔ "THAT computer", not "this". The machine is the RESEARCH computer, which
+    # is usually not the one this command is typed on. This assertion pinned the
+    # wrong pronoun — inside a test whose own name means the research machine —
+    # so the harness enshrined the slip instead of catching it.
+    assert "that computer's own logs" in out
 
 
 def test_a_refusal_is_reported_in_words(wire) -> None:
@@ -472,6 +489,24 @@ def test_every_refusal_the_machine_can_write_has_a_sentence() -> None:
                 "RunsInvalid", "SubmitterMissing", "DeviceReadFailed",
                 "UploadFailed"}
     assert expected <= _failure_keys(CLI_SRC)
+
+
+def test_no_client_calls_the_research_computer_this_one() -> None:
+    """⛔ ONE MACHINE, ONE PRONOUN, ACROSS THREE FILES. The research computer is
+    "that computer" — the agent usually runs somewhere else entirely, and on a
+    fleet it always does. One line said "this computer's own logs" while every
+    other sentence in the same command said "that", and the difference is which
+    machine a person believes they just sent.
+
+    Scanned at the source across the clients AND the bridge, because the three
+    are separate copies and the slip appeared in two of them independently."""
+    from facade import bridge as _bridge
+    bridge_src = Path(_bridge.__file__).read_text(encoding="utf-8")
+    for name, src in (("cli.py", CLI_SRC), ("sr.py", SR_SRC), ("bridge.py", bridge_src)):
+        code = "\n".join(ln.split("#", 1)[0] for ln in src.splitlines())
+        for wrong in ("this computer's own logs", "this computer\u2019s own logs"):
+            assert wrong not in code, (
+                f"{name} calls the research computer 'this' one — it is 'that computer'")
 
 
 def test_neither_client_carries_the_retention_promise_in_source() -> None:

@@ -2348,7 +2348,7 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # one someone asked for would be the normal case, not the edge one.
             if include_machine and not dev.get("owned"):
                 self._json(403, {"reason": "machine_logs_owner_only",
-                                 "error": "this computer's own logs belong to whoever "
+                                 "error": "that computer's own logs belong to whoever "
                                           "owns it — ask again without them, and you "
                                           "will still get every run of yours it holds"})
                 return

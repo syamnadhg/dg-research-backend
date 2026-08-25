@@ -1522,9 +1522,14 @@ _SEND_LOGS_FAILURES = {
                         "a bug on our side, please report it",
     "DeviceReadFailed": "that computer could not look itself up, which usually "
                         "means it has lost its connection",
+    # ⛔ NOT `--doctor`. Measured: `run_doctor` prints no bundle path anywhere;
+    # its closing line points at `--send-logs`, and the path is printed only by
+    # `--send-logs` itself, after building a NEW bundle — never the one this
+    # sentence is about. The fork's copy stopped honestly at "still on that
+    # computer", so the wave shipped two contradictory sentences for one error.
     "UploadFailed": "the bundle was built but could not be uploaded — it is "
-                    "still on that computer, and `superresearch --doctor` "
-                    "there prints where",
+                    "still on that computer, under its Super Research logs "
+                    "folder",
 }
 
 _SEND_LOGS_UNKNOWN = ("that computer refused the request and gave a reason we "
@@ -1624,7 +1629,13 @@ def _await_bundle(code: str, seconds: int) -> int:
             seen_any = True
             status = str(row.get("status") or "")
             if status == "done":
-                machine = " plus this computer's own logs" if row.get("machineIncluded") else ""
+                # ⛔ "THAT computer", not "this" — the machine is the research
+                # computer, which is usually NOT the one this command is typed on.
+                # Every other sentence in this command says "that"; the one line
+                # reporting what actually left said "this", and the test pinning
+                # it was named for the research machine, so the harness enshrined
+                # the slip rather than catching it.
+                machine = " plus that computer's own logs" if row.get("machineIncluded") else ""
                 print(f"{_OK} Sent — {int(row.get('runCount') or 0)} run(s){machine}, "
                       f"{_size_words(row.get('sizeBytes'))}.")
                 print(f"    Quote {code} when you report the problem.")
@@ -1747,6 +1758,15 @@ def cmd_send_logs(args: argparse.Namespace) -> int:
               "run it has ever done, for everyone who uses it.")
     else:
         print("That computer's own logs are NOT included.")
+    # ⛔⛔ THE THREE FACTS THE APP'S MODAL NAMES AND THIS PLAN DID NOT. The header
+    # of this section claims the printed plan makes `consent: true` as true as
+    # the modal does. It did not: `consentIncluded` in the web app names four
+    # things that always leave, and only the first — topics and titles — was
+    # conveyed here, by the run list itself. A claim of equivalence that is not
+    # equivalent is the forging this file exists to prevent.
+    print("Also going, from the runs you picked: links that open those results — "
+          "anyone holding one can read them; the email address on your account; "
+          "and what the agent screens showed while those runs were working.")
     # ⛔⛔ NO "DELETED AFTER 30 DAYS" LINE, AND THAT IS DELIBERATE. The web app
     # refuses to say it for a measured reason — `sendLogsCopy.ts` states it
     # twice: no bucket lifecycle rule exists, so the sentence would be a promise

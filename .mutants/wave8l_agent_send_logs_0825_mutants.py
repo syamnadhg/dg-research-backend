@@ -108,7 +108,7 @@ MUTANTS = [
      "TOLD, and silently gets a smaller bundle than the one they asked for",
      [('            if include_machine and not dev.get("owned"):\n'
        '                self._json(403, {"reason": "machine_logs_owner_only",\n'
-       '                                 "error": "this computer\'s own logs belong to whoever "\n'
+       '                                 "error": "that computer\'s own logs belong to whoever "\n'
        '                                          "owns it — ask again without them, and you "\n'
        '                                          "will still get every run of yours it holds"})\n'
        '                return\n', "")]),
@@ -499,6 +499,34 @@ MUTANTS = [
      "person as our own words",
      [('                     "Only Super Research support can read them.")',
        '                     "They are kept for 30 days and only support can read them.")')]),
+    ("D2", CLI, "under",
+     "\u26d4\u26d4 the plan stops naming the shareable result links, the account "
+     "email and what the screens showed \u2014 so `consent: true` claims a "
+     "disclosure the person never got",
+     [('    print("Also going, from the runs you picked: links that open those results \u2014 "\n'
+       '          "anyone holding one can read them; the email address on your account; "\n'
+       '          "and what the agent screens showed while those runs were working.")\n', "")]),
+    ("D3", SR, "under",
+     "the same three facts go unsaid in chat, which is where a fleet sharer "
+     "actually confirms",
+     [('        lines.append("Also going, from the runs picked: links that open those "\n'
+       '                     "results \u2014 anyone holding one can read them; the email "\n'
+       '                     "address on the account; and what the agent screens showed "\n'
+       '                     "while those runs were working.")\n', "")]),
+    ("N1", CLI, "under",
+     "\u26d4 the outcome line calls the RESEARCH computer 'this' one, so a person "
+     "reads it as the machine they are typing on",
+     [('                machine = " plus that computer\'s own logs" if row.get("machineIncluded") else ""',
+       '                machine = " plus this computer\'s own logs" if row.get("machineIncluded") else ""')]),
+    ("U1", CLI, "under",
+     "the upload-failed sentence sends the person to a command that does not "
+     "print the path \u2014 measured: `run_doctor` prints no bundle path at all",
+     [('    "UploadFailed": "the bundle was built but could not be uploaded \u2014 it is "\n'
+       '                    "still on that computer, under its Super Research logs "\n'
+       '                    "folder",',
+       '    "UploadFailed": "the bundle was built but could not be uploaded \u2014 it is "\n'
+       '                    "still on that computer, and `superresearch --doctor` "\n'
+       '                    "there prints where",')]),
     ("X2", SR, "over",
      "the same gap in chat: the plan describes one computer and the send "
      "re-resolves to whichever is selected when it lands",

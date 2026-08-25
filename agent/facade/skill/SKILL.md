@@ -315,7 +315,7 @@ Research Computer can package its logs and upload them under a **support code** 
 eight characters the user quotes when they report the problem.
 
 **It is always two steps, and never one.** `sr.py send-logs` prints exactly what
-would leave that computer — which runs, how big, how long they are kept — and
+would leave that computer — which runs, how big, and who can read them — and
 sends nothing. Only `sr.py send-logs --confirm` actually sends. **Relay the plan
 verbatim and wait for a real "yes".** The computer refuses a request that does
 not carry recorded consent, and that consent is the user having read those

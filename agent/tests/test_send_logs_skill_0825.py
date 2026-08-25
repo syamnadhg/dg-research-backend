@@ -111,6 +111,15 @@ def test_the_plan_names_the_count_and_the_weight(wire, capsys) -> None:
     assert "1.5 MB" in out
 
 
+def test_the_plan_names_everything_the_apps_modal_names(wire, capsys) -> None:
+    """Same requirement as the terminal's — see that test. Chat is where a fleet
+    sharer actually confirms, so this is the copy that matters most."""
+    _, out = _run(_args(), capsys)
+    assert "anyone holding one can read them" in out
+    assert "email address" in out
+    assert "agent screens showed" in out
+
+
 def test_the_plan_does_not_promise_a_retention_nothing_keeps(wire, capsys) -> None:
     """⛔⛔ THE APP REFUSES THIS SENTENCE ON PURPOSE, and says so twice in
     `sendLogsCopy.ts`: no bucket lifecycle rule exists, so "deleted after 30
