@@ -410,6 +410,95 @@ class FirestoreRest:
         body = self._request("POST", url, json_body={"fields": fields})
         return doc_id(body.get("name", ""))
 
+    def held_runs(self, uid: str, device_id: str) -> dict[str, Any] | None:
+        """What a research computer still holds logs FOR THIS PERSON, or None.
+
+        ``users/{uid}/deviceRunLogs/{deviceId}`` — the same document the web
+        app's picker reads. The machine publishes it; nobody else can compute
+        it, because a research doc outlives the logs of the run that made it
+        (60 runs / 30 days locally, and a reset keeps none).
+
+        ⛔⛔ MISSING IS NOT EMPTY, and the two must not collapse here. `None`
+        means "that machine has never published a list to you" — a build too
+        old, a rule not yet reaching it, or simply a device that has run
+        nothing of yours. An empty `runs` list means "it published, and it
+        holds none of your runs". The first is a sentence about US; the second
+        is a sentence about the machine, and only the second may be printed as
+        one. The web app's watcher draws exactly this line and the reason is
+        recorded there.
+
+        ⭐ IDS, NEVER TITLES. There is no topic anywhere in a run folder — the
+        backend's folder-name helper has no run_id parameter precisely so a
+        topic cannot reach one — so this document carries `researchId` and the
+        caller joins the words from its own research docs.
+        """
+        url = f"{config.FIRESTORE_BASE}/users/{uid}/deviceRunLogs/{device_id}"
+        body = self._request("GET", url, allow_missing=True)
+        if body is None:
+            return None
+        return fields_to_dict(body)
+
+    def get_log_bundle(self, uid: str, code: str) -> dict[str, Any] | None:
+        """One support bundle's row, or None if the machine has not opened it.
+
+        ``users/{uid}/logBundles/{code}``. The machine creates this at
+        'collecting' the moment it accepts the request and patches it through
+        'uploading' to 'done' or 'failed'.
+
+        ⛔ ABSENT IS A REAL STATE AND IT IS NOT AN ERROR. Worker 1 deletes the
+        command document before dispatching it, so between the write and the
+        row there is a window where neither exists — and on a build too old to
+        understand the request, that window never closes. A caller polling this
+        has to be able to tell "not yet" from "never", which it does by how
+        long it has been waiting, not by treating a 404 as a failure.
+        """
+        url = f"{config.FIRESTORE_BASE}/users/{uid}/logBundles/{code}"
+        body = self._request("GET", url, allow_missing=True)
+        if body is None:
+            return None
+        row = fields_to_dict(body)
+        row["code"] = doc_id(body.get("name", "")) or code
+        return row
+
+    def write_device_command(self, device_id: str, action: str, *, uid: str,
+                             extra: dict[str, Any] | None = None) -> str:
+        """Write a DEVICE-scoped command to ``devices/{deviceId}/commands`` —
+        the collection for actions aimed at the machine itself rather than at
+        one run. Mirrors the web app's `writeDeviceCommand` field for field.
+
+        Returns the doc id. ⭐ The machine DELETES a command before acting on
+        it, so a caller that keeps this can watch the deletion as a receipt —
+        the only way to tell "this build did not understand the request" from
+        "it has not answered yet" without a version string.
+
+        ⛔⛔ `submittedBy` IS LOAD-BEARING, not audit decoration. The create
+        rule requires it to equal the caller's uid, and the machine then reads
+        it to decide whose runs a bundle may contain and whose tree the row
+        lands in. A command without it is refused by the rule; a command with
+        somebody else's is refused by the machine.
+
+        ⛔ THE ACTION NAME IS THE PERMISSION. Device commands are OWNER-ONLY by
+        default and the rule opens exactly two names to a sharer. This method
+        writes whatever it is handed — the caller is where an action gets
+        chosen, and `_send_logs` is explicit about why it may only ever choose
+        the selected one.
+        """
+        payload: dict[str, Any] = {
+            "action": action,
+            "processed": False,
+            # Wall-clock ms, NOT a server timestamp: the device's listener
+            # compares this against its own 30s stale gate on the first
+            # snapshot, and a sentinel that resolves later would read as ancient.
+            "timestamp": int(time.time() * 1000),
+            "submittedBy": uid,
+        }
+        if extra:
+            payload.update(extra)
+        fields = {k: to_value(v) for k, v in payload.items()}
+        url = f"{config.FIRESTORE_BASE}/devices/{device_id}/commands"
+        body = self._request("POST", url, json_body={"fields": fields})
+        return doc_id(body.get("name", ""))
+
     def write_command(self, uid: str, research_id: str, action: str, *,
                       device_id: str, extra: dict[str, Any] | None = None) -> str:
         """Write a per-run command to users/{uid}/researches/{rid}/commands — the

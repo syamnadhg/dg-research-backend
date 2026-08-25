@@ -1,0 +1,459 @@
+"""Wave 8L — `agent send-logs` at a terminal.
+
+⛔⛔ THE ONE THING THIS SURFACE IS FOR. `consent: true` on the wire is a claim
+that a person was SHOWN what leaves their computer. The web app's modal is what
+makes that claim true; here the printed plan is. So the tests below care far
+more about what gets PRINTED before the flag is set than about the flag itself
+— a command that sends the right bytes after printing nothing has forged the
+only thing the machine cannot check.
+
+⭐ AND ABOUT WHAT IS NOT PRINTED. Two sentences look interchangeable and are
+not: "that computer hasn't told us which runs it holds" and "it isn't holding
+logs for any of your runs". The first is about us; the second accuses a machine
+of having lost something. There is a test for each, and a mutant that collapses
+them dies on both.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import re
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from facade import cli
+
+CLI_SRC = Path(cli.__file__).read_text(encoding="utf-8")
+SR_SRC = (Path(cli.__file__).parent / "skill" / "scripts" / "sr.py").read_text(
+    encoding="utf-8")
+
+RUNS = [
+    {"name": "run-a", "researchId": "r1", "title": "Tidal power",
+     "startedUtc": "2026-08-24T10:00:00Z", "status": "completed",
+     "sizeBytes": 1_200_000, "attempt": 1},
+    {"name": "run-b", "researchId": "gone", "title": "",
+     "startedUtc": "2026-08-21T09:12:00Z", "status": "failed",
+     "sizeBytes": 400_000, "attempt": 2},
+]
+
+
+def _args(**kw):
+    base = dict(device=None, runs=None, none=False, machine=False, list=False,
+                status=None, yes=True, no_wait=True, wait=0, verbose=False)
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+class Wire:
+    """Records every bridge call so a test can assert a refusal SENT NOTHING."""
+
+    def __init__(self, *, published=True, runs=None, owned=True,
+                 truncated=False, row=None, send_status=200, send_body=None):
+        self.published = published
+        self.runs = RUNS if runs is None else runs
+        self.owned = owned
+        self.truncated = truncated
+        self.row = row
+        self.send_status = send_status
+        self.send_body = send_body or {"ok": True, "code": "K7XQ9B2M"}
+        self.posts: list = []
+        self.gets: list = []
+
+    def get(self, path, timeout=10.0):
+        self.gets.append(path)
+        if path.startswith("/logs/runs"):
+            return 200, {"deviceId": "dev1", "deviceName": "Studio PC",
+                         "owned": self.owned, "published": self.published,
+                         "runs": self.runs, "truncated": self.truncated,
+                         "updatedAt": ""}
+        if path.startswith("/logs/bundle"):
+            return 200, {"code": "K7XQ9B2M", "row": self.row}
+        raise AssertionError(f"unexpected GET {path}")
+
+    def post(self, path, body=None, timeout=30.0):
+        self.posts.append({"path": path, "body": body})
+        return self.send_status, self.send_body
+
+
+@pytest.fixture()
+def wire(monkeypatch):
+    w = Wire()
+    monkeypatch.setattr(cli, "_bridge_up", lambda: True)
+    monkeypatch.setattr(cli, "_bridge_get", w.get)
+    monkeypatch.setattr(cli, "_bridge_post", w.post)
+    monkeypatch.setattr(cli.time, "sleep", lambda _s: None)
+    return w
+
+
+def _run(args, wire_obj=None):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.cmd_send_logs(args)
+    return rc, buf.getvalue()
+
+
+# ── the plan is shown before anything is claimed ────────────────────────────
+
+def test_the_runs_are_listed_before_the_send(wire) -> None:
+    rc, out = _run(_args())
+    assert rc == 0
+    assert "Tidal power" in out
+    assert "Studio PC" in out
+
+
+def test_the_plan_names_the_count_and_the_weight(wire) -> None:
+    _, out = _run(_args())
+    assert "2 run(s)" in out
+    assert "1.5 MB" in out, f"the size a person weighs the decision against: {out}"
+
+
+def test_the_plan_says_the_machines_own_logs_are_not_included(wire) -> None:
+    _, out = _run(_args())
+    assert "NOT included" in out
+
+
+def test_asking_for_the_machines_own_logs_says_what_they_are(wire) -> None:
+    """⛔ "also include the computer's own logs" is not informed consent. That
+    material covers every run the machine has ever done for everyone who uses
+    it, and the sentence has to say so before the person agrees."""
+    _, out = _run(_args(machine=True))
+    assert "everyone who uses it" in out
+
+
+def test_the_plan_is_printed_even_when_the_prompt_is_skipped(wire) -> None:
+    """⛔⛔ `--yes` skips the ASKING, never the SHOWING. If it skipped the
+    printing, this command would put `consent: true` on the wire having shown
+    the person nothing — which is the one claim the machine cannot check for
+    itself, and therefore the one we have to keep true."""
+    _, out = _run(_args(yes=True))
+    assert "This will send" in out
+    assert wire.posts[0]["body"]["consent"] is True
+
+
+def test_declining_the_prompt_sends_nothing(wire, monkeypatch) -> None:
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: False)
+    rc, out = _run(_args(yes=False))
+    assert rc == 1
+    assert "Nothing was sent" in out
+    assert wire.posts == []
+
+
+def test_the_prompt_defaults_to_no(wire, monkeypatch) -> None:
+    """A bare Enter must not send somebody's logs anywhere."""
+    seen: dict = {}
+
+    def fake_confirm(prompt, default=True):
+        seen["default"] = default
+        return default
+
+    monkeypatch.setattr(cli.b, "confirm", fake_confirm)
+    rc, _ = _run(_args(yes=False))
+    assert seen["default"] is False
+    assert rc == 1
+    assert wire.posts == []
+
+
+# ── what reaches the bridge ─────────────────────────────────────────────────
+
+def test_the_default_selection_is_every_run_of_theirs_it_holds(wire) -> None:
+    _run(_args())
+    assert wire.posts[0]["body"]["runNames"] == ["run-a", "run-b"]
+
+
+def test_runs_can_be_chosen_by_the_numbers_on_screen(wire) -> None:
+    _run(_args(runs="2"))
+    assert wire.posts[0]["body"]["runNames"] == ["run-b"]
+
+
+def test_runs_can_be_chosen_by_name(wire) -> None:
+    _run(_args(runs="run-a"))
+    assert wire.posts[0]["body"]["runNames"] == ["run-a"]
+
+
+def test_a_run_named_twice_is_sent_once(wire) -> None:
+    _run(_args(runs="1,run-a"))
+    assert wire.posts[0]["body"]["runNames"] == ["run-a"]
+
+
+def test_a_number_that_is_not_on_the_list_refuses_and_sends_nothing(wire) -> None:
+    """⛔ Dropping it would send fewer runs than were asked for and report
+    success — the person believes a run went and it did not."""
+    rc, out = _run(_args(runs="1,9"))
+    assert rc == 1
+    assert "no run 9" in out
+    assert wire.posts == []
+
+
+def test_a_name_the_machine_is_not_holding_refuses_and_sends_nothing(wire) -> None:
+    rc, out = _run(_args(runs="run-a,run-ghost"))
+    assert rc == 1
+    assert "run-ghost" in out
+    assert wire.posts == []
+
+
+def test_the_machine_flag_is_carried(wire) -> None:
+    _run(_args(machine=True))
+    assert wire.posts[0]["body"]["includeMachine"] is True
+
+
+def test_the_machine_flag_is_carried_as_false_not_omitted(wire) -> None:
+    _run(_args())
+    assert wire.posts[0]["body"]["includeMachine"] is False
+
+
+def test_a_named_device_is_carried_to_both_calls(wire) -> None:
+    _run(_args(device="dev2"))
+    assert any("deviceId=dev2" in g for g in wire.gets)
+    assert wire.posts[0]["body"]["deviceId"] == "dev2"
+
+
+# ── the sharer boundary, said before a round trip ───────────────────────────
+
+def test_a_sharer_asking_for_the_machines_own_logs_is_told_here(wire) -> None:
+    wire.owned = False
+    rc, out = _run(_args(machine=True))
+    assert rc == 1
+    assert "belong to whoever owns it" in out
+    assert wire.posts == [], "told no and sent anyway"
+
+
+def test_that_refusal_says_their_own_runs_still_come(wire) -> None:
+    wire.owned = False
+    _, out = _run(_args(machine=True))
+    assert "every run of yours" in out
+
+
+def test_a_sharer_sending_their_own_runs_is_ordinary(wire) -> None:
+    wire.owned = False
+    rc, _ = _run(_args())
+    assert rc == 0
+    assert wire.posts[0]["body"]["includeMachine"] is False
+
+
+# ── nothing to send ─────────────────────────────────────────────────────────
+
+def test_no_runs_and_no_machine_logs_refuses(wire) -> None:
+    wire.runs = []
+    rc, out = _run(_args())
+    assert rc == 1
+    assert "nothing to send" in out
+    assert wire.posts == []
+
+
+def test_an_owner_with_no_runs_is_told_how_to_send_the_computers_own(wire) -> None:
+    """The pairing-failure case: nothing has run, so there is nothing to tick,
+    and the machine's own logs are the entire point of the send. A refusal that
+    stops there leaves the one person who needs this most with no next step."""
+    wire.runs = []
+    _, out = _run(_args())
+    assert "--machine" in out
+
+
+def test_a_sharer_with_no_runs_is_not_offered_something_they_cannot_have(wire) -> None:
+    wire.runs = []
+    wire.owned = False
+    _, out = _run(_args())
+    assert "--machine" not in out
+
+
+def test_none_with_machine_logs_sends_an_empty_selection(wire) -> None:
+    rc, _ = _run(_args(none=True, machine=True))
+    assert rc == 0
+    assert wire.posts[0]["body"]["runNames"] == []
+    assert wire.posts[0]["body"]["includeMachine"] is True
+
+
+# ── what we can and cannot see ──────────────────────────────────────────────
+
+def test_a_machine_that_never_published_is_not_accused_of_holding_nothing(wire) -> None:
+    """⛔⛔ THE TWO SENTENCES ARE NOT INTERCHANGEABLE. Absent means we cannot
+    see the list; empty means the machine says it holds none. Printing the
+    second when the first is true tells somebody their logs are gone while that
+    computer may be holding all of them."""
+    wire.published = False
+    wire.runs = []
+    _, out = _run(_args())
+    assert "hasn't told us" in out
+    assert "isn't holding logs for any of your runs" not in out
+
+
+def test_a_machine_that_published_an_empty_list_says_so_plainly(wire) -> None:
+    wire.published = True
+    wire.runs = []
+    _, out = _run(_args())
+    assert "isn't holding logs for any of your runs" in out
+    assert "hasn't told us" not in out
+
+
+def test_a_truncated_list_says_there_is_more(wire) -> None:
+    wire.truncated = True
+    _, out = _run(_args())
+    assert "it holds more" in out
+
+
+def test_a_run_with_no_research_document_reads_by_its_date(wire) -> None:
+    _, out = _run(_args(list=True))
+    assert "a run from 2026-08-21" in out
+
+
+def test_list_shows_and_sends_nothing(wire) -> None:
+    rc, out = _run(_args(list=True))
+    assert rc == 0
+    assert "Tidal power" in out
+    assert wire.posts == []
+
+
+# ── waiting for the machine ─────────────────────────────────────────────────
+
+def test_a_finished_bundle_reports_the_code_to_quote(wire) -> None:
+    wire.row = {"status": "done", "runCount": 2, "sizeBytes": 1_600_000,
+                "machineIncluded": False}
+    rc, out = _run(_args(no_wait=False, wait=5))
+    assert rc == 0
+    assert "K7XQ9B2M" in out
+    assert "2 run(s)" in out
+
+
+def test_a_finished_bundle_says_when_the_machines_own_logs_went_too(wire) -> None:
+    wire.row = {"status": "done", "runCount": 1, "sizeBytes": 10,
+                "machineIncluded": True}
+    _, out = _run(_args(no_wait=False, wait=5, machine=True))
+    assert "this computer's own logs" in out
+
+
+def test_a_refusal_is_reported_in_words(wire) -> None:
+    wire.row = {"status": "failed", "errorClass": "CooldownActive"}
+    rc, out = _run(_args(no_wait=False, wait=5))
+    assert rc == 1
+    assert "ten minutes" in out
+    assert "CooldownActive" not in out, "the class name is not a sentence"
+
+
+def test_a_refusal_we_have_no_sentence_for_still_says_something(wire) -> None:
+    """⛔ An error nobody can read is the same as no error, and this is the
+    surface a person only reaches because something already went wrong."""
+    wire.row = {"status": "failed", "errorClass": "SomethingNewIn2027"}
+    rc, out = _run(_args(no_wait=False, wait=5))
+    assert rc == 1
+    assert "SomethingNewIn2027" in out
+    assert len(out.strip()) > 20
+
+
+def test_running_out_of_patience_is_not_reported_as_a_failure(wire) -> None:
+    """⛔⛔ The support code is already valid and the bundle may still land.
+    Calling this a failure is a lie about somebody else's computer, and it
+    would fire on every machine that is merely slow."""
+    wire.row = None
+    rc, out = _run(_args(no_wait=False, wait=1))
+    assert rc == 0
+    assert "--status" in out
+
+
+def test_never_picked_up_reads_differently_from_still_packaging(wire) -> None:
+    """No row at all may mean the request was never picked up — an asleep
+    machine. Telling somebody "still packaging" then sends them away to wait
+    for something that is not happening."""
+    wire.row = None
+    _, no_row = _run(_args(no_wait=False, wait=1))
+    assert "asleep or offline" in no_row
+
+    wire.row = {"status": "collecting"}
+    _, mid = _run(_args(no_wait=False, wait=1))
+    assert "Still packaging" in mid
+    assert "asleep or offline" not in mid
+
+
+def test_no_wait_hands_back_the_code_and_how_to_look(wire) -> None:
+    rc, out = _run(_args(no_wait=True))
+    assert rc == 0
+    assert "K7XQ9B2M" in out
+    assert "--status" in out
+
+
+# ── --status on its own ─────────────────────────────────────────────────────
+
+def test_status_reports_a_finished_bundle(wire) -> None:
+    wire.row = {"status": "done", "runCount": 3, "sizeBytes": 2048}
+    rc, out = _run(_args(status="k7xq9b2m"))
+    assert rc == 0
+    assert "3 run(s)" in out
+    assert wire.posts == []
+
+
+def test_status_upper_cases_what_a_person_typed(wire) -> None:
+    """People type the code back out of a chat message."""
+    wire.row = {"status": "done", "runCount": 1, "sizeBytes": 1}
+    _run(_args(status="k7xq9b2m"))
+    assert any("code=K7XQ9B2M" in g for g in wire.gets)
+
+
+def test_status_on_a_code_nothing_has_answered_is_not_an_error(wire) -> None:
+    wire.row = None
+    rc, out = _run(_args(status="K7XQ9B2M"))
+    assert rc == 0
+    assert "Nothing recorded" in out
+
+
+def test_status_reports_a_refusal_in_words(wire) -> None:
+    wire.row = {"status": "failed", "errorClass": "NotDeviceMember"}
+    rc, out = _run(_args(status="K7XQ9B2M"))
+    assert rc == 1
+    assert "one of its people" in out
+
+
+# ── the two copies of the sentences ─────────────────────────────────────────
+
+def _failure_keys(src: str) -> set:
+    """The error classes a source file has a sentence for. Read from the table
+    literal rather than imported, because sr.py cannot be imported here — it is
+    a standalone stdlib-only script by contract."""
+    block = re.search(r"_SEND_LOGS_FAILURES\s*=\s*\{(.*?)\n\}", src, re.S)
+    assert block, "no _SEND_LOGS_FAILURES table found"
+    return set(re.findall(r'"([A-Za-z]+)":', block.group(1)))
+
+
+def test_the_chat_skill_has_a_sentence_for_every_refusal_the_cli_does() -> None:
+    """⛔⛔ TWO COPIES, AND THE DUPLICATION IS FORCED. `sr.py` runs inside a chat
+    runtime and is stdlib-only by contract — it cannot import this module, and
+    a test in this repo already pins that. So the tables drift unless something
+    reads both, and the failure mode of drift is a person being told nothing at
+    all about why their logs did not send."""
+    assert _failure_keys(CLI_SRC) == _failure_keys(SR_SRC)
+
+
+def test_every_refusal_the_machine_can_write_has_a_sentence() -> None:
+    """The names come from the backend's own refusal sites. A class added there
+    without a sentence here reaches a person as the fallback, which names the
+    class and admits we have no words for it — acceptable once, and never the
+    plan."""
+    expected = {"CooldownActive", "AlreadyBuilding", "NotDeviceMember",
+                "NotDeviceOwner", "NothingSelected", "ConsentMissing",
+                "RunsInvalid", "SubmitterMissing", "DeviceReadFailed",
+                "UploadFailed"}
+    assert expected <= _failure_keys(CLI_SRC)
+
+
+def test_no_sentence_is_empty() -> None:
+    for cls, words in cli._SEND_LOGS_FAILURES.items():
+        assert len(words.strip()) > 10, f"{cls} has no readable sentence"
+
+
+# ── plumbing ────────────────────────────────────────────────────────────────
+
+def test_a_bridge_that_is_not_running_says_how_to_start_it(monkeypatch) -> None:
+    monkeypatch.setattr(cli, "_bridge_up", lambda: False)
+    rc, out = _run(_args())
+    assert rc == 1
+    assert "agent serve" in out
+
+
+def test_sizes_read_as_something_a_person_can_weigh() -> None:
+    assert cli._size_words(0) == "0 bytes"
+    assert cli._size_words(1536) == "1.5 KB"
+    assert cli._size_words(5 * 1024 ** 2) == "5.0 MB"
+    assert cli._size_words(3 * 1024 ** 3) == "3.0 GB"
+    assert cli._size_words(None) == "0 bytes"
+    assert cli._size_words("nonsense") == "unknown size"

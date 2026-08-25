@@ -1489,6 +1489,284 @@ def cmd_stop(_args: argparse.Namespace) -> int:
     return 1
 
 
+# ── send logs ────────────────────────────────────────────────────────────────
+#
+# ⛔⛔ WHY THERE IS A CONFIRMATION STEP AT ALL, when this is a terminal and the
+# person typed the command themselves. The machine refuses a request that does
+# not carry `consent: true`, and that flag is a claim that somebody was SHOWN
+# what leaves their computer. On the web app the modal is what makes the claim
+# true. Here the printed plan is — so the plan is printed BEFORE the flag is
+# ever set, and `--yes` skips the prompt, never the printing. A surface that
+# sets the flag without showing the words is forging it.
+
+# ⭐ TWO TABLES, ONE CONTRACT. The chat skill (`skill/scripts/sr.py`) must be
+# stdlib-only and cannot import this module, so it carries its own copy of these
+# sentences. `test_send_logs_cli_0825.py` reads both files and fails if either
+# grows a case the other lacks — a person told nothing at all is the failure
+# this feature is least able to survive, and it is the one duplication invites.
+_SEND_LOGS_FAILURES = {
+    "CooldownActive": "that computer built a bundle very recently — give it "
+                      "ten minutes and ask again",
+    "AlreadyBuilding": "that computer is already packaging a bundle — wait for "
+                       "it to finish and ask again",
+    "NotDeviceMember": "that computer no longer counts you as one of its "
+                       "people, so it will not package anything for you",
+    "NotDeviceOwner": "only the person who owns that computer can ask for its "
+                      "own logs",
+    "NothingSelected": "nothing was chosen to send",
+    "ConsentMissing": "that computer was not told the request had been agreed "
+                      "to — this is a bug on our side, please report it",
+    "RunsInvalid": "that computer could not read the selection — this is a bug "
+                   "on our side, please report it",
+    "SubmitterMissing": "that computer could not tell who was asking — this is "
+                        "a bug on our side, please report it",
+    "DeviceReadFailed": "that computer could not look itself up, which usually "
+                        "means it has lost its connection",
+    "UploadFailed": "the bundle was built but could not be uploaded — it is "
+                    "still on that computer, and `superresearch --doctor` "
+                    "there prints where",
+}
+
+_SEND_LOGS_UNKNOWN = ("that computer refused the request and gave a reason we "
+                      "do not have a sentence for")
+
+
+def _send_logs_failure(error_class: str) -> str:
+    """A refusal in words. ⛔ NEVER an empty string and never the bare class
+    name: an error nobody can read is the same as no error at all, and this is
+    the surface a person reaches only because something else already went
+    wrong."""
+    known = _SEND_LOGS_FAILURES.get(str(error_class or ""))
+    if known:
+        return known
+    return f"{_SEND_LOGS_UNKNOWN} ({error_class})" if error_class else _SEND_LOGS_UNKNOWN
+
+
+def _size_words(n) -> str:
+    """Bytes as something a person can weigh a decision against."""
+    try:
+        size = float(n or 0)
+    except (TypeError, ValueError):
+        return "unknown size"
+    for unit, step in (("GB", 1024 ** 3), ("MB", 1024 ** 2), ("KB", 1024)):
+        if size >= step:
+            return f"{size / step:.1f} {unit}"
+    return f"{int(size)} bytes"
+
+
+def _run_label(row: dict) -> str:
+    """⭐ The title if this account still holds one, otherwise the date. A run
+    whose research document is gone keeps its row — those logs are still on
+    that disk and are often exactly the ones worth sending."""
+    title = (row.get("title") or "").strip()
+    if title:
+        return title
+    started = (row.get("startedUtc") or "").strip()
+    return f"a run from {started[:10]}" if started else "an unnamed run"
+
+
+def _resolve_selection(rows: list, spec: str | None) -> "tuple[list[str], str] | None":
+    """Turn `--runs` into run names. Returns (names, ) or None with a printed
+    reason.
+
+    Accepts the numbers printed beside the list AND the names themselves,
+    because both are things a person will reasonably type — the numbers are on
+    screen and the names are what the machine calls them.
+
+    ⛔ REFUSES ON ANYTHING IT CANNOT PLACE. Silently dropping an entry would
+    send fewer runs than were asked for and report success, which is the one
+    direction this must not fail in."""
+    known = {r.get("name") for r in rows}
+    picked: list[str] = []
+    for token in (spec or "").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if token.isdigit():
+            index = int(token)
+            if not 1 <= index <= len(rows):
+                print(f"{_NO} There is no run {index} in that list.")
+                return None
+            name = rows[index - 1].get("name")
+        elif token in known:
+            name = token
+        else:
+            print(f"{_NO} That computer isn't holding a run called “{token}”.")
+            return None
+        if name not in picked:
+            picked.append(name)
+    return picked, ""
+
+
+def _print_held_runs(rows: list) -> None:
+    for i, row in enumerate(rows, 1):
+        started = (row.get("startedUtc") or "")[:16].replace("T", " ")
+        print(f"  {str(i).rjust(2)}  {_run_label(row)[:40].ljust(40)}  "
+              f"{started.ljust(16)}  {str(row.get('status') or '?').ljust(10)}  "
+              f"{_size_words(row.get('sizeBytes'))}")
+
+
+def _await_bundle(code: str, seconds: int) -> int:
+    """Poll the row until the machine finishes, or say what is still unknown.
+
+    ⛔⛔ RUNNING OUT OF PATIENCE IS NOT A FAILURE, and saying so would be a lie
+    about somebody else's computer. Worker 1 deletes the command before acting
+    on it, so between the request and the row there is a window in which
+    neither exists; on a machine that is asleep that window is however long it
+    stays asleep. The support code is already valid and the bundle may still
+    land — so the timeout prints how to look again, not an error."""
+    deadline = time.time() + max(0, seconds)
+    seen_any = False
+    while time.time() < deadline:
+        res = _bridge_get(f"/logs/bundle?code={code}", timeout=15.0)
+        row = res[1].get("row") if (res and res[0] == 200) else None
+        if row:
+            seen_any = True
+            status = str(row.get("status") or "")
+            if status == "done":
+                machine = " plus this computer's own logs" if row.get("machineIncluded") else ""
+                print(f"{_OK} Sent — {int(row.get('runCount') or 0)} run(s){machine}, "
+                      f"{_size_words(row.get('sizeBytes'))}.")
+                print(f"    Quote {code} when you report the problem.")
+                return 0
+            if status == "failed":
+                print(f"{_NO} That computer couldn't send: "
+                      f"{_send_logs_failure(row.get('errorClass'))}.")
+                return 1
+        time.sleep(2)
+    if seen_any:
+        print(f"  Still packaging. Check again with:  agent send-logs --status {code}")
+    else:
+        # ⛔ Distinguished on purpose. No row at all after the wait means the
+        # request may never have been picked up — an asleep machine, or a build
+        # too old to understand it — and telling somebody "still packaging"
+        # when nothing is packaging sends them away to wait for nothing.
+        print("  That computer hasn't picked the request up yet — it may be "
+              "asleep or offline.")
+        print(f"  Check again with:  agent send-logs --status {code}")
+    return 0
+
+
+def cmd_send_logs(args: argparse.Namespace) -> int:
+    """Ask a research computer to package its logs and upload them.
+
+    ⛔ WHAT THIS SENDS IS DECIDED BY THAT COMPUTER, NOT BY THIS COMMAND. A
+    request names runs; the machine matches them against what it holds FOR THE
+    PERSON ASKING and refuses anything else. On a shared box — a fleet
+    especially — that is the difference between sending your own logs and
+    sending everyone's."""
+    if not _bridge_up():
+        print(f"{_NO} Bridge isn't running. Run:  agent serve   then   agent login")
+        return 1
+    if args.status:
+        code = str(args.status).strip().upper()
+        res = _bridge_get(f"/logs/bundle?code={code}", timeout=15.0)
+        if res is None or res[0] != 200:
+            print(f"{_NO} {_err(res)}")
+            return 1
+        row = res[1].get("row")
+        if not row:
+            print(f"Nothing recorded for {code} yet.")
+            return 0
+        status = str(row.get("status") or "?")
+        if status == "failed":
+            print(f"{_NO} {code}: {_send_logs_failure(row.get('errorClass'))}.")
+            return 1
+        if status == "done":
+            print(f"{_OK} {code}: sent — {int(row.get('runCount') or 0)} run(s), "
+                  f"{_size_words(row.get('sizeBytes'))}.")
+            return 0
+        print(f"{code}: {status}.")
+        return 0
+
+    path = "/logs/runs" + (f"?deviceId={args.device}" if args.device else "")
+    res = _bridge_get(path, timeout=30.0)
+    if res is None or res[0] != 200:
+        print(f"{_NO} {_err(res)}")
+        return 1
+    body = res[1]
+    rows = body.get("runs") or []
+    name = body.get("deviceName") or body.get("deviceId") or "that computer"
+    owned = bool(body.get("owned"))
+
+    print(f"Research computer: {name}")
+    if not body.get("published"):
+        # ⛔⛔ NOT "it holds none of your runs". The document is absent, which
+        # means we cannot see the list — a machine that has not published one
+        # yet, or one on a build that never does. Saying the other thing
+        # accuses a computer of having lost logs it may be holding right now.
+        print("  That computer hasn't told us which runs it still holds.")
+    elif not rows:
+        print("  It isn't holding logs for any of your runs.")
+    else:
+        _print_held_runs(rows)
+        if body.get("truncated"):
+            print("  (only the most recent are listed — it holds more)")
+
+    if args.list:
+        return 0
+
+    if args.none:
+        names: list[str] = []
+    elif args.runs:
+        picked = _resolve_selection(rows, args.runs)
+        if picked is None:
+            return 1
+        names = picked[0]
+    else:
+        names = [r.get("name") for r in rows]
+
+    machine = bool(args.machine)
+    if machine and not owned:
+        # Refused here as well as at the bridge, so the sentence arrives before
+        # a round trip rather than after one.
+        print(f"{_NO} That computer's own logs belong to whoever owns it.")
+        print("    Ask again without --machine and you will still get every "
+              "run of yours it holds.")
+        return 1
+    if not names and not machine:
+        print(f"{_NO} There's nothing to send.")
+        if owned:
+            print("    To send that computer's own logs instead, add --machine.")
+        return 1
+
+    total = sum(int(r.get("sizeBytes") or 0) for r in rows if r.get("name") in names)
+    print()
+    print(f"This will send {len(names)} run(s) ({_size_words(total)}) from {name}.")
+    if machine:
+        print("It will ALSO include that computer's own logs — its pairing and "
+              "sign-in records and its raw activity trail, which cover every "
+              "run it has ever done, for everyone who uses it.")
+    else:
+        print("That computer's own logs are NOT included.")
+    print("Logs are kept for 30 days and are only readable by Super Research support.")
+
+    # ⛔ The plan above is printed unconditionally; only the ASKING is skipped.
+    if not _decide(None, bool(args.yes), "Send these logs?", default=False):
+        print("Nothing was sent.")
+        return 1
+
+    with b.spinner("Asking the computer"):
+        sent = _bridge_post("/logs/send", {
+            "deviceId": args.device or "",
+            "runNames": names,
+            "includeMachine": machine,
+            # ⛔ Set HERE and nowhere else — this is the line that claims a
+            # person was shown what leaves their computer, and it sits directly
+            # under the printing and the prompt that make the claim true.
+            "consent": True,
+        }, timeout=30.0)
+    if sent is None or sent[0] != 200:
+        print(f"{_NO} {_err(sent)}")
+        return 1
+    code = sent[1].get("code", "")
+    print(f"{_OK} Asked. Support code: {code}")
+    if args.no_wait:
+        print(f"    Check with:  agent send-logs --status {code}")
+        return 0
+    return _await_bundle(code, args.wait)
+
+
 def _local_superresearch() -> "str | None":
     """Path to the Super Research backend CLI on THIS machine, if installed (the
     agent + backend are co-located in the standard setup). None if absent."""
@@ -1627,6 +1905,28 @@ def build_parser() -> argparse.ArgumentParser:
     dvrm = dvsub.add_parser("remove", parents=[common], help="unlink a device from your account")
     dvrm.add_argument("deviceId", help="deviceId to remove (from `agent device`)")
     dvrm.set_defaults(func=cmd_device)
+
+    sl = sub.add_parser("send-logs", parents=[common],
+                        help="ask a research computer to package its logs for support "
+                             "(shows what would be sent, then asks)")
+    sl.add_argument("--device", help="deviceId to ask (else your selected/sole device)")
+    sl.add_argument("--runs", help="which runs, by the numbers shown or by name, "
+                                   "comma-separated (default: all of yours it holds)")
+    sl.add_argument("--none", action="store_true",
+                    help="send no runs — for pairing problems, with --machine")
+    sl.add_argument("--machine", action="store_true",
+                    help="also send that computer's own logs (its owner only)")
+    sl.add_argument("--list", action="store_true",
+                    help="just show what it's holding, send nothing")
+    sl.add_argument("--status", metavar="CODE",
+                    help="report on a support code instead of sending")
+    sl.add_argument("-y", "--yes", action="store_true",
+                    help="don't ask before sending (the plan is still printed)")
+    sl.add_argument("--no-wait", dest="no_wait", action="store_true",
+                    help="don't wait for the computer to finish packaging")
+    sl.add_argument("--wait", type=int, default=180, metavar="SECONDS",
+                    help="how long to wait for it to finish (default 180)")
+    sl.set_defaults(func=cmd_send_logs)
 
     sub.add_parser("logout", parents=[common], help="clear the account session").set_defaults(func=cmd_logout)
     sub.add_parser("doctor", parents=[common], help="run health + connectivity diagnostics").set_defaults(func=cmd_doctor)

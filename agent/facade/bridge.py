@@ -88,6 +88,50 @@ _RID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 # into memory before the Host/Origin checks even run.
 _MAX_BODY_BYTES = 1 << 20  # 1 MiB
 
+# ── send logs ────────────────────────────────────────────────────────────────
+# A support code is a path segment AND a capability: it names the object under
+# `logs/{uid}/{deviceId}/{code}/` that the storage rule pins to one owner and
+# one device. The alphabet drops I, L, O and U so a person reading one off a
+# screen to somebody on a call cannot turn it into a different code.
+_SUPPORT_CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+_SUPPORT_CODE_LENGTH = 8
+_SUPPORT_CODE_RE = re.compile(r"^[0-9A-HJKMNP-TV-Z]{8}$")
+
+# ⛔⛔ THE ONLY DEVICE COMMAND THIS BRIDGE MAY EVER WRITE FOR LOGS, and the
+# reason is the whole shape of this feature on a fleet box.
+#
+# `send-logs` means "this machine's own cap" and `send-logs-limited` means "the
+# newest N". Neither is scoped to a PERSON, so either one asks for a
+# whole-machine bundle — every run the computer has ever done, for everyone who
+# uses it. The Firestore rule keeps both owner-only for exactly that reason, and
+# opens only this third name to a sharer.
+#
+# A fleet box is the case that makes this concrete rather than theoretical: one
+# research computer can be shared by many people (DG_SUPER_RESEARCH_DEFAULT_
+# DEVICE_CODE), so the agent's user is USUALLY a sharer and never assumed to be
+# the owner. Naming the action here — a constant, not a parameter — means no
+# future caller in this file can pick a different one by passing a flag.
+_SEND_LOGS_ACTION = "send-logs-selected"
+
+# The machine publishes at most this many runs per person; a selection larger
+# than the list it published cannot be honest, and the machine refuses one
+# outright. Bounded here so a malformed request never reaches the wire.
+_SEND_LOGS_MAX_NAMES = 60
+_RUN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,95}$")
+
+
+def _mint_support_code() -> str:
+    """A fresh support code from the OS CSPRNG.
+
+    ⭐ Minted HERE rather than by the machine, for the same reason the web app
+    mints it in the browser: the code names the document the caller then
+    watches, so it has to exist before the request is sent. A collision can
+    only ever affect this user's own bundles — the path it names is already
+    scoped to this uid and this device.
+    """
+    return "".join(secrets.choice(_SUPPORT_CODE_ALPHABET)
+                   for _ in range(_SUPPORT_CODE_LENGTH))
+
 # Podcast audio (the chat /sr-podcast → a native audio FILE the runtime attaches).
 # The audio is downloaded host-side to ~/.super-agent/podcasts and only the LOCAL
 # PATH is handed back — the long-lived Storage download token never leaves the
@@ -1609,6 +1653,10 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 self._devices()
             elif path == "/device":
                 self._device_current()
+            elif path == "/logs/runs":
+                self._log_runs()
+            elif path == "/logs/bundle":
+                self._log_bundle()
             elif path == "/updates":
                 self._updates()
             elif path == "/version":
@@ -1668,6 +1716,8 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 self._device_pair()
             elif path == "/device/remove":
                 self._device_remove()
+            elif path == "/logs/send":
+                self._log_send()
             elif path == "/research":
                 self._research()
             elif path.startswith("/research/") and path.endswith("/stop"):
@@ -2138,6 +2188,234 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                              "error": "no device selected — pick one from the device list",
                              "devices": [_device_descriptor(d) for d in devs]})
             return None
+
+        # ── send logs ────────────────────────────────────────────────────
+        def _log_device(self, body: dict[str, Any], sess: AccountSession,
+                        fs: FirestoreRest) -> dict[str, Any] | None:
+            """The machine a log request is aimed at, as a decorated row.
+
+            Reuses `_resolve_device` so "which computer?" reads identically to
+            the run path — the same `reason` codes, the same auto-picks.
+
+            ⛔ THEN IT INSISTS ON THE ROW, which the run path deliberately does
+            not: there, an explicit deviceId is passed through and membership is
+            enforced when the queue write lands. Here the write is a device
+            command, and a non-member's create is refused by the rule as a bare
+            403 — which reaches the person as "could not reach the research
+            store", a sentence about US when the truth is about THEM. And the
+            row is needed anyway: ownership decides what may be asked for.
+            """
+            device_id = self._resolve_device(body, sess, fs)
+            if device_id is None:
+                return None  # _resolve_device already answered
+            try:
+                devs = fs.list_devices(sess.uid)
+            except RevokedError:
+                self._json(401, {"error": "session revoked — run /login again"})
+                return None
+            except FirestoreError as e:
+                self._firestore_502(e)
+                return None
+            match = next((d for d in devs if d.get("id") == device_id), None)
+            if match is None:
+                self._json(404, {"reason": "not_a_member",
+                                 "error": "that computer isn't on your account — "
+                                          "add it, or pick one from the device list"})
+                return None
+            self._decorate_devices([match], sess.uid,
+                                   prefs.get_selected_device(sess.uid))
+            return match
+
+        def _log_runs(self) -> None:
+            """The runs a machine still holds logs for, FOR THIS PERSON, with
+            the titles joined from this account's own research documents.
+
+            ⭐⭐ THE MACHINE SENDS IDS AND WE SUPPLY THE WORDS. No topic and no
+            title exists anywhere in a run folder, on purpose — so the list
+            arrives as folder names plus a researchId, and the words come from
+            documents this account already holds. Nothing about what anybody
+            researched has to leave that computer for this list to read like a
+            list of researches.
+            """
+            acct = self._account()
+            if acct is None:
+                return
+            qs = parse_qs((self.path.split("?", 1) + [""])[1])
+            body = {"deviceId": (qs.get("deviceId") or [""])[0].strip()}
+            sess, fs = acct
+            dev = self._log_device(body, sess, fs)
+            if dev is None:
+                return
+            device_id = str(dev.get("id") or "")
+            try:
+                held = fs.held_runs(sess.uid, device_id)
+                researches = fs.list_researches(sess.uid)
+            except RevokedError:
+                self._json(401, {"error": "session revoked — run /login again"})
+                return
+            except FirestoreError as e:
+                self._firestore_502(e)
+                return
+            # ⛔⛔ NEVER PUBLISHED IS NOT NONE HELD, and the whole value of this
+            # route is that a caller can tell them apart. `published: false`
+            # means the document is absent — a machine on an older build, a rule
+            # that has not reached it, or one that has simply never run anything
+            # of this person's. `published: true` with an empty list is the
+            # machine saying "I hold nothing of yours", which is a sentence
+            # worth printing. Printing the first one as the second accuses a
+            # computer of having lost logs it may be holding right now.
+            titles = {r.get("id"): (r.get("title") or r.get("topic") or "")
+                      for r in researches}
+            rows = []
+            for item in (held or {}).get("runs", []) or []:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name")
+                if not isinstance(name, str) or not name:
+                    continue
+                rid = item.get("researchId") if isinstance(item.get("researchId"), str) else ""
+                rows.append({
+                    "name": name,
+                    "researchId": rid,
+                    # ⭐ A run whose research document is gone from this tree
+                    # KEEPS ITS ROW. The logs are still on that disk and still
+                    # worth sending; it simply reads by its date instead.
+                    "title": titles.get(rid, ""),
+                    "startedUtc": item.get("startedUtc") or "",
+                    "status": item.get("status") or "unknown",
+                    "sizeBytes": item.get("sizeBytes") or 0,
+                    "attempt": item.get("attempt") or 0,
+                })
+            self._json(200, {
+                "deviceId": device_id,
+                "deviceName": dev.get("name") or dev.get("hostname") or device_id,
+                "owned": bool(dev.get("owned")),
+                "online": dev.get("online"),
+                "published": held is not None,
+                "runs": rows,
+                "truncated": bool((held or {}).get("truncated")),
+                "updatedAt": (held or {}).get("updatedAt") or "",
+            })
+
+        def _log_send(self) -> None:
+            """Ask a machine to package logs and upload them under a support code.
+
+            ⛔⛔ CONSENT IS CARRIED, NOT MANUFACTURED. The machine refuses a
+            request that does not claim it, and this route refuses to make the
+            claim on a caller's behalf — the flag has to arrive in the body,
+            because it is a statement that a person was SHOWN what leaves the
+            computer, and this file has shown them nothing. The surface that
+            printed the list is the only place that can honestly set it.
+            """
+            body = self._read_json()
+            acct = self._account()
+            if acct is None:
+                return
+            sess, fs = acct
+            if body.get("consent") is not True:
+                self._json(400, {"reason": "no_consent",
+                                 "error": "logs are only sent after the person has been "
+                                          "shown what leaves the computer"})
+                return
+            raw = body.get("runNames")
+            if not isinstance(raw, list) or len(raw) > _SEND_LOGS_MAX_NAMES:
+                self._json(400, {"reason": "bad_selection",
+                                 "error": "runNames must be a list of run names "
+                                          f"(at most {_SEND_LOGS_MAX_NAMES})"})
+                return
+            names: list[str] = []
+            for item in raw:
+                # ⛔ REFUSE, NEVER DROP. A name this bridge quietly discarded
+                # would be a run the person ticked and did not get, reported as
+                # a success — the one direction a log request must not fail in.
+                if not isinstance(item, str) or not _RUN_NAME_RE.match(item):
+                    self._json(400, {"reason": "bad_selection",
+                                     "error": "one of the run names isn't a run name"})
+                    return
+                names.append(item)
+            include_machine = body.get("includeMachine") is True
+            dev = self._log_device(body, sess, fs)
+            if dev is None:
+                return
+            device_id = str(dev.get("id") or "")
+            # ⛔⛔ REFUSED HERE RATHER THAN QUIETLY DOWNGRADED, and the machine
+            # still ANDs it with ownership regardless. That material — the
+            # pairing and sign-in sessions, the raw device tails — is every run
+            # the computer has ever done for everyone who uses it, so a sharer
+            # asking for it gets nothing extra no matter what this bridge does.
+            # What this bridge decides is whether they are TOLD. A fleet box is
+            # shared by design, so silently sending a smaller bundle than the
+            # one someone asked for would be the normal case, not the edge one.
+            if include_machine and not dev.get("owned"):
+                self._json(403, {"reason": "machine_logs_owner_only",
+                                 "error": "this computer's own logs belong to whoever "
+                                          "owns it — ask again without them, and you "
+                                          "will still get every run of yours it holds"})
+                return
+            # ⛔ NOBODY MAY BUILD AN EMPTY ARCHIVE. The machine refuses this too,
+            # and refusing here as well is what turns a round trip plus a row
+            # nobody is watching into an immediate sentence. A zip of three JSON
+            # files handed back under a support code is worse than a refusal,
+            # because the person believes they have sent something.
+            if not names and not include_machine:
+                self._json(400, {"reason": "nothing_selected",
+                                 "error": "nothing was chosen to send"})
+                return
+            code = _mint_support_code()
+            request_id = uuid.uuid4().hex
+            try:
+                command_id = fs.write_device_command(
+                    device_id, _SEND_LOGS_ACTION, uid=sess.uid,
+                    extra={"code": code, "requestId": request_id,
+                           "consent": True, "runNames": names,
+                           # ⛔ ALWAYS ON THE WIRE, never omitted when false. The
+                           # machine reads a missing field as "not asked for" —
+                           # the safe direction — but an absent field and an
+                           # explicit False would then be indistinguishable, and
+                           # the row this produces records what was chosen.
+                           "includeMachine": include_machine})
+            except RevokedError:
+                self._json(401, {"error": "session revoked — run /login again"})
+                return
+            except FirestoreError as e:
+                self._firestore_502(e)
+                return
+            log.info("send-logs requested on %s (%d runs, machine=%s)",
+                     device_id, len(names), include_machine)
+            self._json(200, {"ok": True, "code": code, "requestId": request_id,
+                             "commandId": command_id, "deviceId": device_id,
+                             "deviceName": dev.get("name") or dev.get("hostname") or device_id,
+                             "runCount": len(names),
+                             "includeMachine": include_machine})
+
+        def _log_bundle(self) -> None:
+            """One support bundle's row — what the machine has done with a code.
+
+            ⛔ ABSENT IS REPORTED AS ABSENT. Worker 1 deletes the command before
+            dispatching it, so there is a real window in which the request is
+            gone and the row has not appeared; on a machine too old to
+            understand the request that window never closes. `row: null` is that
+            state, and a caller decides it has waited long enough — this route
+            never guesses on its behalf by calling it a failure.
+            """
+            acct = self._account()
+            if acct is None:
+                return
+            sess, fs = acct
+            qs = parse_qs((self.path.split("?", 1) + [""])[1])
+            code = (qs.get("code") or [""])[0].strip().upper()
+            if not _SUPPORT_CODE_RE.match(code):
+                self._json(400, {"error": "that isn't a support code"})
+                return
+            try:
+                row = fs.get_log_bundle(sess.uid, code)
+            except RevokedError:
+                self._json(401, {"error": "session revoked — run /login again"})
+                return
+            except FirestoreError as e:
+                self._firestore_502(e)
+                return
+            self._json(200, {"code": code, "row": row})
 
         def _research(self) -> None:
             body = self._read_json()

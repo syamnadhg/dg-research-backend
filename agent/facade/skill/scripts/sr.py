@@ -1088,6 +1088,199 @@ def cmd_updates(args) -> int:
     return _emit(body, args.json, (lines or ["No active runs."]) + _stream_health_lines(runs))
 
 
+# ── send logs ────────────────────────────────────────────────────────────────
+#
+# ⛔⛔ THIS IS A CONFIRM-FIRST VERB AND THE REASON IS NOT POLITENESS. The
+# research computer refuses a request that does not carry recorded consent, and
+# that flag is a claim that a person was SHOWN what leaves their machine. In the
+# app a modal makes the claim true. Here the FIRST call prints what would be
+# sent and sends nothing; only `--confirm` puts the flag on the wire. A single
+# call that showed the person nothing and claimed consent anyway would be
+# forging the one thing the machine cannot check for itself.
+#
+# ⭐ A SECOND COPY OF THE CLI'S SENTENCES, AND THE DUPLICATION IS FORCED. This
+# script is stdlib-only by contract — it runs inside somebody else's chat
+# runtime and may not import `facade` — so it cannot share the table.
+# `test_send_logs_cli_0825.py` reads both files and fails if either grows a case
+# the other lacks.
+_SEND_LOGS_FAILURES = {
+    "CooldownActive": "that computer built a bundle very recently — give it "
+                      "ten minutes and ask again",
+    "AlreadyBuilding": "that computer is already packaging a bundle — wait for "
+                       "it to finish and ask again",
+    "NotDeviceMember": "that computer no longer counts you as one of its "
+                       "people, so it will not package anything for you",
+    "NotDeviceOwner": "only the person who owns that computer can ask for its "
+                      "own logs",
+    "NothingSelected": "nothing was chosen to send",
+    "ConsentMissing": "that computer was not told the request had been agreed "
+                      "to — this is a bug on our side, please report it",
+    "RunsInvalid": "that computer could not read the selection — this is a bug "
+                   "on our side, please report it",
+    "SubmitterMissing": "that computer could not tell who was asking — this is "
+                        "a bug on our side, please report it",
+    "DeviceReadFailed": "that computer could not look itself up, which usually "
+                        "means it has lost its connection",
+    "UploadFailed": "the bundle was built but could not be uploaded — it is "
+                    "still on that computer, and running “superresearch "
+                    "--doctor” there prints where",
+}
+
+_SEND_LOGS_UNKNOWN = ("that computer refused the request and gave a reason we "
+                      "do not have a sentence for")
+
+
+def _send_logs_failure(error_class: str) -> str:
+    """A refusal in words a person can act on. ⛔ Never empty and never the bare
+    class name — an error nobody can read is the same as no error at all."""
+    known = _SEND_LOGS_FAILURES.get(str(error_class or ""))
+    if known:
+        return known
+    return f"{_SEND_LOGS_UNKNOWN} ({error_class})" if error_class else _SEND_LOGS_UNKNOWN
+
+
+def _size_words(n) -> str:
+    try:
+        size = float(n or 0)
+    except (TypeError, ValueError):
+        return "unknown size"
+    for unit, step in (("GB", 1024 ** 3), ("MB", 1024 ** 2), ("KB", 1024)):
+        if size >= step:
+            return f"{size / step:.1f} {unit}"
+    return f"{int(size)} bytes"
+
+
+def _log_run_label(row: dict) -> str:
+    """⭐ The title if this account still holds one, otherwise the date. A run
+    whose research is gone from the app keeps its row — those logs are still on
+    that disk, and are often exactly the ones worth sending."""
+    title = (row.get("title") or "").strip()
+    if title:
+        return title
+    started = (row.get("startedUtc") or "").strip()
+    return f"a run from {started[:10]}" if started else "an unnamed run"
+
+
+def cmd_send_logs(args) -> int:
+    """Ask the research computer to package its logs for support.
+
+    Two steps by design — see the block comment above. Without ``--confirm``
+    this prints what would be sent and sends nothing.
+    """
+    if args.status:
+        want = str(args.status).strip().upper()
+        code, body = _get(f"/logs/bundle?code={want}")
+        if code != 200:
+            return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
+        row = body.get("row")
+        if not row:
+            return _emit(body, args.json, [
+                f"Nothing has come back for {want} yet. That computer may still "
+                "be packaging it, or may not have picked the request up."])
+        status = str(row.get("status") or "")
+        if status == "failed":
+            return _emit(body, args.json,
+                         [f"✗ {want} didn’t send: {_send_logs_failure(row.get('errorClass'))}."], 1)
+        if status == "done":
+            return _emit(body, args.json, [
+                f"✓ {want} was sent — {int(row.get('runCount') or 0)} run(s), "
+                f"{_size_words(row.get('sizeBytes'))}.",
+                f"Quote {want} when you report the problem."])
+        return _emit(body, args.json, [f"{want} is still being packaged."])
+
+    path = "/logs/runs"
+    device_arg = getattr(args, "device", "") or ""
+    if device_arg:
+        dev, fail = _resolve_device_arg(device_arg)
+        if dev is None:
+            return _emit({}, args.json, fail, 1)
+        path += f"?deviceId={dev.get('id')}"
+    code, body = _get(path)
+    if code != 200:
+        if body.get("reason") in ("no_selection", "stale_selection", "no_devices"):
+            return _emit(body, args.json,
+                         _pick_device_lines(body, body.get("reason", "")), _fail_code(code))
+        return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
+
+    rows = body.get("runs") or []
+    name = body.get("deviceName") or "your Research Computer"
+    owned = bool(body.get("owned"))
+    machine = bool(getattr(args, "machine", False))
+
+    if machine and not owned:
+        # Said here rather than after a round trip. The computer would refuse
+        # this anyway; what this decides is whether the person is TOLD, and on
+        # a shared computer that is the ordinary case rather than the odd one.
+        return _emit(body, args.json, [
+            f"“{name}”’s own logs belong to whoever owns it, so I can’t include "
+            "them. Ask again without them and you’ll still get every run of "
+            "yours it’s holding."], 1)
+
+    names = [r.get("name") for r in rows]
+    if getattr(args, "none", False):
+        names = []
+    if not names and not machine:
+        if not body.get("published"):
+            # ⛔⛔ NOT "it isn't holding any of your runs". The list is absent,
+            # which means we cannot see it — a computer that hasn't published
+            # one yet, or one on an older build. The other sentence tells
+            # somebody their logs are gone while that machine may hold them all.
+            return _emit(body, args.json, [
+                f"“{name}” hasn’t told me which runs it’s still holding, so I "
+                "can’t offer you a list yet."] + ([
+                    "If you own it, I can still send the computer’s own logs — "
+                    "that’s the right choice when the problem is with connecting "
+                    "it at all."] if owned else []), 1)
+        return _emit(body, args.json, [
+            f"“{name}” isn’t holding logs for any of your runs."] + ([
+                "If the problem is with connecting it at all, I can send the "
+                "computer’s own logs instead — just ask."] if owned else []), 1)
+
+    total = sum(int(r.get("sizeBytes") or 0) for r in rows if r.get("name") in names)
+
+    if not getattr(args, "confirm", False):
+        lines = [f"I can send Super Research support the logs from “{name}”:"]
+        for row in rows:
+            if row.get("name") in names:
+                lines.append(f"  • {_log_run_label(row)} — "
+                             f"{_size_words(row.get('sizeBytes'))}")
+        if body.get("truncated"):
+            lines.append("  (only the most recent are listed — it’s holding more)")
+        if machine:
+            lines.append("Plus that computer’s own logs: its pairing and sign-in "
+                         "records and its raw activity trail, which cover every "
+                         "run it has ever done, for everyone who uses it.")
+        else:
+            lines.append("That computer’s own logs are not included.")
+        lines.append(f"That’s {len(names)} run(s), about {_size_words(total)}. "
+                     "They’re kept for 30 days and only Super Research support "
+                     "can read them.")
+        lines.append("Say yes and I’ll send them.")
+        return _emit({**body, "wouldSend": names, "includeMachine": machine},
+                     args.json, lines)
+
+    payload = {"runNames": names, "includeMachine": machine,
+               # ⛔ Set on this branch ONLY. It claims the person was shown what
+               # leaves their computer, and the branch above is where that
+               # happened. Moving it up would make the claim false.
+               "consent": True}
+    if device_arg:
+        payload["deviceId"] = path.split("deviceId=", 1)[1]
+    code, sent = _post("/logs/send", payload)
+    if code != 200:
+        return _emit(sent, args.json,
+                     [f"✗ couldn’t send the logs: {sent.get('error', code)}"], _fail_code(code))
+    support = sent.get("code", "")
+    return _emit(sent, args.json, [
+        f"✓ Asked “{name}” for the logs. Your support code is {support}.",
+        "It takes a moment to package. Ask me to check on it and I’ll look.",
+        *_agent_directive_block([
+            f"To check on it later, run: sr send-logs --status {support}",
+            "Do not poll on a timer — only when the user asks.",
+        ]),
+    ])
+
+
 def cmd_list(args) -> int:
     """List the account's recent researches (newest first), so the user can ask for
     any one's links or podcast BY NAME. Account-wide — EVERY research, not just the
@@ -1676,6 +1869,27 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
         if not topic:
             return None, ["Happy to fire a Super Research — what topic?"]
 
+    # 2c. Sending logs to support. AFTER the research rule on purpose — "research
+    #     how log shipping works" is a topic, not a request to send anything —
+    #     and it needs BOTH a giving verb and the word logs, so "check the logs"
+    #     and "what do the logs say" fall through to the status rules where they
+    #     belong. The bare command only SHOWS what would go, so resolving this
+    #     eagerly cannot send anything by mistake.
+    if re.search(r"\b(logs?|log ?files?|diagnostics?)\b", low) and re.search(
+            r"\b(send|share|upload|submit|report|give|email|hand)\b", low):
+        argv = ["send-logs"]
+        # ⛔⛔ ONLY AN EXPLICIT ASK FOR THE COMPUTER'S OWN LOGS REACHES THE FLAG,
+        # and "everything" / "all of them" deliberately do NOT. That material is
+        # every run the machine has ever done for everyone who uses it, and a
+        # person saying "send all the logs" means all of THEIRS — reading it the
+        # other way turns a broad word into a request they did not make. The
+        # narrow phrasing is reachable because the no-runs branch offers it in
+        # those words, so the one case that genuinely needs it has a route.
+        if re.search(r"\b(computer|machine|device)(?:’s|'s)?\s+own\b", low) or \
+                re.search(r"\bown\s+(logs?|log ?files?|diagnostics?)\b", low):
+            argv.append("--machine")
+        return argv, None
+
     # 3. Run controls (before the broad status rules).
     if re.search(r"\b(stop|end|abort|cancel)\b", low) or re.search(r"\bthat.?s enough\b", low):
         name = _nl_run_name(t, re.sub(r"^.*?\b(?:stop|end|abort|cancel)\b", "", t, flags=re.I).strip())
@@ -1907,6 +2121,20 @@ def build_parser() -> argparse.ArgumentParser:
     sk.add_argument("phases", nargs="*")
     sk.add_argument("--run", default="", help="run title or id (default: newest active run)")
     sk.set_defaults(func=cmd_skip)
+
+    # Confirm-first: the bare form SHOWS what would be sent and sends nothing.
+    sl = sub.add_parser("send-logs", aliases=["logs", "send-log"],
+                        help="send Super Research support the logs from the connected computer")
+    sl.add_argument("--confirm", action="store_true",
+                    help="actually send (the bare command only shows what would go)")
+    sl.add_argument("--machine", action="store_true",
+                    help="also send that computer's own logs (its owner only)")
+    sl.add_argument("--none", action="store_true",
+                    help="send no runs — for connection problems, with --machine")
+    sl.add_argument("--device", default="", help="which computer (name or id)")
+    sl.add_argument("--status", default="", metavar="CODE",
+                    help="report on a support code instead of sending")
+    sl.set_defaults(func=cmd_send_logs)
 
     sub.add_parser("logout", help="clear the account session").set_defaults(func=cmd_logout)
 

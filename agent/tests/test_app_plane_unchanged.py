@@ -74,9 +74,24 @@ def test_sr_client_is_stdlib_only():
 
 def test_all_firestore_paths_are_account_scoped():
     """EVERY Firestore path the client builds stays under the caller's own tree
-    (users/{uid}/…) or a device queue it is a member of (devices/{id}/queue) or a
-    read query (:runQuery) — exactly what a normal account client may already do.
-    This is the load-bearing 'no rules change' evidence."""
+    (users/{uid}/…) or a collection on a device it is a member of, or a read
+    query (:runQuery) — exactly what a normal account client may already do.
+    This is the load-bearing 'no rules change' evidence.
+
+    ⭐ 2026-08-25 (wave 8L) — `devices/{id}/commands` JOINS THE LIST, and the
+    claim above survives intact rather than being weakened to fit. That
+    collection has been writable by a device's owner AND its sharers since long
+    before this agent existed; what is newer is only that one of its actions,
+    `send-logs-selected`, was opened to sharers on 2026-08-24, and that clause
+    is in the deployed ruleset already because the web app's own picker needs
+    it. So no rule moved for this wave — the allowlist here was simply narrower
+    than the boundary it was standing in for.
+
+    ⛔ AND THE PATH IS NOT THE WHOLE PERMISSION HERE, which is why the next
+    test exists. A device command's ACTION decides what may be asked for: two
+    of the three send-logs names mean "the whole machine" and stay owner-only.
+    A path check alone would call all three the same thing.
+    """
     src = (FACADE_DIR / "firestore_rest.py").read_text(encoding="utf-8")
     paths = re.findall(r"config\.FIRESTORE_BASE\}(\S*)", src)
     assert paths, "expected to find FIRESTORE_BASE path templates"
@@ -84,8 +99,34 @@ def test_all_firestore_paths_are_account_scoped():
         assert (
             p.startswith("/users/{uid}")
             or p.startswith("/devices/{device_id}/queue")
+            or p.startswith("/devices/{device_id}/commands")
             or p.startswith(":runQuery")
         ), f"Firestore path escapes account scope: {p!r}"
+
+
+def test_this_client_can_never_choose_a_device_command_for_itself():
+    """The action a device command carries IS its permission, so the module
+    that talks to Firestore must not be able to pick one.
+
+    ⛔⛔ A DEFAULT WOULD BE A CHOICE MADE IN THE WRONG PLACE. `send-logs` and
+    `send-logs-limited` both mean "everything this computer has ever done, for
+    everyone who uses it"; only `send-logs-selected` is scoped to the person
+    asking. A default here — however sensible-looking — would be a
+    whole-machine request that every future caller inherits without naming it,
+    and on the owner's own machine it would work perfectly. The caller names
+    the action, every time, and `bridge.py` is where that name is pinned.
+    """
+    import inspect
+
+    from facade.firestore_rest import FirestoreRest
+
+    sig = inspect.signature(FirestoreRest.write_device_command)
+    action = sig.parameters["action"]
+    assert action.default is inspect.Parameter.empty, (
+        "write_device_command must not default its action — see this test's docstring")
+    src = (FACADE_DIR / "firestore_rest.py").read_text(encoding="utf-8")
+    assert "send-logs" not in src, (
+        "no send-logs action name may be written into the Firestore client itself")
 
 
 def test_secret_store_isolated_from_device_keystore():

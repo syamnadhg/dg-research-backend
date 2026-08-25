@@ -174,6 +174,8 @@ cancels. Never send the bare "yes" back into `do`.
 | "what version?" | `sr.py version` (shows the SKILL version only; nudges when a newer skill version is available. The backend's version lives in the app's Settings → About — don't mention the backend here) |
 | "update", "update the skill", "update yourself" (colloquial "update the agent" too) | **confirm**, then `sr.py update` (updates the Super Research **skill** — this chat's scripts + bridge). It returns a do-not-relay finish script — FOLLOW IT: wait for the bridge to restart, verify the new version with `sr.py version` (retry a few times while it restarts), then run **/reload-skills ONCE**, then post one "✓ updated to vX" line. Do NOT improvise your own recovery. This is the ONLY thing the runtime updates. |
 | "update Super Research", "update the backend", "update the research computer" | the runtime does NOT update the backend — tell them to run `superresearch --update` on the Research computer **or** update it from the app (Settings → About / the update notification). `sr.py do "<message>"` returns this exact redirect. |
+| "send my logs", "share the logs with support", "submit diagnostics" | `sr.py send-logs` — it SHOWS what would go and sends nothing. On "yes", run `sr.py send-logs --confirm`. See **Sending logs to support** |
+| "did my logs go through?", "check on that support code" | `sr.py send-logs --status <CODE>` |
 | just `/sr`, "what can you do?", "help" | `sr.py status-account` → welcome (see **A bare `/sr`**) |
 
 **Safe defaults:** unnamed run → the **most-recent active** run. **Confirm before
@@ -306,6 +308,42 @@ superresearch --pair
 It auto-installs Python + pipx + Super Research, then prints the 8-char access
 code — they read it to you and you run `device-add`.
 
+## Sending logs to support
+
+When something has gone wrong and Super Research support needs to see it, the
+Research Computer can package its logs and upload them under a **support code** —
+eight characters the user quotes when they report the problem.
+
+**It is always two steps, and never one.** `sr.py send-logs` prints exactly what
+would leave that computer — which runs, how big, how long they are kept — and
+sends nothing. Only `sr.py send-logs --confirm` actually sends. **Relay the plan
+verbatim and wait for a real "yes".** The computer refuses a request that does
+not carry recorded consent, and that consent is the user having read those
+lines. Confirming on their behalf, or running `--confirm` first because it looks
+like a shortcut, makes a claim about a conversation that did not happen.
+
+- **What goes** is the logs of the runs **this user** fired on that computer,
+  and nothing else. The computer decides that itself — a request cannot widen
+  it. So on a shared Research Computer, sending logs never hands over anybody
+  else's research.
+- **The computer's own logs** — its pairing and sign-in records, its raw
+  activity trail — are a separate thing and are **the owner's**. They cover
+  every run that machine has ever done for everyone who uses it. Only offer
+  them when the user owns the computer, and only when the problem is with
+  connecting it at all rather than with a particular run. `--machine` asks for
+  them; a non-owner is told no.
+- **No runs listed** is normal on a computer that has just been set up, and it
+  is exactly the connection-problem case: offer the computer's own logs instead
+  if the user owns it.
+- **"Hasn't told me which runs it's holding"** is not the same as "isn't holding
+  any". The first means we cannot see the list; do not turn it into a statement
+  about the user's logs being gone.
+- **After sending**, hand back the support code and stop. Packaging takes a
+  moment. Check with `sr.py send-logs --status <CODE>` **when the user asks** —
+  never on a timer.
+- One bundle per ten minutes per person. "Give it ten minutes" is the honest
+  answer to a cooldown, not a retry loop.
+
 ## Which link to share
 
 `sr.py status` lists each **finished** phase with its link(s) — both kinds are safe
@@ -359,6 +397,11 @@ it down too: `cronjob(action="list")` → the `sr-stream…` job →
   `logout` (signs the account out), `device-remove` (unlinks a device — nothing is
   deleted; an owner's device re-pairs with its code), and `update` (briefly
   restarts the chat bridge). There is no destructive "delete the chat" action here.
+- **`send-logs` confirms differently and more strictly**: the bare command prints
+  what would leave the user's computer and sends nothing, and `--confirm` is the
+  only thing that sends. Relay the plan and wait for a real "yes" — the computer
+  refuses a request that does not carry recorded consent, and that consent IS the
+  user having read those lines. See **Sending logs to support**.
 - Never ask for or handle passwords / tokens — sign-in happens on the user's own
   device via the `/sr login` link; any in-AI sign-in or human check is done by the
   user on the device, never by you.
