@@ -480,6 +480,21 @@ MUTANTS = [
      [("- **\"Hasn't told me which runs it's holding\"** is not the same as \"isn't holding\n"
        "  any\". The first means we cannot see the list; do not turn it into a statement\n"
        "  about the user's logs being gone.\n", "")]),
+
+    # ═══════════ X — the machine the plan was printed for ═══════════════════
+    ("X1", CLI, "over",
+     "⛔⛔ the send stops naming the machine the list came from, so a selection "
+     "that changed between the showing and the sending sends from a computer "
+     "the person never saw",
+     [('            # Always the machine the list came from — see above.\n'
+       '            "deviceId": device_id,',
+       '            "deviceId": args.device or "",')]),
+    ("X2", SR, "over",
+     "the same gap in chat: the plan describes one computer and the send "
+     "re-resolves to whichever is selected when it lands",
+     [('               # Always the machine the list came from — see above.\n'
+       '               "deviceId": device_id}',
+       '               "deviceId": ""}')]),
 ]
 
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
@@ -515,6 +530,23 @@ def run_tests() -> bool:
 
 
 def main() -> int:
+    # An optional id filter, for re-checking the mutants a previous run left
+    # standing without paying for the whole sweep again.
+    #
+    # ⛔ A FILTERED RUN IS NOT A RESULT. It proves the ids it names and nothing
+    # else, so it says so in its own output rather than printing a score that
+    # would be quoted later as if the sweep had run. The full run is what a
+    # wave is measured by.
+    only = {a.strip() for a in sys.argv[1:] if a.strip()}
+    selected = [m for m in MUTANTS if not only or m[0] in only]
+    if only:
+        unknown = only - {m[0] for m in MUTANTS}
+        if unknown:
+            print(f"no such mutant: {', '.join(sorted(unknown))}")
+            return 2
+        print(f"⚠ FILTERED to {', '.join(sorted(only))} — this is a spot check, "
+              f"not a score for the wave.")
+
     dirty = tracked_dirty()
     if dirty:
         print("Tracked files are modified. Commit or stash first — a harness that starts\n"
@@ -528,7 +560,7 @@ def main() -> int:
     print("green")
 
     survivors = []
-    for mid, fname, direction, why, edits in MUTANTS:
+    for mid, fname, direction, why, edits in selected:
         path = ROOT / fname
         original = path.read_text(encoding="utf-8")
         try:
@@ -584,8 +616,10 @@ def main() -> int:
               + "\n".join(leftover))
         return 3
 
-    over = sum(1 for m in MUTANTS if m[2] == "over")
-    print(f"\n{len(MUTANTS) - len(survivors)}/{len(MUTANTS)} killed ({over} over-corrections)")
+    over = sum(1 for m in selected if m[2] == "over")
+    label = " (SPOT CHECK — not the wave's score)" if only else ""
+    print(f"\n{len(selected) - len(survivors)}/{len(selected)} killed "
+          f"({over} over-corrections){label}")
     if survivors:
         print("SURVIVORS:\n" + "\n".join(f"  {m} [{d}] {w}" for m, d, w in survivors))
         return 1

@@ -1203,6 +1203,12 @@ def cmd_send_logs(args) -> int:
         return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
 
     rows = body.get("runs") or []
+    # ⛔⛔ THE MACHINE THE LIST CAME FROM, CARRIED ONTO THE SEND. Showing and
+    # sending are two separate calls, and with no deviceId the bridge picks the
+    # selected machine each time — so a selection that changes in between would
+    # show one computer's runs and send from another. The person agreed to what
+    # they were shown.
+    device_id = str(body.get("deviceId") or "")
     name = body.get("deviceName") or "your Research Computer"
     owned = bool(body.get("owned"))
     machine = bool(getattr(args, "machine", False))
@@ -1263,9 +1269,9 @@ def cmd_send_logs(args) -> int:
                # ⛔ Set on this branch ONLY. It claims the person was shown what
                # leaves their computer, and the branch above is where that
                # happened. Moving it up would make the claim false.
-               "consent": True}
-    if device_arg:
-        payload["deviceId"] = path.split("deviceId=", 1)[1]
+               "consent": True,
+               # Always the machine the list came from — see above.
+               "deviceId": device_id}
     code, sent = _post("/logs/send", payload)
     if code != 200:
         return _emit(sent, args.json,

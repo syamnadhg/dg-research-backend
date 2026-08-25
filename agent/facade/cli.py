@@ -1686,7 +1686,15 @@ def cmd_send_logs(args: argparse.Namespace) -> int:
         return 1
     body = res[1]
     rows = body.get("runs") or []
-    name = body.get("deviceName") or body.get("deviceId") or "that computer"
+    # ⛔⛔ THE MACHINE THE LIST CAME FROM, CARRIED ONTO THE SEND — never resolved
+    # a second time. Showing and sending are two round trips, and with no
+    # deviceId the bridge picks the selected machine each time: a selection that
+    # changes in between (in the app, or because the old one stopped being
+    # reachable) would print one computer's runs and then send from another. The
+    # person consented to what they were shown, so what they were shown is what
+    # has to be sent.
+    device_id = str(body.get("deviceId") or "") or (args.device or "")
+    name = body.get("deviceName") or device_id or "that computer"
     owned = bool(body.get("owned"))
 
     print(f"Research computer: {name}")
@@ -1748,7 +1756,8 @@ def cmd_send_logs(args: argparse.Namespace) -> int:
 
     with b.spinner("Asking the computer"):
         sent = _bridge_post("/logs/send", {
-            "deviceId": args.device or "",
+            # Always the machine the list came from — see above.
+            "deviceId": device_id,
             "runNames": names,
             "includeMachine": machine,
             # ⛔ Set HERE and nowhere else — this is the line that claims a

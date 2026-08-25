@@ -64,7 +64,11 @@ class Wire:
         if path.startswith("/logs/runs"):
             if self.runs_body is not None:
                 return self.runs_code, self.runs_body
-            return 200, {"deviceId": "dev1", "deviceName": "Studio PC",
+            # Echoes the device the caller ASKED for, like the bridge does. A
+            # fake that always answered "dev1" could not tell a carried-forward
+            # id from a hard-coded one.
+            asked = path.split("deviceId=", 1)[1] if "deviceId=" in path else ""
+            return 200, {"deviceId": asked or "dev1", "deviceName": "Studio PC",
                          "owned": self.owned, "published": self.published,
                          "runs": self.runs, "truncated": self.truncated}
         if path.startswith("/logs/bundle"):
@@ -115,6 +119,14 @@ def test_the_plan_says_how_long_they_are_kept(wire, capsys) -> None:
 def test_the_plan_says_the_machines_own_logs_are_not_included(wire, capsys) -> None:
     _, out = _run(_args(), capsys)
     assert "not included" in out
+
+
+def test_the_send_goes_to_the_computer_the_plan_was_printed_for(wire, capsys) -> None:
+    """Showing and sending are two calls; without this the bridge re-picks the
+    selected machine and the user agreed to a different computer's list."""
+    rc, _ = _run(_args(confirm=True), capsys)
+    assert rc == 0
+    assert wire.posts[0]["body"]["deviceId"] == "dev1"
 
 
 def test_confirm_sends_and_carries_the_consent(wire, capsys) -> None:
@@ -398,6 +410,26 @@ def test_the_skill_document_explains_the_two_step() -> None:
     assert "Sending logs to support" in SKILL_MD
     assert "sends nothing" in SKILL_MD
     assert "--confirm" in SKILL_MD
+
+
+def test_the_intent_table_points_at_the_bare_command_not_the_confirmed_one() -> None:
+    """⛔⛔ THE TABLE IS WHAT A MODEL ACTUALLY READS. It is the lookup — "the user
+    said this, run that" — and a row naming `--confirm` sends the assistant
+    straight past the plan, whatever the section further down says.
+
+    Checked as its own thing because the obvious assertions cannot see it: the
+    words "sends nothing" and "--confirm" both still appear in the SECTION when
+    the ROW has been rewritten, so a test looking for them anywhere in the file
+    passes against precisely this change. Mutation caught that."""
+    row = next((ln for ln in SKILL_MD.splitlines()
+                if ln.startswith("|") and "send my logs" in ln), "")
+    assert row, "the intent table no longer routes a send-logs request at all"
+    assert "`sr.py send-logs`" in row, (
+        "the table must send the assistant to the command that SHOWS first")
+    assert "SHOWS what would go and sends nothing" in row
+    before, after = row.split("`sr.py send-logs`", 1)
+    assert "--confirm" not in before, (
+        "the table reaches --confirm before the plan is ever printed")
 
 
 def test_the_skill_document_forbids_confirming_on_the_users_behalf() -> None:

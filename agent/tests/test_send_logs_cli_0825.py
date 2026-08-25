@@ -65,7 +65,12 @@ class Wire:
     def get(self, path, timeout=10.0):
         self.gets.append(path)
         if path.startswith("/logs/runs"):
-            return 200, {"deviceId": "dev1", "deviceName": "Studio PC",
+            # Echoes the device the caller ASKED for, defaulting to the
+            # selected one — which is what the bridge does. A fake that
+            # answered "dev1" whatever it was handed could not tell a
+            # carried-forward id from a hard-coded one.
+            asked = path.split("deviceId=", 1)[1] if "deviceId=" in path else ""
+            return 200, {"deviceId": asked or "dev1", "deviceName": "Studio PC",
                          "owned": self.owned, "published": self.published,
                          "runs": self.runs, "truncated": self.truncated,
                          "updatedAt": ""}
@@ -208,6 +213,18 @@ def test_a_named_device_is_carried_to_both_calls(wire) -> None:
     _run(_args(device="dev2"))
     assert any("deviceId=dev2" in g for g in wire.gets)
     assert wire.posts[0]["body"]["deviceId"] == "dev2"
+
+
+def test_the_send_goes_to_the_computer_the_plan_was_printed_for(wire) -> None:
+    """⛔⛔ Showing and sending are two round trips. With no deviceId on the
+    second, the bridge picks the SELECTED machine again — so a selection that
+    changed in between (in the app, or because the old one stopped being
+    reachable) prints one computer's runs and sends from another. The person
+    consented to what they were shown."""
+    rc, _ = _run(_args())
+    assert rc == 0
+    assert wire.posts[0]["body"]["deviceId"] == "dev1", (
+        "the send did not name the machine whose runs were listed")
 
 
 # ── the sharer boundary, said before a round trip ───────────────────────────

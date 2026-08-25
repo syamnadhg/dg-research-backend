@@ -286,12 +286,21 @@ def test_a_name_that_is_not_a_run_name_refuses_rather_than_dropping(live) -> Non
         assert FakeFS.commands == [], f"{bad!r} was refused and sent anyway"
 
 
-def test_runnames_must_be_a_list_not_a_string(live) -> None:
-    """A string is iterable, so a missing check turns "run-a" into eight
-    single-character names — none of which match anything on the far side."""
+@pytest.mark.parametrize("text", ["run-a", "abc"])
+def test_runnames_must_be_a_list_not_a_string(live, text) -> None:
+    """A string is iterable, so a missing check turns it into one name PER
+    CHARACTER — none of which match anything on the far side.
+
+    ⛔⛔ BOTH CASES, AND THE SECOND IS THE ONE THAT MATTERS. `"run-a"` refuses
+    even without the list check, because its `-` fails the per-name shape and
+    the loop rejects it — so a test using only that string passes against a
+    broken check and proves nothing. Mutation caught exactly that here. An
+    all-alphanumeric string has no such accident: every character is a valid
+    name on its own, so it reaches the wire as three names the person never
+    chose."""
     base, _ = live
-    r = _send(base, runNames="run-a")
-    assert r.status_code == 400
+    r = _send(base, runNames=text)
+    assert r.status_code == 400, f"{text!r} was accepted where a list belongs"
     assert FakeFS.commands == []
 
 
@@ -488,10 +497,18 @@ def test_the_command_lands_in_the_device_scoped_collection() -> None:
     subscribe to it. A command written there leaves the person watching a
     spinner that can never resolve — there is no error, because nothing was
     wrong with the write."""
+    from facade import config
+
     client, sent = _capture()
     client.write_device_command("dev1", "send-logs-selected", uid=UID,
                                 extra={"code": "ABCD2345"})
-    assert sent[0]["url"].endswith("/devices/dev1/commands")
+    # ⛔⛔ ANCHORED AT THE BASE, NOT AT THE TAIL. The legacy path ALSO ends
+    # `/devices/dev1/commands` — it just has `/users/{uid}` in front of it — so
+    # an `endswith` here matches both and cannot see the difference between the
+    # collection the machine listens to and the one it does not. Mutation caught
+    # this test passing against exactly that swap.
+    assert sent[0]["url"] == f"{config.FIRESTORE_BASE}/devices/dev1/commands"
+    assert "/users/" not in sent[0]["url"]
     assert sent[0]["method"] == "POST"
 
 
