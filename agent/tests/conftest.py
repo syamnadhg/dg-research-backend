@@ -13,6 +13,36 @@ from facade import config
 
 
 @pytest.fixture(autouse=True)
+def _no_real_fe_posts(monkeypatch):
+    """⛔⛔ NO TEST IN THIS SUITE MAY POST TO THE REAL WEB APP.
+
+    Added 2026-08-26, when `_enqueue_research_run` gained a courtesy notice to
+    the machine's owner. `config.FE_BASE` defaults to `https://superresearch.io`,
+    so from that commit on every existing run-start test — none of which had any
+    reason to know about a notification — would have fired a live POST at
+    production carrying a fake Bearer token. The notice is best-effort and
+    swallows its own failures, so nothing would have gone red: the suite would
+    simply have started talking to the internet, silently.
+
+    So the seam is stubbed for the WHOLE suite by default rather than per test.
+    A test that cares scripts its own reply by monkeypatching the same attribute
+    (several already do) — monkeypatch applies in order, so a test's own
+    `setattr` wins over this one. `bridge._fe_calls` is where the default lands
+    them, for the tests that want to assert on a call they did not script.
+    """
+    from facade import bridge
+
+    calls: list[tuple[str, dict]] = []
+
+    def _stub(_sess, path: str, payload: dict) -> tuple[int, dict]:
+        calls.append((path, payload))
+        return 200, {"ok": True}
+
+    monkeypatch.setattr(bridge, "_fe_api_post", _stub)
+    monkeypatch.setattr(bridge, "_fe_calls", calls, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_prefs_dir(monkeypatch, tmp_path):
     """Point ``config.store_dir()`` at a per-test tmp so prefs.json — including
     the #790 agent install id (minted lazily by get_or_create_install_id) — never

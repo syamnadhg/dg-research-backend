@@ -98,6 +98,13 @@ def live(monkeypatch):
     monkeypatch.setattr(bridge.prefs, "set_selected_device", lambda d, uid: sel.__setitem__("v", d))
     monkeypatch.setattr(bridge.prefs, "clear_selected_device", lambda: sel.__setitem__("v", None))
 
+    # ⭐ The owner-notify POST rides a daemon thread so it cannot add its
+    # 20-second timeout to the latency of starting a run. Run it inline here so
+    # a test can assert on it without a sleep — `_spawn` exists as a seam for
+    # exactly this, and the only other spawner (the remote-login flow) is not
+    # reachable from the routes this file drives.
+    monkeypatch.setattr(bridge, "_spawn", lambda target, *args: target(*args))
+
     state = bridge.BridgeState()
     state.set_session(SimpleNamespace(uid="u1", email="e@x.y", id_token=lambda force=False: "tok"))
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), bridge._make_handler(state))
@@ -1029,3 +1036,129 @@ def test_skip_no_command_for_non_ongoing_run(live):
     r = requests.post(base + "/research/r1/skip", json={"agents": ["claude"]})
     assert r.status_code == 200 and r.json()["commandSent"] is False
     assert FakeFS.last_commands == []
+
+
+# ── stretch 3B: the machine's OWNER is told when a sharer starts a run ───────
+#
+# ⛔⛔ THE GAP, measured. The notice already existed, was correct, and had exactly
+# one caller: the sharer's BROWSER, at submit time (`usePipeline.ts`). So a sharer
+# starting a run from chat, from a terminal, or from a fleet box notified nobody —
+# and a fleet box is where a co-tenant is most likely to be a sharer. The backend
+# did not send it either; there is no second dispatcher to fall back on, unlike
+# phase notices. Owner, 2026-08-25: "I'm not getting notified in spite of being
+# the owner."
+#
+# ⭐⭐ THE AGENT CAN SEND IT BECAUSE OF WHOSE TOKEN IT HOLDS. This process is signed
+# in as the actual human, so the route sees a genuine caller, re-reads the device
+# document itself, and names them without trusting anything a machine supplied.
+#
+# ⛔⛔ AND THERE IS DELIBERATELY NO OWNERSHIP CHECK HERE. The plan said "the agent
+# already knows: `owned` comes back on the device row it just read." Measured
+# false — `_enqueue_research_run` takes `device_id: str` and nothing else,
+# `_resolve_device` returns an explicit id before reading anything, and `owned` is
+# not a Firestore field at all (`_decorate_devices` grafts it on, and no run-start
+# path calls that). The route is the authority on who owns what, by design.
+
+
+def _notice(payload_list):
+    """The one /api/notify payload, or None."""
+    hits = [p for (path, p) in payload_list if path == "/api/notify"]
+    return hits[0] if len(hits) == 1 else (None if not hits else hits)
+
+
+def test_research_tells_the_device_owner(live):
+    base, _ = live
+    FakeFS.devices = [{"id": "a", "ownerUid": "owner-2", "sharedWith": ["u1"]}]
+    r = requests.post(base + "/research", json={"topic": "Neutrinos"})
+    assert r.status_code == 200
+    sent = _notice(bridge._fe_calls)
+    # The route composes every word; this side sends ids and the subject only.
+    assert sent == {"onBehalf": {
+        "kind": "sharerRunStarted",
+        "deviceId": "a",
+        "researchId": FakeFS.last_enqueue["research_id"],
+        "topic": "Neutrinos",
+    }}
+
+
+def test_the_kind_is_the_literal_the_route_demands(live):
+    # `notify-delegate.ts` refuses anything but this exact string with a 400, and
+    # the constant lives in the web app — so it is a wire literal on this side and
+    # a typo is a notice that never lands.
+    base, _ = live
+    FakeFS.devices = [{"id": "a", "ownerUid": "owner-2", "sharedWith": ["u1"]}]
+    requests.post(base + "/research", json={"topic": "T"})
+    assert _notice(bridge._fe_calls)["onBehalf"]["kind"] == "sharerRunStarted"
+
+
+def test_the_topic_travels_so_both_clients_say_the_same_thing(live):
+    # ⭐ The browser sends the topic, and the route uses it to pick between two
+    # bodies. Omitting it here would make one event read differently depending on
+    # which client started the run.
+    base, _ = live
+    FakeFS.devices = [{"id": "a", "ownerUid": "owner-2", "sharedWith": ["u1"]}]
+    requests.post(base + "/research", json={"topic": "Cold fusion"})
+    assert _notice(bridge._fe_calls)["onBehalf"]["topic"] == "Cold fusion"
+
+
+def test_it_names_the_run_that_was_actually_enqueued(live):
+    # The dedup key is (device, run), so a notice naming a different run is a
+    # notice about nothing. Sent after the enqueue for exactly this reason.
+    base, _ = live
+    FakeFS.devices = [{"id": "a", "ownerUid": "owner-2", "sharedWith": ["u1"]}]
+    r = requests.post(base + "/research", json={"topic": "T"})
+    assert _notice(bridge._fe_calls)["onBehalf"]["researchId"] == r.json()["runId"]
+
+
+def test_a_failed_enqueue_notifies_nobody(live):
+    # ⛔ THE ORDERING IS THE POINT. It can only ever describe a run that is real,
+    # so it sits after the queue write — a notice for a run that never started
+    # would send the owner to a chat that does not exist.
+    base, _ = live
+    FakeFS.devices = [{"id": "a", "ownerUid": "owner-2", "sharedWith": ["u1"]}]
+    FakeFS.enqueue_raises = True
+    requests.post(base + "/research", json={"topic": "T"})
+    assert _notice(bridge._fe_calls) is None
+
+
+def test_the_notice_can_never_fail_the_run(live, monkeypatch):
+    # ⚠ Best-effort, exactly like the browser's copy. An agent that dies between
+    # the enqueue and the call tells nobody, with nothing behind it — but a
+    # courtesy notice must never turn a started run into an error.
+    base, _ = live
+    FakeFS.devices = [{"id": "a", "ownerUid": "owner-2", "sharedWith": ["u1"]}]
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("FE unreachable")
+
+    monkeypatch.setattr(bridge, "_fe_api_post", _boom)
+    r = requests.post(base + "/research", json={"topic": "T"})
+    assert r.status_code == 200 and FakeFS.last_enqueue is not None
+    # ⛔⛔ AND THE GUARD IS THE NOTICE'S OWN, not the daemon thread's. This test
+    # runs `_spawn` inline (see the fixture), which is how it caught the first
+    # version: the only thing keeping a raising notice from failing a started run
+    # was that production happens to dispatch it on a thread.
+
+
+def test_a_refusal_is_logged_and_swallowed(live, monkeypatch):
+    # The route answers 200 {"ok": true, "skipped": "self"} when the caller owns
+    # the machine — the COMMON case for this caller, since the owner is the
+    # likeliest agent user. It is the healthy path, not a failure.
+    base, _ = live
+    FakeFS.devices = [{"id": "a", "ownerUid": "u1"}]
+    monkeypatch.setattr(bridge, "_fe_api_post",
+                        lambda *_a, **_k: (200, {"ok": True, "skipped": "self"}))
+    r = requests.post(base + "/research", json={"topic": "T"})
+    assert r.status_code == 200
+
+
+def test_the_owner_check_is_the_route_s_job_not_the_agent_s(live):
+    # ⛔⛔ PINNED AS A DECISION. The agent fires for its own machine too and lets
+    # the route answer `self`. Duplicating an authority rule in the least
+    # trustworthy process, to save one request, trades a real check for a cached
+    # guess — and the row this side holds does not even carry `ownerUid`.
+    base, _ = live
+    FakeFS.devices = [{"id": "a", "ownerUid": "u1"}]      # the caller OWNS it
+    r = requests.post(base + "/research", json={"topic": "T"})
+    assert r.status_code == 200
+    assert _notice(bridge._fe_calls) is not None

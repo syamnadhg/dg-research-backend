@@ -381,6 +381,88 @@ def _resolve_run_config(fs: FirestoreRest, sess: AccountSession,
     return {**_config_from_settings(pipe), **(chat_cfg or {})}
 
 
+def _notify_device_owner_of_run(sess: "AccountSession", device_id: str,
+                                research_id: str, topic: str) -> None:
+    """Tell the machine's OWNER that a sharer just started a run on it.
+
+    ⛔⛔ THE GAP THIS CLOSES. The notice exists and is correct — the web app
+    composes every word of it and re-checks membership itself — and until now its
+    only caller was the sharer's BROWSER, at submit time. So a sharer starting a
+    run from chat, from a terminal, or from a fleet box notified nobody, and a
+    fleet box is exactly where a co-tenant is most likely to be a sharer. The
+    backend does not send it either: there is no second dispatcher to fall back
+    on, unlike phase notices.
+
+    ⭐⭐ AND THE REASON THE AGENT CAN SEND IT IS THE PERSON'S IDENTITY. This
+    process is signed in as the ACTUAL HUMAN, so the route sees a genuine caller,
+    re-reads ``devices/{id}`` for itself, and can name them without trusting
+    anything a machine supplied. The machine-side alternative covers strictly
+    more paths and was rejected for that reason: a machine has no name or email
+    of its own, so the notice would read "Someone started a research" unless the
+    route began trusting an identity a machine handed it, on the one path that
+    writes into somebody ELSE's inbox.
+
+    ⛔⛔ NO OWNERSHIP CHECK HERE, AND THE PLAN ASKED FOR ONE. It said "the agent
+    already knows: ``owned`` comes back on the device row it just read. Skip the
+    call when the person owns the machine." That premise is measured FALSE.
+    ``_enqueue_research_run`` receives ``device_id: str`` and nothing else;
+    ``_resolve_device`` returns the explicit id before reading anything and
+    discards every row on the branch that does list them, and ``owned`` is not a
+    Firestore field at all — ``_decorate_devices`` grafts it on, and no run-start
+    path calls it. Buying it here costs a Firestore read per run start.
+
+    ⭐ It is also the wrong place. The route re-reads the device document and
+    answers ``self`` for an owner precisely because a machine's claim about who
+    owns it cannot be trusted; duplicating that rule in the least trustworthy
+    process, to save one request, trades a real authority for a cached guess.
+    The concern the plan actually had — that an owner's own runs burn the owner's
+    own 20/hour ``sharer-run-notify`` budget — is a fault in the ROUTE's
+    ordering, where the increment is charged before the self-check, and it is
+    fixed there. That fix covers every present and future caller.
+
+    ⚠ Best-effort, exactly like the browser's copy: an agent that dies between
+    the enqueue and this call tells nobody, with nothing behind it.
+    """
+    try:
+        _notify_device_owner_of_run_inner(sess, device_id, research_id, topic)
+    except Exception as e:  # noqa: BLE001 — a courtesy notice, never a failure
+        # ⛔⛔ ITS OWN GUARD, NOT THE THREAD'S. Caught by a test on 2026-08-26: the
+        # only thing standing between a raising notice and a failed run was
+        # `_spawn` putting it on a daemon thread — and `_spawn` exists precisely
+        # as a seam for tests to run the work inline, so the guarantee held
+        # everywhere except where it was measured. A safety property that depends
+        # on its dispatcher is not a property.
+        log.info("owner-notify %s: not sent (%s)", research_id, type(e).__name__)
+
+
+def _notify_device_owner_of_run_inner(sess: "AccountSession", device_id: str,
+                                      research_id: str, topic: str) -> None:
+    """The POST itself. Split out so the guard above owns every exit."""
+    status, body = _fe_api_post(sess, "/api/notify", {
+        "onBehalf": {
+            "kind": "sharerRunStarted",
+            "deviceId": device_id,
+            "researchId": research_id,
+            # ⭐ SENT, because the browser sends it and the same event must not
+            # read differently depending on which client started the run. The
+            # route sanitises it and caps it at 80 characters; omitting it
+            # selects a body with no subject in it.
+            "topic": topic,
+        },
+    })
+    # ⛔ `skipped` IS THE NORMAL ANSWER FOR AN OWNER and it arrives as a 200:
+    # the route answers `{ok: true, skipped: "self"}` when the caller owns the
+    # machine, which is the common case for this caller. Logging that as a
+    # failure would fill the log with the healthy path.
+    if status == 200:
+        why = body.get("skipped")
+        log.info("owner-notify %s: %s", research_id,
+                 f"skipped ({why})" if why else "delivered")
+    else:
+        log.info("owner-notify %s: HTTP %s (%s)", research_id, status,
+                 str(body.get("error") or "")[:120])
+
+
 def _enqueue_research_run(fs: FirestoreRest, sess: AccountSession, *, topic: str,
                           device_id: str, cfg: dict[str, Any],
                           origin: dict[str, str] | None) -> tuple[str, str]:
@@ -423,6 +505,16 @@ def _enqueue_research_run(fs: FirestoreRest, sess: AccountSession, *, topic: str
     except Exception as e:
         log.debug("chat-message seed for %s failed (non-fatal): %s", rid, type(e).__name__)
     log.info("enqueued run %s on device %s", rid, device_id)
+    # ⭐⭐ TELL THE MACHINE'S OWNER, if this person is not the machine's owner —
+    # the route decides which, because this side cannot be trusted to. Owner,
+    # 2026-08-25: "I'm not getting notified in spite of being the owner." The
+    # notice was fine; its only caller was a browser.
+    #
+    # ⛔ ON A THREAD, AND AFTER THE QUEUE WRITE HAS LANDED. The POST carries a
+    # 20-second timeout, and a courtesy notice may not add that to the latency
+    # of starting a run — nor may it turn a started run into an error. Placed
+    # after the enqueue so it can only ever describe a run that is real.
+    _spawn(_notify_device_owner_of_run, sess, device_id, rid, topic)
     return rid, qid
 
 
