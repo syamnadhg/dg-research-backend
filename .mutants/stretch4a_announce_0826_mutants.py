@@ -162,11 +162,13 @@ MUTANTS = [
      "own the event silently eats it",
      [("        with self._lock:\n            ev = self._signed_in\n        if isinstance(ev, dict):\n            return ev if ev.get(\"uid\") in (None, uid) else None",
        "        with self._lock:\n            ev = self._signed_in\n            self._signed_in = None\n        if isinstance(ev, dict):\n            return ev if ev.get(\"uid\") in (None, uid) else None")]),
-    ("D12", BRIDGE, "under",
-     "the delivered announce is never cleared, so every later tick re-announces "
-     "the same sign-in — at-least-once with nothing to bound it on this side",
-     [("                        # Delivered — now drop it, from memory and from disk.\n                        state.clear_signed_in()",
-       "                        pass")]),
+    ("D12", BRIDGE, "over",
+     "⛔⛔ the take stops being atomic: the DISK half moves outside the lock, so "
+     "concurrent polls each fall through to the parked copy and all return it — "
+     "measured at 4 of 8 announcing the same sign-in. ⭐ RE-POINTED: the clear this "
+     "mutant used to delete now lives inside `take_signed_in`",
+     [('            if ev is None:\n                return None\n            try:\n                prefs.clear_pending_announce()',
+       '            if ev is None:\n                return None\n            self._lock.release(); self._lock.acquire()\n            try:\n                prefs.clear_pending_announce()')]),
 
     # ═══════════ P — one device decision, shared by two consumers ═══════════
     ("P1", BRIDGE, "under",
@@ -217,7 +219,7 @@ MUTANTS = [
      "guard that CANNOT FIRE: \"you have three computers\" and \"Firestore "
      "threw\" become the same value, and the comment says \"let the chat "
      "choose\" while naming nothing to choose between",
-     [('            return {"needsDeviceChoice": True, "topic": topic, "devices": choices}',
+     [('            return {"needsDeviceChoice": True, "topic": topic, "devices": choices,\n                    "staleSelection": why == "stale_selection"}',
        '            return {}')]),
     ("F2", BRIDGE, "over",
      "⛔ the ERROR path claims the fourth outcome too, so a Firestore failure "
