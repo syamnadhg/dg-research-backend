@@ -138,9 +138,11 @@ MUTANTS = [
     ("B10", FORK_SR, "over",
      "a duration reaches the fork's refusal table in abbreviated form — the "
      "concrete regression B9 makes invisible",
-     [('"That computer put something together very recently. Its limit counts "\n'
-       '        "everyone who uses it, so it may not have been them. Ask again shortly."',
-       '"That computer put something together very recently. Ask again in 10 min."')]),
+     [('    "CooldownActive": "That computer put something together very recently. Its "\n'
+       '                      "limit counts everyone who uses it, so it may not have "\n'
+       '                      "been them. Ask again shortly.",',
+       '    "CooldownActive": "That computer put something together very recently. "\n'
+       '                      "Ask again in 10 min.",')]),
 ]
 
 
