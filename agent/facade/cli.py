@@ -1068,6 +1068,12 @@ def _logout_session() -> bool:
             pass  # network/auth blip — the app hides it via lastSeenAt staleness
         sess.logout()
     prefs.clear_selected_device()  # also drop the target-device pref (bridge-down path)
+    # ⛔ AND THE PARKED ANNOUNCE, for the same reason and on the same path. With the
+    # bridge UP its /logout handler clears it; with the bridge DOWN this is the only
+    # code that runs, and it used to leave `pendingAnnounce` in prefs.json carrying
+    # the account email and the research topic — immediately after telling the person
+    # their session was cleared. Found by cross-verification.
+    prefs.clear_pending_announce()
     return existed
 
 

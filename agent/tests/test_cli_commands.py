@@ -969,6 +969,23 @@ def test_bridge_authed_true(monkeypatch):
     assert cli._bridge_authed() is True
 
 
+def test_a_bridge_down_logout_clears_the_parked_announce(monkeypatch, tmp_path):
+    """⛔ WITH THE BRIDGE UP its /logout handler clears the announce; with the bridge
+    DOWN this CLI path is the only code that runs, and it used to leave
+    `pendingAnnounce` in prefs.json — the account email and the research topic —
+    immediately after telling the person their session was cleared. Found by
+    cross-verification."""
+    from facade import cli as _cli, config as _cfg, prefs as _prefs
+    monkeypatch.setattr(_cfg, "store_dir", lambda: tmp_path)
+    _prefs.set_pending_announce({"ts": 1, "uid": "u1", "email": "e@x.y",
+                                 "topic": "the EV battery market"}, "u1")
+    monkeypatch.setattr(_cli.AccountSession, "load", staticmethod(lambda: None))
+    monkeypatch.setattr(_cli, "_bridge_post", lambda *a, **k: None)  # bridge down
+    _cli._logout_session()
+    assert _prefs.get_pending_announce("u1") is None
+    assert "pendingAnnounce" not in _prefs.load()
+
+
 def test_bridge_authed_false_when_not_signed_in(monkeypatch):
     monkeypatch.setattr(cli, "_bridge_get", lambda p, **k: (200, {"authed": False}))
     assert cli._bridge_authed() is False

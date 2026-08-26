@@ -478,7 +478,16 @@ def _signed_in_line(signed_in: dict) -> str:
             dot = " · online" if online is True else (" · offline" if online is False else "")
             rows.append(f"  • {_dev_name(d)}{dot}")
         listed = "\n".join(rows)
+        # ⛔ SAY WHY IT IS ASKING. The run path has distinguished these two since
+        # 0.1.27 — "the computer you last used isn't reachable anymore" versus a
+        # plain "pick one" — and the sign-in path could not, so the same person got
+        # a different explanation depending which door they came through.
+        why = ("The computer you last used isn’t reachable anymore, so "
+               if signed_in.get("staleSelection") else "")
         head = (f"✓ Signed in as {who}.\n\n"
+                f"{why}you have {len(devs)} research computers — which should run "
+                f"{quoted}?" if why else
+                f"✓ Signed in as {who}.\n\n"
                 f"You have {len(devs)} research computers — which should run "
                 f"{quoted}?")
         return f"{head}\n{listed}\nJust say: use “{_dev_name(devs[0])}”."

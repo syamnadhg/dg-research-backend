@@ -327,8 +327,9 @@ def test_autostart_hands_back_descriptors_when_it_cannot_choose(monkeypatch):
     the whole point of the fourth outcome."""
     monkeypatch.setattr(prefs, "get_selected_device", lambda uid: None)
     FakeFS.devices = [_dev("a", online=True, name="Desk"), _dev("b", online=True, name="Loft")]
-    did, label, choices = bridge._autostart_pick_device(FakeFS("t"), _sess())
+    did, label, choices, why = bridge._autostart_pick_device(FakeFS("t"), _sess())
     assert did is None and label is None
+    assert why == "no_selection", "the reason must reach the caller"
     assert sorted(c["name"] for c in choices) == ["Desk", "Loft"]
     assert all(set(c) == {"id", "name", "online"} for c in choices), "no internals leak"
 
@@ -378,13 +379,37 @@ def test_the_choice_outcome_does_not_also_offer_reply_yes(monkeypatch):
     start" cannot both be the next thing the person does."""
     monkeypatch.setattr(bridge, "_run_autostart",
                         lambda sess, topic, origin: {"needsDeviceChoice": True,
-                                                     "topic": topic, "devices": []})
+                                                     "topic": topic, "devices": [],
+                                                     "staleSelection": False})
+    # ⛔ THE SAME SESSION OBJECT, deliberately. The worker publishes only when the
+    # session it was spawned for is STILL the live one — an identity test, not an
+    # existence test — so handing it a second `_sess()` would (correctly) publish
+    # nothing. That is the point of the check, and this test used to depend on its
+    # absence.
     state = bridge.BridgeState()
-    state.set_session(_sess())
-    bridge._autostart_worker(state, _sess(), "EVs", None,
+    sess = _sess()
+    state.set_session(sess)
+    bridge._autostart_worker(state, sess, "EVs", None,
                              {"ts": 1, "uid": "u1", "email": "e@x.y"})
     assert state.signed_in["pendingTopic"] == ""
     assert state.signed_in["needsDeviceChoice"] is True
+
+
+def test_the_worker_publishes_nothing_once_a_DIFFERENT_account_is_live():
+    """⛔⛔ IT USED TO TEST FOR *A* SESSION, NOT *THE* SESSION. The worker spends
+    ~1-2s in Firestore; a sign-out and a different account signing in inside that
+    window left the NEW person's announce silently replaced by the old one's — and
+    nothing scoped to the new account would ever deliver it. `is_current` is the
+    identity test this same file already uses for exactly this concern; the guard
+    beside it was an existence test with a comment claiming otherwise."""
+    state = bridge.BridgeState()
+    old_sess = _sess(uid="uA", email="a@x.y")
+    state.set_session(old_sess)
+    state.set_signed_in({"ts": 9, "uid": "uB", "email": "b@x.y"})
+    state.set_session(_sess(uid="uB", email="b@x.y"))  # B signs in meanwhile
+    bridge._autostart_worker(state, old_sess, "A's topic", None,
+                             {"ts": 1, "uid": "uA", "email": "a@x.y"})
+    assert state.signed_in["uid"] == "uB", "A's stale announce replaced B's"
 
 
 def test_updates_carries_the_choice_and_the_devices(monkeypatch):
@@ -399,6 +424,114 @@ def test_updates_carries_the_choice_and_the_devices(monkeypatch):
         # delivered → cleared, from disk too
         assert "signedIn" not in requests.get(base + "/updates?via=agent").json()
         assert bridge.BridgeState().peek_signed_in("u1") is None
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_the_announce_is_taken_exactly_once_under_concurrent_polls(monkeypatch):
+    """⛔⛔ THE THIRD SHAPE OF THIS, and the first that is both exactly-once and
+    lossless. Shape 1 was take-and-clear: any failure after the read destroyed the
+    announce. Shape 2 was peek → send → clear, which fixed the loss and introduced a
+    RACE — this is a threading server, so a second poll could read the event between
+    the send and the clear. That flaked 2 runs in 3 and is what sent this to shape 3:
+    take atomically here, restore in the caller if the send fails."""
+    base, state, httpd = _live(monkeypatch)
+    try:
+        import concurrent.futures as _cf
+        state.set_signed_in({"ts": 8, "uid": "u1", "email": "e@x.y", "origin": None})
+        with _cf.ThreadPoolExecutor(max_workers=8) as pool:
+            bodies = [f.result().json() for f in
+                      [pool.submit(requests.get, base + "/updates?via=agent")
+                       for _ in range(8)]]
+        got = [b for b in bodies if "signedIn" in b]
+        assert len(got) == 1, f"{len(got)} of 8 concurrent polls got the announce"
+        assert got[0]["signedIn"]["ts"] == 8
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_a_failed_send_puts_the_announce_BACK(monkeypatch):
+    """⛔⛔ THE LOSS THIS WHOLE STRETCH IS ABOUT. Taking the event is only safe if a
+    send that never lands returns it — otherwise a dropped connection or the
+    poller's 30-second timeout destroys the announce exactly as the original
+    take-and-clear did. Pinned by making the send explode."""
+    from types import SimpleNamespace as _NS
+
+    class FS:
+        def __init__(self, tok):
+            pass
+
+        def list_researches(self, uid, page_size=20):
+            return []
+
+    monkeypatch.setattr(bridge, "FirestoreRest", FS)
+    state = bridge.BridgeState()
+    state.set_session(_sess())
+    state.set_signed_in({"ts": 8, "uid": "u1", "email": "e@x.y", "origin": None})
+
+    handler_cls = bridge._make_handler(state)
+    sent = {"n": 0}
+
+    class _Boom(handler_cls):  # type: ignore[misc, valid-type]
+        def __init__(self):  # no socket; we drive _updates directly
+            self.path = "/updates?via=agent"
+
+        def _json(self, code, body):
+            sent["n"] += 1
+            raise ConnectionResetError("the watchdog went away mid-send")
+
+        def _account(self):
+            return _NS(uid="u1", email="e@x.y", id_token=lambda force=False: "t"), FS("t")
+
+    with pytest.raises(ConnectionResetError):
+        _Boom()._updates()
+    assert sent["n"] == 1
+    assert state.peek_signed_in("u1")["ts"] == 8, (
+        "a send that never landed destroyed the announce")
+
+
+def test_a_scope_that_does_not_own_the_event_clears_nothing(monkeypatch):
+    """The clear now happens outside the delivery branch, so it needs its own guard
+    — without one, a watchdog that was refused the announce would clear it anyway
+    and destroy it for the chat that owns it."""
+    base, state, httpd = _live(monkeypatch)
+    try:
+        state.set_signed_in({"ts": 4, "uid": "u1", "email": "e@x.y",
+                             "origin": {"platform": "telegram", "chat_id": "111"}})
+        r = requests.get(base + "/updates?via=agent&platform=telegram&chat=999").json()
+        assert "signedIn" not in r
+        assert state.peek_signed_in("u1")["ts"] == 4, "a mismatched scope cleared it"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_the_ask_says_WHY_when_the_saved_computer_is_gone(monkeypatch):
+    """⛔ The run path has told these two apart since 0.1.27 — "the computer you last
+    used isn't reachable anymore" versus "no device selected" — and the sign-in path
+    bound the reason and then read it only in a guard that could not fire. Same
+    account, same question, two different explanations depending on which door."""
+    base, state, httpd = _live(monkeypatch)
+    try:
+        state.set_signed_in({"ts": 6, "uid": "u1", "email": "e@x.y", "origin": None,
+                             "needsDeviceChoice": True, "staleSelection": True,
+                             "devices": [{"id": "a", "name": "Desk", "online": True}]})
+        got = requests.get(base + "/updates?via=agent").json()["signedIn"]
+        assert got["staleSelection"] is True
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_a_never_chosen_account_is_not_told_its_choice_went_stale(monkeypatch):
+    base, state, httpd = _live(monkeypatch)
+    try:
+        state.set_signed_in({"ts": 6, "uid": "u1", "email": "e@x.y", "origin": None,
+                             "needsDeviceChoice": True, "devices": []})
+        got = requests.get(base + "/updates?via=agent").json()["signedIn"]
+        assert got["staleSelection"] is False
     finally:
         httpd.shutdown()
         httpd.server_close()

@@ -601,11 +601,11 @@ def _pick_device_from(devs: list[dict[str, Any]],
 
 def _autostart_pick_device(fs: FirestoreRest,
                            sess: AccountSession) -> tuple[str | None, str | None,
-                                                          list[dict[str, Any]]]:
+                                                          list[dict[str, Any]], str]:
     """Pick the device for a sign-in auto-start WITHOUT a chat round-trip, on the
-    SAME rungs a fired research gets (`_pick_device_from`). Returns ``(device_id,
-    label, devices)``; ``(None, None, devices)`` when the account has several usable
-    computers and none is the obvious one — and then the descriptors come back so
+    SAME rungs a fired research gets (`_pick_device_from`). Returns ``(device_id, label,
+    devices, reason)``; ``(None, None, devices, reason)`` when the account has
+    several usable computers and none is the obvious one — and then the descriptors come back so
     the announce can NAME them instead of saying "reply yes". Raises
     ``_NoResearchNode`` when the account has NO device (→ the pair-a-node prompt)."""
     devs = fs.list_devices(sess.uid)
@@ -618,8 +618,13 @@ def _autostart_pick_device(fs: FirestoreRest,
     if reason == "no_devices":
         raise _NoResearchNode()
     if device_id:
-        return device_id, _device_label(by_id.get(device_id) or {}), []
-    return None, None, [_device_descriptor(d) for d in devs]
+        return device_id, _device_label(by_id.get(device_id) or {}), [], ""
+    # ⛔ THE REASON RIDES ALONG NOW. `reason` was bound and then read only by a guard
+    # that could not fire, so a person whose saved computer had been removed was
+    # asked "which should run this?" with no hint that their last choice was gone —
+    # while the run path has told them exactly that since 0.1.27. Same event, same
+    # account, two different explanations depending which door they came through.
+    return None, None, [_device_descriptor(d) for d in devs], reason
 
 
 def _autostart_enabled() -> bool:
@@ -664,11 +669,12 @@ def _run_autostart(sess: AccountSession, topic: str,
     try:
         fs = FirestoreRest(sess.id_token)
         try:
-            device_id, label, choices = _autostart_pick_device(fs, sess)
+            device_id, label, choices, why = _autostart_pick_device(fs, sess)
         except _NoResearchNode:
             return {"needsDevice": True, "topic": topic}
         if not device_id:
-            return {"needsDeviceChoice": True, "topic": topic, "devices": choices}
+            return {"needsDeviceChoice": True, "topic": topic, "devices": choices,
+                    "staleSelection": why == "stale_selection"}
         cfg = _resolve_run_config(fs, sess, None)
         rid, _qid = _enqueue_research_run(fs, sess, topic=topic, device_id=device_id,
                                           cfg=cfg, origin=_clean_origin(origin))
@@ -699,7 +705,12 @@ def _autostart_worker(state: BridgeState, sess: AccountSession, topic: str,
     ev["pendingTopic"] = "" if (result.get("autoStarted") or result.get("needsDevice")
                                 or result.get("needsDeviceChoice")) else topic
     ev.update(result)
-    if state.session is not None:  # don't resurrect an announce after a sign-out
+    # ⛔ THE SAME SESSION, NOT MERELY A SESSION. This was `state.session is not
+    # None`, an existence test — so a sign-out and a DIFFERENT account signing in
+    # during the ~1-2s this worker spends in Firestore left the new person's
+    # announce silently replaced by the old one's. `is_current` is the identity test
+    # the same file already uses for exactly this concern.
+    if state.is_current(sess):
         state.set_signed_in(ev)
 
 
@@ -1099,6 +1110,60 @@ class BridgeState:
         except Exception as e:  # noqa: BLE001 — an announce must never fail a sign-in
             log.warning("could not park the sign-in announce (%s) — memory only",
                         type(e).__name__)
+
+    def take_signed_in(self, uid: str) -> dict | None:
+        """Atomically remove and return the pending announce for ``uid``.
+
+        ⭐⭐ THE THIRD SHAPE OF THIS, AND THE FIRST CORRECT ONE. It went:
+          1. take-and-clear — exactly-once, and ANY failure after the read
+             destroyed the announce. That was the original defect.
+          2. peek, send, then clear — no loss on a failed send, but delivery
+             became racy: this is a THREADING server, so a second poll could read
+             the event between the send and the clear and announce it twice.
+             Cross-verification found the ordering was ALSO wrong way round in the
+             shipped code, and the flake found the race.
+          3. take atomically HERE, and restore it in the caller's `except` if the
+             send fails. Exactly-once under concurrency AND no loss on failure.
+
+        ⛔ AND IT NO LONGER LEANS ON A DE-DUP I HAD NOT MEASURED. Shape 2's safety
+        rested on both watchdogs de-duplicating on `ts` — which the BE one does,
+        end to end, and which the FORK's does only when its cursor writes: on an
+        unwritable home it prints the note and never records the stamp. That guard
+        also has no test at all (proved by mutation: gutting it leaves the whole
+        fleet suite green). Depending on it while knowing that would not have been
+        honest.
+        """
+        # ⛔⛔ THE WHOLE TAKE IS UNDER THE LOCK, INCLUDING THE DISK HALF — and the
+        # first version of this held it only across the in-memory read. Eight
+        # concurrent polls then had ONE clear memory and the other SEVEN fall
+        # through to the parked copy and all return it: measured, 4 of 8 announced.
+        # An "atomic" take with a read outside the lock is not atomic; it just has a
+        # narrower window. `prefs` takes its own lock and never calls back in here,
+        # so nesting is safe.
+        with self._lock:
+            ev = self._signed_in
+            if isinstance(ev, dict):
+                if ev.get("uid") not in (None, uid):
+                    return None
+                self._signed_in = None
+            else:
+                ev = None
+                try:
+                    parked = prefs.get_pending_announce(uid)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("could not read the parked sign-in announce (%s)",
+                                type(e).__name__)
+                    return None
+                if isinstance(parked, dict):
+                    ev = parked
+            if ev is None:
+                return None
+            try:
+                prefs.clear_pending_announce()
+            except Exception as e:  # noqa: BLE001
+                log.warning("could not clear the parked sign-in announce (%s)",
+                            type(e).__name__)
+            return ev
 
     def peek_signed_in(self, uid: str) -> dict | None:
         """The pending announce for ``uid`` WITHOUT consuming it — memory first,
@@ -3189,6 +3254,8 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                     "attention": attention,
                 })
             out: dict[str, Any] = {"runs": runs}
+            # The event this request took, if any — restored on a failed send.
+            taken: dict | None = None
             # One-shot "just signed in" announce for the chat watchdog. Only the
             # watchdog reads it (it always sets ?via=agent) — so an ordinary client
             # /updates call can't silently consume it. Take-and-clear is atomic; if
@@ -3196,10 +3263,10 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # that does. Delivered to the chat that started the sign-in (origin
             # match), or to any agent watchdog if it carried no origin.
             if via_agent:
-                # PEEK, not take: the announce is cleared only after the response
-                # body is built, so a failure in between costs a repeat (which both
-                # watchdogs de-dup on `ts`) instead of the announce itself.
-                ev = state.peek_signed_in(sess.uid)
+                # TAKE, atomically — and the caller puts it back if the send fails.
+                # See `take_signed_in` for why this is the third shape of this and
+                # the first that is both exactly-once and lossless.
+                ev = state.take_signed_in(sess.uid)
                 if isinstance(ev, dict):
                     ev_origin = ev.get("origin")
                     # An ORIGIN-LESS sign-in event (a connect-CLI / --pair login that
@@ -3236,11 +3303,36 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                             # made indistinguishable from this.
                             "needsDeviceChoice": bool(ev.get("needsDeviceChoice")),
                             "devices": ev.get("devices") or [],
+                            # WHY it is asking: the computer they last used is gone,
+                            # or they simply never picked one. The run path has told
+                            # those apart since 0.1.27; this one could not.
+                            "staleSelection": bool(ev.get("staleSelection")),
                         }
-                        # Delivered — now drop it, from memory and from disk.
-                        state.clear_signed_in()
-                    # else: not this chat's. Nothing to put back — peek never took it.
-            self._json(200, out)
+                        # ⛔⛔ CLEARED AFTER THE RESPONSE IS WRITTEN, NOT BEFORE.
+                        # This was the wrong way round on the first pass, and it
+                        # quietly voided the whole point of replacing take with
+                        # peek: `peek_signed_in`'s own docstring promises "peek,
+                        # write the response, then clear", and the code cleared and
+                        # THEN wrote. Anything that killed the tick in between — a
+                        # dropped connection, the poller's 30-second timeout — lost
+                        # the announce exactly as the take-and-clear it replaced
+                        # did. Found by cross-verification, and it is the same
+                        # commit-before-you-speak shape this stretch fixed in the
+                        # watchdog, reintroduced one layer up while fixing it there.
+                        taken = ev
+                    else:
+                        # Not this chat's — put it straight back for the watchdog
+                        # that owns it.
+                        state.set_signed_in(ev)
+            try:
+                self._json(200, out)
+            except Exception:
+                # ⛔ THE SEND FAILED, SO THE ANNOUNCE WAS NOT DELIVERED. Put it back
+                # rather than let a dropped connection destroy it — that loss is the
+                # whole defect this stretch set out to fix.
+                if taken is not None:
+                    state.set_signed_in(taken)
+                raise
 
         def _research_cancel(self, rid: str) -> None:
             """Cancel a run (the chat /sr-cancel): one action:"cancel" to the run's

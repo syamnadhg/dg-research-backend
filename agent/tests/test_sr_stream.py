@@ -427,6 +427,31 @@ def test_signed_in_line_names_the_computers_when_it_cannot_choose():
     assert "reply" not in line.lower()         # never the old yes/no offer
 
 
+def test_the_ask_says_the_last_computer_is_gone_when_it_is():
+    """⛔ The run path has said this since 0.1.27 and the sign-in path could not —
+    it bound the reason and read it only in a guard that could not fire. A person
+    asked "which computer?" with no explanation assumes they never chose one; the
+    truth is that the one they chose has been removed."""
+    line = poll._signed_in_line({
+        "email": "e@x.y", "needsDeviceChoice": True, "staleSelection": True,
+        "topic": "EVs", "pendingTopic": "",
+        "devices": [{"id": "a", "name": "Desk", "online": True}],
+    })
+    assert "isn’t reachable anymore" in line, line
+    assert "research computers — which should run" in line, line
+
+
+def test_the_ask_does_NOT_invent_a_stale_choice():
+    """The complement. Telling somebody their last computer is unreachable when they
+    never picked one sends them looking for a machine that was never chosen."""
+    line = poll._signed_in_line({
+        "email": "e@x.y", "needsDeviceChoice": True, "topic": "EVs",
+        "pendingTopic": "", "devices": [{"id": "a", "name": "Desk", "online": True}],
+    })
+    assert "isn’t reachable anymore" not in line, line
+    assert line.count("You have 1 research computers") == 1, line
+
+
 def test_the_two_device_asks_share_their_stem_and_their_answer_form():
     """sr.py asks "which computer?" when a FIRED research cannot be routed; the
     watchdog asks it after a SIGN-IN auto-start could not. The scripts share no
