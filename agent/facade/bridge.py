@@ -231,6 +231,20 @@ def _clean_origin(raw: Any) -> dict[str, str] | None:
     return out
 
 
+def _same_origin(a: Any, b: Any) -> bool:
+    """Whether two chat origins address the same conversation.
+
+    Compares on the SAME two fields delivery scopes on — platform (case-folded)
+    and chat_id — so "is this the chat that asked?" gets one answer everywhere.
+    thread_id is deliberately not compared: a reply in a thread is still the same
+    chat, and `/updates` scoping ignores it too."""
+    ca, cb = _clean_origin(a), _clean_origin(b)
+    if ca is None or cb is None:
+        return False
+    return (ca["platform"].lower() == cb["platform"].lower()
+            and ca["chat_id"] == cb["chat_id"])
+
+
 def _config_from_settings(pipe: dict[str, Any] | None) -> dict[str, Any]:
     """Map the account's saved pipeline Settings into the run-config the backend
     pipeline reads, so an agent-fired run honors the same defaults the web app
@@ -547,22 +561,67 @@ def _enqueue_research_run(fs: FirestoreRest, sess: AccountSession, *, topic: str
     return rid, qid
 
 
-def _autostart_pick_device(fs: FirestoreRest, sess: AccountSession) -> tuple[str | None, str | None]:
-    """Pick the device for a sign-in auto-start WITHOUT a chat round-trip: the
-    persisted selection if it's still a member, else the sole device. Returns
-    ``(device_id, label)``; ``(None, None)`` when the account has devices but the
-    pick is ambiguous (multiple, none selected) — leave that to the chat. Raises
+def _pick_device_from(devs: list[dict[str, Any]],
+                     selected: str | None) -> tuple[str | None, str, bool]:
+    """THE device-routing decision, as one pure function: ``(device_id, reason,
+    stale)``. ``reason`` is "" when it resolved, else ``no_devices`` /
+    ``stale_selection`` / ``no_selection``. ``stale`` says the caller should drop a
+    saved selection that is no longer a member.
+
+    ⭐⭐ WHY THIS EXISTS. There were TWO device pickers with DIFFERENT rungs, and
+    the sign-in one was the poorer of them. The run path (`_resolve_device`) went
+    selection → drop a STALE selection → sole device → **the sole ONLINE device**
+    → ask which. The sign-in auto-start went selection → sole device → give up. So
+    on the shape most accounts actually have — several computers, one powered on —
+    firing a research routed it seamlessly while signing in with that same research
+    pending announced "reply yes to start". The two rungs the sign-in path was
+    missing are the two that matter most, and they were sitting in the other picker.
+
+    ⛔ NO I/O AND NO SIDE EFFECTS, deliberately: the stale-selection CLEAR belongs
+    to the caller (one of them answers over HTTP, the other from a worker thread),
+    and a picker that writes prefs cannot be tested as a table.
+    """
+    ids = {d.get("id") for d in devs}
+    if selected and selected in ids:
+        return selected, "", False
+    stale = bool(selected)
+    if not devs:
+        return None, "no_devices", stale
+    if len(devs) == 1:
+        did = devs[0].get("id")
+        if did:
+            return did, "", stale
+        # A sole device with no id is not a target — fall through to the ask
+        # rather than enqueueing to an empty string (the run path does the same).
+    online = [d for d in devs if _device_is_online(d) and d.get("id")]
+    if len(online) == 1:
+        return online[0].get("id"), "", stale
+    return None, ("stale_selection" if stale else "no_selection"), stale
+
+
+def _autostart_pick_device(fs: FirestoreRest,
+                           sess: AccountSession) -> tuple[str | None, str | None,
+                                                          list[dict[str, Any]]]:
+    """Pick the device for a sign-in auto-start WITHOUT a chat round-trip, on the
+    SAME rungs a fired research gets (`_pick_device_from`). Returns ``(device_id,
+    label, devices)``; ``(None, None, devices)`` when the account has several usable
+    computers and none is the obvious one — and then the descriptors come back so
+    the announce can NAME them instead of saying "reply yes". Raises
     ``_NoResearchNode`` when the account has NO device (→ the pair-a-node prompt)."""
     devs = fs.list_devices(sess.uid)
     if not devs:
         raise _NoResearchNode()
     by_id = {d.get("id"): d for d in devs if d.get("id")}
-    selected = prefs.get_selected_device(sess.uid)
-    if selected and selected in by_id:
-        return selected, _device_label(by_id[selected])
-    if len(devs) == 1:
-        return devs[0].get("id"), _device_label(devs[0])
-    return None, None  # ambiguous — don't guess; the chat picks
+    device_id, reason, stale = _pick_device_from(devs, prefs.get_selected_device(sess.uid))
+    if stale:
+        # The saved selection is no longer a member — drop it here too, exactly as
+        # the run path does, or every later sign-in re-derives the same dead pick.
+        prefs.clear_selected_device()
+    if reason == "no_devices":
+        raise _NoResearchNode()
+    if device_id:
+        return device_id, _device_label(by_id.get(device_id) or {}), []
+    return None, None, [_device_descriptor(d) for d in devs]
 
 
 def _autostart_enabled() -> bool:
@@ -583,21 +642,35 @@ def _run_autostart(sess: AccountSession, topic: str,
     longer depends on the chat agent correctly interpreting a "yes" (the fragile
     handoff that kept misfiring live). Returns announce hints:
 
-      {autoStarted: True, runId, deviceName, topic}  — started; watchdog will stream
-      {needsDevice: True, topic}                     — no research node yet (pair prompt)
-      {}                                             — ambiguous device / any error
-                                                       → caller falls back to "reply yes"
+      {autoStarted: True, runId, deviceName, topic}     — started; watchdog will stream
+      {needsDevice: True, topic}                        — no research node yet (pair prompt)
+      {needsDeviceChoice: True, topic, devices: [...]}  — several usable computers,
+                                                          none obvious → NAME them and ask
+      {}                                                — an ERROR, and only an error
+                                                          → caller falls back to "reply yes"
+
+    ⛔⛔ THE FOURTH OUTCOME IS THE FIX, AND WHAT IT REPLACED WAS A GUARD THAT COULD
+    NOT FIRE. "ambiguous device" and "Firestore threw" both returned ``{}``, so
+    nothing downstream could tell them apart — a hint in the shape of a guard, with
+    the two cases collapsed into one. The comment said "let the chat choose" while
+    the empty dict told the chat nothing to choose BETWEEN.
+
+    ⛔ AND THE OLD CLAIM THAT THE FALLBACK "CANNOT BE HONOURED" IS REFUTED. Replying
+    "yes" DOES work: the run path answers `no_selection` with a `devices` array and
+    sr.py already renders "You have N research computers — which should run this?".
+    What this saves is an avoidable round-trip and the conflation above — not a dead
+    end. Said plainly here because the plan said otherwise.
 
     Pure I/O, takes the topic BY VALUE (never touches the remote flow), and NEVER
     raises — so it is safe to run in a worker thread off the remote_lock."""
     try:
         fs = FirestoreRest(sess.id_token)
         try:
-            device_id, label = _autostart_pick_device(fs, sess)
+            device_id, label, choices = _autostart_pick_device(fs, sess)
         except _NoResearchNode:
             return {"needsDevice": True, "topic": topic}
         if not device_id:
-            return {}  # ambiguous device pick — let the chat choose
+            return {"needsDeviceChoice": True, "topic": topic, "devices": choices}
         cfg = _resolve_run_config(fs, sess, None)
         rid, _qid = _enqueue_research_run(fs, sess, topic=topic, device_id=device_id,
                                           cfg=cfg, origin=_clean_origin(origin))
@@ -621,7 +694,12 @@ def _autostart_worker(state: BridgeState, sess: AccountSession, topic: str,
     ev = dict(base_ev)
     # The "reply yes" offer rides along ONLY in the fallback case; started / no-node
     # carry their own rendered message. The topic always rides along for the renderer.
-    ev["pendingTopic"] = "" if (result.get("autoStarted") or result.get("needsDevice")) else topic
+    # The "reply yes" offer rides along ONLY when we genuinely do not know what
+    # happened (the error fallback). started / no-node / pick-one each render their
+    # own message, and offering "reply yes" beside "which computer?" would ask two
+    # different questions in one breath.
+    ev["pendingTopic"] = "" if (result.get("autoStarted") or result.get("needsDevice")
+                                or result.get("needsDeviceChoice")) else topic
     ev.update(result)
     if state.session is not None:  # don't resurrect an announce after a sign-out
         state.set_signed_in(ev)
@@ -975,9 +1053,11 @@ class BridgeState:
         # without blocking /status or other reads.
         self._remote: RemoteFlow | None = None
         self.remote_lock = threading.Lock()
-        # One-shot "just signed in" event for the chat watchdog to announce
-        # proactively (set on remote-login capture, delivered + cleared by a
-        # single /updates read). Carries the email + any pending research topic.
+        # The "just signed in" announce for the chat watchdog to post proactively
+        # (set on remote-login capture, delivered by a /updates read). Carries the
+        # email + any pending research topic. Mirrored to prefs.json so a bridge
+        # restart between the sign-in and the watchdog's next tick cannot lose it;
+        # this attribute is the in-process cache of that file.
         self._signed_in: dict | None = None
 
     @property
@@ -989,6 +1069,9 @@ class BridgeState:
         with self._lock:
             self._session = sess
             # A sign-out invalidates any not-yet-delivered "signed in" announce.
+            # ⛔ KEPT FOR THE TESTS THAT USE IT, AND NOT THE PRODUCTION PATH:
+            # `set_session(None)` has no non-test callers. A real sign-out reaches
+            # `clear_session_if`, which does the disk-backed clear.
             if sess is None:
                 self._signed_in = None
 
@@ -998,21 +1081,75 @@ class BridgeState:
             return self._signed_in
 
     def set_signed_in(self, event: dict | None) -> None:
+        """Park the announce, in memory AND on disk.
+
+        ⛔ The disk write is the point. Before it, a bridge restart in the window
+        between the sign-in capture and the watchdog's next tick lost the announce
+        for good — while a research COMPLETION in the same window lost nothing,
+        because the watchdog re-derives those from the research store every tick.
+        That asymmetry was the whole defect."""
         with self._lock:
             self._signed_in = event
+        uid = (event or {}).get("uid") if isinstance(event, dict) else None
+        try:
+            if isinstance(event, dict) and isinstance(uid, str) and uid:
+                prefs.set_pending_announce(event, uid)
+            else:
+                prefs.clear_pending_announce()
+        except Exception as e:  # noqa: BLE001 — an announce must never fail a sign-in
+            log.warning("could not park the sign-in announce (%s) — memory only",
+                        type(e).__name__)
 
-    def take_signed_in(self) -> dict | None:
-        """Atomically read AND clear the one-shot event in one critical section, so
-        a /updates delivery consumes it exactly once even under concurrent reads
-        (the caller re-stashes it via set_signed_in if the scope didn't match)."""
+    def peek_signed_in(self, uid: str) -> dict | None:
+        """The pending announce for ``uid`` WITHOUT consuming it — memory first,
+        then the parked copy on disk (which is how it survives a restart).
+
+        ⭐ WHY PEEK REPLACED TAKE. ``take_signed_in`` was atomic read-and-clear:
+        exactly-once delivery, so ANY failure after the read — a dropped response, a
+        crash while rendering — destroyed the announce. Delivery is now
+        at-least-once: peek, write the response, then clear. That is safe because
+        BOTH consumers already de-duplicate on the event's ``ts``
+        (``__signed_in_ts__`` in our watchdog's state file and in the fork's), so a
+        repeat is swallowed rather than announced twice. Measured in both copies
+        before this changed — it is not an assumption about them.
+
+        ⛔ And it removed the re-stash write entirely: a scope that does not own the
+        event now simply leaves it alone, instead of taking it and putting it back."""
         with self._lock:
             ev = self._signed_in
-            self._signed_in = None
+        if isinstance(ev, dict):
+            return ev if ev.get("uid") in (None, uid) else None
+        try:
+            ev = prefs.get_pending_announce(uid)
+        except Exception as e:  # noqa: BLE001 — an unreadable file is not an error
+            log.warning("could not read the parked sign-in announce (%s)",
+                        type(e).__name__)
+            return None
+        if isinstance(ev, dict):
+            with self._lock:
+                self._signed_in = ev  # warm the cache so the next tick skips the read
             return ev
+        return None
 
     def clear_signed_in(self) -> None:
+        """Drop the announce from memory AND disk.
+
+        ⛔ THE ONLY CLEARING POINT, and it did not use to be. Clearing was spread
+        over four places and only one of them worked: ``_login_remote_start`` cleared
+        (correct), ``_login_callback`` — the ``agent login --local`` page — did NOT,
+        ``set_session(None)`` did but has no non-test callers, and the REAL sign-out
+        path (``_self_logout`` → ``clear_session_if``) nulled the session under the
+        lock without touching the announce at all. The reachable consequence was a
+        STALE announce: sign in from chat, revoke or log out, sign in again through
+        the local page, and the chat was told "Starting <the old topic> on <the old
+        device> now" for a run that no longer existed."""
         with self._lock:
             self._signed_in = None
+        try:
+            prefs.clear_pending_announce()
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not clear the parked sign-in announce (%s)",
+                        type(e).__name__)
 
     def rotate_login_token(self) -> None:
         with self._lock:
@@ -1041,8 +1178,17 @@ class BridgeState:
         with self._lock:
             if self._session is sess:
                 self._session = None
-                return True
-            return False
+                cleared = True
+            else:
+                cleared = False
+        if cleared:
+            # ⛔ THE REAL SIGN-OUT PATH. `set_session(None)` also drops the pending
+            # announce, but nothing outside the tests ever calls it — every
+            # production sign-out (the /logout route and the revoke self-logout)
+            # arrives here instead. Without this line a not-yet-delivered announce
+            # outlived the session that produced it.
+            self.clear_signed_in()
+        return cleared
 
 
 # ── Agent session (#790): the renamable identity row in the app's "Shared with"
@@ -1886,6 +2032,13 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 self._json(500, {"error": f"capture failed: {e}"})
                 return
             state.set_session(sess)
+            # ⛔ MIRRORS `_login_remote_start`, AND DID NOT. A fresh sign-in
+            # supersedes any prior, undelivered announce. The remote flow cleared it;
+            # this host-local page did not — so a revoke (or /logout) followed by
+            # `agent login --local` handed the chat the PREVIOUS session's announce:
+            # "Starting <the old topic> on <the old device> now", for a run that no
+            # longer existed.
+            state.clear_signed_in()
             state.rotate_login_token()  # one-shot: the captured nonce can't be replayed
             # #790 identity row — explicit human sign-in, so clear any prior revoke.
             _write_agent_session_connected(sess, clear_revoked=True)
@@ -1977,7 +2130,23 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             a research before approving. Unlike /login/remote/start it never mints a
             new flow (which would invalidate the link they're about to approve); it
             just decorates the current pending flow so the post-login announce can
-            offer to continue. A no-op 409 when nothing is pending."""
+            offer to continue. A no-op 409 when nothing is pending.
+
+            ⛔⛔ AND IT USED TO LET A SECOND CHAT STEAL THE FIRST ONE'S RESEARCH.
+            Both fields were overwritten unconditionally, so: chat A fires a topic
+            while signed out → chat B fires one before A's link is approved → B's
+            post replaced A's topic AND A's origin. After sign-in only B's research
+            ran, the announce went to B, and A's watchdog — armed, and told "I'll
+            pick this up" — heard nothing, ever. A's research was simply gone, with
+            no error anywhere: two 200s and one lost request.
+
+            ⭐ SO OWNERSHIP IS FIRST-COME, and only against a DIFFERENT chat. The
+            same chat re-posting is a person correcting themselves and still
+            overwrites. A different chat is told plainly that this sign-in already
+            carries somebody's research — which is true, and actionable (ask again
+            once signed in). Losing a request in silence is the one outcome that is
+            not available.
+            """
             body = self._read_json()
             topic = body.get("pending_topic")
             origin = body.get("origin")
@@ -1985,6 +2154,14 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 flow = state.remote
                 if flow is None or flow.state != "pending":
                     self._json(409, {"error": "no sign-in in progress"})
+                    return
+                if ((flow.pending_topic or "").strip()
+                        and isinstance(origin, dict) and isinstance(flow.origin, dict)
+                        and not _same_origin(flow.origin, origin)):
+                    self._json(409, {"reason": "topic_taken",
+                                     "error": "this sign-in is already carrying a "
+                                              "research request from another chat — "
+                                              "ask again once you're signed in"})
                     return
                 if isinstance(topic, str):
                     flow.pending_topic = topic[:500]
@@ -2263,10 +2440,12 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             except FirestoreError as e:
                 self._firestore_502(e)
                 return None
-            ids = {d.get("id") for d in devs}
-            selected = prefs.get_selected_device(sess.uid)
-            if selected and selected in ids:
-                return selected
+            # ⭐ ONE DECISION, TWO CONSUMERS: `_pick_device_from` holds the rungs
+            # (selection → drop a STALE selection → sole device → the sole ONLINE
+            # device → ask which). This branch's only job is turning the verdict
+            # into an HTTP body; the sign-in auto-start turns the same verdict into
+            # announce hints. They used to be two pickers with different rungs.
+            #
             # A saved selection that's no longer a pair-confirmed member
             # (removed/unlinked in the app) is STALE: drop it so we never enqueue to
             # a phantom device, then fall THROUGH to the same auto-pick a fresh run
@@ -2276,30 +2455,23 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # empty list" dead end). Pre-0.1.27 this returned stale_selection
             # immediately, so a single-device account was told to "pick another" from
             # a list of one.
-            stale = bool(selected)
+            device_id, reason, stale = _pick_device_from(
+                devs, prefs.get_selected_device(sess.uid))
             if stale:
                 prefs.clear_selected_device()
-            if not devs:
+            if reason == "no_devices":
                 # Relayed verbatim into chat — make it the next step, not a dead end.
                 self._json(400, {"reason": "no_devices",
                                  "error": "no devices yet — on the computer running "
                                           "Super Research, grab the pair code from its "
                                           "screen and add it here (device add <code>)"})
                 return None
-            if len(devs) == 1:
-                did = devs[0].get("id")
-                if did:
-                    return did
-            # Several devices, none usable-by-default → auto-pick when exactly ONE is
-            # online right now (the obvious target); otherwise ask which (the user
-            # later says "use Research Computer", which persists via /device/select).
-            online = [d for d in devs if _device_is_online(d) and d.get("id")]
-            if len(online) == 1:
-                return online[0].get("id")
+            if device_id:
+                return device_id
             # Ask which. A stale selection keeps its own reason + message so the user
             # knows WHY they're being asked (their last computer isn't reachable); a
             # never-selected multi-device account gets the plain no_selection ask.
-            if stale:
+            if reason == "stale_selection":
                 self._json(409, {"reason": "stale_selection",
                                  "error": "the computer you last used isn't reachable "
                                           "anymore — pick another from the device list",
@@ -2827,7 +2999,10 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # that does. Delivered to the chat that started the sign-in (origin
             # match), or to any agent watchdog if it carried no origin.
             if via_agent:
-                ev = state.take_signed_in()
+                # PEEK, not take: the announce is cleared only after the response
+                # body is built, so a failure in between costs a repeat (which both
+                # watchdogs de-dup on `ts`) instead of the announce itself.
+                ev = state.peek_signed_in(sess.uid)
                 if isinstance(ev, dict):
                     ev_origin = ev.get("origin")
                     # An ORIGIN-LESS sign-in event (a connect-CLI / --pair login that
@@ -2856,9 +3031,18 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                             "runId": ev.get("runId") or "",
                             "deviceName": ev.get("deviceName") or "",
                             "topic": ev.get("topic") or "",
+                            # The FOURTH outcome: the account has several usable
+                            # computers and the sign-in auto-start could not choose.
+                            # Distinct from `needsDevice` (which means there is no
+                            # research computer at all) and — the point of it —
+                            # distinct from an ERROR, which the old empty-dict hint
+                            # made indistinguishable from this.
+                            "needsDeviceChoice": bool(ev.get("needsDeviceChoice")),
+                            "devices": ev.get("devices") or [],
                         }
-                    else:
-                        state.set_signed_in(ev)  # not this chat's — leave it for its watchdog
+                        # Delivered — now drop it, from memory and from disk.
+                        state.clear_signed_in()
+                    # else: not this chat's. Nothing to put back — peek never took it.
             self._json(200, out)
 
         def _research_cancel(self, rid: str) -> None:

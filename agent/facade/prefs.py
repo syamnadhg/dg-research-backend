@@ -1,13 +1,20 @@
-"""Non-secret local preferences for the bridge.
+"""Non-secret local state for the bridge.
 
 Distinct from `store.py` (which holds the account refresh token in the OS
-keyring): prefs are plain, non-sensitive settings — currently just which device
-the agent runs on by default — kept in a small JSON file at
-``~/.super-agent/prefs.json`` so a selection survives a bridge restart.
+keyring): these are the default device, the connected runtime, the install id, the
+agent label, and the parked sign-in announce — kept in a small JSON file at
+``~/.super-agent/prefs.json`` so they survive a bridge restart.
 
-Deliberately NOT in the keyring: there is no secret here, and mixing a mutable
-UI preference into the credential slot would churn the secret store. Written
-atomically (temp file + os.replace), best-effort 0600.
+Deliberately NOT in the keyring: no credential lives here, and mixing mutable
+state into the credential slot would churn the secret store. Written atomically
+(temp file + os.replace), best-effort 0600.
+
+⛔ "Non-secret" is not the same as "impersonal", and the sign-in announce is where
+that stops being a distinction without a difference: it carries the account EMAIL
+and the RESEARCH TOPIC the person asked for. Both are the file owner's own, both
+already sit in the same home directory in `bridge.log`, and 0600 is the whole
+protection — but nothing broader than the account's own email and topic may be
+parked here, and no token ever.
 """
 
 from __future__ import annotations
@@ -36,6 +43,12 @@ _RUNTIME_DISTRO = "runtimeDistro"      # LEGACY: a WSL distro name written by th
 #                                        only swept by clear_runtime for old prefs.
 _INSTALL_ID = "installId"
 _LABEL = "agentLabel"
+# The one-shot "just signed in" announce, parked on DISK so a bridge restart
+# between the sign-in and the watchdog's next tick can no longer lose it. Bound to
+# the uid that signed in, exactly like the device selection above: an announce
+# belonging to a different account must never be delivered to this one.
+_PENDING_ANNOUNCE = "pendingAnnounce"
+_PENDING_ANNOUNCE_UID = "pendingAnnounceUid"
 
 # Default display name for the agent session in the app's "Shared with" popup;
 # renamable from the FE (the rename writes the label onto the agentSessions doc,
@@ -114,6 +127,48 @@ def clear_selected_device() -> None:
         # Pop EAGERLY (list, not a generator): a short-circuiting any() would stop
         # at the first non-None key and orphan the rest.
         popped = [prefs.pop(k, None) for k in (_SELECTED_DEVICE, _SELECTED_UID)]
+        if any(v is not None for v in popped):
+            save(prefs)
+
+
+def get_pending_announce(uid: str) -> dict[str, Any] | None:
+    """The not-yet-delivered "just signed in" announce for THIS account, or None.
+
+    ⭐ WHY THIS IS ON DISK AT ALL. The announce used to live only in
+    ``BridgeState._signed_in``, so any bridge restart between the sign-in capture
+    and the watchdog's next tick lost it permanently — while a research COMPLETION
+    in the same window lost nothing, because ``compute()`` re-derives those from the
+    research store every tick. This is the durable half of that asymmetry.
+
+    ⛔ UID-BOUND, for the same reason ``get_selected_device`` is: a re-login as a
+    DIFFERENT account must not inherit the previous one's announce. Without the
+    binding, signing in as B would hand B's watchdog A's email and A's topic.
+    """
+    data = load()
+    ev = data.get(_PENDING_ANNOUNCE)
+    owner = data.get(_PENDING_ANNOUNCE_UID)
+    if isinstance(ev, dict) and ev and owner == uid:
+        return ev
+    return None
+
+
+def set_pending_announce(event: dict[str, Any], uid: str) -> None:
+    """Park the announce for ``uid``. Overwrites any earlier one — a fresh sign-in
+    supersedes a stale, undelivered announce rather than queueing behind it."""
+    with _lock:
+        prefs = load()
+        prefs[_PENDING_ANNOUNCE] = event
+        prefs[_PENDING_ANNOUNCE_UID] = uid
+        save(prefs)
+
+
+def clear_pending_announce() -> None:
+    """Drop the parked announce (delivered, superseded, or signed out)."""
+    with _lock:
+        prefs = load()
+        # Pop EAGERLY (a list, not a generator): a short-circuiting any() would
+        # stop at the first non-None key and orphan the other one.
+        popped = [prefs.pop(k, None) for k in (_PENDING_ANNOUNCE, _PENDING_ANNOUNCE_UID)]
         if any(v is not None for v in popped):
             save(prefs)
 

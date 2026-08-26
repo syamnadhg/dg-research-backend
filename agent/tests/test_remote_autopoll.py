@@ -378,9 +378,20 @@ def test_autostart_signals_needs_device_when_account_has_no_node(autostart):
     assert ev["pendingTopic"] == ""  # the pair-a-node message covers it
 
 
-def test_autostart_is_ambiguous_with_multiple_unselected_devices(autostart):
+def test_autostart_asks_which_computer_when_several_are_usable(autostart):
+    """⛔⛔ REWRITTEN 2026-08-26, AND IT USED TO PIN THE DEFECT. This asserted
+    `pendingTopic == "EV market"` — i.e. that an ambiguous device pick fell back to
+    "Continue with 'EV market'? Reply 'yes' to start." The hint it fell back
+    THROUGH was an empty dict, which `_run_autostart` also returns for any ERROR,
+    so "you have two computers, pick one" and "Firestore threw" were the same
+    value and nothing downstream could tell them apart.
+
+    Neither device here carries a `lastHeartbeat`, so both read as OFFLINE and the
+    sole-online rung cannot resolve it — this is the genuinely ambiguous case, and
+    now it says so and names them.
+    """
     autostart.devices = [{"id": "d1", "name": "A"}, {"id": "d2", "name": "B"}]
-    # no selection (fixture default) → can't guess → fall back to confirm-then-run
+    # no selection (fixture default), and nothing awake → genuinely ambiguous
     state = bridge.BridgeState()
     flow = _pending_flow()
     flow.pending_topic = "EV market"
@@ -391,10 +402,36 @@ def test_autostart_is_ambiguous_with_multiple_unselected_devices(autostart):
     assert autostart.enqueued == []
     ev = state.signed_in
     assert not ev.get("autoStarted")
-    # Topic was claimed under the lock (nulled on the flow), but re-offered via the
-    # announce so the legacy "reply yes" handoff still works.
-    assert ev["pendingTopic"] == "EV market"
+    assert ev["needsDeviceChoice"] is True
+    assert [d["name"] for d in ev["devices"]] == ["A", "B"]
+    assert ev["topic"] == "EV market"
+    # ⭐ AND NO "REPLY YES" BESIDE IT. Asking which computer and asking for a yes
+    # are two different questions; offering both is how the old fallback managed
+    # to be answered by the wrong one.
+    assert ev["pendingTopic"] == ""
     assert state.remote.pending_topic is None
+
+
+def test_autostart_just_uses_the_one_computer_that_is_awake(autostart):
+    """⭐ THE RUNG THE SIGN-IN PATH WAS MISSING ENTIRELY. Several computers, exactly
+    one heartbeating: firing a research has always routed straight to it, while
+    signing in with that same research pending gave up and said "reply yes". Most
+    multi-device accounts are this shape, so most of them saw the worse path."""
+    now = int(time.time() * 1000)
+    autostart.devices = [{"id": "d1", "name": "Asleep"},
+                         {"id": "d2", "name": "Awake", "lastHeartbeat": now}]
+    state = bridge.BridgeState()
+    flow = _pending_flow()
+    flow.pending_topic = "EV market"
+    state.set_remote(flow)
+
+    _approve(state)
+
+    ev = state.signed_in
+    assert ev["autoStarted"] is True
+    assert ev["deviceName"] == "Awake"
+    assert not ev.get("needsDeviceChoice")
+    assert [e["device_id"] for e in autostart.enqueued] == ["d2"]
 
 
 def test_autostart_falls_back_to_reply_yes_when_enqueue_fails(autostart):

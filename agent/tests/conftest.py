@@ -68,6 +68,53 @@ def _isolate_prefs_dir(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "store_dir", lambda: tmp_path)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_account_session(monkeypatch, tmp_path):
+    """⛔⛔ NO TEST MAY INHERIT THE DEVELOPER'S OWN SIGNED-IN ACCOUNT.
+
+    `BridgeState.__init__` calls `AccountSession.load()`, so every `BridgeState()`
+    a test builds rehydrates whatever session is stored on the machine running the
+    suite. On macOS that store is the **Keychain**, and `_isolate_prefs_dir` above
+    says so in its own docstring — "store.py freezes its own paths at import" — so
+    redirecting `config.store_dir()` never covered it, and no path override could
+    cover a keyring anyway.
+
+    ⛔ THE RESULT WAS A SUITE WHOSE ANSWER DEPENDED ON WHO RAN IT. Measured
+    2026-08-26 on the owner's Mac, at commit `e5a4ec7`, with nothing modified:
+    THREE tests were red purely because the developer happened to be signed in —
+    `test_advance_past_ttl_expires_without_broker_call` and
+    `test_advance_transient_stays_pending` both assert `state.session is None`
+    after building a fresh state, and `test_every_log_route_refuses_when_signed_out`
+    got 400 instead of 401 because the routes were, in fact, signed in. All three
+    pass in CI, where there is no keyring backend and no stored session — which is
+    exactly why this survived. The tests were right; the isolation was not.
+
+    ⭐ THE SEAM IS WHAT THE STORE READS FROM, and finding it took two wrong
+    guesses that are worth recording, because each broke a legitimate test:
+      · `AccountSession.load` — one level too high. It broke
+        `test_session_persists_and_rehydrates_capture_epoch`, which is a proper
+        already-isolated test OF that classmethod.
+      · `store.load` — still too high. `store` is a MODULE, so patching its
+        attribute is global, and it broke `test_store.py`'s own round-trip.
+    The right level is the one `test_store.py` was already using: no keyring, and
+    the file fallback pointed at a per-test tmp. Then the real `load()` runs, finds
+    an empty store, and returns None — and `test_store.py` re-applies the identical
+    overrides, so its round-trip writes and reads its own tmp file as before.
+
+    ⛔ `config.store_dir()` could never have covered this: `store.py` freezes
+    `_STORE_DIR` / `_FALLBACK_PATH` at import, which the fixture above says in its
+    own docstring — and no path override reaches a keyring at all.
+
+    A test that wants a live session sets one (`state.set_session(...)`), which is
+    what every existing one already does.
+    """
+    from facade import store
+
+    monkeypatch.setattr(store, "_try_keyring", lambda: None)
+    monkeypatch.setattr(store, "_STORE_DIR", tmp_path)
+    monkeypatch.setattr(store, "_FALLBACK_PATH", tmp_path / "session.json")
+
+
 class _FEHandler(BaseHTTPRequestHandler):
     """A scriptable stand-in for the SR web app's remote-login broker routes."""
 

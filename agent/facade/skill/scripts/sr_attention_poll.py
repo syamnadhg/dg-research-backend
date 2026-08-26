@@ -409,6 +409,14 @@ def compute(runs: list, prior_state: dict, *, baseline: bool = False,
     return out, new_state
 
 
+def _dev_name(d: dict) -> str:
+    """Friendly device name — mirrors sr.py `_dev_label` and bridge `_device_label`:
+    name → hostname → id. Duplicated because these scripts share no module (the
+    watchdog imports nothing from sr.py, measured), so the guard is a test that
+    compares the two renderings rather than an import."""
+    return d.get("name") or d.get("hostname") or d.get("id") or "your Research Computer"
+
+
 def _signed_in_line(signed_in: dict) -> str:
     """The proactive sign-in announce. When a research was fired while signed out,
     the BRIDGE starts it server-side at sign-in and reports it here — no fragile
@@ -445,7 +453,37 @@ def _signed_in_line(signed_in: dict) -> str:
             f"  • Windows:      irm https://superresearch.io/install.ps1 | iex\n"
             f"  • macOS/Linux:  curl -fsSL https://superresearch.io/install.sh | sh"
         )
-    # Fallback: bridge couldn't auto-start — OFFER to continue (legacy handoff).
+    if signed_in.get("needsDeviceChoice"):
+        # Several usable computers and none obvious. NAME them and ask — the one
+        # thing the old "reply yes" could not do, because the hint it was rendered
+        # from was an empty dict that also meant "Firestore threw".
+        #
+        # ⛔ THE WORDING IS DELIBERATELY THE RUN PATH'S. sr.py's `_pick_device_lines`
+        # already asks this question when a fired research can't be routed, and
+        # `test_the_two_device_asks_use_one_sentence` pins the two against each
+        # other — one question must not have two phrasings depending on which door
+        # the person came through.
+        devs = [d for d in (signed_in.get("devices") or []) if isinstance(d, dict)]
+        # ⛔ AN OLDER BRIDGE CAN SEND THE FLAG WITH AN EMPTY LIST, and the count in
+        # the sentence comes from the array — so without this it read "You have 0
+        # research computers — which should run 'T'?" followed by 'Just say: use
+        # "that computer"'. Found by its own test. With nothing to name, offer to
+        # start it: the run path asks which computer for real, from a live list.
+        if not devs:
+            return (f"✓ Signed in as {who}.\n\n"
+                    f"Tell me to start {quoted} and I'll ask which computer to use.")
+        rows = []
+        for d in devs:
+            online = d.get("online")
+            dot = " · online" if online is True else (" · offline" if online is False else "")
+            rows.append(f"  • {_dev_name(d)}{dot}")
+        listed = "\n".join(rows)
+        head = (f"✓ Signed in as {who}.\n\n"
+                f"You have {len(devs)} research computers — which should run "
+                f"{quoted}?")
+        return f"{head}\n{listed}\nJust say: use “{_dev_name(devs[0])}”."
+    # Fallback: the bridge hit an ERROR and we do not know what happened — OFFER to
+    # continue (legacy handoff). This is now the ONLY case that reaches "reply yes".
     if (signed_in.get("pendingTopic") or "").strip():
         return f"✓ Signed in as {who}.\n\nContinue with “{topic}”? Reply “yes” to start."
     return f"✓ Signed in as {who}.\n\nJust tell me what to research."
@@ -542,9 +580,16 @@ def main(origin: dict | None = None) -> int:
     if si_ts is not None:
         new_state["__signed_in_ts__"] = si_ts
 
-    _save_state(new_state, state_file)
+    # ⛔ SPEAK FIRST, THEN COMMIT. This was the other way round, which is the exact
+    # shape FORK.md §4.2 records as learned the hard way about the holding-pen
+    # cursor: the cursor was written, then the message printed, so anything that
+    # killed the tick in between (a broken stdout pipe, the cron harness dying)
+    # left a state file claiming the announce had been delivered and no announce.
+    # Reversed, the same window costs a REPEATED line instead of a lost one — and a
+    # repeat is what `__signed_in_ts__` and compute()'s per-run bookkeeping are for.
     if out:
         print("\n".join(out))
+    _save_state(new_state, state_file)
 
     # Persistent watchdog: once armed it NEVER self-removes. It ticks silently
     # (empty stdout = no chat spam) and streams every run for this chat until

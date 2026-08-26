@@ -11,7 +11,10 @@ on-demand via sr.py `status` (covered in test_sr_client).
 
 import importlib.util
 import json
+
 from pathlib import Path
+
+import pytest
 
 
 def _load():
@@ -403,6 +406,66 @@ def test_signed_in_line_prompts_to_pair_a_node_when_none():
     assert line.count("\n") >= 4
 
 
+def test_signed_in_line_names_the_computers_when_it_cannot_choose():
+    """⛔⛔ THE FOURTH OUTCOME. This case used to render "Continue with '…'? Reply
+    'yes' to start." — an offer whose obstacle was not consent. It is answerable
+    (the run path returns `no_selection` with the devices and sr.py renders the
+    same ask), so the old line was not a dead end, but it took an avoidable turn
+    and it never said a choice was needed."""
+    line = poll._signed_in_line({
+        "email": "e@x.y", "needsDeviceChoice": True, "topic": "Golden Retriever",
+        "pendingTopic": "",
+        "devices": [{"id": "d1", "name": "Office PC", "online": True},
+                    {"id": "d2", "name": "Loft Mac", "online": False}],
+    })
+    assert "Signed in as e@x.y" in line
+    assert "2 research computers" in line
+    assert "Office PC" in line and "Loft Mac" in line
+    assert "· online" in line and "· offline" in line
+    assert "Golden Retriever" in line          # says WHAT is waiting on the answer
+    assert 'use “Office PC”' in line           # a concrete reply, not "pick one"
+    assert "reply" not in line.lower()         # never the old yes/no offer
+
+
+def test_the_two_device_asks_use_one_sentence():
+    """⭐ ONE QUESTION, ONE PHRASING. sr.py asks "which computer?" when a FIRED
+    research cannot be routed; the watchdog asks it when a SIGN-IN auto-start
+    cannot. The scripts share no module — the watchdog imports nothing from sr.py —
+    so nothing but this test stops the two drifting into different wordings for the
+    same question, which is how a person gets asked twice in two voices."""
+    from pathlib import Path
+    client = (Path(poll.__file__).parent / "sr.py").read_text(encoding="utf-8")
+    watchdog = Path(poll.__file__).read_text(encoding="utf-8")
+    shared = "research computers — which should run "
+    assert shared in client, "sr.py no longer asks it this way"
+    assert shared in watchdog, "the watchdog drifted from sr.py's wording"
+
+
+def test_the_device_name_rungs_match_the_client():
+    """`_dev_name` here and `_dev_label` in sr.py must fall back the same way, or
+    the same machine is called two different things in two messages."""
+    from pathlib import Path
+    client = (Path(poll.__file__).parent / "sr.py").read_text(encoding="utf-8")
+    assert 'd.get("name") or d.get("hostname") or d.get("id")' in client
+    assert poll._dev_name({"name": "N", "hostname": "H", "id": "I"}) == "N"
+    assert poll._dev_name({"hostname": "H", "id": "I"}) == "H"
+    assert poll._dev_name({"id": "I"}) == "I"
+    assert poll._dev_name({}) == "your Research Computer"
+
+
+def test_a_choice_with_no_devices_still_says_something_usable():
+    """An older bridge could send the flag with an empty list. It must not render a
+    headless "you have 0 research computers" — the count comes from the array."""
+    line = poll._signed_in_line({
+        "email": "e@x.y", "needsDeviceChoice": True, "topic": "T",
+        "pendingTopic": "", "devices": [],
+    })
+    assert "Signed in as e@x.y" in line
+    assert "0 research computers" not in line
+    assert "that computer" not in line       # no invented device name
+    assert "which computer" in line.lower()  # still says a choice is coming
+
+
 def test_main_announces_signed_in_once_then_dedups(monkeypatch, capsys):
     origin = {"platform": "telegram", "chat_id": "111"}
     saved = {"s": None}
@@ -418,6 +481,34 @@ def test_main_announces_signed_in_once_then_dedups(monkeypatch, capsys):
     # on top of the bridge's one-shot clear).
     poll.main(origin)
     assert "Signed in" not in capsys.readouterr().out
+
+
+def test_the_announce_is_spoken_before_the_cursor_is_committed(monkeypatch, capsys):
+    """⛔⛔ SPEAK FIRST, THEN COMMIT — it was the other way round, which is the exact
+    shape FORK.md §4.2 records as learned the hard way about the holding-pen cursor.
+
+    A tick that dies between the two (a broken stdout pipe, the cron harness going
+    away) used to leave a state file claiming `__signed_in_ts__` had been announced
+    and no announce anywhere. The bridge had already handed the event over, so
+    nothing could ever say it again. Reversed, the same window costs a REPEATED
+    line, which is what the de-dup above exists to absorb.
+
+    Pinned by making the SAVE explode: the print must already have happened.
+    """
+    origin = {"platform": "telegram", "chat_id": "111"}
+    si = {"ts": 5, "email": "e@x.y", "pendingTopic": "EV market"}
+    monkeypatch.setattr(poll, "_get_updates", lambda o=None: ([], si))
+    monkeypatch.setattr(poll, "_load_state", lambda path=None: None)
+    monkeypatch.setattr(poll, "_teardown", lambda o: None)
+
+    def _explode(state, path=None):
+        raise OSError("disk went away between speaking and remembering")
+
+    monkeypatch.setattr(poll, "_save_state", _explode)
+    with pytest.raises(OSError):
+        poll.main(origin)
+    assert "Signed in as e@x.y" in capsys.readouterr().out, (
+        "the announce was lost because the cursor was written first")
 
 
 def test_main_persists_after_signed_in_when_idle(monkeypatch):
