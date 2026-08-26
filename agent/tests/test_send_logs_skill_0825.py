@@ -500,7 +500,18 @@ def test_the_skill_document_does_not_hand_the_model_a_wait_to_quote() -> None:
         "the document must say the cooldown is not one number")
     assert "never a number" in section, (
         "the document must tell the assistant not to quote a duration")
+    # ⛔⛔ MUTATION FOUND THIS ONE. Dropping the co-tenant clause left the document
+    # describing a SINGLE window again, with the two assertions above still
+    # passing — "not always ten minutes" says a number is wrong without saying
+    # what is right, and a model handed only the long wait reconstructs it. The
+    # fork's copy of this guard already asserted the short wait; ours did not,
+    # so the two documents' guards had drifted while the documents agreed.
+    assert "another user of that computer" in section, (
+        "the document must name the co-tenant case, or only the long wait is known")
+    assert "about a minute" in section, (
+        "the document must describe the SHORT wait as well as the long one")
     assert '"Give it ten minutes" is the honest' not in section
+    assert "One bundle per ten minutes per person" not in section
 
 
 def test_the_safety_section_names_send_logs() -> None:
