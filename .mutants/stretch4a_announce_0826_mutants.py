@@ -72,14 +72,18 @@ AGENT_SUITES = ("tests/test_signin_announce_0826.py "
                 "tests/test_sr_stream.py "
                 "tests/test_bridge_device.py "
                 "tests/test_agent_session.py "
-                "tests/test_store.py")
+                "tests/test_store.py "
+                # ⛔ ADDED WITH THE X BLOCK. X6/X7 mutate our chat client, and a leg
+                # that never runs its suite would report both as killed.
+                "tests/test_sr_client.py")
 
 FORK_SUITES = "skills/tests/test_super_research_skill.py"
 
 BRIDGE = "agent/facade/bridge.py"
 PREFS = "agent/facade/prefs.py"
 POLL = "agent/facade/skill/scripts/sr_attention_poll.py"
-OURS = (BRIDGE, PREFS, POLL)
+SR_BE = "agent/facade/skill/scripts/sr.py"
+OURS = (BRIDGE, PREFS, POLL, SR_BE)
 
 # ⚠ RELATIVE TO THE FORK, not to this repo.
 FORK_SR = "skills/super-research/scripts/sr.py"
@@ -271,11 +275,13 @@ MUTANTS = [
      "⛔ the picker is tested BEFORE the started case, so a research that IS "
      "running is reported as waiting for somebody to choose a computer",
      [('    if signed.get("autoStarted"):', '    if signed.get("needsDeviceChoice"):')]),
-    ("F13", FORK_POLL, "under",
-     "the fourth client renders an empty list of computers and then asks which "
-     "of them to use",
-     [('        first = sanitize(str((devs[0].get("name") if devs else "") or "that one"))[:80]',
-       '        first = "that one"')]),
+    ("F13", FORK_POLL, "over",
+     "the fourth client's empty-list guard goes, so it claims \"more than one of "
+     "their computers\", lists NONE of them, and offers an example naming a machine "
+     "called \"that one\" - three untruths in a row, and a placeholder its own "
+     "sibling test forbids. RE-POINTED: the line the first version named was "
+     "replaced by the guard cross-verification asked for",
+     [('        if not devs:\n            out.append(', '        if False:\n            out.append(')]),
 
     # ═══════════ O — speak before committing the cursor ═════════════════════
     ("O1", POLL, "under",
@@ -291,7 +297,7 @@ MUTANTS = [
      "chat B's post, so after sign-in only B's research runs and A's watchdog — "
      "armed, and told \"I'll pick this up\" — waits forever. Two 200s, one lost "
      "request, no error anywhere",
-     [('                if ((flow.pending_topic or "").strip()\n                        and isinstance(origin, dict) and isinstance(flow.origin, dict)\n                        and not _same_origin(flow.origin, origin)):',
+     [('                if ((flow.pending_topic or "").strip()\n                        and not _same_origin(flow.origin, origin)):',
        '                if False:')]),
     ("T2", BRIDGE, "over",
      "⛔ the same chat is refused too, so a person correcting their own topic in "
@@ -301,8 +307,8 @@ MUTANTS = [
     ("T3", BRIDGE, "over",
      "the refusal fires when NO topic is held, so the ordinary first attach — "
      "the one that gives a terminal sign-in a chat to answer in — is rejected",
-     [('                if ((flow.pending_topic or "").strip()\n                        and isinstance(origin, dict)',
-       '                if (isinstance(origin, dict)')]),
+     [('                if ((flow.pending_topic or "").strip()\n                        and not _same_origin(flow.origin, origin)):',
+       '                if (not _same_origin(flow.origin, origin)):')]),
     ("T4", BRIDGE, "under",
      "the platform stops counting, so telegram chat 111 and whatsapp chat 111 "
      "read as one conversation and one steals the other's research",
@@ -319,6 +325,54 @@ MUTANTS = [
      "silently inherits whatever the flow was already carrying",
      [("    if ca is None or cb is None:\n        return False",
        "    if ca is None or cb is None:\n        return ca is cb")]),
+
+    # ═══════ X — what CROSS-VERIFICATION found, after the first sweep ═══════
+    #
+    # ⛔⛔ EVERY ONE OF THESE IS A DEFECT THE 39/45 SWEEP DID NOT SEE, because the
+    # code it would have mutated did not exist yet or was wrong in a way no mutant
+    # of MINE was pointed at. A green mutation score is a statement about the
+    # mutants you wrote.
+    ("X1", BRIDGE, "over",
+     "⛔⛔ THE THEFT GUARD GOES BACK TO ITS FIRST FORM, which was WORSE than the bug: "
+     "it demanded an INCOMING origin, so chat B posting without one skipped it "
+     "entirely and B's TOPIC landed on A's ORIGIN — the announce then went to chat A "
+     "carrying chat B's research, and B's research is what started",
+     [('                if ((flow.pending_topic or "").strip()\n                        and not _same_origin(flow.origin, origin)):',
+       '                if ((flow.pending_topic or "").strip()\n                        and isinstance(origin, dict) and isinstance(flow.origin, dict)\n                        and not _same_origin(flow.origin, origin)):')]),
+    ("X2", BRIDGE, "under",
+     "⛔⛔ the START door reopens: a second chat mints a fresh flow that replaces the "
+     "held topic AND origin outright, so closing /pending bought nothing",
+     [("            incoming = body.get(\"origin\")\n            if isinstance(incoming, dict):",
+       "            incoming = body.get(\"origin\")\n            if False:")]),
+    ("X3", BRIDGE, "over",
+     "⛔ the START door refuses an ORIGIN-LESS caller too, which breaks the recovery "
+     "path it also is — the terminal reaches it with no origin at all, and \"send me "
+     "a fresh sign-in link\" stops working for everybody",
+     [("            incoming = body.get(\"origin\")\n            if isinstance(incoming, dict):",
+       "            incoming = body.get(\"origin\")\n            if True:")]),
+    ("X4", BRIDGE, "under",
+     "⛔⛔ `set_session(None)` goes back to nulling the attribute and leaving the "
+     "announce ON DISK, so the next peek rehydrates it — a partial clear beside a "
+     "comment saying a sign-out invalidates it",
+     [("        if sess is None:\n            # ⛔⛔ THIS USED TO NULL THE ATTRIBUTE",
+       "        if False:\n            # ⛔⛔ THIS USED TO NULL THE ATTRIBUTE")]),
+    ("X5", BRIDGE, "over",
+     "the early empty-device return comes back, so the stale-selection clear is "
+     "skipped for an account whose last computer was removed — the dead pick is "
+     "re-derived by every later sign-in",
+     [("    devs = fs.list_devices(sess.uid)\n    by_id = {d.get(\"id\"): d for d in devs if d.get(\"id\")}",
+       "    devs = fs.list_devices(sess.uid)\n    if not devs:\n        raise _NoResearchNode()\n    by_id = {d.get(\"id\"): d for d in devs if d.get(\"id\")}")]),
+    ("X6", SR_BE, "under",
+     "⛔⛔ our chat client discards the refusal again, so a chat whose research was "
+     "refused is told \"I'll pick this up\" and then hears nothing — the same lost "
+     "request the refusal exists to prevent, moved one layer out",
+     [('                if pc == 409 and pbody.get("reason") == "topic_taken":',
+       '                if False:')]),
+    ("X7", SR_BE, "under",
+     "the START door's refusal is swallowed, so the branch falls through to \"tell "
+     "me to log you in\" — neither true nor the next step",
+     [('            if lc == 409 and lbody.get("reason") == "topic_taken":',
+       '            if False:')]),
 
     # ═══════════ C — the fork's login-done ═════════════════════════════════
     ("C1", FORK_SR, "under",

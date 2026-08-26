@@ -68,8 +68,9 @@ APP_SUITES = "tests/unit/agentLogRoute.test.ts tests/unit/logBundles.test.ts"
 BRIDGE = "agent/facade/bridge.py"
 CLI = "agent/facade/cli.py"
 CONFIG = "agent/facade/config.py"
+PREFS_F = "agent/facade/prefs.py"
 SR = "agent/facade/skill/scripts/sr.py"
-OURS = (BRIDGE, CLI, CONFIG, SR)
+OURS = (BRIDGE, CLI, CONFIG, PREFS_F, SR)
 
 FORK_SR = "skills/super-research/scripts/sr.py"
 THEIRS = (FORK_SR,)
@@ -95,13 +96,46 @@ MUTANTS = [
      "⛔⛔ THE SWITCH EXISTS AND CHANGES NOTHING IN PRODUCTION. `or config.VERBOSE` "
      "goes, so an autostarted bridge — which runs `main(['serve'])` with no flag — "
      "is permanently at the default level however the variable is set",
-     [('    logsetup.configure(verbose=getattr(args, "verbose", False) or config.VERBOSE,\n                       to_file=True)',
-       '    logsetup.configure(verbose=getattr(args, "verbose", False), to_file=True)')]),
+     [('        verbose=(getattr(args, "verbose", False) or config.VERBOSE\n                 or prefs.get_verbose()),',
+       '        verbose=getattr(args, "verbose", False),')]),
     ("V3", CONFIG, "over",
      "⛔ any non-empty value turns it on, so `SUPER_AGENT_VERBOSE=0` and "
      "`=false` — the two things a person writes to turn something OFF — turn it on",
      [('VERBOSE: bool = os.environ.get("SUPER_AGENT_VERBOSE", "").strip().lower() in (\n    "1", "true", "yes", "on",\n)',
        'VERBOSE: bool = bool(os.environ.get("SUPER_AGENT_VERBOSE", "").strip())')]),
+
+    # ═══ X — the pref, which is the ONLY switch a pinned bridge can see ═════
+    #
+    # ⛔⛔ THE ENV VAR SHIPPED AS THE FIX FOR THIS AND COULD NOT REACH THE BRIDGE.
+    # `autostart.py` writes no SUPER_AGENT_VERBOSE into any launcher — the macOS
+    # plist has no `EnvironmentVariables` key at all — and a LaunchAgent inherits no
+    # shell profile. Found by cross-verification, after V1-V3 had all been killed
+    # against a switch that was inert in production.
+    ("X1", CLI, "under",
+     "⛔⛔ `or prefs.get_verbose()` goes, so the ONLY switch a pinned bridge can see "
+     "is gone and the feature is back to being inert on the recommended install",
+     [('        verbose=(getattr(args, "verbose", False) or config.VERBOSE\n                 or prefs.get_verbose()),',
+       '        verbose=(getattr(args, "verbose", False) or config.VERBOSE),')]),
+    ("X2", PREFS_F, "under",
+     "the pref stops being read, so `agent verbose on` writes a setting nothing "
+     "consults — a switch with a receipt and no effect",
+     [("    return bool(load().get(_VERBOSE))", "    return False")]),
+    ("X3", PREFS_F, "under",
+     "turning it OFF leaves the key in place, so a person who turned detailed "
+     "logging off keeps writing a detailed log",
+     [("        if on:\n            prefs[_VERBOSE] = True\n        elif prefs.pop(_VERBOSE, None) is None:\n            return",
+       "        if on:\n            prefs[_VERBOSE] = True\n        elif True:\n            return")]),
+    ("X4", CLI, "over",
+     "⛔ doctor names the ENVIRONMENT VARIABLE again — unactionable on the "
+     "recommended install, so somebody sets it, restarts, sees no change, and stops "
+     "looking for the real answer",
+     [('        b.dim("              for more detail:  superresearch-agent verbose on")',
+       '        b.dim("              for more detail:  SUPER_AGENT_VERBOSE=1, then restart")')]),
+    ("X5", CLI, "over",
+     "`agent verbose` accepts anything that is not \"off\" as ON, so a typo turns "
+     "detailed logging on and reports success",
+     [('    if want not in ("on", "off"):', '    if False:'),
+      ('    prefs.set_verbose(want == "on")', '    prefs.set_verbose(want != "off")')]),
 
     # ═══════════ DR — doctor names it, and names it in time ═════════════════
     ("DR1", CLI, "under",
@@ -125,8 +159,8 @@ MUTANTS = [
     ("DR4", CLI, "under",
      "the way to turn verbose on stops being printed, so the switch exists and "
      "nothing anywhere tells a person it does",
-     [('    if not config.VERBOSE:\n        b.dim("              for more detail:  SUPER_AGENT_VERBOSE=1, then restart the bridge")',
-       "    if False:\n        pass")]),
+     [('    if not (config.VERBOSE or prefs.get_verbose()):\n        b.dim("              for more detail:  superresearch-agent verbose on")',
+       '    if False:\n        pass')]),
     ("DR5", CLI, "over",
      "an absent log is reported as a healthy one, so somebody is sent looking for "
      "contents that were never written",
@@ -290,8 +324,8 @@ MUTANTS = [
      "⛔ the prefix loses a segment, so the listing asks for `logs/{uid}/{deviceId}` "
      "— which the rules deny, because {fileName} is a single-segment wildcard. "
      "Every clear then falls back to the row's own path, for every user, always",
-     [("  const prefix = `logs/${uid}/${deviceId}/${row.code}`;",
-       "  const prefix = `logs/${uid}/${deviceId}`;")]),
+     [("  const prefix = `logs/${uid}/${row.deviceId || deviceId}/${row.code}`;",
+       "  const prefix = `logs/${uid}/${row.deviceId || deviceId}`;")]),
     ("C3", BUNDLES, "under",
      "a listing failure deletes nothing instead of falling back to the path the "
      "row can name — a completeness gain traded for a regression",
