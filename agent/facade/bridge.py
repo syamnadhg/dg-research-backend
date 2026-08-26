@@ -1068,6 +1068,9 @@ class BridgeState:
         # restart between the sign-in and the watchdog's next tick cannot lose it;
         # this attribute is the in-process cache of that file.
         self._signed_in: dict | None = None
+        # The `ts` of an announce that was handed out but whose disk clear failed —
+        # so a parked copy that outlived its delivery is not handed out again.
+        self._handed_out_ts: Any = None
 
     @property
     def session(self) -> AccountSession | None:
@@ -1099,17 +1102,25 @@ class BridgeState:
         for good — while a research COMPLETION in the same window lost nothing,
         because the watchdog re-derives those from the research store every tick.
         That asymmetry was the whole defect."""
+        # ⛔⛔ THE DISK HALF IS INSIDE THE LOCK, and it was outside on the first
+        # pass. `take_signed_in` holds this same lock across its WHOLE take
+        # including the disk clear — so a take landing in the writer's gap cleared a
+        # still-empty file, delivered the event, and then the parker's write landed
+        # behind it: memory empty, disk holding an announce that had already gone
+        # out. Reachable on a live path, since `_autostart_worker` parks from a
+        # background thread while the watchdog polls.
         with self._lock:
             self._signed_in = event
-        uid = (event or {}).get("uid") if isinstance(event, dict) else None
-        try:
-            if isinstance(event, dict) and isinstance(uid, str) and uid:
-                prefs.set_pending_announce(event, uid)
-            else:
-                prefs.clear_pending_announce()
-        except Exception as e:  # noqa: BLE001 — an announce must never fail a sign-in
-            log.warning("could not park the sign-in announce (%s) — memory only",
-                        type(e).__name__)
+            self._handed_out_ts = None
+            uid = (event or {}).get("uid") if isinstance(event, dict) else None
+            try:
+                if isinstance(event, dict) and isinstance(uid, str) and uid:
+                    prefs.set_pending_announce(event, uid)
+                else:
+                    prefs.clear_pending_announce()
+            except Exception as e:  # noqa: BLE001 — never fail a sign-in for this
+                log.warning("could not park the sign-in announce (%s) — memory only",
+                            type(e).__name__)
 
     def take_signed_in(self, uid: str) -> dict | None:
         """Atomically remove and return the pending announce for ``uid``.
@@ -1150,6 +1161,12 @@ class BridgeState:
                 ev = None
                 try:
                     parked = prefs.get_pending_announce(uid)
+                    if (isinstance(parked, dict)
+                            and self._handed_out_ts is not None
+                            and parked.get("ts") == self._handed_out_ts):
+                        # Already delivered; the clear that should have removed it
+                        # failed. Not a second announce.
+                        return None
                 except Exception as e:  # noqa: BLE001
                     log.warning("could not read the parked sign-in announce (%s)",
                                 type(e).__name__)
@@ -1161,25 +1178,33 @@ class BridgeState:
             try:
                 prefs.clear_pending_announce()
             except Exception as e:  # noqa: BLE001
+                # ⛔ THE CLEAR FAILED, SO THE PARKED COPY IS STILL CLAIMABLE — and
+                # memory is already empty, so every later take would re-read the
+                # same event and hand it out again, on every poll, forever. Remember
+                # what was handed out and refuse to hand it out twice; the watermark
+                # then keeps it that way across a restart.
                 log.warning("could not clear the parked sign-in announce (%s)",
                             type(e).__name__)
+                self._handed_out_ts = ev.get("ts")
             return ev
 
     def peek_signed_in(self, uid: str) -> dict | None:
         """The pending announce for ``uid`` WITHOUT consuming it — memory first,
-        then the parked copy on disk (which is how it survives a restart).
+        then the parked copy on disk.
 
-        ⭐ WHY PEEK REPLACED TAKE. ``take_signed_in`` was atomic read-and-clear:
-        exactly-once delivery, so ANY failure after the read — a dropped response, a
-        crash while rendering — destroyed the announce. Delivery is now
-        at-least-once: peek, write the response, then clear. That is safe because
-        BOTH consumers already de-duplicate on the event's ``ts``
-        (``__signed_in_ts__`` in our watchdog's state file and in the fork's), so a
-        repeat is swallowed rather than announced twice. Measured in both copies
-        before this changed — it is not an assumption about them.
+        ⛔⛔ A NON-CONSUMING INSPECTION SEAM, AND NOT THE DELIVERY PATH. Production
+        delivers through ``take_signed_in`` (the single call site is the
+        ``/updates?via=agent`` handler); everything here is for tests and for
+        reading state without disturbing it.
 
-        ⛔ And it removed the re-stash write entirely: a scope that does not own the
-        event now simply leaves it alone, instead of taking it and putting it back."""
+        ⛔ THE DOCSTRING THAT USED TO BE HERE DESCRIBED A DESIGN THAT NO LONGER
+        SHIPS. It said "WHY PEEK REPLACED TAKE" and "delivery is now at-least-once",
+        and it asserted that both watchdogs de-duplicate on ``ts`` and that this had
+        been "measured in both copies". Delivery went back to an atomic take; and
+        the measurement claim was false — the fork's de-dup has no test at all, and
+        is bypassed on the write-failure path it exists for. Prose that describes
+        the shape before last is worse than no prose, because the next person
+        believes it."""
         with self._lock:
             ev = self._signed_in
         if isinstance(ev, dict):
@@ -1208,13 +1233,15 @@ class BridgeState:
         STALE announce: sign in from chat, revoke or log out, sign in again through
         the local page, and the chat was told "Starting <the old topic> on <the old
         device> now" for a run that no longer existed."""
+        # Disk half inside the lock, for the same reason as `set_signed_in`.
         with self._lock:
             self._signed_in = None
-        try:
-            prefs.clear_pending_announce()
-        except Exception as e:  # noqa: BLE001
-            log.warning("could not clear the parked sign-in announce (%s)",
-                        type(e).__name__)
+            self._handed_out_ts = None
+            try:
+                prefs.clear_pending_announce()
+            except Exception as e:  # noqa: BLE001
+                log.warning("could not clear the parked sign-in announce (%s)",
+                            type(e).__name__)
 
     def rotate_login_token(self) -> None:
         with self._lock:
@@ -1962,6 +1989,50 @@ def _backend_version() -> "str | None":
 # (turning a fresh PC into a research host) is a separate, still-supported action.
 
 
+def _remint_signin(sess: AccountSession) -> dict[str, Any] | None:
+    """A plain "you are signed in" for a sign-in whose announce never arrived.
+
+    Returns None — the ordinary case — when this session's sign-in has already been
+    announced, or when the session predates the capture epoch (a rehydrated
+    pre-change blob has no `connected_at_ms`, and inventing one would announce a
+    sign-in that happened days ago).
+
+    ⛔ THE WATERMARK IS STAMPED THE FIRST TIME IT IS READ, not only when something is
+    announced. Without that, every existing session would be re-announced once the
+    moment this shipped — a bridge that has been signed in for a week greeting the
+    person on its next tick.
+    """
+    cap = getattr(sess, "connected_at_ms", None)
+    if not isinstance(cap, (int, float)) or not cap:
+        return None
+    try:
+        seen = prefs.get_announced_signin_ms(sess.uid)
+    except Exception as e:  # noqa: BLE001 — a courtesy message, never a failure
+        log.warning("could not read the announce watermark (%s)", type(e).__name__)
+        return None
+    if seen is None:
+        # First observation of this account on a build that keeps a watermark.
+        # Record where we are and say nothing: the sign-in predates the record.
+        _stamp_announced(sess, int(cap))
+        return None
+    if int(cap) <= seen:
+        return None
+    log.info("re-announcing a sign-in whose announce never arrived")
+    _stamp_announced(sess, int(cap))
+    return {"ts": int(cap), "email": sess.email or "", "pendingTopic": "",
+            "autoStarted": False, "needsDevice": False, "runId": "",
+            "deviceName": "", "topic": "", "needsDeviceChoice": False,
+            "devices": [], "staleSelection": False}
+
+
+def _stamp_announced(sess: AccountSession, ms: int) -> None:
+    """Record that this sign-in has been announced. Never fatal."""
+    try:
+        prefs.set_announced_signin_ms(ms, sess.uid)
+    except Exception as e:  # noqa: BLE001
+        log.warning("could not record the announce watermark (%s)", type(e).__name__)
+
+
 def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
 
     class Handler(BaseHTTPRequestHandler):
@@ -2230,18 +2301,27 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # flow, because that is a person starting over on their own machine and
             # there is no way to tell them from themselves.
             incoming = body.get("origin")
-            if isinstance(incoming, dict):
-                with state.remote_lock:
-                    held = state.remote
-                    if (held is not None and held.state == "pending"
+
+            def _taken_by_another() -> bool:
+                held = state.remote
+                return bool(held is not None and held.state == "pending"
                             and (held.pending_topic or "").strip()
                             and isinstance(held.origin, dict)
-                            and not _same_origin(held.origin, incoming)):
-                        self._json(409, {"reason": "topic_taken",
-                                         "error": "another chat is already signing in "
-                                                  "with a research waiting — ask again "
-                                                  "once that finishes"})
-                        return
+                            and isinstance(incoming, dict)
+                            and not _same_origin(held.origin, incoming))
+
+            # ⛔ CHECKED TWICE, AND THE SECOND ONE IS THE ONE THAT COUNTS. The first
+            # is a courtesy: it refuses before spending a broker round-trip. But the
+            # broker call happens between the two lock windows, so a flow can be
+            # created in that gap — the check and the swap have to happen together
+            # or the guard is advisory. Re-evaluated against a fresh read below,
+            # inside the same lock that calls `set_remote`.
+            if _taken_by_another():
+                self._json(409, {"reason": "topic_taken",
+                                 "error": "another chat is already signing in with a "
+                                          "research waiting — ask again once that "
+                                          "finishes"})
+                return
             try:
                 flow = devicelogin.start(
                     label=str(body.get("label", "")), runtime=str(body.get("runtime", ""))
@@ -2272,6 +2352,14 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # Take remote_lock so a start can't swap the flow out from under an
             # in-flight poll (and vice-versa); start/poll are mutually exclusive.
             with state.remote_lock:
+                # The compare half of the compare-and-swap: another chat may have
+                # started one while the broker was answering.
+                if _taken_by_another():
+                    self._json(409, {"reason": "topic_taken",
+                                     "error": "another chat is already signing in "
+                                              "with a research waiting — ask again "
+                                              "once that finishes"})
+                    return
                 state.set_remote(rf)
             # A fresh sign-in supersedes any prior, not-yet-delivered "signed in"
             # announce (e.g. a re-login) so the watchdog can't replay a stale one.
@@ -3263,9 +3351,13 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # that does. Delivered to the chat that started the sign-in (origin
             # match), or to any agent watchdog if it carried no origin.
             if via_agent:
-                # TAKE, atomically — and the caller puts it back if the send fails.
-                # See `take_signed_in` for why this is the third shape of this and
-                # the first that is both exactly-once and lossless.
+                # TAKE, atomically. The caller puts it back if the send RAISES —
+                # and ⛔ that covers less than it sounds like: a reader that times
+                # out and closes gracefully takes the bytes into its socket buffer
+                # and dies without raising anything here. The announce is not lost
+                # for good even then, because the watermark below re-derives it —
+                # see `_remint_signin`. The restore is the cheap half; the watermark
+                # is the half that actually closes the hole.
                 ev = state.take_signed_in(sess.uid)
                 if isinstance(ev, dict):
                     ev_origin = ev.get("origin")
@@ -3320,10 +3412,39 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                         # commit-before-you-speak shape this stretch fixed in the
                         # watchdog, reintroduced one layer up while fixing it there.
                         taken = ev
+                        # The parked announce covers this sign-in, so the watermark
+                        # moves with it — otherwise the re-mint above would fire on
+                        # the very next tick and say it all again, plainly.
+                        _stamp_announced(sess, int(ev.get("ts") or 0)
+                                         or int(getattr(sess, "connected_at_ms", 0) or 0))
                     else:
                         # Not this chat's — put it straight back for the watchdog
                         # that owns it.
                         state.set_signed_in(ev)
+                elif not scope_chat:
+                    # ⛔⛔ NOTHING PARKED — SO CHECK WHETHER ONE WAS LOST. HTTP cannot
+                    # tell us a reader received anything: a poller that times out and
+                    # closes GRACEFULLY takes the bytes into its socket buffer and
+                    # dies, `wfile.write` raises nothing, and the announce is gone
+                    # exactly as the take-and-clear this replaced lost it. Parking it
+                    # on disk made it DURABLE; it did not make it RECOVERABLE, and
+                    # the plan asked for both.
+                    #
+                    # The session records when the human signed in, persisted and
+                    # rehydrated, so "this account signed in at T and nothing has
+                    # announced T" survives any single request. Re-minted plain: the
+                    # auto-start hints are the one part that cannot be re-derived, so
+                    # this degrades to less news rather than to silence.
+                    #
+                    # ⛔ UNSCOPED READERS ONLY. A re-mint carries no origin, and an
+                    # origin-less announce belongs to the account-wide watchdog — the
+                    # same rule the parked path follows, for the same reason: with
+                    # several channels armed, whichever polled first would announce a
+                    # sign-in in the wrong chat.
+                    remade = _remint_signin(sess)
+                    if remade is not None:
+                        out["signedIn"] = remade
+                        taken = None
             try:
                 self._json(200, out)
             except Exception:

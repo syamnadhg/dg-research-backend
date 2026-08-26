@@ -905,6 +905,18 @@ def cmd_research(args) -> int:
                         "research waiting, so I can't add yours to it yet.",
                         "Ask me again once that sign-in finishes and I'll start it.",
                     ], _fail_code(pc))
+                if pc != 200:
+                    # ⛔ ANY other refusal — most reachably the 409 the bridge sends
+                    # when the sign-in ended between the /status read and this post,
+                    # which carries no `reason` at all. Branching only on
+                    # `topic_taken` let every other outcome fall through to the
+                    # promise below, which is the same silent loss in a different
+                    # costume: the topic never landed and the person was told it had.
+                    return _emit(pbody, args.json, [
+                        "That sign-in just ended, so I couldn't attach your research "
+                        "to it.",
+                        "Ask me again and I'll start a fresh one.",
+                    ], _fail_code(pc))
                 lines = ["You're almost signed in — finish in your browser and I'll pick this up."]
                 if arm_rc == 0 and arm_lines:
                     lines += _agent_directive_block(arm_lines)

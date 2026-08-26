@@ -41,6 +41,8 @@ _RUNTIME_DISTRO = "runtimeDistro"      # LEGACY: a WSL distro name written by th
 #                                        pre-Model-A connect; no longer written
 #                                        (a WSL runtime now connects in-distro),
 #                                        only swept by clear_runtime for old prefs.
+_ANNOUNCED_SIGNIN = "announcedSignInMs"
+_ANNOUNCED_SIGNIN_UID = "announcedSignInUid"
 _VERBOSE = "verbose"
 _INSTALL_ID = "installId"
 _LABEL = "agentLabel"
@@ -130,6 +132,45 @@ def clear_selected_device() -> None:
         popped = [prefs.pop(k, None) for k in (_SELECTED_DEVICE, _SELECTED_UID)]
         if any(v is not None for v in popped):
             save(prefs)
+
+
+def get_announced_signin_ms(uid: str) -> int | None:
+    """The sign-in (by its capture epoch) whose announce was last handed out.
+
+    ⛔⛔ THIS IS THE HALF THAT MAKES THE ANNOUNCE RECOVERABLE, and the stretch
+    shipped without it. The plan asked for "durable, RE-DERIVABLE state like runs
+    have"; parking the event on disk delivered the DURABLE half and nothing more.
+    Durable is not the same as recoverable: once the event is handed to a reader it
+    is gone, and HTTP cannot tell you whether the reader received it. A poller that
+    times out and closes GRACEFULLY takes the bytes into its socket buffer and dies
+    — `wfile.write` raises nothing, so no restore fires, and the announce is lost
+    exactly as the take-and-clear this replaced lost it. Measured by review, not
+    reasoned about.
+
+    ⭐ A WATERMARK CLOSES IT PERMANENTLY. The session already records WHEN the human
+    signed in (`AccountSession.connected_at_ms`, persisted and rehydrated), so "this
+    account signed in at T and nothing has announced T" is derivable from state that
+    outlives any single request. A lost announce is re-minted on the next tick — as
+    a plain "you are signed in", because the auto-start hints are the one part that
+    cannot be re-derived. Degrading to less news beats degrading to silence.
+    """
+    data = load()
+    ms = data.get(_ANNOUNCED_SIGNIN)
+    owner = data.get(_ANNOUNCED_SIGNIN_UID)
+    if not uid or not owner or owner != uid:
+        return None
+    return int(ms) if isinstance(ms, (int, float)) else None
+
+
+def set_announced_signin_ms(ms: int, uid: str) -> None:
+    """Record that the sign-in captured at ``ms`` has been announced."""
+    if not uid:
+        return
+    with _lock:
+        prefs = load()
+        prefs[_ANNOUNCED_SIGNIN] = int(ms)
+        prefs[_ANNOUNCED_SIGNIN_UID] = uid
+        save(prefs)
 
 
 def get_verbose() -> bool:

@@ -128,11 +128,48 @@ def test_verbose_on_and_off_round_trip():
 @pytest.mark.parametrize("state,rc,want", [
     ("on", 0, True), ("off", 0, False), ("", 1, False), ("maybe", 1, False),
 ])
-def test_the_verbose_command(state, rc, want):
+def test_the_verbose_command(state, rc, want, monkeypatch):
     from facade import prefs as _p
+    monkeypatch.setattr(cli, "_delegate_lifecycle", lambda *a, **k: None)
     _p.set_verbose(False)
     assert cli.cmd_verbose(argparse.Namespace(state=state)) == rc
     assert _p.get_verbose() is want
+
+
+def test_verbose_names_the_command_that_actually_CYCLES_the_bridge(monkeypatch, capsys):
+    """⛔⛔ IT USED TO SAY `resurrect`, WHICH DOES NOT RESTART A RUNNING BRIDGE. That
+    verb PINS the bridge to start at login and starts it if it is down; the level is
+    read once at start, so on a healthy pinned bridge — the recommended install, and
+    the whole reason the pref exists — following the printed instruction changed
+    nothing. `restart` is the verb whose macOS path is `launchctl kickstart -k`.
+
+    ⛔ And nothing asserted this output at all: the only test checked the return code
+    and the pref, so the sentence could say anything."""
+    monkeypatch.setattr(cli, "_delegate_lifecycle", lambda *a, **k: None)
+    cli.cmd_verbose(argparse.Namespace(state="on"))
+    out = capsys.readouterr().out
+    assert "superresearch-agent restart" in out, out
+    assert "resurrect" not in out, ("it names a command that does not cycle the "
+                                   "process", out)
+    assert "verbose off" in out, ("no way back is offered", out)
+    cli.cmd_verbose(argparse.Namespace(state="off"))
+    assert "superresearch-agent restart" in capsys.readouterr().out
+
+
+def test_verbose_is_DELEGATED_so_the_pref_lands_where_the_bridge_reads_it(monkeypatch):
+    """⛔⛔ THE PREF FILE LIVES WHERE THE BRIDGE RUNS. On a WSL runtime the bridge and
+    its ~/.super-agent are inside the distro, so writing the pref on the Windows side
+    sets a switch the bridge will never read — the command reports success and
+    changes nothing, which is precisely the defect it was built to fix."""
+    from facade import prefs as _p
+    seen = {}
+    monkeypatch.setattr(cli, "_delegate_lifecycle",
+                        lambda cmd, argv, label="": seen.update(cmd=cmd, argv=argv) or 0)
+    _p.set_verbose(False)
+    rc = cli.cmd_verbose(argparse.Namespace(state="on"))
+    assert rc == 0
+    assert seen == {"cmd": "verbose", "argv": ["on"]}, seen
+    assert _p.get_verbose() is False, "it wrote the pref on the wrong side of WSL"
 
 
 def test_serve_stays_quiet_when_neither_flag_nor_switch_is_set(monkeypatch):

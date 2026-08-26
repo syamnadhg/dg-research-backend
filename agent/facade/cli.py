@@ -1159,15 +1159,28 @@ def cmd_verbose(args: argparse.Namespace) -> int:
     if want not in ("on", "off"):
         b.no("Say which:  agent verbose on   |   agent verbose off")
         return 1
+    # ⛔⛔ DELEGATED LIKE THE LIFECYCLE COMMANDS, because the prefs file this writes
+    # lives WHERE THE BRIDGE RUNS. On a WSL runtime the bridge and its
+    # ~/.super-agent are inside the distro, so writing the pref on the Windows side
+    # sets a switch the bridge will never read — the command would report success
+    # and change nothing, which is the whole defect it was built to fix.
+    rc = _delegate_lifecycle("verbose", [want], label="Verbose")
+    if rc is not None:
+        return rc
     prefs.set_verbose(want == "on")
+    # ⛔ `restart`, NOT `resurrect`. Resurrect PINS the bridge to start at login and
+    # starts it if it is down; it does not cycle one that is already running, and
+    # the level is read once at start. So the instruction printed here used to be
+    # unactionable in exactly the case it matters: a healthy pinned bridge.
+    cycle = "superresearch-agent restart"
     if want == "on":
         b.ok("Detailed logging is ON for the next bridge start.")
         b.dim(f"    It writes to {config.log_path()}")
-        b.dim("    Restart the bridge to pick it up:  superresearch-agent resurrect")
+        b.dim(f"    Pick it up now:  {cycle}")
         b.dim("    Turn it off again with:  superresearch-agent verbose off")
     else:
         b.ok("Detailed logging is OFF for the next bridge start.")
-        b.dim("    Restart the bridge to pick it up:  superresearch-agent resurrect")
+        b.dim(f"    Pick it up now:  {cycle}")
     return 0
 
 

@@ -537,6 +537,166 @@ def test_a_never_chosen_account_is_not_told_its_choice_went_stale(monkeypatch):
         httpd.server_close()
 
 
+def test_a_RESTARTED_bridge_delivers_the_parked_announce_through_the_LIVE_ROUTE(monkeypatch):
+    """⛔⛔ THE HEADLINE FIX OF THIS STRETCH HAD NO TEST THROUGH THE ROUTE THAT
+    DELIVERS IT. Every durability test drove `peek_signed_in`, which production no
+    longer calls — the live consumer is `take_signed_in`, and its DISK arm, the
+    entire restart-recovery path, was never executed by the suite. Breaking that arm
+    left the whole agent suite green.
+
+    This parks an announce, builds a SECOND BridgeState — which is what a restarted
+    bridge is — and drives `/updates?via=agent`."""
+    prefs.set_pending_announce(
+        {"ts": 4242, "uid": "u1", "email": "e@x.y", "topic": "EVs",
+         "autoStarted": True, "deviceName": "Desk"}, "u1")
+    base, state, httpd = _live(monkeypatch)  # a fresh BridgeState, nothing in memory
+    try:
+        assert state.signed_in is None, "the fixture already had it in memory"
+        got = requests.get(base + "/updates?via=agent").json()
+        assert got["signedIn"]["ts"] == 4242
+        assert got["signedIn"]["autoStarted"] is True
+        assert got["signedIn"]["deviceName"] == "Desk"
+        # and it is gone from BOTH halves afterwards
+        assert prefs.get_pending_announce("u1") is None
+        assert "signedIn" not in requests.get(base + "/updates?via=agent").json()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_a_lost_announce_is_RE_MINTED_on_the_next_tick(monkeypatch):
+    """⛔⛔ DURABLE IS NOT RECOVERABLE, and the stretch shipped only the first.
+    HTTP cannot tell us a reader received anything: a poller that times out and
+    closes GRACEFULLY takes the bytes into its socket buffer and dies, so
+    `wfile.write` raises nothing, no restore fires, and the announce is gone exactly
+    as the take-and-clear it replaced lost it.
+
+    The session records WHEN the human signed in, persisted and rehydrated, so "this
+    account signed in at T and nothing has announced T" outlives any request. The
+    re-mint is plain — the auto-start hints cannot be re-derived — which is
+    degrading to less news rather than to silence."""
+    sess = _sess()
+    sess.connected_at_ms = 9_000
+    base, state, httpd = _live(monkeypatch)
+    try:
+        state.set_session(sess)
+        # First tick: no watermark yet, so it records where we are and says nothing.
+        assert "signedIn" not in requests.get(base + "/updates?via=agent").json()
+        assert prefs.get_announced_signin_ms("u1") == 9_000
+        # A LATER sign-in whose announce never arrived.
+        sess.connected_at_ms = 12_000
+        got = requests.get(base + "/updates?via=agent").json()
+        assert got["signedIn"]["ts"] == 12_000
+        assert got["signedIn"]["email"] == "e@x.y"
+        assert got["signedIn"]["autoStarted"] is False, "hints cannot be re-derived"
+        # …and exactly once.
+        assert "signedIn" not in requests.get(base + "/updates?via=agent").json()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_an_already_announced_sign_in_is_not_re_minted(monkeypatch):
+    """The watermark's whole job. Without it every existing session would be greeted
+    once the moment this shipped — a bridge signed in for a week saying hello."""
+    sess = _sess()
+    sess.connected_at_ms = 5_000
+    prefs.set_announced_signin_ms(5_000, "u1")
+    base, state, httpd = _live(monkeypatch)
+    try:
+        state.set_session(sess)
+        assert "signedIn" not in requests.get(base + "/updates?via=agent").json()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_a_session_with_no_capture_epoch_is_never_re_minted(monkeypatch):
+    """A rehydrated pre-change blob has no `connected_at_ms`. Inventing one would
+    announce a sign-in that happened days ago."""
+    sess = _sess()
+    sess.connected_at_ms = None
+    base, state, httpd = _live(monkeypatch)
+    try:
+        state.set_session(sess)
+        assert "signedIn" not in requests.get(base + "/updates?via=agent").json()
+        assert prefs.get_announced_signin_ms("u1") is None
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_a_SCOPED_watchdog_never_gets_a_re_mint(monkeypatch):
+    """⛔ A re-mint carries no origin, and an origin-less announce belongs to the
+    account-wide watchdog — the same rule the parked path follows. With several
+    channels armed, whichever polled first would announce a sign-in in the wrong
+    chat, which is the bug the scope predicate exists for."""
+    sess = _sess()
+    sess.connected_at_ms = 9_000
+    prefs.set_announced_signin_ms(1_000, "u1")
+    base, state, httpd = _live(monkeypatch)
+    try:
+        state.set_session(sess)
+        r = requests.get(base + "/updates?via=agent&platform=telegram&chat=111").json()
+        assert "signedIn" not in r
+        # and the unscoped one still gets it
+        assert "signedIn" in requests.get(base + "/updates?via=agent").json()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_the_watermark_moves_when_a_PARKED_announce_is_delivered(monkeypatch):
+    """Otherwise the re-mint fires on the very next tick and says it all again,
+    plainly — the person is greeted twice, the second time with less."""
+    sess = _sess()
+    sess.connected_at_ms = 7_000
+    base, state, httpd = _live(monkeypatch)
+    try:
+        state.set_session(sess)
+        state.set_signed_in({"ts": 7_000, "uid": "u1", "email": "e@x.y",
+                             "origin": None, "autoStarted": True})
+        assert requests.get(base + "/updates?via=agent").json()["signedIn"]["ts"] == 7_000
+        assert prefs.get_announced_signin_ms("u1") == 7_000
+        assert "signedIn" not in requests.get(base + "/updates?via=agent").json()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_a_parked_copy_that_outlived_its_delivery_is_not_handed_out_twice(monkeypatch):
+    """⛔ When the disk clear FAILS the parked copy stays claimable, and memory is
+    already empty — so every later take re-read the same event and handed it out
+    again, on every poll, forever."""
+    state = bridge.BridgeState()
+    state.set_signed_in({"ts": 11, "uid": "u1", "email": "e@x.y"})
+    monkeypatch.setattr(prefs, "clear_pending_announce",
+                        lambda: (_ for _ in ()).throw(OSError("disk full")))
+    assert state.take_signed_in("u1")["ts"] == 11
+    assert state.take_signed_in("u1") is None, "it handed the same announce out twice"
+
+
+def test_the_disk_half_of_a_park_is_inside_the_lock():
+    """⛔ `take_signed_in` holds the lock across its WHOLE take including the disk
+    clear. If a writer sets memory and then writes disk outside the lock, a take
+    landing in that gap clears a still-empty file, delivers the event, and the
+    parker's write lands behind it — memory empty, disk holding an announce that
+    already went out. `_autostart_worker` parks from a background thread while the
+    watchdog polls, so the gap is on a live path."""
+    from conftest import code_only
+    from pathlib import Path as _P
+    src = code_only(_P(bridge.__file__).read_text(encoding="utf-8"))
+    for name in ("def set_signed_in", "def clear_signed_in"):
+        body = src[src.index(name):]
+        body = body[:body.index("\n    def ", 1)]
+        lock = body.index("with self._lock:")
+        disk = body.index("prefs.")
+        assert disk > lock, f"{name} writes prefs outside the lock"
+        # …and no dedent back to method level between them
+        between = body[lock:disk]
+        assert "\n        return" not in between, f"{name} leaves the lock first"
+
+
 def test_a_plain_announce_reports_no_choice_and_no_devices(monkeypatch):
     """The two new keys must be present and FALSY on an ordinary sign-in — a client
     that has to test for their absence is a client that will get it wrong."""

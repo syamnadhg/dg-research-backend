@@ -278,6 +278,32 @@ def test_a_refused_topic_is_RELAYED_and_never_promised(monkeypatch, capsys):
     assert "ask me again" in out, out
 
 
+def test_any_failed_attach_stops_the_promise_not_just_topic_taken(monkeypatch, capsys):
+    """⛔ THE BRANCH READ ONE `reason` AND LET EVERY OTHER OUTCOME THROUGH. The most
+    reachable is the bridge's own 409 when the sign-in ended between the /status read
+    and this post — it carries no `reason` at all — so it fell straight through to
+    "I'll pick this up". The topic never landed and the person was told it had, which
+    is the same silent loss in a different costume."""
+    monkeypatch.setattr(sr, "_get", lambda path, **kw: (200, {"remoteLogin": "pending"})
+                        if path == "/status" else (200, {}))
+    monkeypatch.setattr(sr, "_prepare_stream_arm", lambda: ([], {}, 0))
+
+    def _post(path, body=None):
+        if path == "/research":
+            return 401, {"error": "not signed in"}
+        if path == "/login/remote/pending":
+            return 409, {"error": "no sign-in in progress"}   # no `reason`
+        return 200, {}
+
+    monkeypatch.setattr(sr, "_post", _post)
+    rc = sr.main(["research", "Golden retriever"])
+    out = capsys.readouterr().out.lower()
+    assert rc != 0
+    assert "pick this up" not in out, ("it promised to run a research that never "
+                                       "attached", out)
+    assert "just ended" in out and "fresh one" in out, out
+
+
 def test_a_refusal_on_the_START_door_is_relayed_too(monkeypatch, capsys):
     """A flow can appear between the status read and the start, and the bridge
     refuses a start that would void somebody else's waiting research. Without this
