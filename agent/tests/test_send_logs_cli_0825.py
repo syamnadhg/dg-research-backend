@@ -523,13 +523,18 @@ def test_no_refusal_sentence_tells_a_person_how_long_to_wait() -> None:
 
     ⭐ Values only, so the comment explaining the ban does not trip it — the
     same trap the retention guard hit on its first run."""
+    # ⛔ ABBREVIATIONS TOO. The first version of this listed "minute" and "hour",
+    # which let "10 min" and "1 hr" straight through — a ban that misses the
+    # short forms is the same guard-cannot-see-its-subject shape the rest of
+    # this wave is about. Measured: no legitimate sentence in either table
+    # contains any of these, so the shortest stems are safe to forbid.
     for name, table in (("cli.py", cli._SEND_LOGS_FAILURES),
                         ("sr.py", _sr_failure_table())):
         for cls, words in table.items():
-            for unit in ("second", "minute", "hour", " day"):
+            for unit in ("sec", "min", "hour", "hr", "day", "week", "wk"):
                 assert unit not in words.lower(), (
-                    f"{name}/{cls} names a {unit.strip()} — the refusal row carries "
-                    f"no remaining time, so any duration here is a guess")
+                    f"{name}/{cls} names a duration ({unit!r}) — the refusal row "
+                    f"carries no remaining time, so any number here is a guess")
 
 
 def test_the_machine_keeps_two_cooldown_windows_and_they_differ() -> None:

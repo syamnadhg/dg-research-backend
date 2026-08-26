@@ -115,6 +115,12 @@ MUTANTS = [
        '    "CooldownActive": "that computer built a bundle very recently, perhaps "\n'
        '                      "for someone else who uses it — try again shortly",')]),
 
+    ("CD7", CLI, "over",
+     "⛔ the duration comes back ABBREVIATED — \"10 min\" is the same claim as "
+     "\"ten minutes\", and a ban list that names only the long forms lets it "
+     "through while reporting the surface as guarded",
+     [('"been you. Try again shortly",', '"been you. Try again in 10 min",')]),
+
     # ═══════════ W — the document the assistant reads ═══════════════════════
     ("W1", SKILL, "over",
      "⛔⛔ the document goes back to calling \"give it ten minutes\" the honest "
