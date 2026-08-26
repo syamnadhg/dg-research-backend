@@ -79,35 +79,39 @@ MUTANTS = [
     ("CD1", CLI, "over",
      "⛔⛔ the terminal client names ten minutes again — the long wait, said to "
      "somebody whose real wait is a minute because a co-tenant went first",
-     [('    "CooldownActive": "that computer built a bundle very recently, perhaps "\n'
-       '                      "for someone else who uses it — try again shortly",',
+     [('    "CooldownActive": "that computer built a bundle very recently, and its "\n                      "limit counts everyone who uses it — so it may not have "\n                      "been you. Try again shortly",',
        '    "CooldownActive": "that computer built a bundle very recently — give it "\n'
        '                      "ten minutes and ask again",')]),
     ("CD2", SR, "over",
      "⛔⛔ THE ONE THAT WOULD HAVE SHIPPED. Only the CHAT client regresses, and "
      "the cross-file test compared error-class keys rather than words, so two "
      "clients describing one refusal differently was green",
-     [('    "CooldownActive": "that computer built a bundle very recently, perhaps "\n'
-       '                      "for someone else who uses it — try again shortly",',
+     [('    "CooldownActive": "that computer built a bundle very recently, and its "\n                      "limit counts everyone who uses it — so it may not have "\n                      "been you. Try again shortly",',
        '    "CooldownActive": "that computer built a bundle very recently — give it "\n'
        '                      "ten minutes and ask again",')]),
     ("CD3", CLI, "under",
      "the sentence stops saying what to do — a person is told a bundle went "
      "recently and left to guess whether asking again is worth trying",
-     [('"for someone else who uses it — try again shortly",',
-       '"for someone else who uses it",')]),
+     [('"been you. Try again shortly",', '"been you.",')]),
     ("CD4", CLI, "over",
      "⛔ THE OTHER NUMBER, AND IT IS EXACTLY AS WRONG. A minute is the floor, "
      "so this understates by ten for the person who pressed twice — which is "
      "why the fix bans durations instead of correcting one",
-     [('"for someone else who uses it — try again shortly",',
-       '"for someone else who uses it — wait a minute and ask again",')]),
+     [('"been you. Try again shortly",', '"been you. Wait a minute and ask again",')]),
     ("CD5", SR, "over",
      "the two clients drift apart in wording without either naming a duration: "
      "same machine, same refusal, two different accounts of it",
-     [('    "CooldownActive": "that computer built a bundle very recently, perhaps "\n'
-       '                      "for someone else who uses it — try again shortly",',
+     [('    "CooldownActive": "that computer built a bundle very recently, and its "\n                      "limit counts everyone who uses it — so it may not have "\n                      "been you. Try again shortly",',
        '    "CooldownActive": "that computer is busy — try again shortly",')]),
+
+    ("CD6", CLI, "over",
+     "⛔ the sentence goes back to NAMING A CULPRIT — wrong on a machine nobody "
+     "else uses, refusing somebody's own second ask, and pointing at the wrong "
+     "person even when one did go first: the co-tenant who trips the sixty-second "
+     "floor is most often the machine's OWNER",
+     [('    "CooldownActive": "that computer built a bundle very recently, and its "\n                      "limit counts everyone who uses it — so it may not have "\n                      "been you. Try again shortly",',
+       '    "CooldownActive": "that computer built a bundle very recently, perhaps "\\n'
+       '                      "for someone else who uses it — try again shortly",')]),
 
     # ═══════════ W — the document the assistant reads ═══════════════════════
     ("W1", SKILL, "over",

@@ -320,7 +320,9 @@ def test_a_refusal_is_reported_in_words(wire, capsys) -> None:
     rc, out = _run(_args(status="K7XQ9B2M"), capsys)
     assert rc == 1
     assert "very recently" in out
-    assert "try again shortly" in out
+    assert "Try again shortly" in out
+    assert "counts everyone who uses it" in out
+    assert "perhaps for someone else" not in out
     assert "ten minutes" not in out, "the wait is not always ten minutes"
     assert "CooldownActive" not in out, "a class name is not a sentence"
 

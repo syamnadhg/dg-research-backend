@@ -387,7 +387,12 @@ def test_a_refusal_is_reported_in_words(wire) -> None:
     rc, out = _run(_args(no_wait=False, wait=5))
     assert rc == 1
     assert "very recently" in out
-    assert "try again shortly" in out
+    assert "Try again shortly" in out
+    # ⭐ THE RULE, NOT THE CULPRIT. An earlier draft said "perhaps for someone
+    # else who uses it" — a claim about WHO, and wrong on a machine nobody else
+    # uses when it was the reader's own second press.
+    assert "counts everyone who uses it" in out
+    assert "perhaps for someone else" not in out
     assert "ten minutes" not in out, "the wait is not always ten minutes"
     assert "CooldownActive" not in out, "the class name is not a sentence"
 
@@ -571,15 +576,49 @@ def _int_const(src: str, name: str) -> int:
 
 
 def test_every_refusal_the_machine_can_write_has_a_sentence() -> None:
-    """The names come from the backend's own refusal sites. A class added there
-    without a sentence here reaches a person as the fallback, which names the
-    class and admits we have no words for it — acceptable once, and never the
-    plan."""
-    expected = {"CooldownActive", "AlreadyBuilding", "NotDeviceMember",
-                "NotDeviceOwner", "NothingSelected", "ConsentMissing",
-                "RunsInvalid", "SubmitterMissing", "DeviceReadFailed",
-                "UploadFailed"}
-    assert expected <= _failure_keys(cli._SEND_LOGS_FAILURES)
+    """⛔⛔ ITS DOCSTRING SAID THE NAMES CAME FROM THE BACKEND'S OWN REFUSAL SITES
+    AND THEY DID NOT — the list was hand-typed here, so it could only ever prove
+    that a set somebody wrote down matches a table somebody wrote down. Add a
+    new refusal to `research.py` and this passed, while the person met the
+    fallback that names the class and admits we have no words for it.
+
+    It reads the refusal sites now. The mechanism was already in this file, one
+    test away: `_int_const` reads `research.py`'s source for the two cooldown
+    constants, and this needs no more than that."""
+    root = Path(__file__).resolve().parents[2]      # agent/tests -> repo root
+    src_path = root / "research.py"
+    assert src_path.exists(), (
+        f"{src_path} is missing — this suite runs from the backend checkout, and "
+        f"without it this guard proves only that two lists agree with each other")
+    src = src_path.read_text(encoding="utf-8")
+
+    # Every class literal handed to the row-writing refusal helper, plus the one
+    # written directly onto the row by the upload rung.
+    written = set(re.findall(
+        r"_refuse_log_bundle_with_row\((?:[^()]|\([^()]*\))*?\"([A-Za-z]+)\"",
+        src, re.S))
+    written |= set(re.findall(r'"errorClass":\s*"([A-Za-z]+)"', src))
+    assert len(written) >= 10, (
+        f"only found {sorted(written)} — the scan stopped seeing the refusal "
+        f"sites, which would make this guard vacuous rather than failing")
+
+    have = _failure_keys(cli._SEND_LOGS_FAILURES)
+    assert written <= have, (
+        f"{sorted(written - have)} can be written by the machine with no sentence "
+        f"in either client — a person meets the fallback instead")
+
+
+def test_the_unknown_class_fallback_still_earns_its_place() -> None:
+    """⭐ AND IT DOES, MEASURABLY. The upload rung records `type(exc).__name__`
+    on the row, so the class name is whatever Python raised — unbounded, and
+    impossible to enumerate above. That is the one refusal no table can cover,
+    which is why the fallback exists and why it names the class rather than
+    hiding it."""
+    root = Path(__file__).resolve().parents[2]
+    src = (root / "research.py").read_text(encoding="utf-8")
+    assert 'type(exc).__name__' in src, (
+        "no dynamic error class is written any more — if that is true, the "
+        "fallback's justification has changed and should be re-argued")
 
 
 def test_no_client_calls_the_research_computer_this_one() -> None:
