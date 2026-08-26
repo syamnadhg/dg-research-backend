@@ -1162,3 +1162,57 @@ def test_the_owner_check_is_the_route_s_job_not_the_agent_s(live):
     r = requests.post(base + "/research", json={"topic": "T"})
     assert r.status_code == 200
     assert _notice(bridge._fe_calls) is not None
+
+
+def test_the_notice_is_dispatched_OFF_the_request_thread(caplog):
+    # ⛔⛔ A MUTATION SURVIVOR, AND THE REASON IS THIS FILE'S OWN FIXTURE. `live`
+    # patches `_spawn` to run inline so a test can assert on the notice without a
+    # sleep — which makes "stop spawning it" invisible to every test here. So the
+    # dispatch is pinned against the SOURCE instead: the POST carries a
+    # 20-second timeout and a token refresh, and a courtesy notice may not add
+    # either to the latency of starting a run.
+    import inspect
+
+    src = inspect.getsource(bridge._enqueue_research_run)
+    assert "_spawn(_notify_device_owner_of_run" in src
+    # ⛔ and not called directly — the mutant that survived was exactly this
+    assert "\n    _notify_device_owner_of_run(" not in src
+
+
+def test_the_notices_own_guard_is_a_try_not_the_thread(caplog):
+    # ⛔⛔ THE SAME BLIND SPOT, THE OTHER HALF. In production the daemon thread
+    # eats anything this raises; the guard exists so that is not the only thing
+    # standing between a raising notice and a failed run. Pinned against source
+    # because the fixture removes the thread.
+    import inspect
+
+    src = inspect.getsource(bridge._notify_device_owner_of_run)
+    assert "try:" in src and "except Exception" in src
+    assert "_notify_device_owner_of_run_inner(" in src
+
+
+def test_a_skipped_reply_is_logged_as_skipped_not_as_delivered(live, monkeypatch, caplog):
+    # ⛔ A SURVIVOR: nothing read the log line, so a mutant that reported every
+    # owner's quiet no-op as "delivered" passed. `skipped` is the HEALTHY answer
+    # for the likeliest agent user, and a log that cannot tell it from a real
+    # delivery is a log that cannot answer "did the owner get told".
+    base, _ = live
+    FakeFS.devices = [{"id": "a", "ownerUid": "u1"}]
+    monkeypatch.setattr(bridge, "_fe_api_post",
+                        lambda *_a, **_k: (200, {"ok": True, "skipped": "self"}))
+    with caplog.at_level("INFO", logger="facade.bridge"):
+        requests.post(base + "/research", json={"topic": "T"})
+    lines = [r.getMessage() for r in caplog.records if "owner-notify" in r.getMessage()]
+    assert lines and "skipped (self)" in lines[0], lines
+
+
+def test_a_real_delivery_is_logged_as_delivered(live, monkeypatch, caplog):
+    # The polarity — otherwise the assertion above is satisfied by a log that
+    # says "skipped" for everything.
+    base, _ = live
+    FakeFS.devices = [{"id": "a", "ownerUid": "owner-2", "sharedWith": ["u1"]}]
+    monkeypatch.setattr(bridge, "_fe_api_post", lambda *_a, **_k: (200, {"ok": True}))
+    with caplog.at_level("INFO", logger="facade.bridge"):
+        requests.post(base + "/research", json={"topic": "T"})
+    lines = [r.getMessage() for r in caplog.records if "owner-notify" in r.getMessage()]
+    assert lines and "delivered" in lines[0], lines

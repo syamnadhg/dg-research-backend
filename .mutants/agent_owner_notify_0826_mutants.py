@@ -89,12 +89,21 @@ MUTANTS = [
      [("    try:\n        qid = fs.enqueue_start(",
        "    _spawn(_notify_device_owner_of_run, sess, device_id, rid, topic)\n"
        "    try:\n        qid = fs.enqueue_start(")]),
+    # ⛔⛔ THIS MUTANT WAS A HARNESS FAULT ON ITS FIRST RUN — `try:` → `if True:`
+    # leaves the `except` clause dangling, so the file did not parse and the
+    # compile gate reported "! ERROR" rather than a verdict. A mutant that does
+    # not parse measures nothing and, without that gate, would have reported a
+    # KILL: the suite goes red on an import error rather than on the behaviour.
+    # The guard is removed properly now — the call is made directly and the
+    # whole try/except goes with it.
     ("O5", BRIDGE, "over",
      "⛔⛔ THE NOTICE'S OWN GUARD GOES, so whether a raising notice fails a "
      "started run depends entirely on the dispatcher putting it on a thread — "
      "the exact hole a test found on 2026-08-26",
-     [("    try:\n        _notify_device_owner_of_run_inner(sess, device_id, research_id, topic)",
-       "    if True:\n        _notify_device_owner_of_run_inner(sess, device_id, research_id, topic)")]),
+     [("    try:\n        _notify_device_owner_of_run_inner(sess, device_id, research_id, topic)\n"
+       "    except Exception as e:  # noqa: BLE001 — a courtesy notice, never a failure",
+       "    if True:\n        _notify_device_owner_of_run_inner(sess, device_id, research_id, topic)\n"
+       "    if False:\n        e = Exception()")]),
     ("O6", BRIDGE, "over",
      "⛔ IT STOPS BEING SPAWNED, so a courtesy notice's 20-second timeout is "
      "added to the latency of every run start",
