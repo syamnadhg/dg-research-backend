@@ -427,18 +427,49 @@ def test_signed_in_line_names_the_computers_when_it_cannot_choose():
     assert "reply" not in line.lower()         # never the old yes/no offer
 
 
-def test_the_two_device_asks_use_one_sentence():
-    """⭐ ONE QUESTION, ONE PHRASING. sr.py asks "which computer?" when a FIRED
-    research cannot be routed; the watchdog asks it when a SIGN-IN auto-start
-    cannot. The scripts share no module — the watchdog imports nothing from sr.py —
-    so nothing but this test stops the two drifting into different wordings for the
-    same question, which is how a person gets asked twice in two voices."""
+def test_the_two_device_asks_share_their_stem_and_their_answer_form():
+    """sr.py asks "which computer?" when a FIRED research cannot be routed; the
+    watchdog asks it after a SIGN-IN auto-start could not. The scripts share no
+    module, so nothing but a test stops them drifting into two voices.
+
+    ⛔⛔ AND THE FIRST VERSION OF THIS TEST WAS WRONG TWICE, both found by
+    cross-verification.
+
+    It searched the RAW FILE for "research computers — which should run ", and the
+    watchdog contains that phrase in a COMMENT explaining the empty-list case — so
+    the assertion passed against prose and would have kept passing with the code
+    deleted. That is exactly what `conftest.code_only` exists for, and this test did
+    not use it.
+
+    ⭐ And the claim itself was too strong: the two sentences DO differ, on purpose.
+    The run path ends "which should run this?" because the person just fired it and
+    the object is obvious; the sign-in path ends "which should run “<topic>”?"
+    because it is telling somebody what has been waiting. Naming the topic is
+    better there, so this pins what must genuinely match — the stem of the question
+    and the form of the answer — and lets the object differ.
+    """
     from pathlib import Path
-    client = (Path(poll.__file__).parent / "sr.py").read_text(encoding="utf-8")
-    watchdog = Path(poll.__file__).read_text(encoding="utf-8")
-    shared = "research computers — which should run "
-    assert shared in client, "sr.py no longer asks it this way"
-    assert shared in watchdog, "the watchdog drifted from sr.py's wording"
+    from conftest import code_only
+    client = code_only((Path(poll.__file__).parent / "sr.py").read_text(encoding="utf-8"))
+    watchdog = code_only(Path(poll.__file__).read_text(encoding="utf-8"))
+    stem = "research computers — which should run "
+    assert stem in client, "sr.py no longer asks it this way"
+    assert stem in watchdog, "the watchdog drifted from sr.py's wording"
+    # The answer form is the half a person acts on, and it must be identical.
+    assert 'Just say: use “' in client
+    assert 'Just say: use “' in watchdog
+
+
+def test_the_watchdog_names_the_waiting_topic_and_the_run_path_does_not():
+    """The deliberate difference, pinned so it stays deliberate. If either one
+    drifts onto the other's object, this says so instead of the parity test above
+    quietly widening to accept it."""
+    line = poll._signed_in_line({
+        "email": "e@x.y", "needsDeviceChoice": True, "topic": "Golden Retriever",
+        "pendingTopic": "", "devices": [{"id": "d1", "name": "Office PC"}],
+    })
+    assert "which should run “Golden Retriever”?" in line, line
+    assert "which should run this?" not in line, line
 
 
 def test_the_device_name_rungs_match_the_client():

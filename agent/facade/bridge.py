@@ -609,8 +609,6 @@ def _autostart_pick_device(fs: FirestoreRest,
     the announce can NAME them instead of saying "reply yes". Raises
     ``_NoResearchNode`` when the account has NO device (→ the pair-a-node prompt)."""
     devs = fs.list_devices(sess.uid)
-    if not devs:
-        raise _NoResearchNode()
     by_id = {d.get("id"): d for d in devs if d.get("id")}
     device_id, reason, stale = _pick_device_from(devs, prefs.get_selected_device(sess.uid))
     if stale:
@@ -1068,12 +1066,14 @@ class BridgeState:
     def set_session(self, sess: AccountSession | None) -> None:
         with self._lock:
             self._session = sess
-            # A sign-out invalidates any not-yet-delivered "signed in" announce.
-            # ⛔ KEPT FOR THE TESTS THAT USE IT, AND NOT THE PRODUCTION PATH:
-            # `set_session(None)` has no non-test callers. A real sign-out reaches
-            # `clear_session_if`, which does the disk-backed clear.
-            if sess is None:
-                self._signed_in = None
+        if sess is None:
+            # ⛔⛔ THIS USED TO NULL THE ATTRIBUTE AND NOTHING ELSE, while a comment
+            # beside it said a sign-out "invalidates any not-yet-delivered announce".
+            # It did not: the very next `peek_signed_in` rehydrates the event off
+            # disk and re-warms the cache, so the announce came straight back.
+            # Cross-verification measured it. A partial clear is worse than none,
+            # because the comment made it look handled.
+            self.clear_signed_in()
 
     @property
     def signed_in(self) -> dict | None:
@@ -2150,6 +2150,33 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
 
         def _login_remote_start(self) -> None:
             body = self._read_json()
+            # ⛔⛔ THE OTHER DOOR, AND IT WAS UNCOVERED. Cross-verification found that
+            # closing the theft on /login/remote/pending left this one open: a start
+            # mints a fresh flow and replaces the held topic AND origin outright, so
+            # chat B firing a research while chat A's link is unapproved voids A's
+            # request and A's destination together.
+            #
+            # ⚠ THE RULE HERE IS DELIBERATELY WEAKER THAN /pending's, and the
+            # asymmetry is the point rather than an oversight. This route is ALSO
+            # the recovery door — "send me a fresh sign-in link" — and the terminal
+            # reaches it with no origin at all. So /pending demands proof of
+            # identity and refuses without it; this one refuses only when the caller
+            # PROVES it is somebody else. An origin-less start still replaces the
+            # flow, because that is a person starting over on their own machine and
+            # there is no way to tell them from themselves.
+            incoming = body.get("origin")
+            if isinstance(incoming, dict):
+                with state.remote_lock:
+                    held = state.remote
+                    if (held is not None and held.state == "pending"
+                            and (held.pending_topic or "").strip()
+                            and isinstance(held.origin, dict)
+                            and not _same_origin(held.origin, incoming)):
+                        self._json(409, {"reason": "topic_taken",
+                                         "error": "another chat is already signing in "
+                                                  "with a research waiting — ask again "
+                                                  "once that finishes"})
+                        return
             try:
                 flow = devicelogin.start(
                     label=str(body.get("label", "")), runtime=str(body.get("runtime", ""))
@@ -2236,8 +2263,27 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 if flow is None or flow.state != "pending":
                     self._json(409, {"error": "no sign-in in progress"})
                     return
+                # ⛔⛔ REPLACING A HELD TOPIC REQUIRES PROVING YOU ARE THE CHAT
+                # THAT SET IT, and the first version of this guard asked for far
+                # less — it wanted an incoming origin AND a held origin AND a
+                # mismatch. Cross-verification broke it in two ways, and the first
+                # was worse than the bug it was written for:
+                #
+                #   • B posts with NO origin -> `isinstance(origin, dict)` is
+                #     false, the guard is skipped, and B's TOPIC lands on A's
+                #     ORIGIN. The announce then goes to chat A carrying chat B's
+                #     research, and B's research is what starts. Reproduced
+                #     against the live route, not reasoned about.
+                #   • A held a topic with no origin (the legacy origin-less
+                #     gateway) -> `isinstance(flow.origin, dict)` is false and B
+                #     took both fields.
+                #
+                # So the test is the other way round now: something is held, and
+                # the caller cannot PROVE it is the same conversation. Absent
+                # proof, refuse. That costs an origin-less chat the ability to
+                # correct its own topic — a real cost, and a smaller one than
+                # handing somebody else's request to the wrong person in silence.
                 if ((flow.pending_topic or "").strip()
-                        and isinstance(origin, dict) and isinstance(flow.origin, dict)
                         and not _same_origin(flow.origin, origin)):
                     self._json(409, {"reason": "topic_taken",
                                      "error": "this sign-in is already carrying a "

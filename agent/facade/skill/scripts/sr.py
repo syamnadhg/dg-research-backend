@@ -891,7 +891,20 @@ def cmd_research(args) -> int:
             if sc == 200 and sbody.get("remoteLogin") == "pending":
                 # A sign-in is already in flight — attach the topic to it (don't mint
                 # a fresh flow, which would void the link they're about to approve).
-                _post("/login/remote/pending", stash)
+                pc, pbody = _post("/login/remote/pending", stash)
+                # ⛔⛔ THE REPLY IS READ NOW, AND THE FIRST VERSION DISCARDED IT.
+                # The bridge refuses when the sign-in already carries somebody
+                # else's research (`topic_taken`), and with the reply thrown away
+                # this branch went straight on to promise "I'll pick this up" —
+                # then nothing ever came. That is the same silent loss the refusal
+                # exists to prevent, moved one layer out: two 200-shaped outcomes,
+                # one of them a lie.
+                if pc == 409 and pbody.get("reason") == "topic_taken":
+                    return _emit(pbody, args.json, [
+                        "Someone is already signing in on this account with a "
+                        "research waiting, so I can't add yours to it yet.",
+                        "Ask me again once that sign-in finishes and I'll start it.",
+                    ], _fail_code(pc))
                 lines = ["You're almost signed in — finish in your browser and I'll pick this up."]
                 if arm_rc == 0 and arm_lines:
                     lines += _agent_directive_block(arm_lines)
@@ -899,6 +912,17 @@ def cmd_research(args) -> int:
             # No flow yet: start one carrying the topic, hand back the click-to-approve
             # link, and the bridge captures it automatically on approval (#848).
             lc, lbody = _post("/login/remote/start", stash)
+            # ⛔ THE SAME REFUSAL REACHES THIS DOOR TOO. A flow can appear between
+            # the /status read above and this call, and the bridge refuses a start
+            # that would void somebody else's waiting research. Without this the
+            # branch falls through to "tell me to log you in", which is neither
+            # true nor the next step.
+            if lc == 409 and lbody.get("reason") == "topic_taken":
+                return _emit(lbody, args.json, [
+                    "Someone is already signing in on this account with a research "
+                    "waiting, so I can't start yours yet.",
+                    "Ask me again once that sign-in finishes.",
+                ], _fail_code(lc))
             link = lbody.get("verifyUrl") if lc == 200 else None
             if link:
                 lines = [

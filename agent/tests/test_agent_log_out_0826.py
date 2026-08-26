@@ -62,8 +62,8 @@ def test_the_switch_is_off_when_the_variable_is_absent(monkeypatch):
 def test_serve_honours_the_switch_with_no_flag_on_the_command_line(monkeypatch):
     """⛔⛔ THE WHOLE POINT. The pinned launcher runs `main(['serve'])`, so
     `args.verbose` is False on every autostarted bridge and always will be. Without
-    the `or config.VERBOSE` half, the switch would exist and change nothing on the
-    only install that matters."""
+    the `or` halves, the switch would exist and change nothing on the only install
+    that matters."""
     seen = {}
     monkeypatch.setattr(cli, "_delegate_lifecycle", lambda *a, **k: None)
     monkeypatch.setattr(cli.autostart, "is_installed", lambda: True)
@@ -74,6 +74,65 @@ def test_serve_honours_the_switch_with_no_flag_on_the_command_line(monkeypatch):
     cli.cmd_serve(argparse.Namespace(verbose=False))
     assert seen["verbose"] is True
     assert seen["to_file"] is True
+
+
+def test_serve_honours_the_PREF_which_is_the_only_one_a_pinned_bridge_can_see(monkeypatch):
+    """⛔⛔ THE ENVIRONMENT VARIABLE DOES NOT REACH THE PINNED BRIDGE, and that was
+    found by cross-verification AFTER it shipped as the fix for exactly this.
+    `autostart.py` writes NO environment into any of the three launchers — the
+    generated plist has no `EnvironmentVariables` key and the unit has no
+    `Environment=` — and a LaunchAgent inherits no shell profile. So the variable
+    reaches a foreground `agent serve` and nothing else. The pref reaches the bridge
+    because the bridge reads that file itself, whoever started it."""
+    seen = {}
+    monkeypatch.setattr(cli, "_delegate_lifecycle", lambda *a, **k: None)
+    monkeypatch.setattr(cli.autostart, "is_installed", lambda: True)
+    monkeypatch.setattr(cli.bridge, "serve", lambda: None)
+    monkeypatch.setattr(cli.logsetup, "configure",
+                        lambda verbose=False, **kw: seen.update(verbose=verbose, **kw))
+    monkeypatch.setattr(cli.config, "VERBOSE", False)
+    monkeypatch.setattr(cli.prefs, "get_verbose", lambda: True)
+    cli.cmd_serve(argparse.Namespace(verbose=False))
+    assert seen["verbose"] is True
+
+
+def test_no_launcher_passes_the_verbosity_variable_so_the_pref_is_load_bearing():
+    """⛔ THE MEASUREMENT THIS ALL RESTS ON, asserted rather than remembered.
+
+    ⚠ AND THE FIRST VERSION OF THIS TEST OVERSTATED IT, copying a claim that the
+    launcher writes NO environment at all. It does: the systemd unit sets
+    `Environment="XDG_RUNTIME_DIR=/run/user/%U"`, which its own comment calls
+    load-bearing for self-update. What is true — and what actually matters — is
+    narrower: **no launcher passes SUPER_AGENT_VERBOSE.** The macOS plist has no
+    `EnvironmentVariables` key at all, so nothing reaches it there; the systemd unit
+    passes exactly one variable and this is not it. An assertion that overstates its
+    subject fails for the wrong reason, which is how a real regression gets waved
+    through as a known false alarm."""
+    from conftest import code_only
+    src = code_only((Path(cli.__file__).parent / "autostart.py").read_text(encoding="utf-8"))
+    assert "SUPER_AGENT_VERBOSE" not in src, (
+        "a launcher now passes the variable — the pref may no longer be the only road")
+    assert "EnvironmentVariables" not in src, (
+        "the macOS plist now sets an environment — re-check whether the var reaches it")
+
+
+def test_verbose_on_and_off_round_trip():
+    from facade import prefs as _p
+    _p.set_verbose(True)
+    assert _p.get_verbose() is True
+    _p.set_verbose(False)
+    assert _p.get_verbose() is False
+    assert "verbose" not in _p.load(), "off should remove the key, not store a false"
+
+
+@pytest.mark.parametrize("state,rc,want", [
+    ("on", 0, True), ("off", 0, False), ("", 1, False), ("maybe", 1, False),
+])
+def test_the_verbose_command(state, rc, want):
+    from facade import prefs as _p
+    _p.set_verbose(False)
+    assert cli.cmd_verbose(argparse.Namespace(state=state)) == rc
+    assert _p.get_verbose() is want
 
 
 def test_serve_stays_quiet_when_neither_flag_nor_switch_is_set(monkeypatch):
@@ -100,12 +159,27 @@ def test_the_command_line_flag_still_wins_on_its_own(monkeypatch):
     assert seen["verbose"] is True
 
 
-def test_verbose_actually_lowers_the_level(tmp_path):
-    """The switch is worthless if it does not reach the handler. Pinned by the
-    level, not by the argument."""
-    logsetup.configure(verbose=True, to_file=True, log_file=tmp_path / "b.log")
+def test_verbose_actually_lowers_the_FILE_handlers_level(tmp_path):
+    """⛔ THE FILE HANDLER, NOT JUST THE LOGGER — and the first version of this test
+    checked only the logger. The half that matters is the handler writing the file
+    somebody is going to send: a logger at DEBUG feeding a handler still at INFO
+    would satisfy the old assertion and write exactly the same log."""
+    from logging.handlers import RotatingFileHandler
+    path = tmp_path / "b.log"
+    logsetup.configure(verbose=True, to_file=True, log_file=path)
     try:
-        assert logging.getLogger("facade").level == logging.DEBUG
+        logger = logging.getLogger("facade")
+        assert logger.level == logging.DEBUG
+        files = [h for h in logger.handlers if isinstance(h, RotatingFileHandler)]
+        assert files, "no file handler was installed at all"
+        assert files[0].level == logging.DEBUG, (
+            "the logger is verbose and the file is not — the log a person sends is "
+            "unchanged")
+        # And the complement, so the level is pinned in both directions.
+        logsetup.configure(verbose=False, to_file=True, log_file=path)
+        files = [h for h in logging.getLogger("facade").handlers
+                 if isinstance(h, RotatingFileHandler)]
+        assert files[0].level == logging.INFO
     finally:
         logsetup.configure(verbose=False, to_file=False)
 
@@ -184,14 +258,22 @@ def test_doctor_says_the_log_is_not_in_a_support_bundle(monkeypatch, tmp_path):
 
 
 def test_doctor_says_how_to_make_the_log_say_more(monkeypatch, tmp_path):
+    """⛔⛔ IT USED TO NAME THE ENVIRONMENT VARIABLE, which is unactionable on the
+    recommended install — the launcher passes no such variable, so a person who
+    followed that instruction would set it, restart, and find nothing changed. That
+    is worse than saying nothing, because they stop looking for the real answer."""
+    monkeypatch.setattr(cli.prefs, "get_verbose", lambda: False)
     out = _doctor_output(monkeypatch, bridge_up=True, log_bytes=b"x", tmp_path=tmp_path)
-    assert "SUPER_AGENT_VERBOSE=1" in out
+    assert "verbose on" in out
+    assert "SUPER_AGENT_VERBOSE" not in out, (
+        "doctor is telling people to set a variable the bridge cannot see")
 
 
-def test_doctor_stops_advertising_the_switch_once_it_is_on(monkeypatch, tmp_path):
-    out = _doctor_output(monkeypatch, bridge_up=True, log_bytes=b"x",
-                         tmp_path=tmp_path, verbose=True)
-    assert "SUPER_AGENT_VERBOSE=1" not in out
+def test_doctor_says_so_when_detailed_logging_is_already_on(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli.prefs, "get_verbose", lambda: True)
+    out = _doctor_output(monkeypatch, bridge_up=True, log_bytes=b"x", tmp_path=tmp_path)
+    assert "detailed logging is ON" in out
+    assert "verbose off" in out, "no way back is offered"
 
 
 def test_doctor_does_not_name_a_command_that_cannot_help(monkeypatch, tmp_path):

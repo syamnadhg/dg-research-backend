@@ -249,6 +249,59 @@ def test_research_when_signin_in_flight_says_approve_in_browser(monkeypatch, cap
         httpd.server_close()
 
 
+def test_a_refused_topic_is_RELAYED_and_never_promised(monkeypatch, capsys):
+    """⛔⛔ THE REFUSAL EXISTS TO STOP A REQUEST BEING LOST IN SILENCE, and the first
+    version of it created a new silence one layer out. The bridge refuses to attach
+    a topic to a sign-in that already carries somebody else's; this client DISCARDED
+    that reply and went straight on to "You're almost signed in — I'll pick this
+    up." Nothing ever came. Two 200-shaped outcomes, one of them a promise nobody
+    could keep — which is the same defect, relocated."""
+    monkeypatch.setattr(sr, "_get", lambda path, **kw: (200, {"remoteLogin": "pending"})
+                        if path == "/status" else (200, {}))
+    monkeypatch.setattr(sr, "_prepare_stream_arm", lambda: ([], {}, 0))
+    posts = []
+
+    def _post(path, body=None):
+        posts.append(path)
+        if path == "/research":
+            return 401, {"error": "not signed in"}
+        if path == "/login/remote/pending":
+            return 409, {"reason": "topic_taken", "error": "already carrying one"}
+        return 200, {}
+
+    monkeypatch.setattr(sr, "_post", _post)
+    rc = sr.main(["research", "Golden retriever"])
+    out = capsys.readouterr().out.lower()
+    assert rc != 0
+    assert "already signing in" in out, out
+    assert "pick this up" not in out, ("it promised to run a research it was refused", out)
+    assert "ask me again" in out, out
+
+
+def test_a_refusal_on_the_START_door_is_relayed_too(monkeypatch, capsys):
+    """A flow can appear between the status read and the start, and the bridge
+    refuses a start that would void somebody else's waiting research. Without this
+    the branch falls through to "tell me to log you in", which is neither true nor
+    the next step."""
+    monkeypatch.setattr(sr, "_get", lambda path, **kw: (200, {"remoteLogin": None})
+                        if path == "/status" else (200, {}))
+    monkeypatch.setattr(sr, "_prepare_stream_arm", lambda: ([], {}, 0))
+
+    def _post(path, body=None):
+        if path == "/research":
+            return 401, {"error": "not signed in"}
+        if path == "/login/remote/start":
+            return 409, {"reason": "topic_taken", "error": "already carrying one"}
+        return 200, {}
+
+    monkeypatch.setattr(sr, "_post", _post)
+    rc = sr.main(["research", "Golden retriever"])
+    out = capsys.readouterr().out.lower()
+    assert rc != 0
+    assert "already signing in" in out, out
+    assert "log in here" not in out, out
+
+
 def test_login_arms_watchdog_and_passes_origin(monkeypatch, capsys):
     # /sr login arms this chat's watchdog so the bridge's "✓ signed in" announce
     # posts proactively on capture, and passes the chat origin so it's scoped.

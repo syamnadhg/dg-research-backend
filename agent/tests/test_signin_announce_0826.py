@@ -579,6 +579,115 @@ def test_a_flow_with_an_origin_but_no_topic_still_accepts_one(monkeypatch):
         httpd.server_close()
 
 
+def test_a_second_chat_cannot_steal_by_OMITTING_its_origin(monkeypatch):
+    """⛔⛔ THE FIRST VERSION OF THE GUARD MADE THIS WORSE THAN THE BUG, and only
+    cross-verification found it. It required an incoming origin, so B posting with
+    NONE skipped the guard entirely: B's TOPIC landed on A's ORIGIN, and the
+    announce then went to chat A carrying chat B's research while B's research was
+    what actually started. Two 200s and a request delivered to the wrong person."""
+    base, state, httpd = _live(monkeypatch)
+    try:
+        a = {"platform": "telegram", "chat_id": "111"}
+        flow = _arm_pending(state, topic="A's research", origin=a)
+        r = requests.post(base + "/login/remote/pending",
+                          json={"pending_topic": "B's research"})
+        assert r.status_code == 409, r.text
+        assert flow.pending_topic == "A's research"
+        assert flow.origin == a
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_a_held_topic_with_no_origin_is_still_protected(monkeypatch):
+    """⛔ The legacy origin-less gateway. The old guard required a HELD origin too,
+    so a topic set by a chat that supplied none could be taken outright — the
+    ordinary case on any deployment whose gateway does not pass one."""
+    base, state, httpd = _live(monkeypatch)
+    try:
+        flow = _arm_pending(state, topic="A's research", origin=None)
+        r = requests.post(base + "/login/remote/pending", json={
+            "pending_topic": "B's research",
+            "origin": {"platform": "whatsapp", "chat_id": "222"}})
+        assert r.status_code == 409, r.text
+        assert flow.pending_topic == "A's research"
+        assert flow.origin is None
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_a_second_chat_cannot_steal_through_the_start_door_either(monkeypatch):
+    """⛔⛔ THE OTHER DOOR, AND CLOSING /pending LEFT IT OPEN. `/login/remote/start`
+    mints a fresh flow and replaces the held topic AND origin outright, so chat B
+    firing a research while chat A's link is still unapproved voided A's request and
+    A's destination together — through a route the client reaches on its own."""
+    base, state, httpd = _live(monkeypatch)
+    try:
+        a = {"platform": "telegram", "chat_id": "111"}
+        flow = _arm_pending(state, topic="A's research", origin=a)
+        r = requests.post(base + "/login/remote/start", json={
+            "pending_topic": "B's research",
+            "origin": {"platform": "whatsapp", "chat_id": "222"}})
+        assert r.status_code == 409, r.text
+        assert r.json()["reason"] == "topic_taken"
+        assert state.remote is flow, "A's pending flow was replaced"
+        assert flow.pending_topic == "A's research"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_an_origin_less_start_may_still_replace_the_flow(monkeypatch):
+    """⚠ THE ASYMMETRY IS DELIBERATE. This route is also the RECOVERY door — "send
+    me a fresh sign-in link" — and the terminal reaches it with no origin at all. So
+    /pending demands proof of identity and refuses without it, while this one
+    refuses only a caller that PROVES it is somebody else. Pinned, so the weaker
+    rule stays a choice rather than becoming an oversight."""
+    base, state, httpd = _live(monkeypatch)
+    try:
+        monkeypatch.setattr(bridge.devicelogin, "start",
+                            lambda label="", runtime="": {
+                                "code": "AAAA1111", "pollToken": "p",
+                                "verifyUrl": "u", "expiresIn": 600})
+        held = _arm_pending(state, topic="A's research",
+                            origin={"platform": "telegram", "chat_id": "111"})
+        r = requests.post(base + "/login/remote/start", json={"runtime": "", "label": ""})
+        assert r.status_code == 200, r.text
+        assert state.remote is not held, "it did not mint a fresh flow"
+        assert not state.remote.pending_topic
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_a_sign_out_through_set_session_reaches_the_disk(monkeypatch):
+    """⛔⛔ IT USED TO NULL THE ATTRIBUTE AND NOTHING ELSE, beside a comment claiming
+    a sign-out invalidates the announce. The next peek rehydrated it straight off
+    disk and re-warmed the cache. A partial clear is worse than no clear, because
+    the comment made it look handled."""
+    state = bridge.BridgeState()
+    state.set_signed_in({"ts": 3, "uid": "u1", "email": "e@x.y"})
+    state.set_session(None)
+    assert state.peek_signed_in("u1") is None
+    assert bridge.BridgeState().peek_signed_in("u1") is None
+
+
+def test_a_dead_selection_is_dropped_even_with_no_devices_left(monkeypatch):
+    """⛔ The sign-in path used to `raise _NoResearchNode()` on an empty device list
+    BEFORE it reached the stale-selection clear, so somebody whose last computer was
+    removed kept a saved pick pointing at it — re-derived by every later sign-in.
+    Removing that early return fixed this AND a guard below it that could not fire."""
+    cleared = {"n": 0}
+    monkeypatch.setattr(prefs, "get_selected_device", lambda uid: "gone")
+    monkeypatch.setattr(prefs, "clear_selected_device",
+                        lambda: cleared.__setitem__("n", cleared["n"] + 1))
+    FakeFS.devices = []
+    with pytest.raises(bridge._NoResearchNode):
+        bridge._autostart_pick_device(FakeFS("t"), _sess())
+    assert cleared["n"] == 1, "the dead pick survived an account with no devices"
+
+
 @pytest.mark.parametrize("a,b,same", [
     ({"platform": "telegram", "chat_id": "1"}, {"platform": "TELEGRAM", "chat_id": "1"}, True),
     ({"platform": "telegram", "chat_id": "1"}, {"platform": "telegram", "chat_id": "2"}, False),

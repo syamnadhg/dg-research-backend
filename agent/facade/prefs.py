@@ -41,6 +41,7 @@ _RUNTIME_DISTRO = "runtimeDistro"      # LEGACY: a WSL distro name written by th
 #                                        pre-Model-A connect; no longer written
 #                                        (a WSL runtime now connects in-distro),
 #                                        only swept by clear_runtime for old prefs.
+_VERBOSE = "verbose"
 _INSTALL_ID = "installId"
 _LABEL = "agentLabel"
 # The one-shot "just signed in" announce, parked on DISK so a bridge restart
@@ -129,6 +130,38 @@ def clear_selected_device() -> None:
         popped = [prefs.pop(k, None) for k in (_SELECTED_DEVICE, _SELECTED_UID)]
         if any(v is not None for v in popped):
             save(prefs)
+
+
+def get_verbose() -> bool:
+    """Whether the bridge should log at DEBUG.
+
+    ⛔⛔ THIS EXISTS BECAUSE THE ENVIRONMENT VARIABLE COULD NOT REACH THE BRIDGE,
+    and that was found by cross-verification AFTER `SUPER_AGENT_VERBOSE` shipped as
+    the fix for exactly this problem. The always-on bridge is started by launchd, by
+    systemd, or by a scheduled task — and `autostart.py` writes NO environment into
+    any of them: the generated plist has no `EnvironmentVariables` key and the unit
+    has no `Environment=`. A LaunchAgent does not inherit a shell profile, so
+    `export SUPER_AGENT_VERBOSE=1` reaches a foreground `agent serve` and nothing
+    else. The switch was real, documented, printed by `agent doctor` — and inert on
+    the recommended install, which is the only one that matters.
+
+    ⭐ A PREF REACHES IT BECAUSE THE BRIDGE READS THIS FILE ITSELF, whoever started
+    it. `agent verbose on` writes it; the next bridge start picks it up. The env var
+    is kept as well: it is the right tool for a one-off foreground run, and on
+    Windows a user-level variable does reach a scheduled task.
+    """
+    return bool(load().get(_VERBOSE))
+
+
+def set_verbose(on: bool) -> None:
+    """Turn detailed logging on or off for the next bridge start."""
+    with _lock:
+        prefs = load()
+        if on:
+            prefs[_VERBOSE] = True
+        elif prefs.pop(_VERBOSE, None) is None:
+            return
+        save(prefs)
 
 
 def get_pending_announce(uid: str) -> dict[str, Any] | None:

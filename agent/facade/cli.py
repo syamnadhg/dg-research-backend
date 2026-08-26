@@ -102,11 +102,17 @@ def cmd_serve(args: argparse.Namespace) -> int:
         return rc
     # The long-running bridge writes the durable operational log; short CLI
     # commands stay console-only (configured in main()).
-    # ⛔ `or config.VERBOSE` is the load-bearing half: the pinned launcher runs
-    # `main(['serve'])` with no flag, so on every autostarted bridge — the
-    # recommended install — `args.verbose` is False and always will be.
-    logsetup.configure(verbose=getattr(args, "verbose", False) or config.VERBOSE,
-                       to_file=True)
+    # ⛔⛔ THREE SOURCES, AND THE PREF IS THE ONLY ONE THAT REACHES A PINNED BRIDGE.
+    # The flag needs a command line the generated launcher does not have; the
+    # environment variable needs an environment `autostart.py` never writes — no
+    # `EnvironmentVariables` in the plist, no `Environment=` in the unit — and a
+    # LaunchAgent inherits no shell profile. Both were shipped as the fix for this
+    # and both are inert on the recommended install. `agent verbose on` writes the
+    # pref, and the bridge reads that file itself whoever started it.
+    logsetup.configure(
+        verbose=(getattr(args, "verbose", False) or config.VERBOSE
+                 or prefs.get_verbose()),
+        to_file=True)
     # Foreground serve — nudge toward the always-up background mode unless it's
     # already pinned. (When autostart launches serve windowless this is a no-op:
     # the task exists, so is_installed() is True and the tip is skipped.)
@@ -1137,6 +1143,28 @@ def _doctor_row(label: str, ok_flag: bool, detail: str, warn_only: bool = False)
     print(f"  {b.c(color, mark)}  {label.ljust(10)}{detail}")
 
 
+def cmd_verbose(args: argparse.Namespace) -> int:
+    """Turn detailed logging on or off for the next bridge start.
+
+    ⛔ A COMMAND AND NOT AN ENVIRONMENT VARIABLE, because the variable cannot reach
+    the bridge people actually run. See `prefs.get_verbose` for the measurement.
+    """
+    want = (getattr(args, "state", "") or "").strip().lower()
+    if want not in ("on", "off"):
+        b.no("Say which:  agent verbose on   |   agent verbose off")
+        return 1
+    prefs.set_verbose(want == "on")
+    if want == "on":
+        b.ok("Detailed logging is ON for the next bridge start.")
+        b.dim(f"    It writes to {config.log_path()}")
+        b.dim("    Restart the bridge to pick it up:  superresearch-agent resurrect")
+        b.dim("    Turn it off again with:  superresearch-agent verbose off")
+    else:
+        b.ok("Detailed logging is OFF for the next bridge start.")
+        b.dim("    Restart the bridge to pick it up:  superresearch-agent resurrect")
+    return 0
+
+
 def _doctor_log_row() -> None:
     """Where the agent's own log lives, whether anything is in it, and how to make
     it say more.
@@ -1174,8 +1202,15 @@ def _doctor_log_row() -> None:
         detail = f"{path}  ({size // 1024} KB)"
     _doctor_row("log", size is not None, detail, warn_only=size is None)
     b.dim("              not sent with a support bundle — this file stays on this host")
-    if not config.VERBOSE:
-        b.dim("              for more detail:  SUPER_AGENT_VERBOSE=1, then restart the bridge")
+    # ⛔ THE COMMAND, NOT THE VARIABLE. This line used to name SUPER_AGENT_VERBOSE,
+    # which is unactionable on the recommended install: the launcher writes no
+    # environment, so a variable set in a shell profile never reaches the bridge it
+    # starts. Telling somebody to do a thing that cannot work is worse than telling
+    # them nothing, because they stop looking for the real answer.
+    if not (config.VERBOSE or prefs.get_verbose()):
+        b.dim("              for more detail:  superresearch-agent verbose on")
+    else:
+        b.dim("              detailed logging is ON (superresearch-agent verbose off)")
 
 
 def cmd_doctor(_args: argparse.Namespace) -> int:
@@ -2091,6 +2126,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("logout", parents=[common], help="clear the account session").set_defaults(func=cmd_logout)
     sub.add_parser("doctor", parents=[common], help="run health + connectivity diagnostics").set_defaults(func=cmd_doctor)
+    vb = sub.add_parser("verbose", parents=[common],
+                        help="turn detailed bridge logging on or off")
+    vb.add_argument("state", nargs="?", default="",
+                    help="on | off")
+    vb.set_defaults(func=cmd_verbose)
 
     rs = sub.add_parser("research", parents=[common], help="start a research run")
     rs.add_argument("topic", help="the research topic")
