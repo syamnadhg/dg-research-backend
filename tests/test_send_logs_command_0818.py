@@ -1004,6 +1004,21 @@ class TestConsentScope:
         assert any("whatever number you pick" in l for l in lines)
 
     def test_the_lines_the_number_does_not_govern_never_change(self):
-        a = research._send_logs_consent_lines(3)
-        b = research._send_logs_consent_lines(17)
-        assert a[1:-1] == b[1:-1]
+        """⛔⛔ SELECTED BY CONTENT, NOT BY POSITION — and it used to be `[1:-1]`,
+        which broke the day a line was appended. The slice was a positional
+        guess about which entries vary with the count: the first (the run line)
+        and the last (the ⚠ note, which quotes the number). When the retention
+        line arrived at the end on 2026-08-26, the ⚠ note moved to -2 and got
+        compared, so the test failed on a line that has always varied — a
+        correct assertion made wrong by arithmetic. Naming what varies is the
+        only version of this that survives the list growing."""
+        def fixed(runs: int) -> "list[str]":
+            lines = research._send_logs_consent_lines(runs)
+            # The run line always leads; the ⚠ note names the number wherever it
+            # sits. Everything else must be identical for any count.
+            return [l for l in lines[1:] if "only the first line" not in l]
+
+        assert fixed(3) == fixed(17)
+        # ⛔ And the filter must not have eaten the whole list, which would make
+        # the comparison above pass by comparing nothing.
+        assert len(fixed(3)) >= 6, fixed(3)

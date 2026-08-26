@@ -1782,13 +1782,20 @@ def cmd_send_logs(args: argparse.Namespace) -> int:
     print("Also going, from the runs you picked: links that open those results — "
           "anyone holding one can read them; the email address on your account; "
           "and what the agent screens showed while those runs were working.")
-    # ⛔⛔ NO "DELETED AFTER 30 DAYS" LINE, AND THAT IS DELIBERATE. The web app
-    # refuses to say it for a measured reason — `sendLogsCopy.ts` states it
-    # twice: no bucket lifecycle rule exists, so the sentence would be a promise
-    # nothing keeps. This surface said it anyway when it was first written, in
-    # three places, which made an untrue retention claim in the one screen whose
-    # whole job is to be true about what leaves a computer. It arrives with the
-    # rule, not before it — see wave 8M.
+    # ✅ THE RETENTION LINE ARRIVED 2026-08-26, WITH THE RULE AND NOT BEFORE IT.
+    # This surface printed it when it was first written, in three places, while
+    # no bucket lifecycle rule existed anywhere — an untrue retention claim in
+    # the one screen whose whole job is to be true about what leaves a computer.
+    # It was removed, and held out until the rule was applied AND read back by
+    # two tools (the ship-time runbook, §1 `verified:`). That gap is the whole
+    # point: the sentence is identical, and only one version of it was honest.
+    #
+    # ⛔ IT IS ABOUT THE LOGS, NOT ABOUT THE RECORD. The rule deletes the bundle
+    # in the bucket. The index row that names it survives — its own TTL was
+    # never deployed — but the rules bound that row to a code, a device, a
+    # status, counts and timestamps, so it carries nothing from the logs. Say
+    # the material goes; do not extend it to "we keep no record".
+    print("It is deleted automatically 30 days after it arrives.")
     print("Only Super Research support can read them.")
 
     # ⛔ The plan above is printed unconditionally; only the ASKING is skipped.

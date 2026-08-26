@@ -133,19 +133,23 @@ def test_the_plan_names_everything_the_apps_modal_names(wire) -> None:
     assert "agent screens showed" in out, "what the screens showed while running"
 
 
-def test_the_plan_does_not_promise_a_retention_nothing_keeps(wire) -> None:
-    """⛔⛔ THE APP REFUSES THIS SENTENCE ON PURPOSE and says so twice in
-    `sendLogsCopy.ts`: no bucket lifecycle rule exists, so "deleted after 30
-    days" is a promise nothing keeps. This surface shipped it anyway on its
-    first day, in three places — an untrue retention claim on the one screen
-    whose entire job is to be true about what leaves somebody's computer.
+def test_the_plan_promises_a_retention_that_a_rule_now_keeps(wire) -> None:
+    """✅ INVERTED 2026-08-26 — the sentence arrived with its rule.
 
-    ⭐ Asserted as an ABSENCE across the whole output, because this is the kind
-    of sentence a future edit re-adds while "improving the copy". It arrives
-    with the rule (wave 8M), not before it."""
+    ⛔⛔ Every client refused it until then, and `sendLogsCopy.ts` said so twice:
+    no bucket lifecycle rule existed, so "deleted after 30 days" was a promise
+    nothing kept. This surface shipped it anyway on its first day, in THREE
+    places — an untrue retention claim on the one screen whose entire job is to
+    be true about what leaves somebody's computer. The rule is live on the
+    `logs/` prefix now and was read back by two independent tools first.
+
+    ⚠ THIS WAS THE THIRD ABSENCE PIN ON ONE SENTENCE, in two files, and the
+    other two were found before it — this one only surfaced when the suite went
+    red. Three guards for one string is not over-testing; it is what happens
+    when the same false claim has to be removed from three places, and it is
+    also why inverting "the" pin is never a single edit."""
     _, out = _run(_args())
-    for claim in ("30 days", "thirty days", "deleted after"):
-        assert claim not in out.lower(), f"promises a retention nothing keeps: {claim}"
+    assert "deleted automatically 30 days after it arrives" in out
 
 
 def test_the_plan_still_says_who_can_read_them(wire) -> None:
@@ -644,20 +648,43 @@ def test_no_client_calls_the_research_computer_this_one() -> None:
                 f"{name} calls the research computer 'this' one — it is 'that computer'")
 
 
-def test_neither_client_carries_the_retention_promise_in_source() -> None:
-    """⛔ Both clients said it, and both were wrong the same way. Pinned at the
-    SOURCE as well as in the output, because the two files are separate copies
-    (the chat client is stdlib-only and cannot import the other) — so a fix in
-    one is not a fix in the other, which is exactly how it got in twice."""
+def test_both_clients_now_carry_the_retention_PROMISE_in_source() -> None:
+    """✅ INVERTED 2026-08-26 — the rule exists, so the sentence may exist.
+
+    ⛔ Both clients once said it while no bucket lifecycle rule existed anywhere,
+    and both were wrong the same way. Pinned at the SOURCE as well as in the
+    output, because the two files are separate copies (the chat client is
+    stdlib-only and cannot import the other) — so a fix in one is not a fix in
+    the other, which is exactly how it got in twice, and now exactly how it
+    could go missing from one.
+
+    ⭐ THE ASSERTION IS ON THE FACT, NOT THE STRING. `sr.py` speaks in
+    contractions and curly punctuation throughout, so demanding byte-equality
+    would force a foreign sentence into the middle of its plan. What may never
+    differ is the number, the clock and the subject."""
     for name, src in (("cli.py", CLI_SRC), ("sr.py", SR_SRC)):
         body = src.split("def cmd_send_logs(", 1)[1]
-        # ⛔ COMMENTS STRIPPED FIRST. The comment explaining WHY the sentence is
-        # absent contains the sentence, so a raw search fails on the very fix it
-        # is guarding — which it did, on the first run. This is the Python twin
-        # of the FE suite's `codeOnly`.
+        # ⛔ COMMENTS STRIPPED FIRST. The comment explaining the sentence quotes
+        # it, so a raw search would pass on the comment alone while the printed
+        # line was gone. This is the Python twin of the FE suite's `codeOnly`.
         code = "\n".join(ln.split("#", 1)[0] for ln in body.splitlines())
-        for claim in ("kept for 30 days", "deleted after 30"):
-            assert claim not in code, f"{name} promises a retention nothing keeps"
+        assert "deleted automatically 30 days after it arrives" in code, (
+            f"{name} no longer tells a person how long their logs are kept")
+
+
+def test_neither_client_widens_deletion_to_the_record() -> None:
+    """⛔⛔ THE RULE DELETES THE OBJECT, NOT THE ROW. The index row that names a
+    bundle is not covered by the lifecycle rule, and its own TTL was measured
+    undeployed on 2026-08-26 — so the receipt outlives the file. It carries no
+    log content, which is what makes the sentence honest; it is not what would
+    make "we keep no record of it" honest."""
+    for name, src in (("cli.py", CLI_SRC), ("sr.py", SR_SRC)):
+        body = src.split("def cmd_send_logs(", 1)[1]
+        code = "\n".join(ln.split("#", 1)[0] for ln in body.splitlines()).lower()
+        for overreach in ("no record", "nothing is kept", "no trace",
+                          "we keep nothing", "erased completely"):
+            assert overreach not in code, (
+                f"{name} claims the record goes too, and it does not")
 
 
 def test_no_failure_sentence_names_a_command_that_cannot_help() -> None:

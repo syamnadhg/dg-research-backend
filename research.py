@@ -73697,12 +73697,25 @@ def _network_verdict(probes: "list[dict]") -> dict:
 # doctor's network verdict are what the person is left holding, and that is a
 # real answer, unlike a spinner.
 
-# ⛔ The 30-day deletion promise is GATED. No bucket lifecycle rule exists in
-# any repo, so until one is applied and read back (the ship-time runbook step),
-# saying "deleted after 30 days" would be a lie of exactly the kind wave 1 spent
-# itself removing. Flip this in the SAME commit as the verified `gcloud storage
-# buckets describe` output, never before.
-BUNDLE_LIFECYCLE_VERIFIED = False
+# ✅ FLIPPED 2026-08-26, WITH THE READ-BACK PASTED IN THE SAME COMMIT — which is
+# the whole protocol this flag exists to enforce. The rule is live on
+# `gs://super-research-492814.firebasestorage.app`: one rule, action Delete,
+# `age` 30, `matchesPrefix` ["logs/"], read back by `gcloud storage buckets
+# describe` and `gsutil lifecycle get` independently. See the ship-time runbook
+# in the front end's ARCHITECTURE.md, §1 `verified:`.
+#
+# ⛔ WHAT THE SENTENCE MAY CLAIM. The rule deletes the OBJECT — the zip, which is
+# the logs. It does not delete the Firestore index row, and that row's own TTL
+# turns out never to have been deployed, so today the receipt outlives the file
+# it names. That is why the line below says the material is deleted and stops
+# there: `firestore.rules` bounds the row to a code, a device id, a status,
+# timestamps, counts and sizes — no log content, no topics, no addresses — so a
+# surviving row is a receipt for something that is gone, not a copy of it.
+#
+# ⛔ IF THE RULE IS EVER REMOVED, FLIP THIS BACK IN THE SAME BREATH. The flag is
+# not a feature switch; it is a claim about a bucket, and the bucket is the only
+# thing that makes the claim true.
+BUNDLE_LIFECYCLE_VERIFIED = True
 
 
 def _send_logs_consent_lines(runs: int = BUNDLE_MAX_RUNS,
@@ -73759,8 +73772,14 @@ def _send_logs_consent_lines(runs: int = BUNDLE_MAX_RUNS,
         if chosen_exactly else
         f"⚠ only the first line above is what the {n}-run choice changes — "
         f"everything else leaves in full whatever number you pick")
+    # ⭐ "AFTER IT ARRIVES", NOT "AFTER 30 DAYS", because the two clocks are
+    # different and only one of them is the bucket's. The lifecycle rule counts
+    # from the moment the object is created — the upload — while the index row's
+    # own `expireAt` is stamped when the row is OPENED, before a byte has moved,
+    # and is never refreshed afterwards. Naming the arrival is the half a person
+    # can check against the support code they were just handed.
     if BUNDLE_LIFECYCLE_VERIFIED:
-        lines.append("and it is deleted automatically after 30 days")
+        lines.append("and it is deleted automatically 30 days after it arrives")
     return lines
 
 

@@ -1270,10 +1270,18 @@ def cmd_send_logs(args) -> int:
                      "results — anyone holding one can read them; the email "
                      "address on the account; and what the agent screens showed "
                      "while those runs were working.")
-        # ⛔⛔ NO "kept for 30 days" HERE EITHER. The web app refuses that
-        # sentence for a measured reason (`sendLogsCopy.ts`, twice): no bucket
-        # lifecycle rule exists, so it is a promise nothing keeps. It arrives
-        # with the rule — wave 8M.
+        # ✅ THE RETENTION LINE ARRIVED 2026-08-26, WITH THE RULE — see the
+        # longer note beside the same line in cli.py.
+        #
+        # ⚠ NOT byte-identical to cli.py's, and that is deliberate rather than
+        # drift: this file speaks in contractions and curly punctuation
+        # throughout ("It’s", "That’s") and cli.py does not, so matching it
+        # character for character would put a foreign sentence in the middle of
+        # this plan. What must NOT differ is the FACT — the same number, the same
+        # clock, the same subject — because a person who asks two clients how
+        # long their logs are kept must not get two answers. The guard therefore
+        # compares the claim, not the string.
+        lines.append("It’s deleted automatically 30 days after it arrives.")
         lines.append(f"That’s {len(names)} run(s), about {_size_words(total)}. "
                      "Only Super Research support can read them.")
         lines.append("Say yes and I’ll send them.")

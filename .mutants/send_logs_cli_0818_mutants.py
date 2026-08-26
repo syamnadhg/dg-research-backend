@@ -61,15 +61,22 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [('        "this computer\'s hostname and the account name you sign into it with",',
        '')],
      [T_CLI]),
-    ("Y3", "over", "⛔⛔ the 30-day deletion promise prints while no bucket "
-     "lifecycle rule exists in any repo — the exact class of lie wave 1 removed",
-     [('    if BUNDLE_LIFECYCLE_VERIFIED:\n        lines.append("and it is deleted automatically after 30 days")',
-       '    lines.append("and it is deleted automatically after 30 days")')],
+    # ⛔ Y3/Y4 RE-POINTED 2026-08-26. The gate FLIPPED — the bucket lifecycle
+    # rule is applied and read back — and the sentence gained "after it
+    # arrives", because the rule counts from the object's creation while the
+    # index row's expireAt is stamped before the upload. Both defects these
+    # mutants guard are unchanged; the flag now reads True, so Y3's "prints
+    # while no rule exists" becomes "prints even if the flag is withdrawn".
+    ("Y3", "over", "⛔⛔ the 30-day deletion promise prints unconditionally, so "
+     "withdrawing the bucket rule would leave the claim standing — the exact "
+     "class of lie wave 1 removed",
+     [('    if BUNDLE_LIFECYCLE_VERIFIED:\n        lines.append("and it is deleted automatically 30 days after it arrives")',
+       '    lines.append("and it is deleted automatically 30 days after it arrives")')],
      [T_CLI]),
-    ("Y4", "under", "the gate ignores its own flag, so flipping it after the "
-     "bucket rule lands changes nothing — a gate that is decoration",
-     [('    if BUNDLE_LIFECYCLE_VERIFIED:\n        lines.append("and it is deleted automatically after 30 days")',
-       '    if False:\n        lines.append("and it is deleted automatically after 30 days")')],
+    ("Y4", "under", "the gate ignores its own flag, so withdrawing the bucket "
+     "rule changes nothing — a gate that is decoration",
+     [('    if BUNDLE_LIFECYCLE_VERIFIED:\n        lines.append("and it is deleted automatically 30 days after it arrives")',
+       '    if False:\n        lines.append("and it is deleted automatically 30 days after it arrives")')],
      [T_CLI]),
     ("Y5", "under", "the prompt is skipped entirely, so the screen becomes a "
      "notice rather than a decision",

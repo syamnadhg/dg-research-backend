@@ -120,19 +120,31 @@ def test_the_plan_names_everything_the_apps_modal_names(wire, capsys) -> None:
     assert "agent screens showed" in out
 
 
-def test_the_plan_does_not_promise_a_retention_nothing_keeps(wire, capsys) -> None:
-    """⛔⛔ THE APP REFUSES THIS SENTENCE ON PURPOSE, and says so twice in
-    `sendLogsCopy.ts`: no bucket lifecycle rule exists, so "deleted after 30
-    days" is a promise nothing keeps. This surface shipped it anyway on its
-    first day — an untrue retention claim on the one screen whose entire job is
-    to be true about what leaves somebody's computer.
+def test_the_plan_promises_a_retention_that_a_rule_now_keeps(wire, capsys) -> None:
+    """✅ INVERTED 2026-08-26 — the sentence arrived with its rule.
 
-    ⭐ Asserted as an ABSENCE, across the whole output, because the sentence is
-    the kind a future edit re-adds while "improving the copy". It arrives with
-    the rule (wave 8M), not before it."""
+    ⛔⛔ Every client refused this sentence until then, and `sendLogsCopy.ts`
+    said so twice: no bucket lifecycle rule existed, so "deleted after 30 days"
+    was a promise nothing kept. This surface shipped it anyway on its first day
+    — an untrue retention claim on the one screen whose entire job is to be true
+    about what leaves somebody's computer. The rule is live on the `logs/`
+    prefix now and was read back by two independent tools before this changed.
+
+    ⭐ Asserted on the OUTPUT, not the source, because a person reads the
+    output — and this surface has already proved that a sentence can be right in
+    the file and absent from the screen."""
     _, out = _run(_args(), capsys)
-    for claim in ("30 days", "thirty days", "deleted after"):
-        assert claim not in out.lower(), f"promises a retention nothing keeps: {claim}"
+    assert "deleted automatically 30 days after it arrives" in out
+
+
+def test_the_plan_does_not_promise_that_the_record_goes_too(wire, capsys) -> None:
+    """⛔ The rule deletes the bundle. The row naming it survives — its TTL was
+    measured undeployed the same day — and the sentence must not be widened."""
+    _, out = _run(_args(), capsys)
+    low = out.lower()
+    for overreach in ("no record", "nothing is kept", "no trace",
+                      "we keep nothing", "erased completely"):
+        assert overreach not in low, f"claims the record goes too: {overreach}"
 
 
 def test_the_plan_still_says_who_can_read_them(wire, capsys) -> None:

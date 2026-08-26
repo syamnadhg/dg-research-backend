@@ -84,24 +84,63 @@ def test_ctrl_c_at_the_prompt_sends_nothing(capsys, cli, monkeypatch):
     assert cli["uploads"] == [] and cli["posts"] == []
 
 
-def test_the_thirty_day_deletion_promise_is_gated_on_a_rule_that_exists():
-    """⛔⛔ No bucket lifecycle rule exists in ANY repo. Until one is applied and
-    read back, "deleted after 30 days" is a lie of exactly the kind wave 1 spent
-    itself removing — so the sentence is behind a flag flipped in the same
-    commit as the verified `describe` output."""
-    assert research.BUNDLE_LIFECYCLE_VERIFIED is False, (
-        "if this is now True, the gcloud lifecycle rule must be applied AND its "
-        "describe output pasted into the runbook in the same commit")
+def test_the_thirty_day_deletion_promise_is_made_because_a_rule_now_keeps_it():
+    """✅ INVERTED 2026-08-26, AND BOTH VERSIONS WERE RIGHT AT THE TIME.
+
+    Until that date no bucket lifecycle rule existed in any repo, so this
+    asserted the flag was False and the sentence absent — "deleted after 30
+    days" would have been a lie of exactly the kind wave 1 spent itself
+    removing. The rule is now live on the `logs/` prefix (action Delete, age
+    30) and was read back by two independent tools before the flag moved.
+
+    ⛔ WHAT THIS TEST IS REALLY FOR IS THE OTHER DIRECTION. If the rule is ever
+    withdrawn, the flag has to come back with it — the flag is not a feature
+    switch, it is a claim about a bucket."""
+    assert research.BUNDLE_LIFECYCLE_VERIFIED is True, (
+        "if this is False again the lifecycle rule must have been withdrawn — "
+        "and the runbook's `verified:` block must be withdrawn in the same "
+        "commit, or the front end still promises deletion")
     lines = " ".join(research._send_logs_consent_lines())
-    assert "deleted" not in lines and "30 days" not in lines.replace(
-        "last 30 days", "")
+    assert "deleted automatically 30 days after it arrives" in lines
 
 
-def test_flipping_the_flag_is_what_adds_the_promise(monkeypatch):
-    """The gate has to be a gate in both directions, or it is decoration."""
-    monkeypatch.setattr(research, "BUNDLE_LIFECYCLE_VERIFIED", True)
-    assert any("deleted automatically after 30 days" in line
-               for line in research._send_logs_consent_lines())
+def test_the_gate_still_gates_when_it_is_closed(monkeypatch):
+    """The gate has to be a gate in both directions, or it is decoration.
+
+    ⛔ Kept as a monkeypatch rather than deleted now that the flag ships True:
+    a flag with only one tested value is indistinguishable from a constant, and
+    the day it needs to close is the day nobody remembers whether it can."""
+    monkeypatch.setattr(research, "BUNDLE_LIFECYCLE_VERIFIED", False)
+    lines = " ".join(research._send_logs_consent_lines())
+    assert "deleted" not in lines
+    # ⛔ "last 30 days" is the run AGE BOUND and has nothing to do with
+    # retention. Stripping it is what stops this assertion passing vacuously.
+    assert "30 days" not in lines.replace("last 30 days", "")
+
+
+def test_the_retention_line_names_the_arrival_and_not_the_request():
+    """⭐ The two clocks are different and only one of them is the bucket's.
+
+    The lifecycle rule counts from the object's creation — the upload. The
+    index row's `expireAt` is stamped when the row is OPENED, before a byte
+    moves, and is never refreshed. A sentence that said "30 days from when you
+    asked" would be describing the row's clock while the deletion runs on the
+    object's."""
+    line = [l for l in research._send_logs_consent_lines() if "deleted" in l]
+    assert len(line) == 1
+    assert "after it arrives" in line[0]
+
+
+def test_the_promise_covers_the_material_and_never_the_record():
+    """⛔⛔ The rule deletes the OBJECT. The index row that names it is not
+    covered by it, and that row's own TTL was measured undeployed on 08-26 — so
+    the receipt outlives the file. That is tolerable only because the row
+    carries no log content; it is NOT a licence to widen the sentence."""
+    lines = " ".join(research._send_logs_consent_lines()).lower()
+    for overreach in ("no record", "nothing is kept", "no trace",
+                      "we keep nothing", "erased completely"):
+        assert overreach not in lines, (
+            f"{overreach!r} claims the record goes too, and it does not")
 
 
 def test_the_run_bounds_and_the_raw_logs_are_named_separately():
