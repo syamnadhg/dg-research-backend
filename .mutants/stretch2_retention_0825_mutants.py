@@ -192,23 +192,19 @@ def run_tests() -> bool:
             "would report every fork mutant as killed")
     fork = sh([str(fork_py), "-B", "-m", "pytest", FORK_SUITES,
                "-q", "-p", "no:cacheprovider"], cwd=FORK, env=ENV)
-    # ⚠ THIRTEEN PRE-EXISTING FAILURES IN THIS SUITE, and they are not ours: ten
-    # environment (a skills-ban helper that needs a real install tree) and three
-    # pin gaps. So the fork leg cannot be judged on the exit code — it is judged
-    # on the COUNT, which must not grow.
-    return _fork_failures(fork.stdout) <= FORK_BASELINE_FAILURES
-
-
-FORK_BASELINE_FAILURES = 13
-
-
-def _fork_failures(out: str) -> int:
-    for line in reversed(out.splitlines()):
-        if " failed" in line and " passed" in line:
-            for part in line.replace(",", " ").split():
-                if part.isdigit():
-                    return int(part)
-    return 0 if " passed" in out else 999
+    # ⛔⛔ EXIT CODE, WITH NO TOLERANCE — AND THE FIRST VERSION OF THIS LINE MADE
+    # EVERY FORK MUTANT SURVIVE. The fork's `skills/tests` DIRECTORY carries 13
+    # pre-existing failures (ten environment, three pin gaps), so this leg was
+    # written to allow up to 13 and fail only if the count grew. But the leg runs
+    # ONE FILE, and that file is clean: 161 passed, 0 failed. So a tolerance
+    # measured against the directory was applied to a file, and it silently
+    # absorbed the first thirteen real kills — all four fork mutants reported as
+    # survivors while the suite was going red exactly as it should.
+    #
+    # ⭐ THE LESSON IS THE SCOPE, NOT THE NUMBER. A tolerance is only meaningful
+    # against the same selection it was measured on. Narrow the selection until
+    # it is clean and then demand clean, rather than carrying a budget.
+    return fork.returncode == 0
 
 
 def main() -> int:
