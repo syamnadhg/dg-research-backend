@@ -108,7 +108,7 @@ MUTANTS = [
      "⛔⛔ THE UID CHECK GOES. Signing in as B is handed A's email and A's "
      "research topic — a cross-account leak that could not exist before this "
      "stretch only because nothing was on disk to leak",
-     [("    if isinstance(ev, dict) and ev and owner == uid:",
+     [("    if isinstance(ev, dict) and ev and owner and owner == uid:",
        "    if isinstance(ev, dict) and ev:")]),
     ("D4", PREFS, "under",
      "the clear pops the announce and leaves the uid key, so the file says an "
@@ -139,10 +139,14 @@ MUTANTS = [
      [("            state.clear_signed_in()\n            state.rotate_login_token()",
        "            state.rotate_login_token()")]),
     ("D9", PREFS, "over",
-     "an announce with no uid is parked under the empty account, where the next "
-     "signed-in read cannot see it and nothing ever clears it",
-     [("    if isinstance(ev, dict) and ev and owner == uid:",
-       "    if isinstance(ev, dict) and ev and (owner == uid or owner == \"\"):")]),
+     "⛔⛔ AN EMPTY UID MATCHES AN EMPTY UID. A truncated write or a hand-edited "
+     "file leaves `pendingAnnounceUid: \"\"`, and then the announce is readable by "
+     "whoever asks with nothing — the same cross-account leak the binding exists "
+     "to prevent. ⭐ RE-POINTED 2026-08-26: the first version of this mutant "
+     "SURVIVED, which is how the hole was found; closing it changed the line the "
+     "anchor named, so the next run reported a harness fault rather than a kill",
+     [("    if isinstance(ev, dict) and ev and owner and owner == uid:",
+       "    if isinstance(ev, dict) and ev and owner == uid:")]),
     ("D10", BRIDGE, "over",
      "⛔ the park stops being best-effort, so a read-only disk takes the SIGN-IN "
      "down with it — a courtesy message failing the thing it is a courtesy about",
