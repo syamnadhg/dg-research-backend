@@ -143,9 +143,25 @@ def test_doctor_reports_the_size_in_kilobytes_when_it_is_big(monkeypatch, tmp_pa
 def test_doctor_says_so_when_nothing_has_been_written(monkeypatch, tmp_path):
     """An absent file is not a failure — a bridge that has never run has nothing to
     write — but reporting it as a healthy log would send somebody looking for
-    contents that are not there."""
+    contents that are not there.
+
+    ⛔ A MUTATION SURVIVED HERE. This asserted only the DETAIL text, so flipping the
+    row's ok-flag to a hard True kept the sentence and changed the mark from a
+    warning tick to a green one — the row said "nothing written yet" beside a ✓."""
+    from facade import branding
     out = _doctor_output(monkeypatch, bridge_up=True, log_bytes=None, tmp_path=tmp_path)
     assert "nothing written yet" in out
+    log_line = [ln for ln in out.splitlines() if "bridge.log" in ln][0]
+    assert branding.MARK_WARN in log_line, log_line
+    assert branding.MARK_OK not in log_line, log_line
+
+
+def test_doctor_marks_a_log_that_exists_as_ok(monkeypatch, tmp_path):
+    """The complement, so the mark is pinned in both directions rather than one."""
+    from facade import branding
+    out = _doctor_output(monkeypatch, bridge_up=True, log_bytes=b"x" * 9, tmp_path=tmp_path)
+    log_line = [ln for ln in out.splitlines() if "bridge.log" in ln][0]
+    assert branding.MARK_OK in log_line, log_line
 
 
 def test_doctor_names_the_log_EVEN_WHEN_THE_BRIDGE_IS_DOWN(monkeypatch, tmp_path):
@@ -380,6 +396,20 @@ def _code_only(path: Path) -> str:
     return code_only(path.read_text(encoding="utf-8"))
 
 
+# The sentence each client must print when the agent's log is NOT going. Pinned as
+# whole strings rather than a shared fragment, because the fragment is the trap:
+# ⛔ A MUTATION SURVIVED because the assertion was `"is not included" in code or
+# "NOT included" in code`, and cli.py ALREADY contains "That computer's own logs are
+# NOT included." — the RESEARCH computer's line, six lines above. So deleting the
+# agent's sentence left the assertion satisfied by a different sentence about a
+# different machine. An assertion that can be satisfied by its neighbour is not an
+# assertion about its subject.
+_NOT_GOING = {
+    "agent terminal": "The agent's own log on this host is NOT included.",
+    "our chat client": "The agent’s own log is not included.",
+}
+
+
 @pytest.mark.parametrize("label", sorted(_CLIENTS))
 def test_every_client_says_whether_the_agent_log_is_going(label):
     """A plan that lists what leaves has to say this either way. Naming it only
@@ -387,7 +417,8 @@ def test_every_client_says_whether_the_agent_log_is_going(label):
     "not included" in another."""
     code = _code_only(_CLIENTS[label])
     assert "agent_log" in code, label
-    assert "is not included" in code or "NOT included" in code, label
+    assert _NOT_GOING[label] in code, (
+        f"{label} no longer says the agent's log is NOT going")
 
 
 @pytest.mark.parametrize("label", sorted(_CLIENTS))
@@ -416,17 +447,237 @@ def test_the_terminal_offers_it_as_a_flag_beside_machine():
 def test_no_wait_says_the_agent_log_did_not_go():
     """⛔ --no-wait is the choice not to wait for the row, and the row is the
     condition. Sending anyway would put an object in a folder no row names; saying
-    nothing would let somebody believe it went."""
+    nothing would let somebody believe it went.
+
+    ⛔ A MUTATION SURVIVED HERE: this pinned the SENTENCE and not the absence of the
+    send, so a mutant that kept the message and called `_send_agent_log` anyway was
+    invisible. The message is the smaller half — the ordering is the safety
+    property."""
     code = _code_only(Path(cli.__file__))
-    tail = code[code.index("no_wait"):]
-    assert "was not sent" in tail
+    branch = code[code.index("    if args.no_wait:"):]
+    branch = branch[:branch.index("    rc = _await_bundle")]
+    assert "was not sent" in branch
+    assert "_send_agent_log" not in branch, (
+        "the agent log is sent before the bundle row can exist")
 
 
-def test_the_agent_log_send_never_changes_the_exit_code():
-    """The machine's bundle is already sent and the support code already works. A
-    failure here is one more sentence, not a failed command."""
-    code = _code_only(Path(cli.__file__))
-    body = code[code.index("def _send_agent_log"):]
-    body = body[:body.index("\ndef ", 1)]
-    assert "return None" not in body or True  # it returns None by signature
-    assert "-> None" in body.split("\n")[0], "it must not be able to report a code"
+# ── the terminal, driven for real ─────────────────────────────────────────────
+#
+# ⛔⛔ THE SOURCE ASSERTIONS ABOVE ARE NOT ENOUGH, AND THE SWEEP PROVED IT. Three
+# mutants survived a first pass that checked source text: one pinned the HELPER's
+# signature while the mutant changed the CALLER, one pinned a SENTENCE while the
+# mutant added a CALL beside it, and one was satisfied by a neighbouring line about
+# a different machine. What follows executes `cmd_send_logs`.
+
+class _Wire:
+    """Records every bridge call, so a test can assert something was NOT sent."""
+
+    def __init__(self, *, row=None, agent_log_status=200, agent_log_body=None):
+        self.row = row
+        self.agent_log_status = agent_log_status
+        self.agent_log_body = agent_log_body or {"ok": True, "sent": True, "bytes": 12}
+        self.posts: list = []
+
+    def get(self, path, timeout=10.0):
+        if path.startswith("/logs/runs"):
+            return 200, {"deviceId": "dev1", "deviceName": "Studio PC", "owned": True,
+                         "published": True, "truncated": False, "updatedAt": "",
+                         "runs": [{"name": "r1", "label": "Tidal power",
+                                   "startedAt": "2026-08-24 10:00", "status": "completed",
+                                   "sizeBytes": 1_100_000}]}
+        if path.startswith("/logs/bundle"):
+            return 200, {"code": "K7XQ9B2M", "row": self.row}
+        raise AssertionError(f"unexpected GET {path}")
+
+    def post(self, path, body=None, timeout=30.0):
+        self.posts.append(path)
+        if path == "/logs/agent-log":
+            return self.agent_log_status, self.agent_log_body
+        return 200, {"ok": True, "code": "K7XQ9B2M"}
+
+
+def _send_args(**kw):
+    base = dict(device=None, runs=None, none=False, machine=False, list=False,
+                status=None, yes=True, no_wait=True, wait=0, verbose=False,
+                agent_log=False)
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+def _run_send(monkeypatch, args, wire):
+    import contextlib
+    import io as _io
+    monkeypatch.setattr(cli, "_bridge_up", lambda: True)
+    monkeypatch.setattr(cli, "_bridge_get", wire.get)
+    monkeypatch.setattr(cli, "_bridge_post", wire.post)
+    monkeypatch.setattr(cli.time, "sleep", lambda _s: None)
+    buf = _io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.cmd_send_logs(args)
+    return rc, buf.getvalue()
+
+
+def test_no_wait_does_not_send_the_agent_log(monkeypatch):
+    """⛔⛔ THE ORDERING, ASSERTED AS AN ABSENCE. --no-wait is the choice not to wait
+    for the row, and the row is the condition — an object written before it exists
+    lands in a folder Clear-logs will never list. A mutant that kept the explanatory
+    sentence and uploaded anyway survived the source-text version of this."""
+    wire = _Wire()
+    rc, out = _run_send(monkeypatch, _send_args(no_wait=True, agent_log=True), wire)
+    assert rc == 0
+    assert "/logs/agent-log" not in wire.posts, "it uploaded before the row could exist"
+    assert "was not sent" in out
+
+
+def test_a_failed_agent_log_send_does_not_fail_the_command(monkeypatch):
+    """⛔⛔ PINNING THE HELPER DID NOT TEST THE CALLER — a mutant that added
+    `return 1` beside the call survived a check on `_send_agent_log`'s signature."""
+    wire = _Wire(row={"status": "done", "runCount": 1, "sizeBytes": 10},
+                 agent_log_status=502, agent_log_body={"error": "agent_log_not_sent"})
+    rc, out = _run_send(monkeypatch,
+                        _send_args(no_wait=False, wait=1, agent_log=True), wire)
+    assert "/logs/agent-log" in wire.posts
+    assert rc == 0, "a bundle that arrived was reported as a failed command"
+    assert "did not go" in out
+    assert "unaffected" in out
+
+
+def test_the_agent_log_goes_after_the_bundle_lands(monkeypatch):
+    wire = _Wire(row={"status": "done", "runCount": 1, "sizeBytes": 10})
+    rc, out = _run_send(monkeypatch,
+                        _send_args(no_wait=False, wait=1, agent_log=True), wire)
+    assert rc == 0
+    assert wire.posts == ["/logs/send", "/logs/agent-log"], wire.posts
+    assert "went too" in out
+
+
+def test_nothing_is_sent_when_the_flag_is_absent(monkeypatch):
+    wire = _Wire(row={"status": "done", "runCount": 1, "sizeBytes": 10})
+    _run_send(monkeypatch, _send_args(no_wait=False, wait=1, agent_log=False), wire)
+    assert "/logs/agent-log" not in wire.posts
+
+
+# ── the sign-in path says what happened, at the DEFAULT level ────────────────
+#
+# ⛔⛔ TWO MUTANTS SURVIVED BECAUSE NOTHING HERE EXISTED. I changed what the
+# sign-in path logs and wrote no test for it at all, so both the silence and the
+# mislabel could be restored without anything noticing. The whole argument for the
+# transport is that the log has something in it; an untested log line is an
+# assumption that it does.
+
+def _advance(monkeypatch, caplog, *, poll):
+    """Drive _advance_remote_flow with a scripted broker and capture the log."""
+    import logging as _lg
+    import time as _t
+    from types import SimpleNamespace as _NS
+    from facade import bridge
+
+    monkeypatch.setattr(bridge.devicelogin, "poll_once", poll)
+    state = bridge.BridgeState()
+    flow = _NS(state="pending", poll_token="tok", expires_at=_t.time() + 600,
+               code="C", verifyUrl="u", origin=None, pending_topic=None, error=None)
+    state.set_remote(flow)
+    with caplog.at_level(_lg.INFO, logger="facade"):
+        with state.remote_lock:
+            bridge._advance_remote_flow(state)
+    return flow, caplog.text
+
+
+def test_a_sign_in_that_expires_before_approval_says_so(monkeypatch, caplog):
+    """⛔ THE MOST COMMON UNSUCCESSFUL SIGN-IN THERE IS, and it used to leave NOTHING
+    behind — the expiry is decided here, BEFORE the broker is asked, so the INFO on
+    the broker-reported branch never fires for it. That is precisely what somebody
+    would be sending the log to explain."""
+    import logging as _lg
+    from types import SimpleNamespace as _NS
+    from facade import bridge
+
+    called = {"n": 0}
+    monkeypatch.setattr(bridge.devicelogin, "poll_once",
+                        lambda t: called.__setitem__("n", called["n"] + 1))
+    state = bridge.BridgeState()
+    flow = _NS(state="pending", poll_token="tok", expires_at=0.0, code="C",
+               verifyUrl="u", origin=None, pending_topic=None, error=None)
+    state.set_remote(flow)
+    with caplog.at_level(_lg.INFO, logger="facade"):
+        with state.remote_lock:
+            bridge._advance_remote_flow(state)
+    assert flow.state == "expired"
+    assert called["n"] == 0, "it asked the broker about a code that had already expired"
+    assert "expired before approval" in caplog.text
+
+
+def test_a_broker_failure_is_visible_at_the_default_level(monkeypatch, caplog):
+    """⛔⛔ IT USED TO BE DEBUG, AND CALLED A BLIP. This catch also takes a persistent
+    HTTP 500 and "approved but sent no custom token" — a sign-in that CANNOT succeed,
+    retried until the TTL runs out and then reported as an expiry. At DEBUG the
+    default level recorded nothing; the word "transient" mislabelled it even at -v."""
+    def boom(_t):
+        raise bridge_mod.DeviceLoginError("sign-in broker poll failed: HTTP 500 nope")
+
+    from facade import bridge as bridge_mod
+    flow, text = _advance(monkeypatch, caplog, poll=boom)
+    assert flow.state == "pending", "a failure it keeps waiting through"
+    assert "HTTP 500" in text, "the broker's own detail never reached the log"
+    assert "transient transport blip" not in text, (
+        "a persistent failure is still being called transient")
+
+
+def test_the_upstream_body_never_reaches_the_person(monkeypatch, caplog):
+    """The detail belongs in the log, not in a chat message. The route returns a
+    fixed sentence; only the log gets the status."""
+    from facade import bridge as bridge_mod
+
+    def boom(_t):
+        raise bridge_mod.DeviceLoginError("HTTP 500 <html>secret</html>")
+
+    _flow, text = _advance(monkeypatch, caplog, poll=boom)
+    assert "secret" in text
+
+
+# ── the natural-language route asks for this and nothing wider ───────────────
+
+@pytest.mark.parametrize("said,want", [
+    # explicit, in the words a person would actually use
+    ("send the agent's log", True),
+    ("send the agent log to support", True),
+    ("share the bridge log", True),
+    ("send my agent's own log", True),
+    # ⛔ AND THE ONES THAT MUST NOT REACH IT. A mutation that appended the flag
+    # unconditionally SURVIVED, because nothing drove this route for the agent log
+    # at all. "Everything" is the same over-reading that is deliberately kept away
+    # from --machine: a broad word means all of THEIRS, not a second machine's file.
+    ("send the logs", False),
+    ("send all the logs", False),
+    ("send everything", False),
+    ("upload my logs please", False),
+    ("send the computer's own logs", False),
+])
+def test_only_an_explicit_ask_reaches_the_agent_log_flag(said, want):
+    import importlib.util
+    from pathlib import Path as _P
+    spec = importlib.util.spec_from_file_location(
+        "sr_nl_under_test",
+        _P(cli.__file__).parent / "skill" / "scripts" / "sr.py")
+    sr = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sr)
+    argv, _lines = sr._nl_resolve(said)
+    # ⭐ A phrase that routes NOWHERE satisfies the property too — "send everything"
+    # is one of those, and demanding it route to send-logs would have been asserting
+    # something the claim never made.
+    reached = bool(argv) and "--agent-log" in argv
+    assert reached is want, (said, argv)
+
+
+def test_asking_for_the_agent_log_does_not_also_ask_for_the_machines(said="send the agent's log"):
+    """The two are different machines and different consents. Asking for one must
+    never quietly select the other."""
+    import importlib.util
+    from pathlib import Path as _P
+    spec = importlib.util.spec_from_file_location(
+        "sr_nl_under_test2",
+        _P(cli.__file__).parent / "skill" / "scripts" / "sr.py")
+    sr = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sr)
+    argv, _ = sr._nl_resolve(said)
+    assert "--agent-log" in argv and "--machine" not in argv, argv
