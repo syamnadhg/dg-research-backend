@@ -530,7 +530,20 @@ def _enqueue_research_run(fs: FirestoreRest, sess: AccountSession, *, topic: str
     # 20-second timeout, and a courtesy notice may not add that to the latency
     # of starting a run — nor may it turn a started run into an error. Placed
     # after the enqueue so it can only ever describe a run that is real.
-    _spawn(_notify_device_owner_of_run, sess, device_id, rid, topic)
+    #
+    # ⛔⛔ AND `_spawn` ITSELF IS GUARDED, found by review 2026-08-26. Its body is
+    # `threading.Thread(...).start()`, which raises `RuntimeError` on thread
+    # exhaustion or at interpreter shutdown — outside every guard, two lines under
+    # the promise above. `_research` catches only RevokedError / FirestoreError /
+    # _EnqueueFailed and `do_POST` wraps nothing, so this would have dropped the
+    # connection on a run ALREADY QUEUED; on the sign-in path the catch-all turns
+    # it into `{}`, the chat falls back to "reply yes", and the person starts a
+    # SECOND real run. Same defect class as the notice's own guard being one level
+    # too deep in the two web routes, found in the same review.
+    try:
+        _spawn(_notify_device_owner_of_run, sess, device_id, rid, topic)
+    except Exception as e:  # noqa: BLE001 — a courtesy notice, never a failure
+        log.info("owner-notify %s: not dispatched (%s)", rid, type(e).__name__)
     return rid, qid
 
 

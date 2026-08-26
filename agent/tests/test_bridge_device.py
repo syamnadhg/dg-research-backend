@@ -1245,3 +1245,21 @@ def test_and_an_error_shaped_refusal_still_says_why(live, monkeypatch, caplog):
         requests.post(base + "/research", json={"topic": "T"})
     line = next(r.getMessage() for r in caplog.records if "owner-notify" in r.getMessage())
     assert "429" in line and "rate_limited" in line, line
+
+
+def test_a_thread_that_cannot_start_does_not_fail_the_run(live, monkeypatch):
+    # ⛔⛔ FOUND BY REVIEW. `_spawn` is `Thread(...).start()`, which raises
+    # RuntimeError on thread exhaustion or at interpreter shutdown — and it sat
+    # outside every guard, two lines under a comment promising a courtesy notice
+    # cannot turn a started run into an error. `_research` catches only three
+    # typed errors and `do_POST` wraps nothing, so the connection would have
+    # dropped on a run that was already queued.
+    base, _ = live
+
+    def _cannot_spawn(*_a, **_k):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(bridge, "_spawn", _cannot_spawn)
+    FakeFS.devices = [{"id": "a", "ownerUid": "owner-2", "sharedWith": ["u1"]}]
+    r = requests.post(base + "/research", json={"topic": "T"})
+    assert r.status_code == 200 and FakeFS.last_enqueue is not None
