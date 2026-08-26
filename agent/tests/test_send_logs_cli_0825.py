@@ -525,6 +525,38 @@ def test_neither_client_carries_the_retention_promise_in_source() -> None:
             assert claim not in code, f"{name} promises a retention nothing keeps"
 
 
+def test_no_failure_sentence_names_a_command_that_cannot_help() -> None:
+    """⛔⛔ THE UPLOAD-FAILED SENTENCE SENT PEOPLE TO `--doctor`, WHICH PRINTS NO
+    BUNDLE PATH. Measured: `run_doctor` prints none anywhere; the path is
+    printed only by send-logs itself, and only after building a NEW bundle —
+    never the one the person was told about. So the sentence a person reads at
+    their worst moment pointed at a dead end.
+
+    ⭐ AND THE FIX WENT UNPINNED. Mutation restored the false claim and nothing
+    noticed: the copy had been corrected in both clients with no assertion
+    behind it, which is a fix that lasts exactly until the next edit. Both
+    tables are checked, since they are separate copies by contract."""
+    for name, table in (("cli.py", cli._SEND_LOGS_FAILURES),
+                        ("sr.py", _sr_failure_table())):
+        for cls, words in table.items():
+            assert "--doctor" not in words, (
+                f"{name}/{cls} sends the person to a command that cannot help")
+            assert "doctor" not in words.lower(), (
+                f"{name}/{cls} names doctor, which prints no bundle path")
+
+
+def _sr_failure_table() -> dict:
+    """The chat client's copy of the sentences, read from source — it is
+    stdlib-only by contract and cannot be imported for its module object."""
+    import ast
+    tree = ast.parse(SR_SRC)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(
+                getattr(t, "id", "") == "_SEND_LOGS_FAILURES" for t in node.targets):
+            return ast.literal_eval(node.value)
+    raise AssertionError("sr.py has no _SEND_LOGS_FAILURES table")
+
+
 def test_no_sentence_is_empty() -> None:
     for cls, words in cli._SEND_LOGS_FAILURES.items():
         assert len(words.strip()) > 10, f"{cls} has no readable sentence"
