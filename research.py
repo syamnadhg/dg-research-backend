@@ -8925,8 +8925,17 @@ def _handle_send_logs_command(data: dict, device_id: str, limited: bool = False,
                 "machineIncluded": machine_wanted})
         finally:
             # ⭐ The local copy stays. It is the floor the whole design rests on:
-            # if nothing could be uploaded, the user still has a file to attach
-            # by hand, and `--doctor` prints where it is.
+            # if nothing could be uploaded, the person still has a file to attach
+            # by hand.
+            #
+            # ⛔ AND IT IS NOT `--doctor` THAT NAMES IT — this line used to say so.
+            # Measured: `run_doctor` prints no bundle path anywhere; its closing
+            # remedy points at `--send-logs`, and that command prints a path only
+            # for the archive IT builds, which is a new one with a new support
+            # code, never the file this branch just left behind. The clients say
+            # the true thing — that it is on that computer, under its Super
+            # Research logs folder — and this comment used to contradict them
+            # from the sink end of the same failure.
             with _SEND_LOGS_LOCK:
                 _send_logs_inflight = False
 

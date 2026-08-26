@@ -109,8 +109,10 @@ MUTANTS = [
      "else uses, refusing somebody's own second ask, and pointing at the wrong "
      "person even when one did go first: the co-tenant who trips the sixty-second "
      "floor is most often the machine's OWNER",
-     [('    "CooldownActive": "that computer built a bundle very recently, and its "\n                      "limit counts everyone who uses it — so it may not have "\n                      "been you. Try again shortly",',
-       '    "CooldownActive": "that computer built a bundle very recently, perhaps "\\n'
+     [('    "CooldownActive": "that computer built a bundle very recently, and its "\n'
+       '                      "limit counts everyone who uses it — so it may not have "\n'
+       '                      "been you. Try again shortly",',
+       '    "CooldownActive": "that computer built a bundle very recently, perhaps "\n'
        '                      "for someone else who uses it — try again shortly",')]),
 
     # ═══════════ W — the document the assistant reads ═══════════════════════
@@ -240,7 +242,7 @@ def main() -> int:
         return 2
     print("green")
 
-    survivors = []
+    survivors, faults = [], []
     for mid, fname, direction, why, edits in selected:
         path = ROOT / fname
         original = path.read_text(encoding="utf-8")
@@ -281,8 +283,16 @@ def main() -> int:
             if not killed:
                 survivors.append((mid, direction, why))
         except AssertionError as exc:
+            # ⛔⛔ A HARNESS FAULT IS NOT A SURVIVOR, AND THIS USED TO REPORT IT AS
+            # ONE. A stale anchor or a replacement that does not parse MEASURED
+            # NOTHING — the mutant never reached the file, so the suite was never
+            # asked. Filing it under SURVIVORS reads as "the tests have a gap",
+            # which sends you to write an assertion for a defect that was never
+            # tested. This file's own docstring already said a stale anchor is a
+            # harness fault; the output did not act on it, and the first fault it
+            # met cost a round of diagnosis.
             print(f"! ERROR    {mid} {exc}")
-            survivors.append((mid, direction, why))
+            faults.append((mid, direction, why, str(exc)))
         finally:
             path.write_text(original, encoding="utf-8")
 
@@ -294,10 +304,21 @@ def main() -> int:
 
     over = sum(1 for m in selected if m[2] == "over")
     label = " (SPOT CHECK — not the stretch's score)" if only else ""
-    print(f"\n{len(selected) - len(survivors)}/{len(selected)} killed "
+    measured = len(selected) - len(faults)
+    print(f"\n{measured - len(survivors)}/{measured} killed "
           f"({over} over-corrections){label}")
+    if faults:
+        # ⛔ Counted OUT of the score rather than against it: a mutant that never
+        # reached the file tells you nothing about the suite either way, so
+        # folding it into the denominator would understate coverage as surely as
+        # folding it into the numerator would overstate it.
+        print(f"⚠ {len(faults)} HARNESS FAULT(S) — these measured NOTHING and are "
+              f"excluded from the score above:\n"
+              + "\n".join(f"  {m} [{d}] {w}\n      {e}" for m, d, w, e in faults))
     if survivors:
-        print("SURVIVORS:\n" + "\n".join(f"  {m} [{d}] {w}" for m, d, w in survivors))
+        print("SURVIVORS (real suite gaps):\n"
+              + "\n".join(f"  {m} [{d}] {w}" for m, d, w in survivors))
+    if survivors or faults:
         return 1
     return 0
 
