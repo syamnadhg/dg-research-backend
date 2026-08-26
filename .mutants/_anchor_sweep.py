@@ -27,13 +27,21 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 FE = os.path.join(os.path.dirname(REPO), "dg-research")
+# ⛔⛔ THE FORK IS A THIRD TARGET REPO, ADDED 2026-08-26 — and its absence made
+# four live mutants report as "target file(s) not found", i.e. as STALE, when
+# they resolve perfectly inside their own harness. This tool already reached
+# across into the app repo; a harness that measures the fleet skill's copy of a
+# sentence is the same shape of thing, and the alternative was four entries on
+# the KNOWN_STALE ratchet saying "this measures nothing" about the TOOL rather
+# than about the mutant — the exact mistake two of the original seventeen made.
+FORK = os.path.join(os.path.dirname(REPO), "dg-hermes-fleet")
 SUFFIXES = (".py", ".ts", ".tsx", ".mjs", ".js", ".json", ".rules", ".md")
 
 
 def _read(rel, cache):
     if rel in cache:
         return cache[rel]
-    for base in (REPO, FE):
+    for base in (REPO, FE, FORK):
         path = os.path.join(base, rel)
         if os.path.exists(path):
             cache[rel] = io.open(path, encoding="utf-8").read()
