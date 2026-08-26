@@ -144,10 +144,19 @@ def get_pending_announce(uid: str) -> dict[str, Any] | None:
     DIFFERENT account must not inherit the previous one's announce. Without the
     binding, signing in as B would hand B's watchdog A's email and A's topic.
     """
+    # ⛔ AN EMPTY UID MATCHES AN EMPTY UID, and that was a real hole rather than a
+    # theoretical one — found by a mutation that survived, then by the test written
+    # to kill it. `set_pending_announce` is never CALLED with an empty uid, but a
+    # truncated write or a hand-edited file can leave `pendingAnnounceUid: ""`, and
+    # then `owner == uid` was satisfied by any caller asking with an empty uid. An
+    # announce readable by whoever asks with nothing is the same cross-account leak
+    # the binding exists to prevent, so neither side may be empty.
+    if not uid:
+        return None
     data = load()
     ev = data.get(_PENDING_ANNOUNCE)
     owner = data.get(_PENDING_ANNOUNCE_UID)
-    if isinstance(ev, dict) and ev and owner == uid:
+    if isinstance(ev, dict) and ev and owner and owner == uid:
         return ev
     return None
 

@@ -99,6 +99,24 @@ def test_clearing_the_announce_removes_both_keys():
     assert "pendingAnnounce" not in raw and "pendingAnnounceUid" not in raw
 
 
+def test_an_announce_parked_under_no_account_is_readable_by_nobody():
+    """⛔ A MUTATION SURVIVED HERE, and closing it needed the file written directly.
+
+    `set_signed_in` refuses to park an event with no uid, so nothing this code
+    writes can ever leave an empty `pendingAnnounceUid` — which made a mutant that
+    ALSO accepted `owner == ""` unobservable through the normal path. It is still a
+    hole: a truncated write, a hand-edited file, or a future writer could leave
+    one, and an announce readable by whoever asks with an empty uid is the same
+    cross-account leak the binding exists to prevent. So the file is written
+    directly and the read is asserted from both sides."""
+    raw = prefs.load()
+    raw["pendingAnnounce"] = {"ts": 1, "email": "a@x.y"}
+    raw["pendingAnnounceUid"] = ""
+    prefs.save(raw)
+    assert prefs.get_pending_announce("") is None
+    assert prefs.get_pending_announce("uA") is None
+
+
 def test_a_fresh_announce_supersedes_an_undelivered_one():
     prefs.set_pending_announce({"ts": 1, "uid": "uA", "topic": "old"}, "uA")
     prefs.set_pending_announce({"ts": 2, "uid": "uA", "topic": "new"}, "uA")
@@ -129,6 +147,22 @@ def test_peek_does_not_consume():
     state.set_signed_in({"ts": 5, "uid": "u1", "email": "e@x.y"})
     assert state.peek_signed_in("u1")["ts"] == 5
     assert state.peek_signed_in("u1")["ts"] == 5
+
+
+def test_peek_does_not_consume_even_with_nothing_parked(monkeypatch):
+    """⛔⛔ A MUTATION SURVIVED BECAUSE THE DISK COPY MASKED THE MEMORY ONE.
+    `test_peek_does_not_consume` passes against a `peek` that clears as it reads,
+    because the second call simply rehydrates from `prefs.json`. So at-least-once
+    was proven only for the case where the park SUCCEEDED — and the case that
+    matters most is the other one: a disk that refused the write leaves memory as
+    the only copy, and a consuming read would destroy the announce outright."""
+    monkeypatch.setattr(prefs, "set_pending_announce", lambda ev, uid: None)
+    monkeypatch.setattr(prefs, "get_pending_announce", lambda uid: None)
+    state = bridge.BridgeState()
+    state.set_signed_in({"ts": 5, "uid": "u1", "email": "e@x.y"})
+    assert state.peek_signed_in("u1")["ts"] == 5
+    assert state.peek_signed_in("u1")["ts"] == 5, (
+        "the in-memory copy was consumed by reading it")
 
 
 def test_clearing_reaches_the_disk_not_just_the_attribute():
@@ -254,15 +288,31 @@ def test_the_device_decision_table(spec, selected, want_id, want_reason, want_st
 
 
 def test_an_online_device_is_one_that_beat_within_the_window():
-    """The rung above rests entirely on this, so pin the boundary rather than
-    trusting a fixture: a heartbeat older than the window is NOT a candidate."""
+    """The sole-online rung rests entirely on this, so pin the window.
+
+    ⛔⛔ AND THE FIRST VERSION OF THIS TEST COULD NOT. It built its stale heartbeat
+    as `now - bridge._DEVICE_ONLINE_MS - 1000` — DERIVED FROM THE CONSTANT IT WAS
+    MEANT TO PIN — so widening the window moved the test's own boundary with it and
+    the assertion stayed true. A mutation that stretched the window to half an hour
+    SURVIVED, which would auto-pick a machine that went to sleep twenty minutes ago
+    and enqueue a run to nothing.
+
+    ⭐ The fixture is an ABSOLUTE age now. Five minutes is far outside any window
+    this constant should ever hold — the backend heartbeats every ~5 s and the
+    shipped threshold is six times that — so a mutant has to be absurd to pass,
+    and an absurd one is exactly what needs catching.
+    """
     import time as _t
     now = int(_t.time() * 1000)
-    stale_beat = now - bridge._DEVICE_ONLINE_MS - 1_000
-    devs = [{"id": "a", "lastHeartbeat": stale_beat}, {"id": "b", "lastHeartbeat": stale_beat}]
+    five_minutes_ago = now - 5 * 60 * 1_000
+    devs = [{"id": "a", "lastHeartbeat": five_minutes_ago},
+            {"id": "b", "lastHeartbeat": five_minutes_ago}]
     assert bridge._pick_device_from(devs, None) == (None, "no_selection", False)
     devs[1]["lastHeartbeat"] = now
     assert bridge._pick_device_from(devs, None) == ("b", "", False)
+    # And the shipped window itself, stated as a number rather than derived:
+    # 30 s is six times the ~5 s heartbeat, matching the web app's threshold.
+    assert bridge._DEVICE_ONLINE_MS == 30_000
 
 
 def test_a_sole_device_with_no_id_is_not_a_target():
@@ -500,6 +550,30 @@ def test_a_chat_may_attach_to_a_flow_that_holds_no_topic(monkeypatch):
         assert r.status_code == 200
         assert flow.pending_topic == "EVs"
         assert flow.origin == {"platform": "telegram", "chat_id": "111"}
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_a_flow_with_an_origin_but_no_topic_still_accepts_one(monkeypatch):
+    """⛔ A MUTATION SURVIVED HERE. `test_a_chat_may_attach_to_a_flow_that_holds_no
+    _topic` uses a flow with origin=None, so a mutant that dropped the
+    "is a topic even held?" half of the guard was invisible to it — the
+    `isinstance(flow.origin, dict)` clause refused on its own.
+
+    This is the observable case: a sign-in STARTED from one chat (so the flow
+    carries an origin) that never named a topic. A second chat naming one must be
+    accepted, because nothing is being taken from anybody."""
+    base, state, httpd = _live(monkeypatch)
+    try:
+        flow = _arm_pending(state, topic="",
+                            origin={"platform": "telegram", "chat_id": "111"})
+        r = requests.post(base + "/login/remote/pending", json={
+            "pending_topic": "EVs",
+            "origin": {"platform": "whatsapp", "chat_id": "222"}})
+        assert r.status_code == 200, r.text
+        assert flow.pending_topic == "EVs"
+        assert flow.origin == {"platform": "whatsapp", "chat_id": "222"}
     finally:
         httpd.shutdown()
         httpd.server_close()
