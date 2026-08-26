@@ -66,12 +66,37 @@ def _fresh_bridge():
 
 # ── the class guard ──────────────────────────────────────────────────────────
 
+def _inside_a_nested_checkout(path: "Path") -> bool:
+    """Is `path` inside a second git checkout living within this repo?"""
+    for parent in path.parents:
+        if parent == ROOT:
+            return False
+        if (parent / ".git").exists():
+            return True
+    return False
+
+
 def _repo_logger_roots() -> "set[str]":
     """Every stdlib logger our own shipped code creates, by root name."""
     roots = set()
     skip = {".venv", "agent", "tests", ".mutants", "node_modules", "build", "dist"}
     for path in ROOT.rglob("*.py"):
         if any(part in skip for part in path.relative_to(ROOT).parts):
+            continue
+        # ⛔⛔ A SECOND CHECKOUT INSIDE THIS ONE IS NOT OUR SHIPPED CODE. The org
+        # snapshot is built in a staging WORKTREE at `org-stage/be2` — a whole
+        # copy of this repository, living inside it. Every `getLogger(__name__)`
+        # in that copy resolved to a root literally named "org-stage", so this
+        # test reported a module that does not exist as logging into the void,
+        # and the ENTIRE root suite went red on any machine that had staged a
+        # snapshot. That is the shape of failure that gets a suite ignored
+        # rather than fixed — `test_no_personal_email_literals` carries the same
+        # scar, from a walk that flagged live run state.
+        #
+        # ⭐ FOUND BY MECHANISM, NOT BY NAME. A name in the skip list above would
+        # fix today's directory and miss the next one; a checkout is a directory
+        # carrying its own `.git`, whatever it is called.
+        if _inside_a_nested_checkout(path):
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
         for m in re.finditer(r"getLogger\(\s*(__name__|\"([^\"]+)\"|'([^']+)')\s*\)", text):
@@ -81,6 +106,35 @@ def _repo_logger_roots() -> "set[str]":
             else:
                 roots.add((m.group(2) or m.group(3)).split(".")[0])
     return roots
+
+
+def test_a_second_checkout_inside_the_repo_is_not_scanned(tmp_path, monkeypatch):
+    """⛔⛔ THE GUARD THAT MADE THE WHOLE SUITE RED FOR A REASON OF ITS OWN. The
+    org snapshot is staged in a worktree inside this repository, so the scan
+    walked a full second copy of the code and reported "org-stage" — a module
+    that does not exist — as logging into the void. Every other test in the file
+    was fine; the run stopped anyway.
+
+    ⭐ Built rather than asserted against the real directory, because that one is
+    untracked: a test keyed on it would pass on a clean checkout and fail only on
+    the machines that had actually done the staging, which is precisely the
+    failure mode being fixed."""
+    import test_stdlib_log_bridge_0817 as mod
+
+    ours = tmp_path / "ours.py"
+    ours.write_text("import logging\nlog = logging.getLogger(__name__)\n",
+                    encoding="utf-8")
+    nested = tmp_path / "org-stage" / "be2"
+    nested.mkdir(parents=True)
+    (nested / ".git").write_text("gitdir: /elsewhere\n", encoding="utf-8")
+    (nested / "copy.py").write_text(
+        "import logging\nlog = logging.getLogger(__name__)\n", encoding="utf-8")
+
+    monkeypatch.setattr(mod, "ROOT", tmp_path)
+    roots = mod._repo_logger_roots()
+    assert "ours" in roots, "the scan stopped seeing our own modules"
+    assert "org-stage" not in roots, (
+        "a staging worktree is being scanned as if it were shipped code")
 
 
 def test_every_stdlib_logger_in_this_repo_is_bridged():

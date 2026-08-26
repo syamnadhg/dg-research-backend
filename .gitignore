@@ -72,3 +72,10 @@ tests/fixtures/vision/auto/
 # not on the Windows box, which is one stray `git add` away from a divergence.
 uv.lock
 agent/uv.lock
+
+# The org staging worktrees — a second checkout of this repo, inside it, used to
+# build the signed snapshot for the org remote. ⛔ Ignored rather than left merely
+# untracked: an untracked second copy of the whole repository is one `git add -A`
+# away from committing the repo into itself, and this project has already pushed
+# a stray artefact to the org remote that way.
+org-stage/
