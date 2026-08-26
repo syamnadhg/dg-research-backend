@@ -506,6 +506,57 @@ def test_the_cooldown_expires():
     assert research._send_logs_cooldown_remaining() == 0
 
 
+def test_a_co_tenant_waits_the_short_floor_and_not_the_whole_window():
+    """⛔⛔ THE FACT EVERY CLIENT'S REFUSAL SENTENCE DEPENDS ON, AND NOTHING PINNED
+    IT. `SEND_LOGS_MACHINE_FLOOR_SEC` had zero test references anywhere in either
+    suite while four clients told people the wait was ten minutes.
+
+    Two windows, deliberately different sizes: the per-person one stops somebody
+    hammering the button, the floor stops N co-tenants turning one bundle per ten
+    minutes into N. Making them equal recreates the shared lockout the split
+    exists to fix — so this asserts the SHAPE, not just the numbers.
+
+    ⭐ The person here has never sent anything. On a shared research computer
+    that is the ordinary caller, and the whole reason no client may name a
+    number: the same refusal reaches them after a minute and reaches the person
+    who pressed twice after ten."""
+    owner, other = "user-rocky", "user-someone-else"
+    now = time.time()
+    research._stamp_send_logs_attempt(now=now, uid=owner)
+
+    # The owner's own second press: the whole window.
+    mine = research._send_logs_cooldown_remaining(now=now + 1, uid=owner)
+    assert mine > research.SEND_LOGS_MACHINE_FLOOR_SEC, (
+        "the person who just pressed is held only as long as a bystander")
+    assert mine <= research.SEND_LOGS_COOLDOWN_SEC
+
+    # Somebody else on the same machine, who has never pressed: the floor only.
+    theirs = research._send_logs_cooldown_remaining(now=now + 1, uid=other)
+    assert 0 < theirs <= research.SEND_LOGS_MACHINE_FLOOR_SEC, (
+        "a co-tenant is being held for the per-person window, which is the "
+        "shared lockout the split exists to prevent")
+
+    # And once the floor has passed they are not refused at all, while the
+    # owner still is — the two windows running side by side.
+    past = now + research.SEND_LOGS_MACHINE_FLOOR_SEC + 1
+    assert research._send_logs_cooldown_remaining(now=past, uid=other) == 0
+    assert research._send_logs_cooldown_remaining(now=past, uid=owner) > 0
+
+
+def test_a_stamp_from_an_older_build_still_holds_the_floor():
+    """⭐ BACK-COMPAT IS FLOOR-DEEP, AND THAT IS WORTH SAYING OUT LOUD. A stamp
+    written before the per-submitter split carries only `at`, so the person who
+    just sent is held for a minute rather than ten. The direction is safe — a
+    shorter wait, never a longer one — but it is a real case, and the copy that
+    says "very recently" is true for it while "ten minutes" was not."""
+    now = time.time()
+    _atomic = research._send_logs_stamp_path()
+    _atomic.parent.mkdir(parents=True, exist_ok=True)
+    _atomic.write_text('{"at": %r}' % now, encoding="utf-8")
+    held = research._send_logs_cooldown_remaining(now=now + 1, uid="user-rocky")
+    assert 0 < held <= research.SEND_LOGS_MACHINE_FLOOR_SEC
+
+
 def test_a_missing_or_corrupt_stamp_is_not_a_lockout():
     """A rate limit that fails CLOSED here would make one bad write permanent."""
     path = research._send_logs_stamp_path()

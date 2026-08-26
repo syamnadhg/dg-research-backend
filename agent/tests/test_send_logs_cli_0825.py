@@ -380,10 +380,15 @@ def test_a_finished_bundle_says_when_the_machines_own_logs_went_too(wire) -> Non
 
 
 def test_a_refusal_is_reported_in_words(wire) -> None:
+    """⛔⛔ THIS USED TO ASSERT "ten minutes", WHICH IS THE THING THAT WAS WRONG.
+    The machine keeps two windows and the refusal row names neither, so the one
+    honest answer is that it was recent. See the duration test below."""
     wire.row = {"status": "failed", "errorClass": "CooldownActive"}
     rc, out = _run(_args(no_wait=False, wait=5))
     assert rc == 1
-    assert "ten minutes" in out
+    assert "very recently" in out
+    assert "try again shortly" in out
+    assert "ten minutes" not in out, "the wait is not always ten minutes"
     assert "CooldownActive" not in out, "the class name is not a sentence"
 
 
@@ -461,13 +466,18 @@ def test_status_reports_a_refusal_in_words(wire) -> None:
 
 # ── the two copies of the sentences ─────────────────────────────────────────
 
-def _failure_keys(src: str) -> set:
-    """The error classes a source file has a sentence for. Read from the table
-    literal rather than imported, because sr.py cannot be imported here — it is
-    a standalone stdlib-only script by contract."""
-    block = re.search(r"_SEND_LOGS_FAILURES\s*=\s*\{(.*?)\n\}", src, re.S)
-    assert block, "no _SEND_LOGS_FAILURES table found"
-    return set(re.findall(r'"([A-Za-z]+)":', block.group(1)))
+def _failure_keys(table: dict) -> set:
+    """The error classes a table has a sentence for.
+
+    ⛔⛔ THIS USED TO REGEX THE SOURCE TEXT, AND THE SOURCE TEXT INCLUDES
+    COMMENTS. `re.findall(r'"([A-Za-z]+)":')` over the table block counted any
+    quoted word followed by a colon anywhere inside it — so a comment that
+    quoted the shape of a Firestore patch reported `status` and `errorClass` as
+    error classes this client has sentences for. It found that the moment a
+    comment was added; before that it was simply waiting. Both tables are
+    readable as VALUES — cli.py by import, sr.py through `ast.literal_eval` —
+    so nothing here needs to guess from text."""
+    return set(table)
 
 
 def test_the_chat_skill_has_a_sentence_for_every_refusal_the_cli_does() -> None:
@@ -476,7 +486,88 @@ def test_the_chat_skill_has_a_sentence_for_every_refusal_the_cli_does() -> None:
     a test in this repo already pins that. So the tables drift unless something
     reads both, and the failure mode of drift is a person being told nothing at
     all about why their logs did not send."""
-    assert _failure_keys(CLI_SRC) == _failure_keys(SR_SRC)
+    assert _failure_keys(cli._SEND_LOGS_FAILURES) == _failure_keys(_sr_failure_table())
+
+
+def test_both_clients_say_the_same_words_and_not_merely_the_same_classes() -> None:
+    """⛔⛔ THE KEY-SET TEST ABOVE PASSES WHILE THE TWO CLIENTS SAY DIFFERENT
+    THINGS, and that is exactly how the cooldown sentence came to be corrected
+    in one copy and not the other in an earlier draft of this very wave. A
+    person on the terminal and a person in chat are being told about the same
+    machine and the same refusal; the words are the product, so the words are
+    what has to match, not the dictionary keys around them.
+
+    ⭐ Values, not source text: read through `ast.literal_eval`, so the comment
+    that explains a sentence is free to differ between the two files while the
+    sentence itself may not."""
+    assert cli._SEND_LOGS_FAILURES == _sr_failure_table()
+
+
+def test_no_refusal_sentence_tells_a_person_how_long_to_wait() -> None:
+    """⛔⛔ NO CLIENT MAY NAME A DURATION, BECAUSE NO CLIENT CAN KNOW ONE. The
+    machine writes `{"status": "failed", "errorClass": ...}` and nothing else —
+    the seconds it computed are logged locally and thrown away. Meanwhile it
+    keeps TWO windows: the whole cooldown for your own second press, and a much
+    shorter unkeyed floor when somebody ELSE who uses that computer went first.
+    "Give it ten minutes" was written for the first and said to both, on the one
+    surface whose ordinary caller is a sharer on a shared research computer.
+
+    ⭐ A ban rather than a corrected number, because a corrected number would be
+    wrong for the other case in exactly the same way. `try again shortly` is
+    true whichever window fired.
+
+    ⭐ Values only, so the comment explaining the ban does not trip it — the
+    same trap the retention guard hit on its first run."""
+    for name, table in (("cli.py", cli._SEND_LOGS_FAILURES),
+                        ("sr.py", _sr_failure_table())):
+        for cls, words in table.items():
+            for unit in ("second", "minute", "hour", " day"):
+                assert unit not in words.lower(), (
+                    f"{name}/{cls} names a {unit.strip()} — the refusal row carries "
+                    f"no remaining time, so any duration here is a guess")
+
+
+def test_the_machine_keeps_two_cooldown_windows_and_they_differ() -> None:
+    """⭐⭐ THE FACT THE SENTENCE ABOVE DEPENDS ON, PINNED AT ITS SOURCE. If the
+    floor and the per-person window were ever made equal, one number WOULD be
+    honest and the ban above would be needless caution. They are not equal, and
+    nothing anywhere pinned that until now — `SEND_LOGS_MACHINE_FLOOR_SEC` had
+    zero test references in either suite, so the constant that makes every
+    client's copy wrong could have moved without a single failure.
+
+    Read out of the backend's source rather than imported: `research.py` is a
+    separate program from this package and importing it here would pull in the
+    whole pipeline."""
+    root = Path(__file__).resolve().parents[2]      # agent/tests -> repo root
+    src_path = root / "research.py"
+    assert src_path.exists(), (
+        f"{src_path} is missing — this suite runs from the backend checkout, and "
+        f"without it the client copy's premise is unchecked rather than checked")
+    src = src_path.read_text(encoding="utf-8")
+    window = _int_const(src, "SEND_LOGS_COOLDOWN_SEC")
+    floor = _int_const(src, "SEND_LOGS_MACHINE_FLOOR_SEC")
+    assert window == 600, f"per-person window moved to {window}"
+    assert floor == 60, f"machine floor moved to {floor}"
+    assert floor < window, (
+        "the floor is a concurrency bound, not a fairness one — making it equal "
+        "to the per-person window recreates the shared lockout it exists to fix")
+
+
+def _int_const(src: str, name: str) -> int:
+    """One module-level integer constant, folded from the source text."""
+    import ast
+    m = re.search(rf"^{name}\s*=\s*([0-9 */+]+?)\s*(?:#.*)?$", src, re.M)
+    assert m, f"{name} is not a plain integer constant in research.py"
+
+    def fold(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, int):
+            return node.value
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Mult, ast.Add)):
+            left, right = fold(node.left), fold(node.right)
+            return left * right if isinstance(node.op, ast.Mult) else left + right
+        raise AssertionError(f"{name} is not plain integer arithmetic")
+
+    return fold(ast.parse(m.group(1).strip(), mode="eval").body)
 
 
 def test_every_refusal_the_machine_can_write_has_a_sentence() -> None:
@@ -488,7 +579,7 @@ def test_every_refusal_the_machine_can_write_has_a_sentence() -> None:
                 "NotDeviceOwner", "NothingSelected", "ConsentMissing",
                 "RunsInvalid", "SubmitterMissing", "DeviceReadFailed",
                 "UploadFailed"}
-    assert expected <= _failure_keys(CLI_SRC)
+    assert expected <= _failure_keys(cli._SEND_LOGS_FAILURES)
 
 
 def test_no_client_calls_the_research_computer_this_one() -> None:

@@ -1104,8 +1104,11 @@ def cmd_updates(args) -> int:
 # `test_send_logs_cli_0825.py` reads both files and fails if either grows a case
 # the other lacks.
 _SEND_LOGS_FAILURES = {
-    "CooldownActive": "that computer built a bundle very recently — give it "
-                      "ten minutes and ask again",
+    # ⛔⛔ NAMES NO DURATION. The machine has two windows — 600s for your own
+    # second press, 60s when a co-tenant went first — and the refusal row
+    # carries neither. See the note in cli.py.
+    "CooldownActive": "that computer built a bundle very recently, perhaps "
+                      "for someone else who uses it — try again shortly",
     "AlreadyBuilding": "that computer is already packaging a bundle — wait for "
                        "it to finish and ask again",
     "NotDeviceMember": "that computer no longer counts you as one of its "

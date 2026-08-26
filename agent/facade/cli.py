@@ -1505,8 +1505,16 @@ def cmd_stop(_args: argparse.Namespace) -> int:
 # grows a case the other lacks — a person told nothing at all is the failure
 # this feature is least able to survive, and it is the one duplication invites.
 _SEND_LOGS_FAILURES = {
-    "CooldownActive": "that computer built a bundle very recently — give it "
-                      "ten minutes and ask again",
+    # ⛔⛔ NO DURATION, AND THAT IS THE FIX. The refusal row carries only the
+    # class name — `{"status": "failed", "errorClass": ...}` — so no client
+    # can know which of the machine's TWO windows fired. Somebody refused
+    # for their own second press waits up to SEND_LOGS_COOLDOWN_SEC (600s);
+    # somebody refused because a CO-TENANT went first waits only
+    # SEND_LOGS_MACHINE_FLOOR_SEC (60s). "Give it ten minutes" was written
+    # for the first and said to both, overstating by ten times on the one
+    # surface whose normal caller is a sharer on a shared research computer.
+    "CooldownActive": "that computer built a bundle very recently, perhaps "
+                      "for someone else who uses it — try again shortly",
     "AlreadyBuilding": "that computer is already packaging a bundle — wait for "
                        "it to finish and ask again",
     "NotDeviceMember": "that computer no longer counts you as one of its "

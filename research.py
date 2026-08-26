@@ -8292,8 +8292,13 @@ def _send_logs_cooldown_remaining(now=None, cooldown=SEND_LOGS_COOLDOWN_SEC,
             mine = 0.0
         remaining = max(remaining, int(float(cooldown) - (at - mine)))
     elif not key:
-        # No submitter named: the terminal path and any legacy caller. Fall back
-        # to the whole window on the machine stamp, which is what they had.
+        # No submitter named. ⛔ MEASURED 2026-08-25: nothing in this build
+        # reaches here. The one call site passes `submitted_by`, which is
+        # already refused as SubmitterMissing when empty, and the "terminal
+        # path" this comment used to name does not exist — `cmd_send_logs`
+        # never consults the cooldown or the stamp at all. Kept as the safe
+        # answer for a future caller that omits a uid: the WHOLE window, so a
+        # missing name can never buy a shorter wait than a present one.
         remaining = max(remaining, int(float(cooldown) - (at - machine_last)))
     return max(0, remaining)
 
@@ -8477,10 +8482,19 @@ def _refuse_log_bundle_with_row(owner_uid: str, code: str, device_id: str,
     ⭐ WHICH REFUSALS ARE ACTUALLY REACHABLE, measured rather than assumed —
     because the first two answers I gave were both wrong.
 
-      • A non-owner cannot get here AT ALL. Three gates: the queue rules keep
-        send-logs out of the sharer allowlist, the app filters the picker to
-        devices it owns, and the whole section hides itself when that list is
-        empty. So the owner check below is defence in depth, not a live path.
+      • ⛔⛔ A NON-OWNER REACHES THIS ROUTINELY, AND THIS PARAGRAPH USED TO SAY
+        THE OPPOSITE. It listed three gates — the sharer allowlist, an
+        owned-only picker, a self-hiding section — and `send-logs-selected`
+        removed all three when it shipped. The rules now name that action
+        beside `check-update` for any device MEMBER, the app filters on
+        "owned OR shared with me", and the section hides only from somebody
+        with no machine at all. The handler agrees: the owner check below
+        applies to the two LEGACY actions, and a sharer falls through it to
+        a membership check. Their refusal row is written to THEIR tree
+        (`row_uid = submitted_by if selected`), which is how they read it.
+        ⭐ So CooldownActive is not a rare owner mistake — on a shared
+        research computer it is the likeliest refusal there is, because the
+        60-second machine floor is unkeyed and somebody else's send trips it.
 
       • THE DEVICE-READ FAILURE is the one an owner really reaches — a Firestore
         read hiccup on the machine, nothing to do with the person. It had no row

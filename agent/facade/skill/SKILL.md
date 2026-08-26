@@ -341,8 +341,11 @@ like a shortcut, makes a claim about a conversation that did not happen.
 - **After sending**, hand back the support code and stop. Packaging takes a
   moment. Check with `sr.py send-logs --status <CODE>` **when the user asks** —
   never on a timer.
-- One bundle per ten minutes per person. "Give it ten minutes" is the honest
-  answer to a cooldown, not a retry loop.
+- **A cooldown is not always ten minutes.** That is the window for the same
+  person asking twice; somebody refused because another user of that computer
+  asked first waits about a minute. The machine tells us only that it refused,
+  never how long is left — so say "shortly", never a number, and never retry
+  on a loop.
 
 ## Which link to share
 

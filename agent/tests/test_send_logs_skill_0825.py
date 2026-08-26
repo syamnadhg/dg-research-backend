@@ -313,10 +313,15 @@ def test_a_finished_bundle_reports_the_code_to_quote(wire, capsys) -> None:
 
 
 def test_a_refusal_is_reported_in_words(wire, capsys) -> None:
+    """⛔ "ten minutes" was the assertion here, and it was the defect. A sharer
+    refused because a co-tenant went first waits about a minute; nothing on the
+    wire says which window fired."""
     wire.row = {"status": "failed", "errorClass": "CooldownActive"}
     rc, out = _run(_args(status="K7XQ9B2M"), capsys)
     assert rc == 1
-    assert "ten minutes" in out
+    assert "very recently" in out
+    assert "try again shortly" in out
+    assert "ten minutes" not in out, "the wait is not always ten minutes"
     assert "CooldownActive" not in out, "a class name is not a sentence"
 
 
@@ -482,6 +487,20 @@ def test_the_skill_document_keeps_the_two_sentences_apart() -> None:
 def test_the_skill_document_forbids_polling_the_status() -> None:
     section = SKILL_MD.split("## Sending logs to support", 1)[1].split("\n## ", 1)[0]
     assert "never on a timer" in section
+
+
+def test_the_skill_document_does_not_hand_the_model_a_wait_to_quote() -> None:
+    """⛔⛔ THE DOCUMENT USED TO SAY "One bundle per ten minutes per person" AND
+    CALL "Give it ten minutes" THE HONEST ANSWER. The assistant reads this and
+    repeats it, so the wrong number reached a person through the document as
+    well as through the client's own table. Both windows have to be in here, or
+    the model reconstructs the single number from the one it was given."""
+    section = SKILL_MD.split("## Sending logs to support", 1)[1].split("\n## ", 1)[0]
+    assert "not always ten minutes" in section, (
+        "the document must say the cooldown is not one number")
+    assert "never a number" in section, (
+        "the document must tell the assistant not to quote a duration")
+    assert '"Give it ten minutes" is the honest' not in section
 
 
 def test_the_safety_section_names_send_logs() -> None:
