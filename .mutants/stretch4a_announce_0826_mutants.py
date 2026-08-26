@@ -122,8 +122,8 @@ MUTANTS = [
     ("D5", BRIDGE, "under",
      "⛔ the clear stops reaching the disk, so the next peek rehydrates the "
      "announce from the parked copy — it comes back from the dead",
-     [("            prefs.clear_pending_announce()\n        except Exception as e:  # noqa: BLE001\n            log.warning(\"could not clear the parked sign-in announce (%s)\",\n                        type(e).__name__)",
-       "            pass\n        except Exception as e:  # noqa: BLE001\n            log.warning(\"could not clear the parked sign-in announce (%s)\",\n                        type(e).__name__)")]),
+     [("            self._handed_out_ts = None\n            try:\n                prefs.clear_pending_announce()",
+       "            self._handed_out_ts = None\n            try:\n                pass")]),
     ("D6", BRIDGE, "under",
      "⛔⛔ THE REAL SIGN-OUT PATH STOPS CLEARING. `_self_logout` reaches "
      "`clear_session_if`, never `set_session(None)` — which has no non-test "
@@ -154,8 +154,8 @@ MUTANTS = [
     ("D10", BRIDGE, "over",
      "⛔ the park stops being best-effort, so a read-only disk takes the SIGN-IN "
      "down with it — a courtesy message failing the thing it is a courtesy about",
-     [("        except Exception as e:  # noqa: BLE001 — an announce must never fail a sign-in\n            log.warning(\"could not park the sign-in announce (%s) — memory only\",\n                        type(e).__name__)",
-       "        except Exception:  # noqa: BLE001\n            raise")]),
+     [("            except Exception as e:  # noqa: BLE001 — never fail a sign-in for this\n                log.warning(\"could not park the sign-in announce (%s) — memory only\",\n                            type(e).__name__)",
+       "            except Exception:  # noqa: BLE001\n                raise")]),
     ("D11", BRIDGE, "over",
      "⛔ delivery goes back to at-most-once: the read consumes as it reads, so "
      "any failure afterwards destroys the announce — and a scope that does not "
@@ -344,14 +344,14 @@ MUTANTS = [
     ("X2", BRIDGE, "under",
      "⛔⛔ the START door reopens: a second chat mints a fresh flow that replaces the "
      "held topic AND origin outright, so closing /pending bought nothing",
-     [("            incoming = body.get(\"origin\")\n            if isinstance(incoming, dict):",
-       "            incoming = body.get(\"origin\")\n            if False:")]),
+     [("                if _taken_by_another():\n                    self._json(409, {\"reason\": \"topic_taken\",\n                                     \"error\": \"another chat is already signing in \"\n                                              \"with a research waiting — ask again \"\n                                              \"once that finishes\"})\n                    return\n                state.set_remote(rf)",
+       "                state.set_remote(rf)")]),
     ("X3", BRIDGE, "over",
      "⛔ the START door refuses an ORIGIN-LESS caller too, which breaks the recovery "
      "path it also is — the terminal reaches it with no origin at all, and \"send me "
      "a fresh sign-in link\" stops working for everybody",
-     [("            incoming = body.get(\"origin\")\n            if isinstance(incoming, dict):",
-       "            incoming = body.get(\"origin\")\n            if True:")]),
+     [("                            and isinstance(incoming, dict)\n                            and not _same_origin(held.origin, incoming))",
+       "                            and not _same_origin(held.origin, incoming))")]),
     ("X4", BRIDGE, "under",
      "⛔⛔ `set_session(None)` goes back to nulling the attribute and leaving the "
      "announce ON DISK, so the next peek rehydrates it — a partial clear beside a "
