@@ -1216,3 +1216,32 @@ def test_a_real_delivery_is_logged_as_delivered(live, monkeypatch, caplog):
         requests.post(base + "/research", json={"topic": "T"})
     lines = [r.getMessage() for r in caplog.records if "owner-notify" in r.getMessage()]
     assert lines and "delivered" in lines[0], lines
+
+
+def test_a_decision_refusal_says_WHY_not_just_the_status(live, monkeypatch, caplog):
+    # ⛔⛔ FOUND BY REVIEW: the log read `error` alone, and the route answers a
+    # decision refusal as `{ok: false, skipped: <reason>}` with no `error` key at
+    # all. So `not_a_sharer`, `bad_ids` and `unsupported_kind` each printed
+    # `HTTP 403 ()` — the status without the one word that explains it.
+    base, _ = live
+    FakeFS.devices = [{"id": "a", "ownerUid": "owner-2", "sharedWith": ["u1"]}]
+    monkeypatch.setattr(bridge, "_fe_api_post",
+                        lambda *_a, **_k: (403, {"ok": False, "skipped": "not_a_sharer"}))
+    with caplog.at_level("INFO", logger="facade.bridge"):
+        requests.post(base + "/research", json={"topic": "T"})
+    line = next(r.getMessage() for r in caplog.records if "owner-notify" in r.getMessage())
+    assert "403" in line and "not_a_sharer" in line, line
+
+
+def test_and_an_error_shaped_refusal_still_says_why(live, monkeypatch, caplog):
+    # The polarity: `error` is what the rate-limit refusals and the auth 401
+    # carry, so reading only `skipped` would have moved the blind spot rather
+    # than closed it.
+    base, _ = live
+    FakeFS.devices = [{"id": "a", "ownerUid": "owner-2", "sharedWith": ["u1"]}]
+    monkeypatch.setattr(bridge, "_fe_api_post",
+                        lambda *_a, **_k: (429, {"error": "rate_limited"}))
+    with caplog.at_level("INFO", logger="facade.bridge"):
+        requests.post(base + "/research", json={"topic": "T"})
+    line = next(r.getMessage() for r in caplog.records if "owner-notify" in r.getMessage())
+    assert "429" in line and "rate_limited" in line, line

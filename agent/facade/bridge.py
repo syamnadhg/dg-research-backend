@@ -409,7 +409,16 @@ def _notify_device_owner_of_run(sess: "AccountSession", device_id: str,
     ``_resolve_device`` returns the explicit id before reading anything and
     discards every row on the branch that does list them, and ``owned`` is not a
     Firestore field at all — ``_decorate_devices`` grafts it on, and no run-start
-    path calls it. Buying it here costs a Firestore read per run start.
+    path calls it.
+
+    ⛔ AND THE COST HALF OF THIS ARGUMENT IS STRUCK, 2026-08-26. A first version
+    added "buying it here costs a Firestore read per run start", which review
+    showed is self-refuting: firing unconditionally costs the route's own
+    ``devices/{id}`` read ANYWAY, plus a rate-limiter transaction (one read and
+    one write) and a WAN POST. The read is moved and doubled, not avoided — and
+    on the branches that resolve a device by listing, rows carrying ``ownerUid``
+    are already in hand and thrown away. What survives, and is the whole reason,
+    is the TRUST half below.
 
     ⭐ It is also the wrong place. The route re-reads the device document and
     answers ``self`` for an owner precisely because a machine's claim about who
@@ -459,8 +468,15 @@ def _notify_device_owner_of_run_inner(sess: "AccountSession", device_id: str,
         log.info("owner-notify %s: %s", research_id,
                  f"skipped ({why})" if why else "delivered")
     else:
+        # ⛔⛔ BOTH KEYS, found by review 2026-08-26. This read `error` alone — and
+        # the route answers a DECISION refusal as `{ok:…, skipped:<reason>}` with
+        # no `error` at all. So `not_a_sharer`, `bad_ids` and `unsupported_kind`
+        # each printed `HTTP 403 ()`: the log gave the status and withheld the one
+        # word that says why. `error` is carried by the two rate-limit refusals
+        # and the auth 401; `skipped` by everything the decision itself refuses.
+        detail = body.get("skipped") or body.get("error") or ""
         log.info("owner-notify %s: HTTP %s (%s)", research_id, status,
-                 str(body.get("error") or "")[:120])
+                 str(detail)[:120])
 
 
 def _enqueue_research_run(fs: FirestoreRest, sess: AccountSession, *, topic: str,

@@ -83,9 +83,14 @@ MUTANTS = [
      "somebody else's inbox",
      [('            "topic": topic,',
        '            "topic": topic,\n            "callerLabel": sess.email,')]),
+    # ⛔ `why` CORRECTED 2026-08-26: it said the notice "MOVES" in front of the
+    # enqueue, but the edit PREPENDS one and leaves the original in place, so the
+    # mutant is a double-send whose first copy fires before the run is real. The
+    # harm it demonstrates is the same and the description was not.
     ("O4", BRIDGE, "over",
-     "⛔⛔ THE NOTICE MOVES IN FRONT OF THE ENQUEUE, so it can announce a run "
-     "that never started and send the owner to a chat that does not exist",
+     "⛔⛔ A SECOND NOTICE IS SPAWNED IN FRONT OF THE ENQUEUE, so one of the two "
+     "announces a run that never started and sends the owner to a chat that "
+     "does not exist",
      [("    try:\n        qid = fs.enqueue_start(",
        "    _spawn(_notify_device_owner_of_run, sess, device_id, rid, topic)\n"
        "    try:\n        qid = fs.enqueue_start(")]),
@@ -109,9 +114,11 @@ MUTANTS = [
      "added to the latency of every run start",
      [("    _spawn(_notify_device_owner_of_run, sess, device_id, rid, topic)",
        "    _notify_device_owner_of_run(sess, device_id, rid, topic)")]),
+    # ⛔ `why` CORRECTED 2026-08-26: no queue id is involved — the edit TRUNCATES
+    # the research id to eight characters.
     ("O7", BRIDGE, "over",
-     "⛔ the QUEUE id is sent instead of the research id, so the dedup key names "
-     "a run the owner cannot open and every notice looks like a different event",
+     "⛔ the research id is truncated, so the dedup key names a run the owner "
+     "cannot open and the route's id validation may refuse it outright",
      [("            \"researchId\": research_id,", "            \"researchId\": research_id[:8],")]),
     ("O8", BRIDGE, "over",
      "⛔ the topic is dropped, so the same event reads differently depending on "
@@ -123,9 +130,13 @@ MUTANTS = [
      "nothing was delivered — indistinguishable from an owner's own quiet run",
      [('    status, body = _fe_api_post(sess, "/api/notify", {',
        '    status, body = _fe_api_post(sess, "/api/notifyDevice", {')]),
+    # ⛔ `why` CORRECTED 2026-08-26: the mutated code takes the `else` branch and
+    # logs "delivered" — it does not warn. It was also an unkillable survivor
+    # until this wave added `caplog` assertions on both branches.
     ("O10", BRIDGE, "over",
-     "⛔ a `skipped` reply is logged as a failure, so the HEALTHY path for an "
-     "owner — the likeliest agent user — fills the log with warnings",
+     "⛔⛔ AN OWNER'S QUIET NO-OP IS LOGGED AS 'delivered', so the one question "
+     "this log exists to answer — did the owner actually get told — is answered "
+     "wrongly on the commonest path there is",
      [('        why = body.get("skipped")', '        why = None')]),
 ]
 

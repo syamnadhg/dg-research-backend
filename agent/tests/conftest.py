@@ -41,6 +41,21 @@ def _no_real_fe_posts(monkeypatch):
     monkeypatch.setattr(bridge, "_fe_api_post", _stub)
     monkeypatch.setattr(bridge, "_fe_calls", calls, raising=False)
 
+    # ⛔⛔ AND THE BASE URL TOO, because the sentence above was a RACE, not a
+    # guarantee — found by review 2026-08-26. Patching `_fe_api_post` only covers
+    # calls made while the patch is live. The owner-notice rides a daemon thread
+    # (`_spawn`), and only two suites make `_spawn` synchronous:
+    # `test_bridge_routes.py` drives `POST /research` seven times and does not.
+    # CPython schedules the thread promptly, so in practice it resolves the patched
+    # global — but "in practice" is not what the sentence claims, and a thread that
+    # loses that race would POST to the real host with a fake Bearer token.
+    #
+    # ⭐ So the host is neutralised as well: even a call that escapes the patch
+    # goes to a port nothing is listening on and fails in `requests`, which
+    # `_fe_api_post` turns into `(0, …)`. Two independent guards, because the
+    # failure mode is silent by construction — the notice swallows its own errors.
+    monkeypatch.setattr(config, "FE_BASE", "http://127.0.0.1:9", raising=False)
+
 
 @pytest.fixture(autouse=True)
 def _isolate_prefs_dir(monkeypatch, tmp_path):
