@@ -70,7 +70,16 @@ MUTANTS = [
     ("O1", BRIDGE, "under",
      "⛔⛔ THE GAP ITSELF: nothing is sent, so a sharer starting a run from chat, "
      "a terminal or a fleet box notifies nobody — which is the reported state",
-     [("    _spawn(_notify_device_owner_of_run, sess, device_id, rid, topic)\n", "")]),
+     # ⛔ RE-POINTED 2026-08-26 — the second time this file's compile gate has
+     # earned its keep. `_spawn` gained a try/except of its own, so deleting the
+     # call alone left `try:` with an empty body: a mutant that does not parse,
+     # which measures nothing and WOULD have reported a kill without the gate,
+     # because the suite goes red on an import error rather than on behaviour.
+     # The whole block goes now.
+     [("    try:\n        _spawn(_notify_device_owner_of_run, sess, device_id, rid, topic)\n"
+       "    except Exception as e:  # noqa: BLE001 — a courtesy notice, never a failure\n"
+       "        log.info(\"owner-notify %s: not dispatched (%s)\", rid, type(e).__name__)\n",
+       "")]),
     ("O2", BRIDGE, "over",
      "⛔ the kind is misspelt, so the route refuses it with a 400 on its merits "
      "and the notice silently never lands — the literal is a wire contract with "
