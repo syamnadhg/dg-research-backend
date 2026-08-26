@@ -298,7 +298,7 @@ MUTANTS = [
      "the refusal fires when NO topic is held, so the ordinary first attach — "
      "the one that gives a terminal sign-in a chat to answer in — is rejected",
      [('                if ((flow.pending_topic or "").strip()\n                        and isinstance(origin, dict)',
-       '                if ((isinstance(origin, dict)')]),
+       '                if (isinstance(origin, dict)')]),
     ("T4", BRIDGE, "under",
      "the platform stops counting, so telegram chat 111 and whatsapp chat 111 "
      "read as one conversation and one steals the other's research",
