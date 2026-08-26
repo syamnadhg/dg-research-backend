@@ -1300,6 +1300,71 @@ def _fe_api_post(sess: "AccountSession", path: str, payload: dict) -> tuple[int,
         return 0, {"error": f"could not reach {config.FE_BASE} ({type(e).__name__})"}
 
 
+# The most of the agent's own log we will ever send. The file rotates at 1 MB with
+# 3 backups, so 4 MB can exist and only the ACTIVE file is ever read — but the cap
+# is stated here as well, because the route on the other side enforces its own and
+# a body it refuses is a wasted upload.
+_AGENT_LOG_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _fe_api_post_bytes(sess: "AccountSession", path: str, blob: bytes,
+                       content_type: str, headers: dict[str, str]) -> tuple[int, dict]:
+    """POST raw BYTES to a web-app API route as the signed-in user.
+
+    ⭐ The sibling of `_fe_api_post`, and it exists for the same reason that one
+    does: some writes must go through the app's admin-SDK handlers because the
+    rules deliberately refuse them. This one carries a body that is not JSON.
+
+    ⛔ THE AGENT CANNOT WRITE TO STORAGE DIRECTLY, which is why this is the shape.
+    `storage.rules` gates every write under `logs/**` on a `deviceId` custom claim
+    equal to the path segment, and this session's token has NO custom claims at all
+    — `/api/agent/login/approve` mints `createCustomToken(user.uid)` with no
+    developer claims, deliberately, so that an agent can only ever be connected to
+    its own account. Measured before building.
+    """
+    try:
+        r = requests.post(
+            f"{config.FE_BASE}{path}",
+            data=blob,
+            headers={"Authorization": f"Bearer {sess.id_token()}",
+                     "Content-Type": content_type, **headers},
+            timeout=60,
+        )
+        try:
+            body = r.json() if r.content else {}
+        except ValueError:
+            body = {}
+        return r.status_code, body if isinstance(body, dict) else {}
+    except requests.RequestException as e:
+        return 0, {"error": f"could not reach {config.FE_BASE} ({type(e).__name__})"}
+
+
+def _read_agent_log_tail(cap: int = _AGENT_LOG_MAX_BYTES) -> bytes:
+    """The last ``cap`` bytes of the agent's own log, or b"" if there is none.
+
+    ⛔ THE TAIL, NOT THE HEAD. If the file is over the cap the interesting part is
+    what happened most recently — the thing the person is reporting — so a head
+    read would send the least useful bytes and call it done.
+
+    ⛔ AND THE ACTIVE FILE ONLY, not the rotated backups. Sending four files under
+    one name is not something the receiving route or a reader would understand, and
+    the active file is where a just-reproduced problem is.
+    """
+    path = config.log_path()
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            if size > cap:
+                fh.seek(size - cap)
+                # A mid-line start is inevitable when tailing; drop the partial
+                # first line so the upload begins at a real record.
+                fh.readline()
+            return fh.read()
+    except OSError as e:
+        log.info("agent log not readable (%s) — nothing to send", type(e).__name__)
+        return b""
+
+
 # Phase → (display name, ordered link specs). A spec is (label, source) where
 # source is "sr:<docType>" (the permanent, non-revocable share) or "pf:<kind>"
 # (a platform link with no SR equivalent — NotebookLM / YouTube / final Doc).
@@ -1690,14 +1755,28 @@ def _advance_remote_flow(state: BridgeState) -> str | None:
     if flow is None or flow.state in ("connected", "expired", "error"):
         return None
     if time.time() >= flow.expires_at:
+        # ⛔ THE ORDINARY FAILURE, AND IT USED TO BE SILENT. A person who never
+        # finishes in the browser expires HERE, before the broker is asked — so the
+        # INFO on the broker-reported branch below never fires, and the most common
+        # unsuccessful sign-in left no trace in the log at all. That is precisely
+        # the outcome somebody would be sending the log to explain.
         flow.state = "expired"
+        log.info("remote login expired before approval (never confirmed in the browser)")
         return None
     try:
         res = devicelogin.poll_once(flow.poll_token)
     except DeviceLoginError as e:
-        # Transient transport blip — stay pending, keep polling. Log the detail;
-        # the client gets a fixed message, not the upstream body.
-        log.debug("remote poll transient error: %s", e)
+        # Stay pending and keep polling: from here every one of these is
+        # indistinguishable from a blip, and the flow's own TTL bounds the waiting.
+        #
+        # ⛔⛔ BUT IT IS NOT ALL BLIPS, AND THE OLD LINE SAID IT WAS. This catch also
+        # takes a persistent HTTP 500 from the broker and "broker reported approved
+        # but sent no custom token" — a sign-in that CANNOT succeed, retried until
+        # the TTL runs out and then reported as an expiry. Calling that a "transient
+        # transport blip" at DEBUG meant the default level recorded nothing and the
+        # verbose level mislabelled it. The client still gets a fixed message, never
+        # the upstream body.
+        log.info("remote poll failed, still waiting: %s", e)
         return "sign-in service temporarily unreachable"
     status = res.get("status")
     if status == devicelogin.APPROVED:
@@ -1985,6 +2064,8 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 self._device_remove()
             elif path == "/logs/send":
                 self._log_send()
+            elif path == "/logs/agent-log":
+                self._log_agent_log()
             elif path == "/research":
                 self._research()
             elif path.startswith("/research/") and path.endswith("/stop"):
@@ -2709,6 +2790,76 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 self._firestore_502(e)
                 return
             self._json(200, {"code": code, "row": row})
+
+        def _log_agent_log(self) -> None:
+            """Send THIS host's own agent log up beside a bundle already on its way.
+
+            ⛔⛔ THE ORDER IS NOT NEGOTIABLE, and this route enforces it rather than
+            trusting the caller. The app's Clear-logs button finds objects by listing
+            each ROW's support-code folder — it does not scan the bucket — so an
+            object written before the machine's row lands, or under a code no row
+            names, is a readable log the privacy button can never reach. The
+            receiving route re-checks the row for the same reason; this check is here
+            so a caller gets a sentence instead of a 404 from somewhere else.
+
+            ⛔ AND IT IS NEVER FATAL TO THE SEND IT ACCOMPANIES. The machine's
+            bundle is already gone by the time this runs. A failure here is reported
+            and nothing else: the person is told the agent's log did not go, which
+            is true and actionable, and the support code they were given still works.
+            """
+            acct = self._account()
+            if acct is None:
+                return
+            sess, fs = acct
+            body = self._read_json()
+            code = str(body.get("code") or "").strip().upper()
+            if not _SUPPORT_CODE_RE.match(code):
+                self._json(400, {"error": "that isn't a support code"})
+                return
+            try:
+                row = fs.get_log_bundle(sess.uid, code)
+            except RevokedError:
+                self._json(401, {"error": "session revoked — run /login again"})
+                return
+            except FirestoreError as e:
+                self._firestore_502(e)
+                return
+            if not isinstance(row, dict):
+                # The machine has not answered yet. Not an error state — the caller
+                # waits and asks again, exactly as it does for the bundle itself.
+                self._json(409, {"reason": "bundle_not_landed",
+                                 "error": "that computer hasn't confirmed its own "
+                                          "logs yet — try again in a moment"})
+                return
+            device_id = str(row.get("deviceId") or "")
+            if not device_id:
+                self._json(409, {"reason": "bundle_not_landed",
+                                 "error": "that bundle has no computer recorded "
+                                          "against it yet"})
+                return
+            blob = _read_agent_log_tail()
+            if not blob:
+                # ⭐ Reported as a fact, not a failure. An agent whose log is empty
+                # has nothing to say, and inventing a zero-byte file would leave
+                # something claiming otherwise.
+                self._json(200, {"ok": True, "sent": False, "reason": "empty",
+                                 "path": str(config.log_path())})
+                return
+            status, reply = _fe_api_post_bytes(
+                sess, "/api/logs/agent-log", blob, "text/plain; charset=utf-8",
+                {"x-support-code": code, "x-device-id": device_id},
+            )
+            if status != 200:
+                log.warning("agent-log upload for %s failed: HTTP %s %s",
+                            code, status, reply.get("error", ""))
+                self._json(502, {"reason": "agent_log_not_sent",
+                                 "error": "your computer's own agent log could not "
+                                          "be sent — the rest of the bundle is "
+                                          "unaffected"})
+                return
+            log.info("agent log sent for %s (%s bytes)", code, len(blob))
+            self._json(200, {"ok": True, "sent": bool(reply.get("stored")),
+                             "bytes": len(blob)})
 
         def _research(self) -> None:
             body = self._read_json()

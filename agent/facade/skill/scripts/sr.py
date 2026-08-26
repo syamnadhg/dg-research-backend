@@ -1187,10 +1187,24 @@ def cmd_send_logs(args) -> int:
             return _emit(body, args.json,
                          [f"✗ {want} didn’t send: {_send_logs_failure(row.get('errorClass'))}."], 1)
         if status == "done":
-            return _emit(body, args.json, [
-                f"✓ {want} was sent — {int(row.get('runCount') or 0)} run(s), "
-                f"{_size_words(row.get('sizeBytes'))}.",
-                f"Quote {want} when you report the problem."])
+            lines = [f"✓ {want} was sent — {int(row.get('runCount') or 0)} run(s), "
+                     f"{_size_words(row.get('sizeBytes'))}."]
+            if getattr(args, "agent_log", False):
+                # ⭐ THE SECOND STEP, AND THE ONLY PLACE IT CAN HAPPEN IN THIS
+                # CLIENT. The bundle has landed, so the row now names a folder the
+                # app's Clear-logs will list — which is exactly the condition the
+                # bridge refuses this without.
+                ac, ab = _post("/logs/agent-log", {"code": want})
+                if ac != 200:
+                    lines.append("The agent’s own log did not go: "
+                                 f"{ab.get('error', ac)}. The rest is unaffected.")
+                elif not ab.get("sent"):
+                    lines.append("The agent’s log on this host was empty — nothing "
+                                 "to add.")
+                else:
+                    lines.append("The agent’s log on this host went up too.")
+            lines.append(f"Quote {want} when you report the problem.")
+            return _emit(body, args.json, lines)
         return _emit(body, args.json, [f"{want} is still being packaged."])
 
     path = "/logs/runs"
@@ -1217,6 +1231,7 @@ def cmd_send_logs(args) -> int:
     name = body.get("deviceName") or "your Research Computer"
     owned = bool(body.get("owned"))
     machine = bool(getattr(args, "machine", False))
+    agent_log = bool(getattr(args, "agent_log", False))
 
     if machine and not owned:
         # Said here rather than after a round trip. The computer would refuse
@@ -1263,6 +1278,16 @@ def cmd_send_logs(args) -> int:
                          "run it has ever done, for everyone who uses it.")
         else:
             lines.append("That computer’s own logs are not included.")
+        # ⛔⛔ A DIFFERENT COMPUTER. Everything else in this plan describes material
+        # leaving the RESEARCH computer; the agent's log is on the host running the
+        # bridge, and in a chat setup that is very often somewhere else entirely.
+        # Kept as its own sentence rather than folded into the list below, for the
+        # same structural reason the app keeps retention out of `consentIncluded`.
+        if agent_log:
+            lines.append("Plus the log from the agent on the host running this — a "
+                         "connection and sign-in record, not research content.")
+        else:
+            lines.append("The agent’s own log is not included.")
         # ⛔⛔ The three facts the app's modal names and this plan did not — see
         # the note beside the same lines in cli.py. Only topics and titles were
         # conveyed, by the run list itself.
@@ -1300,14 +1325,28 @@ def cmd_send_logs(args) -> int:
         return _emit(sent, args.json,
                      [f"✗ couldn’t send the logs: {sent.get('error', code)}"], _fail_code(code))
     support = sent.get("code", "")
-    return _emit(sent, args.json, [
+    lines = [
         f"✓ Asked “{name}” for the logs. Your support code is {support}.",
         "It takes a moment to package. Ask me to check on it and I’ll look.",
-        *_agent_directive_block([
-            f"To check on it later, run: sr send-logs --status {support}",
-            "Do not poll on a timer — only when the user asks.",
-        ]),
-    ])
+    ]
+    directives = [
+        f"To check on it later, run: sr send-logs --status {support}",
+        "Do not poll on a timer — only when the user asks.",
+    ]
+    if agent_log:
+        # ⛔⛔ THE AGENT'S LOG CANNOT GO YET, AND THIS SAYS SO RATHER THAN SILENTLY
+        # DROPPING IT. It may only be uploaded once the machine's row has landed —
+        # the app's Clear-logs finds objects by listing each ROW's folder, so
+        # anything written before the row exists is a readable log the privacy
+        # button can never reach. This client does not wait for anything, so the
+        # second step is handed to the assistant as a directive rather than
+        # attempted here and failed.
+        lines.append("The agent’s own log goes up once that computer’s bundle "
+                     "lands — ask me to check on it and I’ll finish that part.")
+        directives.append(
+            f"Once the bundle shows done, run: sr send-logs --status {support} "
+            "--agent-log   (it is refused until then, by design)")
+    return _emit(sent, args.json, [*lines, *_agent_directive_block(directives)])
 
 
 def cmd_list(args) -> int:
@@ -1917,6 +1956,14 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
         if re.search(r"\b(computer|machine|device)(?:’s|'s)?\s+own\b", low) or \
                 re.search(r"\bown\s+(logs?|log ?files?|diagnostics?)\b", low):
             argv.append("--machine")
+        # ⛔ THE AGENT'S OWN LOG NEEDS ITS OWN WORDS, and they must not overlap with
+        # the ones above. "the computer's own logs" and "the agent's log" are two
+        # different machines, so a pattern loose enough to catch both would send
+        # material nobody asked for — the same reasoning that keeps "everything"
+        # away from --machine.
+        if re.search(r"\b(agent|bridge)(?:’s|'s)?\s+(own\s+)?(log|logs)\b", low) or \
+                re.search(r"\bagent\s+log\b", low):
+            argv.append("--agent-log")
         return argv, None
 
     # 3. Run controls (before the broad status rules).
@@ -2158,6 +2205,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="actually send (the bare command only shows what would go)")
     sl.add_argument("--machine", action="store_true",
                     help="also send that computer's own logs (its owner only)")
+    sl.add_argument("--agent-log", dest="agent_log", action="store_true",
+                    help="also send the log from the agent on this host")
     sl.add_argument("--none", action="store_true",
                     help="send no runs — for connection problems, with --machine")
     sl.add_argument("--device", default="", help="which computer (name or id)")

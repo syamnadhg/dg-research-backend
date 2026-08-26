@@ -82,6 +82,19 @@ FE_BASE: str = os.environ.get("SUPER_AGENT_FE_BASE", "https://superresearch.io")
 # `localhost` (not the bare 127.0.0.1 literal) — otherwise signInWithPopup
 # raises auth/unauthorized-domain. Browsers fall back ::1 → 127.0.0.1, so the
 # localhost URL reaches the 127.0.0.1-bound server fine.
+# ⛔⛔ THE ONLY WAY TO GET A VERBOSE PRODUCTION BRIDGE, and until this there was
+# none at all. `agent serve` takes `-v`, but the always-on bridge is started by a
+# GENERATED launcher: `autostart.py` writes the literal
+# `raise SystemExit(main(['serve']))`, with no flag, and refreshes that file — so a
+# hand-edit does not survive. There was no environment variable for verbosity
+# anywhere in this package either, though this module uses `SUPER_AGENT_*` in ten
+# other places. So the support loop every other surface assumes — "turn verbose on,
+# reproduce it, send us the log" — was not awkward, it was IMPOSSIBLE on a
+# correctly-installed agent. `agent doctor` now prints how to set this.
+VERBOSE: bool = os.environ.get("SUPER_AGENT_VERBOSE", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
 BRIDGE_HOST: str = os.environ.get("SUPER_AGENT_BRIDGE_HOST", "127.0.0.1")
 BRIDGE_PORT: int = int(os.environ.get("SUPER_AGENT_BRIDGE_PORT", "9876"))
 

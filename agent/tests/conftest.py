@@ -1,15 +1,50 @@
-"""Shared pytest fixtures."""
+"""Shared pytest fixtures, and the one correct way to read source in this suite."""
 
 from __future__ import annotations
 
+import io
 import json
 import threading
+import tokenize
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import pytest
 
 from facade import config
+
+
+def code_only(src: str) -> str:
+    """Source with `#` comments blanked IN PLACE, all other layout untouched.
+
+    ⛔ MANDATORY FOR ANY ASSERTION ABOUT WHAT THE CODE DOES. The comment
+    explaining a fix almost always quotes the thing the assertion looks for, so a
+    raw search passes against the prose and keeps passing after the code is gone.
+    The root suite's `tests/conftest.py` records two mutants that survived exactly
+    that way.
+
+    ⛔ BLANKED IN PLACE, NOT REBUILT FROM TOKENS. Rebuilding normalises whitespace,
+    which makes every assertion depend on how the tokenizer happens to space a
+    condition — and it silently breaks `.index("def foo")` slicing, which is how
+    this function came to be written: the first version of the agent-log tests
+    rebuilt from tokens and could no longer find its own subject.
+
+    ⚠ AND IT REPLACES A LINE-SPLIT IDIOM ALREADY IN THIS SUITE.
+    `test_send_logs_cli_0825.py` does `ln.split("#", 1)[0]`, which also truncates
+    any line with a `#` inside a STRING. New assertions should use this.
+    """
+    lines = src.splitlines(keepends=True)
+    try:
+        toks = list(tokenize.generate_tokens(io.StringIO(src).readline))
+    except tokenize.TokenError:
+        return src
+    for tok in toks:
+        if tok.type != tokenize.COMMENT:
+            continue
+        row, col = tok.start[0] - 1, tok.start[1]
+        lines[row] = (lines[row][:col] + " " * len(tok.string)
+                      + lines[row][col + len(tok.string):])
+    return "".join(lines)
 
 
 @pytest.fixture(autouse=True)

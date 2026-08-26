@@ -102,7 +102,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
         return rc
     # The long-running bridge writes the durable operational log; short CLI
     # commands stay console-only (configured in main()).
-    logsetup.configure(verbose=getattr(args, "verbose", False), to_file=True)
+    # ⛔ `or config.VERBOSE` is the load-bearing half: the pinned launcher runs
+    # `main(['serve'])` with no flag, so on every autostarted bridge — the
+    # recommended install — `args.verbose` is False and always will be.
+    logsetup.configure(verbose=getattr(args, "verbose", False) or config.VERBOSE,
+                       to_file=True)
     # Foreground serve — nudge toward the always-up background mode unless it's
     # already pinned. (When autostart launches serve windowless this is a no-op:
     # the task exists, so is_installed() is True and the tip is skipped.)
@@ -1133,6 +1137,47 @@ def _doctor_row(label: str, ok_flag: bool, detail: str, warn_only: bool = False)
     print(f"  {b.c(color, mark)}  {label.ljust(10)}{detail}")
 
 
+def _doctor_log_row() -> None:
+    """Where the agent's own log lives, whether anything is in it, and how to make
+    it say more.
+
+    ⛔⛔ BEFORE THIS, THE PATH WAS EFFECTIVELY UNREACHABLE. Its only surface was one
+    `print` in `serve()`'s startup banner, and three things make that print nothing
+    a person sees: the pinned launcher runs the bridge under a launchd plist with no
+    `StandardOutPath`, a systemd unit with no `StandardOutput`, or Windows
+    windowless — so on the RECOMMENDED install it goes to /dev/null; the banner is
+    on the BIND-SUCCESS path only, so somebody whose port is squatted or whose
+    bridge is already running never reaches it; and it scrolls once before
+    `serve_forever` blocks. The only other mention of the path in the whole package
+    is a warning emitted when the file cannot be opened — i.e. the one case where
+    reading it is not an option.
+
+    ⛔ SO IT GOES BEFORE THE BRIDGE CHECK, deliberately. `cmd_doctor` returns early
+    when the bridge is down, and a bridge that will not start is exactly when
+    somebody needs this file.
+
+    ⚠ AND IT SAYS THE LOG IS NOT IN A SUPPORT BUNDLE, because it is not and cannot
+    be: the collector refuses anything outside the research computer's own log root,
+    and that refusal is what the consent screen's promise is gated on. Sending it is
+    a separate, opt-in step.
+    """
+    path = config.log_path()
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = None
+    if size is None:
+        detail = f"{path}  (nothing written yet)"
+    elif size < 1024:
+        detail = f"{path}  ({size} B)"
+    else:
+        detail = f"{path}  ({size // 1024} KB)"
+    _doctor_row("log", size is not None, detail, warn_only=size is None)
+    b.dim("              not sent with a support bundle — this file stays on this host")
+    if not config.VERBOSE:
+        b.dim("              for more detail:  SUPER_AGENT_VERBOSE=1, then restart the bridge")
+
+
 def cmd_doctor(_args: argparse.Namespace) -> int:
     b.header("medicus", "diagnose + connect", tagline_color=branding._BOLD + branding._ACCENT)
     print(f"\n  {b.c(branding._DIM, f'facade v{__version__}')}\n")
@@ -1159,6 +1204,8 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
         _doctor_row("sr web", True, f"reachable ({config.FE_BASE})")
     except requests.RequestException as e:
         _doctor_row("sr web", False, f"{config.FE_BASE} — {e}")
+
+    _doctor_log_row()
 
     health = _bridge_get("/healthz")
     if health is None:
@@ -1751,6 +1798,7 @@ def cmd_send_logs(args: argparse.Namespace) -> int:
         names = [r.get("name") for r in rows]
 
     machine = bool(args.machine)
+    agent_log = bool(getattr(args, "agent_log", False))
     if machine and not owned:
         # Refused here as well as at the bridge, so the sentence arrives before
         # a round trip rather than after one.
@@ -1773,6 +1821,22 @@ def cmd_send_logs(args: argparse.Namespace) -> int:
               "run it has ever done, for everyone who uses it.")
     else:
         print("That computer's own logs are NOT included.")
+    # ⛔⛔ A DIFFERENT COMPUTER, WHICH IS WHY IT IS ITS OWN SENTENCE AND NOT AN ITEM
+    # IN THE LIST BELOW. Every other line in this plan is about material leaving the
+    # RESEARCH computer; the agent's log is on the host running this command, and
+    # the two are frequently not the same machine. The app deliberately keeps
+    # retention out of its `consentIncluded` list for the same structural reason —
+    # every entry in that list is read as another thing leaving the same place.
+    #
+    # ⛔ AND THE WORDING AVOIDS "this computer's own logs" ON PURPOSE. A guard bans
+    # that exact phrase across this file, sr.py and bridge.py, because it reads as
+    # the RESEARCH computer to somebody running the command from a third machine.
+    if agent_log:
+        print("It will ALSO include the log from the agent on THIS host — the "
+              "program running this command. That is a connection and sign-in "
+              "record, not research content, and it never leaves unless asked for.")
+    else:
+        print("The agent's own log on this host is NOT included.")
     # ⛔⛔ THE THREE FACTS THE APP'S MODAL NAMES AND THIS PLAN DID NOT. The header
     # of this section claims the printed plan makes `consent: true` as true as
     # the modal does. It did not: `consentIncluded` in the web app names four
@@ -1821,8 +1885,41 @@ def cmd_send_logs(args: argparse.Namespace) -> int:
     print(f"{_OK} Asked. Support code: {code}")
     if args.no_wait:
         print(f"    Check with:  agent send-logs --status {code}")
+        if agent_log:
+            # ⛔ NOT SENT ON THIS PATH, AND SAID SO. The agent's log may only go up
+            # after the machine's row lands, and --no-wait is the choice not to wait
+            # for that. Sending it anyway would put an object in a folder no row
+            # names yet, where the app's Clear-logs could never find it.
+            print("    The agent's own log was not sent — it can only go once that "
+                  "computer's bundle has landed. Re-run without --no-wait.")
         return 0
-    return _await_bundle(code, args.wait)
+    rc = _await_bundle(code, args.wait)
+    if agent_log:
+        _send_agent_log(code)
+    return rc
+
+
+def _send_agent_log(code: str) -> None:
+    """Hand up this host's own agent log, after the machine's bundle has landed.
+
+    ⛔ NEVER CHANGES THE EXIT CODE, and never retries. The machine's bundle is
+    already sent by the time this runs and the support code the person was given
+    already works, so a failure here is one more sentence rather than a failed
+    command. The person is told plainly that this one piece did not go.
+    """
+    res = _bridge_post("/logs/agent-log", {"code": code}, timeout=90.0)
+    if res is None or res[0] != 200:
+        print(f"{_NO} The agent's own log did not go: {_err(res)}")
+        print(f"    The rest of the bundle is unaffected — support code {code}.")
+        return
+    payload = res[1]
+    if not payload.get("sent"):
+        # An empty log is the ordinary case on a healthy machine, so it is stated
+        # as a fact and not dressed up as a problem.
+        print(f"{_OK} The agent's log on this host was empty — nothing to add.")
+        return
+    print(f"{_OK} The agent's log on this host went too "
+          f"({_size_words(int(payload.get('bytes') or 0))}).")
 
 
 def _local_superresearch() -> "str | None":
@@ -1974,6 +2071,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="send no runs — for pairing problems, with --machine")
     sl.add_argument("--machine", action="store_true",
                     help="also send that computer's own logs (its owner only)")
+    # ⛔ A FLAG AND NOT A PROMPT, matching --machine. This surface prints the whole
+    # plan and then asks ONE yes/no over all of it — `_decide` takes exactly "y" or
+    # "yes" — so there is no per-item reader to hang a question off, and inventing
+    # one here would make this the only screen in the product that asks twice.
+    sl.add_argument("--agent-log", dest="agent_log", action="store_true",
+                    help="also send the log from the agent on THIS host")
     sl.add_argument("--list", action="store_true",
                     help="just show what it's holding, send nothing")
     sl.add_argument("--status", metavar="CODE",

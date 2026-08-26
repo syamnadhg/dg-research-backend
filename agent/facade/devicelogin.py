@@ -30,6 +30,16 @@ import requests
 
 from . import config
 
+# ⛔ DELIBERATELY UNUSED, AND THAT IS WORTH SAYING. Every failure in this module
+# raises `DeviceLoginError` carrying its own detail — the HTTP status, the body
+# prefix, "returned a non-JSON response", "approved but sent no custom token" — and
+# the CALLERS log that text. Logging here as well would double every line.
+#
+# ⚠ What made that arrangement look broken until 2026-08-26 was the consumer, not
+# this file: the poll path logged the exception at DEBUG and called it a "transient
+# transport blip", so at the default level a persistent broker 500 left nothing
+# behind and a verbose run mislabelled it. That is fixed where it was wrong
+# (`bridge.py:_advance_remote_flow`). Do not add duplicate logging here.
 log = logging.getLogger(__name__)
 
 # Flow status values the FE poll endpoint reports.
