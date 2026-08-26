@@ -343,6 +343,38 @@ MUTANTS = [
 ]
 
 
+# ⛔⛔ THE IN-FLIGHT MARKER, ADDED 2026-08-26 AFTER THIS BIT TWICE IN ONE DAY.
+# Each mutant is restored in a `finally`, which covers an exception and a
+# KeyboardInterrupt — and covers NOTHING when the process is killed outright or
+# the session it runs under is torn down. Both happened today, and both left a
+# mutant sitting in the source: once `needsDeviceChoice: False` in the /updates
+# handler, once the sole-ONLINE rung deleted from the picker. A tree that looks
+# committed and is not is the worst possible starting state for the next thing you
+# measure.
+#
+# So the file being mutated is recorded BEFORE the write and the record is removed
+# after the restore. A later run that finds one refuses to start and says exactly
+# which file to check.
+_INFLIGHT = Path(__file__).with_suffix(".inflight")
+
+
+def _mark(mid: str, fname: str) -> None:
+    _INFLIGHT.write_text(f"{mid}\t{fname}\n", encoding="utf-8")
+
+
+def _unmark() -> None:
+    try:
+        _INFLIGHT.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _refuse_if_a_previous_run_died() -> str | None:
+    if not _INFLIGHT.exists():
+        return None
+    return _INFLIGHT.read_text(encoding="utf-8").strip()
+
+
 def sh(args, **kw):
     return subprocess.run(args, capture_output=True, text=True, **kw)
 
@@ -409,6 +441,14 @@ def main() -> int:
         print(f"⚠ FILTERED to {', '.join(sorted(only))} — this is a spot check, "
               f"not a score for the stretch.")
 
+    stranded = _refuse_if_a_previous_run_died()
+    if stranded:
+        print("⛔⛔ A PREVIOUS RUN DIED WITH A MUTANT IN THE SOURCE:\n"
+              f"    {stranded}\n"
+              "Restore that file (git checkout -- <file>), then delete\n"
+              f"    {_INFLIGHT}")
+        return 2
+
     dirty = tracked_dirty()
     if dirty:
         print("Tracked files are modified. Commit or stash first — a harness that starts\n"
@@ -448,6 +488,7 @@ def main() -> int:
                     raise AssertionError(
                         f"the mutant does not parse ({syn.lineno}: {syn.msg}) — "
                         "check the anchor's indentation") from None
+            _mark(mid, fname)
             path.write_text(mutated, encoding="utf-8")
             if path.read_text(encoding="utf-8") != mutated:
                 raise AssertionError("the mutation did not reach the file")
@@ -468,6 +509,7 @@ def main() -> int:
             faults.append((mid, direction, why, str(exc)))
         finally:
             path.write_text(original, encoding="utf-8")
+            _unmark()
 
     leftover = tracked_dirty()
     if leftover:
