@@ -147,7 +147,11 @@ MUTANTS = [
      "file leaves `pendingAnnounceUid: \"\"`, and then the announce is readable by "
      "whoever asks with nothing — the same cross-account leak the binding exists to "
      "prevent.\n"
-     "     ⭐⭐ RE-POINTED TWICE, and the second time because it became EQUIVALENT. "
+     "     ⭐⭐ RE-POINTED THREE TIMES, and it took all three to see why. The case is "
+     "covered by TWO guards — an empty-caller check and an empty-owner check — so "
+     "removing EITHER leaves the other, and any single-edit mutant of it is "
+     "equivalent BY CONSTRUCTION. Two runs proved that before the reason was "
+     "obvious. It removes both now, which is the only edit the behaviour can see. "
      "It first mutated `owner and owner == uid`, survived, and that survival is how "
      "the hole was found. Closing it added `if not uid: return None` — which catches "
      "the empty CALLER before the clause the mutant edits, making `owner and` "
@@ -155,7 +159,9 @@ MUTANTS = [
      "harness fault however true its sentence is, so it now edits the guard that "
      "actually decides the case",
      [("    if not uid:\n        return None\n    data = load()",
-       "    data = load()")]),
+       "    data = load()"),
+      ("    if isinstance(ev, dict) and ev and owner and owner == uid:",
+       "    if isinstance(ev, dict) and ev and owner == uid:")]),
     ("D10", BRIDGE, "over",
      "⛔ the park stops being best-effort, so a read-only disk takes the SIGN-IN "
      "down with it — a courtesy message failing the thing it is a courtesy about",
