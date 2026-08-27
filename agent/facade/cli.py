@@ -1261,6 +1261,14 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
 
     _doctor_log_row()
 
+    # ⛔ SAY IT BEFORE THE BRIDGE ROW, because it is the reason the bridge row is
+    # about to be wrong. A refused SUPER_AGENT_BRIDGE_PORT sends this command and
+    # the bridge to two different ports, and every symptom of that is
+    # indistinguishable from "the bridge is down".
+    if config.BRIDGE_PORT_REJECTED:
+        _doctor_row("bridge port", False,
+                    f"ignoring SUPER_AGENT_BRIDGE_PORT {config.BRIDGE_PORT_REJECTED!r} "
+                    f"— using {config.BRIDGE_PORT}")
     health = _bridge_get("/healthz")
     if health is None:
         _doctor_row("bridge", False, "down (run: superresearch-agent serve)")

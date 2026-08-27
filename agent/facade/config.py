@@ -96,7 +96,59 @@ VERBOSE: bool = os.environ.get("SUPER_AGENT_VERBOSE", "").strip().lower() in (
 )
 
 BRIDGE_HOST: str = os.environ.get("SUPER_AGENT_BRIDGE_HOST", "127.0.0.1")
-BRIDGE_PORT: int = int(os.environ.get("SUPER_AGENT_BRIDGE_PORT", "9876"))
+
+DEFAULT_BRIDGE_PORT = 9876
+
+# The raw value that was refused, verbatim, or "" when the port was taken as
+# given. Recorded rather than printed: this module is imported at the top of
+# `cli.py`, long before `logsetup.configure` has run and on EVERY subcommand, so
+# a print here would be noise on nine commands and a log line would go nowhere.
+# `serve` says it where the person starting a bridge is looking, and `doctor`
+# says it where somebody hunting an unreachable bridge is looking.
+BRIDGE_PORT_REJECTED: str = ""
+
+
+def _read_bridge_port() -> int:
+    """The bridge port, validated the same way all five clients validate it.
+
+    ⛔⛔ THIS USED TO BE A BARE ``int(os.environ.get(...))`` AT MODULE SCOPE, and
+    the blast radius was not the bridge. ``cli.py`` imports this module at import
+    time, so a non-numeric ``SUPER_AGENT_BRIDGE_PORT`` raised ValueError before
+    argparse ever ran and took down ``doctor``, ``version``, ``status`` and
+    ``connect`` together — including the two commands a person would reach for to
+    find out what was wrong.
+
+    ⭐ AND THE POINT IS AGREEMENT, NOT SURVIVAL. The fleet's watcher spawns the
+    bridge with ``Popen([python, "-m", "facade.cli", "serve"])`` and no ``env=``,
+    so the child inherits this variable. With the clients falling back to 9876 on
+    a value this module accepted or died on, the client and the bridge it just
+    started could aim at two different ports — and the only symptom is "the
+    bridge is unreachable", forever, with nothing anywhere saying why. Five
+    copies of this rule now land on the same answer for the same input.
+
+    ⚠ 1..65535 IS THE WHOLE RANGE, PRIVILEGED PORTS INCLUDED, and that is
+    deliberate. It is the range the clients already accept and two fleet tests
+    already rely on (they use port 9 as a nothing-answers port); narrowing it
+    here would make this module the one copy that disagrees, which is the defect.
+    A port a non-root user cannot bind is caught at bind time, by `serve`, which
+    can say so from the errno instead of guessing here.
+    """
+    global BRIDGE_PORT_REJECTED
+    raw = os.environ.get("SUPER_AGENT_BRIDGE_PORT", "").strip()
+    if not raw:
+        return DEFAULT_BRIDGE_PORT
+    try:
+        port = int(raw)
+    except ValueError:
+        BRIDGE_PORT_REJECTED = raw
+        return DEFAULT_BRIDGE_PORT
+    if not (1 <= port <= 65535):
+        BRIDGE_PORT_REJECTED = raw
+        return DEFAULT_BRIDGE_PORT
+    return port
+
+
+BRIDGE_PORT: int = _read_bridge_port()
 
 # How often the bridge polls the FE for a remote-login approval, and how long it
 # keeps polling before giving up if the FE never reports an expiry. Both kept

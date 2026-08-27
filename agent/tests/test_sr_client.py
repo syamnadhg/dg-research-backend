@@ -361,17 +361,54 @@ def test_research_401_stashes_topic_and_arms_watchdog(monkeypatch, capsys):
 
     monkeypatch.setattr(sr, "_post", fake_post)
     monkeypatch.setattr(sr, "_get", lambda path: (200, {"authed": False}))  # no in-flight login
-    monkeypatch.setattr(sr, "_prepare_stream_arm", lambda: (["cronjob: create …"], {}, 0))
+    # The DIRECTIVE fallback: this process could not write the cron row itself, so
+    # `armed` is False and the assistant is being asked to create it with its own
+    # tool. See the sibling test below for why that changes what we may promise.
+    monkeypatch.setattr(sr, "_prepare_stream_arm",
+                        lambda: (["cronjob: create …"], {"armed": False}, 0))
     rc = sr.main(["research", "the EV battery market"])
     assert rc != 0
     start = [b for (p, b) in calls if p == "/login/remote/start"]
     assert start and start[0].get("pending_topic") == "the EV battery market"
     out = capsys.readouterr().out.lower()
-    assert "log in here" in out and "pick this up" in out
+    assert "log in here" in out
+    assert "pick this up" not in out, (
+        "nothing is armed on this branch, so nothing can pick it up", out)
+    assert "tell me and i'll start it" in out, out
     # The arm directive is under the do-not-relay marker, AFTER the sign-in link —
     # so the AI arms silently in one turn (no duplicate "signing you in" message).
     assert "do not relay" in out
     assert out.index("log in here") < out.index("do not relay") < out.index("cronjob")
+
+
+def test_the_signed_out_link_promises_a_pickup_only_when_the_arm_landed(monkeypatch, capsys):
+    """⛔⛔ "I'll pick this up" IS A DELIVERY CLAIM AND IT WAS PRINTED BLIND.
+
+    Nothing in this package schedules anything: the only thing that ticks is a
+    cron row in the host runtime's own store, and `_prepare_stream_arm` is what
+    writes it — or reports that it could not. It hard-codes ``armed: False`` on
+    the legacy no-origin branch, where a runtime that supplies no chat origin can
+    never be delivered to at all, and reports the real write otherwise. The old
+    copy promised the follow-up above the line that decides whether there is a
+    sender for it.
+
+    Both halves are pinned here against one another, because a fix that made the
+    unarmed branch honest while quietly dropping the promise from the armed one
+    would read as a pass and would be a regression: the armed case is the common
+    one and the promise there is true."""
+    def _post(path, body=None):
+        if path == "/research":
+            return 401, {"error": "not signed in"}
+        if path == "/login/remote/start":
+            return 200, {"verifyUrl": "https://superresearch.io/c/XYZ"}
+        return 200, {}
+
+    monkeypatch.setattr(sr, "_post", _post)
+    monkeypatch.setattr(sr, "_get", lambda path, **kw: (200, {"authed": False}))
+    monkeypatch.setattr(sr, "_prepare_stream_arm", lambda: ([], {"armed": True}, 0))
+    sr.main(["research", "the EV battery market"])
+    out = capsys.readouterr().out.lower()
+    assert "pick this up" in out, ("the arm landed — the promise is true here", out)
 
 
 def test_devices(bridge_port, capsys):

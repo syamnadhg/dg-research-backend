@@ -855,6 +855,42 @@ def _pick_device_lines(body: dict, reason: str) -> list[str]:
     return lines
 
 
+def _signed_in_lines(note) -> list[str]:
+    """The one-shot "just signed in" announce, in this client's voice.
+
+    Four outcomes, the same four the watchdog renders and the same four the
+    fleet's `login-done` relays: the bridge started the waiting research, there is
+    no Research Computer to run it on, several could run it and none is obvious,
+    or a topic is simply waiting to be told to go ahead. ``[]`` for a plain
+    sign-in with nothing pending — a bare "you are signed in" from a command
+    somebody ran to ask about their RESEARCH is news they already have.
+
+    ⛔ THE "WHICH COMPUTER?" CASE DELEGATES TO ``_pick_device_lines`` RATHER THAN
+    WORDING IT AGAIN. That question already exists in two places that a test pins
+    against each other, precisely so one question does not get two phrasings
+    depending which door the person came through; writing a third here is how the
+    third phrasing appears.
+    """
+    if not isinstance(note, dict) or not note:
+        return []
+    who = str(note.get("email") or "").strip()
+    topic = str(note.get("topic") or note.get("pendingTopic") or "").strip()
+    quoted = f"“{topic}”" if topic else "your research"
+    head = f"✓ Signed in{(' as ' + who) if who else ''}."
+    if note.get("autoStarted"):
+        where = str(note.get("deviceName") or "").strip()
+        return [head, f"🚀 Started {quoted}{(' on ' + where) if where else ''}."]
+    if note.get("needsDevice"):
+        return [head, f"{quoted} has nowhere to run yet.", "", *_SETUP_NODE_LINES]
+    if note.get("needsDeviceChoice"):
+        return [head] + _pick_device_lines(
+            {"devices": note.get("devices")},
+            "stale_selection" if note.get("staleSelection") else "no_selection")
+    if topic:
+        return [head, f"Continue with {quoted}? Say go ahead and I'll start it."]
+    return [head]
+
+
 def cmd_research(args) -> int:
     payload: dict = {"topic": args.topic}
     if args.device:
@@ -886,7 +922,7 @@ def cmd_research(args) -> int:
             stash = {"pending_topic": args.topic}
             if origin:
                 stash["origin"] = origin
-            arm_lines, _ap, arm_rc = _prepare_stream_arm()
+            arm_lines, arm_payload, arm_rc = _prepare_stream_arm()
             sc, sbody = _get("/status")
             if sc == 200 and sbody.get("remoteLogin") == "pending":
                 # A sign-in is already in flight — attach the topic to it (don't mint
@@ -917,7 +953,12 @@ def cmd_research(args) -> int:
                         "to it.",
                         "Ask me again and I'll start a fresh one.",
                     ], _fail_code(pc))
-                lines = ["You're almost signed in — finish in your browser and I'll pick this up."]
+                # ⛔ THE SECOND HALF OF THIS SENTENCE IS A DELIVERY CLAIM, and it
+                # is only true if the arm above actually wrote a cron row — same
+                # discriminator as the started-run line further down.
+                lines = ["You're almost signed in — finish in your browser and "
+                         + ("I'll pick this up." if arm_payload.get("armed")
+                            else "then tell me and I'll start it.")]
                 if arm_rc == 0 and arm_lines:
                     lines += _agent_directive_block(arm_lines)
                 return _emit(body, args.json, lines, _fail_code(code))
@@ -938,7 +979,10 @@ def cmd_research(args) -> int:
             link = lbody.get("verifyUrl") if lc == 200 else None
             if link:
                 lines = [
-                    "You're not signed in yet. Log in here and I'll pick this up:",
+                    ("You're not signed in yet. Log in here and I'll pick this up:"
+                     if arm_payload.get("armed") else
+                     "You're not signed in yet. Log in here, then tell me and "
+                     "I'll start it:"),
                     f"  {link}",
                 ]
                 if arm_rc == 0 and arm_lines:
@@ -969,16 +1013,31 @@ def cmd_research(args) -> int:
         return _emit(body, args.json, [f"✗ couldn't start: {body.get('error', code)}"], _fail_code(code))
     dev = _device_names().get(body.get("deviceId") or "", body.get("deviceId") or "")
     where = f" on {dev}" if dev else ""
-    lines = [
-        f"🚀 Started “{args.topic}”{where}.",
-        "I’ll post here when it’s done — and if it ever needs you. Ask how it’s going anytime.",
-    ]
     # Auto-arm THIS chat's run-scoped streaming watchdog so progress posts without
     # the user asking — _prepare_stream_arm writes the cron row into jobs.json itself
     # (idempotent), so nothing needs the AI here; arm_lines is empty on success and
     # only carries a fallback directive if the direct write couldn't run. On a prep
     # error, skip silently: the run is fine and `status` still works.
-    arm_lines, _payload, arm_rc = _prepare_stream_arm()
+    #
+    # ⛔⛔ AND IT IS READ NOW, BECAUSE THE PROMISE BELOW DEPENDS ON IT. "I'll post
+    # here when it's done" was printed unconditionally, three lines above the call
+    # that decides whether anything will ever post. Nothing in this package
+    # schedules: the only thing that ticks is a cron row in the host runtime's own
+    # store, and `_prepare_stream_arm` reports whether one was actually written.
+    # It hard-codes `armed: False` on the legacy no-origin branch — a runtime that
+    # supplies no chat origin can never be delivered to — and reports the real
+    # write on the scoped branch, so a jobs.json this process cannot write shows
+    # up here too. On both, the old copy promised a message that had no sender.
+    arm_lines, arm_payload, arm_rc = _prepare_stream_arm()
+    lines = [f"🚀 Started “{args.topic}”{where}."]
+    if arm_payload.get("armed"):
+        lines.append("I’ll post here when it’s done — and if it ever needs you. "
+                     "Ask how it’s going anytime.")
+    else:
+        # ⭐ NO APOLOGY AND NO MECHANISM. What is left is still a complete answer:
+        # the research is running and asking is how they hear about it.
+        lines.append("Ask me how it’s going anytime — I’ll have the brief, "
+                     "reports and podcast right here.")
     if arm_rc == 0 and arm_lines:
         lines += _agent_directive_block(arm_lines)
     return _emit(body, args.json, lines)
@@ -1102,7 +1161,21 @@ def cmd_updates(args) -> int:
     code, body, runs = _fetch_runs(active=args.active, via_agent=True)
     if code != 200:
         return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
-    lines = []
+    # ⛔⛔ THIS READ TAKES THE ONE-SHOT SIGN-IN ANNOUNCE, AND IT USED TO THROW IT
+    # AWAY. `?via=agent` is the bridge's sole take-and-clear trigger, and it does
+    # not care which agent-side reader asked: an `updates` call consumed the
+    # announce, moved the delivered-watermark with it, and then rendered runs
+    # only. The person heard nothing about the sign-in from this command, and the
+    # watchdog that would have said it two minutes later found the note gone AND
+    # the watermark past it, so the re-mint could not recover it either. Silent,
+    # permanent, and produced by somebody asking a perfectly reasonable question.
+    #
+    # ⭐ RENDER IT, DO NOT PEEK. Taking is right — it is what stops the watchdog
+    # saying the same news again a minute later — and it is exactly what the
+    # fleet's `login-done` already does with the same call. The rule the take
+    # implies is the one that was broken: whoever takes this note OWES the person
+    # its contents. Every other `via=agent` reader in the tree already pays it.
+    lines = _signed_in_lines(body.get("signedIn"))
     for r in runs:
         # A queued run has no phase yet — show its place in line (mirrors status).
         if r.get("status") == "queued":
@@ -1694,6 +1767,43 @@ def _stream_arm_directive_lines(script_name: str, job_name: str) -> list[str]:
     ]
 
 
+def _clear_login_wait(slug: str) -> None:
+    """Forget how long the PREVIOUS sign-in attempt waited, for this chat.
+
+    ⛔⛔ WITHOUT THIS THE WATCHDOG SELF-DESTRUCTS ON ITS FIRST TICK, FOREVER AFTER.
+    `sr_attention_poll._tick_unauthed` counts 401 ticks into `__login_wait__` and
+    tears the cron row down once the count passes `_LOGIN_WAIT_LIMIT` — and the
+    give-up returns BEFORE the write, so the file is left holding the limit
+    permanently. Nothing else ever resets it: arming rewrites the shim and the
+    cron row and never touches the state file, and the only other reset is a 200
+    tick, which a signed-out chat cannot reach. So one abandoned sign-in poisons
+    the chat: every later `login` arms a listener that dies on its first tick, and
+    a sign-in completed ninety seconds later announces nothing at all.
+
+    ⭐ ARMING IS THE EVENT "a new sign-in attempt begins for this chat", which is
+    exactly the scope `_LOGIN_WAIT_LIMIT`'s own docstring claims to bound ("a
+    sign-in that never completes can't poll forever" — ONE sign-in). Resetting
+    here restores the meaning the constant already advertises rather than adding
+    a new one.
+
+    Best-effort, like everything else in the arm path: a state file we cannot read
+    or write is not a reason to refuse to arm. And the run de-dup keys are left
+    exactly as they are — dropping those would re-announce every finished run.
+    """
+    try:
+        path = _scripts_dir() / f".sr_poll_{slug}.state.json"
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if not isinstance(raw, dict) or "__login_wait__" not in raw:
+        return
+    raw.pop("__login_wait__", None)
+    try:
+        path.write_text(json.dumps(raw), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def _prepare_stream_arm() -> tuple[list[str], dict, int]:
     """Arm THIS chat's run-scoped streaming watchdog and return ``(lines, payload,
     rc)``. On the modern path (a chat origin is known) this WRITES the cron job row
@@ -1719,6 +1829,7 @@ def _prepare_stream_arm() -> tuple[list[str], dict, int]:
     slug = _origin_slug(origin)
     script_name = f"sr_poll_{slug}.py"
     job_name = f"sr-stream-{slug}"
+    _clear_login_wait(slug)
     err = _write_poll_shim(_scripts_dir(), script_name, origin)
     if err:
         return ([f"✗ {err}"], {"error": err}, 1)

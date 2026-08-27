@@ -42,6 +42,7 @@ carries one and is checked against the actual bound port.
 from __future__ import annotations
 
 import datetime as dt
+import errno
 import hashlib
 import json
 import logging
@@ -50,6 +51,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -2433,15 +2435,45 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 #
                 # So the test is the other way round now: something is held, and
                 # the caller cannot PROVE it is the same conversation. Absent
-                # proof, refuse. That costs an origin-less chat the ability to
-                # correct its own topic — a real cost, and a smaller one than
-                # handing somebody else's request to the wrong person in silence.
+                # proof, refuse.
+                #
+                # ⛔⛔ WITH ONE CELL CARVED BACK OUT — BOTH SIDES ANONYMOUS. When
+                # the held flow carries no origin AND the caller sends none, the
+                # bridge holds no evidence that a second chat exists at all: both
+                # `_clean_origin` calls returned None, so "from another chat" is
+                # an assertion about the world made from nothing. Refusing that
+                # cell cost the origin-less client the ability to correct or retry
+                # ITS OWN topic, permanently, on the very population that reaches
+                # this route first. `/login/remote/start` — the door that MINTS
+                # the flow — already takes exactly this trade for exactly this
+                # population ("there is no way to tell them from themselves"), so
+                # until now `/pending` was STRICTER than the door upstream of it,
+                # which is incoherent. The two agree now.
+                #
+                # ⛔ THE CLAUSE IS `and`, NEVER `or`. Held-dict/caller-none and
+                # held-none/caller-dict both stay refused — those are the two
+                # thefts cross-verification found, and an `or` here would reopen
+                # both. `_clean_origin` is the test rather than `isinstance`, so
+                # an unusable half-origin ({"platform": …} with no chat_id) counts
+                # as anonymous on both sides, which is how `_same_origin` already
+                # treats it.
+                held_origin = _clean_origin(flow.origin)
+                caller_origin = _clean_origin(origin)
+                both_anonymous = held_origin is None and caller_origin is None
                 if ((flow.pending_topic or "").strip()
+                        and not both_anonymous
                         and not _same_origin(flow.origin, origin)):
+                    # ⛔ AND IT NO LONGER NAMES A CHAT IT HAS NOT SEEN. The cell
+                    # that still refuses is "something is held and you cannot show
+                    # you set it" — which is also what a chat that simply lost its
+                    # session environment looks like. Say what is true: a request
+                    # is held, and this caller cannot be shown to own it.
                     self._json(409, {"reason": "topic_taken",
                                      "error": "this sign-in is already carrying a "
-                                              "research request from another chat — "
-                                              "ask again once you're signed in"})
+                                              "research request, and this chat "
+                                              "can't be shown to be the one that "
+                                              "made it — ask again once you're "
+                                              "signed in"})
                     return
                 if isinstance(topic, str):
                     flow.pending_topic = topic[:500]
@@ -3897,6 +3929,24 @@ def _port_holder_is_bridge(host: str, port: int) -> bool:
     return False
 
 
+def _find_holder_hint(port: int) -> str:
+    """A command that will actually run on the machine reading this line.
+
+    ⛔⛔ THE ONE DIAGNOSTIC THIS PACKAGE HANDED OUT WAS WINDOWS-ONLY, PRINTED
+    EVERYWHERE. `netstat -ano | findstr :PORT` — `findstr` is a Windows built-in
+    and exists on neither macOS nor Linux, and the fleet's sandbox (Linux) is the
+    one deployment whose stdout is actually kept, so the unrunnable command is
+    the one that got written down. Telling somebody to run a command that cannot
+    exist is worse than telling them nothing: they conclude the tool is broken in
+    some other way and stop looking.
+    """
+    if sys.platform.startswith("win"):
+        return f"netstat -ano | findstr :{port}"
+    if sys.platform == "darwin":
+        return f"lsof -nP -iTCP:{port} -sTCP:LISTEN"
+    return f"ss -lptn 'sport = :{port}'"
+
+
 def serve(host: str | None = None, port: int | None = None) -> None:
     """Start the bridge and serve forever (blocking)."""
     host = host or config.BRIDGE_HOST
@@ -3909,6 +3959,14 @@ def serve(host: str | None = None, port: int | None = None) -> None:
     # heartbeat, so we never get two owners racing one account session (the
     # single-owner-refresher invariant). BridgeState() above is a read-only
     # session load, so constructing it on the loser is harmless.
+    if config.BRIDGE_PORT_REJECTED:
+        # Said here because this is where a person is watching a bridge start.
+        # `config` cannot say it: it is imported before logging is configured and
+        # on every subcommand.
+        print(f"Ignoring SUPER_AGENT_BRIDGE_PORT {config.BRIDGE_PORT_REJECTED!r} "
+              f"— not a port number between 1 and 65535. Using {port}.")
+        log.warning("ignoring SUPER_AGENT_BRIDGE_PORT %r — using %d",
+                    config.BRIDGE_PORT_REJECTED, port)
     try:
         httpd = ThreadingHTTPServer((host, port), _make_handler(state))
     except OSError as e:
@@ -3916,14 +3974,38 @@ def serve(host: str | None = None, port: int | None = None) -> None:
         # re-fire) from a FOREIGN process squatting the port — the latter would
         # otherwise be silently mis-reported as "already running" and leave the
         # bridge mysteriously unreachable.
-        if _port_holder_is_bridge(host, port):
+        #
+        # ⛔⛔ AND "TAKEN" IS A CLAIM ABOUT THE WORLD THAT ONE OF THESE ERRNOS
+        # CANNOT SUPPORT. `errno.EACCES` on an AF_INET bind is the privileged-port
+        # guard: the port is below 1024 and this process is not root. There is no
+        # holder, so telling somebody to go and find one sends them after a
+        # process that does not exist — measured four times in a real bridge.log,
+        # every line naming a culprit for `127.0.0.1:9`. Only EADDRINUSE means
+        # somebody is actually there; every other errno is reported as itself.
+        # ⭐ Same rule as the send-logs refusals: name neither a number nor a
+        # culprit you have not measured.
+        code = getattr(e, "errno", None)
+        if code == errno.EADDRINUSE and _port_holder_is_bridge(host, port):
             log.info("bridge port %s:%d already serving a bridge — nothing to start", host, port)
             print(f"Super Agent bridge already running on http://{host}:{port} — nothing to start.")
-        else:
+        elif code == errno.EADDRINUSE:
             log.warning("bridge port %s:%d held by a NON-bridge process (%s)", host, port, e)
             print(f"Port {port} is held by another process that isn't a Super Agent bridge.")
             print("  Free it, or set SUPER_AGENT_BRIDGE_PORT to another port, then retry.")
-            print(f"  (find the holder:  netstat -ano | findstr :{port} )")
+            print(f"  (find the holder:  {_find_holder_hint(port)})")
+        elif code == errno.EACCES:
+            log.warning("bridge port %s:%d cannot be bound by this user — %s", host, port, e)
+            print(f"Port {port} cannot be opened by this user account.")
+            print("  Ports below 1024 are reserved for administrators on this system.")
+            print("  Set SUPER_AGENT_BRIDGE_PORT to a port above 1024 (the default is "
+                  f"{config.DEFAULT_BRIDGE_PORT}), then retry.")
+        else:
+            # ⛔ NEITHER "held" NOR "reserved" — say what the system said and stop.
+            # Inventing a cause for an errno we have not thought about is how the
+            # EACCES line came to name a holder in the first place.
+            log.warning("bridge port %s:%d could not be opened — %s", host, port, e)
+            print(f"Port {port} could not be opened: {e}")
+            print("  Set SUPER_AGENT_BRIDGE_PORT to another port, then retry.")
         return
     authed = state.session is not None
     # If we restarted with a live session (rehydrated via AccountSession.load(),
