@@ -560,6 +560,122 @@ def test_both_signed_out_doors_promise_to_post_when_the_arm_landed(
     assert "post here" in out, out
 
 
+def test_updates_still_says_there_is_nothing_running(monkeypatch, capsys):
+    """⛔⛔ A MUTATION SURVIVED HERE. Seeding `lines` with the sign-in announce made
+    the old `lines or ["No active runs."]` fallback dead — so somebody who asked
+    what was running got a sign-in line and NO statement about their runs at all.
+    Answering a different question is its own way of not answering."""
+    monkeypatch.setattr(sr, "_fetch_runs",
+                        lambda **kw: (200, _updates_body(email="a@x.y"), []))
+    monkeypatch.setattr(sr, "_stream_health_lines", lambda runs: [])
+    sr.main(["updates"])
+    out = capsys.readouterr().out
+    assert "Signed in" in out, out
+    assert "No active runs." in out, ("they asked what was running", out)
+
+
+def test_the_no_runs_line_stays_out_of_the_way_when_there_are_runs(monkeypatch, capsys):
+    """The other half: it is keyed on the runs, so a document with runs must not
+    be told there are none."""
+    monkeypatch.setattr(sr, "_fetch_runs",
+                        lambda **kw: (200, {"runs": []}, [{"title": "EVs", "status": "running",
+                                                           "phase": 2}]))
+    monkeypatch.setattr(sr, "_stream_health_lines", lambda runs: [])
+    sr.main(["updates"])
+    out = capsys.readouterr().out
+    assert "EVs" in out, out
+    assert "No active runs." not in out, out
+
+
+def test_a_firewalled_high_port_is_not_told_it_is_privileged(monkeypatch, capsys):
+    """⛔⛔ A MUTATION SURVIVED HERE, and it is this branch's own sin one level
+    down. EACCES on a port ABOVE 1024 is a local policy — a firewall, a sandbox,
+    a security product — and "ports below 1024 are reserved" is then a false
+    explanation followed by advice to set the port to the value that just
+    failed."""
+    monkeypatch.setattr(bridge, "ThreadingHTTPServer", _Boom(errno.EACCES))
+    monkeypatch.setattr(bridge, "BridgeState", lambda: SimpleNamespace(session=None))
+    monkeypatch.setattr(bridge, "_port_holder_is_bridge", lambda h, p: False)
+    bridge.serve(host="127.0.0.1", port=8080)
+    out = capsys.readouterr().out
+    assert "cannot be opened by this user account" in out, out
+    assert "below 1024" not in out, ("it named a cause it has not measured", out)
+    assert "firewall or security policy" in out, out
+    assert "8080" in out, out
+
+
+def test_a_privileged_port_still_gets_the_reason_that_is_true_for_it(monkeypatch, capsys):
+    monkeypatch.setattr(bridge, "ThreadingHTTPServer", _Boom(errno.EACCES))
+    monkeypatch.setattr(bridge, "BridgeState", lambda: SimpleNamespace(session=None))
+    monkeypatch.setattr(bridge, "_port_holder_is_bridge", lambda h, p: False)
+    bridge.serve(host="127.0.0.1", port=9)
+    out = capsys.readouterr().out
+    assert "below 1024" in out, out
+    assert "firewall" not in out, out
+
+
+def test_the_power_state_survives_the_trip_to_the_wire(monkeypatch):
+    """⛔⛔ A MUTATION SURVIVED HERE, and it is the same silence as the field never
+    being set — a different bug that looks identical from the chat. The renderer
+    tests cannot see the payload and the `_run_autostart` test cannot see the
+    route, so only a request can."""
+    base, state, httpd = _live(monkeypatch)
+    try:
+        state.set_signed_in({"ts": 7, "email": "a@x.y", "autoStarted": True,
+                             "topic": "EVs", "deviceName": "Macbook",
+                             "deviceOnline": False, "uid": "u1"})
+        r = requests.get(base + "/updates?via=agent&limit=1")
+        assert r.status_code == 200, r.text
+        note = r.json().get("signedIn")
+        assert note is not None, r.text
+        assert note.get("deviceName") == "Macbook", note
+        assert note.get("deviceOnline") is False, (
+            "the fact was read and then dropped on the way out", note)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_an_unknown_power_state_is_carried_as_unknown(monkeypatch):
+    """⛔ THREE-VALUED, AND THE THIRD VALUE HAS TO SURVIVE TOO. Coerced to False on
+    the wire, an announce that simply could not read the device would tell every
+    reader the computer is asleep."""
+    base, state, httpd = _live(monkeypatch)
+    try:
+        state.set_signed_in({"ts": 7, "email": "a@x.y", "autoStarted": True,
+                             "deviceName": "Macbook", "uid": "u1"})
+        note = requests.get(base + "/updates?via=agent&limit=1").json().get("signedIn")
+        assert note is not None
+        assert note.get("deviceOnline") is None, note
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_reading_the_power_state_can_never_fail_a_started_run(monkeypatch):
+    """⛔⛔ A MUTATION SURVIVED HERE. It is a courtesy field: a Firestore blip while
+    looking it up must not take the whole announce of a run that HAS started down
+    with it — a courtesy failing the thing it is a courtesy about."""
+    from facade import bridge as br
+
+    class _Angry:
+        def __init__(self, tok):
+            pass
+
+        def list_devices(self, uid):
+            raise RuntimeError("firestore is having a moment")
+
+    assert br._autostart_chosen_device(_Angry("t"), _sess(), "d1") is None
+    monkeypatch.setattr(br, "FirestoreRest", _Angry)
+    monkeypatch.setattr(br, "_autostart_pick_device", lambda fs, sess: ("d1", "Macbook", [], ""))
+    monkeypatch.setattr(br, "_resolve_run_config", lambda *a, **k: {})
+    monkeypatch.setattr(br, "_enqueue_research_run", lambda *a, **k: ("r1", "q1"))
+    ev = br._run_autostart(_sess(), "EVs", None)
+    assert ev.get("autoStarted") is True, (
+        "a lookup for a courtesy field took the started run's announce with it", ev)
+    assert ev.get("deviceOnline") is None, ev
+
+
 # ── 4. arming forgets the previous attempt's countdown ───────────────────────
 
 def test_arming_clears_a_poisoned_login_wait(tmp_path, monkeypatch):
