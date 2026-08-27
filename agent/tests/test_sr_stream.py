@@ -496,6 +496,27 @@ def test_the_watchdog_names_the_waiting_topic_and_the_run_path_does_not():
     assert "which should run “Golden Retriever”?" in line, line
     assert "which should run this?" not in line, line
 
+    # ⛔⛔ AND THE CLIENT NOW HAS A SIGN-IN DOOR TOO, which this test could not see
+    # when it was written. Stretch 4.5 made `sr updates` render the same announce,
+    # and its first version delegated to the RUN path's renderer wholesale — so the
+    # sign-in door asked "which should run this?" in a place where there is no
+    # "this", breaking the very distinction above through a door the test did not
+    # know existed.
+    import importlib
+    sr = importlib.import_module("facade.skill.scripts.sr")
+    client_line = "\n".join(sr._signed_in_lines({
+        "email": "e@x.y", "needsDeviceChoice": True, "topic": "Golden Retriever",
+        "devices": [{"id": "d1", "name": "Office PC"}],
+    }))
+    assert "which should run “Golden Retriever”?" in client_line, client_line
+    assert "which should run this?" not in client_line, client_line
+
+    # …while the RUN path keeps its own object.
+    run_line = "\n".join(sr._pick_device_lines(
+        {"devices": [{"id": "d1", "name": "Office PC"}, {"id": "d2", "name": "Mac"}]},
+        "no_selection"))
+    assert "which should run this?" in run_line, run_line
+
 
 def test_the_device_name_rungs_match_the_client():
     """`_dev_name` here and `_dev_label` in sr.py must fall back the same way, or

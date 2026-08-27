@@ -840,7 +840,7 @@ def cmd_device_remove(args) -> int:
     ])
 
 
-def _pick_device_lines(body: dict, reason: str) -> list[str]:
+def _pick_device_lines(body: dict, reason: str, about: str = "this") -> list[str]:
     """Chat lines for the 'which computer should run this?' ask — the account HAS
     research computers, it just needs to be told which (a multi-device account with
     no single online default). Renders the device list the bridge attached to the
@@ -857,7 +857,13 @@ def _pick_device_lines(body: dict, reason: str) -> list[str]:
     if reason == "stale_selection":
         lead = "The computer you last used isn’t reachable anymore — pick another:"
     else:
-        lead = f"You have {len(devices)} research computers — which should run this?"
+        # ⛔ THE OBJECT IS AN ARGUMENT, and it has to be. The RUN path says "run
+        # this?" because the person just fired it and the object is obvious; the
+        # SIGN-IN path has no "this" — it is telling somebody what has been waiting
+        # — so it names the topic. `test_the_watchdog_names_the_waiting_topic_and
+        # _the_run_path_does_not` pins that difference deliberately, and reusing
+        # this renderer for the sign-in door without it silently broke it.
+        lead = f"You have {len(devices)} research computers — which should run {about}?"
     lines = [lead]
     for d in devices:
         online = d.get("online")
@@ -896,13 +902,23 @@ def _signed_in_lines(note) -> list[str]:
     head = f"✓ Signed in{(' as ' + who) if who else ''}."
     if note.get("autoStarted"):
         where = str(note.get("deviceName") or "").strip()
+        # ⛔ "STARTED ON MACBOOK" READS AS WORK IN PROGRESS. Auto-start routes to a
+        # persisted selection or a sole computer without consulting power — right,
+        # because a sleeping computer takes the work when it wakes — so "started"
+        # can mean "queued until somebody switches it on", which could be tomorrow.
+        # ⚠ Only an explicit False says so: an absent flag means we do not know,
+        # and inventing a wait would be its own falsehood.
+        if where and note.get("deviceOnline") is False:
+            return [head, f"🚀 {quoted} is queued on {where} — it's switched off, "
+                          f"so it starts when it comes on."]
         return [head, f"🚀 Started {quoted}{(' on ' + where) if where else ''}."]
     if note.get("needsDevice"):
         return [head, f"{quoted} has nowhere to run yet.", "", *_SETUP_NODE_LINES]
     if note.get("needsDeviceChoice"):
         return [head] + _pick_device_lines(
             {"devices": note.get("devices")},
-            "stale_selection" if note.get("staleSelection") else "no_selection")
+            "stale_selection" if note.get("staleSelection") else "no_selection",
+            about=quoted)
     if topic:
         return [head, f"Continue with {quoted}? Say go ahead and I'll start it."]
     return [head]
@@ -932,10 +948,14 @@ def cmd_research(args) -> int:
         # is already mid-flight, say so (the bridge auto-captures on approval —
         # #848, no `login-done` needed).
         if code == 401:
-            # Remember the topic + this chat so that, once the user signs in, the
-            # watchdog can offer to continue THIS research (confirm-first, never a
-            # silent auto-start). Arm the watchdog so the "✓ signed in — continue
-            # with '…'?" lands here on its own.
+            # Remember the topic + this chat. ⛔ AND THE COMMENT HERE USED TO
+            # DESCRIBE A FLOW THAT NO LONGER RUNS: it said the watchdog would
+            # "offer to continue THIS research (confirm-first, never a silent
+            # auto-start)". Capture does exactly that auto-start — it claims the
+            # topic, resolves a computer and enqueues the run server-side, on by
+            # default, before any tick — which is why the line below must not say
+            # the research waits on them. Arming decides only whether the announce
+            # about it reaches this chat.
             stash = {"pending_topic": args.topic}
             if origin:
                 stash["origin"] = origin
@@ -973,9 +993,19 @@ def cmd_research(args) -> int:
                 # ⛔ THE SECOND HALF OF THIS SENTENCE IS A DELIVERY CLAIM, and it
                 # is only true if the arm above actually wrote a cron row — same
                 # discriminator as the started-run line further down.
+                #
+                # ⛔⛔ AND IT MUST NOT REWRITE WHAT THE BRIDGE DOES, which the first
+                # version did: it said "then tell me and I'll start it", as though
+                # an unwritten cron row stopped the research starting. It does not.
+                # Capture claims the topic and starts the run SERVER-SIDE before any
+                # tick, whatever this process managed to arm. Arming decides only
+                # whether we come back to them about it.
                 lines = ["You're almost signed in — finish in your browser and "
-                         + ("I'll pick this up." if arm_payload.get("armed")
-                            else "then tell me and I'll start it.")]
+                         "I'll pick this up"
+                         + (". I'll post here when it's done."
+                            if arm_payload.get("armed")
+                            else " — ask me once you're in and I'll tell you where "
+                                 "it got to.")]
                 if arm_rc == 0 and arm_lines:
                     lines += _agent_directive_block(arm_lines)
                 return _emit(body, args.json, lines, _fail_code(code))
@@ -996,10 +1026,11 @@ def cmd_research(args) -> int:
             link = lbody.get("verifyUrl") if lc == 200 else None
             if link:
                 lines = [
-                    ("You're not signed in yet. Log in here and I'll pick this up:"
+                    ("You're not signed in yet. Log in here and I'll pick this "
+                     "up — I'll post here when it's done:"
                      if arm_payload.get("armed") else
-                     "You're not signed in yet. Log in here, then tell me and "
-                     "I'll start it:"),
+                     "You're not signed in yet. Log in here and I'll pick this "
+                     "up — ask me once you're in:"),
                     f"  {link}",
                 ]
                 if arm_rc == 0 and arm_lines:
@@ -1041,10 +1072,15 @@ def cmd_research(args) -> int:
     # that decides whether anything will ever post. Nothing in this package
     # schedules: the only thing that ticks is a cron row in the host runtime's own
     # store, and `_prepare_stream_arm` reports whether one was actually written.
-    # It hard-codes `armed: False` on the legacy no-origin branch — a runtime that
-    # supplies no chat origin can never be delivered to — and reports the real
-    # write on the scoped branch, so a jobs.json this process cannot write shows
-    # up here too. On both, the old copy promised a message that had no sender.
+    #
+    # ⚠ `armed` MEANS "THIS PROCESS WROTE THE ROW", AND NOTHING STRONGER. An
+    # earlier version of this comment said a no-origin runtime "can never be
+    # delivered to", which this same file contradicts twice — `_stream_health_lines`
+    # returns True there because the account-wide watchdog streams every agent run,
+    # and the directive handed over on that branch asks the assistant to arm one.
+    # False therefore means "we did not write it and cannot vouch for it", on both
+    # the legacy branch and a jobs.json we could not write. That is the right gate
+    # for what we may PROMISE, and the wrong one for what will happen.
     arm_lines, arm_payload, arm_rc = _prepare_stream_arm()
     lines = [f"🚀 Started “{args.topic}”{where}."]
     if arm_payload.get("armed"):
@@ -1179,10 +1215,14 @@ def cmd_updates(args) -> int:
     if code != 200:
         return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
     # ⛔⛔ THIS READ TAKES THE ONE-SHOT SIGN-IN ANNOUNCE, AND IT USED TO THROW IT
-    # AWAY. `?via=agent` is the bridge's sole take-and-clear trigger, and it does
-    # not care which agent-side reader asked: an `updates` call consumed the
-    # announce, moved the delivered-watermark with it, and then rendered runs
-    # only. The person heard nothing about the sign-in from this command, and the
+    # AWAY. `?via=agent` is the bridge's sole take-and-clear trigger, and this
+    # call carries no chat scope — so it takes an ORIGIN-LESS announce, racing the
+    # account-wide watchdog for it. (⚠ It does NOT take a chat-scoped one: that is
+    # put straight back for the watchdog that owns it. An earlier version of this
+    # comment said the bridge "does not care which reader asked", which is wrong
+    # and would have sent somebody looking for a leak that cannot happen.) An
+    # `updates` call consumed the announce, moved the delivered-watermark with it,
+    # and then rendered runs only. The person heard nothing about the sign-in from this command, and the
     # watchdog that would have said it two minutes later found the note gone AND
     # the watermark past it, so the re-mint could not recover it either. Silent,
     # permanent, and produced by somebody asking a perfectly reasonable question.

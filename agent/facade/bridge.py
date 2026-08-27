@@ -629,6 +629,24 @@ def _autostart_pick_device(fs: FirestoreRest,
     return None, None, [_device_descriptor(d) for d in devs], reason
 
 
+def _autostart_chosen_device(fs: FirestoreRest, sess: AccountSession,
+                             device_id: str) -> dict[str, Any] | None:
+    """The descriptor of the computer auto-start picked, or None.
+
+    Its only job is to let the announce say whether that computer is awake. Best
+    effort by design: a lookup that fails must not take a started run down with
+    it — the renderers treat a missing flag exactly as they did before this
+    existed, which is to say nothing about power at all."""
+    try:
+        for d in fs.list_devices(sess.uid):
+            if d.get("id") == device_id:
+                return d
+    except Exception as e:  # noqa: BLE001 — a courtesy field, never a failure
+        log.warning("could not read the auto-start device's power state (%s)",
+                    type(e).__name__)
+    return None
+
+
 def _autostart_enabled() -> bool:
     """``DG_AGENT_AUTOSTART`` (default ON) — in-field kill-switch for sign-in
     auto-start. Off → fully reverts to the legacy confirm-then-run ("reply yes")."""
@@ -677,6 +695,7 @@ def _run_autostart(sess: AccountSession, topic: str,
         if not device_id:
             return {"needsDeviceChoice": True, "topic": topic, "devices": choices,
                     "staleSelection": why == "stale_selection"}
+        chosen = _autostart_chosen_device(fs, sess, device_id)
         cfg = _resolve_run_config(fs, sess, None)
         rid, _qid = _enqueue_research_run(fs, sess, topic=topic, device_id=device_id,
                                           cfg=cfg, origin=_clean_origin(origin))
@@ -685,7 +704,18 @@ def _run_autostart(sess: AccountSession, topic: str,
                     type(e).__name__)
         return {}
     log.info("sign-in auto-started research %s on device %s", rid, device_id)
-    return {"autoStarted": True, "runId": rid, "deviceName": label or "", "topic": topic}
+    # ⛔⛔ THE POWER STATE RIDES ALONG, and it did not before. Auto-start routes to
+    # a persisted selection or a sole computer WITHOUT consulting power — which is
+    # right, because a sleeping computer takes the work when it wakes — but the
+    # announce then said "Started your research on Macbook" with no hint that
+    # "started" meant "queued until somebody switches it on". Three renderers say
+    # that sentence and none of them could know. One field fixes all three.
+    # ⚠ `online` is THREE-VALUED here on purpose: True, False, or absent when the
+    # descriptor did not carry it. Absent must render as it always did — a renderer
+    # that treated "unknown" as "off" would invent a wait.
+    return {"autoStarted": True, "runId": rid, "deviceName": label or "",
+            "deviceOnline": _device_is_online(chosen) if chosen else None,
+            "topic": topic}
 
 
 def _autostart_worker(state: BridgeState, sess: AccountSession, topic: str,
@@ -3418,6 +3448,9 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                             "needsDevice": bool(ev.get("needsDevice")),
                             "runId": ev.get("runId") or "",
                             "deviceName": ev.get("deviceName") or "",
+                            # None when unknown — never coerced to a boolean, or
+                            # "we could not tell" would render as "it is asleep".
+                            "deviceOnline": ev.get("deviceOnline"),
                             "topic": ev.get("topic") or "",
                             # The FOURTH outcome: the account has several usable
                             # computers and the sign-in auto-start could not choose.

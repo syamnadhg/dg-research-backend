@@ -372,9 +372,12 @@ def test_research_401_stashes_topic_and_arms_watchdog(monkeypatch, capsys):
     assert start and start[0].get("pending_topic") == "the EV battery market"
     out = capsys.readouterr().out.lower()
     assert "log in here" in out
-    assert "pick this up" not in out, (
-        "nothing is armed on this branch, so nothing can pick it up", out)
-    assert "tell me and i'll start it" in out, out
+    # ⛔ ONLY THE DELIVERY HALF IS CONDITIONAL. The bridge starts the stashed
+    # research at capture whatever this process armed, so "I'll pick this up" is
+    # true on both branches; what an unwritten cron row costs is the follow-up.
+    assert "pick this up" in out, out
+    assert "post here" not in out, ("nothing is armed to post", out)
+    assert "ask me once you" in out, out
     # The arm directive is under the do-not-relay marker, AFTER the sign-in link —
     # so the AI arms silently in one turn (no duplicate "signing you in" message).
     assert "do not relay" in out

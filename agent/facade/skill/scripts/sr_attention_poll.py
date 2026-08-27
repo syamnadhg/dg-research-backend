@@ -439,6 +439,18 @@ def _signed_in_line(signed_in: dict) -> str:
     if signed_in.get("autoStarted"):
         dev = (signed_in.get("deviceName") or "").strip()
         on_dev = f" on {dev}" if dev else ""
+        # ⛔ "STARTING NOW" IS NOT TRUE OF A SLEEPING COMPUTER. Auto-start routes to
+        # a persisted selection or a sole computer without consulting power — the
+        # work is queued and claimed when that machine wakes, which could be
+        # tomorrow. ⚠ Only an explicit False says so; an absent flag means unknown,
+        # and this line is delivered word for word, so inventing a wait would be
+        # its own falsehood.
+        if dev and signed_in.get("deviceOnline") is False:
+            return (
+                f"✓ Signed in.\n\n"
+                f"{quoted} is queued on {dev} — it's switched off, so it starts when "
+                f"it comes on. I'll post progress here as each phase finishes."
+            )
         return (
             f"✓ Signed in.\n\n"
             f"Starting {quoted}{on_dev} now — I'll post progress here as each phase finishes."

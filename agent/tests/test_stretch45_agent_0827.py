@@ -327,6 +327,14 @@ def test_doctor_stays_quiet_about_a_port_it_accepted(monkeypatch, tmp_path):
         monkeypatch.setattr(cli, "config", config)
         out = _doctor_output(monkeypatch, tmp_path)
         assert "ignoring SUPER_AGENT_BRIDGE_PORT" not in out, out
+        # ⛔⛔ BUT THE PORT MUST STILL BE NAMED SOMEWHERE, and for the incident's
+        # own value this row is the only place it can be: 9 is accepted, so there
+        # is no refusal to report, and a bare "down" is what `doctor` also says
+        # when nothing is wrong with the port at all. The bridge row names the
+        # origin it actually probed.
+        assert "down at http://127.0.0.1:9 " in out, (
+            "a person whose client and bridge are on different ports is told only "
+            "that the bridge is down", out)
     finally:
         monkeypatch.delenv("SUPER_AGENT_BRIDGE_PORT", raising=False)
         importlib.reload(config)
@@ -396,17 +404,78 @@ def test_the_which_computer_ask_is_not_worded_a_third_time(monkeypatch):
     against a copy."""
     called = {}
     monkeypatch.setattr(sr, "_pick_device_lines",
-                        lambda body, reason: called.update(body=body, reason=reason) or ["X"])
+                        lambda body, reason, about="this":
+                        called.update(body=body, reason=reason, about=about) or ["X"])
     out = sr._signed_in_lines({"email": "a@x.y", "needsDeviceChoice": True,
+                               "topic": "otters",
                                "devices": [{"name": "PC"}], "staleSelection": True})
     assert out[-1] == "X"
     assert called["reason"] == "stale_selection", called
     assert called["body"]["devices"] == [{"name": "PC"}], called
+    # ⛔ AND IT HANDS OVER ITS OWN OBJECT. Delegating wholesale made the sign-in
+    # door ask "which should run this?" in a place where there is no "this" —
+    # breaking a distinction `test_sr_stream` pins on purpose, through a door that
+    # test did not know existed.
+    assert "otters" in called["about"], called
 
 
 @pytest.mark.parametrize("note", [None, {}, "nope", 7, []])
 def test_a_missing_or_malformed_note_renders_nothing(note):
     assert sr._signed_in_lines(note) == []
+
+
+# ── 3c. "started on X" when X is asleep ──────────────────────────────────────
+
+@pytest.mark.parametrize("online,queued", [(False, True), (True, False), (None, False)])
+def test_an_auto_started_run_says_when_its_computer_is_asleep(online, queued):
+    """⛔⛔ AUTO-START NEVER CONSULTED POWER, AND THE ANNOUNCE COULD NOT EITHER. It
+    routes to a persisted selection or a sole computer — right, because a sleeping
+    machine takes the work when it wakes — but "Started your research on Macbook"
+    then reads as work in progress when it means "queued until somebody switches
+    it on", which could be tomorrow. Three renderers said that sentence and none
+    of them had the fact; the announce carries it now.
+
+    ⚠ THREE-VALUED ON PURPOSE. An ABSENT flag means we could not tell, and must
+    render exactly as it did before — a renderer that treated unknown as off would
+    invent a wait, which is the same defect pointing the other way."""
+    note = {"email": "a@x.y", "autoStarted": True, "topic": "EVs",
+            "deviceName": "Macbook"}
+    if online is not None:
+        note["deviceOnline"] = online
+    out = "\n".join(sr._signed_in_lines(note))
+    assert "Macbook" in out, out
+    if queued:
+        assert "queued on Macbook" in out and "switched off" in out, out
+        assert "Started" not in out, out
+    else:
+        assert "Started" in out, out
+        assert "switched off" not in out, out
+
+
+def test_the_bridge_puts_the_power_state_on_the_announce(monkeypatch):
+    """⛔ THE FIELD HAS TO REACH THE WIRE, and a renderer test cannot see whether it
+    does. Pinned at the payload the handler builds."""
+    from facade import bridge as br
+    seen = {}
+
+    class _FS:
+        def __init__(self, tok):
+            pass
+
+        def list_devices(self, uid):
+            return [{"id": "d1", "name": "Macbook", "lastSeenAt": 0}]
+
+    monkeypatch.setattr(br, "FirestoreRest", _FS)
+    monkeypatch.setattr(br, "_autostart_pick_device",
+                        lambda fs, sess: ("d1", "Macbook", [], ""))
+    monkeypatch.setattr(br, "_resolve_run_config", lambda *a, **k: {})
+    monkeypatch.setattr(br, "_enqueue_research_run",
+                        lambda *a, **k: seen.setdefault("run", ("r1", "q1")) or ("r1", "q1"))
+    ev = br._run_autostart(_sess(), "EVs", None)
+    assert ev["autoStarted"] is True, ev
+    assert "deviceOnline" in ev, ("the fact exists and never reached the announce", ev)
+    assert ev["deviceOnline"] is False, (
+        "a device with no recent heartbeat is not awake", ev)
 
 
 # ── 3b. a promise is a claim about a sender ──────────────────────────────────
@@ -466,21 +535,29 @@ def _research_signed_out(monkeypatch, capsys, armed, *, in_flight):
 
 
 @pytest.mark.parametrize("in_flight", [True, False])
-def test_neither_signed_out_door_promises_a_pickup_with_nothing_armed(
+def test_neither_signed_out_door_promises_to_POST_with_nothing_armed(
         monkeypatch, capsys, in_flight):
-    """Both doors carried the same claim and only one of them was pinned, so a
-    mutant of the other survived. "I'll pick this up" is the watchdog's job; with
-    no watchdog there is nobody to pick anything up."""
+    """⛔⛔ ONLY THE DELIVERY HALF IS CONDITIONAL, and the first version of this
+    test got that wrong in a way that made the copy lie the other way. It asserted
+    that an unarmed door must NOT say "I'll pick this up" — so the code said "then
+    tell me and I'll start it", as though an unwritten cron row stopped the
+    research starting. It does not: capture claims the topic and enqueues the run
+    SERVER-SIDE before any tick, on by default. Arming decides who tells them, not
+    whether it happens."""
     out = _research_signed_out(monkeypatch, capsys, False, in_flight=in_flight)
-    assert "pick this up" not in out, out
-    assert "tell me and I" in out, out
+    assert "pick this up" in out, ("the bridge picks it up either way", out)
+    assert "post here" not in out, ("nothing is armed to post", out)
+    assert "ask me once you" in out, out
+    assert "tell me and I" not in out, (
+        "it made the research sound like it was waiting on them", out)
 
 
 @pytest.mark.parametrize("in_flight", [True, False])
-def test_both_signed_out_doors_promise_it_when_the_arm_landed(
+def test_both_signed_out_doors_promise_to_post_when_the_arm_landed(
         monkeypatch, capsys, in_flight):
     out = _research_signed_out(monkeypatch, capsys, True, in_flight=in_flight)
     assert "pick this up" in out, out
+    assert "post here" in out, out
 
 
 # ── 4. arming forgets the previous attempt's countdown ───────────────────────
@@ -500,15 +577,57 @@ def test_arming_clears_a_poisoned_login_wait(tmp_path, monkeypatch):
     19 of the attempt that armed the listener; the watcher outliving one flow is
     correct. It is the SECOND attempt that dies."""
     state = tmp_path / ".sr_poll_telegram-111.state.json"
+    monkeypatch.setattr(sr, "_scripts_dir", lambda: tmp_path)
+
+    # ⛔⛔ THE SHAPE THE WATCHDOG ACTUALLY LEAVES, and the first version of this
+    # test did not use it. It seeded {"__login_wait__": 18, "abc123": {...}} — a
+    # file `_tick_unauthed` CANNOT produce, because any non-`__` key means the
+    # chat was already signed in and it returns before the counter is ever
+    # touched. A guard narrowed to that impossible shape would have left this
+    # suite green and the fix dead.
+    state.write_text(json.dumps({"__login_wait__": 18}), encoding="utf-8")
+    sr._clear_login_wait("telegram-111")
+    assert json.loads(state.read_text(encoding="utf-8")) == {}, state.read_text()
+
+    # And the run de-dup keys survive when they ARE there. Reachable the other way
+    # round: a chat that streamed, lost auth, and was re-armed.
     state.write_text(json.dumps({"__login_wait__": 18, "abc123": {"needs": False}}),
                      encoding="utf-8")
-    monkeypatch.setattr(sr, "_scripts_dir", lambda: tmp_path)
     sr._clear_login_wait("telegram-111")
     left = json.loads(state.read_text(encoding="utf-8"))
     assert "__login_wait__" not in left
     assert left["abc123"] == {"needs": False}, (
         "the run de-dup keys must survive — dropping those re-announces every "
         "finished run", left)
+
+
+def test_the_whole_poison_and_reset_loop_end_to_end(tmp_path, monkeypatch):
+    """⛔⛔ THE DEFECT, DRIVEN RATHER THAN DESCRIBED. Nineteen unauthenticated ticks
+    tear the cron row down and leave the counter at the limit; every later listener
+    then dies on its FIRST tick. The reset has to make the twentieth tick behave
+    like the first — asserted by running the watchdog's own function, not by
+    inspecting a file we wrote ourselves."""
+    state = tmp_path / ".sr_poll_telegram-111.state.json"
+    origin = {"platform": "telegram", "chat_id": "111"}
+    torn = []
+    monkeypatch.setattr(poll, "_teardown", lambda o: torn.append(o))
+    monkeypatch.setattr(sr, "_scripts_dir", lambda: tmp_path)
+    for _ in range(poll._LOGIN_WAIT_LIMIT + 1):
+        poll._tick_unauthed(origin, state)
+    assert torn, "the listener never gave up, so there is nothing to reset"
+    assert json.loads(state.read_text(encoding="utf-8")) == {
+        "__login_wait__": poll._LOGIN_WAIT_LIMIT}, state.read_text()
+
+    torn.clear()
+    poll._tick_unauthed(origin, state)
+    assert torn, ("without a reset the NEXT sign-in attempt dies on its first "
+                  "tick — that is the whole defect")
+
+    torn.clear()
+    sr._clear_login_wait("telegram-111")
+    poll._tick_unauthed(origin, state)
+    assert not torn, ("after arming, the first tick of a fresh attempt must be "
+                      "just that — a first tick")
 
 
 def test_arming_is_what_clears_it(tmp_path, monkeypatch):

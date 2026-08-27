@@ -1274,7 +1274,15 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
                     f"— using {config.BRIDGE_PORT}")
     health = _bridge_get("/healthz")
     if health is None:
-        _doctor_row("bridge", False, "down (run: superresearch-agent serve)")
+        # ⛔⛔ NAME THE ORIGIN IT ACTUALLY PROBED. The incident this stretch came
+        # from was an inherited SUPER_AGENT_BRIDGE_PORT=9 — numeric, in range, and
+        # therefore ACCEPTED, so the refused-port row above never prints for it.
+        # Without the origin here, `doctor` answers a person whose client and
+        # bridge are on two different ports with a bare "down", which is exactly
+        # what it says when nothing is wrong with the port at all.
+        _doctor_row("bridge", False,
+                    f"down at {config.bridge_origin()} "
+                    f"(run: superresearch-agent serve)")
         sess = AccountSession.load()
         _doctor_row("account", bool(sess),
                     "stored session present — start the bridge to validate" if sess
