@@ -208,13 +208,14 @@ MUTANTS = [
      "through",
      [('    if note.get("needsDeviceChoice"):\n        return [head] + _pick_device_lines(\n'
        '            {"devices": note.get("devices")},\n'
-       '            "stale_selection" if note.get("staleSelection") else "no_selection")',
+       '            "stale_selection" if note.get("staleSelection") else "no_selection",\n'
+       "            about=quoted)",
        '    if note.get("needsDeviceChoice"):\n        return [head, "Which computer should run this?"]')]),
     ("U5", SR_BE, "under",
      "the reason stops being read, so somebody whose chosen computer has gone is "
      "told to pick from a list rather than that the one they used is unreachable",
-     [('            "stale_selection" if note.get("staleSelection") else "no_selection")',
-       '            "no_selection")')]),
+     [('            "stale_selection" if note.get("staleSelection") else "no_selection",',
+       '            "no_selection",')]),
     ("U6", SR_BE, "under",
      "⛔ `via=agent` goes. That stops the eating by stopping the per-phase link "
      "minting this command exists for — a fix that removes the feature",
@@ -294,16 +295,20 @@ MUTANTS = [
        '    if False:\n        lines.append("I’ll post here when it’s done')]),
     ("A3", SR_BE, "over",
      "the signed-out link promises a pick-up again with nothing armed to do it",
-     [('                         + ("I\'ll pick this up." if arm_payload.get("armed")\n'
-       '                            else "then tell me and I\'ll start it.")]',
-       '                         + "I\'ll pick this up."]')]),
+     [('                         + (". I\'ll post here when it\'s done."\n'
+       '                            if arm_payload.get("armed")\n'
+       '                            else " — ask me once you\'re in and I\'ll tell you where "\n'
+       '                                 "it got to.")]',
+       '                         + ". I\'ll post here when it\'s done."]')]),
     ("A4", SR_BE, "over",
      "the other signed-out door promises it too",
-     [('                    ("You\'re not signed in yet. Log in here and I\'ll pick this up:"\n'
+     [('                    ("You\'re not signed in yet. Log in here and I\'ll pick this "\n'
+       '                     "up — I\'ll post here when it\'s done:"\n'
        '                     if arm_payload.get("armed") else\n'
-       '                     "You\'re not signed in yet. Log in here, then tell me and "\n'
-       '                     "I\'ll start it:"),',
-       '                    "You\'re not signed in yet. Log in here and I\'ll pick this up:",')]),
+       '                     "You\'re not signed in yet. Log in here and I\'ll pick this "\n'
+       '                     "up — ask me once you\'re in:"),',
+       '                    "You\'re not signed in yet. Log in here and I\'ll pick this "\n'
+       '                    "up — I\'ll post here when it\'s done:",')]),
 
     # ═══════════ F — the fork: the topic survives a sign-in ═══════════
     ("F1", FORK_SR, "under",
@@ -325,8 +330,8 @@ MUTANTS = [
      "⛔ any reply from the attach door counts as success, so the 409 that means "
      "the sign-in ended between the probe and the post becomes a promise that "
      "their research is waiting on a flow that no longer exists",
-     [("        if pcode == 200:\n            _say(\"They are part-way through signing in.",
-       "        if pcode:\n            _say(\"They are part-way through signing in.")]),
+     [("        if pcode == 200:\n            # ⛔⛔ NOT \"IT STARTS ON ITS OWN\".",
+       "        if pcode:\n            # ⛔⛔ NOT \"IT STARTS ON ITS OWN\".")]),
     ("F4", FORK_SR, "under",
      "the probe goes, so a sign-in already in flight is replaced by a fresh one — "
      "voiding the address the person is about to tap",
@@ -524,6 +529,115 @@ MUTANTS = [
      "in the surface where it is delivered word for word",
      [('        if devs and all(d.get("online") is False for d in devs):',
        "        if False:")]),
+
+    # ═══════════ Q — round 3: the sentences that were still false ═══════════
+    ("Q1", SR_BE, "over",
+     "⛔⛔ THE UNARMED COPY REWRITES WHAT THE BRIDGE DOES again — \"then tell me and "
+     "I'll start it\", as though an unwritten cron row stopped the research "
+     "starting. Capture claims the topic and enqueues the run SERVER-SIDE before "
+     "any tick, on by default; arming decides who TELLS them",
+     [('                         + (". I\'ll post here when it\'s done."\n'
+       '                            if arm_payload.get("armed")\n'
+       '                            else " — ask me once you\'re in and I\'ll tell you where "\n'
+       '                                 "it got to.")]',
+       '                         + (". I\'ll post here when it\'s done."\n'
+       '                            if arm_payload.get("armed")\n'
+       '                            else ", then tell me and I\'ll start it.")]')]),
+    ("Q2", SR_BE, "under",
+     "⛔ a run queued on a switched-off computer is announced as STARTED again — "
+     "\"Started your research on Macbook\" reads as work in progress when it means "
+     "\"waiting until somebody switches it on\", which could be tomorrow",
+     [('        if where and note.get("deviceOnline") is False:', "        if False:")]),
+    ("Q3", SR_BE, "over",
+     "⛔⛔ AN UNKNOWN POWER STATE IS TREATED AS OFF, so an announce that simply "
+     "could not read the device invents a wait that may not exist — the same "
+     "defect as the missing sentence, pointing the other way",
+     [('        if where and note.get("deviceOnline") is False:',
+       '        if where and not note.get("deviceOnline"):')]),
+    ("Q4", BRIDGE, "under",
+     "the power state never reaches the announce, so all three renderers are back "
+     "to not being able to say it however carefully they are written",
+     [('            "deviceOnline": _device_is_online(chosen) if chosen else None,',
+       '            "deviceOnline": None,')]),
+    ("Q5", BRIDGE, "under",
+     "the field is dropped at the wire instead, which looks like a different bug "
+     "from Q4 and produces the identical silence",
+     [('                            "deviceOnline": ev.get("deviceOnline"),',
+       '                            "deviceOnline": None,')]),
+    ("Q6", BRIDGE, "over",
+     "⛔ the device lookup stops being best-effort, so a Firestore blip takes a "
+     "STARTED run's whole announce down with it — a courtesy field failing the "
+     "thing it is a courtesy about",
+     [("    except Exception as e:  # noqa: BLE001 — a courtesy field, never a failure\n"
+       "        log.warning(\"could not read the auto-start device's power state (%s)\",\n"
+       "                    type(e).__name__)\n    return None",
+       "    except Exception:\n        raise")]),
+    ("Q7", SR_BE, "under",
+     "⛔ the sign-in door asks \"which should run this?\" again, in a place where "
+     "there is no \"this\" — it is telling somebody what has been WAITING, and the "
+     "run path's object is the wrong one there",
+     [("            about=quoted)", "            about=\"this\")")]),
+    ("Q8", CLI, "under",
+     "⛔ `doctor` stops naming the origin it probed, so somebody whose client and "
+     "bridge are on different ports — the incident's own shape, and one the "
+     "refused-port row cannot report because port 9 is ACCEPTED — is told only "
+     "that the bridge is down",
+     [('                    f"down at {config.bridge_origin()} "\n'
+       '                    f"(run: superresearch-agent serve)")',
+       '                    "down (run: superresearch-agent serve)")')]),
+    ("Q9", SR_BE, "under",
+     "⛔⛔ ARMING STOPS RESETTING THE COUNTER FOR A FILE THE WATCHDOG CAN ACTUALLY "
+     "PRODUCE. The guard narrows to a shape that only exists if a chat was already "
+     "signed in — which is precisely when the counter is never written — so the "
+     "fix is dead and the suite stays green",
+     [('    if not isinstance(raw, dict) or "__login_wait__" not in raw:',
+       '    if not isinstance(raw, dict) or len(raw) < 2:')]),
+    ("Q10", FORK_SR, "over",
+     "⛔⛔ THE FLEET IS PROMISED A START AGAIN. Against the pinned wheel a stashed "
+     "topic runs only if the account already has a computer, and a first-ever "
+     "signer-in has none — which is the entire population a shared research "
+     "computer exists for",
+     [('        _say("They are not signed in yet. Send them this — it remembers %s and "\n'
+       '             "picks it up the moment they are in:" % _topic_phrase(topic))',
+       '        _say("They are not signed in yet. Send them this — their research "\n'
+       '             "starts by itself once they are in:")')]),
+    ("Q11", FORK_SR, "under",
+     "the attach door stops naming the topic it now carries, so a second ask "
+     "silently replaces a first with nothing on screen to say so",
+     [('                 "%s, and it is picked up the moment they finish in the browser."\n'
+       "                 % _topic_phrase(topic))",
+       '                 "their research, and it is picked up the moment they finish."\n'
+       "                 % ())")]),
+    ("Q12", FORK_SR, "under",
+     "⛔⛔ THE THIRD COPY OF THE QUESTION LOSES THE POWER STATE AGAIN — the reply "
+     "somebody gets when they say they are done goes back to a bare comma list "
+     "that never reads `online`, while the other two surfaces keep it",
+     [('            rows.append(label + (" (on)" if up is True else\n'
+       '                                 (" (off - waits until it is switched on)"\n'
+       '                                  if up is False else "")))',
+       "            rows.append(label)")]),
+    ("Q13", FORK_SR, "under",
+     "the sign-in relay claims a choice when none of their computers is awake",
+     [('        if devs and all(d.get("online") is False for d in devs):\n'
+       '            return ["%s has not started: none of their computers is switched on, so "',
+       '        if False:\n'
+       '            return ["%s has not started: none of their computers is switched on, so "')]),
+    ("Q14", FORK_SR, "under",
+     "the relay announces a run queued on a switched-off computer as already "
+     "started",
+     [('        if where and note.get("deviceOnline") is False:\n'
+       '            return ["%s is queued on %s, which is switched off — it starts when "',
+       '        if False:\n'
+       '            return ["%s is queued on %s, which is switched off — it starts when "')]),
+    ("Q15", FORK_POLL, "under",
+     "⛔ the VERBATIM surface announces a queued run as starting now. This one "
+     "reaches the person with no model turn to soften it",
+     [('        if where and signed.get("deviceOnline") is False:', "        if False:")]),
+    ("Q16", FORK_SKILL, "under",
+     "the skill goes back to telling the assistant the research starts by itself, "
+     "which is false for anybody signing in for the first time",
+     [("Do not tell them it will start by itself.",
+       "Tell them it will start by itself.")]),
 
     # ═══════════ S — the prose and the provisioner say one thing ═══════════
     ("S1", FORK_SKILL, "under",
