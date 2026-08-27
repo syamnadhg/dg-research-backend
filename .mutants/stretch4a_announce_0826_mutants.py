@@ -313,8 +313,9 @@ MUTANTS = [
      "⛔⛔ THE THEFT RETURNS. Chat A's topic AND destination are overwritten by "
      "chat B's post, so after sign-in only B's research runs and A's watchdog — "
      "armed, and told \"I'll pick this up\" — waits forever. Two 200s, one lost "
-     "request, no error anywhere",
-     [('                if ((flow.pending_topic or "").strip()\n                        and not _same_origin(flow.origin, origin)):',
+     "request, no error anywhere.\n"
+     "     ⚠ RE-POINTED 2026-08-27: stretch 4.5 added a `both_anonymous` clause to this guard — an origin-less chat may now correct its OWN topic — so the two-line anchor stopped matching. Re-pointed, not deleted: the theft it measures is unchanged",
+     [('                if ((flow.pending_topic or "").strip()\n                        and not both_anonymous\n                        and not _same_origin(flow.origin, origin)):',
        '                if False:')]),
     ("T2", BRIDGE, "over",
      "⛔ the same chat is refused too, so a person correcting their own topic in "
@@ -323,8 +324,9 @@ MUTANTS = [
        '                        and True):')]),
     ("T3", BRIDGE, "over",
      "the refusal fires when NO topic is held, so the ordinary first attach — "
-     "the one that gives a terminal sign-in a chat to answer in — is rejected",
-     [('                if ((flow.pending_topic or "").strip()\n                        and not _same_origin(flow.origin, origin)):',
+     "the one that gives a terminal sign-in a chat to answer in — is rejected.\n"
+     "     ⚠ RE-POINTED 2026-08-27: stretch 4.5 added a `both_anonymous` clause to this guard — an origin-less chat may now correct its OWN topic — so the two-line anchor stopped matching. Re-pointed, not deleted: the theft it measures is unchanged",
+     [('                if ((flow.pending_topic or "").strip()\n                        and not both_anonymous\n                        and not _same_origin(flow.origin, origin)):',
        '                if (not _same_origin(flow.origin, origin)):')]),
     ("T4", BRIDGE, "under",
      "the platform stops counting, so telegram chat 111 and whatsapp chat 111 "
@@ -353,9 +355,10 @@ MUTANTS = [
      "⛔⛔ THE THEFT GUARD GOES BACK TO ITS FIRST FORM, which was WORSE than the bug: "
      "it demanded an INCOMING origin, so chat B posting without one skipped it "
      "entirely and B's TOPIC landed on A's ORIGIN — the announce then went to chat A "
-     "carrying chat B's research, and B's research is what started",
-     [('                if ((flow.pending_topic or "").strip()\n                        and not _same_origin(flow.origin, origin)):',
-       '                if ((flow.pending_topic or "").strip()\n                        and isinstance(origin, dict) and isinstance(flow.origin, dict)\n                        and not _same_origin(flow.origin, origin)):')]),
+     "carrying chat B's research, and B's research is what started.\n"
+     "     ⚠ RE-POINTED 2026-08-27: stretch 4.5 added a `both_anonymous` clause to this guard — an origin-less chat may now correct its OWN topic — so the two-line anchor stopped matching. Re-pointed, not deleted: the theft it measures is unchanged",
+     [('                if ((flow.pending_topic or "").strip()\n                        and not both_anonymous\n                        and not _same_origin(flow.origin, origin)):',
+       '                if ((flow.pending_topic or "").strip()\n                        and isinstance(origin, dict) and isinstance(flow.origin, dict)\n                        and not both_anonymous\n                        and not _same_origin(flow.origin, origin)):')]),
     ("X2", BRIDGE, "under",
      "⛔⛔ the START door reopens: a second chat mints a fresh flow that replaces the "
      "held topic AND origin outright, so closing /pending bought nothing",

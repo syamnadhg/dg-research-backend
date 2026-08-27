@@ -31,13 +31,20 @@ _MAX_STRIKES = 3  # consecutive bridge-unreachable daily ticks before self-remov
 
 
 def _base() -> str:
-    raw = os.environ.get("SUPER_AGENT_BRIDGE_PORT", "9876")
-    try:
-        port = int(raw)
-        if not (1 <= port <= 65535):
-            raise ValueError
-    except ValueError:
-        port = 9876
+    # ⛔ EMPTY IS UNSET, NOT BAD. `os.environ.get(name, default)` returns "" for a
+    # variable that is SET AND EMPTY — a shape a shell exports readily — and the
+    # bridge treats that as unset. Without the strip-and-test this copy called it
+    # a bad value instead, which is the same disagreement between the bridge and
+    # its clients that this whole rule exists to remove.
+    raw = (os.environ.get("SUPER_AGENT_BRIDGE_PORT") or "").strip()
+    port = 9876
+    if raw:
+        try:
+            val = int(raw)
+            if 1 <= val <= 65535:
+                port = val
+        except ValueError:
+            pass
     return f"http://127.0.0.1:{port}"
 
 

@@ -140,8 +140,9 @@ MUTANTS = [
     # ═══════════ DR — doctor names it, and names it in time ═════════════════
     ("DR1", CLI, "under",
      "doctor stops naming the log at all, so the path returns to being reachable "
-     "only through a banner that prints to /dev/null on the pinned install",
-     [("    _doctor_log_row()\n\n    health = _bridge_get", "    health = _bridge_get")]),
+     "only through a banner that prints to /dev/null on the pinned install.\n"
+     "     ⚠ RE-POINTED 2026-08-27: stretch 4.5 put the refused-port row between this call and the bridge check, so the anchor stopped matching",
+     [("    _doctor_log_row()\n", "")]),
     ("DR2", CLI, "under",
      "the line saying the log is NOT in a support bundle goes, so somebody who "
      "sent a bundle assumes this went with it and waits on evidence nobody has",
@@ -153,7 +154,7 @@ MUTANTS = [
      "banner already had, reintroduced by a placement that looks tidier. ⭐ This "
      "genuinely MOVES the call: the first version of this mutant only deleted it, "
      "which made it a duplicate of DR1 and its own description untrue",
-     [("    _doctor_log_row()\n\n    health = _bridge_get", "    health = _bridge_get"),
+     [("    _doctor_log_row()\n", ""),
       ('    _doctor_row("bridge", True, "up")',
        '    _doctor_log_row()\n    _doctor_row("bridge", True, "up")')]),
     ("DR4", CLI, "under",

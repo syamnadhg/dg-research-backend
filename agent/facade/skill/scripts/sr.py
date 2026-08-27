@@ -112,14 +112,26 @@ _SETUP_NODE_LINES = [
 def _base() -> str:
     # Read the port lazily so the env can be set per invocation. Always loopback;
     # the env only chooses the port (validated — never a host).
-    raw = os.environ.get("SUPER_AGENT_BRIDGE_PORT", "9876")
-    try:
-        port = int(raw)
-        if not (1 <= port <= 65535):
-            raise ValueError
-    except ValueError:
-        print(f"(ignoring bad SUPER_AGENT_BRIDGE_PORT {raw!r}; using 9876)", file=sys.stderr)
-        port = 9876
+    #
+    # ⛔⛔ EMPTY IS UNSET, NOT BAD, AND THIS COPY USED TO DISAGREE — LOUDLY. A
+    # variable that is SET AND EMPTY (a shape a shell exports readily) came back
+    # as "" rather than the default, `int("")` raised, and this printed
+    # "(ignoring bad SUPER_AGENT_BRIDGE_PORT ''; using 9876)" TO STDERR ON EVERY
+    # SINGLE INVOCATION — while the bridge, and the other three copies of this
+    # rule, silently treated the same value as unset. Found by executing the two
+    # against each other rather than by reading them.
+    raw = (os.environ.get("SUPER_AGENT_BRIDGE_PORT") or "").strip()
+    port = 9876
+    if raw:
+        try:
+            val = int(raw)
+            if 1 <= val <= 65535:
+                port = val
+            else:
+                raise ValueError
+        except ValueError:
+            print(f"(ignoring bad SUPER_AGENT_BRIDGE_PORT {raw!r}; using 9876)",
+                  file=sys.stderr)
     return f"http://127.0.0.1:{port}"
 
 
@@ -861,9 +873,14 @@ def _signed_in_lines(note) -> list[str]:
     Four outcomes, the same four the watchdog renders and the same four the
     fleet's `login-done` relays: the bridge started the waiting research, there is
     no Research Computer to run it on, several could run it and none is obvious,
-    or a topic is simply waiting to be told to go ahead. ``[]`` for a plain
-    sign-in with nothing pending — a bare "you are signed in" from a command
-    somebody ran to ask about their RESEARCH is news they already have.
+    or a topic is simply waiting to be told to go ahead.
+
+    ⛔ EXACTLY ONE LINE FOR A PLAIN SIGN-IN, AND ``[]`` ONLY WHEN THERE IS NO NOTE.
+    An earlier version of this sentence claimed ``[]`` for a plain sign-in too, and
+    the code has never done that — the difference matters because this read has
+    already CONSUMED the announce by the time we get here. Saying nothing would be
+    the silent eater again, one function further in: the news would be destroyed
+    and the person would never hear it from anybody.
 
     ⛔ THE "WHICH COMPUTER?" CASE DELEGATES TO ``_pick_device_lines`` RATHER THAN
     WORDING IT AGAIN. That question already exists in two places that a test pins
@@ -1192,9 +1209,15 @@ def cmd_updates(args) -> int:
         else:
             # Fallback (older build / no phaseUpdates): the minted permanent SR links.
             lines += _fmt_sr_links(r.get("srLinks") or {})
+    # ⛔ KEYED ON `runs`, NOT ON `lines`. Seeding `lines` with the sign-in announce
+    # made the old `lines or [...]` fallback dead: somebody who asked what was
+    # running got a sign-in line and NO statement about their runs at all, which is
+    # a different way of not answering the question they asked.
+    if not runs:
+        lines.append("No active runs.")
     # Watchdog self-heal: re-emit the arming directive when a live agent run
     # has no ticking watchdog in this chat (see _stream_health_lines).
-    return _emit(body, args.json, (lines or ["No active runs."]) + _stream_health_lines(runs))
+    return _emit(body, args.json, lines + _stream_health_lines(runs))
 
 
 # ── send logs ────────────────────────────────────────────────────────────────

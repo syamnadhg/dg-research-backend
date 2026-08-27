@@ -48,6 +48,8 @@ import requests
 from facade import bridge, config
 
 sr = importlib.import_module("facade.skill.scripts.sr")
+poll = importlib.import_module("facade.skill.scripts.sr_attention_poll")
+notice = importlib.import_module("facade.skill.scripts.sr_update_notice")
 
 
 class FakeFS:
@@ -107,6 +109,37 @@ def test_the_port_is_read_the_same_way_the_clients_read_it(monkeypatch, raw, por
     try:
         assert fresh.BRIDGE_PORT == port
         assert fresh.BRIDGE_PORT_REJECTED == rejected
+        # ⛔⛔ AND THE CLIENTS ARE ACTUALLY READ, which this test's own name claims
+        # and its first version did not do — it reloaded `config` and asserted on
+        # `config`, so "five copies land on the same answer" was pinned by nothing.
+        # The two bundled clients resolve their port lazily from the same variable,
+        # so the port they would REACH is what has to match.
+        assert sr._base().rsplit(":", 1)[1] == str(port), sr._base()
+        assert poll._base().rsplit(":", 1)[1] == str(port), poll._base()
+        assert notice._base().rsplit(":", 1)[1] == str(port), notice._base()
+    finally:
+        monkeypatch.delenv("SUPER_AGENT_BRIDGE_PORT", raising=False)
+        importlib.reload(config)
+
+
+def test_a_variable_that_is_set_but_empty_is_unset_everywhere(monkeypatch, capsys):
+    """⛔⛔ FOUND BY EXECUTING THE COPIES AGAINST EACH OTHER, not by reading them.
+    `os.environ.get(name, default)` returns "" for a variable that is SET AND
+    EMPTY — a shape a shell exports readily — so the default never applies. The
+    bridge and two clients treated that as unset; the chat client called it a bad
+    value and printed "(ignoring bad SUPER_AGENT_BRIDGE_PORT ''; using 9876)" to
+    stderr ON EVERY INVOCATION. Same value, four answers, one of them noisy."""
+    monkeypatch.setenv("SUPER_AGENT_BRIDGE_PORT", "")
+    try:
+        fresh = importlib.reload(config)
+        assert fresh.BRIDGE_PORT == 9876
+        assert fresh.BRIDGE_PORT_REJECTED == "", (
+            "an empty variable is not a value somebody chose badly")
+        capsys.readouterr()
+        for mod in (sr, poll, notice):
+            assert mod._base().endswith(":9876"), mod._base()
+        assert capsys.readouterr().err == "", (
+            "a client complained about a value the bridge did not even see")
     finally:
         monkeypatch.delenv("SUPER_AGENT_BRIDGE_PORT", raising=False)
         importlib.reload(config)
@@ -235,6 +268,70 @@ def test_the_holder_hint_runs_on_the_machine_that_prints_it(monkeypatch, platfor
     assert "9876" in hint, hint
 
 
+def _doctor_output(monkeypatch, tmp_path) -> str:
+    """`doctor` with everything else stubbed out, so only the port row varies.
+
+    Mirrors `test_agent_log_out_0826._doctor_output` deliberately rather than
+    importing it — a shared fixture would make one file's stubs decide another
+    file's assertions, and this one has to control `config` itself."""
+    import argparse
+    import io as _io
+    from facade import cli
+    monkeypatch.setattr(cli.config, "log_path", lambda: tmp_path / "bridge.log")
+    monkeypatch.setattr(cli.config, "VERBOSE", False)
+    monkeypatch.setattr(cli.requests, "get",
+                        lambda *a, **k: SimpleNamespace(status_code=200))
+    monkeypatch.setattr(cli, "_bridge_get", lambda p: None)   # bridge down
+    monkeypatch.setattr(cli.AccountSession, "load", staticmethod(lambda: None))
+    buf = _io.StringIO()
+    monkeypatch.setattr("sys.stdout", buf)
+    cli.cmd_doctor(argparse.Namespace())
+    return buf.getvalue()
+
+
+def test_doctor_names_a_refused_port_before_it_calls_the_bridge_down(monkeypatch, tmp_path):
+    """⛔⛔ A MUTATION SURVIVED HERE. `doctor` is the one command somebody runs when
+    the bridge is unreachable — and a refused SUPER_AGENT_BRIDGE_PORT is a reason
+    it would be, because this command and the bridge then look for each other on
+    two different ports. Every symptom of that is indistinguishable from "the
+    bridge is down", which is exactly what the next row says. Nothing tested it, so
+    the row could be deleted with a green suite."""
+    monkeypatch.setenv("SUPER_AGENT_BRIDGE_PORT", "not-a-port")
+    try:
+        importlib.reload(config)
+        from facade import cli
+        monkeypatch.setattr(cli, "config", config)
+        out = _doctor_output(monkeypatch, tmp_path)
+        assert "not-a-port" in out, out
+        assert "9876" in out, out
+        assert out.index("not-a-port") < out.index("down"), (
+            "the reason must come before the symptom it explains", out)
+        # ⚠ `_doctor_row` pads its label with ljust(10); an eleven-character label
+        # renders welded to its own text. Found by cross-verification, not by a
+        # test, which is why there is one now.
+        assert "portignoring" not in out, ("label welded to the detail", out)
+    finally:
+        monkeypatch.delenv("SUPER_AGENT_BRIDGE_PORT", raising=False)
+        importlib.reload(config)
+
+
+def test_doctor_stays_quiet_about_a_port_it_accepted(monkeypatch, tmp_path):
+    """⛔ INCLUDING PORT 9 — the incident's own value. It is numeric and in range,
+    so it is ACCEPTED, and the row must not appear. A version that reported every
+    non-default port would put a warning in front of everyone who legitimately
+    moved the bridge."""
+    monkeypatch.setenv("SUPER_AGENT_BRIDGE_PORT", "9")
+    try:
+        importlib.reload(config)
+        from facade import cli
+        monkeypatch.setattr(cli, "config", config)
+        out = _doctor_output(monkeypatch, tmp_path)
+        assert "ignoring SUPER_AGENT_BRIDGE_PORT" not in out, out
+    finally:
+        monkeypatch.delenv("SUPER_AGENT_BRIDGE_PORT", raising=False)
+        importlib.reload(config)
+
+
 # ── 3. `updates` owes the person the note it just took ───────────────────────
 
 def _updates_body(**signed):
@@ -275,9 +372,13 @@ def test_updates_still_asks_via_agent(monkeypatch):
     assert seen.get("via_agent") is True, seen
 
 
-def test_a_plain_signin_with_nothing_pending_adds_nothing(monkeypatch, capsys):
-    """A bare "you are signed in", from a command somebody ran to ask about their
-    RESEARCH, is news they already have. `[]` is the honest answer."""
+def test_a_plain_signin_says_that_and_nothing_it_cannot_know(monkeypatch, capsys):
+    """⛔ NAMED AND DOCUMENTED FOR THE OPPOSITE OF WHAT IT ASSERTED, until
+    cross-verification read it. It used to be called "..._adds_nothing" and to
+    claim `[]` was the honest answer — while asserting, correctly, that the line
+    IS printed. Saying nothing here would be the silent eater one function
+    further in: this read has already CONSUMED the announce, so the news would be
+    destroyed and never reach anybody. One line, and not a word beyond it."""
     monkeypatch.setattr(sr, "_fetch_runs",
                         lambda **kw: (200, _updates_body(email="a@x.y"), []))
     monkeypatch.setattr(sr, "_stream_health_lines", lambda runs: [])
@@ -306,6 +407,80 @@ def test_the_which_computer_ask_is_not_worded_a_third_time(monkeypatch):
 @pytest.mark.parametrize("note", [None, {}, "nope", 7, []])
 def test_a_missing_or_malformed_note_renders_nothing(note):
     assert sr._signed_in_lines(note) == []
+
+
+# ── 3b. a promise is a claim about a sender ──────────────────────────────────
+#
+# ⛔⛔ THESE FOUR EXIST BECAUSE THREE MUTANTS SURVIVED. The commit's own headline —
+# "I'll post here when it's done" made conditional on a cron row actually being
+# written — had NO test anywhere in either repo, so it could be reverted to the
+# exact sentence it fixes with a fully green suite. Found by the harness (A1, A2,
+# A3) and by cross-verification independently, which is the only reason it is not
+# still true.
+
+def _research_started(monkeypatch, capsys, armed):
+    monkeypatch.setattr(sr, "_post", lambda path, body=None: (200, {"deviceId": "d1"}))
+    monkeypatch.setattr(sr, "_device_names", lambda: {"d1": "Office PC"})
+    monkeypatch.setattr(sr, "_prepare_stream_arm", lambda: ([], {"armed": armed}, 0))
+    sr.main(["research", "the EV battery market"])
+    return capsys.readouterr().out
+
+
+def test_a_started_run_promises_a_follow_up_only_when_one_was_armed(monkeypatch, capsys):
+    """⛔⛔ NOTHING IN THIS PACKAGE SCHEDULES. The only thing that ticks is a cron
+    row in the host runtime's own store, and `_prepare_stream_arm` either writes it
+    or reports that it could not — it hard-codes `armed: False` on the legacy
+    no-origin branch, where a runtime that supplies no chat origin can never be
+    delivered to at all. The promise was printed three lines ABOVE that call."""
+    out = _research_started(monkeypatch, capsys, False)
+    assert "Started" in out, out
+    assert "post here when it" not in out, (
+        "it promised a message with no sender", out)
+    assert "Ask me how it" in out, out
+
+
+def test_the_armed_case_still_promises_it_because_there_it_is_true(monkeypatch, capsys):
+    """The other half, pinned against the first. A fix that made the unarmed branch
+    honest while quietly dropping the promise from the armed one would read as a
+    pass and would be a regression — the armed case is the common one."""
+    out = _research_started(monkeypatch, capsys, True)
+    assert "post here when it" in out, out
+    assert "going anytime" in out, ("the invitation to ask is in both arms", out)
+
+
+def _research_signed_out(monkeypatch, capsys, armed, *, in_flight):
+    def _post(path, body=None):
+        if path == "/research":
+            return 401, {"error": "not signed in"}
+        if path == "/login/remote/pending":
+            return 200, {"ok": True}
+        if path == "/login/remote/start":
+            return 200, {"verifyUrl": "https://superresearch.io/c/XYZ"}
+        return 200, {}
+    monkeypatch.setattr(sr, "_post", _post)
+    monkeypatch.setattr(sr, "_get", lambda path, **kw: (
+        200, {"remoteLogin": "pending"} if in_flight else {"authed": False}))
+    monkeypatch.setattr(sr, "_prepare_stream_arm", lambda: ([], {"armed": armed}, 0))
+    sr.main(["research", "the EV battery market"])
+    return capsys.readouterr().out
+
+
+@pytest.mark.parametrize("in_flight", [True, False])
+def test_neither_signed_out_door_promises_a_pickup_with_nothing_armed(
+        monkeypatch, capsys, in_flight):
+    """Both doors carried the same claim and only one of them was pinned, so a
+    mutant of the other survived. "I'll pick this up" is the watchdog's job; with
+    no watchdog there is nobody to pick anything up."""
+    out = _research_signed_out(monkeypatch, capsys, False, in_flight=in_flight)
+    assert "pick this up" not in out, out
+    assert "tell me and I" in out, out
+
+
+@pytest.mark.parametrize("in_flight", [True, False])
+def test_both_signed_out_doors_promise_it_when_the_arm_landed(
+        monkeypatch, capsys, in_flight):
+    out = _research_signed_out(monkeypatch, capsys, True, in_flight=in_flight)
+    assert "pick this up" in out, out
 
 
 # ── 4. arming forgets the previous attempt's countdown ───────────────────────

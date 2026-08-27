@@ -247,10 +247,15 @@ MUTANTS = [
     # ═══════════ B — reading the row back ═══════════════════════════════════
     ("B1", BRIDGE, "over",
      "the support-code shape check goes, so a crafted code is interpolated "
-     "straight into a Firestore path",
-     [('            if not _SUPPORT_CODE_RE.match(code):\n'
+     "straight into a Firestore path.\n"
+     "     ⚠ RE-POINTED 2026-08-27 by the sweep: a SECOND door grew the same "
+     "three lines, so this matched TWICE and measured nothing. It now carries "
+     "the line above it, which is unique to the GET door",
+     [('            code = (qs.get("code") or [""])[0].strip().upper()\n'
+       '            if not _SUPPORT_CODE_RE.match(code):\n'
        '                self._json(400, {"error": "that isn\'t a support code"})\n'
-       '                return\n', "")]),
+       '                return\n',
+       '            code = (qs.get("code") or [""])[0].strip().upper()\n')]),
     ("B2", BRIDGE, "under",
      "the code is not upper-cased, so a person typing back the code they were "
      "given is told it is not a support code",
@@ -415,8 +420,10 @@ MUTANTS = [
        '        lines.append(f"That’s {len(names)} run(s).")')]),
     ("H6", SR, "under",
      "⛔ the assistant is no longer told not to poll, so a chat runtime checks "
-     "the status on a timer for as long as the conversation stays open",
-     [('            "Do not poll on a timer — only when the user asks.",\n', "")]),
+     "the status on a timer for as long as the conversation stays open.\n"
+     "     ⚠ RE-POINTED 2026-08-27 by the sweep, and it had been measuring "
+     "NOTHING for some time: the anchor carried twelve spaces of indent against a line that has eight, so it matched zero times and the mutant reported a fault nobody read. It anchors from the newline now",
+     [('\n        "Do not poll on a timer — only when the user asks.",', "")]),
     ("H7", SR, "over",
      "a broad word like 'everything' asks for the whole machine, turning a "
      "phrase into a request nobody made",

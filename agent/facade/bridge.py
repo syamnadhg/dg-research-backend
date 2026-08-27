@@ -3996,9 +3996,20 @@ def serve(host: str | None = None, port: int | None = None) -> None:
         elif code == errno.EACCES:
             log.warning("bridge port %s:%d cannot be bound by this user — %s", host, port, e)
             print(f"Port {port} cannot be opened by this user account.")
-            print("  Ports below 1024 are reserved for administrators on this system.")
-            print("  Set SUPER_AGENT_BRIDGE_PORT to a port above 1024 (the default is "
-                  f"{config.DEFAULT_BRIDGE_PORT}), then retry.")
+            # ⛔ THE REASON IS ONLY KNOWN FOR ONE OF THE TWO CASES, and saying it
+            # for both would repeat this branch's own sin one level down: a port
+            # ABOVE 1024 refused with EACCES is a local policy — a firewall, a
+            # sandbox, a security product — and "ports below 1024 are reserved"
+            # is then a false explanation followed by advice to set the port to
+            # the value that has just failed.
+            if port < 1024:
+                print("  Ports below 1024 are reserved for administrators on this system.")
+                print("  Set SUPER_AGENT_BRIDGE_PORT to a port above 1024 (the default "
+                      f"is {config.DEFAULT_BRIDGE_PORT}), then retry.")
+            else:
+                print("  Something on this machine is refusing it — a firewall or "
+                      "security policy, not the port number itself.")
+                print("  Set SUPER_AGENT_BRIDGE_PORT to another port, then retry.")
         else:
             # ⛔ NEITHER "held" NOR "reserved" — say what the system said and stop.
             # Inventing a cause for an errno we have not thought about is how the

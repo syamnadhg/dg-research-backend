@@ -87,7 +87,8 @@ OURS = (CONF, BRIDGE, CLI, SR_BE)
 FORK_SR = "skills/super-research/scripts/sr.py"
 FORK_SKILL = "skills/super-research/SKILL.md"
 FORK_CRON = "deploy/bin/sr-reconcile-cron.py"
-THEIRS = (FORK_SR, FORK_SKILL, FORK_CRON)
+FORK_POLL = "skills/super-research/scripts/sr_attention_poll.py"
+THEIRS = (FORK_SR, FORK_SKILL, FORK_CRON, FORK_POLL)
 
 SURVIVOR_CONFIRMATIONS = 2
 
@@ -137,8 +138,8 @@ MUTANTS = [
     ("P7", CLI, "under",
      "⛔ `doctor` stops naming the refused port — the one command somebody runs "
      "when the bridge is unreachable, and the refusal is the reason it is",
-     [('    if config.BRIDGE_PORT_REJECTED:\n        _doctor_row("bridge port", False,',
-       '    if False:\n        _doctor_row("bridge port", False,')]),
+     [('    if config.BRIDGE_PORT_REJECTED:\n        # ⚠ NINE CHARACTERS OR FEWER.',
+       '    if False:\n        # ⚠ NINE CHARACTERS OR FEWER.')]),
 
     # ═══════════ E — the bind failure names only what the errno supports ═══════════
     ("E1", BRIDGE, "under",
@@ -351,14 +352,13 @@ MUTANTS = [
      "⛔⛔ IT MINTS A FRESH FLOW EVERY TIME AGAIN. The previous token is never "
      "polled, so the address the person is looking at stops working and any "
      "research attached to it goes with it — and nothing tells them",
-     [('    pstatus, pbody = _post("/login/remote/poll")\n'
-       '    if pstatus == 200 and str(pbody.get("state") or "") == "pending":',
-       '    pstatus, pbody = _post("/login/remote/poll")\n    if False:')]),
+     [('    state = str(pbody.get("state") or "") if pstatus == 200 else ""',
+       '    state = ""')]),
     ("L2", FORK_SR, "over",
      "⛔ any state is reprinted, so an EXPIRED link is handed out again — to "
      "somebody who is asking precisely because the first one stopped working",
-     [('    if pstatus == 200 and str(pbody.get("state") or "") == "pending":',
-       "    if pstatus == 200:")]),
+     [('    if state == "pending":\n        live = str(pbody.get("verifyUrl") or "").strip()',
+       '    if state:\n        live = str(pbody.get("verifyUrl") or "").strip()')]),
     ("L3", FORK_SR, "over",
      "⛔⛔ THE PROMISE COMES BACK. A five-minute job and a one-shot in memory "
      "cannot keep it, and the measured ordinary case is a person asking after "
@@ -445,6 +445,86 @@ MUTANTS = [
      [('SANDBOX_DIR = Path("/sandbox")',
        'SANDBOX_DIR = Path(os.environ.get("SR_SANDBOX_DIR", "/sandbox"))')]),
 
+    # ═══════════ R — the round-2 fixes, every one found by cross-verification ═══════════
+    ("R1", FORK_SR, "over",
+     "⛔⛔ THE POLL GOES BACK TO BEING TREATED AS A READ. A poll REDEEMS an approval "
+     "the person has already given — it signs them in and mints the one-shot note — "
+     "so falling through to a fresh sign-in CAUSES the capture and then destroys it: "
+     "somebody who has just signed in is told to sign in, and the next check answers "
+     "'not signed in yet' about an account that is",
+     [('    if state == "connected" and pbody.get("authed"):', "    if False:")]),
+    ("R2", FORK_SR, "under",
+     "⛔ the flow's own LABEL decides it instead of the live session. A flow is left "
+     "at connected after a capture, so it outlives the session it made — after a sign "
+     "out this would refuse to ever mint another sign-in",
+     [('    if state == "connected" and pbody.get("authed"):',
+       '    if state == "connected":')]),
+    ("R3", FORK_SR, "under",
+     "the topic the poll reported is dropped, so somebody who asked for research "
+     "before signing in is told only that they are in",
+     [('        pending = str(pbody.get("pendingTopic") or "").strip()\n        if pending:',
+       "        pending = \"\"\n        if pending:")]),
+    ("R4", SR_BE, "under",
+     "⛔⛔ THE NO-RUNS LINE GOES BACK TO BEING KEYED ON `lines`, which the sign-in "
+     "announce made dead: somebody who asked what was running gets a sign-in line "
+     "and NO statement about their runs at all",
+     [("    if not runs:\n        lines.append(\"No active runs.\")",
+       "    if not lines:\n        lines.append(\"No active runs.\")")]),
+    ("R5", BRIDGE, "over",
+     "⛔ the privileged-port sentence is said for EVERY EACCES again, so a port "
+     "above 1024 refused by a firewall is given a false reason and then advised to "
+     "be set to the value that has just failed",
+     [("            if port < 1024:", "            if True:")]),
+    ("R6", CLI, "under",
+     "the doctor label goes back to eleven characters, and `_doctor_row` pads with "
+     "ljust(10) — so it renders welded to its own text: `bridge portignoring ...`",
+     [('        _doctor_row("port", False,', '        _doctor_row("bridge port", False,')]),
+    ("R7", SR_BE, "over",
+     "⛔⛔ EMPTY STOPS BEING UNSET IN THE CHAT CLIENT, so a variable that is set and "
+     "empty — a shape a shell exports readily — prints `(ignoring bad "
+     "SUPER_AGENT_BRIDGE_PORT ''; using 9876)` to stderr on EVERY invocation while "
+     "the bridge treats the same value as absent",
+     [('    raw = (os.environ.get("SUPER_AGENT_BRIDGE_PORT") or "").strip()\n'
+       "    port = 9876\n"
+       "    if raw:\n"
+       "        try:\n"
+       "            val = int(raw)\n"
+       "            if 1 <= val <= 65535:\n"
+       "                port = val\n"
+       "            else:\n"
+       "                raise ValueError\n"
+       "        except ValueError:\n"
+       '            print(f"(ignoring bad SUPER_AGENT_BRIDGE_PORT {raw!r}; using 9876)",\n'
+       "                  file=sys.stderr)",
+       '    raw = os.environ.get("SUPER_AGENT_BRIDGE_PORT", "9876")\n'
+       "    try:\n"
+       "        port = int(raw)\n"
+       "        if not (1 <= port <= 65535):\n"
+       "            raise ValueError\n"
+       "    except ValueError:\n"
+       '        print(f"(ignoring bad SUPER_AGENT_BRIDGE_PORT {raw!r}; using 9876)",\n'
+       "              file=sys.stderr)\n"
+       "        port = 9876")]),
+    ("R8", FORK_POLL, "under",
+     "⛔⛔ THE VERBATIM SURFACE STOPS ORDERING ITS OFFER, so the worked example — "
+     "which names the first computer in the list — can tell somebody word for word "
+     "to pick the one machine that will not start their work until it is switched on",
+     [("        devs = ([d for d in devs if d.get(\"online\") is not False]\n"
+       "                + [d for d in devs if d.get(\"online\") is False])",
+       "        devs = list(devs)")]),
+    ("R9", FORK_POLL, "under",
+     "the off mark in the texted offer goes back to a bare (off), which says nothing "
+     "about the wait — in the one message that reaches the person with no turn in "
+     "between to add it",
+     [('                    (" (off - waits until it is switched on)" if up is False else ""))',
+       '                    (" (off)" if up is False else ""))')]),
+    ("R10", FORK_POLL, "under",
+     "the texted offer claims 'more than one of their computers could run it' when "
+     "none of them is awake — the same falsehood the sibling client stopped saying, "
+     "in the surface where it is delivered word for word",
+     [('        if devs and all(d.get("online") is False for d in devs):',
+       "        if False:")]),
+
     # ═══════════ S — the prose and the provisioner say one thing ═══════════
     ("S1", FORK_SKILL, "under",
      "⛔⛔ THE SKILL AND THE PROVISIONER DISAGREE ABOUT THE CADENCE. Both create "
@@ -467,9 +547,15 @@ MUTANTS = [
      [("Tell them to take their time, **and to message you once they are in** — that",
        "Tell them to take their time — that")]),
     ("S5", FORK_SKILL, "over",
-     "the watcher check moves back below the sign-in command, so the commonest "
-     "door — the research command, which now mints an address of its own — sends a "
-     "link with nothing watching for the answer",
+     "the instruction stops telling the assistant to do the watcher check FIRST — "
+     "it now reads 'Later in this section', so the commonest door (the research "
+     "command, which mints an address of its own) can send a link with nothing "
+     "watching for the answer.\n"
+     "     ⚠ RESTATED. This survived its first run and the reason was the `why`, "
+     "not the tests: it claimed the check 'moves back below the sign-in command' "
+     "and the edit moves NO text at all — only the word that tells the assistant "
+     "when to act. An ordering assertion could never have seen it. A `why` must be "
+     "what the edit does",
      [("Before anything else in this section, make sure the watcher described in",
        "Later in this section, make sure the watcher described in")]),
 ]

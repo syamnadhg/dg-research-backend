@@ -1266,7 +1266,10 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
     # the bridge to two different ports, and every symptom of that is
     # indistinguishable from "the bridge is down".
     if config.BRIDGE_PORT_REJECTED:
-        _doctor_row("bridge port", False,
+        # ⚠ NINE CHARACTERS OR FEWER. `_doctor_row` pads with `ljust(10)`, so an
+        # eleven-character label renders welded to its own text
+        # ("bridge portignoring SUPER_AGENT_BRIDGE_PORT ...").
+        _doctor_row("port", False,
                     f"ignoring SUPER_AGENT_BRIDGE_PORT {config.BRIDGE_PORT_REJECTED!r} "
                     f"— using {config.BRIDGE_PORT}")
     health = _bridge_get("/healthz")
