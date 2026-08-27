@@ -145,12 +145,17 @@ MUTANTS = [
     ("D9", PREFS, "over",
      "⛔⛔ AN EMPTY UID MATCHES AN EMPTY UID. A truncated write or a hand-edited "
      "file leaves `pendingAnnounceUid: \"\"`, and then the announce is readable by "
-     "whoever asks with nothing — the same cross-account leak the binding exists "
-     "to prevent. ⭐ RE-POINTED 2026-08-26: the first version of this mutant "
-     "SURVIVED, which is how the hole was found; closing it changed the line the "
-     "anchor named, so the next run reported a harness fault rather than a kill",
-     [("    if isinstance(ev, dict) and ev and owner and owner == uid:",
-       "    if isinstance(ev, dict) and ev and owner == uid:")]),
+     "whoever asks with nothing — the same cross-account leak the binding exists to "
+     "prevent.\n"
+     "     ⭐⭐ RE-POINTED TWICE, and the second time because it became EQUIVALENT. "
+     "It first mutated `owner and owner == uid`, survived, and that survival is how "
+     "the hole was found. Closing it added `if not uid: return None` — which catches "
+     "the empty CALLER before the clause the mutant edits, making `owner and` "
+     "redundant and the mutant unobservable. A mutant that measures nothing is a "
+     "harness fault however true its sentence is, so it now edits the guard that "
+     "actually decides the case",
+     [("    if not uid:\n        return None\n    data = load()",
+       "    data = load()")]),
     ("D10", BRIDGE, "over",
      "⛔ the park stops being best-effort, so a read-only disk takes the SIGN-IN "
      "down with it — a courtesy message failing the thing it is a courtesy about",
@@ -163,12 +168,16 @@ MUTANTS = [
      [("        with self._lock:\n            ev = self._signed_in\n        if isinstance(ev, dict):\n            return ev if ev.get(\"uid\") in (None, uid) else None",
        "        with self._lock:\n            ev = self._signed_in\n            self._signed_in = None\n        if isinstance(ev, dict):\n            return ev if ev.get(\"uid\") in (None, uid) else None")]),
     ("D12", BRIDGE, "over",
-     "⛔⛔ the take stops being atomic: the DISK half moves outside the lock, so "
-     "concurrent polls each fall through to the parked copy and all return it — "
-     "measured at 4 of 8 announcing the same sign-in. ⭐ RE-POINTED: the clear this "
-     "mutant used to delete now lives inside `take_signed_in`",
-     [('            if ev is None:\n                return None\n            try:\n                prefs.clear_pending_announce()',
-       '            if ev is None:\n                return None\n            self._lock.release(); self._lock.acquire()\n            try:\n                prefs.clear_pending_announce()')]),
+     "⛔⛔ THE TAKE STOPS BEING ATOMIC. Concurrent polls each fall through to the "
+     "parked copy and all return it — measured at 4 of 8 announcing the same "
+     "sign-in when this was first written that way.\n"
+     "     ⭐ RE-POINTED TWICE. The first version deleted a clear that had moved "
+     "into `take_signed_in`; the second released the lock around the CLEAR, which "
+     "still held it across the read and so could not produce the double-delivery "
+     "its own sentence describes. Atomicity turns on the READ: two threads that "
+     "both read the parked copy both deliver it, whatever happens afterwards",
+     [("                ev = None\n                try:\n                    parked = prefs.get_pending_announce(uid)",
+       "                ev = None\n                self._lock.release()\n                try:\n                    parked = prefs.get_pending_announce(uid)")]),
 
     # ═══════════ P — one device decision, shared by two consumers ═══════════
     ("P1", BRIDGE, "under",

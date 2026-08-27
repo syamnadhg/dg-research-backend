@@ -931,6 +931,40 @@ def test_a_second_chat_cannot_steal_through_the_start_door_either(monkeypatch):
         httpd.server_close()
 
 
+def test_the_start_guard_catches_a_flow_created_WHILE_THE_BROKER_ANSWERS(monkeypatch):
+    """⛔⛔ A MUTATION SURVIVED HERE, AND IT IS THE HALF THAT MATTERS. The /start guard
+    runs TWICE: a courtesy check before the broker round-trip, and a compare-and-swap
+    after it. Deleting the second left every existing test passing, because they all
+    hit the first — so the only half that closes the actual window was covered by
+    nothing.
+
+    The window is real: `devicelogin.start()` is a network call, and a flow can be
+    created while it is in flight. This drives exactly that by having the broker stub
+    install a competing flow before it returns."""
+    base, state, httpd = _live(monkeypatch)
+    try:
+        def _start_but_someone_else_gets_there_first(label="", runtime=""):
+            state.set_remote(SimpleNamespace(
+                state="pending", pending_topic="A's research",
+                origin={"platform": "telegram", "chat_id": "111"},
+                code="C", verifyUrl="u", poll_token="p"))
+            return {"code": "AAAA1111", "pollToken": "p",
+                    "verifyUrl": "u", "expiresIn": 600}
+
+        monkeypatch.setattr(bridge.devicelogin, "start",
+                            _start_but_someone_else_gets_there_first)
+        r = requests.post(base + "/login/remote/start", json={
+            "pending_topic": "B's research",
+            "origin": {"platform": "whatsapp", "chat_id": "222"}})
+        assert r.status_code == 409, r.text
+        assert r.json()["reason"] == "topic_taken"
+        assert state.remote.pending_topic == "A's research", (
+            "B's start replaced a flow created while the broker was answering")
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 def test_an_origin_less_start_may_still_replace_the_flow(monkeypatch):
     """⚠ THE ASYMMETRY IS DELIBERATE. This route is also the RECOVERY door — "send
     me a fresh sign-in link" — and the terminal reaches it with no origin at all. So
