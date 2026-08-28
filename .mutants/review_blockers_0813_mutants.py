@@ -23,6 +23,7 @@ only, restores in `finally`, and re-checks `git status` at the end.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -413,10 +414,48 @@ def tracked_dirty() -> list[str]:
     return [ln for ln in out.splitlines() if ln and not ln.startswith("?? ")]
 
 
-def run_tests() -> bool:
+SKIP_RE = re.compile(r"(\d+)\s+skipped")
+
+
+def skipped_count(pytest_output: str) -> int:
+    """How many tests pytest SKIPPED, read off its own summary.
+
+    ⛔⛔ THIS EXISTS BECAUSE THE HARNESS ONCE SCORED ITSELF AGAINST HALF A SUITE
+    AND SAID 35/36. 2026-08-27: run from a shell with no `node` on PATH, 68 of
+    the 140 tests in `test_review_blockers_0813.py` skipped — including all three
+    that kill M6 — and pytest still exited 0. The harness read "exit 0" as "no
+    test caught this" and printed `✗ SURVIVED M6`, three confirmations deep,
+    because re-running a broken environment reproduces the broken result.
+
+    ▶ A SKIP IS NOT A PASS, AND IT IS NOT A FAILURE EITHER — it is the absence
+    of a measurement, and a mutation score computed over absences is a lie in
+    BOTH directions. A false survivor costs a repair round chasing a defect that
+    does not exist; a false KILL is worse, and silently hides one that does.
+
+    Reads the LAST match: pytest prints per-file progress before the summary and
+    a stray "1 skipped" in a test name must not be mistaken for the total.
+    """
+    hits = SKIP_RE.findall(pytest_output or "")
+    return int(hits[-1]) if hits else 0
+
+
+def run_tests() -> "tuple[bool, int]":
+    """(green, skipped). ⛔ BOTH halves matter — see `skipped_count`."""
     purge_pycache()
-    return sh([sys.executable, "-B", "-m", "pytest", *SUITES.split(), "-q",
-               "-p", "no:cacheprovider"]).returncode == 0
+    proc = sh([sys.executable, "-B", "-m", "pytest", *SUITES.split(), "-q",
+               "-p", "no:cacheprovider"])
+    return proc.returncode == 0, skipped_count(proc.stdout + proc.stderr)
+
+
+def missing_tooling() -> list[str]:
+    """Executables the SUITES need, that are not on PATH.
+
+    ⛔ `node` is not optional here. The three Claude model-menu filters are
+    JavaScript evaluated in the page, and the only tests that execute them
+    (rather than grep the source) shell out to node. Without it they skip, and
+    the harness goes blind to an entire finding while still printing a score.
+    """
+    return [exe for exe in ("node", "git") if shutil.which(exe) is None]
 
 
 def main() -> int:
@@ -426,9 +465,24 @@ def main() -> int:
               "dirty cannot tell its own restore from your edits.\n" + "\n".join(dirty))
         return 2
 
+    absent = missing_tooling()
+    if absent:
+        print("Missing from PATH: " + ", ".join(absent) + ".\n"
+              "⛔ REFUSING TO SCORE. The JavaScript filters are executed by node; without it\n"
+              "   those tests SKIP and every mutant in them looks like a survivor. Run this\n"
+              "   from an interactive shell, or put the tools on PATH first.")
+        return 2
+
     print("baseline… ", end="", flush=True)
-    if not run_tests():
+    ok, skipped = run_tests()
+    if not ok:
         print("RED. Nothing below would mean anything.")
+        return 2
+    if skipped:
+        print(f"green, but {skipped} test(s) SKIPPED.\n"
+              "⛔ REFUSING TO SCORE. A skip is the absence of a measurement, not a pass —\n"
+              "   a mutant those tests would have killed is reported as a SURVIVOR, and one\n"
+              "   they would have missed is reported as KILLED. Fix the skips first.")
         return 2
     print("green")
 
@@ -447,14 +501,25 @@ def main() -> int:
             # is on disk before crediting anything to the suite.
             if path.read_text(encoding="utf-8") != mutated:
                 raise AssertionError("the mutation did not reach the file")
-            killed = not run_tests()
+            green, skipped = run_tests()
+            # ⛔⛔ A SKIP MID-RUN IS A FAULT, NOT A VERDICT. The environment can
+            # lose a tool between mutants (a PATH change, a crashed helper), and
+            # from here that is indistinguishable from a suite with no opinion.
+            # Raising routes it to the `! ERROR` arm — loud, and counted against
+            # the score — rather than letting it print a confident `SURVIVED`.
+            if skipped:
+                raise AssertionError(f"{skipped} test(s) skipped — verdict refused")
+            killed = not green
             flapped = False
             # Only a survivor needs confirming: a kill is one failing assertion
             # and cannot be produced by importing the wrong copy.
             for _ in range(SURVIVOR_CONFIRMATIONS - 1):
                 if killed:
                     break
-                killed = not run_tests()
+                green, skipped = run_tests()
+                if skipped:
+                    raise AssertionError(f"{skipped} test(s) skipped — verdict refused")
+                killed = not green
                 flapped = flapped or killed
             mark = "✓ killed  " if killed else "✗ SURVIVED"
             note = "  ⚠ FLAPPED — verdicts disagreed across runs" if flapped else ""
