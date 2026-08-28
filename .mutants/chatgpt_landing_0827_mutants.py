@@ -60,12 +60,28 @@ MUTANTS = [
        '                    # Present, new, and not datable → keep the budget running.\n'
        '                    pass')]),
     ("C4", "under",
-     "the fallback never fires — the budget is spent and the leg is failed "
-     "anyway, which is the old outcome with extra waiting",
-     [('            if _undatable:\n'
-       '                return True, _undatable, "undatable_id_transition_observed"',
-       '            if False:\n'
-       '                return True, _undatable, "undatable_id_transition_observed"')]),
+     "⭐⭐ the fallback never fires — the budget is spent and the leg is failed "
+     "anyway. THE HEADLINE OF THE FIX, and it SURVIVED the first round: the only "
+     "thing watching it was a source pin on its `return` line, and a return "
+     "inside an unenterable branch is still in the file",
+     [('    if undatable_url:\n'
+       '        return True, undatable_url, "undatable_id_transition_observed"',
+       '    if False:\n'
+       '        return True, undatable_url, "undatable_id_transition_observed"')]),
+    ("C13", "over",
+     "⛔⛔ the fallback fires with NOTHING remembered — a tab that never moved is "
+     "confirmed as this run's conversation, and `no_conversation_url` dies",
+     [('    if undatable_url:\n'
+       '        return True, undatable_url, "undatable_id_transition_observed"',
+       '    if True:\n'
+       '        return True, undatable_url, "undatable_id_transition_observed"')]),
+    ("C14", "under",
+     "the fallback confirms the LAST url instead of the conversation we actually "
+     "watched — they differ when the tab moves again after the id we noted",
+     [('        return True, undatable_url, "undatable_id_transition_observed"\n'
+       '    return False, last_url, "no_conversation_url"',
+       '        return True, last_url, "undatable_id_transition_observed"\n'
+       '    return False, last_url, "no_conversation_url"')]),
     ("C5", "under",
      "the poll-path predicate condemns an undatable conversation again, so a "
      "leg that survives setup is killed on the next tick instead",
@@ -112,10 +128,8 @@ MUTANTS = [
     ("C11", "over",
      "⛔⛔ the fallback fires WITHOUT having watched a transition — a tab that "
      "never moved is confirmed as this run's conversation",
-     [('            if _undatable:\n'
-       '                return True, _undatable, "undatable_id_transition_observed"',
-       '            if True:\n'
-       '                return True, _last, "undatable_id_transition_observed"')]),
+     [('            return _chatgpt_landing_result(_undatable, _last)',
+       '            return True, _last, "undatable_id_transition_observed"')]),
     ("C12", "over",
      "⛔ the weak route stops announcing itself — the fallback silently becomes "
      "the only check and nobody learns the format changed again",

@@ -49602,6 +49602,25 @@ def _chatgpt_landing_verdict(url: str, pre_send_url: str,
     return "ours" if _chatgpt_conversation_is_ours(url, run_start) else "foreign"
 
 
+def _chatgpt_landing_result(undatable_url: str, last_url: str):
+    """What the wait loop returns once its budget is spent. `(ok, url, why)`. Pure.
+
+    ⛔⛔ THIS IS A FUNCTION BECAUSE MUTATION PROVED THE INLINE VERSION HAD NO
+    KILLER. It was two lines at the end of the loop, and a mutant that changed
+    `if _undatable:` to `if False:` — deleting the entire fallback, the headline
+    of the 2026-08-27 fix — SURVIVED. The test asserting the fallback was a source
+    pin on the `return` line, and a `return` inside a branch nothing can enter is
+    still present in the file. **A presence pin cannot see reachability.**
+
+    ⛔ The condition is load-bearing in the other direction too: firing the
+    fallback with no remembered conversation would confirm a run against a tab
+    that never moved.
+    """
+    if undatable_url:
+        return True, undatable_url, "undatable_id_transition_observed"
+    return False, last_url, "no_conversation_url"
+
+
 def _chatgpt_tab_is_foreign(url: str) -> bool:
     """True when this tab sits on a ChatGPT conversation that PREDATES the run.
 
@@ -53206,9 +53225,7 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 if _controls.is_stop():
                     return False, _last, "stopped"
                 await asyncio.sleep(1.0)
-            if _undatable:
-                return True, _undatable, "undatable_id_transition_observed"
-            return False, _last, "no_conversation_url"
+            return _chatgpt_landing_result(_undatable, _last)
 
         _cg_ok, _cg_url, _cg_why = await _chatgpt_landed(30.0)
         if not _cg_ok:

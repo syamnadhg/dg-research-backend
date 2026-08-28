@@ -151,7 +151,9 @@ class TestTheWholeSequence:
         """The loop's decision logic, exactly: keep waiting through `undatable`,
         remember the last one, and fall back to it if the budget runs out."""
         undatable = ""
+        last = ""
         for u in urls:
+            last = u
             verdict = research._chatgpt_landing_verdict(u, pre, run_start)
             if verdict == "unchanged":
                 return False, u, "url_unchanged_from_pre_send"
@@ -161,9 +163,9 @@ class TestTheWholeSequence:
                 return False, u, "conversation_predates_this_run"
             if verdict == "undatable":
                 undatable = u
-        if undatable:
-            return True, undatable, "undatable_id_transition_observed"
-        return False, urls[-1] if urls else "", "no_conversation_url"
+        # ⛔ THE REAL FUNCTION, not a re-implementation of it. Modelling this tail
+        # inline is what let a mutant delete the whole fallback and survive.
+        return research._chatgpt_landing_result(undatable, last)
 
     # ⛔⛔ RUN 1, AS IT ACTUALLY HAPPENED. It must now succeed.
     def test_run_one_now_lands(self):
@@ -204,6 +206,43 @@ class TestTheWholeSequence:
         assert ok is False and why == "url_unchanged_from_pre_send"
 
 
+class TestTheBudgetRunningOut:
+    """The tail of the wait loop, on its own.
+
+    ⛔⛔ MUTATION FOUND THIS UNCOVERED. A mutant that replaced the fallback's
+    condition with `if False:` — deleting the headline of the whole fix — survived
+    the first version of this file, because the only thing watching the fallback
+    was a source pin on its `return` line, and a return inside a branch nothing
+    can enter is still there to be found. A presence pin cannot see reachability.
+    """
+
+    UNDATABLE = WEB
+
+    def test_a_watched_transition_confirms_the_run(self):
+        ok, url, why = research._chatgpt_landing_result(self.UNDATABLE, HOST)
+        assert ok is True
+        assert url == self.UNDATABLE
+        assert why == "undatable_id_transition_observed"
+
+    # ⛔ The other direction: nothing watched, nothing confirmed. Firing the
+    # fallback here would bless a tab that never moved.
+    def test_nothing_watched_means_the_send_did_not_land(self):
+        ok, url, why = research._chatgpt_landing_result("", HOST)
+        assert ok is False
+        assert url == HOST
+        assert why == "no_conversation_url"
+
+    def test_the_failure_reports_the_last_url_we_saw(self):
+        _ok, url, _why = research._chatgpt_landing_result("", "https://chatgpt.com/somewhere")
+        assert url == "https://chatgpt.com/somewhere"
+
+    # ⭐ The remembered conversation wins over the last observation — they can
+    # differ when the tab moves again after the id we noted.
+    def test_the_remembered_conversation_is_what_gets_confirmed(self):
+        _ok, url, _why = research._chatgpt_landing_result(self.UNDATABLE, HOST)
+        assert url == self.UNDATABLE and url != HOST
+
+
 class TestTheSourceStillWiresItUp:
     """The loop is a closure inside an async function no test can drive, so these
     are source pins — deliberately narrow, and only for the wiring the pure tests
@@ -214,8 +253,12 @@ class TestTheSourceStillWiresItUp:
     def test_the_loop_delegates_to_the_pure_function(self):
         assert "_verdict = _chatgpt_landing_verdict(_last, _pre_send_url)" in self.SRC
 
-    def test_the_fallback_is_reachable_from_the_loop(self):
-        assert 'return True, _undatable, "undatable_id_transition_observed"' in self.SRC
+    # ⚠ A PIN ON THE DELEGATION, NOT ON THE FALLBACK'S BODY. The previous version
+    # asserted the fallback's `return` line was present in the file — and a mutant
+    # that made the branch unenterable left that line exactly where it was and
+    # survived. The behaviour now lives in `TestTheBudgetRunningOut`.
+    def test_the_loop_delegates_its_tail_to_the_pure_function(self):
+        assert "return _chatgpt_landing_result(_undatable, _last)" in self.SRC
 
     # ⭐ A fallback that confirms runs silently becomes the only check nobody
     # notices has taken over.
