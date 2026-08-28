@@ -48,6 +48,28 @@ def h():
     return _harness()
 
 
+@pytest.fixture
+def safe(h, monkeypatch):
+    """`main()` with every route to production source cut.
+
+    ⛔⛔ THIS FIXTURE IS THE FIX FOR A REAL INCIDENT, TWICE OVER. Tests here call
+    `main()`, and `main()`'s job is to write mutants into `research.py`. The
+    first version relied on each test patching what it happened to need — so the
+    moment a MUTANT disabled the gate that test was exercising, control fell
+    through to the genuine 36-mutant loop and rewrote `research.py` for real.
+    Killing that run left a mutant in the tree.
+
+    ▶ **A test must not depend on the code under test behaving, to stay safe.**
+    Both `run_tests` and `MUTANTS` are neutralised here unconditionally, before
+    any individual test gets to express a preference. A test that wants a mutant
+    in the loop re-points `ROOT` at a scratch directory as well.
+    """
+    monkeypatch.setattr(h, "run_tests", lambda: (True, 0))
+    monkeypatch.setattr(h, "MUTANTS", [])
+    monkeypatch.setattr(h, "tracked_dirty", lambda: [])
+    return h
+
+
 class TestSkippedCount:
     """Read pytest's own summary, because pytest's exit code will not say."""
 
@@ -104,19 +126,17 @@ class TestMissingTooling:
 class TestTheHarnessRefusesToScore:
     """`main()` must exit non-zero and print nothing resembling a score."""
 
-    def test_it_refuses_when_a_tool_is_missing(self, h, monkeypatch, capsys):
+    def test_it_refuses_when_a_tool_is_missing(self, safe, monkeypatch, capsys):
+        h = safe
         monkeypatch.setattr(h, "missing_tooling", lambda: ["node"])
-        # If the gate leaks, this would run the real suite; make that impossible.
-        monkeypatch.setattr(h, "run_tests", lambda: pytest.fail("ran the suite anyway"))
-        monkeypatch.setattr(h, "tracked_dirty", lambda: [])
         assert h.main() == 2
         out = capsys.readouterr().out
         assert "REFUSING TO SCORE" in out
         assert "killed" not in out
 
-    def test_it_refuses_when_the_baseline_skips(self, h, monkeypatch, capsys):
+    def test_it_refuses_when_the_baseline_skips(self, safe, monkeypatch, capsys):
+        h = safe
         monkeypatch.setattr(h, "missing_tooling", lambda: [])
-        monkeypatch.setattr(h, "tracked_dirty", lambda: [])
         monkeypatch.setattr(h, "run_tests", lambda: (True, 68))
         assert h.main() == 2
         out = capsys.readouterr().out
@@ -126,10 +146,9 @@ class TestTheHarnessRefusesToScore:
         # against a suite missing half its tests.
         assert "SURVIVED" not in out
 
-    def test_a_green_baseline_with_no_skips_is_allowed_through(self, h, monkeypatch, capsys):
+    def test_a_green_baseline_with_no_skips_is_allowed_through(self, safe, monkeypatch, capsys):
+        h = safe
         monkeypatch.setattr(h, "missing_tooling", lambda: [])
-        monkeypatch.setattr(h, "tracked_dirty", lambda: [])
-        monkeypatch.setattr(h, "run_tests", lambda: (True, 0))
         # ⛔⛔ MUTANTS EMPTIED ON PURPOSE. The first version of this test left the
         # real list in place, so calling main() drove the genuine mutation loop
         # and wrote 36 mutants into research.py. Killing the run mid-loop left
@@ -145,9 +164,9 @@ class TestTheHarnessRefusesToScore:
     # can lose a tool between mutants, and from inside the loop that is
     # indistinguishable from a suite with no opinion. It must be an ERROR, never
     # a confident SURVIVED.
-    def test_a_skip_during_a_mutant_is_an_error_not_a_survivor(self, h, monkeypatch, capsys, tmp_path):
+    def test_a_skip_during_a_mutant_is_an_error_not_a_survivor(self, safe, monkeypatch, capsys, tmp_path):
+        h = safe
         monkeypatch.setattr(h, "missing_tooling", lambda: [])
-        monkeypatch.setattr(h, "tracked_dirty", lambda: [])
         # ⛔ ROOT is re-pointed at a scratch directory so the loop's real
         # read/write lands on a throwaway file. See the note above — this test
         # needs a mutant to enter the loop at all, and it must not be a real one.
@@ -177,10 +196,10 @@ class TestTheHarnessRefusesToScore:
 class TestTheHarnessStillRestores:
     """The guards must not have cost the tree-restore promise."""
 
-    def test_research_py_is_untouched_by_a_refusal(self, h, monkeypatch):
+    def test_research_py_is_untouched_by_a_refusal(self, safe, monkeypatch):
+        h = safe
         before = (ROOT / "research.py").read_text(encoding="utf-8")
         monkeypatch.setattr(h, "missing_tooling", lambda: ["node"])
-        monkeypatch.setattr(h, "tracked_dirty", lambda: [])
         h.main()
         assert (ROOT / "research.py").read_text(encoding="utf-8") == before
 
