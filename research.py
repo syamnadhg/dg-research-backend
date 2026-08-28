@@ -24653,7 +24653,73 @@ def _emit_model_drift_alert(platform_l: str, message: str, details: str = ""):
     )
 
 
-def emit_browser_recovery_status(phase: int, agent: str | None = None):
+def browser_crash_copy(agent_label: str | None = None, *,
+                       elapsed_sec: "int | None" = None,
+                       quiet_sec: "int | None" = None,
+                       rechecks: int = 0) -> "tuple[str, str]":
+    """(message, details) for a page that died under us. Pure.
+
+    ⛔⛔ 2026-08-27 — THIS REPLACES A SENTENCE THAT PROMISED SOMETHING THAT DOES
+    NOT HAPPEN. It said *"auto-retrying from checkpoint… The pipeline will
+    rebuild the browser session and resume."* Measured from a real run: Gemini's
+    tab died at 17:21:00 and the phase reported COMPLETE at 17:21:06 with 2 of 3
+    agents. Nothing was rebuilt and nothing resumed — the agent was failed and
+    the run carried on. All three callers `return False` into exactly that path.
+    The promise is true only when the death takes the whole browser and an
+    exception reaches `run_pipeline`, and one sentence was covering both.
+
+    ⛔ AND IT NEVER SAID WHERE THE FAILURE WAS. The same run had sat on the
+    platform's "Writing your report…" for forty-seven minutes with zero new
+    output while our arbiter twice ruled it healthy. The person was told their
+    browser crashed, which reads as their machine or our pipeline.
+
+    ▶ WHAT THIS MAY AND MAY NOT CLAIM. It reports what we OBSERVED — on the
+    platform's own page, for this long, re-checked this many times — and never
+    names a cause. We genuinely cannot separate a platform stall from our own
+    scrapers going blind, and a dead tab looks identical whether the platform
+    hung, Chrome ran out of memory, or a profile lock was lost. Saying "a
+    problem on their side" would be a guess wearing a fact's clothes.
+
+    ⚠ `quiet_sec` IS A FLOOR, NOT AN EXACT AGE. A WORKING verdict from the
+    arbiter rewinds the growth clock up to `_ARBITER_MAX_WORKING_RESETS` times,
+    so the true silence can be LONGER than what we hold — never shorter. Hence
+    "at least".
+    """
+    def _mins(v):
+        return (max(1, round(v / 60))
+                if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0
+                else None)
+
+    named = bool(agent_label)
+    who = agent_label if named else "The browser"
+    mins, quiet = _mins(elapsed_sec), _mins(quiet_sec)
+
+    message = f"{who} stopped responding"
+    # ⭐ "its own page" is the whole point when we can name the agent — it puts
+    # the failure on the platform's surface rather than on the person's machine
+    # or on our pipeline. With no agent to name there is no "own page" to point
+    # at, and saying it anyway would be noise.
+    where = " on its own page" if named else ""
+    if quiet:
+        head = f"It went quiet{where} for at least {quiet} minutes and never recovered"
+        if rechecks > 0:
+            head += (" — we re-checked it once before giving up" if rechecks == 1
+                     else f" — we re-checked it {rechecks} times before giving up")
+        tail = f", then the page stopped responding at {mins} minutes." if mins else "."
+        body = head + tail
+    else:
+        page = "Its own page" if named else "The page"
+        body = (f"{page} stopped responding after {mins} minutes." if mins
+                else f"{page} stopped responding.")
+    # ⛔ NO PROMISE. What happens next is a fact, not a plan — and the sentence
+    # this replaced promised a rebuild-and-resume that measurably did not happen.
+    return message, f"{body} Nothing on your side caused this; the run continued without it."
+
+
+def emit_browser_recovery_status(phase: int, agent: str | None = None, *,
+                                 elapsed_sec: "int | None" = None,
+                                 quiet_sec: "int | None" = None,
+                                 rechecks: int = 0):
     """Passive 'Reconnecting…' banner for a browser crash that will
     auto-recover via run_pipeline.finally. NO action buttons — the banner
     is informational only and clears on the next pipeline_resumed event
@@ -24679,16 +24745,15 @@ def emit_browser_recovery_status(phase: int, agent: str | None = None):
                    + (f"_{agent}" if agent else ""),
         "auto_clear_on_resume": True,
     }
+    _msg, _details = browser_crash_copy(
+        agent.title() if agent else None,
+        elapsed_sec=elapsed_sec, quiet_sec=quiet_sec, rechecks=rechecks)
     if agent:
         emit_event("pipeline_warning", phase=phase, agent=agent,
-                   message=f"{agent.title()} tab crashed — auto-retrying from checkpoint…",
-                   details="The pipeline will rebuild the browser session and resume.",
-                   **base)
+                   message=_msg, details=_details, **base)
     else:
         emit_event("pipeline_warning", phase=phase,
-                   message="Browser tab crashed — auto-retrying from checkpoint…",
-                   details="The pipeline will rebuild the browser session and resume.",
-                   **base)
+                   message=_msg, details=_details, **base)
 
 
 # DGOPS-7367 DNS-backoff retry machinery (transient-net-error taxonomy +
@@ -38920,7 +38985,25 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 # Always-auto: passive banner, outer run_pipeline.finally
                 # rebuilds the browser session and resumes from checkpoint.
                 _runtime.last_failure_kind = "browser_crash"
-                emit_browser_recovery_status(2, agent=_crash_key)
+                # ⭐ THE FACTS LIVE ON THE PENDING ENTRY AND DIE WITH IT. `_crash_p`
+                # is deleted four lines below, and the exit sweep never sees this
+                # agent at all (a crash calls no `fail_agent`, so nothing persists
+                # "errored" and `_needs_finalize` is false). If the notice does not
+                # carry the clocks here, nothing downstream can.
+                # ⚠ `last_growth_time` defaults to `start_time`, so a leg that
+                # never grew once would otherwise report its whole life as silence.
+                _crash_grew = (_crash_p.get("last_growth_len", 0) > 0
+                               or _crash_p.get("last_growth_sources", 0) > 0)
+                _crash_quiet = (int(time.time() - _crash_p["last_growth_time"])
+                                if _crash_grew and _crash_p.get("last_growth_time") else None)
+                # ⛔ Computed here, not read from `results` — this notice is
+                # emitted BEFORE the results row is written four lines below.
+                _crash_elapsed = int(time.time() - _crash_p.get("start_time", time.time()))
+                emit_browser_recovery_status(
+                    2, agent=_crash_key,
+                    elapsed_sec=_crash_elapsed,
+                    quiet_sec=_crash_quiet,
+                    rechecks=int(_crash_p.get("arbiter_working_resets", 0) or 0))
                 results[_crash_name] = {"status": "browser_crashed", "text": "",
                                         "url": _crash_p.get("url", ""),
                                         "page": None,
