@@ -414,6 +414,13 @@ def tracked_dirty() -> list[str]:
     return [ln for ln in out.splitlines() if ln and not ln.startswith("?? ")]
 
 
+# ⛔⛔ THE SUMMARY LINE ONLY. A bare `(\d+)\s+skipped` scan over all of pytest's
+# output reads the ASSERTION DIFFS too — and this guard's own tests carry strings
+# like "72 passed, 68 skipped in 17.48s" as fixtures. Measured 2026-08-27: five
+# mutants came back "68 test(s) skipped — verdict refused" when nothing had
+# skipped at all; the detector was reading the test data it was being tested
+# with. The apparatus lied about the apparatus.
+SUMMARY_RE = re.compile(r"^=*\s*(?:\d+\s+\w+(?:,\s*)?)+\s+in\s+[\d.]+s", re.M)
 SKIP_RE = re.compile(r"(\d+)\s+skipped")
 
 
@@ -435,7 +442,13 @@ def skipped_count(pytest_output: str) -> int:
     Reads the LAST match: pytest prints per-file progress before the summary and
     a stray "1 skipped" in a test name must not be mistaken for the total.
     """
-    hits = SKIP_RE.findall(pytest_output or "")
+    summaries = SUMMARY_RE.findall(pytest_output or "")
+    line = None
+    for m in SUMMARY_RE.finditer(pytest_output or ""):
+        line = m.group(0)
+    if line is None:
+        return 0
+    hits = SKIP_RE.findall(line)
     return int(hits[-1]) if hits else 0
 
 

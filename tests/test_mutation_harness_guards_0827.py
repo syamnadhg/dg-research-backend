@@ -99,10 +99,61 @@ class TestSkippedCount:
         out = "1 skipped, 2 passed\nsome other line\n72 passed, 68 skipped in 17.48s"
         assert h.skipped_count(out) == 68
 
+    # ⛔⛔ THE ONE THAT BIT THIS GUARD ITSELF. When these very tests FAIL, pytest
+    # prints the assertion diff — which contains the fixture string
+    # "72 passed, 68 skipped in 17.48s". A detector that scans all output reads
+    # its own test data as evidence and refuses five perfectly good verdicts.
+    # Measured 2026-08-27: exactly that, five times.
+    def test_it_reads_the_summary_line_not_the_assertion_diffs(self, h):
+        noisy = (
+            "E   AssertionError: assert 0 == 68\n"
+            "E    +  where 68 = skipped_count('72 passed, 68 skipped in 17.48s')\n"
+            "4 failed, 12 passed in 0.29s"
+        )
+        assert h.skipped_count(noisy) == 0
+
+    def test_a_real_skip_still_reads_through_the_noise(self, h):
+        noisy = ("some diff mentioning 99 skipped in prose\n"
+                 "70 passed, 2 skipped in 1.10s")
+        assert h.skipped_count(noisy) == 2
+
+    def test_prose_with_no_summary_line_at_all_is_zero(self, h):
+        assert h.skipped_count("we skipped lunch. 5 skipped things happened.") == 0
+
     def test_the_number_is_read_not_merely_detected(self, h):
         # A guard keyed on "does the word appear" would pass for any count and
         # so could never tell 1 skip from 68.
         assert h.skipped_count("139 passed, 1 skipped in 18s") == 1
+
+
+class TestRunTests:
+    """`run_tests` must REPORT the skips, not just the exit code."""
+
+    class _Proc:
+        def __init__(self, rc, out="", err=""):
+            self.returncode, self.stdout, self.stderr = rc, out, err
+
+    def test_it_returns_the_parsed_skip_count(self, h, monkeypatch):
+        monkeypatch.setattr(h, "purge_pycache", lambda: None)
+        monkeypatch.setattr(h, "sh", lambda *a, **k: self._Proc(0, "72 passed, 68 skipped in 17.48s"))
+        assert h.run_tests() == (True, 68)
+
+    def test_a_green_run_reports_zero(self, h, monkeypatch):
+        monkeypatch.setattr(h, "purge_pycache", lambda: None)
+        monkeypatch.setattr(h, "sh", lambda *a, **k: self._Proc(0, "140 passed in 18.14s"))
+        assert h.run_tests() == (True, 0)
+
+    def test_a_red_run_is_reported_red(self, h, monkeypatch):
+        monkeypatch.setattr(h, "purge_pycache", lambda: None)
+        monkeypatch.setattr(h, "sh", lambda *a, **k: self._Proc(1, "3 failed, 197 passed in 19.98s"))
+        assert h.run_tests() == (False, 0)
+
+    # ⛔ pytest's summary can land on stderr under some plugins/CI wrappers.
+    # Reading only stdout would hide every skip there.
+    def test_the_summary_is_found_on_stderr_too(self, h, monkeypatch):
+        monkeypatch.setattr(h, "purge_pycache", lambda: None)
+        monkeypatch.setattr(h, "sh", lambda *a, **k: self._Proc(0, "", "72 passed, 68 skipped in 17.48s"))
+        assert h.run_tests() == (True, 68)
 
 
 class TestMissingTooling:
@@ -191,6 +242,34 @@ class TestTheHarnessRefusesToScore:
         assert rc != 0
         # And it still restored what it touched.
         assert (tmp_path / "scratch.py").read_text(encoding="utf-8") == "KEEP_ME = 1\n"
+
+
+    # ⛔⛔ THE FIRST CHECK, ISOLATED. With confirmations left on, removing the
+    # check inside the loop body is masked by the identical check in the
+    # confirmation re-run — each covers for the other, so neither is pinned.
+    # Setting confirmations to 1 removes the understudy.
+    def test_the_first_check_alone_refuses_a_skipping_mutant(self, safe, monkeypatch, capsys, tmp_path):
+        h = safe
+        monkeypatch.setattr(h, "missing_tooling", lambda: [])
+        monkeypatch.setattr(h, "SURVIVOR_CONFIRMATIONS", 1)
+        monkeypatch.setattr(h, "ROOT", tmp_path)
+        (tmp_path / "scratch.py").write_text("KEEP_ME = 1\n", encoding="utf-8")
+        monkeypatch.setattr(h, "MUTANTS", [
+            ("X1", "scratch.py", "under", "a scratch mutant",
+             [("KEEP_ME = 1", "KEEP_ME = 2")]),
+        ])
+        calls = {"n": 0}
+
+        def flaky():
+            calls["n"] += 1
+            return (True, 0) if calls["n"] == 1 else (True, 68)
+
+        monkeypatch.setattr(h, "run_tests", flaky)
+        rc = h.main()
+        out = capsys.readouterr().out
+        assert "! ERROR" in out and "68" in out
+        assert "✗ SURVIVED" not in out
+        assert rc != 0
 
 
 class TestTheHarnessStillRestores:

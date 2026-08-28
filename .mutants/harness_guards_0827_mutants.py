@@ -60,6 +60,17 @@ MUTANTS = [
      [('SKIP_RE = re.compile(r"(\\d+)\\s+skipped")',
        'SKIP_RE = re.compile(r"(\\d+)skipped")')]),
 
+    ("G16", "under", "⭐⭐ the summary-line anchor is dropped, so the detector "
+     "reads assertion diffs again — its own fixtures become 'skips'",
+     [('    for m in SUMMARY_RE.finditer(pytest_output or ""):\n'
+       '        line = m.group(0)',
+       '    for m in [None]:\n'
+       '        line = pytest_output or ""')]),
+    ("G17", "over", "⛔ no summary line is ever found, so every run reports "
+     "zero skips — the gate is dead",
+     [('    if line is None:\n        return 0',
+       '    if True:\n        return 0')]),
+
     # ───────────────────────── missing_tooling ───────────────────────
     ("G6", "under", "⭐ node is no longer required — the JavaScript filter "
      "tests skip and the harness scores anyway. THE ORIGINAL DEFECT.",
