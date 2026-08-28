@@ -117,6 +117,12 @@ class TestSkippedCount:
                  "70 passed, 2 skipped in 1.10s")
         assert h.skipped_count(noisy) == 2
 
+    # ⛔ More than one summary line happens for real — xdist and rerun plugins
+    # both print one per pass. The LAST is the run's actual outcome.
+    def test_the_last_summary_wins_when_there_are_several(self, h):
+        two = "70 passed, 2 skipped in 1.10s\nrerunning...\n60 passed, 12 skipped in 0.90s"
+        assert h.skipped_count(two) == 12
+
     def test_prose_with_no_summary_line_at_all_is_zero(self, h):
         assert h.skipped_count("we skipped lunch. 5 skipped things happened.") == 0
 
@@ -269,6 +275,37 @@ class TestTheHarnessRefusesToScore:
         out = capsys.readouterr().out
         assert "! ERROR" in out and "68" in out
         assert "✗ SURVIVED" not in out
+        assert rc != 0
+
+
+    # ⛔⛔ THE CONFIRMATION RE-RUN NEEDS ITS OWN KILLER. The first check cannot
+    # cover for it: an environment that is healthy on the mutant's first run and
+    # loses a tool before the re-run reaches the loop with the first check
+    # already satisfied. Measured 2026-08-27 — deleting the check inside the
+    # confirmation loop left every test in this file green.
+    def test_a_skip_in_the_CONFIRMATION_rerun_is_also_refused(self, safe, monkeypatch, capsys, tmp_path):
+        h = safe
+        monkeypatch.setattr(h, "missing_tooling", lambda: [])
+        monkeypatch.setattr(h, "SURVIVOR_CONFIRMATIONS", 3)
+        monkeypatch.setattr(h, "ROOT", tmp_path)
+        (tmp_path / "scratch.py").write_text("KEEP_ME = 1\n", encoding="utf-8")
+        monkeypatch.setattr(h, "MUTANTS", [
+            ("X1", "scratch.py", "under", "a scratch mutant",
+             [("KEEP_ME = 1", "KEEP_ME = 2")]),
+        ])
+        calls = {"n": 0}
+
+        def flaky():
+            calls["n"] += 1
+            # 1 = baseline (clean), 2 = the mutant's first run (clean, and it
+            # SURVIVES so the loop is entered), 3+ = the re-run, now skipping.
+            return (True, 0) if calls["n"] <= 2 else (True, 68)
+
+        monkeypatch.setattr(h, "run_tests", flaky)
+        rc = h.main()
+        out = capsys.readouterr().out
+        assert "! ERROR" in out and "68" in out
+        assert "✗ SURVIVED" not in out, "a survivor confirmed by a broken environment is not a survivor"
         assert rc != 0
 
 

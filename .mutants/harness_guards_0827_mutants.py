@@ -42,10 +42,12 @@ MUTANTS = [
      "which is the exact 35/36 lie restored",
      [("    hits = SKIP_RE.findall(line)\n    return int(hits[-1]) if hits else 0",
        "    hits = SKIP_RE.findall(line)\n    return 0")]),
-    ("G2", "under", "the FIRST match wins — an early per-file '1 skipped' is "
-     "read as the total, so 68 skips report as 1",
-     [("    hits = SKIP_RE.findall(line)\n    return int(hits[-1]) if hits else 0",
-       "    hits = SKIP_RE.findall(line)\n    return int(hits[0]) if hits else 0")]),
+    ("G2", "under", "the LAST summary line stops winning — a pytest run that "
+     "prints more than one summary (xdist, reruns) is read off the first",
+     [('    for m in SUMMARY_RE.finditer(pytest_output or ""):\n'
+       '        line = m.group(0)',
+       '    for m in SUMMARY_RE.finditer(pytest_output or ""):\n'
+       '        line = line or m.group(0)')]),
     ("G3", "under", "presence, not count — cannot tell 1 skip from 68, so the "
      "message the operator reads names the wrong scale",
      [("    hits = SKIP_RE.findall(line)\n    return int(hits[-1]) if hits else 0",
