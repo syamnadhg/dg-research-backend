@@ -256,16 +256,19 @@ def test_an_unknown_status_defaults_to_setup_failed_not_to_a_claim_it_ran():
 
 
 def test_a_lost_tab_is_not_reported_as_a_startup_failure():
-    """The three statuses that require a LIVE page to have existed.
+    """The statuses that require a LIVE page to have existed.
 
-    A crashed tab, a tab that drifted into a conversation predating the run, and
-    an extraction that came back empty all describe an agent that started fine.
-    Telling that user their agent "couldn't start" points them at their own login
-    and setup when nothing there was wrong — and the reason slug reaches the FE
-    verbatim, so a wrong one here is a wrong story in the phase dropdown and in
-    the durable record."""
-    for st in ("browser_crashed", "wrong_conversation", "empty",
-               "BROWSER_CRASHED"):
+    A tab that drifted into a conversation predating the run and an extraction
+    that came back empty both describe an agent that started fine. Telling that
+    user their agent "couldn't start" points them at their own login and setup
+    when nothing there was wrong — and the reason slug reaches the FE verbatim,
+    so a wrong one here is a wrong story in the phase dropdown and in the
+    durable record.
+
+    ⚠ `browser_crashed` USED TO BE IN THIS LIST and moved out on 2026-08-27 —
+    see the test below. It is still not a startup failure; it now gets a
+    sentence that says where it failed instead of one that says we mislaid it."""
+    for st in ("wrong_conversation", "empty", "WRONG_CONVERSATION"):
         reason, copy_key, why = research.autoskip_reason_for_status(st)
         assert reason == "auto_skip_tab_lost", st
         assert copy_key == "tab_lost", st
@@ -276,6 +279,54 @@ def test_a_lost_tab_is_not_reported_as_a_startup_failure():
         # A crashed tab raises no decision card, so the neighbours' "and its
         # Retry/Skip alert wasn't answered" clause would be a second false claim.
         assert "wasn't answered" not in text, st
+
+
+def test_a_crashed_page_is_reported_as_the_platforms_failure():
+    """⛔⛔ MEASURED FROM A REAL RUN, 2026-08-27. Gemini sat on "Writing your
+    report…" for forty-seven minutes with zero growth — 133 sites researched, 37
+    steps, not one character of report — our own arbiter twice ruled "WORKING,
+    not a frozen state" off the visible source list, and then the page died. The
+    user was told "we lost the tab we were reading it through", which names OUR
+    end of a failure that began on theirs and reads as though our pipeline
+    dropped their research.
+
+    ▶ Owner's standing rule: when the platform stalls or hands us something new,
+    SAY PLATFORM-SIDE. Extraction is good in ordinary circumstances, and blaming
+    ourselves for their stall teaches the user to distrust the part that works.
+    """
+    for st in ("browser_crashed", "BROWSER_CRASHED"):
+        reason, copy_key, why = research.autoskip_reason_for_status(st)
+        assert reason == "auto_skip_platform_crashed", st
+        assert copy_key == "platform_crashed", st
+        # Still not a startup failure — that half of the 2026-07-31 split holds.
+        assert "couldn't start" not in why, st
+
+        text = research._autoskip_details(copy_key, "Gemini", why)
+        assert "couldn't start" not in text, st
+        # No decision card is raised for a crash, so this clause would be a
+        # second false claim on top of the first.
+        assert "wasn't answered" not in text, st
+        # ⛔ THE POINT OF THE CHANGE: it must not describe the failure as ours.
+        assert "we lost the tab" not in text.lower(), st
+        assert "browser tab was lost" not in text.lower(), st
+        # ⭐ And it must name WHERE it failed, in the platform's own words.
+        assert "Gemini's own page" in text, st
+        assert "stopped responding" in text, st
+        # The agent is still named as having been genuinely running, which is
+        # the half of the old sentence that was true.
+        assert "research was running" in text, st
+
+
+def test_the_crash_copy_names_the_agent_it_was_given():
+    """A sentence that hard-codes one platform is a sentence that lies about the
+    other two — and this copy names the platform twice, so a single missed
+    substitution is easy to ship."""
+    for name in ("Gemini", "ChatGPT", "Claude"):
+        _r, copy_key, why = research.autoskip_reason_for_status("browser_crashed")
+        text = research._autoskip_details(copy_key, name, why)
+        assert text.count(name) >= 2, (name, text)
+        for other in {"Gemini", "ChatGPT", "Claude"} - {name}:
+            assert other not in text, (name, other, text)
 
 
 def test_the_startup_statuses_still_say_startup():

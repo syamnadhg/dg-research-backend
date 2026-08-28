@@ -571,11 +571,32 @@ def test_the_foreign_predicate_is_inert_on_a_bare_host(monkeypatch):
     assert research._chatgpt_tab_is_foreign("https://chatgpt.com/?model=gpt-5") is False
 
 
-def test_the_foreign_predicate_fails_closed_on_an_unreadable_id_and_open_on_no_run(monkeypatch):
-    """The two asymmetric fallbacks, each driven. An id we cannot date is refused; a
-    run we cannot date must NOT start failing healthy legs."""
+def test_the_foreign_predicate_is_open_on_an_unreadable_id_and_on_no_run(monkeypatch):
+    """The two asymmetric fallbacks, each driven. NEITHER may condemn a leg.
+
+    ⛔⛔ THIS TEST ASSERTED THE OPPOSITE UNTIL 2026-08-27, AND IT WAS ENSHRINING A
+    DEFECT. It required an id we cannot date to be refused — "fails closed on an
+    unreadable id" — and the function's own docstring simultaneously claimed it
+    returned True "only for a conversation we can positively date as older than
+    the run". Both could not be true, and the code followed the assertion.
+
+    Then ChatGPT began serving `/c/WEB:<uuid>`, whose id carries no timestamp.
+    Measured from a real run: a healthy Deep Research leg was declared foreign and
+    skipped seven seconds after Send, and the same predicate would have killed it
+    again on every tick of the poll loop.
+
+    ▶ AN ID WE CANNOT READ IS A QUESTION, NOT A VERDICT. Refusing on it means any
+    format change the platform makes reads to us as theft. The 2026-08-05
+    incident stays caught because that conversation's id was perfectly readable
+    and simply old — see `tests/test_chatgpt_landing_0827.py` for the full set.
+    """
     _stub_run_start(monkeypatch, _between())
-    assert research._chatgpt_tab_is_foreign("https://chatgpt.com/c/not-a-timestamp") is True
+    assert research._chatgpt_tab_is_foreign("https://chatgpt.com/c/not-a-timestamp") is False
+    assert research._chatgpt_tab_is_foreign(
+        "https://chatgpt.com/c/WEB:c3a7026f-6c11-4179-9003-0ba4c93a18f3") is False
+    # ⭐ And the half that was always right: a datable, older conversation is
+    # still refused, so widening the unreadable case cost nothing.
+    assert research._chatgpt_tab_is_foreign(FOREIGN_URL) is True
     _stub_run_start(monkeypatch, None)
     assert research._chatgpt_tab_is_foreign(FOREIGN_URL) is False
 

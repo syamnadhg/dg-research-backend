@@ -291,22 +291,41 @@ def test_a_failed_landing_fails_the_agent_rather_than_proceeding():
 def test_the_landing_assertion_rejects_all_three_failure_shapes():
     """⚠ Assert on the CONDITIONS, not on the reason strings. A mutant that
     replaced the same-URL test with `if False:` left every reason string in place
-    and passed the first version of this test — the label is not the check."""
+    and passed the first version of this test — the label is not the check.
+
+    ⛔⛔ RE-POINTED 2026-08-27, AND THE RE-POINTING IS THE LESSON. Every assertion
+    below used to read the decision as INLINE SOURCE inside the loop — and source
+    text cannot tell you that a guard fails closed on an input nobody thought of.
+    It did: `/c/WEB:<uuid>` decoded to nothing, the identity check refused it, and
+    a healthy leg died seven seconds after Send with this file entirely green.
+
+    The decision now lives in `_chatgpt_landing_verdict`, a pure module-level
+    function, and the real coverage is behavioural in
+    `tests/test_chatgpt_landing_0827.py`. What is left here is the WIRING: that
+    the loop delegates, and that each rejection still returns False.
+    """
     src = SEND_SRC[SEND_SRC.index("async def _chatgpt_landed"):]
     src = src[:src.index("_cg_ok, _cg_url, _cg_why")]
+    # The loop asks the pure function rather than deciding inline.
+    assert "_verdict = _chatgpt_landing_verdict(_last, _pre_send_url)" in src, (
+        "the loop must delegate the decision, not re-implement it"
+    )
     # (1) the send left us on the conversation we were already on
-    assert '_last.split("?", 1)[0] == _pre_send_url.split("?", 1)[0]' in src, (
+    assert 'if _verdict == "unchanged":' in src, (
         "a send that created nothing must not read as landed"
     )
     assert "url_unchanged_from_pre_send" in src
-    # (2) the conversation is not one this run created
-    assert "if not _chatgpt_conversation_is_ours(_last):" in src, (
+    # (2) the conversation is one this run did not create
+    assert 'if _verdict == "foreign":' in src, (
         "landing in A conversation is not landing in OURS"
     )
     assert "conversation_predates_this_run" in src
     # (3) no conversation at all
-    assert 'if "/c/" in _last.split("?", 1)[0]:' in src
     assert "no_conversation_url" in src
+    # ⭐ (4) THE NEW ONE: an id we cannot date must not fall into any of the
+    # above. It keeps the budget running and is answered after the loop.
+    assert 'if _verdict == "undatable":' in src
+    assert "_undatable = _last" in src
     # …and each rejection returns False rather than falling through.
     assert src.count("return False, _last,") >= 3
 

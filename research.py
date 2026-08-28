@@ -49433,6 +49433,26 @@ def _p2_run_dir():
     return Path(__file__).parent / "queues" / _tracks_dir.name
 
 
+def _chatgpt_convo_id(url: str):
+    """The conversation id in a ChatGPT `/c/<id>` URL, or None if there isn't one.
+
+    ⛔⛔ 2026-08-27 — THE DISTINCTION THIS EXISTS TO MAKE. "We are not on a
+    conversation" and "we are on a conversation whose id we cannot date" are
+    different facts, and treating them alike cost a whole run. ChatGPT served
+    `/c/WEB:c3a7026f-…`; `_chatgpt_convo_epoch` returned None for it exactly as
+    it does for a bare host, every caller read None as "refuse", and a healthy
+    leg was killed seven seconds after Send.
+
+    An id that is PRESENT but not datable means *ask something else* — never
+    *this is somebody else's conversation*. See `_chatgpt_landed`.
+    """
+    u = (url or "").split("?", 1)[0].split("#", 1)[0]
+    if "/c/" not in u:
+        return None
+    cid = u.split("/c/", 1)[1].strip("/").split("/", 1)[0]
+    return cid or None
+
+
 def _chatgpt_convo_epoch(url: str):
     """Unix seconds encoded in a ChatGPT conversation id, or None.
 
@@ -49550,6 +49570,38 @@ def _chatgpt_conversation_is_ours(url: str, run_start: "float | None" = None) ->
     return convo >= (float(start) - _CONVO_AGE_SLACK_SEC)
 
 
+def _chatgpt_landing_verdict(url: str, pre_send_url: str,
+                             run_start: "float | None" = None) -> str:
+    """What one observation of the URL, after Send, tells us. Pure.
+
+    ⛔⛔ THIS IS A MODULE-LEVEL FUNCTION BECAUSE THE DECISION IT REPLACES LIVED IN
+    A CLOSURE INSIDE AN ASYNC FUNCTION NO TEST CAN DRIVE — so the only thing the
+    suite could do was read it as source text, and source text cannot tell you
+    that a guard fails closed on an input you have not thought of. It did, and it
+    cost a run on 2026-08-27. As a pure function it is five lines of test.
+
+    One of five words, and the two that are not verdicts are the point:
+
+      * `no_conversation`  — not on a `/c/` URL yet. Keep waiting.
+      * `unchanged`        — still the conversation we were on before Send, so the
+                             send created nothing. Refuse. (The 2026-06 incident.)
+      * `ours`             — datable, and dated at or after this run began. Accept.
+      * `foreign`          — datable, and older than this run. Refuse.
+                             (The 2026-08-05 incident.)
+      * `undatable`        — a NEW conversation whose id carries no timestamp.
+                             ⛔ NOT a verdict. Keep waiting; the caller falls back
+                             to the observed transition only when the budget runs
+                             out. `/c/WEB:<uuid>` lands here.
+    """
+    if _chatgpt_convo_id(url) is None:
+        return "no_conversation"
+    if url.split("?", 1)[0] == (pre_send_url or "").split("?", 1)[0]:
+        return "unchanged"
+    if _chatgpt_convo_epoch(url) is None:
+        return "undatable"
+    return "ours" if _chatgpt_conversation_is_ours(url, run_start) else "foreign"
+
+
 def _chatgpt_tab_is_foreign(url: str) -> bool:
     """True when this tab sits on a ChatGPT conversation that PREDATES the run.
 
@@ -49563,11 +49615,21 @@ def _chatgpt_tab_is_foreign(url: str) -> bool:
     The two halves are separate on purpose:
       * no `/c/` id → False. A healthy first send happens at `https://chatgpt.com/`
         before the SPA mints one, and a bare host has nothing to date.
-      * `_chatgpt_conversation_is_ours` fails OPEN on an unknowable run start and
-        CLOSED on an unreadable id, so this returns True only for a conversation
-        we can positively date as older than the run.
+      * `_chatgpt_conversation_is_ours` fails OPEN on an unknowable run start, so
+        this returns True only for a conversation we can positively date as older
+        than the run.
+
+    ⛔⛔ 2026-08-27 — AND THE DOCSTRING ABOVE USED TO SAY THE OPPOSITE OF WHAT THE
+    CODE DID. It claimed "only for a conversation we can positively date as older"
+    while delegating to a predicate that fails CLOSED on an unreadable id — so an
+    id we simply could not parse came back `foreign=True`. When ChatGPT began
+    serving `/c/WEB:<uuid>` that killed healthy legs on the poll path, every tick.
+    An UNDATABLE id is now explicitly not foreign: it is a question for the other
+    detectors, not a verdict here.
     """
-    if "/c/" not in (url or "").split("?", 1)[0]:
+    if _chatgpt_convo_id(url) is None:
+        return False
+    if _chatgpt_convo_epoch(url) is None:
         return False
     return not _chatgpt_conversation_is_ours(url)
 
@@ -50613,7 +50675,25 @@ def autoskip_reason_for_status(results_status: str) -> tuple:
     if st in ("hard_retry_failed", "hard_retry_exhausted_dead_tab"):
         return ("auto_skip_hard_retry_exhausted", "hard_retry_exhausted",
                 "was retried and still produced no report")
-    if st in ("browser_crashed", "wrong_conversation", "empty"):
+    # ⛔⛔ 2026-08-27 — `browser_crashed` IS SPLIT OUT, AND THE OWNER IS RIGHT THAT
+    # IT HAD TO BE. It was sharing the "we lost the tab we were reading it through"
+    # sentence, which names OUR end of the failure and reads to a user as though
+    # our pipeline dropped their research. Measured from a real run: Gemini sat on
+    # "Writing your report…" for FORTY-SEVEN MINUTES with zero growth — 133 sites,
+    # 37 steps, and not one character of report — and our own arbiter twice looked
+    # at the page and ruled "WORKING, not a frozen state" before the page died.
+    # The failure began on the platform and ended in our tab.
+    # ▶ Owner's standing rule, 08-27: when the platform stalls or hands us
+    #   something new, SAY PLATFORM-SIDE. Extraction is good in ordinary
+    #   circumstances, so blaming ourselves for their stall teaches the user to
+    #   distrust the part that works.
+    # ⚠ Scoped deliberately: `wrong_conversation` and `empty` keep the old copy.
+    #   A tab that WANDERED is genuinely our end, and an empty read is not
+    #   measured yet — neither gets a story it has not earned.
+    if st == "browser_crashed":
+        return ("auto_skip_platform_crashed", "platform_crashed",
+                "was running on the platform's own page when that page failed")
+    if st in ("wrong_conversation", "empty"):
         return ("auto_skip_tab_lost", "tab_lost",
                 "started and ran, then we lost the tab we were reading it through")
     # ⚠ The default stays "couldn't start", deliberately. It is the honest answer
@@ -50657,6 +50737,14 @@ def _autoskip_details(copy_key: str, name: str, why: str = "") -> str:
     # wasn't answered" clause every neighbour carries: a crashed tab emits a
     # passive recovery banner and no decision card at all, so claiming the user
     # ignored an alert would be a second false statement layered on the first.
+    if copy_key == "platform_crashed":
+        # ⛔ Says WHERE it failed and stops implying we mislaid it. The research
+        # was live on the platform's own page and that page went down; nothing on
+        # our side chose this, and a user reading "we lost the tab" would take it
+        # as ours. See `_autoskip_reason` for the run this was measured from.
+        return (f"{name}'s research was running on {name}'s own page when that "
+                f"page stopped responding, so the report could never be read "
+                f"{_tail}")
     if copy_key == "tab_lost":
         return (f"{name} started and ran, but its browser tab was lost before "
                 f"we could read the report {_tail}")
@@ -53066,22 +53154,60 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     # four checks below independently fails that run.
     if platform_l == "chatgpt":
         async def _chatgpt_landed(deadline_s: float):
-            """(ok, url, reason). Waits for the SPA to mint /c/<id>."""
+            """(ok, url, reason). Waits for a conversation we can IDENTIFY.
+
+            ⛔⛔ 2026-08-27 — IT USED TO STOP AT THE FIRST THING SHAPED LIKE A
+            CONVERSATION AND THEN JUDGE IT. Measured from a real run: three
+            seconds after Send, ChatGPT's URL read `/c/WEB:c3a7026f-…`. The id
+            carries no timestamp, `_chatgpt_conversation_is_ours` fails closed on
+            one it cannot read, and a healthy Deep Research leg was declared
+            foreign and skipped SEVEN SECONDS into a 34-minute run. The very next
+            run, same code, got a normal id inside the same three seconds and
+            sailed through. A race, not a regression.
+
+            ▶ Two changes, and the second is what makes it survive the NEXT
+            format change rather than this one:
+
+              1. AN ID WE CANNOT READ MEANS "NOT YET", NOT "FOREIGN". We have a
+                 thirty-second budget; spend it. A readable id is still a verdict
+                 the moment it appears — in either direction.
+              2. IF THE BUDGET RUNS OUT AND THE ID IS STILL UNREADABLE, fall back
+                 to what we WATCHED: the URL moved off `_pre_send_url` onto a new
+                 conversation, inside our own post-send window. That is direct
+                 evidence it is ours, and it does not depend on the id's format.
+
+            ⛔ THE 2026-08-05 INCIDENT STAYS CAUGHT, and this is the line that
+            keeps it caught: a conversation whose id we CAN date and which
+            predates the run is refused immediately, exactly as before. The
+            fallback is reached only by an id nothing can date — never by one that
+            can be dated and is old. A warm tab parked in last night's thread has
+            a perfectly readable id.
+
+            ⛔ And stripping the `WEB:` prefix is NOT the fix, which is why this
+            does not do it. That id decoded to 2074; it would have passed only
+            because a random value happened to land in the future, and the next
+            one would be rejected all over again.
+            """
             _t0 = time.time()
             _last = ""
+            _undatable = ""     # a new conversation we watched appear but cannot date
             while time.time() - _t0 < deadline_s:
                 _last = _url_now()
-                if "/c/" in _last.split("?", 1)[0]:
-                    if _last.split("?", 1)[0] == _pre_send_url.split("?", 1)[0]:
-                        # Same conversation we were already on — the send did not
-                        # create anything. This is the incident.
-                        return False, _last, "url_unchanged_from_pre_send"
-                    if not _chatgpt_conversation_is_ours(_last):
-                        return False, _last, "conversation_predates_this_run"
+                _verdict = _chatgpt_landing_verdict(_last, _pre_send_url)
+                if _verdict == "unchanged":
+                    return False, _last, "url_unchanged_from_pre_send"
+                if _verdict == "ours":
                     return True, _last, "ok"
+                if _verdict == "foreign":
+                    return False, _last, "conversation_predates_this_run"
+                if _verdict == "undatable":
+                    # Present, new, and not datable → keep the budget running.
+                    _undatable = _last
                 if _controls.is_stop():
                     return False, _last, "stopped"
                 await asyncio.sleep(1.0)
+            if _undatable:
+                return True, _undatable, "undatable_id_transition_observed"
             return False, _last, "no_conversation_url"
 
         _cg_ok, _cg_url, _cg_why = await _chatgpt_landed(30.0)
@@ -53102,8 +53228,19 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             _controls.chat_mode_pending.pop(platform_l, None)
             fail_agent(platform_l, *_brief_send_fail_copy(platform))
             return page, False
-        log(f"[{label}] ChatGPT submission confirmed ✓ — conversation {_cg_url} "
-            f"created by this run")
+        # ⭐ SAY WHICH EVIDENCE CONFIRMED IT. "Created by this run" is a claim, and
+        # the two routes to it are not equally strong: a datable id is arithmetic,
+        # a watched transition is an observation. When the next format change
+        # arrives, this line is what tells us the fallback is carrying runs — and
+        # a silent fallback is how a weaker check becomes the only check.
+        if _cg_why == "undatable_id_transition_observed":
+            log(f"[{label}] ChatGPT submission confirmed ✓ — conversation {_cg_url} "
+                f"carries no readable timestamp, so this is confirmed by the "
+                f"transition we watched: the tab moved off {_pre_send_url!r} onto a "
+                f"new conversation within {30.0:.0f}s of Send", "WARN")
+        else:
+            log(f"[{label}] ChatGPT submission confirmed ✓ — conversation {_cg_url} "
+                f"created by this run")
 
     # 2026-06-23: Gemini submit-verification. Gemini intermittently DROPS a clicked
     # submission — the DOM click "succeeds" but the brief never enters a
