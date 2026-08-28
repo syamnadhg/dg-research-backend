@@ -122,7 +122,10 @@ def sh(cmd, *, env=None):
 
 
 def purge_pycache():
-    for d in ROOT.rglob("__pycache__"):
+    # ⛔ SCOPED TO `tests/`. An unscoped rglob walks `.venv`, which holds
+    # thousands of caches — it turned a 2-second suite into a run that had to be
+    # killed, and a killed harness leaves a mutant in the tree.
+    for d in (ROOT / "tests").rglob("__pycache__"):
         shutil.rmtree(d, ignore_errors=True)
 
 

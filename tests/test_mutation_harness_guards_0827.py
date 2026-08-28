@@ -24,6 +24,7 @@ belongs in the apparatus, and these are the tests for it.
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -129,9 +130,13 @@ class TestTheHarnessRefusesToScore:
         monkeypatch.setattr(h, "missing_tooling", lambda: [])
         monkeypatch.setattr(h, "tracked_dirty", lambda: [])
         monkeypatch.setattr(h, "run_tests", lambda: (True, 0))
-        # Every mutant "kills" instantly, so this exercises the gate and the loop
-        # without touching research.py.
-        h.main()
+        # ⛔⛔ MUTANTS EMPTIED ON PURPOSE. The first version of this test left the
+        # real list in place, so calling main() drove the genuine mutation loop
+        # and wrote 36 mutants into research.py. Killing the run mid-loop left
+        # one of them THERE — the exact hazard this repo has now hit three times.
+        # A test for the gate must never be able to edit production source.
+        monkeypatch.setattr(h, "MUTANTS", [])
+        assert h.main() == 0
         out = capsys.readouterr().out
         assert "baseline… green" in out
         assert "REFUSING TO SCORE" not in out
@@ -140,9 +145,18 @@ class TestTheHarnessRefusesToScore:
     # can lose a tool between mutants, and from inside the loop that is
     # indistinguishable from a suite with no opinion. It must be an ERROR, never
     # a confident SURVIVED.
-    def test_a_skip_during_a_mutant_is_an_error_not_a_survivor(self, h, monkeypatch, capsys):
+    def test_a_skip_during_a_mutant_is_an_error_not_a_survivor(self, h, monkeypatch, capsys, tmp_path):
         monkeypatch.setattr(h, "missing_tooling", lambda: [])
         monkeypatch.setattr(h, "tracked_dirty", lambda: [])
+        # ⛔ ROOT is re-pointed at a scratch directory so the loop's real
+        # read/write lands on a throwaway file. See the note above — this test
+        # needs a mutant to enter the loop at all, and it must not be a real one.
+        monkeypatch.setattr(h, "ROOT", tmp_path)
+        (tmp_path / "scratch.py").write_text("KEEP_ME = 1\n", encoding="utf-8")
+        monkeypatch.setattr(h, "MUTANTS", [
+            ("X1", "scratch.py", "under", "a scratch mutant",
+             [("KEEP_ME = 1", "KEEP_ME = 2")]),
+        ])
         calls = {"n": 0}
 
         def flaky():
@@ -156,6 +170,8 @@ class TestTheHarnessRefusesToScore:
         assert "skipped" in out
         assert "✗ SURVIVED" not in out
         assert rc != 0
+        # And it still restored what it touched.
+        assert (tmp_path / "scratch.py").read_text(encoding="utf-8") == "KEEP_ME = 1\n"
 
 
 class TestTheHarnessStillRestores:
@@ -167,3 +183,10 @@ class TestTheHarnessStillRestores:
         monkeypatch.setattr(h, "tracked_dirty", lambda: [])
         h.main()
         assert (ROOT / "research.py").read_text(encoding="utf-8") == before
+
+    # ⛔⛔ THE ONE THAT WOULD HAVE CAUGHT MY OWN MISTAKE. Nothing in this file may
+    # leave production source modified, whatever path main() takes.
+    def test_no_test_in_this_file_leaves_research_py_modified(self):
+        out = subprocess.run(["git", "status", "--porcelain", "--", "research.py"],
+                             cwd=ROOT, capture_output=True, text=True).stdout
+        assert out.strip() == "", f"research.py is modified: {out!r}"
