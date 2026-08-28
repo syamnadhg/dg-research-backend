@@ -320,14 +320,22 @@ def test_the_landing_assertion_rejects_all_three_failure_shapes():
         "landing in A conversation is not landing in OURS"
     )
     assert "conversation_predates_this_run" in src
-    # (3) no conversation at all
-    assert "no_conversation_url" in src
+    # (3) no conversation at all — ⚠ THIS ONE MOVED. It is produced by
+    # `_chatgpt_landing_result` once the wait budget is spent, not inside the
+    # loop, so it is read from that function. Leaving it scoped to the loop slice
+    # turned this file red the moment the tail was extracted, which is a fair
+    # warning about how brittle a source pin is.
+    tail = code_only_deep(research._chatgpt_landing_result)
+    assert "no_conversation_url" in tail
+    assert "undatable_id_transition_observed" in tail
     # ⭐ (4) THE NEW ONE: an id we cannot date must not fall into any of the
     # above. It keeps the budget running and is answered after the loop.
     assert 'if _verdict == "undatable":' in src
     assert "_undatable = _last" in src
-    # …and each rejection returns False rather than falling through.
-    assert src.count("return False, _last,") >= 3
+    # …and each rejection returns rather than falling through. Two live in the
+    # loop; the third is the tail's, asserted above.
+    assert src.count("return False, _last,") >= 2
+    assert "return _chatgpt_landing_result(_undatable, _last)" in src
 
 
 def test_the_pre_send_url_is_captured_before_the_send_not_after():
