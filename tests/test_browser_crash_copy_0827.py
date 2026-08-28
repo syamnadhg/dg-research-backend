@@ -94,6 +94,15 @@ class TestItPutsTheFailureOnThePlatformsPage:
         assert "own page" not in d
         assert d.startswith("The page stopped responding after 5 minutes.")
 
+    # ⛔⛔ THE COMBINATION MUTATION FOUND UNCOVERED. A whole-browser death that
+    # ALSO went quiet takes the other branch entirely, and nothing was watching
+    # it — so making `where` unconditional produced "It went quiet on its own
+    # page" for a crash with no agent to attribute it to, and every test passed.
+    def test_an_unnamed_crash_that_went_quiet_still_claims_no_page(self):
+        _t, d = _copy(elapsed_sec=900, quiet_sec=600, rechecks=2)
+        assert "own page" not in d, d
+        assert "went quiet for at least 10 minutes" in d
+
     def test_the_title_names_the_agent(self):
         for name in ("Gemini", "ChatGPT", "Claude"):
             t, _d = _copy(agent_label=name, elapsed_sec=600)
@@ -197,7 +206,11 @@ class TestTheEmitterPassesTheFactsThrough:
         window = self.SRC[i:i + 400]
         assert "elapsed_sec=_crash_elapsed" in window
         assert "quiet_sec=_crash_quiet" in window
-        assert "rechecks=" in window
+        # ⛔ THE VALUE, NOT THE KEYWORD. `assert "rechecks=" in window` was the
+        # first version, and a mutant that replaced the whole expression with
+        # `rechecks=0` satisfied it — the sentence silently lost the clause that
+        # says we did not give up early, with the suite green.
+        assert 'rechecks=int(_crash_p.get("arbiter_working_resets", 0) or 0))' in window
 
     # ⛔⛔ `last_growth_time` DEFAULTS TO `start_time`, so a leg that never
     # produced anything at all would otherwise report its entire life as silence
