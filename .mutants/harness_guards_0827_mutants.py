@@ -24,6 +24,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGET = ".mutants/review_blockers_0813_mutants.py"
+# ⛔ THE ANCHOR SWEEP READS THIS NAME, not `TARGET`. Without it the sweep falls
+# back to `research.py`, every anchor here matches 0x there, and the ratchet in
+# `tests/test_mutation_harness_anchors.py` reports fifteen false stale anchors.
+# A tool that produces false alarms gets its alarms ignored, which ends in the
+# same place as one that misses them.
+MUTATED_FILES = [TARGET]
 SUITES = "tests/test_mutation_harness_guards_0827.py"
 
 ENV = {**os.environ,
