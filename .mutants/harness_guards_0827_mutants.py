@@ -32,6 +32,7 @@ ENV = {**os.environ,
            [str(ROOT)] + ([os.environ["PYTHONPATH"]] if os.environ.get("PYTHONPATH") else []))}
 
 SURVIVOR_CONFIRMATIONS = 2
+SUMMARY_RE = re.compile(r"^=*\s*(?:\d+\s+\w+(?:,\s*)?)+\s+in\s+[\d.]+s", re.M)
 SKIP_RE = re.compile(r"(\d+)\s+skipped")
 
 # (id, direction, why, [(from, to), ...])
@@ -39,18 +40,16 @@ MUTANTS = [
     # ───────────────────────── skipped_count ─────────────────────────
     ("G1", "under", "⭐ the guard goes blind — every run reports zero skips, "
      "which is the exact 35/36 lie restored",
-     [("    hits = SKIP_RE.findall(pytest_output or \"\")\n"
-       "    return int(hits[-1]) if hits else 0",
-       "    hits = SKIP_RE.findall(pytest_output or \"\")\n"
-       "    return 0")]),
+     [("    hits = SKIP_RE.findall(line)\n    return int(hits[-1]) if hits else 0",
+       "    hits = SKIP_RE.findall(line)\n    return 0")]),
     ("G2", "under", "the FIRST match wins — an early per-file '1 skipped' is "
      "read as the total, so 68 skips report as 1",
-     [("    return int(hits[-1]) if hits else 0",
-       "    return int(hits[0]) if hits else 0")]),
+     [("    hits = SKIP_RE.findall(line)\n    return int(hits[-1]) if hits else 0",
+       "    hits = SKIP_RE.findall(line)\n    return int(hits[0]) if hits else 0")]),
     ("G3", "under", "presence, not count — cannot tell 1 skip from 68, so the "
      "message the operator reads names the wrong scale",
-     [("    return int(hits[-1]) if hits else 0",
-       "    return (1 if hits else 0)")]),
+     [("    hits = SKIP_RE.findall(line)\n    return int(hits[-1]) if hits else 0",
+       "    hits = SKIP_RE.findall(line)\n    return (1 if hits else 0)")]),
     ("G4", "under", "the regex reads 'passed' instead of 'skipped' — a healthy "
      "run is refused and a skipping one sails through",
      [('SKIP_RE = re.compile(r"(\\d+)\\s+skipped")',
@@ -149,7 +148,15 @@ def run_tests():
     purge_pycache()
     proc = sh([sys.executable, "-B", "-m", "pytest", *SUITES.split(), "-q",
                "-p", "no:cacheprovider"])
-    hits = SKIP_RE.findall(proc.stdout + proc.stderr)
+    # ⛔⛔ SUMMARY LINE ONLY — this harness made the exact mistake it is here to
+    # measure. Its first version scanned all of pytest's output, and the suite it
+    # runs carries "68 skipped" strings as FIXTURES, so a failing mutant printed
+    # an assertion diff and this parser read the diff as 68 real skips. Seven
+    # verdicts were refused for a skip that never happened.
+    line = None
+    for m in SUMMARY_RE.finditer(proc.stdout + proc.stderr):
+        line = m.group(0)
+    hits = SKIP_RE.findall(line) if line else []
     return proc.returncode == 0, (int(hits[-1]) if hits else 0)
 
 
