@@ -165,9 +165,35 @@ def test_the_nlm_audio_menu_helpers_and_their_deny_list_survived():
 
 def test_extract_with_retry_kept_its_one_live_caller(src):
     """Its only live caller is the NotebookLM notebook-link recovery, which
-    stays. If that ever goes the helper is dead weight."""
+    stays. If that ever goes the helper is dead weight.
+
+    ⛔⛔ THE FIRST VERSION OF THIS TEST ASSERTED `"extract_with_retry(" in src`
+    AND A MUTANT WALKED THROUGH IT. `nb_res = None and await
+    extract_with_retry(…)` short-circuits before the await — the call never runs,
+    the notebook link is never recovered — and the substring is still right
+    there in the source. A guard that reads a call's TEXT cannot tell it from a
+    call that can never execute.
+
+    So: pin the assignment, and pin that its result is what the loop decides on.
+    """
     assert hasattr(research, "extract_with_retry")
-    assert "extract_with_retry(" in src
+    pipeline = code_only(inspect.getsource(research.run_pipeline))
+    assert "nb_res = await extract_with_retry(" in pipeline, (
+        "the recovery call must be awaited directly off the assignment — "
+        "anything between `=` and `await` can short-circuit it"
+    )
+    # …and the result is READ, not merely produced.
+    assert "if nb_res.verified or is_notebooklm_url(nb_res.url):" in pipeline
+    assert "notebook_url = nb_res.url" in pipeline
+
+
+def test_the_notebook_recovery_loop_can_still_end_the_wait(src):
+    """⛔ The loop's two exits, both of which read the extractor's result: a URL
+    good enough to keep, or the card that asks the user. A recovery loop with
+    neither is an unbounded wait."""
+    pipeline = code_only(inspect.getsource(research.run_pipeline))
+    assert "no verified NotebookLM URL after retries" in pipeline
+    assert "{nb_res.error}" in pipeline
 
 
 # ── 4. the P2 → P3 handoff, which the removal ran straight through ──────────
