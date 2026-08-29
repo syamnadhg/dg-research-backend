@@ -611,11 +611,65 @@ def test_phase_updates_sr_for_p1_p2_podcast_platform_for_notebook_yt_doc():
 
 
 def test_sr_mint_gap_detects_unminted_complete_phase():
+    """⛔⛔ THE PROOF FOR A REPORT IS THE PHASE, NOT A PLATFORM LINK (2026-08-28,
+    stretch 6.6B). This used to prove the brief existed by `links.brief` being
+    present; the P2 share step that wrote the three agent equivalents was
+    removed, and keeping a platform-link proof would have meant `_sr_mint_gap`
+    could NEVER fire for phase 2 — a chat user seeing "Deep Research" complete
+    with zero links. A phase completes on its markdown reaching Firestore, which
+    is exactly the condition a snapshot share needs."""
     done = {1: "complete"}
-    platform = {"brief": "https://docs.google.com/brief"}  # proof the brief exists
-    assert bridge._sr_mint_gap({}, platform, done) is True          # no SR yet → gap
-    assert bridge._sr_mint_gap({"brief": "u"}, platform, done) is False  # already minted
-    assert bridge._sr_mint_gap({}, {}, done) is False              # no proof → not a gap
+    assert bridge._sr_mint_gap({}, {}, done) is True                # phase 1 done → gap
+    assert bridge._sr_mint_gap({"brief": "u"}, {}, done) is False   # already minted
+    # The podcast is still PLATFORM-proved: its source is the Storage audio file,
+    # not a document, so a complete phase 3 alone proves nothing about it.
+    p3 = {3: "complete"}
+    assert bridge._sr_mint_gap({}, {}, p3) is False                 # no audio file → no gap
+    assert bridge._sr_mint_gap({}, {"audio_file": "https://s/a.mp3"}, p3) is True
+
+
+def test_sr_mint_gap_ignores_an_agent_that_was_switched_off():
+    """⛔ An agent the user turned off produces no document, so treating its
+    absence as a gap would re-issue the same mint on every status poll for the
+    life of the run."""
+    done = {2: "complete"}
+    all_three = bridge._sr_mint_gap({}, {}, done, {"chatgpt", "gemini", "claude"})
+    assert all_three is True
+    minted_two = bridge._sr_mint_gap({"chatgpt": "u", "gemini": "u"}, {}, done,
+                                     {"chatgpt", "gemini"})
+    assert minted_two is False, "claude was off — its absence is not a gap"
+    assert bridge._sr_mint_gap({"chatgpt": "u"}, {}, done, {"chatgpt"}) is False
+
+
+def test_enabled_agents_defaults_to_all_three_without_a_config():
+    assert bridge._enabled_agents({}) == set(bridge._DEFAULT_AGENTS)
+    assert bridge._enabled_agents(
+        {"pipelineConfig": {"agents": {"chatgpt": True, "gemini": False, "claude": True}}}
+    ) == {"chatgpt", "claude"}
+
+
+def test_mint_sr_unwraps_a_nested_response_and_refuses_a_non_url_value():
+    """⛔⛔ `isinstance(sr, dict)` CANNOT TELL A FLAT MAP FROM `{urls, present}`.
+    The frontend briefly forwarded `mintSrDocLinks`'s new return verbatim; the
+    `{**sr, **fresh}` merge that follows would have added not one URL and
+    shipped two junk keys to every chat client. This agent ships separately on
+    PyPI, so it has to survive both shapes."""
+    import types
+    calls = {}
+
+    def _post(_sess, path, body):
+        calls["path"] = path
+        return 200, {"srLinks": {"urls": {"brief": "https://o/shared/doc/B"},
+                                 "present": ["brief", "chatgpt"]}}
+
+    orig = bridge._fe_api_post
+    bridge._fe_api_post = _post
+    try:
+        out = bridge._mint_sr(types.SimpleNamespace(), "r1", "T")
+    finally:
+        bridge._fe_api_post = orig
+    assert out == {"brief": "https://o/shared/doc/B"}
+    assert calls["path"] == "/api/mintSrLinks"
 
 
 def test_updates_via_agent_filters_and_builds_phase_updates(live, monkeypatch):

@@ -58126,6 +58126,14 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     # from checkpoint. P4 path also sets `audio_overview_url = ""` so the
     # variable is always defined regardless of which branch P3 takes.
     audio_overview_url = cp.get("audio_overview_url", "")
+    # ⛔⛔ SAME REASON, SAME SCOPE, ADDED 2026-08-28 (stretch 6.6C). The Phase-3
+    # completion gate and the run-complete summary both read
+    # `_p3_audio_stored`, and it is assigned inside `if notebook_url:` in the
+    # `elif start_phase <= 3` branch — so a run RESUMED past P3, or one whose
+    # notebook never opened, would raise NameError at the two places that are
+    # supposed to report what happened. The comment directly above records that
+    # this exact trap was already paid for once with `audio_overview_url`.
+    _p3_audio_stored = ""
 
     # #910: a resumed run is ongoing again. Clear a stale local "paused"
     # (login-interrupt / in-process pause) so _plan_pipeline_auto_retry's
@@ -60595,7 +60603,18 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                             # scratch precisely because the upload is what is
                             # missing; the copy now says what the code does.
                             error="Couldn't open the NotebookLM notebook",
-                            reason="We uploaded your reports to NotebookLM but the notebook didn't open — so the audio overview can't be generated. Retry to upload again, or Skip it.",
+                            # ⛔⛔ IT DOES NOT CLAIM THE UPLOAD SUCCEEDED, and the
+                            # first version of this copy did. The gate reaches
+                            # here from three states, and only one of them has
+                            # a notebook: the upload threw and exhausted its
+                            # retries (56307), the login pause ended in a skip
+                            # (56220), or the upload landed somewhere that is
+                            # not a /notebook/{id} page. "We uploaded your
+                            # reports but the notebook didn't open" is false on
+                            # the first two — and the user has just dismissed a
+                            # card saying the upload failed, so it also
+                            # contradicts what they were told a moment ago.
+                            reason="We couldn't get to your NotebookLM notebook, so the audio overview can't be generated. Retry to upload the reports again, or Skip it.",
                             agent="notebooklm",
                             **_nb_deadline_kw,
                         )
@@ -60724,6 +60743,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             update_delivery(research_links=links, notebook_url=notebook_url)
             # Sub-step 3b: Generate audio overview
             audio_overview_url = ""
+            _p3_audio_stored = ""
             _p3_audio_user_skipped = False
             if notebook_url:
                 while True:  # timeout-retry loop
@@ -60804,13 +60824,16 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             _p3_links = []
             if notebook_url and validate_link("notebooklm", notebook_url):
                 _p3_links.append({"label": "NotebookLM Notebook", "url": notebook_url, "verified": True})
-            # NLM emits the same /notebook/{id} URL for both notebook and
-            # audio share dialogs by design. Keep both rows so the FE can
-            # render the Audio Overview as a Play button + external
-            # Open-in-NotebookLM affordance (Option 3 hybrid). Dedup by
-            # label+url at FE allLinks lets the second row survive.
-            if audio_overview_url and validate_link("notebooklm", audio_overview_url):
-                _p3_links.append({"label": "Audio Overview", "url": audio_overview_url, "verified": True})
+            # ⛔ THE "Audio Overview" ROW LEFT HERE ON 2026-08-28, because on
+            # this branch it was DEAD. `audio_overview_url` is `""` for the
+            # whole of the ordinary run path — its only other writer is the
+            # Flow-C hydration of a link the USER pasted, which is the
+            # mutually-exclusive arm of the same if/elif — so the append could
+            # never fire, while its comment still explained how the FE would
+            # render the row. The frontend now injects that row itself from
+            # `research.audios[].audioUrl`, the playable Storage file
+            # (`src/lib/audio-row.ts`), which is the artefact this phase
+            # completes on rather than a NotebookLM page.
             # Hard rule (user_locked 2026-05-02): P3 marks complete only when
             # both notebook AND audio are obtained. Surface a [Retry, Skip]
             # alert when audio is missing rather than emitting phase_complete
@@ -61065,12 +61088,20 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     else "no_audio_generated")
                 log(f"[Phase3] no deliverable podcast ({_p3_audio_reason}) — "
                     f"reporting phase 3 as skipped rather than complete", "WARN")
+                # ⛔⛔ `detail=`, NOT `summary=`. The frontend's phase_skipped
+                # handler reads `evt.data.reason` and renders it through
+                # `phaseSkipSummary`; `evt.data.summary` is read ONLY on
+                # phase_complete. So the sentence this wave is proudest of — the
+                # one telling a user their podcast is sitting on the research
+                # computer — reached no surface at all, and the tile showed a
+                # de-underscored slug instead. `detail` is the field the notice
+                # path already prefers.
                 emit_event("phase_skipped", phase=3, reason=_p3_audio_reason,
                            durationSec=int(time.time() - _p3_start), links=_p3_links,
-                           summary=("NotebookLM notebook created; the podcast was generated but "
-                                    "could not be uploaded — it is still on the research computer"
-                                    if audio_path else
-                                    "NotebookLM notebook created; no audio overview was produced"))
+                           detail=("NotebookLM notebook created. The podcast was generated but "
+                                   "couldn't be uploaded — it's still on your research computer."
+                                   if audio_path else
+                                   "NotebookLM notebook created. No audio overview was produced."))
         else:
             links_file = queue_dir / "links.json"
             if links_file.exists():
@@ -61171,7 +61202,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         log(f"\n{'='*60}")
         log("BE PIPELINE COMPLETE — through Phase 3 (FE owns Phases 4 + 5)")
         log(f"  NotebookLM: {notebook_url or 'N/A'}")
-        log(f"  Audio Overview: {audio_overview_url or 'N/A'}")
+        # ⛔ THE PODCAST, NOT THE REMOVED SHARE PAGE. This read
+        # `audio_overview_url`, which after 6.6C is `""` on every ordinary run —
+        # so the last operator-facing line about a run that generated,
+        # downloaded and uploaded a podcast said "Audio Overview: N/A". The
+        # artefact the phase now completes on is the Storage URL.
+        log(f"  Podcast: {_p3_audio_stored or 'N/A'}")
         log(f"  Queue: {queue_dir}")
         log(f"{'='*60}")
 

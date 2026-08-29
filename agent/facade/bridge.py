@@ -1502,8 +1502,40 @@ _PHASE_PLAN: dict[int, tuple[str, tuple[tuple[str, str], ...]]] = {
 }
 # The platform-link kind whose PRESENCE proves a phase's artifact exists (so its
 # SR snapshot can be minted). audio_file is the podcast's Storage source.
-_SR_PROOF_KIND = {"brief": "brief", "chatgpt": "chatgpt", "gemini": "gemini",
-                  "claude": "claude", "podcast": "audio_file"}
+#
+# ⛔⛔ THE THREE REPORT KINDS LEFT THIS MAP ON 2026-08-28, AND LEAVING THEM WOULD
+# HAVE BEEN SILENT. They proved a report existed by the presence of
+# `links.chatgpt` / `links.gemini` / `links.claude` — the P2 platform share
+# links, whose sole writer (`update_link_in_firestore(name.lower(), share_url…)`
+# in `extract_and_record_agent`) was removed with the share step in stretch
+# 6.6B. Nothing writes those keys now, so the proof would never be present,
+# `_sr_mint_gap` would never fire for phase 2, and a chat user running `/sr
+# status` mid-run would see "Deep Research" complete with ZERO links — where
+# before they got three permanent /shared/doc pages — until FE-P5 finally minted
+# them at delivery.
+#
+# ▶ A report's proof is now the PHASE, not a link. `documents/{agent}` is
+# written the moment the markdown lands, and phase 2 reports "complete" on
+# exactly that (`n_chars > 0 and md_saved`), so a complete phase 2 IS the
+# evidence — see `_sr_mint_gap`, which handles the enabled-agent question that a
+# per-link proof used to answer by accident.
+_SR_PROOF_KIND = {"podcast": "audio_file"}
+
+# Document kinds whose existence a COMPLETE phase proves on its own — no
+# platform link required, because the phase's own completion gate is the
+# markdown reaching Firestore.
+_SR_PHASE_PROVED = {"brief", "chatgpt", "gemini", "claude"}
+
+
+def _enabled_agents(doc: dict) -> set:
+    """The P2 agents this run actually ran. An agent switched off produces no
+    document, so treating its absence as a gap would re-issue the same mint on
+    every status poll for the life of the run."""
+    cfg = doc.get("pipelineConfig")
+    agents = cfg.get("agents") if isinstance(cfg, dict) else None
+    if not isinstance(agents, dict):
+        return set(_DEFAULT_AGENTS)
+    return {a for a in _DEFAULT_AGENTS if agents.get(a, True)}
 
 
 def _completed_phases(doc: dict) -> dict:
@@ -1532,17 +1564,31 @@ def _platform_links(doc: dict) -> dict:
     return {e["kind"]: e["url"] for e in runview.flatten_links(doc.get("links")) if e.get("url")}
 
 
-def _sr_mint_gap(sr_links: dict, platform: dict, done: dict) -> bool:
-    """True if a COMPLETE phase has an artifact (platform proof) but its
-    permanent SR share isn't minted yet — i.e. minting would fill a real gap."""
+def _sr_mint_gap(sr_links: dict, platform: dict, done: dict, enabled: set | None = None) -> bool:
+    """True if a COMPLETE phase has an artifact but its permanent SR share isn't
+    minted yet — i.e. minting would fill a real gap.
+
+    `enabled` is the set of P2 agents this run ran; an agent switched off has no
+    document and must not read as a gap. Defaults to all three for callers that
+    have no config to hand."""
+    if enabled is None:
+        enabled = set(_DEFAULT_AGENTS)
     for p, st in done.items():
         if st != "complete":
             continue
         for _label, src in _PHASE_PLAN.get(p, ("", ()))[1]:
-            if src.startswith("sr:"):
-                dt = src[3:]
-                if dt not in sr_links and _SR_PROOF_KIND.get(dt, dt) in platform:
+            if not src.startswith("sr:"):
+                continue
+            dt = src[3:]
+            if dt in sr_links:
+                continue
+            if dt in _SR_PHASE_PROVED:
+                # The phase's own completion is the proof — but only for an
+                # agent that ran. `brief` is not an agent and is always in play.
+                if dt == "brief" or dt in enabled:
                     return True
+            elif _SR_PROOF_KIND.get(dt, dt) in platform:
+                return True
     return False
 
 
@@ -1606,7 +1652,22 @@ def _mint_sr(sess: "AccountSession", rid: str, title: str) -> dict | None:
     to whatever's already minted)."""
     status, body = _fe_api_post(sess, "/api/mintSrLinks", {"research_id": rid, "title": title or ""})
     sr = body.get("srLinks") if status == 200 else None
-    return sr if isinstance(sr, dict) else None
+    # ⛔⛔ A FLAT {docType: url} MAP, AND `isinstance(dict)` CANNOT TELL. The FE
+    # briefly forwarded `mintSrDocLinks`'s new `{urls, present}` return verbatim,
+    # which passes this guard — and the caller then does `{**sr, **fresh}`, so
+    # not one minted URL would have landed (they are all one level down), two
+    # junk keys would have shipped to every chat client in the `srLinks`
+    # payload, and the gap would never close so the mint re-issued on every
+    # status poll. The route was put back to the flat shape; this unwraps the
+    # nested one too, because this agent ships separately on PyPI and will meet
+    # both.
+    if isinstance(sr, dict) and isinstance(sr.get("urls"), dict):
+        sr = sr["urls"]
+    if not isinstance(sr, dict):
+        return None
+    # Every value must be a URL string — a nested object here is a shape we do
+    # not understand, and merging it would corrupt the map for the whole run.
+    return {k: v for k, v in sr.items() if isinstance(v, str) and v}
 
 
 def _attention_text(r: dict) -> str | None:
@@ -3190,7 +3251,7 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # back to whatever's already minted on failure).
             sr = _sr_links(doc)
             done = _completed_phases(doc)
-            if _sr_mint_gap(sr, _platform_links(doc), done):
+            if _sr_mint_gap(sr, _platform_links(doc), done, _enabled_agents(doc)):
                 fresh = _mint_sr(sess, rid, doc.get("title") or doc.get("topic") or "")
                 if fresh:
                     sr = {**sr, **fresh}
@@ -3372,7 +3433,7 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 phase_updates: list = []
                 if via_agent:
                     done = _completed_phases(r)
-                    if _sr_mint_gap(sr, _platform_links(r), done):
+                    if _sr_mint_gap(sr, _platform_links(r), done, _enabled_agents(r)):
                         fresh = _mint_sr(sess, r.get("id"), r.get("title") or r.get("topic") or "")
                         if fresh:
                             sr = {**sr, **fresh}

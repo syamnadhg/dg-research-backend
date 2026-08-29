@@ -199,7 +199,19 @@ def test_the_notebook_row_is_what_the_frontend_matches_on():
     notice."""
     src = inspect.getsource(research)
     assert '{"label": "NotebookLM Notebook", "url": notebook_url, "verified": True}' in src
-    assert '{"label": "Audio Overview", "url": audio_overview_url, "verified": True}' in src
+    # ⛔ THE "Audio Overview" ROW LEFT THIS LIST ON 2026-08-28 (stretch 6.6C),
+    # and it was DEAD before it left: its guard was `audio_overview_url`, which
+    # is "" for the whole ordinary run path — the only other writer is the
+    # Flow-C hydration of a link the USER pasted, on the mutually-exclusive arm
+    # of the same if/elif. So the append could never fire, while its comment
+    # still explained how the frontend would render the row.
+    #
+    # ⭐ The frontend injects that row itself now, from
+    # `research.audios[].audioUrl` — the playable Storage file, which is the
+    # artefact Phase 3 completes on rather than a NotebookLM page
+    # (`src/lib/audio-row.ts`). The LABEL contract this test protects is
+    # unchanged and is now asserted where the row is actually built.
+    assert '{"label": "Audio Overview", "url": audio_overview_url' not in src
 
 
 def test_the_give_up_still_marks_phase_4_skipped():

@@ -282,3 +282,51 @@ def test_research_py_has_no_unresolved_names_left_by_the_cut(src):
     }
     for name in REMOVED:
         assert name not in defined, f"{name} is still defined"
+
+
+# ── 7. what the cross-verify found: the consumers the removal reached ───────
+
+def test_the_readme_no_longer_documents_the_removed_share_contract():
+    """⛔⛔ IT DESCRIBED THE REMOVED RULES AS A LIVE, HARD-FAILING CONTRACT —
+    "Gemini + Claude: PUBLIC share links ONLY, hard-fail on miss" with a
+    Retry/Skip gate. An auditor reading it concludes Phase 2 can fail on a link.
+    It cannot: the gate is the markdown, and the extractors do not exist."""
+    from pathlib import Path
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+    assert "PUBLIC share links ONLY" not in readme
+    assert "public-share link extraction first" not in readme
+    assert "It completes on the MARKDOWN" in readme, (
+        "the section must say what Phase 2 DOES complete on, not merely stop "
+        "saying what it does not"
+    )
+
+
+def test_the_agents_phase2_proof_is_the_phase_not_a_deleted_link():
+    """⛔⛔ THE CHAT BRIDGE PROVED A REPORT EXISTED BY `links.chatgpt`. That key's
+    sole writer went with the share step, so `_sr_mint_gap` could never fire for
+    phase 2 and a chat user running `/sr status` mid-run would see "Deep
+    Research" complete with ZERO links — where before they got three permanent
+    /shared/doc pages."""
+    import ast as _ast, inspect as _inspect, importlib.util, sys
+    from pathlib import Path
+    bridge_path = Path(__file__).resolve().parents[1] / "agent" / "facade" / "bridge.py"
+    src = bridge_path.read_text(encoding="utf-8")
+    assert '_SR_PROOF_KIND = {"podcast": "audio_file"}' in src, (
+        "the three report kinds must no longer be proved by a platform link"
+    )
+    assert '_SR_PHASE_PROVED = {"brief", "chatgpt", "gemini", "claude"}' in src
+    # …and an agent that was switched off must not read as a permanent gap.
+    assert "def _enabled_agents(doc: dict) -> set:" in src
+    assert "_sr_mint_gap(sr, _platform_links(doc), done, _enabled_agents(doc))" in src
+
+
+def test_the_agent_unwraps_the_mint_response_shape_it_may_meet():
+    """⛔⛔ `isinstance(sr, dict)` CANNOT TELL A FLAT MAP FROM `{urls, present}`.
+    The FE briefly forwarded the new return verbatim; the merge that follows
+    would have added not one URL and shipped two junk keys to every chat
+    client. The agent ships separately on PyPI, so it must survive both."""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "agent" / "facade" / "bridge.py").read_text(encoding="utf-8")
+    assert 'if isinstance(sr, dict) and isinstance(sr.get("urls"), dict):' in src
+    assert 'sr = sr["urls"]' in src
+    assert "return {k: v for k, v in sr.items() if isinstance(v, str) and v}" in src

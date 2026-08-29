@@ -119,7 +119,7 @@ def test_the_skip_names_which_of_the_two_failed(pipeline_src):
     still on the research computer, which the user needs to be told."""
     assert '"audio_generated_but_upload_failed" if audio_path' in pipeline_src
     assert '"no_audio_generated"' in pipeline_src
-    assert "still on the research computer" in pipeline_src
+    assert "still on your research computer" in pipeline_src
 
 
 def test_the_complete_summary_no_longer_claims_an_audio_link(pipeline_src):
@@ -151,7 +151,7 @@ def test_the_upload_card_says_the_upload_failed_not_the_link(pipeline_src):
     for exactly that reason."""
     assert "Couldn't get the NotebookLM link" not in pipeline_src
     assert 'error="Couldn\'t open the NotebookLM notebook"' in pipeline_src
-    assert "the notebook didn't open" in pipeline_src
+    assert "Retry to upload the reports again" in pipeline_src
 
 
 def test_the_notebook_link_is_still_recorded_when_we_have_one(pipeline_src):
@@ -216,3 +216,60 @@ def test_the_pasted_audio_link_path_is_untouched(pipeline_src):
     `audio_overview_url` at hydration. That is a user-supplied source, not a
     scraped one, and it was never part of this wave."""
     assert 'elif _kind == "audio" and not audio_overview_url:' in pipeline_src
+
+
+# ── 5. what the cross-verify found in the first version of this fix ─────────
+
+def test_the_artefact_is_defined_on_every_path_out_of_the_pipeline(pipeline_src):
+    """⛔⛔ A NameError WHERE THE RUN REPORTS WHAT HAPPENED. `_p3_audio_stored`
+    is assigned inside `if notebook_url:` in the fresh-run branch, and it is read
+    by the completion gate AND by the run-complete summary — both reachable from
+    the RESUME branch and from a run whose notebook never opened. The comment
+    beside `audio_overview_url` records that this exact trap was already paid for
+    once, in this same function."""
+    assert '    _p3_audio_stored = ""' in pipeline_src
+    init = pipeline_src.index('    _p3_audio_stored = ""')
+    gate = pipeline_src.index("if _p3_no_skip and _p3_audio_stored:")
+    summary = pipeline_src.index("log(f\"  Podcast: {_p3_audio_stored or 'N/A'}\")")
+    assert init < gate and init < summary, "the function-scope init must precede both readers"
+
+
+def test_the_run_complete_summary_reports_the_podcast_not_the_removed_share(pipeline_src):
+    """⛔ It read `audio_overview_url`, which after 6.6C is "" on every ordinary
+    run — so the last operator-facing line about a run that generated,
+    downloaded AND uploaded a podcast said "Audio Overview: N/A"."""
+    assert "Audio Overview: {audio_overview_url" not in pipeline_src
+    assert "Podcast: {_p3_audio_stored" in pipeline_src
+
+
+def test_the_dead_audio_overview_row_is_gone(pipeline_src):
+    """⛔ `_p3_links.append({"label": "Audio Overview" …})` was guarded on
+    `audio_overview_url`, which is "" for the whole ordinary path — dead code
+    carrying a comment that still explained how the FE would render the row.
+    The FE injects that row itself now, from the playable Storage file."""
+    assert '_p3_links.append({"label": "Audio Overview"' not in pipeline_src
+    # …and the notebook row, which is real, stays.
+    assert '_p3_links.append({"label": "NotebookLM Notebook"' in pipeline_src
+
+
+def test_the_skip_sends_its_sentence_where_the_frontend_reads_it(pipeline_src):
+    """⛔⛔ `summary=` IS NOT READ ON phase_skipped. The FE's handler renders
+    `evt.data.reason` through `phaseSkipSummary`; `evt.data.summary` is read only
+    on phase_complete. So the sentence telling a user their podcast is still on
+    the research computer reached no surface at all, and the tile showed a
+    de-underscored slug instead."""
+    tail = pipeline_src[pipeline_src.index("elif _p3_no_skip:"):]
+    emit = tail[:tail.index("else:")] if "else:" in tail[:2000] else tail[:2000]
+    assert "detail=(" in emit
+    assert "summary=(" not in emit
+    assert "still on your research computer" in emit
+
+
+def test_the_upload_card_does_not_claim_the_upload_succeeded(pipeline_src):
+    """⛔⛔ "We uploaded your reports to NotebookLM but the notebook didn't open"
+    is FALSE on two of the three states that reach this card — an upload that
+    threw and exhausted its retries, and a login pause that ended in a skip. On
+    the first of those the user has just dismissed a card saying the upload
+    failed, so the new one contradicted it."""
+    assert "We uploaded your reports to NotebookLM" not in pipeline_src
+    assert "We couldn't get to your NotebookLM notebook" in pipeline_src

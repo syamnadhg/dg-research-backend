@@ -600,14 +600,32 @@ Long quiet stretches in Phases 1–3 are expected (ChatGPT Pro thinks for ~3 min
 
 When verification IS enabled, preflight walks platforms one at a time (tab open → 4s hydration → URL check → CUA vision → per-platform `login_required`), exactly the 2026-04-24 sequential design.
 
-## Phase 2 — per-agent extraction rules (Apr 19 late-late)
+## Phase 2 — the report is the artefact (Aug 28)
 
-Phase 2 enforces different link-extraction rules per platform. The right rule for each platform comes from how each service exposes authenticated conversations:
+⛔⛔ **THE PER-PLATFORM SHARE-LINK RULES DESCRIBED HERE WERE REMOVED ON
+2026-08-28 (stretch 6.6B), AND THIS SECTION DOCUMENTED THEM AS A LIVE,
+HARD-FAILING CONTRACT.** It said Gemini and Claude were **"PUBLIC share links
+ONLY, hard-fail on miss"** with "a Retry / Skip gate" — a completion rule that
+had not been true for months and is now not even implementable: the three
+extractors, the `_PUBLIC_SHARE_*` authority and the CUA fallback are gone. An
+auditor reading it would have concluded Phase 2 can fail on a link. It cannot.
 
-- **ChatGPT** — unchanged from Phase 1 brief behavior: public-share link extraction first, falls back to the conversation URL if the share flow fails. A conversation URL is acceptable because it's publicly readable to anyone with the link (shareable without explicit action).
-- **Gemini + Claude** — **PUBLIC share links ONLY**, hard-fail on miss. No conversation-URL fallback — those URLs are private to the authenticated session and would fail silent-ticks downstream. If the share flow fails after 3× retries, the agent surfaces a Retry / Skip gate (matching the B1 link-first completion gate).
+**What Phase 2 actually does.** It completes on the MARKDOWN: `n_chars > 0 and
+md_saved`. The report is saved to `documents/<agent>.md`, mirrored to the
+Firestore `documents` subcollection, and the FE is handed the in-app
+`/documents?open=…` link as the agent's primary — the only link `PhaseDropdown`
+renders for P1 and P2. The conversation URL is captured with `current_url()` for
+resume and for the P2→P3 NotebookLM handoff; it is never a gate.
 
-Every extraction method logs explicitly: `[gemini_extractor] method=X result=Y` (and equivalent per platform). Makes post-mortem debugging of "why did this agent not tick" trivial. `link_extracted` is emitted per agent the moment a verified link lands (no phase-end batching).
+**Why the share step went.** Measured over 45 agent-legs across ~15 real runs:
+2.2 minutes and 21.7 CUA calls per run — 31% of every CUA call the pipeline
+makes — for a link nothing gated on, which on a large share of runs was the
+private conversation URL fallback anyway. Delivery now uses Super Research's own
+`/shared/doc/{id}` snapshot pages, minted from the markdown already in
+Firestore, which open for a reader who is not the owner.
+
+`link_extracted` is still emitted per agent the moment the in-app primary lands
+(no phase-end batching).
 
 **Claude 2-artifact wait hard-fail.** If Claude has reached ≥80% of its allotted wait time AND has <2 artifacts in the side panel, the pipeline hard-fails that agent with Retry / Skip — no silent half-answer. First artifact is almost always a research plan, not the final report; accepting a single-artifact Claude as done produces a broken downstream.
 
