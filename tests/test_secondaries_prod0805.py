@@ -325,20 +325,16 @@ def test_no_hostname_literal_gates_a_live_notebook_url():
     assert '"notebook.google.com" in' not in src
 
 
-# ── (d) the ChatGPT share extractor ───────────────────────────────────────
-
-SHARE_SRC = code_only(research.extract_share_link_chatgpt)
-
-
-def test_the_clipboard_is_armed_before_the_copy_click():
-    """Every other extractor arms. This one read the clipboard four times and
-    accepted any string containing the share host — it could not tell a fresh
-    copy from yesterday's. It returned nothing this run, but the leg was already
-    sitting on the previous evening's conversation."""
-    assert "_arm_clipboard()" in SHARE_SRC
-    assert SHARE_SRC.index("_arm_clipboard()") < SHARE_SRC.index("link_btn.click("), (
-        "arming after the copy proves nothing"
-    )
+# ── (d) the clipboard-arming helper ───────────────────────────────────────
+#
+# ⛔ THREE TESTS LEFT THIS SECTION ON 2026-08-28 (stretch 6.6B). They pinned
+# `extract_share_link_chatgpt` — that the clipboard was armed before the copy
+# click, that the CUA mission was pinned to the page, that the CUA pass armed
+# too — and that extractor no longer exists. The P2 platform share step was
+# removed whole; Phase 5 delivers Super Research's own snapshot pages instead.
+#
+# The one below stays because its subject is `_arm_clipboard` itself, which is
+# still live: the NotebookLM legs and the Claude artifact read both arm.
 
 
 def test_the_arming_helper_really_clears_the_channel():
@@ -349,18 +345,10 @@ def test_the_arming_helper_really_clears_the_channel():
     assert src.strip() and "pass" != src.split(":", 1)[-1].strip()
 
 
-def test_the_cua_share_mission_is_pinned_to_the_page():
-    """Without a target, a 31.5s hunt is not guaranteed to be on the tab whose
-    url seeded the result — which is why the prod narration about a
-    "shared/read-only view" cannot be used as evidence about that tab."""
-    assert "switch_to_page(page)" in SHARE_SRC
-    i_switch = SHARE_SRC.index("switch_to_page(page)")
-    i_cua = SHARE_SRC.index("async def _chatgpt_share_cua")
-    assert i_switch < i_cua
-
-
-def test_the_cua_pass_arms_the_clipboard_too():
-    """Its whole stated purpose is "public-share URL on clipboard"."""
-    region = SHARE_SRC[SHARE_SRC.index("CUA fallback for share link"):]
-    region = region[:region.index("async def _chatgpt_share_cua")]
-    assert "_arm_clipboard()" in region
+def test_the_arming_helper_still_has_live_callers():
+    """⛔ The share extractors were three of its callers. If the rest ever go the
+    helper becomes dead code wearing a passing test — so count them, do not
+    assume them."""
+    src = code_only_deep(inspect.getsource(research))
+    callers = src.count("_arm_clipboard()")
+    assert callers >= 2, f"only {callers} call(s) to _arm_clipboard remain"

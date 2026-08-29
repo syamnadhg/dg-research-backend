@@ -60,7 +60,13 @@ TABLE_ROW_LOGQUIET = "| `logquiet.py` | log quieting |\n"
 
 COUNT = "seven subsystems live in their own modules"
 
-TODAY_ROW = "| **today (2026-08-25)** | **75,965** |"
+# ⛔ RE-ANCHORED 2026-08-28. The row was `| **today (2026-08-25)** | **75,965** |`
+# until stretch 6.6B removed 1,302 lines from research.py and the doc had to be
+# re-measured — at which point the doc OVERSTATED the file, the one direction
+# G1 exists to forbid, and the live-disk anchor ratchet reported both mutants
+# stale. A stale anchor measures nothing and reports a kill, so it is re-pointed
+# here rather than allowlisted.
+TODAY_ROW = "| **today (2026-08-28)** | **74,663** |"
 
 REVISIT = """- A second engineer edits `research.py` regularly. Single-author work has been
   hiding what would otherwise be constant merge pain."""
@@ -134,12 +140,12 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     ("G1", "over", "⛔⛔ THE SIZE IS OVERSTATED. The one direction this figure must "
      "never drift: a doc that inflates the problem makes the refusal look braver "
      "than it was, and an inflated number is the kind a reviewer checks",
-     [(TODAY_ROW, "| **today (2026-08-25)** | **95,000** |")],
+     [(TODAY_ROW, "| **today (2026-08-28)** | **95,000** |")],
      [T_NEW]),
     ("G2", "under", "⚠ THE FIGURE GOES BADLY STALE — understated by more than the "
      "guard tolerates, so the growth objection reads as answered when it has "
      "simply stopped being measured",
-     [(TODAY_ROW, "| **today (2026-08-25)** | **58,800** |")],
+     [(TODAY_ROW, "| **today (2026-08-28)** | **58,800** |")],
      [T_NEW]),
     ("G3", "under", "⛔ THE REVISIT CONDITIONS GO, so a will-not-do becomes "
      "permanent by omission. The second-engineer condition is the one most likely "

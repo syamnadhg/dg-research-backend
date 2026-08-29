@@ -86,17 +86,24 @@ def test_2d_copy_wrapped_inside_hijack_trigger():
     assert "removeAllRanges" in src
 
 
-def test_publish_claude_both_sites_wrapped():
-    src_a = _src(research.publish_open_claude_artifact)
-    assert 'hotspot_id="publish-claude"' in src_a
-    assert "mission_prompt=PROMPT_PUBLISH_CLAUDE_ARTIFACT" in src_a
-    # #735 flag is still set BEFORE the CUA/act pass.
-    assert src_a.index("_claude_publish_cua_used = True") < src_a.index(
-        'hotspot_id="publish-claude"')
+# ⛔ `test_publish_claude_both_sites_wrapped` LEFT ON 2026-08-28 (stretch 6.6B).
+# Its two subjects were `publish_open_claude_artifact` and
+# `extract_share_link_claude`, both removed with the P2 platform share step, and
+# the `publish-claude` hotspot went with them. The parity it asserted — that the
+# same hotspot is wired identically at both of its sites — is preserved for the
+# hotspots that remain by `test_every_hotspot_literal_has_a_curated_hint` below.
 
-    src_b = _src(research.extract_share_link_claude)
-    assert 'hotspot_id="publish-claude"' in src_b
-    assert "mission_prompt=PROMPT_PUBLISH_CLAUDE" in src_b
+
+def test_the_removed_share_hotspots_are_gone_from_every_table():
+    """⛔ A HOTSPOT REMOVED FROM THE CODE BUT LEFT IN THE HINT TABLE is a row
+    that can never fire and an id a reader will look for. Both tables, not one:
+    `_HOTSPOT_TO_OP` drives tier-transition telemetry and `_HOTSPOT_VISION_HINTS`
+    drives the vision prompt."""
+    for hs in ("p2-share", "publish-claude"):
+        assert hs not in research._HOTSPOT_VISION_HINTS, hs
+        assert hs not in research._HOTSPOT_TO_OP, hs
+    assert "p2-share" not in _all_hotspot_id_literals()
+    assert "publish-claude" not in _all_hotspot_id_literals()
 
 
 # ── the original five sites gain mission parity ──────────────────────────────
@@ -115,15 +122,6 @@ def test_panel_open_sites_carry_mission_and_marker():
     assert 'success_text="panel: open"' in blk_7d
 
 
-def test_p2_share_sites_carry_missions():
-    (blk_c,) = _block_for(_src(research.extract_share_link_chatgpt), "p2-share")
-    assert "mission_prompt=" in blk_c
-    assert "read it from the clipboard" in blk_c
-
-    (blk_e,) = _block_for(_src(research.extract_and_record_agent), "p2-share")
-    assert "cua_share_prompt" in blk_e
-
-
 # ── hints for the new hotspots ───────────────────────────────────────────────
 
 def test_every_hotspot_literal_has_a_curated_hint():
@@ -134,9 +132,12 @@ def test_every_hotspot_literal_has_a_curated_hint():
     (2c/2d-nav/2d-copy/publish-claude only) could not catch."""
     ids = _all_hotspot_id_literals()
     # Vacuous-pass guard: if the harvester silently breaks (regex/source drift),
-    # fail loudly instead of green-on-empty. ~33 unique dispatch/observe ids today.
-    assert len(ids) >= 30, (
-        f"harvester found only {len(ids)} hotspot_id literals (expected ~33) — "
+    # fail loudly instead of green-on-empty. ~31 unique dispatch/observe ids
+    # today — it was ~33 until 2026-08-28, when `p2-share` and `publish-claude`
+    # went with the P2 share step. ⛔ The floor was LOWERED deliberately and by
+    # exactly two; leaving it at 30 would have let a third id vanish unnoticed.
+    assert len(ids) >= 28, (
+        f"harvester found only {len(ids)} hotspot_id literals (expected ~31) — "
         "the regex or the dispatch wiring drifted; fix the guard before trusting it."
     )
     missing = sorted(

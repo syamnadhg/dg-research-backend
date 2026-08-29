@@ -715,47 +715,7 @@ Steps:
 4. If no Copy button, select all text in the response (Ctrl+A) and copy (Ctrl+C).
 5. Say "copied" when done."""
 
-# ── Phase 3: Shareable Links + NotebookLM ─────────────────────────────────────
-
-PROMPT_SHARE_GEMINI = SYSTEM_BASE + """
-
-Your task: Make this Gemini conversation shareable via a PUBLIC link.
-
-Steps:
-1. Look for a "Share" button or a "Share & Export" / "Export & save" submenu (top area or 3-dots menu).
-2. Click it to open the share dialog or submenu.
-3. If a submenu appears, click "Create public link" or "Public link" if visible — that's the modern flow and there's no visibility dropdown to set.
-4. If a share DIALOG opens with an access/visibility dropdown (legacy flow — usually shows "Restricted" or "Only people added"), click the dropdown and select "Anyone with the link".
-5. If you see a toggle for "Enable sharing" / "Create public link" — enable it.
-6. Once set to public, copy the shareable link (click "Copy link" button if available).
-7. Say "shared" with the EXACT URL (should contain g.co/gemini or gemini.google.com/share).
-
-IMPORTANT: The link MUST be PUBLIC ("Anyone with the link"), not restricted to specific people."""
-
-PROMPT_PUBLISH_CLAUDE = SYSTEM_BASE + """
-
-PREREQUISITE (post-2026-04-26 BE): A Playwright pre-step may have ALREADY opened the LAST artifact in the right panel. If you see a long research document (multiple section headers, paragraphs, citations) currently open in the right panel, skip directly to the Publish click — do NOT re-click the artifact card (re-click toggles the panel closed).
-
-Your task: Publish the Claude research ARTIFACT to get a public URL. Claude's Research tool often produces TWO artifacts — typically a SHORT intermediate one first, then a LARGER final report below it. You want the SECOND/BOTTOM one (the full report), NOT the first.
-
-Steps:
-1. Scan the conversation for artifact preview cards (usually rectangular cards inline in the chat with a preview of document content). Count them.
-2. If you see MULTIPLE artifact cards: click the LAST/BOTTOM one (the final full report). Scroll down in the chat if needed to find the latest artifact — it's the one at the END of the conversation.
-3. If you see only ONE artifact card: click it.
-4. Clicking opens the artifact in the right-side panel.
-5. In the artifact panel, locate the PUBLISH / SHARE button. It's usually at the top-right of the artifact panel and looks like a globe icon, a share icon, or text "Publish".
-6. Click Publish.
-7. A dialog or inline panel appears with options — click the "Publish" or "Create public link" button to confirm. If asked to confirm making public, confirm.
-8. Once published, the dialog shows a URL like `https://claude.site/artifacts/...`. Click the "Copy link" button to copy it to clipboard.
-9. State the URL in your response.
-
-IMPORTANT RULES:
-- Publish the ARTIFACT (the document in the right panel), NOT the conversation (Share conversation does something different).
-- If TWO artifacts exist, the SECOND/BOTTOM one is the full report — that's the one to publish.
-- Don't close the artifact panel — keep it open so the URL stays visible.
-- The published URL format is: `https://claude.site/artifacts/{id}` — tell me THAT URL, not the conversation URL.
-- If you cannot find the Publish button after opening the correct artifact, state exactly what UI you see — don't click arbitrary buttons."""
-
+# ── Phase 3: NotebookLM ────────────────────────────
 PROMPT_NOTEBOOKLM_UPLOAD = SYSTEM_BASE + """
 
 Your task: Create a new NotebookLM notebook and upload source files.
@@ -1154,26 +1114,6 @@ Steps:
 CRITICAL:
 - Step 0 is a state-check guard, not a click — don't act if the panel is already on the final report.
 - Click the LAST artifact, not the first. The first is often an intermediate tracking document."""
-
-PROMPT_PUBLISH_CLAUDE_ARTIFACT = SYSTEM_BASE + """
-
-Your task: Publish the currently-open Claude artifact to get a public URL.
-
-PREREQUISITE: The artifact should ALREADY be open in the right panel. If no artifact panel is visible, say "no artifact open" and STOP.
-
-Steps:
-1. Look at the right-side artifact panel. Verify content is visible.
-2. Find the Publish/Share button — usually at the top-right of the artifact panel. It may look like a globe icon, share icon, or say "Publish".
-3. Click Publish.
-4. A dialog appears — click "Publish" or "Create public link" to confirm.
-5. Once published, the dialog shows a URL like `https://claude.site/artifacts/...`. Click "Copy link" to copy it to clipboard.
-6. Report the EXACT URL in your response.
-
-IMPORTANT:
-- Publish the ARTIFACT (right panel), NOT the conversation
-- The URL format is: `https://claude.site/artifacts/{id}`
-- Don't close the artifact panel
-- If you cannot find the Publish button, describe what UI you see"""
 
 
 # ── Tier-3 panel-open fallbacks (used when DOM helpers miss 2x) ──────────────

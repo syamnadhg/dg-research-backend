@@ -175,11 +175,18 @@ def test_the_rung_does_not_return_early_past_the_rest_of_phase_3():
     )
 
 
-def test_the_share_link_extract_still_follows_the_download():
-    """Guards the ordering the early return would have broken."""
+def test_the_storage_upload_still_follows_the_download():
+    """Guards the ordering the early return would have broken.
+
+    ⛔ 2026-08-28 (stretch 6.6C): this used to check that the audio SHARE
+    extract followed the download. That block is gone — it spent CUA calls
+    re-deriving the notebook URL its own fallback already held. The step that
+    now has to follow the download is the one Phase 3 COMPLETES on: the Firebase
+    Storage upload. An early return past it produces a local file the app can
+    never reach, which is a worse version of the bug this test was written for."""
     dl = SRC.index("        # Use Playwright download event to capture the file reliably")
-    share = SRC.index("_nlm_menu_pick(page, want=(\"share\", \"share notebook\"))")
-    assert dl < share, "the share-link extract must still run after the download block"
+    upload = SRC.index("audio_url = await asyncio.to_thread(upload_audio_to_storage, audio_path)")
+    assert dl < upload, "the Storage upload must still run after the download block"
 
 
 # ── failure handling ────────────────────────────────────────────────────────

@@ -949,8 +949,7 @@ async def observe_only(
     path ALREADY completed successfully, log its proposed action for offline
     comparison, and NEVER touch the page. There is NO CUA leg and NO gather —
     this is the success-path sibling of ``shadow_observe_then_cua`` (which only
-    fires on a DOM MISS, so DOM-robust hotspots like 7d / p2-share almost never
-    log). Every record carries ``source: "dom_success"`` to keep this always-on
+    fires on a DOM MISS, so DOM-robust hotspots like 7d almost never log). Every record carries ``source: "dom_success"`` to keep this always-on
     population separate from the legacy miss-path records (which have a ``cua``
     block and no ``source``).
 
@@ -1268,8 +1267,9 @@ async def with_vision_fallback(
     Vision escalates or `primary_fn` fails again, fall through to CUA.
 
     `primary_fn` MUST be re-entrant (idempotent reads OK; idempotent writes
-    handled by the underlying workflow's resume logic). The existing
-    extract_share_link_* extractors satisfy this.
+    handled by the underlying workflow's resume logic). ⛔ The example this
+    named — the P2 `extract_share_link_*` extractors — was removed on
+    2026-08-28; the live re-entrant callers are the NotebookLM extractors.
     """
     vc = vision or default_client()
     try:

@@ -150,18 +150,23 @@ def test_research_py_is_still_the_overwhelming_majority():
     assert big > siblings * 5
 
 
-@pytest.mark.parametrize("label", ["today (2026-08-25)"])
-def test_the_stated_growth_figure_has_not_gone_badly_stale(label):
+def test_the_stated_growth_figure_has_not_gone_badly_stale():
     """⚠ A FLOOR AND A CEILING, NOT AN EQUALITY.
 
     An exact assertion would fail on every commit that touches `research.py`,
     and a figure people edit reflexively is worse than no figure. So: the doc
     may never OVERSTATE the size (that would flatter the argument), and it may
     understate it only by so much before the number stops meaning anything.
+
+    ⛔ 2026-08-28: the row's DATE was parametrized in, so re-measuring the table
+    — which is the thing this test is asking for — made the test fail with "the
+    growth table no longer carries a row", a message about the wrong problem. It
+    finds the bolded `today (…)` row by shape now; the date is data, not an
+    anchor.
     """
     body = _section()
-    row = re.search(r"\*\*" + re.escape(label) + r"\*\* \| \*\*([\d,]+)\*\*", body)
-    assert row, f"the growth table no longer carries a row for {label}"
+    row = re.search(r"\*\*today \(\d{4}-\d{2}-\d{2}\)\*\* \| \*\*([\d,]+)\*\*", body)
+    assert row, "the growth table no longer carries a bolded `today (YYYY-MM-DD)` row"
     doc_says = int(row.group(1).replace(",", ""))
     actual = len((ROOT / "research.py").read_text(encoding="utf-8").splitlines())
     assert doc_says <= actual, (

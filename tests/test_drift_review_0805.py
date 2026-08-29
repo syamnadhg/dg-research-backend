@@ -210,10 +210,17 @@ def run_dir():
 
 @pytest.fixture(autouse=True)
 def _clean_runtime():
-    before = dict(research._runtime.agent_share_urls)
-    research._runtime.agent_share_urls = {}
+    """⛔ 2026-08-28: this used to save/restore `_runtime.agent_share_urls`, the
+    P2 share-URL stash removed with the platform share step (stretch 6.6B). The
+    handoff now reads each agent's conversation URL straight off `results`, so
+    there is no cross-test runtime state left to isolate here — but the fixture
+    stays, autouse, because `p2_links_for_p3` IS written by every `_handoff`
+    call below and a leftover would make the next test pass on the last one's
+    links."""
+    before = dict(research._runtime.p2_links_for_p3)
+    research._runtime.p2_links_for_p3 = {}
     yield
-    research._runtime.agent_share_urls = before
+    research._runtime.p2_links_for_p3 = before
 
 
 def _golden_retrievers(n=25_000):
@@ -252,22 +259,29 @@ def test_an_on_topic_leg_still_publishes_its_link(run_dir):
 
 
 def test_a_failed_text_extraction_does_NOT_cost_the_leg_its_link(run_dir):
-    """⚠ Deliberately not gated on `text`. A share URL whose scrape failed is still a
-    real, on-topic source that NotebookLM can read for itself."""
-    results = {"Claude": {"status": "done", "text": "", "url": "",
-                          "verified": False}}
-    research._runtime.agent_share_urls["Claude"] = {
-        "url": "https://claude.ai/share/2f8a", "verified": True}
-    assert _handoff(results, run_dir) == {"Claude": "https://claude.ai/share/2f8a"}
+    """⚠ Deliberately not gated on `text`. A URL whose scrape failed is still a
+    real, on-topic source that NotebookLM can read for itself.
+
+    ⛔ 2026-08-28: the url used to come from `_runtime.agent_share_urls` — the
+    public share the P2 extractor stashed. That extractor is gone, so the url
+    is the conversation URL on `results`, which is what the handoff always fell
+    back to. The rule under test is unchanged: an empty `text` does not cost the
+    leg its link."""
+    results = {"Claude": {"status": "done", "text": "",
+                          "url": "https://claude.ai/chat/2f8a", "verified": False}}
+    assert _handoff(results, run_dir) == {"Claude": "https://claude.ai/chat/2f8a"}
 
 
-def test_a_share_url_does_not_smuggle_a_rejected_leg_back_in(run_dir):
-    """The share URL is preferred over the conversation url, so the rejection has to be
-    read off the RESULT, not off whichever url won."""
+def test_a_rejected_leg_cannot_smuggle_its_url_back_in(run_dir):
+    """The rejection is read off the RESULT, not off the url — which is what let
+    the 11:08 run ship an unrelated conversation to NotebookLM as a source.
+
+    ⛔ 2026-08-28: this used to prove the rule against a stashed SHARE url that
+    outranked the conversation one. With the share step gone there is one url,
+    and the rule it has to survive is the same one: a leg the sweep rejected
+    publishes nothing, however good its url looks."""
     results = {"ChatGPT": {"status": "done", "text": _golden_retrievers(),
-                           "url": FOREIGN_URL, "verified": True}}
-    research._runtime.agent_share_urls["ChatGPT"] = {
-        "url": "https://chatgpt.com/share/deadbeef", "verified": True}
+                           "url": "https://chatgpt.com/c/deadbeef", "verified": True}}
     assert research.apply_off_topic_sweep(results, run_dir) == ["ChatGPT"]
     assert _handoff(results, run_dir) == {}
 

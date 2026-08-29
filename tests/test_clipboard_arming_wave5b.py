@@ -277,17 +277,19 @@ def test_the_suite_cannot_reach_the_real_clipboard(monkeypatch):
             "suite is about to touch the developer's own clipboard")
 
 
-def test_all_four_extractors_are_covered():
+def test_every_clipboard_reader_is_named_here():
     """Names the functions, so deleting a call site cannot quietly shrink what
-    the guard above is guarding."""
+    the guard above is guarding.
+
+    ⛔ THREE NAMES LEFT THIS SET ON 2026-08-28 — `extract_share_link_gemini`,
+    `extract_share_link_claude` and `publish_open_claude_artifact`, all removed
+    with the P2 share step. The set is written out rather than counted precisely
+    so a removal has to be stated here, not absorbed."""
     owner = _call_owners(ast.parse(inspect.getsource(research)))
     readers = {fn for _c, fn in _named_calls(owner, "_read_clipboard_after_copy")}
     assert readers == {
-        "extract_share_link_gemini",
-        "extract_share_link_claude",
         "_set_nlm_public_and_get_link",
         "extract_notebooklm_url",
-        "publish_open_claude_artifact",
     }, sorted(readers)
 
 
@@ -370,32 +372,15 @@ def test_a_clipboard_holding_something_else_entirely_is_reported_not_returned(
     assert "clipboard held no notebook" in capsys.readouterr().out
 
 
-# ── 4. Claude artifact publisher — per-attempt arming, then the mission ──────
-
-class _ClaudePublishPage:
-    def __init__(self, clip: _OSClipboard, copy_writes: str | None = None):
-        self._clip = clip
-        self._copy_writes = copy_writes
-        self.copy_clicks = 0
-
-    async def wait_for_selector(self, *a, **k):
-        return object()
-
-    async def evaluate(self, js, arg=None):
-        if "publish-artifact" in js:
-            return "clicked"
-        if "'publish'" in js or "create public link" in js:
-            return "confirmed"
-        if "claude.site/artifacts" in js:            # the in-dialog URL read
-            return ""
-        if "copy link" in js:
-            self.copy_clicks += 1
-            self._clip.trace.append("copy_click")
-            if self._copy_writes:
-                self._clip.copy(self._copy_writes)
-            return "copied"
-        return ""
-
+# ── 4. The page/browser doubles the NotebookLM section still needs ──────────
+#
+# ⛔ THREE SECTIONS LEFT THIS FILE ON 2026-08-28 (stretch 6.6B). Sections 4, 5
+# and 5b exercised `publish_open_claude_artifact`, `extract_share_link_gemini`
+# and `extract_share_link_claude` — the P2 platform share step, removed whole.
+# Every one of those tests was about clipboard arming inside a function that no
+# longer exists; none of them was stale, their subject was deleted. The doubles
+# below stay because section 6 (the NotebookLM URL extractor, which is KEPT)
+# drives `extract_notebooklm_url` through them.
 
 class _Browser:
     def __init__(self, page=None, tab_url=_TAB_URL):
@@ -416,241 +401,6 @@ class _Ctx:
     def remove_listener(self, *a, **k):
         pass
 
-
-def test_a_stale_claude_link_is_not_returned_as_the_published_url(clipboard):
-    """`'claude.site' in clip` is satisfied by any artifact this run already
-    published — including the sources checklist published moments earlier."""
-    clipboard.value = _CLAUDE_STALE
-    page = _ClaudePublishPage(clipboard, copy_writes=None)
-    got = asyncio.run(research.publish_open_claude_artifact(page, _Browser(), None))
-    assert got == ""
-
-
-def test_the_link_this_publish_copies_is_returned(clipboard):
-    fresh = "https://claude.site/artifacts/fresh999-0000-1111-2222-333344445555"
-    clipboard.value = _CLAUDE_STALE
-    page = _ClaudePublishPage(clipboard, copy_writes=fresh)
-    got = asyncio.run(research.publish_open_claude_artifact(page, _Browser(), None))
-    assert got == fresh
-
-
-def test_every_publish_attempt_arms_before_it_clicks_copy(clipboard):
-    """The DOM loop runs up to three times. Arming once outside it would let
-    attempt 3 accept what attempt 1 copied — a retry that "succeeds" while the
-    button it clicked did nothing."""
-    page = _ClaudePublishPage(clipboard, copy_writes=None)
-    asyncio.run(research.publish_open_claude_artifact(page, _Browser(), None))
-    assert page.copy_clicks == 3
-    pairs = [t for t in clipboard.trace if t in ("arm", "copy_click")]
-    assert pairs == ["arm", "copy_click"] * 3
-
-
-def test_the_vision_publish_is_armed_before_the_mission_not_after_it(
-        clipboard, monkeypatch):
-    """The mission is what copies. Arming after it returns would clear the link
-    it just produced; arming before it is the only placement that means
-    anything on the clipboard afterwards came from the mission."""
-    async def _mission(*a, **k):
-        clipboard.trace.append("mission")
-        return {"text": ""}
-
-    monkeypatch.setattr(research, "_shadow_observed_cua", _mission)
-    clipboard.value = _CLAUDE_STALE
-    page = _ClaudePublishPage(clipboard, copy_writes=None)
-    got = asyncio.run(
-        research.publish_open_claude_artifact(page, _Browser(), object()))
-
-    assert got == ""                                   # the stale link is gone
-    # Partitioned between the LAST copy click and the mission. "An arm happened
-    # somewhere before the mission" is already true from the three the DOM loop
-    # performed above, so a presence check passes with the mission's own arm
-    # deleted — verified by mutation, which is exactly how this test first
-    # failed to earn its keep.
-    trace = clipboard.trace
-    mission = trace.index("mission")
-    last_copy = max(i for i, t in enumerate(trace[:mission]) if t == "copy_click")
-    assert "arm" in trace[last_copy:mission], (
-        "nothing re-armed the clipboard between the DOM publish attempts and "
-        "the vision mission")
-    assert trace[mission + 1:].count("arm") == 0
-
-
-# ── 5. Gemini — the DOM copy, and the salvage read after a timeout ──────────
-
-class _Keyboard:
-    def __init__(self, trace):
-        self.trace = trace
-
-    async def press(self, key):
-        self.trace.append(f"press:{key}")
-
-
-class _GeminiPage:
-    """`share_opens` False sends the flow straight to the vision fallback,
-    which is where the timeout-salvage read lives."""
-
-    def __init__(self, clip: _OSClipboard, share_opens=True,
-                 copy_writes: str | None = None):
-        self._clip = clip
-        self._share_opens = share_opens
-        self._copy_writes = copy_writes
-        self.keyboard = _Keyboard(clip.trace)
-
-    async def query_selector(self, sel):
-        return None
-
-    async def evaluate(self, js, arg=None):
-        if "'share & export'" in js:
-            return self._share_opens
-        if "copy link" in js.lower():
-            self._clip.trace.append("copy_click")
-            if self._copy_writes:
-                self._clip.copy(self._copy_writes)
-            return "text"
-        return ""
-
-
-def _run_gemini(page, clipboard, monkeypatch, *, mission_times_out=False,
-                mission_text="", mission_copies=""):
-    async def _agent_loop(*a, **k):
-        clipboard.trace.append("mission")
-        if mission_copies:
-            clipboard.copy(mission_copies)
-        if mission_times_out:
-            raise asyncio.TimeoutError()
-        return {"text": mission_text}
-
-    monkeypatch.setattr(research, "agent_loop", _agent_loop)
-    return asyncio.run(research.extract_share_link_gemini(
-        _Browser(page), cua_client=object(), label="Gemini"))
-
-
-def test_a_gemini_link_from_earlier_in_the_run_cannot_survive_a_mission_timeout(
-        clipboard, monkeypatch):
-    """The salvage read is the most exposed of the nine: it fires precisely when
-    we do NOT know how far the mission got, and it used to answer with whatever
-    was on the clipboard — which on a Phase 2 run is very often a Gemini share
-    link this run produced on an earlier attempt."""
-    clipboard.value = _GEM_STALE
-    page = _GeminiPage(clipboard, share_opens=False)
-    res = _run_gemini(page, clipboard, monkeypatch, mission_times_out=True)
-    assert res.url != _GEM_STALE
-    assert res.verified is False
-
-
-def test_the_salvage_read_still_applies_the_gemini_shape_test(
-        clipboard, monkeypatch):
-    """Arming alone is not the whole guarantee. A vision mission hunting for a
-    place to paste copies whatever it lands on — a heading, a prompt, the page
-    title — so a read that dropped its shape test would emit THAT as the share
-    link, and the arm would be no defence because the value is genuinely fresh.
-    """
-    page = _GeminiPage(clipboard, share_opens=False)
-    res = _run_gemini(page, clipboard, monkeypatch, mission_times_out=True,
-                      mission_copies="Deep Research: ocean acidification")
-    assert "ocean acidification" not in res.url
-    assert res.verified is False
-
-
-def test_the_gemini_mission_is_armed_before_it_starts(clipboard, monkeypatch):
-    page = _GeminiPage(clipboard, share_opens=False)
-    _run_gemini(page, clipboard, monkeypatch, mission_times_out=True)
-    mission = clipboard.trace.index("mission")
-    assert "arm" in clipboard.trace[:mission]
-
-
-def test_a_link_the_gemini_copy_button_writes_is_still_accepted(
-        clipboard, monkeypatch):
-    fresh = "https://gemini.google.com/share/fresh222222"
-    clipboard.value = _GEM_STALE
-    page = _GeminiPage(clipboard, share_opens=True, copy_writes=fresh)
-    res = _run_gemini(page, clipboard, monkeypatch)
-    assert res.url == fresh
-    assert res.verified is True
-
-
-def test_the_gemini_dom_copy_is_armed_before_the_click(clipboard, monkeypatch):
-    fresh = "https://gemini.google.com/share/fresh222222"
-    page = _GeminiPage(clipboard, share_opens=True, copy_writes=fresh)
-    _run_gemini(page, clipboard, monkeypatch)
-    assert clipboard.trace.index("arm") < clipboard.trace.index("copy_click")
-
-
-def test_a_stale_gemini_link_is_not_adopted_when_the_copy_click_misses(
-        clipboard, monkeypatch):
-    clipboard.value = _GEM_STALE
-    page = _GeminiPage(clipboard, share_opens=True, copy_writes=None)
-    res = _run_gemini(page, clipboard, monkeypatch)
-    assert res.url != _GEM_STALE
-    assert res.verified is False
-
-
-# ── 5b. Claude share extractor — the mission that follows a failed publish ──
-
-def _run_claude(clipboard, monkeypatch, *, published="", mission_text=""):
-    async def _mission(*a, **k):
-        clipboard.trace.append("mission")
-        return {"text": mission_text}
-
-    async def _publish(*a, **k):
-        clipboard.trace.append("publish")
-        return published
-
-    async def _click(*a, **k):
-        return False
-
-    monkeypatch.setattr(research, "_shadow_observed_cua", _mission)
-    monkeypatch.setattr(research, "publish_open_claude_artifact", _publish)
-    monkeypatch.setattr(research, "_click_claude_artifact", _click)
-    page = _ClaudePublishPage(clipboard)
-    return asyncio.run(research.extract_share_link_claude(
-        _Browser(page), cua_client=object(), label="Claude"))
-
-
-def test_the_claude_share_mission_is_armed_before_it_starts(clipboard, monkeypatch):
-    """The arm has to sit before the MISSION, not merely before the read. A
-    line-order guard alone would accept it moved down to just above the read,
-    where it clears the very link the mission copied."""
-    _run_claude(clipboard, monkeypatch)
-    mission = clipboard.trace.index("mission")
-    assert "arm" in clipboard.trace[:mission]
-    assert clipboard.trace[mission + 1:].count("arm") == 0
-
-
-def test_a_stale_claude_link_cannot_survive_the_claude_share_mission(
-        clipboard, monkeypatch):
-    """`"claude." in clip` is the loosest shape test of the four — it is
-    satisfied by the artifact the publish step copied moments earlier on the
-    very path that brought us here."""
-    clipboard.value = _CLAUDE_STALE
-    res = _run_claude(clipboard, monkeypatch)
-    assert res.url != _CLAUDE_STALE
-    assert res.verified is False
-
-
-def test_a_link_the_claude_mission_copies_is_still_accepted(clipboard, monkeypatch):
-    fresh = "https://claude.site/artifacts/mission1-2222-3333-4444-555566667777"
-
-    async def _mission(*a, **k):
-        clipboard.trace.append("mission")
-        clipboard.copy(fresh)
-        return {"text": ""}
-
-    monkeypatch.setattr(research, "_shadow_observed_cua", _mission)
-
-    async def _publish(*a, **k):
-        return ""
-
-    async def _click(*a, **k):
-        return False
-
-    monkeypatch.setattr(research, "publish_open_claude_artifact", _publish)
-    monkeypatch.setattr(research, "_click_claude_artifact", _click)
-    clipboard.value = _CLAUDE_STALE
-    res = asyncio.run(research.extract_share_link_claude(
-        _Browser(_ClaudePublishPage(clipboard)), cua_client=object(), label="Claude"))
-    assert res.url == fresh
-    assert res.verified is True
 
 
 # ── 6. NotebookLM URL extractor — the vision fallback ───────────────────────

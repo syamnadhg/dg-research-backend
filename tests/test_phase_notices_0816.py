@@ -154,20 +154,32 @@ def test_the_audio_giveup_carries_the_notebook():
     )
 
 
-def test_only_the_give_up_emit_carries_links():
-    """⛔ THE LOAD-BEARING HALF. The frontend keys the notebook notice off link
-    presence on this event, so any other phase_skipped:3 growing a links kwarg
-    would announce a notebook for a phase that was switched off or skipped by
-    hand — the Flow-C path in particular hydrates `notebook_url` from a URL the
-    USER pasted, and telling them their notebook is ready is a lie about work
-    nobody did."""
+def test_every_emit_that_carries_links_carries_the_PHASES_OWN_list():
+    """⛔ THE LOAD-BEARING HALF, restated 2026-08-28. This asserted that exactly
+    ONE phase_skipped:3 emit carried links, and stretch 6.6C added a second: the
+    branch that fires when the notebook was built but no podcast reached Storage.
+    That branch is the give-up's twin — same state, different cause — and the
+    notebook it built is exactly the thing the user should hear about.
+
+    ⭐ The count was never the protection, and the docstring it replaced was
+    imprecise about why. The frontend's gate is `hasLink(links, /notebook/i)`
+    (phase-notice.ts) — it looks for a ROW with a notebook label and a non-empty
+    url, not for the kwarg. And `_p3_links` is built from `notebook_url` only
+    after `validate_link` accepts it, so it is EMPTY on exactly the paths where
+    there is nothing to announce. The real rule is that the kwarg must be that
+    list and never a fresh literal: a literal is how an emit would announce a
+    notebook the run never made."""
     with_links = [kw for kw in _emit_calls("phase_skipped", phase=3) if "links" in kw]
-    assert len(with_links) == 1, (
-        f"{len(with_links)} phase_skipped:3 emits carry links; only the "
-        f"{GIVE_UP} give-up may"
-    )
-    reason = with_links[0].get("reason")
-    assert isinstance(reason, ast.Constant) and reason.value == GIVE_UP
+    assert with_links, "no phase_skipped:3 emit carries links — the give-up must"
+    for kw in with_links:
+        assert getattr(kw["links"], "id", "") == "_p3_links", (
+            "a phase_skipped:3 emit may carry the phase's own validated link "
+            "list and nothing else — a literal here announces a notebook that "
+            "may never have been made"
+        )
+    reasons = {kw["reason"].value for kw in with_links
+               if isinstance(kw.get("reason"), ast.Constant)}
+    assert GIVE_UP in reasons, f"the give-up emit lost its links: {reasons}"
 
 
 def test_the_links_are_built_before_the_give_up_can_fire():

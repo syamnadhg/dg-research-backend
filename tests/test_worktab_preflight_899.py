@@ -396,9 +396,14 @@ def test_p3_login_skip_cascades_p4_and_never_fakes_complete():
     blk = src[i:i + 1400]
     assert "skipped_phases.add(4)" in blk
     assert 'emit_event("phase_skipped", phase=3' in blk
-    # the complete emit is gated on BOTH skip flags + stop
-    assert ("if (not _p3_audio_user_skipped and not _p3_login_skipped"
-            in src)
+    # The complete emit is gated on BOTH skip flags + stop.
+    # ⛔ 2026-08-28 (stretch 6.6C): the four-flag condition moved into a named
+    # `_p3_no_skip`, because a FIFTH condition joined it — the podcast itself.
+    # `phase_complete:3` used to be emitted purely on the ABSENCE of skips, so
+    # the invariant "completed, therefore there is audio" was a coincidence.
+    # Assert the flags are still ALL required, and that the artefact now is too.
+    assert "_p3_no_skip = (not _p3_audio_user_skipped and not _p3_login_skipped" in src
+    assert "if _p3_no_skip and _p3_audio_stored:" in src
 
 
 # ── phase D: the slimmed gate is a pure trust check (functional) ─────────────

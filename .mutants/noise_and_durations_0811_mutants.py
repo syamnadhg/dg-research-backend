@@ -25,46 +25,23 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 RESEARCH = "research.py"
 
+# ⛔ `tests/test_share_links_0811.py` left this list on 2026-08-28 — the file was
+# renamed to `test_phase1_status_order_0811.py` when 14 of its 15 tests went with
+# the P2 share step, and it pins nothing this harness mutates. A harness that
+# lists a file it does not need still pays for it on every one of its mutants.
 SUITES = ("tests/test_share_expectations_0811.py tests/test_phase_durations_0811.py "
-          "tests/test_share_links_0811.py tests/test_notebooklm_access_logging.py "
+          "tests/test_notebooklm_access_logging.py "
           "tests/test_nlm_access_already_public.py")
 
 MUTANTS = [
-    # ── which agents we expect a public share from ──────────────────────────
-    ("E1", "over", "Gemini is silenced — this morning's outage would have shipped quietly",
-     [('_PUBLIC_SHARE_EXPECTED = ("gemini", "claude")',
-       '_PUBLIC_SHARE_EXPECTED = ("claude",)')]),
-    ("E2", "over", "Claude is silenced",
-     [('_PUBLIC_SHARE_EXPECTED = ("gemini", "claude")',
-       '_PUBLIC_SHARE_EXPECTED = ("gemini",)')]),
-    ("E3", "over", "every agent is silenced",
-     [('_PUBLIC_SHARE_EXPECTED = ("gemini", "claude")',
-       '_PUBLIC_SHARE_EXPECTED = ()')]),
-    ("E4", "under", "ChatGPT warns again on every run",
-     [('_PUBLIC_SHARE_EXPECTED = ("gemini", "claude")',
-       '_PUBLIC_SHARE_EXPECTED = ("gemini", "claude", "chatgpt")')]),
-    ("E5", "under", "the check is case-sensitive, so a capitalised key never matches",
-     [('    return (platform or "").strip().lower() in _PUBLIC_SHARE_EXPECTED',
-       "    return platform in _PUBLIC_SHARE_EXPECTED")]),
-    ("E6", "over", "an unknown agent is treated as expecting a share",
-     [('    return (platform or "").strip().lower() in _PUBLIC_SHARE_EXPECTED',
-       '    return (platform or "").strip().lower() not in ("chatgpt",)')]),
-    ("E7", "under", "the quiet branch drops the reason, so a real breakage is undiagnosable",
-     [('                        log(f"[{name}] using the conversation URL "\n'
-       '                            f"({_elapsed_share:.1f}s) — no public share expected "\n'
-       '                            f"from this agent ({_detail})", "DEBUG")',
-       '                        log(f"[{name}] using the conversation URL "\n'
-       '                            f"({_elapsed_share:.1f}s)", "DEBUG")')]),
-    ("E8", "over", "the quiet branch warns anyway — the change accomplishes nothing",
-     [('                            f"from this agent ({_detail})", "DEBUG")',
-       '                            f"from this agent ({_detail})", "WARN")')]),
-    ("E9", "over", "the expected branch stops warning",
-     [('                            f"NOT viewable by anyone else.", "WARN")',
-       '                            f"NOT viewable by anyone else.", "DEBUG")')]),
-    ("E10", "over", "the agent is named at the log call again — the drift shape returns",
-     [("                    if _public_share_is_expected(agent_key):",
-       '                    if agent_key != "chatgpt":')]),
-
+    # ⛔ THE E-SERIES (E1-E10) LEFT ON 2026-08-28 (stretch 6.6B). Its ten
+    # mutants all anchored on `_PUBLIC_SHARE_EXPECTED` /
+    # `_public_share_is_expected` / Step 4's two log branches — the "which
+    # agents do we expect a public share from" table, removed whole with the P2
+    # platform share step. Their tests went in the same round
+    # (`test_share_expectations_0811.py` kept only its NotebookLM half). ⛔ A
+    # vanished anchor is a HARNESS FAULT, never a survivor, so they are deleted
+    # rather than left to report `anchor occurs 0x`.
     # ── notebooklm read-back vs notebooklm real failures ────────────────────
     ("N1", "under", "the primary path calls a shared notebook maybe-private again",
      [('                        log(f"NotebookLM shared; could not read the sharing state back "\n'

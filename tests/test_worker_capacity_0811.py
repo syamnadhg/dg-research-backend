@@ -80,7 +80,7 @@ def module_src() -> str:
 def code_only(src: str) -> str:
     """`src` with comments blanked out, offsets preserved.
 
-    Same helper, same reason as test_share_links_0811: this file asserts that
+    Same helper, same reason as test_phase1_status_order_0811: this file asserts that
     the heartbeat no longer reads the configured count, and the comment sitting
     directly above the fix quotes `load_worker_count()` while explaining it.
     Prose that documents a call is not the call.

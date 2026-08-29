@@ -333,12 +333,20 @@ against paid third-party services.
 |---|---|
 | `research.py` when DGOPS-9506 was filed (2026-07-28) | 54,626 |
 | at the will-not-do decision (2026-08-05) | ~58,800 |
-| **today (2026-08-25)** | **75,965** |
+| at 2026-08-25 | 75,965 |
+| **today (2026-08-28)** | **74,663** |
 | the seven sibling modules, between them | 7,119 |
 
-So the file has grown by roughly **29%** in the twenty days since the decision,
-and holds **91%** of the non-test Python in this repo. An unbounded trajectory is
-a real objection and none of the reasoning above answers it.
+So the file has grown by roughly **27%** in the twenty-three days since the
+decision, and holds **91%** of the non-test Python in this repo. An unbounded
+trajectory is a real objection and none of the reasoning above answers it.
+
+⭐ **The first fall on record: −1,302 lines on 2026-08-28**, when stretch 6.6B
+removed the P2 platform share step. It is worth writing down because it is the
+only evidence in this table that the trajectory is not one-directional — and
+because of what it took to get: 2.2 minutes and 21.7 CUA calls per run bought a
+link nothing in the pipeline gated on. The lines came out because the FEATURE
+was wrong, not because anyone set out to shrink the file.
 
 **What the rule has actually delivered.** Five sibling modules existed at the
 decision; `telemetry.py` (2026-08-18) and `logquiet.py` (2026-08-19) were both
@@ -821,16 +829,16 @@ Unified per-(op, agent) attempt tracking for retry/escalation across BE operatio
 
 > **Naming note:** these T0/T1/T2/T3 labels are the **crash-recovery escalation ladder** and are unrelated to the **interaction tier ladder** (DOM = tier-1, Vision = tier-2, CUA = tier-3 — the fallback order the pipeline uses to drive each UI hotspot). The two systems coexist; the `from_tier`/`to_tier` fields on `tier_transition` events use the *interaction* labels (`dom`, `cua`, `vision`).
 
-**Centralized emit:** `emit_tier_transition(*, phase, agent, op, from_tier, to_tier, reason)` calls `TierEscalation.record(to_tier, reason)` then fires the `tier_transition` event with the new attempt counter. The 6 wired hotspots are:
+**Centralized emit:** `emit_tier_transition(*, phase, agent, op, from_tier, to_tier, reason)` calls `TierEscalation.record(to_tier, reason)` then fires the `tier_transition` event with the new attempt counter. The 4 wired hotspots are:
 
 | research.py site | `op` | `agent` | direction |
 |------------------|------|---------|-----------|
-| `extract_share_link_chatgpt` | `p2_share_extract` | chatgpt | dom→cua |
 | `verified_paste_brief` → `cua_paste_fallback` | `brief_paste` | platform | dom→cua |
 | ChatGPT P1 activity panel | `open_activity_panel_p1` | chatgpt | dom→cua |
-| Round-robin gemini share | `p2_share_extract` | gemini | dom→cua |
 | Claude artifact panel | `open_artifact_1` | claude | dom→cua |
 | ChatGPT P2 activity panel | `open_activity_panel` | chatgpt | dom→cua |
+
+> ⛔ **Two rows left on 2026-08-28 (stretch 6.6B).** The `p2_share_extract` op — `extract_share_link_chatgpt` and the round-robin Gemini share — was the P2 platform share-link step, measured at 2.2 minutes and 21.7 CUA calls per run for a link nothing in the pipeline gated on. Phase 5 now delivers Super Research's own `/shared/doc/{id}` snapshot pages, minted from the markdown already in Firestore. The `p2_share_extract` op no longer exists.
 
 **Checkpoint enrichment:**
 - `tier_escalation_history: dict[str, dict]` — full registry of TierEscalation records, keyed by `f"{op}:{agent.lower()}"`

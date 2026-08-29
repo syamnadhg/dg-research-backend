@@ -578,45 +578,6 @@ def test_verification_is_the_triggers_own_state():
         "to be expanded inside the scope")
 
 
-def test_the_share_step_is_gated_on_verified_not_on_opened():
-    """⚠ Scoped to the gate itself. `_menu.get("opened")` legitimately appears
-    in the else-branch, so an unscoped "does the function mention verified"
-    assertion passes with the gate flipped — a mutation did exactly that."""
-    src = code_only(inspect.getsource(research.run_phase3_audio))
-    _, _, after = src.partition("_menu = await _nlm_open_audio_menu(page)")
-    gate = after.split("\n", 2)[1]
-    assert gate.strip() == 'if _menu.get("verified"):', (
-        f"the audio ⋮ path must be gated on the proof, not on the click: {gate!r}")
-
-
-def test_an_unverified_open_is_closed_before_the_fallback():
-    """⚠ Scoped to the audio-share block. A bare "Escape appears somewhere in
-    this 200-line function" assertion is satisfied by the Escape at the end of
-    the block, which fires on the happy path too — a mutation that deleted the
-    one guarding the wrong-menu branch would survive it.
-
-    Leaving a menu open is not cosmetic: an unattended overlay one stray click
-    from "Remove source" is the residue the whole fix is about.
-    """
-    src = code_only(inspect.getsource(research.run_phase3_audio))
-    _, _, block = src.partition("_menu = await _nlm_open_audio_menu(page)")
-    wrong_menu, _, _ = block.partition("await _notebook_share_fallback(_menu.get(")
-    assert 'if _menu.get("opened"):' in wrong_menu
-    _, _, after_open = wrong_menu.partition('if _menu.get("opened"):')
-    assert 'await page.keyboard.press("Escape")' in after_open, (
-        "a menu we opened by mistake must be closed before the fallback clicks "
-        "anything else")
-
-
-def test_a_missing_share_row_also_closes_the_menu_it_opened():
-    src = code_only(inspect.getsource(research.run_phase3_audio))
-    _, _, block = src.partition("_pick = await _nlm_menu_pick(page, want=")
-    branch, _, _ = block.partition("else:\n                if _menu.get(\"opened\")")
-    assert 'await page.keyboard.press("Escape")' in branch, (
-        "an open audio menu with no Share row must be closed, not abandoned")
-    assert "_notebook_share_fallback(" in branch
-
-
 # ── the off-canvas control ────────────────────────────────────────────────
 
 def test_a_control_parked_off_canvas_is_not_clicked():
@@ -854,11 +815,41 @@ def test_the_deny_list_is_the_pipelines_no_delete_constraint():
         "a card, a source or a notebook")
 
 
-def test_the_share_call_site_takes_the_deny_default():
+# ⛔⛔ FOUR TESTS LEFT THIS FILE ON 2026-08-28 (stretch 6.6C). All four pinned the
+# AUDIO SHARE step inside `run_phase3_audio` — that the ⋮ menu was gated on
+# `verified` and not on `opened`, that a wrongly-opened menu was closed before
+# the notebook-share fallback, that a menu with no Share row was closed too, and
+# that the share call site took the deny-list default. That block is gone: it
+# spent CUA calls opening a menu to read a URL its own documented fallback
+# already held, and `links.audio` and `links.notebooklm` carried the same
+# `/notebook/{id}` string on the healthy path.
+#
+# ⭐ THE CONSTRAINTS THEY GUARDED DID NOT GO WITH THEM, and that is the point of
+# this note. `_nlm_open_audio_menu` and `_nlm_menu_pick` are still live — the
+# audio DOWNLOAD is their other caller, and it is the step that produces the file
+# Phase 3 now completes on. Every test above about scoping, verification,
+# off-canvas controls, row ranking and the destructive-row deny list still runs
+# against them. What was removed is one CALLER, not the helpers or their rules.
+# The deny default is now pinned at the download call site, below.
+
+
+def test_the_download_call_site_takes_the_deny_default():
+    """⛔ THE ONE THE DENY LIST WAS ALWAYS FOR. `Delete` sits two rows below
+    `Download` in that menu (see `_NLM_MENU_DENY`'s own comment), so the caller
+    that must never pass its own list is this one — the share call site the
+    original test named was the safer of the two."""
     src = code_only(inspect.getsource(research.run_phase3_audio))
-    assert '_nlm_menu_pick(page, want=("share", "share notebook"))' in src, (
+    assert '_nlm_menu_pick(browser.page, want=("download",))' in src, (
         "the call site must not pass its own deny list — the default is the "
         "constraint, and an override is how it would get lost")
+
+
+def test_no_caller_anywhere_overrides_the_deny_list():
+    """The rule stated as a universal rather than per-call-site, so a THIRD
+    caller cannot appear with its own list."""
+    module = code_only_deep(inspect.getsource(research))
+    assert "deny=" not in module.replace(
+        "async def _nlm_menu_pick(page, want, deny=_NLM_MENU_DENY) -> dict:", "")
 
 
 # ── the acting surface ────────────────────────────────────────────────────

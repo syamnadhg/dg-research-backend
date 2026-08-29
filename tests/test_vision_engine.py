@@ -97,7 +97,10 @@ def test_system_prompt_prefers_escalation_over_edge_guess():
 def test_research_ships_per_hotspot_vision_hints():
     import research
     hints = research._HOTSPOT_VISION_HINTS
-    for hid in ("7c-p1", "7c", "7d", "p2-share"):
+    # ⛔ "p2-share" left this list on 2026-08-28 with the P2 platform share step
+    # (stretch 6.6B). The three that remain are the panel-open hotspots, which
+    # are the ones this test was written for.
+    for hid in ("7c-p1", "7c", "7d"):
         assert hid in hints, f"missing vision hint for hotspot {hid}"
         assert hints[hid].get("context_hint")
         assert isinstance(hints[hid].get("success_signals"), list)
