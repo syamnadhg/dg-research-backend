@@ -36419,11 +36419,30 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
         _why = ("0 chars" if n_chars <= 0
                 else "no research anchor (_fb_research_id missing)" if not has_anchor
                 else "Firestore document sync failed after retry — FE doc-reachable would never flip")
+        # ⛔⛔ 2026-08-29 — THE SOURCES RIDE ALONG NOW. The completion emit a few
+        # lines above carries `sourceUrls` / `sources` off the same snapshot and
+        # this one carried three keys and none of them. So an agent that gathered
+        # sources for forty minutes and then failed to hand over its text sent the
+        # UI nothing to show, and the dead-agent card was empty even DURING the
+        # run — before the reload that also loses them. Owner, 2026-08-29: "if
+        # there are sources, let the narration show the sources and stuff."
+        try:
+            _fail_snap = dict(getattr(_runtime, "agent_progress_snapshots", {}).get(agent_key, {}) or {})
+        except Exception:
+            _fail_snap = {}
+        _fail_urls = list(_fail_snap.get("source_urls", []) or [])[:_SOURCE_LIST_CAP]
         try:
             emit_event("agent_progress", phase=2, agent=agent_key,
                        status="failed",
                        progress=f"Content extraction failed — {_why} ({elapsed_sec}s)",
                        partialTextLen=max(int(n_chars), 0),
+                       sourceUrls=_fail_urls,
+                       # ⛔ THE LARGER OF THE TWO, the same way the completion emit
+                       # does it: the counter and the url list are gathered by
+                       # different readers and either can be the fuller one.
+                       sources=max(int(_fail_snap.get("sources", 0) or 0), len(_fail_urls)),
+                       searches=int(_fail_snap.get("searches", 0) or 0),
+                       observedSources=int(_fail_snap.get("observed_sources", 0) or 0),
                        elapsedSec=int(elapsed_sec or 0))
         except Exception:
             pass
@@ -57320,6 +57339,48 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
         if _astat:
             agents.setdefault(platform, {})["status"] = _astat
 
+        # ⛔⛔ 2026-08-29 — AN AGENT WITH NO REPORT PERSISTED NO SOURCES AT ALL, and
+        # the rebuild above is why: `sources` / `sourceUrls` are a regex sweep over
+        # the agent's MARKDOWN FILE, so they exist only where a report does. An
+        # agent that ran forty minutes, gathered sources and then died recorded
+        # nothing but a status — and the UI, which is now asked to show a dead
+        # agent's sources, had nothing to show after a reload.
+        #
+        # ⭐ THE DATA ALWAYS EXISTED. The live poll writes per-agent source urls
+        # and counts into `agent_progress_snapshots` on every tick, independently
+        # of any text. It was simply never persisted for the one population that
+        # needed it. Owner, 2026-08-29: "if there are sources, let the narration
+        # show the sources and stuff."
+        #
+        # ⛔ ONLY WHERE THE REBUILD DID NOT RUN. An agent WITH a report already has
+        # citation-derived sources from its own text, and those are the better
+        # list — they are what the report actually cited, not what the panel
+        # happened to show. This must never overwrite them.
+        if platform not in agents or "sources" not in agents.get(platform, {}):
+            try:
+                _fallback_snap = dict(
+                    getattr(_runtime, "agent_progress_snapshots", {}).get(platform, {}) or {})
+            except Exception:
+                _fallback_snap = {}
+            _fallback_urls = list(_fallback_snap.get("source_urls", []) or [])[:_SOURCE_LIST_CAP]
+            _fallback_searches = int(_fallback_snap.get("searches", 0) or 0)
+            _fallback_observed = int(_fallback_snap.get("observed_sources", 0) or 0)
+            # ⛔ AND ONLY WHEN THERE IS SOMETHING TO SAY. Writing a row of zeroes
+            # for an agent the user turned off upfront would invent an entry for a
+            # platform that never ran, which is the exact thing the status
+            # re-stamp above is careful not to do.
+            if _fallback_urls or _fallback_searches or _fallback_observed:
+                _entry = agents.setdefault(platform, {})
+                _entry.setdefault("sources", len(_fallback_urls))
+                _entry.setdefault("sourceUrls", _fallback_urls)
+                _entry.setdefault("searches", _fallback_searches)
+                _entry.setdefault("observedSources", _fallback_observed)
+                # ⛔ EXPLICITLY ZERO, NOT ABSENT. The frontend reads a missing
+                # `outputChars` and a zero one the same way — as "no report" — but
+                # only the explicit zero says we LOOKED. It is also what stops the
+                # sources below being mistaken for a report that was produced.
+                _entry.setdefault("outputChars", 0)
+
     # ── Phase timeline (for timeline graph) ──
     phases = meta.get("phases", [])
     # Canonical 6-phase timeline (0-5). Audio is part of NotebookLM (phase 3),
@@ -59957,15 +60018,71 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # Tile/Icon Consistency (2026-05-01): write the phase-complete
             # status to root doc so the listing-page tile + chat phase
             # icons + in-chat config icons stay green post-reload.
-            _write_phase_terminal_status(2, "complete")
-            # Per-agent terminal status. "done" → "complete"; other statuses
-            # ("failed" / "skipped" / "paused") are written at their own emit
-            # sites, don't overwrite here.
+            # ⛔⛔ 2026-08-29 — "complete" WAS UNCONDITIONAL, AND `done_count`
+            # GATED NOTHING. It was computed above and used for a log line and the
+            # resume marker; a phase in which every single agent died still wrote
+            # "complete" here, and the frontend read that as a finished phase and
+            # painted a green tick on the tile. A phase where SOME agents
+            # delivered did complete — two of three is a finished phase, and
+            # calling that "errored" would be a second lie in the other direction
+            # — so only the total wipeout is renamed.
+            if results and done_count == 0:
+                log(f"[Phase 2] 0 of {len(results)} agents produced a report — "
+                    f"recording the phase as errored, not complete", "ERROR")
+                _write_phase_terminal_status(2, "errored")
+            else:
+                # Tile/Icon Consistency (2026-05-01): write the phase-complete
+                # status to root doc so the listing-page tile + chat phase
+                # icons + in-chat config icons stay green post-reload.
+                _write_phase_terminal_status(2, "complete")
+            # Per-agent terminal status. "done" → "complete".
+            #
+            # ⛔⛔ 2026-08-29 — THIS LOOP HAD NO `else`, AND ITS COMMENT WAS WRONG.
+            # It claimed the other statuses "are written at their own emit sites".
+            # Measured, several are not: `partial` and `interrupted` (a Stop
+            # mid-round-robin), `browser_crashed` (a crash calls no `fail_agent`,
+            # so nothing persists anything), and a leftover `paused`. Those agents
+            # were left on the "running" stamped when they were OPENED — a value
+            # the frontend's status union did not even list — so a dead agent was
+            # indistinguishable from a clean success at every surface. The owner
+            # watched exactly that: a green tick over a Gemini that produced
+            # nothing.
+            #
+            # ⛔ IT DOES NOT OVERWRITE A TERMINAL STATUS SOMEBODY ELSE WROTE. The
+            # helper's own guard only protects against a transient "running"; this
+            # checks the recorded status first so an "errored" with a REASON —
+            # which `fail_agent` writes, and which the UI shows as a sentence — is
+            # never flattened into a bare "skipped" by this backstop.
+            _p2_recorded = _agent_status_by_rid.get(_fb_research_id, {}) or {}
             for _ag_name, _ag_r in results.items():
                 _ag_status = (_ag_r.get("status") or "").lower()
                 _ag_key_lc = _ag_name.lower().replace(" ", "")
                 if _ag_status in ("done", "complete", "completed", "done_partial"):
                     _write_agent_terminal_status(_ag_key_lc, "complete")
+                    continue
+                # ⛔ THE OFF-TOPIC SWEEP IS WHY THIS BRANCH CANNOT TRUST THE
+                # RECORDED VALUE BLINDLY. It runs a few lines above and flips a
+                # `done` agent to `failed` — but "complete" was already persisted
+                # when the agent finished, and nothing rewrote it. So a report we
+                # deliberately rejected as foreign-topic was reported to the user
+                # as a completed agent. `off_topic_rejected` is the marker it
+                # leaves, and it overrides a stale terminal status.
+                if _ag_r.get("off_topic_rejected"):
+                    _write_agent_terminal_status(
+                        _ag_key_lc, "errored", force=True,
+                        reason="off_topic_rejected",
+                        detail=f"{_ag_name} returned a report about a different "
+                               f"topic, so it was not used.")
+                    continue
+                if _p2_recorded.get(_ag_key_lc) in ("complete", "skipped", "errored"):
+                    continue
+                # Nothing terminal on record and no report to show for it. Grey,
+                # not red: we do not know that it FAILED, only that the run ended
+                # with nothing from it, and saying more than that is a guess.
+                _write_agent_terminal_status(
+                    _ag_key_lc, "skipped",
+                    reason="no_report_at_phase_end",
+                    detail=f"{_ag_name} finished without producing a report.")
             # Phase-2 completion marker — only on a CLEAN finish (not stop/pause).
             # Tells detect_resume_phase that P2 actually finished, so resume
             # doesn't re-run P2 mid-flight.
