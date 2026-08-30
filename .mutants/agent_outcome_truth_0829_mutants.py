@@ -154,19 +154,55 @@ MUTANTS = [
      "⛔⛔ THE PHASE IS 'complete' AGAIN even when every single agent died — "
      "`done_count` goes back to gating nothing but a log line, and the tile paints "
      "a green phase node over a Phase 2 that produced nothing at all",
-     [("            if results and done_count == 0:", "            if False:")]),
+     [("            _p2_wipeout = (done_count == 0 and (bool(results) or _p2_user_skipped))",
+       "            _p2_wipeout = False")]),
 
     ("P2", "over",
      "⛔⛔ A PHASE WHERE SOME AGENTS DELIVERED IS CALLED ERRORED. Two of three is a "
      "finished phase, and renaming it is a second lie in the other direction — "
      "the per-agent record is where a single agent's fate belongs",
-     [("            if results and done_count == 0:", "            if results and done_count < len(results):")]),
+     [("            _p2_wipeout = (done_count == 0 and (bool(results) or _p2_user_skipped))",
+       "            _p2_wipeout = (done_count < len(results))")]),
 
     ("P3", "over",
      "⛔ AN ALL-DISABLED PHASE IS REPORTED AS ERRORED. Every agent turned off in "
      "config leaves `results` empty — a phase that had nothing to do, not one that "
      "failed",
-     [("            if results and done_count == 0:", "            if done_count == 0:")]),
+     [("            _p2_wipeout = (done_count == 0 and (bool(results) or _p2_user_skipped))",
+       "            _p2_wipeout = (done_count == 0)")]),
+
+    ("P4", "over",
+     "⛔⛔ THE EVENT IS EMITTED BEFORE THE VERDICT AGAIN, so the frontend announces "
+     "'Research docs ready' — a push and an email — for a run where every agent "
+     "died. And the correction then RACES its own event: the emit hook writes the "
+     "phase status on a daemon thread and the fix writes it on another, "
+     "non-transactionally, on the same array",
+     [("                skipped=_p2_wipeout,\n", "")]),
+
+    ("P5", "under",
+     "⛔⛔ A PHASE THE USER EXPLICITLY SKIPPED IS RECORDED COMPLETE. That path leaves "
+     "`results` empty, so dropping the user-skip term lets it straight through — "
+     "after `phase_skipped` had already said otherwise",
+     [("            _p2_wipeout = (done_count == 0 and (bool(results) or _p2_user_skipped))",
+       "            _p2_wipeout = (done_count == 0 and bool(results))")]),
+
+    ("H1", "under",
+     "⛔⛔ AN AGENT THAT SALVAGED TEXT IS TOLD IT PRODUCED NOTHING, while the same "
+     "block writes that text to disk and to Firestore — the sentence is "
+     "contradicted by the report sitting in the person's documents list",
+     [('                if (_ag_r.get("text") or "").strip():', "                if False:")]),
+
+    ("H2", "under",
+     "⛔⛔ A CRASH WE WATCHED IS FLATTENED INTO THE GREY A DELIBERATE SKIP PRODUCES, "
+     "throwing away the one thing we actually know about it",
+     [('                if _ag_status in ("browser_crashed", "not_verified", "wrong_conversation"):',
+       "                if False:")]),
+
+    ("H3", "over",
+     "⛔ THE KNOWN-FAILURE COPY SPECULATES ABOUT A CAUSE THE RUN DID NOT RECORD, "
+     "which is the one thing every sentence in this file is written not to do",
+     [('        "{name}\'s tab stopped responding partway through and the run continued without it.",',
+       '        "{name} crashed because the platform was overloaded.",')]),
 
     # ══ S — the sources of a dead agent ════════════════════════════════════
 
