@@ -56996,11 +56996,14 @@ def _sweep_source_urls(md: str) -> list:
     loopback addresses and the RFC-reserved example names here, which is where the
     owner's `127.0.0.1` and `backend.example` chips came from. Two reasons it
     moved to the reader instead:
-      • THIS SIDE IS DESTRUCTIVE. A URL not written is gone; `sourceUrls` is
-        capped at 50 and never revisited. If the host list is wrong even once, a
-        real citation is lost with no way to notice. The frontend's copy of the
-        same rule is a display decision over data that stays on disk, so a
-        mistake there is visible and reversible.
+      • THIS SIDE IS DESTRUCTIVE. A URL not written is gone, and the list is
+        capped (`_SOURCE_LIST_CAP`) and never revisited. If the host list is
+        wrong even once, a real citation is lost with no way to notice. The
+        frontend's copy of the same rule is a display decision over data that
+        stays on disk, so a mistake there is visible and reversible.
+        ⛔ THE FIRST DRAFT OF THIS PARAGRAPH SAID "capped at 50". Measured
+        2026-08-30: it is 200. The argument does not depend on the number, but a
+        wrong number in a rationale is how a wrong reason becomes precedent.
       • IT WOULD NOT HAVE HELPED ANYWAY. The backend ships to the research
         computer through a pinned release, so nothing here reaches the runs
         already recorded — and those are the ones the owner was looking at.
