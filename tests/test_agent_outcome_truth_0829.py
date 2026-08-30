@@ -132,7 +132,7 @@ def test_the_sweep_still_sets_the_marker_this_reads(save_meta_src):
 # ── 3. the phase tells the truth about itself ───────────────────────────────
 
 def test_a_phase_where_every_agent_died_is_not_complete(phase2_src):
-    assert "if results and done_count == 0:" in phase2_src
+    assert "_p2_wipeout = (done_count == 0 and (bool(results) or _p2_user_skipped))" in phase2_src
     assert '_write_phase_terminal_status(2, "errored")' in phase2_src
 
 
@@ -140,17 +140,65 @@ def test_a_phase_where_some_agents_delivered_is_still_complete(phase2_src):
     """⛔ TWO OF THREE IS A FINISHED PHASE. Renaming that "errored" would be a
     second lie in the other direction — the per-agent record is where a single
     agent's fate belongs."""
-    i = phase2_src.index("if results and done_count == 0:")
-    tail = phase2_src[i:i + 900]
+    i = phase2_src.index("if _p2_wipeout:\n                _write_phase_terminal_status(2, \"errored\")")
+    tail = phase2_src[i:i + 600]
     assert '_write_phase_terminal_status(2, "complete")' in tail
     assert "else:" in tail
 
 
-def test_an_empty_results_map_is_not_an_errored_phase(phase2_src):
-    """Every agent disabled in config leaves `results` empty. That is a phase
-    that had nothing to do, not one that failed."""
-    assert "if results and done_count == 0:" in phase2_src
-    assert "if done_count == 0:" not in phase2_src
+def test_a_phase_the_user_skipped_is_not_recorded_complete(phase2_src):
+    """⛔⛔ THE USER-SKIP PATH LEAVES `results` EMPTY, so a `results and
+    done_count == 0` guard let it straight through to "complete" — a phase the
+    person explicitly skipped, recorded as finished, after `phase_skipped` had
+    already said otherwise. Found by cross-verify, not by the harness."""
+    assert "bool(results) or _p2_user_skipped" in phase2_src
+
+
+def test_the_verdict_is_decided_before_the_event_is_emitted(phase2_src):
+    """⛔⛔ THE EVENT IS WHAT THE FRONTEND TURNS INTO A NOTICE. Emitting
+    `phase_complete` and correcting the status afterwards pushed and emailed
+    "Research docs ready" for a run where every agent died — and raced its own
+    correction, because the emit hook writes the phase status on a daemon thread
+    and the fix wrote it on another. One writer, decided first."""
+    verdict = phase2_src.index("_p2_wipeout = (done_count == 0")
+    emit = phase2_src.index('emit_event("phase_complete", phase=2')
+    assert verdict < emit, "the wipeout must be decided before the event that announces it"
+
+
+def test_the_event_carries_the_marker_the_frontend_already_reads(phase2_src):
+    """`phaseProducedArtifact` in the web app is exactly `data?.skipped !== true`
+    — it exists because P3 once announced a podcast that had been skipped. A
+    phase that produced no report is the same shape and reuses the same gate
+    rather than inventing a second one."""
+    assert "skipped=_p2_wipeout," in phase2_src
+
+
+# ── 2b. the backstop does not flatten a failure we watched ──────────────────
+
+def test_an_agent_that_salvaged_text_is_not_told_it_produced_nothing(phase2_src):
+    """⛔⛔ A user STOP can leave partial text, and the SAME block writes that text
+    to disk and to Firestore. Telling the person the agent "finished without
+    producing a report" is contradicted by the report in their documents list."""
+    assert 'if (_ag_r.get("text") or "").strip():' in phase2_src
+    i = phase2_src.index('if (_ag_r.get("text") or "").strip():')
+    assert '"errored"' in phase2_src[i:i + 400]
+
+
+def test_a_crash_we_watched_is_not_flattened_into_a_user_style_skip(phase2_src):
+    """We SAW the tab die. Recording that as the same grey a deliberate Skip
+    produces throws away the one thing we know about it."""
+    assert 'if _ag_status in ("browser_crashed", "not_verified", "wrong_conversation"):' in phase2_src
+    assert "_P2_KNOWN_FAILURE_COPY" in phase2_src
+
+
+def test_the_known_failure_copy_names_what_was_seen_and_no_cause():
+    """⛔ Each sentence says what was OBSERVED. None of them names a cause the run
+    did not record — "crashed" describes the tab, not a reason."""
+    for status, copy in research._P2_KNOWN_FAILURE_COPY.items():
+        assert "{name}" in copy, status
+        low = copy.lower()
+        for forbidden in ("because", "due to", "caused by"):
+            assert forbidden not in low, f"{status} speculates: {copy}"
 
 
 # ── 4. the sources of a dead agent survive ──────────────────────────────────

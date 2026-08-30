@@ -14544,6 +14544,22 @@ def _do_agent_terminal_status_write(agent_key: str, status: str,
     _set_research_doc(_fb_uid, _fb_research_id, {"agents": {ak: _payload}}, merge=True)
 
 
+# ⛔⛔ THE THREE FAILURES WE ACTUALLY WATCHED HAPPEN, and the sentences that say
+# so. Until 2026-08-29 the Phase-2 backstop wrote a blanket "skipped" for every
+# agent with no report, which flattened a crash we OBSERVED into the same grey a
+# user's own Skip produces — throwing away the one thing we knew about it. Each
+# line says what was seen and nothing about a cause we did not record.
+_P2_KNOWN_FAILURE_COPY = {
+    "browser_crashed":
+        "{name}'s tab stopped responding partway through and the run continued without it.",
+    "not_verified":
+        "{name} never reached a research conversation we could read, so nothing was collected.",
+    "wrong_conversation":
+        "{name} ended up in a different conversation from the one this run started, "
+        "so its output was not used.",
+}
+
+
 def _write_agent_terminal_status(agent_key: str, status: str, force: bool = False,
                                  reason: str = "", detail: str = ""):
     """Persist a per-agent terminal status to the root research doc so the
@@ -60009,26 +60025,49 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     f"have text + verified=True but no in-app primary link. Emitting "
                     f"phase_complete anyway — these agents will render as unlinked. "
                     f"Investigate the in-app URL build path.", "ERROR")
+            # ⛔⛔ 2026-08-29 — THE VERDICT IS DECIDED BEFORE THE EVENT, NOT AFTER
+            # IT. The first version of this fix emitted `phase_complete` and THEN
+            # corrected the status to "errored" a few lines down, which was wrong
+            # in two ways at once. The event is what the frontend turns into a
+            # notice, so a run where every agent died still pushed and emailed
+            # "Research docs ready". And the emit's own hook writes
+            # `_write_phase_terminal_status(2, "complete")` on a daemon thread,
+            # so the correction was RACING the thing it was correcting — two
+            # non-transactional read-modify-writes on the same phases array, and
+            # the later writer wins by luck.
+            #
+            # ⭐ `skipped=True` IS THE MARKER THE FRONTEND ALREADY READS.
+            # `phaseProducedArtifact` in `phase-notice.ts` is exactly
+            # `data?.skipped !== true`, and it exists because P3 once announced a
+            # podcast that had been skipped. A phase that produced no report at
+            # all is the same shape, so it reuses the same gate rather than
+            # inventing a second one.
+            #
+            # ⛔ A PHASE WHERE SOME AGENTS DELIVERED STILL COMPLETES. Two of three
+            # is a finished phase; renaming it would be a second lie in the other
+            # direction, and the per-agent record below is where a single agent's
+            # fate belongs.
+            #
+            # ⛔ AND `_p2_user_skipped` IS INCLUDED. That path leaves `results`
+            # empty, so a `results and done_count == 0` guard let it through to
+            # "complete" — a phase the user explicitly skipped, recorded as
+            # finished, after `phase_skipped` had already said otherwise.
+            _p2_wipeout = (done_count == 0 and (bool(results) or _p2_user_skipped))
+            if _p2_wipeout:
+                log(f"[Phase 2] 0 of {len(results)} agents produced a report"
+                    f"{' (user skipped the phase)' if _p2_user_skipped else ''} — "
+                    f"recording the phase as errored, and marking the event so the "
+                    f"frontend does not announce documents nobody has", "ERROR")
             emit_event("phase_complete", phase=2, durationSec=int(time.time() - _p2_start), links=_p2_links,
                 skippedAgents=_p2_skipped_agents,
                 erroredAgents=_p2_errored_agents,
+                # ⛔ THE HOOK ON THIS EVENT WRITES THE PHASE STATUS. Passing the
+                # verdict in means one writer, not two racing daemon threads.
+                skipped=_p2_wipeout,
                 summary=f"{done_count}/{len(results)} agents completed — {total_chars:,} chars — "
                         f"{len(_p2_links)} in-app primary links")
             _update_firestore_research({"phase": 2, "links.phase2": _p2_links})
-            # Tile/Icon Consistency (2026-05-01): write the phase-complete
-            # status to root doc so the listing-page tile + chat phase
-            # icons + in-chat config icons stay green post-reload.
-            # ⛔⛔ 2026-08-29 — "complete" WAS UNCONDITIONAL, AND `done_count`
-            # GATED NOTHING. It was computed above and used for a log line and the
-            # resume marker; a phase in which every single agent died still wrote
-            # "complete" here, and the frontend read that as a finished phase and
-            # painted a green tick on the tile. A phase where SOME agents
-            # delivered did complete — two of three is a finished phase, and
-            # calling that "errored" would be a second lie in the other direction
-            # — so only the total wipeout is renamed.
-            if results and done_count == 0:
-                log(f"[Phase 2] 0 of {len(results)} agents produced a report — "
-                    f"recording the phase as errored, not complete", "ERROR")
+            if _p2_wipeout:
                 _write_phase_terminal_status(2, "errored")
             else:
                 # Tile/Icon Consistency (2026-05-01): write the phase-complete
@@ -60076,7 +60115,31 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     continue
                 if _p2_recorded.get(_ag_key_lc) in ("complete", "skipped", "errored"):
                     continue
-                # Nothing terminal on record and no report to show for it. Grey,
+                # ⛔⛔ 2026-08-29 — A BLANKET "skipped" WAS ITSELF A LIE FOR TWO OF
+                # THESE. `browser_crashed` is a failure we WATCHED happen, and
+                # flattening it into the same grey a user's own Skip produces
+                # throws away the one thing we know. And an agent interrupted by
+                # a user STOP may have salvaged text — the same block writes that
+                # text to disk and to Firestore — so telling the person it
+                # "finished without producing a report" is contradicted by the
+                # report sitting in their documents list.
+                if (_ag_r.get("text") or "").strip():
+                    # It produced something. Whatever went wrong was on the way
+                    # OUT, not on the way through — that is the errored bucket,
+                    # and the same one `_p2_errored_agents` uses above.
+                    _write_agent_terminal_status(
+                        _ag_key_lc, "errored",
+                        reason=f"incomplete_{_ag_status or 'unknown'}",
+                        detail=f"{_ag_name} produced a partial report that could not be saved.")
+                    continue
+                if _ag_status in ("browser_crashed", "not_verified", "wrong_conversation"):
+                    _write_agent_terminal_status(
+                        _ag_key_lc, "errored",
+                        reason=_ag_status,
+                        detail=_P2_KNOWN_FAILURE_COPY.get(_ag_status, "").format(name=_ag_name)
+                               or f"{_ag_name} stopped before it produced a report.")
+                    continue
+                # Nothing terminal on record, no text, and no named failure. Grey,
                 # not red: we do not know that it FAILED, only that the run ended
                 # with nothing from it, and saying more than that is a guess.
                 _write_agent_terminal_status(
