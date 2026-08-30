@@ -65,10 +65,9 @@ MUTANTS = [
      "— a value the frontend's status union did not even list",
      [('                _write_agent_terminal_status(\n'
        '                    _ag_key_lc, "skipped",\n'
-       '                    reason="no_report_at_phase_end",',
-       '                _noop = (\n'
-       '                    _ag_key_lc, "skipped",\n'
-       '                    "no_report_at_phase_end",')]),
+       '                    reason="no_report_at_phase_end",\n'
+       '                    detail=f"{_ag_name} finished without producing a report.")',
+       '                pass  # the backstop is gone')]),
 
     ("B2", "over",
      "⛔⛔ THE BACKSTOP OVERWRITES A REAL STATUS. `fail_agent` writes 'errored' "
@@ -91,10 +90,18 @@ MUTANTS = [
 
     ("B4", "over",
      "⛔ A FINISHED AGENT FALLS THROUGH TO THE BACKSTOP as well as taking the fast "
-     "path, so a completed report is re-stamped 'skipped' a line later",
+     "path, so a completed report is re-stamped 'skipped' a line later. "
+     "⚠ REWRITTEN 2026-08-29: the first version dropped only the `continue` and was "
+     "EQUIVALENT — `_p2_recorded` is a LIVE reference into `_agent_status_by_rid`, "
+     "and the status helper records synchronously BEFORE its async write, so the "
+     "guard two lines down already saw the 'complete' this same iteration had just "
+     "written. There are two defences here and removing one changes nothing; the "
+     "mutant has to take both to be the defect it describes",
      [('                    _write_agent_terminal_status(_ag_key_lc, "complete")\n'
        '                    continue',
-       '                    _write_agent_terminal_status(_ag_key_lc, "complete")')]),
+       '                    _write_agent_terminal_status(_ag_key_lc, "complete")'),
+      ("            _p2_recorded = _agent_status_by_rid.get(_fb_research_id, {}) or {}",
+       "            _p2_recorded = dict(_agent_status_by_rid.get(_fb_research_id, {}) or {})")]),
 
     ("B5", "over",
      "⛔ THE RECORDED-STATUS GUARD READS THE WRONG MAP, so it never matches and "
@@ -129,11 +136,17 @@ MUTANTS = [
        '                        reason="off_topic_rejected",')]),
 
     ("T4", "over",
-     "⛔ THE OFF-TOPIC BRANCH FALLS THROUGH INTO THE BACKSTOP, so the errored "
-     "write is immediately followed by a skipped one and the last writer wins",
+     "⛔ THE OFF-TOPIC BRANCH FALLS THROUGH INTO THE BACKSTOP, so the errored write "
+     "is immediately followed by a skipped one and the last writer wins. "
+     "⚠ REWRITTEN 2026-08-29 for the same reason as B4 — dropping the `continue` "
+     "alone was equivalent, because the live recorded-status guard below already "
+     "catches the 'errored' this branch just wrote",
      [('                               f"topic, so it was not used.")\n'
        '                    continue',
-       '                               f"topic, so it was not used.")')]),
+       '                               f"topic, so it was not used.")'),
+      ('                if _p2_recorded.get(_ag_key_lc) in ("complete", "skipped", "errored"):\n'
+       '                    continue\n',
+       '')]),
 
     # ══ P — the phase's own status ═════════════════════════════════════════
 

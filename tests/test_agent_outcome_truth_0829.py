@@ -204,6 +204,32 @@ def test_the_fallback_never_overwrites_a_real_report_s_citations(save_meta_src):
     assert '_entry.setdefault("sourceUrls", _fallback_urls)' in block
 
 
+def test_the_fallback_url_list_keeps_the_shared_cap(save_meta_src):
+    """⛔ THE CAP, ON THE SAME CEILING every other source list on the wire uses.
+    Without it a pathological run puts an unbounded array on a root document that
+    already carries three agents' worth — and this is the ONE source list that is
+    written for agents nobody is watching, so nothing would notice."""
+    i = save_meta_src.index("_fallback_urls = ")
+    assert "[:_SOURCE_LIST_CAP]" in save_meta_src[i:i + 200]
+
+
+def test_the_two_early_exits_in_the_finalize_loop_are_real(phase2_src):
+    """⛔⛔ TWO DEFENCES, AND THE HARNESS PROVED THEY ARE REDUNDANT. `_p2_recorded`
+    is a LIVE reference into `_agent_status_by_rid`, and the status helper records
+    synchronously BEFORE its async write — so the guard below already catches what
+    each `continue` prevents, and two mutants that removed a `continue` survived by
+    being equivalent rather than by finding a gap.
+
+    Redundancy is fine; SILENT redundancy is not. These are the readable defence —
+    a person reading this loop should not have to know that a dict lookup three
+    lines down is live to see why a finished agent is not re-stamped. Pinned so a
+    tidy-up that removes them has to be a deliberate one."""
+    fast = phase2_src.index('_write_agent_terminal_status(_ag_key_lc, "complete")')
+    assert "continue" in phase2_src[fast:fast + 120]
+    topic = phase2_src.index('f"topic, so it was not used.")')
+    assert "continue" in phase2_src[topic:topic + 120]
+
+
 def test_the_fallback_writes_nothing_for_an_agent_that_never_ran(save_meta_src):
     """A config-disabled platform has an empty snapshot. Writing a row of zeroes
     would invent an entry for something that never started — the exact thing the
