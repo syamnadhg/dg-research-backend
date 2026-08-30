@@ -56949,7 +56949,68 @@ _FIND_MD_LINK_RE = re.compile(r'\[([^\]]{1,200})\]\(([^)]+)\)')
 # could not reach it. Capturing greedily and letting
 # `_find_trim_trailing_punct` drop only an UNBALANCED bracket handles both
 # shapes: "(see https://x.com/a)" still yields `https://x.com/a`.
-_FIND_BARE_URL_RE = re.compile(r'https?://[^\s\]\"\'>]+')
+_FIND_BARE_URL_RE = re.compile(r'https?://[^\s\]\"\'>`]+')
+
+#: Fenced and inline code, MASKED rather than removed.
+#:
+#: ⛔⛔ THE OWNER'S SCREENSHOT, 2026-08-30: an agent card listing ninety-seven
+#: "sources" whose visible twelve were `127.0.0.1`, `localhost`,
+#: `backend.example` and a bare backtick. Cause, measured: both sweeps below run
+#: the bare-URL regex over the WHOLE markdown, so every URL inside a fenced block
+#: or inline code in a report is harvested as a citation. A report that shows you
+#: `curl http://localhost:8080/api` is teaching, not citing.
+#:
+#: ⛔⛔ MASKED, NOT STRIPPED, AND THAT IS LOAD-BEARING. `_extract_findings` locates
+#: each snippet with a LITERAL `md.find(url)` on the original text, so deleting
+#: bytes would slide every offset after the first code block and hand the user a
+#: snippet from the wrong sentence. Replacing code with spaces keeps every offset
+#: identical — the same reason the frontend's source guard blanks comments instead
+#: of removing them.
+#:
+#: ⛔ FENCES BEFORE INLINE. A fenced block can contain single backticks, and
+#: running the inline pass first would pair one of those with a later backtick and
+#: mask a span that is not code at all.
+_CODE_FENCE_RE = re.compile(r'```.*?```|~~~.*?~~~', re.DOTALL)
+_INLINE_CODE_RE = re.compile(r'`[^`\n]*`')
+
+
+def _mask_code(md: str) -> str:
+    """The markdown with every code span replaced by spaces, same length."""
+    def _blank(m):
+        return re.sub(r'[^\n]', ' ', m.group(0))
+    return _INLINE_CODE_RE.sub(_blank, _CODE_FENCE_RE.sub(_blank, md or ""))
+
+
+def _sweep_source_urls(md: str) -> list:
+    """Every URL a report actually cites — code spans masked, punctuation trimmed.
+
+    ⛔ THE TRAILING PUNCTUATION COMES OFF HERE TOO. A report that ends a sentence
+    with a citation glues the full stop to the URL, and the stored source then
+    404s while LOOKING right — which `_find_trim_trailing_punct` already calls
+    worse than dropping it. The findings half of this sweep always trimmed; the
+    `sourceUrls` half never did, so one page was stored two ways depending on
+    which side of a sentence it landed. Trimming is idempotent, so the findings
+    path is unaffected by getting it a step earlier.
+
+    ⛔⛔ AND IT DOES NOT JUDGE HOSTS, DELIBERATELY. The first draft also dropped
+    loopback addresses and the RFC-reserved example names here, which is where the
+    owner's `127.0.0.1` and `backend.example` chips came from. Two reasons it
+    moved to the reader instead:
+      • THIS SIDE IS DESTRUCTIVE. A URL not written is gone; `sourceUrls` is
+        capped at 50 and never revisited. If the host list is wrong even once, a
+        real citation is lost with no way to notice. The frontend's copy of the
+        same rule is a display decision over data that stays on disk, so a
+        mistake there is visible and reversible.
+      • IT WOULD NOT HAVE HELPED ANYWAY. The backend ships to the research
+        computer through a pinned release, so nothing here reaches the runs
+        already recorded — and those are the ones the owner was looking at.
+    What belongs on this side is EXTRACTION being correct: a URL inside a code
+    fence was never a citation, and that is fixed at the cause.
+    """
+    return [
+        _find_trim_trailing_punct(raw)
+        for raw in _FIND_BARE_URL_RE.findall(_mask_code(md))
+    ]
 #: Query keys dropped before comparing two URLs. Ported from the JS `cleanUrl`
 #: the panel scrape already applies, so a panel row and the report's own citation
 #: of the same page compare EQUAL — otherwise `?utm_source=chatgpt.com` makes one
@@ -57085,7 +57146,7 @@ def _extract_findings(md: str, source_urls: list) -> list:
     # first of those passes the http check and would have been emitted to the
     # user as a URL with a title glued to it. A redundant scan that can only make
     # the answer worse is not belt-and-braces.
-    _report = _FIND_BARE_URL_RE.findall(md)
+    _report = _sweep_source_urls(md)
     # ⛔ TWO FORMS PER SOURCE, and a test caught why one is not enough. Dedupe
     # keeps the panel's cleaner URL, but the snippet is located by a LITERAL
     # `md.find`. So when the report spells the same page differently
@@ -57282,7 +57343,7 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
             # Filter out the file header we added
             sections = [s for s in sections if s not in ("ChatGPT Deep Research", "Gemini Deep Research", "Claude Deep Research")]
             # Extract source URLs from markdown links and references
-            urls = _FIND_BARE_URL_RE.findall(content)
+            urls = _sweep_source_urls(content)
             unique_urls = list(dict.fromkeys(urls))[:_SOURCE_LIST_CAP]  # Dedupe, cap at the shared ceiling
             # Build/update agent entry. unique_urls is already capped at 50.
             existing = agents.get(platform, {})

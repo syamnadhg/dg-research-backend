@@ -238,12 +238,83 @@ class TestOrderingAndCap:
 # ── the shared bare-URL pattern ───────────────────────────────────────────────
 
 def test_one_definition_of_a_bare_url_serves_both_harvests():
-    """`save_meta` fills `sourceUrls` from the same report. Two regexes
+    """`save_meta` fills `sourceUrls` from the same report. Two harvests
     disagreeing about what a URL is would put a source in the list and not in
-    the findings — which is exactly the split this wave found."""
+    the findings — which is exactly the split this wave found.
+
+    ⭐ STRENGTHENED 2026-08-30: they used to share a REGEX and each call it
+    themselves; now they share the whole harvest, so the masking, the trimming
+    and the pattern cannot drift apart either. The old assertion counted
+    `_FIND_BARE_URL_RE.findall(` twice and would now fail on a codebase that is
+    strictly safer than the one it was written for.
+    """
     src = inspect.getsource(research)
     assert src.count("_FIND_BARE_URL_RE = re.compile(") == 1
-    assert src.count("_FIND_BARE_URL_RE.findall(") >= 2
+    assert src.count("def _sweep_source_urls(") == 1
+    # Exactly one caller of the raw regex — the shared harvest itself.
+    assert src.count("_FIND_BARE_URL_RE.findall(") == 1
+    # And both harvests go through it.
+    assert src.count("_sweep_source_urls(") >= 3
+
+
+class TestCodeIsNotACitation:
+    """⛔⛔ THE OWNER'S SCREENSHOT, 2026-08-30: an agent card listing ninety-seven
+    "sources" whose visible twelve were `127.0.0.1`, `localhost`,
+    `backend.example` and a bare backtick. Cause: both harvests swept the WHOLE
+    markdown, so a report that shows you `curl http://localhost:8080/api` had that
+    stored as a citation."""
+
+    def test_a_url_inside_a_fence_is_not_a_source(self):
+        md = _report("## X",
+                     "Real prose cites https://source.android.com/docs here.",
+                     "```bash\ncurl http://localhost:8080/api\ncurl http://127.0.0.1:3000/x\n```")
+        assert research._sweep_source_urls(md) == ["https://source.android.com/docs"]
+
+    def test_nor_one_in_inline_code(self):
+        md = _report("## X", "Point it at `https://backend.example/v1` and then "
+                             "read https://real.org/a for the rationale.")
+        assert research._sweep_source_urls(md) == ["https://real.org/a"]
+
+    def test_a_tilde_fence_counts_too(self):
+        md = _report("## X", "~~~\nhttp://127.0.0.1:9/x\n~~~\nSee https://real.org/b.")
+        assert research._sweep_source_urls(md) == ["https://real.org/b"]
+
+    def test_masking_preserves_every_offset(self):
+        """⛔⛔ MASKED, NOT STRIPPED, AND THAT IS LOAD-BEARING. `_extract_findings`
+        locates each snippet with a literal `md.find(url)`, so deleting bytes
+        would slide every offset after the first code block and hand the user a
+        snippet from the wrong sentence."""
+        md = _report("## X", "```\nhttp://127.0.0.1/x\n```", "Then https://real.org/c matters.")
+        masked = research._mask_code(md)
+        assert len(masked) == len(md)
+        assert md.find("https://real.org/c") == masked.find("https://real.org/c")
+
+    def test_a_fence_containing_a_lone_backtick_does_not_mask_prose(self):
+        """⛔ FENCES BEFORE INLINE. Running the inline pass first would pair a
+        backtick inside the fence with a later one and mask real prose."""
+        md = _report("## X", "```\necho ` http://127.0.0.1/x\n```",
+                             "Now https://real.org/d is cited in plain prose.")
+        assert "https://real.org/d" in research._sweep_source_urls(md)
+
+    def test_the_trailing_full_stop_comes_off_but_a_balanced_bracket_stays(self):
+        md = _report("## X", "Cited https://en.wikipedia.org/wiki/Mercury_(planet). "
+                             "And (see https://ok.org/a) as well.")
+        assert research._sweep_source_urls(md) == [
+            "https://en.wikipedia.org/wiki/Mercury_(planet)", "https://ok.org/a"]
+
+    def test_the_regex_no_longer_swallows_a_backtick(self):
+        """⛔ The exclusion set omitted it, so an inline-code URL kept one on its
+        tail — the chip that rendered as a lone backtick."""
+        assert research._FIND_BARE_URL_RE.findall("x `https://a.org/b` y") == ["https://a.org/b"]
+
+    def test_the_writer_does_not_judge_hosts(self):
+        """⛔⛔ DELIBERATELY NOT HERE. A URL not written is gone, `sourceUrls` is
+        capped at 50 and never revisited, and the backend reaches a running
+        machine only through a pinned release — so it could not have repaired the
+        runs the owner was looking at anyway. The frontend carries that rule,
+        where a mistake is visible and reversible."""
+        md = _report("## X", "Prose mentions https://backend.example/v1 outside code.")
+        assert research._sweep_source_urls(md) == ["https://backend.example/v1"]
 
 
 def test_neither_call_site_still_gates_findings_on_the_panel_list():
