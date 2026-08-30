@@ -171,6 +171,30 @@ MUTANTS = [
      [("            _p2_wipeout = (done_count == 0 and (bool(results) or _p2_user_skipped))",
        "            _p2_wipeout = (done_count == 0)")]),
 
+    ("R1", "over",
+     "⛔⛔ THE EMIT HOOK OVERWRITES A VERDICT IT WAS HANDED, which is what made the "
+     "FIRST repair's central claim false: passing `skipped` into the event was "
+     "supposed to make the call site the single writer, and this hook went on "
+     "writing 'complete' for every phase_complete on a daemon thread, racing it "
+     "on the same non-transactional array. P1's post-error skip has had that race "
+     "since it was written",
+     [('            if data.get("skipped") is True:', "            if False:")]),
+
+    ("R2", "over",
+     "⛔⛔ A PHASE THE USER EXPLICITLY SKIPPED IS PAINTED RED. It produced nothing "
+     "BECAUSE THEY SAID SO — a red ✕ over their own decision tells them something "
+     "went wrong when nothing did, and overwrites the honest 'skipped' the "
+     "phase_skipped emit already recorded",
+     [('_write_phase_terminal_status(2, "skipped" if _p2_user_skipped else "errored")',
+       '_write_phase_terminal_status(2, "errored")')]),
+
+    ("R3", "over",
+     "⛔ THE SALVAGE SENTENCE CLAIMS AN OUTCOME IT CANNOT KNOW — it runs BEFORE the "
+     "pass that writes that very text to disk and to Firestore, so the person is "
+     "told the report could not be saved while it appears in their documents list",
+     [('detail=f"{_ag_name} stopped before it finished. "',
+       'detail=f"{_ag_name} produced a partial report that could not be saved. "')]),
+
     ("P4", "over",
      "⛔⛔ THE EVENT IS EMITTED BEFORE THE VERDICT AGAIN, so the frontend announces "
      "'Research docs ready' — a push and an email — for a run where every agent "

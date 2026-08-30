@@ -20925,7 +20925,22 @@ def emit_event(event_type, phase=None, agent=None, **data):
     # to reflect the actual run config via persisted runtime status too.
     try:
         if event_type == "phase_complete" and isinstance(phase, int) and phase >= 0:
-            _write_phase_terminal_status(phase, "complete")
+            # ⛔⛔ 2026-08-29 — AN EVENT THAT CARRIES ITS OWN VERDICT IS NOT
+            # OVERWRITTEN HERE. A `phase_complete` marked `skipped=True` means the
+            # phase finished the loop but produced nothing, and its call site
+            # writes the honest terminal status itself. This hook used to write
+            # "complete" for it anyway, on a daemon thread, while the call site
+            # wrote "skipped" or "errored" on another — two non-transactional
+            # read-modify-writes on the same `phases` array, and the last one
+            # home won. P1's post-error skip (research.py ~59482) has had that
+            # race since it was written; P2's wipeout verdict inherited it, and I
+            # claimed in the same change that passing the marker made this one
+            # writer. It did not. This is what makes that true.
+            if data.get("skipped") is True:
+                log(f"[phase {phase}] event carries its own verdict — the call site "
+                    f"writes the terminal status, not this hook", "INFO")
+            else:
+                _write_phase_terminal_status(phase, "complete")
         elif event_type == "phase_skipped" and isinstance(phase, int) and phase >= 0:
             _write_phase_terminal_status(phase, "skipped")
         elif event_type == "agent_skipped" and agent:
@@ -60068,7 +60083,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         f"{len(_p2_links)} in-app primary links")
             _update_firestore_research({"phase": 2, "links.phase2": _p2_links})
             if _p2_wipeout:
-                _write_phase_terminal_status(2, "errored")
+                # ⛔⛔ TWO DIFFERENT WIPEOUTS, AND ONLY ONE OF THEM IS A FAULT. A
+                # phase the person explicitly skipped produced nothing BECAUSE
+                # THEY SAID SO — painting a red ✕ over their own decision is the
+                # tile telling them something went wrong when nothing did, and it
+                # overwrites the honest "skipped" the `phase_skipped` emit had
+                # already recorded. Errored is reserved for agents that ran.
+                _write_phase_terminal_status(2, "skipped" if _p2_user_skipped else "errored")
             else:
                 # Tile/Icon Consistency (2026-05-01): write the phase-complete
                 # status to root doc so the listing-page tile + chat phase
@@ -60130,7 +60151,14 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     _write_agent_terminal_status(
                         _ag_key_lc, "errored",
                         reason=f"incomplete_{_ag_status or 'unknown'}",
-                        detail=f"{_ag_name} produced a partial report that could not be saved.")
+                        # ⛔⛔ IT CANNOT SAY "could not be saved" — THIS LOOP RUNS
+                        # BEFORE THE SAVE. Twenty lines below, the heavy-persistence
+                        # pass writes exactly this text to disk and to Firestore, so
+                        # the sentence was contradicted by the report appearing in
+                        # the person's documents list. Say what is known: it stopped
+                        # early, and what survived is there.
+                        detail=f"{_ag_name} stopped before it finished. "
+                               f"What it had written is in your documents.")
                     continue
                 if _ag_status in ("browser_crashed", "not_verified", "wrong_conversation"):
                     _write_agent_terminal_status(

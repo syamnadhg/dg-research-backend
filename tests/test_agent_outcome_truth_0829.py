@@ -52,6 +52,11 @@ def phase2_src() -> str:
 
 
 @pytest.fixture(scope="module")
+def emit_src() -> str:
+    return code_only(inspect.getsource(research.emit_event))
+
+
+@pytest.fixture(scope="module")
 def save_meta_src() -> str:
     return code_only(inspect.getsource(research.save_meta))
 
@@ -133,14 +138,36 @@ def test_the_sweep_still_sets_the_marker_this_reads(save_meta_src):
 
 def test_a_phase_where_every_agent_died_is_not_complete(phase2_src):
     assert "_p2_wipeout = (done_count == 0 and (bool(results) or _p2_user_skipped))" in phase2_src
-    assert '_write_phase_terminal_status(2, "errored")' in phase2_src
+    assert '_write_phase_terminal_status(2, "skipped" if _p2_user_skipped else "errored")' in phase2_src
+
+
+def test_a_phase_the_user_skipped_is_not_painted_red(phase2_src):
+    """⛔⛔ TWO DIFFERENT WIPEOUTS, ONE OF THEM NOT A FAULT. A phase the person
+    explicitly skipped produced nothing BECAUSE THEY SAID SO; a red ✕ over their
+    own decision tells them something went wrong when nothing did — and
+    overwrites the honest "skipped" the phase_skipped emit already recorded.
+    Found by the SECOND cross-verify pass, over the first pass's repair."""
+    assert '"skipped" if _p2_user_skipped else "errored"' in phase2_src
+
+
+def test_the_emit_hook_does_not_overwrite_a_verdict_it_was_handed(emit_src):
+    """⛔⛔ THE FIRST REPAIR'S CENTRAL CLAIM WAS FALSE. Passing `skipped` into the
+    event was supposed to make the call site the single writer — but this hook
+    went on writing "complete" for every phase_complete regardless, on a daemon
+    thread, racing the call site's own write on the same non-transactional
+    array. P1's post-error skip has had that race since it was written."""
+    assert 'if data.get("skipped") is True:' in emit_src
+    i = emit_src.index('if data.get("skipped") is True:')
+    tail = emit_src[i:i + 500]
+    assert '_write_phase_terminal_status(phase, "complete")' in tail
+    assert "else:" in tail
 
 
 def test_a_phase_where_some_agents_delivered_is_still_complete(phase2_src):
     """⛔ TWO OF THREE IS A FINISHED PHASE. Renaming that "errored" would be a
     second lie in the other direction — the per-agent record is where a single
     agent's fate belongs."""
-    i = phase2_src.index("if _p2_wipeout:\n                _write_phase_terminal_status(2, \"errored\")")
+    i = phase2_src.index('_write_phase_terminal_status(2, "skipped" if _p2_user_skipped else "errored")')
     tail = phase2_src[i:i + 600]
     assert '_write_phase_terminal_status(2, "complete")' in tail
     assert "else:" in tail
@@ -182,6 +209,10 @@ def test_an_agent_that_salvaged_text_is_not_told_it_produced_nothing(phase2_src)
     assert 'if (_ag_r.get("text") or "").strip():' in phase2_src
     i = phase2_src.index('if (_ag_r.get("text") or "").strip():')
     assert '"errored"' in phase2_src[i:i + 400]
+    # ⛔ AND IT NO LONGER CLAIMS AN OUTCOME IT CANNOT KNOW. It said the report
+    # "could not be saved" — twenty lines before the pass that saves it, to disk
+    # and to Firestore. Round two.
+    assert "could not be saved" not in phase2_src
 
 
 def test_a_crash_we_watched_is_not_flattened_into_a_user_style_skip(phase2_src):
