@@ -34,7 +34,14 @@ def main():
     args = ap.parse_args()
 
     if not research.init_firebase():
-        print("[ERROR] Firebase init failed — check firebase-service-account.json")
+        # ⛔ THE OLD MESSAGE NAMED A FILE THAT DOES NOT EXIST. It said "check
+        # firebase-service-account.json", and `init_firebase`'s own docstring
+        # says the opposite in as many words: "No Admin SDK; no
+        # firebase-service-account.json on disk." It is backed by the
+        # OS-keystore refresh token, so the only recovery is re-pairing.
+        print("[ERROR] Firestore init failed — this reads Firestore as the PAIRED USER "
+              "(OS-keystore refresh token, no service account). Run "
+              "`superresearch --pair` if the keystore is empty or the token was revoked.")
         sys.exit(1)
 
     uid = research.load_paired_uid()
@@ -80,7 +87,24 @@ def main():
 
     # ── Recent push_audit docs ────────────────────────────────────
     audits_ref = db.collection("users").document(uid).collection("push_audit")
-    audits = list(audits_ref.order_by("ts", direction="DESCENDING").limit(args.limit).stream())
+    # ⛔⛔ THIS READ RAISED PermissionDenied FROM THE DAY THE SCRIPT WAS WRITTEN
+    # UNTIL 2026-08-31, and nothing here said so. `push_audit` had no match
+    # block in firestore.rules — its three siblings (notifications, fcm_tokens,
+    # notify_dedup) all did — so the deny-all catch-all caught it, and this
+    # script reads as the PAIRED USER, not the Admin SDK. The collection was
+    # written by the server every delivery and readable by nothing on the
+    # machine that needed it. The rule exists now; the guard stays, because a
+    # diagnostic that dies on its own last section after printing two useful
+    # ones should say which section died and why.
+    try:
+        audits = list(audits_ref.order_by("ts", direction="DESCENDING")
+                      .limit(args.limit).stream())
+    except Exception as e:  # noqa: BLE001 — a diagnostic must not end on a traceback
+        print(f"═════ push_audit ═════\n  [ERROR] could not read the audit trail: "
+              f"{type(e).__name__}: {e}")
+        print("  If this is PermissionDenied, this deployment's firestore.rules "
+              "predates the `push_audit` match block — deploy the rules.")
+        return
     print(f"═════ push_audit (last {len(audits)}) ═════")
     if not audits:
         print("  <no audit docs — /api/notify was never called for this uid since the audit shipped>")
@@ -96,8 +120,23 @@ def main():
         ok_count = sum(1 for r in results if r.get("ok"))
         err_codes = sorted({r.get("code") for r in results if r.get("code")})
         print(f"  [{i}] {ts_str}  type={data.get('type')}")
-        print(f"      pushEnabled(master)={data.get('pushEnabled')}  channelsDecided={ch}")
-        print(f"      tokenCount={data.get('tokenCount')}  pushed={data.get('pushed')}  ok={ok_count}/{len(results)}")
+        # ⭐ ADDED 2026-08-31 WITH ITS WRITER. Three dedup verdicts and a
+        # transaction fault all clear push and email, which is byte-identical
+        # to a category the person muted — so `channelsDecided` alone cannot
+        # tell a suppression WE chose from a switch THEY turned off.
+        dedup = data.get("dedupSuppressed")
+        dedup_str = f"  dedupSuppressed={dedup}" if dedup else ""
+        print(f"      pushEnabled(master)={data.get('pushEnabled')}  "
+              f"channelsDecided={ch}{dedup_str}")
+        # ⛔ `staleCulled` WAS WRITE-ONLY. notify-deliver has persisted it since
+        # the token-culling work, and the only reader of this collection never
+        # printed it — so a fan-out that shrank because tokens were culled as
+        # stale looked identical to a user who quietly stopped registering
+        # devices. That distinction is the whole reason the field is written.
+        culled = data.get("staleCulled")
+        culled_str = f"  staleCulled={culled}" if culled else ""
+        print(f"      tokenCount={data.get('tokenCount')}{culled_str}  "
+              f"pushed={data.get('pushed')}  ok={ok_count}/{len(results)}")
         if err_codes:
             print(f"      err_codes={err_codes}")
             for r in results:
