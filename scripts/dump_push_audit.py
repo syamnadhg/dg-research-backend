@@ -81,8 +81,16 @@ def main():
         # Doc ID is the full FCM token; truncate to last 12 for safety
         tail = doc.id[-12:] if doc.id else "?"
         ua = data.get("userAgent", "")
-        last = data.get("lastUsedAt") or data.get("createdAt")
-        print(f"    [{i}] …{tail}  ua={_trunc(ua, 60)}  last={last}")
+        # ⛔ `lastUsedAt` HAS NO WRITER IN EITHER REPO — a grep across both, and
+        # `git log -S`, find it only in this script. The field the client
+        # actually refreshes on every init is `lastSeenAt` (lib/messaging.ts),
+        # and it is the field the staleness cull reads. So this line printed
+        # `createdAt` for every token and called it "last", which is the pairing
+        # date dressed as recent activity — on the one screen a person consults
+        # to ask whether a device is still listening.
+        last = data.get("lastSeenAt") or data.get("createdAt")
+        last_kind = "seen" if data.get("lastSeenAt") else "paired"
+        print(f"    [{i}] …{tail}  ua={_trunc(ua, 60)}  {last_kind}={last}")
     print()
 
     # ── Recent push_audit docs ────────────────────────────────────
@@ -104,7 +112,13 @@ def main():
               f"{type(e).__name__}: {e}")
         print("  If this is PermissionDenied, this deployment's firestore.rules "
               "predates the `push_audit` match block — deploy the rules.")
-        return
+        # ⛔ EXIT NON-ZERO. The first version of this guard printed the error and
+        # `return`ed, and `main()` is called bare — so the process exited 0 and
+        # any wrapper, CI step or `&&` chain read a failed diagnostic as a
+        # successful one. Its sibling failure (init) has always used sys.exit(1);
+        # a guard that turns a traceback into a silent success is worse than the
+        # traceback it replaced.
+        sys.exit(1)
     print(f"═════ push_audit (last {len(audits)}) ═════")
     if not audits:
         print("  <no audit docs — /api/notify was never called for this uid since the audit shipped>")
@@ -135,8 +149,16 @@ def main():
         # devices. That distinction is the whole reason the field is written.
         culled = data.get("staleCulled")
         culled_str = f"  staleCulled={culled}" if culled else ""
+        # ⛔⛔ `emailed` WAS WRITE-ONLY TOO, in this same loop, and the commit
+        # that fixed `staleCulled` for exactly this reason walked straight past
+        # it. deliverNotice writes `emailed` on every audit doc; the only reader
+        # never printed it — so "channelsDecided.email was true and no mail
+        # arrived" could not be told from "email was never asked for" without
+        # opening Firestore by hand, which is the situation this script exists
+        # to remove.
         print(f"      tokenCount={data.get('tokenCount')}{culled_str}  "
-              f"pushed={data.get('pushed')}  ok={ok_count}/{len(results)}")
+              f"pushed={data.get('pushed')}  ok={ok_count}/{len(results)}  "
+              f"emailed={data.get('emailed')}")
         if err_codes:
             print(f"      err_codes={err_codes}")
             for r in results:
