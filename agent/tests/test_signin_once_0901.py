@@ -375,6 +375,35 @@ def test_a_rollback_never_undoes_a_NEWER_claim_that_was_delivered():
     assert prefs.get_announced_signin_ms("u1") == 3_000
 
 
+def test_the_ROUTE_rollback_leaves_a_newer_delivered_claim_alone(live, monkeypatch):
+    """⛔⛔ THE FOURTH TIME I PINNED THE HELPER AND NOT THE CALLER, and mutation caught it
+    again: `test_a_rollback_never_undoes_a_NEWER_claim_that_was_delivered` calls
+    `restore_announced_signin_ms` itself and passes `expected=` by hand, so the route was
+    free to pass None and degrade the compare-and-swap back to a blind write.
+
+    This drives the ROUTE. A newer sign-in is claimed and delivered inside the window
+    between our claim and our failed send — the rollback must not touch it."""
+    base, state = live
+    state.set_signed_in({"ts": 7_000, "uid": "u1", "email": "e@x.y", "origin": None})
+
+    real = bridge.BaseHTTPRequestHandler.send_response
+
+    def boom(self, *a, **k):
+        # Another request claims a NEWER sign-in and its response goes out fine.
+        prefs.set_announced_signin_ms(9_000, "u1")
+        raise BrokenPipeError("reader vanished")
+
+    monkeypatch.setattr(bridge.BaseHTTPRequestHandler, "send_response", boom)
+    try:
+        requests.get(base + "/updates?via=agent", timeout=5)
+    except Exception:
+        pass
+    monkeypatch.setattr(bridge.BaseHTTPRequestHandler, "send_response", real)
+
+    assert prefs.get_announced_signin_ms("u1") == 9_000, (
+        "the rollback undid a newer claim that had already been delivered")
+
+
 def test_a_rollback_never_deletes_another_accounts_watermark():
     """⛔ The claim reports NO previous value when the stored mark belongs to a different
     account, so the rollback's `None` branch used to delete that account's mark outright
