@@ -303,6 +303,60 @@ def test_enqueue_cancel_payload():
     assert "/devices/dev9/queue" in calls[0]["url"]
 
 
+def test_enqueue_resume_payload():
+    """⛔⛔ THE WIRE, NOT THE CALL. The route-level tests assert what
+    enqueue_resume was CALLED with; only this one asserts what actually reaches
+    Firestore — and mutation testing found all three of these fields
+    unprotected. Each has a distinct failure mode a caller cannot see:
+
+      * no `submittedBy` → the queue create rule (submittedBy == auth.uid)
+        denies it, and chat reports "could not reach the research store";
+      * no `backendRunId` → the backend cannot find the run's folder and
+        DELETES the queue doc with a local WARN and no write-back, so the resume
+        evaporates where nobody is looking;
+      * a `config` key → the backend merges it PERMANENTLY into the run's own
+        config.json, so a resume silently rewrites the run's configuration.
+    """
+    calls = []
+
+    def fake_send(method, url, token, json_body):
+        calls.append({"method": method, "url": url, "body": json_body})
+        return _Resp(200, {"name": ".../queue/R9"})
+
+    c = FirestoreRest(lambda force=False: "tok")
+    c._send = fake_send  # type: ignore[method-assign]
+    qid = c.enqueue_resume("dev9", uid="u1", research_id="r5",
+                           backend_run_id="run-77")
+    assert qid == "R9"
+    assert "/devices/dev9/queue" in calls[0]["url"]
+    body = calls[0]["body"]["fields"]
+    assert body["action"] == {"stringValue": "resume"}
+    assert body["researchId"] == {"stringValue": "r5"}
+    assert body["backendRunId"] == {"stringValue": "run-77"}
+    # rules-pinned: must equal request.auth.uid or the create is denied
+    assert body["submittedBy"] == {"stringValue": "u1"}
+    assert body["uid"] == {"stringValue": "u1"}
+    assert "timestamp" in body and "submittedAt" in body
+    assert body["viaAgent"] == {"booleanValue": True}
+    # "" on purpose: a resumed run reads delivery prefs from delivery.json, and
+    # the signed-in address would override both the sendEmail toggle and the
+    # confirmed-recipient gate.
+    assert body["email"] == {"stringValue": ""}
+    assert "config" not in body
+
+
+def test_enqueue_resume_carries_an_explicit_email_when_given_one():
+    """The "" default is a decision, not a limitation — if a live resume is ever
+    measured to lose the report email, the caller supplies a resolved address and
+    this is the field it lands in."""
+    calls = []
+    c = FirestoreRest(lambda force=False: "tok")
+    c._send = lambda m, u, t, b: (calls.append(b) or _Resp(200, {"name": ".../q/R1"}))  # type: ignore[method-assign]
+    c.enqueue_resume("dev9", uid="u1", research_id="r5", backend_run_id="run-1",
+                     email="who@x.y")
+    assert calls[0]["fields"]["email"] == {"stringValue": "who@x.y"}
+
+
 # ── agentSessions (#790) ─────────────────────────────────────────────────────
 
 def test_upsert_agent_session_masked_merge():

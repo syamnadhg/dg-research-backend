@@ -85,8 +85,9 @@ AGENT_FLOOR = 380
 
 # The one research.py edit (the HV card's own latched verdict) is covered from
 # the root tree, which is where research.py's suites live.
-ROOT_SUITES = "tests/test_alert_intents.py tests/test_phase5_gate_migration_955.py"
-ROOT_FLOOR = 40
+ROOT_SUITES = ("tests/test_hv_intent_mirror_0831.py tests/test_alert_intents.py "
+               "tests/test_phase5_gate_migration_955.py")
+ROOT_FLOOR = 45
 
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 

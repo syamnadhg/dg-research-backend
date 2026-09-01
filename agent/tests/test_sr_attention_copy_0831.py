@@ -167,19 +167,28 @@ def test_the_cards_own_instruction_is_shown(bridge_port, capsys):
 # ── (c) naming only the verbs that work ──────────────────────────────────────
 
 def test_retry_is_refused_locally_when_the_card_has_no_retry(bridge_port, capsys):
+    """Same discrimination as the skip case: the route's own 409 body carries the
+    phrase too, so pin the local sentence."""
     from test_decision_plan_0831 import noretry_card
     _seed(card=noretry_card())
     assert sr.main(["retry", "r1"]) == 1
     out = capsys.readouterr().out
-    assert "has no Retry" in out
+    assert "“EV market” has no Retry right now." in out
+    assert "couldn’t retry" not in out, "it round-tripped instead of refusing locally"
     assert FakeFS.commands == [] and FakeFS.resumes == []
 
 
 def test_skip_is_refused_when_the_card_has_no_skip(bridge_port, capsys):
+    """⛔ ASSERT THE LOCAL FORM, NOT JUST THE WORDS. The ROUTE's 409 body also
+    contains "has no Skip", so an assertion on that phrase alone was satisfied
+    whether or not sr.py checked first — mutation testing removed the local check
+    and this test stayed green. The two outputs differ: the local refusal names
+    the run and what to do, the round-trip prefixes "✗ couldn't skip…"."""
     _seed(card=crash_login_interrupt_card())
     assert sr.main(["skip", "--run", "r1"]) == 1
     out = capsys.readouterr().out
-    assert "has no Skip" in out
+    assert "“EV market” has no Skip right now." in out
+    assert "couldn’t skip" not in out, "it round-tripped instead of refusing locally"
     assert FakeFS.commands == [] and FakeFS.updates == []
 
 
