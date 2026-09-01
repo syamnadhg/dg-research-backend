@@ -2190,9 +2190,32 @@ RAW_LOG_ROTATE_BYTES = 64 * 1024 * 1024
 # Local retention. Deliberately ~2x the bundle's signed-off 30-runs/30-days
 # bounds, so raising the bundle bound later cannot discover that the device
 # already deleted what the new bound wants.
-LOCAL_RUNS_KEEP = 60
-LOCAL_SESSIONS_KEEP = 40
+#
+# ⛔⛔ THE COUNT BOUNDS ARE DISK SAFETY VALVES, NOT A RETENTION POLICY, AND THE
+# NAMES NOW SAY SO. The old names (`LOCAL_RUNS_KEEP`) read like a promise —
+# "we keep 60 runs" — and the promise the product actually makes is the AGE one:
+# thirty days. The two were joined by `or`, so on a busy machine the count bit
+# first and the run half of a person's diagnostics died in DAYS while the cloud
+# half lived its full thirty. That is not the count being wrong; it is the count
+# being mistaken for the policy. It stays, because an unbounded directory on
+# someone's laptop is a real hazard, and it is named for what it is.
+LOCAL_RUNS_DISK_VALVE = 60
+LOCAL_SESSIONS_DISK_VALVE = 40
+# ⭐ THIS is the retention policy. Thirty days means thirty days.
 LOCAL_LOG_MAX_AGE_DAYS = 30
+# ⛔ The raw tails had NO age bound at all — only `RAW_LOG_ROTATE_BYTES`, and
+# rotation is checked at three EVENTS (supervisor boot, worker spawn, `--serve`),
+# never on a clock. Measured 2026-09-01 on this machine: backend.log 44 MB and
+# backend-2.log 40 MB, both last written 27 days earlier, both holding lines
+# older than any bound, and 187 MB of logs in total. A size cap answers "how
+# big"; it never answers "how old".
+LOCAL_TAIL_MAX_AGE_DAYS = LOCAL_LOG_MAX_AGE_DAYS
+# How often the age bound is actually ENFORCED. ⛔⛔ Before this existed the
+# 30-day rule had no trigger of its own: `_prune_local_logs` had exactly two
+# callers, arming a new run and supervisor startup. A machine that was up and
+# idle kept 45-day-old folders, and a machine that never ran another pipeline
+# kept them forever. The bound was written; the guarantee was not.
+LOCAL_PRUNE_INTERVAL_SEC = 6 * 60 * 60
 # How long a meta may claim "running" before a reader calls it a corpse. MUST
 # stay above the worker watchdog's own ACTIVE-time ceiling (5h) plus slack —
 # `test_run_dead_ceiling_clears_the_watchdog` pins the relationship, so bumping
@@ -2840,14 +2863,93 @@ def _folder_is_live(path) -> bool:
     return _derive_run_status(meta) == "running"
 
 
-def _prune_local_logs(runs_keep=LOCAL_RUNS_KEEP, sessions_keep=LOCAL_SESSIONS_KEEP,
+def _run_log_folders_for_research(research_id, root=None) -> "list[Path]":
+    """Every run-log folder this machine holds for one research, safe to delete.
+
+    ⛔⛔ MATCHED ON `meta.json`'s researchId, NEVER ON THE FOLDER NAME. The name
+    is `{safe}_{attempt}_{started}` where `safe` has already been through
+    `_RUN_FOLDER_ID_RE`, so a research whose id contains anything the pattern
+    strips does not appear in its own folder name — and a prefix match would
+    then either miss the folder or, worse, match a DIFFERENT research that
+    happens to share a sanitised prefix. Deleting somebody else's diagnostics
+    because two ids sanitise alike is the failure mode worth spending a
+    `meta.json` read per folder to avoid.
+
+    ⛔ LIVENESS IS `_prune_local_logs`'s, NOT A NEW ONE — the in-process sink
+    list PLUS `_folder_is_live`. `_clear_local_logs`'s docstring already makes
+    this argument and it holds here for the same reason: the sink list alone
+    covers only runs THIS worker armed, and the sweep runs on worker 1 while
+    worker 2 may own the live run. A third notion of "active" would reopen the
+    multi-worker hole mutation found in the prune."""
+    out: "list[Path]" = []
+    rid = str(research_id or "").strip()
+    if not rid:
+        return out
+    base = Path(root) if root is not None else _runs_log_root()
+    live = {str(s.dir) for s in _RUN_LOG_SINKS}
+    try:
+        folders = [p for p in base.iterdir() if p.is_dir()]
+    except OSError:
+        return out
+    for folder in folders:
+        if str(folder) in live or folder.parent != base:
+            continue
+        try:
+            meta = json.loads((folder / "meta.json").read_text(encoding="utf-8"))
+        except Exception:
+            # No readable meta means no attributable researchId. Left alone
+            # deliberately: the age bound is the backstop for folders nothing
+            # can identify, and guessing from the name is the thing above.
+            continue
+        if str(meta.get("researchId") or "").strip() != rid:
+            continue
+        if _folder_is_live(folder):
+            continue
+        out.append(folder)
+    return out
+
+
+_prune_next_ms = 0
+
+
+def _prune_due(now_ms=None) -> bool:
+    """Is the standing retention sweep due? Advances the clock when it says yes.
+
+    ⛔ THE STATE CHANGE IS THE POINT, and it belongs here rather than at the call
+    site: the caller is inside the 5-second heartbeat, so a predicate that only
+    READ the deadline would run the sweep twelve times a minute forever. Same
+    shape as `_publish_run_log_index`'s own self-throttle, deliberately, so
+    there is one idiom for "standing work on the heartbeat" and not two.
+
+    ⭐ Starts due. `_prune_next_ms` is 0 at import, so the first heartbeat after
+    a boot sweeps — which is what makes a machine that has been off for two
+    months clean itself up on the way back rather than on its next run."""
+    global _prune_next_ms
+    stamp = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    if stamp < _prune_next_ms:
+        return False
+    _prune_next_ms = stamp + int(LOCAL_PRUNE_INTERVAL_SEC) * 1000
+    return True
+
+
+def _prune_local_logs(runs_keep=LOCAL_RUNS_DISK_VALVE,
+                      sessions_keep=LOCAL_SESSIONS_DISK_VALVE,
                       max_age_days=LOCAL_LOG_MAX_AGE_DAYS, now=None) -> "list[str]":
     """Keep the per-run/per-session capture bounded. Returns what it removed.
 
     ⛔ Without this the capture is a SECOND unbounded copy of a stream that has
     no rotation anywhere — on a product measured at 44 MB of backend.log in 16
     days. Bounds are ~2x the bundle's 30/30, so raising the bundle bound later
-    never finds the device already deleted what the new bound wants."""
+    never finds the device already deleted what the new bound wants.
+
+    ⛔ THE COUNT BOUNDS ARE VALVES; THE AGE BOUND IS THE POLICY. They are joined
+    by `or`, so on a busy machine the count fires first and the run half of a
+    person's diagnostics dies in days while the cloud half lives its full thirty.
+    That asymmetry is why the constants are now named `*_DISK_VALVE`.
+
+    ⛔ AND IT COVERS THE RAW TAILS NOW. They had no age bound of any kind — only
+    a byte cap checked at three events — so the largest files on the disk were
+    the only ones nothing could ever age out."""
     removed: "list[str]" = []
     now_t = time.time() if now is None else float(now)
     cutoff = now_t - float(max_age_days) * 86400.0
@@ -2890,6 +2992,14 @@ def _prune_local_logs(runs_keep=LOCAL_RUNS_KEEP, sessions_keep=LOCAL_SESSIONS_KE
                     removed.append(str(path))
                 except OSError:
                     pass
+
+    # ⛔ THE THIRD SOURCE, AND IT WAS NEVER HERE. `_clear_local_logs` names the
+    # collector's three sources — runs, sessions and the raw tails — and this
+    # prune only ever walked the first two. The rolled tails are the half that
+    # is safe to remove on a timer; the live half is rolled at reopen time by
+    # `_rotate_if_stale`, because renaming a file the supervisor holds open in
+    # append mode strands every subsequent write in an unnamed inode.
+    removed.extend(_retire_stale_rotations(max_age_days=max_age_days, now=now_t))
     return removed
 
 
@@ -3174,6 +3284,129 @@ def _close_session_tees() -> None:
     _SESSION_TEES.clear()
 
 
+def _raw_tail_marker(path) -> "Path":
+    """Where the current generation of a raw tail records when it began."""
+    p = Path(path)
+    return p.with_name(p.name + ".since")
+
+
+def _raw_tail_started_at(path, now=None) -> float:
+    """When the CURRENT generation of this raw tail started accepting lines.
+
+    ⛔ mtime cannot answer this: it moves on every append, so a file holding
+    lines from four months ago looks like it was created a second ago. The
+    marker is the only portable answer — `st_birthtime` exists on macOS and not
+    on Linux, and a rotated-in-place file's birth time is the rename's, not the
+    content's.
+
+    Seeds the marker when it is missing (first run after upgrade) using
+    `st_birthtime` where the platform offers it and the clock otherwise, so the
+    bound becomes exact within one age window instead of firing immediately on
+    a file whose real age nobody recorded. Deleting a whole tail on the strength
+    of a guess is the one outcome worse than keeping it too long."""
+    now_t = time.time() if now is None else float(now)
+    marker = _raw_tail_marker(path)
+    try:
+        return float(marker.read_text(encoding="utf-8").strip())
+    except Exception:
+        pass
+    seeded = now_t
+    try:
+        st = Path(path).stat()
+        birth = getattr(st, "st_birthtime", None)
+        if birth and float(birth) <= now_t:
+            seeded = float(birth)
+    except OSError:
+        pass
+    try:
+        marker.write_text(f"{seeded:.0f}", encoding="utf-8")
+    except OSError:
+        pass
+    return seeded
+
+
+def _begin_raw_tail_generation(path, now=None) -> None:
+    """Restart the age clock for a tail that has just been rolled or created."""
+    try:
+        _raw_tail_marker(path).write_text(
+            f"{time.time() if now is None else float(now):.0f}", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _retire_stale_rotations(root=None, max_age_days=LOCAL_TAIL_MAX_AGE_DAYS,
+                            now=None) -> "list[str]":
+    """Delete rolled-over raw tails (`*.log.1`) once they pass the age bound.
+
+    ⭐ SAFE FROM A TIMER, and its live sibling is not — which is the whole reason
+    the two halves of the tail bound are enforced in different places. Nothing
+    holds a `.1` open: it stopped receiving writes at the moment it was renamed.
+    The LIVE file is held open in append mode by the supervisor (`open(..., "ab")`
+    in `_spawn_worker`), so renaming it from a background tick would leave every
+    process still writing into the rolled-out inode — the same hazard
+    `_clear_local_logs` documents as the reason it truncates instead of
+    unlinking. So the live half is enforced at the points the file is reopened
+    anyway; see `_rotate_if_stale`."""
+    removed: "list[str]" = []
+    now_t = time.time() if now is None else float(now)
+    cutoff = now_t - float(max_age_days) * 86400.0
+    base = Path(root) if root is not None else _logs_root()
+    try:
+        rolled = [p for p in base.iterdir() if p.is_file() and p.name.endswith(".log.1")]
+    except OSError:
+        return removed
+    for path in rolled:
+        if _safe_mtime(path) >= cutoff:
+            continue
+        try:
+            path.unlink()
+            removed.append(str(path))
+        except OSError:
+            pass
+    return removed
+
+
+def _rotate_if_stale(path, max_age_days=LOCAL_TAIL_MAX_AGE_DAYS, now=None,
+                     audit=None) -> float:
+    """Roll one raw log to `.1` once its CURRENT generation passes the age bound.
+
+    Returns the age rolled, or 0.0 for "left alone".
+
+    ⛔⛔ CALLED ONLY WHERE `_rotate_if_oversize` IS CALLED — supervisor boot and
+    worker spawn — and never from a clock, for the reason in
+    `_retire_stale_rotations`: those are the three points where the file is about
+    to be (re)opened, so a rename there cannot strand a live append handle.
+
+    ⚠ AND THAT IS AN HONEST LIMIT, NOT A COMPLETE ONE. A supervisor that runs
+    unbroken for longer than the bound keeps its current generation until it next
+    restarts, so the guarantee is "no rolled tail outlives the bound, and no live
+    tail outlives it across a restart" — not "no line anywhere is ever older".
+    Reaching the stronger promise means truncating a file somebody is appending
+    to, which throws away the newest lines to satisfy a rule about the oldest."""
+    started = _raw_tail_started_at(path, now=now)
+    now_t = time.time() if now is None else float(now)
+    age = now_t - started
+    if age <= float(max_age_days) * 86400.0:
+        return 0.0
+    p = Path(path)
+    keep = p.with_name(p.name + ".1")
+    try:
+        if not p.exists():
+            return 0.0
+        if keep.exists():
+            keep.unlink()
+        os.replace(str(p), str(keep))
+    except OSError as exc:
+        if audit is not None:
+            try:
+                audit(f"age rotation skipped for {p.name}: {exc}")
+            except Exception:
+                pass
+        return 0.0
+    _begin_raw_tail_generation(p, now=now_t)
+    return float(age)
+
+
 def _rotate_if_oversize(path, max_bytes=RAW_LOG_ROTATE_BYTES, audit=None) -> int:
     """Roll one raw log to `.1` once it passes `max_bytes`. Returns the rolled
     size, or 0 for "left alone".
@@ -3194,6 +3427,11 @@ def _rotate_if_oversize(path, max_bytes=RAW_LOG_ROTATE_BYTES, audit=None) -> int
         if keep.exists():
             keep.unlink()
         os.replace(str(p), str(keep))
+        # ⛔ A SIZE ROLL RESTARTS THE AGE CLOCK TOO. Without this the marker
+        # keeps describing a generation that no longer exists, and the next
+        # age check rolls a file that is minutes old because the number beside
+        # it is thirty days.
+        _begin_raw_tail_generation(p)
         return int(size)
     except OSError as exc:
         # Windows refuses to rename a file another handle still holds open.
@@ -7025,6 +7263,32 @@ async def _heartbeat_loop():
                 except Exception as _ri_err:
                     log(f"[heartbeat] run-index publish skipped ({_ri_err})", "DEBUG")
 
+                # ⛔⛔ THE 30-DAY RULE FINALLY HAS A CLOCK. Until now
+                # `_prune_local_logs` had exactly two callers — arming a run and
+                # supervisor startup — so the age bound only ever fired as a
+                # side effect of the machine being USED. A device that was up and
+                # idle kept 45-day-old folders; one that never ran another
+                # pipeline kept them until it was next restarted, which on a
+                # long-lived install is never. The bound was written and the
+                # guarantee was not, and "thirty days means thirty days" is a
+                # guarantee.
+                #
+                # ⭐ HERE for the same three reasons the run-index publish is:
+                # this loop is worker-1 only (one pruner, no two workers racing
+                # to rmtree the same folder), it is already the machine's
+                # standing tick, and the work is a directory walk that must not
+                # sit on a pipeline task. Six-hourly, in a thread, and it skips
+                # anything a sink still owns or whose meta still reads running.
+                try:
+                    if _prune_due(_now_ms):
+                        _pruned = await asyncio.wait_for(
+                            asyncio.to_thread(_prune_local_logs), timeout=30.0)
+                        if _pruned:
+                            log(f"[heartbeat] retention swept {len(_pruned)} item(s) "
+                                f"past {LOCAL_LOG_MAX_AGE_DAYS} days", "INFO")
+                except Exception as _pr_err:
+                    log(f"[heartbeat] retention sweep skipped ({_pr_err})", "DEBUG")
+
                 # One-shot: report the outcome of an app-driven update that ran while
                 # this backend was down. Deliberately here rather than at boot — the
                 # heartbeat write above just proved Firestore is reachable, and this
@@ -10299,7 +10563,9 @@ _INDEX_PRIVATE_KEYS = ("dir", "submitterUid", "submitterSource")
 # today is unattributed, so on day one this list is empty for everyone — which is
 # the accepted consequence of not backfilling, and why `--send-logs --select` at
 # the terminal shows the owner every run regardless.
-RUN_INDEX_MAX = LOCAL_RUNS_KEEP
+# Never advertise more runs than the disk valve will keep — an index row for a
+# folder the valve has already removed is a promise the bundle cannot honour.
+RUN_INDEX_MAX = LOCAL_RUNS_DISK_VALVE
 RUN_INDEX_PUBLISH_INTERVAL_MS = 60_000
 _run_index_published: "dict[str, str]" = {}
 _run_index_next_ms = 0
@@ -62655,6 +62921,7 @@ async def run_server(port=8000):
                     continue
                 now_ts_inner = time.time()
                 swept_n = 0
+                logs_n = 0
                 for d in queues_root.iterdir():
                     if not d.is_dir():
                         continue
@@ -62701,8 +62968,40 @@ async def run_server(port=8000):
                         log(f"[orphan-sweep] rmtree {d.name} failed: {_e}", "WARN")
                         continue
                     swept_n += 1
+                    # ⛔⛔ AND NOW THE LOG FOLDER, WHICH THIS SWEEP HAS NEVER
+                    # TOUCHED. Deleting a run in the app cascaded its cloud
+                    # copy within ~5 minutes and left the machine's diagnostics
+                    # for that same run sitting on disk until a count or age
+                    # bound happened to reach them — on a quiet machine, for a
+                    # month. "Delete this research" is supposed to leave no
+                    # trace, and the trace it left was the verbose half.
+                    #
+                    # ⭐ KEYED OFF owner.json, WHICH IS WHY IT LIVES INSIDE THIS
+                    # BRANCH rather than in a pass of its own over runs/. A run
+                    # folder's meta.json carries a researchId and NO uid —
+                    # measured on this machine: five of six metas have neither
+                    # submitterUid nor claimedBy — so a folder alone cannot be
+                    # checked against Firestore at all. The queue directory is
+                    # the only place the two halves of the key sit together.
+                    #
+                    # ⚠ THE HONEST LIMIT: a run whose queue directory is already
+                    # gone (the 7-day stale sweep took it, or a clear) cannot be
+                    # attributed, so its log folder waits for the age bound.
+                    # That backstop is real and now has a clock of its own; this
+                    # closes the case where the person is watching.
+                    try:
+                        for _lf in _run_log_folders_for_research(rid):
+                            try:
+                                _shutil.rmtree(_lf)
+                                logs_n += 1
+                            except Exception as _le:
+                                log(f"[orphan-sweep] rmtree logs {_lf.name} failed: {_le}", "WARN")
+                    except Exception as _lo:
+                        log(f"[orphan-sweep] log-folder sweep failed for {rid}: {_lo}", "WARN")
                 if swept_n:
                     log(f"[orphan-sweep] purged {swept_n} orphan(s) (Firestore research doc missing)", "INFO")
+                if logs_n:
+                    log(f"[orphan-sweep] removed {logs_n} run log folder(s) for deleted research", "INFO")
             except asyncio.CancelledError:
                 return
             except Exception as _e:
@@ -69464,6 +69763,11 @@ def run_daemon_loop(port: int = 8000):
     # Silent here by necessity: `_sup_audit` does not exist yet and `log()`
     # crashes under pythonw until the tee is in place, so the sizes are held
     # and audited a few lines below.
+    # ⛔ AGE BEFORE SIZE, at every point the tail is about to be reopened. A
+    # file under the byte cap can still be four months old; the size check alone
+    # is why backend.log sat at 44 MB holding lines from May.
+    _aged_out = _rotate_if_stale(_serve_log)
+    _aged_err = _rotate_if_stale(_serve_err)
     _rotated_out = _rotate_if_oversize(_serve_log)
     _rotated_err = _rotate_if_oversize(_serve_err)
 
@@ -69508,6 +69812,13 @@ def run_daemon_loop(port: int = 8000):
                                ("backend.err.log", _rotated_err)):
             if _rolled:
                 _sup_audit(f"rotated {_name} at {_rolled} bytes → {_name}.1")
+        # ⛔ SAID SEPARATELY FROM THE SIZE ROLL, because they mean different
+        # things to whoever reads this line in a support bundle: one says the
+        # machine is noisy, the other says the machine was quiet for a month.
+        for _name, _aged in (("backend.log", _aged_out),
+                             ("backend.err.log", _aged_err)):
+            if _aged:
+                _sup_audit(f"rotated {_name} at {_aged / 86400.0:.0f} days old → {_name}.1")
         for _stale in _prune_local_logs():
             _sup_audit(f"pruned local log capture: {Path(_stale).name}")
     except Exception:
@@ -69708,6 +70019,8 @@ def run_daemon_loop(port: int = 8000):
             # log it and try anyway (uvicorn will surface EADDRINUSE).
             if not _wait_for_port_free(w_port, max_wait_s=10.0):
                 log(f"[daemon-loop] worker {k}: port {w_port} still in use after 10s — spawning anyway", "WARN")
+            _rotate_if_stale(log_out_path, audit=_sup_audit)
+            _rotate_if_stale(log_err_path, audit=_sup_audit)
             _rotate_if_oversize(log_out_path, audit=_sup_audit)
             _rotate_if_oversize(log_err_path, audit=_sup_audit)
             try:
@@ -70047,6 +70360,8 @@ def run_daemon_loop(port: int = 8000):
             # to 1, so this loop — not the multi-worker branch — is where the
             # default install lives. It also re-opens on every respawn, which
             # makes rotation per-respawn for free.
+            _rotate_if_stale(_serve_log, audit=_sup_audit)
+            _rotate_if_stale(_serve_err, audit=_sup_audit)
             _rotate_if_oversize(_serve_log, audit=_sup_audit)
             _rotate_if_oversize(_serve_err, audit=_sup_audit)
             with open(_serve_log, "ab") as _out, open(_serve_err, "ab") as _err:
