@@ -246,14 +246,60 @@ def test_the_legacy_branch_still_fixes_the_api_key_case():
     assert "API key" in sr._attention_lines(row)[-1]
 
 
+def test_a_healthy_run_is_not_told_it_has_no_retry(bridge_port, capsys):
+    """⛔⛔ A REGRESSION THE PRE-FLIGHT INTRODUCED, found by cross-verify. A run
+    with no blocker also carries an empty offers list — and that means "there is
+    no card", not "this card has no Retry". Refusing on it told somebody whose
+    run was streaming along fine that it had no Retry and they should open the
+    app: a problem invented out of nothing. The bridge already has the right
+    sentence for this state, so the request must go through and relay it."""
+    _seed(status="ongoing")  # no card
+    assert sr.main(["retry", "r1"]) == 1
+    out = capsys.readouterr().out
+    assert "has no Retry" not in out
+    assert "isn't waiting on a decision" in out
+    assert FakeFS.commands == [] and FakeFS.resumes == []
+
+
+def test_a_healthy_run_is_not_told_it_has_no_skip(bridge_port, capsys):
+    _seed(status="ongoing")
+    assert sr.main(["skip", "--run", "r1"]) == 1
+    out = capsys.readouterr().out
+    assert "has no Skip right now" not in out
+    assert "isn't waiting on a decision" in out
+    assert FakeFS.commands == [] and FakeFS.updates == []
+
+
+def test_the_healthy_run_guard_does_not_swallow_a_real_refusal(bridge_port, capsys):
+    """The over-correction guard: a genuinely blocked card must still refuse
+    locally. A guard that returned None for everything would pass the two tests
+    above and undo the whole phantom-skip fix."""
+    _seed(card=crash_login_interrupt_card())
+    assert sr.main(["skip", "--run", "r1"]) == 1
+    assert "has no Skip right now" in capsys.readouterr().out
+
+
+def test_the_guard_reads_needs_attention_not_the_offers_list():
+    """A blocked run whose card offers neither verb still refuses — the guard is
+    about whether a card EXISTS, not about what it holds."""
+    blocked_neither = {"title": "x", "needsAttention": True, "attentionOffers": []}
+    assert sr._refuse_if_not_offered(blocked_neither, "retry") is not None
+    unblocked = {"title": "x", "attentionOffers": []}
+    assert sr._refuse_if_not_offered(unblocked, "retry") is None
+
+
 def test_absent_offers_is_not_empty_offers():
     """⛔⛔ THE LOAD-BEARING SKEW RULE. ABSENT means "an older bridge, assume
     both". PRESENT-AND-EMPTY means "neither works". A script that conflates them
     refuses every action against an older bridge and goes silent."""
-    assert sr._refuse_if_not_offered({"title": "x"}, "retry") is None
-    assert sr._refuse_if_not_offered({"title": "x", "attentionOffers": []},
+    # ⚠ Every row here is BLOCKED. The skew rule is about what a blocked run's
+    # card offers; an unblocked run's empty list means "no card" and is covered
+    # by test_the_guard_reads_needs_attention_not_the_offers_list.
+    blocked = {"title": "x", "needsAttention": True}
+    assert sr._refuse_if_not_offered({**blocked}, "retry") is None
+    assert sr._refuse_if_not_offered({**blocked, "attentionOffers": []},
                                      "retry") is not None
-    assert sr._refuse_if_not_offered({"title": "x", "attentionOffers": ["retry"]},
+    assert sr._refuse_if_not_offered({**blocked, "attentionOffers": ["retry"]},
                                      "retry") is None
 
 

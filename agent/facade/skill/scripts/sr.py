@@ -425,6 +425,17 @@ def _refuse_if_not_offered(run: dict, verb: str) -> list[str] | None:
     ahead. ⛔ ABSENT `attentionOffers` MEANS AN OLDER BRIDGE, NOT "NEITHER".
     Conflating the two makes a current script refuse everything against an older
     bridge, so the check is `is None`, never falsiness."""
+    # ⛔⛔ A RUN WITH NO BLOCKER AT ALL ALSO CARRIES AN EMPTY OFFERS LIST, and it
+    # means something completely different: not "this card has no Retry" but
+    # "there is no card". Refusing here told somebody whose run was streaming
+    # along fine that it had no Retry and they should open the app — inventing a
+    # problem. The bridge already has the right sentence for that state
+    # ("nothing to resolve — this run isn't waiting on a decision"), so let the
+    # request through and relay it. ⛔ The fix is HERE and not on the wire: the
+    # absent-vs-empty distinction `attentionOffers` carries is load-bearing for
+    # version skew, and making it None for an unblocked run would collapse it.
+    if not run.get("needsAttention"):
+        return None
     offers = run.get("attentionOffers")
     if offers is None or verb in offers:
         return None

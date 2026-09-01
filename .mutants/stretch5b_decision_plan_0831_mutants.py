@@ -114,12 +114,26 @@ MUTANTS = [
      [('        if pd.get("envErrors"):\n            return "env_missing_key"',
        '        if pd.get("envErrors") or pd.get("agent"):\n            return "env_missing_key"')]),
 
-    ("A3", BRIDGE, "over",
-     "⛔ THE ORDER FLIPS. The work-tab test runs first, so an env card that "
-     "happened to carry an agent key takes the sign-in branch — the same lie, "
-     "reached by precedence rather than by predicate",
-     [('        if pd.get("envErrors"):\n            return "env_missing_key"\n',
-       '')]),
+    # ⛔⛔ A3 WAS THE SAME MUTANT AS A1 AND ITS KILL WAS INFLATING THE SCORE.
+    # Cross-verify measured it: deleting the envErrors branch and replacing its
+    # test with `if False` produce byte-identical behaviour, so 44 mutants were
+    # measuring 43 behaviours. Replaced with a defect at the OTHER end of the
+    # same fix — the classification stays right and the SENTENCE lies, which is
+    # the half a person actually reads. (A genuine reorder cannot be written
+    # here: no production writer emits an env card carrying an `agent`, so
+    # swapping the two tests is equivalent too, and an equivalent mutant is a
+    # harness bug rather than coverage.)
+    ("A3", BRIDGE, "under",
+     "⛔⛔ THE CARD IS CLASSIFIED CORRECTLY AND THE SENTENCE STILL SAYS 'SIGN "
+     "IN'. A half-fix that lands the plumbing and reverts the copy — and the copy "
+     "is the entire thing the person reads, so the owner's first ask is undone "
+     "with every test of the classifier still green",
+     [('    if card == "env_missing_key":\n'
+       '        return (f"Add an Anthropic API key on {M} (Account → API Config), then reply "\n'
+       '                "“retry”. Reply “skip” to carry on without one.")',
+       '    if card == "env_missing_key":\n'
+       '        return (f"Sign in to {P} in the browser open on {M}, then reply “retry”. "\n'
+       '                "Reply “skip” to skip the sign-in check.")')]),
 
     ("A4", BRIDGE, "over",
      "⛔ A JSON `true` PHASE SATISFIES `phase >= 1` (bool is an int subclass), so "
@@ -230,11 +244,26 @@ MUTANTS = [
      [('            "backendRunId": backend_run_id,\n', '')]),
 
     # ══ C — the skip that does not exist ════════════════════════════════════
+    # ⛔ REWRITTEN after cross-verify: the first version's rationale was WRONG
+    # about what it mutated. `if have and (scan(True) or scan(False))` changes
+    # nothing for the browser-launch card, because that card's `[retry_phase]`
+    # makes scan(True) truthy — it only fired when BOTH scans were empty. The
+    # mutation below is the one that actually restores the hidden Stop.
     ("C1", BRIDGE, "over",
-     "⛔⛔ THE PHANTOM COMES BACK, AND WITH IT THE HIDDEN STOP. A card that "
-     "offers no matching verb is given the generic fallback anyway — on the "
-     "browser-launch failure card that is a skip whose gate TERMINATES THE "
-     "PIPELINE, reported to the person as 'Skipping the current blocker'",
+     "⛔⛔ THE PHANTOM SKIP COMES BACK, AND WITH IT THE HIDDEN STOP. Any card "
+     "lacking a skip is handed a generic skip_phase — and on the phase-0 "
+     "browser-launch card that command reaches a gate which TERMINATES THE "
+     "PIPELINE for anything that is not 'retry', reported to the person as "
+     "'Skipping the current blocker'",
+     [('    if have:\n        return scan(True), scan(False)',
+       '    if have:\n        return scan(True), (scan(False) or _cmd_spec(\n'
+       '            {"action": "skip_phase", **_ph(pd.get("phase"))}, "move past this step"))')]),
+
+    ("C10", BRIDGE, "over",
+     "⛔ A CARD THAT OFFERS NEITHER VERB IS HANDED BOTH. This is what the first "
+     "C1 actually did, kept as its own mutant with an honest rationale: the "
+     "no-actions compatibility shim fires for a card that HAS actions and matches "
+     "none of them — chat_mode's continue/stop, for instance",
      [('    if have:\n        return scan(True), scan(False)',
        '    if have and (scan(True) or scan(False)):\n        return scan(True), scan(False)')]),
 
@@ -348,6 +377,20 @@ MUTANTS = [
      "stop working rather than start telling the truth",
      [('    if offers is None or verb in offers:\n        return None',
        '    if offers and verb in offers:\n        return None')]),
+
+    ("E12", SR, "over",
+     "⛔⛔ A RUN WITH NO BLOCKER IS TOLD IT HAS NO RETRY. An unblocked run also "
+     "carries an empty offers list, and it means 'there is no card' rather than "
+     "'this card has no Retry' — so somebody whose run was streaming along fine "
+     "is told to open the app about a problem that does not exist",
+     [('    if not run.get("needsAttention"):\n        return None\n', '')]),
+
+    ("E13", SR, "under",
+     "⛔ THE OVER-CORRECTION OF E12: the guard swallows EVERY refusal, so the "
+     "phantom skip is offered again on cards that have none — including the one "
+     "whose skip ends the run",
+     [('    if not run.get("needsAttention"):\n        return None\n',
+       '    return None\n')]),
 
     ("E4", SR, "under",
      "the local refusal goes, so chat posts the request anyway — harmless at the "
