@@ -2363,9 +2363,28 @@ def _advance_remote_flow(state: BridgeState) -> str | None:
         # One-shot event for the chat watchdog: announce the moment approval is
         # captured (delivered + cleared by a single /updates read; the FE/poll never
         # sees the token). ``origin`` scopes delivery to the chat that started sign-in.
-        origin = flow.origin if isinstance(flow.origin, dict) else None
+        # ⛔ THE ORIGIN IS CLEANED HERE, AND IT WAS STORED RAW. `_clean_origin` was
+        # applied at the /pending ownership guard and nowhere else — so a HALF-FORMED
+        # origin ({"platform": "telegram"} with no chat_id, which any client can post)
+        # became a note that is neither ADDRESSED nor UNADDRESSED: the delivery gate
+        # refuses it to a scoped reader (no chat_id to match) AND to an unscoped one
+        # (`ev_origin` is truthy), so every reader takes it, fails the gate, and parks
+        # it again — a dead letter, forever, and the re-mint that would recover a lost
+        # announce never runs either because the note is still there. Cleaning at the
+        # mint makes an unusable half-origin mean what `_same_origin` already treats it
+        # as: anonymous.
+        origin = _clean_origin(flow.origin)
         base_ev = {
-            "ts": int(time.time() * 1000),
+            # ⛔⛔ ONE SIGN-IN, ONE IDENTITY. This was its own `time.time()`, minted a
+            # few ms after the session's `connected_at_ms` — so the parked note and the
+            # re-mint that stands in for a lost one carried two DIFFERENT numbers for
+            # the same sign-in. That broke two things at once: the watermark compare
+            # became inexact, and the watchdog's own `__signed_in_ts__` de-dup could
+            # not recognise a re-mint as the announce it had already shown, because it
+            # compares by equality. Reusing the session's capture epoch makes the
+            # client-side de-dup able to protect a repeat, which is the only thing that
+            # can — a graceful reader timeout is invisible to this layer.
+            "ts": int(getattr(sess, "connected_at_ms", 0) or 0) or int(time.time() * 1000),
             "email": sess.email or "",
             "uid": sess.uid,
             "origin": origin,
@@ -2458,13 +2477,15 @@ def _backend_version() -> "str | None":
 # (turning a fresh PC into a research host) is a separate, still-supported action.
 
 
-def _remint_signin(sess: AccountSession) -> dict[str, Any] | None:
+def _remint_signin(sess: AccountSession) -> tuple[dict[str, Any] | None, int | None]:
     """A plain "you are signed in" for a sign-in whose announce never arrived.
 
-    Returns None — the ordinary case — when this session's sign-in has already been
-    announced, or when the session predates the capture epoch (a rehydrated
-    pre-change blob has no `connected_at_ms`, and inventing one would announce a
-    sign-in that happened days ago).
+    Returns ``(note, previous_watermark)``. ``note`` is None — the ordinary case —
+    when this session's sign-in has already been announced, or when the session
+    predates the capture epoch (a rehydrated pre-change blob has no
+    `connected_at_ms`, and inventing one would announce a sign-in that happened days
+    ago). ``previous_watermark`` is what the claim displaced, so the caller can put
+    it back when the response it authorised never reaches anybody.
 
     ⛔ THE WATERMARK IS STAMPED THE FIRST TIME IT IS READ, not only when something is
     announced. Without that, every existing session would be re-announced once the
@@ -2473,33 +2494,51 @@ def _remint_signin(sess: AccountSession) -> dict[str, Any] | None:
     """
     cap = getattr(sess, "connected_at_ms", None)
     if not isinstance(cap, (int, float)) or not cap:
-        return None
+        return (None, None)
     try:
-        seen = prefs.get_announced_signin_ms(sess.uid)
+        # ⛔⛔ ONE ATOMIC CLAIM, AND IT WAS A LOCKLESS READ THEN A LOCKED WRITE with
+        # the compare in between. Measured on this exact function: 24 concurrent
+        # callers, 24 re-mints — the same sign-in announced 24 times, in 24 chats.
+        # `claim_signin_announce` does the whole read-compare-write under the prefs
+        # lock and tells exactly one caller it won.
+        outcome, prev = prefs.claim_signin_announce(int(cap), sess.uid)
     except Exception as e:  # noqa: BLE001 — a courtesy message, never a failure
-        log.warning("could not read the announce watermark (%s)", type(e).__name__)
-        return None
-    if seen is None:
-        # First observation of this account on a build that keeps a watermark.
-        # Record where we are and say nothing: the sign-in predates the record.
-        _stamp_announced(sess, int(cap))
-        return None
-    if int(cap) <= seen:
-        return None
+        log.warning("could not claim the announce watermark (%s)", type(e).__name__)
+        return (None, None)
+    if outcome != "won":
+        # "first" — no watermark existed, so the mark is now set and we say nothing:
+        # the sign-in predates the record and greeting somebody who signed in days
+        # ago is worse than staying quiet. "already" — somebody has it.
+        return (None, None)
     log.info("re-announcing a sign-in whose announce never arrived")
-    _stamp_announced(sess, int(cap))
-    return {"ts": int(cap), "email": sess.email or "", "pendingTopic": "",
-            "autoStarted": False, "needsDevice": False, "runId": "",
-            "deviceName": "", "topic": "", "needsDeviceChoice": False,
-            "devices": [], "staleSelection": False}
+    return ({"ts": int(cap), "email": sess.email or "", "pendingTopic": "",
+             "autoStarted": False, "needsDevice": False, "runId": "",
+             "deviceName": "", "topic": "", "needsDeviceChoice": False,
+             "devices": [], "staleSelection": False}, prev)
 
 
-def _stamp_announced(sess: AccountSession, ms: int) -> None:
-    """Record that this sign-in has been announced. Never fatal."""
+def _claim_announced(sess: AccountSession, ms: int) -> tuple[bool, int | None]:
+    """Claim the announce watermark for ``ms``, returning ``(moved, previous)``.
+
+    ⛔ NEVER FATAL, like the stamp it replaces: an unwritable prefs file must not
+    turn a delivered sign-in into an HTTP 500. On failure we report "not moved",
+    which is the safe direction — the worst case is a plain re-mint the client's own
+    de-dup key already recognises, not a lost announce.
+    """
     try:
-        prefs.set_announced_signin_ms(ms, sess.uid)
+        outcome, prev = prefs.claim_signin_announce(int(ms), sess.uid)
     except Exception as e:  # noqa: BLE001
-        log.warning("could not record the announce watermark (%s)", type(e).__name__)
+        log.warning("could not claim the announce watermark (%s)", type(e).__name__)
+        return (False, None)
+    return (outcome != "already", prev)
+
+
+def _rollback_announced(sess: AccountSession, prev: int | None) -> None:
+    """Undo a claim whose response never reached anybody. Never fatal."""
+    try:
+        prefs.restore_announced_signin_ms(prev, sess.uid)
+    except Exception as e:  # noqa: BLE001
+        log.warning("could not roll back the announce watermark (%s)", type(e).__name__)
 
 
 def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
@@ -3872,6 +3911,13 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             out: dict[str, Any] = {"runs": runs}
             # The event this request took, if any — restored on a failed send.
             taken: dict | None = None
+            # ⛔ AND THE WATERMARK THIS REQUEST MOVED, restored with it. The note was
+            # already put back on a failed send and the mark was NOT, so the restored
+            # note stayed claimable while the mark said the announce had gone out —
+            # the re-mint then refused to recover it. `_rollback` is a sentinel-free
+            # pair: whether we moved it, and what it was.
+            marked: bool = False
+            mark_prev: int | None = None
             # One-shot "just signed in" announce for the chat watchdog. Only the
             # watchdog reads it (it always sets ?via=agent) — so an ordinary client
             # /updates call can't silently consume it. Take-and-clear is atomic; if
@@ -3879,13 +3925,26 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # that does. Delivered to the chat that started the sign-in (origin
             # match), or to any agent watchdog if it carried no origin.
             if via_agent:
-                # TAKE, atomically. The caller puts it back if the send RAISES —
-                # and ⛔ that covers less than it sounds like: a reader that times
-                # out and closes gracefully takes the bytes into its socket buffer
-                # and dies without raising anything here. The announce is not lost
-                # for good even then, because the watermark below re-derives it —
-                # see `_remint_signin`. The restore is the cheap half; the watermark
-                # is the half that actually closes the hole.
+                # TAKE, atomically. The caller puts it back — note AND watermark — if
+                # the send RAISES, and ⛔ that covers less than it sounds like: a
+                # reader that times out and closes gracefully takes the bytes into its
+                # socket buffer and dies without raising anything here.
+                #
+                # ⛔⛔ AND THE COMMENT HERE USED TO CLAIM THE WATERMARK CLOSED THAT
+                # HOLE — "the half that actually closes the hole". It does not, and it
+                # cannot: the watermark is what SUPPRESSES the re-mint, so on a
+                # graceful timeout the note was gone and the mark was past it, and the
+                # recovery built for exactly that loss refused to run. The mechanism
+                # switched itself off at the one moment it was needed.
+                #
+                # ⭐ WHAT ACTUALLY PROTECTS IT IS THE CLIENT'S OWN DE-DUP, and that is
+                # why the note now carries the session's capture epoch as its `ts`
+                # rather than a second, near-identical timestamp of its own: a re-mint
+                # then arrives under the SAME identity the watchdog already recorded
+                # in `__signed_in_ts__`, so a client that did receive the original
+                # drops the repeat and a client that lost it shows it. A graceful
+                # timeout stays invisible at this layer — it is the client, not the
+                # server, that can tell the difference.
                 ev = state.take_signed_in(sess.uid)
                 if isinstance(ev, dict):
                     ev_origin = ev.get("origin")
@@ -3946,8 +4005,12 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                         # The parked announce covers this sign-in, so the watermark
                         # moves with it — otherwise the re-mint above would fire on
                         # the very next tick and say it all again, plainly.
-                        _stamp_announced(sess, int(ev.get("ts") or 0)
-                                         or int(getattr(sess, "connected_at_ms", 0) or 0))
+                        # ⛔ CLAIMED, NOT STAMPED, so the previous mark is known and a
+                        # send that raises can put it back beside the note.
+                        marked, mark_prev = _claim_announced(
+                            sess,
+                            int(ev.get("ts") or 0)
+                            or int(getattr(sess, "connected_at_ms", 0) or 0))
                     else:
                         # Not this chat's — put it straight back for the watchdog
                         # that owns it.
@@ -3972,10 +4035,11 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                     # same rule the parked path follows, for the same reason: with
                     # several channels armed, whichever polled first would announce a
                     # sign-in in the wrong chat.
-                    remade = _remint_signin(sess)
+                    remade, mark_prev = _remint_signin(sess)
                     if remade is not None:
                         out["signedIn"] = remade
                         taken = None
+                        marked = True
             try:
                 self._json(200, out)
             except Exception:
@@ -3984,6 +4048,13 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 # whole defect this stretch set out to fix.
                 if taken is not None:
                     state.set_signed_in(taken)
+                # ⛔⛔ AND PUT THE WATERMARK BACK TOO, which it did not. Restoring the
+                # note while leaving the mark advanced left the two records of the same
+                # fact disagreeing: the note was claimable again, and the re-mint that
+                # exists to recover a lost announce refused to, because the mark said
+                # this sign-in had already gone out. Both halves, or neither.
+                if marked:
+                    _rollback_announced(sess, mark_prev)
                 raise
 
         def _research_cancel(self, rid: str) -> None:

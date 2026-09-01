@@ -173,6 +173,73 @@ def set_announced_signin_ms(ms: int, uid: str) -> None:
         save(prefs)
 
 
+def claim_signin_announce(ms: int, uid: str) -> tuple[str, int | None]:
+    """Atomically claim the right to announce the sign-in captured at ``ms``.
+
+    Returns ``(outcome, previous)`` where outcome is one of:
+      • ``"won"``    — this caller owns the announce; the watermark has moved to ``ms``
+      • ``"already"`` — ``ms`` is at or behind the watermark; say nothing
+      • ``"first"``  — no watermark existed for this account; it has been set to
+        ``ms`` and the caller must stay SILENT (the sign-in predates the record,
+        so announcing it would greet somebody who signed in days ago)
+    ``previous`` is the watermark before the call, for a rollback when the send
+    that this claim authorised never reaches anybody.
+
+    ⛔⛔ THIS EXISTS BECAUSE THE READ-MODIFY-WRITE IT REPLACES HAD NO MUTUAL
+    EXCLUSION AT ALL, AND I MEASURED IT: 24 concurrent callers, 24 re-mints handed
+    out, where the correct answer is one. `get_announced_signin_ms` reads OUTSIDE
+    `_lock` (only the setter takes it), so the compare sat between a lockless read
+    and a locked write — exactly the clobber `_lock`'s own comment says it is here
+    to prevent. The parked-note take was already atomic under one lock and
+    measured 1 of 24, so the durable half was right and only the RECOVERABLE half,
+    added in the same stretch, was unguarded.
+
+    ⭐ A PROCESS-LOCAL LOCK IS THE RIGHT SCOPE, not a file lock. The watchdog is a
+    separate process but reaches this watermark only over loopback HTTP, so every
+    reader and writer of it runs inside the one bridge process.
+    """
+    if not uid:
+        return ("already", None)
+    with _lock:
+        prefs = load()
+        owner = prefs.get(_ANNOUNCED_SIGNIN_UID)
+        raw = prefs.get(_ANNOUNCED_SIGNIN)
+        # A watermark belonging to a DIFFERENT account is not this account's
+        # watermark — same rule the getter applies, so a re-login under another uid
+        # can neither inherit nor be suppressed by the previous owner's mark.
+        seen = (int(raw) if isinstance(raw, (int, float)) and owner == uid else None)
+        if seen is not None and int(ms) <= seen:
+            return ("already", seen)
+        prefs[_ANNOUNCED_SIGNIN] = int(ms)
+        prefs[_ANNOUNCED_SIGNIN_UID] = uid
+        save(prefs)
+        return (("won" if seen is not None else "first"), seen)
+
+
+def restore_announced_signin_ms(ms: int | None, uid: str) -> None:
+    """Put the watermark back where a claim found it, after a send that raised.
+
+    ⛔ The note itself is already restored on that path and the watermark was not,
+    so the restored note stayed claimable while the mark said it had gone out —
+    two records of the same fact disagreeing. ``None`` means there was no mark to
+    begin with, so both keys are removed rather than pinned to a zero that would
+    read as "announced at the epoch".
+    """
+    if not uid:
+        return
+    with _lock:
+        prefs = load()
+        if ms is None:
+            popped = [prefs.pop(k, None)
+                      for k in (_ANNOUNCED_SIGNIN, _ANNOUNCED_SIGNIN_UID)]
+            if any(v is not None for v in popped):
+                save(prefs)
+            return
+        prefs[_ANNOUNCED_SIGNIN] = int(ms)
+        prefs[_ANNOUNCED_SIGNIN_UID] = uid
+        save(prefs)
+
+
 def get_verbose() -> bool:
     """Whether the bridge should log at DEBUG.
 

@@ -712,6 +712,44 @@ def cmd_login(args) -> int:
     return _emit(body, args.json, lines)
 
 
+def _claim_signed_in_announce() -> dict:
+    """TAKE the parked sign-in announce, because we are about to tell them ourselves.
+
+    ⛔⛔ WITHOUT THIS, `login-done` TOLD THEM AND LEFT THE NOTE SITTING THERE, so the
+    watchdog said the same news again a minute later — and the note is the ONLY place
+    that records what the bridge DID about the research they asked for. The owner's
+    own fleet transcript is this exact shape: 78 seconds of silence, the person asks
+    "started the super research?", `login-done` answers "they are signed in" and
+    nothing else, and "which of your three computers?" had to be worked out by hand
+    from a separate command. That question was already minted, parked, and thrown away.
+
+    ⭐ THE FLEET'S FORK ALREADY DOES THIS and this copy did not — the fork has both
+    the claim and the outcome renderer, and the shipped wheel had neither. This is the
+    wheel catching up with the client that overtook it.
+
+    ⭐ SCOPED WHEN WE KNOW OUR CHAT. `?via=agent` is the bridge's only take trigger;
+    adding platform+chat is what lets it hand over an ADDRESSED note — the ordinary
+    case, since `login` posts this chat's address. Without the scope this reads as the
+    account-wide watchdog and an addressed note is (correctly) refused, so we would
+    take nothing and the double-announce would survive the fix.
+
+    Returns {} on any failure: a courtesy line is never worth failing a sign-in over.
+    """
+    q = "/updates?via=agent&limit=1"
+    origin = _origin_from_env()
+    if origin:
+        q += "&platform=" + urllib.parse.quote(origin.get("platform", ""), safe="")
+        q += "&chat=" + urllib.parse.quote(origin.get("chat_id", ""), safe="")
+    try:
+        code, body = _get(q)
+    except Exception:
+        return {}
+    if code != 200 or not isinstance(body, dict):
+        return {}
+    note = body.get("signedIn")
+    return note if isinstance(note, dict) else {}
+
+
 def cmd_login_wait(args) -> int:
     code, body = _post("/login/remote/poll")
     if code != 200:
@@ -720,6 +758,24 @@ def cmd_login_wait(args) -> int:
     if state == "connected":
         who = body.get("email") or body.get("uid")
         topic = (body.get("pendingTopic") or "").strip()
+        # ⭐ SAY WHAT HAPPENED, IN THE NOTE'S OWN WORDS, rather than a guess assembled
+        # from the poll reply. The note knows the four outcomes the poll reply cannot:
+        # the bridge started it, there is nowhere to run it, several computers could
+        # and none is obvious, or a topic is simply waiting. Taking it is also what
+        # stops the watchdog repeating this in a minute — which is what SKILL.md has
+        # always told the assistant this command does.
+        #
+        # ⛔ BUT ONLY WHEN THE NOTE ACTUALLY CARRIES NEWS. `_signed_in_lines` returns
+        # exactly ONE line for a plain sign-in and more for each of the four outcomes,
+        # so `> 1` is precisely "it knows something this reply does not". Preferring
+        # the note unconditionally would have been a quiet regression: for a plain
+        # sign-in `_connected_msg` is DEVICE-AWARE and steers an account with no
+        # computer to pair one, and the note's single line cannot. Taking it still
+        # stops the double announce either way — that is the half that matters.
+        note = _claim_signed_in_announce()
+        note_lines = _signed_in_lines(note) if note else []
+        if len(note_lines) > 1:
+            return _emit(body, args.json, note_lines)
         if topic:
             # The user asked to research this before signing in. Confirm + name the
             # topic; per SKILL.md "After a sign-in link" the assistant now runs

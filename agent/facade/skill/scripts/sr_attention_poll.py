@@ -622,10 +622,20 @@ def main(origin: dict | None = None) -> int:
     # one delivery; __signed_in_ts__ is a belt-and-suspenders de-dup across ticks.
     announced_login = False
     si_ts = pdict.get("__signed_in_ts__")
-    if isinstance(signed_in, dict) and signed_in.get("ts") and signed_in.get("ts") != si_ts:
-        out.append(_signed_in_line(signed_in))
-        si_ts = signed_in.get("ts")
-        announced_login = True
+    if isinstance(signed_in, dict) and signed_in:
+        # ⛔⛔ A NOTE WITH NO `ts` USED TO BE SILENTLY SWALLOWED HERE, and `sr updates`
+        # rendered the same note — two readers of one payload disagreeing about
+        # whether a timestamp is required to speak. The bridge has already TAKEN and
+        # cleared the note by the time we see it, so dropping it destroys the news
+        # outright: the silent eater, in the one reader that is supposed to be the
+        # reliable one. A missing `ts` costs the cross-tick de-dup, not the message —
+        # so say it, and record what we can.
+        new_ts = signed_in.get("ts")
+        if not new_ts or new_ts != si_ts:
+            out.append(_signed_in_line(signed_in))
+            announced_login = True
+            if new_ts:
+                si_ts = new_ts
 
     # Baseline = we've never recorded this chat's RUNS before. A state file that
     # holds only reserved keys (e.g. __login_wait__ written by unauthed login-wait
