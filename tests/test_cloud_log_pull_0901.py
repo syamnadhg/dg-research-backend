@@ -141,6 +141,7 @@ class _Db:
     def __init__(self, docs_by_rid):
         self.docs_by_rid = docs_by_rid
         self.paths = []
+        self.filters = []
         self._parts = []
 
     def collection(self, name):
@@ -151,7 +152,12 @@ class _Db:
         self._parts.append(key)
         return self
 
-    def where(self, **_kw):
+    def where(self, **kw):
+        # ⛔ THE FILTER IS RECORDED, NOT DISCARDED. The first version of this
+        # stand-in threw `filter=` away, so nothing in the suite could tell a
+        # query scoped to type == "cloud_logs" from one that downloaded every
+        # pipeline event in the run — thousands of documents per tick.
+        self.filters.append(kw.get("filter"))
         path = "/".join(self._parts)
         self.paths.append(path)
         rid = self._parts[3] if len(self._parts) > 3 else ""
@@ -179,6 +185,24 @@ def test_it_asks_for_the_right_document_path(tmp_path):
     db = _Db({"chat_1": [_doc(1, 4, ["x"])]})
     research._pull_cloud_logs(db=db, runs_root=runs, queues_root=queues)
     assert db.paths == ["users/user-a/researches/chat_1/pipeline_events"]
+
+
+def test_the_query_is_scoped_to_cloud_logs_not_every_event(tmp_path):
+    # ⛔ A run's pipeline_events holds 2-3k documents at a typical cadence. An
+    # unscoped read would pull all of them down every fifteen minutes, per run,
+    # per machine — and the suite could not have seen the difference until the
+    # stand-in started recording its filter.
+    runs = tmp_path / "runs"
+    queues = tmp_path / "queues"
+    _folder(runs, "chat_1_1_x", "chat_1")
+    _queue(queues, "chat_1", "user-a")
+    db = _Db({"chat_1": [_doc(1, 4, ["x"])]})
+    research._pull_cloud_logs(db=db, runs_root=runs, queues_root=queues)
+    assert len(db.filters) == 1
+    # FieldFilter has no useful repr; read the fields it actually carries.
+    assert getattr(db.filters[0], "field_path", None) == "type"
+    assert getattr(db.filters[0], "value", None) == "cloud_logs"
+    assert getattr(db.filters[0], "op_string", None) == "=="
 
 
 def test_a_folder_with_no_owner_anywhere_is_counted_not_silently_skipped(tmp_path):

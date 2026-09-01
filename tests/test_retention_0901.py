@@ -63,6 +63,10 @@ def test_the_run_index_never_advertises_more_than_the_valve_keeps():
 def test_the_tails_are_bounded_by_the_same_thirty_days_as_everything_else():
     # "Both halves" in the signed item means machine and cloud; on the machine
     # it means all three sources, not the two that already had a clock.
+    # ⛔ BOTH AGAINST THE NUMBER, not one against the other. The tail bound is
+    # DEFINED as the log bound, so comparing them can never fail — it pins the
+    # aliasing and leaves the promise itself unpinned.
+    assert research.LOCAL_TAIL_MAX_AGE_DAYS == 30
     assert research.LOCAL_TAIL_MAX_AGE_DAYS == research.LOCAL_LOG_MAX_AGE_DAYS
 
 
@@ -306,6 +310,22 @@ def test_on_a_platform_with_no_birthtime_the_seed_is_the_CLOCK_not_the_epoch(tmp
     assert seeded == now
 
 
+def test_a_marker_from_the_FUTURE_does_not_switch_the_bound_off(tmp_path):
+    """⛔ A clock that jumped, a restore from another machine, or a corrupt
+    write leaves a marker ahead of now — and `now - started` is then permanently
+    negative, so the age bound never fires again for that file and says nothing
+    about it. Clamped to now: one bound-length of over-retention, and nothing
+    disabled."""
+    tail = tmp_path / "backend.log"
+    tail.write_text("x", encoding="utf-8")
+    now = time.time()
+    research._raw_tail_marker(tail).write_text(f"{now + 900 * 86400:.0f}", encoding="utf-8")
+    assert research._raw_tail_started_at(tail, now=now) == now
+    # and once real time passes the bound, it still rolls
+    assert research._rotate_if_stale(tail, max_age_days=30,
+                                     now=now + 31 * 86400) > 0
+
+
 def test_a_missing_marker_seeds_instead_of_deleting_on_a_guess(tmp_path):
     # ⭐ FIRST RUN AFTER UPGRADE. Nobody recorded when the existing tail began,
     # so the bound becomes exact within one window rather than firing
@@ -441,6 +461,11 @@ def test_the_orphan_sweep_is_what_calls_it(tmp_path):
     body = src[src.index("async def _orphan_sweep_loop"):]
     body = body[:body.index("[orphan-sweep] purged")]
     assert "_run_log_folders_for_research(rid)" in body
-    # the existence re-check comes first, then the queue rmtree, then the logs
+    # The existence re-check comes first — nothing may be deleted before the
+    # research doc has been proved gone twice.
     assert body.index("if ref.get().exists") < body.index("_run_log_folders_for_research")
-    assert body.index("_shutil.rmtree(d)") < body.index("_run_log_folders_for_research")
+    # ⛔ AND THE LOOKUP COMES BEFORE THE QUEUE rmtree, not after. The queue
+    # directory holds the only rid→uid key on disk; if the process dies between
+    # the two removals, log folders resolved afterwards would be left behind
+    # permanently unidentifiable. Reading first makes that window harmless.
+    assert body.index("_run_log_folders_for_research") < body.index("_shutil.rmtree(d)")

@@ -193,8 +193,7 @@ MUTANTS = [
      "⛔⛔ THE SWEEP STOPS REMOVING LOG FOLDERS, which is the state item 4 found: "
      "deleting a run cleared the cloud copy within five minutes and left the verbose "
      "half of it on disk for a month",
-     [("                        for _lf in _run_log_folders_for_research(rid):",
-       "                        for _lf in []:")]),
+     [("                    for _lf in _log_folders:", "                    for _lf in []:")]),
 
     # ══ C — the cloud pull ══════════════════════════════════════════════════
 

@@ -3595,7 +3595,18 @@ def _raw_tail_started_at(path, now=None) -> float:
     now_t = time.time() if now is None else float(now)
     marker = _raw_tail_marker(path)
     try:
-        return float(marker.read_text(encoding="utf-8").strip())
+        stamp = float(marker.read_text(encoding="utf-8").strip())
+        # ⛔ REPAIRED, NOT JUST CLAMPED. A marker holding a future timestamp — a
+        # clock that jumped, a restore from another machine, a corrupt write —
+        # makes `now - started` permanently negative and switches the age bound
+        # off for the life of that file, silently. Clamping the READ alone is
+        # not enough: the bad value stays on disk and every later read clamps
+        # again, so the file never ages. Rewriting it costs one bound-length of
+        # over-retention once, and then the clock runs normally.
+        if stamp <= 0 or stamp > now_t:
+            _begin_raw_tail_generation(path, now=now_t)
+            return now_t
+        return stamp
     except Exception:
         pass
     # ⛔⛔ THE FALLBACK IS THE LINUX PATH, AND IT IS THE ONE THAT MATTERS.
@@ -63329,6 +63340,17 @@ async def run_server(port=8000):
                             continue
                     except Exception:
                         continue
+                    # ⛔ RESOLVED BEFORE THE QUEUE DIRECTORY GOES, not after. The
+                    # rid is already in hand either way, but if the process dies
+                    # between the two removals the log folders are left behind
+                    # with their only attribution key deleted — permanently
+                    # unidentifiable, and reachable after that only by the age
+                    # bound. Doing the read first makes the window harmless.
+                    try:
+                        _log_folders = _run_log_folders_for_research(rid)
+                    except Exception as _lo:
+                        log(f"[orphan-sweep] log-folder lookup failed for {rid}: {_lo}", "WARN")
+                        _log_folders = []
                     try:
                         _shutil.rmtree(d)
                     except Exception as _e:
@@ -63356,15 +63378,12 @@ async def run_server(port=8000):
                     # attributed, so its log folder waits for the age bound.
                     # That backstop is real and now has a clock of its own; this
                     # closes the case where the person is watching.
-                    try:
-                        for _lf in _run_log_folders_for_research(rid):
-                            try:
-                                _shutil.rmtree(_lf)
-                                logs_n += 1
-                            except Exception as _le:
-                                log(f"[orphan-sweep] rmtree logs {_lf.name} failed: {_le}", "WARN")
-                    except Exception as _lo:
-                        log(f"[orphan-sweep] log-folder sweep failed for {rid}: {_lo}", "WARN")
+                    for _lf in _log_folders:
+                        try:
+                            _shutil.rmtree(_lf)
+                            logs_n += 1
+                        except Exception as _le:
+                            log(f"[orphan-sweep] rmtree logs {_lf.name} failed: {_le}", "WARN")
                 if swept_n:
                     log(f"[orphan-sweep] purged {swept_n} orphan(s) (Firestore research doc missing)", "INFO")
                 if logs_n:
