@@ -160,7 +160,7 @@ cancels. Never send the bare "yes" back into `do`.
 | "stop it", "stop the EV run", "that's enough" | `sr.py stop ["<title>"]` (ENDS the run, keeps results) |
 | "pause it", "pause the run", "hold on" | `sr.py pause ["<title>"]` (resumable — does NOT end it) |
 | "resume", "unpause", "continue the paused run" | `sr.py resume ["<title>"]` |
-| "retry", "try again" | `sr.py retry ["<title>"]` (a run BLOCKED on a decision/error — NOT the agent's own sign-in; for "I signed in" right after a sign-in link, see **After a sign-in link**) |
+| "retry", "try again" | `sr.py retry ["<title>"]` (a run BLOCKED on a decision/error — NOT the agent's own sign-in; for "I signed in" right after a sign-in link, see **After a sign-in link**). If the reply says the run has no Retry, relay that line — do NOT try `skip` instead. |
 | "continue" / "yes" / "done" / "I signed in" — **right after you sent a sign-in link** | see **After a sign-in link** (NOT `retry`) |
 | "skip it", "skip this step" / "skip the video and the report" / "skip Claude (in P2)", "drop ChatGPT from the research" | `sr.py skip [phases\|agents] [--run "<title>"]` — phases (brief/podcast/video/report) AND the P2 research agents (chatgpt/gemini/claude), same as the app's per-agent toggles |
 | an **8-char access code** ("7F4V-6W7D"), "add a device", "pair my PC, code is K7XQ-9B2M" | `sr.py device-add <code>` — see **Devices & Research Computers** |
@@ -256,7 +256,10 @@ never `retry`, never a question back to the user.
   *isn't ready yet*.
 - **stop** → confirm first. ENDS the run (terminal "stopped") and keeps the results
   so far + the chat (deletes nothing). Use **pause** for a temporary, resumable hold.
-- **skip** → no args → skip whatever the run is **blocked** on; with phases
+- **skip** → no args → skip whatever the run is **blocked** on. ⛔ NOT EVERY
+  BLOCKER HAS A SKIP — some cards offer only Retry, and the reply will say so
+  ("that card has no Skip"). **That is a real answer, not an error to work
+  around: relay it as written and never substitute `stop`.** With phases
   (Brief=1, Podcast=3, Video=4, Report=5, or their names) → trim those phases;
   with research-agent names (chatgpt / gemini / claude) → turn those P2 agents
   off for the run — the same thing the app's per-agent toggles do ("skip Claude
@@ -386,8 +389,9 @@ Say nothing about arming — the user only sees the clean message above the mark
 The watchdog is scoped to THIS chat and **quiet by design** — it posts only: **🎉 a
 run's completion** (one message with every phase's 🔒 + 🔗 links + "results
 emailed"), **⏹ a stop** (including a stop done from the web app), and **⚠ "needs
-you: <reason>"** when a run blocks (reply "retry" / "skip" here, or do the on-device
-step then "retry"). It de-dups, and once armed it **persists** (ticking silently
+you: <reason>"** when a run blocks. **The ⚠ notice now names the verbs that
+actually work for that particular card — relay them as written and offer
+nothing else.** It de-dups, and once armed it **persists** (ticking silently
 between runs, removed only by `agent disconnect`) — so re-arming on every research is
 a harmless no-op if it's already running. Per-phase progress is **on-demand** — for
 "how's it going / send the brief link" just run `sr.py status`. On `logout`, tear

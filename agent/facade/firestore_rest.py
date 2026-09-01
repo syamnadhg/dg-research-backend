@@ -410,6 +410,54 @@ class FirestoreRest:
         body = self._request("POST", url, json_body={"fields": fields})
         return doc_id(body.get("name", ""))
 
+    def enqueue_resume(self, device_id: str, *, uid: str, research_id: str,
+                       backend_run_id: str, email: str = "") -> str:
+        """Write an ``action:"resume"`` doc to devices/{deviceId}/queue — resume
+        a run from its on-disk checkpoint. Returns the doc id.
+
+        ⛔⛔ THE ONLY TRANSPORT THAT CAN RESTART A CRASHED RUN. Every other
+        chat action rides the PER-RUN command channel (``write_command``), and
+        that listener is torn down the moment run_pipeline returns. The terminal
+        crash cards, and a run paused by a backend restart, are by definition
+        past that point — so a per-run "retry_phase" there is written, marked
+        processed, and does nothing at all, while chat reports a resume. The
+        device queue is served by the always-alive start listener, which
+        re-enqueues the job with ``resume_dir`` pointing at the run's own
+        queue folder. Same engine the web app's Resume button uses.
+
+        ``backend_run_id`` is MANDATORY, not merely useful: without it the
+        backend falls back to reading the research doc, which the synthetic
+        device user is denied under Track D — and it then DELETES the queue doc
+        with only a local WARN. The caller checks it up front so chat can refuse
+        rather than report a resume that evaporates on the far side.
+
+        ``email`` is deliberately "" by default — the same value the backend's
+        own boot-time auto-resume enqueues, because a resumed run reads its
+        delivery preferences from delivery.json on disk. Passing the signed-in
+        account's address instead would bypass BOTH the sendEmail toggle and the
+        confirmed-recipient gate, which is a decision this bridge is not
+        entitled to make on the person's behalf.
+        """
+        now_ms = int(time.time() * 1000)
+        payload: dict[str, Any] = {
+            "uid": uid,
+            "submittedBy": uid,   # rules-pinned: must equal request.auth.uid
+            "action": "resume",
+            "researchId": research_id,
+            "backendRunId": backend_run_id,
+            "email": email,
+            "timestamp": now_ms,
+            "viaAgent": True,
+        }
+        # ⛔ NO `config` KEY. The BE merges any supplied config PERMANENTLY into
+        # the run's config.json — a resume that shipped one would silently
+        # rewrite the run's own configuration. The web app's resume sends none.
+        fields = {k: to_value(v) for k, v in payload.items()}
+        fields["submittedAt"] = {"timestampValue": _now_iso()}
+        url = f"{config.FIRESTORE_BASE}/devices/{device_id}/queue"
+        body = self._request("POST", url, json_body={"fields": fields})
+        return doc_id(body.get("name", ""))
+
     def held_runs(self, uid: str, device_id: str) -> dict[str, Any] | None:
         """What a research computer still holds logs FOR THIS PERSON, or None.
 

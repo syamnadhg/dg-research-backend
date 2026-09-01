@@ -382,8 +382,15 @@ def _resolve_device_arg(arg: str) -> tuple[dict | None, list[str]]:
 
 def _attention_lines(r: dict) -> list[str]:
     """Chat lines for a run that needs the user (C1). `r` is a run row (/updates)
-    or a full research doc (/research/{id}); both may carry pendingDecision /
-    attention / needsAttention."""
+    or a full research doc (/research/{id}); a current bridge puts
+    attention / attentionAction / attentionDetails / attentionOffers on BOTH.
+
+    ⛔ The action line comes from the BRIDGE, which classifies the card. It used
+    to be guessed here from `pendingDecision.kind` — and three different
+    situations share the `login_required` literal, so a run that needed an
+    Anthropic API key was told to "sign in on the device". The legacy branch
+    below still runs against an older bridge; these scripts are copied out at
+    connect time and can sit a release behind."""
     pd = r.get("pendingDecision")
     text = r.get("attention")
     if not text and isinstance(pd, dict) and pd:
@@ -391,14 +398,40 @@ def _attention_lines(r: dict) -> list[str]:
     if not text and not r.get("needsAttention"):
         return []
     lines = [f"  ⚠ Needs you: {text or 'a decision is needed'}"]
+    det = r.get("attentionDetails") or (pd.get("details") if isinstance(pd, dict) else None)
+    if det:
+        lines.append(f"  ↳ {det}")
+    action = r.get("attentionAction")
+    if action:
+        lines.append(f"  → {action}")
+        return lines
+    # ── Legacy: an older bridge ships no attentionAction. Keep today's guess,
+    # minus the one case it got outright wrong.
     kind = pd.get("kind") if isinstance(pd, dict) else None
-    if kind == "login_required":
+    if kind == "login_required" and isinstance(pd, dict) and pd.get("envErrors"):
+        lines.append("  → add an Anthropic API key on the device (Account → API "
+                     "Config), then tell me to retry.")
+    elif kind == "login_required":
         lines.append("  → sign in on the device, then tell me to retry.")
     elif kind == "human_verification_required":
         lines.append("  → finish the check on the device, then tell me to retry.")
     else:
         lines.append("  → tell me to retry to resume, or skip to move past it (or open the app).")
     return lines
+
+
+def _refuse_if_not_offered(run: dict, verb: str) -> list[str] | None:
+    """Chat lines refusing a verb this run's card does not offer — or None to go
+    ahead. ⛔ ABSENT `attentionOffers` MEANS AN OLDER BRIDGE, NOT "NEITHER".
+    Conflating the two makes a current script refuse everything against an older
+    bridge, so the check is `is None`, never falsiness."""
+    offers = run.get("attentionOffers")
+    if offers is None or verb in offers:
+        return None
+    title = run.get("title") or run.get("topic") or run.get("runId")
+    act = run.get("attentionAction") or "Open the app to act on it."
+    label = "Retry" if verb == "retry" else "Skip"
+    return [f"“{title}” has no {label} right now.", f"  → {act}"]
 
 
 # ── per-chat streaming watchdog (arm-stream) ─────────────────────────────────
@@ -1614,9 +1647,19 @@ def cmd_retry(args) -> int:
         return _emit(body, args.json, [f"No run {which}."], 1)
     rid = run.get("runId")
     title = run.get("title") or run.get("topic") or rid
+    refusal = _refuse_if_not_offered(run, "retry")
+    if refusal:
+        return _emit(body, args.json, refusal, 1)
     code, b2 = _post(f"/research/{urllib.parse.quote(rid, safe='')}/resolve", {"intent": "retry"})
     if code != 200:
         return _emit(b2, args.json, [f"✗ couldn’t retry “{title}”: {b2.get('error', code)}"], _fail_code(code))
+    # ⛔ Say what actually happened. A checkpoint resume is a REQUEST to the
+    # research computer — it re-enqueues from disk, and it can still decline
+    # (artifacts pruned, run marked stopped) without telling us. Claiming "the
+    # run is resuming" was the lie this whole item exists to stop.
+    if b2.get("transport") == "queue_resume":
+        return _emit(b2, args.json,
+                     [f"↻ Asked your computer to pick “{title}” up from its last checkpoint."])
     return _emit(b2, args.json, [f"↻ Retrying “{title}” — resuming the run."])
 
 
@@ -1642,11 +1685,19 @@ def cmd_skip(args) -> int:
     q = urllib.parse.quote(rid, safe="")
     if not args.phases:
         # No phases → skip whatever the run is BLOCKED on (resolve the decision).
+        # ⛔ Not every card HAS a skip. On the browser-launch failure card the
+        # command chat used to mint here terminated the run outright, while this
+        # printed "Skipping the current blocker".
+        refusal = _refuse_if_not_offered(run, "skip")
+        if refusal:
+            return _emit(body, args.json, refusal, 1)
         code, b2 = _post(f"/research/{q}/resolve", {"intent": "skip"})
         if code != 200:
             return _emit(b2, args.json,
                          [f"✗ couldn’t skip the blocker on “{title}”: {b2.get('error', code)}"],
                          _fail_code(code))
+        if b2.get("action") == "discard":
+            return _emit(b2, args.json, [f"✓ Put that card away — “{title}” stays stopped."])
         return _emit(b2, args.json, [f"⏭ Skipping the current blocker on “{title}”."])
     # Phases and/or P2 agents given → tune the run's config (skip whole phases
     # when reached; turn named agents off — the app's per-agent toggle write).

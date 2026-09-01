@@ -319,10 +319,36 @@ def _final_lines(run: dict) -> list[str]:
 
 
 def _attention_line(run: dict) -> str:
+    """The proactive blocker notice. The tail comes from the BRIDGE, which knows
+    which card this is and which verbs actually work for it — the hardcoded
+    "retry or skip" below offered both on every card, including ones where Skip
+    ends the run and ones where neither exists.
+
+    Plain text only, no Markdown: this file posts DIRECTLY to the origin channel
+    with no runtime to reformat, and that channel may be SMS."""
     t = _title(run)
     reason = run.get("attention") or "a decision is needed"
-    return (f"⚠ “{t}” needs you: {reason} — "
-            "reply “retry” to resume or “skip” to move past it (or open the app).")
+    head = f"⚠ “{t}” needs you: {reason}"
+    act = run.get("attentionAction")
+    if not act:
+        # Older bridge — today's tail, verbatim.
+        return (head + " — reply “retry” to resume or “skip” to move past it "
+                "(or open the app).")
+    parts = [head]
+    det = run.get("attentionDetails")
+    if det:
+        parts.append(f"   {det}")
+    parts.append(f"   {act}")
+    return "\n".join(parts)
+
+
+def _attention_key(run: dict) -> str:
+    """The change-detect key for a blocker notice. ⛔ `attention` ALONE SWALLOWS
+    A SECOND BLOCKER: two different cards on one run can render the same reason
+    sentence (a generic "Hit a snag", the same platform's message twice), and
+    the notice then never fires for the second — the run sits blocked in silence.
+    The action line differs whenever the card does, so it is part of the key."""
+    return (run.get("attention") or "") + "\x1f" + (run.get("attentionAction") or "")
 
 
 def _ended_line(run: dict) -> str:
@@ -385,9 +411,17 @@ def compute(runs: list, prior_state: dict, *, baseline: bool = False,
 
         needs = bool(run.get("needsAttention"))
         attention = run.get("attention") or ""
+        akey = _attention_key(run)
         prior_needs = bool(prior.get("needs"))
-        prior_attn = prior.get("attention") or ""
-        if needs and (not prior_needs or prior_attn != attention):
+        # ⛔ A state file written by an older script has no "akey". Comparing the
+        # new two-part key against it would differ for every tracked run and
+        # re-announce every live blocker once, on the first tick after an update
+        # — so fall back to comparing the half that file DOES have.
+        if "akey" in prior:
+            changed = prior.get("akey") != akey
+        else:
+            changed = (prior.get("attention") or "") != attention
+        if needs and (not prior_needs or changed):
             live_stuck = run.get("status") in _LIVE_STUCK
             if not baseline or live_stuck:
                 out.append(_attention_line(run))
@@ -410,6 +444,7 @@ def compute(runs: list, prior_state: dict, *, baseline: bool = False,
             "announced": sorted(announced),
             "needs": needs,
             "attention": attention,
+            "akey": akey,
             "ended": ended,
             "completed": completed_announced,
         }

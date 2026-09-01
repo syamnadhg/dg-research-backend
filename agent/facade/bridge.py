@@ -1690,56 +1690,432 @@ def _attention_text(r: dict) -> str | None:
 
 # Per-run command "actions" that resume vs skip a blocked run (the FE decision
 # card writes these verbatim) — used to classify a pendingDecision's own actions.
+#
+# ⛔⛔ `continue_anyway` IS NOT A RESUME, and having it here pressed the wrong
+# button. It is minted by exactly one token — pro_required's "Continue with
+# Free" (research.py `_alert_actions_for`, the `continue_free` branch at
+# phase != 2) — and that token is FIRST in that card's ordered action list
+# (`ALERT_INTENTS["pro_required"]` = continue_free, retry_phase, skip_pro). The
+# scan below is first-match-in-order, so a chat "retry" on a Pro-tier card
+# returned `continue_anyway`: the person was DOWNGRADED TO THE FREE TIER while
+# sr.py printed "↻ Retrying — resuming the run". Belt-and-braces on top of
+# classifying pro_required by kind before the generic scan ever runs.
 _RESUME_ACTIONS = frozenset({
-    "retry_phase", "retry_agent", "resume", "retry_init_verify", "continue_anyway",
+    "retry_phase", "retry_agent", "resume", "retry_init_verify",
 })
 _SKIP_ACTIONS = frozenset({
     "skip_phase", "skip_agent", "skip_init_verify", "continue_partial_agent",
 })
 
+# Every ``action`` research.py's per-run command listener dispatches on. The
+# planner may only ever emit a command from this set — a command outside it is
+# written to Firestore, marked processed, and does nothing, which is exactly how
+# a chat "retry" came to be a no-op on the crash cards.
+_DISPATCHER_ACTIONS = frozenset({
+    "add_context", "agent_decision", "config", "continue_anyway",
+    "continue_free", "continue_partial_agent", "discard_run", "dismiss_alert",
+    "pause", "ping", "poke_agent", "resume", "retry_agent",
+    "retry_init_verify", "retry_phase", "skip_agent", "skip_init_verify",
+    "skip_phase", "stop", "wait_longer_agent",
+})
 
-def _decision_command(pd: dict | None, intent: str) -> dict | None:
-    """The per-run command that resolves a blocked run for ``intent`` — "retry"
-    resumes, "skip" moves past. Prefers the pendingDecision's OWN actions (the
-    exact commands the FE offers — present on BE-authored pipeline_error cards),
-    and falls back to a kind→command mapping for the FE-synthesized kinds
-    (login_required / human_verification_required / agent_link_failed). Returns
-    None when there's nothing to act on. Every action it emits is handled by
-    research.py's per-run command listener."""
-    if not isinstance(pd, dict) or not pd:
-        return None
-    want_resume = intent == "retry"
-    # 1) Honor the decision's own actions verbatim when present.
-    actions = pd.get("actions")
-    if isinstance(actions, list):
-        for a in actions:
+# The blocked-run "cards" chat can be asked to resolve. The first group is
+# derived from a pendingDecision; the second from a run STATUS with no card at
+# all (the FE draws its own recovery banner for those, and chat had nothing).
+_STATUS_CARDS = frozenset({
+    "backend_restart", "restart_failed", "watchdog_stop", "errored",
+})
+_CARD_IDS = frozenset({
+    "env_missing_key", "login_walk", "login_worktab",
+    "hv_solvable", "hv_wall", "agent_link_failed", "pro_required",
+    "crash_login_interrupt", "crash_loop", "pipeline_error", "unknown",
+}) | _STATUS_CARDS
+
+_AGENT_DISPLAY = {"chatgpt": "ChatGPT", "gemini": "Gemini",
+                  "claude": "Claude", "notebooklm": "NotebookLM"}
+
+# The card's own `details` is authored by a caller and unbounded; the row it
+# rides has no byte cap, so it is trimmed here rather than at the far end.
+_DETAILS_MAX = 400
+
+# What each command actually DOES, in words a person can act on. Used to build
+# the one imperative sentence chat shows for a generically-resolved card.
+_ACTION_PHRASE = {
+    "retry_phase": "resume", "retry_agent": "restart {Ag}",
+    "resume": "carry on", "retry_init_verify": "re-run the sign-in check",
+    "skip_phase": "move past this step", "skip_agent": "drop {Ag} from this run",
+    "skip_init_verify": "skip the sign-in check",
+    "continue_partial_agent": "keep what {Ag} has so far",
+}
+
+
+def _lc(v: Any) -> str:
+    """A lowercase, stripped string from a card field — "" for anything that is
+    not a real string. ⛔ NOT `(v or "").strip()`: these fields come off a
+    Firestore document, and a `True` or a number there raised AttributeError
+    straight out of the /updates route, taking every run's row with it."""
+    return v.strip().lower() if isinstance(v, str) else ""
+
+
+def _agent_display(agent: Any) -> str:
+    a = _lc(agent)
+    return _AGENT_DISPLAY.get(a, a.title() if a else "that agent")
+
+
+def _action_tokens(pd: dict) -> set:
+    """The set of ``command.action`` strings a card offers. Empty when the card
+    carries no actions array — which is NOT the same as offering nothing, see
+    ``_generic_offers``."""
+    out: set = set()
+    acts = pd.get("actions")
+    if not isinstance(acts, list):
+        return out
+    for a in acts:
+        cmd = a.get("command") if isinstance(a, dict) else None
+        if isinstance(cmd, dict) and isinstance(cmd.get("action"), str):
+            out.add(cmd["action"])
+    return out
+
+
+def _card_id(pd: dict) -> str:
+    """Which card this pendingDecision IS. Total: every input returns one of
+    ``_CARD_IDS``.
+
+    ⛔⛔ THREE DIFFERENT SITUATIONS SHARE THE ``login_required`` KIND LITERAL —
+    a missing API key, the phase-0 sign-in walk, and a mid-run sign-in wall —
+    and chat used to tell all three to "sign in on the device". The
+    discriminators below are the ones the WEB APP itself uses (``envErrors`` →
+    its isEnv branch; ``phase >= 1`` + a named agent → its work-tab branch), so
+    chat and the app now classify the same card the same way."""
+    kind = pd.get("kind")
+    agent = pd.get("agent")
+    phase = pd.get("phase")
+    acts = _action_tokens(pd)
+    if kind == "login_required":
+        # research.py writes `envErrors` on exactly one payload — the env-check
+        # card — and never empty. The app keys its own isEnv branch on the same
+        # field (pipeline-decision.ts).
+        if pd.get("envErrors"):
+            return "env_missing_key"
+        # The work-tab wall is the only login mirror carrying `agent`; the P0
+        # walk is agent-less at phase 0.
+        if agent and isinstance(phase, int) and not isinstance(phase, bool) and phase >= 1:
+            return "login_worktab"
+        return "login_walk"
+    if kind == "human_verification_required":
+        # A Cloudflare wall cannot be cleared by resuming — only by dropping the
+        # platform. `hvIntent` is stamped by research.py's HV gate (the LATCHED
+        # verdict); the regex over `reason` is the fallback for a card written by
+        # a backend that predates that field, and is what the app does today.
+        hv_intent = pd.get("hvIntent")
+        if isinstance(hv_intent, str) and hv_intent:
+            return "hv_wall" if hv_intent == "hv_wall" else "hv_solvable"
+        blob = str(pd.get("reason") or "")
+        return "hv_wall" if re.search(r"cloudflare", blob, re.I) else "hv_solvable"
+    if kind == "agent_link_failed":
+        return "agent_link_failed"
+    if kind == "pro_required":
+        return "pro_required"
+    if kind == "pipeline_error":
+        # The two terminal-crash cards are named by their OWN command tokens,
+        # which are unique in research.py and (unlike alert_id) are not built by
+        # f-string interpolation.
+        if "resume_from_checkpoint" in acts:
+            return "crash_loop" if "discard_restart_prompt" in acts else "crash_login_interrupt"
+        return "pipeline_error"
+    return "unknown"
+
+
+def _cmd_spec(command: dict, phrase: str) -> dict:
+    return {"transport": "command", "command": command, "phrase": phrase}
+
+
+_QUEUE_RESUME = {"transport": "queue_resume", "command": None,
+                 "phrase": "pick it up from its last checkpoint"}
+_CLEAR_CARD = {"transport": "clear_card", "command": None,
+               "phrase": "put this card away and leave the run stopped"}
+
+
+def _ph(phase) -> dict:
+    """``{"phase": n}`` only for a genuine int — bool is an int subclass and a
+    JSON true is not a phase number."""
+    return {"phase": phase} if isinstance(phase, int) and not isinstance(phase, bool) else {}
+
+
+def _generic_offers(pd: dict) -> tuple:
+    """Resolve a card from its OWN actions array — the exact commands the app's
+    buttons write. Returns ``(resume_spec | None, skip_spec | None)``.
+
+    ⛔ A card that HAS actions and matches none genuinely offers none. That is
+    the whole point: `cua_unavailable` ships [retry_phase] and no skip, the
+    browser-launch failure ships [retry] and no skip, `phase_error_noretry`
+    ships [skip_phase] and no retry. Minting one anyway is what made chat offer
+    a Skip that, on the browser-launch card, TERMINATED THE RUN.
+
+    The kind→command fallback fires only when there is no actions array at all,
+    which production's mirror gate makes unreachable (it requires truthy
+    actions) — it exists for an older backend and for the shape the suite pins."""
+    acts = pd.get("actions")
+    have = isinstance(acts, list) and bool(acts)
+    ag = _lc(pd.get("agent"))
+
+    def scan(want_resume: bool):
+        if not have:
+            return None
+        for a in acts:
             cmd = a.get("command") if isinstance(a, dict) else None
             if not isinstance(cmd, dict):
                 continue
             act = cmd.get("action")
             if act == "agent_decision":
                 if cmd.get("decision") == ("retry" if want_resume else "skip"):
-                    return dict(cmd)
+                    who = _agent_display(_lc(cmd.get("agent")) or ag)
+                    return _cmd_spec(dict(cmd),
+                                     f"try {who} again" if want_resume else f"drop {who}")
             elif act in (_RESUME_ACTIONS if want_resume else _SKIP_ACTIONS):
-                return dict(cmd)
-    # 2) Fall back to the kind for the FE-synthesized cards (no actions array).
-    kind = pd.get("kind")
-    agent = pd.get("agent")
+                phrase = _ACTION_PHRASE.get(act, "carry on" if want_resume else "move past it")
+                return _cmd_spec(dict(cmd),
+                                 phrase.replace("{Ag}", _agent_display(_lc(cmd.get("agent")) or ag)))
+        return None
+
+    if have:
+        return scan(True), scan(False)
     phase = pd.get("phase")
-    if kind == "agent_link_failed" and agent:
-        return {"action": "agent_decision", "agent": agent,
-                "decision": "retry" if want_resume else "skip"}
-    if kind == "human_verification_required":
-        if want_resume:
-            return {"action": "resume"}
-        return {"action": "skip_agent", "agent": agent} if agent else {"action": "skip_init_verify"}
-    if kind == "login_required" and not want_resume:
-        return {"action": "skip_init_verify"}
-    # login_required(retry) / pipeline_error / pro_required / generic.
-    cmd2: dict = {"action": "retry_phase" if want_resume else "skip_phase"}
-    if isinstance(phase, int):
-        cmd2["phase"] = phase
-    return cmd2
+    return (_cmd_spec({"action": "retry_phase", **_ph(phase)}, "resume"),
+            _cmd_spec({"action": "skip_phase", **_ph(phase)}, "move past this step"))
+
+
+def _offers_for(card: str, pd: dict) -> tuple:
+    """``(resume_spec | None, skip_spec | None)`` for a classified card. A None
+    means THIS CARD HAS NO SUCH ACTION — chat must not offer the verb, and
+    /resolve refuses it rather than writing a command nothing executes."""
+    agent = _lc(pd.get("agent"))
+    phase = pd.get("phase")
+    ph = phase if isinstance(phase, int) and not isinstance(phase, bool) else None
+    who = _agent_display(agent)
+    drop = _cmd_spec({"action": "skip_agent", "agent": agent},
+                     f"drop {who} from this run") if agent else None
+    if card == "env_missing_key":
+        return (_cmd_spec({"action": "retry_phase", "phase": 0}, "try again with the key in place"),
+                _cmd_spec({"action": "skip_init_verify"}, "carry on without a key"))
+    if card == "login_walk":
+        return (_cmd_spec({"action": "retry_phase", "phase": 0}, "check the sign-in again"),
+                _cmd_spec({"action": "skip_init_verify"}, "skip the sign-in check"))
+    if card == "login_worktab":
+        # ⛔⛔ skip_agent, NOT skip_init_verify. The work-tab loop watches
+        # `skipped_agents`; skip_init_verify only calls request_resume, which
+        # that loop reads as the user tapping RETRY — so it re-probes the still
+        # signed-out page and re-cards the same wall, forever.
+        return (_cmd_spec({"action": "retry_phase", **_ph(phase)}, "check the sign-in again"),
+                drop)
+    if card == "hv_solvable":
+        return (_cmd_spec({"action": "resume"}, "carry on"), drop)
+    if card == "hv_wall":
+        return (None, drop)
+    if card == "agent_link_failed":
+        if not agent:
+            return _generic_offers(pd)
+        return (_cmd_spec({"action": "agent_decision", "agent": agent, "decision": "retry"},
+                          f"try {who}'s link again"),
+                _cmd_spec({"action": "agent_decision", "agent": agent, "decision": "skip"},
+                          f"drop {who}"))
+    if card == "pro_required":
+        # ⛔ At phase 2 research.py deliberately withholds the Retry token: a
+        # phase restart there cancels run_phase2 and nukes every in-flight deep
+        # research. Chat used to mint retry_phase(2) anyway via the generic
+        # fallback — the one command the backend refuses to offer.
+        resume = None if ph == 2 else _cmd_spec({"action": "retry_phase", **_ph(phase)},
+                                                "re-check the plan")
+        skip = (_cmd_spec({"action": "skip_init_verify"}, "skip the sign-in check")
+                if ph == 0 else drop)
+        return (resume, skip)
+    if card == "crash_login_interrupt":
+        return (_QUEUE_RESUME, None)
+    if card == "crash_loop":
+        return (_QUEUE_RESUME, _CLEAR_CARD)
+    if card == "pipeline_error":
+        return _generic_offers(pd)
+    return (None, None)  # unknown
+
+
+_STATUS_CARD_OF = {
+    "paused_backend_restart": "backend_restart",
+    "paused_backend_restart_failed": "restart_failed",
+    "stopped_by_watchdog": "watchdog_stop",
+    "errored": "errored",
+}
+
+
+def _decision_plan(pd: dict | None) -> dict | None:
+    """What a blocked run's card is, and what chat can actually DO about it.
+
+    None means there is no card. A plan whose ``resume``/``skip`` is None means
+    the card exists and offers no such action — a different answer, and the one
+    that stops chat promising a button that isn't there."""
+    if not isinstance(pd, dict) or not pd:
+        return None
+    card = _card_id(pd)
+    resume, skip = _offers_for(card, pd)
+    details = pd.get("details")
+    if not isinstance(details, str) or not details.strip():
+        details = None
+    elif len(details) > _DETAILS_MAX:
+        details = details[:_DETAILS_MAX].rstrip() + "…"
+    return {
+        "card": card,
+        "phase": pd.get("phase") if isinstance(pd.get("phase"), int)
+        and not isinstance(pd.get("phase"), bool) else None,
+        "agent": _lc(pd.get("agent")) or None,
+        "machine": (pd.get("machineName").strip() or None
+                    if isinstance(pd.get("machineName"), str) else None),
+        "platform": _first_label(pd),
+        "reason": str(pd.get("title") or pd.get("message") or pd.get("reason")
+                      or "a decision is needed"),
+        "details": details,
+        "resume": resume,
+        "skip": skip,
+    }
+
+
+def _first_label(pd: dict) -> str | None:
+    for key in ("platformLabels", "platforms"):
+        v = pd.get(key)
+        if isinstance(v, list) and v and isinstance(v[0], str) and v[0].strip():
+            return v[0].strip()
+    v = pd.get("platformLabel")
+    return v.strip() if isinstance(v, str) and v.strip() else None
+
+
+def _status_plan(status: str) -> dict:
+    """A run blocked by STATUS alone — no card was ever written, because the app
+    draws its own recovery banner for these. Chat had nothing at all: /resolve
+    answered "this run isn't waiting on a decision" for a run the app offers a
+    working Resume on."""
+    card = _STATUS_CARD_OF[status]
+    reason = {"backend_restart": "paused after a backend restart",
+              "restart_failed": "paused after a backend restart",
+              "watchdog_stop": "stopped by the watchdog",
+              "errored": "the run hit an error"}[card]
+    resume = None if card == "errored" else _QUEUE_RESUME
+    return {"card": card, "phase": None, "agent": None, "machine": None,
+            "platform": None, "reason": reason, "details": None,
+            "resume": resume, "skip": None}
+
+
+def _run_plan(doc: dict) -> dict | None:
+    """THE single entry point. Both the /updates row and the /resolve route call
+    this over the same decoded doc, so what chat is told it can do and what
+    /resolve will actually honour cannot drift apart."""
+    if not isinstance(doc, dict):
+        return None
+    plan = _decision_plan(doc.get("pendingDecision"))
+    if plan is not None:
+        return plan
+    status = doc.get("status")
+    if status in _STATUS_CARD_OF:
+        return _status_plan(status)
+    return None
+
+
+def _plan_offers(plan: dict | None) -> list:
+    if not plan:
+        return []
+    return [v for v in ("retry", "skip")
+            if plan.get("resume" if v == "retry" else "skip") is not None]
+
+
+def _attention_action(plan: dict | None) -> str | None:
+    """The ONE imperative sentence chat shows under a blocker: what the person
+    must do, and only the verbs that actually work for this card."""
+    if not plan:
+        return None
+    card = plan["card"]
+    M = plan.get("machine") or "the research computer"
+    P = plan.get("platform") or "the platform"
+    Ag = _agent_display(plan.get("agent"))
+    if card == "env_missing_key":
+        return (f"Add an Anthropic API key on {M} (Account → API Config), then reply "
+                "“retry”. Reply “skip” to carry on without one.")
+    if card == "login_walk":
+        return (f"Sign in to {P} in the browser open on {M}, then reply “retry”. "
+                "Reply “skip” to skip the sign-in check.")
+    if card == "login_worktab":
+        tail = f" Reply “skip” to drop {Ag} from this run instead." if plan["skip"] else ""
+        return (f"Sign in to {Ag} in the browser open on {M} — the run picks up on "
+                f"its own once you are in.{tail}")
+    if card == "hv_solvable":
+        tail = f" Reply “skip” to drop {Ag} instead." if plan["skip"] else ""
+        return f"Finish the check on {M} — the run carries on by itself once it clears.{tail}"
+    if card == "hv_wall":
+        if plan["skip"]:
+            return (f"This check can’t be cleared by retrying. Reply “skip” to drop "
+                    f"{Ag} and carry on, or open the app.")
+        return "This check can’t be cleared from chat — open the app."
+    if card == "pro_required":
+        free = " Continuing on the free tier is a choice only the app offers."
+        if plan["resume"] is None:
+            return (f"Reply “skip” to drop {Ag} from this run. Retry isn’t available "
+                    f"here — it would restart the whole research step.{free}")
+        skip_txt = ("“skip” to skip the sign-in check" if plan.get("phase") == 0
+                    else f"“skip” to drop {Ag} from this run")
+        return f"Reply “retry” to re-check the plan, or {skip_txt}.{free}"
+    if card == "crash_login_interrupt":
+        return ("Reply “retry” to pick the run up from its last checkpoint. There is "
+                "no skip on this one — reply “stop” to end it.")
+    if card == "crash_loop":
+        return ("Reply “retry” to start again from the last checkpoint, or “skip” to "
+                "put this card away and leave the run stopped.")
+    if card in ("backend_restart", "watchdog_stop"):
+        return "Reply “retry” and I’ll ask your computer to pick it up from its last checkpoint."
+    if card == "restart_failed":
+        return ("Reply “retry” and I’ll ask your computer to pick it up — its checkpoint "
+                "may be incomplete, so the app can tell you more.")
+    if card == "errored":
+        return "Open the app to see what went wrong."
+    if card == "unknown":
+        return "Open the app to see what this one needs."
+    # pipeline_error / agent_link_failed — named by whatever the card offers.
+    r, s = plan["resume"], plan["skip"]
+    if r and s:
+        return f"Reply “retry” to {r['phrase']}, or “skip” to {s['phrase']}."
+    if r:
+        return (f"Reply “retry” to {r['phrase']}. There is no skip on this one — "
+                "reply “stop” to end the run.")
+    if s:
+        return f"Reply “skip” to {s['phrase']}. Retry isn’t available on this one."
+    return "Open the app to answer this one — it needs a choice chat can’t make yet."
+
+
+def _attention_extras(plan: dict | None) -> tuple:
+    """``(attentionAction, attentionDetails, attentionOffers)`` for a run row."""
+    if not plan:
+        return None, None, []
+    return _attention_action(plan), plan.get("details"), _plan_offers(plan)
+
+
+def _no_action_sentence(plan: dict, intent: str) -> str:
+    verb = "Retry" if intent == "retry" else "Skip"
+    tail = _attention_action(plan) or "Open the app to act on it."
+    return f"That card has no {verb}. {tail}"
+
+
+def _resume_email() -> str:
+    """The ``email`` a queue resume carries. "" ON PURPOSE.
+
+    A resumed run reads its delivery preferences from delivery.json in its own
+    queue folder — which is why the backend's own boot-time auto-resume enqueues
+    ``"email": ""`` with exactly that comment. Sending the signed-in account's
+    address instead would override both the sendEmail toggle and the confirmed-
+    recipient gate, i.e. decide who gets mail on the person's behalf.
+
+    ⚠ The web app's resume handler carries a comment claiming the opposite (that
+    a resume without an address loses the report email). That was NOT settled by
+    measurement — the backend has no mail transport and P5 is sent by the front
+    end, which re-resolves the recipient itself, but no live resume was observed
+    end to end. If one is, and the report email is genuinely lost, replace this
+    with a full port of the app's loadSettings → sendEmail → loadTrustedRecipient
+    chain — NOT the session's own address, which bypasses both gates."""
+    return ""
 
 
 def _self_logout(state: BridgeState, sess: AccountSession | None) -> bool:
@@ -3260,11 +3636,27 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # `srLinks` = the permanent share links (the ones in the delivered doc).
             # `phaseUpdates` = the per-phase plan (permanent SR links + platform-only
             # links for NotebookLM/YouTube/final Doc) — what `status` should render.
+            # The same five attention keys /updates rows carry, injected into the
+            # returned research map. ⛔ Without this, `sr status` printed NO
+            # blocker line at all for a run blocked by STATUS (a backend restart,
+            # the watchdog) while `sr updates` printed one — the same run, two
+            # answers, depending which command you asked with. `_redact_doc_media`
+            # returns a shallow copy, so mutating it here cannot touch the cache.
+            _doc_view = dict(_redact_doc_media(doc))
+            _plan = _run_plan(doc)
+            _act, _det, _offers = _attention_extras(_plan)
+            _attn = _attention_text(doc)
+            _doc_view["needsAttention"] = (_attn is not None
+                                           or doc.get("status") in _ATTENTION_STATUSES)
+            _doc_view["attention"] = _attn
+            _doc_view["attentionAction"] = _act
+            _doc_view["attentionDetails"] = _det
+            _doc_view["attentionOffers"] = _offers
             self._json(200, {
                 # Redact the tokenized Storage audio URL from both the raw doc and
                 # the flattened events — it must never reach a chat client (the
                 # media itself is served by /research/<rid>/podcast as a local file).
-                "research": _redact_doc_media(doc),
+                "research": _doc_view,
                 "events": _redact_media_urls(runview.flatten_links(doc.get("links"))),
                 "srLinks": sr,
                 "phaseUpdates": _phase_updates(doc, sr),
@@ -3423,6 +3815,10 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                             and (co.get("chat_id") or "").strip() == want_chat):
                         continue
                 attention = _attention_text(r)
+                # The SAME plan /resolve will act on, so the verbs this row
+                # advertises are exactly the verbs that route will honour.
+                _plan = _run_plan(r)
+                _act, _det, _offers = _attention_extras(_plan)
                 needs = attention is not None or status in _ATTENTION_STATUSES
                 # active=1 keeps the in-flight runs AND any run that needs the
                 # user — an errored/paused run isn't "ongoing" but is exactly what
@@ -3463,6 +3859,15 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                     "viaAgent": bool(r.get("viaAgent")),
                     "needsAttention": needs,
                     "attention": attention,
+                    # What the person must DO, named by the card rather than
+                    # guessed from a kind literal three situations share; the
+                    # card's own second sentence; and the verbs that actually
+                    # work. ⛔ `attentionOffers` ABSENT means "an older bridge,
+                    # assume both"; PRESENT-AND-EMPTY means "neither works".
+                    # A client that conflates the two goes silent.
+                    "attentionAction": _act,
+                    "attentionDetails": _det,
+                    "attentionOffers": _offers,
                 })
             out: dict[str, Any] = {"runs": runs}
             # The event this request took, if any — restored on a failed send.
@@ -3727,16 +4132,42 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             if not device_id:
                 self._json(409, {"error": "run has no device"})
                 return
+            # ⛔⛔ A RESUME OF A RESTART-PAUSED RUN CANNOT GO DOWN THIS CHANNEL.
+            # `paused_backend_restart` means the daemon that owned this run is
+            # gone, so its per-run command listener is unbound: the write lands,
+            # is never consumed, and this route answered 200 — chat said
+            # "▶ Resumed" for a run that never moved. Route those to the same
+            # queue transport /resolve uses, which the always-alive start
+            # listener serves. A normally-paused run keeps today's path: its
+            # listener IS bound and the command is the correct, cheaper write.
+            _plan = _run_plan(doc) if action == "resume" else None
+            _spec = (_plan or {}).get("resume")
+            _queue = bool(_spec) and _spec["transport"] == "queue_resume"
+            transport = "command"
             try:
-                fs.write_command(sess.uid, rid, action, device_id=device_id)
+                if _queue:
+                    brid = (doc.get("backendRunId") or "").strip()
+                    if not brid:
+                        self._json(409, {
+                            "error": "this run has no checkpoint to resume from — "
+                                     "start a new research instead",
+                            "reason": "no_checkpoint"})
+                        return
+                    fs.enqueue_resume(device_id, uid=sess.uid, research_id=rid,
+                                      backend_run_id=brid, email=_resume_email())
+                    transport = "queue_resume"
+                else:
+                    fs.write_command(sess.uid, rid, action, device_id=device_id)
             except RevokedError:
                 self._json(401, {"error": "session revoked — run /login again"})
                 return
             except FirestoreError as e:
                 self._firestore_502(e)
                 return
-            log.info("%s requested for run %s on device %s", action, rid, device_id)
-            self._json(200, {"ok": True, "runId": rid, "deviceId": device_id})
+            log.info("%s requested for run %s on device %s (via %s)",
+                     action, rid, device_id, transport)
+            self._json(200, {"ok": True, "runId": rid, "deviceId": device_id,
+                             "transport": transport})
 
         def _research_pause(self, rid: str) -> None:
             """Pause a RUNNING run (resumable). BE action:"pause" → request_pause."""
@@ -3776,26 +4207,60 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             if doc is None:
                 self._json(404, {"error": "run not found"})
                 return
-            cmd = _decision_command(doc.get("pendingDecision"), intent)
-            if cmd is None:
+            plan = _run_plan(doc)
+            if plan is None:
                 self._json(409, {"error": "nothing to resolve — this run isn't waiting on a decision"})
+                return
+            spec = plan["resume"] if intent == "retry" else plan["skip"]
+            # ⛔⛔ THE CARD EXISTS AND HAS NO SUCH BUTTON — a different answer
+            # from "no card", and the whole of the phantom-skip fix. Chat used
+            # to mint a plausible command here: on the browser-launch failure
+            # card that command TERMINATED THE RUN while chat said "skipping the
+            # blocker", and on a work-tab sign-in wall it re-carded forever.
+            # 409 (not 400) so an un-updated sr.py still prints this sentence.
+            if spec is None:
+                self._json(409, {"error": _no_action_sentence(plan, intent),
+                                 "reason": "no_such_action",
+                                 "card": plan["card"],
+                                 "offers": _plan_offers(plan)})
                 return
             device_id = (doc.get("deviceId") or "").strip()
             if not device_id:
                 self._json(409, {"error": "run has no device"})
                 return
-            action = cmd.pop("action")
+            transport = spec["transport"]
             try:
-                fs.write_command(sess.uid, rid, action, device_id=device_id, extra=cmd or None)
+                if transport == "command":
+                    cmd = dict(spec["command"])
+                    action = cmd.pop("action")
+                    fs.write_command(sess.uid, rid, action, device_id=device_id,
+                                     extra=cmd or None)
+                elif transport == "queue_resume":
+                    brid = (doc.get("backendRunId") or "").strip()
+                    if not brid:
+                        self._json(409, {
+                            "error": "this run has no checkpoint to resume from — "
+                                     "start a new research instead",
+                            "reason": "no_checkpoint", "card": plan["card"]})
+                        return
+                    fs.enqueue_resume(device_id, uid=sess.uid, research_id=rid,
+                                      backend_run_id=brid, email=_resume_email())
+                    action = "resume"
+                else:  # clear_card — the bridge's equivalent of the app's Discard
+                    fs.update_research(sess.uid, rid, {},
+                                       delete_fields=["pendingDecision"])
+                    action = "discard"
             except RevokedError:
                 self._json(401, {"error": "session revoked — run /login again"})
                 return
             except FirestoreError as e:
                 self._firestore_502(e)
                 return
-            log.info("resolve(%s) run %s on device %s (%s)", intent, rid, device_id, action)
+            log.info("resolve(%s) run %s on device %s (%s via %s)",
+                     intent, rid, device_id, action, transport)
             self._json(200, {"ok": True, "runId": rid, "deviceId": device_id,
-                             "intent": intent, "action": action})
+                             "intent": intent, "action": action,
+                             "transport": transport, "card": plan["card"]})
 
         def _research_skip(self, rid: str) -> None:
             """Skip phases and/or P2 agents of a run (the chat /sr-skip). Writes

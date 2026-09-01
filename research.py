@@ -49941,6 +49941,15 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
         "agent": platform_key,
         "platformLabel": platform.capitalize(),
         "reason": reason or "Human verification challenge",
+        # The card's own verdict, so a reader doesn't have to re-derive it. ⛔
+        # `reason` is NOT a reliable source: it is a non-latching nonlocal that
+        # later probes overwrite, so a Cloudflare wall whose last probe landed
+        # in the Turnstile gap persists as plain "human verification" — and any
+        # reader keying on the word "cloudflare" then offers a Resume this gate
+        # will refuse. `_hv_intent` is decided once, here, from the same input
+        # that chose the copy and the buttons. The agent bridge prefers this and
+        # falls back to the word test for a card written before this existed.
+        "hvIntent": _hv_intent,
         "message": _hv_msg,
         "alert_id": _hv_alert_id,
     })
