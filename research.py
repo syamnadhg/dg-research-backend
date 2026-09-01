@@ -2863,6 +2863,91 @@ def _folder_is_live(path) -> bool:
     return _derive_run_status(meta) == "running"
 
 
+CLOUD_LOG_FILENAME = "cloud.log"
+# Only runs touched inside this window are candidates. P4/P5 finish minutes
+# after the pipeline returns, not days, so a 24h window catches every run whose
+# cloud half could still be arriving while keeping the query count tiny.
+CLOUD_LOG_PULL_WINDOW_SEC = 24 * 60 * 60
+CLOUD_LOG_PULL_INTERVAL_SEC = 15 * 60
+# Never query more than this many folders on one tick, newest first.
+CLOUD_LOG_PULL_MAX_FOLDERS = 10
+# ⛔ THE COLLECTOR'S CAP DECIDES PER RUN, NOT PER FILE — a run whose folder
+# exceeds the remaining budget is dropped from the bundle WHOLE, machine logs
+# and all. A run with no cloud log is better off than a run with no logs, so
+# this file is bounded well below anything that could tip a folder over.
+CLOUD_LOG_MAX_BYTES = 512 * 1024
+
+
+def _queue_owner_map(queues_root=None) -> "dict[str, str]":
+    """researchId → uid, read from the queue directories' `owner.json`.
+
+    ⛔⛔ THIS EXISTS BECAUSE A RUN FOLDER CANNOT NAME ITS OWN OWNER. `meta.json`
+    carries a researchId and no uid at all — measured on this machine, five of
+    six run folders have neither `submitterUid` nor `claimedBy` — so a folder
+    alone cannot address `users/{uid}/researches/{rid}` and cannot be asked
+    anything about itself. The queue directory is the only place on disk where
+    both halves of the key sit together.
+
+    ⚠ AND THAT IS THE LIMIT OF THE WHOLE FEATURE, STATED ONCE HERE: a run whose
+    queue directory has already been swept keeps whatever cloud lines it has and
+    gains no new ones. It is not silently degraded — `_pull_cloud_logs` counts
+    those folders so the caller can say so."""
+    out: "dict[str, str]" = {}
+    base = Path(queues_root) if queues_root is not None else (Path(__file__).parent / "queues")
+    try:
+        entries = [d for d in base.iterdir() if d.is_dir()]
+    except OSError:
+        return out
+    for d in entries:
+        try:
+            owner = json.loads((d / "owner.json").read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        uid = str(owner.get("uid") or "").strip()
+        rid = str(owner.get("researchId") or "").strip()
+        if uid and rid:
+            out[rid] = uid
+    return out
+
+
+def _render_cloud_log(docs) -> str:
+    """Turn the cloud's captured records into one file for the run folder.
+
+    ⛔ SORTED BY THE RECORD'S OWN TIMESTAMP, not by whatever order Firestore
+    returned. There is deliberately no `seq` on these documents — that absence is
+    what keeps them out of the app's live listener and out of chat's narration —
+    so the usual ordering field is not available and the write time is the only
+    ordering there is."""
+    rows = []
+    for d in docs:
+        try:
+            data = d.get("data") if isinstance(d, dict) else None
+        except Exception:
+            data = None
+        if not isinstance(data, dict):
+            continue
+        rows.append((int(d.get("timestamp") or 0), d))
+    rows.sort(key=lambda r: r[0])
+    out: "list[str]" = []
+    for _ts, d in rows:
+        data = d.get("data") or {}
+        phase = d.get("phase")
+        inv = str(data.get("invocation") or "")[:8]
+        out.append(f"── cloud phase {phase} · invocation {inv} ──")
+        for line in (data.get("lines") or []):
+            out.append(str(line))
+        dropped = int(data.get("dropped") or 0)
+        if dropped:
+            out.append(f"── {dropped} further line(s) dropped at the capture bound ──")
+    text = "\n".join(out)
+    if len(text) > CLOUD_LOG_MAX_BYTES:
+        keep = CLOUD_LOG_MAX_BYTES - 120
+        text = (text[:keep]
+                + f"\n── truncated at {CLOUD_LOG_MAX_BYTES} bytes; the cloud half of this "
+                  "run was longer than a support bundle will carry ──")
+    return text + "\n"
+
+
 def _run_log_folders_for_research(research_id, root=None) -> "list[Path]":
     """Every run-log folder this machine holds for one research, safe to delete.
 
@@ -2906,6 +2991,109 @@ def _run_log_folders_for_research(research_id, root=None) -> "list[Path]":
         if _folder_is_live(folder):
             continue
         out.append(folder)
+    return out
+
+
+_cloud_pull_next_ms = 0
+
+
+def _cloud_pull_due(now_ms=None) -> bool:
+    """Is the cloud-log pull due? Advances the clock when it says yes.
+
+    Same shape and the same reason as `_prune_due`: the caller is the 5-second
+    heartbeat, so a predicate that only read the deadline would run a Firestore
+    query per run folder twelve times a minute."""
+    global _cloud_pull_next_ms
+    stamp = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    if stamp < _cloud_pull_next_ms:
+        return False
+    _cloud_pull_next_ms = stamp + int(CLOUD_LOG_PULL_INTERVAL_SEC) * 1000
+    return True
+
+
+def _pull_cloud_logs(db=None, runs_root=None, queues_root=None, now=None) -> dict:
+    """Bring the cloud's own log lines down into each run's folder.
+
+    ⛔⛔ THIS IS THE HALF THAT MAKES THE ITEM TRUE, and the signed design could
+    not deliver it. The item asked for the lines to be written "into the run's
+    own record so they ride the send-logs bundle" — but the collector NEVER
+    READS FIRESTORE. It is disk-only, allow-listed to under
+    `~/.super-research/logs/`, and a scan of `_build_log_bundle` for any database
+    call returns zero hits. A field on the run record would have been collected
+    by nothing. So the cloud writes a record, and THIS pulls it onto the disk the
+    collector already walks — where `folder.rglob("*")` picks it up with no
+    collector change at all.
+
+    ⛔ IT WRITES INTO A SEALED FOLDER, ON PURPOSE. The run folder is finalized
+    within milliseconds of the pipeline returning while P4 and P5 run for minutes
+    afterwards on a detached thread, so there is no version of this that lands
+    before the seal. The pattern is `_patch_run_log_status`'s: reach into the
+    finished folder and write atomically.
+
+    ⚠ ITS OWN DIAGNOSTICS GO TO THE MACHINE LOG, NOT THE RUN FOLDER, because the
+    heartbeat that hosts it is `@_machine_logged`. That is correct rather than a
+    limitation — "I pulled 3 runs' cloud logs" is a fact about the machine — but
+    it means a failure to pull is NOT recorded in the folder it failed to fill.
+    """
+    out = {"updated": 0, "unattributable": 0, "queried": 0}
+    fs = _firebase_db if db is None else db
+    if fs is None:
+        return out
+    now_t = time.time() if now is None else float(now)
+    base = Path(runs_root) if runs_root is not None else _runs_log_root()
+    try:
+        folders = [p for p in base.iterdir() if p.is_dir()]
+    except OSError:
+        return out
+    fresh = [p for p in folders if (now_t - _safe_mtime(p)) <= CLOUD_LOG_PULL_WINDOW_SEC]
+    fresh.sort(key=_safe_mtime, reverse=True)
+    fresh = fresh[:CLOUD_LOG_PULL_MAX_FOLDERS]
+    if not fresh:
+        return out
+    owners = _queue_owner_map(queues_root)
+    for folder in fresh:
+        try:
+            meta = json.loads((folder / "meta.json").read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        rid = str(meta.get("researchId") or "").strip()
+        if not rid:
+            continue
+        uid = str(meta.get("submitterUid") or "").strip() or owners.get(rid, "")
+        if not uid:
+            # No key, no query. Counted rather than skipped silently — this is
+            # the measured majority case on a machine whose queue dirs have
+            # aged out, and a caller that reports "0 updated" without it reads
+            # like the cloud sent nothing.
+            out["unattributable"] += 1
+            continue
+        try:
+            col = (fs.collection("users").document(uid)
+                     .collection("researches").document(rid)
+                     .collection("pipeline_events"))
+            docs = [d.to_dict() for d in _fs_where(col, "type", "==", "cloud_logs").stream()]
+            out["queried"] += 1
+        except Exception:
+            continue
+        if not docs:
+            continue
+        text = _render_cloud_log(docs)
+        target = folder / CLOUD_LOG_FILENAME
+        try:
+            if target.exists() and target.read_text(encoding="utf-8") == text:
+                # ⭐ Nothing new. Rewriting an identical file would move the
+                # folder's mtime every quarter of an hour, which is the clock
+                # the age bound and the bundle's own run selection both read —
+                # a run would look freshly touched for as long as the machine
+                # stayed up.
+                continue
+        except OSError:
+            pass
+        try:
+            _atomic_write_text(target, text)
+            out["updated"] += 1
+        except Exception:
+            continue
     return out
 
 
@@ -6629,6 +6817,29 @@ RESEARCH_CONFIG_PATH = _STATE_DIR / "research_config.json"
 _LEGACY_PIPE_CONFIG_PATH = _STATE_DIR / "pipe_config.json"
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """`_atomic_write_json`'s sibling for content that is not JSON.
+
+    ⛔ SAME REASON, DIFFERENT READER. The cloud-log file is written into a run
+    folder that the bundle collector may walk at any moment — Send Logs is a
+    button a person presses, not something this process schedules — so a reader
+    must never catch it half-written. `os.replace` onto the target is atomic on
+    POSIX and Windows when both live in the same directory, which they do."""
+    import tempfile
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp_path, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def _atomic_write_json(path: Path, data: dict) -> None:
     """Atomic JSON dump: write to a sibling temp file, then os.replace
     onto the target. Guarantees readers in another process/thread never
@@ -7288,6 +7499,39 @@ async def _heartbeat_loop():
                                 f"past {LOCAL_LOG_MAX_AGE_DAYS} days", "INFO")
                 except Exception as _pr_err:
                     log(f"[heartbeat] retention sweep skipped ({_pr_err})", "DEBUG")
+
+                # ⛔⛔ THE CLOUD'S HALF OF A RUN, BROUGHT DOWN TO THE DISK THE
+                # COLLECTOR ACTUALLY WALKS. Measured 2026-09-01: across six run
+                # folders the P4/P5 dispatch string appears ZERO times, against
+                # 23 in the machine-wide log. P4 and P5 execute in the cloud, so
+                # everything they print has always been in a platform log nobody
+                # cutting a support bundle can reach — including the machine's
+                # own line saying it dispatched them.
+                #
+                # ⭐ HERE, and not in the collector, because the collector never
+                # reads Firestore at all: it is disk-only and allow-listed to
+                # under ~/.super-research/logs/. Landing the lines as a FILE in
+                # the run folder is what lets the existing `rglob("*")` ship them
+                # with no collector change and no bundle-contract edit — the
+                # contract is pinned byte-identical in both repos and by SHA-256
+                # in the suite, so raising a bound would be a four-file, two-repo
+                # change.
+                try:
+                    if _cloud_pull_due(_now_ms):
+                        _cl = await asyncio.wait_for(
+                            asyncio.to_thread(_pull_cloud_logs), timeout=30.0)
+                        if _cl.get("updated"):
+                            log(f"[heartbeat] pulled cloud logs into {_cl['updated']} run "
+                                f"folder(s)", "INFO")
+                        if _cl.get("unattributable"):
+                            # ⚠ SAID OUT LOUD. A run whose queue directory has
+                            # aged out carries no uid anywhere on disk, so its
+                            # cloud half cannot be fetched. Reporting only
+                            # "updated 0" would read as "the cloud sent nothing".
+                            log(f"[heartbeat] {_cl['unattributable']} run folder(s) have no "
+                                f"owner on disk — their cloud logs cannot be fetched", "DEBUG")
+                except Exception as _cl_err:
+                    log(f"[heartbeat] cloud log pull skipped ({_cl_err})", "DEBUG")
 
                 # One-shot: report the outcome of an app-driven update that ran while
                 # this backend was down. Deliberately here rather than at boot — the
