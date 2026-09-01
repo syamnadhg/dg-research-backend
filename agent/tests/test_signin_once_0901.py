@@ -204,6 +204,35 @@ def test_a_send_that_raises_puts_the_note_AND_the_watermark_back(live, monkeypat
         "the watermark must be back too, or the re-mint refuses to recover this")
 
 
+def test_a_RE_MINT_lost_to_a_dropped_connection_also_rolls_its_claim_back(
+        live, monkeypatch):
+    """⛔⛔ THE OTHER HALF OF THE SAME ROLLBACK, AND MY FIRST TEST ONLY COVERED THE
+    PARKED PATH — mutation caught it (B4 survived). A re-mint has no note to restore, so
+    the watermark is the ONLY thing standing between a dropped connection and permanent
+    silence: leave it advanced and this sign-in can never be re-derived by anybody."""
+    base, state = live
+    prefs.set_announced_signin_ms(1_000, "u1")      # cap is 7_000 → a re-mint is due
+    assert state.signed_in is None, "this path needs NOTHING parked"
+
+    real = bridge.BaseHTTPRequestHandler.send_response
+
+    def boom(self, *a, **k):
+        raise BrokenPipeError("reader vanished")
+
+    monkeypatch.setattr(bridge.BaseHTTPRequestHandler, "send_response", boom)
+    try:
+        requests.get(base + "/updates?via=agent", timeout=5)
+    except Exception:
+        pass
+    monkeypatch.setattr(bridge.BaseHTTPRequestHandler, "send_response", real)
+
+    assert prefs.get_announced_signin_ms("u1") == 1_000, (
+        "a re-mint nobody received must leave the watermark where it found it")
+    # …and the proof that it is recoverable: the very next read re-mints it.
+    got = requests.get(base + "/updates?via=agent", timeout=5).json()
+    assert got.get("signedIn", {}).get("ts") == 7_000
+
+
 # ── 2. THE CLAIM IS ATOMIC (measured 24/24 before the fix) ───────────────────
 
 def test_twenty_four_concurrent_re_mints_produce_exactly_one():
@@ -295,28 +324,44 @@ def test_the_rollback_removes_the_keys_when_there_was_no_mark():
 
 # ── 3. A HALF-FORMED ADDRESS IS NOT A DEAD LETTER ────────────────────────────
 
-def test_a_half_formed_address_is_treated_as_anonymous_not_as_undeliverable(live):
+def test_a_half_formed_address_is_treated_as_anonymous_not_as_undeliverable(monkeypatch):
     """⛔⛔ THE DEAD LETTER. `{"platform": "telegram"}` with no chat_id is neither
     ADDRESSED (no chat to match) nor UNADDRESSED (the origin is truthy), so every reader
     took it, failed the gate, and parked it again — forever. And because the note stayed
     parked, the re-mint that recovers a lost announce never ran either.
 
     `_same_origin` already treats an unusable half-origin as anonymous; cleaning at the
-    mint makes the note agree with it."""
-    base, state = live
-    flow = bridge.RemoteFlow("pt", "CODE", "https://x/y", 9e18)
-    flow.origin = {"platform": "telegram"}          # no chat_id — unusable
-    assert bridge._clean_origin(flow.origin) is None
-    state.set_signed_in({"ts": 7_000, "uid": "u1", "email": "e@x.y",
-                         "origin": bridge._clean_origin(flow.origin)})
-    got = requests.get(base + "/updates?via=agent", timeout=5).json()
-    assert got.get("signedIn", {}).get("email") == "e@x.y", (
-        "a half-formed address must fall back to anonymous, not dead-letter")
+    mint makes the note agree with it.
+
+    ⛔⛔ AND THIS TEST'S FIRST VERSION CALLED `_clean_origin` ITSELF and parked the
+    result — so it pinned the HELPER and left the MINT free to store the address raw.
+    Mutation caught it: both F-mutants survived. Third time this shape has cost me a
+    round; the subject has to be the CALLER."""
+    monkeypatch.setattr(bridge, "FirestoreRest", FakeFS)
+    state = bridge.BridgeState()
+    _capture(monkeypatch, state, cap=7_000, origin={"platform": "telegram"})
+    note = state.signed_in
+    assert note is not None, "capture must park an announce"
+    assert note["origin"] is None, (
+        f"an unusable half-address must be stored as anonymous, got {note['origin']!r}")
 
 
-def test_a_whole_address_is_still_honoured(live):
+def test_the_mint_keeps_a_whole_address(monkeypatch):
     """The cleaning must not flatten a USABLE address into anonymous — that would hand
-    every chat-initiated sign-in to whichever watcher polled first."""
+    every chat-initiated sign-in to whichever watcher polled first, which is the
+    wrong-chat bug arriving through the fix for the dead letter."""
+    monkeypatch.setattr(bridge, "FirestoreRest", FakeFS)
+    state = bridge.BridgeState()
+    _capture(monkeypatch, state, cap=7_000,
+             origin={"platform": "telegram", "chat_id": "111"})
+    note = state.signed_in
+    assert note["origin"] == {"platform": "telegram", "chat_id": "111"}, (
+        f"a usable address must survive the mint, got {note['origin']!r}")
+
+
+def test_a_whole_address_is_still_routed_to_its_own_chat_only(live):
+    """The routing half, at the gate rather than the mint — so a change to either end is
+    visible."""
     base, state = live
     state.set_signed_in({"ts": 7_000, "uid": "u1", "email": "e@x.y",
                          "origin": {"platform": "telegram", "chat_id": "111"}})
@@ -367,6 +412,29 @@ def test_login_done_takes_a_plain_note_but_keeps_the_device_aware_greeting(live,
     assert sr.main(["login-done"]) == 0
     out = capsys.readouterr().out
     assert "access code" in out, out
+    assert state.signed_in is None, "the note must still be taken"
+
+
+def test_login_done_keeps_the_cue_to_act_for_a_topic_only_note(live, capsys):
+    """⛔⛔ A DEFECT I FOUND IN MY OWN FIX. The note's FOURTH case is the legacy fallback,
+    *"Continue with X? Say go ahead and I'll start it."* — a question aimed at the
+    PERSON. SKILL.md step 2 is written against *"Continuing your research on X…"* and
+    treats it as the cue to run `research` at once, so preferring the note here swaps a
+    cue-to-act for a question and the topic is stranded: the assistant waits for a "go
+    ahead" that was already given.
+
+    ⭐ The note is STILL taken — that is what stops the watchdog repeating the news."""
+    base, state = live
+    flow = bridge.RemoteFlow("pt", "CODE", "https://x/y", 9e18)
+    flow.state = "connected"
+    flow.pending_topic = "quantum error correction"
+    state.set_remote(flow)
+    state.set_signed_in({"ts": 7_000, "uid": "u1", "email": "e@x.y", "origin": None,
+                         "pendingTopic": "quantum error correction"})
+    assert sr.main(["login-done"]) == 0
+    out = capsys.readouterr().out
+    assert "Continuing your research" in out, out
+    assert "go ahead" not in out, f"a cue to act must not become a question: {out!r}"
     assert state.signed_in is None, "the note must still be taken"
 
 

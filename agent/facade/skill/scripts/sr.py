@@ -772,9 +772,23 @@ def cmd_login_wait(args) -> int:
         # sign-in `_connected_msg` is DEVICE-AWARE and steers an account with no
         # computer to pair one, and the note's single line cannot. Taking it still
         # stops the double announce either way — that is the half that matters.
+        #
+        # ⛔⛔ AND ONLY FOR THE THREE OUTCOMES THE BRIDGE DECIDED, not for the note's
+        # fourth case. That fourth case is the legacy fallback — *"Continue with X? Say
+        # go ahead and I'll start it."* — a question aimed at the PERSON. SKILL.md's
+        # "After a sign-in link" step 2 is written against the OTHER wording (*"Continuing
+        # your research on X…"*) and treats it as the cue to run `research` immediately,
+        # so preferring the note there swaps a cue-to-act for a question and the topic
+        # can be stranded: the assistant waits for a "go ahead" the person has already
+        # given. ⭐ TAKE THE NOTE EITHER WAY — taking it is what stops the watchdog
+        # repeating the news, and that half is true of all four cases.
         note = _claim_signed_in_announce()
-        note_lines = _signed_in_lines(note) if note else []
-        if len(note_lines) > 1:
+        note_lines = (_signed_in_lines(note)
+                      if isinstance(note, dict) and (note.get("autoStarted")
+                                                     or note.get("needsDevice")
+                                                     or note.get("needsDeviceChoice"))
+                      else [])
+        if note_lines:
             return _emit(body, args.json, note_lines)
         if topic:
             # The user asked to research this before signing in. Confirm + name the

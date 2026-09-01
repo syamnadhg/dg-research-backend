@@ -187,12 +187,8 @@ MUTANTS = [
      "only place holding what the bridge DID about their research. The owner's own "
      "fleet transcript is this shape: 'they are signed in' and nothing about the three "
      "computers the note was holding",
-     [('        note = _claim_signed_in_announce()\n'
-       '        note_lines = _signed_in_lines(note) if note else []\n'
-       '        if len(note_lines) > 1:',
-       '        note = {}\n'
-       '        note_lines = _signed_in_lines(note) if note else []\n'
-       '        if len(note_lines) > 1:')]),
+     [('        note = _claim_signed_in_announce()\n        note_lines = (_signed_in_lines(note)',
+       '        note = {}\n        note_lines = (_signed_in_lines(note)')]),
 
     ("D2", SR, "under",
      "⛔ THE CHAT SCOPE IS DROPPED FROM THE CLAIM, so the read looks like the "
@@ -203,16 +199,32 @@ MUTANTS = [
        '    q = "/updates?via=agent&limit=1"\n    origin = None\n    if origin:')]),
 
     ("D3", SR, "over",
-     "⛔ THE `> 1` BECOMES A TRUTHINESS TEST, so a PLAIN sign-in renders the note's one "
-     "line instead of the device-aware greeting — and an account with no computer loses "
-     "the paste-the-access-code steer, which the note cannot know to give",
-     [('        if len(note_lines) > 1:', '        if note_lines:')]),
+     "⛔⛔ THE OUTCOME GATE WIDENS TO ANY NON-EMPTY NOTE — the tidy simplification, and "
+     "it breaks two things at once. A PLAIN sign-in renders the note's one line instead "
+     "of the device-aware greeting, so an account with no computer loses the "
+     "paste-the-access-code steer; and a TOPIC-ONLY note renders *'Continue with X? Say "
+     "go ahead'* — a question aimed at the person — where SKILL.md is written against "
+     "*'Continuing your research on X…'* and treats it as the cue to start the run. The "
+     "assistant then waits for a go-ahead that was already given",
+     [('                      if isinstance(note, dict) and (note.get("autoStarted")\n'
+       '                                                     or note.get("needsDevice")\n'
+       '                                                     or note.get("needsDeviceChoice"))\n'
+       '                      else [])',
+       '                      if isinstance(note, dict) and note\n'
+       '                      else [])')]),
+
+    ("D5", SR, "under",
+     "⛔⛔ `needsDeviceChoice` DROPS OUT OF THE GATE, so the one payload the owner's own "
+     "fleet transcript proves was lost — *'you have 3 research computers, which should "
+     "run this?'* — is taken and then not relayed. The exact defect, re-entered through "
+     "the fix for it",
+     [('                                                     or note.get("needsDeviceChoice"))',
+       '                                                     or False)')]),
 
     ("D4", SR, "under",
      "the note is claimed and then not rendered — the debt is taken and not paid, which "
      "is the silent eater this whole line of work exists to end, one function further in",
-     [('        note_lines = _signed_in_lines(note) if note else []',
-       '        note_lines = []')]),
+     [('        note_lines = (_signed_in_lines(note)', '        note_lines = ([]')]),
 
     # ══ E — the two readers agree about a missing timestamp ═════════════════
     ("E1", POLL, "under",
