@@ -9,8 +9,10 @@ AGENT (``superresearch-agent``) — THREE files that must never drift:
   3. ``agent/facade/__init__.py``          ``__version__`` fallback — used only when the
      installed package metadata is unavailable (i.e. a source checkout)
   ...plus the byte-identical hosted twin the web app serves
-  (``research-app/web/public/.well-known/skills/sr/scripts/sr.py``), refreshed by the
-  FE's own ``scripts/sync-agent-skill.mjs``.
+  (``dg-research/public/.well-known/skills/sr/scripts/sr.py``), refreshed by the
+  FE's own ``scripts/sync-agent-skill.mjs``. ⛔ That path said ``research-app/web``
+  until 2026-09-01 and named a checkout that does not exist — the same wrong
+  layout the code's own default carried, which is why the sync had never run.
 
 BE (``superresearch``) — the ROOT ``pyproject.toml`` ``[project] version`` (the sole BE
 version source), PLUS a re-seed of ``tests/released_deps.json`` (the release-dep guard
@@ -228,11 +230,35 @@ def bump(new_version: str, root: Path = _REPO_ROOT) -> list[str]:
 
 
 def _web_root(root: Path) -> Path:
-    """The sibling web checkout that hosts the byte-identical skill twin."""
+    """The sibling web checkout that hosts the byte-identical skill twin.
+
+    ⛔⛔ THE DEFAULT WAS A LAYOUT THAT DOES NOT EXIST, AND IT IS THE FIRST OF TWO
+    GUESSES THAT HAD TO GO. `research-app/web` is not the checkout — the repo is
+    the sibling `dg-research` — so `sync_fe_twin` failed its `script.exists()`
+    test before reaching anything else and returned "FE sync skipped". ⭐ The
+    first fix for this wave passed the skill bundle's path to the FE script and
+    stopped there, which corrected the SECOND guess while the first still fired
+    earlier and short-circuited the whole function: a repair that could never
+    run. Found by cross-verification, not by the tests, because every test set
+    `SR_WEB_ROOT` and so never exercised the default at all.
+
+    ⭐ PROBED, NOT ASSUMED. The candidates are tried in order and the first that
+    actually holds the sync script wins; the historical name is kept as a
+    fallback rather than deleted, since a checkout somewhere may still use it.
+    The last candidate is returned when none match, so the caller's message
+    still names a concrete path to fix.
+    """
     override = os.environ.get("SR_WEB_ROOT")
     if override:
         return Path(override)
-    return root.parent / "research-app" / "web"
+    candidates = [
+        root.parent / "dg-research",
+        root.parent / "research-app" / "web",
+    ]
+    for c in candidates:
+        if (c / "scripts" / "sync-agent-skill.mjs").is_file():
+            return c
+    return candidates[-1]
 
 
 def sync_fe_twin(root: Path = _REPO_ROOT) -> tuple[bool, str]:
@@ -246,10 +272,22 @@ def sync_fe_twin(root: Path = _REPO_ROOT) -> tuple[bool, str]:
     node = shutil.which("node")
     if not node:
         return False, "FE sync skipped — `node` not on PATH"
+    # ⛔⛔ THE SOURCE IS PASSED, NOT GUESSED — and without this argument the sync
+    # has been a NO-OP at every release. The FE script takes the bundle path as
+    # its first positional and otherwise falls back to a hardcoded sibling layout
+    # (`../../research-automate/agent/facade/skill`) that does not exist in this
+    # checkout, so it printed its own "not found" and exited 1. The bump reports
+    # that as a WARNING and succeeds, which is why nobody noticed: the twin was
+    # only ever current because somebody re-ran the script by hand afterwards.
+    # ⭐ We know where the bundle is — it is in this repo, beside this tool — so
+    # there is no reason for the other repo to guess at our directory layout.
+    src = root / "agent" / "facade" / "skill"
+    if not src.is_dir():
+        return False, f"FE sync skipped — no skill bundle at {src}"
     try:
         # Decode as UTF-8 explicitly: the sync script emits check-marks and
         # em-dashes, and the Windows locale (cp1252) would mojibake them.
-        proc = subprocess.run([node, str(script)], cwd=str(web),
+        proc = subprocess.run([node, str(script), str(src)], cwd=str(web),
                               capture_output=True, text=True,
                               encoding="utf-8", errors="replace", timeout=120)
     except (OSError, subprocess.SubprocessError) as e:

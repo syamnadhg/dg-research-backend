@@ -63237,26 +63237,32 @@ async def run_server(port=8000):
                         if uid and rid:
                             ref = _firebase_db.collection("users").document(uid) \
                                 .collection("researches").document(rid)
-                            for sub in ("documents", "audios", "messages",
-                                        "pipeline_events", "commands"):
-                                try:
-                                    for sd in ref.collection(sub).stream():
-                                        try:
-                                            # #720: `commands` deletes are
-                                            # deviceMemberOf-gated (heal-eligible on a
-                                            # stale token); the other four + the doc
-                                            # are OWNER-ONLY in rules (synth user denied
-                                            # by design), so leave those bare — wrapping
-                                            # them would false-fire the structural latch.
-                                            if sub == "commands":
-                                                _grpc_write_with_heal(
-                                                    lambda sd=sd: sd.reference.delete(),
-                                                    what="cascade-sweep cmd delete")
-                                            else:
-                                                sd.reference.delete()
-                                        except Exception: pass
-                                except Exception: pass
-                            try: ref.delete()
+                            # ⛔⛔ ONLY `commands`. THE OTHER FOUR AND THE DOC ITSELF
+                            # WERE REMOVED 2026-09-01 BECAUSE THIS PROCESS CANNOT DO
+                            # THEM — not "usually fails", cannot. Their rule is
+                            # owner-only and under Track D we are a synthetic DEVICE
+                            # user, so every one of those deletes came back
+                            # PERMISSION_DENIED and was swallowed by the bare
+                            # `except: pass` sitting under it. ⭐ The line above this
+                            # already SAID so — "the other four + the doc are
+                            # OWNER-ONLY in rules (synth user denied by design)" — so
+                            # the code has been documenting its own no-op since #720
+                            # while still walking every document to attempt it.
+                            # ⛔ A cleanup that cannot succeed is worse than none: it
+                            # reads like coverage, and it is why nobody asked who
+                            # WAS deleting these.
+                            # ▶ Who actually does: the front-end cascades, which run
+                            # as the owner. `pipeline_events` additionally has a
+                            # 30-day TTL as of 2026-09-01. ⚠ `documents`, `audios`
+                            # and `messages` have NO TTL — the front end is their
+                            # only reaper, exactly as it already was.
+                            try:
+                                for sd in ref.collection("commands").stream():
+                                    try:
+                                        _grpc_write_with_heal(
+                                            lambda sd=sd: sd.reference.delete(),
+                                            what="cascade-sweep cmd delete")
+                                    except Exception: pass
                             except Exception: pass
                     except Exception: pass
                 # Nuke local queue dir.
@@ -64989,30 +64995,31 @@ async def run_server(port=8000):
                 if uid and rid:
                     research_ref = _firebase_db.collection("users").document(uid) \
                         .collection("researches").document(rid)
-                    # Delete known subcollections. Firestore requires enumerating
-                    # docs and deleting individually — no native recursive delete
-                    # in the Python SDK's positional-arg API.
-                    for sub in ("documents", "audios", "messages",
-                                "pipeline_events", "commands"):
-                        try:
-                            for sd in research_ref.collection(sub).stream():
-                                try:
-                                    # #720: only the deviceMemberOf-gated `commands`
-                                    # delete is heal-eligible; the rest are owner-only.
-                                    if sub == "commands":
-                                        _grpc_write_with_heal(
-                                            lambda sd=sd: sd.reference.delete(),
-                                            what="delete_run cmd delete")
-                                    else:
-                                        sd.reference.delete()
-                                except Exception: pass
-                        except Exception as _se:
-                            log(f"[delete_run] subcollection {sub} sweep: {_se}", "WARN")
-                    # Finally drop the research doc itself
-                    try: research_ref.delete()
-                    except Exception as _rde:
-                        log(f"[delete_run] research doc delete: {_rde}", "WARN")
-                    log(f"[delete_run] cascaded Firestore for users/{uid}/researches/{rid}")
+                    # ⛔⛔ ONLY `commands` — see the startup sweep's note. The other
+                    # four subcollections and the research doc were removed
+                    # 2026-09-01: their rule is owner-only, this process is a
+                    # synthetic DEVICE user, and every attempt returned
+                    # PERMISSION_DENIED into a bare `except: pass`. Firestore still
+                    # requires enumerating docs and deleting individually — there is
+                    # no native recursive delete in the Python SDK's positional-arg
+                    # API — which is why this was a walk over every document to
+                    # perform deletes that could not land.
+                    # ⛔ AND THE LOG LINE BELOW WAS THE REAL COST. It said
+                    # "cascaded Firestore for …" after doing none of it, so the one
+                    # place a person would look to check now says what happened.
+                    try:
+                        for sd in research_ref.collection("commands").stream():
+                            try:
+                                _grpc_write_with_heal(
+                                    lambda sd=sd: sd.reference.delete(),
+                                    what="delete_run cmd delete")
+                            except Exception: pass
+                    except Exception as _se:
+                        log(f"[delete_run] commands sweep: {_se}", "WARN")
+                    log(f"[delete_run] cleared queued commands for "
+                        f"users/{uid}/researches/{rid}; the research doc and its "
+                        f"documents/audios/messages/pipeline_events are the app's "
+                        f"to delete (owner-only rule)")
             except Exception as _oe:
                 log(f"[delete_run] owner.json parse failed: {_oe}", "WARN")
 
@@ -73750,12 +73757,18 @@ def cmd_send_logs(assume_yes: bool = False, email: "str | None" = None,
                      "runCount": int(summary["runCount"]),
                      "sessionCount": int(summary["sessionCount"]),
                      "sizeBytes": int(summary["sizeBytes"])}
-            # ⛔⛔ THE ROW IS THE ONLY THING CLEAR SHARED LOGS CAN SEE. It walks
-            # rows, not objects — so a send whose row never lands leaves a
-            # readable bundle in the bucket that the privacy button cannot
-            # reach, on a product where no lifecycle rule exists yet. A terminal
-            # process has no Firestore client at all, so in practice both writes
-            # park and a serve process replays them.
+            # ⛔⛔ THE ROW IS THE ONLY THING CLEAR LOGS CAN SEE. It walks rows,
+            # not objects — so a send whose row never lands leaves a readable
+            # bundle in the bucket that the privacy button cannot reach.
+            # ⭐ BOUNDED SINCE 2026-08-26. This line read "on a product where no
+            # lifecycle rule exists yet" until 2026-09-01, four days after the
+            # bucket rule went live: everything under `logs/` is deleted at
+            # thirty days, so an unreferenced bundle expires rather than sitting
+            # there forever. That makes the parking below a matter of the person
+            # getting their receipt, not of an unbounded leak — which is still
+            # worth doing, and is why it stays.
+            # A terminal process has no Firestore client at all, so in practice
+            # both writes park and a serve process replays them.
             if not (_open_log_bundle_row(owner_uid, code, device_id or "", "")
                     and _write_log_bundle_status(owner_uid, code, patch)):
                 _queue_log_bundle_row(owner_uid, code, patch,

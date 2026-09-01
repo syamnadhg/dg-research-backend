@@ -283,3 +283,104 @@ def test_check_output_survives_a_cp1252_console(capsys):
 def test_real_repo_is_in_lockstep():
     ok, msgs = bump_mod.check_lockstep()
     assert ok, "\n".join(msgs)
+
+
+# ── the hosted-skill twin sync, 2026-09-01 ───────────────────────────────────
+#
+# ⛔⛔ THIS SYNC HAS BEEN A NO-OP AT EVERY RELEASE, AND IT REPORTED SUCCESS-ISH.
+# `sync_fe_twin` shells out to the frontend's own sync script, which takes the
+# skill bundle's path as its first positional argument. This tool passed none, so
+# the FE script fell back to a hardcoded sibling layout that does not exist in
+# this checkout, printed its own "not found", and exited 1 — which `bump()`
+# renders as a WARNING and carries on from. The twin was only ever current
+# because somebody re-ran the script by hand after the bump.
+#
+# ⭐ Pinned on the ARGV, not on the message. A test asserting the warning text
+# would have passed throughout the entire period the sync did nothing.
+
+def _fake_web(tmp_path):
+    """A throwaway web checkout holding a stub sync script."""
+    web = tmp_path / "web"
+    (web / "scripts").mkdir(parents=True)
+    (web / "scripts" / "sync-agent-skill.mjs").write_text("// stub\n")
+    return web
+
+
+def test_sync_passes_the_skill_bundle_path_as_argv(tmp_path, monkeypatch):
+    """⛔ THE FIX. The bundle lives in THIS repo beside this tool, so the other
+    repo must never have to guess our directory layout."""
+    root = tmp_path / "be"
+    (root / "agent" / "facade" / "skill").mkdir(parents=True)
+    web = _fake_web(tmp_path)
+    monkeypatch.setenv("SR_WEB_ROOT", str(web))
+    monkeypatch.setattr(bump_mod.shutil, "which", lambda _n: "/usr/bin/node")
+
+    seen = {}
+
+    class _Done:
+        returncode = 0
+        stdout = "synced 2 files"
+        stderr = ""
+
+    def _fake_run(argv, **kw):
+        seen["argv"] = argv
+        return _Done()
+
+    monkeypatch.setattr(bump_mod.subprocess, "run", _fake_run)
+    ok, msg = bump_mod.sync_fe_twin(root)
+    assert ok, msg
+    # node, the script, AND the source path — three arguments, not two.
+    assert len(seen["argv"]) == 3, seen["argv"]
+    assert seen["argv"][2] == str(root / "agent" / "facade" / "skill")
+
+
+def test_sync_refuses_rather_than_letting_the_fe_guess(tmp_path, monkeypatch):
+    """⛔ A missing bundle STOPS here with a path in the message. Letting it run
+    argument-less is exactly the silent no-op this pair of tests exists for: the
+    FE would guess, fail, and the bump would shrug."""
+    root = tmp_path / "be"          # no agent/facade/skill inside
+    root.mkdir()
+    web = _fake_web(tmp_path)
+    monkeypatch.setenv("SR_WEB_ROOT", str(web))
+    monkeypatch.setattr(bump_mod.shutil, "which", lambda _n: "/usr/bin/node")
+
+    def _must_not_run(*_a, **_kw):
+        raise AssertionError("the sync ran without a bundle to sync from")
+
+    monkeypatch.setattr(bump_mod.subprocess, "run", _must_not_run)
+    ok, msg = bump_mod.sync_fe_twin(root)
+    assert ok is False
+    assert "no skill bundle" in msg
+
+
+def test_the_real_checkout_is_found_with_NO_env_override(tmp_path, monkeypatch):
+    """⛔⛔ THE GUARD THAT WAS MISSING, AND ITS ABSENCE IS WHY THE FIRST FIX WAS
+    HALF A FIX. Every other test here sets `SR_WEB_ROOT`, so not one of them ever
+    exercised the DEFAULT — and the default pointed at `research-app/web`, a
+    layout that does not exist. `sync_fe_twin` therefore failed its
+    `script.exists()` check before reaching the argument fix at all.
+
+    ⭐ Asserted against the REAL checkout on disk, with the override explicitly
+    cleared. A fixture would have proved only that the probe loop runs."""
+    monkeypatch.delenv("SR_WEB_ROOT", raising=False)
+    root = Path(bump_mod.__file__).resolve().parents[1]
+    web = bump_mod._web_root(root)
+    assert (web / "scripts" / "sync-agent-skill.mjs").is_file(), (
+        f"the default web root does not hold the sync script: {web}. The release "
+        f"sync short-circuits here, before the bundle path is ever passed."
+    )
+
+
+def test_an_env_override_still_wins_over_the_probe(tmp_path, monkeypatch):
+    """The override is how a non-standard checkout works, and probing must not
+    quietly outrank an explicit instruction."""
+    monkeypatch.setenv("SR_WEB_ROOT", str(tmp_path / "elsewhere"))
+    assert bump_mod._web_root(Path("/nope")) == tmp_path / "elsewhere"
+
+
+def test_the_real_repo_has_the_bundle_where_the_tool_looks(tmp_path):
+    """⭐ The path is not a guess in a test fixture either — it is where the
+    bundle actually is. A rename that moved it would make the two tests above
+    pass against a directory nobody ships."""
+    root = Path(bump_mod.__file__).resolve().parents[1]
+    assert (root / "agent" / "facade" / "skill" / "SKILL.md").is_file()

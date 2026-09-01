@@ -319,14 +319,14 @@ MUTANTS = [
      "in the bucket after the privacy button reports the bundle cleared — and so "
      "does the machine's own bundle whenever a lost status write left the row with "
      "no path, which is how the button manufactured its own orphan",
-     [("    for (const path of await folderContents(uid, deviceId, row)) {",
+     [("    for (const path of await folderContents(uid, row)) {",
        "    for (const path of (row.objectPath ? [row.objectPath] : [])) {")]),
     ("C2", BUNDLES, "over",
      "⛔ the prefix loses a segment, so the listing asks for `logs/{uid}/{deviceId}` "
      "— which the rules deny, because {fileName} is a single-segment wildcard. "
      "Every clear then falls back to the row's own path, for every user, always",
-     [("  const prefix = `logs/${uid}/${row.deviceId || deviceId}/${row.code}`;",
-       "  const prefix = `logs/${uid}/${row.deviceId || deviceId}`;")]),
+     [("  const prefix = `logs/${uid}/${row.deviceId}/${row.code}`;",
+       "  const prefix = `logs/${uid}/${row.deviceId}`;")]),
     ("C3", BUNDLES, "under",
      "a listing failure deletes nothing instead of falling back to the path the "
      "row can name — a completeness gain traded for a regression",
