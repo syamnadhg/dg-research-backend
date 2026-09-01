@@ -104,15 +104,15 @@ MUTANTS = [
     ("T3", RESEARCH, "under",
      "⛔⛔ THE HEARTBEAT STOPS CALLING THE SWEEP — the exact state item 4 found, with the "
      "30-day code present and unreachable. Every unit test of the bound still passes",
-     [("                    if _prune_due(_now_ms):", "                    if False:")]),
+     [("                if _prune_due(_now_ms):", "                if False:")]),
 
     # ══ A — the raw tails ═══════════════════════════════════════════════════
 
     ("A1", RESEARCH, "under",
      "⛔⛔ ROLLED TAILS ARE NEVER RETIRED, which is where this started: the largest files "
      "on the disk, and the only ones no code path could reach",
-     [("        if _safe_mtime(path) >= cutoff:\n            continue",
-       "        if True:\n            continue")]),
+     [("        rolled_at = _raw_tail_started_at(path, now=now_t)\n        if rolled_at >= cutoff:",
+       "        rolled_at = _raw_tail_started_at(path, now=now_t)\n        if True:")]),
 
     ("A2", RESEARCH, "over",
      "⛔⛔⛔ THE TIMER DELETES THE LIVE TAIL. The supervisor holds backend.log open in "
@@ -249,13 +249,13 @@ MUTANTS = [
      "⛔⛔ THE RENDER IS UNBOUNDED. The collector's cap decides per RUN, not per file, so "
      "one oversized cloud log takes that run's MACHINE logs out of the bundle with it — "
      "the diagnostic evicting the diagnosis",
-     [("    if len(text) > CLOUD_LOG_MAX_BYTES:", "    if False:")]),
+     [('    if len(text.encode("utf-8", "ignore")) > CLOUD_LOG_MAX_BYTES:', "    if False:")]),
 
     ("C9", RESEARCH, "under",
      "⛔⛔ THE HEARTBEAT STOPS CALLING THE PULL. Every unit test of the puller still "
      "passes and not one cloud line ever reaches a run folder — the fourth time this "
      "stretch that a perfect helper had no caller",
-     [("                    if _cloud_pull_due(_now_ms):", "                    if False:")]),
+     [("                if _cloud_pull_due(_now_ms):", "                if False:")]),
 
     ("C10", RESEARCH, "under",
      "⛔⛔ A HALF KEY IS ACCEPTED, so a queue directory naming only a researchId yields "
@@ -268,8 +268,50 @@ MUTANTS = [
      "⛔ THE WRITE STOPS BEING ATOMIC. Send Logs is a button a person presses, not "
      "something this process schedules, so the collector can walk the folder at any "
      "moment and catch a half-written file",
-     [("            _atomic_write_text(target, text)",
+     [("            _atomic_write_text(target, text, create_parents=False)",
        '            target.write_text(text, encoding="utf-8")')]),
+    # ══ X — what the cross-verify found in the first build ══════════════════
+
+    ("X1", RESEARCH, "under",
+     "⛔⛔⛔ THE WRITE RESURRECTS A DELETED FOLDER. The pull lists folders and writes "
+     "seconds later; Clear Logs or the orphan sweep can remove one in that gap, and a "
+     "writer that mkdir's its way back puts a run the person DELETED back on the disk, "
+     "cloud output and all, ready for the next support bundle",
+     [("        if not folder.is_dir():\n            continue\n", "")]),
+
+    ("X2", RESEARCH, "under",
+     "⛔⛔⛔ THE ROLLED COPY IS AGED BY mtime AGAIN — and `os.replace` PRESERVES mtime, "
+     "so a 40-day generation arrives as a `.1` already past the bound and is deleted on "
+     "the same boot that rolled it, taking yesterday's lines with it",
+     [("        rolled_at = _raw_tail_started_at(path, now=now_t)",
+       "        rolled_at = _safe_mtime(path)")]),
+
+    ("X3", RESEARCH, "under",
+     "⛔ THE ROLLED COPY NEVER STARTS ITS OWN CLOCK, so it falls back to the preserved "
+     "mtime and X2's failure returns by a different route",
+     [("    _begin_raw_tail_generation(keep, now=now_t)\n", "")]),
+
+    ("X4", RESEARCH, "under",
+     "⛔⛔ TRUNCATION KEEPS THE BEGINNING AGAIN. A support bundle is opened because "
+     "something went wrong at the END; keeping the first 512 KB of a chatty upload and "
+     "dropping the exception is the exact opposite of useful",
+     [('        body = text.encode("utf-8", "ignore")[-keep:].decode("utf-8", "ignore")',
+       '        body = text.encode("utf-8", "ignore")[:keep].decode("utf-8", "ignore")')]),
+
+    ("X5", RESEARCH, "under",
+     "⛔⛔ THE MAINTENANCE JOBS GO BACK ON THE HEARTBEAT'S CRITICAL PATH. Awaiting them "
+     "puts up to 75 seconds between liveness writes against a front end that flips a "
+     "device Offline after two missed 5-second ticks — housekeeping that makes the "
+     "machine look dead",
+     [("                    _spawn_maintenance(\"cloud log pull\", _pull_cloud_logs, _cloud_pull_report)",
+       "                    await _spawn_maintenance(\"cloud log pull\", _pull_cloud_logs, _cloud_pull_report)")]),
+
+    ("X6", RESEARCH, "under",
+     "⛔ THE MAJORITY DROP PATH STOPS BEING REPORTED. On this machine five of six run "
+     "folders cannot be attributed, so a tick that fetched nothing for that reason "
+     "reads exactly like a tick where the cloud sent nothing",
+     [('    if res.get("unattributable"):\n        parts.append(f"{res[\'unattributable\']} folder(s) have no owner on disk, "\n                     "so their cloud logs cannot be fetched")',
+       '    if False:\n        parts.append(f"{res[\'unattributable\']} folder(s) have no owner on disk, "\n                     "so their cloud logs cannot be fetched")')]),
 ]
 
 

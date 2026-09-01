@@ -129,6 +129,50 @@ def test_a_rolled_tail_older_than_the_bound_is_retired(tmp_path):
     assert not old.exists()
 
 
+def test_a_JUST_ROLLED_tail_is_not_deleted_on_the_same_boot(tmp_path):
+    """⛔⛔⛔ THE BLOCKER CROSS-VERIFY FOUND, and mtime is the trap.
+
+    `os.replace` PRESERVES mtime, so a generation that began 40 days ago arrives
+    as a `.1` already past the bound and the prune deletes it on the same boot
+    that rolled it. That file also holds YESTERDAY's lines — a long-lived
+    generation is old at its head and current at its tail — so bounding it by
+    its head throws away the diagnostics somebody is about to ask for.
+
+    The rolled copy is bounded from the ROLL instead, which bounds its NEWEST
+    content and over-retains the oldest lines in a file that is byte-capped
+    anyway."""
+    tail = tmp_path / "backend.log"
+    tail.write_text("old head, and yesterday's tail", encoding="utf-8")
+    now = time.time()
+    import os as _os
+    _os.utime(tail, (now - 40 * 86400, now - 40 * 86400))
+    research._begin_raw_tail_generation(tail, now=now - 40 * 86400)
+
+    assert research._rotate_if_stale(tail, max_age_days=30, now=now) > 0
+    rolled = tmp_path / "backend.log.1"
+    assert rolled.exists()
+    # mtime still says 40 days; the roll marker says "just now".
+    assert research._safe_mtime(rolled) < now - 39 * 86400
+    assert research._retire_stale_rotations(root=tmp_path, max_age_days=30, now=now) == []
+    assert rolled.exists(), "the tail was rolled and destroyed in the same breath"
+
+
+def test_a_rolled_tail_is_retired_once_THIRTY_DAYS_AFTER_THE_ROLL(tmp_path):
+    # The other polarity: bounding from the roll must still bound.
+    tail = tmp_path / "backend.log"
+    tail.write_text("x", encoding="utf-8")
+    now = time.time()
+    research._begin_raw_tail_generation(tail, now=now - 90 * 86400)
+    assert research._rotate_if_stale(tail, max_age_days=30, now=now) > 0
+    rolled = tmp_path / "backend.log.1"
+    later = now + 31 * 86400
+    assert str(rolled) in research._retire_stale_rotations(
+        root=tmp_path, max_age_days=30, now=later)
+    assert not rolled.exists()
+    assert not research._raw_tail_marker(rolled).exists(), \
+        "the marker outlived the file it described"
+
+
 def test_a_rolled_tail_inside_the_bound_is_kept(tmp_path):
     fresh = tmp_path / "backend.log.1"
     fresh.write_text("recent", encoding="utf-8")

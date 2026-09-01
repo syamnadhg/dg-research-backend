@@ -2940,11 +2940,19 @@ def _render_cloud_log(docs) -> str:
         if dropped:
             out.append(f"── {dropped} further line(s) dropped at the capture bound ──")
     text = "\n".join(out)
-    if len(text) > CLOUD_LOG_MAX_BYTES:
-        keep = CLOUD_LOG_MAX_BYTES - 120
-        text = (text[:keep]
-                + f"\n── truncated at {CLOUD_LOG_MAX_BYTES} bytes; the cloud half of this "
-                  "run was longer than a support bundle will carry ──")
+    # ⛔⛔ THE END, NOT THE BEGINNING. The first version kept `text[:keep]` — the
+    # opening of the run — and threw away the tail, which is where the failure
+    # is. A support bundle is opened because something went wrong at the end;
+    # keeping the first 512 KB of a chatty run and dropping the exception is the
+    # exact opposite of useful. Same direction as `_system_log_tails`, which
+    # keeps the tail of a raw log for the same reason.
+    if len(text.encode("utf-8", "ignore")) > CLOUD_LOG_MAX_BYTES:
+        head = (f"── truncated: the cloud half of this run was longer than "
+                f"{CLOUD_LOG_MAX_BYTES} bytes, and the OLDEST lines were dropped "
+                "so the failure at the end survives ──")
+        keep = CLOUD_LOG_MAX_BYTES - len(head) - 2
+        body = text.encode("utf-8", "ignore")[-keep:].decode("utf-8", "ignore")
+        text = head + "\n" + body
     return text + "\n"
 
 
@@ -3001,6 +3009,74 @@ def _run_log_folders_for_research(research_id, root=None) -> "list[Path]":
     return out
 
 
+_MAINT_TASKS: "set" = set()
+
+
+def _spawn_maintenance(name, fn, report=None):
+    """Run one standing maintenance job OFF the heartbeat's critical path.
+
+    ⛔⛔ AWAITING WORK ON THE HEARTBEAT MAKES THE DEVICE LOOK OFFLINE, and the
+    first version of these two jobs did exactly that. The loop's whole purpose is
+    a liveness write every HEARTBEAT_INTERVAL_SEC (5s) against a front-end that
+    flips a device to Offline after missing two of them plus slack. Two jobs each
+    awaited with `timeout=30.0`, on top of the run-index publish's existing 15,
+    put up to 75 seconds between one liveness write and the next — so a device
+    doing its housekeeping would have shown up in the app as a device that had
+    stopped.
+
+    ⭐ FIRE AND FORGET, WITH THE DEADLINE STILL ADVANCED BY THE `_due` PREDICATE
+    that gated the spawn: the throttle is what stops a slow job being started
+    again on the next tick, so no second guard is needed. The task reference is
+    held until it completes because asyncio only keeps a weak reference and a
+    garbage-collected task cancels itself mid-work.
+
+    ⚠ The run-index publish above still awaits its 15 seconds. That is
+    pre-existing and not moved here, because changing when the index is
+    published changes what the run picker sees, and this change is about
+    retention."""
+    async def _go():
+        try:
+            result = await asyncio.to_thread(fn)
+        except Exception as err:
+            log(f"[heartbeat] {name} skipped ({err})", "DEBUG")
+            return
+        if report is None:
+            return
+        try:
+            line = report(result)
+        except Exception:
+            return
+        if line:
+            log(f"[heartbeat] {line}", "INFO")
+
+    task = asyncio.create_task(_go())
+    _MAINT_TASKS.add(task)
+    task.add_done_callback(_MAINT_TASKS.discard)
+    return task
+
+
+def _cloud_pull_report(res) -> "str | None":
+    """One line for the machine log, or nothing to say.
+
+    ⛔ EVERY DROP PATH IS COUNTED, not just the one that was easy. A tick that
+    fetched nothing because no folder could be attributed reads identically to a
+    tick where the cloud sent nothing, unless the counts are named — and on this
+    machine the unattributable case is the MAJORITY, five of six folders. The
+    same goes for a write that failed: silence there would report a permissions
+    or disk problem as "the cloud is quiet"."""
+    if not isinstance(res, dict):
+        return None
+    parts = []
+    if res.get("updated"):
+        parts.append(f"pulled cloud logs into {res['updated']} run folder(s)")
+    if res.get("failed"):
+        parts.append(f"{res['failed']} write(s) failed")
+    if res.get("unattributable"):
+        parts.append(f"{res['unattributable']} folder(s) have no owner on disk, "
+                     "so their cloud logs cannot be fetched")
+    return " · ".join(parts) if parts else None
+
+
 _cloud_pull_next_ms = 0
 
 
@@ -3042,7 +3118,7 @@ def _pull_cloud_logs(db=None, runs_root=None, queues_root=None, now=None) -> dic
     limitation — "I pulled 3 runs' cloud logs" is a fact about the machine — but
     it means a failure to pull is NOT recorded in the folder it failed to fill.
     """
-    out = {"updated": 0, "unattributable": 0, "queried": 0}
+    out = {"updated": 0, "unattributable": 0, "queried": 0, "failed": 0}
     fs = _firebase_db if db is None else db
     if fs is None:
         return out
@@ -3096,10 +3172,21 @@ def _pull_cloud_logs(db=None, runs_root=None, queues_root=None, now=None) -> dic
                 continue
         except OSError:
             pass
+        # ⛔⛔ RE-CHECKED IMMEDIATELY BEFORE THE WRITE, and written without
+        # creating parents. The folder was listed at the top of this function
+        # and Clear Logs or the orphan sweep can have removed it since — a
+        # writer that mkdir'd its way back would restore a deleted run's
+        # diagnostics onto the disk, and the person who deleted it would find
+        # them again in their next support bundle. The narrow race that remains
+        # (deleted between this check and the rename) is closed by
+        # `create_parents=False`, which makes the write fail instead of rebuild.
+        if not folder.is_dir():
+            continue
         try:
-            _atomic_write_text(target, text)
+            _atomic_write_text(target, text, create_parents=False)
             out["updated"] += 1
         except Exception:
+            out["failed"] = out.get("failed", 0) + 1
             continue
     return out
 
@@ -3562,11 +3649,26 @@ def _retire_stale_rotations(root=None, max_age_days=LOCAL_TAIL_MAX_AGE_DAYS,
     except OSError:
         return removed
     for path in rolled:
-        if _safe_mtime(path) >= cutoff:
+        # ⛔⛔ AGED FROM WHEN IT WAS ROLLED, NOT FROM ITS mtime — and the mtime is
+        # the trap. `os.replace` PRESERVES it, so a generation that started 40
+        # days ago arrives as a `.1` already past the bound and is deleted on the
+        # same boot that rolled it. That file also holds YESTERDAY's lines: a
+        # long-lived generation is old at its head and current at its tail, and
+        # bounding it by its head throws away the diagnostics somebody is about
+        # to ask for. Bounding it from the roll bounds its NEWEST content, which
+        # over-retains the oldest lines in a file that is byte-capped anyway.
+        rolled_at = _raw_tail_started_at(path, now=now_t)
+        if rolled_at >= cutoff:
             continue
         try:
             path.unlink()
             removed.append(str(path))
+            # Its marker goes with it, or the next generation inherits a
+            # deadline that belongs to a file nobody can read any more.
+            try:
+                _raw_tail_marker(path).unlink()
+            except OSError:
+                pass
         except OSError:
             pass
     return removed
@@ -3609,6 +3711,8 @@ def _rotate_if_stale(path, max_age_days=LOCAL_TAIL_MAX_AGE_DAYS, now=None,
             except Exception:
                 pass
         return 0.0
+    # The rolled copy starts its own clock here — see `_retire_stale_rotations`.
+    _begin_raw_tail_generation(keep, now=now_t)
     _begin_raw_tail_generation(p, now=now_t)
     return float(age)
 
@@ -3637,6 +3741,7 @@ def _rotate_if_oversize(path, max_bytes=RAW_LOG_ROTATE_BYTES, audit=None) -> int
         # keeps describing a generation that no longer exists, and the next
         # age check rolls a file that is minutes old because the number beside
         # it is thirty days.
+        _begin_raw_tail_generation(keep)
         _begin_raw_tail_generation(p)
         return int(size)
     except OSError as exc:
@@ -6835,16 +6940,24 @@ RESEARCH_CONFIG_PATH = _STATE_DIR / "research_config.json"
 _LEGACY_PIPE_CONFIG_PATH = _STATE_DIR / "pipe_config.json"
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
+def _atomic_write_text(path: Path, text: str, create_parents: bool = True) -> None:
     """`_atomic_write_json`'s sibling for content that is not JSON.
 
     ⛔ SAME REASON, DIFFERENT READER. The cloud-log file is written into a run
     folder that the bundle collector may walk at any moment — Send Logs is a
     button a person presses, not something this process schedules — so a reader
     must never catch it half-written. `os.replace` onto the target is atomic on
-    POSIX and Windows when both live in the same directory, which they do."""
+    POSIX and Windows when both live in the same directory, which they do.
+
+    ⛔⛔ `create_parents=False` EXISTS TO STOP A WRITE RESURRECTING A DELETED
+    FOLDER. The cloud-log pull writes into a run folder it listed up to a few
+    seconds earlier, and in that gap Clear Logs or the orphan sweep may have
+    removed it — at which point an mkdir-ing writer recreates the directory and
+    puts the deleted run's cloud output back on the disk. A person who pressed
+    "delete this research" would find it again in their next support bundle."""
     import tempfile
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if create_parents:
+        path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -7508,15 +7621,10 @@ async def _heartbeat_loop():
                 # standing tick, and the work is a directory walk that must not
                 # sit on a pipeline task. Six-hourly, in a thread, and it skips
                 # anything a sink still owns or whose meta still reads running.
-                try:
-                    if _prune_due(_now_ms):
-                        _pruned = await asyncio.wait_for(
-                            asyncio.to_thread(_prune_local_logs), timeout=30.0)
-                        if _pruned:
-                            log(f"[heartbeat] retention swept {len(_pruned)} item(s) "
-                                f"past {LOCAL_LOG_MAX_AGE_DAYS} days", "INFO")
-                except Exception as _pr_err:
-                    log(f"[heartbeat] retention sweep skipped ({_pr_err})", "DEBUG")
+                if _prune_due(_now_ms):
+                    _spawn_maintenance("retention sweep", _prune_local_logs,
+                                       lambda r: (f"retention swept {len(r)} item(s) past "
+                                                  f"{LOCAL_LOG_MAX_AGE_DAYS} days") if r else None)
 
                 # ⛔⛔ THE CLOUD'S HALF OF A RUN, BROUGHT DOWN TO THE DISK THE
                 # COLLECTOR ACTUALLY WALKS. Measured 2026-09-01: across six run
@@ -7534,22 +7642,8 @@ async def _heartbeat_loop():
                 # contract is pinned byte-identical in both repos and by SHA-256
                 # in the suite, so raising a bound would be a four-file, two-repo
                 # change.
-                try:
-                    if _cloud_pull_due(_now_ms):
-                        _cl = await asyncio.wait_for(
-                            asyncio.to_thread(_pull_cloud_logs), timeout=30.0)
-                        if _cl.get("updated"):
-                            log(f"[heartbeat] pulled cloud logs into {_cl['updated']} run "
-                                f"folder(s)", "INFO")
-                        if _cl.get("unattributable"):
-                            # ⚠ SAID OUT LOUD. A run whose queue directory has
-                            # aged out carries no uid anywhere on disk, so its
-                            # cloud half cannot be fetched. Reporting only
-                            # "updated 0" would read as "the cloud sent nothing".
-                            log(f"[heartbeat] {_cl['unattributable']} run folder(s) have no "
-                                f"owner on disk — their cloud logs cannot be fetched", "DEBUG")
-                except Exception as _cl_err:
-                    log(f"[heartbeat] cloud log pull skipped ({_cl_err})", "DEBUG")
+                if _cloud_pull_due(_now_ms):
+                    _spawn_maintenance("cloud log pull", _pull_cloud_logs, _cloud_pull_report)
 
                 # One-shot: report the outcome of an app-driven update that ran while
                 # this backend was down. Deliberately here rather than at boot — the
@@ -14392,9 +14486,20 @@ def _emit_to_firestore(event):
     """Write event to Firestore pipeline_events subcollection.
 
     expireAt: a 30-day-future Timestamp paired with the Firestore TTL policy
-    on `pipeline_events.expireAt` (configured manually in the console). At
-    a typical cadence of 2-3k events per 90-min run, the unbounded subcoll
-    would otherwise hit ~1.5 MB / run × N users → linear-storage growth.
+    on `pipeline_events.expireAt`. At a typical cadence of 2-3k events per
+    90-min run, the unbounded subcoll would otherwise hit ~1.5 MB / run × N
+    users → linear-storage growth.
+
+    ⛔⛔ THIS DOCSTRING USED TO SAY THE POLICY WAS "configured manually in the
+    console", AND THAT SENTENCE IS WHY THE STAMP DID NOTHING FOR FOUR MONTHS. A
+    live read of the deployed project on 2026-09-01 (`firebase
+    firestore:indexes`) returned NINE field overrides and pipeline_events was not
+    among them: there was no policy, and every event written since 2026-04-29
+    was immortal while this comment said otherwise. A console-set policy would
+    not have survived in any case — deploying `firestore.indexes.json` DELETES
+    any TTL the console holds that the file omits, which the front end's
+    `firestoreTtlConfig` test was written to catch. The declaration now lives in
+    that file, where it is reviewable and cannot be dropped by a deploy.
     Completed-run replay reads from the parent message doc + agents map,
     not the event log, so 30-day pruning is invisible to UX.
 

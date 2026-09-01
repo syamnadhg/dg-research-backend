@@ -20,6 +20,7 @@ The last test in this file is the one that matters most: it builds a real bundle
 and opens the zip. Everything above it could pass while the file never shipped.
 """
 import json
+import shutil
 import time
 import zipfile
 from pathlib import Path
@@ -105,7 +106,7 @@ def test_an_enormous_render_is_truncated_and_says_so():
     big = _doc(1, 4, ["y" * 1000] * 2000)
     out = research._render_cloud_log([big])
     assert len(out) <= research.CLOUD_LOG_MAX_BYTES + 200
-    assert "truncated at" in out
+    assert "truncated" in out
 
 
 # ── the pull ───────────────────────────────────────────────────────────
@@ -191,7 +192,7 @@ def test_a_folder_with_no_owner_anywhere_is_counted_not_silently_skipped(tmp_pat
     _folder(runs, "chat_1_1_x", "chat_1")
     db = _Db({})
     out = research._pull_cloud_logs(db=db, runs_root=runs, queues_root=queues)
-    assert out == {"updated": 0, "unattributable": 1, "queried": 0}
+    assert out == {"updated": 0, "unattributable": 1, "queried": 0, "failed": 0}
 
 
 def test_a_meta_that_names_its_submitter_needs_no_queue_dir(tmp_path):
@@ -298,7 +299,7 @@ def test_the_pull_writes_through_the_ATOMIC_writer(tmp_path, monkeypatch):
     calls = []
     real = research._atomic_write_text
     monkeypatch.setattr(research, "_atomic_write_text",
-                        lambda p, t: (calls.append(Path(p).name), real(p, t))[1])
+                        lambda p, t, **kw: (calls.append(Path(p).name), real(p, t, **kw))[1])
     db = _Db({"chat_1": [_doc(1, 4, ["x"])]})
     research._pull_cloud_logs(db=db, runs_root=runs, queues_root=queues)
     assert calls == [research.CLOUD_LOG_FILENAME]
@@ -329,6 +330,50 @@ def test_the_atomic_writer_replaces_the_whole_file(tmp_path):
     assert target.read_text(encoding="utf-8") == "new content"
 
 
+def test_it_refuses_to_RESURRECT_a_folder_that_was_just_deleted(tmp_path, monkeypatch):
+    """⛔⛔⛔ THE BLOCKER CROSS-VERIFY FOUND. The pull lists folders at the top and
+    writes seconds later, and in that gap Clear Logs or the orphan sweep can have
+    removed one. The writer used to `mkdir(parents=True)` its way back — so a run
+    the person had DELETED reappeared on disk, with its cloud output in it, ready
+    for the next support bundle."""
+    runs = tmp_path / "runs"
+    queues = tmp_path / "queues"
+    d = _folder(runs, "chat_1_1_x", "chat_1")
+    _queue(queues, "chat_1", "user-a")
+    real_render = research._render_cloud_log
+
+    def _delete_then_render(docs):
+        # The folder goes between the listing and the write, which is exactly
+        # the window the real sweep runs in.
+        shutil.rmtree(d, ignore_errors=True)
+        return real_render(docs)
+
+    monkeypatch.setattr(research, "_render_cloud_log", _delete_then_render)
+    out = research._pull_cloud_logs(db=_Db({"chat_1": [_doc(1, 4, ["x"])]}),
+                                    runs_root=runs, queues_root=queues)
+    assert out["updated"] == 0
+    assert not d.exists(), "the deleted run folder was rebuilt by the writer"
+
+
+def test_the_render_keeps_the_END_where_the_failure_is(tmp_path):
+    """⛔⛔ THE FIRST VERSION KEPT THE BEGINNING. A support bundle is opened
+    because something went wrong at the end of a run; keeping the first 512 KB of
+    a chatty upload and dropping the exception is the exact opposite of useful."""
+    docs = [_doc(1, 4, ["EARLY MARKER"] + ["filler " * 20] * 40000 + ["LATE FAILURE MARKER"])]
+    out = research._render_cloud_log(docs)
+    assert "LATE FAILURE MARKER" in out
+    assert "EARLY MARKER" not in out
+    assert "OLDEST lines were dropped" in out
+
+
+def test_a_render_inside_the_bound_is_not_truncated(tmp_path):
+    # Accept polarity: a renderer that always truncated would pass the test
+    # above and lose the opening of every ordinary run.
+    out = research._render_cloud_log([_doc(1, 4, ["EARLY MARKER", "LATE MARKER"])])
+    assert "EARLY MARKER" in out and "LATE MARKER" in out
+    assert "truncated" not in out
+
+
 # ── the trigger ────────────────────────────────────────────────────────
 
 def test_the_pull_is_throttled_off_the_five_second_heartbeat():
@@ -337,6 +382,43 @@ def test_the_pull_is_throttled_off_the_five_second_heartbeat():
     assert research._cloud_pull_due(now) is True
     assert research._cloud_pull_due(now + 1) is False
     assert research._cloud_pull_due(now + research.CLOUD_LOG_PULL_INTERVAL_SEC * 1000) is True
+
+
+def test_the_maintenance_jobs_do_NOT_block_the_heartbeat():
+    """⛔⛔ AWAITING THEM ON THE HEARTBEAT MAKES THE DEVICE LOOK OFFLINE.
+
+    The loop's whole purpose is a liveness write every HEARTBEAT_INTERVAL_SEC
+    (5s), against a front end that flips a device to Offline after two missed
+    ticks plus slack. The first version awaited both jobs with `timeout=30.0`,
+    on top of the run-index publish's existing 15 — up to 75 seconds between one
+    liveness write and the next, so a device doing its housekeeping would have
+    appeared in the app as a device that had stopped."""
+    src = Path(research.__file__).read_text(encoding="utf-8")
+    hb = src[src.index("async def _heartbeat_loop"):]
+    hb = hb[:hb.index("\nasync def ", 10)]
+    assert "_spawn_maintenance(" in hb
+    # neither job may be awaited inline on the loop
+    assert "asyncio.to_thread(_prune_local_logs)" not in hb
+    assert "asyncio.to_thread(_pull_cloud_logs)" not in hb
+    # ⛔ AND NOT AWAITED THROUGH THE SPAWNER EITHER. `_spawn_maintenance` returns
+    # a Task, so `await _spawn_maintenance(...)` compiles and reinstates the
+    # exact stall the helper exists to avoid — a mutant of that shape passed the
+    # first version of this assertion.
+    assert "await _spawn_maintenance" not in hb
+
+
+def test_every_drop_path_is_reported_not_only_the_easy_one():
+    # ⛔ A tick that fetched nothing because no folder could be attributed reads
+    # identically to a tick where the cloud sent nothing — and on this machine
+    # the unattributable case is the MAJORITY. Same for a failed write: silence
+    # would report a disk or permissions problem as "the cloud is quiet".
+    assert research._cloud_pull_report({"updated": 0, "unattributable": 0,
+                                        "queried": 0, "failed": 0}) is None
+    line = research._cloud_pull_report({"updated": 2, "unattributable": 3,
+                                        "queried": 5, "failed": 1})
+    assert "2 run folder(s)" in line
+    assert "3 folder(s) have no owner" in line
+    assert "1 write(s) failed" in line
 
 
 def test_the_heartbeat_is_what_calls_the_pull():
