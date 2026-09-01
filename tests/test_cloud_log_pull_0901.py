@@ -377,6 +377,13 @@ def test_it_refuses_to_RESURRECT_a_folder_that_was_just_deleted(tmp_path, monkey
                                     runs_root=runs, queues_root=queues)
     assert out["updated"] == 0
     assert not d.exists(), "the deleted run folder was rebuilt by the writer"
+    # ⛔ AND IT IS NOT REPORTED AS A FAILED WRITE. `create_parents=False` alone
+    # would also stop the resurrection — the temp file cannot be created in a
+    # directory that is gone — but it reaches that outcome by RAISING, so every
+    # run somebody deletes would be logged as a write failure on the machine.
+    # The explicit re-check is what tells "the folder went away, which is fine"
+    # apart from "the write broke, which is not".
+    assert out["failed"] == 0
 
 
 def test_the_render_keeps_the_END_where_the_failure_is(tmp_path):

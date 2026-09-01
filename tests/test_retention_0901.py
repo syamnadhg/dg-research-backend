@@ -469,3 +469,7 @@ def test_the_orphan_sweep_is_what_calls_it(tmp_path):
     # the two removals, log folders resolved afterwards would be left behind
     # permanently unidentifiable. Reading first makes that window harmless.
     assert body.index("_run_log_folders_for_research") < body.index("_shutil.rmtree(d)")
+    # ⛔ AND THE RESULT IS ACTUALLY USED. Resolving the folders and then looping
+    # over something else is a mutant that survived the first harness run: the
+    # lookup was present, correctly ordered, and its answer discarded.
+    assert "for _lf in _log_folders:" in body
