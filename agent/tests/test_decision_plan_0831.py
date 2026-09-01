@@ -302,6 +302,52 @@ def test_worktab_login_skip_drops_the_platform_not_the_check():
     assert plan["skip"]["command"] == {"action": "skip_agent", "agent": "claude"}
 
 
+def test_the_generic_sentence_names_the_agent_and_both_verbs():
+    """⛔ THE MOST COMMON BLOCKER HAD NO ASSERTION ON ITS COPY. An agent that
+    failed or stalled reaches chat through the generic pipeline_error mirror with
+    [retry_agent, skip_agent], and nothing pinned the sentence a person reads —
+    so the {Ag} substitution and the whole phrase table could break silently.
+    Cross-verify found this by measuring which lines the suite executes."""
+    pd = {"kind": "pipeline_error", "phase": 2, "agent": "chatgpt",
+          "title": "ChatGPT stopped responding", "details": "",
+          "actions": [{"id": "retry", "label": "Retry",
+                       "command": {"action": "retry_agent", "agent": "chatgpt"}},
+                      {"id": "skip", "label": "Skip ChatGPT",
+                       "command": {"action": "skip_agent", "agent": "chatgpt"}}],
+          "alert_id": "phase2_error_chatgpt"}
+    plan = bridge._decision_plan(pd)
+    assert plan["card"] == "pipeline_error"
+    assert bridge._attention_action(plan) == (
+        "Reply “retry” to restart ChatGPT, or “skip” to drop ChatGPT from this run.")
+
+
+def test_the_generic_sentence_falls_back_when_no_agent_is_named():
+    """The same phrases with no agent on the card — the {Ag} placeholder must not
+    survive into a sentence a person reads."""
+    pd = {"kind": "pipeline_error", "phase": 1, "title": "No brief",
+          "actions": [{"id": "retry", "command": {"action": "retry_phase", "phase": 1}},
+                      {"id": "skip", "command": {"action": "skip_phase", "phase": 1}}]}
+    action = bridge._attention_action(bridge._decision_plan(pd))
+    assert "{Ag}" not in action
+    assert action == "Reply “retry” to resume, or “skip” to move past this step."
+
+
+def test_pro_required_at_phase_zero_skips_the_sign_in_check():
+    """⛔ research.py's pro card at phase 0 bypasses the INIT verification walk
+    (skip_init_verify); at phase >= 1 it drops that one platform. Flipping this to
+    skip_agent stayed green while the sentence still said "skip the sign-in
+    check" — the same class of mismatch as the work-tab skip, unpinned."""
+    plan = bridge._decision_plan(pro_card(phase=0))
+    assert plan["skip"]["command"] == {"action": "skip_init_verify"}
+    assert "skip the sign-in check" in bridge._attention_action(plan)
+
+
+def test_pro_required_above_phase_zero_drops_the_platform():
+    plan = bridge._decision_plan(pro_card(phase=1, agent="gemini"))
+    assert plan["skip"]["command"] == {"action": "skip_agent", "agent": "gemini"}
+    assert "drop Gemini from this run" in bridge._attention_action(plan)
+
+
 def test_p0_login_skip_is_still_the_sign_in_check():
     """The phase-0 card genuinely gates the verification walk — its Skip must
     stay skip_init_verify, matching the app's own phase-aware Skip."""

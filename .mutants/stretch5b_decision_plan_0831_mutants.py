@@ -455,6 +455,39 @@ MUTANTS = [
        '                    "attentionDetails": _det,\n'
        '                    "attentionOffers": _offers,\n', '')]),
 
+    # ══ H — the paths cross-verify measured as UNEXECUTED by any assertion ══
+    # ⛔ Found by INSTRUMENTING the suite, not by reading it: three reachable
+    # lines in the new planner ran zero times under every assertion in it. Each
+    # of these mutants survived before the pins that now cover them.
+    ("H1", BRIDGE, "over",
+     "⛔⛔ THE MOST COMMON BLOCKER'S SENTENCE BREAKS AND NOBODY NOTICES. An agent "
+     "that failed or stalled reaches chat through the generic mirror, and the "
+     "{Ag} placeholder stops being substituted — so a person is told to “restart "
+     "{Ag}”, verbatim, braces and all",
+     [('                return _cmd_spec(dict(cmd),\n'
+       '                                 phrase.replace("{Ag}", _agent_display(_lc(cmd.get("agent")) or ag)))',
+       '                return _cmd_spec(dict(cmd), phrase)')]),
+
+    ("H2", BRIDGE, "over",
+     "⛔ THE PRO CARD'S PHASE-0 SKIP DROPS A PLATFORM instead of bypassing the "
+     "sign-in verification walk — while its own sentence still says “skip the "
+     "sign-in check”. The same mismatch the work-tab skip had, on the other card",
+     [('        skip = (_cmd_spec({"action": "skip_init_verify"}, "skip the sign-in check")\n'
+       '                if ph == 0 else drop)',
+       '        skip = drop')]),
+
+    ("H3", BRIDGE, "under",
+     "⛔ /research/{id}/resume LOSES ITS NO-CHECKPOINT GUARD while /resolve keeps "
+     "its identical one, so the route a chat model reaches by saying “resume” "
+     "enqueues a request the backend deletes with a local WARN and no write-back "
+     "— a resume reported as asked for and silently dropped",
+     [('                    if not brid:\n'
+       '                        self._json(409, {\n'
+       '                            "error": "this run has no checkpoint to resume from — "\n'
+       '                                     "start a new research instead",\n'
+       '                            "reason": "no_checkpoint"})\n'
+       '                        return\n', '')]),
+
     # ══ F — type safety at the seam ═════════════════════════════════════════
     ("F1", BRIDGE, "over",
      "⛔ A CARD FIELD OF THE WRONG TYPE TAKES DOWN THE WHOLE ROUTE. `True` where "

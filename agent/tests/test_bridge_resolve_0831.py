@@ -264,6 +264,18 @@ def test_the_resume_route_stops_claiming_a_restart_paused_run_resumed(live):
     assert FakeFS.commands == [] and len(FakeFS.resumes) == 1
 
 
+def test_the_resume_route_also_refuses_without_a_checkpoint(live):
+    """⛔ /resolve's no-checkpoint guard was pinned and /resume's identical one was
+    not — so the route a chat model reaches by saying "resume" could have lost it
+    silently. Both refuse rather than enqueue a request the backend will delete
+    with only a local WARN."""
+    _seed(status="paused_backend_restart", brid=None)
+    r = requests.post(live + "/research/r1/resume")
+    assert r.status_code == 409
+    assert r.json()["reason"] == "no_checkpoint"
+    assert FakeFS.resumes == [] and FakeFS.commands == []
+
+
 def test_the_resume_route_keeps_the_command_path_for_a_normally_paused_run(live):
     """A run paused by the user is LIVE — its listener is bound, and the per-run
     command is the correct, cheaper write. Widening the queue path to cover it
