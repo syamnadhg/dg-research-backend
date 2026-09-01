@@ -2968,6 +2968,13 @@ def _run_log_folders_for_research(research_id, root=None) -> "list[Path]":
     multi-worker hole mutation found in the prune."""
     out: "list[Path]" = []
     rid = str(research_id or "").strip()
+    # ⛔⛔ NOT REDUNDANT WITH THE META COMPARISON BELOW, and mutation proved it.
+    # An empty rid looks harmless because a folder whose meta names a real
+    # research will not match it — but a folder whose meta.json has NO
+    # researchId reads back as "" too, and "" == "" is a match. One malformed
+    # owner.json upstream and the sweep would rmtree exactly the folders nothing
+    # can identify. Refusing the empty key is the only thing standing between a
+    # bad input and deleting somebody's diagnostics.
     if not rid:
         return out
     base = Path(root) if root is not None else _runs_log_root()
@@ -3097,7 +3104,13 @@ def _pull_cloud_logs(db=None, runs_root=None, queues_root=None, now=None) -> dic
     return out
 
 
-_prune_next_ms = 0
+# ⛔ NAMED, SO IT CAN BE PINNED. "Starts due" is a real behaviour — it is what
+# makes a machine that has been off for two months clean up on the way back in
+# rather than six hours later — and as a bare `0` inline it was invisible to
+# every test, because each one sets `_prune_next_ms` before it looks.
+_PRUNE_START_DUE_MS = 0
+
+_prune_next_ms = _PRUNE_START_DUE_MS
 
 
 def _prune_due(now_ms=None) -> bool:
@@ -3498,6 +3511,11 @@ def _raw_tail_started_at(path, now=None) -> float:
         return float(marker.read_text(encoding="utf-8").strip())
     except Exception:
         pass
+    # ⛔⛔ THE FALLBACK IS THE LINUX PATH, AND IT IS THE ONE THAT MATTERS.
+    # `st_birthtime` exists on macOS and NOT on Linux, so on a fleet box this
+    # branch never runs and `now_t` is the whole answer. Seeding to the clock —
+    # never to the epoch — is what stops the first run after an upgrade deciding
+    # every existing tail is infinitely old and deleting all of them.
     seeded = now_t
     try:
         st = Path(path).stat()

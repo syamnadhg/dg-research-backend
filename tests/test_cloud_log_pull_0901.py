@@ -281,6 +281,54 @@ def test_with_no_firestore_it_does_nothing_rather_than_raising(tmp_path):
                                      queues_root=tmp_path / "q")["updated"] == 0
 
 
+def test_the_pull_writes_through_the_ATOMIC_writer(tmp_path, monkeypatch):
+    """⛔ THE CALLER, NOT THE HELPER — and found by mutation, which swapped
+    `_atomic_write_text` for a plain `write_text` and survived every test in this
+    file. Nothing here could see the difference, because a test that reads the
+    file afterwards gets the same bytes either way.
+
+    Send Logs is a button a person presses, not something this process
+    schedules, so the collector can walk a run folder at ANY moment — including
+    the moment between `open()` and the last `write()`. A half-written cloud.log
+    in a support bundle is a diagnostic that lies."""
+    runs = tmp_path / "runs"
+    queues = tmp_path / "queues"
+    _folder(runs, "chat_1_1_x", "chat_1")
+    _queue(queues, "chat_1", "user-a")
+    calls = []
+    real = research._atomic_write_text
+    monkeypatch.setattr(research, "_atomic_write_text",
+                        lambda p, t: (calls.append(Path(p).name), real(p, t))[1])
+    db = _Db({"chat_1": [_doc(1, 4, ["x"])]})
+    research._pull_cloud_logs(db=db, runs_root=runs, queues_root=queues)
+    assert calls == [research.CLOUD_LOG_FILENAME]
+
+
+def test_the_atomic_writer_leaves_no_partial_file_when_the_swap_fails(tmp_path, monkeypatch):
+    """The other half: the helper's own promise. A failure part-way must leave
+    the previous content — or no file — never a truncated one, and must not
+    strand the temp file it was building."""
+    target = tmp_path / "cloud.log"
+    target.write_text("the previous, complete content\n", encoding="utf-8")
+
+    def _boom(_src, _dst):
+        raise OSError("replace refused")
+
+    monkeypatch.setattr(research.os, "replace", _boom)
+    with pytest.raises(OSError):
+        research._atomic_write_text(target, "a new and much longer body\n")
+    assert target.read_text(encoding="utf-8") == "the previous, complete content\n"
+    assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
+
+
+def test_the_atomic_writer_replaces_the_whole_file(tmp_path):
+    # Accept polarity: a writer that never writes would pass the test above.
+    target = tmp_path / "cloud.log"
+    target.write_text("old", encoding="utf-8")
+    research._atomic_write_text(target, "new content")
+    assert target.read_text(encoding="utf-8") == "new content"
+
+
 # ── the trigger ────────────────────────────────────────────────────────
 
 def test_the_pull_is_throttled_off_the_five_second_heartbeat():

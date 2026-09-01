@@ -70,9 +70,15 @@ def test_the_tails_are_bounded_by_the_same_thirty_days_as_everything_else():
 
 def test_the_sweep_starts_due_so_a_machine_coming_back_cleans_itself_up():
     # ⭐ A device that has been off for two months should sweep on the way back,
-    # not on its next run. `_prune_next_ms` is 0 at import, so the first tick
-    # after boot is due.
-    research._prune_next_ms = 0
+    # not on its next run.
+    #
+    # ⛔ THE CONSTANT, NOT THE VARIABLE — found by mutation. Every test here sets
+    # `_prune_next_ms` before it looks, so a mutant that changed the module's
+    # INITIAL value to a far-future stamp survived the whole harness: the
+    # behaviour was real, untested, and invisible. Pinning the named start value
+    # is the only thing that can see it.
+    assert research._PRUNE_START_DUE_MS == 0
+    research._prune_next_ms = research._PRUNE_START_DUE_MS
     assert research._prune_due(1_000_000) is True
 
 
@@ -224,6 +230,38 @@ def test_a_size_roll_also_restarts_the_age_clock(tmp_path):
     assert research._rotate_if_stale(tail, max_age_days=30, now=now) == 0.0
 
 
+def test_on_a_platform_with_no_birthtime_the_seed_is_the_CLOCK_not_the_epoch(tmp_path, monkeypatch):
+    """⛔⛔⛔ THE LINUX PATH, AND THE ONE THAT DESTROYS DATA IF IT IS WRONG.
+
+    `st_birthtime` exists on macOS and NOT on Linux, so on a fleet box the
+    fallback is the entire answer — and this suite runs on macOS, where the
+    birthtime branch quietly covered for it. Mutation caught that: seeding to
+    the epoch instead of the clock survived every test in this file, because on
+    this machine the fallback never executed. Seeded from the epoch, the first
+    run after an upgrade decides every tail on the machine is infinitely old and
+    deletes all of them."""
+    tail = tmp_path / "backend.log"
+    tail.write_text("pre-existing", encoding="utf-8")
+    now = time.time()
+
+    real_stat = Path.stat
+
+    class _NoBirth:
+        """A stat result shaped like Linux's — no st_birthtime attribute."""
+
+        def __init__(self, st):
+            self.st_mtime = st.st_mtime
+            self.st_size = st.st_size
+
+    def _stat(self, *a, **kw):
+        return _NoBirth(real_stat(self, *a, **kw))
+
+    monkeypatch.setattr(Path, "stat", _stat)
+    seeded = research._raw_tail_started_at(tail, now=now)
+    # Seeded from the clock: the generation is treated as new, not ancient.
+    assert seeded == now
+
+
 def test_a_missing_marker_seeds_instead_of_deleting_on_a_guess(tmp_path):
     # ⭐ FIRST RUN AFTER UPGRADE. Nobody recorded when the existing tail began,
     # so the bound becomes exact within one window rather than firing
@@ -329,6 +367,24 @@ def test_an_empty_research_id_matches_nothing(rid, tmp_path):
     # delete every run folder on the machine.
     _folder(tmp_path, "chat_1_1_20260801T000000", "chat_1")
     assert research._run_log_folders_for_research(rid, root=tmp_path) == []
+
+
+@pytest.mark.parametrize("rid", ["", None, "   "])
+def test_an_empty_id_does_not_match_a_folder_that_ALSO_has_no_id(rid, tmp_path):
+    """⛔⛔⛔ THE CASE THE GUARD ACTUALLY EXISTS FOR — found by mutation.
+
+    Removing `if not rid: return out` survived every test above, because a
+    folder whose meta names a real research does not match an empty id anyway.
+    But a folder whose meta.json has NO researchId reads back as "" as well, and
+    "" == "" is a match. Without the guard, one malformed owner.json upstream
+    deletes exactly the folders nothing can identify — and those are the oldest
+    and least replaceable diagnostics on the machine."""
+    d = tmp_path / "orphan_1_1_20260801T000000"
+    d.mkdir(parents=True)
+    (d / "meta.json").write_text(json.dumps({"status": "completed"}), encoding="utf-8")
+    (d / "run.log").write_text("lines", encoding="utf-8")
+    assert research._run_log_folders_for_research(rid, root=tmp_path) == []
+    assert d.exists()
 
 
 def test_the_orphan_sweep_is_what_calls_it(tmp_path):
