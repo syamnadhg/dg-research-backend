@@ -2533,12 +2533,33 @@ def _claim_announced(sess: AccountSession, ms: int) -> tuple[bool, int | None]:
     return (outcome != "already", prev)
 
 
-def _rollback_announced(sess: AccountSession, prev: int | None) -> None:
-    """Undo a claim whose response never reached anybody. Never fatal."""
+def _rollback_announced(sess: AccountSession, prev: int | None,
+                        expected: int | None) -> None:
+    """Undo a claim whose response never reached anybody. Never fatal.
+
+    ⛔ ``expected`` is what our own claim installed — a compare-and-swap, so a
+    rollback can only ever undo itself and never a newer claim that was delivered.
+    """
     try:
-        prefs.restore_announced_signin_ms(prev, sess.uid)
+        prefs.restore_announced_signin_ms(prev, sess.uid, expected=expected)
     except Exception as e:  # noqa: BLE001
         log.warning("could not roll back the announce watermark (%s)", type(e).__name__)
+
+
+def _announce_ms(ev: Any, sess: AccountSession) -> int:
+    """The sign-in's identity for a parked note. Never raises.
+
+    ⛔⛔ THIS WAS AN INLINE `int(ev.get("ts") or 0)` SITTING OUTSIDE EVERY try — and
+    the note has already been TAKEN by then. A parked `ts` that is not a number (a
+    hand-edited prefs.json, a note from a future writer) raised there, so the
+    announce was destroyed AND the reader got no response at all. Fall back to the
+    session's capture epoch, which is the same identity fix 1 made it.
+    """
+    raw = ev.get("ts") if isinstance(ev, dict) else None
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw:
+        return int(raw)
+    cap = getattr(sess, "connected_at_ms", 0)
+    return int(cap) if isinstance(cap, (int, float)) and not isinstance(cap, bool) else 0
 
 
 def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
@@ -3918,6 +3939,7 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # pair: whether we moved it, and what it was.
             marked: bool = False
             mark_prev: int | None = None
+            mark_ms: int | None = None      # what our own claim installed, for the CAS
             # One-shot "just signed in" announce for the chat watchdog. Only the
             # watchdog reads it (it always sets ?via=agent) — so an ordinary client
             # /updates call can't silently consume it. Take-and-clear is atomic; if
@@ -3937,17 +3959,32 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 # recovery built for exactly that loss refused to run. The mechanism
                 # switched itself off at the one moment it was needed.
                 #
-                # ⭐ WHAT ACTUALLY PROTECTS IT IS THE CLIENT'S OWN DE-DUP, and that is
-                # why the note now carries the session's capture epoch as its `ts`
-                # rather than a second, near-identical timestamp of its own: a re-mint
-                # then arrives under the SAME identity the watchdog already recorded
-                # in `__signed_in_ts__`, so a client that did receive the original
-                # drops the repeat and a client that lost it shows it. A graceful
-                # timeout stays invisible at this layer — it is the client, not the
-                # server, that can tell the difference.
+                # ⭐ THE SINGLE IDENTITY IS WHAT MAKES A REPEAT SAFE: the note carries
+                # the session's capture epoch as its `ts` rather than a second,
+                # near-identical timestamp of its own, so anything re-sent for this
+                # sign-in arrives under the SAME identity the watchdog recorded in
+                # `__signed_in_ts__` and a client that already showed it drops it. That
+                # is what the rollback below relies on.
+                #
+                # ⚠ AND IT DOES NOT CLOSE THE GRACEFUL-TIMEOUT CASE — an earlier version
+                # of this comment claimed it did ("a client that lost it shows it"), and
+                # cross-verification refuted it: on a parked delivery the watermark is
+                # claimed at exactly the note's own ts, so `_remint_signin` finds
+                # `cap <= seen` and there is no repeat to show. A reader that receives
+                # the bytes and then dies is indistinguishable from one that acted on
+                # them, at this layer and at every layer the server can see.
+                # ▶ Closing it means NOT claiming the watermark on a parked delivery and
+                # letting one re-mint through for the client to de-dup — a change to what
+                # the person can be promised, so it is the owner's call, not a tidy-up.
                 ev = state.take_signed_in(sess.uid)
                 if isinstance(ev, dict):
-                    ev_origin = ev.get("origin")
+                    # ⛔ CLEANED HERE TOO, NOT ONLY AT THE MINT — cross-verification
+                    # found the skew: prefs.json SURVIVES the upgrade (that is the whole
+                    # point of parking it), so a half-formed origin an OLDER bridge wrote
+                    # is read back verbatim and stays the dead letter the mint fix was
+                    # supposed to end. Cleaning at the gate covers every note however it
+                    # got there, and is a no-op for one the mint already cleaned.
+                    ev_origin = _clean_origin(ev.get("origin"))
                     # An ORIGIN-LESS sign-in event (a connect-CLI / --pair login that
                     # confirms in the TERMINAL, started from no chat) must NOT be handed
                     # to a SCOPED chat watchdog: with several channels armed
@@ -4007,10 +4044,8 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                         # the very next tick and say it all again, plainly.
                         # ⛔ CLAIMED, NOT STAMPED, so the previous mark is known and a
                         # send that raises can put it back beside the note.
-                        marked, mark_prev = _claim_announced(
-                            sess,
-                            int(ev.get("ts") or 0)
-                            or int(getattr(sess, "connected_at_ms", 0) or 0))
+                        mark_ms = _announce_ms(ev, sess)
+                        marked, mark_prev = _claim_announced(sess, mark_ms)
                     else:
                         # Not this chat's — put it straight back for the watchdog
                         # that owns it.
@@ -4040,6 +4075,7 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                         out["signedIn"] = remade
                         taken = None
                         marked = True
+                        mark_ms = int(remade.get("ts") or 0)
             try:
                 self._json(200, out)
             except Exception:
@@ -4054,7 +4090,7 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 # exists to recover a lost announce refused to, because the mark said
                 # this sign-in had already gone out. Both halves, or neither.
                 if marked:
-                    _rollback_announced(sess, mark_prev)
+                    _rollback_announced(sess, mark_prev, mark_ms)
                 raise
 
         def _research_cancel(self, rid: str) -> None:

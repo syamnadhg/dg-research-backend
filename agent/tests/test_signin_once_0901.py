@@ -298,6 +298,55 @@ def test_claim_reports_first_won_and_already_apart():
     assert prefs.claim_signin_announce(5_999, "u1") == ("already", 6_000)
 
 
+def test_a_claim_with_no_account_never_reports_a_win():
+    """⛔ MEASURED UNCOVERED by cross-verification: turning this gate into a win left the
+    whole suite green. A caller with no session would be told it owns the announce, and
+    the watermark it "moved" belongs to nobody — so the real account's next claim reads a
+    mark it never made."""
+    assert prefs.claim_signin_announce(5_000, "")[0] == "already"
+    raw = prefs.load()
+    assert "announcedSignInMs" not in raw, "an account-less claim must write nothing"
+
+
+def test_the_rollback_holds_the_lock_while_it_reads_and_writes():
+    """⛔ MEASURED UNCOVERED: replacing the rollback's `with _lock:` with `if True:` left
+    the suite green. It is a read-compare-write like the claim, so it needs the same
+    mutual exclusion — and this pins it the only way a single-threaded test can: by
+    driving it concurrently and checking the outcome is consistent."""
+    prefs.set_announced_signin_ms(1_000, "u1")
+    prefs.claim_signin_announce(2_000, "u1")
+    results: list = []
+    lk = threading.Lock()
+    bar = threading.Barrier(16)
+
+    def worker():
+        bar.wait()
+        ok = prefs.restore_announced_signin_ms(1_000, "u1", expected=2_000)
+        with lk:
+            results.append(ok)
+
+    ts = [threading.Thread(target=worker) for _ in range(16)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert sum(1 for r in results if r) == 1, (
+        f"exactly one rollback may fire for one claim, got {sum(1 for r in results if r)}")
+    assert prefs.get_announced_signin_ms("u1") == 1_000
+
+
+def test_the_announce_identity_falls_back_to_the_capture_epoch():
+    """⛔ MEASURED UNCOVERED: dropping the fallback half of the claim's argument left the
+    suite green, because no suite ever parked a note without a `ts`. Without it, such a
+    note claims 0 — which the watermark reads as "announced at the epoch"."""
+    assert bridge._announce_ms({"ts": 9_000}, _sess(cap=7_000)) == 9_000
+    assert bridge._announce_ms({}, _sess(cap=7_000)) == 7_000
+    assert bridge._announce_ms({"ts": 0}, _sess(cap=7_000)) == 7_000
+    assert bridge._announce_ms({"ts": "nope"}, _sess(cap=7_000)) == 7_000
+    assert bridge._announce_ms({"ts": True}, _sess(cap=7_000)) == 7_000, (
+        "a bool is an int subclass — it must not become an identity of 1")
+
+
 def test_a_claim_never_inherits_another_accounts_watermark():
     """⛔ Same rule the getter applies. Without it a re-login under a different account
     is suppressed by the previous owner's mark — the new person is never greeted."""
@@ -311,6 +360,61 @@ def test_a_first_observation_says_nothing_and_still_records_where_we_are():
     note, _prev = bridge._remint_signin(sess)
     assert note is None
     assert prefs.get_announced_signin_ms("u1") == 8_000
+
+
+def test_a_rollback_never_undoes_a_NEWER_claim_that_was_delivered():
+    """⛔⛔ THE BLIND WRITE, measured by cross-verification. Watermark 1000; request A
+    claims 2000; request B claims 3000 and its response IS delivered; A's send then
+    raises. A blind restore writes 1000 back — so B's delivered 3000 is unmarked and gets
+    announced all over again. A rollback may only ever undo ITSELF."""
+    prefs.set_announced_signin_ms(1_000, "u1")
+    _oa, prev_a = prefs.claim_signin_announce(2_000, "u1")     # request A
+    _ob, _prev_b = prefs.claim_signin_announce(3_000, "u1")    # request B, delivered
+    restored = prefs.restore_announced_signin_ms(prev_a, "u1", expected=2_000)
+    assert restored is False, "A must not be allowed to undo B's newer claim"
+    assert prefs.get_announced_signin_ms("u1") == 3_000
+
+
+def test_a_rollback_never_deletes_another_accounts_watermark():
+    """⛔ The claim reports NO previous value when the stored mark belongs to a different
+    account, so the rollback's `None` branch used to delete that account's mark outright
+    — no race required."""
+    prefs.set_announced_signin_ms(9_000, "uA")
+    outcome, prev = prefs.claim_signin_announce(1_000, "uB")
+    assert (outcome, prev) == ("first", None)
+    # uA's row was legitimately replaced by uB's claim; a rollback of uB's own claim is
+    # allowed, but one carrying a stale expectation must not touch it.
+    assert prefs.restore_announced_signin_ms(None, "uB", expected=5_555) is False
+    assert prefs.get_announced_signin_ms("uB") == 1_000
+
+
+def test_a_parked_ts_that_is_not_a_number_does_not_destroy_the_announce(live):
+    """⛔ THE `int()` SAT OUTSIDE EVERY try, AND THE NOTE IS ALREADY TAKEN BY THEN. A
+    hand-edited prefs.json or a note from a future writer raised there, so the announce
+    was destroyed AND the reader got no response at all — the worst of both."""
+    base, state = live
+    state.set_signed_in({"ts": "not-a-number", "uid": "u1", "email": "e@x.y",
+                         "origin": None})
+    got = requests.get(base + "/updates?via=agent", timeout=5).json()
+    assert got.get("signedIn", {}).get("email") == "e@x.y", got
+    # and the identity falls back to the session's capture epoch, not to a crash
+    assert prefs.get_announced_signin_ms("u1") == 7_000
+
+
+def test_a_half_address_an_OLDER_bridge_parked_on_DISK_is_still_delivered(live):
+    """⛔ THE SKEW FIX 4 MISSED. prefs.json SURVIVES the upgrade — that is the whole point
+    of parking it — so a half-formed origin written by an older bridge is read back
+    verbatim and stays exactly the dead letter cleaning-at-the-mint was meant to end."""
+    base, state = live
+    # Write the note the way an older bridge would have: straight to disk, uncleaned.
+    prefs.set_pending_announce({"ts": 7_000, "uid": "u1", "email": "e@x.y",
+                                "origin": {"platform": "telegram"}}, "u1")
+    state.set_signed_in(None)          # memory empty; only the parked copy exists
+    prefs.set_pending_announce({"ts": 7_000, "uid": "u1", "email": "e@x.y",
+                                "origin": {"platform": "telegram"}}, "u1")
+    got = requests.get(base + "/updates?via=agent", timeout=5).json()
+    assert got.get("signedIn", {}).get("email") == "e@x.y", (
+        f"a half-address already on disk must not stay a dead letter: {got}")
 
 
 def test_the_rollback_removes_the_keys_when_there_was_no_mark():
@@ -394,9 +498,18 @@ def test_login_done_relays_the_device_question_the_note_was_holding(live, capsys
         "devices": [{"id": "d1", "name": "Research Computer"},
                     {"id": "d2", "name": "Macbook"}],
     })
+    # ⛔ A DEVICE IS SEEDED ON PURPOSE. With none, `_connected_msg`'s fallback says
+    # "paste the access code from your Research Computer" — so a bare
+    # `"Research Computer" in out` passes even when the relay is GONE. Cross-verification
+    # measured that: under the mutant that stops login-done taking the note, the loose
+    # assertion still held. Seed a device so the fallback cannot contain the name, and
+    # assert on the QUESTION rather than on a device name alone.
+    FakeFS.devices = [{"id": "d1", "name": "Research Computer", "ownerUid": "u1"}]
     assert sr.main(["login-done"]) == 0
     out = capsys.readouterr().out
-    assert "Research Computer" in out and "Macbook" in out, out
+    assert "Macbook" in out, out
+    assert "which should run" in out.lower() or "use " in out.lower(), out
+    assert "access code" not in out, f"this is the relay, not the fallback: {out!r}"
     assert state.signed_in is None, "the note must be TAKEN, or the watcher repeats it"
 
 
@@ -415,27 +528,63 @@ def test_login_done_takes_a_plain_note_but_keeps_the_device_aware_greeting(live,
     assert state.signed_in is None, "the note must still be taken"
 
 
-def test_login_done_keeps_the_cue_to_act_for_a_topic_only_note(live, capsys):
-    """⛔⛔ A DEFECT I FOUND IN MY OWN FIX. The note's FOURTH case is the legacy fallback,
-    *"Continue with X? Say go ahead and I'll start it."* — a question aimed at the
-    PERSON. SKILL.md step 2 is written against *"Continuing your research on X…"* and
-    treats it as the cue to run `research` at once, so preferring the note here swaps a
-    cue-to-act for a question and the topic is stranded: the assistant waits for a "go
-    ahead" that was already given.
+def test_login_done_still_names_the_topic_when_the_auto_start_FAILED(live, capsys):
+    """⛔⛔⛔ THE BLOCKER CROSS-VERIFICATION FOUND IN MY OWN FIX — and my first test for
+    this case pinned a state the live path cannot produce, which is why the test passed
+    while the code was broken.
 
-    ⭐ The note is STILL taken — that is what stops the watchdog repeating the news."""
+    The real path: a person asks for research while signed out, approves, and the
+    auto-start worker's Firestore I/O FAILS. The worker then parks the note's FOURTH
+    shape — a topic and none of the three outcome flags — and by then `flow.pending_topic`
+    has ALREADY been nulled (it is claimed under the lock before the worker is spawned),
+    so the poll reply carries NO topic.
+
+    My first gate relayed the note only for the three flags, so: note TAKEN, gate says
+    nothing, poll reply has no topic → a plain "you're all set" and the person's research
+    request GONE. Before any of this work the note simply stayed parked and the watchdog
+    said it. **A fix that loses news the bug did not.**
+
+    ⭐ My first test set BOTH `flow.pending_topic` and a topic-only note — mutually
+    exclusive on the real path — so it proved nothing. This one drives the capture."""
     base, state = live
+    monkeypatch_free_topic = "quantum error correction"
+
+    # The real capture, with a pending topic and an auto-start that fails.
     flow = bridge.RemoteFlow("pt", "CODE", "https://x/y", 9e18)
+    flow.pending_topic = monkeypatch_free_topic
     flow.state = "connected"
-    flow.pending_topic = "quantum error correction"
     state.set_remote(flow)
-    state.set_signed_in({"ts": 7_000, "uid": "u1", "email": "e@x.y", "origin": None,
-                         "pendingTopic": "quantum error correction"})
+    # What `_autostart_worker` parks when `_run_autostart` returns {} (its documented
+    # failure fallback): the topic rides along, no outcome flag is set.
+    base_ev = {"ts": 7_000, "uid": "u1", "email": "e@x.y", "origin": None}
+    base_ev["pendingTopic"] = monkeypatch_free_topic
+    state.set_signed_in(base_ev)
+    flow.pending_topic = None          # claimed under the lock before the worker ran
+    assert not (flow.pending_topic or "")
+
     assert sr.main(["login-done"]) == 0
     out = capsys.readouterr().out
+    assert monkeypatch_free_topic in out, (
+        f"the topic must survive — it exists nowhere else once the note is taken: {out!r}")
     assert "Continuing your research" in out, out
     assert "go ahead" not in out, f"a cue to act must not become a question: {out!r}"
     assert state.signed_in is None, "the note must still be taken"
+
+
+def test_login_done_json_carries_the_note_it_consumed(live, capsys):
+    """⛔ THE `--json` PAYLOAD WAS THE POLL BODY, so a caller reading JSON got
+    `state: connected` and none of the news the command had just destroyed."""
+    base, state = live
+    flow = bridge.RemoteFlow("pt", "CODE", "https://x/y", 9e18)
+    flow.state = "connected"
+    state.set_remote(flow)
+    state.set_signed_in({"ts": 7_000, "uid": "u1", "email": "e@x.y", "origin": None,
+                         "autoStarted": True, "deviceName": "Research Computer",
+                         "topic": "quantum error correction"})
+    assert sr.main(["--json", "login-done"]) == 0   # --json is a GLOBAL flag
+    import json as _json
+    payload = _json.loads(capsys.readouterr().out)
+    assert payload.get("signedIn", {}).get("autoStarted") is True, payload
 
 
 def test_login_done_asks_with_this_chats_address_so_an_addressed_note_is_claimable(
@@ -453,9 +602,13 @@ def test_login_done_asks_with_this_chats_address_so_an_addressed_note_is_claimab
         "autoStarted": True, "deviceName": "Research Computer",
         "topic": "quantum error correction",
     })
+    # Same reason as the device-question test: seed a device so the deviceless fallback
+    # cannot supply the string this assertion looks for.
+    FakeFS.devices = [{"id": "d1", "name": "Research Computer", "ownerUid": "u1"}]
     assert sr.main(["login-done"]) == 0
     out = capsys.readouterr().out
-    assert "Research Computer" in out, out
+    assert "Started" in out and "Research Computer" in out, out
+    assert "access code" not in out, f"this is the relay, not the fallback: {out!r}"
     assert state.signed_in is None
 
 
@@ -498,6 +651,29 @@ def test_the_watcher_no_longer_swallows_a_note_with_no_timestamp(monkeypatch, tm
     required to speak."""
     out, _state = _tick(monkeypatch, tmp_path, {"email": "e@x.y"})
     assert "e@x.y" in out, f"a note with no ts must still be announced, got {out!r}"
+
+
+def test_a_ts_less_note_leaves_a_record_so_the_watchdog_is_not_torn_down(
+        monkeypatch, tmp_path):
+    """⛔⛔ THE WORSE HALF OF THE WIDENING, found by cross-verification.
+    `__signed_in_ts__` is also the watcher's ONLY record that a sign-in was ever SEEN —
+    `_tick_unauthed` reads it as `signed_in_before`. Announcing a ts-less note while
+    recording nothing meant a person who was told "✓ Signed in" left no trace, so a later
+    401 counted toward `_LOGIN_WAIT_LIMIT` and TORE THE WATCHDOG DOWN."""
+    out, state = _tick(monkeypatch, tmp_path, {"email": "e@x.y"})
+    assert "e@x.y" in out
+    assert state.get("__signed_in_ts__"), (
+        f"a ts-less announce must still leave a record: {state!r}")
+
+
+def test_a_ts_less_note_is_not_repeated_on_every_tick(monkeypatch, tmp_path):
+    """⛔ AND THE UNBOUNDED REPEAT. With nothing recorded, the next tick's falsy-ts branch
+    fired again — once a minute, forever, each time as if it were news."""
+    note = {"email": "e@x.y"}
+    first, state = _tick(monkeypatch, tmp_path, note)
+    assert "e@x.y" in first
+    again, _ = _tick(monkeypatch, tmp_path, note, prior=state)
+    assert "e@x.y" not in again, f"a ts-less note must not repeat: {again!r}"
 
 
 def test_an_empty_announce_says_nothing(monkeypatch, tmp_path):

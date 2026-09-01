@@ -214,12 +214,21 @@ should I continue?"**. The moment the user replies **anything** ("done",
    '<topic>'?" — that `<topic>` is already in hand. Immediately run
    `sr.py research "<that exact topic>"`.** Do NOT wait for, or re-derive the topic
    from, `login-done`, and do NOT ask what to continue — they already said yes.
-1. Otherwise, run `sr.py login-done`. It confirms the session ("✓ Connected as
-   <email>") and, if they asked to research while signed out, prints "Continuing
-   your research on '<topic>'…".
-2. If `login-done` reported that **pending topic**, immediately run
+1. Otherwise, run `sr.py login-done`. It confirms the sign-in and **relays whatever the
+   bridge already did about their research** — it is the one command that can, because it
+   consumes the same one-shot note the proactive announce would have carried. Four shapes:
+   - "✓ Signed in … 🚀 Started '<topic>' on <computer>" — already running. Say so; start
+     nothing.
+   - "✓ Signed in … '<topic>' has nowhere to run yet" — walk the pair-a-computer steps it
+     prints.
+   - "✓ Signed in … which should run '<topic>'?" — **relay that question with the
+     computer names** and wait for their pick; then `sr.py device-use "<name>"`.
+   - "✓ Connected as <email>. Continuing your research on '<topic>'…" — the cue to act:
+     go straight to step 2.
+2. If `login-done` named a **pending topic** with that last wording, immediately run
    `sr.py research "<that topic>"` (this also surfaces the pair-a-device prompt if
-   they have no device yet).
+   they have no device yet). Do NOT run `research` for the first three shapes — the
+   bridge has already decided, and starting again would duplicate or override it.
 3. If there's no pending topic, greet them and invite a topic.
 
 A "continue" / "yes" after a sign-in link ALWAYS means one of the paths above —

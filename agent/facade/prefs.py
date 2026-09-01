@@ -216,28 +216,53 @@ def claim_signin_announce(ms: int, uid: str) -> tuple[str, int | None]:
         return (("won" if seen is not None else "first"), seen)
 
 
-def restore_announced_signin_ms(ms: int | None, uid: str) -> None:
+def restore_announced_signin_ms(ms: int | None, uid: str, *,
+                                expected: int | None = None) -> bool:
     """Put the watermark back where a claim found it, after a send that raised.
+
+    Returns whether it was restored. ``expected`` is the value this caller's own
+    claim INSTALLED: the restore only happens while that is still what the file
+    holds, so a rollback cannot undo somebody else's newer, delivered claim.
 
     ⛔ The note itself is already restored on that path and the watermark was not,
     so the restored note stayed claimable while the mark said it had gone out —
-    two records of the same fact disagreeing. ``None`` means there was no mark to
-    begin with, so both keys are removed rather than pinned to a zero that would
-    read as "announced at the epoch".
+    two records of the same fact disagreeing.
+
+    ⛔⛔ AND THE FIRST VERSION WAS A BLIND WRITE, which cross-verification measured
+    into two separate losses. Watermark 1000; request A claims 2000; request B
+    claims 3000 and its response is DELIVERED; A's send then raises and writes 1000
+    back — so B's delivered 3000 is unmarked and gets re-announced. And when the
+    stored mark belongs to ANOTHER account the claim reports no previous value, so
+    the rollback's ``None`` branch deleted that account's watermark outright. A
+    compare-and-swap closes both: a rollback is only ever allowed to undo itself.
+
+    ``None`` means there was no mark to begin with, so both keys are removed. ⚠ And
+    NOT because a zero would "suppress" anything — cross-verification measured that
+    claim wrong: the compare is `ms <= seen`, so a stored 0 still lets any later
+    sign-in win. Removing the keys is right for a plainer reason: a 0 asserts this
+    account was announced at the epoch, which never happened.
     """
     if not uid:
-        return
+        return False
     with _lock:
         prefs = load()
+        raw = prefs.get(_ANNOUNCED_SIGNIN)
+        owner = prefs.get(_ANNOUNCED_SIGNIN_UID)
+        current = (int(raw) if isinstance(raw, (int, float)) and owner == uid else None)
+        if expected is not None and current != int(expected):
+            # Somebody else moved it after our claim — theirs is newer and, unlike
+            # ours, may have been delivered. Leave it alone.
+            return False
         if ms is None:
             popped = [prefs.pop(k, None)
                       for k in (_ANNOUNCED_SIGNIN, _ANNOUNCED_SIGNIN_UID)]
             if any(v is not None for v in popped):
                 save(prefs)
-            return
+            return True
         prefs[_ANNOUNCED_SIGNIN] = int(ms)
         prefs[_ANNOUNCED_SIGNIN_UID] = uid
         save(prefs)
+        return True
 
 
 def get_verbose() -> bool:

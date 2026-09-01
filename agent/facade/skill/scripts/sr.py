@@ -783,13 +783,27 @@ def cmd_login_wait(args) -> int:
         # given. ⭐ TAKE THE NOTE EITHER WAY — taking it is what stops the watchdog
         # repeating the news, and that half is true of all four cases.
         note = _claim_signed_in_announce()
-        note_lines = (_signed_in_lines(note)
-                      if isinstance(note, dict) and (note.get("autoStarted")
-                                                     or note.get("needsDevice")
-                                                     or note.get("needsDeviceChoice"))
-                      else [])
-        if note_lines:
-            return _emit(body, args.json, note_lines)
+        if isinstance(note, dict) and (note.get("autoStarted")
+                                       or note.get("needsDevice")
+                                       or note.get("needsDeviceChoice")):
+            # A bridge-decided outcome: relay it in the note's own words. `body` still
+            # rides along so `--json` keeps every field the note carried.
+            return _emit({**body, "signedIn": note}, args.json, _signed_in_lines(note))
+        # ⛔⛔ AND THE TOPIC MUST BE READ BACK OFF THE NOTE, WHICH IS THE DEFECT THE
+        # FIRST VERSION OF THIS GATE INTRODUCED. The note's FOURTH shape — a topic and
+        # none of the three flags — is minted by `_autostart_worker` when its Firestore
+        # I/O FAILS, and by then `flow.pending_topic` has already been nulled (it is
+        # claimed under the lock before the worker is spawned). So the poll reply carries
+        # NO topic, the gate above excludes the note, and my first version fell through
+        # to a plain "you're all set": the note TAKEN, the topic destroyed, and the
+        # person's research request gone. Before any of this work the note simply stayed
+        # parked and the watchdog said it. **A fix that loses news the bug did not.**
+        # ⭐ SKILL.md's wording, not the note's. The note's own fourth line asks the
+        # PERSON ("say go ahead"); step 2 of "After a sign-in link" is written against
+        # "Continuing your research on X…" and treats it as the cue to run `research`
+        # immediately. Keep the cue, take the topic from wherever it survives.
+        if isinstance(note, dict):
+            topic = topic or str(note.get("topic") or note.get("pendingTopic") or "").strip()
         if topic:
             # The user asked to research this before signing in. Confirm + name the
             # topic; per SKILL.md "After a sign-in link" the assistant now runs

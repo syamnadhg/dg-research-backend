@@ -630,12 +630,21 @@ def main(origin: dict | None = None) -> int:
         # outright: the silent eater, in the one reader that is supposed to be the
         # reliable one. A missing `ts` costs the cross-tick de-dup, not the message —
         # so say it, and record what we can.
+        # ⛔⛔ A KEY, NOT THE RAW ts — AND THE FIRST VERSION OF THIS RECORDED NOTHING FOR
+        # A ts-LESS NOTE, which cost two things cross-verification found. (1) An UNBOUNDED
+        # REPEAT: with nothing recorded, the next tick's `not new_ts` fired again, once a
+        # minute, forever. (2) Worse and less obvious — `__signed_in_ts__` is also the
+        # watcher's ONLY record that a sign-in was ever SEEN (`_tick_unauthed` reads it as
+        # `signed_in_before`), so a person who was told "✓ Signed in" left no trace, and a
+        # later 401 counted toward `_LOGIN_WAIT_LIMIT` and TORE THE WATCHDOG DOWN.
+        # ⭐ Falling back to the rendered line makes the de-dup work without a timestamp
+        # and always leaves a record. Bounded, because the line is what the person read.
         new_ts = signed_in.get("ts")
-        if not new_ts or new_ts != si_ts:
+        si_key = new_ts if new_ts else "line:" + _signed_in_line(signed_in)[:200]
+        if si_key != si_ts:
             out.append(_signed_in_line(signed_in))
             announced_login = True
-            if new_ts:
-                si_ts = new_ts
+            si_ts = si_key
 
     # Baseline = we've never recorded this chat's RUNS before. A state file that
     # holds only reserved keys (e.g. __login_wait__ written by unauthed login-wait

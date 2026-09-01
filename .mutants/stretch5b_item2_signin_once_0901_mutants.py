@@ -110,21 +110,21 @@ MUTANTS = [
      "⛔⛔ THE ROLLBACK GOES AWAY AND THE RESTORE STAYS — the exact asymmetry this fix "
      "closed. The note is claimable again while the watermark says the announce went "
      "out, so the re-mint that exists to recover a lost one refuses to run",
-     [('                if marked:\n                    _rollback_announced(sess, mark_prev)',
-       '                if False:\n                    _rollback_announced(sess, mark_prev)')]),
+     [('                if marked:\n                    _rollback_announced(sess, mark_prev, mark_ms)',
+       '                if False:\n                    _rollback_announced(sess, mark_prev, mark_ms)')]),
 
     ("B2", BRIDGE, "under",
      "the parked path stops recording that it moved the mark, so the rollback is "
      "written, reachable, and never taken — a fix that exists only in the source",
-     [('                        marked, mark_prev = _claim_announced(',
-       '                        _ignored, mark_prev = _claim_announced(')]),
+     [('                        marked, mark_prev = _claim_announced(sess, mark_ms)',
+       '                        _ignored, mark_prev = _claim_announced(sess, mark_ms)')]),
 
     ("B3", BRIDGE, "over",
      "⛔ THE ROLLBACK RESTORES A ZERO instead of what it displaced. Zero is not 'no "
      "mark' — it reads as 'announced at the epoch', so the account is left in exactly "
      "the state the rollback was supposed to undo",
-     [('                if marked:\n                    _rollback_announced(sess, mark_prev)',
-       '                if marked:\n                    _rollback_announced(sess, 0)')]),
+     [('                if marked:\n                    _rollback_announced(sess, mark_prev, mark_ms)',
+       '                if marked:\n                    _rollback_announced(sess, 0, mark_ms)')]),
 
     ("B4", BRIDGE, "under",
      "the re-mint path stops recording its claim, so a re-mint lost to a dropped "
@@ -187,8 +187,8 @@ MUTANTS = [
      "only place holding what the bridge DID about their research. The owner's own "
      "fleet transcript is this shape: 'they are signed in' and nothing about the three "
      "computers the note was holding",
-     [('        note = _claim_signed_in_announce()\n        note_lines = (_signed_in_lines(note)',
-       '        note = {}\n        note_lines = (_signed_in_lines(note)')]),
+     [('        note = _claim_signed_in_announce()\n        if isinstance(note, dict) and (note.get("autoStarted")',
+       '        note = {}\n        if isinstance(note, dict) and (note.get("autoStarted")')]),
 
     ("D2", SR, "under",
      "⛔ THE CHAT SCOPE IS DROPPED FROM THE CLAIM, so the read looks like the "
@@ -206,25 +206,41 @@ MUTANTS = [
      "go ahead'* — a question aimed at the person — where SKILL.md is written against "
      "*'Continuing your research on X…'* and treats it as the cue to start the run. The "
      "assistant then waits for a go-ahead that was already given",
-     [('                      if isinstance(note, dict) and (note.get("autoStarted")\n'
-       '                                                     or note.get("needsDevice")\n'
-       '                                                     or note.get("needsDeviceChoice"))\n'
-       '                      else [])',
-       '                      if isinstance(note, dict) and note\n'
-       '                      else [])')]),
+     [('        if isinstance(note, dict) and (note.get("autoStarted")\n'
+       '                                       or note.get("needsDevice")\n'
+       '                                       or note.get("needsDeviceChoice")):',
+       '        if isinstance(note, dict) and note:')]),
 
     ("D5", SR, "under",
      "⛔⛔ `needsDeviceChoice` DROPS OUT OF THE GATE, so the one payload the owner's own "
      "fleet transcript proves was lost — *'you have 3 research computers, which should "
      "run this?'* — is taken and then not relayed. The exact defect, re-entered through "
      "the fix for it",
-     [('                                                     or note.get("needsDeviceChoice"))',
-       '                                                     or False)')]),
+     [('                                       or note.get("needsDeviceChoice")):',
+       '                                       or False):')]),
 
     ("D4", SR, "under",
      "the note is claimed and then not rendered — the debt is taken and not paid, which "
      "is the silent eater this whole line of work exists to end, one function further in",
-     [('        note_lines = (_signed_in_lines(note)', '        note_lines = ([]')]),
+     [('            return _emit({**body, "signedIn": note}, args.json, _signed_in_lines(note))',
+       '            return _emit({**body, "signedIn": note}, args.json, [])')]),
+
+    ("D6", SR, "under",
+     "⛔⛔⛔ THE BLOCKER CROSS-VERIFICATION FOUND IN MY OWN FIRST FIX. The topic stops "
+     "being read back off the note — and the note's FOURTH shape (a topic, no outcome "
+     "flag) is minted exactly when the auto-start FAILED, by which point the flow's copy "
+     "of the topic has already been nulled. So the note is TAKEN and the person's "
+     "research request is destroyed: a fix that loses news the bug did not",
+     [('        if isinstance(note, dict):\n'
+       '            topic = topic or str(note.get("topic") or note.get("pendingTopic") or "").strip()',
+       '        if False:\n'
+       '            topic = topic or str(note.get("topic") or note.get("pendingTopic") or "").strip()')]),
+
+    ("D7", SR, "under",
+     "the `--json` payload goes back to the poll body alone, so a caller reading JSON "
+     "gets `state: connected` and none of the news this command just consumed",
+     [('            return _emit({**body, "signedIn": note}, args.json, _signed_in_lines(note))',
+       '            return _emit(body, args.json, _signed_in_lines(note))')]),
 
     # ══ E — the two readers agree about a missing timestamp ═════════════════
     ("E1", POLL, "under",
@@ -232,13 +248,15 @@ MUTANTS = [
      "updates` renders the same payload — two readers of one field disagreeing about "
      "whether a timestamp is required to speak. The bridge has already cleared the note "
      "by then, so dropping it destroys the news outright",
-     [('        if not new_ts or new_ts != si_ts:',
-       '        if new_ts and new_ts != si_ts:')]),
+     [('        si_key = new_ts if new_ts else "line:" + _signed_in_line(signed_in)[:200]\n'
+       '        if si_key != si_ts:',
+       '        si_key = new_ts\n'
+       '        if si_key and si_key != si_ts:')]),
 
     ("E2", POLL, "over",
      "the cross-tick de-dup is dropped, so the same announce is repeated on every tick "
      "— once a minute, forever, each time as if it were news",
-     [('        if not new_ts or new_ts != si_ts:', '        if True:')]),
+     [('        if si_key != si_ts:', '        if True:')]),
 
     ("E3", POLL, "over",
      "⛔ THE EMPTINESS TEST WIDENS, so `{}` — the ABSENCE of a note, not a note missing "
@@ -263,6 +281,66 @@ MUTANTS = [
      "the fix for the dead letter",
      [('        origin = _clean_origin(flow.origin)\n        base_ev = {',
        '        origin = None\n        base_ev = {')]),
+    # ══ G — what cross-verification found in the fixes themselves ═══════════
+    ("G1", PREFS, "under",
+     "⛔⛔ THE ROLLBACK GOES BACK TO A BLIND WRITE. Measured: watermark 1000, request A "
+     "claims 2000, request B claims 3000 and IS DELIVERED, A's send then raises and "
+     "writes 1000 back — so B's delivered announce is unmarked and said all over again. "
+     "A rollback may only ever undo ITSELF",
+     [('        if expected is not None and current != int(expected):',
+       '        if False and current != int(expected):')]),
+
+    ("G2", BRIDGE, "under",
+     "the caller stops telling the rollback what it installed, so the compare-and-swap "
+     "has nothing to compare and degrades to the blind write G1 restores",
+     [('                    _rollback_announced(sess, mark_prev, mark_ms)',
+       '                    _rollback_announced(sess, mark_prev, None)')]),
+
+    ("G3", BRIDGE, "under",
+     "⛔ THE GATE STOPS CLEANING THE ADDRESS IT READS BACK. prefs.json survives an "
+     "upgrade — that is the point of parking it — so a half-formed origin an OLDER "
+     "bridge wrote stays exactly the dead letter the mint fix was meant to end",
+     [('                    ev_origin = _clean_origin(ev.get("origin"))',
+       '                    ev_origin = ev.get("origin")')]),
+
+    ("G4", BRIDGE, "under",
+     "⛔ THE IDENTITY LOSES ITS FALLBACK, so a parked note with no usable `ts` claims 0 "
+     "— which the watermark reads as 'announced at the epoch' and every later re-mint "
+     "for that account is suppressed permanently",
+     [('    cap = getattr(sess, "connected_at_ms", 0)\n'
+       '    return int(cap) if isinstance(cap, (int, float)) and not isinstance(cap, bool) else 0',
+       '    return 0')]),
+
+    ("G5", BRIDGE, "over",
+     "a JSON `true` is accepted as an identity (bool is an int subclass), so a malformed "
+     "note claims the watermark at 1 and the real sign-in is announced again behind it",
+     [('    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw:',
+       '    if isinstance(raw, (int, float)) and raw:')]),
+
+    ("G6", PREFS, "over",
+     "⛔ THE EMPTY-ACCOUNT GATE REPORTS A WIN, so a caller with no session is told it "
+     "owns the announce — and the mark it moved belongs to nobody, so the real account's "
+     "next claim reads a watermark it never made",
+     [('    if not uid:\n        return ("already", None)\n    with _lock:\n'
+       '        prefs = load()\n        owner = prefs.get(_ANNOUNCED_SIGNIN_UID)',
+       '    if not uid:\n        return ("won", None)\n    with _lock:\n'
+       '        prefs = load()\n        owner = prefs.get(_ANNOUNCED_SIGNIN_UID)')]),
+
+    ("G7", PREFS, "under",
+     "the ROLLBACK's lock comes off — it is a read-compare-write exactly like the claim, "
+     "so without it two rollbacks for one claim can both fire",
+     [('    if not uid:\n        return False\n    with _lock:\n        prefs = load()\n'
+       '        raw = prefs.get(_ANNOUNCED_SIGNIN)',
+       '    if not uid:\n        return False\n    if True:\n        prefs = load()\n'
+       '        raw = prefs.get(_ANNOUNCED_SIGNIN)')]),
+
+    ("G8", POLL, "under",
+     "⛔⛔ THE ts-LESS NOTE STOPS LEAVING A RECORD. `__signed_in_ts__` is also the "
+     "watcher's ONLY evidence that a sign-in was ever seen, so a person who was told "
+     "'✓ Signed in' leaves no trace and a later 401 counts toward the give-up and TEARS "
+     "THE WATCHDOG DOWN — plus the announce repeats every tick, forever",
+     [('        si_key = new_ts if new_ts else "line:" + _signed_in_line(signed_in)[:200]',
+       '        si_key = new_ts')]),
 ]
 
 
