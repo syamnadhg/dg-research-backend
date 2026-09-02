@@ -60657,10 +60657,31 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         _brief_md_regen = f"# Research Brief\n\n{brief_text}"
                         (queue_dir / "documents" / "brief.md").write_text(_brief_md_regen, encoding="utf-8")
                         save_document_to_firestore("brief", _brief_md_regen, "Research Brief")
-                        brief_artifact = BriefArtifact(text=brief_text, url=brief_url)
+                        # ⛔⛔ THIS BRANCH USED TO SHIP THE RAW CHATGPT CONVERSATION
+                        # ADDRESS TO THE APP, and it was the only phase-1 branch
+                        # that did. `p1_new["url"]` is `current_url()` of the
+                        # ChatGPT tab — a page that opens for nobody but the
+                        # account that ran it — and it was emitted as a
+                        # `phase_complete` link labelled "ChatGPT Brief", with no
+                        # `primary` and no `verified`. The app stores every link a
+                        # phase reports, so it outlived the run: it became a row
+                        # in the agent drill-down, a line in the follow-up chat's
+                        # context (which is sent to a model), and a candidate for
+                        # the public video description.
+                        # ▶ Now identical to the three sibling branches: the
+                        # brief's own in-app page, primary and verified.
+                        # ⛔ THE LABEL IS LOAD-BEARING — see #746 at :60576. It
+                        # must be exactly "Read Brief report" or a phone/cold
+                        # reopen renders the brief row TWICE, because the FE's
+                        # hydration backfill synthesizes that label for the same
+                        # URL and the (label, url) dedup cannot collapse them.
+                        _regen_in_app_url = (f"/documents?open={_fb_research_id}:brief"
+                                             if _fb_research_id else "/documents")
+                        brief_artifact = BriefArtifact(text=brief_text, url=_regen_in_app_url)
                         emit_event("phase_complete", phase=1,
                                    summary=f"Brief regenerated with user input ({len(brief_text)} chars)",
-                                   links=[{"label": "ChatGPT Brief", "url": brief_url}] if brief_url else [])
+                                   links=[{"label": "Read Brief report", "url": _regen_in_app_url,
+                                           "verified": True, "primary": True}])
                         # Resume-with-input regen still needs the terminal
                         # phase write because the original P1 write (if any)
                         # was for the pre-pause attempt.
