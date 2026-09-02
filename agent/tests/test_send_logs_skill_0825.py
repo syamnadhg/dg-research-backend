@@ -534,6 +534,161 @@ def test_the_safety_section_names_send_logs() -> None:
     assert "send-logs" in safety
 
 
+# ── the agent's own log, as the ASSISTANT sees it ────────────────────────────
+#
+# ⛔⛔ THE CLIENT COULD DO THIS AND THE DOCUMENT NEVER OFFERED IT. `--agent-log`
+# has been built, tested and mutated since 2026-08-26; the natural-language router
+# reaches it, so a user who said the exact words got it. But the document is what
+# an assistant reads to decide what to OFFER, and it named neither the flag nor
+# the follow-up — so the option only ever existed for someone who already knew it
+# existed. Measured against this file before these tests were written.
+
+
+def _sending_logs_section() -> str:
+    return SKILL_MD.split("## Sending logs to support", 1)[1].split("\n## ", 1)[0]
+
+
+def _agent_log_bullet() -> str:
+    """The agent-log bullet, whitespace-flattened.
+
+    ⭐ FLATTENED ON PURPOSE. These guards are about the WORDS a model reads; the
+    markdown is hand-wrapped, so a sentence that survives intact but crosses a
+    line break differently would fail a raw substring match and teach the next
+    reader to loosen the assertion instead of the wrapping.
+    """
+    section = _sending_logs_section()
+    bullet = section[section.index("The agent's own log on THIS host"):]
+    return " ".join(bullet[:bullet.index("\n- ")].split())
+
+
+def test_the_document_offers_the_agents_own_log_at_all() -> None:
+    assert "--agent-log" in _sending_logs_section()
+
+
+def test_the_table_routes_someone_who_asks_for_it() -> None:
+    """⛔⛔ THE TABLE IS THE LOOKUP, and the sibling guard above exists because a
+    section can be right while the row is wrong. A section-only assertion cannot
+    see a missing row: `--agent-log` still appears further down."""
+    row = next((ln for ln in SKILL_MD.splitlines()
+                if ln.startswith("|") and "--agent-log" in ln), "")
+    assert row, "nothing in the intent table routes a request for the agent's log"
+    assert "second" in row.lower() or "--status" in row, (
+        "the row names the flag without the follow-up that actually sends it", row)
+
+
+def test_the_document_names_the_follow_up_command_this_client_prints() -> None:
+    """⛔ PINNED AGAINST THE CLIENT'S OWN DIRECTIVE, not against a remembered
+    string. The client hands the assistant `--status <CODE> --agent-log`; a
+    document that named a different spelling would hand it a second, conflicting
+    instruction at exactly the moment it is deciding what to run."""
+    src = _SR.read_text(encoding="utf-8")
+    # ⛔ NOT an `or` against a looser pattern. The first draft accepted
+    # "--status {support}" as a fallback — a string the UNCONDITIONAL check
+    # directive already contains — so the guard passed with the agent-log
+    # directive deleted. Mutation found it. This names the agent-log line alone.
+    assert "--agent-log   (it is refused until then, by design)" in src, (
+        "the client stopped printing the follow-up this document promises")
+    assert "--agent-log" in _sending_logs_section()
+    assert "--status <CODE> --agent-log" in SKILL_MD, (
+        "the document must spell the follow-up the way the client prints it")
+
+
+def test_the_document_does_not_let_it_ride_the_send() -> None:
+    """⛔⛔ THE UPLOAD IS A SEPARATE STEP AND ALWAYS WAS. `cmd_send_logs` reads
+    `agent_log` on the plan branch and on the `--status` branch; the confirmed send
+    never posts it. An assistant told to add the flag to `--confirm` and left there
+    would report a log as sent that no one ever uploaded.
+
+    Pinned against the client so this fails loudly if the send path ever learns to
+    carry it, rather than quietly documenting the old shape forever."""
+    src = _SR.read_text(encoding="utf-8")
+    body = src[src.index("def cmd_send_logs"):]
+    body = body[:body.index("\ndef ", 1)]
+    send = body[body.index('code, sent = _post("/logs/send"'):] \
+        if 'code, sent = _post("/logs/send"' in body else body[body.index('"/logs/send"'):]
+    assert "/logs/agent-log" not in send, (
+        "the send path uploads it now — the document must stop saying it does not")
+    assert "does not ride the send" in _agent_log_bullet()
+
+
+def test_the_document_says_to_pass_it_on_the_confirmed_call_too() -> None:
+    """⛔⛔ WITHOUT THE FLAG ON `--confirm` THIS CLIENT SAYS NOTHING AT ALL.
+    `agent_log` is read a second time after the send, and that branch appends both
+    the "goes up once that computer's bundle lands" line the PERSON hears and the
+    follow-up command the ASSISTANT runs.
+
+    The first draft of this row told the assistant to add the flag to the bare
+    command and then claimed the client hands over the follow-up. Driven both
+    ways, a plain `--confirm` printed neither line — so the row promised a
+    directive the flow it prescribed could not produce, and the second step was
+    left resting on a model remembering a command out of prose. Cross-verification
+    measured that.
+
+    Pinned against the branch rather than the sentence, so the day the client
+    stops needing the flag there, this says so instead of going stale."""
+    src = _SR.read_text(encoding="utf-8")
+    body = src[src.index("def cmd_send_logs"):]
+    body = body[:body.index("\ndef ", 1)]
+    after_send = body[body.index('code, sent = _post("/logs/send", payload)'):]
+    assert "if agent_log:" in after_send, (
+        "the client no longer reads the flag after the send — the instruction to "
+        "pass it on --confirm may now be stale")
+    bullet = _agent_log_bullet()
+    assert "pass it on `--confirm` too" in bullet, bullet
+    row = next((ln for ln in SKILL_MD.splitlines()
+                if ln.startswith("|") and "--agent-log" in ln), "")
+    assert "`--confirm`" in row, (
+        "the row omits the call that produces the follow-up it promises", row)
+
+
+def test_the_document_does_not_borrow_the_owner_gate() -> None:
+    """⛔⛔ MEASURED: THERE IS NO OWNERSHIP GATE ON THIS ONE. `--machine` is
+    refused for a non-owner before any round trip, and it is documented in the
+    bullet directly above. A reader carrying that gate across would withhold, on a
+    rule that does not exist, something a person asked for — so the absence has to
+    be stated rather than left to be inferred from silence."""
+    src = _SR.read_text(encoding="utf-8")
+    body = src[src.index("def cmd_send_logs"):]
+    body = body[:body.index("\ndef ", 1)]
+    code = "\n".join(ln.split("#", 1)[0] for ln in body.splitlines())
+    assert "if machine and not owned:" in code, "the gate this contrasts with is gone"
+    assert "agent_log and not owned" not in code, (
+        "a gate appeared — the document now understates what stops this")
+    bullet = _agent_log_bullet()
+    assert "no ownership gate" in bullet, bullet
+
+
+def test_the_document_says_which_machine_the_log_is_on() -> None:
+    """⛔ TWO DIFFERENT COMPUTERS. "The computer's own logs" is this document's
+    phrase for the Research Computer, six lines above. Reads the BULLET rather
+    than lines containing "agent", because a sentence that borrowed the wrong
+    phrase would lose that word and duck a filter keyed on it."""
+    bullet = _agent_log_bullet()
+    assert "not their Research Computer" in bullet, bullet
+    assert "the program running this chat" in bullet, bullet
+
+
+def test_the_document_says_a_refusal_before_the_bundle_is_not_a_fault() -> None:
+    """The ordering is the safety property, so its refusal is the design working.
+    Read as a failure it becomes either a retry loop or a person told their log
+    was lost."""
+    bullet = _agent_log_bullet()
+    assert "by design, not a fault" in bullet, bullet
+    assert "leaves the bundle and the support code" in bullet, (
+        "a failure here still reads as the whole send failing", bullet)
+    assert "the log was empty" in bullet, "an empty log still reads as a failure"
+
+
+def test_the_document_does_not_promise_it_covers_only_this_conversation() -> None:
+    """⛔⛔ THE FILE IS NOT PER-SESSION. It is uploaded whole below the cap and
+    tailed above it, covering everything since the last rotation — which on a
+    quiet host is weeks, and can reach past the run being reported. A document
+    that implied a session's worth would understate what leaves."""
+    bullet = _agent_log_bullet()
+    assert "since it last rotated" in bullet, bullet
+    assert "not just this conversation" in bullet, bullet
+
+
 # ── json mode ───────────────────────────────────────────────────────────────
 
 def test_json_mode_says_what_would_be_sent(wire, capsys) -> None:

@@ -176,6 +176,7 @@ cancels. Never send the bare "yes" back into `do`.
 | "update Super Research", "update the backend", "update the research computer" | the runtime does NOT update the backend — tell them to run `superresearch --update` on the Research computer **or** update it from the app (Settings → About / the update notification). `sr.py do "<message>"` returns this exact redirect. |
 | "send my logs", "share the logs with support", "submit diagnostics" | `sr.py send-logs` — it SHOWS what would go and sends nothing. On "yes", run `sr.py send-logs --confirm`. See **Sending logs to support** |
 | "did my logs go through?", "check on that support code" | `sr.py send-logs --status <CODE>` |
+| "send the agent's log too", "include the bridge log", "the log from this chat" | add `--agent-log` to the **bare** command **and to `--confirm`** — it uploads nothing on either; it makes the plan name it, and makes the client hand you `sr.py send-logs --status <CODE> --agent-log` for once the bundle lands. **Not** owner-gated. See **Sending logs to support** |
 | just `/sr`, "what can you do?", "help" | `sr.py status-account` → welcome (see **A bare `/sr`**) |
 
 **Safe defaults:** unnamed run → the **most-recent active** run. **Confirm before
@@ -344,6 +345,20 @@ like a shortcut, makes a claim about a conversation that did not happen.
   them when the user owns the computer, and only when the problem is with
   connecting it at all rather than with a particular run. `--machine` asks for
   them; a non-owner is told no.
+- **The agent's own log on THIS host** is a third thing and a third computer —
+  the program running this chat, not their Research Computer. `--agent-log`
+  asks for it on the bare command, so the plan names it. Unlike `--machine`
+  there is **no ownership gate**, so no refusal will stop you: offer it only
+  when the problem is this chat reaching their computer at all. It covers that
+  file since it last rotated, not just this conversation, so it can reach back
+  further than the problem being reported. **It does not ride the send** — but
+  **pass it on `--confirm` too**: nothing is uploaded on that call either, and it
+  is what makes the client tell the user a step is still outstanding and hand you
+  the exact follow-up command. Leave it off and you get neither, and the second
+  step survives only in your memory. Run that follow-up when the user asks you to
+  check, never on a timer. Refused before then is by design, not a fault; a
+  failure there leaves the bundle and the support code untouched; "nothing to
+  add" means the log was empty.
 - **No runs listed** is normal on a computer that has just been set up, and it
   is exactly the connection-problem case: offer the computer's own logs instead
   if the user owns it.
