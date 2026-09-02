@@ -286,8 +286,21 @@ def test_the_refusal_names_the_holder():
 
 
 def test_the_refusal_tells_them_how_to_look():
+    """⛔⛔ THIS ASSERTION USED TO BE `"lsof" in server`, AND IT HELD THE DEFECT IN
+    PLACE. `lsof` does not exist on Windows, which this file supports throughout,
+    so the one line meant to unblock somebody was the one line that could not run
+    — at the moment `--serve` had already exited 3. A green test pinning the
+    literal is why it stayed: fixing the code would have gone red.
+
+    Now it pins the PROPERTY — a command is given, and it is chosen for the
+    platform. The per-platform behaviour of `_port_holder_hint` is asserted in
+    tests/test_stretch7_0902.py; this side pins the CONSUMER, because a helper
+    nobody calls is not a fix."""
     server = _src_of("run_server")
-    assert "lsof" in server, "give the command, not just the diagnosis"
+    assert "_port_holder_hint(port)" in server, (
+        "give the command, not just the diagnosis — and let the platform pick it")
+    assert "lsof" not in server, (
+        "a hardcoded lsof is back; on Windows that line cannot run")
 
 
 def test_a_port_check_that_itself_fails_does_not_block_boot():

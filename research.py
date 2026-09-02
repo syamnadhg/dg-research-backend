@@ -4097,6 +4097,55 @@ def _kill_pid_hint(pid: "int | str" = "<pid>") -> str:
     return f"kill -9 {pid}"
 
 
+def _port_row_verdict(holders: list) -> tuple:
+    """Which of the three things the doctor's port row must say, and about whom.
+
+    ⛔⛔ THREE OUTCOMES, AND A PERSON ACTS DIFFERENTLY ON EACH: it is ours (fine),
+    somebody else holds it (kill that binding), or nothing holds it (the API is
+    down for some other reason). Collapsing any two reads as tidier and says
+    strictly less.
+
+    ⛔ EXTRACTED 2026-09-02 BECAUSE THE SOURCE PINS COULD NOT SEE THEIR MUTANTS.
+    One asserted `h.get("ours")` appeared in the block — satisfied by the branch
+    BODY while the condition deciding it had been replaced. The other asserted
+    "not bound" appeared — satisfied by a literal in a branch made unreachable.
+    Both survived mutation. A decision that matters gets a function and a
+    behavioural test, not a substring.
+
+    ⭐ Ours wins over order: a squatter listed first must not mask our own
+    --serve, because the remedy for one is the opposite of the other.
+    """
+    if not holders:
+        return ("unbound", None)
+    for h in holders:
+        if h.get("ours"):
+            return ("ours", h)
+    return ("squatter", holders[0])
+
+
+def _port_holder_hint(port: "int | str" = 8000) -> str:
+    """Platform-appropriate one-liner for finding what holds a TCP port.
+
+    ⛔⛔ THE FOURTH STRING OF THIS KIND, AND THE FIRST THREE ARE WHY THIS BLOCK
+    EXISTS. Two places printed a fixed tool AT A PERSON, each correct for exactly
+    one of the three supported platforms:
+
+      * the stuck-port refusal handed `lsof` to Windows, where it does not exist
+        — and it did so at the moment `--serve` had already exited 3, so the one
+        line meant to unblock them was the one line that could not run;
+      * the doctor's Port-8000 remedy handed `ss` to macOS, where it does not
+        exist either. Same defect, opposite platform, one screen apart.
+
+    ⭐ Not `lsof` everywhere: `_port_holders` documents that lsof is missing from
+    plenty of Linux images, and iproute2 is the one that ships there.
+    """
+    if sys.platform == "win32":
+        return f'netstat -ano -p TCP | findstr ":{port}"'
+    if sys.platform == "darwin":
+        return f"lsof -nP -iTCP:{port} -sTCP:LISTEN"
+    return f"ss -ltnp | grep :{port}"
+
+
 def _process_manager_label() -> str:
     """How to refer to the OS's process-management UI in copy."""
     if sys.platform == "win32":
@@ -9629,6 +9678,42 @@ def _handle_send_logs_command(data: dict, device_id: str, limited: bool = False,
     _log_threading.Thread(target=_work, name="send-logs", daemon=True).start()
 
 
+# ─── Command staleness — ONE gate, because the duplicate is what broke ────────
+STALE_COMMAND_AGE_MS = 30_000
+
+
+def _is_stale_replay(data: dict, is_first_snapshot: bool,
+                     now_ms: "int | None" = None,
+                     max_age_ms: int = STALE_COMMAND_AGE_MS) -> bool:
+    """Whether a command doc is a prior-session leftover that must NOT execute.
+
+    ⛔⛔ ONE FUNCTION BECAUSE TWO COPIES IS WHAT CAUSED THE BUG. This gate was
+    written twice, once per listener, and #704 fixed only one of them. The device
+    listener — the one EVERY Settings button talks to: Update, check-update,
+    Restart, hard_reset, Clear logs and all three send-logs actions — kept
+    applying the check to LIVE commands. `timestamp` is written by the BROWSER,
+    so a machine clock even ~30s ahead silently discarded the button a person had
+    just pressed, forever, and left no trace: the `received action=` log line sat
+    AFTER the skip. Two copies of a safety gate is one copy that gets fixed.
+
+    ⭐ LIVE COMMANDS ARE NEVER STALE. That is the entire property. Firestore
+    replays every pre-existing doc as ADDED in the first callback after attach,
+    and only those can be a previous session's leftovers; everything after is
+    something that just happened.
+
+    ⛔ A bool is not a timestamp. `isinstance(True, int)` is True in Python, so
+    `{"timestamp": True}` passed the original numeric check and was then
+    subtracted from the clock — making a live command look 1.7e12 ms old.
+    """
+    if not is_first_snapshot:
+        return False
+    ts = data.get("timestamp")
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)) or ts <= 0:
+        return False
+    now = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    return (now - int(ts)) > max_age_ms
+
+
 def _handle_update_command(data: dict, device_id: str, loop) -> None:
     """App-driven remote backend update (owner-only `update` device command).
     Runs on WORKER_ID==1 only. Reuses `_perform_self_update`; forces THIS worker
@@ -9671,6 +9756,17 @@ def _handle_update_command(data: dict, device_id: str, loop) -> None:
         _dev = _firebase_db.collection("devices").document(device_id).get().to_dict() or {}
     except Exception as _oe:
         log(f"[device-cmds] UPDATE: device read failed ({_oe}) — refusing", "WARN")
+        # ⛔ THE ONE REFUSAL ON THIS HANDLER THAT SAID NOTHING TO THE PERSON. The
+        # invariant is stated eight lines above — "a refused command writes an
+        # updateStatus too" — and every other branch below honours it. This one
+        # returned bare, so the app sat on "started" until its own timeout and
+        # then reported a wait rather than a reason. merge=True for the same
+        # reason as the owner refusal: a refusal reports on the REQUEST and must
+        # not be able to lower `needsRestart` or wipe `latest`.
+        _write_update_status(device_id, {
+            "state": "failed", "current": cur,
+            "reason": "couldn't read this computer's record — try again"},
+            merge=True)
         return
     _owner = _dev.get("ownerUid")
     if _owner and data.get("submittedBy") and data["submittedBy"] != _owner:
@@ -9851,7 +9947,25 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
     except Exception as _sweep_err:
         log(f"[device-cmds] startup sweep failed: {_sweep_err}", "DEBUG")
 
+    # First-snapshot tracker — gates the stale-command defense below.
+    #
+    # ⛔⛔ THE SAME BUG AS #704, FIXED ONCE AND LEFT STANDING HERE. That fix added
+    # this flag to `_start_command_listener` and its comment already describes the
+    # failure this listener still had: applying the client-`timestamp` check to a
+    # LIVE command silently skips a legitimate click whenever the browser clock
+    # that wrote `timestamp` is skewed against this machine's. This listener is
+    # the one EVERY Settings button talks to — Update, check-update, Restart,
+    # hard_reset, Clear logs and all three send-logs actions — so on a machine
+    # whose clock runs ~30s ahead of the browser, every one of those buttons did
+    # nothing, forever, and left no trace: the `[device-cmds] received` log line
+    # sits AFTER the `continue`, so there was not even a record of the drop.
+    _dev_cmd_first_snapshot = {"v": True}
+
     def _on_snap(_col_snapshot, changes, _read_time):
+        # Firestore delivers all pre-existing docs as ADDED in the FIRST callback
+        # after attach; every later callback is a live delta.
+        is_first_snapshot = _dev_cmd_first_snapshot["v"]
+        _dev_cmd_first_snapshot["v"] = False
         for change in changes:
             if change.type.name != "ADDED":
                 continue
@@ -9860,20 +9974,23 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
             if data.get("processed"):
                 continue
 
-            # 30s stale-command gate — commands older than this are from a
-            # previous serve session and should NOT replay (e.g. a stop
-            # written 5 minutes ago when serve was already down). Same
-            # threshold as the research-scoped listener at line ~2154.
-            STALE_COMMAND_AGE_MS = 30_000
-            _ts = data.get("timestamp")
-            if isinstance(_ts, (int, float)) and _ts > 0:
-                _age_ms = int(time.time() * 1000) - int(_ts)
-                if _age_ms > STALE_COMMAND_AGE_MS:
-                    try:
-                        doc.reference.update({"processed": True, "staleSkipped": True})
-                    except Exception:
-                        pass
-                    continue
+            # 30s stale-command gate — FIRST-ATTACH REPLAY ONLY. Commands older
+            # than this in the first snapshot are from a previous serve session
+            # and must NOT replay (e.g. a stop written 5 minutes ago while serve
+            # was already down). Same threshold as the research-scoped listener.
+            #
+            # ⛔⛔ IT MUST NOT TOUCH LIVE COMMANDS. Everything the app's Settings
+            # page sends arrives LIVE, and `timestamp` is written by the BROWSER
+            # — so a machine clock even slightly ahead made this gate discard the
+            # button a person had just pressed. See the note beside the flag above.
+            if _is_stale_replay(data, is_first_snapshot):
+                try:
+                    doc.reference.update({"processed": True, "staleSkipped": True})
+                except Exception:
+                    pass
+                log(f"[device-cmds] stale first-attach command skipped "
+                    f"doc={doc.id} action={(data.get('action') or '')!r}")
+                continue
 
             action = (data.get("action") or "").strip()
             log(f"[device-cmds] received action={action!r} doc={doc.id}")
@@ -15532,21 +15649,16 @@ def _start_command_listener(uid, research_id, loop):
             # clicks whenever the browser clock that wrote `timestamp` was
             # skewed vs this machine's clock — leaving the run stuck on pause
             # after the user had already acted. Live commands always execute.
-            if is_first_snapshot:
-                STALE_COMMAND_AGE_MS = 30_000
-                _ts = data.get("timestamp")
-                if isinstance(_ts, (int, float)) and _ts > 0:
-                    _age_ms = int(time.time() * 1000) - int(_ts)
-                    if _age_ms > STALE_COMMAND_AGE_MS:
-                        # Mark processed so it stops replaying on future
-                        # attaches, but do NOT execute.
-                        try:
-                            _grpc_write_with_heal(
-                                lambda: doc.reference.update({"processed": True, "staleSkipped": True}),
-                                what="cmd stale-skip mark")
-                        except Exception:
-                            pass
-                        continue
+            if _is_stale_replay(data, is_first_snapshot):
+                # Mark processed so it stops replaying on future
+                # attaches, but do NOT execute.
+                try:
+                    _grpc_write_with_heal(
+                        lambda: doc.reference.update({"processed": True, "staleSkipped": True}),
+                        what="cmd stale-skip mark")
+                except Exception:
+                    pass
+                continue
             action = data.get("action", "")
             # #955 Phase 6: command-ack at DISPATCHER INTAKE. The FE stamps a
             # client-nonce `command_id` (+ the card's `decisionId`) on the doc
@@ -65920,7 +66032,7 @@ async def run_server(port=8000):
         print(f"\n  {_c(_ERR, '⛔')}  Port {port} is still held after stopping the "
               f"earlier backend (pid {_pids}).")
         print(f"      Nothing was started. Check with:  "
-              f"lsof -nP -iTCP:{port} -sTCP:LISTEN\n")
+              f"{_port_holder_hint(port)}\n")
         raise SystemExit(3)
     _paired_uid_now = load_paired_uid()
     _device_id_now = load_device_id() or ""
@@ -73113,19 +73225,37 @@ def run_doctor():
         manual_actions.append(_remedy_serve())
         manual_actions.append(_remedy_resurrect())
     # Port 8000 ownership
-    if plat in ("Linux", "Darwin"):
-        try:
-            r = _sp.run(["ss", "-ltnp"], capture_output=True, text=True, timeout=5)
-            if ":8000" in (r.stdout or ""):
-                if serve_pids and f"pid={serve_pids[0]}" in r.stdout:
-                    _ok("Port 8000", f"bound by our --serve (PID {serve_pids[0]})")
-                else:
-                    _warn("Port 8000", "bound by a non-Super-Research process")
-                    manual_actions.append("Identify with `ss -ltnp | grep :8000` and kill the stale binding")
-            else:
-                _warn("Port 8000 not bound", "API unreachable")
-        except Exception:
-            pass
+    #
+    # ⛔⛔ THIS ROW PRINTED NOTHING AT ALL ON macOS — NEITHER PASS NOR FAIL. It
+    # shelled out to `ss -ltnp`, which does not exist on Darwin, and the
+    # FileNotFoundError went into a bare `except Exception: pass`. So on the
+    # platform most runs happen on, a dead check read as a clean run. Windows was
+    # worse in a quieter way: the `plat in ("Linux", "Darwin")` gate skipped it
+    # entirely, so the row was simply absent.
+    #
+    # ⭐ `_port_holders` is the answer to all three and it already existed: psutil
+    # first (works on every platform), lsof only as a fallback, and it returns an
+    # `ours` flag decided from the process ARGV — which is strictly better than
+    # grepping `pid=` out of one tool's output, because a PID substring can match
+    # the wrong row. No shell-out and no platform gate.
+    try:
+        _holders_8000 = _port_holders(8000)
+    except Exception as _ph_err:
+        _holders_8000 = None
+        _warn("Port 8000 unknown", f"could not look: {type(_ph_err).__name__}")
+        manual_actions.append(f"Check by hand with `{_port_holder_hint(8000)}`")
+    if _holders_8000 is not None:
+        _verdict, _who = _port_row_verdict(_holders_8000)
+        if _verdict == "unbound":
+            _warn("Port 8000 not bound", "API unreachable")
+        elif _verdict == "ours":
+            _ok("Port 8000", f"bound by our --serve (PID {_who['pid']})")
+        else:
+            _warn("Port 8000",
+                  f"bound by a non-Super-Research process "
+                  f"({_who.get('name') or '?'}, PID {_who['pid']})")
+            manual_actions.append(
+                f"Identify with `{_port_holder_hint(8000)}` and kill the stale binding")
     print()
 
     # ── [5] Linux-specific: DISPLAY propagation ──
