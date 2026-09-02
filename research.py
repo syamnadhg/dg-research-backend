@@ -17189,6 +17189,16 @@ class PipelineRuntime:
         self.active_pages: dict = {}  # platform → page object
         self.agent_statuses: dict = {}  # platform → 'generating'|'done'|'failed'
         self.agent_chat_urls: dict = {}  # platform → URL (conversation/chat)
+        # ⭐ STRETCH 7.5 — platform → the tokens that identify the brief we
+        # pasted into that platform's tab. Written ONCE per platform, by
+        # `verified_paste_brief`, and read by the identity check that replaced
+        # decoding a creation time out of the conversation URL.
+        # ⚠ NOT carried through the pause checkpoint, deliberately. Losing it
+        # costs the check its TEETH, never a leg: with no fingerprint the
+        # verdict is `unknown`, which no caller may act on. Threading it through
+        # the resume path would earn the teeth back and is not worth re-opening
+        # that block for in the same stretch that just built its safety net.
+        self.brief_fingerprints: dict = {}
         self.partial_text_lens: dict = {}
         self.original_inputs: dict = {}  # {'topic': str, 'brief': str, 'pdf_paths': []}
         self.queue_dir = None
@@ -21504,6 +21514,22 @@ async def verified_paste_brief(page, brief_text, platform, label, max_retries=1)
     is_claude = platform.lower() == "claude"
     platform_key = (platform or "").strip().lower()
     selectors = _PASTE_SELECTORS.get(platform_key, _PASTE_SELECTORS_GENERIC)
+
+    # ⭐⭐ STRETCH 7.5 — THE ONE PLACE THAT KNOWS WHAT WE PUT IN THIS TAB.
+    # Identity is decided by content now, not by decoding a creation time out of
+    # the URL (see `chatgpt_identity_verdict`), and this is where the evidence
+    # comes from: every brief that reaches any platform's composer goes through
+    # this function — five call sites, one recording point.
+    #
+    # ⛔ FIRST PASTE ONLY, NEVER OVERWRITTEN. This function also pastes MID-RUN
+    # FOLLOW-UPS (the dispatcher at :19801). Letting a follow-up replace the
+    # fingerprint would re-identify the conversation by the newest thing typed
+    # into it, so a resume-with-added-input would make the run stop recognising
+    # its own tab.
+    if platform_key and platform_key not in _runtime.brief_fingerprints:
+        _fp = brief_fingerprint(brief_text)
+        if _fp:
+            _runtime.brief_fingerprints[platform_key] = _fp
 
     for attempt in range(1, max_retries + 1):
         if attempt > 1:
@@ -38158,7 +38184,8 @@ async def _resolve_parked_agent_decision(kind, action, p, name, key, elapsed,
     return "continue"
 
 
-def _sweep_foreign_chatgpt_tabs(pending: dict, results: dict) -> "list[str]":
+async def _sweep_foreign_chatgpt_tabs(pending: dict, results: dict, *,
+                                      read_first_message=None) -> "list[str]":
     """Drop any ChatGPT leg found polling a conversation that predates this run.
 
     Mutates `pending` and `results` in place; returns the names dropped.
@@ -38180,15 +38207,42 @@ def _sweep_foreign_chatgpt_tabs(pending: dict, results: dict) -> "list[str]":
 
     ⚠ Reads the LIVE url, not `p["url"]` — that field is stamped at seed time and
     would report the tab we meant to be on rather than the one we are on.
-    `_chatgpt_tab_is_foreign` abstains unless it can positively date the conversation
-    as older than the run, so a bare composer, an unreadable id, and an undatable run
-    all pass untouched.
+
+    ⛔⛔ 2026-09-02 (stretch 7.5) — THIS NO LONGER DATES AN ADDRESS. It used to ask
+    `_chatgpt_tab_is_foreign`, which decodes a creation time out of the URL and
+    compares it to when the run started — this machine's clock against OpenAI's.
+    That check has been repaired twice after near-misses, and the second one
+    (`/c/WEB:<uuid>`, 2026-08-27) killed a HEALTHY leg on this very path seven
+    seconds after Send, on every tick. This site fires sixty-odd times in a
+    half-hour run, so a check that is one percent wrong per tick is not one
+    percent wrong per run.
+
+    ▶ It now asks the conversation about ITSELF: does it still hold the brief we
+    pasted into this tab? The creation time is still decoded and still LOGGED as
+    corroboration, because it is what made the 2026-08-05 incident diagnosable —
+    but it can no longer end a leg on its own.
+
+    ⭐ THE READ IS CACHED AGAINST THE URL, NOT THE PAGE. The first user turn
+    cannot change within one conversation, so re-reading it every tick would be
+    waste — but caching it per PAGE would freeze the answer from before a drift
+    and this sweep would never see the thing it exists to catch. A drift always
+    lands on a different conversation id, so a URL-keyed cache re-reads exactly
+    when it must.
+
+    ⚠ WITH NO FINGERPRINT THIS SWEEP HAS NO TEETH, and that is the safe
+    direction. `_runtime.brief_fingerprints` is written when the brief is pasted
+    and is not carried through the pause checkpoint, so a resumed run abstains
+    here rather than guessing. Abstaining costs drift detection; guessing costs
+    a healthy leg, and this project has already paid that twice.
 
     A separate function rather than a loop inline in the round-robin for the reason
     the rest of this wave learned the hard way: nothing in the suite executes
     `poll_all_agents_round_robin`, so a guard written inline there could only ever be
     source-scanned — and mutation proved that a source-scanned gate can ship inverted.
+    `read_first_message` is injectable for the same reason: so a test can drive
+    the whole decision without a browser.
     """
+    reader = read_first_message or read_chatgpt_first_user_message
     dropped = []
     for name in list(pending.keys()):
         key = normalize_agent_key(name)
@@ -38199,14 +38253,23 @@ def _sweep_foreign_chatgpt_tabs(pending: dict, results: dict) -> "list[str]":
             url = (p.get("page").url or "")
         except Exception:
             continue          # unreadable handle — the crash sweep owns that
-        if not _chatgpt_tab_is_foreign(url):
+        fingerprint = _runtime.brief_fingerprints.get(key) or []
+        if not fingerprint:
+            continue          # nothing to compare against — see the docstring
+        cached_url, cached_text = p.get("_ident_read") or ("", "")
+        if cached_url == url and url:
+            text = cached_text
+        else:
+            text = await reader(p.get("page"))
+            p["_ident_read"] = (url, text)
+        if chatgpt_identity_verdict(text, fingerprint, url) != "foreign":
             continue
         epoch = _chatgpt_convo_epoch(url)
         when = (datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M:%S")
                 if epoch else "unknown")
-        log(f"[{name}] ⛔ polling a conversation that predates this run (created "
-            f"{when}, url={url!r}) — dropping it from the round-robin rather than "
-            f"harvesting someone else's thread", "ERROR")
+        log(f"[{name}] ⛔ polling a conversation that does not contain this run's "
+            f"brief (created {when}, url={url!r}) — dropping it from the "
+            f"round-robin rather than harvesting someone else's thread", "ERROR")
         # A parked chat-mode decision on this leg belongs to a send into a
         # conversation we are now refusing; retract it with the leg.
         _controls.chat_mode_pending.pop(key, None)
@@ -38639,7 +38702,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 del pending[_crash_name]
                 continue
         # ── Foreign-conversation sweep (per-tick, sibling of the crash sweep) ──
-        _sweep_foreign_chatgpt_tabs(pending, results)
+        await _sweep_foreign_chatgpt_tabs(pending, results)
         # ── Stop/Pause check via asyncio Events ──
         if _controls.is_stop() or _controls.is_pause():
             is_stop = _controls.is_stop()
@@ -49172,6 +49235,198 @@ def _chatgpt_tab_is_foreign(url: str) -> bool:
     return not _chatgpt_conversation_is_ours(url)
 
 
+# ── Identity by CONTENT, not by the shape of an address ─────────────────────
+# ⛔⛔ STRETCH 7.5 — WHY THIS EXISTS AT ALL. Everything above decides whether a
+# tab is somebody else's by decoding a creation time out of the URL and
+# comparing it to when this run started — THIS machine's clock against
+# OpenAI's. It has been repaired twice after near-misses: on 2026-08-05 a
+# mid-run settings write moved the run's own start time forward, and on
+# 2026-08-27 a `WEB:` prefix made an id undatable and killed a healthy leg
+# SEVEN SECONDS AFTER SEND. A guard that compares two machines' clocks is a
+# class this project has already been bitten by twice, and the address format
+# is not ours to control.
+#
+# ▶ The question a conversation can answer about ITSELF: does it hold the brief
+#   we put there? That is not a clock, not a host, and not a URL shape.
+#
+# ⛔ AND IT IS THREE-VALUED ON PURPOSE. The entire lesson of 2026-08-27 is that
+# "I cannot tell" must never come out as "this is somebody else's". `None` here
+# means ask something else; it is never a refusal.
+#
+# ⚠ WHAT THIS DELIBERATELY IS NOT. Gemini has a content-ownership gate of a
+# similar shape (`_gemini_owns_candidate`), and it is NOT reused here — measured
+# 2026-09-02, both of its callers live inside `_gemini_adopt_lost_conversation`,
+# the sidebar/tab hunt that exists because Gemini ORPHANS its own runs. ChatGPT
+# does not do that: we always know which tab we sent into. So nothing here
+# searches for a conversation, and nothing here adopts one. The owner ruled on
+# exactly this on 2026-09-02. Same shape, opposite placement.
+
+# Tokens shorter than this are too common to identify anything.
+_BRIEF_TOKEN_MIN_LEN = 4
+# How many of the brief's leading significant tokens form the fingerprint.
+_BRIEF_FINGERPRINT_TOKENS = 12
+# Below this many, the fingerprint cannot distinguish our brief from a template.
+_BRIEF_FINGERPRINT_MIN_TOKENS = 3
+# Share of the fingerprint that must appear for the conversation to be ours.
+_BRIEF_MATCH_RATIO = 0.6
+# Below this many characters the conversation text is not evidence either way.
+_CONVO_TEXT_MIN_CHARS = 40
+
+
+def brief_fingerprint(brief_text: str) -> "list[str]":
+    """The tokens that identify THIS brief, or `[]` when it cannot identify one.
+
+    ⛔ THE SHARED TEMPLATE HEADER IS DROPPED FIRST. Every brief this product
+    writes opens with the same "# Research Brief" boilerplate, so a fingerprint
+    taken from the top would match every run this product has ever done — it
+    would say "ours" about a stranger's thread and about last week's run alike.
+    Gemini's adoption gate learned this in review and the note is in its own
+    docstring; the same trap applies here for a different reason.
+
+    Word-boundary tokens, lowercased, first `_BRIEF_FINGERPRINT_TOKENS` of them.
+    An empty list means ABSTAIN — never "no match".
+    """
+    body = (brief_text or "").strip()
+    low = body.lower()
+    if low.startswith("# research brief"):
+        body = body.split("\n", 1)[1] if "\n" in body else ""
+    toks = re.findall(rf"[a-z0-9]{{{_BRIEF_TOKEN_MIN_LEN},}}", body.lower())
+    seen, out = set(), []
+    for t in toks:
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+        if len(out) >= _BRIEF_FINGERPRINT_TOKENS:
+            break
+    return out if len(out) >= _BRIEF_FINGERPRINT_MIN_TOKENS else []
+
+
+def conversation_holds_brief(convo_text: str, fingerprint: "list[str]"):
+    """Does this conversation contain the brief we sent? `True | False | None`.
+
+    ⛔⛔ `None` IS NOT `False`. It means the question could not be answered —
+    no fingerprint, or too little text to judge — and a caller that treats it as
+    a refusal re-creates the 2026-08-27 kill in a new place. Every caller here
+    must read `is False` explicitly, never falsiness.
+
+    Word-boundary matching, so a fingerprint token cannot be satisfied by
+    happening to sit inside a longer unrelated word.
+    """
+    if not fingerprint:
+        return None
+    text = re.sub(r"\s+", " ", (convo_text or "")).strip().lower()
+    if len(text) < _CONVO_TEXT_MIN_CHARS:
+        return None
+    hits = sum(1 for t in fingerprint if re.search(rf"\b{re.escape(t)}\b", text))
+    return (hits / len(fingerprint)) >= _BRIEF_MATCH_RATIO
+
+
+def chatgpt_identity_verdict(convo_text: str, fingerprint: "list[str]",
+                             url: str = "") -> str:
+    """`ours` | `foreign` | `unknown`. Pure — the whole decision in one place.
+
+    ⛔⛔ THE CLOCK IS AN OBSERVATION HERE, NEVER A VERDICT. It is kept because it
+    is genuinely good evidence — decoding the conversation's creation time is
+    what let the 2026-08-05 incident be diagnosed at all — but it may only
+    CORROBORATE a content answer, never produce one on its own. Both of this
+    check's near-misses came from a clock or an address format deciding alone.
+
+      * `foreign` — the content says our brief is not in this conversation.
+                    The ONLY verdict that costs a leg.
+      * `ours`    — the content says it is.
+      * `unknown` — nothing could be established. Ask something else.
+
+    ⚠ `url` is accepted and used only for the corroborating log line the callers
+    write; no branch here reads its shape.
+    """
+    held = conversation_holds_brief(convo_text, fingerprint)
+    if held is None:
+        return "unknown"
+    return "ours" if held else "foreign"
+
+
+def chatgpt_landing_content_override(verdict: str, convo_text: str,
+                                     fingerprint: "list[str]") -> str:
+    """A `foreign` landing verdict the CONTENT contradicts is not a verdict.
+
+    ⛔⛔ CONTENT MAY ONLY SAVE A LEG HERE, NEVER CONDEMN ONE. Thirty seconds after
+    Send is the worst moment to ask a conversation what it contains — the turn
+    may not have rendered yet — so an empty or unreadable answer must change
+    nothing. The ONLY transition this makes is `foreign` → `ours`, and only on a
+    positive match.
+
+    ▶ Why it is worth having at all: `foreign` at this site is decided by
+    decoding a creation time out of the id and comparing it to when the run
+    started, which is this machine's clock against OpenAI's. The 2026-08-05
+    incident was a mid-run settings write moving the run's own start time
+    forward — a run that dates itself late will call its OWN fresh conversation
+    foreign, seconds after creating it. If our brief is demonstrably in there,
+    the clock is simply wrong.
+    """
+    if verdict != "foreign":
+        return verdict
+    return "ours" if conversation_holds_brief(convo_text, fingerprint) is True else "foreign"
+
+
+def chatgpt_tab_is_live_conversation(url: str) -> bool:
+    """Is this tab sitting in a conversation this run can be alive in?
+
+    ⛔⛔ THE 2026-08-27 BUG, IN TWO MORE PLACES. Two liveness reads in `run_phase2`
+    called `_chatgpt_conversation_is_ours` DIRECTLY instead of going through
+    `_chatgpt_tab_is_foreign`, so they never got that day's correction — an id
+    we cannot date came back False, and False here means "not alive". On the
+    2A alive-handoff that logs `page is at a conversation that is NOT this run's`
+    about a perfectly healthy leg and drops it into the dead-page path; on the
+    tier backstop it silently skips a probe the run had earned.
+
+    ⛔ AND IT IS NOT SIMPLY `not _chatgpt_tab_is_foreign(url)`. That predicate
+    abstains on a BARE HOST too, so the naive inversion would call an empty
+    composer "alive" — which is the opposite error, and the exact false-health
+    claim the 2026-08-05 incident was made of. Both halves are required:
+    a conversation must be PRESENT, and it must not be positively foreign.
+
+    ⭐ ONE FUNCTION FOR BOTH SITES. Stretch 7 spent a day on a safety gate that
+    existed twice, where the copy everybody remembered got fixed and the copy
+    every Settings button used did not.
+    """
+    if _chatgpt_convo_id(url) is None:
+        return False
+    return not _chatgpt_tab_is_foreign(url)
+
+
+async def read_chatgpt_first_user_message(page, cap: int = 4000) -> str:
+    """The FIRST user turn in the open ChatGPT conversation, or "".
+
+    ⭐ THE FIRST TURN, AND THAT IS WHY THIS IS CHEAP. It is the brief we pasted,
+    and it cannot change for the life of the conversation — so a caller reads it
+    ONCE per tab and remembers it, instead of paying a DOM read on every one of
+    the sixty-odd poll ticks a half-hour run makes.
+
+    ⛔⛔ NO FALLBACK TO THE PAGE'S OWN TEXT, AND THAT IS DELIBERATE. The first
+    draft of this fell back to `document.body.innerText` when the user-turn node
+    was not found, on the reasoning that a weaker answer beats no answer. It is
+    the opposite: on a FRESH chat there is no user turn, so the fallback would
+    return the page chrome and the sidebar's list of the person's OTHER
+    conversations — hundreds of characters, none of them matching our brief —
+    and the pre-send gate would read that as "somebody else's thread" and refuse
+    a perfectly healthy send. The sidebar would literally be the evidence.
+
+    ▶ No user turn means `""`, which every caller reads as ABSTAIN. A markup
+    change therefore costs this check its teeth and never a leg — the same
+    direction as everything else in this block, for the same reason.
+
+    Never raises: an unreadable page returns "" too.
+    """
+    try:
+        return (await page.evaluate(
+            "(cap) => { const n = document.querySelector("
+            "'[data-message-author-role=\"user\"]');"
+            " return (n && n.innerText || '').slice(0, cap); }", cap)) or ""
+    except Exception:
+        return ""
+
+
 async def _refuse_foreign_chatgpt_tab(page, platform, platform_l, label, url,
                                       *, recover: bool, why: str) -> bool:
     """Refuse to act on a tab parked in someone else's finished thread.
@@ -49193,7 +49448,22 @@ async def _refuse_foreign_chatgpt_tab(page, platform, platform_l, label, url,
     never left our side. The default body ("we couldn't hand it over") is
     already exactly true here, so no third copy variant is warranted.
     """
-    if platform_l != "chatgpt" or not _chatgpt_tab_is_foreign(url):
+    # ⛔⛔ 2026-09-02 (stretch 7.5) — THIS GATE KEEPS ITS TEETH AND CHANGES ITS
+    # EVIDENCE. It is the only thing standing between a composer loaded with THIS
+    # run's brief and a stranger's finished thread, so it must still refuse; what
+    # it may no longer do is refuse because two machines' clocks disagree.
+    #
+    # ⭐ AT THIS POINT THE BRIEF IS IN THE COMPOSER AND NOT YET IN THE
+    # CONVERSATION, which is exactly what makes the content question work here:
+    #   · a fresh chat has NO user turn at all → "" → `unknown` → no refusal
+    #   · a stranger's finished thread has THEIRS → `foreign` → refuse
+    # That is the plan's "before sending, is this chat empty?", asked of the
+    # conversation instead of of an address.
+    if platform_l != "chatgpt":
+        return False
+    _fp = _runtime.brief_fingerprints.get("chatgpt") or []
+    _first = await read_chatgpt_first_user_message(page)
+    if chatgpt_identity_verdict(_first, _fp, url) != "foreign":
         return False
 
     def _url_live() -> str:
@@ -49205,8 +49475,8 @@ async def _refuse_foreign_chatgpt_tab(page, platform, platform_l, label, url,
     _epoch = _chatgpt_convo_epoch(url)
     _when = (datetime.fromtimestamp(_epoch).strftime("%Y-%m-%d %H:%M:%S")
              if _epoch else "unknown")
-    log(f"[{label}] ⛔ REFUSING to {why}: the tab is on a conversation created "
-        f"{_when}, which predates this run ({url!r})", "ERROR")
+    log(f"[{label}] ⛔ REFUSING to {why}: the tab is on a conversation that does "
+        f"not contain this run's brief (created {_when}) ({url!r})", "ERROR")
     if recover:
         # ⛔ THE LEG ENDS HERE EITHER WAY, and that is not a shortcut — it is the
         # only honest outcome. A fresh composer is EMPTY: the brief and the typed
@@ -52746,7 +53016,19 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 if _verdict == "ours":
                     return True, _last, "ok"
                 if _verdict == "foreign":
+                    # ⛔ THE CLOCK MAY NO LONGER CONDEMN ALONE. If our brief is
+                    # demonstrably in this conversation, the dating is wrong —
+                    # which is exactly the 2026-08-05 shape, where a mid-run
+                    # settings write moved the run's own start time forward and
+                    # a run began calling its own fresh conversation foreign.
+                    # Content can only turn this verdict around, never make one.
+                    _verdict = chatgpt_landing_content_override(
+                        _verdict, await read_chatgpt_first_user_message(page),
+                        _runtime.brief_fingerprints.get("chatgpt") or [])
+                if _verdict == "foreign":
                     return False, _last, "conversation_predates_this_run"
+                if _verdict == "ours":
+                    return True, _last, "ok"
                 if _verdict == "undatable":
                     # Present, new, and not datable → keep the budget running.
                     _undatable = _last
@@ -53286,7 +53568,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             # liveness semantics are still wanted (a cross-origin DR iframe is
             # unreadable and legitimately false-negatives here); it just has to be
             # liveness of OUR conversation.
-            _chatgpt_alive = _chatgpt_conversation_is_ours(_chatgpt_url)
+            _chatgpt_alive = chatgpt_tab_is_live_conversation(_chatgpt_url)
             if "chatgpt.com/c/" in _chatgpt_url and not _chatgpt_alive:
                 log(f"[2A] page is at a conversation that is NOT this run's "
                     f"({_chatgpt_url}) — refusing to read it as liveness", "ERROR")
@@ -53608,7 +53890,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
     # not being in OURS, and a stale thread must not gate a tier probe as though
     # the run were live in it.
     _cg_alive = bool(_cg_entry.get("verified")) or \
-        _chatgpt_conversation_is_ours((_cg_entry.get("url") or "").lower())
+        chatgpt_tab_is_live_conversation((_cg_entry.get("url") or "").lower())
     if (_cg_alive
             and not _controls.pro_warning_acknowledged
             and not _controls.free_tier_consent.get("chatgpt", False)

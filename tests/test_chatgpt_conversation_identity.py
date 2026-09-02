@@ -377,18 +377,28 @@ def test_no_bare_c_substring_decides_liveness_any_more():
         "being in A conversation is being read as being in OURS again"
     )
     assert '"chatgpt.com/c/" in (_cg_entry.get' not in src
+    # ⛔ REWRITTEN 2026-09-02 (stretch 7.5) — THE NAME CHANGED, THE RULE DID NOT.
+    # Both sites called `_chatgpt_conversation_is_ours` DIRECTLY, which is how
+    # they missed the 2026-08-27 correction: an id nothing can date came back
+    # False, and False here means "not alive", so a healthy leg on a
+    # `/c/WEB:<uuid>` conversation was logged as "NOT this run's" and dropped
+    # into the dead-page path. They now share one helper that requires a
+    # conversation to be PRESENT and not positively foreign.
     for name in ("_chatgpt_alive =", "_cg_alive ="):
         i = src.index(name)
-        assert "_chatgpt_conversation_is_ours" in src[i:i + 260], (
+        assert "chatgpt_tab_is_live_conversation" in src[i:i + 260], (
             f"{name} no longer decides on conversation identity"
         )
 
 
 def test_both_liveness_sites_route_through_the_identity_helper():
     p2 = code_only_deep(research.run_phase2)
-    assert p2.count("_chatgpt_conversation_is_ours(") >= 2, (
+    assert p2.count("chatgpt_tab_is_live_conversation(") >= 2, (
         "the 2A alive-handoff and the Free-tier probe must both check identity"
     )
+    # ⛔ AND NEITHER MAY RE-INLINE THE DATING PREDICATE. That is what made these
+    # two copies drift from the fixed one in the first place.
+    assert "_chatgpt_conversation_is_ours(" not in p2
 
 
 # ── _chatgpt_force_new_chat ───────────────────────────────────────────────

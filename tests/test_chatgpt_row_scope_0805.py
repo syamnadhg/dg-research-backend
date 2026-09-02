@@ -527,13 +527,59 @@ FOREIGN_URL = "https://chatgpt.com/c/6a72ce1e-2284-83ea-abcb-acdf3db558b0"  # 08
 OURS_URL = "https://chatgpt.com/c/6a7377d5-8f14-8320-a5d5-7f9a5a5f0f10"     # 08-05 10:50
 
 
+# ⛔⛔ 2026-09-02 (stretch 7.5) — THE REFUSAL STOPPED DATING THE ADDRESS. It still
+# refuses, and it must: it is the only thing between a composer holding THIS
+# run's brief and a stranger's finished thread. What changed is the evidence — it
+# now reads the conversation's FIRST USER TURN and asks whether our brief is in
+# it. So a fake page has to be able to answer that question.
+#
+# ⭐ AND A FRESH CHAT ANSWERS "" — no user turn exists yet. That is the case the
+# gate must NOT refuse, and it is why the reader deliberately does not fall back
+# to the page's own text: on a fresh chat the sidebar lists the person's OTHER
+# conversations, and a body-text fallback would have offered them as evidence
+# that this tab is somebody else's.
+REFUSAL_BRIEF = ("# Research Brief\n\nInvestigate surface-code thresholds for "
+                 "quantum error correction and transmon decoherence budgets.")
+OURS_TURN = ("Investigate surface-code thresholds for quantum error correction "
+             "and transmon decoherence budgets.")
+STRANGER_TURN = ("Write me a 500-word essay about the history of sourdough "
+                 "baking in northern Europe and Baltic rye starters.")
+
+
 class _FakePage:
-    def __init__(self, url):
+    """A tab. `first_turn` is what the conversation's opening user message says;
+    "" means a fresh chat with no user turn at all."""
+
+    def __init__(self, url, first_turn=None):
         self._url = url
+        if first_turn is None:
+            first_turn = {FOREIGN_URL: STRANGER_TURN, OURS_URL: OURS_TURN}.get(url, "")
+        self._first_turn = first_turn
 
     @property
     def url(self):
         return self._url
+
+    async def evaluate(self, _script, *args):
+        cap = args[0] if args else 4000
+        return self._first_turn[:cap]
+
+
+@pytest.fixture(autouse=True)
+def _this_runs_brief():
+    """The brief we put in this run's tab — what the refusal compares against.
+
+    ⛔ AUTOUSE ON PURPOSE. Two tests below build the refusal call themselves
+    rather than going through `_drive_refusal`, and when this setup lived in that
+    helper they silently stopped refusing: with no fingerprint the verdict is
+    `unknown`, the gate declines to act, and the assertion read as a product bug.
+    A precondition that can be forgotten by one caller belongs in a fixture.
+    """
+    research._runtime.brief_fingerprints["chatgpt"] = research.brief_fingerprint(
+        REFUSAL_BRIEF)
+    assert research._runtime.brief_fingerprints["chatgpt"], "precondition"
+    yield
+    research._runtime.brief_fingerprints.pop("chatgpt", None)
 
 
 def _stub_run_start(monkeypatch, when):

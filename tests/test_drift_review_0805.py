@@ -367,10 +367,33 @@ class _DeadTab:
         raise RuntimeError("Target page, context or browser has been closed")
 
 
+SWEEP_BRIEF = (
+    "# Research Brief\n\nInvestigate surface-code thresholds for quantum error "
+    "correction, focusing on transmon qubit decoherence budgets."
+)
+# What each conversation's first user turn says. This is what the sweep reads now.
+OURS_TEXT = ("Investigate surface-code thresholds for quantum error correction, "
+             "focusing on transmon qubit decoherence budgets.")
+FOREIGN_TEXT = ("Write me a 500-word essay about the history of sourdough baking "
+                "in northern Europe, with attention to rye starters.")
+
+
 @pytest.fixture()
 def sweep(monkeypatch):
-    """The sweep, wired to record instead of emitting. `_run_start_epoch` is pinned
-    between the two real conversation ids from the incident."""
+    """The sweep, wired to record instead of emitting.
+
+    ⛔⛔ REWRITTEN 2026-09-02 (stretch 7.5), NOT SILENCED. Every test below kept
+    its intent; only the evidence changed. The sweep used to decode a creation
+    time out of the conversation URL and compare it to when the run started —
+    this machine's clock against OpenAI's — so this fixture's job was to pin
+    `_run_start_epoch` between the incident's two real ids. It now asks the
+    conversation whether it still contains the brief we pasted, so the fixture's
+    job is to say what each conversation CONTAINS.
+
+    The two real incident ids are kept and still asserted to be twelve hours
+    apart, because they are the evidence the incident happened — they are simply
+    no longer what makes the decision.
+    """
     cards = []
     disarmed = []
     monkeypatch.setattr(research, "fail_agent",
@@ -379,16 +402,31 @@ def sweep(monkeypatch):
     monkeypatch.setattr(research, "_disarm_registry", lambda k: disarmed.append(k))
     old = research._chatgpt_convo_epoch(FOREIGN_URL)
     new = research._chatgpt_convo_epoch(OURS_URL)
-    assert new - old > 4 * research._CONVO_AGE_SLACK_SEC
-    monkeypatch.setattr(research, "_run_start_epoch",
-                        lambda: old + 2 * research._CONVO_AGE_SLACK_SEC + 1.0)
+    assert new - old > 4 * research._CONVO_AGE_SLACK_SEC, (
+        "the incident's own ids, kept as the record of it")
+
+    research._runtime.brief_fingerprints["chatgpt"] = research.brief_fingerprint(
+        SWEEP_BRIEF)
+    assert research._runtime.brief_fingerprints["chatgpt"], "precondition"
+
+    # ⭐ The conversation's first user turn, per URL. Anything unnamed reads as
+    # empty, which is the sweep's ABSTAIN — a bare composer, a tab mid-navigation.
+    texts = {FOREIGN_URL: FOREIGN_TEXT, OURS_URL: OURS_TEXT}
+
+    async def _read(page):
+        try:
+            return texts.get(page.url or "", "")
+        except Exception:
+            return ""
 
     def _run(pending, results=None):
         results = {} if results is None else results
-        dropped = research._sweep_foreign_chatgpt_tabs(pending, results)
+        dropped = asyncio.run(research._sweep_foreign_chatgpt_tabs(
+            pending, results, read_first_message=_read))
         return dropped, pending, results, cards, disarmed
 
-    return _run
+    yield _run
+    research._runtime.brief_fingerprints.pop("chatgpt", None)
 
 
 def _leg(url, start=None):
@@ -434,13 +472,21 @@ def test_the_sweep_is_scoped_to_chatgpt(sweep):
     `key != "chatgpt"` guard changed NOTHING. It survived mutation, correctly. A
     scoping test has to hand the predicate something it WOULD reject; the whole point
     of the guard is that another platform's url shape is not ours to interpret.
+
+    ⛔ REWRITTEN 2026-09-02 and the trap above is the reason it needed care. The
+    old precondition — "the URL-dating predicate rejects this" — no longer says
+    anything about what the sweep does, because the sweep stopped dating URLs.
+    A borrowed URL is now saved by the key scoping only if its CONTENT would
+    otherwise condemn it, so the fixture is told this conversation holds a
+    stranger's text.
     """
     borrowed = "https://claude.ai/c/6a72ce1e-2284-83ea-abcb-acdf3db558b0"
-    assert research._chatgpt_tab_is_foreign(borrowed) is True, (
-        "precondition: the bare predicate rejects this url, so only the agent-key "
-        "scoping can save it")
-    pending = {"Claude": _leg(borrowed),
-               "Gemini": _leg("https://gemini.google.com/c/6a72ce1e-2284-83ea")}
+    _fp = research._runtime.brief_fingerprints["chatgpt"]
+    assert research.chatgpt_identity_verdict(FOREIGN_TEXT, _fp) == "foreign", (
+        "precondition: the content verdict condemns this conversation, so only "
+        "the agent-key scoping can save it")
+    pending = {"Claude": _leg(FOREIGN_URL),
+               "Gemini": _leg(borrowed)}
     dropped, pending, _r, cards, _ = sweep(pending)
     assert dropped == []
     assert len(pending) == 2
@@ -505,16 +551,50 @@ def test_a_parked_chat_mode_decision_is_retracted_with_the_leg(sweep):
         research._controls.chat_mode_pending.pop("chatgpt", None)
 
 
-def test_an_undatable_run_does_not_start_failing_healthy_legs(monkeypatch):
-    """Fails OPEN, and that direction is deliberate: a missing config.json must not
-    turn every ChatGPT leg into a card."""
+def test_a_run_that_cannot_identify_its_own_brief_does_not_fail_healthy_legs(monkeypatch):
+    """⛔⛔ FAILS OPEN, AND THAT DIRECTION IS THE WHOLE POINT OF THE REWRITE.
+
+    This used to be about an unreadable `config.json` leaving the run undatable.
+    The run's start time no longer enters into it; what can now be missing is the
+    fingerprint of the brief — a resumed run does not carry it through the pause
+    checkpoint. With nothing to compare against, the sweep must abstain.
+
+    Abstaining costs the check its teeth. Guessing costs a healthy leg, and this
+    project has already paid that twice — most recently seven seconds after Send.
+    """
     cards = []
     monkeypatch.setattr(research, "fail_agent", lambda *a, **k: cards.append(a))
     monkeypatch.setattr(research, "_disarm_registry", lambda k: None)
-    monkeypatch.setattr(research, "_run_start_epoch", lambda: None)
+    research._runtime.brief_fingerprints.pop("chatgpt", None)
+
+    async def _read(_page):
+        return FOREIGN_TEXT      # unmistakably not ours, and it must not matter
+
     pending = {"ChatGPT": _leg(FOREIGN_URL)}
-    assert research._sweep_foreign_chatgpt_tabs(pending, {}) == []
+    assert asyncio.run(research._sweep_foreign_chatgpt_tabs(
+        pending, {}, read_first_message=_read)) == []
     assert cards == []
+    assert "ChatGPT" in pending
+
+
+def test_a_conversation_we_cannot_read_does_not_fail_a_healthy_leg(monkeypatch):
+    """The other abstain: the DOM read came back empty — mid-navigation, a slow
+    render, a markup change. Silence is not evidence of a stranger's thread."""
+    cards = []
+    monkeypatch.setattr(research, "fail_agent", lambda *a, **k: cards.append(a))
+    monkeypatch.setattr(research, "_disarm_registry", lambda k: None)
+    research._runtime.brief_fingerprints["chatgpt"] = research.brief_fingerprint(
+        SWEEP_BRIEF)
+    try:
+        async def _read(_page):
+            return ""
+
+        pending = {"ChatGPT": _leg(FOREIGN_URL)}
+        assert asyncio.run(research._sweep_foreign_chatgpt_tabs(
+            pending, {}, read_first_message=_read)) == []
+        assert cards == []
+    finally:
+        research._runtime.brief_fingerprints.pop("chatgpt", None)
 
 
 def test_the_round_robin_sweeps_before_any_per_agent_work():
