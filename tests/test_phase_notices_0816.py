@@ -252,13 +252,28 @@ def test_the_terminal_events_ask_the_web_app_to_notify():
     )
 
 
-def test_only_the_two_terminal_events_ask():
-    """A phase emits thousands of progress events. Asking on any of them would
-    be a notification per heartbeat."""
+def test_only_terminal_and_trouble_events_ask():
+    """A phase emits thousands of PROGRESS events. Asking on any of them would
+    be a notification per heartbeat.
+
+    ⭐ 2026-09-01: the accepted set grew from two to four. What it still refuses
+    is progress — the two additions are `pipeline_error` and `pipeline_stopped`,
+    both of which mean the run is no longer advancing. Before that widening this
+    gate was the ONLY thing the machine could ever say, and both of its events
+    were good news, so a run blocked at 02:00 told nobody anything.
+    """
     src = _emit_event_src()
     at = src.index("_post_fe_phase_notice(")
     guard = src[:at]
-    assert 'event_type in ("phase_complete", "phase_skipped")' in guard
+    assert '_NOTIFY_TERMINAL = ("phase_complete", "phase_skipped")' in guard
+    # ⭐⭐ The second half is NOT an event list. Blockers are emitted under four
+    # different event names (`emit_decision` takes an `event_name` override), so
+    # a name list missed every one of them; the card's own catalog class is the
+    # question, and it cannot be defeated by a rename.
+    assert 'data.get("recoverability") == "blocker"' in guard
+    # ⛔ The refusal is still the point: progress must reach nothing.
+    for progress in ("phase_start", "agent_progress", "link_extracted"):
+        assert progress not in guard
 
 
 def test_preflight_does_not_ask():
@@ -268,6 +283,12 @@ def test_preflight_does_not_ask():
     src = _emit_event_src()
     at = src.index("_post_fe_phase_notice(")
     assert "1 <= phase <= 5" in src[:at]
+    # ⛔ …and the range stays on the TERMINAL branch only. A blocker during
+    # preflight is exactly the kind that strands a run overnight, so trouble is
+    # deliberately not phase-scoped.
+    gate = src[:at]
+    trouble = gate[gate.index('or data.get("recoverability") == "blocker"'):]
+    assert "1 <= phase <= 5" not in trouble
 
 
 def test_the_ask_carries_ids_only():
@@ -294,8 +315,13 @@ def test_the_ask_uses_the_seq_of_the_event_just_written():
     src = _emit_event_src()
     assert "_emitted_seq = _emit_to_firestore(event)" in src
     at = src.index("_post_fe_phase_notice(")
-    assert "_emitted_seq" in src[at:at + 200], "the ask must pass the returned seq"
-    assert "and _emitted_seq" in src[:at], "a failed write must not be announced"
+    assert "_emitted_seq" in src[at:at + 400], "the ask must pass the returned seq"
+    # ⛔ A failed write must not be announced. The clause moved to the FRONT of
+    # the gate when the trouble branch was added — `_emitted_seq and (...)` —
+    # so it now guards both branches instead of only the terminal one, which is
+    # stronger than the phrasing this used to match.
+    gate = src[:at]
+    assert "_notify_ok = bool(_emitted_seq) and (" in gate, "a failed write must not be announced"
 
 
 def test_a_write_that_did_not_happen_returns_no_seq():

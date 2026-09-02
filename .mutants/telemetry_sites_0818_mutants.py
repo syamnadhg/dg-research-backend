@@ -245,7 +245,8 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str], str]] = [
      [T], SRC),
     ("F2", "under", "the per-worker drain goes, so a worker-2 spool never leaves "
      "the machine",
-     [('                tm.flush_in_background()\n', '')],
+     [('            tm.flush_in_background()\n            if _firebase_db is not None:',
+       '            if _firebase_db is not None:')],
      [T], SRC),
     ("F3", "over", "⛔ the flush becomes synchronous, so a machine with dead DNS "
      "holds the user's command inside a name lookup",

@@ -5534,6 +5534,7 @@ def _sweep_stuck_research_docs_for_device(
             n, f = _sweep_stuck_research_docs(
                 db, uid, device_id,
                 stopped_by=stopped_by, summary=summary,
+                max_age_ms=SWEEP_MAX_AGE_MS,
             )
             total_n += n
             total_fail += f
@@ -5556,8 +5557,25 @@ def _sweep_stuck_research_docs_for_device(
     return (total_n, total_fail)
 
 
+# ⛔⛔ HOW OLD A STUCK RUN MAY BE AND STILL BE SWEPT.
+#
+# OWNER-REPORTED 2026-09-01: the agent announced that a research "stopped early"
+# for a run from weeks earlier that the person had not touched that day. The
+# sweep is why. It stamps `updatedAt = now` on every doc it touches with no age
+# bound at all, and `updatedAt` is THE ONLY TIMESTAMP the run reaches the
+# watcher on — so pressing Reset Backend re-dated a month-old corpse as if it
+# had just finished, and the watcher announced it.
+#
+# Seven days is well past any real run (the active-time ceiling is five hours)
+# and well short of "a run I started last month". A doc with no timestamp at all
+# is swept: unknown age is not old age, and the sweep's existing tests are built
+# on exactly such docs.
+SWEEP_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
+
+
 def _sweep_stuck_research_docs(db, paired_uid: str, device_id: str, *,
-                                stopped_by: str, summary: str) -> "tuple[int, int]":
+                                stopped_by: str, summary: str,
+                                max_age_ms: "int | None" = None) -> "tuple[int, int]":
     """Bulk-sweep stale BE-self-set states for one device's runs in the
     owner's research collection. Returns `(swept_count, fail_count)`.
 
@@ -5590,6 +5608,7 @@ def _sweep_stuck_research_docs(db, paired_uid: str, device_id: str, *,
         return (0, 0)
     swept_n = 0
     swept_fail = 0
+    skipped_old = 0
     stuck_set = {
         "ongoing", "running", "paused", "queued",
         "paused_backend_restart", "paused_backend_restart_failed",
@@ -5608,10 +5627,38 @@ def _sweep_stuck_research_docs(db, paired_uid: str, device_id: str, *,
         status = (sd.get("status") or "").lower()
         if status not in stuck_set:
             continue
+        # ⛔⛔ WHEN THE RUN ACTUALLY WENT QUIET, as best this document knows.
+        # `updatedAt` before we touch it is the last time anything happened to
+        # this run; after we touch it, that fact is gone forever, and it is the
+        # only one downstream has.
+        _prior = sd.get("updatedAt") or sd.get("createdAt")
+        _prior_ms = _prior if isinstance(_prior, (int, float)) and _prior > 0 else None
+        # ⛔⛔ THE SKIP WAS THE WRONG SHAPE, and cross-verify was right about it.
+        # Refusing to touch an old doc made it a PERMANENT LATCH: Reset Backend
+        # and Unpair became no-ops for exactly the runs a person is trying to
+        # clear, and both callers went on reporting "no stale runs found" while
+        # leaving them stuck forever.
+        #
+        # ⭐ The defect was never the sweeping. It was the RE-DATING: this wrote
+        # `updatedAt = now`, and `updatedAt` is the only timestamp the run
+        # reaches the agent watcher on, so a month-old corpse looked freshly
+        # finished and was announced as having "stopped early". So sweep it —
+        # clean the status, release the queue markers — and leave the one field
+        # that says when the run was last alive exactly as it was.
+        _stale = (max_age_ms is not None and _prior_ms is not None
+                  and now_ms - _prior_ms > max_age_ms)
+        if _stale:
+            skipped_old += 1
         patch: dict = {
             "status": "stopped",
-            "updatedAt": now_ms,
-            "stoppedAt": now_ms,
+            # ⛔ NOT bumped for a run that died weeks ago. A doc with no
+            # timestamp at all still gets one — unknown age is not old age, and
+            # something has to be written for the listing to order by.
+            "updatedAt": _prior_ms if _stale else now_ms,
+            # ⛔ NOT `now_ms`. A run that died a week ago did not stop when we
+            # noticed it, and this is the field anything asking "when did it
+            # end?" should be reading.
+            "stoppedAt": int(_prior_ms) if _prior_ms is not None else now_ms,
             "stoppedBy": stopped_by,
             "summary": summary,
         }
@@ -5646,6 +5693,11 @@ def _sweep_stuck_research_docs(db, paired_uid: str, device_id: str, *,
                 f"[sweep:{stopped_by}] update failed for {snap.id[:24]}…: {_sw_err}",
                 "DEBUG",
             )
+    if skipped_old:
+        # ⛔ Said out loud. A silent rule is how a bound becomes the next mystery.
+        log(f"[sweep:{stopped_by}] swept {skipped_old} run(s) older than "
+            f"{(max_age_ms or 0) // 86400000}d WITHOUT bumping updatedAt — "
+            f"re-dating them is what made an old run look freshly finished", "DEBUG")
     return (swept_n, swept_fail)
 
 
@@ -7962,6 +8014,17 @@ async def _firebase_reconnect_loop():
     while True:
         try:
             _last_loop_tick_ms = int(time.time() * 1000)
+            # ⛔⛔ OUTSIDE THE FIRESTORE BRANCH, AND THAT IS THE WHOLE POINT.
+            # This sat inside `if _firebase_db is not None:` below, so the ONE
+            # event whose entire purpose is to report a Firestore outage —
+            # FIRESTORE_OUTAGE_STARTED — could not be sent for as long as the
+            # outage it describes was happening. Telemetry does not go through
+            # Firestore at all: it POSTs to the web app over HTTPS, which is a
+            # different network path and frequently the one that still works.
+            # There are only three flush sites in the whole backend and no timer
+            # inside telemetry.py, so this loop was the only thing that could
+            # have carried it, and the branch it was in guaranteed it did not.
+            tm.flush_in_background()
             if _firebase_db is not None:
                 idx = 0
                 attempts = 0
@@ -7974,10 +8037,6 @@ async def _firebase_reconnect_loop():
                 # trigger. Runs on every worker, and costs one missing-file stat
                 # when there is nothing parked.
                 _drain_queued_log_bundle_rows()
-                # ⛔ Drains on EVERY worker. The worker-1 heartbeat loop is
-                # gated `WORKER_ID == 1`, so a worker-2 spool anchored there
-                # would never go out at all.
-                tm.flush_in_background()
                 # ⛔⛔ THE CLIENT BEING UP IS NOT THE SAME AS THE LISTENERS BEING
                 # UP, and this loop used to treat them as one thing: everything
                 # below only ever ran when `_firebase_db` had gone None. A watch
@@ -16151,6 +16210,20 @@ def _start_cli_command_reader(loop):
 
 # ── Pipeline Controls (asyncio.Event based stop/pause/resume) ────────────────
 
+# ⛔⛔ HOW LONG A PAUSE MAY LAST, AND HOW OFTEN IT SAYS SO.
+#
+# `wait_if_paused` had NO bound and spoke exactly once. It is also the one wait
+# the worker watchdog deliberately ignores — paused time is excluded from the
+# active-time ceiling, so a run parked here accrues nothing, trips nothing, and
+# is invisible to every backstop in the process.
+#
+# 24h is not a new number: it is what `await_phase_decision` already uses, this
+# project's own answer to how long to wait for a person. The heartbeat is what
+# turns a silent run into one somebody can find in a log.
+PAUSE_MAX_WAIT_S = 86400.0
+PAUSE_HEARTBEAT_S = 600.0
+
+
 class PipelineControls:
     """Replaces file-sentinel (.stop/.pause) checks with in-memory async events.
     Set from Firestore command listener OR HTTP endpoint fallback."""
@@ -16396,7 +16469,13 @@ class PipelineControls:
         return self.stop_event.is_set() or self.pause_event.is_set()
 
     async def wait_if_paused(self):
-        """Block pipeline coroutine until resume or stop is received."""
+        """Block until resume or stop — bounded, and audible while it waits.
+
+        ⛔ Bounded by `PAUSE_MAX_WAIT_S`, saying so every `PAUSE_HEARTBEAT_S`.
+        Callers ignore the return value (all sixteen of them), so the bound ends
+        the wait the only way that already has a handled path: by requesting a
+        stop, exactly as an operator's stop would.
+        """
         if not self.pause_event.is_set():
             return
         if _cli_mode:
@@ -16445,14 +16524,54 @@ class PipelineControls:
         else:
             log("Pipeline paused — waiting for resume or stop...")
         self.resume_event.clear()
-        # Wait for either resume or stop
-        done, _ = await asyncio.wait(
-            [asyncio.create_task(self.resume_event.wait()),
-             asyncio.create_task(self.stop_event.wait())],
-            return_when=asyncio.FIRST_COMPLETED
-        )
+        # ⛔⛔ BOUNDED, AND AUDIBLE WHILE IT WAITS. This used to be a bare
+        # `asyncio.wait` with NO timeout — the only wait in the pipeline with no
+        # bound at all, and the tracker had the wrong one: the 24-hour
+        # `await_phase_decision` is the BOUNDED one. Worse, the worker watchdog
+        # excludes paused time from its active-time ceiling on purpose, so a run
+        # parked here accrued no active time, never tripped the ceiling, and sat
+        # forever having said "Pipeline paused — waiting for resume or stop..."
+        # exactly once. A run nobody can see is the whole subject of this stretch.
+        _paused_for = 0.0
+        self._pause_gave_up = False
+        while True:
+            _resume_t = asyncio.create_task(self.resume_event.wait())
+            _stop_t = asyncio.create_task(self.stop_event.wait())
+            done, pending = await asyncio.wait(
+                [_resume_t, _stop_t],
+                timeout=PAUSE_HEARTBEAT_S,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for _t in pending:
+                _t.cancel()
+            if done:
+                break
+            _paused_for += PAUSE_HEARTBEAT_S
+            log(f"[pause] still waiting on {self.pause_reason or 'a decision'} after "
+                f"{int(_paused_for // 60)}m — this run cannot continue until it is answered",
+                "WARN")
+            if _paused_for >= PAUSE_MAX_WAIT_S:
+                # ⛔ Ending it beats pretending. Stopping surfaces a run the
+                # person can see and restart; waiting on forever surfaces
+                # nothing at all, and the watchdog is blind to this state by
+                # design. 24h matches `await_phase_decision`, which is this
+                # project's own answer to "how long do we wait for a person".
+                log(f"[pause] giving up after {int(PAUSE_MAX_WAIT_S // 3600)}h waiting on "
+                    f"{self.pause_reason or 'a decision'} — stopping the run", "ERROR")
+                # ⛔⛔ CLEAR THE PAUSE FLAG TOO. The worker watchdog excludes
+                # paused time from its active-time ceiling on purpose, so
+                # leaving this set after giving up would keep the watchdog
+                # blind for the rest of the process — the run would be stopping
+                # while the one backstop that could have caught anything after
+                # it still saw "paused" and accrued nothing.
+                self.pause_event.clear()
+                self._pause_gave_up = True
+                self.request_stop()
+                break
         if self.stop_event.is_set():
-            log("Stop received while paused")
+            log("Stop received while paused"
+                if not self._pause_gave_up else
+                "Pause bound reached — stopping the run")
         else:
             self.pause_event.clear()
             log("Resumed from pause")
@@ -21731,13 +21850,63 @@ def emit_event(event_type, phase=None, agent=None, **data):
     # ⛔ It sends IDS ONLY — the phase, the event type, and the seq of the
     # document just written. The web app reads that document and composes every
     # word from what it actually says, so this side cannot announce an artifact
-    # by claiming one exists. Phases 4 and 5 are not here: they are driven by
-    # the web app's own route, which notifies in-process.
-    if (event_type in ("phase_complete", "phase_skipped")
-            and isinstance(phase, int) and 1 <= phase <= 5
-            and _emitted_seq):
+    # by claiming one exists.
+    #
+    # ⛔⛔ "Phases 4 and 5 are not here: they are driven by the web app's own
+    # route" — THAT WAS ALREADY WRONG when it was written. The gate is
+    # `1 <= phase <= 5`, and the resume path really does emit
+    # `phase_complete, phase=4`, so a resumed run whose checkpoint holds phase 4
+    # has always come through here.
+    #
+    # ⛔⛔⛔ AND UNTIL 2026-09-01 THIS WAS THE ONLY THING THE MACHINE COULD EVER
+    # SAY. Two event types, both of them good news. A run waiting on a sign-in at
+    # 02:00, a quota exhaustion, a stop at the time ceiling, a backend restart
+    # mid-run — every one of those was written to Firestore and to nothing else,
+    # while the settings screen promised "a research finished, hit an error, went
+    # offline mid-run, or needs you". Only "finished" had a sender.
+    #
+    # ⭐ A run started via the agent was already covered by a watcher that polls
+    # every five minutes; this is the same news for the people who started theirs
+    # in the web app, who had nothing at all. A BLOCKER is not phase-scoped, so
+    # it is not held to the 1..5 range — one raised in preflight is exactly the
+    # kind that strands a run overnight.
+    _NOTIFY_TERMINAL = ("phase_complete", "phase_skipped")
+    # ⛔⛔⛔ THE GATE IS THE CARD'S CLASS, NOT ITS EVENT NAME — and my first
+    # version of this got that wrong in three separate ways, all of which
+    # cross-verify found and all of which meant the headline case still reached
+    # nobody:
+    #
+    #  1. It keyed on `event_type in ("pipeline_error", "pipeline_stopped")`.
+    #     But `emit_decision` takes an `event_name` override, and every blocker
+    #     that actually strands a run overnight uses it — `login_required`,
+    #     `human_verification_required`, `manual_brief_required`. A run waiting
+    #     on a sign-in at 02:00, the very example written into the comment
+    #     below, did not match and was not sent.
+    #  2. It excluded `quiet` cards. `quiet` means "do not paint the phase tile
+    #     red for a phase that was never reached" (see #23723) — its own comment
+    #     says the Retry banner still fires. Excluding it silenced precisely the
+    #     preflight blockers that strand a run before it starts.
+    #  3. It included `pipeline_stopped`, and every emit site of that event is a
+    #     stop the PERSON asked for. It would have pushed "Your research
+    #     stopped" to somebody who had just pressed Stop — which the completion
+    #     notice already refuses to do, in writing, for the same reason.
+    #
+    # ⭐⭐ `recoverability == "blocker"` is the field the catalog already
+    # maintains for exactly this question: seven intents where "the user
+    # resolves them, they never auto-fire". It is event-name agnostic, so it
+    # cannot be defeated by an `event_name=` override, and it excludes the
+    # recoverable and auto-skipping cards that heal themselves.
+    _notify_ok = bool(_emitted_seq) and (
+        (event_type in _NOTIFY_TERMINAL and isinstance(phase, int) and 1 <= phase <= 5)
+        or data.get("recoverability") == "blocker"
+    )
+    if _notify_ok:
         try:
-            _post_fe_phase_notice(_fb_uid, _fb_research_id, phase, event_type, _emitted_seq)
+            _post_fe_phase_notice(
+                _fb_uid, _fb_research_id,
+                phase if isinstance(phase, int) else 0,
+                event_type, _emitted_seq,
+            )
         except Exception as _pn_e:
             log(f"phase-notify dispatch failed (non-fatal): {_pn_e}", "WARN")
     # Drop into the narrator ring buffer (after Firestore so ordering

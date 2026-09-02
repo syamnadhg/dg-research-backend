@@ -46,28 +46,27 @@ MUTANTS = [
     ("C1", "research.py", "under",
      "⭐ THE FEATURE — nothing asks, so every phase notice needs an open browser "
      "tab again and a 90-minute run tells you nothing until you look",
-     [("            _post_fe_phase_notice(_fb_uid, _fb_research_id, phase, event_type, _emitted_seq)",
+     [('            _post_fe_phase_notice(\n                _fb_uid, _fb_research_id,\n                phase if isinstance(phase, int) else 0,\n                event_type, _emitted_seq,\n            )',
        "            pass")]),
 
     ("C2", "research.py", "over",
      "⛔ every event type asks — phase 2 alone emits thousands of progress events, "
      "so this is a notification per heartbeat",
-     [('    if (event_type in ("phase_complete", "phase_skipped")\n'
-       '            and isinstance(phase, int) and 1 <= phase <= 5\n',
-       '    if (isinstance(phase, int) and 1 <= phase <= 5\n')]),
+     [('        (event_type in _NOTIFY_TERMINAL and isinstance(phase, int) and 1 <= phase <= 5)',
+       '        (True)')]),
 
     ("C3", "research.py", "over",
      "⛔ preflight asks too — one pointless round trip per run, on every run, for "
      "a phase that produces nothing the user asked for",
-     [("            and isinstance(phase, int) and 1 <= phase <= 5\n",
-       "            and isinstance(phase, int) and 0 <= phase <= 5\n")]),
+     [("        (event_type in _NOTIFY_TERMINAL and isinstance(phase, int) and 1 <= phase <= 5)",
+       "        (event_type in _NOTIFY_TERMINAL and isinstance(phase, int) and 0 <= phase <= 5)")]),
 
     ("C4", "research.py", "over",
      "⛔ the module global is used instead of the returned seq — when the write "
      "bailed, that global still holds the PREVIOUS event's seq, which names a "
      "real document from an earlier phase",
-     [("            _post_fe_phase_notice(_fb_uid, _fb_research_id, phase, event_type, _emitted_seq)",
-       "            _post_fe_phase_notice(_fb_uid, _fb_research_id, phase, event_type, _fb_seq)")]),
+     [('            _post_fe_phase_notice(\n                _fb_uid, _fb_research_id,\n                phase if isinstance(phase, int) else 0,\n                event_type, _emitted_seq,\n            )',
+       '            _post_fe_phase_notice(\n                _fb_uid, _fb_research_id,\n                phase if isinstance(phase, int) else 0,\n                event_type, _fb_seq,\n            )')]),
 
     ("C5", "research.py", "over",
      "⛔ a write that never happened reports a seq — the bail returns the stale "
@@ -92,10 +91,10 @@ MUTANTS = [
     ("C7", "research.py", "over",
      "⛔ the ask is no longer wrapped — emit_event is the critical path for every "
      "frontend state update, and a notification failure would break it",
-     [("        try:\n            _post_fe_phase_notice(_fb_uid, _fb_research_id, phase, event_type, _emitted_seq)\n"
+     [("        try:\n" + '            _post_fe_phase_notice(\n                _fb_uid, _fb_research_id,\n                phase if isinstance(phase, int) else 0,\n                event_type, _emitted_seq,\n            )' + "\n"
        "        except Exception as _pn_e:\n"
        '            log(f"phase-notify dispatch failed (non-fatal): {_pn_e}", "WARN")',
-       "        _post_fe_phase_notice(_fb_uid, _fb_research_id, phase, event_type, _emitted_seq)")]),
+       '            _post_fe_phase_notice(\n                _fb_uid, _fb_research_id,\n                phase if isinstance(phase, int) else 0,\n                event_type, _emitted_seq,\n            )')]),
 
     # ⛔ Anchored on this thread's own NAME. `daemon=True,\n        ).start()`
     # occurs FOUR times in research.py — the first version of this mutant matched
