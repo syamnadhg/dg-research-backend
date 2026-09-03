@@ -2,6 +2,14 @@
 
 Backend architecture + Frontend ↔ Backend contract for the Multi-Agent Deep Research Pipeline. Covers phase structure, event/command protocol, retry/continue/skip decision gates, phase-restart semantics, backend-restart resume flow, and watchdog spec.
 
+> ⛔ **NO LINE NUMBERS IN THIS FILE.** Name the symbol; a grep finds it and stays
+> correct. Sixteen `research.py:NNNN` citations lived here and on 2026-09-03
+> every single one pointed at unrelated code — the file has grown past 76,000
+> lines and a citation that rots in silence is worse than no citation, because
+> it reads as evidence. A test enforces this, and it enforces one more rule: a
+> retired symbol may be named only on a line marked ⛔, so a correction can say
+> what it corrects without the mention reading as a live claim.
+
 ---
 
 ## Running the Backend
@@ -70,9 +78,9 @@ Phase 0 (Init)
 A backend can run **N concurrent pipelines** in parallel when `research_config.json.workerCount` is set above 1 (default 1, common production setting 2). Each worker is a separate Python subprocess spawned by the daemon-loop supervisor on adjacent ports (8000, 8001, …); each independently subscribes to `devices/{deviceId}/queue/` and `devices/{deviceId}/commands/`, pins to its own browser-profile dir (`~/.super-research/browser-profile-N/`), and runs its own pipeline coroutine.
 
 **Config + load path:**
-- `load_worker_count()` (research.py:2667) reads `research_config.json.workerCount` with a `max(1, n)` clamp so a bad value can't disable the only worker.
-- `save_worker_count(n)` (research.py:2689) atomic-writes back via `_atomic_write_json` — partial-write safe.
-- BE publishes `workerCount` on every heartbeat to `devices/{deviceId}` (research.py:~2815) so the FE knows N when deciding ongoing vs queued.
+- `load_worker_count()` (research.py) reads `research_config.json.workerCount` with a `max(1, n)` clamp so a bad value can't disable the only worker.
+- `save_worker_count(n)` (research.py) atomic-writes back via `_atomic_write_json` — partial-write safe.
+- BE publishes `workerCount` on every heartbeat to `devices/{deviceId}` (research.py) so the FE knows N when deciding ongoing vs queued.
 
 **Per-worker safety guards:**
 - **On-disk worker lock** (`safe_enqueue_lock_*`) — prevents two workers from claiming the same queue doc on a back-to-back supervisor restart (one-cycle race).
@@ -91,18 +99,18 @@ A backend can run **N concurrent pipelines** in parallel when `research_config.j
 
 Queue ordering and per-doc position numbers stay coherent across cross-account, cross-worker, and cancel-mid-defer scenarios via four BE rules — all in `research.py`, all touched by the 2026-05-22 cycle.
 
-1. **FIFO sort key is `submittedAt` (Firestore serverTimestamp), not client `timestamp`** — `_queue_doc_fifo_ms` helper (research.py:~2112) prefers the server-set timestamp and falls back to `timestamp` (client `Date.now()` millis) only when `submittedAt` is missing on legacy docs. Removes the cross-account clock-skew bug where a sharer's lagging clock could rank ahead of the owner's earlier submit. Commit `41d0a27`.
+1. **FIFO sort key is `submittedAt` (Firestore serverTimestamp), not client `timestamp`** — `_queue_doc_fifo_ms` helper (research.py) prefers the server-set timestamp and falls back to `timestamp` (client `Date.now()` millis) only when `submittedAt` is missing on legacy docs. Removes the cross-account clock-skew bug where a sharer's lagging clock could rank ahead of the owner's earlier submit. Commit `41d0a27`.
 
-2. **Real-time renumber on every claim and cancel** — `_recompute_deferred_queue_positions` (research.py:~2218) does a single scan of `devices/{deviceId}/queue/`, sorts by the helper above, filters out `assignedWorker` / `processed` / non-`start` docs, and batch-writes new `queuePosition` / `queuedBehindRunId` / `queuedBehindTitle` to every remaining deferred research doc in one round-trip. Fires from three sites: (a) listener claim path (`_enqueue_with_position_refresh`, research.py:~4862), (b) idle-rescan claim (research.py:~27563), (c) `_do_cancel` deferred-cancel branch (research.py:~4148). All three call sites wrap the helper in `asyncio.create_task(asyncio.to_thread(...))` so the synchronous Firestore scan never blocks the asyncio loop or the listener thread. Commit `c362126`.
+2. **Real-time renumber on every claim and cancel** — `_recompute_deferred_queue_positions` (research.py) does a single scan of `devices/{deviceId}/queue/`, sorts by the helper above, filters out `assignedWorker` / `processed` / non-`start` docs, and batch-writes new `queuePosition` / `queuedBehindRunId` / `queuedBehindTitle` to every remaining deferred research doc in one round-trip. Fires from three sites: (a) listener claim path (`_enqueue_with_position_refresh`, research.py), (b) idle-rescan claim (research.py), (c) `_do_cancel` deferred-cancel branch (research.py). All three call sites wrap the helper in `asyncio.create_task(asyncio.to_thread(...))` so the synchronous Firestore scan never blocks the asyncio loop or the listener thread. Commit `c362126`.
 
-3. **Cancel of a deferred (Firestore-resident) doc** — `_do_cancel` (research.py:~4148-4225) was extended to handle the case where the cancel target isn't in the local asyncio deque. The handler scans `devices/{deviceId}/queue/`, finds the start doc whose `researchId` matches, deletes it, flips the research doc to `status="stopped"`, then fires the deferred-recompute helper above so the remaining queue renumbers live. Commit `bcc4f84`.
+3. **Cancel of a deferred (Firestore-resident) doc** — `_do_cancel` (research.py) was extended to handle the case where the cancel target isn't in the local asyncio deque. The handler scans `devices/{deviceId}/queue/`, finds the start doc whose `researchId` matches, deletes it, flips the research doc to `status="stopped"`, then fires the deferred-recompute helper above so the remaining queue renumbers live. Commit `bcc4f84`.
 
-4. **Worker count + cross-user awareness in defer decisions** — the listener at `research.py:~4794` checks `is_busy or _gate_will_block`, and the FE-side `usePipeline.startPipeline` checks `ongoing >= workerCount OR queued > 0` (per-device, cross-account). Sharer's FE uses `device.currentRunId` as a cross-user "device busy" signal when its own `cachedResearches` scan can't see the owner's run; 24h `currentRunIsStale` cutoff prevents crash-leftover values from blocking fresh submits.
+4. **Worker count + cross-user awareness in defer decisions** — the listener at `research.py` checks `is_busy or _gate_will_block`, and the FE-side `usePipeline.startPipeline` checks `ongoing >= workerCount OR queued > 0` (per-device, cross-account). Sharer's FE uses `device.currentRunId` as a cross-user "device busy" signal when its own `cachedResearches` scan can't see the owner's run; 24h `currentRunIsStale` cutoff prevents crash-leftover values from blocking fresh submits.
 
 **Where each phase runs:**
 - Phases 0-3 run **BE-side** (Python daemon on user's PC — needs the local browser for ChatGPT / Gemini / Claude / NotebookLM).
 - Phases 4-5 run **FE-side** (Firebase App Hosting / Cloud Run — Data API + Resend, no browser needed). FE-P4 fires off BE's `phase_complete:3` (or `phase_skipped:3` for the no-audio path), then chains directly into FE-P5 on success or fast-path skip. BE exits cleanly after P3 with `delivery.status="completed"`; the user-visible `research.status` stays "ongoing" until FE-P5's `markFeP5Completed` flips it to "completed".
-- **BE-driven P4/P5 (autonomous, #742 / BE `79d943f`)** — the live `phase_complete:3` event is one trigger, **not the only one**. So a run finishes even when the chat app never opens, after P3 the BE also calls `_post_fe_p4p5_trigger(uid, research_id)` (research.py:7003) from a detached daemon thread: it writes a `needsFeTrigger` marker AND POSTs `{FE_BASE_URL}/api/uploadYouTube {research_id, ownerUid}`, authenticated with the synth-device user's own fresh ID token; the route runs P4 then chains P5. `casRouteP4` dedups this against the live-event FE catch-up so both triggers coexist.
+- **BE-driven P4/P5 (autonomous, #742 / BE `79d943f`)** — the live `phase_complete:3` event is one trigger, **not the only one**. So a run finishes even when the chat app never opens, after P3 the BE also calls `_post_fe_p4p5_trigger(uid, research_id)` (research.py) from a detached daemon thread: it writes a `needsFeTrigger` marker AND POSTs `{FE_BASE_URL}/api/uploadYouTube {research_id, ownerUid}`, authenticated with the synth-device user's own fresh ID token; the route runs P4 then chains P5. `casRouteP4` dedups this against the live-event FE catch-up so both triggers coexist.
 
 ---
 
@@ -117,14 +125,14 @@ All events are JSON objects written to `events.jsonl` (one per line) AND mirrore
 | `agent_progress` | 1-2 | `{status, stage, progress, sources, sourceUrls, sections, partialTextLen, model, thinking, steps, plan, toolUses, elapsedSec, expectedMinutes, scrapeOk, scrapeSource, visionNarration}` | During Phase 1/2 polling (~120s interval, `POLL_DEEP_RESEARCH` default). `stage` (`"planning" \| "researching" \| "writing"`) drives the FE milestone stepper — it advances an agent off "Submitted" the moment a real counter is scrape-blind. P1 emits it from `poll_until_done` (#924); P2 emits it continuously from the round-robin poller + launch sites + hard-retry (#930), with `"planning"` gated on the scraper's plan-page signal so a planning Gemini stays on "Submitted" by design. Empty `stage` is omitted so it never clobbers a prior value in the FE merge. `scrapeSource: "dom" \| "vision"` records which tier produced the data. `visionNarration` is populated by the agent-side-panel walker when DG_VISION_NARRATE=1 OR when the vision-narrator fallback is exercised (see `_vision_narration` / `_vision_narration_p2` emits at the P1 + P2 sites); when neither fires it's empty string. FE renders verbatim when present. |
 | `agent_skipped` | 2 | `{agent: string}` | Disabled agent in Phase 2 config |
 | `agent_verified` | 2 | `{agent: string, verified: bool}` | Agent confirmed running |
-| `link_extracting` | 1-5 | `{agent: string}` | Link extraction starting |
-| `link_extract_retry` | 1-5 | `{agent, attempt, max, reason?}` | Extraction retried (emitted by `extract_with_retry`) |
-| `link_extracted` | 1-5 | `{agent: string, url, label, verified}` | Public link obtained (emitted immediately) |
-| `link_extraction_failed` | 1-5 | `{agent: string, error}` | Link extraction failed |
-| `agent_link_failed` | 2 | `{agent, attempts, lastError}` | B1 gate: 3× retry exhausted. Pipeline pauses and waits for `agent_decision` command |
-| `phase_complete` | 0-5 | `{durationSec, links: [{label, url, verified}], skippedAgents?, summary}` | Phase finishes |
+| `link_extracting` | 3 | `{agent: string}` | Notebook-link read starting. ⛔ Phase 3 only — all three of these come from `extract_with_retry`, whose one caller is NotebookLM |
+| `link_extract_retry` | 3 | `{agent, attempt, maxAttempts, description}` | Notebook-link read retried |
+| `link_extracted` | 1-4 | `{agent, url, label, verified, primary?}` | P1/P2: the report's page in OUR app, `primary=true`. P3/P4: a validated third-party link. ⛔ Never a conversation address — see stretch 7.5 |
+| `link_extraction_failed` | 3 | `{agent: string, error}` | Notebook-link read failed |
+| `agent_link_failed` | 2 | `{agent, attempts, lastError}` | ⛔ The name is a wire contract, not a description: the only live producer is Claude finishing without its report artifact. `attempts` is hardcoded 1. **Does not pause** — parks the agent for 300s while the others keep polling |
+| `phase_complete` | 0-5 | `{durationSec, links: [{label, url, verified, primary?}], skippedAgents?, erroredAgents?, skipped?, summary}` | Phase finishes. `skipped` is the wipeout marker the app reads to tell "produced nothing" from "was never asked" |
 | `phase_skipped` | 1-5 | `{reason: string}` | Phase disabled in config |
-| `pipeline_paused` | N | `{phase: number, reason?: "login_required" | "agent_link_failed" | "user_pause"}` | Pipeline paused |
+| `pipeline_paused` | N | `{phase, reason?, agent?, snapshot?}` | Pipeline paused. Reasons actually emitted: `login_required`, `pro_required`, `human_verification_required`, `cua_unavailable` — and NO reason at all when the user pauses, which is the common case. ⛔ The value this row used to name for that case is emitted nowhere. ⛔ `agent_link_failed` is reachable only from the orphaned gate, so in practice it never appears either. ⛔⛔ `snapshot` is the app-facing runtime snapshot and is **deliberately smaller than the one on disk** — see Pause snapshot below |
 | `pipeline_resumed` | N | `{phase: number}` | Resumed from pause |
 | `pipeline_complete` | — | `{summary: string}` | All phases done |
 | `pipeline_stopped` | N | `{phase: number, reason}` | User requested stop OR backend watchdog detected disconnect |
@@ -135,8 +143,8 @@ All events are JSON objects written to `events.jsonl` (one per line) AND mirrore
 | `heartbeat` | N | `{phase, ts}` | Emitted ~60s during long waits so frontend liveness watchdog stays green |
 | `login_required` | 0-5 | `{platforms: string[], platformLabels: string[], envErrors?: string[], attempt, message}` | **Phase 0 (Apr 19): sequential — fired with `platforms: [key]` scoped to the ONE platform currently being verified, one at a time until all pass. Phases 1-5: cookie-only probe at phase entry fires this with the missing platforms for that phase regardless of `skipInitVerify`.** |
 | `phase_narration` | 1-5 | `{text: string, timestamp: int}` | **Per-phase narrator** — emits one human-readable sentence describing what's happening in the active phase, every ~45s. Fed by a bounded ring buffer (~50 recent events). Warms on `phase_start`, quiet during `pipeline_paused`, tears down on `phase_complete` / `pipeline_stopped`. Frontend stores in `phaseNarrations[researchId][phase]` and renders inside the phase dropdown. **Brain (swapped 2026-05-28):** Gemini 3.5 Flash primary (`gemini-3.5-flash`, env `GEMINI_TEXT_MODEL`) → Anthropic Haiku 4.5 cross-vendor fallback (`claude-haiku-4-5`, env `DG_NARRATOR_HAIKU_MODEL`). *(The U2 cleanup removed the older `/api/narrate` speculative-fallback hook; speculative entries no longer appear.)* |
-| `agent_narration` | 2 | `{agent: string, text: string, timestamp: int}` | **Per-agent narrator** — emits one human-readable sentence per active Phase 2 agent every ~6s. Separate API call per agent because per-agent context changes fast during P1/P2. Frontend stores in `agentNarrations[researchId][agentKey]`, rendered by `AgentAccordionRow` as the canonical narration source. Cleared on phase-2 complete. **Brain (swapped 2026-05-28):** Gemini 3.5 Flash primary (`gemini-3.5-flash`, env `GEMINI_TEXT_MODEL`) → Anthropic Haiku 4.5 cross-vendor fallback (`claude-haiku-4-5`, env `DG_NARRATOR_HAIKU_MODEL`). Narrator input is scrubbed of chat-thread chrome (`You said:` / `Claude responded:` / `Gemini said` / `brief.md` / `Building:`-prefix composites) at `_compact_event_for_narration` (research.py:5550-5625) BEFORE the narrator sees it; scrape outputs (chip / step counts) untouched. |
-| `tier_transition` | 0-5 | `{op, agent?, hotspot_id?, from_tier, to_tier, reason, attempt}` | **Vision shadow-eval telemetry (Apr 26) + TierEscalation tracking (Apr 28).** Records every escalation between interaction tiers (e.g. DOM→CUA, Vision→CUA). The `attempt` field is the per-(op, agent) counter inside a 30-min sliding window — fed by `TierEscalation.record()` (research.py:2580+), centralized via `emit_tier_transition()`. Used by `scripts/vision_shadow_report.py` to compute per-hotspot agreement metrics. Persisted to events.jsonl AND to `logs/vision_shadow.jsonl` when `DG_VISION_TIER=shadow`. |
+| `agent_narration` | 2 | `{agent: string, text: string, timestamp: int}` | **Per-agent narrator** — emits one human-readable sentence per active Phase 2 agent every ~6s. Separate API call per agent because per-agent context changes fast during P1/P2. Frontend stores in `agentNarrations[researchId][agentKey]`, rendered by `AgentAccordionRow` as the canonical narration source. Cleared on phase-2 complete. **Brain (swapped 2026-05-28):** Gemini 3.5 Flash primary (`gemini-3.5-flash`, env `GEMINI_TEXT_MODEL`) → Anthropic Haiku 4.5 cross-vendor fallback (`claude-haiku-4-5`, env `DG_NARRATOR_HAIKU_MODEL`). Narrator input is scrubbed of chat-thread chrome (`You said:` / `Claude responded:` / `Gemini said` / `brief.md` / `Building:`-prefix composites) at `_compact_event_for_narration` (research.py) BEFORE the narrator sees it; scrape outputs (chip / step counts) untouched. |
+| `tier_transition` | 0-5 | `{op, agent?, hotspot_id?, from_tier, to_tier, reason, attempt}` | **Vision shadow-eval telemetry (Apr 26) + TierEscalation tracking (Apr 28).** Records every escalation between interaction tiers (e.g. DOM→CUA, Vision→CUA). The `attempt` field is the per-(op, agent) counter inside a 30-min sliding window — fed by `TierEscalation.record()` (research.py), centralized via `emit_tier_transition()`. Used by `scripts/vision_shadow_report.py` to compute per-hotspot agreement metrics. Persisted to events.jsonl AND to `logs/vision_shadow.jsonl` when `DG_VISION_TIER=shadow`. |
 | `wrong_artifact_rejected` | 2 | `{agent, op, tier, attempt}` | **Finalize-extraction guard (Apr 26).** Fired when `_is_sources_not_document` rejects a finalize-copy result (extracted content is the source-list panel, not the report). Tier ∈ {cua, dom_html_md, dom_js, dom_panel}. Drives the retry-cap-2 loop on hotspots #2c and #2d. |
 | `extract_failed` | 2 | `{agent, op, attempts, last_tier}` | **Final-failure terminal (Apr 26).** Fired when all retry attempts on hotspots #2c / #2d are exhausted. Pairs with a `pipeline_error` for FE phase-alert routing. |
 
@@ -153,22 +161,22 @@ All events are JSON objects written to `events.jsonl` (one per line) AND mirrore
 Conflict: last-write-wins on FE; vision narrator + per-agent narrator overlapped; section chips piled up post-completion; Pro 2.5 echoed input verbatim at temp 0.2.
 
 **Post-04-30 — single writer + tail:**
-1. **Per-agent narrator (canonical)** — Gemini 3.5 Flash primary (`gemini-3.5-flash`, env `GEMINI_TEXT_MODEL`), Anthropic Haiku 4.5 cross-vendor fallback (`claude-haiku-4-5`, env `DG_NARRATOR_HAIKU_MODEL`); swapped 2026-05-28. Emits `agent_narration` events. Tighter anti-parrot prompt (research.py:5904-5933) + chrome scrub on input window (research.py:5550-5625).
-2. **BE phase-fallback tail** — when narrator silent, research.py:9601-9604 emits `Extended Thinking active · 12,400 chars drafted` into `progress["progress"]`. FE renders as last-resort tail (PhaseDropdown.tsx:1880-1885).
+1. **Per-agent narrator (canonical)** — Gemini 3.5 Flash primary (`gemini-3.5-flash`, env `GEMINI_TEXT_MODEL`), Anthropic Haiku 4.5 cross-vendor fallback (`claude-haiku-4-5`, env `DG_NARRATOR_HAIKU_MODEL`); swapped 2026-05-28. Emits `agent_narration` events. Tighter anti-parrot prompt (research.py) + chrome scrub on input window (research.py).
+2. **BE phase-fallback tail** — when narrator silent, research.py emits `Extended Thinking active · 12,400 chars drafted` into `progress["progress"]`. FE renders as last-resort tail (`PhaseDropdown.tsx`).
 3. **DOM scrape feeds the input window** — `_compact_event_for_narration` flattens events to `key=value` strings, scrubbed of chat-thread chrome before narrator sees them. Sections and step counts still feed FE chips/strips, but the narrator no longer parrots them back.
 4. **Vision narrator retired** — `narrate.py` `PHASE_BUDGET=0` by default; set `DG_VISION_NARRATE=1` to re-enable.
 
-**Display chain on the agent card (FE, PhaseDropdown.tsx:1861-1891):**
+**Display chain on the agent card (FE, `PhaseDropdown.tsx`):**
 ```
 agentNarrationText                     ← per-agent narrator (Haiku/Flash)
   || detail.lastNarration              ← persisted last narration on F5/reopen
-  || _progressTail                     ← BE fallback (research.py:9601-9604)
+  || _progressTail                     ← BE fallback (research.py)
   || narrations[stage]                 ← P1 parent card phase narrations
   || generatingFallback                ← "ChatGPT working — fetching live activity..."
   || ""
 ```
 
-**Display chain on the P1 parent card (FE, PhaseDropdown.tsx:889-890):**
+**Display chain on the P1 parent card (FE, `PhaseDropdown.tsx`):**
 ```
 agentNarrationText || fallbackNarratives[stage]
 ```
@@ -185,7 +193,7 @@ agentNarrationText || fallbackNarratives[stage]
 
 Manual-brief mode (Flow A in FE) waits indefinitely for the user to send their own brief into the chat. Pre-04-30, a never-finished brief left the pipeline wedged forever.
 
-- `_BRIEF_WAIT_BACKSTOP_S = 3 * 3600` (research.py:17174). After 3h with no manual brief, `fail_phase` fires + emits `pipeline_stopped` with `reason="manual_brief_wait_backstop_3h"`.
+- `_BRIEF_WAIT_BACKSTOP_S = 3 * 3600` (research.py). After 3h with no manual brief, `fail_phase` fires + emits `pipeline_stopped` with `reason="manual_brief_wait_backstop_3h"`.
 - FE renders the stopped-by-watchdog status with the same humanized "Manual brief never arrived" message.
 
 ## Browser Crash Auto-Retry (2026-04-30 `be8f7b3`)
@@ -226,7 +234,7 @@ No human-decision wait. FE narration line surfaces the auto-skip via the existin
 
 ## Dead-Tab Guard (2026-04-30 `6545335`)
 
-Before soft-retrying a Phase 2 agent (research.py:10380):
+Before soft-retrying a Phase 2 agent (research.py):
 
 ```
 if hard_failure_count >= 2:
@@ -241,7 +249,7 @@ Prevents soft-retrying a corpse forever — soft-retry on a dead page just re-fa
 
 ## NotebookLM Upload Filter (2026-04-30 `70e2ab2`)
 
-`_DERIVED_STEMS = {"brief", "consolidated"}` (research.py:14627). Phase 3 NotebookLM upload now skips files whose stem matches `_DERIVED_STEMS` — never uploads `consolidated.md` (a P2 byproduct of claude+gemini concatenation, used for the Documents page only) or `brief.md` (Phase 1 input, already implicit in the agent reports). Pre-fix, the scan-fallback loop picked these up as duplicate sources.
+`_DERIVED_STEMS = {"brief", "consolidated"}` (research.py). Phase 3 NotebookLM upload now skips files whose stem matches `_DERIVED_STEMS` — never uploads `consolidated.md` (a P2 byproduct of claude+gemini concatenation, used for the Documents page only) or `brief.md` (Phase 1 input, already implicit in the agent reports). Pre-fix, the scan-fallback loop picked these up as duplicate sources.
 
 ## NotebookLM Strict-Keep Cleanup (`a52bd7b`, `2a93af0`)
 
@@ -267,11 +275,13 @@ return await run_pipeline(
 )
 ```
 
-(research.py:18006). Pre-fix, the recursive call dropped `uid/research_id/run_id`, severing the Firestore listener mid-retry. FE saw the run flatline despite BE still running.
+(research.py). Pre-fix, the recursive call dropped `uid/research_id/run_id`, severing the Firestore listener mid-retry. FE saw the run flatline despite BE still running.
 
 ## Phase 5 — FE-owned
 
-Phase 5 (Google Doc creation + email delivery) is owned by the frontend. After P4 success, the FE picks up all accumulated links from the `pipeline_events` Firestore subcollection, creates the Doc via the Docs API, sends the email via Resend, and emits its own `phase_complete phase=5` event so the P5 dropdown populates uniformly with every other phase. BE has no Doc/email code path. See FE README + ARCHITECTURE for details on that side.
+Phase 5 (Google Doc creation + email delivery) is owned by the frontend. After P4 success the FE mints a durable snapshot page for each document this run produced, builds the Doc from those, sends the email via Resend, and emits its own `phase_complete phase=5` so the P5 dropdown populates like every other phase. BE has no Doc/email code path.
+
+⛔ **2026-09-03, step 6 — this said the app "picks up all accumulated links" from the events subcollection.** It does not, and believing it did is what let an unvalidated write into the `links.{kind}` map look like the documented way to get something into a delivered document. The Doc's report sections come from the minted snapshot pages, falling back to an in-app deep link; the keyed `links` map supplies only the notebook, audio and video rows; the user's own pasted links come from `userSources`. See FE README + ARCHITECTURE for details on that side.
 
 ## Lint + CI gates
 
@@ -627,7 +637,7 @@ Frontend writes commands to `users/{uid}/research_commands/{researchId}` (or equ
 | `add_context` | `{text}` | Queues text for the running phase. **P1/P2 only**; rejected at listener when `phase >= 3` with a `pipeline_warning`. Behavior: |
 |  |  | • **Running, not paused** — dispatcher pastes text into active agent chats |
 |  |  | • **Paused** — on resume, `peek_extra_context()` sets `restart_requested=True`, current phase reruns with combined topic/brief (up to 3× per phase) |
-| `agent_decision` | `{agent, decision: "retry" \| "skip" \| "stop"}` | Frontend response to `agent_link_failed` modal. Retry loops back to extraction; Skip records best-effort unverified URL and moves on; Stop terminates pipeline |
+| `agent_decision` | `{agent, decision: "retry" \| "skip" \| "stop" \| "continue_chat"}` | Response to the agent's failure card. **Retry** nudges the agent and resumes polling — it does not loop back to extraction, there is none. **Skip** salvages whatever partial text exists and closes the tab; it records no URL. **Stop** terminates. `continue_chat` is a fourth value the dispatcher accepts and this row omitted |
 | `continue_anyway` | `{phase?}` | Frontend response to a `phase_alert` that exposed `continue_anyway` (e.g. brief-short). Backend `_controls.set_continue_anyway()` fires; orchestrator accepts the short/partial output and advances |
 | `skip_phase` | `{phase}` | Frontend's default Skip action on every `phase_alert`. Backend's phase coroutine consumes the request and advances past the failing step. For Phase 4, this replaces the old `skip_phase` verb (removed U2); Phase 5 likewise replaces `skip_phase`. `_controls.skip_phase` / `skip_phase` flags remain as internal-only state read by Phase 4/5 polling logic, but no FE command toggles them anymore |
 | `feedback` | `{phase, message}` | User feedback injection. Stored per-phase, injected into next phase rerun |
@@ -658,7 +668,7 @@ Frontend writes commands to `users/{uid}/research_commands/{researchId}` (or equ
 
 > **CLI dispatcher pause-reason routing (DGOPS-7710 / F6 + 3 follow-ups)** — same root pattern surfaces on the CLI side. When an alert pauses with a `pause_reason` (`agent_link_failed`, `human_verification_required`, `cua_unavailable`, `claude_chat_mode`, `login_required`, `pro_required`), the CLI `r` / `s` keystrokes route to the correct alert-specific helpers (`set_agent_decision`, `set_continue_anyway`, `request_skip_agent`, `request_skip_init_verify`) **plus** `request_resume`. Before the fix, `r` only called `request_resume` and the consume site defaulted user-intended "retry" to silent "skip".
 
-> New consumers wired via `_controls.request_*` + `consume_*` methods; `reset()` clears them on run start. `await_retry_or_continue()`, `await_agent_decision()`, `await_stuck_decision()` are the helper coroutines that Phase N loops block on before branching.
+> New consumers wired via `_controls.request_*` + `consume_*` methods; `reset()` clears them on run start. ⛔ **2026-09-03, step 6 — this named three blocking helpers and got all three wrong.** `await_stuck_decision` has never existed anywhere in the repository; `await_retry_or_continue` has no callers; `await_agent_decision` survives on exactly one, the 90-second send-button fallback. The real blocking gate is **`await_phase_decision`** (24-hour default), which this line did not mention.
 
 ---
 
@@ -668,29 +678,64 @@ When a user adds context while paused and then resumes, the **current phase reru
 
 | Case | Detection site | Mechanism |
 |------|---------------|-----------|
-| **P1 mid-phase** | `poll_until_done:3377` — after `wait_if_paused()` returns, checks `peek_extra_context()` | Sets `_runtime.restart_requested = True`, returns False. Phase 1 orchestrator retry loop (6744-6755) catches flag, pops context, merges into `topic`, reruns `run_phase1`. Cap 3× |
-| **P1 boundary** | Line 6805 after Phase 1 finishes — `is_stop_or_pause()` true | `pause_and_close_browser` → on resume, line 6833 pops queue directly → rebuilds `combined_topic` → calls `run_phase1` once inline |
-| **P2 mid-phase** | Same as P1 plus round-robin:3632 | Phase 2 orchestrator retry loop (6886-6898). Context appended to `research_brief`. Cap 3× |
-| **P2 boundary** | Line 7066 after Phase 2 finishes — `is_stop_or_pause()` true | Line 7101 pops queue inline, builds `combined_brief`, calls `run_phase2` once |
+| **P1 mid-phase** | `poll_until_done` — after `wait_if_paused()` returns, checks `peek_extra_context()` | Sets `_runtime.restart_requested = True`, returns False. The Phase 1 orchestrator retry loop catches the flag, pops context, merges into `topic`, reruns `run_phase1`. Cap 3× |
+| **P1 boundary** | After Phase 1 finishes — `is_stop_or_pause()` true | `pause_and_close_browser` → on resume, that site pops queue directly → rebuilds `combined_topic` → calls `run_phase1` once inline |
+| **P2 mid-phase** | Same as P1, plus the round-robin poller | The Phase 2 orchestrator retry loop. Context appended to `research_brief`. Cap 3× |
+| **P2 boundary** | After Phase 2 finishes — `is_stop_or_pause()` true | Pops the queue inline, builds `combined_brief`, calls `run_phase2` once |
 
 **No input during pause** → queue empty → flag never trips → phase continues from where it stopped.
 
 ---
 
-## Agent Link Gate (B1)
+## Agent completion gate
 
-Phase 2 agents are declared "done" only when BOTH conditions are met:
-1. **Content extracted** — at least 100 chars of research text
-2. **Verified public link** — shareable URL passes `validate_link()` (platform-specific patterns)
+⛔⛔ **THIS SECTION WAS CALLED "Agent Link Gate (B1)" AND EVERY LINE OF IT WAS
+FALSE — 2026-09-03, stretch 7.5 step 6.** It described a gate requiring a
+shareable link to pass validation before an agent could be declared done. Not
+only is that not the gate, it is **unsatisfiable by construction**: the
+validator table holds three entries — `notebooklm`, `youtube`, `gdocs` — and
+rejects every platform it does not know, so it answers *no* for `chatgpt`,
+`gemini` and `claude`, always. **Anyone restoring the behaviour written here
+would ship a pipeline in which no research agent ever completes.** The section
+is kept, corrected, rather than deleted, because five in-code comments were
+written from it and the fear of removing link code came from this page.
 
-`extract_with_retry()` attempts link extraction **3 times** with `validate_link` in between. On final failure:
-- Emits `agent_link_failed` with `{agent, attempts, lastError}`
-- Pauses via `wait_for_agent_decision()`
-- Waits for frontend's `agent_decision` command (retry / skip / stop)
+A Phase 2 agent is declared done when **all three** hold:
+1. **Its markdown is non-empty** — greater than zero characters, not 100.
+2. **The run has a research anchor** — without one there is no document address
+   to hand the app.
+3. **The Firestore document write succeeded** — so the app can find what it is
+   being told about.
 
-**Gemini safeguard:** CUA completion checks don't begin until after "Start research" is clicked. If <3 sources and <2000 chars early in the run, the "done" verdict is reverted.
+No link is consulted. What the agent emits on success is a link to the report's
+page **in our own app**, always marked verified, and it is emitted under the
+same gate — the announcement and the link are one decision, not two.
 
-**Claude safeguard:** If <2 artifacts exist before 80% of max wait time, completion is reverted (first artifact is often a plan, not the final report).
+**How the app decides to show a tick:** it reads that agent's own document, by
+type, and checks the content is non-empty. It does not read a link, and it does
+not read `verified`. See the app's `docContentReadyForType`.
+
+**On failure** there is no pause. The one live producer of `agent_link_failed`
+is the Claude safeguard below; it **parks** the agent non-blockingly with a 300
+second timeout and the round-robin keeps polling the other two.
+
+**Gemini safeguard:** CUA completion checks don't begin until after "Start
+research" is clicked. If <3 sources and <2000 chars early in the run, the "done"
+verdict is reverted.
+
+**Claude safeguard:** if fewer than 2 artifacts exist at 80% of the maximum wait,
+completion is reverted — the first artifact is usually the plan and sources, not
+the report. ⚠ A modern-completion-marker check added 2026-04-26 accepts a
+one-artifact layout outright and bypasses both this and the Gemini gate.
+
+⛔ **`extract_with_retry` IS NOT PART OF THIS.** It is a Phase 3 helper with one
+caller — the NotebookLM notebook link — and it is where `link_extracting`,
+`link_extract_retry` and `link_extraction_failed` come from. Phase 2 has had no
+link-extraction retry loop since the extraction was removed on 2026-08-28.
+
+⛔ **`wait_for_agent_decision` IS NOT THE PAUSE PATH.** It has no production
+caller at all; the live route is `poll_agent_decision` into
+`_resolve_parked_agent_decision`.
 
 ---
 
@@ -744,9 +789,9 @@ The agent-level action set was consolidated to reduce noise:
 
 ## Retry / Continue / Skip Decision Gates
 
-Every recoverable failure offers at least one explicit choice via `phase_alert.actions`. Legacy gates block on a per-gate coroutine (`await_retry_or_continue`, `await_agent_decision`, `await_stuck_decision`) until the user responds (Firestore command) or a bounded timeout elapses (caller picks a safe default).
+Every recoverable failure offers at least one explicit choice via `phase_alert.actions`. Blocking gates wait on `await_phase_decision` (24-hour default) until the user responds via a Firestore command or a bounded timeout elapses, at which point the caller picks a safe default. ⛔ 2026-09-03, step 6 — this line named `await_retry_or_continue`, `await_agent_decision` and `await_stuck_decision` as the gates. The third has never existed, the first has no callers, and the second is down to a single send-button fallback.
 
-**Intent catalog + non-blocking decisions (#955).** Alerts are now authored through a single seam, `emit_decision` (research.py ~14421), over an `ALERT_INTENTS` catalog (~14173). Each decision carries a **recoverability class** — `recoverable` / `hands_off` / `blocker` / `infra` — a `decision_id`, and (when auto-skippable) a deadline; `_alert_actions_for` derives the action tokens and distinct `alert_id`s per intent (login/HV/link/brief/pro_required/chat_mode/crash/cua_unavailable/env-check/soft-warn), with an async best-effort AI copy-sharpen for vague cards. **P2 setup gates are non-blocking**: HV (#1b), `pro_required` (#1a) and `chat_mode` (#1c) are send-before-decision and no longer pause the pipeline — P2 dropped the blocking `wait_for_verification_clearance`/600s tier-5 poll (research.py:34786-34803 → `hv_blocked` + `_hv_setup_fail_card`; the shared blocking wait now runs only for P1/P5's single-surface path). A **non-blocking parked-decision resolver** (#953) means one agent's card never freezes the round-robin; every alert **auto-resumes** on resolve. The auto-skip **deadline lifecycle** is arm → fire → disarm (`HANDS_OFF_AUTO_SKIP_SEC=300` for hands-off walls). A **command-ack** emitted at dispatcher intake lets the FE re-enable a tapped button promptly. Silent self-heals (no card): Gemini lost-send adopt-first + one-Retry reconnect; transient Anthropic errors retry before escalating; a must-act Anthropic `blocker` is never swallowed into a retry banner.
+**Intent catalog + non-blocking decisions (#955).** Alerts are now authored through a single seam, `emit_decision`, over an `ALERT_INTENTS` catalog. Each decision carries a **recoverability class** — `recoverable` / `hands_off` / `blocker` / `infra` — a `decision_id`, and (when auto-skippable) a deadline; `_alert_actions_for` derives the action tokens and distinct `alert_id`s per intent (login/HV/link/brief/pro_required/chat_mode/crash/cua_unavailable/env-check/soft-warn), with an async best-effort AI copy-sharpen for vague cards. **P2 setup gates are non-blocking**: HV (#1b), `pro_required` (#1a) and `chat_mode` (#1c) are send-before-decision and no longer pause the pipeline — P2 dropped the blocking `wait_for_verification_clearance`/600s tier-5 poll (research.py → `hv_blocked` + `_hv_setup_fail_card`; the shared blocking wait now runs only for P1/P5's single-surface path). A **non-blocking parked-decision resolver** (#953) means one agent's card never freezes the round-robin; every alert **auto-resumes** on resolve. The auto-skip **deadline lifecycle** is arm → fire → disarm (`HANDS_OFF_AUTO_SKIP_SEC=300` for hands-off walls). A **command-ack** emitted at dispatcher intake lets the FE re-enable a tapped button promptly. Silent self-heals (no card): Gemini lost-send adopt-first + one-Retry reconnect; transient Anthropic errors retry before escalating; a must-act Anthropic `blocker` is never swallowed into a retry banner.
 
 **Phase-level gates (block current phase):**
 
@@ -813,7 +858,7 @@ Checkpoints that survive the crash, all under `queues/{run}/`: `documents/*.md`,
 
 Unified per-(op, agent) attempt tracking for retry/escalation across BE operations. Replaces ad-hoc tier_transition emits with the centralized `emit_tier_transition()` helper.
 
-**TierEscalation class** (`research.py:2580+`) — one record per (`op`, `agent`) pair, with a 30-min sliding window:
+**TierEscalation class** (`research.py`) — one record per (`op`, `agent`) pair, with a 30-min sliding window:
 - `attempts: {T0, T1, T2, T3}` — counters bucketed by tier label
 - `window_start: float` — counters auto-reset after `_TIER_WINDOW_SEC = 1800`
 - `history: list[{tier, ts_ms, reason, attempt}]` — bounded at 50 entries
@@ -851,7 +896,7 @@ Unified per-(op, agent) attempt tracking for retry/escalation across BE operatio
 
 ## Backend Liveness (Heartbeat + Watchdog)
 
-Backend writes `lastHeartbeat = serverTimestamp()` every **5s** (`HEARTBEAT_INTERVAL_SEC` constant, research.py:2529) to both `research_tokens/{token}` (legacy) and `devices/{deviceId}` (modern, payload also includes `workerCount` + `currentRunId` + `status` + `pollSecretHash`). FE offline threshold = **30s** (`DEVICE_OFFLINE_THRESHOLD_MS`) → six missed ticks flip the device dot red. On long-waits (polling Deep Research for 25+ min) the pipeline ALSO emits a `heartbeat` event so legitimate quiet periods stay green on the per-phase liveness watchdog (FE T1/T2 — see web/ARCHITECTURE.md).
+Backend writes `lastHeartbeat = serverTimestamp()` every **5s** (`HEARTBEAT_INTERVAL_SEC` constant, research.py) to both `research_tokens/{token}` (legacy) and `devices/{deviceId}` (modern, payload also includes `workerCount` + `currentRunId` + `status` + `pollSecretHash`). FE offline threshold = **30s** (`DEVICE_OFFLINE_THRESHOLD_MS`) → six missed ticks flip the device dot red. On long-waits (polling Deep Research for 25+ min) the pipeline ALSO emits a `heartbeat` event so legitimate quiet periods stay green on the per-phase liveness watchdog (FE T1/T2 — see web/ARCHITECTURE.md).
 
 Frontend watchdog: if `lastHeartbeat` is stale >60s AND recent events are stale >60s, pipeline is considered dead. Frontend:
 1. `cancelRunningPhases` — freezes running tile timers, flips badges to "stopped"
@@ -868,9 +913,9 @@ Emits a chat notification: *"Backend disconnected during Phase N (no heartbeat f
 
 *Updated: 2026-04-19 — **Sequential Phase 0 verification** (one platform at a time — cookie → tab-open → CUA → `login_required` scoped to that platform; matches `--setup` script's walk). **Cookie-only per-phase login probe** (runs on every phase regardless of `skipInitVerify`; `cookie_login_hit` read only, no tabs/CUA; catches mid-run session drift). **`phase_narration` event** (Gemini 2.5 Pro narrator emits one human-readable sentence every ~45s during active phases; frontend `/api/narrate` fallback fills >15s gaps with speculative "Likely: …" entries). Frontend stack: `phaseNarrations` store slice + `<PhaseNarrationLine>` + `useNarrationFallback` hook, budget-capped at 20 fallback calls per run.*
 
-*Updated: 2026-04-19 (late-late) — **Phase 2 per-agent extraction rules**: ChatGPT keeps public-share-then-conversation-URL fallback; Gemini + Claude PUBLIC share ONLY, hard-fail on miss. Explicit `[gemini_extractor] method=X result=Y` logs; `link_extracted` per agent the moment a verified link lands. **Claude 2-artifact hard-fail** at ≥80% wait time. **Tab round-robin**: `agent_loop(target_page=None)` + `_anchored_screenshot()`; `bring_to_front()` before every polling tick + after every `execute_action`. **Playwright Claude setup**: `setup_claude_dr` rewritten as 3 Playwright steps (Opus 4.7 dropdown *(Opus 4.7 at the time; current Claude P2 model is Opus 4.8)*, Adaptive Thinking, Research tool) — no more CUA vision for setup. **Normalized error matrix**: default Retry · Skip everywhere; Phase 2 workspace cap → End research only; Phase 2 poll timeout → Retry · Skip · Wait; removed Poke + "Proceed without CUA"; stuck-agent relabeled Retry/Wait/Skip. **New `agent_narration` event**: per-agent Gemini 2.5 Pro call, ~6s cadence during P1/P2. Backend commit `547bf17`.*
+*Updated: 2026-04-19 (late-late) — ⛔⛔ **THE PHASE 2 EXTRACTION RULES IN THIS ENTRY WERE SUPERSEDED ON 2026-08-28 AND THE ENTRY WAS NEVER RETRACTED.** It described ChatGPT keeping a public-share-then-conversation-URL fallback, Gemini and Claude hard-failing on a missing public share, and a per-agent emit the moment a verified link landed. Every artifact it names is gone: the three platform extractors, the share-authority table, the CUA fallback and the `gemini_extractor` logs all return zero hits. Phase 2 publishes a link to the report's page in our own app and never touches a platform share. The rest of this entry still holds. **Claude 2-artifact hard-fail** at ≥80% wait time. **Tab round-robin**: `agent_loop(target_page=None)` + `_anchored_screenshot()`; `bring_to_front()` before every polling tick + after every `execute_action`. **Playwright Claude setup**: `setup_claude_dr` rewritten as 3 Playwright steps (Opus 4.7 dropdown *(Opus 4.7 at the time; current Claude P2 model is Opus 4.8)*, Adaptive Thinking, Research tool) — no more CUA vision for setup. **Normalized error matrix**: default Retry · Skip everywhere; Phase 2 workspace cap → End research only; Phase 2 poll timeout → Retry · Skip · Wait; removed Poke + "Proceed without CUA"; stuck-agent relabeled Retry/Wait/Skip. **New `agent_narration` event**: per-agent Gemini 2.5 Pro call, ~6s cadence during P1/P2. Backend commit `547bf17`.*
 
-*Updated: 2026-04-30 — **Narration consolidation** (commit `94b7bde`): retired vision narrator (`narrate.py` PHASE_BUDGET=0 default; `DG_VISION_NARRATE=1` re-enables). Per-agent narrator brain swap: Gemini Pro 2.5 → Anthropic Haiku 4.5 primary with Gemini 2.5 Flash fallback (`DG_NARRATOR_USE_HAIKU` / `DG_NARRATOR_HAIKU_MODEL` envs). Tighter anti-parrot prompt (research.py:5904-5933) + chrome scrub on narrator inputs (research.py:5550-5625) — strips `You said:` / `Claude responded:` / `Gemini said` / `brief.md` / `Building:`-prefix composites BEFORE narrator sees them; scrape outputs untouched. Claude DOM scrape: dropped `.font-claude-message` + `.contents` heading selectors (research.py:7116-7124). ChatGPT P2 walker: dropped `[class*="row" i]`; added 23-verb VERB_GATE + min-len 4→12 (research.py:7979-7984). **P1 ET fallback** (`86d0ab4`): dropped duplicate elapsed-time bit at research.py:9601-9604 — parent card already shows elapsed. **Stuck-state risk fixes** (`6545335`): manual brief 3h backstop (`_BRIEF_WAIT_BACKSTOP_S`); pending queue persist-failure surfaces `paused_backend_restart_failed` status; dead-tab guard before soft retry at research.py:10380. **Browser crash + P2 timeout** (`be8f7b3`): always-auto, no human prompt — browser crash emits passive `emit_browser_recovery_status` banner + bypasses run_pipeline.finally retry guard; P2 agent timeout drops alert + `await_agent_decision`, saves partial if ≥200 chars and auto-skips. **NotebookLM derived-stems filter** (`70e2ab2`): `_DERIVED_STEMS = {"brief", "consolidated"}` excluded — never uploads consolidated.md. **Auto-retry kwarg forwarding** (`549f079`): forward `uid/research_id/run_id` on retry recursion (research.py:18006) so Firestore listener stays attached. **Doc upload wiring** (`8a05227`): P1/P2 attach + Flow B unblock; `attach_brief_file` extended with `extra_files` for multi-file `set_input_files`. **P2 ChatGPT** (`bf66c9d`): continuous activity-panel scrape mirroring Claude artifact pattern. **patchright** added to `requirements.txt` (`221394d`).*
+*Updated: 2026-04-30 — **Narration consolidation** (commit `94b7bde`): retired vision narrator (`narrate.py` PHASE_BUDGET=0 default; `DG_VISION_NARRATE=1` re-enables). Per-agent narrator brain swap: Gemini Pro 2.5 → Anthropic Haiku 4.5 primary with Gemini 2.5 Flash fallback (`DG_NARRATOR_USE_HAIKU` / `DG_NARRATOR_HAIKU_MODEL` envs). Tighter anti-parrot prompt (research.py) + chrome scrub on narrator inputs (research.py) — strips `You said:` / `Claude responded:` / `Gemini said` / `brief.md` / `Building:`-prefix composites BEFORE narrator sees them; scrape outputs untouched. Claude DOM scrape: dropped `.font-claude-message` + `.contents` heading selectors (research.py). ChatGPT P2 walker: dropped `[class*="row" i]`; added 23-verb VERB_GATE + min-len 4→12 (research.py). **P1 ET fallback** (`86d0ab4`): dropped duplicate elapsed-time bit in the P1 ET fallback — the parent card already shows elapsed. **Stuck-state risk fixes** (`6545335`): manual brief 3h backstop (`_BRIEF_WAIT_BACKSTOP_S`); pending queue persist-failure surfaces `paused_backend_restart_failed` status; dead-tab guard before soft retry. **Browser crash + P2 timeout** (`be8f7b3`): always-auto, no human prompt — browser crash emits passive `emit_browser_recovery_status` banner + bypasses run_pipeline.finally retry guard; P2 agent timeout drops alert + `await_agent_decision`, saves partial if ≥200 chars and auto-skips. **NotebookLM derived-stems filter** (`70e2ab2`): `_DERIVED_STEMS = {"brief", "consolidated"}` excluded — never uploads consolidated.md. **Auto-retry kwarg forwarding** (`549f079`): forward `uid/research_id/run_id` on retry recursion (research.py) so Firestore listener stays attached. **Doc upload wiring** (`8a05227`): P1/P2 attach + Flow B unblock; `attach_brief_file` extended with `extra_files` for multi-file `set_input_files`. **P2 ChatGPT** (`bf66c9d`): continuous activity-panel scrape mirroring Claude artifact pattern. **patchright** added to `requirements.txt` (`221394d`).*
 
 *Updated: 2026-05-18 (final) — **Cross-platform supervisor gate retired (PR3)**: `DG_ALLOW_CROSS_PLATFORM=1` env-flag gate dropped from `_supervisor_platform()`. macOS launchd + Linux systemd-user are first-class supported supervisors alongside the Windows Scheduled Task; no env flag required. Linux smoke caught + fixed two latent bugs (`creationflags` POSIX ValueError in `run_daemon_loop`, `--unpair` browser-profile catch-22 with F4 cookie check). Gate-drop sweep removed all "experimental" / "PR1 PR2 merged" / "PR3 pending" framing from CLI messages + section comments + README + ARCHITECTURE so `--resurrect` / `--retire` / `--unpair` on Mac+Linux read as first-class verbs. `_supervisor_platform()` now returns `Windows` / `Darwin` / `Linux` / `Unsupported` with no env check.*
 
@@ -880,4 +925,37 @@ Emits a chat notification: *"Backend disconnected during Phase N (no heartbeat f
 
 *Updated: 2026-05-22 — **Multi-account queue + multi-worker validation (5-fire E2E)**. Five new BE commits shipped + validated by an owner-owner-sharer-sharer-owner 5-fire test on workerCount=2: `c362126` real-time renumber for Firestore-deferred docs (`_recompute_deferred_queue_positions`); `bcc4f84` deferred-cancel scan+delete+recompute + pre-claim status re-check (cross-worker race guard); `41d0a27` FIFO sort by Firestore `submittedAt` server timestamp (clock-skew immune, with client `timestamp` legacy fallback); `f744913` HARD_RESET sweep extension across sharer trees; `2314f84` device-wide FIFO position numbering on defer + claim. New ARCHITECTURE sections: "Multi-Worker Architecture" (per-worker safety guards, log prefix convention, HARD_RESET fan-out semantics), "Queue Position Invariants" (four BE rules covering FIFO sort + real-time renumber + cancel + worker-count gating), device-scoped commands table (`hard_reset`, `clear_local_storage`). Backend Liveness section corrected: heartbeat cadence 30s → 5s, FE offline threshold 30s. Safe-push tag `safe-push/2026-05-22-multi-account-queue-flow` pinned on both repos at validated HEADs.*
 
-*Updated: 2026-05-18 — **Pair flow renumbered 4 → 5 stages** (commit `ec34481`): new Stage 4/5 = API-key detect-or-prompt for Anthropic + Gemini. Detects via `resolve_api_key()` / `resolve_gemini_api_key()`; if any source resolves (Firestore / Windows user-scope / shell rc / `.dg-supervisor.env`), the prompt is skipped. On paste: writes Firestore `users/{uid}/settings/prefs.apiKeys.<name>` (merge — same path FE Account page writes) + `os.environ` (both var names per key) + busts `_RESOLVED_KEY_CACHE`. Skip first-class per key. Helpers `_save_api_key_to_firestore` / `_pair_prompt_one_key` / `_pair_prompt_api_keys` live just before `run_pair`. **Claude P2 clarification auto-reply** (commit `897353f`): new 5-condition detector in `poll_all_agents_round_robin` per-tick. When user submits a vague brief and Claude responds with chat-text clarifying questions ending with the "Once you ... I'll launch the research" sign-off (matched by `_CLAUDE_CLARIFICATION_SIGNOFF_RE`), the loop auto-types `"Up to Claude to decide for the best output."` + Send-button (Enter fallback) so the agent proceeds without operator intervention. One-shot per agent via `claude_clarification_replied` flag; resets `start_time` / `last_heartbeat` / `last_growth_time` / `stuck_warned_at` / `last_artifact_scrape` after firing. **Dispatcher resume-contract** (commit `1d0366b`): all 8 Firestore command-action handlers that lacked explicit `_controls.request_resume()` now have it (`skip_init_verify` / `retry_init_verify` / `skip_agent` / `retry_agent` / `continue_partial_agent` / `poke_agent` / `wait_longer_agent` / `continue_anyway`). `request_resume()` also clears `pause_reason` + `pause_target_agent` (per-action helpers don't) — closes a state-leak class. Static-analysis test `tests/test_dispatcher_resume_contract.py` enforces the rule. Mirrors the F6 (`f7aa842`) + 3 pre-existing CLI bug fix pattern (`79d6f7e` — `agent_link_failed` / `human_verification_required` / `cua_unavailable`). **Cross-platform supervisor (Track C, code-shipped, smoke-pending)**: macOS launchd (PR1 `bebe4fa`) + Linux systemd-user (PR2 `feature/track-c-pr2-linux`) gated behind `DG_ALLOW_CROSS_PLATFORM=1`. Env-file pivot (PR-Env `fc944a0`) decoupled Track C from Track B. PR3 (drop gate) pending real-hardware smoke verification. Dispatcher `_supervisor_platform()` routes between Windows Scheduled Task / launchd plist / systemd-user unit. Dead `_heartbeat_task = None` removed at research.py:1295 (commit `bce1e90`). `tests/fixtures/vision/auto/` added to `.gitignore`.*
+*Updated: 2026-05-18 — **Pair flow renumbered 4 → 5 stages** (commit `ec34481`): new Stage 4/5 = API-key detect-or-prompt for Anthropic + Gemini. Detects via `resolve_api_key()` / `resolve_gemini_api_key()`; if any source resolves (Firestore / Windows user-scope / shell rc / `.dg-supervisor.env`), the prompt is skipped. On paste: writes Firestore `users/{uid}/settings/prefs.apiKeys.<name>` (merge — same path FE Account page writes) + `os.environ` (both var names per key) + busts `_RESOLVED_KEY_CACHE`. Skip first-class per key. Helpers `_save_api_key_to_firestore` / `_pair_prompt_one_key` / `_pair_prompt_api_keys` live just before `run_pair`. **Claude P2 clarification auto-reply** (commit `897353f`): new 5-condition detector in `poll_all_agents_round_robin` per-tick. When user submits a vague brief and Claude responds with chat-text clarifying questions ending with the "Once you ... I'll launch the research" sign-off (matched by `_CLAUDE_CLARIFICATION_SIGNOFF_RE`), the loop auto-types `"Up to Claude to decide for the best output."` + Send-button (Enter fallback) so the agent proceeds without operator intervention. One-shot per agent via `claude_clarification_replied` flag; resets `start_time` / `last_heartbeat` / `last_growth_time` / `stuck_warned_at` / `last_artifact_scrape` after firing. **Dispatcher resume-contract** (commit `1d0366b`): all 8 Firestore command-action handlers that lacked explicit `_controls.request_resume()` now have it (`skip_init_verify` / `retry_init_verify` / `skip_agent` / `retry_agent` / `continue_partial_agent` / `poke_agent` / `wait_longer_agent` / `continue_anyway`). `request_resume()` also clears `pause_reason` + `pause_target_agent` (per-action helpers don't) — closes a state-leak class. Static-analysis test `tests/test_dispatcher_resume_contract.py` enforces the rule. Mirrors the F6 (`f7aa842`) + 3 pre-existing CLI bug fix pattern (`79d6f7e` — `agent_link_failed` / `human_verification_required` / `cua_unavailable`). **Cross-platform supervisor (Track C, code-shipped, smoke-pending)**: macOS launchd (PR1 `bebe4fa`) + Linux systemd-user (PR2 `feature/track-c-pr2-linux`) gated behind `DG_ALLOW_CROSS_PLATFORM=1`. Env-file pivot (PR-Env `fc944a0`) decoupled Track C from Track B. PR3 (drop gate) pending real-hardware smoke verification. Dispatcher `_supervisor_platform()` routes between Windows Scheduled Task / launchd plist / systemd-user unit. Dead `_heartbeat_task = None` removed at research.py (commit `bce1e90`). `tests/fixtures/vision/auto/` added to `.gitignore`.*
+
+---
+
+*Updated: 2026-09-03 (stretch 7.5) — **THE LINK WORK, WHICH THIS DOCUMENT HAD NOT RECORDED AT ALL.**
+Six steps across 2026-09-02/03. What an editor of this file most needs to know:*
+
+- ***An agent's private conversation address never leaves this machine.*** *It is still captured, and
+  it has exactly one job: reattaching to that agent's tab after a pause. It is not published, not
+  mirrored to the delivery file, not sent to the app, and not written to a log in full — the two log
+  lines that need to identify a tab print host, path shape and a short digest of the whole address
+  via `redacted_chat_url`.*
+- ***⛔⛔ THE PAUSE EVENT AND THE PAUSE CHECKPOINT DELIBERATELY CARRY DIFFERENT THINGS, AND UNDOING
+  THAT REOPENS A LEAK.*** *`PipelineRuntime.snapshot()` is what goes to disk;
+  `snapshot_for_app()` is the same thing minus `_SNAPSHOT_LOCAL_ONLY`, and it is what rides the
+  `pipeline_paused` event. The excluded key is the reattachment map. It matters because the event is
+  kept for 30 days in Firestore and the follow-up chat's recent-events tool hands whole event
+  documents to a model — so every paused run used to put all three agents' conversation addresses
+  into a model's context. Two separate methods, rather than an edit to one, precisely so this cannot
+  be undone by accident.*
+- ***Where a report's link comes from now:*** *`in_app_document_url(kind)` — one answer, previously
+  written out by hand at four sites which had already drifted. Without a research id it returns the
+  bare Documents page rather than inventing an anchor, so callers needing a specific target test the
+  id themselves.*
+- ***The `links.{kind}` aggregate.*** *Writable kinds are `brief`, `notebooklm`, `audio`,
+  `audio_file`, `youtube`, `video`. ⛔ `chatgpt` / `gemini` / `claude` were retired on 2026-08-28;
+  the app filters those three slots on READ because old records hold conversation addresses in them,
+  and it filters rather than ignores because the retired writer stored genuine share pages for most
+  of its life. ⛔ `update_link_in_firestore` validates nothing — callers arriving through
+  `emit_validated_link` are checked, the two direct callers are not.*
+- ***The identity check is content-based.*** *Whether a conversation is ours is decided by what is in
+  it, not by decoding a timestamp out of its address. The rule over the whole stretch: nothing may
+  depend on the shape of a web address.*
+

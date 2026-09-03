@@ -20639,10 +20639,15 @@ def emit_validated_link(phase: int, agent: str, url: str, label: str, link_kind:
 class LinkResult:
     """Result of a link extraction attempt.
 
-    cua_attempted: True if the extractor's internal CUA fallback ran. Lets
-    callers (extract_and_record_agent Step 4b) skip a SECOND CUA pass on
-    the same UI surface when the first already had a turn — avoids
-    wonky-modal misclicks on share dialogs (caused Gemini tab spam).
+    cua_attempted: True if the extractor's internal CUA fallback ran. Lets a
+    caller skip a SECOND CUA pass on the same UI surface when the first already
+    had a turn — avoids wonky-modal misclicks on share dialogs.
+
+    ⛔ 2026-09-03, step 6 — this named `extract_and_record_agent` Step 4b as the
+    caller that benefits. That function has no Step 4b any more, and no phase-2
+    caller of this class survives at all: the only link extraction left in the
+    pipeline is phase 3's NotebookLM notebook link. The class is a phase-3 type
+    now, and the Gemini tab spam it mentions belongs to a removed extractor.
     """
     __slots__ = ("url", "label", "platform", "verified", "error", "cua_attempted")
 
@@ -21365,10 +21370,23 @@ async def wait_for_agent_decision(agent: str, reason: str, phase: int = 2,
                                    options=("retry", "skip")) -> str:
     """Emit agent_link_failed, pause pipeline, wait for user's decision.
     Returns 'retry' | 'skip' — and may return 'stop' if the user hit Stop
-    from the chat input bar while the banner was up (caught via
-    _controls.is_stop()). The banner itself no longer offers Stop as a
+    from the chat input bar while the card was up (caught via
+    _controls.is_stop()). The card itself no longer offers Stop as a
     button; pipeline-level stop lives in the chat bar only (2026-04-19
-    design rule applied to AgentAlertPanel)."""
+    design rule).
+
+    ⛔⛔ 2026-09-03, stretch 7.5 step 6 — NOTHING IN PRODUCTION CALLS THIS, AND
+    THE ARCHITECTURE DOC PRESENTED IT AS THE LIVE PAUSE PATH. It is reached only
+    from the CLI-dispatcher tests, which use it as a vehicle for the pause /
+    resume / decision plumbing that production drives through
+    `_controls.poll_agent_decision` and `_resolve_parked_agent_decision`
+    instead. Those park an agent WITHOUT blocking; this one holds a global
+    pause. A guard below pins the caller count at zero, so wiring it back is a
+    decision somebody has to make on purpose rather than by reading a doc.
+
+    ⛔ Its `request_pause("agent_link_failed")` is the only writer of that pause
+    reason, so the CLI dispatcher's branches on it are unreachable too.
+    """
     _controls.pending_agent_decision = None
     _al_alert_id = f"phase{phase}_agent_link_{agent}"
     # #955 Phase 5: author through the seam (event_name unchanged; reason/options
@@ -21381,8 +21399,12 @@ async def wait_for_agent_decision(agent: str, reason: str, phase: int = 2,
     emit_decision(
         intent="agent_link_failed", event_name="agent_link_failed",
         phase=phase, agent=agent,
-        facts={"title": f"Couldn't get {_al_label}'s report link",
-               "details": f"{_al_label} finished but we couldn't grab its result link."},
+        # ⛔ Copy corrected with the live card's on 2026-09-03 even though this
+        # path is orphaned: leaving the old sentence here would re-seed it the
+        # moment anyone wired this back, and it is the sentence the app's own
+        # card was written to match.
+        facts={"title": f"{_al_label} didn't finish its report",
+               "details": f"{_al_label} stopped before producing its final report."},
         actions=_alert_actions_for("agent_link_failed", phase, agent),
         alert_id=_al_alert_id,
         reason=reason, options=list(options))
@@ -37631,21 +37653,30 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
     return None
 
 
-# ── Per-Agent Extract + Record (content-first, link-second) ──────────────────
+# ── Per-Agent Extract + Record ───────────────────────────────────────────────
 # Called by poll_all_agents_round_robin the moment detect_completion_* flips
-# True for an agent. Runs the locked 2026-04 emission ladder end-to-end so the
-# frontend gets the MD, the public link (or chat-URL fallback), and the
-# `complete` status all together — backend and frontend stay in sync, and the
-# frontend tick mark appears at the same moment the backend marks completed_set.
+# True for an agent. Saves the agent's markdown, then tells the app the report
+# is ready — both, or neither.
 #
-# Emission order (user-locked):
+# ⛔⛔ 2026-09-03, stretch 7.5 step 6 — THIS HEADER DESCRIBED A FIVE-STEP LADDER
+# WITH A LINK IN THE MIDDLE OF IT, AND FOUR OF THE THINGS IT NAMED NO LONGER
+# EXIST. It promised "the public link (or chat-URL fallback)", a step 3 that
+# "attempts a public Share/Publish link", and a step 4 emitting
+# `{ url, verified, fallback? }` that was "chat-URL fallback with
+# verified=False" when the share failed. Measured: no share or publish step
+# survives anywhere in this function, the one emit below is hardcoded
+# `verified=True`, no emit in this module has ever passed a `fallback` key, and
+# `completed_set` / `extraction_in_progress` exist nowhere in this file except
+# in the sentences above. This header is where the app's own dead
+# "using chat URL" branch came from — it was the written contract that branch
+# implemented, so the pair had to be read together to see either was dead.
+#
+# What actually happens, in order:
 #   1. agent_progress status=extracting          (before we touch anything)
 #   2. extract content → save documents/<agent>.md + Firestore mirror
-#   3. attempt public Share/Publish link (short-circuited for ChatGPT iframe)
-#   4. emit link_extracted { url, verified, fallback? }
-#      (public if verified, else chat-URL fallback with verified=False)
-#   5. agent_progress status=complete
-#   Caller then does completed_set.add(agent) and clears extraction_in_progress.
+#   3. emit link_extracted for the report's page IN OUR APP, primary + verified
+#   4. agent_progress status=complete
+# Steps 3 and 4 share one gate and are skipped together — see it below for why.
 
 async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
                                     elapsed_sec=0, verbose=False,
@@ -37821,8 +37852,13 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
                 # holds (preserves pre-F5 behaviour for headless runs).
                 md_saved = True
 
-    # Conversation URL — captured NOW because the page may navigate during the
-    # parallel share-link worker (Gemini's Share & Export modal can redirect).
+    # The tab's own address, kept for ONE purpose: reattaching to this agent
+    # after a pause. It is not published, logged in full, or sent to the app.
+    # ⛔ 2026-09-03, step 6 — the reason given here was "the page may navigate
+    # during the parallel share-link worker (Gemini's Share & Export modal can
+    # redirect)". There is no share-link worker and no modal is opened after
+    # this point; nothing navigates the page. The capture is still correct, so
+    # only its justification changed.
     conversation_url = ""
     try:
         conversation_url = (page.url or "") if page else ""
@@ -37830,9 +37866,17 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
         conversation_url = ""
 
     # Step 3 — Markdown-as-primary emit (P1 mirror), STRICT gate.
-    # The FE flips an agent to ✓ only when it sees:
-    #   (a) link_extracted with primary=true + verified=true, AND
-    #   (b) the doc reachable via useResearches (subcollection sync).
+    # ⛔⛔ 2026-09-03, stretch 7.5 step 6 — THIS SAID THE APP TICKS AN AGENT ONLY
+    # WHEN IT SEES (a) a link_extracted carrying primary+verified AND (b) the
+    # doc reachable. HALF (a) IS FALSE AND IS THE MOST EXPENSIVE FALSE SENTENCE
+    # IN THIS FILE. The app's tick reads the agent's own document BY TYPE and
+    # consults no link at all; `verified` appears nowhere in the code of any
+    # component that draws a tick. Believing (a) is what made removing link code
+    # look like it would leave all three agents spinning forever — the removal
+    # was safe, and this comment is where the fear came from.
+    # ⭐ THE GATE BELOW IS STILL RIGHT, for the reason in (b) alone: we must not
+    # announce `complete` for a document the app cannot then find. Same code,
+    # true reason.
     # Therefore we must NOT emit `complete` unless both _fb_research_id (so the
     # in-app URL has an anchor) AND n_chars > 0 (so a doc actually exists in
     # Firestore for the FE to find). A bare /documents URL without anchor is
@@ -42703,8 +42747,30 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                 intent="agent_link_failed",
                                 event_name="agent_link_failed",
                                 phase=2, agent=agent_key_hf,
-                                facts={"title": "Couldn't get Claude's report link",
-                                       "details": "Claude finished but we couldn't grab its result link."},
+                                # ⛔⛔ 2026-09-03, stretch 7.5 step 6 — THE CARD
+                                # NAMED THE WRONG FAILURE, AND THE SAME EMIT
+                                # ALREADY CARRIED THE RIGHT SENTENCE. It told
+                                # the user we could not fetch Claude's report
+                                # link, while `lastError` five lines below said
+                                # what actually happened. There is no report
+                                # link to grab: since 2026-08-28 the report's
+                                # link is a page in our own app, minted from
+                                # text we already hold, so a link cannot fail
+                                # independently of the report. What this gate
+                                # detects is the SECOND artifact never arriving
+                                # — the first one is Claude's plan and sources,
+                                # not the report — so a user told a link failed
+                                # would go looking for a network problem that
+                                # is not there. Same repair as the NotebookLM
+                                # card on 2026-08-28, same reason.
+                                # ⚠ THE RETIRED SENTENCE IS NOT QUOTED HERE, and
+                                # that is not squeamishness: a guard in the app
+                                # asserts it appears in neither repository, and
+                                # a correction that repeats the words it
+                                # corrects defeats that guard with its own fix.
+                                # This is the third time in one session.
+                                facts={"title": "Claude didn't finish its report",
+                                       "details": "Claude gathered its sources and wrote a plan, but never produced the final report."},
                                 actions=_alert_actions_for("agent_link_failed", 2, agent_key_hf),
                                 alert_id=f"phase2_agent_link_{agent_key_hf}",
                                 attempts=1,
@@ -59692,7 +59758,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     except Exception as e:
         log(f"[dispatcher] Failed to start: {e}", "WARN")
 
-    # ── Helper: update delivery.json incrementally (frontend reads this for live links) ──
+    # ── Helper: update delivery.json incrementally ──
+    # ⛔ 2026-09-03, step 6 — this said "frontend reads this for live links".
+    # The app has never read this file: it reads Firestore. The readers are this
+    # module's own resume gate (it checks `status`) and `GET /api/runs/{id}` on
+    # the local server, which returns the file verbatim. Believing the app read
+    # it is what made mirroring links into it look like delivery rather than
+    # duplication.
     # DGOPS-9508: defined HERE, above the `if resume_dir:` block, not further down
     # beside its first success-path use. `update_delivery` is a LOCAL of
     # run_pipeline, so every reference in this function resolves to this binding —
@@ -61504,9 +61576,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # phase_complete fires as SOON as the brief markdown is
                 # in Firestore. The primary link points at the in-app
                 # Documents viewer — guaranteed to work, no platform
-                # share-link scraping required. Share-link extraction
-                # runs AFTER as a best-effort secondary (90s budget,
-                # conversation URL fallback) and lands via link_extracted.
+                # share-link scraping required.
+                # ⛔ 2026-09-03, step 6 — this went on to say "Share-link
+                # extraction runs AFTER as a best-effort secondary (90s budget,
+                # conversation URL fallback) and lands via link_extracted".
+                # Nothing runs after. There is no secondary, no budget and no
+                # fallback: the in-app page is the only link phase 1 emits.
                 # Goals: (a) phase_complete is no longer gated on a
                 # flaky CUA share-modal flow; (b) the chat/dropdown link
                 # always works; (c) the run advances even if ChatGPT's
@@ -61526,7 +61601,21 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # bug precisely because its BE + backfill labels already matched.
                 _p1_links = [{"label": "Read Brief report", "url": _in_app_brief_url, "verified": True, "primary": True}]
                 save_checkpoint(queue_dir, 1, topic=topic, brief_url=_in_app_brief_url)
-                update_delivery(brief_url=_in_app_brief_url)
+                # ⛔ 2026-09-03, stretch 7.5 step 6 — THE DELIVERY MIRROR OF THIS
+                # VALUE IS GONE, AND IT IS THE TWIN OF THE ONE STEP 5 REMOVED IN
+                # PHASE 2. Nothing in this repository ever read
+                # `delivery.json["brief_url"]`, and that file is returned
+                # verbatim by `GET /api/runs/{id}` on a local server that binds
+                # every interface with no auth — so an unread copy there is
+                # exposure with no upside. Step 5 took the phase-2 mirror for
+                # exactly this reason and left the phase-1 one behind.
+                # ⭐ THE CHECKPOINT WRITE ABOVE IS THE LIVE ONE and stays: a
+                # resume at phase 5 reads `brief_url` back off it and renders the
+                # "Research Brief" row from it. Disk keeps it; the served file
+                # does not. The delivery skeleton still DECLARES the key, like
+                # `doc_url` and `email_sent`, because the app owns those slots
+                # now — declaring a shape this module no longer fills is honest;
+                # filling it with a copy nobody reads was not.
                 # ⭐ 2026-08-11 — ORDER IS THE FIX. `save_meta` rebuilds the whole
                 # `phases` array from the recorded terminal statuses, and this
                 # call used to sit BEFORE the "complete" was recorded. So when
@@ -61548,9 +61637,17 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # (chatgpt slot is shared with P2).
                 # 2026-04-25: P1 secondary "View on ChatGPT" link removed.
                 # The in-app /documents?open=…:brief primary is the only link
-                # surfaced to the FE. The conversation URL (brief_url, captured
-                # at line ~12209) still propagates to Phase 5 for the Google
-                # Doc — it just isn't streamed as a separate link_extracted.
+                # surfaced to the FE.
+                # ⛔⛔ 2026-09-03, step 6 — the rest of this said "The
+                # conversation URL (brief_url) still propagates to Phase 5 for
+                # the Google Doc". Wrong twice over, and both halves mattered.
+                # `brief_url` has not been a conversation address since step 5 —
+                # it is the brief's page in our own app — and it does not reach
+                # the Doc at all: the Doc's brief section is built from the
+                # minted snapshot page, or an in-app deep link when that mint
+                # fails. A sentence saying a private address travels to a
+                # delivered document is exactly the thing that should have been
+                # checked years ago, and it was never true of the Doc builder.
         else:
             # Load brief from documents/ (new location) or root (old location)
             for bp in [queue_dir / "documents" / "brief.md", queue_dir / "brief.md"]:
@@ -62569,14 +62666,41 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     # phase dropdowns + downstream pipeline consumers find
                     # them at the canonical paths.
                     if _kind == "brief" and not brief_url:
-                        # User-pasted brief link (e.g. "ChatGPT Brief:" label
-                        # in front of a chatgpt.com/share URL). Routes to
-                        # the canonical Research Brief slot so FE-P5 emits
-                        # body.brief_url and the Doc renders it under the
-                        # standard "Research Brief" HEADING_2 section,
-                        # parallel to Flow A/B's pipeline-generated brief.
+                        # A brief link the USER pasted. It is theirs, so it is
+                        # kept exactly as given and is not subject to this
+                        # module's link policy.
+                        #
+                        # ⛔⛔ 2026-09-03, stretch 7.5 step 6 — A CALL THAT COULD
+                        # NEVER SUCCEED LIVED HERE, AND ITS COMMENT DESCRIBED
+                        # THREE THINGS THAT DO NOT HAPPEN. It read:
+                        # "Routes to the canonical Research Brief slot so FE-P5
+                        # emits body.brief_url and the Doc renders it under the
+                        # standard Research Brief HEADING_2 section." Measured,
+                        # all three are false:
+                        #   · the slot write never happened — the validator table
+                        #     has no `brief` entry, so every paste took the
+                        #     unknown-platform arm and was refused, logging TWO
+                        #     warnings per pasted brief on every Flow C run;
+                        #   · the app declares a brief-URL field on the Doc
+                        #     builder and never reads it;
+                        #   · the Doc's brief section comes from the minted
+                        #     snapshot page, or an in-app deep link when that
+                        #     mint fails — never from this slot.
+                        #
+                        # ⭐ THE LINK IS NOT LOST, AND NEVER WAS. The
+                        # `append_user_source_in_firestore` call above runs
+                        # first and unconditionally, and the Doc composer
+                        # renders every pasted source with the user's own label.
+                        # That is the path that was always doing the work.
+                        #
+                        # ⛔ AND THE FIX IS NOT A `brief` VALIDATOR. Adding one
+                        # would put somebody else's address back into the slot
+                        # that step 5 made mean "the brief's page in OUR app" —
+                        # the second meaning that was the whole root cause — and
+                        # it would still refuse the most likely paste anyway,
+                        # because a private conversation address is on this
+                        # module's deny list by shape.
                         brief_url = _url
-                        emit_validated_link(2, "brief", _url, _label or "Research Brief")
                     elif _kind == "notebook" and not notebook_url:
                         notebook_url = _url
                         emit_validated_link(3, "notebooklm", _url, _label or "NotebookLM Notebook")
@@ -62782,8 +62906,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                             if _nb_skip_in else {})
                         fail_phase(
                             phase=3,
-                            # ⛔⛔ 2026-08-28: this card used to say "Couldn't get
-                            # the NotebookLM link". The gate that raises it fires
+                            # ⛔⛔ 2026-08-28: this card used to blame a failed
+                            # NotebookLM link fetch. The gate that raises it fires
                             # when the tab is not sitting on a /notebook/{id}
                             # page — which means the UPLOAD did not land, not
                             # that a share dialog failed. `notebook_url` is
