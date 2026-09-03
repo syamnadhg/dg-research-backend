@@ -49,6 +49,7 @@ import re
 import time
 import json
 import base64
+import hashlib
 import socket
 import asyncio
 import random
@@ -14737,23 +14738,42 @@ def update_link_in_firestore(kind: str, url: str, **fields):
     This is HALF of the Firestore link-storage contract; the other half is
     the `userSources` array (see `append_user_source_in_firestore`).
 
-    `links.{kind}` — first-of-kind canonical CACHE. One URL per kind. Used
-    where the FE needs a single canonical URL: phase dropdown buttons
-    ("Open NotebookLM", "Watch on YouTube"), the brief Doc URL embedded
-    in completion emails, etc. Pipeline-generated runs naturally produce
-    one link per kind, so the keyed map is a clean fit. Flow C / B paste
-    flows write only the FIRST pasted link of each kind here so those
-    canonical-slot consumers keep working.
+    `links.{kind}` — first-of-kind canonical CACHE. One URL per kind.
+    ⛔ 2026-09-02, step 5 — this used to say the FE reads it for "phase dropdown
+    buttons ('Open NotebookLM', 'Watch on YouTube')" and "the brief Doc URL
+    embedded in completion emails". Measured: neither string exists in the app,
+    no component reads this map at all, and the brief slot reaches a Doc builder
+    that declares the field and never reads it. Its ACTUAL readers are four, all
+    server-side inputs to the phase-4/5 chain — the video-description reader and
+    its Admin twin, the Doc/email composer reader and its Admin twin — plus the
+    podcast artwork lookup. A slot with no consumer named here was easy to fill
+    with anything; that is how a private address ended up in one.
+    Pipeline-generated runs naturally produce one link per kind, so the keyed map
+    is a clean fit. Flow C / B paste flows write only the FIRST pasted link of
+    each kind here so those canonical-slot consumers keep working.
 
     `userSources` — append-log of every pasted link, full labels preserved.
     The single source of truth for "all links" when assembling the Doc;
     the FE-P5 composer reads it alongside the keyed `links` map and
     dedupes by URL before rendering uniform sections.
 
-    `kind` is the platform key (matches `emit_validated_link`'s `agent` arg):
-      - "brief" / "chatgpt" / "gemini" / "claude"  — research links
-      - "notebooklm" / "audio"                      — Phase 3
-      - "youtube"                                   — Phase 4
+    ⛔ 2026-09-02, stretch 7.5 step 5 — THE KIND TABLE HERE LISTED THREE KEYS
+    NOTHING HAS WRITTEN SINCE 2026-08-28. `chatgpt`, `gemini` and `claude` were
+    retired with the platform share step; the app now filters those three slots
+    out on READ, because the records that still hold them hold conversation
+    addresses. Reading them here as a live contract is how a writer gets added
+    back. What can actually be written today:
+      - "brief"                     — Phase 1, the brief's page in OUR app
+      - "notebooklm" / "audio"      — Phase 3
+      - "audio_file"                — Phase 3, the playable file in Storage
+      - "youtube" / "video"         — Phase 4
+
+    ⛔ AND THIS WRITER VALIDATES NOTHING. Callers reaching it through
+    `emit_validated_link` are checked; the two DIRECT callers are not. That is
+    how `links.brief` came to hold a `chatgpt.com/c/…` address marked
+    `verified=True` — a shape this module's own deny list says must never be
+    emitted. Both direct callers now hand it one of our own addresses; a new
+    direct caller must do the same or go through the validated path.
 
     Idempotent: same key + URL is a no-op merge.
     """
@@ -17310,7 +17330,12 @@ class PipelineRuntime:
 
     def unregister_page(self, platform, final_status="done"):
         self.agent_statuses[platform] = final_status
-        # Keep URL in agent_chat_urls for checkpoint/link display
+        # Keep the URL in agent_chat_urls for the pause checkpoint. ⛔ 2026-09-02,
+        # step 5: this said "checkpoint/link display". There is no link display —
+        # the map has exactly two reads, the resume reattachment loop and the
+        # snapshot the checkpoint is built from, and neither shows anyone
+        # anything. A comment naming a second purpose is what kept the map
+        # looking like display plumbing that could be extended.
         self.active_pages.pop(platform, None)
 
     def snapshot(self):
@@ -17331,6 +17356,37 @@ class PipelineRuntime:
             "last_event_id": self.last_event_id,
             "tier_escalation_history": tier_history,
         }
+
+    # Fields of `snapshot()` that may be written to disk on this machine but may
+    # NOT be handed to the app. One entry today; a list because the next one
+    # should be added here rather than at a call site.
+    _SNAPSHOT_LOCAL_ONLY = ("agent_chat_urls",)
+
+    def snapshot_for_app(self):
+        """The same snapshot, minus what must never leave this machine.
+
+        ⛔⛔ 2026-09-02, stretch 7.5 step 5 — WHY THIS EXISTS AS A SECOND METHOD
+        RATHER THAN AN EDIT TO `snapshot()`. The full snapshot has two consumers
+        and they need opposite things. `save_pause_checkpoint` writes it to
+        `checkpoint_pause.json` on this disk, and `agent_chat_urls` in that file
+        is the pause/resume REATTACHMENT KEY: on resume each still-running agent's
+        tab is re-opened at its saved address, and an agent restored without one
+        comes back with no page — which the very next poll tick's crash sweep
+        reads as a browser crash and deletes from the run. Strip the field inside
+        `snapshot()` and you lose an agent on every resume.
+        ▶ So the disk keeps everything and the wire gets less.
+
+        ⛔ AND THE WIRE WAS THE LEAK. The paused event goes to Firestore, where
+        every pipeline event is kept for thirty days — and the follow-up chat's
+        `get_recent_events` tool returns whole event documents to a MODEL, with a
+        noise filter that does not exclude `pipeline_paused`. So all three
+        private conversation addresses were handed to a model on any paused run.
+        Nothing in the app ever rendered them; the guard that pinned this payload
+        justified itself with "so the app can show the run", and the app shows
+        nothing from it.
+        """
+        return {k: v for k, v in self.snapshot().items()
+                if k not in self._SNAPSHOT_LOCAL_ONLY}
 
 
 _runtime = PipelineRuntime()  # Singleton — reset per run
@@ -19934,10 +19990,12 @@ async def pause_and_close_browser(browser, queue_dir, phase, extra_kwargs=None):
     _runtime.phase = phase
     # Write checkpoint snapshot
     save_pause_checkpoint(queue_dir, extra=extra_kwargs)
-    # Emit paused event with snapshot payload (frontend already shows links)
+    # Emit paused event with the snapshot the APP may see. The checkpoint written
+    # one line above keeps the full one, reattachment key included — see
+    # `PipelineRuntime.snapshot_for_app` for why the two differ.
     try:
         emit_event("pipeline_paused", phase=phase,
-                   snapshot=_runtime.snapshot())
+                   snapshot=_runtime.snapshot_for_app())
     except Exception:
         pass
     # Close browser if active (Phase 0 guard: may be None)
@@ -19989,7 +20047,7 @@ async def resume_browser_from_checkpoint(browser, queue_dir):
                 continue
             restored[platform] = page
             _runtime.register_page(platform, page, url)
-            log(f"[resume] {platform} restored at {url[:80]}")
+            log(f"[resume] {platform} restored at {redacted_chat_url(url)}")
         except Exception as e:
             log(f"[resume] {platform} reopen failed: {e}", "WARN")
     # Reset dedup cache
@@ -20458,11 +20516,109 @@ def validate_link(platform: str, url: str) -> bool:
     return False
 
 
+def in_app_document_url(kind: str) -> str:
+    """Where a document this run produced lives IN OUR OWN APP.
+
+    ⭐⭐ 2026-09-02, stretch 7.5 step 5 — ONE ANSWER, NOT FOUR COPIES. This
+    expression was written out by hand at four sites (phase 2's per-agent emit,
+    and phase 1's file / live / regenerated-brief branches). Three of them agreed;
+    the fourth was the branch step 2 had to repair, and the only way to see that
+    they had drifted was to read all four side by side.
+
+    ⛔ THE ANCHOR IS LOAD-BEARING AND ITS ABSENCE IS NOT AN ERROR. Without a
+    research id there is no document to open, so the answer is the bare Documents
+    page — a real destination, just not a specific one. Callers that need a
+    SPECIFIC target (phase 2's completion emit) must test the id themselves; this
+    function will not invent one, and it will not raise.
+
+    ⭐ It is deliberately not called `link` anything. Every other link name in
+    this module means an address on somebody else's platform. This one is ours,
+    it needs no validation and no deny list, and it is the value that replaced a
+    private conversation address at every sink that ever displayed one.
+    """
+    return (f"/documents?open={_fb_research_id}:{kind}"
+            if _fb_research_id and kind else "/documents")
+
+
+def redacted_chat_url(url: str) -> str:
+    """A conversation address reduced to what a log line actually needs.
+
+    ⛔⛔ 2026-09-02, stretch 7.5 step 5 — THE RUN LOG IS A DELIVERY SURFACE and it
+    was the widest one. Send-logs zips every file under a selected run folder and
+    uploads it; measured on this machine, two real run logs carried full ChatGPT
+    and Gemini conversation addresses in plain text. The system-log tail gets a
+    read-time filter before it goes in the bundle; run files get none.
+
+    ⭐ REDACTED, NOT REMOVED. Two log lines exist to answer "which tab did this
+    leg use" — the reattachment log and the extraction-complete line — and a line
+    that names no tab cannot answer it. Host and path shape stay, so the platform
+    and the kind of page are still readable; the identifier is replaced by a short
+    digest of the whole address, which correlates two mentions of the SAME tab
+    across a log without being reversible into it.
+
+    ⚠ The digest is of the FULL url, so two different conversations never collide
+    into one label, and a truncated or malformed address still gets a stable one.
+    Not a security boundary — a log line is not a secret store — just an end to
+    printing an address whose only property is that it opens for one account.
+    """
+    _u = (url or "").strip()
+    if not _u:
+        return ""
+    _digest = hashlib.sha256(_u.encode("utf-8", "replace")).hexdigest()[:8]
+    try:
+        _parts = urlsplit(_u)
+        _host = (_parts.hostname or "").lower()
+        # First path segment only: `/c/`, `/chat/`, `/app` — the shape, never the id.
+        _seg = ""
+        for _p in (_parts.path or "").split("/"):
+            if _p:
+                _seg = _p
+                break
+    except Exception:
+        _host, _seg = "", ""
+    if not _host:
+        return f"<url #{_digest}>"
+    return f"{_host}/{_seg}/#{_digest}" if _seg else f"{_host}/#{_digest}"
+
+
+def _record_brief_in_aggregate(url: str) -> None:
+    """Fill the research record's `brief` slot with where the brief actually is.
+
+    ⛔ 2026-09-02, stretch 7.5 step 5 — the slot is UNCHANGED; only its contents
+    are. It used to be filled, on one branch, with the ChatGPT tab's address; now
+    all three brief branches fill it with the same in-app page they already hand
+    the app as the phase-1 primary. One meaning, three producers.
+
+    ⚠ Deliberately NOT routed through `emit_validated_link`. That helper's job is
+    to refuse somebody else's platform address, and it refuses by ALLOW-list: it
+    has no entry for `brief`, so every url handed to it under that key is rejected
+    (that is a live, always-warning branch on the Flow-C paste path, and it is
+    step 6's to close). Our own in-app page needs no validation — it is not a
+    platform link — and running it through a validator that cannot say yes would
+    silently drop it.
+
+    ⚠ Best-effort, like every other Firestore write on the phase-1 path: the
+    aggregate is a convenience slot, and a run must not end because a slot could
+    not be written."""
+    if not url:
+        return
+    try:
+        update_link_in_firestore("brief", url, label="Research Brief",
+                                 phase=1, verified=True)
+    except Exception:
+        pass
+
+
 def emit_validated_link(phase: int, agent: str, url: str, label: str, link_kind: str = ""):
     """Emit a link_extracted event ONLY if the URL passes validation.
     Returns True if emitted, False if rejected. Also writes to the research
-    doc's `links.{kind}` aggregate map — P5 reads from there to compose
-    the Doc body (single source of truth, no event-log replay needed).
+    doc's `links.{kind}` aggregate map.
+    ⛔ 2026-09-02, step 5 — this said P5 reads the aggregate "to compose the Doc
+    body (single source of truth)". It does not. The Doc's sections come from the
+    freshly minted snapshot pages plus the user's own pasted sources; the
+    aggregate supplies only the notebook, audio and video rows. Calling it the
+    single source of truth is what made an unvalidated direct write to it look
+    like the documented way to get a link into the Doc.
 
     `link_kind` overrides the Firestore aggregate key when it differs from
     the FE event's `agent` field — e.g. audio-overview emits as
@@ -37682,8 +37838,11 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
     # Firestore for the FE to find). A bare /documents URL without anchor is
     # not enough — it would let the FE flip ✓ without a real target.
     has_anchor = bool(_fb_research_id)
-    _in_app_url = (f"/documents?open={_fb_research_id}:{agent_key}"
-                   if has_anchor else "/documents")
+    # ⚠ `has_anchor` stays a SEPARATE test and is not folded into the helper. The
+    # helper answers "where does this document live"; the gate below answers "may
+    # we tell the app this agent is complete", and the bare Documents page is a
+    # fine answer to the first and not to the second.
+    _in_app_url = in_app_document_url(agent_key)
     _in_app_label = f"Read {name} report"
     if n_chars > 0 and has_anchor and md_saved:
         try:
@@ -41934,7 +42093,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         log(f"[{name}] Extraction complete — "
                             f"{len(res['text'])} chars, "
                             f"in_app={(res.get('_in_app_url') or '')[:60]}, "
-                            f"convo={(res.get('url') or '')[:60]}")
+                            f"convo={redacted_chat_url(res.get('url') or '')}")
                         continue
                     # E4 (DGOPS-7366) cost guardrail: empty extraction → surface
                     # user decision on attempt 1, not 3. The DOM-primary
@@ -55120,9 +55279,13 @@ def _build_phase2_to_phase3_handoff(results: dict, queue_dir) -> None:
     safety net at start of P3 (only does real work if _runtime was wiped
     on a process restart between P2 and P3 — i.e. resume-from-P3 case).
 
-    P2 captures each agent's conversation URL as it reads the report. P3 just
-    consumes this state and uploads to NotebookLM. No browser activity, no
-    agent re-visits, no CUA in P3.
+    ⛔ 2026-09-02, stretch 7.5 step 5 — THE MAP NO LONGER CARRIES CONVERSATION
+    ADDRESSES. It carries each surviving agent's report page in our own app. The
+    conversation address is still READ here, because the two guards below are the
+    only two things in the pipeline that can judge one — but it is not what gets
+    published. Nothing downstream ever needed it: P3 uploads the MARKDOWN FILES,
+    and this map's only consumers are `links.json`, whose EXISTENCE is the
+    resume-from-phase-3 signal, and a log line.
     """
     p3_links: dict[str, str] = {}
     # Report files this run deliberately refused to publish, so the Flow-B
@@ -55173,7 +55336,28 @@ def _build_phase2_to_phase3_handoff(results: dict, queue_dir) -> None:
                 f"conversation predates this run", "WARN")
             _url = ""
         if _url:
-            p3_links[_name] = _url
+            # ⛔⛔ 2026-09-02, stretch 7.5 step 5 — WHAT IS PUBLISHED IS NO LONGER
+            # WHAT IS JUDGED. The two guards above still read the CONVERSATION
+            # address, because that is the only thing they can judge: the sweep's
+            # verdict is recorded against it, and the age test decodes an id out
+            # of it. But the value that goes into this map — and from here into
+            # `links.json`, the delivery mirror and the run log — is now the
+            # agent's report page in OUR app.
+            #
+            # ▶ Emptying the map instead was the obvious move and it was wrong
+            # twice. It would have left both guards above with nothing to act on,
+            # so the four tests that execute them would have gone from proving a
+            # drop to proving an empty dict — passing for a reason that has
+            # nothing to do with the guard. And it would have made "this run
+            # produced no reports" and "this run refused its reports" the same
+            # record on disk, which is exactly the distinction the guards exist
+            # to draw.
+            #
+            # ⚠ The key stays the DISPLAY name (`ChatGPT`, not `chatgpt`) because
+            # `links.json` is read by people; the value is built from the agent
+            # key, which is the same normalisation the phase-2 completion emit
+            # uses, so the two agree by construction rather than by luck.
+            p3_links[_name] = in_app_document_url(_name.lower().replace(" ", ""))
         # ⛔⛔ 2026-09-02 — AND THE SWEEP'S OWN SENTENCE WAS HALF FALSE. When it
         # rejects a leg it logs that the text "will not be written to documents/,
         # mirrored to Firestore, merged into consolidated.md, or handed to
@@ -61182,7 +61366,22 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     emit_event("pipeline_stopped", phase=1, reason=f"user_{decision}_after_error")
                     return
                 brief_text = p1["text"]
-                brief_url = p1.get("url", "")
+                # ⛔⛔ 2026-09-02, stretch 7.5 step 5 — THIS LINE USED TO GIVE
+                # `brief_url` A SECOND MEANING, AND THAT IS THE WHOLE BUG.
+                # `run_phase1` returns `current_url()` of the ChatGPT tab: an
+                # address that opens for nobody but the account that ran it. On
+                # the other three phase-1 branches `brief_url` means the brief's
+                # own page in OUR app. So one name carried two different kinds of
+                # thing depending on which branch produced it, and every sink
+                # downstream — the Firestore aggregate, the phase-2 and phase-3
+                # checkpoints, the pause hand-off, the resume-from-phase-5
+                # replay — took whichever it was handed without asking.
+                #
+                # ⭐ The conversation address is NOT kept here. It is already
+                # held, for the one purpose it has, in `_runtime.agent_chat_urls`
+                # — the pause/resume reattachment key. A second copy in a second
+                # name is what let it travel.
+                brief_url = ""
                 _p1_ran_live = True  # ChatGPT generated the brief — sources already absorbed
                 # Stamp the "don't attach to P2" decision durably NOW, not at
                 # P2 entry — otherwise a pause AFTER P1 but BEFORE P2 entry
@@ -61190,18 +61389,27 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # P1 block is skipped + _p1_ran_live re-inits False) would flip
                 # it to attach, double-feeding sources P1 already distilled.
                 _finalize_p2_source_decision(False)
-                # Propagate the ChatGPT-share / conversation URL to the
-                # Firestore aggregate so P5's Doc body shows the
-                # "ChatGPT Brief: <url>" line. This URL is NOT emitted as
-                # a separate link_extracted (P1 surfaces only the in-app
-                # /documents primary to the FE) — but the Doc spec
-                # requires it, so we land it directly in the aggregate.
-                if brief_url:
-                    try:
-                        update_link_in_firestore("brief", brief_url,
-                                                 label="ChatGPT Brief", phase=1, verified=True)
-                    except Exception:
-                        pass
+                # ⛔⛔ 2026-09-02, stretch 7.5 step 5 — THE AGGREGATE WRITE THAT
+                # STOOD HERE PUT A PRIVATE ADDRESS IN THE RECORD, EVERY RUN.
+                # It wrote `links.brief = current_url() of the ChatGPT tab`,
+                # stamped `verified=True`, straight past this module's own deny
+                # list — which names `chatgpt.com/c/` under the header "Known BAD
+                # URLs that must NEVER be emitted as links". It could do that
+                # because it called the Firestore writer DIRECTLY instead of going
+                # through `emit_validated_link`, the one path that validates.
+                #
+                # ⛔ ITS STATED REASON WAS FALSE. The comment said "the Doc spec
+                # requires it". Measured 2026-09-02: the Doc builder declares
+                # `brief_url` and never reads it, and the video description
+                # refuses `links.brief` by name. Four app readers do pull the slot
+                # out — with no privacy filter, unlike the three sibling slots
+                # beside them — and every one of their consumers then ignores it.
+                # It was saved by omission, not by a gate: the exact shape the
+                # step-2 module was written to end.
+                #
+                # ▶ The slot itself is not the problem and is not removed. It is
+                # now filled where the brief actually lands, with the brief's own
+                # page in our app — see the live and from-file branches below.
                 break
             # Save brief in documents/
             if _p1_skipped_after_error:
@@ -61252,7 +61460,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 _brief_md = f"# Research Brief\n\n{brief_text}"
                 (queue_dir / "documents" / "brief.md").write_text(_brief_md, encoding="utf-8")
                 save_document_to_firestore("brief", _brief_md, "Research Brief")
-                _in_app_brief_url = f"/documents?open={_fb_research_id}:brief" if _fb_research_id else "/documents"
+                _in_app_brief_url = in_app_document_url("brief")
+                brief_url = _in_app_brief_url
+                _record_brief_in_aggregate(_in_app_brief_url)
                 brief_artifact = BriefArtifact(text=brief_text, url=_in_app_brief_url)
                 log(f"BriefArtifact (from file): {brief_artifact.chars} chars, "
                     f"{len(brief_artifact.sections)} sections")
@@ -61301,7 +61511,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # flaky CUA share-modal flow; (b) the chat/dropdown link
                 # always works; (c) the run advances even if ChatGPT's
                 # share UI changes overnight.
-                _in_app_brief_url = f"/documents?open={_fb_research_id}:brief" if _fb_research_id else "/documents"
+                _in_app_brief_url = in_app_document_url("brief")
+                brief_url = _in_app_brief_url
+                _record_brief_in_aggregate(_in_app_brief_url)
                 brief_artifact = BriefArtifact(text=brief_text, url=_in_app_brief_url)
                 log(f"BriefArtifact: {brief_artifact.chars} chars, {len(brief_artifact.sections)} sections")
                 # #746: label MUST match the FE reopen-hydration backfill's
@@ -61385,7 +61597,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     p1_new = await run_phase1(browser, cua_client, combined_topic, pdf_paths, verbose, feedback="")
                     if p1_new and p1_new.get("text"):
                         brief_text = p1_new["text"]
-                        brief_url = p1_new.get("url", brief_url)
+                        # ⛔ 2026-09-02, step 5 — the regenerated brief used to
+                        # overwrite `brief_url` with the NEW ChatGPT tab address,
+                        # re-introducing the private value on a run that had
+                        # already got past phase 1 once. `brief_url` now means one
+                        # thing everywhere — the brief's page in our app — and it
+                        # is set from that page below, after the brief is saved.
                         _brief_md_regen = f"# Research Brief\n\n{brief_text}"
                         (queue_dir / "documents" / "brief.md").write_text(_brief_md_regen, encoding="utf-8")
                         save_document_to_firestore("brief", _brief_md_regen, "Research Brief")
@@ -61407,8 +61624,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         # reopen renders the brief row TWICE, because the FE's
                         # hydration backfill synthesizes that label for the same
                         # URL and the (label, url) dedup cannot collapse them.
-                        _regen_in_app_url = (f"/documents?open={_fb_research_id}:brief"
-                                             if _fb_research_id else "/documents")
+                        _regen_in_app_url = in_app_document_url("brief")
+                        brief_url = _regen_in_app_url
+                        _record_brief_in_aggregate(_regen_in_app_url)
                         brief_artifact = BriefArtifact(text=brief_text, url=_regen_in_app_url)
                         emit_event("phase_complete", phase=1,
                                    summary=f"Brief regenerated with user input ({len(brief_text)} chars)",
@@ -62026,10 +62244,23 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             for name, r in results.items():
                 log(f"  {name:10s} status={r['status']:12s} text={len(r['text']):>6d} chars")
             save_checkpoint(queue_dir, 2, topic=topic, brief_url=brief_url)
-            # Update delivery with live agent URLs
-            agent_urls = {n: r.get("url", "") for n, r in results.items() if r.get("url")}
-            if agent_urls:
-                update_delivery(research_links=agent_urls)
+            # ⛔⛔ 2026-09-02, stretch 7.5 step 5 — THIS MIRRORED EVERY AGENT'S RAW
+            # CONVERSATION ADDRESS INTO `delivery.json`, AND IT WAS THE ONE COPY
+            # THAT PASSED NO GUARD AT ALL. It ran before the phase-2→3 hand-off,
+            # so neither the off-topic drop nor the age test had touched these
+            # values: a leg the sweep had just refused still had its address
+            # written here under its own name.
+            #
+            # ⛔ "Nothing reads the field" was true and was not the whole story.
+            # `GET /api/runs/{id}` on the local server returns `delivery.json`
+            # verbatim, and that server binds every interface with no auth and no
+            # origin restriction — so the field had no reader in this repo and one
+            # on the network.
+            #
+            # ▶ Removed rather than filtered. The one thing it fed is the file the
+            # hand-off writes forty lines later, from a map that IS guarded and
+            # now carries our own in-app pages; a second, earlier, unguarded copy
+            # of the same idea has nothing left to contribute.
             # Enrich meta with per-agent data from results + track events
             save_meta(queue_dir, topic, 2)
             meta_path = queue_dir / "meta.json"

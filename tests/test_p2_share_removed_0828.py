@@ -203,12 +203,23 @@ def test_the_p2_to_p3_handoff_still_reads_a_url_per_agent():
     written at the end of P2 and its EXISTENCE is what the resume-from-Phase-3
     rung checks. The builder used to prefer `_runtime.agent_share_urls[name]`
     and fall back to the conversation URL; the preferred half is gone, so the
-    fallback is now the whole answer. If that read had gone too, links.json
-    would be `{}` on every run and nobody would notice until a resume."""
+    fallback is now the whole answer.
+
+    ⛔⛔ 2026-09-02, stretch 7.5 step 5 — AND THE REST OF THIS DOCSTRING WAS
+    WRONG. It said an empty `links.json` would go unnoticed "until a resume".
+    Measured: the resume rung tests the file's EXISTENCE and never opens it, and
+    the safety net proves an empty file hands over exactly like a full one. So
+    the read is still load-bearing, but for the reason below, not that one: it is
+    what the two drop guards judge. What gets PUBLISHED is now our own in-app
+    report page — never the conversation address.
+    """
     src = code_only(inspect.getsource(research._build_phase2_to_phase3_handoff))
     assert 'agent_share_urls' not in src
-    assert '_r.get("url")' in src
-    assert "p3_links[_name] = _url" in src
+    assert '_r.get("url")' in src, "the guards below have nothing to judge without it"
+    assert 'p3_links[_name] = in_app_document_url(' in src
+    # ⛔ The universal, not the sample: no branch may put the judged value into
+    # the published map.
+    assert "p3_links[_name] = _url" not in src
 
 
 def test_the_handoff_still_drops_an_off_topic_or_foreign_conversation():

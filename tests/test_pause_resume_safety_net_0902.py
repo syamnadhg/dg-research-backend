@@ -203,7 +203,22 @@ async def test_pause_closes_the_browser_and_drops_the_dead_page_handles(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_the_paused_event_carries_the_urls_so_the_app_can_show_the_run(tmp_path, events):
+async def test_the_paused_event_does_NOT_carry_the_reconnect_key(tmp_path, events):
+    """⛔⛔ 2026-09-02, stretch 7.5 step 5 — THIS TEST USED TO ASSERT THE OPPOSITE,
+    AND ITS NAME WAS ITS OWN REFUTATION. It was called "…carries the urls so the
+    app can show the run" and ended `assert payload["snapshot"]["agent_chat_urls"]
+    ["gemini"] == GEMINI_URL`. The app shows nothing from that payload: its only
+    `pipeline_paused` handler reads no field of it at all.
+
+    ⛔ What DID read it was a model. Every emitted event is persisted to
+    Firestore for thirty days, and the follow-up chat's recent-events tool hands
+    whole event documents to the model, filtering only progress noise — so all
+    three private conversation addresses went into a model's context on any
+    paused run. Step 2 closed the links-array channel into that same context;
+    this was the same three addresses arriving by the other door.
+
+    ⭐ The guard is inverted rather than deleted, because "the app is not told"
+    is a promise that needs keeping, not an absence of a promise."""
     _two_live_agents_and_one_done()
 
     await research.pause_and_close_browser(_FakeBrowser(), tmp_path, phase=2)
@@ -212,7 +227,48 @@ async def test_the_paused_event_carries_the_urls_so_the_app_can_show_the_run(tmp
     assert "pipeline_paused" in kinds
     payload = dict(events[kinds.index("pipeline_paused")][1])
     assert payload["phase"] == 2
-    assert payload["snapshot"]["agent_chat_urls"]["gemini"] == GEMINI_URL
+    snap = payload["snapshot"]
+    assert "agent_chat_urls" not in snap
+    # ⛔ THE UNIVERSAL, not the one key: no value anywhere in the streamed payload
+    # may be one of the addresses, however it got there.
+    flat = json.dumps(payload)
+    for url in (CHATGPT_URL, GEMINI_URL):
+        assert url not in flat, url
+
+
+@pytest.mark.asyncio
+async def test_the_paused_event_still_says_what_the_app_actually_uses(tmp_path, events):
+    """The other half: stripping one field must not empty the payload. Phase and
+    per-agent status are what a resumed run and any future reader need."""
+    _two_live_agents_and_one_done()
+
+    await research.pause_and_close_browser(_FakeBrowser(), tmp_path, phase=2)
+
+    kinds = [k for k, _ in events]
+    snap = dict(events[kinds.index("pipeline_paused")][1])["snapshot"]
+    assert snap["phase"] == 2
+    assert snap["agent_statuses"]["gemini"] == "generating"
+    assert snap["agent_statuses"]["claude"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_the_checkpoint_keeps_what_the_event_dropped(tmp_path, events):
+    """⛔⛔ THE PAIR THAT MAKES THE STRIP SAFE, ASSERTED IN ONE PLACE. The same
+    pause writes both, and they must disagree: the disk keeps the reconnect key
+    (without it a restored agent comes back with no page and the next poll tick's
+    crash sweep deletes it from the run), the wire does not. Stripping inside
+    `snapshot()` would have satisfied the test above and cost an agent on every
+    resume."""
+    _two_live_agents_and_one_done()
+
+    await research.pause_and_close_browser(_FakeBrowser(), tmp_path, phase=2)
+
+    cp = research.load_pause_checkpoint(tmp_path)
+    assert cp["agent_chat_urls"]["gemini"] == GEMINI_URL
+    assert cp["agent_chat_urls"]["chatgpt"] == CHATGPT_URL
+    kinds = [k for k, _ in events]
+    streamed = dict(events[kinds.index("pipeline_paused")][1])["snapshot"]
+    assert "agent_chat_urls" not in streamed
 
 
 @pytest.mark.asyncio

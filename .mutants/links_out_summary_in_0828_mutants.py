@@ -242,11 +242,21 @@ MUTANTS = [
      [("async def _nlm_menu_pick(page, want, deny=_NLM_MENU_DENY) -> dict:",
        "async def _nlm_menu_pick(page, want, deny=()) -> dict:")]),
 
+    # ⛔⛔ 2026-09-02, stretch 7.5 step 5 — R13'S REASON WAS FALSE AND ITS TARGET
+    # HAS MOVED. It said removing this write would make "the delivered doc lose
+    # the one platform link"; measured, the Doc builder declares `brief_url` and
+    # never reads it, and the video description refuses `links.brief` by name. And
+    # the value it wrote was the raw ChatGPT conversation address, past this
+    # module's own deny list — step 5 replaced it with the brief's page in our own
+    # app, moved into `_record_brief_in_aggregate`, and made all three brief
+    # branches use it. What the slot buys is that the record says WHERE THE BRIEF
+    # IS; that is what this mutant now takes away.
     ("R13", "under",
-     "⛔ the brief's Firestore link write goes, so the delivered doc loses the "
-     "one platform link this wave was never about",
-     [('                        update_link_in_firestore("brief", brief_url,',
-       '                        _ = ("brief", brief_url) and update_link_in_firestore("brief_disabled", brief_url,')]),
+     "⛔ the brief slot is written under a key nothing reads, so the research "
+     "record stops saying where the brief is — and the guard that pins which kinds "
+     "this module may write no longer sees a brief write at all",
+     [('        update_link_in_firestore("brief", url, label="Research Brief",',
+       '        update_link_in_firestore("brief_disabled", url, label="Research Brief",')]),
 ]
 
 TESTS_LINE = re.compile(r"^(\d+) (passed|failed)", re.M)

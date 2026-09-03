@@ -59,7 +59,15 @@ def _regen_branch(src: "str | None" = None) -> str:
 def test_the_regen_emits_the_in_app_brief_page_not_the_conversation():
     block = _regen_branch()
     assert '"url": _regen_in_app_url' in block
-    assert '_regen_in_app_url = (f"/documents?open={_fb_research_id}:brief"' in block
+    # ⛔⛔ 2026-09-02, step 5 — THIS USED TO PIN THE EXPRESSION, AND THAT IS WHY
+    # IT WENT RED FOR A NON-REASON. It asserted the f-string literally; step 5
+    # lifted the identical expression out of four branches into
+    # `in_app_document_url`, the answer did not change by one character, and the
+    # guard failed anyway. A source pin on a SPELLING breaks on a refactor and
+    # survives a change of meaning — exactly backwards. The value is now pinned
+    # by executing the helper (below); this line only pins that the branch asks
+    # the shared question instead of re-deriving it.
+    assert '_regen_in_app_url = in_app_document_url("brief")' in block
 
 
 def test_the_regen_no_longer_passes_the_conversation_url_to_the_app():
@@ -126,7 +134,7 @@ def test_no_link_labelled_chatgpt_brief_survives_anywhere_in_the_backend():
     assert hits == []
 
 
-def test_the_in_app_url_has_a_fallback_for_a_run_with_no_firestore_id():
+def test_the_in_app_url_has_a_fallback_for_a_run_with_no_firestore_id(monkeypatch):
     # A CLI run with no Firestore doc has no research id. Without the fallback
     # the link reads `/documents?open=None:brief`, which resolves to nothing.
     #
@@ -136,10 +144,51 @@ def test_the_in_app_url_has_a_fallback_for_a_run_with_no_firestore_id():
     # the guard passed while the fallback had become unreachable and every run
     # got `/documents`. Checking that a branch EXISTS is not checking what
     # decides it.
-    assert 'if _fb_research_id else "/documents")' in _regen_branch()
+    #
+    # ⭐ 2026-09-02, step 5 — SO IT NOW DRIVES BOTH SIDES INSTEAD OF READING THE
+    # BRANCH. `if True` and `if False` both survive a substring check and neither
+    # survives being run twice with the two inputs that are supposed to disagree.
+    monkeypatch.setattr(research, "_fb_research_id", "")
+    without = research.in_app_document_url("brief")
+    monkeypatch.setattr(research, "_fb_research_id", "rid123")
+    with_id = research.in_app_document_url("brief")
+    assert without == "/documents"
+    assert with_id == "/documents?open=rid123:brief"
+    assert without != with_id, "the research id must be what decides it"
 
 
-def test_the_link_points_at_the_brief_specifically_not_the_documents_index():
+def test_a_missing_document_kind_falls_back_too(monkeypatch):
+    # ⛔ THE SECOND WAY TO GET AN UNOPENABLE LINK, and the inline copies never
+    # covered it: an id with no kind yields `/documents?open=rid123:`, which
+    # anchors at nothing. The helper answers the index instead.
+    monkeypatch.setattr(research, "_fb_research_id", "rid123")
+    assert research.in_app_document_url("") == "/documents"
+
+
+def test_the_link_points_at_the_brief_specifically_not_the_documents_index(monkeypatch):
     # `/documents?open={id}` without `:brief` opens the index, not the brief —
     # a link that goes somewhere is not the same as a link that goes there.
-    assert ':brief"' in _regen_branch()
+    monkeypatch.setattr(research, "_fb_research_id", "rid123")
+    url = research.in_app_document_url("brief")
+    assert url.endswith(":brief")
+    assert url != "/documents?open=rid123"
+
+
+def test_every_phase_1_branch_and_phase_2_ask_the_same_helper(monkeypatch):
+    # ⭐ 2026-09-02, step 5 — THE POINT OF EXTRACTING IT. Four sites built this
+    # address by hand and three agreed; the fourth is the one this file exists
+    # for. Asking the same function is what makes "they agree" a fact about the
+    # code rather than about who last copied it.
+    src = code_only(inspect.getsource(research.run_pipeline))
+    assert src.count('in_app_document_url("brief")') == 3, (
+        "the from-file, live and regenerated brief branches, and no others")
+    p2 = code_only(inspect.getsource(research.extract_and_record_agent))
+    assert "in_app_document_url(agent_key)" in p2
+    # And no branch anywhere still spells it out by hand. ⛔ ONE occurrence is
+    # correct and it is the helper's own body — a `not in` here would fail on the
+    # very function it is checking everyone uses.
+    whole = code_only(Path(research.__file__).read_text(encoding="utf-8"))
+    assert whole.count('f"/documents?open={_fb_research_id}') == 1, (
+        "the helper builds it; nobody else may")
+    assert 'f"/documents?open={_fb_research_id}' in code_only(
+        inspect.getsource(research.in_app_document_url))

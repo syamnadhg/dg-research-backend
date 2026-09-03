@@ -233,6 +233,23 @@ def _on_topic(n=25_000):
             (n // 62 + 1))[:n]
 
 
+RID = "rid_2026_09_02"
+
+
+@pytest.fixture(autouse=True)
+def _research_id(monkeypatch):
+    """⭐ 2026-09-02, stretch 7.5 step 5 — the hand-off publishes each surviving
+    agent's report page in OUR app, so these tests need a research id or every
+    expected value collapses to the bare `/documents` index and the assertions
+    stop telling one agent from another."""
+    monkeypatch.setattr(research, "_fb_research_id", RID)
+
+
+def _ours(agent_key: str) -> str:
+    """What a surviving leg publishes now: its report page in our app."""
+    return f"/documents?open={RID}:{agent_key}"
+
+
 def _handoff(results, run_dir):
     research._build_phase2_to_phase3_handoff(results, run_dir)
     return dict(research._runtime.p2_links_for_p3)
@@ -249,13 +266,62 @@ def test_the_incident_link_is_not_published_after_the_sweep_rejects_it(run_dir):
 
 
 def test_an_on_topic_leg_still_publishes_its_link(run_dir):
-    """The half that must not regress — dropping every link would silently halve what
-    NotebookLM receives."""
+    """The half that must not regress: a surviving leg still publishes a row.
+
+    ⛔⛔ 2026-09-02, stretch 7.5 step 5 — THIS DOCSTRING SAID "dropping every link
+    would silently halve what NotebookLM receives", AND THAT WAS NEVER TRUE. The
+    link map is written to `links.json` and returned; NotebookLM is fed
+    `p2_md_files_for_p3`, the markdown FILES, and never reads this map. So the
+    test defended the right behaviour with a reason that does not exist — which
+    is why nobody questioned the value it was defending: an agent's private
+    conversation address.
+
+    ▶ What it defends now is the same shape with an address of ours: the leg
+    survived, so it publishes; and what it publishes is the report page in our
+    own app, which is the same destination phase 2 already hands the app."""
     results = {"Gemini": {"status": "done", "text": _on_topic(),
                           "url": "https://gemini.google.com/app/abc123",
                           "verified": True}}
     assert research.apply_off_topic_sweep(results, run_dir) == []
-    assert _handoff(results, run_dir) == {"Gemini": "https://gemini.google.com/app/abc123"}
+    assert _handoff(results, run_dir) == {"Gemini": _ours("gemini")}
+
+
+def test_no_surviving_leg_publishes_the_conversation_address(run_dir):
+    """⛔⛔ THE STEP-5 INVARIANT, stated as a universal rather than a sample. Every
+    agent survives here, so every one of them publishes — and not one published
+    value may be the address it was judged on."""
+    convos = {
+        "ChatGPT": "https://chatgpt.com/c/6a8d6000-0000-83ea-abcb-acdf3db",
+        "Gemini": "https://gemini.google.com/app/abc123",
+        "Claude": "https://claude.ai/chat/2f8a",
+    }
+    results = {n: {"status": "done", "text": _on_topic(), "url": u, "verified": True}
+               for n, u in convos.items()}
+    published = _handoff(results, run_dir)
+    assert set(published) == set(convos), "every surviving leg still publishes"
+    for name, url in published.items():
+        assert url == _ours(name.lower()), name
+        assert url not in convos.values()
+        assert not url.startswith("http"), (
+            "an in-app page is a path on our own origin, never an absolute address")
+
+
+def test_the_guards_still_read_the_conversation_address_they_judge(monkeypatch, run_dir):
+    """⭐ WHAT IS PUBLISHED CHANGED; WHAT IS JUDGED DID NOT. The age test decodes
+    an id out of the ChatGPT address, so the hand-off must still READ it — if the
+    read went away with the publish, the drop could not happen and nothing else
+    in the suite would notice."""
+    monkeypatch.setattr(
+        research, "_run_start_epoch",
+        lambda: research._chatgpt_convo_epoch(FOREIGN_URL)
+        + 2 * research._CONVO_AGE_SLACK_SEC + 1.0)
+    # A leg with no address at all publishes nothing — the read is load-bearing.
+    empty = {"ChatGPT": {"status": "done", "text": _on_topic(), "url": "",
+                         "verified": True}}
+    assert _handoff(empty, run_dir) == {}
+    foreign = {"ChatGPT": {"status": "done", "text": _on_topic(), "url": FOREIGN_URL,
+                           "verified": True}}
+    assert _handoff(foreign, run_dir) == {}, "and a foreign one is dropped"
 
 
 def test_a_failed_text_extraction_does_NOT_cost_the_leg_its_link(run_dir):
@@ -269,7 +335,7 @@ def test_a_failed_text_extraction_does_NOT_cost_the_leg_its_link(run_dir):
     leg its link."""
     results = {"Claude": {"status": "done", "text": "",
                           "url": "https://claude.ai/chat/2f8a", "verified": False}}
-    assert _handoff(results, run_dir) == {"Claude": "https://claude.ai/chat/2f8a"}
+    assert _handoff(results, run_dir) == {"Claude": _ours("claude")}
 
 
 def test_a_rejected_leg_cannot_smuggle_its_url_back_in(run_dir):
@@ -306,7 +372,7 @@ def test_our_own_conversation_link_survives_the_identity_belt(monkeypatch, run_d
                         lambda: research._chatgpt_convo_epoch(FOREIGN_URL) + 300.0)
     results = {"ChatGPT": {"status": "done", "text": _on_topic(), "url": OURS_URL,
                            "verified": True}}
-    assert _handoff(results, run_dir) == {"ChatGPT": OURS_URL}
+    assert _handoff(results, run_dir) == {"ChatGPT": _ours("chatgpt")}
 
 
 def test_the_identity_belt_is_scoped_to_the_chatgpt_leg(monkeypatch, run_dir):
@@ -327,7 +393,7 @@ def test_the_identity_belt_is_scoped_to_the_chatgpt_leg(monkeypatch, run_dir):
         "precondition: the bare predicate would reject this url")
     results = {"Gemini": {"status": "done", "text": _on_topic(), "url": borrowed,
                           "verified": True}}
-    assert _handoff(results, run_dir) == {"Gemini": borrowed}
+    assert _handoff(results, run_dir) == {"Gemini": _ours("gemini")}
 
 
 def test_the_sweep_leaves_the_url_alone_for_resume_reconnect(run_dir):

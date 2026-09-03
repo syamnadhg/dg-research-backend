@@ -16,7 +16,18 @@ instruction (sent to a model), and a candidate for the public video description.
   E5 — the in-app link loses its `:brief` target and opens the documents index
        instead. A link that goes somewhere is not a link that goes there.
   E6 — the fallback goes, so a CLI run with no Firestore id emits
-       `/documents?open=None:brief`.
+       `/documents?open=:brief`.
+  E8 — the empty-kind guard goes, so a caller with no document kind gets
+       `/documents?open=<id>:`, which anchors at nothing.
+
+⛔⛔ 2026-09-02, STRETCH 7.5 STEP 5 — FOUR OF THESE MUTANTS WENT WRONG AT ONCE AND
+THE ANCHOR SWEEP COULD ONLY SEE TWO OF THEM. Step 5 lifted the in-app address into
+`in_app_document_url` and gave `brief_url` a single meaning (that same address, on
+every phase-1 branch). E5 and E6 anchored on the lifted expression and went STALE,
+which the sweep catches. E1 and E4 mutated to `brief_url` in order to restore the
+conversation address — and `brief_url` is now the in-app address, so both quietly
+became EQUIVALENT MUTANTS with descriptions that no longer matched what they did.
+An anchor that still matches is not an anchor that still means anything.
 
 ⚠ THESE ARE SOURCE GUARDS AND THE HARNESS DOES NOT PRETEND OTHERWISE. The branch
 lives inside `run_pipeline`, which no test in this repo can drive. The
@@ -65,8 +76,8 @@ SURVIVOR_CONFIRMATIONS = 2
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 _INFLIGHT = Path(__file__).with_suffix(".inflight")
 
-URL_LINE = '                        _regen_in_app_url = (f"/documents?open={_fb_research_id}:brief"\n'
-FALLBACK_LINE = '                                             if _fb_research_id else "/documents")'
+HELPER_URL = '    return (f"/documents?open={_fb_research_id}:{kind}"'
+HELPER_COND = '            if _fb_research_id and kind else "/documents")'
 LINKS_ARG = ('                                   links=[{"label": "Read Brief report", "url": _regen_in_app_url,\n'
              '                                           "verified": True, "primary": True}])')
 
@@ -76,7 +87,7 @@ MUTANTS = [
      "under the label \"ChatGPT Brief\", unverified and unmarked, stored by the app "
      "and outliving the run",
      [(LINKS_ARG,
-       '                                   links=[{"label": "ChatGPT Brief", "url": brief_url}] if brief_url else [])')]),
+       '                                   links=[{"label": "ChatGPT Brief", "url": p1_new.get("url", "")}])')]),
     ("E2", "under",
      "⛔⛔ the label drifts. Not a leak — a DOUBLE RENDER: the app's reopen backfill "
      "synthesizes \"Read Brief report\" for the same URL and the (label, url) dedup "
@@ -90,19 +101,24 @@ MUTANTS = [
        '                                   links=[{"label": "Read Brief report", "url": _regen_in_app_url}])')]),
     ("E4", "under",
      "⛔⛔ the in-app URL is computed and then IGNORED — the emit goes back to the "
-     "conversation address while the line above it still reads as fixed",
+     "conversation address by a different route, while the line above it still "
+     "reads as fixed. ⚠ It no longer reaches for `brief_url`: since step 5 that "
+     "name IS the in-app address, so the old form of this mutant changed nothing",
      [('"label": "Read Brief report", "url": _regen_in_app_url',
-       '"label": "Read Brief report", "url": brief_url')]),
+       '"label": "Read Brief report", "url": p1_new.get("url", "")')]),
     ("E5", "under",
-     "the link loses its `:brief` target and opens the documents index instead. A "
+     "the link loses its `:{kind}` target and opens the documents index instead. A "
      "link that goes somewhere is not a link that goes there",
-     [(URL_LINE,
-       '                        _regen_in_app_url = (f"/documents?open={_fb_research_id}"\n')]),
+     [(HELPER_URL, '    return (f"/documents?open={_fb_research_id}"')]),
     ("E6", "under",
      "the fallback goes, so a CLI run with no Firestore document emits "
-     "`/documents?open=None:brief`, which resolves to nothing",
-     [(FALLBACK_LINE,
-       '                                             if True else "/documents")')]),
+     "`/documents?open=:brief`, which resolves to nothing",
+     [(HELPER_COND, '            if True else "/documents")')]),
+    ("E8", "under",
+     "the empty-kind half of the guard goes, so a caller with no document kind "
+     "gets `/documents?open=<id>:` — an anchor at nothing, which is the second way "
+     "to build an unopenable link and the one the four inline copies never covered",
+     [(HELPER_COND, '            if _fb_research_id else "/documents")')]),
     ("E7", "over",
      "the regen reports NO links at all, which trips the app's \"(no verified "
      "links)\" caption on a phase that finished perfectly well",

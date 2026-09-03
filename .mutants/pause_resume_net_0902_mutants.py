@@ -81,7 +81,7 @@ _INFLIGHT = Path(__file__).with_suffix(".inflight")
 # ── anchors ─────────────────────────────────────────────────────────────
 SAVE_CALL = "    save_pause_checkpoint(queue_dir, extra=extra_kwargs)"
 PAUSED_EMIT = ('        emit_event("pipeline_paused", phase=phase,\n'
-               '                   snapshot=_runtime.snapshot())')
+               '                   snapshot=_runtime.snapshot_for_app())')
 # ⚠ THE CONTEXT TEST, NOT THE `browser is not None` TEST. Removing the None
 # guard is an EQUIVALENT MUTANT — the AttributeError lands in the `except
 # Exception` two lines below and the function completes exactly as before, so
@@ -157,10 +157,30 @@ MUTANTS = [
      "the checkpoint is never written, so a paused run has no reattachment key "
      "on disk at all and a resume finds nothing to come back to",
      [(SAVE_CALL, "    pass")]),
+    # ⛔⛔ 2026-09-02, stretch 7.5 step 5 — P2 USED TO SAY THE OPPOSITE AND SCORED
+    # THE FIX AS A DEFECT. Its old text was "the paused event stops carrying the
+    # snapshot, so the app is told a run paused but not which conversations it
+    # paused on" — a reason built on a consumer that does not exist. The app's
+    # only pipeline_paused handler reads no field of the payload. The real
+    # consumer was the follow-up chat's recent-events tool, which hands whole
+    # event documents to a MODEL. So the mutation that matters is the reverse
+    # one: putting the reconnect key back on the wire.
     ("P2", "over",
-     "the paused event stops carrying the snapshot, so the app is told a run "
-     "paused but not which conversations it paused on",
-     [(PAUSED_EMIT, '        emit_event("pipeline_paused", phase=phase)')]),
+     "the paused event streams the FULL snapshot again, so every agent's private "
+     "conversation address is persisted to the event log and handed to a model "
+     "by the follow-up chat's recent-events tool",
+     [(PAUSED_EMIT,
+       '        emit_event("pipeline_paused", phase=phase,\n'
+       '                   snapshot=_runtime.snapshot())')]),
+    ("P2b", "over",
+     "the strip moves INSIDE snapshot(), so the wire is clean and the pause "
+     "checkpoint loses the reconnect key too — a restored agent comes back with "
+     "no page and the crash sweep deletes it from the run",
+     [('        return {k: v for k, v in self.snapshot().items()\n'
+       '                if k not in self._SNAPSHOT_LOCAL_ONLY}',
+       '        return self.snapshot()'),
+      ('            "agent_chat_urls": dict(self.agent_chat_urls),',
+       '            "agent_chat_urls": {},')]),
     ("P3", "over",
      "the browser is never closed on pause — the whole point of the pause is "
      "to give the machine back its memory",
