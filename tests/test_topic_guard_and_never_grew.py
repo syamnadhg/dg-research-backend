@@ -270,13 +270,30 @@ def test_a_rejection_clears_the_text_rather_than_logging_a_warning():
     assert research.reject_off_topic_text(off, d, "ChatGPT", "chatgpt", op="t") == ""
 
 
-def test_the_rejection_names_the_terms_it_looked_for():
-    branch = GUARD_SRC[GUARD_SRC.index("anchors = topic_anchors("):]
-    assert "anchors[:6]" in branch, (
-        "the operator needs to see which words were missing, or the rejection "
-        "is unreviewable"
-    )
-    assert "topic_anchors(" in branch
+def test_the_rejection_names_the_terms_it_looked_for(capsys):
+    """⛔⛔ 2026-09-02 — THIS TEST USED TO SURVIVE DELETING THE THING IT GUARDS.
+    It asserted that the substrings `anchors[:6]` and `topic_anchors(` appeared
+    somewhere after a marker in the guard's source. Remove the entire `log(...)`
+    and `emit_event(...)` reporting and keep any line mentioning either — a
+    comment would do — and it still passed. It never executed the log.
+
+    Now it reads what an operator would actually read."""
+    import json as _json
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+    d = _Path(_tempfile.mkdtemp())
+    (d / "meta.json").write_text(
+        _json.dumps({"topic": TOPIC}), encoding="utf-8")
+    assert research.reject_off_topic_text(
+        GOLDEN, d, "ChatGPT", "chatgpt", op="t") == ""
+    out = capsys.readouterr().out
+    assert "OFF-TOPIC" in out, out
+    for anchor in ("nemoclaw", "nemohermes", "nemotron", "openshell"):
+        assert anchor in out.lower(), (
+            f"the operator needs to see which words were missing; {anchor!r} is "
+            f"absent from the rejection line, so it is unreviewable")
+    # And the length, so "how much was thrown away" is answerable from the log.
+    assert str(len(GOLDEN)) in out, out
 
 
 # ── The never-grew veto on ChatGPT's completion verdict ───────────────────

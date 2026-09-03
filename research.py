@@ -1605,12 +1605,13 @@ def title_refusal_verdict(title: str, topic: str, corpus: str) -> str:
     _t = (title or "").strip()
     if not _t:
         return "accept"
-    anchors = topic_anchors(topic)
-    if len(anchors) < _TOPIC_GUARD_MIN_ANCHORS:
-        # Not a guardable topic. Same abstain rule as `text_is_off_topic`.
-        return "accept"
-    low = _t.lower()
-    if any(a in low for a in anchors):
+    # ⭐ 2026-09-02 — was a hand-rolled copy of the presence rule, written out
+    # again here because the shared predicate had a 20,000-character floor and a
+    # title is thirty characters. The floor now belongs to the CALLER, so this
+    # asks the one rule directly and applies its own bar, which for a title is
+    # "not empty" — the line above. `None` means the topic is not guardable at
+    # all, which is the same abstain the hand-rolled anchor count produced.
+    if topic_presence(_t, topic) is not False:
         return "accept"
     # The title is anchor-free. Ask the corpus, which is the only witness with
     # enough text to be believed. `text_is_off_topic` abstains (False) on a short
@@ -25225,6 +25226,29 @@ _TOPIC_GENERIC_WORDS = frozenset({
 _TOPIC_GUARD_MIN_ANCHORS = 3
 _TOPIC_GUARD_MIN_CHARS = 20_000
 
+# The same bar, for the OPENING BRIEF instead of a finished report.
+#
+# ⛔⛔ 2026-09-02 — AND THE NUMBER THIS REPLACES WAS FICTION. The brief-short
+# guard is built on a comment that says "DR briefs are typically 2-5k chars".
+# Twenty-seven real briefs in this machine's own logs measure 46,183 to 73,494
+# characters, median 62,893 — not one below 46 KB. The comment has been wrong by
+# an order of magnitude for months and nothing noticed, because every gate built
+# on it is a FLOOR and real briefs sail over it.
+#
+# So the report floor is not what stops the report guard from judging a brief;
+# `reject_off_topic_text` would have judged all twenty-seven. What stops it is
+# what it DOES on a verdict: it returns "", and phase 2 cannot run without a
+# brief. Pointing the existing sink at the brief would not be a decorative
+# no-op — it would end runs, with no card and no way back.
+#
+# 2,000 is deliberately the same figure as `_MIN_SALVAGEABLE_BRIEF_LEN` and
+# `_SAFETY_NET_MIN_BRIEF_LEN`, which already answer "is this a brief or a
+# streaming stub?" for the salvage offer and the extract accept gate. Three
+# answers to one question would rot apart; below this length the pipeline
+# already declines to treat the text as a brief, so there is nothing here to
+# judge either.
+_BRIEF_TOPIC_MIN_CHARS = 2_000
+
 
 def topic_anchors(topic: str) -> "list[str]":
     """The distinctive words of a research topic — the ones a report about it
@@ -25254,6 +25278,43 @@ def topic_anchors(topic: str) -> "list[str]":
     return seen
 
 
+def topic_presence(text: str, topic: str):
+    """Does `text` name the subject at all? `True` / `False` / `None` = cannot say.
+
+    ⭐⭐ 2026-09-02 — ONE RULE, NOT ONE PER ARTEFACT. "Does this text mention a
+    distinctive word of the topic?" was written out twice with two different
+    length policies: once inside `text_is_off_topic` behind a 20,000-character
+    floor, and once by hand inside `title_refusal_verdict` with no floor at all,
+    because a title is thirty characters and could never clear that floor. The
+    second copy carries a comment explaining why it had to be written again. That
+    is the shape this file elsewhere refuses — a predicate reused, never
+    duplicated — and it left every artefact SHORTER than a finished report with
+    no way to be judged: the title (hand-rolled its own), the opening brief
+    (nothing), and any report the extractor accepted below the floor (nothing).
+
+    So the length policy leaves the rule and moves to the callers, where it
+    belongs: how much text is enough depends entirely on WHAT the text is, and
+    only the caller knows that. This function answers the question and nothing
+    else.
+
+    `None` is the third answer and it is load-bearing: a topic with fewer than
+    `_TOPIC_GUARD_MIN_ANCHORS` distinctive words is not guardable at all ("best
+    practices for team retrospectives" is a perfectly good topic), and saying so
+    is different from saying the text is fine. Every caller must route `None` to
+    abstain, and the ones that can act loudly must be able to SAY they abstained
+    — an operator has to be able to tell "nothing was off-topic" from "nothing
+    could be judged".
+
+    Matching is case-insensitive SUBSTRING, so "Nemotron-4" and "NemoClaw's"
+    both count — a document that discusses the subject cannot score zero.
+    """
+    anchors = topic_anchors(topic)
+    if len(anchors) < _TOPIC_GUARD_MIN_ANCHORS:
+        return None
+    low = (text or "").lower()
+    return any(a in low for a in anchors)
+
+
 def text_is_off_topic(text: str, topic: str) -> bool:
     """Does `text` fail to mention ANY distinctive word from `topic`?
 
@@ -25265,14 +25326,253 @@ def text_is_off_topic(text: str, topic: str) -> bool:
     Everything uncertain returns False. That asymmetry is the point: this gate
     can lose a run's leg when it fires, so it must fire only on the shape that
     has no innocent explanation.
+
+    ⭐ THE FLOOR IS THIS FUNCTION'S OWN POLICY, not the rule's — see
+    `topic_presence`. 20,000 characters is the right bar for a FINISHED AGENT
+    REPORT, which is what all three of this predicate's callers judge, because
+    that is a document with no innocent reason to skip the subject. It is the
+    wrong bar for a title or a brief, and those ask `topic_presence` directly
+    with a bar of their own.
     """
-    anchors = topic_anchors(topic)
-    if len(anchors) < _TOPIC_GUARD_MIN_ANCHORS:
-        return False
     if len(text or "") < _TOPIC_GUARD_MIN_CHARS:
         return False
-    low = text.lower()
-    return not any(a in low for a in anchors)
+    return topic_presence(text, topic) is False
+
+
+def brief_topic_verdict(brief: str, topic: str) -> str:
+    """Is the opening brief about the topic the user asked for?
+
+    Returns one of:
+      "accept"    — it names the subject, or the question does not arise;
+      "abstain"   — it cannot be judged: too short to be a brief, or a topic
+                    with no distinctive vocabulary to judge against;
+      "off_topic" — a full-length brief that mentions NOT ONE distinctive word
+                    of the topic.
+
+    ⭐⭐ 2026-09-02 — WHY THE BRIEF AND NOT THE REPORTS. The reports have had a
+    guard since the 2026-08-05 incident. The brief never has, and it is the
+    document all three researchers work from: one string is pasted into three
+    composers and the same file is attached to all three. A wrong report costs
+    one leg. A wrong brief costs the run, every leg at once, plus the podcast
+    made from it — and it happens BEFORE the 30-to-90 minutes are spent, which
+    is the only moment the loss is still preventable.
+
+    ⛔ THE CALLER MUST NOT DELETE ANYTHING ON "off_topic". That is the whole
+    reason this returns a verdict instead of a string, and the reason it is not
+    `reject_off_topic_text` pointed at the brief. The sink guard's answer to a
+    bad document is `""`, which is correct for one agent's report — the other two
+    carry on — and catastrophic for a brief, because phase 2 has nothing to paste
+    and fails with a message about a missing brief rather than a wrong one. A
+    false positive would end the run and never say why.
+
+    ⚠ AND IT IS ONLY ASKED OF A BRIEF WE WROTE. The pasted-brief flow derives the
+    run's topic FROM the brief's own first line, so asking whether the brief
+    mentions the topic is asking whether a string contains a slice of itself; the
+    answer is yes and it means nothing. Measured, three real runs went further and
+    derived a "topic" of `Worked for 10m 32s` — ChatGPT's own progress header,
+    scraped off the top of what the user pasted. This lives at the end of
+    `run_phase1`, which is the one place both machine-written paths pass through
+    and no user-written brief ever reaches.
+
+    Pure, so both polarities are testable without a browser, a thread or a run
+    directory — the same reason `title_refusal_verdict` is pure.
+    """
+    _b = (brief or "").strip()
+    if len(_b) < _BRIEF_TOPIC_MIN_CHARS:
+        # Not a brief yet — a stub, a salvage from a stalled stream, or an
+        # extractor that grabbed the wrong element. The length guards upstream
+        # already have opinions about those, and a document this short has too
+        # few chances to name the subject for a zero to mean anything.
+        return "abstain"
+    _seen = topic_presence(_b, topic)
+    if _seen is None:
+        return "abstain"
+    return "accept" if _seen else "off_topic"
+
+
+# A second witness needs to have actually said something. 500 is the extractor
+# family's own "enough scraped text to be worth judging" figure (`min_chars=500`
+# is the default on all three extraction primitives), reused rather than reinvented.
+_WITNESS_MIN_CHARS = 500
+
+
+def mid_run_witness_text(agent_key: str) -> str:
+    """What the agent's OWN interface said it was doing, while it was working.
+
+    ⭐⭐ 2026-09-02 — THE SECOND WITNESS, and the reason there can be a second
+    opinion at all. The topic guard runs three times per run — once in the
+    finalize path and twice more at the sweeps — and all three are the same pure
+    function, on the same string, resolving the same topic from the same folder.
+    Three passes that cannot disagree are one pass with two echoes.
+
+    A second opinion is not a second run of the first one. It is the same
+    question asked of DIFFERENT EVIDENCE, and this is the only evidence in hand
+    that qualifies:
+
+      * a different SOURCE — the agent's activity panel, written by the platform
+        as it worked, not the document we asked it for at the end;
+      * a different MECHANISM — a Playwright DOM walk on a poll tick, not the
+        extraction ladder (markdown pull / clipboard hijack / CUA download);
+      * a different MOMENT — during the thirty-to-ninety minutes, not after.
+
+    So it can be right when the extraction is wrong, which is the entire point:
+    an extraction that grabbed the wrong conversation and a leg that genuinely
+    researched the wrong subject look IDENTICAL from the report alone, and they
+    are not the same problem.
+
+    ⚠ WHAT IT IS NOT. Last-write-wins, not accumulated: the snapshot holds the
+    most recent scrape that differed from the one before it, capped at 15 step
+    titles and 20 section headings. Phase 2 only — phase 1 records numbers, not
+    text, so the opening brief has no second witness and must never pretend to.
+    Source titles are scraped but never persisted here. Returns "" for an agent
+    that never entered the poll set, which every caller must read as ABSTAIN.
+    """
+    snap = getattr(_runtime, "agent_progress_snapshots", {}).get(agent_key) or {}
+    parts = []
+    for _key in ("steps", "sections"):
+        for _item in (snap.get(_key) or []):
+            if isinstance(_item, str) and _item.strip():
+                parts.append(_item)
+    _focus = snap.get("current_focus")
+    if isinstance(_focus, str) and _focus.strip():
+        parts.append(_focus)
+    return "\n".join(parts)
+
+
+def report_second_opinion(text: str, topic: str, witness: str) -> str:
+    """Two witnesses on one leg. Returns what they say TOGETHER.
+
+      "agree"               — the report names the subject. Nothing to add.
+      "extraction_suspect"  — the report names nothing, but the agent's own panel
+                              did. It researched the right thing; what we pulled
+                              back is not what it wrote.
+      "drift_corroborated"  — neither the report NOR the panel names the subject.
+                              Two independent sources, one verdict.
+      "abstain"             — no second witness, or a topic nothing can judge.
+
+    ⭐⭐ THE REASON THIS EXISTS IS A GAP THE SIZE OF THE PIPELINE. The report
+    guard demands 20,000 characters before it will judge anything, and the
+    extractors accept a report at 100. Everything between is recorded `done`,
+    written to disk, mirrored, merged and handed to NotebookLM without one line
+    of it ever being compared to what the user asked for. The file already knows:
+    the phase-2→3 handoff carries a belt for exactly this case and describes it
+    as "the case the sweep cannot judge — a topic under the anchor floor, or text
+    under the size floor". That belt dates a conversation id out of a URL. This
+    is the same case, answered from content.
+
+    ⛔ NO VERDICT HERE DESTROYS ANYTHING, and that is deliberate, not timid. The
+    incumbent guard fires only above 20,000 characters precisely because a short
+    document has fewer chances to name its subject, so a zero means less. Two
+    witnesses raise the confidence enough to TELL somebody; they do not raise it
+    enough to fail a leg the user waited an hour for. `title_refusal_verdict`
+    settled the same argument the same way on 2026-08-06, after a correct title
+    was refused loudly on a corpus that had already voted the other way.
+
+    Pure, so every one of the four verdicts is reachable in a test without a
+    browser, a run directory or a poll loop.
+    """
+    _seen_in_report = topic_presence(text or "", topic)
+    if _seen_in_report is None:
+        return "abstain"
+    if _seen_in_report:
+        return "agree"
+    # The report names nothing. On its own that is not evidence — it is why the
+    # incumbent abstains below 20,000 characters. Ask the other witness.
+    _w = (witness or "").strip()
+    if len(_w) < _WITNESS_MIN_CHARS:
+        return "abstain"
+    return "extraction_suspect" if topic_presence(_w, topic) else "drift_corroborated"
+
+
+async def brief_topic_gate(brief_text: str, topic: str, *,
+                           retry_count: int, max_retries: int) -> str:
+    """The opening brief's subject check, and everything it does about it.
+
+    Returns the caller's next move, one of:
+      "keep"  — carry on with this brief (accepted, abstained, or the user chose
+                to keep it);
+      "retry" — the user asked for a new brief;
+      "stop"  — the user ended the run.
+
+    ⭐⭐ 2026-09-02 — WHY THE WHOLE DECISION IS HERE AND NOT AT THE CALL SITE.
+    `run_phase1` navigates a browser, picks a model, types into a composer and
+    polls a stream; nothing in this repo executes it, and nothing plausibly
+    will. A guard living inside it can only be pinned by grepping its source,
+    which is precisely the failure this file has been bitten by — a mutant that
+    changed an entry condition to `if False:` once left every ordering test
+    green. So the browser stays out there and the judgement comes in here, where
+    a test drives all four outcomes with no page, no network and no run
+    directory. The call site is left with a dispatch of three named strings.
+
+    ⛔ IT NEVER RETURNS A MODIFIED BRIEF, AND NEVER CLEARS ONE. `reject_off_topic_text`
+    answers a bad report with `""` — right for one leg of three, fatal for the
+    brief, because phase 2 cannot run without one and would report it MISSING
+    rather than wrong. The user is asked instead, on the phase-1 decision bus the
+    brief-short guard already uses, sharing its retry budget so the two together
+    can never exceed the attempt cap.
+    """
+    if not brief_text:
+        return "keep"
+    _len = len(brief_text)
+    verdict = brief_topic_verdict(brief_text, topic)
+    if verdict != "off_topic":
+        if verdict == "abstain":
+            # ⭐ SAY WHEN IT IS INERT, the same way the phase-2 sweep does. An
+            # operator has to be able to tell "the brief is about the topic" from
+            # "nothing here could be judged" — a silent abstain reads exactly
+            # like a pass, and this one abstains on the two shapes most likely to
+            # be wrong: a topic with no distinctive words, and a brief too short
+            # to be a brief.
+            log(f"Phase 1: brief topic check ABSTAINED — {_len} chars, topic "
+                f"{(topic or '')[:60]!r} yields {len(topic_anchors(topic))} "
+                f"distinctive word(s). Nothing was judged.", "INFO")
+        return "keep"
+
+    anchors = topic_anchors(topic)
+    retries_left = max(0, max_retries - retry_count)
+    log(f"Phase 1: the brief ({_len} chars) mentions NONE of the topic's "
+        f"distinctive terms ({', '.join(anchors[:6])}) — this is not a brief "
+        f"for this run's research", "ERROR")
+    try:
+        emit_event("wrong_artifact_rejected", phase=1, agent="chatgpt",
+                   op="brief_topic_gate", length=_len, tier="topic_guard")
+    except Exception:
+        pass
+    fail_phase(1,
+               "This brief isn't about your topic",
+               f"The brief never mentions {' or '.join(anchors[:3])}. All three "
+               f"researchers work from this one document, so a wrong brief "
+               f"sends every one of them after the wrong subject. Retry to "
+               f"generate it again, or continue if it is right after all.",
+               agent="chatgpt",
+               can_retry=retries_left > 0)
+    if retries_left <= 0:
+        # Out of attempts. The card is already up and says so (`can_retry` is
+        # False); waiting on a decision bus for an answer the user has no button
+        # to give would hang the phase.
+        log("Phase 1: off-topic brief, but the retry budget is spent — "
+            "continuing with it", "WARN")
+        return "keep"
+    decision = await _controls.await_phase_decision(1)
+    log(f"Phase 1 brief-topic decision: {decision}")
+    if decision == "stop":
+        return "stop"
+    if decision == "retry":
+        try:
+            emit_event("phase_restart", phase=1,
+                       reason="user_retry_brief_off_topic",
+                       attempt=retry_count + 2, chars=_len)
+        except Exception:
+            pass
+        log(f"Phase 1: user asked for a new brief after an off-topic one "
+            f"(attempt {retry_count + 2}/{max_retries + 1})")
+        return "retry"
+    # ⚠ 'skip' or 'timeout' — the bus returns those two and nothing else here.
+    # The sibling brief-short guard's comment calls this case 'continue_anyway',
+    # which is not a value `await_phase_decision` can return; the card's second
+    # button reaches us as 'skip'. Either way the meaning is the same: the user
+    # has looked at the brief and kept it.
+    return "keep"
 
 
 def reject_off_topic_text(text: str, queue_dir, label: str, agent_key: str,
@@ -25331,6 +25631,61 @@ def reject_off_topic_text(text: str, queue_dir, label: str, agent_key: str,
     return ""
 
 
+def _second_opinion_on_agent(text: str, topic: str, agent_key: str,
+                             label: str) -> str:
+    """Run the second witness over one leg and SAY what it found. Returns the verdict.
+
+    Split from `report_second_opinion` so the decision stays pure and only the
+    reporting is here — the same split as `text_is_off_topic` and
+    `reject_off_topic_text`.
+
+    ⛔ THE SWEEP RUNS TWICE. `apply_off_topic_sweep` is called at `run_phase2`'s
+    single return AND again as a belt in the finalize block with the caller's own
+    run directory, so anything that speaks must speak once. The caller records
+    the verdict on the results entry and skips a second call, which is the same
+    idiom `off_topic_rejected` already uses one branch below.
+    """
+    verdict = report_second_opinion(text, topic, mid_run_witness_text(agent_key))
+    _anchors = topic_anchors(topic)
+    if verdict == "drift_corroborated":
+        log(f"[{label}] SECOND OPINION — the report ({len(text)} chars) mentions "
+            f"none of the topic's distinctive terms ({', '.join(_anchors[:6])}), "
+            f"AND neither did anything the agent's own panel said while it "
+            f"worked. Two independent sources, one answer: this leg researched "
+            f"something else.", "ERROR")
+        try:
+            emit_event(
+                "pipeline_warning", phase=2, agent=agent_key,
+                # `message=`, not `error=`: the web app's warning branch reads
+                # message/warning and falls back to the literal "Backend warning".
+                # Same contract as the title tripwire's card.
+                message=f"{label} may have researched something else",
+                details=(f"{label}'s report never mentions "
+                         f"{' or '.join(_anchors[:3])}, and neither did anything "
+                         f"it showed while it was working. Its findings may not "
+                         f"belong to this research."),
+                # Explicit empty list: phase 2 is finished by the time this can
+                # fire, so there is nothing to skip, and the web app invents a
+                # [Skip] for a phase alert whose actions are undefined.
+                actions=[], alert_id=f"phase2_{agent_key}_second_opinion",
+                alertType="warn", dismissible=True)
+        except Exception:
+            pass
+    elif verdict == "extraction_suspect":
+        # ⭐ SILENT, and for the same reason `title_refusal_verdict` has a silent
+        # arm. The two witnesses DISAGREE: the panel was on topic, so the leg did
+        # the right work and only the document we pulled back is doubtful. There
+        # is nothing here for a person to do, an anchor test on a short report is
+        # exactly where a false zero lives, and the run already has length-sanity
+        # and wrong-artifact tiers for a bad pull. Logged, because "we pulled a
+        # document that does not match the work" must stay greppable.
+        log(f"[{label}] SECOND OPINION — the report ({len(text)} chars) mentions "
+            f"none of the topic's distinctive terms, but the agent's own panel "
+            f"did. The leg researched the right subject; the extraction may not "
+            f"be what it wrote. No alert raised.", "WARN")
+    return verdict
+
+
 def apply_off_topic_sweep(results: dict, queue_dir) -> "list[str]":
     """Blank every `results[name]["text"]` that is demonstrably not this run's
     research. Mutates `results` in place; returns the rejected names.
@@ -25382,6 +25737,12 @@ def apply_off_topic_sweep(results: dict, queue_dir) -> "list[str]":
         if reject_off_topic_text(text, queue_dir, name,
                                  name.lower().replace(" ", ""),
                                  op="phase2_finalize_topic_guard"):
+            # It survived the incumbent — which, below 20,000 characters, means
+            # only that the incumbent could not look. Ask the second witness.
+            _so_key = name.lower().replace(" ", "")
+            if "topic_second_opinion" not in r:
+                r["topic_second_opinion"] = _second_opinion_on_agent(
+                    text, _t, _so_key, name)
             continue
         r["text"] = ""
         r["verified"] = False
@@ -44841,11 +45202,18 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
                 pass
         # Loop condition re-checks brief_len<100 → exits the moment text appears.
 
-    # Brief-short guard: DR briefs are typically 2-5k chars. Under 500 while
-    # we were expecting >1000 usually means ChatGPT errored or the extractor
-    # grabbed the wrong element. Warn (not error) so the frontend can offer
-    # [continue_anyway] / [retry] — the caller polls consume_continue_anyway()
-    # to decide whether to accept the short brief.
+    # Brief-short guard. Under 500 while we were expecting >1000 usually means
+    # ChatGPT errored or the extractor grabbed the wrong element. Warn (not
+    # error) so the frontend can offer [continue_anyway] / [retry] — the caller
+    # polls consume_continue_anyway() to decide whether to accept the short brief.
+    #
+    # ⛔⛔ 2026-09-02 — THIS COMMENT USED TO SAY "DR briefs are typically 2-5k
+    # chars" AND IT WAS FICTION. Twenty-seven briefs in this machine's own logs
+    # measure 46,183 to 73,494 characters, median 62,893; not one is under 46 KB.
+    # Nothing caught it because every gate built on the figure is a floor, and a
+    # 62 KB brief clears a 500-character floor without anyone looking. It was
+    # still being quoted as a measurement in planning documents a year later,
+    # which is how a stale comment becomes a stale decision.
     P1_MAX_USER_RETRIES = 2  # total attempts = 1 + P1_MAX_USER_RETRIES
     if brief_text and brief_len >= 100 and brief_len < 500:
         retries_left = max(0, P1_MAX_USER_RETRIES - _retry_count)
@@ -44873,6 +45241,50 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
                                         verbose=verbose, feedback=feedback,
                                         _retry_count=_retry_count + 1)
             # 'continue_anyway' or 'timeout' → fall through and return short brief
+
+    # ── ⭐⭐ IS THE BRIEF EVEN ABOUT THE TOPIC? (2026-09-02) ──
+    #
+    # Everything above this line measures the brief with a ruler. Nothing has
+    # ever read it. The reports have been guarded since 2026-08-05; the document
+    # all three of them work from has not, and it is the one artefact whose being
+    # wrong costs every leg at once — one string is pasted into three composers
+    # and the same file is attached to all three.
+    #
+    # HERE, and not at the write in the caller, for three measured reasons:
+    #   * both machine-written briefs come through this return — the live one and
+    #     the resume-with-input regeneration, which re-enters this function — so
+    #     one placement covers both and a future third path cannot out-flank it;
+    #   * it is BEFORE the brief is written to disk, mirrored to Firestore, or
+    #     pasted to anyone, which is the last moment the loss is preventable;
+    #   * `topic` is a parameter here. The caller's guard would have to resolve
+    #     it from disk, and meta.json/checkpoint.json DO NOT EXIST YET at phase 1
+    #     — the run's own topic file is written after this returns — so the disk
+    #     resolver would fall back to the run DIRECTORY name, which is the topic
+    #     with punctuation stripped and truncated to fifty characters.
+    #
+    # ⛔ IT ASKS. IT NEVER DELETES. The sink guard's answer to a bad document is
+    # to blank it, which is right for one agent's report and fatal for a brief:
+    # phase 2 cannot run without one and would fail complaining that the brief is
+    # MISSING rather than wrong. So this raises the same card the short-brief
+    # guard raises, on the same decision bus and the same retry budget, and a
+    # user who disagrees keeps their brief.
+    # ⛔ THE DECISION AND ITS CONSEQUENCE LIVE IN `brief_topic_gate`, NOT HERE,
+    # and that is a testability decision with a history. `run_phase1` is a
+    # six-hundred-line browser coroutine that no test in this repo executes, so a
+    # guard written out inline here could only ever be pinned by reading its
+    # source — and the plan for this very step warned that a test asserting the
+    # call exists would pass against a guard that cannot fire. Everything that
+    # decides anything is in the gate, which runs in a test with no browser; what
+    # is left below is a dispatch of three named outcomes.
+    _bt_action = await brief_topic_gate(brief_text, topic,
+                                        retry_count=_retry_count,
+                                        max_retries=P1_MAX_USER_RETRIES)
+    if _bt_action == "stop":
+        return None
+    if _bt_action == "retry":
+        return await run_phase1(browser, cua_client, topic, pdf_paths,
+                                verbose=verbose, feedback=feedback,
+                                _retry_count=_retry_count + 1)
 
     if brief_text and brief_len > 100:
         log(f"Brief extracted: {brief_len} chars")
@@ -54713,6 +55125,9 @@ def _build_phase2_to_phase3_handoff(results: dict, queue_dir) -> None:
     agent re-visits, no CUA in P3.
     """
     p3_links: dict[str, str] = {}
+    # Report files this run deliberately refused to publish, so the Flow-B
+    # fallback scan below cannot pick them straight back up off disk.
+    _dropped_stems: set = set()
     p3_md_files: list = []
     for _name, _r in (results or {}).items():
         _md_name = _name.lower().replace(" ", "") + ".md"
@@ -54759,6 +55174,28 @@ def _build_phase2_to_phase3_handoff(results: dict, queue_dir) -> None:
             _url = ""
         if _url:
             p3_links[_name] = _url
+        # ⛔⛔ 2026-09-02 — AND THE SWEEP'S OWN SENTENCE WAS HALF FALSE. When it
+        # rejects a leg it logs that the text "will not be written to documents/,
+        # mirrored to Firestore, merged into consolidated.md, or handed to
+        # NotebookLM". True of the link, which the branch above drops. NOT true of
+        # the FILE: the append below asked only whether a file exists on disk and
+        # was over 100 bytes. Nothing about the rejection reached it.
+        #
+        # Today that gap is closed by luck rather than by design — the writers are
+        # all gated on the text the sweep blanks, so a rejected leg leaves no file
+        # to find. Luck is not a gate, and it runs out two ways: a plain
+        # pause/resume does not clear `documents/` (only a feedback-targeted
+        # resume does), so a previous attempt's file outlives the rejection; and
+        # the moment any check gains the power to reject something the FIRST pass
+        # accepted, the file is already on disk, written by the finalize path,
+        # with no deleter anywhere in this file.
+        #
+        # One marker, both consequences, side by side where a reader sees them.
+        if _has_md and _r.get("off_topic_rejected"):
+            log(f"[Phase 2→3 handoff] dropping {_name}'s report file — its "
+                f"output was rejected as off-topic, so it is not a source", "WARN")
+            _has_md = False
+            _dropped_stems.add(_md_path.stem.lower())
         if _has_md:
             p3_md_files.append(_md_path)
     # Flow B: P1 + all P2 skipped means `results` is empty, so the loop
@@ -54787,6 +55224,19 @@ def _build_phase2_to_phase3_handoff(results: dict, queue_dir) -> None:
                 # writes lowercase, but the file is the source of truth
                 # for what NLM uploads so this guard is cheap).
                 if _f.stem.lower() in _DERIVED_STEMS:
+                    continue
+                # ⛔⛔ 2026-09-02 — AND THIS SCAN COULD UNDO THE DROP ABOVE.
+                # Its gate reads "only scan when the per-agent loop added
+                # NOTHING", written for Flow B where nothing was added because
+                # NO AGENT RAN. "Nothing" has a second meaning nobody wrote for:
+                # every agent that ran was REJECTED. In that case the loop above
+                # has just refused these exact files and the scan finds them
+                # again on disk, one directory listing later, and uploads them.
+                # Found by the test for the drop above — the drop passed and the
+                # file arrived at NotebookLM anyway.
+                if _f.stem.lower() in _dropped_stems:
+                    log(f"[Phase 2→3 handoff] not restoring {_f.name} from disk — "
+                        f"this run refused it", "WARN")
                     continue
                 if _f.suffix.lower() not in (".md", ".txt", ".pdf", ".docx"):
                     continue

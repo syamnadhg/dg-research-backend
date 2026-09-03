@@ -972,31 +972,52 @@ def test_run_phase2_sweeps_before_it_returns():
     assert "return" not in guard, guard
 
 
-def test_EVERY_writer_of_an_agent_md_is_downstream_of_the_sweep():
+def test_EVERY_writer_of_an_agent_md_is_covered_by_one_guard_or_the_other():
     """The invariant, enumerated rather than sampled.
 
-    The previous version of this test named the two writers I happened to know about
-    while its docstring claimed a universal rule — and there were four. So find them
-    all, and require each to be reached only from a swept `results`.
+    ⛔⛔ 2026-09-02 — AND THE ENUMERATION MISSED THE ONE THAT MATTERED, TWICE.
+    This test's own docstring recorded the lesson ("the previous version named the
+    two writers I happened to know about while its docstring claimed a universal
+    rule — and there were four"), then repeated the mistake: it searched for the
+    literal `(queue_dir / "documents" / fname).write_text` and there is a FOURTH
+    writer, inside `extract_and_record_agent`, spelled `(documents_dir /
+    fname).write_text`. That writer runs FIRST, it is upstream of both sweeps, and
+    it is the one that actually put the 121KB of golden retrievers on disk on
+    2026-08-05. Three post-sweep writers satisfied `>= 3` while the writer the
+    incident went through was invisible to the search.
+
+    So: match on the part of the expression every spelling shares, and require of
+    each writer that it is covered by ONE of the two mechanisms —
+
+      * downstream of a swept `results` (the three finalize-block writers), or
+      * preceded by its own `reject_off_topic_text` call (the finalize path's
+        per-agent guard, which is why that writer was never actually unguarded).
+
+    A new writer with neither fails here, which is the whole point.
     """
     from conftest import code_only  # type: ignore
     src = code_only(Path(research.__file__).read_text(encoding="utf-8"))
     writers = [i for i in range(len(src))
-               if src.startswith('(queue_dir / "documents" / fname).write_text', i)]
-    assert len(writers) >= 3, (
-        f"expected at least 3 per-agent MD writers, found {len(writers)} — if the "
-        f"count dropped, confirm a path was removed rather than renamed")
-    # Every one of them consumes a `results` that run_phase2 already swept, so the
-    # single in-function sweep is what covers them. Pin that there is exactly one
-    # `run_phase2` definition and that its return is guarded (above), plus that no
-    # writer reads a `results` built anywhere else.
+               if src.startswith('fname).write_text', i)]
+    assert len(writers) == 4, (
+        f"expected 4 per-agent MD writers, found {len(writers)} — if the count "
+        f"moved, confirm a path was added or removed rather than renamed")
     assert src.count("async def run_phase2(") == 1
+    swept = guarded = 0
     for i in writers:
         head = src[max(0, i - 4000):i]
-        assert ("results = await run_phase2(" in head
-                or "for name, r in results.items():" in head), (
-            f"the MD writer at offset {i} does not visibly consume run_phase2's "
-            f"results — it may be a new unswept path")
+        _swept = ("results = await run_phase2(" in head
+                  or "for name, r in results.items():" in head)
+        _guarded = "reject_off_topic_text(" in head
+        assert _swept or _guarded, (
+            f"the MD writer at offset {i} neither consumes a swept `results` nor "
+            f"runs after its own topic guard — it is an unguarded path to disk")
+        swept += _swept
+        guarded += _guarded and not _swept
+    assert guarded == 1, (
+        f"exactly one writer is covered by the per-path guard rather than the "
+        f"sweep — the finalize path, which writes before either sweep runs; "
+        f"found {guarded}")
 
 
 def test_the_consolidated_build_is_downstream_of_the_sweep():
