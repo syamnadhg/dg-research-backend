@@ -142,7 +142,7 @@ class TestTheEventTable:
         emitted = set(re.findall(r'request_pause\("([a-z_]+)"\)', CODE))
         assert emitted == {"login_required", "pro_required",
                            "human_verification_required", "cua_unavailable",
-                           "agent_link_failed"}
+                           "agent_link_failed", "google_credential_expired"}
         # A bare `request_pause()` is the ordinary user pause and carries no
         # reason at all — the case the old row invented a name for.
         assert re.search(r"request_pause\(\)", CODE)

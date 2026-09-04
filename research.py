@@ -1423,6 +1423,56 @@ def _anthropic_key_is_sharers():
     return _RUN_ANTHROPIC_ATTR["is_sharers"]
 
 
+def _probe_google_credentials(timeout=20):
+    """Ask the app whether the Google identities phases 4 and 5 run on are alive.
+
+    ⛔⛔ NOTHING ASKED UNTIL MINUTE 40 OF A 40-MINUTE RUN. On 2026-09-03 phase 5's
+    OAuth grant had been revoked. The run did all its research, wrote three
+    reports, encoded and uploaded a podcast, and only then discovered it could
+    not create the document. The preflight below skipped both Google-backed
+    phases on the note that they are "FE-owned … neither needs login
+    verification in the BE preflight" — true of a browser login WALK, and read
+    for four months as needing no check at all. The same sentence had already
+    been written about the Anthropic key, and the #705 probe beside this one is
+    what it turned into.
+
+    ⛔⛔ PHASE 5 IS THE ONE CREDENTIAL WITH NO REDUNDANCY, BY DESIGN. A document
+    has to land in ONE Drive, so the identity is pinned and there is nothing to
+    rotate to — which makes it exactly the credential worth checking before the
+    work rather than after it. Phase 4's pool degrades quietly instead: rotation
+    covers a dead slot so well that one was rejected on every pick for eight
+    weeks with nothing but a WARN line to show for it.
+
+    ⚠ The credentials live in App Hosting Secrets and are unreadable from here,
+    so this asks the app rather than checking anything itself. Returns the
+    parsed health dict, or None when the answer could not be obtained — and
+    None must never block a run: a preflight that fails closed on its own
+    network blip is worse than the gap it was added to close.
+    """
+    try:
+        import requests as _requests
+        from auth.v2_flow import FE_BASE_URL as _FE_BASE_URL
+    except Exception as _imp:
+        log(f"Phase 0: Google credential probe unavailable ({_imp})", "DEBUG")
+        return None
+    _tok = _fresh_user_mode_id_token()
+    if not _tok:
+        log("Phase 0: Google credential probe skipped — no id token", "DEBUG")
+        return None
+    try:
+        _r = _requests.get(f"{_FE_BASE_URL}/api/health/google",
+                           headers={"Authorization": f"Bearer {_tok}"},
+                           timeout=timeout)
+        if _r.status_code != 200:
+            log(f"Phase 0: Google credential probe HTTP {_r.status_code} — "
+                "proceeding unchecked", "WARN")
+            return None
+        return _r.json()
+    except Exception as _e:
+        log(f"Phase 0: Google credential probe failed ({_e}) — proceeding unchecked", "WARN")
+        return None
+
+
 def _anthropic_key_card_copy(kind, label=""):
     """#938: honest key attribution for the Anthropic error cards.
 
@@ -23357,6 +23407,17 @@ ALERT_INTENTS = {
     "crash_login_interrupt": {"class": "blocker",     "actions": ["retry_resume"]},
     "crash_loop":            {"class": "recoverable", "actions": ["retry_resume", "discard"]},
     "cua_unavailable":       {"class": "blocker",     "actions": ["retry_phase"]},
+    # #282: the phase-0 Google credential preflight. Blocker, and RETRY-ONLY for
+    # the same reason `cua_unavailable` is — the sign-in is reconnected
+    # out-of-band, so nothing here can auto-heal and no action on the card can
+    # fix it either.
+    #
+    # ⛔ NO `skip_phase`, AND NOT BECAUSE SKIPPING PHASE 5 IS UNTHINKABLE. The
+    # action is scoped to the card's OWN phase, and this card is phase 0 — so a
+    # skip token here would offer to skip the preflight, not the Doc. Wanting to
+    # run without the document is reasonable; this is not the control that
+    # expresses it, and one that looked like it would be worse than none.
+    "oauth_expired":         {"class": "blocker",     "actions": ["retry_phase"]},
 }
 
 # Live (unresolved) decision_ids — the liveness gate for the Phase-3 async
@@ -60870,6 +60931,67 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     _controls.consume_retry_phase(0)
                     _controls.retry_init_verify = False
                     continue
+
+        # ── #282: Google credential preflight (infra, NOT login) ──
+        # ⛔⛔ THE COMMENT ABOVE IS WHY THIS DID NOT EXIST. "P5 (Doc + email)
+        # dropped 2026-04-30 — FE-owned … neither needs login verification in
+        # the BE preflight" is true of a browser LOGIN WALK and was read for
+        # four months as needing no check at all. On 2026-09-03 phase 5's grant
+        # had been revoked and the run found out at minute 40, after the
+        # research, the reports and the podcast upload were already done.
+        #
+        # ⛔ IT RUNS ABOVE THE skipInitVerify BLANKING, like the CUA probe: this
+        # is a dead credential, not a login nicety, and the two failed the same
+        # way for the same reason.
+        #
+        # ⚠ AND IT ONLY BLOCKS ON PHASE 5. That identity is pinned by design —
+        # a document lands in ONE Drive — so a refusal there is fatal and
+        # nothing can rotate around it. The phase-4 pool is reported and never
+        # blocked on: one live slot still uploads, and stranding a whole run
+        # over a degraded pool would trade a real research result for a warning.
+        _need_p5 = 5 not in skip_phases
+        _need_p4 = 4 not in skip_phases
+        if _need_p5 or _need_p4:
+            _gcred = _probe_google_credentials()
+            if _gcred:
+                _pool_n = int(_gcred.get("poolHealthy") or 0)
+                _pool_t = int(_gcred.get("poolTotal") or 0)
+                _drv = _gcred.get("drive") or {}
+                # ⚠ ONE LINE, HEALTHY OR NOT. A pool that silently degrades is
+                # the failure this closes, and logging only on failure leaves
+                # "3 of 3" and "never ran" identical in the record.
+                log(f"Phase 0: Google credentials — doc identity "
+                    f"{'ok' if _drv.get('ok') else (_drv.get('error') or 'unset')}, "
+                    f"upload pool {_pool_n}/{_pool_t} healthy")
+                if _need_p4 and _pool_t and _pool_n < _pool_t:
+                    _dead = ", ".join(
+                        f"{a.get('label')} ({a.get('error')}"
+                        + (f": {a.get('detail')}" if a.get("detail") else "") + ")"
+                        for a in (_gcred.get("pool") or []) if not a.get("ok"))
+                    log(f"Phase 0: upload pool DEGRADED — {_pool_t - _pool_n} of "
+                        f"{_pool_t} account(s) rejected: {_dead}", "WARN")
+                if _need_p5 and _gcred.get("driveBlocked"):
+                    _why = _drv.get("detail") or _drv.get("error") or "rejected"
+                    log(f"Phase 0: the Doc + email identity is dead — {_why}", "ERROR")
+                    fail_phase(
+                        0, "Google Docs access has expired",
+                        "The Google sign-in that creates your research document has been "
+                        f"rejected: {_why} It has to be reconnected before a run can "
+                        "finish — starting now would do all the research and then fail "
+                        "at the last step.",
+                        agent="system",
+                        intent="oauth_expired",
+                        alert_id="phase0_google_credential",
+                    )
+                    _controls.request_pause("google_credential_expired")
+                    emit_event("pipeline_paused", phase=0, reason="google_credential_expired")
+                    await _controls.wait_if_paused()
+                    if _controls.is_stop():
+                        emit_event("pipeline_stopped", phase=0,
+                                   reason="stopped during google_credential_expired")
+                        return
+                    emit_event("pipeline_resumed", phase=0, reason="retry")
+                    _controls.consume_retry_phase(0)
 
         # Honor the user's preference (global Settings → Pipeline → Skip
         # login verification, plus any per-run override in pipeline_config).
