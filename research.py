@@ -59354,7 +59354,45 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
             # (loopback, reserved names) because a URL not written is gone and
             # this list is capped and never revisited.
             urls = [u for u in _sweep_source_urls(content) if not _find_is_platform_host(u)]
-            unique_urls = list(dict.fromkeys(urls))[:_SOURCE_LIST_CAP]  # Dedupe, cap at the shared ceiling
+            # ⛔⛔ UNION WITH THE PANEL, NOT INSTEAD OF IT — AND THE OLD RULE HAD
+            # ITS REASONING RIGHT AND ITS FAILURE CASE MISSING. The fallback below
+            # writes the live panel's captures only for an agent with NO report,
+            # on the argument that "an agent WITH a report already has
+            # citation-derived sources from its own text, and those are the better
+            # list". True whenever the report cites addresses. On 2026-09-03 not
+            # one of three reports contained a single URL — they cited by name —
+            # so `urls` was empty, the report existed, the fallback was skipped,
+            # and the panel's genuine research hosts were thrown away for being
+            # second best to nothing.
+            #
+            # ⭐ THE REPORT STAYS PRIMARY: its citations lead, in the order it
+            # made them, because they are what the agent actually leaned on. The
+            # panel FOLLOWS, and it answers a different question — what the model
+            # opened and did not cite. Neither can replace the other, and the
+            # union cannot be empty unless both rungs were.
+            _panel_urls = []
+            try:
+                _panel_urls = [
+                    u for u in (getattr(_runtime, "agent_progress_snapshots", {})
+                                .get(platform, {}) or {}).get("source_urls", []) or []
+                    if isinstance(u, str) and u.lower().startswith(("http://", "https://"))
+                    and not _find_is_platform_host(u)
+                ]
+            except Exception:
+                _panel_urls = []
+            # ⛔ DEDUPED ON THE NORMALISED KEY, NOT THE RAW STRING. The panel row
+            # and the report's own citation of one page differ by the tracking tag
+            # the platform adds on the way out, so a raw dedupe lists the same
+            # source twice and inflates the count the user is shown.
+            _seen_keys, unique_urls = set(), []
+            for _u in urls + _panel_urls:
+                _k = _find_normalize_url(_u)
+                if _k in _seen_keys:
+                    continue
+                _seen_keys.add(_k)
+                unique_urls.append(_u)
+                if len(unique_urls) >= _SOURCE_LIST_CAP:
+                    break
             # Build/update agent entry. unique_urls is already capped at 50.
             existing = agents.get(platform, {})
             # 2026-05-04: pull the runtime per-agent progress snapshot so
@@ -59454,10 +59492,17 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
         # needed it. Owner, 2026-08-29: "if there are sources, let the narration
         # show the sources and stuff."
         #
-        # ⛔ ONLY WHERE THE REBUILD DID NOT RUN. An agent WITH a report already has
-        # citation-derived sources from its own text, and those are the better
-        # list — they are what the report actually cited, not what the panel
-        # happened to show. This must never overwrite them.
+        # ⛔ ONLY WHERE THE REBUILD DID NOT RUN — i.e. an agent with no report file
+        # at all. An agent WITH a report now gets the union of its own citations
+        # and this same panel list, built above, so there is nothing left here for
+        # it to add and nothing to overwrite.
+        #
+        # ⛔⛔ THIS COMMENT USED TO SAY THE PANEL MUST NEVER REACH AN AGENT THAT
+        # HAS A REPORT, "because citation-derived sources are the better list".
+        # The reasoning was right and its failure case was missing: on 2026-09-03
+        # all three reports cited by NAME and carried no address at all, so the
+        # better list was empty, this branch was skipped for having a report, and
+        # the panel's genuine research hosts were discarded in favour of nothing.
         if platform not in agents or "sources" not in agents.get(platform, {}):
             try:
                 _fallback_snap = dict(
