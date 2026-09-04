@@ -25217,12 +25217,72 @@ _NARR_WH_LEADING = frozenset({
 # Hosts that should not be cited as "sources" — they ARE the agent UI
 # itself or its CDN. Filtered before passing hostnames into the narrator
 # prompt (otherwise narration says "scraping chatgpt.com" which is dumb).
+#
+# ⛔⛔ THIS IS THE ONE LIST. It was not, and the copies disagreed in both
+# directions. `accounts.google.com` joined it from the Gemini panel scrape,
+# which was the only reader that had ever excluded the sign-in host.
 _HOST_DENYLIST = frozenset({
     "chatgpt.com", "openai.com", "chat.openai.com", "oaiusercontent.com",
     "claude.ai", "anthropic.com",
     "gemini.google.com", "bard.google.com",
     "notebooklm.google.com", "notebook.google.com",
+    "accounts.google.com",
 })
+
+
+def _is_platform_host(host: str) -> bool:
+    """Is this HOSTNAME one of the agents' own pages rather than a research source?
+
+    ⛔⛔ THE MEMBERSHIP TESTS THIS REPLACES WERE EXACT, AND THAT IS HOW AN
+    ANTHROPIC SUPPORT PAGE WAS PRESENTED TO THE OWNER AS A RESEARCH SOURCE.
+    `host in _HOST_DENYLIST` answers False for `support.anthropic.com`,
+    `cdn.openai.com` and `files.oaiusercontent.com` — every subdomain of every
+    host on the list — because a frozenset test is equality. The suffix rule was
+    written once, for the findings extractor, and the three narrator readers kept
+    the equality test beside it.
+
+    ⭐ Anchored on a LABEL boundary, not a bare suffix, so `notchatgpt.com` is not
+    swallowed by `chatgpt.com`.
+    """
+    h = (host or "").strip().lower()
+    if h.startswith("www."):
+        h = h[4:]
+    if not h:
+        return False
+    return any(h == d or h.endswith("." + d) for d in _HOST_DENYLIST)
+
+
+def _js_platform_guard(var: str) -> str:
+    """JS that answers "is `var` one of the agents' own pages?" — HOST-tested.
+
+    ⛔⛔ EVERY SCRAPE SITE ASKED THIS OF THE WHOLE URL, AND CHATGPT MADE THAT
+    CATASTROPHIC. `h.includes('chatgpt.com')` was written to skip the platform's
+    own pages; ChatGPT appends `?utm_source=chatgpt.com` to EVERY outbound source
+    link, so the filter was instead discarding every genuine source it saw.
+    Measured against the captured panel of the 6 August run: 22 of 40 anchors
+    dropped, 16 sources reported where 36 distinct ones existed. That was
+    diagnosed once and repaired at ONE of the ten sites — the panel reader — and
+    the other nine kept the substring test for another month. This is the same
+    rule as `_find_is_platform_host`, in the language the scrapes run in.
+
+    ⛔ It is INLINED at each call site rather than injected once as a shared page
+    function, and that is deliberate. Each site is a separate `evaluate` against a
+    different page or frame, so a shared function would mean wrapping ten evaluate
+    bodies — and a malformed JS string in this file does not raise, it returns
+    nothing and the run reports zero sources, which is indistinguishable from an
+    agent that cited nothing. One Python definition with a test that every site
+    matches it byte for byte buys the same single-source-of-truth for none of that
+    risk. `test_platform_host_filter_0903` is what makes it true.
+
+    ⭐ Anchored at BOTH ends over a host, so `docs.nvidia.com` survives,
+    `cdn.openai.com` does not, and a hypothetical `notchatgpt.com` is not
+    swallowed by a bare suffix test.
+    """
+    alt = "|".join(sorted(d.replace(".", "\\.") for d in _HOST_DENYLIST))
+    return (f"/(^|\\.)({alt})$/i.test("
+            f"String({var}||'').replace(/^https?:\\/\\//i,'')"
+            ".split(/[\\/?#]/)[0].toLowerCase()"
+            ".replace(/:\\d+$/,'').replace(/^www\\./,''))")
 
 
 def _narration_last_sentence(s: str, limit: int | None = None) -> str:
@@ -25999,7 +26059,7 @@ def _extract_top_hosts(events: list, limit: int = 2) -> list:
                     host = host[4:]
             except Exception:
                 continue
-            if not host or host in _HOST_DENYLIST or host in seen_set:
+            if not host or _is_platform_host(host) or host in seen_set:
                 continue
             seen.append(host)
             seen_set.add(host)
@@ -26118,7 +26178,7 @@ def _compact_event_for_narration(e: dict) -> str:
                     host = host[4:]
             except Exception:
                 host = ""
-            if host and host not in _HOST_DENYLIST:
+            if host and not _is_platform_host(host):
                 parts.append(f"host={host}")
         if label:
             parts.append(f"label={str(label)[:40]}")
@@ -26147,7 +26207,7 @@ def _compact_event_for_narration(e: dict) -> str:
                             h = h[4:]
                     except Exception:
                         continue
-                    if not h or h in _HOST_DENYLIST or h in _hosts_seen:
+                    if not h or _is_platform_host(h) or h in _hosts_seen:
                         continue
                     _hosts.append(h)
                     _hosts_seen.add(h)
@@ -27297,7 +27357,7 @@ async def scrape_progress_chatgpt(page):
                 '[data-testid="canvas"] a[href*="http"], .canvas-container a[href*="http"]'
             ).forEach(s => {
                 const href = s.href || '';
-                if (href.startsWith('http') && !href.includes('chatgpt.com') && !href.includes('openai.com') && !href.includes('chat.openai') && !href.includes('oaiusercontent') && href.length < 500)
+                if (href.startsWith('http') && href.length < 500 && !/(^|\\.)(accounts\\.google\\.com|anthropic\\.com|bard\\.google\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|gemini\\.google\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|openai\\.com)$/i.test(String(href||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,'')))
                     srcSet.add(href);
             });
             r.source_urls = Array.from(srcSet).slice(0, 200);
@@ -27391,8 +27451,7 @@ async def scrape_progress_chatgpt(page):
                             if (real && real.startsWith('http')) h = decodeURIComponent(real);
                         }
                     } catch(e) {}
-                    if (h.includes('chatgpt.com') || h.includes('openai.com') ||
-                        h.includes('oaiusercontent') || h.includes('chat.openai')) return;
+                    if (/(^|\\.)(accounts\\.google\\.com|anthropic\\.com|bard\\.google\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|gemini\\.google\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|openai\\.com)$/i.test(String(h||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,''))) return;
                     srcSet.add(h);
                 });
                 out.source_urls = Array.from(srcSet).slice(0, 200);
@@ -27525,9 +27584,7 @@ async def scrape_progress_chatgpt(page):
                         const srcSet = new Set();
                         document.querySelectorAll('a[href^="http"]').forEach(a => {
                             const h = a.href || '';
-                            if (h.length < 500 &&
-                                !h.includes('chatgpt.com') && !h.includes('openai.com') &&
-                                !h.includes('oaiusercontent')) srcSet.add(h);
+                            if (h.length < 500 && !/(^|\\.)(accounts\\.google\\.com|anthropic\\.com|bard\\.google\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|gemini\\.google\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|openai\\.com)$/i.test(String(h||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,''))) srcSet.add(h);
                         });
                         d.source_urls = Array.from(srcSet).slice(0, 200);
                         // 3. Headings in the DR report
@@ -27643,9 +27700,7 @@ async def scrape_progress_chatgpt(page):
                                     const srcSet = new Set();
                                     document.querySelectorAll('a[href^="http"]').forEach(a => {
                                         const h = a.href || '';
-                                        if (h.length < 500 &&
-                                            !h.includes('chatgpt.com') && !h.includes('openai.com') &&
-                                            !h.includes('oaiusercontent')) srcSet.add(h);
+                                        if (h.length < 500 && !/(^|\\.)(accounts\\.google\\.com|anthropic\\.com|bard\\.google\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|gemini\\.google\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|openai\\.com)$/i.test(String(h||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,''))) srcSet.add(h);
                                     });
                                     return { source_urls: Array.from(srcSet).slice(0, 200) };
                                 }""")
@@ -27740,9 +27795,7 @@ async def scrape_progress_chatgpt(page):
                                         const srcSet = new Set();
                                         root.querySelectorAll('a[href^="http"]').forEach(a => {
                                             const h = a.href || '';
-                                            if (h.length < 500 &&
-                                                !h.includes('chatgpt.com') && !h.includes('openai.com') &&
-                                                !h.includes('oaiusercontent')) srcSet.add(h);
+                                            if (h.length < 500 && !/(^|\\.)(accounts\\.google\\.com|anthropic\\.com|bard\\.google\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|gemini\\.google\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|openai\\.com)$/i.test(String(h||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,''))) srcSet.add(h);
                                         });
                                         return { source_urls: Array.from(srcSet).slice(0, 200) };
                                     }""")
@@ -28171,8 +28224,7 @@ _CHATGPT_INLINE_ACTIVITY_JS = """() => {
                 if (real && real.startsWith('http')) h = decodeURIComponent(real);
             }
         } catch (e) {}
-        if (h.includes('chatgpt.com') || h.includes('openai.com') ||
-            h.includes('oaiusercontent') || h.includes('chat.openai')) return;
+        if (/(^|\\.)(accounts\\.google\\.com|anthropic\\.com|bard\\.google\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|gemini\\.google\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|openai\\.com)$/i.test(String(h||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,''))) return;
         if (seenUrl.has(h)) return;
         seenUrl.add(h);
         out.source_urls.push(h);
@@ -29781,10 +29833,7 @@ async def scrape_progress_gemini(page):
                     const panelSrcSet = new Set();
                     panelMatched.querySelectorAll('a[href^="http"]').forEach(a => {
                         const h = a.href || '';
-                        if (h.length < 500 &&
-                            !h.includes('google.com/gemini') &&
-                            !h.includes('accounts.google') &&
-                            !h.includes('gemini.google')) panelSrcSet.add(h);
+                        if (h.length < 500 && !/(^|\\.)(accounts\\.google\\.com|anthropic\\.com|bard\\.google\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|gemini\\.google\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|openai\\.com)$/i.test(String(h||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,''))) panelSrcSet.add(h);
                     });
                     if (panelSrcSet.size > 0) {
                         // We'll union with the global srcSet below.
@@ -30100,7 +30149,7 @@ async def scrape_progress_claude(page):
             const srcSet = new Set();
             document.querySelectorAll('.font-claude-message a[href*="http"], .contents a[href*="http"]').forEach(a => {
                 const href = a.href || '';
-                if (href.startsWith('http') && !href.includes('claude.ai') && !href.includes('anthropic.com'))
+                if (href.startsWith('http') && !/(^|\\.)(accounts\\.google\\.com|anthropic\\.com|bard\\.google\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|gemini\\.google\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|openai\\.com)$/i.test(String(href||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,'')))
                     srcSet.add(href);
             });
             document.querySelectorAll('[class*="tool"] a[href], .tool-result a[href]').forEach(a => {
@@ -32871,8 +32920,7 @@ async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None,
                 (root || document).querySelectorAll('a[href^="http"]').forEach(a => {
                     const h = a.href || '';
                     if (!root && a.closest('nav, aside, [class*="sidebar" i]')) return;
-                    if (h && h.length < 500 && !h.includes('claude.ai') &&
-                        !h.includes('anthropic.com') && !seen.has(h)) {
+                    if (h && h.length < 500 && !/(^|\\.)(accounts\\.google\\.com|anthropic\\.com|bard\\.google\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|gemini\\.google\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|openai\\.com)$/i.test(String(h||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,'')) && !seen.has(h)) {
                         seen.add(h); out.source_urls.push(h);
                     }
                 });
@@ -33330,7 +33378,7 @@ async def scrape_chatgpt_activity_panel_tracking(page):
         // Subdomain-aware and anchored at both ends, so `docs.nvidia.com` is kept
         // while `chatgpt.com` and `cdn.openai.com` are not. A bare `endsWith`
         // would also swallow a hypothetical `notchatgpt.com`.
-        const INTERNAL_HOST = /(^|\\.)(chatgpt\\.com|openai\\.com)$/i;
+        const INTERNAL_HOST = /(^|\\.)(accounts\\.google\\.com|anthropic\\.com|bard\\.google\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|gemini\\.google\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|openai\\.com)$/i;
         // Tracking parameters are not part of a source's identity: one page cited
         // twice, once tagged and once not, is ONE source. Stripping them here is
         // what keeps the recovered links from re-inflating the count (36 distinct,
@@ -58985,12 +59033,17 @@ def _find_normalize_url(u: str) -> str:
 def _find_is_platform_host(u: str) -> bool:
     """Is this URL one of the agents' own pages rather than a research source?
 
-    ⚠ SUFFIX-aware, unlike the bare `host in _HOST_DENYLIST` membership tests
-    elsewhere. Those are fed hosts the panel scrape already normalised; a report
-    cites whatever the agent wrote, which includes `cdn.openai.com` and
-    `files.oaiusercontent.com` — subdomains an exact-set test lets straight
-    through. This is the same "guard the HOST, not the whole URL" rule that a
-    substring filter here once broke by discarding 56% of a run's sources.
+    The URL-taking face of `_is_platform_host`. A report cites whatever the agent
+    wrote, which includes `cdn.openai.com` and `files.oaiusercontent.com` —
+    subdomains an equality test lets straight through.
+
+    ⛔ 2026-09-03 — THIS DOCSTRING USED TO SAY THIS FUNCTION WAS "SUFFIX-aware,
+    UNLIKE THE BARE `host in _HOST_DENYLIST` MEMBERSHIP TESTS ELSEWHERE", and
+    that sentence described a real split for a month without closing it. There
+    are no such tests now: every reader goes through `_is_platform_host`, and the
+    two scrape-side spellings go through `_js_platform_guard` and the one panel
+    regex, all built from the same `_HOST_DENYLIST`. Noting a divergence is not
+    the same as ending it, and a note that outlives its fix reads as a decision.
     """
     try:
         from urllib.parse import urlsplit
@@ -58999,9 +59052,7 @@ def _find_is_platform_host(u: str) -> bool:
         return False
     if not host:
         return False
-    if host.startswith("www."):
-        host = host[4:]
-    return any(host == d or host.endswith("." + d) for d in _HOST_DENYLIST)
+    return _is_platform_host(host)
 
 
 def _extract_findings(md: str, source_urls: list) -> list:
@@ -59261,8 +59312,18 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
                 sections = list(dict.fromkeys(sections))[:20]  # Dedupe
             # Filter out the file header we added
             sections = [s for s in sections if s not in ("ChatGPT Deep Research", "Gemini Deep Research", "Claude Deep Research")]
-            # Extract source URLs from markdown links and references
-            urls = _sweep_source_urls(content)
+            # Extract source URLs from markdown links and references.
+            #
+            # ⛔⛔ THE SOURCES LIST AND THE FINDINGS LIST WERE ANSWERING THE SAME
+            # QUESTION DIFFERENTLY FOR THE SAME RUN. `_extract_findings` drops the
+            # agents' own pages; this write did not, so a Claude report citing an
+            # Anthropic support page put it in the user's Sources and left it out
+            # of Findings — the link the owner asked about. A platform host is
+            # never a research source, which is the one host judgement safe to
+            # make on the write side: `_sweep_source_urls` still refuses the rest
+            # (loopback, reserved names) because a URL not written is gone and
+            # this list is capped and never revisited.
+            urls = [u for u in _sweep_source_urls(content) if not _find_is_platform_host(u)]
             unique_urls = list(dict.fromkeys(urls))[:_SOURCE_LIST_CAP]  # Dedupe, cap at the shared ceiling
             # Build/update agent entry. unique_urls is already capped at 50.
             existing = agents.get(platform, {})
