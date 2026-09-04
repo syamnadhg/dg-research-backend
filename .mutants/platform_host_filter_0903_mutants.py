@@ -36,6 +36,7 @@ is a harness fault, not a survivor, and faults are counted OUT.
 """
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -47,6 +48,7 @@ SUITES = ("tests/test_platform_host_filter_0903.py "
           "tests/test_panel_counts_9614.py")
 
 MINE = ("listed_host or subdomain_is_platform or everything_else_survives or "
+        "url_face_agrees or apps_list_host_for_host or bare_vendor_domain or "
         "ordinary_sources_survive or "
         "url_face_agrees or tracking_tag or turn_sweep or "
         "findings_list_now_agree or writer_applies or live_code_reader or "
@@ -67,10 +69,16 @@ _INFLIGHT = Path(__file__).with_suffix(".inflight")
 # ── anchors ─────────────────────────────────────────────────────────────
 #: The generated predicate as it appears in the file (these JS strings are
 #: ordinary Python literals, so every backslash is doubled).
-_G = ("/(^|\\\\.)(accounts\\\\.google\\\\.com|anthropic\\\\.com|bard\\\\.google\\\\.com|"
-      "chat\\\\.openai\\\\.com|chatgpt\\\\.com|claude\\\\.ai|gemini\\\\.google\\\\.com|"
-      "notebook\\\\.google\\\\.com|notebooklm\\\\.google\\\\.com|oaiusercontent\\\\.com|"
-      "openai\\\\.com)$/i.test(String(%s||'').replace(/^https?:\\\\/\\\\//i,'')"
+#:
+#: ⛔⛔ READ FROM THE SOURCE, NOT RETYPED. The first version hard-coded the host
+#: alternation here, and the owner's 2026-09-03 narrowing — dropping the bare
+#: `openai.com` / `anthropic.com` so a run researching those companies keeps its
+#: citations — broke SIX anchors at once. A harness that spells the list a second
+#: time is a second copy of the thing this whole fix exists to have one of, and a
+#: stale anchor measures nothing while looking like a pass.
+_HOST_RE = re.compile(r"/\(\^\|\\\\\.\)\(([^)]+)\)\$/i\.test\(String\(")
+_ALT = _HOST_RE.search((ROOT / "research.py").read_text(encoding="utf-8")).group(1)
+_G = ("/(^|\\\\.)(" + _ALT + ")$/i.test(String(%s||'').replace(/^https?:\\\\/\\\\//i,'')"
       ".split(/[\\\\/?#]/)[0].toLowerCase().replace(/:\\\\d+$/,'')"
       ".replace(/^www\\\\./,''))")
 
@@ -87,7 +95,7 @@ SWEEP = ("    return [\n"
          "        _find_trim_trailing_punct(raw)\n"
          "        for raw in _FIND_BARE_URL_RE.findall(_mask_code(md))\n"
          "    ]")
-LIST = '    "accounts.google.com",\n})'
+LIST = '    "accounts.google.com",     # sign-in\n})'
 
 MUTANTS = [
     # ═════════ J — the page scrapes ══════════════════════════════════════════
@@ -154,9 +162,33 @@ MUTANTS = [
      "tidying and it deletes every Google-hosted citation a report makes — "
      "Scholar, Books, Patents, Cloud docs. This mutant SURVIVED the first run on "
      "both sides of the app, which is how it earned its test",
-     [('    "gemini.google.com", "bard.google.com",\n'
-       '    "notebooklm.google.com", "notebook.google.com",',
+     [('    "gemini.google.com",\n'
+       '    "bard.google.com",\n'
+       '    "notebooklm.google.com",\n'
+       '    "notebook.google.com",',
        '    "google.com",')]),
+    ("V1", "over",
+     "⛔⛔ THE BARE VENDOR DOMAINS COME BACK. `openai.com` and `anthropic.com` on "
+     "the list drop `anthropic.com/research/…`, `openai.com/index/…`, "
+     "`docs.anthropic.com` and `platform.openai.com` — the vendors' own published "
+     "research, announcements and API documentation. A run whose TOPIC is one of "
+     "these companies, or LLMs at all, loses the citations most worth having, and "
+     "it reads as tidying: two entries instead of five. The rule is 'this page is "
+     "the agent talking to itself', not 'this company made the agent'",
+     [('    "support.anthropic.com",   # \u26d4 the help-centre page the owner found in Sources\n'
+       '    "console.anthropic.com",   # the API console UI',
+       '    "anthropic.com",'),
+      ('    "chat.openai.com",         # the previous product host\n'
+       '    "auth.openai.com",         # sign-in \u2014 already named as chrome in `login_hosts`\n'
+       '    "help.openai.com",         # help centre\n'
+       '    "cdn.openai.com",          # asset CDN',
+       '    "openai.com",')]),
+    ("V2", "under",
+     "\u26d4 the help centre leaves the list while the console stays, so the exact "
+     "page the owner found in a Sources list is a research source again \u2014 the "
+     "narrowing overshooting by one host",
+     [('    "support.anthropic.com",   # \u26d4 the help-centre page the owner found in Sources\n', "")]),
+
     ("L1", "under",
      "⛔⛔ `accounts.google.com` leaves the list. It came from the Gemini panel "
      "scrape — the ONE reader that had ever excluded the sign-in host — and losing "

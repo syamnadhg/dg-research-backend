@@ -25310,12 +25310,34 @@ _NARR_WH_LEADING = frozenset({
 # ⛔⛔ THIS IS THE ONE LIST. It was not, and the copies disagreed in both
 # directions. `accounts.google.com` joined it from the Gemini panel scrape,
 # which was the only reader that had ever excluded the sign-in host.
+#
+# ⛔⛔ AND IT LISTS PRODUCT SURFACES, NOT VENDORS — a correction the owner made
+# on 2026-09-03, hours after the first version shipped. It used to hold the bare
+# domains `openai.com` and `anthropic.com`, which dropped `anthropic.com/research/…`,
+# `anthropic.com/news/…`, `openai.com/index/…`, `docs.anthropic.com` and
+# `platform.openai.com` — the vendors' published research, announcements and API
+# documentation. A run whose TOPIC is one of these companies, or LLMs at all,
+# would have had its most relevant citations deleted for naming the wrong host.
+# The rule is "this page is the agent talking to itself", not "this company made
+# the agent".
 _HOST_DENYLIST = frozenset({
-    "chatgpt.com", "openai.com", "chat.openai.com", "oaiusercontent.com",
-    "claude.ai", "anthropic.com",
-    "gemini.google.com", "bard.google.com",
-    "notebooklm.google.com", "notebook.google.com",
-    "accounts.google.com",
+    # ── ChatGPT ────────────────────────────────────────────────────────────
+    "chatgpt.com",             # the product, whole host
+    "chat.openai.com",         # the previous product host
+    "auth.openai.com",         # sign-in — already named as chrome in `login_hosts`
+    "help.openai.com",         # help centre
+    "cdn.openai.com",          # asset CDN
+    "oaiusercontent.com",      # user-content CDN, whole host
+    # ── Claude ─────────────────────────────────────────────────────────────
+    "claude.ai",               # the product, whole host
+    "support.anthropic.com",   # ⛔ the help-centre page the owner found in Sources
+    "console.anthropic.com",   # the API console UI
+    # ── Gemini / NotebookLM ────────────────────────────────────────────────
+    "gemini.google.com",
+    "bard.google.com",
+    "notebooklm.google.com",
+    "notebook.google.com",
+    "accounts.google.com",     # sign-in
 })
 
 
@@ -27446,7 +27468,7 @@ async def scrape_progress_chatgpt(page):
                 '[data-testid="canvas"] a[href*="http"], .canvas-container a[href*="http"]'
             ).forEach(s => {
                 const href = s.href || '';
-                if (href.startsWith('http') && href.length < 500 && !/(^|\\.)(accounts\\.google\\.com|anthropic\\.com|bard\\.google\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|gemini\\.google\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|openai\\.com)$/i.test(String(href||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,'')))
+                if (href.startsWith('http') && href.length < 500 && !/(^|\\.)(accounts\\.google\\.com|auth\\.openai\\.com|bard\\.google\\.com|cdn\\.openai\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|console\\.anthropic\\.com|gemini\\.google\\.com|help\\.openai\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|support\\.anthropic\\.com)$/i.test(String(href||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,'')))
                     srcSet.add(href);
             });
             r.source_urls = Array.from(srcSet).slice(0, 200);
@@ -27540,7 +27562,7 @@ async def scrape_progress_chatgpt(page):
                             if (real && real.startsWith('http')) h = decodeURIComponent(real);
                         }
                     } catch(e) {}
-                    if (/(^|\\.)(accounts\\.google\\.com|anthropic\\.com|bard\\.google\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|gemini\\.google\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|openai\\.com)$/i.test(String(h||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,''))) return;
+                    if (/(^|\\.)(accounts\\.google\\.com|auth\\.openai\\.com|bard\\.google\\.com|cdn\\.openai\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|console\\.anthropic\\.com|gemini\\.google\\.com|help\\.openai\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|support\\.anthropic\\.com)$/i.test(String(h||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,''))) return;
                     srcSet.add(h);
                 });
                 out.source_urls = Array.from(srcSet).slice(0, 200);
@@ -27673,7 +27695,7 @@ async def scrape_progress_chatgpt(page):
                         const srcSet = new Set();
                         document.querySelectorAll('a[href^="http"]').forEach(a => {
                             const h = a.href || '';
-                            if (h.length < 500 && !/(^|\\.)(accounts\\.google\\.com|anthropic\\.com|bard\\.google\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|gemini\\.google\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|openai\\.com)$/i.test(String(h||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,''))) srcSet.add(h);
+                            if (h.length < 500 && !/(^|\\.)(accounts\\.google\\.com|auth\\.openai\\.com|bard\\.google\\.com|cdn\\.openai\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|console\\.anthropic\\.com|gemini\\.google\\.com|help\\.openai\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|support\\.anthropic\\.com)$/i.test(String(h||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,''))) srcSet.add(h);
                         });
                         d.source_urls = Array.from(srcSet).slice(0, 200);
                         // 3. Headings in the DR report
@@ -27789,7 +27811,7 @@ async def scrape_progress_chatgpt(page):
                                     const srcSet = new Set();
                                     document.querySelectorAll('a[href^="http"]').forEach(a => {
                                         const h = a.href || '';
-                                        if (h.length < 500 && !/(^|\\.)(accounts\\.google\\.com|anthropic\\.com|bard\\.google\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|gemini\\.google\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|openai\\.com)$/i.test(String(h||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,''))) srcSet.add(h);
+                                        if (h.length < 500 && !/(^|\\.)(accounts\\.google\\.com|auth\\.openai\\.com|bard\\.google\\.com|cdn\\.openai\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|console\\.anthropic\\.com|gemini\\.google\\.com|help\\.openai\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|support\\.anthropic\\.com)$/i.test(String(h||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,''))) srcSet.add(h);
                                     });
                                     return { source_urls: Array.from(srcSet).slice(0, 200) };
                                 }""")
@@ -27884,7 +27906,7 @@ async def scrape_progress_chatgpt(page):
                                         const srcSet = new Set();
                                         root.querySelectorAll('a[href^="http"]').forEach(a => {
                                             const h = a.href || '';
-                                            if (h.length < 500 && !/(^|\\.)(accounts\\.google\\.com|anthropic\\.com|bard\\.google\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|gemini\\.google\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|openai\\.com)$/i.test(String(h||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,''))) srcSet.add(h);
+                                            if (h.length < 500 && !/(^|\\.)(accounts\\.google\\.com|auth\\.openai\\.com|bard\\.google\\.com|cdn\\.openai\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|console\\.anthropic\\.com|gemini\\.google\\.com|help\\.openai\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|support\\.anthropic\\.com)$/i.test(String(h||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,''))) srcSet.add(h);
                                         });
                                         return { source_urls: Array.from(srcSet).slice(0, 200) };
                                     }""")
@@ -28313,7 +28335,7 @@ _CHATGPT_INLINE_ACTIVITY_JS = """() => {
                 if (real && real.startsWith('http')) h = decodeURIComponent(real);
             }
         } catch (e) {}
-        if (/(^|\\.)(accounts\\.google\\.com|anthropic\\.com|bard\\.google\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|gemini\\.google\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|openai\\.com)$/i.test(String(h||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,''))) return;
+        if (/(^|\\.)(accounts\\.google\\.com|auth\\.openai\\.com|bard\\.google\\.com|cdn\\.openai\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|console\\.anthropic\\.com|gemini\\.google\\.com|help\\.openai\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|support\\.anthropic\\.com)$/i.test(String(h||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,''))) return;
         if (seenUrl.has(h)) return;
         seenUrl.add(h);
         out.source_urls.push(h);
@@ -29922,7 +29944,7 @@ async def scrape_progress_gemini(page):
                     const panelSrcSet = new Set();
                     panelMatched.querySelectorAll('a[href^="http"]').forEach(a => {
                         const h = a.href || '';
-                        if (h.length < 500 && !/(^|\\.)(accounts\\.google\\.com|anthropic\\.com|bard\\.google\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|gemini\\.google\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|openai\\.com)$/i.test(String(h||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,''))) panelSrcSet.add(h);
+                        if (h.length < 500 && !/(^|\\.)(accounts\\.google\\.com|auth\\.openai\\.com|bard\\.google\\.com|cdn\\.openai\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|console\\.anthropic\\.com|gemini\\.google\\.com|help\\.openai\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|support\\.anthropic\\.com)$/i.test(String(h||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,''))) panelSrcSet.add(h);
                     });
                     if (panelSrcSet.size > 0) {
                         // We'll union with the global srcSet below.
@@ -30292,7 +30314,7 @@ async def scrape_progress_claude(page):
             const srcSet = new Set();
             document.querySelectorAll('.font-claude-message a[href*="http"], .contents a[href*="http"]').forEach(a => {
                 const href = a.href || '';
-                if (href.startsWith('http') && !/(^|\\.)(accounts\\.google\\.com|anthropic\\.com|bard\\.google\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|gemini\\.google\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|openai\\.com)$/i.test(String(href||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,'')))
+                if (href.startsWith('http') && !/(^|\\.)(accounts\\.google\\.com|auth\\.openai\\.com|bard\\.google\\.com|cdn\\.openai\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|console\\.anthropic\\.com|gemini\\.google\\.com|help\\.openai\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|support\\.anthropic\\.com)$/i.test(String(href||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,'')))
                     srcSet.add(href);
             });
             // ⛔⛔ THESE THREE ASKED `!a.href.includes('claude.')` OF THE WHOLE URL,
@@ -30302,7 +30324,7 @@ async def scrape_progress_claude(page):
             // read `claude.html` was dropped. Wrong in both directions at once,
             // and spelled differently enough from the nine sites fixed beside it
             // that a search for `claude.ai` did not find them.
-            const __keep = (a) => a.href && a.href.startsWith('http') && !/(^|\\.)(accounts\\.google\\.com|anthropic\\.com|bard\\.google\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|gemini\\.google\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|openai\\.com)$/i.test(String(a.href||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,''));
+            const __keep = (a) => a.href && a.href.startsWith('http') && !/(^|\\.)(accounts\\.google\\.com|auth\\.openai\\.com|bard\\.google\\.com|cdn\\.openai\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|console\\.anthropic\\.com|gemini\\.google\\.com|help\\.openai\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|support\\.anthropic\\.com)$/i.test(String(a.href||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,''));
             document.querySelectorAll('[class*="tool"] a[href], .tool-result a[href]').forEach(a => {
                 if (__keep(a)) srcSet.add(a.href);
             });
@@ -33085,7 +33107,7 @@ async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None,
                 (root || document).querySelectorAll('a[href^="http"]').forEach(a => {
                     const h = a.href || '';
                     if (!root && a.closest('nav, aside, [class*="sidebar" i]')) return;
-                    if (h && h.length < 500 && !/(^|\\.)(accounts\\.google\\.com|anthropic\\.com|bard\\.google\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|gemini\\.google\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|openai\\.com)$/i.test(String(h||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,'')) && !seen.has(h)) {
+                    if (h && h.length < 500 && !/(^|\\.)(accounts\\.google\\.com|auth\\.openai\\.com|bard\\.google\\.com|cdn\\.openai\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|console\\.anthropic\\.com|gemini\\.google\\.com|help\\.openai\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|support\\.anthropic\\.com)$/i.test(String(h||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,'')) && !seen.has(h)) {
                         seen.add(h); out.source_urls.push(h);
                     }
                 });
@@ -33543,7 +33565,7 @@ async def scrape_chatgpt_activity_panel_tracking(page):
         // Subdomain-aware and anchored at both ends, so `docs.nvidia.com` is kept
         // while `chatgpt.com` and `cdn.openai.com` are not. A bare `endsWith`
         // would also swallow a hypothetical `notchatgpt.com`.
-        const INTERNAL_HOST = /(^|\\.)(accounts\\.google\\.com|anthropic\\.com|bard\\.google\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|gemini\\.google\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|openai\\.com)$/i;
+        const INTERNAL_HOST = /(^|\\.)(accounts\\.google\\.com|auth\\.openai\\.com|bard\\.google\\.com|cdn\\.openai\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|console\\.anthropic\\.com|gemini\\.google\\.com|help\\.openai\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|support\\.anthropic\\.com)$/i;
         // Tracking parameters are not part of a source's identity: one page cited
         // twice, once tagged and once not, is ONE source. Stripping them here is
         // what keeps the recovered links from re-inflating the count (36 distinct,

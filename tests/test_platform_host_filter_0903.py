@@ -50,15 +50,16 @@ needs_node = pytest.mark.skipif(
 
 class TestTheHostRule:
     @pytest.mark.parametrize("host", [
-        "chatgpt.com", "claude.ai", "anthropic.com", "openai.com",
-        "gemini.google.com", "accounts.google.com",
+        "chatgpt.com", "claude.ai", "support.anthropic.com", "chat.openai.com",
+        "gemini.google.com", "accounts.google.com", "console.anthropic.com",
+        "auth.openai.com", "help.openai.com", "cdn.openai.com",
     ])
     def test_a_listed_host_is_platform(self, host):
         assert research._is_platform_host(host) is True
 
     @pytest.mark.parametrize("host", [
-        "support.anthropic.com",     # ⛔ the owner's link
-        "cdn.openai.com",
+        "help.support.anthropic.com",   # ⛔ the owner's link, one level deeper
+        "assets.cdn.openai.com",
         "files.oaiusercontent.com",
         "www.chatgpt.com",
         "help.claude.ai",
@@ -75,6 +76,15 @@ class TestTheHostRule:
         "nature.com",
         "openai.com.evil.example",   # the list must be at the END of the host
         "",
+        # ⛔⛔ THE VENDORS' OWN PUBLISHED CONTENT, AND THIS IS THE CORRECTION THE
+        # OWNER MADE ON 2026-09-03. The first version of this list held the bare
+        # domains `openai.com` and `anthropic.com`, so a run whose TOPIC was one
+        # of these companies — or LLMs at all — had its most relevant citations
+        # deleted for naming the wrong host. The rule is "this page is the agent
+        # talking to itself", not "this company made the agent".
+        "anthropic.com", "www.anthropic.com", "docs.anthropic.com",
+        "openai.com", "www.openai.com", "platform.openai.com",
+        "community.openai.com",
     ])
     def test_everything_else_survives(self, host):
         assert research._is_platform_host(host) is False
@@ -96,6 +106,9 @@ class TestTheHostRule:
     def test_the_url_face_agrees_with_the_host_face(self):
         assert research._find_is_platform_host("https://support.anthropic.com/a") is True
         assert research._find_is_platform_host("https://docs.nvidia.com/a") is False
+        # ⭐ The pair that says where the line falls: the help centre is chrome,
+        # the API documentation beside it is an ordinary source.
+        assert research._find_is_platform_host("https://docs.anthropic.com/a") is False
 
     def test_a_source_carrying_the_platforms_tracking_tag_is_not_platform(self):
         """⛔⛔ THE 2026-08-06 DEFECT. ChatGPT tags every outbound link with
@@ -105,6 +118,44 @@ class TestTheHostRule:
             "https://docs.nvidia.com/guide?utm_source=chatgpt.com") is False
         assert research._find_is_platform_host(
             "https://example.com/about-claude.ai-tips") is False
+
+
+class TestTheListItself:
+    def test_it_is_the_apps_list_host_for_host(self):
+        """⛔⛔ TWO LISTS, ONE QUESTION, AND THE DISAGREEMENT IS INVISIBLE FROM
+        EITHER SIDE ALONE. This side filters at the writer; the app filters on
+        read, which is what cleans the runs already on disk. A host one drops and
+        the other keeps comes back in the Sources of every existing run, and
+        nothing in either repo would notice.
+
+        A cross-repo read would be worse than a literal — each repo has to pass
+        with the other checked out somewhere else, or not at all. The app's twin
+        of this assertion lives in `tests/unit/sourceHostFilter.test.ts`."""
+        assert sorted(research._HOST_DENYLIST) == [
+            "accounts.google.com",
+            "auth.openai.com",
+            "bard.google.com",
+            "cdn.openai.com",
+            "chat.openai.com",
+            "chatgpt.com",
+            "claude.ai",
+            "console.anthropic.com",
+            "gemini.google.com",
+            "help.openai.com",
+            "notebook.google.com",
+            "notebooklm.google.com",
+            "oaiusercontent.com",
+            "support.anthropic.com",
+        ]
+
+    def test_it_holds_no_bare_vendor_domain(self):
+        """⛔⛔ THE CORRECTION OF 2026-09-03. `openai.com` or `anthropic.com` on
+        this list drops the vendors' own research, announcements and API
+        documentation — exactly the citations a run ABOUT these companies, or
+        about LLMs at all, needs most. Every entry has to name a product surface:
+        a page the agent shows you about itself."""
+        for bare in ("openai.com", "anthropic.com", "google.com"):
+            assert bare not in research._HOST_DENYLIST, bare
 
 
 # ── the page scrapes, actually executed ──────────────────────────────────────
@@ -265,7 +316,13 @@ def test_every_scrape_site_is_the_one_rule():
     every site that did not follow fails here."""
     n_h = SRC.count(_escaped(research._js_platform_guard("h")))
     n_href = SRC.count(_escaped(research._js_platform_guard("href")))
-    assert (n_h, n_href) == (7, 2), (n_h, n_href)
+    # ⛔⛔ `a.href` IS A THIRD VARIABLE AND THIS GUARD DID NOT COUNT IT. The
+    # Claude scraper's `__keep` helper was added a day later with that receiver,
+    # so a tenth site carried the alternation while the test that exists to hold
+    # every site to the generator could see nine. Counting two spellings of the
+    # variable was never the invariant; counting every SITE is.
+    n_dot = SRC.count(_escaped(research._js_platform_guard("a.href")))
+    assert (n_h, n_href, n_dot) == (7, 2, 1), (n_h, n_href, n_dot)
 
 
 def test_the_panel_regex_is_built_from_the_same_list():
