@@ -22438,6 +22438,34 @@ def _p1_select_pro_hotspot() -> dict:
     }
 
 
+#: The one sentence in the phase-2 instruction that asks for ADDRESSES.
+#:
+#: ⛔⛔ MEASURED ON THE 2026-09-03 RUN: THREE REPORTS, 258 KB, ZERO URLS. Not few
+#: — none, in any of them, from any agent. They cited by name instead: "Hart et
+#: al. 2020 (Frontiers in Veterinary Science)", "Torres de la Riva et al. 2013
+#: PLOS ONE". Real, checkable, and unlinkable.
+#:
+#: ⛔⛔ AND THE INSTRUCTION WAS SATISFIED. It said "produce a comprehensive
+#: research report with citations", and those ARE citations — the agents did what
+#: they were asked. Everything downstream then reported honestly on a report with
+#: nothing in it to report: `sources=0` for all three, the findings extractor
+#: empty, the Sources list empty. The defect was never in the readers.
+#:
+#: ⛔ SO THE WORD THAT WAS MISSING IS `links`, and it was missing in all FOUR
+#: places the instruction is written — the deterministic type, the CUA fallback's
+#: user directive, that call's context hint, and the hotspot hint the shadow
+#: observer scores against. Four copies of one sentence is four chances for the
+#: fallback path to ask for something different from the path it is a fallback
+#: for, which is why this is a constant rather than a fifth copy.
+#:
+#: ⚠ ONE SENTENCE, DELIBERATELY. The whole message has to stay short enough that
+#: no platform converts it to an attachment — that is what the brief itself is
+#: for, and a typed prompt that becomes a second attachment leaves the composer
+#: empty and the run with no instruction at all.
+_P2_CITE_SENTENCE = ("Cite primary and authoritative sources inline with links, "
+                     "and list them at the end.")
+
+
 _HOTSPOT_VISION_HINTS = {
     # ⛔⛔ 2026-08-19 — THESE HINTS DESCRIBED A UI THAT NO LONGER EXISTS, and that
     # is not a cosmetic complaint: `success_signals` is what the shadow observer
@@ -22734,7 +22762,7 @@ _HOTSPOT_VISION_HINTS = {
             "claude.ai — this hotspot only ever fires on ChatGPT/Claude, never Gemini). "
             "Click into it and TYPE a prompt that refers to the attached brief — ask it "
             "to perform deep research on the topic described in the attached brief, in "
-            "Deep Research mode, and produce a comprehensive report with citations. "
+            "Deep Research mode, and produce a comprehensive report. " + _P2_CITE_SENTENCE + " "
             "Then STOP: do NOT click Send (the up-arrow / paper-plane submit button), "
             "do NOT press Enter, and do NOT click the attached brief chip/tile, the "
             "model selector, or the Deep-Research mode toggle. Sending is a separate "
@@ -50636,7 +50664,7 @@ async def type_short_inline_prompt(page, platform, label):
     prompt = (
         "Please perform deep research on the topic described in the attached brief. "
         "Use the brief as the complete context — objectives, scope, sections, sources to target. "
-        "Produce a comprehensive research report with citations."
+        "Produce a comprehensive research report. " + _P2_CITE_SENTENCE
     )
     try:
         # Find the composer input (contenteditable or textarea) and type
@@ -50677,7 +50705,8 @@ async def type_inline_prompt_with_cua(page, browser, cua_client, platform, label
         _inline_type_sys = "Type a short research prompt referring to the attached brief — then stop (do NOT send)."
         _inline_type_user = ("Click the message input, type: 'Please perform deep research on the topic "
                              "described in the attached brief. Use Deep Research mode and produce a "
-                             "comprehensive report with citations.' Then STOP — do not click Send.")
+                             "comprehensive report. " + _P2_CITE_SENTENCE +
+                             "' Then STOP — do not click Send.")
 
         async def _inline_type_cua():
             return await agent_loop(cua_client, browser,
@@ -50691,8 +50720,9 @@ async def type_inline_prompt_with_cua(page, browser, cua_client, platform, label
             page, hotspot_id="inline-type", phase=2, platform=platform.lower(),
             current_step="type_reference_prompt_no_send",
             context_hint="click the composer and TYPE a short prompt referring to the "
-                         "attached brief (deep research + citations) — then STOP. Do "
-                         "NOT click Send; the send is a separate step.",
+                         "attached brief (deep research; sources cited inline with "
+                         "links) — then STOP. Do NOT click Send; the send is a "
+                         "separate step.",
             expected_outcome="the reference prompt is typed into the composer (not sent)",
             cua_coro_factory=_inline_type_cua,
             mission_prompt=f"{_inline_type_sys}\n\nTASK: {_inline_type_user}")
