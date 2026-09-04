@@ -30173,6 +30173,60 @@ async def scrape_progress_claude(page):
                 return name ? `${name}: ${txt}` : txt;
             }).filter(t => t.length > 3);
 
+            // ⛔⛔ THE PANEL IS FOUND BY GEOMETRY, NOT BY CLASS NAME, AND THIS FILE
+            // ALREADY KNEW THAT SOMEWHERE ELSE. `_claude_artifact_panel_state` was
+            // rewritten geometry-first in 2026-07 because "the claude.ai panel no
+            // longer reliably carries artifact-panel-style class names, so
+            // class-anchored checks can read closed while the panel is plainly
+            // open". This scraper never got the lesson and kept asking for
+            // `aside .prose` and `[class*="artifact-panel"]`.
+            //
+            // ⛔⛔ MEASURED, 2026-09-03: Claude's report was 60,058 characters and
+            // this scraper saw 4,559 — the chat column, because the panel selectors
+            // matched nothing. ChatGPT saw 87,949 of 89,816 and Gemini 103,773 of
+            // 106,497 on the same run; only Claude reads a container it names.
+            // The one link it did report was an Anthropic support page, because
+            // that was the only link in the column it was reading.
+            //
+            // Same gates as the probe: right-docked (flush right, past 22% of the
+            // viewport), tall, not too wide, holding no chat markers, and not the
+            // left nav. ⚠ The probe also accepts an iframe-mounted panel as OPEN;
+            // this does not, because an iframe host reads `innerText` as '' and
+            // there is nothing here to measure. That case falls through to the
+            // selectors below, which is what happened before.
+            const __panel = (() => {
+                try {
+                    const vw = window.innerWidth || document.documentElement.clientWidth;
+                    const vh = window.innerHeight || document.documentElement.clientHeight;
+                    const NAV = /\\b(new chat|recents?|projects|search|topic generator|starred|home|chats?\\b)\\b/i;
+                    const CHAT = '[data-message-author-role="user"], [data-testid="user-message"], .font-claude-message';
+                    let best = null, bestLen = -1, bestArea = Infinity;
+                    for (const el of document.querySelectorAll('div, aside, section')) {
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width < 380 || rect.width > vw * 0.75) continue;
+                        if (rect.left < vw * 0.22) continue;
+                        if (rect.right < vw - 40) continue;
+                        if (rect.height < vh * 0.5) continue;
+                        if (el.querySelector(CHAT)) continue;
+                        const txt = (el.innerText || '').trim();
+                        if (txt.length < 40) continue;
+                        const head = txt.slice(0, 500);
+                        if (NAV.test(head)) {
+                            let hits = 0;
+                            const re = new RegExp(NAV.source, 'gi');
+                            while (re.exec(head) !== null) hits++;
+                            if (hits >= 2) continue;
+                        }
+                        const area = rect.width * rect.height;
+                        if (txt.length > bestLen || (txt.length === bestLen && area < bestArea)) {
+                            bestLen = txt.length; bestArea = area; best = el;
+                        }
+                    }
+                    return best;
+                } catch (e) { return null; }
+            })();
+            r.panel_open = !!__panel;
+
             // ---- Sources — citations, tool-result links, artifact links
             const srcSet = new Set();
             document.querySelectorAll('.font-claude-message a[href*="http"], .contents a[href*="http"]').forEach(a => {
@@ -30180,17 +30234,33 @@ async def scrape_progress_claude(page):
                 if (href.startsWith('http') && !/(^|\\.)(accounts\\.google\\.com|anthropic\\.com|bard\\.google\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|gemini\\.google\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|openai\\.com)$/i.test(String(href||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,'')))
                     srcSet.add(href);
             });
+            // ⛔⛔ THESE THREE ASKED `!a.href.includes('claude.')` OF THE WHOLE URL,
+            // AND THAT IS THE FILTER THE OWNER'S SUPPORT LINK WALKED THROUGH. It
+            // names no host: `anthropic.com` does not contain "claude.", so every
+            // Anthropic page passed — while a genuine source whose path happens to
+            // read `claude.html` was dropped. Wrong in both directions at once,
+            // and spelled differently enough from the nine sites fixed beside it
+            // that a search for `claude.ai` did not find them.
+            const __keep = (a) => a.href && a.href.startsWith('http') && !/(^|\\.)(accounts\\.google\\.com|anthropic\\.com|bard\\.google\\.com|chat\\.openai\\.com|chatgpt\\.com|claude\\.ai|gemini\\.google\\.com|notebook\\.google\\.com|notebooklm\\.google\\.com|oaiusercontent\\.com|openai\\.com)$/i.test(String(a.href||'').replace(/^https?:\\/\\//i,'').split(/[\\/?#]/)[0].toLowerCase().replace(/:\\d+$/,'').replace(/^www\\./,''));
             document.querySelectorAll('[class*="tool"] a[href], .tool-result a[href]').forEach(a => {
-                if (a.href?.startsWith('http') && !a.href.includes('claude.')) srcSet.add(a.href);
+                if (__keep(a)) srcSet.add(a.href);
             });
             document.querySelectorAll('aside a[href*="http"], [class*="artifact"] a[href*="http"]').forEach(a => {
-                if (a.href?.startsWith('http') && !a.href.includes('claude.')) srcSet.add(a.href);
+                if (__keep(a)) srcSet.add(a.href);
             });
             // Broad research-card link sweep: any http link inside an element whose class/text
             // mentions "research" (research report lives inside card wrappers with dynamic classes)
             document.querySelectorAll('[class*="research"] a[href*="http"], [data-testid*="research"] a[href*="http"]').forEach(a => {
-                if (a.href?.startsWith('http') && !a.href.includes('claude.')) srcSet.add(a.href);
+                if (__keep(a)) srcSet.add(a.href);
             });
+            // ⭐ AND THE PANEL ITSELF, which none of the four selectors above can
+            // reach when its class names have moved. This is where the report — and
+            // therefore every link the report cites — actually lives.
+            if (__panel) {
+                __panel.querySelectorAll('a[href*="http"]').forEach(a => {
+                    if (__keep(a)) srcSet.add(a.href);
+                });
+            }
             r.source_urls = Array.from(srcSet).slice(0, 200);
             r.sources = r.source_urls.length;
             // Text-derived count from "N sources and counting" — kept SEPARATE
@@ -30240,6 +30310,12 @@ async def scrape_progress_claude(page):
             // Research card container text (major content host when "Research" tool is used)
             const researchCard = document.querySelector('[class*="research-card"], [data-testid*="research"], [class*="research-report"]');
             if (researchCard) textLen = Math.max(textLen, (researchCard.innerText || '').length);
+            // ⭐ THE GEOMETRY-FOUND PANEL, WHICH IS THE ONE THAT ACTUALLY HOLDS THE
+            // REPORT. Kept as a MAX beside the three named containers rather than
+            // replacing them: those still win whenever they match, and a run where
+            // the panel is closed or iframe-mounted measures exactly what it did
+            // before. This can only ever raise the number, never lower it.
+            if (__panel) textLen = Math.max(textLen, (__panel.innerText || '').length);
             r.partial_text_len = textLen;
 
             // ---- 2026-04-26 v3: extract artifact-1 CARD preview text BEFORE

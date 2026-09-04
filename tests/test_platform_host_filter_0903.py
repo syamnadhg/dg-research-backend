@@ -284,7 +284,22 @@ def test_no_scrape_still_tests_a_platform_name_against_a_whole_url():
     guard that forbids the name forbids explaining it. Code is not exempt."""
     offenders = [
         m for m in re.findall(
-            r"\.includes\('[^']*(?:chatgpt|openai|claude\.ai|anthropic|gemini\.google|oaiusercontent)[^']*'\)",
+            # ⛔⛔ `claude`, NOT `claude\.ai`, AND THAT NARROWNESS COST THREE SITES.
+            # The first draft of this guard searched for the full host and ran
+            # green over `!a.href.includes('claude.')` — a filter naming no host
+            # at all, in Claude's own progress scraper, which let every
+            # `anthropic.com` page through while deleting sources whose path read
+            # `claude.html`. A guard against spelling a platform name into a
+            # whole-URL test has to match the SPELLINGS, not one of them.
+            # ⛔ AND IT MUST BE A URL BEING TESTED. Widening to the bare platform
+            # names caught two innocents on the first run — a composer placeholder
+            # (`placeholder.includes('ask gemini')`) and a model-name check
+            # (`t.includes('claude')`). Neither is a link filter, and failing on
+            # them would have trained the next reader to loosen the guard rather
+            # than the code. The receiver is the discriminator: these tests are
+            # wrong only when what they test is an address.
+            r"(?:href|url|link|src|\bh|\bu)\??\.includes\("
+            r"'[^']*(?:chatgpt|openai|claude|anthropic|gemini|oaiusercontent|notebooklm)[^']*'\)",
             LIVE)
     ]
     # The redirector unwrap legitimately asks whether a URL IS a chatgpt.com
