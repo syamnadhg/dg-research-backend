@@ -358,6 +358,25 @@ Enable On Startup? [Y/n]:
 - **`Y` (default)** — opts into supervised mode; actual arming is **deferred to Stage 5** so an aborted login can't leave Firestore flagged as supervised while platforms are half-logged-in.
 - **`n`** — skip; you'll run `python research.py --serve` manually after `--pair` finishes (and, on Linux/Mac, set up your own backgrounding via `nohup` / `tmux` / `screen` / your own systemd unit — see [§ Linux/Mac backgrounding](#linuxmac-backgrounding-while-track-c-is-still-pending)).
 
+Then the same stage asks a second question:
+
+```
+Let other people find this computer and ask to use it? [y/N]:
+```
+
+- **`N` (default)** — private. Only people you hand the pair code to can ask for access. This is what an unattended or scripted pair records, deliberately: the default is the private answer, so a machine paired with no one watching is never published.
+- **`y`** — the machine is listed, and people who do not have its pair code can find it and **ask** you for access. **It grants nobody anything.** You still approve every person by hand, and an approved person becomes an ordinary sharer with the ordinary sharer's powers — submit a topic to the fixed pipeline, nothing else. Whether the record itself can be read is unchanged either way: owner, sharers, and the machine, exactly as before.
+
+Change it any time, from the machine:
+
+```
+python research.py --visibility public     # let people find it
+python research.py --visibility private    # hide it again
+python research.py --visibility            # print the current setting
+```
+
+…or from the app, in **Account → the Shared-with popup**, which writes the same field.
+
 **`[3/5] API keys` — Anthropic + Gemini detect-prompt-verify** *(reordered to position 3 on 2026-05-18 so CUA + Vision are available for Stage 4)*
 `--pair` runs `resolve_api_key()` and `resolve_gemini_api_key()` to check whether each key is already resolvable from any source (FE Account-page Firestore, Windows user-scope, shell env, or `.dg-supervisor.env`). For each missing key, it prompts:
 
@@ -497,6 +516,18 @@ RestartSec=10
 WantedBy=default.target
 ```
 Then: `loginctl enable-linger $USER && systemctl --user daemon-reload && systemctl --user enable --now superresearch.service`.
+
+### Step 5a-bis (who can find this PC): `--visibility`
+
+```bash
+python research.py --visibility            # show the current setting
+python research.py --visibility public     # let people find it and ask for access
+python research.py --visibility private    # hide it again (the default)
+```
+
+Discovery, not access. A **public** machine is one other people can see listed and **ask** to use; you still approve each request by hand, and an approved person becomes an ordinary sharer. A **private** machine can only be asked about by someone you gave the pair code to. Machines paired before this setting existed are private, and nothing changes that on its own.
+
+The setting lives on the device record, so the app and the terminal always agree — the same toggle sits at the top of Account → the Shared-with popup.
 
 ### Step 5b (disable On Startup): `--retire`
 

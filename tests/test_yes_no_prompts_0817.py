@@ -245,9 +245,12 @@ def test_every_call_site_states_its_default_explicitly():
              if not src[max(0, p - 10):p].rstrip().endswith("def")
              and "_ask_yes_no_sync, question" not in src[p:p + 60]]
     # 9 since 2026-08-18: `--send-logs` asks before anything leaves the machine.
+    # 10 since 2026-09-04 (7.7B): pair Stage 2 also asks whether other people
+    # may FIND this computer — the second question in that stage, and the one
+    # whose default being False is what keeps an unattended pair private.
     # The count is deliberate rather than a lower bound — a new prompt should
     # have to come past this test and state its default on purpose.
-    assert len(calls) == 9, f"expected 9 wired prompts, saw {len(calls)}"
+    assert len(calls) == 10, f"expected 10 wired prompts, saw {len(calls)}"
     for p in calls:
         window = src[p:p + 400]
         assert "default=" in window.split(")\n")[0] or "default=" in window[:300], (
@@ -331,6 +334,12 @@ def test_ready_reports_the_capacity_it_is_calling_ready():
     ("Save this key anyway", "default=False"),
     ("Skip the verification step?", "default=True"),
     ("Enable On Startup?", "default=True"),
+    # ⛔⛔ FALSE, AND IT HAS TO STAY FALSE. It is the private answer, so an
+    # unattended pair publishes nothing — and it is what makes the two
+    # non-interactive paths AGREE: `_ask_yes_no` returns the DEFAULT after three
+    # unreadable answers while the EOFError branch forces False. On the line
+    # above, whose default is True, those two disagree.
+    ("Let other people find this computer and ask to use it?", "default=False"),
     ("Continue anyway?", "default=False"),
     ("Remove the Super Research backend?", "default=False"),
 ])

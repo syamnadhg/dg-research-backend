@@ -69773,9 +69773,14 @@ async def _continue_pair_stages_2_to_5(
 
     `_push_firestore_progress` writes per-platform login state to:
       - `devices/{device_id_for_progress}.logins` when in user-mode
-        (rule allows synth-user updates of [lastHeartbeat, status,
-        logins, authMode] only — so we don't write setupState /
-        lastSetupCheck in this branch),
+        (the synth-user rule is a `hasOnly()` allow-list, and `setupState`
+        / `lastSetupCheck` are not on it — so this branch does not write
+        them. ⛔ THE LIST IS NOT [lastHeartbeat, status, logins, authMode],
+        which is what this docstring claimed until 2026-09-04: it carries
+        two dozen names including `supervised`, `visibility`,
+        `pairConfirmedAt`, `workerCount`, the `currentRun*` family and
+        `restingWorkerIds`. Read firestore.rules rather than this line —
+        the allow-list has outgrown every prose copy of it in this file),
       - `research_tokens/{token}.{logins, setupState, lastSetupCheck}`
         otherwise (legacy, unchanged behavior).
     """
@@ -69816,12 +69821,112 @@ async def _continue_pair_stages_2_to_5(
     else:
         print(f"  {_c(_DIM, '     Skipped. You will run --serve manually in step 5.')}")
         print(f"  {_c(_DIM, '     Enable later with:')}  {_c(_BOLD, f'{_PROG} --resurrect')}")
+    print()
+
+    # ── The stage's second question: who may FIND this computer ────────────
+    #
+    # ⭐ IT LIVES HERE RATHER THAN IN A SIXTH STAGE, and that was a measured
+    # decision, not a shortcut. The pair arc's "5" is a LITERAL at every one of
+    # its call sites — there is no constant — and it is restated in four banner
+    # comments, six user-visible strings, eleven docstrings, the README, the
+    # app's own walkthrough modal and `_setup_logo`'s hand-written "Five steps"
+    # line, which no test calls. A 5→6 renumber is ~45 sites of which the suite
+    # catches three. This stage is already "how should this machine behave",
+    # already a yes/no, and the question belongs to the same moment.
+    #
+    # ⛔⛔ DEFAULT NO, AND THAT IS LOAD-BEARING TWICE OVER. It is the private
+    # answer, so an unattended pair publishes nothing. And it makes the two
+    # non-interactive paths AGREE: `_ask_yes_no` returns the DEFAULT after three
+    # unreadable answers, while the EOFError branch below forces False. On the
+    # question above, whose default is True, those two disagree — a piped pair
+    # with noise on stdin arms On Startup and a piped pair with no stdin does
+    # not. Here both roads lead to private.
+    #
+    # ⛔ NO `[y/N]` IN THE TEXT. The reader renders the hint from `default=`, so
+    # a hand-written one is a second source that can drift from the parse — the
+    # file has a guard that fails on exactly that.
+    print(f"  {_c(_DIM, 'Anyone you give the pair code to can already use this computer.')}")
+    print(f"  {_c(_DIM, 'This is about people who do NOT have it: whether they can find')}")
+    print(f"  {_c(_DIM, 'this machine and ask you for access. You approve each person.')}")
+    print()
+    discoverable = False
+    try:
+        discoverable = await _ask_yes_no(
+            "Let other people find this computer and ask to use it?",
+            default=False,
+        )
+    except EOFError:
+        # No stdin (piped / non-interactive) — stay private and continue,
+        # rather than aborting a scripted pair.
+        discoverable = False
+        print()
+    except KeyboardInterrupt:
+        # ⛔⛔ `return False`, NEVER A BARE `return`. This function is annotated
+        # `-> None` and lies: `cmd_pair_v2` reads its result as
+        # `pair_completed = bool(...)` and a falsy value runs
+        # `_cleanup_partial_pair`, which REVERTS the device doc and the token. A
+        # bare `return` evaluates to None, which is falsy — so it would do the
+        # right thing here by accident, and the wrong thing the moment this
+        # block is copied into a stage that must not cancel.
+        #
+        # ⚠ AND THIS HANDLER DOES NOT CATCH A REAL Ctrl+C, which is worth saying
+        # rather than leaving for the next person to discover. `--pair` runs
+        # under `asyncio.run`, whose SIGINT handler cancels the task, so the
+        # await above raises CancelledError; `_ask_yes_no_sync`'s `input()` is on
+        # a worker thread, where signals are never delivered anyway. The pair is
+        # still reverted — `cmd_pair_v2`'s finally does it during the unwind, and
+        # main() prints "Cancelled." — so the outcome is right by a different
+        # route. This stays as the backstop for a synchronous caller and to keep
+        # the shape identical to the On Startup question above it.
+        print()
+        log("Pairing cancelled by user (Stage 2 — discoverability)", "INFO")
+        return False
+    print()
+
     # Mirror the Stage 2 intent to the device doc so the FE Account-page
     # On Startup toggle flips in real time. The actual supervisor arm
     # still happens in Stage 5; if it fails the user can fix via
-    # --resurrect later. Best-effort.
+    # --resurrect later.
+    #
+    # ⛔ ONE PATCH, BOTH ANSWERS. `_pair_patch_device` sends an updateMask, and
+    # the rule it lands on is `hasOnly()` — which refuses the WHOLE update when
+    # one key is off-list. Two calls would mean the second answer could be lost
+    # on its own.
+    #
+    # ⛔⛔ AND THE WRITE COMES BEFORE THE CONFIRMATION, which is the opposite of
+    # how this block was first written. `_pair_patch_device` is best-effort: it
+    # returns False on a missing token, a network error and a rules refusal
+    # alike, and printing "✓ People will be able to find it" above it meant the
+    # tick stood whatever happened. `supervised` survives that — Stage 5 writes
+    # it again on both branches — but `visibility` has NO second writer in the
+    # whole pair flow, so a lost answer here is lost for good, and the person was
+    # told otherwise. Discovery is the one thing in this stage nobody can check
+    # from the machine afterwards.
+    saved = False
     if device_id_for_progress:
-        _pair_patch_device(device_id_for_progress, {"supervised": bool(enable_on_startup)})
+        saved = _pair_patch_device(device_id_for_progress, {
+            "supervised": bool(enable_on_startup),
+            "visibility": "public" if discoverable else "private",
+        })
+
+    # ⭐ EVERY BRANCH NAMES THE COMMAND THAT CHANGES THE STATE THE PERSON IS
+    # ACTUALLY IN. A single hint printed under both answers handed whoever said
+    # yes a command that is a no-op for them, and the way back was named nowhere
+    # in the pair session at all.
+    if discoverable and saved:
+        print(f"  {_c(_OK, '✓')}  People will be able to find it and ask you for access.")
+        print(f"  {_c(_DIM, '     Turn it off later with:')}  "
+              f"{_c(_BOLD, f'{_PROG} --visibility private')}")
+    elif discoverable:
+        # ⛔ SAYS WHAT IS TRUE, NOT WHAT WAS ASKED FOR. No key on the record means
+        # private everywhere that reads it, so this is the machine's real state.
+        print(f"  {_c(_WARN, '⚠')}  Could not save that — this computer stays private for now.")
+        print(f"  {_c(_DIM, '     Try again any time with:')}  "
+              f"{_c(_BOLD, f'{_PROG} --visibility public')}")
+    else:
+        print(f"  {_c(_DIM, '     Only people you give the pair code to can ask.')}")
+        print(f"  {_c(_DIM, '     Let them find it later with:')}  "
+              f"{_c(_BOLD, f'{_PROG} --visibility public')}")
     print()
 
     # ══════════════════════════════════════════════════════════════════════
@@ -73708,6 +73813,121 @@ def run_retire():
     ])
 
 
+# ⛔⛔ THE SENTINEL EXISTS BECAUSE `topic` IS ITSELF OPTIONAL. `--visibility`
+# takes `nargs="?"` so the bare form can print the current setting — and argparse
+# then happily binds the NEXT word to it, so `superresearch --visibility "my
+# topic"` swallows the topic and leaves `topic` None. There is no argparse
+# feature that prevents this (and no `choices=` anywhere in this file — the two
+# precedents, --worker-id and --runs, both validate by hand). What stops it being
+# silent is the manual check in `main`, which refuses anything that is not one of
+# these two words and says what happened.
+_VISIBILITY_SHOW = "__show__"
+_VISIBILITY_VALUES = ("public", "private")
+
+
+def run_visibility(value: str, ignored_topic: "str | None" = None) -> int:
+    """`--visibility [public|private]` — show or set who can FIND this computer.
+
+    Discovery, not access. A discoverable machine is one strangers can see
+    listed and ASK to use; the person still approves every request by hand and
+    an approved person becomes an ordinary sharer. Nothing here grants anybody
+    anything, and the device document stays readable by exactly the same three
+    principals either way.
+
+    ⭐ THE STATE LIVES ON THE DEVICE DOCUMENT AND NOWHERE ELSE. There is no
+    research_config.json key for it, deliberately: the owner can change this
+    from the app, so a local copy would be a second answer that goes stale the
+    moment they do. `_fetch_device_meta_rest` is the same reader --resurrect and
+    --retire use, and it needs no gRPC client.
+
+    ⛔ ABSENT MEANS PRIVATE. A machine paired before 2026-09-04 carries no field
+    at all and nothing backfills one.
+
+    Returns a process exit code — 0 on success, non-zero when the machine is
+    not paired or the write was refused.
+    """
+    _branded_header("visus", _BOLD + _ACCENT, "who can find this computer")
+    print()
+
+    # ⛔ A TOPIC ALONGSIDE THIS FLAG IS DROPPED, SO SAY SO — and say it UNDER the
+    # header rather than above it, or the banner's rule reads as belonging to
+    # this line. Five other flags in this parser are silently ignored when
+    # passed with the wrong command; this is the one where silence looks exactly
+    # like the argparse misparse having gone unnoticed.
+    if ignored_topic:
+        print(f"  {_c(_DIM, 'Ignoring the topic — --visibility only changes a setting.')}")
+        print(f"  {_c(_DIM, '     To research it:')}  {_c(_BOLD, f'{_PROG} \"{ignored_topic}\"')}")
+        print()
+
+    device_id = load_device_id()
+    if not device_id:
+        print(f"  {_c(_WARN, '⚠')}  This computer is not paired yet.")
+        print(f"  {_c(_DIM, '     Pair it first with:')}  {_c(_BOLD, f'{_PROG} --pair')}")
+        print()
+        return 1
+
+    meta = _fetch_device_meta_rest()
+    # ⛔ AN EMPTY READ IS NOT "PRIVATE". `_fetch_device_meta_rest` returns {} for
+    # a network failure, an expired token and a real document alike, so the
+    # absent-means-private rule may only be applied to a read that SUCCEEDED —
+    # otherwise a flaky moment reports the machine as hidden while it is listed,
+    # which is the one direction of that lie that matters.
+    if not meta:
+        print(f"  {_c(_WARN, '⚠')}  Could not read this computer's settings just now.")
+        print(f"  {_c(_DIM, '     Check the network, or open the app and look under Devices.')}")
+        print()
+        return 1
+    current = "public" if meta.get("visibility") == "public" else "private"
+
+    def _describe(state: str) -> None:
+        if state == "public":
+            print(f"  {_c(_OK, '●')}  {_c(_BOLD, 'Public')}  "
+                  f"{_c(_DIM, '— other people can find this computer and ask to use it.')}")
+            print(f"  {_c(_DIM, '     You still approve every person yourself.')}")
+        else:
+            print(f"  {_c(_BOLD, '○')}  {_c(_BOLD, 'Private')}  "
+                  f"{_c(_DIM, '— only people you give the pair code to can ask.')}")
+
+    if value == _VISIBILITY_SHOW:
+        _describe(current)
+        print()
+        _render_next_actions([
+            ("python research.py --visibility public", "let people find this computer"),
+            ("python research.py --visibility private", "hide it again"),
+        ])
+        return 0
+
+    if value == current:
+        _describe(current)
+        print(f"  {_c(_DIM, '     Already set — nothing to change.')}")
+        print()
+        return 0
+
+    if not _pair_patch_device(device_id, {"visibility": value}):
+        # ⛔⛔ "NOTHING CHANGED" IS A CLAIM THIS CANNOT MAKE, and the first
+        # version of this made it in bold. `_pair_patch_device` returns False for
+        # four different situations and only two of them prove the write did not
+        # land: a missing token and a rules refusal. The other two — a
+        # RequestException on a 10-second timeout, and a 5xx — happen AFTER the
+        # request went out, so Firestore may already have committed. Telling
+        # somebody their computer is still Private while it is in fact listed is
+        # exactly the direction this command's own read guard, sixteen lines
+        # above, refuses to lie in.
+        print(f"  {_c(_WARN, '⚠')}  Could not confirm that change.")
+        print(f"  {_c(_DIM, '     It may not have been saved. Run this again with no value')}")
+        print(f"  {_c(_DIM, '     to see where it actually stands:')}  "
+              f"{_c(_BOLD, f'{_PROG} --visibility')}")
+        print()
+        return 1
+
+    _describe(value)
+    print()
+    _render_next_actions([
+        ("python research.py --visibility", "check this again later"),
+    ])
+    return 0
+
+
 def run_unpair(deep: bool = False):
     """Fully disconnect this machine from Super Research — opposite of --pair.
 
@@ -74229,6 +74449,13 @@ def run_commands_help():
          "Restart the backend onto a newly installed version (the step after --update / pipx upgrade); keeps On Startup on"),
         ("python research.py --retire",
          "Disable On Startup — removes the supervisor; foreground --serve unchanged"),
+        # ⛔ THIS SCREEN IS THE ONLY DISCOVERY SURFACE THERE IS. `add_help=False`
+        # and nothing in this file ever calls `format_help` or `print_help`, so
+        # every `help=` string on every add_argument is text no user can reach.
+        # That is how --send-logs, --update and --uninstall all shipped
+        # undocumented: they have help strings and no row here.
+        ("python research.py --visibility [public|private]",
+         "Who can FIND this computer and ask to use it (bare = show current). You still approve everyone"),
         ("python research.py --unpair",
          "Fully disconnect this PC (deletes token + device doc + local config)"),
         ("python research.py --unpair --deep",
@@ -77222,6 +77449,10 @@ def main():
         help="Restart the running backend so it picks up a newly installed version "
              "(the step after --update / pipx upgrade / the web installer). Keeps On "
              "Startup enabled — unlike --retire, which removes it.")
+    parser.add_argument("--visibility", nargs="?", const=_VISIBILITY_SHOW, default=None,
+        metavar="public|private",
+        help="Show or set whether other people can find this computer and ask to use it. "
+             "Bare --visibility prints the current setting.")
     parser.add_argument("--unpair", action="store_true",
         help="Fully disconnect this machine from Super Research (inverse of --pair): deletes token + device doc + local config")
     parser.add_argument("--deep", action="store_true",
@@ -77359,6 +77590,20 @@ def main():
     if args.retire:
         run_retire()
         return
+
+    if args.visibility is not None:
+        # ⛔⛔ THE MISPARSE, CAUGHT AND NAMED. `topic` is `nargs="?"` too, so
+        # `superresearch --visibility "my topic"` binds the topic to this flag
+        # and leaves the positional empty. argparse cannot express "optional
+        # value, but only these two words"; this is what turns a silent wrong
+        # run into a sentence that says which word was not understood.
+        if args.visibility != _VISIBILITY_SHOW and args.visibility not in _VISIBILITY_VALUES:
+            parser.error(
+                f"--visibility takes {' or '.join(_VISIBILITY_VALUES)}, "
+                f"not {args.visibility!r}. To research a topic, put it first: "
+                f'{_PROG} "{args.visibility}"'
+            )
+        raise SystemExit(run_visibility(args.visibility, ignored_topic=args.topic))
 
     if args.unpair:
         run_unpair(deep=bool(args.deep))
