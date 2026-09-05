@@ -135,7 +135,14 @@ def test_local_entries_positions_and_skips(monkeypatch):
     entries = research._local_pending_owner_entries()
     assert [e["runId"] for e in entries] == ["r1", "r2"]
     assert [e["position"] for e in entries] == [1, 2]  # resume job skipped, no gap
-    assert entries[0]["uid"] == "uA" and len(entries[0]["title"]) == 60
+    # ⛔⛔ NO `title` — 7.7E. This array is published onto
+    # `devices/{deviceId}`, which every member of a shared machine reads WHOLE,
+    # so it was a machine-wide list of what everybody was researching. The uid
+    # and position are what the badges need, and the fixture above still supplies
+    # a long topic — so this would fail against a version that still truncated
+    # and published one.
+    assert entries[0]["uid"] == "uA"
+    assert "title" not in entries[0]
 
 
 def test_local_entries_empty_without_queue_ref(monkeypatch):
@@ -179,7 +186,7 @@ def test_local_only_union_published_when_subcollection_empty(monkeypatch):
     )
     assert db.device_updates == [{
         "queueOwners": [
-            {"uid": "sharer-1", "runId": "agent-abc", "title": "EV Market", "position": 1},
+            {"uid": "sharer-1", "runId": "agent-abc", "position": 1},
         ],
     }]
 

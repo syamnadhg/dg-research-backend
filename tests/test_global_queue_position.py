@@ -135,19 +135,19 @@ def test_repro_scenario_global_position_matches_user_expectation():
     pos, behind_rid, behind_title = _compute_global_queue_position(col, "qd-husky")
     assert pos == 1
     assert behind_rid == ""  # head — no doc ahead
-    assert behind_title == ""
+    assert behind_title == ""  # ⛔ 7.7E — the topic ahead is not extracted
 
     # Bull Dog perspective (was wrongly 1, should be 2)
     pos, behind_rid, behind_title = _compute_global_queue_position(col, "qd-bulldog")
     assert pos == 2, f"Bull Dog should be position 2, got {pos}"
     assert behind_rid == "rid-3"
-    assert behind_title == "Husky"
+    assert behind_title == ""  # ⛔ 7.7E — the topic ahead is not extracted
 
     # St Bernard perspective (was wrongly 2, should be 3)
     pos, behind_rid, behind_title = _compute_global_queue_position(col, "qd-stbernard")
     assert pos == 3, f"St Bernard should be position 3, got {pos}"
     assert behind_rid == "rid-4"
-    assert behind_title == "Bull Dog"
+    assert behind_title == ""  # ⛔ 7.7E — the topic ahead is not extracted
 
 
 # ── Filter behavior ────────────────────────────────────────────────────
@@ -231,7 +231,7 @@ def test_missing_timestamp_legacy_docs_sort_last():
     pos, behind_rid, behind_title = _compute_global_queue_position(_FakeColRef(snaps), "qd-legacy")
     assert pos == 2
     assert behind_rid == "rid-m"
-    assert behind_title == "Modern"
+    assert behind_title == ""  # ⛔ 7.7E — the topic ahead is not extracted
 
 
 # ── Edge cases ─────────────────────────────────────────────────────────
@@ -245,7 +245,7 @@ def test_my_doc_not_in_collection_returns_fallback():
     pos, behind_rid, behind_title = _compute_global_queue_position(_FakeColRef(snaps), "qd-missing")
     assert pos == 1
     assert behind_rid == ""
-    assert behind_title == ""
+    assert behind_title == ""  # ⛔ 7.7E — the topic ahead is not extracted
 
 
 def test_firestore_unavailable_returns_fallback():
@@ -255,11 +255,23 @@ def test_firestore_unavailable_returns_fallback():
     pos, behind_rid, behind_title = _compute_global_queue_position(col, "qd-mine")
     assert pos == 1
     assert behind_rid == ""
-    assert behind_title == ""
+    assert behind_title == ""  # ⛔ 7.7E — the topic ahead is not extracted
 
 
-def test_topic_truncated_to_60_chars():
-    """Long topics get sliced — matches existing FE/BE banner truncation."""
+def test_the_topic_of_the_run_ahead_is_never_returned():
+    """⛔⛔ THIS TEST USED TO ASSERT THE TRUNCATION, AND 7.7E TOOK ITS SUBJECT AWAY.
+
+    The document ahead of yours in the machine's queue belongs to somebody else
+    on a shared computer, and this value ended up on `devices/{deviceId}`, which
+    is read WHOLE by every member because Firestore cannot scope a read to
+    fields. So the person queued behind you was told what you are researching.
+
+    ⭐ The truncation is what made it look harmless: sixty characters of a topic
+    is still the topic. What survives is the research ID, a routing fact that
+    names nothing.
+
+    ⛔ THE FIXTURE STILL CARRIES A LONG TOPIC, deliberately — one without a topic
+    would pass against a version that still extracts it."""
     long_topic = "A" * 200
     snaps = [
         _q_doc("qd-ahead", timestamp_ms=1_000, topic=long_topic, research_id="rid-a"),
@@ -267,8 +279,9 @@ def test_topic_truncated_to_60_chars():
     ]
     pos, behind_rid, behind_title = _compute_global_queue_position(_FakeColRef(snaps), "qd-mine")
     assert pos == 2
-    assert behind_title == "A" * 60
     assert behind_rid == "rid-a"
+    assert behind_title == ""
+    assert "A" not in behind_title
 
 
 # ── Server-timestamp ordering (clock-skew immunity) ────────────────────
@@ -292,7 +305,7 @@ def test_submitted_at_overrides_client_timestamp():
         "qd-a's server timestamp (10s) is later than qd-b's (2s)"
     )
     assert behind_rid == "rid-b"
-    assert behind_title == "B"
+    assert behind_title == ""  # ⛔ 7.7E — the topic ahead is not extracted
 
 
 def test_clock_skew_repro_owner_vs_sharer():
@@ -322,7 +335,7 @@ def test_clock_skew_repro_owner_vs_sharer():
     pos, behind_rid, behind_title = _compute_global_queue_position(_FakeColRef(snaps), "qd-bulldog")
     assert pos == 2, "Bull Dog should be #2 — sharer's lagging clock must not push it ahead"
     assert behind_rid == "rid-husky"
-    assert behind_title == "Husky"
+    assert behind_title == ""  # ⛔ 7.7E — the topic ahead is not extracted
 
 
 def test_legacy_doc_without_submitted_at_falls_back_to_timestamp():

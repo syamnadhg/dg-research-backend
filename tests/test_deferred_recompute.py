@@ -286,16 +286,25 @@ def test_five_fire_repro_after_husky_claim(stub_module, monkeypatch):
     assert sb_uid == "owner-uid"
     assert sb_patch["queuePosition"] == 2
     assert sb_patch["queuedBehindRunId"] == "rid-bulldog"
-    assert sb_patch["queuedBehindTitle"] == "Bull Dog"
+    # ⛔⛔ THE TITLE IS DELETED, NOT WRITTEN — 7.7E. This patch lands on ST
+    # BERNARD's research document, and "Bull Dog" is the topic of a run in a
+    # DIFFERENT account: the machine was reading one person's tree to label
+    # another person's queue position. The run id stays because it routes; the
+    # topic does not, because it names what somebody is researching.
+    assert sb_patch["queuedBehindTitle"] is DELETE_FIELD
 
     # queueOwners device-doc summary published for the owner's "Shared with"
     # popup (amber #N badges, joined by sharer uid). FIFO order, 1-indexed.
     qo_writes = [w["queueOwners"] for w in db.device_writes if "queueOwners" in w]
     assert qo_writes, "expected a queueOwners device-doc write"
-    assert [(o["uid"], o["runId"], o["title"], o["position"]) for o in qo_writes[-1]] == [
-        ("sharer-uid", "rid-bulldog", "Bull Dog", 1),
-        ("owner-uid", "rid-stbernard", "St Bernard", 2),
+    # ⛔ AND NO `title` IN THE DEVICE-DOC SUMMARY EITHER — same wave, and this is
+    # the widest of the carriers: `queueOwners` is a machine-wide snapshot of
+    # every queued run across every account, on a document every member reads.
+    assert [(o["uid"], o["runId"], o["position"]) for o in qo_writes[-1]] == [
+        ("sharer-uid", "rid-bulldog", 1),
+        ("owner-uid", "rid-stbernard", 2),
     ]
+    assert all("title" not in o for o in qo_writes[-1])
 
 
 def test_claimed_docs_excluded_from_recount(stub_module, monkeypatch):

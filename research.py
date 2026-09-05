@@ -5842,10 +5842,15 @@ def _compute_global_queue_position(col_ref, my_doc_id: str) -> "tuple[int, str, 
     Returns `(position, behind_rid, behind_title)`:
       - position: 1-indexed slot in the global queue. 1 means "head"
         (next to run when any worker becomes free).
-      - behind_rid / behind_title: research-id + topic of the doc
-        immediately ahead of mine in FIFO order. Empty strings when
-        I'm head (caller can fall back to `device.currentRunTitle`
-        for the user-facing "queued behind X" message).
+      - behind_rid: research-id of the doc immediately ahead of mine in
+        FIFO order. Empty string when I'm head.
+      - behind_title: ⛔⛔ ALWAYS EMPTY SINCE 7.7E, and the parameter is kept
+        only because three call sites unpack a 3-tuple. The doc ahead of
+        mine belongs to somebody else on a shared machine, so its topic is
+        not mine to receive; every consumer now writes a field delete in its
+        place. The old note here told the caller to "fall back to
+        `device.currentRunTitle`" — that field is no longer written or
+        mapped either, for the same reason.
 
     Filter rules mirror the existing FIFO pre-query at research.py:4226:
       - skip `processed: true` (already-claimed-and-finished)
@@ -5902,9 +5907,16 @@ def _compute_global_queue_position(col_ref, my_doc_id: str) -> "tuple[int, str, 
     behind_rid = ""
     behind_title = ""
     if my_idx > 0:
+        # ⛔⛔ THE TOPIC IS NOT EXTRACTED — 7.7E. `prev_data` is the research
+        # document of the person QUEUED AHEAD of this one, which on a shared
+        # machine is somebody else's account. Its research id is a routing
+        # fact and stays; its topic is what they are researching, and this is
+        # the one place the machine reached into another account's tree to
+        # fetch it. Every consumer of the value now writes a field delete
+        # instead, so leaving the extraction here would compute a private
+        # string for nobody.
         _, prev_data, _ = queue[my_idx - 1]
         behind_rid = (prev_data.get("researchId") or "")
-        behind_title = (prev_data.get("topic") or "")[:60]
     return (position, behind_rid, behind_title)
 
 
@@ -6112,9 +6124,9 @@ def _compute_queue_enrichment(col_ref, my_doc_id: str, my_uid: str) -> dict:
     behind_title = ""
     behind_uid = ""
     if my_idx > 0:
+        # ⛔ Topic not extracted — see the note in the sibling helper above.
         _, prev_data, _ = queue[my_idx - 1]
         behind_rid = (prev_data.get("researchId") or "")
-        behind_title = (prev_data.get("topic") or "")[:60]
         behind_uid = (prev_data.get("submittedBy") or "")
     return {
         "position": position,
@@ -6222,10 +6234,12 @@ def _local_pending_owner_entries() -> "list[dict]":
         rid_v = (job.get("research_id") or "").strip()
         if not (uid_v and rid_v):
             continue
+        # ⛔ NO `title` — 7.7E. This list is published into the device document's
+        # `queueOwners` array, which every member of the machine reads. See the
+        # note at the append in `_recompute_deferred_queue_positions`.
         out.append({
             "uid": uid_v,
             "runId": rid_v,
-            "title": (job.get("topic") or "")[:60],
             "position": len(out) + 1,
         })
     return out
@@ -6387,10 +6401,20 @@ def _recompute_deferred_queue_positions_locked() -> None:
         # 2026-05-28: per-sharer amber-badge source for the "Shared with"
         # popup. submittedBy is the sharer who queued the run (uid fallback);
         # position is the 1-indexed global FIFO slot the FE joins on by uid.
+        # ⛔⛔ NO `title` — 7.7E (2026-09-04). This was a 60-character slice of the
+        # run's topic, and `devices/{deviceId}` is read WHOLE by the owner, EVERY
+        # SHARER and the machine — Firestore cannot scope a read to fields. So every
+        # person on a shared machine held a live list of what everybody else was
+        # researching. This file had already written the reason down and then done it
+        # anyway: the run-history publisher below refuses to put history here because
+        # "one sharer would learn every other sharer's run history".
+        # ⭐ The KEY stays on the rules whitelist. Removing a name from
+        # `affectedKeys().hasOnly()` also refuses the write that would CLEAR it, and
+        # every machine still on the shipped wheel goes on writing this until its
+        # owner upgrades — so the rule has to keep admitting both.
         _queue_owners.append({
             "uid": (d.get("submittedBy") or d.get("uid") or "").strip(),
             "runId": rid_v,
-            "title": (d.get("topic") or "")[:60],
             "position": new_pos,
         })
         # Per-doc ahead-by-account breakdown (uses each doc's own uid) —
@@ -6415,7 +6439,7 @@ def _recompute_deferred_queue_positions_locked() -> None:
             patch = {
                 "queuePosition": new_pos,
                 "queuedBehindRunId": (prev_d.get("researchId") or ""),
-                "queuedBehindTitle": (prev_d.get("topic") or "")[:60],
+                "queuedBehindTitle": _crun_delete_field(),  # ⛔ 7.7E — another account's topic
                 "queueTotalAhead": new_pos - 1,
                 "queueAheadFromSelf": _ahead_self,
                 "queueAheadFromOthers": _ahead_others,
@@ -6429,7 +6453,7 @@ def _recompute_deferred_queue_positions_locked() -> None:
             patch = {
                 "queuePosition": new_pos,
                 "queuedBehindRunId": _local_owners[-1]["runId"],
-                "queuedBehindTitle": _local_owners[-1]["title"],
+                "queuedBehindTitle": _crun_delete_field(),  # ⛔ 7.7E — another account's topic
                 "queueTotalAhead": new_pos - 1,
                 "queueAheadFromSelf": _ahead_self,
                 "queueAheadFromOthers": _ahead_others,
@@ -6438,8 +6462,9 @@ def _recompute_deferred_queue_positions_locked() -> None:
             }
         else:
             # Head of deferred queue — no doc ahead in queue. FE falls
-            # back to `device.currentRunTitle` for the "queued behind
-            # running X" message (see ChatMessage.QueuedBanner). Clear
+            # ⛔ 7.7E: no title is carried here any more, and
+            # `device.currentRunTitle` is no longer written or mapped —
+            # both were another person's topic on a shared record.
             # behind fields explicitly so a stale prior value can't
             # render as "behind a cancelled/already-completed run."
             patch = {
@@ -7547,7 +7572,7 @@ def _rest_keepalive_pass():
                 "status": "queued",
                 "queuePosition": _enrich["position"],
                 "queuedBehindRunId": _enrich["behind_rid"],
-                "queuedBehindTitle": _enrich["behind_title"],
+                "queuedBehindTitle": _crun_delete_field(),  # ⛔ 7.7E — another account's topic
                 "queueTotalAhead": _enrich["total_ahead"],
                 "queueAheadFromSelf": _enrich["ahead_from_self"],
                 "queueAheadFromOthers": _enrich["ahead_from_others"],
@@ -13670,7 +13695,7 @@ def start_firestore_start_listener(job_queue, loop):
                             "status": "queued",
                             "queuePosition": _enrich["position"],
                             "queuedBehindRunId": _enrich["behind_rid"],
-                            "queuedBehindTitle": _enrich["behind_title"],
+                            "queuedBehindTitle": _crun_delete_field(),  # ⛔ 7.7E — another account's topic
                             "queueTotalAhead": _enrich["total_ahead"],
                             "queueAheadFromSelf": _enrich["ahead_from_self"],
                             "queueAheadFromOthers": _enrich["ahead_from_others"],
@@ -13783,7 +13808,7 @@ def start_firestore_start_listener(job_queue, loop):
                                     "status": "queued",
                                     "queuePosition": _enrich["position"],
                                     "queuedBehindRunId": _enrich["behind_rid"],
-                                    "queuedBehindTitle": _enrich["behind_title"],
+                                    "queuedBehindTitle": _crun_delete_field(),  # ⛔ 7.7E — another account's topic
                                     "queueTotalAhead": _enrich["total_ahead"],
                                     "queueAheadFromSelf": _enrich["ahead_from_self"],
                                     "queueAheadFromOthers": _enrich["ahead_from_others"],
@@ -13921,14 +13946,20 @@ def start_firestore_start_listener(job_queue, loop):
                 # on. Best-effort title read.
                 if not behind_rid and _gate_will_block:
                     behind_rid = _gate_prid
-                    try:
-                        _prior_doc = _firebase_db.collection("users").document(_gate_puid) \
-                            .collection("researches").document(_gate_prid).get()
-                        if _prior_doc.exists:
-                            _prior_data = _prior_doc.to_dict() or {}
-                            behind_title = (_prior_data.get("title") or _prior_data.get("topic") or "")[:60]
-                    except Exception:
-                        pass
+                    # ⛔⛔ THE WHOLE READ IS GONE, NOT JUST THE SLICE — 7.7E, found by
+                    # cross-verify after the first pass missed it. `behind_rid` is
+                    # assigned on the line above from `_gate_prid`, so this Firestore
+                    # get existed ONLY to populate `behind_title`: a cross-tree read of
+                    # ANOTHER account's research document (`_gate_puid` is the prior
+                    # run's submitter, not this one), to fetch their topic, for a value
+                    # every consumer now writes as a field delete. One extra read of
+                    # somebody else's private record, per gate-blocked start, for
+                    # nothing.
+                    #
+                    # ⭐ This is the fifth carrier. The other four were found by design
+                    # review; this one survived because the backend guard written for
+                    # them checked only the two spellings those four used. The guard
+                    # now checks the shape.
                 # Falling back to local current_job ONLY if global helper
                 # returned no behind AND we're not in gate-block — happens
                 # when I'm position 1 and worker has a job mid-completion
@@ -13937,13 +13968,14 @@ def start_firestore_start_listener(job_queue, loop):
                     current = _QUEUE_STATE.get("current_job")
                     if current:
                         behind_rid = current.get("research_id") or ""
-                        behind_title = (current.get("topic") or "")[:60]
+                        # ⛔ Same wave, same reason — no topic is carried.
+                        behind_title = ""
                 status_payload = {
                     "backendRunId": run_id,
                     "status": "queued",
                     "queuePosition": position,
                     "queuedBehindRunId": behind_rid,
-                    "queuedBehindTitle": behind_title,
+                    "queuedBehindTitle": _crun_delete_field(),  # ⛔ 7.7E — another account's topic
                 }
             else:
                 # Clear any stale pendingDecision from a PRIOR run of this same
@@ -14188,6 +14220,17 @@ def _safe_enqueue(job_queue, job, source: str,
     except Exception as e:
         log(f"[safe_enqueue:{source}] put_nowait failed: {e}", "WARN")
         return False
+
+
+def _crun_delete_field():
+    """Firestore's DELETE_FIELD sentinel, imported lazily.
+
+    ⛔ LAZY FOR THE SAME REASON `_fs_where` IS: the subcommands that deliberately
+    skip `init_firebase()` to stay fast must not pay for the google-cloud import,
+    and every caller of this already holds a live Firestore reference.
+    """
+    from google.cloud.firestore import DELETE_FIELD
+    return DELETE_FIELD
 
 
 def _clear_current_run_id_best_effort(reason: str) -> None:
@@ -64270,12 +64313,36 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
     # processing race. "ongoing" status is still rehydrated
     # for paused_backend_restart marking + supervised auto-
     # resume — independent code path.
+    # ⛔⛔ ON A SHARER'S TREE THIS QUERY IS SCOPED TO THIS MACHINE — 7.7E,
+    # 2026-09-04 — and the reason is not only the rules narrowing that requires
+    # it. An UNSCOPED scan of somebody else's tree returns their runs from every
+    # machine they use, and NOTHING BELOW THIS LINE LOOKS AT `deviceId`. Every
+    # ownership test in the loop keys on `assignedWorker`, a worker NUMBER —
+    # so a run that executed on a different computer, whose `assignedWorker` is
+    # unset (the overwhelmingly common single-worker case, which defaults to
+    # worker 1), satisfies `_i_own` here. This machine would then mark that
+    # machine's live run `paused_backend_restart`, popping a Resume CTA for a run
+    # that is fine; and if the OTHER device's doc says `supervised`, it would
+    # auto-resume their run against THIS machine's browser profiles — the exact
+    # wrong-accounts failure the `assignedWorker` logic exists to prevent,
+    # arriving through the machine dimension instead of the worker one.
+    #
+    # ⭐ The OWNER's tree stays UNSCOPED, deliberately. The rule admits it with
+    # no per-document test (`deviceOwnedBy`, first and resource-free), the
+    # orphan-marking safety net is meant to reach a run whose owning worker is
+    # out of this fleet, and an equality filter would silently drop legacy
+    # documents written before the `deviceId` stamp existed.
+    _scoped_col = researches_col
+    if tree_uid != owner_uid:
+        _my_device_id = load_device_id() or ""
+        if _my_device_id:
+            _scoped_col = _fs_where(researches_col, "deviceId", "==", _my_device_id)
     for status_val in ("ongoing",):
         try:
             snaps = await asyncio.wait_for(
                 asyncio.to_thread(
                     lambda sv=status_val: list(
-                        _fs_where(researches_col, "status", "==", sv).get()
+                        _fs_where(_scoped_col, "status", "==", sv).get()
                     )
                 ),
                 timeout=15.0,
@@ -64294,10 +64361,20 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
                 # is gated by deviceMemberOf. Owner trees pass; a sharer tree
                 # passes only if this device's sharedWith[] lists the sharer.
                 # On denial, fall back to device-queue + on-disk state.
+                #
+                # ⛔⛔ WARN, NOT DEBUG — 7.7E. This was the quietest failure in
+                # the backend and it guarded a rules-shaped hazard: rules deploy
+                # in seconds and a wheel arrives whenever its owner upgrades, so
+                # a narrowing that this build cannot satisfy lands on a machine
+                # that cannot be told about it. At DEBUG the ONLY symptom was
+                # that a run killed by a restart quietly stopped being marked
+                # resumable — the Resume CTA simply never appeared again, with
+                # nothing in any log a person reads. A denial here is now
+                # something an operator can find.
                 log(
                     f"[rehydrate:{status_val}] read denied for tree {tree_uid[:12]}… "
                     f"— relying on device-queue + on-disk state",
-                    "DEBUG",
+                    "WARN",
                 )
             else:
                 log(f"Rehydrate query ({status_val}) failed: {e}", "WARN")
@@ -64532,6 +64609,16 @@ async def _reconcile_dead_worker_runs(tree_uid: str, dead_ids: "set[int]") -> in
         so marking it paused would pop a false Resume on a healthy run)."""
     if not dead_ids or not _firebase_db:
         return 0
+    # ⭐⭐ THIS QUERY IS DELIBERATELY UNSCOPED AND MUST STAY THAT WAY. 7.7E scoped
+    # its sibling in `_rehydrate_ongoing_for_tree` to this machine, and the
+    # obvious next edit is to do the same here. It would be wrong. Its ONLY
+    # caller passes `load_paired_uid()` (the periodic worker-1 loop below), so
+    # `tree_uid` is ALWAYS the paired owner and never a sharer — the tightened
+    # rule admits an owner-tree list with no per-document test at all
+    # (`deviceOwnedBy`, first and resource-free). Adding a `deviceId` equality
+    # filter here would buy no permission and would silently drop every legacy
+    # document written before that stamp existed, which is exactly the set of
+    # abandoned runs this safety net exists to catch.
     researches_col = _firebase_db.collection("users").document(tree_uid) \
         .collection("researches")
     try:
@@ -65619,7 +65706,7 @@ async def run_server(port=8000):
                     patch = {
                         "queuePosition": new_pos,
                         "queuedBehindRunId": running_job.get("research_id") or "",
-                        "queuedBehindTitle": (running_job.get("topic") or "")[:60],
+                        "queuedBehindTitle": _crun_delete_field(),  # ⛔ 7.7E — another account's topic
                     }
                 else:
                     patch = {"queuePosition": new_pos}
@@ -65631,7 +65718,7 @@ async def run_server(port=8000):
                 patch = {
                     "queuePosition": new_pos,
                     "queuedBehindRunId": prev.get("research_id") or "",
-                    "queuedBehindTitle": (prev.get("topic") or "")[:60],
+                    "queuedBehindTitle": _crun_delete_field(),  # ⛔ 7.7E — another account's topic
                 }
             patches.append((uid_v, rid_v, patch))
         CHUNK = 450
@@ -66331,10 +66418,12 @@ async def run_server(port=8000):
                     # starts at 0; emit_event refreshes it live per worker.
                     _firebase_db.collection("devices").document(_did_bw).update({
                         "busyWorkerIds": _AU([WORKER_ID]),
+                        # ⛔ NO `title` — 7.7E. See the queueOwners note. The whole
+                        # entry is rewritten on every claim, so omitting the key
+                        # also CLEARS a title an older build already wrote here.
                         f"workers.{WORKER_ID}": {
                             "uid": job.get("uid") or "",
                             "runId": job.get("research_id") or "",
-                            "title": (job.get("topic") or "")[:60],
                             "phase": 0,
                             "totalPhases": 6,
                         },
@@ -66395,10 +66484,27 @@ async def run_server(port=8000):
                         # hard_reset don't leak a stale value into the
                         # next run's pickup.
                         _now_ms = int(time.time() * 1000)
+                        # ⛔⛔ `currentRunTitle` IS CLEARED HERE, NOT WRITTEN — 7.7E
+                        # (2026-09-04). It was a 60-character slice of the topic,
+                        # and `devices/{deviceId}` is read WHOLE by the owner,
+                        # EVERY SHARER and the machine, because Firestore cannot
+                        # scope a read to fields. So the person queued behind you
+                        # was told what you are researching, live, by name.
+                        #
+                        # ⭐⭐ A DELETE RATHER THAN AN OMISSION, and that is the
+                        # useful half. Omitting the key would stop adding new
+                        # titles and leave whatever this machine last wrote
+                        # sitting on the record until the next STOP — so the
+                        # pickup that would have published one now removes the
+                        # one before it. The key is on the rules whitelist (a
+                        # delete puts it IN affectedKeys, so it has to be), and
+                        # the sibling fields stay: the FE needs currentRunId,
+                        # the owner uid and the phase to say "you are second in
+                        # the queue", which is the reader's own business.
                         _crun_patch: dict = {
                             "currentRunId": job.get("research_id") or "",
                             "currentRunOwnerUid": job.get("uid") or "",
-                            "currentRunTitle": (job.get("topic") or "")[:60],
+                            "currentRunTitle": _crun_delete_field(),
                             "currentRunStartedAt": _now_ms,
                             "currentRunPhase": 0,
                             "currentRunPhaseStartedAt": _now_ms,
