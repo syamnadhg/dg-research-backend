@@ -65025,7 +65025,23 @@ async def run_server(port=8000):
     _exit_scheduled = False
 
     app = FastAPI(title="Research Pipeline API")
-    app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+    # ⛔⛔ NOT `allow_origins=["*"]` ANY MORE. This API has no authentication of any
+    # kind: `GET /api/runs` returns every run folder on the machine across every
+    # account that shares it, `/documents/{type}` and `/audio/{name}` serve the
+    # report bodies and the podcasts, and `POST /api/runs` starts a run taking the
+    # `uid` FROM THE REQUEST BODY. A wildcard origin means any page a person
+    # visits, in any tab, can read and drive all of it.
+    #
+    # ⭐ THE LIST IS LOOPBACK-ONLY BECAUSE NOTHING ELSE HAS EVER CALLED IT. The web
+    # app talks to the machine through Firestore (Track D) and contains zero
+    # references to this API; the health probe uses `http://localhost:{port}`; the
+    # `--serve` banner advertises `http://localhost:{port}`. Measured, not assumed.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[f"http://localhost:{port}", f"http://127.0.0.1:{port}"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     queues_root = Path(__file__).parent / "queues"
 
@@ -67698,7 +67714,26 @@ async def run_server(port=8000):
             ("python research.py --unpair", "fully disconnect this machine"),
         ])
 
-    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info",
+    # ⛔⛔ LOOPBACK, NOT `0.0.0.0`. Bound to every interface, this unauthenticated
+    # API was reachable by anything on the same network — a coffee-shop wifi, an
+    # office LAN, a shared house. `GET /api/runs` hands over every run topic on the
+    # machine for every account that shares it; `/api/runs/{id}/documents/{type}`
+    # hands over the report bodies; `POST /api/runs/{id}/stop` stops somebody
+    # else's research; `POST /api/runs` starts one and takes the `uid` from the
+    # request body. None of it asks who is calling.
+    #
+    # ⭐ AND IT BREAKS NOTHING, WHICH IS WHY IT IS ONE LINE RATHER THAN A PROJECT.
+    # Everything that has ever called this API already used loopback: the web app
+    # does not call it at all (it reaches the machine through Firestore), the
+    # health probe asks `http://localhost:{port}`, and the banner this very
+    # function prints advertises `http://localhost:{port}`. The bind address was
+    # the only thing claiming otherwise.
+    #
+    # ⚠ THIS IS A REDUCTION IN EXPOSURE, NOT AUTHENTICATION. A process or a page on
+    # THIS machine can still reach it unauthenticated. The real answer is a token,
+    # which is a larger change; this removes the network from the problem so that
+    # what remains is somebody who is already on the computer.
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="info",
                             log_config=_uvicorn_log_config())
     server = uvicorn.Server(config)
     # Ctrl+C is the only stop this screen advertises; it does not get to be
