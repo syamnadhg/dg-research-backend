@@ -76,6 +76,16 @@ def _no_real_fe_posts(monkeypatch):
     monkeypatch.setattr(bridge, "_fe_api_post", _stub)
     monkeypatch.setattr(bridge, "_fe_calls", calls, raising=False)
 
+    # ⛔ THE GET SIBLING TOO, from the day it existed. It is the helper the
+    # browse and access-request routes call, and an unstubbed one would put the
+    # whole suite back on the internet through the door this fixture closed —
+    # a GET is not safer than a POST for that, only quieter.
+    def _stub_get(_sess, path: str, params: dict | None = None) -> tuple[int, dict]:
+        calls.append((path, params or {}))
+        return 200, {}
+
+    monkeypatch.setattr(bridge, "_fe_api_get", _stub_get)
+
     # ⛔⛔ AND THE BASE URL TOO, because the sentence above was a RACE, not a
     # guarantee — found by review 2026-08-26. Patching `_fe_api_post` only covers
     # calls made while the patch is live. The owner-notice rides a daemon thread

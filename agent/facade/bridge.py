@@ -1427,6 +1427,85 @@ def _mint_bearer(sess: "AccountSession", force: bool) -> "tuple[str | None, dict
                                f"({type(e).__name__})"}
 
 
+# ⛔⛔ FIFTEEN SECONDS, AND THE NUMBER IS SET BY THE RETRY, NOT BY THE ROUTE. It
+# was twenty while these helpers made one attempt each. Both now make two on a
+# 401, and the whole two-attempt path has to finish inside the budget the CLIENTS
+# already allow: `sr.py` waits 30 seconds (`_TIMEOUT`) and `cli.py`'s
+# `_bridge_post` waits 30.0. Past that the client does not report a slow web app
+# — it prints "the Super Research bridge isn't running on this machine yet" and
+# tells somebody to reinstall a bridge that is fine.
+#
+# ⭐ A 401 COMES BACK FAST, so the realistic worst case is one quick refusal, a
+# token refresh (`session.py` caps that call at 10s) and one full second attempt:
+# ~26 seconds, inside both. Twenty would have made it ~31 and put the lie back.
+#
+# ⛔ THE BYTES SIBLING KEEPS ITS SIXTY. It carries megabytes, its caller already
+# waits on a bundle, and no chat client is holding a socket open behind it.
+_FE_JSON_TIMEOUT = 15
+
+
+def _fe_json_body(r: "requests.Response") -> dict:
+    """The decoded JSON object, or `{}`.
+
+    ⛔⛔ A NON-2xx IS NOT NECESSARILY JSON. Two statements in the web app's device
+    routes sit OUTSIDE their own `try` — the rate limiter, and the `deviceId`
+    read on a body of literal `null` — so a Firestore outage there escapes as
+    Next.js's HTML error page rather than as `{"error": …}`. Every caller here
+    reads `body.get("error")`, so a decode that raised would turn somebody else's
+    outage into a dropped socket on this side.
+    """
+    try:
+        body = r.json() if r.content else {}
+    except ValueError:
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+def _fe_api_get(sess: "AccountSession", path: str,
+                params: "dict | None" = None) -> tuple[int, dict]:
+    """GET a web-app API route (`{FE_BASE}{path}`) as the signed-in USER.
+
+    ⛔⛔ THE AGENT HAD NO AUTHENTICATED READ OF THE WEB APP AT ALL. Every outbound
+    call to `FE_BASE` was a POST; the only two GETs in the whole facade are the
+    sign-in poll and the doctor's reachability probe, and NEITHER carries the
+    session. So this is not "the GET helper we forgot to use" — it is the first
+    one, and it is modelled on `_fe_api_post`, not on those two.
+
+    ⛔ AND IT HAS TO EXIST, because Firestore cannot answer these questions. The
+    rules gate `devices/{id}` on owner ∪ sharedWith ∪ the machine, WHOLE
+    DOCUMENT, so a stranger's public machine is unreadable and a
+    `where visibility == "public"` list is denied wholesale rather than filtered;
+    `deviceAccessRequests` is `allow read, write: if false` in both directions.
+    The web route is not a convenience layer over a read the agent could do
+    itself — it is the only door.
+
+    Returns (status, decoded-json|{}); never raises — transport and mint failures
+    come back as (0, {"error": …}), with `reason` set when the session is dead.
+    """
+    def _send(token: str) -> "tuple[int, dict]":
+        try:
+            r = requests.get(
+                f"{config.FE_BASE}{path}",
+                params=params or None,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=_FE_JSON_TIMEOUT,
+            )
+        except requests.RequestException as e:
+            return 0, {"error": f"could not reach {config.FE_BASE} ({type(e).__name__})"}
+        return r.status_code, _fe_json_body(r)
+
+    token, why = _mint_bearer(sess, force=False)
+    if token is None:
+        return 0, why
+    status, body = _send(token)
+    if status != 401:
+        return status, body
+    token, why = _mint_bearer(sess, force=True)
+    if token is None:
+        return 0, why
+    return _send(token)
+
+
 def _fe_api_post(sess: "AccountSession", path: str, payload: dict) -> tuple[int, dict]:
     """POST a web-app API route (`{FE_BASE}{path}`) as the signed-in USER —
     the same Bearer-ID-token calls the browser makes. Used for the device
@@ -1444,28 +1523,51 @@ def _fe_api_post(sess: "AccountSession", path: str, payload: dict) -> tuple[int,
     reach" the WEB APP — a sentence pointing somebody at a service that was
     answering fine.
 
-    ⛔ NO 401 RETRY HERE YET. That is deliberate: the bytes sibling owns one
-    because its single caller is the send-logs upload, and adding one here
-    changes what four callers see on a dead session. It belongs with the wave
-    that revisits those callers.
+    ⛔⛔ AND IT RETRIES ONCE ON A 401 NOW, which it did not while the bytes
+    sibling did — and the reason it was deferred was WRONG. The note here said a
+    revoked session never produces a 401 for a retry to catch, because the mint
+    would raise `RevokedError` first. It does not: `id_token(force=False)` returns
+    the CACHED token without calling Google at all whenever the local clock says
+    it is still fresh, and freshness is `expires_in - 300`, so the cache lives
+    about fifty-five minutes past the moment the refresh token died. The web app
+    verifies with `checkRevoked` on and refuses exactly that token — 401 — and
+    this helper had no second chance, so `device add` answered
+    "couldn't add the device: unauthorized" for the best part of an hour after
+    somebody signed out everywhere. Measured against `session.py` and
+    `firebase-admin.ts`, not assumed.
+
+    ⛔ WHAT THE RETRY ACTUALLY BUYS IS TWO DIFFERENT THINGS. A genuinely revoked
+    session cannot be recovered — the forced mint raises and this returns
+    `(0, {"reason": "revoked", …})`, which the device routes turn into the
+    sentence that names the repair. A merely stale token IS recovered. Both beat
+    relaying the web app's bare "unauthorized".
+
+    ⛔ EXACTLY ONCE, AND ONLY ON 401, as with the bytes sibling. Every one of the
+    four routes reached through here answers 401 before doing any work, so a
+    retried attempt repeats no effect and spends no rate-limit budget.
     """
+    def _send(token: str) -> "tuple[int, dict]":
+        try:
+            r = requests.post(
+                f"{config.FE_BASE}{path}",
+                json=payload,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=_FE_JSON_TIMEOUT,
+            )
+        except requests.RequestException as e:
+            return 0, {"error": f"could not reach {config.FE_BASE} ({type(e).__name__})"}
+        return r.status_code, _fe_json_body(r)
+
     token, why = _mint_bearer(sess, force=False)
     if token is None:
         return 0, why
-    try:
-        r = requests.post(
-            f"{config.FE_BASE}{path}",
-            json=payload,
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=20,
-        )
-        try:
-            body = r.json() if r.content else {}
-        except ValueError:
-            body = {}
-        return r.status_code, body if isinstance(body, dict) else {}
-    except requests.RequestException as e:
-        return 0, {"error": f"could not reach {config.FE_BASE} ({type(e).__name__})"}
+    status, body = _send(token)
+    if status != 401:
+        return status, body
+    token, why = _mint_bearer(sess, force=True)
+    if token is None:
+        return 0, why
+    return _send(token)
 
 
 # The most of the agent's own log we will ever send. The file rotates at 1 MB with
@@ -2745,6 +2847,10 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 self._researches()
             elif path == "/devices":
                 self._devices()
+            elif path == "/devices/public":
+                self._devices_public()
+            elif path == "/devices/requests":
+                self._device_requests()
             elif path == "/device":
                 self._device_current()
             elif path == "/logs/runs":
@@ -2806,6 +2912,8 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 self._logout()
             elif path == "/device/select":
                 self._device_select()
+            elif path == "/device/ask":
+                self._device_ask()
             elif path == "/device/pair":
                 self._device_pair()
             elif path == "/device/remove":
@@ -3250,12 +3358,145 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             match = next((d for d in devs if d.get("id") == device_id), None)
             if match is None:
                 # Don't persist a device this account can't reach.
-                self._json(404, {"error": "device not reachable by this account"})
+                # ⛔⛔ A PERMISSIONS WORD, NOT A CONNECTIVITY ONE. "not reachable"
+                # described a network; this refusal is about whose account the
+                # machine is linked to, and it is now reached routinely — the
+                # browse list prints ids of computers this account has NOT been
+                # given, and selecting one is the first thing anybody tries.
+                # Neither client words this, so it relays raw.
+                self._json(404, {"error": "no computer with that id is linked to "
+                                          "your account",
+                                 "reason": "not_linked"})
                 return
             prefs.set_selected_device(device_id, sess.uid)
             self._decorate_devices([match], sess.uid, device_id)
             log.info("selected device %s", device_id)
             self._json(200, {"ok": True, "device": match})
+
+        def _fe_relay(self, status: int, body: dict, what: str) -> bool:
+            """Turn one `_fe_api_*` answer into a reply, or return True to carry on.
+
+            ⛔⛔ A REVOKED SESSION IS A 401 HERE, NOT A 502. `_fe_api_*` returns
+            status 0 for BOTH a dead session and a web app nobody can reach, and
+            the two device routes written before this mapped every 0 to 502 —
+            so the one failure the person can actually fix was reported as the
+            one they cannot. The discriminator has always been on the wire
+            (`reason == "revoked"`); nothing read it.
+            """
+            if status == 0:
+                if body.get("reason") == "revoked":
+                    self._json(401, {"error": body.get("error") or
+                                     "session revoked — run /login again",
+                                     "reason": "revoked"})
+                else:
+                    self._json(502, body)
+                return False
+            if status != 200:
+                self._json(status if status >= 400 else 502,
+                           {"error": body.get("error") or f"{what} (HTTP {status})",
+                            "retryAfterMs": body.get("retryAfterMs")})
+                return False
+            return True
+
+        def _devices_public(self) -> None:
+            """The machines other people have made discoverable (`GET
+            /api/devices/public`), relayed as the web app sent them.
+
+            ⛔⛔ NOT `_decorate_devices`, AND NOT A DEVICE ROW. A public row is a
+            five-field projection — deviceId, label, osFamily, online, full —
+            with no `ownerUid`, no `id` and no `lastHeartbeat`. Running it
+            through the member-row decorator would answer all three of its
+            questions from ABSENT fields: `owned` false because there is no
+            ownerUid, `selected` false because the id is under another key, and
+            `online` false — overwriting the liveness the route computed
+            correctly. Three wrong answers, every one of them shaped like a real
+            one. The two shapes stay deliberately non-interchangeable.
+
+            ⛔ `truncated` IS RELAYED UNTOUCHED and it does NOT mean "your list
+            was cut". It is computed on the raw scan of up to five hundred
+            documents, before the projection drops the half-paired, the full,
+            the private and the caller's own — so a reply can carry three rows
+            and `truncated` true. The clients word it about the SCAN.
+            """
+            acct = self._account()
+            if acct is None:
+                return
+            sess, _fs = acct
+            status, body = _fe_api_get(sess, "/api/devices/public")
+            if not self._fe_relay(status, body, "could not list public computers"):
+                return
+            devices = body.get("devices")
+            self._json(200, {"devices": devices if isinstance(devices, list) else [],
+                             "truncated": bool(body.get("truncated"))})
+
+        def _device_requests(self) -> None:
+            """The access requests this account is waiting on (`GET
+            /api/devices/access-request`, the `outgoing` half).
+
+            ⛔⛔ ONLY LIVE, PENDING ROWS EXIST HERE, AND THE ROW CARRIES NO
+            STATUS. The route filters both halves through `isLiveRequest`, so an
+            approved one and a denied one are equally absent, and so is one that
+            aged past seven days, one whose machine was handed on or deleted, and
+            one that fell outside a two-hundred-document scan that reports no
+            truncation of its own. A client that reads a missing row as "denied"
+            is inventing a field that never crossed the wire.
+
+            ⛔ THE OWNER'S HALF IS DROPPED ON PURPOSE, not forgotten. `incoming`
+            is the queue waiting on a machine this account owns, and there is no
+            approve or deny verb on this surface yet — listing it would name
+            people whose request nothing here can answer.
+            """
+            acct = self._account()
+            if acct is None:
+                return
+            sess, _fs = acct
+            status, body = _fe_api_get(sess, "/api/devices/access-request")
+            if not self._fe_relay(status, body, "could not list your requests"):
+                return
+            rows = body.get("outgoing")
+            self._json(200, {"requests": rows if isinstance(rows, list) else []})
+
+        def _device_ask(self) -> None:
+            """Ask the owner of a public machine for access (`POST
+            /api/devices/access-request`).
+
+            ⛔⛔ BY deviceId, NEVER BY NAME OR BY A NUMBER FROM THE LIST. Two
+            public machines can carry the same label — an unnamed one is
+            literally the string "Research computer" for everybody — and the
+            list is sorted online-first over a thirty-second heartbeat window,
+            so position two is a different computer half a minute later. This is
+            the same trap send-logs answered by handing back run NAMES and a
+            device id rather than the numbers it printed.
+
+            ⛔ NO OWNERSHIP GUESS ON THIS SIDE. Every refusal — already yours,
+            already shared, previously removed, full, asked too often, already
+            waiting, recently refused — is the route's to make against the live
+            document, and the reasons come back as machine-readable codes the
+            clients word. Deciding any of it here would be deciding it from a
+            projection that deliberately withholds the fields it would need.
+            """
+            device_id = (self._read_json().get("deviceId") or "").strip()
+            if not device_id:
+                self._json(400, {"error": "deviceId is required"})
+                return
+            acct = self._account()
+            if acct is None:
+                return
+            sess, _fs = acct
+            status, body = _fe_api_post(sess, "/api/devices/access-request",
+                                        {"deviceId": device_id})
+            if not self._fe_relay(status, body, "could not ask for that computer"):
+                return
+            # ⛔⛔ THE STRANGER'S ID DOES NOT GO IN THE LOG, and every neighbouring
+            # device handler logs its own. This log is uploadable to support, and
+            # the sentence somebody agrees to before it goes says it holds "the
+            # ids of the computers and runs this agent has touched" — a computer
+            # this account merely asked about, and may be refused, is not one of
+            # those. Nothing here masks a machine's LABEL either, so the whole row
+            # stays out. What is worth keeping is that an ask left the building.
+            log.info("device ask: sent")
+            self._json(200, {"ok": True, "deviceId": device_id,
+                             "status": body.get("status") or "pending"})
 
         def _device_pair(self) -> None:
             """Pair a device to this account by its PAIR CODE (the chat
@@ -3276,13 +3517,11 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 return
             sess, fs = acct
             status, body = _fe_api_post(sess, "/api/devices/claim", {"code": code})
-            if status == 0:
-                self._json(502, body)
+            if not self._fe_relay(status, body, "claim failed"):
                 return
-            if status != 200 or not body.get("ok"):
-                self._json(status if status >= 400 else 502,
-                           {"error": body.get("error") or f"claim failed (HTTP {status})",
-                            "retryAfterMs": body.get("retryAfterMs")})
+            if not body.get("ok"):
+                self._json(502, {"error": body.get("error") or "claim failed",
+                                 "retryAfterMs": body.get("retryAfterMs")})
                 return
             device_id = body.get("deviceId") or ""
             # Auto-select the new device when nothing is selected yet, so a
@@ -3322,13 +3561,11 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 return
             sess, _fs = acct
             status, body = _fe_api_post(sess, "/api/devices/unpair-self", {"deviceId": device_id})
-            if status == 0:
-                self._json(502, body)
+            if not self._fe_relay(status, body, "unlink failed"):
                 return
-            if status != 200 or not body.get("ok"):
-                self._json(status if status >= 400 else 502,
-                           {"error": body.get("error") or f"unlink failed (HTTP {status})",
-                            "retryAfterMs": body.get("retryAfterMs")})
+            if not body.get("ok"):
+                self._json(502, {"error": body.get("error") or "unlink failed",
+                                 "retryAfterMs": body.get("retryAfterMs")})
                 return
             # Don't leave a dangling selection pointing at the removed device.
             if prefs.get_selected_device(sess.uid) == device_id:

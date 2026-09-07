@@ -1108,19 +1108,116 @@ def cmd_logout(_args: argparse.Namespace) -> int:
     return 0
 
 
+# ⛔⛔ ONE SENTENCE PER REFUSAL THE ASK ROUTE CAN GIVE, AND NOT THE PAIRING TABLE.
+# Borrowing `_PAIR_ERRORS` is the obvious shortcut and it is wrong three times.
+# Its `revoked_sharer` line ends "ask them to share it again" — which on THIS
+# route is the one thing that cannot work, because being on that list is exactly
+# what the refusal is; its `rate_limited` says "wait a few minutes" against a
+# window that is an hour here; and its `share_cap_reached` describes a pairing
+# that never started rather than a queue nobody can join.
+#
+# ⛔ NO DURATIONS EXCEPT THE ONE THE SERVER STATES. The cool-off after a refusal
+# is a single fixed week and the route is the only thing that knows a request was
+# ever refused, so naming it is honest. The per-hour ceiling is NOT named: the
+# reply carries `retryAfterMs`, so the number is knowable and guessing beside it
+# would be the thing this codebase has twice been bitten by.
+#
+# ⛔ AND `device_not_found` IS ONE ANSWER FOR FIVE STATES — no such machine, a
+# private one, a half-paired one, one with no owner, one whose id was mistyped.
+# It must not claim any single one of them.
+_ASK_FAILURES = {
+    "device_not_found":
+        "that computer isn't offered publicly any more — it may have been made "
+        "private, or the id may be wrong",
+    "is_owner": "that one is already yours",
+    "already_shared": "you can already use that computer",
+    "revoked_sharer":
+        "its owner removed your access to that computer before, so this is not "
+        "something asking again can change",
+    "share_cap_reached":
+        "that computer is already shared with as many people as it can hold",
+    "already_pending":
+        "you have already asked for that one — it is waiting on its owner",
+    "recently_denied":
+        "its owner said no recently; asking again is refused for a week from "
+        "the day they answered",
+    "too_many_requests":
+        "you have as many requests waiting as an account can have — one has to "
+        "be answered or expire first",
+    "device_queue_full":
+        "that computer already has as many people waiting as it can queue",
+    "invalid_json": "that request didn't reach the app in a form it could read",
+    "device_id_required": "that isn't an id any computer could have",
+    "unauthorized": "this agent's sign-in was refused — run login again",
+}
+
+
+def _minutes_from_ms(retry_after_ms) -> "int | None":
+    """Whole minutes to wait, rounded UP, or None when nothing usable came back.
+
+    ⛔ ROUNDED UP AND AT LEAST ONE. Rounding down turns "fifty seconds" into
+    "0 minutes", and "try again in 0 minutes" is a sentence that invites the
+    retry it is refusing.
+    """
+    if isinstance(retry_after_ms, bool) or not isinstance(retry_after_ms, (int, float)):
+        return None
+    if retry_after_ms <= 0:
+        return None
+    return max(1, int((retry_after_ms + 59_999) // 60_000))
+
+
+def _ask_refusal(err: str, retry_after_ms=None) -> str:
+    """The sentence for one refusal code, with a wait ONLY when the reply gave one.
+
+    ⛔ `rate_limited` IS NOT IN THE TABLE, because its honest sentence needs a
+    number that lives in the reply rather than in this file. Asking is capped at
+    five an hour, so the house habit of saying "a few minutes" would be wrong by
+    up to fifty-five of them — and this is the first refusal in the product where
+    the server actually hands over the wait.
+    """
+    if err == "rate_limited":
+        mins = _minutes_from_ms(retry_after_ms)
+        if mins is None:
+            return ("you have asked for as many computers as an account may in "
+                    "one hour")
+        return (f"you have asked for as many computers as an account may in one "
+                f"hour — the next one can go in about {mins} minute"
+                f"{'' if mins == 1 else 's'}")
+    said = _ASK_FAILURES.get(err)
+    if said is None:
+        return f"couldn't ask for that computer: {err or 'no reason given'}"
+    return said
+
+
 def cmd_device(args: argparse.Namespace) -> int:
     """List the devices the account can reach, or switch the target device."""
-    rc = _redirect_if_wsl("Manage devices from chat:  /sr device")
+    # ⛔ `/sr devices`, NOT `/sr device`. The singular resolves to nothing — chat
+    # matches "devices" and "device list" and never the bare word — so this hint
+    # sent every Windows user to the one phrasing that answers "I didn't catch a
+    # Super Research request in that". Reproduced against the resolver.
+    rc = _redirect_if_wsl("Manage devices from chat:  /sr devices")
     if rc is not None:
         return rc
     if not _bridge_up():
         print(f"{_NO} Bridge isn't running. Run:  agent serve   then   agent login")
         return 1
 
+    if getattr(args, "device_command", None) == "public":
+        return _device_public()
+
+    if getattr(args, "device_command", None) == "ask":
+        return _device_ask(args.deviceId)
+
+    if getattr(args, "device_command", None) == "requests":
+        return _device_requests()
+
     if getattr(args, "device_command", None) == "use":
         res = _bridge_post("/device/select", {"deviceId": args.deviceId})
         if res is None or res[0] != 200:
-            print(f"{_NO} couldn't select device: {res[1].get('error') if res else 'no response'}")
+            # ⛔ `_err`, NOT `res[1].get("error")`. A reply with no body at all
+            # printed the literal word None — the only branch here that reached
+            # past the helper written for exactly this.
+            print(f"{_NO} couldn't select device: {_err(res)}")
             return 1
         d = res[1].get("device", {})
         kind = "owned" if d.get("owned") else "shared"
@@ -1148,7 +1245,10 @@ def cmd_device(args: argparse.Namespace) -> int:
 
     dr = _bridge_get("/devices")
     if dr is None or dr[0] != 200:
-        print(f"{_NO} list devices failed: {dr[1] if dr else 'no response'}")
+        # ⛔ `_err` HERE TOO. This branch printed the raw dict, so a signed-out
+        # person read "list devices failed: {'error': 'not signed in — run
+        # /login'}" — the repair was on screen wearing python punctuation.
+        print(f"{_NO} list devices failed: {_err(dr)}")
         return 1
     devices = dr[1].get("devices", [])
     selected = dr[1].get("selectedDeviceId")
@@ -1159,9 +1259,110 @@ def cmd_device(args: argparse.Namespace) -> int:
     for d in devices:
         mark = "→" if d.get("selected") else " "
         kind = "owned" if d.get("owned") else "shared"
-        print(f"  {mark} {d.get('name') or d.get('id')}  ({kind})  id={d.get('id')}")
+        # ⛔ THE BRIDGE HAS ALWAYS SENT `online` AND THIS LINE DROPPED IT.
+        # "which of my computers is on?" is answered by this list and it did not
+        # carry the answer, while the chat picker one file over prints it.
+        state = "online" if d.get("online") else "offline"
+        print(f"  {mark} {d.get('name') or d.get('id')}  ({kind}, {state})  "
+              f"id={d.get('id')}")
     if not selected:
         print("\nNo device selected — pick one:  agent device use <id>")
+    return 0
+
+
+def _public_row(i: int, d: dict) -> str:
+    """One line of the public list.
+
+    ⛔⛔ THE ID IS ON THE ROW BECAUSE THE ID IS WHAT THE NEXT COMMAND TAKES. Two
+    public machines can carry the identical label — an unnamed one reads as the
+    literal words "Research computer" for everybody — and the list is ordered
+    online-first over a thirty-second window, so both the name and the number
+    stop identifying a row the moment anything changes. The number is for
+    reading; the id is for asking.
+    """
+    label = str(d.get("label") or "").strip() or "(unnamed)"
+    state = "online" if d.get("online") else "offline"
+    full = "  full" if d.get("full") else ""
+    return f"  {i:>2}  {label.ljust(34)}  {state.ljust(8)}{full}  id={d.get('deviceId')}"
+
+
+def _device_public() -> int:
+    """The computers other people have made discoverable."""
+    # ⛔ AN EXPLICIT TIMEOUT. `_bridge_get`'s default is ten seconds, which is
+    # right for the Firestore-backed routes it was written for; this one waits on
+    # the bridge waiting on the WEB APP, and that call is allowed fifteen on its
+    # own before a retry.
+    res = _bridge_get("/devices/public", timeout=40.0)
+    if res is None or res[0] != 200:
+        print(f"{_NO} couldn't list public computers: {_err(res)}")
+        return 1
+    rows = res[1].get("devices") or []
+    if not rows:
+        print("No computers are being offered publicly right now.")
+        print("     A computer is offered only when its owner switches that on.")
+        return 0
+    print(f"Public computers ({len(rows)}):")
+    for i, d in enumerate(rows, 1):
+        print(_public_row(i, d))
+    if res[1].get("truncated"):
+        # ⛔⛔ THIS IS NOT "YOUR LIST WAS CUT". `truncated` is computed on the raw
+        # scan the app makes before it drops the ones you cannot ask for, so it
+        # can be true beside a short list — and there is no next page to offer.
+        print("  (there are more public computers than one look can scan, so some "
+              "may be missing)")
+    print("\nAsk for one by its id:  agent device ask <id>")
+    print("     Its owner decides. Asking tells them your name and email address.")
+    return 0
+
+
+def _device_ask(device_id: str) -> int:
+    """Ask the owner of a public computer for access to it."""
+    device_id = (device_id or "").strip()
+    if not device_id:
+        print(f"{_NO} name the computer by its id — the public list prints one "
+              f"on every row.")
+        return 1
+    res = _bridge_post("/device/ask", {"deviceId": device_id})
+    if res is None:
+        print(f"{_NO} couldn't ask for that computer: {_err(res)}")
+        return 1
+    body = res[1] if isinstance(res[1], dict) else {}
+    if res[0] != 200:
+        print(f"{_NO} {_ask_refusal(body.get('error') or '', body.get('retryAfterMs'))}")
+        return 1
+    print(f"{_OK} Asked. Its owner decides — nothing happens on that computer "
+          f"until they say yes.")
+    # ⛔ NO POLLING ADVICE AND NO WAIT. Nothing tells this side when an owner
+    # answers, and an answered request stops appearing in the list below rather
+    # than turning into a "no" — so the honest next step names the list and says
+    # what its silence means, which `agent device requests` then prints in full.
+    print("     See what you are waiting on with:  agent device requests")
+    return 0
+
+
+def _device_requests() -> int:
+    """The access requests this account is still waiting on."""
+    res = _bridge_get("/devices/requests", timeout=40.0)
+    if res is None or res[0] != 200:
+        print(f"{_NO} couldn't list your requests: {_err(res)}")
+        return 1
+    rows = res[1].get("requests") or []
+    if not rows:
+        print("You are not waiting on any computer.")
+    else:
+        print(f"Waiting on ({len(rows)}):")
+        for d in rows:
+            label = str(d.get("deviceLabel") or "").strip() or "(unnamed)"
+            print(f"     {label.ljust(34)}  id={d.get('deviceId')}")
+    # ⛔⛔ SAID ON BOTH BRANCHES, AND IT IS THE WHOLE POINT OF THE SCREEN. A row
+    # here means one thing only: still waiting. A row that is GONE means answered
+    # — yes or no — or seven days passed, or that computer changed hands or was
+    # retired. The list carries no status at all, so reading an absence as a
+    # refusal would be inventing a field that never crossed the wire.
+    print("\n     Only unanswered requests appear here. Once a request is "
+          "answered it")
+    print("     leaves this list either way — ask again and you will be told "
+          "which it was.")
     return 0
 
 
@@ -2398,6 +2599,16 @@ def build_parser() -> argparse.ArgumentParser:
     dvrm = dvsub.add_parser("remove", parents=[common], help="unlink a device from your account")
     dvrm.add_argument("deviceId", help="deviceId to remove (from `agent device`)")
     dvrm.set_defaults(func=cmd_device)
+    dvsub.add_parser("public", parents=[common],
+                     help="list the computers other people offer publicly"
+                     ).set_defaults(func=cmd_device)
+    dvask = dvsub.add_parser("ask", parents=[common],
+                             help="ask the owner of a public computer for access")
+    dvask.add_argument("deviceId", help="deviceId to ask for (from `agent device public`)")
+    dvask.set_defaults(func=cmd_device)
+    dvsub.add_parser("requests", parents=[common],
+                     help="show the access requests you are waiting on"
+                     ).set_defaults(func=cmd_device)
 
     sl = sub.add_parser("send-logs", parents=[common],
                         help="ask a research computer to package its logs for support "

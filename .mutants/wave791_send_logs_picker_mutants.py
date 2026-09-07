@@ -342,31 +342,39 @@ MUTANTS = [
      "⛔⛔ THE RETRY RE-SENDS THE CACHED TOKEN. It retries, it fails the same way, "
      "and every \"did it eventually work\" assertion is satisfied — only the "
      "ORDER of the tokens tells the two apart",
-     [("    token, why = _mint_bearer(sess, force=True)",
+     [("    # produce the same 401 and call it a retry.\n"
+       "    token, why = _mint_bearer(sess, force=True)",
+       "    # produce the same 401 and call it a retry.\n"
        "    token, why = _mint_bearer(sess, force=False)")]),
     ("R2", BRIDGE, "under",
      "the retry goes, and the call most likely to have its token expire "
      "mid-flight — sixty seconds, megabytes — is the one with no second chance",
-     [('    if status != 401:\n        return status, body\n',
-       '    if True:\n        return status, body\n')]),
+     [('    if status != 401:\n        return status, body\n'
+       '    # ⛔ FORCED, not cached.',
+       '    if True:\n        return status, body\n'
+       '    # ⛔ FORCED, not cached.')]),
     ("R3", BRIDGE, "over",
      "⛔ IT RETRIES ANY FAILURE, so a 500 or a 413 is sent twice — the app choked "
      "on that body once and is handed it again",
-     [('    if status != 401:\n        return status, body\n',
-       '    if status == 200:\n        return status, body\n')]),
+     [('    if status != 401:\n        return status, body\n'
+       '    # ⛔ FORCED, not cached.',
+       '    if status == 200:\n        return status, body\n'
+       '    # ⛔ FORCED, not cached.')]),
     ("R4", BRIDGE, "over",
      "⛔⛔ THE FORCED MINT IS UNWRAPPED. The one caller makes this call OUTSIDE "
      "its `except RevokedError` and `do_POST` has no blanket handler, so a dead "
      "refresh token closes the connection instead of answering",
      [("    token, why = _mint_bearer(sess, force=True)\n    if token is None:\n        return 0, why\n"
-       "    return _send(token)",
-       "    return _send(sess.id_token(force=True))")]),
+       "    return _send(token)\n\n\ndef _read_agent_log_tail",
+       "    return _send(sess.id_token(force=True))\n\n\ndef _read_agent_log_tail")]),
     ("R5", BRIDGE, "over",
      "⛔ THE FIRST MINT IS UNWRAPPED — the hole that existed before any retry did, "
      "and the reason both are wrapped rather than only the new one",
      [("    token, why = _mint_bearer(sess, force=False)\n    if token is None:\n        return 0, why\n"
-       "    status, body = _send(token)",
-       "    status, body = _send(sess.id_token())")]),
+       "    status, body = _send(token)\n    if status != 401:\n        return status, body\n"
+       "    # ⛔ FORCED, not cached.",
+       "    status, body = _send(sess.id_token())\n    if status != 401:\n        return status, body\n"
+       "    # ⛔ FORCED, not cached.")]),
     ("R6", BRIDGE, "under",
      "⛔ A DEAD SESSION IS REPORTED AS A GENERIC UPLOAD FAILURE, naming no cause "
      "and offering no action, on the route whose retry has just proved the "
@@ -513,18 +521,14 @@ MUTANTS = [
      "⛔⛔ THE JSON HELPER MINTS INSIDE THE `try` AGAIN: a dead refresh token "
      "escapes as an exception through /device/pair and /device/remove, and a "
      "failure reaching GOOGLE is reported as failing to reach the WEB APP",
-     [('    token, why = _mint_bearer(sess, force=False)\n'
-       '    if token is None:\n        return 0, why\n'
-       '    try:\n'
-       '        r = requests.post(\n'
-       '            f"{config.FE_BASE}{path}",\n'
-       '            json=payload,\n'
-       '            headers={"Authorization": f"Bearer {token}"},',
-       '    try:\n'
-       '        r = requests.post(\n'
-       '            f"{config.FE_BASE}{path}",\n'
-       '            json=payload,\n'
-       '            headers={"Authorization": f"Bearer {sess.id_token()}"},')]),
+     [('            r = requests.post(\n'
+       '                f"{config.FE_BASE}{path}",\n'
+       '                json=payload,\n'
+       '                headers={"Authorization": f"Bearer {token}"},',
+       '            r = requests.post(\n'
+       '                f"{config.FE_BASE}{path}",\n'
+       '                json=payload,\n'
+       '                headers={"Authorization": f"Bearer {sess.id_token()}"},')]),
     ("X12", SR, "under",
      "⛔⛔ THE CONFIRM COMMAND GOES BACK TO CARRYING NOTHING, so the assistant "
      "re-sends the NUMBERS against a list the second process re-fetches — and "

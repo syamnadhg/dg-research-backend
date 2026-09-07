@@ -209,7 +209,10 @@ MUTANTS = [
     ("U4", BRIDGE, "under",
      "an upload failure is reported as a success, so the person believes evidence "
      "went that never left the machine",
-     [('            if status != 200:', '            if False:')]),
+     [('            if status != 200:\n'
+       '                log.warning("agent-log upload for %s failed: HTTP %s %s",',
+       '            if False:\n'
+       '                log.warning("agent-log upload for %s failed: HTTP %s %s",')]),
     ("U5", BRIDGE, "over",
      "⛔⛔ THE TAIL BECOMES THE HEAD. An oversized log sends its OLDEST bytes and "
      "reports success — the transport works perfectly and carries nothing about "

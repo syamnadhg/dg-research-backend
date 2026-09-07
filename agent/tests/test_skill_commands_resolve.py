@@ -75,8 +75,16 @@ def test_skill_within_sanity_bound():
     # the LLM relies on the explicit/emphatic wording — so we REVERTED to the
     # proven verbose version (reliability > a smaller file). This is just a loose
     # upper bound to catch unbounded growth, NOT a trim mandate.
+    #
+    # ⛔ RAISED 460 → 480 IN 7.9-2, DELIBERATELY AND ONCE. The public-computer
+    # verbs added four intent rows, and three of them carry a fact the model
+    # cannot infer: an answered request LEAVES the waiting list either way, no
+    # request can be withdrawn, and asking discloses the user's name and email.
+    # Dropping those to stay under a number is how this file's own note above
+    # says reliability was lost the last time it was trimmed. The bound still
+    # catches unbounded growth; it is not a trim mandate and not a target.
     n = len((_SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").splitlines())
-    assert n < 460, f"SKILL.md grew to {n} lines — unexpectedly large"
+    assert n < 480, f"SKILL.md grew to {n} lines — unexpectedly large"
 
 
 def test_signin_handoff_continues_from_the_announce_topic():
