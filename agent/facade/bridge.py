@@ -1401,18 +1401,62 @@ def _sr_links(doc: dict) -> dict:
     return out
 
 
+def _mint_bearer(sess: "AccountSession", force: bool) -> "tuple[str | None, dict]":
+    """A bearer token, or the reason there isn't one. NEVER RAISES.
+
+    ⛔⛔ BOTH FE HELPERS PROMISE THEY NEVER RAISE AND NEITHER KEPT IT. Minting can
+    fail two ways — `RevokedError` when the refresh token itself is dead, and a
+    transport error reaching Google — and both were evaluated inside a `try` that
+    catches only `requests.RequestException`. `/logs/agent-log` makes its call
+    OUTSIDE its own `except RevokedError`, and `do_POST` has no blanket handler,
+    so an escaping exception unwinds into `http.server`: the connection closes and
+    the person waiting on an upload gets a dropped socket rather than the sentence
+    this file wrote for them.
+
+    ⛔ AND IT NAMES THE RIGHT HOST. A refresh failure is Google's endpoint, not
+    the web app's — reporting it as "could not reach {FE_BASE}" sent people to
+    look at a service that was answering.
+    """
+    try:
+        return sess.id_token(force=force), {}
+    except RevokedError:
+        return None, {"reason": "revoked",
+                      "error": "this agent's session was rejected — run login again"}
+    except Exception as e:  # noqa: BLE001 - a mint failure must not escape
+        return None, {"error": f"could not refresh this agent's sign-in "
+                               f"({type(e).__name__})"}
+
+
 def _fe_api_post(sess: "AccountSession", path: str, payload: dict) -> tuple[int, dict]:
     """POST a web-app API route (`{FE_BASE}{path}`) as the signed-in USER —
     the same Bearer-ID-token calls the browser makes. Used for the device
     pair/unpair routes, which MUST go through the app's admin-SDK handlers
     (Firestore rules deliberately block owner/sharer writes to ownerUid /
     sharedWith). Returns (status, decoded-json|{}); never raises — transport
-    failures come back as (0, {"error": …}) for the caller to surface."""
+    failures come back as (0, {"error": …}) for the caller to surface.
+
+    ⛔⛔ THE MINT IS OUTSIDE THE `try`, AND THAT IS THE POINT. It used to be
+    evaluated INSIDE it, in the header dict, where two things went wrong at once:
+    a `RevokedError` is a RuntimeError and escaped, breaking the promise above on
+    a helper three of whose four callers sit inside `except RevokedError` blocks
+    that never saw it; and a transport failure reaching GOOGLE's token endpoint
+    was caught by `except requests.RequestException` and reported as "could not
+    reach" the WEB APP — a sentence pointing somebody at a service that was
+    answering fine.
+
+    ⛔ NO 401 RETRY HERE YET. That is deliberate: the bytes sibling owns one
+    because its single caller is the send-logs upload, and adding one here
+    changes what four callers see on a dead session. It belongs with the wave
+    that revisits those callers.
+    """
+    token, why = _mint_bearer(sess, force=False)
+    if token is None:
+        return 0, why
     try:
         r = requests.post(
             f"{config.FE_BASE}{path}",
             json=payload,
-            headers={"Authorization": f"Bearer {sess.id_token()}"},
+            headers={"Authorization": f"Bearer {token}"},
             timeout=20,
         )
         try:
@@ -1469,20 +1513,9 @@ def _fe_api_post_bytes(sess: "AccountSession", path: str, blob: bytes,
     file wrote for them. Both mints are wrapped, and the first one too — it could
     already raise before any retry existed.
     """
-    def _bearer(force: bool) -> "tuple[str | None, dict]":
-        """A token, or the reason there isn't one. Never raises."""
-        try:
-            return sess.id_token(force=force), {}
-        except RevokedError:
-            return None, {"reason": "revoked",
-                          "error": "this agent's session was rejected — "
-                                   "run login again"}
-        except Exception as e:  # noqa: BLE001 - a mint failure must not escape
-            return None, {"error": f"could not refresh this agent's sign-in "
-                                   f"({type(e).__name__})"}
-
-    def _send(token: str) -> "tuple[int, dict] | None":
-        """(status, body), or None if the request itself could not be made."""
+    def _send(token: str) -> "tuple[int, dict]":
+        """(status, body). A transport failure comes back as (0, …), never None
+        and never an exception — both call sites below rely on that."""
         try:
             r = requests.post(
                 f"{config.FE_BASE}{path}",
@@ -1499,7 +1532,7 @@ def _fe_api_post_bytes(sess: "AccountSession", path: str, blob: bytes,
             body = {}
         return r.status_code, body if isinstance(body, dict) else {}
 
-    token, why = _bearer(force=False)
+    token, why = _mint_bearer(sess, force=False)
     if token is None:
         return 0, why
     status, body = _send(token)
@@ -1507,7 +1540,7 @@ def _fe_api_post_bytes(sess: "AccountSession", path: str, blob: bytes,
         return status, body
     # ⛔ FORCED, not cached. Re-sending the token the app just refused would
     # produce the same 401 and call it a retry.
-    token, why = _bearer(force=True)
+    token, why = _mint_bearer(sess, force=True)
     if token is None:
         return 0, why
     return _send(token)

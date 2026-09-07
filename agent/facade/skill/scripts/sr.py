@@ -1466,13 +1466,25 @@ def _log_run_label(row: dict) -> str:
     return f"a run from {started[:10]}" if started else "an unnamed run"
 
 
-# ⭐ THE SAME TWO TOKENS THE TERMINAL TAKES, and they are duplicated here for the
-# same reason every other send-logs sentence in this file is: this script must be
-# stdlib-only and cannot import the facade package, so it carries its own copy.
-# `test_send_logs_cli_0825.py` reads both files and fails if either grows a case
-# the other lacks — the duplication is policed rather than removed.
+# ⭐ THE SAME TWO TOKENS THE TERMINAL TAKES, duplicated here for the same reason
+# every other send-logs sentence in this file is: this script must be stdlib-only
+# and cannot import the facade package, so it carries its own copy.
+#
+# ⛔ AND THE POLICING IS NARROWER THAN IT LOOKS. `test_send_logs_cli_0825.py`
+# compares the two FAILURE TABLES, not this vocabulary — an earlier version of
+# this comment claimed otherwise and was wrong. What compares the tokens is
+# `test_chat_and_the_terminal_agree_on_every_spec` in
+# `test_send_logs_picker_791.py`, which drives BOTH resolvers over the same specs
+# and asserts identical answers. The two have already drifted once (this file
+# splits on spaces and drops spoken connectives; the terminal does neither,
+# because nobody speaks to it), so the agreement list is where a new token must
+# be added, not this comment.
 _AGENT_LOG_TOKEN = "0"
 _ALL_TOKEN = "all"
+# The words a person puts between numbers when they say a list out loud. Dropped
+# before tokenising, never treated as a run.
+_SPOKEN_FILLER = frozenset({"and", "&", "+", "plus", "then", "also", "the", "run",
+                            "runs", "number", "numbers", "no", "no.", "#"})
 
 
 def _resolve_log_selection(rows: list, spec) -> tuple:
@@ -1493,9 +1505,20 @@ def _resolve_log_selection(rows: list, spec) -> tuple:
     known = {r.get("name") for r in rows}
     picked = []
     wants_agent_log = False
+    # ⛔⛔ A PERSON SAYS "1 AND 3", NOT "1,3". The assistant relays words, so the
+    # spec arrives as somebody's sentence rather than as a shell argument — and
+    # splitting on whitespace alone half-accepted it: "1 and 3" refused on the
+    # word "and", naming a run called “and”. The connectives are dropped, and
+    # anything else that is not a number still refuses, because a token this
+    # cannot place is a run somebody asked for and did not get.
+    #
+    # ⛔ ONLY WHEN IT IS NOT A RUN NAME. A machine is free to mint a run called
+    # "and"; if this list is holding one, the word means that run.
     for token in str(spec or "").replace(" ", ",").split(","):
         token = token.strip()
         if not token:
+            continue
+        if token.lower() in _SPOKEN_FILLER and token not in known:
             continue
         if token == _AGENT_LOG_TOKEN:
             wants_agent_log = True
@@ -1505,9 +1528,21 @@ def _resolve_log_selection(rows: list, spec) -> tuple:
                 if row.get("name") not in picked:
                     picked.append(row.get("name"))
             continue
-        if token.lstrip("+-").isdigit():
+        # ⛔ `isdecimal`, NOT `isdigit`, and at most ONE sign — the terminal's
+        # twin. "²".isdigit() is True and int("²") raises; "+-1" survives
+        # `lstrip("+-")` and int() refuses it too. A traceback is not a sentence.
+        body_ = token[1:] if token[:1] in "+-" else token
+        if body_.isdecimal() and body_.isascii():
             index = int(token)
             if not 1 <= index <= len(rows):
+                # ⛔ "numbered 1 to 0" IS NOT A SENTENCE. When that computer
+                # listed nothing there is no range to quote, and the person needs
+                # the other fact — that there is nothing to pick from.
+                if not rows:
+                    return None, False, ["That computer hasn’t listed any runs, "
+                                         "so there are no numbers to pick — 0, "
+                                         "the agent’s own log, still needs a "
+                                         "bundle to ride."]
                 return None, False, [f"There’s no {index} in that list — the runs "
                                      f"are numbered 1 to {len(rows)}, and 0 is the "
                                      "agent’s own log."]
@@ -1545,7 +1580,22 @@ def cmd_send_logs(args) -> int:
         if status == "done":
             lines = [f"✓ {want} was sent — {int(row.get('runCount') or 0)} run(s), "
                      f"{_size_words(row.get('sizeBytes'))}."]
-            if getattr(args, "agent_log", False):
+            # ⛔ `--runs 0` MEANS THE SAME THING HERE. It is accepted on the send
+            # and was dropped in silence on the one call that actually uploads —
+            # so an assistant carrying the person's own words forward got nothing
+            # and was told nothing. Only the `0` is read: this bundle has already
+            # been built, so a RUN named here would change nothing, and that is
+            # said rather than ignored.
+            _st_spec = [t.strip() for t in
+                        str(getattr(args, "runs", "") or "").replace(" ", ",").split(",")
+                        if t.strip()]
+            _st_wants_log = _AGENT_LOG_TOKEN in _st_spec
+            _st_other = [t for t in _st_spec if t != _AGENT_LOG_TOKEN]
+            if _st_other:
+                lines.append("(Only 0 — the agent’s own log — means anything on a "
+                             "check; that bundle is already built, so naming runs "
+                             "here changes nothing.)")
+            if getattr(args, "agent_log", False) or _st_wants_log:
                 # ⭐ THE SECOND STEP, AND THE ONLY PLACE IT CAN HAPPEN IN THIS
                 # CLIENT. The bundle has landed, so the row now names a folder the
                 # app's Clear-logs will list — which is exactly the condition the
@@ -1665,8 +1715,12 @@ def cmd_send_logs(args) -> int:
         # ⛔ THE 0 ROW PRINTS EITHER WAY, so the choice exists for somebody who
         # does not already know it does. `--agent-log` shipped in 2026-08-26 and
         # has been reachable only by naming it.
+        # ⛔ "MAY NOT BE", NOT "IS NOT" — the terminal's twin. The recommended
+        # install co-locates the agent and the backend, so asserting the two
+        # differ is false for most people reading it.
         lines.append(f"  0 {'•' if agent_log else '·'} the log from the agent on "
-                     "THIS host — a different computer, not that one"
+                     "THIS host — the machine running this chat, which may not "
+                     "be that computer"
                      f"{'' if agent_log else '   (not picked)'}")
         if machine:
             lines.append("Plus that computer’s own logs: its pairing and sign-in "
@@ -1687,14 +1741,15 @@ def cmd_send_logs(args) -> int:
             # material covers while this one named nobody. A second person who
             # signed in on this host is in that file, and nothing gates the upload
             # on who owns the host, because an agent host has no owner to ask.
-            lines.append("It covers everyone who has signed in on that host, not "
-                         "only you — there’s no owner to ask on a machine like "
-                         "that, so nothing checks.")
+            lines.append("It covers everyone who signed in through this agent "
+                         "since that file last rotated, not only you — there’s no "
+                         "owner to ask on a machine like that, so nothing checks.")
             # ⛔⛔ NAMED, because "not research content" is what it is NOT.
             # Measured in the file the uploader reads.
-            lines.append("What’s in it: a masked form of your email address, your "
-                         "account id, and the ids of the computers and runs this "
-                         "agent has touched.")
+            lines.append("Among what’s in it: a masked form of your email "
+                         "address, the ids of the computers and runs this agent "
+                         "has touched, file paths on that machine, and — when a "
+                         "lookup fails — your account id.")
         else:
             lines.append("The agent’s own log is not included.")
         # ⛔⛔ The three facts the app's modal names and this plan did not — see
@@ -1723,8 +1778,37 @@ def cmd_send_logs(args) -> int:
         # relaying for them — that saying a number is a thing they may do.
         lines.append("Say yes and I’ll send them — or say which numbers to send "
                      "instead (0 is the agent’s own log).")
+        # ⛔⛔ THE NUMBERS ARE POSITIONS IN THE LIST ABOVE, AND THE CONFIRM IS A
+        # SECOND PROCESS. It re-fetches `/logs/runs`, which re-resolves the
+        # selected device and re-reads a list the machine republishes as runs
+        # start, finish and age out — so between the plan and the send, position
+        # 2 can become a different run, or a different computer's run. Nothing
+        # carried identity across the two calls.
+        #
+        # ⛔ SO THE DIRECTIVE HANDS BACK NAMES AND THE DEVICE, not numbers. Names
+        # are what the machine matches on and what the bridge validates; the
+        # deviceId pins the computer the person was actually shown. The numbers
+        # stay in the words, because that is what a person says.
+        confirm = ["send-logs", "--confirm", f"--device {device_id}"]
+        if names:
+            confirm.append("--runs " + ",".join(names))
+        elif not machine:
+            confirm.append("--none")
+        if machine:
+            confirm.append("--machine")
+        if agent_log:
+            confirm.append("--agent-log")
+        directives = [
+            "If they say yes to exactly what is listed above, run: sr.py "
+            + " ".join(confirm),
+            "⛔ Those are RUN NAMES and a device id, not the numbers shown — the "
+            "numbers are positions in a list this command re-fetches, and it can "
+            "have changed by then.",
+            "If they ask for a different set, re-run the bare command first and "
+            "show them the new plan; never edit this line by hand.",
+        ]
         return _emit({**body, "wouldSend": names, "includeMachine": machine},
-                     args.json, lines)
+                     args.json, [*lines, *_agent_directive_block(directives)])
 
     payload = {"runNames": names, "includeMachine": machine,
                # ⛔ Set on this branch ONLY. It claims the person was shown what

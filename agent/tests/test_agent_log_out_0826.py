@@ -574,7 +574,15 @@ def test_no_wait_says_the_agent_log_did_not_go():
     property."""
     code = _code_only(Path(cli.__file__))
     branch = code[code.index("    if args.no_wait:"):]
-    branch = branch[:branch.index("    rc = _await_bundle")]
+    # ⛔ A HARD INDEX ON A LINE THAT MOVED. This used to terminate on
+    # `"    rc = _await_bundle"`, which became `rc, landed = _await_bundle` when
+    # the wait learned to report whether the bundle actually LANDED — and the
+    # test then died with a ValueError rather than an assertion, which reads as a
+    # broken test rather than a broken guard. Terminate on the call, not on the
+    # assignment, and say so if it is gone.
+    end = branch.find("_await_bundle(")
+    assert end > 0, "the wait call this branch precedes is gone — re-scope me"
+    branch = branch[:end]
     assert "was not sent" in branch
     assert "_send_agent_log" not in branch, (
         "the agent log is sent before the bundle row can exist")

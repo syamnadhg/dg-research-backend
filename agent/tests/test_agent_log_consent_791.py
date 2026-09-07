@@ -91,7 +91,7 @@ def _plan(monkeypatch, **kw):
 def test_the_terminal_says_whose_records_are_in_it(monkeypatch):
     """⛔⛔ THE FACT THE MACHINE'S LINE HAS AND THIS ONE DID NOT."""
     out = _plan(monkeypatch, agent_log=True)
-    assert "everyone who has signed in on THIS host, not only you" in out
+    assert "everyone who signed in through this agent since that file last rotated" in out
 
 
 def test_the_terminal_says_nothing_checks_who_owns_that_host(monkeypatch):
@@ -106,8 +106,14 @@ def test_the_terminal_names_the_fields(monkeypatch):
     """⛔ "Not research content" is what it is NOT. These are measured."""
     out = _plan(monkeypatch, agent_log=True)
     assert "masked form of your email address" in out
-    assert "account id" in out
     assert "ids of the computers and runs" in out
+    # ⛔ "AMONG" AND "WHEN A LOOKUP FAILS". The list is neither exhaustive nor
+    # unconditional: the account id reaches the file only through a FAILED
+    # lookup's document path, and local paths are in there too. A closed list
+    # would be a promise about material nobody enumerated.
+    assert "Among what" in out
+    assert "when a lookup fails" in out
+    assert "file paths on" in out
 
 
 def test_none_of_that_appears_when_the_log_is_not_going(monkeypatch):
@@ -116,7 +122,7 @@ def test_none_of_that_appears_when_the_log_is_not_going(monkeypatch):
     not — and it would make the negative sentence beside it read as a formality."""
     out = _plan(monkeypatch, agent_log=False)
     assert "The agent's own log on this host is NOT included." in out
-    assert "everyone who has signed in" not in out
+    assert "signed in through this agent" not in out
     assert "masked form of your email address" not in out
 
 
@@ -141,7 +147,7 @@ def test_neither_new_sentence_uses_the_banned_phrase(monkeypatch):
     running the command from a third machine. A sibling guard bans it across
     these files; this pins the sentences added here specifically, because that
     guard reads source and would not notice a runtime-composed string."""
-    out = _plan(monkeypatch, agent_log=True).lower()
+    out = (_plan(monkeypatch, agent_log=True) + _plan(monkeypatch, agent_log=False)).lower()
     assert "this computer's own log" not in out
     assert "this computer’s own log" not in out
 
@@ -181,7 +187,7 @@ def _chat_args(**kw):
 def test_chat_says_whose_records_are_in_it(chat, capsys):
     sr.cmd_send_logs(_chat_args(agent_log=True))
     out = capsys.readouterr().out
-    assert "everyone who has signed in on that host, not only you" in out
+    assert "everyone who signed in through this agent since that file last rotated" in out
 
 
 def test_chat_says_nothing_checks_who_owns_that_host(chat, capsys):
@@ -195,15 +201,23 @@ def test_chat_names_the_fields(chat, capsys):
     sr.cmd_send_logs(_chat_args(agent_log=True))
     out = capsys.readouterr().out
     assert "masked form of your email address" in out
-    assert "account id" in out
     assert "ids of the computers and runs" in out
+    # ⛔ "AMONG" AND "WHEN A LOOKUP FAILS". The list is neither exhaustive nor
+    # unconditional: the account id reaches the file only through a FAILED
+    # lookup's document path, and local paths are in there too. A closed list
+    # would be a promise about material nobody enumerated.
+    assert "Among what" in out
+    assert "when a lookup fails" in out
+    assert "file paths on" in out
 
 
 def test_chat_says_none_of_it_when_the_log_is_not_going(chat, capsys):
     sr.cmd_send_logs(_chat_args(agent_log=False))
     out = capsys.readouterr().out
     assert "The agent’s own log is not included." in out
-    assert "everyone who has signed in" not in out
+    assert "signed in through this agent" not in out
+    # ⛔ THE FIELDS TOO — its terminal twin checks this and the chat one did not.
+    assert "masked form of your email address" not in out
 
 
 def test_the_two_clients_state_the_same_three_facts(monkeypatch, chat, capsys):
@@ -215,8 +229,9 @@ def test_the_two_clients_state_the_same_three_facts(monkeypatch, chat, capsys):
     sr.cmd_send_logs(_chat_args(agent_log=True))
     chat_out = capsys.readouterr().out
     term_out = _plan(monkeypatch, agent_log=True)
-    for claim in ("everyone who has signed in", "no owner to ask", "nothing checks",
-                  "masked form of your email address", "account id",
+    for claim in ("signed in through this agent", "since that file last rotated",
+                  "no owner to ask", "nothing checks",
+                  "masked form of your email address", "when a lookup fails",
                   "ids of the computers and runs"):
         assert claim in chat_out, claim
         assert claim in term_out, claim

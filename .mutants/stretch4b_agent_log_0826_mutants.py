@@ -242,11 +242,16 @@ MUTANTS = [
      "\"do not wait for the row\"",
      [('        if agent_log:\n            # ⛔ NOT SENT ON THIS PATH, AND SAID SO.',
        '        if agent_log:\n            _send_agent_log(code)\n        if False:\n            # ⛔ NOT SENT ON THIS PATH, AND SAID SO.')]),
+    # ⛔ RE-ANCHORED 2026-09-07 (wave 7.9-1). The wait now reports whether the
+    # bundle actually LANDED as well as its exit code — a timeout also exits 0,
+    # so `rc` alone could not gate the upload — and the upload sits behind that
+    # flag. Same subject: a failure on the second step must not change the exit
+    # code of a send that arrived.
     ("O3", CLI, "over",
      "a failed agent-log send changes the exit code, so a bundle that arrived is "
      "reported as a command that failed",
-     [('    rc = _await_bundle(code, args.wait)\n    if agent_log:\n        _send_agent_log(code)\n    return rc',
-       '    rc = _await_bundle(code, args.wait)\n    if agent_log:\n        _send_agent_log(code)\n        return 1\n    return rc')]),
+     [('        if landed:\n            _send_agent_log(code)\n',
+       '        if landed:\n            _send_agent_log(code)\n            return 1\n')]),
     ("O4", SR, "under",
      "our chat client stops saying either way, so its plan is silent about a file "
      "that may or may not be going",

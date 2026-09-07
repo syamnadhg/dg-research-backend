@@ -324,9 +324,17 @@ def test_the_zero_row_names_the_other_computer(monkeypatch):
     confusion in the consent copy."""
     wire = _Wire()
     _, out = _run(monkeypatch, _args(list=True), wire)
-    line = [ln for ln in out.splitlines() if ln.startswith("   0  ")]
-    assert len(line) == 1, out
-    assert "a different computer, not that one" in line[0]
+    block = [ln for ln in out.splitlines() if ln.startswith("   0  ")
+             or ln.startswith("      which may not be")]
+    assert len(block) == 2, out
+    assert "the machine you are typing on" in block[0]
+    # ⛔ AND IT DOES NOT ASSERT THEY DIFFER. The recommended install co-locates
+    # the agent and the backend — `_local_superresearch` exists because that is
+    # the standard setup — so "a different computer" was false on most screens
+    # that printed it, and a claim plainly wrong in front of you teaches you to
+    # discount the rest of the plan.
+    assert "which may not be that computer" in block[1]
+    assert "a different computer, not that one" not in out
 
 
 def test_the_runs_are_still_numbered_from_one(monkeypatch):

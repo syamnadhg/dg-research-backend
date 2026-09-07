@@ -20,7 +20,9 @@ the refresh token nor the id token.
 
 from __future__ import annotations
 
+import io
 import logging
+import os
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -39,6 +41,25 @@ _DATEFMT = "%Y-%m-%d %H:%M:%S"
 def _tag(handler: logging.Handler) -> logging.Handler:
     setattr(handler, _HANDLER_TAG, True)
     return handler
+
+
+def _same_file(stream, path: Path) -> bool:
+    """Is this stream already writing the file at ``path``?
+
+    ⛔ BY INODE, NOT BY NAME. The stream is inherited from whatever started the
+    process — a shell redirect names the path, the process only holds the
+    descriptor — so comparing names would answer "no" for the one case this
+    exists to catch. Anything unanswerable (a stream with no fileno, a closed
+    descriptor, a path that is not there yet) is "no": dropping the console on a
+    guess would silence the only output a person watching a foreground `serve`
+    can see.
+    """
+    try:
+        a = os.fstat(stream.fileno())
+        b = path.stat()
+    except (OSError, ValueError, AttributeError, io.UnsupportedOperation):
+        return False
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
 
 
 def configure(verbose: bool = False, *, to_file: bool = False, log_file: Path | None = None) -> Path | None:
@@ -64,6 +85,7 @@ def configure(verbose: bool = False, *, to_file: bool = False, log_file: Path | 
     fmt = logging.Formatter(_FMT, datefmt=_DATEFMT)
 
     console = _tag(logging.StreamHandler())
+    console_is_the_log_file = False
     # Be self-sufficient on a legacy (cp1252) console rather than relying on the
     # CLI's _force_utf8_output having run: degrade un-encodable chars instead of
     # raising UnicodeEncodeError. No-op on streams that can't be reconfigured.
@@ -89,6 +111,27 @@ def configure(verbose: bool = False, *, to_file: bool = False, log_file: Path | 
             fileh.setFormatter(fmt)
             logger.addHandler(fileh)
             resolved = path
+            # ⛔⛔ ONE WRITER PER FILE. On the fleet the bridge is started with its
+            # child stdout/stderr redirected INTO this same path — measured: the
+            # fork's own starter builds $HERMES_HOME/.super-agent/bridge.log, and
+            # HERMES_HOME and HOME are set to the same directory. So the console
+            # handler and the shell redirect both append to one file while the
+            # rotating handler RENAMES it at 1 MB: after the first rotation the
+            # redirect keeps writing to the renamed inode, so the active file the
+            # uploader sends is missing everything the console said, and the .1
+            # backup — which is never uploaded — keeps growing instead.
+            #
+            # ⭐ THE CONSOLE IS THE HALF TO DROP, because it is the duplicate.
+            # Every record it would print is already going to the file through the
+            # handler beside it; what the redirect uniquely carries is output that
+            # never reaches logging at all — a traceback on the way out — and that
+            # is worth keeping.
+            console_is_the_log_file = _same_file(console.stream, path)
+            if console_is_the_log_file:
+                logger.removeHandler(console)
+                logger.warning(
+                    "console output is redirected into %s — dropping the console "
+                    "handler so this file has one writer", path)
         except OSError as e:  # pragma: no cover - disk/permission edge
             logger.warning("could not open log file %s — console only (%s)", path, e)
     return resolved

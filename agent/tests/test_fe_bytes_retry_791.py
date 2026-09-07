@@ -220,7 +220,13 @@ def test_the_route_relays_a_revoked_session_as_401():
     import inspect
     src = inspect.getsource(bridge)
     start = src.index("def _log_agent_log(self)")
-    block = src[start:start + 4000]
+    # ⛔⛔ TO THE END OF THE METHOD, NOT A BYTE COUNT. The first version took a
+    # 4000-byte window whose far edge sat within a line or two of the last thing
+    # it needed to find — so a comment added anywhere above would have pushed the
+    # generic branch out of the window and the ordering assertion would have died
+    # on a ValueError rather than caught anything.
+    end = src.index("def _research(self)", start)
+    block = src[start:end]
     revoked = block.index('reply.get("reason") == "revoked"')
     generic = block.index('"reason": "agent_log_not_sent"')
     assert revoked < generic, "the revoked branch is behind the generic one"

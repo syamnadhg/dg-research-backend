@@ -105,8 +105,21 @@ def test_doctor_still_does_not_point_at_the_bare_send_command(monkeypatch, tmp_p
     `doctor` — was written against a sentence that pointed the wrong way. The flag
     is the precise thing and it collides with nothing."""
     out = _doctor(monkeypatch, tmp_path)
-    block = out[out.index("log"):].split("bridge")[0]
-    assert "send-logs" not in block
+    # ⛔⛔ SLICED BY LINE, NOT BY SUBSTRING. The inherited version cut at the
+    # first "bridge" — which is inside the log PATH itself (`bridge.log`) on the
+    # very first line — so the "block" it searched ended before every sentence it
+    # was guarding. It could not have failed. Take the log row and the indented
+    # continuation lines that belong to it.
+    lines = out.splitlines()
+    start = next(i for i, ln in enumerate(lines) if str(tmp_path / "bridge.log") in ln)
+    block = []
+    for ln in lines[start + 1:]:
+        if ln.strip() and not ln.startswith("      "):
+            break
+        block.append(ln)
+    assert block, out
+    assert any("--agent-log" in ln for ln in block), block
+    assert not any("send-logs" in ln for ln in block), block
 
 
 # ── the two homes ─────────────────────────────────────────────────────────────
@@ -190,8 +203,19 @@ def test_an_unresolvable_home_is_not_reported_as_a_split(monkeypatch, tmp_path):
 
 # ── the consumers, because a helper nobody calls guards nothing ──────────────
 
-def test_the_doctor_is_silent_when_the_homes_agree(monkeypatch, tmp_path):
+def test_the_doctor_is_silent_when_the_homes_are_unset(monkeypatch, tmp_path):
+    """The ordinary host: no HERMES_HOME at all."""
     out = _doctor(monkeypatch, tmp_path, hermes_home=None)
+    assert "homes" not in out
+
+
+def test_the_doctor_is_silent_when_the_homes_are_SET_and_agree(monkeypatch, tmp_path):
+    """⛔ THE FLEET AS IT IS TODAY, which is the case that must stay quiet — and
+    the one the first version of this file never exercised: it passed
+    hermes_home=None, which is the variable being ABSENT, a different branch."""
+    home = tmp_path / "sandbox"
+    home.mkdir()
+    out = _doctor(monkeypatch, tmp_path, hermes_home=home, home=home)
     assert "homes" not in out
 
 

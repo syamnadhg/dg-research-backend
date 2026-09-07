@@ -24,7 +24,15 @@ from . import branding as b
 from .firestore_rest import FirestoreRest
 from .session import AccountSession
 
-log = logging.getLogger(__name__)
+# ⛔⛔ NAMED, NOT `__name__`. The fleet starts the bridge as
+# `python -m facade.cli serve` (dg-hermes-fleet/skills/super-research/scripts/sr.py),
+# and under `-m` this module's `__name__` is `"__main__"` — not a child of the
+# `facade` logger `logsetup.configure` installs the rotating file handler on. So
+# on the ONE deployment that can actually produce a split home, the warning about
+# it would have gone to a logger with no file handler and no console: the pinned
+# launchers give the bridge no StandardOutput at all. It would have been emitted,
+# and nowhere.
+log = logging.getLogger("facade.cli")
 
 _OK = "✓"  # ✓
 _NO = "✗"  # ✗
@@ -1806,7 +1814,14 @@ def _resolve_selection(rows: list, spec: str | None) -> "tuple[list[str], bool] 
         # False, so a negative fell through to the name branch and was refused
         # with "isn't holding a run called “-1”" — a sentence about a run name
         # nobody typed. It is out of range, and that is what it should say.
-        if token.lstrip("+-").isdigit():
+        # ⛔ `isdecimal`, NOT `isdigit`. "²".isdigit() is True and int("²")
+        # raises, so a superscript reached `int()` and left a traceback on the
+        # screen instead of the sentence this function exists to print. And at
+        # most ONE sign: `lstrip("+-")` accepted "+-1", which `int()` also
+        # refuses. Everything that is not a plain signed integer falls to the
+        # name branch, which already has a sentence for it.
+        body = token[1:] if token[:1] in "+-" else token
+        if body.isdecimal() and body.isascii():
             index = int(token)
             if not 1 <= index <= len(rows):
                 # ⛔ `0` REACHES HERE ONLY SPELLED SOME OTHER WAY — "00", "-0",
@@ -1848,8 +1863,14 @@ def _print_agent_log_choice() -> None:
     is reaching the computer at all — and they are precisely the branches that
     print no list to hang a row off. Offering it only when there is something
     else to offer is how the flag became invisible in the first place."""
-    print("   0  the log from the agent on THIS host — a different computer, "
-          "not that one")
+    # ⛔ "MAY NOT BE", NOT "IS NOT". The recommended install puts the agent and
+    # the backend on the SAME machine — `_local_superresearch()` exists because
+    # that is the standard setup — so asserting they differ is false for most
+    # people reading it, and a claim that is plainly wrong on your own screen
+    # teaches you to discount the rest of the plan.
+    print("   0  the log from the agent on THIS host — the machine you are "
+          "typing on,")
+    print("      which may not be that computer")
 
 
 def _print_held_runs(rows: list) -> None:
@@ -1860,8 +1881,17 @@ def _print_held_runs(rows: list) -> None:
               f"{_size_words(row.get('sizeBytes'))}")
 
 
-def _await_bundle(code: str, seconds: int) -> int:
+def _await_bundle(code: str, seconds: int) -> "tuple[int, bool]":
     """Poll the row until the machine finishes, or say what is still unknown.
+
+    Returns (exit code, whether the bundle actually LANDED).
+
+    ⛔⛔ TWO ANSWERS, BECAUSE ZERO MEANS TWO THINGS. A timeout exits 0 on purpose
+    — running out of patience is not a failure and saying so would be a lie about
+    somebody else's computer — so the exit code alone cannot tell "the bundle
+    arrived" from "we stopped waiting for it". The agent-log upload may only
+    follow a bundle that arrived, and the caller had nothing but the exit code to
+    ask; it uploaded on both.
 
     ⛔⛔ RUNNING OUT OF PATIENCE IS NOT A FAILURE, and saying so would be a lie
     about somebody else's computer. Worker 1 deletes the command before acting
@@ -1888,11 +1918,11 @@ def _await_bundle(code: str, seconds: int) -> int:
                 print(f"{_OK} Sent — {int(row.get('runCount') or 0)} run(s){machine}, "
                       f"{_size_words(row.get('sizeBytes'))}.")
                 print(f"    Quote {code} when you report the problem.")
-                return 0
+                return 0, True
             if status == "failed":
                 print(f"{_NO} That computer couldn't send: "
                       f"{_send_logs_failure(row.get('errorClass'))}.")
-                return 1
+                return 1, False
         time.sleep(2)
     if seen_any:
         print(f"  Still packaging. Check again with:  agent send-logs --status {code}")
@@ -1904,7 +1934,7 @@ def _await_bundle(code: str, seconds: int) -> int:
         print("  That computer hasn't picked the request up yet — it may be "
               "asleep or offline.")
         print(f"  Check again with:  agent send-logs --status {code}")
-    return 0
+    return 0, False
 
 
 def cmd_send_logs(args: argparse.Namespace) -> int:
@@ -1918,6 +1948,9 @@ def cmd_send_logs(args: argparse.Namespace) -> int:
     if not _bridge_up():
         print(f"{_NO} Bridge isn't running. Run:  agent serve   then   agent login")
         return 1
+    # ⛔ READ BEFORE THE STATUS BRANCH, which now honours it. Reading it only in
+    # the send path is how the flag came to parse and do nothing here.
+    agent_log = bool(getattr(args, "agent_log", False))
     if args.status:
         code = str(args.status).strip().upper()
         res = _bridge_get(f"/logs/bundle?code={code}", timeout=15.0)
@@ -1935,7 +1968,24 @@ def cmd_send_logs(args: argparse.Namespace) -> int:
         if status == "done":
             print(f"{_OK} {code}: sent — {int(row.get('runCount') or 0)} run(s), "
                   f"{_size_words(row.get('sizeBytes'))}.")
+            # ⛔⛔ THE SECOND STEP, AND THE TERMINAL HAD NONE. The chat client has
+            # always had it — it is the command that client PRINTS to the
+            # assistant — but here the flag parsed, did nothing, said nothing and
+            # exited 0. Both routes out of a wait that did not finish dead-ended
+            # because of it: the timeout sentence has nothing to offer, and
+            # `--no-wait`'s "re-run without --no-wait" mints a NEW request that
+            # the machine refuses for ten minutes.
+            if agent_log:
+                _send_agent_log(code)
             return 0
+        if agent_log:
+            # ⛔ SAID, NOT SILENTLY DROPPED. The upload is refused until the row
+            # lands, by design; a person who asked for it deserves to know this
+            # call was not the one that did it.
+            print(f"    The agent's own log has not gone yet — it can only "
+                  "follow a bundle that")
+            print("    has landed. Ask again with the same code once this shows "
+                  "done.")
         print(f"{code}: {status}.")
         return 0
 
@@ -1976,22 +2026,32 @@ def cmd_send_logs(args: argparse.Namespace) -> int:
         return 0
 
     picked_agent_log = False
-    if args.none:
-        names: list[str] = []
-    elif args.runs:
+    names: list[str] = [r.get("name") for r in rows]
+    if args.runs:
         picked = _resolve_selection(rows, args.runs)
         if picked is None:
             return 1
         names, picked_agent_log = picked
-    else:
-        names = [r.get("name") for r in rows]
+    # ⛔⛔ AFTER THE SELECTION, NOT INSTEAD OF IT. `--none` used to take the whole
+    # branch, so `--none --runs 0` never ran the resolver at all: the agent-log
+    # token was dropped, the plan printed "The agent's own log on this host is NOT
+    # included", and a spec the resolver would have refused (`--none --runs 99`)
+    # was accepted in silence. The chat client already had this order, so the two
+    # clients answered the same words differently — on the surface whose whole
+    # claim is that they do not.
+    #
+    # ⛔ AND IT STILL WINS OVER THE RUNS, which is what `--none` has always meant
+    # and what its help says. What it must not clear is a choice that is not a run
+    # and not on that computer.
+    if args.none:
+        names = []
 
     machine = bool(args.machine)
     # ⛔ EITHER ROUTE, NEVER ONE OVERRIDING THE OTHER. `--agent-log` is the flag
     # this shipped with and `--runs 0` is the row now printed in the list; they say
     # the same thing, and a person who does both must not be silently answered
     # "no" by whichever the code happened to read second.
-    agent_log = bool(getattr(args, "agent_log", False)) or picked_agent_log
+    agent_log = agent_log or picked_agent_log
     if machine and not owned:
         # Refused here as well as at the bridge, so the sentence arrives before
         # a round trip rather than after one.
@@ -2011,10 +2071,26 @@ def cmd_send_logs(args: argparse.Namespace) -> int:
         if agent_log:
             print(f"{_NO} The agent's own log can only go up beside a bundle from "
                   "that computer,")
-            print("    so something has to be in that bundle. Pick a run as well "
-                  "— or, if you")
-            print("    own that computer and the trouble is reaching it at all, "
-                  "add --machine.")
+            print("    so something has to be in that bundle.")
+            if rows:
+                print("    Pick a run as well.")
+            elif not owned:
+                # ⛔⛔ THE HONEST DEAD END, SAID OUT LOUD. A sharer whose runs are
+                # not in the published list has nothing to pick and may not ask
+                # for the machine's own logs, so there is no bundle they can
+                # build — and the row offering choice 0 is printed on exactly
+                # this branch. Sending them round to `--machine`, which is then
+                # refused, is worse than telling them the truth.
+                print("    That computer is holding no runs of yours to build one "
+                      "from, and its own")
+                print("    logs belong to whoever owns it — so there is nothing "
+                      "for this log to ride.")
+            # ⛔ GATED, like the sentence below it. `--machine` is refused for a
+            # non-owner four lines further up, so offering it to one sends them
+            # into a refusal this branch could have spared them.
+            if owned:
+                print("    Or, if the trouble is reaching that computer at all, "
+                      "add --machine.")
             return 1
         print(f"{_NO} There's nothing to send.")
         if owned:
@@ -2040,7 +2116,16 @@ def cmd_send_logs(args: argparse.Namespace) -> int:
     # ⛔ AND THE WORDING AVOIDS "this computer's own logs" ON PURPOSE. A guard bans
     # that exact phrase across this file, sr.py and bridge.py, because it reads as
     # the RESEARCH computer to somebody running the command from a third machine.
-    if agent_log:
+    # ⛔⛔ --no-wait CANNOT SEND IT, SO IT MUST NOT CLAIM TO. The upload may only
+    # follow the machine's row, and `--no-wait` is the choice not to wait for
+    # that row — so the plan used to describe three things about a file this
+    # invocation would then decline to send, and only mention that after the
+    # person had already agreed.
+    if agent_log and args.no_wait:
+        print("The agent's own log will NOT go on this run: it can only follow "
+              "that computer's bundle, and --no-wait does not wait for it. "
+              f"Finish it later with:  agent send-logs --status <CODE> --agent-log")
+    elif agent_log:
         print("It will ALSO include the log from the agent on THIS host — the "
               "program running this command. That is a connection and sign-in "
               "record, not research content, and it never leaves unless asked for.")
@@ -2051,16 +2136,23 @@ def cmd_send_logs(args: argparse.Namespace) -> int:
         # somebody happens to be typing on is not. A second person who signed in
         # here is in this file, and nothing gates the upload on who owns the host,
         # because an agent host has no owner to ask. So it is said instead.
-        print("It covers everyone who has signed in on THIS host, not only you — "
-              "there is no owner to ask on a machine like this, so nothing checks.")
+        print("It covers everyone who signed in through this agent since that "
+              "file last rotated, not only you — there is no owner to ask on a "
+              "machine like this, so nothing checks.")
         # ⛔⛔ NAMED, BECAUSE "NOT RESEARCH CONTENT" IS WHAT IT IS NOT. Measured in
         # the file the uploader actually reads: a masked form of the email address
         # on every connect, the account id, the ids of the computers and the runs
         # this agent touched, and — on any failed lookup — the full document path,
         # which carries the account id unmasked. A person weighing this deserves
         # the list rather than a category, and the list is short enough to print.
-        print("What is in it: a masked form of your email address, your account "
-              "id, and the ids of the computers and runs this agent has touched.")
+        # ⛔ "AMONG" AND "CAN", because the list is neither exhaustive nor
+        # unconditional. The account id reaches the file only when a lookup has
+        # FAILED (the Firestore error carries the document path); the file also
+        # records local paths, which name the account on this machine. Printing a
+        # closed list would be a promise about material nobody has enumerated.
+        print("Among what is in it: a masked form of your email address, the ids "
+              "of the computers and runs this agent has touched, file paths on "
+              "this machine, and — when a lookup fails — your account id.")
     else:
         print("The agent's own log on this host is NOT included.")
     # ⛔⛔ THE THREE FACTS THE APP'S MODAL NAMES AND THIS PLAN DID NOT. The header
@@ -2116,12 +2208,32 @@ def cmd_send_logs(args: argparse.Namespace) -> int:
             # after the machine's row lands, and --no-wait is the choice not to wait
             # for that. Sending it anyway would put an object in a folder no row
             # names yet, where the app's Clear-logs could never find it.
-            print("    The agent's own log was not sent — it can only go once that "
-                  "computer's bundle has landed. Re-run without --no-wait.")
+            print(f"    The agent's own log was not sent — it can only go once "
+                  "that computer's")
+            print(f"    bundle has landed. Finish it with:  agent send-logs "
+                  f"--status {code} --agent-log")
         return 0
-    rc = _await_bundle(code, args.wait)
+    rc, landed = _await_bundle(code, args.wait)
     if agent_log:
-        _send_agent_log(code)
+        # ⛔⛔ ONLY BESIDE A BUNDLE THAT ARRIVED. This call used to be
+        # unconditional on `rc`, and the machine's refusals do not stop it: the
+        # row exists and carries a deviceId before it is patched to `failed`, so
+        # the bridge's ordering check passes and the log goes up ALONE, into a
+        # support-code folder with no bundle in it. That is exactly what the
+        # refusal fifty lines above tells a person cannot happen — and the
+        # commonest refusal here, the machine's unkeyed 60-second floor, is
+        # tripped by whoever else uses that computer, so it is the ordinary case
+        # on a shared box rather than the edge one.
+        if landed:
+            _send_agent_log(code)
+        else:
+            # ⛔ `landed`, NOT `rc == 0`. A timeout also exits 0, and uploading
+            # then puts an object under a code whose row nobody has confirmed —
+            # the folder the app's Clear-logs lists may not exist yet.
+            print("    The agent's own log was not sent — it can only go beside "
+                  "a bundle that")
+            print(f"    arrived. Finish it with:  agent send-logs --status "
+                  f"{code} --agent-log")
     return rc
 
 
@@ -2304,8 +2416,9 @@ def build_parser() -> argparse.ArgumentParser:
     # "yes" — so there is no per-item reader to hang a question off, and inventing
     # one here would make this the only screen in the product that asks twice.
     sl.add_argument("--agent-log", dest="agent_log", action="store_true",
-                    help="also send the log from the agent on THIS host "
-                         "(the same thing as --runs 0)")
+                    help="also send the log from the agent on THIS host; "
+                         "--runs 0 names the same log, but --runs also REPLACES "
+                         "the run selection")
     sl.add_argument("--list", action="store_true",
                     help="just show what it's holding, send nothing")
     sl.add_argument("--status", metavar="CODE",

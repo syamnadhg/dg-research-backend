@@ -66,20 +66,24 @@ CLI = "agent/facade/cli.py"
 BRIDGE = "agent/facade/bridge.py"
 CONFIG = "agent/facade/config.py"
 SR = "agent/facade/skill/scripts/sr.py"
+LOGSETUP = "agent/facade/logsetup.py"
 SKILL = "agent/facade/skill/SKILL.md"
-OURS = (CLI, BRIDGE, CONFIG, SR, SKILL)
+OURS = (CLI, BRIDGE, CONFIG, SR, SKILL, LOGSETUP)
 
 # ⭐ THE GUARDS THIS WAVE ADDED, and the only tests a score here is about.
 MINE = ("tests/test_send_logs_picker_791.py "
         "tests/test_chat_picker_791.py "
         "tests/test_agent_log_consent_791.py "
         "tests/test_log_locality_791.py "
-        "tests/test_fe_bytes_retry_791.py")
-MIN_SELECTED = 90
+        "tests/test_fe_bytes_retry_791.py "
+        "tests/test_send_logs_crossverify_791.py")
+MIN_SELECTED = 140
 
-# ⚠ The whole agent suite for the other question, plus the backend root's anchor
-# sweep — this wave re-anchored three pre-existing harnesses and a mutant that
-# broke one of them again must not read as a kill.
+# ⚠ The whole agent suite, for the other question. ⛔ IT IS ONLY THAT: an earlier
+# version of this comment also claimed the backend root's anchor sweep rode along,
+# and it does not — nothing here runs `.mutants/_anchor_sweep.py`. This wave
+# re-anchored three pre-existing harnesses, and the sweep that proves those still
+# match is a SEPARATE command, run by hand before and after this one.
 ALL_SUITES = "tests/"
 
 SURVIVOR_CONFIRMATIONS = 2
@@ -100,13 +104,13 @@ MUTANTS = [
      "⛔⛔ THE CALLER DROPS IT. The resolver still returns the flag and nothing "
      "reads it — the exact shape that survived a sweep in this family, where a "
      "test pinned the helper's signature while the mutant changed the call site",
-     [('    agent_log = bool(getattr(args, "agent_log", False)) or picked_agent_log',
-       '    agent_log = bool(getattr(args, "agent_log", False))')]),
+     [("    agent_log = agent_log or picked_agent_log",
+       "    agent_log = agent_log or False")]),
     ("P3", CLI, "over",
      "⛔ THE TWO ROUTES BECOME AN AND. Somebody who says it one way is answered "
      "no, and only somebody who says it BOTH ways is heard",
-     [('    agent_log = bool(getattr(args, "agent_log", False)) or picked_agent_log',
-       '    agent_log = bool(getattr(args, "agent_log", False)) and picked_agent_log')]),
+     [("    agent_log = agent_log or picked_agent_log",
+       "    agent_log = agent_log and picked_agent_log")]),
     ("P4", CLI, "under",
      "⛔ `all` STOPS BEING A WORD and goes back to failing with \"isn't holding a "
      "run called “all”\" — a sentence naming a run that never existed, while the "
@@ -124,7 +128,10 @@ MUTANTS = [
      "⛔ A SIGNED NUMBER FALLS BACK TO THE NAME BRANCH, so `-1` is refused as a "
      "missing run NAME rather than as an index out of range — a sentence about a "
      "run name nobody typed",
-     [('        if token.lstrip("+-").isdigit():', '        if token.isdigit():')]),
+     [('        body = token[1:] if token[:1] in "+-" else token\n'
+       '        if body.isdecimal() and body.isascii():',
+       '        body = token\n'
+       '        if body.isdigit():')]),
     ("P7", CLI, "under",
      "⛔⛔ THE AGENT-LOG-ONLY REFUSAL GOES, so somebody who picked exactly one "
      "thing is told there is nothing to send",
@@ -135,11 +142,11 @@ MUTANTS = [
      "⛔⛔ IT EXPLAINS AND THEN CARRIES ON — the sentence is printed and the "
      "request goes anyway, so the bridge is asked to build an empty archive after "
      "a person has been told it cannot be done",
-     [('            print("    own that computer and the trouble is reaching it at all, "\n'
-       '                  "add --machine.")\n'
+     [('                print("    Or, if the trouble is reaching that computer at all, "\n'
+       '                      "add --machine.")\n'
        '            return 1\n',
-       '            print("    own that computer and the trouble is reaching it at all, "\n'
-       '                  "add --machine.")\n')]),
+       '                print("    Or, if the trouble is reaching that computer at all, "\n'
+       '                      "add --machine.")\n')]),
     ("P9", CLI, "under",
      "⛔ THE `0` ROW IS NEVER PRINTED. The flag still works for anybody who knows "
      "it exists and is offered to nobody — 2026-08-26 to 2026-09-06, restored",
@@ -158,8 +165,10 @@ MUTANTS = [
      "⛔ THE ROW STOPS NAMING THE OTHER COMPUTER, so a numbered line under a list "
      "of that machine's runs reads as one more of that machine's runs — the exact "
      "confusion a sibling guard polices in the consent copy",
-     [(' — a different computer, '
-       '"\n          "not that one"', '"')]),
+     [('    print("   0  the log from the agent on THIS host — the machine you are "\n'
+       '          "typing on,")\n'
+       '    print("      which may not be that computer")',
+       '    print("   0  the log from the agent on THIS host")')]),
     ("P12", CLI, "over",
      "⛔⛔ THE RUNS RENUMBER FROM ZERO, so the agent's log and the first run share "
      "a number and the log silently becomes run one. `0` is free ONLY because the "
@@ -169,8 +178,8 @@ MUTANTS = [
      "⛔ THE DEFAULT CHANGES to the plan's Enter-means-machine-logs line, which "
      "was written against a prompt this surface does not have — so a person who "
      "names no runs silently sends none of them",
-     [('    else:\n        names = [r.get("name") for r in rows]\n',
-       '    else:\n        names = []\n')]),
+     [('    names: list[str] = [r.get("name") for r in rows]\n',
+       '    names: list[str] = []\n')]),
 
     # ═══════════ C — chat ═══════════════════════════════════════════════════
     ("C1", SR, "under",
@@ -203,11 +212,11 @@ MUTANTS = [
      "⛔ THE `0` ROW APPEARS ONLY WHEN IT IS ALREADY GOING, so it is shown to "
      "everyone who does not need it and to nobody who does",
      [('        lines.append(f"  0 {\'•\' if agent_log else \'·\'} the log from the agent on "\n'
-       '                     "THIS host — a different computer, not that one"\n'
+       '                     "THIS host — the machine running this chat, which may not "\n'
+       '                     "be that computer"\n'
        '                     f"{\'\' if agent_log else \'   (not picked)\'}")\n',
        '        if agent_log:\n'
-       '            lines.append("  0 • the log from the agent on "\n'
-       '                         "THIS host — a different computer, not that one")\n')]),
+       '            lines.append("  0 • the log from the agent on THIS host")\n')]),
     ("C6", SR, "under",
      "⛔ THE LINE THAT SAYS THE NUMBERS ARE SAYABLE GOES. Nothing else in the "
      "conversation tells a person, or the assistant relaying for them, that "
@@ -292,10 +301,15 @@ MUTANTS = [
      "somebody goes looking for a line that does not exist in their config",
      [('    return None if theirs == ours else raw',
        '    return None if theirs == ours else str(theirs)')]),
-    ("D6", CONFIG, "under",
-     "an exported-but-empty variable reads as a second home, so every shell that "
-     "declares it and sets nothing raises a warning about nothing",
-     [('    if not raw:\n        return None\n', '')]),
+    # ⛔ RESTATED 2026-09-07. The first `why` claimed an empty value would raise a
+    # warning; it cannot — the function would return the empty string, which is
+    # falsy and which no consumer acts on, so the mutant changed nothing anybody
+    # could see. Made observable instead: an UNSET variable now reports a split.
+    ("D6", CONFIG, "over",
+     "an UNSET variable reads as a second home, so every ordinary host — where "
+     "HERMES_HOME does not exist at all — raises a warning about nothing",
+     [('    raw = (os.environ.get(HERMES_HOME_ENV) or "").strip()',
+       '    raw = (os.environ.get(HERMES_HOME_ENV) or "/nowhere").strip()')]),
     ("D7", CLI, "over",
      "⛔⛔ THE WARNING MOVES ABOVE THE FILE HANDLER. It is emitted, it looks right "
      "on a console nobody has, and it is absent from the one file that gets "
@@ -328,7 +342,8 @@ MUTANTS = [
      "⛔⛔ THE RETRY RE-SENDS THE CACHED TOKEN. It retries, it fails the same way, "
      "and every \"did it eventually work\" assertion is satisfied — only the "
      "ORDER of the tokens tells the two apart",
-     [('    token, why = _bearer(force=True)', '    token, why = _bearer(force=False)')]),
+     [("    token, why = _mint_bearer(sess, force=True)",
+       "    token, why = _mint_bearer(sess, force=False)")]),
     ("R2", BRIDGE, "under",
      "the retry goes, and the call most likely to have its token expire "
      "mid-flight — sixty seconds, megabytes — is the one with no second chance",
@@ -343,15 +358,15 @@ MUTANTS = [
      "⛔⛔ THE FORCED MINT IS UNWRAPPED. The one caller makes this call OUTSIDE "
      "its `except RevokedError` and `do_POST` has no blanket handler, so a dead "
      "refresh token closes the connection instead of answering",
-     [('    token, why = _bearer(force=True)\n    if token is None:\n        return 0, why\n'
-       '    return _send(token)',
-       '    return _send(sess.id_token(force=True))')]),
+     [("    token, why = _mint_bearer(sess, force=True)\n    if token is None:\n        return 0, why\n"
+       "    return _send(token)",
+       "    return _send(sess.id_token(force=True))")]),
     ("R5", BRIDGE, "over",
      "⛔ THE FIRST MINT IS UNWRAPPED — the hole that existed before any retry did, "
      "and the reason both are wrapped rather than only the new one",
-     [('    token, why = _bearer(force=False)\n    if token is None:\n        return 0, why\n'
-       '    status, body = _send(token)',
-       '    status, body = _send(sess.id_token())')]),
+     [("    token, why = _mint_bearer(sess, force=False)\n    if token is None:\n        return 0, why\n"
+       "    status, body = _send(token)",
+       "    status, body = _send(sess.id_token())")]),
     ("R6", BRIDGE, "under",
      "⛔ A DEAD SESSION IS REPORTED AS A GENERIC UPLOAD FAILURE, naming no cause "
      "and offering no action, on the route whose retry has just proved the "
@@ -370,32 +385,35 @@ MUTANTS = [
      "⛔⛔ THE TERMINAL STOPS SAYING WHOSE RECORDS ARE IN IT. The machine-log line "
      "four sentences above names the people its material covers; this one names "
      "nobody, on the surface where the sharing is LESS obvious, not more",
-     [('        print("It covers everyone who has signed in on THIS host, not only you — "\n'
-       '              "there is no owner to ask on a machine like this, so nothing checks.")\n', '')]),
+     [('        print("It covers everyone who signed in through this agent since that "\n'
+       '              "file last rotated, not only you — there is no owner to ask on a "\n'
+       '              "machine like this, so nothing checks.")\n', '')]),
     ("K2", CLI, "under",
      "⛔ THE FIELDS GO, leaving \"not research content\" — a category, and the "
      "half of it that is a negative",
-     [('        print("What is in it: a masked form of your email address, your account "\n'
-       '              "id, and the ids of the computers and runs this agent has touched.")\n', '')]),
+     [('        print("Among what is in it: a masked form of your email address, the ids "\n'
+       '              "of the computers and runs this agent has touched, file paths on "\n'
+       '              "this machine, and — when a lookup fails — your account id.")\n', '')]),
     ("K3", CLI, "over",
      "⛔⛔ THE CONSENT LINES MOVE OUT OF THE BRANCH, so a plan that is NOT sending "
      "the file describes what is in it — telling somebody their address is going "
      "when it is not, and making the negative line beside it read as a formality",
-     [('    if agent_log:\n'
+     [('    elif agent_log:\n'
        '        print("It will ALSO include the log from the agent on THIS host — the "',
-       '    if True:\n'
+       '    elif True:\n'
        '        print("It will ALSO include the log from the agent on THIS host — the "')]),
     ("K4", SR, "under",
      "chat stops saying whose records are in it, so the two clients answer the "
      "same question differently",
-     [('            lines.append("It covers everyone who has signed in on that host, not "\n'
-       '                         "only you — there’s no owner to ask on a machine like "\n'
-       '                         "that, so nothing checks.")\n', '')]),
+     [('            lines.append("It covers everyone who signed in through this agent "\n'
+       '                         "since that file last rotated, not only you — there’s no "\n'
+       '                         "owner to ask on a machine like that, so nothing checks.")\n', '')]),
     ("K5", SR, "under",
      "chat stops naming the fields",
-     [('            lines.append("What’s in it: a masked form of your email address, your "\n'
-       '                         "account id, and the ids of the computers and runs this "\n'
-       '                         "agent has touched.")\n', '')]),
+     [('            lines.append("Among what’s in it: a masked form of your email "\n'
+       '                         "address, the ids of the computers and runs this agent "\n'
+       '                         "has touched, file paths on that machine, and — when a "\n'
+       '                         "lookup fails — your account id.")\n', '')]),
     ("K6", SKILL, "under",
      "⛔ THE DOCUMENT STOPS TELLING THE MODEL THE NUMBERS CAN BE PASSED BACK, so "
      "the picker is reachable only by a person typing at a terminal — the gap "
@@ -417,6 +435,155 @@ MUTANTS = [
      "first is silently replaced by every run on the call that actually sends",
      [(' Pass the same `--runs` on `--confirm` — the two calls are separate\n'
        '  processes and the second remembers nothing.', '')]),
+
+    # ═══ X — WHAT CROSS-VERIFICATION FOUND AFTER 47/47 ══════════════════════
+    #
+    # ⛔⛔ EVERY MUTANT BELOW CORRESPONDS TO A DEFECT THAT WAS LIVE WHILE THIS
+    # HARNESS REPORTED A PERFECT SCORE. That is the point of the series: a green
+    # sweep says the guards catch the mutants somebody thought of, and these are
+    # the ones nobody did.
+    ("X1", CLI, "over",
+     "⛔⛔ BLOCKER, RESTORED. `--none` takes the whole selection branch again, so "
+     "`--none --runs 0` never runs the resolver: the agent-log token is dropped, "
+     "the plan prints the OPPOSITE of what was asked for, and a spec that would "
+     "have been refused is accepted in silence",
+     [('    names: list[str] = [r.get("name") for r in rows]\n'
+       '    if args.runs:', '    names: list[str] = [r.get("name") for r in rows]\n'
+       '    if args.none:\n        args.runs = None\n'
+       '    if args.runs:')]),
+    ("X2", CLI, "over",
+     "⛔⛔ BLOCKER, RESTORED. The agent's log rides a bundle that FAILED — the row "
+     "exists and names a device before it is patched, so the bridge's ordering "
+     "check passes and the file lands in a folder with no bundle in it",
+     [('        if landed:\n            _send_agent_log(code)',
+       '        if rc == 0 or not landed:\n            _send_agent_log(code)')]),
+    ("X3", CLI, "over",
+     "⛔ A TIMEOUT COUNTS AS AN ARRIVAL. `_await_bundle` exits 0 for both, which "
+     "is why it reports `landed` separately; keying on the exit code puts an "
+     "object under a code whose row nobody has confirmed",
+     [("        if landed:\n            _send_agent_log(code)",
+       "        if rc == 0:\n            _send_agent_log(code)")]),
+    ("X4", CLI, "under",
+     "⛔ THE TERMINAL'S SECOND STEP GOES AGAIN, so `--status <CODE> --agent-log` "
+     "parses, uploads nothing and says nothing — and both routes out of an "
+     "unfinished wait dead-end, as they did before",
+     [('            if agent_log:\n                _send_agent_log(code)\n'
+       '            return 0\n', '            return 0\n')]),
+    ("X5", CLI, "over",
+     "⛔⛔ THE LOGGER GOES BACK TO `__name__`, which under the fleet's own "
+     "`python -m facade.cli serve` is \"__main__\" — not a child of the logger the "
+     "file handler is on. The split warning reaches nothing, on the only "
+     "deployment that can produce a split",
+     [('log = logging.getLogger("facade.cli")', 'log = logging.getLogger(__name__)')]),
+    ("X6", CLI, "under",
+     "⛔ THE REFUSAL SENDS A NON-OWNER TO `--machine` AGAIN, which is refused four "
+     "lines higher — a sharer with no listed runs goes round in a circle",
+     [('            if owned:\n'
+       '                print("    Or, if the trouble is reaching that computer at all, "\n'
+       '                      "add --machine.")\n',
+       '            if True:\n'
+       '                print("    Or, if the trouble is reaching that computer at all, "\n'
+       '                      "add --machine.")\n')]),
+    ("X7", CLI, "over",
+     "⛔ `--no-wait` DESCRIBES A FILE IT THEN DECLINES TO SEND, and only says so "
+     "after the person has already agreed",
+     [("    if agent_log and args.no_wait:", "    if agent_log and False:")]),
+    ("X8", LOGSETUP, "under",
+     "⛔⛔ TWO WRITERS, ONE FILE. The console handler stays attached while the "
+     "fleet's redirect appends to the same path — after the first rotation the "
+     "redirect keeps writing to the renamed inode, so the file the uploader "
+     "sends is missing everything the console said",
+     [('            console_is_the_log_file = _same_file(console.stream, path)\n'
+       '            if console_is_the_log_file:\n'
+       '                logger.removeHandler(console)\n',
+       '            console_is_the_log_file = False\n'
+       '            if console_is_the_log_file:\n'
+       '                logger.removeHandler(console)\n')]),
+    ("X9", LOGSETUP, "over",
+     "⛔ THE CONSOLE IS DROPPED ON A GUESS, so a person watching a foreground "
+     "`serve` loses the only output they have",
+     [("            console_is_the_log_file = _same_file(console.stream, path)",
+       "            console_is_the_log_file = True")]),
+    ("X10", LOGSETUP, "over",
+     "the streams are compared by NAME, which answers \"no\" for the one case this "
+     "exists to catch — a redirect names the path, the process holds a descriptor",
+     [("        a = os.fstat(stream.fileno())\n        b = path.stat()",
+       "        a = getattr(stream, 'name', None)\n        b = str(path)")]),
+    ("X11", BRIDGE, "over",
+     "⛔⛔ THE JSON HELPER MINTS INSIDE THE `try` AGAIN: a dead refresh token "
+     "escapes as an exception through /device/pair and /device/remove, and a "
+     "failure reaching GOOGLE is reported as failing to reach the WEB APP",
+     [('    token, why = _mint_bearer(sess, force=False)\n'
+       '    if token is None:\n        return 0, why\n'
+       '    try:\n'
+       '        r = requests.post(\n'
+       '            f"{config.FE_BASE}{path}",\n'
+       '            json=payload,\n'
+       '            headers={"Authorization": f"Bearer {token}"},',
+       '    try:\n'
+       '        r = requests.post(\n'
+       '            f"{config.FE_BASE}{path}",\n'
+       '            json=payload,\n'
+       '            headers={"Authorization": f"Bearer {sess.id_token()}"},')]),
+    ("X12", SR, "under",
+     "⛔⛔ THE CONFIRM COMMAND GOES BACK TO CARRYING NOTHING, so the assistant "
+     "re-sends the NUMBERS against a list the second process re-fetches — and "
+     "position 2 can be a different run, or a different computer's run",
+     [('        return _emit({**body, "wouldSend": names, "includeMachine": machine},\n'
+       '                     args.json, [*lines, *_agent_directive_block(directives)])',
+       '        return _emit({**body, "wouldSend": names, "includeMachine": machine},\n'
+       '                     args.json, lines)')]),
+    ("X13", SR, "over",
+     "⛔ THE CONFIRM CARRIES THE NUMBERS INSTEAD OF THE NAMES — the same defect "
+     "wearing a directive",
+     [('            confirm.append("--runs " + ",".join(names))',
+       '            confirm.append("--runs " + str(getattr(args, "runs", "")))')]),
+    ("X14", SR, "under",
+     "spoken connectives are read as run names again, so \"1 and 3\" is refused "
+     "for a run called “and”",
+     [('        if token.lower() in _SPOKEN_FILLER and token not in known:\n'
+       '            continue\n', '')]),
+    ("X15", SR, "over",
+     "⛔ A CONNECTIVE THAT IS A REAL RUN NAME IS SWALLOWED. A machine may mint a "
+     "run called \"and\"; dropping the word unconditionally loses it",
+     [("        if token.lower() in _SPOKEN_FILLER and token not in known:",
+       "        if token.lower() in _SPOKEN_FILLER:")]),
+    ("X16", SR, "under",
+     "\"the runs are numbered 1 to 0\" comes back when that computer listed nothing",
+     [('                if not rows:\n'
+       '                    return None, False, ["That computer hasn’t listed any runs, "\n'
+       '                                         "so there are no numbers to pick — 0, "\n'
+       '                                         "the agent’s own log, still needs a "\n'
+       '                                         "bundle to ride."]\n', '')]),
+    ("X17", SR, "under",
+     "⛔ `--runs 0` IS DROPPED IN SILENCE ON THE ONE CALL THAT UPLOADS, so an "
+     "assistant carrying the person's own words forward gets nothing",
+     [("            if getattr(args, \"agent_log\", False) or _st_wants_log:",
+       "            if getattr(args, \"agent_log\", False):")]),
+    ("X18", SR, "under",
+     "⛔ THE `--runs` FLAG LEAVES THE CHAT PARSER, so the picker exits 2 on the "
+     "one client that reaches it through natural language",
+     [('    sl.add_argument("--runs", default="",\n'
+       '                    help="which runs, by the numbers shown or by name, "\n'
+       '                         "comma-separated; 0 is the agent\'s own log on this host "\n'
+       '                         "and all is every run listed (default: every run listed)")\n',
+       '')]),
+    ("X19", SR, "over",
+     "chat's resolver takes `isdigit` again, so a superscript reaches `int()` and "
+     "leaves a traceback where a sentence belongs",
+     [('        body_ = token[1:] if token[:1] in "+-" else token\n'
+       '        if body_.isdecimal() and body_.isascii():',
+       '        body_ = token\n'
+       '        if body_.isdigit():')]),
+    ("X20", SKILL, "under",
+     "⛔ THE ROUTING ROW THAT MAKES `--runs` REACHABLE FROM CHAT GOES. The table "
+     "is what the assistant reads to decide what to run; the section further down "
+     "is not an offer",
+     [('| "just the one about X", "only the first two", "not all of them" | the plan '
+       'numbers every run — pass those numbers back with `--runs`, comma-separated: '
+       '`sr.py send-logs --runs 1,3` (and again on `--confirm`). `--runs 0` is the '
+       "agent's own log, `--runs all` is every run listed. A name works too. Do "
+       "**not** guess a number the plan did not print |\n", "")]),
 ]
 
 

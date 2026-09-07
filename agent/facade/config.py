@@ -224,16 +224,19 @@ def home_split() -> "str | None":
     HERMES_HOME to /home/u-%i/.hermes and no HOME at all, where they differ by a
     whole segment. That layout carries no agent today. Nothing says it never will.
 
-    ⛔⛔ AND WHAT BREAKS IS SILENT IN THE WORST DIRECTION. The fleet's own client
-    starts the bridge with its child stdout/stderr redirected to
-    $HERMES_HOME/.super-agent/bridge.log, while the bridge's rotating handler
-    writes $HOME/.super-agent/bridge.log and the uploader reads $HOME's copy —
-    three computations of one path, in two repositories, joined to two different
-    roots. Split them and `send-logs --agent-log` answers 200 with sent=False and
-    "the agent's log on this host was empty", naming a file that is genuinely
-    empty while the real one fills up somewhere else. A person is told there was
-    nothing to send, on the one command they reached for because something else
-    already went wrong.
+    ⛔⛔ AND WHAT BREAKS IS SILENT — THOUGH NOT IN THE WAY THIS NOTE FIRST SAID.
+    An earlier version of it claimed a split would make the upload answer "the
+    agent's log on this host was empty". It would not: the handler and the
+    uploader BOTH call this module's `log_path()`, in the same process, so they
+    move together and always agree. Cross-verification caught that, and the real
+    failure is the other half of the pair. The fleet's own client starts the
+    bridge with the child's stdout/stderr redirected to
+    $HERMES_HOME/.super-agent/bridge.log — a path built in the OTHER repository,
+    from the OTHER variable. Split the two and that redirect collects a second
+    copy of everything the bridge writes to its console, in a file nothing ever
+    uploads, while `--agent-log` sends the handler's file and reports success. A
+    crash that only ever reaches stderr — anything that kills the process before
+    a handler runs — lands solely in the file support will never see.
 
     ⭐ SO IT REPORTS, IT DOES NOT RECONCILE. Choosing a root here would move the
     log out from under the fleet's redirect, or out from under `store_dir()` which

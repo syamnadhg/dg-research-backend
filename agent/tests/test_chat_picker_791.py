@@ -143,7 +143,7 @@ def test_runs_zero_turns_the_agent_log_on_in_chat(wire, capsys):
     sr.cmd_send_logs(_args(runs="0,1"))
     out = capsys.readouterr().out
     assert "0 • the log from the agent" in out
-    assert "everyone who has signed in on that host" in out
+    assert "signed in through this agent since that file last rotated" in out
 
 
 def test_a_refusal_stops_the_plan(wire, capsys):
@@ -182,18 +182,26 @@ def test_none_still_wins_in_chat(wire, capsys):
     ("send the computer's own logs to support", "machine"),
     ("send the agent's log too to support", "agent_log"),
 ])
-def test_a_natural_language_ask_reaches_the_command_with_its_flag(message, flag):
+def test_a_natural_language_ask_reaches_the_command_with_its_flag(monkeypatch, message, flag):
     """⛔⛔ THE LIVE ONE. Before this, both of these ended in "I didn't catch a
     Super Research request in that" — argparse exited 2 on a flag pushed behind
     `--`, and the handler turned that into the clarify line."""
-    argv, lines = sr._nl_resolve(message)
-    assert argv is not None, lines
-    cmd, rest = argv[0], argv[1:]
-    flags = [a for a in rest if a in sr._DO_FLAGS]
-    pos = [a for a in rest if a not in sr._DO_FLAGS]
-    final = [cmd] + flags + (["--"] + pos if pos else [])
-    ns = sr.build_parser().parse_args(final)
-    assert getattr(ns, flag) is True, final
+    # ⛔⛔ THROUGH `cmd_do`, NOT AROUND IT. The first version of this test
+    # re-implemented cmd_do's argv assembly and then asserted on its own copy —
+    # so it pinned the reasoning rather than the caller, and a change to cmd_do
+    # itself would have left it green. Run the real dispatcher and look at the
+    # namespace it actually handed to the command.
+    seen = {}
+
+    def _capture(ns):
+        seen["ns"] = ns
+        return 0
+
+    monkeypatch.setattr(sr, "cmd_send_logs", _capture)
+    rc = sr.main(["do", message])
+    assert "ns" in seen, (
+        f"cmd_do never reached send-logs for {message!r} — rc={rc}")
+    assert getattr(seen["ns"], flag) is True, vars(seen["ns"])
 
 
 def test_every_flag_the_router_can_emit_is_in_the_allowlist():
@@ -224,6 +232,26 @@ def test_no_flag_in_the_allowlist_takes_a_value():
     assert seen, "no subcommand declares any of the routed flags"
     for opt, nargs in seen.items():
         assert nargs == 0, f"{opt} takes a value and cannot be routed from chat"
+
+
+def test_the_runs_flag_is_actually_registered_on_the_chat_parser():
+    """⛔ NOTHING IN THE SUITE WENT THROUGH THE PARSER. Every chat test built a
+    namespace by hand, so `sl.add_argument("--runs", …)` could be deleted and the
+    whole picker would still pass — while the real client exited 2 on the flag."""
+    ns = sr.build_parser().parse_args(["send-logs", "--runs", "1,3"])
+    assert ns.runs == "1,3"
+    assert sr.build_parser().parse_args(["send-logs"]).runs == ""
+
+
+def test_the_skill_routes_a_subset_ask_to_the_flag():
+    """⛔ THE ROUTING TABLE IS WHAT THE ASSISTANT READS. A picker the table never
+    mentions is reachable only by somebody typing at a terminal."""
+    text = _SKILL.read_text(encoding="utf-8")
+    row = next((ln for ln in text.splitlines()
+                if ln.startswith("|") and "--runs" in ln), "")
+    assert row, "the routing table has no --runs row"
+    assert "only the first two" in row or "not all of them" in row, row
+    assert "--confirm" in row, "the row does not say to pass it on the send too"
 
 
 def test_the_allowlist_still_holds_the_two_it_always_had():
