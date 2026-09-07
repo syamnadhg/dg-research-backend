@@ -313,13 +313,15 @@ MUTANTS = [
      [('    if not _decide(None, bool(args.yes), "Send these logs?", default=False):\n'
        '        print("Nothing was sent.")\n'
        '        return 1\n', "")]),
+    # ⛔ RE-ANCHORED 2026-09-06 (wave 7.9-1). A comment block was inserted between
+    # the range test and its `print`, explaining which spellings of zero still
+    # reach it now that the bare token is the agent's log. Same two statements,
+    # same mutation, same subject — only the text between them moved.
     ("T4", CLI, "under",
      "a run the person named that the machine is not holding is DROPPED rather "
      "than refused — fewer runs go than were asked for, reported as success",
-     [('            if not 1 <= index <= len(rows):\n'
-       '                print(f"{_NO} There is no run {index} in that list.")\n'
+     [('                print(f"{_NO} There is no run {index} in that list.")\n'
        '                return None\n',
-       '            if not 1 <= index <= len(rows):\n'
        '                continue\n')]),
     ("T5", CLI, "over",
      "a name the machine is not holding is passed through to the wire instead "

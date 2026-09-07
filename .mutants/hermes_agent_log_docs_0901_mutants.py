@@ -113,27 +113,30 @@ _INFLIGHT = Path(__file__).with_suffix(".inflight")
 
 BE_BULLET = (
     "- **The agent's own log on THIS host** is a third thing and a third computer —\n"
-    "  the program running this chat, not their Research Computer. `--agent-log`\n"
-    "  asks for it on the bare command, so the plan names it. Unlike `--machine`\n"
-    "  there is **no ownership gate**, so no refusal will stop you: offer it only\n"
-    "  when the problem is this chat reaching their computer at all. It covers that\n"
-    "  file since it last rotated, not just this conversation, so it can reach back\n"
-    "  further than the problem being reported. **It does not ride the send** — but\n"
-    "  **pass it on `--confirm` too**: nothing is uploaded on that call either, and it\n"
-    "  is what makes the client tell the user a step is still outstanding and hand you\n"
-    "  the exact follow-up command. Leave it off and you get neither, and the second\n"
-    "  step survives only in your memory. Run that follow-up when the user asks you to\n"
-    "  check, never on a timer. Refused before then is by design, not a fault; a\n"
-    "  failure there leaves the bundle and the support code untouched; \"nothing to\n"
-    "  add\" means the log was empty.\n"
+    '  the program running this chat, not their Research Computer. `--agent-log`\n'
+    '  asks for it on the bare command, so the plan names it, and `--runs 0` is the\n'
+    '  same request by the number the plan prints. Unlike `--machine`\n'
+    '  there is **no ownership gate**, so no refusal will stop you: offer it only\n'
+    '  when the problem is this chat reaching their computer at all. It covers that\n'
+    '  file since it last rotated, not just this conversation, so it can reach back\n'
+    '  further than the problem being reported. ⛔ And say what it holds before they\n'
+    '  agree: it covers **everyone who has signed in on that host**, not only them,\n'
+    '  and it carries a masked form of their email address, their account id and the\n'
+    "  ids of the computers and runs this agent has touched. The client's plan prints\n"
+    '  all of that — relay it, do not summarise it away. ⛔ And it cannot go on its\n'
+    '  own: it is uploaded beside a bundle, so there has to be a bundle — `--runs 0`\n'
+    '  alone is refused with that sentence. **It does not ride the send** — but\n'
+    '  **pass it on `--confirm` too**: nothing is uploaded on that call either, and it\n'
+    '  is what makes the client tell the user a step is still outstanding and hand you\n'
+    '  the exact follow-up command. Leave it off and you get neither, and the second\n'
+    '  step survives only in your memory. Run that follow-up when the user asks you to\n'
+    '  check, never on a timer. Refused before then is by design, not a fault; a\n'
+    '  failure there leaves the bundle and the support code untouched; "nothing to\n'
+    '  add" means the log was empty.\n'
 )
 
 BE_ROW = (
-    "| \"send the agent's log too\", \"include the bridge log\", \"the log from this "
-    "chat\" | add `--agent-log` to the **bare** command **and to `--confirm`** — it "
-    "uploads nothing on either; it makes the plan name it, and makes the client hand "
-    "you `sr.py send-logs --status <CODE> --agent-log` for once the bundle lands. "
-    "**Not** owner-gated. See **Sending logs to support** |\n"
+    '| "send the agent\'s log too", "include the bridge log", "the log from this chat" | add `--agent-log` to the **bare** command **and to `--confirm`** — or say `--runs 0`, which is the same thing and is the number the plan prints for it. It uploads nothing on either; it makes the plan name it, and makes the client hand you `sr.py send-logs --status <CODE> --agent-log` for once the bundle lands. **Not** owner-gated. See **Sending logs to support** |\n'
 )
 
 FORK_OFFER_BLOCK = (
@@ -244,11 +247,12 @@ MUTANTS = [
      "⛔⛔ THE ROW DROPS `--confirm` FROM THE FLOW and still promises the client "
      "hands over the follow-up. Measured: a plain `--confirm` prints neither the "
      "person's line nor the directive, so the row's own claim becomes false",
-     [("add `--agent-log` to the **bare** command **and to `--confirm`** — it "
-       "uploads nothing on either; it makes the plan name it, and makes the client "
-       "hand you",
-       "add `--agent-log` to the **bare** command so the plan names it. The client "
-       "hands you")]),
+     # ⛔ RE-ANCHORED 2026-09-06 (wave 7.9-1). The row gained a clause naming
+     # `--runs 0` as the same request; the sentence this mutant rewrites is
+     # otherwise unchanged, and the mutation and its subject are identical.
+     [("It uploads nothing on either; it makes the plan name it, and makes the "
+       "client hand you",
+       "The client hands you")]),
     ("B4", BE_SKILL, "under",
      "the absence of an ownership gate stops being stated, one bullet below the "
      "owner-only rule it must not be confused with",

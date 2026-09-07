@@ -1445,22 +1445,72 @@ def _fe_api_post_bytes(sess: "AccountSession", path: str, blob: bytes,
     — `/api/agent/login/approve` mints `createCustomToken(user.uid)` with no
     developer claims, deliberately, so that an agent can only ever be connected to
     its own account. Measured before building.
+
+    ⛔⛔ AND IT RETRIES ONCE ON A 401 WITH A FORCED TOKEN, which the Firestore
+    client has always done and this did not. Freshness here is decided by the LOCAL
+    clock alone — `id_token()` refreshes only inside a five-minute margin — so a
+    server that disagrees, a signing key rotated under us, or simply a token that
+    dies inside this call's SIXTY-SECOND window all produce a 401 against a token
+    the caller believes is good. Of the two FE helpers this is the one with the
+    long timeout and the large body, which makes it the likeliest to expire
+    mid-flight and made it the only one with no second chance. The blob is bytes
+    already in memory, so the retry re-sends it without re-reading the log.
+
+    ⛔ EXACTLY ONCE, AND ONLY ON 401. A loop would hammer the app with a token it
+    has already refused; any other status is the caller's to interpret.
+
+    ⛔⛔ AND IT STILL NEVER RAISES, WHICH THE RETRY NEARLY BROKE. Minting a token
+    can fail two ways — `RevokedError` when the refresh token itself is dead, and a
+    transport error reaching Google — and the one caller, `_log_agent_log`, makes
+    this call OUTSIDE its `except RevokedError`. An unguarded refresh here would
+    leave the route with no reply at all: `do_POST` has no blanket handler, so the
+    exception unwinds into `http.server`, which closes the connection, and the
+    person waiting on the upload gets a dropped socket instead of the sentence this
+    file wrote for them. Both mints are wrapped, and the first one too — it could
+    already raise before any retry existed.
     """
-    try:
-        r = requests.post(
-            f"{config.FE_BASE}{path}",
-            data=blob,
-            headers={"Authorization": f"Bearer {sess.id_token()}",
-                     "Content-Type": content_type, **headers},
-            timeout=60,
-        )
+    def _bearer(force: bool) -> "tuple[str | None, dict]":
+        """A token, or the reason there isn't one. Never raises."""
+        try:
+            return sess.id_token(force=force), {}
+        except RevokedError:
+            return None, {"reason": "revoked",
+                          "error": "this agent's session was rejected — "
+                                   "run login again"}
+        except Exception as e:  # noqa: BLE001 - a mint failure must not escape
+            return None, {"error": f"could not refresh this agent's sign-in "
+                                   f"({type(e).__name__})"}
+
+    def _send(token: str) -> "tuple[int, dict] | None":
+        """(status, body), or None if the request itself could not be made."""
+        try:
+            r = requests.post(
+                f"{config.FE_BASE}{path}",
+                data=blob,
+                headers={"Authorization": f"Bearer {token}",
+                         "Content-Type": content_type, **headers},
+                timeout=60,
+            )
+        except requests.RequestException as e:
+            return 0, {"error": f"could not reach {config.FE_BASE} ({type(e).__name__})"}
         try:
             body = r.json() if r.content else {}
         except ValueError:
             body = {}
         return r.status_code, body if isinstance(body, dict) else {}
-    except requests.RequestException as e:
-        return 0, {"error": f"could not reach {config.FE_BASE} ({type(e).__name__})"}
+
+    token, why = _bearer(force=False)
+    if token is None:
+        return 0, why
+    status, body = _send(token)
+    if status != 401:
+        return status, body
+    # ⛔ FORCED, not cached. Re-sending the token the app just refused would
+    # produce the same 401 and call it a retry.
+    token, why = _bearer(force=True)
+    if token is None:
+        return 0, why
+    return _send(token)
 
 
 def _read_agent_log_tail(cap: int = _AGENT_LOG_MAX_BYTES) -> bytes:
@@ -3607,6 +3657,15 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 sess, "/api/logs/agent-log", blob, "text/plain; charset=utf-8",
                 {"x-support-code": code, "x-device-id": device_id},
             )
+            if reply.get("reason") == "revoked":
+                # ⛔ THE SAME SENTENCE THE REST OF THIS FILE GIVES, and reached
+                # the same way. A dead refresh token used to surface here as the
+                # generic "could not be sent", which names no cause and offers no
+                # action — on a route whose retry has just proved the session is
+                # the problem. `get_log_bundle` above answers 401 for exactly this
+                # and it is the only reason a person can act on.
+                self._json(401, {"error": "session revoked — run /login again"})
+                return
             if status != 200:
                 log.warning("agent-log upload for %s failed: HTTP %s %s",
                             code, status, reply.get("error", ""))

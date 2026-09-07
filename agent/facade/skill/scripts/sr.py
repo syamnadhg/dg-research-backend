@@ -1466,6 +1466,62 @@ def _log_run_label(row: dict) -> str:
     return f"a run from {started[:10]}" if started else "an unnamed run"
 
 
+# ⭐ THE SAME TWO TOKENS THE TERMINAL TAKES, and they are duplicated here for the
+# same reason every other send-logs sentence in this file is: this script must be
+# stdlib-only and cannot import the facade package, so it carries its own copy.
+# `test_send_logs_cli_0825.py` reads both files and fails if either grows a case
+# the other lacks — the duplication is policed rather than removed.
+_AGENT_LOG_TOKEN = "0"
+_ALL_TOKEN = "all"
+
+
+def _resolve_log_selection(rows: list, spec) -> tuple:
+    """Turn a `--runs` spec into (run names, whether the agent's own log was
+    asked for, lines explaining a refusal). A non-empty third element IS the
+    refusal — names is None then, so a caller that forgets to check cannot go on
+    and send an empty selection as though it were a chosen one.
+
+    ⛔⛔ CHAT COULD NOT EXPRESS A SUBSET AT ALL BEFORE THIS. The client picked
+    every run the machine listed and offered exactly one way to change that —
+    `--none`, which picks nothing. So a person in a chat asking to send the logs
+    for one research had two answers available: all of them, or none, and the
+    assistant relaying for them had no third. The wire has always accepted an
+    arbitrary list; only the client could not name one.
+
+    ⛔ REFUSES ON ANYTHING IT CANNOT PLACE, exactly as the terminal does. A
+    dropped token is a run somebody asked for, not sent, reported as success."""
+    known = {r.get("name") for r in rows}
+    picked = []
+    wants_agent_log = False
+    for token in str(spec or "").replace(" ", ",").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if token == _AGENT_LOG_TOKEN:
+            wants_agent_log = True
+            continue
+        if token.lower() == _ALL_TOKEN:
+            for row in rows:
+                if row.get("name") not in picked:
+                    picked.append(row.get("name"))
+            continue
+        if token.lstrip("+-").isdigit():
+            index = int(token)
+            if not 1 <= index <= len(rows):
+                return None, False, [f"There’s no {index} in that list — the runs "
+                                     f"are numbered 1 to {len(rows)}, and 0 is the "
+                                     "agent’s own log."]
+            name = rows[index - 1].get("name")
+        elif token in known:
+            name = token
+        else:
+            return None, False, [f"That computer isn’t holding a run called "
+                                 f"“{token}”."]
+        if name not in picked:
+            picked.append(name)
+    return picked, wants_agent_log, []
+
+
 def cmd_send_logs(args) -> int:
     """Ask the research computer to package its logs for support.
 
@@ -1543,9 +1599,34 @@ def cmd_send_logs(args) -> int:
             "yours it’s holding."], 1)
 
     names = [r.get("name") for r in rows]
+    if getattr(args, "runs", ""):
+        chosen, picked_agent_log, refusal = _resolve_log_selection(rows, args.runs)
+        if refusal:
+            return _emit(body, args.json, refusal, 1)
+        names = chosen
+        # ⛔ EITHER ROUTE, NEVER ONE OVERRIDING THE OTHER — the same rule the
+        # terminal follows. `--agent-log` and `--runs 0` say the same thing, and a
+        # person who says both must not be answered "no" by whichever the code
+        # happened to read second.
+        agent_log = agent_log or picked_agent_log
     if getattr(args, "none", False):
+        # ⛔ STILL LAST, so it still wins. It is the documented pairing for
+        # `--machine` and it means what it has always meant: no runs. It does NOT
+        # clear the agent's log, which is not a run and not on that computer.
         names = []
     if not names and not machine:
+        # ⛔⛔ THE AGENT'S LOG CANNOT STAND ALONE. It is uploaded into the folder
+        # the machine's bundle row names — the app's Clear-logs finds objects by
+        # listing that folder and nothing else — so with no bundle there is
+        # nowhere it could go that a person could later delete. Without this the
+        # two sentences below would tell somebody who picked only 0 that there is
+        # nothing to send, about the one thing they did pick.
+        if agent_log:
+            return _emit(body, args.json, [
+                "The agent’s own log can only go up beside a bundle from that "
+                "computer, so something has to be in that bundle. Pick a run as "
+                "well — or, if you own it and the trouble is reaching it at all, "
+                "ask for the computer’s own logs too."], 1)
         if not body.get("published"):
             # ⛔⛔ NOT "it isn't holding any of your runs". The list is absent,
             # which means we cannot see it — a computer that hasn't published
@@ -1566,12 +1647,27 @@ def cmd_send_logs(args) -> int:
 
     if not getattr(args, "confirm", False):
         lines = [f"I can send Super Research support the logs from “{name}”:"]
-        for row in rows:
-            if row.get("name") in names:
-                lines.append(f"  • {_log_run_label(row)} — "
-                             f"{_size_words(row.get('sizeBytes'))}")
+        # ⛔⛔ EVERY ROW, NUMBERED, AND MARKED GOING OR NOT — not only the ones
+        # going. Before this the plan listed the selection and nothing else, which
+        # was honest while the selection was always everything; the moment a
+        # subset became expressible, a list of only what is going stopped being a
+        # list somebody could pick FROM. The numbers are the whole point: they are
+        # what a person says back, and a run that is not on screen cannot be asked
+        # for. What is going is still unambiguous — the marker carries it, and the
+        # count below repeats it in words.
+        for i, row in enumerate(rows, 1):
+            going = row.get("name") in names
+            lines.append(f"  {i} {'•' if going else '·'} {_log_run_label(row)} — "
+                         f"{_size_words(row.get('sizeBytes'))}"
+                         f"{'' if going else '   (not picked)'}")
         if body.get("truncated"):
             lines.append("  (only the most recent are listed — it’s holding more)")
+        # ⛔ THE 0 ROW PRINTS EITHER WAY, so the choice exists for somebody who
+        # does not already know it does. `--agent-log` shipped in 2026-08-26 and
+        # has been reachable only by naming it.
+        lines.append(f"  0 {'•' if agent_log else '·'} the log from the agent on "
+                     "THIS host — a different computer, not that one"
+                     f"{'' if agent_log else '   (not picked)'}")
         if machine:
             lines.append("Plus that computer’s own logs: its pairing and sign-in "
                          "records and its raw activity trail, which cover every "
@@ -1586,6 +1682,19 @@ def cmd_send_logs(args) -> int:
         if agent_log:
             lines.append("Plus the log from the agent on the host running this — a "
                          "connection and sign-in record, not research content.")
+            # ⛔⛔ WHOSE, NOT ONLY WHAT — the twin of the terminal's line, and the
+            # machine-log sentence three lines above already names the people its
+            # material covers while this one named nobody. A second person who
+            # signed in on this host is in that file, and nothing gates the upload
+            # on who owns the host, because an agent host has no owner to ask.
+            lines.append("It covers everyone who has signed in on that host, not "
+                         "only you — there’s no owner to ask on a machine like "
+                         "that, so nothing checks.")
+            # ⛔⛔ NAMED, because "not research content" is what it is NOT.
+            # Measured in the file the uploader reads.
+            lines.append("What’s in it: a masked form of your email address, your "
+                         "account id, and the ids of the computers and runs this "
+                         "agent has touched.")
         else:
             lines.append("The agent’s own log is not included.")
         # ⛔⛔ The three facts the app's modal names and this plan did not — see
@@ -1609,7 +1718,11 @@ def cmd_send_logs(args) -> int:
         lines.append("It’s deleted automatically 30 days after it arrives.")
         lines.append(f"That’s {len(names)} run(s), about {_size_words(total)}. "
                      "Only Super Research support can read them.")
-        lines.append("Say yes and I’ll send them.")
+        # ⛔ THE NUMBERS ARE USELESS WITHOUT THIS LINE. The rows carry indices now,
+        # and nothing else in the conversation tells a person — or the assistant
+        # relaying for them — that saying a number is a thing they may do.
+        lines.append("Say yes and I’ll send them — or say which numbers to send "
+                     "instead (0 is the agent’s own log).")
         return _emit({**body, "wouldSend": names, "includeMachine": machine},
                      args.json, lines)
 
@@ -2451,7 +2564,26 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
 
 # The only option flags _nl_resolve ever emits — everything else in a resolved
 # argv is a positional. cmd_do uses this to place the `--` separator.
-_DO_FLAGS = frozenset({"--no-video", "--no-email"})
+#
+# ⛔⛔ IT WAS SHORT BY TWO, AND THAT KILLED THE WHOLE REQUEST RATHER THAN THE
+# FLAG. `_nl_resolve` has emitted `--machine` and `--agent-log` since the
+# send-logs routing row was written; neither was listed here, so `cmd_do`
+# classified them as free text and passed them AFTER `--`. `send-logs` has no
+# positional, so argparse exited 2, the SystemExit handler below caught it, and
+# the person asking "send the computer's own logs to support" was answered with
+# "I didn't catch a Super Research request in that." Not a dropped flag — a
+# dropped request, on the one route a person reaches when something is already
+# wrong. Reproduced against this parser before the fix.
+#
+# ⛔ EVERY FLAG HERE MUST BE A STORE_TRUE FLAG. A value-taking flag would put its
+# VALUE in the positional list and behind `--`, which is the same failure one
+# argument along — so `--runs` is deliberately NOT routed from natural language,
+# and a guard reads this file to keep the two facts in step.
+#
+# ⛔ AND THE GUARD READS `_nl_resolve`'S SOURCE rather than this line, because a
+# hand-kept list is exactly what fell behind. Any `"--…"` literal that function
+# can append must appear here.
+_DO_FLAGS = frozenset({"--no-video", "--no-email", "--machine", "--agent-log"})
 
 
 def cmd_do(args) -> int:
@@ -2563,6 +2695,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="also send that computer's own logs (its owner only)")
     sl.add_argument("--agent-log", dest="agent_log", action="store_true",
                     help="also send the log from the agent on this host")
+    sl.add_argument("--runs", default="",
+                    help="which runs, by the numbers shown or by name, "
+                         "comma-separated; 0 is the agent's own log on this host "
+                         "and all is every run listed (default: every run listed)")
     sl.add_argument("--none", action="store_true",
                     help="send no runs — for connection problems, with --machine")
     sl.add_argument("--device", default="", help="which computer (name or id)")

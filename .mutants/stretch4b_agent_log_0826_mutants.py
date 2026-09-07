@@ -143,10 +143,18 @@ MUTANTS = [
      "only through a banner that prints to /dev/null on the pinned install.\n"
      "     ⚠ RE-POINTED 2026-08-27: stretch 4.5 put the refused-port row between this call and the bridge check, so the anchor stopped matching",
      [("    _doctor_log_row()\n", "")]),
+    # ⛔ RE-ANCHORED 2026-09-06 (wave 7.9-1). The line this named ended "— this
+    # file stays on this host", which was true when this mutant was written and
+    # false from the day `--agent-log` shipped, three weeks earlier in the same
+    # file's own subject. The sentence was split in two and the false half retired;
+    # the mutant's SUBJECT is unchanged — deleting the not-in-the-bundle claim —
+    # and it now removes both halves of the split, because leaving one behind
+    # would be a different mutant that no longer tests what this describes.
     ("DR2", CLI, "under",
      "the line saying the log is NOT in a support bundle goes, so somebody who "
      "sent a bundle assumes this went with it and waits on evidence nobody has",
-     [('    b.dim("              not sent with a support bundle — this file stays on this host")\n', "")]),
+     [('    b.dim("              not sent with a support bundle — that archive is built on the")\n'
+       '    b.dim("              research computer and cannot reach this file")\n', "")]),
     ("DR3", CLI, "over",
      "⛔⛔ THE ROW MOVES BELOW THE BRIDGE CHECK, where `cmd_doctor` returns early — "
      "so the person whose bridge will not start, who needs this file more than "

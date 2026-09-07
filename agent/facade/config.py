@@ -204,6 +204,64 @@ def log_path() -> Path:
     return store_dir() / "bridge.log"
 
 
+# ── the fleet's two homes ──
+# The environment variable the fleet gives its gateway its own home directory in.
+HERMES_HOME_ENV: str = "HERMES_HOME"
+
+
+def home_split() -> "str | None":
+    """The fleet's home when it is NOT the home this agent writes its log under,
+    else None.
+
+    ⛔⛔ WHY THIS IS A GUARD AND NOT A FIX. On the fleet the two are the same
+    directory today — `provision-user-helper.sh` sets HERMES_HOME=/sandbox/.hermes
+    and, nine lines later and for an unrelated reason (dg-cli's token surviving a
+    nightly recreate), HOME to the same literal. Nothing ties them. The comment
+    beside the HOME line even records the reasoning that they are independent:
+    "Hermes itself keys off HERMES_HOME, not HOME, so this is inert for the
+    gateway". So the equality this agent depends on is a coincidence of two
+    unrelated decisions, and the fleet's OTHER profile — the systemd unit — sets
+    HERMES_HOME to /home/u-%i/.hermes and no HOME at all, where they differ by a
+    whole segment. That layout carries no agent today. Nothing says it never will.
+
+    ⛔⛔ AND WHAT BREAKS IS SILENT IN THE WORST DIRECTION. The fleet's own client
+    starts the bridge with its child stdout/stderr redirected to
+    $HERMES_HOME/.super-agent/bridge.log, while the bridge's rotating handler
+    writes $HOME/.super-agent/bridge.log and the uploader reads $HOME's copy —
+    three computations of one path, in two repositories, joined to two different
+    roots. Split them and `send-logs --agent-log` answers 200 with sent=False and
+    "the agent's log on this host was empty", naming a file that is genuinely
+    empty while the real one fills up somewhere else. A person is told there was
+    nothing to send, on the one command they reached for because something else
+    already went wrong.
+
+    ⭐ SO IT REPORTS, IT DOES NOT RECONCILE. Choosing a root here would move the
+    log out from under the fleet's redirect, or out from under `store_dir()` which
+    every other piece of local state also derives from — a bigger change than the
+    problem, made blind, on a machine nobody is watching. Saying which two
+    directories disagree is what a person needs and all this can honestly do.
+
+    Returns the raw HERMES_HOME value (what the operator set), never the
+    resolved one — the value they can go and look at is the one worth printing.
+    """
+    raw = (os.environ.get(HERMES_HOME_ENV) or "").strip()
+    if not raw:
+        return None
+    try:
+        # ⛔ RESOLVED ON BOTH SIDES, so a symlink, a trailing slash or a "." does
+        # not read as a split. The fleet's roots are bind mounts and its HOME is
+        # written by a shell; comparing the strings would cry wolf on a layout
+        # that is in fact identical, and a guard that fires when nothing is wrong
+        # is one people learn to scroll past.
+        theirs = Path(raw).expanduser().resolve()
+        ours = Path.home().resolve()
+    except (OSError, RuntimeError):
+        # An unreadable or cycle-linked path cannot be compared. Do not guess a
+        # split — an alarm nobody can act on is worse than the silence it breaks.
+        return None
+    return None if theirs == ours else raw
+
+
 def web_config() -> dict[str, str]:
     """The Firebase client config injected into the local sign-in page."""
     return {

@@ -113,6 +113,20 @@ def cmd_serve(args: argparse.Namespace) -> int:
         verbose=(getattr(args, "verbose", False) or config.VERBOSE
                  or prefs.get_verbose()),
         to_file=True)
+    # ⛔⛔ RECORDED INTO THE FILE THAT GETS SENT, and immediately after the handler
+    # that opens it — not printed. A split home is exactly the condition under which
+    # somebody is later told their agent log was "empty", and the person who reads
+    # that sentence is support, holding whichever file the handler wrote. A banner
+    # line would not reach them: the pinned launchers give the bridge no
+    # StandardOutPath, no StandardOutput and no console at all, so on the
+    # recommended install every print here goes to /dev/null. The one channel that
+    # survives to the place the question gets asked is the log itself.
+    _split = config.home_split()
+    if _split:
+        log.warning(
+            "the chat host's home is %s but this log is written under %s — "
+            "--agent-log sends THIS file, and anything written under the other "
+            "home will not reach support", _split, Path.home())
     # Foreground serve — nudge toward the always-up background mode unless it's
     # already pinned. (When autostart launches serve windowless this is a no-op:
     # the task exists, so is_installed() is True and the tip is skipped.)
@@ -1207,6 +1221,20 @@ def _doctor_log_row() -> None:
     be: the collector refuses anything outside the research computer's own log root,
     and that refusal is what the consent screen's promise is gated on. Sending it is
     a separate, opt-in step.
+
+    ⛔⛔ AND THAT IS WHERE THIS LINE USED TO STOP BEING TRUE. It went on to say the
+    file "stays on this host", which was true when it was written and stopped being
+    true the day `--agent-log` shipped: that flag reads THIS EXACT PATH — one
+    function, one file, no inference — and posts its tail to the app, where it lands
+    beside the bundle under the same support code. So the sentence told somebody the
+    opposite of what the product does, on the one screen they open because something
+    has already gone wrong, and the reasoning above is exactly how it survived: the
+    zip half is true, and the true half made the false half sound checked.
+
+    ⛔ THE ZIP AND THE SEND ARE DIFFERENT CLAIMS, and only saying both keeps either
+    honest. "Not in the bundle" is about what the research computer packages. "Only
+    if you ask" is about this host. A reader given one of them fills in the other,
+    and both directions of that guess are wrong.
     """
     path = config.log_path()
     try:
@@ -1220,7 +1248,25 @@ def _doctor_log_row() -> None:
     else:
         detail = f"{path}  ({size // 1024} KB)"
     _doctor_row("log", size is not None, detail, warn_only=size is None)
-    b.dim("              not sent with a support bundle — this file stays on this host")
+    b.dim("              not sent with a support bundle — that archive is built on the")
+    b.dim("              research computer and cannot reach this file")
+    # ⛔ NAMED AS THE FLAG, NOT AS THE COMMAND. A sibling guard bans the word
+    # "send-logs" from this block, because the reverse rule — no send-logs refusal
+    # may point at `doctor` — was written against a sentence that pointed the wrong
+    # way. The flag is the actionable half and it collides with nothing.
+    b.dim("              it goes only when you ask for it, with  --agent-log")
+    # ⛔⛔ ONLY WHEN THEY DISAGREE. On every ordinary host HERMES_HOME is unset and
+    # this row does not exist; on the fleet it is set to the SAME directory and the
+    # row still does not exist. A row that printed either way would be one more line
+    # to scroll past on the one screen whose whole job is to show what is wrong.
+    split = config.home_split()
+    if split:
+        _doctor_row("homes", False, f"the chat host's home is {split}", warn_only=True)
+        b.dim(f"              this log is written under {Path.home()} instead, and "
+              "that is")
+        b.dim("              the file --agent-log sends — anything written under the "
+              "other")
+        b.dim("              home does not reach support")
     # ⛔ THE COMMAND, NOT THE VARIABLE. This line used to name SUPER_AGENT_VERBOSE,
     # which is unactionable on the recommended install: the launcher writes no
     # environment, so a variable set in a shell profile never reaches the bridge it
@@ -1705,26 +1751,70 @@ def _run_label(row: dict) -> str:
     return f"a run from {started[:10]}" if started else "an unnamed run"
 
 
-def _resolve_selection(rows: list, spec: str | None) -> "tuple[list[str], str] | None":
-    """Turn `--runs` into run names. Returns (names, ) or None with a printed
-    reason.
+# ⭐ THE ONE NUMBER THAT IS NOT A RUN. The list is printed 1..n, so zero has
+# never addressed anything — and unlike a word it cannot collide with a run name,
+# which is why it is the slot the agent's own log gets rather than a keyword.
+_AGENT_LOG_TOKEN = "0"
+
+# ⭐ AND THE ONE WORD. `--runs all` used to fail with "isn't holding a run called
+# “all”" — a sentence naming a run that never existed — while the flag's own help
+# said the default was all of them. Somebody who types the obvious word deserves
+# the obvious answer, and "all" is not a legal run name (`_RUN_NAME_RE` on the
+# bridge, and every name the machine mints carries a timestamp).
+_ALL_TOKEN = "all"
+
+
+def _resolve_selection(rows: list, spec: str | None) -> "tuple[list[str], bool] | None":
+    """Turn `--runs` into (run names, whether the agent's own log was asked for),
+    or None with a printed reason.
 
     Accepts the numbers printed beside the list AND the names themselves,
     because both are things a person will reasonably type — the numbers are on
-    screen and the names are what the machine calls them.
+    screen and the names are what the machine calls them. Plus two tokens that
+    are not runs at all: `0`, this host's own agent log, and `all`.
 
     ⛔ REFUSES ON ANYTHING IT CANNOT PLACE. Silently dropping an entry would
     send fewer runs than were asked for and report success, which is the one
-    direction this must not fail in."""
+    direction this must not fail in.
+
+    ⛔⛔ AND `0` IS NOT A RUN, SO IT IS NOT COUNTED AS ONE. It comes back in the
+    second slot rather than in the list of names, because everything downstream
+    of the names — the size total, the "N run(s)" sentence, the machine's own
+    refusal to build an empty archive — is about material on the RESEARCH
+    computer, and this is a file on the host running the command. Folding it in
+    would overstate what that computer was asked for by exactly one."""
     known = {r.get("name") for r in rows}
     picked: list[str] = []
+    wants_agent_log = False
     for token in (spec or "").split(","):
         token = token.strip()
         if not token:
             continue
-        if token.isdigit():
+        if token == _AGENT_LOG_TOKEN:
+            wants_agent_log = True
+            continue
+        if token.lower() == _ALL_TOKEN:
+            # ⛔ EVERY LISTED RUN, not every run the computer holds — the list is
+            # the published index and it says so itself when it is short of the
+            # whole ("only the most recent are listed"). Promising more than the
+            # rows in hand would be a claim about material nobody has seen.
+            for row in rows:
+                if row.get("name") not in picked:
+                    picked.append(row.get("name"))
+            continue
+        # ⛔ A LEADING SIGN IS STILL A NUMBER TO A PERSON. `"-1".isdigit()` is
+        # False, so a negative fell through to the name branch and was refused
+        # with "isn't holding a run called “-1”" — a sentence about a run name
+        # nobody typed. It is out of range, and that is what it should say.
+        if token.lstrip("+-").isdigit():
             index = int(token)
             if not 1 <= index <= len(rows):
+                # ⛔ `0` REACHES HERE ONLY SPELLED SOME OTHER WAY — "00", "-0",
+                # "+0". The bare token was taken above as the agent's log; these
+                # are not that token and are not runs either, so the ordinary
+                # out-of-range sentence is the true one. No special case: a
+                # second sentence for a typo nobody types is a branch no test
+                # can justify.
                 print(f"{_NO} There is no run {index} in that list.")
                 return None
             name = rows[index - 1].get("name")
@@ -1735,7 +1825,31 @@ def _resolve_selection(rows: list, spec: str | None) -> "tuple[list[str], str] |
             return None
         if name not in picked:
             picked.append(name)
-    return picked, ""
+    return picked, wants_agent_log
+
+
+def _print_agent_log_choice() -> None:
+    """The one numbered choice that is not on the research computer.
+
+    ⛔⛔ ON SCREEN, OR IT IS NOT AN OFFER. `--agent-log` has existed since
+    2026-08-26 and reaches only somebody who already knows it does: it is in
+    `--help` and nowhere a person doing this task is looking. The list is what
+    they read while deciding, so the choice is numbered and printed beside it.
+
+    ⛔⛔ BUT BELOW THE LIST AND NOT INSIDE IT, and that is the whole reason this
+    is a separate function. Every row above it is material on the RESEARCH
+    computer; this file is on the host running the command, and the two are
+    routinely not the same machine. A row indented into that table would say the
+    research computer holds it — the exact confusion a sibling guard already
+    polices in the consent copy.
+
+    ⛔ AND IT PRINTS ON EVERY BRANCH, including the two where the list is empty.
+    The no-runs cases are when somebody is most likely to want this — the trouble
+    is reaching the computer at all — and they are precisely the branches that
+    print no list to hang a row off. Offering it only when there is something
+    else to offer is how the flag became invisible in the first place."""
+    print("   0  the log from the agent on THIS host — a different computer, "
+          "not that one")
 
 
 def _print_held_runs(rows: list) -> None:
@@ -1856,22 +1970,28 @@ def cmd_send_logs(args: argparse.Namespace) -> int:
         _print_held_runs(rows)
         if body.get("truncated"):
             print("  (only the most recent are listed — it holds more)")
+    _print_agent_log_choice()
 
     if args.list:
         return 0
 
+    picked_agent_log = False
     if args.none:
         names: list[str] = []
     elif args.runs:
         picked = _resolve_selection(rows, args.runs)
         if picked is None:
             return 1
-        names = picked[0]
+        names, picked_agent_log = picked
     else:
         names = [r.get("name") for r in rows]
 
     machine = bool(args.machine)
-    agent_log = bool(getattr(args, "agent_log", False))
+    # ⛔ EITHER ROUTE, NEVER ONE OVERRIDING THE OTHER. `--agent-log` is the flag
+    # this shipped with and `--runs 0` is the row now printed in the list; they say
+    # the same thing, and a person who does both must not be silently answered
+    # "no" by whichever the code happened to read second.
+    agent_log = bool(getattr(args, "agent_log", False)) or picked_agent_log
     if machine and not owned:
         # Refused here as well as at the bridge, so the sentence arrives before
         # a round trip rather than after one.
@@ -1880,6 +2000,22 @@ def cmd_send_logs(args: argparse.Namespace) -> int:
               "run of yours it holds.")
         return 1
     if not names and not machine:
+        # ⛔⛔ THE AGENT'S LOG CANNOT STAND ALONE, AND SAYING SO IS THE WHOLE
+        # POINT OF THIS BRANCH. It is uploaded into the folder the machine's
+        # bundle row names — the app's Clear-logs finds objects by listing that
+        # folder and nothing else — so with no bundle there is nowhere it could
+        # go that a person could later delete. The bridge refuses an empty
+        # archive and the machine refuses it again; without this sentence a
+        # person who picked only `0` would be told "there's nothing to send"
+        # about the one thing they did pick.
+        if agent_log:
+            print(f"{_NO} The agent's own log can only go up beside a bundle from "
+                  "that computer,")
+            print("    so something has to be in that bundle. Pick a run as well "
+                  "— or, if you")
+            print("    own that computer and the trouble is reaching it at all, "
+                  "add --machine.")
+            return 1
         print(f"{_NO} There's nothing to send.")
         if owned:
             print("    To send that computer's own logs instead, add --machine.")
@@ -1908,6 +2044,23 @@ def cmd_send_logs(args: argparse.Namespace) -> int:
         print("It will ALSO include the log from the agent on THIS host — the "
               "program running this command. That is a connection and sign-in "
               "record, not research content, and it never leaves unless asked for.")
+        # ⛔⛔ WHOSE, NOT ONLY WHAT. The machine-log sentence four lines above
+        # names the people its material covers — "for everyone who uses it" — and
+        # this one named nobody, on the surface where that fact is LESS obvious,
+        # not more: a research computer is understood to be shared, and the host
+        # somebody happens to be typing on is not. A second person who signed in
+        # here is in this file, and nothing gates the upload on who owns the host,
+        # because an agent host has no owner to ask. So it is said instead.
+        print("It covers everyone who has signed in on THIS host, not only you — "
+              "there is no owner to ask on a machine like this, so nothing checks.")
+        # ⛔⛔ NAMED, BECAUSE "NOT RESEARCH CONTENT" IS WHAT IT IS NOT. Measured in
+        # the file the uploader actually reads: a masked form of the email address
+        # on every connect, the account id, the ids of the computers and the runs
+        # this agent touched, and — on any failed lookup — the full document path,
+        # which carries the account id unmasked. A person weighing this deserves
+        # the list rather than a category, and the list is short enough to print.
+        print("What is in it: a masked form of your email address, your account "
+              "id, and the ids of the computers and runs this agent has touched.")
     else:
         print("The agent's own log on this host is NOT included.")
     # ⛔⛔ THE THREE FACTS THE APP'S MODAL NAMES AND THIS PLAN DID NOT. The header
@@ -2139,7 +2292,9 @@ def build_parser() -> argparse.ArgumentParser:
                              "(shows what would be sent, then asks)")
     sl.add_argument("--device", help="deviceId to ask (else your selected/sole device)")
     sl.add_argument("--runs", help="which runs, by the numbers shown or by name, "
-                                   "comma-separated (default: all of yours it holds)")
+                                   "comma-separated; 0 is the agent's own log on "
+                                   "this host and all is every run listed "
+                                   "(default: every run listed)")
     sl.add_argument("--none", action="store_true",
                     help="send no runs — for pairing problems, with --machine")
     sl.add_argument("--machine", action="store_true",
@@ -2149,7 +2304,8 @@ def build_parser() -> argparse.ArgumentParser:
     # "yes" — so there is no per-item reader to hang a question off, and inventing
     # one here would make this the only screen in the product that asks twice.
     sl.add_argument("--agent-log", dest="agent_log", action="store_true",
-                    help="also send the log from the agent on THIS host")
+                    help="also send the log from the agent on THIS host "
+                         "(the same thing as --runs 0)")
     sl.add_argument("--list", action="store_true",
                     help="just show what it's holding, send nothing")
     sl.add_argument("--status", metavar="CODE",

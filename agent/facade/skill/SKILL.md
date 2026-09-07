@@ -176,7 +176,8 @@ cancels. Never send the bare "yes" back into `do`.
 | "update Super Research", "update the backend", "update the research computer" | the runtime does NOT update the backend — tell them to run `superresearch --update` on the Research computer **or** update it from the app (Settings → About / the update notification). `sr.py do "<message>"` returns this exact redirect. |
 | "send my logs", "share the logs with support", "submit diagnostics" | `sr.py send-logs` — it SHOWS what would go and sends nothing. On "yes", run `sr.py send-logs --confirm`. See **Sending logs to support** |
 | "did my logs go through?", "check on that support code" | `sr.py send-logs --status <CODE>` |
-| "send the agent's log too", "include the bridge log", "the log from this chat" | add `--agent-log` to the **bare** command **and to `--confirm`** — it uploads nothing on either; it makes the plan name it, and makes the client hand you `sr.py send-logs --status <CODE> --agent-log` for once the bundle lands. **Not** owner-gated. See **Sending logs to support** |
+| "just the one about X", "only the first two", "not all of them" | the plan numbers every run — pass those numbers back with `--runs`, comma-separated: `sr.py send-logs --runs 1,3` (and again on `--confirm`). `--runs 0` is the agent's own log, `--runs all` is every run listed. A name works too. Do **not** guess a number the plan did not print |
+| "send the agent's log too", "include the bridge log", "the log from this chat" | add `--agent-log` to the **bare** command **and to `--confirm`** — or say `--runs 0`, which is the same thing and is the number the plan prints for it. It uploads nothing on either; it makes the plan name it, and makes the client hand you `sr.py send-logs --status <CODE> --agent-log` for once the bundle lands. **Not** owner-gated. See **Sending logs to support** |
 | just `/sr`, "what can you do?", "help" | `sr.py status-account` → welcome (see **A bare `/sr`**) |
 
 **Safe defaults:** unnamed run → the **most-recent active** run. **Confirm before
@@ -335,6 +336,13 @@ not carry recorded consent, and that consent is the user having read those
 lines. Confirming on their behalf, or running `--confirm` first because it looks
 like a shortcut, makes a claim about a conversation that did not happen.
 
+- **Which runs go** is the user's to choose, and the plan numbers them so they
+  can. Everything listed goes unless `--runs` says otherwise; `--runs` takes the
+  printed numbers or the run names, `0` is the agent's own log and `all` is every
+  run listed. Pass the same `--runs` on `--confirm` — the two calls are separate
+  processes and the second remembers nothing. ⛔ A run the plan did not list
+  cannot be asked for: the list is what that computer published, and it says so
+  itself when it is holding more.
 - **What goes** is the logs of the runs **this user** fired on that computer,
   and nothing else. The computer decides that itself — a request cannot widen
   it. So on a shared Research Computer, sending logs never hands over anybody
@@ -347,11 +355,18 @@ like a shortcut, makes a claim about a conversation that did not happen.
   them; a non-owner is told no.
 - **The agent's own log on THIS host** is a third thing and a third computer —
   the program running this chat, not their Research Computer. `--agent-log`
-  asks for it on the bare command, so the plan names it. Unlike `--machine`
+  asks for it on the bare command, so the plan names it, and `--runs 0` is the
+  same request by the number the plan prints. Unlike `--machine`
   there is **no ownership gate**, so no refusal will stop you: offer it only
   when the problem is this chat reaching their computer at all. It covers that
   file since it last rotated, not just this conversation, so it can reach back
-  further than the problem being reported. **It does not ride the send** — but
+  further than the problem being reported. ⛔ And say what it holds before they
+  agree: it covers **everyone who has signed in on that host**, not only them,
+  and it carries a masked form of their email address, their account id and the
+  ids of the computers and runs this agent has touched. The client's plan prints
+  all of that — relay it, do not summarise it away. ⛔ And it cannot go on its
+  own: it is uploaded beside a bundle, so there has to be a bundle — `--runs 0`
+  alone is refused with that sentence. **It does not ride the send** — but
   **pass it on `--confirm` too**: nothing is uploaded on that call either, and it
   is what makes the client tell the user a step is still outstanding and hand you
   the exact follow-up command. Leave it off and you get neither, and the second
