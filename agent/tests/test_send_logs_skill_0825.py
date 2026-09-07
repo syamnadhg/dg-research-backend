@@ -499,8 +499,25 @@ def test_the_skill_document_keeps_the_two_sentences_apart() -> None:
 
 
 def test_the_skill_document_forbids_polling_the_status() -> None:
+    """⛔⛔ IT READ THE WHOLE SECTION AND THE SECTION SAYS IT TWICE. A mutation
+    sweep on 2026-09-07 deleted this rule from the "After sending" bullet — the one
+    that tells the assistant what to do with a support code — and the guard stayed
+    green, because the agent-log bullet further down carries the same words about a
+    DIFFERENT command. Two bullets, one phrase, and a guard that could not tell
+    which of them it had found: satisfied by a neighbour, exactly the shape three
+    mutants in this family have exploited.
+
+    ⛔ SO IT NAMES THE BULLET. The rule has to be beside the command it governs, or
+    a model reading only the row it needs never sees it."""
     section = SKILL_MD.split("## Sending logs to support", 1)[1].split("\n## ", 1)[0]
     assert "never on a timer" in section
+    after_sending = next(
+        (b for b in section.split("\n- ") if b.startswith("**After sending**")), "")
+    assert after_sending, "the After-sending bullet is gone from the section"
+    assert "never on a timer" in after_sending, (
+        "the rule left the bullet that governs the status check — the other copy "
+        "is about the agent log, a different command")
+    assert "when the user asks" in after_sending
 
 
 def test_the_skill_document_does_not_hand_the_model_a_wait_to_quote() -> None:

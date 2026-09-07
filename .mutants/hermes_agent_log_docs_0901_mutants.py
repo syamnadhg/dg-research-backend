@@ -247,12 +247,19 @@ MUTANTS = [
      "⛔⛔ THE ROW DROPS `--confirm` FROM THE FLOW and still promises the client "
      "hands over the follow-up. Measured: a plain `--confirm` prints neither the "
      "person's line nor the directive, so the row's own claim becomes false",
-     # ⛔ RE-ANCHORED 2026-09-06 (wave 7.9-1). The row gained a clause naming
-     # `--runs 0` as the same request; the sentence this mutant rewrites is
-     # otherwise unchanged, and the mutation and its subject are identical.
-     [("It uploads nothing on either; it makes the plan name it, and makes the "
+     # ⛔⛔ RE-ANCHORED 2026-09-06 (wave 7.9-1) AND GOT IT WRONG THE FIRST TIME.
+     # The row gained a clause naming `--runs 0`, so the old anchor no longer
+     # matched; the replacement I wrote for it left "**and to `--confirm`**"
+     # standing, and the guard this mutant exists to defeat asserts exactly that
+     # substring is in the row. It survived — a mutant that no longer touches its
+     # own subject, which reads as a hole in the tests and is a hole in the
+     # harness. The mutation removes `--confirm` from the row again.
+     [("add `--agent-log` to the **bare** command **and to `--confirm`** — or say "
+       "`--runs 0`, which is the same thing and is the number the plan prints for "
+       "it. It uploads nothing on either; it makes the plan name it, and makes the "
        "client hand you",
-       "The client hands you")]),
+       "add `--agent-log` to the **bare** command — or say `--runs 0` — so the plan "
+       "names it. The client hands you")]),
     ("B4", BE_SKILL, "under",
      "the absence of an ownership gate stops being stated, one bullet below the "
      "owner-only rule it must not be confused with",
