@@ -117,6 +117,25 @@ class TestRevokedRecoveryLoopCap:
             raise _RaisedExitCode(code)
 
         monkeypatch.setattr(_os_mod, "_exit", fake_exit)
+
+        # ⛔⛔ THE LOOP GAINED A SECOND WAY TO END A PROCESS, 7.9-0, and this
+        # fixture is the reason that mattered. An unsupervised recovery now
+        # RESTARTS the serve instead of leaving the machine stopped — and the
+        # first version of that change called `os.execv` inline, so driving this
+        # loop re-execed PYTEST at 71% through the suite. Exit code 0, no
+        # summary, no failing test: exactly the silence this whole wave exists
+        # to remove, reproduced by the fix for it.
+        # ⭐ The restart lives behind ONE function precisely so this line can
+        # exist.
+        # ⛔ RETURNS FALSE AND TOUCHES NOTHING. The first version of this stub
+        # appended to `calls` — which is the redeem-counter DICT, not a list —
+        # so it raised AttributeError inside the loop, the loop's broad handler
+        # swallowed it, and the whole thing spun forever on instant fake sleeps.
+        # A hang instead of a kill: a different silence, same lesson.
+        def fake_reexec():
+            return False
+
+        monkeypatch.setattr(research, "_relink_reexec", fake_reexec)
         return calls
 
     def test_cap_fires_after_one_hour_wallclock(self, monkeypatch):

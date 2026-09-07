@@ -50,6 +50,17 @@ def wired(monkeypatch, capsys):
         return state["patch_ok"]
 
     monkeypatch.setattr(research, "_pair_patch_device", _patch)
+    # ⛔⛔ 7.9-0 ADDED A THIRD COLLABORATOR AND IT READS THE REAL KEYSTORE.
+    # `run_visibility`'s empty-read branch now names a revoked session when it
+    # can prove one, and it proves it from disk plus the OS keystore — so
+    # without this line every assertion below would depend on whether the
+    # developer running the suite happens to be paired, and would pass or fail
+    # on a machine rather than on the code. Healthy is the default because it
+    # is what the pre-existing tests were implicitly assuming.
+    state["cred"] = research.CRED_HEALTHY
+    monkeypatch.setattr(
+        research, "credential_state_now", lambda *a, **kw: state["cred"]
+    )
     # The flourish sleeps and the next-actions block prints; neither is under
     # test and both are noisy.
     monkeypatch.setattr(research, "_branded_header", lambda *a, **kw: None)
@@ -407,3 +418,64 @@ def test_the_stage_count_is_untouched():
     src = inspect.getsource(research)
     assert "_setup_step(2, 5, \"On Startup\")" in src
     assert "_setup_step(5, 5" in src
+
+
+# ── 7.9-0: the empty-read branch stops blaming the network ───────────────────
+
+def test_a_revoked_session_is_named_instead_of_the_network(wired):
+    """⛔⛔ MEASURED ON THE OWNER'S MACHINE, 2026-09-06. They reset their pair
+    code — which revokes this machine's token by design — and every later run
+    of this command told them to check the network. The program already knew:
+    the reset wiped the keystore and the wipe logged itself. It just never
+    asked before printing."""
+    wired["meta"] = {}
+    wired["cred"] = research.CRED_NO_TOKEN
+    assert research.run_visibility(research._VISIBILITY_SHOW) == 1
+    out = wired["out"]()
+    assert "revoked" in out
+    assert "Check the network" not in out
+    assert wired["patches"] == []
+
+
+def test_a_revoked_session_never_recommends_pairing(wired):
+    """⛔ THE DESTRUCTIVE HALF. Pairing mints a new device id, and a new device
+    is private — so the advice would have cost this owner both the machine's
+    identity and the public listing they were trying to check."""
+    wired["meta"] = {}
+    wired["cred"] = research.CRED_NO_TOKEN
+    research.run_visibility("public")
+    out = wired["out"]()
+    advice = "\n".join(l for l in out.splitlines() if "⛔" not in l)
+    assert "--pair" not in advice
+    assert "--serve" in out
+
+
+def test_a_failed_SET_says_the_setting_was_not_changed(wired):
+    """⛔⛔ THE OWNER ASKED FOR A WRITE AND WAS TOLD A READ FAILED. One branch
+    served both requests, so the only honest reading of the output was "it
+    might have worked" — about the one setting they had just tried to change."""
+    wired["meta"] = {}
+    research.run_visibility("public")
+    assert "Nothing was changed" in wired["out"]()
+
+
+def test_a_failed_SHOW_does_not_claim_nothing_was_changed(wired):
+    """⛔ THE OVER-CORRECTION. Somebody who typed no value changed nothing and
+    is owed no verdict on it; saying so anyway is noise that makes the real
+    message harder to find."""
+    wired["meta"] = {}
+    research.run_visibility(research._VISIBILITY_SHOW)
+    assert "Nothing was changed" not in wired["out"]()
+
+
+def test_an_unprovable_failure_still_falls_back_to_the_old_sentence(wired):
+    """⭐ THE READ IS STILL AMBIGUOUS AND THIS WAVE DOES NOT PRETEND OTHERWISE.
+    The fetch returns {} for six reasons and only one of them is nameable from
+    disk. When the credentials look healthy the cause really is unknown, and
+    the honest answer is the one that does not claim to know."""
+    wired["meta"] = {}
+    wired["cred"] = research.CRED_HEALTHY
+    research.run_visibility(research._VISIBILITY_SHOW)
+    out = wired["out"]()
+    assert "Could not read" in out
+    assert "revoked" not in out

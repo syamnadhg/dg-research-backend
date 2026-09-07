@@ -193,10 +193,16 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [("    global _firestore_down_since_ts\n    if _firestore_down_since_ts is None:\n        _firestore_down_since_ts = float(now if now is not None else time.time())",
        "    global _firestore_down_since_ts\n    _firestore_down_since_ts = float(now if now is not None else time.time())")],
      [T_OUT]),
+    # ⛔ RE-ANCHORED 2026-09-06 (7.9-0). This carried the three consecutive lines
+    # `_firebase_down_reason = None` / `_clear_firestore_down()` / the log — and
+    # 7.9-0 inserted the relink restart-marker clear between the first two, so
+    # the anchor stopped matching and this mutant silently measured NOTHING.
+    # The sweep caught it; a stale anchor is a harness fault, not a survivor.
+    # It now carries only the call it is about, plus the line after it.
     ("F2", "under", "the clock never stops on a successful rebuild, so the next "
      "outage is measured from the previous one",
-     [("    _firebase_down_reason = None\n    _clear_firestore_down()\n    log(f\"Firestore client initialized",
-       "    _firebase_down_reason = None\n    log(f\"Firestore client initialized")],
+     [("    _clear_firestore_down()\n    log(f\"Firestore client initialized",
+       "    log(f\"Firestore client initialized")],
      [T_OUT]),
     # ⛔ THIS MUTANT WAS BROKEN ON ITS FIRST RUN and reported as a survivor: it
     # inserted `pass` in front of the comment and left the call standing, so it

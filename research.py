@@ -6644,6 +6644,151 @@ def _try_claim_queue_doc(doc_ref, worker_id: int, log_prefix: str = "[claim]",
     return None  # Defensive — loop should always return inside
 
 
+# ── Credential state — one question, asked in one place ──────────────────────
+#
+# ⛔⛔ THIS EXISTS BECAUSE ONE WORD WAS DOING TWO JOBS. `_firebase_down_reason`
+# said "revoked" for BOTH "the keystore holds no refresh token" and "the server
+# rejected the refresh token we hold", and every consumer then had to guess
+# which one it was looking at. They guessed wrong in the same direction: four
+# sites answered "empty keystore" with `--pair`, and pairing MINTS A BRAND NEW
+# deviceId (the server does `randomUUID()` at initiate-pair — nothing reuses the
+# id on disk), while a brand-new device carries no `visibility` field, which
+# reads as PRIVATE. So the advice printed to an owner whose token had just been
+# revoked by their own Reset threw away the machine's identity AND its public
+# listing, in one command. Measured live 2026-09-06 on the owner's own machine.
+#
+# ⛔⛔ AND THE CONFLATION IS NOT SUBTLE — IT IS TWO INDEPENDENT STORES.
+# `keystore.clear_all` wipes keystore SLOTS only; `deviceId`, `pairedUid` and
+# `pollSecret` live in research_config.json and survive it untouched. "Keystore
+# empty" and "not paired" are orthogonal facts and nothing was asking the second
+# one before printing advice that only makes sense when it is true.
+#
+# ⭐ SO THE FIX IS AN EXTRACTION, NOT NEW LOGIC. Both inputs are already on disk
+# and already cheap: `load_device_id()` and `load_paired_uid()` are memoized
+# reads of one small JSON file, no network and no client. The classifier is pure
+# so it can be mutation-tested without a keystore, a network, or a device — and
+# so that the one place that decides cannot drift from the places that print.
+# The precedent for this shape in this file is `_search_path_findings`.
+
+CRED_NEVER_PAIRED = "never_paired"
+CRED_ORPHANED = "orphaned"
+CRED_NO_TOKEN = "no_token"
+CRED_TOKEN_REJECTED = "token_rejected"
+CRED_HEALTHY = "healthy"
+
+
+def classify_credentials(
+    device_id: "str | None",
+    paired_uid: "str | None",
+    has_token: bool,
+    token_rejected: bool = False,
+) -> str:
+    """Which credential state is this computer actually in?
+
+    ⛔ THE ORDER OF THESE TESTS IS THE WHOLE POINT. `device_id` is asked FIRST
+    because it is the fact that decides whether pairing is a repair or a
+    demolition. A machine with no id has nothing to lose and should pair; a
+    machine WITH an id loses that id the moment it pairs, so no branch below it
+    may ever recommend pairing.
+
+    ⛔ `token_rejected` is passed IN rather than probed, because only a live
+    refresh can tell "the server said no" from "we never asked". Everything
+    else here is answerable from disk, which is why the whole function stays
+    callable from the REST subcommands that deliberately never build a client.
+
+    ⭐ AN ORPHANED MACHINE — an id but no owner link — genuinely does need
+    pairing: `clear_paired_uid` drops the owner while keeping the id so a
+    relink can resume, but the relink command its docstring names DOES NOT
+    EXIST in this program, so pairing is the only door left. That is a real
+    difference from `no_token`, and it is why these are two states and not one.
+    """
+    if not device_id:
+        return CRED_NEVER_PAIRED
+    if not paired_uid:
+        return CRED_ORPHANED
+    if token_rejected:
+        return CRED_TOKEN_REJECTED
+    if not has_token:
+        return CRED_NO_TOKEN
+    return CRED_HEALTHY
+
+
+def credential_remedy(state: str, in_serve: bool = False) -> "list[str]":
+    """The sentences to print for a credential state, worst-first.
+
+    ⛔⛔ NO BRANCH HERE MAY NAME `--pair` FOR A MACHINE THAT STILL HAS AN ID
+    AND AN OWNER. That is the defect this wave exists to remove, and putting
+    the sentences in one function is what stops it growing back in the next
+    site somebody adds.
+
+    ⛔ AND NONE OF THEM PROMISES A TIMER. The recovered states wait for a
+    person — an approval in the app, and a process running on this computer —
+    not for a clock. "Try again shortly" would send the owner away for nothing;
+    the owner drew exactly that conclusion from the old message and it was
+    wrong. Name the state and the one action that clears it.
+
+    ⛔ NOR DOES IT PROMISE AN AUTOMATIC RESPAWN. The sentence it replaces said
+    the watcher "will pick it up and respawn the backend automatically", which
+    is true only where a supervisor is installed. On a machine that starts by
+    hand — which is a supported way to run this — nothing respawns anything.
+    """
+    if state == CRED_NEVER_PAIRED:
+        return [
+            "This computer is not paired yet.",
+            f"Pair it with:  {_PROG} --pair",
+        ]
+    if state == CRED_ORPHANED:
+        return [
+            "This computer is no longer linked to an account.",
+            f"Pair it again with:  {_PROG} --pair",
+        ]
+    if state in (CRED_NO_TOKEN, CRED_TOKEN_REJECTED):
+        # ⛔⛔ THE FIRST VERSION SAID "check your email for the new code and
+        # enter it in the app", and cross-verify read the email. It contains NO
+        # CODE — the body renders an Approve button and nothing else. Somebody
+        # following that sentence searches an email for a string that is not in
+        # it. The code does exist, but on the device tile in the app, behind an
+        # eye icon.
+        # ⭐ SO IT NAMES THE ACTION THAT IS ACTUALLY THERE, and names the tile
+        # as the fallback for a person who has already lost the email.
+        return [
+            "This computer's session was revoked — that is what a pair code "
+            "reset does.",
+            "Open the app: click Approve in the reset email, or use the code "
+            "on this computer's tile under Account.",
+            # ⛔⛔ TWO OF THIS FUNCTION'S CONSUMERS ARE ALREADY INSIDE A RUNNING
+            # SERVE — the boot banner and the recovery watcher itself — and
+            # telling somebody sitting in front of a running serve to start a
+            # serve reads as "you did it wrong", when in fact they did the one
+            # thing that makes recovery possible. Cross-verify caught it.
+            # ⭐ The recovery watcher lives in that process, so from there the
+            # honest sentence is that this window is what completes the job.
+            ("This window picks it up automatically — keep it open."
+             if in_serve else
+             f"Then start this computer with:  {_PROG} --serve"),
+            f"⛔ Do NOT run {_PROG} --pair — it would create a NEW computer "
+            "and this one would lose its name and its public setting.",
+        ]
+    return []
+
+
+def credential_state_now(token_rejected: bool = False) -> str:
+    """`classify_credentials` fed from this computer's own state.
+
+    ⛔ THE KEYSTORE PROBE IS THE ONLY PART THAT CAN THROW, and a machine that
+    cannot even ask its keystore is not a machine that should be told to pair —
+    so the failure is folded into "no token", whose advice is safe either way.
+    """
+    try:
+        from auth import keystore as _ks
+        has_token = _ks.try_recover(_ks.install_uuid()) is not None
+    except Exception:
+        has_token = False
+    return classify_credentials(
+        load_device_id(), load_paired_uid(), has_token, token_rejected
+    )
+
+
 def init_firebase():
     """Initialize the Firestore client for this BE process. Backed by the
     OS-keystore refresh token (deposited by `cmd_pair_v2`'s Stage 1
@@ -6681,11 +6826,21 @@ def init_firebase():
         return False
     install_uuid = _ks.install_uuid()
     if _ks.try_recover(install_uuid) is None:
-        log(
-            f"Firestore init: keystore empty — run `{_PROG} --pair` "
-            "to establish a refresh token.",
-            "ERROR",
-        )
+        # ⛔⛔ THIS LINE USED TO SAY "run --pair to establish a refresh token"
+        # AND IT WAS THE MOST EXPENSIVE SENTENCE IN THE FILE. An empty keystore
+        # is the state a pair-code Reset leaves behind, and on that machine
+        # `--pair` does not restore anything — it mints a NEW deviceId and a new
+        # device has no `visibility`, so the owner loses the computer's identity
+        # and its public listing in one command. It said this to the owner on
+        # 2026-09-06 and the owner very nearly ran it.
+        # ⭐ THE CLASSIFICATION BELOW IS UNCHANGED ON PURPOSE. "revoked" is a
+        # ROUTING word — it is what hands recovery to the relink loop rather
+        # than the reconnect ladder — and BOTH the empty keystore and a rejected
+        # token must route there. Splitting it would have quietly stopped the
+        # relink loop firing for exactly the case that needs it most. The bug
+        # was never the classification; it was the advice hung off it.
+        for _line in credential_remedy(credential_state_now()):
+            log(f"Firestore init: {_line}", "ERROR")
         # Nothing to reconnect with — post-Reset / never-paired. The relink
         # loop (not the reconnect loop) owns this. (#717)
         _firebase_down_reason = "revoked"
@@ -6709,18 +6864,34 @@ def init_firebase():
         return False
     if client is None:
         log(
-            "Firestore init: refresh token rejected (revoked or expired). "
-            "If you triggered Reset Pair Code, check your email for the new "
-            "code and enter it in Account → Add Device — the recovery "
-            "watcher will pick it up and respawn the backend automatically.",
+            "Firestore init: refresh token rejected (revoked or expired).",
             "ERROR",
         )
+        # ⛔ THE SENTENCE THAT USED TO BE PART OF THE LINE ABOVE PROMISED THE
+        # WATCHER WOULD "respawn the backend automatically". That is true only
+        # where a supervisor is installed. Starting this program by hand is a
+        # supported way to run it, and on such a machine nothing respawns
+        # anything — the owner is left at a shell believing otherwise. The
+        # shared remedy says what to do without promising who will do it.
+        for _line in credential_remedy(credential_state_now(token_rejected=True)):
+            log(f"Firestore init: {_line}", "ERROR")
         # init_firestore_user_scoped already wiped the keystore on RevokedError
         # — genuine revoke → relink loop owns recovery. (#717)
         _firebase_down_reason = "revoked"
         return False
     _firebase_db = client
     _firebase_down_reason = None
+    # ⛔⛔ THE RESTART MARKER IS CLEARED HERE, AND ONLY HERE. It was set once and
+    # never cleared, which cross-verify caught: the guard then meant "once per
+    # process LINEAGE", so a machine that recovered from one pair-code reset
+    # would refuse to restart itself after the NEXT one — reproducing the
+    # original incident on the second reset, months later, with no clue why.
+    # ⭐ A HEALTHY BOOT IS THE RIGHT MOMENT because it is exactly what the guard
+    # is protecting against not happening. A restart loop is a process that
+    # recovers, re-execs, and fails again — and a process that reaches this line
+    # has not failed. So clearing here can never license a loop, and it lets
+    # every future reset get its one restart.
+    os.environ.pop(RELINK_REEXEC_ENV, None)
     _clear_firestore_down()
     log(f"Firestore client initialized ✓ (install={install_uuid[:8]}…)")
     # #720: verify the gRPC client's freshly-minted idToken actually carries the
@@ -7627,19 +7798,17 @@ def clear_paired_uid():
         log(f"Could not clear pairedUid from config: {e}", "WARN")
 
 
-def generate_device_id():
-    """Mint a new stable deviceId shaped '<sanitized-hostname>-<6-char-hex>'.
-    Called once per machine — subsequent --pair runs reuse the persisted id."""
-    import uuid
-    import socket
-    import re as _re
-    hostname = socket.gethostname()
-    sanitized = _re.sub(r'[^a-z0-9-]', '-', hostname.lower()).strip('-')
-    if not sanitized:
-        sanitized = "device"
-    new_id = f"{sanitized[:30]}-{uuid.uuid4().hex[:6]}"
-    save_device_config(device_id=new_id)
-    return new_id
+# ⛔⛔ `generate_device_id` WAS DELETED HERE, 2026-09-06 (7.9-0), AND ITS
+# DOCSTRING IS WHY. It said "subsequent --pair runs reuse the persisted id",
+# which is the exact opposite of what this program does: pairing calls
+# /api/devices/initiate-pair and the SERVER mints a fresh random id, every time,
+# with nothing anywhere reading the id on disk first. The function had zero
+# callers and had not minted an id in a long time — but it was the most
+# authoritative-looking sentence in the file on the one question that decides
+# whether `--pair` repairs a machine or replaces it, and a reader who trusts it
+# concludes that recommending `--pair` after a pair-code reset is harmless. It
+# is not: the machine loses its id, its name and its public listing.
+# ⭐ THE ID IS MINTED SERVER-SIDE. There is no local generator to keep.
 
 
 def _detect_supervised() -> bool:
@@ -8315,6 +8484,49 @@ async def _firebase_reconnect_loop():
             await asyncio.sleep(10)
 
 
+#: Set on the child when a relink recovery re-execs an unsupervised serve, so a
+#: second failure through the same path prints instead of restarting again.
+#: ⛔ AN ENV VAR RATHER THAN A MODULE GLOBAL, because the whole point is that it
+#: has to survive into a process that has not run this file's top level yet.
+RELINK_REEXEC_ENV = "SR_RELINK_REEXEC"
+
+
+def _relink_reexec() -> bool:
+    """Replace this process with a fresh one, same interpreter and same argv.
+
+    Returns False if the exec could not happen. On success it does not return
+    at all — the process image is gone.
+
+    ⛔⛔ THIS IS A SEAM AND THAT IS THE WHOLE REASON IT EXISTS. The first version
+    of this wave called `os.execv` inline in the recovery loop, and
+    `tests/test_revoked_recovery_loop_cap.py` — which drives that loop directly
+    and carefully replaces `os._exit` with a raising sentinel so it cannot kill
+    the runner — had nothing to replace here. So the loop re-execed PYTEST, at
+    71% through the suite, and the run ended with exit code 0 and no summary.
+    That is the same silence the owner saw in their own terminal, reproduced by
+    my own fix inside the test suite.
+    ⭐ ONE FUNCTION MEANS ONE THING TO REPLACE, and it means a process-ending
+    action in this recovery path can never again be reached by code that is not
+    a serve.
+    """
+    # ⛔⛔ `[sys.executable, *sys.argv]` IS NOT THIS PROGRAM'S COMMAND LINE, and
+    # cross-verify caught it. On a pipx or pip install the entry point is a
+    # console script, so `sys.argv[0]` is that script and not a module this
+    # interpreter can be handed — and on Windows the console script is an .exe
+    # wrapper, where `python thing.exe --serve` simply does not run. The restart
+    # would fail on exactly the installs most likely to be unsupervised.
+    # ⭐ `sys.orig_argv` IS THE REAL COMMAND LINE, interpreter included, and it
+    # has existed since 3.10 while this package floors at 3.11. The old
+    # reconstruction stays as a fallback rather than being trusted first.
+    argv = list(getattr(sys, "orig_argv", None) or [sys.executable, *sys.argv])
+    try:
+        os.environ[RELINK_REEXEC_ENV] = "1"
+        os.execv(argv[0], argv)
+    except Exception as err:
+        log(f"[relink] restart failed ({err})", "WARN")
+    return False
+
+
 async def _revoked_recovery_loop():
     """Auto-relink after the owner triggers Reset Pair Code from the FE.
 
@@ -8327,11 +8539,18 @@ async def _revoked_recovery_loop():
     initial pair used (pollSecret survives Reset in research_config.json),
     so we can pick it up here without any new handshake.
 
-    On success we exit cleanly. Under the daemon-loop supervisor (Win
-    Scheduled Task / mac launchd / linux systemd-user) the BE respawns
-    within ~5s with the new keystore + fresh Firestore client + fresh
-    listener subscriptions. Unsupervised installs need a manual
-    `python research.py --serve`; we log the instruction.
+    On success we replace this process so the new keystore, a fresh
+    Firestore client and fresh listener subscriptions all come up
+    together. Under the daemon-loop supervisor (Win Scheduled Task / mac
+    launchd / linux systemd-user) that is a clean exit and the supervisor
+    respawns. Unsupervised it is a re-exec of this same process, once.
+
+    ⛔ THIS PARAGRAPH USED TO SAY "Unsupervised installs need a manual
+    `python research.py --serve`; we log the instruction", and 7.9-0
+    changed the behaviour without changing these words — a docstring is
+    the first thing the next reader trusts, and every guard this wave
+    added strips docstrings before searching, so nothing could catch it.
+    Cross-verify did.
 
     Loop is quiet during normal operation — sleeps until `_firebase_db`
     goes None. Backs off 5 min after a PollTimeout (code window
@@ -8363,13 +8582,50 @@ async def _revoked_recovery_loop():
             if first_recovery_attempt_ts is None:
                 first_recovery_attempt_ts = time.time()
             elif (time.time() - first_recovery_attempt_ts) > MAX_RECOVERY_WALLCLOCK_SEC:
+                # ⛔⛔ THIS BRANCH SAID "Owner must run --pair to recover" AND
+                # CROSS-VERIFY CAUGHT IT SURVIVING THE WAVE — in the same
+                # function whose other pairing sentence the wave had just
+                # removed, 120 lines apart, for the same reason.
+                # ⭐ AND IT IS THE ONE PLACE WHERE PAIRING MIGHT ACTUALLY BE
+                # RIGHT, WHICH IS WHY IT NEEDS CARE RATHER THAN THE SHARED
+                # REMEDY. An hour of failed redeems usually means the owner
+                # never approved and the device record's own TTL has since
+                # deleted it — a genuinely gone machine, which only pairing can
+                # replace. But "usually" is not "certainly": if the owner DID
+                # approve and the redeems failed for some other reason, the
+                # record survived, and pairing would throw away a machine that
+                # is still there under its own name. This code cannot tell the
+                # two apart — it has no token left to look with.
+                # ⛔ SO IT NAMES BOTH CASES AND LETS THE PERSON LOOK. The app is
+                # the only place the answer actually exists.
                 log(
-                    f"[relink] giving up after {MAX_RECOVERY_WALLCLOCK_SEC}s "
-                    "(device doc TTL likely expired) — exiting so supervisor "
-                    "stops respawning into the same dead loop. Owner must "
-                    f"run `{_PROG} --pair` to recover.",
+                    f"[relink] giving up after {MAX_RECOVERY_WALLCLOCK_SEC}s.",
                     "ERROR",
                 )
+                log(
+                    "[relink] open the app and look under Devices: if this "
+                    "computer is still listed, use the code you were emailed "
+                    f"to add it again, then run `{_PROG} --serve`.",
+                    "ERROR",
+                )
+                log(
+                    "[relink] only if it is GONE from that list has the record "
+                    f"expired, and only then does `{_PROG} --pair` apply — it "
+                    "creates a new computer and does not recover this one.",
+                    "ERROR",
+                )
+                # ⛔ THE EXIT IS UNCHANGED AND DELIBERATELY NOT A RE-EXEC.
+                # Restarting here would re-enter the same dead loop, which is
+                # the one thing this branch exists to stop. But an unsupervised
+                # machine is about to lose the process the person is watching,
+                # so it says so — the original left them at a prompt with an
+                # hour-old log and no last line.
+                if not _supervisor_is_my_parent():
+                    log(
+                        "[relink] this serve is stopping now — nothing on this "
+                        "computer will restart it.",
+                        "ERROR",
+                    )
                 await asyncio.sleep(0.5)
                 import os as _os
                 _os._exit(0)
@@ -8443,20 +8699,87 @@ async def _revoked_recovery_loop():
                 # client + fresh listener subscriptions. In-process swap
                 # would leave the old listeners pointing at the revoked
                 # gRPC channel, which silently stops delivering snapshots.
-                log(
-                    "[relink] exiting --serve so subscriptions reload "
-                    "(supervisor will respawn within ~5s; "
-                    f"unsupervised installs need `{_PROG} --serve`).",
-                    "INFO",
-                )
-                # Give the log line a beat to flush before we go.
-                await asyncio.sleep(0.5)
+                # ⛔⛔ THE EXIT IS RIGHT AND THE ASSUMPTION UNDER IT WAS NOT.
+                # Swapping the client in place would leave every listener bound
+                # to the revoked gRPC channel, which stops delivering snapshots
+                # silently — so a fresh process really is the correct answer and
+                # nothing below deletes it. What was wrong is that it ended the
+                # process unconditionally, on the assumption that a supervisor
+                # would start another one "within ~5s". That is true only where
+                # one is installed. Starting this program by hand is supported,
+                # and the owner's own machine is deliberately run that way.
+                # ⛔ MEASURED 2026-09-06: on that machine the recovery worked
+                # perfectly — token bootstrapped, listing flag set, deletion
+                # timer cancelled — and then this line ended the only process
+                # they had started, with exit code 0, so their shell showed no
+                # error at all. They read it as a crash. The computer stayed off
+                # the public list until they happened to run serve again.
+                # ⭐ THE QUESTION WAS ALREADY ANSWERED ONE SCREEN AWAY.
+                # `_recover_after_reconnect` makes the identical
+                # exit-or-stay decision and asks `_supervisor_is_my_parent()`,
+                # whose own docstring names this exact foreground setup. The
+                # relink path simply never got the branch.
                 import os as _os
+
+                if _supervisor_is_my_parent():
+                    log(
+                        "[relink] exiting --serve so subscriptions reload "
+                        "(supervised — the daemon loop restarts this process).",
+                        "INFO",
+                    )
+                    # Give the log line a beat to flush before we go.
+                    await asyncio.sleep(0.5)
+                    _os._exit(0)
+
+                # ⭐ UNSUPERVISED: BE THE SUPERVISOR. A message telling the
+                # owner to run the command again would still leave the machine
+                # off the public list until they read it and did — and this
+                # recovery has already succeeded, so there is nothing left to
+                # decide. Re-exec gives the fresh process the exit was for,
+                # without needing anything else on the machine to provide it.
+                # ⛔ ONCE, AND ONLY ONCE. A recovery that re-execs into a
+                # process that fails the same way and re-execs again is an
+                # invisible restart loop, which is worse than the defect it
+                # replaces. The marker is inherited by the new process, so the
+                # second pass through here takes the message instead.
+                if _os.environ.get(RELINK_REEXEC_ENV) != "1":
+                    log(
+                        "[relink] recovery complete — restarting this serve so "
+                        "subscriptions reload (no supervisor on this machine).",
+                        "INFO",
+                    )
+                    await asyncio.sleep(0.5)
+                    # ⛔ FALLS THROUGH WHEN IT RETURNS. `_relink_reexec` only
+                    # returns if the exec did NOT happen, so reaching the next
+                    # line means this process is still here and still owes the
+                    # person a sentence. Ending it here instead would reproduce
+                    # the original defect on the one path hardest to reproduce.
+                    _relink_reexec()
+
+                # ⛔ THE LAST THING PRINTED, because it is the only thing left
+                # for a person to act on, and the line it replaces was buried
+                # forty lines above a shell prompt.
+                log(
+                    "[relink] recovery complete, but this serve must be started "
+                    f"again to pick it up: {_PROG} --serve",
+                    "ERROR",
+                )
+                await asyncio.sleep(0.5)
                 _os._exit(0)
             except _v2.PollTimeout:
                 log(
+                    # ⛔⛔ THE SECOND HALF OF THIS LINE USED TO SAY "or run
+                    # --pair on this PC", and this is the ONE site in the file
+                    # that had already PROVEN the machine is paired — the guard
+                    # 76 lines up tests both the poll secret and the device id
+                    # before we can reach here. Recommending the command that
+                    # discards that device id, on the one code path that knows
+                    # it exists, is the sharpest version of the whole defect.
+                    # ⭐ The FIRST half was right and is kept: Manage devices
+                    # really is where Reset lives.
                     "[relink] 15-min code window expired — owner can re-Reset "
-                    "from Settings → Manage devices, or run --pair on this PC.",
+                    "from Settings → Manage devices, then this computer picks "
+                    "the new code up on its own.",
                     "WARN",
                 )
                 await asyncio.sleep(5 * 60)
@@ -67649,21 +67972,36 @@ async def run_server(port=8000):
         or (f"{_device_id_now[:8]}…" if _device_id_now else "(none)")
     )
     _device_os = _meta.get("os", "") or ""
+    # ⛔⛔ "(active)" USED TO COME FROM A FILE ON DISK AND NOTHING ELSE. The word
+    # was decided by `load_device_id()` — i.e. by whether this machine has ever
+    # been paired — while the connection that makes it true or false had already
+    # succeeded or failed by the time this strip prints, and no row read it.
+    # ⛔ MEASURED 2026-09-06: the owner's machine printed a green "(active)"
+    # device and "Keep this terminal open" in the same breath as a failed
+    # Firestore init, and quit one second later. Nothing on screen was false in
+    # isolation; the banner as a whole was.
+    _connected = _firebase_db is not None
+    _state_chip = _c(_OK, "(active)") if _connected else _c(_WARN, "(not connected)")
     if _device_id_now:
         if _device_os:
             _device_val = (
                 f"{_c(_BOLD, _device_name)}  {_c(_DIM, '(' + _device_os + ')')}  "
-                f"{_c(_OK, '(active)')}"
+                f"{_state_chip}"
             )
         else:
-            _device_val = f"{_c(_BOLD, _device_name)}  {_c(_OK, '(active)')}"
+            _device_val = f"{_c(_BOLD, _device_name)}  {_state_chip}"
     else:
         _device_val = _c(_DIM, "(none)")
     _ctx_rows_serve = [
         ("Paired to", _paired_val),
         ("Device",    _device_val),
         ("Local API", _c(_BOLD, f"http://localhost:{port}")),
-        ("Heartbeat", _c(_BOLD, f"{HEARTBEAT_INTERVAL_SEC}s cadence")),
+        # ⛔ A CADENCE IS NOT A HEARTBEAT. This row printed a constant, and the
+        # task that does the beating is only created when the client exists —
+        # so on a disconnected boot it advertised a rhythm nothing was keeping.
+        ("Heartbeat",
+         _c(_BOLD, f"{HEARTBEAT_INTERVAL_SEC}s cadence") if _connected
+         else _c(_WARN, "not beating — no connection")),
     ]
     _bat_serve = _battery_state()
     if _bat_serve:
@@ -67678,7 +68016,28 @@ async def run_server(port=8000):
     # SystemExit(3) on a False probe — a speculative gate in the critical
     # startup path that could keep the API from ever binding.)
     print()
-    print(f"  {_c(_BOLD + _ACCENT, '  Listening for pipeline jobs.')}  {_c(_DIM, 'Keep this terminal open.')}")
+    # ⛔⛔ THE FOOTER ANNOUNCED A LISTENER THAT WAS NEVER STARTED. The job
+    # listener is created only when the Firestore client exists; on a
+    # disconnected boot this line still said the machine was listening, and
+    # still told the owner to keep the terminal open — advice that was about to
+    # be made meaningless by the recovery watcher exiting the process.
+    # ⭐ IT STILL SAYS "KEEP THIS TERMINAL OPEN" WHEN CONNECTED, because then it
+    # is true and it is the one instruction a foreground serve depends on.
+    if _connected:
+        print(f"  {_c(_BOLD + _ACCENT, '  Listening for pipeline jobs.')}  {_c(_DIM, 'Keep this terminal open.')}")
+    else:
+        # ⛔⛔ "KEEP THIS TERMINAL OPEN" WAS DROPPED HERE AND CROSS-VERIFY CAUGHT
+        # IT. This is the exact boot where the instruction matters MOST: the
+        # relink watcher that recovers a reset machine lives inside THIS
+        # process, so closing the window is the one action that guarantees the
+        # computer never comes back. Removing the line because the machine is
+        # not listening confused two different reasons to stay open.
+        # ⛔ AND "Jobs will not arrive until this is resolved" PROMISED A
+        # RESOLUTION NOBODY IS BRINGING. On a machine with no supervisor,
+        # nothing here resolves anything on its own — the person does, in the
+        # app. The line now says who has to act.
+        print(f"  {_c(_WARN, '  Not listening yet — no connection to Super Research.')}")
+        print(f"  {_c(_DIM, '  Keep this terminal open — this window is what picks the connection back up.')}")
     print()
     print(f"  {_c(_DIM, 'Stop:')}  {_c(_BOLD, 'Ctrl+C')}")
 
@@ -67697,12 +68056,28 @@ async def run_server(port=8000):
         )
     except (asyncio.TimeoutError, Exception):
         _currently_supervised = False
-    if not (_device_id_now and _paired_uid_now):
+    # ⛔⛔ THE GATE USED TO BE `not (_device_id_now and _paired_uid_now)`, AND
+    # CROSS-VERIFY CAUGHT THAT IT EXCLUDES THE INCIDENT MACHINE. On the computer
+    # this whole wave came from, BOTH of those are on disk — only the token was
+    # revoked — so the remedy the wave added was gated behind a condition that
+    # machine cannot satisfy. It fell through to the `elif` and was offered
+    # `--resurrect`: the one suggestion the owner had already refused, on a boot
+    # that could not work at all.
+    # ⛔ AND THE NEXT-ACTION BELOW HARDCODED `--pair`, a TENTH advice site the
+    # wave's own sweep of eight missed, printed on the busiest surface there is.
+    # ⭐ ASKING THE CLASSIFIER FIXES BOTH AT ONCE: it is the thing that knows
+    # whether pairing is a repair or a demolition, and the remedy's own first
+    # line is the action.
+    _cred_now = credential_state_now()
+    if _cred_now != CRED_HEALTHY:
         print()
-        print(f"  {_c(_WARN, '⚠')}  Not paired yet — jobs will be ignored until this machine is paired.")
-        _render_next_actions([
-            ("python research.py --pair", "pair this machine to your account"),
-        ])
+        for _line in credential_remedy(_cred_now, in_serve=True):
+            print(f"  {_c(_WARN, '⚠')}  {_line}")
+        print(f"  {_c(_DIM, '     Jobs will be ignored until this is resolved.')}")
+        if _cred_now in (CRED_NEVER_PAIRED, CRED_ORPHANED):
+            _render_next_actions([
+                ("python research.py --pair", "pair this machine to your account"),
+            ])
     elif not _currently_supervised:
         _render_next_actions([
             ("python research.py --resurrect", "enable On Startup (auto-start in background)"),
@@ -70407,7 +70782,18 @@ async def _continue_pair_stages_2_to_5(
                 ok, pid, info, killed_serves = await asyncio.to_thread(_arm_supervisor_quiet)
             if ok:
                 supervised_armed = True
-                _write_supervised_flag(True)
+                # ⛔⛔ THE RETURN IS CAPTURED, AND THE FIRST VERSION OF 7.9-0 DID
+                # NOT CAPTURE IT HERE. A regex converted the four other tick
+                # sites as call-and-guard pairs and this one as a guard only, so
+                # `if _synced:` forty lines down read a name that was never
+                # bound on this branch. That is an UnboundLocalError on the
+                # DEFAULT `--pair` path (On Startup defaults to yes), and
+                # `cmd_pair_v2`'s finally then treats the raise as an
+                # interrupted pair and runs `_cleanup_partial_pair` — deleting
+                # the device doc server-side, revoking the synth user and wiping
+                # the local config. The pairing flow would have destroyed the
+                # machine it had just successfully created.
+                _synced = _write_supervised_flag(True)
                 _step4_plat = _supervisor_platform()
                 if _step4_plat == "Darwin":
                     print(f"  {_c(_OK, '✓')}  LaunchAgent installed ({_SUPERVISOR_PLIST_LABEL})")
@@ -70425,7 +70811,11 @@ async def _continue_pair_stages_2_to_5(
                 else:
                     print(f"  {_c(_WARN, '⚠')}  {info or 'Backend did not appear within 5s'}")
                     print(f"  {_c(_DIM, '     The scheduled task still fires at next login as a fallback.')}")
-                print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
+                if _synced:
+                    print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
+                else:
+                    print(f"  {_c(_WARN, '⚠')}  Could not tell the app just now.")
+                    print(f"  {_c(_DIM, '     This computer is set correctly. The app will keep showing the old setting until this is run again.')}")
             else:
                 if info == "unsupported":
                     print(f"  {_c(_WARN, '⚠')}  Only Windows / macOS / Linux desktop is supported.")
@@ -70443,7 +70833,11 @@ async def _continue_pair_stages_2_to_5(
             print()
             async with _async_spinner_ctx("Enforcing unsupervised mode"):
                 task_info, killed_procs = await asyncio.to_thread(_disarm_supervisor_quiet)
-            _write_supervised_flag(False)
+            # ⛔ THE FIFTH SITE, and the one where the claim mattered most:
+            # this is the pair flow's own "I will run serve myself" branch, so
+            # it is exactly the machine that has no supervisor to re-write the
+            # flag later. The tick below printed whether or not the app heard.
+            _synced = _write_supervised_flag(False)
             if task_info == "removed":
                 print(f"  {_c(_OK, '✓')}  Removed leftover {_supervisor_artifact_label()} ({_SUPERVISOR_TASK_NAME})")
             elif task_info in ("missing", "no-task"):
@@ -72779,9 +73173,18 @@ def run_daemon_loop(port: int = 8000):
                         f"non-zero exits in <{CRASH_WINDOW_SEC}s. NOT wiping the "
                         f"keystore (a crash is not a revoke). Inspect "
                         f"backend.err.log for the real cause (port conflict / dep "
-                        f"mismatch / corrupt profile). If the refresh token is "
-                        f"genuinely revoked, run `{_PROG} --unpair && "
-                        f"{_PROG} --pair`. Backing off, will keep retrying.",
+                        # ⛔⛔ THIS USED TO PRESCRIBE `--unpair && --pair`,
+                        # which is the most destructive advice this program has
+                        # ever printed: unpair deletes the device server-side
+                        # AND removes the local config, and pair then mints a
+                        # different machine. The line's own first half is
+                        # careful not to wipe the keystore on a crash, and then
+                        # it handed the owner a command that wipes far more.
+                        # ⭐ A crash loop is not a credential problem at all —
+                        # the sentence above already says so — so it now points
+                        # at the log that holds the real cause and stops there.
+                        f"mismatch / corrupt profile). Backing off, will keep "
+                        f"retrying.",
                         "ERROR",
                     )
                     crash_window = []  # diagnose once per loop, not every cycle
@@ -72848,18 +73251,30 @@ def _write_supervised_flag(enabled: bool):
     client init needed, so callers (--resurrect / --retire / --pair
     Stage 5) don't pay the ~10-30s init_firebase wall-clock on Windows.
 
-    Best-effort: if no deviceId on disk or the PATCH fails, returns
-    silently (the Scheduled Task / launchd / systemd unit is the actual
-    source of truth for supervisor state, and the heartbeat will re-
-    write supervised on next --serve boot)."""
+    Best-effort: if no deviceId on disk or the PATCH fails, the local unit is
+    still the source of truth for supervisor state and the heartbeat re-writes
+    the flag on the next --serve boot.
+
+    ⛔⛔ IT USED TO RETURN NOTHING, AND FIVE CALLERS PRINTED "✓ Synced to the
+    Super Research app" UNDERNEATH IT REGARDLESS. Both failure paths here are
+    real and reachable — a machine with no device id, and a REST patch that was
+    refused — and on both of them the person watching --resurrect or --retire
+    was told the app had been updated when it had not. The outcome was known at
+    this line and thrown away one frame later.
+
+    ⭐ RETURNS WHETHER THE APP ACTUALLY HEARD. Existing callers that ignore it
+    are unaffected; the ones that make a claim about it now have something to
+    check. "Best-effort" describes what this does about a failure, not what it
+    is allowed to say about one."""
     device_id = load_device_id()
     if not device_id:
         log("Device not paired — skipping Firestore flag update.", "WARN")
-        return
+        return False
     if _pair_patch_device(device_id, {"supervised": bool(enabled)}):
         log(f"Supervised flag = {enabled} written to device doc.")
-    else:
-        log("Could not update supervised flag (REST patch failed)", "WARN")
+        return True
+    log("Could not update supervised flag (REST patch failed)", "WARN")
+    return False
 
 
 def _apply_supervisor_respawn_policy() -> "tuple[bool, str]":
@@ -73277,9 +73692,19 @@ def run_resurrect():
 
         # ── [1/4] Pre-flight ──
         _setup_step(1, 4, "Pre-flight")
+        # ⛔ "Device not paired yet" IS FALSE WHENEVER A DEVICE ID IS ON DISK,
+        # and `clear_paired_uid` exists precisely to produce that state — it
+        # drops the owner link and keeps the id on purpose. Both branches read
+        # the device id into a local two lines up and then ignored it.
+        # ⭐ THE COMMAND STAYS `--pair` HERE, and that is not an oversight: an
+        # orphaned machine has no owner to re-approve it and this program has no
+        # relink command (the one `clear_paired_uid`'s docstring names does not
+        # exist), so pairing really is the only door. Only the SENTENCE was
+        # wrong, and the shared remedy is what makes it match the state.
         if not paired_uid:
-            print(f"  {_c(_WARN, '⚠')} Device not paired yet.")
-            print(f"  {_c(_DIM, '     Run')} {_c(_BOLD, f'{_PROG} --pair')} {_c(_DIM, 'first, then retry --resurrect.')}")
+            for _line in credential_remedy(credential_state_now()):
+                print(f"  {_c(_WARN, '⚠')} {_line}")
+            print(f"  {_c(_DIM, '     Then retry')} {_c(_BOLD, f'{_PROG} --resurrect')}")
             return
         print(f"  {_c(_OK, '✓')}  Pairing complete on this machine")
         _seed_env_file_if_missing()
@@ -73319,8 +73744,16 @@ def run_resurrect():
 
         # ── [3/4] Firestore sync ──
         _setup_step(3, 4, "Firestore sync")
-        _write_supervised_flag(True)
-        print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
+        # ⛔ THE TICK USED TO PRINT UNCONDITIONALLY. Both of the helper's
+        # failure paths are reachable — no device id on disk, and a patch
+        # the rules refused — and on either one this line told the person
+        # the app had been updated when it had not.
+        _synced = _write_supervised_flag(True)
+        if _synced:
+            print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
+        else:
+            print(f"  {_c(_WARN, '⚠')}  Could not tell the app just now.")
+            print(f"  {_c(_DIM, '     This computer is set correctly. The app will keep showing the old setting until this is run again.')}")
 
         # ── [4/4] Handoff — verify daemon-loop is live + API responds ──
         # Asymmetric with Windows: `_arm_supervisor_<plat>` already spawned
@@ -73429,9 +73862,19 @@ def run_resurrect():
 
     # ── [1/4] Pre-flight ──
     _setup_step(1, 4, "Pre-flight")
+    # ⛔ "Device not paired yet" IS FALSE WHENEVER A DEVICE ID IS ON DISK,
+    # and `clear_paired_uid` exists precisely to produce that state — it
+    # drops the owner link and keeps the id on purpose. Both branches read
+    # the device id into a local two lines up and then ignored it.
+    # ⭐ THE COMMAND STAYS `--pair` HERE, and that is not an oversight: an
+    # orphaned machine has no owner to re-approve it and this program has no
+    # relink command (the one `clear_paired_uid`'s docstring names does not
+    # exist), so pairing really is the only door. Only the SENTENCE was
+    # wrong, and the shared remedy is what makes it match the state.
     if not paired_uid:
-        print(f"  {_c(_WARN, '⚠')} Device not paired yet.")
-        print(f"  {_c(_DIM, '     Run')} {_c(_BOLD, 'python research.py --pair')} {_c(_DIM, 'first, then retry --resurrect.')}")
+        for _line in credential_remedy(credential_state_now()):
+            print(f"  {_c(_WARN, '⚠')} {_line}")
+        print(f"  {_c(_DIM, '     Then retry')} {_c(_BOLD, f'{_PROG} --resurrect')}")
         return
     print(f"  {_c(_OK, '✓')}  Pairing complete on this machine")
 
@@ -73476,8 +73919,16 @@ def run_resurrect():
 
     # ── [3/4] Firestore sync ──
     _setup_step(3, 4, "Firestore sync")
-    _write_supervised_flag(True)  # uses _pair_patch_device internally — fast
-    print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
+    # ⛔ THE TICK USED TO PRINT UNCONDITIONALLY. Both of the helper's
+    # failure paths are reachable — no device id on disk, and a patch
+    # the rules refused — and on either one this line told the person
+    # the app had been updated when it had not.
+    _synced = _write_supervised_flag(True)  # uses _pair_patch_device internally — fast
+    if _synced:
+        print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
+    else:
+        print(f"  {_c(_WARN, '⚠')}  Could not tell the app just now.")
+        print(f"  {_c(_DIM, '     This computer is set correctly. The app will keep showing the old setting until this is run again.')}")
 
     # ── [4/4] Handoff — activate the supervisor NOW, not at next logon ──
     # Without this, --resurrect only schedules the task and leaves the
@@ -73774,8 +74225,16 @@ def run_retire():
 
         # ── [3/3] Firestore sync ──
         _setup_step(3, 3, "Firestore sync")
-        _write_supervised_flag(False)
-        print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
+        # ⛔ THE TICK USED TO PRINT UNCONDITIONALLY. Both of the helper's
+        # failure paths are reachable — no device id on disk, and a patch
+        # the rules refused — and on either one this line told the person
+        # the app had been updated when it had not.
+        _synced = _write_supervised_flag(False)
+        if _synced:
+            print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
+        else:
+            print(f"  {_c(_WARN, '⚠')}  Could not tell the app just now.")
+            print(f"  {_c(_DIM, '     This computer is set correctly. The app will keep showing the old setting until this is run again.')}")
 
         # ── Final flourish + next actions (matches Windows path) ──
         print()
@@ -73932,8 +74391,16 @@ def run_retire():
 
     # ── [3/3] Firestore sync + verification ──
     _setup_step(3, 3, "Firestore sync")
-    _write_supervised_flag(False)
-    print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
+    # ⛔ THE TICK USED TO PRINT UNCONDITIONALLY. Both of the helper's
+    # failure paths are reachable — no device id on disk, and a patch
+    # the rules refused — and on either one this line told the person
+    # the app had been updated when it had not.
+    _synced = _write_supervised_flag(False)
+    if _synced:
+        print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
+    else:
+        print(f"  {_c(_WARN, '⚠')}  Could not tell the app just now.")
+        print(f"  {_c(_DIM, '     This computer is set correctly. The app will keep showing the old setting until this is run again.')}")
 
     stragglers = [(pid, role) for pid, _cmd, role in last_survivors if role in ("daemon-loop", "serve")]
     print()
@@ -74014,8 +74481,34 @@ def run_visibility(value: str, ignored_topic: "str | None" = None) -> int:
     # otherwise a flaky moment reports the machine as hidden while it is listed,
     # which is the one direction of that lie that matters.
     if not meta:
-        print(f"  {_c(_WARN, '⚠')}  Could not read this computer's settings just now.")
-        print(f"  {_c(_DIM, '     Check the network, or open the app and look under Devices.')}")
+        # ⛔⛔ THIS ONE BRANCH SERVED BOTH REQUESTS, and that is two defects in
+        # three lines. The owner ran `--visibility public` — a WRITE — and was
+        # handed read-only copy that never said the setting had not been
+        # changed, so the only honest reading of the output was "it might have
+        # worked". And it blamed the network when the real cause was a revoked
+        # session that this program had already recorded: the reset wiped the
+        # keystore, the wipe logged itself once, and every later run went quiet
+        # because the token function returns None with no log once the keystore
+        # is already empty. Measured on the owner's machine, 2026-09-06.
+        # ⭐ THE READ IS STILL AMBIGUOUS AND THAT IS NOT FIXED HERE — the fetch
+        # returns {} for six different reasons. What changes is that the ONE
+        # reason we can name from disk, without a network call, is now named.
+        state = credential_state_now()
+        remedy = credential_remedy(state)
+        if remedy:
+            for line in remedy:
+                print(f"  {_c(_WARN, '⚠')}  {line}")
+        else:
+            print(f"  {_c(_WARN, '⚠')}  Could not read this computer's settings just now.")
+            print(f"  {_c(_DIM, '     Check the network, or open the app and look under Devices.')}")
+        # ⛔ THE ASK DECIDES THE LAST LINE. A person who typed a value asked for
+        # a change and is owed a verdict on it; a person who typed nothing asked
+        # a question and has already been answered above. Saying "nothing was
+        # changed" to someone who changed nothing is noise, and saying nothing
+        # to someone who tried to is the defect.
+        if value != _VISIBILITY_SHOW:
+            print(f"  {_c(_DIM, '     Nothing was changed — this computer is still')} "
+                  f"{_c(_BOLD, 'set the way it was')}{_c(_DIM, '.')}")
         print()
         return 1
     current = "public" if meta.get("visibility") == "public" else "private"
@@ -74745,8 +75238,15 @@ def run_doctor():
     if paired_uid and device_id:
         _ok("Pair state", f"deviceId={device_id}")
     else:
-        _fail("Not paired", "research_config.json missing or incomplete — run --pair")
-        manual_actions.append("Run `python research.py --pair`")
+        # ⛔ "Not paired" COLLAPSES TWO DIFFERENT MACHINES. A computer with no
+        # device id has never paired; a computer with an id but no owner link
+        # was deliberately left that way by `clear_paired_uid`, which keeps the
+        # id so a relink can resume. Both end up here and were told the same
+        # sentence. The command happens to be right for both — an orphaned
+        # machine has no owner to re-approve it — but the sentence was not, and
+        # a reader who believes "not paired" goes looking for the wrong problem.
+        _fail("Not paired", "research_config.json missing or incomplete")
+        manual_actions.extend(credential_remedy(credential_state_now()))
 
     with _sync_spinner_ctx("Checking Firestore connectivity"):
         _fb_ok = init_firebase()
@@ -74821,7 +75321,23 @@ def run_doctor():
             f"nslookup {FIRESTORE_HOST}   (then check VPN / proxy / firewall / DNS)"])
     else:
         _fail("Firestore init failed", "OS keystore empty or refresh token revoked")
-        manual_actions.append("Run `python research.py --pair`")
+        # ⛔⛔ THIS APPENDED "Run `python research.py --pair`" UNCONDITIONALLY,
+        # seventy-five lines after this same function read the device id into a
+        # local and printed it as the pair state. It had the fact that makes the
+        # advice wrong, in hand, and did not consult it.
+        # ⭐ The _fail LINE IS UNCHANGED — three other tests slice this source on
+        # it, and the classification it reports is accurate. What changes is only
+        # the action, which now comes from the one place that knows.
+        # ⛔ NEVER AN EMPTY ACTION LIST. This branch means the client failed to
+        # come up, and `credential_remedy` returns nothing for a machine whose
+        # credentials look fine — so a genuine init failure with an intact
+        # keystore would have printed a fault with no remedy at all, where the
+        # old hardcoded line always gave the reader somewhere to go.
+        _cred_actions = credential_remedy(credential_state_now())
+        manual_actions.extend(_cred_actions or [
+            "Credentials look intact — see the log above for why Firestore "
+            f"could not start, then run `{_PROG} --serve` again.",
+        ])
     print()
 
     # ── [2] Browser dependencies (Playwright + Chromium) ──

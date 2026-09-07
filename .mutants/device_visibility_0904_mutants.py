@@ -72,7 +72,13 @@ MINE = ("unpaired_machine or failed_read or reports_public or reports_private or
         "unreadable_stdin or WRITTEN_before_it_is_confirmed or "
         "lost_write_is_reported or names_the_command_that_changes or "
         "call_site_states_its_default or prompt_kept_its_original_default or "
-        "yn_hint_in_the_file")
+        "yn_hint_in_the_file or "
+        # ⛔ ADDED 7.9-0. The empty-read branch gained five guards and the
+        # filter's own coverage check flagged every one of them before this
+        # line existed — which is the check working. A mutant that only these
+        # can kill would otherwise have been reported as a SURVIVOR, and a
+        # survivor and a deselected guard read identically.
+        "revoked_session or failed_SET or failed_SHOW or unprovable_failure")
 
 # ⛔⛔ EXACT COVERAGE, NOT A COUNT. A filter that silently deselects the guard
 # written to kill a mutant reports that mutant as a SURVIVOR, which reads
@@ -99,8 +105,13 @@ PATCH = ('        saved = _pair_patch_device(device_id_for_progress, {\n'
          '            "visibility": "public" if discoverable else "private",\n'
          '        })')
 #: The read-failure refusal in `run_visibility`.
-READ_GUARD = ('    if not meta:\n'
-              '        print(f"  {_c(_WARN, \'⚠\')}  Could not read this computer\'s settings just now.")')
+# ⛔ RE-ANCHORED 2026-09-06 (7.9-0). It used to carry the first printed line
+# with it, and 7.9-0 replaced that line — the empty-read branch now names a
+# revoked session instead of blaming the network, and says whether a requested
+# change was applied. The GUARD ITSELF is unchanged and is what this mutant is
+# about, so the anchor shrinks to the guard and stops carrying copy that is free
+# to move. A stale anchor measures NOTHING, which is why the sweep runs first.
+READ_GUARD = '    if not meta:'
 #: How the current state is derived from the document.
 CURRENT = '    current = "public" if meta.get("visibility") == "public" else "private"'
 #: The manual value check in `main`.
@@ -183,9 +194,7 @@ MUTANTS = [
      "blip and an expired token as well as from a document with no field, so a "
      "machine that IS listed is reported hidden — and the person believes they "
      "turned discovery off",
-     [(READ_GUARD,
-       '    if False:\n'
-       '        print(f"  {_c(_WARN, \'⚠\')}  Could not read this computer\'s settings just now.")')]),
+     [(READ_GUARD, '    if False:')]),
     ("V2", "under",
      "⛔⛔ `!= \"private\"` instead of `== \"public\"`, so a machine that was never "
      "asked — every machine paired before this wave, since nothing backfills the "

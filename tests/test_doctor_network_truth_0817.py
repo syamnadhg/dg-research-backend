@@ -151,13 +151,40 @@ def test_a_network_failure_suggests_a_network_check_not_a_re_pair():
         assert cause in net, f"{cause} not named"
 
 
-def test_a_genuine_revoke_still_says_re_pair():
-    """⛔ OVER-CORRECTION GUARD. The revoked case is real and its advice was
-    always right — widening the network branch over it would strand the owner
-    who actually did trigger a reset."""
+def test_a_genuine_revoke_says_something_and_it_is_not_pair():
+    """⛔⛔ THIS TEST USED TO ASSERT THE EXACT OPPOSITE, and its docstring said
+    "the revoked case is real and its advice was always right". The first half
+    is still true. The second half was refuted in production on 2026-09-06.
+
+    The owner reset their own pair code — the supported, documented way to boot
+    a sharer off a machine. That revokes the machine's device token by design.
+    The machine then printed this branch, which told them to run `--pair`, and
+    `--pair` does not repair a machine: the server mints a NEW random deviceId
+    at initiate-pair and nothing reuses the id on disk, so the owner would have
+    ended up with a different computer, under a different id, with no
+    `visibility` field — and absent reads as private, so it would also have
+    silently dropped off the public list it was on.
+
+    ⭐ THE ORIGINAL GUARD'S REAL INTENT SURVIVES INTACT and is the first two
+    assertions: the revoked case must still be reported, and must still say
+    something actionable. Only the specific remedy it hardcoded was wrong. That
+    remedy now comes from `credential_remedy`, which is the single place that
+    knows the difference between a machine with nothing to lose and a machine
+    that would lose its identity — see tests/test_credential_state_790.py.
+
+    ⛔ Comments are stripped by `_code_only`, so the `--pair` inside this
+    branch's own explanatory comment is not what this assertion reads. That
+    distinction has bitten this codebase before."""
     revoked = _revoked_branch()
-    assert "OS keystore empty or refresh token revoked" in revoked
-    assert "--pair" in revoked
+    assert "OS keystore empty or refresh token revoked" in revoked, (
+        "the revoked case must still be reported"
+    )
+    assert "credential_remedy" in revoked, (
+        "the branch must delegate to the one place that knows the state"
+    )
+    assert "--pair" not in revoked, (
+        "hardcoding --pair here is what nearly cost the owner their machine"
+    )
 
 
 def test_the_branches_cannot_both_fire():

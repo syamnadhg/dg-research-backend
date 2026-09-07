@@ -208,11 +208,25 @@ rules enforce the boundary via the BE's custom claim.
 code, revokes the BE's refresh token, clears `sharedWith=[]`, and
 emails you the new code with a 15-min TTL. The BE's recovery watcher
 notices the revoke, polls the same pending subdoc, picks up the new
-customToken once you enter the new code in the FE, and exits cleanly
-so the supervisor respawns with a fresh keystore + listener
-subscriptions. **No `--pair` on the PC needed** — the device is back
-online within ~5s of you entering the new code. Miss the 15-min
-window and you'll need to re-run `--pair` for a fresh device record.
+customToken once you enter the new code in the FE, and then replaces
+itself so a fresh keystore and fresh listener subscriptions come up
+together — a clean exit under a supervisor, a re-exec without one.
+**No `--pair` on the PC needed.**
+
+> ⛔ **THE WATCHER ONLY EXISTS INSIDE A RUNNING `--serve`.** This
+> paragraph used to promise the device is back "within ~5s of you
+> entering the new code", with no mention of that. On a machine that is
+> switched off, or that runs `--serve` by hand and is not running it
+> right now, nothing recovers at all: entering the code does nothing
+> visible, the computer silently drops off the public device list, and
+> waiting does not help because there is no timer involved — it is
+> waiting for a process. Start `--serve` and recovery happens in about a
+> second. Measured on an owner's machine, 2026-09-06, after several
+> hours of it appearing to have crashed.
+
+Miss the 15-min window and the device record itself expires; only then
+is `--pair` the answer, and it creates a NEW computer rather than
+recovering this one.
 
 What Reset does to **in-flight runs** (multi-worker safe): the FE
 route writes a `hard_reset` command to `devices/{id}/commands/`
