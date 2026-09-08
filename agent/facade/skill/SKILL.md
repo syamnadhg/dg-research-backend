@@ -22,7 +22,8 @@ platforms: [linux, macos, windows]
 You operate the user's **own** Super Research account from chat through a local
 bridge: **run, track, stop, and resume** research, manage **Research Computers**
 (list, switch, add by access code, remove, find a public one and ask its owner for
-access), and fetch briefs / podcasts / links.
+access — and for a computer they OWN, answer the people asking for it and set
+whether strangers can find it), and fetch briefs / podcasts / links.
 Every run also shows up in their web app as a normal chat. You drive everything
 with one client — it prints chat-ready text, so relay it **verbatim** (don't
 reflow it into a paragraph, re-introduce command syntax, or tack on extra steps):
@@ -92,7 +93,9 @@ nothing to mean the most-recent / active run.
   one, run `sr.py device-add <that code>` immediately. The other device verbs are
   just as direct: "switch to / run on X" → `sr.py device-use "<name>"`; "remove /
   unlink X" → `sr.py device-remove "<name>"` (confirm first); "which devices" →
-  `sr.py devices`. (The one command you MAY show the user: if they're stuck adding a
+  `sr.py devices` (its rows also say `public` or `private` for a computer the user
+  OWNS); "who wants to use my computer" → `sr.py device-requests`; "say yes to X" →
+  `sr.py device-approve "<person>"` (confirm first). (The one command you MAY show the user: if they're stuck adding a
   Research Computer, tell them to send `/sr device-add <their code>` in a single message.)
 - **Reply in short, readable lines** — never one long run-on paragraph. Put each
   step, link, or command on its own line so it's easy to scan.
@@ -131,9 +134,9 @@ run `sr.py status-account`, then branch on what it reports:
 - **Signed in** → greet them by their account email, tell them what they can do in
   plain words (research a topic · check / stop / resume a run · their researches +
   podcasts & links by name · devices · version / update), and invite them to just
-  name a topic. (Approving or refusing somebody, offering a computer publicly,
-  revoking sharers, and resets stay owner-only in the web app — but ASKING to use
-  somebody else's public computer is something you can do from here.)
+  name a topic. (For a computer they OWN they can also answer the people asking
+  for it and set whether strangers can find it at all. Revoking a sharer and
+  resetting a pair code stay in the web app.)
 
 ---
 
@@ -147,8 +150,9 @@ missing thing, or asks for the confirmation first. Pass the message exactly as
 the user wrote it, never your paraphrase (escape any double quotes inside it).
 If `do` asked a confirm question ("Say yes and I'll …") and the user confirms,
 run the REAL command it described — stop/logout/device-remove/device-ask/
-update/install/research, with the run or device it named — a "no" just
-cancels. Never send the bare "yes" back into `do`.
+device-approve/device-deny/device-visibility/update/install/research, with the
+run, device or person it named — a "no" just cancels. Never send the bare "yes"
+back into `do`.
 
 | The user says (examples) | You run |
 |---|---|
@@ -181,17 +185,27 @@ cancels. Never send the bare "yes" back into `do`.
 | "just the one about X", "only the first two", "not all of them" | the plan numbers every run — pass those numbers back with `--runs`, comma-separated: `sr.py send-logs --runs 1,3` (and again on `--confirm`). `--runs 0` is the agent's own log, `--runs all` is every run listed. A name works too. Do **not** guess a number the plan did not print |
 | "send the agent's log too", "include the bridge log", "the log from this chat" | add `--agent-log` to the **bare** command **and to `--confirm`** — or say `--runs 0`, which is the same thing and is the number the plan prints for it. It uploads nothing on either; it makes the plan name it, and makes the client hand you `sr.py send-logs --status <CODE> --agent-log` for once the bundle lands. **Not** owner-gated. See **Sending logs to support** |
 | "are there any public computers?", "show me computers I could ask to use", "I don't have a computer of my own" | `sr.py devices-public` (only machines whose owners offer them; the id on each row is what the next command takes — public names collide, an unnamed one reads as "Research computer" for everybody). A row marked "can't take anyone else" is full: asking would be refused |
-| "make my computer public", "is my computer public?", "who wants to use my machine?" | offering your own machine, and answering people who ask for it, are done in the web app — relay the client's line and do not substitute the public list |
+| "make my computer public", "let people find my mac", "offer my machine to other people" | **confirm** — relay the client's question verbatim (strangers would see the name the computer reports, which on an unrenamed machine is often its OWNER'S own name; the user still approves each person) — then `sr.py device-visibility public` (add `"<name>"` only if they named a computer; with one machine the user OWNS the client picks it, with several it asks which — a shared machine is never picked and never offered, because its visibility is not theirs to set) |
+| "make my computer private", "hide my mac", "stop offering my machine", "take it off the public list" | `sr.py device-visibility private` — **no confirmation**: it only takes a computer OFF a list |
+| "is my computer public?", "which of my computers are findable?" | `sr.py devices` — the row for a computer the user OWNS says `findable` or `hidden`. Do NOT change anything to answer a question |
+| "who wants to use my machine?", "any requests for my mac?", "what am I waiting on?" | `sr.py device-requests` — it prints BOTH halves: people waiting on the user's OWN computers first, then what the user is waiting on from other people. Never add the two together |
+| "approve that request", "say yes to Sam", "let them use my computer" | **confirm** — relay the client's question verbatim (anyone the user says yes to can run research on that computer, the same as somebody given a pair code) — then `sr.py device-approve "<person>"`, or with no name when only one person is waiting. Report what the reply says: they CAN USE it, never "you just added them" — an approval of somebody who already got in changes nothing on the machine |
+| "deny that request", "say no to Sam", "turn them down" | **confirm** — relay the client's question verbatim (they are told, and cannot ask again for a week; the pair code is still a way back) — then `sr.py device-deny "<person>"` |
 | "ask for the Studio PC", "request access to that Mac", "ask its owner if I can use it" | **confirm** — relay the client's question verbatim (the research would run on THEIR computer using THEIR AI accounts, that computer can read this account's research, and they see the user's name, or email if no name is set; a "no" blocks asking again for a week) — then `sr.py device-ask "<name or id>"`. Prefer the **id** from the list: public names collide |
-| "what am I waiting on?", "did they answer?", "my pending requests" | `sr.py device-requests` — ONLY unanswered ones appear. A request that has been answered leaves the list **either way**; never read a missing row as a refusal. A **yes** shows up as the computer appearing in `sr.py devices`; for a **no**, ask for that computer again and the reply says so |
+| "did they answer?", "my pending requests" | `sr.py device-requests` — of the ones the USER asked for, ONLY unanswered ones appear. A request that has been answered leaves that half **either way**; never read a missing row as a refusal. A **yes** shows up as the computer appearing in `sr.py devices`; for a **no**, ask for that computer again and the reply says so. The owner half above it drops a row for different reasons — a machine handed on or deleted takes its queue with it |
 | "cancel my request", "withdraw that request" | nothing withdraws a request — relay the client's line. It stays with the owner until they answer, or lapses after a week |
 | just `/sr`, "what can you do?", "help" | `sr.py status-account` → welcome (see **A bare `/sr`**) |
 
 **Safe defaults:** unnamed run → the **most-recent active** run. **Confirm before
-`stop`, `logout`, `device-remove`, `device-ask`, and `update`** (a quick "Stop the
-EV run?" is enough); everything else runs on a clear request. `device-ask` is on
-that list even though it destroys nothing: it is the only command here that tells
-somebody else who the user is, and a refusal blocks asking again for a week. **Always answer "what phase / is
+`stop`, `logout`, `device-remove`, `device-ask`, `device-approve`, `device-deny`,
+`device-visibility public`, and `update`** (a quick "Stop the EV run?" is enough);
+everything else runs on a clear request. The four device ones destroy nothing and
+are on the list anyway, because each tells somebody something about somebody else:
+`device-ask` hands the owner the user's name; `device-approve` lets a stranger run
+research on the user's computer; `device-deny` stops that person asking again for
+a week; and `device-visibility public` publishes the computer's name to everyone
+signed in. **`device-visibility private` needs no confirmation** — it only takes a
+computer off a list. **Always answer "what phase / is
 X skipped / how's it going" from a FRESH `sr.py status`** (or `updates`) — never
 from memory or an earlier watchdog message (a run keeps advancing and the user can
 toggle phases in the web app). **Sign-in / connection state the same: ONLY from a
@@ -316,6 +330,15 @@ ask "which platform". First pair = they own it (auto-selects, so research can st
 right away); pairing someone else's = shared with them. Switch with
 `device-use "<name>"`, remove with `device-remove "<name>"` (confirm first — owner
 unlinks but the device keeps running + re-pairs with its code; sharer just leaves).
+
+**Owner-only, for a computer the user owns.** `device-visibility public|private`
+sets whether strangers can FIND it — discovery, not access: a findable computer is
+one people can see listed and ASK for, and the owner still approves each of them
+by hand. `device-requests` shows who is asking; `device-approve` / `device-deny`
+answer them. ⛔ `devices-public` is the OPPOSITE direction — other people's
+machines, the ones the user could ask to use. One letter apart, and picking the
+wrong one either shows a list nobody wanted or publishes a computer nobody meant
+to publish, so read the intent before choosing between them.
 
 If the user wants to add a Research Computer but hasn't given a code, ask them to **paste the
 access code** shown on the computer running Super Research (8 chars; accept it with
@@ -450,8 +473,12 @@ it down too: `cronjob(action="list")` → the `sr-stream…` job →
 
 - **Confirm before** `stop` (ends a real run — keeps partial results + the chat),
   `logout` (signs the account out), `device-remove` (unlinks a device — nothing is
-  deleted; an owner's device re-pairs with its code), and `update` (briefly
-  restarts the chat bridge). There is no destructive "delete the chat" action here.
+  deleted; an owner's device re-pairs with its code), `device-ask`, `device-approve`,
+  `device-deny`, `device-visibility public`, and `update` (briefly restarts the chat
+  bridge). There is no destructive "delete the chat" action here — the four device
+  ones are listed because each says something about somebody else, not because
+  anything is destroyed. `device-visibility private` is not on the list: it only
+  takes a computer off a list.
 - **`send-logs` confirms differently and more strictly**: the bare command prints
   what would leave the user's computer and sends nothing, and `--confirm` is the
   only thing that sends. Relay the plan and wait for a real "yes" — the computer
@@ -460,10 +487,13 @@ it down too: `cronjob(action="list")` → the `sr-stream…` job →
 - Never ask for or handle passwords / tokens — sign-in happens on the user's own
   device via the `/sr login` link; any in-AI sign-in or human check is done by the
   user on the device, never by you.
-- You drive the user's own account only. The one thing that reaches past it is the
-  public-computer list: it names machines other people chose to offer, and asking
-  for one tells that owner the user's name — or their email, if no name is set.
-  Never ask on the
-  user's behalf without a real "yes" to the client's own question first — the
-  client refuses nothing, so YOU are the consent step, and a refusal from the
-  owner blocks a fresh request for a week.
+- You drive the user's own account only. Three things reach past it, and all three
+  are consent moments where the client refuses nothing — so YOU are the consent
+  step every time. **Asking** for a public computer tells that owner the user's
+  name — or their email, if no name is set — and a refusal blocks asking again for a
+  week. **Answering** somebody lets a stranger run research on the user's own
+  computer, exactly as a pair code would, and a "no" spends that person's week —
+  they are told, and giving them the pair code is still the way back. **Publishing**
+  a computer puts the name it reports in front of everyone signed in, and a machine
+  nobody has renamed usually reports its owner's own name. Never do any of the
+  three on the user's behalf without a real "yes" to the client's own question.

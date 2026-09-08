@@ -83,8 +83,16 @@ def test_skill_within_sanity_bound():
     # Dropping those to stay under a number is how this file's own note above
     # says reliability was lost the last time it was trimmed. The bound still
     # catches unbounded growth; it is not a trim mandate and not a target.
+    # ⛔ RAISED 480 → 510 IN 7.9-3, DELIBERATELY AND ONCE. The owner verbs added
+    # six intent rows and put three new commands into all THREE places this file
+    # enumerates confirms — a row alone was not enough last wave, and one of
+    # those lists ends "everything else runs on a clear request", so a name
+    # missing from it is a name the file licenses skipping. Two sentences that
+    # asserted approving and publishing were web-app-only also had to be
+    # rewritten rather than deleted. The bound still catches unbounded growth;
+    # it is not a trim mandate and not a target.
     n = len((_SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").splitlines())
-    assert n < 480, f"SKILL.md grew to {n} lines — unexpectedly large"
+    assert n < 510, f"SKILL.md grew to {n} lines — unexpectedly large"
 
 
 def test_signin_handoff_continues_from_the_announce_topic():

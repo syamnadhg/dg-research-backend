@@ -146,7 +146,8 @@ class FirestoreRest:
         if not resp.ok:
             raise FirestoreError(
                 f"{method} {url.split('/databases')[-1]} -> "
-                f"HTTP {resp.status_code}: {resp.text[:300]}"
+                f"HTTP {resp.status_code}: {resp.text[:300]}",
+                status=resp.status_code,
             )
         return resp.json() if resp.content else {}
 
@@ -575,6 +576,33 @@ class FirestoreRest:
         body = self._request("POST", url, json_body={"fields": fields})
         return doc_id(body.get("name", ""))
 
+    def set_device_visibility(self, device_id: str, value: str) -> None:
+        """Set who may FIND this machine — the `visibility` field on its own row.
+
+        ⛔⛔ THERE IS NO WEB ROUTE FOR THIS AND THAT IS NOT AN OVERSIGHT. The app
+        writes the field straight from the browser under the signed-in owner, and
+        the machine writes it at pair time and from `--visibility`. This is the
+        third writer and it uses the same door: one field, one update mask, the
+        owner's own token. Nothing about it is privileged.
+
+        ⛔⛔ THE VALUE IS CHECKED HERE AS WELL AS BY THE CALLER. This is the only
+        field on the device document whose VALUE the security rules examine, and
+        a value they reject refuses the WHOLE update — so a typo would not write
+        a strange setting, it would fail a write the caller believes it made.
+        Two checks, because the one that matters is the one nearest the wire.
+
+        ⛔ A WRONG ID CANNOT MINT A MACHINE. A PATCH to a document that does not
+        exist is an upsert in this API, but this collection is `allow create: if
+        false` for every client, so a bad id is refused rather than created.
+        That is why there is no existence precondition on the request.
+        """
+        if value not in ("public", "private"):
+            raise ValueError(
+                f"visibility must be 'public' or 'private', not {value!r}")
+        target = f"{config.FIRESTORE_BASE}/devices/{device_id}"
+        self._request("PATCH", f"{target}?updateMask.fieldPaths=visibility",
+                      json_body={"fields": {"visibility": to_value(value)}})
+
     def update_research(self, uid: str, rid: str, patch: dict[str, Any], *,
                         delete_fields: list[str] | None = None) -> None:
         """PATCH users/{uid}/researches/{rid} with `patch` (top-level fields), and
@@ -592,4 +620,21 @@ class FirestoreRest:
 
 
 class FirestoreError(RuntimeError):
-    """A Firestore REST call failed (HTTP error / permission denied)."""
+    """A Firestore REST call failed (HTTP error / permission denied).
+
+    ⛔⛔ `status` IS THE DIFFERENCE BETWEEN "REFUSED" AND "MAY HAVE LANDED", and
+    a caller that cannot tell those apart cannot honestly say what happened. A
+    403 is the rules refusing the write, so the document did not change. A 5xx
+    happens AFTER the request went out, so it may already carry the new value.
+    The machine's own `--visibility` records this exact lesson against itself:
+    "nothing changed" is a claim four different failures cannot support and only
+    two of them can, and it shipped in bold on all four.
+
+    ⛔ `None` MEANS THE FAILURE CARRIED NO STATUS — a transport error, or a test
+    double raising this by hand. It must be read as the unknown case, never as a
+    refusal, because unknown is the direction that does not lie.
+    """
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status

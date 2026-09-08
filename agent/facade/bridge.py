@@ -1441,6 +1441,92 @@ def _mint_bearer(sess: "AccountSession", force: bool) -> "tuple[str | None, dict
 #
 # ⛔ THE BYTES SIBLING KEEPS ITS SIXTY. It carries megabytes, its caller already
 # waits on a bundle, and no chat client is holding a socket open behind it.
+# ⛔⛔ ONE SENTENCE, ONE PLACE. Two routes refuse the same fact — an id this
+# account cannot reach — and the wording is load-bearing: it is a PERMISSIONS
+# word, not a connectivity one, because the browse list prints ids of computers
+# this account has NOT been given and those are the ids people try first. Held
+# as a constant from the moment there was a second caller, on the rule this
+# project keeps relearning: a sentence written twice is a sentence that will
+# eventually be written two ways.
+_NOT_LINKED_ERROR = "no computer with that id is linked to your account"
+
+# ⛔ THE WEB APP'S OWN PREDICATE FOR A PERSON'S ID, PORTED. The DECIDE route
+# refuses anything outside these characters with a bare `requester_required`, so
+# a client that sent a display name would get a code back and have nothing to
+# say about it. Checked on this side as well so the refusal is about what
+# somebody typed rather than about a foreign token.
+# ⛔ The ASKING route applies the same predicate to the CALLER's own uid and
+# refuses with 401 `unauthorized` — a different door and a different answer. An
+# earlier version of this note claimed both behaved alike.
+# Source of truth: `isAddressableUid` in `src/lib/devices/access-request.ts`.
+_ADDRESSABLE_UID_RE = re.compile(r"[A-Za-z0-9]{1,128}")
+
+# The public label's chain and bound, from `src/lib/devices/public-listing.ts`.
+_PUBLIC_LABEL_MAX = 40
+_PUBLIC_LABEL_FALLBACK = "Research computer"
+# C0, DEL + C1, line/paragraph separators and the bidi overrides — the set
+# `boundedLabel` strips before a label is published. Ported so the label this
+# bridge SHOWS an owner is the one strangers actually get.
+# ⛔ THE CLASS IS THE WEB APP'S, CHARACTER FOR CHARACTER. Two were missing
+# — the plain bidi marks — and the byte-order mark is here because Python's
+# `strip()` does not treat it as whitespace while JavaScript's `trim()` does.
+# Each omission showed the owner a different label from the published one.
+_PUBLIC_LABEL_STRIP_RE = re.compile(
+    "[\\x00-\\x1f\\x7f-\\x9f\\u200e\\u200f\\u2028\\u2029\\u202a-\\u202e"
+    "\\u2066-\\u2069\\ufeff]")
+
+
+def _body_str(body: dict[str, Any], key: str) -> str:
+    """One string field out of a request body, whatever the caller sent.
+
+    ⛔⛔ `(body.get(k) or "").strip()` CRASHES ON A NUMBER, and an exception out
+    of a handler does not become a 500 — `http.server` drops the socket, so the
+    caller gets no reply at all and the traceback lands in the uploadable log.
+    Measured. The routes below have refusals written for a bad id and a bad
+    value; this is what lets those refusals actually be reached.
+    """
+    value = body.get(key)
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _public_label_of(row: dict[str, Any]) -> str:
+    """The name STRANGERS see for a machine that has been made findable.
+
+    ⛔⛔ A PORT, AND THE WEB APP OWNS THE ORIGINAL — `publicLabelOf`, chained
+    through `deviceDisplayName`. It is duplicated rather than asked for because
+    the public listing deliberately drops machines the caller is already on, so
+    an owner cannot read their own public row through it. There is no request
+    that answers this question, and the owner is owed the answer.
+
+    ⛔⛔ THE OWNER'S OWN NAME CAN BE IN IT. A Mac nobody has renamed reports a
+    hostname like "Jane Smith's MacBook Pro", so switching one on publishes that
+    string to every signed-in stranger. The web app's toggle names the exact
+    label for that reason, and every surface that offers this must.
+
+    Chain: name → machineName → hostname → the fallback, each stripped of the
+    characters a label may not carry, trimmed, skipped when it empties, and
+    bounded to forty characters.
+    """
+    # ⛔⛔ THE LADDER IS WALKED ON THE UNSTRIPPED VALUE AND THE STRIP HAPPENS
+    # AFTER — and getting that order wrong is not cosmetic. The web app picks
+    # the first field whose PLAIN trim is non-empty, sanitises THAT, and if it
+    # sanitises away returns the fallback; it does NOT carry on down the chain.
+    # Stripping first made an all-strippable name skip to the hostname, so this
+    # showed an owner a label strangers never see. Found by cross-verify running
+    # both implementations side by side — and a test of mine had pinned the
+    # wrong answer, which is why no mutant could catch it.
+    raw = None
+    for key in ("name", "machineName", "hostname"):
+        value = row.get(key)
+        if isinstance(value, str) and value.strip():
+            raw = value.strip()
+            break
+    if raw is None:
+        return _PUBLIC_LABEL_FALLBACK
+    cleaned = _PUBLIC_LABEL_STRIP_RE.sub("", raw).strip()
+    return cleaned[:_PUBLIC_LABEL_MAX] if cleaned else _PUBLIC_LABEL_FALLBACK
+
+
 _FE_JSON_TIMEOUT = 15
 
 
@@ -2935,6 +3021,10 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 self._device_pair()
             elif path == "/device/remove":
                 self._device_remove()
+            elif path == "/device/decide":
+                self._device_decide()
+            elif path == "/device/visibility":
+                self._device_visibility()
             elif path == "/logs/send":
                 self._log_send()
             elif path == "/logs/agent-log":
@@ -3381,8 +3471,7 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 # browse list prints ids of computers this account has NOT been
                 # given, and selecting one is the first thing anybody tries.
                 # Neither client words this, so it relays raw.
-                self._json(404, {"error": "no computer with that id is linked to "
-                                          "your account",
+                self._json(404, {"error": _NOT_LINKED_ERROR,
                                  "reason": "not_linked"})
                 return
             prefs.set_selected_device(device_id, sess.uid)
@@ -3390,7 +3479,7 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             log.info("selected device %s", device_id)
             self._json(200, {"ok": True, "device": match})
 
-        def _fe_relay(self, status: int, body: dict, what: str) -> bool:
+        def _fe_relay(self, status: int, body: dict, _what: str = "") -> bool:
             """Turn one `_fe_api_*` answer into a reply, or return True to carry on.
 
             ⛔⛔ A REVOKED SESSION IS A 401 HERE, NOT A 502. `_fe_api_*` returns
@@ -3462,8 +3551,9 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                              "truncated": bool(body.get("truncated"))})
 
         def _device_requests(self) -> None:
-            """The access requests this account is waiting on (`GET
-            /api/devices/access-request`, the `outgoing` half).
+            """Both halves of the access-request queue (`GET
+            /api/devices/access-request`): people waiting on machines this
+            account OWNS, and what this account is waiting on from other people.
 
             ⛔⛔ ONLY LIVE, PENDING ROWS EXIST HERE, AND THE ROW CARRIES NO
             STATUS. The route filters both halves through `isLiveRequest`, so an
@@ -3473,10 +3563,28 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             truncation of its own. A client that reads a missing row as "denied"
             is inventing a field that never crossed the wire.
 
-            ⛔ THE OWNER'S HALF IS DROPPED ON PURPOSE, not forgotten. `incoming`
-            is the queue waiting on a machine this account owns, and there is no
-            approve or deny verb on this surface yet — listing it would name
-            people whose request nothing here can answer.
+            ⛔⛔ BOTH HALVES ARE RELAYED AND THEY ARE KEPT APART. `incoming` is
+            the queue waiting on machines this account OWNS; `requests` is what
+            this account is waiting on from other people. Merging them tells an
+            owner that somebody else's request is something they are waiting for,
+            which is the reading the two names exist to prevent. Until this wave
+            the owner's half was dropped on purpose, because there was no verb
+            here that could answer it; `/device/decide` is that verb.
+
+            ⛔ THE OWNER'S HALF IS OWNERSHIP-CHECKED BY THE ROUTE, BUT NOT BY THE
+            SAME TEST `/device/decide` APPLIES — and reading it as the same test
+            is a mistake this note used to invite. The GET narrows on the
+            request's STORED ownerUid and then re-checks the live device; the
+            decide route reads only the live device and never looks at the
+            stored field. After a hand-off, a request filed against the previous
+            owner is invisible here and still answerable there. Both drops are
+            silent and uncounted, so no client may describe this list as
+            everything anybody has asked.
+
+            ⛔ A ROW'S LABELS ARE A SNAPSHOT FROM THE DAY OF THE ASK — the
+            machine's name and the asker's are copied into the record when it is
+            written and never refreshed. And the asker's label falls back to a
+            neutral word, so it is a name to SHOW, never a thing to match on.
             """
             acct = self._account()
             if acct is None:
@@ -3486,7 +3594,10 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             if not self._fe_relay(status, body, "could not list your requests"):
                 return
             rows = body.get("outgoing")
-            self._json(200, {"requests": rows if isinstance(rows, list) else []})
+            incoming = body.get("incoming")
+            self._json(200, {"requests": rows if isinstance(rows, list) else [],
+                             "incoming": incoming if isinstance(incoming, list)
+                             else []})
 
         def _device_ask(self) -> None:
             """Ask the owner of a public machine for access (`POST
@@ -3604,6 +3715,238 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 prefs.clear_selected_device()
             log.info("device remove: %s (%s)", device_id, body.get("action"))
             self._json(200, {"ok": True, "action": body.get("action"), "deviceId": device_id})
+
+        def _owned_device(self, fs: FirestoreRest, sess: AccountSession,
+                          device_id: str, verb: str) -> dict[str, Any] | None:
+            """One machine of this account's, decorated — and OWNED, or a refusal.
+
+            ⛔⛔ THE GATE IS HERE BECAUSE NEITHER ANSWER DOWNSTREAM IS READABLE.
+            The web app's decide route answers a non-owner with the SAME 404 it
+            gives for a machine that does not exist — deliberately, so no caller
+            can use it to discover that a device id is real. And the visibility
+            write is refused by a security rule as a bare 403, which this bridge
+            turns into "could not reach the research store": a sentence about US
+            when the truth is about THEM. Ungated, one verb would tell a sharer
+            that a computer sitting in their own list does not exist, and the
+            other would report an outage that never happened.
+
+            ⛔ THIS IS THE SAME REASONING `_log_device` RECORDS about the
+            send-logs write, and the same refusal shape `_log_send` uses for
+            `--machine`. Three owner-only paths now, one story.
+
+            ⛔ AND IT IS NOT A CONTRADICTION OF `_device_ask` HAVING NO GATE.
+            Asking makes no ownership guess on purpose: every refusal there is
+            the route's to make against the live document, from fields a public
+            projection withholds. This one is a fact this side already holds —
+            `list_devices` returns the row and `ownerUid` is on it.
+
+            ⛔ NO AUTO-PICK, unlike `_resolve_device`. Falling back to the
+            selected machine is right for starting a run and wrong for every
+            verb here: nobody's computer gets published to strangers, or opened
+            to a person, because it happened to be the one already chosen.
+            """
+            try:
+                devs = fs.list_devices(sess.uid)
+            except RevokedError:
+                self._json(401, {"error": "session revoked — run /login again"})
+                return None
+            except FirestoreError as e:
+                self._firestore_502(e)
+                return None
+            row = next((d for d in devs if d.get("id") == device_id), None)
+            if row is None:
+                # The sentence `/device/select` gives, for its reason: the browse
+                # list prints ids of computers this account has NOT been given,
+                # and those are the ids people try first.
+                self._json(404, {"error": _NOT_LINKED_ERROR,
+                                 "reason": "not_linked"})
+                return None
+            self._decorate_devices([row], sess.uid,
+                                   prefs.get_selected_device(sess.uid))
+            if not row.get("owned"):
+                # ⛔ NAMES WHICH RELATIONSHIP THEY HAVE, not just the one they
+                # lack. "You are not the owner" leaves somebody wondering whether
+                # the machine is even theirs to see; they were given access to
+                # it, and that is worth saying in the same breath.
+                self._json(403, {"reason": "not_owner",
+                                 "error": "only the owner of that computer can "
+                                          f"{verb} — you have been given access "
+                                          "to it, which is not the same thing"})
+                return None
+            return row
+
+        def _device_decide(self) -> None:
+            """Answer somebody asking to use one of this account's machines
+            (`POST /api/devices/access-request/decide`).
+
+            ⛔⛔ `decision: "approved"` DOES NOT MEAN A MEMBERSHIP WAS JUST
+            GRANTED. The route closes an `already_shared` request as approved and
+            writes nothing to the machine — that person got in another way while
+            the request sat waiting. So what this reports is a STATE ("they can
+            use it") and never an event ("you have just added them"), because the
+            state is true on both branches and the event is true on only one.
+
+            ⛔ A REFUSAL SPENDS SOMEBODY'S WEEK. Denying stamps a seven-day
+            cool-off, the asker is told, and the owner is told nothing at all by
+            the web app — the fact lives in a code comment there. Both clients
+            here say it BEFORE the decision, on the queue, which is what a person
+            reads while deciding.
+
+            ⛔ THE ASKER'S ID STAYS OUT OF THE LOG, same rule as the ask: this
+            file is uploadable to support and the person deciding is not the
+            person whose id that is. The machine is this account's own, so it is
+            logged like every other device this bridge acts on.
+            """
+            body_in = self._read_json()
+            device_id = _body_str(body_in, "deviceId")
+            if not device_id:
+                self._json(400, {"error": "deviceId is required"})
+                return
+            requester = _body_str(body_in, "requesterUid")
+            if not _ADDRESSABLE_UID_RE.fullmatch(requester):
+                self._json(400, {"reason": "requester_required",
+                                 "error": "that isn't the id of a person who has "
+                                          "asked — the queue prints one on every "
+                                          "row"})
+                return
+            decision = _body_str(body_in, "decision")
+            if decision not in ("approve", "deny"):
+                self._json(400, {"reason": "decision_required",
+                                 "error": "say approve or deny"})
+                return
+            acct = self._account()
+            if acct is None:
+                return
+            sess, fs = acct
+            row = self._owned_device(fs, sess, device_id,
+                                     "answer people asking for it")
+            if row is None:
+                return
+            status, reply = _fe_api_post(
+                sess, "/api/devices/access-request/decide",
+                {"deviceId": device_id, "requesterUid": requester,
+                 "decision": decision})
+            # ⛔⛔ A TRANSPORT FAILURE HERE MAY SIT ON A COMMITTED DECISION, and
+            # saying nothing about that is the same defect `_device_visibility`
+            # was written to avoid one screen away. The route declares thirty
+            # seconds and does two Auth RPCs, a contended transaction and a
+            # push; this side gives up at fifteen. So the answer may well have
+            # landed, the owner's natural retry then meets `request_not_pending`
+            # — and a deny that landed has already spent somebody's week.
+            # ⛔ A `reason` of "revoked" is a DEAD SESSION and keeps its own
+            # branch below; only a transport failure is unconfirmed.
+            if status == 0 and reply.get("reason") != "revoked":
+                log.warning("device decide: no answer on %s — outcome unknown",
+                            device_id)
+                self._json(502, {"reason": "decide_unconfirmed",
+                                 "error": "the app did not answer in time — that "
+                                          "decision may or may not have been "
+                                          "made. Ask for the queue again before "
+                                          "trying it a second time"})
+                return
+            if not self._fe_relay(status, reply, "could not answer that request"):
+                return
+            if not reply.get("ok"):
+                self._json(502, {"error": reply.get("error") or
+                                 "could not answer that request",
+                                 "retryAfterMs": reply.get("retryAfterMs")})
+                return
+            log.info("device decide: %s on %s", decision, device_id)
+            self._json(200, {"ok": True,
+                             "decision": reply.get("decision") or
+                             ("approved" if decision == "approve" else "denied"),
+                             "deviceId": device_id,
+                             # ⛔ THE SAME LADDER THE SIBLINGS USE. `name` alone
+                             # returns null for a machine nobody has renamed,
+                             # and the terminal then prints a device id where a
+                             # label belongs — directly above a line quoting the
+                             # label strangers see.
+                             "deviceName": _public_label_of(row)})
+
+        def _device_visibility(self) -> None:
+            """Make one of this account's machines findable by strangers, or hide
+            it again — the `visibility` field on the machine's own row.
+
+            ⛔⛔ DISCOVERY, NOT ACCESS, in the same words the machine's own
+            `--visibility` uses. A findable computer is one strangers can SEE
+            listed and ASK for; each of them still waits for the owner to say
+            yes, and who may READ the document does not change either way.
+
+            ⛔⛔ THERE IS NO WEB ROUTE TO RELAY. The app writes this field
+            straight from the browser and the machine writes it from the
+            terminal, so this bridge is the third writer and goes through the
+            same door — see `set_device_visibility`.
+
+            ⛔⛔ ABSENT IS PRIVATE. A machine paired before 2026-09-04 carries no
+            such field and nothing backfills one, so the only value that reads as
+            public is the exact string.
+
+            ⛔ A FAILED READ IS NOT "PRIVATE", and the machine's version of this
+            command shipped that bug — an empty fetch reported a listed computer
+            as hidden. It cannot happen here, and not by luck: the ownership gate
+            needs the row, so a read that fails answers 401 or 502 and never
+            reaches the comparison below.
+
+            ⛔⛔ "NOTHING CHANGED" IS NOT ALWAYS SAYABLE. A rules refusal proves
+            the write did not land. A 5xx happened after the request went out and
+            proves nothing at all, so the two get different sentences and the
+            second one does not promise the machine is as it was.
+            """
+            body_in = self._read_json()
+            device_id = _body_str(body_in, "deviceId")
+            if not device_id:
+                self._json(400, {"error": "deviceId is required"})
+                return
+            value = _body_str(body_in, "visibility").lower()
+            if value not in ("public", "private"):
+                # ⛔ REFUSED HERE, BEFORE THE ROW IS EVEN READ. This is the one
+                # field on the device document whose VALUE the rules check, and a
+                # value they reject refuses the WHOLE update — so a typo would
+                # not write a strange setting, it would fail a write the person
+                # believes they made.
+                self._json(400, {"reason": "visibility_required",
+                                 "error": "say public or private"})
+                return
+            acct = self._account()
+            if acct is None:
+                return
+            sess, fs = acct
+            row = self._owned_device(fs, sess, device_id,
+                                     "change who can find it")
+            if row is None:
+                return
+            current = "public" if row.get("visibility") == "public" else "private"
+            label = _public_label_of(row)
+            if value == current:
+                self._json(200, {"ok": True, "changed": False,
+                                 "visibility": current, "publicLabel": label,
+                                 "deviceId": device_id,
+                                 "deviceName": row.get("name")})
+                return
+            try:
+                fs.set_device_visibility(device_id, value)
+            except RevokedError:
+                self._json(401, {"error": "session revoked — run /login again"})
+                return
+            except FirestoreError as e:
+                # ⛔ THE STATUS DECIDES WHICH SENTENCE IS HONEST, and an absent
+                # status is the unknown case — never the refusal, because unknown
+                # is the direction that does not lie about the machine.
+                log.warning("device visibility write failed: %s", e)
+                refused = getattr(e, "status", None) == 403
+                self._json(403 if refused else 502,
+                           {"reason": "visibility_refused" if refused
+                            else "visibility_unconfirmed",
+                            "error": ("that change was refused — nothing changed"
+                                      if refused else
+                                      "could not confirm that change — it may or "
+                                      "may not have been saved"),
+                            "visibility": current if refused else None})
+                return
+            log.info("device visibility: %s on %s", value, device_id)
+            self._json(200, {"ok": True, "changed": True, "visibility": value,
+                             "publicLabel": label, "deviceId": device_id,
+                             "deviceName": row.get("name")})
 
         def _resolve_device(self, body: dict[str, Any], sess: AccountSession,
                             fs: FirestoreRest) -> str | None:

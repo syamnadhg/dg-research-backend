@@ -1155,6 +1155,50 @@ _ASK_FAILURES = {
                       "was sent, so it is safe to try again",
 }
 
+# ⛔⛔ ANSWERING A REQUEST HAS ITS OWN TABLE AND IT IS NOT `_ASK_FAILURES`.
+# Five codes appear on both routes and mean different things on each: on the ask
+# route `device_not_found` means the computer is not offered publicly, here it
+# means it is not YOURS any more; `is_owner` there means "already yours", here it
+# means the person asking owns it; `revoked_sharer` there is about the caller,
+# here it is about somebody else. A borrowed table would say the wrong true
+# thing, which is worse than saying a code.
+#
+# ⭐ WORDED TO MATCH THE WEB APP where the web app has a sentence, because the
+# same owner reads both surfaces about the same request and two descriptions of
+# one refusal is how somebody concludes they are looking at two problems.
+_DECIDE_FAILURES = {
+    "device_not_found": "that computer isn't yours any more",
+    "request_not_found":
+        "there is no request from that person for that computer — it may have "
+        "been answered already, or it may have run out",
+    "request_mismatch":
+        "that request doesn't belong to that computer — ask for the queue again "
+        "and answer from what it prints",
+    # ⛔⛔ THIS CODE COVERS THREE STATES, NOT ONE. The route throws it whenever
+    # the row is not live, and `isLiveRequest` tests `status != "pending"` FIRST
+    # — so an already-approved and an already-denied request arrive here too.
+    # The old sentence said "expired" and "they are free to ask again", and both
+    # are false for a denial: it landed, and a seven-day block is enforced from
+    # the day it was answered. The honest sentence is the one true of all three.
+    "request_not_pending":
+        "that request isn't open any more — it was already answered, or it ran "
+        "out. Ask for the queue again to see what is still waiting",
+    "is_owner": "that person owns that computer, so there is nothing to answer",
+    "revoked_sharer":
+        "you removed this person from that computer before — resetting its pair "
+        "code is what lets them back in",
+    "share_cap_reached":
+        "that computer is already shared with as many people as it can hold — "
+        "remove someone first",
+    "invalid_json": "that answer didn't reach the app in a form it could read",
+    "device_id_required": "that isn't an id any computer could have",
+    "requester_required": "that isn't the id of a person who could have asked",
+    "decision_required": "the app didn't get a yes or a no — nothing was answered",
+    "unauthorized": "this agent's sign-in was refused — run login again",
+    "internal_error": "the app hit a problem of its own answering that — nothing "
+                      "about that request changed, so it is safe to try again",
+}
+
 # ⛔⛔ THE TWO LIST ROUTES NEEDED THEIR OWN TABLE AND DID NOT HAVE ONE. Every
 # refusal they can give — `rate_limited` at thirty a five minutes on browse and
 # sixty on the queue, `unauthorized`, `internal_error` — reached the person as
@@ -1247,7 +1291,12 @@ def cmd_device(args: argparse.Namespace) -> int:
     _WSL_HINTS = {
         "public": "Find a public computer from chat:  /sr are there any public computers",
         "ask": "Ask for a public computer from chat:  /sr ask for that computer",
-        "requests": "See what you are waiting on from chat:  /sr what am I waiting on",
+        "requests": "See who is asking, and what you are waiting on, from chat:  "
+                    "/sr who wants to use my computer",
+        "approve": "Answer a request from chat:  /sr approve that request",
+        "deny": "Answer a request from chat:  /sr say no to that request",
+        "visibility": "Change who can find a computer from chat:  "
+                      "/sr make my computer public",
     }
     rc = _redirect_if_wsl(_WSL_HINTS.get(getattr(args, "device_command", None) or "",
                                          "Manage devices from chat:  /sr devices"))
@@ -1265,6 +1314,13 @@ def cmd_device(args: argparse.Namespace) -> int:
 
     if getattr(args, "device_command", None) == "requests":
         return _device_requests()
+
+    if getattr(args, "device_command", None) in ("approve", "deny"):
+        return _device_decide(args.deviceId, args.requesterUid,
+                              args.device_command)
+
+    if getattr(args, "device_command", None) == "visibility":
+        return _device_visibility(args.deviceId, args.value)
 
     if getattr(args, "device_command", None) == "use":
         res = _bridge_post("/device/select", {"deviceId": args.deviceId})
@@ -1318,7 +1374,22 @@ def cmd_device(args: argparse.Namespace) -> int:
         # "which of my computers is on?" is answered by this list and it did not
         # carry the answer, while the chat picker one file over prints it.
         state = "online" if d.get("online") else "offline"
-        print(f"  {mark} {d.get('name') or d.get('id')}  ({kind}, {state})  "
+        # ⛔⛔ ONLY ON THE ROWS IT IS TRUE OF, AND ABSENT MEANS PRIVATE. Only an
+        # owner can change this and only an owner is being told anything by it,
+        # so a shared row saying "private" would be reporting somebody else's
+        # setting as if it were the reader's to change. And a machine paired
+        # before 2026-09-04 carries no such field at all — the exact string is
+        # the only value that reads as public.
+        # ⛔⛔ THE SAME TWO WORDS THE COMMAND USES. This column said
+        # "findable"/"hidden" while `agent device visibility` said
+        # "public"/"private" and the web app's toggle says "Public computer" —
+        # three vocabularies for one setting, in a file whose own comment two
+        # hundred lines below says that is how somebody comes to believe there
+        # are two settings.
+        found = ""
+        if d.get("owned"):
+            found = ", public" if d.get("visibility") == "public" else ", private"
+        print(f"  {mark} {d.get('name') or d.get('id')}  ({kind}, {state}{found})  "
               f"id={d.get('id')}")
     if not selected:
         print("\nNo device selected — pick one:  agent device use <id>")
@@ -1421,8 +1492,158 @@ def _device_ask(device_id: str) -> int:
     return 0
 
 
+def _decide_refusal(err: str, retry_after_ms=None) -> str:
+    """One refusal from the answer-a-request route, in words.
+
+    Same three-tier ladder as the ask: the rate limit first because only the
+    server can say how long, then the table, then an unreadable reply, then the
+    code itself rather than silence. ⛔ The bridge's OWN refusals — an id this
+    account cannot reach, a machine somebody else owns — arrive as whole
+    sentences and fall through to the last tier on purpose: they are already
+    written for a person, and a table row would be a second wording of a
+    sentence that has one.
+    """
+    if err == "rate_limited":
+        mins = _minutes_from_ms(retry_after_ms)
+        if mins is None:
+            return ("the app is rate-limiting answers from this account just "
+                    "now — nothing was answered")
+        return (f"the app is rate-limiting answers from this account — try again "
+                f"in about {mins} minute{'s' if mins != 1 else ''}")
+    said = _DECIDE_FAILURES.get(err)
+    if said is not None:
+        return said
+    if err.startswith("http_"):
+        return ("the app answered that with nothing this client can read "
+                f"(HTTP {err[5:]}) — nothing was answered")
+    return f"couldn't answer that request: {err or 'no reason given'}"
+
+
+def _device_decide(device_id: str, requester: str, decision: str) -> int:
+    """Approve or deny one person waiting on one of this account's machines."""
+    device_id = (device_id or "").strip()
+    requester = (requester or "").strip()
+    if not device_id or not requester:
+        print(f"{_NO} name the computer and the person by their ids — "
+              f"`agent device requests` prints both on every row.")
+        return 1
+    res = _bridge_post("/device/decide",
+                       {"deviceId": device_id, "requesterUid": requester,
+                        "decision": decision}, timeout=40.0)
+    if res is None:
+        print(f"{_NO} couldn't answer that request: {_err(res)}")
+        return 1
+    body = res[1] if isinstance(res[1], dict) else {}
+    if res[0] != 200:
+        print(f"{_NO} {_decide_refusal(body.get('error') or '', body.get('retryAfterMs'))}")
+        return 1
+    # ⛔ THE PERSON IS NAMED, AND THE TERMINAL IS WHERE IT MATTERS MOST — this
+    # is the surface where they were identified only by an opaque id typed out
+    # of a queue print that may already be stale. The chat client named them
+    # from the start; this one did not, and its own resolver docstring promised
+    # it would.
+    name = body.get("deviceName") or device_id
+    who = f"{requester}" if requester else "they"
+    if body.get("decision") == "approved":
+        # ⛔⛔ A STATE, NEVER AN EVENT. The route closes an already-shared request
+        # as approved and writes nothing to the machine, so "you have just added
+        # them" is false on one of the two branches that reach here. "They can
+        # use it" is true on both.
+        print(f"{_OK} {who} can use {name}.")
+        print("     It shows up on their side as one of their computers.")
+    else:
+        print(f"{_OK} Said no to {who} for {name}.")
+        # ⛔ THE COST, STATED WHERE THE PERSON CAN STILL SEE IT. The web app tells
+        # the ASKER about the week and tells the owner nothing at all.
+        # ⛔⛔ "THEY ARE TOLD" WAS STATED AS FACT AND THE PRODUCT CANNOT PROMISE
+        # IT. The notice is best-effort — every failure is swallowed and the
+        # result discarded — and delivery is gated on the asker's own User
+        # updates preference, which they can switch off. The seven days ARE
+        # enforced, so that half stays flat.
+        print("     They cannot ask again for a week. The app tries to tell "
+              "them, but")
+        print("     that depends on their own notification settings. Giving "
+              "them the pair")
+        print("     code still works if you change your mind.")
+    return 0
+
+
+def _device_visibility(device_id: str, value: str) -> int:
+    """Make one of this account's machines findable by strangers, or hide it."""
+    device_id = (device_id or "").strip()
+    if not device_id:
+        print(f"{_NO} name the computer by its id — `agent device` prints one on "
+              f"every row.")
+        return 1
+    res = _bridge_post("/device/visibility",
+                       {"deviceId": device_id, "visibility": value}, timeout=40.0)
+    if res is None:
+        print(f"{_NO} couldn't change that: {_err(res)}")
+        return 1
+    body = res[1] if isinstance(res[1], dict) else {}
+    if res[0] != 200:
+        # ⛔⛔ NOT `_list_refusal`. Its last tier is "couldn't {what}: {err}",
+        # which is ungrammatical here ("couldn't changed that computer") and —
+        # far worse — asserts that nothing happened OVER a payload that exists
+        # to say the opposite. The bridge went to deliberate trouble to separate
+        # a rules refusal from an unconfirmed write; wrapping both in "couldn't"
+        # threw that distinction away one line before the person read it.
+        said = body.get("error") or ""
+        mins = _minutes_from_ms(body.get("retryAfterMs"))
+        if not said:
+            said = "the app gave no reason"
+        print(f"{_NO} {said}" + (f" — try again in about {mins} minute"
+                                 f"{'s' if mins != 1 else ''}" if mins else ""))
+        return 1
+    name = body.get("deviceName") or device_id
+    state = body.get("visibility")
+    # ⛔ `.get`, NOT `[]`. A 200 whose body failed to parse arrives as `{}` and
+    # this was the only raw index on a server-supplied value in the file — a
+    # KeyError traceback where a sentence belonged.
+    word = _VISIBILITY_WORDS.get(state)
+    if word is None:
+        print(f"{_OK} {name} was changed, but the app did not say to what.")
+        print("     Run `agent device` to see where it stands.")
+        return 0
+    if not body.get("changed"):
+        print(f"{_OK} {name} is already {word}. Nothing to change.")
+        _print_visibility_meaning(state, body.get("publicLabel"))
+        return 0
+    print(f"{_OK} {name} is now {word}.")
+    _print_visibility_meaning(state, body.get("publicLabel"))
+    return 0
+
+
+# ⛔ THE WORDS ARE THE MACHINE'S OWN. `superresearch --visibility` calls these
+# states Public and Private and describes them in these sentences; a second
+# vocabulary for one setting is how somebody ends up believing there are two.
+_VISIBILITY_WORDS = {"public": "public", "private": "private"}
+
+
+def _print_visibility_meaning(state: str, public_label) -> None:
+    """What the state actually means, under the line that reports it."""
+    if state == "public":
+        print("     Other people can find it and ask to use it. You still "
+              "approve every")
+        print("     person yourself.")
+        # ⛔⛔ THE PUBLISHED LABEL IS NAMED, and this is not decoration. A Mac
+        # nobody has renamed reports a hostname carrying its owner's own name,
+        # so switching this on can publish that to every signed-in stranger.
+        # The web app's toggle names it for the same reason.
+        if public_label:
+            print(f"     They see it as “{public_label}”.")
+    else:
+        print("     Nobody can find it. A pair code still lets someone in "
+              "without asking you.")
+
+
 def _device_requests() -> int:
-    """The access requests this account is still waiting on."""
+    """Both halves of the access-request queue: people waiting on THIS account's
+    machines, and what this account is waiting on from other people.
+
+    ⛔ The two are printed apart and never summed. They are answered by different
+    people and only one of them is anybody's to act on from here.
+    """
     res = _bridge_get("/devices/requests", timeout=40.0)
     if res is None:
         print(f"{_NO} couldn't list your requests: {_err(res)}")
@@ -1432,6 +1653,41 @@ def _device_requests() -> int:
         print(f"{_NO} {_list_refusal('asked for your requests', body.get('error') or '', body.get('retryAfterMs'))}")
         return 1
     rows = res[1].get("requests") or []
+    incoming = res[1].get("incoming") or []
+    # ⛔⛔ THE OWNER'S QUEUE GOES FIRST, because it is the only half anybody can
+    # ACT on from here. What you are waiting on is somebody else's decision.
+    if not incoming:
+        # ⛔ SAID, NOT LEFT OUT. Silence about the owner's half reads as "this
+        # screen does not cover that" — which is what it USED to mean, and the
+        # habit is the thing being replaced.
+        print("Nobody is waiting on your computers.")
+        print()
+    else:
+        print(f"People asking to use your computers ({len(incoming)}):")
+        for d in incoming:
+            who = str(d.get("requesterLabel") or "").strip() or "Someone"
+            what = str(d.get("deviceLabel") or "").strip() or "(unnamed)"
+            print(f"     {who.ljust(28)}  wants {what}")
+            # ⛔ BOTH IDS, BECAUSE BOTH ARE WHAT THE NEXT COMMAND TAKES, and
+            # neither name identifies a row: a label is a snapshot from the day
+            # of the ask, an unnamed machine is the identical string for
+            # everybody, and a person with no display name shows as their email
+            # or as a neutral word shared with anyone the lookup failed on.
+            print(f"       answer with:  agent device approve "
+                  f"{d.get('deviceId')} {d.get('requesterUid')}")
+        # ⛔⛔ WHAT A YES MEANS AND WHAT A NO COSTS, BOTH BEFORE THE DECISION.
+        # The web app puts the first on the screen beside the buttons and never
+        # states the second to the owner at all — it tells the ASKER about the
+        # week and leaves the person spending it uninformed.
+        print("\n     Anyone you say yes to can run research on that computer — "
+              "the same as")
+        print("     somebody you gave a pair code to. Saying no stops them "
+              "asking again")
+        print("     for a week; the app tries to tell them, but that depends on "
+              "their own")
+        print("     notification settings.")
+        print("     Say no with:  agent device deny <computer id> <person id>")
+        print()
     if not rows:
         print("You are not waiting on any computer.")
     else:
@@ -1444,14 +1700,23 @@ def _device_requests() -> int:
     # — yes or no — or seven days passed, or that computer changed hands or was
     # retired. The list carries no status at all, so reading an absence as a
     # refusal would be inventing a field that never crossed the wire.
-    print("\n     Only unanswered requests appear here. Once a request is "
-          "answered it")
+    # ⛔⛔ IT SAYS WHICH HALF IT IS ABOUT. This sentence was written when the
+    # asker's list was the only thing on the screen, and 7.9-3 put the owner's
+    # queue above it without qualifying it — so every clause read as a claim
+    # about people waiting on YOU as well, and every clause is false of them: an
+    # incoming row also vanishes when the machine changes hands, and "a yes
+    # shows up as the computer appearing in `agent device`" means nothing for a
+    # machine already in your own list. The chat client was fixed and the
+    # terminal was not, which is also how the two came to disagree.
+    print("\n     Of the ones YOU asked for: only unanswered requests appear "
+          "here. Once a")
+    print("     request is answered it")
     # ⛔⛔ THE FIRST VERSION SAID "ask again and you will be told which it was",
     # and that is false for the one answer people care about. An APPROVAL makes
     # the machine one of yours, and the browse list drops machines you are
     # already on — so asking again cannot report a yes. It reports a yes by the
     # machine simply being in your own list.
-    print("     leaves this list either way. A yes shows up as the computer "
+    print("     leaves that half either way. A yes shows up as the computer "
           "appearing in")
     print("     `agent device`; for a no, ask for that computer again and you "
           "will be told.")
@@ -2699,8 +2964,35 @@ def build_parser() -> argparse.ArgumentParser:
     dvask.add_argument("deviceId", help="deviceId to ask for (from `agent device public`)")
     dvask.set_defaults(func=cmd_device)
     dvsub.add_parser("requests", parents=[common],
-                     help="show the access requests you are waiting on"
+                     help="show who is asking for your computers, and what you "
+                          "are waiting on"
                      ).set_defaults(func=cmd_device)
+    # ⛔⛔ TWO POSITIONALS AND BOTH ARE IDS. A person is named by their id, not
+    # their name: the queue's label is a snapshot taken the day they asked and
+    # falls back to a word shared by everybody the app could not look up, so it
+    # identifies nobody. `agent device requests` prints the whole command.
+    dvap = dvsub.add_parser("approve", parents=[common],
+                            help="let somebody use one of your computers")
+    dvap.add_argument("deviceId", help="your computer's id (from `agent device`)")
+    dvap.add_argument("requesterUid",
+                      help="the asker's id (from `agent device requests`)")
+    dvap.set_defaults(func=cmd_device)
+    dvdn = dvsub.add_parser("deny", parents=[common],
+                            help="refuse somebody asking for one of your computers")
+    dvdn.add_argument("deviceId", help="your computer's id (from `agent device`)")
+    dvdn.add_argument("requesterUid",
+                      help="the asker's id (from `agent device requests`)")
+    dvdn.set_defaults(func=cmd_device)
+    # ⛔ NOT `device public`. That name is already the BROWSE list — the machines
+    # other people offer — and one word meaning both "show me theirs" and "give
+    # them mine" is a mistake somebody makes once and cannot undo. The machine's
+    # own terminal calls this setting visibility for the same reason.
+    dvvis = dvsub.add_parser("visibility", parents=[common],
+                             help="set who can find one of your computers")
+    dvvis.add_argument("deviceId", help="your computer's id (from `agent device`)")
+    dvvis.add_argument("value", choices=("public", "private"),
+                       help="public = other people can find it and ask")
+    dvvis.set_defaults(func=cmd_device)
 
     sl = sub.add_parser("send-logs", parents=[common],
                         help="ask a research computer to package its logs for support "

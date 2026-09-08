@@ -133,14 +133,28 @@ def test_every_new_route_refuses_when_signed_out(monkeypatch, verb, path, body):
 
 # ── GET /devices/requests ────────────────────────────────────────────────────
 
-def test_requests_forwards_and_returns_only_the_outgoing_half(live, monkeypatch):
+def test_requests_forwards_and_keeps_the_two_halves_apart(live, monkeypatch):
+    """⛔⛔ REWRITTEN IN 7.9-3, NOT DELETED, AND ITS PREMISE IS REVERSED.
+
+    Until 7.9-3 this test pinned the owner's half being DROPPED, and that was
+    right: nothing on this surface could answer one, so naming people whose
+    request had no verb was a dead end wearing a list's clothes. `/device/decide`
+    is that verb, so the reason expired — and a test still demanding the old
+    behaviour would have been a test demanding the wrong advice, which this
+    project has shipped before.
+
+    What it pins now is the invariant that outlives the change: both halves
+    cross the wire and they stay APART. Merged, an owner is told that somebody
+    else's request for their machine is something THEY are waiting on.
+    """
     seen = {}
 
     def _get(sess, path, params=None):
         seen["path"] = path
         return 200, {
-            "incoming": [{"deviceId": "dev-mine", "requesterUid": "u9",
-                          "requesterLabel": "Someone Else"}],
+            "incoming": [{"deviceId": "dev-mine", "deviceLabel": "My Mac",
+                          "requesterUid": "u9", "requesterLabel": "Someone Else",
+                          "createdAt": 7}],
             "outgoing": [{"deviceId": "dev-a1", "deviceLabel": "Studio PC",
                           "createdAt": 5}],
         }
@@ -148,13 +162,33 @@ def test_requests_forwards_and_returns_only_the_outgoing_half(live, monkeypatch)
     monkeypatch.setattr(bridge, "_fe_api_get", _get)
     body = requests.get(live[0] + "/devices/requests").json()
     assert seen["path"] == "/api/devices/access-request"
-    assert body == {"requests": [{"deviceId": "dev-a1", "deviceLabel": "Studio PC",
-                                  "createdAt": 5}]}
-    # ⛔ THE OWNER'S QUEUE IS DROPPED ON PURPOSE — there is no approve or deny
-    # verb on this surface yet, and naming people whose request nothing here can
-    # answer is a dead end wearing a list's clothes.
-    assert "incoming" not in body
-    assert "Someone Else" not in requests.get(live[0] + "/devices/requests").text
+    assert body["requests"] == [{"deviceId": "dev-a1", "deviceLabel": "Studio PC",
+                                 "createdAt": 5}]
+    assert body["incoming"] == [{"deviceId": "dev-mine", "deviceLabel": "My Mac",
+                                 "requesterUid": "u9",
+                                 "requesterLabel": "Someone Else",
+                                 "createdAt": 7}]
+    # The two lists never share a member — that is the whole point of two names.
+    assert not [r for r in body["requests"] if r in body["incoming"]]
+
+
+def test_requests_reports_each_half_absent_as_empty_not_missing(live, monkeypatch):
+    """A reply carrying neither half answers with two empty lists, never with a
+    missing key: a client that has to tell "nobody is waiting" from "this bridge
+    does not report that" would be reading the difference out of a KeyError."""
+    monkeypatch.setattr(bridge, "_fe_api_get", lambda *a, **k: (200, {}))
+    body = requests.get(live[0] + "/devices/requests").json()
+    assert body == {"requests": [], "incoming": []}
+
+
+def test_requests_refuses_a_non_list_half(live, monkeypatch):
+    """Neither half is trusted to be a list. A string would otherwise be
+    iterated character by character by both clients."""
+    monkeypatch.setattr(bridge, "_fe_api_get",
+                        lambda *a, **k: (200, {"outgoing": "nope",
+                                               "incoming": {"a": 1}}))
+    body = requests.get(live[0] + "/devices/requests").json()
+    assert body == {"requests": [], "incoming": []}
 
 
 # ── POST /device/ask ─────────────────────────────────────────────────────────
@@ -404,7 +438,14 @@ def test_the_terminal_requests_list_says_what_a_missing_row_means(term):
     assert _run(device_command="requests") == 0
     out = term.out()
     assert "Waiting on (1):" in out and "Studio PC" in out
-    assert "leaves this list either way" in out
+    # ⛔⛔ QUALIFIED IN 7.9-3, AND THIS ASSERTION WAS PART OF THE DEFECT. The
+    # sentence was written when the asker's list was the only thing on screen;
+    # the owner's queue now prints above it and every clause is false of that
+    # half. Two tests demanded the unqualified string, so the copy could not be
+    # corrected without going red — they were enshrining it.
+    out = " ".join(out.split())
+    assert "Of the ones YOU asked for" in out
+    assert "leaves that half either way" in out
 
 
 def test_the_empty_requests_list_says_it_too(term):
@@ -414,7 +455,11 @@ def test_the_empty_requests_list_says_it_too(term):
     _run(device_command="requests")
     out = term.out()
     assert "not waiting on any computer" in out
-    assert "leaves this list either way" in out
+    # ⛔ Same correction as above, and said on the empty branch too — empty is
+    # exactly when somebody decides for themselves what the silence means.
+    out = " ".join(out.split())
+    assert "Of the ones YOU asked for" in out
+    assert "leaves that half either way" in out
 
 
 def test_no_client_calls_a_missing_request_a_refusal():

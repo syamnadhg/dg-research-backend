@@ -423,9 +423,14 @@ def test_the_skill_says_an_answered_request_leaves_the_list():
     # no status at all; every absence looks identical. Without this line the
     # model's own summary of an empty list is a guess, and the likeliest guess is
     # "they said no".
+    # ⛔ 7.9-3: the row now says WHICH HALF it is about, because the owner's queue
+    # sits above it and loses a row for entirely different reasons. The fact
+    # being pinned is unchanged.
     low = " ".join(_skill().lower().split())
-    assert "leaves the list" in low and "either way" in low
+    assert "leaves that half" in low and "either way" in low
     assert "never read a missing row as a refusal" in low
+    assert "of the ones the user asked for" in low, (
+        "the row must say which half it describes now that both are printed")
 
 
 def test_the_skill_says_asking_discloses_the_person():
@@ -441,18 +446,35 @@ def test_the_skill_no_longer_promises_it_cannot_reach_anyone_elses_data():
     # false the moment browse lists other people's machines and an ask hands an
     # owner this person's name and address. A safety promise that has quietly
     # stopped being true is worse than none.
+    # ⛔ 7.9-3: what reaches past the account went from ONE thing to THREE, so the
+    # positive half names all three. Asserted positively for the reason 7.9-2
+    # recorded: "the false promise is absent" is satisfied by deleting the whole
+    # bullet, and a mutant proved that.
     low = " ".join(_skill().lower().split())
     assert "you cannot reach anyone else's data" not in low
-    assert "public-computer list" in low
+    assert "three things reach past it" in low
+    for reach in ("**asking**", "**answering**", "**publishing**"):
+        assert reach in low, reach
 
 
 def test_the_skill_no_longer_says_sharing_is_owner_only_in_the_web_app():
     # ⛔ The parenthetical told the model that everything about sharing "stays
     # owner-only in the web app" — after this wave the ASKER's half is right
     # here, and a model reading that line would refuse the verbs it now has.
+    # ⛔⛔ 7.9-3 WENT FURTHER AND THE OLD ASSERTION WOULD NOW ENSHRINE A LIE. The
+    # parenthetical used to grant the ASKER's half and reserve everything else to
+    # the web app; this wave brought two of those reserved verbs here, so what it
+    # must not say has grown, and the sentence it must contain has changed.
     low = " ".join(_skill().lower().split())
     assert "sharing a device with other people, revoking sharers, and resets stay owner-only" not in low
-    assert "asking to use somebody else's public computer" in low
+    assert "approving or refusing somebody, offering a computer publicly" not in low, (
+        "the greeting still reserves approve/publish to the web app — the model "
+        "would refuse the verbs it now has")
+    assert "answer the people asking" in low
+    assert "set whether strangers can find it" in low
+    # Revoking a sharer and resetting a pair code are STILL web-app only, and the
+    # greeting is the only place that says so.
+    assert "revoking a sharer and resetting a pair code stay in the web app" in low
 
 
 def test_the_capability_line_the_fallback_prints_names_the_new_surface():
@@ -578,18 +600,30 @@ def test_a_code_shaped_name_is_still_not_a_pairing(said, verb):
     "stop sharing my machine",
 ])
 def test_offering_your_own_machine_is_not_answered_with_other_peoples(said):
-    # ⛔⛔ THE BROWSE CLAUSE HAD NO VERB GATE, so every one of these was answered
-    # with a list of OTHER people's machines — a list that structurally cannot
-    # contain the asker's own, because the projection drops it. Cross-verify
-    # found it from five independent angles.
+    """⛔⛔ THE INVARIANT SURVIVES THE WAVE; THE ANSWER DOES NOT.
+
+    7.9-2 pinned these three on a RELAY naming the web app, because the verb did
+    not exist here. 7.9-3 built it, so demanding the relay would now be demanding
+    that the client refuse something it can do. What has to stay true either way
+    is what the browse clause got wrong: none of these may be answered with a
+    list of OTHER people's machines — a list that structurally cannot contain the
+    asker's own, because the projection drops it.
+
+    ⛔ AND EACH IS STILL ASSERTED POSITIVELY. "not the public list" was satisfied
+    by the catch-all too, so the answer could vanish entirely and this test would
+    stay green; a mutant proved that in 7.9-2.
+    """
     argv, lines = sr._nl_resolve(said)
     assert argv != ["devices-public"], said
-    # ⛔ ASSERTED POSITIVELY. "not the public list" was satisfied by the catch-all
-    # too, so the relay could be deleted and this test stayed green — a mutant
-    # proved it. The honest answer names where the setting lives.
-    assert argv is None, (said, argv)
-    assert "Offering your own computer" in lines[0], lines
-    assert "web app" in lines[0]
+    if said.startswith("is "):
+        # A question about the state is answered by the list that carries it,
+        # never by changing the thing asked about.
+        assert argv == ["devices"], (said, argv)
+    elif "stop" in said:
+        assert argv == ["device-visibility", "private"], (said, argv)
+    else:
+        assert argv is None, (said, argv)
+        assert "Let other people find" in lines[0], lines
 
 
 @pytest.mark.parametrize("said", [
@@ -597,14 +631,19 @@ def test_offering_your_own_machine_is_not_answered_with_other_peoples(said):
     "is anyone waiting for my computer",
     "how many people asked for my machine",
 ])
-def test_an_owner_asking_about_their_own_queue_is_told_where_it_lives(said):
-    # ⛔⛔ THE ASKER'S LIST IS NOT THE OWNER'S QUEUE. Answering this with an empty
-    # `device-requests` told an owner nobody had asked when somebody had — and
-    # the owner half of that route is deliberately dropped at the bridge because
-    # there is no approve or deny verb here yet.
-    argv, lines = sr._nl_resolve(said)
-    assert argv != ["device-requests"], said
-    assert argv is None and "YOUR computer" in lines[0], lines
+def test_an_owner_asking_about_their_own_queue_gets_their_own_queue(said):
+    """⛔⛔ REVERSED IN 7.9-3, AND THE OLD DEFECT IS WHY IT IS SAFE TO REVERSE.
+
+    In 7.9-2 routing this to `device-requests` was the defect: the bridge dropped
+    the owner's half, so an owner asking who wanted their machine was shown their
+    own empty OUTGOING list and told nobody had asked when somebody had. This
+    wave makes that route carry both halves, so the same command is now the right
+    answer — and the guard that matters moved to the bridge, where
+    `test_requests_forwards_and_keeps_the_two_halves_apart` pins that the owner's
+    queue is present and separate.
+    """
+    argv, _lines = sr._nl_resolve(said)
+    assert argv == ["device-requests"], (said, argv)
 
 
 @pytest.mark.parametrize("said", [

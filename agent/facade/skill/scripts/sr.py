@@ -901,7 +901,17 @@ def cmd_devices(args) -> int:
     for d in devices:
         mark = "→" if d.get("selected") else " "
         kind = "owned" if d.get("owned") else "shared"
-        lines.append(f"  {mark} {_dev_label(d)}  ({kind})")
+        # ⛔⛔ THE SETTING IS PRINTED HERE BECAUSE THE SKILL FILE SAYS IT IS.
+        # SKILL.md routes "is my computer public?" to this command and tells the
+        # model the row says which — and this list printed neither word, so the
+        # documented answer path landed on output that could not answer it. Only
+        # on rows this account OWNS: a shared row would be reporting somebody
+        # else's setting as if it were the reader's to change. ⛔ And absent
+        # means private — a machine paired before 2026-09-04 carries no field.
+        state = ""
+        if d.get("owned"):
+            state = ", public" if d.get("visibility") == "public" else ", private"
+        lines.append(f"  {mark} {_dev_label(d)}  ({kind}{state})")
     if not selected:
         lines.append("Tell me which one you’d like to use.")
     lines.append("You can add, remove, or switch devices anytime — just ask.")
@@ -1155,6 +1165,269 @@ def cmd_device_ask(args) -> int:
     ])
 
 
+# ⛔⛔ ANSWERING A REQUEST HAS ITS OWN TABLE. Five codes appear on both this
+# route and the ask route and mean DIFFERENT things on each: `device_not_found`
+# there means "not offered publicly", here it means "not yours any more";
+# `is_owner` there means "already yours", here it means the person asking owns
+# it; `revoked_sharer` there is about the caller and here it is about somebody
+# else. Borrowing `_ASK_ERRORS` would say the wrong true thing.
+# ⭐ THE SAME CLAIMS AS THE TERMINAL'S `_DECIDE_FAILURES`, worded for chat. A
+# guard compares what the two say, not how they say it.
+_DECIDE_ERRORS = {
+    "device_not_found": "That computer isn’t yours any more.",
+    "request_not_found":
+        "There’s no request from that person for that computer — it may have "
+        "been answered already, or it may have run out.",
+    "request_mismatch":
+        "That request doesn’t belong to that computer. Ask me for the queue "
+        "again and answer from what it shows.",
+    # ⛔⛔ THREE STATES BEHIND ONE CODE — see the terminal's note.
+    "request_not_pending":
+        "That request isn’t open any more — it was already answered, or it ran "
+        "out. Ask me for the queue again to see what is still waiting.",
+    "is_owner": "That person owns that computer, so there’s nothing to answer.",
+    "revoked_sharer":
+        "You removed this person from that computer before. Resetting its pair "
+        "code is what lets them back in.",
+    "share_cap_reached":
+        "That computer is already shared with as many people as it can hold. "
+        "Remove someone first.",
+    "invalid_json": "That answer didn’t reach the app in a form it could read.",
+    "device_id_required": "That isn’t an id any computer could have.",
+    "requester_required": "That isn’t the id of a person who could have asked.",
+    "decision_required":
+        "The app didn’t get a yes or a no, so nothing was answered.",
+    # ⛔ NO RETRY PROMISE. The ask table's row for this same code ends "and I'll
+    # retry", and nothing here retries anything — one code should not make two
+    # different promises inside one client.
+    "unauthorized": "This agent’s sign-in was refused — sign in again.",
+    "internal_error":
+        "The app hit a problem of its own answering that. Nothing about that "
+        "request changed, so it’s safe to try again.",
+}
+
+
+def _decide_refusal_line(err: str, retry_after_ms=None) -> str:
+    """One refusal from the answer-a-request route, in words.
+
+    Same ladder as the ask: the server's own wait first, then the table, then an
+    unreadable reply, then the code rather than silence. ⛔ The bridge's OWN
+    refusals — an id this account cannot reach, a machine somebody else owns —
+    are whole sentences already and fall through to the last tier on purpose.
+    """
+    if err == "rate_limited":
+        mins = None
+        if isinstance(retry_after_ms, (int, float)) and not isinstance(
+                retry_after_ms, bool) and retry_after_ms > 0:
+            mins = max(1, int((retry_after_ms + 59_999) // 60_000))
+        if mins is None:
+            return ("The app is rate-limiting answers from this account just now. "
+                    "Nothing was answered.")
+        return (f"The app is rate-limiting answers from this account. Try again in "
+                f"about {mins} minute{'s' if mins != 1 else ''}.")
+    said = _DECIDE_ERRORS.get(err)
+    if said is not None:
+        return said
+    if str(err).startswith("http_"):
+        return (f"The app answered that with nothing I can read (HTTP {err[5:]}) "
+                f"— nothing was answered.")
+    return f"Couldn’t answer that request: {err or 'no reason given'}"
+
+
+def _incoming_or_lines() -> "tuple[list, list, int]":
+    """The people waiting on this account's machines — or the lines saying why
+    there are none, and the exit code that failure deserves.
+
+    ⛔ THE CODE COMES BACK TOO. Returning only lines made the caller exit 1 for
+    everything, so an unreachable bridge — which every sibling reports as 2 —
+    was reported as a refusal the person could act on.
+    """
+    code, body = _get("/devices/requests", timeout=40)
+    if code != 200:
+        return [], [f"✗ {_list_refusal_line('asked for your requests', body.get('error', ''), body.get('retryAfterMs'))}"], _fail_code(code)
+    rows = body.get("incoming") or []
+    if not rows:
+        return [], ["Nobody is waiting on your computers."], 1
+    return rows, [], 0
+
+
+def _describe_incoming(rows: list, whole: bool = True) -> list:
+    """The queue, as lines. ⛔ THE PERSON'S NAME IS A SNAPSHOT taken the day they
+    asked and falls back to a neutral word shared by everybody the app could not
+    look up, so the machine is named on every row too — a row that says only who
+    is asking is unanswerable when two people are waiting."""
+    # ⛔ THE HEADER COUNTS WHAT IT IS SHOWING, and `whole` says whether that is
+    # the queue. Called with a filtered subset it printed "People asking to use
+    # your computers (2)" over two of five — a false count under a header that
+    # claims to be everybody.
+    lines = [f"People asking to use your computers ({len(rows)}):" if whole
+             else f"Matching ({len(rows)}):"]
+    for d in rows:
+        who = str(d.get("requesterLabel") or "").strip() or "Someone"
+        what = str(d.get("deviceLabel") or "").strip() or "(unnamed)"
+        lines.append(f"  • {who} wants “{what}”")
+    return lines
+
+
+def _resolve_asker(who: str, rows: list) -> "tuple[dict | None, list]":
+    """One waiting person, from what somebody typed.
+
+    ⛔⛔ EXACT FIRST, THEN ONE UNIQUE SUBSTRING, THEN NOTHING — the same ladder
+    `_resolve_device_arg` uses for machines, for the same reason: a wrong match
+    here does not misname a thing, it lets a stranger onto somebody's computer.
+    An ambiguous or absent match prints the queue instead of guessing, and the
+    reply names in full whoever was actually answered.
+    """
+    bare = (who or "").strip().strip(_NL_QUOTE_CHARS).strip()
+    if not bare:
+        if len(rows) == 1:
+            return rows[0], []
+        return None, (["Which one?"] + _describe_incoming(rows) +
+                      ["Say for example: approve " +
+                       (str(rows[0].get("requesterLabel") or "").strip()
+                        or "the first one")])
+    low = bare.lower()
+    # ⛔⛔ THE EXACT RUNG NEEDS THE UNIQUENESS TEST TOO, and it did not have one
+    # while the substring rung below carefully did. The queue holds one row per
+    # MACHINE per person, so somebody who asked for two of this account's
+    # computers is two rows with the identical label AND the identical id — and
+    # "approve Alex" silently answered the older one. Two askers with no display
+    # name are both the neutral fallback word, so "approve Someone" did the
+    # same. This function's own docstring promised the opposite.
+    exact = [d for d in rows
+             if str(d.get("requesterUid") or "") == bare
+             or str(d.get("requesterLabel") or "").strip().lower() == low]
+    if len(exact) == 1:
+        return exact[0], []
+    if len(exact) > 1:
+        return None, (["That matches more than one thing they are waiting on."] +
+                      _describe_incoming(exact, whole=False) +
+                      ["Answer one at a time from a terminal, where each row "
+                       "carries both ids: `agent device requests`."])
+    hits = [d for d in rows
+            if low in str(d.get("requesterLabel") or "").strip().lower()]
+    if len(hits) == 1:
+        return hits[0], []
+    if len(hits) > 1:
+        return None, (["More than one person waiting matches that."] +
+                      _describe_incoming(hits, whole=False) +
+                      ["Say the whole name. If two of them read the same, answer "
+                       "from a terminal — `agent device requests` prints an id "
+                       "on every row."])
+    return None, ([f"Nobody called “{bare}” is waiting on your computers."] +
+                  _describe_incoming(rows))
+
+
+def _cmd_device_decide(args, decision: str) -> int:
+    """Approve or deny one person waiting on one of this account's machines."""
+    rows, lines, rc = _incoming_or_lines()
+    if not rows:
+        # ⛔ THE BRIDGE'S OWN CODE, NOT A FLAT 1. Every sibling exits 2 when the
+        # bridge is unreachable and 1 when the answer was a refusal; this one
+        # reported a refusal for both.
+        return _emit({}, args.json, lines, rc)
+    row, fail = _resolve_asker(getattr(args, "person", "") or "", rows)
+    if row is None:
+        return _emit({}, args.json, fail, 1)
+    code, body = _post("/device/decide",
+                       {"deviceId": row.get("deviceId"),
+                        "requesterUid": row.get("requesterUid"),
+                        "decision": decision}, timeout=40)
+    if code != 200:
+        return _emit(body, args.json,
+                     [f"✗ {_decide_refusal_line(body.get('error', ''), body.get('retryAfterMs'))}"],
+                     _fail_code(code))
+    who = str(row.get("requesterLabel") or "").strip() or "They"
+    name = body.get("deviceName") or str(row.get("deviceLabel") or "").strip() \
+        or "that computer"
+    if body.get("decision") == "approved":
+        # ⛔⛔ A STATE, NEVER AN EVENT. The route closes an already-shared request
+        # as approved and writes nothing to the machine, so "you have just added
+        # them" is false on one of the two branches that reach here. "They can
+        # use it" is true on both.
+        return _emit(body, args.json, [
+            f"✓ {who} can use “{name}”.",
+            "It turns up on their side as one of their computers.",
+        ])
+    return _emit(body, args.json, [
+        f"✓ Said no to {who} for “{name}”.",
+        "They can’t ask again for a week. The app tries to tell them, but that "
+        "depends on their own notification settings. Giving them the pair code "
+        "still works if you change your mind.",
+    ])
+
+
+def cmd_device_approve(args) -> int:
+    return _cmd_device_decide(args, "approve")
+
+
+def cmd_device_deny(args) -> int:
+    return _cmd_device_decide(args, "deny")
+
+
+def cmd_device_visibility(args) -> int:
+    """Set who can FIND one of this account's machines."""
+    value = (getattr(args, "value", "") or "").strip().lower()
+    if value not in ("public", "private"):
+        return _emit({}, args.json, ["Say public or private."], 1)
+    hint = (getattr(args, "device", "") or "").strip()
+    if hint:
+        dev, fail = _resolve_device_arg(hint)
+        if dev is None:
+            return _emit({}, args.json, fail, 1)
+    else:
+        dev, fail = _pick_owned_device()
+        if dev is None:
+            return _emit({}, args.json, fail, 1)
+    code, body = _post("/device/visibility",
+                       {"deviceId": dev.get("id"), "visibility": value}, timeout=40)
+    if code != 200:
+        # ⛔⛔ NOT `_list_refusal_line` — see the terminal's note. Its "Couldn’t
+        # …" prefix contradicts the very payload the bridge built to say the
+        # write may have landed.
+        said = body.get("error") or "the app gave no reason"
+        return _emit(body, args.json, [f"✗ {said}"], _fail_code(code))
+    name = body.get("deviceName") or _dev_label(dev)
+    state = body.get("visibility")
+    head = (f"✓ “{name}” is now {state}." if body.get("changed")
+            else f"✓ “{name}” is already {state}. Nothing to change.")
+    if state == "public":
+        lines = [head,
+                 "Other people can find it and ask to use it. You still approve "
+                 "every person yourself."]
+        # ⛔⛔ THE PUBLISHED NAME IS THE DISCLOSURE, not decoration: a computer
+        # nobody has renamed reports a hostname that often carries its owner's
+        # own name, and this is where that becomes visible to strangers.
+        if body.get("publicLabel"):
+            lines.append(f"They see it as “{body.get('publicLabel')}”.")
+    else:
+        lines = [head,
+                 "Nobody can find it. A pair code still lets someone in without "
+                 "asking you."]
+    return _emit(body, args.json, lines)
+
+
+def _pick_owned_device() -> "tuple[dict | None, list]":
+    """The machine an owner verb should act on when nobody named one.
+
+    ⛔ OWNED ONLY. A shared machine is somebody else's to publish, and offering
+    one in this picker would send the person into a refusal the picker could
+    have spared them — the same reasoning the terminal's send-logs advice uses.
+    """
+    code, body = _get("/devices")
+    if code != 200:
+        return None, [f"✗ {body.get('error', code)}"]
+    owned = [d for d in (body.get("devices") or []) if d.get("owned")]
+    if not owned:
+        return None, ["None of the computers on this account are yours to change "
+                      "— that setting belongs to whoever owns the machine."]
+    if len(owned) == 1:
+        return owned[0], []
+    return None, (["Which computer?"] +
+                  [f"  • {_dev_label(d)}" for d in owned] +
+                  [f'Say for example: make “{_dev_label(owned[0])}” public.'])
+
+
 def _looks_like_a_device_id(wanted: str) -> bool:
     """Is this an id rather than a name somebody typed?
 
@@ -1213,17 +1486,38 @@ def _resolve_public_device(wanted: str):
 
 
 def cmd_device_requests(args) -> int:
-    """The access requests this account is still waiting on."""
+    """Both halves of the queue: people waiting on THIS account's machines, and
+    what this account is waiting on from other people.
+
+    ⛔ Printed apart and never summed. Only one half is anybody's to act on from
+    here, and the other is somebody else's decision.
+    """
     code, body = _get("/devices/requests", timeout=40)
     if code != 200:
         return _emit(body, args.json,
                      [f"✗ {_list_refusal_line('asked for your requests', body.get('error', ''), body.get('retryAfterMs'))}"],
                      _fail_code(code))
     rows = body.get("requests") or []
-    if not rows:
-        lines = ["You’re not waiting on any computer."]
+    incoming = body.get("incoming") or []
+    # ⛔⛔ THE OWNER'S HALF LEADS, because it is the only one anybody can answer
+    # from here. ⛔ AND ITS ABSENCE IS SAID OUT LOUD: silence about it reads as
+    # "this screen does not cover that", which is exactly what it used to mean.
+    if incoming:
+        lines = _describe_incoming(incoming)
+        # ⛔⛔ WHAT A YES MEANS AND WHAT A NO COSTS, BOTH BEFORE THE DECISION. The
+        # web app puts the first beside its buttons and never states the second
+        # to the owner at all — it tells the ASKER about the week and leaves the
+        # person spending it uninformed.
+        lines.append("Anyone you say yes to can run research on that computer — "
+                     "the same as somebody you gave a pair code to. Saying no "
+                     "stops them asking again for a week; the app tries to tell "
+                     "them, but that depends on their own notification settings.")
     else:
-        lines = [f"Waiting on ({len(rows)}):"]
+        lines = ["Nobody is waiting on your computers."]
+    if not rows:
+        lines.append("You’re not waiting on any computer.")
+    else:
+        lines.append(f"Waiting on ({len(rows)}):")
         for d in rows:
             label = str(d.get("deviceLabel") or "").strip() or "(unnamed)"
             lines.append(f"  • “{label}”  (id {d.get('deviceId')})")
@@ -1237,10 +1531,15 @@ def cmd_device_requests(args) -> int:
     # are already on — so asking again cannot report a yes; it answers "no public
     # computer is called that". A yes reports itself by the machine turning up in
     # your own list.
-    lines.append("Only unanswered requests show here. Once one is answered it leaves "
-                 "this list whichever way it went. A yes shows up as the computer "
-                 "appearing in your own list; for a no, ask for it again and I’ll "
-                 "tell you.")
+    # ⛔ THIS SENTENCE IS ABOUT THE ASKER'S HALF AND SAYS SO. It used to be the
+    # only half on the screen, so "requests" needed no qualifier; with the
+    # owner's queue above it, an unqualified "only unanswered requests show here"
+    # would read as a claim about people waiting on YOU as well — and the two
+    # halves lose a row for different reasons.
+    lines.append("Of the ones you asked for, only unanswered requests show here. "
+                 "Once one is answered it leaves this list whichever way it went. "
+                 "A yes shows up as the computer appearing in your own list; for "
+                 "a no, ask for it again and I’ll tell you.")
     return _emit(body, args.json, lines)
 
 
@@ -2647,6 +2946,17 @@ _NL_AGENT_WORDS = ("chatgpt", "claude", "gemini", "gpt")
 # The quote marks a person or a chat runtime can wrap a name in. ⛔ ALL SIX:
 # the picker prints curly doubles, phones substitute curly singles, and a
 # hand-typed reply uses straight ones.
+# ⛔⛝ ONE MACHINE-NOUN LIST FOR THE WHOLE FILE, AND IT IS MODULE LEVEL FOR A
+# MEASURED REASON. 7.9-3 unified two copies inside `_nl_resolve` after they had
+# drifted by two words and silently broke four guards — and then cross-verify
+# found THREE MORE copies elsewhere in the same function, each missing `mac`,
+# `macbook` and `workstation`. So "remove my mac" and "unlink my macbook"
+# reached the catch-all while "remove my computer" worked, and the comment
+# claiming the list was unified was false when it was written. Every site that
+# asks "is a computer being talked about" now reads this one name.
+_MACHINE_NOUNS = (r"computers?|devices?|machines?|nodes?|pcs?|laptops?"
+                  r"|macs?|macbooks?|desktops?|workstations?")
+
 _NL_QUOTE_CHARS = "“”‘’\"'"
 
 _NL_CONFIRMS = {
@@ -2674,6 +2984,34 @@ _NL_CONFIRMS = {
                   "and they see your name — or your email, if you haven’t set one. "
                   "They decide, and nothing runs on it unless they say yes. Say yes "
                   "and I’ll ask.",
+    # ⛔⛔ THE WEB APP DOES NOT CONFIRM THIS AND THIS SURFACE MUST. Over there the
+    # warning sits at the top of the list the Yes and No buttons are in, so the
+    # cost is on screen at the moment of the tap. Here there is no screen — the
+    # confirm line IS that warning, and it carries the app's own sentence rather
+    # than a second wording of it.
+    "device-approve": "Say yes to {name}? Anyone you say yes to can run research "
+                      "on that computer — the same as somebody you gave a pair "
+                      "code to. Say yes and I’ll tell them yes.",
+    # ⛔⛝ DENYING CONFIRMS TOO, AND ITS COST IS THE ONE NOBODY IS TOLD. A refusal
+    # stops that person asking again for a week; the app tells THEM that and
+    # tells the owner nothing at all — the fact lives in a code comment there.
+    # It is recoverable (the pair code still works) and that is said here,
+    # because a cost with no way out reads as a bigger decision than it is.
+    "device-deny": "Say no to {name}? They cannot ask again for a week — the app "
+                   "tries to tell them, but that depends on their own "
+                   "notification settings. Giving them the pair code still works "
+                   "if you change your mind. Say yes and I’ll turn them down.",
+    # ⛔⛔ ONLY THE PUBLIC DIRECTION. Hiding a computer takes it OFF a list and
+    # costs nothing anybody was promised; confirming a strictly narrowing change
+    # is how people learn to click through the confirms that matter.
+    # ⛔ THE NAME IT PUBLISHES IS THE DISCLOSURE. A Mac nobody has renamed
+    # reports a hostname carrying its owner's own name, so this says so without
+    # needing to know the value — the command prints the exact label after.
+    "device-visibility": "Let other people find {name} and ask to use it? They "
+                         "would see the name it reports — on a computer nobody "
+                         "has renamed that is often its owner’s own name — and "
+                         "you would still approve every person yourself. Say yes "
+                         "and I’ll switch it on.",
 }
 
 # Info-only reply (NOT a confirm — there's no action for me to take): the skill
@@ -2727,7 +3065,7 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     code_m = _NL_CODE_RE.search(t)
     if code_m:
         tok = code_m.group(1) or code_m.group(2)
-        _kw = re.search(r"\b(device|node|pair|add|code|machine|pc|computer)\b", low)
+        _kw = re.search(rf"\b({_MACHINE_NOUNS}|pair|add|code)\b", low)
         _bare = re.fullmatch(r"[^A-Za-z0-9]*" + re.escape(tok) + r"[^A-Za-z0-9]*", t, re.I)
         # ⛔⛔ A VERB THAT NAMES AN EXISTING COMPUTER IS NOT A PAIRING. The comment
         # above claims a code-shaped token inside a sentence cannot hijack the
@@ -2748,7 +3086,12 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
                               r"request|requesting|borrow)\b", low)
         if _bare or _pairing or (_kw and not _existing):
             return ["device-add", tok], None
-    if re.search(r"\b(add|pair|connect)\b.*\b(device|node|machine|pc|computer)\b", low) or \
+    # ⛔ A PUBLISH REQUEST IS NOT A PAIRING REQUEST. "add my computer to the
+    # public list" was answered with "paste the access code" — this rule sits
+    # above everything and its verb list contains `add`.
+    if re.search(r"\bpublic|\bfindable|\bdiscoverable\b", low):
+        pass
+    elif re.search(r"\b(add|pair|connect)\b.*\b(device|node|machine|pc|computer)\b", low) or \
             re.search(r"\bpair (my|a|the|this)\b", low):
         return None, ["Paste the access code shown on the computer running Super "
                       "Research (8 characters — dashes optional) and I’ll add it."]
@@ -2870,22 +3213,43 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     # — the same reason `--runs` is argument-only.
     _public_kw = re.search(r"\bpublic(?:ly)?\b|\bsomebody else|\bsomeone else"
                            r"|\bother (?:people|persons?|users?)\b", low)
-    _machine_kw = re.search(r"\b(computers?|devices?|machines?|nodes?|pcs?|laptops?"
-                            r"|macs?|desktops?)\b", low)
+    # ⛔⛔ ONE NOUN LIST, TWO QUESTIONS, AND THEY HAD DRIFTED. `_machine_kw` asks
+    # whether a computer is being talked about; `_mine_kw` asks whether it is the
+    # ASKER'S. They were written as two literals two lines apart and ended up
+    # differing by two words — `macs?` and `nodes?` were in one and not the other
+    # — so every guard built on `_mine_kw` silently failed for the commonest word
+    # for a Mac. Measured 2026-09-07, four live defects, all of them mine from
+    # 7.9-2 and every one of them a defect a comment here claimed was fixed:
+    # "make my mac public" and "is my mac public" listed STRANGERS' machines,
+    # "who is waiting on my mac" showed the asker's own outgoing list, and "stop
+    # offering my mac" became a run-stop quoting the phrase as a research title.
+    # One list now, so the next word added to it cannot land in only one place.
+    _machine_kw = re.search(rf"\b({_MACHINE_NOUNS})\b", low)
     _ask_kw = re.search(r"\b(ask|asked|asking|request|requests|requested|apply|"
                         r"borrow)\b", low)
     # ⛔ THE FOUR SUBJECTS THAT ARE NOT THIS RULE'S. A message carrying one of
     # them belongs to a rule further down and must fall through untouched: an
     # artefact or a run, a run control, an unlink, or the person's OWN machine.
+    # ⛔⛔ "RESEARCH COMPUTER" IS A MACHINE, NOT AN ARTEFACT — and it is the
+    # DEFAULT LABEL of every machine nobody has renamed, printed verbatim by the
+    # browse list and by this client's own picker ("Say for example: make
+    # “Research computer” public."). With `research` in the artefact list, every
+    # owner verb aimed at one fell to the catch-all, including the exact string
+    # the client had just told the person to type. Blanked for this test only.
+    _low_no_rc = re.sub(rf"\bresearch(?:es)?\s+(?:{_MACHINE_NOUNS})\b", "  ", low)
     _artefact_kw = re.search(r"\b(podcasts?|audio|videos?|reports?|briefs?|links?|"
                              r"status|progress|updates?|research(?:es)?|topics?|"
-                             r"logs?|results?|runs?|emails?)\b", low)
+                             r"logs?|results?|runs?|emails?)\b", _low_no_rc)
     _control_kw = re.search(r"\b(stop|end|abort|pause|resume|unpause|retry|skip|"
                             r"drop)\b", low)
     _unlink_kw = re.search(r"\b(unlink|forget)\b", low)
-    _mine_kw = re.search(r"\b(my|mine|our|this)\b(?:\s+\w+){0,2}\s+"
-                         r"(?:computers?|machines?|devices?|pcs?|laptops?|desktops?)\b",
-                         low)
+    _mine_kw = re.search(rf"\b(my|mine|our|this)\b(?:\s+\w+){{0,2}}\s+"
+                         rf"(?:{_MACHINE_NOUNS})\b", low)
+    # ⛔ MOVED UP FROM THE WAITING CLAUSE IN 7.9-3, unchanged. Two clauses above
+    # it now need the same subject test, and a second copy of this pattern is
+    # exactly the drift the noun list above records.
+    _request_kw = re.search(r"\b(requests?|asks?|access|approvals?|permissions?)\b",
+                            low)
 
     # ⛔⛔ OFFERING YOUR OWN MACHINE IS AN OWNER VERB AND IT IS NOT HERE YET.
     # Without this the browse clause answered "make my computer public" and
@@ -2896,12 +3260,127 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     # it as a run-stop, quoting "sharing my machine" back as a research title. It
     # is the same owner question in different words, so it belongs here.
     _offering_kw = re.search(r"\b(sharing|offering|discoverable|findable)\b", low)
-    if (_public_kw or _offering_kw) and (_mine_kw or re.search(r"\bmy own\b", low)) and \
-            not re.search(r"\b(find|browse|discover|available)\b", low):
-        return None, ["Offering your own computer to other people is set on that "
-                      "computer, or from the web app — I can’t switch it from here.",
-                      "I can show you the computers other people are offering, if "
-                      "that’s what you meant."]
+    # ⛔⛔ THE WORDS FOR HIDING CARRY NO "PUBLIC" IN THEM. "hide my computer",
+    # "unlist my mac", "make my pc private", "stop offering my machine" — every
+    # one of those fell through to the catch-all or, worse, to rule 3, which
+    # quoted "offering my mac" back as a research title and offered to stop it.
+    # ⛔⛔ HIDING IS OFTEN SAID WITHOUT THE WORD "PRIVATE" — cross-verify found
+    # eight shapes that carry no hiding word at all and every one of them
+    # reached the PUBLISH confirm, i.e. the exact opposite of what was asked.
+    # "turn off sharing", "disable sharing", "no longer share it", "remove it
+    # from the public list", "undo making it public", "it should not be public".
+    _hiding_kw = (re.search(r"\b(private|hidden|hide|unlist|unlisted|unpublish|"
+                            r"undiscoverable)\b", low)
+                  or re.search(r"\b(stop|turn|switch|shut)\b.{0,20}\b(off|offering|"
+                               r"sharing|listing|publishing|letting|showing|"
+                               r"allowing)\b", low)
+                  or re.search(r"\b(disable|unshare|deregister|delist)\b", low)
+                  or re.search(r"\b(take|remove|drop|pull)\b.{0,30}"
+                               r"\b(off|out of|from)\b.{0,24}\b(list|public|"
+                               r"directory)\b", low)
+                  or re.search(r"\bundo\b.{0,24}\bpublic\b", low)
+                  # ⛔⛔ A NEGATION IN FRONT OF "PUBLIC" IS A HIDE, NOT A PUBLISH.
+                  or re.search(r"\b(don'?t|do not|never|no longer|not|shouldn'?t|"
+                               r"should not|stop)\b[^.?!]{0,40}\b(public|findable|"
+                               r"discoverable|shared?|sharing)\b", low))
+    # ⛔⛔ A POLITE IMPERATIVE IS NOT A QUESTION. "can you make my mac public"
+    # and "could you hide my mac" are the commonest way anybody asks for either
+    # verb, and reading them as state questions answered neither. The
+    # discriminator is whether a SETTER follows the politeness, not the opening
+    # word — "is my mac public" has no setter and stays a question.
+    _polite_imperative = re.match(r"^(?:can|could|would|will|please|do)\s+(?:you\s+)?"
+                                  r"(?:please\s+)?(?:make|set|switch|turn|put|hide|"
+                                  r"unlist|unpublish|offer|share|publish|disable)\b",
+                                  low)
+    _asking_state = (re.match(r"^(is|are|does|do|can|could|who|what|which|how|"
+                              r"tell me (?:if|whether)|check)\b", low)
+                     and not _polite_imperative)
+    # ⛔⛔ THE SUBJECT MUST BE ONE OF THIS ACCOUNT'S OWN MACHINES, AND A BARE
+    # SETTER IS NOT THAT. Widening the gate to any setter verb let "switch to a
+    # public computer", "put me on a public computer" and "make a list of public
+    # computers" reach the publish confirm, each naming a fabricated machine
+    # ("to a", "me", "list of"). ⛔ And "hide other people's computers from me"
+    # — a BROWSE wish — silently made the asker's own machine private.
+    # ⛔⛔ "OTHER PEOPLE'S", NOT "CONTAINS THE WORD PUBLIC". The first version of
+    # this gate keyed on `_public_kw`, which matches the bare word — and bailed
+    # on "make the Studio PC public", a regression this repair introduced and
+    # this comment exists to stop being reintroduced. What marks a message as
+    # about somebody ELSE'S machine is the phrase that says so.
+    # ⛔ AND NOT WHEN THE ASKER NAMES THEIR OWN MACHINE IN THE SAME BREATH.
+    # "offer my machine to other people" is the plainest way to say publish, and
+    # a bare other-people test bailed on it — the second regression this one
+    # gate produced while being narrowed.
+    _about_others = (re.search(r"\bsomebody else|\bsomeone else|\bother (?:people|"
+                               r"persons?|users?)\b|\bother people'?s\b", low)
+                     and not _mine_kw and not re.search(r"\bmy own\b", low))
+    _named_target = (re.search(r"\b(?:make|set|switch|turn|put|hide|unlist|"
+                               r"unpublish|offer|share|publish|disable|take|"
+                               r"remove|drop|pull)\s+"
+                               rf"(?:the|my|our|this|that)\s+[\w' -]*"
+                               rf"(?:{_MACHINE_NOUNS})\b", low)
+                     # ⛔ A QUOTED NAME CARRIES NO ARTICLE, and the picker's own
+                     # worked example quotes one: `make “Research computer”
+                     # public`. Without this the string the client just told the
+                     # person to type reached the browse list.
+                     or re.search(r"\b(?:make|set|switch|turn|put|hide|unlist|"
+                                  r"unpublish|offer|share|publish|disable)\s+"
+                                  rf"[{re.escape(_NL_QUOTE_CHARS)}]", t))
+    if (_public_kw or _offering_kw or _hiding_kw) \
+            and (_mine_kw or re.search(r"\bmy own\b", low) or _named_target) \
+            and not _about_others \
+            and not _artefact_kw and not _unlink_kw \
+            and not (_control_kw and not _hiding_kw):
+        if _asking_state:
+            return ["devices"], None
+        # ⛔ THE MACHINE IS A HINT, NEVER A NAME THIS RULE INVENTS. 7.9-2 shipped
+        # a clause that captured "access to the studio pc" as a machine name and
+        # then quoted it in a consent question, naming a computer that could not
+        # exist. What is passed here is validated against the account's OWN list
+        # by the command, and an unresolvable hint degrades to the picker rather
+        # than to a confident wrong machine.
+        # ⛔⛔ TWO SHAPES, BECAUSE A VERB-FIRST HIDE HAS NO TRAILING KEYWORD.
+        # "hide the studio pc" matched nothing, so the name was dropped and the
+        # picker hid whichever machine it liked — unconfirmed. And `on|off|to`
+        # as terminators captured "off sharing" out of "turn off sharing".
+        _vis_obj = ""
+        _vm = (re.search(rf"\b(?:make|set|switch|turn|put|offer|share|publish|"
+                         rf"hide|unlist|unpublish)\s+"
+                         rf"[{re.escape(_NL_QUOTE_CHARS)}]([^{re.escape(_NL_QUOTE_CHARS)}]+)",
+                         t, flags=re.I)
+               or re.search(r"\b(?:make|set|switch|turn|put|offer|share|publish)\s+"
+                            r"(.+?)\s+(?:public|private|findable|discoverable|"
+                            r"hidden|unlisted)\b", t, flags=re.I)
+               or re.search(r"\b(?:hide|unlist|unpublish|delist)\s+(.+?)$",
+                            t, flags=re.I)
+               or re.search(r"\b(?:take|remove|drop|pull)\s+(.+?)\s+"
+                            r"(?:off|out of|from)\b", t, flags=re.I))
+        if _vm:
+            _vis_obj = re.sub(r"^(?:the|a|an|my|our|this|that)\s+", "",
+                              _vm.group(1).strip().strip(_NL_QUOTE_CHARS),
+                              flags=re.I).strip()
+            _vis_obj = re.sub(r"[?.!,]+$", "", _vis_obj).strip()
+            # A bare noun names no machine; neither does a phrase about other
+            # people's, and quoting either back is the 7.9-2 defect shape.
+            # ⛔ THE TEST IS ON THE CAPTURED OBJECT, NOT ON THE MESSAGE. The
+            # first version also cleared the name whenever `_public_kw` matched
+            # — which is every publish phrasing there is — so no machine could
+            # ever be named. What disqualifies a capture is that IT names no
+            # machine: a bare noun, a pronoun, or a phrase about other people's.
+            if (re.fullmatch(rf"(?:{_MACHINE_NOUNS}|it|them|one|ones|everything|"
+                             rf"me|us|myself)", _vis_obj, flags=re.I)
+                    or re.search(r"\bpublic|\bsomebody else|\bsomeone else|"
+                                 r"\bother (?:people|persons?|users?)\b",
+                                 _vis_obj, flags=re.I)):
+                _vis_obj = ""
+        if _hiding_kw:
+            # ⛔ NO CONFIRM ON HIDING. It takes a computer OFF a list; the only
+            # thing it can cost is somebody not finding a machine they were
+            # never promised. Confirming a strictly narrowing change teaches
+            # people to click through the confirms that matter.
+            return (["device-visibility", "private"] +
+                    ([_vis_obj] if _vis_obj else []), None)
+        return None, [_NL_CONFIRMS["device-visibility"].format(
+            name=f"“{_vis_obj}”" if _vis_obj else "that computer")]
 
     # ⛔⛔ THERE IS NO WITHDRAW, SO SAY SO — but only about a REQUEST FOR A
     # MACHINE. Ungated, this clause answered "cancel the video" with a sentence
@@ -2919,26 +3398,165 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
                       "after a week.",
                       "I can show you what you’re waiting on if that helps."]
 
-    # ⛔⛔ AN OWNER ASKING WHO WANTS THEIR MACHINE IS ASKING SOMETHING THIS
-    # SURFACE CANNOT ANSWER. The queue of people waiting on YOUR computer is the
-    # owner's half of the same route, and there is no approve or deny verb here
-    # yet — so the honest answer names the web app. Before this, the phrasing
-    # reached the catch-all or, worse, the asker's own empty list, which told an
-    # owner nobody had asked when somebody had.
+    # ⛔⛔ ANSWERING SOMEBODY. Until 7.9-3 every phrasing below reached either
+    # the catch-all, which denies having the verb, or — worse — the ASK consent
+    # question: "approve the request for my Mac" offered to hand the owner's own
+    # name to a stranger for a computer named "for my Mac". Measured live.
+    _yes_kw = (re.search(r"\b(approve[sd]?|approving|accept(?:s|ed|ing)?|"
+                         r"allow(?:s|ed|ing)?|grant(?:s|ed|ing)?|"
+                         r"say(?:s|ing)? yes|said yes)\b", low)
+               # ⛔ "give X access" is the plainest way an owner says yes and it
+               # reached nothing. Bare `give` is far too broad, so the shape —
+               # not the word — is what routes.
+               or re.search(r"\bgives?\s+(?:\w+\s+){0,2}access\b", low)
+               # ⛔⛔ "LET ME USE IT" IS THE REQUESTER'S SENTENCE, NOT AN OWNER
+               # GRANTING. This shape was written for "let Sam use it" and
+               # matched the commonest way anybody ASKS for a computer — and
+               # sitting above the ask clause, it offered to approve a stranger
+               # instead. "ask them to let me use their computer" is the
+               # product's own advice wording and did the same.
+               or re.search(r"\blet\s+(?!me\b|us\b|myself\b)"
+                            r"(?:\w+\s+){0,2}(?:use|onto|on|in)\b", low))
+    _no_kw = re.search(r"\b(deny|denies|denied|denying|reject(?:s|ed|ing)?|"
+                       r"refus(?:e|es|ed|ing)|declin(?:e|es|ed|ing)|"
+                       r"turn(?:s|ed)? (?:them |him |her |it )?down|"
+                       r"say(?:s|ing)? no|said no)\b", low)
+    # ⛔⛔ THE SUBJECT GATE IS THE WHOLE SAFETY OF THIS CLAUSE. `accept`, `allow`
+    # and `grant` are ordinary English — "allow it to finish", "accept the risk"
+    # — so on their own they must not route anywhere. The five words below mean
+    # nothing else in this product: nothing here is approved, denied, rejected
+    # or declined except a person waiting for a computer.
+    _strong_decide = (re.search(r"\b(approve[sd]?|approving|deny|denies|denied|"
+                                r"denying|reject(?:s|ed|ing)?|"
+                                r"declin(?:e|es|ed|ing))\b", low)
+                      # ⛔ TWO SHAPES, NOT TWO WORDS. Bare `say` and bare `let`
+                      # are everywhere; "say yes to somebody" and "let somebody
+                      # use it" are answers to a request and nothing else.
+                      or re.search(r"\bsay(?:s|ing)? (?:yes|no) to\b", low)
+                      or re.search(r"\bgives?\s+(?:\w+\s+){0,2}access\b", low)
+                      or re.search(r"\blet\s+(?!me\b|us\b|myself\b)"
+                                   r"(?:\w+\s+){0,2}(?:use|onto|on|in)\b", low))
+    # ⛔⛔ A NEGATION IS NOT THE VERB IT CONTAINS. "don't allow anyone else to
+    # use my computer" and "never allow strangers on my mac" returned an APPROVE
+    # confirm — the exact opposite of what was asked, one "yes" from granting.
+    # Neither is refused here either: what the person wants is a hide or a
+    # sharer removal, and guessing between them is worse than the catch-all.
+    _negated_decide = re.search(r"\b(don'?t|do not|never|no longer|not|cannot|"
+                                r"can'?t|shouldn'?t|should not|won'?t|would not)"
+                                r"\b[^.?!]{0,24}\b(allow|approve|accept|grant|"
+                                r"let|say yes)\b", low)
+    # ⛔⛔ MY OWN REQUEST IS THE ASKER'S STATUS QUESTION, NOT A DECISION. "has my
+    # request been approved yet" and "why was my request denied" reached the
+    # decide confirms, so somebody reading their own refusal was offered to
+    # refuse a stranger — and a "yes" would have spent that stranger's week.
+    _about_my_own_request = re.search(r"\bmy (?:access )?(?:requests?|asks?)\b", low)
+    # ⛔ A QUESTION ABOUT ANSWERING IS NOT AN ANSWER. The visibility clause grew
+    # this guard and the decide clause did not, so "how do I approve someone"
+    # and "have I approved anyone" raised a confirm.
+    _asking_about_deciding = re.match(r"^(how|why|what|when|who|which|should|"
+                                      r"have|has|had|did|does|do|can|could|is|"
+                                      r"are|was|were)\b", low)
+    # ⛔⛝ THE WEAK VERBS NEED A SUBJECT THE STRONG ONES DO NOT. `accept`, `allow`
+    # and `grant` are ordinary English, and the gate accepted a bare machine word
+    # as their subject — so "allow it to finish on my computer" and "accept the
+    # risk on my machine" raised a grant confirm. The comment above this clause
+    # named those exact sentences as ones that must not route, and the gate did
+    # not implement it. A weak verb now needs a REQUEST word or a person.
+    _person_object = re.search(r"\b(person|people|somebody|someone|anyone|"
+                               r"anybody|them|him|her|everyone)\b", low)
+    _weak_ok = bool(_request_kw or _person_object)
+    # ⛔ A BARE "I APPROVE" NAMES NOBODY AND NOTHING. On its own it granted the
+    # single queued requester after one reflexive "yes"; a strong verb has to be
+    # pointed at a request, a machine, a person, or an object of its own.
+    _decide_subject = bool(
+        _request_kw or _person_object or
+        (_strong_decide and (_machine_kw or re.search(
+            r"\b(?:approve|deny|reject|decline|accept|say (?:yes|no) to)\s+\S",
+            low))))
+    # ⛔ THE ASKER'S OWN STATUS QUESTION HAS AN ANSWER — their side of the queue
+    # — so it is routed there rather than dropped on the catch-all, which would
+    # deny having the verb somebody was plainly asking about.
+    if (_yes_kw or _no_kw) and _about_my_own_request and not _artefact_kw:
+        return ["device-requests"], None
+    if (_yes_kw or _no_kw) and not _artefact_kw and not _control_kw \
+            and not _negated_decide and not _asking_about_deciding \
+            and (_strong_decide or _weak_ok) and _decide_subject:
+        # ⛔ THE PERSON IS A HINT, VALIDATED LATER, NEVER INVENTED HERE. The
+        # command matches it against the actual queue and falls back to printing
+        # who IS waiting, so a bad capture costs a question rather than granting
+        # a stranger a computer.
+        _who = ""
+        _wm = (re.search(r"\b(?:approve|grant|gives?|deny|refuse|decline)\s+"
+                         r"(?:\w+\s+)?access\s+(?:to|for)\s+"
+                         r"(.+?)(?:\s+\b(?:for|to|on|onto)\b|$)", t, flags=re.I)
+               or re.search(r"\b(?:from|by)\s+(.+?)(?:\s+\b(?:for|to|on)\b|$)",
+                            t, flags=re.I)
+               or re.search(r"\b(?:say (?:yes|no) to|approve|approving|deny|"
+                            r"denying|reject|decline|accept|allow|grant)\s+"
+                            r"(.+?)(?:\s+\b(?:for|to|on|onto)\b|$)",
+                            t, flags=re.I))
+        if _wm:
+            _who = re.sub(r"[?.!,]+$", "", _wm.group(1)).strip().strip(_NL_QUOTE_CHARS)
+            _who = re.sub(r"^(?:the|a|an|that|this|their|his|her|its)\s+", "",
+                          _who, flags=re.I).strip()
+            _who = re.sub(r"(?:'s|s')?\s*\b(requests?|asks?|application)\b\s*$",
+                          "", _who, flags=re.I).strip()
+            # ⛔ A PRONOUN, A POSSESSIVE OF MINE, OR A BARE MACHINE WORD IS NOT A
+            # PERSON. "approve it", "let them use my computer", "approve the
+            # request for my mac" all end up here with an object that names
+            # nobody, and quoting one back is the defect 7.9-2 shipped.
+            # ⛔ THE WORDS AROUND A PERSON ARE NOT THE PERSON. Cross-verify
+            # found six captures quoted back as names that name nobody:
+            # "access" ("grant access to sam"), "my" ("did the owner approve my
+            # request"), "default" ("deny everyone by default"), "this", "here",
+            # "marketing". A capture has to survive being stripped of the words
+            # that surround an answer before it can be quoted as somebody.
+            _who = re.sub(r"^(?:access|permission|entry|the request|request)\s+"
+                          r"(?:to|for|from)?\s*", "", _who, flags=re.I).strip()
+            if re.fullmatch(rf"(?:it|them|him|her|us|they|everyone|everybody|"
+                            rf"persons?|people|somebody|someone|anyone|anybody|"
+                            rf"this|that|here|there|now|yet|access|permission|"
+                            rf"default|both|all|everything|one|ones|my|our|"
+                            rf"my\s+\w+|our\s+\w+|{_MACHINE_NOUNS})", _who,
+                            flags=re.I) or len(_who) > 60:
+                _who = ""
+        _named = f"“{_who}”" if _who else "that request"
+        if _no_kw and not _yes_kw:
+            # ⛔⛔ DENYING CONFIRMS TOO, AND THE WEB APP DOES NOT. Over there the
+            # queue and the buttons are on one screen, so the cost is in front of
+            # the person as they click; here there is no screen. And the cost is
+            # real and invisible: a refusal stops that person asking again for a
+            # week, the app tells THEM and tells the owner nothing at all.
+            return None, [_NL_CONFIRMS["device-deny"].format(name=_named)]
+        return None, [_NL_CONFIRMS["device-approve"].format(name=_named)]
+
+    # ⛔⛔ AN OWNER ASKING WHO WANTS THEIR MACHINE IS NOW A REAL QUESTION WITH A
+    # REAL ANSWER. Until 7.9-3 this named the web app, because the queue had no
+    # verb behind it on this surface; `device-requests` carries both halves now.
     if _mine_kw and re.search(r"\b(who|whos|whose|anyone|anybody|somebody|someone|"
-                              r"people|how many)\b", low) and \
-            re.search(r"\b(want|wants|wanting|ask|asked|asking|request|requested|"
+                              r"people|how many|show|list|see|any|what)\b", low) and \
+            re.search(r"\b(wants?|wanting|asks?|asked|asking|requests?|requested|"
                       r"requesting|queued|queue|waiting|access)\b", low):
-        return None, ["Requests for YOUR computer are answered in the web app — I "
-                      "can’t show or decide them from here yet.",
-                      "What I can show you is what you are waiting on from other "
-                      "people."]
+        return ["device-requests"], None
 
     # What am I waiting on? ⛔ IT NEEDS ITS OWN SUBJECT. A bare "waiting for …"
     # answered every run-progress question — "still waiting for the podcast",
     # "waiting for the report" — with "You're not waiting on any computer".
-    _request_kw = re.search(r"\b(requests?|asks?|access|approvals?|permissions?)\b", low)
-    if not _artefact_kw and (_request_kw or _machine_kw or _public_kw) and (
+    # ⛔⛔ THE ONE PHRASING TWO SURFACES ALREADY PROMISE, AND IT ROUTED NOWHERE.
+    # `agent device requests` tells a Windows user to type "/sr what am I waiting
+    # on" and SKILL.md lists it as an example, and it reached the catch-all —
+    # which denies having the verb. The subject gate below is what blocked it,
+    # and that gate is right: 7.9-2 shipped a bare "waiting for …" that answered
+    # every run-progress question. So this is not the gate coming off — it is one
+    # more subject, and a narrow one. A WHOLE question about waiting, anchored at
+    # the start of the message and naming nothing else, is not somebody asking
+    # about a run; a person asking about a run names the run or its artefact, and
+    # `_artefact_kw` above still excludes every one of those.
+    _bare_waiting_q = re.match(r"^(?:so\s+)?(?:what|who)?\s*"
+                               r"(?:am|are)\s+(?:i|we)\s+(?:still\s+)?"
+                               r"waiting\s+(?:on|for)\b", low)
+    if not _artefact_kw and (_request_kw or _machine_kw or _public_kw
+                             or _bare_waiting_q) and (
             (_ask_kw and re.search(r"\b(my|any|outstanding|pending|open|all)\b.{0,24}"
                                    r"\b(requests?|asks?)\b", low))
             or re.search(r"\bwhat (?:did|have) i (?:ask|request)(?:ed)?\b", low)
@@ -2946,17 +3564,10 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
             or re.search(r"\b(?:did|has|have) (?:anyone|anybody|they|the owner)\b"
                          r".{0,24}\b(?:answer|answered|reply|replied|respond|"
                          r"responded|approve|approved|said)\b", low)):
-        # ⛔ AN OWNER ASKING WHO IS QUEUED FOR THEIR MACHINE IS NOT ASKING THIS.
-        # This surface carries only the asker's half — there is no approve or
-        # deny verb here yet — and answering with an empty asker list told an
-        # owner nobody had asked when somebody had.
-        if _mine_kw or re.search(r"\b(who|anyone|anybody|people)\b.{0,30}"
-                                 r"\b(want|wants|asking for|queued|waiting for)\b"
-                                 r".{0,20}\bmy\b", low):
-            return None, ["Requests for YOUR computer are answered in the web app — "
-                          "I can’t show or decide them from here yet.",
-                          "What I can show you is what you are waiting on from "
-                          "other people."]
+        # ⛔ THE OWNER'S BRANCH AND THE ASKER'S BRANCH ARE THE SAME COMMAND NOW.
+        # It used to matter which one somebody meant, because only one of them
+        # had an answer here; `device-requests` prints both halves, apart and
+        # labelled, so either reading is served by the same reply.
         return ["device-requests"], None
 
     # ⭐ THE OBJECT DECIDES BETWEEN ASK AND BROWSE. A phrasing that names a
@@ -3072,7 +3683,7 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
         r"|can|could|should|would|will|shall|may|do|don't|dont)\b",
         low,
     )
-    _device_noun = re.search(r"\b(device|node|laptop|pc|computer|machine|phone|desktop)\b", low)
+    _device_noun = re.search(rf"\b({_MACHINE_NOUNS}|phones?)\b", low)
     if not _q_start and not _device_noun and \
             re.search(r"\b(skip|drop|remove|cut|leave out|without|no)\b", low):
         phases = [p for p in _NL_PHASE_WORDS if p in low]
@@ -3109,7 +3720,7 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
                       "", name, flags=re.I).strip()
         return (["device-use", name] if name else ["devices"]), None
     if re.search(r"\b(remove|unlink|forget|delete)\b", low) and \
-            re.search(r"\b(device|node|laptop|pc|computer|machine|phone|desktop)\b", low):
+            re.search(rf"\b({_MACHINE_NOUNS}|phones?)\b", low):
         m = re.search(r"\b(?:remove|unlink|forget|delete)\s+(?:the\s+|my\s+)?(.+)$", t, flags=re.I)
         name = re.sub(r"[?.!,]+$", "", m.group(1)).strip() if m else ""
         name = re.sub(r"^(old|other)\s+", "", name, flags=re.I)
@@ -3182,8 +3793,10 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     # a verb the fallback denies having.
     return None, ["I didn’t catch a Super Research request in that. I can research "
                   "a topic, check a run’s status, fetch its podcast or links, list "
-                  "your researches, manage your devices, or find a public computer "
-                  "and ask to use it — what would you like?"]
+                  "your researches, manage your devices, find a public computer and "
+                  "ask to use it, and — for a computer you own — answer the people "
+                  "asking for it and set whether strangers can find it at all — "
+                  "what would you like?"]
 
 
 # The only option flags _nl_resolve ever emits — everything else in a resolved
@@ -3270,8 +3883,38 @@ def build_parser() -> argparse.ArgumentParser:
     dk.set_defaults(func=cmd_device_ask)
 
     sub.add_parser("device-requests",
-                   help="show the access requests you are waiting on"
+                   help="show who is asking for your computers, and what you "
+                        "are waiting on"
                    ).set_defaults(func=cmd_device_requests)
+
+    # ⛔ THE PERSON IS OPTIONAL AND THAT IS DELIBERATE. With exactly one person
+    # waiting, "approve that request" names everything it needs to; with several,
+    # the command prints the queue rather than choosing one. A required argument
+    # would force the router to invent a name from free text, which is the
+    # mistake 7.9-2 shipped.
+    dap = sub.add_parser("device-approve",
+                         help="let somebody use one of your computers")
+    dap.add_argument("person", nargs="?", default="")
+    dap.set_defaults(func=cmd_device_approve)
+
+    ddn = sub.add_parser("device-deny",
+                         help="refuse somebody asking for one of your computers")
+    ddn.add_argument("person", nargs="?", default="")
+    ddn.set_defaults(func=cmd_device_deny)
+
+    # ⛔⛔ NOT `device-public`. `devices-public` is the BROWSE list — other
+    # people's machines — and two commands one letter apart, where one shows you
+    # theirs and the other gives them yours, is a mistake somebody makes once and
+    # cannot undo. The setting is called visibility on the machine's own terminal
+    # for the same reason.
+    # ⛔ THE VALUE LEADS HERE AND TRAILS IN THE TERMINAL, because the OPTIONAL
+    # argument differs: chat can pick the machine when an account owns one, the
+    # terminal always names it by id.
+    dvi = sub.add_parser("device-visibility",
+                         help="set who can find one of your computers")
+    dvi.add_argument("value", choices=("public", "private"))
+    dvi.add_argument("device", nargs="?", default="")
+    dvi.set_defaults(func=cmd_device_visibility)
 
     rs = sub.add_parser("research", help="start a run")
     rs.add_argument("topic")

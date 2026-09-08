@@ -84,7 +84,13 @@ def _no_real_fe_posts(monkeypatch):
     # browse and access-request routes call, and an unstubbed one would put the
     # whole suite back on the internet through the door this fixture closed —
     # a GET is not safer than a POST for that, only quieter.
-    def _stub_get(_sess, path: str, params: dict | None = None) -> tuple[int, dict]:
+    # ⛔⛔ `**_kw` HERE TOO, AND IT WAS MISSING. The POST stub grew it in 7.9-2
+    # after `retry_401` turned a fixed signature into a TypeError in a dozen
+    # unrelated tests, and the GET stub two lines down was left as it was — the
+    # same trap, armed, on the helper this wave was about to touch. Closed
+    # before it fired rather than after.
+    def _stub_get(_sess, path: str, params: dict | None = None,
+                  **_kw) -> tuple[int, dict]:
         calls.append((path, params or {}))
         return 200, {}
 

@@ -428,12 +428,18 @@ MUTANTS = [
     ("A12", SR, "over",
      "⛔⛔ CHAT GUESSES BETWEEN TWO MACHINES WEARING THE SAME DEFAULT NAME, and "
      "the coin decides whose computer gets a request naming this person",
+     # ⛔ RE-ANCHORED IN 7.9-3 WITH ITS NEXT LINE. The wave added the same
+     # exact-then-unique-substring ladder for PEOPLE waiting on a machine, so
+     # this three-line shape stopped being unique in the file. The tail below
+     # is what makes it the MACHINE resolver and not the person one.
      [('    if len(hits) == 1:\n'
        '        return hits[0], []\n'
-       '    if len(hits) > 1:\n',
+       '    if len(hits) > 1:\n'
+       '        return None, [\n',
        '    if len(hits) >= 1:\n'
        '        return hits[0], []\n'
-       '    if False:\n')]),
+       '    if False:\n'
+       '        return None, [\n')]),
     ("A13", SR, "under",
      "⛔ AN EXACT ID STOPS WINNING OUTRIGHT, so the only unique thing on a public "
      "row is resolved by the same name match that cannot separate two of them",
@@ -454,14 +460,20 @@ MUTANTS = [
      "back to and B4's whole reason for existing is gone",
      [('            elif path == "/devices/requests":\n'
        '                self._device_requests()\n', '')]),
+    # ⛔ RE-ANCHORED IN 7.9-3, AND ITS CLAIM IS NOW THE OPPOSITE OF WHAT IT WAS.
+    # This mutant used to say that relaying the owner's queue at all was the
+    # defect, and that was true while nothing on this surface could answer one.
+    # 7.9-3 added the verb that answers it, so the defect moved: the two halves
+    # must stay APART, or an owner is told that somebody else's request is
+    # something THEY are waiting on.
     ("Q2", BRIDGE, "over",
-     "⛔⛔ THE OWNER'S QUEUE IS RELAYED TOO — names of people whose request "
-     "nothing on this surface can approve or deny, which is a dead end wearing a "
-     "list's clothes",
+     "⛔⛔ THE TWO HALVES ARE MERGED INTO ONE LIST, so people queued for the "
+     "owner's own machine are reported as things the owner is waiting on — the "
+     "exact reading the two separate names exist to prevent",
      [('            rows = body.get("outgoing")\n'
-       '            self._json(200, {"requests": rows if isinstance(rows, list) else []})',
+       '            incoming = body.get("incoming")',
        '            rows = (body.get("outgoing") or []) + (body.get("incoming") or [])\n'
-       '            self._json(200, {"requests": rows if isinstance(rows, list) else []})')]),
+       '            incoming = []')]),
     ("Q3", BRIDGE, "over",
      "the two halves are swapped, so a person is shown other people's requests "
      "for THEIR machine and told it is what they are waiting on",
@@ -483,35 +495,42 @@ MUTANTS = [
        '        for d in rows:\n'
        '            label = str(d.get("deviceLabel") or "").strip() or "(unnamed)"\n'
        '            print(f"     {label.ljust(34)}  id={d.get(\'deviceId\')}")\n')]),
+    # ⛔ RE-ANCHORED IN 7.9-3. The sentence was QUALIFIED — it is about the
+    # asker's own half, and 7.9-3 put the owner's queue above it, where every
+    # clause of it is false. The mutant's claim is unchanged: the whole
+    # sentence goes, and it must take all three prints with it.
     ("Q5", CLI, "under",
-     "⛔⛔ THE SENTENCE GOES ENTIRELY —— ⚠ AND THE FIRST FORM OF THIS MUTANT CUT "
-     "ONLY ITS FIRST LINE, so the two continuation prints satisfied the guard and "
-     "it survived honestly. Fifth time in this project: a multi-line sentence "
-     "needs a multi-line anchor. —— and every client is then free to read an "
-     "absence as a refusal — a field that never crossed the wire",
-     [('    print("\\n     Only unanswered requests appear here. Once a request is "\n'
-       '          "answered it")\n'
+     "⛔⛔ THE SENTENCE GOES ENTIRELY — a row that is GONE means answered, or "
+     "expired, or the machine changed hands, and the list carries no status at "
+     "all. ⚠ AND THE FIRST FORM OF THIS MUTANT CUT ONLY ITS FIRST LINE, so the "
+     "continuation prints satisfied the guard and it survived honestly. Fifth "
+     "time in this project that a neighbouring line has satisfied a guard "
+     "aimed at its neighbour",
+     [('    print("\\n     Of the ones YOU asked for: only unanswered requests appear "\n'
+       '          "here. Once a")\n'
+       '    print("     request is answered it")\n'
        '    # ⛔⛔ THE FIRST VERSION SAID "ask again and you will be told which it was",\n'
        '    # and that is false for the one answer people care about. An APPROVAL makes\n'
        '    # the machine one of yours, and the browse list drops machines you are\n'
        '    # already on — so asking again cannot report a yes. It reports a yes by the\n'
        '    # machine simply being in your own list.\n'
-       '    print("     leaves this list either way. A yes shows up as the computer "\n'
+       '    print("     leaves that half either way. A yes shows up as the computer "\n'
        '          "appearing in")\n'
        '    print("     `agent device`; for a no, ask for that computer again and you "\n'
-       '          "will be told.")\n', '')]),
+       '          "will be told.")\n',
+       '')]),
     ("Q6", SR, "over",
      "⛔ CHAT CALLS A MISSING ROW A REFUSAL — the exact fabrication B4 was written "
      "to prevent, and the one the web app already ships one layer down",
-     [('    lines.append("Only unanswered requests show here. Once one is answered it leaves "\n'
-       '                 "this list whichever way it went. A yes shows up as the computer "\n'
-       '                 "appearing in your own list; for a no, ask for it again and I’ll "\n'
-       '                 "tell you.")',
+     [('    lines.append("Of the ones you asked for, only unanswered requests show here. "\n'
+       '                 "Once one is answered it leaves this list whichever way it went. "\n'
+       '                 "A yes shows up as the computer appearing in your own list; for "\n'
+       '                 "a no, ask for it again and I’ll tell you.")',
        '    lines.append("Anything that has dropped off this list was denied.")')]),
     ("Q7", SR, "over",
      "⛔ CHAT'S SENTENCE MOVES INSIDE THE NON-EMPTY BRANCH, so the empty screen "
      "says nothing about what an empty screen means",
-     [('        lines = ["You’re not waiting on any computer."]\n',
+     [('        lines.append("You’re not waiting on any computer.")\n',
        '        return _emit(body, args.json, ["You’re not waiting on any computer."])\n')]),
 
     # ═══════════ N — natural language ════════════════════════════════════════
@@ -529,9 +548,11 @@ MUTANTS = [
     ("N2", SR, "under",
      "⛔ THE WAITING RULE GOES, so \"what did I ask for\" is answered by the "
      "capabilities line on the one screen a person opens because they are waiting",
-     [('    if not _artefact_kw and (_request_kw or _machine_kw or _public_kw) and (\n'
+     [('    if not _artefact_kw and (_request_kw or _machine_kw or _public_kw\n'
+       '                             or _bare_waiting_q) and (\n'
        '            (_ask_kw and re.search(r"\\b(my|any|outstanding|pending|open|all)\\b.{0,24}"',
-       '    if False and (_request_kw or _machine_kw or _public_kw) and (\n'
+       '    if False and (_request_kw or _machine_kw or _public_kw\n'
+       '                             or _bare_waiting_q) and (\n'
        '            (_ask_kw and re.search(r"\\b(my|any|outstanding|pending|open|all)\\b.{0,24}"')]),
     ("N3", SR, "under",
      "⛔⛔ THE WITHDRAW RULE GOES AND \"remove my request for the Studio PC\" IS A "
@@ -605,9 +626,10 @@ MUTANTS = [
     ("N14", SR, "under",
      "⛔ THE CAPABILITIES LINE STOPS NAMING THE NEW SURFACE, so the fallback "
      "denies having the verbs the resolver just failed to reach",
-     [('                  "your researches, manage your devices, or find a public computer "\n'
-       '                  "and ask to use it — what would you like?"]',
-       '                  "your researches, or manage your devices — what would you like?"]')]),
+     [('                  "your researches, manage your devices, find a public computer and "\n'
+       '                  "ask to use it, and — for a computer you own — answer the people "',
+       '                  "your researches, or manage your devices — what would you like?" #',
+       )]),
 
     # ═══════════ L — what the uploadable log carries ═════════════════════════
     ("L1", BRIDGE, "over",
@@ -633,28 +655,24 @@ MUTANTS = [
      "was true until this wave and is false the moment browse lists other "
      "people's machines — a promise that has quietly stopped being true is worse "
      "than none",
-     [("""- You drive the user's own account only. The one thing that reaches past it is the
-  public-computer list: it names machines other people chose to offer, and asking
-  for one tells that owner the user's name — or their email, if no name is set.
-  Never ask on the
-  user's behalf without a real "yes" to the client's own question first — the
-  client refuses nothing, so YOU are the consent step, and a refusal from the
-  owner blocks a fresh request for a week.""",
+     [("""- You drive the user's own account only. Three things reach past it, and all three
+  are consent moments where the client refuses nothing — so YOU are the consent
+  step every time.""",
        "- You drive the user's own account only — you cannot reach anyone else's data.")]),
     ("S4", SKILL, "under",
      "⛔⛔ THE ROW STOPS SAYING AN ANSWERED REQUEST LEAVES THE LIST, which is the "
      "one fact the model cannot infer — every absence looks identical, and the "
      "likeliest guess is \"they said no\"",
-     [('`sr.py device-requests` — ONLY unanswered ones appear. A request that has been '
-       'answered leaves the list **either way**; never read a missing row as a '
-       'refusal.',
+     [('`sr.py device-requests` — of the ones the USER asked for, ONLY unanswered ones '
+       'appear. A request that has been answered leaves that half **either way**; '
+       'never read a missing row as a refusal.',
        '`sr.py device-requests` —')]),
     ("S5", SKILL, "over",
      "⛔ THE PARENTHETICAL TELLS THE MODEL SHARING IS OWNER-ONLY IN THE WEB APP "
      "AGAIN, so it refuses the verbs it now has",
-     [("""  name a topic. (Approving or refusing somebody, offering a computer publicly,
-  revoking sharers, and resets stay owner-only in the web app — but ASKING to use
-  somebody else's public computer is something you can do from here.)""",
+     [("""  name a topic. (For a computer they OWN they can also answer the people asking
+  for it and set whether strangers can find it at all. Revoking a sharer and
+  resetting a pair code stay in the web app.)""",
        """  name a topic. (Sharing a device with other people, revoking sharers, and resets
   stay owner-only in the web app.)""")]),
     ("S6", SKILL, "under",
@@ -694,18 +712,18 @@ MUTANTS = [
     ("T5", CLI, "under",
      "⛔ THE OWNED LIST DROPS `online` AGAIN — the bridge has always sent it, and "
      "\"which of my computers is on?\" is answered by this list",
-     [('        state = "online" if d.get("online") else "offline"\n'
-       '        print(f"  {mark} {d.get(\'name\') or d.get(\'id\')}  ({kind}, {state})  "\n'
+     [('        print(f"  {mark} {d.get(\'name\') or d.get(\'id\')}  ({kind}, {state}{found})  "\n'
        '              f"id={d.get(\'id\')}")',
-       '        print(f"  {mark} {d.get(\'name\') or d.get(\'id\')}  ({kind})  "\n'
+       '        print(f"  {mark} {d.get(\'name\') or d.get(\'id\')}  ({kind}{found})  "\n'
        '              f"id={d.get(\'id\')}")')]),
     ("T6", BRIDGE, "over",
-     "⛔ THE SELECT REFUSAL GOES BACK TO A CONNECTIVITY WORD for a permissions "
-     "state, in the one moment browsing makes it most likely to be read",
-     [('                self._json(404, {"error": "no computer with that id is linked to "\n'
-       '                                          "your account",\n'
-       '                                 "reason": "not_linked"})',
-       '                self._json(404, {"error": "device not reachable by this account"})')]),
+     "⛔ THE REFUSAL GOES BACK TO A CONNECTIVITY WORD for a permissions state, "
+     "in the one moment browsing makes it most likely to be read. ⛔ RE-ANCHORED "
+     "IN 7.9-3 onto the constant both callers now share: the owner verbs refuse "
+     "an unreachable id with the same sentence, and a literal written twice is "
+     "one that drifts",
+     [('_NOT_LINKED_ERROR = "no computer with that id is linked to your account"',
+       '_NOT_LINKED_ERROR = "device not reachable by this account"')]),
     ("T7", CLI, "over",
      "the two clients stop making the same claims: one refusal code is dropped "
      "from the terminal's table and only chat can word it",
@@ -730,8 +748,8 @@ MUTANTS = [
      "⛔⛔ THE WAITING CLAUSE LOSES ITS SUBJECT and answers every run-progress "
      "question — \"still waiting for the podcast\" — with \"You're not waiting on "
      "any computer\"",
-     [('    if not _artefact_kw and (_request_kw or _machine_kw or _public_kw) and (\n',
-       '    if True or (_request_kw or _machine_kw or _public_kw) and (\n')]),
+     [('    if not _artefact_kw and (_request_kw or _machine_kw or _public_kw\n',
+       '    if True or (_request_kw or _machine_kw or _public_kw\n')]),
     ("V4", SR, "under",
      "⛔⛔ THE BROWSE CLAUSE LOSES ITS BAILS, so \"make my computer public\", "
      "\"stop the run on the shared machine\" and \"ask for the podcast on my "
@@ -744,8 +762,8 @@ MUTANTS = [
      "⛔ THE OWN-MACHINE RELAY GOES, so an owner asking to offer their computer "
      "is shown the computers other people offer — a list that structurally "
      "cannot contain theirs",
-     [('    if (_public_kw or _offering_kw) and (_mine_kw or re.search(r"\\bmy own\\b", low)) and \\\n',
-       '    if False and (_mine_kw or re.search(r"\\bmy own\\b", low)) and \\\n')]),
+     [('    if (_public_kw or _offering_kw or _hiding_kw) \\\n',
+       '    if False \\\n')]),
     ("V6", SR, "under",
      "⛔ THE OWNER-QUEUE RELAY GOES and \"who wants to use my computer\" falls to "
      "the asker's own empty list, telling an owner nobody asked when somebody did",
@@ -828,11 +846,11 @@ MUTANTS = [
      "AGAIN. It cannot: the machine leaves the public list the moment this "
      "account is put on it, so asking again answers \"no public computer is "
      "called that\" to the person who was just granted one",
-     [('                 "this list whichever way it went. A yes shows up as the computer "\n'
-       '                 "appearing in your own list; for a no, ask for it again and I’ll "\n'
-       '                 "tell you.")',
-       '                 "this list whichever way it went — ask for that computer again "\n'
-       '                 "and I’ll tell you which it was.")')]),
+     [('                 "Once one is answered it leaves this list whichever way it went. "\n'
+       '                 "A yes shows up as the computer appearing in your own list; for "\n'
+       '                 "a no, ask for it again and I’ll tell you.")',
+       '                 "Once one is answered it leaves this list whichever way it went "\n'
+       '                 "— ask for that computer again and I’ll tell you which it was.")')]),
     ("V18", SR, "under",
      "⛔ THE QUOTE STRIP MOVES BACK BEHIND THE ID COMPARE and drops two of the "
      "six marks, so a quoted id resolves to nothing",
@@ -910,7 +928,7 @@ MUTANTS = [
      "⛔⛔ `device-ask` LEAVES THE SAFE-DEFAULTS CONFIRM LIST, whose next clause "
      "says everything not listed runs on a clear request — so the file positively "
      "licenses skipping the one consent moment this wave added",
-     [('`stop`, `logout`, `device-remove`, `device-ask`, and `update`**',
+     [('`stop`, `logout`, `device-remove`, `device-ask`, `device-approve`, `device-deny`,\n`device-visibility public`, and `update`**',
        '`stop`, `logout`, `device-remove`, and `update`**')]),
     ("V31", SKILL, "under",
      "⛔ `device-ask` LEAVES THE CONFIRM HANDOFF LIST, so a \"yes\" to the consent "
@@ -920,8 +938,8 @@ MUTANTS = [
     ("V32", SKILL, "over",
      "⛔⛔ THE SKILL SAYS THE OWNER SEES THE ASKER'S EMAIL ADDRESS. They see the "
      "NAME; the email only when no name is set",
-     [("for one tells that owner the user's name — or their email, if no name is set.",
-       "for one tells that owner the user's name and email address.")]),
+     [("name — or their email, if no name is set — and a refusal blocks asking again for a",
+       "name and email address, and a refusal blocks asking again for a")]),
     ("V33", CONFTEST, "over",
      "⛔ THE SEAM'S STUB GETS A FIXED SIGNATURE AGAIN, so the helper growing one "
      "argument is a TypeError in a dozen unrelated tests rather than a no-op",
