@@ -1506,7 +1506,8 @@ def _fe_api_get(sess: "AccountSession", path: str,
     return _send(token)
 
 
-def _fe_api_post(sess: "AccountSession", path: str, payload: dict) -> tuple[int, dict]:
+def _fe_api_post(sess: "AccountSession", path: str, payload: dict,
+                 retry_401: bool = True) -> tuple[int, dict]:
     """POST a web-app API route (`{FE_BASE}{path}`) as the signed-in USER —
     the same Bearer-ID-token calls the browser makes. Used for the device
     pair/unpair routes, which MUST go through the app's admin-SDK handlers
@@ -1543,8 +1544,18 @@ def _fe_api_post(sess: "AccountSession", path: str, payload: dict) -> tuple[int,
     relaying the web app's bare "unauthorized".
 
     ⛔ EXACTLY ONCE, AND ONLY ON 401, as with the bytes sibling. Every one of the
-    four routes reached through here answers 401 before doing any work, so a
-    retried attempt repeats no effect and spends no rate-limit budget.
+    FIVE routes reached through here answers 401 before doing any work, so a
+    retried attempt repeats no effect and spends no rate-limit budget. (The count
+    was written as four and was wrong: notify, mintSrLinks, claim, unpair-self and
+    now access-request.)
+
+    ⛔⛔ AND `retry_401=False` EXISTS FOR ONE CALLER, WHICH RUNS IN A LOOP. `/updates`
+    re-mints share links for EVERY row it returns, inside one request — so on a
+    session whose refresh token died while its ID token is still cached, a retry
+    here turned one poll into one forced Google token call PER RUN, all of them
+    failing the same way, for the sake of a link the caller treats as optional.
+    Cross-verify found it. Everything that writes keeps the retry; the one
+    best-effort read in a loop does not.
     """
     def _send(token: str) -> "tuple[int, dict]":
         try:
@@ -1562,7 +1573,7 @@ def _fe_api_post(sess: "AccountSession", path: str, payload: dict) -> tuple[int,
     if token is None:
         return 0, why
     status, body = _send(token)
-    if status != 401:
+    if status != 401 or not retry_401:
         return status, body
     token, why = _mint_bearer(sess, force=True)
     if token is None:
@@ -1835,7 +1846,13 @@ def _mint_sr(sess: "AccountSession", rid: str, title: str) -> dict | None:
     user) — idempotent, mints only the docTypes whose content already exists.
     Returns the fresh {docType: url} map, or None on failure (callers fall back
     to whatever's already minted)."""
-    status, body = _fe_api_post(sess, "/api/mintSrLinks", {"research_id": rid, "title": title or ""})
+    # ⛔ NO 401 RETRY ON THIS ONE. `/updates` calls it once per run in a single
+    # request, and the reply is optional — the caller falls back to whatever is
+    # already minted. With the retry, a dead-but-cached session made one forced
+    # Google refresh per row of one poll.
+    status, body = _fe_api_post(sess, "/api/mintSrLinks",
+                                {"research_id": rid, "title": title or ""},
+                                retry_401=False)
     sr = body.get("srLinks") if status == 200 else None
     # ⛔⛔ A FLAT {docType: url} MAP, AND `isinstance(dict)` CANNOT TELL. The FE
     # briefly forwarded `mintSrDocLinks`'s new `{urls, present}` return verbatim,
@@ -3392,8 +3409,18 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                     self._json(502, body)
                 return False
             if status != 200:
+                # ⛔ A BARE CODE, NOT A SENTENCE. The synthesised fallback used to
+                # be the same phrase the clients wrap it in — "couldn't ask for
+                # that computer: could not ask for that computer (HTTP 500)" —
+                # because both sides were writing the sentence. This side names
+                # the STATUS and lets each client word it.
+                # ⛔ AND NO `reason` HERE. It was added with the status and taken
+                # straight back out: `reason` already means one thing on these
+                # routes — "revoked", the discriminator a client branches on —
+                # and a second meaning on the same key is how a client comes to
+                # test for the wrong one. The caller knows what it called.
                 self._json(status if status >= 400 else 502,
-                           {"error": body.get("error") or f"{what} (HTTP {status})",
+                           {"error": body.get("error") or f"http_{status}",
                             "retryAfterMs": body.get("retryAfterMs")})
                 return False
             return True
@@ -3411,6 +3438,11 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             `online` false — overwriting the liveness the route computed
             correctly. Three wrong answers, every one of them shaped like a real
             one. The two shapes stay deliberately non-interchangeable.
+
+            ⛔ A FULL MACHINE IS LISTED, NOT DROPPED, and an earlier version of
+            this note said otherwise. The projection publishes one bit, `full`,
+            and leaves the row in; the clients are what must not invite an ask on
+            it, because the route would refuse with certainty.
 
             ⛔ `truncated` IS RELAYED UNTOUCHED and it does NOT mean "your list
             was cut". It is computed on the raw scan of up to five hundred

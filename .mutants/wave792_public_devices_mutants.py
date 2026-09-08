@@ -76,7 +76,7 @@ OURS = (CLI, BRIDGE, SR, SKILL, CONFTEST)
 MINE = ("tests/test_fe_json_792.py "
         "tests/test_public_devices_792.py "
         "tests/test_chat_public_792.py")
-MIN_SELECTED = 120
+MIN_SELECTED = 190
 
 ALL_SUITES = "tests/"
 
@@ -135,44 +135,27 @@ MUTANTS = [
      "⛔ THE GET MINTS BY HAND AGAIN, so a dead session raises out of a helper "
      "that promises it never does — and its one caller is a route with no "
      "blanket handler, which means a dropped socket rather than a sentence",
-     [('    token, why = _mint_bearer(sess, force=False)\n'
-       '    if token is None:\n'
-       '        return 0, why\n'
-       '    status, body = _send(token)\n'
-       '    if status != 401:\n'
-       '        return status, body\n'
-       '    token, why = _mint_bearer(sess, force=True)\n'
-       '    if token is None:\n'
-       '        return 0, why\n'
-       '    return _send(token)\n'
+     [('        return r.status_code, _fe_json_body(r)\n'
        '\n'
-       '\n'
-       'def _fe_api_post(sess: "AccountSession", path: str, payload: dict)',
-       '    token = sess.id_token(force=False)\n'
-       '    status, body = _send(token)\n'
-       '    if status != 401:\n'
-       '        return status, body\n'
-       '    return _send(sess.id_token(force=True))\n'
-       '\n'
-       '\n'
-       'def _fe_api_post(sess: "AccountSession", path: str, payload: dict)')]),
-    ("G3", BRIDGE, "over",
-     "⛔⛔ THE GET'S RETRY RE-SENDS THE CACHED TOKEN. It retries, it fails the "
-     "same way, and every \"did it eventually work\" assertion is satisfied",
-     [('    token, why = _mint_bearer(sess, force=True)\n'
-       '    if token is None:\n'
-       '        return 0, why\n'
-       '    return _send(token)\n'
-       '\n'
-       '\n'
-       'def _fe_api_post(sess: "AccountSession", path: str, payload: dict)',
        '    token, why = _mint_bearer(sess, force=False)\n'
        '    if token is None:\n'
        '        return 0, why\n'
-       '    return _send(token)\n'
+       '    status, body = _send(token)\n'
+       '    if status != 401:\n',
+       '        return r.status_code, _fe_json_body(r)\n'
        '\n'
-       '\n'
-       'def _fe_api_post(sess: "AccountSession", path: str, payload: dict)')]),
+       '    token = sess.id_token(force=False)\n'
+       '    status, body = _send(token)\n'
+       '    if status != 401:\n')]),
+    ("G3", BRIDGE, "over",
+     "⛔⛔ THE GET'S RETRY RE-SENDS THE CACHED TOKEN. It retries, it fails the "
+     "same way, and every \"did it eventually work\" assertion is satisfied",
+     [('    if status != 401:\n'
+       '        return status, body\n'
+       '    token, why = _mint_bearer(sess, force=True)\n',
+       '    if status != 401:\n'
+       '        return status, body\n'
+       '    token, why = _mint_bearer(sess, force=False)\n')]),
     ("G4", BRIDGE, "over",
      "⛔ THE RETRY BECOMES A LOOP, hammering the app with a token it has already "
      "refused",
@@ -182,20 +165,14 @@ MUTANTS = [
        '    token, why = _mint_bearer(sess, force=True)\n'
        '    if token is None:\n'
        '        return 0, why\n'
-       '    return _send(token)\n'
-       '\n'
-       '\n'
-       'def _fe_api_post(sess: "AccountSession", path: str, payload: dict)',
+       '    return _send(token)\n',
        '    status, body = _send(token)\n'
        '    while status == 401:\n'
        '        token, why = _mint_bearer(sess, force=True)\n'
        '        if token is None:\n'
        '            return 0, why\n'
        '        status, body = _send(token)\n'
-       '    return status, body\n'
-       '\n'
-       '\n'
-       'def _fe_api_post(sess: "AccountSession", path: str, payload: dict)')]),
+       '    return status, body\n')]),
     ("G5", BRIDGE, "over",
      "⛔ EVERY STATUS IS RETRIED, so a 429 spends a second slice of a five-an-hour "
      "budget and a 500 is asked twice for the same answer",
@@ -254,43 +231,23 @@ MUTANTS = [
     ("R1", BRIDGE, "under",
      "⛔⛔ THE POST'S RETRY GOES AND `device add` ANSWERS \"unauthorized\" AGAIN "
      "for the fifty-five minutes a cached token outlives a revoked session",
-     [('    token, why = _mint_bearer(sess, force=False)\n'
-       '    if token is None:\n'
-       '        return 0, why\n'
-       '    status, body = _send(token)\n'
-       '    if status != 401:\n'
+     [('    status, body = _send(token)\n'
+       '    if status != 401 or not retry_401:\n'
        '        return status, body\n'
        '    token, why = _mint_bearer(sess, force=True)\n'
        '    if token is None:\n'
        '        return 0, why\n'
-       '    return _send(token)\n'
-       '\n'
-       '\n'
-       '# The most of the agent\'s own log',
-       '    token, why = _mint_bearer(sess, force=False)\n'
-       '    if token is None:\n'
-       '        return 0, why\n'
-       '    return _send(token)\n'
-       '\n'
-       '\n'
-       '# The most of the agent\'s own log')]),
+       '    return _send(token)\n',
+       '    return _send(token)\n')]),
     ("R2", BRIDGE, "over",
      "⛔ THE POST'S RETRY RE-SENDS THE CACHED TOKEN — the same shape as G3, on "
      "the helper four routes go through",
-     [('    token, why = _mint_bearer(sess, force=True)\n'
-       '    if token is None:\n'
-       '        return 0, why\n'
-       '    return _send(token)\n'
-       '\n'
-       '\n'
-       '# The most of the agent\'s own log',
-       '    token, why = _mint_bearer(sess, force=False)\n'
-       '    if token is None:\n'
-       '        return 0, why\n'
-       '    return _send(token)\n'
-       '\n'
-       '\n'
-       '# The most of the agent\'s own log')]),
+     [('    if status != 401 or not retry_401:\n'
+       '        return status, body\n'
+       '    token, why = _mint_bearer(sess, force=True)\n',
+       '    if status != 401 or not retry_401:\n'
+       '        return status, body\n'
+       '    token, why = _mint_bearer(sess, force=False)\n')]),
     ("R3", BRIDGE, "under",
      "⛔ THE FIRST MINT IS UNWRAPPED on the POST, so a transport failure reaching "
      "GOOGLE escapes as an exception from a helper whose callers sit outside any "
@@ -299,26 +256,10 @@ MUTANTS = [
        '    if token is None:\n'
        '        return 0, why\n'
        '    status, body = _send(token)\n'
-       '    if status != 401:\n'
-       '        return status, body\n'
-       '    token, why = _mint_bearer(sess, force=True)\n'
-       '    if token is None:\n'
-       '        return 0, why\n'
-       '    return _send(token)\n'
-       '\n'
-       '\n'
-       "# The most of the agent's own log",
+       '    if status != 401 or not retry_401:\n',
        '    token = sess.id_token(force=False)\n'
        '    status, body = _send(token)\n'
-       '    if status != 401:\n'
-       '        return status, body\n'
-       '    token, why = _mint_bearer(sess, force=True)\n'
-       '    if token is None:\n'
-       '        return 0, why\n'
-       '    return _send(token)\n'
-       '\n'
-       '\n'
-       "# The most of the agent's own log")]),
+       '    if status != 401 or not retry_401:\n')]),
     ("R4", BRIDGE, "over",
      "⛔⛔ THE TIMEOUT GOES BACK TO TWENTY. One quick 401, a ten-second refresh "
      "and one full second attempt is then thirty-one seconds — past what BOTH "
@@ -430,9 +371,9 @@ MUTANTS = [
      "⛔ `retryAfterMs` IS DROPPED FROM THE RELAY, so the one refusal in the "
      "product where the server knows the wait arrives without it and both clients "
      "fall back to naming nothing",
-     [('                           {"error": body.get("error") or f"{what} (HTTP {status})",\n'
+     [('                           {"error": body.get("error") or f"http_{status}",\n'
        '                            "retryAfterMs": body.get("retryAfterMs")})',
-       '                           {"error": body.get("error") or f"{what} (HTTP {status})"})')]),
+       '                           {"error": body.get("error") or f"http_{status}"})')]),
     ("A4", BRIDGE, "over",
      "⛔⛔ A REVOKED SESSION IS A 502 AGAIN — the one failure the person can fix, "
      "reported as the one they cannot, on all five routes that reach the web app",
@@ -450,12 +391,8 @@ MUTANTS = [
      "\"ask them to share it again\" — on this route being on that list is "
      "exactly what the refusal IS, so the sentence invites the one retry "
      "guaranteed to fail",
-     [('    said = _ASK_FAILURES.get(err)\n'
-       '    if said is None:\n'
-       '        return f"couldn\'t ask for that computer: {err or \'no reason given\'}"\n'
+     [('        return f"couldn\'t ask for that computer: {err or \'no reason given\'}"\n'
        '    return said',
-       '    said = _ASK_FAILURES.get(err)\n'
-       '    if said is None:\n'
        '        return ("the owner removed your access to that device — ask them to "\n'
        '                "share it again")\n'
        '    return said')]),
@@ -501,15 +438,15 @@ MUTANTS = [
      "⛔ AN EXACT ID STOPS WINNING OUTRIGHT, so the only unique thing on a public "
      "row is resolved by the same name match that cannot separate two of them",
      [('    for d in rows:\n'
-       '        if str(d.get("deviceId") or "") == wanted:\n'
+       '        if str(d.get("deviceId") or "") == bare:\n'
        '            return d, []\n', '')]),
     ("A14", SR, "under",
      "⛔ THE ASK CONFIRM LOSES THE DISCLOSURE, so the only consent moment on the "
      "chat path stops saying what is disclosed",
-     [('    "device-ask": "Ask the owner of {name} to let you use it? They’ll see your name "\n'
-       '                  "and email address, and they decide — nothing runs on it unless they "\n'
-       '                  "say yes. Say yes and I’ll ask.",',
-       '    "device-ask": "Ask the owner of {name} to let you use it? Say yes and I’ll ask.",')]),
+     [('                  "and they see your name — or your email, if you haven’t set one. "\n'
+       '                  "They decide, and nothing runs on it unless they say yes. Say yes "\n'
+       '                  "and I’ll ask.",',
+       '                  "Say yes and I’ll ask.",')]),
 
     # ═══════════ Q — what you are waiting on ═════════════════════════════════
     ("Q1", BRIDGE, "under",
@@ -547,18 +484,29 @@ MUTANTS = [
        '            label = str(d.get("deviceLabel") or "").strip() or "(unnamed)"\n'
        '            print(f"     {label.ljust(34)}  id={d.get(\'deviceId\')}")\n')]),
     ("Q5", CLI, "under",
-     "⛔⛔ THE SENTENCE GOES ENTIRELY, and every client is then free to read an "
+     "⛔⛔ THE SENTENCE GOES ENTIRELY —— ⚠ AND THE FIRST FORM OF THIS MUTANT CUT "
+     "ONLY ITS FIRST LINE, so the two continuation prints satisfied the guard and "
+     "it survived honestly. Fifth time in this project: a multi-line sentence "
+     "needs a multi-line anchor. —— and every client is then free to read an "
      "absence as a refusal — a field that never crossed the wire",
      [('    print("\\n     Only unanswered requests appear here. Once a request is "\n'
        '          "answered it")\n'
-       '    print("     leaves this list either way — ask again and you will be told "\n'
-       '          "which it was.")\n', '')]),
+       '    # ⛔⛔ THE FIRST VERSION SAID "ask again and you will be told which it was",\n'
+       '    # and that is false for the one answer people care about. An APPROVAL makes\n'
+       '    # the machine one of yours, and the browse list drops machines you are\n'
+       '    # already on — so asking again cannot report a yes. It reports a yes by the\n'
+       '    # machine simply being in your own list.\n'
+       '    print("     leaves this list either way. A yes shows up as the computer "\n'
+       '          "appearing in")\n'
+       '    print("     `agent device`; for a no, ask for that computer again and you "\n'
+       '          "will be told.")\n', '')]),
     ("Q6", SR, "over",
      "⛔ CHAT CALLS A MISSING ROW A REFUSAL — the exact fabrication B4 was written "
      "to prevent, and the one the web app already ships one layer down",
      [('    lines.append("Only unanswered requests show here. Once one is answered it leaves "\n'
-       '                 "this list whichever way it went — ask for that computer again and "\n'
-       '                 "I’ll tell you which it was.")',
+       '                 "this list whichever way it went. A yes shows up as the computer "\n'
+       '                 "appearing in your own list; for a no, ask for it again and I’ll "\n'
+       '                 "tell you.")',
        '    lines.append("Anything that has dropped off this list was denied.")')]),
     ("Q7", SR, "over",
      "⛔ CHAT'S SENTENCE MOVES INSIDE THE NON-EMPTY BRANCH, so the empty screen "
@@ -572,37 +520,40 @@ MUTANTS = [
      "phrasing is answered with the account's own machines again — a "
      "complete-looking answer to a different question, which is the state this "
      "wave found",
-     [('    if _machine_kw and (_public_kw\n'
-       '                        or (_ask_kw and re.search(r"\\bto use\\b|\\baccess\\b|"\n'
-       '                                                  r"\\bborrow\\b|\\bask for\\b", low))):\n'
+     [('    elif _machine_kw and (_public_kw\n'
+       '                          or (_ask_kw and re.search(r"\\bto use\\b|\\baccess\\b|"\n'
+       '                                                    r"\\bborrow\\b|\\bask for\\b", low))):\n'
        '        return ["devices-public"], None\n',
-       '    if False:\n'
+       '    elif False:\n'
        '        return ["devices-public"], None\n')]),
     ("N2", SR, "under",
      "⛔ THE WAITING RULE GOES, so \"what did I ask for\" is answered by the "
      "capabilities line on the one screen a person opens because they are waiting",
-     [('    if (_ask_kw and re.search(r"\\b(my|any|outstanding|pending|open|all)\\b.{0,24}"',
-       '    if False and (_ask_kw and re.search(r"\\b(my|any|outstanding|pending|open|all)\\b.{0,24}"')]),
+     [('    if not _artefact_kw and (_request_kw or _machine_kw or _public_kw) and (\n'
+       '            (_ask_kw and re.search(r"\\b(my|any|outstanding|pending|open|all)\\b.{0,24}"',
+       '    if False and (_request_kw or _machine_kw or _public_kw) and (\n'
+       '            (_ask_kw and re.search(r"\\b(my|any|outstanding|pending|open|all)\\b.{0,24}"')]),
     ("N3", SR, "under",
      "⛔⛔ THE WITHDRAW RULE GOES AND \"remove my request for the Studio PC\" IS A "
      "DESTRUCTIVE UNLINK CONFIRM AGAIN, because \"PC\" satisfies the device noun "
      "one rule down. Say yes and it dead-ends on a device that never existed",
-     [('    if _ask_kw and re.search(r"\\b(cancel|withdraw|remove|delete|take back|undo|"\n'
-       '                             r"retract|forget)\\b", low) and \\\n'
+     [('    if _ask_kw and not _artefact_kw and \\\n'
+       '            (_machine_kw or _public_kw or re.search(r"\\baccess\\b|\\brequests?\\b", low)) and \\\n'
+       '            re.search(r"\\b(cancel|withdraw|remove|delete|take back|undo|retract|"\n'
+       '                      r"forget)\\b", low) and \\\n'
        '            re.search(r"\\b(requests?|asks?|application)\\b", low):\n',
        '    if False:\n')]),
     ("N4", SR, "over",
      "⛔ A CATEGORY BECOMES A NAME, so \"ask to use someone else's computer\" "
      "confirms a request for a machine called \"someone else's\" instead of "
      "showing the list",
-     [('    if _ask_kw and _ask_obj and _ask_is_about_a_machine and not _ask_obj_is_thing \\\n'
-       '            and not _ask_obj_is_pronoun and not _ask_obj_is_category:',
-       '    if _ask_kw and _ask_obj and _ask_is_about_a_machine and not _ask_obj_is_thing \\\n'
-       '            and not _ask_obj_is_pronoun:')]),
+     [('            and not _ask_obj_is_pronoun and not _ask_obj_is_category \\\n',
+       '            and not _ask_obj_is_pronoun \\\n')]),
     ("N5", SR, "over",
      "⛔ AN ARTEFACT BECOMES A MACHINE, so \"ask for the podcast\" is a request "
      "for somebody's computer",
-     [('    _ask_obj_is_thing = bool(re.search(', '    _ask_obj_is_thing = False and bool(re.search(')]),
+     [('    _ask_obj_is_thing = bool(_artefact_kw) or bool(re.search(',
+       '    _ask_obj_is_thing = False and bool(re.search(')]),
     ("N6", SR, "over",
      "⛔ A PRONOUN BECOMES A NAME — this product's own advice line, \"ask them to "
      "share it again\", read back as a request for a computer called \"them\"",
@@ -611,14 +562,14 @@ MUTANTS = [
     ("N7", SR, "over",
      "⛔ THE ASK STOPS NEEDING TO BE ABOUT A MACHINE, so any unfamiliar \"ask\" "
      "object is read as a request for somebody's computer",
-     [('    if _ask_kw and _ask_obj and _ask_is_about_a_machine and not _ask_obj_is_thing \\\n',
-       '    if _ask_kw and _ask_obj and not _ask_obj_is_thing \\\n')]),
+     [('    if _ask_kw and _ask_obj and _ask_is_about_a_machine and not _ask_obj_is_thing \\\n'
+       '            and not _ask_obj_is_pronoun and not _ask_obj_is_category \\\n',
+       '    if _ask_kw and _ask_obj and not _ask_obj_is_thing \\\n'
+       '            and not _ask_obj_is_pronoun and not _ask_obj_is_category \\\n')]),
     ("N8", SR, "under",
      "⛔⛔ THE CODE-HIJACK COMES BACK: \"switch to the machine LABPC001\" is a "
      "pairing attempt again and is refused as a code that matched no device",
-     [('        _existing = re.search(r"\\b(switch to|run (?:it |everything )?on|use|select|"\n'
-       '                              r"remove|unlink|forget|delete|ask for)\\b", low)\n'
-       '        if (_kw or _bare) and not (_existing and not _bare):\n',
+     [('        if _bare or _pairing or (_kw and not _existing):\n',
        '        if _kw or _bare:\n')]),
     ("N9", SR, "over",
      "⛔ ONLY A CODE ON ITS OWN PAIRS, so \"pair my PC, code is K7XQ-9B2M\" — the "
@@ -626,7 +577,7 @@ MUTANTS = [
      "⚠ THE FIRST VERSION OF THIS MUTANT WAS EQUIVALENT: it dropped `not _bare` "
      "from the guard, and a message that IS the token can never also contain a "
      "switch verb, so the two forms could not disagree. It survived honestly",
-     [('        if (_kw or _bare) and not (_existing and not _bare):\n',
+     [('        if _bare or _pairing or (_kw and not _existing):\n',
        '        if _bare:\n')]),
     ("N10", SR, "under",
      "⛔ THE PHRASING THE PICKER TELLS PEOPLE TO SAY STOPS ROUTING — 'Just say: "
@@ -648,7 +599,9 @@ MUTANTS = [
      "⛔ A LEADING DEVICE NOUN GOES BACK INTO THE NAME, so \"switch to the machine "
      "LABPC001\" looks up a device called \"machine LABPC001\"",
      [('        name = re.sub(r"^(?:device|node|machine|computer|pc|laptop|desktop)\\s+",\n'
-       '                      "", name, flags=re.I).strip()\n', '')]),
+       '                      "", name, flags=re.I).strip()\n'
+       '        return (["device-use", name] if name else ["devices"]), None\n',
+       '        return (["device-use", name] if name else ["devices"]), None\n')]),
     ("N14", SR, "under",
      "⛔ THE CAPABILITIES LINE STOPS NAMING THE NEW SURFACE, so the fallback "
      "denies having the verbs the resolver just failed to reach",
@@ -669,19 +622,12 @@ MUTANTS = [
      "⛔ THE BROWSE ROW GOES. The table is what the assistant reads to decide "
      "what to run; a verb with no row reaches the CLI only",
      [('| "are there any public computers?", "show me computers I could ask to use", '
-       '"I don\'t have a computer of my own" | `sr.py devices-public` (only machines '
-       'whose owners offer them; the id on each row is what the next command takes — '
-       'public names collide, an unnamed one reads as "Research computer" for '
-       'everybody) |\n', '')]),
+       '"I don\'t have a computer of my own" | `sr.py devices-public`', '| unrouted |')]),
     ("S2", SKILL, "over",
      "⛔⛔ THE ASK ROW LOSES ITS CONFIRM, so the assistant fires a request that "
      "names the person to a stranger without asking them first",
-     [('| "ask for the Studio PC", "request access to that Mac", "ask its owner if I '
-       'can use it" | **confirm** (the client prints the question — it tells the owner '
-       "the user's name + email, and a \"no\" blocks asking again for a week), then "
-       '`sr.py device-ask "<name or id>"` |',
-       '| "ask for the Studio PC", "request access to that Mac", "ask its owner if I '
-       'can use it" | `sr.py device-ask "<name or id>"` |')]),
+     [('can use it" | **confirm** — relay the client\'s question verbatim',
+       'can use it" | relay the client\'s question verbatim')]),
     ("S3", SKILL, "over",
      "⛔⛔ THE SAFETY PROMISE COMES BACK. \"You cannot reach anyone else's data\" "
      "was true until this wave and is false the moment browse lists other "
@@ -689,7 +635,8 @@ MUTANTS = [
      "than none",
      [("""- You drive the user's own account only. The one thing that reaches past it is the
   public-computer list: it names machines other people chose to offer, and asking
-  for one tells that owner the user's name and email address. Never ask on the
+  for one tells that owner the user's name — or their email, if no name is set.
+  Never ask on the
   user's behalf without a real "yes" to the client's own question first — the
   client refuses nothing, so YOU are the consent step, and a refusal from the
   owner blocks a fresh request for a week.""",
@@ -698,12 +645,10 @@ MUTANTS = [
      "⛔⛔ THE ROW STOPS SAYING AN ANSWERED REQUEST LEAVES THE LIST, which is the "
      "one fact the model cannot infer — every absence looks identical, and the "
      "likeliest guess is \"they said no\"",
-     [('| "what am I waiting on?", "did they answer?", "my pending requests" | '
-       '`sr.py device-requests` — ONLY unanswered ones appear. A request that has been '
+     [('`sr.py device-requests` — ONLY unanswered ones appear. A request that has been '
        'answered leaves the list **either way**; never read a missing row as a '
-       'refusal. Ask for that computer again and the reply says which it was |',
-       '| "what am I waiting on?", "did they answer?", "my pending requests" | '
-       '`sr.py device-requests` |')]),
+       'refusal.',
+       '`sr.py device-requests` —')]),
     ("S5", SKILL, "over",
      "⛔ THE PARENTHETICAL TELLS THE MODEL SHARING IS OWNER-ONLY IN THE WEB APP "
      "AGAIN, so it refuses the verbs it now has",
@@ -729,8 +674,8 @@ MUTANTS = [
      "⛔ THE WINDOWS HINT NAMES `/sr device` AGAIN — the singular resolves to "
      "nothing, so it sends every Windows user to the one phrasing answered with "
      "\"I didn't catch a Super Research request in that\"",
-     [('    rc = _redirect_if_wsl("Manage devices from chat:  /sr devices")',
-       '    rc = _redirect_if_wsl("Manage devices from chat:  /sr device")')]),
+     [('                                         "Manage devices from chat:  /sr devices"))',
+       '                                         "Manage devices from chat:  /sr device"))')]),
     ("T3", CLI, "over",
      "⛔ THE BODYLESS FAILURE PRINTS THE LITERAL WORD None AGAIN",
      [('            print(f"{_NO} couldn\'t select device: {_err(res)}")',
@@ -765,6 +710,223 @@ MUTANTS = [
      "the two clients stop making the same claims: one refusal code is dropped "
      "from the terminal's table and only chat can word it",
      [('    "is_owner": "that one is already yours",\n', '')]),
+    # ═══════════ V — the repairs cross-verification forced after green ═══════
+    # ⛔⛔ EVERY ONE OF THESE IS A DEFECT THIS WAVE SHIPPED AND THEN FIXED. They
+    # are here because the first round of guards did not see them: 80 confirmed
+    # findings, 50 refuted, and seven of the confirmed were blockers of my own.
+    ("V1", SR, "over",
+     "⛔⛔ THE PAIRING REPAIR BREAKS PAIRING AGAIN. Excluding any message with "
+     "\"use\" in it takes out \"use this code K7XQ-9B2M\" — the commonest way "
+     "anybody types one — and the client then asks for the code that is already "
+     "in the sentence",
+     [('        if _bare or _pairing or (_kw and not _existing):\n',
+       '        if _bare or (_kw and not _existing):\n')]),
+    ("V2", SR, "under",
+     "⛔ THE CODE-SHAPED-NAME HIJACK COMES BACK for the wave's own verbs: "
+     "\"request access to computer LABPC001\" is a pairing attempt again",
+     [('        if _bare or _pairing or (_kw and not _existing):\n',
+       '        if _bare or _pairing or _kw:\n')]),
+    ("V3", SR, "under",
+     "⛔⛔ THE WAITING CLAUSE LOSES ITS SUBJECT and answers every run-progress "
+     "question — \"still waiting for the podcast\" — with \"You're not waiting on "
+     "any computer\"",
+     [('    if not _artefact_kw and (_request_kw or _machine_kw or _public_kw) and (\n',
+       '    if True or (_request_kw or _machine_kw or _public_kw) and (\n')]),
+    ("V4", SR, "under",
+     "⛔⛔ THE BROWSE CLAUSE LOSES ITS BAILS, so \"make my computer public\", "
+     "\"stop the run on the shared machine\" and \"ask for the podcast on my "
+     "computer\" are all answered with a list of OTHER people's machines",
+     [('    if _artefact_kw or _control_kw or _unlink_kw or _mine_kw:\n'
+       '        pass\n',
+       '    if False:\n'
+       '        pass\n')]),
+    ("V5", SR, "under",
+     "⛔ THE OWN-MACHINE RELAY GOES, so an owner asking to offer their computer "
+     "is shown the computers other people offer — a list that structurally "
+     "cannot contain theirs",
+     [('    if (_public_kw or _offering_kw) and (_mine_kw or re.search(r"\\bmy own\\b", low)) and \\\n',
+       '    if False and (_mine_kw or re.search(r"\\bmy own\\b", low)) and \\\n')]),
+    ("V6", SR, "under",
+     "⛔ THE OWNER-QUEUE RELAY GOES and \"who wants to use my computer\" falls to "
+     "the asker's own empty list, telling an owner nobody asked when somebody did",
+     [('    if _mine_kw and re.search(r"\\b(who|whos|whose|anyone|anybody|somebody|someone|"\n',
+       '    if False and re.search(r"\\b(who|whos|whose|anyone|anybody|somebody|someone|"\n')]),
+    ("V7", SR, "over",
+     "⛔⛔ THE IS-THIS-AN-ID TEST GOES BACK TO A BARE LENGTH CHECK, so \"ask for "
+     "feedback\" raises the question that hands somebody's name to a stranger",
+     [('    _ask_obj_is_id = bool(" " not in _ask_obj and len(_ask_obj) >= 8\n'
+       '                          and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*[-_]"\n'
+       '                                           r"[A-Za-z0-9_-]*[A-Za-z0-9]", _ask_obj))\n',
+       '    _ask_obj_is_id = bool(" " not in _ask_obj and len(_ask_obj) >= 6)\n')]),
+    ("V8", SR, "under",
+     "⛔⛔ \"access to\" GOES BACK INTO THE MACHINE'S NAME, so the consent question "
+     "quotes a computer that cannot exist and the follow-up dead-ends on it",
+     [('        _ask_obj = re.sub(r"^(?:access\\s+to|use\\s+of|permission\\s+to\\s+use|"\n'
+       '                          r"permission\\s+to|permission\\s+for|use)\\s+", "",\n'
+       '                          _ask_obj, flags=re.I).strip()\n', '')]),
+    ("V9", SR, "under",
+     "⛔ POLITENESS RIDES INTO THE NAME AND INTO THE LOOKUP: \"ask for the Studio "
+     "PC please\" asks the owner of “Studio PC please”",
+     [('        _ask_obj = re.sub(r"[,;]?\\s+(?:please|thanks|thank you|for me|"\n'
+       '                          r"if (?:i|you) (?:can|could|may|would))\\s*$", "",\n'
+       '                          _ask_obj, flags=re.I).strip()\n', '')]),
+    ("V10", SR, "under",
+     "⛔ THE WITHDRAW LINE LOSES ITS MACHINE CONTEXT and answers \"cancel the "
+     "video\" with a sentence about owners and weeks",
+     [('    if _ask_kw and not _artefact_kw and \\\n'
+       '            (_machine_kw or _public_kw or re.search(r"\\baccess\\b|\\brequests?\\b", low)) and \\\n',
+       '    if _ask_kw and \\\n')]),
+    ("V11", SR, "under",
+     "⛔ THE UNLINK CONFIRM KEEPS THE DEVICE NOUN AGAIN — the DESTRUCTIVE branch, "
+     "whose own follow-up then cannot resolve the name it just quoted",
+     [('        name = re.sub(r"^(?:device|node|machine|computer|pc|laptop|desktop)\\s+",\n'
+       '                      "", name, flags=re.I).strip()\n'
+       '        return None, [_NL_CONFIRMS["device-remove"]',
+       '        return None, [_NL_CONFIRMS["device-remove"]')]),
+    ("V12", SR, "under",
+     "⛔⛔ THE CONSENT QUESTION DROPS THE TWO DISCLOSURES THAT COST THE READER "
+     "MOST — that the research runs on somebody else's computer on their paid AI "
+     "accounts, and that the computer can read this account's research — and "
+     "overstates the third",
+     [('    "device-ask": "Ask the owner of {name} to let you use it? Your research would "\n'
+       '                  "run on their computer, using their ChatGPT, Gemini and Claude "\n'
+       '                  "accounts; that computer can read the research in your account; "\n'
+       '                  "and they see your name — or your email, if you haven’t set one. "\n'
+       '                  "They decide, and nothing runs on it unless they say yes. Say yes "\n'
+       '                  "and I’ll ask.",',
+       '    "device-ask": "Ask the owner of {name} to let you use it? They’ll see your "\n'
+       '                  "name and email address. Say yes and I’ll ask.",')]),
+    ("V13", SR, "over",
+     "⛔⛔ CHAT GOES BACK TO RESOLVING AN ID THROUGH THE BROWSE LIST, so the "
+     "person who was just GRANTED a computer is told no such public computer "
+     "exists, and three of this verb's own refusals become unreachable",
+     [('    if _looks_like_a_device_id(wanted):\n'
+       '        device_id = wanted\n'
+       '    else:\n', '    if False:\n'
+       '        device_id = wanted\n'
+       '    else:\n')]),
+    ("V14", SR, "under",
+     "⛔ A FULL MACHINE IS ASKED FOR ANYWAY, spending one of five hourly asks on "
+     "a refusal the row already published",
+     [('        if dev.get("full"):\n', '        if False:\n')]),
+    ("V15", SR, "over",
+     "⛔⛔ THE LIST SCREENS PRINT THE MACHINE'S CODE AGAIN — `rate_limited`, "
+     "`unauthorized` — in the wave whose purpose was to stop that",
+     [('                     [f"✗ {_list_refusal_line(\'looked for public computers\', body.get(\'error\', \'\'), body.get(\'retryAfterMs\'))}"],\n'
+       '                     _fail_code(code))\n'
+       '    rows = body.get("devices") or []\n',
+       '                     [f"✗ {body.get(\'error\', code)}"],\n'
+       '                     _fail_code(code))\n'
+       '    rows = body.get("devices") or []\n')]),
+    ("V16", SR, "over",
+     "⛔ THE BROWSE LIMIT IS DESCRIBED WITH THE ASK'S HOURLY SENTENCE, wrong by "
+     "nearly an hour in the other direction",
+     [('            return f"You’ve {what} too many times in a row — give it a minute."\n',
+       '            return "You’ve asked for as many computers as an account may in one hour."\n')]),
+    ("V17", SR, "over",
+     "⛔⛔ THE REQUESTS SCREEN PROMISES AN APPROVAL CAN BE READ BACK BY ASKING "
+     "AGAIN. It cannot: the machine leaves the public list the moment this "
+     "account is put on it, so asking again answers \"no public computer is "
+     "called that\" to the person who was just granted one",
+     [('                 "this list whichever way it went. A yes shows up as the computer "\n'
+       '                 "appearing in your own list; for a no, ask for it again and I’ll "\n'
+       '                 "tell you.")',
+       '                 "this list whichever way it went — ask for that computer again "\n'
+       '                 "and I’ll tell you which it was.")')]),
+    ("V18", SR, "under",
+     "⛔ THE QUOTE STRIP MOVES BACK BEHIND THE ID COMPARE and drops two of the "
+     "six marks, so a quoted id resolves to nothing",
+     [('    bare = (wanted or "").strip().strip(_NL_QUOTE_CHARS).strip()\n'
+       '    for d in rows:\n'
+       '        if str(d.get("deviceId") or "") == bare:\n'
+       '            return d, []\n'
+       '    low = bare.lower()\n',
+       '    bare = wanted\n'
+       '    for d in rows:\n'
+       '        if str(d.get("deviceId") or "") == wanted:\n'
+       '            return d, []\n'
+       '    low = wanted.strip().strip("“”\\"\'").lower()\n')]),
+    ("V19", CLI, "over",
+     "⛔⛔ THE TERMINAL LIST SCREENS PRINT THE MACHINE'S CODE AGAIN",
+     [('        print(f"{_NO} {_list_refusal(\'looked for public computers\', body.get(\'error\') or \'\', body.get(\'retryAfterMs\'))}")\n',
+       '        print(f"{_NO} couldn\'t list public computers: {body.get(\'error\')}")\n')]),
+    ("V20", CLI, "under",
+     "⛔ `full` GOES BACK TO A QUIET WORD beside an invitation to ask, and the "
+     "route refuses these with certainty",
+     [('    full = "  (can\'t take anyone else)" if d.get("full") else ""\n',
+       '    full = "  full" if d.get("full") else ""\n')]),
+    ("V21", CLI, "under",
+     "⛔⛔ TRUNCATION STOPS BEING REPORTED ON THE EMPTY BRANCH — the branch where "
+     "it matters most, because a flat \"nobody is offering\" over a filled scan "
+     "is the one reading that is definitely wrong",
+     [('        if res[1].get("truncated"):\n'
+       '            print("     (There were more machines than one look can scan, so this "\n'
+       '                  "may not be the whole story.)")\n', '')]),
+    ("V22", CLI, "over",
+     "⛔ THE WINDOWS HINT GOES BACK TO ONE MESSAGE FOR EVERY SUBCOMMAND, so all "
+     "three new verbs point at the OWNED device list",
+     [('    rc = _redirect_if_wsl(_WSL_HINTS.get(getattr(args, "device_command", None) or "",\n'
+       '                                         "Manage devices from chat:  /sr devices"))',
+       '    rc = _redirect_if_wsl("Manage devices from chat:  /sr devices")')]),
+    ("V23", CLI, "under",
+     "⛔ THE ASK STOPS SAYING WHAT IT DISCLOSES, on the one path that reaches the "
+     "route without ever seeing the browse screen",
+     [('    print("     They see your name — or your email, if you have not set one.")\n',
+       '')]),
+    ("V24", CLI, "over",
+     "⛔ THE ONE VERB THAT WRITES goes back to the 30-second wait its two read "
+     "siblings were widened past, so it is the likeliest to report a failure on "
+     "a request the app has already filed",
+     [('    res = _bridge_post("/device/ask", {"deviceId": device_id}, timeout=40.0)',
+       '    res = _bridge_post("/device/ask", {"deviceId": device_id})')]),
+    ("V25", CLI, "under",
+     "⛔ `internal_error` LEAVES THE ASK TABLE and the route's own 500 code is "
+     "printed at the person as a word",
+     [('    "internal_error": "the app hit a problem of its own answering that — nothing "\n'
+       '                      "was sent, so it is safe to try again",\n', '')]),
+    ("V26", CLI, "over",
+     "⛔ AN UNWORDED FAILURE IS DOUBLE-WRAPPED AGAIN — \"couldn\'t ask for that "
+     "computer: could not ask for that computer (HTTP 500)\" — because both the "
+     "bridge and the client write the sentence",
+     [('        if err.startswith("http_"):\n'
+       '            return ("the app answered that with nothing this client can read "\n'
+       '                    f"(HTTP {err[5:]}) — nothing was sent")\n', '')]),
+    ("V27", BRIDGE, "over",
+     "⛔ THE BRIDGE WRITES THE SENTENCE AGAIN instead of naming the status, so "
+     "each client wraps it in its own copy of the same phrase",
+     [('                           {"error": body.get("error") or f"http_{status}",',
+       '                           {"error": body.get("error") or f"{what} (HTTP {status})",')]),
+    ("V28", BRIDGE, "under",
+     "⛔⛔ THE LINK MINT TAKES THE RETRY AGAIN, so one `/updates` poll on a "
+     "dead-but-cached session makes one forced Google token call PER RUN — all "
+     "failing the same way, for a link the caller treats as optional",
+     [('                                {"research_id": rid, "title": title or ""},\n'
+       '                                retry_401=False)',
+       '                                {"research_id": rid, "title": title or ""})')]),
+    ("V29", BRIDGE, "over",
+     "⛔ THE OPT-OUT IS IGNORED, so the parameter reads as respected and is not",
+     [('    if status != 401 or not retry_401:\n', '    if status != 401:\n')]),
+    ("V30", SKILL, "under",
+     "⛔⛔ `device-ask` LEAVES THE SAFE-DEFAULTS CONFIRM LIST, whose next clause "
+     "says everything not listed runs on a clear request — so the file positively "
+     "licenses skipping the one consent moment this wave added",
+     [('`stop`, `logout`, `device-remove`, `device-ask`, and `update`**',
+       '`stop`, `logout`, `device-remove`, and `update`**')]),
+    ("V31", SKILL, "under",
+     "⛔ `device-ask` LEAVES THE CONFIRM HANDOFF LIST, so a \"yes\" to the consent "
+     "question has no command named for it",
+     [('run the REAL command it described — stop/logout/device-remove/device-ask/',
+       'run the REAL command it described — stop/logout/device-remove/')]),
+    ("V32", SKILL, "over",
+     "⛔⛔ THE SKILL SAYS THE OWNER SEES THE ASKER'S EMAIL ADDRESS. They see the "
+     "NAME; the email only when no name is set",
+     [("for one tells that owner the user's name — or their email, if no name is set.",
+       "for one tells that owner the user's name and email address.")]),
+    ("V33", CONFTEST, "over",
+     "⛔ THE SEAM'S STUB GETS A FIXED SIGNATURE AGAIN, so the helper growing one "
+     "argument is a TypeError in a dozen unrelated tests rather than a no-op",
+     [('    def _stub(_sess, path: str, payload: dict, **_kw) -> tuple[int, dict]:',
+       '    def _stub(_sess, path: str, payload: dict) -> tuple[int, dict]:')]),
 ]
 
 

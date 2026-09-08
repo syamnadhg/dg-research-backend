@@ -69,7 +69,11 @@ def _no_real_fe_posts(monkeypatch):
 
     calls: list[tuple[str, dict]] = []
 
-    def _stub(_sess, path: str, payload: dict) -> tuple[int, dict]:
+    # ⛔ `**kw` BECAUSE THE HELPER GREW AN ARGUMENT. 7.9-2 gave `_fe_api_post` a
+    # `retry_401` opt-out for the one caller that runs in a loop, and a stub with
+    # a fixed signature turned that into a TypeError in a dozen unrelated tests.
+    # A seam's stub has to be at least as tolerant as the thing it replaces.
+    def _stub(_sess, path: str, payload: dict, **_kw) -> tuple[int, dict]:
         calls.append((path, payload))
         return 200, {"ok": True}
 

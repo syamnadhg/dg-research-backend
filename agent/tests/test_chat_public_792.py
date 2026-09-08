@@ -87,30 +87,68 @@ def test_browse_phrasings_reach_the_public_list(said):
 @pytest.mark.parametrize("said", [
     "what did I ask for",
     "any pending requests",
-    "has the owner answered yet",
+    "has the owner answered my request",
     "list my requests for other devices",
+    "am I still waiting for that computer",
 ])
 def test_waiting_phrasings_reach_the_requests_list(said):
     assert sr._nl_resolve(said)[0] == ["device-requests"], said
 
 
+@pytest.mark.parametrize("said", [
+    "still waiting for the podcast",
+    "waiting for the report",
+    "has anyone answered my email",
+])
+def test_the_waiting_rule_needs_its_own_subject(said):
+    # ⛔⛔ A BARE "waiting for …" ANSWERED EVERY RUN-PROGRESS QUESTION with
+    # "You're not waiting on any computer." The clause sits above the status and
+    # phase rules, so with no subject of its own it took all of theirs.
+    # Cross-verify found it after the wave was green.
+    argv, _lines = sr._nl_resolve(said)
+    assert argv != ["device-requests"], said
+
+
 @pytest.mark.parametrize("said,name", [
     ("ask for the Studio PC", "Studio PC"),
+    ("ask for the Studio PC please", "Studio PC"),
     ("ask for dev-a1b2c3", "dev-a1b2c3"),
     ("request access to the Lab Mac", "Lab Mac"),
+    ("request access to that Mac", "Mac"),
+    ("request access to computer LABPC001", "LABPC001"),
     ("ask to use the Lab Mac", "Lab Mac"),
     ("ask the owner of Studio PC for access", "Studio PC"),
+    ("ask for access to the studio pc", "studio pc"),
 ])
 def test_asking_for_a_named_machine_confirms_first(said, name):
     argv, lines = sr._nl_resolve(said)
     assert argv is None, said
     # ⛔⛔ CONFIRM-GATED THOUGH IT DESTROYS NOTHING. It is the only verb here that
-    # hands the person's NAME AND EMAIL to a stranger, spends one of five asks an
-    # hour, and arms a week-long refusal if the answer is no. Without this the
-    # chat path is the one door into the feature with no consent moment at all.
-    assert name in lines[0]
-    assert "name and email" in lines[0]
-    assert "they decide" in lines[0] or "owner" in lines[0]
+    # tells somebody else who the user is, spends one of five asks an hour, and
+    # arms a week-long refusal if the answer is no. Without this the chat path is
+    # the one door into the feature with no consent moment at all.
+    #
+    # ⛔⛔ AND THE NAME IS THE MACHINE'S, NOT THE SENTENCE'S. "ask for access to
+    # the studio pc" produced “access to the studio pc” — a computer that cannot
+    # exist, quoted in a request to disclose somebody, whose follow-up then
+    # dead-ended on it. Cross-verify found it; so did the trailing "please".
+    assert f"“{name}”" in lines[0], lines[0]
+    assert "they decide" in lines[0] or "They decide" in lines[0]
+
+
+def test_the_consent_question_carries_all_three_disclosures():
+    # ⛔⛔ THE FIRST VERSION SAID "your name and email address" AND THAT IS WRONG
+    # TWICE. The owner sees the name, and the email only when no name is set
+    # (`requesterLabelOf`) — and it left out the two facts that cost the reader
+    # most, which the web app puts FIRST: the research runs on somebody else's
+    # computer using their paid AI accounts, and that computer can read the
+    # research in this account.
+    _argv, lines = sr._nl_resolve("ask for the Studio PC")
+    said = lines[0]
+    assert "their computer" in said and "their ChatGPT" in said
+    assert "read the research in your account" in said
+    assert "or your email, if you haven’t set one" in said
+    assert "name and email address" not in said
 
 
 def test_the_stop_rule_no_longer_eats_a_cancelled_request():
@@ -145,6 +183,18 @@ def test_there_is_no_withdraw_and_the_answer_says_so():
 
 @pytest.mark.parametrize("said,expected", [
     ("ask for the podcast", "podcast"),
+    # ⛔⛔ THE ARTEFACT GUARD IS ONLY OBSERVABLE WITH A MACHINE WORD IN THE SAME
+    # MESSAGE. "ask for the podcast" alone is stopped one check earlier by not
+    # being about a machine at all, so the guard could be deleted with the test
+    # still green — a mutant proved it. This phrasing needs the guard.
+    ("ask for the podcast on my computer", "podcast"),
+    ("ask for the podcast from that machine", "podcast"),
+    ("ask for an update on my machine", "status"),
+    # ⛔ AND THE BROWSE CLAUSE'S BAILS ARE ONLY OBSERVABLE HERE: a run control
+    # that mentions a public machine reached the browse list when the bail was
+    # removed, and no other case in this file could see it.
+    ("stop the run on the public computer", None),
+    ("pause the run on the shared machine", "pause"),
     ("research iphone17 pricing", "research"),
     ("stop it", None),
     ("skip the video", "skip"),
@@ -380,7 +430,10 @@ def test_the_skill_says_an_answered_request_leaves_the_list():
 
 def test_the_skill_says_asking_discloses_the_person():
     low = " ".join(_skill().lower().split())
-    assert "name + email" in low or "name and email" in low
+    # ⛔ THE SAME CORRECTION AS THE CLIENT'S. "name + email" was wrong: the owner
+    # sees the name, or the email only when there is no name.
+    assert "email, if no name is set" in low or "email if no name is set" in low
+    assert "their ai accounts" in low or "their computer using their ai accounts" in low
 
 
 def test_the_skill_no_longer_promises_it_cannot_reach_anyone_elses_data():
@@ -462,7 +515,22 @@ def test_the_skill_ask_row_is_confirm_gated():
     # stranger, with nobody having agreed to it.
     row = next(ln for ln in _skill().splitlines() if "sr.py device-ask" in ln)
     assert "**confirm**" in row
-    assert "name + email" in row or "name and email" in row
+    assert "their ai accounts" in row.lower()
+
+
+def test_the_skill_names_device_ask_in_both_of_its_confirm_lists():
+    # ⛔⛔ THE ROW WAS NOT ENOUGH. Two other places in this file enumerate what
+    # needs a confirm — the handoff instruction and the Safe-defaults line — and
+    # the second one ends "everything else runs on a clear request". So a model
+    # reading either list was positively licensed to skip the one consent moment
+    # this wave added. Cross-verify found it from four independent angles.
+    text = _skill()
+    handoff = next(ln for ln in text.splitlines()
+                   if "run the REAL command it described" in ln)
+    assert "device-ask" in handoff, handoff
+    safe = text[text.index("**Safe defaults:**"):]
+    safe = safe[:safe.index("everything else runs on a clear request")]
+    assert "`device-ask`" in safe, safe[:400]
 
 
 def test_the_skill_keeps_the_row_for_the_thing_that_cannot_be_done():
@@ -471,3 +539,277 @@ def test_the_skill_keeps_the_row_for_the_thing_that_cannot_be_done():
     # improvise with are an unlink and a run-stop.
     low = " ".join(_skill().lower().split())
     assert "nothing withdraws a request" in low
+
+
+# ── the six regressions cross-verify found after the wave was green ──────────
+
+@pytest.mark.parametrize("said", [
+    "use this code K7XQ-9B2M",
+    "K7XQ-9B2M",
+    "pair my PC, code is K7XQ-9B2M",
+    "here is the code K7XQ9B2M",
+    "add device K7XQ-9B2M",
+])
+def test_a_pair_code_still_pairs_however_it_is_offered(said):
+    # ⛔⛔ MY FIRST REPAIR OF THE HIJACK BROKE PAIRING ITSELF. It excluded any
+    # message containing "use" — which is the word in "use this code K7XQ-9B2M",
+    # the commonest way anybody types one — so the client answered by asking for
+    # the code that was already in the sentence. A message that says "code" is
+    # about a code whatever else it says.
+    argv, _lines = sr._nl_resolve(said)
+    assert argv and argv[0] == "device-add", (said, argv)
+
+
+@pytest.mark.parametrize("said,verb", [
+    ("switch to the machine LABPC001", "device-use"),
+    ("request access to computer LABPC001", None),
+])
+def test_a_code_shaped_name_is_still_not_a_pairing(said, verb):
+    argv, _lines = sr._nl_resolve(said)
+    got = argv[0] if argv else None
+    assert got != "device-add", (said, argv)
+    if verb:
+        assert got == verb, (said, argv)
+
+
+@pytest.mark.parametrize("said", [
+    "is my computer public?",
+    "make my computer public",
+    "stop sharing my machine",
+])
+def test_offering_your_own_machine_is_not_answered_with_other_peoples(said):
+    # ⛔⛔ THE BROWSE CLAUSE HAD NO VERB GATE, so every one of these was answered
+    # with a list of OTHER people's machines — a list that structurally cannot
+    # contain the asker's own, because the projection drops it. Cross-verify
+    # found it from five independent angles.
+    argv, lines = sr._nl_resolve(said)
+    assert argv != ["devices-public"], said
+    # ⛔ ASSERTED POSITIVELY. "not the public list" was satisfied by the catch-all
+    # too, so the relay could be deleted and this test stayed green — a mutant
+    # proved it. The honest answer names where the setting lives.
+    assert argv is None, (said, argv)
+    assert "Offering your own computer" in lines[0], lines
+    assert "web app" in lines[0]
+
+
+@pytest.mark.parametrize("said", [
+    "who wants to use my computer",
+    "is anyone waiting for my computer",
+    "how many people asked for my machine",
+])
+def test_an_owner_asking_about_their_own_queue_is_told_where_it_lives(said):
+    # ⛔⛔ THE ASKER'S LIST IS NOT THE OWNER'S QUEUE. Answering this with an empty
+    # `device-requests` told an owner nobody had asked when somebody had — and
+    # the owner half of that route is deliberately dropped at the bridge because
+    # there is no approve or deny verb here yet.
+    argv, lines = sr._nl_resolve(said)
+    assert argv != ["device-requests"], said
+    assert argv is None and "YOUR computer" in lines[0], lines
+
+
+@pytest.mark.parametrize("said", [
+    "ask for feedback",
+    "ask about pricing",
+    "request refund",
+    "ask for access",
+])
+def test_an_ordinary_word_never_reaches_the_disclosing_consent(said):
+    # ⛔⛔ THE IS-THIS-AN-ID TEST WAS A BARE LENGTH CHECK, so any six-letter word
+    # counted as a machine and these all raised the question that hands somebody's
+    # name to a stranger. An id carries a separator; a word does not.
+    argv, lines = sr._nl_resolve(said)
+    if argv is None:
+        assert "Ask the owner of" not in lines[0], (said, lines[0])
+
+
+@pytest.mark.parametrize("said", [
+    "cancel the video",
+    "cancel my video request",
+])
+def test_the_no_withdraw_line_is_only_about_a_machine(said):
+    # ⛔ UNGATED, IT ANSWERED "cancel the video" WITH A SENTENCE ABOUT OWNERS AND
+    # WEEKS. The clause sits above the run controls, so it needed its own subject.
+    _argv, lines = sr._nl_resolve(said)
+    assert "taken back" not in " ".join(lines), (said, lines)
+
+
+def test_the_unlink_confirm_no_longer_keeps_the_device_noun():
+    # ⛔ THE STRIP LANDED ON THE SWITCH BRANCH AND NOT ON THIS ONE, four lines
+    # below — and this is the DESTRUCTIVE branch, whose own follow-up then
+    # cannot resolve the name it just quoted.
+    _argv, lines = sr._nl_resolve("remove device LABPC001")
+    assert "“LABPC001”" in lines[0], lines[0]
+
+
+# ── the list surfaces' own refusals ─────────────────────────────────────────
+
+@pytest.mark.parametrize("code", ["rate_limited", "unauthorized", "internal_error",
+                                  "http_502"])
+def test_neither_list_screen_prints_a_machine_code(chat, code):
+    # ⛔⛔ BOTH LIST ROUTES CAN REFUSE — thirty browse looks per five minutes,
+    # sixty queue reads — and neither had a table, so the wave whose purpose was
+    # to word refusals shipped two screens that printed the code. Every chat ask
+    # spends a browse call, so the limit is genuinely reachable.
+    chat.gets["/devices/public"] = (429, {"error": code, "retryAfterMs": 120_000})
+    chat.gets["/devices/requests"] = (429, {"error": code, "retryAfterMs": 120_000})
+    assert sr.cmd_devices_public(_ns()) != 0
+    assert sr.cmd_device_requests(_ns()) != 0
+    out = chat.out()
+    assert code not in out, out
+
+
+@pytest.mark.parametrize("code", ["rate_limited", "unauthorized", "internal_error",
+                                  "http_502"])
+def test_neither_terminal_list_screen_prints_a_machine_code(monkeypatch, capsys, code):
+    monkeypatch.setattr(cli, "_bridge_get",
+                        lambda p, timeout=10.0: (429, {"error": code,
+                                                       "retryAfterMs": 120_000}))
+    cli._device_public()
+    cli._device_requests()
+    out = capsys.readouterr().out
+    assert code not in out, out
+
+
+def test_a_list_rate_limit_names_the_wait_the_server_sent(chat):
+    chat.gets["/devices/public"] = (429, {"error": "rate_limited",
+                                          "retryAfterMs": 120_000})
+    sr.cmd_devices_public(_ns())
+    assert "2 minutes" in chat.out()
+
+
+def test_the_list_wait_is_not_the_asks_hourly_one(chat):
+    # ⛔ BROWSE IS THIRTY EVERY FIVE MINUTES, not five an hour. Reusing the ask's
+    # sentence here would be wrong by nearly an hour in the other direction.
+    chat.gets["/devices/public"] = (429, {"error": "rate_limited"})
+    sr.cmd_devices_public(_ns())
+    assert "hour" not in chat.out()
+
+
+def test_internal_error_is_worded_by_both_clients():
+    # ⛔ THE ASK ROUTE'S OWN CATCH-ALL, in neither table in the first pass.
+    for said in (cli._ask_refusal("internal_error"),
+                 sr._ask_refusal_line("internal_error")):
+        assert "internal_error" not in said
+        assert "safe to try again" in said.lower()
+
+
+def test_a_status_only_failure_is_worded_once_not_twice():
+    # ⛔ THE BRIDGE USED TO SYNTHESISE THE SAME PHRASE THE CLIENTS WRAP IT IN, so
+    # an unworded failure read "couldn't ask for that computer: could not ask for
+    # that computer (HTTP 500)". The bridge hands over a status; the client
+    # writes the sentence.
+    said = cli._ask_refusal("http_500")
+    assert said.count("ask for that computer") == 0
+    assert "HTTP 500" in said
+
+
+# ── the full row, and the id path ───────────────────────────────────────────
+
+def test_a_full_row_says_it_cannot_take_anyone(chat):
+    chat.gets["/devices/public"] = (200, {"devices": [
+        {"deviceId": "dev-f", "label": "Busy PC", "online": True, "full": True}]})
+    sr.cmd_devices_public(_ns())
+    out = chat.out()
+    # ⛔⛔ `full` IS A REFUSAL IN ADVANCE. The route answers `share_cap_reached`
+    # for these with certainty, so a quiet label beside an invitation to ask spent
+    # one of five hourly asks on a guaranteed no.
+    assert "can’t take anyone else" in out
+
+
+def test_asking_for_a_full_machine_is_refused_before_it_is_spent(chat):
+    chat.gets["/devices/public"] = (200, {"devices": [
+        {"deviceId": "dev-f", "label": "Busy PC", "online": True, "full": True}]})
+    assert sr.cmd_device_ask(_ns(device="Busy PC")) == 1
+    assert not [c for c in chat.calls if c[0] == "POST"]
+    assert "as many people as it can hold" in chat.out()
+
+
+def test_an_id_goes_straight_to_the_route_without_the_list(chat):
+    # ⛔⛔ RESOLVING EVERYTHING THROUGH THE BROWSE LIST WAS WRONG TWICE. The
+    # projection drops machines this account is already on, so after an approval
+    # the person just granted a computer was told no such public computer exists;
+    # and it drops the caller's own and the private ones, so `is_owner`,
+    # `already_shared` and `revoked_sharer` could never be reached from chat.
+    chat.posts["/device/ask"] = (200, {"ok": True})
+    assert sr.cmd_device_ask(_ns(device="dev-a1b2c3")) == 0
+    assert not [c for c in chat.calls if c[0] == "GET"]
+    assert [c for c in chat.calls if c[0] == "POST"][0][2] == {"deviceId": "dev-a1b2c3"}
+
+
+@pytest.mark.parametrize("code", ["is_owner", "already_shared", "revoked_sharer"])
+def test_the_three_refusals_the_list_used_to_hide_are_reachable(chat, code):
+    chat.posts["/device/ask"] = (403, {"error": code})
+    assert sr.cmd_device_ask(_ns(device="dev-a1b2c3")) == 1
+    out = chat.out()
+    assert code not in out and len(out.strip()) > 20
+
+
+@pytest.mark.parametrize("wanted,is_id", [
+    ("dev-a1b2c3", True), ("dev_a1b2c3", True),
+    ("Studio PC", False), ("feedback", False), ("Mac", False), ("short-1", False),
+])
+def test_what_counts_as_an_id(wanted, is_id):
+    assert sr._looks_like_a_device_id(wanted) is is_id, wanted
+
+
+def test_a_quoted_id_resolves_too(chat):
+    chat.gets["/devices/public"] = (200, {"devices": [ROW]})
+    chat.posts["/device/ask"] = (200, {"ok": True})
+    # ⛔ THE ID WAS COMPARED AGAINST THE RAW ARGUMENT, so a quoted one matched
+    # nothing — and only four of the six quote marks this file enumerates were
+    # stripped for the name compare.
+    dev, fail = sr._resolve_public_device("“dev-a1”")
+    assert dev and dev["deviceId"] == "dev-a1", fail
+    dev2, fail2 = sr._resolve_public_device("‘Studio PC’")
+    assert dev2 and dev2["deviceId"] == "dev-a1", fail2
+
+
+def test_a_name_that_is_gone_names_the_likeliest_reason(chat):
+    # ⛔ THE COMMONEST CAUSE IS AN APPROVAL. The machine leaves the public list
+    # the moment this account is put on it, so "no public computer is called
+    # that" is true and useless on its own.
+    chat.gets["/devices/public"] = (200, {"devices": [ROW]})
+    assert sr.cmd_device_ask(_ns(device="Lab Mac")) == 1
+    out = chat.out()
+    assert "one of YOUR computers now" in out
+
+
+def test_neither_client_promises_an_approval_can_be_read_back(chat):
+    chat.gets["/devices/requests"] = (200, {"requests": []})
+    sr.cmd_device_requests(_ns())
+    said = chat.out()
+    # ⛔⛔ "ask again and I'll tell you which it was" IS FALSE FOR A YES. An
+    # approval puts this account on the machine and the browse projection drops
+    # machines you are already on, so asking again answers "no public computer is
+    # called that". A yes reports itself by the machine turning up in your list.
+    assert "tell you which it was" not in said
+    assert "appearing in your own list" in said
+
+
+def test_chat_reports_a_truncated_scan_on_the_empty_branch_too(chat):
+    chat.gets["/devices/public"] = (200, {"devices": [], "truncated": True})
+    sr.cmd_devices_public(_ns())
+    assert "not be the whole story" in chat.out()
+
+
+def test_the_skills_safety_bullet_says_name_or_email_not_both():
+    # ⛔⛔ THE ROW AND THE BULLET BOTH SAY IT, and the guard that read the whole
+    # file was satisfied by the row alone — so the BULLET could revert to "name
+    # and email address" with nothing red. A mutant proved it. The bullet is the
+    # normative one: it is what the model reads about what it may reach.
+    text = _skill()
+    bullet = text[text.index("- You drive the user's own account only"):]
+    bullet = bullet[:bullet.index("\n- ") if "\n- " in bullet else 600]
+    assert "name and email address" not in bullet, bullet
+    assert "or their email, if no name is set" in bullet, bullet
+
+
+def test_the_suite_wide_post_stub_tolerates_the_retry_argument():
+    # ⛔ THE SEAM'S STUB HAS TO BE AT LEAST AS TOLERANT AS THE THING IT REPLACES.
+    # `_fe_api_post` grew a `retry_401` opt-out in this wave, and a stub with a
+    # fixed signature turned that into a TypeError in a dozen unrelated tests.
+    # No test in THIS file passed the argument, so nothing here noticed — a
+    # mutant proved it.
+    from facade import bridge as _b
+    status, _body = _b._fe_api_post(None, "/api/mintSrLinks", {}, retry_401=False)
+    assert status == 200

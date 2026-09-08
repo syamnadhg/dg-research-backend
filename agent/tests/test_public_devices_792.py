@@ -307,7 +307,11 @@ def test_the_terminal_lists_public_computers_with_their_ids(term):
     out = term.out()
     assert "Public computers (2):" in out
     assert "id=dev-a1" in out and "id=dev-b2" in out
-    assert "online" in out and "offline" in out and "full" in out
+    assert "online" in out and "offline" in out
+    # ⛔⛔ `full` SAYS WHAT IT MEANS NOW. It was printed as the bare word beside
+    # an invitation to ask, and the route refuses these with certainty — so the
+    # row invited an ask that spent one of five an hour on a guaranteed no.
+    assert "can't take anyone else" in out
     # ⛔ THE DISCLOSURE IS ON THE SCREEN THAT OFFERS THE ASK, not buried in the
     # ask's own output — a person decides here whether to ask at all.
     assert "name and email" in out
@@ -458,3 +462,86 @@ def test_the_windows_hint_names_a_phrase_chat_actually_routes(monkeypatch):
     import argparse
     cli.cmd_device(argparse.Namespace(device_command=None))
     assert "/sr devices" in said["msg"]
+
+
+# ── the terminal repairs cross-verify found after green ─────────────────────
+
+def test_the_terminal_refuses_a_full_row_before_spending_an_ask(term):
+    term.box["get"]["/devices/public"] = (200, {"devices": [
+        {"deviceId": "dev-f", "label": "Busy PC", "online": True, "full": True}]})
+    _run(device_command="public")
+    out = term.out()
+    assert "can't take anyone else" in out
+
+
+def test_the_terminal_says_what_it_discloses_on_the_ask_itself(term):
+    # ⛔ SOMEBODY WITH AN ID NEVER SEES THE BROWSE SCREEN, and the disclosure was
+    # printed only there — so the one path that reaches the route directly was
+    # the one that never named what it discloses.
+    term.box["post"]["/device/ask"] = (200, {"ok": True})
+    _run(device_command="ask", deviceId="dev-a1")
+    out = term.out()
+    assert "or your email, if you have not set one" in out
+
+
+def test_the_terminal_requests_screen_does_not_promise_to_read_back_a_yes(term):
+    term.box["get"]["/devices/requests"] = (200, {"requests": []})
+    _run(device_command="requests")
+    out = term.out()
+    # ⛔⛔ AN APPROVAL CANNOT BE READ BACK BY ASKING AGAIN: the machine leaves the
+    # public list once this account is on it. It reports itself by appearing in
+    # the account's own list.
+    assert "told which it was" not in out
+    assert "agent device" in out
+
+
+def test_the_terminal_empty_browse_still_reports_a_truncated_scan(term):
+    # ⛔⛔ THE FLAG WAS REPORTED ONLY ON THE NON-EMPTY BRANCH. It is computed on
+    # the raw scan, so zero rows can mean "the scan filled and everything in it
+    # was filtered" — over which a flat "nobody is offering" is the one reading
+    # that is definitely wrong.
+    term.box["get"]["/devices/public"] = (200, {"devices": [], "truncated": True})
+    _run(device_command="public")
+    out = term.out()
+    assert "not be the whole story" in out
+
+
+def test_the_terminal_ask_waits_as_long_as_its_siblings(term):
+    # ⛔ THE ONE VERB THAT WRITES was left on the 30s default its two read
+    # siblings were widened past, so it was the most likely to report a failure
+    # on a request the app had already filed.
+    term.box["post"]["/device/ask"] = (200, {"ok": True})
+    _run(device_command="ask", deviceId="dev-a1")
+    sent = next(c for c in term.calls if c[1] == "/device/ask")
+    assert sent[2] == {"deviceId": "dev-a1"}
+    import inspect
+    src = inspect.getsource(cli._device_ask)
+    assert "timeout=40.0" in src
+
+
+@pytest.mark.parametrize("sub,phrase", [
+    ("public", "public computers"),
+    ("ask", "ask for"),
+    ("requests", "waiting on"),
+])
+def test_the_windows_hint_matches_the_subcommand(monkeypatch, sub, phrase):
+    # ⛔⛔ THE REDIRECT RUNS BEFORE THE DISPATCH, so all three new verbs were
+    # answered under WSL with a pointer at the OWNED device list — a different
+    # question, given to somebody who had just asked a public one.
+    said = {}
+    monkeypatch.setattr(cli, "_redirect_if_wsl",
+                        lambda msg: said.setdefault("msg", msg) or 0)
+    import argparse
+    cli.cmd_device(argparse.Namespace(device_command=sub, deviceId="x"))
+    assert phrase in said["msg"], said
+
+
+def test_the_relay_hands_over_a_status_not_a_sentence(live, monkeypatch):
+    # ⛔ BOTH SIDES USED TO WRITE THE SENTENCE, so an unworded failure read
+    # "couldn't ask for that computer: could not ask for that computer (HTTP
+    # 500)". The bridge names the status; the client words it.
+    monkeypatch.setattr(bridge, "_fe_api_post", lambda s, p, b, **kw: (500, {}))
+    r = requests.post(live[0] + "/device/ask", json={"deviceId": "dev-a1"})
+    assert r.status_code == 500
+    assert r.json()["error"] == "http_500"
+    assert "could not ask" not in r.text

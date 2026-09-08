@@ -275,3 +275,42 @@ def test_the_suite_wide_stub_actually_replaces_the_get(monkeypatch):
     status, _body = bridge._fe_api_get(None, "/api/devices/public")
     assert status == 200
     assert ("/api/devices/public", {}) in bridge._fe_calls
+
+
+# ── the retry's one opt-out ─────────────────────────────────────────────────
+
+def test_the_post_can_be_asked_not_to_retry(monkeypatch):
+    # ⛔⛔ ONE CALLER RUNS IN A LOOP. `/updates` re-mints share links for EVERY
+    # row it returns, inside one request — so on a session whose refresh token
+    # died while its ID token is still cached, the retry turned one poll into one
+    # forced Google token call PER RUN, all failing the same way, for a link the
+    # caller treats as optional. Cross-verify found it.
+    seen = _script(monkeypatch, "post", [_Reply(401)])
+    sess = _Sess()
+    status, _body = _REAL_POST(sess, "/api/mintSrLinks", {}, retry_401=False)
+    assert status == 401
+    assert len(seen) == 1 and sess.calls == [False]
+
+
+def test_every_write_keeps_the_retry_by_default(monkeypatch):
+    seen = _script(monkeypatch, "post", [_Reply(401), _Reply(200)])
+    sess = _Sess()
+    _REAL_POST(sess, "/api/devices/claim", {"code": "X"})
+    assert len(seen) == 2 and sess.calls == [False, True]
+
+
+def test_the_link_mint_is_the_only_caller_that_opts_out():
+    # ⛔ A SOURCE PIN, because the whole point is WHICH call site does this. Any
+    # other caller reaching for the opt-out is a write that lost its second
+    # chance, which is the opposite of what this wave added.
+    # ⛔ MATCHED AS A CALL ARGUMENT, NOT AS A SUBSTRING. The first version counted
+    # every occurrence and found two — the call site and the docstring that
+    # explains it — so the guard failed on prose about itself, which is this
+    # project's most repeated test defect.
+    src = code_only(_SRC)
+    sites = [i for i, ln in enumerate(src.splitlines())
+             if re.fullmatch(r"\s*retry_401=False\)\s*", ln)]
+    assert len(sites) == 1, sites
+    lines = src.splitlines()
+    block = "\n".join(lines[max(0, sites[0] - 6):sites[0] + 1])
+    assert "mintSrLinks" in block, block

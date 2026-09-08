@@ -146,7 +146,7 @@ resolves the intent in code and either runs the right command, asks the one
 missing thing, or asks for the confirmation first. Pass the message exactly as
 the user wrote it, never your paraphrase (escape any double quotes inside it).
 If `do` asked a confirm question ("Say yes and I'll …") and the user confirms,
-run the REAL command it described — stop/logout/device-remove/
+run the REAL command it described — stop/logout/device-remove/device-ask/
 update/install/research, with the run or device it named — a "no" just
 cancels. Never send the bare "yes" back into `do`.
 
@@ -180,15 +180,18 @@ cancels. Never send the bare "yes" back into `do`.
 | "did my logs go through?", "check on that support code" | `sr.py send-logs --status <CODE>` |
 | "just the one about X", "only the first two", "not all of them" | the plan numbers every run — pass those numbers back with `--runs`, comma-separated: `sr.py send-logs --runs 1,3` (and again on `--confirm`). `--runs 0` is the agent's own log, `--runs all` is every run listed. A name works too. Do **not** guess a number the plan did not print |
 | "send the agent's log too", "include the bridge log", "the log from this chat" | add `--agent-log` to the **bare** command **and to `--confirm`** — or say `--runs 0`, which is the same thing and is the number the plan prints for it. It uploads nothing on either; it makes the plan name it, and makes the client hand you `sr.py send-logs --status <CODE> --agent-log` for once the bundle lands. **Not** owner-gated. See **Sending logs to support** |
-| "are there any public computers?", "show me computers I could ask to use", "I don't have a computer of my own" | `sr.py devices-public` (only machines whose owners offer them; the id on each row is what the next command takes — public names collide, an unnamed one reads as "Research computer" for everybody) |
-| "ask for the Studio PC", "request access to that Mac", "ask its owner if I can use it" | **confirm** (the client prints the question — it tells the owner the user's name + email, and a "no" blocks asking again for a week), then `sr.py device-ask "<name or id>"` |
-| "what am I waiting on?", "did they answer?", "my pending requests" | `sr.py device-requests` — ONLY unanswered ones appear. A request that has been answered leaves the list **either way**; never read a missing row as a refusal. Ask for that computer again and the reply says which it was |
+| "are there any public computers?", "show me computers I could ask to use", "I don't have a computer of my own" | `sr.py devices-public` (only machines whose owners offer them; the id on each row is what the next command takes — public names collide, an unnamed one reads as "Research computer" for everybody). A row marked "can't take anyone else" is full: asking would be refused |
+| "make my computer public", "is my computer public?", "who wants to use my machine?" | offering your own machine, and answering people who ask for it, are done in the web app — relay the client's line and do not substitute the public list |
+| "ask for the Studio PC", "request access to that Mac", "ask its owner if I can use it" | **confirm** — relay the client's question verbatim (the research would run on THEIR computer using THEIR AI accounts, that computer can read this account's research, and they see the user's name, or email if no name is set; a "no" blocks asking again for a week) — then `sr.py device-ask "<name or id>"`. Prefer the **id** from the list: public names collide |
+| "what am I waiting on?", "did they answer?", "my pending requests" | `sr.py device-requests` — ONLY unanswered ones appear. A request that has been answered leaves the list **either way**; never read a missing row as a refusal. A **yes** shows up as the computer appearing in `sr.py devices`; for a **no**, ask for that computer again and the reply says so |
 | "cancel my request", "withdraw that request" | nothing withdraws a request — relay the client's line. It stays with the owner until they answer, or lapses after a week |
 | just `/sr`, "what can you do?", "help" | `sr.py status-account` → welcome (see **A bare `/sr`**) |
 
 **Safe defaults:** unnamed run → the **most-recent active** run. **Confirm before
-`stop`, `logout`, `device-remove`, and `update`** (a quick "Stop the EV
-run?" is enough); everything else runs on a clear request. **Always answer "what phase / is
+`stop`, `logout`, `device-remove`, `device-ask`, and `update`** (a quick "Stop the
+EV run?" is enough); everything else runs on a clear request. `device-ask` is on
+that list even though it destroys nothing: it is the only command here that tells
+somebody else who the user is, and a refusal blocks asking again for a week. **Always answer "what phase / is
 X skipped / how's it going" from a FRESH `sr.py status`** (or `updates`) — never
 from memory or an earlier watchdog message (a run keeps advancing and the user can
 toggle phases in the web app). **Sign-in / connection state the same: ONLY from a
@@ -459,7 +462,8 @@ it down too: `cronjob(action="list")` → the `sr-stream…` job →
   user on the device, never by you.
 - You drive the user's own account only. The one thing that reaches past it is the
   public-computer list: it names machines other people chose to offer, and asking
-  for one tells that owner the user's name and email address. Never ask on the
+  for one tells that owner the user's name — or their email, if no name is set.
+  Never ask on the
   user's behalf without a real "yes" to the client's own question first — the
   client refuses nothing, so YOU are the consent step, and a refusal from the
   owner blocks a fresh request for a week.

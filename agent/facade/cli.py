@@ -1149,7 +1149,44 @@ _ASK_FAILURES = {
     "invalid_json": "that request didn't reach the app in a form it could read",
     "device_id_required": "that isn't an id any computer could have",
     "unauthorized": "this agent's sign-in was refused — run login again",
+    # ⛔ THE ROUTE'S OWN CATCH-ALL. It answers `internal_error` on any unhandled
+    # throw, and with no row here both clients printed that word at the person.
+    "internal_error": "the app hit a problem of its own answering that — nothing "
+                      "was sent, so it is safe to try again",
 }
+
+# ⛔⛔ THE TWO LIST ROUTES NEEDED THEIR OWN TABLE AND DID NOT HAVE ONE. Every
+# refusal they can give — `rate_limited` at thirty a five minutes on browse and
+# sixty on the queue, `unauthorized`, `internal_error` — reached the person as
+# the machine's own token, in a wave whose whole point was to stop exactly that.
+# Cross-verify found it on all four surfaces at once.
+_LIST_FAILURES = {
+    "unauthorized": "this agent's sign-in was refused — run login again",
+    "internal_error": "the app hit a problem of its own answering that — nothing "
+                      "about your account changed",
+}
+
+
+def _list_refusal(what: str, err: str, retry_after_ms=None) -> str:
+    """The sentence for one refusal from a list route.
+
+    ⛔ `rate_limited` CARRIES ITS OWN WAIT and it is not the ask's hourly one —
+    browse allows thirty looks every five minutes — so the number has to come
+    from the reply rather than from a habit.
+    """
+    if err == "rate_limited":
+        mins = _minutes_from_ms(retry_after_ms)
+        if mins is None:
+            return f"you have {what} too many times in a row — give it a minute"
+        return (f"you have {what} too many times in a row — try again in about "
+                f"{mins} minute{'' if mins == 1 else 's'}")
+    said = _LIST_FAILURES.get(err)
+    if said is None:
+        if err.startswith("http_"):
+            return (f"the app answered that with nothing this client can read "
+                    f"(HTTP {err[5:]})")
+        return f"couldn't {what}: {err or 'no reason given'}"
+    return said
 
 
 def _minutes_from_ms(retry_after_ms) -> "int | None":
@@ -1185,6 +1222,13 @@ def _ask_refusal(err: str, retry_after_ms=None) -> str:
                 f"{'' if mins == 1 else 's'}")
     said = _ASK_FAILURES.get(err)
     if said is None:
+        # ⛔ THE BRIDGE HANDS OVER A STATUS, NOT A SENTENCE. It used to synthesise
+        # the same phrase each client wraps it in, so an unworded failure read
+        # "couldn't ask for that computer: could not ask for that computer
+        # (HTTP 500)". A bare `http_<n>` is the code; this is the sentence.
+        if err.startswith("http_"):
+            return ("the app answered that with nothing this client can read "
+                    f"(HTTP {err[5:]}) — nothing was sent")
         return f"couldn't ask for that computer: {err or 'no reason given'}"
     return said
 
@@ -1195,7 +1239,18 @@ def cmd_device(args: argparse.Namespace) -> int:
     # matches "devices" and "device list" and never the bare word — so this hint
     # sent every Windows user to the one phrasing that answers "I didn't catch a
     # Super Research request in that". Reproduced against the resolver.
-    rc = _redirect_if_wsl("Manage devices from chat:  /sr devices")
+    #
+    # ⛔⛔ AND THE HINT HAS TO MATCH THE SUBCOMMAND. This redirect runs before the
+    # dispatch below, so `agent device public|ask|requests` under WSL was answered
+    # with a pointer at the OWNED device list — a different question, sent to
+    # somebody who had just asked a public one. Cross-verify caught it.
+    _WSL_HINTS = {
+        "public": "Find a public computer from chat:  /sr are there any public computers",
+        "ask": "Ask for a public computer from chat:  /sr ask for that computer",
+        "requests": "See what you are waiting on from chat:  /sr what am I waiting on",
+    }
+    rc = _redirect_if_wsl(_WSL_HINTS.get(getattr(args, "device_command", None) or "",
+                                         "Manage devices from chat:  /sr devices"))
     if rc is not None:
         return rc
     if not _bridge_up():
@@ -1282,7 +1337,12 @@ def _public_row(i: int, d: dict) -> str:
     """
     label = str(d.get("label") or "").strip() or "(unnamed)"
     state = "online" if d.get("online") else "offline"
-    full = "  full" if d.get("full") else ""
+    # ⛔⛔ `full` IS NOT DECORATION — IT IS A REFUSAL IN ADVANCE. The projection
+    # sets it when the machine's people list is at its ceiling, and the ask route
+    # is then guaranteed to answer `share_cap_reached`. Printing it as a quiet
+    # word beside an invitation to ask spent one of five hourly asks on a certain
+    # no; it says what it means now.
+    full = "  (can't take anyone else)" if d.get("full") else ""
     return f"  {i:>2}  {label.ljust(34)}  {state.ljust(8)}{full}  id={d.get('deviceId')}"
 
 
@@ -1293,13 +1353,25 @@ def _device_public() -> int:
     # the bridge waiting on the WEB APP, and that call is allowed fifteen on its
     # own before a retry.
     res = _bridge_get("/devices/public", timeout=40.0)
-    if res is None or res[0] != 200:
+    if res is None:
         print(f"{_NO} couldn't list public computers: {_err(res)}")
+        return 1
+    if res[0] != 200:
+        body = res[1] if isinstance(res[1], dict) else {}
+        print(f"{_NO} {_list_refusal('looked for public computers', body.get('error') or '', body.get('retryAfterMs'))}")
         return 1
     rows = res[1].get("devices") or []
     if not rows:
         print("No computers are being offered publicly right now.")
         print("     A computer is offered only when its owner switches that on.")
+        # ⛔⛔ TRUNCATION MATTERS MOST ON THE EMPTY BRANCH, and it was reported
+        # only on the other one. The flag is computed on the raw scan, so an
+        # answer of zero rows can still mean "the scan was full and everything in
+        # it was filtered" — printing a flat "nobody is offering" over that is
+        # the one reading that is definitely wrong.
+        if res[1].get("truncated"):
+            print("     (There were more machines than one look can scan, so this "
+                  "may not be the whole story.)")
         return 0
     print(f"Public computers ({len(rows)}):")
     for i, d in enumerate(rows, 1):
@@ -1322,7 +1394,11 @@ def _device_ask(device_id: str) -> int:
         print(f"{_NO} name the computer by its id — the public list prints one "
               f"on every row.")
         return 1
-    res = _bridge_post("/device/ask", {"deviceId": device_id})
+    # ⛔ FORTY, LIKE ITS TWO SIBLINGS. This POST goes through the bridge to the
+    # web app exactly as they do, and it was left on the thirty-second default
+    # they were widened past — so the one verb that WRITES something was the one
+    # most likely to report a failure on a request the app had already filed.
+    res = _bridge_post("/device/ask", {"deviceId": device_id}, timeout=40.0)
     if res is None:
         print(f"{_NO} couldn't ask for that computer: {_err(res)}")
         return 1
@@ -1332,6 +1408,11 @@ def _device_ask(device_id: str) -> int:
         return 1
     print(f"{_OK} Asked. Its owner decides — nothing happens on that computer "
           f"until they say yes.")
+    # ⛔ SAID HERE TOO, AND NOT ONLY ON THE LIST. Somebody who already has an id
+    # can run this without ever seeing the browse screen, and the disclosure was
+    # printed only there — so the one path that reaches the route directly was
+    # the one that never named what it discloses.
+    print("     They see your name — or your email, if you have not set one.")
     # ⛔ NO POLLING ADVICE AND NO WAIT. Nothing tells this side when an owner
     # answers, and an answered request stops appearing in the list below rather
     # than turning into a "no" — so the honest next step names the list and says
@@ -1343,8 +1424,12 @@ def _device_ask(device_id: str) -> int:
 def _device_requests() -> int:
     """The access requests this account is still waiting on."""
     res = _bridge_get("/devices/requests", timeout=40.0)
-    if res is None or res[0] != 200:
+    if res is None:
         print(f"{_NO} couldn't list your requests: {_err(res)}")
+        return 1
+    if res[0] != 200:
+        body = res[1] if isinstance(res[1], dict) else {}
+        print(f"{_NO} {_list_refusal('asked for your requests', body.get('error') or '', body.get('retryAfterMs'))}")
         return 1
     rows = res[1].get("requests") or []
     if not rows:
@@ -1361,8 +1446,15 @@ def _device_requests() -> int:
     # refusal would be inventing a field that never crossed the wire.
     print("\n     Only unanswered requests appear here. Once a request is "
           "answered it")
-    print("     leaves this list either way — ask again and you will be told "
-          "which it was.")
+    # ⛔⛔ THE FIRST VERSION SAID "ask again and you will be told which it was",
+    # and that is false for the one answer people care about. An APPROVAL makes
+    # the machine one of yours, and the browse list drops machines you are
+    # already on — so asking again cannot report a yes. It reports a yes by the
+    # machine simply being in your own list.
+    print("     leaves this list either way. A yes shows up as the computer "
+          "appearing in")
+    print("     `agent device`; for a no, ask for that computer again and you "
+          "will be told.")
     return 0
 
 

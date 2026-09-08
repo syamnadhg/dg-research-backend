@@ -657,8 +657,9 @@ def test_mint_sr_unwraps_a_nested_response_and_refuses_a_non_url_value():
     import types
     calls = {}
 
-    def _post(_sess, path, body):
+    def _post(_sess, path, body, **kw):
         calls["path"] = path
+        calls["kw"] = kw
         return 200, {"srLinks": {"urls": {"brief": "https://o/shared/doc/B"},
                                  "present": ["brief", "chatgpt"]}}
 
@@ -670,6 +671,11 @@ def test_mint_sr_unwraps_a_nested_response_and_refuses_a_non_url_value():
         bridge._fe_api_post = orig
     assert out == {"brief": "https://o/shared/doc/B"}
     assert calls["path"] == "/api/mintSrLinks"
+    # ⛔ AND IT DOES NOT TAKE THE 401 RETRY. `/updates` calls this once per run in
+    # a single request and treats the answer as optional, so a dead-but-cached
+    # session would otherwise make one forced Google token call PER ROW of one
+    # poll. Every write keeps the retry; this best-effort read in a loop does not.
+    assert calls["kw"] == {"retry_401": False}
 
 
 def test_updates_via_agent_filters_and_builds_phase_updates(live, monkeypatch):
