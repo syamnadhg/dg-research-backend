@@ -496,7 +496,11 @@ def _signed_in_line(signed_in: dict) -> str:
         return (
             f"✓ Signed in as {who}.\n\n"
             f"There's no Research Computer on your account yet, so {quoted} has nowhere to run.\n\n"
-            f"On a computer with Super Research, run:\n"
+            f"Two ways to fix that. Ask to use somebody else's — ask me for the "
+            f"public computers and I'll list the ones on offer; their owner "
+            f"decides, and they see your name — or your email, if you have not "
+            f"set one.\n\n"
+            f"Or add your own. On a computer with Super Research, run:\n"
             f"      superresearch --pair\n"
             f"It shows an 8-char code. Then add the Research Computer either way:\n\n"
             f"1) In the web app (most reliable):\n"

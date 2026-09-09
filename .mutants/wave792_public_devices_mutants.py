@@ -313,14 +313,13 @@ MUTANTS = [
      "⛔⛔ THE DISCLOSURE LEAVES THE SCREEN THAT OFFERS THE ASK. A person decides "
      "HERE whether to ask at all, and the fact that asking names them was the "
      "thing they needed before deciding",
-     [('    print("     Its owner decides. Asking tells them your name and email address.")\n',
-       '')]),
+     [('_PUBLIC_ASK_INVITE_T = ("     Its owner decides. They see your name — or your "\n                        "email, if you have not set one.")',
+       '_PUBLIC_ASK_INVITE_T = "     Its owner decides."')]),
     ("P8", CLI, "over",
      "⛔ THE TRUNCATION CAPTION PROMISES A NEXT PAGE. There is no cursor, no "
      "ordering and no second request — the rest are unreachable, permanently",
-     [('        print("  (there are more public computers than one look can scan, so some "\n'
-       '              "may be missing)")',
-       '        print("  (only the first page is shown — ask again for the next page)")')]),
+     [('_PUBLIC_TRUNCATED_SOME_T = ("  (there are more public computers than one look can "\n                            "scan, so some may be missing)")',
+       '_PUBLIC_TRUNCATED_SOME_T = "  (only the first page is shown — ask again for the next page)"')]),
     ("P9", CLI, "over",
      "the browse call falls back to `_bridge_get`'s ten-second default, which is "
      "shorter than the fifteen the bridge's own web-app call is allowed before it "
@@ -330,19 +329,18 @@ MUTANTS = [
     ("P10", CLI, "under",
      "⛔ THE EMPTY LIST STOPS SAYING WHY IT IS EMPTY, so \"nobody is offering\" "
      "reads as a fault rather than as the ordinary state of an opt-in feature",
-     [('        print("     A computer is offered only when its owner switches that on.")\n',
-       '')]),
+     [('        print("No computers are being offered publicly right now.")\n        print(_PUBLIC_NONE_WHY_T)\n',
+       '        print("No computers are being offered publicly right now.")\n')]),
     ("P11", SR, "under",
      "⛔⛔ CHAT'S PUBLIC LIST DROPS THE ID, and chat is the surface where public "
      "names collide worst — every unrenamed machine is the identical string",
-     [('        lines.append(f"  • {label}{dot}{full}  (id {d.get(\'deviceId\')})")',
-       '        lines.append(f"  • {label}{dot}{full}")')]),
+     [('    return f"  • {label}{dot}{full}  (id {d.get(\'deviceId\')})"',
+       '    return f"  • {label}{dot}{full}"')]),
     ("P12", SR, "under",
      "chat stops saying that asking names the person, so the disclosure exists on "
      "one client and not the other",
-     [('    lines.append("Tell me which one to ask for and I’ll ask its owner. Asking tells "\n'
-       '                 "them your name and email address.")\n',
-       '    lines.append("Tell me which one to ask for and I’ll ask its owner.")\n')]),
+     [('_PUBLIC_ASK_INVITE = ("Tell me which one to ask for — its name, or the id beside it "\n                      "if two read the same. Its owner decides, and they see your "\n                      "name — or your email, if you haven’t set one.")',
+       '_PUBLIC_ASK_INVITE = "Tell me which one to ask for and I’ll ask its owner."')]),
 
     # ═══════════ A — ask ═════════════════════════════════════════════════════
     ("A1", BRIDGE, "under",
@@ -619,10 +617,8 @@ MUTANTS = [
     ("N13", SR, "under",
      "⛔ A LEADING DEVICE NOUN GOES BACK INTO THE NAME, so \"switch to the machine "
      "LABPC001\" looks up a device called \"machine LABPC001\"",
-     [('        name = re.sub(r"^(?:device|node|machine|computer|pc|laptop|desktop)\\s+",\n'
-       '                      "", name, flags=re.I).strip()\n'
-       '        return (["device-use", name] if name else ["devices"]), None\n',
-       '        return (["device-use", name] if name else ["devices"]), None\n')]),
+     [('        name = _strip_leading_noun(name)\n        if _is_bare_machine_noun(name):\n',
+       '        if _is_bare_machine_noun(name):\n')]),
     ("N14", SR, "under",
      "⛔ THE CAPABILITIES LINE STOPS NAMING THE NEW SURFACE, so the fallback "
      "denies having the verbs the resolver just failed to reach",
@@ -643,8 +639,8 @@ MUTANTS = [
     ("S1", SKILL, "under",
      "⛔ THE BROWSE ROW GOES. The table is what the assistant reads to decide "
      "what to run; a verb with no row reaches the CLI only",
-     [('| "are there any public computers?", "show me computers I could ask to use", '
-       '"I don\'t have a computer of my own" | `sr.py devices-public`', '| unrouted |')]),
+     [('| "are there any public computers?", "show me computers I could ask to use" | `sr.py devices-public`',
+       '| unrouted |')]),
     ("S2", SKILL, "over",
      "⛔⛔ THE ASK ROW LOSES ITS CONFIRM, so the assistant fires a request that "
      "names the person to a stranger without asking them first",
@@ -797,10 +793,8 @@ MUTANTS = [
     ("V11", SR, "under",
      "⛔ THE UNLINK CONFIRM KEEPS THE DEVICE NOUN AGAIN — the DESTRUCTIVE branch, "
      "whose own follow-up then cannot resolve the name it just quoted",
-     [('        name = re.sub(r"^(?:device|node|machine|computer|pc|laptop|desktop)\\s+",\n'
-       '                      "", name, flags=re.I).strip()\n'
-       '        return None, [_NL_CONFIRMS["device-remove"]',
-       '        return None, [_NL_CONFIRMS["device-remove"]')]),
+     [('        name = _strip_leading_noun(name)\n        # ⛔⛔ AND NOT "that device" EITHER.',
+       '        # ⛔⛔ AND NOT "that device" EITHER.')]),
     ("V12", SR, "under",
      "⛔⛔ THE CONSENT QUESTION DROPS THE TWO DISCLOSURES THAT COST THE READER "
      "MOST — that the research runs on somebody else's computer on their paid AI "
@@ -830,12 +824,8 @@ MUTANTS = [
     ("V15", SR, "over",
      "⛔⛔ THE LIST SCREENS PRINT THE MACHINE'S CODE AGAIN — `rate_limited`, "
      "`unauthorized` — in the wave whose purpose was to stop that",
-     [('                     [f"✗ {_list_refusal_line(\'looked for public computers\', body.get(\'error\', \'\'), body.get(\'retryAfterMs\'))}"],\n'
-       '                     _fail_code(code))\n'
-       '    rows = body.get("devices") or []\n',
-       '                     [f"✗ {body.get(\'error\', code)}"],\n'
-       '                     _fail_code(code))\n'
-       '    rows = body.get("devices") or []\n')]),
+     [('    code, body = _get("/devices/public", timeout=40)\n    if code != 200:\n        return _emit(body, args.json,\n                     [f"✗ {_list_refusal_line(\'looked for public computers\', body.get(\'error\', \'\'), body.get(\'retryAfterMs\'))}"],',
+       '    code, body = _get("/devices/public", timeout=40)\n    if code != 200:\n        return _emit(body, args.json,\n                     [f"✗ {body.get(\'error\', code)}"],')]),
     ("V16", SR, "over",
      "⛔ THE BROWSE LIMIT IS DESCRIBED WITH THE ASK'S HOURLY SENTENCE, wrong by "
      "nearly an hour in the other direction",
@@ -877,9 +867,8 @@ MUTANTS = [
      "⛔⛔ TRUNCATION STOPS BEING REPORTED ON THE EMPTY BRANCH — the branch where "
      "it matters most, because a flat \"nobody is offering\" over a filled scan "
      "is the one reading that is definitely wrong",
-     [('        if res[1].get("truncated"):\n'
-       '            print("     (There were more machines than one look can scan, so this "\n'
-       '                  "may not be the whole story.)")\n', '')]),
+     [('        if res[1].get("truncated"):\n            print(_PUBLIC_TRUNCATED_NONE_T)\n        return 0\n',
+       '        return 0\n')]),
     ("V22", CLI, "over",
      "⛔ THE WINDOWS HINT GOES BACK TO ONE MESSAGE FOR EVERY SUBCOMMAND, so all "
      "three new verbs point at the OWNED device list",
@@ -928,7 +917,7 @@ MUTANTS = [
      "⛔⛔ `device-ask` LEAVES THE SAFE-DEFAULTS CONFIRM LIST, whose next clause "
      "says everything not listed runs on a clear request — so the file positively "
      "licenses skipping the one consent moment this wave added",
-     [('`stop`, `logout`, `device-remove`, `device-ask`, `device-approve`, `device-deny`,\n`device-visibility public`, and `update`**',
+     [('`stop`, `logout`, `device-remove`, `device-ask`, `device-approve`, `device-deny`,\n`device-visibility public`, `update`, and `install`**',
        '`stop`, `logout`, `device-remove`, and `update`**')]),
     ("V31", SKILL, "under",
      "⛔ `device-ask` LEAVES THE CONFIRM HANDOFF LIST, so a \"yes\" to the consent "

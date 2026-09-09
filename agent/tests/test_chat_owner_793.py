@@ -1139,9 +1139,34 @@ def test_the_shared_noun_list_reaches_the_skip_guard_too(noun):
 def test_the_shared_noun_list_reaches_the_unlink_gate_too(noun):
     """⛔⛔ W1. Three MORE hand-written noun lists were found after the first two
     were unified, each missing `mac` — so "remove my mac" reached nothing while
-    "remove my computer" worked."""
+    "remove my computer" worked.
+
+    ⛔⛔ AND THIS TEST PINNED A DEFECT WHILE PROVING THE FIX. It demanded the
+    reply be `Unlink “computer”?` — a DESTRUCTIVE confirm quoting a word that is
+    not a name, whose own "yes" runs a remove that resolves to "No device matching
+    “computer”". That is the same defect 7.9-3 fixed one rung up for "remove
+    device LABPC001", and the assertion enshrined it here. What the gate has to
+    prove is that the message REACHES the unlink rule at all — which the
+    "which one?" answer proves, and the catch-all disproves.
+    """
     argv, lines = sr._nl_resolve(f"remove my {noun}")
-    assert argv is None and "Unlink" in lines[0], (noun, argv, lines)
+    assert argv is None, (noun, argv)
+    assert "unlink" in lines[0].lower(), (noun, lines)
+    # ⛔ THE CATCH-ALL IS THE FAILURE THIS GUARDS AGAINST. It is the thing every
+    # one of these five said before the noun list was shared.
+    assert "didn’t catch" not in lines[0], (noun, lines)
+    # ⛔ AND NO NAME IS QUOTED, because none was given.
+    assert f"“{noun}”" not in lines[0], (noun, lines)
+
+
+@pytest.mark.parametrize("noun", ["computer", "machine", "mac", "macbook",
+                                  "workstation", "laptop", "device", "node"])
+def test_a_named_machine_still_confirms_by_name_after_the_noun_is_stripped(noun):
+    """The other half of the rung above: a real name behind the noun still gets
+    the destructive confirm, and the confirm quotes the NAME with the noun gone."""
+    argv, lines = sr._nl_resolve(f"remove my {noun} LABPC001")
+    assert argv is None, (noun, argv)
+    assert "Unlink “LABPC001”" in lines[0], (noun, lines)
 
 
 @pytest.mark.parametrize("said", [

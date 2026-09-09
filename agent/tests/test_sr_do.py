@@ -103,8 +103,14 @@ def test_skip_phase_words_not_device_remove():
 def test_devices_verbs():
     assert _argv("which devices do I have?") == ["devices"]
     assert _argv("switch to the office PC") == ["device-use", "office PC"]
+    # ⛔⛔ "the old laptop device" NAMES NO MACHINE. Both leading-noun strips run
+    # ("old ", then "laptop ") and what is left is the bare word "device" — so the
+    # old assertion was pinning `Unlink “device”?`, a destructive confirm whose
+    # own "yes" resolves to "No device matching “device”".
     note = _note("remove the old laptop device")
-    assert "Unlink" in note and "yes" in note.lower()
+    assert "unlink" in note.lower() and "“device”" not in note
+    note = _note("remove the old laptop LABPC001")
+    assert "Unlink “LABPC001”" in note and "yes" in note.lower()
 
 
 def test_podcast_and_lists():

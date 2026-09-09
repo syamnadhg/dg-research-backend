@@ -1204,6 +1204,27 @@ _DECIDE_FAILURES = {
 # sixty on the queue, `unauthorized`, `internal_error` — reached the person as
 # the machine's own token, in a wave whose whole point was to stop exactly that.
 # Cross-verify found it on all four surfaces at once.
+# ⛔ THE PLAIN VERB FOR EACH CALLER PHRASE — see the chat client's twin table.
+# ⛔⛔ FOUR SENTENCES THE PUBLIC LIST AND THE EMPTY STATE BOTH PRINT. They were
+# hand-copied into the second site and the anchor sweep caught it immediately —
+# three mutants that had measured one line each began matching two, which is a
+# harness fault and was also a promise that the two screens would drift.
+_PUBLIC_NONE_WHY_T = "     A computer is offered only when its owner switches that on."
+_PUBLIC_TRUNCATED_NONE_T = ("     (There were more machines than one look can scan, "
+                            "so this may not be the whole story.)")
+_PUBLIC_TRUNCATED_SOME_T = ("  (there are more public computers than one look can "
+                            "scan, so some may be missing)")
+# ⛔ THE SAME CLAIM THE ASK ITSELF MAKES: the owner sees the NAME, and the email
+# only when no name is set. This screen said "your name and email address", which
+# is the phrasing the chat client's confirm was corrected away from in 7.9-2.
+_PUBLIC_ASK_INVITE_T = ("     Its owner decides. They see your name — or your "
+                        "email, if you have not set one.")
+
+_PLAIN_VERBS = {
+    "looked for public computers": "look for public computers",
+    "asked for your requests": "ask for your requests",
+}
+
 _LIST_FAILURES = {
     "unauthorized": "this agent's sign-in was refused — run login again",
     "internal_error": "the app hit a problem of its own answering that — nothing "
@@ -1226,10 +1247,17 @@ def _list_refusal(what: str, err: str, retry_after_ms=None) -> str:
                 f"{mins} minute{'' if mins == 1 else 's'}")
     said = _LIST_FAILURES.get(err)
     if said is None:
+        # ⛔⛔ THE SAME TWO DEFECTS AS THE CHAT CLIENT'S. The bridge answers a
+        # signed-out caller with a SENTENCE, which keys no row here either; and
+        # `what` is past tense for the rate-limit line above, so this fallback
+        # printed "couldn't looked for public computers". This file did not even
+        # have the one-word patch its sibling had.
+        if err.lower().startswith("not signed in"):
+            return "not signed in — run:  agent login"
         if err.startswith("http_"):
             return (f"the app answered that with nothing this client can read "
                     f"(HTTP {err[5:]})")
-        return f"couldn't {what}: {err or 'no reason given'}"
+        return f"couldn't {_PLAIN_VERBS.get(what, what)}: {err or 'no reason given'}"
     return said
 
 
@@ -1364,7 +1392,7 @@ def cmd_device(args: argparse.Namespace) -> int:
     devices = dr[1].get("devices", [])
     selected = dr[1].get("selectedDeviceId")
     if not devices:
-        print("No devices reachable by this account.")
+        _print_no_devices()
         return 0
     print(f"Devices ({len(devices)}):")
     for d in devices:
@@ -1394,6 +1422,60 @@ def cmd_device(args: argparse.Namespace) -> int:
     if not selected:
         print("\nNo device selected — pick one:  agent device use <id>")
     return 0
+
+
+def _print_no_devices() -> None:
+    """THE terminal empty state.
+
+    ⛔⛔ IT WAS ONE SENTENCE WITH NO NEXT STEP OF ANY KIND — no pair-code line, no
+    install link, no mention that somebody else's computer can be asked for. The
+    chat client had seven wordings of this and the terminal had the shortest and
+    emptiest of the lot, and nothing anywhere pinned it.
+
+    ⭐ THE SAME THREE THINGS THE CHAT CLIENT SAYS, in this file's voice: no
+    computer on this account · add your own with a pair code · or ask to use
+    somebody else's, with the ones on offer LISTED. A guard compares the claims,
+    not the punctuation — this file has no curly apostrophes and that one is full
+    of them.
+    """
+    # ⛔⛔ THE LOOK GOES FIRST AND NOTHING IS PRINTED UNTIL IT ANSWERS. Printing
+    # three lines and then blocking for up to twenty seconds mid-message reads as
+    # a hung command — the chat client returns its whole block at once and this
+    # one stuttered. Measured by cross-verify.
+    # ⛔ A FAILED LOOK MUST NOT EAT THE OFFER either: the option is true whether or
+    # not the list could be read; only the list itself is conditional. A shorter
+    # budget than `device public`'s own 40s, because this look is riding on a
+    # command that was asked something else.
+    res = _bridge_get("/devices/public", timeout=20.0)
+    print("No research computer on this account yet.")
+    print("     Add your own:  the computer running Super Research prints an "
+          "8-char access code —")
+    print("                    agent device add <code>")
+    # ⛔⛔ AND THE ROUTE FOR SOMEBODY WITH NO MACHINE AT ALL. The chat client's
+    # block carries the one-line installer; this screen offered a pair code from a
+    # computer that may be running nothing, which is advice you cannot act on.
+    print("     No Super Research on any computer yet? Install it there first:")
+    print("       Windows:      irm https://superresearch.io/install.ps1 | iex")
+    print("       macOS/Linux:  curl -fsSL https://superresearch.io/install.sh | sh")
+    print("                     superresearch --pair")
+    if res is None or res[0] != 200 or not isinstance(res[1], dict):
+        print("     Or ask to use somebody else's:  agent device public")
+        return
+    rows = [d for d in (res[1].get("devices") or []) if isinstance(d, dict)]
+    if not rows:
+        print("     Or ask to use somebody else's — but nobody is offering one "
+              "publicly right now.")
+        print(_PUBLIC_NONE_WHY_T)
+        if res[1].get("truncated"):
+            print(_PUBLIC_TRUNCATED_NONE_T)
+        return
+    print("     Or ask to use somebody else's — on offer right now:")
+    for i, d in enumerate(rows, 1):
+        print(_public_row(i, d))
+    if res[1].get("truncated"):
+        print(_PUBLIC_TRUNCATED_SOME_T)
+    print("\nAsk for one by its id:  agent device ask <id>")
+    print(_PUBLIC_ASK_INVITE_T)
 
 
 def _public_row(i: int, d: dict) -> str:
@@ -1434,15 +1516,14 @@ def _device_public() -> int:
     rows = res[1].get("devices") or []
     if not rows:
         print("No computers are being offered publicly right now.")
-        print("     A computer is offered only when its owner switches that on.")
+        print(_PUBLIC_NONE_WHY_T)
         # ⛔⛔ TRUNCATION MATTERS MOST ON THE EMPTY BRANCH, and it was reported
         # only on the other one. The flag is computed on the raw scan, so an
         # answer of zero rows can still mean "the scan was full and everything in
         # it was filtered" — printing a flat "nobody is offering" over that is
         # the one reading that is definitely wrong.
         if res[1].get("truncated"):
-            print("     (There were more machines than one look can scan, so this "
-                  "may not be the whole story.)")
+            print(_PUBLIC_TRUNCATED_NONE_T)
         return 0
     print(f"Public computers ({len(rows)}):")
     for i, d in enumerate(rows, 1):
@@ -1451,10 +1532,9 @@ def _device_public() -> int:
         # ⛔⛔ THIS IS NOT "YOUR LIST WAS CUT". `truncated` is computed on the raw
         # scan the app makes before it drops the ones you cannot ask for, so it
         # can be true beside a short list — and there is no next page to offer.
-        print("  (there are more public computers than one look can scan, so some "
-              "may be missing)")
+        print(_PUBLIC_TRUNCATED_SOME_T)
     print("\nAsk for one by its id:  agent device ask <id>")
-    print("     Its owner decides. Asking tells them your name and email address.")
+    print(_PUBLIC_ASK_INVITE_T)
     return 0
 
 

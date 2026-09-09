@@ -184,10 +184,11 @@ back into `do`.
 | "did my logs go through?", "check on that support code" | `sr.py send-logs --status <CODE>` |
 | "just the one about X", "only the first two", "not all of them" | the plan numbers every run — pass those numbers back with `--runs`, comma-separated: `sr.py send-logs --runs 1,3` (and again on `--confirm`). `--runs 0` is the agent's own log, `--runs all` is every run listed. A name works too. Do **not** guess a number the plan did not print |
 | "send the agent's log too", "include the bridge log", "the log from this chat" | add `--agent-log` to the **bare** command **and to `--confirm`** — or say `--runs 0`, which is the same thing and is the number the plan prints for it. It uploads nothing on either; it makes the plan name it, and makes the client hand you `sr.py send-logs --status <CODE> --agent-log` for once the bundle lands. **Not** owner-gated. See **Sending logs to support** |
-| "are there any public computers?", "show me computers I could ask to use", "I don't have a computer of my own" | `sr.py devices-public` (only machines whose owners offer them; the id on each row is what the next command takes — public names collide, an unnamed one reads as "Research computer" for everybody). A row marked "can't take anyone else" is full: asking would be refused |
+| "are there any public computers?", "show me computers I could ask to use" | `sr.py devices-public` (only machines whose owners offer them; the id on each row is what the next command takes — public names collide, an unnamed one reads as "Research computer" for everybody). A row marked "can't take anyone else" is full: asking would be refused |
+| "I don't have a computer of my own", "I have no computer", "I haven't got a machine" | `sr.py devices` — **not** `devices-public`. It answers from the account's own list, and when that list is empty it IS the full answer: no computer here, add your own with a pair code, or ask to use one of the public ones, which it lists. Sending these to `devices-public` told anybody who DID have a computer to go and ask a stranger |
 | "make my computer public", "let people find my mac", "offer my machine to other people" | **confirm** — relay the client's question verbatim (strangers would see the name the computer reports, which on an unrenamed machine is often its OWNER'S own name; the user still approves each person) — then `sr.py device-visibility public` (add `"<name>"` only if they named a computer; with one machine the user OWNS the client picks it, with several it asks which — a shared machine is never picked and never offered, because its visibility is not theirs to set) |
 | "make my computer private", "hide my mac", "stop offering my machine", "take it off the public list" | `sr.py device-visibility private` — **no confirmation**: it only takes a computer OFF a list |
-| "is my computer public?", "which of my computers are findable?" | `sr.py devices` — the row for a computer the user OWNS says `findable` or `hidden`. Do NOT change anything to answer a question |
+| "is my computer public?", "which of my computers are findable?" | `sr.py devices` — the row for a computer the user OWNS says `public` or `private` (the same two words the command uses, and the web app's toggle). Do NOT change anything to answer a question |
 | "who wants to use my machine?", "any requests for my mac?", "what am I waiting on?" | `sr.py device-requests` — it prints BOTH halves: people waiting on the user's OWN computers first, then what the user is waiting on from other people. Never add the two together |
 | "approve that request", "say yes to Sam", "let them use my computer" | **confirm** — relay the client's question verbatim (anyone the user says yes to can run research on that computer, the same as somebody given a pair code) — then `sr.py device-approve "<person>"`, or with no name when only one person is waiting. Report what the reply says: they CAN USE it, never "you just added them" — an approval of somebody who already got in changes nothing on the machine |
 | "deny that request", "say no to Sam", "turn them down" | **confirm** — relay the client's question verbatim (they are told, and cannot ask again for a week; the pair code is still a way back) — then `sr.py device-deny "<person>"` |
@@ -198,7 +199,7 @@ back into `do`.
 
 **Safe defaults:** unnamed run → the **most-recent active** run. **Confirm before
 `stop`, `logout`, `device-remove`, `device-ask`, `device-approve`, `device-deny`,
-`device-visibility public`, and `update`** (a quick "Stop the EV run?" is enough);
+`device-visibility public`, `update`, and `install`** (a quick "Stop the EV run?" is enough);
 everything else runs on a clear request. The four device ones destroy nothing and
 are on the list anyway, because each tells somebody something about somebody else:
 `device-ask` hands the owner the user's name; `device-approve` lets a stranger run
@@ -301,7 +302,8 @@ never `retry`, never a question back to the user.
 - **install** → confirm first. Installs the backend on the connected device (turns
   that PC into a Research Computer) — then guide pairing (`superresearch --pair` on that
   PC → 8-char code → you run `device-add`; they finish API-key + browser-login on
-  the PC). Use ONLY when `research` reports "no devices yet" (reason `no_devices`) —
+  the PC). Use ONLY when `research` reports **"no research computer on this account
+  yet"** (reason `no_devices`) — the older wording "no devices yet" is gone —
   NOT when it returns a "which computer?" list (the account already has computers;
   relay the list and let the user pick with "use <name>").
 - **version / update** → `version` relays the SKILL version only (never mention a
@@ -321,6 +323,13 @@ never `retry`, never a question back to the user.
   update is available).
 
 ## Devices & Research Computers
+
+**An account with NO computer is not a dead end.** Every screen that reports it
+names BOTH routes — add your own with a pair code, or ask to use somebody else's —
+and the full ones (`devices`, `research`, the sign-in announce) also LIST the public
+computers on offer. Relay that list; never present setting up a machine as the only
+route. The one-line sign-in confirmation names both routes without a list, which is
+deliberate: it must not make a second call to render one.
 
 A **Research Computer** is a computer running Super Research. **Any bare 8-char
 access code (e.g. `7F4V-6W7D`, dashes optional), or "add a device", means run
@@ -474,7 +483,8 @@ it down too: `cronjob(action="list")` → the `sr-stream…` job →
 - **Confirm before** `stop` (ends a real run — keeps partial results + the chat),
   `logout` (signs the account out), `device-remove` (unlinks a device — nothing is
   deleted; an owner's device re-pairs with its code), `device-ask`, `device-approve`,
-  `device-deny`, `device-visibility public`, and `update` (briefly restarts the chat
+  `device-deny`, `device-visibility public`, `install` (installs the backend on
+  the connected computer), and `update` (briefly restarts the chat
   bridge). There is no destructive "delete the chat" action here — the four device
   ones are listed because each says something about somebody else, not because
   anything is destroyed. `device-visibility private` is not on the list: it only

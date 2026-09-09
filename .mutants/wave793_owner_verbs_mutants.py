@@ -676,19 +676,13 @@ MUTANTS = [
      "⛔⛔ `device-deny` LEAVES THE SAFE-DEFAULTS LIST, whose next clause says "
      "everything not listed runs on a clear request — so the file positively "
      "licenses spending somebody's week without asking",
-     [('`stop`, `logout`, `device-remove`, `device-ask`, `device-approve`, `device-deny`,\n'
-       '`device-visibility public`, and `update`**',
-       '`stop`, `logout`, `device-remove`, `device-ask`, `device-approve`,\n'
-       '`device-visibility public`, and `update`**')]),
+     [('`stop`, `logout`, `device-remove`, `device-ask`, `device-approve`, `device-deny`,\n`device-visibility public`, `update`, and `install`**',
+       '`stop`, `logout`, `device-remove`, `device-ask`, `device-approve`,\n`device-visibility public`, `update`, and `install`**')]),
     ("S3", SKILL, "under",
      "⛔⛔ `device-visibility` LEAVES THE SAFETY BULLET — the third list, and the "
      "one 7.9-2 forgot. A row in the table was not enough then either",
-     [('`device-remove` (unlinks a device — nothing is\n'
-       '  deleted; an owner\'s device re-pairs with its code), `device-ask`, `device-approve`,\n'
-       '  `device-deny`, `device-visibility public`, and `update`',
-       '`device-remove` (unlinks a device — nothing is\n'
-       '  deleted; an owner\'s device re-pairs with its code), `device-ask`, `device-approve`,\n'
-       '  `device-deny`, and `update`')]),
+     [("`device-remove` (unlinks a device — nothing is\n  deleted; an owner's device re-pairs with its code), `device-ask`, `device-approve`,\n  `device-deny`, `device-visibility public`, `install` (installs the backend on\n  the connected computer), and `update` (briefly restarts the chat",
+       "`device-remove` (unlinks a device — nothing is\n  deleted; an owner's device re-pairs with its code), `device-ask`, `device-approve`,\n  `device-deny`, and `update` (briefly restarts the chat")]),
     ("S4", SKILL, "over",
      "⛔⛔ THE GREETING RESERVES THESE VERBS TO THE WEB APP AGAIN, so the model "
      "refuses the two commands it now has",
@@ -818,12 +812,8 @@ MUTANTS = [
     ("W14", SR, "over",
      "⛔ the pairing rule eats a publish request again — \"add my computer to the "
      "public list\" answered with \"paste the access code\"",
-     [('    if re.search(r"\\bpublic|\\bfindable|\\bdiscoverable\\b", low):\n'
-       '        pass\n'
-       '    elif re.search',
-       '    if False:\n'
-       '        pass\n'
-       '    elif re.search')]),
+     [('    if re.search(r"\\bpublic|\\bfindable|\\bdiscoverable\\b", low):\n        pass\n    # ⛔⛔ AND NEVER AHEAD OF A RESEARCH REQUEST. This guard sits ABOVE rule 2b,\n    # and widening its nouns made it swallow "research how to connect my mac" —\n    # answering a research topic with "paste the access code". Rule 2b\'s own test\n    # is the one that decides, so it is asked here first.\n    elif (not _NL_RESEARCH_RE.match(t)) and (',
+       'elif (not _NL_RESEARCH_RE.match(t)) and (')]),
     ("W15", SR, "under",
      "⛔ the person after \"access to\" is lost, so \"grant access to sam\" quotes "
      "nobody and the owner has to name them twice",

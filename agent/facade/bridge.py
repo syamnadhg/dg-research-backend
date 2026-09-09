@@ -3994,11 +3994,22 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             if stale:
                 prefs.clear_selected_device()
             if reason == "no_devices":
-                # Relayed verbatim into chat — make it the next step, not a dead end.
+                # ⛔⛔ THE COMMENT HERE SAID "Relayed verbatim into chat" AND THAT
+                # HAS NEVER BEEN TRUE. The chat client reads the `reason` and
+                # throws this English away — it renders its own empty state. The
+                # surface that DOES print this sentence word for word is the
+                # TERMINAL, which reads none of the reason codes at all, which is
+                # why the parenthetical is terminal syntax.
+                # ⭐ SO IT NAMES BOTH WAYS OUT NOW. A person with no machine of
+                # their own was told, on the one screen that reached them, to go
+                # and get one — while the account could have asked to use
+                # somebody else's since 7.9-2.
                 self._json(400, {"reason": "no_devices",
-                                 "error": "no devices yet — on the computer running "
-                                          "Super Research, grab the pair code from its "
-                                          "screen and add it here (device add <code>)"})
+                                 "error": "no research computer on this account yet "
+                                          "— on the computer running Super Research, "
+                                          "grab the pair code from its screen and add "
+                                          "it here (agent device add <code>), or ask "
+                                          "to use somebody else's (agent device public)"})
                 return None
             if device_id:
                 return device_id

@@ -348,7 +348,13 @@ def test_the_terminal_lists_public_computers_with_their_ids(term):
     assert "can't take anyone else" in out
     # ⛔ THE DISCLOSURE IS ON THE SCREEN THAT OFFERS THE ASK, not buried in the
     # ask's own output — a person decides here whether to ask at all.
-    assert "name and email" in out
+    # ⛔⛔ AND IT SAYS WHAT THE ASK ITSELF SAYS. This file's own
+    # `test_the_terminal_ask_names_what_the_owner_sees` pins "or your email, if
+    # you have not set one" forty lines below; this screen said "your name and
+    # email address", which is the phrasing the chat client's confirm was
+    # corrected away from in 7.9-2.
+    assert "or your email, if you have not set one" in out
+    assert "name and email address" not in out
 
 
 def test_the_terminal_says_truncation_is_about_the_scan(term):

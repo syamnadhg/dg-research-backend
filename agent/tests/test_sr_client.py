@@ -141,7 +141,12 @@ def test_status_account_no_device_nudges_pairing(bridge_port, capsys):
     assert sr.main(["status-account"]) == 0
     out = capsys.readouterr().out
     assert "Signed in as e@x.y" in out
-    assert "No device connected" in out and "access code" in out
+    # ⛔⛔ ALL THREE THINGS, NOT JUST THE PAIR CODE. This screen used to end at
+    # "paste the access code", which is one route and it needs hardware the
+    # reader may not have. Every deviceless screen renders the same block now.
+    assert "No research computer on this account yet." in out
+    assert "access code" in out
+    assert "ask to use somebody else" in out.lower()
 
 
 def test_connected_msg_is_device_aware(bridge_port):
@@ -534,9 +539,23 @@ def test_research_no_devices_shows_pair_prompt(monkeypatch, capsys):
     monkeypatch.setattr(sr, "_origin_from_env", lambda: None)
     monkeypatch.setattr(sr, "_post", lambda path, body=None: (
         400, {"reason": "no_devices", "error": "no devices yet — grab the pair code"}))
+    # ⛔⛔ THE EMPTY STATE LOOKS UP THE PUBLIC LIST NOW, so this test drove a real
+    # localhost connection until it was stubbed. Two rows here, so the offer is
+    # the LISTED one and not the degraded sentence.
+    monkeypatch.setattr(sr, "_get", lambda path, timeout=None: (200, {
+        "devices": [{"deviceId": "dev-a1", "label": "Studio PC", "online": True},
+                    {"deviceId": "dev-b2", "label": "Research computer",
+                     "online": False, "full": True}],
+        "truncated": False}))
     assert sr.main(["research", "Pitbull"]) != 0
     out = capsys.readouterr().out
-    assert "Paste the access code" in out and "install.ps1" in out
+    assert "No research computer on this account yet." in out
+    assert "access code" in out and "install.ps1" in out
+    # ⛔ AND THE THIRD THING IS A LIST, NOT ADVICE. "or ask for a public one" with
+    # nothing named is the dead end this wave exists to remove.
+    assert "ask to use somebody else" in out.lower()
+    assert "Studio PC" in out and "dev-a1" in out
+    assert "can’t take anyone else" in out
     # the human setup-page URL is offered too as a bare URL (NOT Markdown); the
     # trailing newline distinguishes it from the install.ps1/.sh script URLs
     assert "https://superresearch.io/install\n" in out
@@ -563,8 +582,16 @@ def test_research_older_bridge_infers_pair_prompt_from_text(monkeypatch, capsys)
     monkeypatch.setattr(sr, "_origin_from_env", lambda: None)
     monkeypatch.setattr(sr, "_post", lambda path, b=None: (
         400, {"error": "no devices yet — grab the pair code"}))
+    # ⛔ A FAILED LOOK MUST NOT EAT THE OFFER. This one leaves the public fetch
+    # broken on purpose: the option is true whether or not the list could be read,
+    # so the sentence stays and hands over the verb that retries it.
+    monkeypatch.setattr(sr, "_get", lambda path, timeout=None: (0, {"error": "x"}))
     assert sr.main(["research", "X"]) != 0
-    assert "Paste the access code" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "No research computer on this account yet." in out
+    assert "access code" in out
+    assert "ask to use somebody else" in out.lower()
+    assert "show me public computers" in out
 
 
 def test_no_backend_update_surface_left(bridge_port, monkeypatch):

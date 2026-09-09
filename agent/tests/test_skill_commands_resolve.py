@@ -92,7 +92,7 @@ def test_skill_within_sanity_bound():
     # rewritten rather than deleted. The bound still catches unbounded growth;
     # it is not a trim mandate and not a target.
     n = len((_SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").splitlines())
-    assert n < 510, f"SKILL.md grew to {n} lines — unexpectedly large"
+    assert n < 525, f"SKILL.md grew to {n} lines — unexpectedly large"
 
 
 def test_signin_handoff_continues_from_the_announce_topic():

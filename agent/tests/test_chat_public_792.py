@@ -281,7 +281,13 @@ def test_chat_browse_prints_the_id_beside_every_row(chat):
     out = chat.out()
     assert "dev-a1" in out and "dev-b2" in out
     assert "online" in out and "offline" in out
-    assert "name and email" in out
+    # ⛔⛔ THIS ASSERTION PINNED THE WRONG CLAIM FOR TWO WAVES. Its sibling
+    # `test_the_consent_question_carries_all_three_disclosures` forbids "name and
+    # email address" BY NAME as wrong twice — the owner sees the name, and the
+    # email only when no name is set — and this line demanded it on the screen
+    # where somebody decides whether to ask at all. One claim, both screens.
+    assert "or your email, if you haven’t set one" in out
+    assert "name and email address" not in out
 
 
 def test_chat_browse_says_truncation_is_about_the_scan(chat):
