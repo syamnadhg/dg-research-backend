@@ -123,14 +123,123 @@ def test_the_heartbeat_is_the_thing_that_calls_it():
 # ── the raw tails ──────────────────────────────────────────────────────
 
 def test_a_rolled_tail_older_than_the_bound_is_retired(tmp_path):
+    """⛔⛔ THIS TEST USED TO PASS ONLY ON macOS, and it took until 2026-09-10 to
+    see it because CI could not run the suite at all.
+
+    It back-dated the file's mtime and expected the prune to act. But the prune
+    reads the MARKER, and falls back to `st_birthtime` — and macOS CLAMPS
+    birthtime to a back-dated mtime (measured: `utime` to −40d moves birthtime
+    to −40d too), so the fallback answered "40 days" on my disk. Linux has no
+    birthtime at all, so the fallback seeds the clock and the file is KEPT. The
+    fleet is Linux. `research.py`'s own comment on that branch says it "is the
+    one that matters"; the test asserted the accident instead.
+
+    ⭐ The marker is what a real rolled tail has — `_rotate_if_stale` writes it
+    at the roll — so pinning it is both portable and the actual mechanism."""
+    old = tmp_path / "backend.log.1"
+    old.write_text("ancient", encoding="utf-8")
+    now = time.time()
+    research._begin_raw_tail_generation(old, now=now - 40 * 86400)
+    removed = research._retire_stale_rotations(root=tmp_path, max_age_days=30, now=now)
+    assert str(old) in removed
+    assert not old.exists()
+    assert not research._raw_tail_marker(old).exists(), (
+        "the marker outlived the file it dates, so the next generation inherits "
+        "a deadline belonging to a file nobody can read"
+    )
+
+
+def test_the_bound_does_not_depend_on_a_stat_only_one_platform_has(tmp_path):
+    """⛔⛔ THE GUARD THE TWO TESTS EITHER SIDE OF THIS ONE COULD NOT BE.
+
+    Both of them now date the file through the marker, which is right — but a
+    macOS run cannot TELL whether they do. Reverting either to a back-dated
+    mtime keeps them green here and turns them red on every Linux runner, which
+    is exactly the state this file was in from 2026-09-01 to 09-10. A guard
+    whose correctness is only visible on a machine nobody runs it on is not a
+    guard.
+
+    ⭐ So the platform difference is brought INTO the suite: `st_birthtime` is
+    hidden, which is all Linux is for this code path, and the bound is asserted
+    again through the same public function. Now the marker is load-bearing on
+    both platforms and reverting it goes red immediately."""
+    import pathlib
+
+    class _NoBirthtime:
+        """A stat_result with the one attribute Linux does not have removed."""
+
+        def __init__(self, st):
+            self._st = st
+
+        def __getattr__(self, name):
+            if name == "st_birthtime":
+                raise AttributeError(name)
+            return getattr(self._st, name)
+
+    class _LinuxPath(type(pathlib.Path())):
+        def stat(self, *a, **kw):
+            return _NoBirthtime(super().stat(*a, **kw))
+
+    probe = tmp_path / "probe"
+    probe.write_text("x", encoding="utf-8")
+    assert hasattr(probe.stat(), "st_birthtime") or True   # macOS yes, Linux no
+    assert not hasattr(_LinuxPath(probe).stat(), "st_birthtime"), (
+        "the stand-in still answers st_birthtime, so this test proves nothing"
+    )
+
     old = tmp_path / "backend.log.1"
     old.write_text("ancient", encoding="utf-8")
     now = time.time()
     import os as _os
+    # Back-dated the way the ORIGINAL tests did it. On macOS this also drags
+    # st_birthtime back — measured — which is the accident that made them pass.
     _os.utime(old, (now - 40 * 86400, now - 40 * 86400))
+    research._begin_raw_tail_generation(old, now=now - 40 * 86400)
+
+    real_path = research.Path
+    try:
+        research.Path = _LinuxPath
+        removed = research._retire_stale_rotations(
+            root=tmp_path, max_age_days=30, now=now)
+    finally:
+        research.Path = real_path
+
+    assert str(old) in removed, (
+        "with birthtime gone the bound stopped firing, so it was resting on a "
+        "stat only macOS has and the fleet's tails are never retired"
+    )
+
+
+def test_a_rolled_tail_NOBODY_DATED_is_kept_and_its_clock_starts_now(tmp_path):
+    """⛔⛔ THE LINUX PATH, WHICH NOTHING ASSERTED UNTIL 2026-09-10 — and it is
+    the only path the fleet ever takes.
+
+    With no marker and no `st_birthtime`, the age of a rolled tail is genuinely
+    unknown, and the code's decision is to seed the clock rather than guess:
+    deleting a whole tail on the strength of a guess is worse than keeping it
+    one window too long. So the first sight of an undated file KEEPS it and
+    dates it; the window starts from that moment.
+
+    ⭐ Written so it holds on both platforms: the file really is new here, so
+    macOS's birthtime and Linux's absence of one agree for once."""
+    orphan = tmp_path / "backend.log.1"
+    orphan.write_text("undated", encoding="utf-8")
+    now = time.time()
+    assert not research._raw_tail_marker(orphan).exists()
+
     removed = research._retire_stale_rotations(root=tmp_path, max_age_days=30, now=now)
-    assert str(old) in removed
-    assert not old.exists()
+    assert removed == [], "an undated tail was deleted on a guess"
+    assert orphan.exists()
+
+    marker = research._raw_tail_marker(orphan)
+    assert marker.is_file(), "it was kept but not dated, so it is undated forever"
+    assert abs(float(marker.read_text(encoding="utf-8")) - now) < 2
+
+    # ⭐ And it is not kept FOREVER — the seeded clock is a real clock.
+    later = research._retire_stale_rotations(
+        root=tmp_path, max_age_days=30, now=now + 31 * 86400)
+    assert str(orphan) in later
+    assert not orphan.exists()
 
 
 def test_a_JUST_ROLLED_tail_is_not_deleted_on_the_same_boot(tmp_path):
@@ -349,8 +458,10 @@ def test_the_prune_reports_the_tails_it_retired(tmp_path, monkeypatch):
     rolled = root / "backend.log.1"
     rolled.write_text("ancient", encoding="utf-8")
     now = time.time()
-    import os as _os
-    _os.utime(rolled, (now - 50 * 86400, now - 50 * 86400))
+    # ⛔ Dated through the marker, not by back-dating mtime: mtime only reached
+    # the bound via macOS's birthtime clamp, so this assertion was red on every
+    # Linux runner. See test_a_rolled_tail_older_than_the_bound_is_retired.
+    research._begin_raw_tail_generation(rolled, now=now - 50 * 86400)
     monkeypatch.setattr(research, "_logs_root", lambda: root)
     monkeypatch.setattr(research, "_runs_log_root", lambda: root / "runs")
     monkeypatch.setattr(research, "_sessions_log_root", lambda: root / "sessions")

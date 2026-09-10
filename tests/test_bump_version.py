@@ -364,10 +364,57 @@ def test_the_real_checkout_is_found_with_NO_env_override(tmp_path, monkeypatch):
     cleared. A fixture would have proved only that the probe loop runs."""
     monkeypatch.delenv("SR_WEB_ROOT", raising=False)
     root = Path(bump_mod.__file__).resolve().parents[1]
+    sibling = root.parent / "dg-research"
+    if not sibling.is_dir():
+        pytest.skip(
+            f"the app checkout is not beside this one ({sibling}), so there is "
+            f"no real layout to probe here — the property is pinned without it "
+            f"by test_the_probe_names_the_app_repo_and_prefers_it"
+        )
     web = bump_mod._web_root(root)
     assert (web / "scripts" / "sync-agent-skill.mjs").is_file(), (
         f"the default web root does not hold the sync script: {web}. The release "
         f"sync short-circuits here, before the bundle path is ever passed."
+    )
+
+
+def test_the_probe_names_the_app_repo_and_prefers_it(tmp_path, monkeypatch):
+    """⛔⛔ THE SAME PROPERTY, ON A RUNNER WITH ONE CHECKOUT — and the reason it
+    had to be split on 2026-09-10. The test above deliberately asserts against
+    the REAL sibling repo, which exists on a dev machine and nowhere in CI, so
+    it was red on every runner from the day it landed and green every time I ran
+    it. A guard that can only pass where it was written is a guard that reports
+    on the author's disk.
+
+    ⭐ What is actually load-bearing is checkable anywhere: the default names
+    `dg-research`, and it WINS over the historical `research-app/web` layout
+    when both are on disk. That was the bug — the default pointed at a layout
+    that never existed, so the release sync short-circuited before reaching the
+    argument fix. ⛔ And the override is cleared here, which is the omission
+    that let the original default ship: every other test in this file sets
+    `SR_WEB_ROOT` and so none of them ever ran this code path."""
+    monkeypatch.delenv("SR_WEB_ROOT", raising=False)
+    root = tmp_path / "dg-research-backend"
+    root.mkdir()
+    for rel in ("dg-research", "research-app/web"):
+        (tmp_path / rel / "scripts").mkdir(parents=True)
+        (tmp_path / rel / "scripts" / "sync-agent-skill.mjs").write_text("//", encoding="utf-8")
+
+    assert bump_mod._web_root(root) == tmp_path / "dg-research", (
+        "the historical layout outranked the real repo, which is the defect "
+        "inverted: whichever wins, the loser's checkout is the one that syncs"
+    )
+
+    shutil.rmtree(tmp_path / "dg-research")
+    assert bump_mod._web_root(root) == tmp_path / "research-app" / "web", (
+        "the fallback is kept on purpose for a checkout that still uses the "
+        "old name; dropping it would strand those"
+    )
+
+    shutil.rmtree(tmp_path / "research-app")
+    assert bump_mod._web_root(root) == tmp_path / "research-app" / "web", (
+        "with nothing on disk the probe must still return a CONCRETE path so "
+        "the caller's message names something a person can go and fix"
     )
 
 

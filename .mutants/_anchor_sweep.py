@@ -37,11 +37,34 @@ FE = os.path.join(os.path.dirname(REPO), "dg-research")
 FORK = os.path.join(os.path.dirname(REPO), "dg-hermes-fleet")
 SUFFIXES = (".py", ".ts", ".tsx", ".mjs", ".js", ".json", ".rules", ".md")
 
+# ⛔⛔ THIS TOOL NEEDS THREE CHECKOUTS AND CI HAS ONE, which is why the suite's
+# copy of it was RED from 2026-08-26 to 09-10 — every anchor whose target lives
+# in the app repo or the fork reported "target file(s) not found", i.e. as STALE,
+# on a runner that simply never had those files. 168 of them. ⛔ And nobody saw
+# it for fifteen days: the lint step runs first in the same job, so once THAT
+# broke on 09-05 the tests step reported `skipped` and the run's red looked like
+# one failure instead of two.
+# ⭐ So a missing file now has two meanings, and they are told apart by looking
+# at the DISK rather than by pattern-matching the path: if every root exists, a
+# file that resolves nowhere has genuinely moved and is STALE. If a root is
+# absent, the anchor is UNREACHABLE HERE — counted, named, and excluded from the
+# staleness verdict, because this checkout cannot hold an opinion about it.
+# ⛔ The ratchet is NOT loosened by that: the test asserts unreachable is EMPTY
+# whenever all three roots are present, so a fork file that gets renamed still
+# fails on every machine that can see the fork — which is every machine a
+# harness is ever run on.
+ROOTS = (("backend", REPO), ("app", FE), ("fork", FORK))
+
+
+def absent_roots():
+    """The declared target checkouts that are not on this disk."""
+    return [name for name, path in ROOTS if not os.path.isdir(path)]
+
 
 def _read(rel, cache):
     if rel in cache:
         return cache[rel]
-    for base in (REPO, FE, FORK):
+    for _name, base in ROOTS:
         path = os.path.join(base, rel)
         if os.path.exists(path):
             cache[rel] = io.open(path, encoding="utf-8").read()
@@ -56,9 +79,16 @@ def harnesses():
 
 
 def sweep():
-    """Return (anchors_checked, [(harness, mutant_id, why), …])."""
+    """Return (checked, [(harness, mutant, why)…], [(harness, mutant, why)…]).
+
+    The third list is the anchors this checkout cannot judge: their target files
+    live in a repo that is not here. `checked` counts only anchors that were
+    actually compared, so a caller can tell a real sweep from a vacuous one.
+    """
     cache = {}
     bad = []
+    unreachable = []
+    missing = absent_roots()
     checked = 0
 
     for path in harnesses():
@@ -105,25 +135,46 @@ def sweep():
             files = targets or default_files
 
             for frm, to in edits:
-                checked += 1
                 if frm == to:
+                    checked += 1
                     bad.append((name, mid, "replacement equals anchor — "
                                            "mutates nothing"))
                     continue
                 texts = [_read(f, cache) for f in files]
-                if all(t is None for t in texts):
-                    bad.append((name, mid, f"target file(s) not found: {files}"))
+                # ⛔ ANY missing file disqualifies the mutant, not just all of
+                # them. A mutant declaring one backend file and one fork file
+                # used to fall through here and sum its hits across whatever
+                # happened to be present — reporting "matches 0x" for an anchor
+                # that matches perfectly in the file this checkout lacks. None
+                # of the 168 was that shape, but the next one would have been
+                # harder to read than a plain "not found".
+                gone = [f for f, t in zip(files, texts) if t is None]
+                if gone:
+                    why = f"target file(s) not found: {gone}"
+                    if missing:
+                        unreachable.append(
+                            (name, mid, why + f" — not this checkout's call, "
+                                              f"missing root(s): {missing}"))
+                    else:
+                        bad.append((name, mid, why))
                     continue
+                checked += 1
                 hits = sum((t or "").count(frm) for t in texts)
                 if hits != 1:
                     bad.append((name, mid,
                                 f"matches {hits}x in {files}: {frm[:60]!r}"))
-    return checked, bad
+    return checked, bad, unreachable
 
 
 def main() -> int:
-    checked, bad = sweep()
+    checked, bad, unreachable = sweep()
     print(f"swept {checked} anchors across {len(harnesses())} harnesses")
+    if unreachable:
+        print(f"\n… {len(unreachable)} anchor(s) NOT CHECKED — their target "
+              f"files live in a repo this checkout does not have "
+              f"({', '.join(absent_roots())}):")
+        for name, mid, why in unreachable:
+            print(f"  {name}  {mid}  {why}")
     if bad:
         print("\n⛔ STALE / BROKEN ANCHORS — each of these measures NOTHING:")
         for name, mid, why in bad:

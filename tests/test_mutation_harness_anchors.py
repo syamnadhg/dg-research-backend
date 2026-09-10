@@ -26,11 +26,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SWEEP = os.path.join(os.path.dirname(HERE), ".mutants", "_anchor_sweep.py")
 
 
-def _sweep():
+def _sweep_module():
     spec = importlib.util.spec_from_file_location("_anchor_sweep", SWEEP)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod.sweep()
+    return mod
+
+
+def _sweep():
+    """(checked, stale) — the two the ratchet below is about."""
+    checked, bad, _unreachable = _sweep_module().sweep()
+    return checked, bad
 
 
 # ⛔ PRE-EXISTING DEBT, recorded 2026-08-17 by the sweep's first run. Four waves
@@ -60,9 +66,71 @@ KNOWN_STALE: "set[tuple[str, str]]" = set()
 
 def test_the_sweep_can_actually_see_the_harnesses():
     """A sweep that silently found nothing to check would pass every assertion
-    below — the same shape of lie it exists to catch."""
+    below — the same shape of lie it exists to catch.
+
+    ⭐ `checked` counts anchors actually COMPARED, so this floor is what stops
+    the unreachable bucket below from turning the whole guard vacuous on a
+    one-checkout runner: excusing an anchor removes it from this count too."""
     checked, _ = _sweep()
-    assert checked > 400, f"only {checked} anchors reachable; the sweep is broken"
+    assert checked > 400, f"only {checked} anchors compared; the sweep is broken"
+
+
+def test_nothing_is_excused_when_every_target_repo_is_present():
+    """⛔⛔ THE HALF OF THE RATCHET THAT KEEPS ITS GRIP AFTER 2026-09-10.
+
+    The sweep reads three checkouts — this repo, the app repo and the fork — and
+    CI has only the first, so 84 anchors there resolve to no file through no
+    fault of their own. Those are reported as UNREACHABLE rather than stale, and
+    that concession is the kind of thing that quietly eats a guard: the same
+    excuse covers a fork file somebody actually renamed.
+
+    ⭐ So it is bounded by the disk. On any checkout holding all three repos —
+    which is every machine a harness is written or run on — nothing may be
+    excused at all. A renamed fork file fails here, immediately, on the only
+    machines that could ever have noticed."""
+    mod = _sweep_module()
+    missing = mod.absent_roots()
+    if missing:
+        pytest.skip(f"target checkout(s) not on this disk: {missing} — the "
+                    f"reachability ratchet is asserted where they exist")
+    _checked, _bad, unreachable = mod.sweep()
+    assert not unreachable, (
+        "every target repo is present, so these anchors have genuinely moved "
+        "and are measuring nothing:\n"
+        + "\n".join(f"  {n} {m}: {w}" for n, m, w in unreachable)
+    )
+
+
+def test_an_absent_repo_is_the_only_thing_that_excuses_an_anchor():
+    """⛔ The concession must be keyed on the ROOT being gone, not on the file
+    being gone — otherwise it is just "missing files are fine", which is the
+    failure mode this whole file exists to prevent. Proven by taking the two
+    sibling roots away and checking that the anchors move buckets rather than
+    disappearing, and that the backend's own anchors are still compared."""
+    mod = _sweep_module()
+    if mod.absent_roots():
+        pytest.skip("this proof needs all three checkouts present")
+    before_checked, before_bad, before_unreachable = mod.sweep()
+    assert not before_unreachable
+
+    mod.FE = "/nonexistent-app-checkout"
+    mod.FORK = "/nonexistent-fork-checkout"
+    mod.ROOTS = (("backend", mod.REPO), ("app", mod.FE), ("fork", mod.FORK))
+    after_checked, after_bad, after_unreachable = mod.sweep()
+
+    assert after_unreachable, "hiding two repos excused nothing — the split is dead"
+    assert len(after_bad) == len(before_bad), (
+        "hiding a repo turned anchors STALE instead of unreachable, which is "
+        "the red CI carried for fifteen days"
+    )
+    assert after_checked == before_checked - len(after_unreachable), (
+        "an excused anchor must leave the compared count too, or the floor "
+        f"above stops meaning anything: {after_checked} vs {before_checked}"
+    )
+    assert after_checked > 400, (
+        f"only {after_checked} anchors survive a one-checkout run; the guard "
+        f"would be vacuous on CI"
+    )
 
 
 def test_no_new_stale_anchors():
@@ -74,6 +142,76 @@ def test_no_new_stale_anchors():
         "these anchors no longer match exactly once, so the mutants using them "
         "measure nothing and report kills:\n"
         + "\n".join(f"  {n} {m}: {details[(n, m)]}" for n, m in sorted(new))
+    )
+
+
+def test_a_missing_file_is_still_stale_when_its_repo_IS_here():
+    """⛔⛔ THE PROPERTY THE CONCESSION COULD HAVE EATEN, and the one the two
+    tests above cannot see: nothing is actually missing on a full checkout, so
+    "excuse every missing file" and "excuse only what an absent repo explains"
+    look identical here. One of those is the fifteen-day CI red fixed the wrong
+    way round.
+
+    ⭐ So a file is made invisible with every root present, and the anchors that
+    used it must come back STALE. Hiding `research.py` is deliberate: it is the
+    file most mutants target, so if the concession is keyed on the file rather
+    than the root this goes from "hundreds stale" to "hundreds excused"."""
+    mod = _sweep_module()
+    if mod.absent_roots():
+        pytest.skip("this proof needs all three checkouts present")
+    real_read = mod._read
+
+    def _blind(rel, cache):
+        if rel == "research.py":
+            return None
+        return real_read(rel, cache)
+
+    mod._read = _blind
+    checked, bad, unreachable = mod.sweep()
+    assert bad, "hiding research.py upset nothing — the sweep is not reading it"
+    assert not unreachable, (
+        "a file that is simply GONE was excused while every repo it could live "
+        "in is right here; the ratchet is keyed on the wrong thing:\n"
+        + "\n".join(f"  {n} {m}: {w}" for n, m, w in unreachable[:5])
+    )
+    assert all("not found" in w for _n, _m, w in bad
+               if "research.py" in w), "the reason no longer names the file"
+
+
+def test_one_missing_file_does_not_get_summed_around(tmp_path):
+    """⛔ A mutant naming TWO files used to need BOTH gone before it was reported
+    as missing. With one present it fell through and summed its hits across
+    whatever was there — so an anchor that matches exactly once in the file this
+    checkout lacks was reported as `matches 0x`, i.e. as drift in a file that is
+    perfectly fine. 48 mutants declare more than one target file today; none of
+    them spans two repos yet, which is the only reason this never fired.
+
+    ⭐ Proven on a synthetic harness because no real one is that shape. A test
+    that waited for one to appear would be a comment, not a guard."""
+    mod = _sweep_module()
+    harness = tmp_path / "synthetic_mutants.py"
+    harness.write_text(
+        'MUTANTS = [\n'
+        '    ("M1", "here.py", "gone.py", [("KEEP", "BREAK")], "two files, one absent"),\n'
+        ']\n',
+        encoding="utf-8")
+    present = tmp_path / "repo"
+    present.mkdir()
+    (present / "here.py").write_text("KEEP\n", encoding="utf-8")
+
+    mod.HERE = str(tmp_path)
+    mod.ROOTS = (("backend", str(present)), ("fork", str(tmp_path / "nope")))
+    checked, bad, unreachable = mod.sweep()
+
+    assert not bad, f"a partial file set was reported as drift: {bad}"
+    assert len(unreachable) == 1, unreachable
+    _n, mid, why = unreachable[0]
+    assert mid == "M1"
+    assert "gone.py" in why and "here.py" not in why, (
+        f"the report must name the file that is actually missing: {why}"
+    )
+    assert checked == 0, (
+        f"an anchor nobody could compare was counted as compared: {checked}"
     )
 
 
