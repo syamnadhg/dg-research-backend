@@ -38968,6 +38968,731 @@ _GEMINI_COMPLETION_RE = re.compile(
 # Gemini is never reloaded mid-run anymore, so there is nothing to recover.
 
 
+# ── Gemini's plan-fail regenerate control (the 09-10 captured DOM) ────────────
+#
+# ⛔⛔ WHY THIS EXISTS AT ALL, AND WHY IT IS NOT THE SHARED RETRY HELPER.
+# `_try_inpage_retry_on_research_fail` has never clicked anything on Gemini's
+# plan-fail screen, and could not have. Measured 2026-09-10 against the owner's
+# live console dump: the control is `aria-label="Redo"`, and that helper's word
+# list is `retry|regenerate|try again|rerun|restart` — "Redo" matches none of
+# them. Its failure-text alternation says `encountered`, and one of the two real
+# wordings says `encountering`. Two words, fifteen months, zero clicks: there is
+# not one `inpage_retry_clicked` line for Gemini in 96 MB of logs, and that is
+# construction, not luck.
+#
+# ⭐⭐ THE STRUCTURAL LESSON, WHICH IS THE WHOLE REASON THIS IS SHAPED LIKE THIS.
+# The wording could be wrong for that long because the guard's regex lived
+# inside a JS template inside a Python raw string, and the only test that read
+# it re-extracted the literal, un-doubled the backslashes, and compiled it in
+# PYTHON — so the test never ran what the browser runs, and it fed the pattern a
+# sentence a human wrote to satisfy it. A guard that certifies itself is not a
+# guard. So: the JS below reports STRUCTURE ONLY — what is present, and what it
+# is called — and every decision is a pure Python function underneath it, tested
+# in the language it actually runs in, against fixtures taken from the capture.
+#
+# ⛔ AND IT READS THE LATEST TURN ONLY. The shared helper tests
+# `document.body.innerText`, which holds the pasted brief, the sidebar's chat
+# titles, and every earlier turn. That was survivable only because the guard
+# could never fire; the moment Redo works it becomes a trap, because a healthy
+# re-draft that leaves the failed turn above it still reads as failed and the
+# loop feeds itself. Scoping to the latest turn is what makes a retry loop
+# terminate.
+# ⛔⛔ SHARED, BECAUSE THE READER ASSIGNS ROW INDICES AND THE PICKER CONSUMES
+# THEM. The two walk the overlays independently and agree only by enumerating
+# the same elements in the same order — so the selectors have to be one string,
+# not two copies of one string. A mutation harness cannot help here either way:
+# every mutant that edits one copy of a duplicated selector is either killed by
+# a fixture or provably equivalent, and the first R5 of this wave was the second
+# kind twice over. Removing the duplication is the answer duplication has.
+# ⛔ AND THEY ARE SUBSTITUTED WITH `json.dumps`, NOT WRAPPED IN QUOTES BY HAND.
+# Both selectors CONTAIN double quotes — `[role="menuitem"]` — so hand-quoting
+# them closed the JS string early and node refused to parse the file. That is
+# the same class of defect as the one this whole wave exists to fix: a value
+# crossing from Python into JS through quoting nobody executed. It took seconds
+# to find here only because the suite now RUNS this JS.
+# The outermost per-turn element this UI renders, OUTERMOST FIRST — the first
+# selector with any match wins and its last node is the latest turn.
+# ⛔ `model-response` and `.response-container` are the only two that contain the
+# action row; per the 09-10 capture the button sits under `div.response-container`
+# while `message-content` and `.model-response-text` are inside the TEXT
+# container. So if the first two ever stop matching, the reader still reads text
+# correctly and reports `controls: []` for ever — a silent degrade to
+# never-clicks, diagnosed as "Gemini has no Redo button". The last two are kept
+# because a text reading is still better than none, and `found` distinguishes
+# them in the log.
+_GEMINI_TURN_SELECTORS = ("model-response", ".response-container",
+                          "message-content", ".model-response-text")
+
+# Shape → selector, most reliable first. Shared for the same reason the overlay
+# selectors are: the reader assigns the shape/index pair the clicker consumes,
+# so two copies could mean two different buttons.
+_GEMINI_REGEN_SHAPES = (
+    ("testid", '[data-test-id="regenerate-button"]'),
+    ("element", "regenerate-button"),
+    ("icon", 'mat-icon[fonticon="refresh"]'),
+    ("label", 'button, [role="button"]'),
+)
+
+# ⛔ AND THE CONTROL HAS A DENY LIST TOO. The captured action row holds five
+# aria-labelled siblings, and every structural shape resolves through "the first
+# descendant button" — so a test id migrated up one level onto
+# `div.buttons-container-v2`, or a second button added inside the icon button
+# for the very menu this feature needs, makes the first descendant
+# `thumb-up-button`. The finder would return it as "matched by testid", the log
+# would say it clicked its own control, and the run would have posted feedback to
+# Google instead of re-drafting. Structural targeting is right; refusing a
+# resolved node that names itself as something else costs nothing.
+_GEMINI_REGEN_DENY_RE = re.compile(
+    r"\b(?:good|bad) response\b|\bthumbs?[ -]?(?:up|down)\b"
+    r"|\bcopy\b|\bshare\b|\bexport\b|\bmore options\b|\bsources?\b")
+
+_GEMINI_MENU_PANE_SEL = (
+    '.cdk-overlay-pane, .cdk-overlay-popover, .cdk-overlay-container [role="menu"]')
+_GEMINI_MENU_ROW_SEL = 'gem-menu-item, [role="menuitem"], [role="menuitemradio"]'
+# ⛔⛔ A DENY LIST, FOR THE REASON THIS REPO'S OTHER MENU PICKER HAS ONE. The note
+# on `_NLM_MENU_DENY` puts it plainly: "an off-by-two is not a failed download,
+# it is a destroyed one." Gemini's overlays carry Delete and Report rows, this
+# one is opened programmatically on a page we are also clicking blind-ish, and
+# the row we want is identified by a test id that a build can rename. Nothing on
+# this list is ever clicked, whatever key matched it.
+_GEMINI_MENU_DENY = ("delete", "remove", "discard", "trash", "report", "block",
+                     "unpublish", "clear")
+
+_GEMINI_LATEST_TURN_JS = """
+() => {
+  // The outermost per-turn element that this UI actually renders, most
+  // specific first; the first selector with any match wins and we take its
+  // LAST node — that is the latest turn. Mixing the levels in one query would
+  // return an inner node of a turn and read as "the last bubble" by accident.
+  const TURN_SELECTORS = %(turns)s;
+  let turn = null;
+  for (const sel of TURN_SELECTORS) {
+    const nodes = document.querySelectorAll(sel);
+    if (nodes.length) { turn = nodes[nodes.length - 1]; break; }
+  }
+  if (!turn) return JSON.stringify({found: false, text: '', controls: [], rows: []});
+
+  const isVisible = (el) => {
+    if (!el || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width < 8 || r.height < 8) return false;
+    const cs = getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+    return parseFloat(cs.opacity) >= 0.1;
+  };
+  const name = (el) => {
+    if (!el) return '';
+    const a = (el.getAttribute && el.getAttribute('aria-label')) || '';
+    const t = (el.getAttribute && el.getAttribute('title')) || '';
+    return (a || t || (el.textContent || '')).trim().slice(0, 60);
+  };
+  // ⛔⛔ BOTH DIRECTIONS, AND SELF FIRST. The capture nests the real `<button>`
+  // INSIDE `gem-icon-button[data-test-id="regenerate-button"]`, while the
+  // refresh `mat-icon` sits inside that same button — so one shape needs a
+  // DESCENDANT and another needs an ANCESTOR. Resolving only upwards, which is
+  // all `closest` does, clicked the custom-element WRAPPER for two of the three
+  // shapes: a DOM no-op that still hands back a truthy label, which is exactly
+  // #905's disabled-skeleton Start wearing a new costume. Caught by RUNNING
+  // this against the owner's capture, never by reading it.
+  const isBtn = (n) => !!n && (String(n.tagName || '').toLowerCase() === 'button'
+                               || (n.getAttribute && n.getAttribute('role') === 'button'));
+  const asButton = (el) => {
+    if (!el) return null;
+    if (isBtn(el)) return el;
+    const inner = el.querySelector ? el.querySelector('button, [role="button"]') : null;
+    if (inner) return inner;
+    return el.closest ? el.closest('button, [role="button"]') : null;
+  };
+
+  // The control, by STRUCTURE, most reliable shape first. Never by wording:
+  // wording is what failed. `label` is last and exists only so a build that
+  // drops every test id still has something to aim at — and the deciding is
+  // Python's, so the word list is testable.
+  const SHAPES = %(shapes)s;
+  const controls = [];
+  for (const [shape, sel] of SHAPES) {
+    const seen = [];
+    for (const raw of turn.querySelectorAll(sel)) {
+      const b = asButton(raw);
+      if (!b || seen.indexOf(b) !== -1) continue;
+      seen.push(b);
+      controls.push({
+        shape: shape,
+        index: seen.length - 1,
+        name: name(b),
+        visible: isVisible(b),
+        disabled: !!(b.disabled || b.getAttribute('aria-disabled') === 'true'),
+      });
+    }
+  }
+
+  // The overlay menu a Redo click opens. It is NOT inside the turn — Angular
+  // hangs it off an overlay container at the document root — so it is read
+  // from the document, and only the rows the regenerate control owns.
+  const ROW_SEL = %(rows)s;
+  // ⛔⛔ ONE ROW IS ONE ROW, AND THE CAPTURE PROVES THAT HAS TO BE SAID OUT
+  // LOUD. The overlay nests `.cdk-overlay-pane` inside `.cdk-overlay-popover`,
+  // so every row is reached once per ancestor pane, and a
+  // `gem-menu-item[role="menuitem"]` satisfies two members of the row selector
+  // at once. Untreated, the single captured row read as THREE — and far worse
+  // than a wrong count, the index handed to the picker would then address a
+  // different row than the one the decider chose.
+  const rows = [];
+  const seenRows = [];
+  const panes = document.querySelectorAll(%(panes)s);
+  for (const pane of panes) {
+    if (!isVisible(pane)) continue;
+    for (const r of pane.querySelectorAll(ROW_SEL)) {
+      if (!isVisible(r) || seenRows.indexOf(r) !== -1) continue;
+      seenRows.push(r);
+      rows.push({
+        index: rows.length,
+        name: (r.innerText || r.textContent || '').trim().slice(0, 80),
+        testid: (r.getAttribute('data-test-id') || '').slice(0, 40),
+      });
+    }
+  }
+
+  return JSON.stringify({
+    found: true,
+    text: (turn.innerText || '').slice(0, 4000),
+    controls: controls,
+    rows: rows,
+  });
+}
+""" % {"panes": json.dumps(_GEMINI_MENU_PANE_SEL),
+       "rows": json.dumps(_GEMINI_MENU_ROW_SEL),
+       "deny": json.dumps(list(_GEMINI_MENU_DENY)),
+       "turns": json.dumps(list(_GEMINI_TURN_SELECTORS)),
+       "shapes": json.dumps([list(p) for p in _GEMINI_REGEN_SHAPES])}
+
+# Click the control the Python decider chose, re-deriving it from the SAME
+# scoped query in the same tick rather than carrying a DOM handle across the
+# bridge. `shape` and `index` come straight from the reading above.
+_GEMINI_REGEN_CLICK_JS = """
+(arg) => {
+  const TURN_SELECTORS = %(turns)s;
+  let turn = null;
+  for (const sel of TURN_SELECTORS) {
+    const nodes = document.querySelectorAll(sel);
+    if (nodes.length) { turn = nodes[nodes.length - 1]; break; }
+  }
+  if (!turn) return '';
+  const SHAPES = %(shapes)s;
+  let sel = '';
+  for (const [name, s] of SHAPES) { if (name === arg.shape) { sel = s; break; } }
+  if (!sel) return '';
+  // Identical resolution to the reader's, and it has to stay identical: if the
+  // two disagree about which node a shape means, the reading and the click are
+  // about different buttons.
+  const isBtn = (n) => !!n && (String(n.tagName || '').toLowerCase() === 'button'
+                               || (n.getAttribute && n.getAttribute('role') === 'button'));
+  const asButton = (el) => {
+    if (!el) return null;
+    if (isBtn(el)) return el;
+    const inner = el.querySelector ? el.querySelector('button, [role="button"]') : null;
+    if (inner) return inner;
+    return el.closest ? el.closest('button, [role="button"]') : null;
+  };
+  const seen = [];
+  for (const raw of turn.querySelectorAll(sel)) {
+    const b = asButton(raw);
+    if (!b || seen.indexOf(b) !== -1) continue;
+    seen.push(b);
+    if (seen.length - 1 !== arg.index) continue;
+    // ⛔ RE-CHECKED HERE, NOT ONLY IN THE READER. A node that went
+    // `aria-disabled` or zero-sized between the two round trips would
+    // otherwise be clicked and return a truthy label — #905's
+    // disabled-skeleton Start, one more time.
+    const rr = b.getBoundingClientRect();
+    if (rr.width < 8 || rr.height < 8) return '';
+    const cs2 = getComputedStyle(b);
+    if (cs2.display === 'none' || cs2.visibility === 'hidden') return '';
+    if (parseFloat(cs2.opacity) < 0.1) return '';
+    if (b.disabled || b.getAttribute('aria-disabled') === 'true') return '';
+    const label = ((b.getAttribute('aria-label') || b.getAttribute('title')
+                    || b.textContent || '').trim()).slice(0, 60);
+    b.click();
+    return label || 'clicked';
+  }
+  return '';
+}
+""" % {"turns": json.dumps(list(_GEMINI_TURN_SELECTORS)),
+       "shapes": json.dumps([list(p) for p in _GEMINI_REGEN_SHAPES])}
+
+# Pick a row out of the overlay menu by the row's own stable key — its test id,
+# or failing that its exact label. Never by ordinal.
+_GEMINI_MENU_PICK_JS = """
+(want) => {
+  // ⛔⛔ MATCHED BY KEY, NOT BY ORDINAL. The first version was handed the row's
+  // INDEX from a reading taken a round trip earlier — and the index space
+  // depends on which overlay panes were VISIBLE at that instant, so a popover
+  // finishing its opacity ramp, or a co-open menu closing, renumbers the rows
+  // and the click lands on a different one than the decider chose. The decider
+  // was holding a stable key and threw it away. With a Delete row two places
+  // over, an off-by-two is not a missed re-draft.
+  //
+  // ⛔⛔ AND NOT ONE REGEX CROSSES INTO HERE. The whole incident this wave
+  // closes was a pattern that lived in a JS template inside a Python string,
+  // double-escaped, executed by nothing. The label comparison is therefore
+  // EXACT against the raw string the reader reported, built by the identical
+  // expression on the identical node — so no normalising, no escaping, and
+  // nothing to get wrong in the hop. Everything that needs judgement about
+  // wording already happened in Python.
+  const isVisible = (el) => {
+    if (!el || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width < 8 || r.height < 8) return false;
+    const cs = getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+    return parseFloat(cs.opacity) >= 0.1;
+  };
+  const DENY = %(deny)s;
+  const ROW_SEL = %(rows)s;
+  const seenRows = [];
+  const panes = document.querySelectorAll(%(panes)s);
+  for (const pane of panes) {
+    if (!isVisible(pane)) continue;
+    for (const r of pane.querySelectorAll(ROW_SEL)) {
+      if (!isVisible(r) || seenRows.indexOf(r) !== -1) continue;
+      seenRows.push(r);
+      const tid = (r.getAttribute('data-test-id') || '').toLowerCase();
+      const raw = (r.innerText || r.textContent || '').trim().slice(0, 80);
+      if (want.testid) { if (tid !== String(want.testid).toLowerCase()) continue; }
+      else if (raw !== want.name) continue;
+      // ⛔ The deny list is checked AFTER the match, never instead of it: a row
+      // that answers to our key AND reads as destructive is not our row.
+      const low = raw.toLowerCase();
+      for (const d of DENY) { if (low.indexOf(d) !== -1) return ''; }
+      // The captured row carries `role="menuitem"` on the HOST, so the host is
+      // the control; a descendant <button> is preferred only where one exists.
+      // ⛔ `[role="menuitem"]` is deliberately NOT in this query —
+      // `querySelector` never matches self, so it could only ever find a
+      // NESTED row, which is the wrong node by definition.
+      const hit = r.querySelector('button') || r;
+      hit.click();
+      return raw || 'picked';
+    }
+  }
+  return '';
+}
+""" % {"panes": json.dumps(_GEMINI_MENU_PANE_SEL),
+       "rows": json.dumps(_GEMINI_MENU_ROW_SEL),
+       "deny": json.dumps(list(_GEMINI_MENU_DENY)),
+       "turns": json.dumps(list(_GEMINI_TURN_SELECTORS)),
+       "shapes": json.dumps([list(p) for p in _GEMINI_REGEN_SHAPES])}
+
+
+# ⭐⭐ NORMALISE ONCE, DO NOT SPRINKLE `'?` THROUGH THE ALTERNATION. Every
+# apostrophe in the old pattern was written `'?`, which matches a missing
+# apostrophe and a straight one and MISSES the curly `’` these UIs actually
+# render — so `can’t`, `I’m` and `couldn’t` all slipped past, once per
+# alternation, with nothing to make the omission visible. One normaliser cannot
+# be forgotten in the tenth alternation the way an escape can.
+_GEMINI_QUOTE_MAP = str.maketrans({
+    "‘": "'", "’": "'", "‛": "'", "ʼ": "'", "´": "'",
+    "“": '"', "”": '"',
+    "–": "-", "—": "-", "‑": "-",
+    " ": " ",
+})
+
+
+def _gemini_norm(text: str) -> str:
+    """Lowercased, ASCII-quoted, whitespace-collapsed — the form the patterns
+    below are written against. Non-text in, empty string out."""
+    return re.sub(r"\s+", " ", (text or "").translate(_GEMINI_QUOTE_MAP)).strip().lower()
+
+
+# The plan-fail wordings. TWO are ground truth from the owner's 2026-09-10
+# console dump and are fixtures in the suite; the rest are the old helper's
+# alternation carried over, with the tense and the missing verbs repaired.
+# ⛔ `encounter(?:ed|ing)` — the old pattern said `encountered` only, and the
+# live text says "I seem to be encountering an error". A past-tense-only verb
+# in a UI that narrates in the present is the whole of cause 2.
+_GEMINI_PLAN_FAIL_RE = re.compile(
+    r"something went wrong"
+    r"|encounter(?:ed|ing) an? (?:issue|error)"
+    r"|an error (?:occurred|has occurred)"
+    r"|unable to (?:start|continue|complete|generate)"
+    r"|(?:can|could|did)n't (?:complete|start|continue|generate|finish)"
+    r"|research (?:stopped|failed)"
+    r"|failed to (?:generate|complete|run|continue|start)"
+    r"|response stopped"
+    r"|this research (?:was )?(?:stopped|interrupted)"
+    r"|sorry,? (?:i'm |i )?can't help"
+    r"|i can't help (?:you )?with that"
+    r"|i'm (?:unable|not able) to help",
+)
+
+# The last-resort label list for the regenerate control. "redo" is FIRST
+# because it is the only wording Gemini has ever actually shown, and the reason
+# it was missing is that the list was written from imagination.
+# ⛔ `refresh` is deliberately NOT here even though the control's icon IS the
+# refresh glyph: as an accessible NAME, "Refresh" is far more likely to mean
+# reload-the-page than re-draft-this-turn, and the icon is already covered
+# structurally by its own shape. A word list is the fallback, not the finder.
+_GEMINI_REGEN_LABEL_RE = re.compile(
+    r"\b(?:redo|retry|regenerate|rerun|restart|try again)\b")
+
+# The menu row a Redo click opens onto. The test id is the primary key and the
+# wording is the tie-break, never the finder — the owner captured the row as
+# "Don't personalise", and both spellings and both apostrophes are accepted
+# because the normaliser has already run.
+_GEMINI_REGEN_ROW_TESTID = "regenerate"
+_GEMINI_NO_PERSONALISE_RE = re.compile(r"don't personali[sz]e")
+
+
+# ⛔⛔ AND A FAILURE MESSAGE IS SHORT. THIS IS THE ONLY THING SEPARATING GEMINI'S
+# ERROR FROM A PLAN *ABOUT* ERRORS, and without it the feature eats healthy work.
+# The turn this predicate reads is Gemini's own research plan, which restates the
+# user's brief — so a brief on an outage, a post-mortem, a failed mission or a
+# fund that underperformed puts these exact phrases on screen as CONTENT.
+# Measured against the live pattern: "establish why the Arecibo research stopped",
+# "funds that failed to generate returns", "every incident where the research
+# stopped early", "why the migration was unable to complete" all read as a failed
+# draft. Each one would be re-drafted up to the cap, destroying a good plan, and
+# `start_present` cannot save it because the auto-start layout renders Start
+# disabled forever.
+# ⭐ The discriminator is length, not vocabulary. Both captured failures are
+# under 70 characters — they are one sentence, because that is all a UI error
+# says. A research plan is hundreds to thousands. No wording list can separate
+# those two; a size can, and it needs no maintenance as the wordings drift.
+_GEMINI_PLAN_FAIL_MAX_CHARS = 400
+
+
+def _gemini_reads_as_failed(latest_text: str) -> bool:
+    """Does the LATEST turn's own text say the draft failed?
+
+    ⛔ The argument is one turn's text on purpose. The predicate this replaces
+    ran against `document.body.innerText`, which carries the pasted brief, the
+    rail's chat titles and every earlier turn — so a failure that had already
+    been redrawn kept authorising clicks, and the first working Redo would have
+    turned that into a loop that never ends.
+
+    ⛔ AND A TURN LONGER THAN A SENTENCE IS A PLAN, NOT AN ERROR. See the note
+    on `_GEMINI_PLAN_FAIL_MAX_CHARS`: the phrases are the same either way, so
+    the only honest separator is that Gemini's failure message is short and its
+    research plan is not.
+    """
+    norm = _gemini_norm(latest_text)
+    if len(norm) > _GEMINI_PLAN_FAIL_MAX_CHARS:
+        return False
+    return bool(_GEMINI_PLAN_FAIL_RE.search(norm))
+
+
+def _gemini_plan_verdict(*, research_started: bool, start_present: bool,
+                         streaming: bool, latest_text: str) -> str:
+    """What the Gemini plan screen IS: the gate the 2D loop turns on.
+
+    `'researching'` · already running, so there is nothing to start or re-draft
+    (the 2026-07-13 auto-start layout renders Start already-disabled forever).
+    `'ready'`       · an enabled Start control — click it, whatever else shows.
+    `'failed'`      · the latest turn says the draft failed → re-draft it.
+    `'drafting'`    · visibly generating; healthy-slow, leave it alone.
+    `'silent'`      · no plan, no error, nothing moving — the plain-chat case
+                      the early card exists for. There is nothing to click, and
+                      that is precisely why the alert is the right answer here
+                      and the wrong answer in `'failed'`.
+
+    ⭐ ORDER IS THE CONTENT. Something actionable outranks any diagnosis of what
+    went wrong: a Start control means click Start even if the turn above it
+    still reads as an error, because the goal is a started run, not a tidy page.
+    """
+    if research_started:
+        return "researching"
+    if start_present:
+        return "ready"
+    if _gemini_reads_as_failed(latest_text):
+        return "failed"
+    if streaming:
+        return "drafting"
+    return "silent"
+
+
+def _gemini_regen_control(controls) -> "tuple[dict | None, str]":
+    """Choose the regenerate control to click. Returns `(control, why)`.
+
+    Structural shapes in the order the capture proved them, and the wording
+    list only after all three have missed. A shape that is present but
+    invisible or disabled is skipped, not clicked — the sibling lesson from
+    #905, where clicking the disabled skeleton Start reported success and did
+    nothing.
+    """
+    if not controls:
+        return None, "no controls in the latest turn"
+    _blocked = ""
+    for shape in ("testid", "element", "icon", "label"):
+        for c in controls:
+            if (c or {}).get("shape") != shape:
+                continue
+            if shape == "label" and not _GEMINI_REGEN_LABEL_RE.search(
+                    _gemini_norm(c.get("name") or "")):
+                continue
+            # ⛔ A NEGATIVE NAME CHECK, WHICH IS NOT THE SAME AS FINDING BY
+            # NAME. Every structural shape resolves through "the first
+            # descendant button", so a test id migrated one level up onto the
+            # buttons container, or a second button added inside the icon
+            # button, makes the first descendant `thumb-up-button`. The finder
+            # would return it as "matched by testid" and the run would post
+            # feedback to Google while logging that it re-drafted. Refusing a
+            # node that names itself as one of the row's other actions costs
+            # nothing; finding BY name is what this wave exists to stop.
+            if _GEMINI_REGEN_DENY_RE.search(_gemini_norm(c.get("name") or "")):
+                _blocked = _blocked or (
+                    f"{shape} resolved to {c.get('name')!r}, which is another "
+                    "action in the row")
+                continue
+            if not c.get("visible"):
+                _blocked = _blocked or f"{shape} present but not visible"
+                continue
+            if c.get("disabled"):
+                _blocked = _blocked or f"{shape} present but disabled"
+                continue
+            return c, f"matched by {shape}"
+    return None, _blocked or "no regenerate control in the latest turn"
+
+
+def _gemini_menu_choice(rows) -> "tuple[dict | None, str]":
+    """Choose a row out of the regenerate overlay. Returns `(row, why)`.
+
+    ⭐ THE ROW, NOT ITS ORDINAL. The picker re-finds it by the row's own stable
+    key — its test id, or failing that its exact label — because an index is
+    only meaningful inside the single reading it came from, and the two ends of
+    this are a round trip apart.
+
+    ⛔ `None` MEANS CLOSE THE MENU, NOT GUESS. This file already ruled on that
+    once, in the plan-stall diagnostic: "we do NOT blind-click — clicking an
+    unidentified control risks a destructive misclick." An overlay whose rows we
+    cannot name is exactly that.
+
+    ⛔ AND NOTHING ON THE DENY LIST IS EVER RETURNED, whatever key matched it.
+    """
+    if not rows:
+        return None, "no menu rows"
+
+    def _ok(r):
+        low = _gemini_norm(r.get("name") or "")
+        return not any(d in low for d in _GEMINI_MENU_DENY)
+
+    live = [r for r in rows if _ok(r)]
+    if not live:
+        return None, "every row in the menu reads as destructive"
+    owned = [r for r in live
+             if _GEMINI_REGEN_ROW_TESTID in (r.get("testid") or "").lower()]
+    for r in owned:
+        if _GEMINI_NO_PERSONALISE_RE.search(_gemini_norm(r.get("name") or "")):
+            return r, "regenerate row, un-personalised"
+    if owned:
+        return owned[0], "regenerate row"
+    for r in live:
+        if _GEMINI_NO_PERSONALISE_RE.search(_gemini_norm(r.get("name") or "")):
+            return r, "un-personalised row, by wording"
+    return None, "menu is open but no row identifies itself as a re-draft"
+
+
+def _gemini_regen_next_step(reading, *, opened_menu: bool = False) -> "tuple[str, str]":
+    """One move at a time, from one reading. Returns `(step, why)`.
+
+    `'settled'`   · the latest turn no longer reads as failed → we are done.
+    `'pick_menu'` · the overlay WE opened is up and a row names itself → pick it.
+    `'close_menu'`· the overlay we opened is up and nothing in it does → dismiss.
+    `'click'`     · still failed, and a control is reachable → click it.
+    `'no_control'`· still failed, nothing to click → the caller escalates.
+    `'no_turn'`   · nothing rendered to read.
+
+    ⛔⛔ THE FAILURE CHECK COMES FIRST, AND THE FIRST VERSION HAD IT LAST. Rows
+    were consulted before the turn's own text, so a regenerate overlay left open
+    over a HEALTHY plan returned `pick_menu` — and the caller then clicked "Don't
+    personalise", destroyed a good plan, and returned `redrafted=True` with a
+    success log line. Cross-verify demonstrated it from a literal reading, and
+    the harness had a mutant ENFORCING that ordering. A settled turn is the end
+    of this machine, whatever is floating above it.
+
+    ⛔⛔ AND AN OVERLAY IS ONLY OURS IF WE OPENED IT IN THIS CALL. The reader
+    reports every visible overlay in the document, related to this control or
+    not — Gemini's own model picker renders `menuitemradio` rows — so without
+    `opened_menu` any unrelated open menu diverted the whole call, and the
+    dismiss path pressed Escape on a menu the user may have opened themselves.
+    """
+    r = reading or {}
+    if not r.get("found"):
+        return "no_turn", "no model turn rendered yet"
+    if not _gemini_reads_as_failed(r.get("text") or ""):
+        return "settled", "the latest turn no longer reads as failed"
+    rows = r.get("rows") or []
+    if opened_menu and rows:
+        row, why = _gemini_menu_choice(rows)
+        return ("pick_menu", why) if row is not None else ("close_menu", why)
+    control, why = _gemini_regen_control(r.get("controls") or [])
+    return ("click", why) if control is not None else ("no_control", why)
+
+
+
+async def _gemini_regen_read(page) -> dict:
+    """One reading of the latest Gemini turn. `{}` on any failure.
+
+    Fail-CLOSED into an empty dict, which `_gemini_regen_next_step` reports as
+    `'no_turn'`: a probe that could not read the page must never come out as
+    "nothing is wrong here", and it must never come out as a reason to click
+    either.
+    """
+    try:
+        raw = await page.evaluate(_GEMINI_LATEST_TURN_JS)
+    except Exception:
+        return {}
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+async def _gemini_dismiss_our_overlay(page) -> None:
+    """Escape an overlay THIS code opened. Never raises, never reports.
+
+    ⛔ Only ever called for a menu we opened ourselves. The reader can see every
+    visible overlay in the document — Gemini's own model picker among them — and
+    pressing Escape at one the user opened is not this function's business.
+    """
+    try:
+        await page.keyboard.press("Escape")
+    except Exception:
+        pass
+    await asyncio.sleep(1.0)
+
+
+async def _gemini_redraft_plan(page, label, *, settle_s: float = 8.0):
+    """Click Gemini's OWN re-draft control on a failed plan turn, once.
+
+    Returns `(redrafted, acted, in_flight, why)`.
+
+    ⭐⭐ THREE BOOLEANS, BECAUSE THE CALLER NEEDS THREE DIFFERENT FACTS AND ONLY
+    ONE OF THEM IS THE OUTCOME.
+
+      `redrafted` · the latest turn stopped reading as failed. What a success
+                    log may claim, and nothing else.
+      `acted`     · this page was TOUCHED — a control clicked, an overlay row
+                    picked. This is what spends an attempt and arms the
+                    cooldown, whatever came of it: counting only successes
+                    leaves a control that clicks and never re-drafts being
+                    clicked every ten seconds forever, which is the button-spam
+                    #953 removed from the Start click ("send Start Research and
+                    wait, only retry if it doesn't fire").
+      `in_flight` · a re-draft may be UNDER WAY right now. Only the card reads
+                    this, and it is the narrower fact on purpose: the paths
+                    where we clicked and then gave up on the attempt — an
+                    overlay whose rows we cannot name, an `evaluate` that
+                    raised — are `acted` but emphatically NOT `in_flight`,
+                    because nothing is generating and holding the owner's alert
+                    for them would be waiting on something that cannot arrive.
+                    Cross-verify caught that conflation, and it was the most
+                    likely `acted` outcome of all on a build whose row labels
+                    have drifted.
+
+    ⛔⛔ THE MENU IS THE WHOLE REASON THIS IS NOT A ONE-LINER. The owner's
+    capture shows the re-draft living on an overlay row
+    (`data-test-id="regenerate-option"`, reading "Don't personalise") that the
+    Redo button opens. So a single click on Redo re-drafts NOTHING, and the old
+    helper's contract — "single click per call", return True — would have
+    reported success for opening a menu, burnt one of three attempts, and left
+    the overlay sitting over the page so the next click hit its backdrop. Three
+    attempts, three menus, no re-draft, and a log line saying it retried.
+
+    ⭐ It also never clicks twice on one call. Once the control is clicked, the
+    only thing left to do is resolve the overlay and then WAIT and re-read: a
+    turn that is still failed a moment after the click has not refused, it has
+    not repainted yet, and re-clicking there is how a bounded cap turns into a
+    burst.
+    """
+    reading = await _gemini_regen_read(page)
+    step, why = _gemini_regen_next_step(reading)
+
+    if step in ("no_turn", "no_control", "settled"):
+        return False, False, False, why
+
+    clicked = ""
+    _acted = False
+    _opened_menu = False
+    if step == "click":
+        control, _why_c = _gemini_regen_control(reading.get("controls") or [])
+        if control is None:                      # the reading moved under us
+            return False, False, False, "the control went away between the reading and the click"
+        if _controls.is_stop():
+            return False, False, False, "stop requested before the re-draft click"
+        # ⭐ SET BEFORE THE CALL, NOT AFTER IT. An evaluate that RAISED may
+        # have half-landed, and guessing "nothing happened" there is what turns
+        # a bounded cap into a click every ten seconds against a page that is
+        # already unwell.
+        _acted = True
+        try:
+            clicked = await page.evaluate(_GEMINI_REGEN_CLICK_JS, {
+                "shape": control.get("shape"), "index": control.get("index")})
+        except Exception as _ce:
+            # Touched (an evaluate that raised may have half-landed) but NOT
+            # in flight: nothing is known to be generating, so the owner's
+            # alert must not wait on it.
+            return False, _acted, False, f"the re-draft click raised: {_ce}"
+        if not clicked:
+            _acted = False       # the finder returned empty: no node was clicked
+            return False, _acted, False, "the control was gone by the time the click ran"
+        _opened_menu = True      # whatever overlay is up next, we opened it
+        log(f"[{label}] Gemini plan re-draft: clicked its own control "
+            f"'{clicked}' ({_why_c})", "INFO")
+        await asyncio.sleep(min(2.0, max(0.0, settle_s / 4.0)))
+        reading = await _gemini_regen_read(page)
+        step, why = _gemini_regen_next_step(reading, opened_menu=_opened_menu)
+
+    if step == "pick_menu":
+        row, _why_m = _gemini_menu_choice(reading.get("rows") or [])
+        if _controls.is_stop():
+            await _gemini_dismiss_our_overlay(page)
+            return False, _acted, False, "stop requested before the re-draft menu pick"
+        _was = _acted
+        _acted = True
+        try:
+            picked = await page.evaluate(_GEMINI_MENU_PICK_JS, {
+                "testid": row.get("testid") or "", "name": row.get("name") or ""})
+        except Exception as _pe:
+            return False, _acted, False, f"the re-draft menu pick raised: {_pe}"
+        if not picked:
+            _acted = _was        # the row went: only the earlier click counts
+            await _gemini_dismiss_our_overlay(page)
+            return False, _acted, False, "the menu row was gone by the time the pick ran"
+        log(f"[{label}] Gemini plan re-draft: picked '{picked}' ({_why_m})", "INFO")
+    elif step == "close_menu":
+        # We opened this overlay and cannot name a row in it, so this attempt
+        # is over: touched, and nothing generating. ⛔ It must not be left up —
+        # a CDK backdrop intercepts pointer events, so every later click on
+        # this page, ours or the CUA ladder's, would land on it.
+        await _gemini_dismiss_our_overlay(page)
+        return False, _acted, False, why
+
+    # Every remaining path has touched the page: the entry step was `click` or
+    # `pick_menu`, and everything else has already returned.
+    await asyncio.sleep(settle_s)
+    after = await _gemini_regen_read(page)
+    # ⛔ AND IF ANY OVERLAY OF OURS IS STILL UP, IT GOES. The pane can mount
+    # LATER than the post-click re-read, in which case the step machine never
+    # saw it and neither branch above dismissed it — cross-verify's find. A
+    # backdrop left over attempt 3 is one the loop can never clear, because the
+    # loop has exited.
+    if _opened_menu and (after.get("rows") or []):
+        await _gemini_dismiss_our_overlay(page)
+        after = await _gemini_regen_read(page)
+    if not after.get("found"):
+        return False, _acted, False, "could not re-read the turn after the re-draft"
+    if _gemini_reads_as_failed(after.get("text") or ""):
+        # The one genuinely in-flight case: the control took the click and the
+        # turn has not come back yet.
+        return False, _acted, True, "clicked, but the turn still reads as failed"
+    try:
+        emit_event("gemini_plan_redraft", phase=2, agent="gemini",
+                   match=str(clicked)[:60])
+    except Exception:
+        pass
+    return True, _acted, False, f"re-drafted after '{clicked}'"
+
+
 async def _gemini_kickoff_pending(page):
     """Lightweight DOM probe: did Gemini ACK without actually starting?
 
@@ -47743,7 +48468,8 @@ _CLAUDE_EFFORT_SUBMENU_JS = r"""(P) => {
 
 def _gemini_plan_card_due(*, elapsed: float, wait_max_sec: float,
                           alert_sec: float, regen_capped: bool,
-                          streaming_recent: bool, start_clicked: bool) -> bool:
+                          streaming_recent: bool, start_clicked: bool,
+                          redraft_pending: bool = False) -> bool:
     """May the early [Retry][Skip] card fire yet?
 
     ⛔ THE FALSE ALARM (owner's e2e, 2026-08-17). The card went up at 248s and
@@ -47766,6 +48492,23 @@ def _gemini_plan_card_due(*, elapsed: float, wait_max_sec: float,
     `streaming_recent` keeps its #929 meaning: a plan that is visibly still
     generating is healthy-slow, and `start_clicked` means there is nothing to
     alert about at all.
+
+    ⭐⭐ `redraft_pending` (2026-09-10) IS THE OWNER'S "THE ALERT COMES LAST",
+    and it sits BELOW the regen arm on purpose. It means: we have clicked
+    Gemini's own re-draft control, the plan has not come back yet, and attempts
+    remain — so the clicks are not exhausted and the card would be describing a
+    recovery that is still in progress. It is deliberately FALSE when nothing
+    was clickable, because no amount of waiting produces a re-draft there; the
+    plain-chat stall is exactly that case, and it is the one the timer arm below
+    exists for.
+
+    ⛔ THIS ARM ONLY BECAME REACHABLE ON 2026-09-10, AND SO DID THE ONE ABOVE
+    IT. `regen_capped` is fed from a counter that only advances when a re-draft
+    is clicked, and until this wave nothing could click Gemini's control — its
+    label is "Redo" and the finder's word list was
+    `retry|regenerate|try again|rerun|restart`. So the evidence arm had eight
+    passing tests and had never once fired in production, and every card this
+    predicate ever raised came from the clock.
     """
     if start_clicked:
         return False
@@ -47773,6 +48516,8 @@ def _gemini_plan_card_due(*, elapsed: float, wait_max_sec: float,
         return False
     if regen_capped:
         return True
+    if redraft_pending:
+        return False
     return elapsed >= max(float(alert_sec), float(wait_max_sec))
 
 
@@ -52821,6 +53566,109 @@ def _gemini_owns_candidate(candidate_text: str, pasted_head: str) -> bool:
     return hits / len(toks) >= 0.6
 
 
+# The head of the brief, past any shared template boilerplate — the chunk that
+# identifies THIS run rather than every run this product has ever done.
+# ⛔ THE HEADER STRIP IS LOAD-BEARING: every brief opens with the same
+# "# Research Brief" line, so a chunk taken from the very top would match a
+# stranger's thread and last week's run alike.
+def _gemini_brief_chunk(pasted_text: str) -> str:
+    head = (pasted_text or "")[:600]
+    if head.lstrip().lower().startswith("# research brief"):
+        head = head.split("\n", 1)[1] if "\n" in head else ""
+    return re.sub(r"\s+", " ", head).strip().lower()[:60]
+
+
+def _gemini_conversation_is_ours(convo_text: str, pasted_text: str) -> bool:
+    """Does this conversation's text hold OUR brief? Positive evidence only.
+
+    Lifted out of `_gemini_adopt_lost_conversation`'s closure unchanged so a
+    second caller — the post-Send landing check — asks the same question the
+    adoption gate asks, rather than growing a second opinion about it.
+    """
+    b = re.sub(r"\s+", " ", convo_text or "").strip().lower()
+    chunk = _gemini_brief_chunk(pasted_text)
+    if chunk and chunk in b:
+        return True
+    return _gemini_owns_candidate(b[:300], (pasted_text or "")[:600])
+
+
+def _gemini_conversation_ownership(convo_text: str, pasted_text: str, *,
+                                   from_turn: bool = True) -> "bool | None":
+    """`True` provably ours · `False` provably NOT ours · `None` cannot tell.
+
+    ⛔⛔ THREE-VALUED, AND FOR THE REASON THE OWNER RULED ON ALREADY. The note on
+    ChatGPT's landing verdict says it in full: "the entire lesson of 2026-08-27
+    is that 'I cannot tell' must never come out as 'this is somebody else's'".
+    Here that lesson has teeth, because `False` is now ACTED on — it sends the
+    tab back to the home and into the sidebar hunt. A conversation that has
+    merely not finished rendering must therefore answer `None`, or a healthy run
+    whose bubble painted a moment late would be walked out of its own thread.
+
+    `_CONVO_TEXT_MIN_CHARS` is the existing threshold for exactly this and its
+    comment already says so — "below this many characters the conversation text
+    is not evidence either way".
+    """
+    b = re.sub(r"\s+", " ", convo_text or "").strip()
+    if len(b) < _CONVO_TEXT_MIN_CHARS or not (pasted_text or "").strip():
+        return None
+    ours = bool(_gemini_conversation_is_ours(b, pasted_text))
+    if ours:
+        return True
+    # ⛔⛔ PAGE-WIDE TEXT MAY AFFIRM BUT IT MAY NEVER CONDEMN. If the turn was
+    # not readable, what was measured is Gemini's own chrome — the rail's chat
+    # titles, "New chat", "Settings & help" — which is always long enough to
+    # clear the evidence threshold and never contains this run's brief. Reading
+    # that as "somebody else's conversation" is the 2026-08-27 ruling broken by
+    # a fallback rather than by a judgement.
+    return False if from_turn else None
+
+
+# ⛔ HOISTED SO A TEST CAN EXECUTE IT. While this lived inline the only thing a
+# test could say about it was which selector appears first in the source — and
+# that is exactly the assertion a body-first mutant walked straight through,
+# because `document.querySelector('user-query')` still comes first in the text
+# either way. Running it against a fixture whose body and user turn DIFFER is
+# the only question worth asking.
+# ⛔⛔ AND IT REPORTS WHICH SOURCE IT USED, which is not bookkeeping — it is the
+# difference between evidence and chrome. An `user-query` that is mounted but
+# not yet filled is FALSY, so this falls through to the body; and Gemini's body
+# chrome ("New chat · Recent · Gems · Settings & help") is comfortably past the
+# minimum-evidence threshold, so the ownership check answered a hard "not ours"
+# for a page it simply could not read yet. Cross-verify demonstrated three such
+# strings. With `False` now ACTED on — it walks the tab out to the home and into
+# the sidebar hunt — that answer evicts a healthy run from its own conversation.
+_GEMINI_CONVO_TEXT_JS = (
+    "() => { const q = document.querySelector('user-query');"
+    " const t = (q && q.innerText) || '';"
+    " return JSON.stringify(t"
+    "   ? {src: 'turn', text: t.slice(0, 4000)}"
+    "   : {src: 'body', text: (document.body.innerText || '').slice(0, 4000)}); }")
+
+
+async def _gemini_read_conversation_text(page) -> "tuple[str, bool]":
+    """`(text, from_turn)` for the mounted conversation.
+
+    ⭐ THE USER TURN IS THE PRIMARY SOURCE and the body is only a fallback: the
+    body also carries the rail's chat titles and every other turn, so judging
+    ownership from it would find our brief's words in a page that merely LISTS
+    our other conversations.
+
+    `("", False)` on any failure, which every caller must read as "no evidence"
+    — never as "not ours".
+    """
+    try:
+        raw = await page.evaluate(_GEMINI_CONVO_TEXT_JS)
+    except Exception:
+        return "", False
+    try:
+        got = json.loads(raw) if raw else {}
+    except Exception:
+        return "", False
+    if not isinstance(got, dict):
+        return "", False
+    return (got.get("text") or ""), (got.get("src") == "turn")
+
+
 async def _gemini_adopt_lost_conversation(page, pasted_text: str, label: str):
     """Last-resort recovery when a Gemini send never surfaced on OUR tab (URL
     pinned at bare /app through every re-submit) — live incident 2026-07-11
@@ -52844,25 +53692,18 @@ async def _gemini_adopt_lost_conversation(page, pasted_text: str, label: str):
     # Build the identity chunk from PAST any shared template header (every
     # brief opens with the same "# Research Brief…" boilerplate — a chunk of
     # it would match every past run; adversarial-review finding).
-    _chunk_src = pasted_head
-    if _chunk_src.lstrip().lower().startswith("# research brief"):
-        _chunk_src = _chunk_src.split("\n", 1)[1] if "\n" in _chunk_src else ""
-    _chunk = re.sub(r"\s+", " ", _chunk_src).strip().lower()[:60]
+    # (the identity chunk itself now lives in `_gemini_brief_chunk`, shared with
+    # the post-Send landing check — a second live-looking copy here is exactly
+    # what the de-duplication was for)
 
     async def _conversation_matches(p) -> bool:
-        # The opened conversation must CONTAIN our brief: read the first
-        # user-query bubble (fallback: body text) and match it.
-        try:
-            body = await p.evaluate(
-                "() => { const q = document.querySelector('user-query');"
-                " return ((q && q.innerText) || document.body.innerText || '')"
-                ".slice(0, 4000); }")
-        except Exception:
-            return False
-        b = re.sub(r"\s+", " ", body or "").strip().lower()
-        if _chunk and _chunk in b:
-            return True
-        return _gemini_owns_candidate(b[:300], pasted_head)
+        # The opened conversation must CONTAIN our brief. 2026-09-10: the read
+        # and the judgement are both shared with the post-Send landing check now
+        # (`_gemini_read_conversation_text` / `_gemini_conversation_is_ours`) —
+        # same behaviour, one opinion. A gate that decides which thread is ours
+        # must not exist twice.
+        _txt, _from_turn = await _gemini_read_conversation_text(p)
+        return _gemini_conversation_is_ours(_txt, pasted_text)
 
     async def _adoptable_state(p) -> str:
         """Pre-Start states only. A conversation already holding a COMPLETED
@@ -54328,14 +55169,84 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             except Exception:
                 return False
 
+        # ⛔⛔ THE URL'S SHAPE IS NOT THE QUESTION, AND THE COMMENT ABOVE ALREADY
+        # SAID SO WHILE THE CODE DID SOMETHING ELSE: "the URL ADVANCES to
+        # /app/<id> — the reliable signal: every healthy run gets one, a dropped
+        # send never does". Advancing is a CHANGE; `"/app/" in url` is a SHAPE,
+        # and the two differ in precisely the case that matters — a tab that was
+        # already sitting inside a conversation when we pasted. There the shape
+        # test is true on the very first poll, the whole recovery below is
+        # skipped, and the run is confirmed against a thread that may be last
+        # run's. That is the "stuck in a past run" failure Layer 0.6 exists to
+        # prevent, reached through the one door it does not watch.
+        #
+        # ⭐ So a landing is a conversation that is not PROVABLY somebody else's.
+        # `None` — still rendering, nothing to read yet — lands exactly as it did
+        # before, which is what keeps a healthy-but-slow bubble from being walked
+        # out of its own thread.
+        _wrong_chat = False
+
+        async def _gemini_conversation_is_not_foreign() -> bool:
+            """In a conversation that is not PROVABLY somebody else's.
+
+            ⭐ ONE PLACE ASKS THIS. Both the polling landing check and the
+            re-submit ladder's final confirmation used to compare the URL's
+            shape, in two separate expressions — and the ladder's was an `or`
+            straight back to the bare shape, so a run that ended up in a
+            rejected chat was still reported as "submission confirmed".
+            """
+            nonlocal _wrong_chat
+            if not _gemini_in_conversation():
+                # ⛔⛔ CLEARED HERE, AND LEAVING IT SET WAS A BLOCKER. This is a
+                # `nonlocal` latch read by BOTH the 15-second landing wait and
+                # the re-submit ladder's 40-second one. Set on a stale
+                # conversation, then not cleared once the reset put the tab back
+                # on the bare home, the ladder's `if _wrong_chat: return False`
+                # fired on poll one — so its 40-second wait became ZERO on all
+                # three attempts, each attempt re-pasted into an empty composer,
+                # and a send that had in fact landed produced two or three
+                # duplicate Deep Research conversations on the owner's account
+                # before the card. That is the duplicate-run failure #955 Phase
+                # 2G exists to prevent, reached through the recovery for it.
+                _wrong_chat = False
+                return False
+            _convo_text, _from_turn = await _gemini_read_conversation_text(page)
+            _own = _gemini_conversation_ownership(
+                _convo_text, brief_to_paste, from_turn=_from_turn)
+            if _own is False:
+                _wrong_chat = True
+                log(f"[{label}] the tab is inside a conversation that provably "
+                    "does NOT hold this run's brief — not confirming on it", "WARN")
+                return False
+            _wrong_chat = False
+            return True
+
         async def _gemini_landed(deadline_s: float) -> bool:
             waited = 0.0
             while waited <= deadline_s:
-                if _gemini_in_conversation():
+                if await _gemini_conversation_is_not_foreign():
                     return True
+                # ⛔ A PROVEN-FOREIGN CHAT ENDS THE WAIT RATHER THAN OUTLASTING
+                # IT. Polling it for the rest of the deadline cannot change the
+                # answer — the recovery below is what changes it.
+                if _wrong_chat:
+                    return False
                 await asyncio.sleep(1.5)
                 waited += 1.5
             return False
+
+        async def _gemini_reset_to_home() -> bool:
+            """Walk the tab back to the empty home. True if it got there."""
+            for _hg in range(3):
+                try:
+                    await page.goto("https://gemini.google.com/app",
+                                    wait_until="domcontentloaded", timeout=20000)
+                except Exception as _hge:
+                    log(f"[{label}] home reset attempt {_hg + 1}/3 failed ({_hge})", "WARN")
+                if not _gemini_in_conversation():
+                    return True
+                await asyncio.sleep(1.5)
+            return not _gemini_in_conversation()
 
         if not await _gemini_landed(15.0):
             # The conversation URL hasn't advanced to /app/<id>. Under concurrent
@@ -54382,6 +55293,28 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             # mechanics). Skipped after a user Stop (#737 spirit — no post-Stop
             # DOM driving). On failure it returns our tab reset to the bare home,
             # so the re-paste ladder below runs cleanly.
+            # ⭐⭐ THE OWNER'S ASK, AND IT IS ONE STEP RATHER THAN A NEW HUNT.
+            # A tab stranded in the WRONG conversation used to be reset to the
+            # home and CARDED; now it is reset to the home and then sent through
+            # the sidebar hunt that already exists — "go and find the right
+            # chat" instead of "give up and ask".
+            # ⛔ THE RESET HAS TO COME FIRST, and not for tidiness: the hunt
+            # refreshes the rail to freshen a stale Recent list, and its own rule
+            # is that it never reloads while inside a conversation. Handing it a
+            # tab that is in one would break that rule from the outside.
+            if _wrong_chat and _gemini_in_conversation() and not _controls.is_stop():
+                log(f"[{label}] stepping out of the wrong conversation before the "
+                    "sidebar hunt", "WARN")
+                if not await _gemini_reset_to_home():
+                    # ⛔ SAY SO. Without this the run lands in the branch below
+                    # whose log reads "adoption rejected the sidebar
+                    # candidate(s)" — when adoption never ran at all, because
+                    # its gate requires the tab to be out of a conversation.
+                    # That line is the primary forensic artefact for this
+                    # incident class and it would misdirect the next look.
+                    log(f"[{label}] could not leave the wrong conversation — the "
+                        "sidebar hunt cannot run from inside one, so it is "
+                        "being skipped", "WARN")
             _adopted = False
             if not _controls.is_stop() and not _gemini_in_conversation():
                 _pre_adopt_page = page
@@ -54427,15 +55360,7 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             if not _adopted and _gemini_in_conversation():
                 log(f"[{label}] adoption rejected the sidebar candidate(s) but left "
                     "the tab on a stale /app/<id> — resetting to the empty home", "WARN")
-                for _hg in range(3):
-                    try:
-                        await page.goto("https://gemini.google.com/app",
-                                        wait_until="domcontentloaded", timeout=20000)
-                    except Exception as _hge:
-                        log(f"[{label}] home reset attempt {_hg + 1}/3 failed ({_hge})", "WARN")
-                    if not _gemini_in_conversation():
-                        break
-                    await asyncio.sleep(1.5)
+                await _gemini_reset_to_home()
                 if _gemini_in_conversation():
                     log(f"[{label}] tab stuck on a stale conversation we can't leave — "
                         "surfacing the Retry/Skip blocker (refusing to confirm on the "
@@ -54627,7 +55552,7 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 if await _gemini_landed(40.0):
                     _landed = True
                     break
-            if _landed or _gemini_in_conversation():
+            if _landed or await _gemini_conversation_is_not_foreign():
                 # A re-submit created the conversation (the send really was
                 # dropped, now recovered) — a silent self-heal, no card to clear.
                 log(f"[{label}] Gemini submission confirmed ✓ (re-submit landed)")
@@ -55265,8 +56190,20 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         _regen_count = 0
         _GEMINI_MAX_PLAN_REGEN = 3
         _GEMINI_REGEN_COOLDOWN_SEC = 45   # space attempts so a slow-but-healthy
-        _last_regen_at = 0.0              # re-draft can't burn the 3-cap
+        # ⛔ STARTS WITH THE LOOP, NOT AT ZERO. At 0.0 the cooldown is already
+        # satisfied on the very first tick, so a re-draft could fire ~2 seconds
+        # after the brief was submitted — at a turn still painting, whose first
+        # words may be Gemini's own transient narration. Harmless while nothing
+        # could click; a live hazard now. The same 45 seconds every later
+        # attempt gets is the right grace for the first, and it needs no new
+        # constant.
+        _last_regen_at = time.time()      # re-draft can't burn the 3-cap
         _regen_cap_emitted = False
+        # ⛔ OUTSIDE THE LOOP ON PURPOSE. 1b only runs once the cooldown has
+        # elapsed, so a per-tick variable would read False for the 45 seconds
+        # between attempts — which is precisely the window the card must be
+        # held through.
+        _redraft_pending = False
         _logged_stall_diag = False
         # #921 incident-3: surface a [Retry][Skip] card EARLY. Before this, the
         # honest fail_agent lived only after the full 300s plan-wait + a 3× CUA
@@ -55348,7 +56285,20 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             # #953: still streaming past the hand-off point → the research
             # (almost certainly) auto-started — hand off to the round-robin
             # instead of dwelling to the hard cap + CUA ladder + false card.
-            if _elapsed >= _stream_handoff_sec and _streaming_recent:
+            # ⛔⛔ AND NOT WHEN THE STREAMING IS OUR OWN RE-DRAFT. This branch
+            # reads persistent streaming as "a plan never streams this long, so
+            # the research has almost certainly auto-started" — and a Redo we
+            # clicked ourselves restarts the plan, legitimately, which the
+            # heartbeat then reports as `generating`. Before this wave nothing
+            # could click, so the premise held by accident. Unfixed it hands a
+            # planless Gemini to the round-robin as though its research were
+            # already running, skips the CUA ladder, retracts the card, and
+            # writes a log line that is false. So the hand-off window must have
+            # elapsed since OUR last attempt too; with no attempt yet
+            # `_last_regen_at` is the loop start, and this reads exactly as it
+            # did before.
+            if (_elapsed >= _stream_handoff_sec and _streaming_recent
+                    and (time.time() - _last_regen_at) >= _stream_handoff_sec):
                 _streaming_handoff = True
                 log(f"[2D] Still streaming at {_elapsed}s (≥ {_stream_handoff_sec}s) — a plan "
                     "never streams this long, so Gemini has almost certainly auto-started its "
@@ -55371,7 +56321,22 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                         alert_sec=_PLAN_ALERT_SEC,
                         regen_capped=_regen_cap_emitted,
                         streaming_recent=_streaming_recent,
-                        start_clicked=bool(start_clicked)):
+                        start_clicked=bool(start_clicked),
+                        # ⛔⛔ FALSE HERE, AND NOT AS A SHORTCUT. `redraft_pending`
+                        # means "keep waiting, a re-draft is in flight" — and this
+                        # call site is the loop DECIDING TO STOP WAITING: the next
+                        # statement is an unconditional `break`, so there is no
+                        # next attempt for the card to defer to. Passing the flag
+                        # here deferred the alert to a retry the following line
+                        # cancelled, which left the owner with nothing on screen
+                        # until the CUA ladder's terminal card ~12 minutes later.
+                        # That is the seventeen-minute ladder #921 exists to
+                        # remove, deleted by a boolean instead of by an edit —
+                        # exactly what the comment above this block warns about.
+                        # ⭐ The rule both directions: an alert that fires while
+                        # its caller intends to keep waiting is wrong, and an
+                        # alert held while its caller is giving up is wrong too.
+                        redraft_pending=False):
                     _raise_plan_alert("our own plan-wait budget is spent")
                 break
             # #755: stop/pause-aware — a 10-min plan wait must honor Stop/Pause.
@@ -55395,6 +56360,14 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 await _close_skipped_agent_tab(browser, gemini_page, "gemini", "Gemini")
                 break
             # 1. Check Start-research button on Gemini and click if present
+            # ⭐ `_start_present_now` is this tick's ANSWER to "is there an
+            # enabled Start control", and it comes from the finder that just
+            # ran rather than from a second probe that could disagree with it
+            # (#905: two finders reading the same DOM differently is how the
+            # disabled skeleton got clicked). A falsy click means the shared
+            # predicate found no enabled control; a click that did not take
+            # means the control is still sitting there.
+            _start_present_now = False
             try:
                 await browser.switch_to_page(gemini_page)
                 clicked = await gemini_page.evaluate(_click_start_js)
@@ -55437,76 +56410,142 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                         _retract_plan_alert("main loop")
                         await asyncio.sleep(5)
                         break
+                    _start_present_now = True
                     log("[2D] 'Start research' click didn't take after a patient "
                         "re-click (30s watch) — continuing to poll", "WARN")
             except Exception:
                 pass
 
-            # 1b. (#755) No "Start research" yet — if Gemini is in a plan-FAIL
-            # state, auto-click its Regenerate/Retry (bounded + stop-aware) so the
-            # plan re-drafts. _try_inpage_retry_on_research_fail only clicks when
-            # the page actually shows failure text AND finds a retry-labeled
-            # button in the assistant area, so a healthy "still drafting" plan is
-            # never touched. The 30s loop sleep below spaces successive attempts
-            # so each re-draft has time to produce a plan (or a fresh failure).
+            # 1b. (#755; rebuilt 2026-09-10 from the owner's captured DOM)
+            # No "Start research" yet — read what the plan screen IS, and only
+            # when the LATEST turn says the draft failed, click Gemini's own
+            # re-draft control.
+            #
+            # ⛔⛔ WHAT THIS REPLACED, AND WHY IT COULD NOT BE A TUNING CHANGE.
+            # This branch delegated to `_try_inpage_retry_on_research_fail`,
+            # whose button word list is `retry|regenerate|try again|rerun|
+            # restart`. Gemini's control is `aria-label="Redo"`. So this branch
+            # has never clicked anything — not on a bad day, ever — and
+            # `_regen_count` has never left zero, which also means the
+            # `regen_capped` arm of `_gemini_plan_card_due` (eight tests, all
+            # green) has never been reachable in production. The other wording,
+            # "encountering an error", missed a fail-text alternation that says
+            # "encountered". Two words, and no test could see either: the only
+            # one that read that pattern re-compiled it in Python and fed it a
+            # sentence written to satisfy it.
+            #
+            # ⭐⭐ AND THE GATE IS THE STATE NOW, NOT THE TEXT. `not
+            # start_clicked` is true for the entire drafting window, so the old
+            # branch leaned wholly on that helper's page-wide fail-text probe to
+            # stay off a healthy plan. `_gemini_plan_verdict` is asked instead,
+            # from four measured inputs — and the expensive one is bought only
+            # on the tick where a click is imminent, because re-drafting a
+            # RUNNING research is the single destructive move available on this
+            # screen and the 2026-07-13 auto-start layout renders Start
+            # permanently disabled, so "no Start control" cannot tell a dead
+            # plan from a live run by itself.
             if (not start_clicked and _regen_count < _GEMINI_MAX_PLAN_REGEN
                     and not _controls.is_stop()
                     and (time.time() - _last_regen_at) > _GEMINI_REGEN_COOLDOWN_SEC):
-                try:
-                    _regened = await _try_inpage_retry_on_research_fail(
-                        gemini_page, "gemini", "2D-plan", max_wait_s=4)
-                except Exception:
-                    _regened = False
-                if _regened:
-                    _regen_count += 1
-                    _last_regen_at = time.time()
-                    log(f"[2D] Gemini plan failed — auto-clicked Regenerate "
-                        f"{_regen_count}/{_GEMINI_MAX_PLAN_REGEN}; re-drafting plan, "
-                        f"will re-check for 'Start research'", "INFO")
+                _reading = await _gemini_regen_read(gemini_page)
+                _latest = _reading.get("text") or ""
+                _already_running = False
+                if _gemini_reads_as_failed(_latest):
                     try:
-                        emit_event("agent_progress", phase=2, agent="gemini",
-                                   status="generating", stage="planning",
-                                   progress=(f"Gemini plan hit an error — retrying "
-                                             f"({_regen_count}/{_GEMINI_MAX_PLAN_REGEN})…"))
+                        _already_running = await _gemini_research_started(gemini_page)
                     except Exception:
-                        pass
-                elif not _logged_stall_diag and _elapsed > 90:
-                    # No labeled Retry was clickable but we're stuck past 90s with
-                    # no "Start research". Capture the assistant-area buttons ONCE
-                    # (read-only) so a future E2E can pin the icon-only Regenerate
-                    # selector for the silent-stall case. We do NOT blind-click —
-                    # clicking an unidentified control risks a destructive misclick.
-                    try:
-                        _cands = await gemini_page.evaluate("""() => {
-                            const scope = document.querySelector(
-                                'message-content, model-response, .response-container, main') || document.body;
-                            const out = [];
-                            for (const b of scope.querySelectorAll('button, [role="button"]')) {
-                                const r = b.getBoundingClientRect();
-                                if (r.width < 8 || r.height < 8) continue;
-                                out.push({
-                                    aria: (b.getAttribute('aria-label') || '').slice(0, 40),
-                                    title: (b.getAttribute('title') || '').slice(0, 40),
-                                    cls: ((b.className && b.className.toString) ? b.className.toString() : '').slice(0, 60),
-                                    svg: !!b.querySelector('svg'),
-                                    txt: (b.textContent || '').trim().slice(0, 30),
-                                });
-                                if (out.length >= 12) break;
-                            }
-                            return JSON.stringify(out);
-                        }""")
-                        log(f"[2D] Gemini plan stall diag @ {_elapsed}s (no labeled "
-                            f"Retry found, no 'Start research'): {_cands}", "WARN")
-                    except Exception:
-                        pass
-                    _logged_stall_diag = True
+                        # ⛔ TRUE, NOT FALSE, AND THE POLARITY IS THE POINT.
+                        # `_gemini_research_started` is documented fail-closed
+                        # "so a probe miss never fakes a start" — but at THIS
+                        # call site False is what authorises the click, and the
+                        # click is the one destructive move on this screen. A
+                        # probe that could not answer must read as "assume it is
+                        # running": the cost is one re-draft skipped, against
+                        # re-drafting a live research run.
+                        _already_running = True
+                _verdict = _gemini_plan_verdict(
+                    research_started=_already_running,
+                    start_present=_start_present_now,
+                    streaming=_streaming_recent, latest_text=_latest)
+                if _verdict == "failed":
+                    (_redrafted, _acted, _in_flight,
+                     _why_rd) = await _gemini_redraft_plan(gemini_page, "2D-plan")
+                    if _acted:
+                        # ⭐ THE ATTEMPT IS SPENT ON THE CLICK, NOT ON THE
+                        # OUTCOME. A control that clicks and never re-drafts
+                        # would otherwise be clicked every ten seconds forever
+                        # — the Start-button spam #953 removed.
+                        _regen_count += 1
+                        _last_regen_at = time.time()
+                        log(f"[2D] Gemini plan re-draft "
+                            f"{_regen_count}/{_GEMINI_MAX_PLAN_REGEN}: {_why_rd}",
+                            "INFO" if _redrafted else "WARN")
+                        try:
+                            emit_event("agent_progress", phase=2, agent="gemini",
+                                       status="generating", stage="planning",
+                                       progress=(f"Gemini's plan hit an error — retrying "
+                                                 f"({_regen_count}/{_GEMINI_MAX_PLAN_REGEN})…"))
+                        except Exception:
+                            pass
+                    # ⭐ THE CARD WAITS WHILE A RE-DRAFT IS IN FLIGHT, and that
+                    # is the whole of the owner's "the alert comes last". It is
+                    # deliberately NOT set when nothing was clickable, and not
+                    # when we clicked and then abandoned the attempt: there is
+                    # nothing to wait for in either case, and holding the card
+                    # for a re-draft that cannot arrive would be another guard
+                    # that never fires — pointed at the owner.
+                    # ⛔ AND THE CAP IS NOT A TERM HERE. It belongs to the card
+                    # predicate's own exhausted-attempts arm, which is checked
+                    # FIRST; putting it in both places made that ordering
+                    # unexercisable, so the arm order could not be tested and a
+                    # mutation of it was free.
+                    _redraft_pending = bool(_in_flight)
+                    if not _acted and not _logged_stall_diag and _elapsed > 90:
+                        log(f"[2D] Gemini plan reads as FAILED at {_elapsed}s but no "
+                            f"re-draft control was reachable ({_why_rd}); controls "
+                            f"read: {_reading.get('controls')}", "WARN")
+                        _logged_stall_diag = True
+                else:
+                    _redraft_pending = False
+                    if (_verdict == "silent" and not _reading.get("found")
+                            and not _logged_stall_diag and _elapsed > 90):
+                        # ⛔ A READ THAT FAILED IS NOT A SILENT PLAN. Without
+                        # this, the one artefact meant to make a Gemini UI
+                        # revision visible reported "no plan, no error text, not
+                        # streaming" with `controls read: None` — naming the
+                        # wrong cause for the exact failure it exists to catch.
+                        log(f"[2D] Gemini plan reading FAILED at {_elapsed}s — no "
+                            f"model turn matched {list(_GEMINI_TURN_SELECTORS)}; the "
+                            f"re-draft path is blind until that is fixed", "WARN")
+                        _logged_stall_diag = True
+                    elif (_verdict == "silent" and not _logged_stall_diag
+                            and _elapsed > 90):
+                        # No plan, no error, nothing moving — the 2026-07-08
+                        # plain-chat run. Read-only, once: there is nothing to
+                        # click here and clicking an unidentified control is a
+                        # destructive misclick waiting to happen. This is the
+                        # state the early card exists for.
+                        log(f"[2D] Gemini plan stall diag @ {_elapsed}s: no plan, no "
+                            f"error text, not streaming (verdict={_verdict}); "
+                            f"controls read: {_reading.get('controls')}", "WARN")
+                        _logged_stall_diag = True
 
             # 1c. (#755) Auto-regenerate exhausted but still no plan — surface it
             # ONCE so the eventual not-verified outcome reads as a known repeated
             # failure in the FE, not a silent stall (the user previously had to
             # retry by hand ~3×). We keep polling until the window/CUA fallback.
+            # ⛔ AND NOT UNTIL THE LAST ATTEMPT HAS HAD ITS OWN WINDOW. This arm
+            # was unreachable in production until this wave (nothing could click
+            # Gemini's control, so the counter never moved), and making it
+            # reachable exposed a missing grace: attempts 1 and 2 each get the
+            # full cooldown to produce a plan, while attempt 3 was judged ~10
+            # seconds after its click — the settle window and nothing more. Same
+            # page, same failure, and a card on the third that the first would
+            # not have raised. Cross-verify caught it; the fix is to spend the
+            # same patience on the last attempt as on the others.
             if (not start_clicked and _regen_count >= _GEMINI_MAX_PLAN_REGEN
-                    and not _regen_cap_emitted and not _controls.is_stop()):
+                    and not _regen_cap_emitted and not _controls.is_stop()
+                    and (time.time() - _last_regen_at) > _GEMINI_REGEN_COOLDOWN_SEC):
                 _regen_cap_emitted = True
                 log(f"[2D] Gemini plan auto-regenerate exhausted ({_regen_count} tries) "
                     f"— still no 'Start research'; will keep polling then escalate", "WARN")
@@ -55535,7 +56574,8 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                     elapsed=_elapsed, wait_max_sec=_start_wait_max_sec,
                     alert_sec=_PLAN_ALERT_SEC, regen_capped=_regen_cap_emitted,
                     streaming_recent=_streaming_recent,
-                    start_clicked=bool(start_clicked)):
+                    start_clicked=bool(start_clicked),
+                    redraft_pending=_redraft_pending):
                 _raise_plan_alert("plan clearly failed")
 
             # 2. Emit a Gemini planning heartbeat every ~15s so the frontend

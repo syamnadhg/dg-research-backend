@@ -106,7 +106,13 @@ def test_failed_adopt_normalizes_to_home_and_fails_safe_if_stranded():
     i_ladder = _GEM.index("_max_attempts = 3")
     seg = _GEM[i_adopt:i_ladder]
     assert "not _adopted and _gemini_in_conversation()" in seg
-    assert 'page.goto("https://gemini.google.com/app"' in seg
+    # 2026-09-10: the reset became `_gemini_reset_to_home()` because the
+    # wrong-conversation branch needs it BEFORE the sidebar hunt too — the hunt
+    # refreshes the rail and never reloads from inside a conversation. Same
+    # three attempts, same best-effort, one copy.
+    assert "_gemini_reset_to_home()" in seg
+    assert 'page.goto("https://gemini.google.com/app"' in _GEM, (
+        "the home reset itself is gone, not just moved")
     # stranded-and-can't-leave → terminal blocker + return False (safe fail)
     # #63: couldn't-start copy centralized in the _GEMINI_CANT_START constant.
     assert 'fail_agent("gemini", *_GEMINI_CANT_START)' in seg

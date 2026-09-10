@@ -84,7 +84,8 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
                     elapsed=_elapsed, wait_max_sec=_start_wait_max_sec,
                     alert_sec=_PLAN_ALERT_SEC, regen_capped=_regen_cap_emitted,
                     streaming_recent=_streaming_recent,
-                    start_clicked=bool(start_clicked)):
+                    start_clicked=bool(start_clicked),
+                    redraft_pending=_redraft_pending):
                 _raise_plan_alert("plan clearly failed")""",
        """            if (not start_clicked and not _streaming_recent
                     and (_regen_cap_emitted or _elapsed > _PLAN_ALERT_SEC)):
@@ -93,14 +94,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     ("N9", "under", "⛔⛔ the card is not raised at the give-up point — and since "
      "the break sits ABOVE the card block, the timer arm becomes unreachable "
      "and #921's protection is silently gone",
-     [("""                if _gemini_plan_card_due(
-                        elapsed=_elapsed, wait_max_sec=_start_wait_max_sec,
-                        alert_sec=_PLAN_ALERT_SEC,
-                        regen_capped=_regen_cap_emitted,
-                        streaming_recent=_streaming_recent,
-                        start_clicked=bool(start_clicked)):
-                    _raise_plan_alert("our own plan-wait budget is spent")
-                break""",
+     [('                if _gemini_plan_card_due(\n                        elapsed=_elapsed, wait_max_sec=_start_wait_max_sec,\n                        alert_sec=_PLAN_ALERT_SEC,\n                        regen_capped=_regen_cap_emitted,\n                        streaming_recent=_streaming_recent,\n                        start_clicked=bool(start_clicked),\n                        # ⛔⛔ FALSE HERE, AND NOT AS A SHORTCUT. `redraft_pending`\n                        # means "keep waiting, a re-draft is in flight" — and this\n                        # call site is the loop DECIDING TO STOP WAITING: the next\n                        # statement is an unconditional `break`, so there is no\n                        # next attempt for the card to defer to. Passing the flag\n                        # here deferred the alert to a retry the following line\n                        # cancelled, which left the owner with nothing on screen\n                        # until the CUA ladder\'s terminal card ~12 minutes later.\n                        # That is the seventeen-minute ladder #921 exists to\n                        # remove, deleted by a boolean instead of by an edit —\n                        # exactly what the comment above this block warns about.\n                        # ⭐ The rule both directions: an alert that fires while\n                        # its caller intends to keep waiting is wrong, and an\n                        # alert held while its caller is giving up is wrong too.\n                        redraft_pending=False):\n                    _raise_plan_alert("our own plan-wait budget is spent")\n                break',
        "                break")],
      [T_NEW]),
     ("N10", "over", "the once-only guard goes, so every tick re-cards a stalled "

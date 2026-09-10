@@ -21,8 +21,23 @@ stall with no failure text) still NEEDS a live E2E to pin the exact Regenerate
 selector — so instead of blind-clicking an unidentified control (misclick risk)
 the loop logs a ONE-TIME read-only dump of the assistant-area buttons after 90s.
 
+⛔⛔ SUPERSEDED IN PART, 2026-09-10 — READ THIS BEFORE TRUSTING THE PARAGRAPHS
+ABOVE. The "fix" described above wired this loop to
+`_try_inpage_retry_on_research_fail`, and that call never clicked anything on
+Gemini for the fifteen months it stood: the control is `aria-label="Redo"` and
+that helper's word list is `retry|regenerate|try again|rerun|restart`. The
+"icon-only / silent-stall case" the third paragraph says "still NEEDS a live
+E2E" was in fact the ONLY case there ever was, and the owner captured it on
+09-10 — the control is not icon-only at all, it is aria-labelled and carries
+`data-test-id="regenerate-button"`. The loop now targets it structurally via
+`_gemini_redraft_plan` and gates on `_gemini_plan_verdict`; the bound, the
+cooldown and the Stop-awareness pinned below are unchanged and still this
+file's job. The behaviour lives in test_gemini_redraft_0910.py, executed
+against that capture, and the gate in test_gemini_plan_gate_0910.py.
+
 These are source-inspection guards (the loop lives inline in the large
-run_phase2 coroutine), matching the suite convention.
+run_phase2 coroutine), matching the suite convention — and the fifteen months
+above are what that convention costs when nothing executes the thing it wires.
 
 Run:  pytest tests/test_gemini_plan_regen_755.py -v
 """
@@ -56,11 +71,28 @@ def test_regen_is_bounded():
     assert "_regen_count += 1" in loop, "the regen counter is never incremented"
 
 
-def test_regen_wires_the_existing_retry_clicker():
+def test_regen_wires_the_redraft_path():
+    """⛔⛔ THE ANCHOR MOVED ON 2026-09-10, AND THE REASON MATTERS MORE THAN THE
+    RENAME. This used to assert the loop called
+    `_try_inpage_retry_on_research_fail`, and it passed for fifteen months
+    while that call clicked NOTHING: Gemini's control is `aria-label="Redo"`
+    and that helper's word list is `retry|regenerate|try again|rerun|restart`.
+    A wiring assertion cannot see that the thing it is wired to does not work,
+    which is why the replacement path is pinned by EXECUTION against the
+    owner's captured DOM in test_gemini_redraft_0910.py — this test only keeps
+    the wire attached."""
     loop = _2d_loop()
-    assert "_try_inpage_retry_on_research_fail(" in loop, (
-        "the [2D] loop no longer calls _try_inpage_retry_on_research_fail — the "
-        "plan-fail auto-regenerate is not wired in"
+    assert "_gemini_redraft_plan(" in loop, (
+        "the [2D] loop no longer calls _gemini_redraft_plan — the plan-fail "
+        "re-draft is not wired in"
+    )
+    assert "_try_inpage_retry_on_research_fail(" not in loop, (
+        "the [2D] loop is delegating to the text-gated shared helper again; its "
+        "word list has never matched Gemini's control"
+    )
+    assert "_gemini_plan_verdict(" in loop, (
+        "the re-draft must be gated on the plan STATE, not on `not "
+        "start_clicked` plus a page-wide text probe"
     )
 
 
@@ -83,7 +115,7 @@ def test_start_research_click_is_preferred_over_regen():
     # call site `_click_start_js`, not the predicate's literal text.)
     loop = _2d_loop()
     i_start = loop.find("evaluate(_click_start_js)")
-    i_regen = loop.find("_try_inpage_retry_on_research_fail(")
+    i_regen = loop.find("_gemini_redraft_plan(")
     assert i_start != -1 and i_regen != -1, "loop markers missing"
     assert i_start < i_regen, (
         "the regenerate path now precedes the 'Start research' click — a healthy "
