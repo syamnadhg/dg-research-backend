@@ -453,7 +453,7 @@ def test_device_add_pairs_and_autoselects(bridge_port, monkeypatch, capsys):
     # First device: claim forwards to the web app route; the bridge auto-selects
     # it so research can start immediately.
     calls = {}
-    def fake_fe(sess, path, payload):
+    def fake_fe(sess, path, payload, **_kw):
         calls["path"], calls["payload"] = path, payload
         return 200, {"ok": True, "action": "initial-pair", "deviceId": "dev-new"}
     monkeypatch.setattr(bridge, "_fe_api_post", fake_fe)
@@ -468,23 +468,34 @@ def test_device_add_pairs_and_autoselects(bridge_port, monkeypatch, capsys):
 
 def test_device_add_friendly_errors(bridge_port, monkeypatch, capsys):
     monkeypatch.setattr(bridge, "_fe_api_post",
-                        lambda sess, path, payload: (404, {"error": "code_not_found"}))
+                        lambda sess, path, payload, **_kw: (404, {"error": "code_not_found"}))
     assert sr.main(["device-add", "BADCODE1"]) == 1
     assert "match any device" in capsys.readouterr().out
 
 
 def test_device_remove_by_name_owner(bridge_port, monkeypatch, capsys):
+    """⛔⛔ THIS TEST USED TO PIN THE DEFECT. It asserted `"re-paired" in out`,
+    which is the false sentence — "can be re-paired with its code", said about a
+    code the route had just rotated out from under the person. A guard written
+    against the wording rather than the behaviour will hold a lie in place, and
+    this one did, through four waves. It now pins what the route actually does:
+    the code changed, and here is the new one."""
     monkeypatch.setattr(bridge, "_fe_api_post",
-                        lambda sess, path, payload: (200, {"ok": True, "action": "owner-unlinked"}))
+                        lambda sess, path, payload, **_kw: (200, {
+                            "ok": True, "action": "owner-unlinked",
+                            "pairCode": "K7XQ-9B2M", "deviceName": "My PC"}))
     assert sr.main(["device-remove", "my pc"]) == 0
     out = capsys.readouterr().out
-    assert "Unlinked" in out and "My PC" in out and "re-paired" in out
+    assert "Unlinked" in out and "My PC" in out
+    assert "K7XQ-9B2M" in out                      # the live code reaches them
+    assert "pair code changed" in out              # and the old one is dead
+    assert "re-paired with its code" not in out    # the sentence stays dead
 
 
 def test_device_remove_sharer_leaves(bridge_port, monkeypatch, capsys):
     FakeFS.devices = [{"id": "dev-s", "name": "Boss PC", "ownerUid": "other"}]
     monkeypatch.setattr(bridge, "_fe_api_post",
-                        lambda sess, path, payload: (200, {"ok": True, "action": "left-shared"}))
+                        lambda sess, path, payload, **_kw: (200, {"ok": True, "action": "left-shared"}))
     assert sr.main(["device-remove", "boss pc"]) == 0
     assert "Left the shared device" in capsys.readouterr().out
 

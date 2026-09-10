@@ -11,13 +11,13 @@ account action is the bridge's responsibility (single-owner session).
 
 Commands (mirror the chat slash actions). A run is named by its TITLE (a word
 or two from the topic) or run-id; omit it to mean the most recent / active run:
-  login              start a remote sign-in → prints a code + link to relay
-  login-done         poll until the sign-in is approved / expires (alias: login-wait)
+  login              start a remote sign-in → prints a link to relay
+  login-done         check once whether the sign-in was approved (alias: login-wait)
   status-account     is the bridge up + signed in?
-  devices            list reachable devices
+  devices            list this account’s devices, each with an online flag
   device-use <name>  choose the device runs go to (name or id)
   device-add <code>  pair a new device by the code on its screen
-  device-remove <name>  unlink a device (owner keeps it re-pairable; sharer leaves)
+  device-remove <name>  unlink a device (owner: new pair code issued; sharer leaves)
   research <topic>   start a run (--device <id> to override the selected device)
   status [run]       a run's progress + links + any blocker (no run = most recent)
   podcast [run]      download a run's audio → a local file to send as native audio
@@ -26,15 +26,21 @@ or two from the topic) or run-id; omit it to mean the most recent / active run:
   retry [run]        resume a run that's waiting on a decision / hit an error
   skip [phases…]     skip the run's current blocker (no phases) or named phases
                        (--run <run> to target one; else the latest active run)
-  arm-stream         prepare this chat's streaming watchdog → prints the cron
-                       script + job name to arm via the runtime's cronjob tool
+  arm-stream         arm this chat's streaming watchdog (writes the job itself;
+                       older runtimes get a printed cron script to arm by hand)
   version            show the Super Research skill version
   update             update the Super Research skill (this chat — scripts + bridge)
   logout             clear the account session
-  help               this list
 
-Add --json to print the raw bridge response (the streaming cron uses
-`sr.py --json updates`).
+Add --json to print the raw bridge response INSTEAD of the friendly lines.
+⛔ --json REPLACES the rendered text, so a reply whose lines carry a warning
+loses the warning: `--json device-remove` prints the new pair code with none of
+the three sentences that say the old one is dead, that this one claims the
+machine, and to keep it like a password. Callers that render for a person must
+not use it.
+⛔ THE LIVE-UPDATES CRON IS `sr_attention_poll.py`, NOT THIS. It reads the
+bridge's /updates directly and imports nothing from here; the claim that the
+cron used `sr.py --json updates` was false and only two tests ever called it.
 """
 
 from __future__ import annotations
@@ -311,8 +317,13 @@ def _get(path: str, timeout: float | None = None) -> tuple[int, dict]:
     return _request("GET", path, timeout=timeout)
 
 
-def _post(path: str, body: dict | None = None) -> tuple[int, dict]:
-    return _request("POST", path, body if body is not None else {})
+def _post(path: str, body: dict | None = None,
+          timeout: float | None = None) -> tuple[int, dict]:
+    """⛔ `timeout` IS PER CALL because one route needs longer than the rest.
+    `/device/remove` can take the bridge up to 35s (the web route declares a 30s
+    budget and uses it), and a client that gave up first would report a bridge
+    that is not running AND lose the only copy of the machine's new pair code."""
+    return _request("POST", path, body if body is not None else {}, timeout=timeout)
 
 
 def _emit(payload: dict, as_json: bool, lines: list[str], code: int = 0) -> int:
@@ -321,6 +332,17 @@ def _emit(payload: dict, as_json: bool, lines: list[str], code: int = 0) -> int:
     Returns the process exit code so the streaming cron can tell success (0)
     from a bridge/session failure (non-zero)."""
     if as_json:
+        # ⛔⛔ THE WARNING RIDES ALONG IN JSON TOO. `--json` prints the payload
+        # INSTEAD of the rendered lines, so `--json device-remove` emitted the
+        # rotated pair code with none of the three sentences that say the old one
+        # is dead, that whoever holds this one can claim the machine, and to keep
+        # it like a password. A machine-readable caller is still read by somebody.
+        # Cross-verify found it; nothing in either new test file drove `--json`.
+        if isinstance(payload, dict) and payload.get("pairCode"):
+            payload = {**payload, "pairCodeWarning":
+                       "This is the machine's new pair code. Whoever holds it can "
+                       "claim the computer as its owner. The previous code no "
+                       "longer works and this is the only copy."}
         print(json.dumps(payload))
     else:
         print("\n".join(lines))
@@ -1064,15 +1086,94 @@ def cmd_device_use(args) -> int:
     return _emit(body, args.json, [f"✓ Now running on {_dev_label(d)} ({kind})."])
 
 
-# Friendly wording for the web app's claim/unpair error codes.
+# Friendly wording for the web app's CLAIM route (`/api/devices/claim`) — the
+# codes `device-add` can receive, and nothing else.
+#
+# ⛔⛔ IT USED TO SERVE `device-remove` TOO AND SHARED NOT ONE CODE WITH IT.
+# `unpair-self` emits nine codes and this table holds seven; the intersection is
+# EMPTY. So every single way an unlink can fail fell through to the raw
+# fallback, and a person who could not unlink their machine read
+# "couldn't remove the device: rotation_failed" — the one refusal in the product
+# that is protecting them, delivered as a bare identifier. The unlink route has
+# its own table below, and the guard in test_unlink_copy_795.py pins each table
+# to its own route's codes so the shortcut cannot be taken again.
 _PAIR_ERRORS = {
-    "invalid_code_format": "Pair codes are 8 letters/digits (like K7XQ-9B2M) — check the device's screen.",
+    # ⛔ THE ALPHABET EXCLUDES I, L, O, 0 AND 1 — the five that get confused —
+    # and "8 letters/digits" told people the opposite, so somebody who typed an
+    # O for a zero read a rule their input satisfied and retyped the same code.
+    "invalid_code_format": "Pair codes are 8 characters and never use I, L, O, 0 or 1 — check those.",
     "code_not_found": "That code didn’t match any device — re-check it on the device’s screen.",
-    "code_expired": "That code expired — reset the pair code on the device and try the fresh one.",
+    # ⛔ NOT "reset the pair code on the device" — Reset is an owner-only control
+    # in the web app and no agent command performs it, so that named a remedy in
+    # a place it does not live. `--pair` on the machine is the one that works.
+    "code_expired": "That code expired — run “superresearch --pair” on the machine for a fresh one.",
     "not_previous_owner": "That device is waiting for its previous owner to re-pair — only they can.",
-    "revoked_sharer": "The owner removed your access to that device — ask them to share it again.",
-    "share_cap_reached": "That device has reached its sharer limit.",
-    "rate_limited": "Too many attempts — wait a few minutes and try again.",
+    # ⛔⛔ "ask them to share it again" IS REFUSED ON EVERY PATH, and the web app's
+    # own table says it too. The blocklist is consulted by claim, by the ask route
+    # and by the approve route, and it is cleared only by a full Reset or an
+    # owner-unlink — so a re-sent code answers `revoked_sharer` again. This file
+    # already words the ask route's version correctly; this one lagged.
+    "revoked_sharer": "The owner removed your access to that computer. Re-using a code "
+                      "or asking again can’t change that — only they can, from the app.",
+    "share_cap_reached": "That device is shared with as many people as it can hold — "
+                         "ask the owner to remove someone first.",
+    # ⛔ NO DURATION HERE — `_rate_limited_line` reads the one the route sent.
+    "rate_limited": "",
+    # ⛔ THE FIVE THIS TABLE WAS MISSING — it covered 7 of the route's 12, so a
+    # third of the ways pairing can fail printed the bare identifier.
+    # ⭐ `pair_bootstrap_failed` IS THE ONE WORTH THE MOST HERE: the device DID
+    # pair, the machine just did not get its token, and entering the same code
+    # again finishes the job. Read as a bare code it looks like a dead end, so
+    # somebody would have gone looking for a fresh code they do not need.
+    # ⭐ THE RECOVERABLE ONE, WITH ITS DEADLINE. The committed branch stamps a
+    # five-minute TTL on the half-paired document, so "the same code again" is
+    # true only inside that window — after it the document is gone and the same
+    # code answers `code_not_found`, contradicting the promise.
+    "pair_bootstrap_failed": "It paired, but the computer didn’t finish picking "
+                             "up its token — send me the same code again in the "
+                             "next few minutes and it will resume. After that, "
+                             "run “superresearch --pair” on the machine.",
+    # ⛔ RESETTING THE CODE CANNOT RESTORE THE MISSING FIELD — only the pairing
+    # handshake writes it, so a fresh code throws this again, indefinitely.
+    "device_secret_missing": "That machine didn’t finish its side of the handshake — "
+                             "run “superresearch --pair” on it again.",
+    "unauthorized": "Your sign-in has expired — sign in again and send me the code.",
+    "invalid_json": "That request didn’t reach the app in one piece — send me the "
+                    "code again.",
+    "internal_error": "Something went wrong at our end — nothing was paired; try again.",
+}
+
+# Friendly wording for the web app's UNPAIR-SELF route — the codes
+# `device-remove` can receive. All nine are worded, including the two the agent
+# cannot itself reach (`auth_delete_failed` is on the retire branch, which is
+# gated on the machine's own synthetic login; `deviceId_mismatch` needs a token
+# carrying a `deviceId` claim, which a person's session never has). They are
+# covered anyway because the guard pins this table to the ROUTE, and a table
+# with hand-maintained exclusions is how the last one came to share nothing
+# with the route it was serving.
+_UNLINK_ERRORS = {
+    # ⛔⛔ IT DOES NOT SAY "NOTHING CHANGED", AND IT USED TO. The route deletes the
+    # device's pending customToken BEFORE it attempts the rotation, and only then
+    # returns this — so an unlink that stops here has already destroyed a handoff.
+    # The true and useful claim is narrower: the machine is STILL YOURS.
+    "rotation_failed": "Couldn’t unlink it — its pair code wouldn’t change, and "
+                       "unlinking without a fresh code would leave the computer "
+                       "claimable by anyone holding the old one. It is still "
+                       "linked to you; try again in a moment.",
+    "not_authorized": "That computer isn’t linked to your account, so there’s "
+                      "nothing to unlink.",
+    "device_not_found": "That computer no longer exists — nothing to unlink.",
+    "rate_limited": "",
+    "unauthorized": "Your sign-in was refused — sign in again and ask me once more.",
+    # ⛔ NOT "you named no computer" — the bridge refuses an empty id itself, so
+    # the only way this code arrives is an id the app rejected as malformed.
+    "deviceId_missing": "The app didn’t recognise that computer’s id. Ask me to list "
+                        "them and name the one to remove.",
+    "deviceId_mismatch": "That request named two different computers — ask me to "
+                         "list them and name the one to remove.",
+    "auth_delete_failed": "Couldn’t finish retiring that computer — nothing was "
+                          "changed, so it is safe to try again.",
+    "internal_error": "Something went wrong at our end — nothing changed; try again.",
 }
 
 
@@ -1081,7 +1182,8 @@ def cmd_device_add(args) -> int:
     code, body = _post("/device/pair", {"code": args.code})
     if code != 200:
         err = body.get("error", "")
-        msg = _PAIR_ERRORS.get(err, f"couldn’t add the device: {err or code}")
+        msg = _device_refusal_line(err, _PAIR_ERRORS, "add the device",
+                                   body.get("retryAfterMs"))
         return _emit(body, args.json, [f"✗ {msg}"], _fail_code(code))
     action = body.get("action")
     name = body.get("deviceName") or "the new device"
@@ -1098,22 +1200,82 @@ def cmd_device_add(args) -> int:
 
 
 def cmd_device_remove(args) -> int:
-    """Unlink a device (owner: device stays installed + re-pairable; sharer: leaves it)."""
+    """Unlink a device (owner: device stays installed, NEW code issued; sharer: leaves)."""
     dev, fail = _resolve_device_arg(args.device)
     if dev is None:
         return _emit({}, args.json, fail, 1)
-    code, body = _post("/device/remove", {"deviceId": dev.get("id")})
+    # ⛔ 50s, NOT THE DEFAULT 30. The bridge waits up to 35 on this route (it can
+    # use its whole 30s budget) plus a 10s token refresh; a client that gave up
+    # first would report a bridge that is not running and lose the new pair code.
+    code, body = _post("/device/remove", {"deviceId": dev.get("id")}, timeout=50)
     if code != 200:
         err = body.get("error", "")
-        msg = _PAIR_ERRORS.get(err, f"couldn’t remove the device: {err or code}")
+        msg = _device_refusal_line(err, _UNLINK_ERRORS, "remove the device",
+                                   body.get("retryAfterMs"))
         return _emit(body, args.json, [f"✗ {msg}"], _fail_code(code))
     label = _dev_label(dev)
     if body.get("action") == "left-shared":
+        # ⛔ NO CODE HERE, ON PURPOSE. A sharer walking away is not handed the
+        # key to the machine they just left — the route omits it and this says
+        # nothing about it either, because mentioning a rotation they cannot use
+        # only invites them to go looking for the new one.
         return _emit(body, args.json, [f"✓ Left the shared device “{label}”."])
     return _emit(body, args.json, [
         f"✓ Unlinked “{label}” from your account.",
-        "(Nothing was deleted — the device keeps running and can be re-paired with its code.)",
+        *_unlink_code_lines(body.get("pairCode")),
     ])
+
+
+# ⛔⛔ THIS REPLACES A SENTENCE THAT WAS FALSE IN BOTH HALVES — the old copy
+# promised nothing had gone and told the person to carry on using the code they
+# already had. The first promise is true. The second was not: since 7.7A an
+# owner-unlink ROTATES the code before it clears the owner, and it has to,
+# because the claim route hands OWNERSHIP to whoever presents a code against an
+# ownerless device and unlinking creates exactly that state. So the code they
+# were told to keep stopped working as they read the sentence, and the live one
+# sat on the machine's screen where nothing told them to look.
+#
+# ⛔ AND IT IS PRESENTED AS A CREDENTIAL, which is the other thing the product
+# got wrong: SKILL.md called a pair code "NOT a password". On a machine with no
+# owner it is stronger than one — it hands over the machine. The existing
+# precedent ("A pair code still lets someone in without asking you") understates
+# it for exactly this moment, so this says the harder thing.
+#
+# ⛔ THE EXPLANATION LIVES IN A `#` COMMENT, NOT A DOCSTRING, and that is not
+# style. The guard that keeps the false sentence out sweeps CODE ONLY —
+# `code_only` blanks `#` comments and a docstring is a string literal, so a
+# docstring quoting the old wording satisfies the search and the sweep goes
+# green over a lie. It caught this file doing exactly that while being written.
+def _unlink_code_lines(new_code: str | None) -> list[str]:
+    """What an owner is told about the code after unlinking their own machine.
+
+    ⛔⛔ THE FALLBACK USED TO SEND PEOPLE TO THE MACHINE'S SCREEN AND THAT WAS
+    FALSE — cross-verify caught it, three lines from the field I had been reading.
+    `unpair-self/route.ts` says it in its own words: "This is the only copy that
+    exists: the machine cannot show it either, since the backend only ever learns
+    a code from the pairing response and cannot read the admin-only entry it now
+    lives in." The ex-owner cannot use the reveal either, because the rotation has
+    already taken their ownership away. So there is no lookup to point at, and
+    inventing one sent somebody to read a dead code off a screen.
+
+    ⭐ WHAT IS TRUE IS THE UNCOMFORTABLE THING, so it is what this says: the code
+    is gone, and the way back is to pair the machine again from the machine, which
+    joins it as a NEW computer (`research.py`: "--pair does not restore anything —
+    it mints a NEW deviceId").
+    """
+    if not new_code:
+        return ["The device keeps running, but its pair code changed and the new "
+                "one did not reach me.",
+                "That code cannot be looked up anywhere — this reply was the only "
+                "copy. To use the computer again, run “superresearch --pair” on "
+                "the machine itself; it will join as a new computer."]
+    return [
+        "The device keeps running, and its pair code changed — the old one no "
+        "longer works.",
+        f"New pair code: {new_code}",
+        "Anyone who has that code can claim this computer as its owner, so keep "
+        "it like a password.",
+    ]
 
 
 # ⛔⛔ ITS OWN TABLE, NOT `_PAIR_ERRORS`. Three codes appear in both and mean
@@ -1176,6 +1338,42 @@ def _plain_verb(what: str) -> str:
     return _PLAIN_VERBS.get(what, what)
 
 
+def _device_refusal_line(err, table: dict, what: str, retry_after_ms=None) -> str:
+    """The chat sentence for one refusal from the pair or unlink route.
+
+    ⛔⛔ THE TWO DEVICE ROUTES WERE THE ONLY REFUSAL PATHS IN THIS FILE WITH NO
+    HELPER, and cross-verify found both holes the helper exists to close. A bare
+    `table.get(err, fallback)` meant a SIGNED-OUT caller read the bridge's own
+    words — "not signed in — run /login" — which hands a chat user the terminal's
+    command; and a synthesised `http_500` (a Firestore outage inside the route's
+    rate limiter, which sits outside its try) printed that identifier verbatim,
+    the exact thing this wave was written to remove. Every sibling route already
+    had this shape.
+
+    ⛔ AND THE WAIT IS THE SERVER'S NUMBER OR NOTHING. Both routes send
+    `retryAfterMs` and the bridge relays it; the chat client read it on four
+    other routes and not on these two, so it invented "a few minutes" beside a
+    number it had been handed — while the terminal said "about 5 minutes" for the
+    same reply. The two clients disagreed about the same 429.
+    """
+    if err == "rate_limited":
+        ms = retry_after_ms
+        ok = (not isinstance(ms, bool)) and isinstance(ms, (int, float)) and ms > 0
+        if not ok:
+            return f"Too many attempts to {what} in a row — give it a minute."
+        mins = max(1, int((ms + 59_999) // 60_000))
+        return (f"Too many attempts to {what} in a row — try again in about "
+                f"{mins} minute{'' if mins == 1 else 's'}.")
+    said = table.get(err)
+    if said:
+        return said
+    if str(err).lower().startswith("not signed in"):
+        return _signed_out_or(err)
+    if str(err).startswith("http_"):
+        return f"The app answered that with nothing I can read (HTTP {str(err)[5:]})."
+    return f"couldn’t {what}: {err or 'no reason given'}"
+
+
 def _signed_out_or(err) -> str:
     """The chat sentence for a signed-out refusal; anything else unchanged.
 
@@ -1225,10 +1423,14 @@ def _list_refusal_line(what: str, err: str, retry_after_ms=None) -> str:
 def _ask_refusal_line(err: str, retry_after_ms=None) -> str:
     """The sentence for one ask refusal, with a wait only when the reply gave one.
 
-    ⛔ THE WAIT IS THE SERVER'S NUMBER OR NOTHING. This is the first refusal in
-    the product where the reply carries `retryAfterMs`; every other one omits a
-    duration precisely because no client could know it, and inventing one here
-    beside a number that was handed over would be the worse half of both habits.
+    ⛔ THE WAIT IS THE SERVER'S NUMBER OR NOTHING — inventing one beside a number
+    that was handed over is the worse half of both habits.
+    ⛔ AND THE CLAIM THAT USED TO STAND HERE WAS FALSE: it called this "the first
+    refusal in the product where the reply carries `retryAfterMs`". The pair and
+    unlink routes both send it, two hundred lines above, and until 7.9-5's
+    cross-verify round both of those invented "a few minutes" instead of reading
+    it. A comment asserting it is the only one of its kind is how the other two
+    stayed unnoticed.
     """
     if err == "rate_limited":
         ms = retry_after_ms
@@ -3234,12 +3436,28 @@ def _is_bare_machine_noun(name: str) -> bool:
         rf"(?:(?:all|every|each|both)\s+(?:my\s+|the\s+|of\s+my\s+)?)?"
         rf"(?:{_MACHINE_NOUNS}|phones?)", (name or "").strip(), re.I))
 
+
+# ⛔⛔ THE SET-REQUEST GATE LIVED HERE AND WAS REVERTED ON 2026-09-09, OWNER'S
+# CALL, AFTER CROSS-VERIFY MEASURED IT AS A REGRESSION. It classified a captured
+# name by its QUANTIFIER, and a wildcard word slot made any real machine name
+# shaped `<all|every|each|both> <word> <machine-noun>` full-match the bulk
+# pattern — 96 measured phrases, 12 names × 8 verbs, so "All Hands Mac" could
+# not be unlinked, published, hidden, asked for, approved or denied, while
+# `switch to All Hands Mac` still resolved it.
+#
+# ⭐ IT RETURNS AS WAVE 7.9-5b WITH A DIFFERENT SIGNAL: a request names a set
+# iff it carries a PLURAL machine/run noun outside a quoted name. "All Hands
+# Mac" is singular and survives; `my computers`, `my two macs` and `any of my
+# computers` — all of which the quantifier design MISSED — do not. WAVES.md
+# holds the full finding list; nothing about it is carried here.
+#
+# ⛔ 7.9-4's unlink gate below is UNCHANGED and stays. It was never the problem.
 _NL_QUOTE_CHARS = "“”‘’\"'"
 
 _NL_CONFIRMS = {
     "stop": "Stop {name}? It ends the run — everything finished so far is kept. Say yes and I’ll stop it.",
     "logout": "Sign out of Super Research? (The skill stays installed — you can sign back in anytime.) Say yes and I’ll sign you out.",
-    "device-remove": "Unlink {name}? Nothing gets deleted — an owner’s device can re-pair with its code. Say yes and I’ll remove it.",
+    "device-remove": "Unlink {name}? It keeps running, but its pair code changes — the old one stops working and I’ll show you the new one. Say yes and I’ll remove it.",
     "update": "Update the Super Research skill (this chat runtime)? The bridge restarts briefly. Say yes and I’ll update it.",
     "install": "Install the Super Research backend on the connected device? Say yes and I’ll set it up.",
     # ⛔⛔ CONFIRM-GATED THOUGH IT DESTROYS NOTHING, and that is the point. It is
@@ -3290,6 +3508,7 @@ _NL_CONFIRMS = {
                          "you would still approve every person yourself. Say yes "
                          "and I’ll switch it on.",
 }
+
 
 # Info-only reply (NOT a confirm — there's no action for me to take): the skill
 # only updates itself. A backend-update ask is redirected to where it happens —

@@ -681,14 +681,14 @@ MUTANTS = [
     ("S3", SKILL, "under",
      "⛔⛔ `device-visibility` LEAVES THE SAFETY BULLET — the third list, and the "
      "one 7.9-2 forgot. A row in the table was not enough then either",
-     [("`device-remove` (unlinks a device — nothing is\n  deleted; an owner's device re-pairs with its code), `device-ask`, `device-approve`,\n  `device-deny`, `device-visibility public`, `install` (installs the backend on\n  the connected computer), and `update` (briefly restarts the chat",
-       "`device-remove` (unlinks a device — nothing is\n  deleted; an owner's device re-pairs with its code), `device-ask`, `device-approve`,\n  `device-deny`, and `update` (briefly restarts the chat")]),
+     [("`device-remove` (unlinks a device — an\n  owner's keeps running but on a NEW code), `device-ask`, `device-approve`,\n  `device-deny`, `device-visibility public`, `install` (installs the backend on\n  the connected computer), and `update` (briefly restarts the chat",
+       "`device-remove` (unlinks a device — an\n  owner's keeps running but on a NEW code), `device-ask`, `device-approve`,\n  `device-deny`, and `update` (briefly restarts the chat")]),
     ("S4", SKILL, "over",
      "⛔⛔ THE GREETING RESERVES THESE VERBS TO THE WEB APP AGAIN, so the model "
      "refuses the two commands it now has",
      [('  name a topic. (For a computer they OWN they can also answer the people asking\n'
-       '  for it and set whether strangers can find it at all. Revoking a sharer and\n'
-       '  resetting a pair code stay in the web app.)',
+       '  for it and set whether strangers can find it at all. Unlinking their own\n'
+       '  machine issues it a new pair code. Revoking one sharer stays in the web app.)',
        '  name a topic. (Approving or refusing somebody, offering a computer publicly,\n'
        '  revoking sharers, and resets stay owner-only in the web app.)')]),
     ("S5", SKILL, "under",
@@ -704,9 +704,13 @@ MUTANTS = [
     ("S7", SKILL, "under",
      "⛔ the disclosure bullet loses ANSWERING, so the file describes two of the "
      "three ways this account reaches past itself",
+     # ⭐ REPOINTED IN 7.9-5, which corrected "they are told" to the hedged truth
+     # (delivery depends on the asker's own notification settings). Same mutant:
+     # the disclosure bullet loses ANSWERING.
      [('**Answering** somebody lets a stranger run research on the user\'s own\n'
        '  computer, exactly as a pair code would, and a "no" spends that person\'s week —\n'
-       '  they are told, and giving them the pair code is still the way back. ',
+       '  the app tries to tell them (their own notification settings decide), and giving\n'
+       '  them the pair code is still the way back. ',
        '')]),
     ("S8", SKILL, "over",
      "⛔ the file stops exempting the private direction, so hiding a computer "

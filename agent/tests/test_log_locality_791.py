@@ -37,7 +37,6 @@ import logging
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
 
 from facade import cli, config
 

@@ -280,29 +280,32 @@ MUTANTS = [
     ("P2", BRIDGE, "under",
      "⛔⛔ `truncated` IS DROPPED and the list silently becomes \"some of them\" "
      "wearing the shape of \"all of them\"",
-     [('            self._json(200, {"devices": devices if isinstance(devices, list) else [],\n'
-       '                             "truncated": bool(body.get("truncated"))})',
+     [('            self._json(200, {\n                "devices": [{k: d[k] for k in _PUBLIC_DEVICE_KEYS if k in d}\n                            for d in rows if isinstance(d, dict)],\n'
+       '                "truncated": bool(body.get("truncated"))})',
        '            self._json(200, {"devices": devices if isinstance(devices, list) else []})')]),
     ("P3", BRIDGE, "over",
      "`truncated` is inverted, so the caption cries wolf on every ordinary list "
      "and is silent on the one that is short",
-     [('                             "truncated": bool(body.get("truncated"))})',
+     [('                "truncated": bool(body.get("truncated"))})',
        '                             "truncated": not body.get("truncated")})')]),
     ("P4", BRIDGE, "over",
      "⛔⛔ THE PUBLIC ROW GOES THROUGH `_decorate_devices`. Three answers come "
      "back from ABSENT fields — owned from a missing ownerUid, selected from an "
      "id under another key, and online OVERWRITING the liveness the route "
      "computed correctly. Every one of them is shaped like a real answer",
-     [('            devices = body.get("devices")\n'
-       '            self._json(200, {"devices": devices if isinstance(devices, list) else [],',
-       '            devices = body.get("devices")\n'
-       '            if isinstance(devices, list):\n'
-       '                self._decorate_devices(devices, sess.uid, None)\n'
-       '            self._json(200, {"devices": devices if isinstance(devices, list) else [],')]),
+     # ⭐ REPOINTED IN 7.9-5, when the browse relay gained its own allow-list
+     # prune. Same mutant: the OWN-machine decorator is applied to strangers'
+     # rows, which invents `owned`/`selected` and overwrites the liveness the
+     # route computed.
+     [('            rows = body.get("devices")\n'
+       '            rows = rows if isinstance(rows, list) else []',
+       '            rows = body.get("devices")\n'
+       '            rows = rows if isinstance(rows, list) else []\n'
+       '            self._decorate_devices(rows, sess.uid, None)')]),
     ("P5", BRIDGE, "under",
      "a non-list body reaches the clients unchecked, so a malformed reply is a "
      "traceback in a loop rather than an empty list",
-     [('            self._json(200, {"devices": devices if isinstance(devices, list) else [],',
+     [('            self._json(200, {\n                "devices": [{k: d[k] for k in _PUBLIC_DEVICE_KEYS if k in d}\n                            for d in rows if isinstance(d, dict)],',
        '            self._json(200, {"devices": devices,')]),
     ("P6", CLI, "under",
      "⛔ THE ID LEAVES THE PUBLIC ROW, so the one thing on it that is unique — and "
@@ -667,8 +670,8 @@ MUTANTS = [
      "⛔ THE PARENTHETICAL TELLS THE MODEL SHARING IS OWNER-ONLY IN THE WEB APP "
      "AGAIN, so it refuses the verbs it now has",
      [("""  name a topic. (For a computer they OWN they can also answer the people asking
-  for it and set whether strangers can find it at all. Revoking a sharer and
-  resetting a pair code stay in the web app.)""",
+  for it and set whether strangers can find it at all. Unlinking their own
+  machine issues it a new pair code. Revoking one sharer stays in the web app.)""",
        """  name a topic. (Sharing a device with other people, revoking sharers, and resets
   stay owner-only in the web app.)""")]),
     ("S6", SKILL, "under",

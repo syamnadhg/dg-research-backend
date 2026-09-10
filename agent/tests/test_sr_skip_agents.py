@@ -71,8 +71,16 @@ def test_questions_about_agents_are_not_skip_orders():
 def test_device_phrasings_with_agent_names_stay_device_verbs():
     # "remove claude's laptop" must reach the device-remove CONFIRM, and a
     # device named with an agent word must never silently drop the P2 agent.
+    # ⛔⛔ THIS GUARD USED TO ASSERT `"device" in lines` AND THAT MEASURED THE
+    # COPY, NOT THE ROUTING. The only reason it passed was that the old confirm
+    # happened to contain the word — "an owner's DEVICE can re-pair with its
+    # code" — which is the false sentence 7.9-5 deleted. Rewording a confirm
+    # turned a routing guard red while the routing was correct. It now pins the
+    # confirm it must be, and the machine it must name.
     argv, lines = sr._nl_resolve("remove claude's laptop")
-    assert argv is None and "device" in " ".join(lines).lower()
+    assert argv is None
+    assert lines == [sr._NL_CONFIRMS["device-remove"].format(
+        name="“claude's laptop”")]
     _not_skip("remove the claude-pc device")
 
 

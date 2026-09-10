@@ -74464,7 +74464,17 @@ def run_visibility(value: str, ignored_topic: "str | None" = None) -> int:
     # like the argparse misparse having gone unnoticed.
     if ignored_topic:
         print(f"  {_c(_DIM, 'Ignoring the topic — --visibility only changes a setting.')}")
-        print(f"  {_c(_DIM, '     To research it:')}  {_c(_BOLD, f'{_PROG} \"{ignored_topic}\"')}")
+        # ⛔⛔ THE QUOTED TOPIC IS BUILT OUTSIDE THE f-STRING, and that is not
+        # style. Nesting the same quote character AND a backslash inside an
+        # f-string is PEP 701 syntax — legal from 3.12, a SyntaxError on 3.11 —
+        # and both pyprojects declare `requires-python = ">=3.11"`. CI's
+        # correctness lint floor runs ruff at `target-version = "py311"`, so this
+        # ONE LINE had been failing the whole backend gate: red on every push
+        # from before 7.9-0 through 7.9-4, six waves reported as verified by a
+        # check that never went green. Found 2026-09-09 while running the same
+        # command CI runs.
+        _quoted = '"' + ignored_topic + '"'
+        print(f"  {_c(_DIM, '     To research it:')}  {_c(_BOLD, f'{_PROG} {_quoted}')}")
         print()
 
     device_id = load_device_id()

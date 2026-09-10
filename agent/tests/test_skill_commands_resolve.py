@@ -83,7 +83,11 @@ def test_skill_within_sanity_bound():
     # Dropping those to stay under a number is how this file's own note above
     # says reliability was lost the last time it was trimmed. The bound still
     # catches unbounded growth; it is not a trim mandate and not a target.
-    # ⛔ RAISED 480 → 510 IN 7.9-3, DELIBERATELY AND ONCE. The owner verbs added
+    # ⛔⛔ THE COMMENT AND THE NUMBER DISAGREED. This note said 510 while the
+    # assertion below said 525 — one of them was edited and the other was not,
+    # so a reader checking "how much headroom is left" got the wrong answer by
+    # fifteen lines. The assertion is the truth and the note now names it.
+    # ⛔ RAISED 480 → 525 ACROSS 7.9-3 AND 7.9-4, DELIBERATELY. The owner verbs added
     # six intent rows and put three new commands into all THREE places this file
     # enumerates confirms — a row alone was not enough last wave, and one of
     # those lists ends "everything else runs on a clear request", so a name

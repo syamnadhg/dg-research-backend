@@ -714,10 +714,23 @@ def test_the_skill_no_longer_reserves_these_verbs_to_the_web_app():
 
 
 def test_the_skill_still_reserves_what_really_is_web_app_only():
-    """⛔ Revoking a sharer and resetting a pair code are NOT in this wave, and
-    the greeting is the only place that says where they live."""
+    """⛔ Revoking ONE sharer is still web-app-only, and the greeting is the only
+    place that says where it lives.
+
+    ⛔⛔ AND HALF OF WHAT THIS USED TO ASSERT STOPPED BEING TRUE IN 7.9-5. The
+    sentence it pinned was "revoking a sharer and resetting a pair code stay in
+    the web app". The first half holds. The second does not: an owner-unlink
+    from chat ROTATES the machine's pair code and now hands the new one back, so
+    chat does produce a fresh code — just not through Reset, which is still the
+    web app's. A guard on the old wording would have held a sentence that had
+    become misleading about the one thing this wave was correcting, so it pins
+    the two facts separately instead of the sentence that used to carry both."""
     low = " ".join(_skill().lower().split())
-    assert "revoking a sharer and resetting a pair code stay in the web app" in low
+    assert "revoking one sharer stays in the web app" in low
+    # chat CAN produce a new code, and only this way
+    assert "unlinking their own machine issues it a new pair code" in low
+    # …and the blanket claim is gone
+    assert "resetting a pair code stay in the web app" not in low
 
 
 def test_the_skill_warns_that_publishing_can_expose_the_owners_name():

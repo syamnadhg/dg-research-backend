@@ -61,7 +61,7 @@ ROW = {"deviceId": "dev-a1", "label": "Studio PC", "osFamily": "macos",
 def test_browse_forwards_to_the_web_route_and_relays_the_rows(live, monkeypatch):
     seen = {}
 
-    def _get(sess, path, params=None):
+    def _get(sess, path, params=None, **_kw):
         seen["path"] = path
         return 200, {"devices": [ROW], "truncated": False}
 
@@ -73,7 +73,7 @@ def test_browse_forwards_to_the_web_route_and_relays_the_rows(live, monkeypatch)
 
 def test_browse_relays_truncated(live, monkeypatch):
     monkeypatch.setattr(bridge, "_fe_api_get",
-                        lambda s, p, params=None: (200, {"devices": [ROW], "truncated": True}))
+                        lambda s, p, params=None, **_kw: (200, {"devices": [ROW], "truncated": True}))
     assert requests.get(live[0] + "/devices/public").json()["truncated"] is True
 
 
@@ -86,7 +86,7 @@ def test_browse_never_decorates_a_public_row(live, monkeypatch):
     live_base, sel = live
     sel["v"] = "dev-a1"
     monkeypatch.setattr(bridge, "_fe_api_get",
-                        lambda s, p, params=None: (200, {"devices": [dict(ROW)],
+                        lambda s, p, params=None, **_kw: (200, {"devices": [dict(ROW)],
                                                          "truncated": False}))
     row = requests.get(live_base + "/devices/public").json()["devices"][0]
     assert row["online"] is True, "the route's liveness must survive"
@@ -95,7 +95,7 @@ def test_browse_never_decorates_a_public_row(live, monkeypatch):
 
 def test_browse_coerces_a_missing_or_wrong_shaped_list(live, monkeypatch):
     monkeypatch.setattr(bridge, "_fe_api_get",
-                        lambda s, p, params=None: (200, {"devices": "nope"}))
+                        lambda s, p, params=None, **_kw: (200, {"devices": "nope"}))
     body = requests.get(live[0] + "/devices/public").json()
     assert body == {"devices": [], "truncated": False}
 
@@ -149,7 +149,7 @@ def test_requests_forwards_and_keeps_the_two_halves_apart(live, monkeypatch):
     """
     seen = {}
 
-    def _get(sess, path, params=None):
+    def _get(sess, path, params=None, **_kw):
         seen["path"] = path
         return 200, {
             "incoming": [{"deviceId": "dev-mine", "deviceLabel": "My Mac",
@@ -196,7 +196,7 @@ def test_requests_refuses_a_non_list_half(live, monkeypatch):
 def test_ask_forwards_the_device_id(live, monkeypatch):
     seen = {}
 
-    def _post(sess, path, payload):
+    def _post(sess, path, payload, **_kw):
         seen.update(path=path, payload=payload)
         return 200, {"ok": True, "status": "pending"}
 
@@ -214,7 +214,7 @@ def test_ask_refuses_an_empty_device_id(live):
 
 def test_ask_relays_a_refusal_with_its_code_and_wait(live, monkeypatch):
     monkeypatch.setattr(bridge, "_fe_api_post",
-                        lambda s, p, b: (429, {"error": "rate_limited",
+                        lambda s, p, b, **_kw: (429, {"error": "rate_limited",
                                                "retryAfterMs": 900_000}))
     r = requests.post(live[0] + "/device/ask", json={"deviceId": "dev-a1"})
     assert r.status_code == 429
@@ -245,7 +245,7 @@ def test_ask_keeps_the_strangers_id_out_of_the_uploadable_log(live, monkeypatch)
     old = logger.level
     logger.setLevel(logging.INFO)
     try:
-        monkeypatch.setattr(bridge, "_fe_api_post", lambda s, p, b: (200, {"ok": True}))
+        monkeypatch.setattr(bridge, "_fe_api_post", lambda s, p, b, **_kw: (200, {"ok": True}))
         requests.post(live[0] + "/device/ask", json={"deviceId": "dev-secret-99"})
     finally:
         logger.removeHandler(sink)
@@ -271,8 +271,8 @@ def test_a_revoked_session_is_401_not_502(live, monkeypatch, verb, path, body):
     # wire and nothing read it.
     dead = (0, {"reason": "revoked",
                 "error": "this agent's session was rejected — run login again"})
-    monkeypatch.setattr(bridge, "_fe_api_get", lambda s, p, params=None: dead)
-    monkeypatch.setattr(bridge, "_fe_api_post", lambda s, p, b: dead)
+    monkeypatch.setattr(bridge, "_fe_api_get", lambda s, p, params=None, **_kw: dead)
+    monkeypatch.setattr(bridge, "_fe_api_post", lambda s, p, b, **_kw: dead)
     r = getattr(requests, verb)(live[0] + path, json=body)
     assert r.status_code == 401, path
     assert r.json()["reason"] == "revoked"
@@ -285,8 +285,8 @@ def test_a_revoked_session_is_401_not_502(live, monkeypatch, verb, path, body):
 ])
 def test_an_unreachable_web_app_is_still_502(live, monkeypatch, verb, path, body):
     down = (0, {"error": "could not reach https://app.test (ConnectionError)"})
-    monkeypatch.setattr(bridge, "_fe_api_get", lambda s, p, params=None: down)
-    monkeypatch.setattr(bridge, "_fe_api_post", lambda s, p, b: down)
+    monkeypatch.setattr(bridge, "_fe_api_get", lambda s, p, params=None, **_kw: down)
+    monkeypatch.setattr(bridge, "_fe_api_post", lambda s, p, b, **_kw: down)
     r = getattr(requests, verb)(live[0] + path, json=body)
     assert r.status_code == 502, path
 

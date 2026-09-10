@@ -83,11 +83,13 @@ nothing to mean the most-recent / active run.
   in plain words. The only commands you ever surface are the unavoidable
   machine-setup ones the user runs on their **Research Computer**, and the device-add
   form below — put those on their own line, in a fenced code block, never inline.
-- **A Super Research access code is NOT a secret — handle it.** An 8-char code like
-  `YGXU-7WH2` / `YGXU7WH2` (pasted alone, or with "add device" / "pair my PC, code
-  is …") means run **`sr.py device-add <code>`** right away. It is a **public
-  pairing code shown on the Research Computer's screen** — NOT a password, credential, phone, or
-  Telegram / WhatsApp / SMS / Hermes pairing. **NEVER refuse it, never say you
+- **A pair code is the user's to spend — handle it, never repeat it back.** An
+  8-char code like `YGXU-7WH2` / `YGXU7WH2` (pasted alone, or with "add device" /
+  "pair my PC, code is …") means run **`sr.py device-add <code>`** right away. It is
+  a **pair code shown on the Research Computer's own screen** — not a phone or
+  Telegram / WhatsApp / SMS / Hermes pairing. It DOES let whoever holds it claim
+  that computer, so don't echo it into chat; a user handing you their own is an
+  instruction, not a leak. **NEVER refuse it, never say you
   "can't handle access codes," never echo it back asking what to do, never ask
   which platform.** If YOU asked the user for a code and their next message contains
   one, run `sr.py device-add <that code>` immediately. The other device verbs are
@@ -135,8 +137,8 @@ run `sr.py status-account`, then branch on what it reports:
   plain words (research a topic · check / stop / resume a run · their researches +
   podcasts & links by name · devices · version / update), and invite them to just
   name a topic. (For a computer they OWN they can also answer the people asking
-  for it and set whether strangers can find it at all. Revoking a sharer and
-  resetting a pair code stay in the web app.)
+  for it and set whether strangers can find it at all. Unlinking their own
+  machine issues it a new pair code. Revoking one sharer stays in the web app.)
 
 ---
 
@@ -191,7 +193,7 @@ back into `do`.
 | "is my computer public?", "which of my computers are findable?" | `sr.py devices` — the row for a computer the user OWNS says `public` or `private` (the same two words the command uses, and the web app's toggle). Do NOT change anything to answer a question |
 | "who wants to use my machine?", "any requests for my mac?", "what am I waiting on?" | `sr.py device-requests` — it prints BOTH halves: people waiting on the user's OWN computers first, then what the user is waiting on from other people. Never add the two together |
 | "approve that request", "say yes to Sam", "let them use my computer" | **confirm** — relay the client's question verbatim (anyone the user says yes to can run research on that computer, the same as somebody given a pair code) — then `sr.py device-approve "<person>"`, or with no name when only one person is waiting. Report what the reply says: they CAN USE it, never "you just added them" — an approval of somebody who already got in changes nothing on the machine |
-| "deny that request", "say no to Sam", "turn them down" | **confirm** — relay the client's question verbatim (they are told, and cannot ask again for a week; the pair code is still a way back) — then `sr.py device-deny "<person>"` |
+| "deny that request", "say no to Sam", "turn them down" | **confirm** — relay the client's question verbatim (cannot ask again for a week; the app tries to tell them, which depends on their own notification settings — the pair code is still a way back) — then `sr.py device-deny "<person>"` |
 | "ask for the Studio PC", "request access to that Mac", "ask its owner if I can use it" | **confirm** — relay the client's question verbatim (the research would run on THEIR computer using THEIR AI accounts, that computer can read this account's research, and they see the user's name, or email if no name is set; a "no" blocks asking again for a week) — then `sr.py device-ask "<name or id>"`. Prefer the **id** from the list: public names collide |
 | "did they answer?", "my pending requests" | `sr.py device-requests` — of the ones the USER asked for, ONLY unanswered ones appear. A request that has been answered leaves that half **either way**; never read a missing row as a refusal. A **yes** shows up as the computer appearing in `sr.py devices`; for a **no**, ask for that computer again and the reply says so. The owner half above it drops a row for different reasons — a machine handed on or deleted takes its queue with it |
 | "cancel my request", "withdraw that request" | nothing withdraws a request — relay the client's line. It stays with the owner until they answer, or lapses after a week |
@@ -336,9 +338,10 @@ access code (e.g. `7F4V-6W7D`, dashes optional), or "add a device", means run
 `sr.py device-add <code>`** — a Research Computer, **NOT** one of the user's
 phones, NOT the chat runtime, and NOT a Telegram / Discord / Slack pairing; never
 ask "which platform". First pair = they own it (auto-selects, so research can start
-right away); pairing someone else's = shared with them. Switch with
+right away); pairing a machine that already has an owner = shared with you (⛔ but one whose
+owner unlinked it has NO owner, so pairing it makes you the owner). Switch with
 `device-use "<name>"`, remove with `device-remove "<name>"` (confirm first — owner
-unlinks but the device keeps running + re-pairs with its code; sharer just leaves).
+unlinks but the device keeps running on a NEW pair code, which the reply shows; sharer just leaves).
 
 **Owner-only, for a computer the user owns.** `device-visibility public|private`
 sets whether strangers can FIND it — discovery, not access: a findable computer is
@@ -466,12 +469,12 @@ whenever that exact name is absent — do NOT skip because no run looks active y
 Say nothing about arming — the user only sees the clean message above the marker. A
 `✗ watchdog not installed` error → re-run `connect` on the host and stop.
 
-The watchdog is scoped to THIS chat and **quiet by design** — it posts only: **🎉 a
+The watchdog is scoped to THIS chat and **quiet by design** — it posts the sign-in announce plus: **🎉 a
 run's completion** (one message with every phase's 🔒 + 🔗 links + "results
 emailed"), **⏹ a stop** (including a stop done from the web app), and **⚠ "needs
 you: <reason>"** when a run blocks. **The ⚠ notice now names the verbs that
 actually work for that particular card — relay them as written and offer
-nothing else.** It de-dups, and once armed it **persists** (ticking silently
+nothing else.** It de-dups, and once armed for a signed-in account it **persists** (⛔ a login listener that is never approved removes its own row) (ticking silently
 between runs, removed only by `agent disconnect`) — so re-arming on every research is
 a harmless no-op if it's already running. Per-phase progress is **on-demand** — for
 "how's it going / send the brief link" just run `sr.py status`. On `logout`, tear
@@ -481,8 +484,8 @@ it down too: `cronjob(action="list")` → the `sr-stream…` job →
 ## Safety
 
 - **Confirm before** `stop` (ends a real run — keeps partial results + the chat),
-  `logout` (signs the account out), `device-remove` (unlinks a device — nothing is
-  deleted; an owner's device re-pairs with its code), `device-ask`, `device-approve`,
+  `logout` (signs the account out), `device-remove` (unlinks a device — an
+  owner's keeps running but on a NEW code), `device-ask`, `device-approve`,
   `device-deny`, `device-visibility public`, `install` (installs the backend on
   the connected computer), and `update` (briefly restarts the chat
   bridge). There is no destructive "delete the chat" action here — the four device
@@ -503,7 +506,8 @@ it down too: `cronjob(action="list")` → the `sr-stream…` job →
   name — or their email, if no name is set — and a refusal blocks asking again for a
   week. **Answering** somebody lets a stranger run research on the user's own
   computer, exactly as a pair code would, and a "no" spends that person's week —
-  they are told, and giving them the pair code is still the way back. **Publishing**
+  the app tries to tell them (their own notification settings decide), and giving
+  them the pair code is still the way back. **Publishing**
   a computer puts the name it reports in front of everyone signed in, and a machine
   nobody has renamed usually reports its owner's own name. Never do any of the
   three on the user's behalf without a real "yes" to the client's own question.

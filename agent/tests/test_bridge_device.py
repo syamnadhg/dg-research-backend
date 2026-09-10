@@ -493,7 +493,7 @@ def test_researches_list_redacts_tokenized_audio_url(live):
 def test_device_pair_forwards_and_autoselects_first_device(live, monkeypatch):
     base, sel = live
     calls = {}
-    def fake_fe(sess, path, payload):
+    def fake_fe(sess, path, payload, **_kw):
         calls["path"], calls["payload"] = path, payload
         return 200, {"ok": True, "action": "initial-pair", "deviceId": "dev-n"}
     monkeypatch.setattr(bridge, "_fe_api_post", fake_fe)
@@ -510,7 +510,7 @@ def test_device_pair_keeps_existing_selection(live, monkeypatch):
     base, sel = live
     sel["v"] = "dev-a"  # the user already chose a device — don't stomp it
     monkeypatch.setattr(bridge, "_fe_api_post",
-                        lambda s, p, b: (200, {"ok": True, "action": "share-claim", "deviceId": "dev-x"}))
+                        lambda s, p, b, **_kw: (200, {"ok": True, "action": "share-claim", "deviceId": "dev-x"}))
     body = requests.post(base + "/device/pair", json={"code": "AAAAAAAA"}).json()
     assert body["selected"] is False and sel["v"] == "dev-a"
 
@@ -518,7 +518,7 @@ def test_device_pair_keeps_existing_selection(live, monkeypatch):
 def test_device_pair_relays_claim_errors(live, monkeypatch):
     base, _sel = live
     monkeypatch.setattr(bridge, "_fe_api_post",
-                        lambda s, p, b: (429, {"error": "rate_limited", "retryAfterMs": 9000}))
+                        lambda s, p, b, **_kw: (429, {"error": "rate_limited", "retryAfterMs": 9000}))
     r = requests.post(base + "/device/pair", json={"code": "AAAAAAAA"})
     assert r.status_code == 429
     assert r.json() == {"error": "rate_limited", "retryAfterMs": 9000}
@@ -528,7 +528,7 @@ def test_device_remove_clears_dangling_selection(live, monkeypatch):
     base, sel = live
     sel["v"] = "dev-a"
     monkeypatch.setattr(bridge, "_fe_api_post",
-                        lambda s, p, b: (200, {"ok": True, "action": "owner-unlinked"}))
+                        lambda s, p, b, **_kw: (200, {"ok": True, "action": "owner-unlinked"}))
     body = requests.post(base + "/device/remove", json={"deviceId": "dev-a"}).json()
     assert body["action"] == "owner-unlinked"
     assert sel["v"] is None  # no stale selection pointing at the removed device
@@ -538,7 +538,7 @@ def test_device_remove_other_device_keeps_selection(live, monkeypatch):
     base, sel = live
     sel["v"] = "dev-a"
     monkeypatch.setattr(bridge, "_fe_api_post",
-                        lambda s, p, b: (200, {"ok": True, "action": "left-shared"}))
+                        lambda s, p, b, **_kw: (200, {"ok": True, "action": "left-shared"}))
     requests.post(base + "/device/remove", json={"deviceId": "dev-other"})
     assert sel["v"] == "dev-a"
 

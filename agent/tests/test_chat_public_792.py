@@ -478,9 +478,15 @@ def test_the_skill_no_longer_says_sharing_is_owner_only_in_the_web_app():
         "would refuse the verbs it now has")
     assert "answer the people asking" in low
     assert "set whether strangers can find it" in low
-    # Revoking a sharer and resetting a pair code are STILL web-app only, and the
-    # greeting is the only place that says so.
-    assert "revoking a sharer and resetting a pair code stay in the web app" in low
+    # ⛔⛔ HALF OF THIS STOPPED BEING TRUE IN 7.9-5, and the identical assertion
+    # stood in `test_chat_owner_793.py` — two files pinning one sentence, which
+    # is how the sentence outlived the fact. Revoking ONE sharer is still
+    # web-app only. "Resetting a pair code" is not the whole story any more: an
+    # owner-unlink from chat rotates the machine's code and hands the new one
+    # back. Reset itself is still the web app's, and that is what is pinned.
+    assert "revoking one sharer stays in the web app" in low
+    assert "unlinking their own machine issues it a new pair code" in low
+    assert "resetting a pair code stay in the web app" not in low
 
 
 def test_the_capability_line_the_fallback_prints_names_the_new_surface():

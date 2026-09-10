@@ -47,6 +47,57 @@ def code_only(src: str) -> str:
     return "".join(lines)
 
 
+def ts_code_only(src: str) -> str:
+    """TypeScript source with `//` and `/* */` comments blanked IN PLACE.
+
+    ⛔⛔ `code_only` CANNOT DO THIS AND SILENTLY DID NOTHING. It runs Python's
+    `tokenize`, which raises `TokenError` on a `.ts` file, and its except clause
+    returns the source UNCHANGED — so a guard reading a route with `code_only`
+    was searching 268 live `//` comment lines in `claim/route.ts` and 222 in
+    `unpair-self/route.ts` while its docstring said "with comments blanked".
+    Measured in 7.9-5's cross-verify round: a commented-out `error: "…"` counts
+    as an emitted code, so deleting a real one keeps the guard green.
+
+    ⛔ BLANKED IN PLACE, same contract as `code_only` — byte offsets and line
+    numbers are preserved so slicing still works. String literals are respected
+    so a `//` inside a URL is not mistaken for a comment.
+    """
+    out = list(src)
+    i, n = 0, len(src)
+    quote = None
+    while i < n:
+        c = src[i]
+        if quote:
+            if c == "\\":
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c in "\"'`":
+            quote = c
+            i += 1
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "/":
+            while i < n and src[i] != "\n":
+                out[i] = " "
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "*":
+            while i < n and not (src[i] == "*" and i + 1 < n and src[i + 1] == "/"):
+                if src[i] != "\n":
+                    out[i] = " "
+                i += 1
+            for _ in range(2):
+                if i < n:
+                    out[i] = " "
+                    i += 1
+            continue
+        i += 1
+    return "".join(out)
+
+
 @pytest.fixture(autouse=True)
 def _no_real_fe_posts(monkeypatch):
     """⛔⛔ NO TEST IN THIS SUITE MAY POST TO THE REAL WEB APP.

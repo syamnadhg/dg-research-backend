@@ -1231,6 +1231,137 @@ _LIST_FAILURES = {
                       "about your account changed",
 }
 
+# ⛔⛔ THE ROUTE WITH THE MOST WAYS TO FAIL HAD NO TABLE AT ALL. `device remove`
+# printed `_err(res)` — the web app's own identifier, unwrapped — so somebody
+# whose unlink was REFUSED to protect them read "couldn't remove device:
+# rotation_failed". This file did not even borrow the wrong table, as the chat
+# client did; it borrowed nothing.
+#
+# ⛔ `rotation_failed` IS NOT AN ERROR, IT IS A SAFETY REFUSAL, and it is the
+# only one here that has to say why. Unlinking leaves the machine ownerless, and
+# the claim route hands ownership to whoever presents a valid code against an
+# ownerless machine — so if the code cannot be rotated first, going ahead would
+# publish the computer to whoever already holds the old one. The route declines
+# and writes nothing, which is the part worth telling somebody.
+#
+# `rate_limited` is absent on purpose: its wait comes from `retryAfterMs` on the
+# reply, exactly as `_list_refusal` does it, and guessing a window beside a
+# number the server already sent is the thing this file has twice been bitten by.
+_UNLINK_FAILURES = {
+    # ⛔⛔ NOT "nothing was changed", WHICH IS WHAT IT SAID. The route deletes the
+    # device's pending customToken BEFORE it attempts the rotation and only then
+    # returns this, so an unlink stopping here has already destroyed a handoff.
+    # What is true and useful is narrower: the machine is still yours.
+    "rotation_failed":
+        "its pair code would not change, and unlinking without a fresh one would "
+        "leave the computer claimable by anyone holding the old one — so it is "
+        "still linked to this account. Try again in a moment",
+    "not_authorized": "that computer isn't linked to this account, so there is "
+                      "nothing to unlink",
+    "device_not_found": "that computer no longer exists — nothing to unlink",
+    "unauthorized": "this agent's sign-in was refused — run login again",
+    # ⛔ NOT "no id was given" — the bridge refuses an empty id itself, so the only
+    # way this arrives is an id the app rejected as malformed.
+    "deviceId_missing": "the app did not recognise that computer id — run:  "
+                        "agent device list",
+    "deviceId_mismatch": "that request named two different computers — run:  "
+                         "agent device list",
+    "auth_delete_failed": "the app could not finish retiring that computer — "
+                          "nothing was changed, so it is safe to try again",
+    "internal_error": "the app hit a problem of its own — nothing about your "
+                      "account changed",
+}
+
+
+# The CLAIM route's twelve codes. `device add` printed `_err(res)` raw, so every
+# one of them reached the terminal as an identifier — including the two that are
+# recoverable and say how.
+#
+# ⭐ `pair_bootstrap_failed` EARNS ITS SENTENCE: the device DID pair; the machine
+# just did not collect its token, and re-entering the SAME code finishes it. As
+# a bare code it reads like a dead end, which would send somebody off to reset a
+# code they do not need to reset.
+_PAIR_FAILURES = {
+    # ⛔ THE ALPHABET EXCLUDES I, L, O, 0 AND 1 — the five that get confused.
+    "invalid_code_format": "pair codes are 8 characters and never use I, L, O, 0 "
+                           "or 1 — check those",
+    "code_not_found": "that code didn't match any device — re-check it on the "
+                      "device's screen",
+    # ⛔ Reset is an owner-only WEB control and no agent command performs it.
+    "code_expired": "that code expired — run:  superresearch --pair   on the "
+                    "machine for a fresh one",
+    "not_previous_owner": "that device is waiting for its previous owner to "
+                          "re-pair — only they can",
+    # ⛔⛔ ASKING AGAIN IS REFUSED ON EVERY PATH — the blocklist is consulted by
+    # claim, by the ask route and by approve, and only a Reset or an owner-unlink
+    # clears it. The remedy that used to stand here could not work.
+    "revoked_sharer": "the owner removed your access to that computer, and re-using "
+                      "a code or asking again cannot change that — only they can",
+    "share_cap_reached": "that device is shared with as many people as it can hold "
+                         "— ask the owner to remove someone first",
+    # ⭐ RECOVERABLE, WITH ITS DEADLINE: the half-paired document carries a
+    # five-minute TTL, after which the same code answers code_not_found.
+    "pair_bootstrap_failed": "it paired, but the computer did not finish picking up "
+                             "its token — run the same command again with the same "
+                             "code within a few minutes; after that, run:  "
+                             "superresearch --pair   on the machine",
+    # ⛔ A FRESH CODE CANNOT RESTORE THE MISSING FIELD — only the handshake writes
+    # it, so resetting loops forever on this same error.
+    "device_secret_missing": "that machine did not finish its side of the handshake "
+                             "— run:  superresearch --pair   on it again",
+    "unauthorized": "this agent's sign-in was refused — run login again",
+    "invalid_json": "that request didn't reach the app in one piece — try again",
+    "internal_error": "the app hit a problem of its own — nothing was paired",
+}
+
+
+def _pair_refusal(err: str, retry_after_ms=None) -> str:
+    """The sentence for one refusal from the claim route.
+
+    `rate_limited` is not in the table above for the usual reason: the wait
+    arrives on the reply as `retryAfterMs`, so it is read rather than guessed.
+    """
+    if err == "rate_limited":
+        mins = _minutes_from_ms(retry_after_ms)
+        if mins is None:
+            return "too many attempts in a row — give it a minute"
+        return ("too many attempts in a row — try again in about "
+                f"{mins} minute{'' if mins == 1 else 's'}")
+    said = _PAIR_FAILURES.get(err)
+    if said is not None:
+        return said
+    if err.lower().startswith("not signed in"):
+        return "not signed in — run:  agent login"
+    if err.startswith("http_"):
+        return (f"the app answered that with nothing this client can read "
+                f"(HTTP {err[5:]})")
+    return err or "no reason given"
+
+
+def _unlink_refusal(err: str, retry_after_ms=None) -> str:
+    """The sentence for one refusal from the unlink route."""
+    if err == "rate_limited":
+        # ⛔ "ATTEMPTS", NOT "UNLINKED". The route's limiter records an attempt
+        # before it does any work, so five refusals then a sixth call hits this
+        # on ZERO successful unlinks — and telling somebody they unlinked six
+        # machines when they unlinked none is its own small lie.
+        mins = _minutes_from_ms(retry_after_ms)
+        if mins is None:
+            return "too many unlink attempts in a row — give it a minute"
+        return ("too many unlink attempts in a row — try again in about "
+                f"{mins} minute{'' if mins == 1 else 's'}")
+    said = _UNLINK_FAILURES.get(err)
+    if said is not None:
+        return said
+    # The bridge's own refusals are SENTENCES, not codes, and key no row here —
+    # the same fallback pair `_list_refusal` needs for the same reason.
+    if err.lower().startswith("not signed in"):
+        return "not signed in — run:  agent login"
+    if err.startswith("http_"):
+        return (f"the app answered that with nothing this client can read "
+                f"(HTTP {err[5:]})")
+    return err or "no reason given"
+
 
 def _list_refusal(what: str, err: str, retry_after_ms=None) -> str:
     """The sentence for one refusal from a list route.
@@ -1367,7 +1498,9 @@ def cmd_device(args: argparse.Namespace) -> int:
         with b.spinner("Pairing the device"):
             res = _bridge_post("/device/pair", {"code": args.code})
         if res is None or res[0] != 200:
-            print(f"{_NO} couldn't add device: {_err(res)}")
+            body = res[1] if res and isinstance(res[1], dict) else {}
+            print(f"{_NO} couldn't add device: "
+                  f"{_pair_refusal(_err(res), body.get('retryAfterMs'))}")
             return 1
         d = res[1]
         nm = d.get("deviceName") or d.get("deviceId") or "device"
@@ -1375,11 +1508,55 @@ def cmd_device(args: argparse.Namespace) -> int:
         return 0
 
     if getattr(args, "device_command", None) == "remove":
-        res = _bridge_post("/device/remove", {"deviceId": args.deviceId})
+        # ⛔ 50s for the same reason the chat client waits 50: the bridge waits up
+        # to 35 on this route plus a 10s refresh, and giving up first loses the
+        # only copy of the rotated pair code.
+        res = _bridge_post("/device/remove", {"deviceId": args.deviceId},
+                           timeout=50.0)
         if res is None or res[0] != 200:
-            print(f"{_NO} couldn't remove device: {_err(res)}")
+            body = res[1] if res and isinstance(res[1], dict) else {}
+            print(f"{_NO} couldn't remove device: "
+                  f"{_unlink_refusal(_err(res), body.get('retryAfterMs'))}")
             return 1
-        print(f"{_OK} Removed device {args.deviceId}.")
+        body = res[1] if isinstance(res[1], dict) else {}
+        name = body.get("deviceName") or args.deviceId
+        if body.get("action") == "left-shared":
+            # ⛔ THE SHARER BRANCH CARRIES NO `deviceName` — the route omits it
+            # (only the owner branch sends one), so `name` here is the raw device
+            # id and the screen read "Left the shared device dev-a1c9f2." Say the
+            # neutral thing rather than an id nobody recognises.
+            if body.get("deviceName"):
+                print(f"{_OK} Left the shared device {name}.")
+            else:
+                print(f"{_OK} Left that shared device.")
+            return 0
+        print(f"{_OK} Unlinked {name} from this account.")
+        # ⛔⛔ THIS SCREEN SAID NOTHING ABOUT THE CODE AND THAT WAS THE WORSE
+        # HALF. The chat client at least told the person something (which was
+        # false); the terminal printed "Removed device dev-a1." and stopped, so
+        # somebody who unlinked their own machine here was never told that its
+        # pair code had just been rotated out from under them, nor given the new
+        # one — and the new one is the only thing that can re-link the machine.
+        # ⛔ AND IT IS SPELLED OUT AS A CREDENTIAL. On a machine with no owner
+        # the code does not merely let somebody in; it makes them the owner.
+        code = body.get("pairCode")
+        if code:
+            print("  Its pair code changed — the old one no longer works.")
+            print(f"  New pair code: {code}")
+            print("  Anyone who has that code can claim this computer as its "
+                  "owner. Keep it like a password.")
+        else:
+            # ⛔⛔ THIS USED TO SAY "the new one is on the device's own screen" AND
+            # THAT WAS FALSE. `unpair-self/route.ts` says so itself: "the machine
+            # cannot show it either, since the backend only ever learns a code
+            # from the pairing response and cannot read the admin-only entry it
+            # now lives in" — and the rotation has already removed the reader's
+            # ownership, so the reveal refuses them too. There is no lookup to
+            # point at, and inventing one sent people to read a dead code.
+            print("  Its pair code changed and the new one did not come back.")
+            print("  That code cannot be looked up anywhere — this reply was the")
+            print("  only copy. Run:  superresearch --pair   on the machine to use")
+            print("  it again; it joins as a new computer.")
         return 0
 
     dr = _bridge_get("/devices")
@@ -2620,7 +2797,7 @@ def cmd_send_logs(args: argparse.Namespace) -> int:
             # ⛔ SAID, NOT SILENTLY DROPPED. The upload is refused until the row
             # lands, by design; a person who asked for it deserves to know this
             # call was not the one that did it.
-            print(f"    The agent's own log has not gone yet — it can only "
+            print("    The agent's own log has not gone yet — it can only "
                   "follow a bundle that")
             print("    has landed. Ask again with the same code once this shows "
                   "done.")
@@ -2762,7 +2939,7 @@ def cmd_send_logs(args: argparse.Namespace) -> int:
     if agent_log and args.no_wait:
         print("The agent's own log will NOT go on this run: it can only follow "
               "that computer's bundle, and --no-wait does not wait for it. "
-              f"Finish it later with:  agent send-logs --status <CODE> --agent-log")
+              "Finish it later with:  agent send-logs --status <CODE> --agent-log")
     elif agent_log:
         print("It will ALSO include the log from the agent on THIS host — the "
               "program running this command. That is a connection and sign-in "
@@ -2846,7 +3023,7 @@ def cmd_send_logs(args: argparse.Namespace) -> int:
             # after the machine's row lands, and --no-wait is the choice not to wait
             # for that. Sending it anyway would put an object in a folder no row
             # names yet, where the app's Clear-logs could never find it.
-            print(f"    The agent's own log was not sent — it can only go once "
+            print("    The agent's own log was not sent — it can only go once "
                   "that computer's")
             print(f"    bundle has landed. Finish it with:  agent send-logs "
                   f"--status {code} --agent-log")

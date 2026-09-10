@@ -13,7 +13,6 @@ from __future__ import annotations
 import inspect
 import re
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -314,3 +313,38 @@ def test_the_link_mint_is_the_only_caller_that_opts_out():
     lines = src.splitlines()
     block = "\n".join(lines[max(0, sites[0] - 6):sites[0] + 1])
     assert "mintSrLinks" in block, block
+
+def test_every_stub_of_the_json_helpers_tolerates_a_new_argument():
+    """⛔⛔ THIS HELPER HAS GROWN AN ARGUMENT TWICE AND BROKEN THE SUITE BOTH TIMES.
+    7.9-2 added `retry_401` and a dozen unrelated tests went red with TypeError
+    because their stubs had fixed signatures; `conftest.py`'s own comment records
+    it and says "a seam's stub has to be at least as tolerant as the thing it
+    replaces". 7.9-5 added a per-call `timeout` and five more tests went red the
+    same way — the lesson was written down and not enforced.
+
+    ⭐ SO IT IS ENFORCED HERE. Every stub the suite installs over `_fe_api_post`
+    or `_fe_api_get` must accept arbitrary keywords. This reads the SOURCE of
+    every test file rather than calling anything, because the stubs only exist
+    inside their own tests.
+    """
+    import re as _re
+    from pathlib import Path as _P
+
+    offenders = []
+    for f in sorted((_P(__file__).parent).glob("test_*.py")):
+        src = code_only(f.read_text(encoding="utf-8"))
+        for m in _re.finditer(
+                r'setattr\(\s*\w+\s*,\s*"(_fe_api_post|_fe_api_get)"\s*,\s*'
+                r'(lambda [^:]*:|\w+)', src):
+            tail = m.group(2)
+            if tail.startswith("lambda"):
+                if "**" not in tail and "*" not in tail:
+                    offenders.append(f"{f.name}: {tail.strip()}")
+            else:
+                # a named function — find its def and check its parameters
+                d = _re.search(rf"def {_re.escape(tail)}\(([^)]*)\)", src)
+                if d and "**" not in d.group(1) and "*" not in d.group(1):
+                    offenders.append(f"{f.name}: def {tail}({d.group(1)})")
+    assert not offenders, (
+        "these stubs will break the moment the helper grows an argument — add "
+        "`**_kw`:\n  " + "\n  ".join(offenders))

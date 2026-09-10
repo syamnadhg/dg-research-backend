@@ -373,6 +373,36 @@ def _device_is_online(d: dict[str, Any]) -> bool:
     return (time.time() * 1000 - hb) < _DEVICE_ONLINE_MS
 
 
+# ⛔⛔ THE ONLY DEVICE FIELDS THAT MAY LEAVE THIS PROCESS. `list_devices` sends
+# no field mask, so a device row arrives WHOLE — and a never-rotated machine's
+# row still carries a plaintext `pairCode`, which is the credential that claims
+# it (`/api/devices/claim` grants ownership on `ownerUid == null`, and unlink
+# leaves exactly that state). Three routes used to hand a caller the raw row.
+#
+# Curated by CONSUMER, not by taste: `id`/`name`/`hostname`/`machineName` are the
+# label ladder both clients walk (`_device_label`, `_public_label_of`),
+# `owned`/`selected`/`online` are the flags this bridge computes because no
+# client can, and `visibility` is what the publish surfaces read back. Nothing
+# else has a reader. Adding a key here is a decision to publish it; the exact
+# key-set assertions on all three emitters make that decision loud.
+#
+# `_device_descriptor` is deliberately NARROWER than this and stays that way —
+# an error body that says "pick one of these" needs a label and a power state,
+# not a machine's whole shape. It is pinned as a SUBSET rather than rebuilt from
+# this tuple, so widening the list for a device-list consumer can never widen a
+# chat error body behind anyone's back.
+_DEVICE_PUBLIC_KEYS = ("id", "name", "hostname", "machineName",
+                       "owned", "selected", "online", "visibility")
+
+
+# ⛔ THE BROWSE PROJECTION, WHICH IS A DIFFERENT AND NARROWER LIST. These five are
+# what the web app's `toPublicDevice` emits for a machine somebody ELSE owns —
+# an id to ask for, a label, an OS glyph, a power state and whether it is full.
+# Nothing about ownership, nothing about the account's own selection, and no
+# hostname ladder, because none of that is the browsing account's business.
+_PUBLIC_DEVICE_KEYS = ("deviceId", "label", "osFamily", "online", "full")
+
+
 def _device_descriptor(d: dict[str, Any]) -> dict[str, Any]:
     """A minimal, chat-safe device descriptor for a 'pick one' error body — id +
     friendly name + online flag (never tokens/heartbeat internals)."""
@@ -1529,6 +1559,26 @@ def _public_label_of(row: dict[str, Any]) -> str:
 
 _FE_JSON_TIMEOUT = 15
 
+# ⛔⛔ THE UNLINK ROUTE NEEDS LONGER THAN THE SHARED DEFAULT, AND RAISING THE
+# SHARED ONE WAS THE WRONG FIX. `unpair-self` declares `maxDuration = 30` and does
+# real work at the top of it — up to 26 sequential user-tree sweeps on a machine
+# shared with a full cohort, plus a mint, a rotate, a token revoke and an
+# access-request sweep. At 15s the bridge gave up while the route went on to
+# SUCCEED, and the rotated pair code — the only copy that ever exists — was
+# discarded with the timed-out response. Both clients then said the request never
+# landed, the retry answered `not_authorized` because the machine really WAS
+# unlinked, and the ex-owner cannot use the reveal: the machine became
+# permanently un-re-linkable by a timeout. Cross-verify found it in 7.9-5.
+#
+# ⛔ AND MY FIRST FIX RAISED `_FE_JSON_TIMEOUT` ITSELF, WHICH A GUARD CAUGHT AS A
+# REGRESSION — correctly. Both clients wait 30s for the bridge, and past that
+# they do not report a slow web app, they report a bridge that is not running and
+# tell somebody to reinstall a healthy one. A retried generic call has to fit
+# inside that budget: timeout + a 10s token refresh + 1 < 30. So the long wait is
+# PER CALL, on the one route that needs it, and its callers wait longer to match —
+# the same shape `_fe_api_post_bytes` already uses for its 60s upload.
+_FE_UNLINK_TIMEOUT = 35
+
 
 def _fe_json_body(r: "requests.Response") -> dict:
     """The decoded JSON object, or `{}`.
@@ -1593,7 +1643,8 @@ def _fe_api_get(sess: "AccountSession", path: str,
 
 
 def _fe_api_post(sess: "AccountSession", path: str, payload: dict,
-                 retry_401: bool = True) -> tuple[int, dict]:
+                 retry_401: bool = True,
+                 timeout: float = _FE_JSON_TIMEOUT) -> tuple[int, dict]:
     """POST a web-app API route (`{FE_BASE}{path}`) as the signed-in USER —
     the same Bearer-ID-token calls the browser makes. Used for the device
     pair/unpair routes, which MUST go through the app's admin-SDK handlers
@@ -1649,7 +1700,7 @@ def _fe_api_post(sess: "AccountSession", path: str, payload: dict,
                 f"{config.FE_BASE}{path}",
                 json=payload,
                 headers={"Authorization": f"Bearer {token}"},
-                timeout=_FE_JSON_TIMEOUT,
+                timeout=timeout,
             )
         except requests.RequestException as e:
             return 0, {"error": f"could not reach {config.FE_BASE} ({type(e).__name__})"}
@@ -3387,10 +3438,21 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             self._json(200, {"researches": [_redact_doc_media(r) for r in rows]})
 
         def _decorate_devices(self, devs: list[dict[str, Any]], uid: str, selected: str | None):
-            """Add the authoritative owned/selected flags the client can't infer.
+            """Add the authoritative owned/selected flags the client can't infer,
+            then PRUNE each row to `_DEVICE_PUBLIC_KEYS`.
 
             `owned` is computed against THIS session's uid (the CLI/skill route
             through the bridge and can't see sess.uid) — owner vs shared-to.
+
+            ⛔⛔ THE PRUNE IS IN PLACE, NOT A NEW DICT, AND THAT IS LOAD-BEARING.
+            Three of the five callers pass a one-element literal list and then go
+            on to read the ORIGINAL variable — `{"device": match}`, `row.get(
+            "owned")`, `return match` — so a version of this that built fresh
+            rows and returned them would compile, pass its own unit test, and
+            leave every one of those three routes emitting the unpruned row it
+            still held a reference to. The flags are set FIRST and then the row
+            is narrowed, because `owned` is derived from `ownerUid`, which the
+            prune removes.
             """
             for d in devs:
                 d["owned"] = d.get("ownerUid") == uid
@@ -3400,6 +3462,8 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 # with no indication of which machine is actually on, so a user
                 # picks a sleeping one and their research silently never starts.
                 d["online"] = _device_is_online(d)
+                for k in [k for k in d if k not in _DEVICE_PUBLIC_KEYS]:
+                    del d[k]
             return devs
 
         def _devices(self) -> None:
@@ -3546,9 +3610,32 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             status, body = _fe_api_get(sess, "/api/devices/public")
             if not self._fe_relay(status, body, "could not list public computers"):
                 return
-            devices = body.get("devices")
-            self._json(200, {"devices": devices if isinstance(devices, list) else [],
-                             "truncated": bool(body.get("truncated"))})
+            # ⛔⛔ PRUNED HERE TOO, AND IT WAS NOT. This route relayed the web
+            # app's `devices` array BYTE FOR BYTE, so it was the one device-row
+            # emitter in this file with no allow-list of its own. Cross-verify
+            # measured it with a stubbed upstream: a row carrying `pairCode`,
+            # `pollSecretHash`, `syntheticDeviceUid`, `ownerUid`, `sharedWith`,
+            # `people`, `workers` and `queueOwners` came back WHOLE, plaintext
+            # code included, while every other device route in the same sweep
+            # returned nothing.
+            #
+            # ⭐ THE WEB APP'S OWN PROJECTION IS CORRECT TODAY — `toPublicDevice`
+            # is an allow-list of exactly these five fields, and its file says so
+            # in its own header. That is precisely why this is worth having: the
+            # bridge should not be one upstream regression away from publishing a
+            # credential, and a relay that trusts its source is exactly the shape
+            # `list_devices` had before this wave.
+            #
+            # ⛔ THESE ARE THE PUBLIC-LISTING KEYS, NOT `_DEVICE_PUBLIC_KEYS`.
+            # A browse row is a STRANGER'S machine: it carries no `owned`, no
+            # `selected`, no `visibility` and no hostname ladder, and reusing the
+            # own-machine list here would widen it by four fields.
+            rows = body.get("devices")
+            rows = rows if isinstance(rows, list) else []
+            self._json(200, {
+                "devices": [{k: d[k] for k in _PUBLIC_DEVICE_KEYS if k in d}
+                            for d in rows if isinstance(d, dict)],
+                "truncated": bool(body.get("truncated"))})
 
         def _device_requests(self) -> None:
             """Both halves of the access-request queue (`GET
@@ -3690,11 +3777,44 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
 
         def _device_remove(self) -> None:
             """Unlink a device from this account (the chat `device remove`).
-            Forwards to the web app's /api/devices/unpair-self, which branches
-            on the caller's relationship: OWNER → owner-unlink (the device doc
-            + its install stay alive; re-pairable with its code — nothing is
-            destroyed), SHARER → removes themself from sharedWith. The chat
-            client confirms with the user BEFORE calling this."""
+
+            Forwards to the web app's /api/devices/unpair-self, which branches on
+            the caller's relationship. TWO of its three branches are reachable
+            from here: OWNER → `owner-unlinked` (the device doc and its install
+            stay alive, but the pair code is ROTATED first), SHARER →
+            `left-shared`. The third, `retired`, is gated on
+            `callerUid === syntheticDeviceUid` — the machine unpairing ITSELF via
+            `--unpair` — and this bridge always calls with a person's session, so
+            it cannot be reached down this path. That matters because `retired`
+            deletes the device document, the synthetic login and the code entry
+            outright, and neither client has copy for it.
+
+            The pair code rides back now — see the comment block below for what
+            the old copy claimed and why it could not have been true.
+            """
+            # ⛔⛔ THE PAIR CODE RIDES BACK NOW, AND THE OLD COPY WAS A LIE. Both
+            # clients told the person their machine was untouched and its code
+            # still good, which read as: keep the code, use it whenever. Since
+            # 7.7A an owner-unlink ROTATES the code before clearing `ownerUid` —
+            # it has to, because `/api/devices/claim` grants OWNERSHIP to whoever
+            # presents a code against a device with no owner, and unlink produces
+            # exactly that state. So the code the person was told to keep is dead
+            # the instant this returns, and the live one was reachable only from
+            # the machine's own screen. The route has always sent `pairCode` on
+            # the owner branch; this route discarded it, so no client COULD say
+            # the true thing even where its wording was fixed.
+            #
+            # ⛔ RELAYED, NOT DECIDED. `pairCode` is forwarded only when the route
+            # sends one — which is the owner branch alone. A sharer who walks away
+            # must never be handed the code to the machine they just left, and the
+            # route enforces that by omitting it; mirroring the route rather than
+            # branching on `action` here keeps that one decision in one place.
+            #
+            # ⛔ AND THE EXPLANATION IS A `#` COMMENT, NOT PART OF THE DOCSTRING.
+            # The guard that keeps the old sentence out of the tree sweeps CODE
+            # ONLY, and a docstring is a string literal — so an explanation that
+            # quoted the old wording would satisfy the search and leave the sweep
+            # green over a lie. Both files caught themselves doing that here.
             device_id = (self._read_json().get("deviceId") or "").strip()
             if not device_id:
                 self._json(400, {"error": "deviceId is required"})
@@ -3703,7 +3823,11 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             if acct is None:
                 return
             sess, _fs = acct
-            status, body = _fe_api_post(sess, "/api/devices/unpair-self", {"deviceId": device_id})
+            # ⛔ THE LONG WAIT, BECAUSE THIS ROUTE CAN USE ITS WHOLE 30s BUDGET AND
+            # A TIMEOUT HERE THROWS AWAY THE ONLY COPY OF THE NEW PAIR CODE.
+            status, body = _fe_api_post(sess, "/api/devices/unpair-self",
+                                        {"deviceId": device_id},
+                                        timeout=_FE_UNLINK_TIMEOUT)
             if not self._fe_relay(status, body, "unlink failed"):
                 return
             if not body.get("ok"):
@@ -3713,8 +3837,16 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # Don't leave a dangling selection pointing at the removed device.
             if prefs.get_selected_device(sess.uid) == device_id:
                 prefs.clear_selected_device()
-            log.info("device remove: %s (%s)", device_id, body.get("action"))
-            self._json(200, {"ok": True, "action": body.get("action"), "deviceId": device_id})
+            # ⛔ NOT LOGGED, AND THAT IS THE POINT OF SPLITTING THE LINE. The
+            # code is a credential; the log line records that one was issued,
+            # never its value.
+            log.info("device remove: %s (%s, new code %s)", device_id,
+                     body.get("action"), "issued" if body.get("pairCode") else "none")
+            out = {"ok": True, "action": body.get("action"), "deviceId": device_id,
+                   "deviceName": body.get("deviceName")}
+            if body.get("pairCode"):
+                out["pairCode"] = body["pairCode"]
+            self._json(200, out)
 
         def _owned_device(self, fs: FirestoreRest, sess: AccountSession,
                           device_id: str, verb: str) -> dict[str, Any] | None:

@@ -309,6 +309,27 @@ class TestTheHarnessRefusesToScore:
         assert rc != 0
 
 
+# ⛔⛔ MODULE SCOPE AND AUTOUSE, AND BOTH ARE THE FIX. The first version was
+# class-scoped and requested by ONE test, so pytest built it immediately before
+# that test and nothing ran between the snapshot and the comparison — the guard
+# could not fail. Worse, the `git status` version it replaced DID cover this
+# file's other tests, including the six in `TestTheHarnessRefusesToScore` that
+# call `h.main()` and are the recorded incident. Narrowing the mechanism to fix
+# a false positive removed the coverage that mattered.
+#
+# ⭐ MODULE-SCOPED AUTOUSE BRACKETS EVERY TEST IN THE FILE, which is what the
+# docstring always claimed, and it is still indifferent to somebody else's
+# uncommitted edit — which is the false positive the `git status` version had.
+@pytest.fixture(scope="module", autouse=True)
+def _research_py_snapshot():
+    """research.py's bytes around EVERY test in this file — the baseline the
+    restore promise is measured against."""
+    before = (ROOT / "research.py").read_text(encoding="utf-8")
+    yield before
+    assert (ROOT / "research.py").read_text(encoding="utf-8") == before, (
+        "a test in this file left research.py modified")
+
+
 class TestTheHarnessStillRestores:
     """The guards must not have cost the tree-restore promise."""
 
@@ -321,7 +342,34 @@ class TestTheHarnessStillRestores:
 
     # ⛔⛔ THE ONE THAT WOULD HAVE CAUGHT MY OWN MISTAKE. Nothing in this file may
     # leave production source modified, whatever path main() takes.
-    def test_no_test_in_this_file_leaves_research_py_modified(self):
-        out = subprocess.run(["git", "status", "--porcelain", "--", "research.py"],
-                             cwd=ROOT, capture_output=True, text=True).stdout
-        assert out.strip() == "", f"research.py is modified: {out!r}"
+    #
+    # ⛔⛔ AND IT USED TO MEASURE THE WRONG THING. It ran `git status` on
+    # research.py and asserted the file was CLEAN — which is not "this file's
+    # tests left it modified", it is "nobody has an uncommitted change to
+    # research.py". So it went red for any legitimate edit to that file sitting
+    # in the working tree, and green for a harness that had genuinely failed to
+    # restore as long as the damage happened to match HEAD. It fired on an
+    # ordinary one-line fix on 2026-09-09, which is how it was found.
+    #
+    # ⭐ IT NOW MEASURES ITS OWN DOCSTRING: snapshot the bytes before this
+    # class's tests run, compare after. That is exactly what the sibling above
+    # does for one code path, generalised to every path through this file, and
+    # it is indifferent to what else is in the working tree.
+    def test_no_test_in_this_file_leaves_research_py_modified(self, _research_py_snapshot):
+        """The mid-run half. The fixture above asserts the same thing at teardown,
+        which is what actually covers the other tests; this one fails FAST and
+        names the file, so a broken `safe` is reported here rather than as a
+        teardown error after the whole file has run."""
+        assert (ROOT / "research.py").read_text(encoding="utf-8") == _research_py_snapshot, (
+            "a test in this file left research.py modified")
+
+    # ⛔ THE CRASHED-HARNESS CASE THE OLD MECHANISM WAS REACHING FOR, kept and
+    # made specific. Every harness writes an `.inflight` marker before it edits
+    # the tree and removes it in a `finally`; a marker still on disk means a run
+    # died mid-mutation and the tree may be holding a mutant. That signal is the
+    # harness's own, so it cannot be confused with somebody's edit.
+    def test_no_harness_left_an_inflight_marker(self):
+        stranded = sorted(p.name for p in (ROOT / ".mutants").glob("*.inflight"))
+        assert not stranded, (
+            f"a mutation run died mid-flight and may have left a mutant in the "
+            f"tree: {stranded}")
