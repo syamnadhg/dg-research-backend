@@ -436,10 +436,17 @@ MUTANTS = [
      '`run on` goes back to bare, so "which device is my run ON" is treated as a switch and the inventory question it is reaches nothing',
      [('    _dev_verb = re.search(r"\\b(remove|unlink|forget|delete|add|pair|connect|"\n                          r"switch to)\\b|\\brun (?:it |everything )?on\\s+\\S", low)',
        '    _dev_verb = re.search(r"\\b(remove|unlink|forget|delete|add|pair|connect|"\n                          r"switch to|run on)\\b", low)')]),
-    ("X8", SR, "under",
-     '⛔ A BULK REQUEST IS A NAME AGAIN: "remove all my devices" offers to unlink a machine called “all my devices”',
-     [('    return bool(re.fullmatch(\n        rf"(?:all|every|each|both)\\s+(?:my\\s+|the\\s+|of\\s+my\\s+)?"\n        rf"(?:{_MACHINE_NOUNS}|phones?)", (name or "").strip(), re.I))',
-       '    return False')]),
+    # ⛔⛔ X8 IS RETIRED, NOT MOVED — 7.9-5b, 2026-09-10. It mutated the body of
+    # `_is_bulk_machine_phrase`, which has been FOLDED INTO the one predicate
+    # `_names_a_set`: 7.9-5 had added a second answer to the same question and the
+    # two disagreed, and duplication is what produced an equivalent mutant twice
+    # in the Gemini wave. Repointing X8 at the folded predicate would make it a
+    # duplicate of that wave's P1/P2/P3 and S1, and an equivalent mutant is a
+    # harness bug that inflates a score rather than measuring anything.
+    # ⭐ THE PROPERTY IT ASSERTED IS STILL PINNED, in two places:
+    #   · wave795b_bulk_gate_0910_mutants.py  S1  — the unlink call site,
+    #   · agent/tests/test_bulk_gate_0910.py::test_there_is_one_predicate_for_this_question_not_two
+    #     — which asserts the fold kept every shape 7.9-4's gate answered.
     ("X9", SR, "over",
      'the bulk answer becomes "which one?", which hides that unlink takes exactly one machine and the request as made cannot be carried out at all',
      [('            return None, ["I unlink one computer at a time. Ask me to list them and "\n                          "name the one to remove — nothing is removed until you do."]',

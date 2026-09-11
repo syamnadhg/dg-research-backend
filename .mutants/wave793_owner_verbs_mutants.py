@@ -743,11 +743,16 @@ MUTANTS = [
     ("W3", SR, "under",
      "⛔ THE POLITE IMPERATIVE IS READ AS A QUESTION AGAIN, so \"can you make my "
      "mac public\" — the commonest way anybody asks — answers neither verb",
-     [('    _asking_state = (re.match(r"^(is|are|does|do|can|could|who|what|which|how|"\n'
-       '                              r"tell me (?:if|whether)|check)\\b", low)\n'
+     # ⛔ ANCHOR MOVED 7.9-5b: the state question now allows a conversational
+     # lead-in, because `^` alone meant the word "so" turned a read-only question
+     # into an offer to publish an unnamed machine. The mutant is unchanged in
+     # what it asserts — that dropping `_polite_imperative` reads "can you make
+     # my mac public" as a question.
+     [('    _asking_state = (re.match(_NL_LEAD_IN + r"(is|are|does|do|can|could|who|what|"\n'
+       '                              r"which|how|tell me (?:if|whether)|check)\\b", low)\n'
        '                     and not _polite_imperative)',
-       '    _asking_state = re.match(r"^(is|are|does|do|can|could|who|what|which|how|"\n'
-       '                             r"tell me (?:if|whether)|check)\\b", low)')]),
+       '    _asking_state = re.match(_NL_LEAD_IN + r"(is|are|does|do|can|could|who|what|"\n'
+       '                             r"which|how|tell me (?:if|whether)|check)\\b", low)')]),
     ("W4", SR, "over",
      "⛔⛔ A BROWSE WISH ABOUT OTHER PEOPLE\'S MACHINES SILENTLY MAKES YOUR OWN "
      "PRIVATE — \"hide other people\'s computers from me\" acted, with no confirm",

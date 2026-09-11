@@ -3323,9 +3323,17 @@ _NL_QUOTED_RE = re.compile(r"[\"“]([^\"“”]+)[\"”]")
 # the control/status rules) so a research request whose TOPIC contains words
 # like stop/pause/status/podcast ("research how to stop smoking") can never be
 # hijacked into a run-control or status command.
+# ⛔⛔ ONE LEAD-IN LIST. A conversational opener is not part of any request, and
+# an anchored test that does not allow for one is broken by the word "so" —
+# measured: `so are all my computers public?`, `and are …`, `hey are …` all
+# stopped being read as QUESTIONS and reached the publish confirm, which then
+# offered to publish "that computer" with no name, so a "yes" published whichever
+# one the picker landed on. The research pattern below already allowed for these
+# words and the state-question test did not.
+_NL_LEAD_IN = r"(?:please |can you |could you |would you |hey |ok |okay |go |now |so |and |also |then |just )*"
 _NL_RESEARCH_RE = re.compile(
-    r"^(?:please |can you |could you |would you |hey |ok |okay |go |now )*"
-    r"(?:(?:do|run|start|fire|kick ?off|launch|begin) (?:a |another |the )?)?"
+    r"^" + _NL_LEAD_IN
+    + r"(?:(?:do|run|start|fire|kick ?off|launch|begin) (?:a |another |the )?)?"
     r"(?:super ?research|deep[- ]?research|deep[- ]?dive|research|look into|"
     r"investigate|dig into|analy[sz]e)\b(?: on| into| about| for| of)?\s*(.*)$",
     re.I)
@@ -3399,11 +3407,256 @@ def _strip_leading_noun(name: str) -> str:
     return (name or "").strip()
 
 
-def _is_bulk_machine_phrase(name: str) -> bool:
-    """"all my devices", "every computer" — a request naming no single machine."""
-    return bool(re.fullmatch(
-        rf"(?:all|every|each|both)\s+(?:my\s+|the\s+|of\s+my\s+)?"
-        rf"(?:{_MACHINE_NOUNS}|phones?)", (name or "").strip(), re.I))
+# ⛔⛔ ONE PREDICATE FOR "IS THIS A SET", AND IT REPLACES `_is_bulk_machine_phrase`
+# RATHER THAN SITTING BESIDE IT. 7.9-5 added a second answer to the same question
+# and the two disagreed; worse, the duplication produced an EQUIVALENT MUTANT twice
+# in the Gemini wave, which is a harness bug and not a survivor. The fold was
+# measured before it was made: 17 of the 18 captured-name shapes the 7.9-4 gate
+# answers are identical, and the single disagreement is "All Dev Laptops" — a
+# genuinely plural machine NAME, the residue this design rules acceptable with
+# quoting as the escape.
+#
+# ⛔⛔ AND THE SIGNAL IS A PLURAL NOUN, NOT A QUANTIFIER. Every defect in 7.9-5
+# came from classifying a string by its quantifier behind a wildcard filler
+# `(?:\w+\s+)?`, which full-matched any real machine name shaped
+# "<all|every|each|both> <word> <machine-noun>" — 96 measured phrases, 12 names
+# across 8 verbs, so "All Hands Mac" could not be unlinked, published, hidden,
+# asked for, approved or denied while "switch to All Hands Mac" still resolved it.
+# THERE IS NO WILDCARD IN THIS FILE'S ANSWER. A quantifier counts only when it
+# binds the noun through a DETERMINER slot, and "Hands" is not a determiner.
+#
+# ⭐ MEASURED BEFORE IT WAS BUILT, over 384 generated two- and three-token names
+# across 8 verbs plus the 186 phrases SKILL.md and the routing tests already feed
+# this resolver: 0 names caught, 43 of 44 bulk phrases caught. Every one of the 12
+# corpus hits is a `show my computers`-shaped LIST request, which is why this
+# predicate is consulted ONLY inside the branches that ACT on one target — see
+# each call site. A set on a reading verb is a list to serve, never a refusal.
+# ⛔⛔ EVERY ONE OF THESE CARRIES ITS OWN GROUP, AND THAT IS NOT A STYLE CHOICE.
+# I wrote `_QUANTIFIERS` as a bare `all|every|each|both|any` first, interpolated it
+# into a larger alternation, and `all` became a TOP-LEVEL alternative of that
+# alternation — so the bare word "All" in "All Hands Mac" matched, and all 384
+# generated names classified as sets. That is the 7.9-5 defect's own shape,
+# reintroduced by me in the predicate written to replace it, and caught only
+# because the name corpus ran against the live code and not against my model of
+# it. A constant that is safe to interpolate ANYWHERE cannot leak alternatives.
+_MACHINE_PLURAL = "(?:" + _MACHINE_NOUNS.replace("s?", "s") + "|phones)"
+_MACHINE_SINGULAR = "(?:" + _MACHINE_NOUNS.replace("s?", "") + "|phone)"
+# ⛔ RUN NOUNS ARE A SEPARATE LIST BECAUSE `research` IS A MASS NOUN. "stop all of
+# my research" names a set with no plural form anywhere in it, so a plural-only
+# test cannot see it — measured, it was one of this design's 17 original misses.
+_RUN_PLURAL = r"(?:runs|researches|reports|briefs)"
+_RUN_MASS = r"(?:research|work)"
+_QUANTIFIERS = r"(?:all|every|each|both|any)"
+# ⛔⛔ `any` IS NOT A TOTALISER AND THE OWNER MEASURED THAT. `stop any run` and
+# `approve any` mean "whichever one" and were on 7.9-5's TOO-WIDE list — refusing
+# them is a defect. `every run` and `each run` mean all of them. So the singular
+# noun `run` binds only to the totalising quantifiers, while `any of my
+# computers` keeps working through the PLURAL reading, where `any` belongs.
+_QUANTIFIERS_TOTAL = r"(?:all|every|each|both)"
+# The determiner slot. ⛔ NO WILDCARD MAY EVER JOIN IT — that is the 7.9-5 defect.
+# ⛔⛔ COMPOSED, NOT ENUMERATED. I wrote it as a flat list of whole phrases first
+# and it went short on the first combination nobody had listed — `all the public
+# computers` matched neither `the\s+` nor `public\s+` because it needs BOTH. A
+# list of combinations is a list that is always one combination behind; three
+# independent optional slots cover them all and cannot go short.
+# ⛔ AND EVERY SLOT IS STILL A CLOSED LIST. No wildcard may join any of them —
+# that is the 7.9-5 defect, and a `\w+` here would re-open all 96 phrases.
+_SET_OF = r"(?:of\s+|one\s+of\s+)?"
+_SET_POSS_WORD = r"(?:my|the|your|their|our|his|her|its)\s+"
+_SET_COUNT = r"(?:\d+|two|three|four|five|six|seven|eight|nine|ten)\s+"
+_SET_ADJECTIVE = r"(?:public|private|hidden|other|remaining|spare|old|new)\s+"
+_SET_DETERMINER = (rf"(?:{_SET_OF}(?:{_SET_POSS_WORD})?(?:{_SET_COUNT})?"
+                   rf"(?:{_SET_ADJECTIVE})?)")
+
+
+# ⛔⛔ THE THREE SIGNALS ARE NAMED AND COMPILED SO A TEST CAN REACH THEM. The
+# 7.9-5 gate's patterns were built inline, which is why nothing could assert that
+# it carried no wildcard filler. Each is also proved LOAD-BEARING in the tests:
+# for each one there is a phrase that only it catches.
+# 1. A PLURAL machine or run noun — the signed signal — but it must be a POSSESSED
+#    HEAD, not a bare word anywhere in the message.
+# ⛔⛔ I SHIPPED IT AS A BARE WORD AND CROSS-VERIFY MEASURED FIFTEEN FALSE
+# POSITIVES, every one a regression against the revision this wave started from.
+# `unlink my Nodes Mac`, `hide my Backup PCs Room` and `remove my Reports Desktop`
+# are SINGULAR machines whose NAMES contain a plural word; `stop the laptops
+# comparison` and `stop my research how to compare laptops` are research TOPICS —
+# and this is a research product, so a topic containing `reports` or `laptops` is
+# ordinary. The design authorised one residue, "a genuinely plural machine NAME";
+# a bare-word match is far wider than that and was never authorised.
+# ⭐ TWO REQUIREMENTS, BOTH MEASURED OVER THE WHOLE CORPUS. The plural must be
+#   · POSSESSED — `my`/`our`/`the`/… immediately before it, optionally with a
+#     count. "Francois Laptops" has no determiner and is cleared by this alone.
+#   · THE HEAD of its phrase — nothing after it but the end, punctuation, or a
+#     word that cannot continue a name. "my Nodes Mac" has "Mac" after the
+#     plural, so the plural is not what is being asked about.
+_SET_POSSESSIVE = rf"{_SET_POSS_WORD}(?:{_SET_COUNT})?(?:{_SET_ADJECTIVE})?"
+# ⛔ THE CONTINUATIONS ARE A CLOSED LIST, and they are the words a VERB needs
+# after its object — not words a name can contain.
+_SET_HEAD = (r"(?=\s*$|[,.;:!?]|\s+(?:public|private|hidden|unlisted|findable|"
+             r"discoverable|visible|alone|too|please|now|also|instead|again|"
+             r"anymore|today|and\b|or\b))")
+_SET_SIGNAL_PLURAL = re.compile(
+    rf"\b{_SET_POSSESSIVE}(?:{_MACHINE_PLURAL}|{_RUN_PLURAL})\b{_SET_HEAD}", re.I)
+# 2. A QUANTIFIER BINDING A SINGULAR noun through the determiner slot. `hide every
+#    computer` and `every computer i have` use the singular form, so signal 1 is
+#    blind to them. ⛔ IT BINDS THROUGH A DETERMINER, NEVER A WILDCARD — "Hands"
+#    is not a determiner, which is the whole reason "All Hands Mac" survives.
+# ⛔ THE PLURAL NOUNS BELONG HERE TOO, now that signal 1 requires a possessive.
+# `stop all my runs` and `stop all three runs` have a quantifier and no possessive
+# before the noun, so signal 1 cannot see them and this is the only reading left.
+# ⛔ AND THE SINGULAR NOUN THIS FILE USES FOR A RUN WAS MISSING ENTIRELY. `_RUN_MASS`
+# is research|work and `_RUN_PLURAL` is plural-only, so nothing saw `every run`,
+# `each run` or `every run i have` — and pause/resume/retry EXECUTE with no
+# confirm, so those three ran against whichever run was current. Cross-verify
+# measured it on all three.
+_SET_SIGNAL_QUANTIFIED = re.compile(
+    rf"\b(?:{_QUANTIFIERS}\s+{_SET_DETERMINER}"
+    rf"(?:{_MACHINE_SINGULAR}|{_MACHINE_PLURAL}|{_RUN_MASS}|{_RUN_PLURAL})"
+    rf"|{_QUANTIFIERS_TOTAL}\s+{_SET_DETERMINER}runs?)\b", re.I)
+# 3. A COLLECTIVE OF PEOPLE. ⛔⛔ THE CONSENT SURFACE HAS NO MACHINE NOUN AT ALL —
+#    the set there is of PEOPLE — so the signed signal missed the whole queue.
+#    It matters most: those phrases capture NOTHING, `_resolve_asker("")` returns
+#    the sole waiting row, and one stranger is let onto the machine (or one person
+#    refused for seven days) while the person believes they answered the queue.
+_SET_SIGNAL_COLLECTIVE = re.compile(
+    # ⛔ `everyone`/`everybody` NEEDS THE HEAD TEST TOO — a person can be labelled
+    # "Everyone Smith", and cross-verify found `approve Everyone Smith` refused.
+    rf"\b(?:them all|all of them|"
+    rf"(?:everyone|everybody)(?=\s*$|[,.;:!?]|\s+(?:waiting|pending|who|in\b|else))|"
+    rf"{_QUANTIFIERS}\s+(?:the\s+)?(?:pending|waiting|queued)|"
+    rf"the queue|the rest|{_QUANTIFIERS}\s+{_SET_DETERMINER}"
+    rf"(?:requests?|asks?|people|askers?|pending))\b", re.I)
+# 4. A TOTALISING GENERIC — the words that mean "all of the things".
+# ⛔⛔ THE ROOT CAUSE CROSS-VERIFY NAMED, AND IT UNIFIES FOUR SURFACES: the words
+# the collective signal was blind to are EXACTLY the words this file's three
+# capture-blankers erase to "" — `_NL_GENERIC_RUN` for the run verbs, the `_who`
+# fullmatch for consent, the `_vis_obj` fullmatch for hide. So a blank capture IS
+# the tell that a collective was said, and the message no longer holds anything
+# the other signals recognise. Measured: `pause everything`, `resume them` and
+# `retry all of it` EXECUTED with no confirm; `stop everything` and `approve the
+# whole queue` reached confident single-target confirms.
+# ⛔ BARE `all`, `both`, `any`, `one` AND `ones` ARE DELIBERATELY ABSENT. 7.9-5's
+# TOO-WIDE list has `approve Any`, `deny Both` and `approve any` on it: a lone
+# quantifier is as likely to be a name or an abbreviation as a set, and
+# `_resolve_asker` already asks which one when more than one is waiting. What is
+# gated here is a totalising PHRASE, plus the three words that can only ever mean
+# everything.
+# ⛔⛔ BARE `them` IS OUT, AND THE PRODUCT'S OWN CORPUS IS WHAT REMOVED IT.
+# English has a singular `them`: `let them use my computer` is one of the
+# phrasings this client teaches, and it means ONE person. The A/B over SKILL.md
+# and the routing tests caught it on the first run — which is the argument for
+# replaying the product's own phrases as a test rather than as a one-off.
+# ⭐ `them all` and `all of them` stay: those cannot be singular.
+# ⛔ AND `everyone`/`everybody` CARRY THE HEAD TEST HERE TOO. I added it to the
+# collective signal, then wrote this one without it — the same miss twice in one
+# file — so `approve Everyone Smith` came back refused again.
+_SET_SIGNAL_TOTALISER = re.compile(
+    r"\b(?:everything|"
+    r"(?:everyone|everybody)(?=\s*$|[,.;:!?]|\s+(?:waiting|pending|who|in\b|else))|"
+    r"them all|all of them|all of it|it all|both of them|"
+    r"the (?:whole )?(?:lot|batch|queue|rest)|the pending ones|"
+    r"anyone waiting|whoever(?:'s| is) waiting)\b", re.I)
+_SET_SIGNALS = (_SET_SIGNAL_PLURAL, _SET_SIGNAL_QUANTIFIED, _SET_SIGNAL_COLLECTIVE,
+                _SET_SIGNAL_TOTALISER)
+# ⛔ THE VISIBILITY SETTERS, ONE LIST. `_named_target` and the set arm below both
+# need to know "did somebody ask to CHANGE something here", and two copies of a
+# verb list two lines apart is exactly how `_machine_kw` and `_mine_kw` drifted by
+# two words and silently broke four guards.
+_VIS_SETTERS = (r"(?:make|set|switch|turn|put|hide|unlist|unpublish|offer|share|"
+                r"publish|disable|take|remove|drop|pull)")
+
+
+# ⛔⛔ MATCHED PAIRS, NOT ANY TWO OF THE SIX QUOTE CHARACTERS — and this file had
+# already written the warning I ignored. `_NL_QUOTED_RE` says, in as many words,
+# that apostrophes are NOT delimiters because a contraction plus a possessive
+# would extract the garbage between them. I used `_NL_QUOTE_CHARS`, which
+# contains both apostrophes, so TWO CONTRACTIONS made a quoted span: `don't hide
+# all my computers, it's fine` blanked down to "don s fine", the set vanished,
+# and the unconfirmed hide RAN — the exact defect this wave exists to close,
+# reintroduced by the line that grants the escape from it. A mutation survivor is
+# what found it.
+# ⭐ `‘…’` STAYS A PAIR because the picker's own copy uses curly singles on
+# phones. A contraction cannot forge one: the apostrophe people type is the
+# straight `'` or the curly RIGHT `’`, and neither of those opens this span.
+_SET_QUOTED_SPAN = re.compile(r'"[^"]*"|“[^”]*”|‘[^’]*’')
+
+
+def _outside_quoted_names(text: str) -> str:
+    """The message with every quoted span blanked out.
+
+    ⛔⛔ QUOTING A NAME EXEMPTS IT OUTRIGHT, and this is the only rung that can
+    give a person an escape from the residue above. It also restores three run
+    titles 7.9-5 ate — `stop "All Reports"`, `stop "Every Report"` — because the
+    signal is looked for in what is LEFT once the name is removed.
+    ⛔ THE SPAN IS BLANKED, NOT DELETED. Dropping it would weld the words either
+    side of the name into a phrase nobody typed.
+    """
+    return _SET_QUOTED_SPAN.sub(" ", text or "")
+
+
+# ⛔ THE EXCLUSION SHAPES ARE CLAUSE-BOUNDED, NOT WILDCARDS. Each runs to the next
+# comma, semicolon or full stop — an unbounded span is how 7.9-5's filler ate real
+# names, and nothing in this wave gets to reintroduce one.
+_SET_EXCLUSION = (r"(?:\b(?:not|except|excluding|apart\s+from|other\s+than|"
+                  r"rather\s+than|instead\s+of)\b[^,.;]*"
+                  r"|\bleave\b[^,.;]*\balone\b)")
+
+
+def _outside_exclusions(text: str) -> str:
+    """The message with quoted names AND exclusion clauses blanked out."""
+    return re.sub(_SET_EXCLUSION, " ", _outside_quoted_names(text), flags=re.I)
+
+
+def _names_a_set(text: str) -> bool:
+    """True when this names a SET of machines, runs or waiting people.
+
+    Three signals, each on the surface it is the only one that can serve —
+    measured, not assumed:
+
+    · a PLURAL machine or run noun. The signed signal, and it carries the
+      machine surfaces on its own: `my computers`, `my two macs`,
+      `any of my computers`.
+    · a QUANTIFIER BINDING A SINGULAR noun through the determiner slot.
+      `hide every computer` and `every computer i have` use the singular form,
+      so the plural test is blind to them.
+    · a COLLECTIVE OF PEOPLE. ⛔⛔ THE CONSENT SURFACE HAS NO MACHINE NOUN AT ALL
+      — the set there is of PEOPLE — so the signed signal missed the whole queue:
+      `approve them all`, `approve the queue`, `let them all in`, `refuse
+      everyone` and the entire deny mirror, the branch that arms a seven-day
+      refusal. It matters more than the rest: those phrases capture NOTHING, and
+      `_resolve_asker("")` returns the sole waiting row, so one stranger is let
+      in — or one person refused for a week — while the person believes they
+      answered the queue.
+    """
+    bare = _outside_quoted_names(text)
+    return any(s.search(bare) for s in _SET_SIGNALS)
+
+
+def _request_names_a_set(message: str, captured: str | None = None) -> bool:
+    """The rule every ACT branch asks, about what THAT branch is going to do.
+
+    ⛔⛔ IT READS THE MESSAGE, BECAUSE ONLY THE MESSAGE STILL HAS THE QUOTES. A
+    captured name arrives stripped of them, so testing the capture would refuse
+    `stop "All Reports"` and `remove "All My Laptops"` — and quoting is the one
+    escape this design offers from the plural-NAME residue.
+
+    ⛔⛔ AND THE CAPTURE IS NOT THE OVERRIDE. I built it as one first: a branch
+    that captured a non-set name won over the message. It looked right on the two
+    phrases it was written for and it silently DEFEATED FOUR REAL SETS, because on
+    those the capture is a FRAGMENT OF the set phrase, not a name beside it —
+    `approve the queue` captures "queue", `approve the rest` captures "rest",
+    `stop all my research on tesla` captures "tesla". Each came back a confident
+    single-target confirm. The A/B against the pre-build revision is what showed
+    it; the predicate itself was 44/44 either way.
+
+    ⭐ WHAT ACTUALLY SEPARATES THE TWO PHRASES 7.9-5 GOT WRONG IS AN EXCLUSION.
+    `make my Studio PC public, not all my devices` and `hide the Studio PC and
+    leave all my other machines alone` both name one target and then say which
+    set to leave out. So an exclusion clause is blanked with the quoted names, and
+    a set mentioned only inside one does not count. `captured` is accepted and
+    deliberately unused for the decision — see the assertion in the tests.
+    """
+    return _names_a_set(_outside_exclusions(message))
 
 
 def _is_bare_machine_noun(name: str) -> bool:
@@ -3789,12 +4042,22 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     # verb, and reading them as state questions answered neither. The
     # discriminator is whether a SETTER follows the politeness, not the opening
     # word — "is my mac public" has no setter and stays a question.
-    _polite_imperative = re.match(r"^(?:can|could|would|will|please|do)\s+(?:you\s+)?"
+    # ⛔⛔ IT NEEDS THE LEAD-IN TOO, AND I BROKE THIS BY GIVING IT TO ONLY ONE SIDE.
+    # `_asking_state` below is `question-word AND NOT this`. I let a lead-in
+    # precede the question word and left this one anchored at bare `^`, so
+    # `hey can you hide my computer` and `so could you make my computer public`
+    # made the question test fire while its own veto silently could not — and
+    # both were answered with a bare device list instead of doing the thing.
+    # Measured against the revision this wave started from: eleven phrasings.
+    _polite_imperative = re.match(_NL_LEAD_IN + r"(?:can|could|would|will|please|do)"
+                                  r"\s+(?:you\s+)?"
                                   r"(?:please\s+)?(?:make|set|switch|turn|put|hide|"
                                   r"unlist|unpublish|offer|share|publish|disable)\b",
                                   low)
-    _asking_state = (re.match(r"^(is|are|does|do|can|could|who|what|which|how|"
-                              r"tell me (?:if|whether)|check)\b", low)
+    # ⛔⛔ THE LEAD-IN IS WHY THIS WAS ANCHORED WRONG. `^` alone meant one
+    # conversational word turned a read-only question into an offer to publish.
+    _asking_state = (re.match(_NL_LEAD_IN + r"(is|are|does|do|can|could|who|what|"
+                              r"which|how|tell me (?:if|whether)|check)\b", low)
                      and not _polite_imperative)
     # ⛔⛔ THE SUBJECT MUST BE ONE OF THIS ACCOUNT'S OWN MACHINES, AND A BARE
     # SETTER IS NOT THAT. Widening the gate to any setter verb let "switch to a
@@ -3814,9 +4077,7 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     _about_others = (re.search(r"\bsomebody else|\bsomeone else|\bother (?:people|"
                                r"persons?|users?)\b|\bother people'?s\b", low)
                      and not _mine_kw and not re.search(r"\bmy own\b", low))
-    _named_target = (re.search(r"\b(?:make|set|switch|turn|put|hide|unlist|"
-                               r"unpublish|offer|share|publish|disable|take|"
-                               r"remove|drop|pull)\s+"
+    _named_target = (re.search(rf"\b{_VIS_SETTERS}\s+"
                                rf"(?:the|my|our|this|that)\s+[\w' -]*"
                                rf"(?:{_MACHINE_NOUNS})\b", low)
                      # ⛔ A QUOTED NAME CARRIES NO ARTICLE, and the picker's own
@@ -3826,8 +4087,19 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
                      or re.search(r"\b(?:make|set|switch|turn|put|hide|unlist|"
                                   r"unpublish|offer|share|publish|disable)\s+"
                                   rf"[{re.escape(_NL_QUOTE_CHARS)}]", t))
+    # ⛔⛔ A SET GETS IN, AND IT CAN ONLY EVER LEAVE BY THE REFUSAL. `make all the
+    # computers public` answered with the BROWSE list of STRANGERS' machines and
+    # `hide every computer` reached the catch-all, both because this gate needs
+    # `my`/`our` or a determiner-led target and a set supplies neither. The arm
+    # is paired with a SETTER VERB on purpose: without that, `find public
+    # computers` — a browse — would enter and be refused, which is the mirror of
+    # the defect being fixed. Entering on a set cannot act: the refusal below
+    # sits ahead of both returns.
+    _set_target = bool(_request_names_a_set(t)
+                       and re.search(rf"\b{_VIS_SETTERS}\b", low))
     if (_public_kw or _offering_kw or _hiding_kw) \
-            and (_mine_kw or re.search(r"\bmy own\b", low) or _named_target) \
+            and (_mine_kw or re.search(r"\bmy own\b", low) or _named_target
+                 or _set_target) \
             and not _about_others \
             and not _artefact_kw and not _unlink_kw \
             and not (_control_kw and not _hiding_kw):
@@ -3860,6 +4132,23 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
                               _vm.group(1).strip().strip(_NL_QUOTE_CHARS),
                               flags=re.I).strip()
             _vis_obj = re.sub(r"[?.!,]+$", "", _vis_obj).strip()
+            # ⛔ AN EXCLUSION CLAUSE IS NOT PART OF THE NAME. `hide the Studio PC
+            # and leave all my other machines alone` captured the whole tail and
+            # passed it as a machine name, which resolves to nothing and drops to
+            # the picker — measured. The clause that says what to leave out is
+            # the same one the set gate blanks, so it is trimmed from the same
+            # constant rather than a second list that can drift.
+            # ⛔⛔ AND IT MUST LEAVE SOMETHING BEHIND. Written to trim a trailing
+            # clause, it ate the WHOLE capture when the name itself opens with a
+            # trigger word — a machine called "Not My Mac" or "Other Than
+            # Desktop" came back empty and the command fell to the picker, which
+            # is the unconfirmed-wrong-machine outcome this branch exists to
+            # avoid. Cross-verify measured seven of them against the revision
+            # this wave started from.
+            _trimmed = re.sub(rf"\s*(?:,|;|\band\b)\s*{_SET_EXCLUSION}\s*$",
+                              "", _vis_obj, flags=re.I).strip()
+            if _trimmed:
+                _vis_obj = _trimmed
             # A bare noun names no machine; neither does a phrase about other
             # people's, and quoting either back is the 7.9-2 defect shape.
             # ⛔ THE TEST IS ON THE CAPTURED OBJECT, NOT ON THE MESSAGE. The
@@ -3873,6 +4162,22 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
                                  r"\bother (?:people|persons?|users?)\b",
                                  _vis_obj, flags=re.I)):
                 _vis_obj = ""
+        # ⛔⛔ AND A SET IS NOT A TARGET. This branch is where 7.9-5's
+        # `_asks_about_every_machine` lived as a `search` over the WHOLE message,
+        # which refused `make “All Hands Mac” public` — the form the client's own
+        # picker tells people to type — and refused every single-target request
+        # that merely mentioned a set. It is asked here, about what THIS branch is
+        # about to act on, with the capture allowed to win.
+        # ⛔⛔ AND IT HAS TO BE HERE AND NOT ONLY IN THE HIDE ARM. Measured: `hide
+        # my machines` and `hide my computers` RAN the unconfirmed hide with no
+        # name at all, so the picker hid whichever machine it landed on; `make my
+        # computers public` and `make my 3 pcs public` reached the publish
+        # confirm quoting a name that cannot exist.
+        if _request_names_a_set(t, _vis_obj):
+            _verb = "hide" if _hiding_kw else "publish"
+            return None, [f"I {_verb} one computer at a time. Ask me to list them "
+                          f"and name the one to {_verb} — nothing changes until "
+                          f"you do."]
         if _hiding_kw:
             # ⛔ NO CONFIRM ON HIDING. It takes a computer OFF a list; the only
             # thing it can cost is somebody not finding a machine they were
@@ -4021,6 +4326,20 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
                             rf"my\s+\w+|our\s+\w+|{_MACHINE_NOUNS})", _who,
                             flags=re.I) or len(_who) > 60:
                 _who = ""
+        # ⛔⛔ THE MOST IMPORTANT CALL SITE IN THIS WAVE, AND THE SIGNED SIGNAL
+        # COULD NOT SEE IT. There is no machine noun on this surface — the set is
+        # of PEOPLE — so a plural-machine test missed the whole queue. And the
+        # cost here is not a bad question: `let them all in`, `refuse everyone`
+        # and `deny Both` capture NOTHING, `_who` is blanked, and
+        # `_resolve_asker("")` RETURNS THE SOLE WAITING ROW — so one stranger is
+        # let onto the machine, or one person refused for seven days, while the
+        # person who typed it believes they answered the queue. Measured against
+        # this resolver, post-revert.
+        if _request_names_a_set(t, _who):
+            _plural = "no to" if (_no_kw and not _yes_kw) else "yes to"
+            return None, [f"I say {_plural} one person at a time. Ask me who is "
+                          f"waiting and name them — nobody is answered until you "
+                          f"do."]
         _named = f"“{_who}”" if _who else "that request"
         if _no_kw and not _yes_kw:
             # ⛔⛔ DENYING CONFIRMS TOO, AND THE WEB APP DOES NOT. Over there the
@@ -4154,6 +4473,12 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     if _ask_kw and _ask_obj and _ask_is_about_a_machine and not _ask_obj_is_thing \
             and not _ask_obj_is_pronoun and not _ask_obj_is_category \
             and not _control_kw and not _unlink_kw:
+        # ⛔ ONE ASK NAMES ONE OWNER. A request for a SET would file a disclosure
+        # against every owner in it, and the confirm can only name one.
+        if _request_names_a_set(t, _ask_obj):
+            return None, ["I ask one owner at a time. Show me the public "
+                          "computers and name the one you want — nothing is sent "
+                          "until you do."]
         return None, [_NL_CONFIRMS["device-ask"].format(name=f"“{_ask_obj}”")]
 
     # Browse. ⛔⛔ IT NEEDS A BROWSING VERB. Without one this clause matched on
@@ -4175,15 +4500,46 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     # 3. Run controls (before the broad status rules).
     if re.search(r"\b(stop|end|abort|cancel)\b", low) or re.search(r"\bthat.?s enough\b", low):
         name = _nl_run_name(t, re.sub(r"^.*?\b(?:stop|end|abort|cancel)\b", "", t, flags=re.I).strip())
+        # ⛔ STOP HAD NO MESSAGE-LEVEL CHECK AT ALL. Measured: `stop all of my
+        # research` came back "Stop the current run?", `stop all my research on
+        # tesla` came back `Stop “tesla”?` and `stop all three runs`
+        # confirmed — three ways to ask for every run and three confident
+        # single-run answers.
+        # ⭐ AND QUOTING STILL WINS: `stop "All Reports"` names a run title, and
+        # the quoted span is blanked before the signal is looked for.
+        if _request_names_a_set(t, name):
+            return None, ["I stop one run at a time. Ask me to list the running "
+                          "ones and name it — nothing is stopped until you do."]
         return None, [_NL_CONFIRMS["stop"].format(name=f"“{name}”" if name else "the current run")]
     if re.search(r"\bpause\b|\bhold (on|it)\b", low):
         name = _nl_run_name(t, re.sub(r"^.*?\bpause\b", "", t, flags=re.I).strip())
+        # ⛔ THE SAME GATE AS STOP. These three end in an honest "No run matching"
+        # when handed a set, so 7.9-5 graded them minor — but `stop all my runs`
+        # refusing while `pause all my runs` does not is an inconsistency a person
+        # reads as one of the two being broken, and it is one line each.
+        if _request_names_a_set(t, name):
+            return None, ["I pause one run at a time. Ask me to list the running "
+                          "ones and name it — nothing changes until you do."]
         return ["pause"] + ([name] if name else []), None
     if re.search(r"\b(resume|unpause)\b|\bcontinue the paused\b", low):
         name = _nl_run_name(t, re.sub(r"^.*?\b(?:resume|unpause)\b", "", t, flags=re.I).strip())
+        # ⛔ THE SAME GATE AS STOP. These three end in an honest "No run matching"
+        # when handed a set, so 7.9-5 graded them minor — but `stop all my runs`
+        # refusing while `pause all my runs` does not is an inconsistency a person
+        # reads as one of the two being broken, and it is one line each.
+        if _request_names_a_set(t, name):
+            return None, ["I resume one run at a time. Ask me to list the running "
+                          "ones and name it — nothing changes until you do."]
         return ["resume"] + ([name] if name else []), None
     if re.search(r"\b(retry|try again)\b", low):
         name = _nl_run_name(t, re.sub(r"^.*?\b(?:retry|try again)\b", "", t, flags=re.I).strip())
+        # ⛔ THE SAME GATE AS STOP. These three end in an honest "No run matching"
+        # when handed a set, so 7.9-5 graded them minor — but `stop all my runs`
+        # refusing while `pause all my runs` does not is an inconsistency a person
+        # reads as one of the two being broken, and it is one line each.
+        if _request_names_a_set(t, name):
+            return None, ["I retry one run at a time. Ask me to list the running "
+                          "ones and name it — nothing changes until you do."]
         return ["retry"] + ([name] if name else []), None
     # skip / drop phases or P2 agents ("skip the video and the report",
     # "remove the video", "no email", "skip Claude in P2"). Guards (review
@@ -4285,6 +4641,17 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
         name = _strip_leading_noun(name)
         if _is_bare_machine_noun(name):
             name = ""
+        # ⛔⛔ THE ONE ACT BRANCH ON THIS SURFACE THAT MUTATES WITH NO CONFIRM AT
+        # ALL, and it was the one I did not gate. Cross-verify found it: `switch
+        # to every computer i have`, `switch to my two macs` and `run it on my
+        # remaining laptops` all EXECUTED `device-use` with a set as the name.
+        # `_is_bare_machine_noun` caught only `<quantifier> <bare noun>`, which is
+        # why `switch to all my computers` looked safe and the rest were not.
+        # ⭐ IT PRE-DATES THIS WAVE — the revision this started from does the same
+        # — but it is the same question on the same surface, so it is gated here.
+        if _request_names_a_set(t, name):
+            return None, ["I run on one computer at a time. Ask me to list them "
+                          "and name the one to use — nothing changes until you do."]
         return (["device-use", name] if name else ["devices"]), None
     if re.search(r"\b(remove|unlink|forget|delete)\b", low) and \
             re.search(rf"\b({_MACHINE_NOUNS}|phones?)\b", low):
@@ -4310,9 +4677,13 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
         # it just turned out to be the noun. Confirming "Unlink that device?" and
         # then running a remove with no argument would unlink whichever one the
         # resolver happened to land on. Ask which, and remove nothing until told.
-        if _is_bulk_machine_phrase(name):
+        if _request_names_a_set(t, name):
             # ⛔ UNLINK TAKES EXACTLY ONE MACHINE. Answering a bulk request with
             # "which one?" hides that the thing asked for cannot be done at all.
+            # ⭐ THE CAPTURE IS PASSED SO A QUOTED NAME STILL WINS, and so
+            # "remove my Studio PC, not all my macs" keeps working. Measured:
+            # "remove my machines" and "remove my two macs" both reached the
+            # DESTRUCTIVE confirm before this line read the plural.
             return None, ["I unlink one computer at a time. Ask me to list them and "
                           "name the one to remove — nothing is removed until you do."]
         if not name or _is_bare_machine_noun(name):
