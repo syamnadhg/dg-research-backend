@@ -569,9 +569,7 @@ MUTANTS = [
      "⛔ the hiding words lose the phrasings with no \"private\" in them, and "
      "\"stop letting people find my pc\" goes back to rule 3, which quotes it "
      "as a research title and offers to stop a run",
-     [('                  or re.search(r"\\b(stop|turn|switch|shut)\\b.{0,20}\\b(off|offering|"\n'
-       '                               r"sharing|listing|publishing|letting|showing|"\n'
-       '                               r"allowing)\\b", low)\n',
+     [('        or re.search(r"\\b(?:turn|switch|shut|toggle)\\b(?:(?!\\bon\\b)[^.?!]){0,20}"\n                     r"\\b(?:off|down)\\b", _pol_low)\n',
        '')]),
     ("N4", SR, "over",
      "⛔⛔ A QUESTION ABOUT THE STATE CHANGES IT. \"is my computer public?\" "
@@ -656,9 +654,7 @@ MUTANTS = [
     ("N15", SR, "under",
      "⛔ the capability line stops naming the owner verbs, so the fallback "
      "denies having the two commands the resolver just failed to reach",
-     [('                  "ask to use it, and — for a computer you own — answer the people "\n'
-       '                  "asking for it and set whether strangers can find it at all — "\n'
-       '                  "what would you like?"]',
+     [('                 "ask to use it, and — for a computer you own — answer the people "\n                 "asking for it and set whether strangers can find it at all — "\n                 "what would you like?")',
        '                  "ask to use it — what would you like?"]')]),
     ("N16", SR, "over",
      "⛔ an artefact question reaches the decide confirm, so \"approve the "
@@ -736,9 +732,7 @@ MUTANTS = [
      "⛔⛔ A HIDE PHRASED AS A NEGATION BECOMES A PUBLISH — the exact opposite of "
      "what was asked, one reflexive yes from putting a machine in front of every "
      "signed-in stranger",
-     [('                  or re.search(r"\\b(don\'?t|do not|never|no longer|not|shouldn\'?t|"\n'
-       '                               r"should not|stop)\\b[^.?!]{0,40}\\b(public|findable|"\n'
-       '                               r"discoverable|shared?|sharing)\\b", low))',
+     [('        or _neg_public_side)',
        '                  )')]),
     ("W3", SR, "under",
      "⛔ THE POLITE IMPERATIVE IS READ AS A QUESTION AGAIN, so \"can you make my "

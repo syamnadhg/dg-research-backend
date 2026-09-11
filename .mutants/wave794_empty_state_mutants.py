@@ -410,7 +410,7 @@ MUTANTS = [
     #   Every fix below has a guard, and every guard has a mutant here.
     ("X1", SR, "under",
      '⛔⛔ THE STRIP EATS THE FIRST WORD OF A REAL NAME AGAIN. "switch to the Mac Studio" reaches for “Studio”, "remove my MacBook Air" offers to unlink “Air”. Four of the widened nouns are words people put IN a machine\'s name, and cross-verify caught all three cases',
-     [('    m = re.match(rf"^(?:{_NAMEABLE_NOUNS})\\s+(.+)$", (name or "").strip(), re.I)\n    if m and _looks_like_an_identifier(m.group(1).strip()):',
+     [('    m = re.match(rf"^(?:{_NAMEABLE_NOUNS})\\s+(.+)$", whole, re.I)\n    if m and _looks_like_an_identifier(m.group(1).strip()):',
        '    m = re.match(rf"^(?:{_NAMEABLE_NOUNS})\\s+(.+)$", (name or "").strip(), re.I)\n    if m:')]),
     ("X2", SR, "over",
      'the identifier test accepts any single token, so “Studio” and “Air” are read as ids and stripped — the same defect one rung in',

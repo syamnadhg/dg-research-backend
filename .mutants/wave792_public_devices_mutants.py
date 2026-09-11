@@ -591,7 +591,7 @@ MUTANTS = [
     ("N8", SR, "under",
      "⛔⛔ THE CODE-HIJACK COMES BACK: \"switch to the machine LABPC001\" is a "
      "pairing attempt again and is refused as a code that matched no device",
-     [('        if _bare or _pairing or (_kw and not _existing):\n',
+     [('        if _bare or (_pairing and not _reading) or (_kw and not _existing):\n',
        '        if _kw or _bare:\n')]),
     ("N9", SR, "over",
      "⛔ ONLY A CODE ON ITS OWN PAIRS, so \"pair my PC, code is K7XQ-9B2M\" — the "
@@ -599,14 +599,13 @@ MUTANTS = [
      "⚠ THE FIRST VERSION OF THIS MUTANT WAS EQUIVALENT: it dropped `not _bare` "
      "from the guard, and a message that IS the token can never also contain a "
      "switch verb, so the two forms could not disagree. It survived honestly",
-     [('        if _bare or _pairing or (_kw and not _existing):\n',
+     [('        if _bare or (_pairing and not _reading) or (_kw and not _existing):\n',
        '        if _bare:\n')]),
     ("N10", SR, "under",
      "⛔ THE PHRASING THE PICKER TELLS PEOPLE TO SAY STOPS ROUTING — 'Just say: "
      "use “<name>”' answered with \"I didn't catch a Super Research request\"",
-     [('    _bare_use = t[:4].lower() == "use " and t[4:5] in _NL_QUOTE_CHARS\n'
-       '    if m and (re.search(r"\\b(switch to|run (it |everything )?on)\\b", low) or _bare_use):',
-       '    if m and re.search(r"\\b(switch to|run (it |everything )?on)\\b", low):')]),
+     [('    if m and (re.search(r"\\b(switch to|run (it |everything )?on)\\b", low) or _bare_use) \\\n            and not _q_start and not _runctl_dropped:',
+       '    if m and re.search(r"\\b(switch to|run (it |everything )?on)\\b", low) \\\n            and not _q_start:')]),
     ("N11", SR, "over",
      "the bare `use` gate loses its quote requirement, so \"use less video\" is a "
      "device switch",
@@ -625,10 +624,8 @@ MUTANTS = [
     ("N14", SR, "under",
      "⛔ THE CAPABILITIES LINE STOPS NAMING THE NEW SURFACE, so the fallback "
      "denies having the verbs the resolver just failed to reach",
-     [('                  "your researches, manage your devices, find a public computer and "\n'
-       '                  "ask to use it, and — for a computer you own — answer the people "',
-       '                  "your researches, or manage your devices — what would you like?" #',
-       )]),
+     [('                 "your researches, manage your devices, find a public computer and "\n                 "ask to use it, and — for a computer you own — answer the people "',
+       '                 "your researches, or manage your devices — what would you like?" #')]),
 
     # ═══════════ L — what the uploadable log carries ═════════════════════════
     ("L1", BRIDGE, "over",
@@ -736,12 +733,12 @@ MUTANTS = [
      "\"use\" in it takes out \"use this code K7XQ-9B2M\" — the commonest way "
      "anybody types one — and the client then asks for the code that is already "
      "in the sentence",
-     [('        if _bare or _pairing or (_kw and not _existing):\n',
+     [('        if _bare or (_pairing and not _reading) or (_kw and not _existing):\n',
        '        if _bare or (_kw and not _existing):\n')]),
     ("V2", SR, "under",
      "⛔ THE CODE-SHAPED-NAME HIJACK COMES BACK for the wave's own verbs: "
      "\"request access to computer LABPC001\" is a pairing attempt again",
-     [('        if _bare or _pairing or (_kw and not _existing):\n',
+     [('        if _bare or (_pairing and not _reading) or (_kw and not _existing):\n',
        '        if _bare or _pairing or _kw:\n')]),
     ("V3", SR, "under",
      "⛔⛔ THE WAITING CLAUSE LOSES ITS SUBJECT and answers every run-progress "

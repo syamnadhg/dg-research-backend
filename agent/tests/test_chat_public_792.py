@@ -515,7 +515,11 @@ def test_the_new_rules_route_no_flags():
     # finds nothing and the guard dies with a ValueError instead of an assertion.
     # It did exactly that on the first run of this test.
     src = code_only(inspect.getsource(sr._nl_resolve))
-    start = src.index("_public_kw = re.search(")
+    # ⛔ THE START ANCHOR MOVED ON 09-11, AND THE GUARD'S SUBJECT DID NOT. Wave 1.1
+    # made `_public_kw` a parenthesised OR — polarity is computed now, not
+    # collected — so the literal gained one character. The slice still has to open
+    # at the public-computer block, which is what the two asserts below check.
+    start = src.index("_public_kw = (re.search(")
     end = src.index('r"\\b(stop|end|abort|cancel)\\b"')
     block = src[start:end]
     assert "devices-public" in block and "device-requests" in block, \
