@@ -147,7 +147,37 @@ def test_skip_unknown_word_names_agents_in_the_error(monkeypatch):
     monkeypatch.setattr(sr, "_emit", lambda body, as_json, lines, code=0: printed.extend(lines) or code)
     args = type("A", (), {"phases": ["nonsense"], "run": "", "json": False})()
     assert sr.cmd_skip(args) == 1
-    assert "chatgpt/gemini/claude" in " ".join(printed)
+    said = " ".join(printed)
+    # ⛔⛤ DERIVED, BECAUSE A LITERAL PINNED THE SHORTFALL. Hand-written, this
+    # message named four of the seven phase words and three of the six agent
+    # words — so `audio`, `youtube`, `openai` and `anthropic` all WORKED at the
+    # CLI while the error said they did not. Asserting every accepted word
+    # appears is the property; asserting one ordering of three is not.
+    for word in list(sr._SKIP_NAMES) + list(sr._SKIP_AGENTS):
+        assert word in said, f"the refusal never names {word}, which it accepts"
+    for n in sr._SKIP_PHASE_NUMBERS:
+        assert str(n) in said, n
+
+
+def test_skip_refuses_a_phase_number_it_cannot_skip(monkeypatch):
+    """⛔ ANY INTEGER PARSED AND POSTED — `sr skip 0`, `sr skip 2` (the Research
+    stage, which is not skippable) and `sr skip 99` all reached the backend."""
+    printed, posted = [], []
+    monkeypatch.setattr(sr, "_fetch_runs", lambda **kw: (200, {}, [
+        {"runId": "r1", "title": "T", "status": "ongoing"},
+    ]))
+    monkeypatch.setattr(sr, "_emit", lambda body, as_json, lines, code=0: printed.extend(lines) or code)
+    monkeypatch.setattr(sr, "_post", lambda *a, **k: posted.append(a) or (200, {}))
+    for bad in ("0", "2", "99"):
+        printed.clear()
+        args = type("A", (), {"phases": [bad], "run": "", "json": False})()
+        assert sr.cmd_skip(args) == 1, bad
+        assert "isn’t one I can skip" in " ".join(printed), (bad, printed)
+    assert not posted, "an unskippable phase reached the backend"
+    for good in ("1", "3", "4", "5"):
+        printed.clear()
+        args = type("A", (), {"phases": [good], "run": "", "json": False})()
+        assert sr.cmd_skip(args) == 0, (good, printed)
 
 
 # ── watchdog self-heal: stale/missing state + live agent run → re-arm lines ──

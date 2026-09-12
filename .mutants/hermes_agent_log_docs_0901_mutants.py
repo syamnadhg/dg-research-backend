@@ -136,7 +136,7 @@ BE_BULLET = (
 )
 
 BE_ROW = (
-    '| "send the agent\'s log too", "include the bridge log", "the log from this chat" | add `--agent-log` to the **bare** command **and to `--confirm`** — or say `--runs 0`, which is the same thing and is the number the plan prints for it. It uploads nothing on either; it makes the plan name it, and makes the client hand you `sr.py send-logs --status <CODE> --agent-log` for once the bundle lands. **Not** owner-gated. See **Sending logs to support** |\n'
+    '| "send the agent\'s log too", "include the bridge log", "the log from this chat" | ⛔ **SAID INSIDE THE SEND-LOGS FLOW** — on its own, "include the bridge log" names no request to add it to, so `sr.py do` answers with the catch-all. add `--agent-log` to the **bare** command **and to `--confirm`** — or say `--runs 0`, which is the same thing and is the number the plan prints for it. It uploads nothing on either; it makes the plan name it, and makes the client hand you `sr.py send-logs --status <CODE> --agent-log` for once the bundle lands. **Not** owner-gated. See **Sending logs to support** |\n'
 )
 
 FORK_OFFER_BLOCK = (

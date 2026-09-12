@@ -609,8 +609,8 @@ MUTANTS = [
     ("N11", SR, "over",
      "the bare `use` gate loses its quote requirement, so \"use less video\" is a "
      "device switch",
-     [('    _bare_use = t[:4].lower() == "use " and t[4:5] in _NL_QUOTE_CHARS\n',
-       '    _bare_use = t[:4].lower() == "use "\n')]),
+     [('    _bare_use = t[:4].lower() == "use " and (\n        t[4:5] in _NL_QUOTE_CHARS\n        or bool(re.search(rf"\\b(?:{_MACHINE_NOUNS_SAID})\\b", _use_obj, re.I)\n                or _looks_like_a_machine_token(_use_obj))',
+       '    _bare_use = t[:4].lower() == "use "')]),
     ("N12", SR, "under",
      "⛔ A QUOTED NAME STOPS RESOLVING, so routing the picker's own phrasing was "
      "only half the repair and the other half is gone",
@@ -781,9 +781,8 @@ MUTANTS = [
     ("V9", SR, "under",
      "⛔ POLITENESS RIDES INTO THE NAME AND INTO THE LOOKUP: \"ask for the Studio "
      "PC please\" asks the owner of “Studio PC please”",
-     [('        _ask_obj = re.sub(r"[,;]?\\s+(?:please|thanks|thank you|for me|"\n'
-       '                          r"if (?:i|you) (?:can|could|may|would))\\s*$", "",\n'
-       '                          _ask_obj, flags=re.I).strip()\n', '')]),
+     [('        _ask_obj = _trim_trailing_clause(_ask_obj, t)\n',
+       '')]),
     ("V10", SR, "under",
      "⛔ THE WITHDRAW LINE LOSES ITS MACHINE CONTEXT and answers \"cancel the "
      "video\" with a sentence about owners and weeks",

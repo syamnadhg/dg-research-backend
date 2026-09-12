@@ -247,24 +247,24 @@ MUTANTS = [
      "⛔⛔ THE RULE GOES AND \"I don't have a computer of my own\" REACHES THE "
      "CATCH-ALL AGAIN — the phrasing SKILL.md gives as its own worked example, "
      "and the one sentence a person with nothing actually says",
-     [('    if not _artefact_kw and re.search(\n            rf"\\b(?:i (?:do not|don\'?t|dont) have|i have no|i haven\'?t got"\n            rf"|i\'?ve got no|i (?:do not|don\'?t|dont) own)\\b[^.?!]*"\n            rf"\\b(?:{_MACHINE_NOUNS})\\b", low):\n        return ["devices"], None\n',
+     [('    if not _artefact_kw and (re.search(\n            rf"\\b(?:i (?:do not|don\'?t|dont) have|i have no|i haven\'?t got"\n            rf"|i\'?ve got no|i (?:do not|don\'?t|dont) own)\\b[^.?!]*"\n            rf"\\b(?:{_MACHINE_NOUNS_SAID})\\b", low)\n            # ⛔⛤ AND THE BARE FORM OF THE SAME SENTENCE. SKILL.md teaches\n            # "no devices — set one up" and it reached the catch-all: the\n            # negation vocabulary above is all first-person, and a person\n            # reporting the state does not always put themselves in it.\n            or re.fullmatch(rf"(?:no|zero|0)\\s+(?:{_MACHINE_NOUNS_SAID})\\b"\n                            rf"[^.?!]{{0,32}}", low)):\n        return ["devices"], None\n\n',
        '')]),
     ("R2", SR, "over",
      "⛔⛔ IT ANSWERS FROM THE PUBLIC LIST INSTEAD OF THE ACCOUNT'S OWN. That "
      "list structurally cannot contain the asker's machine, so somebody who DOES "
      "have one is told to go and ask a stranger",
-     [('    if not _artefact_kw and re.search(\n            rf"\\b(?:i (?:do not|don\'?t|dont) have|i have no|i haven\'?t got"\n            rf"|i\'?ve got no|i (?:do not|don\'?t|dont) own)\\b[^.?!]*"\n            rf"\\b(?:{_MACHINE_NOUNS})\\b", low):\n        return ["devices"], None\n',
-       '    if not _artefact_kw and re.search(\n            rf"\\b(?:i (?:do not|don\'?t|dont) have|i have no|i haven\'?t got"\n            rf"|i\'?ve got no|i (?:do not|don\'?t|dont) own)\\b[^.?!]*"\n            rf"\\b(?:{_MACHINE_NOUNS})\\b", low):\n        return ["devices-public"], None\n')]),
+     [('    if not _artefact_kw and (re.search(\n            rf"\\b(?:i (?:do not|don\'?t|dont) have|i have no|i haven\'?t got"\n            rf"|i\'?ve got no|i (?:do not|don\'?t|dont) own)\\b[^.?!]*"\n            rf"\\b(?:{_MACHINE_NOUNS_SAID})\\b", low)\n            # ⛔⛤ AND THE BARE FORM OF THE SAME SENTENCE. SKILL.md teaches\n            # "no devices — set one up" and it reached the catch-all: the\n            # negation vocabulary above is all first-person, and a person\n            # reporting the state does not always put themselves in it.\n            or re.fullmatch(rf"(?:no|zero|0)\\s+(?:{_MACHINE_NOUNS_SAID})\\b"\n                            rf"[^.?!]{{0,32}}", low)):\n        return ["devices"], None\n\n',
+       '    if not _artefact_kw and (re.search(\n            rf"\\b(?:i (?:do not|don\'?t|dont) have|i have no|i haven\'?t got"\n            rf"|i\'?ve got no|i (?:do not|don\'?t|dont) own)\\b[^.?!]*"\n            rf"\\b(?:{_MACHINE_NOUNS})\\b", low):\n        return ["devices-public"], None\n')]),
     ("R4", SR, "under",
      "the add/pair guard reverts to the narrow list, so \"add my mac\" and "
      "\"connect my workstation\" reach the catch-all — which then offers to "
      "manage devices, the thing it has just failed to do",
-     [('            re.search(rf"\\b(add|pair|connect)\\b.*\\b({_MACHINE_NOUNS})\\b", low)',
-       '            re.search(r"\\b(add|pair|connect)\\b.*\\b(device|node|machine|pc|computer)\\b", low)')]),
+     [('            (re.search(rf"\\b(add|pair|connect)\\b.*\\b({_MACHINE_NOUNS_SAID})\\b", low)',
+       '            (re.search(r"\\b(add|pair|connect)\\b.*\\b(device|node|machine|pc|computer)\\b", low)')]),
     ("R5", SR, "under",
      "the device-list clause reverts, so \"show my computers\" and \"which "
      "machines do I have\" reach the catch-all",
-     [('    _list_wide = re.search(rf"\\b(which|what|list|show|my)\\b.*\\b({_MACHINE_NOUNS})\\b", low)',
+     [('    _list_wide = re.search(rf"\\b(which|what|list|show|my)\\b.*\\b({_MACHINE_NOUNS_SAID})\\b", low)',
        '    _list_wide = None')]),
     ("R6", SR, "under",
      "⛔⛔ THE CATEGORY GUARD REVERTS AND \"ask for a public mac\" RAISES THE "
@@ -305,13 +305,13 @@ MUTANTS = [
      "⛔⛔ A BARE NOUN IS A NAME AGAIN. \"remove my mac\" offers to unlink a "
      "machine called “mac” — a DESTRUCTIVE confirm whose own yes resolves to "
      "\"No device matching “mac”\"",
-     [('    return bool(re.fullmatch(\n        rf"(?:(?:all|every|each|both)\\s+(?:my\\s+|the\\s+|of\\s+my\\s+)?)?"\n        rf"(?:{_MACHINE_NOUNS}|phones?)", (name or "").strip(), re.I))',
+     [('    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*[-_][A-Za-z0-9_-]*[A-Za-z0-9]", w))\n\n',
        '    return False')]),
     ("R13", SR, "under",
      "`phone` drops out of the bare-noun test, and the unlink rule admits it as a "
      "thing people say while nothing in this product is one — so \"remove my "
      "phone\" quotes “phone” back as a machine",
-     [('    return bool(re.fullmatch(\n        rf"(?:(?:all|every|each|both)\\s+(?:my\\s+|the\\s+|of\\s+my\\s+)?)?"\n        rf"(?:{_MACHINE_NOUNS}|phones?)", (name or "").strip(), re.I))',
+     [('    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*[-_][A-Za-z0-9_-]*[A-Za-z0-9]", w))\n\n',
        '    return bool(re.fullmatch(\n        rf"(?:(?:all|every|each|both)\\s+(?:my\\s+|the\\s+|of\\s+my\\s+)?)?"\n        rf"(?:{_MACHINE_NOUNS})", (name or "").strip(), re.I))')]),
     ("R14", SR, "under",
      "⛔⛔ THE DETERMINER CHECK GOES, so \"ask for a mac\" is a NAME again and "
@@ -418,7 +418,7 @@ MUTANTS = [
        '    return True')]),
     ("X3", SR, "under",
      '⛔⛔ THE NO-COMPUTER RULE LOSES ITS LAST GUARD and answers "I don\'t have the report from my laptop" with a device list — a wrong answer where the catch-all would at least be an honest one',
-     [('    if not _artefact_kw and re.search(',
+     [('    if not _artefact_kw and (re.search(',
        '    if re.search(')]),
     ("X4", SR, "under",
      '⛔⛔ THE ARTEFACT GATE APPLIES TO THE WHOLE LIST CLAUSE AGAIN, so "which device is my run on", "list my devices and runs" and "show me my devices and their status" fall into the catch-all that boasts it can manage devices',
@@ -434,7 +434,7 @@ MUTANTS = [
        '    elif (\n')]),
     ("X7", SR, "under",
      '`run on` goes back to bare, so "which device is my run ON" is treated as a switch and the inventory question it is reaches nothing',
-     [('    _dev_verb = re.search(r"\\b(remove|unlink|forget|delete|add|pair|connect|"\n                          r"switch to)\\b|\\brun (?:it |everything )?on\\s+\\S", low)',
+     [('    _dev_verb = re.search(rf"\\b(?:{_UNLINK_VERBS[3:-1]}|add|pair|connect|"\n                          rf"switch to)\\b|\\brun (?:it |everything )?on\\s+\\S", low)',
        '    _dev_verb = re.search(r"\\b(remove|unlink|forget|delete|add|pair|connect|"\n                          r"switch to|run on)\\b", low)')]),
     # ⛔⛔ X8 IS RETIRED, NOT MOVED — 7.9-5b, 2026-09-10. It mutated the body of
     # `_is_bulk_machine_phrase`, which has been FOLDED INTO the one predicate
@@ -453,11 +453,11 @@ MUTANTS = [
        '            return None, ["Which computer should I unlink?"]')]),
     ("X10", SR, "under",
      'the determiner strip narrows back to `the|my`, so "remove that computer" and "unlink their laptop" carry the word into a DESTRUCTIVE confirm',
-     [('        m = re.search(r"\\b(?:remove|unlink|forget|delete)\\s+"\n                      r"(?:the\\s+|a\\s+|an\\s+|my\\s+|their\\s+|its\\s+|that\\s+|this\\s+)?(.+)$",',
+     [('    m = re.search(rf"\\b(?:switch to|run (?:it |everything )?on|use)\\s+"\n                  rf"(?:{_NAME_DETERMINER}\\s+)?(.+)$", t, flags=re.I)',
        '        m = re.search(r"\\b(?:remove|unlink|forget|delete)\\s+(?:the\\s+|my\\s+)?(.+)$",')]),
     ("X11", SR, "under",
      'the quote strip goes and the confirm prints a doubled name — this client tells people to reply with the name in quotes',
-     [('        name = name.strip().strip(_NL_QUOTE_CHARS).strip()\n',
+     [('        name = _quoted_name(t) or name.strip().strip(_NL_QUOTE_CHARS).strip()\n        # ⛔⛤ THE DESTRUCTIVE CONFIRM QUOTED THE WHOLE SENTENCE. This site ran to\n',
        '')]),
     ("X12", SR, "under",
      "⛔⛔ --json PAYS FOR LINES IT THROWS AWAY: up to twenty seconds of wall clock on the STREAMING CRON's own invocation, every minute, to build a string `_emit` discards",

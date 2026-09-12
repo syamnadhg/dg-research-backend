@@ -22,6 +22,7 @@ language.
 """
 
 import importlib.util
+import inspect
 import re
 import sys
 from pathlib import Path
@@ -208,7 +209,6 @@ def test_every_flag_the_router_can_emit_is_in_the_allowlist():
     """⛔⛔ THE STRUCTURAL GUARD, and the reason this defect is not coming back.
     A hand-kept list beside a growing function falls behind silently; this reads
     the function's own source, so a new flag fails here instead of in a chat."""
-    import inspect
     src = inspect.getsource(sr._nl_resolve)
     emitted = set(re.findall(r'"(--[a-z][a-z0-9-]*)"', src))
     assert emitted, "the regex found no flags at all — it has stopped reading"
@@ -218,10 +218,18 @@ def test_every_flag_the_router_can_emit_is_in_the_allowlist():
         "text and push behind `--` — the whole request then fails to parse")
 
 
-def test_no_flag_in_the_allowlist_takes_a_value():
-    """⛔ A VALUE-TAKING FLAG BREAKS THE SAME WAY ONE ARGUMENT ALONG: the flag is
-    kept and its VALUE goes behind `--`. This is why `--runs` is an argument and
-    not a natural-language route."""
+def test_every_value_taking_routed_flag_is_emitted_glued_to_its_value():
+    """⛔ A VALUE-TAKING FLAG BREAKS THE SAME WAY ONE ARGUMENT ALONG: the relay
+    sorts each resolved token into flags-or-positionals by membership, so a bare
+    `--run` lands in flags and its value behind `--`, where it becomes a topic.
+
+    ⛔⛤ THE RULE CHANGED IN WAVE 1.2 AND THE INVARIANT DID NOT. `skip` genuinely
+    needs a run name — a person could not skip a phase of any run but the newest,
+    from chat, at all — so `--run` joined the allowlist. What keeps the relay
+    honest is not "no flag takes a value"; it is that a value-taking flag is
+    emitted as ONE `--flag=value` token, which argparse accepts and the splitter
+    cannot come apart. This asserts that, which is the property the old test was
+    standing in for."""
     parser = sr.build_parser()
     seen = {}
     for action in parser._subparsers._group_actions[0].choices.values():
@@ -230,8 +238,14 @@ def test_no_flag_in_the_allowlist_takes_a_value():
                 if opt in sr._DO_FLAGS:
                     seen[opt] = act.nargs
     assert seen, "no subcommand declares any of the routed flags"
-    for opt, nargs in seen.items():
-        assert nargs == 0, f"{opt} takes a value and cannot be routed from chat"
+    valued = [opt for opt, nargs in seen.items() if nargs != 0]
+    src = inspect.getsource(sr._nl_resolve)
+    for opt in valued:
+        assert f'"{opt} ' not in src and f"'{opt} " not in src, \
+            f"{opt} is emitted as a bare token — its value will become a topic"
+        assert f"{opt}=" in src, f"{opt} takes a value and is never emitted glued"
+    # and the relay matches on the part before the `=`
+    assert 'split("=", 1)[0] in _DO_FLAGS' in inspect.getsource(sr.cmd_do)
 
 
 def test_the_runs_flag_is_actually_registered_on_the_chat_parser():

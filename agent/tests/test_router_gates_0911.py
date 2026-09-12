@@ -423,8 +423,11 @@ def test_a_real_run_command_still_fires(phrase, head):
     # new veto produced an action on the WRONG feature, and only these landings
     # catch that — "did not pause" was true in every one of them.
     ("pause the run on the shared machine", ["pause", "shared machine"]),
-    ("skip the podcast on my computer", ["skip"]),
-    ("skip the video on my mac", ["skip"]),
+    # ⛔⛤ 1.2: the phase is the verb's OBJECT here, so it is extracted.
+    #    Bailing sent these to branch 2, whose bare form resolves the run's
+    #    BLOCKER — a different mutation than the one asked for.
+    ("skip the podcast on my computer", ["skip", "podcast"]),
+    ("skip the video on my mac", ["skip", "video"]),
     ("use this code K7XQ-9B2M", ["device-add", "K7XQ-9B2M"]),
 ])
 def test_where_a_veto_hands_the_message_next(phrase, expected):
@@ -444,7 +447,12 @@ def test_the_question_guard_is_defined_once_for_all_five_branches():
     and silently broke four guards."""
     src = inspect.getsource(sr._nl_resolve)
     assert src.count("_q_start = re.match(") == 1, "the question guard was copied"
-    assert src.index("_q_start = re.match(") < src.index('r"\\bthat.?s enough\\b"'), \
+    # ⛔ THE ANCHOR MOVED IN 1.2, AND A STALE ANCHOR MEASURES NOTHING. The
+    # run-control family's trigger phrases were folded into one pattern per verb
+    # because the branch condition knew the multi-word forms and its own tail
+    # strip did not — so `hold on` became a run TITLE. The subject here is the
+    # ORDER, not the literal, and `_T_STOP` is where that family now begins.
+    assert src.index("_q_start = re.match(") < src.index("_T_STOP = "), \
         "the guard must be defined above the run-control family"
 
 
@@ -635,13 +643,21 @@ def test_a_question_never_executes_a_device_switch(phrase):
 
 
 def test_a_phone_counts_as_a_device_for_the_skip_guard():
-    """⛔⛝ `phones?` IS IN THE SHARED DEVICE-NOUN LIST FOR A REASON. Without it a
-    phone stops counting as a device, so `skip the video on my phone` extracts the
-    PHASE and reconfigures a live run instead of returning a bare skip — and skip
-    is not confirm-gated, so there is no second chance.
+    """⛔⛝ `phones?` IS IN THE SHARED DEVICE-NOUN LIST FOR A REASON.
+
+    ⛔⛤ AND WAVE 1.2 MOVED WHAT THAT REASON PROTECTS. The guard used to bail on
+    ANY machine noun, so `skip the video on my phone` returned a bare skip — and
+    the bare form resolves the run's current BLOCKER, a different mutation than
+    the person asked for. The phase is the verb's OBJECT there and the phone is
+    WHERE, so it is extracted now. What the shared noun list still decides, and
+    what this pins, is the SET refusal and the device branches: a plural phone is
+    a set of machines, and `remove my phone` is an unlink, not a skip.
     """
-    assert _r("skip the video on my phone")[0] == ["skip"], _r("skip the video on my phone")
+    assert _r("skip the video on my phone")[0] == ["skip", "video"]
     assert _refused_as_a_set("skip the podcast on my phones")
+    argv, _ = _r("remove my phone")
+    assert argv is None or argv[0] != "skip", argv
+    assert _r("hide my phone")[0][:2] == ["device-visibility", "private"]
 
 
 @pytest.mark.parametrize("name", ["Nodes and Bolts PC", "Nodes or Bolts Mac",
@@ -765,7 +781,7 @@ def test_the_drop_guard_does_not_break_the_branches_below_it():
     the switch and skip branches must still get there."""
     assert _r("switch to the office PC")[0] == ["device-use", "office PC"]
     assert _r("run everything on my Studio PC")[0] == ["device-use", "Studio PC"]
-    assert _r("skip the podcast on my computer")[0] == ["skip"]
+    assert _r("skip the podcast on my computer")[0] == ["skip", "podcast"]
     assert _r("skip the video")[0] == ["skip", "video"]
     assert _r("pause the run on the shared machine")[0] == ["pause", "shared machine"]
 

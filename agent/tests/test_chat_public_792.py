@@ -508,8 +508,12 @@ def test_the_new_rules_route_no_flags():
     # harness pin that line verbatim, and a stale anchor is a hard red on the
     # backend suite's ratchet — not a survivor. Every object here is a
     # POSITIONAL, which is also what the store_true rule requires.
+    # ⛔⛤ `--run` JOINED IN WAVE 1.2. A person could not skip a phase of any run but
+    # the newest active one, from chat, at all — nineteen phrasings dropped the
+    # name. It is the first routed flag that carries a VALUE, which is why it is
+    # emitted as one `--run=<name>` token; see the picker suite for that invariant.
     assert sr._DO_FLAGS == frozenset({"--no-video", "--no-email", "--machine",
-                                      "--agent-log"})
+                                      "--agent-log", "--run"})
     # ⛔ SLICED ON CODE, NOT ON THE COMMENT HEADINGS. `code_only` blanks comments
     # — which is the point of it — so a slice keyed on "2d. PUBLIC COMPUTERS"
     # finds nothing and the guard dies with a ValueError instead of an assertion.
@@ -520,7 +524,11 @@ def test_the_new_rules_route_no_flags():
     # collected — so the literal gained one character. The slice still has to open
     # at the public-computer block, which is what the two asserts below check.
     start = src.index("_public_kw = (re.search(")
-    end = src.index('r"\\b(stop|end|abort|cancel)\\b"')
+    # ⛔ THE END ANCHOR MOVED ON 09-11 TOO. Wave 1.2 folded the three spellings of
+    # the stop-verb list into one constant, so the literal this looked for is gone.
+    # A stale anchor here does not fail loudly — `.index` raises, which is why the
+    # guard above exists — but the SLICE is the subject, not the literal.
+    end = src.index('_stop_verbs = ')
     block = src[start:end]
     assert "devices-public" in block and "device-requests" in block, \
         "the slice lost its own subject"

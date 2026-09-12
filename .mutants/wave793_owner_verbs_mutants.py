@@ -561,10 +561,8 @@ MUTANTS = [
     ("N2", SR, "under",
      "⛔⛔ `_mine_kw` GETS ITS OWN LITERAL BACK, which is how the two drifted "
      "apart in the first place — the shared list is the fix, not the wording",
-     [('    _mine_kw = re.search(rf"\\b(my|mine|our|this)\\b(?:\\s+\\w+){{0,2}}\\s+"\n'
-       '                         rf"(?:{_MACHINE_NOUNS})\\b", low)',
-       '    _mine_kw = re.search(r"\\b(my|mine|our|this)\\b(?:\\s+\\w+){0,2}\\s+"\n'
-       '                         r"(?:computers?|machines?|devices?|pcs?)\\b", low)')]),
+     [('    _mine_kw = re.search(rf"\\b(my|mine|our|this)\\b"\n                         rf"(?:\\s+(?!(?:{_POLARITY_WORDS[3:-1]})\\b)[\\w\'-]+){{0,4}}\\s+"\n                         rf"(?:{_MACHINE_NOUNS_SAID})\\b", low)',
+       '    _mine_kw = re.search(r"\\b(my|mine|our|this)\\b(?:\\s+\\w+){0,2}\\s+"\n                         r"(?:computers?|machines?|devices?|pcs?)\\b", low)')]),
     ("N3", SR, "under",
      "⛔ the hiding words lose the phrasings with no \"private\" in them, and "
      "\"stop letting people find my pc\" goes back to rule 3, which quotes it "
@@ -725,7 +723,7 @@ MUTANTS = [
      "⛔⛔ THE NOUN LIST GOES BACK TO BEING PER-FUNCTION, which is how two copies "
      "drifted by two words and broke four guards for the commonest word for a "
      "Mac — and how three MORE copies were found still carrying the old set",
-     [('    _device_noun = re.search(rf"\\b({_MACHINE_NOUNS}|phones?)\\b", low)',
+     [('    _device_noun = re.search(rf"\\b({_MACHINE_NOUNS_SAID})\\b", low)',
        '    _device_noun = re.search(r"\\b(device|node|laptop|pc|computer|machine|'
        'phone|desktop)\\b", low)')]),
     ("W2", SR, "under",
@@ -764,8 +762,7 @@ MUTANTS = [
     ("W6", SR, "under",
      "⛔⛔ A VERB-FIRST HIDE DROPS THE MACHINE NAME AGAIN, so \"hide the studio "
      "pc\" hides whichever machine the picker returns — unconfirmed",
-     [('               or re.search(r"\\b(?:hide|unlist|unpublish|delist)\\s+(.+?)$",\n'
-       '                            t, flags=re.I)\n',
+     [('               or re.search(rf"\\b{_VIS_HIDE_ALL}\\s+(.+?)$", t, flags=re.I)\n',
        '')]),
     ("W7", SR, "over",
      "⛔ the object guard tests the MESSAGE instead of the capture, so every "
@@ -810,7 +807,7 @@ MUTANTS = [
      "⛔⛔ \"RESEARCH COMPUTER\" IS AN ARTEFACT AGAIN — the default label of every "
      "unnamed machine, so every owner verb aimed at one dies, including the exact "
      "string this client tells people to type",
-     [('    _low_no_rc = re.sub(rf"\\bresearch(?:es)?\\s+(?:{_MACHINE_NOUNS})\\b", "  ", low)',
+     [('    _low_no_rc = re.sub(rf"\\bresearch(?:es)?\\s+(?:{_NAME_DETERMINER}\\s+)?"\n                        rf"(?:own\\s+)?(?:{_MACHINE_NOUNS_SAID})\\b", "  ", low)',
        '    _low_no_rc = low')]),
     ("W14", SR, "over",
      "⛔ the pairing rule eats a publish request again — \"add my computer to the "

@@ -1142,9 +1142,23 @@ def test_the_shared_noun_list_reaches_the_skip_guard_too(noun):
     # became `skip video` on the live run instead of a bare skip. `skip` is not
     # confirm-gated, so this is the copy where being wrong changes a RUN rather
     # than a setting.
+    # ⛔⛤ WAVE 1.2 SPLIT THIS QUESTION IN TWO, AND THE GUARD KEPT THE HALF THAT
+    # MATTERS. Bailing on every machine noun ALSO killed `skip the podcast on my
+    # computer`: branch 2 caught it and returned the bare form, which resolves
+    # the run's current BLOCKER — so a person who named a PHASE got a different
+    # mutation, silently. The machine in that sentence is WHERE, not WHAT.
+    # What still bails is a message where the phase word is not the verb's
+    # object — `remove my mac`, `remove claude's laptop` — and a phase word that
+    # is part of a machine NAME, `remove my video PC`, which is the swap this
+    # guard exists to prevent and which the exception could have reopened.
     for phase in ("video", "podcast", "report"):
         argv, _lines = sr._nl_resolve(f"skip the {phase} on my {noun}")
-        assert phase not in (argv or []), (noun, phase, argv)
+        assert argv == ["skip", phase], (noun, phase, argv)
+        # the machine-named forms still cannot reach a phase
+        for said in (f"remove my {noun}", f"unlink my {noun}",
+                     f"remove my {phase} {noun}"):
+            argv2, _l2 = sr._nl_resolve(said)
+            assert argv2 is None or argv2[0] != "skip", (said, argv2)
 
 
 @pytest.mark.parametrize("noun", ["computer", "machine", "mac", "macbook",

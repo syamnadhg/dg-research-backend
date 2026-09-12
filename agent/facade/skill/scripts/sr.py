@@ -1838,6 +1838,65 @@ def _looks_like_a_device_id(wanted: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*[-_][A-Za-z0-9_-]*[A-Za-z0-9]", w))
 
 
+# ⛔⛔⛔ A SENTENCE FRAGMENT IS NOT A MACHINE NAME, AND CROSS-VERIFY FOUND THIS
+# WAVE MINTING THEM. The capture arms take whatever sits between a verb and a
+# polarity word, and ordinary English put these into a lookup that HIDES with no
+# confirm:
+#     `why is my mac not public`        -> “mac not”  -> hid “Mac Notebook”
+#     `make sure my mac is not public`  -> “sure my mac is” -> offered to PUBLISH
+#     `my mac should not be public`     -> “should not be”  -> refused
+#     `add my computer to the public list` -> “to the”
+# ⭐ THE TEST IS THE LAST WORD. A machine name ends in a machine noun, an
+# identifier, or a word somebody chose; it never ends in a copula, a modal, a
+# negator, a preposition or a determiner. Applied after every trim, so it judges
+# what the command is actually about to act on.
+_NOT_A_NAME_TAIL = (r"(?:is|are|was|were|be|been|being|am|isn'?t|aren'?t|wasn'?t|"
+                    r"weren'?t|has|have|had|do|does|did|doesn'?t|don'?t|didn'?t|"
+                    r"should|shouldn'?t|would|wouldn'?t|will|won'?t|can|can'?t|"
+                    r"could|couldn'?t|may|might|must|mustn'?t|shall|need|needs|"
+                    r"want|wants|keep|keeps|stay|stays|remain|remains|get|gets|"
+                    r"not|never|no|nor|and|or|but|if|so|to|of|in|on|at|by|for|"
+                    r"from|with|into|onto|about|the|a|an|my|our|your|their|its|"
+                    r"his|her|that|this|these|those|it|them|me|us|you|i|we|they)")
+
+
+def _names_a_machine(span: str) -> bool:
+    """Could this captured span be a machine somebody named?
+
+    ⛔ It is a test on the LAST WORD, not on the whole span, because a real name
+    can contain any of these words — “Now or Never Mac”, “Show and Tell PC”,
+    “Not My Mac” — and only the ending tells you whether the capture stopped
+    where a name stops or where a clause does.
+    """
+    w = (span or "").strip().strip(_NL_QUOTE_CHARS).strip()
+    if not w:
+        return False
+    return not re.search(rf"(?:^|\s){_NOT_A_NAME_TAIL}$", w, re.I)
+
+
+def _looks_like_a_machine_token(word: str) -> bool:
+    """Is this bare word a machine somebody would type without a noun in front?
+
+    ⛔⛔ WAVE 1.2 MEASURED 432 DEAD PHRASINGS IN THIS ONE SHAPE — more than a
+    third of everything the capture corpus killed. `hide LABPC001`,
+    `make LABPC001 public` and `remove LABPC001` all reached the catch-all,
+    because hide, publish and unlink each require a machine NOUN in the message
+    and a bare id carries none. `switch to LABPC001` worked, so the person had no
+    way of knowing which verbs would take it.
+
+    ⛔ `_looks_like_a_device_id` CANNOT ANSWER THIS. It demands a hyphen or an
+    underscore, which is right for an id the app minted and wrong for a hostname
+    a person reads off a screen: LABPC001 has neither. This is the weaker test —
+    a digit or a separator, no spaces, and never a bare number, which would make
+    `hide 2024` name a machine.
+    """
+    w = (word or "").strip().strip(_NL_QUOTE_CHARS)
+    if " " in w or len(w) < 5 or w.isdigit():
+        return False
+    return bool(re.search(r"\d", w) or re.search(r"[-_]", w)) and \
+        bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", w))
+
+
 def _resolve_public_device(wanted: str):
     """Turn what the person said into one public row, or the lines to say instead.
 
@@ -2968,9 +3027,22 @@ def cmd_skip(args) -> int:
     # when reached; turn named agents off — the app's per-agent toggle write).
     phases = []
     agents = []
+    # ⛔⛔ THE REFUSAL NAMES EVERYTHING THIS COMMAND ACCEPTS, AND IT IS DERIVED.
+    # Hand-written it listed four of the seven phase words and three of the six
+    # agent words, so `audio`, `youtube`, `openai` and `anthropic` all WORKED and
+    # the error message said they did not.
+    _accepted = (f"{'/'.join(str(n) for n in _SKIP_PHASE_NUMBERS)}, "
+                 f"{'/'.join(_SKIP_NAMES)}, or a Research agent: "
+                 f"{'/'.join(_SKIP_AGENTS)}")
     for p in args.phases:
         lp = p.lower()
         if p.isdigit():
+            # ⛔ ANY INTEGER PARSED AND POSTED — `sr skip 0`, `sr skip 2` (the
+            # Research stage, which is not skippable) and `sr skip 99` all reached
+            # the backend. The router cannot produce one, the CLI could.
+            if int(p) not in _SKIP_PHASE_NUMBERS:
+                return _emit({}, args.json,
+                             [f"✗ phase {int(p)} isn’t one I can skip ({_accepted})"], 1)
             phases.append(int(p))
         elif lp in _SKIP_NAMES:
             phases.append(_SKIP_NAMES[lp])
@@ -2978,11 +3050,10 @@ def cmd_skip(args) -> int:
             agents.append(_SKIP_AGENTS[lp])
         else:
             return _emit({}, args.json,
-                         [f"✗ unknown phase '{p}' (1/3/4/5, brief/podcast/video/report, "
-                          f"or a Research agent: chatgpt/gemini/claude)"], 1)
+                         [f"✗ unknown phase '{p}' ({_accepted})"], 1)
     payload: dict = {}
     if phases:
-        payload["phases"] = phases
+        payload["phases"] = sorted(set(phases))
     if agents:
         payload["agents"] = sorted(set(agents))
     code, b2 = _post(f"/research/{q}/skip", payload)
@@ -3352,10 +3423,19 @@ _NL_GENERIC_RUN = {"it", "that", "this", "them", "run", "the run", "this run",
                    "research", "the last one", "everything",
                    # the product's own name is never a run title
                    "super", "super research", "the super research"}
-_NL_PHASE_WORDS = ("brief", "podcast", "video", "report", "email")
-# P2 agent nouns for skip asks ("skip Claude in P2"). Ordered longest-first so
-# "chatgpt" wins its substring "gpt" when rendering back into skip args.
-_NL_AGENT_WORDS = ("chatgpt", "claude", "gemini", "gpt")
+# ⛔⛔ DERIVED FROM THE COMMAND'S OWN MAPS, because hand-written they went short
+# and the shortfall was invisible: `sr skip audio` and `sr skip youtube` work at
+# the CLI and `skip the audio` reached the router's bare form, which resolves the
+# run's current BLOCKER instead — a mutating act nobody asked for. Same for
+# `openai` and `anthropic`, which `_SKIP_AGENTS` maps and this list did not.
+# ⭐ Longest-first so "chatgpt" wins its own substring "gpt" when rendering back.
+_NL_PHASE_WORDS = tuple(sorted(dict.fromkeys(_SKIP_NAMES), key=len, reverse=True))
+_NL_AGENT_WORDS = tuple(sorted(dict.fromkeys(_SKIP_AGENTS), key=len, reverse=True))
+# Every phase the CLI can be told to skip, as numbers — the complement set an
+# "all but X" ask has to be turned into.
+_SKIP_PHASE_NUMBERS = tuple(sorted(set(_SKIP_NAMES.values())))
+_NL_SKIP_ONE_RUN = ("I skip one run at a time. Ask me to list the running "
+                    "ones and name it — nothing changes until you do.")
 # Destructive verbs → the user-facing confirm question (AI runs the real
 # command on "yes"; mirrors the SKILL.md Safety confirm-first list).
 # The quote marks a person or a chat runtime can wrap a name in. ⛔ ALL SIX:
@@ -3371,6 +3451,28 @@ _NL_AGENT_WORDS = ("chatgpt", "claude", "gemini", "gpt")
 # asks "is a computer being talked about" now reads this one name.
 _MACHINE_NOUNS = (r"computers?|devices?|machines?|nodes?|pcs?|laptops?"
                   r"|macs?|macbooks?|desktops?|workstations?")
+# ⛔⛔ THE WORDS PEOPLE SAY, WHICH IS NOT THE SAME LIST. `phone` belongs here and
+# NOT in `_MACHINE_NOUNS`: nothing in this product is a phone, so it can never be
+# a machine NAME either, and `_MACHINE_NOUNS` is read by the leading-noun strip
+# and the bare-noun test where that distinction matters. That decision is right
+# and it stays — what was wrong is that FIVE separate sites then hand-spliced
+# `|phones?` back on, and the sites that DIDN'T were the admission tests. So
+# `hide my phone` reached the catch-all while `hide my phones` got the set
+# refusal, and `remove my phone` worked. One constant, every reader.
+def _alt(words: "tuple[str, ...]") -> str:
+    """A safe alternation: longest first, and ALWAYS its own group.
+
+    ⛔ A constant that leaks alternatives is the 7.9-5 defect's own shape — see
+    the note above `_MACHINE_PLURAL`. Never return a bare `a|b`.
+    """
+    return "(?:" + "|".join(sorted(set(words), key=len, reverse=True)) + ")"
+
+
+_MACHINE_NOUNS_SAID = _MACHINE_NOUNS + r"|phones?"
+# The verbs that unlink a machine. `drop` is one of them and reached the
+# catch-all; spelled at the gate and not at the capture, it then reached a
+# confirm with no name at all.
+_UNLINK_VERBS = r"(?:remove|unlink|forget|delete|drop)"
 
 
 # ⛔⛔ FOUR OF THESE WORDS ARE ALSO WORDS PEOPLE PUT IN A MACHINE'S NAME, and
@@ -3417,9 +3519,29 @@ def _strip_leading_noun(name: str) -> str:
     strip had always been wrong here, and the refusal was hiding it. ⛔ A fix that
     turns a WRONG REFUSAL into a WRONG ACTION is not a fix, so this guard ships in
     the same change as the signal that exposed it.
+    ⛔⛔ AND A REMAINDER THAT NAMES NOTHING IS THE SAME PROOF. `my Nodes Mac` has a
+    device noun for its FIRST word and a device noun for its LAST, so stripping the
+    first leaves "Mac" — a bare noun, which every caller blanks. Wave 1.2 gave this
+    strip to the visibility branch and instantly lost the name on twenty frames of
+    that one machine. A strip that leaves nothing behind did not find a category
+    word; it ate half a name. Same principle as `_trim_trailing_clause`'s own
+    never-return-empty guard, and it was missing here.
     """
     def _kept(rest: str, whole: str) -> str:
-        return whole if re.match(r"^(?:and|or|&|plus|as\s+well\s+as)\b", rest, re.I) else rest
+        # ⛔⛤ AND IT LOOKS PAST A TAIL WORD. `my Nodes Mac today` left “Mac today”,
+        # which is not a bare noun — so the guard passed and the strip still ate
+        # half the name. What matters is whether the remainder names anything
+        # once the words a name can END in are set aside.
+        if _is_bare_machine_noun(rest) or _is_bare_machine_noun(
+                re.sub(rf"[\s,;]+{_NAME_TAIL_COMMA_ONLY}$", "", rest, flags=re.I)):
+            return whole
+        # ⛔ THE WORD BOUNDARY IS WHY `&` SLIPPED THROUGH THIS GUARD. `\b` after a
+        # `&` needs a word character on ONE side only, and `"& Bolts"` has a
+        # space there — so `hide "Nodes & Bolts"` had its first word eaten as a
+        # category noun and came out as “& Bolts”. The guard was right; its
+        # anchor was wrong. Symbols get no boundary; words keep theirs.
+        return whole if re.match(r"^(?:(?:and|or|plus|as\s+well\s+as)\b|[&+])",
+                                 rest, re.I) else rest
     whole = (name or "").strip()
     m = re.match(rf"^(?:{_UNAMBIGUOUS_NOUNS})\s+(.+)$", whole, re.I)
     if m:
@@ -3462,8 +3584,8 @@ def _strip_leading_noun(name: str) -> str:
 # reintroduced by me in the predicate written to replace it, and caught only
 # because the name corpus ran against the live code and not against my model of
 # it. A constant that is safe to interpolate ANYWHERE cannot leak alternatives.
-_MACHINE_PLURAL = "(?:" + _MACHINE_NOUNS.replace("s?", "s") + "|phones)"
-_MACHINE_SINGULAR = "(?:" + _MACHINE_NOUNS.replace("s?", "") + "|phone)"
+_MACHINE_PLURAL = "(?:" + _MACHINE_NOUNS_SAID.replace("s?", "s") + ")"
+_MACHINE_SINGULAR = "(?:" + _MACHINE_NOUNS_SAID.replace("s?", "") + ")"
 # ⛔ RUN NOUNS ARE A SEPARATE LIST BECAUSE `research` IS A MASS NOUN. "stop all of
 # my research" names a set with no plural form anywhere in it, so a plural-only
 # test cannot see it — measured, it was one of this design's 17 original misses.
@@ -3524,9 +3646,67 @@ _SET_POSSESSIVE = rf"{_SET_POSS_WORD}(?:{_SET_COUNT})?(?:{_SET_ADJECTIVE})?"
 # continuation of `and` lets any name whose SECOND word is a device noun satisfy
 # it. The sets those two words were carrying are carried properly now, by the
 # conjunction signal below — which is the reading they always needed.
-_SET_HEAD = (r"(?=\s*$|[,.;:!?]|\s+(?:public|private|hidden|unlisted|findable|"
-             r"discoverable|visible|alone|too|please|now|also|instead|again|"
-             r"anymore|today))")
+# ⛔⛔ THE WORDS THAT END A NAME, IN TWO HALVES, AND EVERY CONSUMER DERIVES FROM
+# THEM. The set head used to spell this list inline, and wave 1.2 measured the
+# cost of that: a POLITENESS word ran into the captured name at six separate
+# capture sites — `hide my Studio PC please` refused “Studio PC please” — while
+# the only list in the file that already knew those words end a name sat right
+# here, unread by any of them. 592 of 7,091 driven phrasings broke on a word the
+# person added to be polite.
+# ⛔ THE HALVES ARE NOT INTERCHANGEABLE. The polarity half belongs to the COMMAND
+# — trimming `public` off a name would delete the instruction — so only the
+# adverbial half is a name tail. Splitting them here is what lets one list serve
+# both readers without a fifth hand copy going short. (7.9-5b, 1.1.)
+_NAME_END_POLARITY = ("public", "private", "hidden", "unlisted", "findable",
+                      "discoverable", "visible")
+_NAME_END_ADVERB = ("alone", "too", "please", "now", "also", "instead",
+                    "again", "anymore", "today")
+_SET_HEAD = (r"(?=\s*$|[,.;:!?]|\s+(?:"
+             + "|".join(_NAME_END_POLARITY + _NAME_END_ADVERB) + r"))")
+
+# The politeness a person adds that no machine, run or person is named after.
+# ⛔ SEPARATE FROM THE ADVERBS ON PURPOSE: these are multi-word and none of them
+# is in the set head, so they cannot be derived from it — but they also carry no
+# risk, because nothing is called “thank you”.
+_POLITE_TAIL = (r"(?:pls|plz|thanks|thank\s+you|thx|ta|cheers|for\s+me|"
+                r"if\s+you\s+(?:can|could|would)|"
+                r"when(?:ever)?\s+you\s+(?:can|get\s+a\s+chance|have\s+time)|"
+                r"right\s+(?:now|away)|ok|okay|asap|for\s+now|of\s+course)")
+# ⛔⛔⛔ THE TAIL LIST SPLITS BY CONSEQUENCE, AND CROSS-VERIFY IS WHY. Trimming
+# every word in `_NAME_END_ADVERB` unconditionally produced the one outcome this
+# file refuses above all others: an act on the WRONG MACHINE. Measured, on an
+# account holding both “Studio PC Now” and “Studio PC” —
+#     `hide my Studio PC Now`      HID “Studio PC”, no confirm
+#     `switch to my Studio PC Now` SWITCHED to “Studio PC”, no confirm
+#     `remove my Studio PC Now`    offered to UNLINK the wrong one
+#     `ask for Studio PC Now`      disclosed the asker to the wrong OWNER
+# 118 distinct name→machine pairs, 430 of them on branches that do not confirm.
+# The truncation is always a SUBSTRING of the real name, so the real machine
+# always matches too — the wrong one wins whenever the account holds a machine
+# whose whole name equals the truncation, which is exactly what a person does
+# when they buy a second one.
+# ⭐⭐ SO THE WORDS SPLIT. Nobody calls a machine “please” or “thanks”, and those
+# fixed 592 phrasings at no risk. `now`, `today`, `also`, `alone`, `too`, `again`,
+# `anymore`, `instead` all appear in real names, so they come off only behind a
+# COMMA — `hide my mac, now` yes, `hide my Studio PC Now` no.
+# ⛔ A FIX THAT TURNS A WRONG REFUSAL INTO A WRONG ACTION IS NOT A FIX. This
+# file's own words, from the wave before this one.
+# `please` sits with the polite words, not the adverbs: it is the single
+# commonest one and no machine is called it.
+# ⛔ BUILT BY INTERPOLATION, NOT BY PULLING WORDS OUT OF A REGEX. My first version
+# ran `findall` over `_POLITE_TAIL`'s SOURCE and harvested a bare `now` out of
+# `right now` — so `hide my Studio PC Now` lost its last word again, by a road the
+# split was written to close. A pattern is not a word list.
+_NAME_TAIL_ALWAYS = rf"(?:please|{_POLITE_TAIL[3:-1]})"
+_NAME_TAIL_COMMA_ONLY = _alt(tuple(w for w in _NAME_END_ADVERB if w != "please"))
+# ⛔ TWO PATTERNS, NOT ONE ALTERNATION, because the caller treats them
+# differently: a COMMA is the person separating the tail from the name, so a
+# bare-noun remainder after one is the picker and correct; a SPACE leaves no
+# such evidence, so a bare-noun remainder there means the trim ate half a name.
+_NAME_TAIL_SPACED = re.compile(rf"(?:\s*[,;]\s*|\s+){_NAME_TAIL_ALWAYS}"
+                               rf"\s*[.!?]*$", re.I)
+_NAME_TAIL_COMMAED = re.compile(rf"\s*[,;]\s*(?:{_NAME_TAIL_COMMA_ONLY[3:-1]}|"
+                                rf"{_NAME_TAIL_ALWAYS[3:-1]})\s*[.!?]*$", re.I)
 _SET_SIGNAL_PLURAL = re.compile(
     rf"\b{_SET_POSSESSIVE}(?:{_MACHINE_PLURAL}|{_RUN_PLURAL})\b{_SET_HEAD}", re.I)
 # 2. A QUANTIFIER BINDING A SINGULAR noun through the determiner slot. `hide every
@@ -3679,8 +3859,89 @@ _SET_SIGNALS = (_SET_SIGNAL_PLURAL, _SET_SIGNAL_QUANTIFIED, _SET_SIGNAL_COLLECTI
 # need to know "did somebody ask to CHANGE something here", and two copies of a
 # verb list two lines apart is exactly how `_machine_kw` and `_mine_kw` drifted by
 # two words and silently broke four guards.
-_VIS_SETTERS = (r"(?:make|set|switch|turn|put|hide|unlist|unpublish|offer|share|"
-                r"publish|disable|take|remove|drop|pull)")
+# ⛔⛔⛔ ONE LIST PER ROLE, AND EVERY READER DERIVES FROM IT. Wave 1.2 measured the
+# price of the alternative: FOUR hand copies of the setter list existed (this one,
+# `_polite_imperative`, the quoted arm of `_named_target`, and the explicit half of
+# `_ACT_VERBS`, which re-listed eight words the splice already carried), plus TWO
+# polarity lists neither derived from the other. **Every "dead word" defect in the
+# wave was a copy that had gone short.** This is 7.9-5b's lesson and 1.1's lesson
+# landing in the same place: a hand-written list goes short, and it goes short
+# silently, because a missing word looks exactly like a word nobody says.
+#
+# ⛔⛔ AND THE SETTER LIST IS A TARGET LIST, NOT A SIGNAL LIST — measured, and it
+# is the single fact that explains most of group B. The branch is admitted by
+# `_public_kw | _offering_kw | _hiding_kw` alone, so a verb that lives only here
+# cannot start anything. Proof in both directions: `my Studio PC public`, with no
+# verb at all, reached the publish confirm, while `publish my Studio PC` reached
+# the DEVICE LIST. Eleven of the sixteen words were in no signal.
+#
+# THE ROLES, and what each one means:
+#   POLAR   — needs a polarity word after the name:  "make X public"
+#   HIDE    — is itself the hide, no polarity word:  "unlist X"
+#   PUBLISH — is itself the publish, no polarity word: "offer X"
+#   OFF     — "take X off the list" — needs the off/out-of/from shape
+_VIS_POLAR_VERBS = ("make", "set", "switch", "turn", "put", "take")
+_VIS_HIDE_VERBS = ("hide", "unlist", "unpublish", "delist", "disable",
+                   "unshare", "deregister")
+# ⛔ `list` AND `post` ARE DELIBERATELY ABSENT. `list` is the device-LIST request
+# word — admitting it here would hand every "list my computers" to the visibility
+# branch — and `post` collides with posting a brief. `register` is absent because
+# "register my computer" is how people ask to PAIR one.
+_VIS_PUBLISH_VERBS = ("publish", "offer", "share", "advertise", "expose")
+_VIS_OFF_VERBS = ("take", "remove", "drop", "pull")
+
+
+def _inflect(verbs: "tuple[str, ...]") -> "tuple[str, ...]":
+    """bare, -s and -ing for each verb — BUILT, never typed.
+
+    ⛔⛔ WAVE 1.2 MEASURED THAT NO `-s` FORM ANYWHERE IN THIS FILE FIRED, and that
+    the two sides were exact inverses: the hide side had only the BARE form
+    (`hiding my mac` was dead) and the publish side only the `-ing` form
+    (`offer my mac` was dead, `offering my mac` worked). Nobody chose that; it is
+    what two hand-written lists drift into.
+    """
+    out = []
+    for v in verbs:
+        out.append(v)
+        out.append(v + "es" if re.search(r"(?:sh|ch|s|x|z)$", v) else v + "s")
+        out.append(v[:-1] + "ing" if v.endswith("e") else v + "ing")
+    return tuple(sorted(dict.fromkeys(out), key=len, reverse=True))
+
+
+
+_VIS_SETTERS = _alt(_VIS_POLAR_VERBS + _VIS_HIDE_VERBS + _VIS_PUBLISH_VERBS
+                    + _VIS_OFF_VERBS)
+_VIS_HIDE_ALL = _alt(_inflect(_VIS_HIDE_VERBS))
+# The polarity words that MEAN hidden — one list, read by the hide signal and by
+# the negation test that inverts it. They were two lists that had drifted apart.
+# ⛔⛔ THE POLARITY WORDS SPLIT BY SIDE, BECAUSE THE SIDES ARE NOT
+# INTERCHANGEABLE — 1.1's asymmetry, and deriving the publish-side negation test
+# from the WHOLE list broke it within minutes: negating a PUBLISH is a concrete
+# hide, so `make my mac not private` is a publish; negating a HIDE names no state
+# at all, so it is not a command. Two of 1.1's own tests caught it. One list per
+# side, and a union for the readers that want both.
+_PUBLISH_POLARITY_WORDS = ("public", "publicly", "findable", "discoverable",
+                           "visible", "shared", "sharing", "listed")
+_HIDE_POLARITY_WORDS = ("private", "hidden", "unlisted", "invisible",
+                        "undiscoverable")
+_HIDE_POLARITY = _alt(_HIDE_POLARITY_WORDS)
+# Every word that can sit after a name and mean "this is the setting". The name
+# ends where one of these begins — which is exactly what `_SET_HEAD` uses its
+# polarity half for, so the two are the same list plus the two hide-only words
+# that were never in it. `make my Studio PC undiscoverable` dropped the name for
+# want of them.
+# ⛔ THE `-ly` FORMS ARE HERE AND NOT IN `_NAME_END_POLARITY`, which also builds
+# the set head. `\bpublic\b` does not match "publicly", so `list my Studio PC
+# publicly` and `offer my Studio PC publicly` reached the confirm with NO NAME —
+# a word the polarity list has held all along, in a spelling it never had.
+_VIS_POLARITY_ALL = _alt(_NAME_END_POLARITY + ("invisible", "undiscoverable",
+                                               "publicly", "privately"))
+# The determiners a name can hide behind. Spelled separately at four capture
+# sites, they disagreed: unlink stripped eight, switch stripped two, and the six
+# switch was missing rode into a lookup that cannot resolve them.
+_NAME_DETERMINER = _alt(("the", "a", "an", "my", "our", "your", "their", "its",
+                         "his", "her", "that", "this"))
+_VIS_PUBLISH_ALL = _alt(_inflect(_VIS_PUBLISH_VERBS))
 
 # ⛔⛔⛔ A NEGATION IS NOT THE VERB IT CONTAINS — AND THIS FILE ALREADY KNEW THAT.
 # The decide clause carries `_negated_decide` with the whole vocabulary and the
@@ -3711,27 +3972,44 @@ _NEG_WORDS = (r"(?:don'?t|dont|do\s+not|does\s+not|doesn'?t|never|no\s+longer|no
               r"rather\s+not|please\s+don'?t)")
 # ⛔ THE INTERVENING WORDS ARE A CLOSED LIST. A free span here is how the old
 # 40-character negation arm came to read a machine NAME as a negation.
-_NEG_FILLER = r"(?:\s+(?:you|i|we|it|to|please|ever|even|really|actually|just|bother(?:ing)?|want\s+to|need\s+to|try(?:ing)?\s+to))*"
+# ⛔⛤ `keep` JOINED AFTER CROSS-VERIFY. `don't keep hiding my Studio PC` ran an
+# UNCONFIRMED HIDE — the ask was to STOP hiding it. The gerunds entered the act
+# verbs this wave, and the filler between the negator and the verb had never had
+# to carry `keep` before, because no `-ing` form could be the verb.
+_NEG_FILLER = r"(?:\s+(?:you|i|we|it|to|please|ever|even|really|actually|just|bother(?:ing)?|keep|keeps|continue|carry\s+on|want\s+to|need\s+to|try(?:ing)?\s+to))*"
 # ⭐ THE ACT VERBS, DERIVED FROM THE INVENTORIES THAT ALREADY EXIST rather than
 # hand-written a fourth time — a hand-written copy is what left `status` out of
 # the pairing guard and every visibility verb out of its sibling.
-_ACT_VERBS = (rf"(?:{_VIS_SETTERS[3:-1]}|hide|unlist|unpublish|delist|disable|unshare|"
-              rf"send|share|pair|add|connect|link|unlink|remove|forget|delete|unpair|"
-              rf"pause|resume|unpause|retry|stop|end|abort|cancel|skip|drop|"
-              rf"approve|accept|allow|grant|deny|refuse|reject|block|"
-              rf"research|look\s+into|investigate|start|run|switch|use|update|install|"
-              rf"uninstall|reset|rename|sign\s+out|log\s+out|logout"
-              # ⛔ THE READ VERBS BELONG HERE AS WELL. `stop trying to fetch the
-              # podcast` FETCHED IT — the veto never fired because `fetch` was
-              # missing, and the message then reached the podcast branch.
-              rf"|fetch|get|show|list|tell|display|download|open|play|status|check"
-              # ⛔⛔ AND THE ASK SURFACE WAS MISSING ENTIRELY — the hand-written
-              # list went short by four, which is the failure this file records
-              # twice already. `don'?t ask to use the Lab Mac` still offered to
-              # hand the owner the person's name and email.
-              rf"|ask|request|borrow|apply)")
-_POLARITY_WORDS = (r"(?:public(?:ly)?|findable|discoverable|visible|shared|sharing|"
-                   r"listed|private|hidden|unlisted|invisible)")
+# ⛔ THE SPLICE ALREADY CARRIES THE SETTERS — and this list re-typed EIGHT of them
+# anyway (switch, hide, unlist, unpublish, share, disable, remove, drop), which is
+# proof the explicit half was written without reading the spliced half. Harmless
+# to the regex; not harmless as evidence, because the same habit is what left
+# `link` in here and nowhere else, where its veto can never fire.
+# ⛔⛔ TWO HALVES, BECAUSE TWO DIFFERENT QUESTIONS READ THIS. The NEGATION veto
+# wants every verb — `stop trying to fetch the podcast` FETCHED IT until the read
+# verbs were added. The COMPOUND-ASK test wants only the verbs that CHANGE
+# something: a trailing read request is a follow-up and is trimmed, a trailing
+# MUTATION is a second command and the message has to go to the catch-all.
+# Spelled as one list, the compound test would refuse `stop the tesla run and show
+# me the rest`, which 1.1 deliberately made work.
+_MUTATING_VERBS = (rf"(?:{_VIS_SETTERS[3:-1]}|{_VIS_HIDE_ALL[3:-1]}|"
+                   rf"{_VIS_PUBLISH_ALL[3:-1]}|"
+                   rf"send|pair|add|connect|link|unlink|forget|delete|unpair|"
+                   rf"pause|resume|unpause|retry|stop|end|abort|cancel|skip|"
+                   rf"approve|accept|allow|grant|deny|refuse|reject|block|"
+                   rf"research|look\s+into|investigate|start|run|use|update|install|"
+                   rf"uninstall|reset|rename|sign\s+out|log\s+out|logout|"
+                   rf"switch\s+to|ask|request|borrow|apply)")
+# ⛔ THE READ VERBS. `don'?t ask to use the Lab Mac` still offered to hand the
+# owner the person's name and email, because the ask surface was missing entirely.
+_READING_VERBS = (r"(?:fetch|get|show|list|tell|display|download|open|play|"
+                  r"status|check)")
+_ACT_VERBS = rf"(?:{_MUTATING_VERBS[3:-1]}|{_READING_VERBS[3:-1]})"
+# ⛔⛔ ONE POLARITY LIST. There were TWO — this one and the inline list inside
+# `_NEG_PUBLISH_SIDE` — and neither derived from the other: this one had
+# private/hidden/unlisted/invisible the other lacked, the other had offer/offering
+# this one lacked. Nothing reconciled them and nothing ever would have.
+_POLARITY_WORDS = _alt(_PUBLISH_POLARITY_WORDS + _HIDE_POLARITY_WORDS)
 _NEG_BEFORE_VERB = re.compile(rf"\b{_NEG_WORDS}\b{_NEG_FILLER}\s+{_ACT_VERBS}\b", re.I)
 # ⛔⛔⛔ A NEGATOR INSIDE A NOUN PHRASE BELONGS TO THE NAME, and position relative
 # to the DETERMINER is what separates the two — not distance, which is what I
@@ -3766,8 +4044,22 @@ _NEG_IN_NAME = re.compile(
 # HEAD showed them their devices, which is right.
 _NEG_PUBLISH_SIDE = re.compile(
     rf"(?<!\bis )(?<!\bare )(?<!\bwas )(?<!\bwere )(?<!\bisn't )(?<!\baren't )"
-    rf"\b{_NEG_WORDS}\b[^.?!]{{0,40}}\b(?:public(?:ly)?|findable|discoverable|"
-    rf"shared?|sharing|listed|visible|offering|offer)\b", re.I)
+    # ⛔⛔ THE SECOND POLARITY LIST — and it had `offer`/`offering` the first one
+    # lacked while lacking the hide words the first one had. Deriving it caught a
+    # live regression the moment the publish gerunds entered the act-verb list:
+    # `no longer publishing my mac` became a NEGATED COMMAND and reached the
+    # catch-all, because `publishing` was in one list and not the other. It means
+    # "stop publishing it" — a hide — and this is the test that says so.
+    # ⛔⛤ AND `let <people> find` IS A PUBLISH IN THIS LIST TOO. The moment that
+    # phrasing got a signal — it is the one SKILL.md teaches — its NEGATION
+    # inverted: `don't let people find my mac` reached the publish CONFIRM, the
+    # exact opposite of the ask. A new signal owns its own negation; 1.1's rule
+    # says negating a publish is a concrete hide, and that is where it lands now.
+    rf"\b{_NEG_WORDS}\b[^.?!]{{0,40}}\b(?:{_alt(_PUBLISH_POLARITY_WORDS)[3:-1]}|"
+    rf"{_VIS_PUBLISH_ALL[3:-1]}|"
+    rf"let\s+(?:people|persons|users|anyone|anybody|everyone|everybody|others|"
+    rf"strangers|folks|other\s+(?:people|persons?|users?))\s+"
+    rf"(?:find|see|discover|locate))\b", re.I)
 _NEG_BEFORE_POLARITY = re.compile(
     rf"\b(?:not|no\s+longer|never)\s+(?:be\s+|being\s+|stay\s+|remain\s+)?"
     rf"{_POLARITY_WORDS}\b", re.I)
@@ -3862,9 +4154,16 @@ _SET_EXCLUSION = (r"(?:(?:(?<=,)|(?<=;)|(?<=\band)|(?<=\bbut)|(?<=^))\s*\bnot\b[
 #   at all: one run was named and then a SECOND, read-only thing was asked. The
 #   tell is a READ VERB after the conjunction. `hide my computers and list them`
 #   is still a set, because the plural signal fires on what is LEFT.
-_SET_AUDIENCE = (r"\b(?:public(?:ly)?|findable|discoverable|visible|available|open)\s+"
-                 r"to\s+(?:everyone|everybody|anyone|anybody|all|the\s+world|"
-                 r"the\s+public|other\s+people|strangers)\b")
+# ⛔ `everyone` IS THE AUDIENCE, NOT A SET OF MACHINES — and the exemption used to
+# require a POLARITY word in front of it, so `make my mac public to everyone` was
+# exempt while `offer my Studio PC to everyone` was refused as a bulk publish.
+# The publish VERBS carry the same meaning as the polarity words here, and they
+# are derived rather than re-listed.
+_SET_AUDIENCE_WHO = (r"(?:everyone|everybody|anyone|anybody|all|the\s+world|"
+                     r"the\s+public|other\s+people|strangers)")
+_SET_AUDIENCE = (rf"\b(?:public(?:ly)?|findable|discoverable|visible|available|open"
+                 rf"|{_VIS_PUBLISH_ALL[3:-1]})\s+"
+                 rf"(?:it\s+|them\s+|this\s+)?to\s+{_SET_AUDIENCE_WHO}\b")
 # ⛔⛝ A READ VERB IS NOT ENOUGH — IT NEEDS A QUESTION'S OBJECT AFTER IT. Without
 # that, `hide my Show and Tell PC` had "and Tell PC" eaten as a read tail and
 # EXECUTED a hide on a machine called "Show", and `pause the Show and Tell
@@ -3888,10 +4187,88 @@ def _outside_exclusions(text: str) -> str:
     bare = _outside_quoted_names(text)
     bare = re.sub(_SET_READ_TAIL, " ", bare, flags=re.I)
     bare = re.sub(_SET_AUDIENCE, " ", bare, flags=re.I)
+    # ⛔⛤ AND `to everyone` IS AN AUDIENCE AFTER A PUBLISH VERB TOO, not only
+    # after a polarity word. `make my mac public to everyone` was exempt and
+    # `offer my Studio PC to everyone` was REFUSED as a bulk publish — the same
+    # sentence, the same audience, two answers.
+    # ⛔ ONLY THE `to <who>` IS BLANKED, never the span from the verb. Blanking
+    # that whole span would erase the name as well, and `offer all my macs to
+    # everyone` — a genuine set — would come out exempt. This is the 40-character
+    # window 1.1 had to remove, and it is not coming back.
+    if re.search(rf"\b{_VIS_PUBLISH_ALL}\b", bare, re.I):
+        bare = re.sub(rf"\bto\s+{_SET_AUDIENCE_WHO}\b", " ", bare, flags=re.I)
     return re.sub(_SET_EXCLUSION, " ", bare, flags=re.I)
 
 
-def _trim_trailing_clause(name: str) -> str:
+# ⛔⛔ A COMPOUND ASK LOSES HALF OF ITSELF SILENTLY, AND THAT IS WORSE THAN A
+# REFUSAL. Measured three times across 1.1 and 1.2: `pause the run and switch to
+# the office PC` PAUSED a run called “run and switch to the office PC” and dropped
+# the switch; `stop the tesla run and hide my mac` offered to stop a run called
+# “tesla run and hide my mac”. The person asked for two things and watched one
+# happen to a name they never said.
+# ⛔ A TRAILING READ REQUEST IS NOT A SECOND COMMAND — `stop the tesla run and
+# show me the rest` is one ask with a follow-up, and 1.1 deliberately made it
+# work. Only a MUTATION on the far side of the conjunction makes a message
+# compound, which is why the verb list is split above.
+# ⛔⛔ AND IT IS NARROW, BECAUSE MY FIRST VERSION WAS NOT AND THE A/B SAID SO:
+# written as "any mutation on the far side of a conjunction", it refused FOUR
+# real phrasings — `skip the video and drop claude` (one ask, two phases),
+# `hide my mac and make it private` (one ask said twice), and
+# `find a public one and ask its owner for access`, which is a phrasing SKILL.md
+# itself teaches. Two halves of the SAME act are one ask.
+# ⭐ The measured defects were one shape and one only: RUN CONTROL followed by a
+# DEVICE command. That is what this refuses, and nothing wider until something
+# wider is measured.
+_COMPOUND_ASK = re.compile(
+    r"\b(?:stop|end|abort|cancel|pause|resume|unpause|retry)\b[^.?!]*?"
+    r"\s+(?:and|then|also|plus|,\s*and|;)\s+(?:please\s+|also\s+)?"
+    # ⛔⛤ AND IT DOES NOT SPLICE THE SETTER LIST, WHICH IS THE FILE'S OWN POINT
+    # ABOUT THAT LIST: it is a TARGET list, not a signal one. Splicing it here
+    # made `take`, `put`, `set`, `turn`, `drop` and `make` count as second
+    # commands, so 56 ordinary follow-ups were refused — `stop the run and take
+    # a break`, `pause the run and put it on hold`, `stop the run and drop me a
+    # link`. Only a DEVICE command makes a message compound.
+    # ⛔ `drop` IS NOT IN THE SECOND-VERB LIST EITHER. It is the three-way
+    # ambiguous one, and `stop the run and drop me a link` is an idiom, not a
+    # device command.
+    rf"(?:switch\s+to|use|run\s+(?:it|everything)\s+on|remove|unlink|forget|delete|"
+    rf"{_VIS_HIDE_ALL[3:-1]}|{_VIS_PUBLISH_ALL[3:-1]})\b",
+    re.I)
+
+
+def _is_compound_ask(text: str) -> bool:
+    """Two commands in one message — the landing is the catch-all, never half.
+
+    ⛔⛤ AND A RUN TITLE IS BLANKED FIRST, not only a quoted one. `stop the Pause
+    and Share run` is ONE ask about a machine-shop's run; 16 driven titles were
+    refused because the conjunction inside the NAME read as a second command,
+    and quoting was the only escape. The explicit run-naming spans are the ones
+    the skip capture already recognises.
+    """
+    bare = _outside_quoted_names(text or "")
+    bare = re.sub(r"\bthe\s+[\w'\u2019 -]+?\s+(?:run|research)\b", " the run ", bare, flags=re.I)
+    bare = re.sub(r"\b(?:on|for|in|of)\s+(?:the\s+|my\s+)?[\w'\u2019 -]+?\s+(?:run|research)\b",
+                  " on the run ", bare, flags=re.I)
+    return bool(_COMPOUND_ASK.search(bare))
+
+
+def _trim_trailing_clause(name: str, whole_message: str = "") -> str:
+    """⛔⛔ A QUOTED NAME IS TAKEN VERBATIM — pass the whole message and the trims
+    are skipped when the capture IS the quoted span. Cross-verify measured that
+    the escape hatch this wave promised worked at ONE capture site of six, and
+    even there it tested the matched PATTERN's group count rather than whether
+    anything had been quoted — so `pause “Not Today”` captured “Not” and paused
+    a DIFFERENT run, and `stop sharing "Studio PC Now"` was trimmed anyway.
+    Quoting is the one thing a person can do to be unambiguous; it has to work
+    everywhere or it is not an escape hatch."""
+    if whole_message:
+        q = _quoted_name(whole_message)
+        if q and (name or "").strip().strip(_NL_QUOTE_CHARS).strip() == q.strip():
+            return q.strip()
+    return _trim_trailing_clause_inner(name)
+
+
+def _trim_trailing_clause_inner(name: str) -> str:
     """A captured NAME with a trailing read-only question or exclusion removed.
 
     ⛔⛔ ONE COPY, CALLED FROM EVERY CAPTURE THAT NEEDED IT. The visibility branch
@@ -3907,6 +4284,37 @@ def _trim_trailing_clause(name: str) -> str:
     whole = (name or "").strip()
     out = re.sub(_SET_READ_TAIL, "", whole, flags=re.I).strip()
     out = re.sub(rf"\s*(?:,|;|\band\b)\s*{_SET_EXCLUSION}\s*$", "", out, flags=re.I).strip()
+    # ⛔ AN AUDIENCE IS NOT A NAME EITHER. `share my Studio PC with other people`
+    # captured the whole tail, which then matched the about-other-people test and
+    # BLANKED the capture — so naming the audience cost you the machine and the
+    # publish fell to the picker. The audience is who, not which.
+    out = re.sub(r"\s+(?:with|to|for)\s+(?:other\s+(?:people|persons?|users?)|"
+                 r"everyone|everybody|anyone|anybody|strangers|the\s+world|"
+                 r"the\s+public|all)\b.*$", "", out, flags=re.I).strip()
+    # ⛔⛔ AND THE POLITENESS COMES OFF TOO — WAVE 1.2 MEASURED 592 PHRASINGS
+    # BROKEN BY ONE COURTEOUS WORD. `hide my mac please` captured “mac please”,
+    # which resolves to nothing, so a command that worked without the word
+    # REFUSED with it. The words are the same ones `_SET_HEAD` already uses to
+    # decide where a name ends; they are derived from it, not written again.
+    # ⛔ REPEATEDLY, because people stack them: “hide my Studio PC now, thanks”.
+    # ⛔ AND IT STILL NEVER RETURNS EMPTY — the guard below is why a machine
+    # actually called “Please” survives. A machine called “Studio PC Now” does
+    # not, and must be QUOTED; that cost is real and is the accepted trade,
+    # because today every one of those phrasings refuses outright.
+    for _ in range(4):
+        # A comma-separated tail comes off whatever it leaves behind.
+        commaed = _NAME_TAIL_COMMAED.sub("", out).strip()
+        if commaed and commaed != out:
+            out = commaed
+            continue
+        # ⭐ AND NO BARE-NOUN GUARD IS NEEDED HERE. The space pattern trims only
+        # the words nobody is called, so `hide my mac please` SHOULD come out as
+        # the bare noun and reach the picker — that is the fix, not a loss. The
+        # words a machine can genuinely end in are comma-gated above.
+        stripped = _NAME_TAIL_SPACED.sub("", out).strip()
+        if stripped == out or not stripped:
+            break
+        out = stripped
     out = re.sub(r"[\s,;]+$", "", out).strip()
     return out or whole
 
@@ -3991,7 +4399,7 @@ def _is_bare_machine_noun(name: str) -> bool:
     # first; the action gate this wave added handed it to the remove branch.
     return bool(re.fullmatch(
         rf"(?:(?:all|every|each|both)\s+(?:my\s+|the\s+|of\s+my\s+)?)?"
-        rf"(?:{_MACHINE_NOUNS}|phones?)", (name or "").strip(), re.I))
+        rf"(?:{_MACHINE_NOUNS_SAID})", (name or "").strip(), re.I))
 
 
 # ⛔⛔ THE SET-REQUEST GATE LIVED HERE AND WAS REVERTED ON 2026-09-09, OWNER'S
@@ -4010,6 +4418,36 @@ def _is_bare_machine_noun(name: str) -> bool:
 #
 # ⛔ 7.9-4's unlink gate below is UNCHANGED and stays. It was never the problem.
 _NL_QUOTE_CHARS = "“”‘’\"'"
+
+# ⛔ A PAIRED span, never a character class. See the visibility capture for what
+# a class cost. One group, so every user reads `.group(1)` the same way.
+_QUOTED_SPAN = r"(?:\"([^\"]+)\"|“([^”]+)”|‘([^’]+)’)"
+_QUOTED_RE = re.compile(_QUOTED_SPAN)
+
+
+def _quoted_name(text: str) -> str:
+    """The PAIRED quoted span in a message, taken verbatim, or "".
+
+    ⛔⛔ CHASING A MUTATION SURVIVOR FOUND THIS, AND IT WAS MINE. Stripping quote
+    characters off the EDGES of a capture works only while the quote IS the edge:
+    `switch to “Nodes Mac”, thanks` has a tail after the closing quote, so the
+    opening `“` came off, the closing `”` did not, and the leading-noun strip then
+    ate `Nodes` and handed the lookup `Mac”` — which matched two machines. The
+    visibility branch had already been taught to pair its quotes; these two had
+    not, and a quoted name is the one thing a person can do to be unambiguous.
+    """
+    return _cap(_QUOTED_RE.search(text or ""))
+
+
+def _cap(m: "re.Match | None") -> str:
+    """The first non-empty group of a match.
+
+    ⛔ `_QUOTED_SPAN` carries THREE alternatives, so a capture that used to be
+    `group(1)` is now whichever of the three matched. Every reader goes through
+    here so a fourth quote style can be added in one place — and so that a
+    straight-quoted name and a curly-quoted one cannot diverge again.
+    """
+    return next((g for g in (m.groups() if m else ()) if g), "")
 
 _NL_CONFIRMS = {
     "stop": "Stop {name}? It ends the run — everything finished so far is kept. Say yes and I’ll stop it.",
@@ -4089,7 +4527,10 @@ def _nl_run_name(t: str, verb_tail: str = "") -> "str | None":
         name = m.group(1)
     else:
         src = verb_tail if verb_tail else t
-        m2 = re.search(r"\b(?:of|for|on|about)\s+(?:the\s+|my\s+)?(.+)$", src, re.I) or \
+        # ⛔ `for me` IS NOT A RUN TITLE. `resume the Mars run for me` came out
+        # naming a run “me”, because `for` is one of the title prepositions.
+        m2 = re.search(r"\b(?:of|for|on|about)\s+(?:the\s+|my\s+)?"
+                       r"((?!(?:me|us|you|him|her|them|now|today)\b).+)$", src, re.I) or \
             (re.search(r"^(?:the\s+|my\s+)?(.+)$", verb_tail, re.I) if verb_tail else None)
         if m2:
             name = m2.group(1)
@@ -4097,7 +4538,7 @@ def _nl_run_name(t: str, verb_tail: str = "") -> "str | None":
         return None
     name = re.sub(r"[?.!,]+$", "", name).strip()
     # ⛔ A TRAILING READ-ONLY QUESTION IS NOT PART OF THE TITLE.
-    name = _trim_trailing_clause(name)
+    name = _trim_trailing_clause(name, t)
     name = re.sub(r"\s+(run|one|research|research run)$", "", name, flags=re.I).strip()
     if not name or name.lower() in _NL_GENERIC_RUN:
         return None
@@ -4145,7 +4586,10 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
         # the code that was already in the sentence. Cross-verify caught it; the
         # SAYING-A-CODE words have to win over the naming-a-machine words, because
         # a message that says "code" is about a code whatever else it says.
-        _pairing = re.search(r"\b(pair|pairing|code|codes|connect|add)\b", low)
+        # ⛔ `link` WAS IN THE ACT-VERB LIST AND IN NO OTHER, so `link my computer`
+        # reached the catch-all — which also meant its negation veto could never
+        # fire, because there was nothing to veto.
+        _pairing = re.search(r"\b(pair|pairing|code|codes|connect|add|link)\b", low)
         # ⛔⛔ TWO WAYS TO PAIR A COMPUTER NOBODY ASKED TO PAIR, both measured:
         #   `hide device LABPC001`            PAIRED it
         #   `status of support code AB12CD34` PAIRED it
@@ -4154,11 +4598,22 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
         # to the pairing return. ⭐ It is DERIVED from the setter inventory now —
         # the standing rule, and the same fix as the conjunction signal: the words
         # a branch must know about are the words the file already lists.
+        # ⛔⛤ AND IT WENT SHORT AGAIN — WAVE 1.2 MEASURED THREE MORE. The RUN and
+        # CONSENT verbs were missing, so a code-shaped token in a sentence about
+        # an existing machine PAIRED it:
+        #   `stop the machine LABPC001 run`      PAIRED LABPC001
+        #   `approve the machine LABPC001`       PAIRED LABPC001
+        #   `did my logs go through? code AB12CD34`  PAIRED THE SUPPORT CODE
+        # The last one is the worst: a support code is taught at two places in
+        # SKILL.md and is not a pair code at all. Derived where a list exists.
         _existing = re.search(rf"\b(?:switch to|run (?:it |everything )?on|use|using|"
-                              rf"select|remove|unlink|forget|delete|ask|asking|"
+                              rf"select|{_UNLINK_VERBS[3:-1]}|ask|asking|"
                               rf"request|requesting|borrow"
                               rf"|{_VIS_SETTERS[3:-1]}"
-                              rf"|hide|unlist|unpublish|delist|disable|unshare"
+                              rf"|{_VIS_HIDE_ALL[3:-1]}|{_VIS_PUBLISH_ALL[3:-1]}"
+                              rf"|stop|end|abort|cancel|pause|resume|unpause|retry|skip"
+                              rf"|approve|accept|allow|grant|deny|refuse|reject|block"
+                              rf"|logs?|log\s+files?|diagnostics|support"
                               rf"|status|state|check|show|list|progress|which|what)\b", low)
         # ⛔ A READ VERB BEATS THE CODE WORD. The comment above says a message that
         # says "code" is about a code whatever else it says — true for `use this
@@ -4185,10 +4640,32 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     # answering a research topic with "paste the access code". Rule 2b's own test
     # is the one that decides, so it is asked here first.
     elif (not _NL_RESEARCH_RE.match(t)) and (
-            re.search(rf"\b(add|pair|connect)\b.*\b({_MACHINE_NOUNS})\b", low)
+            # ⛔⛤ `link` ONLY AS A VERB. Added to the pairing words in the same
+            # wave that added the artefact-LINK surface, it answered
+            # `the brief link for my mac` with pairing instructions — 8 driven
+            # shapes. A verb opens the sentence; a noun has an article in front.
+            (re.search(rf"\b(add|pair|connect)\b.*\b({_MACHINE_NOUNS_SAID})\b", low)
+             or re.match(rf"{_NL_LEAD_IN}link\b.*\b({_MACHINE_NOUNS_SAID})\b", low))
             or re.search(r"\bpair (my|a|the|this)\b", low)):
         return None, ["Paste the access code shown on the computer running Super "
                       "Research (8 characters — dashes optional) and I’ll add it."]
+
+    # 1b. ⛔⛤ "help" AND "what can you do?" REACHED THE CATCH-ALL, whose line opens
+    #     "I didn't catch a Super Research request in that." The list that follows
+    #     is exactly the right answer — so the client knew what to say and told
+    #     the person they had failed to say it. SKILL.md teaches both phrasings.
+    if re.fullmatch(r"(?:please\s+)?(?:help|help me|what can you do|what do you do|"
+                    r"what can i (?:do|say|ask)|what is super ?research|"
+                    r"what'?s super ?research|how do i (?:start|begin|use this)|"
+                    r"how does this work|getting started|commands?|options?)",
+                    low):
+        # ⛔⛤ AND THE ANSWER IS THE CAPABILITY LINE, NOT AN ACCOUNT CHECK. I
+        # routed these to `status-account`, which prints `✓ Signed in as <email>`
+        # and nothing else once the account has a machine — so `help` answered a
+        # question nobody asked. The list the comment calls the right answer is
+        # the catch-all's own sentence, minus the line that blames the person.
+        return None, [_NL_CATCH_ALL.split("that. ", 1)[-1]
+                      if "that. " in _NL_CATCH_ALL else _NL_CATCH_ALL]
 
     # 2. Sign-in / connection questions — always a FRESH account check.
     if re.search(r"\b(am i|are we|is (it|this|the agent))\b.*\b(signed?[ -]?in|logg?ed[ -]?in|connected|authenticated)\b", low) or \
@@ -4205,11 +4682,56 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     rm = _NL_RESEARCH_RE.match(t)
     if rm:
         topic = re.sub(r"[?.!]+$", "", rm.group(1)).strip().strip("\"“”'‘’")
-        if topic and not re.fullmatch(r"(?:the |my )?(?:status|progress|updates?)", topic, re.I):
+        # ⛔⛔ THE RESEARCH BRANCH TOOK 100% OF RESEARCH-VERB OPENINGS — 392 of 392
+        # driven — and `research my devices` STARTED A PAID RUN titled “my
+        # devices”. The veto was a fullmatch on three bare words, so anything
+        # longer was a topic by default.
+        # ⛔ THE COST IS STATED, NOT DISCOVERED: `look into the Mars run` now
+        # reaches the CATCH-ALL rather than status, because no later branch
+        # claims that shape. A refusal costs nothing; the paid run it replaces
+        # costs money, so this is the trade and it is deliberate.
+        _not_a_topic = (
+            re.fullmatch(r"(?:the |my )?(?:status|progress|updates?)", topic, re.I)
+            # an inventory of this account's own machines is not a subject
+            # ⛔⛤ THE DETERMINER IS REQUIRED AND IT IS POSSESSIVE. Optional, it
+            # made a bare plural product noun "an inventory of this account's
+            # machines": 90 of 96 driven `research phones|laptops|macs` reached
+            # the catch-all, and those are ordinary subjects.
+            or re.fullmatch(r"(?:my|our|this|these)\s+(?:own\s+)?"
+                            rf"(?:{_MACHINE_NOUNS_SAID})", topic, re.I)
+            # ⛔ A RUN'S OWN status or artefact is not a subject — and the test is
+            # WHOSE, not which noun. Written as "status|progress|podcast… and
+            # anything after it", this refused `research the status of the EV
+            # market`, a perfectly good topic, and an existing test caught it
+            # within the hour. What makes `research the status of my run` not a
+            # topic is that the thing it asks about is THIS ACCOUNT'S.
+            or re.fullmatch(rf"(?:{_NAME_DETERMINER}\s+)?"
+                            rf"(?:status|progress|podcast|audio|video|brief|report|"
+                            rf"links?|results?|logs?)\s+(?:of|from|for|on)\s+"
+                            # ⛔ `the` GOES: the comment beside this says the
+                            # test is WHOSE, and `the laptop market` is nobody's.
+                            rf"(?:my|this|that)\s+"
+                            rf"(?:run|research|{_MACHINE_NOUNS_SAID})\b.{{0,20}}",
+                            topic, re.I)
+            # ⛔⛤ AND THE `<word> run` VETO IS GONE. I shipped it with its cost
+            # stated — `research the marathon run` — and cross-verify measured
+            # the class as 22 driven idioms wide: a bank run, a print run, a
+            # trial run, a fun run, the long run, a dry run. One measured case
+            # (`look into the Mars run`) does not buy that. It reverts to a paid
+            # run, which is the pre-existing behaviour, and it is recorded as an
+            # open defect rather than paid for with twenty-two real subjects.
+            )
+        if topic and not _not_a_topic:
             flags: list[str] = []
             ex = re.search(
                 r"[,;\s]*\b(?:without|minus|skip(?:ping)?|drop(?:ping)?|leave out|no)\s+"
-                r"(?:the\s+|a\s+|any\s+)?(?:video|email|podcast|brief|report|chatgpt|gpt|claude|gemini)s?\b",
+                # ⛔⛤ DERIVED. Hand-written, this was short by audio, youtube,
+                # openai and anthropic against the very lists the loop five
+                # lines below iterates — so `research tesla without audio`
+                # started a PAID RUN titled “tesla without audio” with the
+                # exclusion silently dropped.
+                rf"(?:the\s+|a\s+|any\s+)?(?:{'|'.join(_NL_PHASE_WORDS)}|"
+                rf"{'|'.join(_NL_AGENT_WORDS)})s?\b",
                 topic, re.I)
             if ex:
                 clause = topic[ex.start():].lower()
@@ -4243,6 +4765,21 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
             return None, ["Happy to fire a Super Research — what topic?"]
         if not topic:
             return None, ["Happy to fire a Super Research — what topic?"]
+
+    # 2b-i. ⛔⛔ TWO COMMANDS IN ONE MESSAGE GO TO THE CATCH-ALL, NEVER HALFWAY.
+    #     `pause the run and switch to the office PC` paused a run called “run and
+    #     switch to the office PC” and dropped the switch; `stop the tesla run and
+    #     hide my mac` offered to stop a run called “tesla run and hide my mac”.
+    #     Both did something, to a name the person never said, and said nothing
+    #     about the half they lost.
+    # ⛔⛔ IT IS A RETURN, NOT A BAIL, and that is the whole lesson of wave 1.1: a
+    #     veto in an ordered ladder hands its message to the NEXT branch, which
+    #     then acts on the wrong feature. Four defects in one wave came from that.
+    # ⛔ AND IT SITS BELOW THE RESEARCH BRANCH ON PURPOSE. A TOPIC is allowed to
+    #     contain anything — `research how to stop smoking and start running` is
+    #     one ask, and a compound test above the research rule would refuse it.
+    if _is_compound_ask(t):
+        return None, [_NL_CATCH_ALL]
 
     # 2c. Sending logs to support. AFTER the research rule on purpose — "research
     #     how log shipping works" is a topic, not a request to send anything —
@@ -4320,8 +4857,8 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     # see the polarity the person negated.
     _pol_src = _NEG_IN_NAME.sub(r"\1", _outside_quoted_names(low))
     _neg_hide_side = re.search(
-        r"\b(?:not|no\s+longer|never)\s+(?:be\s+|being\s+|stay\s+|remain\s+)?"
-        r"(?:private|hidden|unlisted|invisible|undiscoverable)\b", _pol_src, re.I)
+        rf"\b(?:not|no\s+longer|never)\s+(?:be\s+|being\s+|stay\s+|remain\s+)?"
+        rf"{_HIDE_POLARITY}\b", _pol_src, re.I)
     _neg_public_side = _NEG_PUBLISH_SIDE.search(_pol_src)
     _pol_low = _NEG_BEFORE_POLARITY.sub(" ", _pol_src)
     _public_kw = (re.search(r"\bpublic(?:ly)?\b|\bsomebody else|\bsomeone else"
@@ -4331,7 +4868,14 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
                   # ⛔ `un-hide` IS THE OPPOSITE OF `hide`, and it executed a hide.
                   # Excluding it from the hide arm only got it as far as the
                   # catch-all; the request it makes is a publish.
-                  or re.search(r"\bun-?(?:hide|unlist|delist|conceal)\b", _pol_low))
+                  # ⛔⛤ AND THIS LIST WENT SHORT TOO — four of the seven hide verbs
+                  # were missing, so `un-disable`, `un-unpublish` and `un-unshare`
+                  # answered with a DEVICE LIST while `un-hide` published. The
+                  # hide guard opposite this already spells `(?<!un-)(?<!un )`;
+                  # this arm has to spell the same two forms, and both are
+                  # DERIVED from the hide verbs rather than typed a third time.
+                  or re.search(rf"\bun[- ]?{_VIS_HIDE_ALL}\b|\bun-?conceal\b",
+                               _pol_low))
     # ⛔⛔ ONE NOUN LIST, TWO QUESTIONS, AND THEY HAD DRIFTED. `_machine_kw` asks
     # whether a computer is being talked about; `_mine_kw` asks whether it is the
     # ASKER'S. They were written as two literals two lines apart and ended up
@@ -4343,7 +4887,7 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     # "who is waiting on my mac" showed the asker's own outgoing list, and "stop
     # offering my mac" became a run-stop quoting the phrase as a research title.
     # One list now, so the next word added to it cannot land in only one place.
-    _machine_kw = re.search(rf"\b({_MACHINE_NOUNS})\b", low)
+    _machine_kw = re.search(rf"\b({_MACHINE_NOUNS_SAID})\b", low)
     _ask_kw = re.search(r"\b(ask|asked|asking|request|requests|requested|apply|"
                         r"borrow)\b", low)
     # ⛔ THE FOUR SUBJECTS THAT ARE NOT THIS RULE'S. A message carrying one of
@@ -4355,15 +4899,40 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     # “Research computer” public."). With `research` in the artefact list, every
     # owner verb aimed at one fell to the catch-all, including the exact string
     # the client had just told the person to type. Blanked for this test only.
-    _low_no_rc = re.sub(rf"\bresearch(?:es)?\s+(?:{_MACHINE_NOUNS})\b", "  ", low)
+    # ⛔ THE DETERMINER SLOT WAS MISSING, so `research my computers` still carried
+    # the artefact word `research` and failed the device-list gate — it reached
+    # the catch-all while `research my devices` answered. Two spellings of the
+    # same ask, two answers.
+    _low_no_rc = re.sub(rf"\bresearch(?:es)?\s+(?:{_NAME_DETERMINER}\s+)?"
+                        rf"(?:own\s+)?(?:{_MACHINE_NOUNS_SAID})\b", "  ", low)
     _artefact_kw = re.search(r"\b(podcasts?|audio|videos?|reports?|briefs?|links?|"
                              r"status|progress|updates?|research(?:es)?|topics?|"
                              r"logs?|results?|runs?|emails?)\b", _low_no_rc)
+    # ⛔ `cancel` WAS IN THE RUN-CONTROL VERB LIST AND NOT IN THIS ONE, and the two
+    # lists differed by exactly that word — so `cancel on my Studio PC` reached
+    # the device list while the identical `stop on my Studio PC` reached the
+    # catch-all. Same question, two answers.
+    # ⛔⛔ AND `drop` STAYS IN IT, THOUGH IT ONCE VETOED THE BRANCH IT ALSO
+    # BELONGS TO. `drop my Studio PC` failed the visibility gate here and reached
+    # the CATCH-ALL, so I first wrote a machine-noun exclusion — and the mutation
+    # harness then showed that exclusion measures NOTHING: `drop` is in the
+    # device verbs and in the unlink verbs now, so every `drop <machine>` phrasing
+    # reaches the unlink confirm by that road whether this vetoes or not. A guard
+    # that cannot change an outcome is not a guard; the simpler list is the true
+    # one. ⭐ This is the harness refuting my own reasoning, which is what it is for.
     _control_kw = re.search(r"\b(stop|end|abort|pause|resume|unpause|retry|skip|"
-                            r"drop)\b", low)
+                            r"cancel|drop)\b", low)
     _unlink_kw = re.search(r"\b(unlink|forget)\b", low)
-    _mine_kw = re.search(rf"\b(my|mine|our|this)\b(?:\s+\w+){{0,2}}\s+"
-                         rf"(?:{_MACHINE_NOUNS})\b", low)
+    # ⛔ A THREE-WORD MACHINE NAME DEFEATED THE TWO-WORD GAP, so
+    # `advertise my Now or Never Mac publicly` was routed as somebody ELSE's
+    # machine and answered with the browse list of strangers' computers.
+    # ⛔⛤ AND A POLARITY WORD IN THE GAP DOES NOT MAKE A MACHINE MINE. Widening
+    # the gap to four turned `show me this week's public computers` and
+    # `this is a public computer` into MY machine, which vetoed the browse
+    # surface and sent them to a publish confirm naming “week's”.
+    _mine_kw = re.search(rf"\b(my|mine|our|this)\b"
+                         rf"(?:\s+(?!(?:{_POLARITY_WORDS[3:-1]})\b)[\w'-]+){{0,4}}\s+"
+                         rf"(?:{_MACHINE_NOUNS_SAID})\b", low)
     # ⛔ MOVED UP FROM THE WAITING CLAUSE IN 7.9-3, unchanged. Two clauses above
     # it now need the same subject test, and a second copy of this pattern is
     # exactly the drift the noun list above records.
@@ -4378,7 +4947,54 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     # ⛔ "stop sharing my machine" HAS NO PUBLIC WORD IN IT and rule 3 was eating
     # it as a run-stop, quoting "sharing my machine" back as a research title. It
     # is the same owner question in different words, so it belongs here.
-    _offering_kw = re.search(r"\b(sharing|offering|discoverable|findable)\b", low)
+    # ⛔⛤ THE FINITE PUBLISH VERBS LIVE HERE NOW, AND NOT IN A NARROWED THIEF.
+    # `publish|offer|share my Studio PC` answered with the DEVICE LIST — 312
+    # measured shapes — because this signal held only the gerunds while the verbs
+    # themselves sat in the setter list, which admits nothing. The fix is to
+    # WIDEN the signal, never to narrow the branch that was stealing them:
+    # measured, that branch's veto hands the message to the CATCH-ALL, not to
+    # this one. A veto in an ordered ladder is not inert — wave 1.1, four times.
+    # ⛔ AND THE PUBLISH-SIDE POLARITY WORDS ARE PART OF THE SIGNAL, DERIVED. Four
+    # of them — `visible`, `shared`, `listed`, plus `invisible` on the hide side —
+    # sat in the polarity constant and in NO signal at all, so `make my mac
+    # visible` answered with a device LIST while `make my mac not visible` hid it.
+    # ⛔⛔⛔ THE SINGLE COSTLIEST WIDENING IN THIS WAVE, AND CROSS-VERIFY MEASURED
+    # IT: admitting the bare publish-side polarity words moved 192 driven DEVICE
+    # LIST requests onto a publish CONFIRM — `show my shared computers`,
+    # `list my visible machines`, `who has access to my shared mac` — and every
+    # copula STATEMENT with them: `my mac is listed as offline`,
+    # `my laptop is shared with three people`, and worst,
+    # `my mac is not visible on the network`, which is the exact opposite of the
+    # sentence. The hide side three lines below has carried `(?<!\bis )` for a
+    # wave; the publish side got the same words with no guard at all.
+    # ⭐ THE FIX IS THE VERB. `public`/`publicly` stay bare — they are `_public_kw`
+    # and they are what people say — but `shared|sharing|visible|listed` mean a
+    # REQUEST only when a setter is asking for one. Driven: every phrasing the
+    # document teaches goes through a setter, so nothing taught breaks.
+    _offering_kw = (re.search(rf"\b{_VIS_PUBLISH_ALL}\b", low)
+                    or (re.search(rf"\b{_alt(_PUBLISH_POLARITY_WORDS)}\b", low)
+                        and re.search(rf"\b{_VIS_SETTERS}\b", low)
+                        and not re.search(rf"\b(?:is|are|was|were|isn'?t|aren'?t|"
+                                          rf"wasn'?t|weren'?t)\s+(?:not\s+)?"
+                                          rf"(?:\w+\s+){{0,2}}"
+                                          rf"{_alt(_PUBLISH_POLARITY_WORDS)}\b", low))
+                    # ⛔ `let people find my mac` IS THE PHRASING SKILL.md TEACHES
+                    # and it answered with a device list. The hide side already
+                    # knows the shape — `stop LETTING people FIND it` is one of
+                    # its arms — and the publish side, which is the one the
+                    # document puts in a person's mouth, did not.
+                    # ⛔⛤ THE AUDIENCE IS GENERIC AND THE VERB IS `find`, BOTH
+                    # NARROWED AFTER AN EXISTING TEST CAUGHT ME. Written as a
+                    # wildcard gap plus `find|use|…`, this stole
+                    # `let them use my computer` — which is a CONSENT decision
+                    # about a person already waiting, not a publish. `them` names
+                    # somebody; `people` names nobody. And `use` belongs to that
+                    # branch and to the ask branch; publishing is about being
+                    # FOUND.
+                    or re.search(r"\blet\s+(?:people|persons|users|anyone|anybody|"
+                                 r"everyone|everybody|others|strangers|folks|"
+                                 r"other\s+(?:people|persons?|users?))\s+"
+                                 r"(?:find|see|discover|locate)\b", low))
     # ⛔⛔ THE WORDS FOR HIDING CARRY NO "PUBLIC" IN THEM. "hide my computer",
     # "unlist my mac", "make my pc private", "stop offering my machine" — every
     # one of those fell through to the catch-all or, worse, to rule 3, which
@@ -4391,8 +5007,15 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     _hiding_kw = (
         # ⛔ `un-hide` CONTAINS `hide` BECAUSE A HYPHEN IS A WORD BOUNDARY, and it
         # executed a hide. Same for `un-delist` and `un-unlist`.
-        re.search(r"(?<!un-)(?<!un )\b(private|hidden|hide|unlist|unlisted|unpublish|"
-                  r"undiscoverable)\b", _pol_low)
+        # ⛔⛔⛔ AND THE GUARD COVERED ONLY THIS ARM. `disable|unshare|deregister|
+        # delist` sat in a SECOND arm below with no lookbehind, so
+        # `un-delist my Studio PC` HID the machine — the person asked to un-hide
+        # and got a hide, while `un-unlist` correctly published. Two arms, two
+        # answers to the same question, which is what made it a bug and not a
+        # design. The arms are now ONE, the verbs are DERIVED, and the guard
+        # cannot be given to half of them again.
+        re.search(rf"(?<!un-)(?<!un )\b(?:{_HIDE_POLARITY[3:-1]}|hidden|unlisted|"
+                  rf"{_VIS_HIDE_ALL[3:-1]})\b", _pol_low)
         # ⛔⛔ THE TWO HALVES OF THIS ARM NEEDED DIFFERENT VERBS, AND SHARING ONE
         # LIST MADE `turn on sharing for my mac` HIDE IT. `off` belongs with the
         # neutral verbs (turn/switch/shut); the -ING words only ever mean a hide
@@ -4404,7 +5027,6 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
         or re.search(r"\b(?:stop|shut|quit|cease|end|no longer)\b[^.?!]{0,20}"
                      r"\b(?:offering|sharing|listing|publishing|letting|showing|"
                      r"allowing)\b", _pol_low)
-        or re.search(r"\b(disable|unshare|deregister|delist)\b", _pol_low)
         or re.search(r"\b(take|remove|drop|pull)\b.{0,30}"
                      r"\b(off|out of|from)\b.{0,24}\b(list|public|"
                      r"directory)\b", _pol_low)
@@ -4425,10 +5047,12 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     # made the question test fire while its own veto silently could not — and
     # both were answered with a bare device list instead of doing the thing.
     # Measured against the revision this wave started from: eleven phrasings.
+    # ⛔ DERIVED — the fourth hand copy of the setter list, also twelve of
+    # twenty-one, so `can you delist my Studio PC` and `could you take my mac off
+    # the list` were read as QUESTIONS and answered with a device list.
     _polite_imperative = re.match(_NL_LEAD_IN + r"(?:can|could|would|will|please|do)"
                                   r"\s+(?:you\s+)?"
-                                  r"(?:please\s+)?(?:make|set|switch|turn|put|hide|"
-                                  r"unlist|unpublish|offer|share|publish|disable)\b",
+                                  rf"(?:please\s+)?{_VIS_SETTERS}\b",
                                   low)
     # ⛔⛔ THE LEAD-IN IS WHY THIS WAS ANCHORED WRONG. `^` alone meant one
     # conversational word turned a read-only question into an offer to publish.
@@ -4455,13 +5079,36 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
                      and not _mine_kw and not re.search(r"\bmy own\b", low))
     _named_target = (re.search(rf"\b{_VIS_SETTERS}\s+"
                                rf"(?:the|my|our|this|that)\s+[\w' -]*"
-                               rf"(?:{_MACHINE_NOUNS})\b", low)
+                               rf"(?:{_MACHINE_NOUNS_SAID})\b", low)
                      # ⛔ A QUOTED NAME CARRIES NO ARTICLE, and the picker's own
                      # worked example quotes one: `make “Research computer”
                      # public`. Without this the string the client just told the
                      # person to type reached the browse list.
-                     or re.search(r"\b(?:make|set|switch|turn|put|hide|unlist|"
-                                  r"unpublish|offer|share|publish|disable)\s+"
+                     # ⛔⛤ AND A NAMED MACHINE IS A NAMED TARGET WHATEVER THE
+                     # VERB, once a polarity word is in the message. `list the
+                     # Studio PC publicly` answered with the BROWSE list of
+                     # strangers' machines, because `list` is deliberately not a
+                     # setter — it is the device-LIST request word — so no arm
+                     # here saw the machine the person had named. Shape, not
+                     # vocabulary: determiner, name, machine noun.
+                     # ⛔ IT NEEDS A REAL NAME AND A SINGULAR NOUN, because
+                     # written as "determiner, anything, machine noun" it claimed
+                     # `list the public computers` and `find me a public
+                     # computer` — BROWSE requests — from the branch that serves
+                     # them. Two existing tests caught it. The adjective `public`
+                     # is not a name, and a set of machines is not one machine.
+                     or (re.search(rf"\b{_POLARITY_WORDS}\b", low)
+                         and re.search(
+                             rf"\b\w+\s+{_NAME_DETERMINER}\s+"
+                             rf"(?:(?!(?:{_POLARITY_WORDS[3:-1]}|other|own|"
+                             rf"more|any|some)\b)[\w'-]+\s+){{1,3}}"
+                             rf"{_MACHINE_SINGULAR}\b", low))
+                     # ⛔ DERIVED. Spelled out, this copy held twelve of the
+                     # twenty-one setters — `take`, `remove`, `drop`, `pull`,
+                     # `delist`, `unshare`, `deregister`, `advertise` and
+                     # `expose` were all missing, so a quoted name after any of
+                     # them was not a named target at all.
+                     or re.search(rf"\b{_VIS_SETTERS}\s+"
                                   rf"[{re.escape(_NL_QUOTE_CHARS)}]", t))
     # ⛔⛔ A SET GETS IN, AND IT CAN ONLY EVER LEAVE BY THE REFUSAL. `make all the
     # computers public` answered with the BROWSE list of STRANGERS' machines and
@@ -4471,10 +5118,44 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     # computers` — a browse — would enter and be refused, which is the mirror of
     # the defect being fixed. Entering on a set cannot act: the refusal below
     # sits ahead of both returns.
+    # ⛔ A BARE MACHINE TOKEN IS A NAMED TARGET. Without this the visibility gate
+    # had no way to see `hide LABPC001` as naming anything, so the largest single
+    # class of dead phrasings in the wave stayed dead.
+    # ⛔⛤ AND THE TOKEN MUST BE THE WHOLE OBJECT. Written as "a token anywhere
+    # after a setter", it claimed ordinary sentences that merely contain a
+    # hyphenated identifier: `share ISO-8601 with the team`, `publish RFC-2119`,
+    # `share COVID-19 findings`, and `take GPT-4 off the list` EXECUTED a hide.
+    _id_target = bool(re.fullmatch(rf"(?:{_NL_LEAD_IN})?{_VIS_SETTERS}\s+"
+                                   rf"(?:{_NAME_DETERMINER}\s+)?"
+                                   rf"[A-Za-z0-9][A-Za-z0-9._-]*"
+                                   rf"(?:\s+(?:to|into|on|onto|as)?\s*"
+                                   rf"{_VIS_POLARITY_ALL})?"
+                                   rf"(?:[\s,;]+(?:{_NAME_TAIL_ALWAYS[3:-1]}|"
+                                   rf"{_NAME_TAIL_COMMA_ONLY[3:-1]}))*[.!?]*", low)
+                      and re.search(rf"\b{_VIS_SETTERS}\s+(?:{_NAME_DETERMINER}\s+)?"
+                                rf"([A-Za-z0-9][A-Za-z0-9._-]*)\b", t, re.I)
+                      and _looks_like_a_machine_token(
+                          re.search(rf"\b{_VIS_SETTERS}\s+(?:{_NAME_DETERMINER}\s+)?"
+                                    rf"([A-Za-z0-9][A-Za-z0-9._-]*)\b",
+                                    t, re.I).group(1)))
     _set_target = bool(_request_names_a_set(t)
                        and re.search(rf"\b{_VIS_SETTERS}\b", low))
+    # ⛔⛤ A PRONOUN POINTS AT THE MACHINE ON SCREEN. `take it off the public list`
+    # is a phrasing SKILL.md teaches and it reached the catch-all: the hide signal
+    # fired and no clause said the message had a target at all. It lands on the
+    # PICKER, which is the honest answer to "it" — never on a confident guess.
+    # ⛔⛔ AND IT NEEDS A POLARITY WORD, because without one `turn it off` — the
+    # commonest way anybody says STOP THE RUN — reached this branch and executed
+    # an UNCONFIRMED HIDE. The phrasing this clause exists for is
+    # `take it off the public list`, which says `public` out loud.
+    _pronoun_target = bool(re.fullmatch(
+        r"(?:please\s+|can you\s+|could you\s+)*"
+        r"(?:take|put|make|set|switch|turn|keep)\s+"
+        r"(?:it|this|that|mine)\s+[^.?!]{0,40}", low)
+        and re.search(rf"\b(?:{_POLARITY_WORDS[3:-1]}|list|listing|directory)\b", low))
     if (_public_kw or _offering_kw or _hiding_kw) \
             and (_mine_kw or re.search(r"\bmy own\b", low) or _named_target
+                 or _id_target or _pronoun_target
                  or _set_target) \
             and not _about_others \
             and not _artefact_kw and not _unlink_kw \
@@ -4491,22 +5172,129 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
         # "hide the studio pc" matched nothing, so the name was dropped and the
         # picker hid whichever machine it liked — unconfirmed. And `on|off|to`
         # as terminators captured "off sharing" out of "turn off sharing".
+        # ⛔⛔⛔ THE QUOTED SPAN IS PAIRED, AND THIS IS THE ONE DEFECT IN WAVE 1.2
+        # THAT ACTED ON THE WRONG MACHINE. Spelling the delimiters as a CLASS
+        # made every quote character a terminator, so an APOSTROPHE inside the
+        # name ended the capture: `hide "Sam's MacBook Pro"` captured “Sam”,
+        # which then SUBSTRING-MATCHED a different machine and hid it, with a ✓.
+        # Measured on an account holding only “Donna Mac”: `hide "Don't Send PC"`
+        # hid Donna Mac. The curly ’ behaves identically and is what macOS and
+        # iOS autocorrect actually type — and `<First>'s MacBook Pro` is what a
+        # Mac calls itself out of the box, so this is the DEFAULT name shape.
+        # ⛔ `_NL_QUOTED_RE` above already pairs correctly; the divergence was
+        # here alone. Pairing means: a span opened with " ends at ", one opened
+        # with “ ends at ”, and everything between is CONTENT.
         _vis_obj = ""
-        _vm = (re.search(rf"\b(?:make|set|switch|turn|put|offer|share|publish|"
-                         rf"hide|unlist|unpublish)\s+"
-                         rf"[{re.escape(_NL_QUOTE_CHARS)}]([^{re.escape(_NL_QUOTE_CHARS)}]+)",
-                         t, flags=re.I)
-               or re.search(r"\b(?:make|set|switch|turn|put|offer|share|publish)\s+"
-                            r"(.+?)\s+(?:public|private|findable|discoverable|"
-                            r"hidden|unlisted)\b", t, flags=re.I)
-               or re.search(r"\b(?:hide|unlist|unpublish|delist)\s+(.+?)$",
+        # ⛔ THE `off the list` ARM IS READ BEFORE THE POLARITY ARM. Read after
+        # it, `take my Studio PC off the public list` matched `take … public` and
+        # captured “Studio PC off” — the word that makes the phrase a HIDE went
+        # into the name. It cannot steal `take X public`, which has no
+        # off/out-of/from in it.
+        _vm = (re.search(rf"\b{_VIS_SETTERS}\s+{_QUOTED_SPAN}", t, flags=re.I)
+               or re.search(rf"\b{_alt(_VIS_OFF_VERBS)}\s+(.+?)\s+"
+                            rf"(?:off|out of|from)\b", t, flags=re.I)
+               # ⛔⛔ A LINKING PREPOSITION BELONGS TO THE POLARITY, NOT THE
+               # NAME. Written without it, the lazy capture swallowed the
+               # preposition: `set my Studio PC to private` captured
+               # “Studio PC to”, `put my Studio PC on private` captured
+               # “Studio PC on”, and each refused a machine the person had named
+               # correctly. Only the bare-adjective form was ever clean.
+               # ⛔ AND THE POLARITY WORDS ARE DERIVED. Spelled here by hand the
+               # list went short by one — `visible` was in the polarity constant
+               # and missing from this arm, which is half of why
+               # `make my mac visible` answered with a device LIST.
+               or re.search(rf"\b(?:{'|'.join(_VIS_POLAR_VERBS)}|"
+                            rf"{_VIS_PUBLISH_ALL[3:-1]})\s+"
+                            rf"(.+?)\s+(?:(?:to|into|on|onto|as)\s+)?(?:the\s+)?"
+                            rf"(?:{_NEG_WORDS}\s+)?(?:be\s+|being\s+|stay\s+|"
+                            rf"remain\s+)?{_VIS_POLARITY_ALL}\b", t, flags=re.I)
+               # ⛔⛤ EVERY VERB THE SIGNAL ADMITS NOW HAS A CAPTURE ARM, AND BOTH
+               # SIDES ARE DERIVED FROM THE SAME LISTS THE SIGNAL READS. Wave 1.2
+               # measured SEVEN routes that reached the visibility branch with no
+               # arm here at all — `disable`, `unshare`, `deregister`,
+               # `stop <x>ing`, `undiscoverable`, `take X private`, and
+               # `share X with other people` — so each one handed the command a
+               # machine it had never been told and fell through to the picker.
+               # A signal and a capture written from two lists WILL diverge; the
+               # only question is which verbs fall in the gap.
+               or re.search(rf"\b{_VIS_HIDE_ALL}\s+(.+?)$", t, flags=re.I)
+               or re.search(rf"\b{_VIS_PUBLISH_ALL}\s+(.+?)$", t, flags=re.I)
+               or re.search(r"\b(?:stop|shut|quit|cease|end)\s+"
+                            r"(?:off\s+|down\s+)?(?:offering|sharing|listing|"
+                            r"publishing|letting|showing|allowing)\s+(.+?)$",
                             t, flags=re.I)
-               or re.search(r"\b(?:take|remove|drop|pull)\s+(.+?)\s+"
-                            r"(?:off|out of|from)\b", t, flags=re.I))
+               # ⛔ `let <who> find <machine>` — the phrasing SKILL.md teaches,
+               # which has a signal now and needed a capture to match it.
+               or re.search(r"\blet\s+(?:people|persons|users|anyone|anybody|"
+                            r"everyone|everybody|others|strangers|folks|"
+                            r"other\s+(?:people|persons?|users?))\s+"
+                            r"(?:find|see|discover|locate)\s+(.+?)$",
+                            t, flags=re.I)
+               # ⛔ THE LAST ARM IS SHAPE, NOT VOCABULARY, and it is last for that
+               # reason. Some phrasings reach this branch on a POLARITY word with
+               # a verb no inventory holds — `list my Studio PC publicly` is the
+               # measured one, and `list` is deliberately not a setter because it
+               # is the device-LIST request word. Between a verb and a polarity
+               # word is a name whatever the verb was; every arm above gets first
+               # refusal, so this can only catch what they left.
+               # ⛔⛤ AND IT REFUSES A COPULA CLAUSE, because my first version did
+               # not: `my mac is not public` is a STATEMENT, and this arm
+               # captured “is not” as a machine name and offered to publish it.
+               # A name never contains a copula.
+               or re.search(rf"^\W*\w+(?:\s+\w+)?\s+"
+                            rf"((?:(?!\b(?:is|are|was|were|isn'?t|aren'?t|has|"
+                            rf"have|does|do|did)\b)[^.?!])+?)\s+"
+                            rf"(?:{'|'.join(_NAME_END_ADVERB)}\s+)?"
+                            rf"{_VIS_POLARITY_ALL}\b", t, flags=re.I))
         if _vm:
-            _vis_obj = re.sub(r"^(?:the|a|an|my|our|this|that)\s+", "",
-                              _vm.group(1).strip().strip(_NL_QUOTE_CHARS),
-                              flags=re.I).strip()
+            # ⛔⛤ A QUOTED NAME IS TAKEN VERBATIM, AND THAT IS THE WHOLE ESCAPE
+            # HATCH FOR EVERY TRIM IN THIS WAVE. The tail trim has to eat words
+            # like `now` and `today` to fix the 592 phrasings a politeness word
+            # broke — which means it can also eat a machine genuinely called
+            # “Studio PC Now”. Quoting is what the picker already tells people to
+            # do, so quoting is what must survive. My own test caught this: the
+            # trim ran on the quoted capture too.
+            _vis_quoted = bool(_vm.re.groups >= 3)
+            _vis_obj = _cap(_vm).strip().strip(_NL_QUOTE_CHARS).strip()
+            # ⛔⛔ THE FEATURE IS NOT THE MACHINE, AND MY OWN A/B CAUGHT THIS ONE
+            # BEFORE IT SHIPPED. Giving every hide verb a bare `(.+?)$` arm made
+            # `disable sharing on my mac` capture “sharing on my mac” as a
+            # MACHINE NAME — a phrase that resolves to nothing, so a command that
+            # used to reach the picker started refusing. `disable [sharing] on
+            # [my mac]` names the setting first and the machine after the
+            # preposition; the loop peels both, because people stack them
+            # (`turn off sharing for my mac`).
+            # ⛔ THE PREPOSITION IS REQUIRED, or the peel eats a NAME. Written as
+            # a bare word list it turned `hide Sharing Mac` into “Mac”. A setting
+            # word only means a setting when a machine follows it through `on`,
+            # `for` or `of`; standing alone it is somebody's machine name.
+            for _ in range(3):
+                # ⛔ AND THE AUDIENCE IS NOT THE MACHINE EITHER. `stop letting
+                # people find my pc` captured “people find my pc” — the people
+                # are who, the pc is which. An existing test caught it.
+                # ⛔ TWO PEELS, NOT ONE ALTERNATION. The audience phrase stands
+                # on its own (`letting PEOPLE FIND my pc` — no preposition after
+                # it), while a setting word only means a setting when a machine
+                # follows it THROUGH one. Folding them into a single pattern made
+                # the preposition mandatory for both and the audience survived.
+                _peeled = re.sub(r"^(?:people|persons?|users?|anyone|anybody|"
+                                 r"everyone|everybody|others|strangers|folks|"
+                                 r"other\s+(?:people|persons?|users?))\s+"
+                                 r"(?:to\s+)?(?:find|use|see|discover|access|"
+                                 r"borrow|reach)\s+", "", _vis_obj,
+                                 flags=re.I).strip()
+                _peeled = re.sub(r"^(?:(?:sharing|listing|publishing|offering|"
+                                 r"discovery|visibility|discoverability)\s+)?"
+                                 r"(?:on|for|of|to|from|off|down)\s+", "",
+                                 _peeled, flags=re.I).strip()
+                if _peeled == _vis_obj or not _peeled:
+                    break
+                _vis_obj = _peeled
+            # ⛔ AND THE DETERMINER STAYS ON A QUOTED NAME. Verbatim means
+            # verbatim: a machine somebody called “my mac” is theirs to call that.
+            if not _vis_quoted:
+                _vis_obj = re.sub(rf"^{_NAME_DETERMINER}\s+", "", _vis_obj,
+                                  flags=re.I).strip()
             _vis_obj = re.sub(r"[?.!,]+$", "", _vis_obj).strip()
             # ⛔ AN EXCLUSION CLAUSE IS NOT PART OF THE NAME. `hide the Studio PC
             # and leave all my other machines alone` captured the whole tail and
@@ -4521,7 +5309,21 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
             # is the unconfirmed-wrong-machine outcome this branch exists to
             # avoid. Cross-verify measured seven of them against the revision
             # this wave started from.
-            _vis_obj = _trim_trailing_clause(_vis_obj)
+            # ⛔⛤ THE QUOTED EXEMPTION LIVES IN THE TRIM ITSELF NOW — it takes
+            # the whole message and bypasses when the capture IS the quoted span,
+            # which is what made the hatch work at all six sites. Keeping a
+            # second copy of the same condition here measured NOTHING: the
+            # mutation harness proved the branch could not change an outcome.
+            # ⭐ `_vis_quoted` still earns its keep below, where it exempts a
+            # quoted name from the determiner strip and the bare-noun blank.
+            _vis_obj = _trim_trailing_clause(_vis_obj, t)
+            # ⛔ AND THE CATEGORY WORD IN FRONT COMES OFF, as it already does at
+            # switch, remove and ask. Visibility was the one machine capture
+            # without it, so `hide the machine LABPC001` looked up
+            # “machine LABPC001” and found nothing — the 7.9-3 defect, still
+            # live on hide and publish alone. The helper carries 1.1's guard
+            # against eating a NAME whose own first word is a device noun.
+            _vis_obj = _strip_leading_noun(_vis_obj)
             # A bare noun names no machine; neither does a phrase about other
             # people's, and quoting either back is the 7.9-2 defect shape.
             # ⛔ THE TEST IS ON THE CAPTURED OBJECT, NOT ON THE MESSAGE. The
@@ -4529,7 +5331,16 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
             # — which is every publish phrasing there is — so no machine could
             # ever be named. What disqualifies a capture is that IT names no
             # machine: a bare noun, a pronoun, or a phrase about other people's.
-            if (re.fullmatch(rf"(?:{_MACHINE_NOUNS}|it|them|one|ones|everything|"
+            # ⛔⛔ AND A SPAN THAT ENDS LIKE A CLAUSE NAMES NOTHING — see
+            # `_names_a_machine`. Falling to the picker is the honest outcome;
+            # hiding whatever “mac not” substring-matches is not.
+            if _vis_obj and not _names_a_machine(_vis_obj):
+                _vis_obj = ""
+            # ⛔ AND A QUOTED NAME IS EXEMPT FROM THE BARE-NOUN BLANK TOO. The
+            # escape hatch is that quoting means VERBATIM; a machine somebody
+            # called “my mac” is theirs to call that.
+            if not _vis_quoted and (re.fullmatch(
+                    rf"(?:{_MACHINE_NOUNS_SAID}|it|them|one|ones|everything|"
                              rf"me|us|myself)", _vis_obj, flags=re.I)
                     or re.search(r"\bpublic|\bsomebody else|\bsomeone else|"
                                  r"\bother (?:people|persons?|users?)\b",
@@ -4676,7 +5487,9 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
                             t, flags=re.I))
         if _wm:
             _who = re.sub(r"[?.!,]+$", "", _wm.group(1)).strip().strip(_NL_QUOTE_CHARS)
-            _who = re.sub(r"^(?:the|a|an|that|this|their|his|her|its)\s+", "",
+            # ⛔ THE SHARED DETERMINER LIST — this copy was missing `my` and
+            # `our`, so `approve my colleague Sam` kept the possessive.
+            _who = re.sub(rf"^{_NAME_DETERMINER}\s+", "",
                           _who, flags=re.I).strip()
             _who = re.sub(r"(?:'s|s')?\s*\b(requests?|asks?|application)\b\s*$",
                           "", _who, flags=re.I).strip()
@@ -4692,6 +5505,20 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
             # that surround an answer before it can be quoted as somebody.
             _who = re.sub(r"^(?:access|permission|entry|the request|request)\s+"
                           r"(?:to|for|from)?\s*", "", _who, flags=re.I).strip()
+            # ⛔⛤ A PERSON'S NAME ENDS WHERE THE SENTENCE DOES. This site ran to
+            # end-of-string, so `approve Sam please` asked "Say yes to
+            # “Sam please”?" and `approve Sam and show me the rest` asked about
+            # “Sam and show me the rest” — a CONSENT decision quoting a person
+            # who does not exist. The same trim the other sites use.
+            _who = _trim_trailing_clause(_who, t)
+            # ⛔ AND THE CATEGORY WORD IN FRONT GOES, exactly as it does for a
+            # machine. `approve the person Sam` asked "Say yes to “person Sam”?".
+            # These are the words nobody is CALLED, so unlike the machine nouns
+            # they need no identifier test behind them.
+            _who = re.sub(r"^(?:person|user|account|colleague|coworker|co-worker|"
+                          r"guy|woman|man|requester|requestor)\s+(?=\S)", "",
+                          _who, flags=re.I).strip()
+            _who = _strip_leading_noun(_who)
             if re.fullmatch(rf"(?:it|them|him|her|us|they|everyone|everybody|"
                             rf"persons?|people|somebody|someone|anyone|anybody|"
                             rf"this|that|here|there|now|yet|access|permission|"
@@ -4785,10 +5612,13 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
                           _ask_obj, flags=re.I).strip()
         # ⛔ AND NEITHER IS POLITENESS. "ask for the Studio PC please" and
         # "…, if I can" carried the courtesy into the name and into the lookup.
-        _ask_obj = re.sub(r"[,;]?\s+(?:please|thanks|thank you|for me|"
-                          r"if (?:i|you) (?:can|could|may|would))\s*$", "",
-                          _ask_obj, flags=re.I).strip()
-        _ask_obj = re.sub(r"^(?:the|a|an|my|their|its|that|this)\s+", "", _ask_obj,
+        # ⛔⛤ THIS USED TO BE A PRIVATE LIST OF FIVE PHRASINGS AND IT WENT SHORT
+        # BY FOUR — `today`, `now`, `pls` and `ok` all survived into the name.
+        # It is the only site that had a politeness trim at all, which is why the
+        # trim moved INTO the shared helper rather than being copied to the
+        # other five. One list, one reader each.
+        _ask_obj = _trim_trailing_clause(_ask_obj, t)
+        _ask_obj = re.sub(rf"^{_NAME_DETERMINER}\s+", "", _ask_obj,
                           flags=re.I).strip()
         _ask_obj = _strip_leading_noun(_ask_obj)
     # ⛔ A PHASE OR AN ARTEFACT IS NOT A COMPUTER. "ask for the podcast" and
@@ -4901,7 +5731,7 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
         r"|can|could|should|would|will|shall|may|do|don't|dont)\b",
         low,
     )
-    _device_noun = re.search(rf"\b({_MACHINE_NOUNS}|phones?)\b", low)
+    _device_noun = re.search(rf"\b({_MACHINE_NOUNS_SAID})\b", low)
     _runctl_question = _q_start or re.match(
         r"\s*(?:i\s+(?:want|need|would\s+like|wish)\s+to|how\s+to|what\s+happens)\b",
         low)
@@ -4937,11 +5767,31 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     # worse than asking. ⭐ It gates only the branches BELOW that mutate — the run
     # branches themselves still fire whenever they can, and `skip the podcast on my
     # computer` still reaches skip's own second branch, which is bare and correct.
-    _runctl_verb = re.search(r"\b(stop|end|abort|cancel|pause|resume|unpause|retry)\b", low)
+    # ⛔ ONE LIST FOR THE STOP VERBS, read three times in four lines.
+    # ⛔⛔ AND `drop` IS NOT IN IT, THOUGH I PUT IT THERE FIRST. `drop` is
+    # THREE-WAY ambiguous on this surface — drop a run, drop a machine, drop a
+    # phase — and the skip branch already owns the third. Adding it here stole
+    # `drop ChatGPT from the research` from skip and offered to stop a run called
+    # “ChatGPT from the”. Two existing tests caught it. A shared verb is settled
+    # by its OBJECT, and here the object that matters is a machine: `drop my
+    # Studio PC` unlinks, exactly as `remove` does. The run side stays with skip.
+    _stop_verbs = r"(?:stop|end|abort|cancel)"
+    # ⛔⛤ ONE TRIGGER PATTERN PER VERB, READ BY THE BRANCH AND BY ITS OWN TAIL
+    #    STRIP. Written separately, the condition knew the multi-word forms and
+    #    the strip did not — so the trigger phrase stayed in the message and
+    #    became the run TITLE. Every one of these is a phrasing SKILL.md teaches:
+    #      `hold on`                  -> ['pause', 'hold on']
+    #      `continue the paused run`  -> ['resume', 'continue the paused']
+    #      `that's enough`            -> Stop “that's enough”?
+    #    The person named no run; the client quoted their own words back as one.
+    _T_STOP = rf"(?:{_stop_verbs[3:-1]}|that.?s\s+enough)"
+    _T_PAUSE = r"(?:pause|hold\s+(?:on|it))"
+    _T_RESUME = r"(?:resume|unpause|continue\s+the\s+paused(?:\s+run)?)"
+    _T_RETRY = r"(?:retry|try\s+again)"
+    _runctl_verb = re.search(rf"\b(?:{_stop_verbs[3:-1]}|pause|resume|unpause|retry)\b", low)
     _runctl_dropped = bool(_runctl_verb) and not _runctl_ok
-    if (re.search(r"\b(stop|end|abort|cancel)\b", low) or re.search(r"\bthat.?s enough\b", low)) \
-            and _runctl_ok:
-        name = _nl_run_name(t, re.sub(r"^.*?\b(?:stop|end|abort|cancel)\b", "", t, flags=re.I).strip())
+    if re.search(rf"\b{_T_STOP}\b", low) and _runctl_ok:
+        name = _nl_run_name(t, re.sub(rf"^.*?\b{_T_STOP}\b", "", t, flags=re.I).strip())
         # ⛔ STOP HAD NO MESSAGE-LEVEL CHECK AT ALL. Measured: `stop all of my
         # research` came back "Stop the current run?", `stop all my research on
         # tesla` came back `Stop “tesla”?` and `stop all three runs`
@@ -4953,9 +5803,8 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
             return None, ["I stop one run at a time. Ask me to list the running "
                           "ones and name it — nothing is stopped until you do."]
         return None, [_NL_CONFIRMS["stop"].format(name=f"“{name}”" if name else "the current run")]
-    if re.search(r"\bpause\b|\bhold (on|it)\b", low) \
-            and _runctl_ok:
-        name = _nl_run_name(t, re.sub(r"^.*?\bpause\b", "", t, flags=re.I).strip())
+    if re.search(rf"\b{_T_PAUSE}\b", low) and _runctl_ok:
+        name = _nl_run_name(t, re.sub(rf"^.*?\b{_T_PAUSE}\b", "", t, flags=re.I).strip())
         # ⛔ THE SAME GATE AS STOP. These three end in an honest "No run matching"
         # when handed a set, so 7.9-5 graded them minor — but `stop all my runs`
         # refusing while `pause all my runs` does not is an inconsistency a person
@@ -4964,9 +5813,8 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
             return None, ["I pause one run at a time. Ask me to list the running "
                           "ones and name it — nothing changes until you do."]
         return ["pause"] + ([name] if name else []), None
-    if re.search(r"\b(resume|unpause)\b|\bcontinue the paused\b", low) \
-            and _runctl_ok:
-        name = _nl_run_name(t, re.sub(r"^.*?\b(?:resume|unpause)\b", "", t, flags=re.I).strip())
+    if re.search(rf"\b{_T_RESUME}\b", low) and _runctl_ok:
+        name = _nl_run_name(t, re.sub(rf"^.*?\b{_T_RESUME}\b", "", t, flags=re.I).strip())
         # ⛔ THE SAME GATE AS STOP. These three end in an honest "No run matching"
         # when handed a set, so 7.9-5 graded them minor — but `stop all my runs`
         # refusing while `pause all my runs` does not is an inconsistency a person
@@ -4975,9 +5823,8 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
             return None, ["I resume one run at a time. Ask me to list the running "
                           "ones and name it — nothing changes until you do."]
         return ["resume"] + ([name] if name else []), None
-    if re.search(r"\b(retry|try again)\b", low) \
-            and _runctl_ok:
-        name = _nl_run_name(t, re.sub(r"^.*?\b(?:retry|try again)\b", "", t, flags=re.I).strip())
+    if re.search(rf"\b{_T_RETRY}\b", low) and _runctl_ok:
+        name = _nl_run_name(t, re.sub(rf"^.*?\b{_T_RETRY}\b", "", t, flags=re.I).strip())
         # ⛔ THE SAME GATE AS STOP. These three end in an honest "No run matching"
         # when handed a set, so 7.9-5 graded them minor — but `stop all my runs`
         # refusing while `pause all my runs` does not is an inconsistency a person
@@ -4999,19 +5846,283 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     #     video, not the agent);
     #   • a research ask in the same message bails ("no gpt needed, research
     #     solar panels" must not eat the research and drop ChatGPT).
-    if not _q_start and not _device_noun and not _runctl_dropped and \
-            re.search(r"\b(skip|drop|remove|cut|leave out|without|no)\b", low):
-        phases = [p for p in _NL_PHASE_WORDS if p in low]
+    # ⛔⛔ THE RUN NAME. Wave 1.2 measured that a person CANNOT skip a phase of any
+    #    run but the newest active one, from chat, at all — nineteen phrasings all
+    #    dropped the name and reconfigured whichever run was newest. The branch
+    #    had exactly two returns and neither ever appended `--run`; the capability
+    #    exists only at the raw CLI. It is emitted as `--run=<name>` in ONE token
+    #    because the relay splits flags from positionals by membership.
+    # ⛔⛤ AND IT IS CAPTURED NARROWLY, NOT BY THE SHARED RUN-NAME HELPER. That
+    #    helper falls back to "everything after the verb", which here is the PHASE
+    #    LIST: `skip the video and the report` came out naming a run called
+    #    “video and the report”. A skip names a run in exactly two ways — a quoted
+    #    title, or an explicit `on|for|of <title> run` — and anything else is the
+    #    phases, which is why this is a shape test and not a fallback.
+    # ⛔⛤ THE `called|named|titled` SHAPE IS READ FIRST, because the `<name> run`
+    #    shape eats it: `skip the podcast on run called Deep Research` came out
+    #    naming a run “run called Deep”. And the `<name> run` capture rejects a
+    #    bare determiner — `skip the podcast on the run` named a run “the”, which
+    #    then SUBSTRING-MATCHED an arbitrary run and skipped a phase of it.
+    _skip_rm = (_NL_QUOTED_RE.search(t)
+                or re.search(r"\brun\s+(?:called|named|titled)\s+"
+                             r"([\w'\u2019 -]+?)\s*$", t, re.I)
+                or re.search(r"\b(?:on|for|in|of)\s+(?:the\s+|my\s+)?"
+                             r"((?!(?:the|a|an|my|our|this|that|current|latest|"
+                             r"last|newest|run|research)\b)[\w'\u2019 -]+?)"
+                             r"\s+(?:run|research)\b", t, re.I)
+                # ⛔ AND WITHOUT A PREPOSITION: `skip the Mars run` names a run
+                #    and no phase, which is what the bare form is for.
+                # ⛔⛤ THE TITLE CARRIES NO PREPOSITION OF ITS OWN. A space-tolerant
+                #    capture reached ACROSS one — `skip the podcast on the run`
+                #    came out naming a run “podcast on the” — so each word after
+                #    the first is guarded, not only the first.
+                or re.search(r"\b(?:the|my)\s+"
+                             r"((?!(?:the|a|an|my|our|this|that|current|latest|"
+                             r"last|newest|run|research)\b)[\w'\u2019-]+"
+                             r"(?:\s+(?!(?:on|for|in|of|the|a|an|my|our|this|that)\b)"
+                             r"[\w'\u2019-]+)*?)"
+                             r"\s+(?:run|research)\b", t, re.I))
+    _skip_run = _skip_rm.group(1).strip() if _skip_rm else None
+    # ⛔⛤ AND A PHASE WORD IS NOT REJECTED HERE, THOUGH I REJECTED ONE FIRST.
+    #    All three shapes above are EXPLICIT run-naming — a quoted title, an
+    #    `on|for|of <title> run`, a `run called <title>` — so a run genuinely
+    #    called “brief” is named by the only means the product offers, and
+    #    throwing it away sent the skip to the NEWEST run instead. The guard was
+    #    written for the loose fallback this capture replaced; it outlived its
+    #    reason, and the mutation harness is what showed the difference.
+    #    What still disqualifies a capture is a GENERIC reference or a bare
+    #    machine noun, neither of which is a title anybody typed.
+    if _skip_run and (_skip_run.lower() in _NL_GENERIC_RUN
+                      or _is_bare_machine_noun(_skip_run)):
+        _skip_run = None
+    _run_flag = [f"--run={_skip_run}"] if _skip_run else []
+
+    # ⛔⛔ A QUESTION ABOUT SKIPPING IS NOT AN ORDER, AND BAILING IS NOT ENOUGH.
+    #    `can i skip the podcast` fell past both branches and reached the PODCAST
+    #    branch, which DOWNLOADS THE AUDIO. This returns the catch-all rather than
+    #    handing the message on — the lesson wave 1.1 paid for four times.
+    # ⛔ THE INFLECTIONS TOO — `is the podcast skipped` is a question about a
+    #    phase and it reached the PODCAST branch, which downloads the audio.
+    # ⛔⛤ AND THE QUESTION TEST HERE IS NOT ANCHORED AT CHARACTER 0. `_q_start` is
+    #    a `re.match`, so `please could you skip the brief`, `hey can you skip the
+    #    video`, `btw can i skip the podcast` and a dozen more preambles defeated
+    #    it and POSTED A REAL SKIP. Skip is not confirm-gated; there is no second
+    #    chance. The lead-in vocabulary this file already keeps is the fix.
+    # ⛔ AND THE SUBJECT IS WHAT SEPARATES A QUESTION FROM A POLITE ORDER.
+    #    `could YOU skip the brief` is an order — this file already has
+    #    `_polite_imperative` for that shape on the visibility surface — while
+    #    `can I skip the podcast` and `should WE skip the video` are asks. My
+    #    first version read both as questions and refused the order too.
+    # ⛔ AND A POLITE ORDER IS NOT A QUESTION, however it opens: `would you skip
+    #    the report` and `can you skip the video` are instructions to the
+    #    assistant, and `_q_start` reads their first word as a question opener.
+    _polite_skip_order = re.match(
+        rf"{_NL_LEAD_IN}(?:can|could|would|will|please|do)\s+(?:you\s+)?"
+        rf"(?:please\s+)?(?:skip|drop)\b", low)
+    _skip_question = (not _polite_skip_order) and (bool(_q_start) or bool(re.match(
+        r"\s*(?:please|hey|hi|ok|okay|so|also|btw|hmm+|um+|well|"
+        r"quick question|question|tell me|i wonder|i was wondering|"
+        r"just wondering|any chance|by the way)\b[\s,:;-]*"
+        r"(?:\w+\s+){0,3}?"
+        r"(?:\b(?:can|could|should|would|shall|may|do|did|does|is|are|am)\s+"
+        r"(?:i|we)\b|\b(?:i|we)\s+"
+        r"(?:can|could|should|would|shall|may|ought)\b)",
+        low)) or bool(re.match(
+        r"\s*(?:please|hey|hi|ok|okay|so|also|btw|hmm+|um+|well|"
+        r"quick question|question|tell me|i wonder|i was wondering|"
+        r"just wondering|any chance|by the way)\b[\s,:;-]*"
+        r"(?:\w+\s+){0,3}?"
+        r"\b(?:what|which|why|when|where|who|how|is|are|did|does|has|have)\b",
+        low)))
+    if _skip_question and re.search(r"\bskip(?:s|ped|ping)?\b|\bdrop(?:s|ped|ping)?\b", low) and \
+            re.search(rf"\b(?:{'|'.join(_NL_PHASE_WORDS)}|"
+                      rf"{'|'.join(_NL_AGENT_WORDS)}|phase|step|blocker)\b", low):
+        return None, [_NL_CATCH_ALL]
+    # ⛔ `skip nothing` IS NOT A SKIP. It reached the bare form and resolved the
+    #    run's blocker — the one thing it says not to do.
+    if re.search(r"\bskip\s+(?:nothing|none|neither)\b", low):
+        return None, [_NL_CATCH_ALL]
+
+    # skip / drop phases or P2 agents ("skip the video and the report",
+    # "remove the video", "no email", "skip Claude in P2"). Guards (review
+    # catches — skip is NOT confirm-gated, so a mis-route silently
+    # reconfigures a live run):
+    #   • questions bail ("did claude skip anything?" is not an order);
+    #   • device nouns bail ("remove claude's laptop" = device-remove, which
+    #     keeps its confirm) — UNLESS a phase word sits right after the verb;
+    #   • agent nouns need the verb ADJACENT ("skip claude"), never bare
+    #     co-occurrence, never a possessive/compound ("claude's", "claude-pc"),
+    #     and never when folded into a phase noun ("the gemini video" is the
+    #     video, not the agent);
+    #   • a research ask in the same message bails ("no gpt needed, research
+    #     solar panels" must not eat the research and drop ChatGPT).
+    # ⛔⛔ THE DEVICE BAIL IS CONDITIONAL NOW. `skip the podcast on my computer`
+    #    bailed here and branch 2 returned the bare form, which resolves the run's
+    #    BLOCKER — the person named a phase and got a different mutation. The
+    #    machine in that sentence is WHERE, not WHAT. The bail still stands when
+    #    no phase follows the verb, which is what keeps `remove claude's laptop`
+    #    a device-remove with its confirm.
+    # ⛔ AND THE PHASE WORD MUST NOT ITSELF BE PART OF A MACHINE NAME.
+    #    `remove my video PC` names a computer called “video PC”; without the
+    #    lookahead it read as "skip the video" and reconfigured a live run
+    #    instead of asking to unlink a machine — which is the very swap the
+    #    device bail was written to prevent, reintroduced by the exception to it.
+    _phase_is_the_object = re.search(
+        rf"\b(?:skip(?:ping)?|drop(?:ping)?|remove|cut|leave\s+out|without|no)\s+"
+        rf"(?:{_NAME_DETERMINER}\s+)?(?:{'|'.join(_NL_PHASE_WORDS)})\b"
+        rf"(?!\s+(?:{_MACHINE_NOUNS_SAID})\b)", low)
+    if not _skip_question and (not _device_noun or _phase_is_the_object) \
+            and not _runctl_dropped and \
+            re.search(r"\bskip(?:s|ping)?\b|\bdrop(?:s|ping)?\b|"
+                      r"\b(remove|cut|leave out|without|no)\b", low):
+        # ⛔⛔ THE EXCLUSION INVERTS ITSELF WITHOUT THIS. `skip all but the
+        #    podcast` skipped THE PODCAST — the one thing the person said to
+        #    keep — because the phase words were collected by presence. An
+        #    exclusion names the KEEPER; what is skipped is everything else, and
+        #    "everything else" is derived from the command's own phase map.
+        # ⛔⛤ THE RUN NAME IS NOT A PHASE LIST, AND CHASING A MUTATION SURVIVOR
+        #    FOUND THIS ONE. `skip the report for the brief run` came out
+        #    `['skip','brief','report']` — it skipped the BRIEF as well, because
+        #    the phase scan read the whole message and the run is CALLED brief.
+        #    The span the run name came from is blanked before the scan.
+        _scan = low
+        if _skip_rm:
+            _scan = low[:_skip_rm.start()] + " " + low[_skip_rm.end():]
+        # ⛔⛔⛔ ONE EXCLUSION READER, AND CROSS-VERIFY MEASURED WHY. The first
+        #    version knew ONE shape and ONE keeper, and everything else inverted:
+        #      `skip all but phase 3`             SKIPPED PHASE 3 — a perfect inversion
+        #      `skip all but claude and gemini`   TURNED OFF BOTH KEEPERS
+        #      `skip all but the podcast and the brief`  skipped the brief
+        #      `skip the video but keep the report`      skipped the report
+        #      `skip the podcast but not the video`      skipped the video
+        #    An exclusion names what to KEEP. Two shapes say it, and both have to
+        #    read EVERY keeper after the word, across all three domains — phase
+        #    words, phase numbers and agents.
+        #      COMPLEMENT   `skip ALL but X`  -> everything except X
+        #      SUBTRACTIVE  `skip A but keep B` -> A minus B
+        _excl = re.search(r"\b(?:but|except|apart\s+from|other\s+than|excluding)\s+"
+                          r"(?:not\s+|leave\s+|keep\s+)?(.+)$|"
+                          r"\b(?:keep|leave|save)\s+(.+)$", _scan)
+        if _excl:
+            _tail = _excl.group(1) or _excl.group(2) or ""
+            _head = _scan[:_excl.start()]
+            _keep_phases = {_SKIP_NAMES[w] for w in _NL_PHASE_WORDS
+                            if re.search(rf"\b{w}\b", _tail)}
+            _keep_phases |= {int(n) for n in re.findall(r"\b(\d+)\b", _tail)
+                             if int(n) in _SKIP_PHASE_NUMBERS}
+            _keep_agents = {_SKIP_AGENTS[a] for a in _NL_AGENT_WORDS
+                            if re.search(rf"\b{a}\b", _tail)}
+            _totaliser = re.search(r"\b(?:all|everything|every\s+phase|"
+                                   r"the\s+(?:rest|lot|whole\s+thing))\b", _head)
+            _order = {w: i for i, w in enumerate(_SKIP_NAMES)}
+
+            def _one_per_number(nums):
+                seen_n: set = set()
+                return [w for w in sorted(_NL_PHASE_WORDS,
+                                          key=lambda w: (_SKIP_NAMES[w], _order[w]))
+                        if _SKIP_NAMES[w] in nums
+                        and not (_SKIP_NAMES[w] in seen_n
+                                 or seen_n.add(_SKIP_NAMES[w]))]
+
+            if _totaliser and (_keep_phases or _keep_agents):
+                # ⛔ THE DOMAIN IS WHICHEVER ONE THE KEEPER NAMES. `skip all but
+                #    chatgpt` is about AGENTS, and complementing phases there
+                #    would turn off everything the person did not mention.
+                if _keep_agents and not _keep_phases:
+                    _out = sorted(set(_SKIP_AGENTS.values()) - _keep_agents)
+                else:
+                    _out = _one_per_number(set(_SKIP_PHASE_NUMBERS) - _keep_phases)
+                if not _out:
+                    return None, [_NL_CATCH_ALL]
+                # ⛔ AND THE SET GATE STILL SEES THE HEAD. Blanking the whole
+                #    exclusion span took `all my runs` with it, so
+                #    `skip the podcast on all my runs but the brief` executed on
+                #    ONE run. Only the keeper tail is the exclusion's.
+                # ⛔ AND THE TOTALISER ITSELF IS THE EXCLUSION'S WORD, not a set
+                #    of runs — `skip everything except the brief` was refused as
+                #    a bulk RUN ask because "everything" survived into the head.
+                #    It is blanked, and anything else that makes the head a set
+                #    (`all my runs`) is not.
+                if _request_names_a_set(
+                        _head[:_totaliser.start()] + " " + _head[_totaliser.end():],
+                        _skip_run):
+                    return None, [_NL_SKIP_ONE_RUN]
+                return ["skip"] + _run_flag + _out, None
+            if _keep_phases or _keep_agents:
+                _said_p = {_SKIP_NAMES[w] for w in _NL_PHASE_WORDS
+                           if re.search(rf"\b{w}\b", _head)}
+                _said_a = {_SKIP_AGENTS[a] for a in _NL_AGENT_WORDS
+                           if re.search(rf"\b{a}\b", _head)}
+                _out = _one_per_number(_said_p - _keep_phases) + \
+                    sorted(_said_a - _keep_agents)
+                if _out:
+                    if _request_names_a_set(_head, _skip_run):
+                        return None, [_NL_SKIP_ONE_RUN]
+                    return ["skip"] + _run_flag + _out, None
+                return None, [_NL_CATCH_ALL]
+        # ⛔ EMITTED IN PHASE ORDER, NOT MATCH ORDER — the matching list is sorted
+        #    longest-first so "chatgpt" beats its own substring "gpt", and reusing
+        #    that order here reversed `skip the video and the report`.
+        _order = {w: i for i, w in enumerate(_SKIP_NAMES)}
+        _hits = [w for w in _NL_PHASE_WORDS if re.search(rf"\b{w}\b", _scan)]
+        seen_n = set()
+        phases = [w for w in sorted(_hits, key=lambda w: (_SKIP_NAMES[w], _order[w]))
+                  if not (_SKIP_NAMES[w] in seen_n or seen_n.add(_SKIP_NAMES[w]))]
+        # ⛔⛔ PHASE NUMBERS WERE UNROUTABLE AND LANDED ON A MUTATION. `skip phase
+        #    3`, `skip 4 and 5` and `skip step 2` all reached the bare form, which
+        #    resolves the run's BLOCKER. The CLI has accepted numbers all along.
+        _nums: list = []
+        # ⛔⛤ AND IT READS THE BLANKED COPY, as the phase-word scan does. Reading
+        #    `low` made a number inside a RUN TITLE a phase: `skip phase 3 for the
+        #    2024 run` was refused as “Phase 2024”, and `skip the video on
+        #    "Phase 3 Review"` skipped phase 3 as well.
+        # ⛔ A BARE NUMBER AFTER `skip` IS A PHASE — the refusal this command
+        #    prints names the numbers, so it invites exactly `skip 3`, and that
+        #    reached the bare arm and RESOLVED THE BLOCKER instead.
+        if re.fullmatch(r"(?:please\s+|just\s+)*(?:skip|drop)\s+"
+                        r"\d+(?:\s*(?:,|and|&)\s*\d+)*[.!]*", _scan):
+            _nums = re.findall(r"\b(\d+)\b", _scan)
+        elif re.search(r"\b(?:phases?|steps?|p)\s*\d", _scan):
+            # ⛔ EVERY NUMBER IN THE LIST, not only the one beside the word.
+            #    `skip phase 4 and 5` skipped 4 and silently dropped 5.
+            _tail = _scan[re.search(r"\b(?:phases?|steps?|p)\s*\d", _scan).start():]
+            _nums = re.findall(r"\b(\d+)\b", _tail)
+        _nums = _nums or []
+        _bad = [n for n in _nums if int(n) not in _SKIP_PHASE_NUMBERS]
+        if _bad:
+            # ⛔ AND AN UNSKIPPABLE NUMBER IS REFUSED BY NAME. `skip step 2` found
+            #    no phase, fell to the bare arm and RESOLVED THE RUN'S BLOCKER —
+            #    a mutation the person never asked for. The list it names is the
+            #    command's own map, so it cannot go stale.
+            _menu = ", ".join(f"{n} ({'/'.join(sorted(w for w in _SKIP_NAMES if _SKIP_NAMES[w] == n))})"
+                              for n in _SKIP_PHASE_NUMBERS)
+            return None, [f"Phase {_bad[0]} isn’t one I can skip. The ones I can: "
+                          f"{_menu}."]
+        for _n in _nums:
+            if _n not in phases:
+                phases.append(_n)
         agents: list = []
+        # ⛔ THE AGENT MAY FOLLOW A CONJUNCTION, NOT ONLY THE VERB.
+        #    `skip chatgpt and the video` turned ChatGPT off; `skip the video and
+        #    chatgpt` — the same ask, said the other way round — silently did not.
         _agent_adjacent = re.search(
-            r"\b(?:skip(?:ping)?|drop(?:ping)?|remove|cut|leave\s+out|without|minus|no)\s+"
-            r"(?:the\s+|a\s+|any\s+)?(?:chatgpt|gpt|claude|gemini)\b(?!['’-])"
-            r"(?!\s+(?:video|podcast|report|brief|email)\b)", low)
+            rf"\b(?:skip(?:ping)?|drop(?:ping)?|remove|cut|leave\s+out|without|minus|no)\s+"
+            rf"(?:[^.?!]{{0,28}}?\b(?:and|or|,|plus|as\s+well\s+as)\s+)?"
+            rf"(?:{_NAME_DETERMINER}\s+|any\s+)?(?:{'|'.join(_NL_AGENT_WORDS)})\b(?!['’-])"
+            rf"(?!\s+(?:{'|'.join(_NL_PHASE_WORDS)})\b)", low)
         if _agent_adjacent and not re.search(r"\b(?:research|look into|deep dive on|investigate)\s+\w+", low):
-            agents = [a for a in _NL_AGENT_WORDS
-                      if re.search(rf"\b{a}\b(?!['’-])(?!\s+(?:video|podcast|report|brief|email)\b)", low)]
+            agents = [_SKIP_AGENTS[a] for a in _NL_AGENT_WORDS
+                      if re.search(rf"\b{a}\b(?!['’-])"
+                                   rf"(?!\s+(?:{'|'.join(_NL_PHASE_WORDS)})\b)", low)]
+            agents = sorted(dict.fromkeys(agents))
         if phases or agents:
-            return ["skip"] + phases + agents, None
+            # ⛔⛔ AND THE SET GATE. This was the ONLY mutating act branch with no
+            #    set gate on its phase arm: `skip the podcast on all my runs`
+            #    applied it to ONE run and said nothing. The bare arm below has
+            #    had the gate since 1.1; the two arms now answer alike.
+            if _request_names_a_set(t, _skip_run):
+                return None, [_NL_SKIP_ONE_RUN]
+            return ["skip"] + _run_flag + phases + agents, None
     # ⛔⛔ BRANCH 2 HAD NEITHER GUARD, AND IT IS THE ONE THAT ACTUALLY FIRES for a
     # bare `skip`. `_q_start` above gates branch 1 only, so `should i skip it`
     # SKIPPED A PHASE ON A LIVE RUN — and skip is not confirm-gated, so there was
@@ -5030,12 +6141,30 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     # third time in this one change that a veto turned into a hand-off to the wrong
     # branch. ⭐ A VETO IN AN ORDERED LADDER IS NOT INERT: it gives the message to
     # whatever comes next, and that has to be checked every single time.
-    if re.search(r"^skip\b|\bskip (it|this|that|the step|the blocker)\b", low) \
-            and not _q_start:
-        if _request_names_a_set(t, None):
-            return None, ["I skip one run at a time. Ask me to list the running "
-                          "ones and name it — nothing changes until you do."]
-        return ["skip"], None
+    # ⛔⛤ AND THE BARE ARM NEEDS A GENERIC OBJECT, NOT JUST THE WORD `skip`.
+    #    Written as `^skip\b` it fired on ANY object it did not recognise —
+    #    `skip the summary`, `skip the sources`, `skip the transcript`,
+    #    `skip the pdf`, `skip my computer` — and the bare form RESOLVES THE
+    #    RUN'S CURRENT BLOCKER, a mutation none of them asked for.
+    # ⛔ THE SET REFUSAL COMES FIRST AND DOES NOT DEPEND ON THE OBJECT. Narrowing
+    #    the bare arm's object sent `skip all my runs` to the CATCH-ALL, which
+    #    says nothing about the thing being asked for; the refusal says skip works
+    #    one run at a time, which is the answer. An existing test caught it.
+    if re.search(r"\bskip(?:s|ping)?\b|\bdrop(?:s|ping)?\b", low) \
+            and not _skip_question and _request_names_a_set(t, _skip_run):
+        return None, [_NL_SKIP_ONE_RUN]
+    # ⛔ AND A NAMED RUN WITH NO PHASE IS A BARE SKIP ON THAT RUN. `skip the Mars
+    #    run` reached the catch-all: it names a run and no phase, which is exactly
+    #    what the bare form is for — resolve THAT run's blocker, not the newest.
+    if (re.fullmatch(r"(?:please\s+|just\s+|now\s+|ok\s+)*skip"
+                     r"(?:\s+(?:it|this|that|the\s+step|the\s+blocker|"
+                     r"the\s+current\s+one|ahead|forward|please|now))*[.!]*", low)
+            or re.search(r"\bskip (it|this|that|the step|the blocker)\b", low)
+            or (_skip_run and re.match(rf"{_NL_LEAD_IN}skip\b", low))) \
+            and not _skip_question:
+        if _request_names_a_set(t, _skip_run):
+            return None, [_NL_SKIP_ONE_RUN]
+        return ["skip"] + _run_flag, None
 
     # 4. Devices.
     # ⛔⛔ THE LIST CLAUSE READ ONLY `devices?|nodes?`, SO FIVE OF THE TEN WORDS
@@ -5072,10 +6201,13 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     # because this gate is consulted before the clause it protects. Cross-verify
     # measured it; at HEAD the narrow clause answered it before any switch rule
     # could see it.
-    _dev_verb = re.search(r"\b(remove|unlink|forget|delete|add|pair|connect|"
-                          r"switch to)\b|\brun (?:it |everything )?on\s+\S", low)
+    # ⛔ `drop` BELONGS HERE TOO, or the list branch above takes it: `drop my
+    # Studio PC` answered with the DEVICE LIST because `my … PC` reads as a list
+    # request, and the unlink branch that would have handled it sits below.
+    _dev_verb = re.search(rf"\b(?:{_UNLINK_VERBS[3:-1]}|add|pair|connect|"
+                          rf"switch to)\b|\brun (?:it |everything )?on\s+\S", low)
     _list_narrow = re.search(r"\b(which|what|list|show|my)\b.*\b(devices?|nodes?)\b", low)
-    _list_wide = re.search(rf"\b(which|what|list|show|my)\b.*\b({_MACHINE_NOUNS})\b", low)
+    _list_wide = re.search(rf"\b(which|what|list|show|my)\b.*\b({_MACHINE_NOUNS_SAID})\b", low)
     # ⛔ `running` IS NOT IN `_artefact_kw` AND HAD TO BE NAMED. "what's running on
     # my mac" is a question about RUNS; at HEAD the narrow list let it fall through
     # to the progress rule, and the wider one caught it.
@@ -5084,13 +6216,40 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     if (not _dev_verb and (_list_narrow or (_list_wide and _wide_is_clean))) or \
             low in ("devices", "device list") or "what am i running on" in low:
         return ["devices"], None
-    m = re.search(r"\b(?:switch to|run (?:it |everything )?on|use)\s+(?:the\s+|my\s+)?(.+)$", t, flags=re.I)
+    # ⛔ THE DETERMINER LIST IS THE SHARED ONE. Spelled `the|my` here and
+    # `the|a|an|my|their|its|that|this` at unlink, this branch carried the
+    # determiner INTO the name: `switch to that mac`, `to their laptop` and
+    # `to this computer` all EXECUTED — no confirm — on a string no lookup can
+    # resolve. Same question, same answer, one list.
+    m = re.search(rf"\b(?:switch to|run (?:it |everything )?on|use)\s+"
+                  rf"(?:{_NAME_DETERMINER}\s+)?(.+)$", t, flags=re.I)
     # ⛔ `use` IS IN THE GATE NOW BECAUSE IT WAS ALWAYS IN THE CAPTURE. The
     # picker one file up ends every ask with 'Just say: use “<name>”.' — the one
     # phrasing this line did not route, so following the instruction on screen
     # reached "I didn't catch a Super Research request in that". It is gated on a
     # QUOTED name so that "use less video" and "use chatgpt" stay clear of it.
-    _bare_use = t[:4].lower() == "use " and t[4:5] in _NL_QUOTE_CHARS
+    # ⛔⛤ AND UNQUOTED TOO, WHEN WHAT FOLLOWS IS A MACHINE AND NOT A SETTING.
+    #     `use "Studio PC"` worked and `use Studio PC` reached the catch-all, so
+    #     following the picker's instruction worked only if you typed the quotes
+    #     it printed. The gate that kept `use less video` and `use chatgpt` out is
+    #     what the word list below does — an artefact, an agent or a phase word
+    #     after `use` is not a machine.
+    # ⛔⛔ AND THE UNQUOTED OBJECT MUST LOOK LIKE A MACHINE. Cross-verify drove
+    # 24 of 24 ordinary objects into an UNCONFIRMED device switch: `use the web`,
+    # `use plain english`, `use bullet points`, `use dark mode`, `use google`,
+    # `use my judgment` all repointed where every future run would execute. A
+    # stop-list of phase and agent words cannot cover the English language; the
+    # object has to carry a machine noun or be an identifier.
+    _use_obj = re.sub(rf"^use\s+(?:{_NAME_DETERMINER}\s+)?", "", t, flags=re.I).strip()
+    _bare_use = t[:4].lower() == "use " and (
+        t[4:5] in _NL_QUOTE_CHARS
+        or bool(re.search(rf"\b(?:{_MACHINE_NOUNS_SAID})\b", _use_obj, re.I)
+                or _looks_like_a_machine_token(_use_obj))
+        and bool(re.fullmatch(
+            rf"use\s+(?:{_NAME_DETERMINER}\s+)?"
+            rf"(?!(?:{'|'.join(_NL_PHASE_WORDS)}|{'|'.join(_NL_AGENT_WORDS)}|"
+            rf"less|more|fewer|another|it|this|that|them|one)\b)"
+            rf"[\w'\u2019-]+(?:\s+[\w'\u2019-]+){{0,3}}", low)))
     # ⛔⛔ THE QUESTION GUARD REACHES HERE TOO, AND IT HAD TO. This branch mutates
     # with NO CONFIRM, and once the run-control family started bailing on
     # questions, every question that mentions a machine fell THROUGH to this line:
@@ -5100,7 +6259,20 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     # traffic into an ungated branch owns that branch's gate.
     if m and (re.search(r"\b(switch to|run (it |everything )?on)\b", low) or _bare_use) \
             and not _q_start and not _runctl_dropped:
-        name = re.sub(r"[?.!,]+$", "", m.group(1)).strip()
+        # ⛔ A QUOTED NAME WINS OUTRIGHT — see `_quoted_name`. Everything below
+        # is for the unquoted case.
+        name = _quoted_name(t) or re.sub(r"[?.!,]+$", "", m.group(1)).strip()
+        # ⛔ AND THE QUOTES COME OFF, as they do at unlink. The picker this client
+        # prints ends every ask with 'Just say: use “<name>”.', so the one
+        # phrasing the product itself teaches arrived here still wrapped.
+        name = name.strip().strip(_NL_QUOTE_CHARS).strip()
+        # ⛔⛤ AND THE TRAILING CLAUSE COMES OFF HERE TOO. This is the branch that
+        # MUTATES WITH NO CONFIRM, and it was one of four capture sites that ran
+        # the name to end-of-string: `switch to my Studio PC and show me the rest`
+        # switched to a machine called “Studio PC and show me the rest”, and
+        # `switch to my Studio PC please` switched to “Studio PC please”. One trim,
+        # every site — the reason the helper says ONE COPY at the top.
+        name = _trim_trailing_clause(name, t)
         # ⛔ A LEADING DEVICE NOUN IS NOT PART OF THE NAME. "switch to the machine
         # LABPC001" carried "machine LABPC001" into a name lookup that matches on
         # name, hostname and substring — none of which contains the word.
@@ -5125,13 +6297,22 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
             return None, ["I run on one computer at a time. Ask me to list them "
                           "and name the one to use — nothing changes until you do."]
         return (["device-use", name] if name else ["devices"]), None
-    if re.search(r"\b(remove|unlink|forget|delete)\b", low) and \
-            re.search(rf"\b({_MACHINE_NOUNS}|phones?)\b", low):
+    # ⛔ `drop` IS A SYNONYM OF `remove` ON THIS SURFACE and reached the catch-all.
+    # Routing it to the device LIST instead — which is where the control-word fix
+    # first sent it — is not an improvement on a refusal: the person named one
+    # machine and asked for something to happen to it.
+    # ⛔ A BARE MACHINE TOKEN NAMES A MACHINE HERE TOO — `remove LABPC001` reached
+    # the catch-all for want of the word "computer" in the sentence.
+    _unlink_tok = re.search(rf"\b{_UNLINK_VERBS}\s+(?:{_NAME_DETERMINER}\s+)?"
+                            rf"(\S+)\s*$", t, re.I)
+    if re.search(rf"\b{_UNLINK_VERBS}\b", low) and \
+            (re.search(rf"\b({_MACHINE_NOUNS_SAID})\b", low)
+             or (_unlink_tok and _looks_like_a_machine_token(_unlink_tok.group(1)))):
         # ⛔ FIVE MORE DETERMINERS. The ask branch strips `the|a|an|my|their|its|
         # that|this`; this one stripped only `the|my`, so "remove that computer"
         # and "unlink their laptop" carried the word into a DESTRUCTIVE confirm.
-        m = re.search(r"\b(?:remove|unlink|forget|delete)\s+"
-                      r"(?:the\s+|a\s+|an\s+|my\s+|their\s+|its\s+|that\s+|this\s+)?(.+)$",
+        m = re.search(rf"\b{_UNLINK_VERBS}\s+"
+                      rf"(?:{_NAME_DETERMINER}\s+)?(.+)$",
                       t, flags=re.I)
         name = re.sub(r"[?.!,]+$", "", m.group(1)).strip() if m else ""
         name = re.sub(r"^(old|other)\s+", "", name, flags=re.I)
@@ -5142,7 +6323,14 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
         # ⛔ THE QUOTES COME OFF BEFORE THEY GO BACK ON. This client tells people to
         # reply with the name in quotes, so a quoted one arrives here wrapped and
         # the confirm printed ““Studio PC””.
-        name = name.strip().strip(_NL_QUOTE_CHARS).strip()
+        name = _quoted_name(t) or name.strip().strip(_NL_QUOTE_CHARS).strip()
+        # ⛔⛤ THE DESTRUCTIVE CONFIRM QUOTED THE WHOLE SENTENCE. This site ran to
+        # end-of-string, so `remove my Studio PC please` offered to unlink
+        # “Studio PC please” and `remove my Studio PC and show me the rest`
+        # offered to unlink “Studio PC and show me the rest”. A confirm whose own
+        # follow-up cannot resolve is worse here than anywhere else on the
+        # surface, because saying yes to it rotates a pair code.
+        name = _trim_trailing_clause(name, t)
         name = _strip_leading_noun(name)
         # ⛔⛔ AND NOT "that device" EITHER. The old fallback was written for a
         # message that named nothing at all; here the person DID name something,
@@ -5203,11 +6391,59 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
         return None, [_NL_CONFIRMS["install"]]
 
     # 6. Listing + progress (before research — "results of X" is a status ask).
+    # ⛔⛤ `did they answer?` AND `any word back?` — SKILL.md teaches both as the
+    #     way to check on a request you sent, and both reached the catch-all. The
+    #     surface exists; nothing pointed at it.
+    # ⛔⛤ `ask its owner if I can use it` IS TAUGHT AND RESOLVED NOWHERE. It names
+    #     no machine — "it" is whichever row is on screen — so the honest landing
+    #     is the list you pick one from, not a confident guess at which.
+    # ⛔⛤ AND NOT WHEN AN ARTEFACT IS NAMED: `ask the owner for the podcast` is
+    # a fetch, and this return took it.
+    if (not _artefact_kw) and (re.fullmatch(
+            r"(?:please\s+)?(?:can (?:i|we) )?(?:ask|request)\s+"
+            r"(?:its|their|the)\s+owner\s+[^.?!]{0,48}", low)) or \
+            re.fullmatch(r"(?:please\s+)?(?:can (?:i|we) )?"
+                         r"(?:ask|request)\s+(?:to use|access to|for)\s+"
+                         r"(?:it|this|that|one)\b[^.?!]{0,24}", low):
+        return ["devices-public"], None
+    if re.fullmatch(r"(?:please\s+)?(?:did (?:they|he|she|the owner) (?:answer|reply|"
+                    # ⛔ A MANDATORY SPACE BEFORE AN OPTIONAL GROUP killed the
+                    # bare arm: `any news` reached the catch-all while
+                    # `any news yet` worked.
+                    r"respond|say yes|get back to me)|any (?:word|answer|reply|news)"
+                    r"(?:\s+(?:back|yet))?|have they (?:answered|replied|responded)|"
+                    r"heard back(?: yet)?)", low):
+        return ["device-requests"], None
     if re.search(r"\bwhat('s| is) (running|active)\b|\bactive runs?\b|\banything running\b", low):
         return ["updates"], None
+    # ⛔⛤ NARROWED. `my last report` and `my recent brief` are asks about ONE
+    # artefact and the status branch has always served them; `the run` and
+    # `my run` likewise. I had this list eating both.
+    _past_research = re.fullmatch(
+        r"(?:my|the|all|our)\s+(?:past|previous|old|earlier|recent)\s+"
+        r"(?:research(?:es)?|runs)|(?:my|the|our)\s+(?:researches|runs)", low)
     if re.search(r"\b(list|show|what)\b.*\b(researches|research history|past research(es)?)\b", low) or \
-            low in ("list", "my researches", "researches"):
+            low in ("list", "my researches", "researches") or _past_research:
         return ["list"], None
+    # ⛔⛤ THE ARTEFACT LINKS. SKILL.md teaches `the brief link`, `a report link`,
+    #     `the NotebookLM link`, `the doc` and `the video` as things to SAY, and
+    #     every one reached the catch-all — the links live in the status output
+    #     and nothing routed a person to it. ⛔ IT IS A FULLMATCH ON PURPOSE: the
+    #     same words inside a longer sentence belong to skip (`skip the video`),
+    #     to research (`research the podcast industry`) and to the branches above.
+    if re.fullmatch(r"(?:please\s+|can\s+you\s+|could\s+you\s+|send\s+|show\s+"
+                    r"|give\s+|get\s+)*(?:me\s+)?"
+                    r"(?:the|a|an|my)\s+"
+                    # ⛔⛤ `audio overview` GOES BACK TO THE PODCAST BRANCH two
+                    # rules below, which is where it was and which is the only
+                    # command that delivers playable audio. I took it and gave
+                    # the product two spellings with two answers: bare
+                    # `audio overview` fetched, `the audio overview` did not.
+                    r"(?:brief|report|doc|document|google\s+doc|notebooklm|"
+                    r"video|youtube|links?|results?)"
+                    r"(?:\s+links?)?", low):
+        name = _nl_run_name(t)
+        return ["status"] + ([name] if name else []), None
     if re.search(r"\bpodcast\b|\baudio( overview)?\b", low):
         name = _nl_run_name(t)
         return ["podcast"] + ([name] if name else []), None
@@ -5241,10 +6477,16 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     # my laptop" is about a REPORT — nothing above claims it, so being last is not
     # enough here, and answering with a device list is a wrong answer where the
     # catch-all would at least be an honest one.
-    if not _artefact_kw and re.search(
+    if not _artefact_kw and (re.search(
             rf"\b(?:i (?:do not|don'?t|dont) have|i have no|i haven'?t got"
             rf"|i'?ve got no|i (?:do not|don'?t|dont) own)\b[^.?!]*"
-            rf"\b(?:{_MACHINE_NOUNS})\b", low):
+            rf"\b(?:{_MACHINE_NOUNS_SAID})\b", low)
+            # ⛔⛤ AND THE BARE FORM OF THE SAME SENTENCE. SKILL.md teaches
+            # "no devices — set one up" and it reached the catch-all: the
+            # negation vocabulary above is all first-person, and a person
+            # reporting the state does not always put themselves in it.
+            or re.fullmatch(rf"(?:no|zero|0)\s+(?:{_MACHINE_NOUNS_SAID})\b"
+                            rf"[^.?!]{{0,32}}", low)):
         return ["devices"], None
 
     # 7. Nothing matched — user-safe capabilities line (never guess a command).
@@ -5276,7 +6518,12 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
 # ⛔ AND THE GUARD READS `_nl_resolve`'S SOURCE rather than this line, because a
 # hand-kept list is exactly what fell behind. Any `"--…"` literal that function
 # can append must appear here.
-_DO_FLAGS = frozenset({"--no-video", "--no-email", "--machine", "--agent-log"})
+# ⛔⛔ `--run` CARRIES A VALUE, AND THE RELAY SPLITS ON MEMBERSHIP. `cmd_do` sorts
+# every resolved token into flags-or-positionals, so a bare `--run` would land in
+# flags and its value in the topic. It is emitted as ONE `--run=<name>` token and
+# matched on the part before the `=`, which argparse accepts verbatim.
+_DO_FLAGS = frozenset({"--no-video", "--no-email", "--machine", "--agent-log",
+                       "--run"})
 
 
 def cmd_do(args) -> int:
@@ -5289,8 +6536,9 @@ def cmd_do(args) -> int:
     # with a dash ("research --help") must reach the command as a literal value,
     # never dump argparse usage into the chat relay.
     cmd, rest = argv[0], argv[1:]
-    flags = [a for a in rest if a in _DO_FLAGS]
-    pos = [a for a in rest if a not in _DO_FLAGS]
+    _is_flag = lambda a: a.split("=", 1)[0] in _DO_FLAGS
+    flags = [a for a in rest if _is_flag(a)]
+    pos = [a for a in rest if not _is_flag(a)]
     final = (["--json"] if args.json else []) + [cmd] + flags + (["--"] + pos if pos else [])
     try:
         ns = build_parser().parse_args(final)

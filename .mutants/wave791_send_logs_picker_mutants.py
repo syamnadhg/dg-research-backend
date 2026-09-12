@@ -258,17 +258,17 @@ MUTANTS = [
      "reads it as free text and pushes it behind `--`, `send-logs` has no "
      "positional, argparse exits 2, and \"send the computer's own logs to "
      "support\" becomes \"I didn't catch a Super Research request in that\"",
-     [('_DO_FLAGS = frozenset({"--no-video", "--no-email", "--machine", "--agent-log"})',
+     [('_DO_FLAGS = frozenset({"--no-video", "--no-email", "--machine", "--agent-log",\n                       "--run"})',
        '_DO_FLAGS = frozenset({"--no-video", "--no-email", "--agent-log"})')]),
     ("N2", SR, "under",
      "⛔⛔ THE SAME, FOR THE FLAG THIS WAVE IS ABOUT",
-     [('_DO_FLAGS = frozenset({"--no-video", "--no-email", "--machine", "--agent-log"})',
+     [('_DO_FLAGS = frozenset({"--no-video", "--no-email", "--machine", "--agent-log",\n                       "--run"})',
        '_DO_FLAGS = frozenset({"--no-video", "--no-email", "--machine"})')]),
     ("N3", SR, "over",
      "⛔⛔ A VALUE-TAKING FLAG IS ROUTED. The flag survives and its VALUE goes "
      "behind `--` — the same failure one argument along, and invisible to a guard "
      "that only checks membership",
-     [('_DO_FLAGS = frozenset({"--no-video", "--no-email", "--machine", "--agent-log"})',
+     [('_DO_FLAGS = frozenset({"--no-video", "--no-email", "--machine", "--agent-log",\n                       "--run"})',
        '_DO_FLAGS = frozenset({"--no-video", "--no-email", "--machine", "--agent-log", "--runs"})')]),
 
     # ═══════════ D — the doctor and the fleet's two homes ═══════════════════
@@ -583,11 +583,7 @@ MUTANTS = [
      "⛔ THE ROUTING ROW THAT MAKES `--runs` REACHABLE FROM CHAT GOES. The table "
      "is what the assistant reads to decide what to run; the section further down "
      "is not an offer",
-     [('| "just the one about X", "only the first two", "not all of them" | the plan '
-       'numbers every run — pass those numbers back with `--runs`, comma-separated: '
-       '`sr.py send-logs --runs 1,3` (and again on `--confirm`). `--runs 0` is the '
-       "agent's own log, `--runs all` is every run listed. A name works too. Do "
-       "**not** guess a number the plan did not print |\n", "")]),
+     [('| "just the one about X", "only the first two", "not all of them" | ⛔ **ANSWERS TO THE PLAN THIS COMMAND JUST PRINTED**, not standalone asks — `sr.py do` cannot resolve them, because the numbers exist only on the screen in front of the user. the plan numbers every run — pass those numbers back with `--runs`, comma-separated: `sr.py send-logs --runs 1,3` (and again on `--confirm`). `--runs 0` is the agent\'s own log, `--runs all` is every run listed. A name works too. Do **not** guess a number the plan did not print |\n', "")]),
 ]
 
 
