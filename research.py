@@ -44359,8 +44359,11 @@ async def attach_pdf_chatgpt(browser, pdf_path):
 # ⛔⛔ THE FETCH IS THE RISK. The URL comes from text a platform produced, and the
 # prompt behind that text may have been written by someone the owner shared the
 # machine with. So: https only, a cookie-less session that ignores the
-# environment, every resolved address public AND the connected peer public
-# (checked at TCP connect, before a byte of the request is sent — DNS rebinding),
+# environment, every resolved address public when the URL is checked, and again
+# for each address the connect resolves BEFORE a socket is made for it (DNS
+# rebinding: the second lookup may answer a LAN host, and no handshake may reach
+# it), then the connected peer public as a second guard — after the handshake,
+# before TLS and before a byte of the request is sent;
 # redirects followed by hand and re-checked, a hard byte cap, magic-byte sniff,
 # never SVG. ⛔ No image URL, alt text or document text is ever logged — run logs
 # are declared to hold no topic.
@@ -44759,8 +44762,14 @@ def _doc_img_connect(host: str, port: int, deadline: float, socket_options=None)
     budget and the hard stop — and the timer had nothing to shut.
     So: no connect is started once `deadline` has passed; one lookup; at most
     `_DOC_IMG_CONNECT_ADDRS` addresses; each try gets min(connect timeout, time left).
+    ⛔⛔ An address that is not public is skipped BEFORE its socket is made: the URL
+    check resolved the name once, this lookup is a second answer, and a rebinding
+    name would otherwise get a TCP handshake with a LAN host before
+    `_doc_img_check_peer` (kept, the second guard) closed it.
     ⚠ The name lookup itself is not bounded (recorded).
-    Every failure is a "failed" refusal: the image is not kept, nothing more."""
+    Only non-public addresses and nothing tried → a "refused" refusal (what the peer
+    check said before). Every other failure is "failed": the image is not kept,
+    nothing more."""
     from urllib3.util.connection import allowed_gai_family
     if time.monotonic() >= deadline:
         raise _DocImageRefused("failed")
@@ -44769,10 +44778,15 @@ def _doc_img_connect(host: str, port: int, deadline: float, socket_options=None)
                                    socket.SOCK_STREAM)[:_DOC_IMG_CONNECT_ADDRS]
     except OSError:
         raise _DocImageRefused("failed") from None
+    skipped = tried = False
     for af, socktype, proto, _canon, addr in infos:
+        if not _doc_img_address_is_public(addr[0]):
+            skipped = True
+            continue
         left = deadline - time.monotonic()
         if left <= 0:
             break
+        tried = True
         sock = None
         try:
             sock = socket.socket(af, socktype, proto)
@@ -44788,7 +44802,7 @@ def _doc_img_connect(host: str, port: int, deadline: float, socket_options=None)
         # watches it from the moment the caller hands it over.
         sock.settimeout(_DOC_IMG_TIMEOUT[0])
         return sock
-    raise _DocImageRefused("failed")
+    raise _DocImageRefused("refused" if skipped and not tried else "failed")
 
 
 class _DocImgDeadline:
@@ -44863,9 +44877,9 @@ class _DocImgDeadline:
 
 def _doc_img_session(guard: "_DocImgDeadline"):
     """A fresh session for one image: no environment (proxies, .netrc), no cookies
-    kept, no auth, and a connection class that checks the peer at TCP connect —
-    before TLS, before the request is written — and hands the socket to the
-    image's deadline."""
+    kept, no auth, and a connection class that connects only to public addresses
+    (`_doc_img_connect`), checks the connected peer again — before TLS, before the
+    request is written — and hands the socket to the image's deadline."""
     import requests
     import urllib3.connection as _u3c
     import urllib3.connectionpool as _u3p
@@ -45613,19 +45627,42 @@ def _doc_img_log_stats(label: str, stats: dict) -> None:
 
 
 class _DocImgStopRequested(Exception):
-    """A Stop was pressed while (or before) a document waited on its images."""
+    """This process's exit was scheduled while (or before) a document waited on
+    its images (`_doc_img_exit_coming`)."""
+
+
+def _doc_img_exit_coming() -> bool:
+    """True once this process's exit is scheduled — the one condition under which
+    a document must be written without waiting on its images.
+
+    ⛔⛔ NOT THE STOP FLAG. A Stop from the Stop button, the HTTP stop, a cancel of
+    the running job, the watchdog or an update is followed by `_schedule_server_exit`,
+    and the process is gone ~3 s later. But the 24-hour pause limit, a cancel that
+    lands in the gate wait and a foreground hard reset set the Stop and exit
+    NOTHING: the run goes on to finalize, and treating that Stop as an exit wrote
+    every not-yet-stored image as a caption for good (the source address is gone
+    from the text).
+    Reads `_exit_scheduled`: set only inside `_schedule_server_exit`, which every
+    exit path shares, and never cleared in a live process (a respawn is a new
+    process; `run_server` resets it on entry). ⚠ A signal's first press is a
+    graceful uvicorn shutdown that cancels the pipeline task — that ends the
+    rehost as a cancelled task, not through here.
+    Ends: with the process. Read by: `_rehost_document_images` (before the worker
+    starts) and `_doc_img_until_stop` (every poll)."""
+    return bool(_exit_scheduled)
 
 
 async def _doc_img_until_stop(work):
-    """The worker's answer — or `_DocImgStopRequested` as soon as a Stop is seen.
+    """The worker's answer — or `_DocImgStopRequested` as soon as an exit is coming.
 
-    ⛔⛔ A Stop in --serve exits the process 3 s later (`_schedule_server_exit`). A
+    ⛔⛔ An exit scheduled in --serve lands ~3 s later (`_schedule_server_exit`). A
     document still waiting on its images — up to the hard stop — was never written,
     under a status that already said "What it had written is in your documents."
-    ⭐ Stop, NOT pause: a pause exits nothing, and a caption can never become an
-    image again — the source address is gone from the text.
-    Ends: when the worker answers, at the Stop, or when the caller's hard stop
-    cancels this wait. Read by: `_rehost_document_images` only.
+    ⭐ An exit, NOT a Stop and NOT a pause: neither of those exits anything by
+    itself, and a caption can never become an image again — the source address is
+    gone from the text. See `_doc_img_exit_coming`.
+    Ends: when the worker answers, when the exit is seen, or when the caller's hard
+    stop cancels this wait. Read by: `_rehost_document_images` only.
     ⚠ On the way out the waiting future is cancelled, as `wait_for` did, so a worker
     that fails later leaves no "exception never retrieved"."""
     try:
@@ -45633,7 +45670,7 @@ async def _doc_img_until_stop(work):
             done, _pending = await asyncio.wait({work}, timeout=_DOC_IMG_STOP_POLL_SEC)
             if work in done:
                 return work.result()
-            if _controls.is_stop():
+            if _doc_img_exit_coming():
                 raise _DocImgStopRequested()
     finally:
         if not work.done():
@@ -45653,9 +45690,10 @@ async def _rehost_document_images(text: str, label: str = "document") -> str:
     awaits `extract_and_record_agent` — its polling of the other agents stalls for
     up to the hard stop (`_DOC_IMG_DOC_BUDGET_SEC + _DOC_IMG_HARD_STOP_GRACE_SEC`)
     per document. Bounded: a per-document deadline inside, a hard stop outside it,
-    and a Stop (`_controls.is_stop()`, before the call or during the wait) — each
-    falls back to a pass with no network at all: references and cache hits kept,
-    everything else a caption."""
+    and a scheduled process exit (`_doc_img_exit_coming()`, before the call or
+    during the wait) — each falls back to a pass with no network at all: references
+    and cache hits kept, everything else a caption. ⭐ A Stop with no exit coming
+    (the pause limit, a gate-wait cancel) still fetches, within the same bounds."""
     global _doc_img_decorative_pending
     dropped, _doc_img_decorative_pending = _doc_img_decorative_pending, 0
     if not text or not ("![" in text or _DOC_IMG_HTML_RE.search(text)):
@@ -45667,9 +45705,9 @@ async def _rehost_document_images(text: str, label: str = "document") -> str:
     run.stats["dropped"] += dropped
     pool = None
     try:
-        # ⛔⛔ A Stop already pressed: no worker, no fetch, no upload — the pass below
-        # writes at once, so the save lands before the process exits.
-        if _controls.is_stop():
+        # ⛔⛔ An exit already scheduled: no worker, no fetch, no upload — the pass
+        # below writes at once, so the save lands before the process exits.
+        if _doc_img_exit_coming():
             raise _DocImgStopRequested()
         pool = _doc_img_executor()
         # ⭐ The context is copied the way `to_thread` copies it: the token refresh
@@ -45706,11 +45744,58 @@ async def _rehost_result_texts(results) -> None:
     """The funnel for phase 2's `results`, rewritten in place before any loop
     writes them. Texts that came through `extract_and_record_agent` are already
     references and cost nothing; a salvaged partial or a resume does not.
-    ⛔ After a Stop it fetches nothing (`_rehost_document_images`): a skipped or
-    salvaged partial is written with captions before the process exits."""
+    ⛔ Once an exit is scheduled it fetches nothing (`_rehost_document_images`): a
+    skipped or salvaged partial is written with captions before the process exits.
+    A Stop with no exit coming still rehosts."""
     for agent_name, entry in list((results or {}).items()):
         if isinstance(entry, dict) and entry.get("text"):
             entry["text"] = await _rehost_document_images(entry["text"], label=str(agent_name))
+
+
+async def _rehost_skipped_brief(queue_dir, brief_text: str, loaded_from=None) -> str:
+    """The funnel for a brief that phase 1 did NOT build — supplied inline, from a
+    file, or through the verify gate — when phase 1 is skipped.
+
+    ⛔ That branch read the brief back with no rehost, so a data: URI or a platform
+    image URL stayed in brief_artifact.text (what every phase-2 agent is pasted and
+    attached) and in the run's own documents/brief.md.
+    The rehost follows the funnel's rules (`_rehost_document_images`): a Stop with
+    no exit coming still fetches; a scheduled exit writes captions at once.
+    ⭐ The run's documents/brief.md is rewritten ONLY when the brief was read from
+    that very file. ⛔ Never the owner's own --brief-file elsewhere, and no new
+    documents/brief.md is created: phase 2 writes one from this text when it is
+    missing, and a skip-everything run (phase 3 scans documents/) would otherwise
+    gain a source it never had.
+    ⛔ And ONLY when the rehost changed the text, keeping the file's OWN header:
+    the inline brief is saved as-is when it already opens `# Research Brief…`
+    (`# Research Brief: EV batteries`, a leading newline), the skip branch strips
+    only the exact `# Research Brief\\n\\n`, and a fixed header written back doubled
+    it — on a brief with no image at all. The header is what the file holds ahead
+    of the text read from it; a file that no longer ends with that text is left
+    alone.
+    Ends: with this call. Read by: the phase-1 skip branch of `run_pipeline`; the
+    file it rewrites is read by phase 2's attachment and a later resume."""
+    out = await _rehost_document_images(brief_text, label="Brief")
+    if loaded_from is None or out == brief_text:
+        return out
+    local = Path(queue_dir) / "documents" / "brief.md"
+    try:
+        same_file = Path(loaded_from).resolve() == local.resolve()
+    except (OSError, RuntimeError, ValueError):
+        same_file = False
+    if not same_file:
+        return out
+    try:
+        current = local.read_text(encoding="utf-8")
+        if current.endswith(brief_text):
+            local.write_text(current[:len(current) - len(brief_text)] + out, encoding="utf-8")
+        else:
+            log("Phase 1 skip: brief.md changed while its images were stored — left as it is",
+                "WARN")
+    except OSError as e:
+        log(f"Phase 1 skip: could not rewrite brief.md with stored images ({type(e).__name__})",
+            "WARN")
+    return out
 
 
 def html_to_markdown(html, keep_images=True):
@@ -47480,7 +47565,10 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
         # (rare) still gets a shot at T3's CUA copy below. T1 (.md download) and
         # T3 (clipboard hijack) keep their 500 floor — a downloaded file / clean
         # CUA copy is authoritative even when short; a raw DOM scrape is not.
-        if md_dom and len(md_dom) > 2000:
+        # ⭐ Wave 4: measured with image destinations emptied, like every sibling
+        # floor on converter output — a partial panel with a few signed chart URLs
+        # must not pass as the report and skip T3.
+        if md_dom and _doc_img_prose_len(md_dom) > 2000:
             if _is_sources_not_document(md_dom, platform="claude"):
                 log(f"[{label}] T2 HTML→MD wrong-artifact "
                     f"({len(md_dom)} chars) — falling to Tier 3", "WARN")
@@ -61916,11 +62004,32 @@ def load_checkpoint(queue_dir):
 # a hard sentence ending so we don't bleed across markdown paragraphs.
 _FIND_SENT_TAIL_RE = re.compile(r'(?:[.!?]\s|\n\n|\n#{1,4}\s)', re.MULTILINE)
 _FIND_SENT_HEAD_RE = re.compile(r'(?:[.!?]\s|\n\n|\n#{1,4}\s)', re.MULTILINE)
-_FIND_HEADING_RE = re.compile(r'^#{2,4}\s+(.{2,80})$', re.MULTILINE)
+#: A heading line. ⭐ Wave 4: the 2-80 length is measured on the text with its
+#: image markup removed (`_find_heading_title`) — a rehosted image in a heading
+#: added ~90 characters and pushed a real heading out of the match, so a finding
+#: under it took the heading above as its source title.
+_FIND_HEADING_RE = re.compile(r'^#{2,4}\s+(.+)$', re.MULTILINE)
 _FIND_MD_LINK_RE = re.compile(r'\[([^\]]{1,200})\]\(([^)]+)\)')
 _FIND_MD_IMG_RE = re.compile(
     r'\[[ \t]*!\[(?:\\.|[^\]\\\n]){0,2000}\]\([^)\n]*\)[ \t]*\]\([^)\n]*\)'
     r'|(?<!\\)!\[(?:\\.|[^\]\\\n]){0,2000}\]\([^)\n]*\)')
+
+
+def _find_heading_title(text: str) -> str:
+    """A heading's text with its image markup removed.
+
+    ⛔ `<h2><img alt="Logo"> Market overview</h2>` is saved as
+    `## ![Logo](/document-images/…) Market overview`. Raw, that went into
+    `agents.<platform>.sections` (and the findings fallback built from it) as text
+    the analysis view prints, and past `_FIND_HEADING_RE`'s 80 characters.
+    A heading with no image markup comes back exactly as it was. One that was ONLY
+    an image comes back empty.
+    Ends: with this call. Read by: `save_meta`'s sections and `_extract_findings`'s
+    heading titles."""
+    out = _FIND_MD_IMG_RE.sub("", text)
+    if out == text:
+        return text
+    return re.sub(r"[ \t]{2,}", " ", out).strip()
 #: Bare URLs in a report. Hoisted out of `save_meta` (which harvests the same
 #: markdown for `sourceUrls`) so one definition serves both — the two disagreeing
 #: about what a URL is would put a source in the list and not in the findings.
@@ -62173,7 +62282,14 @@ def _extract_findings(md: str, source_urls: list) -> list:
     # would re-scan from start for every URL.
     headings: list = []
     for hm in _FIND_HEADING_RE.finditer(md):
-        headings.append((hm.start(), hm.group(1).strip()))
+        raw = hm.group(1)
+        heading = _find_heading_title(raw)
+        if heading != raw and not heading:
+            # An image-only heading still ends the section above it: a finding
+            # under it is titled by its host, not by the heading before.
+            headings.append((hm.start(), ""))
+        elif 2 <= len(heading) <= 80:
+            headings.append((hm.start(), heading.strip()))
     for url in source_urls:
         if not url or url in seen_urls:
             continue
@@ -62325,13 +62441,19 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
         if md_file and md_file.exists() and md_file.stat().st_size > 100:
             content = md_file.read_text(encoding="utf-8")
             # Extract sections — markdown headings + bold standalone lines (ChatGPT style)
-            sections = re.findall(r'^#{1,3}\s+(.+)$', content, re.MULTILINE)
+            # ⭐ Wave 4: a heading's image markup is not its title; an image-only
+            # heading is no section. ⛔ Titled BEFORE the count, the dedupe and the
+            # cap: on the raw strings `## ![Logo](…) Overview` and `**Overview**`
+            # both survived the dedupe as "Overview", and two image-only headings
+            # counted as sections and skipped the bold fallback.
+            sections = [t for t in map(_find_heading_title,
+                                       re.findall(r'^#{1,3}\s+(.+)$', content, re.MULTILINE)) if t]
             if len(sections) <= 2:
                 # ChatGPT often uses **Bold Title** instead of # headings
                 bold_sections = re.findall(r'^\*\*(.{5,80})\*\*\s*$', content, re.MULTILINE)
                 # Also try numbered bold: **1. Title**
                 numbered = re.findall(r'^\*\*\d+[\.\)]\s*(.{5,80})\*\*', content, re.MULTILINE)
-                sections = sections + bold_sections + numbered
+                sections = sections + [t for t in map(_find_heading_title, bold_sections + numbered) if t]
                 sections = list(dict.fromkeys(sections))[:20]  # Dedupe
             # Filter out the file header we added
             sections = [s for s in sections if s not in ("ChatGPT Deep Research", "Gemini Deep Research", "Claude Deep Research")]
@@ -64353,10 +64475,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # or by a previous run we're resuming). Phase 2 hard-fails
             # without this ("No brief text available — cannot run Phase 2").
             _loaded_from = None
+            _loaded_path = None
             if brief_file and Path(brief_file).exists():
                 try:
                     brief_text = Path(brief_file).read_text(encoding="utf-8")
                     _loaded_from = f"brief_file={brief_file}"
+                    _loaded_path = Path(brief_file)
                 except Exception as _e:
                     log(f"Phase 1 skip: could not read brief_file ({_e})", "WARN")
             if not brief_text:
@@ -64365,11 +64489,15 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         try:
                             brief_text = _bp.read_text(encoding="utf-8")
                             _loaded_from = f"disk={_bp}"
+                            _loaded_path = _bp
                             break
                         except Exception:
                             continue
             if brief_text.startswith("# Research Brief\n\n"):
                 brief_text = brief_text[len("# Research Brief\n\n"):]
+            # ⭐ Wave 4: a supplied brief's images are rehosted here too — before the
+            # phase-2 paste reads brief_artifact, and in the run's own brief.md.
+            brief_text = await _rehost_skipped_brief(queue_dir, brief_text, _loaded_path)
             brief_artifact = BriefArtifact(text=brief_text, url="")
             if brief_text:
                 log(f"Phase 1 skip: loaded brief ({len(brief_text)} chars) from {_loaded_from}")

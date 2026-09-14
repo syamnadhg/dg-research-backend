@@ -31,6 +31,7 @@ import contextlib
 import datetime
 import hashlib
 import ipaddress
+import json
 import re
 import signal
 import socket
@@ -137,6 +138,9 @@ def world(monkeypatch):
     # A fresh Stop/Pause state: the funnel reads it, and another test's Stop must
     # not turn every rehost here into the offline pass.
     monkeypatch.setattr(R, "_controls", R.PipelineControls())
+    # ⛔ And no exit scheduled: the offline pass is taken on `_exit_scheduled`, which
+    # a test elsewhere in the suite may leave set.
+    monkeypatch.setattr(R, "_exit_scheduled", False)
 
     def token():
         w.token_calls += 1
@@ -1179,6 +1183,8 @@ def test_the_pipeline_has_exactly_the_measured_document_saves():
     assert src.count("save_document_to_firestore(") == 7
     assert src.count("await _rehost_document_images(") == 3
     assert src.count("await _rehost_result_texts(results)") == 3
+    # Round 4: the phase-1 skip branch's brief (no save, a local file and the paste).
+    assert src.count("await _rehost_skipped_brief(") == 1
 
 
 def test_the_per_agent_funnel_sits_between_the_guard_and_the_first_write():
@@ -1307,6 +1313,8 @@ def _trust_local_server(monkeypatch, cert):
     real_session = R._doc_img_session
     monkeypatch.setattr(R, "_doc_img_check_url", lambda url: None)
     monkeypatch.setattr(R, "_doc_img_check_peer", lambda sock: None)
+    # The connect's own address rule too (round 4: checked before a socket is made).
+    monkeypatch.setattr(R, "_doc_img_address_is_public", lambda addr: True)
 
     def session(guard):
         s = real_session(guard)
@@ -2333,17 +2341,39 @@ def controls(monkeypatch):
     return c
 
 
+def _schedule_exit_without_exiting(monkeypatch, source="firestore-command"):
+    """⭐ Round 4: the offline pass is taken on a SCHEDULED EXIT, not on the Stop flag.
+    This runs the REAL `_schedule_server_exit` — the helper every exit path calls —
+    with only its exit thread kept from starting and its Firestore write stubbed."""
+    held = []
+    real_thread = threading.Thread
+
+    class HeldExit(real_thread):
+        def start(self):
+            if getattr(getattr(self, "_target", None), "__name__", "") == "_runner":
+                held.append(self)
+                return None
+            return super().start()
+    monkeypatch.setattr(R, "_clear_current_run_id_best_effort", lambda *a, **k: None)
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(threading, "Thread", HeldExit)
+        R._schedule_server_exit(source)
+    assert len(held) == 1 and R._exit_scheduled is True
+
+
 def test_a_stop_before_the_results_funnel_writes_at_once_with_captions(world, controls, monkeypatch):
     """EXECUTED through `_rehost_result_texts` — the finalize re-save's, both regen
-    loops' funnel. No worker, no fetch, no token, no upload; a reference and a cache
-    hit stay stored, the rest are captions."""
+    loops' funnel. The Stop button's path: Stop, then the exit scheduled. No worker,
+    no fetch, no token, no upload; a reference and a cache hit stay stored, the rest
+    are captions."""
     kept = "https://img.example.com/kept.png"
     world.images[kept] = png()
     rehost(f"![Kept]({kept})")
     assert world.fetches == [kept] and len(world.posts) == 1 and world.token_calls == 1
     monkeypatch.setattr(R, "_doc_img_executor", lambda: pytest.fail("a worker started after the Stop"))
     controls.request_stop()
-    new = "https://img.example.com/new.png"
+    _schedule_exit_without_exiting(monkeypatch)
+    new ="https://img.example.com/new.png"
     world.images[new] = png(200, 100)
     stored = ref_for(gif())
     results = {"Gemini": {"text": f"Partial ![Kept]({kept}) ![New]({new}) ![Old]({stored})",
@@ -2361,6 +2391,7 @@ def test_a_stop_before_the_per_agent_save_writes_it_at_once_with_captions(monkey
     """EXECUTED — the save the round-robin makes when an agent finishes."""
     monkeypatch.setattr(R, "_doc_img_executor", lambda: pytest.fail("a worker started after the Stop"))
     controls.request_stop()
+    _schedule_exit_without_exiting(monkeypatch, "http-endpoint")
     result, saved = _drive_extract(monkeypatch, tmp_path, world)
     local = (tmp_path / "documents" / "chatgpt.md").read_text(encoding="utf-8")
     assert local == "# ChatGPT Deep Research\n\nFindings ![Market chart]() end"
@@ -2391,6 +2422,7 @@ def test_a_stop_while_images_are_fetched_writes_at_once_and_the_worker_stores_no
             await asyncio.sleep(0.01)
         t0 = time.monotonic()
         controls.request_stop()
+        _schedule_exit_without_exiting(monkeypatch, "agent-decision-stop")
         out = await task
         return out, time.monotonic() - t0
     try:
@@ -2674,7 +2706,9 @@ def _unreachable_host(monkeypatch, n, refuse):
 
     def getaddrinfo(host, port, *a, **k):
         lookups.append(host)
-        return Addrs([(socket.AF_INET, socket.SOCK_STREAM, 6, "", (f"192.0.2.{i + 1}", port))
+        # Public addresses (the sockets are fakes): a private one is skipped before
+        # any socket is made, and would measure nothing here.
+        return Addrs([(socket.AF_INET, socket.SOCK_STREAM, 6, "", (f"93.184.216.{i + 1}", port))
                       for i in range(n)])
 
     class Sock:
@@ -2796,6 +2830,8 @@ def test_the_frame_density_floor_does_not_count_image_urls(monkeypatch):
     ("extract_chatgpt_response", "if md and _doc_img_prose_len(md) > 2000:"),
     ("extract_gemini_response", "if md and _doc_img_prose_len(md) > 2000:"),
     ("extract_claude_response", "if md_chat and _doc_img_prose_len(md_chat) > 100:"),
+    # Round 4: Claude's artifact-panel DOM scrape (T2), the last one left raw.
+    ("extract_claude_response", "if md_dom and _doc_img_prose_len(md_dom) > 2000:"),
 ])
 def test_every_other_floor_on_converter_output_measures_without_image_urls(fn, floor):
     """SOURCE PIN — these tiers need a live page, a CUA or a clipboard. Each floor on
@@ -2839,3 +2875,330 @@ def test_the_length_sanity_check_does_not_count_image_urls(monkeypatch, tmp_path
     right = "Right artifact. " * 410 + imgs
     assert _drive_claude_extract(monkeypatch, tmp_path, world, right, 20000) == []
     assert (tmp_path / "documents" / "claude.md").exists()
+
+
+# ═══ 26. repair round 4 (2026-09-14) — a Stop with no exit coming still stores ══
+#
+# ⛔⛔ Round 3 took every Stop as "the process exits in 3 s". The 24-hour pause
+# limit, a cancel in the gate wait and a foreground hard reset set the Stop and exit
+# nothing: the run finalizes, and its unsaved documents' images became captions for
+# good. The offline pass is now taken on a SCHEDULED EXIT only.
+
+def test_a_stop_with_no_exit_coming_still_rehosts(world, controls):
+    controls.request_stop()
+    url = "https://img.example.com/stopped.png"
+    world.images[url] = png()
+    assert rehost(f"![S]({url})") == f"![S]({ref_for(png())})"
+    assert world.fetches == [url] and len(world.posts) == 1
+
+
+def test_a_stop_with_no_exit_coming_during_a_fetch_still_rehosts(world, controls):
+    """The Stop lands while the worker is inside a fetch longer than a poll."""
+    world.fetch_delay = 0.6
+    url = "https://img.example.com/slow-stop.png"
+    world.images[url] = png()
+
+    async def main():
+        task = asyncio.create_task(R._rehost_document_images(f"![S]({url})", "Gemini"))
+        for _ in range(500):
+            if world.fetches:
+                break
+            await asyncio.sleep(0.01)
+        controls.request_stop()
+        return await task
+    assert asyncio.run(main()) == f"![S]({ref_for(png())})"
+    assert world.fetches == [url] and len(world.posts) == 1
+
+
+def test_the_pause_limit_stops_the_run_and_its_partials_still_store_their_images(
+        world, controls, monkeypatch):
+    """EXECUTED — `wait_if_paused` giving up (its bound shrunk), then the finalize
+    funnel. The finding's scenario: nobody answered a parked agent for 24 hours."""
+    monkeypatch.setattr(R, "PAUSE_HEARTBEAT_S", 0.01)
+    monkeypatch.setattr(R, "PAUSE_MAX_WAIT_S", 0.02)
+    url = "https://img.example.com/parked.png"
+    world.images[url] = png()
+    results = {"Claude": {"text": f"Partial ![Chart]({url})", "status": "skipped"}}
+
+    async def main():
+        controls.request_pause("a parked agent's retry or skip")
+        await controls.wait_if_paused()
+        assert controls.is_stop() and controls._pause_gave_up and R._exit_scheduled is False
+        await R._rehost_result_texts(results)
+    asyncio.run(main())
+    assert results["Claude"]["text"] == f"Partial ![Chart]({ref_for(png())})"
+    assert world.fetches == [url] and len(world.posts) == 1
+
+
+def test_an_exit_scheduled_with_no_stop_pressed_writes_at_once(world, controls, monkeypatch):
+    """The process goes whatever scheduled it: an exit alone takes the offline pass."""
+    monkeypatch.setattr(R, "_doc_img_executor",
+                        lambda: pytest.fail("a worker started with the exit scheduled"))
+    _schedule_exit_without_exiting(monkeypatch, "device-update")
+    assert not controls.is_stop()
+    url = "https://img.example.com/exit.png"
+    world.images[url] = png()
+    assert rehost(f"![E]({url})") == "![E]()"
+    assert world.fetches == [] and world.posts == []
+
+
+# ═══ 27. repair round 4 — no TCP handshake with an address that is not public ══
+#
+# ⛔ The connect resolved the name a second time and completed a handshake with
+# whatever came back; the peer check closed a LAN socket only after it.
+
+def _connect_world(monkeypatch, addrs, refuse=False):
+    made, connected = [], []
+
+    class Sock:
+        def __init__(self, *a, **k):
+            made.append(self)
+
+        def setsockopt(self, *a):
+            pass
+
+        def settimeout(self, t):
+            pass
+
+        def connect(self, addr):
+            connected.append(addr[0])
+            if refuse:
+                raise ConnectionRefusedError(61, "Connection refused")
+
+        def close(self):
+            pass
+
+    def getaddrinfo(host, port, *a, **k):
+        return [(socket.AF_INET6 if ":" in ip else socket.AF_INET, socket.SOCK_STREAM, 6, "",
+                 (ip, port)) for ip in addrs]
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    monkeypatch.setattr(socket, "socket", Sock)
+    return made, connected
+
+
+def test_the_connect_makes_no_socket_for_an_address_that_is_not_public(monkeypatch):
+    """⛔⛔ DNS rebinding: the URL check saw a public answer, the connect's own lookup
+    answers LAN hosts. No socket is made, so no handshake reaches them."""
+    made, connected = _connect_world(
+        monkeypatch, ["10.0.0.7", "127.0.0.1", "fe80::1%en0", "169.254.169.254"])
+    with pytest.raises(R._DocImageRefused) as got:
+        R._doc_img_connect("img.example.com", 443, far())
+    assert made == [] and connected == []
+    assert got.value.kind == "refused"
+
+
+def test_the_real_chain_refuses_a_rebound_name_before_any_socket(monkeypatch):
+    """The consumer: requests → urllib3 → `_new_conn` → `_doc_img_connect`."""
+    made, connected = _connect_world(monkeypatch, ["10.0.0.7"])
+    session = R._doc_img_session(R._DocImgDeadline(far()))
+    with pytest.raises(R._DocImageRefused) as got:
+        session.get("https://img.example.com/a.png", stream=True, allow_redirects=False,
+                    timeout=(1, 1))
+    assert got.value.kind == "refused" and made == [] and connected == []
+
+
+def test_the_connect_skips_the_private_answer_and_connects_to_the_public_one(monkeypatch):
+    made, connected = _connect_world(monkeypatch, ["10.0.0.7", "93.184.216.34"])
+    sock = R._doc_img_connect("img.example.com", 443, far())
+    assert connected == ["93.184.216.34"] and made == [sock]
+
+
+def test_a_public_address_that_fails_after_a_skipped_one_is_a_failure(monkeypatch):
+    """Only 'nothing public to try' is a refusal; a public host that did not answer
+    is the ordinary failure it always was."""
+    made, connected = _connect_world(monkeypatch, ["10.0.0.7", "93.184.216.34"], refuse=True)
+    with pytest.raises(R._DocImageRefused) as got:
+        R._doc_img_connect("img.example.com", 443, far())
+    assert connected == ["93.184.216.34"] and got.value.kind == "failed"
+
+
+# ═══ 28. repair round 4 — a heading's image is not its title ════════════════════
+
+HEADING_REF = f"/document-images/{RID}/{'d' * 64}.png"
+
+
+def test_heading_titles_carry_no_image_markup():
+    assert R._find_heading_title(f"![Logo]({HEADING_REF}) Market overview") == "Market overview"
+    assert R._find_heading_title(f"Q3 ![Chart]({HEADING_REF}) results") == "Q3 results"
+    assert R._find_heading_title(f"[![Logo]({HEADING_REF})](https://example.org) Home") == "Home"
+    assert R._find_heading_title(f"![Only]({HEADING_REF})") == ""
+    assert R._find_heading_title("Plain  heading  ") == "Plain  heading  "
+
+
+def test_save_meta_sections_carry_no_image_markup(tmp_path, monkeypatch):
+    """EXECUTED — `save_meta`: agents.<platform>.sections, and the findings fallback
+    built from them when there are no cited findings."""
+    (tmp_path / "documents").mkdir()
+    body = (f"# Claude Deep Research\n\n## ![Logo]({HEADING_REF}) Market overview\n\nText.\n\n"
+            f"## Q3 ![Chart]({HEADING_REF}) results\n\n## ![Only]({HEADING_REF})\n\n"
+            "## Plain  heading  \n\n" + "filler line to clear the size gate. " * 8)
+    (tmp_path / "documents" / "claude.md").write_text(body, encoding="utf-8")
+    monkeypatch.setattr(R, "_runtime", types.SimpleNamespace(agent_progress_snapshots={}),
+                        raising=False)
+    R.save_meta(tmp_path, "a topic", 2)
+    got = json.loads((tmp_path / "meta.json").read_text(encoding="utf-8"))["agents"]["claude"]
+    assert got["sections"] == ["Market overview", "Q3 results", "Plain  heading  "]
+    assert got["findings"] == ["Market overview", "Q3 results", "Plain  heading  "]
+
+
+def _claude_sections(tmp_path, monkeypatch, body):
+    (tmp_path / "documents").mkdir()
+    (tmp_path / "documents" / "claude.md").write_text(
+        "# Claude Deep Research\n\n" + body + "filler line to clear the size gate. " * 8,
+        encoding="utf-8")
+    monkeypatch.setattr(R, "_runtime", types.SimpleNamespace(agent_progress_snapshots={}),
+                        raising=False)
+    R.save_meta(tmp_path, "a topic", 2)
+    return json.loads((tmp_path / "meta.json").read_text(encoding="utf-8"))["agents"]["claude"]
+
+
+def test_save_meta_dedupes_sections_on_their_titles_not_their_image_markup(tmp_path, monkeypatch):
+    """EXECUTED — fixup: the dedupe ran on the raw strings, so a heading with a logo
+    and the bold line under it were two sections both called "Overview"."""
+    got = _claude_sections(tmp_path, monkeypatch,
+                           f"## ![Logo]({HEADING_REF}) Overview\n\nText.\n\n**Overview**\n\n")
+    assert got["sections"] == ["Overview"]
+
+
+def test_image_only_headings_do_not_count_toward_skipping_the_bold_fallback(tmp_path, monkeypatch):
+    """EXECUTED — fixup: two image-only headings counted as sections, the bold
+    fallback was skipped, and then both were dropped — one section left."""
+    got = _claude_sections(tmp_path, monkeypatch,
+                           f"## ![A]({HEADING_REF})\n\n## ![B]({HEADING_REF})\n\n"
+                           "## Real heading\n\n**Bold Section Title**\n\n")
+    assert got["sections"] == ["Real heading", "Bold Section Title"]
+
+
+def test_a_bold_section_line_is_titled_without_its_image_caption(tmp_path, monkeypatch):
+    """EXECUTED — an image that could not be kept is `![Chart]()`, short enough for
+    the bold fallback's 80 characters."""
+    got = _claude_sections(tmp_path, monkeypatch,
+                           "## Only heading\n\n**![Chart]() Quarterly revenue**\n\n")
+    assert got["sections"] == ["Only heading", "Quarterly revenue"]
+
+
+def test_a_finding_under_a_heading_with_an_image_is_titled_by_that_heading():
+    """EXECUTED — `_extract_findings`. The rehosted reference pushed the heading past
+    80 characters, and the finding took the heading above as its source title. An
+    image-only heading still ends the section above it."""
+    md = ("## Background\n\nOld context sits here for the reader.\n\n"
+          f"## ![Company logo]({HEADING_REF}) Market overview\n\n"
+          "Revenue grew 40% last year according to [Reuters](https://www.reuters.com/markets/a) today.\n\n"
+          f"## ![Only]({HEADING_REF})\n\n"
+          "Margins fell sharply in the quarter per [Source](https://www.example.org/src) data.\n")
+    assert len(f"![Company logo]({HEADING_REF}) Market overview") > 80
+    got = {f["url"]: f["sourceTitle"] for f in R._extract_findings(md, [])}
+    assert got == {"https://www.reuters.com/markets/a": "Market overview",
+                   "https://www.example.org/src": "example.org"}
+
+
+# ═══ 29. repair round 4 — a brief supplied with phase 1 skipped is rehosted ═════
+#
+# ⛔ The skip branch read the brief back with no rehost: a data: URI or a platform
+# URL stayed in brief.md and in what every phase-2 agent was pasted.
+
+def _brief_images(world):
+    url = "https://img.example.com/brief.png"
+    world.images[url] = png()
+    data = "data:image/gif;base64," + base64.b64encode(gif()).decode()
+    text = f"Plan ![Chart]({url}) and ![Pasted]({data}) end"
+    return text, f"Plan ![Chart]({ref_for(png())}) and ![Pasted]({ref_for(gif())}) end"
+
+
+def test_a_skipped_phase_1_brief_is_rehosted_and_the_runs_brief_md_rewritten(world, tmp_path):
+    """EXECUTED — `_rehost_skipped_brief` on the inline brief's path: read back from
+    the run's own documents/brief.md."""
+    text, want = _brief_images(world)
+    local = tmp_path / "documents" / "brief.md"
+    local.parent.mkdir()
+    local.write_text(f"# Research Brief\n\n{text}", encoding="utf-8")
+    out = asyncio.run(R._rehost_skipped_brief(tmp_path, text, local))
+    assert out == want
+    assert local.read_text(encoding="utf-8") == f"# Research Brief\n\n{want}"
+
+
+def test_the_owners_own_brief_file_is_never_rewritten_and_no_brief_md_is_made(world, tmp_path):
+    text, want = _brief_images(world)
+    own = tmp_path / "my-brief.md"
+    own.write_text(text, encoding="utf-8")
+    run = tmp_path / "run"
+    (run / "documents").mkdir(parents=True)
+    assert asyncio.run(R._rehost_skipped_brief(run, text, own)) == want
+    assert own.read_text(encoding="utf-8") == text
+    assert not (run / "documents" / "brief.md").exists()
+
+
+def test_a_brief_from_the_verify_gate_is_rehosted_with_no_file_written(world, tmp_path):
+    text, want = _brief_images(world)
+    (tmp_path / "documents").mkdir()
+    assert asyncio.run(R._rehost_skipped_brief(tmp_path, text, None)) == want
+    assert list((tmp_path / "documents").iterdir()) == []
+
+
+def test_a_skipped_brief_with_an_exit_scheduled_is_written_at_once_with_captions(
+        world, tmp_path, monkeypatch):
+    text, _want = _brief_images(world)
+    local = tmp_path / "documents" / "brief.md"
+    local.parent.mkdir()
+    local.write_text(f"# Research Brief\n\n{text}", encoding="utf-8")
+    _schedule_exit_without_exiting(monkeypatch)
+    out = asyncio.run(R._rehost_skipped_brief(tmp_path, text, local))
+    assert out == "Plan ![Chart]() and ![Pasted]() end"
+    assert local.read_text(encoding="utf-8") == f"# Research Brief\n\n{out}"
+    assert world.fetches == [] and world.posts == []
+
+
+def _read_like_the_skip_branch(path):
+    """What the phase-1 skip branch hands the rehost: the file read back, with only
+    the exact `# Research Brief\\n\\n` header stripped."""
+    text = path.read_text(encoding="utf-8")
+    return text[len("# Research Brief\n\n"):] if text.startswith("# Research Brief\n\n") else text
+
+
+def test_a_skipped_brief_with_no_image_leaves_brief_md_byte_identical(world, tmp_path):
+    """EXECUTED — fixup: the inline brief is saved as-is when it already opens with
+    `# Research Brief…`; the skip branch strips only the exact header, and a fixed
+    header written back doubled it for a brief with no image at all."""
+    local = tmp_path / "documents" / "brief.md"
+    local.parent.mkdir()
+    raw = b"# Research Brief: EV batteries\r\n\r\nCell chemistry plan, no pictures.\r\n"
+    local.write_bytes(raw)
+    text = _read_like_the_skip_branch(local)
+    assert asyncio.run(R._rehost_skipped_brief(tmp_path, text, local)) == text
+    assert local.read_bytes() == raw
+    assert world.fetches == []
+
+
+def test_a_skipped_brief_with_its_own_header_keeps_that_header_once(world, tmp_path):
+    text, want = _brief_images(world)
+    local = tmp_path / "documents" / "brief.md"
+    local.parent.mkdir()
+    local.write_text(f"# Research Brief: EV batteries\n\n{text}", encoding="utf-8")
+    got = _read_like_the_skip_branch(local)
+    assert asyncio.run(R._rehost_skipped_brief(tmp_path, got, local)).endswith(want)
+    assert local.read_text(encoding="utf-8") == f"# Research Brief: EV batteries\n\n{want}"
+
+
+def test_a_brief_md_that_no_longer_ends_with_the_brief_is_left_alone(world, tmp_path):
+    text, want = _brief_images(world)
+    local = tmp_path / "documents" / "brief.md"
+    local.parent.mkdir()
+    other = "# Research Brief\n\nSomething else was written here meanwhile."
+    local.write_text(other, encoding="utf-8")
+    assert asyncio.run(R._rehost_skipped_brief(tmp_path, text, local)) == want
+    assert local.read_text(encoding="utf-8") == other
+
+
+def test_the_phase_1_skip_branch_rehosts_the_brief_before_the_paste_reads_it():
+    """SOURCE PIN — `run_pipeline` cannot be executed here. The rehost is the last
+    word on brief_text before brief_artifact is built, and it is handed the file the
+    brief was read from."""
+    src = _pipeline()
+    assert src.count("_rehost_skipped_brief(") == 1
+    call = src.index("brief_text = await _rehost_skipped_brief(queue_dir, brief_text, _loaded_path)")
+    build = src.index('brief_artifact = BriefArtifact(text=brief_text, url="")', call)
+    assert src[src.index("\n", call):build].strip() == ""
+    strip = src.rindex('brief_text = brief_text[len("# Research Brief\\n\\n"):]', 0, call)
+    branch = src.rindex("if 1 in skip_phases or _user_skip_p1 or _gate_skipped_p1:", 0, strip)
+    body = src[branch:call]
+    assert "_loaded_path = Path(brief_file)" in body and "_loaded_path = _bp" in body
