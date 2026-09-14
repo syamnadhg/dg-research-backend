@@ -32350,7 +32350,7 @@ async def _read_claude_artifact_panel(page):
         for target in targets:
             html_blob = await _try_html(target)
             if html_blob and len(html_blob) > 200:
-                md = html_to_markdown(html_blob)
+                md = html_to_markdown(html_blob, keep_images=False)
                 if md and len(md) > 100:
                     return md
         # Pass 2 — wait 1.5s then HTML retry. Covers slow artifact mounts
@@ -32360,7 +32360,7 @@ async def _read_claude_artifact_panel(page):
         for target in targets:
             html_blob = await _try_html(target)
             if html_blob and len(html_blob) > 200:
-                md = html_to_markdown(html_blob)
+                md = html_to_markdown(html_blob, keep_images=False)
                 if md and len(md) > 100:
                     return md
         # Pass 3 — innerText fallback (preserves prior behavior). Markdown
@@ -38391,6 +38391,13 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
     text = reject_off_topic_text(text, queue_dir, name, agent_key,
                                  op="finalize_topic_guard")
 
+    # ⭐⭐ Wave 4 — images. AFTER the topic guard, so an off-topic document's
+    # images are never fetched; BEFORE the first write, so the local .md, the
+    # Firestore document and the `text` handed back in `results` (which the
+    # finalize re-save and the consolidated report are built from) all carry
+    # references instead of platform URLs.
+    text = await _rehost_document_images(text, label=name)
+
     n_chars = len(text)
 
     # Step 2b — Save MD to disk (Phase 3 input) + Firestore mirror (FE doc).
@@ -44327,11 +44334,668 @@ async def attach_pdf_chatgpt(browser, pdf_path):
 # Extraction chain: HTML→MD (best formatting) → copy button → JS innerText → clipboard.
 
 
-def html_to_markdown(html):
-    """Convert HTML to clean markdown using markdownify. Preserves all formatting."""
+# ── Document images (wave 4, 2026-09-13) ─────────────────────────────────────
+#
+# ⛔⛔ WHY IMAGES WERE MISSING. `html_to_markdown` passed `strip=['img', …]`, so
+# every HTML capture route deleted every image AND its alt text — Gemini's first
+# choice, Claude chat mode, Claude research's panel scrape, and the ChatGPT
+# brief's ONLY route. The routes that save a platform's own markdown (a download,
+# a copy button) kept `![alt](url)` pointing at the platform's servers, often
+# signed and short-lived, and nothing ever fetched a byte.
+#
+# ⭐⭐ THE SHAPE. The converter keeps image tags (decorative ones dropped). Before
+# a document is written anywhere, `_rehost_document_images` fetches each image ONCE
+# per research, hands the bytes to the web (`POST /api/document-images`, the
+# machine's own device token), and rewrites the destination to the reference the
+# web RETURNED: `/document-images/{researchId}/{sha256}.{ext}`. Anything that is
+# not kept, for any reason, becomes `![alt]()` — or disappears when it has no alt.
+# The contract lives in dg-research `src/lib/document-images.ts`; the regex and the
+# raster rules below mirror it exactly.
+#
+# ⛔⛔ THE FETCH IS THE RISK. The URL comes from text a platform produced, and the
+# prompt behind that text may have been written by someone the owner shared the
+# machine with. So: https only, a cookie-less session that ignores the
+# environment, every resolved address public AND the connected peer public
+# (checked at TCP connect, before a byte of the request is sent — DNS rebinding),
+# redirects followed by hand and re-checked, a hard byte cap, magic-byte sniff,
+# never SVG. ⛔ No image URL, alt text or document text is ever logged — run logs
+# are declared to hold no topic.
+#
+# ⭐ WHY IN research.py AND NOT A MODULE. It needs `log`, the per-run `_fb_uid` /
+# `_fb_research_id` and `_fresh_user_mode_id_token`, all of which live here; a new
+# module would also have to be added to py-modules and the compiled-wheel list,
+# and a miss there ships readable source (tests/test_compiled_wheel_covers_every_module.py).
+
+_DOC_IMG_REF_RE = re.compile(
+    r"\A/document-images/([A-Za-z0-9_-]{1,128})/([a-f0-9]{64})\.(png|jpg|gif|webp)\Z")
+# ⛔ `\A…\Z`, not `^…$`: Python's `$` also matches before a trailing newline, and
+# the web's anchored JS regex does not — a ref with "\n" would pass here and fail there.
+
+_DOC_IMG_MAX_BYTES = 5 * 1024 * 1024
+_DOC_IMG_MIN_PX = 48
+_DOC_IMG_DECORATIVE_MAX_PX = 32
+_DOC_IMG_MAX_PER_DOC = 40
+_DOC_IMG_MAX_REDIRECTS = 3
+_DOC_IMG_TIMEOUT = (5.0, 10.0)
+_DOC_IMG_DOC_BUDGET_SEC = 120.0
+_DOC_IMG_HARD_STOP_GRACE_SEC = 30.0
+_DOC_IMG_MAX_URL_CHARS = 4096
+_DOC_IMG_CACHE_RUNS = 8
+_DOC_IMG_CACHE_PER_RUN = 600
+_DOC_IMG_STAT_KEYS = ("found", "stored", "reused", "dropped", "refused", "failed",
+                      "captioned", "removed")
+
+_DOC_IMG_PX_RE = re.compile(r"\s*(\d+(?:\.\d+)?)\s*(?:px)?\s*\Z", re.I)
+_DOC_IMG_STYLE_PX_RE = re.compile(r"(?:\A|;)\s*(?:width|height)\s*:\s*(\d+(?:\.\d+)?)px\b", re.I)
+
+# One image in markdown: inline `![alt](dest "title")`, `![alt](<dest>)`, or a
+# reference `![alt][label]` / `![alt][]` / `![alt]`. Possessive and bounded so a
+# stray `![` in a 1 MB report costs a scan, never a backtrack.
+_DOC_IMG_MD_RE = re.compile(
+    r"(?<!\\)!\[(?P<alt>(?:\\.|[^\[\]\\]|\[(?:\\.|[^\[\]\\])*+\]){0,2000}+)\]"
+    r"(?:(?P<inline>\([ \t\n]*"
+    r"(?:<(?P<adest>[^<>\n]*)>|(?P<dest>(?:[^\s()\\]|\\.|\((?:[^\s()\\]|\\.)*+\))*+))"
+    r"(?:[ \t\n]+(?:\"(?:[^\"\\]|\\.)*+\"|'(?:[^'\\]|\\.)*+'|\((?:[^()\\]|\\.)*+\)))?"
+    r"[ \t\n]*\))"
+    r"|\[(?P<label>[^\[\]]{0,999})\])?")
+_DOC_IMG_DEF_RE = re.compile(
+    r"^[ ]{0,3}\[(?P<label>[^\[\]\n]{1,999})\]:[ \t]*"
+    r"(?:<(?P<adest>[^<>\n]*)>|(?P<dest>\S+))"
+    r"(?:[ \t]+(?:\"[^\"\n]*\"|'[^'\n]*'|\([^()\n]*\)))?[ \t]*(?:\n|\Z)", re.M)
+_DOC_IMG_HTML_RE = re.compile(r"<img\b(?P<attrs>[^>]*)>", re.I)
+_DOC_IMG_ATTR_RE = re.compile(
+    r"""([A-Za-z_:][-A-Za-z0-9_:.]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?""")
+_DOC_IMG_DATA_RE = re.compile(r"\Adata:[^,]*?;base64,(?P<b64>.*)\Z", re.I | re.S)
+_DOC_IMG_URL_BAD_CHARS_RE = re.compile(r"[\\\s\x00-\x1f\x7f]")
+_DOC_IMG_REDIRECT_CODES = (301, 302, 303, 307, 308)
+_DOC_IMG_JPEG_SOF = frozenset((0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                               0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF))
+
+# Decorative images the converter dropped since the last document was rehosted.
+# Counts only, for that document's stats line.
+_doc_img_decorative_pending = 0
+
+# Per research: source (a URL, or `data:` + sha256 of a data URI) → the stored
+# reference, or None when it could not be kept. Bounded both ways. Documents are
+# rehosted one at a time (every funnel awaits), so no lock.
+_doc_img_cache: "collections.OrderedDict" = collections.OrderedDict()
+_DOC_IMG_MISS = object()
+
+
+class _DocImageRefused(Exception):
+    """An image that will not be kept. `kind` is the stats bucket it lands in:
+    "refused" (a URL or address rule), "dropped" (too small) or "failed".
+    ⛔ Carries no URL — its message is only ever the bucket name."""
+
+    def __init__(self, kind: str):
+        super().__init__(kind)
+        self.kind = kind
+
+
+class _DocImageRun:
+    """One document's rehost: who it belongs to (captured at call time), its
+    deadline, how many fetches it has spent, and its counts."""
+
+    def __init__(self, uid, rid, label: str, budget_sec: float):
+        self.uid = uid or ""
+        self.rid = rid or ""
+        self.label = label
+        self.deadline = time.monotonic() + budget_sec
+        self.attempts = 0
+        self.token = None
+        self.token_checked = False
+        self.cache_key = f"{self.uid}\x00{self.rid}"
+        self.stats = dict.fromkeys(_DOC_IMG_STAT_KEYS, 0)
+
+
+def _doc_img_is_favicon_service(src: str) -> bool:
+    try:
+        parts = urlsplit(src.strip())
+    except ValueError:
+        return False
+    host = (parts.hostname or "").lower()
+    path = parts.path or ""
+    if (host == "google.com" or host.endswith(".google.com")) and path.startswith("/s2/favicons"):
+        return True
+    if (host == "gstatic.com" or host.endswith(".gstatic.com")) and path.startswith("/faviconV2"):
+        return True
+    if host == "icons.duckduckgo.com" and path.startswith("/ip3/"):
+        return True
+    return path.lower().endswith("/favicon.ico")
+
+
+def _doc_img_is_decorative(attrs: dict) -> bool:
+    """An image that carries no content: hidden from assistive tech, an explicit
+    size of 32 px or less, or a favicon service. Dropped before it costs a fetch."""
+    if str(attrs.get("aria-hidden") or "").strip().lower() == "true":
+        return True
+    if str(attrs.get("role") or "").strip().lower() in ("presentation", "none"):
+        return True
+    for key in ("width", "height"):
+        m = _DOC_IMG_PX_RE.match(str(attrs.get(key) or ""))
+        if m and float(m.group(1)) <= _DOC_IMG_DECORATIVE_MAX_PX:
+            return True
+    for m in _DOC_IMG_STYLE_PX_RE.finditer(str(attrs.get("style") or "")):
+        if float(m.group(1)) <= _DOC_IMG_DECORATIVE_MAX_PX:
+            return True
+    return _doc_img_is_favicon_service(str(attrs.get("src") or ""))
+
+
+def _doc_img_markdown_for_tag(attrs: dict) -> "str | None":
+    """Markdown for one `<img>`'s attributes, or None when it is decorative.
+
+    ⭐ The destination is always written in angle brackets: a src with a space or a
+    parenthesis would otherwise end the destination early and leave half a platform
+    URL in the text, where the rehost's parser could not see it as an image."""
+    if _doc_img_is_decorative(attrs):
+        return None
+    alt = " ".join(str(attrs.get("alt") or "").split())
+    alt = re.sub(r"([\\\[\]|])", r"\\\1", alt)
+    src = re.sub(r"[\t\n\r]", "", str(attrs.get("src") or "")).strip()
+    if src and not re.search(r"[<>]", src):
+        return f"![{alt}](<{src}>)"
+    return f"![{alt}]()" if alt else ""
+
+
+def _doc_img_note_decorative() -> None:
+    global _doc_img_decorative_pending
+    _doc_img_decorative_pending += 1
+
+
+_doc_img_converter_classes: dict = {}
+
+
+def _doc_img_converter_cls(base):
+    """markdownify's converter with `convert_img` replaced.
+
+    ⛔ Not `keep_inline_images_in`: markdownify's own `convert_img` returns the bare
+    alt for an image inside a heading or table cell unless its DIRECT parent is
+    listed, so `<td><a><img></a></td>` still lost the image. GFM renders an image
+    inside a cell, a heading or a link, so this one always emits it."""
+    cls = _doc_img_converter_classes.get(base)
+    if cls is None:
+        class _DocImageConverter(base):
+            def convert_img(self, el, text, parent_tags):
+                out = _doc_img_markdown_for_tag(dict(el.attrs))
+                if out is None:
+                    _doc_img_note_decorative()
+                    return ""
+                return out
+        cls = _doc_img_converter_classes[base] = _DocImageConverter
+    return cls
+
+
+def _doc_img_parse_attrs(raw: str) -> dict:
+    from html import unescape as _html_unescape
+    attrs = {}
+    for m in _DOC_IMG_ATTR_RE.finditer(raw or ""):
+        value = next((g for g in (m.group(2), m.group(3), m.group(4)) if g is not None), "")
+        attrs.setdefault(m.group(1).lower(), _html_unescape(value))
+    return attrs
+
+
+def _doc_img_sniff_ext(b: bytes) -> "str | None":
+    """Mirror of `sniffRasterExt` in document-images.ts. ⛔ Magic bytes only."""
+    if len(b) >= 8 and b[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if len(b) >= 3 and b[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    if len(b) >= 6 and b[:4] == b"GIF8" and b[4] in (0x37, 0x39) and b[5] == 0x61:
+        return "gif"
+    if len(b) >= 12 and b[:4] == b"RIFF" and b[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+def _doc_img_dimensions(b: bytes, ext: str) -> "tuple[int, int] | None":
+    """(width, height) read from the header, or None when it cannot be read."""
+    import struct
+    try:
+        if ext == "png":
+            if b[12:16] != b"IHDR":
+                return None
+            w, h = struct.unpack(">II", b[16:24])
+            return w, h
+        if ext == "gif":
+            w, h = struct.unpack("<HH", b[6:10])
+            return w, h
+        if ext == "webp":
+            kind = b[12:16]
+            if kind == b"VP8X":
+                return (int.from_bytes(b[24:27], "little") + 1,
+                        int.from_bytes(b[27:30], "little") + 1)
+            if kind == b"VP8L":
+                if b[20] != 0x2F:
+                    return None
+                bits = int.from_bytes(b[21:25], "little")
+                return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+            if kind == b"VP8 ":
+                if b[23:26] != b"\x9d\x01\x2a":
+                    return None
+                w, h = struct.unpack("<HH", b[26:30])
+                return w & 0x3FFF, h & 0x3FFF
+            return None
+        if ext == "jpg":
+            i = 2
+            while i + 9 <= len(b):
+                if b[i] != 0xFF:
+                    return None
+                marker = b[i + 1]
+                if marker == 0xFF:
+                    i += 1
+                    continue
+                if marker == 0x01 or 0xD0 <= marker <= 0xD8:
+                    i += 2
+                    continue
+                if marker in _DOC_IMG_JPEG_SOF:
+                    h, w = struct.unpack(">HH", b[i + 5:i + 9])
+                    return w, h
+                seg = struct.unpack(">H", b[i + 2:i + 4])[0]
+                if seg < 2:
+                    return None
+                i += 2 + seg
+            return None
+    except (struct.error, IndexError):
+        return None
+    return None
+
+
+def _doc_img_check_bytes(data: bytes) -> str:
+    """The raster extension of bytes that may be stored, or a refusal."""
+    if not data or len(data) > _DOC_IMG_MAX_BYTES:
+        raise _DocImageRefused("failed")
+    ext = _doc_img_sniff_ext(data)
+    if ext is None:
+        raise _DocImageRefused("failed")
+    dims = _doc_img_dimensions(data, ext)
+    if not dims:
+        raise _DocImageRefused("failed")
+    if min(dims) < _DOC_IMG_MIN_PX:
+        raise _DocImageRefused("dropped")
+    return ext
+
+
+def _doc_img_decode_data_uri(src: str) -> bytes:
+    """A `data:` image decoded locally. ⛔ Never left in a document: Firestore's
+    1 MiB document limit, and the renderer blanks the scheme anyway."""
+    m = _DOC_IMG_DATA_RE.match(src)
+    if not m:
+        raise _DocImageRefused("failed")
+    b64 = re.sub(r"\s+", "", m.group("b64"))
+    if len(b64) > 4 * -(-_DOC_IMG_MAX_BYTES // 3):
+        raise _DocImageRefused("failed")
+    try:
+        return base64.b64decode(b64, validate=True)
+    except ValueError:
+        raise _DocImageRefused("failed") from None
+
+
+def _doc_img_address_is_public(addr) -> bool:
+    """True only for a globally routable unicast address.
+
+    `is_global` already refuses loopback, private, link-local (169.254.169.254
+    included), CGNAT, unspecified, and IPv4-mapped / 6to4 / Teredo forms of those
+    on this interpreter (pinned by the tests). It does NOT refuse multicast, and it
+    calls the NAT64 prefix 64:ff9b::/96 global whatever IPv4 address it wraps —
+    on a NAT64 network `64:ff9b::a00:1` reaches 10.0.0.1."""
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(str(addr))
+    except ValueError:
+        return False
+    candidates = [ip]
+    if ip.version == 6 and (int(ip) >> 32) == 0x0064FF9B0000000000000000:
+        candidates.append(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
+    return all(c.is_global and not c.is_multicast for c in candidates)
+
+
+def _doc_img_resolve_host(host: str, port: int) -> "list[str]":
+    return [info[4][0] for info in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)]
+
+
+def _doc_img_check_url(url: str) -> None:
+    """Refuse unless the URL is https on the default port, carries no credentials,
+    and EVERY address its host resolves to is public."""
+    if len(url) > _DOC_IMG_MAX_URL_CHARS or _DOC_IMG_URL_BAD_CHARS_RE.search(url):
+        raise _DocImageRefused("refused")
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        raise _DocImageRefused("refused") from None
+    if parts.scheme.lower() != "https" or not parts.hostname:
+        raise _DocImageRefused("refused")
+    if parts.username is not None or parts.password is not None:
+        raise _DocImageRefused("refused")
+    if port not in (None, 443):
+        raise _DocImageRefused("refused")
+    try:
+        addrs = _doc_img_resolve_host(parts.hostname, 443)
+    except OSError:
+        raise _DocImageRefused("failed") from None
+    if not addrs or not all(_doc_img_address_is_public(a) for a in addrs):
+        raise _DocImageRefused("refused")
+
+
+def _doc_img_check_peer(sock) -> None:
+    """The address the socket actually connected to must be public too. A name that
+    resolved public for the check can resolve private for the connect."""
+    try:
+        peer = sock.getpeername()[0]
+    except (OSError, IndexError, TypeError):
+        peer = ""
+    if not _doc_img_address_is_public(peer):
+        try:
+            sock.close()
+        except OSError:
+            pass
+        raise _DocImageRefused("refused")
+
+
+def _doc_img_session():
+    """A fresh session for one image: no environment (proxies, .netrc), no cookies
+    kept, no auth, and a connection class that checks the peer at TCP connect —
+    before TLS, before the request is written."""
+    import requests
+    import urllib3.connection as _u3c
+    import urllib3.connectionpool as _u3p
+    from http.cookiejar import DefaultCookiePolicy
+    from requests.adapters import HTTPAdapter
+
+    class _PeerCheckedHTTPSConnection(_u3c.HTTPSConnection):
+        def _new_conn(self):
+            sock = super()._new_conn()
+            _doc_img_check_peer(sock)
+            return sock
+
+    class _PeerCheckedPool(_u3p.HTTPSConnectionPool):
+        ConnectionCls = _PeerCheckedHTTPSConnection
+
+    class _PeerCheckedAdapter(HTTPAdapter):
+        def init_poolmanager(self, *args, **kwargs):
+            super().init_poolmanager(*args, **kwargs)
+            self.poolmanager.pool_classes_by_scheme = {
+                **self.poolmanager.pool_classes_by_scheme, "https": _PeerCheckedPool}
+
+    session = requests.Session()
+    session.trust_env = False
+    session.auth = None
+    session.cookies.set_policy(DefaultCookiePolicy(allowed_domains=[]))
+    session.headers.clear()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (compatible; SuperResearch document images)",
+        "Accept": "image/png,image/jpeg,image/gif,image/webp",
+        "Accept-Encoding": "identity",
+    })
+    session.mount("https://", _PeerCheckedAdapter(max_retries=0))
+    return session
+
+
+def _doc_img_read_capped(resp, deadline: float) -> bytes:
+    declared = str(resp.headers.get("Content-Length") or "").strip()
+    if declared.isdigit() and int(declared) > _DOC_IMG_MAX_BYTES:
+        raise _DocImageRefused("failed")
+    buf = bytearray()
+    while len(buf) <= _DOC_IMG_MAX_BYTES:
+        if time.monotonic() >= deadline:
+            raise _DocImageRefused("failed")
+        chunk = resp.raw.read(min(65536, _DOC_IMG_MAX_BYTES + 1 - len(buf)),
+                              decode_content=False)
+        if not chunk:
+            break
+        buf += chunk
+    if len(buf) > _DOC_IMG_MAX_BYTES:
+        raise _DocImageRefused("failed")
+    return bytes(buf)
+
+
+def _doc_img_fetch(url: str, deadline: float) -> bytes:
+    """The bytes behind an https image URL, or a refusal. Redirects are followed by
+    hand, at most three, and every hop is checked exactly like the first."""
+    from urllib.parse import urljoin
+    session = _doc_img_session()
+    try:
+        for _hop in range(_DOC_IMG_MAX_REDIRECTS + 1):
+            _doc_img_check_url(url)
+            if time.monotonic() >= deadline:
+                raise _DocImageRefused("failed")
+            resp = session.get(url, stream=True, allow_redirects=False,
+                               timeout=_DOC_IMG_TIMEOUT)
+            try:
+                if resp.status_code in _DOC_IMG_REDIRECT_CODES:
+                    location = resp.headers.get("Location")
+                    if not location:
+                        raise _DocImageRefused("failed")
+                    url = urljoin(url, location)
+                    continue
+                if resp.status_code != 200:
+                    raise _DocImageRefused("failed")
+                return _doc_img_read_capped(resp, deadline)
+            finally:
+                resp.close()
+        raise _DocImageRefused("failed")
+    finally:
+        session.close()
+
+
+def _doc_img_upload(data: bytes, ext: str, run: "_DocImageRun") -> "str | None":
+    """Hand the bytes to the web. The reference comes back from the web and is
+    accepted only if it names THIS research and THESE bytes."""
+    import requests
+    from auth.v2_flow import FE_BASE_URL as _FE_BASE_URL
+    resp = requests.post(
+        f"{_FE_BASE_URL}/api/document-images",
+        headers={"Authorization": f"Bearer {run.token}"},
+        json={"ownerUid": run.uid, "research_id": run.rid,
+              "data_base64": base64.b64encode(data).decode("ascii")},
+        timeout=(5.0, 30.0),
+        allow_redirects=False,
+    )
+    if resp.status_code != 200:
+        return None
+    body = resp.json()
+    ref = body.get("ref") if isinstance(body, dict) else None
+    m = _DOC_IMG_REF_RE.match(ref) if isinstance(ref, str) else None
+    if (not m or m.group(1) != run.rid
+            or m.group(2) != hashlib.sha256(data).hexdigest() or m.group(3) != ext):
+        return None
+    return ref
+
+
+def _doc_img_cache_get(run: "_DocImageRun", key: str):
+    bucket = _doc_img_cache.get(run.cache_key)
+    if bucket is None or key not in bucket:
+        return _DOC_IMG_MISS
+    return bucket[key]
+
+
+def _doc_img_cache_put(run: "_DocImageRun", key: str, ref) -> None:
+    bucket = _doc_img_cache.get(run.cache_key)
+    if bucket is None:
+        bucket = _doc_img_cache[run.cache_key] = collections.OrderedDict()
+        while len(_doc_img_cache) > _DOC_IMG_CACHE_RUNS:
+            _doc_img_cache.popitem(last=False)
+    bucket[key] = ref
+    while len(bucket) > _DOC_IMG_CACHE_PER_RUN:
+        bucket.popitem(last=False)
+
+
+def _doc_img_resolve_src(src: str, run: "_DocImageRun") -> "str | None":
+    """The reference for one image source, or None when it is not kept."""
+    src = (src or "").strip()
+    if not src:
+        return None
+    m = _DOC_IMG_REF_RE.match(src)
+    if m:
+        if run.rid and m.group(1) == run.rid:
+            run.stats["reused"] += 1
+            return src
+        run.stats["failed"] += 1
+        return None
+    if not (run.uid and run.rid):
+        run.stats["failed"] += 1
+        return None
+    is_data = src[:5].lower() == "data:"
+    if not is_data and len(src) > _DOC_IMG_MAX_URL_CHARS:
+        run.stats["refused"] += 1
+        return None
+    key = "data:" + hashlib.sha256(src.encode("utf-8", "surrogatepass")).hexdigest() if is_data else src
+    hit = _doc_img_cache_get(run, key)
+    if hit is not _DOC_IMG_MISS:
+        run.stats["reused" if hit else "failed"] += 1
+        return hit
+    if run.attempts >= _DOC_IMG_MAX_PER_DOC or time.monotonic() >= run.deadline:
+        run.stats["failed"] += 1
+        return None
+    if not run.token_checked:
+        run.token_checked = True
+        try:
+            run.token = _fresh_user_mode_id_token()
+        except Exception:
+            run.token = None
+    if not run.token:
+        run.stats["failed"] += 1
+        return None
+    run.attempts += 1
+    ref = None
+    try:
+        data = _doc_img_decode_data_uri(src) if is_data else _doc_img_fetch(src, run.deadline)
+        ext = _doc_img_check_bytes(data)
+        ref = _doc_img_upload(data, ext, run)
+        run.stats["stored" if ref else "failed"] += 1
+    except _DocImageRefused as refusal:
+        run.stats[refusal.kind] += 1
+    except Exception:
+        run.stats["failed"] += 1
+    _doc_img_cache_put(run, key, ref)
+    return ref
+
+
+def _doc_img_label_key(label: str) -> str:
+    return " ".join((label or "").split()).casefold()
+
+
+def _doc_images_rewrite_sync(text: str, run: "_DocImageRun") -> str:
+    """Rewrite every image in `text`. Blocking — runs in a worker thread."""
+    def _html_img(m):
+        out = _doc_img_markdown_for_tag(_doc_img_parse_attrs(m.group("attrs")))
+        if out is None:
+            run.stats["dropped"] += 1
+            return ""
+        return out
+
+    text = _DOC_IMG_HTML_RE.sub(_html_img, text)
+
+    defs: dict = {}
+    for m in _DOC_IMG_DEF_RE.finditer(text):
+        defs.setdefault(_doc_img_label_key(m.group("label")),
+                        m.group("adest") if m.group("adest") is not None else m.group("dest"))
+    used: set = set()
+
+    def _image(m):
+        if m.group("inline") is not None:
+            src = m.group("adest") if m.group("adest") is not None else (m.group("dest") or "")
+        else:
+            key = _doc_img_label_key(m.group("label") or m.group("alt"))
+            if key not in defs:
+                return m.group(0)
+            used.add(key)
+            src = defs[key]
+        alt = " ".join(m.group("alt").split())
+        run.stats["found"] += 1
+        ref = _doc_img_resolve_src(src, run)
+        if ref:
+            return f"![{alt}]({ref})"
+        if alt:
+            run.stats["captioned"] += 1
+            return f"![{alt}]()"
+        run.stats["removed"] += 1
+        return ""
+
+    text = _DOC_IMG_MD_RE.sub(_image, text)
+
+    def _definition(m):
+        dest = m.group("adest") if m.group("adest") is not None else m.group("dest")
+        if _doc_img_label_key(m.group("label")) in used or dest.strip()[:5].lower() == "data:":
+            return ""
+        return m.group(0)
+
+    return _DOC_IMG_DEF_RE.sub(_definition, text)
+
+
+def _doc_img_log_stats(label: str, stats: dict) -> None:
+    """⛔ Counts only. Never a URL, an alt text or a line of the document."""
+    log(f"[{label}] document images: "
+        + " ".join(f"{k}={int(stats.get(k, 0))}" for k in _DOC_IMG_STAT_KEYS))
+
+
+async def _rehost_document_images(text: str, label: str = "document") -> str:
+    """Every image in an extracted document, rehosted — THE funnel.
+
+    Called before a document is written anywhere, so the local .md, the Firestore
+    document and whatever is built from the text later (the consolidated report)
+    all carry references. Idempotent: a reference to this research is left alone,
+    so a second pass over rewritten text costs no fetch.
+
+    ⭐ Never on the event loop — the round-robin loop polls the other agents while
+    this runs. Bounded: a per-document deadline inside, and a hard stop outside it
+    that falls back to a pass with no network at all."""
+    global _doc_img_decorative_pending
+    dropped, _doc_img_decorative_pending = _doc_img_decorative_pending, 0
+    if not text or not ("![" in text or _DOC_IMG_HTML_RE.search(text)):
+        if dropped:
+            _doc_img_log_stats(label, {"dropped": dropped})
+        return text
+    uid, rid = _fb_uid, _fb_research_id
+    run = _DocImageRun(uid, rid, label, _DOC_IMG_DOC_BUDGET_SEC)
+    run.stats["dropped"] += dropped
+    try:
+        out = await asyncio.wait_for(
+            asyncio.to_thread(_doc_images_rewrite_sync, text, run),
+            timeout=_DOC_IMG_DOC_BUDGET_SEC + _DOC_IMG_HARD_STOP_GRACE_SEC)
+    except Exception as e:
+        log(f"[{label}] document images: rehost stopped ({type(e).__name__}) — "
+            "images not yet stored are captions", "WARN")
+        run = _DocImageRun(uid, rid, label, 0.0)
+        run.stats["dropped"] += dropped
+        try:
+            out = _doc_images_rewrite_sync(text, run)
+        except Exception:
+            return text
+    _doc_img_log_stats(label, run.stats)
+    return out
+
+
+async def _rehost_result_texts(results) -> None:
+    """The funnel for phase 2's `results`, rewritten in place before any loop
+    writes them. Texts that came through `extract_and_record_agent` are already
+    references and cost nothing; a salvaged partial or a resume does not."""
+    for agent_name, entry in list((results or {}).items()):
+        if isinstance(entry, dict) and entry.get("text"):
+            entry["text"] = await _rehost_document_images(entry["text"], label=str(agent_name))
+
+
+def html_to_markdown(html, keep_images=True):
+    """Convert HTML to clean markdown using markdownify. Preserves all formatting.
+
+    ⭐⭐ Wave 4, 2026-09-13: images are KEPT (decorative ones dropped) and become
+    `![alt](<src>)` for `_rehost_document_images`. This used to pass
+    `strip=['img', …]`, which deleted every image and its alt text on every HTML
+    capture route.
+
+    `keep_images=False` is the old output byte for byte, for ONE caller: the Claude
+    artifact panel TRACKER, whose markdown is never saved. Its length becomes
+    `partial_text_len` — the input to the length-sanity rejection in
+    `extract_and_record_agent` — and its `https://` harvest becomes the source list;
+    image markdown there would inflate the one and pollute the other."""
     try:
         from markdownify import markdownify as md
-        text = md(html, heading_style="ATX", bullets="-", strip=['img', 'script', 'style'])
+        if keep_images:
+            from markdownify import MarkdownConverter
+            text = _doc_img_converter_cls(MarkdownConverter)(
+                heading_style="ATX", bullets="-", strip=['script', 'style']).convert(html)
+        else:
+            text = md(html, heading_style="ATX", bullets="-", strip=['img', 'script', 'style'])
         # Clean up excessive whitespace
         lines = text.split('\n')
         cleaned = []
@@ -63291,6 +63955,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # there's no ChatGPT session to share from. Link to the
                 # in-app document viewer (FE Documents page renders the
                 # markdown in app theme).
+                # ⭐ Wave 4: images in the supplied brief are rehosted like any
+                # extracted one — a data: URI or a platform link never reaches
+                # brief.md, the document, or the Phase 2 paste.
+                brief_text = await _rehost_document_images(brief_text, label="Brief")
                 _brief_md = f"# Research Brief\n\n{brief_text}"
                 (queue_dir / "documents" / "brief.md").write_text(_brief_md, encoding="utf-8")
                 save_document_to_firestore("brief", _brief_md, "Research Brief")
@@ -63327,6 +63995,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # green ✓ before P2 finished. See _p1_skipped_after_error
                 # branch above for the full rationale.
             else:
+                # ⭐ Wave 4: rehost the brief's images before either write.
+                brief_text = await _rehost_document_images(brief_text, label="Brief")
                 _brief_md = f"# Research Brief\n\n{brief_text}"
                 (queue_dir / "documents" / "brief.md").write_text(_brief_md, encoding="utf-8")
                 # Sync to Firestore documents subcollection — this is the
@@ -63456,6 +64126,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     p1_new = await run_phase1(browser, cua_client, combined_topic, pdf_paths, verbose, feedback="")
                     if p1_new and p1_new.get("text"):
                         brief_text = p1_new["text"]
+                        brief_text = await _rehost_document_images(brief_text, label="Brief")
                         # ⛔ 2026-09-02, step 5 — the regenerated brief used to
                         # overwrite `brief_url` with the NEW ChatGPT tab address,
                         # re-introducing the private value on a run that had
@@ -64027,6 +64698,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # consolidated.md build, save_meta enrichment, P2→P3 handoff.
             # Runs AFTER phase_complete:2 so the user sees P2 turn green
             # immediately while this work completes invisibly.
+            # ⭐ Wave 4: rehost images in `results` BEFORE the re-save and the
+            # consolidated build below. Texts from extract_and_record_agent are
+            # already references (no fetch); a salvaged partial is not.
+            await _rehost_result_texts(results)
             for name, r in results.items():
                 if r["text"]:
                     fname = name.lower().replace(" ", "") + ".md"
@@ -64201,6 +64876,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         browser, cua_client, combined_brief, verbose,
                         enabled_agents=enabled_agents_now)
                     # Rewrite documents
+                    await _rehost_result_texts(results)
                     for name, r in results.items():
                         if r.get("text"):
                             fname = name.lower().replace(" ", "") + ".md"
@@ -64323,6 +64999,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     browser, cua_client, _retry_brief_text, verbose,
                     enabled_agents=_retry_enabled)
                 # Rewrite documents from the fresh results
+                await _rehost_result_texts(results)
                 for name, r in results.items():
                     if r.get("text"):
                         fname = name.lower().replace(" ", "") + ".md"
