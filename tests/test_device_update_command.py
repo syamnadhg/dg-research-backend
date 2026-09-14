@@ -553,10 +553,16 @@ class TestReapProtectsUpgradeWaiter:
         # after os._exit in _runner) instead of terminating pytest.
         monkeypatch.setattr(_os, "_exit", lambda code: seen.update(exit=code))
         research._schedule_server_exit("test", delay_sec=0, protect_pids={4242})
-        for _ in range(60):
-            if "protect" in seen:
+        # ⛔⛔ WAIT FOR THE EXIT, NOT FOR THE REAP (2026-09-14). The reap records its
+        # arguments BEFORE the thread logs and calls os._exit. Returning as soon as the
+        # reap had run let monkeypatch restore the REAL os._exit while the thread was
+        # still between the two — and the whole root suite then ended with exit code 0
+        # at 27% and no summary, which a gate reading exit codes scored green.
+        for _ in range(100):
+            if "exit" in seen:
                 break
             _time.sleep(0.05)
+        assert seen.get("exit") == 0, "the exit thread must finish under the mock"
         assert seen.get("protect") == {4242}, "protect_pids must reach the reap"
 
     def test_handle_update_protects_the_waiter_pid(self, monkeypatch):
