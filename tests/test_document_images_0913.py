@@ -45,7 +45,6 @@ from pathlib import Path
 
 import pytest
 import requests
-import urllib3.connection
 
 import research as R
 from conftest import code_only  # type: ignore
@@ -135,6 +134,9 @@ def world(monkeypatch):
     monkeypatch.setattr(R, "_doc_img_cache", collections.OrderedDict())
     monkeypatch.setattr(R, "_doc_img_decorative_pending", 0)
     monkeypatch.setattr(R, "_doc_img_resolve_host", lambda host, port: ["93.184.216.34"])
+    # A fresh Stop/Pause state: the funnel reads it, and another test's Stop must
+    # not turn every rehost here into the offline pass.
+    monkeypatch.setattr(R, "_controls", R.PipelineControls())
 
     def token():
         w.token_calls += 1
@@ -763,6 +765,10 @@ class FakeSock:
         return -1
 
 
+def _no_lookup(*a, **k):
+    raise AssertionError("a real name lookup — this test must not reach the network")
+
+
 @pytest.mark.parametrize("peer", ["10.0.0.7", "127.0.0.1", "169.254.169.254", OSError("gone")])
 def test_a_non_public_peer_is_refused_and_the_socket_closed(peer):
     sock = FakeSock(peer)
@@ -780,14 +786,15 @@ def test_a_public_peer_passes():
 def test_the_peer_check_runs_inside_real_requests_before_a_byte_is_written(monkeypatch):
     """DNS rebinding: the name resolved public for the check, then the connect went
     somewhere private. Driven through the REAL requests → urllib3 chain, with only
-    the TCP connect faked."""
+    the TCP connect faked (`_doc_img_connect`, the connection's own connect)."""
     socks = []
 
-    def fake_new_conn(self):
+    def fake_connect(host, port, deadline, socket_options=None):
         s = FakeSock("10.0.0.7")
         socks.append(s)
         return s
-    monkeypatch.setattr(urllib3.connection.HTTPConnection, "_new_conn", fake_new_conn)
+    monkeypatch.setattr(R, "_doc_img_connect", fake_connect)
+    monkeypatch.setattr(socket, "getaddrinfo", _no_lookup)
     session = R._doc_img_session(R._DocImgDeadline(far()))
     with pytest.raises(R._DocImageRefused):
         session.get("https://img.example.com/a.png", stream=True, allow_redirects=False,
@@ -796,8 +803,8 @@ def test_the_peer_check_runs_inside_real_requests_before_a_byte_is_written(monke
 
 
 def test_a_public_peer_is_not_refused_by_the_real_chain(monkeypatch):
-    monkeypatch.setattr(urllib3.connection.HTTPConnection, "_new_conn",
-                        lambda self: FakeSock("93.184.216.34"))
+    monkeypatch.setattr(R, "_doc_img_connect", lambda *a, **k: FakeSock("93.184.216.34"))
+    monkeypatch.setattr(socket, "getaddrinfo", _no_lookup)
     session = R._doc_img_session(R._DocImgDeadline(far()))
     with pytest.raises(Exception) as got:
         session.get("https://img.example.com/a.png", stream=True, allow_redirects=False,
@@ -2311,3 +2318,524 @@ def test_a_cancelled_rehost_stops_its_worker_before_the_upload_and_the_next_fetc
     assert done.wait(5)
     assert fetched == [a] and world.posts == []
     assert R._doc_img_cache.get(f"{UID}\x00{RID}", {}) == {}
+
+
+# ═══ 21. repair round 3 (2026-09-14) — a Stop writes the document at once ══════
+#
+# ⛔⛔ A Stop in --serve exits the process 3 s later. A skipped or salvaged partial
+# waited on its image fetches (up to the hard stop) before the finalize loop wrote
+# it, under a status already saying "What it had written is in your documents."
+
+@pytest.fixture
+def controls(monkeypatch):
+    c = R.PipelineControls()
+    monkeypatch.setattr(R, "_controls", c)
+    return c
+
+
+def test_a_stop_before_the_results_funnel_writes_at_once_with_captions(world, controls, monkeypatch):
+    """EXECUTED through `_rehost_result_texts` — the finalize re-save's, both regen
+    loops' funnel. No worker, no fetch, no token, no upload; a reference and a cache
+    hit stay stored, the rest are captions."""
+    kept = "https://img.example.com/kept.png"
+    world.images[kept] = png()
+    rehost(f"![Kept]({kept})")
+    assert world.fetches == [kept] and len(world.posts) == 1 and world.token_calls == 1
+    monkeypatch.setattr(R, "_doc_img_executor", lambda: pytest.fail("a worker started after the Stop"))
+    controls.request_stop()
+    new = "https://img.example.com/new.png"
+    world.images[new] = png(200, 100)
+    stored = ref_for(gif())
+    results = {"Gemini": {"text": f"Partial ![Kept]({kept}) ![New]({new}) ![Old]({stored})",
+                          "status": "skipped"}}
+    t0 = time.monotonic()
+    asyncio.run(R._rehost_result_texts(results))
+    assert time.monotonic() - t0 < 0.5
+    assert results["Gemini"]["text"] == f"Partial ![Kept]({ref_for(png())}) ![New]() ![Old]({stored})"
+    assert world.fetches == [kept] and len(world.posts) == 1 and world.token_calls == 1
+    assert new not in R._doc_img_cache[f"{UID}\x00{RID}"]
+    assert any(level == "WARN" and "_DocImgStopRequested" in msg for level, msg in world.logs)
+
+
+def test_a_stop_before_the_per_agent_save_writes_it_at_once_with_captions(monkeypatch, tmp_path, world, controls):
+    """EXECUTED — the save the round-robin makes when an agent finishes."""
+    monkeypatch.setattr(R, "_doc_img_executor", lambda: pytest.fail("a worker started after the Stop"))
+    controls.request_stop()
+    result, saved = _drive_extract(monkeypatch, tmp_path, world)
+    local = (tmp_path / "documents" / "chatgpt.md").read_text(encoding="utf-8")
+    assert local == "# ChatGPT Deep Research\n\nFindings ![Market chart]() end"
+    assert saved == [("chatgpt", local)] and result["text"] == "Findings ![Market chart]() end"
+    assert world.fetches == [] and world.posts == []
+
+
+def test_a_stop_while_images_are_fetched_writes_at_once_and_the_worker_stores_nothing(
+        world, controls, monkeypatch):
+    """⛔ The Stop lands while the worker is inside a fetch: the document is written
+    with captions within a poll, and the abandoned worker uploads and remembers
+    nothing."""
+    done = _worker_done(monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+
+    def fetch(url, deadline):
+        entered.set()
+        release.wait(3)
+        return png()
+    monkeypatch.setattr(R, "_doc_img_fetch", fetch)
+    url = "https://img.example.com/slow.png"
+
+    async def main():
+        task = asyncio.create_task(R._rehost_document_images(f"![Slow]({url})", "Gemini"))
+        for _ in range(500):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        t0 = time.monotonic()
+        controls.request_stop()
+        out = await task
+        return out, time.monotonic() - t0
+    try:
+        out, elapsed = asyncio.run(main())
+    finally:
+        release.set()
+    assert out == "![Slow]()" and elapsed < 1.0, elapsed
+    assert done.wait(5)
+    assert world.posts == [] and R._doc_img_cache.get(f"{UID}\x00{RID}", {}) == {}
+    assert any(level == "WARN" and "_DocImgStopRequested" in msg for level, msg in world.logs)
+
+
+def test_a_pause_still_rehosts(world, controls):
+    """⭐ Stop, NOT pause: a pause exits nothing, and a caption can never become an
+    image again — the source address is gone from the text. Paused before the call
+    and throughout a fetch longer than a poll."""
+    controls.request_pause()
+    world.fetch_delay = 0.6
+    url = "https://img.example.com/paused.png"
+    world.images[url] = png()
+    assert rehost(f"![P]({url})") == f"![P]({ref_for(png())})"
+    assert world.fetches == [url] and len(world.posts) == 1
+
+
+# ═══ 22. repair round 3 — what is remembered for the rest of the research ══════
+
+def _fetch_that_ends_at_its_deadline(monkeypatch, outcomes):
+    """Each call waits for its own deadline to pass, then takes the next outcome:
+    an exception is raised, bytes are returned."""
+    calls = []
+
+    def fetch(url, deadline):
+        calls.append(url)
+        got = outcomes[min(len(calls), len(outcomes)) - 1]
+        time.sleep(max(0.0, deadline - time.monotonic()) + 0.02)
+        if isinstance(got, BaseException):
+            raise got
+        return got
+    monkeypatch.setattr(R, "_doc_img_fetch", fetch)
+    return calls
+
+
+@pytest.mark.parametrize("cut", [R._DocImageRefused("failed"),
+                                 requests.ConnectionError("shut at the deadline")],
+                         ids=["the timer's refusal", "the shut connection's error"])
+def test_an_image_cut_off_by_the_document_deadline_is_fetched_again_by_the_next_document(
+        world, monkeypatch, cut):
+    """⛔ It started with little of the document's budget left. The next document of
+    the research has a fresh budget — and used to read a cached failure instead."""
+    monkeypatch.setattr(R, "_DOC_IMG_DOC_BUDGET_SEC", 0.3)
+    url = "https://img.example.com/late-chart.png"
+    calls = _fetch_that_ends_at_its_deadline(monkeypatch, [cut])
+    assert rehost(f"![Chart]({url})", "ChatGPT") == "![Chart]()"
+    assert world.logs[-1][1].endswith("failed=1 linked=0 captioned=1 removed=0")
+    monkeypatch.setattr(R, "_DOC_IMG_DOC_BUDGET_SEC", 5.0)
+    monkeypatch.setattr(R, "_doc_img_fetch", lambda u, d: (calls.append(u), png())[1])
+    assert rehost(f"again ![Chart]({url})", "Gemini") == f"again ![Chart]({ref_for(png())})"
+    assert calls == [url, url]
+
+
+@pytest.mark.parametrize("case", ["the per-image limit", "a login-only answer at the deadline",
+                                  "bytes read by the deadline that are not an image"])
+def test_what_the_document_deadline_did_not_cut_off_is_still_remembered(world, monkeypatch, case):
+    url = "https://img.example.com/c.png"
+    if case == "the per-image limit":
+        monkeypatch.setattr(R, "_DOC_IMG_PER_IMAGE_SEC", 0.2)
+        monkeypatch.setattr(R, "_DOC_IMG_DOC_BUDGET_SEC", 5.0)
+        outcome = R._DocImageRefused("failed")
+    else:
+        monkeypatch.setattr(R, "_DOC_IMG_DOC_BUDGET_SEC", 0.3)
+        outcome = (R._DocImageRefused("login") if case.startswith("a login")
+                   else b"<svg>not a raster</svg>")
+    calls = _fetch_that_ends_at_its_deadline(monkeypatch, [outcome])
+    assert rehost(f"![C]({url})") == "![C]()"
+    monkeypatch.setattr(R, "_DOC_IMG_DOC_BUDGET_SEC", 5.0)
+    assert rehost(f"again ![C]({url})") == "again ![C]()"
+    assert calls == [url]
+
+
+@pytest.mark.parametrize("passing", [
+    lambda body: FakeWebResponse(503, {"error": "storage"}),
+    lambda body: FakeWebResponse(500, None, raise_json=True),
+    requests.ConnectionError("reset by peer"),
+    requests.ReadTimeout("no answer"),
+    R._DocImageRefused("failed"),
+    requests.exceptions.ProxyError("proxy unreachable"),
+    requests.ConnectTimeout("no connect"),
+    requests.exceptions.ChunkedEncodingError("body cut off"),
+    ConnectionResetError("a bare reset"),
+    TimeoutError("a bare socket timeout"),
+], ids=["503", "500 not json", "connection reset", "read timeout", "the guard's refusal",
+        "proxy unreachable", "connect timeout", "body cut off", "bare reset", "bare timeout"])
+def test_a_passing_upload_failure_is_not_remembered_and_the_next_document_stores_it(world, passing):
+    """⛔ A one-off web failure used to caption that chart in every later document."""
+    url = "https://img.example.com/chart.png"
+    world.images[url] = png()
+    answers = []
+
+    def web(body):
+        answers.append(1)
+        if len(answers) == 1:
+            if isinstance(passing, BaseException):
+                raise passing
+            return passing(body)
+        return FakeWebResponse(200, {"ref": ref_for(png())})
+    world.web = web
+    assert rehost(f"![Chart]({url})", "ChatGPT") == "![Chart]()"
+    assert rehost(f"![Chart]({url})", "Claude") == f"![Chart]({ref_for(png())})"
+    assert world.fetches == [url, url] and len(answers) == 2
+
+
+@pytest.mark.parametrize("answer", [
+    400, 401, 403, 404, 413, 499,
+    requests.exceptions.InvalidURL("Invalid URL 'https://': No host supplied"),
+    requests.exceptions.MissingSchema("Invalid URL 'localhost:3000/api': No scheme supplied"),
+    requests.exceptions.InvalidSchema("No connection adapters were found"),
+    requests.exceptions.InvalidHeader("Invalid leading whitespace in header value"),
+    requests.exceptions.SSLError("certificate verify failed: self-signed certificate"),
+    requests.exceptions.ContentDecodingError("the answer cannot be decoded"),
+    OSError("Could not find a suitable TLS CA certificate bundle"),
+], ids=["400", "401", "403", "404", "413", "499", "invalid url", "missing schema",
+        "invalid schema", "invalid header", "certificate", "undecodable body", "no ca bundle"])
+def test_a_definite_upload_refusal_is_remembered(world, answer):
+    """⛔ A misconfigured FE base URL or a certificate that fails verification fails
+    every upload the same way: not remembered, every later document fetched the
+    image again only to fail the upload again."""
+    url = "https://img.example.com/chart.png"
+    world.images[url] = png()
+    answers = []
+
+    def web(body):
+        answers.append(1)
+        if len(answers) > 1:
+            return FakeWebResponse(200, {"ref": ref_for(png())})
+        if isinstance(answer, BaseException):
+            raise answer
+        return FakeWebResponse(answer, {"error": "no"})
+    world.web = web
+    assert rehost(f"![Chart]({url})") == "![Chart]()"
+    assert rehost(f"again ![Chart]({url})") == "again ![Chart]()"
+    assert world.fetches == [url] and len(answers) == 1
+
+
+def test_an_untrusted_certificate_on_the_real_upload_is_remembered(world, tmp_path, monkeypatch):
+    """The REAL upload session against a local https web whose certificate it does
+    not trust: requests raises SSLError, and it fails the same way every time."""
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy",
+                 "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
+        monkeypatch.delenv(name, raising=False)
+    url = "https://img.example.com/chart.png"
+    world.images[url] = png()
+    raised = _record_real_upload_errors(monkeypatch)
+    with web_server(tmp_path, b"HTTP/1.1 200 OK\r\n\r\n", b"", tls=True, for_sec=0.0) as (_c, port, stored):
+        monkeypatch.setattr("auth.v2_flow.FE_BASE_URL", f"https://localhost:{port}")
+        assert rehost(f"![Chart]({url})") == "![Chart]()"
+        assert rehost(f"again ![Chart]({url})") == "again ![Chart]()"
+    assert stored == [] and [type(e) for e in raised] == [requests.exceptions.SSLError], raised
+    assert "CERTIFICATE_VERIFY_FAILED" in str(raised[0])
+    assert world.fetches == [url]
+
+
+def _record_real_upload_errors(monkeypatch):
+    """The REAL upload session; every error its post raises, in order."""
+    raised = []
+
+    def session(guard):
+        s = _REAL_UPLOAD_SESSION(guard)
+        real_post = s.post
+
+        def post(*a, **kw):
+            try:
+                return real_post(*a, **kw)
+            except BaseException as e:
+                raised.append(e)
+                raise
+        s.post = post
+        return s
+    monkeypatch.setattr(R, "_doc_img_upload_session", session)
+    return raised
+
+
+@contextlib.contextmanager
+def _silent_tls_web():
+    """A local web that accepts the TCP connection and never starts TLS."""
+    lsock = socket.socket()
+    lsock.bind(("127.0.0.1", 0))
+    lsock.listen(4)
+    held = []
+
+    def serve():
+        while True:
+            try:
+                conn, _ = lsock.accept()
+            except OSError:
+                return
+            held.append(conn)
+    th = threading.Thread(target=serve, daemon=True)
+    th.start()
+    try:
+        yield lsock.getsockname()[1], held
+    finally:
+        lsock.close()
+        for conn in held:
+            conn.close()
+        th.join(2)
+
+
+def test_a_tls_handshake_the_upload_guard_cut_is_not_remembered(world, monkeypatch):
+    """⛔⛔ The guard shutting a TLS handshake at its end raises requests' SSLError —
+    the class a certificate failure raises. It is the run's clock, not the image:
+    the next document of the research stores the chart."""
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(R, "_DOC_IMG_DOC_BUDGET_SEC", 0.2)
+    monkeypatch.setattr(R, "_DOC_IMG_HARD_STOP_GRACE_SEC", 2.0)
+    monkeypatch.setattr(R, "_DOC_IMG_UPLOAD_MARGIN_SEC", 0.8)
+    monkeypatch.setattr(R, "_DOC_IMG_UPLOAD_MIN_SEC", 0.5)
+    url = "https://img.example.com/chart.png"
+    world.images[url] = png()
+    fake_session = R._doc_img_upload_session
+    raised = _record_real_upload_errors(monkeypatch)
+    with _silent_tls_web() as (port, held):
+        monkeypatch.setattr("auth.v2_flow.FE_BASE_URL", f"https://localhost:{port}")
+        t0 = time.monotonic()
+        assert rehost(f"![Chart]({url})", "ChatGPT") == "![Chart]()"
+        elapsed = time.monotonic() - t0
+    assert held, "the upload never connected — the test measured nothing"
+    assert 1.2 <= elapsed < 2.0, elapsed
+    # The class a certificate failure raises — only the guard's state tells them apart.
+    assert [type(e) for e in raised] == [requests.exceptions.SSLError], raised
+    monkeypatch.setattr(R, "_doc_img_upload_session", fake_session)
+    monkeypatch.setattr(R, "_DOC_IMG_DOC_BUDGET_SEC", 5.0)
+    assert rehost(f"![Chart]({url})", "Claude") == f"![Chart]({ref_for(png())})"
+    assert world.fetches == [url, url]
+
+
+# ═══ 23. repair round 3 — a link around an image to a platform's host ══════════
+
+LH3_FULL = "https://lh3.googleusercontent.com/SIGNED-chart=s0"
+
+
+@pytest.mark.parametrize("kept", [True, False], ids=["stored", "captioned"])
+def test_a_click_to_enlarge_link_to_another_size_on_the_platform_host_goes(world, kept):
+    """⛔ `<a href="…=s0"><img src="…=w800">`: the href is not the image's own source,
+    and the signed platform URL stayed in the document and every share."""
+    md = R.html_to_markdown(f'<p>See <a href="{LH3_FULL}"><img src="{SIGNED}" alt="Chart"></a> end</p>')
+    assert md == f"See [![Chart](<{SIGNED}>)]({LH3_FULL}) end"
+    world.images[SIGNED] = png() if kept else R._DocImageRefused("failed")
+    out = rehost(md)
+    assert out == (f"See ![Chart]({ref_for(png())}) end" if kept else "See ![Chart]() end")
+    assert "googleusercontent" not in out
+
+
+def test_a_link_around_an_image_to_a_platform_product_host_goes(world):
+    src = "https://cdn.example.com/chart.png"
+    href = "https://files.oaiusercontent.com/file-abc?se=2026&sig=x"
+    md = R.html_to_markdown(f'<p><a href="{href}"><img src="{src}" alt="Chart"> Open</a></p>')
+    world.images[src] = png()
+    assert rehost(md) == f"![Chart]({ref_for(png())}) Open"
+
+
+# ═══ 24. repair round 3 — one image connection is bounded by the image's clock ═
+#
+# ⛔ urllib3's create_connection tried EVERY resolved address with the full 5 s
+# connect timeout before a socket existed for the deadline to watch: thirty silent
+# addresses held the worker ~150 s. Driven through the REAL fetch → requests →
+# urllib3 chain; only the resolver and the sockets are fakes.
+
+def _unreachable_host(monkeypatch, n, refuse):
+    stop = threading.Event()
+    made, lookups = [], []
+
+    class Addrs(list):
+        # urllib3's own loop walks this — it stops once the test is over, so a
+        # surviving mutant's thread does not go on trying the rest.
+        def __iter__(self):
+            for item in list.__iter__(self):
+                if stop.is_set():
+                    return
+                yield item
+
+    def getaddrinfo(host, port, *a, **k):
+        lookups.append(host)
+        return Addrs([(socket.AF_INET, socket.SOCK_STREAM, 6, "", (f"192.0.2.{i + 1}", port))
+                      for i in range(n)])
+
+    class Sock:
+        def __init__(self, *a, **k):
+            self.timeout = None
+            made.append(self)
+
+        def setsockopt(self, *a):
+            pass
+
+        def settimeout(self, t):
+            if t is not None and t < 0:
+                raise ValueError("Timeout value out of range")
+            self.timeout = t
+
+        def connect(self, addr):
+            if refuse:
+                raise ConnectionRefusedError(61, "Connection refused")
+            end = time.monotonic() + (60.0 if self.timeout is None else self.timeout)
+            while not stop.is_set() and time.monotonic() < end:
+                stop.wait(max(0.0, end - time.monotonic()))
+            raise socket.timeout("timed out")
+
+        def close(self):
+            pass
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    monkeypatch.setattr(socket, "socket", Sock)
+    monkeypatch.setattr(R, "_doc_img_check_url", lambda url: None)
+    return stop, made, lookups
+
+
+def test_an_image_host_with_many_silent_addresses_ends_at_the_image_deadline(monkeypatch):
+    stop, made, lookups = _unreachable_host(monkeypatch, 30, refuse=False)
+    try:
+        th, box = _fetch_in_thread("https://img.example.com/a.png", 0.6, 2.5)
+        alive = th.is_alive()
+    finally:
+        stop.set()
+    th.join(5)
+    assert not alive, "the connect outlived the image's deadline"
+    assert isinstance(box.get("error"), R._DocImageRefused) and box["error"].kind == "failed", box
+    assert box["elapsed"] < 1.3, box
+    assert lookups == ["img.example.com"] and len(made) == 1 and made[0].timeout <= 0.6
+
+
+def test_one_image_connection_tries_only_a_few_of_the_addresses(monkeypatch):
+    stop, made, lookups = _unreachable_host(monkeypatch, 30, refuse=True)
+    try:
+        th, box = _fetch_in_thread("https://img.example.com/a.png", 5.0, 4.0)
+    finally:
+        stop.set()
+    assert not th.is_alive()
+    assert isinstance(box.get("error"), R._DocImageRefused), box
+    assert len(made) == R._DOC_IMG_CONNECT_ADDRS == 4 and lookups == ["img.example.com"]
+
+
+def test_no_lookup_and_no_connect_once_the_image_deadline_has_passed(monkeypatch):
+    stop, made, lookups = _unreachable_host(monkeypatch, 3, refuse=True)
+    session = R._doc_img_session(R._DocImgDeadline(time.monotonic() - 0.01))
+    try:
+        with pytest.raises(R._DocImageRefused):
+            session.get("https://img.example.com/a.png", stream=True, allow_redirects=False,
+                        timeout=(1, 1))
+    finally:
+        stop.set()
+    assert lookups == [] and made == []
+
+
+# ═══ 25. repair round 3 — image URLs do not count toward an extraction's length ═
+#
+# ⛔ The floors and Claude's length-sanity check run before the rehost shrinks the
+# URLs: three signed chart URLs lifted a wrong artifact past the 30% check.
+
+LONG_IMG = "https://lh3.googleusercontent.com/" + "x" * 700
+
+
+def test_image_destinations_do_not_count_toward_a_documents_length():
+    text = f"Short prose. ![Chart](<{LONG_IMG}>) ![Q3]({LONG_IMG} \"t\") ![Ref][1] end"
+    assert R._doc_img_prose_len(text) == len("Short prose. ![Chart]() ![Q3]() ![Ref][1] end")
+    assert R._doc_img_prose_len("no images at all") == len("no images at all")
+    assert R._doc_img_prose_len("") == 0 and R._doc_img_prose_len(None) == 0
+
+
+class _EvalPage:
+    def __init__(self, html):
+        self.html = html
+
+    async def evaluate(self, js, *a):
+        return self.html
+
+
+def test_the_html_capture_floor_does_not_count_image_urls(monkeypatch):
+    """EXECUTED — `_extract_html_to_md`, the HTML route every platform's capture uses."""
+    monkeypatch.setattr(R, "log", lambda *a, **k: None)
+    sparse = f'<div><p>Tiny ack.</p><img src="{LONG_IMG}" alt="Chart"></div>'
+    assert asyncio.run(R._extract_html_to_md(_EvalPage(sparse), [".markdown"], "Gemini")) == ""
+    rich = f'<div><p>{"Real report prose. " * 8}</p><img src="{LONG_IMG}" alt="Chart"></div>'
+    assert asyncio.run(R._extract_html_to_md(_EvalPage(rich), [".markdown"], "Gemini")).startswith(
+        "Real report prose.")
+
+
+def test_the_frame_density_floor_does_not_count_image_urls(monkeypatch):
+    """EXECUTED — the ChatGPT Deep Research frame's density fallback."""
+    monkeypatch.setattr(R, "log", lambda *a, **k: None)
+
+    async def no_selector_hit(target, selectors, label):
+        return ""
+    monkeypatch.setattr(R, "_extract_html_to_md", no_selector_hit)
+    frame = _EvalPage(f'<div><p>{"Words here. " * 20}</p><img src="{LONG_IMG}" alt="Chart"></div>')
+    monkeypatch.setattr(R, "_chatgpt_dr_frame_targets", lambda page: [_EvalPage(""), frame])
+    assert asyncio.run(R._extract_html_to_md_anyframe(object(), [".markdown"], "ChatGPT")) == ""
+    frame.html = f'<div><p>{"Words here. " * 50}</p><img src="{LONG_IMG}" alt="Chart"></div>'
+    assert asyncio.run(R._extract_html_to_md_anyframe(object(), [".markdown"], "ChatGPT")).startswith(
+        "Words here.")
+
+
+@pytest.mark.parametrize("fn,floor", [
+    ("_copy_via_hijack", "if md and _doc_img_prose_len(md) >= min_chars:"),
+    ("extract_chatgpt_response", "if md and _doc_img_prose_len(md) > 2000:"),
+    ("extract_gemini_response", "if md and _doc_img_prose_len(md) > 2000:"),
+    ("extract_claude_response", "if md_chat and _doc_img_prose_len(md_chat) > 100:"),
+])
+def test_every_other_floor_on_converter_output_measures_without_image_urls(fn, floor):
+    """SOURCE PIN — these tiers need a live page, a CUA or a clipboard. Each floor on
+    the converter's output measures prose. ⚠ The text/plain and clipboard floors are
+    not changed: their platform markdown carried image URLs before wave 4 too."""
+    assert code_only(getattr(R, fn)).count(floor) == 1
+
+
+def _drive_claude_extract(monkeypatch, tmp_path, world, text, expected):
+    events = []
+
+    async def extract(page, **kw):
+        return text
+
+    async def save(doc_type, content, name=None, **kw):
+        return True
+
+    async def no_sleep(*a, **k):
+        return None
+    monkeypatch.setattr(R, "extract_claude_response", extract)
+    monkeypatch.setattr(R, "reject_off_topic_text", lambda t, *a, **k: t)
+    monkeypatch.setattr(R, "save_document_to_firestore_with_retry", save)
+    monkeypatch.setattr(R, "_firebase_db", object())
+    monkeypatch.setattr(R, "emit_event", lambda name, **k: events.append((name, k)))
+    monkeypatch.setattr(R, "_write_agent_terminal_status", lambda *a, **k: None)
+    monkeypatch.setattr(R.asyncio, "sleep", no_sleep)
+    asyncio.run(R.extract_and_record_agent("Claude", _Page(), _Browser(), None, tmp_path,
+                                           expected_text_len=expected))
+    return [k for name, k in events if name == "wrong_artifact_rejected"]
+
+
+def test_the_length_sanity_check_does_not_count_image_urls(monkeypatch, tmp_path, world):
+    """EXECUTED — `extract_and_record_agent`. The tracker streamed 20,000 characters;
+    the extraction is 4,000 of prose and three signed chart URLs, 6,000+ in all."""
+    imgs = "".join(f" ![Chart {i}]({LONG_IMG}{i})" for i in range(3))
+    wrong = "Wrong artifact. " * 250 + imgs
+    assert len(wrong) >= 6000 > R._doc_img_prose_len(wrong)
+    rejected = _drive_claude_extract(monkeypatch, tmp_path, world, wrong, 20000)
+    assert [r["length"] for r in rejected] == [R._doc_img_prose_len(wrong)]
+    assert not (tmp_path / "documents" / "claude.md").exists() and world.fetches == []
+    right = "Right artifact. " * 410 + imgs
+    assert _drive_claude_extract(monkeypatch, tmp_path, world, right, 20000) == []
+    assert (tmp_path / "documents" / "claude.md").exists()

@@ -38357,14 +38357,18 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
             # <30% of it, the extractor likely grabbed the wrong artifact
             # (e.g. an early summary tile). Reject and let the failed-status
             # branch fire so the caller's retry budget kicks in.
+            # ⛔ Wave 4: measured WITHOUT image destinations. `expected_text_len` is the
+            # tracker's text with no image markup at all (`keep_images=False`), and this
+            # text still carries every full platform URL — the rehost runs below.
+            _sanity_len = _doc_img_prose_len(text)
             if (text and expected_text_len >= 1000
-                    and len(text) < int(0.3 * expected_text_len)):
-                log(f"[{name}] Length-sanity rejection: {len(text)} chars < 30% of "
+                    and _sanity_len < int(0.3 * expected_text_len)):
+                log(f"[{name}] Length-sanity rejection: {_sanity_len} chars < 30% of "
                     f"streamed {expected_text_len} chars — likely wrong artifact", "WARN")
                 try:
                     emit_event("wrong_artifact_rejected", phase=2, agent="claude",
                                op="finalize_length_sanity",
-                               length=len(text),
+                               length=_sanity_len,
                                expected=expected_text_len,
                                tier="length_sanity")
                 except Exception:
@@ -44382,7 +44386,12 @@ _DOC_IMG_DOC_BUDGET_SEC = 120.0
 # (or at the document's deadline, if sooner). `_DOC_IMG_TIMEOUT` bounds one socket
 # receive only; see `_DocImgDeadline`.
 _DOC_IMG_PER_IMAGE_SEC = 30.0
+# ⛔ How many of the addresses an image host resolves to one connection tries
+# (`_doc_img_connect`). Each try gets min(connect timeout, time left).
+_DOC_IMG_CONNECT_ADDRS = 4
 _DOC_IMG_HARD_STOP_GRACE_SEC = 30.0
+# How often a document waiting on its images looks for a Stop (`_doc_img_until_stop`).
+_DOC_IMG_STOP_POLL_SEC = 0.25
 # ⛔⛔ An upload is the tail of an image already fetched: it lives in the grace, and
 # its WHOLE request ends `_DOC_IMG_UPLOAD_MARGIN_SEC` before the hard stop, while the
 # funnel still waits for the answer. It does not start with less than
@@ -44740,6 +44749,48 @@ def _doc_img_check_peer(sock) -> None:
         raise _DocImageRefused("refused")
 
 
+def _doc_img_connect(host: str, port: int, deadline: float, socket_options=None):
+    """One image connection's TCP connect, bounded by the image's deadline.
+
+    ⛔⛔ WHY NOT urllib3's `create_connection`. It tries EVERY address the name
+    resolves to, each with the full 5 s connect timeout, before it hands back a
+    socket `_DocImgDeadline` could watch: a host with thirty addresses that drop
+    packets held the worker about 150 s — past the per-image limit, the document
+    budget and the hard stop — and the timer had nothing to shut.
+    So: no connect is started once `deadline` has passed; one lookup; at most
+    `_DOC_IMG_CONNECT_ADDRS` addresses; each try gets min(connect timeout, time left).
+    ⚠ The name lookup itself is not bounded (recorded).
+    Every failure is a "failed" refusal: the image is not kept, nothing more."""
+    from urllib3.util.connection import allowed_gai_family
+    if time.monotonic() >= deadline:
+        raise _DocImageRefused("failed")
+    try:
+        infos = socket.getaddrinfo(host.strip("[]"), port, allowed_gai_family(),
+                                   socket.SOCK_STREAM)[:_DOC_IMG_CONNECT_ADDRS]
+    except OSError:
+        raise _DocImageRefused("failed") from None
+    for af, socktype, proto, _canon, addr in infos:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        sock = None
+        try:
+            sock = socket.socket(af, socktype, proto)
+            for opt in socket_options or ():
+                sock.setsockopt(*opt)
+            sock.settimeout(min(_DOC_IMG_TIMEOUT[0], left))
+            sock.connect(addr)
+        except OSError:
+            if sock is not None:
+                sock.close()
+            continue
+        # What urllib3 leaves on the socket for the TLS handshake; the deadline
+        # watches it from the moment the caller hands it over.
+        sock.settimeout(_DOC_IMG_TIMEOUT[0])
+        return sock
+    raise _DocImageRefused("failed")
+
+
 class _DocImgDeadline:
     """One image's clock — the status line, the headers and the body included.
 
@@ -44823,7 +44874,7 @@ def _doc_img_session(guard: "_DocImgDeadline"):
 
     class _PeerCheckedHTTPSConnection(_u3c.HTTPSConnection):
         def _new_conn(self):
-            sock = super()._new_conn()
+            sock = _doc_img_connect(self._dns_host, self.port, guard.deadline, self.socket_options)
             _doc_img_check_peer(sock)
             guard.watch(sock)
             return sock
@@ -44978,9 +45029,14 @@ def _doc_img_fetch(url: str, deadline: float) -> bytes:
 
 def _doc_img_upload(data: bytes, ext: str, run: "_DocImageRun"):
     """Hand the bytes to the web. The reference comes back from the web and is
-    accepted only if it names THIS research and THESE bytes. None when the web did
-    not give one; `_DOC_IMG_MISS` when the upload was never started (the run
-    stopped, or too little time) — the run's condition, never remembered."""
+    accepted only if it names THIS research and THESE bytes. None when the upload
+    fails for good (a 4xx, a malformed answer, a client error that repeats every
+    time — `_doc_img_upload_error_passes`); `_DOC_IMG_MISS` — never
+    remembered — when the upload was never started (the run stopped, or too little
+    time) or the web failed for the moment: a 5xx, or no answer at all (a network
+    error, the guard's cut).
+    ⛔ A one-off 503 used to be cached as a failed image for the rest of the
+    research, so every later document captioned a chart the web could store."""
     from auth.v2_flow import FE_BASE_URL as _FE_BASE_URL
     # ⛔ Never for an abandoned rehost: the object would count toward the research's
     # cap and nothing would reference it.
@@ -44997,14 +45053,29 @@ def _doc_img_upload(data: bytes, ext: str, run: "_DocImageRun"):
     session = _doc_img_upload_session(guard)
     guard.start()
     try:
-        resp = session.post(
-            f"{_FE_BASE_URL}/api/document-images",
-            headers={"Authorization": f"Bearer {run.token}"},
-            json={"ownerUid": run.uid, "research_id": run.rid,
-                  "data_base64": base64.b64encode(data).decode("ascii")},
-            timeout=(5.0, 30.0),
-            allow_redirects=False,
-        )
+        try:
+            resp = session.post(
+                f"{_FE_BASE_URL}/api/document-images",
+                headers={"Authorization": f"Bearer {run.token}"},
+                json={"ownerUid": run.uid, "research_id": run.rid,
+                      "data_base64": base64.b64encode(data).decode("ascii")},
+                timeout=(5.0, 30.0),
+                allow_redirects=False,
+            )
+        except (OSError, _DocImageRefused) as exc:
+            # ⭐ Every requests error is an OSError (RequestException subclasses
+            # IOError). ⛔ Not every one passes: a bad FE base URL or a certificate
+            # that fails verification fails every upload the same way, and not
+            # remembering it refetched the image for every later document.
+            # ⛔⛔ `guard.expired` FIRST: the guard shutting a TLS handshake at its end
+            # raises `SSLError` (measured) — the run's clock, never the image's.
+            # ⚠ `resp.json()` stays OUTSIDE: its JSONDecodeError is a RequestException
+            # too, and a 200 that is not JSON is the web's answer.
+            if guard.expired or _doc_img_upload_error_passes(exc):
+                return _DOC_IMG_MISS
+            return None
+        if resp.status_code >= 500:
+            return _DOC_IMG_MISS
         if resp.status_code != 200:
             return None
         body = resp.json()
@@ -45017,6 +45088,24 @@ def _doc_img_upload(data: bytes, ext: str, run: "_DocImageRun"):
             or m.group(2) != hashlib.sha256(data).hexdigest() or m.group(3) != ext):
         return None
     return ref
+
+
+def _doc_img_upload_error_passes(exc: BaseException) -> bool:
+    """Is this upload error the moment's (the next document may store the image)
+    rather than the client's for good?
+
+    Passing: no connection or no answer — a refused or reset connection, a proxy
+    that could not be reached, a timeout, a body cut off mid-answer, the guard
+    refusing a new connection. Definite: a malformed URL, schema or header, a TLS
+    failure (a certificate that fails verification fails every time; a handshake the
+    guard cut is caught before this, by `guard.expired`), a body that cannot be
+    decoded, any other OSError (a missing CA bundle)."""
+    import requests
+    if isinstance(exc, requests.exceptions.SSLError):
+        return False
+    return isinstance(exc, (_DocImageRefused, requests.ConnectionError, requests.Timeout,
+                            requests.exceptions.ChunkedEncodingError,
+                            ConnectionError, TimeoutError))
 
 
 def _doc_img_cache_get(run: "_DocImageRun", key: str):
@@ -45069,10 +45158,20 @@ def _doc_img_citation_shaped(text: str, bang: int, dest: str, angled: bool) -> b
         return False
     if parts.username is not None or parts.password is not None:
         return False
-    if _is_platform_host(host) or any(host == h or host.endswith("." + h)
-                                      for h in _DOC_IMG_PLATFORM_IMAGE_HOSTS):
+    if _doc_img_is_platform_host(host):
         return False
     return not _DOC_IMG_IMAGE_PATH_RE.search(parts.path)
+
+
+def _doc_img_is_platform_host(host: str) -> bool:
+    """A platform's own host: a product surface (`_is_platform_host`) or one of the
+    platforms' image hosts. ⭐ ONE list for both readers — a citation after "!"
+    (`_doc_img_citation_shaped`) and a link around an image
+    (`_doc_img_unwrap_self_links`) — so the two can never disagree about which
+    address may stay in a saved document."""
+    host = (host or "").lower()
+    return _is_platform_host(host) or any(host == h or host.endswith("." + h)
+                                          for h in _DOC_IMG_PLATFORM_IMAGE_HOSTS)
 
 
 def _doc_img_resolve_src(src: str, run: "_DocImageRun", may_link: bool = False):
@@ -45128,9 +45227,21 @@ def _doc_img_resolve_src(src: str, run: "_DocImageRun", may_link: bool = False):
         return _not_fetched("failed")
     run.attempts += 1
     ref = cached = None
+    # ⛔ A fetch that failed while the image was still being read, and ended at or
+    # after the DOCUMENT's deadline, was cut off by this document's spent budget —
+    # the run's condition, like `_DOC_IMG_MISS`: counted failed, never remembered,
+    # so the next document of the research (a fresh budget) tries again. It was
+    # cached, and a chart that started with 3 s left was a caption in every
+    # document. ⭐ Still remembered: the per-image limit (it ends BEFORE the
+    # document's deadline), every verdict that is not "failed" (refused, login,
+    # dropped, a page), and anything decided after the bytes were read.
+    # Ends: with this call. Read by: the cache write below only.
+    reading = True
+    cut_off = False
     try:
         data = (_doc_img_decode_data_uri(src) if is_data else
                 _doc_img_fetch(src, min(run.deadline, time.monotonic() + _DOC_IMG_PER_IMAGE_SEC)))
+        reading = False
         ext = _doc_img_check_bytes(data)
         ref = cached = _doc_img_upload(data, ext, run)
         if ref is _DOC_IMG_MISS:
@@ -45146,8 +45257,12 @@ def _doc_img_resolve_src(src: str, run: "_DocImageRun", may_link: bool = False):
             if may_link:
                 ref = _DOC_IMG_LINKED
         run.stats["linked" if ref is _DOC_IMG_LINKED else refusal.fallback] += 1
+        cut_off = reading and refusal.kind == "failed"
     except Exception:
         run.stats["failed"] += 1
+        cut_off = reading
+    if cut_off and time.monotonic() >= run.deadline:
+        return ref
     # ⛔ An abandoned rehost remembers nothing: the next document reads this cache.
     if run.stopped:
         return None
@@ -45388,6 +45503,15 @@ def _doc_img_unwrap_self_links(text: str, slot_re, slots: list) -> str:
         sources = {slots[int(i)][1] for i in slot_re.findall(inner)}
         if sources and (href in sources or href.lower().startswith(("data:", "blob:", "sandbox:"))):
             return inner
+        # ⛔ A click-to-enlarge link to ANOTHER address on a platform's host —
+        # `<a href="…/X=s0"><img src="…/X=w400">` — is still a signed platform URL
+        # in the saved document and every share. ⭐ A link to an ordinary page stays.
+        try:
+            href_host = urlsplit(href).hostname or ""
+        except ValueError:
+            href_host = ""
+        if sources and _doc_img_is_platform_host(href_host):
+            return inner
         return m.group(0)
 
     return _DOC_IMG_WRAP_RE.sub(_link, text)
@@ -45488,6 +45612,34 @@ def _doc_img_log_stats(label: str, stats: dict) -> None:
         + " ".join(f"{k}={int(stats.get(k, 0))}" for k in _DOC_IMG_STAT_KEYS))
 
 
+class _DocImgStopRequested(Exception):
+    """A Stop was pressed while (or before) a document waited on its images."""
+
+
+async def _doc_img_until_stop(work):
+    """The worker's answer — or `_DocImgStopRequested` as soon as a Stop is seen.
+
+    ⛔⛔ A Stop in --serve exits the process 3 s later (`_schedule_server_exit`). A
+    document still waiting on its images — up to the hard stop — was never written,
+    under a status that already said "What it had written is in your documents."
+    ⭐ Stop, NOT pause: a pause exits nothing, and a caption can never become an
+    image again — the source address is gone from the text.
+    Ends: when the worker answers, at the Stop, or when the caller's hard stop
+    cancels this wait. Read by: `_rehost_document_images` only.
+    ⚠ On the way out the waiting future is cancelled, as `wait_for` did, so a worker
+    that fails later leaves no "exception never retrieved"."""
+    try:
+        while True:
+            done, _pending = await asyncio.wait({work}, timeout=_DOC_IMG_STOP_POLL_SEC)
+            if work in done:
+                return work.result()
+            if _controls.is_stop():
+                raise _DocImgStopRequested()
+    finally:
+        if not work.done():
+            work.cancel()
+
+
 async def _rehost_document_images(text: str, label: str = "document") -> str:
     """Every image in an extracted document, rehosted — THE funnel.
 
@@ -45496,9 +45648,14 @@ async def _rehost_document_images(text: str, label: str = "document") -> str:
     all carry references. Idempotent: a reference to this research is left alone,
     so a second pass over rewritten text costs no fetch.
 
-    ⭐ Never on the event loop — the round-robin loop polls the other agents while
-    this runs. Bounded: a per-document deadline inside, and a hard stop outside it
-    that falls back to a pass with no network at all."""
+    ⭐ The fetches run off the event loop, so other tasks keep ticking. ⛔ But the
+    CALLER waits: `extract_and_record_agent` awaits this, and the round-robin loop
+    awaits `extract_and_record_agent` — its polling of the other agents stalls for
+    up to the hard stop (`_DOC_IMG_DOC_BUDGET_SEC + _DOC_IMG_HARD_STOP_GRACE_SEC`)
+    per document. Bounded: a per-document deadline inside, a hard stop outside it,
+    and a Stop (`_controls.is_stop()`, before the call or during the wait) — each
+    falls back to a pass with no network at all: references and cache hits kept,
+    everything else a caption."""
     global _doc_img_decorative_pending
     dropped, _doc_img_decorative_pending = _doc_img_decorative_pending, 0
     if not text or not ("![" in text or _DOC_IMG_HTML_RE.search(text)):
@@ -45508,14 +45665,19 @@ async def _rehost_document_images(text: str, label: str = "document") -> str:
     uid, rid = _fb_uid, _fb_research_id
     run = _DocImageRun(uid, rid, label, _DOC_IMG_DOC_BUDGET_SEC)
     run.stats["dropped"] += dropped
-    pool = _doc_img_executor()
+    pool = None
     try:
+        # ⛔⛔ A Stop already pressed: no worker, no fetch, no upload — the pass below
+        # writes at once, so the save lands before the process exits.
+        if _controls.is_stop():
+            raise _DocImgStopRequested()
+        pool = _doc_img_executor()
         # ⭐ The context is copied the way `to_thread` copies it: the token refresh
         # logs, and the log scope must follow it into the worker.
         ctx = _log_contextvars.copy_context()
         out = await asyncio.wait_for(
-            asyncio.get_running_loop().run_in_executor(
-                pool, ctx.run, _doc_images_rewrite_sync, text, run),
+            _doc_img_until_stop(asyncio.get_running_loop().run_in_executor(
+                pool, ctx.run, _doc_images_rewrite_sync, text, run)),
             timeout=_DOC_IMG_DOC_BUDGET_SEC + _DOC_IMG_HARD_STOP_GRACE_SEC)
     except BaseException as e:
         # ⛔⛔ Whatever ended the wait — the hard stop, an error, a cancelled task —
@@ -45534,7 +45696,8 @@ async def _rehost_document_images(text: str, label: str = "document") -> str:
             return text
     finally:
         # The pool's threads end with this document (see `_doc_img_executor`).
-        pool.shutdown(wait=False, cancel_futures=True)
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
     _doc_img_log_stats(label, run.stats)
     return out
 
@@ -45542,7 +45705,9 @@ async def _rehost_document_images(text: str, label: str = "document") -> str:
 async def _rehost_result_texts(results) -> None:
     """The funnel for phase 2's `results`, rewritten in place before any loop
     writes them. Texts that came through `extract_and_record_agent` are already
-    references and cost nothing; a salvaged partial or a resume does not."""
+    references and cost nothing; a salvaged partial or a resume does not.
+    ⛔ After a Stop it fetches nothing (`_rehost_document_images`): a skipped or
+    salvaged partial is written with captions before the process exits."""
     for agent_name, entry in list((results or {}).items()):
         if isinstance(entry, dict) and entry.get("text"):
             entry["text"] = await _rehost_document_images(entry["text"], label=str(agent_name))
@@ -45583,6 +45748,24 @@ def html_to_markdown(html, keep_images=True):
     except ImportError:
         log("markdownify not installed — falling back to innerText", "WARN")
         return ""
+
+
+def _doc_img_prose_len(text: str) -> int:
+    """`len(text)` with every inline image's DESTINATION left out — what a length
+    check on an extraction means.
+
+    ⛔ Wave 4 keeps images in the converter's output, and a signed platform URL runs
+    to hundreds of characters. The capture floors and Claude's length-sanity check
+    run BEFORE the rehost shrinks them to references or captions, so three chart
+    URLs lifted a 4,000-character wrong artifact past the 30% check, and a sparse
+    container past its floor. Before wave 4 those checks saw no image markup at all
+    (`strip=['img']`); the alt stays counted — it is a caption a reader sees.
+    Read by: the HTML→MD floors and `extract_and_record_agent`'s length-sanity only;
+    the text itself is never changed."""
+    if not text or "![" not in text:
+        return len(text or "")
+    return len(_DOC_IMG_MD_RE.sub(
+        lambda m: f"![{m.group('alt')}]()" if m.group("inline") is not None else m.group(0), text))
 
 
 # ChatGPT Deep Research wraps inline citation markers in Private Use Area
@@ -45644,7 +45827,7 @@ async def _extract_html_to_md(page, selectors, label):
                     biggest_sel = sel
             if html and len(html) > 200:
                 md_text = html_to_markdown(html)
-                if md_text and len(md_text) > 100:
+                if md_text and _doc_img_prose_len(md_text) > 100:
                     log(f"[{label}] Extracted via HTML→MD: {len(md_text)} chars")
                     return md_text
         except Exception:
@@ -45759,7 +45942,7 @@ async def _extract_html_to_md_anyframe(page, selectors, label):
             }""")
             if html and len(html) > 200:
                 md_text = html_to_markdown(html)
-                if md_text and len(md_text) > 500:
+                if md_text and _doc_img_prose_len(md_text) > 500:
                     log(f"[{label}] Extracted via HTML→MD density fallback: {len(md_text)} chars (iframe target {idx})")
                     return md_text
         except Exception:
@@ -46036,7 +46219,7 @@ async def _copy_via_hijack(
             return text
         if html and len(html) >= max(200, min_chars // 4):
             md = html_to_markdown(html)
-            if md and len(md) >= min_chars:
+            if md and _doc_img_prose_len(md) >= min_chars:
                 log(f"[{label}] Copy hijack captured {len(html)}B HTML → {len(md)} chars MD via {src} (clicked: {clicked})")
                 return md
         log(f"[{label}] Copy hijack captured but too short (text={len(text)}, html={len(html)}, src={src})", "DEBUG")
@@ -46566,7 +46749,7 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
         'main .markdown',
         'main .prose',
     ], label)
-    if md and len(md) > 2000:
+    if md and _doc_img_prose_len(md) > 2000:
         if _is_sources_not_document(md, platform="chatgpt"):
             log(f"[{label}] T2 HTML→MD wrong-artifact ({len(md)} chars source-panel-shape) "
                 f"— falling to Tier 3", "WARN")
@@ -46789,7 +46972,7 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
     # is the "stuck post-completion / wrong md" symptom. Real Deep
     # Research reports are >5000 chars; 2000 is a safe floor that
     # tolerates partial-render glitches while rejecting the ack shape.
-    if md and len(md) > 2000:
+    if md and _doc_img_prose_len(md) > 2000:
         if _is_sources_not_document(md, platform="generic"):
             log(f"[{label}] T1 HTML→MD wrong-artifact — falling to Tier 2", "WARN")
         elif _looks_like_nav_sidebar(md):
@@ -47059,7 +47242,7 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
                 'div[data-streamed]:last-of-type .markdown',
                 'div[data-is-streaming="false"]:last-of-type .markdown',
             ], label)
-            if md_chat and len(md_chat) > 100:
+            if md_chat and _doc_img_prose_len(md_chat) > 100:
                 if _looks_like_nav_sidebar(md_chat):
                     log(f"[{label}] chat-mode HTML→MD looks-like-nav-sidebar — falling to Tier 2", "WARN")
                 else:
