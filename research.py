@@ -44378,12 +44378,23 @@ _DOC_IMG_MAX_PER_DOC = 40
 _DOC_IMG_MAX_REDIRECTS = 3
 _DOC_IMG_TIMEOUT = (5.0, 10.0)
 _DOC_IMG_DOC_BUDGET_SEC = 120.0
+# ⛔ One image's whole fetch — connect, status line, headers and body — ends here
+# (or at the document's deadline, if sooner). `_DOC_IMG_TIMEOUT` bounds one socket
+# receive only; see `_DocImgDeadline`.
+_DOC_IMG_PER_IMAGE_SEC = 30.0
 _DOC_IMG_HARD_STOP_GRACE_SEC = 30.0
+_DOC_IMG_WORKERS = 1
+# Synchronous signals a rehost thread must never block (see `_doc_img_block_signals`).
+_DOC_IMG_FAULT_SIGNALS = ("SIGSEGV", "SIGBUS", "SIGFPE", "SIGILL", "SIGABRT", "SIGTRAP", "SIGSYS")
 _DOC_IMG_MAX_URL_CHARS = 4096
 _DOC_IMG_CACHE_RUNS = 8
 _DOC_IMG_CACHE_PER_RUN = 600
-_DOC_IMG_STAT_KEYS = ("found", "stored", "reused", "dropped", "refused", "failed",
-                      "captioned", "removed")
+# Every image found lands in exactly one of stored · reused · dropped · refused ·
+# login (the host answered 401/403 — an image only a signed-in reader sees) ·
+# failed · linked (the destination is a web page, written back as a link). Then
+# captioned / removed say what became of the ones not kept and not linked.
+_DOC_IMG_STAT_KEYS = ("found", "stored", "reused", "dropped", "refused", "login", "failed",
+                      "linked", "captioned", "removed")
 
 _DOC_IMG_PX_RE = re.compile(r"\s*(\d+(?:\.\d+)?)\s*(?:px)?\s*\Z", re.I)
 _DOC_IMG_STYLE_PX_RE = re.compile(r"(?:\A|;)\s*(?:width|height)\s*:\s*(\d+(?:\.\d+)?)px\b", re.I)
@@ -44398,10 +44409,22 @@ _DOC_IMG_MD_RE = re.compile(
     r"(?:[ \t\n]+(?:\"(?:[^\"\\]|\\.)*+\"|'(?:[^'\\]|\\.)*+'|\((?:[^()\\]|\\.)*+\)))?"
     r"[ \t\n]*\))"
     r"|\[(?P<label>[^\[\]]{0,999})\])?")
+# ⭐ The title may sit on the NEXT line (CommonMark allows it); matched only when
+# nothing else follows it on that line, so a quoted sentence under a definition
+# stays prose. Before this, removing a used definition left the title behind.
 _DOC_IMG_DEF_RE = re.compile(
     r"^[ ]{0,3}\[(?P<label>[^\[\]\n]{1,999})\]:[ \t]*"
     r"(?:<(?P<adest>[^<>\n]*)>|(?P<dest>\S+))"
-    r"(?:[ \t]+(?:\"[^\"\n]*\"|'[^'\n]*'|\([^()\n]*\)))?[ \t]*(?:\n|\Z)", re.M)
+    r"(?:(?:[ \t]+|[ \t]*\n[ \t]*)(?:\"[^\"\n]*\"|'[^'\n]*'|\([^()\n]*\)))?[ \t]*(?:\n|\Z)", re.M)
+# Any `[text]`, `[text][label]` or `[text][]` — which of them is a LINK reference
+# (not an image, not an inline link) is decided by `_doc_img_link_ref_labels`.
+_DOC_IMG_BRACKET_RE = re.compile(
+    r"\[(?P<text>(?:\\.|[^\[\]\\\n]){1,999}+)\](?:\[(?P<label>[^\[\]\n]{0,999})\])?")
+# The start of an inline image the main pattern could not parse (a destination
+# with a space, or parentheses nested two deep).
+_DOC_IMG_LEFTOVER_RE = re.compile(
+    r"(?<!\\)!\[(?P<alt>(?:\\.|[^\[\]\\]|\[(?:\\.|[^\[\]\\])*+\]){0,2000}+)\]\(")
+_DOC_IMG_FENCE_OPEN_RE = re.compile(r"[ ]{0,3}(?P<fence>`{3,}(?=[^`]*\Z)|~{3,})")
 _DOC_IMG_HTML_RE = re.compile(r"<img\b(?P<attrs>[^>]*)>", re.I)
 _DOC_IMG_ATTR_RE = re.compile(
     r"""([A-Za-z_:][-A-Za-z0-9_:.]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?""")
@@ -44420,6 +44443,9 @@ _doc_img_decorative_pending = 0
 # rehosted one at a time (every funnel awaits), so no lock.
 _doc_img_cache: "collections.OrderedDict" = collections.OrderedDict()
 _DOC_IMG_MISS = object()
+# A destination that answered with a web page: cached like a failure, written back
+# as a link. ⛔ Truthy — test it by identity before any `if ref:`.
+_DOC_IMG_LINKED = object()
 
 
 class _DocImageRefused(Exception):
@@ -44692,10 +44718,79 @@ def _doc_img_check_peer(sock) -> None:
         raise _DocImageRefused("refused")
 
 
-def _doc_img_session():
+class _DocImgDeadline:
+    """One image's clock — the status line, the headers and the body included.
+
+    ⛔⛔ WHY A TIMER AND NOT THE READ TIMEOUT. `_DOC_IMG_TIMEOUT` bounds ONE socket
+    receive, and a buffered read of 65536 bytes keeps receiving until it has them:
+    a server that sends a byte every nine seconds never trips it, in the headers or
+    the body, and the thread was held for days while the hard stop outside could
+    only stop waiting for it. So at the deadline this SHUTS DOWN every connection
+    the image opened, which ends whatever read is blocked on it.
+
+    ⭐ It shuts a DUP of each socket: TLS detaches the socket urllib3 connected, and
+    `shutdown` acts on the connection, not on one descriptor.
+
+    Ends: `close()` in `_doc_img_fetch`'s finally cancels the timer and closes every
+    dup; from then on (and from the deadline on) a new connection is refused.
+    Read by: this image's own connections only — the session is per image."""
+
+    def __init__(self, deadline: float):
+        self.deadline = deadline
+        self.expired = False
+        self._lock = _threading.Lock()
+        self._socks: list = []
+        self._timer = _threading.Timer(max(0.0, deadline - time.monotonic()), self.expire)
+        self._timer.daemon = True
+
+    def start(self) -> None:
+        self._timer.start()
+
+    def watch(self, sock) -> None:
+        try:
+            dup = sock.dup()
+        except OSError:
+            dup = None
+        with self._lock:
+            if dup is not None and not self.expired:
+                self._socks.append(dup)
+                return
+        for s in (dup, sock):
+            try:
+                if s is not None:
+                    s.close()
+            except OSError:
+                pass
+        raise _DocImageRefused("failed")
+
+    def expire(self) -> None:
+        # ⚠ Under the lock, so `close()` can never close a dup between the list
+        # being read and the shutdown landing on a reused descriptor.
+        with self._lock:
+            self.expired = True
+            for s in self._socks:
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+    def close(self) -> None:
+        self._timer.cancel()
+        with self._lock:
+            self.expired = True
+            socks, self._socks = self._socks, []
+            for s in socks:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+
+
+def _doc_img_session(guard: "_DocImgDeadline"):
     """A fresh session for one image: no environment (proxies, .netrc), no cookies
     kept, no auth, and a connection class that checks the peer at TCP connect —
-    before TLS, before the request is written."""
+    before TLS, before the request is written — and hands the socket to the
+    image's deadline."""
     import requests
     import urllib3.connection as _u3c
     import urllib3.connectionpool as _u3p
@@ -44706,6 +44801,7 @@ def _doc_img_session():
         def _new_conn(self):
             sock = super()._new_conn()
             _doc_img_check_peer(sock)
+            guard.watch(sock)
             return sock
 
     class _PeerCheckedPool(_u3p.HTTPSConnectionPool):
@@ -44722,8 +44818,10 @@ def _doc_img_session():
     session.auth = None
     session.cookies.set_policy(DefaultCookiePolicy(allowed_domains=[]))
     session.headers.clear()
+    # ⛔ No product name: the host is whatever a platform's answer linked to, and a
+    # prompt a sharer wrote can choose it. It learns the IP and the time, not whose.
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (compatible; SuperResearch document images)",
+        "User-Agent": "Mozilla/5.0 (compatible; image fetch)",
         "Accept": "image/png,image/jpeg,image/gif,image/webp",
         "Accept-Encoding": "identity",
     })
@@ -44749,11 +44847,25 @@ def _doc_img_read_capped(resp, deadline: float) -> bytes:
     return bytes(buf)
 
 
+def _doc_img_is_page(resp) -> bool:
+    """The host says it answered with a web page."""
+    ctype = str(resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    return ctype in ("text/html", "application/xhtml+xml")
+
+
 def _doc_img_fetch(url: str, deadline: float) -> bytes:
     """The bytes behind an https image URL, or a refusal. Redirects are followed by
-    hand, at most three, and every hop is checked exactly like the first."""
+    hand, at most three, and every hop is checked exactly like the first. The
+    whole fetch ends at `deadline` (`_DocImgDeadline`).
+
+    Refusal kinds of its own: "login" for 401/403, and "linked" for a 200 web page
+    whose bytes are not a raster — `everything![source](https://news…)` is a
+    citation after an exclamation mark, not an image. ⛔ Not SVG or any other
+    non-raster image: those are captions, as the contract says."""
     from urllib.parse import urljoin
-    session = _doc_img_session()
+    guard = _DocImgDeadline(deadline)
+    session = _doc_img_session(guard)
+    guard.start()
     try:
         for _hop in range(_DOC_IMG_MAX_REDIRECTS + 1):
             _doc_img_check_url(url)
@@ -44768,13 +44880,24 @@ def _doc_img_fetch(url: str, deadline: float) -> bytes:
                         raise _DocImageRefused("failed")
                     url = urljoin(url, location)
                     continue
+                if resp.status_code in (401, 403):
+                    raise _DocImageRefused("login")
                 if resp.status_code != 200:
                     raise _DocImageRefused("failed")
-                return _doc_img_read_capped(resp, deadline)
+                data = _doc_img_read_capped(resp, deadline)
+                # ⛔ The timer can land between the loop's deadline check and the
+                # next read, which then sees EOF: a truncated image with a
+                # readable header would pass every later check.
+                if guard.expired:
+                    raise _DocImageRefused("failed")
+                if _doc_img_sniff_ext(data) is None and _doc_img_is_page(resp):
+                    raise _DocImageRefused("linked")
+                return data
             finally:
                 resp.close()
         raise _DocImageRefused("failed")
     finally:
+        guard.close()
         session.close()
 
 
@@ -44820,8 +44943,9 @@ def _doc_img_cache_put(run: "_DocImageRun", key: str, ref) -> None:
         bucket.popitem(last=False)
 
 
-def _doc_img_resolve_src(src: str, run: "_DocImageRun") -> "str | None":
-    """The reference for one image source, or None when it is not kept."""
+def _doc_img_resolve_src(src: str, run: "_DocImageRun"):
+    """The reference for one image source, None when it is not kept, or
+    `_DOC_IMG_LINKED` when the destination is a web page."""
     src = (src or "").strip()
     if not src:
         return None
@@ -44842,7 +44966,7 @@ def _doc_img_resolve_src(src: str, run: "_DocImageRun") -> "str | None":
     key = "data:" + hashlib.sha256(src.encode("utf-8", "surrogatepass")).hexdigest() if is_data else src
     hit = _doc_img_cache_get(run, key)
     if hit is not _DOC_IMG_MISS:
-        run.stats["reused" if hit else "failed"] += 1
+        run.stats["linked" if hit is _DOC_IMG_LINKED else "reused" if hit else "failed"] += 1
         return hit
     if run.attempts >= _DOC_IMG_MAX_PER_DOC or time.monotonic() >= run.deadline:
         run.stats["failed"] += 1
@@ -44859,11 +44983,14 @@ def _doc_img_resolve_src(src: str, run: "_DocImageRun") -> "str | None":
     run.attempts += 1
     ref = None
     try:
-        data = _doc_img_decode_data_uri(src) if is_data else _doc_img_fetch(src, run.deadline)
+        data = (_doc_img_decode_data_uri(src) if is_data else
+                _doc_img_fetch(src, min(run.deadline, time.monotonic() + _DOC_IMG_PER_IMAGE_SEC)))
         ext = _doc_img_check_bytes(data)
         ref = _doc_img_upload(data, ext, run)
         run.stats["stored" if ref else "failed"] += 1
     except _DocImageRefused as refusal:
+        if refusal.kind == "linked":
+            ref = _DOC_IMG_LINKED
         run.stats[refusal.kind] += 1
     except Exception:
         run.stats["failed"] += 1
@@ -44875,13 +45002,125 @@ def _doc_img_label_key(label: str) -> str:
     return " ".join((label or "").split()).casefold()
 
 
+def _doc_img_code_spans(text: str) -> "list[tuple[int, int]]":
+    """(start, end) of every fenced code block and inline code span, in order.
+
+    ⛔ Code is quoted text, not an image: `Use the <img> element` in backticks, or
+    an HTML sample in a fence, was deleted or rewritten into a reference and its
+    URL fetched. The renderer shows code as text and never loads it, so code is
+    kept byte for byte.
+    ⭐ A fence closes on a line of the same character at least as long, or runs to
+    the end (CommonMark). A code span pairs backtick runs of equal length INSIDE
+    one paragraph — a stray backtick must not hide the images of every paragraph
+    after it. ⚠ Not indented code blocks: the capture routes write fences."""
+    import bisect
+    spans: list = []
+    paras: list = []
+    fence = ""
+    closer = None
+    para_start = -1
+    block_start = offset = 0
+    for line in text.split("\n"):
+        end = min(offset + len(line) + 1, len(text))
+        if fence:
+            if closer.match(line):
+                spans.append((block_start, end))
+                fence = ""
+        else:
+            m = _DOC_IMG_FENCE_OPEN_RE.match(line)
+            if m or not line.strip():
+                if para_start >= 0:
+                    paras.append((para_start, offset))
+                para_start = -1
+            elif para_start < 0:
+                para_start = offset
+            if m:
+                fence = m.group("fence")
+                # ⛔ `\r?`: in a CRLF document every line ends in "\r"; the opener
+                # accepted it and a closer that did not ran the fence to the end,
+                # hiding every later image, platform URL and all.
+                closer = re.compile(r"[ ]{0,3}" + re.escape(fence[0]) + "{" + str(len(fence)) + r",}[ \t]*\r?\Z")
+                block_start = offset
+        offset = end
+    if fence:
+        spans.append((block_start, len(text)))
+    elif para_start >= 0:
+        paras.append((para_start, len(text)))
+    for p_start, p_end in paras:
+        runs = [(r.start(), r.end()) for r in re.finditer(r"`+", text[p_start:p_end])]
+        by_len: dict = {}
+        for i, (s, e) in enumerate(runs):
+            by_len.setdefault(e - s, []).append(i)
+        i = 0
+        while i < len(runs):
+            s, e = runs[i]
+            if text[p_start + s - 1:p_start + s] == "\\":
+                i += 1
+                continue
+            same = by_len[e - s]
+            k = bisect.bisect_right(same, i)
+            if k == len(same):
+                i += 1
+                continue
+            spans.append((p_start + s, p_start + runs[same[k]][1]))
+            i = same[k] + 1
+    return sorted(spans)
+
+
+def _doc_img_mask_code(text: str) -> "tuple[str, object]":
+    """`text` with every code region swapped for a placeholder, and the function
+    that puts them back. The placeholder's delimiter is a run of NULs longer than
+    any in the text, so it can never collide with the document."""
+    spans = _doc_img_code_spans(text)
+    if not spans:
+        return text, lambda t: t
+    longest = max((len(r.group(0)) for r in re.finditer(r"\x00+", text)), default=0)
+    sep = "\x00" * (longest + 1)
+    codes: list = []
+    parts: list = []
+    pos = 0
+    for s, e in spans:
+        parts.append(text[pos:s])
+        parts.append(f"{sep}{len(codes)}{sep}")
+        codes.append(text[s:e])
+        pos = e
+    parts.append(text[pos:])
+    back = re.compile(re.escape(sep) + r"(\d+)" + re.escape(sep))
+    return "".join(parts), lambda t: back.sub(lambda m: codes[int(m.group(1))], t)
+
+
+def _doc_img_link_ref_labels(text: str) -> set:
+    """Labels a LINK reference still uses — `[see][1]`, `[1][]`, `[1]`, and an
+    escaped `\\![source][1]` — so a definition an image shared with a link is kept.
+    Not an inline link or image (`[…](…)`), not a definition line.
+    ⭐ No `!` test: by now every image whose label has a definition was rewritten
+    inline or escaped into a link, so an image's brackets never name a used label."""
+    text = _DOC_IMG_DEF_RE.sub("\n", text)
+    labels: set = set()
+    for m in _DOC_IMG_BRACKET_RE.finditer(text):
+        if m.group("label") is None and text.startswith("(", m.end()):
+            continue
+        labels.add(_doc_img_label_key(m.group("label") or m.group("text")))
+    return labels
+
+
 def _doc_images_rewrite_sync(text: str, run: "_DocImageRun") -> str:
     """Rewrite every image in `text`. Blocking — runs in a worker thread."""
+    text, unmask = _doc_img_mask_code(text)
+
     def _html_img(m):
-        out = _doc_img_markdown_for_tag(_doc_img_parse_attrs(m.group("attrs")))
+        attrs = _doc_img_parse_attrs(m.group("attrs"))
+        out = _doc_img_markdown_for_tag(attrs)
         if out is None:
             run.stats["dropped"] += 1
             return ""
+        # ⛔ A tag with nothing to write and NO attribute value at all is a MENTION —
+        # "use the <img> element" — not an image; there is nothing to fetch or lose.
+        # ⛔⛔ Not "no src": `srcset`, `data-src`, `style="…url()"` and every lazy-load
+        # variant carry a platform URL a raw-HTML renderer loads, and that tag went
+        # into the saved document byte for byte. Any non-blank value → removed.
+        if not out and not any(str(v).strip() for v in attrs.values()):
+            return m.group(0)
         return out
 
     text = _DOC_IMG_HTML_RE.sub(_html_img, text)
@@ -44895,15 +45134,29 @@ def _doc_images_rewrite_sync(text: str, run: "_DocImageRun") -> str:
     def _image(m):
         if m.group("inline") is not None:
             src = m.group("adest") if m.group("adest") is not None else (m.group("dest") or "")
+            key = None
         else:
+            # `![c](dest the pattern cannot parse)` — the leftover pass below captions it.
+            # ⛔ Only a SHORTCUT, and only when that pass will take it: a full
+            # `![c][l](2024)` or collapsed `![c][](x)` is an image followed by text,
+            # and so is `![c](see below` whose `(` never closes on its line — each
+            # renders through the definition, so each resolves through it here.
+            if (m.group("label") is None and m.string.startswith("(", m.end())
+                    and _doc_img_leftover_close(m.string, m.end() + 1) >= 0):
+                return m.group(0)
             key = _doc_img_label_key(m.group("label") or m.group("alt"))
             if key not in defs:
                 return m.group(0)
-            used.add(key)
             src = defs[key]
         alt = " ".join(m.group("alt").split())
         run.stats["found"] += 1
         ref = _doc_img_resolve_src(src, run)
+        if ref is _DOC_IMG_LINKED:
+            # The `!` stays as text and the link stays a link. Escaped, so a later
+            # pass over this text never sees an image here again.
+            return "\\" + m.group(0)
+        if key is not None:
+            used.add(key)
         if ref:
             return f"![{alt}]({ref})"
         if alt:
@@ -44913,14 +45166,108 @@ def _doc_images_rewrite_sync(text: str, run: "_DocImageRun") -> str:
         return ""
 
     text = _DOC_IMG_MD_RE.sub(_image, text)
+    text = _doc_img_blank_leftovers(text, run)
+    linked = _doc_img_link_ref_labels(text)
 
     def _definition(m):
         dest = m.group("adest") if m.group("adest") is not None else m.group("dest")
-        if _doc_img_label_key(m.group("label")) in used or dest.strip()[:5].lower() == "data:":
+        if dest.strip()[:5].lower() == "data:":
+            return ""
+        key = _doc_img_label_key(m.group("label"))
+        if key in used and key not in linked:
             return ""
         return m.group(0)
 
-    return _DOC_IMG_DEF_RE.sub(_definition, text)
+    return unmask(_DOC_IMG_DEF_RE.sub(_definition, text))
+
+
+def _doc_img_leftover_close(text: str, start: int) -> int:
+    """Index of the `)` closing the inline destination that opens just before
+    `start`, when the leftover pass captions it; -1 when it does not — the
+    destination never closes on its line, is empty, or is already a reference.
+    ⭐ The ONE test for both the leftover pass and the main pass's shortcut guard,
+    so the two can never disagree about who takes `![c](…)`: a guard that passed an
+    image on to a pass that then left it alone kept its platform URL."""
+    depth, i = 1, start
+    while i < len(text) and text[i] != "\n":
+        c = text[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    if depth:
+        return -1
+    dest = text[start:i].strip()
+    if not dest or _DOC_IMG_REF_RE.match(dest):
+        return -1
+    return i
+
+
+def _doc_img_blank_leftovers(text: str, run: "_DocImageRun") -> str:
+    """Every inline image the main pattern could not parse, captioned.
+
+    ⛔ `![c](https://x/File_(a_(b)).png)` and `![c](https://x/a b.png)` matched
+    neither form and kept their platform URL in the saved document. Whatever sits
+    between the balanced parentheses on that line is dropped unless it is empty or
+    already a reference; a destination that never closes on its line is not image
+    markup to any renderer and is left alone."""
+    out: list = []
+    pos = 0
+    for m in _DOC_IMG_LEFTOVER_RE.finditer(text):
+        if m.start() < pos:
+            continue
+        i = _doc_img_leftover_close(text, m.end())
+        if i < 0:
+            continue
+        alt = " ".join(m.group("alt").split())
+        run.stats["found"] += 1
+        run.stats["refused"] += 1
+        run.stats["captioned" if alt else "removed"] += 1
+        out.append(text[pos:m.start()])
+        out.append(f"![{alt}]()" if alt else "")
+        pos = i + 1
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _doc_img_block_signals() -> None:
+    """Worker initializer. ⛔⛔ A signal sent to the PROCESS goes to any thread that
+    has not blocked it. The serve-stop path blocks SIGINT/SIGTERM in the main thread
+    to HOLD a press, and its real-kernel test sends itself SIGUSR1: a rehost thread
+    with an open mask took the signal instead — the test failed, and once the
+    default action ran afterwards and ended the whole suite with no summary.
+    Python runs every handler in the main thread anyway; this thread needs none.
+    The deadline's Timer threads are started from here and inherit the mask.
+    ⛔⛔ Never the FAULT signals: a SIGSEGV/SIGBUS/SIGFPE/SIGILL raised in a blocked
+    thread (ssl, a C extension) is undefined by POSIX — the kernel kills the process
+    with no faulthandler traceback and the serve log says nothing. They are raised
+    by this thread's own crash, never sent to hold a press, so they stay open."""
+    import signal as _signal
+    if hasattr(_signal, "pthread_sigmask"):
+        faults = {getattr(_signal, name) for name in _DOC_IMG_FAULT_SIGNALS if hasattr(_signal, name)}
+        _signal.pthread_sigmask(_signal.SIG_BLOCK, _signal.valid_signals() - faults)
+
+
+def _doc_img_executor():
+    """A fresh pool for ONE document's rehost.
+
+    ⛔ Not the loop's default pool: --serve shares that with every other
+    `to_thread`, and a fetch cut off by the hard stop keeps its thread until its
+    own deadline ends it. ⛔ And not one pool for the process: idle threads that
+    never end are threads every process-wide signal can land on.
+    Ends: `_rehost_document_images` shuts it down (no wait) when the document is
+    done; a thread still inside a fetch ends at that image's deadline.
+    Read by: `_rehost_document_images` only."""
+    import concurrent.futures
+    return concurrent.futures.ThreadPoolExecutor(
+        max_workers=_DOC_IMG_WORKERS, thread_name_prefix="doc-images",
+        initializer=_doc_img_block_signals)
 
 
 def _doc_img_log_stats(label: str, stats: dict) -> None:
@@ -44949,9 +45296,14 @@ async def _rehost_document_images(text: str, label: str = "document") -> str:
     uid, rid = _fb_uid, _fb_research_id
     run = _DocImageRun(uid, rid, label, _DOC_IMG_DOC_BUDGET_SEC)
     run.stats["dropped"] += dropped
+    pool = _doc_img_executor()
     try:
+        # ⭐ The context is copied the way `to_thread` copies it: the token refresh
+        # logs, and the log scope must follow it into the worker.
+        ctx = _log_contextvars.copy_context()
         out = await asyncio.wait_for(
-            asyncio.to_thread(_doc_images_rewrite_sync, text, run),
+            asyncio.get_running_loop().run_in_executor(
+                pool, ctx.run, _doc_images_rewrite_sync, text, run),
             timeout=_DOC_IMG_DOC_BUDGET_SEC + _DOC_IMG_HARD_STOP_GRACE_SEC)
     except Exception as e:
         log(f"[{label}] document images: rehost stopped ({type(e).__name__}) — "
@@ -44962,6 +45314,9 @@ async def _rehost_document_images(text: str, label: str = "document") -> str:
             out = _doc_images_rewrite_sync(text, run)
         except Exception:
             return text
+    finally:
+        # The pool's threads end with this document (see `_doc_img_executor`).
+        pool.shutdown(wait=False, cancel_futures=True)
     _doc_img_log_stats(label, run.stats)
     return out
 
@@ -61162,6 +61517,9 @@ _FIND_SENT_TAIL_RE = re.compile(r'(?:[.!?]\s|\n\n|\n#{1,4}\s)', re.MULTILINE)
 _FIND_SENT_HEAD_RE = re.compile(r'(?:[.!?]\s|\n\n|\n#{1,4}\s)', re.MULTILINE)
 _FIND_HEADING_RE = re.compile(r'^#{2,4}\s+(.{2,80})$', re.MULTILINE)
 _FIND_MD_LINK_RE = re.compile(r'\[([^\]]{1,200})\]\(([^)]+)\)')
+_FIND_MD_IMG_RE = re.compile(
+    r'\[[ \t]*!\[(?:\\.|[^\]\\\n]){0,2000}\]\([^)\n]*\)[ \t]*\]\([^)\n]*\)'
+    r'|(?<!\\)!\[(?:\\.|[^\]\\\n]){0,2000}\]\([^)\n]*\)')
 #: Bare URLs in a report. Hoisted out of `save_meta` (which harvests the same
 #: markdown for `sourceUrls`) so one definition serves both — the two disagreeing
 #: about what a URL is would put a source in the list and not in the findings.
@@ -61437,6 +61795,11 @@ def _extract_findings(md: str, source_urls: list) -> list:
             continue
         # Replace markdown links with their label text — keeps prose
         # readable and avoids "click 'http://...'" awkwardness.
+        # ⭐ Wave 4: images first — a linked image as a unit, then a bare one — or
+        # the link pass leaves `!Chart` or `[](…)` in the card. A citation the
+        # image rehost wrote back as `\![source](url)` reads `!source`.
+        snippet = _FIND_MD_IMG_RE.sub("", snippet)
+        snippet = snippet.replace("\\![", "![")
         snippet = _FIND_MD_LINK_RE.sub(lambda m: m.group(1), snippet)
         # Collapse internal whitespace so "  \n   " runs read as a
         # single space in the rendered card.

@@ -27,12 +27,21 @@ from __future__ import annotations
 import asyncio
 import base64
 import collections
+import contextlib
+import datetime
 import hashlib
+import ipaddress
 import re
+import signal
+import socket
+import ssl
 import struct
+import subprocess
+import threading
 import time
 import types
 from email.message import Message
+from pathlib import Path
 
 import pytest
 import requests
@@ -119,7 +128,8 @@ class FakeWebResponse:
 @pytest.fixture
 def world(monkeypatch):
     w = types.SimpleNamespace(images={}, fetches=[], posts=[], logs=[], token_calls=0,
-                              web=None, fetch_delay=0.0)
+                              web=None, fetch_delay=0.0, budgets=[], threads=[], scopes=[],
+                              masks=[])
     monkeypatch.setattr(R, "_fb_uid", UID)
     monkeypatch.setattr(R, "_fb_research_id", RID)
     monkeypatch.setattr(R, "_doc_img_cache", collections.OrderedDict())
@@ -133,6 +143,11 @@ def world(monkeypatch):
 
     def fetch(url, deadline):
         w.fetches.append(url)
+        w.budgets.append(deadline - time.monotonic())
+        w.threads.append(threading.current_thread().name)
+        w.scopes.append(R._LOG_SCOPE.get())
+        if hasattr(signal, "pthread_sigmask"):
+            w.masks.append(signal.pthread_sigmask(signal.SIG_BLOCK, []))
         if w.fetch_delay:
             time.sleep(w.fetch_delay)
         if url in w.images:
@@ -716,6 +731,12 @@ class FakeSock:
     def settimeout(self, t):
         pass
 
+    def dup(self):
+        return FakeSock(self.peer)
+
+    def shutdown(self, how):
+        pass
+
     def gettimeout(self):
         return None
 
@@ -751,7 +772,7 @@ def test_the_peer_check_runs_inside_real_requests_before_a_byte_is_written(monke
         socks.append(s)
         return s
     monkeypatch.setattr(urllib3.connection.HTTPConnection, "_new_conn", fake_new_conn)
-    session = R._doc_img_session()
+    session = R._doc_img_session(R._DocImgDeadline(far()))
     with pytest.raises(R._DocImageRefused):
         session.get("https://img.example.com/a.png", stream=True, allow_redirects=False,
                     timeout=(1, 1))
@@ -761,7 +782,7 @@ def test_the_peer_check_runs_inside_real_requests_before_a_byte_is_written(monke
 def test_a_public_peer_is_not_refused_by_the_real_chain(monkeypatch):
     monkeypatch.setattr(urllib3.connection.HTTPConnection, "_new_conn",
                         lambda self: FakeSock("93.184.216.34"))
-    session = R._doc_img_session()
+    session = R._doc_img_session(R._DocImgDeadline(far()))
     with pytest.raises(Exception) as got:
         session.get("https://img.example.com/a.png", stream=True, allow_redirects=False,
                     timeout=(1, 1))
@@ -770,7 +791,7 @@ def test_a_public_peer_is_not_refused_by_the_real_chain(monkeypatch):
 
 def test_the_session_keeps_no_cookies_sends_no_auth_and_ignores_the_environment():
     from requests.cookies import MockRequest, MockResponse
-    session = R._doc_img_session()
+    session = R._doc_img_session(R._DocImgDeadline(far()))
     assert session.trust_env is False and session.auth is None
     assert "Cookie" not in session.headers and "Authorization" not in session.headers
     assert session.headers["Accept-Encoding"] == "identity"
@@ -841,7 +862,7 @@ def net(monkeypatch):
         n.resolved.append(host)
         return n.dns.get(host, ["93.184.216.34"])
     monkeypatch.setattr(R, "_doc_img_resolve_host", resolve)
-    monkeypatch.setattr(R, "_doc_img_session", lambda: n.session)
+    monkeypatch.setattr(R, "_doc_img_session", lambda guard: n.session)
     return n
 
 
@@ -949,7 +970,7 @@ def test_a_refused_address_inside_the_document_is_counted_and_captioned(world, m
     monkeypatch.setattr(R, "_doc_img_resolve_host", lambda h, p: ["192.168.0.10"])
     out = rehost("![Router admin](https://router.example.com/cam.png)")
     assert out == "![Router admin]()"
-    assert world.logs[-1][1].endswith("refused=1 failed=0 captioned=1 removed=0")
+    assert world.logs[-1][1].endswith("refused=1 login=0 failed=0 linked=0 captioned=1 removed=0")
 
 
 # ═══ 10. the funnel ════════════════════════════════════════════════════════════
@@ -999,7 +1020,7 @@ def test_a_stuck_document_is_cut_off_and_written_with_captions(world, monkeypatc
 
 
 def test_text_without_images_is_returned_untouched_with_no_thread(world, monkeypatch):
-    monkeypatch.setattr(R.asyncio, "to_thread", lambda *a, **k: pytest.fail("thread started"))
+    monkeypatch.setattr(R, "_doc_img_executor", lambda: pytest.fail("thread started"))
     text = "# Report\n\nNo pictures [a link](https://example.com) here."
     assert rehost(text) is text
     assert world.logs == []
@@ -1011,7 +1032,7 @@ def test_the_stats_line_holds_counts_only(world):
            "![](https://img.example.com/none.png) ![Cap](sandbox:/x.png)", "Claude")
     (level, line), = world.logs
     assert line == ("[Claude] document images: found=3 stored=1 reused=0 dropped=0 refused=1 "
-                    "failed=1 captioned=1 removed=1")
+                    "login=0 failed=1 linked=0 captioned=1 removed=1")
     for leak in ("img.example.com", "Secret", "Tesla", "sandbox", "Cap"):
         assert leak not in line
 
@@ -1021,7 +1042,7 @@ def test_decorative_drops_reach_the_next_documents_stats_line_and_reset(world):
                        'src="https://c.example.com/j.png"></p>')
     rehost("no images at all", "Gemini")
     assert world.logs[-1][1] == ("[Gemini] document images: found=0 stored=0 reused=0 dropped=2 "
-                                 "refused=0 failed=0 captioned=0 removed=0")
+                                 "refused=0 login=0 failed=0 linked=0 captioned=0 removed=0")
     rehost("still none", "Gemini")
     assert len(world.logs) == 1
 
@@ -1143,3 +1164,613 @@ def test_the_per_agent_funnel_sits_between_the_guard_and_the_first_write():
     funnel = src.index("text = await _rehost_document_images(text, label=name)")
     write = src.index("(documents_dir / fname).write_text")
     assert guard < funnel < write
+
+
+# ═══ 12. repair round 1 — one image's fetch ends at its deadline ════════════════
+#
+# ⛔⛔ The read timeout bounds ONE receive; a buffered read of 65536 bytes keeps
+# receiving, so a server that trickles a byte at a time held a worker thread for
+# days. These run the REAL fetch — requests, urllib3, TLS — against a REAL local
+# server, with only the public-address rules switched off (it is 127.0.0.1).
+
+def _self_signed(tmp_path):
+    cert, key = tmp_path / "cert.pem", tmp_path / "key.pem"
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.x509.oid import NameOID
+    except ImportError:
+        made = subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+             "-nodes", "-keyout", str(key), "-out", str(cert), "-days", "1", "-subj", "/CN=localhost",
+             "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"], capture_output=True)
+        if made.returncode != 0:
+            pytest.skip("⛔⛔ NO CERTIFICATE TOOL (neither `cryptography` nor openssl) — the "
+                        "trickling-server deadline tests measured NOTHING on this machine")
+        return cert, key
+    pkey = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    ski = x509.SubjectKeyIdentifier.from_public_key(pkey.public_key())
+    built = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+             .public_key(pkey.public_key()).serial_number(x509.random_serial_number())
+             .not_valid_before(now - datetime.timedelta(minutes=5))
+             .not_valid_after(now + datetime.timedelta(days=1))
+             .add_extension(x509.SubjectAlternativeName(
+                 [x509.DNSName("localhost"), x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]),
+                 critical=False)
+             .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+             .add_extension(x509.KeyUsage(digital_signature=True, content_commitment=False,
+                                          key_encipherment=False, data_encipherment=False,
+                                          key_agreement=False, key_cert_sign=True, crl_sign=False,
+                                          encipher_only=False, decipher_only=False), critical=True)
+             .add_extension(ski, critical=False)
+             .add_extension(x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(ski),
+                            critical=False)
+             .sign(pkey, hashes.SHA256()))
+    cert.write_bytes(built.public_bytes(serialization.Encoding.PEM))
+    key.write_bytes(pkey.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                       serialization.NoEncryption()))
+    return cert, key
+
+
+@contextlib.contextmanager
+def tls_server(tmp_path, head: bytes, drip: bytes = b"", every: float = 0.2, for_sec: float = 0.0):
+    """Serves `head` at once, then `drip` every `every` seconds for `for_sec`, then closes."""
+    cert, key = _self_signed(tmp_path)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(str(cert), str(key))
+    lsock = socket.socket()
+    lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    lsock.bind(("127.0.0.1", 0))
+    lsock.listen(4)
+    lsock.settimeout(0.1)
+    stop = threading.Event()
+    served = []
+
+    def serve():
+        while not stop.is_set():
+            try:
+                raw, _ = lsock.accept()
+            except OSError:
+                continue
+            conn = None
+            try:
+                raw.settimeout(3)
+                conn = ctx.wrap_socket(raw, server_side=True)
+                conn.recv(65536)
+                conn.sendall(head)
+                served.append("head")
+                until = time.monotonic() + for_sec
+                while drip and not stop.is_set() and time.monotonic() < until:
+                    conn.sendall(drip)
+                    stop.wait(every)
+            except (OSError, ssl.SSLError):
+                pass
+            finally:
+                (conn or raw).close()
+
+    th = threading.Thread(target=serve, daemon=True)
+    th.start()
+    try:
+        yield cert, lsock.getsockname()[1], served
+    finally:
+        stop.set()
+        th.join(5)
+        lsock.close()
+
+
+class _Made(list):
+    pass
+
+
+def _spy_deadlines(monkeypatch):
+    """Every `_DocImgDeadline` the fetch makes, in order."""
+    made = _Made()
+    real_guard = R._DocImgDeadline
+
+    class SpyDeadline(real_guard):
+        def __init__(self, deadline):
+            super().__init__(deadline)
+            made.append(self)
+    monkeypatch.setattr(R, "_DocImgDeadline", SpyDeadline)
+    return made
+
+
+def _trust_local_server(monkeypatch, cert):
+    """The real session, trusting the local certificate, with the public-address
+    rules off (the server is 127.0.0.1)."""
+    real_session = R._doc_img_session
+    monkeypatch.setattr(R, "_doc_img_check_url", lambda url: None)
+    monkeypatch.setattr(R, "_doc_img_check_peer", lambda sock: None)
+
+    def session(guard):
+        s = real_session(guard)
+        s.verify = str(cert)
+        return s
+    monkeypatch.setattr(R, "_doc_img_session", session)
+
+
+def _fetch_in_thread(url, budget, wait):
+    box = {}
+
+    def go():
+        t0 = time.monotonic()
+        try:
+            box["value"] = R._doc_img_fetch(url, time.monotonic() + budget)
+        except BaseException as exc:  # noqa: BLE001 — the kind is asserted by the caller
+            box["error"] = exc
+        box["elapsed"] = time.monotonic() - t0
+
+    th = threading.Thread(target=go, daemon=True)
+    th.start()
+    th.join(wait)
+    return th, box
+
+
+def _png_response(body: bytes) -> bytes:
+    return (b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: "
+            + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
+
+
+def test_the_real_tls_chain_fetches_a_whole_image(tmp_path, monkeypatch):
+    """The control: without it the trickle tests below could pass on a certificate
+    error that fails at once."""
+    made = _spy_deadlines(monkeypatch)
+    with tls_server(tmp_path, _png_response(png(300, 200))) as (cert, port, served):
+        _trust_local_server(monkeypatch, cert)
+        th, box = _fetch_in_thread(f"https://localhost:{port}/a.png", 5.0, 6.0)
+    assert not th.is_alive()
+    assert box.get("value") == png(300, 200), box.get("error")
+    (guard,) = made
+    guard._timer.join(2)
+    assert not guard._timer.is_alive() and guard._socks == [] and guard.expired
+
+
+def _trickle(tmp_path, monkeypatch, head, drip):
+    made = _spy_deadlines(monkeypatch)
+    with tls_server(tmp_path, head, drip, every=0.2, for_sec=6.0) as (cert, port, served):
+        _trust_local_server(monkeypatch, cert)
+        th, box = _fetch_in_thread(f"https://localhost:{port}/slow.png", 1.0, 3.0)
+        alive = th.is_alive()
+        head_sent = list(served)
+    return alive, box, head_sent, made
+
+
+def test_a_body_sent_a_byte_at_a_time_ends_at_the_deadline(tmp_path, monkeypatch):
+    head = (b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 4000000\r\n\r\n"
+            + png(300, 200))
+    alive, box, head_sent, made = _trickle(tmp_path, monkeypatch, head, b"\x00")
+    assert not alive, "the fetch was still reading 3 s after a 1 s deadline"
+    assert head_sent == ["head"] and "error" in box and "value" not in box
+    assert 0.8 <= box["elapsed"] < 2.5, box
+    assert made[0]._socks == [] and made[0].expired
+
+
+def test_headers_sent_a_byte_at_a_time_end_at_the_deadline(tmp_path, monkeypatch):
+    alive, box, head_sent, made = _trickle(tmp_path, monkeypatch, b"HTTP/1.1 200 OK\r\nX-Slow: ", b"a")
+    assert not alive, "the status line and headers held the fetch past its deadline"
+    assert head_sent == ["head"] and "error" in box and "value" not in box
+    assert 0.8 <= box["elapsed"] < 2.5, box
+
+
+def test_the_deadline_shuts_the_connection_through_a_dup():
+    guard = R._DocImgDeadline(far())
+    a, b = socket.socketpair()
+    try:
+        a.settimeout(3)
+        guard.watch(a)
+        t0 = time.monotonic()
+        guard.expire()
+        assert a.recv(1) == b"" and time.monotonic() - t0 < 1.0
+    finally:
+        guard.close()
+        a.close()
+        b.close()
+    assert guard._socks == []
+
+
+def test_no_connection_may_start_after_the_deadline():
+    guard = R._DocImgDeadline(far())
+    guard.expire()
+    a, b = socket.socketpair()
+    try:
+        with pytest.raises(R._DocImageRefused) as got:
+            guard.watch(a)
+        assert got.value.kind == "failed" and a.fileno() == -1
+    finally:
+        a.close()
+        b.close()
+
+
+def test_a_deadline_that_lands_between_reads_is_a_refusal_not_a_short_image(net, monkeypatch):
+    """The timer fires after the loop's deadline check; the next read sees EOF and
+    a truncated image with a readable header would pass every later check."""
+    made = _spy_deadlines(monkeypatch)
+    raw = FakeRaw([png(300, 200), lambda: (made[0].expire(), b"")[1]])
+    net.session = FakeSession([FakeHTTPResponse(200, {"Content-Type": "image/png"}, raw=raw)])
+    with pytest.raises(R._DocImageRefused) as got:
+        R._doc_img_fetch("https://img.example.com/a.png", far())
+    assert got.value.kind == "failed"
+
+
+def test_every_fetch_cancels_its_timer_and_closes_its_dups(net, monkeypatch):
+    made = _spy_deadlines(monkeypatch)
+    net.session = FakeSession([FakeHTTPResponse(200, {}, [png()])])
+    assert R._doc_img_fetch("https://img.example.com/a.png", far()) == png()
+    net.session = FakeSession([FakeHTTPResponse(500, {}, [])])
+    with pytest.raises(R._DocImageRefused):
+        R._doc_img_fetch("https://img.example.com/a.png", far())
+    assert len(made) == 2
+    for guard in made:
+        guard._timer.join(2)
+        assert not guard._timer.is_alive() and guard.expired
+
+
+def test_one_image_gets_at_most_its_own_budget_and_never_more_than_the_document(world, monkeypatch):
+    world.images["https://img.example.com/a.png"] = png()
+    rehost("![a](https://img.example.com/a.png)")
+    assert R._DOC_IMG_PER_IMAGE_SEC - 2 <= world.budgets[0] <= R._DOC_IMG_PER_IMAGE_SEC
+    monkeypatch.setattr(R, "_DOC_IMG_DOC_BUDGET_SEC", 5.0)
+    world.images["https://img.example.com/b.png"] = gif()
+    rehost("![b](https://img.example.com/b.png)")
+    assert 3.0 <= world.budgets[1] <= 5.0
+
+
+def test_the_rehost_runs_on_its_own_threads_and_keeps_the_log_scope(world):
+    world.images["https://img.example.com/a.png"] = png()
+
+    async def main():
+        with R._machine_log_scope():
+            return await R._rehost_document_images("![a](https://img.example.com/a.png)", "Gemini")
+    assert asyncio.run(main()) == f"![a]({ref_for(png())})"
+    assert world.threads[0].startswith("doc-images")
+    assert world.scopes == [R._LOG_SCOPE_MACHINE]
+    assert R._doc_img_executor()._max_workers == R._DOC_IMG_WORKERS == 1
+
+
+def _doc_image_threads():
+    return [t for t in threading.enumerate() if t.name.startswith("doc-images")]
+
+
+@pytest.mark.skipif(not hasattr(signal, "pthread_sigmask"), reason="no signal mask on this platform")
+def test_a_rehost_thread_takes_no_signal_and_ends_with_its_document(world):
+    """⛔⛔ A process-wide signal goes to ANY thread that has not blocked it. Idle
+    rehost threads that lived forever took the serve-stop test's SIGUSR1 — it
+    failed, and once the default action killed the whole suite with no summary."""
+    world.images["https://img.example.com/a.png"] = png()
+    assert rehost("![a](https://img.example.com/a.png)") == f"![a]({ref_for(png())})"
+    (mask,) = world.masks
+    assert {signal.SIGUSR1, signal.SIGINT, signal.SIGTERM} <= mask
+    # ⛔⛔ A blocked fault signal is undefined by POSIX: a crash in this thread would
+    # kill the serve process with no traceback.
+    faults = {signal.SIGSEGV, signal.SIGBUS, signal.SIGFPE, signal.SIGILL, signal.SIGABRT}
+    assert not (faults & mask), sorted(faults & mask)
+    for t in _doc_image_threads():
+        t.join(3)
+    assert _doc_image_threads() == []
+    got = []
+    old_handler = signal.getsignal(signal.SIGUSR1)
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+    try:
+        signal.signal(signal.SIGUSR1, lambda *_a: got.append(1))
+        signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGUSR1])
+        import os
+        os.kill(os.getpid(), signal.SIGUSR1)
+        assert signal.SIGUSR1 in signal.sigpending(), "held by the main thread"
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, [signal.SIGUSR1])
+        assert got == [1]
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+        signal.signal(signal.SIGUSR1, old_handler)
+
+
+# ═══ 13. repair round 1 — login-only images, the user agent ═════════════════════
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_a_login_only_image_is_its_own_count(net, status):
+    resp = FakeHTTPResponse(status, {}, [png()])
+    net.session = FakeSession([resp])
+    with pytest.raises(R._DocImageRefused) as got:
+        R._doc_img_fetch("https://img.example.com/a.png", far())
+    assert got.value.kind == "login" and resp.raw.asks == []
+
+
+def test_the_stats_line_counts_login_only_images(world):
+    world.images["https://img.example.com/private.png"] = R._DocImageRefused("login")
+    assert rehost("![Private](https://img.example.com/private.png)", "ChatGPT") == "![Private]()"
+    assert world.logs[-1][1] == ("[ChatGPT] document images: found=1 stored=0 reused=0 dropped=0 "
+                                 "refused=0 login=1 failed=0 linked=0 captioned=1 removed=0")
+
+
+def test_the_user_agent_does_not_name_the_product():
+    ua = R._doc_img_session(R._DocImgDeadline(far())).headers["User-Agent"]
+    assert ua.startswith("Mozilla/5.0") and "superresearch" not in ua.lower()
+
+
+# ═══ 14. repair round 1 — a citation after "!" stays a link ═════════════════════
+
+def test_a_page_after_an_exclamation_mark_is_written_back_as_a_link(world):
+    url = "https://news.example.com/article"
+    world.images[url] = R._DocImageRefused("linked")
+    text = f"This changes everything![source]({url}) and more."
+    out = rehost(text)
+    assert out == f"This changes everything\\![source]({url}) and more."
+    assert world.logs[-1][1].endswith("linked=1 captioned=0 removed=0")
+    assert rehost(out) == out and world.fetches == [url]
+    again = rehost(f"Another doc![source]({url}) too.", "Gemini")
+    assert again == f"Another doc\\![source]({url}) too." and world.fetches == [url]
+    assert world.logs[-1][1] == ("[Gemini] document images: found=1 stored=0 reused=0 dropped=0 "
+                                 "refused=0 login=0 failed=0 linked=1 captioned=0 removed=0")
+
+
+def test_a_linked_reference_keeps_its_definition(world):
+    url = "https://news.example.com/a"
+    world.images[url] = R._DocImageRefused("linked")
+    text = f"See everything![source][1] now.\n\n[1]: {url}\n"
+    assert rehost(text) == f"See everything\\![source][1] now.\n\n[1]: {url}\n"
+
+
+def test_only_a_web_page_is_a_link(net):
+    net.session = FakeSession([FakeHTTPResponse(200, {"Content-Type": "text/html; charset=utf-8"},
+                                                [b"<!doctype html><title>x</title>"])])
+    with pytest.raises(R._DocImageRefused) as got:
+        R._doc_img_fetch("https://news.example.com/a", far())
+    assert got.value.kind == "linked"
+    svg = b"<svg xmlns='http://www.w3.org/2000/svg'></svg>"
+    net.session = FakeSession([FakeHTTPResponse(200, {"Content-Type": "image/svg+xml"}, [svg])])
+    assert R._doc_img_fetch("https://img.example.com/a.svg", far()) == svg
+    net.session = FakeSession([FakeHTTPResponse(200, {"Content-Type": "text/html"}, [png()])])
+    assert R._doc_img_fetch("https://img.example.com/mislabelled", far()) == png()
+
+
+def test_the_citation_after_an_exclamation_mark_is_a_finding_again(world):
+    url = "https://news.example.com/article"
+    world.images[url] = R._DocImageRefused("linked")
+    out = rehost(f"## Impact\n\nThis changes everything![source]({url}) and more for the market.\n")
+    (finding,) = R._extract_findings(out, [])
+    assert finding["url"] == url
+    assert "This changes everything!source and more for the market" in finding["snippet"]
+
+
+# ═══ 15. repair round 1 — code is quoted text ═══════════════════════════════════
+
+@pytest.mark.parametrize("text", [
+    "Use the <img> element for pictures.",
+    "Always give <IMG /> an alt.",
+    "Always give <img alt> a value.",
+    "Inline `<img src=\"https://cdn.example.com/x.png\" alt=\"logo\">` sample.",
+    "Inline ``a ` ![x](https://img.example.com/x.png) b`` span.",
+    "```html\n<img src=\"https://cdn.example.com/logo.png\" alt=\"logo\">\n![m](https://img.example.com/m.png)\n```\n",
+    "~~~\n![t](https://img.example.com/t.png)\n~~~\n",
+    "````md\n```\n![q](https://img.example.com/q.png)\n````\n",
+])
+def test_code_and_a_bare_img_mention_are_kept_byte_for_byte(world, text):
+    world.images.update({u: png() for u in ("https://cdn.example.com/logo.png",
+                                              "https://cdn.example.com/x.png",
+                                              "https://img.example.com/x.png",
+                                              "https://img.example.com/m.png",
+                                              "https://img.example.com/t.png",
+                                              "https://img.example.com/q.png")})
+    assert rehost(text) == text
+    assert world.fetches == [] and world.posts == []
+    _assert_the_pass_ran_clean(world)
+
+
+def _assert_the_pass_ran_clean(world):
+    """⛔ The funnel hands back the INPUT when the rewrite raises, so "unchanged" alone
+    cannot tell kept code from a crash. The stats line proves the pass finished."""
+    assert not any(level == "WARN" for level, _msg in world.logs), world.logs
+    assert world.logs and " document images: found=" in world.logs[-1][1]
+
+
+def test_an_image_after_a_closed_fence_is_still_rehosted(world):
+    url = "https://img.example.com/after.png"
+    world.images[url] = png()
+    out = rehost(f"```\ncode `x`\n```\n\n![after]({url})")
+    assert out == f"```\ncode `x`\n```\n\n![after]({ref_for(png())})"
+
+
+def test_an_image_after_a_closed_fence_in_a_crlf_document_is_still_rehosted(world):
+    """⛔ Every CRLF line ends in "\\r": the closer refused it, the fence ran to the
+    end of the document, and every later image kept its platform URL."""
+    url = "https://img.example.com/crlf.png"
+    world.images[url] = png()
+    world.images["https://img.example.com/m.png"] = png()
+    text = f"```\r\n![m](https://img.example.com/m.png)\r\n```\r\n\r\n![after]({url})\r\n"
+    out = rehost(text)
+    assert out == f"```\r\n![m](https://img.example.com/m.png)\r\n```\r\n\r\n![after]({ref_for(png())})\r\n"
+    assert world.fetches == [url]
+
+
+def test_a_stray_backtick_does_not_hide_the_next_paragraph(world):
+    url = "https://img.example.com/p2.png"
+    world.images[url] = png()
+    out = rehost(f"one ` stray\n\n![p]({url}) and ` later")
+    assert out == f"one ` stray\n\n![p]({ref_for(png())}) and ` later"
+
+
+def test_an_escaped_backtick_opens_no_code_span(world):
+    url = "https://img.example.com/e.png"
+    world.images[url] = png()
+    assert rehost(f"a \\` ![e]({url}) `b") == f"a \\` ![e]({ref_for(png())}) `b"
+
+
+def test_an_img_with_a_source_is_still_not_left_in_prose(world):
+    """⛔ The mention guard is for a tag with NO source: one whose source cannot be
+    written as markdown still goes, URL and all."""
+    out = rehost('Before <img src="https://img.example.com/a&gt;b.png"> after')
+    assert out == "Before  after" and "img.example.com" not in out
+
+
+@pytest.mark.parametrize("tag", [
+    '<img srcset="https://cdn.example.com/a.png 2x">',
+    '<img data-src="https://cdn.example.com/a.png">',
+    '<img style="background:url(https://cdn.example.com/a.png)">',
+])
+def test_an_img_with_any_url_bearing_attribute_is_not_left_in_prose(world, tag):
+    """⛔⛔ The mention guard looked at `src` alone: a lazy-load tag with its URL in
+    `srcset` or `data-src` was kept byte for byte, and a raw-HTML renderer loads it."""
+    out = rehost(f"Before {tag} after")
+    assert out == "Before  after" and "cdn.example.com" not in out
+    assert world.fetches == []
+    _assert_the_pass_ran_clean(world)
+
+
+def test_nul_bytes_in_the_document_never_collide_with_the_code_placeholders(world):
+    text = "odd \x000\x00 and `code` and \x00\x001\x00\x00 <img>"
+    assert rehost(text) == text
+    _assert_the_pass_ran_clean(world)
+
+
+# ═══ 16. repair round 1 — definitions, odd destinations, snippets ═══════════════
+
+def test_a_definition_an_image_shares_with_a_link_stays(world):
+    url = "https://cdn.example.com/fig.png"
+    world.images[url] = png()
+    text = f"Chart ![fig][1] and cited [see][1].\n\n[1]: {url}\n"
+    assert rehost(text) == f"Chart ![fig]({ref_for(png())}) and cited [see][1].\n\n[1]: {url}\n"
+
+
+@pytest.mark.parametrize("link", ["[1][]", "[1]"])
+def test_collapsed_and_shortcut_link_references_keep_the_definition(world, link):
+    url = "https://cdn.example.com/fig.png"
+    world.images[url] = png()
+    out = rehost(f"![fig][1] then {link} here.\n\n[1]: {url}\n")
+    assert out.endswith(f"[1]: {url}\n")
+
+
+def test_an_inline_link_with_the_same_text_does_not_keep_the_definition(world):
+    url = "https://cdn.example.com/fig.png"
+    world.images[url] = png()
+    out = rehost(f"![fig][1] and [1](https://example.com/x).\n\n[1]: {url}\n")
+    assert out == f"![fig]({ref_for(png())}) and [1](https://example.com/x).\n\n"
+
+
+@pytest.mark.parametrize("dest", [
+    "https://upload.example.org/File_(a_(b)).png", "https://img.example.com/a b.png",
+    "https://img.example.com/a\\) b.png",
+])
+def test_an_image_the_pattern_cannot_parse_loses_its_url(world, dest):
+    out = rehost(f"x ![c]({dest}) y")
+    assert out == "x ![c]() y"
+    assert world.logs[-1][1].endswith("refused=1 login=0 failed=0 linked=0 captioned=1 removed=0")
+
+
+def test_an_escaped_bang_before_an_unparseable_destination_is_left_as_text(world):
+    text = "literal \\![x](https://img.example.com/a b.png) text"
+    assert rehost(text) == text
+    _assert_the_pass_ran_clean(world)
+
+
+def test_an_unparseable_image_named_like_a_definition_loses_its_url_too(world):
+    world.images["https://cdn.example.com/c.png"] = png()
+    out = rehost("x ![c](https://img.example.com/a b.png) y\n\n[c]: https://cdn.example.com/c.png\n")
+    assert out.startswith("x ![c]() y") and "a b.png" not in out and world.fetches == []
+
+
+@pytest.mark.parametrize("image, tail, label", [
+    ("![fig][l]", "(2024)", "l"),
+    ("![fig][]", "(x)", "fig"),
+    ("![fig]", "(see below", "fig"),
+])
+def test_a_reference_image_followed_by_a_parenthesis_resolves_through_its_definition(
+        world, image, tail, label):
+    """⛔ The unparseable-destination guard caught every reference form: a full
+    `![fig][l](2024)`, a collapsed `![fig][](x)` and a shortcut whose `(` never closes
+    on its line all render the DEFINITION's image — and all kept its platform URL."""
+    url = "https://cdn.example.com/fig.png"
+    world.images[url] = png()
+    out = rehost(f"see {image}{tail} here\n\n[{label}]: {url}\n")
+    assert out == f"see ![fig]({ref_for(png())}){tail} here\n\n"
+    assert world.fetches == [url]
+
+
+def test_a_shortcut_image_inside_a_parenthetical_still_resolves(world):
+    url = "https://cdn.example.com/fig.png"
+    world.images[url] = png()
+    out = rehost(f"(chart: ![fig] below) now\n\n[fig]: {url}\n")
+    assert out == f"(chart: ![fig]({ref_for(png())}) below) now\n\n"
+
+
+def test_a_definition_title_on_the_next_line_goes_with_it(world):
+    url = "https://cdn.example.com/x.png"
+    world.images[url] = png()
+    out = rehost(f'![f][fig]\n\n[fig]: {url}\n  "Figure title"\nafter\n')
+    assert out == f"![f]({ref_for(png())})\n\nafter\n"
+    out = rehost(f'![f][fig]\n\n[fig]: {url}\n"Quoted" said he.\n')
+    assert out == f'![f]({ref_for(png())})\n\n"Quoted" said he.\n'
+
+
+def test_findings_snippets_carry_no_image_markup():
+    ref = f"/document-images/{RID}/{'c' * 64}.png"
+    md = (f"## Market\n\nRevenue grew 40% last year ![Chart]({ref}) according to "
+          "[Reuters](https://www.reuters.com/markets/a) today.\n\n"
+          f"Margins fell [![Logo]({ref})](https://www.example.org/src) as costs rose "
+          "sharply in the quarter.\n")
+    got = {f["url"]: f["snippet"] for f in R._extract_findings(md, [])}
+    reuters = got["https://www.reuters.com/markets/a"]
+    assert "Revenue grew 40% last year according to Reuters today" in reuters
+    src = got["https://www.example.org/src"]
+    assert "Margins fell as costs rose sharply" in src
+    for snip in (reuters, src):
+        assert "![" not in snip and "!Chart" not in snip and "[](" not in snip
+        assert "document-images" not in snip and "Logo" not in snip
+
+
+# ═══ 17. repair round 1 — the machine and the web read ONE upload contract ══════
+#
+# ⛔ Two copied literals: rename a body key or the reference form on one side and
+# both suites stay green, and at THE DEPLOY every upload is refused. Read from the
+# web repo's COMMITTED tree (its working tree may be mid-mutation).
+
+WEB_CONTRACT_REV = "87ff717"
+
+
+def _web_repo():
+    here = Path(R.__file__).resolve().parent
+    candidates = [here.parent / "dg-research"]
+    try:
+        common = subprocess.run(["git", "-C", str(here), "rev-parse", "--path-format=absolute",
+                                 "--git-common-dir"], capture_output=True, text=True, timeout=10)
+        if common.returncode == 0 and common.stdout.strip():
+            candidates.append(Path(common.stdout.strip()).parent.parent / "dg-research")
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return next((c for c in candidates if (c / ".git").exists()), None)
+
+
+def _web_file(path):
+    repo = _web_repo()
+    if repo is None:
+        pytest.skip("⛔⛔ THE WEB REPO (dg-research) IS NOT ON THIS DISK — the machine/web upload "
+                    "contract was NOT compared")
+    got = subprocess.run(["git", "-C", str(repo), "show", f"{WEB_CONTRACT_REV}:{path}"],
+                         capture_output=True, text=True, timeout=30)
+    assert got.returncode == 0, f"{repo} has no {WEB_CONTRACT_REV}:{path}: {got.stderr.strip()}"
+    return got.stdout
+
+
+def test_the_reference_regex_is_the_webs():
+    src = _web_file("src/lib/document-images.ts")
+    folder = re.search(r'export const DOCUMENT_IMAGE_FOLDER = "([^"]+)";', src).group(1)
+    id_pattern = re.search(r'const ID_PATTERN = "([^"]+)";', src).group(1)
+    template = re.search(r"DOCUMENT_IMAGE_REF_RE = new RegExp\(\s*`([^`]+)`", src).group(1)
+    js = (template.replace("${DOCUMENT_IMAGE_FOLDER}", folder)
+          .replace("${ID_PATTERN}", id_pattern).replace("\\\\", "\\"))
+    assert js.startswith("^") and js.endswith("$") and "${" not in js, js
+    assert R._DOC_IMG_REF_RE.pattern == r"\A" + js[1:-1] + r"\Z"
+
+
+def test_the_upload_body_and_answer_are_the_routes(world):
+    route = _web_file("src/app/api/document-images/route.ts")
+    read_keys = set(re.findall(r"body\?\.(\w+)", route))
+    answers = set(re.findall(r"NextResponse\.json\(\{ (\w+): parsed\.path \}\)", route))
+    assert read_keys and answers == {"ref"}
+    world.images["https://img.example.com/c.png"] = png()
+    assert rehost("![c](https://img.example.com/c.png)") == f"![c]({ref_for(png())})"
+    (post,) = world.posts
+    assert set(post["json"]) == read_keys
+    assert post["url"].endswith("/api/document-images")
+    assert 'body.get("ref")' in code_only(R._doc_img_upload)
