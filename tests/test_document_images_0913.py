@@ -168,6 +168,22 @@ def world(monkeypatch):
         return FakeWebResponse(200, {"ref": ref_for(data, json["research_id"])})
     monkeypatch.setattr(requests, "post", post)
 
+    # The upload's own session (its every connection watched by its guard): the same
+    # fake web behind it. `w.upload_guards` holds each upload's REAL guard.
+    w.upload_guards, w.upload_sessions_closed = [], 0
+
+    class UploadSession:
+        def post(self, url, **kw):
+            return post(url, **kw)
+
+        def close(self):
+            w.upload_sessions_closed += 1
+
+    def upload_session(guard):
+        w.upload_guards.append(guard)
+        return UploadSession()
+    monkeypatch.setattr(R, "_doc_img_upload_session", upload_session)
+
     monkeypatch.setattr(R, "log", lambda msg, level="INFO": w.logs.append((level, msg)))
     return w
 
@@ -1724,8 +1740,10 @@ def test_findings_snippets_carry_no_image_markup():
 # ⛔ Two copied literals: rename a body key or the reference form on one side and
 # both suites stay green, and at THE DEPLOY every upload is refused. Read from the
 # web repo's COMMITTED tree (its working tree may be mid-mutation).
+# ⭐ Its `main`, not a fixed commit: a pinned commit kept comparing the machine with
+# a web the repairs had already moved past. Still read-only (`git show`).
 
-WEB_CONTRACT_REV = "87ff717"
+WEB_CONTRACT_REV = "main"
 
 
 def _web_repo():
@@ -1774,3 +1792,522 @@ def test_the_upload_body_and_answer_are_the_routes(world):
     assert set(post["json"]) == read_keys
     assert post["url"].endswith("/api/document-images")
     assert 'body.get("ref")' in code_only(R._doc_img_upload)
+
+
+# ═══ 18. repair round 2 — a link around an image to that image goes ═════════════
+#
+# ⛔ A capture wraps a chart in a click-to-enlarge anchor. The converter writes
+# `[![Chart](<S>)](S)` and the rewrite changed only the inner image, so the saved
+# document and every share kept S — a signed platform URL — as the link. Every
+# case below starts from the REAL converter's output.
+
+SIGNED = "https://lh3.googleusercontent.com/SIGNED-chart=w800"
+
+
+def test_the_converter_wraps_a_linked_image_the_way_these_tests_assume():
+    """The control: without it the cases below could pass on a shape no capture writes."""
+    assert (R.html_to_markdown(f'<p><a href="{SIGNED}"><img src="{SIGNED}" alt="Chart"></a></p>')
+            == f"[![Chart](<{SIGNED}>)]({SIGNED})")
+
+
+def test_a_self_link_around_a_stored_image_goes_and_the_image_stays(world):
+    md = R.html_to_markdown(f'<p>Chart: <a href="{SIGNED}"><img src="{SIGNED}" alt="Chart"></a> end</p>')
+    world.images[SIGNED] = png()
+    out = rehost(md)
+    assert out == f"Chart: ![Chart]({ref_for(png())}) end"
+    assert rehost(out) == out and world.fetches == [SIGNED]
+
+
+def test_a_self_link_with_a_title_around_a_captioned_image_goes(world):
+    md = R.html_to_markdown(f'<p><a href="{SIGNED}" title="Open full size">'
+                            f'<img src="{SIGNED}" alt="Chart"></a></p>')
+    assert md.endswith(f'({SIGNED} "Open full size")')
+    world.images[SIGNED] = R._DocImageRefused("login")
+    assert rehost(md) == "![Chart]()"
+
+
+def test_a_self_link_around_an_image_with_no_alt_goes_with_it(world):
+    md = R.html_to_markdown(f'<p>a <a href="{SIGNED}"><img src="{SIGNED}"></a> b</p>')
+    world.images[SIGNED] = R._DocImageRefused("failed")
+    out = rehost(md)
+    assert "googleusercontent" not in out and "](" not in out
+    assert out == "a  b"
+
+
+def test_a_self_link_around_a_removed_image_with_words_goes_and_the_words_stay(world):
+    """⛔ A removed image leaves no text, so reading the link's text for it kept S
+    whenever the anchor said more than the image."""
+    md = R.html_to_markdown(f'<p><a href="{SIGNED}"><img src="{SIGNED}"> View full size</a></p>')
+    assert md == f"[![](<{SIGNED}>) View full size]({SIGNED})"
+    world.images[SIGNED] = R._DocImageRefused("failed")
+    out = rehost(md)
+    assert out == " View full size" and "googleusercontent" not in out
+
+
+def test_a_link_to_a_different_page_around_a_removed_image_with_words_stays(world):
+    page = "https://news.example.com/a"
+    md = R.html_to_markdown(f'<p>see <a href="{page}"><img src="{SIGNED}"> Caption</a> end</p>')
+    assert md == f"see [![](<{SIGNED}>) Caption]({page}) end"
+    world.images[SIGNED] = R._DocImageRefused("failed")
+    assert rehost(md) == f"see [ Caption]({page}) end"
+
+
+def test_document_text_cannot_pose_as_an_image_slot(world):
+    """The slot that marks where an image was written carries a per-pass nonce."""
+    src = "https://cdn.example.com/chart.png"
+    lookalike = ":0 000000000000:0"
+    world.images[src] = png()
+    assert rehost(f"{lookalike} ![Chart]({src})") == f"{lookalike} ![Chart]({ref_for(png())})"
+
+
+def test_a_self_link_whose_text_holds_more_than_the_image_goes(world):
+    src = "https://cdn.example.com/chart.png"
+    md = R.html_to_markdown(f'<p><a href="{src}"><img src="{src}" alt="Q3"> Revenue by quarter</a></p>')
+    world.images[src] = png()
+    assert rehost(md) == f"![Q3]({ref_for(png())}) Revenue by quarter"
+
+
+@pytest.mark.parametrize("href", ["blob:https://chatgpt.com/1234", "sandbox:/mnt/data/chart.png",
+                                  "data:image/png;base64,AAAA", "BLOB:https://chatgpt.com/9"])
+def test_a_link_to_an_address_nobody_can_open_around_an_image_goes(world, href):
+    src = "https://cdn.example.com/chart.png"
+    md = R.html_to_markdown(f'<p><a href="{href}"><img src="{src}" alt="Chart"></a></p>')
+    assert md == f"[![Chart](<{src}>)]({href})"
+    world.images[src] = png()
+    assert rehost(md) == f"![Chart]({ref_for(png())})"
+
+
+def test_a_link_around_an_image_to_a_different_page_stays(world):
+    """⭐ The article the chart came from is a source, not a platform URL."""
+    src = "https://cdn.example.com/chart.png"
+    page = "https://news.example.com/story_(2024)"
+    md = R.html_to_markdown(f'<p><a href="{page}"><img src="{src}" alt="Chart"> Caption words</a></p>')
+    world.images[src] = png()
+    assert rehost(md) == f"[![Chart]({ref_for(png())}) Caption words]({page})"
+    world.images[SIGNED] = R._DocImageRefused("failed")
+    md = R.html_to_markdown(f'<p><a href="{page}"><img src="{SIGNED}" alt="Fig"></a></p>')
+    assert rehost(md) == f"[![Fig]()]({page})"
+
+
+def test_a_citation_to_the_page_a_captioned_image_pointed_at_keeps_its_link(world):
+    """⛔ Only a link AROUND that image goes. The same address cited elsewhere is a
+    source the report names."""
+    url = "https://news.example.com/article"
+    world.images[url] = R._DocImageRefused("failed")
+    out = rehost(f"Chart ![Reuters]({url}) and per [Reuters]({url}) today.")
+    assert out == f"Chart ![Reuters]() and per [Reuters]({url}) today."
+
+
+# ═══ 19. repair round 2 — a citation after "!" whatever the page answered ═══════
+#
+# ⛔⛔ Round 1 kept the citation only when its host answered 200 with a web page; a
+# 403 to a plain client, a 404, a 5xx, an http address or a spent budget deleted
+# it. ⛔⛔ But "any HTML answer is a link" is not the fix either: Google's image host
+# answers an id it will not serve with `400 text/html` (measured 2026-09-14), so a
+# Gemini chart would have gone back into the share as a live platform URL. A link
+# needs the page answer (or no answer at all) AND markup that can be a citation.
+
+_REAL_FETCH = R._doc_img_fetch
+CITE = "https://www.reuters.com/markets/a"
+
+
+def _real_fetch_answering(monkeypatch, status, ctype, body=b"<!doctype html><title>x</title>"):
+    """The REAL fetch runs inside the rehost; every URL is answered the same way."""
+    monkeypatch.setattr(R, "_doc_img_fetch", _REAL_FETCH)
+    calls = []
+
+    def session(guard):
+        s = FakeSession([])
+
+        def get(url, **kw):
+            calls.append(url)
+            return FakeHTTPResponse(status, {"Content-Type": ctype}, [body])
+        s.get = get
+        return s
+    monkeypatch.setattr(R, "_doc_img_session", session)
+    return calls
+
+
+@pytest.mark.parametrize("status,fallback", [(401, "login"), (403, "login"), (404, "failed"),
+                                             (429, "failed"), (500, "failed"), (503, "failed")])
+def test_a_page_answer_is_a_page_whatever_its_status(net, status, fallback):
+    resp = FakeHTTPResponse(status, {"Content-Type": "text/html; charset=utf-8"}, [b"<html>no</html>"])
+    net.session = FakeSession([resp])
+    with pytest.raises(R._DocImageRefused) as got:
+        R._doc_img_fetch(CITE, far())
+    assert got.value.kind == "linked" and got.value.fallback == fallback
+    assert resp.raw.asks == [] and resp.closed
+
+
+@pytest.mark.parametrize("status,ctype,kind", [(403, "application/xml", "login"),
+                                               (404, "application/json", "failed")])
+def test_an_error_that_is_not_a_page_lands_where_it_always_did(net, status, ctype, kind):
+    net.session = FakeSession([FakeHTTPResponse(status, {"Content-Type": ctype}, [b"<Error/>"])])
+    with pytest.raises(R._DocImageRefused) as got:
+        R._doc_img_fetch("https://files.example.net/blob?sig=x", far())
+    assert got.value.kind == kind and got.value.fallback == kind
+
+
+@pytest.mark.parametrize("status", [200, 403, 404, 503])
+def test_a_citation_after_an_exclamation_mark_stays_a_link_whatever_the_page_answered(
+        world, monkeypatch, status):
+    calls = _real_fetch_answering(monkeypatch, status, "text/html; charset=utf-8")
+    out = rehost(f"Revenue rose 40%![Reuters]({CITE}) in May.")
+    assert out == f"Revenue rose 40%\\![Reuters]({CITE}) in May."
+    assert calls == [CITE] and world.posts == []
+    assert world.logs[-1][1].endswith("login=0 failed=0 linked=1 captioned=0 removed=0")
+
+
+@pytest.mark.parametrize("md,expected", [
+    ("Chart:\n\n![Chart](https://img.example.com/render?id=1)", "Chart:\n\n![Chart]()"),
+    ("Chart: ![Chart](https://img.example.com/render?id=1)", "Chart: ![Chart]()"),
+    ("Chart:![Chart](<https://img.example.com/render?id=1>)", "Chart:![Chart]()"),
+    ("Chart:![Chart](https://lh3.googleusercontent.com/gg/abc)", "Chart:![Chart]()"),
+    ("Chart:![Chart](https://img.example.com/charts/q3.png)", "Chart:![Chart]()"),
+])
+@pytest.mark.parametrize("status", [200, 400, 404])
+def test_an_image_whose_host_answers_a_page_is_a_caption_not_a_link(world, monkeypatch, md, expected, status):
+    """⛔⛔ The over direction of the fix above: an image on its own line or after a
+    space, one the converter wrote (angle brackets), one on a platform's image
+    host, one with an image path — each answered by an HTML error page."""
+    _real_fetch_answering(monkeypatch, status, "text/html; charset=UTF-8")
+    assert rehost(md) == expected
+
+
+@pytest.mark.parametrize("status,counts", [(403, "login=1 failed=0"), (404, "login=0 failed=1"),
+                                           (200, "login=0 failed=1")])
+def test_a_page_answer_that_is_not_a_citation_counts_where_it_always_did(world, monkeypatch, status, counts):
+    _real_fetch_answering(monkeypatch, status, "text/html")
+    assert rehost("![Private](https://img.example.com/private)") == "![Private]()"
+    assert world.logs[-1][1].endswith(f"refused=0 {counts} linked=0 captioned=1 removed=0")
+
+
+@pytest.mark.parametrize("exit_", ["http", "no-token", "cap", "budget", "no-research"])
+def test_a_citation_that_is_never_fetched_stays_a_link(world, monkeypatch, exit_):
+    url = CITE
+    if exit_ == "http":
+        url = "http://www.reuters.com/markets/a"
+    elif exit_ == "no-token":
+        monkeypatch.setattr(R, "_fresh_user_mode_id_token", lambda: None)
+    elif exit_ == "cap":
+        monkeypatch.setattr(R, "_DOC_IMG_MAX_PER_DOC", 0)
+    elif exit_ == "budget":
+        monkeypatch.setattr(R, "_DOC_IMG_DOC_BUDGET_SEC", 0.0)
+    else:
+        monkeypatch.setattr(R, "_fb_research_id", None)
+    out = rehost(f"Revenue rose 40%![Reuters]({url}) in May.")
+    assert out == f"Revenue rose 40%\\![Reuters]({url}) in May."
+    assert world.fetches == [] and world.posts == []
+    assert world.logs[-1][1].endswith("linked=1 captioned=0 removed=0")
+
+
+@pytest.mark.parametrize("md,expected", [
+    ("Chart ![Chart](https://img.example.com/render?id=1) end", "Chart ![Chart]() end"),
+    ("![Chart](https://img.example.com/render?id=1)", "![Chart]()"),
+    ("x\n![Chart](https://img.example.com/render?id=1)", "x\n![Chart]()"),
+    ("[![Chart](https://img.example.com/render?id=1)](https://news.example.com/a)",
+     "[![Chart]()](https://news.example.com/a)"),
+    ("(![Chart](https://img.example.com/render?id=1))", "(![Chart]())"),
+    ("|![Chart](https://img.example.com/render?id=1)|", "|![Chart]()|"),
+    ("```\ncode\n```\n![Chart](https://img.example.com/render?id=1)", "```\ncode\n```\n![Chart]()"),
+    ("Chart:![Chart](<https://img.example.com/render?id=1>)", "Chart:![Chart]()"),
+    ("Chart:![Chart](https://lh3.googleusercontent.com/gg/abc)", "Chart:![Chart]()"),
+    ("Chart:![Chart](https://files.oaiusercontent.com/file-1?sig=x)", "Chart:![Chart]()"),
+    ("Chart:![Chart](https://img.example.com/q3.PNG)", "Chart:![Chart]()"),
+    ("Chart:![Chart](http://img.example.com/q3.jpg)", "Chart:![Chart]()"),
+    ("Chart:![Chart](sandbox:/mnt/data/chart)", "Chart:![Chart]()"),
+    ("Chart:![Chart](blob:https://chatgpt.com/1234)", "Chart:![Chart]()"),
+    ("Chart:![Chart](ftp://files.example.com/chart)", "Chart:![Chart]()"),
+    ("Chart:![Chart](http://user:pw@img.example.com/chart)", "Chart:![Chart]()"),
+])
+def test_an_image_that_is_never_fetched_is_a_caption_not_a_link(world, monkeypatch, md, expected):
+    """⛔⛔ With no answer to go on, only the markup decides — and every doubt is a
+    caption: a lost citation is a low defect, a platform URL in a share is not."""
+    monkeypatch.setattr(R, "_fresh_user_mode_id_token", lambda: None)
+    assert rehost(md) == expected
+    assert world.fetches == [] and world.posts == []
+
+
+def test_a_page_verdict_is_cached_but_the_link_is_decided_per_occurrence(world):
+    url = "https://news.example.com/article"
+    world.images[url] = R._DocImageRefused("linked", "failed")
+    out = rehost(f"Wow![source]({url}) and\n\n![source]({url})\n")
+    assert out == f"Wow\\![source]({url}) and\n\n![source]()\n"
+    other = "https://news.example.com/other"
+    world.images[other] = R._DocImageRefused("linked", "failed")
+    out = rehost(f"![x]({other})\n\nSo true![y]({other})", "Gemini")
+    assert out == f"![x]()\n\nSo true\\![y]({other})"
+    assert world.fetches == [url, other]
+
+
+# ═══ 20. repair round 2 — an abandoned rehost stores nothing, remembers nothing ═
+#
+# ⛔ The hard stop only stops WAITING: the worker kept going, uploaded an object the
+# captioned document never references (it counts toward the research's 300) and
+# wrote the shared cache under the next document.
+
+def _worker_done(monkeypatch):
+    """Set when the WORKER's rewrite returns — not the fallback pass on the loop."""
+    done = threading.Event()
+    real = R._doc_images_rewrite_sync
+
+    def rewrite(text, run):
+        try:
+            return real(text, run)
+        finally:
+            if threading.current_thread().name.startswith("doc-images"):
+                done.set()
+    monkeypatch.setattr(R, "_doc_images_rewrite_sync", rewrite)
+    return done
+
+
+def _saving_web(monkeypatch, save_sec):
+    """A web that takes `save_sec` to save and SAVES WHATEVER THE CLIENT DOES: a client
+    whose read timeout is shorter gives up (ReadTimeout) and the object is stored
+    anyway — the stranded image a client-side give-up leaves behind."""
+    web = types.SimpleNamespace(stored=[], timeouts=[], closed=0, guards=[])
+
+    class Session:
+        def post(self, url, json=None, timeout=None, **kw):
+            web.timeouts.append(timeout)
+            data = base64.b64decode(json["data_base64"])
+            if timeout[1] < save_sec:
+                time.sleep(max(0.0, timeout[1]))
+                web.stored.append(data)
+                raise requests.ReadTimeout("the web is still saving")
+            time.sleep(save_sec)
+            web.stored.append(data)
+            return FakeWebResponse(200, {"ref": ref_for(data)})
+
+        def close(self):
+            web.closed += 1
+
+    def session(guard):
+        web.guards.append(guard)
+        return Session()
+    monkeypatch.setattr(R, "_doc_img_upload_session", session)
+    return web
+
+
+@pytest.mark.parametrize("arrives", [-0.1, 0.1])
+def test_an_image_fetched_at_the_document_deadline_is_uploaded_and_kept(world, monkeypatch, arrives):
+    """⛔⛔ The upload's timeouts are NOT the time left. Capped at it, a web saving for
+    longer than 0.1 s stored the image while the client gave up: a caption in the
+    document AND an object nothing references. The grace is the upload's."""
+    monkeypatch.setattr(R, "_DOC_IMG_DOC_BUDGET_SEC", 0.5)
+    monkeypatch.setattr(R, "_DOC_IMG_HARD_STOP_GRACE_SEC", 8.0)
+    web = _saving_web(monkeypatch, save_sec=1.0)
+
+    def fetch(url, deadline):
+        time.sleep(max(0.0, deadline - time.monotonic() + arrives))
+        return png()
+    monkeypatch.setattr(R, "_doc_img_fetch", fetch)
+    assert rehost("![Big](https://img.example.com/big.png)") == f"![Big]({ref_for(png())})"
+    assert web.stored == [png()] and web.timeouts == [(5.0, 30.0)]
+    assert not any(level == "WARN" for level, _m in world.logs), world.logs
+    (guard,) = web.guards
+    guard._timer.join(1)
+    assert web.closed == 1 and guard.expired and not guard._timer.is_alive()
+
+
+@pytest.mark.parametrize("grace,started", [(3.0, False), (6.0, False), (7.5, True)])
+def test_an_upload_with_no_time_to_finish_before_the_hard_stop_is_not_started(
+        world, monkeypatch, grace, started):
+    """It must end 2 s before the hard stop and needs 5 s of that: with a 0.2 s budget
+    a 3 s or 6 s grace leaves 1.2 s or 4.2 s — nothing reaches the web, which would
+    have stored it whatever the client did. 7.5 s leaves 5.7 s: the control."""
+    monkeypatch.setattr(R, "_DOC_IMG_DOC_BUDGET_SEC", 0.2)
+    monkeypatch.setattr(R, "_DOC_IMG_HARD_STOP_GRACE_SEC", grace)
+    web = _saving_web(monkeypatch, save_sec=0.05)
+    world.images["https://img.example.com/late.png"] = png()
+    out = rehost("![Late](https://img.example.com/late.png)")
+    assert world.fetches == ["https://img.example.com/late.png"]
+    if started:
+        assert out == f"![Late]({ref_for(png())})" and web.stored == [png()]
+    else:
+        assert out == "![Late]()" and web.stored == [] and web.timeouts == [] and web.guards == []
+        assert world.logs[-1][1].endswith("stored=0 reused=0 dropped=0 refused=0 login=0 failed=1 "
+                                          "linked=0 captioned=1 removed=0")
+        # ⛔ Too little time is the RUN's condition, not the image's: nothing is
+        # remembered, and the next document of the research (a fresh budget) stores it.
+        monkeypatch.setattr(R, "_DOC_IMG_HARD_STOP_GRACE_SEC", 30.0)
+        assert rehost("![Late](https://img.example.com/late.png)") == f"![Late]({ref_for(png())})"
+        assert world.fetches == ["https://img.example.com/late.png"] * 2 and web.stored == [png()]
+
+
+_REAL_UPLOAD_SESSION = R._doc_img_upload_session
+
+
+@contextlib.contextmanager
+def web_server(tmp_path, head, drip, tls, every=0.2, for_sec=6.0):
+    """A local web that RECEIVES the whole upload — stored, as the real web would,
+    whatever the client does next — then answers `head` and drips `drip`."""
+    ctx = cert = None
+    if tls:
+        cert, key = _self_signed(tmp_path)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(str(cert), str(key))
+    lsock = socket.socket()
+    lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    lsock.bind(("127.0.0.1", 0))
+    lsock.listen(4)
+    lsock.settimeout(0.1)
+    stop = threading.Event()
+    stored = []
+
+    def serve():
+        while not stop.is_set():
+            try:
+                raw, _ = lsock.accept()
+            except OSError:
+                continue
+            conn = None
+            try:
+                raw.settimeout(3)
+                conn = ctx.wrap_socket(raw, server_side=True) if ctx else raw
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        raise OSError("closed before the headers")
+                    buf += chunk
+                headers, _, body = buf.partition(b"\r\n\r\n")
+                length = int(re.search(rb"(?im)^content-length:\s*(\d+)", headers).group(1))
+                while len(body) < length:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        raise OSError("closed before the body")
+                    body += chunk
+                stored.append(body)
+                conn.sendall(head)
+                until = time.monotonic() + for_sec
+                while not stop.is_set() and time.monotonic() < until:
+                    conn.sendall(drip)
+                    stop.wait(every)
+            except (OSError, ssl.SSLError):
+                pass
+            finally:
+                (conn or raw).close()
+
+    th = threading.Thread(target=serve, daemon=True)
+    th.start()
+    try:
+        yield cert, lsock.getsockname()[1], stored
+    finally:
+        stop.set()
+        th.join(5)
+        lsock.close()
+
+
+@pytest.mark.parametrize("tls", [True, False])
+def test_an_upload_answered_a_byte_at_a_time_ends_before_the_hard_stop(world, tmp_path, monkeypatch, tls):
+    """⛔⛔ A socket timeout bounds ONE receive: a web answering a byte every 0.2 s held
+    the upload past the hard stop, and it stored an image the captioned document
+    never references. The REAL upload session and guard, against a real local web
+    (https as in production, http as in development)."""
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(R, "_DOC_IMG_DOC_BUDGET_SEC", 0.2)
+    monkeypatch.setattr(R, "_DOC_IMG_HARD_STOP_GRACE_SEC", 2.0)
+    monkeypatch.setattr(R, "_DOC_IMG_UPLOAD_MARGIN_SEC", 0.8)
+    monkeypatch.setattr(R, "_DOC_IMG_UPLOAD_MIN_SEC", 0.5)
+    made = _spy_deadlines(monkeypatch)
+    url = "https://img.example.com/big.png"
+    world.images[url] = png()
+    with web_server(tmp_path, b"HTTP/1.1 200 OK\r\nX-Slow: ", b"a", tls) as (cert, port, stored):
+        def session(guard):
+            s = _REAL_UPLOAD_SESSION(guard)
+            if cert:
+                s.verify = str(cert)
+            return s
+        monkeypatch.setattr(R, "_doc_img_upload_session", session)
+        monkeypatch.setattr("auth.v2_flow.FE_BASE_URL", f"{'https' if tls else 'http'}://localhost:{port}")
+        t0 = time.monotonic()
+        out = rehost(f"![Big]({url})")
+        elapsed = time.monotonic() - t0
+    assert len(stored) == 1, "the upload never reached the local web — the test measured nothing"
+    assert out == "![Big]()"
+    # It ends at 0.2 + 2.0 - 0.8 = 1.4 s, while the funnel still waits (hard stop 2.2 s).
+    assert 1.2 <= elapsed < 2.0, elapsed
+    assert not any(level == "WARN" for level, _m in world.logs), world.logs
+    (guard,) = made
+    assert guard.expired and guard._socks == []
+
+
+@pytest.mark.parametrize("comes_back", ["an image", "a refusal"])
+def test_after_the_hard_stop_the_abandoned_worker_uploads_nothing_and_remembers_nothing(
+        world, monkeypatch, comes_back):
+    """⛔ The fetch comes back WHILE the fallback pass runs — the pass that reads the
+    same cache — so a stop marked only after that pass is caught too."""
+    monkeypatch.setattr(R, "_DOC_IMG_DOC_BUDGET_SEC", 0.2)
+    monkeypatch.setattr(R, "_DOC_IMG_HARD_STOP_GRACE_SEC", 0.1)
+    # The upload's time rule off, so only the stop mark can refuse the upload.
+    monkeypatch.setattr(R, "_DOC_IMG_UPLOAD_MARGIN_SEC", -30.0)
+    monkeypatch.setattr(R, "_DOC_IMG_UPLOAD_MIN_SEC", 0.0)
+    done, release = threading.Event(), threading.Event()
+    real = R._doc_images_rewrite_sync
+
+    def rewrite(text, run):
+        worker = threading.current_thread().name.startswith("doc-images")
+        if not worker:
+            release.set()
+            assert done.wait(5), "the abandoned worker never finished"
+        try:
+            return real(text, run)
+        finally:
+            if worker:
+                done.set()
+    monkeypatch.setattr(R, "_doc_images_rewrite_sync", rewrite)
+
+    def fetch(url, deadline):
+        release.wait(5)
+        if comes_back == "a refusal":
+            # No upload to refuse: only the stop check before the cache write stands.
+            raise R._DocImageRefused("failed")
+        return png()
+    monkeypatch.setattr(R, "_doc_img_fetch", fetch)
+    url = "https://img.example.com/stuck.png"
+    try:
+        assert rehost(f"![Stuck]({url})") == "![Stuck]()"
+    finally:
+        release.set()
+    assert done.wait(5)
+    assert any(level == "WARN" and "TimeoutError" in msg for level, msg in world.logs)
+    assert world.posts == []
+    assert url not in R._doc_img_cache.get(f"{UID}\x00{RID}", {})
+
+
+def test_a_cancelled_rehost_stops_its_worker_before_the_upload_and_the_next_fetch(world, monkeypatch):
+    """⛔ A cancelled task ends the wait long before any deadline: only the stop mark
+    keeps its worker from uploading, fetching on and writing the cache."""
+    done = _worker_done(monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+    fetched = []
+
+    def fetch(url, deadline):
+        fetched.append(url)
+        entered.set()
+        release.wait(5)
+        return png(100 + len(fetched))
+    monkeypatch.setattr(R, "_doc_img_fetch", fetch)
+    a, b = "https://img.example.com/a.png", "https://img.example.com/b.png"
+
+    async def main():
+        task = asyncio.create_task(R._rehost_document_images(f"![A]({a}) ![B]({b})", "ChatGPT"))
+        for _ in range(500):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            return "cancelled"
+        return "finished"
+    try:
+        assert asyncio.run(main()) == "cancelled"
+    finally:
+        release.set()
+    assert done.wait(5)
+    assert fetched == [a] and world.posts == []
+    assert R._doc_img_cache.get(f"{UID}\x00{RID}", {}) == {}

@@ -44383,6 +44383,13 @@ _DOC_IMG_DOC_BUDGET_SEC = 120.0
 # receive only; see `_DocImgDeadline`.
 _DOC_IMG_PER_IMAGE_SEC = 30.0
 _DOC_IMG_HARD_STOP_GRACE_SEC = 30.0
+# ⛔⛔ An upload is the tail of an image already fetched: it lives in the grace, and
+# its WHOLE request ends `_DOC_IMG_UPLOAD_MARGIN_SEC` before the hard stop, while the
+# funnel still waits for the answer. It does not start with less than
+# `_DOC_IMG_UPLOAD_MIN_SEC` of that left. Its socket timeouts are NOT the time left:
+# a client that gives up while the web is still saving strands a stored image.
+_DOC_IMG_UPLOAD_MIN_SEC = 5.0
+_DOC_IMG_UPLOAD_MARGIN_SEC = 2.0
 _DOC_IMG_WORKERS = 1
 # Synchronous signals a rehost thread must never block (see `_doc_img_block_signals`).
 _DOC_IMG_FAULT_SIGNALS = ("SIGSEGV", "SIGBUS", "SIGFPE", "SIGILL", "SIGABRT", "SIGTRAP", "SIGSYS")
@@ -44391,7 +44398,7 @@ _DOC_IMG_CACHE_RUNS = 8
 _DOC_IMG_CACHE_PER_RUN = 600
 # Every image found lands in exactly one of stored · reused · dropped · refused ·
 # login (the host answered 401/403 — an image only a signed-in reader sees) ·
-# failed · linked (the destination is a web page, written back as a link). Then
+# failed · linked (a citation after "!", written back as a link). Then
 # captioned / removed say what became of the ones not kept and not linked.
 _DOC_IMG_STAT_KEYS = ("found", "stored", "reused", "dropped", "refused", "login", "failed",
                       "linked", "captioned", "removed")
@@ -44443,19 +44450,28 @@ _doc_img_decorative_pending = 0
 # rehosted one at a time (every funnel awaits), so no lock.
 _doc_img_cache: "collections.OrderedDict" = collections.OrderedDict()
 _DOC_IMG_MISS = object()
-# A destination that answered with a web page: cached like a failure, written back
-# as a link. ⛔ Truthy — test it by identity before any `if ref:`.
+# A destination that answered with a web page, or a citation never fetched: cached
+# (the page verdict only), written back as a link only where the markup is a
+# citation (`_doc_img_citation_shaped`). ⛔ Truthy — test it by identity before any
+# `if ref:`.
 _DOC_IMG_LINKED = object()
+# Image hosts of the platforms themselves that `_is_platform_host` does not list
+# (it names product surfaces, and it also feeds findings). A VETO on writing a link.
+_DOC_IMG_PLATFORM_IMAGE_HOSTS = ("googleusercontent.com", "ggpht.com", "gstatic.com")
+_DOC_IMG_IMAGE_PATH_RE = re.compile(r"\.(?:png|jpe?g|gif|webp|avif|bmp|svg|ico|tiff?|heic)\Z", re.I)
 
 
 class _DocImageRefused(Exception):
     """An image that will not be kept. `kind` is the stats bucket it lands in:
     "refused" (a URL or address rule), "dropped" (too small) or "failed".
+    "linked" — the destination answered a web page — carries `fallback`: the bucket
+    it lands in when its markup is not a citation (`_doc_img_citation_shaped`).
     ⛔ Carries no URL — its message is only ever the bucket name."""
 
-    def __init__(self, kind: str):
+    def __init__(self, kind: str, fallback: str = ""):
         super().__init__(kind)
         self.kind = kind
+        self.fallback = fallback or kind
 
 
 class _DocImageRun:
@@ -44472,6 +44488,12 @@ class _DocImageRun:
         self.token_checked = False
         self.cache_key = f"{self.uid}\x00{self.rid}"
         self.stats = dict.fromkeys(_DOC_IMG_STAT_KEYS, 0)
+        # ⛔ Set by the funnel the moment it stops waiting for this run — the hard
+        # stop, an error, a cancelled task. Ends: never; the run is this document's
+        # and dies with its worker. Read by: that worker only — before a fetch,
+        # before the upload and before a cache write, so an abandoned rehost stores
+        # nothing and remembers nothing. The fallback pass gets a fresh run.
+        self.stopped = False
 
 
 def _doc_img_is_favicon_service(src: str) -> bool:
@@ -44731,9 +44753,11 @@ class _DocImgDeadline:
     ⭐ It shuts a DUP of each socket: TLS detaches the socket urllib3 connected, and
     `shutdown` acts on the connection, not on one descriptor.
 
-    Ends: `close()` in `_doc_img_fetch`'s finally cancels the timer and closes every
-    dup; from then on (and from the deadline on) a new connection is refused.
-    Read by: this image's own connections only — the session is per image."""
+    Ends: `close()` in `_doc_img_fetch`'s (or `_doc_img_upload`'s) finally cancels
+    the timer and closes every dup; from then on (and from the deadline on) a new
+    connection is refused.
+    Read by: the connections of the one fetch or the one upload that made it — each
+    makes its own guard and its own session."""
 
     def __init__(self, deadline: float):
         self.deadline = deadline
@@ -44829,6 +44853,50 @@ def _doc_img_session(guard: "_DocImgDeadline"):
     return session
 
 
+def _doc_img_upload_session(guard: "_DocImgDeadline"):
+    """A session for ONE upload whose every direct connection, http or https, is
+    handed to `guard`, so the whole request ends at the guard's end.
+
+    ⛔ No peer check: the destination is the web, a local address in development.
+    Otherwise the session `requests.post` used (the environment's proxies too);
+    through a proxy the connection is the proxy manager's and only the socket
+    timeouts bound it."""
+    import requests
+    import urllib3.connection as _u3c
+    import urllib3.connectionpool as _u3p
+    from requests.adapters import HTTPAdapter
+
+    class _WatchedHTTPConnection(_u3c.HTTPConnection):
+        def _new_conn(self):
+            sock = super()._new_conn()
+            guard.watch(sock)
+            return sock
+
+    class _WatchedHTTPSConnection(_u3c.HTTPSConnection):
+        def _new_conn(self):
+            sock = super()._new_conn()
+            guard.watch(sock)
+            return sock
+
+    class _WatchedHTTPPool(_u3p.HTTPConnectionPool):
+        ConnectionCls = _WatchedHTTPConnection
+
+    class _WatchedHTTPSPool(_u3p.HTTPSConnectionPool):
+        ConnectionCls = _WatchedHTTPSConnection
+
+    class _WatchedAdapter(HTTPAdapter):
+        def init_poolmanager(self, *args, **kwargs):
+            super().init_poolmanager(*args, **kwargs)
+            self.poolmanager.pool_classes_by_scheme = {
+                **self.poolmanager.pool_classes_by_scheme,
+                "http": _WatchedHTTPPool, "https": _WatchedHTTPSPool}
+
+    session = requests.Session()
+    session.mount("https://", _WatchedAdapter())
+    session.mount("http://", _WatchedAdapter())
+    return session
+
+
 def _doc_img_read_capped(resp, deadline: float) -> bytes:
     declared = str(resp.headers.get("Content-Length") or "").strip()
     if declared.isdigit() and int(declared) > _DOC_IMG_MAX_BYTES:
@@ -44858,10 +44926,11 @@ def _doc_img_fetch(url: str, deadline: float) -> bytes:
     hand, at most three, and every hop is checked exactly like the first. The
     whole fetch ends at `deadline` (`_DocImgDeadline`).
 
-    Refusal kinds of its own: "login" for 401/403, and "linked" for a 200 web page
-    whose bytes are not a raster — `everything![source](https://news…)` is a
-    citation after an exclamation mark, not an image. ⛔ Not SVG or any other
-    non-raster image: those are captions, as the contract says."""
+    Refusal kinds of its own: "login" for 401/403, and "linked" for a web page —
+    any status; at 200 only when its bytes are not a raster —
+    `everything![source](https://news…)` is a citation after an exclamation mark,
+    not an image. ⛔ Not SVG or any other non-raster image: those are captions, as
+    the contract says."""
     from urllib.parse import urljoin
     guard = _DocImgDeadline(deadline)
     session = _doc_img_session(guard)
@@ -44880,10 +44949,16 @@ def _doc_img_fetch(url: str, deadline: float) -> bytes:
                         raise _DocImageRefused("failed")
                     url = urljoin(url, location)
                     continue
-                if resp.status_code in (401, 403):
-                    raise _DocImageRefused("login")
                 if resp.status_code != 200:
-                    raise _DocImageRefused("failed")
+                    # ⭐ A web page is a web page whatever its status: a news site
+                    # answering this plain client with 403, 404 or 5xx is still the
+                    # citation's page. Whether it is WRITTEN as a link is the
+                    # markup's call (`_doc_img_citation_shaped`); if not, it lands
+                    # where it always did. An error body is never read.
+                    bucket = "login" if resp.status_code in (401, 403) else "failed"
+                    if _doc_img_is_page(resp):
+                        raise _DocImageRefused("linked", bucket)
+                    raise _DocImageRefused(bucket)
                 data = _doc_img_read_capped(resp, deadline)
                 # ⛔ The timer can land between the loop's deadline check and the
                 # next read, which then sees EOF: a truncated image with a
@@ -44891,7 +44966,7 @@ def _doc_img_fetch(url: str, deadline: float) -> bytes:
                 if guard.expired:
                     raise _DocImageRefused("failed")
                 if _doc_img_sniff_ext(data) is None and _doc_img_is_page(resp):
-                    raise _DocImageRefused("linked")
+                    raise _DocImageRefused("linked", "failed")
                 return data
             finally:
                 resp.close()
@@ -44901,22 +44976,41 @@ def _doc_img_fetch(url: str, deadline: float) -> bytes:
         session.close()
 
 
-def _doc_img_upload(data: bytes, ext: str, run: "_DocImageRun") -> "str | None":
+def _doc_img_upload(data: bytes, ext: str, run: "_DocImageRun"):
     """Hand the bytes to the web. The reference comes back from the web and is
-    accepted only if it names THIS research and THESE bytes."""
-    import requests
+    accepted only if it names THIS research and THESE bytes. None when the web did
+    not give one; `_DOC_IMG_MISS` when the upload was never started (the run
+    stopped, or too little time) — the run's condition, never remembered."""
     from auth.v2_flow import FE_BASE_URL as _FE_BASE_URL
-    resp = requests.post(
-        f"{_FE_BASE_URL}/api/document-images",
-        headers={"Authorization": f"Bearer {run.token}"},
-        json={"ownerUid": run.uid, "research_id": run.rid,
-              "data_base64": base64.b64encode(data).decode("ascii")},
-        timeout=(5.0, 30.0),
-        allow_redirects=False,
-    )
-    if resp.status_code != 200:
-        return None
-    body = resp.json()
+    # ⛔ Never for an abandoned rehost: the object would count toward the research's
+    # cap and nothing would reference it.
+    # ⛔⛔ And only while the funnel still waits for the answer. The whole request —
+    # connect, body, answer — ends at `end` (`_DocImgDeadline`; a socket timeout
+    # bounds one receive, not the request), and an upload with too little of that
+    # left is not started. ⛔ The timeouts stay realistic: capped at the time left, a
+    # web saving for longer than that turned a kept image into a caption AND a stored
+    # object nothing references.
+    end = run.deadline + _DOC_IMG_HARD_STOP_GRACE_SEC - _DOC_IMG_UPLOAD_MARGIN_SEC
+    if run.stopped or end - time.monotonic() < _DOC_IMG_UPLOAD_MIN_SEC:
+        return _DOC_IMG_MISS
+    guard = _DocImgDeadline(end)
+    session = _doc_img_upload_session(guard)
+    guard.start()
+    try:
+        resp = session.post(
+            f"{_FE_BASE_URL}/api/document-images",
+            headers={"Authorization": f"Bearer {run.token}"},
+            json={"ownerUid": run.uid, "research_id": run.rid,
+                  "data_base64": base64.b64encode(data).decode("ascii")},
+            timeout=(5.0, 30.0),
+            allow_redirects=False,
+        )
+        if resp.status_code != 200:
+            return None
+        body = resp.json()
+    finally:
+        guard.close()
+        session.close()
     ref = body.get("ref") if isinstance(body, dict) else None
     m = _DOC_IMG_REF_RE.match(ref) if isinstance(ref, str) else None
     if (not m or m.group(1) != run.rid
@@ -44943,9 +45037,50 @@ def _doc_img_cache_put(run: "_DocImageRun", key: str, ref) -> None:
         bucket.popitem(last=False)
 
 
-def _doc_img_resolve_src(src: str, run: "_DocImageRun"):
+def _doc_img_citation_shaped(text: str, bang: int, dest: str, angled: bool) -> bool:
+    """Could `![label](dest)` starting at `bang` be a CITATION after an exclamation
+    mark — `rose 40%![Reuters](https://…)` — rather than an image?
+
+    ⛔⛔ WHY THE MARKUP AND NOT ONLY THE ANSWER. Google's image host answers an id it
+    will not serve with `400 text/html` (measured 2026-09-14): "any HTML answer is a
+    link" would write an unfetchable Gemini chart back into the share as a live
+    platform URL. And an address never fetched (http, no token, the cap or the
+    budget spent) has no answer at all. So a link also needs a citation's shape:
+      · not in angle brackets — the converter writes every `<img>` that way, and an
+        `<img>` is an image, never a citation;
+      · glued to what comes before — an image starts the text or a line, follows a
+        space, opens a link, a parenthesis or a table cell (`[`, `(`, `|`, `<`,
+        `>`), or follows code (the mask's NUL: a fence ends with its newline);
+      · http or https with a host, no credentials, not a platform's own host;
+      · no image extension on the path.
+    Every doubt is a caption: a lost citation is a low defect, a platform URL in a
+    permanent share breaks the contract."""
+    if angled or bang <= 0:
+        return False
+    prev = text[bang - 1]
+    if prev.isspace() or prev in "[(|<>\x00":
+        return False
+    try:
+        parts = urlsplit((dest or "").strip())
+    except ValueError:
+        return False
+    host = (parts.hostname or "").lower()
+    if parts.scheme.lower() not in ("https", "http") or not host:
+        return False
+    if parts.username is not None or parts.password is not None:
+        return False
+    if _is_platform_host(host) or any(host == h or host.endswith("." + h)
+                                      for h in _DOC_IMG_PLATFORM_IMAGE_HOSTS):
+        return False
+    return not _DOC_IMG_IMAGE_PATH_RE.search(parts.path)
+
+
+def _doc_img_resolve_src(src: str, run: "_DocImageRun", may_link: bool = False):
     """The reference for one image source, None when it is not kept, or
-    `_DOC_IMG_LINKED` when the destination is a web page."""
+    `_DOC_IMG_LINKED` when it is written back as a link — only when `may_link` (the
+    markup is citation-shaped) and the destination answered a web page or was never
+    fetched. The page verdict is the DESTINATION's and is cached; the link is each
+    occurrence's own."""
     src = (src or "").strip()
     if not src:
         return None
@@ -44956,21 +45091,33 @@ def _doc_img_resolve_src(src: str, run: "_DocImageRun"):
             return src
         run.stats["failed"] += 1
         return None
-    if not (run.uid and run.rid):
-        run.stats["failed"] += 1
+
+    def _not_fetched(bucket: str):
+        # No answer to go on: the markup alone decides.
+        if may_link:
+            run.stats["linked"] += 1
+            return _DOC_IMG_LINKED
+        run.stats[bucket] += 1
         return None
+
+    if not (run.uid and run.rid):
+        return _not_fetched("failed")
     is_data = src[:5].lower() == "data:"
     if not is_data and len(src) > _DOC_IMG_MAX_URL_CHARS:
         run.stats["refused"] += 1
         return None
+    if src[:5].lower() == "http:":
+        # The URL rules refuse it anyway; decided here, with no fetch and no attempt.
+        return _not_fetched("refused")
     key = "data:" + hashlib.sha256(src.encode("utf-8", "surrogatepass")).hexdigest() if is_data else src
     hit = _doc_img_cache_get(run, key)
     if hit is not _DOC_IMG_MISS:
+        if hit is _DOC_IMG_LINKED and not may_link:
+            hit = None
         run.stats["linked" if hit is _DOC_IMG_LINKED else "reused" if hit else "failed"] += 1
         return hit
-    if run.attempts >= _DOC_IMG_MAX_PER_DOC or time.monotonic() >= run.deadline:
-        run.stats["failed"] += 1
-        return None
+    if run.stopped or run.attempts >= _DOC_IMG_MAX_PER_DOC or time.monotonic() >= run.deadline:
+        return _not_fetched("failed")
     if not run.token_checked:
         run.token_checked = True
         try:
@@ -44978,23 +45125,33 @@ def _doc_img_resolve_src(src: str, run: "_DocImageRun"):
         except Exception:
             run.token = None
     if not run.token:
-        run.stats["failed"] += 1
-        return None
+        return _not_fetched("failed")
     run.attempts += 1
-    ref = None
+    ref = cached = None
     try:
         data = (_doc_img_decode_data_uri(src) if is_data else
                 _doc_img_fetch(src, min(run.deadline, time.monotonic() + _DOC_IMG_PER_IMAGE_SEC)))
         ext = _doc_img_check_bytes(data)
-        ref = _doc_img_upload(data, ext, run)
+        ref = cached = _doc_img_upload(data, ext, run)
+        if ref is _DOC_IMG_MISS:
+            # ⛔ Not started — the run stopped, or too little time before the hard
+            # stop. The RUN's condition, not the image's: counted, never remembered,
+            # so the next document of the research (a fresh budget) tries again.
+            run.stats["failed"] += 1
+            return None
         run.stats["stored" if ref else "failed"] += 1
     except _DocImageRefused as refusal:
         if refusal.kind == "linked":
-            ref = _DOC_IMG_LINKED
-        run.stats[refusal.kind] += 1
+            cached = _DOC_IMG_LINKED
+            if may_link:
+                ref = _DOC_IMG_LINKED
+        run.stats["linked" if ref is _DOC_IMG_LINKED else refusal.fallback] += 1
     except Exception:
         run.stats["failed"] += 1
-    _doc_img_cache_put(run, key, ref)
+    # ⛔ An abandoned rehost remembers nothing: the next document reads this cache.
+    if run.stopped:
+        return None
+    _doc_img_cache_put(run, key, cached)
     return ref
 
 
@@ -45127,13 +45284,30 @@ def _doc_images_rewrite_sync(text: str, run: "_DocImageRun") -> str:
 
     defs: dict = {}
     for m in _DOC_IMG_DEF_RE.finditer(text):
+        # (destination, written in angle brackets)
         defs.setdefault(_doc_img_label_key(m.group("label")),
-                        m.group("adest") if m.group("adest") is not None else m.group("dest"))
+                        (m.group("adest"), True) if m.group("adest") is not None
+                        else (m.group("dest"), False))
     used: set = set()
+    # ⛔ Every image written is a SLOT until the link pass has read it: `slots[i]` is
+    # (what it became — a reference, a caption, "" when removed — and its source).
+    # A removed image leaves no text, so only its slot says it sat inside a link.
+    # The tag carries a per-pass nonce, so no document text can pose as one.
+    # Ends: filled right after `_doc_img_unwrap_self_links`, before anything else
+    # reads the text. Read by: the leftover pass (a slot has no bracket, parenthesis
+    # or newline, so it cuts nothing) and the link pass.
+    slot_tag = f"{os.urandom(6).hex()}:"
+    slot_re = re.compile(re.escape(slot_tag) + r"(\d+)")
+    slots: list = []
+
+    def _slot(out: str, src: str) -> str:
+        slots.append((out, src.strip()))
+        return f"{slot_tag}{len(slots) - 1}"
 
     def _image(m):
         if m.group("inline") is not None:
-            src = m.group("adest") if m.group("adest") is not None else (m.group("dest") or "")
+            angled = m.group("adest") is not None
+            src = m.group("adest") if angled else (m.group("dest") or "")
             key = None
         else:
             # `![c](dest the pattern cannot parse)` — the leftover pass below captions it.
@@ -45147,10 +45321,10 @@ def _doc_images_rewrite_sync(text: str, run: "_DocImageRun") -> str:
             key = _doc_img_label_key(m.group("label") or m.group("alt"))
             if key not in defs:
                 return m.group(0)
-            src = defs[key]
+            src, angled = defs[key]
         alt = " ".join(m.group("alt").split())
         run.stats["found"] += 1
-        ref = _doc_img_resolve_src(src, run)
+        ref = _doc_img_resolve_src(src, run, _doc_img_citation_shaped(m.string, m.start(), src, angled))
         if ref is _DOC_IMG_LINKED:
             # The `!` stays as text and the link stays a link. Escaped, so a later
             # pass over this text never sees an image here again.
@@ -45158,15 +45332,17 @@ def _doc_images_rewrite_sync(text: str, run: "_DocImageRun") -> str:
         if key is not None:
             used.add(key)
         if ref:
-            return f"![{alt}]({ref})"
+            return _slot(f"![{alt}]({ref})", src)
         if alt:
             run.stats["captioned"] += 1
-            return f"![{alt}]()"
+            return _slot(f"![{alt}]()", src)
         run.stats["removed"] += 1
-        return ""
+        return _slot("", src)
 
     text = _DOC_IMG_MD_RE.sub(_image, text)
     text = _doc_img_blank_leftovers(text, run)
+    text = _doc_img_unwrap_self_links(text, slot_re, slots)
+    text = slot_re.sub(lambda s: slots[int(s.group(1))][0], text)
     linked = _doc_img_link_ref_labels(text)
 
     def _definition(m):
@@ -45179,6 +45355,42 @@ def _doc_images_rewrite_sync(text: str, run: "_DocImageRun") -> str:
         return m.group(0)
 
     return unmask(_DOC_IMG_DEF_RE.sub(_definition, text))
+
+
+# A link around an image: `[![alt](src)](href "title")`. The text may hold more than
+# the image, and brackets three deep (an alt with `[1]` inside a link's text).
+_DOC_IMG_WRAP_RE = re.compile(
+    r"(?<![\\!])\[(?P<text>(?:\\.|[^\[\]\\]|\[(?:\\.|[^\[\]\\]|\[(?:\\.|[^\[\]\\])*+\])*+\]){0,4000}+)\]"
+    r"\([ \t\n]*(?:<(?P<ahref>[^<>\n]*)>|(?P<href>(?:[^\s()\\]|\\.|\((?:[^\s()\\]|\\.)*+\))*+))"
+    r"(?:[ \t\n]+(?:\"(?:[^\"\\]|\\.)*+\"|'(?:[^'\\]|\\.)*+'|\((?:[^()\\]|\\.)*+\)))?[ \t\n]*\)")
+
+
+def _doc_img_unwrap_self_links(text: str, slot_re, slots: list) -> str:
+    """Every link around an image that points at that image — or at an address
+    nobody can open — dropped, the image kept.
+
+    ⛔ A capture wraps a chart in a click-to-enlarge anchor, `<a href=S><img src=S>`.
+    The converter writes `[![Chart](<S>)](S)` and the image pass rewrites only the
+    inner image, so the saved document, the report and every share kept S — a
+    signed platform URL — as the link. A link goes when its target is the ORIGINAL
+    source of an image written inside it, or a data:, blob: or sandbox: address.
+    ⭐ Only a link AROUND that image: a link to a different page (the article the
+    chart came from) stays, and so does the same address cited elsewhere.
+    ⛔ Which images sit inside a link is read from their SLOTS (`slots[i]` = what the
+    image became, its source), never guessed from the link's text: a removed image
+    leaves none, and `[![](<S>) View full size](S)` kept S once the words remained."""
+    if not slots:
+        return text
+
+    def _link(m):
+        href = (m.group("ahref") if m.group("ahref") is not None else m.group("href")).strip()
+        inner = m.group("text")
+        sources = {slots[int(i)][1] for i in slot_re.findall(inner)}
+        if sources and (href in sources or href.lower().startswith(("data:", "blob:", "sandbox:"))):
+            return inner
+        return m.group(0)
+
+    return _DOC_IMG_WRAP_RE.sub(_link, text)
 
 
 def _doc_img_leftover_close(text: str, start: int) -> int:
@@ -45305,7 +45517,13 @@ async def _rehost_document_images(text: str, label: str = "document") -> str:
             asyncio.get_running_loop().run_in_executor(
                 pool, ctx.run, _doc_images_rewrite_sync, text, run),
             timeout=_DOC_IMG_DOC_BUDGET_SEC + _DOC_IMG_HARD_STOP_GRACE_SEC)
-    except Exception as e:
+    except BaseException as e:
+        # ⛔⛔ Whatever ended the wait — the hard stop, an error, a cancelled task —
+        # the worker may still be inside a fetch or an upload. Marked BEFORE the
+        # fallback pass reads the cache: from here it stores and remembers nothing.
+        run.stopped = True
+        if not isinstance(e, Exception):
+            raise
         log(f"[{label}] document images: rehost stopped ({type(e).__name__}) — "
             "images not yet stored are captions", "WARN")
         run = _DocImageRun(uid, rid, label, 0.0)
