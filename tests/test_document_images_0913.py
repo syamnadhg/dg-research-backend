@@ -1497,6 +1497,33 @@ def test_a_rehost_thread_takes_no_signal_and_ends_with_its_document(world):
         signal.signal(signal.SIGUSR1, old_handler)
 
 
+def test_the_pool_is_shut_down_by_the_funnel_and_not_by_the_collector(world, monkeypatch):
+    """⛔⛔ `pool.shutdown` in the funnel's `finally` — never a dropped reference.
+
+    The executor's OWN weakref hides a missing shutdown: while nothing else holds
+    the pool, CPython frees it the moment the funnel returns and the callback ends
+    the worker anyway, so the test above passes either way. Anything that keeps the
+    frame alive keeps the pool alive with it — a profiler, a debugger, a traceback
+    held for a log line, any non-refcounted runtime — and then the idle thread lives
+    on with the process's signals to take. So the pool is HELD here, the way such a
+    reader holds it, and the shutdown is read where it is public and needs no
+    collector: a shut-down executor refuses new work, and its worker still ends."""
+    world.images["https://img.example.com/a.png"] = png()
+    pools = []
+    real = R._doc_img_executor
+    monkeypatch.setattr(R, "_doc_img_executor", lambda: pools.append(real()) or pools[-1])
+    assert rehost("![a](https://img.example.com/a.png)") == f"![a]({ref_for(png())})"
+    assert len(pools) == 1
+    try:
+        with pytest.raises(RuntimeError):
+            pools[0].submit(lambda: None)
+        for t in _doc_image_threads():
+            t.join(3)
+        assert _doc_image_threads() == []
+    finally:
+        pools[0].shutdown(wait=False)
+
+
 # ═══ 13. repair round 1 — login-only images, the user agent ═════════════════════
 
 @pytest.mark.parametrize("status", [401, 403])
@@ -1716,6 +1743,42 @@ def test_a_reference_image_followed_by_a_parenthesis_resolves_through_its_defini
     out = rehost(f"see {image}{tail} here\n\n[{label}]: {url}\n")
     assert out == f"see ![fig]({ref_for(png())}){tail} here\n\n"
     assert world.fetches == [url]
+
+
+@pytest.mark.parametrize("gap", ["\xa0", "\r", "\x0b", "\x0c"], ids=["nbsp", "cr", "vt", "ff"])
+def test_a_stored_reference_reaches_the_leftover_pass_and_survives_it(world, gap):
+    """⛔ A FINISHED IMAGE THAT REACHES THE LEFTOVER PASS IS LEFT ALONE — end to end.
+
+    The pass captions whatever sits between the parentheses the main pattern could
+    not parse, and a stored `/document-images/…` reference DOES arrive there: one
+    whitespace character the main pattern will not accept between the reference and
+    its `)` — a non-breaking space out of an HTML capture, a stray CR — drops the
+    image out of the main pass, and `.strip()` then hands THIS pass the bare
+    reference. Blanked, the image is a caption in the saved document and the stored
+    object is orphaned while the research's 300 still counts it."""
+    ref = ref_for(png())
+    text = f"Kept ![Chart]({ref}{gap}) end"
+    assert rehost(text) == text
+    assert world.fetches == [] and world.posts == []
+
+
+def test_the_leftover_pass_leaves_a_finished_document_alone():
+    """⛔ THE SAME CHECK AT THE PASS ITSELF — a stored reference, and a caption the
+    last save wrote, handed to it directly.
+
+    ⭐ Both ends are pinned because the funnel reaches this only through the odd
+    whitespace above: the main pattern hides everything IT writes in slots until
+    after this pass, so a plain `![c](/document-images/…)` cannot arrive here today.
+    That is what the check buys — it is the ONE thing standing between every stored
+    image and a caption the day the passes are reordered (the link pass leaves
+    leftovers of its own), and nothing else would go red first."""
+    run = R._DocImageRun(UID, RID, "ChatGPT", 120.0)
+    ref = ref_for(png())
+    text = (f"Stored ![Chart]({ref}) then ![Gone]() and a plain [link](https://x/y) "
+            f"with [![Logo]({ref})](https://example.org/src) end")
+    assert R._doc_img_blank_leftovers(text, run) == text
+    assert run.stats["found"] == 0 and run.stats["captioned"] == 0
+    assert run.stats["refused"] == 0 and run.stats["removed"] == 0
 
 
 def test_a_shortcut_image_inside_a_parenthetical_still_resolves(world):
@@ -2326,6 +2389,55 @@ def test_a_cancelled_rehost_stops_its_worker_before_the_upload_and_the_next_fetc
     assert done.wait(5)
     assert fetched == [a] and world.posts == []
     assert R._doc_img_cache.get(f"{UID}\x00{RID}", {}) == {}
+
+
+def test_an_abandoned_workers_own_failure_is_never_remembered(world, monkeypatch):
+    """⛔ The cut-off rule covers a fetch that ran out THIS document's budget — it
+    reads the deadline. A cancel (a Stop, a gate-wait, the pipeline torn down) ends
+    the wait with the whole budget still on the clock, and the fetch the cancel then
+    breaks fails for the MOMENT. Remembered, that chart is a caption in every later
+    document of the research, each with a budget of its own. The stop mark before
+    the cache write is the only thing that stops it: the upload's own refusal never
+    gets that far (it returns before the write), and neither does the deadline's.
+
+    ⭐ The next document is run for real here — the cache is not the point, being
+    fetched again is."""
+    done = _worker_done(monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+    fake_web_fetch = R._doc_img_fetch
+    url = "https://img.example.com/a.png"
+
+    def fetch(u, deadline):
+        entered.set()
+        release.wait(5)
+        # What a torn-down connection raises — the "failed" bucket, mid-read.
+        raise R._DocImageRefused("failed")
+    monkeypatch.setattr(R, "_doc_img_fetch", fetch)
+
+    async def main():
+        task = asyncio.create_task(R._rehost_document_images(f"![A]({url})", "ChatGPT"))
+        for _ in range(3000):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        # ⛔ Loudly on the SETUP, never as a puzzle later: a cancel before the pool
+        # picked the job up drops the future, no worker ever runs, and the waits
+        # below would fail for a reason that has nothing to do with the rule.
+        assert entered.is_set(), "the worker never entered the fetch"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    try:
+        asyncio.run(main())
+    finally:
+        release.set()
+    assert done.wait(5), "the abandoned worker never finished"
+    assert R._doc_img_cache.get(f"{UID}\x00{RID}", {}) == {}
+    # The document after it — its own budget — fetches the image and stores it.
+    monkeypatch.setattr(R, "_doc_img_fetch", fake_web_fetch)
+    world.images[url] = png()
+    assert rehost(f"![A]({url})") == f"![A]({ref_for(png())})"
+    assert world.fetches == [url]
 
 
 # ═══ 21. repair round 3 (2026-09-14) — a Stop writes the document at once ══════
@@ -3117,15 +3229,44 @@ def test_a_skipped_phase_1_brief_is_rehosted_and_the_runs_brief_md_rewritten(wor
     assert local.read_text(encoding="utf-8") == f"# Research Brief\n\n{want}"
 
 
-def test_the_owners_own_brief_file_is_never_rewritten_and_no_brief_md_is_made(world, tmp_path):
+def test_the_owners_own_brief_file_is_never_rewritten_and_no_brief_md_is_made(
+        world, tmp_path, monkeypatch):
+    """⛔ The run's brief.md is refused BY NAME — it is never even opened. Pinned on
+    the open, not on what a missing file happens to raise or log: a run that has one
+    (a resume) is the test below, and here nothing but the name stands."""
     text, want = _brief_images(world)
     own = tmp_path / "my-brief.md"
     own.write_text(text, encoding="utf-8")
     run = tmp_path / "run"
     (run / "documents").mkdir(parents=True)
+    local = run / "documents" / "brief.md"
+    opened: list = []
+    real_read_text = Path.read_text
+    monkeypatch.setattr(
+        Path, "read_text",
+        lambda self, *a, **kw: (opened.append(Path(self)), real_read_text(self, *a, **kw))[1])
     assert asyncio.run(R._rehost_skipped_brief(run, text, own)) == want
+    assert local not in opened
+    assert not local.exists()
     assert own.read_text(encoding="utf-8") == text
-    assert not (run / "documents" / "brief.md").exists()
+
+
+def test_a_resumes_brief_md_is_left_alone_when_the_owner_named_another_file(world, tmp_path):
+    """⛔ A resume ALREADY HAS a documents/brief.md — the one phase 3 ingests and the
+    phase-2 attachment reads. An owner who then passes their own --brief-file holding
+    that same brief must not have the run's copy rewritten under them: only the file
+    the brief was actually read from is rewritten, and `.resolve()` is what decides."""
+    text, want = _brief_images(world)
+    own = tmp_path / "my-brief.md"
+    own.write_text(text, encoding="utf-8")
+    run = tmp_path / "run"
+    (run / "documents").mkdir(parents=True)
+    local = run / "documents" / "brief.md"
+    raw = f"# Research Brief\n\n{text}".encode()
+    local.write_bytes(raw)
+    assert asyncio.run(R._rehost_skipped_brief(run, text, own)) == want
+    assert local.read_bytes() == raw
+    assert own.read_text(encoding="utf-8") == text
 
 
 def test_a_brief_from_the_verify_gate_is_rehosted_with_no_file_written(world, tmp_path):
