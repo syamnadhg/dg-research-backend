@@ -25,8 +25,10 @@ Two properties matter here and they pull against each other:
 The tests for the second property are the ones worth having.
 """
 import ast
+import os
 import re
 import signal
+import subprocess
 import sys
 from pathlib import Path
 
@@ -333,8 +335,18 @@ def test_the_signal_module_is_imported_where_it_is_used():
 
 def test_holder_lookup_survives_both_sources_failing():
     """psutil raises AccessDenied on macOS without root; lsof is absent on many
-    Linux images. Neither may take the boot down."""
-    body = _src_of("_port_holders")
+    Linux images. Neither may take the boot down.
+
+    ⭐ 2026-09-16 — RE-POINTED, NOT WEAKENED. The two probes moved into
+    `_listening_pids`, which `_port_holders` and `_free_port` now share, so this
+    grep follows them there. What "survives" means also tightened: both sources
+    failing used to return `[]` from here, which the doctor read as "not bound"
+    and the reclaim read as "nothing identifiable". It now raises
+    `_PortProbeUnavailable`, and the BOOT still does not fall over because
+    `run_server` catches it — pinned by
+    test_a_port_check_that_itself_fails_does_not_block_boot just above, and
+    behaviourally throughout tests/test_port_probe_0916.py."""
+    body = _src_of("_listening_pids")
     assert body.count("except Exception") >= 2
 
 
@@ -347,6 +359,103 @@ def test_a_process_that_vanishes_mid_stop_is_not_an_error():
 def test_we_never_signal_ourselves():
     """The current process is listening on that port by the time this matters in
     some restart paths; signalling it would be the backend killing itself during
-    boot."""
-    body = _src_of("_port_holders")
+    boot.
+
+    ⭐ 2026-09-16 — RE-POINTED to `_listening_pids`, where the self-skip now
+    lives once instead of twice, and where `_free_port` picks it up too: the
+    blunt path used to carry its own copy in each of its two branches.
+    tests/test_port_probe_0916.py::test_we_are_never_in_our_own_answer drives
+    it rather than reading it."""
+    body = _src_of("_listening_pids")
     assert "getpid" in body and "== me" in body
+
+
+# ── the two halves of `_listening_pids` nothing was driving ─────────────────
+#
+# ⭐ ADDED 2026-09-17. These two exist because
+# .mutants/wave9_port_probe_0916_mutants.py needed a killer for P4 and P7 and
+# there was none: every other case in either suite either has psutil RAISING
+# (so a fallback gated on the exception still opens) or drives the shell
+# fallback with somebody else's pid. A mutant nothing can kill reports as a
+# survivor, which reads identically to a real one.
+
+
+class _PsutilThatAnsweredWithoutKnowing:
+    """psutil, answering, having attributed nothing.
+
+    `net_connections` hands back LISTEN rows it could not attribute with
+    `pid=None` — on macOS without root that is the ordinary case — and
+    `_listening_pids` drops those rows. So the source did not raise and still
+    could not name the holder.
+    """
+
+    CONN_LISTEN = "LISTEN"
+
+    def __init__(self, port=8000):
+        self._port = port
+
+    def net_connections(self, kind="inet"):
+        return [type("c", (), {
+            "pid": None,
+            "status": "LISTEN",
+            "laddr": type("a", (), {"port": self._port})(),
+        })()]
+
+    def Process(self, pid):  # noqa: N802 — psutil's own casing
+        raise RuntimeError("not inspectable")
+
+
+def _lsof_saying(monkeypatch, stdout):
+    seen = []
+
+    def _run(cmd, *a, **kw):
+        seen.append(list(cmd))
+        return type("r", (), {"stdout": stdout, "returncode": 0})()
+
+    monkeypatch.setattr(subprocess, "run", _run)
+    return seen
+
+
+def test_the_shell_tool_is_tried_whenever_psutil_FOUND_nothing(monkeypatch):
+    """⛔⛔ PSUTIL ANSWERING IS NOT PSUTIL KNOWING, and the fallback gate is the
+    whole difference. `_listening_pids` promises in its own docstring that the
+    shell tool runs "whenever psutil found NOTHING, not only when it raised —
+    psutil can return a socket with no pid attached, which reads here as an
+    empty answer while lsof can still name the holder — so this is no narrower
+    than what it replaced". Gate the fallback on the EXCEPTION instead of on the
+    ANSWER and that last clause stops being true: one probe would see less than
+    the two it replaced, on a held port, silently, on the platform this is
+    developed on.
+
+    Drives the real `_listening_pids`, not a re-implementation of it.
+    """
+    monkeypatch.setitem(sys.modules, "psutil", _PsutilThatAnsweredWithoutKnowing())
+    monkeypatch.setattr(R, "_supervisor_platform", lambda: "Linux")
+    seen = _lsof_saying(monkeypatch, "4242\n")
+
+    found = R._listening_pids(8000)
+
+    assert seen, ("the shell fallback was never reached — psutil answering "
+                  "nothing was read as psutil knowing there is nothing")
+    assert found == {4242}, (
+        "psutil could not attribute the listener and the fallback that could "
+        "was skipped, so a held port came back empty from a probe that ran")
+
+
+def test_the_shell_fallback_does_not_report_us_either(monkeypatch):
+    """⛔⛔ THE SELF-SKIP EXISTS TWICE AND ONLY ONE COPY WAS DRIVEN. In some
+    restart paths this process is the one listening on the port; handing our own
+    pid back to `_free_port` is the backend force-killing itself at boot.
+    `test_we_are_never_in_our_own_answer` in tests/test_port_probe_0916.py pins
+    the psutil branch. Nothing drove the lsof/netstat branch, which is the one
+    that runs on exactly the images this wave's defect was about — no psutil,
+    a shell tool only.
+    """
+    monkeypatch.setitem(sys.modules, "psutil", None)   # a source checkout
+    monkeypatch.setattr(R, "_supervisor_platform", lambda: "Linux")
+    me = os.getpid()
+    _lsof_saying(monkeypatch, f"{me}\n4242\n")
+
+    assert R._listening_pids(8000) == {4242}, (
+        f"the shell fallback reported our own pid {me} — the caller of this "
+        "signals what it is given")

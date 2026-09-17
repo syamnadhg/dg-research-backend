@@ -231,8 +231,8 @@ def test_run_login_uses_phase1_only():
     assert 'verify_mode="skip"' in src, "--login must not run the automated verify"
 
 
-def test_pair_step4_asks_with_skip_default():
-    src = inspect.getsource(research._continue_pair_stages_2_to_5)
+def test_pair_step5_asks_with_skip_default():
+    src = inspect.getsource(research._continue_pair_stages_2_to_6)
     assert src.count('verify_mode="ask"') >= 2, (
         "pair profile-1 AND the multi-profile loop must both use ask-mode"
     )

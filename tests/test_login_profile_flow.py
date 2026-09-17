@@ -87,7 +87,7 @@ def test_login_offers_multi_profile_loop_like_pair():
     flow = inspect.getsource(research.run_login_flow)
     assert "allow_add" in flow, "run_login_flow must accept allow_add"
     assert "Add another browser profile" in flow, (
-        "the add-loop must prompt to add another browser profile (like pair Stage 4)."
+        "the add-loop must prompt to add another browser profile (like pair Stage 5)."
     )
     assert "save_worker_count" in flow, (
         "each fully-verified added profile must bump workerCount via save_worker_count."

@@ -256,6 +256,36 @@ RETIRED_SENTENCES = [
     "respawn the backend automatically",
     # False whenever a device id is on disk, which is exactly when it printed.
     "Device not paired yet",
+    # ── wave 9 ───────────────────────────────────────────────────────────────
+    #
+    # ⛔⛔ THE SAME DEFECT, FOUND OUTSIDE THIS FUNCTION'S REACH. Every guard
+    # above reads `credential_remedy`'s return value, so all of them passed
+    # while the storage-REST 403 diagnostic printed "try Reset Pair Code →
+    # re-pair" and "(re-pair to refresh)" — pairing, recommended to a machine
+    # that still holds a device id, which is precisely what this file exists to
+    # forbid. THESE FIVE ARE WRITTEN OVER THE WHOLE FILE instead, because the
+    # lesson of the incident is that the advice grows back somewhere nobody
+    # thought to look, and a helper's return value cannot see that.
+    #
+    # The two pairing ones. A synth-token claim is refreshed by restarting the
+    # machine, never by re-pairing it.
+    "Reset Pair Code → re-pair",
+    "re-pair to refresh",
+    # A control that has never existed in the web app: zero hits for
+    # "add sharer" / "addSharer", and its Manage-Sharers popup takes only
+    # `onRevoke`. Sharing happens by giving somebody the access code, or by
+    # approving their request from the Account banner's Review action.
+    "Manage devices → Add sharer",
+    # A page that has never existed. The web app's own copy file names this
+    # exact string as non-existent (src/lib/devices/reset-recovery-copy.ts
+    # MANAGE_DEVICES_PATH). Manage devices is under Settings; the Account page
+    # holds the device tiles and their Unlink buttons.
+    "Account → Manage devices",
+    # A file that has never existed on disk — `init_firebase` says so itself
+    # ("No Admin SDK; no firebase-service-account.json on disk") and the Track D
+    # pair flow is keystore-only — printed by --unpair as something it had
+    # preserved "for re-pairing", which sent people hunting for a credential.
+    "firebase-service-account.json  (needed to re-pair)",
 ]
 
 

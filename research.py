@@ -292,7 +292,7 @@ def _profile_dir(n: int) -> Path:
     PROFILE_DIR path (`~/.super-research/browser-profile/`) so existing
     installs keep their cookies on the same disk location — no migration.
     Workers ≥2 return `~/.super-research/browser-profile-{n}/`, created
-    on first use by the Patchright launcher when pair Stage 4 opens its
+    on first use by the Patchright launcher when pair Stage 5 opens its
     Browser instance for that profile.
 
     Each profile = 1 concurrent run slot. The total profile count for
@@ -778,7 +778,7 @@ def _read_user_scope_env(name: str) -> str:
     on non-Windows or failure. Persistent across shells — settable
     manually via `setx NAME value` or PowerShell
     `[System.Environment]::SetEnvironmentVariable(name, value, 'User')`,
-    and by --pair Stage 3 via `_save_api_key_to_user_scope` (Windows
+    and by --pair Stage 4 via `_save_api_key_to_user_scope` (Windows
     persistence path for paste-time API keys)."""
     if sys.platform != "win32":
         return ""
@@ -898,7 +898,7 @@ def _save_api_key_local(name: str, value: str) -> bool:
     at process spawn from the registry, not live; .env file is read
     only by --env-file at startup).
 
-    Pair-time keys (Stage 3 of `--pair`) flow through here. They live
+    Pair-time keys (Stage 4 of `--pair`) flow through here. They live
     ONLY on the paired machine — the FE Account page is a SEPARATE
     surface that writes to Firestore (see `_read_firestore_api_keys`).
     BE resolution prefers Firestore → User-scope → shell env, so an
@@ -4124,7 +4124,7 @@ def _say_profile_capacity(count: int) -> None:
     Both add-loops used to leave on a bare `break` and print nothing, so
     declining — or being READ as declining — left no trace anywhere. A new
     owner who meant to add a second profile watched the prompt disappear and
-    [5/5] Ready report success, with no line in the whole session naming the
+    [6/6] Ready report success, with no line in the whole session naming the
     capacity they actually ended up with.
     """
     n = max(1, int(count or 1))
@@ -4305,17 +4305,29 @@ def _branded_header(tagline_text: str, tagline_color: str, tagline_gloss: str):
 def _setup_logo():
     """Branded header for --pair. Thin wrapper around _branded_header so
     --pair wears the same crown as the other four commands, plus a compact
-    5-step preview line so the user sees the whole arc before step [1/5]
-    starts."""
+    6-step preview line so the user sees the whole arc before step [1/6]
+    starts.
+
+    ⛔ TWO ROWS SINCE 2026-09-17, AND THE WRAP IS DELIBERATE. The six-chip arc
+    does not fit 80 columns on one line — the five-chip version was already 88
+    visible characters and relied on the terminal soft-wrapping it in an
+    arbitrary place. Splitting it here puts the break where WE chose it and
+    keeps both rows inside the `_rule(max_width=58)` neighbourhood that frames
+    every step header below. The padding is literal, not computed: if a chip
+    label changes, re-measure the second row's indent by hand.
+    """
     _branded_header("vinculum", _BOLD + _ACCENT, "the bond is forged")
     print()
     print(
-        f"  {_c(_DIM, 'Five steps:')}   "
+        f"  {_c(_DIM, 'Six steps:')}   "
         f"{_c(_ACCENT, '1')} Token   {_c(_DIM, '→')}   "
         f"{_c(_ACCENT, '2')} On StartUp   {_c(_DIM, '→')}   "
-        f"{_c(_ACCENT, '3')} API Keys   {_c(_DIM, '→')}   "
-        f"{_c(_ACCENT, '4')} Logins   {_c(_DIM, '→')}   "
-        f"{_c(_ACCENT, '5')} Ready"
+        f"{_c(_ACCENT, '3')} Discovery   {_c(_DIM, '→')}"
+    )
+    print(
+        f"               {_c(_ACCENT, '4')} API Keys   {_c(_DIM, '→')}   "
+        f"{_c(_ACCENT, '5')} Logins   {_c(_DIM, '→')}   "
+        f"{_c(_ACCENT, '6')} Ready"
     )
 
 
@@ -4471,7 +4483,7 @@ def _fs_where(col_ref, field: str, op: str, value):
 
 
 def _serve_boot_preview(port: int) -> None:
-    """`--serve`'s counterpart to `--setup_logo`'s "Five steps" line.
+    """`--serve`'s counterpart to `--setup_logo`'s "Six steps" line.
 
     Serve's identity strip (Paired to / Device / Local API) cannot be printed
     with the wordmark: it reads the device doc, so Firestore has to be live
@@ -5391,7 +5403,7 @@ _firebase_db = None     # Firestore client (module-level, init once)
 #   None        → healthy
 #   "transient" → DNS/network/5xx; refresh token still valid (keystore intact).
 #                 _firebase_reconnect_loop retries init_firebase on a tight backoff.
-#   "revoked"   → refresh token rejected (Reset Pair Code / keystore wiped).
+#   "revoked"   → refresh token rejected (Reset Access Code / keystore wiped).
 #                 _revoked_recovery_loop owns recovery (customToken relink).
 #   "broken_install" → this build cannot import its own code. ⛔⛔ IT USED TO SAY
 #                 "transient" here, with the comment "import hiccup — let
@@ -6743,19 +6755,45 @@ def credential_remedy(state: str, in_serve: bool = False) -> "list[str]":
             f"Pair it again with:  {_PROG} --pair",
         ]
     if state in (CRED_NO_TOKEN, CRED_TOKEN_REJECTED):
-        # ⛔⛔ THE FIRST VERSION SAID "check your email for the new code and
-        # enter it in the app", and cross-verify read the email. It contains NO
-        # CODE — the body renders an Approve button and nothing else. Somebody
-        # following that sentence searches an email for a string that is not in
-        # it. The code does exist, but on the device tile in the app, behind an
-        # eye icon.
-        # ⭐ SO IT NAMES THE ACTION THAT IS ACTUALLY THERE, and names the tile
-        # as the fallback for a person who has already lost the email.
+        # ⛔⛔ THIS COMMENT USED TO CLAIM THE RESET EMAIL CARRIES NO CODE — that
+        # only an Approve button is rendered in it — and that has not been true
+        # since wave 2. src/lib/email/sendResetCode.ts renders a
+        # labelled block headed "Your new access code" with the code printed on
+        # its own as XXXX-XXXX beside the Approve link, and names where to type
+        # it. A stale comment is what re-grows the wrong sentence beneath it, so
+        # it is corrected here rather than deleted.
+        # ⛔⛔ AND BOTH DOORS THE OLD ADVICE NAMED DIE AT THE SAME 15-MINUTE
+        # MARK. The claim route throws code_expired past `pairCodeExpiresAt`,
+        # and the reveal route /api/devices/pair-code answers 410 reset_expired
+        # once the window has passed (tests/unit/pairCodeResetWindow.test.ts
+        # drives it) — so "use the code on this computer's tile" was live only
+        # inside the same 15 minutes as the Approve link, and this branch prints
+        # to plenty of people who are already past it. The one instruction that
+        # survives the window is "press Reset again".
+        # ⭐ SO IT SAYS WHAT THE WEB AND THE AGENT ALREADY SAY, and deliberately
+        # invents no fourth variant: src/lib/devices/reset-recovery-copy.ts
+        # (RESET_WINDOW_MINUTES, ENTER_CODE_PATH, MANAGE_DEVICES_PATH,
+        # RESET_AGAIN_STEP) and agent/facade/cli.py's _PAIR_FAILURES
+        # ["code_not_found"] / sr.py's _PAIR_ERRORS both word it this way.
+        # ⛔ ENTER_CODE_PATH IS THE FULL PATH ON PURPOSE. While a computer is
+        # listed, Account → Pipeline Connection shows no code field at all —
+        # only the "+ add device" button at its foot — and the computer being
+        # reset is still listed.
         return [
-            "This computer's session was revoked — that is what a pair code "
+            "This computer's session was revoked — that is what an access-code "
             "reset does.",
-            "Open the app: click Approve in the reset email, or use the code "
-            "on this computer's tile under Account.",
+            # ⛔ ONE SENTENCE PER LINE, AND NONE OF THEM LONG. Every consumer
+            # prints these lines one apiece with a short prefix and none of them
+            # wraps, so a 200-character line breaks mid-word in the terminal —
+            # on the screen somebody reads when they are already stuck.
+            "Open the app and approve the NEWEST reset email while this "
+            "computer is running — you have 15 minutes.",
+            "That email prints the code too, for "
+            "Account → Pipeline Connection → + add device, for the same window.",
+            "Past that window, press Reset again in Settings → Manage devices, "
+            "for as long as this computer is still listed.",
+            "Use only the newest email — a second Reset rotates the code, so an "
+            "older link stops working.",
             # ⛔⛔ TWO OF THIS FUNCTION'S CONSUMERS ARE ALREADY INSIDE A RUNNING
             # SERVE — the boot banner and the recovery watcher itself — and
             # telling somebody sitting in front of a running serve to start a
@@ -6828,7 +6866,7 @@ def init_firebase():
     if _ks.try_recover(install_uuid) is None:
         # ⛔⛔ THIS LINE USED TO SAY "run --pair to establish a refresh token"
         # AND IT WAS THE MOST EXPENSIVE SENTENCE IN THE FILE. An empty keystore
-        # is the state a pair-code Reset leaves behind, and on that machine
+        # is the state an access-code Reset leaves behind, and on that machine
         # `--pair` does not restore anything — it mints a NEW deviceId and a new
         # device has no `visibility`, so the owner loses the computer's identity
         # and its public listing in one command. It said this to the owner on
@@ -6883,7 +6921,7 @@ def init_firebase():
     _firebase_down_reason = None
     # ⛔⛔ THE RESTART MARKER IS CLEARED HERE, AND ONLY HERE. It was set once and
     # never cleared, which cross-verify caught: the guard then meant "once per
-    # process LINEAGE", so a machine that recovered from one pair-code reset
+    # process LINEAGE", so a machine that recovered from one access-code reset
     # would refuse to restart itself after the NEXT one — reproducing the
     # original incident on the second reset, months later, with no clue why.
     # ⭐ A HEALTHY BOOT IS THE RIGHT MOMENT because it is exactly what the guard
@@ -7280,13 +7318,19 @@ _update_live_next_ms = 0
 # worker — `_last_heartbeat_at_ms` is worker-1-only and can't see a hung worker 2.
 _last_loop_tick_ms = 0
 HEARTBEAT_REINIT_THRESHOLD = 3  # consecutive fails before reinit_firebase()
-# Heartbeat cadence. Paired with the frontend's 15s offline threshold at
-# `DEVICE_OFFLINE_THRESHOLD_MS` in web/src/lib/firestore.ts so missing
-# two consecutive ticks + a ~5s slack flips the UI to offline. Cadence
-# tightened over two passes (30→15→5) because user kept observing the
-# "device killed, tile still green" gap and asked for near-realtime.
-# Cost: 12 writes/min/device on token + device docs — negligible at
-# personal-usage scale.
+# Heartbeat cadence. Paired with the frontend's 30s offline threshold at
+# `DEVICE_OFFLINE_THRESHOLD_MS`, which is DECLARED in
+# src/lib/device-order.ts and only re-exported from src/lib/firestore.ts,
+# so missing five consecutive ticks + a ~5s slack flips the UI to offline.
+# (The threshold was 15s until 2026-05-20; every copy of that number in
+# this file was stale for four months.) Cadence tightened over two passes
+# (30→15→5) because user kept observing the "device killed, tile still
+# green" gap and asked for near-realtime — that history is about the
+# CADENCE, not the threshold, and is correct as written.
+# Cost: 12 writes/min/device on the top-level `devices/{deviceId}` doc —
+# negligible at personal-usage scale. The loop has not written
+# `research_tokens/{token}` since the device-doc cutover; the only
+# research_tokens write left is the pair-time logins/setupState patch.
 HEARTBEAT_INTERVAL_SEC = 5
 
 # Pairing/runtime state lives in the stable per-user state dir (~/.super-research/),
@@ -7527,7 +7571,7 @@ def load_worker_count() -> int:
     """Number of concurrent-run slots this device has logins for.
 
     1 = single-worker (legacy default). 2+ = multi-profile, set up during
-    pair Stage 4's "Add another browser profile?" loop. PR 2 wires this
+    pair Stage 5's "Add another browser profile?" loop. PR 2 wires this
     into daemon-loop so N worker subprocesses spawn, each pinned to its
     own browser profile.
 
@@ -7806,7 +7850,7 @@ def clear_paired_uid():
 # callers and had not minted an id in a long time — but it was the most
 # authoritative-looking sentence in the file on the one question that decides
 # whether `--pair` repairs a machine or replaces it, and a reader who trusts it
-# concludes that recommending `--pair` after a pair-code reset is harmless. It
+# concludes that recommending `--pair` after an access-code reset is harmless. It
 # is not: the machine loses its id, its name and its public listing.
 # ⭐ THE ID IS MINTED SERVER-SIDE. There is no local generator to keep.
 
@@ -7850,13 +7894,18 @@ def _detect_supervised_windows() -> bool:
 async def _heartbeat_loop():
     """Write lastHeartbeat to the top-level `devices/{deviceId}` doc every
     HEARTBEAT_INTERVAL_SEC so the frontend can show Online/Offline status
-    per device. Pairs with the FE 15s offline threshold
-    (DEVICE_OFFLINE_THRESHOLD_MS) — missing two consecutive ticks plus
-    a small slack flips the UI to offline.
+    per device. Pairs with the FE 30s offline threshold
+    (DEVICE_OFFLINE_THRESHOLD_MS, declared in src/lib/device-order.ts and
+    only re-exported from src/lib/firestore.ts) — missing five
+    consecutive ticks plus a small slack flips the UI to offline.
 
-    Device doc uses millis-as-int — the frontend compares
-    `Date.now() - lastHeartbeat` directly, so a Timestamp object would
-    become NaN and the tile would look perpetually offline.
+    `lastHeartbeat` is millis-as-int and is NEVER retired — the frontend's
+    legacy mapper and the agent's REST reader both compare
+    `now - lastHeartbeat` directly, so a Timestamp object in that field
+    would become NaN and the tile would look perpetually offline. The
+    server-stamped `heartbeatAt` Timestamp is written BESIDE it in the same
+    update (see the payload below) for readers that prefer a clock neither
+    end can be wrong about.
 
     First-tick confirms the atomic-pair contract: writes
     pairConfirmedAt:true + FieldValue.delete() on expireAt. The claim
@@ -7867,7 +7916,7 @@ async def _heartbeat_loop():
     pairConfirmedAt is set, every subsequent heartbeat keeps it true
     (idempotent — `update` overwrites cleanly).
     """
-    from google.cloud.firestore import DELETE_FIELD
+    from google.cloud.firestore import DELETE_FIELD, SERVER_TIMESTAMP
     # All globals must be declared at the top of the function — Python
     # rejects `global X` if X has already been read in this scope.
     global _last_heartbeat_at_ms, _heartbeat_failures, _firebase_db, _firebase_down_reason
@@ -7902,6 +7951,39 @@ async def _heartbeat_loop():
                         lambda: _firebase_db.collection("devices")
                             .document(device_id).update({
                                 "lastHeartbeat": int(time.time() * 1000),
+                                # 2026-09-16: the SAME liveness fact, stamped
+                                # by Firestore instead of by this machine.
+                                # `lastHeartbeat` is this computer's own clock,
+                                # and every reader ages it against a DIFFERENT
+                                # clock — so a machine a minute fast reads
+                                # online forever after it is switched off, and
+                                # a machine a minute slow reads offline while
+                                # it is working. SERVER_TIMESTAMP resolves to
+                                # `request.time`, one clock for writer and
+                                # reader both, which is the only version of
+                                # this the rules can also enforce.
+                                #
+                                # ⛔ IN THIS UPDATE ON PURPOSE, not in the
+                                # separate throttled publish below. A stamp
+                                # written by a different request can land
+                                # before or after the liveness write it is
+                                # supposed to date, and a liveness stamp that
+                                # can lag its own liveness write is not worth
+                                # reading. The cost of that choice is that
+                                # this key must ALREADY be admitted by the
+                                # deployed firestore.rules: the update is
+                                # atomic, so one off-list key 403s the
+                                # `expireAt` cancel three lines down with it,
+                                # and a machine pairing inside the claim CF's
+                                # 5-minute TTL then loses its whole device
+                                # document. Rules first, verified in
+                                # production; wheel second.
+                                #
+                                # ⛔ AND `lastHeartbeat` STAYS FOREVER beside
+                                # it. The agent reaches Firestore over REST and
+                                # the web's legacy mapper reads a plain number;
+                                # this is a second field, never a replacement.
+                                "heartbeatAt": SERVER_TIMESTAMP,
                                 "status": "active",
                                 # Atomic-pair contract: confirm this BE
                                 # is alive + cancel the post-claim TTL.
@@ -8265,8 +8347,9 @@ async def _firebase_reconnect_loop():
         "revoked"               + down → idle here; _revoked_recovery_loop
         drives the customToken relink.
 
-    Backoff is deliberately TIGHT (5→10→30s, never minutes — the FE flips a
-    device Offline at ~15s, so a short blip clears before the tile changes).
+    Backoff is deliberately TIGHT (BACKOFF below is 5→5→10→30s, four steps,
+    never minutes — the FE flips a device Offline at ~30s, so a short blip
+    clears before the tile changes).
     Don't borrow a slow minutes-scale backoff — far too slow for a
     device-liveness signal. init_firebase
     runs in a thread because its live creds.refresh() has a 10s timeout that
@@ -8528,13 +8611,17 @@ def _relink_reexec() -> bool:
 
 
 async def _revoked_recovery_loop():
-    """Auto-relink after the owner triggers Reset Pair Code from the FE.
+    """Auto-relink after the owner triggers Reset Access Code from the FE.
 
     Reset revokes the synth device user's refresh tokens; the next
     securetoken refresh on this BE raises RevokedError → the keystore
     is wiped → `_firebase_db` goes None. The owner gets emailed the
-    fresh 8-char code and enters it in Account → Add Device within 15
-    minutes. The claim Cloud Function writes a new customToken to the
+    fresh 8-char code — as an Approve link AND printed as XXXX-XXXX —
+    and approves, or types it in Account → Pipeline Connection →
+    + add device, within 15 minutes. (⛔ Not "Account → Add Device":
+    while a computer is listed that section shows no code field, only
+    the "+ add device" button at its foot.) The claim Cloud Function
+    writes a new customToken to the
     same `devices/{deviceId}/pending/{hash(pollSecret)}` subdoc that
     initial pair used (pollSecret survives Reset in research_config.json),
     so we can pick it up here without any new handshake.
@@ -8602,10 +8689,22 @@ async def _revoked_recovery_loop():
                     f"[relink] giving up after {MAX_RECOVERY_WALLCLOCK_SEC}s.",
                     "ERROR",
                 )
+                # ⛔⛔ WAVE 9: THIS SENTENCE WAS DEAD BY CONSTRUCTION. It told
+                # the owner to "use the code you were emailed", and this branch
+                # only fires after MAX_RECOVERY_WALLCLOCK_SEC — an hour — while
+                # the emailed code's window is RESET_WINDOW_MINUTES = 15. So an
+                # hour-old code answers code_expired every single time it is
+                # printed. The instruction that still works past the window is
+                # the web's and the agent's: press Reset AGAIN, for as long as
+                # the computer is listed (the reset route has no pairState
+                # guard). See src/lib/devices/reset-recovery-copy.ts
+                # RESET_AGAIN_STEP and cli.py _PAIR_FAILURES["code_expired"].
                 log(
-                    "[relink] open the app and look under Devices: if this "
-                    "computer is still listed, use the code you were emailed "
-                    f"to add it again, then run `{_PROG} --serve`.",
+                    "[relink] open the app: if this computer is still listed "
+                    "in Settings → Manage devices, press Reset again — that "
+                    "mints a fresh code and emails a new Approve link. Have "
+                    "this computer running before you approve, then run "
+                    f"`{_PROG} --serve`.",
                     "ERROR",
                 )
                 log(
@@ -8644,8 +8743,9 @@ async def _revoked_recovery_loop():
                 continue
             log(
                 "[relink] Firestore client down — polling pending subdoc for "
-                "fresh pair code (15 min window). "
-                "Owner enters the emailed code in Account → Add Device.",
+                "fresh access code (15 min window). Owner approves the newest "
+                "reset email, or enters its code under "
+                "Account → Pipeline Connection → + add device.",
                 "INFO",
             )
             poll_hash = _v2.compute_poll_secret_hash(poll_secret)
@@ -10809,7 +10909,7 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                 # "Ongoing" forever and the queue gate (which keys on the
                 # most recent beDone marker) would refuse to advance into
                 # the NEXT user's queued run until the user manually went
-                # tile-by-tile in Account → Manage devices to delete them.
+                # tile-by-tile in Settings → Manage devices to delete them.
                 #
                 # Filter: by deviceId so other devices' in-flight work
                 # isn't accidentally killed. The research doc's deviceId
@@ -12749,7 +12849,15 @@ def _upload_audio_via_storage_rest(local_path: "Path", owner_uid: str, research_
                 "token.ownerUid == path-uid OR path-uid in token.sharedWith. "
                 "If sharer firing on shared device: confirm sharer is in the "
                 "device's sharedWith via FE Account → Manage Sharers. If owner: "
-                "device may have lost ownerUid — re-pair via FE Account → Add Device. "
+                # ⛔⛔ WAVE 9: THIS SAID "re-pair via FE Account → Add Device",
+                # which is the same two faults as the three hints below it — it
+                # named a page the app does not have, and it recommended the one
+                # command that would discard this machine's identity. A device
+                # doc missing ownerUid is repaired by a Reset, which re-stamps
+                # the claim; pairing would mint a new id and drop its sharers.
+                "device may have lost ownerUid — press Reset in "
+                "Settings → Manage devices and approve the newest email while "
+                "this computer is running. "
                 "If ALL identifiers already match yet it still 403s, suspect a "
                 "DEPLOYED-ruleset lag (the rules engine 403s blanket when the "
                 "live storage.rules differs from the repo) — redeploy via "
@@ -12895,16 +13003,45 @@ def _download_user_source_via_storage_rest(storage_path: str, dest_path: "Path")
                     f"device_doc_sharedWith={[s[:16] for s in _dev_shared]}",
                     "ERROR",
                 )
-                # Specifically call out the mismatch class so the user
-                # knows whether it's a stale-claim issue (re-pair fixes)
-                # vs a sharing issue (owner needs to share with sharer).
+                # Specifically call out the mismatch class so the user knows
+                # whether it's a stale-claim issue (a restart refreshes the
+                # claim) vs a sharing issue (the owner has to let this account
+                # in).
+                #
+                # ⛔⛔ WAVE 9: ALL THREE OF THESE SENTENCES NAMED SOMETHING THAT
+                # DOES NOT EXIST OR MUST NOT BE RUN, and they sat OUTSIDE
+                # `credential_remedy`, which is the one place that knows the
+                # difference between a machine with nothing to lose and a
+                # machine that would lose its identity — so the guard in
+                # tests/test_credential_state_790.py never reached them.
+                #   · "try Reset Pair Code → re-pair" and "re-pair to refresh"
+                #     are the exact defect that function exists to forbid: on a
+                #     machine that still has a device id, `--pair` mints a NEW
+                #     id and drops its sharers and its public setting. And
+                #     "Reset Pair Code" is not a control's name — the web calls
+                #     the feature Reset Access Code and it lives in
+                #     Settings → Manage devices.
+                #   · "Manage devices → Add sharer" is a control that has never
+                #     existed: zero hits for add sharer / addSharer anywhere in
+                #     the web app, and its Manage-Sharers popup takes only
+                #     onRevoke. The two real ways in are the owner GIVING the
+                #     person the access code (they enter it under
+                #     Account → Pipeline Connection → + add device), or the
+                #     owner pressing Review on the Account banner to approve an
+                #     access request.
+                # ⭐ BOTH DEAD PHRASES ARE NOW IN RETIRED_SENTENCES in
+                # tests/test_credential_state_790.py, which walks the WHOLE of
+                # research.py — so this site is finally inside the guard's
+                # reach and neither sentence can grow back anywhere in the file.
+                # ⛔ `sharedWith` STAYS: it is the Firestore field name and
+                # firestore.rules reads it.
                 if _path_owner != "?" and _dev_owner != "?":
                     if _path_owner == _dev_owner:
-                        log("[storage REST] 403 root: path is for THIS device's owner yet still denied AFTER retries — either claim/token freshness (try Reset Pair Code → re-pair) OR a DEPLOYED-ruleset lag (live storage.rules differs from repo → blanket 403 regardless of claims; redeploy via `firebase deploy --only storage`).", "ERROR")
+                        log("[storage REST] 403 root: path is for THIS device's owner yet still denied AFTER retries — either claim/token freshness (restart this computer: `--restart`, or stop it and `--serve` again, which mints a fresh claim; if it still fails, press Reset in Settings → Manage devices and approve the newest email while this computer is running) OR a DEPLOYED-ruleset lag (live storage.rules differs from repo → blanket 403 regardless of claims; redeploy via `firebase deploy --only storage`).", "ERROR")
                     elif _path_owner in _dev_shared:
-                        log("[storage REST] 403 root: path is for a sharer who IS in sharedWith — device-doc state OK, suspect synth-token claim staleness (re-pair to refresh)", "ERROR")
+                        log("[storage REST] 403 root: path is for a sharer who IS in sharedWith — device-doc state OK, suspect synth-token claim staleness (restart this computer to refresh the claim: `--restart`, or stop it and `--serve` again)", "ERROR")
                     else:
-                        log(f"[storage REST] 403 root: path owner {_path_owner[:24]}… is NOT in device's owner/sharedWith. Owner must share with this user via Manage devices → Add sharer.", "ERROR")
+                        log(f"[storage REST] 403 root: path owner {_path_owner[:24]}… is NOT in device's owner/sharedWith. The owner has to let this account in: give them this computer's access code (they enter it under Account → Pipeline Connection → + add device), or approve their access request from Review on the Account banner.", "ERROR")
             except Exception as _diag_err:
                 log(f"[storage REST] 403 diagnostic raised: {_diag_err}", "WARN")
         return False
@@ -15834,7 +15971,7 @@ def _write_agent_terminal_status(agent_key: str, status: str, force: bool = Fals
     doesn't block the asyncio event loop (heartbeat, command listener,
     narration ticker). Same lesson as B2 (research.py:1046) — any
     multi-second sync I/O on the main loop starves heartbeat and trips
-    the FE 15s offline threshold.
+    the FE 30s offline threshold.
 
     Caller writes one of:
       - "complete"  → on phase_complete phase=2 for agents whose details
@@ -44767,9 +44904,16 @@ def _doc_img_connect(host: str, port: int, deadline: float, socket_options=None)
     name would otherwise get a TCP handshake with a LAN host before
     `_doc_img_check_peer` (kept, the second guard) closed it.
     ⚠ The name lookup itself is not bounded (recorded).
-    Only non-public addresses and nothing tried → a "refused" refusal (what the peer
-    check said before). Every other failure is "failed": the image is not kept,
-    nothing more."""
+    Only non-public addresses, nothing tried and time still left → a "refused"
+    refusal (what the peer check said before). Every other failure is "failed": the
+    image is not kept, nothing more.
+    ⛔⛔ THE CLOCK IS NOT A REFUSAL (wave 9). A private answer skipped and then the
+    image's deadline breaking the loop before any public address was tried also
+    reads as "skipped and not tried" — and a "refused" is remembered for the whole
+    research, so an image the CLOCK ran out on was a caption in every later
+    document. `out_of_time` keeps the two apart: the clock raises "failed", which
+    `_doc_img_resolve_src` lets out of the cache when the document's budget is
+    spent, and the next document tries it again."""
     from urllib3.util.connection import allowed_gai_family
     if time.monotonic() >= deadline:
         raise _DocImageRefused("failed")
@@ -44778,13 +44922,14 @@ def _doc_img_connect(host: str, port: int, deadline: float, socket_options=None)
                                    socket.SOCK_STREAM)[:_DOC_IMG_CONNECT_ADDRS]
     except OSError:
         raise _DocImageRefused("failed") from None
-    skipped = tried = False
+    skipped = tried = out_of_time = False
     for af, socktype, proto, _canon, addr in infos:
         if not _doc_img_address_is_public(addr[0]):
             skipped = True
             continue
         left = deadline - time.monotonic()
         if left <= 0:
+            out_of_time = True
             break
         tried = True
         sock = None
@@ -44802,7 +44947,7 @@ def _doc_img_connect(host: str, port: int, deadline: float, socket_options=None)
         # watches it from the moment the caller hands it over.
         sock.settimeout(_DOC_IMG_TIMEOUT[0])
         return sock
-    raise _DocImageRefused("refused" if skipped and not tried else "failed")
+    raise _DocImageRefused("refused" if skipped and not tried and not out_of_time else "failed")
 
 
 class _DocImgDeadline:
@@ -47066,8 +47211,15 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
             log(f"[{label}] Extracted via T1 HTML→MD: {len(md)} chars")
             return md
     elif md:
-        log(f"[{label}] T1 HTML→MD returned {len(md)} chars (below 2000-char threshold — "
-            f"likely chat-side ack, not the report panel) — falling to Tier 2", "WARN")
+        # ⛔ Wave 9: the number beside the floor is the number the GATE above weighed
+        # — prose, images' destinations left out. Printing len(md) put a figure far
+        # ABOVE 2000 next to "below 2000-char threshold" whenever the panel carried
+        # signed chart URLs, and the rejection read as a machine fault.
+        # ⭐ The helper is called a second time rather than hoisted into a local so
+        # the gate line stays byte-identical: it is the pinned and mutated line.
+        log(f"[{label}] T1 HTML→MD returned {_doc_img_prose_len(md)} chars of prose "
+            f"(below 2000-char threshold — likely chat-side ack, not the report "
+            f"panel) — falling to Tier 2", "WARN")
 
     # ── Tier 2 (FALLBACK): CUA Share & Export → "Copy contents" + clipboard ──
     # The "Copy contents" action lives in the Share & Export dropdown on the
@@ -47579,8 +47731,13 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
                 log(f"[{label}] Extracted via T2 HTML→MD (artifact panel): {len(md_dom)} chars")
                 return md_dom
         elif md_dom:
-            log(f"[{label}] T2 HTML→MD returned {len(md_dom)} chars (below 2000-char "
-                f"floor — likely a partial render or wrong panel) — falling to Tier 3", "WARN")
+            # ⛔ Wave 9: as Gemini's T1 — the figure beside the floor is the PROSE
+            # length the gate weighed, not len(md_dom), which a few signed chart
+            # URLs lift far above the floor the panel just failed. Second call, not
+            # a local, so the gate line above stays byte-identical (pinned + mutated).
+            log(f"[{label}] T2 HTML→MD returned {_doc_img_prose_len(md_dom)} chars of "
+                f"prose (below 2000-char floor — likely a partial render or wrong "
+                f"panel) — falling to Tier 3", "WARN")
 
         # ── Tier 3 (LAST RESORT, Wayland-safe): CUA + clipboard hijack ──
         # _run_with_clipboard_hijack installs the JS hook before CUA's
@@ -61131,7 +61288,7 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         try:
             # B2 (2026-05-01): to_thread so the asyncio event loop (and
             # _heartbeat_loop on it) keeps ticking — a blocking probe ate
-            # 1/3 of the 15s offline threshold. 2026-07-12: probing goes
+            # 1/6 of the 30s offline threshold. 2026-07-12: probing goes
             # through _audio_duration_sec (tinytag primary — pure Python,
             # pip-installed, works on a clean machine with no ffmpeg;
             # ffprobe fallback). durationSec: 0 froze the FE player's
@@ -61142,7 +61299,7 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                     "— writing durationSec=0; FE will self-heal from media "
                     "metadata", "WARN")
             # B2: Firebase Storage upload (50-100MB on slow uplinks) was the
-            # biggest single blocker — easily blew past the 15s offline window.
+            # biggest single blocker — easily blew past the 30s offline window.
             audio_url = await asyncio.to_thread(upload_audio_to_storage, audio_path)
             # Use the filename stem as doc id so re-runs upsert in place
             # instead of stacking duplicates. Display name = research
@@ -62450,10 +62607,21 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
                                        re.findall(r'^#{1,3}\s+(.+)$', content, re.MULTILINE)) if t]
             if len(sections) <= 2:
                 # ChatGPT often uses **Bold Title** instead of # headings
-                bold_sections = re.findall(r'^\*\*(.{5,80})\*\*\s*$', content, re.MULTILINE)
+                # ⛔⛔ Wave 9: THE 5-80 BOUND MEASURES THE TITLE, NOT THE RAW LINE.
+                # `**![Chart](/document-images/…/<64 hex>.png) Quarterly revenue**` is
+                # 126 raw characters, so a bold pseudo-heading whose image was STORED
+                # was dropped — while the same line written `## …` kept its section,
+                # because the '##' path above captures the whole line and strips first.
+                # The capture is wide enough to reach the title; the bound below is
+                # where 5-80 belongs. (The findings side does the same at its own
+                # `2 <= len(heading) <= 80`; the two bounds differ on purpose.)
+                bold_sections = re.findall(r'^\*\*(.{1,400})\*\*\s*$', content, re.MULTILINE)
                 # Also try numbered bold: **1. Title**
-                numbered = re.findall(r'^\*\*\d+[\.\)]\s*(.{5,80})\*\*', content, re.MULTILINE)
-                sections = sections + [t for t in map(_find_heading_title, bold_sections + numbered) if t]
+                numbered = re.findall(r'^\*\*\d+[\.\)]\s*(.{1,400})\*\*', content, re.MULTILINE)
+                # ⛔ `5 <= len(t)` also carries the old truthiness filter: an image-ONLY
+                # bold line strips to "" and must not come back as an empty section.
+                sections = sections + [t for t in map(_find_heading_title, bold_sections + numbered)
+                                       if 5 <= len(t) <= 80]
                 sections = list(dict.fromkeys(sections))[:20]  # Dedupe
             # Filter out the file header we added
             sections = [s for s in sections if s not in ("ChatGPT Deep Research", "Gemini Deep Research", "Claude Deep Research")]
@@ -69896,7 +70064,7 @@ async def run_server(port=8000):
     #
     # The banner is therefore two beats, not one:
     #   1. here — the wordmark + a dim preview of the boot arc (the same shape
-    #      as --pair's "Five steps: …" line), printed before any work;
+    #      as --pair's "Six steps: …" line), printed before any work;
     #   2. after init — the identity strip (Paired to / Device / Local API),
     #      which CANNOT move up: it reads the device doc, so it needs Firestore
     #      to be live. `_serve_boot_preview` is what bridges the two, so the
@@ -70073,8 +70241,9 @@ async def run_server(port=8000):
         start_firestore_start_listener(_job_queue, asyncio.get_event_loop())
     # Reset-recovery watcher. Armed unconditionally so a post-Reset
     # boot (keystore wiped → init_firebase returned False above) can
-    # still auto-relink the moment the owner enters the new code at
-    # Account → Add Device. Loop is idle while _firebase_db is set.
+    # still auto-relink the moment the owner approves the reset email, or
+    # enters its code at Account → Pipeline Connection → + add device.
+    # Loop is idle while _firebase_db is set.
     asyncio.create_task(_revoked_recovery_loop())
     # Transient-outage reconnect watcher (#717/#718). Armed unconditionally on
     # EVERY worker so a dropped Firestore client (DNS/network blip) self-heals on
@@ -70552,6 +70721,23 @@ async def run_server(port=8000):
         print(f"      Nothing was started. Check with:  "
               f"{_port_holder_hint(port)}\n")
         raise SystemExit(3)
+
+    if _port_state == "unknown":
+        # ⛔⛔ THIS USED TO ARRIVE AS "stuck", and "stuck" tells them we stopped
+        # the earlier backend — we did not, because nothing here could even see
+        # it. On an image with neither psutil nor a port tool the probe answers
+        # nothing at all, and the refusal a person reads has to be about the
+        # probe, not about a process we invented. (No tool is NAMED in this
+        # block on purpose: `_port_holder_hint` picks the one that exists here.)
+        print(f"[serve] bind refused: port {port} is held and no probe could "
+              f"identify the holder", file=sys.stderr, flush=True)
+        print(f"\n  {_c(_ERR, '⛔')}  Port {port} is in use, and this machine has no "
+              f"way to say by what.")
+        print("      Neither psutil nor this platform's port tool could run, so "
+              "nothing was stopped.")
+        print(f"      Look yourself with:  {_port_holder_hint(port)}")
+        print("      Or start this backend on another port.\n")
+        raise SystemExit(3)
     _paired_uid_now = load_paired_uid()
     _device_id_now = load_device_id() or ""
     # Pull owner identity + device metadata from the device doc, not
@@ -70912,7 +71098,7 @@ def _pair_patch_device(
 def _cancel_unclaimed_pair(device_id: "str | None", poll_secret: str) -> str:
     """Undo an initiate-pair that never got claimed, and say what happened.
 
-    By the time the pair code is on screen the server has already created three
+    By the time the access code is on screen the server has already created three
     things: the device doc, the pollSecretHash entry, and the synthetic Firebase
     Auth user. Abandoning the flow here used to leave all three behind — the doc
     surfaced later as a stale `awaiting-initial-claim` tile, and the auth user
@@ -70953,9 +71139,14 @@ def _cancel_unclaimed_pair(device_id: "str | None", poll_secret: str) -> str:
             "WARN",
         )
     else:
+        # ⛔ "Account → Manage devices" IS NOT A PAGE. Manage devices lives under
+        # SETTINGS — the web app's own copy file names that exact wrong string as
+        # non-existent (src/lib/devices/reset-recovery-copy.ts MANAGE_DEVICES_PATH,
+        # "⛔ Not 'Account → Manage devices' — that page does not exist"). The
+        # Account page carries the device TILES, and an Unlink button on each.
         log(
             f"Could not clean up the unclaimed pair (deviceId={device_id[:12]}…). "
-            "It expires on its own; remove it from Account → Manage devices "
+            "It expires on its own; remove it from Settings → Manage devices "
             "if it lingers.",
             "WARN",
         )
@@ -70964,7 +71155,7 @@ def _cancel_unclaimed_pair(device_id: "str | None", poll_secret: str) -> str:
 
 def _cleanup_partial_pair(device_id: str) -> None:
     """Reverse a partially-completed pair when the user Ctrl+Cs (or the
-    flow errors out) between Stage 1 exchange and Stage 5 completion.
+    flow errors out) between Stage 1 exchange and Stage 6 completion.
 
     Track D writes pairConfirmedAt:true to the device doc the moment
     exchange succeeds so the FE Account tile appears at Stage 1 — but
@@ -70977,7 +71168,7 @@ def _cleanup_partial_pair(device_id: str) -> None:
       3) Removes research_config.json.
       4) Best-effort supervisor disarm (schtasks /Delete on Windows /
          launchctl bootout on mac / systemctl --user disable on linux)
-         in case the cancellation happened during Stage 5 arming.
+         in case the cancellation happened during Stage 6 arming.
 
     Best-effort throughout — never raises, prints WARN on each failed
     step so the user can run `--unpair` manually if anything sticks."""
@@ -70986,6 +71177,17 @@ def _cleanup_partial_pair(device_id: str) -> None:
     # Server-side: delete the device doc + revoke synth user. Requires
     # an idToken which is still mintable from the just-bootstrapped
     # keystore at this point (we haven't wiped it yet).
+    #
+    # ⛔ THIS BLOCK IS THE SAME SHAPE AS run_unpair's AND IS DELIBERATELY NOT
+    # GATED (considered in wave 9, kept). run_unpair now REFUSES to wipe when
+    # the server did not confirm, because there it would strand a real device
+    # doc and its login while destroying the only credential that could ask
+    # again. Here it is pair ROLLBACK: the user cancelled mid-flow, the local
+    # state is half-built and worthless, and wiping it anyway is the correct
+    # outcome even if the server never answered — the alternative is leaving a
+    # "confirmed" tile with no backend AND a broken local install. Note this
+    # site already says "no idToken — skipping server-side retire" below; the
+    # total silence on a failed mint was unique to run_unpair.
     try:
         from auth.v2_flow import FE_BASE_URL as _FE_BASE_URL
         _id_token = _fresh_user_mode_id_token()
@@ -71054,7 +71256,7 @@ def _cleanup_partial_pair(device_id: str) -> None:
 
 
 # ── Pair-flow API key verifiers ───────────────────────────────────────
-# Cheap live-API calls invoked during --pair Stage 3 to confirm a pasted
+# Cheap live-API calls invoked during --pair Stage 4 to confirm a pasted
 # key actually authenticates before we persist it. Verification at paste
 # time means the operator catches typos / revoked keys / wrong-account
 # pastes immediately, instead of mid-pipeline. All verifiers return one
@@ -71143,7 +71345,14 @@ def _verify_gemini_key(key: str) -> str:
 
 
 async def _pair_prompt_one_key(label: str, example: str, help_url: str) -> str:
-    """Single-key paste loop for --pair Stage 4/5.
+    """Single-key paste loop for --pair's Stage 4 (API keys).
+
+    ⛔ THIS SAID "Stage 4/5" UNTIL 2026-09-17 AND THAT WAS ALREADY STALE — it
+    was the position API keys held before the 2026-05-18 reorder, and the slash
+    read as "stage 4 of 5" to everyone who came after. The only caller is
+    `_pair_prompt_api_keys`, so there is exactly one stage, and it is now the
+    fourth of six.
+
 
     Returns the trimmed key string on paste, or "" on skip / EOF. Ctrl+C is
     RE-RAISED (universal cancel — the caller reverts the partial pair); type
@@ -71171,7 +71380,7 @@ async def _pair_prompt_one_key(label: str, example: str, help_url: str) -> str:
             return ""
         except KeyboardInterrupt:
             # Ctrl+C = cancel the pair (not "skip this key" — type s to skip).
-            # Propagate so Stage 3 / cmd_pair_v2 revert the partial pair.
+            # Propagate so Stage 4 / cmd_pair_v2 revert the partial pair.
             print()
             raise
         except _getpass.GetPassWarning:
@@ -71209,7 +71418,7 @@ async def _pair_prompt_one_key_with_verify(
     verifier,
     max_attempts: int = 3,
 ) -> str:
-    """Paste-and-verify loop for --pair Stage 3.
+    """Paste-and-verify loop for --pair Stage 4.
 
     Wraps `_pair_prompt_one_key` with an API-call verifier (cheap
     `models.list`-style probe). A visible `_async_spinner_ctx` runs
@@ -71284,7 +71493,7 @@ async def _pair_prompt_one_key_with_verify(
 
 
 async def _pair_prompt_api_keys(uid: str):
-    """Stage 3/5 of --pair: detect-or-prompt for Anthropic + Gemini.
+    """Stage 4 of 6 of --pair: detect-or-prompt for Anthropic + Gemini.
 
     Per key: if any source already resolves (Firestore Account-page key /
     Windows User-scope env / shell env / .dg-supervisor.env via
@@ -71295,7 +71504,7 @@ async def _pair_prompt_api_keys(uid: str):
     verified paste: write to BE-local persistence (Win User-scope env
     on Windows; `.dg-supervisor.env` on POSIX) + os.environ (in-memory
     for this session) + bust _RESOLVED_KEY_CACHE so the change is picked
-    up immediately by Stage 4 browser-login CUA init AND by Stage 5
+    up immediately by Stage 5 browser-login CUA init AND by Stage 6
     supervisor arming.
 
     Pair-time keys live ONLY on the paired machine — they are NOT
@@ -71325,7 +71534,7 @@ async def _pair_prompt_api_keys(uid: str):
             # Persist to BE-local FIRST, then mirror to os.environ for the
             # in-flight session (User-scope env / .env file are only seen
             # by *new* processes — the current pair session needs the
-            # os.environ mirror to use the key in Stage 4 / Stage 5).
+            # os.environ mirror to use the key in Stage 5 / Stage 6).
             #
             # Single canonical name only — `CUA_API_KEY` was retired
             # 2026-05-23 in favor of the Anthropic-SDK standard
@@ -71457,10 +71666,9 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
     RefreshTokenCredentials.bootstrap. No Admin SDK, no
     firebase-service-account.json on disk.
 
-    Stages 2-5 are then handled by the shared
-    `_continue_pair_stages_2_to_5` helper (same code path the legacy
-    `run_pair` uses after its research_token handshake) — On Startup
-    prompt, API keys via the FE bridge (D5c-2), browser logins,
+    Stages 2-6 are then handled by the shared
+    `_continue_pair_stages_2_to_6` helper — On Startup prompt,
+    discoverability, API keys via the FE bridge (D5c-2), browser logins,
     Ready/supervisor.
     """
     from auth import v2_flow
@@ -71483,7 +71691,7 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
         log(f"[pair +{elapsed:5.2f}s] {msg}", kind)
 
     _setup_logo()
-    _setup_step(1, 5, "Token setup")
+    _setup_step(1, 6, "Token setup")
 
     existing_secret = load_poll_secret()
     if existing_secret:
@@ -71520,9 +71728,16 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
         formatted = (
             f"{pair_code[:4]}-{pair_code[4:]}" if len(pair_code) == 8 else pair_code
         )
+        # ⛔ THE LABEL IS THE WEB'S WORD, THE IDENTIFIERS ARE NOT. The web app
+        # calls this value "Access code" in every label, error and placeholder,
+        # so the headline above the eight characters says the same. The wire
+        # names deliberately do NOT move: the local `pair_code`, the telemetry
+        # event `PAIR_CODE_SHOWN`, the JSON field `pairCode` and the routes
+        # /api/devices/pair-code and reset-pair-code are all identifiers
+        # something else reads, and renaming one is a defect, not a cleanup.
         tm.tm_emit(tm.Ev.PAIR_CODE_SHOWN)
         print()
-        print(f"  {_c(_DIM, 'Pair code')}")
+        print(f"  {_c(_DIM, 'Access code')}")
         print(f"  {_c(_BOLD + _ACCENT, formatted)}")
         print()
         try:
@@ -71537,7 +71752,7 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
             # the terminal honors color (matches F12 of the CLI audit).
             qr.print_ascii(tty=True, invert=bool(_USE_COLOR))
         except ImportError:
-            # Cosmetic only: the pair code is printed as text a few lines below,
+            # Cosmetic only: the access code is printed as text a few lines below,
             # so nothing is lost and there is nothing for the reader to do. It
             # used to be a WARN in the middle of the branded pairing screen
             # carrying a remedy that cannot run on an installed copy.
@@ -71570,7 +71785,7 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
     # captured_device_id is set immediately after a successful exchange
     # so the try/finally cleanup at the bottom of this function can
     # reverse a partial pair if the user Ctrl+Cs between Stage 1 and
-    # Stage 5.
+    # Stage 6.
     captured_device_id: "str | None" = None
     pair_completed = False
 
@@ -71582,7 +71797,7 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
 
     try:
         try:
-            _init_spinner["ctx"] = _sync_spinner_ctx("Requesting a pair code")
+            _init_spinner["ctx"] = _sync_spinner_ctx("Requesting an access code")
             _init_spinner["ctx"].__enter__()
             try:
                 result = await v2_flow.do_pair_v2(
@@ -71672,7 +71887,7 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
         # contract heartbeat would write: pairConfirmedAt:true + delete
         # expireAt (cancels the 5-min "must confirm" TTL set by the claim
         # Cloud Function). Best-effort — if this fails the heartbeat at
-        # Stage 5 still writes both via the same path.
+        # Stage 6 still writes both via the same path.
         async with _async_spinner_ctx("Confirming with Super Research"):
             if _pair_patch_device(
                 result["device_id"],
@@ -71752,12 +71967,13 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
         print(f"  {_c(_OK, '✓')}  Linked to {_linked_to}")
         print()
 
-        _pt("entering stages 2-5 (On Startup → API keys → Logins → Ready)")
-        # Stages 2-5 — On Startup, API keys (via FE bridge in user-mode),
-        # browser logins, Ready/supervisor. The helper writes per-platform
-        # login progress to devices/{deviceId}.logins via the user-scoped
-        # Firestore client (rule permits synth user updates of `logins`).
-        _pair_ok = await _continue_pair_stages_2_to_5(
+        _pt("entering stages 2-6 (On Startup → Discovery → API keys → Logins → Ready)")
+        # Stages 2-6 — On Startup, discoverability, API keys (via FE bridge in
+        # user-mode), browser logins, Ready/supervisor. The helper writes
+        # per-platform login progress to devices/{deviceId}.logins via the
+        # user-scoped Firestore client (rule permits synth user updates of
+        # `logins`).
+        _pair_ok = await _continue_pair_stages_2_to_6(
             profile_dir or str(PROFILE_DIR),
             linked_uid=owner_uid,
             linked_email=owner_email or owner_label or owner_uid[:8],
@@ -71767,9 +71983,9 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
         )
         # _continue returns True when the pair completed (incl. partial / zero
         # logins) or was intentionally refused, and False only when the user
-        # cancelled mid-Stage-4. On cancel we leave pair_completed=False so the
+        # cancelled mid-Stage-5. On cancel we leave pair_completed=False so the
         # finally reverts the partial pair (device doc + token) — no ghost tile
-        # left in the app. (Fixes: Ctrl+C at Stage 4 used to keep the device.)
+        # left in the app. (Fixes: Ctrl+C at Stage 5 used to keep the device.)
         pair_completed = bool(_pair_ok)
     finally:
         if captured_device_id and not pair_completed:
@@ -71803,7 +72019,7 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
 # then reopen the now-warm profile with patchright and VERIFY logins + Pro tier
 # (phase 2). Both phases use the SAME on-disk profile dir the pipeline drives,
 # so the saved cookies are exactly what a run reuses. Shared by `--login` and
-# (later) pair Step 4.
+# (later) pair Step 5.
 
 _LOGIN_SERVICES = [
     ("ChatGPT",    "https://chatgpt.com",           "chatgpt"),
@@ -72467,7 +72683,7 @@ async def _probe_profile_logins(profile_dir, *, security_check, results) -> str:
 async def _login_one_profile(profile_dir, cua_client, *, label, results, emit_row,
                              security_check=None, verify_mode="verify",
                              ask_reopen_if_signed_in=False) -> str:
-    """Sign in ONE profile — the shared engine for `--login` and pair Step 4.
+    """Sign in ONE profile — the shared engine for `--login` and pair Step 5.
     Phase 1 = the user's plain Chrome (human signs in on the un-detected surface,
     and can clear any Cloudflare check by hand — a REAL human interaction that
     WARMS the profile). Phase 2 (verification) is now OPTIONAL (2026-07-02):
@@ -72499,7 +72715,7 @@ async def _login_one_profile(profile_dir, cua_client, *, label, results, emit_ro
       • some/all signed out → "Open Chrome to sign in? [Y/n]" — DEFAULT open.
     Declining either just leaves the profile as-is (never cleaned, worker count
     unchanged). On a probe failure (e.g. the profile is locked) it falls through
-    to seed, i.e. today's behaviour. Off (pair Step 4) the flow is unchanged.
+    to seed, i.e. today's behaviour. Off (pair Step 5) the flow is unchanged.
 
     Mutates `results`. Returns 'ok' | 'no_chrome' | 'refused'. Raises
     KeyboardInterrupt on Ctrl+C (universal cancel) — the caller handles it."""
@@ -72633,7 +72849,7 @@ async def run_login_flow(
     allow_add: bool = False,
     verify_mode: str = "skip",
 ) -> "tuple[dict[int, dict], bool]":
-    """The login flow shared by `--login` and pair Step 4:
+    """The login flow shared by `--login` and pair Step 5:
       Phase 1 — plain Chrome (no automation): human signs in + clears any check.
       Phase 2 — OPTIONAL verification (see _login_one_profile.verify_mode;
       `--login` uses 'skip' — automated verify navigations on fresh profiles are
@@ -72706,7 +72922,7 @@ async def run_login_flow(
 
     # `--login` add-loop: offer to set up ADDITIONAL worker profiles, pair-style,
     # so a single-worker install can grow to multi-worker from --login (matching
-    # pair Stage 4). Only after at least one profile's Chrome launched.
+    # pair Stage 5). Only after at least one profile's Chrome launched.
     if allow_add and seeded_any:
         base = max(profile_list) if profile_list else 1
         try:
@@ -72880,7 +73096,7 @@ async def run_login() -> None:
     print()
 
 
-async def _continue_pair_stages_2_to_5(
+async def _continue_pair_stages_2_to_6(
     profile_dir: str,
     *,
     linked_uid: str,
@@ -72889,12 +73105,20 @@ async def _continue_pair_stages_2_to_5(
     token: str,
     device_id_for_progress: "str | None",
 ) -> None:
-    """Stages 2-5 of pair — On Startup → API keys → Browser logins → Ready.
+    """Stages 2-6 of pair — On Startup → Discoverability → API keys →
+    Browser logins → Ready.
 
-    Shared between legacy `run_pair` (whose Stage 1 mints a research_token
-    and waits for the app to claim it) and user-mode `cmd_pair_v2` (whose
-    Stage 1 is the pollSecret + customToken handshake). Each Stage-1
-    flow pre-fills the parameters this helper needs.
+    ⭐ THE NAME CARRIES THE COUNT ON PURPOSE. It was `_continue_pair_stages_2_to_5`
+    until 2026-09-17, when the discoverability question — which had been living
+    inside Stage 2 as "the stage's second question" — was given its own displayed
+    step. The name is reached by `inspect.getsource` from ten test sites across
+    four files, so it is the one rename in this change that fails loudly (an
+    AttributeError, not a quiet mismatch) if a reference is missed.
+
+    `cmd_pair_v2` (whose Stage 1 is the pollSecret + customToken handshake)
+    pre-fills the parameters this helper needs. ⛔ THIS DOCSTRING ALSO CLAIMED A
+    SHARED `run_pair` CALLER UNTIL 2026-09-17; there is no `run_pair` in this
+    file and there has not been for some time. Do not resurrect that claim.
 
     `_push_firestore_progress` writes per-platform login state to:
       - `devices/{device_id_for_progress}.logins` when in user-mode
@@ -72912,14 +73136,40 @@ async def _continue_pair_stages_2_to_5(
     _initial_paired_uid = initial_paired_uid  # legacy local-var alias
 
     # ══════════════════════════════════════════════════════════════════════
-    # [2/5] ON STARTUP — ask whether to enable On Startup mode. We only
+    # [2/6] ON STARTUP — ask whether to enable On Startup mode. We only
     #       CAPTURE the answer here; the actual arming (schtasks install
-    #       + detached daemon-loop spawn) happens in Stage 5 AFTER logins
+    #       + detached daemon-loop spawn) happens in Stage 6 AFTER logins
     #       succeed, so an aborted login can't leave Firestore with
     #       supervised=true while platforms are half-logged-in.
     # ══════════════════════════════════════════════════════════════════════
+    #
+    # ╔═ ⛔⛔ TELEMETRY STAGE ≠ DISPLAYED STEP, SINCE 2026-09-17 ═══════════════╗
+    # ║ DO NOT "FIX" THE MISMATCH BELOW. `PAIR_STAGE_REACHED.stage` is an     ║
+    # ║ IDENTITY IN A TIME SERIES, not a position on the screen. Every row    ║
+    # ║ ever recorded carries one of these numbers, and renumbering them      ║
+    # ║ would make a historical `stage=3` mean API keys before today and      ║
+    # ║ discoverability after — a reinterpretation of data already written,   ║
+    # ║ which is not reversible. So the emitted numbers are FROZEN at the     ║
+    # ║ code points they have always sat on, and the DISPLAYED step numbers   ║
+    # ║ moved. The mapping:                                                   ║
+    # ║                                                                       ║
+    # ║   displayed step   stage title        emitted telemetry               ║
+    # ║   1/6              Token setup        (no PAIR_STAGE_REACHED)         ║
+    # ║   2/6              On Startup         PAIR_STAGE_REACHED stage=2      ║
+    # ║   3/6              Discoverability    (none — see below)              ║
+    # ║   4/6              API keys           PAIR_STAGE_REACHED stage=3      ║
+    # ║   5/6              Browser logins     PAIR_STAGE_REACHED stage=4      ║
+    # ║   6/6              Ready              PAIR_COMPLETED      stage=5     ║
+    # ║                                                                       ║
+    # ║ ⭐ AND STEP 3 GETS NO NEW EMIT, WHICH COSTS NOTHING. The              ║
+    # ║ discoverability question already sat inside the stage that emits 2    ║
+    # ║ and was never separately reported; splitting the DISPLAY did not      ║
+    # ║ remove any coverage, so adding an emit would be a new series, not a   ║
+    # ║ repair. `tests/test_telemetry_call_sites_0818.py` therefore still     ║
+    # ║ pins exactly (2, 3, 4) — leave that tuple alone too.                  ║
+    # ╚═══════════════════════════════════════════════════════════════════════╝
     tm.tm_emit(tm.Ev.PAIR_STAGE_REACHED, stage=2)
-    _setup_step(2, 5, "On Startup")
+    _setup_step(2, 6, "On Startup")
     print(f"  {_c(_DIM, 'Keep the backend running in the background?')}")
     print(f"  {_c(_DIM, 'It will auto-start when you log in and stay alive through crashes')}")
     print(f"  {_c(_DIM, 'and reboots. You can turn it off anytime with --retire.')}")
@@ -72944,20 +73194,35 @@ async def _continue_pair_stages_2_to_5(
     if enable_on_startup:
         print(f"  {_c(_OK, '✓')}  On Startup will be enabled after the logins finish.")
     else:
-        print(f"  {_c(_DIM, '     Skipped. You will run --serve manually in step 5.')}")
+        print(f"  {_c(_DIM, '     Skipped. You will run --serve manually in step 6.')}")
         print(f"  {_c(_DIM, '     Enable later with:')}  {_c(_BOLD, f'{_PROG} --resurrect')}")
     print()
 
-    # ── The stage's second question: who may FIND this computer ────────────
+    # ══════════════════════════════════════════════════════════════════════
+    # [3/6] DISCOVERABILITY — who may FIND this computer. A yes/no, captured
+    #       here and written by the SHARED patch a few lines below, together
+    #       with the On Startup answer from step 2.
+    # ══════════════════════════════════════════════════════════════════════
     #
-    # ⭐ IT LIVES HERE RATHER THAN IN A SIXTH STAGE, and that was a measured
-    # decision, not a shortcut. The pair arc's "5" is a LITERAL at every one of
-    # its call sites — there is no constant — and it is restated in four banner
-    # comments, six user-visible strings, eleven docstrings, the README, the
-    # app's own walkthrough modal and `_setup_logo`'s hand-written "Five steps"
-    # line, which no test calls. A 5→6 renumber is ~45 sites of which the suite
-    # catches three. This stage is already "how should this machine behave",
-    # already a yes/no, and the question belongs to the same moment.
+    # ⭐ IT GOT ITS OWN DISPLAYED STEP ON 2026-09-17, AND THE COMMENT THAT USED
+    # TO SIT HERE ARGUED THE OPPOSITE. That comment was titled "IT LIVES HERE
+    # RATHER THAN IN A SIXTH STAGE, and that was a measured decision, not a
+    # shortcut", and it rested on a cost estimate: "~45 sites of which the suite
+    # catches three". Two things changed.
+    #
+    #   1. The owner asked for the sixth step (2026-09-15). Whether the question
+    #      deserves its own screen is theirs to decide, not the renumber cost's.
+    #   2. The cost was RECOUNTED and the old figure was wrong in both
+    #      directions. There are four `[n/5]` banner comments in this arc, not
+    #      six — step 1 has none — and the five other `[n/5]` banners in this
+    #      file belong to `--unpair`, whose arc is untouched. Against that, the
+    #      recount found a surface the old estimate never named at all: this
+    #      function's own NAME encoded the count (`_continue_pair_stages_2_to_5`)
+    #      and is reached by `inspect.getsource` from ten test sites.
+    #
+    # ⛔⛔ AND THE THING THAT ACTUALLY MATTERED WAS NEVER THE NUMBERS. It is the
+    # single `_pair_patch_device` write below, which carries BOTH answers. The
+    # display split; the write did not, and must not. See the block above it.
     #
     # ⛔⛔ DEFAULT NO, AND THAT IS LOAD-BEARING TWICE OVER. It is the private
     # answer, so an unattended pair publishes nothing. And it makes the two
@@ -72970,7 +73235,12 @@ async def _continue_pair_stages_2_to_5(
     # ⛔ NO `[y/N]` IN THE TEXT. The reader renders the hint from `default=`, so
     # a hand-written one is a second source that can drift from the parse — the
     # file has a guard that fails on exactly that.
-    print(f"  {_c(_DIM, 'Anyone you give the pair code to can already use this computer.')}")
+    #
+    # ⛔ NO `PAIR_STAGE_REACHED` EMIT HERE, DELIBERATELY — see the frozen-mapping
+    # block at step 2. This question has never been separately reported and a
+    # new emit would start a new series, not close a gap.
+    _setup_step(3, 6, "Discoverability")
+    print(f"  {_c(_DIM, 'Anyone you give the access code to can already use this computer.')}")
     print(f"  {_c(_DIM, 'This is about people who do NOT have it: whether they can find')}")
     print(f"  {_c(_DIM, 'this machine and ask you for access. You approve each person.')}")
     print()
@@ -73004,29 +73274,37 @@ async def _continue_pair_stages_2_to_5(
         # route. This stays as the backstop for a synchronous caller and to keep
         # the shape identical to the On Startup question above it.
         print()
-        log("Pairing cancelled by user (Stage 2 — discoverability)", "INFO")
+        log("Pairing cancelled by user (Stage 3 — discoverability)", "INFO")
         return False
     print()
 
-    # Mirror the Stage 2 intent to the device doc so the FE Account-page
-    # On Startup toggle flips in real time. The actual supervisor arm
-    # still happens in Stage 5; if it fails the user can fix via
+    # Mirror the Stage 2 AND Stage 3 answers to the device doc so the FE
+    # Account-page On Startup toggle flips in real time. The actual supervisor
+    # arm still happens in Stage 6; if it fails the user can fix via
     # --resurrect later.
     #
-    # ⛔ ONE PATCH, BOTH ANSWERS. `_pair_patch_device` sends an updateMask, and
-    # the rule it lands on is `hasOnly()` — which refuses the WHOLE update when
-    # one key is off-list. Two calls would mean the second answer could be lost
-    # on its own.
+    # ⛔⛔ TWO DISPLAYED STEPS, ONE WRITE, AND THAT IS THE WHOLE POINT. As of
+    # 2026-09-17 the two answers are asked under separate step headers — [2/6]
+    # On Startup and [3/6] Discoverability — but they still travel together in
+    # the SINGLE `_pair_patch_device` call below, and splitting the display must
+    # never become a licence to split the call. Two reasons, and either alone is
+    # enough:
+    #
+    #   · `_pair_patch_device` sends an updateMask and the rule it lands on is
+    #     `hasOnly()` — which refuses the WHOLE update when one key is off-list.
+    #     Two calls mean the second answer can be refused ON ITS OWN, with the
+    #     first already through, and nothing on this screen would show it.
+    #   · `visibility` has NO second writer anywhere in the pair flow. Stage 6
+    #     re-writes `supervised` on both branches, so that answer gets a second
+    #     chance; discoverability does not. A lost discoverability answer is lost
+    #     for good, with the person told it was saved.
     #
     # ⛔⛔ AND THE WRITE COMES BEFORE THE CONFIRMATION, which is the opposite of
     # how this block was first written. `_pair_patch_device` is best-effort: it
     # returns False on a missing token, a network error and a rules refusal
     # alike, and printing "✓ People will be able to find it" above it meant the
-    # tick stood whatever happened. `supervised` survives that — Stage 5 writes
-    # it again on both branches — but `visibility` has NO second writer in the
-    # whole pair flow, so a lost answer here is lost for good, and the person was
-    # told otherwise. Discovery is the one thing in this stage nobody can check
-    # from the machine afterwards.
+    # tick stood whatever happened. Discovery is the one thing in these two
+    # stages nobody can check from the machine afterwards.
     saved = False
     if device_id_for_progress:
         saved = _pair_patch_device(device_id_for_progress, {
@@ -73049,15 +73327,15 @@ async def _continue_pair_stages_2_to_5(
         print(f"  {_c(_DIM, '     Try again any time with:')}  "
               f"{_c(_BOLD, f'{_PROG} --visibility public')}")
     else:
-        print(f"  {_c(_DIM, '     Only people you give the pair code to can ask.')}")
+        print(f"  {_c(_DIM, '     Only people you give the access code to can ask.')}")
         print(f"  {_c(_DIM, '     Let them find it later with:')}  "
               f"{_c(_BOLD, f'{_PROG} --visibility public')}")
     print()
 
     # ══════════════════════════════════════════════════════════════════════
-    # [3/5] API KEYS — detect-or-prompt for Anthropic + Gemini BEFORE
+    # [4/6] API KEYS — detect-or-prompt for Anthropic + Gemini BEFORE
     #       browser logins so the keys (especially Anthropic) are available
-    #       for the CUA + Vision verification path during Stage 4. Without
+    #       for the CUA + Vision verification path during Stage 5. Without
     #       this ordering, login verification falls back to Playwright-only
     #       (less rigorous) and the Pro-tier check can't run at all.
     #       Each key is independently skippable; pair continues either way.
@@ -73065,11 +73343,14 @@ async def _continue_pair_stages_2_to_5(
     #       Account page — or via FE bridge in user-mode, per D5c-2) +
     #       os.environ (current session) + busts the resolver cache so the
     #       very-next resolve_api_key() call (in the CUA-client init at the
-    #       top of Stage 4) sees the new key. NOT written to .dg-supervisor
+    #       top of Stage 5) sees the new key. NOT written to .dg-supervisor
     #       .env — would create a 3rd source of truth and drift on rotation.
     # ══════════════════════════════════════════════════════════════════════
+    # ⛔ THE EMIT BELOW STAYS `stage=3` WHILE THE SCREEN SAYS [4/6]. That is
+    # deliberate and frozen — see the mapping block at step 2. A historical
+    # `stage=3` row means API keys, and it must go on meaning API keys.
     tm.tm_emit(tm.Ev.PAIR_STAGE_REACHED, stage=3)
-    _setup_step(3, 5, "API keys")
+    _setup_step(4, 6, "API keys")
     print(f"  {_c(_DIM, 'Anthropic powers the agents (CUA + Vision).  Gemini powers narration.')}")
     print(f"  {_c(_DIM, 'Already-set keys are detected and reused. Skip to set later via the web app.')}")
     print()
@@ -73079,17 +73360,19 @@ async def _continue_pair_stages_2_to_5(
         # Ctrl+C during API-key entry = cancel the pair (universal Ctrl+C rule).
         # Return False so cmd_pair_v2 reverts the partial pair.
         print()
-        log("Pairing cancelled by user (Stage 3 — API keys)", "INFO")
+        log("Pairing cancelled by user (Stage 4 — API keys)", "INFO")
         return False
     print()
 
     # ══════════════════════════════════════════════════════════════════════
-    # [4/5] BROWSER LOGINS — open 4 platform tabs and wait for real auth.
-    #       Uses CUA + Vision when Anthropic key was set in Stage 3 (above),
+    # [5/6] BROWSER LOGINS — open 4 platform tabs and wait for real auth.
+    #       Uses CUA + Vision when Anthropic key was set in Stage 4 (above),
     #       or falls back to Playwright-only if user skipped.
     # ══════════════════════════════════════════════════════════════════════
+    # ⛔ THE EMIT BELOW STAYS `stage=4` WHILE THE SCREEN SAYS [5/6] — frozen
+    # identity, see the mapping block at step 2.
     tm.tm_emit(tm.Ev.PAIR_STAGE_REACHED, stage=4)
-    _setup_step(4, 5, "Browser logins")
+    _setup_step(5, 6, "Browser logins")
     print(f"  {_c(_DIM, 'We open your real Chrome — sign in to each platform (+ solve any check).')}")
     print(f"  {_c(_DIM, 'Your sign-ins are saved to the profile (verification optional afterwards).')}")
     print("")
@@ -73116,29 +73399,29 @@ async def _continue_pair_stages_2_to_5(
 
 
     # CUA client for visual double-verification. Best-effort: if no key is
-    # available, Stage 4 (Browser logins) falls back to Playwright-only
-    # verification (same as before). With a key present — set in Stage 3
+    # available, Stage 5 (Browser logins) falls back to Playwright-only
+    # verification (same as before). With a key present — set in Stage 4
     # via the API-key prompt OR already resolved via Firestore / user-scope
     # env / shell rc / .dg-supervisor.env — each platform has to pass BOTH
-    # Playwright DOM checks AND CUA vision before Stage 4 clears it.
+    # Playwright DOM checks AND CUA vision before Stage 5 clears it.
     # Matches Phase 0 init rigor.
     _setup_cua_client = None
     # Route through `resolve_api_key()` (research.py:203) so this site honors
     # the full precedence chain (Firestore → user-scope env → os.environ),
     # not just flat os.environ. Was previously a two-ladder inconsistency
     # with vision.py:269 — both now go through the same resolver. After the
-    # 2026-05-18 stage reorder, Stage 3 also busts `_RESOLVED_KEY_CACHE` so
+    # 2026-05-18 stage reorder, Stage 4 also busts `_RESOLVED_KEY_CACHE` so
     # a freshly-pasted key is visible here without restart.
     _setup_cua_api_key = resolve_api_key()
     if _setup_cua_api_key:
         try:
             import anthropic as _anthropic
             _setup_cua_client = _anthropic.Anthropic(api_key=_setup_cua_api_key)
-            log("Setup Stage 4: CUA vision verifier enabled — each platform will be double-checked.", "INFO")
+            log("Setup Stage 5: CUA vision verifier enabled — each platform will be double-checked.", "INFO")
         except Exception as e:
-            log(f"Setup Stage 4: Could not init CUA client ({e}) — Playwright-only verification.", "WARN")
+            log(f"Setup Stage 5: Could not init CUA client ({e}) — Playwright-only verification.", "WARN")
     else:
-        log("Setup Stage 4: No ANTHROPIC_API_KEY — Playwright-only verification (less rigorous). Re-run --pair and paste a key at Stage 3 to enable CUA.", "WARN")
+        log("Setup Stage 5: No ANTHROPIC_API_KEY — Playwright-only verification (less rigorous). Re-run --pair and paste a key at Stage 4 to enable CUA.", "WARN")
 
     services = _LOGIN_SERVICES
     pad = max(len(n) for n, _u, _k in services)
@@ -73223,7 +73506,7 @@ async def _continue_pair_stages_2_to_5(
             verify_mode="ask")
     except (EOFError, KeyboardInterrupt):
         print("")
-        log("Setup cancelled by user (Stage 4 sign-in)", "INFO")
+        log("Setup cancelled by user (Stage 5 sign-in)", "INFO")
         return False  # real cancel → cmd_pair_v2 reverts the partial pair
     except Exception as e:
         # A transient launch/verify failure must NOT destroy a real pairing
@@ -73342,25 +73625,35 @@ async def _continue_pair_stages_2_to_5(
         # to be a fraction OF — and "no completions recorded" reads exactly like
         # "nobody ever finishes pairing". `profiles` is the answer to the question
         # the founding incident turned on: the owner wanted two concurrent run
-        # slots and got one, and [5/5] Ready reported success without ever naming
+        # slots and got one, and [6/6] Ready reported success without ever naming
         # the capacity.
+        #
+        # ⛔ `stage=5` BELOW WHILE THE SCREEN SAYS [6/6] — frozen identity, see
+        # the mapping block at step 2. PAIR_COMPLETED has always carried 5 and
+        # must go on carrying it.
+        #
+        # ⚠ SEPARATELY, AND NOT INTRODUCED HERE: `stage` is not in this event's
+        # declared field list in telemetry.py (("duration_ms","profiles",
+        # "supervised")), nor in telemetry_catalogue.json. That drift predates
+        # 2026-09-17 and is left exactly as found rather than repaired in a
+        # renumber change.
         tm.tm_emit(tm.Ev.PAIR_COMPLETED, stage=5,
                    profiles=max(1, int(next_profile_n) - 1),
                    supervised=bool(enable_on_startup))
         # ══════════════════════════════════════════════════════════════════════
-        # [5/5] READY — pair is complete. If the user opted into On Startup
+        # [6/6] READY — pair is complete. If the user opted into On Startup
         #       back in step 2, arm the supervisor NOW (deferred from step 2).
         #
         #       PARTIAL / ZERO logins STILL complete the pair (user direction
-        #       2026-06-30): a stuck Stage-4 login must not strand pairing. The
-        #       device link (Stages 1-3) is real; Phase 0 re-verifies logins at
+        #       2026-06-30): a stuck Stage-5 login must not strand pairing. The
+        #       device link (Stages 1-4) is real; Phase 0 re-verifies logins at
         #       run time, so the missing ones can be signed in later. Supervisor
         #       is armed per the On-Startup choice regardless of login count —
         #       an armed backend just idles until a run needs a logged-in tab.
         # ══════════════════════════════════════════════════════════════════════
         _logged_in = [n for n, _u, k in services if results.get(k, False)]
         _not_logged_in = [n for n, _u, k in services if not results.get(k, False)]
-        _setup_step(5, 5, "Ready")
+        _setup_step(6, 6, "Ready")
         print(f"  {_c(_OK, '✓')}  Paired with {_c(_BOLD, linked_email or '—')}")
         if not _not_logged_in:
             print(f"  {_c(_OK, '✓')}  All {len(services)} platforms logged in")
@@ -74475,67 +74768,170 @@ def _kill_pids(pids: list[int]) -> int:
     return 0
 
 
-def _free_port(port: int = 8000) -> "list[int]":
+class _PortProbeUnavailable(Exception):
+    """Nothing on this machine could say what is listening on a port.
+
+    ⛔⛔ THE EMPTY LIST WAS THE BUG, WHICH IS WHY THIS IS A RAISE AND NOT A
+    RETURN VALUE. `_free_port` ran `lsof -ti :<port>` as its only POSIX probe
+    inside a bare `except Exception: return []`, and plenty of Linux images ship
+    without lsof. "[] because the port is free" and "[] because I could not
+    look" were then the same value, and every caller read the kinder one:
+
+      * the multi-worker supervisor had ALREADY proved the port was occupied
+        (`_serve_exit_was_port_conflict`), logged "freed nothing", and respawned
+        into the identical EADDRINUSE — forever, because a port conflict is
+        deliberately exempt from the crash tracker;
+      * the installer printed its "Cleared port 8000" line only on success, so a
+        probe that never ran was completely invisible;
+      * `--doctor` said "Port 8000 not bound — API unreachable" about a port it
+        had never managed to examine. That is the defect recorded in that row's
+        own comment — "a dead check read as a clean run" — restated one layer
+        down, and the handler written for it could not fire, because
+        `_port_holders` swallowed every exception and this class did not exist.
+
+    A caller may still decide to carry on. It may not decide that silently.
+    """
+
+
+def _listening_pids(port: int) -> "set[int]":
+    """PIDs LISTENING on `port` — psutil first, a shell tool only as fallback.
+
+    ⛔ THE ONE PROBE IN THIS FILE, because the two it replaced did not ask the
+    same question and the difference was a bug by itself. `_port_holders` asked
+    `lsof -nP -iTCP:<port> -sTCP:LISTEN -t`; `_free_port` asked `lsof -ti
+    :<port>`, which matches any socket whose LOCAL **or REMOTE** port is that
+    number and applies no LISTEN filter at all. So the blunt path would
+    force-kill a process that merely held an outbound connection to somebody
+    else's port 8000. There is one query now and it is the listener one.
+
+    Two sources because neither is reliable alone: psutil's `net_connections`
+    raises AccessDenied on macOS without root even for the caller's own sockets,
+    and lsof is missing from many Linux images (`_port_holder_hint` hands those
+    `ss` for the same reason). The shell tool is still tried whenever psutil
+    found NOTHING, not only when it raised — psutil can return a socket with no
+    pid attached, which reads here as an empty answer while lsof can still name
+    the holder — so this is no narrower than what it replaced.
+
+    Never reports the caller. In some restart paths this process is the one
+    listening, and signalling it would be the backend killing itself at boot.
+
+    Raises `_PortProbeUnavailable` when NEITHER source could run. An empty set
+    means a probe answered and nothing is listening. Those are different facts
+    and no caller may read the first as the second.
+    """
+    import os as _os
+    import subprocess as _sp
+    me = _os.getpid()
+    pids: "set[int]" = set()
+    why: "list[str]" = []
+
+    psutil_ok = False
+    try:
+        import psutil as _ps
+        for conn in _ps.net_connections(kind="inet"):
+            if conn.status != _ps.CONN_LISTEN or not conn.laddr:
+                continue
+            if conn.laddr.port != port or not conn.pid or conn.pid == me:
+                continue
+            pids.add(conn.pid)
+        psutil_ok = True
+    except Exception as _pe:
+        # ⭐ Every `import psutil` in this file is function-local and guarded on
+        # purpose, so a SOURCE checkout without it lands here — which on an
+        # lsof-less box is the exact double failure this function exists to
+        # report rather than swallow.
+        why.append(f"psutil: {type(_pe).__name__}")
+
+    shell_ok = False
+    plat = _supervisor_platform()
+    if not pids:
+        _p = str(port)
+        try:
+            if plat == "Windows":
+                r = _sp.run(
+                    ["netstat", "-ano", "-p", "TCP"],
+                    capture_output=True, text=True, timeout=8,
+                    creationflags=_PS_NO_WINDOW,
+                )
+                for line in (r.stdout or "").splitlines():
+                    # Format: "  TCP    0.0.0.0:8000    0.0.0.0:0    LISTENING    1234"
+                    if "LISTENING" not in line:
+                        continue
+                    if f":{_p} " not in line and not line.endswith(f":{_p}"):
+                        if f" :{_p}\t" not in line and f"0.0.0.0:{_p}" not in line and f"[::]:{_p}" not in line:
+                            continue
+                    parts = line.split()
+                    if not parts:
+                        continue
+                    try:
+                        pid = int(parts[-1])
+                    except ValueError:
+                        continue
+                    if pid > 0 and pid != me:
+                        pids.add(pid)
+                shell_ok = True
+            elif plat in ("Darwin", "Linux"):
+                r = _sp.run(
+                    ["lsof", "-nP", f"-iTCP:{_p}", "-sTCP:LISTEN", "-t"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                for tok in (r.stdout or "").split():
+                    try:
+                        pid = int(tok.strip())
+                    except ValueError:
+                        continue
+                    if pid > 0 and pid != me:
+                        pids.add(pid)
+                shell_ok = True
+            else:
+                # ⛔ `_supervisor_platform` answers "Unsupported" for anything
+                # that is not Windows/Darwin/Linux, and NEITHER branch matched
+                # it — so the old code fell straight through to `return []`, and
+                # a platform that was never probed at all reported a free port.
+                why.append(f"no port tool for platform {plat}")
+        except Exception as _se:
+            why.append(
+                f"{'netstat' if plat == 'Windows' else 'lsof'}: {type(_se).__name__}")
+
+    if not psutil_ok and not shell_ok:
+        raise _PortProbeUnavailable(
+            f"could not look at port {port} — " + ("; ".join(why) or "no source"))
+    return pids
+
+
+def _free_port(port: int = 8000) -> "tuple[list[int], bool]":
     """Find and force-kill any process listening on `port` so a fresh --serve
     can bind. Used by --resurrect, the multi-worker port-squatter auto-recovery,
     and any arming path — clears stale squatters (crashed-but-port-leaked
     --serves and accidentally-running third-party apps) on any worker port.
 
-    Returns the list of PIDs that were killed. Returns [] when the port is
-    already free or no killable owner could be identified (best-effort).
-    Cross-platform — Windows uses netstat, POSIX uses lsof.
+    Returns `(killed_pids, probed)`. `probed` is False when NO source could say
+    what was listening; the pid list is then empty for a reason that is not "the
+    port is free", and a caller that prints or logs must say so. See
+    `_PortProbeUnavailable` for what that silence cost.
+
+    ⛔⛔ THIS ONE STILL KILLS WHAT IT FINDS, AND THAT IS DELIBERATE. It shares
+    `_listening_pids` with `_port_holders`, but NOT `_port_holders`' `ours` flag:
+    this is the blunt instrument on the install and crash-respawn paths, where
+    nothing is running yet and the only question is whether the port is clear.
+    `_reclaim_port` is the opposite — it names a foreign holder and refuses to
+    touch it. Routing this through `_port_holders` would inherit that ownership
+    check for free and silently change the kill policy of two paths nobody
+    reviewed for it. Whether it SHOULD keep killing strangers is an open
+    question for the owner; it is not a side effect of swapping probes.
     """
-    import subprocess as _sp
-    plat = _supervisor_platform()
-    pids_to_kill: "set[int]" = set()
-    _p = str(port)
     try:
-        if plat == "Windows":
-            r = _sp.run(
-                ["netstat", "-ano", "-p", "TCP"],
-                capture_output=True, text=True, timeout=8,
-                creationflags=_PS_NO_WINDOW,
-            )
-            for line in (r.stdout or "").splitlines():
-                # Format: "  TCP    0.0.0.0:8000    0.0.0.0:0    LISTENING    1234"
-                if "LISTENING" not in line:
-                    continue
-                if f":{_p} " not in line and not line.endswith(f":{_p}"):
-                    if f" :{_p}\t" not in line and f"0.0.0.0:{_p}" not in line and f"[::]:{_p}" not in line:
-                        continue
-                parts = line.split()
-                if not parts:
-                    continue
-                try:
-                    pid = int(parts[-1])
-                except ValueError:
-                    continue
-                if pid > 0 and pid != os.getpid():
-                    pids_to_kill.add(pid)
-        elif plat in ("Darwin", "Linux"):
-            r = _sp.run(
-                ["lsof", "-ti", f":{_p}"],
-                capture_output=True, text=True, timeout=8,
-            )
-            for line in (r.stdout or "").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    pid = int(line)
-                except ValueError:
-                    continue
-                if pid > 0 and pid != os.getpid():
-                    pids_to_kill.add(pid)
-    except Exception:
-        return []
-    if not pids_to_kill:
-        return []
-    _kill_pids(list(pids_to_kill))
-    return sorted(pids_to_kill)
+        pids = _listening_pids(port)
+    except _PortProbeUnavailable:
+        return [], False
+    if not pids:
+        return [], True
+    ordered = sorted(pids)
+    _kill_pids(ordered)
+    return ordered, True
 
 
-def _free_port_8000() -> "list[int]":
+def _free_port_8000() -> "tuple[list[int], bool]":
     """Back-compat alias — see `_free_port`. Retained for existing callers."""
     return _free_port(8000)
 
@@ -74622,42 +75018,19 @@ def _looks_like_our_backend(cmdline: str) -> bool:
 def _port_holders(port: int) -> list:
     """Listening processes on `port`, each tagged with whether it is ours.
 
-    Two sources because neither is reliable alone: psutil's `net_connections`
-    raises AccessDenied on macOS without root even for the caller's own sockets,
-    and `lsof` is not installed on every Linux image. Whichever answers, answers.
+    The probe is `_listening_pids` — psutil first, the platform's port tool as
+    the fallback, one query shared with `_free_port`. What this function adds is
+    the thing the probe cannot answer: WHO each pid is, read from its ARGV,
+    because that is what decides whether we are allowed to touch it.
+
+    Raises `_PortProbeUnavailable` when no source could look. It used to swallow
+    that and return [], and [] is a sentence two callers finish differently and
+    both wrongly: `_port_row_verdict` reads it as "unbound", `_reclaim_port` read
+    it as "nothing identifiable, wait it out". One missing binary, two confident
+    wrong answers to "is anything there?".
     """
-    import os as _os
-    me = _os.getpid()
-    found: dict = {}
-
-    try:
-        import psutil as _ps
-        for conn in _ps.net_connections(kind="inet"):
-            if conn.status != _ps.CONN_LISTEN or not conn.laddr:
-                continue
-            if conn.laddr.port != port or not conn.pid or conn.pid == me:
-                continue
-            found.setdefault(conn.pid, None)
-    except Exception:
-        pass
-
-    if not found:
-        try:
-            out = subprocess.run(
-                ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
-                capture_output=True, text=True, timeout=10)
-            for line in (out.stdout or "").split():
-                try:
-                    pid = int(line.strip())
-                except ValueError:
-                    continue
-                if pid and pid != me:
-                    found.setdefault(pid, None)
-        except Exception:
-            pass
-
     holders = []
-    for pid in found:
+    for pid in sorted(_listening_pids(port)):
         name, cmd, argv = "?", "", []
         try:
             import psutil as _ps
@@ -74707,6 +75080,12 @@ def _reclaim_port(port: int, settle_s: float = 12.0):
       foreign   — something else holds it; caller must refuse
       busy      — ours, and running or queueing work; caller must refuse
       stuck     — ours, but it would not let go
+      unknown   — held, and NOTHING on this machine could look at who holds it
+
+    ⛔ "unknown" is new because it used to come out as "stuck", whose refusal
+    text says "still held after stopping the earlier backend" — and nothing had
+    been stopped, or even identified. A probe that could not run is not a holder
+    that would not let go.
     """
     import signal as _sig   # NOT module-level in this file; `_kill_tree` imports
                            # its own for the same reason. Missing it here failed
@@ -74717,7 +75096,13 @@ def _reclaim_port(port: int, settle_s: float = 12.0):
     if _wait_for_port_free(port, 0.5):
         return "free", []
 
-    holders = _port_holders(port)
+    try:
+        holders = _port_holders(port)
+    except _PortProbeUnavailable:
+        # Still wait it out first: a TIME_WAIT socket clears on its own, and
+        # that is true whether or not we could see who left it. Only if the port
+        # is STILL held do we say the honest thing — held, and unidentifiable.
+        return ("free", []) if _wait_for_port_free(port, settle_s) else ("unknown", [])
     ours = [h for h in holders if h["ours"]]
     foreign = [h for h in holders if not h["ours"]]
 
@@ -75359,7 +75744,7 @@ def run_daemon_loop(port: int = 8000):
         log(f"[daemon-loop] Pre-flight import probe crashed (continuing anyway): {_pe}", "WARN")
 
     # ──── Multi-worker branch (2026-05-21) ────────────────────────────
-    # workerCount > 1 means pair Stage 4 set up N>=2 browser profiles —
+    # workerCount > 1 means pair Stage 5 set up N>=2 browser profiles —
     # spawn N --serve subprocesses (one per profile slot) in parallel via
     # Popen + a poll loop. Each worker K binds port (port + K - 1) and
     # is pinned to its own profile dir via --worker-id=K. Single-worker
@@ -75604,13 +75989,30 @@ def run_daemon_loop(port: int = 8000):
                         _w_port = state.get("port") or (port + (k - 1))
                         _, _err_path = _open_logs(k)
                         if _serve_exit_was_port_conflict(_err_path):
-                            freed = _free_port(_w_port)
-                            log(
-                                f"[daemon-loop] worker {k}: port {_w_port} was occupied "
-                                f"(EADDRINUSE) — freed {freed or 'nothing'}; respawning "
-                                f"(not counted as a crash)",
-                                "WARN",
-                            )
+                            freed, _probed = _free_port(_w_port)
+                            if _probed:
+                                log(
+                                    f"[daemon-loop] worker {k}: port {_w_port} was occupied "
+                                    f"(EADDRINUSE) — freed {freed or 'nothing'}; respawning "
+                                    f"(not counted as a crash)",
+                                    "WARN",
+                                )
+                            else:
+                                # ⛔⛔ WHERE THE SILENCE WAS PAID FOR. The worker has
+                                # already PROVED the port is occupied, so "freed
+                                # nothing" was never the fact — the fact is that
+                                # nothing here could look. This respawns into the
+                                # same EADDRINUSE, and a port conflict is exempt
+                                # from the crash tracker, so it does so forever.
+                                # The exemption stays; the silence does not.
+                                log(
+                                    f"[daemon-loop] worker {k}: port {_w_port} was occupied "
+                                    f"(EADDRINUSE) and NO PROBE COULD LOOK at who holds it "
+                                    f"(no psutil, no netstat/lsof) — freed nothing and "
+                                    f"respawning into the same conflict. Check by hand: "
+                                    f"{_port_holder_hint(_w_port)}",
+                                    "WARN",
+                                )
                         else:
                             state["crash_window"].append(_now)
                             state["crash_window"] = [
@@ -75858,7 +76260,7 @@ def _write_supervised_flag(enabled: bool):
     so the FE Account-page On Startup toggle reflects the supervisor
     state. Uses Firestore REST PATCH via _pair_patch_device — no gRPC
     client init needed, so callers (--resurrect / --retire / --pair
-    Stage 5) don't pay the ~10-30s init_firebase wall-clock on Windows.
+    Stage 6) don't pay the ~10-30s init_firebase wall-clock on Windows.
 
     Best-effort: if no deviceId on disk or the PATCH fails, the local unit is
     still the source of truth for supervisor state and the heartbeat re-writes
@@ -76590,9 +76992,15 @@ def run_resurrect():
         # Without this, daemon-loop will spawn --serve which hits "address
         # already in use" on the first uvicorn bind and crash-loops every
         # 5s. _free_port_8000 catches it once at install time.
-        port_squatters = _free_port_8000()
+        port_squatters, _port_probed = _free_port_8000()
         if port_squatters:
             print(f"  {_c(_DIM, f'     Cleared port 8000 (killed PID(s): {port_squatters})')}")
+        elif not _port_probed:
+            # It printed on success only, so a probe that never ran left no line
+            # at all — and this is the arming path, where the very next thing is
+            # a daemon-loop that will crash-loop on the bind we could not clear.
+            print(f"  {_c(_WARN, '     Could not check port 8000 — no psutil and no netstat/lsof here.')}")
+            print(f"  {_c(_DIM, f'     If the backend does not start, look yourself: {_port_holder_hint(8000)}')}")
         # Belt-and-suspenders: gate on win32 (mirrors `run_daemon_loop`'s
         # _NO_WINDOW pattern at research.py:27223-27240). This branch is
         # already only reachable on Windows after the Darwin/Linux early-
@@ -77041,6 +77449,60 @@ def run_retire():
 _VISIBILITY_SHOW = "__show__"
 _VISIBILITY_VALUES = ("public", "private")
 
+# ⛔⛔ THE MACHINE WAS THE HALF THAT NEVER LEARNED THE NEW NAME. `visibility` is
+# becoming `joinPolicy` — the same answer under the name groups give it, "who may
+# join this computer". `firestore.rules` has admitted both keys side by side since
+# wave 7 and the agent learned to read both in wave 8; this file still compared to
+# the literal `visibility` and fell through to PRIVATE, so the day a document is
+# written under the new name it would read "private" to the very machine that owns
+# it. `--visibility` would print Private on a listed computer, and `--visibility
+# private` would then be answered "Already set — nothing to change" and never
+# write — leaving somebody unable to close a door they had been told was shut,
+# with no error anywhere and nothing to notice it by.
+#
+# ⛔⛔ THE OLD NAME WINS WHILE IT IS THERE, AND THE FIRST BUILD OF THIS HAD IT
+# BACKWARDS. Preferring `joinPolicy` reads its presence as proof the document has
+# been migrated — but nothing writes it yet, and everything that ACTS on the
+# setting still reads `visibility`: the app's public list queries
+# `where("visibility", "==", "public")`, `isListable` tests `source.visibility`,
+# and both of this program's own writes (pair Stage 3, and `--visibility` below)
+# put the OLD key down. A reader must agree with the writers, not with the
+# migration's destination. On a toggle the cost of disagreeing is the door that
+# never closes: write `visibility: private` while `joinPolicy` still says public
+# and the next read answers "already public".
+#
+# ⭐ AND IT STILL SURVIVES THE RENAME. When the migration finally removes
+# `visibility`, `joinPolicy` is what is left and it answers. That is the whole
+# job: be right before, during and after, without this program ever WRITING the
+# new name.
+#
+# ⛔ THIS IS THE READ VOCABULARY AND `_VISIBILITY_VALUES` IS THE WRITE ONE. They
+# sit two lines apart and are both 2-tuples of lowercase words, so say it out
+# loud: that tuple is the two values `--visibility` accepts, this one is the field
+# NAMES to look under. Merging them would make the machine write `joinPolicy`,
+# which would take the old key off a document every un-upgraded machine in the
+# field is still reading. Reading both names is compatible; writing the new one is
+# not, and the old key comes off when a fleet reading says nobody is writing it.
+_DISCOVERY_KEYS = ("visibility", "joinPolicy")
+
+
+def _discovery_of(meta: dict) -> str:
+    """Who can FIND this computer: "public" or "private", under either name.
+
+    ⛔ Callers must apply this to a read that SUCCEEDED. `{}` from a failed fetch
+    resolves to "private" here exactly like a real document with no field, and
+    that is the one lie `run_visibility`'s empty-read guard exists to refuse — so
+    the guard stays ABOVE the call, never below it.
+    """
+    for key in _DISCOVERY_KEYS:
+        value = meta.get(key)
+        if isinstance(value, str) and value:
+            return "public" if value == "public" else "private"
+    # ⛔ ABSENT IS PRIVATE. A machine paired before 2026-09-04 carries neither key
+    # and nothing backfills one, and the safe direction for a discovery setting is
+    # the one that hides.
+    return "private"
+
 
 def run_visibility(value: str, ignored_topic: "str | None" = None) -> int:
     """`--visibility [public|private]` — show or set who can FIND this computer.
@@ -77130,7 +77592,10 @@ def run_visibility(value: str, ignored_topic: "str | None" = None) -> int:
                   f"{_c(_BOLD, 'set the way it was')}{_c(_DIM, '.')}")
         print()
         return 1
-    current = "public" if meta.get("visibility") == "public" else "private"
+    # ⛔ BELOW THE EMPTY-READ GUARD, NEVER ABOVE IT — `_discovery_of({})` answers
+    # "private", so resolving before the guard would reinstate the exact defect
+    # that guard exists to catch.
+    current = _discovery_of(meta)
 
     def _describe(state: str) -> None:
         if state == "public":
@@ -77139,7 +77604,7 @@ def run_visibility(value: str, ignored_topic: "str | None" = None) -> int:
             print(f"  {_c(_DIM, '     You still approve every person yourself.')}")
         else:
             print(f"  {_c(_BOLD, '○')}  {_c(_BOLD, 'Private')}  "
-                  f"{_c(_DIM, '— only people you give the pair code to can ask.')}")
+                  f"{_c(_DIM, '— only people you give the access code to can ask.')}")
 
     if value == _VISIBILITY_SHOW:
         _describe(current)
@@ -77181,7 +77646,156 @@ def run_visibility(value: str, ignored_topic: "str | None" = None) -> int:
     return 0
 
 
-def run_unpair(deep: bool = False):
+def _unpair_body_error(resp) -> str:
+    """The `error` string from an unpair-self JSON body, or "" if there isn't one.
+
+    The route answers every refusal as `{"error": "<slug>"}` (401
+    unauthorized, 403 not_authorized, 404 device_not_found, 500
+    auth_delete_failed / internal_error). The slug — not the bare status —
+    is what `run_unpair` discriminates on: a 404 from the ROUTE means the
+    device doc is already gone and wiping locally is correct, while a 404
+    from a proxy/edge (a wrong FE_BASE_URL, a rewritten path) means we never
+    reached the route at all and must not be read as confirmation."""
+    try:
+        _body = resp.json() or {}
+    except Exception:
+        return ""
+    if not isinstance(_body, dict):
+        return ""
+    _err = _body.get("error")
+    return _err if isinstance(_err, str) else ""
+
+
+def _unpair_keystore_is_gone() -> "bool | None":
+    """True when the OS keystore holds nothing recoverable, False when it does,
+    None when we could not tell (auth/ missing, keyring exploded).
+
+    Exists because `_fresh_user_mode_id_token()` IS NOT READ-ONLY ON FAILURE:
+    on a genuine RevokedError it calls `keystore.clear_all(iuid,
+    reason="revoke")` before returning None. So on the revoke path the
+    keystore is ALREADY wiped by the time the unpair gate fires, and printing
+    "nothing changed" there would be a lie. The gate probes this and says
+    what actually happened instead."""
+    try:
+        from auth import keystore as _ks
+        return _ks.try_recover(_ks.install_uuid()) is None
+    except Exception:
+        return None
+
+
+def _unpair_refusal_sentences(
+    device_id: str,
+    kind: str,
+    status: int = 0,
+    detail: str = "",
+    keystore_gone: "bool | None" = None,
+) -> "list[str]":
+    """The sentences `--unpair` prints when the server did not CONFIRM.
+
+    `kind` is "no-token" (the ID token never minted — no request was made,
+    so there is no status to report), "http" (a non-200 answer) or "error"
+    (network failure / exception / import failure).
+
+    Deliberately NOT one canned line. Three of the cases make "run it again"
+    actively wrong advice:
+      • 500 auth_delete_failed — the route's own comment says the revoke has
+        already run, so a second attempt cannot even mint a token. The
+        owner's web Reset is the recovery, and re-running would loop.
+      • 403 not_authorized — a device doc with no `syntheticDeviceUid` fails
+        every branch of the route forever. Retrying never succeeds.
+      • the revoke path — the keystore is already gone (see
+        `_unpair_keystore_is_gone`), so "nothing changed" is false and a
+        second run cannot authenticate either.
+    Every branch names `--force`, because a refusal skips the orphan-process
+    kill + supervisor removal that --unpair otherwise always performs."""
+    _lines: "list[str]" = []
+    _err = (detail or "").strip()
+
+    if kind == "no-token" and keystore_gone is True:
+        _lines.append(
+            "This machine's sign-in is already gone, so the server could never "
+            "be told to release the device."
+        )
+        _lines.append(
+            "Nothing else changed — your local pairing config is still here — "
+            "but running --unpair again cannot reach the server either."
+        )
+        # ⛔ "Account → Manage devices" IS NOT A PAGE (see the note in
+        # `_cancel_unclaimed_pair`). Removing a device is Unlink, on the tile,
+        # which IS on the Account page; Reset and the device list are under
+        # Settings. These four sentences said one name for two different places.
+        _lines.append(
+            f"Unlink the device{' ' + device_id if device_id else ''} on your "
+            "Account page on the web, then run "
+            "`--unpair --force` here to finish cleaning up this machine."
+        )
+    elif kind == "no-token":
+        _lines.append(
+            "Nothing changed — this machine could not prove who it is, so no "
+            "request reached the server."
+        )
+        _lines.append("Run it again, or remove it in Account.")
+    elif kind == "http" and status == 500:
+        _lines.append(
+            f"Nothing changed here — the server started the retire and could "
+            f"not finish it (HTTP {status}"
+            + (f" {_err}" if _err else "")
+            + ")."
+        )
+        _lines.append(
+            "⛔ Do NOT just run it again: the sign-in this needs was already "
+            "revoked server-side, so a second attempt cannot authenticate."
+        )
+        _lines.append(
+            "Use Reset in Settings → Manage devices on the web to recover, then "
+            "`--unpair --force` here."
+        )
+    elif kind == "http" and status == 403:
+        _lines.append(
+            f"Nothing changed — the server would not authorise this machine "
+            f"(HTTP {status}"
+            + (f" {_err}" if _err else "")
+            + ")."
+        )
+        _lines.append(
+            "This device's record predates the current pairing format, so "
+            "retrying will refuse again every time."
+        )
+        _lines.append(
+            "Unlink the tile on your Account page, then run "
+            "`--unpair --force` here."
+        )
+    elif kind == "http":
+        _lines.append(
+            f"Nothing changed — the server did not confirm the release "
+            f"(HTTP {status}"
+            + (f" {_err}" if _err else "")
+            + ")."
+        )
+        _lines.append("Run it again, or remove it in Account.")
+    else:
+        _lines.append(
+            "Nothing changed — the server could not be reached, so it never "
+            "confirmed the release."
+            + (f" ({_err[:160]})" if _err else "")
+        )
+        _lines.append("Run it again, or remove it in Account.")
+
+    # ⛔ ALWAYS, on every branch. A refusal returns before step 1, which means
+    # it skips the orphan daemon-loop/--serve kill and the On Startup
+    # supervisor removal that --unpair otherwise ALWAYS runs. Saying so — and
+    # naming the two commands that DO run it — is what keeps this fix from
+    # trading a stranded device doc for a crash-looping backend.
+    _lines.append(
+        "Because nothing local was touched, any orphan backend processes and "
+        "the On Startup task are still in place: `--unpair --force` wipes this "
+        "machine anyway and does that cleanup, and `--doctor` repairs without "
+        "unpairing."
+    )
+    return _lines
+
+
+def run_unpair(deep: bool = False, force: bool = False) -> int:
     """Fully disconnect this machine from Super Research — opposite of --pair.
 
     Semantics: after --unpair, this PC appears nowhere in the Super
@@ -77204,7 +77818,7 @@ def run_unpair(deep: bool = False):
         in case any survived the startup migration) from Windows
         User-scope env (HKCU) or `.dg-supervisor.env` on POSIX, plus the current
         process's os.environ + _RESOLVED_KEY_CACHE — so the next
-        --pair Stage 3 actually re-prompts and re-verifies instead
+        --pair Stage 4 actually re-prompts and re-verifies instead
         of short-circuiting on a leftover key.
       • Transient multi-worker state files at queues/ root
         (`.worker.*.lock` and `_pending_queue*.json`, including
@@ -77217,19 +77831,32 @@ def run_unpair(deep: bool = False):
     multi-account safety check refuses pair due to stale Google auth.
 
     Five-step reset (order matters):
-      0. Pre-step: while keystore is still alive, mint an ID token and
-         POST /api/devices/unpair-self so the FE drops the device tile
-         instantly across every browser.
+      0. THE GATE — not a pre-step. While the keystore is still alive,
+         mint an ID token and POST /api/devices/unpair-self so the FE
+         drops the device tile instantly across every browser. Steps
+         1-5 (and the Firestore sweep) run ONLY if that POST CONFIRMED:
+         HTTP 200, or HTTP 404 whose body is {"error":"device_not_found"}
+         (the doc is already gone, so wiping locally is right).
+         Everything else — a non-200, a network error, an exception, or
+         an ID token that never minted at all — changes NOTHING, prints
+         why, and returns a non-zero exit code. `--force` restores the
+         old wipe-anyway behaviour; it is the escape hatch for a device
+         doc the route can never authorise (one with no
+         syntheticDeviceUid answers 403 forever) and it is the only way
+         to get the step-2 orphan-process cleanup after a refusal.
       1. Wipe local research_config.json + OS-keystore refresh token
          + zero in-memory caches. A respawned --serve now reads empty
          state and the heartbeat loop bails on its missing-deviceId
          guard.
       2. Remove the supervisor artifact; kill every daemon-loop +
          --serve process.
-      3. Confirm the server-side retire (or fall back to FE Unlink for
-         pre-cutover devices the BE can't reach).
+      3. Report the server-side retire step 0 already confirmed (or, on
+         the --force path only, say plainly that it did not).
       4. Local artifacts summary.
-      5. Verify no related process survived."""
+      5. Verify no related process survived.
+
+    Returns 0 when this machine was actually unpaired, and 2 when it
+    refused because the server did not confirm."""
     import subprocess as _subprocess
     import time as _time
 
@@ -77247,14 +77874,127 @@ def run_unpair(deep: bool = False):
     device_id = load_device_id()
     paired_email = ""  # cosmetic only — banner falls back to uid[:8]
 
-    # Bug C extension (2026-05-22): sweep stale research docs before
-    # the device doc gets deleted. Without this, runs that were
-    # ongoing/queued/paused_backend_restart on this device persist
-    # under the owner's tree with no device link (cloud function
-    # deletes the device doc but doesn't cascade-update research
+    # ── [0/5] THE GATE — server-side retire BEFORE anything changes ──
+    # The endpoint deletes the top-level devices/{deviceId} doc + revokes
+    # the synth-device-user's refresh tokens, so the FE listenToDevices
+    # subscription drops the tile across every browser instantly. Once
+    # we wipe the keystore in step 1 we lose the ability to mint an ID
+    # token, so this MUST run first.
+    #
+    # ⛔ IT IS NOT "NON-FATAL IF IT FAILS" ANY MORE (wave 9). It used to
+    # WARN and carry on, which wiped this machine's keystore while the
+    # device doc and its Firebase login stayed on the server, listed on
+    # nobody's screen and unreachable from here — the machine had just
+    # destroyed the only credential that could ask again. And the
+    # commonest failure made no noise at all: a failed token mint issued
+    # no request, so there was no status and no exception to notice.
+    # THE TRIGGER IS "THE SERVER DID NOT CONFIRM", not "the server
+    # refused". Confirmation is HTTP 200, or HTTP 404 whose BODY says
+    # device_not_found (an edge/proxy 404 from a wrong FE_BASE_URL is
+    # also a 404 and must not count). `--force` restores the old
+    # behaviour deliberately.
+    _retire_action = None
+    _server_confirmed = False
+    # `_retire_action` alone cannot carry this decision: it is also None
+    # when device_id is empty, which is a legitimate nothing-to-do, not a
+    # refusal. The confirmation is its own flag.
+    _refusal_kind = ""     # "" | "no-token" | "http" | "error"
+    _refusal_status = 0
+    _refusal_detail = ""
+    if device_id:
+        with _sync_spinner_ctx("Releasing this device from the server"):
+            try:
+                import requests as _requests
+                from auth.v2_flow import FE_BASE_URL as _FE_BASE_URL
+                _id_token = _fresh_user_mode_id_token()
+                if _id_token:
+                    _resp = _requests.post(
+                        f"{_FE_BASE_URL}/api/devices/unpair-self",
+                        headers={"Authorization": f"Bearer {_id_token}"},
+                        json={"deviceId": device_id},
+                        timeout=15,
+                    )
+                    if _resp.status_code == 200:
+                        _server_confirmed = True
+                        try:
+                            _retire_action = (_resp.json() or {}).get("action")
+                        except Exception:
+                            _retire_action = "retired"
+                    elif (_resp.status_code == 404
+                          and _unpair_body_error(_resp) == "device_not_found"):
+                        # The ROUTE's own not-found answer: the device doc is
+                        # already gone, so there is nothing left to strand and
+                        # wiping locally is the correct finish.
+                        _server_confirmed = True
+                        _retire_action = "already-gone"
+                    else:
+                        _refusal_kind = "http"
+                        _refusal_status = _resp.status_code
+                        _refusal_detail = _unpair_body_error(_resp)
+                        log(
+                            f"[unpair] retire endpoint HTTP {_resp.status_code}: {_resp.text[:200]}",
+                            "WARN",
+                        )
+                else:
+                    # ⛔ THE SILENT PATH THIS LANE EXISTS FOR. There was no
+                    # `else` here: no request, no status, no exception and no
+                    # log line — the spinner just stopped and the full wipe
+                    # ran. _fresh_user_mode_id_token() returns None on five
+                    # distinct causes (auth/ import failure, empty keystore,
+                    # genuine revoke, a transient error on the revoke retry,
+                    # any other exception) and only ONE of them means the
+                    # device is really gone — so None is never confirmation.
+                    _refusal_kind = "no-token"
+                    log(
+                        "[unpair] no idToken — cannot prove who this machine is; "
+                        "refusing before anything is changed",
+                        "WARN",
+                    )
+            except Exception as _re:
+                # Covers the requests/auth.v2_flow import AND the 15s network
+                # timeout — i.e. the offline case. Not "(continuing)".
+                _refusal_kind = "error"
+                _refusal_detail = str(_re)
+                log(f"[unpair] retire endpoint failed: {_re}", "WARN")
+
+    # THE GATE ITSELF. It is an EARLY RETURN, on purpose and not
+    # negotiable: `self_pid` is bound inside step 2 and read again in
+    # step 5, so a "skip steps 1-2 and carry on" shape raises NameError
+    # in step 5 instead of refusing. Nothing local — and nothing in
+    # Firestore — has been touched above this line.
+    if device_id and not _server_confirmed and not force:
+        _ks_gone = (_unpair_keystore_is_gone()
+                    if _refusal_kind == "no-token" else None)
+        print()
+        print(f"  {_c(_WARN, '⚠')}  {_c(_BOLD, 'This machine is still paired.')}")
+        print()
+        for _sentence in _unpair_refusal_sentences(
+            device_id, _refusal_kind, _refusal_status, _refusal_detail, _ks_gone,
+        ):
+            print(f"  {_c(_DIM, _sentence)}")
+        print()
+        return 2
+
+    # Bug C extension (2026-05-22): sweep stale research docs so runs
+    # that were ongoing/queued/paused_backend_restart on this device do
+    # not persist under the owner's tree with no device link (the cloud
+    # function deletes the device doc but doesn't cascade-update research
     # docs), leaving zombie chat tiles the owner can't Resume.
     # Mirror of the HARD_RESET sweep — same helper, different
     # stopped_by/summary labels for audit-trail differentiation.
+    #
+    # ⛔ MOVED BEHIND THE GATE (wave 9), and it used to run BEFORE the
+    # retire POST. This sweep writes stoppedBy='unpair_sweep' /
+    # summary='Cancelled by Unpair' across the owner's AND every sharer's
+    # research docs — so refusing after it had run made "nothing changed"
+    # a lie about other people's chat tiles. Running it here is safe: the
+    # helper queries the queue subcollection + user-tree researches BY
+    # deviceId and subcollections don't cascade-delete, which is the same
+    # guarantee the route relies on when it runs its own
+    # expireOrphanedDeviceRuns AFTER deviceRef.delete()
+    # (dg-research/src/app/api/devices/unpair-self/route.ts, the
+    # "durable-state-first" comment). It still runs well before the local
+    # wipe in step 1.
     #
     # Cost: ~10-15s wall-clock for init_firebase() on Windows (the
     # bypass-init optimization is intentionally reverted here for
@@ -77280,40 +78020,6 @@ def run_unpair(deep: bool = False):
             except Exception as _sw_err:
                 log(f"[unpair] Firestore sweep failed (continuing): {_sw_err}", "WARN")
 
-    # Best-effort server-side retire BEFORE we wipe the keystore. The
-    # endpoint deletes the top-level devices/{deviceId} doc + revokes
-    # the synth-device-user's refresh tokens, so the FE listenToDevices
-    # subscription drops the tile across every browser instantly. Once
-    # we wipe the keystore in step 1 we lose the ability to mint an ID
-    # token, so this MUST run first. Non-fatal if it fails — the local
-    # wipe still happens and the FE Unlink button is the fallback.
-    _retire_action = None
-    if device_id:
-        with _sync_spinner_ctx("Releasing this device from the server"):
-            try:
-                import requests as _requests
-                from auth.v2_flow import FE_BASE_URL as _FE_BASE_URL
-                _id_token = _fresh_user_mode_id_token()
-                if _id_token:
-                    _resp = _requests.post(
-                        f"{_FE_BASE_URL}/api/devices/unpair-self",
-                        headers={"Authorization": f"Bearer {_id_token}"},
-                        json={"deviceId": device_id},
-                        timeout=15,
-                    )
-                    if _resp.status_code == 200:
-                        try:
-                            _retire_action = (_resp.json() or {}).get("action")
-                        except Exception:
-                            _retire_action = "retired"
-                    else:
-                        log(
-                            f"[unpair] retire endpoint HTTP {_resp.status_code}: {_resp.text[:200]}",
-                            "WARN",
-                        )
-            except Exception as _re:
-                log(f"[unpair] retire endpoint failed (continuing): {_re}", "WARN")
-
     # NOTE: no "nothing to do" short-circuit here even when local config is
     # missing. A prior --unpair (or manual config wipe) can leave orphan
     # daemon-loop + serve processes and a scheduled task behind — those are
@@ -77321,6 +78027,19 @@ def run_unpair(deep: bool = False):
     # --unpair to ALWAYS run step 1 (process kill + schtasks removal) so
     # re-running it is a guaranteed-clean cleanup. Steps 2-4 already no-op
     # gracefully when the relevant state is missing.
+    #
+    # ⛔ ONE EXCEPTION NOW, AND THE TRADE IS RECORDED RATHER THAN HIDDEN
+    # (wave 9). The gate above returns before this point when there IS a
+    # device_id and the server did not confirm, so a refusal SKIPS exactly
+    # the process kill + supervisor removal this paragraph argues for. That
+    # is the deliberately chosen lesser harm: wiping local state while a
+    # live device doc and its Firebase login stay behind is unrecoverable
+    # FROM THIS MACHINE (the keystore that could ask again is the thing we
+    # would have destroyed), whereas a crash-looping backend is recoverable
+    # from here by one command. Both of those commands DO run this cleanup
+    # and the refusal message names them: `--unpair --force` and `--doctor`.
+    # When there is NO device_id there is nothing to confirm, the gate does
+    # not fire, and this paragraph holds exactly as written.
 
     # Context strip — what's about to vanish.
     _render_context_strip([
@@ -77461,16 +78180,26 @@ def run_unpair(deep: bool = False):
     else:
         print(f"  {_c(_DIM, '     No backend processes were running.')}")
 
-    # ── [3/5] Confirm the server-side retire that ran before step 1 ──
+    # ── [3/5] Report the server-side retire that was CONFIRMED in step 0 ──
     _setup_step(3, total, "Removing device from your account")
     if _retire_action == "retired":
         print(f"  {_c(_OK, '✓')}  Deleted devices/{device_id} on the server.")
         print(f"  {_c(_DIM, '     The device tile will disappear from all browsers immediately.')}")
+    elif _retire_action == "already-gone":
+        print(f"  {_c(_OK, '✓')}  devices/{device_id} was already gone on the server — nothing left to delete.")
+    # NOTE: 'left-shared' is UNREACHABLE from this command and is kept only
+    # so the branch set still mirrors the route's. The machine authenticates
+    # as the synthetic device user, so route.ts takes branch 1 (callerUid ===
+    # syntheticUid → 'retired') every time; 'left-shared' needs a sharer's
+    # own uid and 'owner-unlinked' needs the owner's. Not deleted in this
+    # lane — see the wave-9 record.
     elif _retire_action == "left-shared":
         print(f"  {_c(_OK, '✓')}  Removed your account from the device's shared list.")
     elif device_id:
-        print(f"  {_c(_WARN, '⚠')}  Server-side retire didn't complete — the device tile may stick around.")
-        print(f"  {_c(_DIM, '     If it does, tap Unlink on the tile in your Account page.')}")
+        # Reachable ONLY under --force now: without it the gate returned
+        # before step 1 and this line never prints.
+        print(f"  {_c(_WARN, '⚠')}  Forced past an unconfirmed retire (--force) — the device doc and its login are still on the server.")
+        print(f"  {_c(_DIM, '     Unlink the tile on your Account page; this machine can no longer ask for you.')}")
     else:
         print(f"  {_c(_DIM, '     No paired modern device on this machine — nothing to remove server-side.')}")
     # Pre-cutover devices live at users/{uid}/devices/{deviceId} — the
@@ -77486,14 +78215,14 @@ def run_unpair(deep: bool = False):
 
     # Deep cleanup: also wipe pair-time API keys. Lives in Step 4 because
     # API keys are conceptually "local pairing artifacts" — they're
-    # persisted by --pair Stage 3 and live in the same axis as the
+    # persisted by --pair Stage 4 and live in the same axis as the
     # config + keystore. _save_api_key_local writes to Windows User-
     # scope env (HKCU) on Windows and to .dg-supervisor.env on POSIX.
     # Default --unpair leaves these in place so a re-pair on the same
-    # machine skips re-pasting (Stage 3 short-circuits via
+    # machine skips re-pasting (Stage 4 short-circuits via
     # resolve_api_key/resolve_gemini_api_key "already configured").
     # --deep is the "I want a truly fresh slate" path — wipe the
-    # persisted keys too so the next --pair Stage 3 fires the paste-
+    # persisted keys too so the next --pair Stage 4 fires the paste-
     # and-verify loop end-to-end.
     #
     # We also pop from os.environ in this process so an immediate
@@ -77527,7 +78256,7 @@ def run_unpair(deep: bool = False):
             pass
     api_keys_wiped = api_keys_cleared > 0
     if api_keys_wiped:
-        print(f"  {_c(_OK, '✓')}  Pair-time API keys cleared (`--deep`) — Stage 3 will re-prompt and re-verify on next --pair.")
+        print(f"  {_c(_OK, '✓')}  Pair-time API keys cleared (`--deep`) — Stage 4 will re-prompt and re-verify on next --pair.")
 
     # 2026-05-26: also wipe queues/ runtime-state files under --deep.
     # Per-run history dirs are intentionally preserved (the rest of
@@ -77594,7 +78323,7 @@ def run_unpair(deep: bool = False):
     # so profile-1 (legacy `browser-profile/`) AND any profile-N dirs
     # (`browser-profile-2/`, `browser-profile-3/`, …) all get wiped in one
     # pass. Without this, a re-pair after --unpair --deep would see stale
-    # cookies in profile-2+ and the new pair's Stage 4 multi-profile loop
+    # cookies in profile-2+ and the new pair's Stage 5 multi-profile loop
     # would inherit them. workerCount is also reset to 1 so the post-deep
     # state matches a fresh-install baseline.
     browser_wiped_count = 0
@@ -77631,7 +78360,7 @@ def run_unpair(deep: bool = False):
             browser_wiped_count = len(wiped_names)
             if browser_wiped_count:
                 # Reset worker capacity to fresh-install baseline. Next pair's
-                # Stage 4 multi-profile loop will re-establish whatever count
+                # Stage 5 multi-profile loop will re-establish whatever count
                 # the user wants.
                 try:
                     save_worker_count(1)
@@ -77650,19 +78379,30 @@ def run_unpair(deep: bool = False):
             print(f"  {_c(_OK, '✓')}  Chrome profile wiped (`--deep`) — fresh browser on next --pair.")
         else:
             print(f"  {_c(_OK, '✓')}  {browser_wiped_count} Chrome profiles wiped (`--deep`) — fresh browsers on next --pair.")
+    # ⛔⛔ WAVE 9: BOTH BRANCHES USED TO LIST
+    # "• firebase-service-account.json  (needed to re-pair)" AND THE FILE DOES
+    # NOT EXIST. This same file says so twice — `init_firebase` ("No Admin SDK;
+    # no firebase-service-account.json on disk") and the Track D pair flow, which
+    # is keystore-only — and this function's OWN docstring lists exactly two
+    # preserved things, the browser profiles and queues/. So the line invented a
+    # file, then told the reader it was load-bearing for re-pairing, which sends
+    # somebody hunting for a credential that was never there. Deleted from BOTH
+    # branches: leaving the `else` copy would have left it on the DEFAULT
+    # `--unpair` path, the one most people see.
+    # ⛔ The plan's other candidate, a "run --unpair again" sentence, is not here
+    # and never was — `git log -S "run --unpair again"` finds no commit for it.
     if browser_wiped or api_keys_wiped:
         print(f"  {_c(_DIM, 'Preserved on disk (remove manually for a fully clean slate):')}")
         print(f"       {_c(_DIM, '• Research history in queues/')}")
-        print(f"       {_c(_DIM, '• firebase-service-account.json  (needed to re-pair)')}")
     else:
         print(f"  {_c(_DIM, 'Preserved on disk (remove manually for a fully clean slate):')}")
         print(f"       {_c(_DIM, '• Chrome profile(s) at ~/.super-research/browser-profile*/  (your logins)')}")
         print(f"       {_c(_DIM, '• Research history in queues/')}")
-        print(f"       {_c(_DIM, '• firebase-service-account.json  (needed to re-pair)')}")
         print(f"       {_c(_DIM, '  Add --deep to also wipe the Chrome profile(s) + pair-time API keys next time.')}")
     _render_next_actions([
         ("python research.py --pair", "reconnect this machine (mints a fresh token)"),
     ])
+    return 0
 
 
 def run_commands_help():
@@ -77713,6 +78453,8 @@ def run_commands_help():
          "Fully disconnect this PC (deletes token + device doc + local config)"),
         ("python research.py --unpair --deep",
          "Same as --unpair, but ALSO wipes browser-profile*/ dirs + pair-time API keys + stale worker-state files + resets workerCount"),
+        ("python research.py --unpair --force",
+         "Unpair even when the server never confirmed — leaves the device tile behind (remove it in Account). Use when the server can't be reached"),
     ])
 
     _section("Agent — drive Super Research from chat (Hermes / OpenClaw)", [
@@ -80714,7 +81456,7 @@ def main():
     parser.add_argument("--worker-id", type=int, default=None, dest="worker_id",
         help="Worker slot index (1-based). Worker N uses _profile_dir(N) for its browser "
              "and binds port 8000+N-1 (unless --port overrides). Workers ≥2 are spawned by "
-             "daemon-loop when research_config.json's workerCount > 1; set up via pair Stage 4's "
+             "daemon-loop when research_config.json's workerCount > 1; set up via pair Stage 5's "
              "multi-profile loop. Omitted = standalone serve, which runs one worker no matter "
              "how many profiles are configured (WORKER_ID still resolves to 1).")
     parser.add_argument("--resurrect", action="store_true",
@@ -80731,12 +81473,18 @@ def main():
              "Bare --visibility prints the current setting.")
     parser.add_argument("--unpair", action="store_true",
         help="Fully disconnect this machine from Super Research (inverse of --pair): deletes token + device doc + local config")
+    parser.add_argument("--force", action="store_true",
+        help="With --unpair: wipe this machine even when the server never confirmed the retire. "
+             "Leaves the device document and its Firebase login behind — remove the tile in Account "
+             "afterwards. Also the only way to get --unpair's orphan-process kill + On Startup removal "
+             "when the server cannot be reached, and the escape hatch for a device record the retire "
+             "endpoint will never authorise.")
     parser.add_argument("--deep", action="store_true",
         help="With --unpair: also wipe ALL Playwright browser profiles under ~/.super-research/browser-profile*/ "
              "(clears ChatGPT/Gemini/Claude/NotebookLM logins across profile-1 and any profile-N set up via pair "
-             "Stage 4 multi-profile loop). Also resets workerCount to 1 and wipes pair-time API keys "
+             "Stage 5 multi-profile loop). Also resets workerCount to 1 and wipes pair-time API keys "
              "(ANTHROPIC_API_KEY/GEMINI_API_KEY, plus retired legacy aliases CUA_API_KEY/GOOGLE_API_KEY) from Windows User-scope env or "
-             ".dg-supervisor.env so the next --pair Stage 3 re-prompts and re-verifies. Useful when re-pairing "
+             ".dg-supervisor.env so the next --pair Stage 4 re-prompts and re-verifies. Useful when re-pairing "
              "to a different account or when the F4 cookie check refuses pair due to stale Google auth. "
              "Default: preserve profiles + keys.")
     parser.add_argument("--daemon-loop", action="store_true",
@@ -80882,8 +81630,13 @@ def main():
         raise SystemExit(run_visibility(args.visibility, ignored_topic=args.topic))
 
     if args.unpair:
-        run_unpair(deep=bool(args.deep))
-        return
+        # ⛔ `raise SystemExit`, not `return` — and not `return run_unpair(...)`
+        # either. `python research.py` calls main() bare at the bottom of this
+        # file and discards whatever it returns, so only the console-script
+        # entry point would ever see a returned int. This is the same form
+        # --visibility uses two lines up, and it is what lets a refused
+        # --unpair exit non-zero on BOTH entry points.
+        raise SystemExit(run_unpair(deep=bool(args.deep), force=bool(args.force)))
 
     # Resolve worker_id + port. Port defaults to 8000+(worker_id-1) so the
     # daemon-loop's N children each bind a distinct port without each spawn

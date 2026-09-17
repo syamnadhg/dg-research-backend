@@ -548,7 +548,13 @@ def test_research_with_zero_devices_guides_pairing(live):
     r = requests.post(base + "/research", json={"topic": "EVs"})
     assert r.status_code == 400
     err = r.json()["error"]
-    assert "pair code" in err and "device add" in err  # actionable, not a dead end
+    # ⛔ RE-POINTED IN WAVE 9 (was "pair code"): the web app calls this value an
+    # access code everywhere, so the agent's refusals do too.
+    assert "access code" in err and "device add" in err  # actionable, not a dead end
+    # ⛔⛔ AND THE OLD WORD MUST BE GONE, because this sentence is what sr.py's
+    # legacy-bridge fallback pattern-matches — a half-rename here is how the
+    # no-device empty state goes missing without anything going red.
+    assert "pair code" not in err
 
 
 def test_research_seeds_topic_and_intro_messages(live):

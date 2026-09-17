@@ -17,7 +17,7 @@ or two from the topic) or run-id; omit it to mean the most recent / active run:
   devices            list this account’s devices, each with an online flag
   device-use <name>  choose the device runs go to (name or id)
   device-add <code>  pair a new device by the code on its screen
-  device-remove <name>  unlink a device (owner: new pair code issued; sharer leaves)
+  device-remove <name>  unlink a device (owner: new access code issued; sharer leaves)
   research <topic>   start a run (--device <id> to override the selected device)
   status [run]       a run's progress + links + any blocker (no run = most recent)
   podcast [run]      download a run's audio → a local file to send as native audio
@@ -34,7 +34,7 @@ or two from the topic) or run-id; omit it to mean the most recent / active run:
 
 Add --json to print the raw bridge response INSTEAD of the friendly lines.
 ⛔ --json REPLACES the rendered text, so a reply whose lines carry a warning
-loses the warning: `--json device-remove` prints the new pair code with none of
+loses the warning: `--json device-remove` prints the new access code with none of
 the three sentences that say the old one is dead, that this one claims the
 machine, and to keep it like a password. Callers that render for a person must
 not use it.
@@ -89,7 +89,7 @@ _INSTALL_PAGE_URL = "https://superresearch.io/install"
 # Bare URL (auto-links on every channel — NO Markdown, which would hard-code a
 # rich-text channel assumption). Conditional lead ("don't have one?") so it reads
 # gracefully even where the caller already told a user WITH a backend to just
-# paste their pair code (reason=no_devices = no *paired* device, which includes an
+# paste their access code (reason=no_devices = no *paired* device, which includes an
 # installed-but-unpaired machine — that user pairs, they don't reinstall).
 _INSTALL_PAGE_LINE = (
     f"Don't have your own Research Computer yet? Set one up — full walkthrough: {_INSTALL_PAGE_URL}"
@@ -187,7 +187,7 @@ def _public_offer_lines() -> list[str]:
     if not rows:
         # ⛔⛔ THE THIRD THING IS STILL SAID WHEN THERE ARE NONE. "Nobody is
         # offering one" on its own answers a question this reader did not ask and
-        # silently drops the option — they are left with the pair code again, which
+        # silently drops the option — they are left with the access code again, which
         # is the dead end this whole block exists to remove. The option is named,
         # then the truth about today.
         # ⛔ AND THE SHARED SENTENCE KEEPS ITS OWN LINE. Splicing it after an
@@ -225,11 +225,11 @@ def _no_device_lines(lead: str | None = None) -> list[str]:
     the list command, the status line, a name that would not resolve, a run that
     could not be routed, the sign-in announce, the picker's own fallback, the
     watcher, and the terminal. Every one of them offered exactly ONE way out:
-    paste a pair code. Somebody with no machine of their own, and no way to get
+    paste an access code. Somebody with no machine of their own, and no way to get
     one, was told to go and get one.
 
     ⭐ THREE THINGS, IN THIS ORDER, EVERY TIME. There is no computer on this
-    account · your own can be added with a pair code · or you can ask to use
+    account · your own can be added with an access code · or you can ask to use
     somebody else's — and the ones on offer are LISTED, because "ask for a public
     one" with no list is advice rather than a next step.
 
@@ -322,7 +322,7 @@ def _post(path: str, body: dict | None = None,
     """⛔ `timeout` IS PER CALL because one route needs longer than the rest.
     `/device/remove` can take the bridge up to 35s (the web route declares a 30s
     budget and uses it), and a client that gave up first would report a bridge
-    that is not running AND lose the only copy of the machine's new pair code."""
+    that is not running AND lose the only copy of the machine's new access code."""
     return _request("POST", path, body if body is not None else {}, timeout=timeout)
 
 
@@ -334,13 +334,15 @@ def _emit(payload: dict, as_json: bool, lines: list[str], code: int = 0) -> int:
     if as_json:
         # ⛔⛔ THE WARNING RIDES ALONG IN JSON TOO. `--json` prints the payload
         # INSTEAD of the rendered lines, so `--json device-remove` emitted the
-        # rotated pair code with none of the three sentences that say the old one
+        # rotated access code with none of the three sentences that say the old one
         # is dead, that whoever holds this one can claim the machine, and to keep
         # it like a password. A machine-readable caller is still read by somebody.
         # Cross-verify found it; nothing in either new test file drove `--json`.
+        # ⛔ `pairCode` AND `pairCodeWarning` ARE WIRE NAMES A CHAT RUNTIME READS
+        # — only the sentence inside moves to the web app's "access code".
         if isinstance(payload, dict) and payload.get("pairCode"):
             payload = {**payload, "pairCodeWarning":
-                       "This is the machine's new pair code. Whoever holds it can "
+                       "This is the machine's new access code. Whoever holds it can "
                        "claim the computer as its owner. The previous code no "
                        "longer works and this is the only copy."}
         print(json.dumps(payload))
@@ -1013,7 +1015,7 @@ def _connected_msg(who) -> str:
         return f"✓ Connected as {who} — you’re all set."
     # ⛔ ONE LINE, AND IT STILL CARRIES BOTH WAYS OUT. This is a confirmation, not
     # the empty state — it must not fire a second fetch to render a list — but the
-    # sentence that used to end at the pair code was the first thing a brand-new
+    # sentence that used to end at the access code was the first thing a brand-new
     # account read, and it named the one route that needs hardware.
     return (f"✓ Connected as {who}. To get started, paste the access code from your "
             "Research Computer — or ask me for a public computer you could use.")
@@ -1108,7 +1110,7 @@ _PAIR_ERRORS = {
     # ⛔ THE ALPHABET EXCLUDES I, L, O, 0 AND 1 — the five that get confused —
     # and "8 letters/digits" told people the opposite, so somebody who typed an
     # O for a zero read a rule their input satisfied and retyped the same code.
-    "invalid_code_format": "Pair codes are 8 characters and never use I, L, O, 0 or 1 — check those.",
+    "invalid_code_format": "Access codes are 8 characters and never use I, L, O, 0 or 1 — check those.",
     # ⛔⛔ THE REPAIR IT NAMED MINTS A NEW COMPUTER AND LOSES ITS PEOPLE. Both of
     # these sentences sent somebody to `superresearch --pair`, which on a machine
     # that still exists does not refresh anything — it sets that machine up as a
@@ -1174,7 +1176,7 @@ _UNLINK_ERRORS = {
     # device's pending customToken BEFORE it attempts the rotation, and only then
     # returns this — so an unlink that stops here has already destroyed a handoff.
     # The true and useful claim is narrower: the machine is STILL YOURS.
-    "rotation_failed": "Couldn’t unlink it — its pair code wouldn’t change, and "
+    "rotation_failed": "Couldn’t unlink it — its access code wouldn’t change, and "
                        "unlinking without a fresh code would leave the computer "
                        "claimable by anyone holding the old one. It is still "
                        "linked to you; try again in a moment.",
@@ -1224,7 +1226,7 @@ def cmd_device_remove(args) -> int:
         return _emit({}, args.json, fail, 1)
     # ⛔ 50s, NOT THE DEFAULT 30. The bridge waits up to 35 on this route (it can
     # use its whole 30s budget) plus a 10s token refresh; a client that gave up
-    # first would report a bridge that is not running and lose the new pair code.
+    # first would report a bridge that is not running and lose the new access code.
     code, body = _post("/device/remove", {"deviceId": dev.get("id")}, timeout=50)
     if code != 200:
         err = body.get("error", "")
@@ -1254,9 +1256,9 @@ def cmd_device_remove(args) -> int:
 # sat on the machine's screen where nothing told them to look.
 #
 # ⛔ AND IT IS PRESENTED AS A CREDENTIAL, which is the other thing the product
-# got wrong: SKILL.md called a pair code "NOT a password". On a machine with no
+# got wrong: SKILL.md called the code "NOT a password". On a machine with no
 # owner it is stronger than one — it hands over the machine. The existing
-# precedent ("A pair code still lets someone in without asking you") understates
+# precedent ("An access code still lets someone in without asking you") understates
 # it for exactly this moment, so this says the harder thing.
 #
 # ⛔ THE EXPLANATION LIVES IN A `#` COMMENT, NOT A DOCSTRING, and that is not
@@ -1282,15 +1284,15 @@ def _unlink_code_lines(new_code: str | None) -> list[str]:
     it mints a NEW deviceId").
     """
     if not new_code:
-        return ["The device keeps running, but its pair code changed and the new "
+        return ["The device keeps running, but its access code changed and the new "
                 "one did not reach me.",
                 "That code cannot be looked up anywhere — this reply was the only "
                 "copy. To use the computer again, run “superresearch --pair” on "
                 "the machine itself; it will join as a new computer."]
     return [
-        "The device keeps running, and its pair code changed — the old one no "
+        "The device keeps running, and its access code changed — the old one no "
         "longer works.",
-        f"New pair code: {new_code}",
+        f"New access code: {new_code}",
         "Anyone who has that code can claim this computer as its owner, so keep "
         "it like a password.",
     ]
@@ -1600,7 +1602,7 @@ _DECIDE_ERRORS = {
         "out. Ask me for the queue again to see what is still waiting.",
     "is_owner": "That person owns that computer, so there’s nothing to answer.",
     "revoked_sharer":
-        "You removed this person from that computer before. Resetting its pair "
+        "You removed this person from that computer before. Resetting its access "
         "code is what lets them back in.",
     "share_cap_reached":
         "That computer is already shared with as many people as it can hold. "
@@ -1765,7 +1767,7 @@ def _cmd_device_decide(args, decision: str) -> int:
     return _emit(body, args.json, [
         f"✓ Said no to {who} for “{name}”.",
         "They can’t ask again for a week. The app tries to tell them, but that "
-        "depends on their own notification settings. Giving them the pair code "
+        "depends on their own notification settings. Giving them the access code "
         "still works if you change your mind.",
     ])
 
@@ -1815,7 +1817,7 @@ def cmd_device_visibility(args) -> int:
             lines.append(f"They see it as “{body.get('publicLabel')}”.")
     else:
         lines = [head,
-                 "Nobody can find it. A pair code still lets someone in without "
+                 "Nobody can find it. An access code still lets someone in without "
                  "asking you."]
     return _emit(body, args.json, lines)
 
@@ -1997,7 +1999,7 @@ def cmd_device_requests(args) -> int:
         # to the owner at all — it tells the ASKER about the week and leaves the
         # person spending it uninformed.
         lines.append("Anyone you say yes to can run research on that computer — "
-                     "the same as somebody you gave a pair code to. Saying no "
+                     "the same as somebody you gave an access code to. Saying no "
                      "stops them asking again for a week; the app tries to tell "
                      "them, but that depends on their own notification settings.")
     else:
@@ -2254,8 +2256,19 @@ def cmd_research(args) -> int:
         # the account HAS computers, ask which. Older bridge (no reason): infer from text.
         err = str(body.get("error", "")).lower()
         reason = body.get("reason")
+        # ⛔⛔ HIDDEN COUPLING WITH bridge.py's no_devices REFUSAL TEXT, and it
+        # is a prose rename with a behavioural consequence. This fallback reads
+        # the bridge's ENGLISH, so when wave 9 renamed "pair code" to the web's
+        # "access code" in that sentence, matching only the new wording would
+        # have silently lost the no-device empty state for every INSTALLED
+        # bridge older than the rename — the person would drop through to the
+        # bare "couldn't start" line instead. BOTH spellings are matched on
+        # purpose, and neither may be removed while an older bridge can still be
+        # on disk. See the matching note at bridge.py's `reason == "no_devices"`.
         if not reason:
-            reason = ("no_devices" if ("no devices yet" in err or "grab the pair code" in err)
+            reason = ("no_devices" if ("no devices yet" in err
+                                       or "grab the access code" in err
+                                       or "grab the pair code" in err)
                       else ("no_selection" if "no device" in err else ""))
         if reason == "no_devices":
             return _emit(body, args.json, _no_device_lines(), _fail_code(code))
@@ -4692,7 +4705,7 @@ def _cap(m: "re.Match | None") -> str:
 _NL_CONFIRMS = {
     "stop": "Stop {name}? It ends the run — everything finished so far is kept. Say yes and I’ll stop it.",
     "logout": "Sign out of Super Research? (The skill stays installed — you can sign back in anytime.) Say yes and I’ll sign you out.",
-    "device-remove": "Unlink {name}? It keeps running, but its pair code changes — the old one stops working and I’ll show you the new one. Say yes and I’ll remove it.",
+    "device-remove": "Unlink {name}? It keeps running, but its access code changes — the old one stops working and I’ll show you the new one. Say yes and I’ll remove it.",
     "update": "Update the Super Research skill (this chat runtime)? The bridge restarts briefly. Say yes and I’ll update it.",
     "install": "Install the Super Research backend on the connected device? Say yes and I’ll set it up.",
     # ⛔⛔ CONFIRM-GATED THOUGH IT DESTROYS NOTHING, and that is the point. It is
@@ -4720,16 +4733,16 @@ _NL_CONFIRMS = {
     # confirm line IS that warning, and it carries the app's own sentence rather
     # than a second wording of it.
     "device-approve": "Say yes to {name}? Anyone you say yes to can run research "
-                      "on that computer — the same as somebody you gave a pair "
-                      "code to. Say yes and I’ll tell them yes.",
+                      "on that computer — the same as somebody you gave an "
+                      "access code to. Say yes and I’ll tell them yes.",
     # ⛔⛝ DENYING CONFIRMS TOO, AND ITS COST IS THE ONE NOBODY IS TOLD. A refusal
     # stops that person asking again for a week; the app tells THEM that and
     # tells the owner nothing at all — the fact lives in a code comment there.
-    # It is recoverable (the pair code still works) and that is said here,
+    # It is recoverable (the access code still works) and that is said here,
     # because a cost with no way out reads as a bigger decision than it is.
     "device-deny": "Say no to {name}? They cannot ask again for a week — the app "
                    "tries to tell them, but that depends on their own "
-                   "notification settings. Giving them the pair code still works "
+                   "notification settings. Giving them the access code still works "
                    "if you change your mind. Say yes and I’ll turn them down.",
     # ⛔⛔ ONLY THE PUBLIC DIRECTION. Hiding a computer takes it OFF a list and
     # costs nothing anybody was promised; confirming a strictly narrowing change
@@ -4845,7 +4858,7 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
         #   `approve the machine LABPC001`       PAIRED LABPC001
         #   `did my logs go through? code AB12CD34`  PAIRED THE SUPPORT CODE
         # The last one is the worst: a support code is taught at two places in
-        # SKILL.md and is not a pair code at all. Derived where a list exists.
+        # SKILL.md and is not an access code at all. Derived where a list exists.
         _existing = re.search(rf"\b(?:switch to|run (?:it |everything )?on|use|using|"
                               rf"select|{_UNLINK_VERBS[3:-1]}|ask|asking|"
                               rf"request|requesting|borrow"
@@ -6583,7 +6596,7 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
         # “Studio PC please” and `remove my Studio PC and show me the rest`
         # offered to unlink “Studio PC and show me the rest”. A confirm whose own
         # follow-up cannot resolve is worse here than anywhere else on the
-        # surface, because saying yes to it rotates a pair code.
+        # surface, because saying yes to it rotates an access code.
         name = _trim_trailing_clause(name, t)
         name = _strip_leading_noun(name)
         # ⛔⛔ AND NOT "that device" EITHER. The old fallback was written for a

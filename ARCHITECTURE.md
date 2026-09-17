@@ -959,3 +959,38 @@ Six steps across 2026-09-02/03. What an editor of this file most needs to know:*
   it, not by decoding a timestamp out of its address. The rule over the whole stretch: nothing may
   depend on the shape of a web address.*
 
+---
+
+*Updated: 2026-09-17 — **Pair flow renumbered 5 → 6 stages** (owner request, 2026-09-15). The
+discoverability question ("Let other people find this computer and ask to use it?") had been asked
+inside Stage 2 as an unannounced second question since 7.7B; it now has its own displayed step. The
+arc is `1 Token setup → 2 On Startup → 3 Discoverability → 4 API keys → 5 Browser logins → 6 Ready`,
+so the old steps 3/4/5 each shifted up by one. Banner header "Five steps" → "Six steps", and the
+preview line wrapped to two rows because six chips do not fit 80 columns.
+`_continue_pair_stages_2_to_5` → `_continue_pair_stages_2_to_6` (the name encoded the count and is
+reached by `inspect.getsource` from ten test sites).*
+
+- ***IT IS A DISPLAY SPLIT AND NOTHING ELSE.*** *On Startup and Discoverability still share ONE
+  `_pair_patch_device` write, and that is load-bearing: the call lands on a `hasOnly()` rule which
+  refuses the WHOLE update if a single key is off-list, and `visibility` has no second writer
+  anywhere in the pair flow (Stage 6 re-writes `supervised` only). A split write would lose a
+  discoverability answer for good while the screen said it was saved.*
+- ***⛔⛔ THE TELEMETRY STAGE NUMBERS DID NOT MOVE, AND MUST NOT.*** *`PAIR_STAGE_REACHED` still
+  emits 2 / 3 / 4 at the same three code points and `PAIR_COMPLETED` still carries `stage=5`. Those
+  numbers are identities in a time series: renumbering them would silently make a historical
+  `stage=3` row mean API keys before 2026-09-17 and Discoverability after, which is not reversible.
+  The new step 3 gets NO emit — it never had separate coverage, so nothing was lost. Displayed step
+  → emitted stage: 2/6 → 2, 3/6 → none, 4/6 → 3, 5/6 → 4, 6/6 → PAIR_COMPLETED 5. The mismatch is
+  recorded in a comment block at the step-2 emit site so the next reader does not "fix" it.*
+- ***What did NOT renumber.*** *`--unpair` keeps its own five-step arc (`total = 5`, five `[n/5]`
+  banners, "Five-step reset"), `--resurrect` its four and `--retire` its three — different arcs
+  sharing the same `_setup_step` helper. README's own `### Step 1 … ### Step 6` headings are the
+  install walkthrough, not the pair arc. The agent's `branding.py` is data-driven and needed only a
+  docstring word.*
+- ***Two things the recount corrected.*** *The pair arc has FOUR `[n/5]` banner comments, not six —
+  step 1 has none, and the other five in `research.py` belong to `--unpair`. And README had been
+  calling step 1 "Pair code" while the code and the web modal both said "Token setup"; fixed in the
+  same pass.*
+- ***⛔ The web half is NOT in this change.*** *`dg-research/src/components/chat/WalkthroughModal.tsx`
+  and `src/lib/firestore.ts` still say five stages, and no FE test pins the step count.*
+

@@ -668,7 +668,7 @@ MUTANTS = [
      "AGAIN, so it refuses the verbs it now has",
      [("""  name a topic. (For a computer they OWN they can also answer the people asking
   for it and set whether strangers can find it at all. Unlinking their own
-  machine issues it a new pair code. Revoking one sharer stays in the web app.)""",
+  machine issues it a new access code. Revoking one sharer stays in the web app.)""",
        """  name a topic. (Sharing a device with other people, revoking sharers, and resets
   stay owner-only in the web app.)""")]),
     ("S6", SKILL, "under",

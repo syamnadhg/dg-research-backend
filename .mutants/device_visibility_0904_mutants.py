@@ -113,7 +113,18 @@ PATCH = ('        saved = _pair_patch_device(device_id_for_progress, {\n'
 # to move. A stale anchor measures NOTHING, which is why the sweep runs first.
 READ_GUARD = '    if not meta:'
 #: How the current state is derived from the document.
-CURRENT = '    current = "public" if meta.get("visibility") == "public" else "private"'
+# ⛔ RE-ANCHORED 2026-09-16 (wave 9). It used to be the ONE LINE in
+# `run_visibility` that compared `meta.get("visibility")` to the literal
+# "public". `visibility` is becoming `joinPolicy`, so that read moved into
+# `_discovery_of`, which tries both names old-first — and the line the old anchor
+# named no longer exists. The MUTATION is unchanged in meaning: turn
+# `== "public"` into `!= "private"` so that a machine nobody ever asked reports
+# as PUBLIC. It now takes two edits because the derivation takes two lines: the
+# per-name verdict, and the both-names-absent fallback. Flipping only the first
+# would leave the absent case answering "private" correctly and would measure
+# strictly less than the old anchor did.
+DISCOVERY_PICK = '            return "public" if value == "public" else "private"'
+DISCOVERY_ABSENT = '    return "private"'
 #: The manual value check in `main`.
 VALIDATE = ('        if args.visibility != _VISIBILITY_SHOW and args.visibility not in _VISIBILITY_VALUES:')
 
@@ -138,9 +149,13 @@ MUTANTS = [
      "`pair_completed = bool(...)` and reverts the entire pair on a falsy one. "
      "None IS falsy, so the mutant behaves correctly today and stops being "
      "correct the moment the block is copied into a stage that must not cancel",
-     [('        log("Pairing cancelled by user (Stage 2 — discoverability)", "INFO")\n'
+     # ⛔ RE-ANCHORED 2026-09-17. The discoverability question was given its own
+     # displayed step ([3/6]) and this cancel line renumbered with it, Stage 2 →
+     # Stage 3. The mutation is unchanged: `return False` collapses to a bare
+     # `return`.
+     [('        log("Pairing cancelled by user (Stage 3 — discoverability)", "INFO")\n'
        '        return False',
-       '        log("Pairing cancelled by user (Stage 2 — discoverability)", "INFO")\n'
+       '        log("Pairing cancelled by user (Stage 3 — discoverability)", "INFO")\n'
        '        return')]),
     ("B4", "under",
      "⛔⛔ the two Stage-2 answers go out as two PATCHes. The rule is `hasOnly()`, "
@@ -199,8 +214,24 @@ MUTANTS = [
      "⛔⛔ `!= \"private\"` instead of `== \"public\"`, so a machine that was never "
      "asked — every machine paired before this wave, since nothing backfills the "
      "field — reports as PUBLIC",
-     [(CURRENT,
-       '    current = "private" if meta.get("visibility") == "private" else "public"')]),
+     [(DISCOVERY_PICK,
+       '            return "private" if value == "private" else "public"'),
+      (DISCOVERY_ABSENT, '    return "public"')]),
+    ("V2b", "under",
+     "⛔⛔ THE NEW NAME IS BELIEVED FIRST, which is the shape wave 8's first build "
+     "shipped and cross-verify overturned. Nothing writes `joinPolicy` yet, so on "
+     "a flipped-then-toggled document the write lands on `visibility` while "
+     "`joinPolicy` still says public — and the very next read answers \"already "
+     "public\", so the door never closes",
+     [('_DISCOVERY_KEYS = ("visibility", "joinPolicy")',
+       '_DISCOVERY_KEYS = ("joinPolicy", "visibility")')]),
+    ("V2c", "under",
+     "⛔⛔ THE MACHINE GOES BACK TO KNOWING ONE NAME. After the migration drops "
+     "`visibility` every document reads private to the computer that owns it — "
+     "`--visibility` prints Private on a listed machine and `--visibility private` "
+     "is answered \"Already set\" and never writes",
+     [('_DISCOVERY_KEYS = ("visibility", "joinPolicy")',
+       '_DISCOVERY_KEYS = ("visibility",)')]),
     ("V3", "under",
      "⛔ the no-op shortcut goes, so `--visibility private` on an untouched "
      "machine PATCHes the field onto every document the flag was ever pointed at, "

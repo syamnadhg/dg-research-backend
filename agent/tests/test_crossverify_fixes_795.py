@@ -129,10 +129,20 @@ def test_json_output_carries_the_pair_code_warning(capsys):
     sr._emit({"ok": True, "action": "owner-unlinked", "pairCode": "K7XQ-9B2M"},
              True, ["ignored"])
     out = json.loads(capsys.readouterr().out)
+    # ⛔⛔ THE WIRE NAMES, WHICH WAVE 9's RENAME WAS NOT ALLOWED TO TOUCH. A chat
+    # runtime reads these two keys; renaming either to match the new prose would
+    # break every consumer silently, and a bulk find-and-replace over this file
+    # would have done exactly that. They are asserted in the same test as the
+    # renamed sentence so neither half can drift without the other going red.
     assert out["pairCode"] == "K7XQ-9B2M"
     assert "pairCodeWarning" in out
     w = out["pairCodeWarning"].lower()
     assert "claim the computer" in w and "only copy" in w
+    # …and the SENTENCE inside uses the web app's word.
+    assert "new access code" in w, (
+        "the value is prose a person reads, and the app calls it an access code"
+    )
+    assert "pair code" not in w
 
 
 def test_json_adds_no_warning_when_there_is_no_code(capsys):
@@ -234,7 +244,10 @@ def test_device_secret_missing_names_the_remedy_that_works():
     for said in (sr._PAIR_ERRORS["device_secret_missing"],
                  cli._PAIR_FAILURES["device_secret_missing"]):
         assert "--pair" in said
+        # ⛔ BOTH SPELLINGS. Wave 9 renamed the user-visible word to "access
+        # code", so a negative pin on "pair code" alone could no longer fail.
         assert "reset the pair code" not in said.lower()
+        assert "reset the access code" not in said.lower()
 
 
 # ── C10 · the header may name only real subcommands ───────────────────────────

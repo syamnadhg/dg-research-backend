@@ -959,7 +959,7 @@ MUTANTS = [
        '    from urllib3.util.connection import allowed_gai_family\n')]),
     ('CN5', RP, 'under',
      'A CONNECT STARTS WITH NO TIME LEFT: a socket is made and a negative timeout raises out of the loop, leaking it',
-     [('        left = deadline - time.monotonic()\n        if left <= 0:\n            break\n',
+     [('        left = deadline - time.monotonic()\n        if left <= 0:\n            out_of_time = True\n            break\n',
        '        left = deadline - time.monotonic()\n')]),
 
     # ── repair round 3: image URLs do not count toward a length check ────────
@@ -1031,12 +1031,12 @@ MUTANTS = [
        '')]),
     ('CP3', RP, 'under',
      'A NAME THAT ANSWERS ONLY LAN HOSTS IS A PASSING FAILURE, not the refusal the peer check gave it',
-     [('    raise _DocImageRefused("refused" if skipped and not tried else "failed")',
+     [('    raise _DocImageRefused("refused" if skipped and not tried and not out_of_time else "failed")',
        '    raise _DocImageRefused("failed")')]),
     ('CP4', RP, 'over',
      'A PUBLIC HOST THAT DID NOT ANSWER IS A REFUSAL because a private answer was skipped first',
-     [('    raise _DocImageRefused("refused" if skipped and not tried else "failed")',
-       '    raise _DocImageRefused("refused" if skipped else "failed")')]),
+     [('    raise _DocImageRefused("refused" if skipped and not tried and not out_of_time else "failed")',
+       '    raise _DocImageRefused("refused" if skipped and not out_of_time else "failed")')]),
     ('CP5', RP, 'under',
      '⛔ THE RULE READS THE HOST NAME, not the address: every image host is skipped and every image is a caption',
      [('        if not _doc_img_address_is_public(addr[0]):',
@@ -1062,7 +1062,8 @@ MUTANTS = [
        '            sections = [t for t in map(_find_heading_title, sections) if t]\n')]),
     ('HD10', RP, 'over',
      'A BOLD SECTION LINE KEEPS ITS IMAGE CAPTION: `![Chart]() Quarterly revenue`',
-     [('sections = sections + [t for t in map(_find_heading_title, bold_sections + numbered) if t]',
+     [('sections = sections + [t for t in map(_find_heading_title, bold_sections + numbered)\n'
+       '                                       if 5 <= len(t) <= 80]',
        'sections = sections + bold_sections + numbered')]),
     ('HD3', RP, 'under',
      '⛔ THE FINDINGS HEADING KEEPS ITS IMAGE: past 80 characters, and a finding under it takes the heading above as its title',
@@ -1126,6 +1127,54 @@ MUTANTS = [
      'A brief.md THAT NO LONGER HOLDS THE BRIEF IS CUT AT A GUESSED OFFSET and overwritten',
      [('        if current.endswith(brief_text):\n',
        '        if True:\n')]),
+
+    # ── wave 9 (2026-09-16): pictures survive the clock ──────────────────────
+    #
+    # ⛔⛔ A CLOCK EXPIRY WAS REPORTED AS A REFUSAL, and refusals are remembered for
+    # the whole research. One private answer skipped, the image's deadline breaking
+    # the loop before any public address was tried, and `skipped and not tried` was
+    # true — so the image was a caption in EVERY later document of that research.
+    ('W9A1', RP, 'under',
+     '⛔⛔ THE CLOCK IS A REFUSAL AGAIN: a private answer skipped and the deadline breaking before any public address was tried is cached as "refused", and that chart is a caption in every later document of the research',
+     [('    raise _DocImageRefused("refused" if skipped and not tried and not out_of_time else "failed")',
+       '    raise _DocImageRefused("refused" if skipped and not tried else "failed")')]),
+    ('W9A2', RP, 'under',
+     '⛔ THE TIME BREAK IS NEVER MARKED, so the raise below cannot tell "nothing public to try" from "the budget ran out first" — the same cached caption by the other half of the wiring',
+     [('            out_of_time = True\n            break\n',
+       '            break\n')]),
+
+    # ⛔⛔ A BOLD PSEUDO-HEADING WHOSE IMAGE WAS STORED WAS DROPPED. The 5-80 bound
+    # measured the RAW line, image markup and all, while the '##' path strips first
+    # and has no bound at all — the same section survived one way and not the other.
+    ('W9B1', RP, 'under',
+     '⛔ THE BOLD CAPTURE IS BOUNDED AT 80 RAW CHARACTERS AGAIN: `**![Chart](/document-images/…/<64 hex>.png) Quarterly revenue**` is 126 raw characters and stops being a section, though the same line written `## …` still is',
+     [("bold_sections = re.findall(r'^\\*\\*(.{1,400})\\*\\*\\s*$', content, re.MULTILINE)",
+       "bold_sections = re.findall(r'^\\*\\*(.{5,80})\\*\\*\\s*$', content, re.MULTILINE)")]),
+    ('W9B2', RP, 'under',
+     '⛔ THE NUMBERED-BOLD CAPTURE IS BOUNDED AT 80 RAW CHARACTERS AGAIN: `**1. ![Chart](…) Quarterly revenue**` loses its section to its own image',
+     [("numbered = re.findall(r'^\\*\\*\\d+[\\.\\)]\\s*(.{1,400})\\*\\*', content, re.MULTILINE)",
+       "numbered = re.findall(r'^\\*\\*\\d+[\\.\\)]\\s*(.{5,80})\\*\\*', content, re.MULTILINE)")]),
+    ('W9B3', RP, 'over',
+     'THE WIDENED CAPTURE REACHES meta.json UNBOUNDED: with the title bound gone, a 300-character bold sentence is a section title in the analysis view',
+     [('                                       if 5 <= len(t) <= 80]',
+       '                                       if t]')]),
+    ('W9B4', RP, 'under',
+     'THE LOWER BOUND STOPS CARRYING THE TRUTHINESS FILTER: an image-ONLY bold line strips to "" and comes back as an empty section',
+     [('                                       if 5 <= len(t) <= 80]',
+       '                                       if 0 <= len(t) <= 80]')]),
+
+    # ⛔ THE REJECTION LINE PRINTED A NUMBER THE GATE NEVER WEIGHED: the floors
+    # measure prose (image destinations left out), the messages printed len(). A
+    # panel with three signed chart URLs logged a figure far ABOVE the floor it had
+    # just failed, and the rejection read as a machine fault.
+    ('W9C1', RP, 'under',
+     '⛔ GEMINI\'S T1 REJECTION PRINTS THE RAW LENGTH AGAIN: "returned 6,400 chars … below 2000-char threshold"',
+     [('        log(f"[{label}] T1 HTML→MD returned {_doc_img_prose_len(md)} chars of prose "',
+       '        log(f"[{label}] T1 HTML→MD returned {len(md)} chars of prose "')]),
+    ('W9C2', RP, 'under',
+     '⛔ CLAUDE\'S T2 PANEL REJECTION PRINTS THE RAW LENGTH AGAIN, beside the floor it just failed',
+     [('            log(f"[{label}] T2 HTML→MD returned {_doc_img_prose_len(md_dom)} chars of "',
+       '            log(f"[{label}] T2 HTML→MD returned {len(md_dom)} chars of "')]),
 ]
 
 

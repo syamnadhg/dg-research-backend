@@ -504,8 +504,11 @@ def test_the_skill_no_longer_says_sharing_is_owner_only_in_the_web_app():
     # owner-unlink from chat rotates the machine's code and hands the new one
     # back. Reset itself is still the web app's, and that is what is pinned.
     assert "revoking one sharer stays in the web app" in low
-    assert "unlinking their own machine issues it a new pair code" in low
+    assert "unlinking their own machine issues it a new access code" in low
+    # ⛔ BOTH SPELLINGS, since wave 9's rename means the old one can no longer
+    # appear anywhere and a lone negative on it could never fail again.
     assert "resetting a pair code stay in the web app" not in low
+    assert "resetting an access code stay in the web app" not in low
 
 
 def test_the_capability_line_the_fallback_prints_names_the_new_surface():

@@ -3343,3 +3343,225 @@ def test_the_phase_1_skip_branch_rehosts_the_brief_before_the_paste_reads_it():
     branch = src.rindex("if 1 in skip_phases or _user_skip_p1 or _gate_skipped_p1:", 0, strip)
     body = src[branch:call]
     assert "_loaded_path = Path(brief_file)" in body and "_loaded_path = _bp" in body
+
+
+# ═══ 33. wave 9 (2026-09-16) — the clock is not a refusal ══════════════════════
+#
+# ⛔⛔ `skipped and not tried` is ALSO true when one answer was private and the
+# image's deadline broke the loop before any public address was tried. That verdict
+# was "refused", and a refusal is remembered for the whole research — so a chart the
+# CLOCK ran out on was a caption in every later document of that run, though the
+# next document has a fresh budget and `_doc_img_resolve_src` already lets a
+# deadline "failed" out of the cache.
+
+
+def _skip_that_spends_the_budget(monkeypatch, seen, spend=0.6):
+    """The REAL public/private rule, with a skipped answer taking `spend` seconds of
+    the image's budget — what a second lookup and a slow skip do on a live run."""
+    real = R._doc_img_address_is_public
+
+    def slow(ip):
+        seen.append(ip)
+        if real(ip):
+            return True
+        time.sleep(spend)
+        return False
+    monkeypatch.setattr(R, "_doc_img_address_is_public", slow)
+
+
+def test_a_connect_the_clock_broke_is_a_failure_not_a_refusal(monkeypatch):
+    """⛔⛔ EXECUTED — `_doc_img_connect`. One private answer skipped, then the image's
+    deadline broke the loop before the public address could be tried. `seen` holds
+    both addresses, so the loop DID run (the pre-loop guard would leave it empty) and
+    `connected` is empty, so the break — not a connect failure — ended it."""
+    made, connected = _connect_world(monkeypatch, ["10.0.0.7", "93.184.216.34"])
+    seen = []
+    _skip_that_spends_the_budget(monkeypatch, seen)
+    with pytest.raises(R._DocImageRefused) as got:
+        R._doc_img_connect("img.example.com", 443, time.monotonic() + 0.3)
+    assert seen == ["10.0.0.7", "93.184.216.34"]
+    assert made == [] and connected == []
+    assert got.value.kind == "failed"
+
+
+def _connect_world_for_the_funnel(monkeypatch, addrs):
+    """`_connect_world`, with asyncio's own AF_UNIX self-pipe left alone: the funnel
+    runs inside `asyncio.run`, which cannot start an event loop on a fake socket.
+    An image address still gets a dead socket, so nothing can reach the network."""
+    made, connected = [], []
+    real = socket.socket
+
+    class _Dead:
+        def setsockopt(self, *a):
+            pass
+
+        def settimeout(self, t):
+            pass
+
+        def connect(self, addr):
+            connected.append(addr[0])
+
+        def close(self):
+            pass
+
+    def spy(family=-1, type=-1, proto=-1, fileno=None):
+        if family in (socket.AF_INET, socket.AF_INET6):
+            made.append(family)
+            return _Dead()
+        return real(family, type, proto, fileno)
+
+    def getaddrinfo(host, port, *a, **k):
+        return [(socket.AF_INET6 if ":" in ip else socket.AF_INET, socket.SOCK_STREAM, 6, "",
+                 (ip, port)) for ip in addrs]
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    monkeypatch.setattr(socket, "socket", spy)
+    return made, connected
+
+
+def test_an_image_the_connects_clock_broke_is_fetched_again_by_the_next_document(
+        world, monkeypatch):
+    """⛔⛔ EXECUTED — THE CONSUMER of that verdict is the cache. The rehost runs the
+    REAL `_doc_img_connect` inside the fetch; the document's budget is spent by the
+    time it breaks, so nothing is remembered and the next document of the research
+    (a fresh budget) fetches the chart and stores it."""
+    made, connected = _connect_world_for_the_funnel(monkeypatch, ["10.0.0.7", "93.184.216.34"])
+    seen = []
+    _skip_that_spends_the_budget(monkeypatch, seen)
+    monkeypatch.setattr(R, "_DOC_IMG_DOC_BUDGET_SEC", 0.3)
+    url = "https://img.example.com/late-chart.png"
+    calls = []
+
+    def fetch(u, deadline):
+        calls.append(u)
+        return R._doc_img_connect("img.example.com", 443, deadline)
+    monkeypatch.setattr(R, "_doc_img_fetch", fetch)
+    assert rehost(f"![Chart]({url})", "ChatGPT") == "![Chart]()"
+    assert seen == ["10.0.0.7", "93.184.216.34"] and made == [] and connected == []
+    assert world.logs[-1][1].endswith("failed=1 linked=0 captioned=1 removed=0")
+
+    monkeypatch.setattr(R, "_DOC_IMG_DOC_BUDGET_SEC", 5.0)
+    monkeypatch.setattr(R, "_doc_img_fetch", lambda u, d: (calls.append(u), png())[1])
+    assert rehost(f"again ![Chart]({url})", "Gemini") == f"again ![Chart]({ref_for(png())})"
+    assert calls == [url, url]
+
+
+# ═══ 34. wave 9 — a bold pseudo-heading whose image was STORED ═════════════════
+#
+# ⛔⛔ The 5-80 bound measured the RAW captured line, image markup and all, so a
+# stored reference (96 characters) pushed a bold section line out of the match
+# entirely — while the SAME line written `## …` kept its section, because that path
+# captures the whole line, has no bound at all, and strips first.
+
+BOLD_STORED = f"**![Chart]({HEADING_REF}) Quarterly revenue**"
+LONG_BOLD_TITLE = ("Revenue grew steadily across every region we sell into this year " * 5).strip()
+
+
+def test_a_bold_section_line_whose_image_was_stored_is_still_a_section(tmp_path, monkeypatch):
+    """⛔⛔ EXECUTED — `save_meta`. The stored line must come back as a section now,
+    and the two the bound still has to drop are in the SAME document: an image-ONLY
+    bold line (which must not return as an empty section) and a bold sentence whose
+    TITLE runs past 80, which the widened capture can now reach."""
+    assert len(BOLD_STORED) - 4 > 80 and 80 < len(LONG_BOLD_TITLE) < 400
+    got = _claude_sections(tmp_path, monkeypatch,
+                           f"## Only heading\n\n{BOLD_STORED}\n\n"
+                           f"**![Only]({HEADING_REF})**\n\n"
+                           f"**{LONG_BOLD_TITLE}**\n\n")
+    assert got["sections"] == ["Only heading", "Quarterly revenue"]
+
+
+def test_a_stored_image_makes_no_difference_between_a_bold_line_and_a_hash_heading(
+        tmp_path, monkeypatch):
+    """The asymmetry itself: the same content, once as `**…**` and once as `## …`.
+    The '##' path always kept it; the bold path dropped it on the image's length."""
+    got = _claude_sections(tmp_path, monkeypatch,
+                           f"## ![Chart]({HEADING_REF}) Quarterly revenue\n\nText.\n\n")
+    assert got["sections"] == ["Quarterly revenue"]
+    (tmp_path / "b").mkdir()
+    bold = _claude_sections(tmp_path / "b", monkeypatch, f"{BOLD_STORED}\n\n")
+    assert bold["sections"] == ["Quarterly revenue"]
+
+
+def test_a_numbered_bold_line_whose_image_was_stored_is_still_a_section(tmp_path, monkeypatch):
+    """⛔ The numbered-bold variant carried the same raw bound. The trailing prose
+    keeps the plain-bold pattern (which needs the line to END in `**`) off this line,
+    so only the numbered capture can put this section in meta.json."""
+    line = f"**1. ![Chart]({HEADING_REF}) Margin outlook** — see the appendix"
+    got = _claude_sections(tmp_path, monkeypatch, f"## Only heading\n\n{line}\n\n")
+    assert got["sections"] == ["Only heading", "Margin outlook"]
+
+
+# ═══ 35. wave 9 — the rejection line reports the number the gate weighed ═══════
+#
+# ⛔ The HTML→MD floors measure PROSE (image destinations left out); the messages
+# printed len(). A panel carrying four signed chart URLs logged ~3,000 characters
+# beside "below 2000-char threshold" and the rejection read as a machine fault.
+#
+# ⭐ These two tiers turn out to be EXECUTABLE with no browser: T1/T2 of the CUA
+# ladders are gated on `browser and cua_client`, so a page whose every evaluate
+# answers empty falls straight through them.
+
+
+class _TierPage:
+    """Every evaluate answers empty, so the CUA/clipboard tiers below find nothing."""
+
+    async def evaluate(self, js, *a):
+        return ""
+
+
+def _tier_logs(monkeypatch, md):
+    logs = []
+    monkeypatch.setattr(R, "log", lambda msg, level="INFO", *a, **k: logs.append(msg))
+
+    async def no_sleep(*a, **k):
+        return None
+
+    async def scrape(page, selectors, label):
+        return md
+    monkeypatch.setattr(R.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(R, "_extract_html_to_md", scrape)
+    return logs
+
+
+def _ack_with_charts(prose):
+    """A chat-side ack whose RAW length clears the 2000 floor on image URLs alone."""
+    return prose + "".join(f"![C{i}]({LONG_IMG}{i})" for i in range(4))
+
+
+@pytest.mark.parametrize("prose", ["Tiny chat-side ack. ",
+                                   "A rather longer chat-side acknowledgement sits here. "])
+def test_geminis_T1_rejection_reports_the_prose_length_the_gate_weighed(monkeypatch, prose):
+    """⛔ EXECUTED — `extract_gemini_response` T1. Two different acks, so a hard-coded
+    number could not satisfy both."""
+    md = _ack_with_charts(prose)
+    assert len(md) > 2000 > R._doc_img_prose_len(md)
+    logs = _tier_logs(monkeypatch, md)
+    monkeypatch.setattr(R, "_strip_gemini_panel_noise", lambda t: t)
+    assert asyncio.run(R.extract_gemini_response(_TierPage())) == ""
+    line = [m for m in logs if "T1 HTML→MD returned" in m]
+    assert len(line) == 1
+    assert f"returned {R._doc_img_prose_len(md)} chars" in line[0]
+    assert f"returned {len(md)} chars" not in line[0]
+    assert "below 2000-char threshold" in line[0]
+
+
+@pytest.mark.parametrize("prose", ["Tiny partial render. ",
+                                   "A rather longer partial render sits in the panel. "])
+def test_claudes_T2_panel_rejection_reports_the_prose_length_the_gate_weighed(monkeypatch, prose):
+    """⛔ EXECUTED — `extract_claude_response` T2, the artifact-panel DOM scrape."""
+    md = _ack_with_charts(prose)
+    assert len(md) > 2000 > R._doc_img_prose_len(md)
+    logs = _tier_logs(monkeypatch, md)
+
+    async def one(page):
+        return 1
+
+    async def click(page, index=0):
+        return True
+    monkeypatch.setattr(R, "_count_claude_artifacts", one)
+    monkeypatch.setattr(R, "_click_claude_artifact", click)
+    assert asyncio.run(R.extract_claude_response(_TierPage())) == ""
+    line = [m for m in logs if "T2 HTML→MD returned" in m]
+    assert len(line) == 1
+    assert f"returned {R._doc_img_prose_len(md)} chars" in line[0]
+    assert f"returned {len(md)} chars" not in line[0]
+    assert "below 2000-char floor" in line[0]

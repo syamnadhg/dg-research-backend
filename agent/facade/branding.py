@@ -88,7 +88,12 @@ def header(tagline: str, gloss: str, *, tagline_color: str | None = None) -> Non
 
 
 def step_arc(steps: list[str]) -> None:
-    """Compact preview of the whole step sequence (like --pair's 'Five steps')."""
+    """Compact preview of the whole step sequence (like --pair's 'Six steps').
+
+    ⭐ NOTHING TO RENUMBER HERE. This takes the step list and numbers it from
+    the list's own length, so the machine's 2026-09-17 five→six pair renumber
+    reached this file as one stale word in a docstring and nothing else.
+    """
     parts = []
     for i, name in enumerate(steps, 1):
         parts.append(f"{c(_ACCENT, str(i))} {name}")

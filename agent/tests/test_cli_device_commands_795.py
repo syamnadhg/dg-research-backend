@@ -95,7 +95,7 @@ def test_unlink_prints_the_new_code_and_calls_it_a_credential(live, monkeypatch,
     assert _remove() == 0
     out = capsys.readouterr().out
     assert "Unlinked My PC" in out
-    assert "New pair code: K7XQ-9B2M" in out
+    assert "New access code: K7XQ-9B2M" in out
     assert "no longer works" in out
     assert "claim this computer as its owner" in out
     assert "password" in out
@@ -110,20 +110,30 @@ def test_unlink_fallback_is_honest_when_no_code_came_back(live, monkeypatch, cap
     _fe(monkeypatch, {"ok": True, "action": "owner-unlinked", "deviceName": "My PC"})
     assert _remove() == 0
     out = capsys.readouterr().out
-    assert "pair code changed" in out
+    assert "access code changed" in out
     assert "device's own screen" not in out
     assert "cannot be looked up anywhere" in out
     assert "superresearch --pair" in out and "new computer" in out
-    assert "New pair code:" not in out
+    assert "New access code:" not in out
 
 
 def test_unlink_prints_no_code_for_a_sharer(live, monkeypatch, capsys):
     """A sharer walking away is not handed the key to the machine they left, and
-    is not told about a rotation on a computer that is no longer theirs."""
+    is not told about a rotation on a computer that is no longer theirs.
+
+    ⛔⛔ RE-POINTED IN WAVE 9, AND IT WOULD HAVE GONE ON PASSING FOREVER. This
+    asserted `"pair code" not in out.lower()` — a NEGATIVE test on the exact
+    words the wave renamed. The rename satisfied it trivially: the screen could
+    have started printing "New access code: …" to every sharer and this would
+    still have been green, because the string it forbids no longer exists
+    anywhere in the program. A negative pin on retired wording is a decoration.
+    ⭐ SO IT NOW FORBIDS BOTH SPELLINGS, and the old one stays listed precisely
+    so a half-revert cannot sneak the leak back either."""
     _fe(monkeypatch, {"ok": True, "action": "left-shared", "deviceName": "Boss PC"})
     assert _remove() == 0
     out = capsys.readouterr().out
     assert "Left the shared device Boss PC" in out
+    assert "access code" not in out.lower()
     assert "pair code" not in out.lower()
     assert "K7XQ" not in out
 
@@ -138,7 +148,7 @@ def test_unlink_refusal_is_worded_on_screen(live, monkeypatch, capsys):
     assert _remove() == 1
     out = capsys.readouterr().out
     assert "rotation_failed" not in out
-    assert "pair code would not change" in out
+    assert "access code would not change" in out
     assert "still linked to this account" in out
     assert "nothing was changed" not in out.lower()
 

@@ -284,7 +284,7 @@ def test_each_pair_stage_reports_at_its_OWN_call_site():
 
 
 def test_the_completion_names_the_capacity_the_incident_turned_on():
-    """⭐ The owner wanted two concurrent run slots and got one, and [5/5] Ready
+    """⭐ The owner wanted two concurrent run slots and got one, and [6/6] Ready
     reported success without ever naming the capacity."""
     src = code_only_deep(research)
     i = src.index("Ev.PAIR_COMPLETED")

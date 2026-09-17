@@ -6,7 +6,7 @@
 
 with `2` — the number the question had just used — and the loop exited
 printing nothing at all. They wanted two concurrent run slots, got one, and
-`[5/5] Ready` then reported success. Nothing in the whole session named the
+`[6/6] Ready` then reported success. Nothing in the whole session named the
 capacity they actually ended up with.
 
 ⭐⭐ THE PARSING IS THE TRIGGER; THE SILENCE IS THE DEFECT. Before this wave
@@ -313,13 +313,20 @@ def test_the_capacity_line_never_claims_zero(capsys, bad):
     assert "1 browser profile" in capsys.readouterr().out
 
 
-# ── [5/5] Ready ──────────────────────────────────────────────────────────────
+# ── [6/6] Ready ──────────────────────────────────────────────────────────────
 
 def test_ready_reports_the_capacity_it_is_calling_ready():
     """The new owner's Ready screen listed platforms and never once said how
-    many concurrent slots they had ended up with."""
-    src = inspect.getsource(research._continue_pair_stages_2_to_5)
-    ready = src[src.index("_setup_step(5, 5"):]
+    many concurrent slots they had ended up with.
+
+    ⛔ THE SLICE ANCHOR BELOW IS `str.index`, NOT AN ASSERT. When the pair arc
+    went 5 → 6 on 2026-09-17 the old `_setup_step(5, 5` literal moved and this
+    raised ValueError at call time, which reads as a crash rather than as a
+    renumber. If Ready's call site changes again, repair it here — and note that
+    `_setup_step(6, 6` is unique to this arc, so it cannot silently slice from
+    --unpair's or --retire's last step instead."""
+    src = inspect.getsource(research._continue_pair_stages_2_to_6)
+    ready = src[src.index("_setup_step(6, 6"):]
     assert "load_worker_count()" in ready, (
         "read the persisted count — the add-loop's counter does not exist when "
         "profile 1 failed, and Ready still runs"

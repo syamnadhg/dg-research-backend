@@ -78,6 +78,11 @@ def from_value(v: dict[str, Any]) -> Any:
     if "stringValue" in v:
         return v["stringValue"]
     if "timestampValue" in v:
+        # Left as the raw RFC3339 STRING on purpose — `submittedAt` round-trips
+        # through here and every consumer of it wants the string. A reader that
+        # needs to do arithmetic on a Timestamp calls `timestamp_millis` below;
+        # widening this branch to return millis would silently change the type
+        # of every timestamp field in the agent.
         return v["timestampValue"]
     if "mapValue" in v:
         return {
@@ -86,6 +91,60 @@ def from_value(v: dict[str, Any]) -> Any:
     if "arrayValue" in v:
         return [from_value(x) for x in v.get("arrayValue", {}).get("values", [])]
     return None
+
+
+def timestamp_millis(value: Any) -> float | None:
+    """Epoch millis for a decoded Firestore ``timestampValue``, else ``None``.
+
+    ⛔⛔ THE AGENT COULD NOT DO ARITHMETIC ON A TIMESTAMP FIELD AT ALL. Over REST
+    a Timestamp arrives as ``{"timestampValue": "2026-09-16T12:34:56.789123Z"}``
+    and ``from_value`` hands back that STRING — so a reader that subtracted it
+    from ``time.time() * 1000`` raised ``TypeError``, and a reader that guarded
+    with ``isinstance(x, (int, float))`` fell through and never saw the field.
+    That is why the machine's server-stamped ``heartbeatAt`` needs this: the BE
+    writes it with Firestore's SERVER_TIMESTAMP sentinel, so it is the one
+    liveness value neither the machine's clock nor this host's can be wrong
+    about — but only if this side can read it.
+
+    ⛔ TOLERANT OF THE REAL WIRE SHAPE, NOT OF A TIDY ONE. Firestore REST
+    serializes a timestamp with ZERO, three, six or NINE fractional digits, and
+    ``datetime.fromisoformat`` accepts none of those last ones: nine digits raise
+    on every Python this package supports. The fraction is therefore clipped to
+    the six digits a ``datetime`` can hold. A value this cannot parse returns
+    ``None`` so the caller falls back rather than crashing — an unreadable stamp
+    must not be able to take a working machine offline.
+
+    A number is passed through unchanged, because the Admin SDK and the browser
+    hand the same field over as millis and a caller should not have to care.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text[-1] in ("Z", "z"):
+        text = text[:-1] + "+00:00"
+    dot = text.find(".")
+    if dot != -1:
+        end = dot + 1
+        while end < len(text) and text[end].isdigit():
+            end += 1
+        digits = text[dot + 1:end][:6].ljust(6, "0")
+        text = text[:dot + 1] + digits + text[end:]
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        # Firestore always sends an offset; a bare local-looking string is a
+        # malformed payload, and reading it as UTC is the only guess that does
+        # not shift a machine's liveness by this host's timezone.
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.timestamp() * 1000
 
 
 def fields_to_dict(doc: dict[str, Any]) -> dict[str, Any]:

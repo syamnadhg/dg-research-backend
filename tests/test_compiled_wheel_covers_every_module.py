@@ -32,6 +32,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
+from _wheel_surface import dropped_from_wheel, wheel_shipped_sources
 
 REPO = Path(__file__).resolve().parent.parent
 PYPROJECT = REPO / "pyproject.toml"
@@ -168,8 +169,22 @@ def _shipped_sources() -> "list[Path]":
     coverage was resting on a coincidence, and a separate test that called the
     scanner with its OWN list could not see the narrowing at all. Both the
     assertion and the auth-is-covered test now read this, so shrinking it turns
-    two tests red instead of none."""
-    return [REPO / "research.py", *sorted((REPO / "auth").glob("*.py"))]
+    two tests red instead of none.
+
+    ⛔⛔ 2026-09-17 — AND IT WAS STILL THE WRONG LIST. `research.py + auth/*.py`
+    is not the wheel's source surface: the other SEVEN py-modules (models,
+    prompts, vision, narrate, selfheal, telemetry, logquiet) and the whole
+    shipped `scripts` package were never read, so the 2026-08-19 hole was closed
+    for research.py alone. A module-scope `import <something>` added to any of
+    them of a module missing from py-modules would ship a wheel that raises
+    ModuleNotFoundError on startup — the same launch-blocker, one file over.
+
+    It is now the DERIVED surface (tests/_wheel_surface.py), which the wave 2
+    guard already read. Not a second list here: the narrow list is exactly the
+    kind that goes stale, and this one did. `research.py` is added back because
+    the derivation excludes the launcher shim on purpose and the shim's source
+    is where `telemetry` was caught."""
+    return [REPO / "research.py", *wheel_shipped_sources()]
 
 
 def test_the_scan_reaches_the_auth_package_too() -> None:
@@ -182,6 +197,81 @@ def test_the_scan_reaches_the_auth_package_too() -> None:
     found = _first_party_top_level_imports(*auth_sources)
     assert found.get("logquiet") == "credentials.py", (
         f"the auth package is scanned but its imports are not seen: {found}")
+
+
+def test_the_scan_covers_every_module_the_wheel_packs() -> None:
+    """The relationship the narrow list broke: a module the wheel PACKS must
+    also be a module the wheel scans.
+
+    Anything in py-modules is shipped, so whatever it imports at module scope
+    has to be shipped with it — and the import guard below can only say that
+    about files it reads. Until 2026-09-17 it read one of the eight: seven
+    shipped modules could import an unpacked module and the three assertions in
+    this file all stayed green, which is the 08-19 telemetry hole in a different
+    file.
+
+    Written as py-modules ⊆ scanned rather than as a list of names, because a
+    list here is maintained by the same person who forgot to widen the scan."""
+    scanned = {p.relative_to(REPO).as_posix() for p in _shipped_sources()}
+    unscanned = sorted(m for m in _declared_py_modules() if f"{m}.py" not in scanned)
+    assert not unscanned, (
+        f"pyproject packs {unscanned} into the wheel, but the import scan never "
+        f"reads them — a module-scope first-party import in any of those ships a "
+        f"wheel that dies with ModuleNotFoundError before printing a line, and "
+        f"every assertion in this file stays green. Scanned: {sorted(scanned)}"
+    )
+
+
+def test_the_scan_reaches_the_compiled_siblings_too() -> None:
+    """The auth test's twin for the seven sibling modules — and the same reason
+    it exists: a list that CLAIMS to cover them proves nothing, a module-scope
+    import actually seen inside one of them does.
+
+    `telemetry.py -> logquiet` is the pin that matters most. telemetry is the
+    module whose absence from py-modules was the 08-19 launch blocker, and it in
+    turn imports another first-party module at module scope — so the file that
+    started this whole class of defect is now inside the scan instead of only
+    being named by it."""
+    siblings = [p for p in _shipped_sources()
+                if p.parent == REPO and p.name != "research.py"]
+    assert siblings, (
+        "the compiled sibling modules dropped out of the shipped-source list, so "
+        "models/prompts/vision/narrate/selfheal/telemetry/logquiet could each "
+        "import something the wheel does not carry")
+    found = _first_party_top_level_imports(*siblings)
+    assert found.get("logquiet") == "telemetry.py", (
+        f"telemetry.py is listed but its module-scope imports are not seen: {found}")
+    assert found.get("models") in {"prompts.py", "vision.py", "narrate.py"}, (
+        f"the compiled siblings are listed but their imports are not seen: {found}")
+
+
+def test_the_scan_reaches_the_shipped_scripts_but_not_the_dropped_ones() -> None:
+    """pyproject ships `scripts` WHOLESALE (packages = ["auth", "scripts"]) minus
+    whatever tools/build_compiled.py deletes out of the packed tree, so the
+    package is shipped source the scan owes the same guarantee to — and the
+    build's DROP_FROM_WHEEL list is the only thing that says which of its files
+    are source-tree diagnostics rather than product.
+
+    Both halves in one test on purpose: scanning the package but not honouring
+    the drop would report a file as shipped that the wheel does not contain.
+
+    The dropped half is DERIVED, not a filename written here, and the file it
+    names must exist on disk — otherwise "it is not in the scan" is true of a
+    file nobody ships anyway and the assertion is passing vacuously."""
+    rels = {p.relative_to(REPO).as_posix() for p in _shipped_sources()}
+    assert any(r.startswith("scripts/") for r in rels), (
+        f"the shipped scripts package is not scanned at all: {sorted(rels)}")
+
+    on_disk = sorted(r for r in dropped_from_wheel() if (REPO / r).exists())
+    assert on_disk, (
+        "no file in tools/build_compiled.py's DROP_FROM_WHEEL exists in this "
+        "tree, so the half below asserts nothing")
+    scanned_anyway = sorted(r for r in on_disk if r in rels)
+    assert not scanned_anyway, (
+        f"{scanned_anyway} are DROPPED from the wheel by tools/build_compiled.py "
+        f"but the scan reads them as if they shipped — their imports are not the "
+        f"wheel's problem, and demanding them would push a source-tree diagnostic "
+        f"into py-modules")
 
 
 def test_a_guarded_or_function_local_import_is_not_demanded(tmp_path) -> None:

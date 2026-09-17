@@ -313,7 +313,7 @@ The supervisor reads env vars from `.dg-supervisor.env` (created automatically o
 
 **API keys** — Anthropic powers the agents (CUA + Vision) and is **required** for browser automation. Gemini powers narration + acts as the Haiku fallback for title refinement, and is **optional** (narrator silently disables without it). Four ways to set either, **all platforms**:
 
-- **(easiest — recommended)** **`--pair` Stage 3 auto-prompt.** At the end of pairing, `--pair` checks whether each key is already resolvable from any source; for missing keys it prompts with `[paste / S=skip]`, **verifies** the pasted key against the provider's API (5s cheap probe), and on success writes BE-local persistence + `os.environ` + busts the resolver cache. Persistence is per-machine: Windows User-scope env on Windows; `.dg-supervisor.env` upsert on macOS / Linux. Skip is first-class per key.
+- **(easiest — recommended)** **`--pair` Stage 4 auto-prompt.** At the end of pairing, `--pair` checks whether each key is already resolvable from any source; for missing keys it prompts with `[paste / S=skip]`, **verifies** the pasted key against the provider's API (5s cheap probe), and on success writes BE-local persistence + `os.environ` + busts the resolver cache. Persistence is per-machine: Windows User-scope env on Windows; `.dg-supervisor.env` upsert on macOS / Linux. Skip is first-class per key.
 - **(equivalent — set later, or rotate, or sync across devices)** "Account → API Config" in the web app — writes `users/{uid}/settings/prefs.apiKeys.{anthropic,gemini}` in Firestore. Distinct surface from pair-time keys: pair never auto-fills these inputs, so anything you see there is something you typed there. Works on Windows, macOS, Linux. No restart required after rotating; backend re-reads on next call (60s cache).
 - **(file-based, all platforms)** Uncomment `ANTHROPIC_API_KEY=sk-ant-...` and/or `GEMINI_API_KEY=AIza...` in `.dg-supervisor.env`. Loaded by `--env-file` at supervisor startup; survives reboots via the persistence supervisor. Good for un-paired backends or operators who prefer files. (On POSIX, `--pair` writes here too.)
 - **(advanced / legacy)** Set in your shell rc (Mac/Linux) or via PowerShell `[System.Environment]::SetEnvironmentVariable(..., 'User')` (Windows user-scope). The canonical env-var names are `ANTHROPIC_API_KEY` and `GEMINI_API_KEY` (matching the Anthropic SDK + Gemini API docs). Legacy aliases `CUA_API_KEY` and `GOOGLE_API_KEY` are auto-migrated on next startup and removed; new BE versions only read the canonical names. (On Windows, `--pair` writes here too.)
@@ -334,9 +334,11 @@ The supervisor reads env vars from `.dg-supervisor.env` (created automatically o
 python research.py --pair
 ```
 
-The flow has **five** gated stages — each waits for the previous to confirm before advancing. (The terminal renumbered from 4 to 5 stages with the 2026-05-18 pair-prompt addition.)
+The flow has **six** gated stages — each waits for the previous to confirm before advancing. (Renumber history: 4 → 5 stages with the 2026-05-18 pair-prompt addition; 5 → 6 on 2026-09-17, when the discoverability question — which had been asked inside Stage 2 as an unannounced second question — was given its own displayed step. Nothing about the flow's behaviour changed with that split: both answers are still written to Firestore in a **single** patch, because the rule they land on refuses the whole update if one key is off-list.)
 
-**`[1/5] Pair code` — mint + render code+QR + wait for app to claim**
+> ⛔ **The telemetry stage number and the displayed step number are deliberately different since 2026-09-17.** `PAIR_STAGE_REACHED` still emits 2 / 3 / 4 at the same three code points and `PAIR_COMPLETED` still carries `stage=5`, because those numbers are identities in a time series: renumbering them would make every historical row mean something new. Displayed step → emitted stage: 2/6 → 2, 3/6 → *(none)*, 4/6 → 3, 5/6 → 4, 6/6 → `PAIR_COMPLETED` 5.
+
+**`[1/6] Token setup` — mint + render code+QR + wait for app to claim**
 Mints (or reuses) a 256-bit `pollSecret` and POSTs `sha256(pollSecret)`
 to the FE Cloud Function `/api/devices/initiate-pair`. The function
 creates a synthetic Firebase Auth user, allocates a unique 8-char pair
@@ -362,17 +364,18 @@ refresh token to the OS keystore, and prints
 `research_config.json` so a future Reset Pair Code can rebind to the
 same `deviceId` without a fresh handshake.
 
-**`[2/5] On Startup` — supervised auto-restart prompt**
+**`[2/6] On Startup` — supervised auto-restart prompt**
 After the link lands, `--pair` prompts:
 
 ```
 Enable On Startup? [Y/n]:
 ```
 
-- **`Y` (default)** — opts into supervised mode; actual arming is **deferred to Stage 5** so an aborted login can't leave Firestore flagged as supervised while platforms are half-logged-in.
+- **`Y` (default)** — opts into supervised mode; actual arming is **deferred to Stage 6** so an aborted login can't leave Firestore flagged as supervised while platforms are half-logged-in.
 - **`n`** — skip; you'll run `python research.py --serve` manually after `--pair` finishes (and, on Linux/Mac, set up your own backgrounding via `nohup` / `tmux` / `screen` / your own systemd unit — see [§ Linux/Mac backgrounding](#linuxmac-backgrounding-while-track-c-is-still-pending)).
 
-Then the same stage asks a second question:
+**`[3/6] Discoverability` — who may find this computer**
+*(Asked inside Stage 2 as an unannounced second question until 2026-09-17; it has its own step header now. Both answers still ship in one Firestore write — see the note at the top of this section.)*
 
 ```
 Let other people find this computer and ask to use it? [y/N]:
@@ -391,7 +394,7 @@ python research.py --visibility            # print the current setting
 
 …or from the app, in **Account → the Shared-with popup**, which writes the same field.
 
-**`[3/5] API keys` — Anthropic + Gemini detect-prompt-verify** *(reordered to position 3 on 2026-05-18 so CUA + Vision are available for Stage 4)*
+**`[4/6] API keys` — Anthropic + Gemini detect-prompt-verify** *(reordered to sit ahead of the browser logins on 2026-05-18 so CUA + Vision are available for Stage 5; shifted from 3/5 to 4/6 by the 2026-09-17 split)*
 `--pair` runs `resolve_api_key()` and `resolve_gemini_api_key()` to check whether each key is already resolvable from any source (FE Account-page Firestore, Windows user-scope, shell env, or `.dg-supervisor.env`). For each missing key, it prompts:
 
 ```
@@ -401,11 +404,11 @@ Anthropic  — get one at https://console.anthropic.com/settings/keys
 
 On paste, the BE makes a cheap **live-API verification call** (`models.list` for Anthropic; `GET /v1beta/models` for Gemini) with a 5s timeout. If the provider rejects the key (auth_failed), the prompt re-asks up to 3 times then offers `Save anyway? [y/N]` defaulting to no. If the verifier itself can't reach the API (network_error — offline pair, transient blip), the key is saved with a fail-loud-at-first-run warning rather than blocking the pair.
 
-On verified paste, the BE writes the key to **BE-local persistence**: Windows User-scope env on Windows, `.dg-supervisor.env` upsert on macOS / Linux. It also mirrors to `os.environ` under the canonical name (`ANTHROPIC_API_KEY` for the Anthropic key, `GEMINI_API_KEY` for the Gemini key) so the running pair session can use the key immediately, and busts `_RESOLVED_KEY_CACHE` so the very next `resolve_api_key()` call (at the top of Stage 4 browser-login CUA init) sees the new key. Pair-time keys do NOT touch Firestore — the FE Account → API Config page is a separate surface that writes Firestore directly. (Pre-2026-05-23 devices may still have the legacy aliases `CUA_API_KEY` / `GOOGLE_API_KEY` in their User-scope env; `_migrate_legacy_api_keys()` runs once at startup, copies any surviving value to the canonical name, then retires the legacy entry. Idempotent + sentinel-cached.)
+On verified paste, the BE writes the key to **BE-local persistence**: Windows User-scope env on Windows, `.dg-supervisor.env` upsert on macOS / Linux. It also mirrors to `os.environ` under the canonical name (`ANTHROPIC_API_KEY` for the Anthropic key, `GEMINI_API_KEY` for the Gemini key) so the running pair session can use the key immediately, and busts `_RESOLVED_KEY_CACHE` so the very next `resolve_api_key()` call (at the top of Stage 5 browser-login CUA init) sees the new key. Pair-time keys do NOT touch Firestore — the FE Account → API Config page is a separate surface that writes Firestore directly. (Pre-2026-05-23 devices may still have the legacy aliases `CUA_API_KEY` / `GOOGLE_API_KEY` in their User-scope env; `_migrate_legacy_api_keys()` runs once at startup, copies any surviving value to the canonical name, then retires the legacy entry. Idempotent + sentinel-cached.)
 
-Skip is first-class per key — pair finishes regardless. Missing Anthropic falls back to **Playwright-only** verification in Stage 4 (less rigorous; no Pro-tier check) and surfaces a `cua_unavailable` alert at first job (recoverable via the chat-side `[Retry]` button once you add the key); missing Gemini silently disables narration.
+Skip is first-class per key — pair finishes regardless. Missing Anthropic falls back to **Playwright-only** verification in Stage 5 (less rigorous; no Pro-tier check) and surfaces a `cua_unavailable` alert at first job (recoverable via the chat-side `[Retry]` button once you add the key); missing Gemini silently disables narration.
 
-**`[4/5] Browser logins`**
+**`[5/6] Browser logins`**
 Runs the same real-Chrome sign-in engine `--login` uses:
 - **Phase 1 — real Chrome sign-in.** Opens your *real, non-automated* Chrome (a plain subprocess) on the profile, pointed at the ChatGPT / Gemini / Claude / NotebookLM sign-in pages. You sign into each and solve any human-verification, then press Enter. Real Chrome is used here because Google BotGuard / Cloudflare block the automated browser on sign-in pages — and a human sign-in also *warms* the fresh profile's trust.
 - **Verification is optional (2026-07-02).** Pair then asks `Skip the verification step? [Y/n]` — **Enter skips** (recommended: automated verify navigations on a brand-new profile are the strongest bot-score signal, and runs recheck logins at phase time anyway). Your per-platform state is still recorded truthfully via a local cookie read (zero page loads). Answer `n` to run the old patchright verify pass (sign-in + Pro tier per platform). `--login` never verifies — it's Phase 1 + the add-another-profile loop only.
@@ -424,9 +427,9 @@ It mirrors the resulting login state to the BE-owned `devices/{deviceId}.logins`
 
 > **Markers only tick after real auth.** `verify_login()` checks only auth-specific DOM (profile menus, account chips, chat-history lists). Generic chat-input elements are excluded because they show up on logged-out landing pages too.
 
-> **F4 / DGOPS-7451 cookie check** *(relaxed 2026-05-18)*: when Stage 4 opens the browser, it inspects the Playwright profile for persisted Google auth cookies. The relaxed semantics: refuse pair only when the device was previously paired to a DIFFERENT account (`account_switch_with_prior_cookies`). First-pair on a fresh device OR re-pair to the same account both allow cookies through with a passive log line + `security_pair_allowed_with_prior_cookies` event — the existing Google session is presumed to belong to the user about to claim THIS link. Strict "any cookie → refuse" was creating a catch-22 with `--unpair` preserving the profile. For the account-switch refuse case, the message points to `--unpair --deep` (below) which wipes the profile cleanly.
+> **F4 / DGOPS-7451 cookie check** *(relaxed 2026-05-18)*: when Stage 5 opens the browser, it inspects the Playwright profile for persisted Google auth cookies. The relaxed semantics: refuse pair only when the device was previously paired to a DIFFERENT account (`account_switch_with_prior_cookies`). First-pair on a fresh device OR re-pair to the same account both allow cookies through with a passive log line + `security_pair_allowed_with_prior_cookies` event — the existing Google session is presumed to belong to the user about to claim THIS link. Strict "any cookie → refuse" was creating a catch-22 with `--unpair` preserving the profile. For the account-switch refuse case, the message points to `--unpair --deep` (below) which wipes the profile cleanly.
 
-**`[5/5] Ready` — arm supervisor (if opted in) + final message**
+**`[6/6] Ready` — arm supervisor (if opted in) + final message**
 If you said `Y` to On Startup back in Stage 2, the supervisor is armed now — Windows Scheduled Task, macOS LaunchAgent (`~/Library/LaunchAgents/com.dgresearch.supervisor.plist`), or Linux systemd-user unit (`~/.config/systemd/user/dgresearch-supervisor.service`) depending on platform. If you said `n`, any leftover scheduled task / launchd agent / systemd unit is torn down so the machine genuinely matches "unsupervised". Final banner branches on whether the supervisor is live.
 
 ### Step 4: After pair succeeds
@@ -593,7 +596,7 @@ One account can pair multiple PCs. Each `--pair` on a new machine mints its own 
 A device can run **multiple pipelines in parallel** when its backend has `workerCount > 1` in `research_config.json`. Default is **1** (single-worker); a typical multi-profile production setup is **2**. Each worker is a separate Python subprocess spawned by the daemon-loop supervisor on adjacent ports (8000, 8001, …); each subscribes independently to the same `devices/{deviceId}/queue/` and `devices/{deviceId}/commands/` subcollections, and each pins to its own browser-profile dir (`~/.super-research/browser-profile-N/`) so they don't race on the same Chrome session.
 
 - **Where it's set:** `research_config.json.workerCount`. Loaded by `load_worker_count()` (research.py:3486) with a >=1 clamp so a bad config can't disable the only worker.
-- **How to raise it:** run `python research.py --pair` and at the "Add another browser profile?" prompt during Stage 4, add a second profile. The BE will spawn the additional worker on next supervisor cycle.
+- **How to raise it:** run `python research.py --pair` and at the "Add another browser profile?" prompt during Stage 5, add a second profile. The BE will spawn the additional worker on next supervisor cycle.
 - **Where the FE learns about it:** every heartbeat publishes `workerCount` on `devices/{deviceId}`. The FE gates a new submit on `ongoing >= workerCount OR queued > 0` to decide ongoing vs queued.
 - **Two researches running at once on one PC — is that a bug?** No. It's the expected behavior under `workerCount=2`. The queue only kicks in when ALL workers are busy.
 - **Cross-cutting safety:** the on-disk worker lock (`safe_enqueue_lock_*`) prevents dual-spawn on supervisor restarts; the listener `_pending_enq` counter prevents back-to-back claims by Firestore listener replay; a pre-claim status re-check drops a claim if the research doc transitioned to a terminal status (cancel, stop) between claim-scan and enqueue (cross-worker cancel race guard).
@@ -816,7 +819,7 @@ research-automate/
 
 **Two researches running at once on one PC** — Expected under `workerCount > 1`. See § Multi-Worker above. Not a bug.
 
-**Browser sessions expired** — The lighter path is now `python research.py --login`: it runs a **per-profile Y/N walk** (same as pair Stage 4) fronted by a **read-only pre-probe** that leaves any still-valid session **intact** — it only re-opens your real Chrome for the profiles you say Y to, so an already-signed-in profile is never blown away. Sign into the platforms + clear any Google/Cloudflare human-check in that window. It does **not** run the patchright login/Pro-tier verify pass (`--login` never verifies). Re-running `python research.py --pair` also logs you in again.
+**Browser sessions expired** — The lighter path is now `python research.py --login`: it runs a **per-profile Y/N walk** (same as pair Stage 5) fronted by a **read-only pre-probe** that leaves any still-valid session **intact** — it only re-opens your real Chrome for the profiles you say Y to, so an already-signed-in profile is never blown away. Sign into the platforms + clear any Google/Cloudflare human-check in that window. It does **not** run the patchright login/Pro-tier verify pass (`--login` never verifies). Re-running `python research.py --pair` also logs you in again.
 
 **NotebookLM login expired mid-run** — Surfaces as a Phase 3 alert with `login_expired` detail (distinct from generic upload failure). Re-run `--pair` to refresh that session; hit `[Skip]` on the alert if you want to move past Phase 3 and still get Phase 5 report/email.
 

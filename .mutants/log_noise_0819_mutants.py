@@ -260,9 +260,15 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str], str]] = [
        '               "telemetry", "logquiet"]',
        'TOP_MODULES = ["models", "prompts", "vision", "narrate", "selfheal",\n'
        '               "telemetry"]')], [T_WHEEL], BUILD),
-    ("P3", "under", "the import scan only looks at research.py, so an auth module "
-     "can import something the wheel does not carry",
-     [('    return [REPO / "research.py", *sorted((REPO / "auth").glob("*.py"))]',
+    # RE-ANCHORED 09-17: the shipped-source list stopped being an inline glob and
+    # became the derived wheel surface (tests/_wheel_surface.py), because
+    # research.py + auth/ left the other seven py-modules and the whole scripts
+    # package unscanned. Same mutation, same direction — narrow the list back to
+    # the shim alone — now against the line that carries it.
+    ("P3", "under", "the import scan only looks at research.py, so an auth module, "
+     "a compiled sibling or a shipped script can import something the wheel does "
+     "not carry",
+     [('    return [REPO / "research.py", *wheel_shipped_sources()]',
        '    return [REPO / "research.py"]')], [T_WHEEL], "tests/test_compiled_wheel_covers_every_module.py"),
     ("P4", "under", "the scan counts GUARDED imports too, so an optional "
      "dependency starts demanding to be shipped",

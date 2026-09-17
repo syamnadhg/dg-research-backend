@@ -387,7 +387,7 @@ MUTANTS = [
      "spends are said nowhere before the decision",
      [('        print("\\n     Anyone you say yes to can run research on that computer — "\n'
        '              "the same as")\n'
-       '        print("     somebody you gave a pair code to. Saying no stops them "\n'
+       '        print("     somebody you gave an access code to. Saying no stops them "\n'
        '              "asking again")\n'
        '        print("     for a week; the app tries to tell them, but that depends on "\n'
        '              "their own")\n'
@@ -423,9 +423,9 @@ MUTANTS = [
        '            print(f"     They see it as “{public_label}”.")',
        '        pass')]),
     ("T13", CLI, "under",
-     "the private branch stops saying a pair code still works, so hiding a "
+     "the private branch stops saying an access code still works, so hiding a "
      "machine reads as locking it — discovery mistaken for access again",
-     [('        print("     Nobody can find it. A pair code still lets someone in "\n'
+     [('        print("     Nobody can find it. An access code still lets someone in "\n'
        '              "without asking you.")',
        '        print("     Nobody can find it.")')]),
     ("T14", CLI, "under",
@@ -461,7 +461,7 @@ MUTANTS = [
      "the week goes from chat's denial, so the only surface most people use "
      "never says what a refusal costs the other person",
      [('        "They can’t ask again for a week. The app tries to tell them, but that "\n'
-       '        "depends on their own notification settings. Giving them the pair code "\n'
+       '        "depends on their own notification settings. Giving them the access code "\n'
        '        "still works if you change your mind.",',
        '        "They’re told.",')]),
     ("C4", SR, "over",
@@ -535,7 +535,7 @@ MUTANTS = [
      "the two costs go from chat's queue, so the surface most people use says "
      "neither what a yes means nor what a no spends",
      [('        lines.append("Anyone you say yes to can run research on that computer — "\n'
-       '                     "the same as somebody you gave a pair code to. Saying no "\n'
+       '                     "the same as somebody you gave an access code to. Saying no "\n'
        '                     "stops them asking again for a week; the app tries to tell "\n'
        '                     "them, but that depends on their own notification settings.")\n',
        '')]),
@@ -678,7 +678,7 @@ MUTANTS = [
      "refuses the two commands it now has",
      [('  name a topic. (For a computer they OWN they can also answer the people asking\n'
        '  for it and set whether strangers can find it at all. Unlinking their own\n'
-       '  machine issues it a new pair code. Revoking one sharer stays in the web app.)',
+       '  machine issues it a new access code. Revoking one sharer stays in the web app.)',
        '  name a topic. (Approving or refusing somebody, offering a computer publicly,\n'
        '  revoking sharers, and resets stay owner-only in the web app.)')]),
     ("S5", SKILL, "under",
@@ -698,9 +698,9 @@ MUTANTS = [
      # (delivery depends on the asker's own notification settings). Same mutant:
      # the disclosure bullet loses ANSWERING.
      [('**Answering** somebody lets a stranger run research on the user\'s own\n'
-       '  computer, exactly as a pair code would, and a "no" spends that person\'s week —\n'
+       '  computer, exactly as an access code would, and a "no" spends that person\'s week —\n'
        '  the app tries to tell them (their own notification settings decide), and giving\n'
-       '  them the pair code is still the way back. ',
+       '  them the access code is still the way back. ',
        '')]),
     ("S8", SKILL, "over",
      "⛔ the file stops exempting the private direction, so hiding a computer "
@@ -879,13 +879,13 @@ MUTANTS = [
      [('        print("     They cannot ask again for a week. The app tries to tell "\n'
        '              "them, but")\n'
        '        print("     that depends on their own notification settings. Giving "\n'
-       '              "them the pair")\n'
-       '        print("     code still works if you change your mind.")',
+       '              "them the")\n'
+       '        print("     access code still works if you change your mind.")',
        '        print("     They are told, and they cannot ask again for a week.")')]),
     ("W24", SR, "over",
      "⛔⛔ the same promise, on the surface most people use",
      [('        "They can’t ask again for a week. The app tries to tell them, but that "\n'
-       '        "depends on their own notification settings. Giving them the pair code "\n'
+       '        "depends on their own notification settings. Giving them the access code "\n'
        '        "still works if you change your mind.",',
        '        "They’re told, and they can’t ask again for a week.",')]),
     ("W25", CLI, "over",

@@ -1185,7 +1185,7 @@ _DECIDE_FAILURES = {
         "out. Ask for the queue again to see what is still waiting",
     "is_owner": "that person owns that computer, so there is nothing to answer",
     "revoked_sharer":
-        "you removed this person from that computer before — resetting its pair "
+        "you removed this person from that computer before — resetting its access "
         "code is what lets them back in",
     "share_cap_reached":
         "that computer is already shared with as many people as it can hold — "
@@ -1253,7 +1253,7 @@ _UNLINK_FAILURES = {
     # returns this, so an unlink stopping here has already destroyed a handoff.
     # What is true and useful is narrower: the machine is still yours.
     "rotation_failed":
-        "its pair code would not change, and unlinking without a fresh one would "
+        "its access code would not change, and unlinking without a fresh one would "
         "leave the computer claimable by anyone holding the old one — so it is "
         "still linked to this account. Try again in a moment",
     "not_authorized": "that computer isn't linked to this account, so there is "
@@ -1283,7 +1283,7 @@ _UNLINK_FAILURES = {
 # code they do not need to reset.
 _PAIR_FAILURES = {
     # ⛔ THE ALPHABET EXCLUDES I, L, O, 0 AND 1 — the five that get confused.
-    "invalid_code_format": "pair codes are 8 characters and never use I, L, O, 0 "
+    "invalid_code_format": "access codes are 8 characters and never use I, L, O, 0 "
                            "or 1 — check those",
     # ⛔⛔ THE REPAIR IT NAMED MINTS A NEW COMPUTER AND LOSES ITS PEOPLE. Both of
     # these sentences sent somebody to `superresearch --pair`, which on a machine
@@ -1521,7 +1521,7 @@ def cmd_device(args: argparse.Namespace) -> int:
     if getattr(args, "device_command", None) == "remove":
         # ⛔ 50s for the same reason the chat client waits 50: the bridge waits up
         # to 35 on this route plus a 10s refresh, and giving up first loses the
-        # only copy of the rotated pair code.
+        # only copy of the rotated access code.
         res = _bridge_post("/device/remove", {"deviceId": args.deviceId},
                            timeout=50.0)
         if res is None or res[0] != 200:
@@ -1546,14 +1546,16 @@ def cmd_device(args: argparse.Namespace) -> int:
         # HALF. The chat client at least told the person something (which was
         # false); the terminal printed "Removed device dev-a1." and stopped, so
         # somebody who unlinked their own machine here was never told that its
-        # pair code had just been rotated out from under them, nor given the new
+        # access code had just been rotated out from under them, nor given the new
         # one — and the new one is the only thing that can re-link the machine.
         # ⛔ AND IT IS SPELLED OUT AS A CREDENTIAL. On a machine with no owner
         # the code does not merely let somebody in; it makes them the owner.
+        # ⛔ `pairCode` IS THE WIRE FIELD AND STAYS. The route sends it under that
+        # name; only the words on the screen move to the web app's "access code".
         code = body.get("pairCode")
         if code:
-            print("  Its pair code changed — the old one no longer works.")
-            print(f"  New pair code: {code}")
+            print("  Its access code changed — the old one no longer works.")
+            print(f"  New access code: {code}")
             print("  Anyone who has that code can claim this computer as its "
                   "owner. Keep it like a password.")
         else:
@@ -1564,7 +1566,7 @@ def cmd_device(args: argparse.Namespace) -> int:
             # now lives in" — and the rotation has already removed the reader's
             # ownership, so the reveal refuses them too. There is no lookup to
             # point at, and inventing one sent people to read a dead code.
-            print("  Its pair code changed and the new one did not come back.")
+            print("  Its access code changed and the new one did not come back.")
             print("  That code cannot be looked up anywhere — this reply was the")
             print("  only copy. Run:  superresearch --pair   on the machine to use")
             print("  it again; it joins as a new computer.")
@@ -1622,13 +1624,13 @@ def cmd_device(args: argparse.Namespace) -> int:
 def _print_no_devices() -> None:
     """THE terminal empty state.
 
-    ⛔⛔ IT WAS ONE SENTENCE WITH NO NEXT STEP OF ANY KIND — no pair-code line, no
+    ⛔⛔ IT WAS ONE SENTENCE WITH NO NEXT STEP OF ANY KIND — no access-code line, no
     install link, no mention that somebody else's computer can be asked for. The
     chat client had seven wordings of this and the terminal had the shortest and
     emptiest of the lot, and nothing anywhere pinned it.
 
     ⭐ THE SAME THREE THINGS THE CHAT CLIENT SAYS, in this file's voice: no
-    computer on this account · add your own with a pair code · or ask to use
+    computer on this account · add your own with an access code · or ask to use
     somebody else's, with the ones on offer LISTED. A guard compares the claims,
     not the punctuation — this file has no curly apostrophes and that one is full
     of them.
@@ -1647,7 +1649,7 @@ def _print_no_devices() -> None:
           "8-char access code —")
     print("                    agent device add <code>")
     # ⛔⛔ AND THE ROUTE FOR SOMEBODY WITH NO MACHINE AT ALL. The chat client's
-    # block carries the one-line installer; this screen offered a pair code from a
+    # block carries the one-line installer; this screen offered an access code from a
     # computer that may be running nothing, which is advice you cannot act on.
     print("     No Super Research on any computer yet? Install it there first:")
     print("       Windows:      irm https://superresearch.io/install.ps1 | iex")
@@ -1838,8 +1840,8 @@ def _device_decide(device_id: str, requester: str, decision: str) -> int:
         print("     They cannot ask again for a week. The app tries to tell "
               "them, but")
         print("     that depends on their own notification settings. Giving "
-              "them the pair")
-        print("     code still works if you change your mind.")
+              "them the")
+        print("     access code still works if you change your mind.")
     return 0
 
 
@@ -1908,7 +1910,7 @@ def _print_visibility_meaning(state: str, public_label) -> None:
         if public_label:
             print(f"     They see it as “{public_label}”.")
     else:
-        print("     Nobody can find it. A pair code still lets someone in "
+        print("     Nobody can find it. An access code still lets someone in "
               "without asking you.")
 
 
@@ -1956,7 +1958,7 @@ def _device_requests() -> int:
         # week and leaves the person spending it uninformed.
         print("\n     Anyone you say yes to can run research on that computer — "
               "the same as")
-        print("     somebody you gave a pair code to. Saying no stops them "
+        print("     somebody you gave an access code to. Saying no stops them "
               "asking again")
         print("     for a week; the app tries to tell them, but that depends on "
               "their own")
@@ -3383,8 +3385,9 @@ def build_parser() -> argparse.ArgumentParser:
     use = dvsub.add_parser("use", parents=[common], help="select the device to run on")
     use.add_argument("deviceId", help="deviceId to run on (from `agent device`)")
     use.set_defaults(func=cmd_device)
-    dvadd = dvsub.add_parser("add", parents=[common], help="pair a new device by its on-screen pair code")
-    dvadd.add_argument("code", help="the pair code shown on the new device's screen")
+    dvadd = dvsub.add_parser("add", parents=[common], help="pair a new device by its on-screen access code")
+    # ⛔ THE POSITIONAL'S NAME IS THE PARSED ATTRIBUTE — only the help text moves.
+    dvadd.add_argument("code", help="the access code shown on the new device's screen")
     dvadd.set_defaults(func=cmd_device)
     dvrm = dvsub.add_parser("remove", parents=[common], help="unlink a device from your account")
     dvrm.add_argument("deviceId", help="deviceId to remove (from `agent device`)")

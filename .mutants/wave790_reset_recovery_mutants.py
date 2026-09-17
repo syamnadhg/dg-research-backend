@@ -163,8 +163,14 @@ BANNER_GATE = ('    if _cred_now != CRED_HEALTHY:')
 #: The pairing offer in the banner's next actions, and what limits it.
 BANNER_PAIR_GATE = ('        if _cred_now in (CRED_NEVER_PAIRED, CRED_ORPHANED):')
 #: The give-up branch's refusal to lead with pairing.
+#: ⛔ RE-ANCHORED IN WAVE 9 (was `"[relink] open the app and look under Devices:
+#: if this "`). The sentence itself was replaced because it was dead by
+#: construction — it offered an emailed code an hour after a 15-minute window —
+#: so the anchor moved to the "press Reset again" sentence that took its place.
+#: The MUTATION is unchanged: W20 still puts pairing back as the first thing the
+#: give-up branch says.
 GIVEUP = ('                log(\n'
-          '                    "[relink] open the app and look under Devices: if this "')
+          '                    "[relink] open the app: if this computer is still listed "')
 #: The marker clear on a healthy boot.
 MARKER_CLEAR = ('    os.environ.pop(RELINK_REEXEC_ENV, None)')
 #: The real command line the restart re-execs.

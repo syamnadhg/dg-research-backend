@@ -265,11 +265,36 @@ def test_the_giveup_does_not_lead_with_pairing():
     and only pairing replaces it. But if they DID approve and the redeems failed
     for another reason, the record survived and pairing throws away a machine
     that is still there. This code cannot tell: it has no token left to look
-    with. So it must not lead with the destructive answer."""
+    with. So it must not lead with the destructive answer.
+
+    ⛔ RE-POINTED IN WAVE 9, AND STRICTLY STRONGER. It used to accept
+    "look under Devices" as the first instruction, which is where the sentence
+    then sent people: "use the code you were emailed". That was dead by
+    construction — this branch only fires after MAX_RECOVERY_WALLCLOCK_SEC, an
+    hour, while an emailed code's window is RESET_WINDOW_MINUTES = 15, so the
+    code it offered had ALWAYS expired by the time the line printed. The old
+    assertion could not see that, because looking-before-pairing was all it
+    asked. It now also demands the real page name and the repair that survives
+    the window, which is what the web and the agent both say."""
     branch = _giveup_branch()
     first = branch[:branch.index("--pair")] if "--pair" in branch else branch
-    assert "look under Devices" in first, (
+    # ⛔ THE WHOLE CLAUSE, NOT "still listed". The retired sentence ALSO said
+    # "computer is still listed", so a bare substring test for it would have
+    # passed against the code this wave replaced — measuring nothing while
+    # looking like the guard. Asked once: would it have passed an hour ago? It
+    # would. So it reads the clause only the new sentence has.
+    assert "open the app: if this computer is still listed" in first, (
         "the first instruction must be to look, not to pair"
+    )
+    assert "Settings → Manage devices" in first, (
+        "Account → Manage devices is not a page; Reset lives under Settings"
+    )
+    assert "press Reset again" in first, (
+        "past the 15-minute window a second Reset is the only door left, and "
+        "this branch fires an hour in — so it must not offer the emailed code"
+    )
+    assert "use the code you were emailed" not in branch, (
+        "an hour-old emailed code answers code_expired every time"
     )
     assert "--serve" in first
 

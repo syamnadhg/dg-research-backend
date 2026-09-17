@@ -239,7 +239,7 @@ def test_the_chat_confirm_warns_the_code_changes_before_anyone_says_yes():
     where the warning has to land — telling somebody afterwards is a receipt, not
     a choice."""
     said = sr._NL_CONFIRMS["device-remove"].lower()
-    assert "pair code changes" in said or "pair code change" in said
+    assert "access code changes" in said or "access code change" in said
     assert "old one" in said
 
 
@@ -398,7 +398,7 @@ def test_chat_unlink_uses_the_unlink_table_not_the_pairing_one(monkeypatch, caps
     assert sr.cmd_device_remove(args) != 0
     out = capsys.readouterr().out
     assert "rotation_failed" not in out
-    assert "pair code wouldn’t change" in out
+    assert "access code wouldn’t change" in out
     assert "still linked to you" in out
 
 

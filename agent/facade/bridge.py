@@ -64,7 +64,12 @@ import requests
 
 from . import __version__, config, devicelogin, prefs, runview, selfupdate
 from .devicelogin import DeviceLoginError
-from .firestore_rest import FirestoreError, FirestoreRest, pair_state_usable
+from .firestore_rest import (
+    FirestoreError,
+    FirestoreRest,
+    pair_state_usable,
+    timestamp_millis,
+)
 from .session import AccountSession, CustomTokenError, RevokedError
 
 log = logging.getLogger(__name__)
@@ -378,16 +383,44 @@ _HEARTBEAT_FUTURE_TOLERANCE_MS = 5 * 60_000
 
 
 def _device_is_online(d: dict[str, Any]) -> bool:
-    """Whether a pair-confirmed device is heartbeating RIGHT NOW (recent
-    lastHeartbeat), not merely paired-but-powered-off. `lastHeartbeat` is epoch
-    millis written by the BE heartbeat loop. Missing/zero/non-numeric → offline.
+    """Whether a pair-confirmed device is heartbeating RIGHT NOW, not merely
+    paired-but-powered-off. Missing/zero/unreadable on both fields → offline.
+
+    ⛔⛔ NEW FIELD FIRST, AND THAT IS THE OPPOSITE OF THE `joinPolicy` READ A FEW
+    LINES DOWN — the two orderings are in the same wave on purpose and a later
+    reader will get one of them wrong unless the reason is written here.
+    `joinPolicy` reads OLD-FIRST because `visibility` is still the AUTHORITATIVE
+    copy: the app's public query, `isListable` and the machine all act on the old
+    name, and nothing writes the new one until a later flip, so preferring the new
+    name would let a stale or half-migrated value overrule the one in force.
+    Liveness is the other way round: `heartbeatAt` is not a second opinion about
+    the same fact, it is a BETTER-SOURCED one. `lastHeartbeat` is stamped with the
+    MACHINE's clock and aged here against THIS host's, so the two ends disagree by
+    however wrong either clock is; `heartbeatAt` is written with Firestore's
+    SERVER_TIMESTAMP, which means one clock for writer and reader both. When the
+    trustworthy side is present there is no reason to consult the other one.
+
+    ⛔ THE FALLBACK IS PERMANENT, not a migration step. `lastHeartbeat` (epoch
+    millis) is written forever beside the stamp: a device doc under the legacy
+    `users/{uid}/devices` tree never carries `heartbeatAt`, and a machine on an
+    older wheel will not write it until it updates. A device with only the old
+    field must keep reading exactly as it did.
 
     ⛔ BOUNDED AT BOTH ENDS since wave 8 — see `_HEARTBEAT_FUTURE_TOLERANCE_MS`.
+    Both bounds still apply to the server-stamped path. They cannot fire on it
+    (a server stamp cannot be ahead of or behind the server), which makes the
+    future bound dead weight there rather than wrong — and it is still load-
+    bearing on the fallback, which is the whole reason it exists.
     """
-    hb = d.get("lastHeartbeat")
-    if not isinstance(hb, (int, float)) or isinstance(hb, bool) or hb <= 0:
-        return False
-    age = time.time() * 1000 - hb
+    stamped = timestamp_millis(d.get("heartbeatAt"))
+    if stamped is not None and stamped > 0:
+        hb_ms: float = stamped
+    else:
+        hb = d.get("lastHeartbeat")
+        if not isinstance(hb, (int, float)) or isinstance(hb, bool) or hb <= 0:
+            return False
+        hb_ms = float(hb)
+    age = time.time() * 1000 - hb_ms
     return age < _DEVICE_ONLINE_MS and age > -_HEARTBEAT_FUTURE_TOLERANCE_MS
 
 
@@ -465,7 +498,7 @@ _PUBLIC_DEVICE_KEYS = ("deviceId", "label", "osFamily", "online", "full")
 # NO allow-list at all — it handed the web app's `incoming` and `outgoing` arrays
 # back byte for byte, which is precisely the shape `_devices_public` carried until
 # cross-verification measured it with a stubbed upstream and found a whole device
-# row coming through, plaintext pair code included. The fix landed four lines above
+# row coming through, plaintext access code included. The fix landed four lines above
 # this one and stopped there; the queue is the same relay with the same trust in
 # its source.
 #
@@ -1663,7 +1696,7 @@ _FE_JSON_TIMEOUT = 15
 # real work at the top of it — up to 26 sequential user-tree sweeps on a machine
 # shared with a full cohort, plus a mint, a rotate, a token revoke and an
 # access-request sweep. At 15s the bridge gave up while the route went on to
-# SUCCEED, and the rotated pair code — the only copy that ever exists — was
+# SUCCEED, and the rotated access code — the only copy that ever exists — was
 # discarded with the timed-out response. Both clients then said the request never
 # landed, the retry answered `not_authorized` because the machine really WAS
 # unlinked, and the ex-owner cannot use the reveal: the machine became
@@ -3931,7 +3964,7 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                              "status": body.get("status") or "pending"})
 
         def _device_pair(self) -> None:
-            """Pair a device to this account by its PAIR CODE (the chat
+            """Pair a device to this account by its ACCESS CODE (the chat
             `device add <code>`). Forwards to the web app's /api/devices/claim
             as the signed-in user — identical security to pairing in the web
             app: the 8-char code only exists on the new device's screen, so
@@ -3983,7 +4016,7 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             Forwards to the web app's /api/devices/unpair-self, which branches on
             the caller's relationship. TWO of its three branches are reachable
             from here: OWNER → `owner-unlinked` (the device doc and its install
-            stay alive, but the pair code is ROTATED first), SHARER →
+            stay alive, but the access code is ROTATED first), SHARER →
             `left-shared`. The third, `retired`, is gated on
             `callerUid === syntheticDeviceUid` — the machine unpairing ITSELF via
             `--unpair` — and this bridge always calls with a person's session, so
@@ -3991,10 +4024,10 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             deletes the device document, the synthetic login and the code entry
             outright, and neither client has copy for it.
 
-            The pair code rides back now — see the comment block below for what
+            The access code rides back now — see the comment block below for what
             the old copy claimed and why it could not have been true.
             """
-            # ⛔⛔ THE PAIR CODE RIDES BACK NOW, AND THE OLD COPY WAS A LIE. Both
+            # ⛔⛔ THE ACCESS CODE RIDES BACK NOW, AND THE OLD COPY WAS A LIE. Both
             # clients told the person their machine was untouched and its code
             # still good, which read as: keep the code, use it whenever. Since
             # 7.7A an owner-unlink ROTATES the code before clearing `ownerUid` —
@@ -4026,7 +4059,7 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 return
             sess, _fs = acct
             # ⛔ THE LONG WAIT, BECAUSE THIS ROUTE CAN USE ITS WHOLE 30s BUDGET AND
-            # A TIMEOUT HERE THROWS AWAY THE ONLY COPY OF THE NEW PAIR CODE.
+            # A TIMEOUT HERE THROWS AWAY THE ONLY COPY OF THE NEW ACCESS CODE.
             status, body = _fe_api_post(sess, "/api/devices/unpair-self",
                                         {"deviceId": device_id},
                                         timeout=_FE_UNLINK_TIMEOUT)
@@ -4343,10 +4376,19 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 # their own was told, on the one screen that reached them, to go
                 # and get one — while the account could have asked to use
                 # somebody else's since 7.9-2.
+                # ⛔⛔ THIS SENTENCE IS LOAD-BEARING TWICE, AND THE SECOND ONE
+                # IS INVISIBLE FROM HERE. `sr.py` (_cmd_research, the
+                # legacy-bridge fallback) recognises a no-device refusal from an
+                # OLDER bridge that sends no `reason` by searching this English
+                # for "grab the pair code" — so wave 9's rename of "pair code"
+                # to the web's "access code" would, on its own, have silently
+                # dropped the no-device empty state for anybody whose installed
+                # bridge predates this line. sr.py now matches EITHER wording;
+                # do not narrow it back to one.
                 self._json(400, {"reason": "no_devices",
                                  "error": "no research computer on this account yet "
                                           "— on the computer running Super Research, "
-                                          "grab the pair code from its screen and add "
+                                          "grab the access code from its screen and add "
                                           "it here (agent device add <code>), or ask "
                                           "to use somebody else's (agent device public)"})
                 return None

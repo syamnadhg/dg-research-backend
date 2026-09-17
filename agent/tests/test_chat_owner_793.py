@@ -144,7 +144,7 @@ def test_approve_phrasings_confirm_before_anything_happens(said):
     assert argv is None, (said, argv)
     assert "Say yes to" in lines[0], (said, lines)
     # The web app's own sentence, because the same owner reads both surfaces.
-    assert "the same as somebody you gave a pair code to" in lines[0], said
+    assert "the same as somebody you gave an access code to" in lines[0], said
 
 
 @pytest.mark.parametrize("said", [
@@ -165,7 +165,7 @@ def test_deny_phrasings_confirm_and_state_the_week(said):
     assert "Say no to" in lines[0], (said, lines)
     assert "week" in lines[0], said
     # ⛔ And the way back, or a recoverable cost reads as a bigger decision.
-    assert "pair code" in lines[0], said
+    assert "access code" in lines[0], said
 
 
 @pytest.mark.parametrize("said", [
@@ -370,7 +370,7 @@ def test_the_queue_states_both_costs_before_any_decision(chat):
     chat.gets["/devices/requests"] = (200, {"incoming": [INCOMING], "requests": []})
     sr.cmd_device_requests(_ns())
     out = chat.out()
-    assert "the same as somebody you gave a pair code to" in out
+    assert "the same as somebody you gave an access code to" in out
     assert "week" in out
 
 
@@ -495,10 +495,10 @@ def test_hiding_does_not_claim_anybody_is_still_locked_out(chat):
                                               "deviceName": "Studio PC"})
     sr.cmd_device_visibility(_ns(value="private", device=""))
     out = chat.out()
-    # ⛔ The pair code still works and the copy says so — hiding is discovery,
+    # ⛔ The access code still works and the copy says so — hiding is discovery,
     # not access, and implying otherwise is the misreading this whole feature
     # has to keep correcting.
-    assert "A pair code still lets someone in" in out
+    assert "An access code still lets someone in" in out
 
 
 # ── the terminal ─────────────────────────────────────────────────────────────
@@ -559,7 +559,7 @@ def test_the_terminal_denial_states_the_week_and_the_way_back(term):
     out = " ".join(term.out().split())
     assert "abc123" in out, "the terminal must say who it just refused"
     assert "for a week" in out
-    assert "pair code still works" in out
+    assert "access code still works" in out
     assert "tries to tell them" in out
     assert "They are told" not in out
 
@@ -720,7 +720,7 @@ def test_the_skill_still_reserves_what_really_is_web_app_only():
     ⛔⛔ AND HALF OF WHAT THIS USED TO ASSERT STOPPED BEING TRUE IN 7.9-5. The
     sentence it pinned was "revoking a sharer and resetting a pair code stay in
     the web app". The first half holds. The second does not: an owner-unlink
-    from chat ROTATES the machine's pair code and now hands the new one back, so
+    from chat ROTATES the machine's access code and now hands the new one back, so
     chat does produce a fresh code — just not through Reset, which is still the
     web app's. A guard on the old wording would have held a sentence that had
     become misleading about the one thing this wave was correcting, so it pins
@@ -728,9 +728,12 @@ def test_the_skill_still_reserves_what_really_is_web_app_only():
     low = " ".join(_skill().lower().split())
     assert "revoking one sharer stays in the web app" in low
     # chat CAN produce a new code, and only this way
-    assert "unlinking their own machine issues it a new pair code" in low
-    # …and the blanket claim is gone
+    assert "unlinking their own machine issues it a new access code" in low
+    # …and the blanket claim is gone. ⛔ BOTH SPELLINGS ARE FORBIDDEN: after
+    # wave 9's rename the old one could no longer appear anywhere, so keeping
+    # only it would have left this half of the guard unable to fail.
     assert "resetting a pair code stay in the web app" not in low
+    assert "resetting an access code stay in the web app" not in low
 
 
 def test_the_skill_warns_that_publishing_can_expose_the_owners_name():
@@ -782,7 +785,7 @@ def test_the_terminal_hiding_says_a_pair_code_still_works(term):
     _run(device_command="visibility", deviceId="dev-a1", value="private")
     out = term.out()
     assert "Nobody can find it." in out
-    assert "A pair code still lets someone in without asking you." in out
+    assert "An access code still lets someone in without asking you." in out
 
 
 def test_an_already_set_machine_reports_no_change_and_still_explains(term):
@@ -793,7 +796,7 @@ def test_an_already_set_machine_reports_no_change_and_still_explains(term):
     out = term.out()
     assert "already private" in out
     assert "Nothing to change." in out
-    assert "A pair code still lets someone in" in out
+    assert "An access code still lets someone in" in out
 
 
 @pytest.mark.parametrize("sub,phrase", [
@@ -835,7 +838,7 @@ def test_the_chat_denial_states_the_week(chat):
     sr.cmd_device_deny(_ns(person="sam"))
     out = chat.out()
     assert "can’t ask again for a week" in out
-    assert "pair code still works" in out
+    assert "access code still works" in out
 
 
 def test_a_captured_name_longer_than_a_name_is_not_quoted():
@@ -882,7 +885,7 @@ def test_the_disclosure_bullet_names_all_three_reaches():
     bullet = text[text.index("- You drive the user's own account only"):]
     nxt = bullet.find("\n- ", 1)
     bullet = bullet[:nxt] if nxt != -1 else bullet
-    for reach, word in (("**Asking**", "week"), ("**Answering**", "pair code"),
+    for reach, word in (("**Asking**", "week"), ("**Answering**", "access code"),
                         ("**Publishing**", "owner's own name")):
         assert reach in bullet, reach
         assert word in bullet, (reach, word)

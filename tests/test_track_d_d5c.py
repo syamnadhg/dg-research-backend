@@ -8,7 +8,7 @@ Originally covered three areas:
   - `_save_api_key_to_firestore` mode-branch (REMOVED — function deleted
     alongside the bridge)
 
-The bridge tests were dropped when --pair Stage 3 moved to BE-local
+The bridge tests were dropped when --pair Stage 4 moved to BE-local
 persistence (Win User-scope env / .dg-supervisor.env). See
 test_pair_prompt.py for the new `TestSaveApiKeyLocal` coverage.
 """

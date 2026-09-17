@@ -235,9 +235,9 @@ MUTANTS = [
      [('            f"Two ways to fix that. Ask to use somebody else\'s — ask me for the "\n            f"public computers and I\'ll list the ones on offer; their owner "\n            f"decides, and they see your name — or your email, if you have not "\n            f"set one.\\n\\n"\n            f"Or add your own. On a computer with Super Research, run:\\n"',
        '            f"On a computer with Super Research, run:\\n"')]),
     ("W3", BRIDGE, "under",
-     "the wire sentence loses the pair-code half instead, so somebody who owns a "
-     "machine already is sent to ask a stranger for one",
-     [('                                 "error": "no research computer on this account yet "\n                                          "— on the computer running Super Research, "\n                                          "grab the pair code from its screen and add "\n                                          "it here (agent device add <code>), or ask "',
+     "the wire sentence loses the access-code half instead, so somebody who owns "
+     "a machine already is sent to ask a stranger for one",
+     [('                                 "error": "no research computer on this account yet "\n                                          "— on the computer running Super Research, "\n                                          "grab the access code from its screen and add "\n                                          "it here (agent device add <code>), or ask "',
        '                                 "error": "no research computer on this account yet "\n                                          "— ask to use "')]),
 
     # ═══════════ R — the routing: the rule that did not exist, and the six ═══
@@ -385,7 +385,7 @@ MUTANTS = [
     ("S5", SKILL, "under",
      "the paragraph telling the assistant an empty account is not a dead end "
      "goes, so the model is free to relay the shortest of the ten old sentences",
-     [("**An account with NO computer is not a dead end.** Every screen that reports it\nnames BOTH routes — add your own with a pair code, or ask to use somebody else's —\nand the full ones (`devices`, `research`, the sign-in announce) also LIST the public\ncomputers on offer. Relay that list; never present setting up a machine as the only\nroute. The one-line sign-in confirmation names both routes without a list, which is\ndeliberate: it must not make a second call to render one.\n\n",
+     [("**An account with NO computer is not a dead end.** Every screen that reports it\nnames BOTH routes — add your own with an access code, or ask to use somebody else's —\nand the full ones (`devices`, `research`, the sign-in announce) also LIST the public\ncomputers on offer. Relay that list; never present setting up a machine as the only\nroute. The one-line sign-in confirmation names both routes without a list, which is\ndeliberate: it must not make a second call to render one.\n\n",
        '')]),
 
     # ═══════════ C — the anti-drift constants ════════════════════════════════

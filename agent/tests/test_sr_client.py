@@ -494,7 +494,7 @@ def test_device_remove_by_name_owner(bridge_port, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Unlinked" in out and "My PC" in out
     assert "K7XQ-9B2M" in out                      # the live code reaches them
-    assert "pair code changed" in out              # and the old one is dead
+    assert "access code changed" in out            # and the old one is dead
     assert "re-paired with its code" not in out    # the sentence stays dead
 
 
@@ -596,6 +596,10 @@ def test_research_multi_device_asks_which_not_pair(monkeypatch, capsys):
 
 def test_research_older_bridge_infers_pair_prompt_from_text(monkeypatch, capsys):
     # An older bridge returns no `reason`; infer no_devices from the English text.
+    # ⛔ THIS FIXTURE KEEPS THE PRE-WAVE-9 WORDING ON PURPOSE. A bridge already
+    # installed on somebody's disk still says "pair code", and this is the only
+    # test that proves that spelling is still recognised. Its twin below carries
+    # the bridge's CURRENT sentence; both spellings have to keep working.
     monkeypatch.setattr(sr, "_origin_from_env", lambda: None)
     monkeypatch.setattr(sr, "_post", lambda path, b=None: (
         400, {"error": "no devices yet — grab the pair code"}))
@@ -609,6 +613,54 @@ def test_research_older_bridge_infers_pair_prompt_from_text(monkeypatch, capsys)
     assert "access code" in out
     assert "ask to use somebody else" in out.lower()
     assert "show me public computers" in out
+
+
+def test_the_legacy_fallback_matches_the_bridges_OWN_no_device_sentence(
+        bridge_port, monkeypatch, capsys):
+    """⛔⛔ A PROSE RENAME WITH A BEHAVIOURAL CONSEQUENCE, AND NOTHING MEASURED
+    IT. `_cmd_research`'s fallback recognises a no-device refusal from a bridge
+    too old to send `reason` by searching the bridge's ENGLISH — and the bridge's
+    sentence does not contain "no devices yet", so the ONLY substring that ever
+    matched it was "grab the pair code". Wave 9 renamed that to the web's
+    "access code". Renaming the bridge alone would have dropped the whole
+    no-device empty state for every already-installed older bridge, silently,
+    with the suite green: the person would have got the bare "couldn't start"
+    line instead of the screen that tells them how to get a computer.
+
+    ⭐ SO IT DOES NOT HARDCODE EITHER SENTENCE. It asks the REAL bridge for its
+    real refusal, then replays that exact text the way an old bridge sends it —
+    with no `reason` key. Rename one side and this fails; rename both and it
+    passes. Nothing else can satisfy it, because the string comes from the
+    bridge itself."""
+    FakeFS.devices = []
+    seen = {}
+    real_post = sr._post
+
+    def _recording_post(path, body=None):
+        code, payload = real_post(path, body)
+        seen.setdefault("payload", payload)
+        return code, payload
+
+    monkeypatch.setattr(sr, "_post", _recording_post)
+    monkeypatch.setattr(sr, "_get", lambda path, timeout=None: (0, {"error": "x"}))
+    sr.main(["research", "EVs"])
+    capsys.readouterr()
+
+    sentence = str((seen.get("payload") or {}).get("error", ""))
+    assert "grab the access code" in sentence, (
+        "the bridge's own no-device refusal must use the web app's word; "
+        f"got {sentence!r}"
+    )
+
+    # Now the OLD bridge's shape: the same sentence, no machine-readable reason.
+    monkeypatch.setattr(sr, "_post",
+                        lambda path, b=None: (400, {"error": sentence}))
+    assert sr.main(["research", "EVs"]) != 0
+    out = capsys.readouterr().out
+    assert "No research computer on this account yet." in out, (
+        "the bridge's current wording is not recognised by the text fallback — "
+        "sr.py and bridge.py have drifted apart, and the empty state is gone"
+    )
 
 
 def test_no_backend_update_surface_left(bridge_port, monkeypatch):

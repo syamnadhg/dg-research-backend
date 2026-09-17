@@ -45,6 +45,7 @@ import narrate
 import prompts
 import research
 import vision
+from _wheel_surface import wheel_shipped_sources
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
@@ -600,34 +601,17 @@ def test_the_shared_resolver_finds_the_gemini_key_under_the_core_name(monkeypatc
 
 
 def _wheel_shipped_sources() -> "list[pathlib.Path]":
-    """Every first-party .py the WHEEL contains, read from the two declarations
-    that decide it rather than from a hand-kept list here.
+    """The shipped surface — MOVED to tests/_wheel_surface.py on 2026-09-17.
 
-    ⚠ A hardcoded list is what made the first version of the guard below useless:
-    it named the five compiled sibling modules, so it could not see the same
-    defect sitting in the `scripts/` package — which pyproject ships wholesale,
-    minus whatever the build script drops. Deriving the set means a new shipped
-    file is covered the day it is added, by the person who added it."""
-    import tomllib
-    pyproject = tomllib.loads(REPO.joinpath("pyproject.toml").read_text(encoding="utf-8"))
-    tool = (pyproject.get("tool") or {}).get("setuptools") or {}
-
-    build = REPO / "tools" / "build_compiled.py"
-    btree = ast.parse(build.read_text(encoding="utf-8"))
-    dropped = set()
-    for node in ast.walk(btree):
-        if (isinstance(node, ast.Assign)
-                and any(getattr(t, "id", "") == "DROP_FROM_WHEEL" for t in node.targets)):
-            dropped = {e.value for e in node.value.elts if isinstance(e, ast.Constant)}
-    assert dropped, "DROP_FROM_WHEEL could not be read — this scan would over-report"
-
-    out = [REPO / f"{m}.py" for m in tool.get("py-modules", []) if m != "research"]
-    for pkg in tool.get("packages", []):
-        for path in sorted((REPO / pkg).rglob("*.py")):
-            if path.relative_to(REPO).as_posix() in dropped:
-                continue
-            out.append(path)
-    return [p for p in out if p.exists()]
+    It moved because a second guard needed the same fact and had grown its own,
+    narrower answer to it: the import scan in
+    tests/test_compiled_wheel_covers_every_module.py read research.py + auth/
+    only, so seven shipped modules and the whole scripts package went unscanned.
+    Two lists that must agree is the defect, not the cure. The derivation, and
+    the reason `research.py` is deliberately absent from it, are documented
+    there; this name stays so the two call sites below and the guard on them
+    keep reading the same words they always did."""
+    return wheel_shipped_sources()
 
 
 def test_nothing_the_wheel_ships_reaches_the_pipeline_by_the_name_research() -> None:

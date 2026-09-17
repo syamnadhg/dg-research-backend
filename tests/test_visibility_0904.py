@@ -301,14 +301,14 @@ def test_the_pairing_question_asks_to_FIND_and_promises_approval():
     person still approves every request by hand and an approved person becomes
     an ordinary sharer. A question implying otherwise would be asking for
     consent to something that does not happen."""
-    src = inspect.getsource(research._continue_pair_stages_2_to_5)
+    src = inspect.getsource(research._continue_pair_stages_2_to_6)
     assert "Let other people find this computer and ask to use it?" in src
     assert "You approve each person." in src
     assert "anyone can use" not in src.lower()
 
 
 def test_the_pairing_question_defaults_to_private():
-    src = inspect.getsource(research._continue_pair_stages_2_to_5)
+    src = inspect.getsource(research._continue_pair_stages_2_to_6)
     i = src.index("Let other people find this computer and ask to use it?")
     assert "default=False" in src[i:i + 200]
 
@@ -320,7 +320,7 @@ def test_an_unreadable_stdin_leaves_the_machine_private():
     disagree — noise on stdin arms it, no stdin does not. Here both roads have
     to lead to private, or a scripted pair publishes a machine depending on what
     happened to be in the pipe."""
-    src = inspect.getsource(research._continue_pair_stages_2_to_5)
+    src = inspect.getsource(research._continue_pair_stages_2_to_6)
     i = src.index("Let other people find this computer and ask to use it?")
     tail = src[i:i + 700]
     assert "except EOFError:" in tail
@@ -332,11 +332,11 @@ def test_the_answer_is_WRITTEN_before_it_is_confirmed():
     """⛔⛔ FOUND BY CROSS-VERIFY. The first version printed
     "✓ People will be able to find it" and then wrote, discarding
     `_pair_patch_device`'s bool — so the tick stood through a network failure, a
-    dead token and a rules refusal alike. `supervised` survives that (Stage 5
+    dead token and a rules refusal alike. `supervised` survives that (Stage 6
     writes it again on both branches); `visibility` has NO second writer in the
     whole pair flow, so the answer was lost for good while the screen said
     otherwise."""
-    src = inspect.getsource(research._continue_pair_stages_2_to_5)
+    src = inspect.getsource(research._continue_pair_stages_2_to_6)
     write = src.index("saved = _pair_patch_device(device_id_for_progress")
     tick = src.index("People will be able to find it and ask you for access.")
     assert write < tick, "the confirmation must not precede the write it reports"
@@ -347,7 +347,7 @@ def test_the_answer_is_WRITTEN_before_it_is_confirmed():
 
 
 def test_a_lost_write_is_reported_as_lost():
-    src = inspect.getsource(research._continue_pair_stages_2_to_5)
+    src = inspect.getsource(research._continue_pair_stages_2_to_6)
     i = src.index("elif discoverable:")
     branch = src[i:i + 500]
     assert "stays private for now" in branch
@@ -357,21 +357,46 @@ def test_a_lost_write_is_reported_as_lost():
 def test_each_branch_names_the_command_that_changes_ITS_state():
     """⛔ A single hint under both answers handed whoever said yes a command that
     is a no-op for them, and named the way back nowhere in the pair session."""
-    src = inspect.getsource(research._continue_pair_stages_2_to_5)
+    src = inspect.getsource(research._continue_pair_stages_2_to_6)
     yes = src[src.index("if discoverable and saved:"):src.index("elif discoverable:")]
     assert "--visibility private" in yes
-    no = src[src.index("     Only people you give the pair code to can ask."):]
+    # ⛔ RE-POINTED IN WAVE 9, NOT WEAKENED. This is `str.index`, so when the
+    # machine's prose moved from "pair code" to the web's word it raised
+    # ValueError rather than failing — the loudest-but-least-readable way for a
+    # rename to break a guard. The slice still has to start at the PRIVATE
+    # branch's own sentence, which is the whole point of the assertion below.
+    no = src[src.index("     Only people you give the access code to can ask."):]
     assert "--visibility public" in no[:400]
+    # ⛔ AND THE OLD WORD IS GONE FROM THIS FUNCTION, so a half-migration that
+    # leaves one branch saying each cannot pass: the two sentences sit four
+    # printed lines apart on the same screen.
+    assert "pair code" not in src, (
+        "the pair session still says 'pair code' somewhere; the web app calls "
+        "this value an access code in every label it has"
+    )
 
 
 def test_both_stage_2_answers_go_in_ONE_patch():
     """⛔ The rule this lands on is `hasOnly()`, which refuses the WHOLE update
     when one key is off-list. Two calls would mean the second answer could be
     lost on its own; one call means the pair records what the person said, or
-    records neither."""
-    src = inspect.getsource(research._continue_pair_stages_2_to_5)
+    records neither.
+
+    ⛔⛔ AND SINCE 2026-09-17 THE TWO ANSWERS ARE ASKED UNDER SEPARATE STEP
+    HEADERS — [2/6] On Startup and [3/6] Discoverability — while still sharing
+    this one write. Splitting the display is exactly what tempts someone to
+    split the call, so the single-call count below now guards a boundary the
+    screen appears to draw."""
+    src = inspect.getsource(research._continue_pair_stages_2_to_6)
     calls = [i for i in range(len(src)) if src.startswith("_pair_patch_device(", i)]
-    assert len(calls) == 1, f"expected one device PATCH in stage 2-5, saw {len(calls)}"
+    assert len(calls) == 1, f"expected one device PATCH in stages 2-6, saw {len(calls)}"
+    # ⛔ AND IT LANDS AFTER BOTH QUESTIONS. A write hoisted up under step 2 would
+    # still be one call, and would still pass the count above — while leaving the
+    # step-3 answer with no writer at all.
+    assert calls[0] > src.index('_setup_step(3, 6, "Discoverability")'), (
+        "the shared patch must come after the discoverability question, not "
+        "between the two steps"
+    )
     body = src[calls[0]:calls[0] + 300]
     assert '"supervised": bool(enable_on_startup),' in body
     # ⛔ THE VALUE IS ONE OF TWO WORDS, NOT A BOOLEAN. `_pair_patch_device` maps a
@@ -387,8 +412,8 @@ def test_the_pairing_cancel_returns_False_rather_than_falling_out():
     `_cleanup_partial_pair`, which reverts the device doc and the token. Every
     cancel path in it must say `return False` on purpose — a bare `return` gets
     the right answer by accident and the wrong one the moment it is copied."""
-    src = inspect.getsource(research._continue_pair_stages_2_to_5)
-    i = src.index("Stage 2 — discoverability")
+    src = inspect.getsource(research._continue_pair_stages_2_to_6)
+    i = src.index("Stage 3 — discoverability")
     assert "return False" in src[i:i + 120]
     # And no bare `return` anywhere in the function's own body (the nested
     # progress helper has one, so this looks only at top-level indentation).
@@ -411,13 +436,56 @@ def test_the_pairing_cancel_returns_False_rather_than_falling_out():
         )
 
 
-def test_the_stage_count_is_untouched():
-    """⛔ The question folded into Stage 2 rather than becoming a sixth stage.
-    A 5→6 renumber is ~45 sites across six files of which the suite catches
-    three — and this is one of the three."""
+def test_the_discoverability_question_is_its_own_stage():
+    """⭐ THE SIXTH STAGE WAS BUILT ON 2026-09-17, and this test used to refuse it.
+
+    It was `test_the_stage_count_is_untouched`, and it pinned the old arc on the
+    grounds that "a 5→6 renumber is ~45 sites across six files of which the suite
+    catches three". Two things changed. The owner asked for the sixth step, which
+    is not a question the renumber cost gets to answer; and the recount found the
+    old figure wrong in both directions — four banner comments in this arc rather
+    than six, but also this helper's own NAME, which encoded the count and is
+    reached by `inspect.getsource` from ten test sites.
+
+    So the pin is inverted, not deleted: the arc is still deliberate, it is just
+    deliberately six now. Every step is anchored on its FULL call including the
+    title, because `"_setup_step(2, 6" in src` alone would be satisfiable by any
+    other arc that grew to six steps.
+    """
     src = inspect.getsource(research)
-    assert "_setup_step(2, 5, \"On Startup\")" in src
-    assert "_setup_step(5, 5" in src
+
+    # The six displayed steps, in order, each with its title.
+    arc = [
+        '_setup_step(1, 6, "Token setup")',
+        '_setup_step(2, 6, "On Startup")',
+        '_setup_step(3, 6, "Discoverability")',
+        '_setup_step(4, 6, "API keys")',
+        '_setup_step(5, 6, "Browser logins")',
+        '_setup_step(6, 6, "Ready")',
+    ]
+    for call in arc:
+        assert call in src, call
+    # …and they appear in that order in the file, so a step cannot be renumbered
+    # into the wrong position and still pass on presence alone.
+    where = [src.index(c) for c in arc]
+    assert where == sorted(where), dict(zip(arc, where))
+
+    # ⛔ THE OLD ARC CANNOT COME BACK. These are the exact literals the refusing
+    # version of this test pinned; both must now be absent.
+    assert '_setup_step(2, 5, "On Startup")' not in src
+    assert "_setup_step(5, 5" not in src
+    # Nor any other pair-arc call still claiming a five-step total.
+    for n in (1, 2, 3, 4, 5):
+        assert f"_setup_step({n}, 5," not in src, n
+
+    # ⛔⛔ AND THE OTHER THREE ARCS DID NOT MOVE. `_setup_step` is shared with
+    # --unpair (5), --resurrect (4) and --retire (3); a naive 5→6 sweep would
+    # have rewritten about eighteen sites across them.
+    assert "total = 5" in src, "--unpair's own five-step total"
+    assert "_setup_step(5, total, " in src, "--unpair's last step"
+    assert "_setup_step(1, total, " in src, "--unpair's first step"
+    assert "_setup_step(4, 4, " in src, "--resurrect is four steps"
+    assert "_setup_step(3, 3, " in src, "--retire is three steps"
 
 
 # ── 7.9-0: the empty-read branch stops blaming the network ───────────────────
@@ -479,3 +547,153 @@ def test_an_unprovable_failure_still_falls_back_to_the_old_sentence(wired):
     out = wired["out"]()
     assert "Could not read" in out
     assert "revoked" not in out
+
+
+# ── wave 9: the rename, and the half that never learned it ───────────────────
+#
+# ⛔⛔ EVERY PIN ABOVE THIS LINE SETS ONLY `visibility`, so old-first and
+# new-first pass all of them identically and none of them can tell the two apart.
+# `visibility` is becoming `joinPolicy`; the rules learned both names in wave 7
+# and the agent learned to read both in wave 8, and this file — the machine —
+# never learned the new one at all. A pin that sets ONE key measures NOTHING
+# here, which is why the ones below set both, in conflict, or set only the new
+# one on a document the old one has already left.
+
+def test_the_new_name_is_read_when_the_old_one_is_gone(wired):
+    """⛔⛔ THE DAY THE MIGRATION LANDS. A document carrying only `joinPolicy`
+    read "private" to the very machine that owns it — so `--visibility` printed
+    Private on a listed computer, with no error and nothing to notice it by."""
+    wired["meta"] = {"joinPolicy": "public"}
+    assert research.run_visibility(research._VISIBILITY_SHOW) == 0
+    out = wired["out"]()
+    assert "Public" in out
+    assert "Private" not in out
+
+
+def test_the_new_name_reads_private_too_when_that_is_what_it_says(wired):
+    """The complement, so the fix cannot be "treat the new key as public"."""
+    wired["meta"] = {"joinPolicy": "private"}
+    assert research.run_visibility(research._VISIBILITY_SHOW) == 0
+    assert "Private" in wired["out"]()
+
+
+def test_the_toggle_CLOSES_the_door_on_a_machine_public_under_the_NEW_name(wired):
+    """⛔⛔ THE SHARPEST CONSUMER, AND THE ONE A HELPER PIN WOULD MISS. Reading
+    the old literal alone, a machine public under the new name looks private
+    here — so `--visibility private` is answered "Already set — nothing to
+    change", NO WRITE GOES OUT, and the computer stays discoverable. Somebody is
+    told a door is shut while it stands open.
+
+    ⛔ And the write still lands on the OLD key: reading both names is
+    compatible, writing the new one is not."""
+    wired["meta"] = {"joinPolicy": "public"}
+    assert research.run_visibility("private") == 0
+    assert wired["patches"] == [("dev-1", {"visibility": "private"})]
+    assert "Already set" not in wired["out"]()
+
+
+def test_the_OLD_name_wins_while_it_is_still_there(wired):
+    """⛔⛔ THE ORDERING PIN, AND THE ONLY THING THAT REFUSES NEW-FIRST. Wave 8's
+    first build preferred `joinPolicy`, reasoning that its presence proved the
+    document had been migrated — and cross-verify overturned it. Nothing writes
+    the new key yet, and everything that ACTS on the setting reads the old one:
+    the app's public list queries `where("visibility", "==", "public")`, and both
+    of this program's own writes put `visibility` down. A reader must agree with
+    the writers, not with the migration's destination.
+
+    ⛔ HONEST ABOUT WHAT THIS MEASURES: it cannot fail against the code as it was
+    an hour ago, because old-only and old-first agree on every document that
+    carries a real `visibility`. It fails against NEW-first, which is the wrong
+    build this wave could have shipped instead — mutants V2b and V2c."""
+    wired["meta"] = {"visibility": "public", "joinPolicy": "private"}
+    assert research.run_visibility(research._VISIBILITY_SHOW) == 0
+    assert "Public" in wired["out"]()
+
+    wired["meta"] = {"visibility": "private", "joinPolicy": "public"}
+    assert research.run_visibility(research._VISIBILITY_SHOW) == 0
+    out = wired["out"]()
+    assert "Private" in out
+    assert "Public" not in out
+
+
+def test_the_OLD_name_wins_on_the_TOGGLE_so_the_door_still_closes(wired):
+    """⛔⛔ WHERE PREFERRING THE NEW KEY COSTS MONEY-SHAPED HARM. On a document
+    still carrying `visibility: private` beside a stale `joinPolicy: public`, a
+    new-first reader answers "already public" to `--visibility public` and writes
+    nothing — and the owner's change is silently dropped."""
+    wired["meta"] = {"visibility": "private", "joinPolicy": "public"}
+    assert research.run_visibility("public") == 0
+    assert wired["patches"] == [("dev-1", {"visibility": "public"})]
+
+
+def test_a_cleared_OLD_name_falls_through_to_the_NEW_one(wired):
+    """⛔ HALF-MIGRATED IS A REAL DOCUMENT SHAPE. The rules allow clearing
+    `visibility` and allow writing `joinPolicy` beside it, so an empty old key
+    next to a real new one can exist — and "empty" is not an answer. It must keep
+    looking rather than stop and report private."""
+    wired["meta"] = {"visibility": "", "joinPolicy": "public"}
+    assert research.run_visibility(research._VISIBILITY_SHOW) == 0
+    assert "Public" in wired["out"]()
+
+
+def test_a_NON_STRING_old_value_does_not_swallow_the_new_one(wired):
+    """⛔ `_fetch_device_meta_rest` unwraps `booleanValue` to a real bool and
+    `integerValue` to an int, and mutant B5 is precisely a `visibility` written
+    as a bool — so a document whose old key is `True` is mintable by this repo's
+    own known defect. A junk old value is not an answer either."""
+    wired["meta"] = {"visibility": True, "joinPolicy": "public"}
+    assert research.run_visibility(research._VISIBILITY_SHOW) == 0
+    assert "Public" in wired["out"]()
+
+
+def test_the_machine_reads_both_names_and_WRITES_only_the_old_one(wired):
+    """⭐ STATED AS THE RULE, NOT AS TWO EXAMPLES: the key this program believes
+    FIRST must be the key it actually writes, or its own toggle and its own
+    reader disagree about the machine in front of them. Derived from a real
+    driven write, not from a literal this test made up.
+
+    ⛔ Writing `joinPolicy` would take the old key off a document every
+    un-upgraded machine in the field is still reading — and the app's public list
+    would stop listing the computer. The old key comes off when a fleet reading
+    says nobody is writing it, not when a wave number says so."""
+    wired["meta"] = {"joinPolicy": "public"}
+    assert research.run_visibility("private") == 0
+    (_id, fields), = wired["patches"]
+    written_key, = fields.keys()
+    assert written_key == research._DISCOVERY_KEYS[0]
+    assert "joinPolicy" not in fields
+    # ⛔ And both names are known, in that order — one alone is the defect.
+    assert research._DISCOVERY_KEYS == ("visibility", "joinPolicy")
+
+
+@pytest.mark.parametrize(
+    "meta",
+    [
+        {},
+        {"machineName": "studio"},
+        {"joinPolicy": ""},
+        {"joinPolicy": None},
+        {"joinPolicy": 1},
+        {"visibility": "", "joinPolicy": ""},
+        {"visibility": True, "joinPolicy": False},
+    ],
+)
+def test_nothing_recognisable_under_either_name_reads_as_private(meta):
+    """⛔ ABSENT IS PRIVATE, AND SO IS JUNK. A machine paired before 2026-09-04
+    carries neither key and nothing backfills one; the safe direction for a
+    discovery setting is the one that hides."""
+    assert research._discovery_of(meta) == "private"
+
+
+def test_an_EMPTY_read_still_never_reaches_the_resolver_s_answer(wired):
+    """⛔⛔ THE PORT'S ONE REAL HAZARD, PINNED. `_discovery_of({})` answers
+    "private" exactly like a real document with no field — so if the resolution
+    were ever hoisted ABOVE the empty-read guard, a network blip would report a
+    LISTED machine as hidden again. The guard is the whole difference and it
+    stays on top."""
+    assert research._discovery_of({}) == "private"
+    wired["meta"] = {}
+    assert research.run_visibility(research._VISIBILITY_SHOW) == 1
+    out = wired["out"]()
+    assert "Private" not in out
+    assert "Could not read" in out

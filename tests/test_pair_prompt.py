@@ -1,4 +1,4 @@
-"""--pair Stage 3 API-key detect-or-prompt tests.
+"""--pair Stage 4 API-key detect-or-prompt tests.
 
 Covers the helpers added to research.py for the pair flow:
   - _save_api_key_to_user_scope(name, value)  -> bool (Windows)
@@ -162,7 +162,7 @@ class TestSaveApiKeyLocal:
 class TestClearApiKeyLocal:
     """`_clear_api_key_local` mirrors `_save_api_key_local`: per-OS
     dispatch removes a key from BE-local persistence. Used by
-    `--unpair --deep` so the next `--pair` Stage 3 actually re-prompts
+    `--unpair --deep` so the next `--pair` Stage 4 actually re-prompts
     and re-verifies instead of short-circuiting on the leftover key.
 
     Windows: SetEnvironmentVariable(name, $null, 'User').
@@ -286,7 +286,7 @@ class TestPairPromptOneKey:
 
     def test_ctrl_c_propagates(self, monkeypatch, silent_log):
         """Ctrl+C = universal cancel: _pair_prompt_one_key RE-RAISES the
-        KeyboardInterrupt so the caller (Stage 3 / cmd_pair_v2) reverts the
+        KeyboardInterrupt so the caller (Stage 4 / cmd_pair_v2) reverts the
         partial pair. Typing 's' is how you skip a single key (see the skip
         tests above) — Ctrl+C is not "skip this key". pytest.raises contains
         the KI so it never escapes to the session."""
