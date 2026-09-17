@@ -440,9 +440,8 @@ MUTANTS = [
     ("H9", SR, "under",
      "a 'which computer?' answer is rendered as a bare error, so somebody with "
      "two computers is told their logs cannot be sent",
-     [('        if body.get("reason") in ("no_selection", "stale_selection", "no_devices"):\n'
-       '            return _emit(body, args.json,\n'
-       '                         _pick_device_lines(body, body.get("reason", "")), _fail_code(code))\n', "")]),
+     [('        if body.get("reason") in ("no_selection", "stale_selection", "no_devices",\n                                  "selection_not_ready"):',
+       '        if False:')]),
     ("H10", SR, "under",
      "a refusal in chat is reported as its class name",
      [('    known = _SEND_LOGS_FAILURES.get(str(error_class or ""))\n'

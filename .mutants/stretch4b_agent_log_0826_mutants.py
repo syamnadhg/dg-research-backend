@@ -205,7 +205,8 @@ MUTANTS = [
     ("U3", BRIDGE, "over",
      "an empty log is uploaded anyway, leaving a zero-byte object that says a "
      "log was sent when there was nothing to send",
-     [('            if not blob:', '            if False:')]),
+     [('            blob = _read_agent_log_tail()\n            if not blob:\n                # ⭐ Reported as a fact, not a failure. An agent whose log is empty',
+       '            blob = _read_agent_log_tail()\n            if False:\n                # ⭐ Reported as a fact, not a failure. An agent whose log is empty')]),
     ("U4", BRIDGE, "under",
      "an upload failure is reported as a success, so the person believes evidence "
      "went that never left the machine",
@@ -227,13 +228,16 @@ MUTANTS = [
      "the cap goes, so a log that outgrew its rotation is sent whole and refused "
      "by the receiving route — a wasted upload reported as a failure to send",
      [("_AGENT_LOG_MAX_BYTES = 8 * 1024 * 1024", "_AGENT_LOG_MAX_BYTES = 64 * 1024 * 1024")]),
+    # ⛔ RE-NARROWED 2026-09-16 (wave 8). The first re-anchor swallowed the whole
+    # standalone dispatch — the contradiction check AND the `_agent_log_alone` call
+    # — so the mutant deleted a feature rather than the guard its `why` names, and
+    # died to tests that have nothing to do with validating a code. A mutant that
+    # dies for the wrong reason measures the wrong thing.
     ("U8", BRIDGE, "under",
      "the support code stops being validated, so a caller-shaped path reaches the "
      "lookup — this route talks to the Admin SDK, which evaluates no rules at all",
-     [('            code = str(body.get("code") or "").strip().upper()\n            if not _SUPPORT_CODE_RE.match(code):\n                self._json(400, {"error": "that isn\'t a support code"})\n                return',
-       '            code = str(body.get("code") or "").strip().upper()')]),
-
-    # ═══════════ O — the offer, in the clients that word it ═════════════════
+     [('            if standalone:\n                self._agent_log_alone(sess)\n                return\n            if not _SUPPORT_CODE_RE.match(code):\n                self._json(400, {"error": "that isn\'t a support code"})\n                return',
+       '            if standalone:\n                self._agent_log_alone(sess)\n                return')]),
     ("O1", CLI, "under",
      "the terminal stops saying the agent log is NOT included, so silence has to "
      "be interpreted — and in the other client silence means something else",
@@ -319,10 +323,18 @@ MUTANTS = [
      "the file can hold — a hole rather than a limit",
      [("export const MAX_AGENT_LOG_BYTES = 8 * 1024 * 1024;",
        "export const MAX_AGENT_LOG_BYTES = 64 * 1024 * 1024;")]),
+    # ⛔⛔ RE-ANCHORED 2026-09-16 (wave 8). The cap is read in TWO places now — the
+    # attached path and the standalone one — with byte-identical lines, so this
+    # anchor matched twice and the harness could no longer place it. That is a
+    # fault, not a survivor, and it is also a finding: one mutant weakening one
+    # call site measures half the property. This one keeps the ATTACHED path (it
+    # is what this harness is about) and carries the `device_mismatch` return
+    # above it as the thing that tells the two apart; the standalone cap is
+    # measured by S15 in wave8_agent_log_alone_0916_mutants.mjs.
     ("A9", ROUTE, "under",
-     "the body cap stops being enforced on bytes actually read",
-     [("  const bytes = await readCapped(req, MAX_AGENT_LOG_BYTES);\n  if (bytes === null) {",
-       "  const bytes = await readCapped(req, Number.MAX_SAFE_INTEGER);\n  if (bytes === null) {")]),
+     "the body cap stops being enforced on bytes actually read (attached path)",
+     [('  if (row.deviceId === AGENT_LOG_DEVICE_SEGMENT) {\n    return NextResponse.json({ error: "not_a_machine_bundle" }, { status: 409 });\n  }\n\n  const bytes = await readCapped(req, MAX_AGENT_LOG_BYTES);\n  if (bytes === null) {',
+       '  if (row.deviceId === AGENT_LOG_DEVICE_SEGMENT) {\n    return NextResponse.json({ error: "not_a_machine_bundle" }, { status: 409 });\n  }\n\n  const bytes = await readCapped(req, Number.MAX_SAFE_INTEGER);\n  if (bytes === null) {')]),
     ("A10", ROUTE, "under",
      "the rate limit goes, so an unbounded number of 8 MB bodies is the cost of "
      "one account behaving badly",

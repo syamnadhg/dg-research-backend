@@ -624,6 +624,13 @@ def _uninstall_stream_script(home: Path | None) -> None:
     try:
         targets += list(scripts.glob("sr_poll_*.py"))
         targets += list(scripts.glob(".sr_poll_*.state.json"))
+        # ⛔⛔ AND THE ATOMIC WRITE'S LEFTOVERS. Wave 8 made the poller's state save
+        # temp-then-replace, so a tick killed between the two leaves
+        # `.sr_stream_state.json.sr-tmp.<pid>` behind — a name the explicit list
+        # cannot match and the globs above cannot either, because both require the
+        # name to END in `.state.json` or `.py`. `agent disconnect` would leave it
+        # in `HERMES_HOME/scripts` forever, and a later re-arm would never notice.
+        targets += list(scripts.glob(".sr_*.sr-tmp.*"))
     except OSError:
         pass
     for p in targets:
@@ -633,17 +640,42 @@ def _uninstall_stream_script(home: Path | None) -> None:
             pass
 
 
+# Every cron job NAME this agent arms. A job carrying one of these is ours by the
+# only field a fleet cannot collide on: we chose it.
+_OUR_JOB_NAMES = ("sr-stream", "sr-update-notice")
+
+
 def _is_stream_job(job: object) -> bool:
     """True for any watchdog cron job we own: the shared `sr-stream` / its script,
-    or a per-chat `sr-stream-<slug>` job / its generated `sr_poll_<slug>.py` shim."""
+    or a per-chat `sr-stream-<slug>` job / its generated `sr_poll_<slug>.py` shim.
+
+    ⛔⛔ THE SHIM IS MATCHED BY ITS WHOLE SHAPE NOW, NOT BY A PREFIX. This used
+    `script.startswith("sr_poll_")`, which is true of `sr_poll_notes.txt`, of
+    `sr_poll_x.py.bak`, and of anything else beginning with those eight
+    characters — so `agent disconnect` would delete a cron row for a file that is
+    not one of our generated shims and cannot be. `_POLL_SHIM_RE` has sat beside
+    this function since the shims existed and described exactly the right shape;
+    this simply uses it.
+
+    ⭐ THE SCRIPT FALLBACK ITSELF IS DELIBERATE AND STAYS. It is what catches a job
+    of OURS whose NAME drifted — a real state, because the arming writer and the
+    teardown edit the same file — and `test_remove_stream_cron_drops_per_chat_jobs`
+    pins a renamed job carrying one of our shims as ours to remove.
+
+    ⚠ AND IT IS STILL HOST-WIDE, WHICH IS AN OWNER QUESTION AND NOT A BUG THIS
+    FUNCTION CAN SETTLE. On a fleet-shaped machine a shared `HERMES_HOME` holds
+    every chat's cron entries, so one chat's `disconnect` sweeps every chat's
+    watchdog — by NAME (`sr-stream-<other-slug>`) exactly as much as by script.
+    Narrowing either one would leave orphaned jobs firing "Script not found" every
+    tick, which is the failure the sweep exists for. Raised rather than changed.
+    """
     if not isinstance(job, dict):
         return False
-    name = job.get("name") or ""
-    script = job.get("script") or ""
-    return (name == "sr-stream" or name.startswith("sr-stream-")
-            or name == "sr-update-notice"
+    name = str(job.get("name") or "")
+    script = str(job.get("script") or "")
+    return (name in _OUR_JOB_NAMES or name.startswith("sr-stream-")
             or script == _STREAM_SCRIPT or script == "sr_update_notice.py"
-            or script.startswith("sr_poll_"))
+            or bool(_POLL_SHIM_RE.fullmatch(script)))
 
 
 def _stream_jobs_present(jobs_file: Path) -> bool | None:

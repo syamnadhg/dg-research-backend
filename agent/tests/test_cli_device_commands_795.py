@@ -153,9 +153,16 @@ def test_pair_refusal_is_worded_on_screen(live, monkeypatch, capsys):
     assert "same command again" in out
 
 
+# ⛔⛔ TWO ROWS RE-AIMED IN WAVE 8, AND BOTH USED TO PIN THE DEFECT. `code_expired`
+# required the sentence to name `superresearch --pair`, which on a computer that
+# still exists does not refresh a code — it sets that machine up as a NEW one with
+# a new id and everybody it was shared with loses access. `code_not_found` pinned
+# "re-check it on the device", which says nothing about the reset-email case that
+# actually produces it. A pin that requires the wrong remedy is worse than no pin:
+# it holds the defect in place.
 @pytest.mark.parametrize("code,fragment", [
-    ("code_not_found", "re-check it on the device"),
-    ("code_expired", "superresearch --pair"),
+    ("code_not_found", "press Reset again"),
+    ("code_expired", "press Reset again"),
     ("share_cap_reached", "as many people as it can hold"),
     ("device_secret_missing", "did not finish its side of the handshake"),
 ])

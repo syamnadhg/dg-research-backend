@@ -191,8 +191,8 @@ MUTANTS = [
      "research routes to the one awake machine while signing in with that same "
      "research pending gives up and says \"reply yes\". Most multi-device "
      "accounts are exactly that shape",
-     [("    online = [d for d in devs if _device_is_online(d) and d.get(\"id\")]\n    if len(online) == 1:\n        return online[0].get(\"id\"), \"\", stale",
-       "    online = [d for d in devs if _device_is_online(d) and d.get(\"id\")]")]),
+     [('    online = [d for d in runnable if _device_is_online(d) and d.get("id")]',
+       '    online = []')]),
     ("P2", BRIDGE, "under",
      "the stale flag is never raised, so a selection pointing at a removed "
      "device is re-derived by every later sign-in and every later run",
@@ -200,8 +200,8 @@ MUTANTS = [
     ("P3", BRIDGE, "over",
      "a sole device with no id is returned anyway, so the run is enqueued to an "
      "empty string instead of falling through to the ask",
-     [("        did = devs[0].get(\"id\")\n        if did:\n            return did, \"\", stale",
-       "        return devs[0].get(\"id\"), \"\", stale")]),
+     [('        did = runnable[0].get("id")\n        if did:\n            return did, "", stale',
+       '        did = runnable[0].get("id")\n        if False:\n            return did, "", stale')]),
     ("P4", BRIDGE, "over",
      "⛔ the two asks collapse into one reason, so somebody whose last computer "
      "became unreachable is told only \"pick one\" and never why they are being "

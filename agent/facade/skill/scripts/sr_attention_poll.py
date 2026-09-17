@@ -176,9 +176,38 @@ def _load_state(path: Path | None = None) -> dict | None:
 
 
 def _save_state(state: dict, path: Path | None = None) -> None:
+    """Persist the last-seen state, replacing the old file ATOMICALLY.
+
+    ⛔⛔ A BARE `write_text` TRUNCATES BEFORE IT WRITES, and what a reader finds in
+    that window is not a missed save — it is a file that PARSES AS NOTHING.
+    `_load_state` answers None for anything it cannot read, and None means "first
+    tick after arming", which makes `compute()` BASELINE SILENTLY. So a write
+    interrupted by a kill, a full disk or a container stop does not cost one
+    announcement; it costs every phase that completed while the state was being
+    written, with no error and nothing to notice it by. The failure is silent on
+    the surface whose whole job is to tell somebody their research moved.
+
+    ⭐ THE PATTERN IS ALREADY IN THIS FILE — the cron-jobs writer ninety lines
+    below does temp-then-`os.replace` for a related reason — so this is the
+    existing rule applied where it was missed, not a new idea.
+
+    ⛔ PER-PROCESS TEMP NAME, like that one. A shared name lets two ticks
+    interleave and publish half a state.
+
+    ⛔ AND IT IS STILL BEST-EFFORT. A save that cannot happen at all is the old
+    behaviour: one re-announced tick, which is survivable. What must not happen is
+    a file that exists and reads empty.
+    """
+    target = path or _STATE_FILE
+    tmp = target.with_suffix(".json.sr-tmp.%d" % os.getpid())
     try:
-        (path or _STATE_FILE).write_text(json.dumps(state), "utf-8")
+        tmp.write_text(json.dumps(state), "utf-8")
+        os.replace(tmp, target)
     except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
         pass  # best-effort; a missed save just re-announces next tick (rare)
 
 

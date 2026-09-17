@@ -768,9 +768,7 @@ MUTANTS = [
     ("V7", SR, "over",
      "⛔⛔ THE IS-THIS-AN-ID TEST GOES BACK TO A BARE LENGTH CHECK, so \"ask for "
      "feedback\" raises the question that hands somebody's name to a stranger",
-     [('    _ask_obj_is_id = bool(" " not in _ask_obj and len(_ask_obj) >= 8\n'
-       '                          and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*[-_]"\n'
-       '                                           r"[A-Za-z0-9_-]*[A-Za-z0-9]", _ask_obj))\n',
+     [('    _ask_obj_is_id = bool(\n        " " not in _ask_obj\n        and (re.fullmatch(r"[0-9a-fA-F]{32}", _ask_obj)\n             or (len(_ask_obj) >= 8\n                 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*[-_]"\n                                  r"[A-Za-z0-9_-]*[A-Za-z0-9]", _ask_obj))))\n',
        '    _ask_obj_is_id = bool(" " not in _ask_obj and len(_ask_obj) >= 6)\n')]),
     ("V8", SR, "under",
      "⛔⛔ \"access to\" GOES BACK INTO THE MACHINE'S NAME, so the consent question "

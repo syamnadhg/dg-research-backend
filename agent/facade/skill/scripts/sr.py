@@ -71,7 +71,7 @@ except ImportError:  # None elsewhere (e.g. a Windows test import) → lock-free
 # silently (live 2026-07-02: a stale copy predating the podcast MEDIA: fix
 # kept sending bare audio paths). Bumped together with pyproject.toml —
 # guarded by tests/test_sr_skip_agents.py::test_skill_build_matches_package_version.
-_SKILL_BUILD = "0.1.32"
+_SKILL_BUILD = "0.1.33"
 
 _TIMEOUT = 30
 # By-title run resolution scans the newest N runs (status / podcast / list / the
@@ -1066,6 +1066,13 @@ def cmd_devices(args) -> int:
         # means private — a machine paired before 2026-09-04 carries no field.
         state = ""
         if d.get("owned"):
+        # ⛔⛔ THIS READS THE BRIDGE'S ANSWER, NOT A FIRESTORE FIELD, AND THE
+        # DIFFERENCE IS WHAT CARRIES IT THROUGH THE RENAME. `visibility` is
+        # becoming `joinPolicy`; the bridge resolves both names into this one key
+        # before any row leaves it (`_discovery_of`), so this line keeps working
+        # without ever learning the new name. ⛔ Point it at a raw device document
+        # and it goes silently wrong: every public computer would read private,
+        # with no error anywhere.
             state = ", public" if d.get("visibility") == "public" else ", private"
         lines.append(f"  {mark} {_dev_label(d)}  ({kind}{state})")
     if not selected:
@@ -1102,11 +1109,22 @@ _PAIR_ERRORS = {
     # and "8 letters/digits" told people the opposite, so somebody who typed an
     # O for a zero read a rule their input satisfied and retyped the same code.
     "invalid_code_format": "Pair codes are 8 characters and never use I, L, O, 0 or 1 — check those.",
-    "code_not_found": "That code didn’t match any device — re-check it on the device’s screen.",
-    # ⛔ NOT "reset the pair code on the device" — Reset is an owner-only control
-    # in the web app and no agent command performs it, so that named a remedy in
-    # a place it does not live. `--pair` on the machine is the one that works.
-    "code_expired": "That code expired — run “superresearch --pair” on the machine for a fresh one.",
+    # ⛔⛔ THE REPAIR IT NAMED MINTS A NEW COMPUTER AND LOSES ITS PEOPLE. Both of
+    # these sentences sent somebody to `superresearch --pair`, which on a machine
+    # that still exists does not refresh anything — it sets that machine up as a
+    # NEW computer with a NEW id, and everybody it was shared with loses access.
+    # The repair for a code that has run out is to press Reset again in the app,
+    # which the web app's own table has said since wave 2 and this one did not.
+    # ⛔ `--pair` IS STILL NAMED, and only where it is right: once the computer is
+    # gone from that list there is nothing to reset and it IS a new setup.
+    "code_not_found": "No computer is waiting for that code. If it came from a "
+                      "reset email, use the newest one, or press Reset again in "
+                      "Settings → Manage devices. Only if the computer isn’t "
+                      "listed there, run “superresearch --pair” on it — that sets "
+                      "it up as a new computer with a new id, and nobody you "
+                      "shared the old one with keeps access.",
+    "code_expired": "That code expired — press Reset again in Settings → Manage "
+                    "devices for a new one, and use only the newest email.",
     "not_previous_owner": "That device is waiting for its previous owner to re-pair — only they can.",
     # ⛔⛔ "ask them to share it again" IS REFUSED ON EVERY PATH, and the web app's
     # own table says it too. The blocklist is consulted by claim, by the ask route
@@ -1831,9 +1849,25 @@ def _looks_like_a_device_id(wanted: str) -> bool:
     how "ask for feedback" reached a consent question about disclosing somebody's
     name. A device id has no spaces and carries a hyphen or an underscore; a
     machine somebody NAMED almost always has a space, or neither.
+
+    ⛔⛔ AND THE SHAPE THE APP ACTUALLY MINTS HAS NO SEPARATOR AT ALL.
+    `/api/devices/initiate-pair` writes `randomUUID().replace(/-/g, "")` — thirty-
+    two lowercase hex characters — so every real id failed this, went to the browse
+    list instead, and was looked up as a NAME. That list drops the caller's own
+    machines, the ones they already share and the private ones, which is precisely
+    why the id route exists; so pasting a real id out of a browse listing reached
+    "no public computer is called that" about a computer that was right there.
+
+    ⭐ THE SEPARATOR RULE IS KEPT FOR EVERYTHING ELSE — it is what holds "feedback"
+    out — and the minted shape is admitted beside it. Thirty-two hex characters is
+    not a name anybody types.
     """
     w = (wanted or "").strip()
-    if " " in w or len(w) < 8:
+    if " " in w:
+        return False
+    if re.fullmatch(r"[0-9a-fA-F]{32}", w):
+        return True
+    if len(w) < 8:
         return False
     return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*[-_][A-Za-z0-9_-]*[A-Za-z0-9]", w))
 
@@ -2018,7 +2052,16 @@ def _pick_device_lines(body: dict, reason: str, about: str = "this") -> list[str
     if not devices:
         # No reachable devices after all → the empty state (older bridge path).
         return _no_device_lines()
-    if reason == "stale_selection":
+    if reason == "selection_not_ready":
+        # ⛔⛔ NOT "isn't reachable" AND NOT "pick another" ON ITS OWN. The machine
+        # is powered on and answering; what it cannot do is take a run, because it
+        # is part-way through being set up again. Telling somebody their computer
+        # is unreachable sends them to check a network that is fine, and quietly
+        # routing the run elsewhere would put their research on a computer they did
+        # not choose. The state has a cause and a cure, so both are named.
+        lead = ("The computer you’re using is part-way through being set up again, "
+                "so it can’t take a run yet. Finish pairing it, or pick another:")
+    elif reason == "stale_selection":
         lead = "The computer you last used isn’t reachable anymore — pick another:"
     else:
         # ⛔ THE OBJECT IS AN ARGUMENT, and it has to be. The RUN path says "run
@@ -2216,7 +2259,7 @@ def cmd_research(args) -> int:
                       else ("no_selection" if "no device" in err else ""))
         if reason == "no_devices":
             return _emit(body, args.json, _no_device_lines(), _fail_code(code))
-        if reason in ("no_selection", "stale_selection"):
+        if reason in ("no_selection", "stale_selection", "selection_not_ready"):
             return _emit(body, args.json, _pick_device_lines(body, reason), _fail_code(code))
         return _emit(body, args.json, [f"✗ couldn't start: {body.get('error', code)}"], _fail_code(code))
     dev = _device_names().get(body.get("deviceId") or "", body.get("deviceId") or "")
@@ -2589,6 +2632,172 @@ def _resolve_log_selection(rows: list, spec) -> tuple:
     return picked, wants_agent_log, []
 
 
+def _agent_log_only_request(args) -> bool:
+    """True when the ONLY thing being asked for is this host's own agent log.
+
+    ⛔⛔ THIS DECIDES WHETHER A DEVICE IS NEEDED AT ALL, which is why it runs
+    before the run list is fetched rather than after. The person who most needs to
+    send this file is the person with no research computer, or one they cannot
+    reach — and `/logs/runs` refuses both of those with "pick a computer". Asking
+    it first would turn the one request that needs no machine into the one request
+    a machineless person cannot make.
+
+    ⛔ `--agent-log` ON ITS OWN IS NOT THIS. Bare, it means "everything this
+    computer is holding, and the agent's log as well" — the runs default to every
+    listed row. Only an explicit "and nothing else" (`--none`, or a `--runs` spec
+    naming just the 0) says the log is the whole request.
+
+    ⛔⛔ `--list` DISQUALIFIES IT TOO, AND ITS ABSENCE WAS A LIVE REGRESSION.
+    `--list` means "show me what it is holding and send nothing" — the one flag on
+    this command that promises no side effect at all. The early return sits above
+    the `if args.list: return 0` short-circuit, so `send-logs --list --runs 0 -y`
+    printed the standalone plan and UPLOADED. Found by cross-verification, which
+    ran it.
+
+    ⛔ AND `--machine` DISQUALIFIES IT outright: that is material from a research
+    computer, so there is a computer in the request.
+    """
+    if bool(getattr(args, "machine", False)):
+        return False
+    # ⛔ SEE THE NOTE ABOVE — `--list` sends nothing, ever.
+    if bool(getattr(args, "list", False)):
+        return False
+    spec = [t.strip() for t in
+            str(getattr(args, "runs", "") or "").replace(" ", ",").split(",")
+            if t.strip()]
+    if not (bool(getattr(args, "agent_log", False)) or _AGENT_LOG_TOKEN in spec):
+        return False
+    if [t for t in spec if t != _AGENT_LOG_TOKEN]:
+        return False
+    return bool(getattr(args, "none", False)) or bool(spec)
+
+
+def _agent_log_machine_hint(args) -> tuple:
+    """(may we offer --machine, what to call that computer) — BEST EFFORT ONLY.
+
+    ⛔⛔ A FAILURE HERE COSTS THE HINT AND NOTHING ELSE, and that is the whole
+    distinction this branch turns on. It exists so somebody with no research
+    computer can send the agent's log, and `/logs/runs` is precisely the call that
+    refuses those people — so its answer is used when it arrives and ignored when
+    it does not. It may never decide whether the send happens.
+
+    ⛔ AND THE OFFER STAYS OWNER-ONLY. `--machine` is refused for anybody else, so
+    offering it to a sharer walks them into a refusal an earlier wave closed on
+    this exact branch.
+
+    ⛔ NO HINT AT ALL WHEN A COMPUTER WAS NAMED. Resolving `--device` costs another
+    round trip, and naming the SELECTED machine in a sentence about the one they
+    asked for would be a wrong statement rather than a missing one.
+    """
+    if getattr(args, "device", "") or "":
+        return False, ""
+    code, body = _get("/logs/runs")
+    if code != 200 or not body.get("owned"):
+        return False, ""
+    return True, str(body.get("deviceName") or "your Research Computer")
+
+
+def _agent_log_facts() -> list:
+    """What a person is told before this file leaves, in both clients.
+
+    ⛔⛔ ONE SOURCE, BECAUSE THE TWO PLANS DRIFTED ONCE ALREADY. These sentences
+    are printed from two places in this file now — beside a machine's bundle and
+    on its own — and a guard compares the CLAIMS against the terminal's twin. A
+    second hand-written copy is how one of the three quietly stops being said.
+    """
+    return [
+        # ⛔⛔ WHOSE, NOT ONLY WHAT. A second person who signed in on this host is
+        # in that file, and nothing gates the upload on who owns the host, because
+        # an agent host has no owner to ask.
+        "It covers everyone who signed in through this agent, not only you — "
+        "there’s no owner to ask on a machine like that, so nothing checks.",
+        # ⛔⛔ THE ROTATED COPIES GO TOO, SINCE WAVE 8 — and this sentence changed
+        # with the material rather than after it. It used to say "since that file
+        # last rotated", which was true of a reader that sent the active file and
+        # only the active file, and understates what leaves now.
+        "The rotated copies go too, not only the newest file, so it reaches back "
+        "further than the problem you’re reporting.",
+        # ⛔⛔ NAMED, because "not research content" is what it is NOT. Measured in
+        # the file the uploader reads.
+        "Among what’s in it: a masked form of your email address, the ids of the "
+        "computers and runs this agent has touched, file paths on that machine, "
+        "and — when a lookup fails — your account id.",
+    ]
+
+
+def _send_agent_log_alone(args, offer_machine: bool = False, name: str = "") -> int:
+    """Send this host's agent log with NO bundle behind it, under its own code.
+
+    ⛔⛔ THIS IS WHAT THE REFUSAL USED TO BE. Until wave 8 the only answer here was
+    "the agent's own log can only go up beside a bundle from that computer", which
+    was true of the transport and useless to the person reading it: the two
+    commonest reasons to be sending an agent log are having no research computer
+    and having one you cannot reach, and neither of those can produce a bundle.
+    The app mints a support code for it now, so this is a send like any other.
+
+    ⛔ STILL TWO STEPS. Nothing leaves without `--confirm`, and the plan printed
+    here is what makes `consent` true — the same rule the bundle path follows.
+    """
+    if not getattr(args, "confirm", False):
+        lines = [
+            "I can send Super Research support the log from the agent on THIS "
+            "host — the machine running this chat. No research computer is "
+            "involved, and nothing from one is included.",
+            "It’s a connection and sign-in record, not research content.",
+            *_agent_log_facts(),
+            "It’s deleted automatically 30 days after it arrives.",
+            "You’ll get a support code of its own to quote.",
+        ]
+        directives = [
+            "If they say yes, run: sr.py send-logs --confirm --agent-log --none",
+            "⛔ That sends the agent’s log and NOTHING from any research "
+            "computer. It needs no device and no support code.",
+        ]
+        if offer_machine:
+            # ⛔ ONLY TO AN OWNER. `--machine` is refused for anybody else, so
+            # offering it to a sharer sends them into a refusal this line could
+            # have spared them — the circle a previous wave closed here.
+            lines.append(
+                f"If the trouble is reaching “{name}” at all, I can ask for that "
+                "computer’s own logs as well — say so and they’ll go together.")
+            # ⛔⛔ AND THE COMMAND THAT DELIVERS IT, or the offer is a sentence with
+            # nothing behind it. The directive above sends the agent's log ALONE,
+            # so an assistant relaying an offer it cannot carry out is the same
+            # shape as the refusal-in-a-circle an earlier wave closed: the words
+            # say yes and the only command on the screen says no.
+            directives.append(
+                "If they want that computer’s own logs too, run instead: sr.py "
+                "send-logs --confirm --machine --none --agent-log")
+        lines.append("Say yes and I’ll send it.")
+        # ⛔⛔ `--json` PRINTS THE PAYLOAD *INSTEAD OF* THE LINES, so a plan whose
+        # whole job is disclosure disclosed nothing at all on that path — and
+        # `wouldSend: []` read as "nothing would be sent" about a call that sends a
+        # file. Everything the words say is in the payload now, because the relay
+        # reading JSON is relaying to a person either way.
+        return _emit({"wouldSend": [], "includeMachine": False,
+                      "agentLogOnly": True, "agentLogWouldSend": True,
+                      "retentionDays": 30, "consentIncluded": _agent_log_facts(),
+                      "plan": lines},
+                     args.json, [*lines, *_agent_directive_block(directives)])
+
+    code, sent = _post("/logs/agent-log", {"standalone": True})
+    if code != 200:
+        return _emit(sent, args.json,
+                     [f"✗ the agent’s log didn’t go: {sent.get('error', code)}"],
+                     _fail_code(code))
+    if not sent.get("sent"):
+        # ⭐ A fact, not a failure — and there is no code, because nothing was
+        # stored. An agent whose log is empty has nothing to say.
+        return _emit(sent, args.json,
+                     ["The agent’s log on this host was empty — there was nothing "
+                      "to send."])
+    support = sent.get("code", "")
+    return _emit(sent, args.json, [
+        f"✓ Sent the agent’s own log. Your support code is {support}.",
+        "Quote it when you report the problem.",
+    ])
+
+
 def cmd_send_logs(args) -> int:
     """Ask the research computer to package its logs for support.
 
@@ -2632,6 +2841,19 @@ def cmd_send_logs(args) -> int:
                 # CLIENT. The bundle has landed, so the row now names a folder the
                 # app's Clear-logs will list — which is exactly the condition the
                 # bridge refuses this without.
+                # ⛔⛔ AND THE FACTS COME WITH IT. The consent screen for this file
+                # is printed by a DIFFERENT command, and nothing here checks that
+                # it ever was — so an assistant arriving straight at this step with
+                # a code and a flag could upload it having shown the person
+                # nothing. The three sentences are cheap; they ride the flag.
+                #
+                # ⚠ THEY ARE BUFFERED, NOT PRINTED, AND THAT IS THIS CLIENT'S
+                # SHAPE RATHER THAN AN OVERSIGHT. Every command here emits ONE
+                # message at the end, so the bytes are gone before any of it
+                # renders — but the person reads the facts ABOVE the result, which
+                # is the order that matters to them. The terminal, which prints as
+                # it goes, prints them before the call.
+                lines.extend(_agent_log_facts())
                 ac, ab = _post("/logs/agent-log", {"code": want})
                 if ac != 200:
                     lines.append("The agent’s own log did not go: "
@@ -2645,6 +2867,14 @@ def cmd_send_logs(args) -> int:
             return _emit(body, args.json, lines)
         return _emit(body, args.json, [f"{want} is still being packaged."])
 
+    # ⛔⛔ BEFORE THE RUN LIST, AND THAT IS THE WHOLE POINT. `/logs/runs` resolves a
+    # selected computer and refuses with "pick a computer" when there is none — so
+    # asking it first would make the one request that needs no machine impossible
+    # for exactly the people who need it. See `_agent_log_only_request`.
+    if _agent_log_only_request(args):
+        owned_hint, hint_name = _agent_log_machine_hint(args)
+        return _send_agent_log_alone(args, offer_machine=owned_hint, name=hint_name)
+
     path = "/logs/runs"
     device_arg = getattr(args, "device", "") or ""
     if device_arg:
@@ -2654,9 +2884,19 @@ def cmd_send_logs(args) -> int:
         path += f"?deviceId={dev.get('id')}"
     code, body = _get(path)
     if code != 200:
-        if body.get("reason") in ("no_selection", "stale_selection", "no_devices"):
-            return _emit(body, args.json,
-                         _pick_device_lines(body, body.get("reason", "")), _fail_code(code))
+        if body.get("reason") in ("no_selection", "stale_selection", "no_devices",
+                                  "selection_not_ready"):
+            lines = _pick_device_lines(body, body.get("reason", ""))
+            # ⛔⛔ THE ONE THING THIS PERSON CAN ACTUALLY SEND, SAID HERE. With no
+            # computer there is no bundle and every sentence above is about picking
+            # one — so somebody whose problem IS that they have no computer was
+            # handed a screen with no door in it. The agent's own log needs no
+            # machine and now carries its own support code.
+            if body.get("reason") == "no_devices":
+                lines.append("If what’s wrong is this agent itself, I can send its "
+                             "own log on its own — no computer needed, and it "
+                             "comes back with a support code. Just ask.")
+            return _emit(body, args.json, lines, _fail_code(code))
         return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
 
     rows = body.get("runs") or []
@@ -2697,18 +2937,18 @@ def cmd_send_logs(args) -> int:
         # clear the agent's log, which is not a run and not on that computer.
         names = []
     if not names and not machine:
-        # ⛔⛔ THE AGENT'S LOG CANNOT STAND ALONE. It is uploaded into the folder
-        # the machine's bundle row names — the app's Clear-logs finds objects by
-        # listing that folder and nothing else — so with no bundle there is
-        # nowhere it could go that a person could later delete. Without this the
-        # two sentences below would tell somebody who picked only 0 that there is
-        # nothing to send, about the one thing they did pick.
+        # ⛔⛔ IT USED TO BE REFUSED HERE, AND WAVE 8 TURNED THAT INTO A SEND. The
+        # old sentence — "can only go up beside a bundle from that computer" — was
+        # true of the transport and useless to the reader: this branch is reached
+        # when that computer is holding nothing of theirs, which is one of the two
+        # states in which no bundle can be built at all. The log now has a route of
+        # its own and a support code of its own, so the thing they asked for
+        # happens instead of being explained away.
         if agent_log:
-            return _emit(body, args.json, [
-                "The agent’s own log can only go up beside a bundle from that "
-                "computer, so something has to be in that bundle. Pick a run as "
-                "well — or, if you own it and the trouble is reaching it at all, "
-                "ask for the computer’s own logs too."], 1)
+            # ⛔ THE MACHINE OFFER SURVIVES, AND STILL ONLY FOR AN OWNER — a
+            # non-owner is refused `--machine` a few lines above, so offering it to
+            # them would send them round the circle a previous wave closed.
+            return _send_agent_log_alone(args, offer_machine=owned, name=name)
         if not body.get("published"):
             # ⛔⛔ NOT "it isn't holding any of your runs". The list is absent,
             # which means we cannot see it — a computer that hasn't published
@@ -2768,20 +3008,11 @@ def cmd_send_logs(args) -> int:
         if agent_log:
             lines.append("Plus the log from the agent on the host running this — a "
                          "connection and sign-in record, not research content.")
-            # ⛔⛔ WHOSE, NOT ONLY WHAT — the twin of the terminal's line, and the
-            # machine-log sentence three lines above already names the people its
-            # material covers while this one named nobody. A second person who
-            # signed in on this host is in that file, and nothing gates the upload
-            # on who owns the host, because an agent host has no owner to ask.
-            lines.append("It covers everyone who signed in through this agent "
-                         "since that file last rotated, not only you — there’s no "
-                         "owner to ask on a machine like that, so nothing checks.")
-            # ⛔⛔ NAMED, because "not research content" is what it is NOT.
-            # Measured in the file the uploader reads.
-            lines.append("Among what’s in it: a masked form of your email "
-                         "address, the ids of the computers and runs this agent "
-                         "has touched, file paths on that machine, and — when a "
-                         "lookup fails — your account id.")
+            # ⛔⛔ ONE SOURCE WITH THE STANDALONE PLAN. These three sentences are
+            # printed from two places in this file now, and a guard compares the
+            # claims against the terminal's twin — a second hand-written copy is
+            # how one of them quietly stops being said on one of the paths.
+            lines.extend(_agent_log_facts())
         else:
             lines.append("The agent’s own log is not included.")
         # ⛔⛔ The three facts the app's modal names and this plan did not — see
@@ -2875,6 +3106,15 @@ def cmd_send_logs(args) -> int:
         directives.append(
             f"Once the bundle shows done, run: sr send-logs --status {support} "
             "--agent-log   (it is refused until then, by design)")
+        # ⛔⛔ AND THE WAY OUT IF THAT BUNDLE NEVER LANDS. This is the attached
+        # step; a bundle that never arrives used to leave the person's own log
+        # stranded behind a machine they may not be able to reach at all, which is
+        # the commonest reason to be sending it. Since wave 8 it has a route of its
+        # own and does not need that computer.
+        directives.append(
+            "If that bundle never lands, the log can go on its own instead: "
+            "sr send-logs --confirm --agent-log --none   (its own support code, "
+            "no computer involved)")
     return _emit(sent, args.json, [*lines, *_agent_directive_block(directives)])
 
 
@@ -5666,9 +5906,23 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     # "ask about pricing" and "request refund" all raised the consent question
     # that hands somebody's name to a stranger. An id here carries a separator;
     # an ordinary word does not.
-    _ask_obj_is_id = bool(" " not in _ask_obj and len(_ask_obj) >= 8
-                          and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*[-_]"
-                                           r"[A-Za-z0-9_-]*[A-Za-z0-9]", _ask_obj))
+    #
+    # ⛔⛔ EXCEPT THAT A REAL ID CARRIES NO SEPARATOR, WHICH MADE THIS BRANCH DEAD.
+    # `/api/devices/initiate-pair` mints `randomUUID().replace(/-/g, "")` — thirty-
+    # two lowercase hex characters, no hyphen, no underscore — so the one shape the
+    # app actually produces was the one shape this refused, and the three refusals
+    # the branch exists to reach were unreachable. Somebody pasting the id from a
+    # browse list got "I didn't catch a Super Research request in that."
+    #
+    # ⭐ THE SEPARATOR RULE STILL STANDS FOR EVERYTHING ELSE, because it is what
+    # keeps "ask for feedback" out. Thirty-two hex characters is not an English
+    # word and cannot become one, so admitting that exact shape widens nothing.
+    _ask_obj_is_id = bool(
+        " " not in _ask_obj
+        and (re.fullmatch(r"[0-9a-fA-F]{32}", _ask_obj)
+             or (len(_ask_obj) >= 8
+                 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*[-_]"
+                                  r"[A-Za-z0-9_-]*[A-Za-z0-9]", _ask_obj))))
     _ask_is_about_a_machine = bool(
         _public_kw or _machine_kw or _ask_obj_is_id
         or re.search(r"\baccess to\b|\bto use\b|\bpermission\b|\bborrow\b", low))

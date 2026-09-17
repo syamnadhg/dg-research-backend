@@ -470,7 +470,13 @@ def test_device_add_friendly_errors(bridge_port, monkeypatch, capsys):
     monkeypatch.setattr(bridge, "_fe_api_post",
                         lambda sess, path, payload, **_kw: (404, {"error": "code_not_found"}))
     assert sr.main(["device-add", "BADCODE1"]) == 1
-    assert "match any device" in capsys.readouterr().out
+    # ⛔ RE-AIMED IN WAVE 8. The old fragment ("match any device") came with a
+    # remedy that mints a NEW computer and loses its sharers; the sentence now
+    # puts Reset first and warns about `--pair` where it is still right.
+    out = capsys.readouterr().out
+    assert "code_not_found" not in out
+    assert "press Reset again" in out
+    assert "new id" in out
 
 
 def test_device_remove_by_name_owner(bridge_port, monkeypatch, capsys):

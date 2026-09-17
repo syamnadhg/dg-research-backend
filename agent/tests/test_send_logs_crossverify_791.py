@@ -92,6 +92,13 @@ class _Wire:
         self.posts.append(path)
         self.bodies.append(body or {})
         if path == "/logs/agent-log":
+            # ⛔⛔ THE STANDALONE REPLY CARRIES A CODE AND THE ATTACHED ONE DOES
+            # NOT, exactly as the bridge answers. A fixture that returned the same
+            # body for both would let the client print an empty support code and
+            # still pass — which is what it did before this branch existed.
+            if (body or {}).get("standalone"):
+                return 200, {"ok": True, "sent": True, "standalone": True,
+                             "code": "SOLO7X2M", "bytes": 12}
             return 200, {"ok": True, "sent": True, "bytes": 12}
         return 200, {"ok": True, "code": "K7XQ9B2M"}
 
@@ -181,7 +188,15 @@ def test_a_failed_bundle_says_the_log_did_not_go(monkeypatch):
     be left believing it went."""
     wire = _Wire(row={"status": "failed", "errorClass": "CooldownActive"})
     _, out = _run(monkeypatch, _args(runs="1", agent_log=True), wire)
-    assert "can only go beside a bundle that" in out
+    # ⛔⛔ RE-AIMED IN WAVE 8: THIS FROZE A SENTENCE THE WAVE MADE FALSE. It
+    # required "it can only go beside a bundle that arrived" — true of the
+    # transport until the log got a route of its own, and from that day an
+    # instruction that leaves somebody's log stranded behind a machine they cannot
+    # reach. The property that still holds is that the failure is SAID and the
+    # person is given something to do; it now asserts both ways out.
+    assert "was not sent" in out
+    assert "--status" in out
+    assert "--agent-log --none" in out, "the way out that needs no computer"
     assert "--status K7XQ9B2M --agent-log" in out
 
 
@@ -229,7 +244,12 @@ def test_status_says_so_when_the_bundle_has_not_landed(monkeypatch):
     wire = _Wire(row={"status": "packaging"})
     _, out = _run(monkeypatch, _args(status="K7XQ9B2M", agent_log=True), wire)
     assert "/logs/agent-log" not in wire.posts
-    assert "has not gone yet" in out
+    # ⛔ RE-AIMED IN WAVE 8 — the contraction changed with the sentence, and the
+    # sentence changed because "it can only follow a bundle" stopped being true.
+    # It asserts MORE: the state, the attached step, and the route that needs no
+    # computer at all.
+    assert "hasn't gone yet" in out
+    assert "--agent-log --none" in out
 
 
 def test_no_wait_points_at_the_command_that_can_finish_it(monkeypatch):
@@ -252,27 +272,45 @@ def test_no_wait_does_not_claim_the_log_is_going(monkeypatch):
 
 # ── the refusal no longer sends a sharer in a circle ─────────────────────────
 
-def test_a_sharer_with_no_listed_runs_is_told_the_truth(monkeypatch):
-    """⛔⛔ CHOICE 0 IS PRINTED LOUDEST ON EXACTLY THIS BRANCH. The old refusal
-    pointed at `--machine`, which is refused for a non-owner four lines higher,
-    so the two sentences sent them round in a circle."""
+def test_a_sharer_with_no_listed_runs_gets_it_sent_rather_than_explained(monkeypatch):
+    """⛔⛔ RE-AIMED IN WAVE 8, AND THE CIRCLE IT CLOSED IS STILL CLOSED. This
+    branch used to end in "there is nothing for this log to ride" — the honest
+    dead end for a sharer who has no runs listed and may not ask for the machine's
+    own logs. Wave 8 removed the dead end rather than the sentence: the log travels
+    alone now, so the person in the worst position on this surface is the one it
+    helps most. What must NOT come back is the `--machine` suggestion, which is
+    refused for a non-owner a few lines above."""
     wire = _Wire(rows=[], owned=False)
     rc, out = _run(monkeypatch, _args(runs="0"), wire)
-    assert rc == 1
-    assert "nothing for this log to ride" in out
+    assert rc == 0
+    assert "nothing for this log to ride" not in out
     assert "--machine" not in out
+    assert wire.posts == ["/logs/agent-log"]
+    assert "Support code: SOLO7X2M" in out
 
 
 def test_an_owner_with_no_listed_runs_is_still_offered_the_machine(monkeypatch):
+    """⛔ THE OFFER SURVIVED THE REWRITE. An owner whose computer is unreachable
+    wants both files, and this is the only line that tells them they can have
+    both — it is read from a best-effort lookup, so it appears exactly when
+    `--machine` would be accepted."""
     wire = _Wire(rows=[], owned=True)
     _, out = _run(monkeypatch, _args(runs="0"), wire)
-    assert "add --machine" in out
+    assert "--machine" in out
+    assert "Studio PC" in out
 
 
-def test_someone_with_runs_is_told_to_pick_one(monkeypatch):
+def test_someone_who_picked_only_zero_gets_only_that(monkeypatch):
+    """⛔⛔ RE-AIMED: THEY PICKED ONE THING AND IT IS THE THING THEY GET. The old
+    branch told them to "Pick a run as well", which is a refusal of a request that
+    was complete — the numbered row 0 is printed precisely so it can be said on its
+    own. A run list being available does not make the log unsendable."""
     wire = _Wire(owned=False)
-    _, out = _run(monkeypatch, _args(runs="0"), wire)
-    assert "Pick a run as well" in out
+    rc, out = _run(monkeypatch, _args(runs="0"), wire)
+    assert rc == 0
+    assert "Pick a run as well" not in out
+    assert wire.posts == ["/logs/agent-log"]
+    assert wire.bodies[-1] == {"standalone": True}
     assert "--machine" not in out
 
 

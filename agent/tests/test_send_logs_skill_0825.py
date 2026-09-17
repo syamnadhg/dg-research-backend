@@ -651,7 +651,10 @@ def test_the_document_says_to_pass_it_on_the_confirmed_call_too() -> None:
         "the client no longer reads the flag after the send — the instruction to "
         "pass it on --confirm may now be stale")
     bullet = _agent_log_bullet()
-    assert "pass it on `--confirm` too" in bullet, bullet
+    # ⛔ RE-AIMED IN WAVE 8 AND MADE SPECIFIC. The bullet now distinguishes two
+    # shapes — the log riding a bundle and the log travelling alone — so "it"
+    # would have been ambiguous exactly where the instruction has to be exact.
+    assert "pass `--agent-log` on `--confirm` too" in bullet, bullet
     row = next((ln for ln in SKILL_MD.splitlines()
                 if ln.startswith("|") and "--agent-log" in ln), "")
     assert "`--confirm`" in row, (
@@ -698,12 +701,30 @@ def test_the_document_says_a_refusal_before_the_bundle_is_not_a_fault() -> None:
 
 def test_the_document_does_not_promise_it_covers_only_this_conversation() -> None:
     """⛔⛔ THE FILE IS NOT PER-SESSION. It is uploaded whole below the cap and
-    tailed above it, covering everything since the last rotation — which on a
-    quiet host is weeks, and can reach past the run being reported. A document
-    that implied a session's worth would understate what leaves."""
+    tailed above it, and since wave 8 the ROTATED COPIES go too — so it covers far
+    more than the run being reported, on a quiet host weeks of it. A document that
+    implied a session's worth would understate what leaves.
+
+    ⛔ RE-AIMED AND STRICTER. It used to accept "since it last rotated", which was
+    the honest bound while the uploader sent the active file alone and is an
+    UNDERSTATEMENT now. The claim has to name the rotated copies, so a document
+    that drifts back to the narrower promise fails here."""
     bullet = _agent_log_bullet()
-    assert "since it last rotated" in bullet, bullet
+    assert "rotated copies" in bullet, bullet
+    assert "newest file" in bullet, bullet
     assert "not just this conversation" in bullet, bullet
+
+
+def test_the_document_says_the_log_can_travel_alone() -> None:
+    """⛔⛔ THE DOCUMENT SAID THE OPPOSITE UNTIL WAVE 8 — "it cannot go on its own:
+    it is uploaded beside a bundle, so there has to be a bundle". Left in place it
+    would talk an assistant out of the one route a person with no research computer
+    can use, which is the case the whole change exists for."""
+    bullet = _agent_log_bullet()
+    assert "cannot go on its own" not in bullet, bullet
+    assert "`--agent-log --none`" in bullet, bullet
+    assert "support code of its own" in bullet, bullet
+    assert "no Research Computer at all" in bullet, bullet
 
 
 # ── json mode ───────────────────────────────────────────────────────────────

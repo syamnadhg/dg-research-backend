@@ -1285,11 +1285,22 @@ _PAIR_FAILURES = {
     # ⛔ THE ALPHABET EXCLUDES I, L, O, 0 AND 1 — the five that get confused.
     "invalid_code_format": "pair codes are 8 characters and never use I, L, O, 0 "
                            "or 1 — check those",
-    "code_not_found": "that code didn't match any device — re-check it on the "
-                      "device's screen",
-    # ⛔ Reset is an owner-only WEB control and no agent command performs it.
-    "code_expired": "that code expired — run:  superresearch --pair   on the "
-                    "machine for a fresh one",
+    # ⛔⛔ THE REPAIR IT NAMED MINTS A NEW COMPUTER AND LOSES ITS PEOPLE. Both of
+    # these sentences sent somebody to `superresearch --pair`, which on a machine
+    # that still exists does not refresh anything — it sets that machine up as a
+    # NEW computer with a NEW id, and everybody it was shared with loses access.
+    # The repair for a code that has run out is to press Reset again in the app,
+    # which the web app's own table has said since wave 2 and this one did not.
+    # ⛔ `--pair` IS STILL NAMED, and only where it is right: once the computer is
+    # gone from that list there is nothing to reset and it IS a new setup.
+    "code_not_found": "no computer is waiting for that code. If it came from a "
+                      "reset email, use the newest one, or press Reset again in "
+                      "Settings -> Manage devices. Only if the computer is not "
+                      "listed there, run:  superresearch --pair   on it — that "
+                      "sets it up as a NEW computer with a new id, and nobody you "
+                      "shared the old one with keeps access",
+    "code_expired": "that code expired — press Reset again in Settings -> Manage "
+                    "devices for a new one, and use only the newest email",
     "not_previous_owner": "that device is waiting for its previous owner to "
                           "re-pair — only they can",
     # ⛔⛔ ASKING AGAIN IS REFUSED ON EVERY PATH — the blocklist is consulted by
@@ -1593,6 +1604,13 @@ def cmd_device(args: argparse.Namespace) -> int:
         # are two settings.
         found = ""
         if d.get("owned"):
+        # ⛔⛔ THIS READS THE BRIDGE'S ANSWER, NOT A FIRESTORE FIELD, AND THE
+        # DIFFERENCE IS WHAT CARRIES IT THROUGH THE RENAME. `visibility` is
+        # becoming `joinPolicy`; the bridge resolves both names into this one key
+        # before any row leaves it (`_discovery_of`), so this line keeps working
+        # without ever learning the new name. ⛔ Point it at a raw device document
+        # and it goes silently wrong: every public computer would read private,
+        # with no error anywhere.
             found = ", public" if d.get("visibility") == "public" else ", private"
         print(f"  {mark} {d.get('name') or d.get('id')}  ({kind}, {state}{found})  "
               f"id={d.get('id')}")
@@ -2059,17 +2077,24 @@ def _doctor_log_row() -> None:
     if you ask" is about this host. A reader given one of them fills in the other,
     and both directions of that guess are wrong.
     """
+    # ⛔⛔ EVERY FILE THAT LEAVES, NOT JUST THE ACTIVE ONE. Since wave 8 the rotated
+    # backups go up with it — up to four files — and this row stated one path and
+    # one size and then said that file is what `--agent-log` sends. Somebody
+    # weighing whether to send it was shown a fraction of what would go.
+    from .bridge import _agent_log_paths, _file_size
+    files = [(p, _file_size(p)) for p in _agent_log_paths()]
+    present = [(p, n) for p, n in files if n > 0]
+    total = sum(n for _p, n in present)
     path = config.log_path()
-    try:
-        size = path.stat().st_size
-    except OSError:
-        size = None
+    size = total if present else None
     if size is None:
         detail = f"{path}  (nothing written yet)"
-    elif size < 1024:
-        detail = f"{path}  ({size} B)"
     else:
-        detail = f"{path}  ({size // 1024} KB)"
+        shown = f"{size} B" if size < 1024 else f"{size // 1024} KB"
+        # ⭐ The count is named only when there IS more than one, so the ordinary
+        # single-file host reads exactly as it did.
+        extra = f" + {len(present) - 1} rotated" if len(present) > 1 else ""
+        detail = f"{path}  ({shown}{extra})"
     _doctor_row("log", size is not None, detail, warn_only=size is None)
     b.dim("              not sent with a support bundle — that archive is built on the")
     b.dim("              research computer and cannot reach this file")
@@ -2078,6 +2103,15 @@ def _doctor_log_row() -> None:
     # may point at `doctor` — was written against a sentence that pointed the wrong
     # way. The flag is the actionable half and it collides with nothing.
     b.dim("              it goes only when you ask for it, with  --agent-log")
+    # ⛔⛔ AND THAT ROUTE NEEDS NO RESEARCH COMPUTER SINCE WAVE 8, which is the one
+    # fact this screen's reader is most likely to need: doctor is opened when
+    # something is already wrong, and "cannot reach my computer" is the commonest
+    # thing that is. Until this wave the only way to send this file was beside a
+    # bundle from a machine, so the person reading this had nothing they could do.
+    # ⛔ FLAGS ONLY, NEVER THE COMMAND'S NAME — the sibling guard three lines above
+    # bans it from this block, and the flags are the precise half anyway.
+    b.dim("              add  --none  and it goes on its own, with no computer "
+          "involved")
     # ⛔⛔ ONLY WHEN THEY DISAGREE. On every ordinary host HERMES_HOME is unset and
     # this row does not exist; on the fleet it is set to the SAME directory and the
     # row still does not exist. A row that printed either way would be one more line
@@ -2791,18 +2825,41 @@ def cmd_send_logs(args: argparse.Namespace) -> int:
             # `--no-wait`'s "re-run without --no-wait" mints a NEW request that
             # the machine refuses for ten minutes.
             if agent_log:
+                # ⛔⛔ THE PLAN WAS PRINTED BY A DIFFERENT COMMAND, AND NOTHING
+                # CHECKED THAT IT EVER WAS. This is the second step, reached with
+                # a support code and a flag — so an assistant that never showed
+                # the person what is in this file can upload it from here, and the
+                # only thing standing in the way is a directive it is asked to
+                # follow. The facts are cheap; they travel with the flag instead.
+                for _fact in _agent_log_fact_lines():
+                    print(_fact)
                 _send_agent_log(code)
             return 0
         if agent_log:
             # ⛔ SAID, NOT SILENTLY DROPPED. The upload is refused until the row
             # lands, by design; a person who asked for it deserves to know this
             # call was not the one that did it.
-            print("    The agent's own log has not gone yet — it can only "
-                  "follow a bundle that")
-            print("    has landed. Ask again with the same code once this shows "
-                  "done.")
+            # ⛔⛔ "CAN ONLY FOLLOW A BUNDLE" STOPPED BEING TRUE IN WAVE 8, and
+            # this fires in exactly the state the standalone route exists for: the
+            # bundle has not landed, so the thing they asked for is stuck behind a
+            # machine they may not be able to reach at all. The attached route is
+            # still the one that puts it BESIDE this bundle; it is no longer the
+            # only way to send the file.
+            print("    The agent's own log hasn't gone yet — attaching it to this "
+                  "bundle needs")
+            print("    the bundle to land first. Ask again with the same code once "
+                  "this shows done,")
+            print("    or send the log on its own now:  agent send-logs "
+                  "--agent-log --none")
         print(f"{code}: {status}.")
         return 0
+
+    # ⛔⛔ BEFORE THE RUN LIST, AND THAT IS THE POINT. `/logs/runs` resolves a
+    # selected computer and refuses without one, so asking it first would make the
+    # one request that needs no machine impossible for the people who have none.
+    if _agent_log_only_request(args):
+        owned_hint, hint_name = _agent_log_machine_hint(args)
+        return _send_agent_log_alone(args, offer_machine=owned_hint, name=hint_name)
 
     path = "/logs/runs" + (f"?deviceId={args.device}" if args.device else "")
     res = _bridge_get(path, timeout=30.0)
@@ -2875,38 +2932,18 @@ def cmd_send_logs(args: argparse.Namespace) -> int:
               "run of yours it holds.")
         return 1
     if not names and not machine:
-        # ⛔⛔ THE AGENT'S LOG CANNOT STAND ALONE, AND SAYING SO IS THE WHOLE
-        # POINT OF THIS BRANCH. It is uploaded into the folder the machine's
-        # bundle row names — the app's Clear-logs finds objects by listing that
-        # folder and nothing else — so with no bundle there is nowhere it could
-        # go that a person could later delete. The bridge refuses an empty
-        # archive and the machine refuses it again; without this sentence a
-        # person who picked only `0` would be told "there's nothing to send"
-        # about the one thing they did pick.
+        # ⛔⛔ IT USED TO BE REFUSED HERE, AND WAVE 8 TURNED THAT INTO A SEND. The
+        # old sentence — "can only go up beside a bundle from that computer" — was
+        # true about the transport and useless to the person reading it: this
+        # branch is reached when that computer is holding nothing of theirs, which
+        # is one of the two states in which no bundle can be built at all. The log
+        # has a route of its own and a support code of its own now, so the thing
+        # they asked for happens instead of being explained away.
         if agent_log:
-            print(f"{_NO} The agent's own log can only go up beside a bundle from "
-                  "that computer,")
-            print("    so something has to be in that bundle.")
-            if rows:
-                print("    Pick a run as well.")
-            elif not owned:
-                # ⛔⛔ THE HONEST DEAD END, SAID OUT LOUD. A sharer whose runs are
-                # not in the published list has nothing to pick and may not ask
-                # for the machine's own logs, so there is no bundle they can
-                # build — and the row offering choice 0 is printed on exactly
-                # this branch. Sending them round to `--machine`, which is then
-                # refused, is worse than telling them the truth.
-                print("    That computer is holding no runs of yours to build one "
-                      "from, and its own")
-                print("    logs belong to whoever owns it — so there is nothing "
-                      "for this log to ride.")
-            # ⛔ GATED, like the sentence below it. `--machine` is refused for a
-            # non-owner four lines further up, so offering it to one sends them
-            # into a refusal this branch could have spared them.
-            if owned:
-                print("    Or, if the trouble is reaching that computer at all, "
-                      "add --machine.")
-            return 1
+            # ⛔ THE MACHINE OFFER SURVIVES AND IS STILL OWNER-ONLY. `--machine` is
+            # refused for a non-owner a few lines above, so offering it to one
+            # sends them round the circle an earlier wave closed here.
+            return _send_agent_log_alone(args, offer_machine=owned, name=name)
         print(f"{_NO} There's nothing to send.")
         if owned:
             print("    To send that computer's own logs instead, add --machine.")
@@ -2937,9 +2974,10 @@ def cmd_send_logs(args: argparse.Namespace) -> int:
     # invocation would then decline to send, and only mention that after the
     # person had already agreed.
     if agent_log and args.no_wait:
-        print("The agent's own log will NOT go on this run: it can only follow "
-              "that computer's bundle, and --no-wait does not wait for it. "
-              "Finish it later with:  agent send-logs --status <CODE> --agent-log")
+        print("The agent's own log will NOT go on this run: attaching it needs "
+              "that computer's bundle to land, and --no-wait does not wait for it. "
+              "Finish it later with:  agent send-logs --status <CODE> --agent-log — "
+              "or send it on its own:  agent send-logs --agent-log --none")
     elif agent_log:
         print("It will ALSO include the log from the agent on THIS host — the "
               "program running this command. That is a connection and sign-in "
@@ -2951,23 +2989,11 @@ def cmd_send_logs(args: argparse.Namespace) -> int:
         # somebody happens to be typing on is not. A second person who signed in
         # here is in this file, and nothing gates the upload on who owns the host,
         # because an agent host has no owner to ask. So it is said instead.
-        print("It covers everyone who signed in through this agent since that "
-              "file last rotated, not only you — there is no owner to ask on a "
-              "machine like this, so nothing checks.")
-        # ⛔⛔ NAMED, BECAUSE "NOT RESEARCH CONTENT" IS WHAT IT IS NOT. Measured in
-        # the file the uploader actually reads: a masked form of the email address
-        # on every connect, the account id, the ids of the computers and the runs
-        # this agent touched, and — on any failed lookup — the full document path,
-        # which carries the account id unmasked. A person weighing this deserves
-        # the list rather than a category, and the list is short enough to print.
-        # ⛔ "AMONG" AND "CAN", because the list is neither exhaustive nor
-        # unconditional. The account id reaches the file only when a lookup has
-        # FAILED (the Firestore error carries the document path); the file also
-        # records local paths, which name the account on this machine. Printing a
-        # closed list would be a promise about material nobody has enumerated.
-        print("Among what is in it: a masked form of your email address, the ids "
-              "of the computers and runs this agent has touched, file paths on "
-              "this machine, and — when a lookup fails — your account id.")
+        # ⛔⛔ ONE SOURCE WITH THE STANDALONE PLAN, which prints the same three
+        # sentences. A second hand-written copy is how one of them quietly stops
+        # being said on one of the two paths — see `_agent_log_fact_lines`.
+        for _fact in _agent_log_fact_lines():
+            print(_fact)
     else:
         print("The agent's own log on this host is NOT included.")
     # ⛔⛔ THE THREE FACTS THE APP'S MODAL NAMES AND THIS PLAN DID NOT. The header
@@ -3023,10 +3049,12 @@ def cmd_send_logs(args: argparse.Namespace) -> int:
             # after the machine's row lands, and --no-wait is the choice not to wait
             # for that. Sending it anyway would put an object in a folder no row
             # names yet, where the app's Clear-logs could never find it.
-            print("    The agent's own log was not sent — it can only go once "
+            print("    The agent's own log was not sent — attaching it needs "
                   "that computer's")
-            print(f"    bundle has landed. Finish it with:  agent send-logs "
+            print(f"    bundle to land. Finish it with:  agent send-logs "
                   f"--status {code} --agent-log")
+            print("    Or send it on its own, with no computer involved:  agent "
+                  "send-logs --agent-log --none")
         return 0
     rc, landed = _await_bundle(code, args.wait)
     if agent_log:
@@ -3045,11 +3073,159 @@ def cmd_send_logs(args: argparse.Namespace) -> int:
             # ⛔ `landed`, NOT `rc == 0`. A timeout also exits 0, and uploading
             # then puts an object under a code whose row nobody has confirmed —
             # the folder the app's Clear-logs lists may not exist yet.
-            print("    The agent's own log was not sent — it can only go beside "
-                  "a bundle that")
+            print("    The agent's own log was not sent — attaching it needs a "
+                  "bundle that")
             print(f"    arrived. Finish it with:  agent send-logs --status "
                   f"{code} --agent-log")
+            print("    Or send it on its own, with no computer involved:  agent "
+                  "send-logs --agent-log --none")
     return rc
+
+
+def _agent_log_fact_lines() -> "list[str]":
+    """What a person is told before this file leaves.
+
+    ⛔⛔ ONE SOURCE, BECAUSE IT IS PRINTED FROM TWO PLACES NOW — beside a machine's
+    bundle and on its own. A guard compares these CLAIMS against the chat client's
+    twin (the two files punctuate differently on purpose, so the comparison is of
+    the fact and never of the string); a second hand-written copy is how one of
+    them quietly stops being said on one of the paths.
+    """
+    return [
+        # ⛔⛔ WHOSE, NOT ONLY WHAT. A second person who signed in here is in this
+        # file, and nothing gates the upload on who owns the host, because an agent
+        # host has no owner to ask.
+        "It covers everyone who signed in through this agent, not only you — "
+        "there is no owner to ask on a machine like this, so nothing checks.",
+        # ⛔⛔ THE ROTATED COPIES GO TOO, SINCE WAVE 8, and this sentence moved with
+        # the material rather than after it. It said "since that file last rotated"
+        # while the reader sent the active file alone; that understates what leaves
+        # now, on the one screen whose whole job is to be true about it.
+        "The rotated copies go too, not only the newest file, so it reaches back "
+        "further than the problem you are reporting.",
+        # ⛔⛔ NAMED, BECAUSE "NOT RESEARCH CONTENT" IS WHAT IT IS NOT. ⛔ "AMONG"
+        # AND "WHEN A LOOKUP FAILS", because the list is neither exhaustive nor
+        # unconditional: the account id reaches the file only through a FAILED
+        # lookup's document path.
+        "Among what is in it: a masked form of your email address, the ids of the "
+        "computers and runs this agent has touched, file paths on this machine, "
+        "and — when a lookup fails — your account id.",
+    ]
+
+
+def _agent_log_machine_hint(args) -> "tuple[bool, str]":
+    """(may we offer --machine, what to call that computer) — BEST EFFORT ONLY.
+
+    ⛔⛔ A FAILURE HERE COSTS THE HINT AND NOTHING ELSE, and that is the whole
+    distinction this branch turns on. It exists so somebody with no research
+    computer can send the agent's log, and `/logs/runs` is precisely the call that
+    refuses those people — so its answer is used when it arrives and ignored when
+    it does not. It may never decide whether the send happens.
+
+    ⛔ AND THE OFFER STAYS OWNER-ONLY. `--machine` is refused for anybody else, so
+    offering it to a sharer walks them into a refusal an earlier wave closed on
+    this exact branch.
+
+    ⛔ NO HINT AT ALL WHEN A COMPUTER WAS NAMED. Resolving `--device` costs another
+    round trip, and naming the SELECTED machine in a sentence about the one they
+    asked for would be a wrong statement rather than a missing one.
+    """
+    if getattr(args, "device", "") or "":
+        return False, ""
+    res = _bridge_get("/logs/runs", timeout=30.0)
+    if res is None or res[0] != 200 or not res[1].get("owned"):
+        return False, ""
+    body = res[1]
+    return True, str(body.get("deviceName") or body.get("deviceId") or "that computer")
+
+
+def _agent_log_only_request(args) -> bool:
+    """True when the ONLY thing being asked for is this host's own agent log.
+
+    ⛔⛔ IT DECIDES WHETHER A RESEARCH COMPUTER IS NEEDED AT ALL, which is why it
+    is read before `/logs/runs`. That route resolves a selected machine and
+    refuses without one — so asking it first makes the single request that needs
+    no machine impossible for precisely the people who have none.
+
+    ⛔⛔ `--list` DISQUALIFIES IT TOO, AND ITS ABSENCE WAS A LIVE REGRESSION.
+    `--list` means "show me what it is holding and send nothing" — the one flag on
+    this command that promises no side effect at all. The early return sits above
+    the `if args.list: return 0` short-circuit, so `send-logs --list --runs 0 -y`
+    printed the standalone plan and UPLOADED. Found by cross-verification, which
+    ran it.
+
+    ⛔ BARE `--agent-log` IS NOT THIS: it means "everything that computer holds,
+    and the agent's log as well". Only an explicit "and nothing else" — `--none`,
+    or a `--runs` spec naming just the 0 — makes the log the whole request. And
+    `--machine` disqualifies it outright, because that IS a computer's material.
+
+    ⭐ THE TWIN OF THE CHAT CLIENT'S FUNCTION OF THE SAME NAME, and a guard drives
+    both over the same specs. `sr.py` cannot import this module — it is stdlib-only
+    by contract — so the duplication is structural, not laziness.
+    """
+    if bool(getattr(args, "machine", False)):
+        return False
+    # ⛔ SEE THE NOTE ABOVE — `--list` sends nothing, ever.
+    if bool(getattr(args, "list", False)):
+        return False
+    spec = [t.strip() for t in
+            str(getattr(args, "runs", "") or "").replace(" ", ",").split(",")
+            if t.strip()]
+    if not (bool(getattr(args, "agent_log", False)) or _AGENT_LOG_TOKEN in spec):
+        return False
+    if [t for t in spec if t != _AGENT_LOG_TOKEN]:
+        return False
+    return bool(getattr(args, "none", False)) or bool(spec)
+
+
+def _send_agent_log_alone(args, offer_machine: bool = False, name: str = "") -> int:
+    """Send this host's agent log with NO bundle behind it, under its own code.
+
+    ⛔⛔ THIS IS WHAT THE REFUSAL USED TO BE. Until wave 8 the answer here was "the
+    agent's own log can only go up beside a bundle from that computer" — true
+    about the transport and useless to the person reading it, because the two
+    commonest reasons to be sending an agent log are having no research computer
+    and having one you cannot reach, and neither can produce a bundle. The app
+    mints a support code for it now, so this is a send like any other.
+
+    ⛔ STILL TWO STEPS, AND THE PLAN IS STILL WHAT MAKES CONSENT TRUE. Nothing
+    leaves before the prompt below is answered.
+    """
+    print()
+    print("This will send the log from the agent on THIS host — the program "
+          "running this command.")
+    print("No research computer is involved, and nothing from one is included.")
+    print("It is a connection and sign-in record, not research content.")
+    for line in _agent_log_fact_lines():
+        print(line)
+    print("It is deleted automatically 30 days after it arrives.")
+    print("You will get a support code of its own to quote.")
+    if offer_machine:
+        # ⛔ ONLY TO AN OWNER. `--machine` is refused for anybody else, so offering
+        # it to a sharer walks them into a refusal — the circle an earlier wave
+        # closed on this very branch.
+        print(f"If the trouble is reaching {name} at all, add --machine and that "
+              "computer's own logs go as well.")
+    if not _decide(None, bool(getattr(args, "yes", False)),
+                   "Send the agent's own log?", default=False):
+        print("Nothing was sent.")
+        return 1
+    with b.spinner("Sending the agent's log"):
+        res = _bridge_post("/logs/agent-log", {"standalone": True}, timeout=90.0)
+    if res is None or res[0] != 200:
+        print(f"{_NO} The agent's own log did not go: {_err(res)}")
+        return 1
+    payload = res[1]
+    if not payload.get("sent"):
+        # ⭐ Stated as a fact and not dressed up as a problem — and there is no
+        # code, because nothing was stored.
+        print(f"{_OK} The agent's log on this host was empty — there was nothing "
+              "to send.")
+        return 0
+    print(f"{_OK} Sent. Support code: {payload.get('code', '')}")
+    print(f"    {_size_words(int(payload.get('bytes') or 0))}. Quote that code "
+          "when you report the problem.")
+    return 0
 
 
 def _send_agent_log(code: str) -> None:

@@ -264,8 +264,8 @@ MUTANTS = [
      "⛔⛔ ABSENT READS AS PUBLIC. Every machine paired before 2026-09-04 carries "
      "no such field and nothing backfills one, so this is most of them — and it "
      "reports a private computer as findable",
-     [('            current = "public" if row.get("visibility") == "public" else "private"',
-       '            current = "private" if row.get("visibility") == "private" else "public"')]),
+     [('    # ⛔ ABSENT IS PRIVATE. A machine paired before 2026-09-04 carries neither key,\n    # and the safe direction for a discovery setting is the one that hides.\n    return "private"\n',
+       '    # ⛔ ABSENT IS PRIVATE. A machine paired before 2026-09-04 carries neither key,\n    # and the safe direction for a discovery setting is the one that hides.\n    return "public"\n')]),
     ("V4", BRIDGE, "over",
      "a no-op reports that something changed, so somebody believes they just "
      "published a machine that was already published",
@@ -343,11 +343,8 @@ MUTANTS = [
     ("Q2", BRIDGE, "over",
      "a half that arrives as something other than a list is passed through, so "
      "both clients iterate a string character by character",
-     [('                             "incoming": incoming if isinstance(incoming, list)\n'
-       '                             else []})',
-       '                             "incoming": incoming})')]),
-
-    # ═══════════ T — the terminal ════════════════════════════════════════════
+     [('            rows = rows if isinstance(rows, list) else []\n            incoming = incoming if isinstance(incoming, list) else []\n',
+       '            rows = rows if isinstance(rows, list) else []\n            pass\n')]),
     ("T1", CLI, "over",
      "⛔⛔ THE DECIDE TABLE IS THE ASK TABLE. Five codes appear on both routes "
      "and mean different things on each — `device_not_found` becomes \"not "
@@ -407,9 +404,8 @@ MUTANTS = [
     ("T9", CLI, "over",
      "⛔⛔ THE FINDABLE COLUMN APPEARS ON SHARED ROWS, so somebody else's setting "
      "is reported as if it were the reader's to change",
-     [('        if d.get("owned"):\n'
-       '            found = ", public" if d.get("visibility") == "public" else ", private"',
-       '        found = ", public" if d.get("visibility") == "public" else ", private"')]),
+     [('        found = ""\n        if d.get("owned"):\n        # ⛔⛔ THIS READS THE BRIDGE\'S ANSWER, NOT A FIRESTORE FIELD, AND THE\n        # DIFFERENCE IS WHAT CARRIES IT THROUGH THE RENAME. `visibility` is\n        # becoming `joinPolicy`; the bridge resolves both names into this one key\n        # before any row leaves it (`_discovery_of`), so this line keeps working\n        # without ever learning the new name. ⛔ Point it at a raw device document\n        # and it goes silently wrong: every public computer would read private,\n        # with no error anywhere.\n            found = ", public" if d.get("visibility") == "public" else ", private"\n',
+       '        found = ", public" if d.get("visibility") == "public" else ", private"\n')]),
     ("T10", CLI, "over",
      "⛔ absent reads as findable on the owned list, and every machine paired "
      "before 2026-09-04 carries no such field",
@@ -841,11 +837,8 @@ MUTANTS = [
      "⛔⛔ THE CHAT DEVICE LIST STOPS SAYING WHICH MACHINES ARE PUBLIC, and "
      "SKILL.md routes \"is my computer public?\" straight at it — a documented "
      "answer path landing on output that cannot answer",
-     [('        state = ""\n'
-       '        if d.get("owned"):\n'
-       '            state = ", public" if d.get("visibility") == "public" else ", private"\n'
-       '        lines.append(f"  {mark} {_dev_label(d)}  ({kind}{state})")',
-       '        lines.append(f"  {mark} {_dev_label(d)}  ({kind})")')]),
+     [('        state = ""\n        if d.get("owned"):\n        # ⛔⛔ THIS READS THE BRIDGE\'S ANSWER, NOT A FIRESTORE FIELD, AND THE\n        # DIFFERENCE IS WHAT CARRIES IT THROUGH THE RENAME. `visibility` is\n        # becoming `joinPolicy`; the bridge resolves both names into this one key\n        # before any row leaves it (`_discovery_of`), so this line keeps working\n        # without ever learning the new name. ⛔ Point it at a raw device document\n        # and it goes silently wrong: every public computer would read private,\n        # with no error anywhere.\n            state = ", public" if d.get("visibility") == "public" else ", private"\n        lines.append(f"  {mark} {_dev_label(d)}  ({kind}{state})")\n',
+       '        lines.append(f"  {mark} {_dev_label(d)}  ({kind})")\n')]),
     ("W19", CLI, "under",
      "⛔⛔ THE TERMINAL FOOTER LOSES ITS QUALIFIER, so a sentence about the "
      "asker\'s own requests is printed under a list of people waiting on THEM, "

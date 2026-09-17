@@ -237,7 +237,8 @@ MUTANTS = [
      "⛔ THE BULLET GOES. The NL router still honours somebody who says the exact "
      "words, so the option survives for people who already know it — and is never "
      "OFFERED to anyone else",
-     [(BE_BULLET, "")]),
+     [('- **The agent\'s own log on THIS host** is a third thing and a third computer —\n  the program running this chat, not their Research Computer. `--agent-log`\n  asks for it on the bare command, so the plan names it, and `--runs 0` is the\n  same request by the number the plan prints. Unlike `--machine`\n  there is **no ownership gate**, so no refusal will stop you: offer it only\n  when the problem is this chat reaching their computer at all. It covers the\n  rotated copies as well as the newest file, not just this conversation, so it\n  can reach back further than the problem being reported. ⛔ And say what it\n  holds before they agree: it covers **everyone who has signed in on that host**,\n  not only them, and it carries a masked form of their email address, their\n  account id and the ids of the computers and runs this agent has touched. The\n  client\'s plan prints all of that — relay it, do not summarise it away.\n  ⭐ **It CAN go on its own, and that is often the right offer.**\n  `--agent-log --none` — or `--runs 0` with nothing else — sends this file and\n  nothing else, with **a support code of its own**, and it needs\n  **no Research Computer at all**. Offer it to somebody who has no computer paired yet, or cannot reach the\n  one they have, because those are exactly the people who cannot build a bundle\n  for it to ride. It is still two steps: the bare command prints the plan, and\n  nothing leaves until you pass `--confirm`.\n  ⛔ Riding a bundle is the OTHER shape and still works the old way. When runs\n  ARE going, **it does not ride the send** — so **pass `--agent-log` on\n  `--confirm` too**: nothing is uploaded on that call either, and it is what\n  makes the client tell the user a step is still outstanding and hand you the\n  exact follow-up command. Leave it off and you get neither, and the second step\n  survives only in your memory. Run that follow-up when the user asks you to\n  check, never on a timer. Refused before then is by design, not a fault; a\n  failure there leaves the bundle and the support code untouched; "nothing to\n  add" means the log was empty.\n',
+       '')]),
     ("B2", BE_SKILL, "under",
      "⛔⛔ THE ROW GOES AND THE SECTION STAYS. The table is what a model actually "
      "reads to decide what to run; a section further down it never reaches on a "
@@ -280,24 +281,19 @@ MUTANTS = [
     ("B7", BE_SKILL, "under",
      "the separate step stops being named, so the assistant adds the flag to the "
      "send and stops there",
-     [("**It does not ride the send** — but\n", "")]),
+     [('**it does not ride the send** — so **pass `--agent-log` on\n',
+       '')]),
     ("B12", BE_SKILL, "under",
      "⛔⛔ THE INSTRUCTION THAT MAKES THE CLIENT SPEAK GOES. Without the flag on "
      "`--confirm` this client prints neither the outstanding-step line nor the "
      "follow-up command — measured by driving it both ways",
-     [("  **pass it on `--confirm` too**: nothing is uploaded on that call either, and it\n"
-       "  is what makes the client tell the user a step is still outstanding and hand you\n"
-       "  the exact follow-up command. Leave it off and you get neither, and the second\n"
-       "  step survives only in your memory. Run that follow-up when the user asks you to\n"
-       "  check, never on a timer. ",
-       "  the client hands you the exact follow-up command; run it when the user asks\n"
-       "  you to check, never on a timer. ")]),
+     [('  `--confirm` too**: nothing is uploaded on that call either, and it is what\n  makes the client tell the user a step is still outstanding and hand you the\n  exact follow-up command. Leave it off and you get neither, and the second step\n  survives only in your memory. Run that follow-up when the user asks you to\n  check, never on a timer. ',
+       '  the client hands you the exact follow-up command; run it when the user asks\n  you to check, never on a timer. ')]),
     ("B8", BE_SKILL, "under",
      "the rotation clause goes, so the log reads as this conversation's when it "
      "covers everything since the file last rotated",
-     [("It covers that\n"
-       "  file since it last rotated, not just this conversation, so it can reach back\n"
-       "  further than the problem being reported. ", "")]),
+     [('It covers the\n  rotated copies as well as the newest file, not just this conversation, so it\n  can reach back further than the problem being reported. ',
+       '')]),
     ("B9", BE_SKILL, "under",
      "the deliberate refusal stops being called deliberate, so the ordering that "
      "keeps a log deletable reads as a bug",

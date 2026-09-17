@@ -62,6 +62,14 @@ class _Wire:
 
     def post(self, path, body=None):
         self.posts.append({"path": path, "body": body})
+        if path == "/logs/agent-log":
+            # ⛔⛔ ROUTE-SHAPED, NOT ONE REPLY FOR EVERY POST. This used to answer
+            # every path with the send-logs body, which has no `sent` key — so the
+            # agent-log client read every upload as an EMPTY log and the "nothing
+            # to send" branch swallowed every assertion about a successful one.
+            # A fixture that cannot tell the two apart tests neither.
+            return 200, {"ok": True, "sent": True, "standalone": True,
+                         "code": "K7XQ9B2M", "bytes": 4096}
         return 200, {"ok": True, "code": "K7XQ9B2M"}
 
 
@@ -144,7 +152,11 @@ def test_runs_zero_turns_the_agent_log_on_in_chat(wire, capsys):
     sr.cmd_send_logs(_args(runs="0,1"))
     out = capsys.readouterr().out
     assert "0 • the log from the agent" in out
-    assert "signed in through this agent since that file last rotated" in out
+    assert "signed in through this agent" in out
+    # ⛔⛔ RE-AIMED IN WAVE 8 AND ASSERTING MORE. The old claim was "since that
+    # file last rotated" — true while the uploader sent the active file alone, and
+    # an understatement now that the rotated backups go too.
+    assert "rotated copies go too" in out
 
 
 def test_a_refusal_stops_the_plan(wire, capsys):
@@ -159,12 +171,35 @@ def test_a_refusal_stops_the_plan(wire, capsys):
     assert wire.posts == []
 
 
-def test_the_agent_log_alone_is_refused_in_chat(wire, capsys):
+def test_the_agent_log_alone_is_SENT_in_chat(wire, capsys):
+    """⛔⛔ RE-AIMED IN WAVE 8: THIS USED TO BE A REFUSAL AND IS NOW THE FEATURE.
+    The old sentence — "can only go up beside a bundle from that computer" — was
+    true about the transport and useless to the reader, because the two commonest
+    reasons to be sending an agent log are having no research computer and having
+    one you cannot reach, and neither can produce a bundle. It asserts MORE than
+    the refusal did: the plan is still a consent screen (nothing leaves without
+    `--confirm`), and the follow-up it hands back is the command that finishes it.
+    """
     rc = sr.cmd_send_logs(_args(runs="0", none=True))
     out = capsys.readouterr().out
-    assert rc == 1
-    assert "only go up beside a bundle" in out
+    assert rc == 0
+    assert "only go up beside a bundle" not in out
+    # Still two steps: the plan alone uploads nothing.
     assert wire.posts == []
+    assert "log from the agent on THIS host" in out
+    assert "support code of its own" in out
+    assert "send-logs --confirm --agent-log --none" in out
+
+
+def test_the_agent_log_alone_reaches_the_wire_on_confirm(wire, capsys):
+    """⛔ AND IT GOES WITHOUT A DEVICE AND WITHOUT A CODE. Anything else on that
+    body is a second request the receiving route refuses."""
+    rc = sr.cmd_send_logs(_args(runs="0", none=True, confirm=True))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert [p["path"] for p in wire.posts] == ["/logs/agent-log"]
+    assert wire.posts[0]["body"] == {"standalone": True}
+    assert "support code is" in out
 
 
 def test_the_default_is_still_every_listed_run(wire, capsys):
@@ -307,6 +342,18 @@ def test_the_skill_says_what_the_agent_log_holds_and_whose_it_is():
     assert "not only them" in text
 
 
-def test_the_skill_says_the_agent_log_cannot_go_alone():
+def test_the_skill_says_the_agent_log_CAN_go_alone():
+    """⛔⛔ RE-AIMED IN WAVE 8, AND THE OLD PIN WOULD NOW HOLD THE DOCUMENT WRONG.
+    It required the sentence "`--runs 0` alone is refused with that sentence" —
+    true until the log got a route and a support code of its own, and from that
+    day an instruction that talks an assistant out of the only send available to
+    somebody with no research computer.
+
+    ⭐ IT ASSERTS MORE THAN IT DID: both spellings of the request, the code that
+    comes back, and that the document no longer carries the refusal anywhere."""
     text = _SKILL.read_text(encoding="utf-8")
-    assert "`--runs 0`\n  alone is refused with that sentence" in text
+    assert "cannot go on its own" not in text
+    assert "alone is refused" not in text
+    assert "`--agent-log --none`" in text
+    assert "`--runs 0` with nothing else" in text
+    assert "support code of its own" in text

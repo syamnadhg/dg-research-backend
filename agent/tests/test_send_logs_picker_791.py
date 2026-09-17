@@ -193,6 +193,13 @@ class _Wire:
         self.posts.append(path)
         self.bodies.append(body or {})
         if path == "/logs/agent-log":
+            # ⛔⛔ THE STANDALONE REPLY CARRIES A CODE AND THE ATTACHED ONE DOES
+            # NOT, exactly as the bridge answers. A fixture that returned the same
+            # body for both would let the client print an empty support code and
+            # still pass — which is what it did before this branch existed.
+            if (body or {}).get("standalone"):
+                return 200, {"ok": True, "sent": True, "standalone": True,
+                             "code": "SOLO7X2M", "bytes": 12}
             return 200, {"ok": True, "sent": True, "bytes": 12}
         return 200, {"ok": True, "code": "K7XQ9B2M"}
 
@@ -243,19 +250,47 @@ def test_saying_it_both_ways_is_not_answered_no(monkeypatch):
     assert "/logs/agent-log" in wire.posts
 
 
-def test_the_agent_log_alone_is_refused_with_the_reason(monkeypatch):
-    """⛔⛔ IT CANNOT STAND ALONE, and the sentence has to say why. The upload
-    lands in the folder the machine's bundle row names — Clear-logs finds objects
-    by listing that folder and nothing else — so with no bundle there is nowhere
-    it could go that a person could later delete. The bridge refuses an empty
-    archive and the machine refuses it again."""
+def test_the_agent_log_alone_is_SENT_with_its_own_code(monkeypatch):
+    """⛔⛔ RE-AIMED IN WAVE 8: THIS WAS A REFUSAL AND IS NOW THE FEATURE. The old
+    sentence — "it can only go up beside a bundle from that computer" — described
+    the transport truthfully and left the reader with nothing to do, because the
+    two commonest reasons to be sending an agent log are having no research
+    computer and having one you cannot reach, and neither can produce a bundle.
+
+    ⭐ IT ASSERTS MORE THAN THE REFUSAL DID: no bundle is requested (the old
+    "an empty bundle was requested" guard survives verbatim), the ONE call made is
+    the standalone upload, its body names nothing else, and the person is handed a
+    support code — which is the thing the owner asked for and the thing that makes
+    this artifact reachable by a developer at all."""
     wire = _Wire()
     rc, out = _run(monkeypatch, _args(runs="0"), wire)
-    assert rc == 1
-    assert wire.posts == [], "an empty bundle was requested"
-    assert "only go up beside a bundle" in out
+    assert rc == 0
+    assert "/logs/send" not in wire.posts, "an empty bundle was requested"
+    assert wire.posts == ["/logs/agent-log"]
+    assert wire.bodies[-1] == {"standalone": True}
+    assert "Support code: SOLO7X2M" in out
+    assert "only go up beside a bundle" not in out
     assert "There's nothing to send" not in out, (
         "the one thing they picked was reported as nothing")
+
+
+def test_the_standalone_plan_is_still_a_consent_screen(monkeypatch):
+    """⛔ NOTHING LEAVES BEFORE THE PROMPT. `--yes` is what the fixture passes, so
+    the complement has to be driven explicitly — the plan has to be printed and the
+    refusal has to send nothing."""
+    wire = _Wire()
+    # ⛔ THE PROMPT IS THE SUBJECT, so it is answered rather than assumed away.
+    # `input()` raises under pytest's capture, which would make this test pass on
+    # an exception instead of on a refusal.
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: False)
+    rc, out = _run(monkeypatch, _args(runs="0", yes=False), wire)
+    assert rc == 1
+    assert wire.posts == []
+    assert "Nothing was sent." in out
+    # The three facts are stated BEFORE the prompt, not after it.
+    assert "signed in through this agent" in out
+    assert "rotated copies go too" in out
+    assert "masked form of your email address" in out
 
 
 def test_the_ordinary_nothing_to_send_sentence_survives(monkeypatch):

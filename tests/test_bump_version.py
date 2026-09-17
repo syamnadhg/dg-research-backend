@@ -431,3 +431,148 @@ def test_the_real_repo_has_the_bundle_where_the_tool_looks(tmp_path):
     pass against a directory nobody ships."""
     root = Path(bump_mod.__file__).resolve().parents[1]
     assert (root / "agent" / "facade" / "skill" / "SKILL.md").is_file()
+
+
+# ── the hosted twin tracks the PUBLISHED wheel (wave 8) ─────────────────────
+#
+# ⛔⛔ THE TWIN IS NOT THIS REPO'S FILE, AND THE FIRST VERSION OF THIS BLOCK SAID IT
+# WAS. The committed copy under the web app's `public/.well-known/skills/` is what
+# the Hermes Skills Hub hands people, and it pairs with the wheel
+# `pipx run superresearch-agent connect` installs — so it has to match what is ON
+# PyPI, not what this tree is building. Cross-verification caught the inversion:
+# the twin was byte-identical to `chore(agent): release 0.1.32`, which is exactly
+# right, and it had been reported as "six weeks stale" by comparing it to dev HEAD.
+#
+# ⭐⭐ AND THE BUMP USED TO SYNC IT UNCONDITIONALLY, which is the same mistake
+# automated. It only ever looked harmless because the FE sync script's default
+# source named a checkout nobody has, so the sync failed at every release and the
+# twin stayed correct BY ACCIDENT.
+
+
+def _with_twin(root: Path, version: str, published: str | None = None) -> Path:
+    """Put a sibling web checkout beside `root`: a hosted twin, and the constant
+    that records which wheel is actually on PyPI.
+
+    ⛔ THE SYNC SCRIPT HAS TO BE THERE TOO. `_web_root` probes its candidates by
+    asking which one holds `scripts/sync-agent-skill.mjs` — a checkout without it
+    is not the web checkout — so a fixture that omits it falls through to the last
+    candidate and the twin is never found. That is the probe working; this is the
+    fixture matching it."""
+    web = root.parent / "dg-research"
+    (web / "scripts").mkdir(parents=True, exist_ok=True)
+    (web / "scripts" / "sync-agent-skill.mjs").write_text("// stub\n", encoding="utf-8")
+    (web / "src" / "lib").mkdir(parents=True, exist_ok=True)
+    (web / "src" / "lib" / "agent-release-gates.ts").write_text(
+        f'export const AGENT_WHEEL_PUBLISHED = "{published or version}";\n',
+        encoding="utf-8")
+    twin = web / "public" / ".well-known" / "skills" / "sr" / "scripts" / "sr.py"
+    twin.parent.mkdir(parents=True, exist_ok=True)
+    twin.write_text(f'#!/usr/bin/env python3\n_SKILL_BUILD = "{version}"\n', encoding="utf-8")
+    return twin
+
+
+def test_check_passes_while_this_repo_is_AHEAD_of_the_published_wheel(tmp_path):
+    """⭐ THE NORMAL STATE BETWEEN RELEASES, and it must not read as a fault. The
+    repo builds 0.1.29; the wheel on PyPI is 0.1.28; the twin serves 0.1.28, which
+    is what a Hub install can actually run."""
+    root = _make_tree(tmp_path / "be", "0.1.29")
+    _with_twin(root, "0.1.28", published="0.1.28")
+    ok, msgs = bump_mod.check_lockstep(root)
+    assert ok, msgs
+    assert any("0.1.28 is what is published" in m for m in msgs), msgs
+
+
+def test_check_FAILS_when_the_twin_serves_something_UNPUBLISHED(tmp_path):
+    """⛔⛔ THE MISTAKE THIS WAVE MADE AND CAUGHT. A twin ahead of the wheel hands
+    people a skill whose commands the published bridge cannot answer."""
+    root = _make_tree(tmp_path / "be", "0.1.29")
+    _with_twin(root, "0.1.29", published="0.1.28")
+    ok, msgs = bump_mod.check_lockstep(root)
+    assert not ok
+    assert any("hosted twin DRIFT" in m for m in msgs), msgs
+    assert any("AFTER the wheel is on PyPI" in m for m in msgs), msgs
+
+
+def test_check_FAILS_when_the_twin_is_BEHIND_the_published_wheel(tmp_path):
+    """The other direction, and it is not symmetrical in what it costs: a twin
+    behind the wheel makes `cmd_version` warn on every Hub chat at once."""
+    root = _make_tree(tmp_path / "be", "0.1.29")
+    _with_twin(root, "0.1.27", published="0.1.28")
+    ok, msgs = bump_mod.check_lockstep(root)
+    assert not ok
+    assert any("hosted twin DRIFT" in m for m in msgs), msgs
+
+
+def test_an_ABSENT_twin_is_reported_as_UNKNOWN_and_not_as_a_pass(tmp_path):
+    """⛔ THE DISTINCTION NOBODY DREW. The web checkout is genuinely absent on a
+    machine that only has this repo, and failing there would make the check
+    unusable where it is still worth running — but a silent pass is how an unknown
+    came to read as a verified fact. It says NOT CHECKED, in words."""
+    root = _make_tree(tmp_path / "be", "0.1.28")
+    ok, msgs = bump_mod.check_lockstep(root)
+    assert ok
+    assert any("NOT CHECKED" in m for m in msgs), msgs
+
+
+def test_a_twin_with_no_stamp_is_also_UNKNOWN_rather_than_agreement(tmp_path):
+    root = _make_tree(tmp_path / "be", "0.1.28")
+    twin = _with_twin(root, "0.1.28")
+    twin.write_text("#!/usr/bin/env python3\nprint('hi')\n", encoding="utf-8")
+    ok, msgs = bump_mod.check_lockstep(root)
+    assert ok
+    assert any("NO VERSION STAMP" in m for m in msgs), msgs
+
+
+def test_an_unrecorded_published_version_is_reported_rather_than_assumed(tmp_path):
+    root = _make_tree(tmp_path / "be", "0.1.28")
+    _with_twin(root, "0.1.28")
+    (root.parent / "dg-research" / "src" / "lib" / "agent-release-gates.ts").unlink()
+    ok, msgs = bump_mod.check_lockstep(root)
+    assert ok
+    assert any("NOT RECORDED" in m for m in msgs), msgs
+
+
+def test_a_BUMP_never_touches_the_twin(monkeypatch, tmp_path, capsys):
+    """⛔⛔ IT DID, UNCONDITIONALLY — and that is the mistake automated. A bump
+    happens before the publish by definition, so a bump that also synced would put
+    source nobody can install in front of every Hub user."""
+    root = _make_tree(tmp_path / "be", "0.1.28")
+    monkeypatch.setattr(bump_mod, "_REPO_ROOT", root)
+    monkeypatch.setattr(bump_mod, "bump", lambda v: ["(stubbed)"])
+    monkeypatch.setattr(bump_mod, "check_lockstep", lambda *a, **k: (True, ["ok"]))
+    monkeypatch.setattr(bump_mod, "check_be", lambda *a, **k: (True, ["ok"]))
+    called = []
+    monkeypatch.setattr(bump_mod, "sync_fe_twin",
+                        lambda *a, **k: called.append(1) or (True, "synced"))
+    assert bump_mod.main(["--agent", "0.1.29"]) == 0
+    assert called == [], "the bump synced the twin"
+    out = capsys.readouterr().out
+    assert "NOT synced by a bump" in out
+    assert "--sync-twin" in out
+
+
+def test_sync_twin_REFUSES_until_the_published_constant_has_moved(monkeypatch, tmp_path, capsys):
+    """⛔ THE ONE RECORD OF WHAT IS ON PyPI IS THAT CONSTANT. A sync before it moves
+    is the mistake itself, not a step towards it."""
+    root = _make_tree(tmp_path / "be", "0.1.29")
+    _with_twin(root, "0.1.28", published="0.1.28")
+    monkeypatch.setattr(bump_mod, "_REPO_ROOT", root)
+    called = []
+    monkeypatch.setattr(bump_mod, "sync_fe_twin",
+                        lambda *a, **k: called.append(1) or (True, "synced"))
+    assert bump_mod.main(["--sync-twin"]) == 2
+    assert called == []
+    assert "REFUSED" in capsys.readouterr().err
+
+
+def test_sync_twin_RUNS_once_the_published_constant_matches(monkeypatch, tmp_path, capsys):
+    """The complement, so the refusal cannot swallow the real release step."""
+    root = _make_tree(tmp_path / "be", "0.1.29")
+    _with_twin(root, "0.1.29", published="0.1.29")
+    monkeypatch.setattr(bump_mod, "_REPO_ROOT", root)
+    monkeypatch.setattr(bump_mod, "check_lockstep", lambda *a, **k: (True, ["ok"]))
+    called = []
+    monkeypatch.setattr(bump_mod, "sync_fe_twin",
+                        lambda *a, **k: called.append(1) or (True, "FE twin synced"))
+    assert bump_mod.main(["--sync-twin"]) == 0
+    assert called == [1]

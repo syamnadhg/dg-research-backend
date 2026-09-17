@@ -64,7 +64,7 @@ import requests
 
 from . import __version__, config, devicelogin, prefs, runview, selfupdate
 from .devicelogin import DeviceLoginError
-from .firestore_rest import FirestoreError, FirestoreRest
+from .firestore_rest import FirestoreError, FirestoreRest, pair_state_usable
 from .session import AccountSession, CustomTokenError, RevokedError
 
 log = logging.getLogger(__name__)
@@ -363,14 +363,73 @@ def _device_label(d: dict[str, Any]) -> str:
 _DEVICE_ONLINE_MS = 30_000
 
 
+# How far in the FUTURE a heartbeat may be dated and still count as fresh.
+#
+# ⛔⛔ WITHOUT THIS THE ONLINE CHECK NEVER DECAYS. The heartbeat is stamped with
+# the MACHINE's clock and aged against this host's, so a machine whose clock runs
+# ahead produces a NEGATIVE age — and `age < 30_000` is true of every negative
+# number there is. A computer switched off with a fast clock therefore read online
+# here for as long as the skew lasted, which is to say indefinitely, while the web
+# app called it offline. ⭐ The web has had the lopsided rule since wave 3
+# (`isHeartbeatAgeOnline`): the past side is the offline threshold, the future side
+# is five minutes, because a working machine 45 s fast must not read offline
+# everywhere. This is that rule, in this file's units.
+_HEARTBEAT_FUTURE_TOLERANCE_MS = 5 * 60_000
+
+
 def _device_is_online(d: dict[str, Any]) -> bool:
     """Whether a pair-confirmed device is heartbeating RIGHT NOW (recent
     lastHeartbeat), not merely paired-but-powered-off. `lastHeartbeat` is epoch
-    millis written by the BE heartbeat loop. Missing/zero/non-numeric → offline."""
+    millis written by the BE heartbeat loop. Missing/zero/non-numeric → offline.
+
+    ⛔ BOUNDED AT BOTH ENDS since wave 8 — see `_HEARTBEAT_FUTURE_TOLERANCE_MS`.
+    """
     hb = d.get("lastHeartbeat")
     if not isinstance(hb, (int, float)) or isinstance(hb, bool) or hb <= 0:
         return False
-    return (time.time() * 1000 - hb) < _DEVICE_ONLINE_MS
+    age = time.time() * 1000 - hb
+    return age < _DEVICE_ONLINE_MS and age > -_HEARTBEAT_FUTURE_TOLERANCE_MS
+
+
+# ⛔⛔ THE RENAME READS FROM HERE OR IT FAILS SILENTLY. `visibility` is becoming
+# `joinPolicy` — the same answer under the name groups give it, "who may join this
+# computer" — and `firestore.rules` has admitted the new key beside the old one
+# since wave 7 so that both are legal during the changeover. Every read site in
+# this agent compared to the literal `visibility` and fell through to PRIVATE, so
+# the first document written under the new name would have turned every public
+# computer private in chat and in the terminal, with no error anywhere and nothing
+# to notice it by.
+#
+# ⛔⛔ THE OLD NAME WINS WHILE IT IS THERE, AND THE FIRST BUILD HAD THIS BACKWARDS.
+# It preferred `joinPolicy` on the reasoning that its presence meant the document
+# had been migrated — but nothing writes it yet, and everything that ACTS on the
+# setting still reads `visibility`: the app's public list queries
+# `where("visibility", "==", "public")`, `isListable` tests `source.visibility`,
+# and this agent's own toggle writes `visibility`. A reader that preferred the new
+# key would report a state the product does not implement — and worse, on the
+# toggle: turn a machine private and the write lands on `visibility` while
+# `joinPolicy` still says public, so the very next read answers "already public"
+# and the door never closes. A reader must agree with the writers, not with the
+# migration's destination.
+#
+# ⭐ AND IT STILL SURVIVES THE RENAME. When the migration removes `visibility`,
+# `joinPolicy` is what is left and answers. That is the whole job: be right before,
+# during and after, without this agent ever writing the new name.
+#
+# ⛔ SEE `set_device_visibility` — writing the new name would take the old key off a
+# document that machines in the field are still reading.
+_DISCOVERY_KEYS = ("visibility", "joinPolicy")
+
+
+def _discovery_of(d: dict[str, Any]) -> str:
+    """Who may find this computer: "public" or "private", under either name."""
+    for key in _DISCOVERY_KEYS:
+        value = d.get(key)
+        if isinstance(value, str) and value:
+            return "public" if value == "public" else "private"
+    # ⛔ ABSENT IS PRIVATE. A machine paired before 2026-09-04 carries neither key,
+    # and the safe direction for a discovery setting is the one that hides.
+    return "private"
 
 
 # ⛔⛔ THE ONLY DEVICE FIELDS THAT MAY LEAVE THIS PROCESS. `list_devices` sends
@@ -401,6 +460,28 @@ _DEVICE_PUBLIC_KEYS = ("id", "name", "hostname", "machineName",
 # Nothing about ownership, nothing about the account's own selection, and no
 # hostname ladder, because none of that is the browsing account's business.
 _PUBLIC_DEVICE_KEYS = ("deviceId", "label", "osFamily", "online", "full")
+
+# ⛔⛔ THE REQUEST QUEUE'S TWO HALVES, AND THEY ARE DIFFERENT LISTS. This relay had
+# NO allow-list at all — it handed the web app's `incoming` and `outgoing` arrays
+# back byte for byte, which is precisely the shape `_devices_public` carried until
+# cross-verification measured it with a stubbed upstream and found a whole device
+# row coming through, plaintext pair code included. The fix landed four lines above
+# this one and stopped there; the queue is the same relay with the same trust in
+# its source.
+#
+# ⭐ THE WEB APP'S OWN PROJECTIONS ARE CORRECT TODAY — `/api/devices/access-request`
+# maps each half to exactly these fields. That is the reason to pin them rather
+# than an argument against it: the bridge should not be one upstream regression
+# away from publishing something, and a relay that trusts its source is how this
+# file's worst finding happened.
+#
+# ⛔ `requesterUid` IS ON THE OWNER'S HALF AND ONLY THERE. `/device/decide` takes
+# it as the argument naming who is being answered, and both clients read it. On
+# the OUTGOING half there is no requester but the caller, so carrying one would be
+# publishing a uid nobody needs.
+_INCOMING_REQUEST_KEYS = ("deviceId", "deviceLabel", "requesterUid",
+                          "requesterLabel", "createdAt")
+_OUTGOING_REQUEST_KEYS = ("deviceId", "deviceLabel", "createdAt")
 
 
 def _device_descriptor(d: dict[str, Any]) -> dict[str, Any]:
@@ -597,8 +678,10 @@ def _pick_device_from(devs: list[dict[str, Any]],
                      selected: str | None) -> tuple[str | None, str, bool]:
     """THE device-routing decision, as one pure function: ``(device_id, reason,
     stale)``. ``reason`` is "" when it resolved, else ``no_devices`` /
-    ``stale_selection`` / ``no_selection``. ``stale`` says the caller should drop a
-    saved selection that is no longer a member.
+    ``stale_selection`` / ``no_selection`` / ``selection_not_ready``. ``stale`` says
+    the caller should drop a saved selection that is no longer a member — and
+    ``selection_not_ready`` deliberately does NOT set it, because a machine
+    part-way through a Reset is still the person's machine and still their choice.
 
     ⭐⭐ WHY THIS EXISTS. There were TWO device pickers with DIFFERENT rungs, and
     the sign-in one was the poorer of them. The run path (`_resolve_device`) went
@@ -613,19 +696,35 @@ def _pick_device_from(devs: list[dict[str, Any]],
     to the caller (one of them answers over HTTP, the other from a worker thread),
     and a picker that writes prefs cannot be tested as a table.
     """
-    ids = {d.get("id") for d in devs}
-    if selected and selected in ids:
+    by_id = {d.get("id"): d for d in devs if d.get("id")}
+    if selected and selected in by_id:
+        # ⛔⛔ THE RUN GATE LIVES HERE, WHERE THE BROWSER KEEPS IT. A machine
+        # part-way through a Reset still heartbeats and still carries
+        # `pairConfirmedAt`, so every test the agent had passed while the app
+        # refused the identical machine — the person was told "Started" and
+        # nothing ran. ⛔ AND IT MUST NOT BE DONE BY FILTERING THE LIST: that makes
+        # their own selection stop being a member, so it reads STALE, is cleared,
+        # and the run silently goes to a DIFFERENT computer. Refusing the chosen
+        # machine by name is the only honest answer.
+        if not pair_state_usable(by_id[selected]):
+            return None, "selection_not_ready", False
         return selected, "", False
     stale = bool(selected)
     if not devs:
         return None, "no_devices", stale
-    if len(devs) == 1:
-        did = devs[0].get("id")
+    # ⛔ AUTO-PICK ONLY FROM MACHINES THAT CAN ACTUALLY RUN. Choosing one for
+    # somebody and then having it refuse is the same broken promise arrived at
+    # without them even naming it.
+    runnable = [d for d in devs if pair_state_usable(d)]
+    if not runnable:
+        return None, "selection_not_ready", stale
+    if len(runnable) == 1:
+        did = runnable[0].get("id")
         if did:
             return did, "", stale
         # A sole device with no id is not a target — fall through to the ask
         # rather than enqueueing to an empty string (the run path does the same).
-    online = [d for d in devs if _device_is_online(d) and d.get("id")]
+    online = [d for d in runnable if _device_is_online(d) and d.get("id")]
     if len(online) == 1:
         return online[0].get("id"), "", stale
     return None, ("stale_selection" if stale else "no_selection"), stale
@@ -1719,9 +1818,14 @@ def _fe_api_post(sess: "AccountSession", path: str, payload: dict,
 
 
 # The most of the agent's own log we will ever send. The file rotates at 1 MB with
-# 3 backups, so 4 MB can exist and only the ACTIVE file is ever read — but the cap
-# is stated here as well, because the route on the other side enforces its own and
-# a body it refuses is a wasted upload.
+# 3 backups, so about 4 MB can exist and — since wave 8 — ALL OF IT can be read:
+# the rotated copies go up with the active file. The cap is stated here as well as
+# on the receiving route, because a body that route refuses is a wasted upload.
+#
+# ⛔ THIS SENTENCE SAID "only the ACTIVE file is ever read" UNTIL WAVE 8 MADE IT
+# FALSE, and it had been re-anchored into a mutation harness in that state — so the
+# harness was pinning a contract the code no longer keeps. A comment that describes
+# what leaves a person's computer is not decoration.
 _AGENT_LOG_MAX_BYTES = 8 * 1024 * 1024
 
 
@@ -1796,30 +1900,114 @@ def _fe_api_post_bytes(sess: "AccountSession", path: str, blob: bytes,
     return _send(token)
 
 
-def _read_agent_log_tail(cap: int = _AGENT_LOG_MAX_BYTES) -> bytes:
-    """The last ``cap`` bytes of the agent's own log, or b"" if there is none.
+# How many rotated backups the handler keeps. ⛔ MIRRORS `logsetup._FILE_BACKUPS`
+# and is pinned against it: a handler configured for more backups than this reader
+# looks for would silently drop the oldest of them from every support bundle.
+_AGENT_LOG_BACKUPS = 3
 
-    ⛔ THE TAIL, NOT THE HEAD. If the file is over the cap the interesting part is
-    what happened most recently — the thing the person is reporting — so a head
-    read would send the least useful bytes and call it done.
 
-    ⛔ AND THE ACTIVE FILE ONLY, not the rotated backups. Sending four files under
-    one name is not something the receiving route or a reader would understand, and
-    the active file is where a just-reproduced problem is.
+def _agent_log_paths() -> "list[Path]":
+    """Every file the agent's log currently occupies, OLDEST FIRST.
+
+    `RotatingFileHandler` names its backups `bridge.log.1` … `bridge.log.N`, where
+    `.1` is the MOST RECENT rotation — so counting down from N and ending on the
+    active file puts them in the order they were written.
     """
-    path = config.log_path()
+    active = config.log_path()
+    older = [active.with_name(f"{active.name}.{i}")
+             for i in range(_AGENT_LOG_BACKUPS, 0, -1)]
+    return [*older, active]
+
+
+def _file_size(path: "Path") -> int:
+    """This file's size, or 0 when it is absent or unreadable."""
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _read_file_tail(path: "Path", cap: int) -> bytes:
+    """The last ``cap`` bytes of one file, starting at a whole line. b"" if absent."""
+    if cap <= 0:
+        return b""
     try:
         size = path.stat().st_size
         with path.open("rb") as fh:
             if size > cap:
                 fh.seek(size - cap)
                 # A mid-line start is inevitable when tailing; drop the partial
-                # first line so the upload begins at a real record.
+                # first line so what is read begins at a real record.
                 fh.readline()
             return fh.read()
-    except OSError as e:
-        log.info("agent log not readable (%s) — nothing to send", type(e).__name__)
+    except OSError:
         return b""
+
+
+def _read_agent_log_tail(cap: int = _AGENT_LOG_MAX_BYTES) -> bytes:
+    """The last ``cap`` bytes of the agent's own log, or b"" if there is none.
+
+    ⛔ THE TAIL, NOT THE HEAD. If the log is over the cap the interesting part is
+    what happened most recently — the thing the person is reporting — so a head
+    read would send the least useful bytes and call it done.
+
+    ⛔⛔ AND THE ROTATED BACKUPS COME TOO, SINCE WAVE 8. This used to read the
+    active file and nothing else, on the reasoning that "the active file is where a
+    just-reproduced problem is". That is true of a problem somebody can reproduce
+    on demand, and false of every other kind: the file rotates at 1 MB, a busy
+    agent turns that over in a session, and the whole reason a person is sending
+    this file is usually something that has ALREADY happened. Under the old shape
+    the evidence scrolled past the rotation and there was no way to ask for it.
+
+    ⭐ NEWEST FIRST AGAINST THE CAP, ASSEMBLED OLDEST FIRST. The budget is spent on
+    the most recent material — which is the tail rule again, one level up — and
+    what survives is then written in the order it happened, because a log read
+    backwards is not a log.
+
+    ⛔ A SEPARATOR ONLY WHERE THERE IS SOMETHING TO SEPARATE. One file is sent
+    byte-for-byte as it sits on disk: nothing added, nothing lost. The banners
+    appear when a second file contributes, which is the only time a reader needs to
+    know where one ends.
+    """
+    # ⛔⛔ WHICH FILES CONTRIBUTE IS DECIDED BEFORE THE BUDGET IS SPENT, and the
+    # order matters: charging a banner against the cap while still reading would
+    # shrink the single-file read by the width of a banner nobody is going to see.
+    # That is not theoretical — on a tight cap it is the difference between the
+    # last whole line and nothing at all, because a tail that lands mid-line drops
+    # what it landed in.
+    present = [p for p in _agent_log_paths() if _file_size(p) > 0]
+    if not present:
+        log.info("agent log not readable or empty — nothing to send")
+        return b""
+    if len(present) == 1:
+        return _read_file_tail(present[0], cap)
+
+    parts: "list[bytes]" = []
+    room = cap
+    for path in reversed(present):
+        if room <= 0:
+            break
+        banner = f"===== {path.name} =====\n".encode("utf-8")
+        chunk = _read_file_tail(path, room - len(banner))
+        if not chunk:
+            # ⛔⛔ AND THE LOOP STOPS, RATHER THAN TRYING OLDER FILES. Reaching here
+            # with room left means the banner did not fit, and every older file's
+            # banner is at least as wide — so carrying on spends the rest of the
+            # budget on nothing and returns b"", which the caller reports to the
+            # person as "your log was empty". Measured: two files and a cap of 8
+            # returned nothing where ONE file returned the last whole line.
+            if len(banner) >= room:
+                break
+            continue
+        parts.append(banner + chunk)
+        room -= len(banner) + len(chunk)
+    if not parts:
+        # ⛔ THE CAP WAS TOO TIGHT FOR ANY BANNER, so fall back to the newest file
+        # alone — which is what a one-file host would have sent, and is never worse
+        # than sending nothing and calling the log empty.
+        return _read_file_tail(present[-1], cap)
+    parts.reverse()
+    return b"".join(parts)
 
 
 # Phase → (display name, ordered link specs). A spec is (label, source) where
@@ -3462,6 +3650,13 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 # with no indication of which machine is actually on, so a user
                 # picks a sleeping one and their research silently never starts.
                 d["online"] = _device_is_online(d)
+                # ⛔⛔ RESOLVED HERE, ONCE, SO NO CLIENT HAS TO KNOW ABOUT THE
+                # RENAME. Both clients read `visibility` off the row this returns
+                # and neither talks to Firestore, so this single line is what
+                # carries all three surfaces through the changeover — and it is why
+                # the key set below is unchanged and `test_app_plane_unchanged`
+                # still holds. See `_discovery_of`.
+                d["visibility"] = _discovery_of(d)
                 for k in [k for k in d if k not in _DEVICE_PUBLIC_KEYS]:
                     del d[k]
             return devs
@@ -3680,11 +3875,18 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             status, body = _fe_api_get(sess, "/api/devices/access-request")
             if not self._fe_relay(status, body, "could not list your requests"):
                 return
+            # ⛔⛔ PRUNED HERE TOO, AND IT WAS NOT — see the key lists. Relayed
+            # whole, this was the last device-shaped emitter in this file with no
+            # allow-list of its own, four lines below the one that got one.
             rows = body.get("outgoing")
             incoming = body.get("incoming")
-            self._json(200, {"requests": rows if isinstance(rows, list) else [],
-                             "incoming": incoming if isinstance(incoming, list)
-                             else []})
+            rows = rows if isinstance(rows, list) else []
+            incoming = incoming if isinstance(incoming, list) else []
+            self._json(200, {
+                "requests": [{k: d[k] for k in _OUTGOING_REQUEST_KEYS if k in d}
+                             for d in rows if isinstance(d, dict)],
+                "incoming": [{k: d[k] for k in _INCOMING_REQUEST_KEYS if k in d}
+                             for d in incoming if isinstance(d, dict)]})
 
         def _device_ask(self) -> None:
             """Ask the owner of a public machine for access (`POST
@@ -4047,7 +4249,12 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                                      "change who can find it")
             if row is None:
                 return
-            current = "public" if row.get("visibility") == "public" else "private"
+            # ⛔⛔ THE NO-OP BRANCH IS THE WORST PLACE TO GET THIS WRONG. Read off
+            # the raw literal, a machine already public under the NEW name reads
+            # private here — so an owner turning it private is answered "it is
+            # already private" and the write never goes out, on the one surface
+            # whose entire job is to close that door.
+            current = _discovery_of(row)
             label = _public_label_of(row)
             if value == current:
                 self._json(200, {"ok": True, "changed": False,
@@ -4145,6 +4352,21 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 return None
             if device_id:
                 return device_id
+            # ⛔⛔ THE CHOSEN MACHINE CANNOT RUN RIGHT NOW, AND IT IS SAID RATHER
+            # THAN ROUTED AROUND. A computer part-way through a Reset heartbeats,
+            # carries `pairConfirmedAt`, and is refused by the app — so the agent
+            # used to announce "Started" on it. Sending the run to a different
+            # computer instead would be the same broken promise with a second
+            # surprise on top: a person's research running where they did not
+            # choose. The selection is kept, because the machine is still theirs.
+            if reason == "selection_not_ready":
+                self._json(409, {"reason": "selection_not_ready",
+                                 "error": "that computer is part-way through being "
+                                          "set up again, so it can't take a run yet "
+                                          "— finish pairing it, or pick another "
+                                          "computer",
+                                 "devices": [_device_descriptor(d) for d in devs]})
+                return None
             # Ask which. A stale selection keeps its own reason + message so the user
             # knows WHY they're being asked (their last computer isn't reachable); a
             # never-selected multi-device account gets the plain no_selection ask.
@@ -4409,6 +4631,28 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             sess, fs = acct
             body = self._read_json()
             code = str(body.get("code") or "").strip().upper()
+            # ⭐⭐ THE LOG TRAVELLING ALONE — wave 8, and the reason the whole
+            # feature is worth having. Everything this docstring says about
+            # ordering is about a log riding BESIDE a machine's bundle; the person
+            # who most needs to send this file has no bundle to ride, because the
+            # two commonest reasons to be reading an agent log are having no
+            # research computer yet and having one you cannot reach.
+            #
+            # ⛔⛔ ASKED FOR BY NAME, NEVER INFERRED FROM AN ABSENT CODE. A caller
+            # that lost its code would otherwise open a fresh bundle under a code
+            # nobody was told, which is a silent divergence rather than the refusal
+            # it is. Sending both is a contradiction and is refused rather than
+            # resolved — picking one of two things somebody asked for is how a log
+            # ends up somewhere they did not expect.
+            standalone = body.get("standalone") is True
+            if standalone and code:
+                self._json(400, {"reason": "contradictory_request",
+                                 "error": "a standalone agent log does not go "
+                                          "under an existing support code"})
+                return
+            if standalone:
+                self._agent_log_alone(sess)
+                return
             if not _SUPPORT_CODE_RE.match(code):
                 self._json(400, {"error": "that isn't a support code"})
                 return
@@ -4465,6 +4709,63 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             log.info("agent log sent for %s (%s bytes)", code, len(blob))
             self._json(200, {"ok": True, "sent": bool(reply.get("stored")),
                              "bytes": len(blob)})
+
+        def _agent_log_alone(self, sess) -> None:
+            """Send THIS host's own agent log with NO machine bundle behind it.
+
+            ⛔⛔ THIS IS THE ONE ROUTE A PERSON WITH NO RESEARCH COMPUTER CAN USE.
+            Every other way to hand support a file goes through a machine — the
+            bundle is zipped and uploaded by the machine, with the machine's own
+            token — so somebody who has not paired one, or cannot reach the one
+            they have, had no way to send the artifact that describes exactly that
+            problem. That is the state this exists for, so it asks for no device,
+            resolves no selection and reads no bundle row.
+
+            ⭐ AND IT COMES BACK WITH A SUPPORT CODE OF ITS OWN. Every other
+            send-logs hands the person a code to quote; this one did not, because
+            it had no row to take one from. The app mints it — see the standalone
+            branch in `/api/logs/agent-log`, which opens the row before the object
+            so the privacy button can always reach what it stored.
+
+            ⛔ NEVER FATAL, exactly like the attached path. There is nothing else
+            in flight to damage, and the person is told plainly which of the two
+            things happened: it went, or it did not.
+            """
+            blob = _read_agent_log_tail()
+            if not blob:
+                # ⭐ A fact, not a failure — and no code is minted for it, because a
+                # support code naming an empty folder is worse than this sentence.
+                self._json(200, {"ok": True, "sent": False, "reason": "empty",
+                                 "path": str(config.log_path())})
+                return
+            status, reply = _fe_api_post_bytes(
+                sess, "/api/logs/agent-log", blob, "text/plain; charset=utf-8",
+                # ⛔ NO support code and NO device id go with this — the receiving
+                # route refuses the combination, because it would be two different
+                # requests in one.
+                {"x-agent-log-mode": "standalone"},
+            )
+            if reply.get("reason") == "revoked":
+                self._json(401, {"error": "session revoked — run /login again"})
+                return
+            if status != 200:
+                log.warning("standalone agent-log upload failed: HTTP %s %s",
+                            status, reply.get("error", ""))
+                self._json(502, {"reason": "agent_log_not_sent",
+                                 "error": "your agent's own log could not be sent "
+                                          "— nothing else was affected"})
+                return
+            code = str(reply.get("code") or "")
+            if not reply.get("stored") or not code:
+                # ⛔ A 200 THAT STORED NOTHING IS NOT A SEND, and answering as
+                # though it were would hand somebody a code that names nothing —
+                # or no code at all, under a sentence claiming their log went.
+                self._json(200, {"ok": True, "sent": False, "reason": "empty",
+                                 "path": str(config.log_path())})
+                return
+            log.info("agent log sent alone as %s (%s bytes)", code, len(blob))
+            self._json(200, {"ok": True, "sent": True, "standalone": True,
+                             "code": code, "bytes": len(blob)})
 
         def _research(self) -> None:
             body = self._read_json()

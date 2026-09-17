@@ -95,8 +95,15 @@ def test_skill_within_sanity_bound():
     # asserted approving and publishing were web-app-only also had to be
     # rewritten rather than deleted. The bound still catches unbounded growth;
     # it is not a trim mandate and not a target.
+    # ⛔ RAISED 525 → 545 IN WAVE 8, FOR NINE LINES WITH A FACT IN EACH. The agent
+    # log can now be sent with no research computer at all, under a support code of
+    # its own — a route the document previously told the model was impossible, in a
+    # sentence it had to lose. Replacing a refusal with the two spellings of the
+    # request, who it is for, and the reminder that it is still two steps is longer
+    # than the refusal was. The bound still catches unbounded growth; it is not a
+    # trim mandate and not a target.
     n = len((_SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").splitlines())
-    assert n < 525, f"SKILL.md grew to {n} lines — unexpectedly large"
+    assert n < 545, f"SKILL.md grew to {n} lines — unexpectedly large"
 
 
 def test_signin_handoff_continues_from_the_announce_topic():

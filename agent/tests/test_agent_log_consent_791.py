@@ -91,7 +91,21 @@ def _plan(monkeypatch, **kw):
 def test_the_terminal_says_whose_records_are_in_it(monkeypatch):
     """⛔⛔ THE FACT THE MACHINE'S LINE HAS AND THIS ONE DID NOT."""
     out = _plan(monkeypatch, agent_log=True)
-    assert "everyone who signed in through this agent since that file last rotated" in out
+    assert "everyone who signed in through this agent" in out
+
+
+def test_the_terminal_says_the_rotated_copies_go_too(monkeypatch):
+    """⛔⛔ RE-AIMED IN WAVE 8, BECAUSE THE MATERIAL CHANGED UNDER THE SENTENCE.
+    This line used to read "since that file last rotated", which was true while
+    the uploader sent the ACTIVE file and only the active file. It sends the
+    rotated backups now — a problem that scrolled past a rotation was otherwise
+    unsendable — so the old wording understates what leaves, on the one screen
+    whose whole job is to be true about that. It asserts MORE than it did: the
+    reach is still claimed, and now the reason for it is too."""
+    out = _plan(monkeypatch, agent_log=True)
+    assert "rotated copies go too" in out
+    assert "not only the newest file" in out
+    assert "reaches back further" in out
 
 
 def test_the_terminal_says_nothing_checks_who_owns_that_host(monkeypatch):
@@ -187,7 +201,16 @@ def _chat_args(**kw):
 def test_chat_says_whose_records_are_in_it(chat, capsys):
     sr.cmd_send_logs(_chat_args(agent_log=True))
     out = capsys.readouterr().out
-    assert "everyone who signed in through this agent since that file last rotated" in out
+    assert "everyone who signed in through this agent" in out
+
+
+def test_chat_says_the_rotated_copies_go_too(chat, capsys):
+    """The chat twin of the terminal's — see the note there."""
+    sr.cmd_send_logs(_chat_args(agent_log=True))
+    out = capsys.readouterr().out
+    assert "rotated copies go too" in out
+    assert "not only the newest file" in out
+    assert "reaches back further" in out
 
 
 def test_chat_says_nothing_checks_who_owns_that_host(chat, capsys):
@@ -229,7 +252,8 @@ def test_the_two_clients_state_the_same_three_facts(monkeypatch, chat, capsys):
     sr.cmd_send_logs(_chat_args(agent_log=True))
     chat_out = capsys.readouterr().out
     term_out = _plan(monkeypatch, agent_log=True)
-    for claim in ("signed in through this agent", "since that file last rotated",
+    for claim in ("signed in through this agent", "rotated copies go too",
+                  "not only the newest file", "reaches back further",
                   "no owner to ask", "nothing checks",
                   "masked form of your email address", "when a lookup fails",
                   "ids of the computers and runs"):

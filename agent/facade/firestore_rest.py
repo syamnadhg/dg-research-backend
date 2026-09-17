@@ -98,13 +98,55 @@ def doc_id(name: str) -> str:
     return name.rsplit("/", 1)[-1]
 
 
+def pair_state_usable(d: dict[str, Any]) -> bool:
+    """Would the web app's submit gate accept this machine? Mirrors
+    ``isDeviceEligible`` (``device-order.ts``): ``!pairState || pairState ===
+    "active"``.
+
+    ⛔⛔ THE AGENT HAD NO EQUIVALENT AND ANNOUNCED RUNS IT COULD NOT START. A
+    machine part-way through a Reset carries ``pairState: "awaiting-re-pair"`` (or
+    ``"awaiting-initial-claim"``) while still heartbeating and still holding a
+    ``pairConfirmedAt`` — so it passed every test the agent had, was listed, was
+    chosen as the run target, and the person was told "Started" while the browser
+    refused the identical machine on the identical account. No clock skew and no
+    outage required; a Reset is enough.
+
+    ⛔ ABSENT IS USABLE, and that is deliberate rather than lenient. A pre-cutover
+    record under ``users/{uid}/devices`` carries no ``pairState`` at all, and the
+    web app admits those for exactly that reason. A stricter rule here would make
+    the agent refuse machines the app runs on.
+
+    ⛔⛔ AND IT IS A RUN GATE, NOT A LIST FILTER. It is called from
+    ``_pick_device_from``, never from ``is_pair_confirmed`` — a machine that cannot
+    run right now is still the person's machine, still theirs to see, and still the
+    one they chose. Filtering it out of the list makes their selection read as
+    stale and sends the run somewhere else in silence.
+    """
+    state = d.get("pairState")
+    return state is None or state == "active"
+
+
 def is_pair_confirmed(d: dict[str, Any]) -> bool:
     """Whether a device doc is a usable, pair-confirmed member — mirrors the web
-    app's ``isPairConfirmed`` (firestore.ts). A device must be confirmed paired
-    (``pairConfirmedAt`` is True) or currently online (a positive ``lastHeartbeat``).
+    app's ``isPairConfirmed`` (firestore.ts) AND its submit gate. A device must be
+    confirmed paired (``pairConfirmedAt`` is True) or currently online (a positive
+    ``lastHeartbeat``), and it must be one the app would let somebody run on.
     The owner-unlink the app performs DELETES ``pairConfirmedAt`` (and ownerUid /
     sharedWith) but leaves the device doc, so without this gate the agent would keep
     showing — and enqueueing research to — a device the app already considers gone.
+
+    ⛔⛔ AND ``pairState`` IS DELIBERATELY NOT CHECKED HERE — wave 8 put it in and
+    cross-verification took it back out, because the browser runs the two checks in
+    two different PLACES and the difference is the whole point. ``isPairConfirmed``
+    draws the LIST; ``isDeviceEligible`` accepts a SUBMIT. Folding the second into
+    the first drops a machine mid-Reset out of ``list_devices`` entirely — so the
+    person's saved selection stops being a member, reads as STALE, is cleared, and
+    the run is re-routed to a DIFFERENT computer without a word. That is worse than
+    the defect it was meant to fix: the old bug announced "Started" on a machine
+    that would not run; the fix ran it somewhere nobody chose.
+
+    ⭐ The eligibility half lives at the run gate, where the browser keeps it —
+    ``_pick_device_from`` in bridge.py. See ``pair_state_usable``.
     """
     if d.get("pairConfirmedAt") is True:
         return True
@@ -595,6 +637,14 @@ class FirestoreRest:
         exist is an upsert in this API, but this collection is `allow create: if
         false` for every client, so a bad id is refused rather than created.
         That is why there is no existence precondition on the request.
+
+        ⛔⛔ IT WRITES `visibility` AND ONLY `visibility`, THROUGH THE RENAME. The
+        rules admit `joinPolicy` beside it since wave 7, and this agent READS both
+        (`_discovery_of` in bridge.py) — but writing the new name would take the
+        old one off a document while machines in the field are still reading it,
+        and the fleet's own reading is what decides when the old key may come off.
+        The reader is the compatible half; the writer is not, and it stays put
+        until a fleet reading says otherwise, not until a wave number says so.
         """
         if value not in ("public", "private"):
             raise ValueError(

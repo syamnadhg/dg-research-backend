@@ -107,8 +107,53 @@ def read_versions(root: Path = _REPO_ROOT) -> dict[str, list[str]]:
     return found
 
 
+def _published_version(root: Path = _REPO_ROOT) -> str | None:
+    """The version the web app records as ACTUALLY ON PyPI, or None.
+
+    ⛔⛔ THE TWIN TRACKS THE WHEEL, NOT THIS REPO, and conflating the two is how
+    wave 8 nearly shipped a hosted skill nobody could run. The committed copy under
+    `public/.well-known/skills/` is what the Hermes Skills Hub hands people, and it
+    pairs with the wheel `pipx run superresearch-agent connect` installs: a hosted
+    `sr.py` from newer source calls bridge routes the published bridge does not
+    serve. So the comparison is against `AGENT_WHEEL_PUBLISHED` in the web repo —
+    a constant that moves only when the wheel is really on PyPI — and NOT against
+    the version this repo happens to be building.
+    """
+    web = _web_root(root)
+    gates = web / "src" / "lib" / "agent-release-gates.ts"
+    if not gates.exists():
+        return None
+    text, _ = _read(gates)
+    m = re.search(r'AGENT_WHEEL_PUBLISHED\s*=\s*"([^"]+)"', text)
+    return m.group(1) if m else None
+
+
+def _twin_build(root: Path = _REPO_ROOT) -> tuple[str | None, str]:
+    """(the hosted twin's `_SKILL_BUILD`, a message). None when it cannot be read.
+
+    ⛔⛔ THE TWIN WAS OUTSIDE EVERY CHECK, AND THAT IS HOW IT WENT SIX WEEKS STALE
+    WHILE WEARING A CURRENT STAMP. `check_lockstep` verified the three declarations
+    in THIS repo and stopped there; the file the product actually serves to the
+    Skills Hub is in the other one, so `--check` passed on a tree whose published
+    skill had none of the public-computer work in it. Nothing looked wrong
+    anywhere: the probe in `cmd_version` compares this stamp against the live
+    bridge, so a stale copy carrying the package's own version is precisely the
+    state in which it stays silent.
+    """
+    web = _web_root(root)
+    twin = web / "public" / ".well-known" / "skills" / "sr" / "scripts" / "sr.py"
+    if not twin.exists():
+        return None, f"  {'hosted twin':<18} NOT CHECKED — no {twin}"
+    text, _ = _read(twin)
+    m = re.search(r'^_SKILL_BUILD\s*=\s*"([^"]+)"', text, re.M)
+    if not m:
+        return None, f"  {'hosted twin':<18} NO VERSION STAMP in {twin}"
+    return m.group(1), f"  {'hosted twin':<18} {m.group(1)}"
+
+
 def check_lockstep(root: Path = _REPO_ROOT) -> tuple[bool, list[str]]:
-    """(ok, messages). Verifies every declaration carries the SAME version."""
+    """(ok, messages). Verifies every declaration carries the SAME version —
+    INCLUDING the hosted twin the web app serves, when that checkout is present."""
     found = read_versions(root)
     msgs: list[str] = []
     missing = [lbl for lbl, vs in found.items() if not vs]
@@ -117,9 +162,39 @@ def check_lockstep(root: Path = _REPO_ROOT) -> tuple[bool, list[str]]:
     everything = {v for vs in found.values() for v in vs}
     for label, vs in found.items():
         msgs.append(f"  {label:<18} {', '.join(vs)}")
+    twin, twin_msg = _twin_build(root)
+    msgs.append(twin_msg)
     if len(everything) != 1:
         return False, ["agent version DRIFT — these must all match:", *msgs]
-    return True, [f"agent version lockstep OK: {everything.pop()}", *msgs]
+    mine = everything.pop()
+    # ⛔ A TWIN THAT CANNOT BE READ IS REPORTED AND NOT FAILED. The web checkout is
+    # genuinely absent on a machine that only has this repo, and failing there
+    # would make the check unusable where it is still worth running. The line above
+    # says NOT CHECKED in words, which is the difference between an unknown and a
+    # pass — the distinction this whole paragraph exists because nobody drew.
+    if twin is not None:
+        published = _published_version(root)
+        if published is None:
+            msgs.append(f"  {'published wheel':<18} NOT RECORDED — no "
+                        "AGENT_WHEEL_PUBLISHED in the web repo")
+        else:
+            msgs.append(f"  {'published wheel':<18} {published}")
+            # ⛔⛔ THE TWIN MUST MATCH THE WHEEL PEOPLE CAN INSTALL. Either
+            # direction of drift breaks somebody's install: a twin BEHIND the
+            # wheel warns on every Hub chat, and a twin AHEAD of it hands people a
+            # skill whose commands the published bridge cannot answer.
+            if twin != published:
+                return False, [
+                    f"hosted twin DRIFT — it serves {twin}, the published wheel is "
+                    f"{published}. Sync the twin only AFTER the wheel is on PyPI.",
+                    *msgs]
+            # ⭐ AND THIS REPO BEING AHEAD IS THE NORMAL STATE BETWEEN RELEASES,
+            # not a fault. Said out loud so nobody reads the agreement above as
+            # "everything is released".
+            if mine != published:
+                msgs.append(f"  (this repo is building {mine}; {published} is what "
+                            "is published, so the twin is correct as it stands)")
+    return True, [f"agent version lockstep OK: {mine}", *msgs]
 
 
 # ── BE (superresearch) — root pyproject version + release-dep guard snapshot ───
@@ -311,7 +386,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--check", action="store_true",
                     help="verify agent lockstep AND the BE release-dep guard; exit 1 on drift")
     ap.add_argument("--no-sync", action="store_true",
-                    help="skip the FE hosted-twin sync (agent bump only)")
+                    help="(retained, now a no-op: a bump never syncs the twin)")
+    ap.add_argument("--sync-twin", action="store_true",
+                    help="refresh the hosted twin from this tree — run ONLY after "
+                         "the wheel is published and AGENT_WHEEL_PUBLISHED has moved")
     args = ap.parse_args(argv)
 
     # Windows consoles default to cp1252, which cannot encode check/warn glyphs
@@ -330,6 +408,41 @@ def main(argv: list[str] | None = None) -> int:
         print("\n".join([*a_msgs, "", *b_msgs]))
         return 0 if (a_ok and b_ok) else 1
 
+    if args.sync_twin:
+        # ⛔ REFUSED UNLESS THE WEB REPO ALREADY SAYS THIS VERSION IS PUBLISHED.
+        # The whole hazard is syncing source that is not on PyPI, and the one
+        # record of what IS on PyPI is that constant. A sync that runs before it
+        # moves is the mistake, not a step towards it.
+        # ⛔⛔ THE ROOT IS PASSED, NOT LEFT TO THE DEFAULT. `def f(root=_REPO_ROOT)`
+        # binds the path ONCE at import, so a test that monkeypatches the module
+        # global changes nothing and silently measures the REAL repository —
+        # passing, or failing, for reasons that have nothing to do with the tree it
+        # built. Read here, the global resolves at call time and the fixture works.
+        mine = {v for vs in read_versions(_REPO_ROOT).values() for v in vs}
+        published = _published_version(_REPO_ROOT)
+        if len(mine) != 1:
+            print("ERROR: this repo's own versions disagree — fix that first.",
+                  file=sys.stderr)
+            return 2
+        building = mine.pop()
+        if published is None:
+            print("ERROR: the web repo records no AGENT_WHEEL_PUBLISHED, so there "
+                  "is nothing to check this against.", file=sys.stderr)
+            return 2
+        if published != building:
+            print(f"REFUSED: this repo is building {building} and the web repo says "
+                  f"{published} is published.\n"
+                  f"  Publish {building} first, then move AGENT_WHEEL_PUBLISHED to "
+                  f"it, then re-run.", file=sys.stderr)
+            return 2
+        ok, msg = sync_fe_twin()
+        print(("OK:   " if ok else "ERROR: ") + msg)
+        if not ok:
+            return 1
+        ok2, msgs2 = check_lockstep(_REPO_ROOT)
+        print("\n".join(msgs2))
+        return 0 if ok2 else 1
+
     if not args.agent and not args.be:
         ap.error("give --agent VERSION and/or --be VERSION, or --check")
 
@@ -347,9 +460,28 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         print(f"agent version -> {args.agent}")
         print("\n".join(notes))
-        if not args.no_sync:
-            ok, msg = sync_fe_twin()
-            print(("OK:   " if ok else "WARN: ") + msg)
+        # ⛔⛔ A BUMP NO LONGER SYNCS THE TWIN, AND THAT IS THE CORRECTION. It did,
+        # unconditionally — and the twin tracks the PUBLISHED wheel, not this repo,
+        # so a bump that also synced would hand the Hermes Skills Hub a skill built
+        # from source nobody can install yet. Every command in it would call bridge
+        # routes the published bridge does not serve.
+        #
+        # ⭐⭐ AND ITS BROKENNESS WAS HIDING THAT. The FE sync script's default
+        # source named a checkout layout nobody has, so the sync failed at every
+        # release and the twin stayed correct BY ACCIDENT. Wave 8 repaired the path
+        # and the accident stopped protecting us; fixing one without the other would
+        # have shipped unpublished code to the Hub at the next bump.
+        #
+        # ⭐ THE ORDER AT A RELEASE, and `--sync-twin` is the step that belongs
+        # after the publish, never before it:
+        #     1. bump here          2. build + publish the wheel to PyPI
+        #     3. move AGENT_WHEEL_PUBLISHED in the web repo
+        #     4. tools/bump_version.py --sync-twin      5. deploy the web app
+        print("NOTE: the hosted twin is NOT synced by a bump — it tracks the "
+              "PUBLISHED wheel.")
+        print("      After publishing, move AGENT_WHEEL_PUBLISHED in the web repo, "
+              "then run:")
+        print("          python tools/bump_version.py --sync-twin")
         ok, msgs = check_lockstep()
         print("\n".join(msgs))
         rc = rc or (0 if ok else 1)

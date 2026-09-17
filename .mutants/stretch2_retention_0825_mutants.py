@@ -80,20 +80,20 @@ MUTANTS = [
      "⚠ the terminal plan names the wrong clock — the rule counts from the "
      "upload, so \"after 30 days\" describes the row's stamp, which does no "
      "deleting and is written before a byte moves",
-     [('    print("It is deleted automatically 30 days after it arrives.")',
-       '    print("It is deleted automatically after 30 days.")')]),
+     [('    print("It is deleted automatically 30 days after it arrives.")\n    print("Only Super Research support can read them.")',
+       '    print("It is deleted automatically after 30 days.")\n    print("Only Super Research support can read them.")')]),
     ("B2", CLI, "over",
      "⛔⛔ the promise is widened from the FILES to the RECORD. The rule deletes "
      "the object; the index row naming it is not covered by it and its own TTL "
      "was measured undeployed, so a receipt outlives the bundle",
-     [('    print("It is deleted automatically 30 days after it arrives.")',
-       '    print("It is deleted automatically 30 days after it arrives, and we '
-       'keep no record of it.")')]),
+     [('    print("It is deleted automatically 30 days after it arrives.")\n    print("Only Super Research support can read them.")',
+       '    print("It is deleted automatically 30 days after it arrives, and we keep no record of it.")\n    print("Only Super Research support can read them.")')]),
     ("B3", CLI, "under",
      "the terminal plan says nothing about how long the logs are kept, so the "
      "one screen whose whole job is to be true about what leaves a computer is "
      "silent on what happens to it afterwards",
-     [('    print("It is deleted automatically 30 days after it arrives.")\n', '')]),
+     [('    print("It is deleted automatically 30 days after it arrives.")\n    print("Only Super Research support can read them.")',
+       '    print("Only Super Research support can read them.")')]),
     ("B4", SR, "under",
      "⛔⛔ THE ONE THAT WOULD HAVE SHIPPED. Only the CHAT client goes silent, so "
      "three programs promise a retention and the fourth does not — and the "

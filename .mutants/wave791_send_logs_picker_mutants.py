@@ -135,18 +135,21 @@ MUTANTS = [
     ("P7", CLI, "under",
      "⛔⛔ THE AGENT-LOG-ONLY REFUSAL GOES, so somebody who picked exactly one "
      "thing is told there is nothing to send",
-     [('        if agent_log:\n'
-       '            print(f"{_NO} The agent\'s own log can only go up beside a bundle from "\n'
-       '                  "that computer,")\n', '        if False:\n')]),
-    ("P8", CLI, "over",
-     "⛔⛔ IT EXPLAINS AND THEN CARRIES ON — the sentence is printed and the "
-     "request goes anyway, so the bridge is asked to build an empty archive after "
-     "a person has been told it cannot be done",
-     [('                print("    Or, if the trouble is reaching that computer at all, "\n'
-       '                      "add --machine.")\n'
-       '            return 1\n',
-       '                print("    Or, if the trouble is reaching that computer at all, "\n'
-       '                      "add --machine.")\n')]),
+     [('        if agent_log:\n            # ⛔ THE MACHINE OFFER SURVIVES AND IS STILL OWNER-ONLY. `--machine` is\n            # refused for a non-owner a few lines above, so offering it to one\n            # sends them round the circle an earlier wave closed here.\n            return _send_agent_log_alone(args, offer_machine=owned, name=name)\n',
+       '        if False:\n            pass\n')]),
+    # ⛔⛔ P8 RETIRED 2026-09-16 (wave 8) — THE DEFECT IT MUTATED NO LONGER HAS A
+    # PLACE TO LIVE, and it is retired rather than re-pointed because nothing in
+    # the new shape expresses the same thing. It mutated the agent-log-only
+    # REFUSAL: the branch printed "the agent's own log can only go up beside a
+    # bundle", and P8 deleted its `return 1` so the sentence was printed and the
+    # request went out anyway — the bridge asked to build an empty archive after a
+    # person had been told it could not be done.
+    #
+    # ⭐ THAT REFUSAL IS NOW A SEND. The log has a route and a support code of its
+    # own, so the branch does not explain-and-continue; it returns the send. There
+    # is no "prints and carries on" left here to break, and inventing a mutant
+    # somewhere else to keep the id alive would be a pin that measures a different
+    # thing under an old name. P7 and X6 cover what this branch still owes.
     ("P9", CLI, "under",
      "⛔ THE `0` ROW IS NEVER PRINTED. The flag still works for anybody who knows "
      "it exists and is offered to nobody — 2026-08-26 to 2026-09-06, restored",
@@ -245,14 +248,8 @@ MUTANTS = [
     ("C8", SR, "under",
      "⛔ CHAT'S AGENT-LOG-ONLY REFUSAL GOES, so the two clients disagree about "
      "the one thing they were just made to agree on",
-     [('        if agent_log:\n'
-       '            return _emit(body, args.json, [\n'
-       '                "The agent’s own log can only go up beside a bundle from that "\n',
-       '        if False:\n'
-       '            return _emit(body, args.json, [\n'
-       '                "The agent’s own log can only go up beside a bundle from that "\n')]),
-
-    # ═══════════ N — the natural-language router ════════════════════════════
+     [('        if agent_log:\n            # ⛔ THE MACHINE OFFER SURVIVES, AND STILL ONLY FOR AN OWNER — a\n            # non-owner is refused `--machine` a few lines above, so offering it to\n            # them would send them round the circle a previous wave closed.\n            return _send_agent_log_alone(args, offer_machine=owned, name=name)\n',
+       '        if False:\n            pass\n')]),
     ("N1", SR, "under",
      "⛔⛔ THE LIVE DEFECT RESTORED. `--machine` leaves the allowlist, `cmd_do` "
      "reads it as free text and pushes it behind `--`, `send-logs` has no "
@@ -364,9 +361,8 @@ MUTANTS = [
      "⛔⛔ THE FORCED MINT IS UNWRAPPED. The one caller makes this call OUTSIDE "
      "its `except RevokedError` and `do_POST` has no blanket handler, so a dead "
      "refresh token closes the connection instead of answering",
-     [("    token, why = _mint_bearer(sess, force=True)\n    if token is None:\n        return 0, why\n"
-       "    return _send(token)\n\n\ndef _read_agent_log_tail",
-       "    return _send(sess.id_token(force=True))\n\n\ndef _read_agent_log_tail")]),
+     [("    token, why = _mint_bearer(sess, force=True)\n    if token is None:\n        return 0, why\n    return _send(token)\n\n\n# The most of the agent's own log",
+       "    return _send(sess.id_token(force=True))\n\n\n# The most of the agent's own log")]),
     ("R5", BRIDGE, "over",
      "⛔ THE FIRST MINT IS UNWRAPPED — the hole that existed before any retry did, "
      "and the reason both are wrapped rather than only the new one",
@@ -379,7 +375,8 @@ MUTANTS = [
      "⛔ A DEAD SESSION IS REPORTED AS A GENERIC UPLOAD FAILURE, naming no cause "
      "and offering no action, on the route whose retry has just proved the "
      "session is the problem",
-     [('            if reply.get("reason") == "revoked":\n', '            if False:\n')]),
+     [('            if reply.get("reason") == "revoked":\n                # ⛔ THE SAME SENTENCE',
+       '            if False:\n                # ⛔ THE SAME SENTENCE')]),
     ("R7", BRIDGE, "over",
      "⛔⛔ THE REVOKED BRANCH MOVES BEHIND THE GENERIC ONE, where it can never be "
      "reached — a correct sentence, unreachable, which is how it reads in review",
@@ -393,15 +390,13 @@ MUTANTS = [
      "⛔⛔ THE TERMINAL STOPS SAYING WHOSE RECORDS ARE IN IT. The machine-log line "
      "four sentences above names the people its material covers; this one names "
      "nobody, on the surface where the sharing is LESS obvious, not more",
-     [('        print("It covers everyone who signed in through this agent since that "\n'
-       '              "file last rotated, not only you — there is no owner to ask on a "\n'
-       '              "machine like this, so nothing checks.")\n', '')]),
+     [('        "It covers everyone who signed in through this agent, not only you — "\n        "there is no owner to ask on a machine like this, so nothing checks.",\n',
+       '')]),
     ("K2", CLI, "under",
      "⛔ THE FIELDS GO, leaving \"not research content\" — a category, and the "
      "half of it that is a negative",
-     [('        print("Among what is in it: a masked form of your email address, the ids "\n'
-       '              "of the computers and runs this agent has touched, file paths on "\n'
-       '              "this machine, and — when a lookup fails — your account id.")\n', '')]),
+     [('        "Among what is in it: a masked form of your email address, the ids of the "\n        "computers and runs this agent has touched, file paths on this machine, "\n        "and — when a lookup fails — your account id.",\n',
+       '')]),
     ("K3", CLI, "over",
      "⛔⛔ THE CONSENT LINES MOVE OUT OF THE BRANCH, so a plan that is NOT sending "
      "the file describes what is in it — telling somebody their address is going "
@@ -413,15 +408,12 @@ MUTANTS = [
     ("K4", SR, "under",
      "chat stops saying whose records are in it, so the two clients answer the "
      "same question differently",
-     [('            lines.append("It covers everyone who signed in through this agent "\n'
-       '                         "since that file last rotated, not only you — there’s no "\n'
-       '                         "owner to ask on a machine like that, so nothing checks.")\n', '')]),
+     [('        "It covers everyone who signed in through this agent, not only you — "\n        "there’s no owner to ask on a machine like that, so nothing checks.",\n',
+       '')]),
     ("K5", SR, "under",
      "chat stops naming the fields",
-     [('            lines.append("Among what’s in it: a masked form of your email "\n'
-       '                         "address, the ids of the computers and runs this agent "\n'
-       '                         "has touched, file paths on that machine, and — when a "\n'
-       '                         "lookup fails — your account id.")\n', '')]),
+     [('        "Among what’s in it: a masked form of your email address, the ids of the "\n        "computers and runs this agent has touched, file paths on that machine, "\n        "and — when a lookup fails — your account id.",\n',
+       '')]),
     ("K6", SKILL, "under",
      "⛔ THE DOCUMENT STOPS TELLING THE MODEL THE NUMBERS CAN BE PASSED BACK, so "
      "the picker is reachable only by a person typing at a terminal — the gap "
@@ -475,8 +467,8 @@ MUTANTS = [
      "⛔ THE TERMINAL'S SECOND STEP GOES AGAIN, so `--status <CODE> --agent-log` "
      "parses, uploads nothing and says nothing — and both routes out of an "
      "unfinished wait dead-end, as they did before",
-     [('            if agent_log:\n                _send_agent_log(code)\n'
-       '            return 0\n', '            return 0\n')]),
+     [('            if agent_log:\n                # ⛔⛔ THE PLAN WAS PRINTED BY A DIFFERENT COMMAND, AND NOTHING\n                # CHECKED THAT IT EVER WAS. This is the second step, reached with\n                # a support code and a flag — so an assistant that never showed\n                # the person what is in this file can upload it from here, and the\n                # only thing standing in the way is a directive it is asked to\n                # follow. The facts are cheap; they travel with the flag instead.\n                for _fact in _agent_log_fact_lines():\n                    print(_fact)\n                _send_agent_log(code)\n            return 0\n',
+       '            return 0\n')]),
     ("X5", CLI, "over",
      "⛔⛔ THE LOGGER GOES BACK TO `__name__`, which under the fleet's own "
      "`python -m facade.cli serve` is \"__main__\" — not a child of the logger the "
@@ -486,12 +478,8 @@ MUTANTS = [
     ("X6", CLI, "under",
      "⛔ THE REFUSAL SENDS A NON-OWNER TO `--machine` AGAIN, which is refused four "
      "lines higher — a sharer with no listed runs goes round in a circle",
-     [('            if owned:\n'
-       '                print("    Or, if the trouble is reaching that computer at all, "\n'
-       '                      "add --machine.")\n',
-       '            if True:\n'
-       '                print("    Or, if the trouble is reaching that computer at all, "\n'
-       '                      "add --machine.")\n')]),
+     [('        if agent_log:\n            # ⛔ THE MACHINE OFFER SURVIVES AND IS STILL OWNER-ONLY. `--machine` is\n            # refused for a non-owner a few lines above, so offering it to one\n            # sends them round the circle an earlier wave closed here.\n            return _send_agent_log_alone(args, offer_machine=owned, name=name)\n',
+       '        if agent_log:\n            # ⛔ THE MACHINE OFFER SURVIVES AND IS STILL OWNER-ONLY. `--machine` is\n            # refused for a non-owner a few lines above, so offering it to one\n            # sends them round the circle an earlier wave closed here.\n            return _send_agent_log_alone(args, offer_machine=True, name=name)\n')]),
     ("X7", CLI, "over",
      "⛔ `--no-wait` DESCRIBES A FILE IT THEN DECLINES TO SEND, and only says so "
      "after the person has already agreed",

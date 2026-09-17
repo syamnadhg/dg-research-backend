@@ -33,11 +33,24 @@ def _load_sr():
 
 sr = _load_sr()
 
-ROW = {"deviceId": "dev-a1", "label": "Studio PC", "osFamily": "macos",
+# ⛔⛔ THE SHAPE THE APP ACTUALLY MINTS, AND NOT ONE OF THESE USED TO BE.
+# `/api/devices/initiate-pair` writes `randomUUID().replace(/-/g, "")` — thirty-two
+# lowercase hex characters, no hyphen and no underscore — while every fixture here
+# carried a hyphen. That is not cosmetic: the id predicate this file tests REQUIRED
+# a separator, so the tests asserting that the direct-id route is reachable were
+# green on an id shape the app has never produced, about a branch no real id could
+# enter. A pin on a value the system cannot mint measures nothing. See
+# `_looks_like_a_device_id`.
+ID_A = "a1b2c3d4e5f6071829304a5b6c7d8e9f"
+ID_B = "b2c3d4e5f6071829304a5b6c7d8e9f01"
+ID_C = "c3d4e5f6071829304a5b6c7d8e9f0112"
+ID_F = "f0112233445566778899aabbccddeeff"
+
+ROW = {"deviceId": ID_A, "label": "Studio PC", "osFamily": "macos",
        "online": True, "full": False}
-UNNAMED_A = {"deviceId": "dev-b2", "label": "Research computer", "osFamily": "linux",
+UNNAMED_A = {"deviceId": ID_B, "label": "Research computer", "osFamily": "linux",
              "online": False, "full": False}
-UNNAMED_B = {"deviceId": "dev-c3", "label": "Research computer", "osFamily": "windows",
+UNNAMED_B = {"deviceId": ID_C, "label": "Research computer", "osFamily": "windows",
              "online": True, "full": False}
 
 
@@ -113,6 +126,7 @@ def test_the_waiting_rule_needs_its_own_subject(said):
     ("ask for the Studio PC", "Studio PC"),
     ("ask for the Studio PC please", "Studio PC"),
     ("ask for dev-a1b2c3", "dev-a1b2c3"),
+    ("ask for a1b2c3d4e5f6071829304a5b6c7d8e9f", "a1b2c3d4e5f6071829304a5b6c7d8e9f"),
     ("request access to the Lab Mac", "Lab Mac"),
     ("request access to that Mac", "Mac"),
     ("request access to computer LABPC001", "LABPC001"),
@@ -267,9 +281,9 @@ def test_a_quoted_name_survives_the_lookup(monkeypatch):
     # hostname and substring — none of which contains a quote mark — so the
     # quoted reply resolved to "No device matching".
     monkeypatch.setattr(sr, "_get", lambda p, timeout=None: (
-        200, {"devices": [{"id": "dev-a1", "name": "Studio PC"}]}))
+        200, {"devices": [{"id": ID_A, "name": "Studio PC"}]}))
     dev, fail = sr._resolve_device_arg('“Studio PC”')
-    assert dev and dev["id"] == "dev-a1", fail
+    assert dev and dev["id"] == ID_A, fail
 
 
 # ── the chat verbs ───────────────────────────────────────────────────────────
@@ -279,7 +293,7 @@ def test_chat_browse_prints_the_id_beside_every_row(chat):
                                           "truncated": False})
     assert sr.cmd_devices_public(_ns()) == 0
     out = chat.out()
-    assert "dev-a1" in out and "dev-b2" in out
+    assert ID_A in out and ID_B in out
     assert "online" in out and "offline" in out
     # ⛔⛔ THIS ASSERTION PINNED THE WRONG CLAIM FOR TWO WAVES. Its sibling
     # `test_the_consent_question_carries_all_three_disclosures` forbids "name and
@@ -306,9 +320,14 @@ def test_chat_browse_empty_explains_why(chat):
 def test_chat_ask_resolves_an_exact_id_without_touching_names(chat):
     chat.gets["/devices/public"] = (200, {"devices": [UNNAMED_A, UNNAMED_B]})
     chat.posts["/device/ask"] = (200, {"ok": True, "status": "pending"})
-    assert sr.cmd_device_ask(_ns(device="dev-c3")) == 0
+    assert sr.cmd_device_ask(_ns(device=ID_C)) == 0
     sent = [c for c in chat.calls if c[0] == "POST"][0]
-    assert sent[2] == {"deviceId": "dev-c3"}
+    assert sent[2] == {"deviceId": ID_C}
+    # ⛔ AND IT NEVER ASKED THE LIST. A real id is recognised as one, so the
+    # browse lookup — which drops this account's own machines, the ones it
+    # already shares and the private ones — is skipped entirely. That is the
+    # whole reason the direct route exists.
+    assert not [c for c in chat.calls if c[0] == "GET"]
 
 
 def test_chat_ask_refuses_to_guess_between_two_identical_public_names(chat):
@@ -327,20 +346,20 @@ def test_chat_ask_takes_a_unique_name(chat):
     chat.gets["/devices/public"] = (200, {"devices": [ROW, UNNAMED_A]})
     chat.posts["/device/ask"] = (200, {"ok": True})
     assert sr.cmd_device_ask(_ns(device="Studio PC")) == 0
-    assert [c for c in chat.calls if c[0] == "POST"][0][2] == {"deviceId": "dev-a1"}
+    assert [c for c in chat.calls if c[0] == "POST"][0][2] == {"deviceId": ID_A}
 
 
 def test_chat_ask_says_nothing_runs_until_the_owner_agrees(chat):
     chat.gets["/devices/public"] = (200, {"devices": [ROW]})
     chat.posts["/device/ask"] = (200, {"ok": True})
-    sr.cmd_device_ask(_ns(device="dev-a1"))
+    sr.cmd_device_ask(_ns(device="Studio PC"))
     out = chat.out()
     assert "owner decides" in out and "until they say yes" in out
 
 
 def test_chat_requests_says_what_a_missing_row_means(chat):
     chat.gets["/devices/requests"] = (200, {"requests": [
-        {"deviceId": "dev-a1", "deviceLabel": "Studio PC", "createdAt": 1}]})
+        {"deviceId": ID_A, "deviceLabel": "Studio PC", "createdAt": 1}]})
     assert sr.cmd_device_requests(_ns()) == 0
     out = chat.out()
     assert "Studio PC" in out
@@ -770,7 +789,7 @@ def test_a_status_only_failure_is_worded_once_not_twice():
 
 def test_a_full_row_says_it_cannot_take_anyone(chat):
     chat.gets["/devices/public"] = (200, {"devices": [
-        {"deviceId": "dev-f", "label": "Busy PC", "online": True, "full": True}]})
+        {"deviceId": ID_F, "label": "Busy PC", "online": True, "full": True}]})
     sr.cmd_devices_public(_ns())
     out = chat.out()
     # ⛔⛔ `full` IS A REFUSAL IN ADVANCE. The route answers `share_cap_reached`
@@ -781,7 +800,7 @@ def test_a_full_row_says_it_cannot_take_anyone(chat):
 
 def test_asking_for_a_full_machine_is_refused_before_it_is_spent(chat):
     chat.gets["/devices/public"] = (200, {"devices": [
-        {"deviceId": "dev-f", "label": "Busy PC", "online": True, "full": True}]})
+        {"deviceId": ID_F, "label": "Busy PC", "online": True, "full": True}]})
     assert sr.cmd_device_ask(_ns(device="Busy PC")) == 1
     assert not [c for c in chat.calls if c[0] == "POST"]
     assert "as many people as it can hold" in chat.out()
@@ -794,21 +813,28 @@ def test_an_id_goes_straight_to_the_route_without_the_list(chat):
     # and it drops the caller's own and the private ones, so `is_owner`,
     # `already_shared` and `revoked_sharer` could never be reached from chat.
     chat.posts["/device/ask"] = (200, {"ok": True})
-    assert sr.cmd_device_ask(_ns(device="dev-a1b2c3")) == 0
+    assert sr.cmd_device_ask(_ns(device=ID_A)) == 0
     assert not [c for c in chat.calls if c[0] == "GET"]
-    assert [c for c in chat.calls if c[0] == "POST"][0][2] == {"deviceId": "dev-a1b2c3"}
+    assert [c for c in chat.calls if c[0] == "POST"][0][2] == {"deviceId": ID_A}
 
 
 @pytest.mark.parametrize("code", ["is_owner", "already_shared", "revoked_sharer"])
 def test_the_three_refusals_the_list_used_to_hide_are_reachable(chat, code):
     chat.posts["/device/ask"] = (403, {"error": code})
-    assert sr.cmd_device_ask(_ns(device="dev-a1b2c3")) == 1
+    assert sr.cmd_device_ask(_ns(device=ID_A)) == 1
     out = chat.out()
     assert code not in out and len(out.strip()) > 20
 
 
 @pytest.mark.parametrize("wanted,is_id", [
+    # ⛔⛔ THE FIRST TWO ROWS ARE THE ONLY SHAPE THE APP EVER MINTS, and neither
+    # was in this table while the predicate refused it — so the table agreed with
+    # a predicate that could not do the job it exists for.
+    (ID_A, True), (ID_A.upper(), True),
     ("dev-a1b2c3", True), ("dev_a1b2c3", True),
+    # A hex run of the wrong length is not the minted shape, and has no
+    # separator to fall back on.
+    (ID_A[:31], False), (ID_A + "0", False),
     ("Studio PC", False), ("feedback", False), ("Mac", False), ("short-1", False),
 ])
 def test_what_counts_as_an_id(wanted, is_id):
@@ -821,10 +847,10 @@ def test_a_quoted_id_resolves_too(chat):
     # ⛔ THE ID WAS COMPARED AGAINST THE RAW ARGUMENT, so a quoted one matched
     # nothing — and only four of the six quote marks this file enumerates were
     # stripped for the name compare.
-    dev, fail = sr._resolve_public_device("“dev-a1”")
-    assert dev and dev["deviceId"] == "dev-a1", fail
+    dev, fail = sr._resolve_public_device("“" + ID_A + "”")
+    assert dev and dev["deviceId"] == ID_A, fail
     dev2, fail2 = sr._resolve_public_device("‘Studio PC’")
-    assert dev2 and dev2["deviceId"] == "dev-a1", fail2
+    assert dev2 and dev2["deviceId"] == ID_A, fail2
 
 
 def test_a_name_that_is_gone_names_the_likeliest_reason(chat):

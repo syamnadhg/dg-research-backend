@@ -411,19 +411,26 @@ like a shortcut, makes a claim about a conversation that did not happen.
   asks for it on the bare command, so the plan names it, and `--runs 0` is the
   same request by the number the plan prints. Unlike `--machine`
   there is **no ownership gate**, so no refusal will stop you: offer it only
-  when the problem is this chat reaching their computer at all. It covers that
-  file since it last rotated, not just this conversation, so it can reach back
-  further than the problem being reported. ⛔ And say what it holds before they
-  agree: it covers **everyone who has signed in on that host**, not only them,
-  and it carries a masked form of their email address, their account id and the
-  ids of the computers and runs this agent has touched. The client's plan prints
-  all of that — relay it, do not summarise it away. ⛔ And it cannot go on its
-  own: it is uploaded beside a bundle, so there has to be a bundle — `--runs 0`
-  alone is refused with that sentence. **It does not ride the send** — but
-  **pass it on `--confirm` too**: nothing is uploaded on that call either, and it
-  is what makes the client tell the user a step is still outstanding and hand you
-  the exact follow-up command. Leave it off and you get neither, and the second
-  step survives only in your memory. Run that follow-up when the user asks you to
+  when the problem is this chat reaching their computer at all. It covers the
+  rotated copies as well as the newest file, not just this conversation, so it
+  can reach back further than the problem being reported. ⛔ And say what it
+  holds before they agree: it covers **everyone who has signed in on that host**,
+  not only them, and it carries a masked form of their email address, their
+  account id and the ids of the computers and runs this agent has touched. The
+  client's plan prints all of that — relay it, do not summarise it away.
+  ⭐ **It CAN go on its own, and that is often the right offer.**
+  `--agent-log --none` — or `--runs 0` with nothing else — sends this file and
+  nothing else, with **a support code of its own**, and it needs
+  **no Research Computer at all**. Offer it to somebody who has no computer paired yet, or cannot reach the
+  one they have, because those are exactly the people who cannot build a bundle
+  for it to ride. It is still two steps: the bare command prints the plan, and
+  nothing leaves until you pass `--confirm`.
+  ⛔ Riding a bundle is the OTHER shape and still works the old way. When runs
+  ARE going, **it does not ride the send** — so **pass `--agent-log` on
+  `--confirm` too**: nothing is uploaded on that call either, and it is what
+  makes the client tell the user a step is still outstanding and hand you the
+  exact follow-up command. Leave it off and you get neither, and the second step
+  survives only in your memory. Run that follow-up when the user asks you to
   check, never on a timer. Refused before then is by design, not a fault; a
   failure there leaves the bundle and the support code untouched; "nothing to
   add" means the log was empty.
