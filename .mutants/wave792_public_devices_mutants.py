@@ -609,8 +609,17 @@ MUTANTS = [
     ("N11", SR, "over",
      "the bare `use` gate loses its quote requirement, so \"use less video\" is a "
      "device switch",
-     [('    _bare_use = t[:4].lower() == "use " and (\n        t[4:5] in _NL_QUOTE_CHARS\n        or bool(re.search(rf"\\b(?:{_MACHINE_NOUNS_SAID})\\b", _use_obj, re.I)\n                or _looks_like_a_machine_token(_use_obj))',
-       '    _bare_use = t[:4].lower() == "use "')]),
+     # ⛔⛔ REPAIRED 2026-09-17. The anchor stopped MID-EXPRESSION and the
+     # replacement ended the statement, so the four lines below it — `and
+     # bool(re.fullmatch(…))` — were left dangling and the mutant has not parsed
+     # since 2026-09-12. ⭐ It is expressed as `True` inside the gate instead of
+     # by swallowing the whole nine-line condition: `X and (True or Y)` IS `X`,
+     # so `_bare_use` is again just the `use ` prefix test — the same mutation,
+     # written so that a re-wrap of the phase/agent word lists cannot break it.
+     [('    _bare_use = t[:4].lower() == "use " and (\n'
+       '        t[4:5] in _NL_QUOTE_CHARS\n',
+       '    _bare_use = t[:4].lower() == "use " and (\n'
+       '        True\n')]),
     ("N12", SR, "under",
      "⛔ A QUOTED NAME STOPS RESOLVING, so routing the picker's own phrasing was "
      "only half the repair and the other half is gone",

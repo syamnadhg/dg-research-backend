@@ -1302,6 +1302,18 @@ def test_the_requesters_own_phrasing_never_reaches_a_grant(said):
     "don't allow anyone else to use my computer",
     "never allow strangers on my mac",
     "do not let them use my machine",
+    # ⛔⛔ THE THREE ABOVE STOPPED MEASURING THIS CLAUSE and nothing said so.
+    # Wave 1.1, three days after this wave, took `allow` and `use` into
+    # `_ACT_VERBS`, so `_negated_command` now vetoes all three ABOVE the decide
+    # clause is ever reached — delete `_negated_decide` from the gate and they
+    # all still pass. `say yes to` is NOT in that list, and SKILL.md teaches it
+    # as the owner's own approve phrasing, so these are what this clause alone
+    # stands in front of. Each was checked to FAIL with `_negated_decide` gone.
+    "don't say yes to sam",
+    "never say yes to anyone",
+    "no longer say yes to that request",
+    "won't say yes to sam",
+    "shouldn't say yes to anyone",
 ])
 def test_a_negated_verb_does_not_route_as_that_verb(said):
     """⛔⛔ W9. These returned an APPROVE confirm — the exact opposite verb."""

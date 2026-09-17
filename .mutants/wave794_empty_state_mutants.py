@@ -254,7 +254,13 @@ MUTANTS = [
      "list structurally cannot contain the asker's machine, so somebody who DOES "
      "have one is told to go and ask a stranger",
      [('    if not _artefact_kw and (re.search(\n            rf"\\b(?:i (?:do not|don\'?t|dont) have|i have no|i haven\'?t got"\n            rf"|i\'?ve got no|i (?:do not|don\'?t|dont) own)\\b[^.?!]*"\n            rf"\\b(?:{_MACHINE_NOUNS_SAID})\\b", low)\n            # ⛔⛤ AND THE BARE FORM OF THE SAME SENTENCE. SKILL.md teaches\n            # "no devices — set one up" and it reached the catch-all: the\n            # negation vocabulary above is all first-person, and a person\n            # reporting the state does not always put themselves in it.\n            or re.fullmatch(rf"(?:no|zero|0)\\s+(?:{_MACHINE_NOUNS_SAID})\\b"\n                            rf"[^.?!]{{0,32}}", low)):\n        return ["devices"], None\n\n',
-       '    if not _artefact_kw and (re.search(\n            rf"\\b(?:i (?:do not|don\'?t|dont) have|i have no|i haven\'?t got"\n            rf"|i\'?ve got no|i (?:do not|don\'?t|dont) own)\\b[^.?!]*"\n            rf"\\b(?:{_MACHINE_NOUNS})\\b", low):\n        return ["devices-public"], None\n')]),
+     # ⛔ REPAIRED 2026-09-17 — ONE CHARACTER, `low)` -> `low))`. Wave 1.2 wrapped
+     # this rule's condition in a second pair of parens and re-anchored R2 onto
+     # the new shape, but the REPLACEMENT still closed only the inner `re.search(`
+     # — so the mutated file had an unclosed `(` and R2 has measured nothing since
+     # 2026-09-12. The MUTATION is untouched: the rule still answers from the
+     # PUBLIC list, which structurally cannot hold the asker's own machine.
+       '    if not _artefact_kw and (re.search(\n            rf"\\b(?:i (?:do not|don\'?t|dont) have|i have no|i haven\'?t got"\n            rf"|i\'?ve got no|i (?:do not|don\'?t|dont) own)\\b[^.?!]*"\n            rf"\\b(?:{_MACHINE_NOUNS})\\b", low)):\n        return ["devices-public"], None\n')]),
     ("R4", SR, "under",
      "the add/pair guard reverts to the narrow list, so \"add my mac\" and "
      "\"connect my workstation\" reach the catch-all — which then offers to "
@@ -418,8 +424,14 @@ MUTANTS = [
        '    return True')]),
     ("X3", SR, "under",
      '⛔⛔ THE NO-COMPUTER RULE LOSES ITS LAST GUARD and answers "I don\'t have the report from my laptop" with a device list — a wrong answer where the catch-all would at least be an honest one',
+     # ⛔ REPAIRED 2026-09-17 — the replacement KEEPS THE OPEN PAREN. Wave 1.2
+     # wrapped this condition in a second pair of parens; the re-anchor picked up
+     # the new anchor and dropped the `(` from the replacement, so the mutated
+     # file carried an unmatched `)` and X3 has measured nothing since
+     # 2026-09-12. The MUTATION is untouched: `not _artefact_kw and` goes, which
+     # is the rule's last guard.
      [('    if not _artefact_kw and (re.search(',
-       '    if re.search(')]),
+       '    if (re.search(')]),
     ("X4", SR, "under",
      '⛔⛔ THE ARTEFACT GATE APPLIES TO THE WHOLE LIST CLAUSE AGAIN, so "which device is my run on", "list my devices and runs" and "show me my devices and their status" fall into the catch-all that boasts it can manage devices',
      [('    _list_narrow = re.search(r"\\b(which|what|list|show|my)\\b.*\\b(devices?|nodes?)\\b", low)',
@@ -453,8 +465,18 @@ MUTANTS = [
        '            return None, ["Which computer should I unlink?"]')]),
     ("X10", SR, "under",
      'the determiner strip narrows back to `the|my`, so "remove that computer" and "unlink their laptop" carry the word into a DESTRUCTIVE confirm',
-     [('    m = re.search(rf"\\b(?:switch to|run (?:it |everything )?on|use)\\s+"\n                  rf"(?:{_NAME_DETERMINER}\\s+)?(.+)$", t, flags=re.I)',
-       '        m = re.search(r"\\b(?:remove|unlink|forget|delete)\\s+(?:the\\s+|my\\s+)?(.+)$",')]),
+     # ⛔⛔ RE-ANCHORED ONTO THE SITE THE WHY-LINE IS ABOUT, 2026-09-17. The
+     # anchor had been re-pointed at the SWITCH-TO capture four lines up — a
+     # different branch, already mutated by wave12_router_captures N-series — while
+     # the replacement stayed the UNLINK branch's old narrow strip at its 8-space
+     # indent. So the mutant emitted the unlink line into the switch statement and
+     # has not parsed since 2026-09-12. `remove that computer` and `unlink their
+     # laptop` are unlink phrasings, and the source comment at the unlink capture
+     # names them word for word. ⭐ The anchor is now the ONE LINE that carries
+     # the determiner, so a re-wrap of the verb list above it cannot break it
+     # again — the long anchor is what broke.
+     [('                      rf"(?:{_NAME_DETERMINER}\\s+)?(.+)$",',
+       '                      rf"(?:the\\s+|my\\s+)?(.+)$",')]),
     ("X11", SR, "under",
      'the quote strip goes and the confirm prints a doubled name — this client tells people to reply with the name in quotes',
      [('        name = _quoted_name(t) or name.strip().strip(_NL_QUOTE_CHARS).strip()\n        # ⛔⛤ THE DESTRUCTIVE CONFIRM QUOTED THE WHOLE SENTENCE. This site ran to\n',

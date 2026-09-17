@@ -23,7 +23,9 @@ import os
 import pytest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SWEEP = os.path.join(os.path.dirname(HERE), ".mutants", "_anchor_sweep.py")
+MUTANTS = os.path.join(os.path.dirname(HERE), ".mutants")
+SWEEP = os.path.join(MUTANTS, "_anchor_sweep.py")
+APPLY = os.path.join(MUTANTS, "_apply_sweep.py")
 
 
 def _sweep_module():
@@ -37,6 +39,27 @@ def _sweep():
     """(checked, stale) — the two the ratchet below is about."""
     checked, bad, _unreachable = _sweep_module().sweep()
     return checked, bad
+
+
+def _apply_module():
+    spec = importlib.util.spec_from_file_location("_apply_sweep", APPLY)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_APPLY_RESULT = []
+
+
+def _apply_sweep():
+    """(stats, broken, unreachable, notes, per_harness), computed ONCE.
+
+    ⛔ It applies 3.4k mutants and parses each result, so it costs ~35 seconds.
+    Running it per test would put four minutes into a unit file and somebody
+    would take it out again — which is how the twenty breaks below survived."""
+    if not _APPLY_RESULT:
+        _APPLY_RESULT.append(_apply_module().sweep())
+    return _APPLY_RESULT[0]
 
 
 # ⛔ PRE-EXISTING DEBT, recorded 2026-08-17 by the sweep's first run. Four waves
@@ -232,3 +255,264 @@ def test_every_harness_is_swept():
     unreadable = [(n, w) for n, m, w in bad
                   if m == "-" or "would not import" in w]
     assert not unreadable, f"harnesses the sweep could not read: {unreadable}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# THE OTHER HALF: a mutant that APPLIES but measures nothing anyway.
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# ⛔⛔ EVERYTHING ABOVE COUNTS ANCHORS AGAINST THE FILE AS IT SITS, and on
+# 2026-09-17 that turned out to be half a guard. Applying every mutant in order
+# found TWENTY-SEVEN mutants measuring nothing where the resting sweep saw a
+# clean bill, in two shapes it structurally cannot see:
+#
+#   1. THE MUTANT DOES NOT PARSE. A re-anchor moved the ANCHOR onto re-wrapped
+#      source and left the REPLACEMENT in the old shape. Where the harness
+#      compiles the mutant first this is subtracted from its own denominator as a
+#      "fault" and the score line still reads clean. Where it does NOT — eleven of
+#      the sixteen harnesses holding a break — the unparseable file is WRITTEN,
+#      the suite reds on an import error, and `killed = not green` BANKS A KILL
+#      IT NEVER EARNED. Those scores are not narrower than they claim. They are
+#      INFLATED, and eighteen of the twenty-seven were that.
+#   2. THE ANCHOR IS UNIQUE UNTIL THE MUTANT'S OWN EARLIER EDIT RUNS. Edit 1's
+#      replacement contains edit 2's anchor as a substring, so edit 2 matches
+#      twice — unique at rest, ambiguous mid-mutant. A resting sweep can NEVER
+#      see this one, however carefully it is written.
+#
+# ⭐ Seven were repaired the day the tool was written, because they belonged to
+# the harnesses wave 9 actually ran: device_visibility V2 (shape 2 — and the
+# only mutation evidence for the joinPolicy read), wave793 N15 and W14, wave794
+# R2/X3/X10, wave792 N11. The twenty below belong to their own waves and are
+# recorded here rather than fixed, for the same reason the list above was:
+# re-anchoring one needs the intent of the wave that wrote it.
+#
+# ⛔ THE DATES ARE THE POINT. Only ONE of the twenty-seven arrived with wave 9.
+# Eighteen have been broken since the day they were written — the oldest since
+# 2026-08-11 — so those mutants have never once measured anything, and
+# `telemetry_0818` F2 writes keyword params after `**kwargs`, which has never
+# been legal on any day of Python.
+KNOWN_UNAPPLIABLE: "set[tuple[str, str]]" = {
+    ('broken_install_0822_mutants.py', 'N6'),
+    ('clear_local_logs_0818_mutants.py', 'C16'),
+    ('new_owner_setup_0817_mutants.py', 'F1'),
+    ('new_owner_setup_0817_mutants.py', 'F15'),
+    ('noise_and_durations_0811_mutants.py', 'D4'),
+    ('queue_gate_vision_0811_mutants.py', 'X3'),
+    ('queue_gate_vision_0811_mutants.py', 'X4'),
+    ('queue_gate_vision_0811_mutants.py', 'X6'),
+    ('queue_gate_vision_0811_mutants.py', 'X7'),
+    ('review_wave2_0813_mutants.py', 'K4'),
+    ('telemetry_0818_mutants.py', 'F2'),
+    ('watch_liveness_0822_mutants.py', 'D2'),
+    ('watch_liveness_0822_mutants.py', 'P5'),
+    ('watch_liveness_0822_mutants.py', 'R2'),
+    ('watch_liveness_0822_mutants.py', 'R6'),
+    ('wave11_router_gates_0911_mutants.py', 'Q6'),
+    ('wave11_router_gates_0911_mutants.py', 'Q8'),
+    ('wave1_merge_gates_0821_mutants.py', 'U3'),
+    ('wave8_attribution_0824_mutants.py', 'O1c'),
+    ('wave8_machine_scope_0824_mutants.py', 'H1'),
+}
+
+
+def test_no_new_mutant_stops_applying():
+    """⛔⛔ THE RATCHET. Anything not on the dated list above fails at once.
+
+    A hard failure on the whole set would red the gate over twenty breaks that
+    are five weeks old and belong to other waves, and a gate that is red for a
+    reason nobody can act on today gets switched off — which is the same end
+    state as no gate. So the debt is CLOSED and DATED, and the list may only
+    shrink."""
+    _stats, broken, _unreachable, _notes, _per = _apply_sweep()
+    found = {(f["harness"], f["mutant"]) for f in broken}
+    new = found - KNOWN_UNAPPLIABLE
+    why = {(f["harness"], f["mutant"]): f"[{f['kind']}] {f['detail']}"
+           for f in broken}
+    assert not new, (
+        "these mutants no longer apply cleanly, so they measure NOTHING — and "
+        "in a harness with no pre-write compile guard they report a KILL:\n"
+        + "\n".join(f"  {h} {m}: {why[(h, m)]}" for h, m in sorted(new))
+    )
+
+
+def test_the_known_unappliable_list_only_shrinks():
+    mod = _apply_module()
+    if mod.absent_roots():
+        pytest.skip(f"target checkout(s) not on this disk: {mod.absent_roots()}")
+    _stats, broken, _unreachable, _notes, _per = _apply_sweep()
+    found = {(f["harness"], f["mutant"]) for f in broken}
+    fixed = KNOWN_UNAPPLIABLE - found
+    assert not fixed, (
+        "good news — these apply and parse again. Take them off "
+        f"KNOWN_UNAPPLIABLE so the ratchet keeps its grip: {sorted(fixed)}"
+    )
+
+
+def test_the_apply_sweep_cannot_report_clean_by_doing_nothing():
+    """⛔⛔ AN AUDITOR THAT PASSES BY LOOKING AT NOTHING IS THE DEFECT BEING FIXED.
+
+    The two assertions above are satisfied perfectly by a sweep that loaded no
+    harness, found no mutant and applied no edit — which is precisely the shape
+    of silence that let twenty-seven mutants report kills. So the floors are
+    asserted, and a harness that yields zero mutants or applies zero edits is a
+    HOLE in the audit rather than a clean harness."""
+    stats, _broken, _unreachable, _notes, per_harness = _apply_sweep()
+    assert not _apply_module().vacuity(stats, per_harness)
+    assert stats["harnesses"] > 100, stats
+    assert stats["mutants"] > 3000, stats
+    assert stats["edits"] > 3000, stats
+    assert stats["py_parsed"] > 3000, (
+        "the edits were applied but almost nothing was PARSED, so the half of "
+        f"this that finds an unparseable mutant is not running: {stats}"
+    )
+
+
+def test_every_harness_still_imports_for_the_apply_sweep():
+    """A harness that will not import yields no mutants, and a sweep that skips
+    it quietly is back to reporting clean by looking at nothing."""
+    stats, broken, _unreachable, notes, _per = _apply_sweep()
+    assert stats["harnesses"] == stats["imported"], (
+        f"{stats['harnesses'] - stats['imported']} harness(es) would not "
+        f"import: {[n for n in notes if 'would not import' in n]}"
+    )
+    assert not [f for f in broken if f["mutant"] == "-"], (
+        f"harnesses yielding no mutant table: {[f for f in broken if f['mutant'] == '-']}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# The two properties the ratchet above rests on, pinned where nothing else can
+# satisfy them. Both are proven on a SYNTHETIC harness: pinning them on a real
+# one would mean keeping a mutant broken on purpose, and the moment somebody
+# repaired it the proof would evaporate without anyone noticing.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _synthetic(tmp_path, name, target, edits):
+    """A one-mutant harness in a repo-shaped temp tree; returns both sweeps."""
+    repo = tmp_path / name
+    (repo / ".mutants").mkdir(parents=True)
+    (repo / "t.py").write_text(target, encoding="utf-8")
+    body = [
+        "from pathlib import Path",
+        "",
+        "ROOT = Path(__file__).resolve().parent.parent",
+        'SRC = "t.py"',
+        "MUTANTS = [",
+        f'    ("M1", "the synthetic mutant", {edits!r}),',
+        "]",
+        "",
+        "for mid, why, edits in MUTANTS:",
+        "    path = ROOT / SRC",
+        "",
+    ]
+    (repo / ".mutants" / "synthetic_mutants.py").write_text(
+        "\n".join(body), encoding="utf-8")
+
+    rest = _sweep_module()
+    rest.HERE = str(repo / ".mutants")
+    rest.ROOTS = (("backend", str(repo)),)
+    resting = rest.sweep()
+
+    app = _apply_module()
+    app.HERE = repo / ".mutants"
+    app.REPO = repo
+    app.ROOT_SPEC = (("backend", repo),)
+    applied = app.sweep()
+    return resting, applied
+
+
+def test_an_anchor_that_only_doubles_MID_MUTANT_is_caught(tmp_path):
+    """⛔⛔ THE ONE THE RESTING SWEEP CAN NEVER SEE, and the reason applying the
+    edits IN ORDER is the whole point rather than an implementation detail.
+
+    `device_visibility` V2 is exactly this shape and it is wave 9's own bug: its
+    edit 2 anchors on the four-space `return "private"` fallback, which is unique
+    in the file — until edit 1's own replacement, a twelve-space
+    `return "private" if …`, puts a second copy of that substring in the file.
+    The harness then saw two matches, called V2 a fault, subtracted it from its
+    own denominator and printed a clean score. V2 is the only mutation evidence
+    for the joinPolicy read, the sharpest lane in that wave.
+
+    ⭐ The assertion below is in two halves ON PURPOSE. Checking only that the
+    apply sweep complains would be satisfied by a tool that checks anchors
+    against the resting file and happens to be strict — so the resting sweep is
+    asserted CLEAN on the very same harness. Nothing but applying edit 1 before
+    counting edit 2 can pass both."""
+    target = ('def pick(v):\n'
+              '    for k in ("a",):\n'
+              '        if v:\n'
+              '            return "public" if v == "public" else "private"\n'
+              '    return "private"\n')
+    edits = [('            return "public" if v == "public" else "private"',
+              '            return "private" if v == "private" else "public"'),
+             ('    return "private"', '    return "public"')]
+    (r_checked, r_bad, r_unreach), (stats, broken, _un, _n, per) = _synthetic(
+        tmp_path, "midmutant", target, edits)
+
+    assert r_checked == 2 and not r_bad and not r_unreach, (
+        "the resting sweep found this at rest, so it proves nothing about "
+        f"applying the edits in order: {r_bad}")
+    assert len(broken) == 1, broken
+    assert broken[0]["mutant"] == "M1"
+    assert broken[0]["kind"] == "anchor-2x+", broken[0]
+    assert "edit 2" in broken[0]["detail"], broken[0]["detail"]
+    assert "2x" in broken[0]["detail"], broken[0]["detail"]
+    assert stats["mutants"] == 1 and stats["harnesses"] == 1, stats
+    assert per["synthetic_mutants.py"]["mutants"] == 1
+
+
+def test_a_mutant_that_does_not_PARSE_is_caught(tmp_path):
+    """⛔⛔ THE EIGHTEEN THAT BANKED A KILL THEY NEVER EARNED.
+
+    A replacement left behind by a half-done re-anchor still MATCHES once, so
+    the resting sweep is happy; the file it produces is a SyntaxError. In a
+    harness with no pre-write compile guard — eleven of the sixteen holding a
+    break — that file is written, the suite reds on an import error, and
+    `killed = not green` reads the red as a kill. The score is not narrower than
+    it claims. It is inflated.
+
+    ⭐ Same two-halved assertion: the resting sweep must be CLEAN here, so the
+    only thing that can pass this test is actually parsing the mutated text."""
+    target = ('def pick(v):\n'
+              '    return "private"\n')
+    edits = [('    return "private"', '    return ("private"')]
+    (r_checked, r_bad, r_unreach), (stats, broken, _un, _n, _per) = _synthetic(
+        tmp_path, "unparseable", target, edits)
+
+    assert r_checked == 1 and not r_bad and not r_unreach, (
+        f"the resting sweep already refused this, so it pins nothing: {r_bad}")
+    assert len(broken) == 1, broken
+    assert broken[0]["mutant"] == "M1"
+    assert broken[0]["kind"] == "parse-error", broken[0]
+    assert "t.py" in broken[0]["detail"], broken[0]["detail"]
+    assert stats["edits"] == 1, stats
+
+
+def test_a_harness_with_no_mutants_is_a_HOLE_not_a_clean_bill(tmp_path):
+    """⛔ The failure mode this whole file is about, one level up: a sweep that
+    reports clean because it looked at nothing. An empty harness passes every
+    ratchet above, so emptiness itself has to be the thing that fails."""
+    app = _apply_module()
+    repo = tmp_path / "empty"
+    (repo / ".mutants").mkdir(parents=True)
+    (repo / ".mutants" / "hollow_mutants.py").write_text(
+        "MUTANTS = []\n", encoding="utf-8")
+    app.HERE = repo / ".mutants"
+    app.REPO = repo
+    app.ROOT_SPEC = (("backend", repo),)
+    stats, broken, _un, _notes, per = app.sweep()
+
+    reasons = app.vacuity(stats, per)
+    assert reasons, "a harness yielding zero mutants was reported as clean"
+    assert any("ZERO mutants" in r for r in reasons), reasons
+    assert [f["kind"] for f in broken] == ["no-mutants"], broken
+
+    # …and the same verdict when there is no harness at all.
+    bare = tmp_path / "bare"
+    (bare / ".mutants").mkdir(parents=True)
+    app.HERE = bare / ".mutants"
+    app.REPO = bare
+    app.ROOT_SPEC = (("backend", bare),)
+    stats2, _b2, _u2, _n2, per2 = app.sweep()
+    assert app.vacuity(stats2, per2), (
+        "a sweep that loaded no harness at all called itself clean")

@@ -648,8 +648,16 @@ MUTANTS = [
     ("N15", SR, "under",
      "⛔ the capability line stops naming the owner verbs, so the fallback "
      "denies having the two commands the resolver just failed to reach",
+     # ⛔⛔ REPAIRED 2026-09-17. `_NL_CATCH_ALL` was a LIST at 7.9-3 and became a
+     # parenthesised implicit concatenation; wave 1.1 re-anchored this mutant
+     # onto the new shape and left the REPLACEMENT in the old one, still ending
+     # `"]`. Applying it left `_NL_CATCH_ALL = (` closed by `]`, so the mutant
+     # has not parsed — and has measured NOTHING — since 2026-09-11. The
+     # replacement now closes the paren and sits at the same 17-space indent as
+     # its neighbours. The MUTATION is unchanged: the capability line stops
+     # naming the owner verbs.
      [('                 "ask to use it, and — for a computer you own — answer the people "\n                 "asking for it and set whether strangers can find it at all — "\n                 "what would you like?")',
-       '                  "ask to use it — what would you like?"]')]),
+       '                 "ask to use it — what would you like?")')]),
     ("N16", SR, "over",
      "⛔ an artefact question reaches the decide confirm, so \"approve the "
      "report\" offers to let a stranger onto a computer",
@@ -808,8 +816,20 @@ MUTANTS = [
     ("W14", SR, "over",
      "⛔ the pairing rule eats a publish request again — \"add my computer to the "
      "public list\" answered with \"paste the access code\"",
-     [('    if re.search(r"\\bpublic|\\bfindable|\\bdiscoverable\\b", low):\n        pass\n    # ⛔⛔ AND NEVER AHEAD OF A RESEARCH REQUEST. This guard sits ABOVE rule 2b,\n    # and widening its nouns made it swallow "research how to connect my mac" —\n    # answering a research topic with "paste the access code". Rule 2b\'s own test\n    # is the one that decides, so it is asked here first.\n    elif (not _NL_RESEARCH_RE.match(t)) and (',
-       'elif (not _NL_RESEARCH_RE.match(t)) and (')]),
+     # ⛔⛔ REPAIRED 2026-09-17, and it is the shape W14 was BORN with at 7.9-3.
+     # 7.9-4 re-anchored it onto the whole block down to the `elif` line and
+     # wrote the replacement as a bare `elif …` at COLUMN 0 — the anchor eats the
+     # four-space indent, so the mutant emitted a dedented `elif` with no `if`
+     # above it and has not parsed since 2026-09-09. Six waves scored it as a
+     # fault. ⭐ The anchor is now THE GUARD ALONE, which is the whole of the
+     # mutation, so the `elif` line below is free to re-wrap without breaking it
+     # — the long anchor is precisely what broke. Nothing is weakened: deleting
+     # the guard and never firing it are the same behaviour, and the pairing
+     # branch is again reached by every message, publish requests included.
+     [('    if re.search(r"\\bpublic|\\bfindable|\\bdiscoverable\\b", low):\n'
+       '        pass\n',
+       '    if False:\n'
+       '        pass\n')]),
     ("W15", SR, "under",
      "⛔ the person after \"access to\" is lost, so \"grant access to sam\" quotes "
      "nobody and the owner has to name them twice",

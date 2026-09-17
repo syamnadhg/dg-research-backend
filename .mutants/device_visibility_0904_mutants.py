@@ -134,7 +134,18 @@ READ_GUARD = '    if not meta:'
 # would leave the absent case answering "private" correctly and would measure
 # strictly less than the old anchor did.
 DISCOVERY_PICK = '            return "public" if value == "public" else "private"'
-DISCOVERY_ABSENT = '    return "private"'
+# ⛔⛔ RE-ANCHORED 2026-09-17. `    return "private"` is unique in `research.py`
+# AT REST and ambiguous the moment V2's OWN first edit lands: that edit's
+# replacement, `return "private" if value == "private" else "public"`, CONTAINS
+# this anchor as a substring. So the harness found two matches, called V2 a
+# fault, subtracted it from its own denominator, and printed a clean score —
+# and `_anchor_sweep.py` could never have seen it, because at rest there is
+# nothing to see. V2 is the only mutation evidence for the joinPolicy read, the
+# sharpest lane in wave 9, so it measured nothing on the wave that needed it.
+# ⭐ The fix is to carry the comment line above it: the fallback is what this
+# edit is about, the comment names it, and neither is free to move without the
+# other. `# the one that hides.` occurs exactly once in the file.
+DISCOVERY_ABSENT = '    # the one that hides.\n    return "private"'
 #: The manual value check in `main`.
 VALIDATE = ('        if args.visibility != _VISIBILITY_SHOW and args.visibility not in _VISIBILITY_VALUES:')
 
@@ -226,7 +237,7 @@ MUTANTS = [
      "field — reports as PUBLIC",
      [(DISCOVERY_PICK,
        '            return "private" if value == "private" else "public"'),
-      (DISCOVERY_ABSENT, '    return "public"')]),
+      (DISCOVERY_ABSENT, '    # the one that hides.\n    return "public"')]),
     ("V2b", "under",
      "⛔⛔ THE NEW NAME IS BELIEVED FIRST, which is the shape wave 8's first build "
      "shipped and cross-verify overturned. Nothing writes `joinPolicy` yet, so on "

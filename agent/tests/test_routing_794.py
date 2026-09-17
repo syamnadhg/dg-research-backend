@@ -236,12 +236,61 @@ def test_every_determiner_is_stripped_before_a_destructive_confirm(det):
     assert "“" not in lines[0], (det, lines)
 
 
-def test_a_quoted_name_is_not_quoted_twice():
+# ⛔ THE THREE PAIRED STYLES `_QUOTED_SPAN` KNOWS, and every one of them is what
+# somebody's keyboard produces without being asked — macOS types curly.
+_QUOTE_STYLES = ['"{n}"', "“{n}”", "‘{n}’"]
+# ⛔⛔ THE TAIL IS WHAT MAKES THE DEFECT VISIBLE, so "" is one row among four and
+# never the only one. See the docstring below.
+_QUOTE_TAILS = ["", ", thanks", " please", " today"]
+
+
+@pytest.mark.parametrize("q", _QUOTE_STYLES)
+@pytest.mark.parametrize("tail", _QUOTE_TAILS)
+def test_a_quoted_name_is_not_quoted_twice(q, tail):
     """⛔ THIS CLIENT TELLS PEOPLE TO REPLY WITH THE NAME IN QUOTES, so a quoted one
-    arrives here wrapped — and the confirm printed it doubled."""
-    _argv, lines = sr._nl_resolve('remove "Studio PC"')
-    assert "Unlink “Studio PC”" in lines[0], lines
-    assert "““" not in lines[0], lines
+    arrives here wrapped — and the confirm printed it doubled, on the one screen
+    where somebody is deciding whether to say yes to rotating an access code.
+
+    ⛔⛔ THIS GUARD USED TO BE ONE PHRASING WITH NO TRAILING WORD, AND THAT IS
+    EXACTLY THE ONE PHRASING THAT CANNOT SEE THE DEFECT. Drop the quote strip and
+    `remove "Studio PC"` still confirms “Studio PC” — `_trim_trailing_clause`'s
+    verbatim-quote escape hands back the unquoted span when the quoted name IS the
+    end of the sentence. Measured: the mutant that removes the strip passes every
+    no-tail row and fails all nine rows that carry one. A probe set without a
+    "please" measures nothing here.
+
+    ⛔⛔ AND THE ASSERTION IS EQUALITY, NOT `in`. A containment assertion about a
+    string the code wraps in the same character can never fail on a doubling:
+    ““Studio PC”” contains “Studio PC”, so the curly half — the half a Mac types —
+    stays unmeasured. The old `"““" not in lines[0]` saw only the curly doubling,
+    and only on a phrasing that never doubles.
+
+    ⛔ THE STRAIGHT SINGLE QUOTE IS DELIBERATELY ABSENT. `_QUOTED_SPAN` does not
+    pair it, so `remove 'Studio PC' please` confirms “Studio PC'” today — a live
+    defect reported separately, not something this guard should be red for.
+    """
+    said = q.format(n="Studio PC") + tail
+    argv, lines = sr._nl_resolve(f"remove {said}")
+    assert argv is None, (said, argv)
+    assert lines[0] == sr._NL_CONFIRMS["device-remove"].format(
+        name="“Studio PC”"), (said, lines[0])
+
+
+@pytest.mark.parametrize("said,expected", [
+    ('remove the computer named "Studio PC"', "Studio PC"),
+    ("remove the computer named “Studio PC”", "Studio PC"),
+    ("unlink my “Sam’s Mac” please", "Sam’s Mac"),
+])
+def test_a_quoted_name_survives_the_leading_noun_and_tail_trims(said, expected):
+    """⛔ THE QUOTE STRIP RUNS BEFORE THE TRAILING-CLAUSE AND LEADING-NOUN TRIMS,
+    and those trims are what turn a still-quoted capture into a MANGLED name
+    rather than merely a doubled one: without it `remove the computer named
+    “Studio PC”` offers to unlink “named “Studio PC””, whose own yes resolves to
+    nothing."""
+    argv, lines = sr._nl_resolve(said)
+    assert argv is None, (said, argv)
+    assert lines[0] == sr._NL_CONFIRMS["device-remove"].format(
+        name=f"“{expected}”"), (said, lines[0])
 
 
 def test_no_hand_written_noun_list_survives_in_the_resolver():

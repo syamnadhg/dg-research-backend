@@ -4219,10 +4219,26 @@ _VIS_PUBLISH_ALL = _alt(_inflect(_VIS_PUBLISH_VERBS))
 #   · a negator ANYWHERE ELSE belongs to a NAME and is ignored — which is the
 #     whole reason the window is adjacency and not a 40-character span:
 #     `make my Now or Never Mac public` HID a machine whose own name says "Never".
-_NEG_WORDS = (r"(?:don'?t|dont|do\s+not|does\s+not|doesn'?t|never|no\s+longer|not|"
-              r"cannot|can'?t|shouldn'?t|should\s+not|won'?t|will\s+not|would\s+not|"
-              r"no\s+need\s+to|don'?t\s+want\s+to|stop\s+trying\s+to|quit|"
-              r"rather\s+not|please\s+don'?t)")
+# ⛔⛔⛔ THE APOSTROPHE A MAC ACTUALLY TYPES IS THE CURLY ONE, and this vocabulary
+# only ever spelled the straight `'`. Smart quotes are ON BY DEFAULT on macOS and
+# iOS, and SKILL.md relays the user's sentence VERBATIM — so `don’t` arrived here
+# and EVERY veto in this file was off. Measured on the shipped router, same
+# sentence, two apostrophes: `don’t send the logs` SENT THEM; `don’t hide my
+# studio pc` HID IT, unconfirmed; `don’t make my mac public` offered to PUBLISH
+# it; `don’t add device K7XQ-9B2M` PAIRED IT; `please don’t switch to the office
+# PC` SWITCHED; `don’t pause the run` PAUSED IT. 12 of 13 negatable bases failed
+# for `don’t `. The file already spells both apostrophes at four other sites
+# (`(?:’s|'s)`, `(?!['’-])`); these contraction copies were the ones that did not.
+# ⛔⛔ AND THE FIX IS A CHARACTER CLASS, NEVER A NORMALISE-TO-ASCII AT THE TOP OF
+# `_nl_resolve`. `t` there feeds EVERY NAME CAPTURE, so rewriting `’` to `'`
+# would make `hide Sam’s Mac` capture the name "Sam's Mac" and miss the exact-name
+# lookup against the real device document — trading a missed veto for acting on
+# the wrong machine. The class touches the vocabulary only, and nothing else.
+_NEG_WORDS = (r"(?:don['’]?t|dont|do\s+not|does\s+not|doesn['’]?t|never|"
+              r"no\s+longer|not|cannot|can['’]?t|shouldn['’]?t|should\s+not|"
+              r"won['’]?t|will\s+not|would\s+not|"
+              r"no\s+need\s+to|don['’]?t\s+want\s+to|stop\s+trying\s+to|quit|"
+              r"rather\s+not|please\s+don['’]?t)")
 # ⛔ THE INTERVENING WORDS ARE A CLOSED LIST. A free span here is how the old
 # 40-character negation arm came to read a machine NAME as a negation.
 # ⛔⛤ `keep` JOINED AFTER CROSS-VERIFY. `don't keep hiding my Studio PC` ran an
@@ -5684,8 +5700,14 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     # confirm — the exact opposite of what was asked, one "yes" from granting.
     # Neither is refused here either: what the person wants is a hide or a
     # sharer removal, and guessing between them is worse than the catch-all.
-    _negated_decide = re.search(r"\b(don'?t|do not|never|no longer|not|cannot|"
-                                r"can'?t|shouldn'?t|should not|won'?t|would not)"
+    # ⛔⛔ THE CURLY APOSTROPHE HERE TOO — see `_NEG_WORDS` for why the fix is a
+    # character class and not a normalise of `t` (it feeds every name capture).
+    # This is the copy that cost most, because this surface is DESTRUCTIVE:
+    # `don’t approve sam` answered "Say yes to “sam”?", one reflexive yes from
+    # letting a stranger onto the machine.
+    _negated_decide = re.search(r"\b(don['’]?t|do not|never|no longer|not|cannot|"
+                                r"can['’]?t|shouldn['’]?t|should not|won['’]?t|"
+                                r"would not)"
                                 r"\b[^.?!]{0,24}\b(allow|approve|accept|grant|"
                                 r"let|say yes)\b", low)
     # ⛔⛔ MY OWN REQUEST IS THE ASKER'S STATUS QUESTION, NOT A DECISION. "has my

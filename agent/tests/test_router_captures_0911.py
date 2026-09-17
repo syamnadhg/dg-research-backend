@@ -962,11 +962,22 @@ def test_a_quoted_name_wins_outright_at_switch_and_unlink(q, tail):
     """⛔⛤ D2 SURVIVED AND CHASING IT FOUND A DEFECT OF MINE. Stripping quote
     characters off the EDGES works only while the quote IS the edge:
     `switch to “Nodes Mac”, thanks` kept the closing `”`, the leading-noun strip
-    then ate `Nodes`, and the lookup got `Mac”` — which matched TWO machines."""
+    then ate `Nodes`, and the lookup got `Mac”` — which matched TWO machines.
+
+    ⛔⛔ THE UNLINK LINE USED TO READ `"“Nodes Mac”" in say` AND COULD NOT FAIL ON
+    THE CURLY HALF. The confirm wraps the name in those same curly quotes, so the
+    doubled ““Nodes Mac”” CONTAINS the expected substring — a containment
+    assertion about a string the code wraps in the same character never sees a
+    doubling. Measured against the mutant that drops the unlink branch's quote
+    strip: `in` caught 3 of these 8 rows, all STRAIGHT-double; equality catches 6.
+    Curly is what macOS types, so the half that matters most was unpinned."""
     said = q.format(n="Nodes Mac") + tail
     assert _r(f"switch to {said}")[0] == ["device-use", "Nodes Mac"], said
     assert _r(f"use {said}")[0] == ["device-use", "Nodes Mac"], said
-    assert "“Nodes Mac”" in _r(f"remove {said}")[1], said
+    argv, say = _r(f"remove {said}")
+    assert argv is None, (said, argv)
+    assert say == sr._NL_CONFIRMS["device-remove"].format(
+        name="“Nodes Mac”"), (said, say)
 
 
 @pytest.mark.parametrize("verb", ["list", "post", "advertise"])
