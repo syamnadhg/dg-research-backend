@@ -78,7 +78,17 @@ MINE = ("unpaired_machine or failed_read or reports_public or reports_private or
         # line existed — which is the check working. A mutant that only these
         # can kill would otherwise have been reported as a SURVIVOR, and a
         # survivor and a deselected guard read identically.
-        "revoked_session or failed_SET or failed_SHOW or unprovable_failure")
+        "revoked_session or failed_SET or failed_SHOW or unprovable_failure or "
+        # ⛔ ADDED WAVE 9 (2026-09-17). The machine learned to read `joinPolicy`
+        # old-first, and the walkthrough split its second stage in two — seventeen
+        # new guards, every one of which the filter's own coverage check named
+        # before this line existed. It REFUSED TO RUN rather than score them as
+        # survivors, which is the check doing its job against the wave that added
+        # them. Same repair as 7.9-0 above.
+        "swallow_the_new_one or falls_through_to_the_NEW_one or "
+        "reaches_the_resolver or nothing_recognisable or OLD_name_wins or "
+        "its_own_stage or reads_both_names or new_name_is_read or "
+        "new_name_reads_private or CLOSES_the_door")
 
 # ⛔⛔ EXACT COVERAGE, NOT A COUNT. A filter that silently deselects the guard
 # written to kill a mutant reports that mutant as a SURVIVOR, which reads
