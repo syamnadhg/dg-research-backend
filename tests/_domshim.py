@@ -13,7 +13,7 @@ test suite behind an `npm install` and a node_modules tree.
 
 Supports what the production selectors actually use: tag names, `[attr]`,
 `[attr="v"]`, `[attr*="v" i]`, comma selector lists, descendant combinators,
-`getComputedStyle` driven by `anim`/`clip` attributes,
+`getComputedStyle` driven by `anim`/`clip`/`disp`/`vis`/`op` attributes,
 `textContent`/`innerText`, attribute reads, `getBoundingClientRect`, `closest`,
 `getAnimations()` (element and document), and a click that records what was clicked.
 """
@@ -566,10 +566,41 @@ globalThis.document = {
 // unreachable under the shim and no test could tell a working anchor from one
 // that had never fired. Driven by attributes, like the geometry above: put
 // `anim="shimmer"` (or `clip="text"`) on a fixture node to make it shimmer.
+// ⭐⭐ 2026-09-17 — AND SO ARE DISPLAY / VISIBILITY / OPACITY, which were the
+// three CONSTANTS left in this object. Every "is this control really on screen"
+// gate in the Gemini re-draft path reads `getBoundingClientRect` AND
+// `getComputedStyle`, and with these three pinned to their healthy values only
+// the SIZE half could ever be driven negative by a fixture. So the 09-10 wave's
+// own visibility check — the reader's `isVisible` and the clicker's re-check —
+// had never once executed: `hidden` suppresses `getClientRects` and
+// `offsetParent` (above), and neither of those is what that code reads.
+//
+// ⛔ NEW KEYS, NOT NEW MEANINGS FOR OLD ONES. `hidden` deliberately does NOT
+// feed this object: fixtures across this suite already use it for the
+// rects/offsetParent idiom, and making it also report `display:none` would
+// silently change what every one of them tells production JS. `anim` and `clip`
+// keep their exact behaviour for the same reason — two live mutants read them.
+// A fixture asks for the new behaviour by name: `disp`, `vis`, `op`.
+//
+// Browser semantics, deliberately: `visibility` INHERITS (a row inside a
+// `visibility:hidden` container is hidden too, and a descendant can override
+// back to visible), while `display` and `opacity` DO NOT — a browser reports a
+// child of a `display:none` parent with its OWN display, and opacity composites
+// rather than inheriting. Getting that backwards would let a fixture prove a
+// gate that the live page never exercises.
 globalThis.getComputedStyle = (el) => {
   const get = (n) => (el && el.getAttribute) ? (el.getAttribute(n) || '') : '';
+  const inherited = (n) => {
+    for (let x = el; x; x = x.parent) {
+      const v = (x && x.getAttribute) ? x.getAttribute(n) : null;
+      if (v) return v;
+    }
+    return '';
+  };
   const clip = get('clip');
-  return { display: 'block', visibility: 'visible', opacity: '1',
+  return { display: get('disp') || 'block',
+           visibility: inherited('vis') || 'visible',
+           opacity: get('op') || '1',
            animationName: get('anim') || 'none',
            backgroundClip: clip, webkitBackgroundClip: clip };
 };

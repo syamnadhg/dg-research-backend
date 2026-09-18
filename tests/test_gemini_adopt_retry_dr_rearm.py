@@ -23,9 +23,11 @@ re-runs setup_gemini_dr when the pill is off), fail-open on measurement misses.
 
 Run:  pytest tests/test_gemini_adopt_retry_dr_rearm.py -v
 """
+import ast
 import inspect
 import os
 import sys
+import textwrap
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -226,3 +228,79 @@ def test_normal_presend_ensure_still_present():
         "normal pre-send + Phoenix measure-only + the ladder re-arm must all "
         "call the ensure helper"
     )
+
+
+# ── Fix 2, continued: the re-draft arm must not BYPASS the re-arm ────────────
+#
+# ⛔⛔ THE GUARANTEE THIS FILE ASSERTS WAS AN ACCIDENT OF A HELPER THAT COULD NOT
+# CLICK. `_retried = await <waiter>` / `if _retried:` / `elif not
+# _gemini_in_conversation():` — for fifteen months the waiter was
+# `_try_inpage_retry_on_research_fail`, whose word list never matched Gemini's
+# `aria-label="Redo"`, so `_retried` was ALWAYS False and the `elif` ran on
+# every attempt. Wave 10 re-pointed that call at a waiter that really does
+# click, which made the True arm reachable for the first time — and that arm
+# logs, then skips the composer read, the re-paste and the Deep Research re-arm
+# that `test_repaste_ladder_rearms_deep_research_before_resubmit` above calls
+# mandatory. On the shape it is reachable on (an errored DR leaves the URL bare
+# `/app` while the brief DID enter the conversation), a re-draft that comes back
+# with the tool selection reverted is a PLAIN CHAT answer that `_gemini_landed`
+# then accepts as the recovered research — the exact outcome the re-arm exists
+# to prevent, through a door nothing was watching.
+#
+# ⭐ PINNED ON THE PARSE TREE, NOT ON THE TEXT. "An `elif` is not there any more"
+# is a structural fact; asserted as a substring it is a fact a comment can
+# supply. `orelse` is a node, and no comment can put one there or take one away.
+
+def _ladder_retried_if():
+    """The `if _retried:` statement of the dropped-send ladder, as an AST node,
+    with the statement list it lives in."""
+    tree = ast.parse(textwrap.dedent(GEM_SRC))
+    for parent in ast.walk(tree):
+        for field in ("body", "orelse", "finalbody"):
+            block = getattr(parent, field, None)
+            if not isinstance(block, list):
+                continue
+            for i, node in enumerate(block):
+                if (isinstance(node, ast.If)
+                        and isinstance(node.test, ast.Name)
+                        and node.test.id == "_retried"):
+                    return node, block, i
+    raise AssertionError(
+        "the dropped-send ladder's `if _retried:` statement is gone — if the "
+        "re-draft call was removed, this test should go with it")
+
+
+def test_the_redraft_arm_does_not_own_the_ladders_only_else():
+    """⛔⛔ THE RE-PASTE MUST NOT BE THE RE-DRAFT'S ALTERNATIVE. While it was,
+    a successful re-draft silently bought the attempt out of the composer read,
+    the re-paste and the DR re-arm."""
+    node, _block, _i = _ladder_retried_if()
+    assert node.orelse == [], (
+        "`if _retried:` still carries an else/elif — the ladder's re-paste and "
+        "Deep Research re-arm are gated on a re-draft NOT having happened, "
+        "which is the guarantee the retired helper only ever kept by accident"
+    )
+
+
+def test_the_repaste_arm_is_gated_on_the_conversation_and_nothing_else():
+    """⭐ WHAT IT IS GATED ON INSTEAD, AND IT IS THE RIGHT THING. The ladder
+    exists because no conversation was created; a re-draft that landed one is
+    seen through that check, and one that did not falls into the re-paste
+    exactly as every attempt did before wave 10."""
+    _node, block, i = _ladder_retried_if()
+    following = block[i + 1:]
+    assert following, "nothing follows the re-draft arm — the ladder is gone"
+    nxt = following[0]
+    assert isinstance(nxt, ast.If), (
+        "the re-paste ladder must be the re-draft's SIBLING, not its else")
+    test_src = ast.dump(nxt.test)
+    assert "_gemini_in_conversation" in test_src, (
+        "the re-paste arm must be gated on the conversation, which is what the "
+        "ladder is actually about")
+    assert "_retried" not in test_src, (
+        "nothing in the re-paste's own condition may consult whether a "
+        "re-draft happened")
+    body_src = ast.dump(ast.Module(body=nxt.body, type_ignores=[]))
+    assert "ensure_deep_mode_active" in body_src, (
+        "the arm that re-submits must still be the arm that re-arms Deep "
+        "Research first")

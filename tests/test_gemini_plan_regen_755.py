@@ -42,8 +42,13 @@ above are what that convention costs when nothing executes the thing it wires.
 Run:  pytest tests/test_gemini_plan_regen_755.py -v
 """
 import inspect
+import os
+import sys
 
-import research
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import research  # noqa: E402
+from conftest import code_only  # noqa: E402
 
 
 def _phase2_src():
@@ -57,6 +62,18 @@ def _2d_loop():
     src = _phase2_src()
     return src.split("start_clicked = False", 1)[1].split(
         '# CUA recovery for "Start research"', 1)[0]
+
+
+def _2d_loop_code():
+    """The same slice with `#` comments blanked — for assertions about CODE.
+
+    `code_only` blanks in place, so the raw offsets stay valid, which matters
+    here because the END boundary is itself a comment."""
+    raw = _phase2_src()
+    blanked = code_only(raw)
+    i = raw.index("start_clicked = False") + len("start_clicked = False")
+    j = raw.index('# CUA recovery for "Start research"', i)
+    return blanked[i:j]
 
 
 def test_regen_is_bounded():
@@ -80,15 +97,23 @@ def test_regen_wires_the_redraft_path():
     A wiring assertion cannot see that the thing it is wired to does not work,
     which is why the replacement path is pinned by EXECUTION against the
     owner's captured DOM in test_gemini_redraft_0910.py — this test only keeps
-    the wire attached."""
-    loop = _2d_loop()
+    the wire attached.
+
+    ⛔⛔ AND THE NEGATIVE HALF OF IT IS GONE, 2026-09-18. This also asserted
+    `"_try_inpage_retry_on_research_fail(" not in loop`. The helper was retired
+    that day and its name no longer exists anywhere in the module, so no
+    realistic edit could make that line fail — an unfalsifiable assertion
+    standing in for a retirement it could not see. The live pin is
+    tests/test_gemini_dr_error_retry.py::
+    test_the_retired_helper_is_gone_and_nothing_calls_it, which parses the
+    module for a definition or a call. What is left here reads the loop with
+    comments BLANKED, because a containment pin on raw source is satisfied by a
+    comment naming the call — which is how a wire that clicked nothing stayed
+    certified for fifteen months."""
+    loop = _2d_loop_code()
     assert "_gemini_redraft_plan(" in loop, (
         "the [2D] loop no longer calls _gemini_redraft_plan — the plan-fail "
         "re-draft is not wired in"
-    )
-    assert "_try_inpage_retry_on_research_fail(" not in loop, (
-        "the [2D] loop is delegating to the text-gated shared helper again; its "
-        "word list has never matched Gemini's control"
     )
     assert "_gemini_plan_verdict(" in loop, (
         "the re-draft must be gated on the plan STATE, not on `not "

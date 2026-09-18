@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import sys
 
 import pytest
@@ -427,6 +428,227 @@ def test_a_curly_apostrophe_does_not_defeat_the_pattern():
 ])
 def test_the_widened_wordings_are_recognised(text):
     assert research._gemini_reads_as_failed(text)
+
+
+# ── The retired reader's wordings, one sentence per alternation ──────────────
+#
+# ⛔⛔ THE SUPERSET CLAIM WAS FALSE, AND IT WAS THE PERMISSION SLIP FOR A
+# DELETION. `_try_inpage_retry_on_research_fail` was retired on 2026-09-18 on
+# the record that `_GEMINI_PLAN_FAIL_RE` was "a strict SUPERSET of the old
+# `fail_re`". Cross-verify ran both patterns instead of reading them and found
+# sentences the retired one caught and the new one dropped — five of the old
+# thirteen alternations wrote their apostrophe `'?`, and one of them had no
+# counterpart at all without a leading "i", so "We can't help you with that at
+# this time" was matched by the reader that was about to be deleted.
+#
+# ⛔⛔ THE COUNT, RE-DERIVED 2026-09-18. It was recorded as TEN here, in the
+# tombstone and in the pattern's own note, and ten is reproducible from nothing:
+# not from the code, not from the list below. Enumerated exhaustively instead —
+# the retired pattern's thirteen alternations expand to 49 concrete sentences
+# (every optional group both ways), and the PRE-widening reader dropped NINETEEN
+# of them, across exactly FIVE alternations. The alternation count was right all
+# along; the sentence count was invented. The list below is one sentence per
+# alternation, so it exercises 8 of those 19 — that is what `<<<` marks, and it
+# is the honest description of this fixture rather than a claim to be the whole
+# measurement. `test_the_retired_language_is_covered_exhaustively` is the whole
+# measurement.
+#
+# ⭐ THIS IS THE ONLY COPY OF THAT PATTERN LEFT. It is reproduced verbatim from
+# `_try_inpage_retry_on_research_fail`'s `fail_re` as the BROWSER received it
+# (the source stored it double-escaped to survive the Python-raw → JS-template
+# hop; these are the single backslashes `new RegExp()` actually compiled). Every
+# case below is asserted against it FIRST — a fixture that has drifted off the
+# retired behaviour is a fixture that proves nothing about the retirement.
+RETIRED_FAIL_RE = re.compile(
+    r"research\s+stopped|research\s+failed|"
+    r"failed\s+to\s+(?:generate|complete|run|continue)|"
+    r"something\s+went\s+wrong|encountered\s+an?\s+(?:issue|error)|"
+    r"unable\s+to\s+(?:continue|complete|generate)|"
+    r"couldn'?t\s+complete|response\s+stopped|"
+    r"this\s+research\s+(?:was\s+)?(?:stopped|interrupted)|"
+    r"sorry,?\s+(?:i'?m\s+|i\s+)?can'?t\s+help|"
+    r"i\s+can'?t\s+help\s+(?:you\s+)?with\s+that|"
+    r"can'?t\s+help\s+(?:you\s+)?with\s+that\s+at\s+this\s+time|"
+    r"i'?m\s+(?:unable|not\s+able)\s+to\s+help",
+    re.IGNORECASE)
+
+# (the old alternation this sentence exercises, the sentence). The `<<<` ones
+# are the EIGHT of these thirty the new pattern dropped before this wave widened
+# it — eight of the nineteen sentences in the retired pattern's full language.
+RETIRED_ALTERNATIONS = [
+    (r"research\s+stopped", "Research stopped."),
+    (r"research\s+failed", "The research failed."),
+    (r"failed\s+to\s+generate", "Failed to generate the plan."),
+    (r"failed\s+to\s+complete", "Failed to complete the request."),
+    (r"failed\s+to\s+run", "Failed to run the research."),
+    (r"failed\s+to\s+continue", "Failed to continue."),
+    (r"something\s+went\s+wrong", "Something went wrong."),
+    (r"encountered\s+an\s+error", "I encountered an error doing what you asked."),
+    (r"encountered\s+an\s+issue", "I encountered an issue."),
+    (r"unable\s+to\s+continue", "Unable to continue."),
+    (r"unable\s+to\s+complete", "Unable to complete this."),
+    (r"unable\s+to\s+generate", "Unable to generate a response."),
+    (r"couldn't\s+complete", "I couldn't complete that."),
+    (r"couldnt\s+complete <<<", "I couldnt complete that."),
+    (r"response\s+stopped", "Response stopped."),
+    (r"this\s+research\s+was\s+stopped", "This research was stopped."),
+    (r"this\s+research\s+interrupted", "This research interrupted."),
+    (r"sorry,\s+i\s+can't\s+help", "Sorry, I can't help with that."),
+    (r"sorry\s+i\s+can't\s+help", "Sorry I can't help."),
+    (r"sorry,\s+i\s+cant\s+help <<<", "Sorry, I cant help with that."),
+    (r"i\s+can't\s+help\s+with\s+that", "I can't help with that."),
+    (r"i\s+can't\s+help\s+you\s+with\s+that", "I can't help you with that."),
+    (r"i\s+cant\s+help\s+you\s+with\s+that <<<", "I cant help you with that."),
+    (r"can't\s+help\s+…\s+at\s+this\s+time <<<",
+     "We can't help you with that at this time."),
+    (r"cant\s+help\s+…\s+at\s+this\s+time <<<",
+     "We cant help you with that at this time."),
+    (r"can't\s+help\s+…\s+at\s+this\s+time (no subject) <<<",
+     "Can't help you with that at this time."),
+    (r"i'm\s+unable\s+to\s+help", "I'm unable to help."),
+    (r"im\s+unable\s+to\s+help <<<", "Im unable to help."),
+    (r"i'm\s+not\s+able\s+to\s+help", "I'm not able to help."),
+    (r"im\s+not\s+able\s+to\s+help <<<", "Im not able to help."),
+]
+
+
+@pytest.mark.parametrize("alternation,text", RETIRED_ALTERNATIONS,
+                         ids=[t for _, t in RETIRED_ALTERNATIONS])
+def test_the_widened_pattern_covers_every_retired_alternation(alternation, text):
+    """⛔⛔ THE TEST THAT MAKES THE RETIREMENT SAFE. Every sentence the deleted
+    reader would have caught, fed through the one that replaces it — and through
+    its real consumer, not through the bare regex, because the bound and the
+    normaliser are part of the reading."""
+    assert RETIRED_FAIL_RE.search(text), (
+        f"the fixture has drifted: {text!r} was never matched by the retired "
+        f"{alternation!r} either, so it proves nothing about the retirement")
+    assert research._gemini_reads_as_failed(text), (
+        f"{text!r} was read as a failure by the retired "
+        f"_try_inpage_retry_on_research_fail ({alternation!r}) and is not read "
+        f"as one now — retiring that helper LOSES this wording")
+
+
+def test_the_retired_wordings_reach_the_verdict_the_loop_turns_on():
+    """⭐ THE CONSUMER, NOT THE PATTERN. A widening that never reaches
+    `_gemini_plan_verdict` is a widening of nothing: this is the call the [2D]
+    loop makes, on the alternation that had no counterpart at all."""
+    assert research._gemini_plan_verdict(
+        research_started=False, start_present=False, streaming=False,
+        latest_text="We can't help you with that at this time.") == "failed"
+    assert research._gemini_plan_verdict(
+        research_started=False, start_present=False, streaming=False,
+        latest_text="Im unable to help.") == "failed"
+    # ⛔ And the widening must not have cost the arms above it: a started
+    # research and an actionable Start still outrank the same sentence.
+    assert research._gemini_plan_verdict(
+        research_started=True, start_present=False, streaming=False,
+        latest_text="We can't help you with that at this time.") == "researching"
+
+
+# ── The retired reader's WHOLE language, generated rather than listed ─────────
+#
+# ⛔⛔ THE NUMBER IN THE TOMBSTONE HAD TO BE RE-DERIVABLE, AND IT WAS NOT. The
+# record of why a 111-line deletion was safe said "ten sentences, across five
+# alternations" in three places, and ten comes out of neither the code nor the
+# hand-written list above. This is the derivation, run instead of quoted: every
+# alternation of the retired pattern expanded to its MINIMAL language — each
+# optional group taken both ways, each choice enumerated, `\s+` written as the
+# single space the normaliser collapses it to. Thirteen alternations, 49
+# sentences, and the pre-widening reader dropped 19 of them across exactly FIVE
+# alternations (the apostrophe-optional halves of four, plus the whole of
+# `can'?t help (you )?with that at this time`, which had no counterpart at all
+# without a leading "i"). The ALTERNATION count was right all along.
+#
+# ⭐ AND THIS IS THE SUPERSET CLAIM MADE TOTAL. The list above exercises one
+# sentence per alternation — 30 of them, 8 of which the pre-widening reader
+# dropped. This exercises all 49, so a future narrowing anywhere in the pattern
+# fails here even if it misses every hand-picked fixture.
+RETIRED_LANGUAGE = {
+    "research stopped": ["research stopped"],
+    "research failed": ["research failed"],
+    "failed to X": ["failed to " + v
+                    for v in ("generate", "complete", "run", "continue")],
+    "something went wrong": ["something went wrong"],
+    "encountered a(n) X": ["encountered " + a + " " + v
+                           for a in ("a", "an") for v in ("issue", "error")],
+    "unable to X": ["unable to " + v
+                    for v in ("continue", "complete", "generate")],
+    "couldn(')t complete": ["couldn't complete", "couldnt complete"],
+    "response stopped": ["response stopped"],
+    "this research (was) X": ["this research " + w + v
+                              for w in ("", "was ")
+                              for v in ("stopped", "interrupted")],
+    "sorry(,) (i'm|im|i) can(')t help": [
+        "sorry" + c + " " + s + "can" + a + "t help"
+        for c in ("", ",") for s in ("", "i'm ", "im ", "i ")
+        for a in ("'", "")],
+    "i can(')t help (you) with that": [
+        "i can" + a + "t help " + y + "with that"
+        for a in ("'", "") for y in ("", "you ")],
+    "can(')t help (you) with that at this time": [
+        "can" + a + "t help " + y + "with that at this time"
+        for a in ("'", "") for y in ("", "you ")],
+    "i(')m (unable|not able) to help": [
+        "i" + a + "m " + v + " to help"
+        for a in ("'", "") for v in ("unable", "not able")],
+}
+
+
+def test_the_retired_languages_shape_is_the_one_the_record_claims():
+    """⛔ THE FIGURES THE TOMBSTONE NOW QUOTES, RE-DERIVED HERE. A number in a
+    comment that nothing reproduces is worse than no number — this is what
+    reproduces them."""
+    sentences = [s for group in RETIRED_LANGUAGE.values() for s in group]
+    assert len(RETIRED_LANGUAGE) == 13
+    assert len(sentences) == 49
+    assert len(set(sentences)) == 49, "the enumeration must not repeat itself"
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [s for group in RETIRED_LANGUAGE.values() for s in group])
+def test_the_retired_language_is_covered_exhaustively(sentence):
+    """⛔⛔ THE SUPERSET CLAIM, TOTAL. Nineteen of these forty-nine were dropped
+    by the reader that was about to become the only one in the file."""
+    assert RETIRED_FAIL_RE.search(sentence), (
+        f"the enumeration has drifted: {sentence!r} was never matched by the "
+        f"retired pattern either, so it proves nothing about the retirement")
+    assert research._gemini_reads_as_failed(sentence), (
+        f"{sentence!r} is inside the retired reader's language and is not read "
+        f"as a failure now — retiring that helper LOSES this wording")
+
+
+# A research plan whose ONLY failure-shaped wording is one this wave ADDED.
+# ⛔ Nothing else in it matches: no "something went wrong", no "research
+# stopped", no "failed to …", no "unable to …", no "encountered an error". If
+# this prose reads as a failure, it is because of the widening and nothing else.
+PLAN_CARRYING_ONLY_A_WIDENED_WORDING = (
+    "Here is your research plan. Objective: document how three vendors phrased "
+    "their refusals during the 2026 support-desk review. Step 1: collect the "
+    "transcripts and quote them verbatim, including the line \"we cant help you "
+    "with that at this time\" that two of the three used. Step 2: group the "
+    "refusals by channel and by hour of the day, and note which of them offered "
+    "a callback. Step 3: compare the phrasing against each vendor's published "
+    "support policy and its service-level commitments. Step 4: assemble an "
+    "appendix of the exact sentences with timestamps, and a one-page summary. "
+    "Ready to start?")
+
+
+def test_the_widening_did_not_swallow_the_plan_about_failures():
+    """⛔⛔ THE WIDENING'S OWN OVER-CORRECTION RISK, PINNED ON PROSE ONLY THE
+    WIDENING CAN REACH. Every apostrophe-less form added here makes the pattern
+    looser, and the turn being read is Gemini's own plan, which restates the
+    user's brief — a brief about support refusals puts the newly-covered
+    sentence on screen as CONTENT. The size bound is the only thing between that
+    and a good plan being re-drafted to the cap, so it is asserted against the
+    widened pattern rather than assumed to still hold."""
+    norm = research._gemini_norm(PLAN_CARRYING_ONLY_A_WIDENED_WORDING)
+    # the widening really did reach this prose — this is what makes the bound
+    # load-bearing rather than decorative
+    assert research._GEMINI_PLAN_FAIL_RE.search(norm)
+    assert len(norm) > research._GEMINI_PLAN_FAIL_MAX_CHARS
+    assert not research._gemini_reads_as_failed(
+        PLAN_CARRYING_ONLY_A_WIDENED_WORDING)
 
 
 @pytest.mark.parametrize("text", [
@@ -1051,3 +1273,224 @@ def test_a_stop_between_the_reading_and_the_click_is_honoured():
     assert (ok, acted) == (False, False)
     assert page.clicks == []
     assert "stop requested" in why
+
+
+# ── The send path's waiter, which is what the retired helper became ──────────
+#
+# ⛔⛔ `_try_inpage_retry_on_research_fail` WAS RETIRED ON 2026-09-18 AND ITS TWO
+# CALL SITES LAND HERE. It carried its own failure regex inside a JS template,
+# read `document.body.innerText` — which carries the pasted brief — and clicked
+# any button whose accessible name was in `retry|regenerate|try again|rerun|
+# restart`. Gemini's control is `aria-label="Redo"`: it clicked NOTHING in
+# fifteen months. What survives is the waiting; every decision now belongs to
+# the machinery above, so what has to be pinned here is the WAITING and the
+# GATE — and above all that a click is no longer mistaken for a success.
+
+class _FakeSendPage(_FakePage):
+    """`_FakePage`, plus the two probes the send-path waiter buys before it
+    lets anything be clicked."""
+
+    def __init__(self, readings, *, body="", start_present=False):
+        super().__init__(readings)
+        self.body = body
+        self.start_present = start_present
+
+    async def evaluate(self, js, arg=None):
+        if js is research._GEMINI_START_PRESENT_JS:
+            return self.start_present
+        if isinstance(js, str) and "document.body.innerText" in js:
+            return self.body
+        return await super().evaluate(js, arg)
+
+
+def _wait(page, max_wait_s=5.0):
+    return asyncio.run(
+        research._gemini_retry_failed_turn(page, "T", max_wait_s=max_wait_s,
+                                           settle_s=0))
+
+
+def test_the_send_path_waiter_redrafts_a_failed_turn():
+    # ⛔ TWO reads before it hands the turn on, not one — corrected 2026-09-18
+    # when the waiter began requiring a SETTLED turn (see
+    # `test_a_streaming_plan_is_never_redrafted_however_failed_it_reads`). A
+    # real page returns the same unchanged reading on both polls, which is
+    # exactly what this script now says.
+    page = _FakeSendPage([FAILED, FAILED, FAILED, MENU_UP, REDRAFTED])
+    assert _wait(page) is True
+    assert len(page.clicks) == 1
+    assert page.picks == [{"testid": "regenerate-option",
+                           "name": "Don't personalise"}]
+
+
+def test_the_waiter_returns_THE_OUTCOME_NOT_THE_CLICK():
+    """⛔⛔ THE CONTRACT THE RETIRED HELPER GOT WRONG, AND ITS CALLER READ. That
+    helper returned True for having CLICKED — and one click on Redo opens an
+    overlay that re-drafts nothing. Its second call site treats True as "the
+    retry worked" and SKIPS the re-paste the dropped-send ladder exists to do,
+    so a menu-opening click cost the run a real attempt and logged a success."""
+    page = _FakeSendPage([FAILED, FAILED, FAILED, MENU_UP, MENU_UP])
+    assert _wait(page) is False
+    assert len(page.clicks) == 1, "it still spent its one click"
+
+
+# ── The window the send path opens: a plan that is merely HALF-DRAWN ──────────
+#
+# ⛔⛔ `_gemini_retry_failed_turn` IS CALLED 3 SECONDS AFTER THE SEND AND POLLS
+# FOR 90 — which is exactly the window in which Gemini is streaming the plan it
+# was just asked for. `_gemini_plan_verdict` consults the failure reader BEFORE
+# `streaming`, deliberately and correctly (a genuinely failed turn shows a
+# streaming animation too), and a half-drawn plan is under
+# `_GEMINI_PLAN_FAIL_MAX_CHARS` — so a HEALTHY plan for a failure-themed brief
+# reads as `failed` for as long as it is short. Before wave 10 this call site
+# could not click at all (the retired word list never matched `aria-label=
+# "Redo"`), so re-drafting healthy work is an exposure the re-pointing
+# INTRODUCED: the exact harm the size bound exists to prevent, through a new
+# door. The fix is to act on a SETTLED turn — the same text twice — and these
+# prefixes are what a settled reading tells apart from a sampled one.
+_MPL = "Here is my plan to research why the Mars Polar Lander was unable to " \
+       "complete its descent."
+STREAMING_PLAN = [
+    _MPL,
+    _MPL + " I will start with the 1999 mission timeline",
+    _MPL + " I will start with the 1999 mission timeline and the loss of signal",
+    _MPL + " I will start with the 1999 mission timeline and the loss of signal "
+           "at entry, then the review board's",
+    _MPL + " I will start with the 1999 mission timeline and the loss of signal "
+           "at entry, then the review board's findings on the touchdown sensor",
+    _MPL + " I will start with the 1999 mission timeline and the loss of signal "
+           "at entry, then the review board's findings on the touchdown sensor "
+           "logic, and finally what",
+    _MPL + " I will start with the 1999 mission timeline and the loss of signal "
+           "at entry, then the review board's findings on the touchdown sensor "
+           "logic, and finally what the software change would have cost",
+    _MPL + " I will start with the 1999 mission timeline and the loss of signal "
+           "at entry, then the review board's findings on the touchdown sensor "
+           "logic, and finally what the software change would have cost. Ready?",
+]
+
+
+def test_every_prefix_of_that_healthy_plan_reads_as_a_failure():
+    """The fixture's whole point: each of these is a HEALTHY plan being drawn,
+    and the reader calls every one of them a failure. Nothing about the pattern
+    or the bound can tell them apart — only time can."""
+    for prefix in STREAMING_PLAN:
+        assert len(research._gemini_norm(prefix)) \
+            <= research._GEMINI_PLAN_FAIL_MAX_CHARS, prefix
+        assert research._gemini_reads_as_failed(prefix) is True, prefix
+
+
+def test_a_streaming_plan_is_never_redrafted_however_failed_it_reads():
+    """⛔⛔ THE SEND PATH'S OWN DOOR TO THE HARM, CLOSED. Three seconds after the
+    send, this waiter looks at a plan that is still being typed and every single
+    reading of it says "failed". One Redo here re-drafts work that was never
+    broken. A turn that has genuinely failed never changes again; a turn that is
+    still being drawn is never byte-identical 1.5 s apart."""
+    page = _FakeSendPage([{"found": True, "text": t,
+                           "controls": [_c("testid")], "rows": []}
+                          for t in STREAMING_PLAN])
+    assert _wait(page) is False
+    assert page.clicks == [], (
+        "a plan that changed between two polls was re-drafted — the size "
+        "bound's harm, reached through the caller instead of the pattern")
+    assert page.reads >= 2, "it must have looked more than once"
+
+
+def test_a_turn_that_stopped_changing_is_still_redrafted():
+    """⭐ AND THE COST IS ONE POLL, NOT THE CAPABILITY. The same fixture, drawn
+    to a halt on a failure: the waiter waits one more tick and then acts."""
+    settled = {"found": True, "text": STREAMING_PLAN[0],
+               "controls": [_c("testid")], "rows": []}
+    page = _FakeSendPage([settled, settled, settled, MENU_UP, REDRAFTED])
+    assert _wait(page) is True
+    assert len(page.clicks) == 1
+
+
+def test_the_waiter_leaves_a_running_research_alone():
+    """⛔⛔ THE ONE DESTRUCTIVE MOVE ON THIS SCREEN. The 2026-07-13 auto-start
+    layout renders Start disabled for ever, so "a failed-looking turn with no
+    Start control" cannot tell a dead plan from a live research run — only the
+    research-card probe can, and re-drafting a running research throws the run
+    away."""
+    page = _FakeSendPage([FAILED, FAILED, MENU_UP, REDRAFTED],
+                         body="Researching 42 websites")
+    assert _wait(page) is False
+    assert page.clicks == []
+
+
+def test_a_running_research_probe_that_raised_reads_as_RUNNING():
+    """⛔⛔ AND THE POLARITY IS INVERTED AT THIS CALL SITE.
+    `_gemini_research_started` is documented fail-closed (False) so a probe miss
+    never fakes a start — but here False is what AUTHORISES the click. A probe
+    that could not answer must read as "assume it is running": the cost is one
+    re-draft skipped, against re-drafting a live run.
+
+    ⛔ THE PROBE IS REPLACED RATHER THAN FED A BAD PAGE, AND THAT IS THE HONEST
+    SHAPE. `_gemini_research_started` swallows its own `evaluate` failure and
+    returns False, so an unreadable page does NOT reach this `except` — only
+    what escapes that function does (a body the pattern cannot be run against).
+    Feeding it a raising page would have pinned the opposite of what happens."""
+    async def _raises(page):
+        raise RuntimeError("the running-research probe could not answer")
+
+    page = _FakeSendPage([FAILED, FAILED, MENU_UP, REDRAFTED])
+    real = research._gemini_research_started
+    research._gemini_research_started = _raises
+    try:
+        assert _wait(page) is False
+    finally:
+        research._gemini_research_started = real
+    assert page.clicks == []
+
+
+def test_an_offered_start_research_outranks_the_failure_above_it():
+    """The verdict's own ordering, reached from this call site: something
+    actionable beats any diagnosis of what went wrong."""
+    page = _FakeSendPage([FAILED, FAILED, MENU_UP, REDRAFTED], start_present=True)
+    assert _wait(page) is False
+    assert page.clicks == []
+
+
+def test_a_healthy_turn_is_never_touched_and_the_wait_is_bounded():
+    page = _FakeSendPage([REDRAFTED])
+    assert _wait(page, max_wait_s=0.01) is False
+    assert page.clicks == []
+    assert page.reads >= 1, "it must actually have looked"
+
+
+def test_an_unreadable_page_never_reports_a_redraft_from_the_send_path():
+    page = _FakeSendPage([{"found": False, "text": "", "controls": [], "rows": []}])
+    assert _wait(page, max_wait_s=0.01) is False
+    assert page.clicks == []
+
+
+def test_the_waiter_does_not_drive_the_page_after_stop():
+    """"No post-Stop DOM driving" is the standing rule, and the waiter is the
+    outermost thing on this path — it must not even read."""
+    class _Stopping:
+        def is_stop(self):
+            return True
+
+    page = _FakeSendPage([FAILED, FAILED, MENU_UP, REDRAFTED])
+    real = research._controls
+    research._controls = _Stopping()
+    try:
+        assert _wait(page) is False
+    finally:
+        research._controls = real
+    assert page.reads == 0
+    assert page.clicks == []
+
+
+@pytestmark_node
+def test_a_control_named_only_by_title_is_still_found():
+    """⛔ RE-POINTED FROM THE RETIRED HELPER'S OWN GUARD, AND EXECUTED THIS TIME.
+    That helper read `title` explicitly because an icon-only regenerate button
+    may carry its label there; the test that guarded it asserted a substring of
+    the helper's source. This drives the real reader against markup whose only
+    accessible name is a `title`."""
+    html = CAPTURED_FAIL_TURN.replace(
+        '<button aria-label="Redo">', '<button title="Redo">')
+    r = _read(html)
+    control, why = research._gemini_regen_control(r["controls"])
+    assert control is not None, why
+    assert control["name"] == "Redo"

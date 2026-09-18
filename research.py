@@ -1954,8 +1954,8 @@ def _generate_research_summary_async(topic, brief_text="", findings_text=""):
     cascade: Haiku 4.5 → Gemini Flash 2.5 → truncate → topic stub.
 
     Per UX direction 2026-05-10: NO summary is written before research
-    completes. The single call site is after P2 builds consolidated.md
-    (all 3 agent reports merged) — by then the pipeline has the real
+    completes. The single call site is after P2 merges the three agent
+    reports — by then the pipeline has the real
     findings to summarize. P3 (podcast) and FE P4/P5 (YouTube + Doc +
     email) are distribution-only — they add no new research content,
     so no further summary refresh. The FE typewriter-animates the
@@ -38556,15 +38556,21 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
             documents_dir.mkdir(parents=True, exist_ok=True)
             fname = agent_key + ".md"
             md_content = f"# {name} Deep Research\n\n{text}"
-            (documents_dir / fname).write_text(md_content, encoding="utf-8")
-            local_saved = True
-            log(f"[{name}] Saved {n_chars} chars to documents/{fname}")
-            # Extract real cited-source findings from the just-written
-            # markdown so the FE GraphAnalysis Findings tab can render
-            # rich {url, snippet, sourceTitle} cards instead of just
-            # section headings. Persisted by save_meta's agents map
-            # writer (research.py:~17686). Source URLs come from the
-            # in-memory progress snapshot (already deduped).
+            # Extract real cited-source findings from the markdown so the FE
+            # GraphAnalysis Findings tab can render rich
+            # {url, snippet, sourceTitle} cards instead of just section
+            # headings. Persisted by save_meta's agents map writer
+            # (research.py:~17686). Source URLs come from the in-memory
+            # progress snapshot (already deduped).
+            #
+            # ⛔⛔ WAVE 10 — THIS RUNS BEFORE THE WRITE NOW, and the order is the
+            # point, not tidiness. The numbering below appends a Sources
+            # list of markdown links; extracted after it, every one of those
+            # links is itself "a URL in the report", so the Findings tab would
+            # fill with rows whose snippet is a bibliography line and whose
+            # heading is "Sources". The findings are read from the CLEAN
+            # report, and the numbering is then built from those same findings.
+            _findings = []
             try:
                 _src_urls = list(getattr(_runtime, "agent_progress_snapshots", {}).get(agent_key, {}).get("source_urls", []) or [])
                 # ⛔ NO LONGER GATED ON THE PANEL LIST. `if _src_urls:` meant a
@@ -38573,7 +38579,7 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
                 # report is the other input now, so the only thing that can
                 # make findings impossible is having no report.
                 if md_content:
-                    _findings = _extract_findings(md_content, _src_urls)
+                    _findings = _extract_findings(md_content, _src_urls) or []
                     if _findings:
                         _runtime.agent_findings[agent_key] = _findings
                         _from_panel = sum(
@@ -38583,6 +38589,14 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
                             f"report {len(_findings) - _from_panel})")
             except Exception as _ef:
                 log(f"[{name}] findings extraction failed: {_ef}", "DEBUG")
+                _findings = []
+            # ⭐ Wave 10 — the numbers a reader clicks. BEFORE both writes, so
+            # the local .md, the Firestore mirror the Documents page renders and
+            # the NotebookLM upload all carry the same bibliography.
+            md_content = _document_with_sources(md_content, findings=_findings)
+            (documents_dir / fname).write_text(md_content, encoding="utf-8")
+            local_saved = True
+            log(f"[{name}] Saved {n_chars} chars to documents/{fname}")
         except Exception as e:
             log(f"[{name}] Local MD save failed: {e}", "WARN")
         if local_saved:
@@ -39112,21 +39126,34 @@ _GEMINI_COMPLETION_RE = re.compile(
 # #897a (2026-07-04): the periodic-reload recovery subsystem
 # (_GEMINI_CONVERSATION_PRESENT_JS / _gemini_conversation_id /
 # _gemini_conversation_present / _gemini_reopen_from_sidebar /
-# _gemini_recover_if_empty) was deleted along with the reload itself —
-# Gemini is never reloaded mid-run anymore, so there is nothing to recover.
+# _gemini_recover_if_empty) was deleted along with the reload itself, and all
+# five stay deleted.
+# ⭐ CORRECTED 2026-09-18: "so Gemini is never reloaded mid-run" stopped being
+# true at wave 10. The bounded stale-research cadence
+# (`_gemini_stale_reload_due`, wired in the round-robin's Gemini leg) reloads a
+# post-Start tab in place — but it did NOT restore any of the above: it proves
+# IDENTITY (`_gemini_reload_identity_ok`) instead of presence, and recovers
+# through the sidebar hunt that already exists rather than through a second
+# copy of one. A bound and a proof are what this subsystem never had.
 
 
 # ── Gemini's plan-fail regenerate control (the 09-10 captured DOM) ────────────
 #
 # ⛔⛔ WHY THIS EXISTS AT ALL, AND WHY IT IS NOT THE SHARED RETRY HELPER.
-# `_try_inpage_retry_on_research_fail` has never clicked anything on Gemini's
+# `_try_inpage_retry_on_research_fail` never clicked anything on Gemini's
 # plan-fail screen, and could not have. Measured 2026-09-10 against the owner's
 # live console dump: the control is `aria-label="Redo"`, and that helper's word
-# list is `retry|regenerate|try again|rerun|restart` — "Redo" matches none of
-# them. Its failure-text alternation says `encountered`, and one of the two real
+# list was `retry|regenerate|try again|rerun|restart` — "Redo" matches none of
+# them. Its failure-text alternation said `encountered`, and one of the two real
 # wordings says `encountering`. Two words, fifteen months, zero clicks: there is
 # not one `inpage_retry_clicked` line for Gemini in 96 MB of logs, and that is
 # construction, not luck.
+#
+# ⭐ 2026-09-18 — AND THAT HELPER IS NOW GONE, so this is no longer "not the
+# shared helper", it is the only reader of this screen. Its two send-path
+# callers wait through `_gemini_retry_failed_turn` and end up here. See the
+# tombstone at `_chatgpt_force_new_chat`'s doorstep for what was deleted and
+# what had to be widened into `_GEMINI_PLAN_FAIL_RE` first.
 #
 # ⭐⭐ THE STRUCTURAL LESSON, WHICH IS THE WHOLE REASON THIS IS SHAPED LIKE THIS.
 # The wording could be wrong for that long because the guard's regex lived
@@ -39301,9 +39328,18 @@ _GEMINI_LATEST_TURN_JS = """
     }
   }
 
+  // ⛔⛔ AND THE TURN'S ENDING, WHICH `text` CANNOT CARRY. `text` is the FIRST
+  // 4000 characters, which is the whole of a plan-fail bubble and nowhere near
+  // the whole of a research turn: a research that dies has already rendered the
+  // card and however much of the report arrived, so on any real report the
+  // error sentence sits far past 4000 and is sliced away. A reader whose failure
+  // text is structurally unable to contain the failure is the fifteen-month
+  // defect in a new costume — it would refuse every research, for ever, and
+  // read as "Gemini has no Redo button". Same node, same property, other end.
   return JSON.stringify({
     found: true,
     text: (turn.innerText || '').slice(0, 4000),
+    tail: (turn.innerText || '').slice(-4000),
     controls: controls,
     rows: rows,
   });
@@ -39457,19 +39493,42 @@ def _gemini_norm(text: str) -> str:
 # ⛔ `encounter(?:ed|ing)` — the old pattern said `encountered` only, and the
 # live text says "I seem to be encountering an error". A past-tense-only verb
 # in a UI that narrates in the present is the whole of cause 2.
+#
+# ⛔⛔ THIS PATTERN IS NOW THE ONLY FAILURE READER IN THE FILE, AND IT ONLY
+# EARNED THAT BY BEING WIDENED FIRST. `_try_inpage_retry_on_research_fail` was
+# retired on 2026-09-18 and its `fail_re` went with it — but the claim that this
+# pattern already covered that one was FALSE, and cross-verify disproved it by
+# running both. Five of the old alternations wrote their apostrophe `'?`, and
+# one of them — "can't help ... with that at this time" — had no counterpart
+# here without a leading "i", so "We can't help you with that at this time" was
+# caught by the retired reader and would have stopped being caught. NINETEEN
+# sentences in all, across those five alternations — the retired pattern's
+# minimal language is 49 sentences and 19 of them were dropped; the "ten"
+# recorded here until 2026-09-18 was not reproducible from anything. They are
+# pinned one per old alternation in
+# `test_gemini_redraft_0910.py::test_the_widened_pattern_covers_every_retired_alternation`,
+# against a verbatim copy of the retired pattern, which is what makes the
+# retirement safe rather than merely tidy.
+#
+# ⭐ WHAT NEEDED NO ALTERNATION, BECAUSE `_gemini_norm` ALREADY DOES IT: the old
+# pattern's `\s+` between every word (the normaliser collapses whitespace), its
+# `re.IGNORECASE` (the normaliser lowercases) and the curly `’` a real bubble
+# renders (the normaliser maps it, which `'?` never did). Only a MISSING
+# apostrophe survives normalisation — hence `'?`, and nothing more.
 _GEMINI_PLAN_FAIL_RE = re.compile(
     r"something went wrong"
     r"|encounter(?:ed|ing) an? (?:issue|error)"
     r"|an error (?:occurred|has occurred)"
     r"|unable to (?:start|continue|complete|generate)"
-    r"|(?:can|could|did)n't (?:complete|start|continue|generate|finish)"
+    r"|(?:can|could|did)n'?t (?:complete|start|continue|generate|finish)"
     r"|research (?:stopped|failed)"
     r"|failed to (?:generate|complete|run|continue|start)"
     r"|response stopped"
     r"|this research (?:was )?(?:stopped|interrupted)"
-    r"|sorry,? (?:i'm |i )?can't help"
-    r"|i can't help (?:you )?with that"
-    r"|i'm (?:unable|not able) to help",
+    r"|sorry,? (?:i'?m |i )?can'?t help"
+    r"|i can'?t help (?:you )?with that"
+    r"|can'?t help (?:you )?with that at this time"
+    r"|i'?m (?:unable|not able) to help",
 )
 
 # The last-resort label list for the regenerate control. "redo" is FIRST
@@ -39557,6 +39616,194 @@ def _gemini_plan_verdict(*, research_started: bool, start_present: bool,
     return "silent"
 
 
+# ── The RESEARCH-fail screen (wave 10, lane 7) ───────────────────────────────
+#
+# ⛔⛔ A DIFFERENT PAGE STATE FROM EVERYTHING ABOVE, AND THE DIFFERENCE IS SIZE.
+# The machinery above was built from the owner's 2026-09-10 capture of a PLAN
+# that failed: one bubble, one sentence, under 70 characters. A RESEARCH that
+# dies fails inside a turn that has ALREADY rendered the "Researching N
+# websites" card and whatever of the report arrived before it stopped — so the
+# same turn runs to hundreds or thousands of characters, and
+# `_gemini_reads_as_failed` REFUSES IT at `_GEMINI_PLAN_FAIL_MAX_CHARS`.
+# Followed through: the plan reader returns False, `_gemini_regen_next_step`
+# reads that as `'settled'`, and `_gemini_redraft_plan` returns without
+# clicking. So pointing the existing machinery at this screen is not enough on
+# its own — the FAILURE READER is the one piece that has to change, and
+# deliberately nothing else does: the structural control finder, the overlay
+# picker, both deny lists, the normaliser and the click/pick round trip all come
+# across untouched, because a second copy of any of them is the shape this
+# file's own notes forbid.
+#
+# ⛔ AND THE BOUND CANNOT SIMPLY BE RAISED, because the reason for it is true on
+# both screens: a report about an outage, a post-mortem or a failed mission puts
+# these exact phrases on screen as CONTENT, and a research report is the longest
+# text in the run. What is true of a UI error and false of content is that the
+# error is the LAST thing in the turn — the card, then what arrived, then the
+# error. So the claim moves from "the turn is short" to "the turn ENDS with a
+# short failure", which is the same claim scoped to where the error lives.
+# ⭐ A tail of the same 400 characters, and the plan reader is still the thing
+# that judges it, so there is one wording list and one size bound in the file.
+_GEMINI_RESEARCH_FAIL_TAIL_CHARS = 400
+
+
+def _gemini_research_reads_as_failed(latest_text: str, *,
+                                     full_text: str = "") -> bool:
+    """Does the latest turn END with Gemini saying the RESEARCH failed?
+
+    ⛔⛔ THE COMPLETION MARKER IS AN ABSOLUTE REFUSAL AND IT COMES FIRST. A
+    research that finished and then said something that reads like an error is a
+    FINISHED research: re-drafting it throws away the report this whole run
+    exists to collect. The one thing on this screen that cannot be undone.
+
+    ⛔⛔ AND `full_text` IS WHAT MAKES THAT REFUSAL ABLE TO SEE. CORRECTED
+    2026-09-18: this function was given the TAIL by every real caller (see
+    `_gemini_screen_failure_text`), so the completion refusal searched the last
+    400 characters only — while THIS FILE'S OWN Gemini platform hint says the
+    completion line ("I've completed your research…") sits ABOVE the report
+    tile, i.e. at the turn's START, which is exactly where a 400-char tail
+    cannot look. Demonstrated on a 12,323-char completed turn: completion found
+    in `text`, absent from `tail`, verdict `'redraft'` — the hook re-drafting a
+    FINISHED research and throwing away the report the run exists to collect.
+    The turn is only ever readable in two pieces (`text` is its first 4000
+    chars, `tail` its last 400), so the refusal must run over BOTH; passing the
+    reading's `text` here is how the caller hands over the piece the tail lost.
+    ⭐ It only ever REFUSES more, never permits more — a caller that forgets it
+    is no worse off than before, which is why the argument is optional.
+
+    ⛔ The tail is at most `_GEMINI_RESEARCH_FAIL_TAIL_CHARS`, which is the plan
+    bound itself, so the plan reader's own size check can never trip inside this
+    one — the slice has already done the bounding. On a turn that is short
+    anyway the two functions read the same characters and agree by construction,
+    which is what keeps this from being a second opinion about the same screen.
+    """
+    norm = _gemini_norm(latest_text)
+    if not norm:
+        return False
+    if _GEMINI_COMPLETION_RE.search(norm):
+        return False
+    if full_text:
+        if _GEMINI_COMPLETION_RE.search(_gemini_norm(full_text)):
+            return False
+    return _gemini_reads_as_failed(norm[-_GEMINI_RESEARCH_FAIL_TAIL_CHARS:])
+
+
+def _gemini_screen_reads_as_failed(latest_text: str, *, screen: str,
+                                   full_text: str = "") -> bool:
+    """The failure reader belonging to the screen being acted on.
+
+    ⛔ `'plan'` IS THE DEFAULT AT EVERY CALLER, so the send path and the [2D]
+    loop keep the exact reader they were measured with. Only the post-Start
+    error branch asks for `'research'`, and it asks explicitly.
+
+    ⭐ `full_text` is the rest of the turn the research reader's completion
+    refusal has to see (the reading's `text`). It is meaningless on the plan
+    screen — there the turn is one short bubble and `text` IS the turn — so it
+    is carried, not branched on.
+    """
+    if screen == "research":
+        return _gemini_research_reads_as_failed(latest_text, full_text=full_text)
+    return _gemini_reads_as_failed(latest_text)
+
+
+def _gemini_screen_failure_text(reading, *, screen: str) -> str:
+    """WHICH PART of a reading the screen's failure reader is given.
+
+    ⛔⛔ THE PLAN SCREEN READS `text` AND THE RESEARCH SCREEN READS `tail`, AND
+    THE DIFFERENCE IS NOT COSMETIC. `text` is the turn's FIRST 4000 characters.
+    A plan-fail bubble is one sentence, so `text` is all of it. A research turn
+    is the card plus however much of the report arrived — on any real report the
+    error sentence sits far past 4000 and is sliced off the end of `text`
+    entirely. Reading `text` here would mean the research hook could never fire
+    on a real research, only on a toy one, which is the fifteen-month defect
+    rebuilt: a guard that cannot see the thing it is guarding against.
+
+    ⭐ `tail` falls back to `text` so an older reading — or any caller holding a
+    dict this reader did not produce — still gets an answer rather than a
+    silent False.
+    """
+    r = reading or {}
+    if screen == "research":
+        return r.get("tail") or r.get("text") or ""
+    return r.get("text") or ""
+
+
+def _gemini_url_in_conversation(url: str) -> bool:
+    """Is this URL inside a Gemini CONVERSATION rather than the bare home?
+
+    The same test the send path makes inline, lifted to module scope so the
+    post-Start gate can be measured without the send path around it. ⛔ The
+    trailing strip is what rejects `/app` and `/app/`: the home has no turn to
+    re-draft, and #897a is the record of Gemini landing exactly there.
+    """
+    try:
+        u = (url or "").split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    except Exception:
+        return False
+    return "/app/" in u
+
+
+def _gemini_research_fail_verdict(*, cua_error: bool, in_conversation: bool,
+                                  already_tried: bool, found: bool,
+                                  latest_text: str, machine_failed: bool = False,
+                                  full_text: str = "") -> str:
+    """May Gemini's own Redo be pressed on a RESEARCH that died? Says why not.
+
+    `'redraft'`             · every condition below is met.
+    `'not_error'`           · NOTHING has called this a failure — neither the
+                              CUA verdict nor this machine's own reader.
+    `'already_tried'`       · this agent has had its one attempt this phase.
+    `'not_in_conversation'` · the tab is not inside `/app/<id>`.
+    `'no_turn'`             · nothing rendered to read.
+    `'not_failed'`          · the turn does not END with a failure.
+
+    ⛔⛔ EVERY ARM IS A REFUSAL AND THAT IS THE WHOLE DESIGN. No capture of a
+    research-fail screen exists — the owner has both DOMs for the CONTROL, from
+    the plan screen, and the failure that would produce this page state is
+    platform-side and may not reproduce on demand. So this gate is written to be
+    wrong in the direction of doing nothing: the screen has to have been called
+    a failure, the tab still inside the conversation, a turn it could actually
+    read, and that turn's own ending to say it failed. A capture is what will
+    VERIFY these; it is not what permits them.
+
+    ⛔⛔ `machine_failed` — CORRECTED 2026-09-18, AND THE CORRECTION COSTS THIS
+    GATE ITS INDEPENDENCE CLAIM, DELIBERATELY. The first arm used to read `if
+    not cua_error`, on the record that "an INDEPENDENT reader must already have
+    called the screen a failure". That reader is the CUA `error` verdict — and
+    BOTH prompts in the call that produces it say an error is "an error banner
+    or a blocking popup", with Gemini's own platform hint ending "otherwise say
+    'still generating'". A Gemini research failure renders as a chat BUBBLE:
+    neither a banner nor a popup. So the verdict this gate waited for is one the
+    screen cannot produce, and the lane sat at ZERO CLICKS — the third
+    guard-that-cannot-fire in this one lane, and the identical shape to the
+    fifteen months `_try_inpage_retry_on_research_fail` spent clicking nothing.
+    An unsatisfiable precondition is not a safety property.
+
+    ⭐ SO THE ENTRY IS THE MACHINE'S OWN READER, AND THE HONEST STATEMENT OF
+    WHAT IS LEFT IS THIS: on a machine entry the LAST arm is no longer a second
+    opinion — the same `_gemini_research_reads_as_failed` decided both. Four
+    refusals still bind (the once-per-phase latch, the conversation, a readable
+    turn, and the completion marker inside that reader), the caller adds a
+    SETTLED reading that a streaming turn cannot pass, and the re-read here is a
+    fresh one — a turn that moved on between the caller's reading and this one
+    is refused. What is gone is the fourth-party veto, and it was never real.
+    ⛔ The prompt was NOT the fix chosen: a hint can only be pinned by asserting
+    its own words back, which a comment can satisfy and a vision model need not
+    obey, and widening the CUA's `error` verdict widens the DROP path (an error
+    verdict ends in `fail_agent` + out of rotation) rather than this one.
+    """
+    if not (cua_error or machine_failed):
+        return "not_error"
+    if already_tried:
+        return "already_tried"
+    if not in_conversation:
+        return "not_in_conversation"
+    if not found:
+        return "no_turn"
+    if not _gemini_research_reads_as_failed(latest_text, full_text=full_text):
+        return "not_failed"
+    return "redraft"
+
+
 def _gemini_regen_control(controls) -> "tuple[dict | None, str]":
     """Choose the regenerate control to click. Returns `(control, why)`.
 
@@ -39638,7 +39885,8 @@ def _gemini_menu_choice(rows) -> "tuple[dict | None, str]":
     return None, "menu is open but no row identifies itself as a re-draft"
 
 
-def _gemini_regen_next_step(reading, *, opened_menu: bool = False) -> "tuple[str, str]":
+def _gemini_regen_next_step(reading, *, opened_menu: bool = False,
+                            screen: str = "plan") -> "tuple[str, str]":
     """One move at a time, from one reading. Returns `(step, why)`.
 
     `'settled'`   · the latest turn no longer reads as failed → we are done.
@@ -39661,11 +39909,20 @@ def _gemini_regen_next_step(reading, *, opened_menu: bool = False) -> "tuple[str
     not — Gemini's own model picker renders `menuitemradio` rows — so without
     `opened_menu` any unrelated open menu diverted the whole call, and the
     dismiss path pressed Escape on a menu the user may have opened themselves.
+
+    ⛔ `screen` PICKS THE FAILURE READER AND NOTHING ELSE. `'plan'` is the
+    default so every caller that existed before wave 10 keeps the reader it was
+    measured with; `'research'` reads the turn's ENDING instead, because a
+    research that dies leaves the "Researching N websites" card and whatever
+    arrived of the report in the same turn, and the plan reader's size bound
+    refuses all of it. See `_gemini_research_reads_as_failed`.
     """
     r = reading or {}
     if not r.get("found"):
         return "no_turn", "no model turn rendered yet"
-    if not _gemini_reads_as_failed(r.get("text") or ""):
+    if not _gemini_screen_reads_as_failed(
+            _gemini_screen_failure_text(r, screen=screen), screen=screen,
+            full_text=(r.get("text") or "")):
         return "settled", "the latest turn no longer reads as failed"
     rows = r.get("rows") or []
     if opened_menu and rows:
@@ -39709,7 +39966,8 @@ async def _gemini_dismiss_our_overlay(page) -> None:
     await asyncio.sleep(1.0)
 
 
-async def _gemini_redraft_plan(page, label, *, settle_s: float = 8.0):
+async def _gemini_redraft_plan(page, label, *, settle_s: float = 8.0,
+                               screen: str = "plan"):
     """Click Gemini's OWN re-draft control on a failed plan turn, once.
 
     Returns `(redrafted, acted, in_flight, why)`.
@@ -39751,9 +40009,25 @@ async def _gemini_redraft_plan(page, label, *, settle_s: float = 8.0):
     turn that is still failed a moment after the click has not refused, it has
     not repainted yet, and re-clicking there is how a bounded cap turns into a
     burst.
+
+    ⛔⛔ `screen` IS THE ONLY THING WAVE 10 ADDED HERE, AND IT CHANGES ONE
+    DECISION: which reader answers "does this turn say it failed". `'plan'` is
+    the default, so the send path and the [2D] loop are byte-for-byte the
+    machine they were measured as. `'research'` is asked for by name at the
+    post-Start error branch, where the turn carries the research card and
+    report fragments and the plan reader's size bound refuses the whole thing —
+    entry would read as `'settled'` and this function would never click. ⛔ It
+    must reach the FINAL check too: judging the click's outcome with the plan
+    reader on a long turn returns "no longer failed" for a page that never
+    changed, which is the retired helper's fabricated success in a new place.
     """
+    # ⛔ THE LOG HAS TO NAME THE SCREEN IT ACTED ON. Two page states now reach
+    # this function and its lines are the only record of which one — a log that
+    # says "plan" while the run was re-drafting a dead research is the same
+    # class of defect as a guard that reports a retry it never performed.
+    _screen_word = "research" if screen == "research" else "plan"
     reading = await _gemini_regen_read(page)
-    step, why = _gemini_regen_next_step(reading)
+    step, why = _gemini_regen_next_step(reading, screen=screen)
 
     if step in ("no_turn", "no_control", "settled"):
         return False, False, False, why
@@ -39784,11 +40058,12 @@ async def _gemini_redraft_plan(page, label, *, settle_s: float = 8.0):
             _acted = False       # the finder returned empty: no node was clicked
             return False, _acted, False, "the control was gone by the time the click ran"
         _opened_menu = True      # whatever overlay is up next, we opened it
-        log(f"[{label}] Gemini plan re-draft: clicked its own control "
+        log(f"[{label}] Gemini {_screen_word} re-draft: clicked its own control "
             f"'{clicked}' ({_why_c})", "INFO")
         await asyncio.sleep(min(2.0, max(0.0, settle_s / 4.0)))
         reading = await _gemini_regen_read(page)
-        step, why = _gemini_regen_next_step(reading, opened_menu=_opened_menu)
+        step, why = _gemini_regen_next_step(reading, opened_menu=_opened_menu,
+                                            screen=screen)
 
     if step == "pick_menu":
         row, _why_m = _gemini_menu_choice(reading.get("rows") or [])
@@ -39806,7 +40081,8 @@ async def _gemini_redraft_plan(page, label, *, settle_s: float = 8.0):
             _acted = _was        # the row went: only the earlier click counts
             await _gemini_dismiss_our_overlay(page)
             return False, _acted, False, "the menu row was gone by the time the pick ran"
-        log(f"[{label}] Gemini plan re-draft: picked '{picked}' ({_why_m})", "INFO")
+        log(f"[{label}] Gemini {_screen_word} re-draft: picked '{picked}' "
+            f"({_why_m})", "INFO")
     elif step == "close_menu":
         # We opened this overlay and cannot name a row in it, so this attempt
         # is over: touched, and nothing generating. ⛔ It must not be left up —
@@ -39829,16 +40105,307 @@ async def _gemini_redraft_plan(page, label, *, settle_s: float = 8.0):
         after = await _gemini_regen_read(page)
     if not after.get("found"):
         return False, _acted, False, "could not re-read the turn after the re-draft"
-    if _gemini_reads_as_failed(after.get("text") or ""):
+    if _gemini_screen_reads_as_failed(
+            _gemini_screen_failure_text(after, screen=screen), screen=screen,
+            full_text=(after.get("text") or "")):
         # The one genuinely in-flight case: the control took the click and the
         # turn has not come back yet.
         return False, _acted, True, "clicked, but the turn still reads as failed"
     try:
         emit_event("gemini_plan_redraft", phase=2, agent="gemini",
-                   match=str(clicked)[:60])
+                   screen=str(screen), match=str(clicked)[:60])
     except Exception:
         pass
     return True, _acted, False, f"re-drafted after '{clicked}'"
+
+
+async def _gemini_redraft_failed_research(page, label, *, cua_error: bool,
+                                          already_tried: bool,
+                                          machine_failed: bool = False,
+                                          settle_s: float = 8.0):
+    """Press Gemini's own Redo on a RESEARCH that died. `(redrafted, acted, why)`.
+
+    ⛔⛔ THE POST-START WINDOW HAD NO FAILURE READER AT ALL, AND THIS IS THE
+    WHOLE OF WAVE 10's LANE 7. The [2D] loop's re-draft branch is gated on `not
+    start_clicked`, so it is dead from the moment Start research is pressed —
+    which is the moment this screen begins. The plan's own text had that veto
+    the other way round at one point; a hook hung inside that branch could never
+    have run here, and it would have read as a Gemini-side problem.
+
+    ⭐⭐ IT BUILDS NOTHING NEW THAT DECIDES ANYTHING. The structural control
+    finder, the overlay picker, both deny lists, the normaliser, the click/pick
+    round trip and the dismiss-what-we-opened rule all come across untouched, by
+    calling `_gemini_redraft_plan` with `screen="research"`. ⛔ THE OVERLAY IS
+    WHY THAT MATTERS MOST HERE: one click on Redo opens a menu and re-drafts
+    nothing, so anything that treated the click as the outcome would burn the
+    single attempt, report success, and leave a CDK backdrop that swallows every
+    later click on the page — ours and the CUA ladder's.
+
+    ⛔⛔ AND IT IS GATED, BECAUSE NO CAPTURE OF THIS SCREEN EXISTS. The owner
+    gave both DOMs for the CONTROL and they are built in above; what is missing
+    is a dump of the page state a RESEARCH failure produces, and the owner says
+    that failure is platform-side and may not reproduce on demand. So the gate
+    is `_gemini_research_fail_verdict`: something must already have called the
+    screen a failure, the tab must still be inside `/app/<id>`, the turn must be
+    readable, and its ENDING must say it failed. Every arm refuses.
+
+    ⛔ `machine_failed` IS THE SECOND ENTRY, AND IT EXISTS BECAUSE THE FIRST ONE
+    COULD NEVER FIRE — see the note on `_gemini_research_fail_verdict`. The CUA
+    `error` verdict is a banner/popup verdict and a Gemini research failure is a
+    chat bubble, so `cua_error` alone left this function unreachable in
+    production. Callers pass one or the other, never invent both.
+
+    ⛔ THREE FACTS, NOT FOUR, AND `in_flight` IS DELIBERATELY NOT ONE. On the
+    plan screen the card waits for an in-flight re-draft; here the caller is the
+    error branch, which parks the agent behind a [Retry][Skip] card — and it
+    would have parked it anyway, with no click. Only a re-draft this function
+    can SEE landed keeps the agent in rotation, so the hook can never be worse
+    than the branch it sits in.
+    """
+    if _controls.is_stop():
+        return False, False, "stop requested before the research re-draft"
+    try:
+        _url = page.url
+    except Exception:
+        _url = ""
+    reading = await _gemini_regen_read(page)
+    verdict = _gemini_research_fail_verdict(
+        cua_error=bool(cua_error),
+        machine_failed=bool(machine_failed),
+        in_conversation=_gemini_url_in_conversation(_url),
+        already_tried=bool(already_tried),
+        found=bool(reading.get("found")),
+        latest_text=_gemini_screen_failure_text(reading, screen="research"),
+        full_text=(reading.get("text") or ""))
+    if verdict != "redraft":
+        return False, False, f"not re-drafting the research: {verdict}"
+    redrafted, acted, _in_flight, why = await _gemini_redraft_plan(
+        page, label, settle_s=settle_s, screen="research")
+    return bool(redrafted), bool(acted), why
+
+
+async def _gemini_research_fail_settled(page, label, *,
+                                        settle_s: float = 2.0):
+    """Has the research turn SETTLED on a failure? `(failed, why)`.
+
+    ⛔⛔ THE LIVENESS CHECK THE MACHINE ENTRY CANNOT GO WITHOUT. Reading "this
+    turn ends with a failure" ONCE is a sample, not a state: a research that is
+    still streaming its report is mid-sentence at every instant, and the one
+    class of text this screen's reader cannot separate from a real failure is a
+    report ABOUT a failure whose most recent paragraph names it. Two readings a
+    real gap apart separate them for free — a streaming turn is not
+    byte-identical across two seconds and a dead one never changes again.
+    ⭐ It is the same discipline the send path now uses across its own polls;
+    the shapes differ because that caller is already a loop and this one is not.
+
+    ⛔ THE FIRST READ IS THE CHEAP ONE. A healthy turn fails the failure test
+    immediately and this returns without sleeping or reading twice, so the cost
+    on every other tick is one DOM read.
+    """
+    first = await _gemini_regen_read(page)
+    if not first.get("found"):
+        return False, "no turn to read"
+    _t1 = _gemini_screen_failure_text(first, screen="research")
+    if not _gemini_research_reads_as_failed(
+            _t1, full_text=(first.get("text") or "")):
+        return False, "the turn does not end in a failure"
+    await asyncio.sleep(settle_s)
+    second = await _gemini_regen_read(page)
+    if not second.get("found"):
+        return False, "the turn vanished between the two readings"
+    _t2 = _gemini_screen_failure_text(second, screen="research")
+    if _gemini_norm(_t2) != _gemini_norm(_t1):
+        return False, "the turn is still moving — not a settled failure"
+    if not _gemini_research_reads_as_failed(
+            _t2, full_text=(second.get("text") or "")):
+        return False, "the turn stopped reading as a failure"
+    return True, "the turn settled on a failure"
+
+
+def _gemini_note_research_redraft_landed(p) -> None:
+    """The state a LANDED research re-draft leaves behind.
+
+    ⛔ ITS TWIN IS INLINE IN THE POLL LOOP'S ERROR BRANCH, DELIBERATELY. A test
+    in the stale-reload suite parses THAT branch for the keys it writes, so
+    hoisting them into this call would move the rule out from under its own
+    measurement — a green suite proving nothing. The two copies are pinned
+    against each other key-for-key by
+    `test_the_two_entries_cannot_drift_apart_on_what_a_landed_redraft_leaves`.
+
+    The clocks are reset because what stalled was the TURN that was just
+    re-drafted, not the run — and only a re-draft this code could SEE land gets
+    here, so a refusal never buys an agent another fifteen minutes of silence.
+    ⛔ AND THE LATE-START WATCH IS RE-ARMED WITH THEM. Gemini's Redo on a
+    deep-research turn plausibly comes back as a PLAN with a fresh "Start
+    research"; nothing in this module captures that state either way, so the
+    cheap self-clearing watch is the right answer — its very next leg clears
+    itself if a research is already running, and clicks the button if one
+    rendered. The click budget goes back to zero because this is a NEW turn: a
+    count spent on the ORIGINAL plan's Start would otherwise clear the watch on
+    its first leg and leave the re-draft sitting unstarted. It also suppresses
+    the stale-reload cadence while the start is pending, so a re-drafted plan is
+    never reloaded out from under the watch.
+    """
+    p["last_heartbeat"] = time.time()
+    p["last_growth_time"] = time.time()
+    p["gemini_watch_start"] = True
+    p["gemini_watch_click_count"] = 0
+
+
+async def _gemini_research_redraft_on_own_reading(p, label, *,
+                                                  settle_s: float = 2.0,
+                                                  redraft_settle_s: float = 8.0):
+    """THE SECOND ENTRY TO THE RESEARCH RE-DRAFT: our own reader. `(ok, why)`.
+
+    ⛔⛔ WHY A SECOND ENTRY EXISTS AT ALL. The hook's only door was the CUA
+    `error` verdict, and both prompts in the call that produces it define an
+    error as "an error banner or a blocking popup", with Gemini's platform hint
+    ending "otherwise say 'still generating'". A Gemini research failure renders
+    as a chat BUBBLE — neither a banner nor a popup — so the reader that can
+    read that bubble perfectly was never asked, and the lane sat at ZERO clicks,
+    exactly as the helper it replaced did for fifteen months. This is the third
+    guard-that-cannot-fire found in this one lane.
+
+    ⛔ AND IT IS NOT THE ERROR BRANCH, DELIBERATELY. That branch ends in
+    `fail_agent` + out of rotation; entering it on our own reading would mean a
+    misread DROPS a healthy agent. This entry can only ever press Redo once and
+    leave the agent exactly where it was — on a refusal, on a click that landed
+    nothing, and on a raise. Worst case is the behaviour before this existed.
+
+    ⛔ BOUNDED THE SAME WAY THE ERROR-BRANCH ENTRY IS: the once-per-phase latch
+    is taken BEFORE the page is touched, so a refusal can never become a retry
+    loop against a page that is already unwell.
+    """
+    if p is None or p.get("page") is None:
+        return False, "no page"
+    if p.get("_gemini_research_redraft_used"):
+        return False, "the one attempt this phase is already spent"
+    # ⛔ "No post-Stop DOM driving" is the standing rule and THIS is now the
+    # outermost thing on this path — the settled reading below touches the page
+    # two ticks before `_gemini_redraft_failed_research` gets to ask.
+    if _controls.is_stop():
+        return False, "stop requested before the research re-draft"
+    failed, why = await _gemini_research_fail_settled(
+        p["page"], label, settle_s=settle_s)
+    if not failed:
+        return False, why
+    p["_gemini_research_redraft_used"] = True
+    ok, acted, rwhy = await _gemini_redraft_failed_research(
+        p["page"], label, cua_error=False, machine_failed=True,
+        already_tried=False, settle_s=redraft_settle_s)
+    log(f"[{label}] our own reader called the research dead ({why}) — "
+        f"Gemini research re-draft: {rwhy} (redrafted={ok}, acted={acted})",
+        "INFO" if ok else "WARN")
+    if ok:
+        _gemini_note_research_redraft_landed(p)
+        log(f"[{label}] re-drafted its failed research — keeping it in "
+            "rotation (no alert: silent self-heal)", "INFO")
+    return bool(ok), rwhy
+
+
+async def _gemini_retry_failed_turn(page, label, *, max_wait_s: float = 20.0,
+                                    settle_s: float = 8.0) -> bool:
+    """Wait for Gemini's latest turn to read as FAILED, then re-draft it once.
+
+    Returns True only when the turn stopped reading as failed.
+
+    ⛔⛔ THIS IS WHAT `_try_inpage_retry_on_research_fail` BECAME, AND THE
+    DIFFERENCE IS THE WHOLE OF WAVE 10's LANE 3. That helper carried its own
+    failure regex inside a JS template, read `document.body.innerText` (which
+    carries the pasted brief, the rail's chat titles and every earlier turn),
+    and clicked any button whose accessible name was in
+    `retry|regenerate|try again|rerun|restart`. Gemini's control is
+    `aria-label="Redo"`, so in fifteen months it clicked NOTHING — there is not
+    one `inpage_retry_clicked` line in 96 MB of logs. A second reader of the
+    same screen with a second copy of the pattern is the shape this file's own
+    notes forbid, and a mutation harness cannot police two copies. So the
+    waiting is all that survived; every decision below belongs to the machinery
+    that was built from the owner's 2026-09-10 capture and is executed against
+    it in the suite.
+
+    ⛔ THE GATE IS `_gemini_plan_verdict`, THE SAME ONE THE [2D] LOOP ASKS, with
+    the same polarity on the running-research probe: a probe that could not
+    answer reads as "assume it is running", because at this call site False is
+    what AUTHORISES the click and re-drafting a live research run is the single
+    destructive move available on this screen. ⛔ See the note at that call:
+    `_gemini_research_started` swallows its own read failure into the same False
+    it returns for "no research card", so that inversion covers less than it
+    looks — a gap this shares with the [2D] loop and does not widen.
+
+    ⛔ AND SUCCESS IS THE OUTCOME, NOT THE CLICK. The retired helper returned
+    True for having clicked, which on this screen means having opened an overlay
+    that re-drafts nothing — its caller then logged a successful retry and
+    skipped the re-paste it actually needed. `redrafted` is the only honest
+    answer, and `_gemini_redraft_plan` is the thing that knows it.
+    """
+    # ⛔⛔ A SAMPLED TURN IS NOT A FAILED TURN, AND THIS CALLER IS THE ONE THAT
+    # PROVES IT. `_gemini_retry_failed_turn` is called 3 SECONDS AFTER THE SEND
+    # and then polls for 90 — which is precisely the window in which Gemini is
+    # STREAMING the plan it was just asked for. `_gemini_plan_verdict` consults
+    # the failure reader BEFORE `streaming`, deliberately (a genuinely failed
+    # turn shows a streaming animation too, so `streaming` legitimately cannot
+    # veto a failure), and a half-drawn plan is under
+    # `_GEMINI_PLAN_FAIL_MAX_CHARS` — so a HEALTHY plan that restates a
+    # failure-themed brief reads as `failed` for as long as it is short.
+    # Measured on the live module: the brief "why was the Mars Polar Lander
+    # unable to complete its descent" reads as failed at every prefix from 90 to
+    # 416 normalised characters and only becomes `drafting` once complete.
+    # ⛔ Before wave 10 this call site could not click at all — the retired
+    # helper's word list never matched `aria-label="Redo"` — so re-drafting
+    # healthy work is an exposure this lane INTRODUCED, through a new door, to
+    # the exact harm the size bound exists to prevent.
+    #
+    # ⭐ THE FIX IS TO ACT ON A SETTLED TURN, NOT A SAMPLED ONE: the same text,
+    # unchanged across two consecutive polls, before anything is clicked. A
+    # streaming turn is never byte-identical 1.5 s apart, and a turn that has
+    # genuinely failed never changes again. It costs ONE poll — inside a budget
+    # of 90 s and 20 s — and needs no change to the pattern, the bound or the
+    # verdict order, which are the three things this lane was measured on.
+    _prev = None
+    deadline = asyncio.get_event_loop().time() + max_wait_s
+    while asyncio.get_event_loop().time() < deadline:
+        if _controls.is_stop():
+            return False
+        reading = await _gemini_regen_read(page)
+        latest = reading.get("text") or ""
+        _seen, _prev = _prev, (_gemini_norm(latest) if reading.get("found") else None)
+        if (reading.get("found") and _gemini_reads_as_failed(latest)
+                and _seen is not None and _seen == _prev):
+            # ⛔ TRUE, NOT FALSE, AND THE POLARITY IS THE POINT — the same
+            # inversion the [2D] loop carries. `_gemini_research_started` is
+            # documented fail-closed "so a probe miss never fakes a start", but
+            # HERE False is what AUTHORISES the click, and the click is the one
+            # destructive move on this screen. ⛔ Its fail-closed False is
+            # returned for an `evaluate` that raised as well as for a page with
+            # no research card, so this `except` only covers what escapes it —
+            # the two answers are not distinguishable from outside that
+            # function, and that is a gap it shares with the [2D] loop.
+            try:
+                _already_running = await _gemini_research_started(page)
+            except Exception:
+                _already_running = True
+            try:
+                _start_present = bool(await page.evaluate(_GEMINI_START_PRESENT_JS))
+            except Exception:
+                _start_present = False
+            # `streaming` is not measured here and does not need to be: the
+            # verdict consults it only AFTER the failure arm, which this branch
+            # has already satisfied.
+            _verdict = _gemini_plan_verdict(
+                research_started=_already_running, start_present=_start_present,
+                streaming=False, latest_text=latest)
+            if _verdict != "failed":
+                log(f"[{label}] Gemini turn reads as failed but the screen is "
+                    f"'{_verdict}' — not re-drafting", "INFO")
+                return False
+            redrafted, _acted, _in_flight, why = await _gemini_redraft_plan(
+                page, label, settle_s=settle_s)
+            log(f"[{label}] Gemini failed-turn re-draft: {why} "
+                f"(redrafted={redrafted}, acted={_acted}, in_flight={_in_flight})",
+                "INFO" if redrafted else "WARN")
+            return bool(redrafted)
+        await asyncio.sleep(1.5)
+    return False
 
 
 async def _gemini_kickoff_pending(page):
@@ -39884,6 +40451,318 @@ async def _gemini_research_started(page) -> bool:
     if not body:
         return False
     return bool(_GEMINI_RESEARCH_CARD_RE.search(body) or _GEMINI_COMPLETION_RE.search(body))
+
+
+# ── The stale deep research: a BOUNDED CADENCE, not a stall detector ─────────
+#
+# ⛔⛔ THERE IS NO STALL DETECTOR TO BUILD ON THIS SCREEN, AND A FIX THAT CLAIMS
+# ONE IS LYING. Two measurements, both verified:
+#   • The growth clock advances only on `partial_text_len` / `observer_text_len`
+#     / `sources`, and Gemini's reader does not see the deep-research surface —
+#     so "no growth for N minutes" is TRUE of a perfectly healthy Gemini
+#     research. The 2026-08-19 e2e tripped the no-growth arbiter twice while
+#     Gemini researched happily; the note at the `_active_statuses` gate records
+#     it in full.
+#   • Every positively-read in-flight marker inherits that blindness. The only
+#     one in the tree is `_gemini_research_started`, and it is a PRESENCE
+#     signal: the "Researching N websites" card stays in the transcript whether
+#     the run is alive or wedged, so it reads True on both. "Named marker +
+#     bound" is a wall-clock cadence wearing a detector's name.
+# ⭐⭐ WHAT MAKES A CADENCE ACCEPTABLE ANYWAY IS THAT PRECISION IS NOT
+# LOAD-BEARING HERE. The research runs PLATFORM-SIDE and this tab is only a view
+# onto it (see the note at the extraction site), and the owner verified on
+# 2026-09-16 that a reload AFTER "Start research" comes back into the same
+# conversation. A reload on a HEALTHY run therefore costs a page load, not the
+# run. The one destruction path left is the 2026-07 land-on-the-empty-home, and
+# that is what the identity prover and the adoption fallback are for — never a
+# liveness prover, which returns True on Gemini's blank home while the SPA
+# hydrates, i.e. "rescued" on the exact failure it exists to catch.
+#
+# ⛔ C — HOW LONG THE TAB MUST GO UNTOUCHED BEFORE THE CADENCE RELOADS IT AGAIN.
+# MEASURED, NOT GUESSED. Instrument: `run_analytics.json` — the per-device
+# phase-duration record that `record_phase_duration` appends to and
+# `load_analytics` averages into `_phase_averages`. Read 2026-09-18: 40
+# completed Phase-2 records, fastest 10.5 min, median 24.0, mean 29.4, p90 36.4,
+# slowest 101.2. Twelve minutes sits ABOVE the fastest healthy Phase 2 on record
+# — so the quickest healthy run finishes without ever being reloaded. It also
+# keeps the cadence deliberately low: this module avoids cold page loads on
+# Gemini for bot-score reasons, and a reload is the cheaper cousin of one.
+#
+# ⛔⛔ THE COST, STATED HONESTLY AND AT THE TAIL, NOT AT THE MEDIAN. Simulating
+# this bound at the real 30 s poll tick across all 40 recorded durations gives
+# {0 reloads: 1 run, 1: 20, 2: 14, 3: 1, 4: 1, 5: 1, 8: 2} — 76 reloads over 40
+# HEALTHY runs. A median run (24.0 min) pays one, but that is a boundary: 24.5
+# min already pays two, 19 of the 40 pay two or more, p90 (36.4 min) pays three
+# and the slowest (101.2 min) paid EIGHT. "At most one page load" was true only
+# of the median exactly. Each reload also blocks Gemini's poll leg — and so the
+# other agents' legs that cycle behind it — for ~35-40 s (30 s reload timeout +
+# settle + up to 3x2 s identity retries).
+_GEMINI_STALE_RELOAD_SEC = int(os.environ.get("DG_GEMINI_STALE_RELOAD_SEC", str(12 * 60)))
+
+# ⛔⛔ AND A CEILING, BECAUSE A CADENCE WITHOUT ONE IS THE `_ARBITER_MAX_WORKING_RESETS`
+# LESSON REBUILT. Three is above p90 (36.4 min = 3 reloads), so no healthy run
+# in the record loses a reload it would have used; a 101-minute run is stopped
+# at three instead of eight. Past the cap the tab is left alone and the stuck
+# arbiter, the [Retry][Skip] card and the 90-minute cap own the agent — which is
+# the right owner for a tab that three reloads did not cure.
+_GEMINI_STALE_RELOAD_MAX = int(os.environ.get("DG_GEMINI_STALE_RELOAD_MAX", "3"))
+
+# A Gemini conversation URL carries its id in the path: /app/<id>.
+_GEMINI_APP_CONVO_RE = re.compile(r"gemini\.google\.com/app/([A-Za-z0-9_-]{4,})")
+
+
+def _gemini_convo_url_id(url: str) -> str:
+    """The conversation id inside a `/app/<id>` URL; `""` for the bare home.
+
+    ⛔ NOT the #897a `_gemini_conversation_id`, which probed the DOM and was
+    deleted with the periodic reload. This reads the URL and nothing else, so
+    "are we still in the conversation we were in" is answerable without
+    trusting a page that may have just dropped to the home.
+    """
+    m = _GEMINI_APP_CONVO_RE.search((url or "").split("?", 1)[0])
+    return m.group(1) if m else ""
+
+
+async def _gemini_research_surface(page) -> "tuple[bool, bool]":
+    """`(card_present, completion_seen)` from ONE body read.
+
+    The same two patterns `_gemini_research_started` ORs together, kept APART
+    because the cadence needs them apart: the card is what says a research is
+    mounted on this tab, the completion line is what says it must now be left
+    alone. Reads the first 8000 chars of body innerText only; safe every tick.
+    Fail-closed — `(False, False)` on any error, so a probe miss can never
+    manufacture a reload.
+    """
+    try:
+        body = await page.evaluate("""() => (document.body.innerText || "").slice(0, 8000)""")
+    except Exception:
+        return False, False
+    if not body:
+        return False, False
+    return (bool(_GEMINI_RESEARCH_CARD_RE.search(body)),
+            bool(_GEMINI_COMPLETION_RE.search(body)))
+
+
+def _gemini_stale_reload_due(now: float, *, research_started_at: float,
+                             last_reload_at: float, in_conversation: bool,
+                             card_present: bool, completion_seen: bool,
+                             have_identity_brief: bool, no_growth_secs: float,
+                             reloads_so_far: int = 0,
+                             window_sec: "float | None" = None,
+                             max_reloads: "int | None" = None) -> bool:
+    """Should the bounded cadence reload this Gemini tab on this tick?
+
+    Every clause is an AND and none of them is a staleness DETECTOR — together
+    they are a BOUND on how often a post-Start research tab may be refreshed:
+
+      · inside `/app/<id>` — a reload of the bare home restores nothing, and
+        `page.goto` of a conversation URL lands on the home (the 2026-07
+        finding, which still holds);
+      · past Start by a full window — the plan-draft window has its own
+        machinery (the kickoff nudges, the late-Start watch) and must not meet
+        a reload;
+      · the research card is present and no completion line is — a finished
+        research is left alone, always;
+      · we hold this run's brief, because without it the identity prover cannot
+        return True and every reload would fall through to adoption and out to
+        the bare home. ⛔⛔ NO BRIEF, NO CADENCE: that is the one way this
+        branch could destroy the run it is trying to save;
+      · nothing has touched the tab for a window;
+      · the growth clock is flat for the same window — a CHEAP EXTRA, never
+        the reason. It is blind on this screen (see the block above), so it can
+        only ever suppress a reload, never justify one;
+      · and this phase has not already spent its whole reload budget. ⛔⛔ THE
+        CEILING IS PART OF THE BOUND, NOT A TRIMMING: the recorded worst case
+        paid EIGHT reloads on one healthy run, each of them ~35-40 s of the
+        Gemini leg and a page load on the one platform this module avoids them
+        for. A tab three reloads did not cure belongs to the stuck arbiter.
+    """
+    w = _GEMINI_STALE_RELOAD_SEC if window_sec is None else float(window_sec)
+    # ⛔ FAIL-CLOSED ON THE CEILING TOO: a zero or negative cap turns the cadence
+    # OFF, exactly as a zero window does. There is deliberately no "uncapped"
+    # value — an env var that could restore the unbounded shape is the defect
+    # with a switch on it.
+    cap = max(0, _GEMINI_STALE_RELOAD_MAX if max_reloads is None else int(max_reloads))
+    if w <= 0:
+        return False
+    if int(reloads_so_far or 0) >= cap:
+        return False
+    if not in_conversation:
+        return False
+    if not have_identity_brief:
+        return False
+    if not research_started_at or (now - research_started_at) < w:
+        return False
+    if not card_present:
+        return False
+    if completion_seen:
+        return False
+    if (now - (last_reload_at or research_started_at)) < w:
+        return False
+    if no_growth_secs < w:
+        return False
+    return True
+
+
+async def _gemini_reload_identity_ok(page, convo_id: str, pasted_text: str, *,
+                                     attempts: int = 3,
+                                     settle_sec: float = 2.0) -> bool:
+    """Did THIS conversation survive the reload? URL id AND brief, both.
+
+    ⛔⛔ DELIBERATELY NOT THE LIVENESS PROVER THE TWO EXISTING RESCUES USE.
+    `verify_gemini_generating` green-lights on any running CSS animation, and
+    Gemini's blank `/app` home animates while the SPA hydrates — so a liveness
+    prover reads "rescued" on the exact failure this exists to catch. Identity
+    is the only question worth asking after a Gemini reload.
+
+    ⭐ The brief half REUSES the ownership READ the sidebar hunt already uses
+    (`_gemini_read_conversation_text` + `_gemini_conversation_is_ours`) rather
+    than growing a second opinion about which thread is ours — never the send
+    path's VERDICT, which refuses a conversation holding a report.
+
+    The retry exists because the conversation content mounts lazily after the
+    URL flips: a single-shot check one render tick early already defeated the
+    sidebar recovery once, and the same trap is here.
+    """
+    if not convo_id or not (pasted_text or "").strip():
+        return False
+    for _i in range(max(1, int(attempts))):
+        try:
+            _url = page.url or ""
+        except Exception:
+            _url = ""
+        if _gemini_convo_url_id(_url) == convo_id:
+            _txt, _ = await _gemini_read_conversation_text(page)
+            if _gemini_conversation_is_ours(_txt, pasted_text):
+                return True
+        if _i < max(1, int(attempts)) - 1:
+            await asyncio.sleep(settle_sec)
+    return False
+
+
+async def _gemini_reattach_observer(p: dict, name: str) -> None:
+    """Re-run `inject_agent_observer` on whatever page `p` now holds.
+
+    One helper rather than two call sites, because "after EVERY reload" is the
+    whole rule and a second copy is how one of them comes to be missing.
+    """
+    try:
+        await inject_agent_observer(p["page"], "gemini")
+    except Exception as _oe:
+        log(f"[{name}] observer re-inject after the stale reload failed ({_oe})",
+            "WARN")
+
+
+async def _gemini_stale_reload_tick(p: dict, name: str,
+                                    *, settle_sec: float = 3.0) -> str:
+    """One tick of the bounded stale-research cadence. Mutates `p` in place and
+    returns the verdict: `"held"` (the bound said no), `"reload_failed"`,
+    `"survived"` (the same conversation came back, proven), `"adopted"` (it did
+    not, and the sidebar hunt re-attached it) or `"lost"` (neither).
+
+    ⛔ HOISTED OUT OF THE ROUND-ROBIN LEG SO A TEST CAN EXECUTE THE CONSUMER.
+    While this lived inline the only thing a test could say about it was which
+    identifiers appear in the source of a 2,000-line function — and this
+    project has already had a lane's whole evidence turn out to be exactly that.
+    The leg calls it; everything it decides happens here.
+    """
+    _url = ""
+    try:
+        _url = p["page"].url or ""
+    except Exception:
+        _url = ""
+    _convo = _gemini_convo_url_id(_url)
+    _brief = p.get("brief") or ""
+    _card, _done = await _gemini_research_surface(p["page"])
+    _now = time.time()
+    _flat_for = _now - (p.get("last_growth_time") or p.get("start_time") or _now)
+    if not _gemini_stale_reload_due(
+            _now,
+            research_started_at=p.get("start_time", 0.0),
+            last_reload_at=p.get("gemini_stale_reload_at", 0.0),
+            in_conversation=bool(_convo),
+            card_present=_card,
+            completion_seen=_done,
+            have_identity_brief=bool(_brief.strip()),
+            no_growth_secs=_flat_for,
+            reloads_so_far=int(p.get("gemini_stale_reloads", 0) or 0)):
+        return "held"
+    # ⛔ Stamp BEFORE the reload, never after: a reload that throws must still
+    # consume its window, or a wedged tab would be hammered every tick.
+    p["gemini_stale_reload_at"] = _now
+    p["gemini_stale_reloads"] = int(p.get("gemini_stale_reloads", 0) or 0) + 1
+    log(f"[{name}] research tab flat for {int(_flat_for) // 60}m with a research "
+        f"card and no completion line — bounded stale reload "
+        f"#{p['gemini_stale_reloads']} of conversation {_convo[:12]}", "WARN")
+    try:
+        await p["page"].reload(wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(settle_sec)
+    except Exception as _err:
+        log(f"[{name}] stale reload failed ({_err}) — leaving the tab alone "
+            "until the next window", "WARN")
+        # ⛔ A `domcontentloaded` timeout does NOT mean the page stayed put: a
+        # slow SPA can navigate and then miss the deadline, which tears the
+        # observer off exactly as a clean reload would. Re-attach on this path
+        # too — it is idempotent, so on a genuinely untouched tab it costs one
+        # no-op evaluate. What we do NOT do here is judge identity: nothing is
+        # known to have changed, so the growth clock is left alone.
+        await _gemini_reattach_observer(p, name)
+        return "reload_failed"
+
+    _verdict = "survived"
+    if not await _gemini_reload_identity_ok(p["page"], _convo, _brief):
+        # The 2026-07 land-on-the-empty-home, live. Adoption is the recovery
+        # that already exists for it — with the post-Start verdict, because from
+        # this side of Start a present report is the research having FINISHED
+        # while the tab was away, not a stale one from a previous run.
+        log(f"[{name}] the reload did not come back into {_convo[:12]} — "
+            "falling back to post-Start adoption", "WARN")
+        try:
+            _page, _adopted = await _gemini_adopt_lost_conversation(
+                p["page"], _brief, name, post_start=True,
+                lost_convo_id=_convo)
+        except Exception as _ae:
+            _page, _adopted = p["page"], False
+            log(f"[{name}] post-Start adoption raised (non-fatal): {_ae}", "WARN")
+        if _adopted:
+            p["page"] = _page
+            try:
+                p["url"] = _page.url or p.get("url", "")
+            except Exception:
+                pass
+            try:
+                _runtime.register_page("gemini", _page)
+            except Exception:
+                pass
+            _verdict = "adopted"
+            log(f"[{name}] post-Start adoption re-attached the research "
+                "conversation ✓", "WARN")
+        else:
+            _verdict = "lost"
+            # Nothing to reset and nothing to claim — the stuck arbiter and the
+            # 90-min hard cap still own this agent, on their original schedule.
+            log(f"[{name}] post-Start adoption could not re-attach the "
+                "conversation — leaving the stuck arbiter's clock exactly where "
+                "it was", "WARN")
+    # Idempotent, and it runs after EVERY reload: the MutationObserver is torn
+    # off by the navigation, and an adopted page never had one.
+    await _gemini_reattach_observer(p, name)
+    # ⛔⛔ THIS TICK NEVER TOUCHES `last_growth_time`, ON ANY VERDICT. A SURVIVING
+    # URL IS NOT GROWTH. The first cut of this lane rewound the clock on a proven
+    # identity ("survived"/"adopted"), reasoning that a proof earns a fresh
+    # window. It does not: identity is explicitly NOT liveness (that is the whole
+    # argument for `_gemini_reload_identity_ok`), so proving we are still in the
+    # conversation says nothing whatever about progress inside it. And the
+    # arithmetic was fatal — C is 12 min, STUCK_NO_GROWTH_SEC is 15, so a rewind
+    # every 12 minutes meant `no_growth_secs` could never reach 15 again and the
+    # L1 arbiter, the [Retry][Skip] card, the owner's ping and the 30-minute
+    # unacted auto-skip all became UNREACHABLE for Gemini for the rest of the
+    # run. Simulated on a wedged 90-minute tab: cadence off → carded at 15.5
+    # min; cadence on → seven reloads and no card ever, straight to the 90-min
+    # hard cap. The lane exists for "it's getting stuck in working phase" and
+    # that shape disabled the only thing that says so. Pinned in
+    # tests/test_gemini_stale_reload_0918.py by simulation over the real tick.
+    return _verdict
 
 
 # Escalating nudge wording — attempt 0 is a polite directive, attempt 1
@@ -40349,8 +41228,12 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
     # Agents whose conversation SURVIVES a reload, so the error-verdict rescue may
     # re-navigate them. GEMINI IS DELIBERATELY EXCLUDED: its SPA no longer restores
     # the conversation on reload, it lands on the empty home (#897a — the same reason
-    # the periodic Gemini refresh was deleted). Reloading Gemini to rescue it would
-    # destroy the very run being rescued.
+    # the periodic Gemini refresh was deleted). Letting THESE rescues reload Gemini
+    # would destroy the very run being rescued: their survival test is
+    # `verify_*_generating`, i.e. LIVENESS, and liveness reads True on Gemini's
+    # blank home while the SPA hydrates — "rescued" on the exact failure. The one
+    # mid-run reload Gemini does get (the bounded stale-research cadence below)
+    # earns it by proving IDENTITY instead, which is why it is not this set.
     RELOAD_SAFE = {"ChatGPT", "Claude"}
     # CUA completion check: first at 5 min (MIN_WAIT), then every 5 min.
     # 2026-04-25: dropped from 20→5 to mirror P1 cadence (catches fast finishers).
@@ -40358,8 +41241,17 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
     MIN_WAIT = {"ChatGPT": _min_agent_wait, "Gemini": _min_agent_wait, "Claude": _min_agent_wait}
     CUA_CHECK_INTERVAL = 300   # 5 min between CUA completion checks
     # #897a: GEMINI_REFRESH_INTERVAL / GEMINI_REFRESH_GRACE deleted with the
-    # periodic reload — Gemini is never reloaded mid-run (its SPA no longer
-    # restores the conversation on reload; it lands on the empty home).
+    # periodic reload, and they stay deleted.
+    # ⭐ CORRECTED 2026-09-18 (wave 10): the sentence this comment used to carry,
+    # "Gemini is never reloaded mid-run", is no longer true and was the second
+    # copy of the rule the wiring site's own note had already retired. The
+    # bounded stale-research cadence (`_gemini_stale_reload_due`, wired in the
+    # Gemini leg below) reloads a post-Start tab IN PLACE, proves the
+    # conversation came back by IDENTITY, and falls back to the sidebar hunt
+    # when it did not — the bound and the proof #897a's periodic reload never
+    # had. What is still true is the FACT underneath: a `page.goto` of a
+    # conversation URL lands on the empty home, so nothing here may navigate
+    # Gemini to restore it.
     ARTIFACT_SCRAPE_INTERVAL = 60   # 1 min between Claude artifact-tracking scrapes (was 180; iteration #1 must pass — see init at last_artifact_scrape=0 below)
 
     # ── #921 per-agent stuck escalation (Layer 1) + auto-skip backstop (Layer 3) ──
@@ -40451,6 +41343,12 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # A confirmed running verify is the ONE fact that separates the run
             # that started from the run that never did.
             "gemini_running_confirmed": bool(agent.get("verified")),
+            # This run's brief, carried so the stale-research reload can PROVE
+            # the conversation it came back to is still ours. ⛔ Without it the
+            # cadence refuses to fire at all (`have_identity_brief`) — a reload
+            # whose identity can never be proven would walk every run out to the
+            # bare home through the adoption fallback.
+            "brief": agent.get("brief") or "",
         }
         # Register for mid-run input dispatcher
         platform_key = name.lower().replace(" ", "")
@@ -40840,7 +41738,17 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                              "claude_artifact_dom_misses": 0,
                                              "claude_artifact_cua_attempts": 0,
                                              "observer_text_len": 0,
-                                             "claude_clarification_replied": False}
+                                             "claude_clarification_replied": False,
+                                             # Re-seeded from `agents` for the
+                                             # same reason the hard-retry rebuild
+                                             # re-seeds it: this entry REPLACES
+                                             # the old one, so a key the poll body
+                                             # reads and this literal omits simply
+                                             # stops existing. Without it a
+                                             # paused-and-resumed Gemini loses the
+                                             # stale-research cadence for the rest
+                                             # of the run.
+                                             "brief": (agents.get(name) or {}).get("brief") or ""}
                             del results[name]
                             log(f"  [{name}] Restored to polling")
                         else:
@@ -41186,6 +42094,11 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     "empty_retries": 0,
                     "hard_retry_count": 0,
                     "claude_clarification_replied": False,
+                    # Every pending seed carries this run's brief — see the note
+                    # on the main seed. The rebuild below overwrites this stub
+                    # with the recovered brief; seeding it here keeps the
+                    # invariant total rather than "true of three seeds".
+                    "brief": (agents.get(_agent_name) or {}).get("brief") or "",
                 }
             p = pending[_agent_name]
             _hard_count = int(p.get("hard_retry_count", 0)) + 1
@@ -41361,6 +42274,13 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 "empty_retries": 0,
                 "hard_retry_count": _hard_count,
                 "claude_clarification_replied": False,
+                # ⛔ THE REBUILD IS WHOLESALE, so every key the poll body reads
+                # has to be re-seeded here or it silently stops existing. The
+                # stale-research reload refuses to fire without this run's
+                # brief, so omitting it would leave a hard-retried Gemini with
+                # no cadence at all — and a hard retry is exactly the run most
+                # likely to need one.
+                "brief": _brief_text_hr or "",
             }
             _runtime.register_page(_agent_key, new_page,
                                     new_page.url if new_page else "")
@@ -42021,17 +42941,42 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     }
                     continue
 
-            # ── Gemini periodic refresh: REMOVED (#897a, 2026-07-04) ──
+            # ── Gemini periodic refresh: STILL REMOVED (#897a, 2026-07-04) ──
             # The 2026-05-26 ~10-min reload existed because Gemini then didn't
             # push the completed DR panel into the live DOM. The 2026-07 Gemini
-            # SPA no longer restores the conversation on reload AT ALL — every
-            # reload landed on the empty "new chat" home (image-verified live),
-            # so the reload + its sidebar-reopen recovery subsystem were pure
-            # hazard. Do NOT reload Gemini mid-run for any reason; completion
-            # is detected in-place by detect_completion_gemini (new-UI text
-            # signals) + the CUA visual check. If extraction ever comes back
-            # short, fix it with an in-place DOM re-read/scroll at EXTRACTION
-            # time — never by restoring the reload.
+            # SPA no longer restores the conversation from a `page.goto` of a
+            # conversation URL — that lands on the empty "new chat" home
+            # (image-verified live) — so the periodic reload and its
+            # sidebar-reopen recovery subsystem were pure hazard and stay
+            # deleted: they had neither a bound nor a proof.
+            #
+            # ⭐⭐ REWRITTEN 2026-09-18 (wave 10). THE SENTENCE THAT STOOD HERE —
+            # "Do NOT reload Gemini mid-run for any reason" — IS NO LONGER TRUE,
+            # and leaving it would have contradicted the branch immediately
+            # below it. What the 2026-07 finding actually established is the
+            # `goto`; the owner verified on 2026-09-16 that a RELOAD of a tab
+            # already inside `/app/<id>`, AFTER "Start research", comes back
+            # into the same conversation. So the rule is NARROWER, not gone:
+            # the bounded stale-research cadence below is the ONLY mid-run
+            # reload of Gemini there is, it reloads IN PLACE, it PROVES the
+            # conversation survived before trusting it, and it falls back to
+            # adoption when it did not. Nothing else may reload Gemini mid-run;
+            # the other five refusal sites stand exactly as written.
+            # Completion is still detected in-place by detect_completion_gemini
+            # (new-UI text signals) + the CUA visual check, and a short
+            # extraction is still fixed with an in-place DOM re-read/scroll at
+            # EXTRACTION time — never by restoring the periodic reload.
+            #
+            # ⛔ AND IT IS A CADENCE, NOT A DETECTOR. The reasoning, the
+            # blindness measurement and where C comes from live on
+            # `_gemini_stale_reload_due` / `_GEMINI_STALE_RELOAD_SEC`; this is
+            # the wiring. The owner's report is "it's getting stuck in working
+            # phase, sometimes or mostly", cured today only by them noticing and
+            # refreshing by hand.
+            if (name == "Gemini" and not _controls.is_stop()
+                    and not p.get("gemini_watch_start")
+                    and not p.get("needs_start_verify")):
+                await _gemini_stale_reload_tick(p, name)
 
             # DOM scrape (primary); MutationObserver handles token-level stream separately.
             scrape_fn = SCRAPE_FNS.get(name)
@@ -43861,6 +44806,85 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 except Exception as _e_err:
                     log(f"[{name}] Salvage extract during error verdict failed: {_e_err}", "WARN")
 
+                # ── Gemini's own Redo on a RESEARCH that died (wave 10) ─────────
+                # ⛔⛔ THE POST-START WINDOW HAS NEVER HAD A FAILURE READER. The
+                # [2D] loop's re-draft branch is gated on `not start_clicked`, so
+                # it is dead from the moment Start research is pressed — and this
+                # screen only exists after that. So a Gemini research that dies
+                # has always gone straight to salvage → card → park, with no page
+                # action of any kind, while the control that would re-run it sits
+                # in the failed turn. This is the new site; it is NOT a widening
+                # of the pre-Start branch, which could never have run here.
+                #
+                # DELIBERATELY AFTER THE SALVAGE, for the reload rescue's own
+                # reason: a re-draft replaces the turn, so anything that clicked
+                # first would destroy the partial output we are about to keep.
+                # Salvaging first makes the attempt free — worst case we park
+                # with exactly the text we would have parked with anyway.
+                #
+                # ⛔ AND IT IS MUTUALLY EXCLUSIVE WITH THE RESCUE BELOW, by
+                # construction rather than by a flag: `RELOAD_SAFE` is
+                # {"ChatGPT", "Claude"} because Gemini's SPA lands on the empty
+                # home (#897a), and this arm is Gemini's alone.
+                #
+                # Bounded the same three ways as that rescue: ONCE per agent per
+                # phase (the latch is taken before the attempt, so a refusal
+                # cannot turn into a retry loop against a page that is already
+                # unwell), only in the error branch — never the normal poll path
+                # — and only behind `_gemini_research_fail_verdict`, whose every
+                # arm is a refusal because this page state has never been
+                # captured. A re-draft that lands raises NO alert: silent
+                # self-heal, the same contract as the reload rescue.
+                if (normalize_agent_key(name) == "gemini"
+                        and not p.get("_gemini_research_redraft_used")
+                        and p.get("page") is not None):
+                    p["_gemini_research_redraft_used"] = True
+                    _rr_ok, _rr_acted, _rr_why = await _gemini_redraft_failed_research(
+                        p["page"], name, cua_error=True, already_tried=False)
+                    log(f"[{name}] error verdict — Gemini research re-draft: "
+                        f"{_rr_why} (redrafted={_rr_ok}, acted={_rr_acted}; "
+                        f"partial output already salvaged: {len(_err_text)} chars)",
+                        "INFO" if _rr_ok else "WARN")
+                    if _rr_ok:
+                        # ⛔ THESE FOUR WRITES STAY INLINE, AND THE REASON IS A
+                        # RULE'S POSITION. Their twin lives in
+                        # `_gemini_note_research_redraft_landed`, which the
+                        # machine-read entry below calls — but a test in the
+                        # stale-reload suite PARSES this branch for the keys it
+                        # writes, so hoisting them into that call would move the
+                        # rule out from under its own measurement and leave a
+                        # green suite proving nothing. Two copies, pinned
+                        # against each other by
+                        # `test_the_two_entries_cannot_drift_apart_on_what_a_
+                        # landed_redraft_leaves`; change one and that test
+                        # names the other.
+                        #
+                        # Reset the growth clock: what stalled was the turn we
+                        # just re-drafted, not the run.
+                        p["last_heartbeat"] = time.time()
+                        p["last_growth_time"] = time.time()
+                        # ⛔ AND RE-ARM THE LATE-START WATCH, alongside the clock.
+                        # Gemini's Redo on a deep-research turn plausibly comes
+                        # back as a PLAN with a fresh "Start research" — nothing
+                        # in this module captures that state either way, so the
+                        # cheap, self-clearing watch is the right answer: its
+                        # very next leg clears itself if a research is already
+                        # running, and clicks the button if one rendered. The
+                        # click budget is reset with it because this is a NEW
+                        # turn — a count spent on the ORIGINAL plan's Start
+                        # would otherwise clear the watch on its first leg and
+                        # the re-draft would sit unstarted. Bounded either way:
+                        # the re-draft itself is once per agent per phase.
+                        # It also correctly suppresses the stale-reload cadence
+                        # (the leg's guard refuses while a start is pending), so
+                        # a re-drafted plan is never reloaded out from under the
+                        # watch.
+                        p["gemini_watch_start"] = True
+                        p["gemini_watch_click_count"] = 0
+                        log(f"[{name}] re-drafted its failed research — keeping it "
+                            "in rotation (no alert: silent self-heal)", "INFO")
+                        continue
+
                 # ── Reload rescue (ONE per agent per phase) ──────────────────────
                 # Before this, an ERROR verdict was terminal: salvage + fail card +
                 # drop, with no page action of any kind. Nothing in the whole poll
@@ -44005,6 +45029,32 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 continue
 
             if is_generating and not is_done:
+                # ── Gemini's Redo, entered by OUR OWN reader (wave 10 repair) ──
+                # ⛔⛔ THE HOOK ABOVE COULD NEVER BE ASKED. Its only door is the
+                # CUA `error` verdict, and both prompts in the call that
+                # produces it define an error as "an error banner or a blocking
+                # popup", with Gemini's own platform hint ending "otherwise say
+                # 'still generating'". A Gemini research failure renders as a
+                # chat BUBBLE — neither a banner nor a popup — so the CUA lands
+                # HERE, on this branch, saying keep waiting, while the reader
+                # that can read that bubble perfectly is never consulted and the
+                # lane sits at zero clicks. That is the third guard in this one
+                # lane that cannot fire, and the shape the retired helper spent
+                # fifteen months in.
+                #
+                # ⛔ DELIBERATELY NOT IN THE ERROR BRANCH. That branch salvages,
+                # cards and DROPS the agent; entering it on our own reading
+                # would let a misread end a healthy research. This entry can
+                # only press Redo once and leave the agent exactly where it was,
+                # so its worst case is the behaviour that exists without it.
+                # ⭐ And this is the branch where the run would otherwise sit
+                # and wait, which is exactly the hang being repaired.
+                if normalize_agent_key(name) == "gemini":
+                    try:
+                        await _gemini_research_redraft_on_own_reading(p, name)
+                    except Exception as _mre:
+                        log(f"[{name}] machine-read research re-draft raised "
+                            f"(non-fatal): {_mre}", "DEBUG")
                 log(f"[{name}] CUA: still generating ({int(elapsed/60)}m)")
                 p["done_count"] = 0
                 continue
@@ -54982,117 +56032,43 @@ async def check_hv_gate(browser, cua_client, platform: str, label: str,
     return False
 
 
-async def _try_inpage_retry_on_research_fail(page, platform, label, max_wait_s=20):
-    """Detect the agent's own in-page Retry button after Send and click it once.
-
-    When Deep Research kicks off but immediately fails (rate limit, internal
-    error, brief-parse failure), the agent UI shows a 'Research stopped' /
-    'Research failed' / 'Something went wrong' message with a Retry (or
-    Regenerate / Try again) button right below it in the assistant area.
-    This guard auto-clicks that button ONCE so the round-robin watchdog
-    doesn't have to escalate to a human-intervention alert for what is
-    effectively a transient agent-side glitch.
-
-    Scope:
-      - Only fires when the page actually shows failure-message text — no
-        click happens on a healthy research start.
-      - Buttons must live inside an assistant message area (not composer /
-        toolbar / footer), with aria-label or text matching retry words.
-      - Single click per call; idempotent.
-
-    Returns True if a button was clicked, False otherwise. Wayland-safe
-    (pure DOM click, no clipboard reads)."""
-    platform_l = (platform or "").lower()
-    deadline = asyncio.get_event_loop().time() + max_wait_s
-    poll_n = 0
-    # Failure-message regex — covers ChatGPT / Claude / Gemini wording
-    # variants seen across recent runs. Word-boundary-loose because some
-    # UIs render the text with extra punctuation.
-    fail_re = (
-        r"research\\s+stopped|research\\s+failed|"
-        r"failed\\s+to\\s+(?:generate|complete|run|continue)|"
-        r"something\\s+went\\s+wrong|encountered\\s+an?\\s+(?:issue|error)|"
-        r"unable\\s+to\\s+(?:continue|complete|generate)|"
-        r"couldn'?t\\s+complete|response\\s+stopped|"
-        r"this\\s+research\\s+(?:was\\s+)?(?:stopped|interrupted)|"
-        r"sorry,?\\s+(?:i'?m\\s+|i\\s+)?can'?t\\s+help|"
-        r"i\\s+can'?t\\s+help\\s+(?:you\\s+)?with\\s+that|"
-        r"can'?t\\s+help\\s+(?:you\\s+)?with\\s+that\\s+at\\s+this\\s+time|"
-        r"i'?m\\s+(?:unable|not\\s+able)\\s+to\\s+help"
-    )
-    while asyncio.get_event_loop().time() < deadline:
-        poll_n += 1
-        try:
-            clicked = await page.evaluate(
-                f"""() => {{
-                    const failPattern = new RegExp(`{fail_re}`, 'i');
-                    // 2026-05-14: dropped 'resume' — too generic, could match
-                    // Claude's resume-conversation button (unrelated to
-                    // research-fail recovery).
-                    const retryWords = /(?:^|\\s)(retry|regenerate|try\\s+again|rerun|restart)\\b/i;
-                    const isInComposerOrToolbar = (el) => !!el.closest(
-                        '[data-testid*="composer"], [data-testid*="prompt-textarea"], ' +
-                        '[contenteditable="true"], form[data-message-id], ' +
-                        '[role="toolbar"], footer, [class*="composer" i], ' +
-                        '[class*="input-area" i], [class*="message-input" i]'
-                    );
-                    const isAssistantScoped = (el) => !!el.closest(
-                        '[data-message-author-role="assistant"], .font-claude-message, ' +
-                        '[data-testid*="conversation-turn"], ' +
-                        // Gemini custom-element + class selectors for the model
-                        // response bubble. Without these the refusal-text
-                        // assistant-scope check returned false and the function
-                        // skipped the regenerate-button click that the soft-
-                        // refusal regex had just matched.
-                        'message-content, model-response, ' +
-                        '.model-response-text, .response-container'
-                    );
-                    const isVisible = (el) => {{
-                        const r = el.getBoundingClientRect();
-                        if (r.width < 16 || r.height < 16) return false;
-                        const cs = getComputedStyle(el);
-                        if (cs.display === 'none' || cs.visibility === 'hidden') return false;
-                        if (parseFloat(cs.opacity) < 0.1) return false;
-                        return true;
-                    }};
-                    // First confirm the failure-text actually shows on the page.
-                    // No fail-text → not the failure case this guard is for.
-                    const bodyText = document.body ? (document.body.innerText || '') : '';
-                    if (!failPattern.test(bodyText)) return '';
-                    const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
-                    for (const b of btns) {{
-                        if (isInComposerOrToolbar(b)) continue;
-                        if (!isVisible(b)) continue;
-                        const aria = (b.getAttribute('aria-label') || '').toLowerCase();
-                        const title = (b.getAttribute('title') || '').toLowerCase();
-                        const txt = (b.textContent || '').trim().toLowerCase();
-                        if (!(retryWords.test(aria) || retryWords.test(title) || retryWords.test(txt))) continue;
-                        // Require either assistant-scope OR a fail-text token
-                        // inside the nearest block. Without one of those a
-                        // composer regenerate icon outside the toolbar can
-                        // sneak through.
-                        if (!isAssistantScoped(b)) {{
-                            const parent = b.closest('div, section, article, li, [role="dialog"]');
-                            if (!parent || !failPattern.test(parent.innerText || '')) continue;
-                        }}
-                        b.click();
-                        return aria || title || txt || 'matched';
-                    }}
-                    return '';
-                }}"""
-            )
-            if clicked:
-                log(f"[{label}] In-page Retry auto-clicked: '{clicked}' (poll {poll_n})", "INFO")
-                try:
-                    emit_event("inpage_retry_clicked", phase=2, agent=platform_l,
-                               match=str(clicked)[:60])
-                except Exception:
-                    pass
-                return True
-        except Exception as _pe:
-            log(f"[{label}] In-page retry probe raised: {_pe}", "DEBUG")
-        await asyncio.sleep(1.5)
-    return False
+# ⛔⛔ `_try_inpage_retry_on_research_fail` WAS RETIRED HERE, 2026-09-18.
+# It detected a failure by running its own regex over `document.body.innerText`
+# inside a JS template, then clicked any button whose accessible name matched
+# `retry|regenerate|try again|rerun|restart`. Gemini's re-draft control is
+# `aria-label="Redo"`, so across its fifteen months it clicked NOTHING: not one
+# `inpage_retry_clicked` line for any platform in 96 MB of logs. Its two callers
+# were both on the Gemini send path and now call `_gemini_retry_failed_turn`,
+# which waits the same way and then hands the turn to the machinery built from
+# the owner's 09-10 capture — one reader of this screen, not two.
+#
+# ⛔ AND ITS PATTERN WAS NOT REDUNDANT THE DAY IT WENT. `_GEMINI_PLAN_FAIL_RE` was
+# recorded as a strict superset of this `fail_re` and was not.
+# ⛔⛔ THE FIGURE, RE-DERIVED 2026-09-18, BECAUSE THE ONE RECORDED HERE WAS NOT
+# REPRODUCIBLE. It said "ten sentences, across five alternations", and ten is a
+# number nobody can get back from either the code or the fixture list it cites —
+# which is worse than no number on the stated record of why a 111-line deletion
+# was safe. Enumerated exhaustively instead: the retired `fail_re` has THIRTEEN
+# alternations whose minimal language (every optional group taken both ways,
+# every choice expanded, whitespace collapsed as the normaliser collapses it) is
+# 49 concrete sentences, each self-checked against the retired pattern. Run
+# through the PRE-widening `_gemini_reads_as_failed`: 19 of the 49 were dropped,
+# across exactly FIVE alternations — the apostrophe-optional halves of
+# `couldn'?t complete`, `sorry,? (i'?m |i )?can'?t help`, `i can'?t help (you )?
+# with that` and `i'?m (unable|not able) to help`, plus the whole of
+# `can'?t help (you )?with that at this time`, which had no counterpart here at
+# all without a leading "i". FIVE ALTERNATIONS WAS RIGHT; the sentence count was
+# not. The claim the number supports is TRUE and stronger than it was stated.
+# The pattern was WIDENED FIRST, and the retired alternations are pinned one per
+# alternation in tests/test_gemini_redraft_0910.py against a verbatim copy of the
+# regex the browser used to compile — 8 of those 30 fixtures fail against the
+# pre-widening reader, which is what makes that test a measurement.
+#
+# ⭐ THE PLAN'S NOTE ABOUT THE POLL LOOP, CORRECTED: the [2D] loop DOES read
+# failure text, but only through its pre-Start branch, which is dead the moment
+# Start research is clicked. Nothing reads failure text after Start, and this
+# helper never had a poll-loop caller at all — both of its call sites were on the
+# send path, before the plan screen exists.
 
 
 async def _chatgpt_force_new_chat(page, label) -> bool:
@@ -55334,7 +56310,9 @@ async def _gemini_read_conversation_text(page) -> "tuple[str, bool]":
     return (got.get("text") or ""), (got.get("src") == "turn")
 
 
-async def _gemini_adopt_lost_conversation(page, pasted_text: str, label: str):
+async def _gemini_adopt_lost_conversation(page, pasted_text: str, label: str,
+                                          *, post_start: bool = False,
+                                          lost_convo_id: str = ""):
     """Last-resort recovery when a Gemini send never surfaced on OUR tab (URL
     pinned at bare /app through every re-submit) — live incident 2026-07-11
     ~02:50 (worker 2): the brief eventually registered platform-side (the user
@@ -55352,8 +56330,43 @@ async def _gemini_adopt_lost_conversation(page, pasted_text: str, label: str):
     Ownership gate for BOTH probes (_gemini_owns_candidate + brief-chunk body
     check): adopt ONLY what provably is THIS run's brief. Logs a full Gemini
     tab census either way so backend.log alone can adjudicate tab-orphan vs
-    dropped-send next time. Returns (page, adopted). Never raises."""
+    dropped-send next time. Returns (page, adopted). Never raises.
+
+    ⛔⛔ `post_start` FLIPS ONE VERDICT AND NOTHING ELSE, AND THE DEFAULT KEEPS
+    THE SEND PATH EXACTLY AS IT WAS. The send-path caller runs BEFORE "Start
+    research" is pressed, so a conversation already holding a report is a
+    PREVIOUS run of the same brief and adopting it would deliver stale research
+    — that refusal is correct and is not relaxed. The stale-research reload
+    fallback calls from the OTHER side of Start: its conversation is the one it
+    just lost, and a present report is that research having FINISHED while the
+    tab was away, i.e. the best outcome available. Same ownership evidence,
+    opposite reading of one state — so it is a parameter here rather than a
+    second hunt, and never a widening of the send path's gate.
+
+    ⛔⛔ AND THE RELAXATION IS SCOPED TO THE CONVERSATION THAT WAS LOST, BY ID.
+    `lost_convo_id` is the `/app/<id>` the post-Start caller was in before the
+    reload dropped it; it is REQUIRED for the relaxation, and a report-bearing
+    candidate with any other id is refused exactly as the send path refuses it.
+    Without that scope the sentence above is only true of the happy case: the
+    ownership evidence is the BRIEF, and on a re-run of the same topic LAST
+    RUN's finished conversation matches the brief deterministically — so the
+    relaxed verdict would adopt it and deliver last run's report as this run's,
+    silently, looking exactly like a successful recovery. "The conversation it
+    just lost" has an id, so ask for the id."""
     pasted_head = (pasted_text or "")[:600]
+    _lost_id = (lost_convo_id or "").strip()
+
+    def _report_ok(candidate_url: str) -> bool:
+        """May we adopt a candidate that already holds a COMPLETED report?
+
+        Only from past Start, and only when this is provably the conversation
+        we lost. An unknown or mismatched id falls back to the send path's
+        refusal — the safe direction: we keep hunting, or return `lost` and
+        leave the stuck arbiter's clock where it was.
+        """
+        if not post_start or not _lost_id:
+            return False
+        return _gemini_convo_url_id(candidate_url or "") == _lost_id
     # Build the identity chunk from PAST any shared template header (every
     # brief opens with the same "# Research Brief…" boilerplate — a chunk of
     # it would match every past run; adversarial-review finding).
@@ -55417,10 +56430,11 @@ async def _gemini_adopt_lost_conversation(page, pasted_text: str, label: str):
             continue
         if await _conversation_matches(_t):
             _st = await _adoptable_state(_t)
-            if _st == "report_present":
+            if _st == "report_present" and not _report_ok(_u):
                 log(f"[{label}] sibling Gemini tab {_u} matches our brief but "
-                    "already holds a COMPLETED report (previous run of the same "
-                    "brief) — not adopting", "WARN")
+                    "already holds a COMPLETED report and is not the "
+                    f"conversation we lost ({_lost_id[:12] or 'unknown'}) — "
+                    "not adopting", "WARN")
                 continue
             log(f"[{label}] ADOPTED sibling Gemini tab at {_u} (state={_st}) — "
                 "the send landed in a tab we weren't watching", "WARN")
@@ -55762,9 +56776,10 @@ async def _gemini_adopt_lost_conversation(page, pasted_text: str, label: str):
                 "our brief — trying next", "WARN")
             continue
         _st = await _adoptable_state(page)
-        if _st == "report_present":
+        if _st == "report_present" and not _report_ok(_u):
             log(f"[{label}] sidebar chat {_u} matches our brief but already holds a "
-                "COMPLETED report (previous run of the same brief) — trying next", "WARN")
+                "COMPLETED report and is not the conversation we lost "
+                f"({_lost_id[:12] or 'unknown'}) — trying next", "WARN")
             continue
         log(f"[{label}] ADOPTED sidebar conversation {_u} (state={_st}) — the send "
             "had registered platform-side after our confirm window", "WARN")
@@ -56673,9 +57688,9 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     await asyncio.sleep(3)
     # 2026-05-14: in-page Retry auto-click guard (Fix #515) — Gemini-only.
     # When Gemini's "show thinking" path lands on a soft-refusal screen
-    # ("Sorry, I can't help…") this clicks the in-page Retry button so
-    # the round-robin watchdog doesn't escalate a transient soft-refusal
-    # to a human-intervention alert.
+    # ("Sorry, I can't help…") this re-drafts the failed turn so the
+    # round-robin watchdog doesn't escalate a transient soft-refusal to a
+    # human-intervention alert.
     #
     # Originally invoked for all 3 platforms (Fix #515). Re-scoped on
     # 2026-05-14 to Gemini-only: ChatGPT/Claude soft-refusals are rarer,
@@ -56683,16 +57698,22 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     # on a healthy "Researching..." page, risking a false-fire that
     # closes a working DR session. Watchdog + verify recover real
     # failures for ChatGPT/Claude.
+    #
+    # ⛔⛔ RE-POINTED 2026-09-18 — AND THE SCOPING NOTE ABOVE IS THE REASON THIS
+    # IS AN IMPROVEMENT AND NOT A RENAME. The "unrelated body text" that made
+    # the old guard Gemini-only was real: it read `document.body.innerText`,
+    # which carries the pasted brief. `_gemini_retry_failed_turn` reads the
+    # LATEST TURN, bounds it by length, and asks `_gemini_plan_verdict` before
+    # touching anything — so a running research is left alone by the gate, not
+    # by the platform check.
     if platform_l == "gemini":
         try:
-            retried = await _try_inpage_retry_on_research_fail(
-                page, platform, label, max_wait_s=90,
-            )
+            retried = await _gemini_retry_failed_turn(page, label, max_wait_s=90)
             if retried:
-                log(f"[{label}] In-page Retry auto-click handled — research re-kicked", "INFO")
+                log(f"[{label}] Gemini failed turn re-drafted — research re-kicked", "INFO")
                 await asyncio.sleep(2)
         except Exception as _re:
-            log(f"[{label}] In-page Retry guard raised (non-fatal): {_re}", "DEBUG")
+            log(f"[{label}] Failed-turn re-draft guard raised (non-fatal): {_re}", "DEBUG")
 
     # ── 2026-08-05: ChatGPT submit-verification — the twin of Gemini's, below ──
     #
@@ -57045,12 +58066,40 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             for _att in range(1, _max_attempts + 1):
                 if _controls.is_stop() or _gemini_in_conversation():
                     break
-                _retried = await _try_inpage_retry_on_research_fail(
-                    page, platform, label, max_wait_s=20)
+                # ⛔ RE-POINTED 2026-09-18 off `_try_inpage_retry_on_research_fail`.
+                # ⭐ AND THE RETURN NOW MEANS WHAT THIS BRANCH READS IT AS. The
+                # retired helper returned True for having CLICKED, and one click
+                # on Gemini's Redo opens an overlay that re-drafts nothing — so a
+                # True here skipped the re-paste this ladder exists to do while
+                # logging that it had retried. `_gemini_retry_failed_turn`
+                # returns True only when the turn stopped reading as failed.
+                #
+                # ⛔⛔ AND THE ARM BELOW IS NO LONGER AN `elif`. CORRECTED
+                # 2026-09-18. `_retried` was STRUCTURALLY DEAD for fifteen
+                # months — the retired helper's word list never matched
+                # `aria-label="Redo"`, so it was always False and the re-paste
+                # arm ran on EVERY attempt. That guarantee was an accident of a
+                # helper that could not click, and re-pointing this call site
+                # made the True branch reachable for the first time: it logs,
+                # skips the composer read, skips the re-paste, and skips the
+                # Deep Research re-arm, which is the one thing this ladder's own
+                # test calls mandatory ("every ladder re-submit must re-arm Deep
+                # Research first"). On the incident shape this branch is
+                # reachable on — an errored DR leaves the URL bare `/app` while
+                # the brief DID enter the conversation — a re-draft that comes
+                # back with the tool selection reverted is a PLAIN CHAT answer
+                # that `_gemini_landed` then accepts as the recovered research.
+                # ⭐ So the re-draft is kept and the guarantee is restored: the
+                # ladder's own work is gated on the CONVERSATION, which is what
+                # it was always really about. A re-draft that landed one skips
+                # the re-paste through that check (and the loop's own head
+                # breaks on it next time round); one that did not lands on the
+                # re-paste + DR re-arm, exactly as every attempt did before.
+                _retried = await _gemini_retry_failed_turn(page, label, max_wait_s=20)
                 if _retried:
-                    log(f"[{label}] Gemini error → clicked in-page Retry "
+                    log(f"[{label}] Gemini error → re-drafted the failed turn "
                         f"(attempt {_att}/{_max_attempts})")
-                elif not _gemini_in_conversation():
+                if not _gemini_in_conversation():
                     # 2026-07-11 incident: the documented drop REVERTS the
                     # composer to empty, so re-clicking Send / pressing Enter
                     # against it is a guaranteed no-op (all 3 retries in the
@@ -57285,8 +58334,16 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         try:
             brief_path.parent.mkdir(parents=True, exist_ok=True)
             if not brief_path.exists() or brief_path.stat().st_size < 100:
-                brief_path.write_text(
-                    f"# Research Brief\n\n{brief_text}", encoding="utf-8")
+                # ⛔⛔ WAVE 10 REPAIR — THIS FILE IS NOT NUMBERED, AND THAT IS
+                # THE POINT. This is the file ChatGPT and Claude RECEIVE:
+                # attached when `use_file_attach`, pasted off disk on a hard
+                # retry. Numbering it handed the agents our own idempotency
+                # sentinel, and one echoed marker in a report made
+                # `_number_document_sources` a no-op on THAT report — no
+                # numbers, no bibliography, silently. See
+                # `tests/test_numbered_sources_placement_0918.py`.
+                brief_path.write_text(f"# Research Brief\n\n{brief_text}",
+                                      encoding="utf-8")
                 log(f"Wrote brief to disk for attachment: {brief_path.name} ({len(brief_text)} chars)")
             else:
                 log(f"Using existing brief.md ({brief_path.stat().st_size} bytes)")
@@ -58086,11 +59143,21 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             # when the LATEST turn says the draft failed, click Gemini's own
             # re-draft control.
             #
+            # ⛔⛔ THE PLAN'S NOTE ABOUT THIS LOOP, CORRECTED 2026-09-18. Wave
+            # 10's text says "nothing in the poll loop reads failure text". It
+            # does — right here, through `_gemini_reads_as_failed` below. What
+            # is true is the SCOPE: this whole branch is gated on `not
+            # start_clicked`, so it is dead from the moment Start research is
+            # clicked, and nothing reads failure text in the post-Start window
+            # at all. The retired helper never had a poll-loop caller either;
+            # both of its call sites were on the send path, before this screen.
+            #
             # ⛔⛔ WHAT THIS REPLACED, AND WHY IT COULD NOT BE A TUNING CHANGE.
-            # This branch delegated to `_try_inpage_retry_on_research_fail`,
-            # whose button word list is `retry|regenerate|try again|rerun|
-            # restart`. Gemini's control is `aria-label="Redo"`. So this branch
-            # has never clicked anything — not on a bad day, ever — and
+            # This branch delegated to `_try_inpage_retry_on_research_fail`
+            # (retired 2026-09-18), whose button word list was `retry|
+            # regenerate|try again|rerun|restart`. Gemini's control is
+            # `aria-label="Redo"`. So this branch never clicked anything — not
+            # on a bad day, ever — and
             # `_regen_count` has never left zero, which also means the
             # `regen_capped` arm of `_gemini_plan_card_due` (eight tests, all
             # green) has never been reachable in production. The other wording,
@@ -58550,6 +59617,13 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         if not _gemini_2d_skipped:
             agents["Gemini"] = {"page": gemini_page, "verified": verified_b, "url": gemini_page.url,
                                 "research_started_at": time.time(),
+                                # Carried for the round-robin's stale-research
+                                # reload identity prover. The HEAD of the brief
+                                # is what identifies a conversation, and
+                                # `_augment_brief_with_sources` only APPENDS —
+                                # so the un-augmented text answers the same
+                                # question the paste would.
+                                "brief": brief_text,
                                 "needs_start_verify": bool(start_clicked and not verified_b),
                                 # #953: streaming hand-off — the round-robin's
                                 # Gemini leg watches for a late 'Start research'
@@ -62222,11 +63296,34 @@ _CODE_FENCE_RE = re.compile(r'```.*?```|~~~.*?~~~', re.DOTALL)
 _INLINE_CODE_RE = re.compile(r'`[^`\n]*`')
 
 
+def _mask_code_spans(md: str) -> tuple:
+    """`(_mask_code(md), the [start, end) spans it blanked)`.
+
+    ⛔⛔ WAVE 10 REPAIR — THE SPANS ARE WHY THIS EXISTS. Masking blanks a fenced
+    block to spaces but KEEPS its newlines, which is load-bearing for every
+    offset-based reader here. The cost is that a blank line INSIDE a fence still
+    reads as a paragraph break, so a position taken from the masked text can land
+    inside code that the mask exists to keep out. `_number_document_sources` used
+    to take its marker position that way and wrote the marker between two
+    commands. One definition, so the mask and the spans cannot disagree about
+    what code is.
+
+    ⛔ FENCES BEFORE INLINE, and the inline pass runs over the FENCE-MASKED text
+    (a fence can contain single backticks). Masking preserves length, so every
+    span is an offset into `md` itself."""
+    src = md or ""
+    spans: list = []
+
+    def _blank(m):
+        spans.append((m.start(), m.end()))
+        return re.sub(r'[^\n]', ' ', m.group(0))
+
+    return _INLINE_CODE_RE.sub(_blank, _CODE_FENCE_RE.sub(_blank, src)), spans
+
+
 def _mask_code(md: str) -> str:
     """The markdown with every code span replaced by spaces, same length."""
-    def _blank(m):
-        return re.sub(r'[^\n]', ' ', m.group(0))
-    return _INLINE_CODE_RE.sub(_blank, _CODE_FENCE_RE.sub(_blank, md or ""))
+    return _mask_code_spans(md)[0]
 
 
 def _sweep_source_urls(md: str) -> list:
@@ -62505,6 +63602,450 @@ def _extract_findings(md: str, source_urls: list) -> list:
     return findings
 
 
+# ── NUMBERED SOURCES IN THE MACHINE'S OWN DOCUMENTS (wave 10, 2026-09-18) ─────
+#
+# The reader's ask: "when I see a sentence I really want to see where did that
+# sentence come from." The web shipped this for the two documents IT generates;
+# this is the same contract for the phase-1 brief and the three phase-2 agent
+# reports, which the machine writes and no model ever touches.
+#
+# ⛔⛔ THE GRAMMAR IS DELIBERATELY *NOT* THE WEB'S `[[n]]`, AND THAT CHOICE IS THE
+# WHOLE RISK OF THIS LANE. `src/lib/doc-sources.ts` RESERVES `[[n]]`
+# (`SOURCE_TOKEN_RE = /\[\[(\d{1,3})\]\]/g`) as the token a MODEL writes, and its
+# safety rests on one measured sentence: "the doubled form has never appeared in
+# an agent report". Both web generators feed the agent reports to the model
+# UNSTRIPPED and then rewrite every `[[n]]` in the REPLY against the web's own
+# numbering — which is computed across all three agents at once and is therefore
+# a different numbering from any single document's. So a machine marker written
+# in that grammar becomes model input, comes back in the synthesis, and is
+# renumbered to a DIFFERENT source: a citation that looks right and opens the
+# wrong page. Of the two ways out named in the plan — change the grammar, or
+# strip machine markers before a model sees them — only the first is available
+# from this side, because the strip would have to happen in the web, which is
+# already shipped and is read-only to this repo.
+#
+# ⭐ SO WE EMIT `[\[n\]](url)`: an ordinary markdown link whose TEXT is an
+# ESCAPED bracketed number. Verified through the web's own micromark + GFM stack:
+# it renders `<a href="url">[n]</a>` — byte-identical to what the web's
+# `sourceMarker` produces, so the two halves look the same to a reader — and it
+# contains no `[[` anywhere, so the web's token regex cannot match it.
+# `_number_document_sources` is pinned to emit nothing that regex can see.
+#
+# ⛔ NOT GFM `[^n]`: a GFM footnote ALWAYS renders as an internal link to a
+# definition, so the number moves the reader DOWN the page instead of opening the
+# source. The owner chose the opposite. ⛔ NOT superscript: react-markdown turns
+# raw HTML into text and no rehype-raw is wired, so `<sup>` would be visible
+# markup rather than a small number.
+#
+# ⛔⛔ AND A NUMBER IS ONLY EVER WRITTEN FOR A URL THIS DOCUMENT ACTUALLY
+# CONTAINS. An unresolvable marker renders as literal text, which is visible
+# breakage, so numbering and PLACEMENT are ONE decision here: a source earns a
+# number only when its inline marker was placed, and the trailing list holds
+# exactly the numbers that appear in the prose. Nothing in the list points at a
+# number the reader cannot find, and nothing in the prose points at a list entry
+# that does not exist. It is also what makes the pass idempotent.
+#
+# ⛔ THE MARKER GOES AT THE END OF THE ENCLOSING SENTENCE, NOT AGAINST THE URL.
+# Measured through micromark: appending `[\[1\]](…)` directly after a BARE URL is
+# swallowed by the GFM autolink-literal extension — the marker's own text becomes
+# part of the preceding href and the link breaks. A separating space fixes it in
+# every shape (bare URL, `<autolink>`, `[label](url)`, list item, paragraph end),
+# so a space is written whenever the preceding character is not already one.
+#
+# ⛔⛔ AND "THE ENCLOSING SENTENCE" IS BOUNDED BY THE ENCLOSING BLOCK. The first
+# draft took the sentence tail alone, which knows `[.!?]\s`, a blank line and a
+# heading — so in a bulleted list whose items do not end in a full stop, EVERY
+# number in the list migrated to its LAST bullet, pointing a reader at a page
+# that bullet never mentioned. Agent reports are heavily bulleted. A table row
+# was worse: the marker landed past the row's trailing `|`, where GFM drops it,
+# so the bibliography carried a number the reader could not find anywhere — the
+# one thing the paragraph above says this design makes impossible. The clamp and
+# its two special cases live in `_doc_marker_position`.
+
+#: Our own inline marker, used as the idempotency sentinel.
+#:
+#: ⛔⛔ WAVE 10 REPAIR — THIS COMMENT USED TO SAY THE MARKER "cannot collide with
+#: anything an agent writes". Numbering `brief.md` made that false BY
+#: CONSTRUCTION: the brief is the file ChatGPT and Claude RECEIVE, so our own
+#: sentinel was handed to the agents, and one imitated marker in a report made
+#: this whole pass a no-op on it — no numbers, no bibliography, no log line.
+#: The sentinel cannot be made un-echoable (it has to be in the output to make
+#: the pass idempotent, and the output is what the agent is holding), so the
+#: brief the agents receive is no longer numbered. See `_number_document_sources`
+#: and `tests/test_numbered_sources_placement_0918.py`.
+_DOC_SOURCE_MARK_RE = re.compile(r'\[\\\[\d{1,3}\\\]\]\(')
+
+#: The bibliography's title. The alternate is used when the report already ends
+#: with a sources list of its own — deep-research reports commonly do, and a
+#: second identical `Sources` shows in the document, the share and the
+#: delivered Google Doc.
+#: ⛔ THE ALTERNATE STILL BEGINS WITH THE WORD. The web collapses a trailing
+#: sources section on `/^sources\b/i` (`markdown-components.tsx:151`), and it is
+#: deliberately not widened to References/Citations — "Numbered sources" would
+#: have quietly stopped collapsing.
+_DOC_SOURCES_TITLE = "Sources"
+_DOC_SOURCES_ALT_TITLE = "Sources (numbered)"
+#: A heading whose text says "this is the source list" — the report's own.
+_DOC_SOURCES_WORD_RE = re.compile(
+    r'(?:sources|references|citations|bibliography|works cited)[\s:]*\Z', re.IGNORECASE)
+#: Any heading, ATX or SETEXT, so "the last heading in the report" can be read.
+_DOC_ANY_HEADING_RE = re.compile(
+    r'^#{1,6}[ \t]+(?P<atx>.+?)[ \t]*$|^(?P<setext>\S.*?)[ \t]*\n[ \t]{0,3}[-=]{2,}[ \t]*$',
+    re.MULTILINE)
+#: The tail this module appends, for the readers that want the report WITHOUT it.
+#: ⛔ EVERY LEVEL, AND BOTH TITLES: a document numbered before this repair carries
+#: `## Sources`, and the strip has to take its own tail off either way.
+#: The level our heading is written at. ⛔⛔ FIVE, AND IT IS THE ONLY LEVEL THAT
+#: WORKS — see `_doc_sources_heading`.
+_DOC_SOURCES_HEADING_LEVEL = 5
+
+#: ⛔⛔ BUILT FROM THE CONSTANTS, AND NO WIDER THAN THE TWO FORMS THIS MACHINE HAS
+#: EVER WRITTEN — level five today, `##` before this repair. The strip is gated on
+#: our own markers being present, but a pattern loose enough to match ANY heading
+#: level or a generic "sources" title would, the first time it ran on a document
+#: whose tail had already come off, eat the AGENT's own sources list instead. The
+#: alternate title comes first: it is the longer of the two.
+_DOC_SOURCES_BLOCK_RE = re.compile(
+    r'\n\n(?:%s|##)[ \t]+(?:%s|%s)[ \t]*\n\n(?:\d{1,3}\. \[.*\n?)+\Z'
+    % ("#" * _DOC_SOURCES_HEADING_LEVEL,
+       re.escape(_DOC_SOURCES_ALT_TITLE), re.escape(_DOC_SOURCES_TITLE)))
+
+
+def _doc_sources_heading(title: str) -> str:
+    """Our heading, written at level FIVE.
+
+    ⛔⛔ WAVE 10 REPAIR, AND IT IS MEASURED AGAINST THREE READERS RATHER THAN
+    chosen for looks. The same appended heading is read by:
+
+      • THE WEB'S SUPER RESEARCH PLANNER, which indexes each agent report by
+        `/^(#{1,4})\\s+(.+?)\\s*$/gm` (`superresearch-doc.ts:228`) and offers
+        every match to a section writer as "Your material". At `##` our
+        bibliography became a phantom research slice — up to three per run —
+        and a section could be written from a list of links. It stops at FOUR.
+      • THE WEB'S DOCUMENT VIEWER AND PUBLIC SHARE, which collapse the report's
+        LAST heading into a `Sources · n` disclosure when it matches
+        `/^ {0,3}(#{1,6})\\s+(.+?)\\s*#*\\s*$/` and `/^sources\\b/i`
+        (`markdown-components.tsx:140,151`). That one goes to SIX — so a setext
+        heading, which renders byte-identically to `##`, would have silently
+        stopped the bibliography collapsing on both surfaces. Level five is the
+        only form the viewer still folds and the planner cannot see.
+      • `save_meta`, which counts `^#{1,3}\\s+` headings to decide whether a
+        report titles its sections in bold — the whole reason
+        `_strip_numbered_sources_section` exists. Level five is below that too,
+        so a strip that ever failed could no longer cost a ChatGPT report every
+        section it has.
+
+    ⛔ THE LEVEL IS NOT A LOOK. Collapsed, the reader never sees it at all; the
+    disclosure is labelled with the TITLE."""
+    return "%s %s" % ("#" * _DOC_SOURCES_HEADING_LEVEL, title)
+
+
+def _doc_ends_with_its_own_sources(masked: str) -> bool:
+    """Does the report's LAST heading already say "sources"?
+
+    Read off the masked text so a `# heading` inside a fenced block is not one."""
+    last = ""
+    for m in _DOC_ANY_HEADING_RE.finditer(masked or ""):
+        last = (m.group("atx") or m.group("setext") or "").strip()
+    return bool(last) and _DOC_SOURCES_WORD_RE.match(last) is not None
+
+
+def _doc_markdown_url(u: str) -> str:
+    """A destination safe to put inside `](…)`.
+
+    ⛔ Parentheses are percent-encoded rather than left alone: a URL containing
+    `)` ends the markdown link early, so the tail of the address becomes visible
+    prose and the link points at a truncated URL — a broken link that LOOKS like
+    a working one. Ported from the web's `markdownUrl` so both halves agree."""
+    return (u or "").replace("(", "%28").replace(")", "%29")
+
+
+def _doc_escape_link_text(s: str) -> str:
+    """Square brackets in link TEXT terminate it; escape them."""
+    return re.sub(r'([\[\]])', r'\\\1', s or "")
+
+
+def _doc_source_marker(n: int, url: str) -> str:
+    """The inline number, as markdown. See this block's header for the grammar."""
+    return "[\\[%d\\]](%s)" % (n, _doc_markdown_url(url))
+
+
+def _doc_is_linkable_url(u) -> bool:
+    """Is this a destination we are willing to put behind a number?
+
+    http(s) only, no whitespace or angle brackets (either silently truncates the
+    href), and never one of the agents' own pages — a report can cite the
+    conversation it was written in, and these documents are frozen into shares
+    and inserted into a delivered Google Doc. The URL-taking platform test is
+    already the one `_extract_findings` uses, so the two agree by construction."""
+    if not isinstance(u, str):
+        return False
+    t = u.strip()
+    if not t or re.search(r'[\s<>]', t):
+        return False
+    if not re.match(r'https?://[^\s]+\Z', t, re.IGNORECASE):
+        return False
+    return not _find_is_platform_host(t)
+
+
+def _doc_source_host(url: str) -> str:
+    """A readable name for a row that has none: the host, minus `www.`."""
+    try:
+        from urllib.parse import urlsplit
+        h = (urlsplit(url).hostname or "").lower()
+        if h.startswith("www."):
+            h = h[4:]
+        return h
+    except Exception:
+        return ""
+
+
+def _doc_source_title(finding: dict, url: str) -> str:
+    """The bibliography row's text: the finding's own title, else the host."""
+    t = re.sub(r'\s+', ' ', ((finding or {}).get("sourceTitle") or "")).strip()[:160]
+    return t or _doc_source_host(url) or url
+
+
+def _doc_sources_row(n: int, url: str, title: str) -> str:
+    """One bibliography line.
+
+    ⛔ AN EXPLICIT NUMBER, never `1.` repeated: the document is also inserted
+    into a delivered Google Doc and frozen into a share as PLAIN TEXT, and a
+    renderer-computed number would survive neither — the numbers in the prose
+    would then point at positions nothing states.
+
+    ⭐ AND THE HOST IS PRINTED BESIDE THE TITLE. `_extract_findings`' title is
+    the nearest HEADING IN OUR OWN DOCUMENT, not the page's own name, so two
+    sources cited under one heading arrive with the same title — a bibliography
+    reading "1. Battery prices / 2. Battery prices" tells a reader nothing about
+    where either went. The web's row spends that column on the agent's name,
+    which a per-agent document already states in its H1."""
+    host = _doc_source_host(url)
+    tail = "" if not host or host == title else " — %s" % host
+    return "%d. [%s](%s)%s" % (n, _doc_escape_link_text(title),
+                               _doc_markdown_url(url), tail)
+
+
+#: A line that OPENS a block, so the line before it cannot be continued into it.
+#: ⛔⛔ WAVE 10 REPAIR. `_FIND_SENT_TAIL_RE` knows `[.!?]\s`, a blank line and a
+#: heading, and nothing about line or block structure — so in a bulleted list
+#: whose items do not end in a full stop, the first "sentence tail" after ANY
+#: bullet's url is the blank line that ends the WHOLE list, and every number in
+#: the list migrated to its LAST bullet. Agent reports are heavily bulleted, and
+#: a bullet ending in a bare url, a `%` or a closing bracket is the normal shape.
+_DOC_BLOCK_START_RE = re.compile(
+    r'^[ \t]{0,3}(?:[-*+][ \t]|#{1,6}[ \t]|>|\||```|~~~'
+    r'|(?:[-*_][ \t]*){3,}$)')
+#: An ordered item, kept apart from the rest because it is the one shape that
+#: does NOT always open a block.
+#: ⛔⛔ THE CLAMP'S OWN TRAP. `2025. Prices fell…` at the start of a line is a
+#: list item to the eye and to this regex, and treating it as one ended a
+#: WRAPPED SENTENCE at the wrap — the number landed mid-sentence, which the
+#: unclamped code never did. CommonMark settles it: only `1.`/`1)` may interrupt
+#: a paragraph, so an ordered item ends the line above it only when that line is
+#: itself a list item, or when the item is the list's first.
+_DOC_ORDERED_ITEM_RE = re.compile(r'^[ \t]{0,3}(?P<n>\d{1,9})[.)][ \t]')
+#: Is the citing line itself a list item?
+_DOC_LIST_ITEM_RE = re.compile(r'^[ \t]{0,3}(?:[-*+][ \t]|\d{1,9}[.)][ \t])')
+#: A table row — the one block whose END is not a place a marker may go.
+_DOC_TABLE_ROW_RE = re.compile(r'^[ \t]{0,3}\|')
+#: A cell boundary. GFM treats `\|` as a literal pipe inside a cell.
+_DOC_CELL_END_RE = re.compile(r'(?<!\\)\|')
+
+
+def _doc_block_end(masked: str, pos: int, in_list: bool = False) -> int:
+    """Where the block containing `pos` ends.
+
+    A block runs on through lines that continue it (a wrapped paragraph, a
+    wrapped list item) and stops before the first blank line or line that opens
+    a block of its own. A sentence never runs past that.
+
+    `in_list` says whether the line `pos` is on is itself a list item, which is
+    the only thing that decides whether `2025. ` below it opens a new item or is
+    the rest of a wrapped sentence — see `_DOC_ORDERED_ITEM_RE`."""
+    n = len(masked)
+    at = masked.find("\n", pos)
+    while at != -1:
+        nxt = masked.find("\n", at + 1)
+        line = masked[at + 1: n if nxt == -1 else nxt]
+        if not line.strip() or _DOC_BLOCK_START_RE.match(line):
+            return at
+        ordered = _DOC_ORDERED_ITEM_RE.match(line)
+        if ordered and (in_list or ordered.group("n") == "1"):
+            return at
+        if nxt == -1:
+            return n
+        at = nxt
+    return n
+
+
+def _doc_marker_position(md: str, masked: str, spans: list,
+                         url_end: int, doc_end: int) -> int:
+    """Where the number for the citation ending at `url_end` goes.
+
+    ⛔⛔ THE SENTENCE TAIL IS A CEILING, NOT AN ANSWER. It is clamped to the end
+    of the block the url is in (see `_DOC_BLOCK_START_RE`), so a bullet, a
+    numbered item or a heading-terminated paragraph closes a sentence even when
+    it ends without punctuation.
+
+    ⛔⛔ A TABLE ROW IS CLAMPED TO ITS OWN CELL. GFM DISCARDS CELLS BEYOND THE
+    HEADER'S COLUMN COUNT, so a marker written after the row's trailing `|` is a
+    number that is in the file, has a row in the bibliography, and renders
+    NOWHERE — which is exactly the invariant this module states about itself.
+
+    ⛔⛔ AND THE POSITION IS REJECTED IF IT IS INSIDE CODE. Masking keeps a
+    fence's newlines, so a blank line inside one reads as a paragraph break; the
+    marker then renders as literal text inside the block and corrupts a command
+    a reader may copy."""
+    line_end = masked.find("\n", url_end)
+    if line_end == -1:
+        line_end = len(masked)
+    line_start = masked.rfind("\n", 0, url_end) + 1
+    line = masked[line_start:line_end]
+    if _DOC_TABLE_ROW_RE.match(line):
+        cell = _DOC_CELL_END_RE.search(masked, url_end, line_end)
+        limit = cell.start() if cell else line_end
+    else:
+        limit = _doc_block_end(
+            masked, url_end, in_list=bool(_DOC_LIST_ITEM_RE.match(line)))
+    if limit > doc_end:
+        limit = doc_end
+    tail = _FIND_SENT_TAIL_RE.search(masked, url_end)
+    at = min(tail.start(), limit) if tail else limit
+    for start, end in spans:
+        if start < at < end:
+            at = start
+    # Trailing spaces first (a table cell pads its closing pipe), then the
+    # sentence's own closing stop, so the number sits where every other one
+    # sits — before the punctuation rather than orphaned after it.
+    while at - 1 >= url_end and md[at - 1] in " \t":
+        at -= 1
+    if at - 1 >= url_end and md[at - 1] in ".!?":
+        at -= 1
+    return at if at > url_end else url_end
+
+
+def _number_document_sources(md: str, findings: list) -> str:
+    """Add an inline `[n]` link at each cited sentence, and a Sources list.
+
+    ⛔⛔ THE SENTENCE IS A BLOCK'S SENTENCE — see `_doc_marker_position`. A bullet,
+    a numbered item and a table cell each END one, whether or not they close with
+    a full stop; the naked sentence-tail regex sent every number in a list to its
+    LAST bullet and every number in a table past the row's closing pipe.
+
+    ⛔ THE POSITIONS ARE RE-DERIVED FROM THE DOCUMENT, NOT TAKEN FROM THE
+    FINDING. A finding's `url` is the CANONICAL form — `_extract_findings` emits
+    the panel's spelling when the panel supplied one — and the panel's spelling
+    need not appear in the prose at all. Matching on the normalised key against
+    the report's own URLs is what makes "the marker sits where the citation is"
+    true rather than usually true.
+
+    ⛔ Code spans are masked first (`_mask_code_spans`), so a URL a report shows
+    you inside a fenced block is teaching, not citing, and earns no number — the
+    same rule `_sweep_source_urls` already applies, through the same helper. The
+    SPANS are kept as well as the mask, because a position derived from masked
+    text is not automatically a position outside code.
+
+    Returns the markdown unchanged when there is nothing to number, and when it
+    has been numbered already — and says so in the log when it bails, which is
+    how an echoed marker would be noticed next time."""
+    if not md or not findings:
+        return md or ""
+    if _DOC_SOURCE_MARK_RE.search(md):
+        # ⛔ NOT SILENT ANY MORE. This is the normal answer on a re-save of a
+        # document we already numbered, so it is DEBUG rather than a warning —
+        # but the one thing that must never happen again is this firing on an
+        # agent report that merely echoed a marker and nobody knowing.
+        log("numbered sources: document already carries markers, left as it is",
+            "DEBUG")
+        return md
+    masked, spans = _mask_code_spans(md)
+    ends: dict = {}
+    for m in _FIND_BARE_URL_RE.finditer(masked):
+        u = _find_trim_trailing_punct(m.group(0))
+        if not u:
+            continue
+        k = _find_normalize_url(u)
+        if k not in ends:
+            ends[k] = m.start() + len(u)
+    doc_end = len(md.rstrip())
+    placements: list = []
+    seen: set = set()
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        url = (f.get("url") or "").strip()
+        if not _doc_is_linkable_url(url):
+            continue
+        k = _find_normalize_url(url)
+        if not k or k in seen:
+            continue
+        url_end = ends.get(k)
+        if url_end is None:
+            continue
+        seen.add(k)
+        # ⛔ The citation may be in the document's LAST sentence with nothing
+        # after it — `[.!?]\s` needs the space, so a report that ends without a
+        # newline has no tail to find and `doc_end` is the answer.
+        at = _doc_marker_position(md, masked, spans, url_end, doc_end)
+        placements.append((at, url_end, url, _doc_source_title(f, url)))
+    if not placements:
+        return md
+    # Ascending through the document, so the numbers a reader meets count up.
+    placements.sort(key=lambda p: (p[0], p[1]))
+    out = md
+    for i in range(len(placements) - 1, -1, -1):
+        at, _url_end, url, _title = placements[i]
+        lead = "" if at <= 0 or md[at - 1].isspace() else " "
+        out = out[:at] + lead + _doc_source_marker(i + 1, url) + out[at:]
+    rows = "\n".join(
+        _doc_sources_row(i + 1, p[2], p[3]) for i, p in enumerate(placements))
+    heading = _doc_sources_heading(
+        _DOC_SOURCES_ALT_TITLE if _doc_ends_with_its_own_sources(masked)
+        else _DOC_SOURCES_TITLE)
+    return "%s\n\n%s\n\n%s\n" % (out.rstrip(), heading, rows)
+
+
+def _strip_numbered_sources_section(md: str) -> str:
+    """The document as it was before this module appended its bibliography.
+
+    ⛔⛔ `save_meta` ANALYSES THE REPORT'S OWN STRUCTURE, and appending a heading
+    to a document changes that analysis. Its bold-pseudo-heading fallback fires
+    only when a report has two headings or fewer, so an added `## Sources` would
+    push a ChatGPT report that titles its sections in bold past the test and cost
+    it every section it has. Cutting our own tail back off first keeps that
+    reader byte-identical to what it saw before the numbering existed.
+
+    Only ever removes a block this module could have written — a trailing
+    `Sources`/`Numbered sources` heading, ATX or setext, whose every line is
+    `n. [` — and leaves an agent's own sources list alone.
+
+    ⭐ WAVE 10 REPAIR — OUR HEADING IS LEVEL FIVE NOW (`_doc_sources_heading`),
+    so the `^#{1,3}` count above can no longer see it even if this strip failed.
+    The strip still runs: `sections` is built from the stripped text and our rows
+    would otherwise arrive as section titles."""
+    if not md or not _DOC_SOURCE_MARK_RE.search(md):
+        return md or ""
+    return _DOC_SOURCES_BLOCK_RE.sub("", md)
+
+
+def _document_with_sources(md: str, source_urls=None, findings=None) -> str:
+    """The write-site face: number `md`, extracting its findings if none given.
+
+    ⛔ The findings are read from the CLEAN document. Every caller that has them
+    already extracts BEFORE this call for the same reason: run the other way
+    round, the appended bibliography's own links become "findings", and the
+    Findings tab fills with rows whose snippet is a bibliography line.
+
+    Never raises — an un-numbered document is a smaller loss than a lost one."""
+    try:
+        rows = findings if findings else _extract_findings(md, list(source_urls or []))
+        return _number_document_sources(md, rows or [])
+    except Exception as _nse:
+        log(f"numbered sources skipped ({type(_nse).__name__})", "DEBUG")
+        return md
+
+
 def _run_started_ms(queue_dir) -> int:
     """When the RUN began — not when meta.json first happened to be written.
 
@@ -62596,7 +64137,16 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
     for platform in ["chatgpt", "gemini", "claude"]:
         md_file = doc_dir / f"{platform}.md" if doc_dir.exists() else None
         if md_file and md_file.exists() and md_file.stat().st_size > 100:
-            content = md_file.read_text(encoding="utf-8")
+            # ⛔⛔ WAVE 10 — THE BIBLIOGRAPHY IS CUT BACK OFF BEFORE ANY OF THIS
+            # READS THE REPORT. Everything below judges the report's OWN
+            # structure, and the bold-pseudo-heading fallback fires only at two
+            # headings or fewer: an appended ATX `## Sources` would push a
+            # ChatGPT report that titles its sections in bold past that test and
+            # cost it every section it has. `_strip_numbered_sources_section`
+            # removes only a tail this machine wrote, and since the wave 10
+            # repair that tail's heading is level FIVE, which the count below
+            # cannot see at all — belt as well as braces.
+            content = _strip_numbered_sources_section(md_file.read_text(encoding="utf-8"))
             # Extract sections — markdown headings + bold standalone lines (ChatGPT style)
             # ⭐ Wave 4: a heading's image markup is not its title; an image-only
             # heading is no section. ⛔ Titled BEFORE the count, the dedupe and the
@@ -65019,6 +66569,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # extracted one — a data: URI or a platform link never reaches
                 # brief.md, the document, or the Phase 2 paste.
                 brief_text = await _rehost_document_images(brief_text, label="Brief")
+                # ⛔⛔ WAVE 10 REPAIR — THE BRIEF IS NOT NUMBERED. It is the file
+                # the agents are handed, so numbering it fed them our own
+                # idempotency sentinel; one echoed marker cost a whole agent
+                # report its numbers and its bibliography, silently. The three
+                # agent reports are still numbered — they are read, not sent.
                 _brief_md = f"# Research Brief\n\n{brief_text}"
                 (queue_dir / "documents" / "brief.md").write_text(_brief_md, encoding="utf-8")
                 save_document_to_firestore("brief", _brief_md, "Research Brief")
@@ -65057,6 +66612,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             else:
                 # ⭐ Wave 4: rehost the brief's images before either write.
                 brief_text = await _rehost_document_images(brief_text, label="Brief")
+                # ⛔⛔ WAVE 10 REPAIR — NOT NUMBERED: same file, same reason as
+                # the `_brief_from_file` branch above. The disk copy phase 2
+                # attaches and the Firestore copy the app renders still agree,
+                # which is what this ordering was for.
                 _brief_md = f"# Research Brief\n\n{brief_text}"
                 (queue_dir / "documents" / "brief.md").write_text(_brief_md, encoding="utf-8")
                 # Sync to Firestore documents subcollection — this is the
@@ -65193,6 +66752,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         # already got past phase 1 once. `brief_url` now means one
                         # thing everywhere — the brief's page in our app — and it
                         # is set from that page below, after the brief is saved.
+                        # ⛔⛔ WAVE 10 REPAIR — a regenerated brief is not
+                        # numbered either: phase 2 hands this same file to the
+                        # agents.
                         _brief_md_regen = f"# Research Brief\n\n{brief_text}"
                         (queue_dir / "documents" / "brief.md").write_text(_brief_md_regen, encoding="utf-8")
                         save_document_to_firestore("brief", _brief_md_regen, "Research Brief")
@@ -65766,19 +67328,21 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 if r["text"]:
                     fname = name.lower().replace(" ", "") + ".md"
                     _agent_md = f"# {name} Deep Research\n\n{r['text']}"
-                    (queue_dir / "documents" / fname).write_text(_agent_md, encoding="utf-8")
-                    # Sync to Firestore documents subcollection — doc_type is the
-                    # agent key (chatgpt / gemini / claude), consistent with the
-                    # frontend's Documents page expectation.
                     _agent_lc = name.lower().replace(" ", "")
-                    save_document_to_firestore(_agent_lc, _agent_md, f"{name} Deep Research")
                     # Backstop findings extraction at the P2 finalize re-save
                     # site. The primary site is in extract_and_record_agent
                     # (~research.py:10988), but this resave path can run on
                     # resume / manual re-finalize when the snapshot ring may
-                    # have been cleared. Skip if findings already exist.
+                    # have been cleared. Reuses findings that already exist.
+                    #
+                    # ⛔⛔ WAVE 10 — AHEAD OF THE WRITE, for the reason the
+                    # primary site states: the numbering below appends a
+                    # bibliography, and a findings pass run after it would read
+                    # that bibliography as the report's own citations.
+                    _findings = []
                     try:
-                        if _agent_lc not in (getattr(_runtime, "agent_findings", {}) or {}):
+                        _findings = list((getattr(_runtime, "agent_findings", {}) or {}).get(_agent_lc) or [])
+                        if not _findings:
                             _src_urls = list(getattr(_runtime, "agent_progress_snapshots", {}).get(_agent_lc, {}).get("source_urls", []) or [])
                             # Same de-gating as the primary site: this backstop
                             # exists for resume/re-finalize, exactly when the
@@ -65786,12 +67350,60 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                             # on the panel list made it useless in the one case
                             # it was written for.
                             if _agent_md:
-                                _findings = _extract_findings(_agent_md, _src_urls)
+                                _findings = _extract_findings(_agent_md, _src_urls) or []
                                 if _findings:
                                     _runtime.agent_findings[_agent_lc] = _findings
                     except Exception:
-                        pass
-            # Generate consolidated report
+                        _findings = []
+                    # ⭐ Wave 10 — numbered sources, on the same document both
+                    # writes below carry.
+                    _agent_md = _document_with_sources(_agent_md, findings=_findings)
+                    (queue_dir / "documents" / fname).write_text(_agent_md, encoding="utf-8")
+                    # Sync to Firestore documents subcollection — doc_type is the
+                    # agent key (chatgpt / gemini / claude), consistent with the
+                    # frontend's Documents page expectation.
+                    save_document_to_firestore(_agent_lc, _agent_md, f"{name} Deep Research")
+            # ⛔⛔ 2026-09-18, WAVE 10 — THE STACKED DOCUMENT NO LONGER REACHES
+            # DISK, AND THE STACK ITSELF IS ON ITS WAY OUT. This block is exactly
+            # what it looks like: one H1 and each agent's report verbatim, written
+            # to `documents/consolidated.md` AND mirrored to Firestore under the
+            # `consolidated` doc type. No model, no budget, no cap. The web now
+            # SYNTHESISES the real combined document at P5
+            # (`superresearch-generate.ts` → `documents/synthesis`: planner →
+            # sections → stitch, sources numbered before the first call), and it
+            # reads THE THREE PER-AGENT REPORTS, never this stack — so the
+            # concatenation has no reader of its own left.
+            #
+            # ▶ THE DISK COPY IS GONE, and dropping it settles three things at
+            # once rather than one:
+            #   * the redundancy. Every consumer of `documents/` already refused
+            #     this file BY NAME — the P3 NotebookLM scan, the Flow-B fallback
+            #     scan and the P1 attach scan each carry a derived-stem exclusion
+            #     for it — so all it did was cost ~250 KB a run.
+            #   * it disagreed with its own inputs on every re-run. `run_phase2`
+            #     has three consumers, and the pause-with-extra-context resume and
+            #     the Retry at the Phase-3 "no documents" gate each re-write
+            #     `documents/<agent>.md` and re-mirror it; neither rebuilt the
+            #     stack, because it was built HERE and nowhere else. A resumed
+            #     run's combined file was the previous attempt's text, under a
+            #     name that claimed otherwise.
+            #   * it was written unguarded — one `write_text`, no retry, and on a
+            #     targeted resume the feedback sweep unlinks every non-brief MD,
+            #     so the file could also simply vanish and be rebuilt by nothing.
+            #
+            # ⛔⛔ THE FIRESTORE MIRROR STAYS, AND THAT IS NOT THE TASK LEFT HALF
+            # DONE — IT HAS A LIVE READER ON THE WEB. The P5 SUMMARY document
+            # reads `documents/consolidated` as its ONLY source and refuses
+            # without it ("no consolidated report to summarise" —
+            # summary-generate.ts:103, summary-doc.ts:76). On BOTH P5 legs the
+            # summary runs BEFORE the synthesis, so `documents/synthesis` does not
+            # exist yet at the moment that input is built, and the web's own note
+            # calls swapping the two call sites FILED, NOT BUILT.
+            # ▶ So this mirror is the last line of the stack, and it goes the
+            # moment the summary reads the synthesis instead (or joins the three
+            # agent documents itself). Deleting it today costs every run its
+            # Summary document, silently, and that document is minted a share link
+            # and quoted in the delivery mail.
             consolidated_parts = [f"# Consolidated Research Report: {topic}\n"]
             for name in ["ChatGPT", "Gemini", "Claude"]:
                 r = results.get(name, {})
@@ -65799,11 +67411,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     consolidated_parts.append(f"\n## {name} Research\n\n{r['text']}")
             if len(consolidated_parts) > 1:
                 _consolidated_md = "\n".join(consolidated_parts)
-                (queue_dir / "documents" / "consolidated.md").write_text(_consolidated_md, encoding="utf-8")
                 save_document_to_firestore("consolidated", _consolidated_md, "Consolidated Report")
-                log(f"Consolidated report: {len(_consolidated_md)} chars")
                 # 2026-05-10: kick off the final post-research summary using
-                # the consolidated findings (all 3 agent reports merged).
+                # the merged agent reports (all 3, as built above).
                 # Overwrites the earlier brief-based stub with a "what the
                 # research found" line — this is the version users see on
                 # /researches after the pipeline finishes. Non-blocking
@@ -65940,7 +67550,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     for name, r in results.items():
                         if r.get("text"):
                             fname = name.lower().replace(" ", "") + ".md"
-                            _regen_md = f"# {name} Deep Research (regenerated)\n\n{r['text']}"
+                            # ⭐ Wave 10 — a regenerated report is numbered like
+                            # any other. No findings are in hand here, so they
+                            # come from the report's own citations.
+                            _regen_md = _document_with_sources(
+                                f"# {name} Deep Research (regenerated)\n\n{r['text']}")
                             (queue_dir / "documents" / fname).write_text(_regen_md, encoding="utf-8")
                             save_document_to_firestore(name.lower().replace(" ", ""), _regen_md, f"{name} Deep Research")
                     # Build links from round-robin results — prefer in-app primary
@@ -66063,7 +67677,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 for name, r in results.items():
                     if r.get("text"):
                         fname = name.lower().replace(" ", "") + ".md"
-                        _regen_md = f"# {name} Deep Research (retry)\n\n{r['text']}"
+                        # ⭐ Wave 10 — numbered sources on the retry copy too.
+                        _regen_md = _document_with_sources(
+                            f"# {name} Deep Research (retry)\n\n{r['text']}")
                         (queue_dir / "documents" / fname).write_text(_regen_md, encoding="utf-8")
                         save_document_to_firestore(name.lower().replace(" ", ""), _regen_md, f"{name} Deep Research")
                 # Re-check gate using the same source scan helper.

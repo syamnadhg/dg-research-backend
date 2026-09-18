@@ -516,3 +516,74 @@ def test_a_harness_with_no_mutants_is_a_HOLE_not_a_clean_bill(tmp_path):
     stats2, _b2, _u2, _n2, per2 = app.sweep()
     assert app.vacuity(stats2, per2), (
         "a sweep that loaded no harness at all called itself clean")
+
+
+# ── the two sweeps must agree about WHICH FILE a harness mutates ────────────
+# ⛔⛔ ADDED 2026-09-18, AFTER THE BUG THIS PINS SHIPPED AND HID FOR A DAY.
+# `_anchor_sweep` resolved a harness's target as MUTATED_FILES or SRC, falling
+# back to "research.py". That default was RIGHT BY ACCIDENT for all 55 harnesses
+# that declare neither, because every one of them targets research.py anyway.
+# The first harness in the fleet to target something else — wave10_domshim_style,
+# whose target is tests/_domshim.py — had all EIGHT of its anchors reported STALE,
+# because they were being counted in a file they do not appear in.
+#
+# ⭐ WHAT MADE IT INVISIBLE IS THE THING THIS TEST FIXES: `_apply_sweep` already
+# read TARGET and resolved it correctly, so the two tools disagreed and neither
+# said so. One reported 8 stale anchors, the other reported a clean apply, and a
+# reader could believe whichever matched their expectation. A default that is
+# usually correct is worse than one that is never correct — nothing reveals it
+# until the day it matters, and on that day it accuses the newest work.
+def test_a_module_level_TARGET_is_swept_against_that_file(tmp_path):
+    """⛔⛔ THE 09-18 BUG, DRIVEN THROUGH THE REAL SWEEP.
+
+    `_anchor_sweep` resolved a harness's target as MUTATED_FILES or SRC, falling
+    back to "research.py". That default was RIGHT BY ACCIDENT for all 55 harnesses
+    that declare neither, because every one of them targets research.py anyway.
+    The first harness in the fleet to target something else — wave10_domshim_style,
+    whose target is tests/_domshim.py — had all EIGHT of its anchors reported
+    STALE, because they were being counted in a file they do not appear in.
+
+    ⭐ WHAT MADE IT INVISIBLE: `_apply_sweep` already read TARGET and resolved it
+    correctly, so the two tools disagreed and neither said so. One reported eight
+    stale anchors, the other reported a clean apply, and a reader could believe
+    whichever matched their expectation.
+
+    ⛔ THIS TEST DRIVES THE REAL SWEEP rather than re-deriving its chain. The
+    first two attempts at this pin did re-derive it — once comparing the fallback
+    against the other tool's per-mutant resolution (which falsely accused five
+    healthy harnesses), and once comparing the chain to itself (which could not
+    fail at all). A synthetic harness that declares TARGET and nothing else is the
+    only shape that measures the tool instead of a copy of it.
+    """
+    repo = tmp_path / "declared_target"
+    (repo / ".mutants").mkdir(parents=True)
+    (repo / "elsewhere.py").write_text("VALUE = 1\n", encoding="utf-8")
+    # research.py exists and does NOT contain the anchor — so a sweep that
+    # defaults to it reports the anchor stale, which is precisely the bug.
+    (repo / "research.py").write_text("# nothing to see here\n", encoding="utf-8")
+
+    (repo / ".mutants" / "declared_mutants.py").write_text("\n".join([
+        "from pathlib import Path",
+        "",
+        "ROOT = Path(__file__).resolve().parent.parent",
+        'TARGET = "elsewhere.py"',
+        "FILES = (TARGET,)",
+        "MUTANTS = [",
+        '    ("M1", "the declared-target mutant", [("VALUE = 1", "VALUE = 2")]),',
+        "]",
+        "",
+        "for mid, why, edits in MUTANTS:",
+        "    path = ROOT / TARGET",
+        "",
+    ]), encoding="utf-8")
+
+    rest = _sweep_module()
+    rest.HERE = str(repo / ".mutants")
+    rest.ROOTS = (("backend", str(repo)),)
+    checked, bad, unreachable = rest.sweep()
+
+    assert not bad, (
+        "the sweep resolved a harness's declared TARGET somewhere else and called "
+        "its anchor stale — the 09-18 bug: " + repr(bad)
+    )
+    assert checked >= 1, "the sweep checked nothing, so its clean verdict means nothing"

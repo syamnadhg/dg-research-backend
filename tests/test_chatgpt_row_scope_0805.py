@@ -1024,8 +1024,13 @@ def test_the_consolidated_build_is_downstream_of_the_sweep():
     from conftest import code_only  # type: ignore
     src = code_only(Path(research.__file__).read_text(encoding="utf-8"))
     sweep = src.index("apply_off_topic_sweep(results, _p2_run_dir())")
-    consolidated = src.index('"consolidated.md").write_text(_consolidated_md')
+    # ⭐ Wave 10, 2026-09-18 — the disk write this used to index is retired, so
+    # the anchor moves to the BUILD itself, which is one line EARLIER than the
+    # write was: an off-topic leg must be blanked before its text is merged at
+    # all, not merely before it is persisted. Strictly more than the old claim.
+    consolidated = src.index('consolidated_parts = [f"# Consolidated Research Report')
     assert sweep < consolidated
+    assert src.index('save_document_to_firestore("consolidated"') > consolidated
 
 
 def test_the_skip_branch_runs_the_guard_on_what_it_extracted():

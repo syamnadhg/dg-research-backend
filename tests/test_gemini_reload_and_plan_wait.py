@@ -7,8 +7,19 @@ then didn't push the completed DR panel into the live DOM without a reload.
 The 2026-07 Gemini SPA no longer restores the conversation on reload AT ALL —
 every reload landed on the empty "new chat" home (image-verified live
 2026-07-04) — so #897a DELETED the reload and its sidebar-reopen recovery
-subsystem outright. The inverse is now the invariant this file guards:
-Gemini is NEVER reloaded mid-run, for any reason.
+subsystem outright. The inverse is the invariant this file guards.
+
+⭐ NARROWED 2026-09-18 (wave 10): it used to read "Gemini is NEVER reloaded
+mid-run, for any reason", and that sentence is no longer true. The 2026-07
+finding was about `page.goto` of a conversation URL, which still lands on the
+empty home; the owner verified on 2026-09-16 that a RELOAD of a tab already
+inside `/app/<id>`, after "Start research", comes back into the same
+conversation. So exactly one mid-run reload exists — the bounded stale-research
+cadence, pinned in tests/test_gemini_stale_reload_0918.py, which reloads in
+place, proves IDENTITY before trusting the result, and adopts when it cannot.
+Everything below still holds: the PERIODIC reload and its whole recovery
+subsystem stay deleted, and the re-auth retry still never reloads a mounted
+Gemini conversation.
 
 Completion under the new UI (#897b, user-confirmed live): the collapsed
 composer removed the persistent bottom input box (a launcher button becomes

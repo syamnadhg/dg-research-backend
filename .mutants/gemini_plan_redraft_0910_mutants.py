@@ -45,6 +45,32 @@ right element and clicks the WRAPPER around it, reporting a truthy label for a
 DOM no-op. R2 is the one that produces the wrapper click; R1 only blinds the
 reader's name — the first draft had those two descriptions swapped.
 
+⛔ DELIBERATELY ABSENT — recorded so the next reader does not re-add them:
+  * F7, "the research gate stops requiring an INDEPENDENT reader to have called
+    the screen a failure" (`if not cua_error: return "not_error"` deleted).
+    DELETED 2026-09-18, and NOT re-anchored, because the behaviour it pinned is
+    gone BY DESIGN rather than by drift. The Redo-gate repair made the entry
+    `if not (cua_error or machine_failed)`: the CUA `error` verdict is defined
+    in both prompts as "an error banner or a blocking popup" and a Gemini
+    research failure renders as a chat BUBBLE, so the independent verdict this
+    gate waited for is one the screen cannot produce and the lane sat at ZERO
+    clicks. The hook now enters on this machine's own reader — i.e. it DOES
+    decide for itself, which is the exact harm F7's why-line names. There is no
+    site left at which that mutation can be written.
+    ⛔ AND THE REMAINING ARM IS NOT A SUBSTITUTE. Deleting
+    `if not (cua_error or machine_failed)` would only say "nothing at all called
+    it a failure" — a strictly narrower claim than F7's, wearing F7's id and
+    why-line, and unreachable from BOTH real callers (each passes exactly one of
+    the two True, never neither). A re-pointed pin that asserts less than the one
+    it replaced is a defect of its own, so it was not written. What still covers
+    that arm is direct: test_the_gate_refuses_without_an_independent_error_verdict
+    and test_the_hook_refuses_a_screen_nothing_independent_called_a_failure, both
+    in tests/test_gemini_research_fail_0918.py.
+    ⭐ THE MUTANT WORTH HAVING HERE IS THE OTHER DIRECTION — 'under': the machine
+    entry taken back OUT (`(cua_error or machine_failed)` → `cua_error`), which
+    returns the lane to zero clicks. It is a NEW mutant, not this one, and it is
+    filed rather than invented under a re-anchor.
+
     python .mutants/gemini_plan_redraft_0910_mutants.py
 """
 from __future__ import annotations
@@ -65,6 +91,11 @@ OURS = (RESEARCH,)
 
 MINE_AGENT = "tests/"
 MINE_ROOT = ("tests/test_gemini_redraft_0910.py "
+             # ⛔ WAVE 10, LANE 7. The F-mutants live in the post-Start
+             # research-fail half, and this is the only file that kills them —
+             # left out of the selection they would all survive while measuring
+             # nothing, which is the fault 27 mutants were found with on 09-17.
+             "tests/test_gemini_research_fail_0918.py "
              "tests/test_gemini_plan_gate_0910.py "
              "tests/test_gemini_orphan_gate_0910.py "
              "tests/test_gemini_plan_regen_755.py "
@@ -239,7 +270,19 @@ MUTANTS = [
        '      const hit = r.querySelector(\'button, [role="menuitem"]\') || r;')]),
     ('S1', RESEARCH, 'over',
      '⛔⛔ THE ROWS ARE CONSULTED BEFORE THE TURN\'S OWN TEXT AGAIN. A regenerate overlay left open over a HEALTHY plan then returns `pick_menu`, the caller clicks "Don\'t personalise", a good plan is destroyed and the call reports `redrafted=True` with a success log line. Cross-verify demonstrated it from a literal reading, and the first harness had a mutant ENFORCING this order',
-     [('    if not _gemini_reads_as_failed(r.get("text") or ""):\n        return "settled", "the latest turn no longer reads as failed"\n    rows = r.get("rows") or []\n    if opened_menu and rows:',
+     # ⛔ RE-ANCHORED 2026-09-18 (wave 10, lane 7). The step machine's failure
+     # check now goes through `_gemini_screen_reads_as_failed`, because the
+     # RESEARCH-fail screen needs a differently-scoped reader. Same mutation,
+     # same direction: the rows are consulted before the turn's own text.
+     # ⛔ RE-ANCHORED AGAIN THE SAME DAY, and the second time was the Redo-gate
+     # REPAIR, not the build: the call grew `full_text=(r.get("text") or "")` so
+     # the research reader's completion refusal can see the turn's START. The
+     # anchor had to take that argument on board — an anchor that stops at
+     # `screen=screen)` matches 0x and the mutant scores kills it never earned.
+     # Nothing about the mutation moved: the whole failure check, `settled`
+     # return included, is still what goes, so the rows are still what a healthy
+     # plan is judged by.
+     [('    if not _gemini_screen_reads_as_failed(\n            _gemini_screen_failure_text(r, screen=screen), screen=screen,\n            full_text=(r.get("text") or "")):\n        return "settled", "the latest turn no longer reads as failed"\n    rows = r.get("rows") or []\n    if opened_menu and rows:',
        '    rows = r.get("rows") or []\n    if opened_menu and rows:')]),
     ('S2', RESEARCH, 'over',
      "⛔⛔ ANY OPEN OVERLAY IS TREATED AS OURS. The reader sees every visible overlay in the document — Gemini's own model picker renders `menuitemradio` rows — so an unrelated menu diverts the whole call and the dismiss path presses Escape at a menu the user opened themselves",
@@ -281,10 +324,18 @@ MUTANTS = [
      "the Stop check before the click goes, so a Stop arriving inside this helper's two round trips still results in a click — 'no post-Stop DOM driving' is the standing rule",
      [('        if _controls.is_stop():\n            return False, False, False, "stop requested before the re-draft click"\n',
        '')]),
+    # ⛔⛔ RE-ANCHORED 2026-09-18, AND THE REPLACEMENT HAD TO CHANGE, NOT THE
+    # ANCHOR. This mutant used to restore the delegation to
+    # `_try_inpage_retry_on_research_fail` — the fifteen-month defect in one
+    # line. That helper was RETIRED in wave 10, so the old replacement named a
+    # function that no longer exists: it still parses, so `_apply_sweep` cannot
+    # see it, and it would have gone on scoring a kill for a regression that can
+    # no longer be written. What survives of the same defect is the loop giving
+    # up the structural re-draft and reporting that it had one.
     ('G1', RESEARCH, 'under',
-     "⛔⛔ THE LOOP DELEGATES TO THE TEXT-GATED SHARED HELPER AGAIN, whose word list has never matched Gemini's control. This is the whole fifteen-month defect in one line, and it left every test green",
+     "⛔⛔ THE LOOP STOPS DELEGATING TO THE STRUCTURAL RE-DRAFT and hands the caller a fabricated outcome. This is the shape of the whole fifteen-month defect — a branch that reports a retry it never performed — with the dead helper it used to call taken out of it",
      [('                    (_redrafted, _acted, _in_flight,\n                     _why_rd) = await _gemini_redraft_plan(gemini_page, "2D-plan")',
-       '                    _acted = await _try_inpage_retry_on_research_fail(\n                        gemini_page, "gemini", "2D-plan", max_wait_s=4)\n                    _redrafted, _in_flight, _why_rd = _acted, _acted, "legacy helper"')]),
+       '                    _redrafted, _acted, _in_flight, _why_rd = (\n                        False, False, False, "legacy helper")')]),
     ('G2', RESEARCH, 'over',
      'the running-research probe is hoisted ABOVE the fail-text gate, so every healthy tick of the plan wait pays for a body read it has no use for',
      [('                _already_running = False\n                if _gemini_reads_as_failed(_latest):\n                    try:',
@@ -405,6 +456,94 @@ MUTANTS = [
      "the reset's answer is discarded, so the log below reports 'adoption rejected the sidebar candidate(s)' for a run where adoption never got to execute",
      [('                if not await _gemini_reset_to_home():',
        '                if False:')]),
+
+    # ── WAVE 10, LANE 7 (2026-09-18) — the RESEARCH-fail screen ───────────────
+    # ⛔⛔ THE POST-START WINDOW HAD NO FAILURE READER AT ALL. Everything above
+    # is the PLAN screen, which is gated `not start_clicked` and dead from the
+    # moment Start research is pressed. These mutants are the new half: a
+    # differently-scoped reader for a turn that carries the research card and
+    # report fragments, and a gate written entirely out of refusals because this
+    # page state has NEVER been captured — the owner has both DOMs for the
+    # control, from the plan screen, and says the research failure itself is
+    # platform-side and may not reproduce on demand.
+    ('F1', RESEARCH, 'over',
+     "⛔⛔ THE COMPLETION REFUSAL GOES, and this is the one move on this screen that cannot be undone. A research that FINISHED and closed with a line naming an error — 'I encountered an error fetching two of the sources … I've completed your research' — then reads as dead, gets re-drafted, and the report the whole run exists to collect is thrown away",
+     [('    if _GEMINI_COMPLETION_RE.search(norm):\n        return False\n',
+       '')]),
+    ('F2', RESEARCH, 'over',
+     "the tail window goes and the whole turn is searched again, so a REPORT ABOUT a failure — an outage, a post-mortem, a launch that failed to complete — reads as a failed research. This is D1's over-correction moved to the screen where the text is longest",
+     [('    return _gemini_reads_as_failed(norm[-_GEMINI_RESEARCH_FAIL_TAIL_CHARS:])',
+       '    return bool(_GEMINI_PLAN_FAIL_RE.search(norm))')]),
+    ('F3', RESEARCH, 'under',
+     "the window shrinks below the captured wordings themselves, so a real dying research stops being recognised — the same one-character class of miss as cause 2, in the size dimension",
+     [('_GEMINI_RESEARCH_FAIL_TAIL_CHARS = 400',
+       '_GEMINI_RESEARCH_FAIL_TAIL_CHARS = 20')]),
+    ('F4', RESEARCH, 'under',
+     "⛔⛔ THE RESEARCH SCREEN IS HANDED BACK THE PLAN READER, whose size bound refuses every real dying-research turn. Entry reads as 'settled', nothing is ever clicked, and the lane silently degrades to the fifteen-month defect it exists to close — diagnosed, as before, as 'Gemini has no Redo button'",
+     # ⛔ RE-ANCHORED 2026-09-18 by the Redo-gate repair: the research reader now
+     # takes `full_text=full_text` (the completion refusal has to see the turn's
+     # START, where "I've completed your research" sits). The branch it selects
+     # is the same one, so the mutation is unchanged — the research screen is
+     # handed the plan reader and the size bound refuses every real dying turn.
+     [('    if screen == "research":\n        return _gemini_research_reads_as_failed(latest_text, full_text=full_text)\n    return _gemini_reads_as_failed(latest_text)',
+       '    return _gemini_reads_as_failed(latest_text)')]),
+    ('F5', RESEARCH, 'over',
+     "⛔⛔ THE DEFAULT SCREEN FLIPS, so every caller that never asked for it — the send path and the [2D] loop — buys the wider reader. A long research PLAN whose closing section is about why something failed then reads as a failed draft and is re-drafted up to the cap, which is exactly the healthy work D1 exists to protect",
+     [('async def _gemini_redraft_plan(page, label, *, settle_s: float = 8.0,\n                               screen: str = "plan"):',
+       'async def _gemini_redraft_plan(page, label, *, settle_s: float = 8.0,\n                               screen: str = "research"):')]),
+    ('F6', RESEARCH, 'over',
+     "⛔⛔ THE OUTCOME IS JUDGED WITH THE PLAN READER WHILE THE ENTRY USED THIS SCREEN'S. On a long turn the plan reader answers 'not failed' for a page that never moved, so the call reports a re-draft it did not achieve — the retired helper's fabricated success, rebuilt inside the machinery that replaced it",
+     # ⛔ RE-ANCHORED 2026-09-18 by the Redo-gate repair, which added
+     # `full_text=(after.get("text") or "")` to the post-click re-read as well.
+     # The replacement is untouched and still the PLAN reader on the turn's
+     # first 4000 characters, so the mutant still says exactly what it said:
+     # the outcome is judged with a reader the entry did not use.
+     [('    if _gemini_screen_reads_as_failed(\n            _gemini_screen_failure_text(after, screen=screen), screen=screen,\n            full_text=(after.get("text") or "")):',
+       '    if _gemini_reads_as_failed(after.get("text") or ""):')]),
+    ('F15', RESEARCH, 'under',
+     "⛔⛔ THE RESEARCH SCREEN IS GIVEN THE TURN'S FIRST 4000 CHARACTERS INSTEAD OF ITS LAST. On any real report the error sentence sits far past 4000 and is sliced off the end, so the hook refuses every research there has ever been while looking, in the log, exactly like a Gemini build with no Redo button — the fifteen-month defect rebuilt inside the machinery that replaced it",
+     [('    if screen == "research":\n        return r.get("tail") or r.get("text") or ""\n    return r.get("text") or ""',
+       '    return r.get("text") or ""')]),
+    ('F16', RESEARCH, 'over',
+     "the turn's ending is read off `document.body` instead of the turn, so the rail's chat titles, the pasted brief and every earlier turn are what the failure check judges — the page-wide read this whole wave exists to have removed",
+     [("    tail: (turn.innerText || '').slice(-4000),",
+       "    tail: (document.body.innerText || '').slice(-4000),")]),
+    ('F17', RESEARCH, 'under',
+     "the tail is sliced from the FRONT like `text` is, so it carries the same first 4000 characters and the ending it exists to preserve is gone — a field that looks like a fix and is a copy",
+     [("    tail: (turn.innerText || '').slice(-4000),",
+       "    tail: (turn.innerText || '').slice(0, 4000),")]),
+    # ⛔ F7 WAS DELETED 2026-09-18 — its behaviour no longer exists to mutate.
+    # See "DELIBERATELY ABSENT" in this file's header for the whole reason and
+    # for the 'under' mutant that should be written instead. The id is retired,
+    # not reused: renumbering an identity rewrites history.
+    ('F8', RESEARCH, 'over',
+     "the once-per-phase bound goes from the gate, so a research that keeps erroring is re-drafted every time the error branch is reached",
+     [('    if already_tried:\n        return "already_tried"\n',
+       '')]),
+    ('F9', RESEARCH, 'over',
+     "the conversation check goes, so a tab that has landed on the bare /app home (#897a) is treated as a conversation with a turn to re-draft",
+     [('    if not in_conversation:\n        return "not_in_conversation"\n',
+       '')]),
+    ('F10', RESEARCH, 'over',
+     "⛔ THE GATE BECOMES DECORATIVE: the verdict is computed and then ignored, so every refusal it names still ends in a click",
+     [('    if verdict != "redraft":\n        return False, False, f"not re-drafting the research: {verdict}"\n',
+       '')]),
+    ('F11', RESEARCH, 'under',
+     "⛔⛔ THE CLICK IS RETURNED AS THE OUTCOME — the retired helper's contract, in the one place it is most tempting. One click on Redo opens an overlay and re-drafts nothing, so the caller keeps a dead agent in rotation on the strength of having touched the page",
+     [('    return bool(redrafted), bool(acted), why',
+       '    return bool(acted), bool(acted), why')]),
+    ('F12', RESEARCH, 'over',
+     "the Stop check goes from the outermost thing on this path, so a Stop arriving while the error branch runs still results in a read and a click — 'no post-Stop DOM driving' is the standing rule",
+     [('    if _controls.is_stop():\n        return False, False, "stop requested before the research re-draft"\n',
+       '')]),
+    ('F13', RESEARCH, 'over',
+     "⛔⛔ THE ONCE-PER-PHASE LATCH IS TAKEN AFTER THE ATTEMPT INSTEAD OF BEFORE IT, so an attempt that raises never marks itself and the error branch can re-enter it — the bounded rescue turning into a click loop against a page that is already unwell",
+     [('                    p["_gemini_research_redraft_used"] = True\n                    _rr_ok, _rr_acted, _rr_why = await _gemini_redraft_failed_research(\n                        p["page"], name, cua_error=True, already_tried=False)',
+       '                    _rr_ok, _rr_acted, _rr_why = await _gemini_redraft_failed_research(\n                        p["page"], name, cua_error=True, already_tried=False)\n                    p["_gemini_research_redraft_used"] = True')]),
+    ('F14', RESEARCH, 'over',
+     "⛔ `acted` KEEPS THE AGENT IN ROTATION. A click that opened a menu and re-drafted nothing then skips the [Retry][Skip] card the branch would have raised with no hook at all — the hook becoming worse than the branch it sits in",
+     [('                    if _rr_ok:',
+       '                    if _rr_ok or _rr_acted:')]),
 ]
 
 def sh(args, **kw):

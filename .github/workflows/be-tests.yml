@@ -78,6 +78,28 @@ jobs:
       - name: Install ffmpeg (the audio sniffer probes with it)
         run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
 
+      # ⛔⛔ EXACTLY THE FFMPEG STORY ABOVE, ONE ORDER OF MAGNITUDE LARGER, and it
+      # had no step at all until 2026-09-17. `tests/_domshim.py` executes the
+      # pipeline's page JS under node — the only way selector-semantics defects can
+      # be caught, since source-text assertions cannot see them. Sixteen test files
+      # gate themselves on node with `skipif`, and measured with node hidden from
+      # PATH the result is `392 passed, 402 skipped`: 402 test functions vanish and
+      # the suite still reports green.
+      #
+      # The ubuntu-latest image happens to ship node today, so this step changes
+      # nothing about the current run. That is the point: without it the truth of
+      # the suite's node assertion belongs to a runner image nobody here reviews,
+      # and the day the image drops node a guard becomes an outage on a commit that
+      # changed nothing.
+      #
+      # SHA-pinned rather than tagged, and `node-version` pinned to the same major
+      # both front-end workflows use, so the page JS runs here under the engine the
+      # web half is built with. tests/test_node_is_required_not_skipped_0917.py
+      # asserts this step exists, is unconditional, and comes BEFORE the suite.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+
       - name: Install dependencies
         run: pip install -r requirements.txt
 

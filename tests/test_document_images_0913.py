@@ -1142,9 +1142,22 @@ def _pipeline():
 def test_every_brief_save_is_built_from_rehosted_text():
     """SOURCE PIN — `run_pipeline` cannot be executed here. For each brief build,
     the LAST assignment to `brief_text` before it is the rehost, and its save
-    follows the build."""
+    follows the build.
+
+    ⛔⛔ Wave 10 REPAIR, 2026-09-18 — RE-POINTED BACK. The wave first numbered the
+    brief on its way to disk, so this pattern read
+    `_document_with_sources(f"# Research Brief…")`. `brief.md` is the file
+    ChatGPT and Claude RECEIVE, so numbering it handed them the numbering pass's
+    own idempotency sentinel and one echoed marker cost a whole agent report its
+    numbers and its bibliography, silently
+    (`tests/test_numbered_sources_placement_0918.py`). The brief is written
+    unnumbered again; the rehost-ordering claim below is untouched throughout,
+    and the funnel count that used to include these three sites now pins them
+    OUT."""
     src = _pipeline()
-    builds = list(re.finditer(r'(_brief_md\w*) = f"# Research Brief\\n\\n\{brief_text\}"', src))
+    builds = list(re.finditer(
+        r'(_brief_md\w*) = f"# Research Brief\\n\\n\{brief_text\}"',
+        src))
     assert len(builds) == 3
     for b in builds:
         last = list(re.finditer(r"\bbrief_text = ", src[:b.start()]))[-1]
@@ -1173,7 +1186,13 @@ def test_the_consolidated_build_reads_the_rehosted_results():
     funnel = src.rindex("await _rehost_result_texts(results)", 0, build)
     between = src[funnel:build]
     assert "results = " not in between and "results[" not in between
-    assert src.index('"consolidated.md").write_text(_consolidated_md') > build
+    # ⭐ Wave 10, 2026-09-18 — this used to point at the disk write, which is
+    # retired (`tests/test_stacked_document_retired_0918.py`). The ordering claim
+    # is unchanged and now rides the write that survived, the Firestore mirror;
+    # the disk write is additionally pinned ABSENT, so re-pointing asserts more
+    # than it did rather than less.
+    assert '"consolidated.md").write_text' not in src
+    assert src.index('save_document_to_firestore("consolidated", _consolidated_md') > build
 
 
 def test_the_pipeline_has_exactly_the_measured_document_saves():

@@ -109,8 +109,26 @@ def sweep():
             bad.append((name, "-", "no MUTANTS table — cannot sweep"))
             continue
 
-        default_files = list(getattr(mod, "MUTATED_FILES", None)
-                             or [getattr(mod, "SRC", "research.py")])
+        # ⛔⛔ RESOLVE THE TARGET THE WAY THE HARNESSES ACTUALLY DECLARE IT.
+        # This read used to be MUTATED_FILES or SRC, falling back to
+        # "research.py" — and it was RIGHT BY ACCIDENT for 55 harnesses,
+        # because every one of them targets research.py anyway. The first
+        # harness in the fleet to target anything else (wave10_domshim_style,
+        # target tests/_domshim.py) had all eight of its anchors reported STALE:
+        # they were being counted in research.py, where of course they do not
+        # appear. A default that is usually correct is worse than one that is
+        # never correct, because nothing reveals it until the day it matters.
+        # ⭐ _apply_sweep.py already reads this chain; the two tools disagreeing
+        # is what hid the bug, so they now agree by construction.
+        default_files = list(getattr(mod, "MUTATED_FILES", None) or [])
+        if not default_files:
+            for _attr in ("SRC", "TARGET", "RESEARCH", "FILE"):
+                _v = getattr(mod, _attr, None)
+                if isinstance(_v, str) and _v:
+                    default_files = [_v]
+                    break
+        if not default_files:
+            default_files = ["research.py"]
 
         for entry in mutants:
             mid = entry[0] if entry else "?"
