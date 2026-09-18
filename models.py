@@ -63,24 +63,42 @@ TITLE_HAIKU = os.environ.get("TITLE_MODEL", "claude-haiku-4-5")
 # General-purpose text — research summary, URL extraction from Gemini
 # Deep Research page, narrator fallback when Haiku is unavailable.
 # `gemini-2.5-flash` hard-deprecates 2026-06-17 on the generativelanguage
-# API path (Vertex extended to 2026-10-16). `gemini-3.6-flash` is the
-# current GA Flash (verified against the live model list 2026-07-26 —
-# 3.6 ships without a `-preview` suffix, unlike 3-flash / 3.1-flash-live)
-# and a drop-in successor to 3.5 — same speed class, same multimodal
-# support. Bumped 2026-07-26 (3.5 → 3.6).
-GEMINI_TEXT = os.environ.get("GEMINI_TEXT_MODEL", "gemini-3.6-flash")
+# API path (Vertex extended to 2026-10-16). Bumped 2026-07-26 (3.5 → 3.6).
+# BUMPED AGAIN 2026-09-17 (3.6 → 3.8), verified against the live model
+# list on the day: 3.7 and 3.8 are both GA and 3.8 is the newest numbered
+# Flash with no `-preview`/`-exp` suffix. 65536 output / 1048576 input,
+# same speed class and multimodal support as 3.6.
+# ⛔ NUMBERED ON PURPOSE, unlike the Pro below. A `gemini-flash-latest`
+# alias exists and is GA, but the Flash line HAS a current numbered
+# release, so pinning keeps a research run reproducible; the Pro line has
+# no such option and had to take the alias. Re-check with
+# dg-research/scripts/verify-gemini-models.mjs, which fails by CONSTANT NAME.
+GEMINI_TEXT = os.environ.get("GEMINI_TEXT_MODEL", "gemini-3.8-flash")
 
 # Vision narrator (narrate.py) — agent-side screenshot panel reader.
 # Multimodal Gemini call (image + structured-output schema). Same model
 # family as GEMINI_TEXT but kept as its own env var so the narrator can
 # be tuned independently from text-only summary/extractor sites.
-GEMINI_NARRATE = os.environ.get("GEMINI_NARRATE_MODEL", "gemini-3.6-flash")
+# ⛔ MOVES WITH GEMINI_TEXT, ALWAYS. tests/test_gemini_thinking_config_rejected.py
+# rests on a 200-vs-400 differential between the two; bumping one alone reds
+# the backend suite.
+GEMINI_NARRATE = os.environ.get("GEMINI_NARRATE_MODEL", "gemini-3.8-flash")
 
 # Vision narrator fallback — Gemini Pro hedge against a Flash-specific
-# outage. Kept on 2.5-pro pending 3.x-pro reaching GA (3.1-pro is still
-# preview as of 2026-05-28); 2.5-pro deprecation is 2026-10-16, giving
-# ample runway to migrate when the next Pro lands.
-GEMINI_NARRATE_FALLBACK = os.environ.get("GEMINI_NARRATE_FALLBACK_MODEL", "gemini-2.5-pro")
+# outage.
+# ⛔⛔ 2026-09-17: THE NEXT PRO NEVER LANDED, AND THE RUNWAY IS 29 DAYS.
+# Measured against the live GA list on the day: the ONLY Pro-class
+# `generateContent` models are `gemini-2.5-pro` (deprecates 2026-10-16) and
+# the `gemini-pro-latest` ALIAS. There is no numbered 3.x Pro — not 3.1,
+# not 3.5, not 3.8 — so "migrate when the next Pro lands" has no target to
+# migrate to, and the old note's "ample runway" expired without anyone
+# noticing because nothing re-asked the API between 2026-06-23 and today.
+# ⭐ So the alias is not a preference here, it is the only forward path that
+# stays Pro-class. It costs reproducibility: Google can move it under us
+# without warning, which a numbered pin would prevent. Accepted, because the
+# alternative is a model that stops answering in October.
+# ⛔ If a numbered GA Pro appears, pin it and delete this note.
+GEMINI_NARRATE_FALLBACK = os.environ.get("GEMINI_NARRATE_FALLBACK_MODEL", "gemini-pro-latest")
 
 
 # ── Phoenix (model_refresh) — P2 deep-research model POLICY ──────────────
