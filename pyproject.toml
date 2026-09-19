@@ -70,6 +70,14 @@ dependencies = [
     # transitive pin nobody here controls — and a floor is what the subclassing
     # actually needs, since those attributes are 2.x shapes. Declared 2026-09-18.
     "urllib3>=2.0",
+    # ⛔ NAMED IN THE STARTUP PREFLIGHT, so it is ours to declare. research.py
+    # lists `typing_extensions` in the `_critical` import probe and HARD-ABORTS
+    # when it cannot be imported — a hard dependency by any reading. It was
+    # reaching us only because pydantic, fastapi and anthropic all happen to
+    # require it, so the day one of them drops it the backend refuses to start
+    # and neither manifest says why. Declared 2026-09-19, same reasoning as
+    # urllib3 above.
+    "typing_extensions>=4.0",
     "pypdf>=4.0",
     "python-docx>=1.2",
     "Pillow>=11.0",

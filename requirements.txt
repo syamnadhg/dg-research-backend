@@ -40,6 +40,10 @@ requests>=2.32
 # fetch and upload. It arrived transitively via requests until 2026-09-18; the
 # floor is 2.x because that is the shape the subclassing assumes.
 urllib3>=2.0
+# ⛔ Named in research.py's `_critical` startup probe, which HARD-ABORTS without
+# it — so it is a direct requirement, not an incidental one. It arrived only via
+# pydantic / fastapi / anthropic until 2026-09-19.
+typing_extensions>=4.0
 # Phase-2 source-doc inlining for Gemini (paste path): when P1 is skipped
 # and the user attaches .pdf/.docx sources, Gemini gets their text pasted
 # (it silently drops file uploads). md/txt need no lib; these cover the
