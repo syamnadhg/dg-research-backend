@@ -46,8 +46,8 @@ def _code_only(text: str) -> str:
                 range(first.lineno, (first.end_lineno or first.lineno) + 1)
             )
     return "\n".join(
-        l for i, l in enumerate(text.splitlines(), 1)
-        if i not in doc_lines and not l.strip().startswith("#")
+        ln for i, ln in enumerate(text.splitlines(), 1)
+        if i not in doc_lines and not ln.strip().startswith("#")
     )
 
 

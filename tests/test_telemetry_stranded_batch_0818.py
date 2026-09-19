@@ -117,8 +117,8 @@ def test_events_that_arrived_during_the_attempt_are_kept_behind_the_owed_ones(sp
 
     telemetry.flush(post=lambda _b: False, deadline_sec=1.0)
 
-    seqs = [json.loads(l)["seq"]
-            for l in live.read_text(encoding="utf-8").splitlines() if l.strip()]
+    seqs = [json.loads(ln)["seq"]
+            for ln in live.read_text(encoding="utf-8").splitlines() if ln.strip()]
     assert seqs == [0, 99], seqs
 
 

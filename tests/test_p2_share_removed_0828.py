@@ -318,7 +318,6 @@ def test_the_agents_phase2_proof_is_the_phase_not_a_deleted_link():
     phase 2 and a chat user running `/sr status` mid-run would see "Deep
     Research" complete with ZERO links — where before they got three permanent
     /shared/doc pages."""
-    import ast as _ast, inspect as _inspect, importlib.util, sys
     from pathlib import Path
     bridge_path = Path(__file__).resolve().parents[1] / "agent" / "facade" / "bridge.py"
     src = bridge_path.read_text(encoding="utf-8")

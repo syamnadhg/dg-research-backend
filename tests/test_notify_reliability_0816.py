@@ -12,7 +12,6 @@ was closed. The backend's part of that is the ask it makes on the owner's behalf
 could be lost to a single network blip, and ran inside a process that would
 `os._exit` itself out from under the run.
 """
-import ast
 import inspect
 
 import pytest

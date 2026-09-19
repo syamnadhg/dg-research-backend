@@ -67,7 +67,7 @@ def _code_only(src: str) -> str:
     string a guard searches for satisfies the guard. Two of the nine refusals it
     "derived" were comments in this very file quoting the real ones.
     """
-    return "\n".join(l for l in src.splitlines() if not l.lstrip().startswith("#"))
+    return "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
 
 
 # ⛔ DERIVED FROM THE CODE, NOT TYPED OUT AND NOT READ OUT OF PROSE. The refusal
@@ -154,8 +154,8 @@ _NAME_RIGHT = ("Roll", "Pepper", "Decker", "Bolts", "Dagger", "Cry", "Mouse",
                "Breakfast", "Seek", "Go")
 _NAME_HEAD = ("PC", "Mac", "Laptop", "Desktop", "Node")
 _NAMES_WITH_A_CONJUNCTION = [
-    f"{l} {c} {r} {h}"
-    for (l, r), h, c in itertools.product(zip(_NAME_LEFT, _NAME_RIGHT),
+    f"{ln} {c} {r} {h}"
+    for (ln, r), h, c in itertools.product(zip(_NAME_LEFT, _NAME_RIGHT),
                                           _NAME_HEAD, ("and", "or"))
 ]
 

@@ -28,7 +28,6 @@ window a new owner is in when they need it.
 seventh module added later, logging into the same void, fails that test.
 """
 import inspect
-import io
 import logging
 import re
 from pathlib import Path
@@ -286,12 +285,12 @@ def test_a_traceback_becomes_lines_that_are_each_timestamped(capsys):
         raise ValueError("inner cause")
     except ValueError:
         logging.getLogger("selfheal").error("outer message", exc_info=True)
-    lines = [l for l in capsys.readouterr().out.splitlines() if l.strip()]
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
     assert len(lines) >= 3
-    assert all(re.match(r"^\[\d\d:\d\d:\d\d\] \[ERROR\] ", l) for l in lines), lines
-    assert any("outer message" in l for l in lines)
-    assert any("ValueError: inner cause" in l for l in lines)
-    assert any("Traceback (most recent call last)" in l for l in lines)
+    assert all(re.match(r"^\[\d\d:\d\d:\d\d\] \[ERROR\] ", ln) for ln in lines), lines
+    assert any("outer message" in ln for ln in lines)
+    assert any("ValueError: inner cause" in ln for ln in lines)
+    assert any("Traceback (most recent call last)" in ln for ln in lines)
 
 
 def test_a_broken_format_string_does_not_take_the_process_down(capsys):

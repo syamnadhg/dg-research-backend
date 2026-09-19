@@ -52,8 +52,8 @@ def _code_only(text: str) -> str:
                 range(first.lineno, (first.end_lineno or first.lineno) + 1)
             )
     return "\n".join(
-        l for i, l in enumerate(text.splitlines(), 1)
-        if i not in doc_lines and not l.strip().startswith("#")
+        ln for i, ln in enumerate(text.splitlines(), 1)
+        if i not in doc_lines and not ln.strip().startswith("#")
     )
 
 
@@ -137,10 +137,10 @@ def test_the_restart_cannot_loop():
     assert "RELINK_REEXEC_ENV" in SRC
     assert research.RELINK_REEXEC_ENV.startswith("SR_")
     src_lines = SRC.splitlines()
-    guard = [l for l in src_lines if "RELINK_REEXEC_ENV" in l and "environ.get" in l]
+    guard = [ln for ln in src_lines if "RELINK_REEXEC_ENV" in ln and "environ.get" in ln]
     assert guard, "the re-exec must be guarded by a read of the marker"
-    setter = [l for l in SEAM.splitlines()
-              if "RELINK_REEXEC_ENV" in l and "environ[" in l]
+    setter = [ln for ln in SEAM.splitlines()
+              if "RELINK_REEXEC_ENV" in ln and "environ[" in ln]
     assert setter, "the marker must be written, and the seam is where it lives"
 
 

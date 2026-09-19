@@ -11,7 +11,6 @@ the first time somebody adds a line, which somebody always does.
 have passed; the feature would have silently never worked. So a REAL id being
 ACCEPTED is asserted first, before any of the refusals.
 """
-import importlib
 import inspect
 import json
 import os
@@ -47,7 +46,7 @@ def _spooled():
     path = tm.spool_path()
     if not path.exists():
         return []
-    return [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    return [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
 
 
 # ══ 1. accept polarity FIRST ═══════════════════════════════════════════

@@ -6,7 +6,6 @@ thirteen; this one found fifteen across both repos. The pattern that keeps
 recurring is not a wrong algorithm — it is a confident comment above code that
 does something slightly different, and a test written from the comment.
 """
-import re
 
 import research
 
@@ -131,7 +130,8 @@ class TestTheDoctorHandsOverOnEveryPath:
         # written about: measured against the live file it counted zero, so
         # `<= 1` passed vacuously and a second early return would have too.
         # Parsed rather than pattern-matched now, so indentation cannot hide one.
-        import ast, textwrap
+        import ast
+        import textwrap
         tree = ast.parse(textwrap.dedent(_source_of(research.run_doctor)))
         fn = tree.body[0]
         returns = [n for n in ast.walk(fn) if isinstance(n, ast.Return)]

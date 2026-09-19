@@ -17,7 +17,6 @@ import sys
 from pathlib import Path
 import json
 
-import pytest
 
 import research
 from conftest import code_only, serving_version

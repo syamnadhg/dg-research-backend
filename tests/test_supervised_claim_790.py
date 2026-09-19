@@ -41,8 +41,8 @@ def _code_only(text: str) -> str:
                 range(first.lineno, (first.end_lineno or first.lineno) + 1)
             )
     return "\n".join(
-        l for i, l in enumerate(text.splitlines(), 1)
-        if i not in doc_lines and not l.strip().startswith("#")
+        ln for i, ln in enumerate(text.splitlines(), 1)
+        if i not in doc_lines and not ln.strip().startswith("#")
     )
 
 
@@ -143,7 +143,7 @@ def test_the_misleading_dead_generator_is_gone():
     # broken a guard, so the scope is stated rather than rediscovered.
     raw = Path(research.__file__).read_text(encoding="utf-8")
     no_comments = "\n".join(
-        l for l in raw.splitlines() if not l.strip().startswith("#")
+        ln for ln in raw.splitlines() if not ln.strip().startswith("#")
     )
     assert "reuse the persisted id" not in no_comments
     assert "reuses the persisted id" not in no_comments

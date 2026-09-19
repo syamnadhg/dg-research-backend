@@ -25,7 +25,6 @@ printed at the exact moment the product stops working.
 import inspect
 import re
 
-import pytest
 
 import research
 
@@ -101,7 +100,7 @@ def test_the_supervisor_abort_says_what_it_means_for_the_machine():
 def _code_only(text: str) -> str:
     """Drop comment lines. Every assertion below is about what the CLI PRINTS,
     and a comment explaining the old wording is not the old wording."""
-    return "\n".join(l for l in text.splitlines() if not l.strip().startswith("#"))
+    return "\n".join(ln for ln in text.splitlines() if not ln.strip().startswith("#"))
 
 
 # The three branches, sliced on INDENTATION rather than on the first `else:`.

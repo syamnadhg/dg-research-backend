@@ -37,7 +37,6 @@ succeeds, and — the one that nearly shipped broken — it does NOT return earl
 the transcode, the cleanup and the share-link extract.
 """
 import re
-import textwrap
 from pathlib import Path
 
 import pytest
@@ -168,7 +167,7 @@ def test_the_rung_does_not_return_early_past_the_rest_of_phase_3():
     # return early — and therefore contains the word — so a raw search matched the
     # explanation and failed against correct code. This project has hit that exact
     # shape before: a comment quoting the asserted text defeats a search for it.
-    rung = "\n".join(l for l in rung.splitlines() if not l.lstrip().startswith("#"))
+    rung = "\n".join(ln for ln in rung.splitlines() if not ln.lstrip().startswith("#"))
     assert "return " not in rung, (
         "the DOM rung must not return out of phase 3 — the transcode, the cleanup and "
         "the share-link extract still have to run:\n" + rung
@@ -216,13 +215,13 @@ def test_a_dom_exception_cannot_take_phase_3_down():
     # mid-block string and dedenting it — a slice that starts inside a function body
     # has mixed indentation and does not parse on its own.
     lines = SRC.splitlines()
-    first = next(i for i, l in enumerate(lines, 1) if "_dl_via_dom = False" in l)
+    first = next(i for i, ln in enumerate(lines, 1) if "_dl_via_dom = False" in ln)
     # Ends at the 8s-wait block, NOT at the narration ticker. The wider range swept
     # in that block's own `except Exception: pass`, which satisfied the assertion
     # while the DOM rung's handler had been narrowed to ZeroDivisionError — the
     # mutant survived because the test was reading a different try/except entirely.
-    last = next(i for i, l in enumerate(lines, 1)
-                if i > first and "_dl_seen = False" in l)
+    last = next(i for i, ln in enumerate(lines, 1)
+                if i > first and "_dl_seen = False" in ln)
 
     tree = ast.parse(SRC)
     handlers = [
@@ -259,7 +258,7 @@ def test_blocked_does_not_gate_the_click():
     """
     block = _download_block()
     rung = block[block.index("_dl_via_dom = False"):block.index("_stop_d, _task_d = start_narration_ticker")]
-    code = "\n".join(l for l in rung.splitlines() if not l.lstrip().startswith("#"))
+    code = "\n".join(ln for ln in rung.splitlines() if not ln.lstrip().startswith("#"))
 
     # The blocked branch must not be on the same if/elif chain as the click.
     assert "elif _dl_pick.get(\"clicked\")" not in code, (

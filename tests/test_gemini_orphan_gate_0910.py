@@ -410,7 +410,7 @@ def test_gemini_can_never_reach_the_landing_check_without_a_pasted_brief():
     exclusion is ever lifted, every Gemini run would raise UnboundLocalError in
     the landing check. This test is the tripwire."""
     src = _setup_src()
-    decl = [l for l in src.splitlines() if l.strip().startswith("use_file_attach = ")]
+    decl = [ln for ln in src.splitlines() if ln.strip().startswith("use_file_attach = ")]
     assert len(decl) == 1, decl
     assert "not is_gemini" in decl[0], (
         "Gemini can now take the file-attach arm, which does not bind "

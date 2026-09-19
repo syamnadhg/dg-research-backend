@@ -39,7 +39,6 @@ bug, and the whole fix is that condition.
 """
 import re
 
-import research
 
 
 def _src():

@@ -45,13 +45,11 @@ WHAT THESE TESTS PIN
      leave every already-collected line misreported.
   6. The two dialog-scoped observations happen while the dialog is still open.
 """
-import ast
 import inspect
 import json
 import sys
 from pathlib import Path
 
-import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent))

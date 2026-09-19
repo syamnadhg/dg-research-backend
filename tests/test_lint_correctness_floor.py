@@ -93,7 +93,7 @@ def test_the_workflow_still_has_a_correctness_floor():
     # ⛔⛔ THE FLAG IS READ OFF THE STEP LINE, NOT SEARCHED FOR IN THE FILE. The
     # first version did `"--ignore-noqa" in wf`, which the YAML COMMENT three
     # lines above the step satisfies — measured: deleting the flag from the live
-    # `run:` left this whole file green, so a `# noqa` silencing a real F821 in
+    # `run:` left this whole file green, so a noqa comment silencing a real F821 in
     # CI would have slipped past the assertion whose own message calls the flag
     # load-bearing. It is the comment-satisfies-the-search trap, in the guard
     # written to stop an unread gate.

@@ -16,7 +16,6 @@ excluded from the row altogether by the same gate.
 from __future__ import annotations
 
 import importlib
-import inspect
 
 import pytest
 

@@ -11,8 +11,6 @@ touches the network, because it is the one rung that cannot fail. A diagnostic
 that only works over the channel whose failure it diagnoses is not a diagnostic.
 """
 import inspect
-import io
-import json
 import re
 import sys
 
@@ -126,7 +124,7 @@ def test_the_retention_line_names_the_arrival_and_not_the_request():
     moves, and is never refreshed. A sentence that said "30 days from when you
     asked" would be describing the row's clock while the deletion runs on the
     object's."""
-    line = [l for l in research._send_logs_consent_lines() if "deleted" in l]
+    line = [ln for ln in research._send_logs_consent_lines() if "deleted" in ln]
     assert len(line) == 1
     assert "after it arrives" in line[0]
 
@@ -148,8 +146,8 @@ def test_the_run_bounds_and_the_raw_logs_are_named_separately():
     capture has its whole history only there. Folding them into the 30-day
     sentence would make that half a claim about bytes it does not cover."""
     lines = research._send_logs_consent_lines()
-    runs_line = [l for l in lines if "30 runs" in l]
-    raw_line = [l for l in lines if "log files" in l]
+    runs_line = [ln for ln in lines if "30 runs" in ln]
+    raw_line = [ln for ln in lines if "log files" in ln]
     assert len(runs_line) == 1 and len(raw_line) == 1
     assert runs_line != raw_line
     assert "whatever their age" in raw_line[0]

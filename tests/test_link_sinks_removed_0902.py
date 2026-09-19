@@ -29,7 +29,6 @@ asserted here and in the safety net, from both ends.
 
 Run:  pytest tests/test_link_sinks_removed_0902.py -v
 """
-import asyncio
 import inspect
 import json
 import os

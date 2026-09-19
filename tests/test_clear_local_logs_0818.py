@@ -31,11 +31,9 @@ publishes. The app deletes the cloud rows itself, so a drain landing after that
 sweep resurrects a bundle the person just cleared. Emptying that file before the
 slow rmtree is what shrinks the window to nothing this process controls.
 """
-import io
 import os
 import zipfile
 
-import pytest
 
 import research
 

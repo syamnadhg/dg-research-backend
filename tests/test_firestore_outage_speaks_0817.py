@@ -167,7 +167,7 @@ def test_the_alarm_threshold_clears_the_whole_backoff_ladder():
 # ── what it actually says ────────────────────────────────────────────────────
 
 def test_it_names_the_host():
-    assert all("firestore.googleapis.com" in l for l in _notice()[:1])
+    assert all("firestore.googleapis.com" in ln for ln in _notice()[:1])
     assert "firestore.googleapis.com" in " ".join(_notice())
 
 
@@ -211,11 +211,11 @@ def test_it_returns_separate_lines_not_one_paragraph():
     every line after the first with no timestamp and no level."""
     lines = _notice()
     assert len(lines) >= 3
-    assert not any("\n" in l for l in lines)
+    assert not any("\n" in ln for ln in lines)
 
 
 def test_every_line_is_greppable_as_one_topic():
-    assert all(l.startswith("[firestore] ") for l in _notice())
+    assert all(ln.startswith("[firestore] ") for ln in _notice())
 
 
 # ── the aegis pulse stops lying ──────────────────────────────────────────────

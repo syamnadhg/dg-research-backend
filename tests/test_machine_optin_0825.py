@@ -20,7 +20,6 @@ material by default — the person running it is physically at the machine, and 
 founding incident was a pairing failure that produced no run at all, so that
 material is the whole evidence there.
 """
-import json
 
 import pytest
 

@@ -166,7 +166,7 @@ def test_the_in_serve_variant_still_refuses_to_recommend_pairing():
     for state in PAIRED_STATES:
         lines = research.credential_remedy(state, in_serve=True)
         advice = " ".join(
-            l for l in lines if not l.lstrip().startswith("⛔")
+            ln for ln in lines if not ln.lstrip().startswith("⛔")
         )
         assert "--pair" not in advice
 
@@ -234,8 +234,8 @@ def _code_only(text: str) -> str:
                     range(first.lineno, (first.end_lineno or first.lineno) + 1)
                 )
     return "\n".join(
-        l for i, l in enumerate(text.splitlines(), 1)
-        if i not in doc_lines and not l.strip().startswith("#")
+        ln for i, ln in enumerate(text.splitlines(), 1)
+        if i not in doc_lines and not ln.strip().startswith("#")
     )
 
 

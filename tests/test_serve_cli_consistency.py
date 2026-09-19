@@ -23,7 +23,6 @@ the change, so the two ordering claims inside it are pinned by SOURCE ORDER via
 line numbers — stated here rather than implied.
 """
 import inspect
-import json
 import logging
 import os
 import subprocess

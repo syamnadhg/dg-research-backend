@@ -46,7 +46,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import research  # noqa: E402
-from _domshim import el, evaluate_js, run_js, spec_from_html, stamp_panel_geometry  # noqa: E402
+from _domshim import el, run_js, spec_from_html, stamp_panel_geometry  # noqa: E402
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "panels"
 PROBE = research._CHATGPT_DONE_PROBE_JS

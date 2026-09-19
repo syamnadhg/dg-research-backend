@@ -268,7 +268,7 @@ def test_only_the_heartbeat_writes_workercount_to_the_device_doc():
     """If a second publisher appears, this fix is half-applied and the two
     writers will fight over the field."""
     src = module_src()
-    writes = [l for l in src.splitlines() if '"workerCount":' in l]
+    writes = [ln for ln in src.splitlines() if '"workerCount":' in ln]
     assert len(writes) == 1, f"expected one publisher, found {len(writes)}: {writes}"
 
 

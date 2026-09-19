@@ -14,7 +14,6 @@ machine with nothing else to send.
 """
 import json
 import os
-import re
 import time
 import zipfile
 

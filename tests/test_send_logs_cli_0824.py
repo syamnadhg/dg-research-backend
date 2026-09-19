@@ -15,7 +15,6 @@ where everybody sees only the runs they fired.
 ⛔ AND THE PROMPT REFUSES RATHER THAN GUESSING, on this file's standing rule: a
 malformed request must never resolve toward MORE collection than was agreed to.
 """
-import re
 
 import pytest
 
@@ -209,7 +208,7 @@ def test_the_honesty_line_survives_a_selection_and_names_it_correctly():
     tails have no bound at all, and those tails carry the same topics, links and
     account email for the machine's whole history."""
     lines = research._send_logs_consent_lines(2, chosen_exactly=True)
-    warn = [l for l in lines if l.startswith("⚠")]
+    warn = [ln for ln in lines if ln.startswith("⚠")]
     assert len(warn) == 1
     assert "only the first line above" in warn[0]
     assert "whichever runs you pick" in warn[0]

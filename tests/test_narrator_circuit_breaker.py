@@ -20,7 +20,6 @@ cadence in phases 1 and 2 is SIX seconds.
 """
 import logging
 
-import pytest
 
 import research
 

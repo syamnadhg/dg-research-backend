@@ -267,7 +267,7 @@ def test_a_category_word_in_front_is_not_part_of_the_machine_name(frame, noun):
 
 def test_a_category_word_in_front_is_not_part_of_a_person_name():
     for lead in ("person", "user", "colleague", "requester"):
-        assert f"“Sam”" in _r(f"approve the {lead} Sam")[1]
+        assert "“Sam”" in _r(f"approve the {lead} Sam")[1]
     assert "“Sam”" in _r("approve my colleague Sam")[1]
 
 
@@ -883,8 +883,8 @@ def test_the_in_flow_rows_say_they_are_in_flow(phrase):
     row that teaches it has to say why — otherwise the next measurement reports
     it as a defect again, which is how it arrived in this wave."""
     text = _SKILL_MD.read_text(encoding="utf-8")
-    row = next(l for l in text.splitlines()
-               if l.startswith("|") and f'"{phrase}"' in l)
+    row = next(ln for ln in text.splitlines()
+               if ln.startswith("|") and f'"{phrase}"' in ln)
     assert "FOLLOW-UP" in row or "IN-FLOW" in row or "ANSWERS TO" in row \
         or "INSIDE THE SEND-LOGS FLOW" in row, row[:120]
 
@@ -1318,7 +1318,7 @@ def test_the_research_exclusion_reads_the_derived_phase_words(phrase):
 
 @pytest.mark.parametrize("det", ["our", "your", "his", "her", "that", "this"])
 def test_every_determiner_comes_off_at_unlink_and_ask(det):
-    assert f"“Studio PC”" in _r(f"remove {det} Studio PC")[1], det
+    assert "“Studio PC”" in _r(f"remove {det} Studio PC")[1], det
 
 
 # --- skip, after the round ------------------------------------------------

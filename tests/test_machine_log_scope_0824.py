@@ -31,7 +31,6 @@ that explain why a run died.
 """
 import asyncio
 import inspect
-import json
 import logging
 from pathlib import Path
 

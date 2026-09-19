@@ -442,7 +442,6 @@ def skipped_count(pytest_output: str) -> int:
     Reads the LAST match: pytest prints per-file progress before the summary and
     a stray "1 skipped" in a test name must not be mistaken for the total.
     """
-    summaries = SUMMARY_RE.findall(pytest_output or "")
     line = None
     for m in SUMMARY_RE.finditer(pytest_output or ""):
         line = m.group(0)

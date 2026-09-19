@@ -6825,7 +6825,8 @@ def cmd_do(args) -> int:
     # with a dash ("research --help") must reach the command as a literal value,
     # never dump argparse usage into the chat relay.
     cmd, rest = argv[0], argv[1:]
-    _is_flag = lambda a: a.split("=", 1)[0] in _DO_FLAGS
+    def _is_flag(a):
+        return a.split("=", 1)[0] in _DO_FLAGS
     flags = [a for a in rest if _is_flag(a)]
     pos = [a for a in rest if not _is_flag(a)]
     final = (["--json"] if args.json else []) + [cmd] + flags + (["--"] + pos if pos else [])

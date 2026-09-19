@@ -33,7 +33,7 @@ from pathlib import Path
 import pytest
 
 import research
-from _domshim import js_constant, run_js, spec_from_html, stamp_panel_geometry
+from _domshim import run_js, spec_from_html, stamp_panel_geometry
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "panels"
 POPOVER = FIXTURES / "claude_model_popover_with_submenu_20260806.html"

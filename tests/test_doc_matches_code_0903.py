@@ -55,7 +55,7 @@ def live_claims(text: str = DOC) -> str:
     is allowed to name the dead. Every absence check runs against the remaining
     lines, which are the doc's live claims.
     """
-    return "\n".join(l for l in text.splitlines() if "⛔" not in l)
+    return "\n".join(ln for ln in text.splitlines() if "⛔" not in ln)
 
 #: Symbols the doc presented as live that are not. A retired symbol may appear
 #: in the doc ONLY on a line that also carries the ⛔ marker — that lets a

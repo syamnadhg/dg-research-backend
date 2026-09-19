@@ -254,7 +254,7 @@ def test_an_unidentifiable_holder_is_waited_out_not_killed(monkeypatch):
 
 
 def test_an_unidentifiable_holder_that_never_clears_is_stuck(monkeypatch):
-    st = _fake(monkeypatch, free_after=99, holders=[])
+    _fake(monkeypatch, free_after=99, holders=[])
     assert R._reclaim_port(8000)[0] == "stuck"
 
 

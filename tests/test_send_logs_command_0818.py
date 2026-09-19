@@ -11,10 +11,8 @@ coalesced away inside a stream-resync window, dropping the command with no
 replay. So the tuple and the dispatch branch land together, and this file pins
 that they still are together.
 """
-import ast
 import inspect
 import json
-import os
 import re
 import time
 from pathlib import Path
@@ -1000,8 +998,8 @@ class TestConsentScope:
         the machine's whole history. Without this, moving the number down reads
         as "less of everything leaves"."""
         lines = research._send_logs_consent_lines(1)
-        assert any("only the first line" in l for l in lines), lines
-        assert any("whatever number you pick" in l for l in lines)
+        assert any("only the first line" in ln for ln in lines), lines
+        assert any("whatever number you pick" in ln for ln in lines)
 
     def test_the_lines_the_number_does_not_govern_never_change(self):
         """⛔⛔ SELECTED BY CONTENT, NOT BY POSITION — and it used to be `[1:-1]`,
@@ -1016,7 +1014,7 @@ class TestConsentScope:
             lines = research._send_logs_consent_lines(runs)
             # The run line always leads; the ⚠ note names the number wherever it
             # sits. Everything else must be identical for any count.
-            return [l for l in lines[1:] if "only the first line" not in l]
+            return [ln for ln in lines[1:] if "only the first line" not in ln]
 
         assert fixed(3) == fixed(17)
         # ⛔ And the filter must not have eaten the whole list, which would make

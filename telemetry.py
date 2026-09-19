@@ -741,8 +741,8 @@ def _read_batch(claimed: Path,
             fresh.append((record, line))
     except OSError:
         return [], []
-    batch = [r for r, _l in fresh[:BATCH_MAX_EVENTS]]
-    owed = [l for _r, l in fresh[BATCH_MAX_EVENTS:]]
+    batch = [record for record, _raw in fresh[:BATCH_MAX_EVENTS]]
+    owed = [raw for _record, raw in fresh[BATCH_MAX_EVENTS:]]
     return batch, owed
 
 

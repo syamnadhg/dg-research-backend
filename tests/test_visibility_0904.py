@@ -513,7 +513,7 @@ def test_a_revoked_session_never_recommends_pairing(wired):
     wired["cred"] = research.CRED_NO_TOKEN
     research.run_visibility("public")
     out = wired["out"]()
-    advice = "\n".join(l for l in out.splitlines() if "⛔" not in l)
+    advice = "\n".join(ln for ln in out.splitlines() if "⛔" not in ln)
     assert "--pair" not in advice
     assert "--serve" in out
 

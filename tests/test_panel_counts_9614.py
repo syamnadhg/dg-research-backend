@@ -26,7 +26,6 @@ for the fixes. Measured on that document:
 ⚠ The grown capture is TRUNCATED (it hit the old 60,000-char limit mid-tag), so
 36 is a floor. Every count here is asserted as "at least", never as exact.
 """
-import sys
 from pathlib import Path
 
 import pytest

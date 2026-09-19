@@ -18,7 +18,6 @@ agent mapped onto an enum, and the id. `**data` is structurally never passed,
 because "temporarily" adding one field is how free text re-enters a content-free
 path.
 """
-import inspect
 import re
 
 import pytest

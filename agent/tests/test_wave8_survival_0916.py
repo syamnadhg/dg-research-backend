@@ -8,8 +8,6 @@ first tick; and `agent disconnect` deletes a cron row by the script it runs rath
 than the name we gave it. Not one of them reports anything.
 """
 
-import json
-import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -295,7 +293,7 @@ def test_the_agent_mirrors_the_web_apps_two_rules_in_its_two_places():
     import inspect
     from facade import firestore_rest
     body = inspect.getsource(firestore_rest.is_pair_confirmed)
-    code = "\n".join(l for l in body.splitlines() if not l.strip().startswith("#"))
+    code = "\n".join(ln for ln in body.splitlines() if not ln.strip().startswith("#"))
     code = code.split('"""')[-1]
     assert "pair_state_usable" not in code, (
         "the list filter took the run gate back — that drops a machine mid-Reset "

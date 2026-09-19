@@ -32,7 +32,6 @@ THREE CHANGES, each correct whatever the trigger was:
      forever — while the reader held the disproof every single cycle.
 """
 
-import asyncio
 import inspect
 import sys
 from pathlib import Path

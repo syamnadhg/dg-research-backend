@@ -8283,9 +8283,9 @@ def _firestore_outage_notice(*, down_for, attempts, last_spoken_ago,
         f"[firestore] This machine cannot reach {host} — "
         f"{_outage_duration_text(elapsed)} of failed reconnects "
         f"({n} attempt{'' if n == 1 else 's'}).",
-        f"[firestore] While that is true the web app shows this computer "
-        f"offline and any research fired at it will not arrive here. Your "
-        f"pairing is fine — there is nothing to re-pair.",
+        "[firestore] While that is true the web app shows this computer "
+        "offline and any research fired at it will not arrive here. Your "
+        "pairing is fine — there is nothing to re-pair.",
         f"[firestore] This is the network rather than Super Research: a VPN or "
         f"corporate proxy, a firewall, or DNS (a Pi-hole or resolver that will "
         f"not answer for {host}).",
@@ -14399,7 +14399,6 @@ def start_firestore_start_listener(job_queue, loop):
                     )
                     position = job_queue.qsize() + 1
                     behind_rid = ""
-                    behind_title = ""
                 # Gate-blocked path special-case: when no behind-doc
                 # found in the global queue (we're head), fill behind
                 # from the prior run whose FE-P5 the gate is waiting
@@ -14428,8 +14427,10 @@ def start_firestore_start_listener(job_queue, loop):
                     current = _QUEUE_STATE.get("current_job")
                     if current:
                         behind_rid = current.get("research_id") or ""
-                        # ⛔ Same wave, same reason — no topic is carried.
-                        behind_title = ""
+                        # ⛔ Same wave, same reason — no topic is carried, and there is
+                        # deliberately no `behind_title` to set: the payload below sends
+                        # `_crun_delete_field()` for `queuedBehindTitle`, because the only
+                        # title there could be is another account's topic.
                 status_payload = {
                     "backendRunId": run_id,
                     "status": "queued",
@@ -39344,7 +39345,10 @@ _GEMINI_LATEST_TURN_JS = """
     rows: rows,
   });
 }
-""" % {"panes": json.dumps(_GEMINI_MENU_PANE_SEL),
+""" % {  # noqa: F504 — ONE substitution bag, several templates. Each template
+       # uses a subset of these keys, so every key is used by some template and
+       # none is missing from the JS; ruff checks one template at a time.
+       "panes": json.dumps(_GEMINI_MENU_PANE_SEL),
        "rows": json.dumps(_GEMINI_MENU_ROW_SEL),
        "deny": json.dumps(list(_GEMINI_MENU_DENY)),
        "turns": json.dumps(list(_GEMINI_TURN_SELECTORS)),
@@ -39460,7 +39464,10 @@ _GEMINI_MENU_PICK_JS = """
   }
   return '';
 }
-""" % {"panes": json.dumps(_GEMINI_MENU_PANE_SEL),
+""" % {  # noqa: F504 — ONE substitution bag, several templates. Each template
+       # uses a subset of these keys, so every key is used by some template and
+       # none is missing from the JS; ruff checks one template at a time.
+       "panes": json.dumps(_GEMINI_MENU_PANE_SEL),
        "rows": json.dumps(_GEMINI_MENU_ROW_SEL),
        "deny": json.dumps(list(_GEMINI_MENU_DENY)),
        "turns": json.dumps(list(_GEMINI_TURN_SELECTORS)),
@@ -49748,9 +49755,9 @@ async def setup_chatgpt_dr(page, allow_model_pick=False, *,
         # index against the same list or the two disagree again.
         _seen_used = list((_snap or {}).get("seen_used") or [])
         if (_snap or {}).get("census_ignored"):
-            log(f"[setup_chatgpt_dr] Step 2: the pre-open census matched every "
-                f"candidate, so it was ignored for this read — the conversation-link "
-                f"exclusion still applies", "WARN")
+            log("[setup_chatgpt_dr] Step 2: the pre-open census matched every "
+                "candidate, so it was ignored for this read — the conversation-link "
+                "exclusion still applies", "WARN")
         # Title and description are CONCATENATED in these rows ("Deep research Get
         # a detailed report"), so the match is a prefix-or-word test, never `===`.
         _idx = -1
@@ -72332,7 +72339,7 @@ async def run_server(port=8000):
         print(f"\n  {_c(_ERR, '⛔')}  Port {port} is already in use by something "
               f"that is not Super Research.")
         print(f"      {_who}")
-        print(f"      Stop it, or start this backend on another port.\n")
+        print("      Stop it, or start this backend on another port.\n")
         raise SystemExit(3)
 
     if _port_state == "busy":
@@ -72351,8 +72358,8 @@ async def run_server(port=8000):
               f"backend that is {_doing}.")
         print(f"      pid {_pids}"
               + (f" — {_queued} job(s) queued" if _queued else ""))
-        print(f"      Nothing was stopped. Wait for it to finish, or start this "
-              f"backend on another port.\n")
+        print("      Nothing was stopped. Wait for it to finish, or start this "
+              "backend on another port.\n")
         raise SystemExit(3)
 
     if _port_state == "stuck":
@@ -76734,7 +76741,6 @@ def _reclaim_port(port: int, settle_s: float = 12.0):
                            # its own for the same reason. Missing it here failed
                            # as a swallowed NameError, so the stale backend was
                            # never signalled and the reclaim reported "stuck".
-    import time as _t
 
     if _wait_for_port_free(port, 0.5):
         return "free", []

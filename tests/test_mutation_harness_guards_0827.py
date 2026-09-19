@@ -24,7 +24,6 @@ belongs in the apparatus, and these are the tests for it.
 from __future__ import annotations
 
 import importlib.util
-import subprocess
 from pathlib import Path
 
 import pytest

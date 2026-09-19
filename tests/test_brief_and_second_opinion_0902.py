@@ -493,9 +493,12 @@ def test_the_card_is_raised_BEFORE_the_wait(gate):
 # THE SECOND WITNESS
 # ─────────────────────────────────────────────────────────────────────────────
 
-import json
-import tempfile
-from pathlib import Path
+# ⛔ noqa E402: deliberately here and not at the top. This file is grouped by
+# WITNESS, and these three belong to the second one — moving them up would put
+# them a hundred lines from the only code that uses them.
+import json  # noqa: E402
+import tempfile  # noqa: E402
+from pathlib import Path  # noqa: E402
 
 
 def _report(n, on_topic):

@@ -19,10 +19,8 @@ so a problem that had already scrolled past a rotation was unsendable, and nothi
 said so.
 """
 
-import contextlib
 import importlib.util
 import json
-import io
 import sys
 from pathlib import Path
 from types import SimpleNamespace
