@@ -172,7 +172,7 @@ def _child_env_value(preset: "str | None") -> str:
         [sys.executable, "-c",
          "import sys, os; sys.argv = ['research.py']; import research; "
          "sys.stdout.write(os.environ.get('GRPC_VERBOSITY', ''))"],
-        cwd=str(REPO), env=env, capture_output=True, text=True, timeout=180)
+        cwd=str(REPO), env=env, capture_output=True, text=True, encoding="utf-8", timeout=180)
     assert out.returncode == 0, out.stderr[-2000:]
     return out.stdout.strip()
 
@@ -265,7 +265,7 @@ def test_the_config_applies_under_a_real_dictconfig():
     )
     env = dict(os.environ, DG_ALERT_AI_COPY="0")
     out = subprocess.run([sys.executable, "-c", prog], cwd=str(REPO), env=env,
-                         capture_output=True, text=True, timeout=180)
+                         capture_output=True, text=True, encoding="utf-8", timeout=180)
     assert out.returncode == 0, out.stderr[-3000:]
     emitted = [ln for ln in out.stdout.splitlines() if ln.strip()]
 

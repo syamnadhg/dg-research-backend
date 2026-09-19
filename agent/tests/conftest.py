@@ -164,6 +164,47 @@ def _no_real_fe_posts(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _restore_facade_logging():
+    """⛔⛔ NO TEST MAY LEAVE THE `facade` LOGGER DETACHED FROM THE ROOT.
+
+    `logsetup.configure()` sets `logging.getLogger("facade").propagate = False`
+    and installs its own handler. That is process-global and permanent, and
+    pytest's capture handler lives on the ROOT logger — so the moment any test
+    calls `configure()` and does not put the logger back, EVERY later
+    `caplog.text` in the process is `''` while the product logs perfectly (the
+    lines still show up in captured stderr).
+
+    ⚠ THE FAILURES IT CAUSES LOOK LIKE PRODUCT BUGS AND LIKE PLATFORM BUGS, AND
+    ARE NEITHER. Measured 2026-09-18: ten tests across four files —
+    test_agent_log_out_0826, test_bridge_device, test_log_locality_791,
+    test_store, test_unlink_copy_795 — every one of which passes on its own.
+    `propagate = False` is unconditional, so a single-process run leaks the same
+    way on macOS; a chunked or parallel run only hides it by putting the victims
+    in other processes, which is why this went unnoticed.
+
+    ⭐ `tests/test_logsetup.py` already had exactly this teardown, but file-local,
+    so it protected only its own nine `configure()` calls. Suite-wide is the only
+    scope that actually holds the invariant: the leak is caused by whoever calls
+    `configure()`, and suffered by whoever runs next.
+    """
+    import logging
+    logger = logging.getLogger("facade")
+    saved = (logger.handlers[:], logger.level, logger.propagate, logger.disabled)
+    try:
+        yield
+    finally:
+        for h in logger.handlers:
+            if h not in saved[0]:
+                # Close what the test opened — Windows will not delete a file
+                # whose handler still holds it, and these are usually on tmp_path.
+                try:
+                    h.close()
+                except Exception:
+                    pass
+        logger.handlers[:], logger.level, logger.propagate, logger.disabled = saved
+
+
+@pytest.fixture(autouse=True)
 def _isolate_prefs_dir(monkeypatch, tmp_path):
     """Point ``config.store_dir()`` at a per-test tmp so prefs.json — including
     the #790 agent install id (minted lazily by get_or_create_install_id) — never

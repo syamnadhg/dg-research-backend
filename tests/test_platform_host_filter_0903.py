@@ -27,7 +27,6 @@ test files fail to collect. `test_every_scrape_site_is_the_one_rule` is what mak
 the literal a copy rather than a fork.
 """
 import re
-import subprocess
 import sys
 from pathlib import Path
 
@@ -35,13 +34,21 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import research  # noqa: E402
-from _domshim import el, run_js  # noqa: E402
+from _domshim import NODE, el, run_js  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = (ROOT / "research.py").read_text(encoding="utf-8")
 
+# ⛔ `_domshim.NODE` (`shutil.which("node")`), NOT a shell-out to `which`.
+# Windows HAS no `which` executable, so `subprocess.run(["which", ...])` raises
+# FileNotFoundError [WinError 2] — and this runs at MODULE SCOPE, so it raises
+# during COLLECTION. A collection error is fatal to the whole pytest run, not
+# just to this file, and its message never mentions node. Sixteen other
+# node-gated files in this suite already read `_domshim.NODE`; this was the one
+# that did not, which `test_node_is_required_not_skipped_0917.py` calls out by
+# name. `shutil.which` is the portable answer and resolves node.exe here.
 needs_node = pytest.mark.skipif(
-    subprocess.run(["which", "node"], capture_output=True).returncode != 0,
+    NODE is None,
     reason="node required to execute page JS",
 )
 

@@ -116,7 +116,7 @@ def _installed_ruff_version() -> str | None:
     if not exe:
         return None
     try:
-        out = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=60)
+        out = subprocess.run([exe, "--version"], capture_output=True, text=True, encoding="utf-8", timeout=60)
     except (OSError, subprocess.SubprocessError):
         return None
     m = re.search(r"(\d+\.\d+\.\d+)", out.stdout or "")

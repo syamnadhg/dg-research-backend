@@ -51,7 +51,7 @@ def _ruff_cmd() -> "list[str] | None":
     if exe:
         return [exe]
     probe = subprocess.run([sys.executable, "-m", "ruff", "--version"],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, encoding="utf-8")
     return [sys.executable, "-m", "ruff"] if probe.returncode == 0 else None
 
 
@@ -114,7 +114,7 @@ def test_the_tree_passes_the_correctness_floor():
     out = subprocess.run(
         [*ruff, "check", ".", "--select", ",".join(_selected_rules()),
          "--ignore-noqa", "--output-format=concise"],
-        cwd=ROOT, capture_output=True, text=True)
+        cwd=ROOT, capture_output=True, text=True, encoding="utf-8")
     findings = [ln for ln in out.stdout.splitlines()
                 if re.match(r"^[^\s].*:\d+:\d+: ", ln)]
     assert out.returncode == 0, (
@@ -130,7 +130,7 @@ def test_the_installed_ruff_matches_the_pin():
     ruff = _ruff_cmd()
     if ruff is None:
         pytest.skip("ruff not installed")
-    have = subprocess.run([*ruff, "--version"], capture_output=True, text=True).stdout
+    have = subprocess.run([*ruff, "--version"], capture_output=True, text=True, encoding="utf-8").stdout
     want = _pinned_ruff()
     # ⛔ IT HAD NO ASSERTION AT ALL — it could only pass or skip, never fail, and
     # it contributed one of the file's reassuring "3 passed". At minimum it must

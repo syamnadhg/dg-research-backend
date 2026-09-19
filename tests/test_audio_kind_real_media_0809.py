@@ -138,7 +138,7 @@ def test_the_video_really_does_carry_an_audio_track(real_video_with_audio):
         [shutil.which("ffprobe") or "/opt/homebrew/bin/ffprobe", "-v", "error",
          "-show_entries", "stream=codec_type", "-of",
          "default=noprint_wrappers=1:nokey=1", str(real_video_with_audio)],
-        capture_output=True, text=True, timeout=60)
+        capture_output=True, text=True, encoding="utf-8", timeout=60)
     kinds = {l.strip() for l in out.stdout.splitlines() if l.strip()}
     assert "audio" in kinds and "video" in kinds, kinds
 

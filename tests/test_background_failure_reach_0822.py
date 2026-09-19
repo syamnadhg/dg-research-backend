@@ -41,6 +41,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import research  # noqa: E402
 from conftest import code_only_deep  # noqa: E402
 
+# ⛔ `os.geteuid` is POSIX-ONLY, and the skipif below reads it at CLASS-BODY
+# time — i.e. during COLLECTION, where an AttributeError is fatal to the whole
+# run, not just to this file. Windows is also the wrong host for the test it
+# guards: `chmod(0o000)` there maps to the read-only bit, which still permits
+# reads, so the unreadable file that case needs cannot be staged at all.
+# Hence two separate conditions rather than one.
+HAS_POSIX_PERMS = hasattr(os, "geteuid")
+RUNS_AS_ROOT = HAS_POSIX_PERMS and os.geteuid() == 0
+
 
 # ══════════════════════════════════════════════════════════════════════════
 #  1. it is written where the bundle already looks
@@ -248,7 +257,10 @@ class TestReadingTheSupervisorsOwnWords:
         (d / "supervisor.err.log").mkdir()
         assert _ev(tmp_path)["lines"] == []
 
-    @pytest.mark.skipif(os.geteuid() == 0, reason="root reads anything")
+    @pytest.mark.skipif(
+        not HAS_POSIX_PERMS or RUNS_AS_ROOT,
+        reason="needs POSIX permission enforcement and a non-root euid "
+               "(root reads anything; Windows chmod does not deny reads)")
     def test_a_file_it_may_not_read_is_an_empty_answer_not_an_exception(
             self, tmp_path):
         """⭐ FOUND BY MUTATION. The earlier version of this used a DIRECTORY of

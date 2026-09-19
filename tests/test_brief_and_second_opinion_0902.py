@@ -152,8 +152,23 @@ _MATRIX_TEXTS = [
 ]
 _MATRIX_TOPICS = [TOPIC, BLAND_TOPIC, "", None, "NemoClaw"]
 
+# ⛔ EXPLICIT IDS, because two of these values are tens of thousands of
+# characters long. Without them pytest derives the id FROM THE VALUE, and the
+# id goes into PYTEST_CURRENT_TEST — which on Windows hits the 32,767-char cap
+# for a single environment variable. Every case then fails in BOTH setup and
+# teardown with a ValueError that never mentions the id, so the file reports
+# dozens of errors and no failures. The ids also make `-k` usable on a matrix
+# whose cases are otherwise unnameable.
+_MATRIX_TEXT_IDS = [
+    "empty", "none",
+    "anchor-tiny", "no-anchor-tiny",
+    "one-below-floor", "at-floor", "anchor-straddling-floor",
+    "no-anchor-huge", "anchor-huge",
+]
+assert len(_MATRIX_TEXT_IDS) == len(_MATRIX_TEXTS)
 
-@pytest.mark.parametrize("text", _MATRIX_TEXTS)
+
+@pytest.mark.parametrize("text", _MATRIX_TEXTS, ids=_MATRIX_TEXT_IDS)
 @pytest.mark.parametrize("topic", _MATRIX_TOPICS)
 def test_the_report_predicate_is_byte_for_byte_the_old_one(text, topic):
     assert research.text_is_off_topic(text, topic) is _text_is_off_topic_ORIGINAL(
@@ -164,7 +179,9 @@ def test_the_report_predicate_is_byte_for_byte_the_old_one(text, topic):
                                    "Golden Retriever Ownership Evidence"])
 @pytest.mark.parametrize("corpus", ["", "golden retrievers",
                                     ("golden retriever " * 2000),
-                                    ("nemoclaw " * 4000)])
+                                    ("nemoclaw " * 4000)],
+                         ids=["empty", "short-no-anchor",
+                              "huge-no-anchor", "huge-anchor"])
 @pytest.mark.parametrize("topic", [TOPIC, BLAND_TOPIC])
 def test_the_title_verdict_is_byte_for_byte_the_old_one(title, corpus, topic):
     assert research.title_refusal_verdict(title, topic, corpus) == \

@@ -503,12 +503,19 @@ def _phrases_from_the_routing_tests() -> list[str]:
     nouns = [re.sub(r"s\?$", "", n.strip())
              for n in re.sub(r"^\(\?:|\)$", "", sr._MACHINE_NOUNS).split("|")]
     assert all(not n.endswith("s") for n in nouns), nouns
+    # ⛔ encoding="utf-8" on BOTH harvesting reads (here and in
+    # `_phrases_from_skill_md`). Without it Python decodes with the LOCALE
+    # codec — cp1252 on Windows — and dies on the codebase's own ⛔/⭐ markers:
+    # 39 of the 71 files this walks cannot be decoded as cp1252 at all. The
+    # product never reads them that way: connect.py opens SKILL.md with
+    # encoding="utf-8", and sr.py is loaded through importlib, which decodes
+    # source per PEP 263 regardless of locale. Test-side only.
     here = Path(__file__).resolve().parent
     for f in sorted(here.glob("test_*.py")):
         if f.name == Path(__file__).name:
             continue
         try:
-            tree = ast.parse(f.read_text())
+            tree = ast.parse(f.read_text(encoding="utf-8"))
         except SyntaxError:                                  # pragma: no cover
             continue
         for node in ast.walk(tree):
@@ -537,7 +544,7 @@ def _phrases_from_the_routing_tests() -> list[str]:
 def _phrases_from_skill_md() -> list[str]:
     """The example sentences SKILL.md tells people to type."""
     out = []
-    for m in re.finditer(r"[“\"]([a-z][^”\"\n]{4,70})[”\"]", _SKILL.read_text()):
+    for m in re.finditer(r"[“\"]([a-z][^”\"\n]{4,70})[”\"]", _SKILL.read_text(encoding="utf-8")):
         s = m.group(1).strip()
         if re.search(r"\b(research|stop|pause|resume|retry|remove|unlink|forget|"
                      r"delete|add|pair|connect|switch|use|make|set|hide|unlist|"

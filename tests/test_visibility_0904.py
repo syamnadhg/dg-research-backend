@@ -230,7 +230,7 @@ def _cli(*args, tmp_home):
     env.pop("SUPERRESEARCH_STATE_DIR", None)
     return subprocess.run(
         [sys.executable, "research.py", *args],
-        cwd=str(REPO), env=env, capture_output=True, text=True, timeout=300,
+        cwd=str(REPO), env=env, capture_output=True, text=True, encoding="utf-8", timeout=300,
     )
 
 

@@ -1080,8 +1080,14 @@ def test_every_code_the_decide_route_can_return_is_worded_on_both_surfaces():
     if not route.exists():
         pytest.skip("web app not checked out beside the backend")
     import re as _re
-    codes = set(_re.findall(r'DecideError\("([a-z_]+)"', route.read_text()))
-    codes |= set(_re.findall(r'error: "([a-z_]+)"', route.read_text()))
+    # ⛔ encoding="utf-8": this reads a FIRST-PARTY .ts file, and those carry the
+    # codebase's ⛔/⭐ markers. Bare read_text() decodes with the locale codec
+    # (cp1252 on Windows) and dies on byte 0x90. Only reachable when the web
+    # checkout resolves, which is why it surfaced the day one was put beside this
+    # repo rather than when the guard was written.
+    _src = route.read_text(encoding="utf-8")
+    codes = set(_re.findall(r'DecideError\("([a-z_]+)"', _src))
+    codes |= set(_re.findall(r'error: "([a-z_]+)"', _src))
     missing = codes - set(cli._DECIDE_FAILURES) - {"rate_limited"}
     assert not missing, missing
     assert missing == (codes - set(sr._DECIDE_ERRORS) - {"rate_limited"})

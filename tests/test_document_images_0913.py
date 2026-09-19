@@ -38,6 +38,7 @@ import socket
 import ssl
 import struct
 import subprocess
+import sys
 import threading
 import time
 import types
@@ -1221,6 +1222,17 @@ def test_the_per_agent_funnel_sits_between_the_guard_and_the_first_write():
 # days. These run the REAL fetch — requests, urllib3, TLS — against a REAL local
 # server, with only the public-address rules switched off (it is 127.0.0.1).
 
+# ⛔ 127.0.0.1, NOT "localhost". Every fake server in this file binds
+# ("127.0.0.1", 0), but "localhost" resolves ::1 FIRST on Windows and nothing is
+# listening there — and a refused connect to a closed loopback port costs ~2.04s
+# here (Windows retransmits the SYN before reporting WSAECONNREFUSED), not the
+# instant RST POSIX gives. Tests whose whole budget is 1.0-1.4s therefore spent it
+# all on the dead address family: the deadline expired, `guard.watch()` refused the
+# socket, and the listener was never reached — reported as `head_sent == []` or
+# "the upload never reached the local web", i.e. as the product failing. The certs
+# below already carry `IP:127.0.0.1` in their SANs, so TLS verification stays real.
+_LOOPBACK = "127.0.0.1"
+
 def _self_signed(tmp_path):
     cert, key = tmp_path / "cert.pem", tmp_path / "key.pem"
     try:
@@ -1370,7 +1382,7 @@ def test_the_real_tls_chain_fetches_a_whole_image(tmp_path, monkeypatch):
     made = _spy_deadlines(monkeypatch)
     with tls_server(tmp_path, _png_response(png(300, 200))) as (cert, port, served):
         _trust_local_server(monkeypatch, cert)
-        th, box = _fetch_in_thread(f"https://localhost:{port}/a.png", 5.0, 6.0)
+        th, box = _fetch_in_thread(f"https://{_LOOPBACK}:{port}/a.png", 5.0, 6.0)
     assert not th.is_alive()
     assert box.get("value") == png(300, 200), box.get("error")
     (guard,) = made
@@ -1382,7 +1394,7 @@ def _trickle(tmp_path, monkeypatch, head, drip):
     made = _spy_deadlines(monkeypatch)
     with tls_server(tmp_path, head, drip, every=0.2, for_sec=6.0) as (cert, port, served):
         _trust_local_server(monkeypatch, cert)
-        th, box = _fetch_in_thread(f"https://localhost:{port}/slow.png", 1.0, 3.0)
+        th, box = _fetch_in_thread(f"https://{_LOOPBACK}:{port}/slow.png", 1.0, 3.0)
         alive = th.is_alive()
         head_sent = list(served)
     return alive, box, head_sent, made
@@ -1413,7 +1425,20 @@ def test_the_deadline_shuts_the_connection_through_a_dup():
         guard.watch(a)
         t0 = time.monotonic()
         guard.expire()
-        assert a.recv(1) == b"" and time.monotonic() - t0 < 1.0
+        # ⛔ THE PROPERTY IS "the blocked read ENDED", not the shape of the
+        # ending. POSIX gets a clean FIN, so `recv` returns b"". Windows gets an
+        # RST, because `shutdown` there returns success and leaves the read
+        # sitting out its full timeout — so `expire()` uses an abortive close and
+        # the read wakes as ConnectionAbortedError. Both are the cut landing; the
+        # thing this test must still catch is the read NOT ending, which on either
+        # platform shows up as the 3s timeout blowing the 1.0s budget below.
+        try:
+            ended = a.recv(1) == b""
+        except ConnectionResetError:
+            ended = True
+        except ConnectionAbortedError:
+            ended = True
+        assert ended and time.monotonic() - t0 < 1.0
     finally:
         guard.close()
         a.close()
@@ -1848,7 +1873,7 @@ def _web_repo():
     candidates = [here.parent / "dg-research"]
     try:
         common = subprocess.run(["git", "-C", str(here), "rev-parse", "--path-format=absolute",
-                                 "--git-common-dir"], capture_output=True, text=True, timeout=10)
+                                 "--git-common-dir"], capture_output=True, text=True, encoding="utf-8", timeout=10)
         if common.returncode == 0 and common.stdout.strip():
             candidates.append(Path(common.stdout.strip()).parent.parent / "dg-research")
     except (OSError, subprocess.SubprocessError):
@@ -1862,7 +1887,7 @@ def _web_file(path):
         pytest.skip("⛔⛔ THE WEB REPO (dg-research) IS NOT ON THIS DISK — the machine/web upload "
                     "contract was NOT compared")
     got = subprocess.run(["git", "-C", str(repo), "show", f"{WEB_CONTRACT_REV}:{path}"],
-                         capture_output=True, text=True, timeout=30)
+                         capture_output=True, text=True, encoding="utf-8", timeout=30)
     assert got.returncode == 0, f"{repo} has no {WEB_CONTRACT_REV}:{path}: {got.stderr.strip()}"
     return got.stdout
 
@@ -2318,7 +2343,7 @@ def test_an_upload_answered_a_byte_at_a_time_ends_before_the_hard_stop(world, tm
                 s.verify = str(cert)
             return s
         monkeypatch.setattr(R, "_doc_img_upload_session", session)
-        monkeypatch.setattr("auth.v2_flow.FE_BASE_URL", f"{'https' if tls else 'http'}://localhost:{port}")
+        monkeypatch.setattr("auth.v2_flow.FE_BASE_URL", f"{'https' if tls else 'http'}://{_LOOPBACK}:{port}")
         t0 = time.monotonic()
         out = rehost(f"![Big]({url})")
         elapsed = time.monotonic() - t0
@@ -2707,7 +2732,7 @@ def test_an_untrusted_certificate_on_the_real_upload_is_remembered(world, tmp_pa
     world.images[url] = png()
     raised = _record_real_upload_errors(monkeypatch)
     with web_server(tmp_path, b"HTTP/1.1 200 OK\r\n\r\n", b"", tls=True, for_sec=0.0) as (_c, port, stored):
-        monkeypatch.setattr("auth.v2_flow.FE_BASE_URL", f"https://localhost:{port}")
+        monkeypatch.setattr("auth.v2_flow.FE_BASE_URL", f"https://{_LOOPBACK}:{port}")
         assert rehost(f"![Chart]({url})") == "![Chart]()"
         assert rehost(f"again ![Chart]({url})") == "again ![Chart]()"
     assert stored == [] and [type(e) for e in raised] == [requests.exceptions.SSLError], raised
@@ -2776,14 +2801,25 @@ def test_a_tls_handshake_the_upload_guard_cut_is_not_remembered(world, monkeypat
     fake_session = R._doc_img_upload_session
     raised = _record_real_upload_errors(monkeypatch)
     with _silent_tls_web() as (port, held):
-        monkeypatch.setattr("auth.v2_flow.FE_BASE_URL", f"https://localhost:{port}")
+        monkeypatch.setattr("auth.v2_flow.FE_BASE_URL", f"https://{_LOOPBACK}:{port}")
         t0 = time.monotonic()
         assert rehost(f"![Chart]({url})", "ChatGPT") == "![Chart]()"
         elapsed = time.monotonic() - t0
     assert held, "the upload never connected — the test measured nothing"
     assert 1.2 <= elapsed < 2.0, elapsed
-    # The class a certificate failure raises — only the guard's state tells them apart.
-    assert [type(e) for e in raised] == [requests.exceptions.SSLError], raised
+    # The class a certificate failure raises — only the guard's state tells them
+    # apart. ⛔ ON WINDOWS IT IS `ConnectionError`, and for the same reason: the
+    # guard cannot cut a handshake with `shutdown` there (it returns success and
+    # does nothing), so it closes abortively and the RST surfaces as
+    # ProtocolError/ConnectionAbortedError rather than an SSL error. The point of
+    # the assertion survives either way — the class is one a REAL network or
+    # certificate failure also raises, so it cannot be used to decide whether to
+    # remember the refusal. What proves that is two lines below: the chart is
+    # fetched again and stored by the next document.
+    _cut_classes = ([requests.exceptions.SSLError, requests.exceptions.ConnectionError]
+                    if sys.platform == "win32" else [requests.exceptions.SSLError])
+    assert [type(e) for e in raised] != [], "nothing was raised - the test measured nothing"
+    assert all(type(e) in _cut_classes for e in raised), raised
     monkeypatch.setattr(R, "_doc_img_upload_session", fake_session)
     monkeypatch.setattr(R, "_DOC_IMG_DOC_BUDGET_SEC", 5.0)
     assert rehost(f"![Chart]({url})", "Claude") == f"![Chart]({ref_for(png())})"
@@ -3432,6 +3468,22 @@ def _connect_world_for_the_funnel(monkeypatch, addrs):
     def getaddrinfo(host, port, *a, **k):
         return [(socket.AF_INET6 if ":" in ip else socket.AF_INET, socket.SOCK_STREAM, 6, "",
                  (ip, port)) for ip in addrs]
+    # ⛔ `socketpair` MUST KEEP THE REAL CLASS. On POSIX it is a native AF_UNIX
+    # call that never touches `socket.socket`, so the spy above is invisible to
+    # it. On Windows there is no AF_UNIX socketpair and CPython falls back to a
+    # pure-Python one that binds and connects a real AF_INET pair — through
+    # `socket.socket`, which is now `spy`, which hands it a `_Dead` with no
+    # `bind`. The AttributeError surfaces far from here, inside whatever the
+    # product used a self-pipe for, and reads as the funnel under test breaking.
+    _real_pair = getattr(socket, "socketpair", None)
+    if _real_pair is not None:
+        def _socketpair(*a, **k):
+            saved, socket.socket = socket.socket, real
+            try:
+                return _real_pair(*a, **k)
+            finally:
+                socket.socket = saved
+        monkeypatch.setattr(socket, "socketpair", _socketpair)
     monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
     monkeypatch.setattr(socket, "socket", spy)
     return made, connected

@@ -1,0 +1,14 @@
+# bundle-contract.json is a TWO-REPO FILE PINNED BY ITS BYTES. The same document
+# lives here and at research-app/web/src/lib/bundle-contract.json, and
+# tests/test_log_noise_0819.py sha256s it with read_bytes() against a constant
+# so that a one-sided edit goes red in each repo's OWN suite, with no second
+# checkout involved. That only works if every checkout holds the same bytes.
+#
+# This box is core.autocrlf=true and this repo had no .gitattributes, so the
+# file came out of git with CRLF and hashed to a13f96c1... against the pinned
+# f6b3276e... — a deterministic Windows-only failure whose message reads
+# "bundle-contract.json changed. Update BOTH repos' copies and BOTH digests",
+# which if followed would push a CRLF-derived digest that then fails everywhere
+# else. Pin LF so the bytes are the same everywhere and the digest means what it
+# says.
+bundle-contract.json text eol=lf

@@ -73,6 +73,11 @@ class TestWhichAll:
         path = os.pathsep.join([str(tmp_path / "zzz"), str(tmp_path / "aaa")])
         assert research._which_all("ffmpeg", path) == [str(a), str(b)]
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Windows decides executability by PATHEXT, not by a permission "
+               "bit: `_mk(executable=False)` chmods a .exe that stays runnable, "
+               "so the scenario cannot be staged here at all")
     def test_a_file_that_is_not_executable_is_not_a_match(self, tmp_path):
         """⛔ A non-executable file of the right name is not what runs, and
         reporting it as a shadow would send someone after the wrong thing."""
@@ -114,11 +119,14 @@ class TestWhichAll:
         happened to be standing next to a file with that name — and the earlier
         empty-path tests could not see it, because the directory they ran in did
         not contain one."""
-        _mk(tmp_path, "ffmpeg")
+        # ⛔ What `_mk` RETURNS, not the bare name — on Windows it makes
+        # `ffmpeg.exe`, because that is what `_which_all` has to find there.
+        # Hardcoding `tmp_path / "ffmpeg"` compared the right answer against a
+        # file that does not exist on this platform. Identical on POSIX.
+        made = _mk(tmp_path, "ffmpeg")
         monkeypatch.chdir(tmp_path)
         assert research._which_all("ffmpeg", os.pathsep) == []
-        assert research._which_all("ffmpeg", f"{os.pathsep}{tmp_path}") == [
-            str(tmp_path / "ffmpeg")]
+        assert research._which_all("ffmpeg", f"{os.pathsep}{tmp_path}") == [str(made)]
 
 
 # ══════════════════════════════════════════════════════════════════════════

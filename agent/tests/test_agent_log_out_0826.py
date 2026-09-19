@@ -203,6 +203,20 @@ def test_verbose_actually_lowers_the_FILE_handlers_level(tmp_path):
     would satisfy the old assertion and write exactly the same log."""
     from logging.handlers import RotatingFileHandler
     path = tmp_path / "b.log"
+    # ⛔⛔ SNAPSHOT AND RESTORE — the `finally` below used to call `configure()`
+    # again, which is not an undo: `configure()` sets `facade.propagate = False`,
+    # and that is process-global and permanent. pytest's capture handler lives on
+    # the ROOT logger, so from the moment this test ran, EVERY later `caplog`
+    # assertion in the same process read '' while the product logged perfectly
+    # (its lines still appear in captured stderr). Measured 2026-09-18: this one
+    # leak reddened 10 tests across four files — test_log_locality_791,
+    # test_store, test_unlink_copy_795 and four in test_bridge_device — every one
+    # of which passes on its own.
+    # ⚠ NOT A WINDOWS BUG. `propagate = False` is unconditional, so a
+    # single-process run leaks the same way on any platform; a chunked or
+    # parallel run only hides it by putting the victims in other processes.
+    _logger = logging.getLogger("facade")
+    _saved = (_logger.handlers[:], _logger.level, _logger.propagate)
     logsetup.configure(verbose=True, to_file=True, log_file=path)
     try:
         logger = logging.getLogger("facade")
@@ -218,7 +232,16 @@ def test_verbose_actually_lowers_the_FILE_handlers_level(tmp_path):
                  if isinstance(h, RotatingFileHandler)]
         assert files[0].level == logging.INFO
     finally:
-        logsetup.configure(verbose=False, to_file=False)
+        # Close what `configure()` opened before restoring: the rotating file
+        # handler must let go of the log, because Windows will not remove an
+        # open file and tmp_path cleanup would fail on it.
+        for _h in _logger.handlers:
+            if _h not in _saved[0]:
+                try:
+                    _h.close()
+                except Exception:
+                    pass
+        _logger.handlers[:], _logger.level, _logger.propagate = _saved
 
 
 # ── doctor names it, and names it EARLY ───────────────────────────────────────

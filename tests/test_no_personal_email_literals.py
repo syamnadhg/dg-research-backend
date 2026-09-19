@@ -62,7 +62,7 @@ def _source_files() -> list[Path]:
     """
     try:
         out = subprocess.run(["git", "-C", str(ROOT), "ls-files", "-z"],
-                             capture_output=True, text=True, timeout=60, check=True)
+                             capture_output=True, text=True, encoding="utf-8", timeout=60, check=True)
         names = [n for n in out.stdout.split("\0") if n]
         if names:
             return [ROOT / n for n in names

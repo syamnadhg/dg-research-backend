@@ -95,7 +95,7 @@ def _piped_wordmark(env_extra: "dict[str, str]") -> str:
         [sys.executable, "-c",
          "import sys; sys.argv = ['research.py']; import research; "
          "sys.stdout.write(research._c(research._ACCENT, 'SUPER'))"],
-        cwd=str(REPO), env=env, capture_output=True, text=True, timeout=180)
+        cwd=str(REPO), env=env, capture_output=True, text=True, encoding="utf-8", timeout=180)
     assert proc.returncode == 0, proc.stderr[-2000:]
     return proc.stdout
 

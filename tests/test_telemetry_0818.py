@@ -403,7 +403,7 @@ def test_two_real_processes_appending_during_a_flush_lose_nothing(tmp_path):
          "for _ in range(5): t.tm_emit(t.Ev.DOCTOR_RUN, count=1)\n"],
         cwd=str(Path(__file__).resolve().parents[1]),
         env={**os.environ, "HOME": str(home), "SR_TELEMETRY": "1"},
-        capture_output=True, text=True)
+        capture_output=True, text=True, encoding="utf-8")
     assert child.returncode == 0, child.stderr
     tm.tm_emit(tm.Ev.LOGIN_STARTED)
     delivered = []
