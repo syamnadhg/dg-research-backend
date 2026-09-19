@@ -26,7 +26,7 @@ superresearch --serve     # run the backend
 superresearch "<topic>"   # one-shot CLI run
 ```
 
-`superresearch <flags>` is a pure drop-in for `python research.py <flags>` — identical flags (`--pair` / `--serve` / `--resurrect` / `--retire` / `--unpair` / `--doctor` / `--commands` / `--update` / `--login` / `agent`), identical branded UI. `--update` is **idempotent** — it only reinstalls when the installed build is actually outdated. `--login` runs a per-profile Y/N login walk (pair Step-4 parity) fronted by a READ-ONLY pre-probe that never blows away an already-signed-in session (it does NOT run the patchright verify pass). Invocation-aware help shows whichever prefix matches how it was launched (`superresearch` when installed, `python research.py` from a checkout).
+`superresearch <flags>` is a pure drop-in for `python research.py <flags>` — identical flags (`--pair` / `--serve` / `--resurrect` / `--retire` / `--restart` / `--unpair` / `--visibility` / `--doctor` / `--send-logs` / `--update` / `--uninstall` / `--version` / `--login` / `agent`), identical branded UI. ⛔ `--commands` is not one of them any more — the branded reference card it printed became `--help` / `-h` itself (`run_commands_help`, `add_help=False`), which is the only discovery surface there is. `--update` is **idempotent** — it only reinstalls when the installed build is actually outdated. `--login` runs a per-profile Y/N login walk (parity with the pair flow's **Browser logins** step — named rather than numbered, because the arc has renumbered twice and a step number in this sentence rots silently) fronted by a READ-ONLY pre-probe that never blows away an already-signed-in session (it does NOT run the patchright verify pass). Invocation-aware help shows whichever prefix matches how it was launched (`superresearch` when installed, `python research.py` from a checkout).
 
 The **source / developer path** is unchanged and still fully supported:
 
@@ -101,7 +101,7 @@ Queue ordering and per-doc position numbers stay coherent across cross-account, 
 
 1. **FIFO sort key is `submittedAt` (Firestore serverTimestamp), not client `timestamp`** — `_queue_doc_fifo_ms` helper (research.py) prefers the server-set timestamp and falls back to `timestamp` (client `Date.now()` millis) only when `submittedAt` is missing on legacy docs. Removes the cross-account clock-skew bug where a sharer's lagging clock could rank ahead of the owner's earlier submit. Commit `41d0a27`.
 
-2. **Real-time renumber on every claim and cancel** — `_recompute_deferred_queue_positions` (research.py) does a single scan of `devices/{deviceId}/queue/`, sorts by the helper above, filters out `assignedWorker` / `processed` / non-`start` docs, and batch-writes new `queuePosition` / `queuedBehindRunId` / `queuedBehindTitle` to every remaining deferred research doc in one round-trip. Fires from three sites: (a) listener claim path (`_enqueue_with_position_refresh`, research.py), (b) idle-rescan claim (research.py), (c) `_do_cancel` deferred-cancel branch (research.py). All three call sites wrap the helper in `asyncio.create_task(asyncio.to_thread(...))` so the synchronous Firestore scan never blocks the asyncio loop or the listener thread. Commit `c362126`.
+2. **Real-time renumber on every claim and cancel** — `_recompute_deferred_queue_positions` (research.py) does a single scan of `devices/{deviceId}/queue/`, sorts by the helper above, filters out `assignedWorker` / `processed` / non-`start` docs, and batch-writes new `queuePosition` / `queuedBehindRunId` / `queueTotalAhead` / `queueAheadFromSelf` / `queueAheadFromOthers` / `queueEtaMs` / `queueEtaComputedAt` to every remaining deferred research doc in one round-trip. ⚠ Read that as a closed list only if you keep it closed: `queueEtaComputedAt` rides all three patch shapes and was missing from this enumeration until 2026-09-19. ⛔ `queuedBehindTitle` is in that patch as a **field delete**, not a value — 7.7E (2026-09-04) stopped publishing another account's topic on a record every sharer reads; a delete rather than an omission so a pickup removes whatever the previous one wrote, and the key stays on the rules whitelist because a `deleteField()` still lands in `affectedKeys`. Fires from three sites: (a) listener claim path (`_enqueue_with_position_refresh`, research.py), (b) idle-rescan claim (research.py), (c) `_do_cancel` deferred-cancel branch (research.py). All three call sites wrap the helper in `asyncio.create_task(asyncio.to_thread(...))` so the synchronous Firestore scan never blocks the asyncio loop or the listener thread. Commit `c362126`.
 
 3. **Cancel of a deferred (Firestore-resident) doc** — `_do_cancel` (research.py) was extended to handle the case where the cancel target isn't in the local asyncio deque. The handler scans `devices/{deviceId}/queue/`, finds the start doc whose `researchId` matches, deletes it, flips the research doc to `status="stopped"`, then fires the deferred-recompute helper above so the remaining queue renumbers live. Commit `bcc4f84`.
 
@@ -131,8 +131,8 @@ All events are JSON objects written to `events.jsonl` (one per line) AND mirrore
 | `link_extraction_failed` | 3 | `{agent: string, error}` | Notebook-link read failed |
 | `agent_link_failed` | 2 | `{agent, attempts, lastError}` | ⛔ The name is a wire contract, not a description: the only live producer is Claude finishing without its report artifact. `attempts` is hardcoded 1. **Does not pause** — parks the agent for 300s while the others keep polling |
 | `phase_complete` | 0-5 | `{durationSec, links: [{label, url, verified, primary?}], skippedAgents?, erroredAgents?, skipped?, summary}` | Phase finishes. `skipped` is the wipeout marker the app reads to tell "produced nothing" from "was never asked" |
-| `phase_skipped` | 1-5 | `{reason: string}` | Phase disabled in config |
-| `pipeline_paused` | N | `{phase, reason?, agent?, snapshot?}` | Pipeline paused. Reasons actually emitted: `login_required`, `pro_required`, `human_verification_required`, `cua_unavailable`, `google_credential_expired` — and NO reason at all when the user pauses, which is the common case. ⭐ `google_credential_expired` is raised at phase 0, BEFORE the work: the identity that creates the research document is pinned by design (a document lands in one Drive) so nothing can rotate around it, and on 2026-09-03 a revoked grant was discovered at minute 40 of a 40-minute run. Blocker, Retry only — the sign-in is reconnected out of band. ⛔ The value this row used to name for that case is emitted nowhere. ⛔ `agent_link_failed` is reachable only from the orphaned gate, so in practice it never appears either. ⛔⛔ `snapshot` is the app-facing runtime snapshot and is **deliberately smaller than the one on disk** — see Pause snapshot below |
+| `phase_skipped` | 1-5 | `{reason: string, detail?, durationSec?, links?}` | Phase disabled in config — **and, since stretch 6.6C, a Phase 3 that produced no deliverable podcast** (`no_audio_generated` / `audio_generated_but_upload_failed`; see *Phase 3 completes on a podcast* below). ⚠ The app reads `detail` on this event and `summary` only on `phase_complete`, so a sentence meant for the user goes in `detail` or it reaches no surface |
+| `pipeline_paused` | N | `{phase, reason?, agent?, snapshot?}` | Pipeline paused. Reasons actually emitted: `login_required`, `pro_required`, `human_verification_required`, `cua_unavailable`, `google_credential_expired`, `phase_timeout`, `login_interrupt` — and NO reason at all when the user pauses, which is the common case. ⛔⛔ **The last two were missing from this row and the repo's own guard test cannot see them**: `tests/test_doc_matches_code_0903.py::test_the_table_lists_every_reason_that_is_emitted_and_no_others` extracts `request_pause("…")` string literals, not the `reason=` kwarg on the event, and both of these sites call a bare `request_pause()`. Its docstring still asserts that `phase_timeout` is a `pipeline_stopped` reason and that neither pauses anything; `_phase_timeout_decision` emits `pipeline_paused reason="phase_timeout"` one line after `request_pause()`, so the docstring is the thing that is wrong. Read the row against `emit_event("pipeline_paused"` in `research.py`, not against that test. `phase_timeout` is the hard per-phase ceiling gate — four call sites (P1 at `PHASE_1_MAX_MIN`, P2 at `PHASE_2_MAX_MIN`, the P3 upload and the P3 audio sub-step) — and it pauses only to freeze the active-time clock while the user answers Retry/Skip. `login_interrupt` is `run_pipeline`'s failure path recognising that `--login` closed our Chrome on purpose. ⭐ `google_credential_expired` is raised at phase 0, BEFORE the work: the identity that creates the research document is pinned by design (a document lands in one Drive) so nothing can rotate around it, and on 2026-09-03 a revoked grant was discovered at minute 40 of a 40-minute run. Blocker, Retry only — the sign-in is reconnected out of band. ⛔ The value this row used to name for that case is emitted nowhere. ⛔ `agent_link_failed` is reachable only from the orphaned gate, so in practice it never appears either. ⛔⛔ `snapshot` is the app-facing runtime snapshot and is **deliberately smaller than the one on disk** — see the *2026-09-03 (stretch 7.5)* entry at the foot of this file, second bullet (this row used to point at a "Pause snapshot" section that has never existed) |
 | `pipeline_resumed` | N | `{phase: number}` | Resumed from pause |
 | `pipeline_complete` | — | `{summary: string}` | All phases done |
 | `pipeline_stopped` | N | `{phase: number, reason}` | User requested stop OR backend watchdog detected disconnect |
@@ -142,8 +142,8 @@ All events are JSON objects written to `events.jsonl` (one per line) AND mirrore
 | ~~`phase_alert_clear`~~ | — | — | **Frontend-only.** FE clears panels via `clearPhaseAlert(researchId, phase)` on `phase_complete` / `phase_skipped` / pong recovery / user action acknowledgement. Not a wire event. |
 | `heartbeat` | N | `{phase, ts}` | Emitted ~60s during long waits so frontend liveness watchdog stays green |
 | `login_required` | 0-5 | `{platforms: string[], platformLabels: string[], envErrors?: string[], attempt, message}` | **Phase 0 (Apr 19): sequential — fired with `platforms: [key]` scoped to the ONE platform currently being verified, one at a time until all pass. Phases 1-5: cookie-only probe at phase entry fires this with the missing platforms for that phase regardless of `skipInitVerify`.** |
-| `phase_narration` | 1-5 | `{text: string, timestamp: int}` | **Per-phase narrator** — emits one human-readable sentence describing what's happening in the active phase, every ~45s. Fed by a bounded ring buffer (~50 recent events). Warms on `phase_start`, quiet during `pipeline_paused`, tears down on `phase_complete` / `pipeline_stopped`. Frontend stores in `phaseNarrations[researchId][phase]` and renders inside the phase dropdown. **Brain (swapped 2026-05-28):** Gemini 3.5 Flash primary (`gemini-3.5-flash`, env `GEMINI_TEXT_MODEL`) → Anthropic Haiku 4.5 cross-vendor fallback (`claude-haiku-4-5`, env `DG_NARRATOR_HAIKU_MODEL`). *(The U2 cleanup removed the older `/api/narrate` speculative-fallback hook; speculative entries no longer appear.)* |
-| `agent_narration` | 2 | `{agent: string, text: string, timestamp: int}` | **Per-agent narrator** — emits one human-readable sentence per active Phase 2 agent every ~6s. Separate API call per agent because per-agent context changes fast during P1/P2. Frontend stores in `agentNarrations[researchId][agentKey]`, rendered by `AgentAccordionRow` as the canonical narration source. Cleared on phase-2 complete. **Brain (swapped 2026-05-28):** Gemini 3.5 Flash primary (`gemini-3.5-flash`, env `GEMINI_TEXT_MODEL`) → Anthropic Haiku 4.5 cross-vendor fallback (`claude-haiku-4-5`, env `DG_NARRATOR_HAIKU_MODEL`). Narrator input is scrubbed of chat-thread chrome (`You said:` / `Claude responded:` / `Gemini said` / `brief.md` / `Building:`-prefix composites) at `_compact_event_for_narration` (research.py) BEFORE the narrator sees it; scrape outputs (chip / step counts) untouched. |
+| `phase_narration` | 1-5 | `{text: string, timestamp: int}` | **Per-phase narrator** — emits one human-readable sentence describing what's happening in the active phase, every ~45s. Fed by a bounded ring buffer (~50 recent events). Warms on `phase_start`, quiet during `pipeline_paused`, tears down on `phase_complete` / `pipeline_stopped`. Frontend stores in `phaseNarrations[researchId][phase]` and renders inside the phase dropdown. **Brain (swapped 2026-05-28):** Gemini Flash primary (env `GEMINI_TEXT_MODEL`, `gemini-3.8-flash` since 2026-09-17 — a numbered pin, re-read against the live GA list rather than recalled) → Anthropic Haiku 4.5 cross-vendor fallback (`claude-haiku-4-5`, env `DG_NARRATOR_HAIKU_MODEL`). *(The U2 cleanup removed the older `/api/narrate` speculative-fallback hook; speculative entries no longer appear.)* |
+| `agent_narration` | 2 | `{agent: string, text: string, timestamp: int}` | **Per-agent narrator** — emits one human-readable sentence per active Phase 2 agent every ~6s. Separate API call per agent because per-agent context changes fast during P1/P2. Frontend stores in `agentNarrations[researchId][agentKey]`, rendered by `AgentAccordionRow` as the canonical narration source. Cleared on phase-2 complete. **Brain (swapped 2026-05-28):** Gemini Flash primary (env `GEMINI_TEXT_MODEL`, `gemini-3.8-flash` since 2026-09-17 — a numbered pin, re-read against the live GA list rather than recalled) → Anthropic Haiku 4.5 cross-vendor fallback (`claude-haiku-4-5`, env `DG_NARRATOR_HAIKU_MODEL`). Narrator input is scrubbed of chat-thread chrome (`You said:` / `Claude responded:` / `Gemini said` / `brief.md` / `Building:`-prefix composites) at `_compact_event_for_narration` (research.py) BEFORE the narrator sees it; scrape outputs (chip / step counts) untouched. |
 | `tier_transition` | 0-5 | `{op, agent?, hotspot_id?, from_tier, to_tier, reason, attempt}` | **Vision shadow-eval telemetry (Apr 26) + TierEscalation tracking (Apr 28).** Records every escalation between interaction tiers (e.g. DOM→CUA, Vision→CUA). The `attempt` field is the per-(op, agent) counter inside a 30-min sliding window — fed by `TierEscalation.record()` (research.py), centralized via `emit_tier_transition()`. Used by `scripts/vision_shadow_report.py` to compute per-hotspot agreement metrics. Persisted to events.jsonl AND to `logs/vision_shadow.jsonl` when `DG_VISION_TIER=shadow`. |
 | `wrong_artifact_rejected` | 2 | `{agent, op, tier, attempt}` | **Finalize-extraction guard (Apr 26).** Fired when `_is_sources_not_document` rejects a finalize-copy result (extracted content is the source-list panel, not the report). Tier ∈ {cua, dom_html_md, dom_js, dom_panel}. Drives the retry-cap-2 loop on hotspots #2c and #2d. |
 | `extract_failed` | 2 | `{agent, op, attempts, last_tier}` | **Final-failure terminal (Apr 26).** Fired when all retry attempts on hotspots #2c / #2d are exhausted. Pairs with a `pipeline_error` for FE phase-alert routing. |
@@ -161,7 +161,7 @@ All events are JSON objects written to `events.jsonl` (one per line) AND mirrore
 Conflict: last-write-wins on FE; vision narrator + per-agent narrator overlapped; section chips piled up post-completion; Pro 2.5 echoed input verbatim at temp 0.2.
 
 **Post-04-30 — single writer + tail:**
-1. **Per-agent narrator (canonical)** — Gemini 3.5 Flash primary (`gemini-3.5-flash`, env `GEMINI_TEXT_MODEL`), Anthropic Haiku 4.5 cross-vendor fallback (`claude-haiku-4-5`, env `DG_NARRATOR_HAIKU_MODEL`); swapped 2026-05-28. Emits `agent_narration` events. Tighter anti-parrot prompt (research.py) + chrome scrub on input window (research.py).
+1. **Per-agent narrator (canonical)** — Gemini Flash primary (env `GEMINI_TEXT_MODEL`, `gemini-3.8-flash` since 2026-09-17 — a numbered pin, re-read against the live GA list rather than recalled), Anthropic Haiku 4.5 cross-vendor fallback (`claude-haiku-4-5`, env `DG_NARRATOR_HAIKU_MODEL`); swapped 2026-05-28. Emits `agent_narration` events. Tighter anti-parrot prompt (research.py) + chrome scrub on input window (research.py).
 2. **BE phase-fallback tail** — when narrator silent, research.py emits `Extended Thinking active · 12,400 chars drafted` into `progress["progress"]`. FE renders as last-resort tail (`PhaseDropdown.tsx`).
 3. **DOM scrape feeds the input window** — `_compact_event_for_narration` flattens events to `key=value` strings, scrubbed of chat-thread chrome before narrator sees them. Sections and step counts still feed FE chips/strips, but the narrator no longer parrots them back.
 4. **Vision narrator retired** — `narrate.py` `PHASE_BUDGET=0` by default; set `DG_VISION_NARRATE=1` to re-enable.
@@ -196,22 +196,65 @@ Manual-brief mode (Flow A in FE) waits indefinitely for the user to send their o
 - `_BRIEF_WAIT_BACKSTOP_S = 3 * 3600` (research.py). After 3h with no manual brief, `fail_phase` fires + emits `pipeline_stopped` with `reason="manual_brief_wait_backstop_3h"`.
 - FE renders the stopped-by-watchdog status with the same humanized "Manual brief never arrived" message.
 
-## Browser Crash Auto-Retry (2026-04-30 `be8f7b3`)
+## Browser death — two different things under one name (2026-04-30 `be8f7b3`, corrected 2026-08-27)
 
-When 3 sites crash inside the same recovery window:
+⛔⛔ **THIS SECTION DESCRIBED A REBUILD-AND-RESUME THAT DOES NOT HAPPEN AT THE
+SITES THAT EMIT THE BANNER**, and `browser_crash_copy`'s docstring is the
+measurement that retired it: *"Gemini's tab died at 17:21:00 and the phase
+reported COMPLETE at 17:21:06 with 2 of 3 agents. Nothing was rebuilt and
+nothing resumed — the agent was failed and the run carried on."* One sentence was
+covering two failures with opposite outcomes. They are split here.
 
-```
-Browser crash detected (1st site) → log warn, keep going
-Browser crash detected (2nd site) → log warn, keep going
-Browser crash detected (3rd site) → triggers recovery:
-  1. emit_browser_recovery_status(phase, agent) → passive banner on FE
-  2. browser.stop() → browser.start() (T2 restart)
-  3. Bypass run_pipeline.finally retry guard (no Retry/Skip prompt)
-  4. FE shows AgentAlert with auto_clear_on_resume=true flag
-  5. On resume, FE auto-clears the banner
-```
+**A. The whole browser dies and an exception reaches `run_pipeline`** — the
+promise holds, and this is the only case it ever held for. `_is_browser_close_error`
+classifies the exception (the same string set the `navigate()` retry path keys
+on, all CDP-driver strings, so the classification reads identically on every OS)
+and sets `last_failure_kind="browser_crash"`. `_plan_pipeline_auto_retry` is then
+the single source of truth for what happens next, and it is called twice with
+identical inputs — once inside the `except` to decide whether to **suppress** the
+user-facing card, once after the `finally` to actually recurse — so the two can
+never disagree. A crash bypasses the one-shot gate a normal failure gets and is
+capped at `BROWSER_CRASH_MAX_RETRIES` (2) consecutive **silent** retries, i.e.
+three browser launches before a human is involved. Terminal or intentional states
+never auto-retry: `delivery.json` status in `completed` / `stopped` / `paused`, a
+`.stop` or `.pause` sentinel, or a `--login` in flight. Phases 0-4 are eligible for
+a crash (a phase-0/1 crash was excluded by the legacy `1 < phase` gate — that was
+the #725 bug); a normal one-shot retry keeps the conservative 2-4 window.
 
-No human prompt; the previous behavior of pausing for Retry/Skip blocked recovery.
+**B. One agent's tab dies inside the Phase 2 round-robin** — nothing is rebuilt
+and nothing resumes. The per-tick crash sweep runs before any per-agent work,
+tests each pending agent's page for `is_closed()`, and for a dead one writes
+`results[agent] = {"status": "browser_crashed", …}`, calls `_disarm_registry` (a
+crash emits no resolve-seam signal, so a stale armed deadline would auto-skip a
+healthy same-key agent on the next run in this long-lived worker), drops the agent
+from `pending` and continues. The rotation is not starved and the other two keep
+polling. Two cases are taken out before that: a tab **we** closed on a user Skip
+is not a crash, and a `--login` in flight raises instead, so the whole run unwinds
+to its checkpoint rather than failing agents one at a time into a phantom
+"PHASE 2 COMPLETE: 0/3".
+
+**What the person is told, wherever a banner fires at all** — three call sites: the
+two poll loops and the P2 crash sweep — is `emit_browser_recovery_status` →
+a dismissible `pipeline_warning` with no actions and `auto_clear_on_resume=true`.
+⛔ In case A, when a silent retry is planned, the card is **suppressed** and the
+only trace is a log line; the silent-self-heal rule is that Retry/Skip appears only
+once the auto-retries are exhausted.
+Its copy comes from the pure `browser_crash_copy` and **reports only what was
+observed** — on the platform's own page, for this long, re-checked this many
+times — and names no cause, because a platform stall and our own scrapers going
+blind are genuinely indistinguishable from here: `<Agent> stopped responding …
+Nothing on your side caused this; the run continued without it.` ⚠ `quiet_sec` is
+a **floor, not an age**: an arbiter WORKING verdict rewinds the growth clock up to
+`_ARBITER_MAX_WORKING_RESETS` times, so the true silence can be longer than what we
+hold, never shorter — hence "at least". ⛔ The clocks are read off the pending entry
+**before** it is deleted, because a crash calls no `fail_agent`, nothing persists
+"errored", and the exit sweep never sees that agent at all. ⛔ The banner is
+suppressed entirely while `--login` is active: no auto-retry is coming, so
+"auto-retrying" would be both wrong and alarming, and `run_pipeline`'s failure path
+emits the honest login-interrupt card instead.
+
+No human prompt in either case; the previous behavior of pausing for Retry/Skip
+blocked recovery.
 
 ## Phase 2 Agent Timeout — Auto-Skip (2026-04-30 `be8f7b3`)
 
@@ -249,7 +292,19 @@ Prevents soft-retrying a corpse forever — soft-retry on a dead page just re-fa
 
 ## NotebookLM Upload Filter (2026-04-30 `70e2ab2`)
 
-`_DERIVED_STEMS = {"brief", "consolidated"}` (research.py). Phase 3 NotebookLM upload now skips files whose stem matches `_DERIVED_STEMS` — never uploads `consolidated.md` (a P2 byproduct of claude+gemini concatenation, used for the Documents page only) or `brief.md` (Phase 1 input, already implicit in the agent reports). Pre-fix, the scan-fallback loop picked these up as duplicate sources.
+`_DERIVED_STEMS = {"brief", "consolidated"}` (research.py). Phase 3 NotebookLM upload skips files whose stem matches `_DERIVED_STEMS` — never uploads `consolidated.md` (a P2 byproduct of claude+gemini concatenation) or `brief.md` (Phase 1 input, already implicit in the agent reports). Pre-fix, the scan-fallback loop picked these up as duplicate sources.
+
+⛔ **2026-09-18, wave 10 — `consolidated.md` no longer reaches disk at all**, and
+the exclusions stay anyway because runs made before that day still carry the
+file. The stacked document was one H1 plus each agent's report verbatim, with no
+reader of its own left: the app synthesises the real combined document at P5 from
+**the three per-agent reports**, never from the stack. ⛔⛔ The **Firestore
+mirror** of the `consolidated` doc type is pinned PRESENT on purpose — the app's
+P5 Summary document reads it as its only source and refuses without it, and on
+both P5 legs the summary runs BEFORE the synthesis, so deleting the mirror today
+would cost every run its Summary silently. The merged text also still reaches its
+two in-memory readers (the post-P2 summary refresh and the title refresh), which
+is why the BUILD outlived the write.
 
 ## NotebookLM Strict-Keep Cleanup (`a52bd7b`, `2a93af0`)
 
@@ -260,6 +315,39 @@ Phase 3 used to lean on a "cleanup-by-delete" pass after audio generation — sw
 - **Post-completion strict-keep** — once the audio is fully rendered, the cleanup pass deletes any cards that are NOT the Long + Deep-Dive entry, while ALWAYS preserving the Long + Deep-Dive one. The keep-list is the contract; deletions are derived from "everything else", not from a denylist of known-bad shapes. This makes the cleanup robust to NLM UI changes that introduce new card variants.
 
 Within the same flow, the audio-generate prompt itself was tightened (`98bd631`) to keep CUA's click target on the generate button rather than wandering onto the surrounding tile body — a class of misclicks that, pre-fix, occasionally created a second card the strict-keep pass then had to clean up.
+
+## Phase 3 completes on a podcast (stretch 6.6C, 2026-08-28)
+
+⛔⛔ **"`phase_complete:3`, therefore there is a podcast" was a coincidence, not a
+rule.** The emit was gated purely on the ABSENCE of four skip flags — a login
+pause, a stop, a Skip on the link card, a Skip on the upload-timeout card — and
+not one of them read the audio. The app states the invariant in prose and fires
+its "Podcast ready" notice off the event, so a run whose bytes never reached
+Storage produced a green tile and a notice, while FE-P4 read `links.audio_file`,
+found nothing, and skipped the video in silence. Completion and delivery
+disagreed about the same run.
+
+The gate now says it out loud: the phase completes when nothing skipped it **and
+the Storage upload returned a URL** — the downloaded-and-uploaded podcast, not a
+link. Otherwise it emits `phase_skipped phase=3` naming which of the two failed:
+
+| reason | what happened | what the user is told |
+|---|---|---|
+| `no_audio_generated` | NotebookLM produced no audio overview | the notebook was created, there is no podcast |
+| `audio_generated_but_upload_failed` | the file exists locally, the Storage upload did not land | the podcast **is still on the research computer** |
+
+Those are different states with different repairs, which is why one reason
+would have been worse than none. The sentence rides `detail`, not `summary` —
+the app reads `summary` only on `phase_complete`.
+
+⛔ **The "Audio Overview" link row went in the same round, and it was already
+dead.** `audio_overview_url` is empty for the whole of the ordinary run path
+(its only other writer is the mutually-exclusive Flow-C hydration of a link the
+user pasted), so the append could never fire while its comment still explained
+how the app would render it. The app injects that row itself from the playable
+Storage file. ⛔ What did NOT change: the notebook URL is still the navigation
+target for the audio step, so the loop that recovers it stays — what stopped
+being true is that a link decides whether the phase succeeded.
 
 ## Auto-Retry Kwarg Forwarding (2026-04-30 `549f079`)
 
@@ -276,6 +364,143 @@ return await run_pipeline(
 ```
 
 (research.py). Pre-fix, the recursive call dropped `uid/research_id/run_id`, severing the Firestore listener mid-retry. FE saw the run flatline despite BE still running.
+
+## The topic guard — a guard at the sink, not at the producer
+
+⛔⛔ **This is what stops 121 KB about golden retrievers being written to
+`documents/chatgpt.md`, reported `status=done`, and handed to NotebookLM as source
+3-of-3** — which is exactly what the 2026-08-05 e2e shipped. The check existed; it
+lived at ONE call site inside `extract_and_record_agent`, which is the path a
+**healthy** agent takes. Two other paths reach the same files and neither went
+through it: the user-Skip branch calls the extractor directly and drops the raw
+string into `results[name]["text"]`, and the Phase-2 finalize re-save loop writes
+every `results[name]["text"]` to `documents/<agent>.md` and Firestore. Only the
+title guard objected, four seconds after the upload had been queued.
+
+⭐ **A guard on the producer is a guard on the producers you remembered; a guard on
+the sink covers the ones you did not.** `reject_off_topic_text(text, queue_dir,
+label, agent_key, op=…)` returns the text, or `""` if it is demonstrably not about
+this run's topic, and **every path that fills a `text` destined for disk calls it**.
+
+⚠ **Everything uncertain passes** — the asymmetry is deliberate, because firing can
+cost a whole leg. `text_is_off_topic` does the deciding and ABSTAINS on: no
+`queue_dir`, an unreadable topic, fewer than `_TOPIC_GUARD_MIN_ANCHORS` (3)
+distinctive words in the topic, or a document under `_TOPIC_GUARD_MIN_CHARS`
+(20,000). It fires only on the shape with no innocent explanation.
+
+## Document images (wave 4, 2026-09-13)
+
+⛔⛔ **Every image in an extracted document used to be deleted, and the two
+halves failed differently.** `html_to_markdown` was called with `strip=['img', …]`,
+so every HTML capture route dropped each image AND its alt text — Gemini's first
+choice, Claude chat mode, Claude research's panel scrape, and the ChatGPT
+brief's only route. The routes that save a platform's own markdown (a download,
+a copy button) kept `![alt](url)` pointing at the platform's servers, often
+signed and short-lived, and nothing ever fetched a byte.
+
+**The shape.** The converter keeps image tags (decorative ones — favicon
+services, or a width/height at or under 32px — are dropped). Before a document
+is written anywhere, `_rehost_document_images` fetches each image **once per
+research**, hands the bytes to the web app (`POST /api/document-images`, the
+machine's own device token), and rewrites the destination to the reference the
+web **returned**: `/document-images/{researchId}/{sha256}.{ext}`. Anything not
+kept, for any reason, becomes `![alt]()` — or disappears when it has no alt. The
+contract lives in dg-research `src/lib/document-images.ts`; the regexes and
+raster rules here mirror it exactly (`\A…\Z`, not `^…$`, because Python's `$`
+also matches before a trailing newline and the web's anchored JS regex does not).
+
+⚠ **Every length check upstream of the rehost had to learn to discount image
+destinations, and `_doc_img_prose_len` is how.** The capture floors and Claude's
+30% length-sanity check run BEFORE the rehost shrinks a URL to a reference or a
+caption, and a signed platform URL runs to hundreds of characters — so three chart
+URLs lifted a 4,000-character **wrong** artifact past the sanity check, and a sparse
+container past its floor. Before wave 4 those checks saw no image markup at all
+(`strip=['img']`). The helper is `len(text)` with each inline image's destination
+left out and the **alt kept**, because alt text is a caption a reader sees; it never
+changes the text, and its only readers are the HTML→MD floors and
+`extract_and_record_agent`'s length-sanity.
+
+It is **the** funnel, and it is idempotent — a reference to this research is left
+alone, so a second pass costs no fetch. Call sites: `extract_and_record_agent`
+(after the topic guard, so an off-topic document's images are never fetched, and
+before the first write, so the local `.md`, the Firestore document and the
+consolidated report all carry references), `_rehost_result_texts` for salvaged
+partials and resumes, and `_rehost_skipped_brief` plus the Phase 1 brief sites.
+
+⛔⛔ **THE FETCH IS THE RISK, because the URL comes from text a platform
+produced** — and the prompt behind that text may have been written by somebody
+the owner shared the machine with. So: https only; a session with `trust_env`
+off, no cookies, no auth and no product name in the User-Agent; the address
+checked public when the URL is checked, **again for each address the connect
+resolves, before a socket is made for it** (DNS rebinding — the second lookup
+may answer a LAN host), and the connected peer checked a third time after the
+handshake, before TLS and before a byte of the request is written; redirects
+followed by hand and re-checked; a hard byte cap; a magic-byte sniff with a
+minimum pixel size; never SVG. ⛔ No image URL, alt text or document text is
+ever logged — run logs are declared to hold no topic, so what a document's
+images produce is one counts-only line: `found · stored · reused · dropped ·
+refused · login · failed · linked · captioned · removed`.
+
+**`_DocImgDeadline` — one image's whole clock, and why a timer.** A socket
+timeout bounds ONE receive, and a buffered read keeps receiving until it has its
+64 KB: a server sending a byte every nine seconds never trips it, in the headers
+or the body, and the thread was held while the hard stop outside could only stop
+waiting for it. So the deadline cuts every connection the image opened. It
+watches a **dup** of each socket, because TLS detaches the socket urllib3
+connected and the cut has to act on the connection rather than one descriptor.
+
+> ⛔⛔ **`shutdown` DOES NOT END A BLOCKED READ ON WINDOWS — and does not fail
+> either.** It returns success and does nothing, so the `except OSError` never
+> fired and `expire()` was a silent no-op on the platform the research computer
+> actually runs. Measured 2026-09-18 through the shipped paths: a fetch with a
+> 1.0s deadline ended at 10.008s (the socket read timeout — the bound this class
+> exists to replace), and an upload whose guard ended at 1.0s ended at 30.012s,
+> some 28s past the hard stop the upload margin protects. ⭐ What lands is an
+> **abortive close**: `SO_LINGER {on, 0}` makes `close` send RST instead of FIN
+> and the blocked read wakes. ⛔ **Order is load-bearing** — calling `shutdown`
+> first defeats it and the read goes back to sitting out its full timeout, so on
+> Windows the abort is *instead of* `shutdown`, not in addition to it. POSIX
+> keeps `shutdown`: it already ends the read and leaves the peer a clean FIN.
+
+**The budgets, outermost first.** A document gets `_DOC_IMG_DOC_BUDGET_SEC`
+(120s) of fetching; one image gets at most `_DOC_IMG_PER_IMAGE_SEC` (30s) of
+that; the caller's hard stop is the document budget plus a 30s grace. An upload
+is the tail of an image already fetched, so it lives in that grace: its whole
+request must end `_DOC_IMG_UPLOAD_MARGIN_SEC` before the hard stop, and it is
+not started with less than `_DOC_IMG_UPLOAD_MIN_SEC` of that left. ⛔ The caller
+waits — the round-robin's polling of the other agents stalls for up to the hard
+stop per document.
+
+**What is remembered, and what deliberately is not.** The cache is per research,
+keyed by URL (or `data:` + a digest of the data URI) and bounded both ways. A
+refusal IS remembered for the whole research — but two verdicts are not, and
+each was a real defect:
+
+- ⭐ **The clock is not a refusal (wave 9).** A fetch cut off while the image was
+  still being read, ending at or after the DOCUMENT's deadline, is this
+  document's spent budget rather than anything about the image. It is counted
+  `failed` and never cached, so the next document — a fresh budget — tries again.
+  Cached, a chart that happened to start with three seconds left was a caption in
+  every later document.
+- ⭐ **A moment's failure at the web app is not a verdict.** An upload that never
+  started (the run stopped, too little time left) or that the web failed for the
+  moment (a 5xx, no answer at all, the guard's cut) returns a never-remembered
+  miss. A one-off 503 used to be cached as a failed image for the rest of the run.
+
+**Stop is not exit.** `_doc_img_exit_coming()` reads `_exit_scheduled`, set only
+inside `_schedule_server_exit` — the one condition under which a document is
+written without waiting on its images. ⛔⛔ NOT the stop flag: the 24-hour pause
+limit, a cancel landing in a gate wait and a foreground hard reset all set a
+Stop and exit nothing, the run goes on to finalize, and treating that as an exit
+wrote every not-yet-stored image as a caption **for good** — a caption can never
+become an image again, because the source address is gone from the text.
+Whatever ends the wait, the run is marked stopped **before** the fallback pass
+reads the cache, so an abandoned rehost stores nothing and remembers nothing.
+
+⭐ **Why this lives in `research.py` and not a module of its own** (see *Module
+boundaries*): it needs `log`, the per-run uid / research id and the token
+minting, all of which live there — and a new module has to be added to BOTH
+`py-modules` and `TOP_MODULES`, where a miss ships readable source.
 
 ## Phase 5 — FE-owned
 
@@ -337,22 +562,31 @@ move has no behavioural change to assert on, so the suite cannot tell a correct
 split from a subtly wrong one. Real verification is a live run of roughly an hour
 against paid third-party services.
 
-**⚠ The honest counterweight, measured 2026-08-25 rather than recalled.**
+**⚠ The honest counterweight, measured 2026-09-19 rather than recalled.**
 
 | | lines |
 |---|---|
 | `research.py` when DGOPS-9506 was filed (2026-07-28) | 54,626 |
 | at the will-not-do decision (2026-08-05) | ~58,800 |
 | at 2026-08-25 | 75,965 |
-| **today (2026-08-28)** | **74,663** |
-| the seven sibling modules, between them | 7,119 |
+| at 2026-08-28, after the share step came out | 74,663 |
+| **today (2026-09-19)** | **83,374** |
+| the seven sibling modules, between them | 7,077 |
 
-So the file has grown by roughly **27%** in the twenty-three days since the
-decision, and holds **91%** of the non-test Python in this repo. An unbounded
-trajectory is a real objection and none of the reasoning above answers it.
+So the file has grown by roughly **42%** in the forty-five days since the
+decision, and holds **88%** of the non-test Python outside `agent/` (the figure
+this row carried before named no denominator; counting the agent package's own
+sources it is 71%, and the number only means something with the boundary
+stated). An unbounded trajectory is a real objection and none of the reasoning
+above answers it.
 
-⭐ **The first fall on record: −1,302 lines on 2026-08-28**, when stretch 6.6B
-removed the P2 platform share step. It is worth writing down because it is the
+⭐ **The only fall on record is the step between the 2026-08-25 and 2026-08-28
+rows above, −1,302 lines**, over the days stretch 6.6B removed the P2 platform
+share step. ⛔ Read it as what it is: subtraction between two rows measured three
+days apart, so it is the NET of everything that landed in that window — additions
+included — and not a measurement of the removal. The growth table itself was
+re-measured on 2026-09-19; this figure is still derived from it and nobody has
+re-counted the commit. It is worth writing down because it is the
 only evidence in this table that the trajectory is not one-directional — and
 because of what it took to get: 2.2 minutes and 21.7 CUA calls per run bought a
 link nothing in the pipeline gated on. The lines came out because the FEATURE
@@ -447,6 +681,86 @@ the bytes the assertions compare against.
 The frontend half — owner-only gating, modern-device gating, the consent copy, the
 support code, and the bucket lifecycle runbook — lives in the app repo's
 `ARCHITECTURE.md` under "Support logs".
+
+### Whose runs a bundle may carry (2026-09-01)
+
+Only the person who fired a run knows it went wrong, and the picker used to list
+the devices you OWN — so a sharer saw an empty list and a disabled button and
+could not report a broken run at all. **Owner-versus-sharer was the wrong axis;
+the run is.** Everyone picks from their own runs on a machine, and what rides
+along is decided at the sink rather than by the request.
+
+⛔⛔ **Attribution was reading the field the rules do not guard.** A start
+document carries `uid` (the tree the run executes in) and `submittedBy` (the
+writer); `firestore.rules` pins `submittedBy == request.auth.uid` on the device
+queue and says nothing about `uid`. Once that stamp decides whose support bundle
+may carry a run it is a permission, and a permission may not rest on an unpinned
+field. `_resolve_run_submitter` therefore grants attribution only when the two
+**agree**, and records which kind of nothing a null is — `local` (no cloud
+identity: a `--resume` or CLI topic run), `unclaimed` (a tree, no pinned writer —
+every run written by a build older than this one), `disputed` (both present and
+different; the owner-control path writes exactly that divergence on a `cancel`,
+so it is a real shape and it fails closed). A start doc whose two identities
+disagree is refused **at both claim sites**, because the idle rescan would
+otherwise turn the listener's refusal into a delay.
+
+The bundle intersects the selection against what the machine actually holds and
+fails closed on a run it cannot attribute. ⚠ The machine-level material —
+pairing and sign-in sessions, the raw device tails — is the owner's and is
+opt-in even for them: measured on one machine, those tails carry eighteen
+research ids and fifteen topics against five run folders on disk, so they are
+not a bigger version of the runs, they are everything that computer has ever
+done for everyone who uses it. A bundle with nothing in it is refused rather
+than uploaded, because a support code that explains nothing is worse than a
+refusal.
+
+The machine publishes which runs it still holds, **per submitter, into that
+person's own tree** (`_publish_run_log_index`, off the heartbeat). Ids only —
+there is no topic or title anywhere in a run folder to publish, which is the
+same reason the folder name has never carried one. The terminal half is
+`--send-logs --select`: a numbered list of what is on the disk, taking `1,3` or
+`all` or nothing; ⛔ a RANGE is refused rather than read, since somebody who
+meant one and three and typed a dash would otherwise send two.
+
+⛔⛔ **The cloud's half of a run is pulled DOWN to the disk.** P4 and P5 execute
+in the cloud, so everything they print has always been in a platform log nobody
+cutting a bundle can reach — measured across six run folders, the P4/P5 dispatch
+string appears zero times in them against 23 in the machine-wide log. The
+collector never reads Firestore (it is disk-only and allow-listed under the log
+root), so `_pull_cloud_logs` lands those lines as a FILE inside the finished run
+folder, where the existing walk ships them with no collector change and no edit
+to the bundle contract. ⚠ It writes into a sealed folder on purpose: the folder
+is finalized within milliseconds of the pipeline returning while P4/P5 run for
+minutes afterwards, so there is no version of this that lands before the seal.
+
+### Retention — thirty days, with a clock (2026-09-01)
+
+⛔⛔ **The 30-day bound had no trigger of its own.** `_prune_local_logs` had
+exactly two callers — arming a run and supervisor startup — so the age bound
+only ever fired as a side effect of the machine being USED: a device up and idle
+kept 45-day-old folders, and one that never ran another pipeline kept them until
+its next restart, which on a long-lived install is never. It now also runs from
+the heartbeat, six-hourly, worker-1 only, in a thread, and it starts DUE so a
+machine coming back after two months cleans up on the way in.
+
+⛔ **The count bound was being read as the policy.** 60 runs and 30 days are
+joined by `or`, so on a busy machine the run half of a person's diagnostics died
+in days while the cloud half lived its full thirty. The counts stay — an
+unbounded directory on a laptop is a real hazard — and are named
+`LOCAL_RUNS_DISK_VALVE` / `LOCAL_SESSIONS_DISK_VALVE` for what they are;
+`LOCAL_LOG_MAX_AGE_DAYS` is the policy.
+
+⛔ **The raw tails had no age bound at all** — only `RAW_LOG_ROTATE_BYTES`,
+checked at three events and never on a clock. Their two halves are enforced in
+different places on purpose: a rolled `.1` is safe to remove from a timer, while
+the LIVE file is held open in append mode by the supervisor, so renaming it from
+a background tick would strand every later write in an unnamed inode. The live
+half therefore rolls at the three points the file is reopened anyway. ⚠ The
+promise is stated rather than papered over: *no rolled tail outlives thirty
+days, and no live tail outlives it across a restart* — not "no line anywhere is
+ever older", which would mean truncating a file somebody is appending to.
+⛔ Age cannot be read from mtime (it moves on every append, so a file holding
+May survives to September looking new); a `.since` marker records it.
 
 ## Package distribution + supply chain
 
@@ -604,12 +918,27 @@ Stored in `{queue_dir}/config.json`:
 
 ## API Endpoints
 
+> ⛔⛔ **LOOPBACK ONLY, SINCE 2026-09-05 — and it is exposure reduction, not
+> authentication.** `uvicorn` binds `127.0.0.1`, and CORS allows only
+> `http://localhost:{port}` / `http://127.0.0.1:{port}`. Before that it bound
+> `0.0.0.0` with `allow_origins=["*"]` and no authentication of any kind, so
+> anything on the same network — a coffee-shop wifi, an office LAN, a shared
+> house — could list every run on the machine **for every account that shares
+> it**, read the brief / the agent markdown / the podcast, start a run (`POST
+> /api/runs` takes `uid` from the request body), or stop somebody else's.
+> ⭐ Nothing broke, because nothing had ever used the network: the web app
+> reaches the machine through Firestore and contains zero references to this
+> API, the health probe asks `http://localhost:{port}`, and the `--serve`
+> banner advertises the same. ⚠ A process or a page **on this machine** still
+> reaches every route unauthenticated; a token is the real answer and is a
+> bigger change.
+
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/api/runs` | Start new pipeline `{topic, email?, config?}` → `{id, status}` |
 | GET | `/api/runs` | List all runs |
 | GET | `/api/runs/{id}` | Get run details (meta, checkpoint, delivery) |
-| GET | `/api/runs/{id}/documents/{type}` | Get document content (brief/chatgpt/gemini/claude/consolidated) |
+| GET | `/api/runs/{id}/documents/{type}` | Get document content (brief/chatgpt/gemini/claude). ⛔ `consolidated` was retired here on 2026-09-18 (wave 10): this route reads the run folder and nothing else (`documents/{type}.md`, with a legacy sibling fallback), and the stacked document no longer reaches disk — it survives only as a Firestore mirror, so the route 404s it for every run made since. See *NotebookLM Upload Filter* |
 | GET | `/api/runs/{id}/audio/{filename}` | Stream audio file |
 | POST | `/api/runs/{id}/stop` | Stop pipeline |
 | POST | `/api/runs/{id}/pause` | Pause pipeline |
@@ -639,7 +968,7 @@ Frontend writes commands to `users/{uid}/research_commands/{researchId}` (or equ
 |  |  | • **Paused** — on resume, `peek_extra_context()` sets `restart_requested=True`, current phase reruns with combined topic/brief (up to 3× per phase) |
 | `agent_decision` | `{agent, decision: "retry" \| "skip" \| "stop" \| "continue_chat"}` | Response to the agent's failure card. **Retry** nudges the agent and resumes polling — it does not loop back to extraction, there is none. **Skip** salvages whatever partial text exists and closes the tab; it records no URL. **Stop** terminates. `continue_chat` is a fourth value the dispatcher accepts and this row omitted |
 | `continue_anyway` | `{phase?}` | Frontend response to a `phase_alert` that exposed `continue_anyway` (e.g. brief-short). Backend `_controls.set_continue_anyway()` fires; orchestrator accepts the short/partial output and advances |
-| `skip_phase` | `{phase}` | Frontend's default Skip action on every `phase_alert`. Backend's phase coroutine consumes the request and advances past the failing step. For Phase 4, this replaces the old `skip_phase` verb (removed U2); Phase 5 likewise replaces `skip_phase`. `_controls.skip_phase` / `skip_phase` flags remain as internal-only state read by Phase 4/5 polling logic, but no FE command toggles them anymore |
+| `skip_phase` | `{phase}` | Frontend's default Skip action on every `phase_alert`. Backend's phase coroutine consumes the request and advances past the failing step. Phase 4 and Phase 5 come through this same unified verb; each used to have its own per-phase Skip verb and both were removed in U2. ⛔ **This sentence used to "name" those two verbs and named `skip_phase` for both**, so it said nothing — an over-eager rename, and the original names are gone from the tree, so they are not recoverable from code and are left unnamed rather than guessed. The internal `_controls` flags Phase 4/5 polling reads remain, but no FE command toggles them anymore |
 | `feedback` | `{phase, message}` | User feedback injection. Stored per-phase, injected into next phase rerun |
 | `retry_phase` | `{phase}` | Frontend response to a phase-level warning (brief-short, brief-timeout, NotebookLM failure, audio timeout, Phase 3 gate). Backend's phase coroutine polls `consume_retry_phase(N)` + loops back to restart |
 | `retry_agent` | `{agent}` | Frontend response to a Phase 2 agent warning (timeout, empty-final, send-fallback, session-expiry). Phase 2 polling consumes + submits a follow-up prompt via `paste_followup` |
@@ -655,16 +984,41 @@ Frontend writes commands to `users/{uid}/research_commands/{researchId}` (or equ
 
 **Device-scoped commands** (written to `devices/{deviceId}/commands/` instead of the per-research path; every worker on the device subscribes independently):
 
+> ⛔⛔ **EVERY ROW BELOW PASSES THROUGH ONE CLOCK-SKEW GATE, `_is_stale_replay`,
+> and until stretch 7 that gate was written twice.** Firestore replays every
+> pre-existing doc as ADDED in the first callback after attach, so only docs in
+> that first snapshot can be a previous session's leftovers; a doc arriving later
+> is something that just happened and **can never be stale**. The per-research
+> listener had that `is_first_snapshot` guard; the device listener — the one every
+> Settings button talks to — did not, and applied the age check to LIVE commands.
+> `timestamp` on those docs is written by the **browser**, so a research computer
+> whose clock ran even ~30s ahead (`STALE_COMMAND_AGE_MS`) silently discarded
+> Update, check-update, Restart, Hard Reset, Clear logs and all three send-logs
+> actions, forever, and left no trace — the `[device-cmds] received action=` line
+> sits *after* the skip. One function now, because two copies of a safety gate is
+> one copy that gets fixed. ⛔ A bool is not a timestamp: `isinstance(True, int)`
+> is True in Python, so `{"timestamp": True}` passed the original numeric check
+> and was then subtracted from the clock, making a live command look 1.7e12 ms
+> old. ⛔ A **failed device read refuses** on the owner-checked rows rather than
+> falling through — `update` and `restart` both log `device read failed … —
+> refusing` — and on the send-logs family every refusing guard also writes a
+> refusal row (`_refuse_log_bundle_with_row`), because worker 1 deletes the
+> command before dispatch and a silent return is indistinguishable from a build
+> too old to understand the request.
+
 | Action | Body | Behavior |
 |--------|------|----------|
 | `hard_reset` | — | Drains in-flight pipeline on every worker, sweeps stale queue + share + research artifacts across owner + every sharer's Firestore tree, clears local browser-profile state, schedules `os._exit(0)` so the daemon-loop respawns clean. Fired by Settings → Manage devices → Hard Reset AND by the Reset Pair Code path (before refresh-token revoke) so all N workers tear down before the token death. Commits `f744913` + `ab119b2`. |
 | `clear_local_storage` | — | Wipes BE-local checkpoint + completed-run + browser-profile caches. Does NOT touch Firestore-side researches. Fired by Settings → Manage devices → Clear local data. |
 | `update` | `{force?}` | **Owner-only, worker-1.** App-driven remote backend update via `_perform_self_update` (the same idempotent core as `superresearch --update`). Owner-check (`submittedBy == ownerUid`) + supervised-check + mid-run defer (unless `force`, which stops the active run first, keeping partial results). Writes `updateStatus` to the device doc; success is observed via the heartbeat `version` bumping after the pipx rebuild + respawn. Fired by Settings → About → Update. |
 | `check-update` | — | **Owner-only, worker-1.** Forces a fresh PyPI check and republishes `version` / `updateAvailable` / `versionCheckedAt` so the About row's inline Check control resolves. No restart. |
+| `restart` | — | **Owner-only, worker-1.** The narrow "finish the update" action for an upgrade whose files landed but whose restart leg didn't (`updateStatus.needsRestart`): cycles worker 1 so the supervisor respawns it from the rebuilt venv and the app sees the new version. Deliberately NOT `hard_reset` — it refuses while a run is in progress rather than destroying it. ⛔ The owner check is defence in depth and was missing until 2026-08-05: the rule lets any device member create a command with their own `submittedBy`, so a sharer could cycle the owner's backend while the sibling `update` refused them. A device read that FAILS refuses too. |
+| `clear-logs` | — | **Owner-only (by the default-closed command rule, not a check here), worker-1.** Settings → Manage Data → Clear logs, the LOCAL half: run folders, session logs, raw tails, local bundles, telemetry spool. The app deletes this device's cloud bundles itself — the two halves are reported separately and neither pretends to be the other. |
+| `send-logs` · `send-logs-limited` · `send-logs-selected` | `{code, requestId, submittedBy, runs? (limited), runNames? (selected), includeMachine?}` | Build a support bundle and upload it under a support code. **Three action NAMES, not one action with a field** — a build one release behind ignores an unknown field and would collect the newest thirty against a request for two, so the skew has to fail as "nothing left the machine" rather than as over-collection. The names come from `bundle-contract.json`, pinned byte-identical in both repos (the installed wheel packs no `.json`, so `BUNDLE_CONTRACT_FALLBACK` is what every field build actually reads). `send-logs-selected` is the one a **sharer** may fire: what it contains is decided at the sink, never by the request — the runs attributed to that submitter and nothing else, with the machine-level material (pairing and sign-in sessions, the raw device tails) owner-only AND opt-in. Every guard that can refuse writes a refusal row, because worker 1 deletes the command before dispatch and a bare return is indistinguishable from a build too old to understand the request. |
 
-> **App-driven backend update + source-checkout.** On every heartbeat worker-1 publishes `version`, `updateAvailable`, `updateStatus`, `versionCheckedAt`, and `sourceCheckout` to `devices/{deviceId}`; the app's Settings → About shows a real-time BE version **per owned device** with an inline Check → Update control (no popups; sharers / no-device users see no version row). A source-tree BE (`git clone` + `python research.py`) sets `sourceCheckout:true` — gated on the authoritative PATH probe `_is_source_checkout()`, NOT the version string (an editable install still reports a real version) — so the About row reads "Source checkout · update with `git pull`" with no Check button; only a pipx build is app-updatable.
+> **App-driven backend update + source-checkout.** Worker-1 publishes `version`, `updateAvailable`, `updateStatus`, `versionCheckedAt`, and `sourceCheckout` to `devices/{deviceId}` from the heartbeat loop — ⛔ **decoupled from the liveness write and best-effort by design**, throttled to ~5 min and written only when a value changed: these fields are a SEPARATE allow-list entry, so a 403 from rules that have not been deployed yet must not flip the device offline; the app's Settings → About shows a real-time BE version **per owned device** with an inline Check → Update control (no popups; sharers / no-device users see no version row). A source-tree BE (`git clone` + `python research.py`) sets `sourceCheckout:true` — gated on the authoritative PATH probe `_is_source_checkout()`, NOT the version string (an editable install still reports a real version) — so the About row reads "Source checkout · update with `git pull`" with no Check button; only a pipx build is app-updatable.
 
-> **Dispatcher resume-contract (2026-05-18)**: every action that acknowledges a paused alert MUST call `_controls.request_resume()` so the pipeline doesn't stay paused after the user clicks the action button. The per-action helpers (`request_skip_agent`, `request_retry_agent`, `set_continue_anyway`, etc.) already clear `pause_event` + set `resume_event`; the dispatcher's explicit `request_resume()` ALSO clears `pause_reason` + `pause_target_agent` — a state-leak class that previously kept FE rendering "paused" even after Retry. The 8 actions covered: `skip_init_verify`, `retry_init_verify`, `skip_agent`, `retry_agent`, `continue_partial_agent`, `poke_agent`, `wait_longer_agent`, `continue_anyway`. Plus the 5 already-correct ones (`pause`, `resume`, `skip_phase`, `retry_phase`, `agent_decision`). Plus 8 intentionally-not-resumed actions (`pause`, `stop`, `discard_run`, `ping`, `add_context`, `config`, `dismiss_alert`). Static-analysis test `tests/test_dispatcher_resume_contract.py` (4 cases) enforces the contract — adding a new resume-required action without wiring `request_resume` fails CI.
+> **Dispatcher resume-contract (2026-05-18)**: every action that acknowledges a paused alert MUST call `_controls.request_resume()` so the pipeline doesn't stay paused after the user clicks the action button. The per-action helpers (`request_skip_agent`, `request_retry_agent`, `set_continue_anyway`, etc.) already clear `pause_event` + set `resume_event`; the dispatcher's explicit `request_resume()` ALSO clears `pause_reason` + `pause_target_agent` — a state-leak class that previously kept FE rendering "paused" even after Retry. The 8 actions the fix covered: `skip_init_verify`, `retry_init_verify`, `skip_agent`, `retry_agent`, `continue_partial_agent`, `poke_agent`, `wait_longer_agent`, `continue_anyway`. Plus the already-correct ones — `resume`, `skip_phase`, `retry_phase`, `agent_decision`; those last three join the 8 in the test's `REQUIRED_RESUME_ACTIONS` list, 11 names in all. ⛔ **The tallies in this line were wrong in both directions and are corrected 2026-09-19:** `pause` was counted twice, once as "already correct", and the intentionally-not-resumed group was labelled 8 while listing 7. It is seven, and `pause` is one of them — `pause`, `stop`, `discard_run`, `ping`, `add_context`, `config`, `dismiss_alert`. Static-analysis test `tests/test_dispatcher_resume_contract.py` enforces the contract — adding a new resume-required action without wiring `request_resume` fails CI.
 
 > **CLI dispatcher pause-reason routing (DGOPS-7710 / F6 + 3 follow-ups)** — same root pattern surfaces on the CLI side. When an alert pauses with a `pause_reason` (`agent_link_failed`, `human_verification_required`, `cua_unavailable`, `claude_chat_mode`, `login_required`, `pro_required`), the CLI `r` / `s` keystrokes route to the correct alert-specific helpers (`set_agent_decision`, `set_continue_anyway`, `request_skip_agent`, `request_skip_init_verify`) **plus** `request_resume`. Before the fix, `r` only called `request_resume` and the consume site defaulted user-intended "retry" to silent "skip".
 
@@ -770,7 +1124,7 @@ caller at all; the live route is `poll_agent_decision` into
 | user taps a panel button (Retry/Skip/etc.) | `PhaseDropdown.tsx` action handler clears after the Firestore command writes |
 | `pipeline_resumed` | resumes paused state but doesn't clear panels — the next phase event clears them |
 
-**Action semantics recap:** action buttons in a panel come from the source event's `actions` array. The FE renders them via `PhaseAlertPanel` / `AgentAlertPanel`; tapping a button writes the embedded `command` (`{action, …}`) to the research's `commands` subcollection. Phase 4/5 use the unified `skip_phase phase=N` verb (legacy `skip_phase` / `skip_phase` were removed in U2).
+**Action semantics recap:** action buttons in a panel come from the source event's `actions` array. The FE renders them via `PhaseAlertPanel` / `AgentAlertPanel`; tapping a button writes the embedded `command` (`{action, …}`) to the research's `commands` subcollection. Phase 4/5 use the unified `skip_phase phase=N` verb (the two legacy per-phase Skip verbs were removed in U2 — ⛔ the same over-eager rename that garbled the `skip_phase` command row above left both of their names written here as `skip_phase`).
 
 ### Normalized error matrix (Apr 19 late-late)
 
@@ -854,6 +1208,79 @@ Checkpoints that survive the crash, all under `queues/{run}/`: `documents/*.md`,
 
 ---
 
+## Credential state, and recovery on a machine nothing supervises
+
+⚠ **Everything above this line assumes a supervisor.** A machine started by hand
+— `superresearch --serve` in a terminal, which is a supported way to run this — has
+no daemon loop, no Scheduled Task, no launchd plist and nothing at all to respawn
+it. Two defects lived in that gap, and both were about what the program *says* and
+then *does* when its credentials go.
+
+**One classifier, every advice site.** `classify_credentials(device_id, paired_uid,
+has_token, token_rejected)` is pure and returns one of five states, and **the order
+of its tests is the whole point**: `device_id` is asked FIRST, because that is the
+fact deciding whether pairing is a repair or a demolition. A machine with no id has
+nothing to lose; a machine WITH an id loses that id the moment it pairs, so no
+branch below the first may recommend pairing.
+
+| state | what it means | what it may advise |
+|---|---|---|
+| never paired | no device id | `--pair` |
+| orphaned | an id, no owner link | `--pair` — the only door left; the relink command the id-preserving path names does not exist in this program |
+| token rejected | the server said no | ⛔ never `--pair` |
+| no token | we never asked, or the keystore itself cannot be reached | ⛔ never `--pair` |
+| healthy | — | — |
+
+⛔⛔ **`--pair` ON A MACHINE THAT STILL HAS ITS ID IS DESTRUCTIVE, AND FOUR SITES
+USED TO PRINT IT.** An access-code Reset leaves an empty keystore; `--pair` on that
+machine does not restore anything — it mints a NEW `deviceId`, and a new device has
+no `visibility`, so the owner loses the computer's identity **and** its public
+listing in one command. The advice was said to an owner on 2026-09-06 and very
+nearly run. ⭐ The routing word `revoked` is deliberately unchanged: both the empty
+keystore and a rejected token must reach the relink loop rather than the reconnect
+ladder. The classification was never the bug; the advice hung off it was.
+
+`credential_state_now()` feeds the classifier from this computer — two on-disk reads
+plus a keystore probe. ⛔ No network, no gRPC, which is what keeps it callable from
+the REST-only subcommands that deliberately never build a client; `token_rejected`
+is passed **in** rather than probed, because only a live refresh can tell "the server
+said no" from "we never asked". A keystore that cannot even be asked folds into *no
+token*, whose advice is safe either way. `credential_remedy(state)` holds the
+sentences, worst-first, in one place so the `--pair` rule cannot grow back at the
+next site somebody adds — and ⛔ **no branch promises a timer or an automatic
+respawn**. The recovered states wait for a person (an approval in the app, a process
+on this computer), not a clock, and "the watcher will respawn the backend
+automatically" is true only where a supervisor is installed.
+
+**`--serve` is its own supervisor when nothing else is.** After the revoked-recovery
+loop relinks successfully, `--serve` must exit so its Firestore subscriptions reload.
+It now asks the same question `_recover_after_reconnect` already asked —
+`_supervisor_is_my_parent()`:
+
+- **supervised** → `_os._exit(0)`, the daemon loop brings it back.
+- **unsupervised** → **re-exec this process, once.** The recovery has already
+  succeeded, so there is nothing left for a person to decide, and a message telling
+  them to run the command again would leave the machine off the public list until
+  they read it. ⛔ The exec is behind the seam `_relink_reexec()` rather than inline:
+  the first version called `os.execv` in the loop body, and the test that drives that
+  loop replaces `os._exit` with a raising sentinel but had nothing to replace here —
+  so the loop re-execed **pytest**, 71% through the suite, and the run ended with
+  exit code 0 and no summary. ⛔ The command line comes from `sys.orig_argv`, not
+  `[sys.executable, *sys.argv]`: on a pipx or pip install `sys.argv[0]` is a console
+  script, and on Windows that is an `.exe` wrapper no interpreter can be handed —
+  the restart would have failed on exactly the installs most likely to be
+  unsupervised. `_relink_reexec` returns only when the exec did NOT happen, so the
+  path falls through to the sentence the person is owed.
+- ⛔ **Once, and only once.** An invisible restart loop is worse than the defect it
+  replaces. The latch is the env var `SR_RELINK_REEXEC` (`RELINK_REEXEC_ENV`) rather
+  than a module global, precisely because it must survive into a process that has not
+  run this file's top level yet — and it is **cleared on a healthy Firestore init**,
+  which is the one moment that proves no loop is in progress. Left uncleared it meant
+  "once per process lineage", so the *next* access-code reset, months later, would
+  refuse to restart and reproduce the original incident with no clue why.
+
+---
+
 ## Tier Escalation Tracking + Phoenix Resume (C1, Apr 28)
 
 Unified per-(op, agent) attempt tracking for retry/escalation across BE operations. Replaces ad-hoc tier_transition emits with the centralized `emit_tier_transition()` helper.
@@ -894,9 +1321,191 @@ Unified per-(op, agent) attempt tracking for retry/escalation across BE operatio
 
 ---
 
+## Public computers — discovery, and what the device document may carry
+
+**Discovery is not access.** A machine marked public is one other people can see
+listed and **ask** to use; the owner approves every request by hand, and an
+approved person becomes an ordinary sharer. Nothing about the setting grants
+anybody anything, and the device document stays readable by exactly the same
+three principals either way.
+
+**The state lives on the device document and nowhere else** — deliberately no
+`research_config.json` key, because the owner can change this from the app and a
+local copy would be a second answer that goes stale the moment they do. The
+reader is `_fetch_device_meta_rest`, the same one `--resurrect` and `--retire`
+use, so it needs no gRPC client.
+
+⭐ **Two names, one answer, and the OLD name wins while it is there.**
+`_DISCOVERY_KEYS = ("visibility", "joinPolicy")` — the same question ("who may
+join this computer") under the name the rename is heading for. `firestore.rules`
+has admitted both keys side by side since wave 7 and the agent bridge learned to
+read both in wave 8; this program still compared against the literal `visibility`
+until wave 9 and fell through to PRIVATE, so the day a document is written under
+the new name it would read "private" to the very machine that owns it. Order is
+load-bearing and the first build had it backwards: everything that ACTS on the
+setting still reads `visibility` — the app's public list queries it, and both of
+this program's writes (pair Stage 3 and `--visibility`) put the old key down — so
+a reader must agree with the **writers**, not with the migration's destination.
+Preferring the new name on a toggle is a door that never closes: write
+`visibility: private` while `joinPolicy` still says public and the next read
+answers "already public". ⭐ It survives the rename anyway — when the migration
+removes `visibility`, `joinPolicy` is what is left and it answers. The machine
+reads both names and writes only the old one.
+
+⛔ **ABSENT IS PRIVATE.** A machine paired before 2026-09-04 carries neither key
+and nothing backfills one; the safe direction for a discovery setting is the one
+that hides.
+
+**`superresearch --visibility [public|private]`** shows or sets it; bare, it
+prints. Three things about that command are decisions rather than style:
+
+- ⛔ **An empty read is not "private".** `_fetch_device_meta_rest` returns `{}`
+  for a network failure, an expired session and a real document alike, so the
+  absent-means-private rule may only be applied to a read that SUCCEEDED — the
+  guard sits ABOVE `_discovery_of`, never below it. The one cause that can be
+  named from disk with no network call (a wiped keystore after a reset) is named.
+- ⛔ **A failed write may not claim "nothing changed".** `_pair_patch_device`
+  returns False for four situations and only two of them prove the write did not
+  land; a timeout and a 5xx both happen after the request went out.
+- ⚠ `topic` is itself optional, so argparse will happily bind the next word to
+  `--visibility`'s `nargs="?"` and swallow a topic. A manual check in `main`
+  refuses anything that is not one of the two words and says what happened.
+
+Pair Stage 3 asks the same question (default **No**, so an unattended pair
+publishes nothing) and its answer travels in the **same single**
+`_pair_patch_device` write as On Startup — see the 2026-09-17 entry below for why
+splitting that write would lose a discoverability answer for good.
+
+### What `devices/{deviceId}` may carry — 7.7E (2026-09-04)
+
+⛔⛔ **The device document is read WHOLE by the owner, by every sharer and by the
+machine** — Firestore cannot scope a read to fields. This file had already
+written that reason down at the run-history publisher, which refuses to put
+history there because "one sharer would learn every other sharer's run history",
+and three other sites put the live one there anyway. So the machine stopped
+publishing what other people are researching:
+
+- `currentRunTitle` and `queuedBehindTitle` are **cleared** on every pickup and
+  every renumber — a delete rather than an omission, so a write that would have
+  published a title removes the one before it. Both keys stay on the rules
+  whitelist, because a `deleteField()` lands in `affectedKeys` and every machine
+  still on the shipped wheel goes on writing them until its owner upgrades.
+- the per-sharer queue-owners list carries uid, run id and position, no title.
+- the sibling fields stay: `currentRunId`, the owner uid and the phase are what
+  let the app say "you are second in the queue", which is the reader's own
+  business.
+
+⛔ **And the sharer-tree rehydration scan is scoped to this machine.** Nothing
+below that query reads `deviceId` — every ownership test keys on
+`assignedWorker`, a worker NUMBER, which is unset on the overwhelmingly common
+single-worker run and defaults to worker 1. Unscoped, this machine marked
+*another* machine's healthy run `paused_backend_restart`, and on a device whose
+doc says `supervised` it would auto-resume that run against THIS machine's
+browser profiles — the wrong-accounts failure the `assignedWorker` logic exists
+to prevent, arriving through the machine dimension instead of the worker one.
+⭐ The OWNER's tree stays unscoped deliberately: the rule admits it with no
+per-document test, and an equality filter would drop every pre-stamp document
+from the orphan safety net. The denial log on a sharer tree is WARN, not DEBUG —
+rules deploy in seconds while a wheel arrives when its owner upgrades.
+
+⛔ **The pair code is a credential, not a name.** The unlink route rotates it,
+and must: the claim route grants ownership to whoever presents a code against an
+ownerless device, which is exactly the state unlinking creates. Because
+`list_devices` sends no field mask, a device row arrives whole — a never-rotated
+machine's plaintext `pairCode` included — so the agent bridge prunes every device
+relay to an allow-list of the keys a consumer actually reads
+(`_DEVICE_PUBLIC_KEYS`, and narrower lists again for the public-browse and
+request-queue projections). The rotated code is relayed once, to the owner
+branch only, and never logged.
+
+---
+
+## A parked run: the pause ceiling, and the one notice that reaches a closed app
+
+These two shipped together (2026-09-01) because they are the same hole seen from
+either end — a run that needs a person, and a person who is not there.
+
+**`PAUSE_MAX_WAIT_S = 86400.0` — pause is bounded now, and audible while it waits.**
+`wait_if_paused` had no bound at all and spoke exactly once. ⛔⛔ It is also the one
+wait the worker watchdog **deliberately** ignores: paused time is excluded from the
+active-time ceiling by design, so a parked run accrues nothing, trips nothing, and is
+invisible to every backstop in the process. It now logs every `PAUSE_HEARTBEAT_S`
+(10 min) naming what it is waiting on, and at the ceiling it **requests a stop** —
+all sixteen callers ignore the return value, so the only way to end the wait is the
+path that already has a handler, exactly as an operator's Stop would. ⛔ It clears
+`pause_event` before stopping: leaving it set would keep the watchdog blind for the
+rest of the process while the run was stopping. ⭐ 24h is not a new number — it is
+what `await_phase_decision` already uses, this project's own answer to how long to
+wait for a person. (This is the "24-hour pause limit" the *Document images* section
+refers to.)
+
+**The notification ask is gated on the card's CLASS, not its event name.** Every
+phase notice in the product is dispatched by a React component, so it needs an open
+tab; a run takes ninety minutes and nobody watches a tab for ninety minutes. One
+seam in `emit_event` asks the web app to notify, and ⛔ it sends **ids only** — the
+phase, the event type, and the seq of the document just written — so the app reads
+that document and composes every word from what it actually says, and this side
+cannot announce an artifact by claiming one exists.
+
+⛔⛔ **Until 2026-09-01 that seam was two good-news event types and nothing else.**
+A run waiting on a sign-in at 02:00, a quota exhaustion, a stop at the time ceiling,
+a backend restart mid-run — each was written to Firestore and to nothing else, while
+the settings screen promised "a research finished, hit an error, went offline
+mid-run, or needs you". Only *finished* had a sender. The gate is now:
+
+```
+(event_type in ("phase_complete", "phase_skipped") and 1 <= phase <= 5)
+  or  recoverability == "blocker"
+```
+
+⭐ `recoverability == "blocker"` is the field the alert catalog already maintains for
+exactly this question — the intents a **person** resolves, that never auto-fire. It
+is event-name agnostic, which matters because `emit_decision` takes an `event_name`
+override and every blocker that actually strands a run overnight uses one
+(`login_required`, `human_verification_required`, `manual_brief_required`); an
+event-name gate missed all of them. A blocker is not phase-scoped, so it is **not**
+held to the 1..5 range — one raised in preflight is exactly the kind that strands a
+run before it starts. ⛔ `quiet` cards are **not** excluded: `quiet` means "do not
+paint a phase tile red for a phase that was never reached", and excluding it silenced
+precisely the preflight blockers. ⛔ `pipeline_stopped` is **not** included: every
+emit site of it is a stop the person asked for, and pushing "Your research stopped"
+to somebody who just pressed Stop is what the completion notice already refuses to
+do, in writing, for the same reason.
+
+---
+
 ## Backend Liveness (Heartbeat + Watchdog)
 
-Backend writes `lastHeartbeat = serverTimestamp()` every **5s** (`HEARTBEAT_INTERVAL_SEC` constant, research.py) to both `research_tokens/{token}` (legacy) and `devices/{deviceId}` (modern, payload also includes `workerCount` + `currentRunId` + `status` + `pollSecretHash`). FE offline threshold = **30s** (`DEVICE_OFFLINE_THRESHOLD_MS`) → six missed ticks flip the device dot red. On long-waits (polling Deep Research for 25+ min) the pipeline ALSO emits a `heartbeat` event so legitimate quiet periods stay green on the per-phase liveness watchdog (FE T1/T2 — see web/ARCHITECTURE.md).
+Worker 1 writes a liveness tick to `devices/{deviceId}` every **5s**
+(`HEARTBEAT_INTERVAL_SEC`, research.py), carrying `lastHeartbeat` + `heartbeatAt`
++ `status` + `workerCount`, plus the atomic-pair contract (`pairConfirmedAt:true`
+and a delete of the claim Cloud Function's `expireAt` TTL). ⛔ The loop has not
+written `research_tokens/{token}` since the device-doc cutover — the only
+research_tokens write left is the pair-time logins/setupState patch. FE offline
+threshold = **30s** (`DEVICE_OFFLINE_THRESHOLD_MS`) → six missed ticks flip the
+device dot red.
+
+> ⛔⛔ **`lastHeartbeat` IS THIS COMPUTER'S OWN CLOCK — millis-as-int, not a
+> server timestamp** (this row said `serverTimestamp()` and had it backwards).
+> Every reader ages it against a DIFFERENT clock, so the answer to "is that
+> machine on?" was the difference between two unsynchronised clocks and it was
+> wrong in both directions: a machine running fast reads ONLINE after it is
+> switched off, one running slow reads OFFLINE while it is working and every run
+> is refused. Wave 9 (2026-09-16) added a SECOND field, `heartbeatAt`, written
+> with Firestore's `SERVER_TIMESTAMP` sentinel — `request.time`, one clock for
+> writer and reader, and the only form a rule can enforce, because a millis int
+> can be forged to any value. ⛔ `lastHeartbeat` stays forever beside it: the
+> agent reads Firestore over REST and the app's legacy mapper compares a plain
+> number, so a Timestamp in that field would read as perpetually offline.
+> ⛔⛔ It rides the SAME `update()` on purpose — a stamp written by a separate
+> request can land before or after the liveness write it is supposed to date —
+> and the cost of that choice is a **release order, not a code change**: the
+> update is atomic, so one key the deployed `firestore.rules` does not admit
+> 403s the `expireAt` delete with it, and a machine pairing inside the claim
+> function's 5-minute TTL window then loses its whole device document. Rules
+> deploy and verify in production BEFORE the wheel publishes.
+
+On long-waits (polling Deep Research for 25+ min) the pipeline ALSO emits a `heartbeat` event so legitimate quiet periods stay green on the per-phase liveness watchdog (FE T1/T2 — see web/ARCHITECTURE.md).
 
 Frontend watchdog: if `lastHeartbeat` is stale >60s AND recent events are stale >60s, pipeline is considered dead. Frontend:
 1. `cancelRunningPhases` — freezes running tile timers, flips badges to "stopped"
@@ -913,9 +1522,9 @@ Emits a chat notification: *"Backend disconnected during Phase N (no heartbeat f
 
 *Updated: 2026-04-19 — **Sequential Phase 0 verification** (one platform at a time — cookie → tab-open → CUA → `login_required` scoped to that platform; matches `--setup` script's walk). **Cookie-only per-phase login probe** (runs on every phase regardless of `skipInitVerify`; `cookie_login_hit` read only, no tabs/CUA; catches mid-run session drift). **`phase_narration` event** (Gemini 2.5 Pro narrator emits one human-readable sentence every ~45s during active phases; frontend `/api/narrate` fallback fills >15s gaps with speculative "Likely: …" entries). Frontend stack: `phaseNarrations` store slice + `<PhaseNarrationLine>` + `useNarrationFallback` hook, budget-capped at 20 fallback calls per run.*
 
-*Updated: 2026-04-19 (late-late) — ⛔⛔ **THE PHASE 2 EXTRACTION RULES IN THIS ENTRY WERE SUPERSEDED ON 2026-08-28 AND THE ENTRY WAS NEVER RETRACTED.** It described ChatGPT keeping a public-share-then-conversation-URL fallback, Gemini and Claude hard-failing on a missing public share, and a per-agent emit the moment a verified link landed. Every artifact it names is gone: the three platform extractors, the share-authority table, the CUA fallback and the `gemini_extractor` logs all return zero hits. Phase 2 publishes a link to the report's page in our own app and never touches a platform share. The rest of this entry still holds. **Claude 2-artifact hard-fail** at ≥80% wait time. **Tab round-robin**: `agent_loop(target_page=None)` + `_anchored_screenshot()`; `bring_to_front()` before every polling tick + after every `execute_action`. **Playwright Claude setup**: `setup_claude_dr` rewritten as 3 Playwright steps (Opus 4.7 dropdown *(Opus 4.7 at the time; current Claude P2 model is Opus 4.8)*, Adaptive Thinking, Research tool) — no more CUA vision for setup. **Normalized error matrix**: default Retry · Skip everywhere; Phase 2 workspace cap → End research only; Phase 2 poll timeout → Retry · Skip · Wait; removed Poke + "Proceed without CUA"; stuck-agent relabeled Retry/Wait/Skip. **New `agent_narration` event**: per-agent Gemini 2.5 Pro call, ~6s cadence during P1/P2. Backend commit `547bf17`.*
+*Updated: 2026-04-19 (late-late) — ⛔⛔ **THE PHASE 2 EXTRACTION RULES IN THIS ENTRY WERE SUPERSEDED ON 2026-08-28 AND THE ENTRY WAS NEVER RETRACTED.** It described ChatGPT keeping a public-share-then-conversation-URL fallback, Gemini and Claude hard-failing on a missing public share, and a per-agent emit the moment a verified link landed. Every artifact it names is gone: the three platform extractors, the share-authority table, the CUA fallback and the `gemini_extractor` logs all return zero hits. Phase 2 publishes a link to the report's page in our own app and never touches a platform share. The rest of this entry still holds. **Claude 2-artifact hard-fail** at ≥80% wait time. **Tab round-robin**: `agent_loop(target_page=None)` + `_anchored_screenshot()`; `bring_to_front()` before every polling tick + after every `execute_action`. **Playwright Claude setup**: `setup_claude_dr` rewritten as 3 Playwright steps (model dropdown, Adaptive Thinking, Research tool) ⛔ *the aside that named the model here — Opus 4.7 then, "currently Opus 4.8" — is exactly the shape the 2026-08-01 owner directive removed: `P2_MODEL_POLICY` in `models.py` holds no version literal at all, only family `opus` + highest-offered (`free_family` sonnet when every Opus row is a sales chip), and a frozen floor is how P2 sat on the previous Opus through a whole rollout. The Thinking step went with it — `thinking` is False for Claude because effort IS the reasoning lever now* — no more CUA vision for setup. **Normalized error matrix**: default Retry · Skip everywhere; Phase 2 workspace cap → End research only; Phase 2 poll timeout → Retry · Skip · Wait; removed Poke + "Proceed without CUA"; stuck-agent relabeled Retry/Wait/Skip. **New `agent_narration` event**: per-agent Gemini 2.5 Pro call, ~6s cadence during P1/P2. Backend commit `547bf17`.*
 
-*Updated: 2026-04-30 — **Narration consolidation** (commit `94b7bde`): retired vision narrator (`narrate.py` PHASE_BUDGET=0 default; `DG_VISION_NARRATE=1` re-enables). Per-agent narrator brain swap: Gemini Pro 2.5 → Anthropic Haiku 4.5 primary with Gemini 2.5 Flash fallback (`DG_NARRATOR_USE_HAIKU` / `DG_NARRATOR_HAIKU_MODEL` envs). Tighter anti-parrot prompt (research.py) + chrome scrub on narrator inputs (research.py) — strips `You said:` / `Claude responded:` / `Gemini said` / `brief.md` / `Building:`-prefix composites BEFORE narrator sees them; scrape outputs untouched. Claude DOM scrape: dropped `.font-claude-message` + `.contents` heading selectors (research.py). ChatGPT P2 walker: dropped `[class*="row" i]`; added 23-verb VERB_GATE + min-len 4→12 (research.py). **P1 ET fallback** (`86d0ab4`): dropped duplicate elapsed-time bit in the P1 ET fallback — the parent card already shows elapsed. **Stuck-state risk fixes** (`6545335`): manual brief 3h backstop (`_BRIEF_WAIT_BACKSTOP_S`); pending queue persist-failure surfaces `paused_backend_restart_failed` status; dead-tab guard before soft retry. **Browser crash + P2 timeout** (`be8f7b3`): always-auto, no human prompt — browser crash emits passive `emit_browser_recovery_status` banner + bypasses run_pipeline.finally retry guard; P2 agent timeout drops alert + `await_agent_decision`, saves partial if ≥200 chars and auto-skips. **NotebookLM derived-stems filter** (`70e2ab2`): `_DERIVED_STEMS = {"brief", "consolidated"}` excluded — never uploads consolidated.md. **Auto-retry kwarg forwarding** (`549f079`): forward `uid/research_id/run_id` on retry recursion (research.py) so Firestore listener stays attached. **Doc upload wiring** (`8a05227`): P1/P2 attach + Flow B unblock; `attach_brief_file` extended with `extra_files` for multi-file `set_input_files`. **P2 ChatGPT** (`bf66c9d`): continuous activity-panel scrape mirroring Claude artifact pattern. **patchright** added to `requirements.txt` (`221394d`).*
+*Updated: 2026-04-30 — **Narration consolidation** (commit `94b7bde`): retired vision narrator (`narrate.py` PHASE_BUDGET=0 default; `DG_VISION_NARRATE=1` re-enables). Per-agent narrator brain swap: Gemini Pro 2.5 → Anthropic Haiku 4.5 primary with Gemini 2.5 Flash fallback (`DG_NARRATOR_USE_HAIKU` / `DG_NARRATOR_HAIKU_MODEL` envs). Tighter anti-parrot prompt (research.py) + chrome scrub on narrator inputs (research.py) — strips `You said:` / `Claude responded:` / `Gemini said` / `brief.md` / `Building:`-prefix composites BEFORE narrator sees them; scrape outputs untouched. Claude DOM scrape: dropped `.font-claude-message` + `.contents` heading selectors (research.py). ChatGPT P2 walker: dropped `[class*="row" i]`; added 23-verb VERB_GATE + min-len 4→12 (research.py). **P1 ET fallback** (`86d0ab4`): dropped duplicate elapsed-time bit in the P1 ET fallback — the parent card already shows elapsed. **Stuck-state risk fixes** (`6545335`): manual brief 3h backstop (`_BRIEF_WAIT_BACKSTOP_S`); pending queue persist-failure surfaces `paused_backend_restart_failed` status; dead-tab guard before soft retry. **Browser crash + P2 timeout** (`be8f7b3`): always-auto, no human prompt — browser crash emits passive `emit_browser_recovery_status` banner + bypasses run_pipeline.finally retry guard ⛔ *the "bypasses the retry guard, therefore it rebuilds and resumes" half was measured false on 2026-08-27 for the per-agent tab death, which fails the agent and carries on; see* Browser death — two different things under one name; P2 agent timeout drops alert + `await_agent_decision`, saves partial if ≥200 chars and auto-skips. **NotebookLM derived-stems filter** (`70e2ab2`): `_DERIVED_STEMS = {"brief", "consolidated"}` excluded — never uploads consolidated.md. **Auto-retry kwarg forwarding** (`549f079`): forward `uid/research_id/run_id` on retry recursion (research.py) so Firestore listener stays attached. **Doc upload wiring** (`8a05227`): P1/P2 attach + Flow B unblock; `attach_brief_file` extended with `extra_files` for multi-file `set_input_files`. **P2 ChatGPT** (`bf66c9d`): continuous activity-panel scrape mirroring Claude artifact pattern. **patchright** added to `requirements.txt` (`221394d`).*
 
 *Updated: 2026-05-18 (final) — **Cross-platform supervisor gate retired (PR3)**: `DG_ALLOW_CROSS_PLATFORM=1` env-flag gate dropped from `_supervisor_platform()`. macOS launchd + Linux systemd-user are first-class supported supervisors alongside the Windows Scheduled Task; no env flag required. Linux smoke caught + fixed two latent bugs (`creationflags` POSIX ValueError in `run_daemon_loop`, `--unpair` browser-profile catch-22 with F4 cookie check). Gate-drop sweep removed all "experimental" / "PR1 PR2 merged" / "PR3 pending" framing from CLI messages + section comments + README + ARCHITECTURE so `--resurrect` / `--retire` / `--unpair` on Mac+Linux read as first-class verbs. `_supervisor_platform()` now returns `Windows` / `Darwin` / `Linux` / `Unsupported` with no env check.*
 
@@ -982,15 +1591,109 @@ reached by `inspect.getsource` from ten test sites).*
   The new step 3 gets NO emit — it never had separate coverage, so nothing was lost. Displayed step
   → emitted stage: 2/6 → 2, 3/6 → none, 4/6 → 3, 5/6 → 4, 6/6 → PAIR_COMPLETED 5. The mismatch is
   recorded in a comment block at the step-2 emit site so the next reader does not "fix" it.*
-- ***What did NOT renumber.*** *`--unpair` keeps its own five-step arc (`total = 5`, five `[n/5]`
-  banners, "Five-step reset"), `--resurrect` its four and `--retire` its three — different arcs
+- ***What did NOT renumber.*** *`--unpair` keeps its own five-step arc (`total = 5`,
+  "Five-step reset"), `--resurrect` its four and `--retire` its three — different arcs
   sharing the same `_setup_step` helper. README's own `### Step 1 … ### Step 6` headings are the
   install walkthrough, not the pair arc. The agent's `branding.py` is data-driven and needed only a
   docstring word.*
 - ***Two things the recount corrected.*** *The pair arc has FOUR `[n/5]` banner comments, not six —
-  step 1 has none, and the other five in `research.py` belong to `--unpair`. And README had been
+  step 1 has none, and the other six in `research.py` belong to `--unpair`, which has one
+  more banner than it has steps: it opens with a `[0/5]` GATE banner that does
+  the server-side retire before anything local is touched. And README had been
   calling step 1 "Pair code" while the code and the web modal both said "Token setup"; fixed in the
   same pass.*
-- ***⛔ The web half is NOT in this change.*** *`dg-research/src/components/chat/WalkthroughModal.tsx`
-  and `src/lib/firestore.ts` still say five stages, and no FE test pins the step count.*
+- ***⛔ The web half followed on 2026-09-19, and only part of it did.***
+  *`dg-research/src/components/chat/WalkthroughModal.tsx` teaches all six now — `[1/6] Token setup`
+  through `[6/6] Ready`, with Discoverability under its own header — and
+  `tests/unit/deviceVisibility.test.ts` pins that ORDERED list against `research.py` itself, parsing
+  the `_setup_step(n, 6, "…")` calls out of the source when the backend tree sits beside the web one
+  (it returns early when it does not, so the list written into the test holds the line everywhere
+  else). What is still on five is `src/lib/firestore.ts`: its `visibility` field comment credits
+  "pair Stage 2" and its `workerCount` one puts the multi-profile loop in "pair Stage 4" — Stage 3
+  and Stage 5 respectively, since the split.*
 
+---
+
+*Updated: 2026-09-19 — **the privacy waves and the browser-side wave, read against
+the release being prepared (backend 0.1.14 + agent 0.1.33).** Each item below has
+its own section above; what is here is the shape and where to look.*
+
+- ***Images inside extracted platform documents are kept now.*** *Every HTML
+  capture route used to delete them along with their alt text. They are fetched
+  once per research, handed to the app and referenced by digest — see* Document
+  images *for the address guards, the budgets and what a refusal remembers.*
+- ***⛔ And that document's per-image deadline was a silent no-op on Windows
+  until 2026-09-18.*** *`socket.shutdown` returns success there and does nothing,
+  so the class that exists to replace a socket timeout was bounded by the socket
+  timeout it replaces — an abortive close (SO_LINGER, then close) lands on
+  Windows INSTEAD of `shutdown`, and the order is load-bearing. Images quietly
+  became captions on the platform the research computer actually runs.*
+- ***A computer can be findable, and who may find it has two names.*** *See*
+  Public computers. *`visibility` is becoming `joinPolicy`; the machine READS
+  both, OLD NAME FIRST, and writes only the old one. 7.7E stopped the device
+  document — which every sharer reads whole — from carrying anybody's topic, and
+  scoped the sharer-tree rehydration scan to this machine.*
+- ***The local API left the network (2026-09-05).*** *It bound every interface,
+  with a wildcard CORS origin and no authentication of any kind, for the whole of
+  its life. Loopback now; the block above the endpoint table says what that does
+  and, more importantly, what it does not.*
+- ***The heartbeat gained a twin no clock can be wrong about.*** *`heartbeatAt`,
+  server-stamped, in the SAME atomic update as `lastHeartbeat` — which is also why
+  the rules must deploy and be verified in production BEFORE this wheel publishes.*
+- ***Phase 3 completes on a podcast, not on the absence of a skip*** *(stretch
+  6.6C), and the P2 platform share step came out in the same round (6.6B) — 2.2
+  minutes and 21.7 CUA calls per run for a link nothing in the pipeline gated on.*
+- ***A support bundle is per RUN now, and the 30-day promise has a clock.*** *A
+  sharer can report their own broken run; attribution rests on the field the rules
+  pin and fails closed; the machine-level material is the owner's AND opt-in; the
+  cloud's own P4/P5 lines are pulled down into the run folder the collector
+  already walks. See* Diagnostics.
+- ***The agent's own log travels alone (wave 8).*** *`/logs/agent-log` gained a
+  DECLARED standalone mode with a support code of its own — never inferred from a
+  missing code, so a client that drops its code takes the refusal instead of
+  silently opening a bundle nobody was told about — and the rotated copies go with
+  it. That half lives in the agent package; see `agent/README.md`.*
+- ***The model pins were re-read against the live GA list rather than recalled
+  (2026-09-17).*** *`GEMINI_TEXT` and `GEMINI_NARRATE` move together to
+  `gemini-3.8-flash`, because a differential test rests on the two agreeing.
+  ⛔ The Pro hedge had to take the `gemini-pro-latest` ALIAS: there is no numbered
+  3.x Pro at all, and the only other Pro-class `generateContent` model deprecates
+  2026-10-16. It costs reproducibility, deliberately — pin it and delete the note
+  the day a numbered GA Pro appears.*
+- ***Wave 10, the browser half.*** *Gemini's own Redo now reaches a research that
+  DIED, at a new site in the post-Start error branch, entered on the machine's own
+  reader rather than on the vision model's `error` verdict — a Gemini research
+  failure is a chat bubble, and both prompts define that verdict as a banner or a
+  popup. A stuck research reloads itself on a bounded CADENCE rather than a
+  detector (`_GEMINI_STALE_RELOAD_SEC`, 12 minutes, capped at three by
+  `_GEMINI_STALE_RELOAD_MAX`), because the growth clock advances on signals that
+  surface does not feed.*
+- ***And the three agent reports carry numbered source links.*** *⛔ NOT the app's
+  `[[n]]` token — the app reserves that for what a MODEL writes and rewrites every
+  instance against its own numbering, so a machine marker in that grammar would
+  open the wrong page with nothing raised. The machine emits `[\[n\]](url)`,
+  which renders identically and contains nothing the app's regex can find.
+  `brief.md` is deliberately NOT numbered: it is the file the agents are handed,
+  and one echoed marker would make a whole report skip numbering.*
+- ***A machine nothing supervises can now recover from a reset on its own.*** *One
+  pure classifier answers "which credential state is this computer in", every
+  advice site asks it, and four of them used to print `--pair` on a machine that
+  still had its device id — which mints a new one and silently unlists a public
+  computer. `--serve`'s relink exit now asks whether anything will restart it and
+  re-execs itself once when nothing will. See* Credential state, and recovery on a
+  machine nothing supervises.
+- ***Two ways a run could need somebody and tell nobody.*** *`wait_if_paused` was
+  unbounded and is the one wait the watchdog excludes by design, so a parked run
+  sat forever; and the notify seam keyed on event NAMES, so a blocker raised
+  through an `event_name` override — every sign-in, HV and manual-brief card —
+  reached no one. Bounded at 24h, gated on `recoverability == "blocker"`. See* A
+  parked run.
+- ***Every Settings button on the device listener passes one clock-skew gate.***
+  *`_is_stale_replay` — live commands are never stale, and the gate that says so
+  had been written twice and fixed once. On a computer running ~30s fast, Update,
+  Restart, Hard Reset, Clear logs and all three send-logs actions did nothing,
+  with no log line. See the note above the device-scoped commands table.*
+- ***The off-topic guard moved to the sink on 2026-08-05 and this file had never
+  named it.*** *It is the thing standing between a wrong extraction and
+  `documents/chatgpt.md`; the* Document images *section had been citing it as an
+  ordering constraint for a section that did not exist. It does now.*
