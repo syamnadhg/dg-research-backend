@@ -46049,12 +46049,39 @@ class _DocImgDeadline:
 
     def expire(self) -> None:
         # ⚠ Under the lock, so `close()` can never close a dup between the list
-        # being read and the shutdown landing on a reused descriptor.
+        # being read and the cut landing on a reused descriptor.
+        #
+        # ⛔⛔ `shutdown` DOES NOT END A BLOCKED READ ON WINDOWS, and it does not
+        # fail either — it returns success and does nothing, so the `except OSError`
+        # below never fires and this whole method was a silent no-op on the platform
+        # the research computer actually runs. Measured 2026-09-18 through the
+        # shipped paths: a fetch with a 1.0s deadline ended at 10.008s (the socket
+        # read timeout, the bound this class exists to replace) and an upload whose
+        # guard ended at 1.0s ended at 30.012s, ~28s past the hard stop
+        # `_DOC_IMG_UPLOAD_MARGIN_SEC` protects. A blocking recv never returned at
+        # all until the peer closed. With `_DOC_IMG_WORKERS = 1` every stall eats
+        # up to ten seconds of the document's 120s budget, so images silently
+        # became captions here that would have been fetched on macOS.
+        #
+        # ⭐ An ABORTIVE close is what lands: SO_LINGER {on, 0} makes `close` send
+        # RST instead of FIN, and the blocked read wakes with WSAECONNABORTED.
+        # ⛔ ORDER IS LOAD-BEARING — calling `shutdown` FIRST defeats it and the
+        # read goes back to sitting out its full timeout. So this is not "shutdown,
+        # then also abort"; on Windows it is the abort INSTEAD.
+        # POSIX keeps `shutdown`: it already ends the read, it leaves the peer a
+        # clean FIN rather than an RST, and the dup exists precisely because
+        # `shutdown` acts on the connection rather than on one descriptor.
+        import struct as _struct
         with self._lock:
             self.expired = True
             for s in self._socks:
                 try:
-                    s.shutdown(socket.SHUT_RDWR)
+                    if sys.platform == "win32":
+                        s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                     _struct.pack("hh", 1, 0))
+                        s.close()
+                    else:
+                        s.shutdown(socket.SHUT_RDWR)
                 except OSError:
                     pass
 
