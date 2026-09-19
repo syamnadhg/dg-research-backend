@@ -466,8 +466,11 @@ MUTANTS = [
        '_DO_FLAGS = frozenset({"--no-video", "--no-email", "--machine", "--agent-log"})')]),
     ('K17', SR, 'under',
      '⛔ THE RELAY GOES BACK TO EXACT-MEMBERSHIP MATCHING, so `--run=Mars Water` is not recognised as a flag at all and the whole token is passed as a phase name',
-     [('    _is_flag = lambda a: a.split("=", 1)[0] in _DO_FLAGS',
-       '    _is_flag = lambda a: a in _DO_FLAGS')]),
+     # ⛔ RE-ANCHORED 2026-09-19: the lint sweep turned the assigned lambda into a
+     # def (E731). The mutation is unchanged — the `=`-split goes, so `--flag=value`
+     # stops being recognised as a flag and lands in the positionals.
+     [('    def _is_flag(a):\n        return a.split("=", 1)[0] in _DO_FLAGS',
+       '    def _is_flag(a):\n        return a in _DO_FLAGS')]),
     ('K18', SR, 'under',
      '⛔ THE RANGE CHECK GOES AND ANY INTEGER IS POSTED: `sr skip 0`, `sr skip 2` — the Research stage, which is not skippable — and `sr skip 99` all reach the backend',
      [('            if int(p) not in _SKIP_PHASE_NUMBERS:\n',

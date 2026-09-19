@@ -256,8 +256,12 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     # ══ what the outage says ═══════════════════════════════════════════
     ("F12", "under", "it stops saying the pairing is fine, so the reader's "
      "first move is to re-pair — which cannot help and costs the pairing",
-     [("        f\"[firestore] While that is true the web app shows this computer \"\n        f\"offline and any research fired at it will not arrive here. Your \"\n        f\"pairing is fine — there is nothing to re-pair.\",",
-       "        f\"[firestore] Firestore is unavailable.\",")],
+     # ⛔ RE-ANCHORED 2026-09-19: the lint sweep dropped the f-prefix from these
+     # three lines (F541 — an f-string with no placeholders). The mutation is
+     # unchanged: the whole "your pairing is fine" reassurance is replaced by a
+     # bare unavailable line, so the reader's first move becomes a re-pair.
+     [("        \"[firestore] While that is true the web app shows this computer \"\n        \"offline and any research fired at it will not arrive here. Your \"\n        \"pairing is fine — there is nothing to re-pair.\",",
+       "        \"[firestore] Firestore is unavailable.\",")],
      [T_OUT]),
     ("F13", "under", "it stops naming the causes and the one command that "
      "distinguishes them",

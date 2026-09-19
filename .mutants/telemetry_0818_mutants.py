@@ -236,7 +236,11 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str], str]] = [
        '            if False:\n                continue')], [T], SRC),
     ("T5", "under", "a batch is unbounded, so one POST carries a whole offline "
      "month and is refused as too large",
-     [('    batch = [r for r, _l in fresh[:BATCH_MAX_EVENTS]]', '    batch = [r for r, _l in fresh]')],
+     # ⛔ RE-ANCHORED 2026-09-19: the 09-19 lint sweep renamed the comprehension's
+     # bindings (r/_l → record/_raw). The mutation is unchanged — the cap comes off
+     # the slice and one POST carries the whole spool.
+     [('    batch = [record for record, _raw in fresh[:BATCH_MAX_EVENTS]]',
+       '    batch = [record for record, _raw in fresh]')],
      [T], SRC),
     ("T6", "under", "⛔⛔ FOUND BY MUTATION, AND IT WAS REAL. The events past the "
      "batch cap are deleted with the claimed file instead of staying owed — and "

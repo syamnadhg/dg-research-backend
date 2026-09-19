@@ -66,7 +66,12 @@ COUNT = "seven subsystems live in their own modules"
 # G1 exists to forbid, and the live-disk anchor ratchet reported both mutants
 # stale. A stale anchor measures nothing and reports a kill, so it is re-pointed
 # here rather than allowlisted.
-TODAY_ROW = "| **today (2026-08-28)** | **74,663** |"
+# ⛔ RE-ANCHORED AGAIN 2026-09-19, same cause as the 08-28 note above: the docs
+# were re-measured (159 commits' worth) and the row moved to 83,374 against a real
+# 83,380 lines. Both replacements below still violate their own bound — 95,000
+# overstates a file of 83,380, and 58,800 understates it by 24,580 against a
+# 12,000 tolerance — so the two mutations are unchanged in meaning, only re-pointed.
+TODAY_ROW = "| **today (2026-09-19)** | **83,374** |"
 
 REVISIT = """- A second engineer edits `research.py` regularly. Single-author work has been
   hiding what would otherwise be constant merge pain."""
@@ -140,12 +145,12 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     ("G1", "over", "⛔⛔ THE SIZE IS OVERSTATED. The one direction this figure must "
      "never drift: a doc that inflates the problem makes the refusal look braver "
      "than it was, and an inflated number is the kind a reviewer checks",
-     [(TODAY_ROW, "| **today (2026-08-28)** | **95,000** |")],
+     [(TODAY_ROW, "| **today (2026-09-19)** | **95,000** |")],
      [T_NEW]),
     ("G2", "under", "⚠ THE FIGURE GOES BADLY STALE — understated by more than the "
      "guard tolerates, so the growth objection reads as answered when it has "
      "simply stopped being measured",
-     [(TODAY_ROW, "| **today (2026-08-28)** | **58,800** |")],
+     [(TODAY_ROW, "| **today (2026-09-19)** | **58,800** |")],
      [T_NEW]),
     ("G3", "under", "⛔ THE REVISIT CONDITIONS GO, so a will-not-do becomes "
      "permanent by omission. The second-engineer condition is the one most likely "
