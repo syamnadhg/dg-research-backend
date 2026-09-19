@@ -1,5 +1,5 @@
 {
-  "version": "0.1.13",
-  "deps_sha256": "76dd8df790907fda76809918d5e88e5f43d2945aca00fc8c1e3fb48c96ee5826",
+  "version": "0.1.14",
+  "deps_sha256": "40aff3ba2af4291c13cc3902b65f05a4b74fed03b0a1bf11e04c98a2545e0cfa",
   "_comment": "Snapshot of [project].dependencies as of this release. Re-seed (python tests/test_release_dep_version_guard.py --seed) only together with a [project].version bump."
 }

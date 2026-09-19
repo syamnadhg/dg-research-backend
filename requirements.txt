@@ -1,13 +1,21 @@
 # Multi-Agent Deep Research Pipeline
 #
+# ⛔ THIS FILE AND pyproject.toml ARE ONE FACT IN TWO PLACES. Everything above
+# the "Testing" block mirrors pyproject's `[project] dependencies` EXACTLY, in
+# both directions; the Testing block mirrors its `[dev]` extra. A source
+# checkout installs from THIS file and nothing else, while a published wheel
+# resolves from pyproject alone — so a dep added to one and not the other is an
+# ImportError that appears only on the side the author was not looking at.
+#
 # Version floors bumped 2026-06-30 to the versions we actually run + test
 # against (see pyproject.toml — kept in sync). `>=` still lets a fresh install
 # pull anything newer.
 # Core
 anthropic>=0.85
 playwright>=1.61
-# patchright is a stealth drop-in for playwright's async API — used in
-# start_browser_session at research.py:8186 since the 2026-04-19 stealth
+# patchright is a stealth drop-in for playwright's async API — the only
+# browser import the pipeline makes (`from patchright.async_api import
+# async_playwright`, in `Browser.start`) since the 2026-04-19 stealth
 # migration. Without this, every fresh `--pair` install crashes after
 # stage 2 with ModuleNotFoundError.
 #
@@ -16,11 +24,22 @@ playwright>=1.61
 # patches that track bot-detection; running ~3 releases behind is exactly
 # when Cloudflare's Turnstile starts looping. Upgrade an existing source
 # checkout with:  pip install -U patchright playwright && patchright install chrome
+#
+# ⛔ NAME THE SYMBOL, NOT A LINE NUMBER. This comment used to point at
+# "start_browser_session at research.py:8186". That function no longer exists
+# and the line now lands in unrelated Firestore-outage code, so the one
+# pointer a reader had led somewhere wrong. A file this long renumbers on
+# every commit; `Browser.start` does not.
 patchright>=1.61
 
 # Extraction
 markdownify>=1.2
 requests>=2.32
+# ⛔ DIRECT, not incidental — research.py imports urllib3.connection /
+# urllib3.connectionpool and subclasses their internals for the document-image
+# fetch and upload. It arrived transitively via requests until 2026-09-18; the
+# floor is 2.x because that is the shape the subclassing assumes.
+urllib3>=2.0
 # Phase-2 source-doc inlining for Gemini (paste path): when P1 is skipped
 # and the user attaches .pdf/.docx sources, Gemini gets their text pasted
 # (it silently drops file uploads). md/txt need no lib; these cover the
@@ -74,5 +93,15 @@ tinytag>=2.0
 # _matches_security_deny_host, _read_security_deny_hosts,
 # _detect_persisted_google_auth, _scrub_persisted_google_auth.
 # Run via `pytest tests/test_f4_security.py -v`.
+#
+# These three are pyproject.toml's `[dev]` extra — see the header.
 pytest>=8.0
 pytest-asyncio>=0.23
+# ⛔ PINNED EXACTLY, not floored — the same reason pyproject.toml pins it
+# (DGOPS-9508): rule implementations change between ruff releases, so a floor
+# reproduces the ruleset but not the count, and CI and a developer's machine
+# stop agreeing about a clean tree. Was missing here while pyproject carried
+# it, so `pip install -r requirements.txt` left the machine without ruff and
+# tests/test_lint_correctness_floor.py silently SKIPPED its only real test.
+# The CI workflow still installs it in its own pinned step; the two agree.
+ruff==0.16.0

@@ -143,7 +143,7 @@ def _twin_build(root: Path = _REPO_ROOT) -> tuple[str | None, str]:
     web = _web_root(root)
     twin = web / "public" / ".well-known" / "skills" / "sr" / "scripts" / "sr.py"
     if not twin.exists():
-        return None, f"  {'hosted twin':<18} NOT CHECKED — no {twin}"
+        return None, f"  {'hosted twin':<18} NOT CHECKED - no {twin}"
     text, _ = _read(twin)
     m = re.search(r'^_SKILL_BUILD\s*=\s*"([^"]+)"', text, re.M)
     if not m:
@@ -165,8 +165,15 @@ def check_lockstep(root: Path = _REPO_ROOT) -> tuple[bool, list[str]]:
     twin, twin_msg = _twin_build(root)
     msgs.append(twin_msg)
     if len(everything) != 1:
-        return False, ["agent version DRIFT — these must all match:", *msgs]
+        return False, ["agent version DRIFT - these must all match:", *msgs]
     mine = everything.pop()
+    # ⛔ AND EVERY MESSAGE ON THIS PATH IS PLAIN ASCII, hyphen not em-dash. These
+    # are the branches a BACKEND-ONLY checkout takes, which is also the checkout
+    # most likely to be driven by importing `check_lockstep()` rather than through
+    # `main()` -- and only `main()` reconfigures stdout to UTF-8. Measured
+    # 2026-09-18: with no web checkout beside this repo, the "NOT CHECKED" line
+    # below carried an em-dash and `test_status_markers_are_plain_ascii` failed,
+    # which on a cp1252 console is a release tool crashing on its own status line.
     # ⛔ A TWIN THAT CANNOT BE READ IS REPORTED AND NOT FAILED. The web checkout is
     # genuinely absent on a machine that only has this repo, and failing there
     # would make the check unusable where it is still worth running. The line above
@@ -175,7 +182,7 @@ def check_lockstep(root: Path = _REPO_ROOT) -> tuple[bool, list[str]]:
     if twin is not None:
         published = _published_version(root)
         if published is None:
-            msgs.append(f"  {'published wheel':<18} NOT RECORDED — no "
+            msgs.append(f"  {'published wheel':<18} NOT RECORDED - no "
                         "AGENT_WHEEL_PUBLISHED in the web repo")
         else:
             msgs.append(f"  {'published wheel':<18} {published}")
@@ -185,7 +192,7 @@ def check_lockstep(root: Path = _REPO_ROOT) -> tuple[bool, list[str]]:
             # skill whose commands the published bridge cannot answer.
             if twin != published:
                 return False, [
-                    f"hosted twin DRIFT — it serves {twin}, the published wheel is "
+                    f"hosted twin DRIFT - it serves {twin}, the published wheel is "
                     f"{published}. Sync the twin only AFTER the wheel is on PyPI.",
                     *msgs]
             # ⭐ AND THIS REPO BEING AHEAD IS THE NORMAL STATE BETWEEN RELEASES,
@@ -374,6 +381,150 @@ def sync_fe_twin(root: Path = _REPO_ROOT) -> tuple[bool, str]:
     return True, f"FE twin synced: {tail}"
 
 
+# ══ post-publish — the half that was never scripted ═════════════════════
+#
+# ⛔⛔ THE COPY WAS AUTOMATED AND THE STATE TRANSITION WAS NOT, which is exactly
+# backwards. `sync_fe_twin` has always done the safe half — copy the bundle, write
+# the record, refuse when the versions disagree. Every WRITE that makes a release
+# real stayed manual: moving `AGENT_WHEEL_PUBLISHED`, flipping
+# `AGENT_LOG_STEP_PUBLISHED`, and the two tests that pin them.
+#
+# ⛔ AND ONE OF THOSE HAND-EDITS FAILS SILENTLY. `hostedSkillTwin.test.ts` wraps
+# assertions in `if (AGENT_WHEEL_PUBLISHED === "<old>")`. The moment the constant
+# moves, that block stops asserting and the suite stays green — a guard retiring
+# itself at the one moment it is needed. Forgetting the twin sync is loud;
+# forgetting this is invisible. That asymmetry is the reason this command exists.
+#
+# ⭐ AND "PUBLISHED" IS VERIFIED, NOT ASSERTED. Everything downstream keys off
+# `AGENT_WHEEL_PUBLISHED`, a number a human types after believing they published.
+# This asks PyPI. Via `/simple/`, not the JSON API — that one is CDN-cached and
+# has answered with a stale `info.version` minutes after an upload, which is the
+# worst possible moment to be told what you hoped to hear.
+
+_PYPI_SIMPLE = "https://pypi.org/simple/superresearch-agent/"
+
+
+def _is_on_pypi(version: str, timeout: float = 20.0) -> tuple[bool, str]:
+    """(is it there, what we saw). Reads /simple/, which is not CDN-lagged."""
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(_PYPI_SIMPLE, headers={
+        "Accept": "text/html",
+        "User-Agent": "superresearch-release-tool",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return False, f"PyPI answered HTTP {e.code} for {_PYPI_SIMPLE}"
+    except Exception as e:                                   # network, DNS, TLS
+        return False, f"could not reach PyPI ({type(e).__name__}: {e})"
+    # Filenames on /simple/ carry the version: superresearch_agent-0.1.33-py3-...
+    needle = f"superresearch_agent-{version}"
+    alt = f"superresearch-agent-{version}"
+    if needle in body or alt in body:
+        return True, f"found {needle}* on PyPI /simple/"
+    seen = sorted({m.group(1) for m in re.finditer(
+        r"superresearch[_-]agent-(\d+\.\d+\.\d+)", body)},
+        key=lambda v: tuple(int(x) for x in v.split(".")))
+    return False, (f"{version} is NOT on PyPI. /simple/ lists: "
+                   f"{', '.join(seen[-6:]) if seen else '(nothing parsed)'}")
+
+
+def _flip_gate(path: Path, const: str, new_literal: str) -> tuple[bool, str]:
+    """Rewrite `export const NAME = <literal>;`. Idempotent."""
+    text, nl = _read(path)
+    pat = re.compile(r"(export const " + re.escape(const) + r"\s*=\s*)([^;]+)(;)")
+    m = pat.search(text)
+    if not m:
+        return False, f"{const} not found in {path.name}"
+    if m.group(2).strip() == new_literal:
+        return True, f"{const} already {new_literal}"
+    out = pat.sub(lambda _m: _m.group(1) + new_literal + _m.group(3), text, count=1)
+    _write(path, out)
+    return True, f"{const}: {m.group(2).strip()} -> {new_literal}"
+
+
+def _retarget_pin(path: Path, old: str, new: str) -> tuple[bool, str]:
+    """Move a test's expectation. Idempotent; reports when there is nothing to do."""
+    if not path.exists():
+        return True, f"{path.name} absent - skipped"
+    text, _nl = _read(path)
+    if old not in text:
+        return (True, f"{path.name}: already retargeted") if new in text else \
+               (False, f"{path.name}: neither the old nor the new form is present - "
+                       f"look at it by hand")
+    _write(path, text.replace(old, new))
+    return True, f"{path.name}: {old!r} -> {new!r}"
+
+
+def post_publish(version: str, root: Path = _REPO_ROOT) -> tuple[bool, list[str]]:
+    """Move the web repo to 'this version is published', then sync the twin."""
+    msgs: list[str] = []
+    if not valid_version(version):
+        return False, [f"not a valid version string: {version!r}"]
+
+    mine = {v for vs in read_versions(root).values() for v in vs}
+    if len(mine) != 1:
+        return False, ["this repo's own agent versions disagree - fix that first."]
+    building = mine.pop()
+    if building != version:
+        return False, [f"this repo builds {building}, you asked to publish {version}. "
+                       f"Bump first, or pass {building}."]
+
+    ok, what = _is_on_pypi(version)
+    msgs.append(("  OK    " if ok else "  STOP  ") + what)
+    if not ok:
+        msgs.append("  Nothing was changed. Publish the wheel first, then re-run.")
+        return False, msgs
+
+    web = _web_root(root)
+    gates = web / "src" / "lib" / "agent-release-gates.ts"
+    if not gates.exists():
+        return False, [*msgs, f"no web checkout beside this repo (looked for {gates})"]
+    was = _published_version(root)
+
+    steps = [
+        _flip_gate(gates, "AGENT_WHEEL_PUBLISHED", f'"{version}"'),
+        _flip_gate(gates, "AGENT_LOG_STEP_PUBLISHED", "true"),
+    ]
+    # The two tests that pin AGENT_LOG_STEP_PUBLISHED false.
+    for rel in ("tests/unit/documentImagesContract.test.ts",
+                "tests/unit/sendLogsAgentLogLine.test.ts"):
+        steps.append(_retarget_pin(
+            web / rel,
+            "expect(AGENT_LOG_STEP_PUBLISHED).toBe(false)",
+            "expect(AGENT_LOG_STEP_PUBLISHED).toBe(true)"))
+    # ⛔ The one that silently stops asserting. Its guard names the OLD version.
+    if was:
+        steps.append(_retarget_pin(
+            web / "tests/unit/hostedSkillTwin.test.ts",
+            f'if (AGENT_WHEEL_PUBLISHED === "{was}")',
+            f'if (AGENT_WHEEL_PUBLISHED === "{version}")'))
+
+    for ok_i, msg in steps:
+        msgs.append(("  OK    " if ok_i else "  FAIL  ") + msg)
+    if not all(ok for ok, _ in steps):
+        return False, [*msgs, "  Stopped before syncing the twin. Fix the above, re-run."]
+
+    ok_sync, msg = sync_fe_twin(root)
+    msgs.append(("  OK    " if ok_sync else "  FAIL  ") + msg)
+    if not ok_sync:
+        return False, msgs
+
+    msgs += [
+        "",
+        "Commit the WEB repo (one commit - the gates, the two pins, the twin and its record):",
+        "  git -C <web> add src/lib/agent-release-gates.ts tests/unit public/.well-known/skills "
+        "scripts/agent-skill-sync.json",
+        f'  git -C <web> commit -m "release: agent {version} is published"',
+        "",
+        "⚠ The twin is SERVED, so it only reaches anyone on the next FE deploy.",
+        "⚠ Run the web suite before pushing: the two pins above now expect true.",
+    ]
+    return True, msgs
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="bump_version.py",
@@ -390,6 +541,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--sync-twin", action="store_true",
                     help="refresh the hosted twin from this tree — run ONLY after "
                          "the wheel is published and AGENT_WHEEL_PUBLISHED has moved")
+    ap.add_argument("--post-publish", metavar="VERSION",
+                    help="after the agent wheel is REALLY on PyPI: verify it there, "
+                         "move AGENT_WHEEL_PUBLISHED, flip AGENT_LOG_STEP_PUBLISHED, "
+                         "retarget the tests that pin both, and sync the twin")
     args = ap.parse_args(argv)
 
     # Windows consoles default to cp1252, which cannot encode check/warn glyphs
@@ -407,6 +562,11 @@ def main(argv: list[str] | None = None) -> int:
         b_ok, b_msgs = check_be()
         print("\n".join([*a_msgs, "", *b_msgs]))
         return 0 if (a_ok and b_ok) else 1
+
+    if args.post_publish:
+        ok, msgs = post_publish(args.post_publish)
+        print("\n".join(msgs))
+        return 0 if ok else 2
 
     if args.sync_twin:
         # ⛔ REFUSED UNLESS THE WEB REPO ALREADY SAYS THIS VERSION IS PUBLISHED.

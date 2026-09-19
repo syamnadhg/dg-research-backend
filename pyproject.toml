@@ -32,7 +32,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "superresearch"
-version = "0.1.13"
+version = "0.1.14"
 description = "Super Research — multi-agent deep-research pipeline: topic → brief → 3× deep research → NotebookLM → audio/video → delivery, driven from the web app or a paired device."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -62,6 +62,14 @@ dependencies = [
     "patchright>=1.61",
     "markdownify>=1.2",
     "requests>=2.32",
+    # ⛔ DIRECT, not incidental. The wave-4 document-image path imports urllib3
+    # itself (research.py — `urllib3.connection`, `urllib3.connectionpool`) and
+    # subclasses its INTERNALS: `HTTPSConnection._new_conn`, the pool's
+    # `pool_classes_by_scheme`, `self._dns_host`, `self.socket_options`. It was
+    # reaching us only because `requests` happens to depend on it, which is a
+    # transitive pin nobody here controls — and a floor is what the subclassing
+    # actually needs, since those attributes are 2.x shapes. Declared 2026-09-18.
+    "urllib3>=2.0",
     "pypdf>=4.0",
     "python-docx>=1.2",
     "Pillow>=11.0",
