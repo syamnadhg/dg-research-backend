@@ -25334,7 +25334,24 @@ async def _platform_auth_cookie_present(browser, agent_key: str) -> bool:
     try:
         cookies = await browser.context.cookies()
     except Exception as e:
-        log(f"[gate] cookie probe failed ({e}) — falling back to full verify", "DEBUG")
+        # ⛔ 2026-09-20 — THIS PROBE SAW THE BROWSER DIE AND WHISPERED IT.
+        # In bundle 8D9CWHZJ this line fired at 00:34:43 with "BrowserContext
+        # .cookies: Target page, context or browser has been closed" — one
+        # second before Phase 3 tried `new_page()` on the same dead context and
+        # reported a NotebookLM upload failure. It was the earliest honest
+        # signal in the whole run and it went out at DEBUG, which the console
+        # does not show by default.
+        #
+        # ⚠ It still does NOT raise, and that is deliberate: this is a
+        # fast-path asking "can I skip the full verify?", and every other way
+        # it can fail is a reason to fall back rather than to unwind. The
+        # callers that own the unwind now classify it themselves. All this has
+        # to do is stop burying the one failure that means something.
+        if _is_browser_close_error(e):
+            log(f"[gate] cookie probe failed because the BROWSER IS GONE ({e}) "
+                f"— the caller's browser-death handling will pick this up", "WARN")
+        else:
+            log(f"[gate] cookie probe failed ({e}) — falling back to full verify", "DEBUG")
         return False
     return _auth_cookie_present_in(cookies, agent_key)
 
@@ -42182,6 +42199,41 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     _runtime.last_failure_kind = "login_interrupt"
                     raise RuntimeError(
                         "research browser closed by the login command (login interrupt)")
+                # ⛔⛔ 2026-09-20 — ONE TAB, OR THE WHOLE BROWSER? THIS SWEEP
+                # COULD NOT TELL, AND THAT COST A NINE-HOUR DEAD RUN.
+                #
+                # Support bundle 8D9CWHZJ: Chrome's BROWSER process took a
+                # SIGSEGV at 00:33:59 (macOS wrote the report —
+                # `Google Chrome-2026-09-20-003359.ips`, EXC_BAD_ACCESS,
+                # faulting thread CrBrowserMain, pid parented by the patchright
+                # driver). The whole context went. This sweep then read
+                # `page.is_closed()` per agent, saw two closed pages, and did
+                # what it does for a tab crash: failed each agent and dropped
+                # it from `pending`. `pending` emptied, Phase 2 reported
+                # "COMPLETE: 1/3", and Phase 3 walked into a dead context and
+                # parked a decision the user found nine hours later.
+                #
+                # The comment right below this one has always claimed the
+                # "outer run_pipeline.finally rebuilds the browser session and
+                # resumes from checkpoint" — and that machinery is real
+                # (`_plan_pipeline_auto_retry`, BROWSER_CRASH_MAX_RETRIES=2,
+                # silent relaunch + resume). It was simply never reached,
+                # because setting `last_failure_kind` does not unwind anything.
+                # The `--login` branch twenty lines above gets this right: it
+                # sets the flag AND raises. Phase 3's audio poll gets it right
+                # too (research.py, "Browser closed mid-audio-poll"). Phase 2,
+                # the longest phase and the one most likely to be running when
+                # Chrome dies, was the only one that did not.
+                #
+                # ⚠ A SINGLE dead tab is still a per-agent failure and still
+                # falls through to the existing path — that distinction is the
+                # whole point of probing the CONTEXT rather than the page.
+                if await _browser_context_is_dead(browser):
+                    log(f"[{_crash_name}] the whole browser is gone, not just this tab "
+                        f"— unwinding for checkpoint recovery", "WARN")
+                    _runtime.last_failure_kind = "browser_crash"
+                    raise RuntimeError(
+                        "research browser died during phase 2 (browser crash)")
                 log(f"[{_crash_name}] Browser tab crashed — failing agent", "WARN")
                 # Always-auto: passive banner, outer run_pipeline.finally
                 # rebuilds the browser session and resumes from checkpoint.
@@ -61725,6 +61777,27 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
             break  # Successful upload — exit retry loop
         except Exception as e:
             log(f"NotebookLM upload error: {e}", "ERROR")
+            # ⛔⛔ 2026-09-20 — A DEAD BROWSER IS NOT AN UPLOAD FAILURE, and
+            # calling it one is what parked bundle 8D9CWHZJ for nine hours.
+            # Chrome had segfaulted a few seconds earlier, so `new_page()` threw
+            # "Target page, context or browser has been closed" — and this
+            # handler, which classifies only login-vs-generic, told the user
+            # "We couldn't upload the reports to NotebookLM. Retry to try
+            # again" about a browser that no longer existed. Retry could not
+            # have worked; nothing here can upload anything until Chrome is
+            # relaunched.
+            #
+            # `_is_browser_close_error` already knows this string — the
+            # navigate() retry path and the Phase-2 sweep both key on it — so
+            # the fix is to ASK it, and then unwind the way every other
+            # browser-death site does, into the silent relaunch-and-resume that
+            # `_plan_pipeline_auto_retry` exists to perform.
+            if _is_browser_close_error(e):
+                _runtime.last_failure_kind = "browser_crash"
+                log("[Phase3] the browser is gone, not the upload — unwinding "
+                    "for checkpoint recovery", "WARN")
+                raise RuntimeError(
+                    "research browser died before the NotebookLM upload (browser crash)")
             # Distinguish session-expired from generic upload failure — the
             # frontend can offer "re-login then retry" vs "just retry".
             _err_msg = str(e)
@@ -65294,6 +65367,39 @@ def detect_resume_phase(queue_dir):
 # browser launches before we involve the human. Threaded through run_pipeline's
 # `_crash_retries` param (NOT _runtime, which `reset()`s per run).
 BROWSER_CRASH_MAX_RETRIES = 2
+
+
+async def _browser_context_is_dead(browser) -> bool:
+    """Is the whole BrowserContext gone, as opposed to one tab having closed?
+
+    ⛔⛔ THE DISTINCTION THAT WAS MISSING. `page.is_closed()` answers a question
+    about ONE TAB, and every caller that only had that answer treated a dead
+    browser as N independent tab crashes. On 2026-09-20 (bundle 8D9CWHZJ) that
+    turned a recoverable Chrome segfault into a run that sat parked for nine
+    hours: Phase 2 reported "COMPLETE: 1/3", and the silent relaunch-and-resume
+    machinery that exists for exactly this never ran.
+
+    ⭐ PROBES THE CONTEXT, AND THE PROBE IS THE ONE THE FAILURE ALREADY GAVE US.
+    In that bundle the context's own death surfaced twice within four seconds —
+    `BrowserContext.cookies: Target page, context or browser has been closed`
+    and `BrowserContext.new_page: …` — so `cookies()` is a known-good, cheap,
+    side-effect-free question to ask. `_is_browser_close_error` classifies the
+    answer, so this shares its string set with the navigate() retry path rather
+    than growing a second opinion about what "gone" looks like.
+
+    ⚠ FAILS SAFE TOWARDS "ALIVE". A False here costs what we have today — a
+    per-agent failure — while a wrong True would unwind a healthy run and
+    relaunch Chrome underneath it. So anything unrecognised, and any missing
+    handle, answers False.
+    """
+    ctx = getattr(browser, "context", None)
+    if ctx is None:
+        return True
+    try:
+        await ctx.cookies()
+        return False
+    except Exception as _e:
+        return _is_browser_close_error(_e)
 
 
 def _is_browser_close_error(exc) -> bool:
