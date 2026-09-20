@@ -57,6 +57,8 @@ import shutil
 import argparse
 import subprocess
 import collections
+import threading        # the console-quiet flag below `log()` needs it at import time
+import contextlib       # ditto — `_console_quiet_for_prompt` is a contextmanager
 import logging          # only to reshape uvicorn's own records — see _uvicorn_log_config
 # The content-free tier. ⭐ Imports NOTHING from this file, so instrumenting a
 # call site can never create a circular import, and a telemetry failure can
@@ -2183,6 +2185,63 @@ def _log_date_marker(day: str, ts: str) -> "str | None":
     return f"[{ts}] [INFO] {LOG_DATE_PREFIX} {day}"
 
 
+# ⛔⛔ 2026-09-19 — THE CONSOLE GOES QUIET WHILE SOMEONE IS BEING ASKED A
+# QUESTION. What the owner saw, verbatim:
+#
+#     >  Send this to the team? [y/N]: [18:48:25] [INFO] [date] 2026-09-19
+#   [18:48:25] [DEBUG] [telemetry] telemetry: no id-token accessor (ImportError)…
+#   y
+#
+# Their words: "because of the noise, it's very unclear what to even type."
+#
+# The lines land INSIDE the prompt because a daemon thread writes them. The
+# telemetry flusher starts at the top of `main()` and posts in the background;
+# its stdlib `log.debug` reaches `log()` through the bridge, which is attached
+# at DEBUG on purpose. So the main thread is parked in `input()` and another
+# thread is printing over the question — nothing about ordering on the main
+# thread can fix it.
+#
+# ⚠ WITHHELD, NEVER DISCARDED. Every line still goes to the run file through
+# `_log_write_through` on its normal path, and the console copy is replayed the
+# moment the answer is read. A prompt that ate diagnostics would trade a
+# cosmetic problem for a real one — the next support bundle is assembled from
+# exactly these lines.
+_CONSOLE_QUIET = threading.Event()
+_CONSOLE_HELD: list = []
+_CONSOLE_HELD_LOCK = threading.Lock()
+#: A held buffer is a courtesy, not a queue. A prompt left open overnight must
+#: not grow one line per telemetry flush until the process dies.
+_CONSOLE_HELD_MAX = 500
+
+
+def _console_print(text: str) -> None:
+    """`print`, unless a question is on screen — then hold it for replay."""
+    if not _CONSOLE_QUIET.is_set():
+        print(text)
+        return
+    with _CONSOLE_HELD_LOCK:
+        if len(_CONSOLE_HELD) < _CONSOLE_HELD_MAX:
+            _CONSOLE_HELD.append(text)
+
+
+@contextlib.contextmanager
+def _console_quiet_for_prompt():
+    """Hold console log output for the duration of an interactive read.
+
+    Re-entrant-safe and never swallows the replay: the `finally` runs on
+    Ctrl+C and on EOF too, both of which callers here rely on propagating.
+    """
+    _CONSOLE_QUIET.set()
+    try:
+        yield
+    finally:
+        _CONSOLE_QUIET.clear()
+        with _CONSOLE_HELD_LOCK:
+            held, _CONSOLE_HELD[:] = list(_CONSOLE_HELD), []
+        for line in held:
+            print(line)
+
+
 def log(msg, level="INFO"):
     # ⭐ ONE strftime for both halves. The printed line's format is unchanged
     # byte-for-byte; the date is sliced off the same call rather than costing a
@@ -2191,10 +2250,10 @@ def log(msg, level="INFO"):
     ts = _stamp[11:]
     marker = _log_date_marker(_stamp[:10], ts)
     if marker:
-        print(marker)
+        _console_print(marker)
         _log_write_through(marker, "INFO")
     line = f"[{ts}] [{level}] {msg}"
-    print(line)
+    _console_print(line)
     # ⭐ The printed format is byte-for-byte what it always was. The second
     # sink is the armed per-run folder — see `_log_write_through`, which is a
     # no-op when nothing is armed and can never recurse back through here.
@@ -4081,7 +4140,11 @@ def _ask_yes_no_sync(
         a.strip().lower() for a in no_aliases if str(a).strip())) if w not in yes)
 
     for attempt in range(1, max(1, int(tries)) + 1):
-        raw = input(prompt)
+        # ⛔ The console is held for the read — a background thread printing
+        # over the question is what made it unreadable. See
+        # `_console_quiet_for_prompt`; withheld lines replay right after.
+        with _console_quiet_for_prompt():
+            raw = input(prompt)
         ans = (raw or "").strip().lower()
         if ans == "":
             return default
@@ -18938,10 +19001,42 @@ _CHATGPT_MODEL_TRIGGER_JS = r"""(P) => {
     const vis = el => el.getClientRects().length > 0 || !!el.offsetParent;
     const inOverlay = el => !!el.closest('[role="menu"], [role="listbox"], [role="dialog"]');
     const avoid = (P.avoid || '').toLowerCase();
+    // ⛔⛔ 2026-09-19 — READ THE LABEL THE WAY IT IS RENDERED, NOT THE WAY IT IS
+    // CONCATENATED. This was `norm(el.textContent)`, and on the live pill the
+    // tier is TWO adjacent inline spans — "6" and "Pro" — separated by CSS and
+    // by nothing else. `textContent` glues them into "6Pro", and the tier test
+    // is word-boundary aware, so `has_term("6Pro", ["pro"])` is False: the
+    // left-hand neighbour of "pro" is the alphanumeric "6".
+    //
+    // The cost was the whole slider rung. The 2026-09-19 run drove the thumb
+    // onto the Pro stop correctly and then failed its own confirm twice —
+    // "unverified … slider on tier; pill still '6Pro'" — and handed the job to
+    // CUA anyway, which is the exact expense the rung was built to remove.
+    //
+    // ⚠ NOT `innerText`, which was the obvious candidate and is WRONG. It is
+    // line-aware, not gap-aware: for two inline siblings it concatenates
+    // exactly as textContent does, in the shim and in a real browser alike.
+    // The space a human sees there is CSS. So the boundary has to be supplied
+    // here, by walking the tree and separating ELEMENTS — which is also what
+    // makes this honest, because a word boundary in the rendering is a word
+    // boundary in the reading.
+    const spaced = el => {
+        let out = '';
+        const walk = n => {
+            for (const c of n.childNodes || []) {
+                if (c.nodeType === 3) out += c.nodeValue || '';
+                else if (c.nodeType === 1) { out += ' '; walk(c); out += ' '; }
+            }
+        };
+        walk(el);
+        // Fall back to textContent for a node the walk cannot read — a glued
+        // label still beats no label, and every caller tolerates a miss.
+        return norm(out) || norm(el.textContent);
+    };
     for (const g of (P.groups || [])) {
         for (const el of document.querySelectorAll(g.sel)) {
             if (!vis(el) || inOverlay(el)) continue;
-            const t = norm(el.textContent);
+            const t = spaced(el);
             // A trigger is a short chip. The cap also keeps a wrapper whose
             // textContent concatenates the whole composer from posing as one.
             if (!t || t.length > 40) continue;
@@ -82077,7 +82172,8 @@ def _choose_runs_interactively(rows: "list[dict]") -> "list[str] | None":
     print(f"    {_c(_DIM, _hint)}")
     for _ in range(3):
         try:
-            answer = input(f"  {_c(_ACCENT, '>')}  Choose ")
+            with _console_quiet_for_prompt():
+                answer = input(f"  {_c(_ACCENT, '>')}  Choose ")
         except (EOFError, KeyboardInterrupt):
             print()
             return None

@@ -280,10 +280,11 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     ("X4", "over", "the write-through's own gate is moved into `log()`, so a "
      "marked loop stops printing to stdout as well — the machine's OWN log loses "
      "the lines the exclusion exists to keep",
-     [("    line = f\"[{ts}] [{level}] {msg}\"\n    print(line)",
+     # ⚠ 2026-09-19 re-anchored: print → _console_print (prompt-quiet window).
+     [("    line = f\"[{ts}] [{level}] {msg}\"\n    _console_print(line)",
        "    line = f\"[{ts}] [{level}] {msg}\"\n"
        "    if _LOG_SCOPE.get() == _LOG_SCOPE_MACHINE:\n        return\n"
-       "    print(line)")],
+       "    _console_print(line)")],
      [T_NEW]),
 ]
 

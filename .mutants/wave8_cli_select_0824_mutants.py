@@ -77,9 +77,12 @@ _GIVEUP = """    print(f"  {_c(_WARN, '⚠')}  Could not read a choice. Nothing 
 
 # ⛔ WIDENED: `for _ in range(3):` appears four times in this file, so the narrow
 # anchor mutated a place this mutant was never about and reported a kill.
+# ⚠ 2026-09-19 re-anchored: the read is wrapped so a background thread cannot
+# print over the question.
 _RETRY = """    for _ in range(3):
         try:
-            answer = input(f"  {_c(_ACCENT, '>')}  Choose ")"""
+            with _console_quiet_for_prompt():
+                answer = input(f"  {_c(_ACCENT, '>')}  Choose ")"""
 
 _ECHO = """            if picked:
                 print(f"     {_c(_DIM, f'Sending {len(picked)} run(s).')}")"""
@@ -168,7 +171,8 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     ("P3", "under", "there is no retry, so one typo abandons the send",
      [(_RETRY, "    for _ in range(1):\n"
                "        try:\n"
-               "            answer = input(f\"  {_c(_ACCENT, '>')}  Choose \")")],
+               "            with _console_quiet_for_prompt():\n"
+               "                answer = input(f\"  {_c(_ACCENT, '>')}  Choose \")")],
      [T_NEW]),
     ("P4", "under", "the prompt stops echoing what it understood, so a person "
      "who typed something ambiguous never learns how it was read",

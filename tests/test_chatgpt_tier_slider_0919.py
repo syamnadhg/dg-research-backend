@@ -472,3 +472,91 @@ def test_emptying_the_row_words_disables_the_tie_break_not_the_picker():
                  {"attr": research._SR_CLICK_MARK, "value": "effort-slider",
                   "rowWords": []})["ret"]
     assert out["found"] is True and out["max"] == 4
+
+
+# ── The pill's own text, as the page actually renders it ──────────────────
+
+def two_span_pill(value=4, is_open=False):
+    """The composer with the pill's tier split across TWO inline spans.
+
+    ⛔⛔ THIS IS THE LIVE SHAPE AND MY FIXTURE DID NOT HAVE IT. The captured
+    `smallStops` show the top tier rendered as `<span>6</span>` next to
+    `<span data-max-effort="true">Pro</span>` — two elements, separated by CSS
+    and by nothing else. My fixture put "6 Pro" in one text node, which is what
+    the accessible DESCRIPTION says, not what the PILL is built from. So the
+    tests passed while the real read returned "6Pro".
+    """
+    return el("body", {}, "", [
+        el("button", {"class": "__composer-pill", "type": "button",
+                      "aria-haspopup": "menu", "id": "trigger",
+                      "aria-expanded": "true" if is_open else "false",
+                      "w": "150", "h": "36"}, "", [
+            el("span", {"class": "max-w-40 truncate"}, "", [
+                el("span", {"class": "text-token-text-primary min-w-0 truncate"}, str(value + 2)),
+                el("span", {"data-max-effort": "true", "class": "shrink-0"}, "Pro"),
+            ]),
+        ]),
+        el("button", {"class": "__composer-pill", "type": "button",
+                      "w": "130", "h": "36"}, "Deep research"),
+    ])
+
+
+def read_trigger(spec):
+    return run_js(spec, js_constant(research, "_CHATGPT_MODEL_TRIGGER_JS"),
+                  {"groups": research._CHATGPT_MODEL_TRIGGER_GROUPS,
+                   "avoid": "deep research"})["ret"]
+
+
+def test_the_pill_reads_with_the_space_the_user_sees():
+    """⛔⛔ THE DEFECT THE 2026-09-19 RUN CAUGHT, TWICE.
+
+    The run log, verbatim:
+        ✗ p1 chatgpt.select_model: unverified — slider on tier; pill still '6Pro'
+        ✗ p2 chatgpt.select_model: unverified — slider on tier; pill still '6Pro'
+
+    The slider drove to the Pro stop correctly and then the confirm rejected
+    its own success, because `textContent` glues two inline spans into "6Pro"
+    and the tier test is word-boundary aware: the character to the left of
+    "pro" is the alphanumeric "6", so it does not match. The whole rung — the
+    one built to stop paying CUA for this — fell through on every run.
+    """
+    assert read_trigger(two_span_pill())["text"] == "6 Pro"
+
+
+def test_and_that_text_satisfies_the_tier_check():
+    """The consumer. The read is only worth anything if `on_target` flips —
+    that boolean is what decides `already` in P2 and confirms the drive in P1."""
+    assert models.has_term("6Pro", TIERS) is False     # the string we used to produce
+    assert models.has_term("6 Pro", TIERS) is True     # the string we produce now
+
+
+def test_a_single_text_node_label_is_unchanged():
+    """⛔ The no-widening guard. Every other layout puts the label in one text
+    node, and separating elements must not start inserting spaces INSIDE a
+    word or padding a plain chip."""
+    spec = el("body", {}, "", [
+        el("button", {"class": "__composer-pill", "aria-haspopup": "menu",
+                      "w": "150", "h": "36"}, "Instant"),
+    ])
+    assert read_trigger(spec)["text"] == "Instant"
+
+
+def test_the_deep_research_pill_is_still_excluded():
+    """The safety exclusion survives the new read. Clicking the DR pill does
+    not open a menu — it ADDS A SECOND DEEP RESEARCH — so a read that started
+    returning it would be destructive, not merely wrong."""
+    got = read_trigger(two_span_pill())
+    assert "Deep research" not in got["text"]
+
+
+def test_a_nested_wrapper_does_not_become_a_trigger():
+    """The 40-character cap still applies to the spaced read. Separating
+    elements makes labels LONGER, so a wrapper that used to squeak under the
+    cap could now pose as a chip — or a real chip could be pushed over it."""
+    spec = el("body", {}, "", [
+        el("div", {"class": "__composer-pill", "w": "600", "h": "40"}, "", [
+            el("span", {}, "Thinking effort"), el("span", {}, "Deep research"),
+            el("span", {}, "Attach"), el("span", {}, "Dictate"), el("span", {}, "Send"),
+        ]),
+    ])
+    assert read_trigger(spec)["found"] is False

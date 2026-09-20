@@ -122,8 +122,10 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_YN]),
     ("Y13", "over", "EOF is swallowed into the default, taking the choice away "
      "from callers that handle a non-interactive stdin themselves",
-     [("        raw = input(prompt)",
-       "        try:\n            raw = input(prompt)\n        except EOFError:\n            return default")],
+     # ⚠ 2026-09-19 re-anchored: the read sits inside `with _console_quiet_for_prompt():`
+     # now, so the mutant has to keep that block intact or it will not parse.
+     [("            raw = input(prompt)",
+       "            try:\n                raw = input(prompt)\n            except EOFError:\n                return default")],
      [T_YN, T_PAIR]),
 
     # ══ the add-loops ══════════════════════════════════════════════════
