@@ -42835,6 +42835,21 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     _brief_text_hr, _brief_path_hr, verbose,
                     reuse_page=_reuse_page)
             except Exception as _e:
+                # ⛔⛔ A DEAD BROWSER IS NOT A FAILED AGENT, HERE EITHER
+                # (2026-09-20). This catch fails one agent and deletes it from
+                # `pending` on ANY exception, which is exactly what the crash
+                # sweep used to do — so a browser that dies while the last
+                # agents are in hard retry empties the set one agent at a time
+                # and Phase 2 reports COMPLETE on a browser that is gone. The
+                # sweep learned to ask the context; this path had not, and it
+                # is the one path that can drain `pending` without the sweep
+                # ever running.
+                if await _browser_context_is_dead(browser):
+                    _runtime.last_failure_kind = "browser_crash"
+                    log(f"[{_agent_name}] the browser died during hard retry — unwinding "
+                        f"for checkpoint recovery rather than failing one agent", "WARN")
+                    raise RuntimeError(
+                        "research browser died during a phase 2 hard retry (browser crash)")
                 log(f"[{_agent_name}] Hard retry setup crashed: {_e}", "ERROR")
                 fail_agent(_agent_key, f"{_agent_name} couldn't restart", f"{_agent_name} hit an error while restarting. Retry to try again, or Skip it.")
                 del pending[_agent_name]
@@ -62555,6 +62570,16 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             _browser_dead = _poll_pg is None or _poll_pg.is_closed()
         except Exception:
             _browser_dead = True
+        # ⛔⛔ AND ASK THE CONTEXT TOO (2026-09-20). `is_closed()` is a question
+        # about ONE TAB, and bundle 8D9CWHZJ was a whole browser PROCESS dying:
+        # the page object can go on reporting open while every call through it
+        # fails. That lens cost nine hours in the phase-2 sweep. The cheap
+        # per-tab question is asked first and the driver round-trip only happens
+        # when the tab still looks alive — at one cycle per three minutes that
+        # is free, and it is the difference between unwinding and looping
+        # "Audio still generating..." until somebody notices.
+        if not _browser_dead:
+            _browser_dead = await _browser_context_is_dead(browser)
         if _browser_dead:
             if _login_interrupt_active():
                 _runtime.last_failure_kind = "login_interrupt"
@@ -65419,6 +65444,22 @@ def _is_browser_close_error(exc) -> bool:
         or "browser has been closed" in msg
         or "bring_to_front" in msg
         or "targetclosed" in tname
+        # ⛔⛔ OUR OWN MARKER, ADDED 2026-09-20. Every site that detects a dead
+        # browser raises a RuntimeError of its own wording — "died during phase
+        # 2", "died before the NotebookLM upload", "died during a phase 2 hard
+        # retry" — and NONE of those texts matched the patterns above, because
+        # they are our sentences, not the driver's. So the whole recovery rode
+        # on `_runtime.last_failure_kind` surviving the unwind: one side channel,
+        # set on the line before the raise, with nothing pinning the coupling.
+        # Anything that reset the runtime mid-unwind would silently downgrade a
+        # browser crash to an ordinary one-shot failure and put a Retry card in
+        # front of somebody instead of relaunching.
+        #
+        # ⭐ Every such message ends in the marker below, so the top-level
+        # handler can re-derive the kind from the exception ALONE. The flag is
+        # still set and still preferred; this is the belt to its braces, and it
+        # is the half that cannot be lost by a `reset()`.
+        or "(browser crash)" in msg
     )
 
 
@@ -68515,6 +68556,23 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             _p3gate_attempt += 1
             log(f"No research output (attempt {_p3gate_attempt}) — awaiting user decision "
                 f"(flow_b_intent={_flow_b_intent}, p2_was_skipped={_p2_was_skipped})", "WARN")
+            # ⛔⛔ WHY IS THERE NO OUTPUT? ASK BEFORE PARKING FOR A DAY
+            # (2026-09-20). "None of the agents produced a report" is a true
+            # sentence about a dead browser and a useless one — the card offers
+            # "Retry Phase 2", which cannot work, and the wait below takes
+            # `await_phase_decision`'s 24-hour default. Phase 2 now raises on a
+            # browser death, so this gate should not normally be reached that
+            # way; it is checked anyway because "should not be reached" is what
+            # was believed about the sweep, and the cost of being wrong here is
+            # a silent day.
+            if await _browser_context_is_dead(browser):
+                _runtime.last_failure_kind = (
+                    "login_interrupt" if _login_interrupt_active() else "browser_crash")
+                log("[Phase3] there is no research output because the browser is gone "
+                    "— unwinding for checkpoint recovery rather than offering a Retry "
+                    "that cannot run", "WARN")
+                raise RuntimeError(
+                    "research browser died before phase 3 could start (browser crash)")
             if _flow_b_intent:
                 # Flow B: P1+P2 skipped, user expected to bring source docs.
                 # Either none were attached, or all downloads failed (the
@@ -68862,6 +68920,32 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                                 "DEBUG")
                         break
                     log(f"Phase 3: no verified NotebookLM URL after retries — awaiting user decision ({nb_res.error})", "ERROR")
+                    # ⛔⛔ IS THE BROWSER EVEN THERE? ASKED FIRST, 2026-09-20.
+                    # Every rung below assumes a live page and answers softly
+                    # when it does not: `extract_notebooklm_url` returns an
+                    # unverified RESULT rather than raising, and
+                    # `_page_shows_login_wall` is documented never to raise and
+                    # answers None on a dead page. So a browser that died in
+                    # THIS window fell straight through to the 24-hour park
+                    # below — and unlike the upload and audio-poll paths this
+                    # block sits outside `_await_phase_with_active_deadline`, so
+                    # there is no 15-minute ceiling either. A straight
+                    # twenty-four-hour hang, with a card offering a Retry that
+                    # cannot work. Same symptom as bundle 8D9CWHZJ, one window
+                    # later, which is why it is closed in the same pass.
+                    if await _browser_context_is_dead(browser):
+                        if _login_interrupt_active():
+                            _runtime.last_failure_kind = "login_interrupt"
+                            log("[NotebookLM] browser closed by the login command before the "
+                                "notebook could be opened — pausing at the checkpoint", "WARN")
+                            raise RuntimeError(
+                                "research browser closed by the login command (login interrupt)")
+                        _runtime.last_failure_kind = "browser_crash"
+                        log("[NotebookLM] the browser is gone, not the notebook — unwinding "
+                            "for checkpoint recovery instead of parking on a Retry that "
+                            "cannot work", "WARN")
+                        raise RuntimeError(
+                            "research browser died before the notebook could be opened (browser crash)")
                     # #893: a stale trusted Google cookie lands here as a
                     # sign-in redirect — name the real cause so the card is
                     # actionable (and re-verify for real on the next gate).
