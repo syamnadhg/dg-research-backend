@@ -312,28 +312,126 @@ def get(slot: Slot, install_id: str) -> str | None:
     return blob.get(_keyring_account(slot, install_id))
 
 
+#: The macOS Security codes a keystore write actually meets, spelled out.
+#:
+#: ⛔ `keyring` renders an unmapped OSStatus as the literal string "Unknown
+#: Error", so the log line that finally surfaced this said
+#: `(-25244, 'Unknown Error')` — a number with no meaning attached, which is
+#: why it read as noise for as long as it did. These are the ones that mean
+#: something to us; anything else still gets its raw text.
+_OSSTATUS_NAMES: Final[dict[int, str]] = {
+    -25244: "errSecInvalidOwnerEdit: the item exists but belongs to a different binary",
+    -25243: "errSecNoAccessForItem: the item has no access control entry for us",
+    -25293: "errSecAuthFailed: the keychain refused authentication",
+    -25308: "errSecInteractionNotAllowed: the keychain is locked and cannot prompt",
+    -25300: "errSecItemNotFound",
+    -25299: "errSecDuplicateItem",
+}
+
+
+def _oserror_hint(e: BaseException) -> str:
+    """The exception's own text, plus what its OSStatus actually means.
+
+    Keeps the raw message — a hint that replaced the evidence would be the same
+    mistake in the other direction.
+    """
+    text = str(e)
+    for code, name in _OSSTATUS_NAMES.items():
+        if str(code) in text:
+            return f"{text} — {name}"
+    return text
+
+
+def _purge_file_shadow(acct: str) -> None:
+    """Drop `acct` from auth.json so the file cannot answer with a stale token.
+
+    Called after a good keyring write. Only rewrites the file when a shadow
+    actually exists, so the hot path does no I/O.
+    """
+    try:
+        blob = _file_load()
+        if acct in blob:
+            blob.pop(acct, None)
+            _file_save(blob)
+    except Exception:
+        pass  # best-effort; never fail a good keyring write
+
+
+def _keyring_can_still_answer(kr, acct: str) -> bool:
+    """Would `get()` get a value out of the keyring for this account?
+
+    ⭐ ASKED, NOT INFERRED. The first version of this repair decided the same
+    thing from whether a delete had raised — which is a different question and
+    got it wrong in both directions: a delete that failed with "not found" was
+    read as a stale entry surviving, and a delete that succeeded before a failed
+    rewrite was read as a clean store when the rewrite might have left one.
+    `get()` is the thing that matters; ask `get()`.
+    """
+    try:
+        return bool(kr.get_password(SERVICE, acct))
+    except Exception:
+        return False
+
+
 def set(slot: Slot, install_id: str, value: str) -> None:  # noqa: A001 - dict-ish API
     kr = _try_keyring()
+    acct = _keyring_account(slot, install_id)
     if kr is not None:
         try:
-            kr.set_password(SERVICE, _keyring_account(slot, install_id), value)  # type: ignore[attr-defined]
+            kr.set_password(SERVICE, acct, value)  # type: ignore[attr-defined]
             # Keyring is the live store → purge any file-fallback shadow for
             # this slot so auth.json can never hold a STALE token that a later
-            # get() would return on a transient keyring read miss. Only rewrites
-            # the file when a shadow actually exists (no churn on the hot path).
-            try:
-                acct = _keyring_account(slot, install_id)
-                blob = _file_load()
-                if acct in blob:
-                    blob.pop(acct, None)
-                    _file_save(blob)
-            except Exception:
-                pass  # shadow purge is best-effort; never fail a good keyring write
+            # get() would return on a transient keyring read miss.
+            _purge_file_shadow(acct)
             return
         except Exception as e:
-            log.warning("keyring write of slot=%s failed, using file: %s", slot, e)
+            # ⛔⛔ A FAILED WRITE USED TO BUILD THE EXACT SHADOW THE LINE ABOVE
+            # EXISTS TO DESTROY, and it was not hypothetical: on 2026-09-20 this
+            # machine held `previous:<install>` in BOTH stores at once — the
+            # keychain copy from 18:39:51Z, the file copy written fifty minutes
+            # later by this very fallback. `get()` asks the keyring FIRST and
+            # returns its value when non-empty, so the fresher file copy was
+            # unreachable and the rotation had written to a store nobody reads.
+            # On the `current` slot that is every refresh presenting a dead
+            # token until the machine has to be paired again.
+            #
+            # ⭐ ONE DELETE DOES BOTH JOBS, WHICH IS WHY THERE IS ONLY ONE.
+            # macOS answers errSecInvalidOwnerEdit (-25244) when the item EXISTS
+            # but was created by a different binary — a new venv, a new wheel, a
+            # reinstalled interpreter — because `set_password` MODIFIES in place
+            # and the item's ACL does not trust us. Removing the item both lets
+            # the rewrite below take ownership (curing it for every future
+            # rotation) and, if that rewrite still fails, stops the stale value
+            # answering reads. An earlier draft had two deletes for those two
+            # jobs; the second could never fire usefully, and its test passed on
+            # the first one's work.
+            with contextlib.suppress(Exception):
+                kr.delete_password(SERVICE, acct)  # type: ignore[attr-defined]
+            try:
+                kr.set_password(SERVICE, acct, value)  # type: ignore[attr-defined]
+                log.info(
+                    "keyring slot=%s belonged to another binary (%s) — "
+                    "recreated it under this one", slot, _oserror_hint(e))
+                _purge_file_shadow(acct)
+                return
+            except Exception:
+                pass
+            if _keyring_can_still_answer(kr, acct):
+                # The one genuinely bad state: two stores, disagreeing, and we
+                # cannot silence either. ERROR, and name the remedy — a WARNING
+                # is what hid this for as long as it hid.
+                log.error(
+                    "keyring write of slot=%s failed (%s) AND a stale entry is "
+                    "still readable there, so reads may return an OLD token. "
+                    "Clear it with: security delete-generic-password -s %s -a %s",
+                    slot, _oserror_hint(e), SERVICE, acct)
+            else:
+                log.warning(
+                    "keyring write of slot=%s failed (%s); the keyring is now "
+                    "silent for it, so the file store is authoritative",
+                    slot, _oserror_hint(e))
     blob = _file_load()
-    blob[_keyring_account(slot, install_id)] = value
+    blob[acct] = value
     _file_save(blob)
 
 
