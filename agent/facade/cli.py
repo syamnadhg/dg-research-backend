@@ -1644,35 +1644,61 @@ def _print_no_devices() -> None:
     # budget than `device public`'s own 40s, because this look is riding on a
     # command that was asked something else.
     res = _bridge_get("/devices/public", timeout=20.0)
-    print("No research computer on this account yet.")
-    print("     Add your own:  the computer running Super Research prints an "
-          "8-char access code —")
-    print("                    agent device add <code>")
-    # ⛔⛔ AND THE ROUTE FOR SOMEBODY WITH NO MACHINE AT ALL. The chat client's
-    # block carries the one-line installer; this screen offered an access code from a
-    # computer that may be running nothing, which is advice you cannot act on.
-    print("     No Super Research on any computer yet? Install it there first:")
-    print("       Windows:      irm https://superresearch.io/install.ps1 | iex")
-    print("       macOS/Linux:  curl -fsSL https://superresearch.io/install.sh | sh")
-    print("                     superresearch --pair")
+    print("No research computer on this account yet. Two ways in:")
+    print("  1 . Add your own computer:  the computer running Super Research "
+          "prints an")
+    print("                              8-char access code —")
+    print("                              agent device add <code>")
+    # ⭐⭐ THE PUBLIC HALF IS A NAMED, NUMBERED SECTION HERE TOO, and the install
+    # block moved BELOW it. Both halves of that are one fix. This screen rendered
+    # the list under "Or ask to use somebody else's — …" and never printed the
+    # noun, exactly as the chat client did — where a relay, which preserves what
+    # the client states and restructures what it leaves implicit, folded the
+    # nameless section into the option above it and it vanished from the chat
+    # (owner, 2026-09-20). A section with no name has nothing to survive on.
+    # ⛔ AND THE INSTALLER CANNOT SIT BETWEEN THE TWO OPTIONS. It did, so
+    # numbering them in source order would have read 1, 3, 2. The order is now the
+    # chat client's — said, own, ask, walkthrough — which is pinned on that side
+    # (tests/test_empty_state_794.py:177) for a reason that applies identically
+    # here: seven lines of shell arriving before the two options buries them.
     if res is None or res[0] != 200 or not isinstance(res[1], dict):
-        print("     Or ask to use somebody else's:  agent device public")
+        print("  2 . Public computers — ask to use somebody else's:  "
+              "agent device public")
+        _print_install_block_t()
         return
     rows = [d for d in (res[1].get("devices") or []) if isinstance(d, dict)]
     if not rows:
-        print("     Or ask to use somebody else's — but nobody is offering one "
-              "publicly right now.")
+        print("  2 . Public computers — ask to use somebody else's. Nobody is "
+              "offering one publicly right now.")
         print(_PUBLIC_NONE_WHY_T)
         if res[1].get("truncated"):
             print(_PUBLIC_TRUNCATED_NONE_T)
+        _print_install_block_t()
         return
-    print("     Or ask to use somebody else's — on offer right now:")
+    print("  2 . Public computers — ask to use somebody else's; on offer right "
+          "now:")
     for i, d in enumerate(rows, 1):
         print(_public_row(i, d))
     if res[1].get("truncated"):
         print(_PUBLIC_TRUNCATED_SOME_T)
     print("\nAsk for one by its id:  agent device ask <id>")
     print(_PUBLIC_ASK_INVITE_T)
+    _print_install_block_t()
+
+
+def _print_install_block_t() -> None:
+    """The route for somebody with no machine running Super Research at all.
+
+    ⛔⛔ EVERY EXIT FROM `_print_no_devices` OWES THIS BLOCK. It used to print
+    unconditionally, before the two options, which made it impossible to skip —
+    and also put seven lines of shell between the sentence saying what happened
+    and the two things you can do about it. Moving it last means the early
+    returns have to call it rather than fall past it, so it is a function.
+    """
+    print("\n  No Super Research on any computer yet? Install it there first:")
+    print("    Windows:      irm https://superresearch.io/install.ps1 | iex")
+    print("    macOS/Linux:  curl -fsSL https://superresearch.io/install.sh | sh")
+    print("                  superresearch --pair")
 
 
 def _public_row(i: int, d: dict) -> str:
@@ -2702,12 +2728,23 @@ def _print_agent_log_choice() -> None:
     `--help` and nowhere a person doing this task is looking. The list is what
     they read while deciding, so the choice is numbered and printed beside it.
 
-    ⛔⛔ BUT BELOW THE LIST AND NOT INSIDE IT, and that is the whole reason this
-    is a separate function. Every row above it is material on the RESEARCH
+    ⛔⛔ OUTSIDE THE MACHINE'S TABLE, AND THAT IS THE WHOLE REASON THIS IS A
+    SEPARATE FUNCTION. Every row in that table is material on the RESEARCH
     computer; this file is on the host running the command, and the two are
     routinely not the same machine. A row indented into that table would say the
     research computer holds it — the exact confusion a sibling guard already
     polices in the consent copy.
+
+    ⚠ IT USED TO SAY "BELOW THE LIST" AND IT NOW PRINTS ABOVE IT (2026-09-20).
+    The rationale did not change and is not weakened — it is strengthened: row 0
+    now sits above the `Research computer: <name>` header entirely, so it is not
+    merely un-indented from that machine's table, it is outside the scope of the
+    line that names the machine at all. What changed is the reason for the
+    position. Printing 0 LAST handed a relay a list that counts down (1, 2, 0),
+    which no assistant will show a person; one renumbered it into its own scheme
+    and the person then answered in numbers that were not this command's. Reading
+    order now matches numbering order, so a relay that preserves order is correct
+    by construction. The chat twin made the same move for the same reason.
 
     ⛔ AND IT PRINTS ON EVERY BRANCH, including the two where the list is empty.
     The no-runs cases are when somebody is most likely to want this — the trouble
@@ -2719,15 +2756,21 @@ def _print_agent_log_choice() -> None:
     # that is the standard setup — so asserting they differ is false for most
     # people reading it, and a claim that is plainly wrong on your own screen
     # teaches you to discount the rest of the plan.
-    print("   0  the log from the agent on THIS host — the machine you are "
+    # ⭐ "Run 0", NOT A BARE DIGIT — the same label the chat twin prints, for a
+    # reason that is the chat's and not this screen's (a relay cannot re-wrap a
+    # number that rides inside the text). It is carried here anyway because the
+    # two clients share one selection vocabulary: `_resolve_log_selection` takes
+    # the same tokens on both, and a person who reads "Run 0" in one place and
+    # "0" in the other has been shown two names for one row.
+    print("  Run 0  the log from the agent on THIS host — the machine you are "
           "typing on,")
-    print("      which may not be that computer")
+    print("         which may not be that computer")
 
 
 def _print_held_runs(rows: list) -> None:
     for i, row in enumerate(rows, 1):
         started = (row.get("startedUtc") or "")[:16].replace("T", " ")
-        print(f"  {str(i).rjust(2)}  {_run_label(row)[:40].ljust(40)}  "
+        print(f"  Run {str(i).ljust(2)}  {_run_label(row)[:40].ljust(40)}  "
               f"{started.ljust(16)}  {str(row.get('status') or '?').ljust(10)}  "
               f"{_size_words(row.get('sizeBytes'))}")
 
@@ -2881,6 +2924,9 @@ def cmd_send_logs(args: argparse.Namespace) -> int:
     name = body.get("deviceName") or device_id or "that computer"
     owned = bool(body.get("owned"))
 
+    # ⛔ ROW 0 FIRST, THEN THE LINE THAT NAMES THE MACHINE. The header scopes
+    # everything below it to the research computer, and row 0 is not on it.
+    _print_agent_log_choice()
     print(f"Research computer: {name}")
     if not body.get("published"):
         # ⛔⛔ NOT "it holds none of your runs". The document is absent, which
@@ -2894,7 +2940,6 @@ def cmd_send_logs(args: argparse.Namespace) -> int:
         _print_held_runs(rows)
         if body.get("truncated"):
             print("  (only the most recent are listed — it holds more)")
-    _print_agent_log_choice()
 
     if args.list:
         return 0

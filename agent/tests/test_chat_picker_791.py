@@ -101,14 +101,311 @@ def test_the_plan_numbers_every_run(wire, capsys):
     assert "3 · Tides again" in out
 
 
+def _status_out(monkeypatch, capsys, **extra):
+    """Run `--status CODE` against a bridge reply with no row and the given
+    diagnostic extras."""
+    def get(path, timeout=None):
+        return 200, {"code": "BUNDLE11", "row": None, **extra}
+    monkeypatch.setattr(sr, "_get", get)
+    sr.cmd_send_logs(_args(status="BUNDLE11"))
+    return capsys.readouterr().out
+
+
+def test_a_machine_that_took_the_request_is_reported_as_packaging(monkeypatch, capsys):
+    """⭐ THE COMMAND IS GONE, SO A MACHINE READ IT. Worker 1 deletes the command
+    before dispatching, which makes its absence a delivery receipt — the only one
+    this protocol has."""
+    out = _status_out(monkeypatch, capsys, picked=True, deviceOnline=True,
+                      deviceName="Macbook", ageSeconds=90)
+    assert "HAS picked the request up" in out, out
+    assert "packaging it" in out
+
+
+def test_a_machine_that_never_took_it_and_is_not_answering_is_terminal(monkeypatch, capsys):
+    """⛔⛔ THE CASE THAT USED TO BE UNSAYABLE, AND THE ONE THAT HAPPENED. The
+    command is still sitting there, so nothing read it; the device is not
+    answering, so nothing will until it is back. The device's stale gate MARKS
+    rather than deletes, so an unread command persists indefinitely — this is not
+    a race, it is a standing state. Telling somebody to keep waiting would be
+    telling them to wait for nothing."""
+    out = _status_out(monkeypatch, capsys, picked=False, deviceOnline=False,
+                      deviceName="Macbook", ageSeconds=1020)
+    assert "hasn’t picked up the request" in out, out
+    assert "isn’t answering right now" in out
+    assert "17 minutes" in out
+    # ⛔ NEVER "it is off" — a late heartbeat reads identically to a dead machine
+    assert "is off" not in out
+
+
+def test_an_unknown_receipt_keeps_the_honest_ambiguity(monkeypatch, capsys):
+    """⛔ `picked` IS ABSENT WHEN THIS BRIDGE DID NOT MINT THE CODE — restarted
+    since the send, or a code from another host. Then nothing distinguishes the
+    two causes and the old sentence is the true one. It is the FALLBACK, not the
+    default; making it the default is what produced four identical non-answers."""
+    out = _status_out(monkeypatch, capsys, deviceName="Macbook")
+    assert "may still be packaging it, or may not have picked the request up" in out
+
+
+def test_the_half_that_did_arrive_is_named_on_the_waiting_branch(monkeypatch, capsys):
+    """⛔ ON THIS BRANCH THE AGENT'S LOG IS THE ONLY THING SUPPORT CAN READ. A
+    message about the half that did not arrive is exactly where somebody forgets
+    the other half went at all."""
+    out = _status_out(monkeypatch, capsys, picked=False, deviceOnline=False,
+                      deviceName="Macbook", agentLogCode="AGENTLOG")
+    assert "AGENTLOG" in out, out
+    assert "did go, separately" in out
+
+
+def _two_code_wire(monkeypatch):
+    """A wire that answers the two routes with DIFFERENT codes, so a test can
+    tell which code came from which send. The shared fixture answers both with
+    one string, which cannot distinguish them."""
+    seen = []
+
+    def post(path, body=None):
+        seen.append({"path": path, "body": body})
+        if path == "/logs/agent-log":
+            return 200, {"ok": True, "sent": True, "standalone": True,
+                         "code": "AGENTLOG", "bytes": 4096}
+        return 200, {"ok": True, "code": "BUNDLE11"}
+
+    w = _Wire()
+    monkeypatch.setattr(sr, "_get", w.get)
+    monkeypatch.setattr(sr, "_post", post)
+    return seen
+
+
+def test_the_agent_log_goes_first_and_alone_on_a_combined_confirm(monkeypatch, capsys):
+    """⭐⭐ THE LOCAL FILE STOPS WAITING FOR A REMOTE MACHINE. It used to be
+    DEFERRED: the confirmed send printed "the agent's own log goes up once that
+    computer's bundle lands" and handed over `--status <CODE> --agent-log`, which
+    the bridge refuses until the machine's row exists. On 2026-09-20 the Macbook
+    never answered, so the refusal never lifted — and a file sitting readable on
+    THIS disk, needing no device and nobody's permission, was lost along with a
+    bundle it had no reason to be attached to.
+
+    ⛔ ORDER IS THE FIX, NOT A DETAIL. `/logs/agent-log` must be posted BEFORE
+    `/logs/send`, because `/logs/send` writes a Firestore command and answers 502
+    when Firestore is the broken thing — which is one of the states people send
+    agent logs about."""
+    seen = _two_code_wire(monkeypatch)
+    sr.cmd_send_logs(_args(confirm=True, runs="1", agent_log=True))
+    assert [p["path"] for p in seen] == ["/logs/agent-log", "/logs/send"], seen
+    # ⛔ STANDALONE, AND CARRYING THE CONSENT CLAIM — symmetric with /logs/send.
+    assert seen[0]["body"] == {"standalone": True, "consent": True}
+
+
+def test_both_codes_are_reported_and_each_is_named(monkeypatch, capsys):
+    """⛔ TWO BARE CODES IN A CHAT MESSAGE IS HOW SOMEBODY QUOTES THE WRONG ONE AT
+    SUPPORT. Each has to arrive with its role attached."""
+    _two_code_wire(monkeypatch)
+    sr.cmd_send_logs(_args(confirm=True, runs="1", agent_log=True))
+    out = capsys.readouterr().out
+    assert "AGENTLOG" in out and "BUNDLE11" in out, out
+    said = out[:out.index(sr._AGENT_ONLY_MARKER)]
+    assert "agent’s own log" in said and "AGENTLOG" in said
+    assert "BUNDLE11" in said
+
+
+def test_the_already_sent_log_is_never_offered_a_second_time(monkeypatch, capsys):
+    """⛔⛔ THE DUPLICATE IS REFUSED BY NAME, NOT LEFT TO JUDGEMENT. The old
+    directive pointed at `--status <CODE> --agent-log`; run after a two-code send
+    that uploads the SAME file again under the other code, spending one of the
+    account's ten hourly uploads on a copy of material carrying a masked email and
+    a whole sign-in trail."""
+    _two_code_wire(monkeypatch)
+    sr.cmd_send_logs(_args(confirm=True, runs="1", agent_log=True))
+    out = capsys.readouterr().out
+    directives = out[out.index(sr._AGENT_ONLY_MARKER):]
+    assert "ALREADY SENT" in directives, directives
+    assert "Do NOT run" in directives
+    # ⛔ and the old deferral promise is gone from the whole message
+    assert "goes up once that computer’s bundle lands" not in out
+
+
+def test_a_failed_local_send_does_not_stop_the_machine_request(monkeypatch, capsys):
+    """⛔ NEVER FATAL, IN EITHER DIRECTION. The local upload runs first, so a
+    failure there must not take the machine request with it — and the person must
+    be told which half did not go rather than left to infer it from one code."""
+    seen = []
+
+    def post(path, body=None):
+        seen.append(path)
+        if path == "/logs/agent-log":
+            return 500, {"error": "storage unreachable"}
+        return 200, {"ok": True, "code": "BUNDLE11"}
+
+    w = _Wire()
+    monkeypatch.setattr(sr, "_get", w.get)
+    monkeypatch.setattr(sr, "_post", post)
+    rc = sr.cmd_send_logs(_args(confirm=True, runs="1", agent_log=True))
+    out = capsys.readouterr().out
+    assert seen == ["/logs/agent-log", "/logs/send"], seen
+    assert rc == 0, "a failed local half must not fail the whole command"
+    assert "didn’t go" in out and "BUNDLE11" in out, out
+
+
+def test_no_research_computer_still_sends_the_local_half(monkeypatch, capsys):
+    """⭐⭐ THE STATE THE OLD CODE LOST IT IN MOST RELIABLY. `/logs/runs` refuses
+    with `no_devices`, and the whole command used to return on that branch — so
+    somebody whose problem WAS having no reachable computer could not send the one
+    file that describes it. The upload now happens above that fetch."""
+    seen = []
+
+    def get(path, timeout=None):
+        if path.startswith("/logs/runs"):
+            return 400, {"reason": "no_devices", "error": "no computer"}
+        return 200, {"devices": [], "selectedDeviceId": None}
+
+    def post(path, body=None):
+        seen.append(path)
+        return 200, {"ok": True, "sent": True, "standalone": True,
+                     "code": "AGENTLOG", "bytes": 10}
+
+    monkeypatch.setattr(sr, "_get", get)
+    monkeypatch.setattr(sr, "_post", post)
+    sr.cmd_send_logs(_args(confirm=True, runs="1", agent_log=True))
+    out = capsys.readouterr().out
+    assert seen == ["/logs/agent-log"], seen
+    # ⛔ AND THE RECEIPT IS PRINTED ON THAT BRANCH, not swallowed by the refusal
+    assert "AGENTLOG" in out, out
+
+
+def test_row_zero_leads_and_the_list_counts_up(wire, capsys):
+    """⭐⭐ READING ORDER MUST MATCH NUMBERING ORDER. Row 0 printed LAST, after
+    runs 1..N, so the plan handed a relay a list that counts 1, 2, 0 — and no
+    assistant will show a person a list that counts down. On 2026-09-20 one
+    renumbered into its own "1."/"2.", the person answered in the RELAY's numbers,
+    and those are not this command's numbers. With one run that refused loudly;
+    with two it would have sent a valid but WRONG run's results, links and account
+    email to support under a consent given for a different row."""
+    sr.cmd_send_logs(_args())
+    rows = [ln for ln in capsys.readouterr().out.splitlines()
+            if ln.startswith("  Run ")]
+    assert [ln.split()[1] for ln in rows] == ["0", "1", "2", "3"], rows
+
+
+def test_the_machine_header_scopes_only_what_is_under_it(wire, capsys):
+    """⛔ ROW 0 IS NOT ON THE RESEARCH COMPUTER, so it must not sit under a line
+    naming one. The header used to read "the logs from “Studio PC”:" and cover
+    the whole list — survivable only while row 0 was far enough down to read as
+    an aside. Moving 0 to the top without de-scoping the header would have traded
+    a numbering confusion for a locality one, in a CONSENT screen, reversing the
+    reason cli.py:2688 gives for `_print_agent_log_choice` existing at all."""
+    out = (sr.cmd_send_logs(_args()), capsys.readouterr().out)[1]
+    lines = out.splitlines()
+    head = next(i for i, ln in enumerate(lines) if ln.startswith("I can send"))
+    zero = next(i for i, ln in enumerate(lines) if ln.startswith("  Run 0 "))
+    scope = next(i for i, ln in enumerate(lines) if ln.startswith("From “"))
+    one = next(i for i, ln in enumerate(lines) if ln.startswith("  Run 1 "))
+    assert head < zero < scope < one, lines
+    # ⛔ and the top line names NO computer
+    assert "Studio PC" not in lines[head]
+
+
+def test_every_row_carries_its_number_inside_the_text(wire, capsys):
+    """⭐⭐ THE NUMBER RIDES IN THE TEXT, NOT IN THE POSITION. A bare leading digit
+    is positional, so a relay that re-wraps the rows into its own ordered list
+    creates a SECOND numbering with equal authority and the two silently disagree.
+    A label the client supplies cannot be re-wrapped away — the relay's own index
+    becomes visibly redundant beside it instead of competing with it.
+
+    ⛔ THIS IS MEASURED, NOT ASSUMED. In the 2026-09-20 transcript the assistant
+    invented exactly these labels and mapped them CORRECTLY while getting the
+    order wrong. The label is the part that already survives a relay; the bare
+    digit is the part that did not."""
+    sr.cmd_send_logs(_args())
+    out = capsys.readouterr().out
+    for n in range(4):
+        assert len([ln for ln in out.splitlines()
+                    if ln.startswith(f"  Run {n} ")]) == 1, (n, out)
+
+
+def test_the_row_carries_the_runs_own_status(wire, capsys):
+    """⛔ THE TERMINAL HAS ALWAYS PRINTED IT AND THE CHAT DROPPED IT. `/logs/runs`
+    forwards each run's status; `_log_run_label` discarded it, so a run that had
+    STOPPED mid-phase was offered as a plain title and a size. Somebody choosing
+    what to send support is choosing between runs, and which one broke is the
+    thing they are choosing on."""
+    sr.cmd_send_logs(_args(runs="all"))
+    out = capsys.readouterr().out
+    failed = next(ln for ln in out.splitlines() if "Tides again" in ln)
+    assert "failed" in failed, failed
+    ok = next(ln for ln in out.splitlines() if "Tidal power" in ln)
+    assert "completed" in ok, ok
+
+
+def test_a_machine_that_is_not_answering_says_so_before_the_offer(monkeypatch, capsys):
+    """⭐⭐ THE FACT WAS ON THE WIRE AND NEVER PRINTED. `/logs/runs` returns
+    `online`; this client dropped it. The MACHINE zips and uploads the bundle —
+    the app only mints the code — so a machine that is not answering yields a
+    support code that names nothing, with no error anywhere. On 2026-09-20 that
+    produced four status checks over seventeen minutes, each answered "nothing
+    has come back yet", while the fact that explained it was already in hand.
+
+    ⛔ IT SAYS SO; IT DOES NOT REFUSE. This is heartbeat freshness, not truth."""
+    wire = _Wire()
+    base = wire.get
+
+    def off(path, timeout=None):
+        code, body = base(path, timeout)
+        if path.startswith("/logs/runs"):
+            body = {**body, "online": False}
+        return code, body
+
+    monkeypatch.setattr(sr, "_get", off)
+    monkeypatch.setattr(sr, "_post", wire.post)
+    sr.cmd_send_logs(_args())
+    out = capsys.readouterr().out
+    scope = next(ln for ln in out.splitlines() if ln.startswith("From “"))
+    assert "isn’t answering right now" in scope, scope
+    # ⛔ NEVER "is off" — a late heartbeat reads identically to a dead machine
+    assert "is off" not in out
+    # ⛔ AND ROW 0 IS STILL OFFERED: it needs no machine at all, which is exactly
+    # why it must survive this branch
+    assert any(ln.startswith("  Run 0 ") for ln in out.splitlines()), out
+
+
+def test_the_relay_rule_rides_with_the_rows_not_only_in_skill_md(wire, capsys):
+    """⭐⭐ SKILL.md SAYS "relay verbatim" TWELVE TIMES — once in bold and
+    output-specific to this exact plan — and on 2026-09-20 the plan was reflowed
+    into a Markdown list under a second set of numbers anyway. Prose three hundred
+    lines away is measured-failed. The two relay rules in this skill that have
+    NEVER failed are both carried IN BAND (`_AGENT_ONLY_MARKER`, the `MEDIA:`
+    line), attached to the bytes they govern. So is this one.
+
+    ⛔ AND IT IS LAST. The action directive is what the assistant must DO; a
+    formatting rule placed above it pushes the thing that matters into second
+    place."""
+    sr.cmd_send_logs(_args())
+    lines = capsys.readouterr().out.splitlines()
+    marker = next(i for i, ln in enumerate(lines) if sr._AGENT_ONLY_MARKER in ln)
+    rule = next(i for i, ln in enumerate(lines) if "Do NOT re-number them" in ln)
+    action = next(i for i, ln in enumerate(lines) if ln.startswith("If they say yes"))
+    rows = [i for i, ln in enumerate(lines) if ln.startswith("  Run ")]
+    # rows above the marker (the user sees them), rule below it, action first
+    assert max(rows) < marker < action < rule, (rows, marker, action, rule)
+    assert "Run N" in lines[rule]
+
+
 def test_the_plan_says_which_are_not_picked_in_words(wire, capsys):
     """⛔ A MARKER ALONE IS NOT A SENTENCE. `•` versus `·` is one glyph apart and
     is the only thing separating "this is going" from "this is not" — in a chat
     relayed through a model and read on a phone."""
     sr.cmd_send_logs(_args(runs="1"))
     out = capsys.readouterr().out
-    assert "Kelp — 2.1 MB   (not picked)" in out
-    assert "Tidal power — 1.0 MB\n" in out
+    # ⚠ REPINNED 2026-09-20: each row now also carries the RUN'S OWN STATUS,
+    # which the terminal twin has always printed and this client dropped — so a
+    # run that had stopped mid-phase was offered as a plain size. The property
+    # under test is untouched: "not picked" is stated in words, not left to one
+    # glyph. Split in two so the status between them is not re-pinned here;
+    # `test_the_row_carries_the_runs_own_status` owns that claim.
+    kelp = next(ln for ln in out.splitlines() if "Kelp" in ln)
+    assert kelp.startswith("  Run 2 · Kelp — 2.1 MB"), kelp
+    assert kelp.endswith("   (not picked)"), kelp
+    tidal = next(ln for ln in out.splitlines() if "Tidal power" in ln)
+    assert tidal.startswith("  Run 1 • Tidal power — 1.0 MB"), tidal
+    assert "(not picked)" not in tidal
 
 
 def test_the_count_still_names_only_what_is_going(wire, capsys):

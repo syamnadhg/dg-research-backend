@@ -184,8 +184,8 @@ back into `do`.
 | "update Super Research", "update the backend", "update the research computer" | the runtime does NOT update the backend — tell them to run `superresearch --update` on the Research computer **or** update it from the app (Settings → About / the update notification). `sr.py do "<message>"` returns this exact redirect. |
 | "send my logs", "share the logs with support", "submit diagnostics" | `sr.py send-logs` — it SHOWS what would go and sends nothing. On "yes", run `sr.py send-logs --confirm`. See **Sending logs to support** |
 | "did my logs go through?", "check on that support code" | `sr.py send-logs --status <CODE>`. ⛔ **A FOLLOW-UP, NOT A STANDALONE ASK** — it needs the support code from the earlier reply, so `sr.py do "<message>"` cannot resolve it and will answer with the catch-all. Run the flag yourself with the code you were given |
-| "just the one about X", "only the first two", "not all of them" | ⛔ **ANSWERS TO THE PLAN THIS COMMAND JUST PRINTED**, not standalone asks — `sr.py do` cannot resolve them, because the numbers exist only on the screen in front of the user. the plan numbers every run — pass those numbers back with `--runs`, comma-separated: `sr.py send-logs --runs 1,3` (and again on `--confirm`). `--runs 0` is the agent's own log, `--runs all` is every run listed. A name works too. Do **not** guess a number the plan did not print |
-| "send the agent's log too", "include the bridge log", "the log from this chat" | ⛔ **SAID INSIDE THE SEND-LOGS FLOW** — on its own, "include the bridge log" names no request to add it to, so `sr.py do` answers with the catch-all. add `--agent-log` to the **bare** command **and to `--confirm`** — or say `--runs 0`, which is the same thing and is the number the plan prints for it. It uploads nothing on either; it makes the plan name it, and makes the client hand you `sr.py send-logs --status <CODE> --agent-log` for once the bundle lands. **Not** owner-gated. See **Sending logs to support** |
+| "just the one about X", "only the first two", "not all of them" | ⛔ **ANSWERS TO THE PLAN THIS COMMAND JUST PRINTED**, not standalone asks — `sr.py do` cannot resolve them, because the numbers exist only on the screen in front of the user. the plan labels every row — `Run 0`, `Run 1`, `Run 2` — pass those numbers back with `--runs`, comma-separated: `sr.py send-logs --runs 1,3` (and again on `--confirm`). `--runs 0` is the agent's own log, `--runs all` is every run listed. A name works too. ⛔ **POSITIONAL PHRASES RESOLVE AGAINST THE LABEL, NEVER THE SCREEN POSITION** — `Run 0` is printed FIRST, so "the first two" means `Run 0` and `Run 1`, i.e. `--runs 0,1`, and "the first one" is `--runs 0`. Read the label off the row; do not count down the screen. Do **not** guess a number the plan did not print |
+| "send the agent's log too", "include the bridge log", "the log from this chat" | ⛔ **SAID INSIDE THE SEND-LOGS FLOW** — on its own, "include the bridge log" names no request to add it to, so `sr.py do` answers with the catch-all. add `--agent-log` to the **bare** command **and to `--confirm`** — or say `--runs 0`, which is the same thing and is the number the plan prints for it. On the bare command it only makes the plan name it. On `--confirm` the client sends it **immediately and on its own**, before it asks the research computer for anything, and hands back **a second support code** for it — quote both, and never re-send it with `--status <CODE> --agent-log`. **Not** owner-gated. See **Sending logs to support** |
 | "are there any public computers?", "show me computers I could ask to use" | `sr.py devices-public` (only machines whose owners offer them; the id on each row is what the next command takes — public names collide, an unnamed one reads as "Research computer" for everybody). A row marked "can't take anyone else" is full: asking would be refused |
 | "I don't have a computer of my own", "I have no computer", "I haven't got a machine" | `sr.py devices` — **not** `devices-public`. It answers from the account's own list, and when that list is empty it IS the full answer: no computer here, add your own with an access code, or ask to use one of the public ones, which it lists. Sending these to `devices-public` told anybody who DID have a computer to go and ask a stranger |
 | "make my computer public", "let people find my mac", "offer my machine to other people" | **confirm** — relay the client's question verbatim (strangers would see the name the computer reports, which on an unrenamed machine is often its OWNER'S own name; the user still approves each person) — then `sr.py device-visibility public` (add `"<name>"` only if they named a computer; with one machine the user OWNS the client picks it, with several it asks which — a shared machine is never picked and never offered, because its visibility is not theirs to set) |
@@ -425,15 +425,22 @@ like a shortcut, makes a claim about a conversation that did not happen.
   one they have, because those are exactly the people who cannot build a bundle
   for it to ride. It is still two steps: the bare command prints the plan, and
   nothing leaves until you pass `--confirm`.
-  ⛔ Riding a bundle is the OTHER shape and still works the old way. When runs
-  ARE going, **it does not ride the send** — so **pass `--agent-log` on
-  `--confirm` too**: nothing is uploaded on that call either, and it is what
-  makes the client tell the user a step is still outstanding and hand you the
-  exact follow-up command. Leave it off and you get neither, and the second step
-  survives only in your memory. Run that follow-up when the user asks you to
-  check, never on a timer. Refused before then is by design, not a fault; a
-  failure there leaves the bundle and the support code untouched; "nothing to
-  add" means the log was empty.
+  ⭐ **When runs are going too, it STILL goes on its own — and it goes FIRST.**
+  **Pass `--agent-log` on `--confirm` as well**: the client uploads this host's
+  log standalone, under **its own second support code**, *before* it asks the
+  research computer for anything. So it survives a computer that never answers,
+  a Firestore that is down, and a selection that went stale — every state in
+  which it used to be lost. You get **two codes**: tell the user which is which
+  (one is this host's log, sent; the other is that computer's bundle, requested)
+  and quote both. Leave the flag off `--confirm` and the log does not go at all.
+  ⛔ **Never re-send it.** `--status <CODE> --agent-log` attaches a log to a
+  bundle and exists only for a request made WITHOUT `--agent-log` on the confirm.
+  Running it after a two-code send uploads the same file twice and spends one of
+  the account's ten uploads an hour on a duplicate. The client tells you outright
+  when it has already gone — believe it.
+  ⛔ Refused before the bundle lands is by design, not a fault; a failure there
+  leaves the bundle and the support code untouched; "nothing to add" means the
+  log was empty.
 - **No runs listed** is normal on a computer that has just been set up, and it
   is exactly the connection-problem case: offer the computer's own logs instead
   if the user owns it.

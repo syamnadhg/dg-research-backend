@@ -349,7 +349,10 @@ def test_the_zero_choice_is_printed_on_every_branch(monkeypatch, published, rows
     it only when there is something else to offer is how that happened."""
     wire = _Wire(rows=rows, published=published)
     _, out = _run(monkeypatch, _args(list=True), wire)
-    assert "   0  the log from the agent on THIS host" in out
+    # ⚠ REPINNED 2026-09-20: the row is labelled "Run 0" and prints ABOVE the
+    # machine's table rather than below it. The claim under test is unchanged —
+    # it appears on every branch, including the two that print no list at all.
+    assert "  Run 0  the log from the agent on THIS host" in out
 
 
 def test_the_zero_row_names_the_other_computer(monkeypatch):
@@ -359,8 +362,13 @@ def test_the_zero_row_names_the_other_computer(monkeypatch):
     confusion in the consent copy."""
     wire = _Wire()
     _, out = _run(monkeypatch, _args(list=True), wire)
-    block = [ln for ln in out.splitlines() if ln.startswith("   0  ")
-             or ln.startswith("      which may not be")]
+    # ⚠ REPINNED 2026-09-20 for the label and the new position. Same property:
+    # two lines, outside the machine's table, naming whose host it is. It now
+    # sits ABOVE the `Research computer:` header rather than below the table,
+    # which makes the separation stronger rather than weaker — it is outside the
+    # scope of the line that names the machine at all.
+    block = [ln for ln in out.splitlines() if ln.startswith("  Run 0  ")
+             or ln.startswith("         which may not be")]
     assert len(block) == 2, out
     assert "the machine you are typing on" in block[0]
     # ⛔ AND IT DOES NOT ASSERT THEY DIFFER. The recommended install co-locates
@@ -377,7 +385,7 @@ def test_the_runs_are_still_numbered_from_one(monkeypatch):
     from zero the agent log would silently become run one."""
     wire = _Wire()
     _, out = _run(monkeypatch, _args(list=True), wire)
-    assert "   1  Tidal power" in out
+    assert "  Run 1   Tidal power" in out
     assert "   0  Tidal power" not in out
 
 

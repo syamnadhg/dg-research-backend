@@ -610,6 +610,37 @@ class FirestoreRest:
         row["code"] = doc_id(body.get("name", "")) or code
         return row
 
+    def get_device_command(self, device_id: str,
+                           command_id: str) -> dict[str, Any] | None:
+        """One device command, or None when it is GONE — which is the receipt.
+
+        ⭐⭐ ITS DISAPPEARANCE IS THE ONLY DELIVERY RECEIPT THIS PROTOCOL HAS.
+        The machine DELETES a command before acting on it (see
+        `write_device_command`), so "gone" means a machine read it and "still
+        there" means none ever did. Without this, a caller waiting on a support
+        bundle can only recite "it may still be packaging, or may not have been
+        picked up" forever — which is exactly what a person was told four times
+        over seventeen minutes on 2026-09-20 while the answer was one read away.
+
+        ⛔⛔ AND "STILL THERE" IS A DURABLE ANSWER, NOT A RACE. The device's 30s
+        stale gate MARKS rather than deletes, so a command written to a machine
+        that is not running sits here indefinitely. Combined with that device
+        being offline, a command still present is terminal: nothing is coming.
+
+        ⛔ THE RULE ALREADY ALLOWS THIS AND WAS WRITTEN FOR IT. firestore.rules
+        scopes the read to `submittedBy == request.auth.uid` and admits the
+        `resource == null` case explicitly — the comment above that clause says
+        the single-document read of something absent IS the receipt. The web app
+        consumes it the same way (`watchCommandGone`, src/lib/logBundles.ts);
+        this is the agent reaching parity, not a new permission.
+        """
+        url = (f"{config.FIRESTORE_BASE}/devices/{device_id}"
+               f"/commands/{command_id}")
+        body = self._request("GET", url, allow_missing=True)
+        if body is None:
+            return None
+        return fields_to_dict(body)
+
     def write_device_command(self, device_id: str, action: str, *, uid: str,
                              extra: dict[str, Any] | None = None) -> str:
         """Write a DEVICE-scoped command to ``devices/{deviceId}/commands`` —

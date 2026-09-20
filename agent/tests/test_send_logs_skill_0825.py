@@ -593,39 +593,64 @@ def test_the_table_routes_someone_who_asks_for_it() -> None:
         "the row names the flag without the follow-up that actually sends it", row)
 
 
-def test_the_document_names_the_follow_up_command_this_client_prints() -> None:
-    """⛔ PINNED AGAINST THE CLIENT'S OWN DIRECTIVE, not against a remembered
-    string. The client hands the assistant `--status <CODE> --agent-log`; a
-    document that named a different spelling would hand it a second, conflicting
-    instruction at exactly the moment it is deciding what to run."""
+def test_the_document_and_the_client_agree_the_log_is_already_sent() -> None:
+    """⛔ PINNED AGAINST THE CLIENT'S OWN DIRECTIVE, not a remembered string — a
+    document naming a different spelling hands the assistant a second, conflicting
+    instruction at the moment it is deciding what to run.
+
+    ⭐⭐ AND THE DIRECTIVE REVERSED ON 2026-09-20. The client used to print
+    `--status <CODE> --agent-log   (it is refused until then, by design)` — a
+    SECOND STEP, gated on a machine answering. When the machine did not answer,
+    the local file was lost with it. The log is now sent up front, so the client's
+    directive on that path is the OPPOSITE: it names the code the log already went
+    under and forbids the re-send, which would upload the same file twice and
+    spend one of the account's ten hourly uploads on a duplicate.
+
+    ⛔ THE ATTACH SHAPE STILL EXISTS and the document must still spell it, because
+    a request confirmed WITHOUT `--agent-log` can still add one afterwards."""
     src = _SR.read_text(encoding="utf-8")
-    # ⛔ NOT an `or` against a looser pattern. The first draft accepted
-    # "--status {support}" as a fallback — a string the UNCONDITIONAL check
-    # directive already contains — so the guard passed with the agent-log
-    # directive deleted. Mutation found it. This names the agent-log line alone.
-    assert "--agent-log   (it is refused until then, by design)" in src, (
-        "the client stopped printing the follow-up this document promises")
+    assert "The agent’s log is ALREADY SENT, as {agent_log_code}" in src, (
+        "the client stopped telling the assistant the log has already gone — "
+        "without that line the obvious next move is to upload it a second time")
+    assert "Never re-send it" in _sending_logs_section(), (
+        "the document must forbid the duplicate the client's own directive forbids")
     assert "--agent-log" in _sending_logs_section()
     assert "--status <CODE> --agent-log" in SKILL_MD, (
-        "the document must spell the follow-up the way the client prints it")
+        "the attach shape is still reachable and must still be spelled out")
 
 
-def test_the_document_does_not_let_it_ride_the_send() -> None:
-    """⛔⛔ THE UPLOAD IS A SEPARATE STEP AND ALWAYS WAS. `cmd_send_logs` reads
-    `agent_log` on the plan branch and on the `--status` branch; the confirmed send
-    never posts it. An assistant told to add the flag to `--confirm` and left there
-    would report a log as sent that no one ever uploaded.
+def test_the_agent_log_is_uploaded_BEFORE_the_machine_is_asked() -> None:
+    """⭐⭐ IT NO LONGER RIDES THE SEND — IT OVERTAKES IT (owner, 2026-09-20).
 
-    Pinned against the client so this fails loudly if the send path ever learns to
-    carry it, rather than quietly documenting the old shape forever."""
+    ⛔⛔ AND THIS GUARD WAS RE-ANCHORED, BECAUSE THE OBVIOUS FLIP WOULD HAVE LEFT
+    IT GREEN AND ENFORCING NOTHING. It used to slice the function AFTER the
+    `/logs/send` post and assert `/logs/agent-log` was absent from that tail. The
+    upload now sits BEFORE that line, so the old assertion still PASSED while the
+    statement it existed to enforce had become false — the exact failure mode this
+    repo has already eaten once, a guard staying green over a claim that had
+    quietly reversed. It therefore asserts PRESENCE, in the region between the
+    argument parsing and the machine request.
+
+    The fix this pins: a purely LOCAL file — this host's agent log, on this disk,
+    needing no device and nobody's permission — was queued behind a remote machine
+    and lost when that machine never answered."""
     src = _SR.read_text(encoding="utf-8")
     body = src[src.index("def cmd_send_logs"):]
     body = body[:body.index("\ndef ", 1)]
-    send = body[body.index('code, sent = _post("/logs/send"'):] \
-        if 'code, sent = _post("/logs/send"' in body else body[body.index('"/logs/send"'):]
-    assert "/logs/agent-log" not in send, (
-        "the send path uploads it now — the document must stop saying it does not")
-    assert "does not ride the send" in _agent_log_bullet()
+    at_send = body.index('code, sent = _post("/logs/send"')
+    before = body[:at_send]
+    assert "_send_agent_log_now(args)" in before, (
+        "the agent log must be uploaded BEFORE the machine is asked — that is the "
+        "whole fix; a deferred upload is lost whenever the machine does not answer")
+    # ⛔ AND ABOVE THE RUN LIST TOO. `/logs/runs` refuses with no_selection /
+    # stale_selection / no_devices, and each of those used to lose the local file.
+    assert before.index("_send_agent_log_now(args)") < before.index('"/logs/runs"'), (
+        "it must not sit behind the run-list fetch, which refuses for four "
+        "reasons that have nothing to do with this host's own log")
+    # ⛔ AND IT MUST CARRY consent, exactly as the machine request does.
+    assert '"standalone": True, "consent": True' in src, (
+        "an immediate upload without a consent claim is a plan the person never saw")
+    assert "goes FIRST" in _agent_log_bullet()
 
 
 def test_the_document_says_to_pass_it_on_the_confirmed_call_too() -> None:
@@ -647,14 +672,22 @@ def test_the_document_says_to_pass_it_on_the_confirmed_call_too() -> None:
     body = src[src.index("def cmd_send_logs"):]
     body = body[:body.index("\ndef ", 1)]
     after_send = body[body.index('code, sent = _post("/logs/send", payload)'):]
-    assert "if agent_log:" in after_send, (
+    # ⚠ RE-ANCHORED 2026-09-20: the branch is now `if agent_log_code:` (it went,
+    # here are both codes) with an `elif agent_log:` (it was asked for and did not
+    # go). Either way the flag is still READ after the send, which is the property
+    # this guard exists for.
+    assert "elif agent_log:" in after_send, (
         "the client no longer reads the flag after the send — the instruction to "
         "pass it on --confirm may now be stale")
     bullet = _agent_log_bullet()
     # ⛔ RE-AIMED IN WAVE 8 AND MADE SPECIFIC. The bullet now distinguishes two
     # shapes — the log riding a bundle and the log travelling alone — so "it"
     # would have been ambiguous exactly where the instruction has to be exact.
-    assert "pass `--agent-log` on `--confirm` too" in bullet, bullet
+    # ⚠ REPINNED 2026-09-20. Unchanged in substance and STRONGER in consequence:
+    # leaving the flag off `--confirm` no longer merely costs a follow-up
+    # directive, it means the log does not go at all.
+    assert "Pass `--agent-log` on `--confirm` as well" in bullet, bullet
+    assert "Leave the flag off `--confirm` and the log does not go" in bullet
     row = next((ln for ln in SKILL_MD.splitlines()
                 if ln.startswith("|") and "--agent-log" in ln), "")
     assert "`--confirm`" in row, (

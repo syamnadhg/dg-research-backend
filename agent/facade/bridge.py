@@ -104,6 +104,53 @@ _SUPPORT_CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _SUPPORT_CODE_LENGTH = 8
 _SUPPORT_CODE_RE = re.compile(r"^[0-9A-HJKMNP-TV-Z]{8}$")
 
+# ⭐⭐ WHAT THIS HOST MINTED, SO A STATUS CHECK CAN STOP GUESSING. The bridge is
+# the ONLY component that sees a support code before the machine does — it mints
+# it — and it used to throw the code, the commandId and the target's liveness
+# away the instant it answered. So a person quoting a code back had nothing on
+# this host to correlate it with, and `--status` could only recite "it may still
+# be packaging it, or may not have picked the request up" forever.
+#
+# ⛔ IN MEMORY, AND THAT IS THE DELIBERATE SMALL VERSION. Parking it in prefs.json
+# would survive a bridge restart, but prefs is a file other code loads wholesale
+# and every account-bearing key in it is uid-paired by hand; a new shape there
+# needs its own cap, prune and uid tests. A restart here simply degrades to the
+# old wording, which is the same way `ageSeconds` degrades and is already
+# accepted. Each record carries its uid anyway — this host re-logs in as
+# different accounts, and a stale record would otherwise answer a new session
+# with the PREVIOUS account's device name.
+_LOG_REQUESTS: "dict[str, dict[str, Any]]" = {}
+_LOG_REQUESTS_MAX = 20
+_LOG_REQUESTS_LOCK = threading.Lock()
+
+# ⛔ LONGER THAN PACKAGING TAKES, SHORTER THAN A PERSON'S PATIENCE. Past this a
+# bundle with no row is worth a WARNING in its own right: the 2026-09-20 episode
+# ran seventeen minutes and produced none.
+_BUNDLE_LATE_SECONDS = 300
+
+# ⛔ HOW LONG THE WATCHDOG KEEPS AN EYE ON A BUNDLE. Long enough to cover a slow
+# machine and a big archive; short enough that a machine which is never going to
+# answer stops costing a Firestore read a minute. Past this the person still has
+# the code and `--status` still works — only the unprompted notice lapses.
+_BUNDLE_WATCH_SECONDS = 1800
+
+
+def _remember_log_request(code: str, record: "dict[str, Any]") -> None:
+    with _LOG_REQUESTS_LOCK:
+        _LOG_REQUESTS[code] = record
+        # ⛔ BOUNDED, OLDEST OUT FIRST. A diagnostic memory, not a store.
+        while len(_LOG_REQUESTS) > _LOG_REQUESTS_MAX:
+            _LOG_REQUESTS.pop(next(iter(_LOG_REQUESTS)))
+
+
+def _recall_log_request(code: str, uid: str) -> "dict[str, Any] | None":
+    """The record for ``code``, but ONLY if it belongs to the live session."""
+    with _LOG_REQUESTS_LOCK:
+        rec = _LOG_REQUESTS.get(code)
+    if rec is None or rec.get("uid") != uid:
+        return None
+    return dict(rec)
+
 # ⛔⛔ THE ONLY DEVICE COMMAND THIS BRIDGE MAY EVER WRITE FOR LOGS, and the
 # reason is the whole shape of this feature on a fleet box.
 #
@@ -2699,6 +2746,12 @@ def _self_logout(state: BridgeState, sess: AccountSession | None) -> bool:
         return False  # a concurrent reconnect already swapped the session in — leave it
     sess.logout()
     prefs.clear_selected_device()
+    # ⛔ A DIFFERENT ACCOUNT MUST NOT INHERIT EITHER OF THESE. Both are uid-bound
+    # so a stale record could not be READ by the next account anyway, but leaving
+    # them behind means this host keeps polling a web route about an ask nobody is
+    # waiting on, for a week.
+    prefs.clear_device_ask()
+    prefs.clear_held_research()
     return True
 
 
@@ -3940,7 +3993,8 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             clients word. Deciding any of it here would be deciding it from a
             projection that deliberately withholds the fields it would need.
             """
-            device_id = (self._read_json().get("deviceId") or "").strip()
+            ask_body = self._read_json()
+            device_id = (ask_body.get("deviceId") or "").strip()
             if not device_id:
                 self._json(400, {"error": "deviceId is required"})
                 return
@@ -3960,6 +4014,19 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # those. Nothing here masks a machine's LABEL either, so the whole row
             # stays out. What is worth keeping is that an ask left the building.
             log.info("device ask: sent")
+            # ⭐⭐ REMEMBERED, SO THE ANSWER CAN BE NOTICED. The approval lands in
+            # `deviceAccessRequests`, which is `allow read, write: if false` to
+            # every credential this agent holds — the web route is the only door,
+            # and nothing on this side ever knocked on it unprompted. So an owner
+            # said yes and the person found out twenty minutes later by asking
+            # "done?" (2026-09-20). The watchdog now checks, but only if it knows
+            # there is something to check for.
+            #
+            # ⛔ THE ORIGIN IS WHAT MAKES IT ANNOUNCEABLE. It names the chat that
+            # is waiting; without it there is nowhere to deliver the answer.
+            prefs.set_device_ask({"deviceId": device_id,
+                                  "origin": _clean_origin(ask_body.get("origin")),
+                                  "at": time.time()}, sess.uid)
             self._json(200, {"ok": True, "deviceId": device_id,
                              "status": body.get("status") or "pending"})
 
@@ -4005,6 +4072,11 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                     name = match.get("name") or match.get("hostname")
             except Exception:
                 pass
+            # ⛔ PAIRING IS ALSO AN ANSWER. Somebody who asked to use a public
+            # computer and then added one of their own is not waiting any more,
+            # and the held topic is about to be started by the ordinary sign-in
+            # auto-start path rather than by an approval that may never come.
+            prefs.clear_device_ask()
             log.info("device pair: %s (%s)", device_id, body.get("action"))
             self._json(200, {"ok": True, "action": body.get("action"),
                              "deviceId": device_id, "deviceName": name,
@@ -4365,6 +4437,13 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 devs, prefs.get_selected_device(sess.uid))
             if stale:
                 prefs.clear_selected_device()
+            # ⛔ THE CALLER CAN READ WHY, WITHOUT THIS METHOD GROWING A SECOND
+            # RETURN SHAPE. Four routes call this and three of them want exactly
+            # what it does today: answer the client and stop. Only `_research` has
+            # anything to do with the REASON — it parks the topic when the answer
+            # is "there is no computer" — and a tuple return would have made the
+            # other three unpack something they will never look at.
+            self._resolve_reason = reason
             if reason == "no_devices":
                 # ⛔⛔ THE COMMENT HERE SAID "Relayed verbatim into chat" AND THAT
                 # HAS NEVER BEEN TRUE. The chat client reads the `reason` and
@@ -4568,6 +4647,15 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                     return
                 names.append(item)
             include_machine = body.get("includeMachine") is True
+            # ⭐ THE CODE THE LOCAL HALF ALREADY WENT UNDER. The client uploads
+            # this host's own agent log standalone before it asks the machine for
+            # anything, so by the time this route runs that half is already done
+            # and has a code of its own. Recording it here is what lets a later
+            # `--status <bundle code>` say "the agent's log already went as <X>"
+            # — which is the fact that stops the same file being uploaded twice.
+            agent_log_code = str(body.get("agentLogCode") or "").strip().upper()
+            if agent_log_code and not _SUPPORT_CODE_RE.match(agent_log_code):
+                agent_log_code = ""
             dev = self._log_device(body, sess, fs)
             if dev is None:
                 return
@@ -4614,12 +4702,41 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             except FirestoreError as e:
                 self._firestore_502(e)
                 return
-            log.info("send-logs requested on %s (%d runs, machine=%s)",
-                     device_id, len(names), include_machine)
+            # ⭐⭐ THE BRIDGE KNOWS THE CODE FIRST AND USED TO THROW IT AWAY. This
+            # line recorded the device, the run count and the machine flag — not
+            # the support code it had just minted, not the commandId Firestore had
+            # just returned, not whether the target was even answering. So the
+            # 2026-09-20 episode left ONE line in bridge.log naming none of the
+            # three facts that explained it, and the code the person was quoting
+            # back appeared nowhere on this host at all.
+            device_name = dev.get("name") or dev.get("hostname") or device_id
+            online = dev.get("online")
+            log.info("send-logs requested on %s (%s): code=%s commandId=%s "
+                     "runs=%d machine=%s agentLogCode=%s deviceOnline=%s",
+                     device_id, device_name, code, command_id, len(names),
+                     include_machine, agent_log_code or "-", online)
+            # ⛔ AND A WARNING WHEN THE TARGET IS NOT ANSWERING, because that write
+            # is near-certainly a no-op: a command written to a machine that is
+            # not running is dropped by its own stale gate when it next starts.
+            if online is False:
+                log.warning("send-logs target %s (%s) is not answering — %s may "
+                            "never be picked up", device_id, device_name, code)
+            _remember_log_request(code, {
+                "uid": sess.uid, "deviceId": device_id, "deviceName": device_name,
+                "commandId": command_id, "requestId": request_id,
+                "at": time.time(), "runCount": len(names),
+                "includeMachine": include_machine,
+                "agentLogCode": agent_log_code,
+                "origin": _clean_origin(body.get("origin")),
+                # ⛔ NOT YET ANNOUNCED. Flipped by the watchdog when the row
+                # reaches a terminal state, so the news goes out exactly once.
+                "announced": False,
+            })
             self._json(200, {"ok": True, "code": code, "requestId": request_id,
                              "commandId": command_id, "deviceId": device_id,
-                             "deviceName": dev.get("name") or dev.get("hostname") or device_id,
+                             "deviceName": device_name,
                              "runCount": len(names),
+                             "agentLogCode": agent_log_code,
                              "includeMachine": include_machine})
 
         def _log_bundle(self) -> None:
@@ -4649,7 +4766,56 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             except FirestoreError as e:
                 self._firestore_502(e)
                 return
-            self._json(200, {"code": code, "row": row})
+            # ⭐⭐ WHEN THERE IS NO ROW, SAY WHY. `row: null` has three causes and
+            # they were collapsed into one sentence: the machine is packaging it,
+            # the machine has not picked it up, or nothing is ever coming. The
+            # command document separates them, because the machine DELETES it
+            # before acting — gone means somebody read it, still there means
+            # nobody did. A person checked this four times over seventeen minutes
+            # on 2026-09-20 and got the identical non-answer each time, while the
+            # discriminating fact sat one read away.
+            extra: dict[str, Any] = {}
+            note = _recall_log_request(code, sess.uid)
+            if note:
+                extra["ageSeconds"] = int(time.time() - float(note.get("at") or 0))
+                extra["deviceName"] = note.get("deviceName")
+                extra["agentLogCode"] = note.get("agentLogCode") or ""
+            # ⛔ ONLY WHEN THE ROW IS ABSENT. With a row there is nothing left to
+            # disambiguate, and the extra reads would be spent for nothing. The
+            # route is documented as never polled on a timer, so this is bounded.
+            if row is None and note:
+                try:
+                    cmd = fs.get_device_command(str(note.get("deviceId") or ""),
+                                                str(note.get("commandId") or ""))
+                    extra["picked"] = cmd is None
+                except (RevokedError, FirestoreError) as e:
+                    # ⛔ NEVER FATAL. This is a diagnostic extra on a route whose
+                    # job is to report a row; failing to read it must not turn a
+                    # legitimate "not yet" into an error.
+                    log.debug("receipt read failed for %s: %s", code, e)
+                try:
+                    devs = fs.list_devices(sess.uid)
+                    match = next((d for d in devs
+                                  if d.get("id") == note.get("deviceId")), None)
+                    if match is not None:
+                        self._decorate_devices([match], sess.uid, None)
+                        extra["deviceOnline"] = match.get("online")
+                except (RevokedError, FirestoreError) as e:
+                    log.debug("liveness read failed for %s: %s", code, e)
+            # ⛔⛔ EVERY CHECK LEAVES A LINE. This route logged NOTHING at any
+            # level, so four polls over seventeen minutes were completely
+            # invisible in bridge.log and the episode could not be reconstructed
+            # from this host at all.
+            log.info("bundle %s: %s (age=%ss picked=%s online=%s)", code,
+                     (row or {}).get("status") or "no row yet",
+                     extra.get("ageSeconds"), extra.get("picked"),
+                     extra.get("deviceOnline"))
+            if row is None and int(extra.get("ageSeconds") or 0) > _BUNDLE_LATE_SECONDS:
+                log.warning("bundle %s has had no row for %ss (picked=%s, "
+                            "online=%s) — longer than packaging takes", code,
+                            extra.get("ageSeconds"), extra.get("picked"),
+                            extra.get("deviceOnline"))
+            self._json(200, {"code": code, "row": row, **extra})
 
         def _log_agent_log(self) -> None:
             """Send THIS host's own agent log up beside a bundle already on its way.
@@ -4819,8 +4985,29 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             if acct is None:
                 return
             sess, fs = acct
+            self._resolve_reason = ""
             device_id = self._resolve_device(body, sess, fs)
             if device_id is None:
+                # ⭐⭐ A TOPIC WITH NOWHERE TO RUN IS HELD, NOT DROPPED. Somebody
+                # asks for research, has no computer, is shown the two ways in,
+                # asks to use a public one — and when the owner says yes, the
+                # thing they originally wanted has to still exist somewhere or
+                # they have to type it again. Until 2026-09-20 it did not.
+                #
+                # ⛔ ONLY ON `no_devices`. A stale or unchosen selection is a
+                # question this client is about to ASK, and the answer arrives in
+                # seconds; parking there would race the person's own reply.
+                #
+                # ⛔ AND ONLY WITH A USABLE ORIGIN. Without one there is no chat
+                # that could ever be told the approval landed, so parking buys
+                # nothing but a week of pointless reads. A terminal
+                # `agent research` therefore behaves exactly as it does today.
+                origin = _clean_origin(body.get("origin"))
+                if self._resolve_reason == "no_devices" and origin:
+                    prefs.set_held_research(
+                        {"topic": topic, "origin": origin, "at": time.time()},
+                        sess.uid)
+                    log.info("held a topic with no computer to run it on")
                 return  # _resolve_device already sent the error
             # Honor the account's saved pipeline Settings; explicit chat flags
             # (--no-video / --no-email) override. The chat origin (sr.py reads it
@@ -4845,7 +5032,177 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 else:
                     self._firestore_502(ef.original)
                 return
+            # ⛔ A RUN THAT STARTED CLEARS THE HOLD. Otherwise the topic that had
+            # nowhere to run would start a SECOND time the moment a computer
+            # arrived — including the case where this very call is the auto-start
+            # claiming it.
+            prefs.clear_held_research()
             self._json(200, {"runId": rid, "queueId": qid, "deviceId": device_id})
+
+        def _device_access_note(self, out: dict, sess, fs, want_platform: str,
+                                want_chat: str, scope_chat: bool) -> None:
+            """Did the public computer this account asked for come through?
+
+            ⛔⛔ THE ANSWER IS UNREADABLE FROM HERE, WHICH IS WHY NOTHING NOTICED
+            IT. `deviceAccessRequests` is `allow read, write: if false` to every
+            credential this agent holds, so the approval cannot be watched in
+            Firestore at all — the web route is the only door, and until now
+            nothing on this side knocked on it unprompted. An owner said yes and
+            the person found out twenty minutes later by asking "done?".
+
+            ⭐⭐ THREE OUTCOMES, TOLD APART BY A TRANSITION RATHER THAN A STANDING
+            STATE. The row leaves `outgoing` whether it was approved, refused or
+            expired — the array is unanswered-only — so "gone" alone says
+            nothing. Gone AND now a member is an approval; gone AND not a member
+            is a no; still there is still waiting. Reading it as a transition is
+            also what keeps a refusal from being announced as a yes later, when
+            the same person gets in some other way.
+
+            ⛔ NEVER TO THE WRONG CHAT. The ask recorded which chat made it; a
+            scoped watchdog answers only for its own.
+            """
+            try:
+                ask = prefs.get_device_ask(sess.uid)
+            except Exception:  # prefs is best-effort and never fatal to /updates
+                return
+            if not ask:
+                return
+            origin = _clean_origin(ask.get("origin"))
+            if scope_chat:
+                if not (isinstance(origin, dict)
+                        and (origin.get("platform") or "").strip().lower() == want_platform
+                        and (origin.get("chat_id") or "").strip() == want_chat):
+                    return
+            elif origin:
+                # An ask made FROM a chat is not for an unscoped watchdog to
+                # announce — same rule the sign-in note follows.
+                return
+            device_id = str(ask.get("deviceId") or "")
+            status, body = _fe_api_get(sess, "/api/devices/access-request")
+            if status != 200 or not isinstance(body, dict):
+                # ⛔ SILENT. This runs every tick; a route having a bad minute
+                # must not put an error in somebody's chat.
+                log.debug("access-request check failed: HTTP %s", status)
+                return
+            rows = body.get("outgoing")
+            rows = rows if isinstance(rows, list) else []
+            if any(isinstance(r, dict) and str(r.get("deviceId") or "") == device_id
+                   for r in rows):
+                return  # still unanswered
+            try:
+                devs = fs.list_devices(sess.uid)
+            except (RevokedError, FirestoreError) as e:
+                log.debug("membership check failed: %s", e)
+                return
+            row = next((d for d in devs if d.get("id") == device_id), None)
+            # Either way the ask is answered and stops being polled.
+            prefs.clear_device_ask()
+            if row is None:
+                # ⛔ A NO IS NOT ANNOUNCED. The app tells them, subject to their own
+                # notification settings, and a refusal repeated by a second channel
+                # is worse than one delivered once. Expiry lands here too, and the
+                # two are indistinguishable from outside — which is another reason
+                # not to put words to it.
+                log.info("device access request answered: not a member")
+                return
+            usable = pair_state_usable(row)
+            name = _device_label(row)
+            log.info("device access APPROVED for %s (usable=%s)", device_id, usable)
+            note: dict[str, Any] = {"state": "approved", "deviceId": device_id,
+                                    "deviceName": name, "usable": usable,
+                                    "online": row.get("online")}
+            held = prefs.get_held_research(sess.uid)
+            topic = str((held or {}).get("topic") or "").strip()
+            if topic:
+                note["topic"] = topic
+                # ⛔⛔ PINNED TO THE COMPUTER THAT WAS JUST APPROVED, and re-checked
+                # before anything is enqueued. Handing the run to the selection
+                # logic would let it land on a different machine than the one the
+                # person was told about — and a device row can be a member without
+                # being ready to take work.
+                if usable:
+                    try:
+                        cfg = _resolve_run_config(fs, sess, {})
+                        rid, _qid = _enqueue_research_run(
+                            fs, sess, topic=topic, device_id=device_id,
+                            cfg=cfg, origin=_clean_origin(held.get("origin")))
+                        note["autoStarted"] = True
+                        note["runId"] = rid
+                        prefs.clear_held_research()
+                    except (RevokedError, FirestoreError, _EnqueueFailed) as e:
+                        # ⛔ THE APPROVAL IS STILL ANNOUNCED. Losing the auto-start
+                        # costs one line; losing the announce costs the whole
+                        # reason this exists.
+                        log.warning("auto-start after approval failed: %s", e)
+                        note["autoStarted"] = False
+                else:
+                    # ⛔ "STARTING" WOULD BE A LIE about a machine that is not
+                    # ready. Say the true thing and keep the topic.
+                    note["autoStarted"] = False
+            out["deviceAccess"] = note
+
+        def _support_log_note(self, out: dict, sess, fs, want_platform: str,
+                              want_chat: str, scope_chat: bool) -> None:
+            """Did the support bundle this chat asked for actually arrive?
+
+            ⭐⭐ "ASKED" IS THE ONLY HONEST THING THE SEND CAN SAY, and it was the
+            last thing anybody heard. The machine packages and uploads the bundle
+            with its own token, so the send returns the moment the request is
+            WRITTEN — whether it ever landed was reachable only by somebody
+            thinking to ask again, which is the same shape as the approval defect
+            and was reported in the same breath (owner, 2026-09-20).
+
+            ⛔ IN-MEMORY, SO A BRIDGE RESTART SIMPLY MEANS NO PROACTIVE NOTICE.
+            The check still works on demand. A bundle normally lands in under a
+            minute, so the window this covers is short and the degradation is the
+            same one `ageSeconds` already accepts.
+
+            ⛔ AND IT STOPS. Past `_BUNDLE_WATCH_SECONDS` the record is dropped
+            rather than read forever — a machine that has not answered in half an
+            hour is not answering, and the person has the code either way.
+            """
+            now = time.time()
+            with _LOG_REQUESTS_LOCK:
+                pending = [(c, dict(r)) for c, r in _LOG_REQUESTS.items()
+                           if r.get("uid") == sess.uid and not r.get("announced")]
+            for code, rec in pending:
+                age = now - float(rec.get("at") or 0)
+                if age > _BUNDLE_WATCH_SECONDS:
+                    with _LOG_REQUESTS_LOCK:
+                        _LOG_REQUESTS.pop(code, None)
+                    continue
+                origin = _clean_origin(rec.get("origin"))
+                if scope_chat:
+                    if not (isinstance(origin, dict)
+                            and (origin.get("platform") or "").strip().lower() == want_platform
+                            and (origin.get("chat_id") or "").strip() == want_chat):
+                        continue
+                elif origin:
+                    continue
+                try:
+                    row = fs.get_log_bundle(sess.uid, code)
+                except (RevokedError, FirestoreError) as e:
+                    log.debug("bundle watch read failed for %s: %s", code, e)
+                    continue
+                status = str((row or {}).get("status") or "")
+                if status not in ("done", "failed"):
+                    continue
+                with _LOG_REQUESTS_LOCK:
+                    if code in _LOG_REQUESTS:
+                        _LOG_REQUESTS[code]["announced"] = True
+                log.info("bundle %s reached %s — announcing", code, status)
+                out["supportLogs"] = {
+                    "code": code, "status": status,
+                    "deviceName": rec.get("deviceName") or "",
+                    "runCount": int((row or {}).get("runCount") or 0),
+                    "sizeBytes": (row or {}).get("sizeBytes"),
+                    "errorClass": (row or {}).get("errorClass") or "",
+                    "agentLogCode": rec.get("agentLogCode") or "",
+                }
+                # ⛔ ONE PER TICK. Two support bundles landing in the same minute
+                # is rare, and the second keeps its record and goes out next tick
+                # rather than being merged into a message about the first.
+                return
 
         def _research_status(self, rid: str) -> None:
             """Point-in-time status of one run (the chat /sr-status). Streaming is P4."""
@@ -5025,6 +5382,13 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # the agent (viaAgent) so web-app runs don't clutter the chat, and
             # compute per-phase updates (lazily minting the permanent SR links).
             via_agent = qs.get("via", [""])[0] == "agent"
+            # ⭐⭐ `?watchdog=1` IS A SEPARATE DOOR FROM `?via=agent`, ON PURPOSE.
+            # `via=agent` has THREE readers — the per-chat poller, sr.py's
+            # `_claim_signed_in_announce` and `cmd_updates` — so a side effect
+            # hung off it fires on all three, and whichever got there first would
+            # silently eat an approval nobody was listening for. Only the poller
+            # sets this, and only the poller can deliver a proactive message.
+            watchdog = qs.get("watchdog", [""])[0] in ("1", "true", "yes")
             # ?platform=…&chat=… (a PER-CHAT watchdog): further restrict to runs
             # fired FROM that chat (matched on the doc's chatOrigin) so a run
             # started in one chat streams back only to that chat. Both must be
@@ -5120,6 +5484,11 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                     "attentionOffers": _offers,
                 })
             out: dict[str, Any] = {"runs": runs}
+            if watchdog:
+                self._device_access_note(out, sess, fs, want_platform,
+                                         want_chat, scope_chat)
+                self._support_log_note(out, sess, fs, want_platform,
+                                       want_chat, scope_chat)
             # The event this request took, if any — restored on a failed send.
             taken: dict | None = None
             # ⛔ AND THE WATERMARK THIS REQUEST MOVED, restored with it. The note was

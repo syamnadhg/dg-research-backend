@@ -124,9 +124,8 @@ _SETUP_NODE_LINES = [
 # machine reads as the identical string "Research computer", so "tell me which one"
 # alone is a question the reader may not be able to answer — and the resolver
 # refuses an ambiguous name rather than guessing.
-_PUBLIC_ASK_INVITE = ("Tell me which one to ask for — its name, or the id beside it "
-                      "if two read the same. Its owner decides, and they see your "
-                      "name — or your email, if you haven’t set one.")
+_PUBLIC_ASK_INVITE = ("Tell me which one to ask for. Once the request is accepted "
+                      "you can use that computer. They see your name.")
 
 # ⛔ ONE EXPLANATION OF AN EMPTY PUBLIC LIST. The two screens ask different
 # questions — "are there any?" and "I have none, is there another way?" — so the
@@ -155,6 +154,20 @@ _PUBLIC_TRUNCATED_NONE = ("(There were more machines than one look can scan, so 
 # so is the trade, and the sentence below is what a reader gets for it.
 _PUBLIC_LOOK_TIMEOUT = 20
 
+# ⭐⭐ THE NOUN, ONCE, FOR BOTH SCREENS. The browse list has always been headed
+# "Public computers (N):"; the empty state rendered the IDENTICAL rows under "Or
+# ask to use somebody else’s — …" and never printed the noun at all. A person
+# arriving with no computer therefore met the concept as the tail of a sentence
+# rather than as a section, and a relay — which restructures what the client
+# leaves implicit and preserves what it states — folded it into the option above
+# it and the section vanished from the chat (owner, 2026-09-20).
+#
+# ⛔ SO THE HEAD IS A CONSTANT AND BOTH SCREENS TAKE IT FROM HERE. Two screens
+# rendering one list under two different names is the drift this file’s comments
+# keep being written about; the count belongs to the browse screen alone, because
+# the empty state is naming an option rather than reporting a scan.
+_PUBLIC_HEAD = "Public computers"
+
 # ⛔ FALSE ONLY UNDER --json, where `_emit` prints the payload and drops the lines.
 _RENDERING_LINES = True
 
@@ -180,9 +193,10 @@ def _public_offer_lines() -> list[str]:
                                   str(body.get("error", "")) if isinstance(body, dict) else "",
                                   body.get("retryAfterMs") if isinstance(body, dict) else None)
         if isinstance(body, dict) and body.get("error") == "rate_limited":
-            return [f"Or ask to use somebody else’s — {said[0].lower()}{said[1:]}"]
-        return ["Or ask to use somebody else’s — say “show me public computers” "
-                "and I’ll look again."]
+            return [f"{_PUBLIC_HEAD} — ask to use somebody else’s. "
+                    f"{said}"]
+        return [f"{_PUBLIC_HEAD} — ask to use somebody else’s. Say "
+                "“show me public computers” and I’ll look again."]
     rows = [d for d in (body.get("devices") or []) if isinstance(d, dict)]
     if not rows:
         # ⛔⛔ THE THIRD THING IS STILL SAID WHEN THERE ARE NONE. "Nobody is
@@ -194,8 +208,8 @@ def _public_offer_lines() -> list[str]:
         # em-dash printed "— A computer shows up there…" with a capital A
         # mid-sentence; it is written as a sentence because the browse screen uses
         # it as one.
-        lines = ["Or ask to use somebody else’s — but nobody is offering one "
-                 "publicly right now.",
+        lines = [f"{_PUBLIC_HEAD} — ask to use somebody else’s. Nobody is "
+                 "offering one publicly right now.",
                  _PUBLIC_NONE_WHY]
         if body.get("truncated"):
             lines.append(_PUBLIC_TRUNCATED_NONE)
@@ -206,13 +220,16 @@ def _public_offer_lines() -> list[str]:
     # no — the exact defect 7.9-3 removed from the ask verb, reintroduced by the
     # screen that offers it.
     if all(d.get("full") for d in rows):
-        lines = ["Or ask to use somebody else’s — but every computer on offer is "
-                 "already shared with as many people as it can hold:"]
+        lines = [f"{_PUBLIC_HEAD} — ask to use somebody else’s, but every "
+                 "computer on offer is already shared with as many people as it "
+                 "can hold:"]
     else:
-        lines = ["Or ask to use somebody else’s — these are on offer right now:"]
-    lines += [_public_row_line(d) for d in rows]
+        lines = [f"{_PUBLIC_HEAD} — ask to use somebody else’s; these are on "
+                 "offer right now:"]
+    lines += _public_rows_block(rows)
     if body.get("truncated"):
         lines.append(_PUBLIC_TRUNCATED_SOME)
+    lines.append("")
     lines.append(_PUBLIC_ASK_INVITE)
     return lines
 
@@ -239,11 +256,22 @@ def _no_device_lines(lead: str | None = None) -> list[str]:
     unchanged.
     """
     lines = [lead] if lead else []
-    lines.append("No research computer on this account yet.")
-    lines.append("Add your own: paste the access code from the computer running "
-                 "Super Research and I’ll connect it.")
-    lines += _public_offer_lines()
+    lines.append("No research computer on this account yet. Two ways in:")
     lines.append("")
+    lines.append("1 · Add your own computer: paste the access code from the "
+                 "computer running Super Research and I’ll connect it.")
+    lines.append("")
+    # ⭐⭐ BOTH ORDINALS ARE ASSIGNED HERE, AT THE ONE CALL SITE, and never
+    # inside `_public_offer_lines`. That function has five branches and one of
+    # them returns nothing at all (under --json), so a "2 ·" baked into the
+    # renderer would print a numbered hole — an option 1 followed by the install
+    # block, with the reader left looking for the 2. The caller is also the only
+    # thing that knows this is a numbered list; the renderer is reused by no one
+    # today, but it is written as a pure renderer and stays one.
+    pub = _public_offer_lines()
+    if pub:
+        lines += [f"2 · {pub[0]}"] + pub[1:]
+        lines.append("")
     lines += _SETUP_NODE_LINES
     return lines
 
@@ -637,26 +665,77 @@ def _origin_slug(origin: dict) -> str:
     return f"{platform}_{hashlib.sha1(key.encode('utf-8')).hexdigest()[:10]}"
 
 
-def _scripts_dir() -> Path:
-    """The HERMES_HOME/scripts dir where the watchdog + its shims live (the
-    cronjob tool requires scripts there). Derived from this file's install
-    location (<HERMES_HOME>/skills/research/sr/scripts/sr.py → <HERMES_HOME>/
-    scripts) so a shim lands beside sr_attention_poll.py and can import it.
+_WATCHDOG_NAME = "sr_attention_poll.py"
 
-    The derivation is AUTHORITATIVE for the deployed Hermes layout REGARDLESS of
-    whether the watchdog copy has landed yet: if it hasn't, _write_poll_shim then
-    surfaces a clean "re-run agent connect" error — rather than this silently
-    returning the skill BUNDLE's own scripts dir (which also holds a watchdog copy
-    but is a path the cron tool rejects, masking the real failure with a confusing
-    cron error). $HERMES_HOME and a local dir only cover a non-standard layout the
-    derivation can't recognize."""
-    here = Path(__file__).resolve()
-    if len(here.parents) >= 5 and here.parents[1].name == "sr":
-        return here.parents[4] / "scripts"  # deployed Hermes layout (authoritative)
-    env = os.environ.get("HERMES_HOME")
+
+def _scripts_dir_candidates() -> "list[Path]":
+    """Every plausible <HERMES_HOME>/scripts, most authoritative first.
+
+    ⛔⛔ THE OLD DERIVATION FOLLOWED A SYMLINK STRAIGHT OUT OF HERMES_HOME, and it
+    did so AHEAD of $HERMES_HOME, so the runtime's own declaration of its home was
+    never consulted. It took `Path(__file__).resolve()` and walked up four parents.
+    On a host whose skills dir is a symlink into a separate state repo —
+    `~/.hermes/skills -> ~/rocky/skills`, which is the owner's own box — `resolve()`
+    rewrites the path, so the walk yields `~/rocky/scripts` (empty) and
+    `_cron_jobs_file` yields `~/rocky/cron/jobs.json`, a store the live gateway
+    never reads.
+
+    ⛔ AND THE WHOLE FEATURE RIDES ON THIS ONE ANSWER. `_cron_jobs_file` hangs off
+    its parent, so getting it wrong means no shim, no cron row, and therefore no run
+    progress, no completion, and no "✓ signed in" after a successful browser
+    approval. Measured live 2026-09-19: the login succeeded, the bridge parked the
+    announce, and the chat said nothing until the owner asked.
+
+    ⭐ `connect.hermes_scripts_dir()` computes the SAME directory from `Path.home()`
+    and never resolves — which is why the INSTALL landed correctly while the SKILL
+    looked somewhere else. The two must not be able to disagree again, so the
+    candidates below are ordered by how hard they are to fool:
+
+      1. `$HERMES_HOME` — the runtime's own declaration, exported by the gateway
+         into every child. Symlink-proof by construction.
+      2. The install path WITHOUT resolving symlinks. `os.path.abspath` is purely
+         lexical, so this is the path the runtime actually addressed us by.
+      3. The RESOLVED path — the old behaviour, still right when the physical
+         location really is the home.
+    """
+    out: "list[Path]" = []
+
+    def add(p: Path) -> None:
+        if p not in out:
+            out.append(p)
+
+    env = (os.environ.get("HERMES_HOME") or "").strip()
     if env:
-        return Path(env) / "scripts"
-    return here.parent  # unrecognized layout — best effort
+        add(Path(env) / "scripts")
+    for here in (Path(os.path.abspath(__file__)), Path(__file__).resolve()):
+        if len(here.parents) >= 5 and here.parents[1].name == "sr":
+            add(here.parents[4] / "scripts")
+    return out
+
+
+def _scripts_dir() -> Path:
+    """The <HERMES_HOME>/scripts dir where the watchdog + its shims live (the cronjob
+    tool only accepts scripts from there, and a shim imports `sr_attention_poll`
+    from beside itself).
+
+    ⭐ PICK THE CANDIDATE THAT ACTUALLY HOLDS THE WATCHDOG. Presence on disk is the
+    one piece of evidence a symlink or an unusual layout cannot forge. If none holds
+    it, return the most authoritative candidate anyway, so `_write_poll_shim` still
+    surfaces its clean "re-run `agent connect`" error against the right directory.
+
+    ⚠ THE LAST RESORT IS THIS BUNDLE'S OWN SCRIPTS DIR, and that is a poor answer —
+    it holds a watchdog copy but is a path the cron tool rejects, so the failure
+    arrives as a confusing cron error rather than a clear one. It is reached only
+    when NOTHING identifies a home: no `$HERMES_HOME`, and an install path that is
+    not the deployed `<home>/skills/research/sr/scripts/` shape — i.e. running this
+    file straight out of a source checkout, which is not a deployment. Unchanged
+    from the previous implementation; kept because with no home identified there is
+    nothing better to return."""
+    cands = _scripts_dir_candidates()
+    for c in cands:
+        if (c / _WATCHDOG_NAME).is_file():
+            return c
+    return cands[0] if cands else Path(__file__).resolve().parent
 
 
 # A tiny generated shim: the cron `no_agent` runner can't pass args or see the
@@ -868,6 +947,15 @@ def cmd_login(args) -> int:
     arm_lines, _payload, arm_rc = _prepare_stream_arm()
     if arm_rc == 0 and arm_lines:
         lines += _agent_directive_block(arm_lines)
+    elif arm_rc != 0 and arm_lines:
+        # ⛔⛔ DO NOT SWALLOW THIS. `_prepare_stream_arm` returns rc=1 with a single
+        # "✗ …" line when the watchdog could not be armed, and this branch used to
+        # drop it — so a sign-in whose announce could never be delivered looked
+        # exactly like one that would arrive momentarily. The user waits, nothing
+        # comes, and the only diagnostic was computed and thrown away. Measured
+        # live 2026-09-19. Relayed to the person, not as an AI directive: there is
+        # nothing for the model to DO with it, and it names the repair.
+        lines += arm_lines
     return _emit(body, args.json, lines)
 
 
@@ -1473,7 +1561,27 @@ def _ask_refusal_line(err: str, retry_after_ms=None) -> str:
     return f"Couldn’t ask for that computer: {err or 'no reason given'}"
 
 
-def _public_row_line(d: dict) -> str:
+def _public_rows_block(rows: "list[dict]") -> "list[str]":
+    """Every public row, with the id shown ONLY on the ones that need it.
+
+    ⭐ A ROW NEEDS ITS ID WHEN ANOTHER ROW READS THE SAME. That question cannot be
+    answered one row at a time, which is why it lives here and not in the
+    renderer. Both screens — the browse list and the no-computer empty state —
+    go through this, so they cannot drift into two different answers about when
+    an id appears.
+    """
+    seen: "dict[str, int]" = {}
+    for d in rows:
+        label = str(d.get("label") or "").strip() or "(unnamed)"
+        seen[label] = seen.get(label, 0) + 1
+    out = []
+    for d in rows:
+        label = str(d.get("label") or "").strip() or "(unnamed)"
+        out.append(_public_row_line(d, show_id=seen.get(label, 0) > 1))
+    return out
+
+
+def _public_row_line(d: dict, show_id: bool = False) -> str:
     """ONE public row, in this client's voice — used by the browse list AND by the
     empty state, so the two screens cannot drift apart.
 
@@ -1488,11 +1596,18 @@ def _public_row_line(d: dict) -> str:
     # `share_cap_reached` for these with certainty, and a quiet word beside
     # an invitation spent one of five hourly asks on a guaranteed no.
     full = " · can’t take anyone else" if d.get("full") else ""
-    # ⛔⛔ THE ID IS PRINTED AND IT IS NOT DECORATION. Public labels collide —
-    # every unnamed machine is the identical string "Research computer" — and
-    # the list is ordered online-first over a thirty-second window, so neither
-    # a name nor a position identifies a row for long. The ask takes the id.
-    return f"  • {label}{dot}{full}  (id {d.get('deviceId')})"
+    # ⛔⛔ THE ID IS NOT DECORATION, BUT IT IS ALSO NOT ALWAYS NEEDED. Public
+    # labels genuinely collide — every unnamed machine is the identical string
+    # "Research computer" — and the list is ordered online-first over a
+    # thirty-second window, so when two rows read the same neither the name nor
+    # the position identifies one. There the id is the only handle and the ask
+    # takes it.
+    # ⭐ BUT PRINTING IT ON EVERY ROW COST MORE THAN IT BOUGHT (owner, 2026-09-19):
+    # a 32-character hex string beside a one-word name is the widest thing on the
+    # screen and reads as something the person has to deal with. So the CALLER
+    # decides — it can see the whole list, which is the only place the question
+    # "do two of these read the same?" can actually be answered.
+    return f"  • {label}{dot}{full}" + (f"  (id {d.get('deviceId')})" if show_id else "")
 
 
 def cmd_devices_public(args) -> int:
@@ -1518,8 +1633,8 @@ def cmd_devices_public(args) -> int:
         if body.get("truncated"):
             lines.append(_PUBLIC_TRUNCATED_NONE)
         return _emit(body, args.json, lines)
-    lines = [f"Public computers ({len(rows)}):"]
-    lines += [_public_row_line(d) for d in rows]
+    lines = [f"{_PUBLIC_HEAD} ({len(rows)}):"]
+    lines += _public_rows_block(rows)
     if body.get("truncated"):
         # ⛔ ABOUT THE SCAN, NOT ABOUT THIS LIST. The flag is set before the app
         # drops the ones you cannot ask for, so it can be true beside a short
@@ -1567,7 +1682,16 @@ def cmd_device_ask(args) -> int:
                 f"“{label}” is already shared with as many people as it can hold, "
                 f"so a request would be refused.",
             ], 1)
-    code, body = _post("/device/ask", {"deviceId": device_id})
+    # ⭐ THE CHAT THAT IS WAITING GOES WITH THE ASK. The approval lands in a
+    # collection no credential here can read, so the bridge has to knock on the
+    # web route to notice it — and it only knows to knock, and where to deliver
+    # the answer, because this request said which chat asked. Without it the
+    # owner says yes and nobody is told (owner, 2026-09-20).
+    ask_payload = {"deviceId": device_id}
+    _ask_origin = _origin_from_env()
+    if _ask_origin:
+        ask_payload["origin"] = _ask_origin
+    code, body = _post("/device/ask", ask_payload)
     if code != 200:
         return _emit(body, args.json,
                      [f"✗ {_ask_refusal_line(body.get('error', ''), body.get('retryAfterMs'))}"],
@@ -2271,7 +2395,22 @@ def cmd_research(args) -> int:
                                        or "grab the pair code" in err)
                       else ("no_selection" if "no device" in err else ""))
         if reason == "no_devices":
-            return _emit(body, args.json, _no_device_lines(), _fail_code(code))
+            # ⭐⭐ THE TOPIC IS HELD, AND THE PERSON HAS TO BE TOLD SO. The bridge
+            # parks it when the ask came from a chat, and starts it by itself the
+            # moment a computer arrives — which is only a kindness if it was
+            # promised. Unannounced it is research starting on its own, minutes or
+            # hours later, for a reason nobody can see.
+            #
+            # ⛔ CONDITIONAL ON THE ORIGIN, because the park is. Without one the
+            # bridge holds nothing (there would be no chat to tell), so promising
+            # it here would be a claim this client cannot keep.
+            # ⚠ `origin` and `args.topic` — not a local named `topic`, which does
+            # not exist in this function and which ruff caught before any test
+            # did. The origin was already resolved at the top of the call.
+            lead = (f"“{args.topic}” has nowhere to run yet — I’ll hold it and "
+                    "start it as soon as you have a computer."
+                    if origin else None)
+            return _emit(body, args.json, _no_device_lines(lead), _fail_code(code))
         if reason in ("no_selection", "stale_selection", "selection_not_ready"):
             return _emit(body, args.json, _pick_device_lines(body, reason), _fail_code(code))
         return _emit(body, args.json, [f"✗ couldn't start: {body.get('error', code)}"], _fail_code(code))
@@ -2710,6 +2849,132 @@ def _agent_log_machine_hint(args) -> tuple:
     return True, str(body.get("deviceName") or "your Research Computer")
 
 
+def _bundle_waiting_lines(code: str, body: dict) -> "list[str]":
+    """What to say about a support bundle whose row has not appeared.
+
+    ⛔⛔ THE THREE CAUSES ARE DIFFERENT ADVICE, AND THEY WERE ONE SENTENCE. A
+    machine that has taken the request and is zipping needs patience; a machine
+    that has not taken it and is not answering needs something else entirely, and
+    telling somebody to keep waiting for it is telling them to wait for nothing.
+
+    ⛔ `picked` IS ABSENT WHEN THIS BRIDGE DID NOT MINT THE CODE — a restart since
+    the send, or a code from another host. Then there is genuinely nothing to
+    distinguish and the old honest ambiguity is the right answer; it is the
+    fallback rather than the default.
+
+    ⛔ AND LIVENESS NEVER TURNS INTO "IT IS OFF". A late heartbeat reads the same
+    as a dead machine, so the words stay "isn't answering".
+    """
+    name = str(body.get("deviceName") or "that computer")
+    picked = body.get("picked")
+    online = body.get("deviceOnline")
+    age = int(body.get("ageSeconds") or 0)
+    waited = f" It’s been {_age_words(age)}." if age >= 120 else ""
+
+    if picked is True:
+        lines = [f"Nothing has come back for {code} yet, but “{name}” HAS picked "
+                 f"the request up — it’s packaging it.{waited}"]
+        if age > 900:
+            lines.append("That’s longer than packaging usually takes, so it may "
+                         "have stopped partway. Ask me again in a bit.")
+    elif picked is False and online is False:
+        # ⛔⛔ THE ONE TERMINAL CASE, AND IT IS WORTH STATING PLAINLY. The device's
+        # stale gate MARKS rather than deletes, so an unread command sits there
+        # indefinitely — a machine that is not answering has not read it and will
+        # not until it comes back. Saying "wait" here would be false.
+        lines = [f"“{name}” hasn’t picked up the request for {code}, and it isn’t "
+                 f"answering right now.{waited}",
+                 "Nothing will arrive until that computer is back on — the "
+                 "request keeps until then."]
+    elif picked is False:
+        lines = [f"“{name}” is answering, but hasn’t picked up the request for "
+                 f"{code} yet.{waited}"]
+    else:
+        # the honest ambiguity, for when we genuinely cannot tell
+        lines = [f"Nothing has come back for {code} yet. “{name}” may still be "
+                 "packaging it, or may not have picked the request up."]
+
+    # ⛔ AND THE HALF THAT DID ARRIVE IS NAMED, because on this branch it is the
+    # only thing support can actually read. It is easy to forget it went at all
+    # when the message is about the half that did not.
+    other = str(body.get("agentLogCode") or "")
+    if other:
+        lines.append(f"The agent’s own log did go, separately — quote {other} for "
+                     "that half.")
+    return lines
+
+
+def _age_words(seconds: int) -> str:
+    if seconds < 120:
+        return f"{seconds} seconds"
+    if seconds < 5400:
+        return f"{seconds // 60} minutes"
+    return f"{seconds // 3600} hours"
+
+
+def _wants_agent_log(args) -> bool:
+    """True when this request includes the agent's own log — decided from the
+    ARGUMENTS ALONE, with no run list.
+
+    ⛔⛔ IT HAS TO BE ANSWERABLE BEFORE `/logs/runs`. The local half is uploaded
+    up front now, before the run list is fetched and before the research computer
+    is asked for anything, so the question has to be answerable at a point where
+    no rows exist yet. `_resolve_log_selection` answers the same question a second
+    time, from the matched rows; the two agree because both read the same `0`
+    token, this one off the raw `--runs` string and that one after matching.
+
+    ⛔ THIS IS NOT `_agent_log_only_request`. That one asks "is the log the WHOLE
+    request?" and routes to a different command entirely. This one asks "is the
+    log IN the request?", which is true of the combined shape too — and the
+    combined shape is the one that was losing it.
+    """
+    spec = [t.strip() for t in
+            str(getattr(args, "runs", "") or "").replace(" ", ",").split(",")
+            if t.strip()]
+    return bool(getattr(args, "agent_log", False)) or _AGENT_LOG_TOKEN in spec
+
+
+def _send_agent_log_now(args) -> "tuple[str, list[str]]":
+    """Upload this host's agent log on its own, right now, and say what happened.
+
+    ⭐⭐ THE LOCAL FILE STOPS WAITING FOR A REMOTE MACHINE. It used to be deferred:
+    the confirmed send printed "the agent's own log goes up once that computer's
+    bundle lands" and handed the assistant `--status <CODE> --agent-log`, which the
+    bridge refuses until the machine's row exists. On 2026-09-20 the machine never
+    answered, so the refusal never lifted, and a file sitting readable on THIS
+    disk — needing no device, no permission and nobody's cooperation — was lost
+    along with a bundle it had no reason to be attached to.
+
+    ⛔ THE REASON FOR THE DEFERRAL IS GONE, NOT IGNORED. It existed because the
+    app's Clear-logs button finds objects by listing each ROW's folder, so an
+    object written before a row exists is a log the privacy button can never
+    reach. The standalone route mints its own code and opens its own row BEFORE
+    the object, which satisfies that invariant without any machine — so this is
+    not a relaxation of the rule, it is the rule being met a different way.
+
+    ⛔ AND IT CARRIES `consent`, exactly as `/logs/send` does. The plan that
+    listed this file, its three disclosures and its retention was printed on the
+    branch above; this claims that happened. Without it the bridge refuses, so an
+    assistant that skips the plan and jumps to `--confirm` cannot cause an
+    immediate upload of a file naming a masked email and a whole sign-in trail.
+
+    ⛔ NEVER FATAL. The machine's request has not been made yet when this runs, so
+    there is nothing in flight to damage, and a failure here is reported as its
+    own sentence rather than taking the rest of the send down with it.
+    """
+    code, sent = _post("/logs/agent-log", {"standalone": True, "consent": True})
+    if code != 200:
+        return "", [f"⚠ The agent’s own log didn’t go: "
+                    f"{sent.get('error', code)}. Nothing else was affected."]
+    if not sent.get("sent"):
+        # ⭐ A fact, not a failure — and no code, because nothing was stored.
+        return "", ["The agent’s log on this host was empty — there was nothing "
+                    "to send from here."]
+    support = str(sent.get("code") or "")
+    return support, [f"✓ Sent the agent’s own log from this host. Its support "
+                     f"code is {support}."]
+
+
 def _agent_log_facts() -> list:
     """What a person is told before this file leaves, in both clients.
 
@@ -2824,9 +3089,16 @@ def cmd_send_logs(args) -> int:
             return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
         row = body.get("row")
         if not row:
-            return _emit(body, args.json, [
-                f"Nothing has come back for {want} yet. That computer may still "
-                "be packaging it, or may not have picked the request up."])
+            # ⭐⭐ THREE DEFINITE ANSWERS, NOT ONE AMBIGUITY REPEATED. This branch
+            # said "may still be packaging it, or may not have picked the request
+            # up" and nothing else — and on 2026-09-20 a person was told exactly
+            # that, four times over seventeen minutes, while the fact that settled
+            # it was one Firestore read away. The machine DELETES the command
+            # before acting on it, so its absence is a delivery receipt: gone
+            # means a machine read the request, still there means none ever did.
+            # The bridge keeps the commandId now and spends it.
+            return _emit(body, args.json,
+                         _bundle_waiting_lines(want, body))
         status = str(row.get("status") or "")
         if status == "failed":
             return _emit(body, args.json,
@@ -2888,12 +3160,35 @@ def cmd_send_logs(args) -> int:
         owned_hint, hint_name = _agent_log_machine_hint(args)
         return _send_agent_log_alone(args, offer_machine=owned_hint, name=hint_name)
 
+    # ⭐⭐ THE LOCAL HALF GOES FIRST, AND IT GOES ALONE. Above `/logs/runs`, above
+    # `/logs/send`, above every early return between here and the machine —
+    # because each one of those is a state in which the old code lost this file
+    # entirely. `/logs/runs` refuses with `no_selection` / `stale_selection` /
+    # `no_devices`; `/logs/send` answers 502 when Firestore is the broken thing,
+    # which is one of the states people send agent logs ABOUT. After this, the
+    # agent's own log survives a dead Firestore, a stalled machine, a selection
+    # that went stale and an account with no research computer at all.
+    #
+    # ⛔ ONLY ON `--confirm`, so nothing leaves without the plan. And only on the
+    # COMBINED shape: the log-only request returned two lines up, through the
+    # command that exists for it.
+    agent_log_code, agent_log_lines = "", []
+    if getattr(args, "confirm", False) and _wants_agent_log(args):
+        agent_log_code, agent_log_lines = _send_agent_log_now(args)
+
+    def _say(payload: dict, said: "list[str]", rc: int = 0) -> int:
+        """⛔ EVERY EXIT FROM HERE OWES THE AGENT-LOG RECEIPT. The upload has
+        already happened by the time any of them runs, so a branch that reports
+        only its own failure would leave a person who was told "yes" holding no
+        record of a file that went."""
+        return _emit(payload, args.json, [*agent_log_lines, *said], rc)
+
     path = "/logs/runs"
     device_arg = getattr(args, "device", "") or ""
     if device_arg:
         dev, fail = _resolve_device_arg(device_arg)
         if dev is None:
-            return _emit({}, args.json, fail, 1)
+            return _say({}, fail, 1)
         path += f"?deviceId={dev.get('id')}"
     code, body = _get(path)
     if code != 200:
@@ -2909,8 +3204,8 @@ def cmd_send_logs(args) -> int:
                 lines.append("If what’s wrong is this agent itself, I can send its "
                              "own log on its own — no computer needed, and it "
                              "comes back with a support code. Just ask.")
-            return _emit(body, args.json, lines, _fail_code(code))
-        return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
+            return _say(body, lines, _fail_code(code))
+        return _say(body, [f"✗ {body.get('error', code)}"], _fail_code(code))
 
     rows = body.get("runs") or []
     # ⛔⛔ THE MACHINE THE LIST CAME FROM, CARRIED ONTO THE SEND. Showing and
@@ -2928,7 +3223,7 @@ def cmd_send_logs(args) -> int:
         # Said here rather than after a round trip. The computer would refuse
         # this anyway; what this decides is whether the person is TOLD, and on
         # a shared computer that is the ordinary case rather than the odd one.
-        return _emit(body, args.json, [
+        return _say(body, [
             f"“{name}”’s own logs belong to whoever owns it, so I can’t include "
             "them. Ask again without them and you’ll still get every run of "
             "yours it’s holding."], 1)
@@ -2937,7 +3232,7 @@ def cmd_send_logs(args) -> int:
     if getattr(args, "runs", ""):
         chosen, picked_agent_log, refusal = _resolve_log_selection(rows, args.runs)
         if refusal:
-            return _emit(body, args.json, refusal, 1)
+            return _say(body, refusal, 1)
         names = chosen
         # ⛔ EITHER ROUTE, NEVER ONE OVERRIDING THE OTHER — the same rule the
         # terminal follows. `--agent-log` and `--runs 0` say the same thing, and a
@@ -2958,6 +3253,22 @@ def cmd_send_logs(args) -> int:
         # its own and a support code of its own, so the thing they asked for
         # happens instead of being explained away.
         if agent_log:
+            # ⛔⛔ ON A CONFIRM IT HAS ALREADY GONE, AND CALLING THE STANDALONE
+            # COMMAND AGAIN WOULD UPLOAD IT TWICE. A live defect created by moving
+            # the upload up front, caught by walking every exit between the upload
+            # and the machine request rather than by a test. This branch is reached
+            # when the machine turns out to be holding nothing, and it used to be
+            # the ONLY way the log could go from here — so it sent it. Now the send
+            # happened before the run list was ever fetched, and a second call here
+            # would mint a second row, store a second copy of a file carrying a
+            # masked email and the host's whole sign-in trail, and spend another of
+            # the account's ten uploads an hour.
+            if getattr(args, "confirm", False):
+                return _say(body, [
+                    f"“{name}” isn’t holding logs for any of your runs, so there "
+                    "was no bundle to ask it for."])
+            # ⛔ THE PLAN BRANCH IS UNCHANGED AND MUST BE: nothing has been sent
+            # yet, and this is the command that prints the standalone plan.
             # ⛔ THE MACHINE OFFER SURVIVES, AND STILL ONLY FOR AN OWNER — a
             # non-owner is refused `--machine` a few lines above, so offering it to
             # them would send them round the circle a previous wave closed.
@@ -2967,13 +3278,13 @@ def cmd_send_logs(args) -> int:
             # which means we cannot see it — a computer that hasn't published
             # one yet, or one on an older build. The other sentence tells
             # somebody their logs are gone while that machine may hold them all.
-            return _emit(body, args.json, [
+            return _say(body, [
                 f"“{name}” hasn’t told me which runs it’s still holding, so I "
                 "can’t offer you a list yet."] + ([
                     "If you own it, I can still send the computer’s own logs — "
                     "that’s the right choice when the problem is with connecting "
                     "it at all."] if owned else []), 1)
-        return _emit(body, args.json, [
+        return _say(body, [
             f"“{name}” isn’t holding logs for any of your runs."] + ([
                 "If the problem is with connecting it at all, I can send the "
                 "computer’s own logs instead — just ask."] if owned else []), 1)
@@ -2981,7 +3292,15 @@ def cmd_send_logs(args) -> int:
     total = sum(int(r.get("sizeBytes") or 0) for r in rows if r.get("name") in names)
 
     if not getattr(args, "confirm", False):
-        lines = [f"I can send Super Research support the logs from “{name}”:"]
+        # ⭐⭐ THE HEADER NAMES NO COMPUTER, BECAUSE ROW 0 IS NOT ON ONE. It used
+        # to read "… the logs from “{name}”:" and scope the whole list to the
+        # research computer, which was true only while row 0 printed LAST, far
+        # enough down to read as an aside. Row 0 now leads (see below), so that
+        # header would put a file living on THIS host directly under a line
+        # naming a different machine — the exact confusion cli.py:2688 says
+        # `_print_agent_log_choice` exists as a separate function to avoid. The
+        # scope moved down to where it is actually true: `From “{name}”:`.
+        lines = ["I can send Super Research support:"]
         # ⛔⛔ EVERY ROW, NUMBERED, AND MARKED GOING OR NOT — not only the ones
         # going. Before this the plan listed the selection and nothing else, which
         # was honest while the selection was always everything; the moment a
@@ -2990,23 +3309,72 @@ def cmd_send_logs(args) -> int:
         # what a person says back, and a run that is not on screen cannot be asked
         # for. What is going is still unambiguous — the marker carries it, and the
         # count below repeats it in words.
-        for i, row in enumerate(rows, 1):
-            going = row.get("name") in names
-            lines.append(f"  {i} {'•' if going else '·'} {_log_run_label(row)} — "
-                         f"{_size_words(row.get('sizeBytes'))}"
-                         f"{'' if going else '   (not picked)'}")
-        if body.get("truncated"):
-            lines.append("  (only the most recent are listed — it’s holding more)")
         # ⛔ THE 0 ROW PRINTS EITHER WAY, so the choice exists for somebody who
         # does not already know it does. `--agent-log` shipped in 2026-08-26 and
         # has been reachable only by naming it.
         # ⛔ "MAY NOT BE", NOT "IS NOT" — the terminal's twin. The recommended
         # install co-locates the agent and the backend, so asserting the two
         # differ is false for most people reading it.
-        lines.append(f"  0 {'•' if agent_log else '·'} the log from the agent on "
+        #
+        # ⭐⭐ AND IT LEADS, SO READING ORDER MATCHES NUMBERING ORDER. It printed
+        # LAST, after runs 1..N, which handed a relay a list that counts DOWN —
+        # and a relay will not show a person 1, 2, 0. On 2026-09-20 one renumbered
+        # into its own "1."/"2.", the person answered in the RELAY's numbers, and
+        # those are not this command's numbers. With one run that happened to
+        # refuse loudly; with two it would have sent the wrong run's results,
+        # links and account email to support, under a `consent: true` the person
+        # gave for a different row.
+        lines.append(f"  Run 0 {'•' if agent_log else '·'} the log from the agent on "
                      "THIS host — the machine running this chat, which may not "
                      "be that computer"
                      f"{'' if agent_log else '   (not picked)'}")
+        # ⛔ THE SCOPE LINE. Everything below it is on the research computer;
+        # everything above it is not. Row 0 is the only thing above it.
+        #
+        # ⭐⭐ AND IT SAYS WHETHER THAT COMPUTER IS ANSWERING. `/logs/runs` has
+        # always returned `online` and this client has always dropped it. The
+        # machine is what zips and uploads the bundle — the app only mints the
+        # code — so a machine that is not answering produces a support code that
+        # names nothing, forever, with no error anywhere. That is exactly what
+        # happened on 2026-09-20: four status checks over seventeen minutes, each
+        # answered "nothing has come back yet", while the one fact that explained
+        # it was on the wire the whole time and never printed.
+        #
+        # ⛔ "ISN'T ANSWERING", NEVER "IS OFF". This is heartbeat freshness, not
+        # truth — a machine that is up with a briefly late heartbeat reads the
+        # same. The line never REFUSES on this basis; it only says it, and points
+        # at the row that still works without any machine at all.
+        online = body.get("online")
+        lines.append(f"From “{name}”:" if online is not False
+                     else f"From “{name}” — which isn’t answering right now, so "
+                          "anything picked below may sit unsent until it is:")
+        # ⭐⭐ "Run N", NOT A BARE DIGIT — THE NUMBER RIDES INSIDE THE TEXT. A bare
+        # leading "1" is positional, so a relay that re-wraps the rows into its own
+        # ordered list produces a SECOND numbering with equal authority and the two
+        # silently disagree. A label the client supplies cannot be re-wrapped away:
+        # the relay's own index becomes visibly redundant beside it rather than
+        # competing with it. This is not a guess — in the 2026-09-20 transcript the
+        # assistant INVENTED exactly these labels ("Run 1", "Run 0") and mapped them
+        # correctly while getting the order wrong, so the label is the part that
+        # already survives. Zero resolver cost: `_SPOKEN_FILLER` already drops
+        # "run"/"runs"/"number", so "run 1 and run 0" has always resolved.
+        for i, row in enumerate(rows, 1):
+            going = row.get("name") in names
+            # ⛔ THE RUN'S OWN STATUS IS ON THE ROW. cli.py's `_print_held_runs`
+            # has always printed it and this client dropped it, so the chat plan
+            # offered "Managed Creative Cycles — 37.8 KB" for a run that had
+            # STOPPED in phase 3 without saying so. A failed run's bundle is
+            # perfectly sendable — the folder is on the disk and the machine
+            # published its size — but somebody deciding what to send support is
+            # choosing between runs, and which one broke is the thing they are
+            # choosing on.
+            status = str(row.get("status") or "").strip()
+            lines.append(f"  Run {i} {'•' if going else '·'} {_log_run_label(row)} — "
+                         f"{_size_words(row.get('sizeBytes'))}"
+                         f"{f' · {status}' if status else ''}"
+                         f"{'' if going else '   (not picked)'}")
+        if body.get("truncated"):
+            lines.append("  (only the most recent are listed — it’s holding more)")
         if machine:
             lines.append("Plus that computer’s own logs: its pairing and sign-in "
                          "records and its raw activity trail, which cover every "
@@ -3052,6 +3420,9 @@ def cmd_send_logs(args) -> int:
         # ⛔ THE NUMBERS ARE USELESS WITHOUT THIS LINE. The rows carry indices now,
         # and nothing else in the conversation tells a person — or the assistant
         # relaying for them — that saying a number is a thing they may do.
+        # ⚠ NO POSITIONAL CLAIM ("the numbers on the left") — a position stops
+        # being true the moment anything re-wraps the rows, which is the exact
+        # failure this sentence has to survive. The row LABEL is the handle.
         lines.append("Say yes and I’ll send them — or say which numbers to send "
                      "instead (0 is the agent’s own log).")
         # ⛔⛔ THE NUMBERS ARE POSITIONS IN THE LIST ABOVE, AND THE CONFIRM IS A
@@ -3082,6 +3453,21 @@ def cmd_send_logs(args) -> int:
             "have changed by then.",
             "If they ask for a different set, re-run the bare command first and "
             "show them the new plan; never edit this line by hand.",
+            # ⭐⭐ THE RELAY RULE ARRIVES WITH THE BYTES IT GOVERNS. SKILL.md states
+            # "relay verbatim" TWELVE times, once in bold and output-specific to
+            # this very plan — and on 2026-09-20 the plan was still reflowed into
+            # a Markdown list under a second set of numbers. Prose in a file three
+            # hundred lines away is measured-failed; the two relay rules in this
+            # skill that have NEVER failed (`_AGENT_ONLY_MARKER` and the `MEDIA:`
+            # line) are both carried IN BAND, attached to the message they govern.
+            # So is this one.
+            # ⛔ LAST, NOT FIRST. The action directive above is what the assistant
+            # must DO; a formatting rule placed before it pushes the thing that
+            # matters into second position.
+            "⛔ Relay the rows above exactly as printed, each on its own line, "
+            "keeping the “Run N” labels. Do NOT re-number them into a list of "
+            "your own — the user answers in the numbers they can see, and yours "
+            "are not this command’s.",
         ]
         return _emit({**body, "wouldSend": names, "includeMachine": machine},
                      args.json, [*lines, *_agent_directive_block(directives)])
@@ -3091,6 +3477,20 @@ def cmd_send_logs(args) -> int:
                # leaves their computer, and the branch above is where that
                # happened. Moving it up would make the claim false.
                "consent": True,
+               # ⭐⭐ THE SECOND CODE IS RE-DERIVABLE FROM THE FIRST. The local
+               # half has already gone under its own code by the time this runs,
+               # and two bare codes in a chat message is how somebody quotes the
+               # wrong one at support. Handing it over here lets the bridge
+               # remember the pair, so `--status <bundle code>` can always say
+               # "the agent's log already went as <other>" — which is also what
+               # stops a later branch offering to send the same file again.
+               "agentLogCode": agent_log_code,
+               # ⭐ THE CHAT THAT IS WAITING. The machine packages and uploads the
+               # bundle itself, so the only honest thing this command can say is
+               # "asked" — whether it ARRIVED was reachable only by somebody
+               # thinking to ask again. With an origin the watchdog can say so
+               # unprompted, in the chat that made the request.
+               "origin": _origin_from_env() or None,
                # Always the machine the list came from — see above.
                "deviceId": device_id}
     code, sent = _post("/logs/send", payload)
@@ -3106,29 +3506,38 @@ def cmd_send_logs(args) -> int:
         f"To check on it later, run: sr send-logs --status {support}",
         "Do not poll on a timer — only when the user asks.",
     ]
-    if agent_log:
-        # ⛔⛔ THE AGENT'S LOG CANNOT GO YET, AND THIS SAYS SO RATHER THAN SILENTLY
-        # DROPPING IT. It may only be uploaded once the machine's row has landed —
-        # the app's Clear-logs finds objects by listing each ROW's folder, so
-        # anything written before the row exists is a readable log the privacy
-        # button can never reach. This client does not wait for anything, so the
-        # second step is handed to the assistant as a directive rather than
-        # attempted here and failed.
-        lines.append("The agent’s own log goes up once that computer’s bundle "
-                     "lands — ask me to check on it and I’ll finish that part.")
+    if agent_log_code:
+        # ⛔⛔ IT HAS ALREADY GONE, AND SAYING SO IS WHAT PREVENTS A SECOND COPY.
+        # This branch used to read "the agent's own log goes up once that
+        # computer's bundle lands" and hand over `--status <CODE> --agent-log`, a
+        # step the bridge refuses until the machine's row exists — so when the
+        # machine never answered, the local file was lost with it. It is now sent
+        # before this function ever reaches the machine.
+        #
+        # ⛔ TWO CODES, EACH NAMED BY ITS ROLE. Two bare codes in a chat message
+        # is how somebody opens the wrong one at support.
+        lines.append(f"The agent’s own log went separately, under its own code "
+                     f"{agent_log_code} — quote both: {agent_log_code} is this "
+                     f"host’s log, {support} is “{name}”’s bundle.")
         directives.append(
-            f"Once the bundle shows done, run: sr send-logs --status {support} "
-            "--agent-log   (it is refused until then, by design)")
-        # ⛔⛔ AND THE WAY OUT IF THAT BUNDLE NEVER LANDS. This is the attached
-        # step; a bundle that never arrives used to leave the person's own log
-        # stranded behind a machine they may not be able to reach at all, which is
-        # the commonest reason to be sending it. Since wave 8 it has a route of its
-        # own and does not need that computer.
+            f"⛔ The agent’s log is ALREADY SENT, as {agent_log_code}. Do NOT run "
+            f"`--status {support} --agent-log` — that would upload the same file "
+            "a second time under the other code, and spend one of the account’s "
+            "ten uploads an hour on a duplicate.")
         directives.append(
-            "If that bundle never lands, the log can go on its own instead: "
-            "sr send-logs --confirm --agent-log --none   (its own support code, "
-            "no computer involved)")
-    return _emit(sent, args.json, [*lines, *_agent_directive_block(directives)])
+            f"Quote BOTH codes whenever you mention either: {agent_log_code} = "
+            f"the agent’s own log (sent), {support} = the bundle from “{name}” "
+            "(requested).")
+    elif agent_log:
+        # ⛔ THE UPLOAD WAS ATTEMPTED AND DID NOT PRODUCE A CODE — it failed, or
+        # the log was empty. `agent_log_lines` already said which, in the person's
+        # words, above; what is owed here is the way to try again, because the
+        # attempt is not repeated automatically.
+        directives.append(
+            "The agent’s own log did NOT go (the line above says why). To try it "
+            "on its own: sr send-logs --confirm --agent-log --none")
+    return _emit({**sent, "agentLogCode": agent_log_code}, args.json,
+                 [*agent_log_lines, *lines, *_agent_directive_block(directives)])
 
 
 def cmd_list(args) -> int:

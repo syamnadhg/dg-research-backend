@@ -25,6 +25,7 @@ import os
 import stat
 import tempfile
 import threading
+import time as _time
 import uuid
 from typing import Any
 
@@ -52,6 +53,41 @@ _LABEL = "agentLabel"
 # belonging to a different account must never be delivered to this one.
 _PENDING_ANNOUNCE = "pendingAnnounce"
 _PENDING_ANNOUNCE_UID = "pendingAnnounceUid"
+
+# ⭐⭐ THE TWO THINGS A PERSON IS WAITING ON WHEN THEY HAVE NO COMPUTER YET.
+# Somebody asks for research, has no research computer, asks to use a public one,
+# and then — nothing. The approval lands in Firestore where this agent cannot see
+# it (`deviceAccessRequests` is `allow read, write: if false` to every credential,
+# so the web route is the only door), and until 2026-09-20 nothing on this side
+# ever knocked on that door unprompted. The owner approved, and the person found
+# out twenty minutes later by asking "done?".
+#
+# ⛔ ON DISK, BECAUSE THE WAIT IS LONG. An approval can arrive hours after the
+# ask; in memory it would not survive one bridge restart, and a restart inside a
+# multi-hour wait is the normal case rather than the edge one.
+#
+# ⛔ UID-BOUND, exactly like the announce above and for the same reason: a
+# re-login as a different account must not inherit the previous one's pending ask
+# or its parked topic.
+#
+# ⚠ AND ON WHAT MAY BE PARKED HERE. The header's rule is the account's own email
+# and topic — the topic is explicitly in scope. The device id of a STRANGER'S
+# machine is new, and it is deliberate: it is the only handle the transition can
+# be detected on. Note the distinction from `bridge.log`, which keeps a stranger's
+# id OUT precisely because that file is uploadable to support; this file is not,
+# and 0600 is its protection.
+_DEVICE_ASK = "deviceAsk"
+_DEVICE_ASK_UID = "deviceAskUid"
+_HELD_RESEARCH = "heldResearch"
+_HELD_RESEARCH_UID = "heldResearchUid"
+
+# ⛔ THE ASK'S OWN LIFETIME. A refusal blocks asking again for a week, so a row
+# that has neither been approved nor refused in that time is not coming back —
+# and a record polled forever is a Firestore read a minute, for nothing.
+_DEVICE_ASK_TTL = 7 * 24 * 3600
+# ⛔ SHORTER FOR THE TOPIC, because starting research somebody asked for hours ago
+# without being asked again is a surprise, not a convenience.
+_HELD_RESEARCH_TTL = 6 * 3600
 
 # Default display name for the agent session in the app's "Shared with" popup;
 # renamable from the FE (the rename writes the label onto the agentSessions doc,
@@ -346,6 +382,93 @@ def clear_pending_announce() -> None:
         popped = [prefs.pop(k, None) for k in (_PENDING_ANNOUNCE, _PENDING_ANNOUNCE_UID)]
         if any(v is not None for v in popped):
             save(prefs)
+
+
+def _get_uid_bound(key: str, uid_key: str, uid: str,
+                   ttl: int) -> dict[str, Any] | None:
+    """One uid-bound, time-bounded record, or None.
+
+    ⛔ AN EMPTY UID MATCHES AN EMPTY UID and that is a real hole, not a
+    theoretical one — see the long note on `get_pending_announce`, where a
+    truncated write left an empty owner readable by any caller asking with
+    nothing. Neither side may be empty.
+
+    ⛔ AND EXPIRY IS READ-SIDE, not swept. Nothing here runs on a timer, so a
+    record that outlives its window has to stop answering rather than wait to be
+    collected.
+    """
+    if not uid:
+        return None
+    data = load()
+    rec = data.get(key)
+    owner = data.get(uid_key)
+    if not (isinstance(rec, dict) and rec and owner and owner == uid):
+        return None
+    try:
+        age = _time.time() - float(rec.get("at") or 0)
+    except (TypeError, ValueError):
+        return None
+    if age < 0 or age > ttl:
+        return None
+    return rec
+
+
+def _set_uid_bound(key: str, uid_key: str, rec: dict[str, Any], uid: str) -> None:
+    with _lock:
+        prefs = load()
+        prefs[key] = {**rec, "at": rec.get("at") or _time.time()}
+        prefs[uid_key] = uid
+        save(prefs)
+
+
+def _clear_uid_bound(key: str, uid_key: str) -> None:
+    with _lock:
+        prefs = load()
+        # Pop EAGERLY (a list, not a generator) — a short-circuiting any() would
+        # stop at the first non-None key and orphan the other one.
+        popped = [prefs.pop(k, None) for k in (key, uid_key)]
+        if any(v is not None for v in popped):
+            save(prefs)
+
+
+def get_device_ask(uid: str) -> dict[str, Any] | None:
+    """The public computer this account is waiting on an answer about, or None."""
+    return _get_uid_bound(_DEVICE_ASK, _DEVICE_ASK_UID, uid, _DEVICE_ASK_TTL)
+
+
+def set_device_ask(rec: dict[str, Any], uid: str) -> None:
+    """Park the outstanding ask. A newer ask SUPERSEDES an older one rather than
+    queueing behind it — one person can have several asks outstanding, but only
+    the most recent is the one a chat is plausibly still waiting on."""
+    _set_uid_bound(_DEVICE_ASK, _DEVICE_ASK_UID, rec, uid)
+
+
+def clear_device_ask() -> None:
+    """Answered, expired, superseded, or signed out."""
+    _clear_uid_bound(_DEVICE_ASK, _DEVICE_ASK_UID)
+
+
+def get_held_research(uid: str) -> dict[str, Any] | None:
+    """A topic that had nowhere to run when it was asked for, or None."""
+    return _get_uid_bound(_HELD_RESEARCH, _HELD_RESEARCH_UID, uid,
+                          _HELD_RESEARCH_TTL)
+
+
+def set_held_research(rec: dict[str, Any], uid: str) -> None:
+    """Park a topic that had no computer to run on.
+
+    ⛔ FIRST ONE WINS IS *NOT* THE RULE HERE — the newest is. Somebody who asks
+    for two things with no computer meant the second one at least as much as the
+    first, and silently starting the older one when a computer arrives is the
+    surprise. The caller refuses the overwrite where it matters; this is the
+    store, not the policy.
+    """
+    _set_uid_bound(_HELD_RESEARCH, _HELD_RESEARCH_UID, rec, uid)
+
+
+def clear_held_research() -> None:
+    """Started, superseded, expired, or signed out."""
+    _clear_uid_bound(_HELD_RESEARCH, _HELD_RESEARCH_UID)
 
 
 def get_runtime() -> str | None:

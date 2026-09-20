@@ -137,12 +137,25 @@ def _state_path(origin: dict | None) -> Path:
     return Path(__file__).with_name(f".sr_poll_{_origin_slug(origin)}.state.json")
 
 
-def _get_updates(origin: dict | None = None) -> tuple[list, dict | None]:
-    """``(runs, signedIn)`` from the bridge. ``signedIn`` is the one-shot
-    "just signed in" event (or None) the bridge delivers once after a remote-login
-    capture — so an armed watchdog announces the sign-in (and any pending topic)
-    proactively. Raises on HTTP/transport error (main() handles a 401 specially)."""
-    q = "/updates?via=agent&limit=20"
+def _get_updates(origin: dict | None = None) -> tuple:
+    """``(runs, signedIn, deviceAccess)`` from the bridge.
+
+    ``signedIn`` is the one-shot "just signed in" event (or None) the bridge
+    delivers once after a remote-login capture — so an armed watchdog announces
+    the sign-in (and any pending topic) proactively.
+
+    ``deviceAccess`` is the same shape for the OTHER thing a person waits on with
+    no computer of their own: the owner of a public machine answering their ask.
+
+    ⭐⭐ `?watchdog=1` IS WHAT MAKES THE SECOND ONE SAFE. `via=agent` alone has
+    three readers — this poller, `sr.py`'s sign-in claim, and `sr updates` — and
+    a side effect hung off it fires on all three, so whichever ran first would
+    consume an approval nobody was listening for. This poller is the only thing
+    that can deliver a proactive message, so it is the only thing that asks.
+
+    Raises on HTTP/transport error (main() handles a 401 specially).
+    """
+    q = "/updates?via=agent&watchdog=1&limit=20"
     if origin:
         q += "&platform=" + urllib.parse.quote(origin.get("platform", ""), safe="")
         q += "&chat=" + urllib.parse.quote(origin.get("chat_id", ""), safe="")
@@ -152,7 +165,75 @@ def _get_updates(origin: dict | None = None) -> tuple[list, dict | None]:
     if not isinstance(body, dict):
         return [], None
     si = body.get("signedIn")
-    return body.get("runs", []), (si if isinstance(si, dict) else None)
+    da = body.get("deviceAccess")
+    sl = body.get("supportLogs")
+    return (body.get("runs", []),
+            (si if isinstance(si, dict) else None),
+            (da if isinstance(da, dict) else None),
+            (sl if isinstance(sl, dict) else None))
+
+
+def _device_access_line(ev: dict) -> str:
+    """What to say when the owner of a public computer answers.
+
+    ⛔ ONLY A YES IS SPOKEN. The bridge does not send a note for a refusal at
+    all — the app tells them, subject to their own notification settings, and a
+    "no" repeated by a second channel is worse than one delivered once. Expiry is
+    indistinguishable from a refusal from outside, which is a second reason not to
+    put words to either.
+
+    ⛔ AND "STARTING" IS ONLY SAID WHEN SOMETHING STARTED. A computer can be
+    shared with you and still not be ready to take work; claiming a run is
+    starting on one that is not is the shape of falsehood this file's comments
+    keep being written about.
+    """
+    if (ev.get("state") or "") != "approved":
+        return ""
+    name = str(ev.get("deviceName") or "that computer").strip() or "that computer"
+    topic = str(ev.get("topic") or "").strip()
+    quoted = f"“{topic}”" if topic else ""
+    head = f"✓ You're in — you can use {name} for your research now."
+    if not topic:
+        return head
+    if ev.get("autoStarted"):
+        if ev.get("online") is False:
+            return (f"{head}\n\n{quoted} is queued on it — it's switched off, so "
+                    "it starts when it comes on. I'll post progress here as each "
+                    "phase finishes.")
+        return (f"{head}\n\nStarting {quoted} on it now — I'll post progress here "
+                "as each phase finishes.")
+    return (f"{head}\n\nI'm still holding {quoted} for you, but {name} isn't ready "
+            "to take work yet. Say the word and I'll try it again.")
+
+
+def _support_log_line(ev: dict) -> str:
+    """What to say when a support bundle lands — or does not.
+
+    ⛔ A FAILURE IS SAID TOO. The person believes they have sent something; a
+    bundle that failed silently is the one case where saying nothing actively
+    misleads, and it is the case they most need to hear about.
+    """
+    code = str(ev.get("code") or "").strip()
+    if not code:
+        return ""
+    name = str(ev.get("deviceName") or "that computer").strip() or "that computer"
+    other = str(ev.get("agentLogCode") or "").strip()
+    if (ev.get("status") or "") == "failed":
+        line = (f"✗ {name} couldn't package the logs for {code}.")
+        if other:
+            line += (f" The agent's own log did go — quote {other} when you "
+                     "report the problem.")
+        else:
+            line += " Ask me to try again and I'll re-send."
+        return line
+    runs = int(ev.get("runCount") or 0)
+    line = (f"✓ Support has the logs from {name} — {runs} run(s), under code "
+            f"{code}.")
+    if other:
+        line += f" Quote both {code} and {other} (the agent's own log)."
+    else:
+        line += " Quote it when you report the problem."
+    return line
 
 
 def _load_state(path: Path | None = None) -> dict | None:
@@ -520,22 +601,38 @@ def _signed_in_line(signed_in: dict) -> str:
             f"Starting {quoted}{on_dev} now — I'll post progress here as each phase finishes."
         )
     if signed_in.get("needsDevice"):
-        # Multi-line + a Rocky-free path FIRST (scan the QR), then the exact one-line
-        # chat form (code + command together — the reliable shape for the gateway).
+        # ⭐⭐ TWO NAMED, NUMBERED SECTIONS, OWN FIRST — THE SAME TWO NOUNS AND THE
+        # SAME ORDER AS `sr.py._no_device_lines` AND `cli.py._print_no_devices`.
+        # This surface runs with `no_agent`, so it is the ONLY one of the three
+        # whose structure is guaranteed: nothing relays it, nothing reflows it.
+        # It was also the one that disagreed most — public first, own second, the
+        # sections unnamed ("Two ways to fix that. Ask to use somebody else's …"),
+        # and its own `1)`/`2)` numbering attached to a THIRD thing (two ways to
+        # hand over the code). Two competing numbering schemes in one message is
+        # the exact confusion the owner reported on 2026-09-20; the inner pair is
+        # now one line and a parenthetical, so the only numbers here are the two
+        # ways in.
+        #
+        # ⛔ THE FULL DISCLOSURE STAYS ON THIS SURFACE AND ONLY THIS ONE. The chat
+        # client's invite was shortened to "They see your name." because a model
+        # turn follows it and can be asked. Nothing follows this, and somebody who
+        # has never set a display name would otherwise be told a stranger sees
+        # their NAME at the moment the product hands over their EMAIL — see
+        # `test_the_watcher_carries_the_whole_disclosure_not_half_of_it`.
         return (
             f"✓ Signed in as {who}.\n\n"
             f"There's no Research Computer on your account yet, so {quoted} has nowhere to run.\n\n"
-            f"Two ways to fix that. Ask to use somebody else's — ask me for the "
-            f"public computers and I'll list the ones on offer; their owner "
-            f"decides, and they see your name — or your email, if you have not "
-            f"set one.\n\n"
-            f"Or add your own. On a computer with Super Research, run:\n"
+            f"Two ways in:\n\n"
+            f"1 · Add your own computer. On a computer with Super Research, run:\n"
             f"      superresearch --pair\n"
-            f"It shows an 8-char code. Then add the Research Computer either way:\n\n"
-            f"1) In the web app (most reliable):\n"
-            f"      superresearch.io → Account → Pipeline Connection → Add Device\n\n"
-            f"2) Or from here — send the code with the command, in ONE message:\n"
-            f"      /sr device-add YOUR-CODE\n\n"
+            f"It shows an 8-char code — send it to me here, in ONE message:\n"
+            f"      /sr device-add YOUR-CODE\n"
+            f"(or in the web app: superresearch.io → Account → Pipeline Connection "
+            f"→ Add Device)\n\n"
+            f"2 · Public computers — ask to use somebody else's. Ask me for the "
+            f"public computers and I'll list the ones on offer, and tell me which "
+            f"one to ask for; they see your name — or your email, if you have not "
+            f"set one.\n\n"
             f"No Super Research on any computer yet? Install it first:\n"
             f"  • Windows:      irm https://superresearch.io/install.ps1 | iex\n"
             f"  • macOS/Linux:  curl -fsSL https://superresearch.io/install.sh | sh"
@@ -644,9 +741,19 @@ def main(origin: dict | None = None) -> int:
         # loopback response — http.client.BadStatusLine / IncompleteRead subclass
         # HTTPException, NOT OSError, so a narrow tuple would let them escape.
         return 0
-    # Back-compat unpack: real fetch returns (runs, signedIn); a test/monkeypatch or
-    # an older shim may hand back just the runs list.
-    runs, signed_in = fetched if isinstance(fetched, tuple) else (fetched, None)
+    # Back-compat unpack: the real fetch returns (runs, signedIn, deviceAccess);
+    # a test/monkeypatch or an older shim may hand back a 2-tuple or just the runs
+    # list. ⛔ THE OLD 2-TUPLE FORM STILL WORKS — a shim generated by a previous
+    # version is on disk in every chat that ever armed one, and this file is
+    # deployed by `connect`/`update` rather than by `pip install`, so the two
+    # versions genuinely coexist.
+    device_access = support_logs = None
+    if isinstance(fetched, tuple):
+        runs, signed_in = fetched[0], (fetched[1] if len(fetched) > 1 else None)
+        device_access = fetched[2] if len(fetched) > 2 else None
+        support_logs = fetched[3] if len(fetched) > 3 else None
+    else:
+        runs, signed_in = fetched, None
     prior = _load_state(state_file)
     pdict = prior or {}
 
@@ -679,6 +786,38 @@ def main(origin: dict | None = None) -> int:
             announced_login = True
             si_ts = si_key
 
+    # ⭐⭐ THE OWNER SAID YES — AND NOBODY USED TO BE TOLD. The approval lands in
+    # `deviceAccessRequests`, which is `allow read, write: if false` to every
+    # credential the agent holds, so it cannot be watched in Firestore at all; the
+    # bridge now knocks on the web route for it, and this is the only channel that
+    # can carry the answer into a chat unprompted. Before this, an owner approved
+    # and the person found out twenty minutes later by asking "done?" themselves
+    # (owner, 2026-09-20).
+    #
+    # ⛔ THE BRIDGE CLEARS THE ASK AS IT ANSWERS, so this note arrives exactly
+    # once and there is nothing to de-dup across ticks — the reserved key records
+    # that it was said, for the same belt-and-braces reason `__signed_in_ts__`
+    # exists, not to gate the message.
+    da_key = pdict.get("__device_access__")
+    if isinstance(device_access, dict) and device_access:
+        line = _device_access_line(device_access)
+        key = "dev:" + str(device_access.get("deviceId") or "") + ":" + line[:120]
+        if line and key != da_key:
+            out.append(line)
+            da_key = key
+
+    # ⭐⭐ AND THE LOGS THEY SENT ACTUALLY ARRIVED. The send can only ever say
+    # "asked" — a machine somewhere else does the packaging and the upload — so
+    # the arrival was reachable only by somebody thinking to check. The bridge
+    # flips its own record as it hands this over, so it goes out exactly once.
+    sl_key = pdict.get("__support_logs__")
+    if isinstance(support_logs, dict) and support_logs:
+        line = _support_log_line(support_logs)
+        key = "log:" + str(support_logs.get("code") or "")
+        if line and key != sl_key:
+            out.append(line)
+            sl_key = key
+
     # Baseline = we've never recorded this chat's RUNS before. A state file that
     # holds only reserved keys (e.g. __login_wait__ written by unauthed login-wait
     # ticks) is NOT a real run-baseline — without this, the first authed tick after
@@ -694,6 +833,13 @@ def main(origin: dict | None = None) -> int:
     # drop __login_wait__ now that we're authed).
     if si_ts is not None:
         new_state["__signed_in_ts__"] = si_ts
+    # ⛔ RE-STAMPED BESIDE IT, for the same reason: compute() rebuilds new_state
+    # from the runs alone, so a reserved key not copied forward is a key that
+    # vanishes every tick.
+    if da_key is not None:
+        new_state["__device_access__"] = da_key
+    if sl_key is not None:
+        new_state["__support_logs__"] = sl_key
 
     # ⛔ SPEAK FIRST, THEN COMMIT. This was the other way round, which is the exact
     # shape FORK.md §4.2 records as learned the hard way about the holding-pen

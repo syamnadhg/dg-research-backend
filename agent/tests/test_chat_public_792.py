@@ -288,20 +288,42 @@ def test_a_quoted_name_survives_the_lookup(monkeypatch):
 
 # ── the chat verbs ───────────────────────────────────────────────────────────
 
-def test_chat_browse_prints_the_id_beside_every_row(chat):
+def test_chat_browse_names_every_row_and_holds_the_id_back(chat):
+    """⭐ THE ID IS NO LONGER ON EVERY ROW (owner, 2026-09-19). A 32-character hex
+    string beside a one-word name was the widest thing on the screen and read as
+    something the person had to deal with. It now appears only where two rows read
+    the same, which is the only case where it is the thing that separates them —
+    see `test_chat_browse_shows_the_id_when_two_rows_read_the_same`."""
     chat.gets["/devices/public"] = (200, {"devices": [ROW, UNNAMED_A],
                                           "truncated": False})
     assert sr.cmd_devices_public(_ns()) == 0
     out = chat.out()
-    assert ID_A in out and ID_B in out
+    assert "Studio PC" in out and "Research computer" in out
     assert "online" in out and "offline" in out
-    # ⛔⛔ THIS ASSERTION PINNED THE WRONG CLAIM FOR TWO WAVES. Its sibling
-    # `test_the_consent_question_carries_all_three_disclosures` forbids "name and
-    # email address" BY NAME as wrong twice — the owner sees the name, and the
-    # email only when no name is set — and this line demanded it on the screen
-    # where somebody decides whether to ask at all. One claim, both screens.
-    assert "or your email, if you haven’t set one" in out
+    # these two read differently, so neither needs its id
+    assert ID_A not in out and ID_B not in out
+    # ⛔ THE CLAIM ABOUT WHAT THE OWNER SEES STAYS TRUE, in its short form here.
+    # "name and email address" is wrong twice — the owner sees the NAME, and the
+    # email only when no name is set — and it is forbidden on every surface. The
+    # full sentence lives on the CONSENT CONFIRM, which is the last thing shown
+    # before anything is sent; this screen is only choosing a row.
+    assert "They see your name." in out
     assert "name and email address" not in out
+
+
+def test_chat_browse_shows_the_id_when_two_rows_read_the_same(chat):
+    """The case the id exists for: two unnamed machines both render as the
+    identical string "Research computer", and the list reorders online-first over
+    a thirty-second window, so neither the name nor the position identifies one."""
+    twin = dict(UNNAMED_A)
+    twin["deviceId"] = "c3d4e5f6071829304a5b6c7d8e9f0102"
+    chat.gets["/devices/public"] = (200, {"devices": [ROW, UNNAMED_A, twin],
+                                          "truncated": False})
+    assert sr.cmd_devices_public(_ns()) == 0
+    out = chat.out()
+    assert ID_B in out and twin["deviceId"] in out
+    # ⛔ and the row that has a name of its own keeps the clean line
+    assert ID_A not in out
 
 
 def test_chat_browse_says_truncation_is_about_the_scan(chat):

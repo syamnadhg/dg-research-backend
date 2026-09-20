@@ -571,7 +571,10 @@ def test_research_no_devices_shows_pair_prompt(monkeypatch, capsys):
     # ⛔ AND THE THIRD THING IS A LIST, NOT ADVICE. "or ask for a public one" with
     # nothing named is the dead end this wave exists to remove.
     assert "ask to use somebody else" in out.lower()
-    assert "Studio PC" in out and "dev-a1" in out
+    # ⚠ the id is no longer printed beside a row whose name is unique
+    # (owner, 2026-09-19) — the NAME is what the person picks by, and the ask
+    # resolver takes it. The id returns only when two rows read the same.
+    assert "Studio PC" in out and "dev-a1" not in out
     assert "can’t take anyone else" in out
     # the human setup-page URL is offered too as a bare URL (NOT Markdown); the
     # trailing newline distinguishes it from the install.ps1/.sh script URLs

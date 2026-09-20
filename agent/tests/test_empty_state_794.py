@@ -167,11 +167,89 @@ def test_the_pair_code_sentence_is_its_own_line_and_not_the_install_block(chat):
     that phrase can never see the second thing disappear."""
     sr.cmd_devices(_ns())
     out = chat.out()
-    assert ("Add your own: paste the access code from the computer running "
+    # ⚠ REPINNED 2026-09-20. The head is now "Add your own computer:" — the two
+    # ways in are NAMED and NUMBERED sections, because the unnamed public half
+    # was being folded away by the relay. The claim under test is untouched: this
+    # sentence is its own line and is not the install block.
+    assert ("Add your own computer: paste the access code from the computer running "
             "Super Research and I’ll connect it.") in out
     # ⛔ AND THE PROOF THAT IT IS NOT THE INSTALL BLOCK SPEAKING: that block is
     # present too, and says the phrase in its own words.
     assert "It installs Super Research and prints an 8-char access code" in out
+
+
+def test_the_public_half_is_a_named_section_on_every_surface(chat, term, monkeypatch):
+    """⭐⭐ THE SECTION HAD NO NAME, SO IT HAD NOTHING TO SURVIVE ON (owner,
+    2026-09-20). The browse screen has always headed these rows "Public computers
+    (N):". The empty state rendered the IDENTICAL rows under "Or ask to use
+    somebody else's — these are on offer right now:" and never printed the noun
+    at all — so a person meeting the concept for the FIRST time met it as the
+    tail of a sentence, on the one screen where it is new information.
+
+    ⛔ AND A RELAY PRESERVES WHAT THE CLIENT STATES AND RESTRUCTURES WHAT IT
+    LEAVES IMPLICIT. Sent to a chat, the nameless half was merged into the option
+    above it and the list of public computers left the message entirely. No
+    amount of "relay verbatim" in SKILL.md fixed that — the word was never in the
+    bytes. This pins the word into the bytes, on all three surfaces.
+    """
+    sr.cmd_devices(_ns())
+    assert "public computers" in chat.out().lower()
+
+    sr.cmd_devices_public(_ns())
+    assert "public computers" in chat.out().lower()
+
+    cli.cmd_device(argparse.Namespace(device_command=None))
+    assert "public computers" in term.out().lower()
+
+    line = poll._signed_in_line({"email": "e@x.y", "needsDevice": True,
+                                 "topic": "Golden Retrievers", "pendingTopic": ""})
+    assert "public computers" in line.lower(), line
+
+
+def test_one_noun_for_the_public_list_not_two(chat):
+    """⛔ THE TWO SCREENS RENDER ONE LIST AND MUST NOT NAME IT TWO WAYS. They drifted
+    once already — the browse head said "Public computers", the empty state said
+    nothing — so the noun is a module constant and both read from it. The count is
+    the browse screen's alone: it is reporting a scan, while the empty state is
+    naming an option."""
+    assert sr._PUBLIC_HEAD == "Public computers"
+    sr.cmd_devices_public(_ns())
+    assert f"{sr._PUBLIC_HEAD} (" in chat.out()
+    sr.cmd_devices(_ns())
+    empty = chat.out()
+    assert sr._PUBLIC_HEAD in empty
+    # ⛔ and WITHOUT a count, which would be a claim about a scan this screen did
+    # not report on
+    assert f"{sr._PUBLIC_HEAD} (" not in empty
+
+
+def test_both_ways_in_are_numbered_and_the_numbers_come_from_one_place(chat):
+    """⭐ TWO OPTIONS, TWO ORDINALS, ASSIGNED AT THE CALL SITE. `_public_offer_lines`
+    has five branches and one of them returns nothing at all, so a "2 ·" baked
+    into the renderer would leave a numbered hole — an option 1 followed by the
+    install block and a reader looking for the 2."""
+    sr.cmd_devices(_ns())
+    out = chat.out()
+    assert "Two ways in:" in out
+    assert "1 · Add your own computer" in out
+    assert f"2 · {sr._PUBLIC_HEAD}" in out
+    # ⛔ THE RENDERER STAYS PURE — it must not know its own position
+    import inspect
+    src = inspect.getsource(sr._public_offer_lines)
+    assert "2 ·" not in src and "1 ·" not in src, src
+
+
+def test_a_renderer_that_returns_nothing_leaves_no_numbered_hole(chat, monkeypatch):
+    """The --json path sets `_RENDERING_LINES` False and `_public_offer_lines`
+    returns []. Option 1 must then stand alone rather than being followed by a
+    missing 2."""
+    monkeypatch.setattr(sr, "_RENDERING_LINES", False)
+    lines = sr._no_device_lines()
+    blob = "\n".join(lines)
+    assert "1 · Add your own computer" in blob
+    assert "2 ·" not in blob, blob
+    # ⛔ and the walkthrough still arrives — the early-out must not eat it
+    assert any("full walkthrough" in ln for ln in lines), lines
 
 
 def test_the_three_things_come_before_the_install_walkthrough(chat):
@@ -249,15 +327,42 @@ def test_the_post_sign_in_one_liner_names_both_ways_out(chat):
 def test_the_empty_state_lists_the_public_ones_with_everything_a_row_carries(chat):
     sr.cmd_devices(_ns())
     out = chat.out()
-    assert "Studio PC" in out and "(id dev-a1)" in out
+    assert "Studio PC" in out
     assert "online" in out and "offline" in out
     # ⛔⛔ `full` IS A REFUSAL IN ADVANCE. A row offered without it invites an ask
     # the route answers `share_cap_reached` with certainty, spending one of five
     # an hour on a guaranteed no.
     assert "can’t take anyone else" in out
-    # ⛔ THE ID IS NOT DECORATION — public labels collide. Both rows here are what
-    # every unnamed machine reads as, so the id is the only thing that separates.
-    assert "(id dev-b2)" in out
+    # ⛔⛔ AND NO ID, BECAUSE THESE TWO ROWS DO NOT READ THE SAME. The id used to
+    # print on every row and it was the widest thing on the screen — a 32-char hex
+    # string beside a one-word name, which reads as something the person has to
+    # deal with (owner, 2026-09-19). It is now shown only where it is the ONLY
+    # thing that separates two rows; see the collision test below.
+    # ⚠ The comment that stood here claimed both rows were the default unnamed
+    # label. They are not — the fixture is "Studio PC" and "Research computer" —
+    # so the assertion it justified was passing for a reason that was not true.
+    assert "(id dev-a1)" not in out
+    assert "(id dev-b2)" not in out
+
+
+def test_the_id_comes_back_the_moment_two_rows_read_the_same(chat):
+    """⭐ THE CASE THE ID EXISTS FOR. Every unnamed machine renders as the identical
+    string "Research computer", and the list reorders online-first over a
+    thirty-second window — so with two of them neither the name nor the position
+    identifies one, and the ask takes the id. Dropping it everywhere would have
+    made exactly this situation unanswerable."""
+    chat.gets["/devices/public"] = (200, {"devices": [
+        {"deviceId": "dup-1", "label": "Research computer", "online": True, "full": False},
+        {"deviceId": "dup-2", "label": "Research computer", "online": False, "full": False},
+        {"deviceId": "solo", "label": "Studio PC", "online": True, "full": False},
+    ]})
+    sr.cmd_devices(_ns())
+    out = chat.out()
+    assert "(id dup-1)" in out and "(id dup-2)" in out
+    # ⛔ AND ONLY ON THE ONES THAT COLLIDE. A row with a name of its own keeps the
+    # clean line — otherwise one duplicate pair would drag the id back onto
+    # everything, which is the state this replaced.
+    assert "(id solo)" not in out
 
 
 def test_the_two_screens_print_the_identical_row_for_the_identical_machine(chat):
@@ -265,29 +370,39 @@ def test_the_two_screens_print_the_identical_row_for_the_identical_machine(chat)
     consumers and this is the guard that they are the SAME consumer of it — a
     renderer pinned only through the browse list would let the empty state grow a
     second phrasing, which is exactly how the ten deviceless sentences happened."""
+    # ⚠ MATCHED BY NAME, NOT BY ID. This used to find the row by its device id,
+    # which stopped working the moment the id left the line — and it failed as
+    # "browse and empty are both empty", i.e. as the two screens agreeing about
+    # nothing. The property under test is unchanged: one renderer, both screens.
     sr.cmd_devices_public(_ns())
-    browse = [ln for ln in chat.out().splitlines() if "dev-a1" in ln]
+    browse = [ln for ln in chat.out().splitlines() if "Studio PC" in ln]
     sr.cmd_devices(_ns())
-    empty = [ln for ln in chat.out().splitlines() if "dev-a1" in ln]
+    empty = [ln for ln in chat.out().splitlines() if "Studio PC" in ln]
     assert browse and empty and browse == empty, (browse, empty)
 
 
 def test_the_invitation_says_what_the_consent_question_says(chat):
-    """⛔⛔ "your name and email address" IS WRONG TWICE and was corrected in ONE
-    place. The owner sees the NAME, and the email only when no name is set. Both
-    screens that invite an ask now read from one string, and the confirm states the
-    same claim."""
+    """⛔⛔ "your name and email address" IS WRONG TWICE. The owner sees the NAME,
+    and the email only when no name is set.
+
+    ⭐ THE TWO SURFACES NOW SAY DIFFERENT AMOUNTS, ON PURPOSE (owner, 2026-09-19).
+    The LIST invite is a prompt to pick one of several rows, and a full privacy
+    disclosure there made a five-line message out of a one-line question. The
+    CONFIRM is the consent gate — the last thing shown before anything is sent —
+    and it keeps the whole sentence, including the email fallback, because that is
+    the moment the claim has to be exactly true.
+
+    ⛔ What must NOT diverge is the CLAIM. Neither may say "name and email
+    address", which is wrong in both directions."""
     sr.cmd_devices(_ns())
     out = chat.out()
-    assert "or your email, if you haven’t set one" in out
+    # the short invite: says the owner sees a name, and stops there
+    assert "They see your name." in out, out
     assert "name and email address" not in out
-    assert "or your email, if you haven’t set one" in sr._NL_CONFIRMS["device-ask"]
-    # ⛔⛔ AND IT OFFERS THE ID, BECAUSE THE ROWS ABOVE IT COLLIDE. Every unnamed
-    # machine reads as the identical string "Research computer", so "tell me which
-    # one" alone is a question the reader may not be able to answer — and the
-    # resolver refuses an ambiguous name rather than guessing. Both rows in this
-    # fixture are that default label, which is why the id is on every line.
-    assert "the id beside it" in out, out
+    # the consent gate: the precise version, unchanged
+    confirm = sr._NL_CONFIRMS["device-ask"]
+    assert "or your email, if you haven’t set one" in confirm
+    assert "name and email address" not in confirm
 
 
 # ── the look can fail, and the offer must survive it ─────────────────────────
@@ -501,7 +616,7 @@ def test_one_name_for_the_code_on_every_surface(term, chat):
     sr.cmd_devices(_ns())
     # ⛔ THE SENTENCE, NOT THE PHRASE — the install block below it also says
     # "8-char access code", which is the vacuity this same file documents above.
-    assert "Add your own: paste the access code" in chat.out()
+    assert "Add your own computer: paste the access code" in chat.out()
     assert "8-char access code" in _SKILL.read_text(encoding="utf-8")
     # ⛔ SCOPED TO THE EMPTY STATE, WHICH IS THIS WAVE'S SUBJECT. The short form
     # still appears twice in SKILL.md and once in the install flow, in sentences
