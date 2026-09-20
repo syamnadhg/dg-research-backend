@@ -256,21 +256,27 @@ def _no_device_lines(lead: str | None = None) -> list[str]:
     unchanged.
     """
     lines = [lead] if lead else []
-    lines.append("No research computer on this account yet. Two ways in:")
+    lines.append("No research computer on this account yet.")
     lines.append("")
-    lines.append("1 · Add your own computer: paste the access code from the "
-                 "computer running Super Research and I’ll connect it.")
+    # ⛔⛔ NOT NUMBERED, AND NOT COUNTED — THERE IS NO HONEST NUMBER TO GIVE
+    # (owner, 2026-09-20). A first version of this headed the block "Two ways in:"
+    # and numbered the options 1 and 2. Both are false: an access code connects
+    # ANY computer running Super Research, so "add a computer" already covers a
+    # machine of your own AND somebody else's private machine whose owner hands
+    # you the code — which is a third way in that the count silently denied.
+    # A wrong number is worse than no number: it tells the reader to stop looking.
+    #
+    # ⭐ WHAT THE SECTIONS NEEDED WAS NAMES, NOT ORDINALS. The defect this block
+    # was rewritten for was that the public half had no NOUN — it read as the tail
+    # of a sentence, so a relay folded it into the option above it and the list
+    # left the message. The names fix that; the numbers were never load-bearing.
+    lines.append("Add a computer: paste the access code from any computer "
+                 "running Super Research — your own, or one whose owner hands "
+                 "you the code — and I’ll connect it.")
     lines.append("")
-    # ⭐⭐ BOTH ORDINALS ARE ASSIGNED HERE, AT THE ONE CALL SITE, and never
-    # inside `_public_offer_lines`. That function has five branches and one of
-    # them returns nothing at all (under --json), so a "2 ·" baked into the
-    # renderer would print a numbered hole — an option 1 followed by the install
-    # block, with the reader left looking for the 2. The caller is also the only
-    # thing that knows this is a numbered list; the renderer is reused by no one
-    # today, but it is written as a pure renderer and stays one.
     pub = _public_offer_lines()
     if pub:
-        lines += [f"2 · {pub[0]}"] + pub[1:]
+        lines += pub
         lines.append("")
     lines += _SETUP_NODE_LINES
     return lines

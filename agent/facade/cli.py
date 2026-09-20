@@ -1644,11 +1644,17 @@ def _print_no_devices() -> None:
     # budget than `device public`'s own 40s, because this look is riding on a
     # command that was asked something else.
     res = _bridge_get("/devices/public", timeout=20.0)
-    print("No research computer on this account yet. Two ways in:")
-    print("  1 . Add your own computer:  the computer running Super Research "
-          "prints an")
-    print("                              8-char access code —")
-    print("                              agent device add <code>")
+    print("No research computer on this account yet.")
+    # ⛔⛔ NOT NUMBERED, AND NOT COUNTED. An access code connects ANY computer
+    # running Super Research, so this option already covers a machine of your own
+    # and somebody else's private machine whose owner hands you the code — a third
+    # way in that "two ways" silently denied (owner, 2026-09-20). What these
+    # sections needed was NAMES, not ordinals: the defect was that the public half
+    # had no noun to be recognised by, not that it had no number.
+    print("  Add a computer:      any computer running Super Research prints an")
+    print("                       8-char access code — your own, or one whose")
+    print("                       owner hands you the code:")
+    print("                       agent device add <code>")
     # ⭐⭐ THE PUBLIC HALF IS A NAMED, NUMBERED SECTION HERE TOO, and the install
     # block moved BELOW it. Both halves of that are one fix. This screen rendered
     # the list under "Or ask to use somebody else's — …" and never printed the
@@ -1662,20 +1668,20 @@ def _print_no_devices() -> None:
     # (tests/test_empty_state_794.py:177) for a reason that applies identically
     # here: seven lines of shell arriving before the two options buries them.
     if res is None or res[0] != 200 or not isinstance(res[1], dict):
-        print("  2 . Public computers — ask to use somebody else's:  "
+        print("  Public computers — ask to use somebody else's:  "
               "agent device public")
         _print_install_block_t()
         return
     rows = [d for d in (res[1].get("devices") or []) if isinstance(d, dict)]
     if not rows:
-        print("  2 . Public computers — ask to use somebody else's. Nobody is "
+        print("  Public computers — ask to use somebody else's. Nobody is "
               "offering one publicly right now.")
         print(_PUBLIC_NONE_WHY_T)
         if res[1].get("truncated"):
             print(_PUBLIC_TRUNCATED_NONE_T)
         _print_install_block_t()
         return
-    print("  2 . Public computers — ask to use somebody else's; on offer right "
+    print("  Public computers — ask to use somebody else's; on offer right "
           "now:")
     for i, d in enumerate(rows, 1):
         print(_public_row(i, d))

@@ -58,7 +58,13 @@ PUB_FULL = {"deviceId": "dev-b2", "label": "Research computer", "osFamily": "lin
 # SENTENCE deleted — a mutant proved it, killing nothing across eight tests. The
 # phrase now belongs to that sentence alone, on both clients.
 THING_NONE = "no research computer on this account yet"
-THING_OWN = "add your own"
+# ⚠ "add your own" UNTIL 2026-09-20, AND THAT PHRASE WAS ITSELF THE MISLEAD.
+# An access code connects ANY computer running Super Research, so this option has
+# always covered somebody else's private machine whose owner hands you the code —
+# "your own" narrowed a door that was never that narrow, and heading the block
+# "Two ways in" denied the third route outright (owner). The claim pinned here is
+# unchanged: the access-code route is NAMED on every door.
+THING_OWN = "add a computer"
 THING_ASK = "ask to use somebody else"
 
 
@@ -167,12 +173,15 @@ def test_the_pair_code_sentence_is_its_own_line_and_not_the_install_block(chat):
     that phrase can never see the second thing disappear."""
     sr.cmd_devices(_ns())
     out = chat.out()
-    # ⚠ REPINNED 2026-09-20. The head is now "Add your own computer:" — the two
-    # ways in are NAMED and NUMBERED sections, because the unnamed public half
-    # was being folded away by the relay. The claim under test is untouched: this
-    # sentence is its own line and is not the install block.
-    assert ("Add your own computer: paste the access code from the computer running "
-            "Super Research and I’ll connect it.") in out
+    # ⚠ REPINNED 2026-09-20, TWICE. The head is "Add a computer:" — the routes
+    # are NAMED (because the unnamed public half was being folded away by the
+    # relay) and deliberately NOT NUMBERED (because an access code connects any
+    # computer running Super Research, so "two ways in" was false). The claim
+    # under test is untouched: this sentence is its own line, not the install
+    # block. It is asserted WHOLE so the widened clause cannot quietly vanish.
+    assert ("Add a computer: paste the access code from any computer running "
+            "Super Research — your own, or one whose owner hands you the code "
+            "— and I’ll connect it.") in out
     # ⛔ AND THE PROOF THAT IT IS NOT THE INSTALL BLOCK SPEAKING: that block is
     # present too, and says the phrase in its own words.
     assert "It installs Super Research and prints an 8-char access code" in out
@@ -223,32 +232,52 @@ def test_one_noun_for_the_public_list_not_two(chat):
     assert f"{sr._PUBLIC_HEAD} (" not in empty
 
 
-def test_both_ways_in_are_numbered_and_the_numbers_come_from_one_place(chat):
-    """⭐ TWO OPTIONS, TWO ORDINALS, ASSIGNED AT THE CALL SITE. `_public_offer_lines`
-    has five branches and one of them returns nothing at all, so a "2 ·" baked
-    into the renderer would leave a numbered hole — an option 1 followed by the
-    install block and a reader looking for the 2."""
+def test_the_ways_in_are_NAMED_and_never_COUNTED(chat):
+    """⛔⛔ THERE IS NO HONEST NUMBER TO GIVE, so no number is given (owner,
+    2026-09-20). A first version of this block headed itself "Two ways in:" and
+    numbered the options 1 and 2. Both are false: an access code connects ANY
+    computer running Super Research, so the access-code option already covers a
+    machine of your own AND somebody else's private machine whose owner hands you
+    the code — a third way in that the count silently denied. A wrong number is
+    worse than no number, because it tells the reader to stop looking.
+
+    ⭐ AND THE NUMBERS WERE NEVER THE FIX. What the public half lacked was a
+    NOUN: it rendered as the tail of a sentence, so a relay folded it into the
+    option above it and the list left the message entirely. Names fix that;
+    ordinals never did."""
     sr.cmd_devices(_ns())
     out = chat.out()
-    assert "Two ways in:" in out
-    assert "1 · Add your own computer" in out
-    assert f"2 · {sr._PUBLIC_HEAD}" in out
-    # ⛔ THE RENDERER STAYS PURE — it must not know its own position
-    import inspect
-    src = inspect.getsource(sr._public_offer_lines)
-    assert "2 ·" not in src and "1 ·" not in src, src
+    assert "Add a computer:" in out
+    assert f"{sr._PUBLIC_HEAD} —" in out
+    assert "Two ways in" not in out
+    assert "1 · " not in out and "2 · " not in out, out
 
 
-def test_a_renderer_that_returns_nothing_leaves_no_numbered_hole(chat, monkeypatch):
+def test_the_access_code_route_does_not_narrow_itself_to_your_own_machine(chat):
+    """⛔ THE MISLEAD THE COUNT EXPOSED. "Add your own" describes the common case
+    and quietly forbids the real one: a private computer somebody else owns is
+    added exactly the same way, with the code its owner hands you. Somebody told
+    the only route is "your own", who hasn't got one, reads a dead end."""
+    sr.cmd_devices(_ns())
+    out = chat.out()
+    assert "any computer running Super Research" in out
+    assert "whose owner hands you the code" in out
+    assert "Add your own" not in out
+
+
+def test_a_renderer_that_returns_nothing_still_leaves_a_whole_screen(chat, monkeypatch):
     """The --json path sets `_RENDERING_LINES` False and `_public_offer_lines`
-    returns []. Option 1 must then stand alone rather than being followed by a
-    missing 2."""
+    returns []. The access-code route and the walkthrough must both survive it.
+
+    ⚠ THIS PINNED "no numbered hole" — the right worry about a design that is
+    gone. With the options numbered, a branch returning nothing left an option 1
+    followed by the install block and a reader hunting for the 2. Without
+    ordinals the hole cannot exist; what is still worth pinning is that the
+    early-out does not eat the rest of the screen."""
     monkeypatch.setattr(sr, "_RENDERING_LINES", False)
     lines = sr._no_device_lines()
     blob = "\n".join(lines)
-    assert "1 · Add your own computer" in blob
-    assert "2 ·" not in blob, blob
-    # ⛔ and the walkthrough still arrives — the early-out must not eat it
+    assert "Add a computer:" in blob
     assert any("full walkthrough" in ln for ln in lines), lines
 
 
@@ -616,7 +645,7 @@ def test_one_name_for_the_code_on_every_surface(term, chat):
     sr.cmd_devices(_ns())
     # ⛔ THE SENTENCE, NOT THE PHRASE — the install block below it also says
     # "8-char access code", which is the vacuity this same file documents above.
-    assert "Add your own computer: paste the access code" in chat.out()
+    assert "Add a computer: paste the access code" in chat.out()
     assert "8-char access code" in _SKILL.read_text(encoding="utf-8")
     # ⛔ SCOPED TO THE EMPTY STATE, WHICH IS THIS WAVE'S SUBJECT. The short form
     # still appears twice in SKILL.md and once in the install flow, in sentences

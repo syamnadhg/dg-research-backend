@@ -228,7 +228,7 @@ def test_a_topic_with_nowhere_to_run_is_promised_not_dropped(monkeypatch, capsys
     assert "“creativity” has nowhere to run yet" in out, out
     assert "I’ll hold it" in out
     # ⛔ AND THE TWO WAYS IN STILL FOLLOW IT — the promise replaces neither
-    assert "Add your own computer" in out
+    assert "Add a computer" in out
     assert "Public computers" in out
 
 
@@ -240,5 +240,5 @@ def test_no_chat_means_no_promise_because_nothing_is_held(monkeypatch, capsys):
     out = _research_out(monkeypatch, capsys, None)
     assert "hold it" not in out, out
     # ⛔ the empty state itself is unchanged — only the lead is conditional
-    assert "Add your own computer" in out
+    assert "Add a computer" in out
     assert "Public computers" in out
