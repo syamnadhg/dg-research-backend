@@ -711,17 +711,6 @@ IMPORTANT:
   do NOT re-click the card — re-click can collapse the panel.
 - Checklist content = WRONG artifact. Multi-section prose = correct."""
 
-PROMPT_COPY_RESPONSE = SYSTEM_BASE + """
-
-Your task: Copy the AI response text to clipboard.
-
-Steps:
-1. Look at the screen. You should see a completed AI response.
-2. Find the "Copy" button near the response (usually an icon that looks like two overlapping squares).
-3. Click it to copy the response to clipboard.
-4. If no Copy button, select all text in the response (Ctrl+A) and copy (Ctrl+C).
-5. Say "copied" when done."""
-
 # ── Phase 3: NotebookLM ────────────────────────────
 PROMPT_NOTEBOOKLM_UPLOAD = SYSTEM_BASE + """
 
@@ -1017,11 +1006,6 @@ If you cannot read the rows clearly, close the menu and say
         _body = _body.replace("Steps:", _ord_note + "\n\nSteps:", 1)
     return _body
 
-
-# Backward-compat aliases — keep the previous "long" behavior for any
-# importer that hasn't been updated to call the factory with podcast_length.
-PROMPT_AUDIO_CHECK = make_prompt_audio_check("long")
-PROMPT_AUDIO_DOWNLOAD = make_prompt_audio_download("long")
 
 # ── Inline CUA Prompts (used as one-off fallbacks) ────────────────────────────
 

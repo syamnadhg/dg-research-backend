@@ -148,11 +148,29 @@ def test_empty_evidence_is_not_a_title():
     assert research._alert_title_safe(None) is False
 
 
-def test_the_quiet_word_list_matches_the_webs():
-    """⚠ The list is duplicated across two repos that ship separately. This is
-    the backend half of the pin; `pipelineErrors.test.ts` holds the other."""
-    assert set(research._ALERT_QUIET_INFRA_WORDS) >= {
-        "rate-limit", "rate_limit", "overloaded", "529"}
+@pytest.mark.parametrize("text,swallowed", research._ALERT_MIRROR_CORPUS)
+def test_the_mirror_of_the_webs_swallow_rule(text, swallowed):
+    """⛔⛔ THE MIRROR HAD ALREADY DRIFTED, IN THE COMMIT THAT CREATED IT.
+
+    This used to assert that a flat word tuple CONTAINED four strings — a test
+    that could only ever catch a deletion, never an omission. And an omission
+    is what there was: the web also swallows `429` with `rate`/`limit`, and
+    `anthropic` with `overload`/`busy`/`server`. So "429 rate limit exceeded"
+    passed the backend's safety check, went into an alert title, and was then
+    rendered by the web as a passive banner with no Retry and no Skip — the
+    exact outcome `_alert_title_safe` exists to prevent.
+
+    The corpus is shared with `pipelineErrors.test.ts`, which asserts the WEB's
+    verdict on the same strings. Either side changing alone now fails here or
+    there."""
+    assert research._web_swallows_title(text) is swallowed, text
+
+
+def test_a_title_is_refused_exactly_when_the_web_would_swallow_it():
+    """The consumer. The corpus pins the predicate; this pins the thing that
+    actually decides whether evidence reaches the headline."""
+    for text, swallowed in research._ALERT_MIRROR_CORPUS:
+        assert research._alert_title_safe(text) is (not swallowed), text
 
 
 # ── 3. the card actually carries it ───────────────────────────────────────

@@ -1102,15 +1102,6 @@ def _migrate_legacy_api_keys() -> None:
         pass
 
 
-def get_env(name):
-    """os.environ first, User-scope Windows env as fallback. Keeps the
-    legacy contract for callers that just want 'whatever env has this
-    name'. See resolve_api_key for CUA key resolution order, which is
-    deliberately reversed."""
-    val = os.environ.get(name, "")
-    if not val:
-        val = _read_user_scope_env(name)
-    return val
 
 
 def _read_device_key_doc(uid: str, device_id: str) -> dict:
@@ -4868,27 +4859,6 @@ def _render_context_strip(items: list[tuple[str, str]]):
         print(f"  {_c(_DIM, (lab + ':').ljust(label_width + 2))}  {val}")
 
 
-def _fetch_paired_email(paired_uid: str | None) -> str:
-    """Best-effort lookup of the user's email for display. Returns empty
-    string if Firestore is unreachable or the uid is unknown — callers
-    fall back to showing '(not paired)' or the truncated uid.
-
-    Post-Track-D: reads from the device doc's `ownerEmail` field (set
-    by the claim Cloud Function from claimerRecord.email), NOT the
-    legacy `users/{uid}.email` path which the synth user can't read
-    per the user-tree rule."""
-    if not _firebase_db:
-        return ""
-    device_id = load_device_id()
-    if not device_id:
-        return ""
-    try:
-        snap = _firebase_db.collection("devices").document(device_id).get()
-        if snap.exists:
-            return (snap.to_dict() or {}).get("ownerEmail", "") or ""
-    except Exception:
-        pass
-    return ""
 
 
 def _fetch_device_meta() -> dict:
@@ -9697,8 +9667,6 @@ def _parse_bundle_run_names(data: dict) -> "list[str] | None":
     return out
 
 
-def _log_bundle_doc_path(owner_uid: str, code: str) -> str:
-    return f"users/{owner_uid}/logBundles/{code}"
 
 
 def _open_log_bundle_row(owner_uid: str, code: str, device_id: str,
@@ -15681,18 +15649,6 @@ def _owner_control_patch(oc: str, *, running: bool) -> dict:
 # on next chat-open and re-fires the YouTube upload + Doc + Email +
 # status="completed" chain via FE-side credentials.
 # ════════════════════════════════════════════════════════════════════
-
-
-def _mint_fe_id_token(uid):
-    """Always returns None — the BE has no path to mint a Firebase ID
-    token for an arbitrary uid (the synth-device-user's refresh-token
-    credentials only authorize itself, and Admin custom-token mint
-    requires the service account that's no longer on disk). Returning
-    None triggers `_fire_fe_p4_trigger`'s `needsFeTrigger` fallback;
-    the FE catch-up hook re-fires P4/P5 on next chat-open."""
-    del uid  # unused — kept for caller signature compatibility
-    log("FE trigger: ID token mint unavailable — fallback to needsFeTrigger marker", "INFO")
-    return None
 
 
 def _fire_fe_p4_trigger(uid, research_id):
@@ -25782,10 +25738,18 @@ def _park_chat_mode_decision(platform_l: str, label: str, *, why: str) -> None:
         f"{'none (auto-skip off — waiting for you)' if window_sec <= 0 else f'{window_sec}s'} "
         f"deadline_ms={deadline_ms}", "WARN")
 
-
 def _emit_claude_chat_mode_alert():
-    """Back-compat shim — #709 generalized this into _emit_chat_mode_alert."""
+    """Back-compat shim — #709 generalized this into _emit_chat_mode_alert.
+
+    ⛔ NOT DEAD, AND A 2026-09-20 cleanup sweep nearly deleted it. It has no
+    production caller, which is exactly what a back-compat shim looks like —
+    and `tests/test_chat_mode_gate.py` PINS its existence by name ("the Claude
+    alert name must remain as a back-compat shim (#709)"). Test-only reach is a
+    deliberate seam here, not an absence of one."""
     _emit_chat_mode_alert("claude")
+
+
+
 
 
 def _emit_model_drift_alert(platform_l: str, message: str, details: str = ""):
@@ -35254,9 +35218,6 @@ class Browser:
         """Set the file for the next file dialog (replaces any queued files)."""
         self._upload_queue = [str(path)]
 
-    def queue_upload_file(self, path):
-        """Add a file to the upload queue (for sequential file dialogs like video + thumbnail)."""
-        self._upload_queue.append(str(path))
 
     def clear_upload_file(self):
         self._upload_queue = []
@@ -37218,16 +37179,78 @@ _CUA_EVIDENCE_LINE = re.compile(
 _CUA_FIELD_LINE = re.compile(
     r"^[^\S\n]*(?:verdict|stop[_ -]?button|conclusion|evidence)[^\S\n]*[:=]",
     re.I)
-#: Words that make the WEB swallow a card. `isQuietInfraCard` in
-#: `src/lib/pipeline-errors.ts` classes a title carrying any of these as
-#: transient infrastructure and renders it as a passive banner with no Retry and
-#: no Skip — so putting one in a title turns an actionable alert into a shrug.
-#: ⚠ This is a FRONTEND rule mirrored here. It is duplicated on purpose (the two
-#: repos ship separately and a shared constant would be a lie about coupling),
-#: and it is pinned by a test on each side.
-_ALERT_QUIET_INFRA_WORDS = ("rate-limit", "rate_limit", "ratelimit",
-                            "overloaded", "529")
 _EVIDENCE_MAX = 200
+
+
+def _web_swallows_title(text: str) -> bool:
+    """Would the WEB classify this title as transient infrastructure?
+
+    `isAnthropicRuntimeError` in `src/lib/pipeline-errors.ts` decides this, and
+    `isQuietInfraCard` renders anything it flags as a passive banner with NO
+    Retry and NO Skip. So a title this returns True for is a title that loses
+    the user their two controls.
+
+    ⛔⛔ THIS IS A MIRROR OF FRONTEND LOGIC AND IT HAD ALREADY DRIFTED — within
+    hours of being written, in the same commit that introduced it. It was a
+    flat word tuple:
+
+        ("rate-limit", "rate_limit", "ratelimit", "overloaded", "529")
+
+    which is a SUBSET of what the web actually matches. The web also swallows
+    `429` together with `rate` or `limit`, and `anthropic` together with
+    `overload`, `busy` or `server`. So an evidence line the model might really
+    write — "429 rate limit exceeded", "Anthropic servers are busy" — passed
+    this check, went into a title, and was then swallowed by the web into
+    exactly the shrug this guard exists to prevent.
+
+    ⚠ DUPLICATED ON PURPOSE, MIRRORED EXACTLY. The two repos ship separately, so
+    a shared constant would be a lie about coupling — but a LOOSE mirror is
+    worse than no mirror, because it reads as a guard while leaving the hole
+    open. The predicate below is the web's, clause for clause and in the same
+    order, so the two can be compared by eye. `_ALERT_MIRROR_CORPUS` beneath it
+    is the shared example set, and `tests/test_alert_evidence_0919.py` asserts
+    this function's verdict on every one; `pipelineErrors.test.ts` asserts the
+    web's on the same strings. That pair is what makes the duplication safe.
+    """
+    low = str(text or "").lower()
+    if not low:
+        return False
+    return bool(
+        "overloaded" in low
+        or "529" in low
+        or ("429" in low and ("rate" in low or "limit" in low))
+        or "rate_limit" in low
+        or "rate-limit" in low
+        or ("anthropic" in low
+            and ("overload" in low or "busy" in low or "server" in low))
+    )
+
+
+#: The shared example set. Every entry is a string a CUA evidence line could
+#: plausibly contain, paired with whether the WEB swallows it. Both repos assert
+#: against this corpus, so a change to either predicate that is not mirrored
+#: fails on the side that did not change.
+_ALERT_MIRROR_CORPUS = (
+    # (text, web_swallows_it)
+    ("Usage limit reached · Resets Sep 20 at 1:00 AM", False),
+    ("The composer is disabled and no Stop button is present", False),
+    ("Claude is unavailable in your region", False),
+    ("A red banner reads: something went wrong", False),
+    ("Anthropic is overloaded (529)", True),
+    ("overloaded", True),
+    ("529 from the API", True),
+    ("429 rate limit exceeded", True),          # ⛔ the one the flat list missed
+    ("HTTP 429 — too many requests, limit hit", True),
+    ("rate_limit_error", True),
+    ("rate-limit reached", True),
+    ("Anthropic servers are busy", True),       # ⛔ and this one
+    ("Anthropic had a server error", True),
+    ("Anthropic overload detected", True),
+    # ⚠ Near-misses that must NOT be swallowed — a bare 429 with no rate/limit
+    # word, and "anthropic" with no infra word, are ordinary text.
+    ("Error 4290 on the page", False),
+    ("Anthropic Console is open in another tab", False),
+)
 
 
 def _cua_error_evidence(cua_text: str) -> str:
@@ -37283,7 +37306,7 @@ def _alert_title_safe(evidence: str) -> bool:
     where nothing filters it; only the headline falls back.
     """
     low = str(evidence or "").lower()
-    return bool(low) and not any(w in low for w in _ALERT_QUIET_INFRA_WORDS)
+    return bool(low) and not _web_swallows_title(low)
 
 
 def _cua_completion_report(cua_text: str) -> dict:
@@ -70622,6 +70645,25 @@ async def run_server(port=8000):
     ORPHAN_SWEEP_INTERVAL_SEC = 300
     ORPHAN_SWEEP_MIN_AGE_SEC = 300
     ORPHAN_SWEEP_IN_FLIGHT_STATUSES = {"ongoing", "queued"}
+    # ⛔⛔ 2026-09-20 — THE SWEEP BILLED ONE FIRESTORE READ PER FINISHED QUEUE
+    # DIRECTORY, EVERY FIVE MINUTES, FOREVER. The age gate below only skips
+    # directories YOUNGER than five minutes, and nothing else prunes a
+    # completed one — the 7-day startup sweep explicitly spares them. So every
+    # research this machine has ever finished stayed in the listing and cost a
+    # read on every tick, and the answer was `exists == True` every single
+    # time: 288 reads a day for one old run, and the count only ever grows.
+    #
+    # A research that exists does not stop existing often, so the answer is
+    # worth remembering. A directory confirmed present is re-checked at most
+    # hourly; one never seen before is still checked on the very next tick, so
+    # a genuine orphan is detected exactly as fast as it was.
+    #
+    # ⚠ The cost of the memo is a DELETED research surviving up to an hour
+    # longer on local disk instead of up to five minutes. That is latency on a
+    # cleanup path with no user-visible surface — the Firestore side of the
+    # delete has already happened before this sweep ever looks.
+    ORPHAN_RECHECK_SEC = 3600
+    _orphan_verified: dict = {}
 
     # Its one line is a verdict about OTHER runs' queue directories
     # ("purged N orphan(s)") — measured landing inside two of the five run
@@ -70664,10 +70706,16 @@ async def run_server(port=8000):
                         continue
                     if not uid or not rid:
                         continue
+                    _seen_key = f"{uid}/{rid}"
+                    if (now_ts_inner - _orphan_verified.get(_seen_key, 0.0)
+                            < ORPHAN_RECHECK_SEC):
+                        continue
                     try:
                         ref = _firebase_db.collection("users").document(uid) \
                             .collection("researches").document(rid)
                         if ref.get().exists:
+                            # Remember it, so the next eleven ticks cost nothing.
+                            _orphan_verified[_seen_key] = now_ts_inner
                             continue
                     except Exception:
                         continue
@@ -70693,6 +70741,10 @@ async def run_server(port=8000):
                     except Exception as _e:
                         log(f"[orphan-sweep] rmtree {d.name} failed: {_e}", "WARN")
                         continue
+                    # ⚠ The memo tracks the LISTING, so a removed directory
+                    # takes its entry with it. Without this the dict is the one
+                    # thing in this loop that could grow without bound.
+                    _orphan_verified.pop(_seen_key, None)
                     swept_n += 1
                     # ⛔⛔ AND NOW THE LOG FOLDER, WHICH THIS SWEEP HAS NEVER
                     # TOUCHED. Deleting a run in the app cascaded its cloud
@@ -74505,31 +74557,6 @@ def _kill_chrome_for_profile(profile_dir: str, graceful: bool = False) -> int:
     return signaled
 
 
-def _count_chrome_for_profile(profile_dir: str) -> int:
-    """#907: read-only sibling of _kill_chrome_for_profile — how many Chrome
-    processes currently reference this profile dir. Used to wait for a
-    graceful close to actually finish before printing 'Browser closed'."""
-    try:
-        import psutil
-    except Exception:
-        return 0
-    raw = str(profile_dir).lower().replace("\\", "/")
-    try:
-        resolved = str(Path(profile_dir).resolve()).lower().replace("\\", "/")
-    except Exception:
-        resolved = raw
-    targets = {t for t in (raw, resolved) if t}
-    n = 0
-    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
-        try:
-            if not (proc.info["name"] and "chrom" in proc.info["name"].lower()):
-                continue
-            cmdline = " ".join(proc.info["cmdline"] or []).lower().replace("\\", "/")
-            if any(_profile_matches_cmdline(t, cmdline) for t in targets):
-                n += 1
-        except Exception:
-            pass
-    return n
 
 
 def _chrome_procs_for_profile(profile_dir: str) -> list:
@@ -79045,9 +79072,9 @@ def run_resurrect():
         # them. Platform-specific install lives in `_arm_supervisor_<plat>`
         # which spawns the daemon-loop inline (vs Windows which spawns it in
         # Step 4 — that asymmetry is intentional, see Step 4 below).
-        # NOTE: init_firebase() + _fetch_paired_email() deliberately skipped
-        # — see the matching comment in the Windows path below. supervised
-        # flag goes through _pair_patch_device (REST), no gRPC dep.
+        # NOTE: init_firebase() and the gRPC device-doc read are deliberately
+        # skipped — see the matching comment in the Windows path below. The
+        # supervised flag goes through _pair_patch_device (REST), no gRPC dep.
         paired_uid = load_paired_uid()
         device_id = load_device_id()
         # Pull friendly name + owner email from the device doc via REST so
@@ -79213,7 +79240,7 @@ def run_resurrect():
     # _arm_supervisor_quiet install path).
     task_run = f'"{python_exe}" "{script_path}" --daemon-loop --env-file "{env_file}"'
 
-    # NOTE: deliberately skip `init_firebase()` + `_fetch_paired_email()` here.
+    # NOTE: deliberately skip `init_firebase()` and the gRPC device-doc read here.
     # The only Firestore-side action --resurrect needs is the supervised:true
     # flag write in step 3, which goes through _pair_patch_device (Firestore
     # REST + bootstrapped idToken — no gRPC client init). Skipping the cold
@@ -79539,8 +79566,8 @@ def run_retire():
         # scaffolding (Context strip → [1/3] Unbinding → [2/3] Stopping →
         # [3/3] Firestore sync → flourish + next-actions). Closes the
         # "Polish deferred" gap so --retire reads the same on every OS.
-        # NOTE: init_firebase + _fetch_paired_email skipped — supervised
-        # flag goes via _write_supervised_flag → _pair_patch_device REST.
+        # NOTE: init_firebase and the gRPC device-doc read are skipped — the
+        # supervised flag goes via _write_supervised_flag → _pair_patch_device REST.
         paired_uid = load_paired_uid()
         device_id = load_device_id()
         # Pull friendly name + owner email from the device doc via REST so

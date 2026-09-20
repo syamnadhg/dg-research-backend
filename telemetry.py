@@ -396,10 +396,6 @@ _seq = 0
 _dropped = 0
 
 
-def session_id() -> str:
-    return _SESSION_ID
-
-
 def _next_seq() -> int:
     global _seq
     with _seq_lock:
