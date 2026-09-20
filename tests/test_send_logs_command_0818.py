@@ -683,7 +683,12 @@ def test_the_row_carries_an_expiry_and_a_build(db, monkeypatch):
     research._handle_send_logs_command(_cmd(), "d-1")
     row = db[f"users/user-rocky/logBundles/{CODE}"]
     assert row["expireAt"] is not None
-    assert row["buildId"] == research._sr_version()
+    # ⛔ 2026-09-19 — THE RUNNING BUILD, NOT THE INSTALLED PACKAGE. This row
+    # names the build whose logs are inside the bundle, and `_sr_version()` is
+    # `importlib.metadata`, which answers from whatever dist-info is on disk. On
+    # 2026-09-19 that sent a reader of support bundle K6N8WMXZ to revision
+    # 0.1.13 for logs produced by 0.1.14 source, and cost the whole diagnosis.
+    assert row["buildId"] == research._sr_build_label()
     assert row["status"] == "failed" and row["errorClass"] == "UploadFailed"
 
 

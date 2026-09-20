@@ -463,6 +463,13 @@ CHECK 3 — Is the response complete?
 
 OTHER: If a "Start research" button is visible and must be clicked → NEEDS_CLICK. If an error banner or blocking popup is visible → ERROR. Otherwise default to GENERATING.
 
+MANDATORY OUTPUT — put this line SECOND-TO-LAST, immediately above the CONCLUSION line:
+EVIDENCE: <one short line naming what you actually saw>
+Quote any banner, error or limit text VERBATIM, including dates and times. If the
+conclusion is ERROR this line is the only thing that tells the user WHY, and it is
+shown to them, so "an error occurred" is not an answer — "Usage limit reached ·
+Resets Sep 20 at 1:00 AM" is. One line, under 200 characters, no quotes around it.
+
 MANDATORY OUTPUT — the LAST line of your response must be exactly one of:
 CONCLUSION: GENERATING
 CONCLUSION: DONE

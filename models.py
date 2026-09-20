@@ -420,6 +420,19 @@ P1_MODEL_POLICY = {
         # `Advanced / Model … / Effort …`, none of which names a tier, so it
         # correctly reports "no row names 'pro'" and stops at the front door.
         #
+        # ⛔⛔ (2026-09-19) …AND THEN THEY DID BECOME A SLIDER. The line above
+        # ruled that out by name, which is why this note replaces it rather than
+        # sitting beside it: a stale "it is not X" is worse than no note at all,
+        # because the next reader stops looking for X. The live capture of
+        # 2026-09-19 (`#Dev/dom-capture/`) shows ONE row carrying a
+        # `role="slider"` with `aria-valuemin=0 aria-valuemax=4`, driven by
+        # ArrowLeft/ArrowRight, whose five stops are the old rows: Instant /
+        # Medium / High / Extra High / Pro. There are no tier rows left to rank.
+        #
+        # Both walks stay. The rows path answers an older layout, a rollback or an
+        # A-B bucket; the slider path answers today's. Neither is speculative —
+        # each was the live UI within a month of the other.
+        #
         # Two words get it the rest of the way. `effort_row_words` names the row
         # whose submenu holds `Instant / Medium / High / Extra High / Pro`;
         # `advanced_words` names the toggle that reveals that row when the menu
@@ -435,6 +448,19 @@ P1_MODEL_POLICY = {
         # precisely the thing this path exists to change.
         "effort_row_words": ["effort"],
         "advanced_words": ["advanced"],
+        # The accessible NAME of the row that holds the tier slider. Captured
+        # 2026-09-19 as `aria-label="Power"` — the rename from "Effort" is exactly
+        # why `effort_row_words` above stopped finding anything, so both words
+        # live here and a third rename is one more entry.
+        #
+        # ⚠ A DISAMBIGUATOR, NOT THE HOOK. The slider is found by `role="slider"`
+        # with a numeric range inside the open picker, because a role is the one
+        # thing about this control that is contractual rather than cosmetic. This
+        # list is consulted only when the picker offers MORE THAN ONE slider, to
+        # keep a future second knob (length, temperature) from being driven to
+        # maximum by a function that only ever wanted the effort one. Emptying it
+        # therefore does not disable the picker — it disables the tie-break.
+        "slider_row_words": ["power", "effort"],
     },
 }
 

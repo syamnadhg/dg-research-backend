@@ -3248,11 +3248,18 @@ def test_a_finding_under_a_heading_with_an_image_is_titled_by_that_heading():
     """EXECUTED — `_extract_findings`. The rehosted reference pushed the heading past
     80 characters, and the finding took the heading above as its source title. An
     image-only heading still ends the section above it."""
+    # ⚠ 2026-09-19 — THE URLS ARE BARE NOW, AND THAT IS THE POINT OF THE EDIT.
+    # They used to be `[Reuters](…)` and `[Source](…)`. Once `_extract_findings`
+    # learned to read a link's own label as the page title, those labels won and
+    # this test passed without ever consulting a heading — it would have gone on
+    # reporting green while the image-in-heading handling it is named for rotted
+    # away underneath it. Bare mentions keep the heading rung as the rung under
+    # test.
     md = ("## Background\n\nOld context sits here for the reader.\n\n"
           f"## ![Company logo]({HEADING_REF}) Market overview\n\n"
-          "Revenue grew 40% last year according to [Reuters](https://www.reuters.com/markets/a) today.\n\n"
+          "Revenue grew 40% last year according to https://www.reuters.com/markets/a today.\n\n"
           f"## ![Only]({HEADING_REF})\n\n"
-          "Margins fell sharply in the quarter per [Source](https://www.example.org/src) data.\n")
+          "Margins fell sharply in the quarter per https://www.example.org/src data.\n")
     assert len(f"![Company logo]({HEADING_REF}) Market overview") > 80
     got = {f["url"]: f["sourceTitle"] for f in R._extract_findings(md, [])}
     assert got == {"https://www.reuters.com/markets/a": "Market overview",

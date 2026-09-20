@@ -2599,7 +2599,8 @@ class _RunLogSink:
             "attempt": self.attempt,
             "pid": os.getpid(),
             "worker": WORKER_ID,
-            "build": _sr_version(),
+            # The code that RAN this research, not the dist-info on disk.
+            "build": _sr_build_label(),
             "platform": sys.platform,
             "startedUtc": self.started_utc,
             # ⭐ WHO FIRED THIS RUN — and, since Wave 8, whose support bundle
@@ -3398,7 +3399,7 @@ class _RunLogCapture:
                 f"attempt={self.attempt} "
                 f"parentResearchId={parent.research_id if parent is not None else None}")
             sink.writer.write_line(
-                f"build={_sr_version()} pid={os.getpid()} worker={WORKER_ID} "
+                f"build={_sr_build_label()} pid={os.getpid()} worker={WORKER_ID} "
                 f"python={sys.version.split()[0]} platform={sys.platform}")
             _RUN_LOG_SINKS.append(sink)
             self.sink = sink
@@ -3598,7 +3599,7 @@ def _install_session_tee(command: str):
             keep=RUN_LOG_OVERFLOW_KEEP)
         writer.write_line(f"=== super research session: {command} ===")
         writer.write_line(
-            f"startedUtc={started} build={_sr_version()} pid={os.getpid()} "
+            f"startedUtc={started} build={_sr_build_label()} pid={os.getpid()} "
             f"python={sys.version.split()[0]} platform={sys.platform}")
         for name in ("stdout", "stderr"):
             stream = getattr(sys, name, None)
@@ -9687,7 +9688,8 @@ def _write_log_bundle_status(owner_uid: str, code: str, patch: dict,
         body.setdefault("createdAt", datetime.now(timezone.utc))
         body.setdefault("expireAt",
                         datetime.now(timezone.utc) + timedelta(days=BUNDLE_MAX_AGE_DAYS))
-        body.setdefault("buildId", _sr_version())
+        # The build whose logs are in the bundle, not whatever is installed now.
+        body.setdefault("buildId", _sr_build_label())
     try:
         ref = (_firebase_db.collection("users").document(owner_uid)
                .collection("logBundles").document(code))
@@ -12484,7 +12486,9 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
             "schema": 1,
             "createdUtc": _utc_iso(),
             "supportCode": support_code,
-            "build": _sr_version(),
+            # ⛔ THE FIELD THAT LIED. A support bundle that names the wrong
+            # revision sends whoever reads it to the wrong source.
+            "build": _sr_build_label(),
             "platform": sys.platform,
             "installUuid": _install_uuid_best_effort(),
             "bounds": {"maxRuns": int(max_runs), "maxAgeDays": int(max_age_days),
@@ -19641,6 +19645,317 @@ async def _chatgpt_open_effort_submenu(page, *, tag, trace=None) -> str:
     return ""
 
 
+# ⭐⭐ 2026-09-19 — THE TIER IS A SLIDER NOW. Read it, and name its stops, from
+# ARIA only.
+#
+# The 2026-08-17 walk looks for a ROW naming the tier. The live picker has none:
+# one row carries `role="slider"` with `aria-valuemin="0" aria-valuemax="4"`, and
+# its five stops ARE the old rows (Instant / Medium / High / Extra High / Pro).
+# So the walk correctly reports "no row names 'pro'", correctly declines to call
+# that a no-subscription verdict, and hands every single run to CUA — which then
+# does the job, slowly and at cost, on an account that has Pro.
+#
+# ⛔ WHY NOT JUST DRIVE IT TO THE MAXIMUM. Because "the top stop" and "the tier
+# the policy asks for" are two different claims, and only one of them is this
+# function's to make. A top stop that is not Pro is precisely the free-account
+# case the caller's `no_target` verdict exists to report; driving blind to
+# `aria-valuemax` would report a successful Pro pick on an account that has none.
+# So each stop is NAMED and checked, and the drive stops at the named one.
+#
+# ⛔ AND NOT BY CLICKING. A slider track sets its value from WHERE it is clicked,
+# so the marking-and-real-click machinery every other control here uses is, on
+# this one, a way to land on an arbitrary tier. The row advertises its own
+# contract — `aria-keyshortcuts="ArrowLeft ArrowRight"`, `tabindex="0"` — and
+# that is what gets used: focus the row, press ArrowRight, re-read the value.
+#
+# The stop's NAME comes from the row's `aria-describedby`, which points at the two
+# live labels ("6 Pro" and "Pro, 5 of 5. Use Left and Right arrow keys to adjust
+# power"). That is the platform stating the stop's name in the one vocabulary it
+# is contractually obliged to keep accurate. The class names in the same capture
+# (`d1BZWq_SliderTopRowMotion`, `_9wXMRW_ThumbInput`) are build-hashed and will
+# not survive a deploy; none of them is used here.
+_CHATGPT_SLIDER_JS = r"""(P) => {
+    const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+    const low = s => norm(s).toLowerCase();
+    const vis = el => el.getClientRects().length > 0;
+    const OVERLAY = '[role="menu"], [role="listbox"], [data-radix-popper-content-wrapper]';
+    const ROW = '[role="menuitem"], [role="menuitemradio"], [role="group"]';
+    // Tokens, never a RegExp built per word — see the row filter's note on the
+    // lone `\b` that became a literal backspace in an interpolated string.
+    const toks = s => low(s).split(/[^a-z0-9+]+/).filter(Boolean);
+    const anyOf = (s, words) => {
+        const t = toks(s);
+        return (words || []).some(w => t.indexOf(String(w).toLowerCase()) !== -1);
+    };
+    for (const el of document.querySelectorAll('[' + P.attr + '="' + P.value + '"]')) {
+        el.removeAttribute(P.attr);
+    }
+
+    // ── the control ───────────────────────────────────────────────────────
+    // Scoped to a VISIBLE overlay. The composer has no other slider today, but
+    // "no other one today" is the assumption that let the left sidebar absorb a
+    // menu-row click on 2026-08-05 and navigate the tab mid-run.
+    const found = [];
+    for (const el of document.querySelectorAll('[role="slider"][aria-valuemax]')) {
+        const menu = el.closest(OVERLAY);
+        if (!menu || !vis(menu)) continue;
+        found.push({ el: el, menu: menu });
+    }
+    if (!found.length) return { found: false, reason: 'no_slider' };
+    let pick = null, named = false;
+    if (found.length === 1) {
+        pick = found[0];
+    } else {
+        // More than one knob in the picker: take only the one the policy names,
+        // and refuse rather than guess. Driving the wrong slider to maximum is
+        // not a failed pick — it is a silent change to a setting nobody asked
+        // about, on the user's own account.
+        for (const c of found) {
+            const row = c.el.closest(ROW);
+            if (row && anyOf(row.getAttribute('aria-label') || '', P.rowWords)) {
+                pick = c; named = true; break;
+            }
+        }
+        if (!pick) return { found: false, reason: 'ambiguous_slider', count: found.length };
+    }
+    const sl = pick.el, menu = pick.menu;
+    const row = sl.closest(ROW);
+    const nnum = a => {
+        const v = parseInt(sl.getAttribute(a) || '', 10);
+        return (typeof v === 'number' && isFinite(v)) ? v : null;
+    };
+    const now = nnum('aria-valuenow'), lo = nnum('aria-valuemin'), hi = nnum('aria-valuemax');
+    if (now === null || hi === null) return { found: false, reason: 'no_value' };
+
+    // ── what THIS stop is called ─────────────────────────────────────────
+    const names = [];
+    const push = s => { s = norm(s); if (s && names.indexOf(s) === -1) names.push(s); };
+    push(sl.getAttribute('aria-valuetext'));
+    if (row) {
+        for (const id of (row.getAttribute('aria-describedby') || '').split(/\s+/)) {
+            if (!id) continue;
+            const n = document.getElementById(id);
+            if (n) push(n.textContent);
+        }
+        push(row.textContent);
+    }
+
+    // Stops the plan does not offer. CORROBORATION ONLY: it turns "the thumb
+    // will not move" from an unexplained stall into a plan limit, and it is
+    // never on its own enough to claim one.
+    let locked = 0, stops = 0;
+    for (const t of menu.querySelectorAll('[data-locked]')) {
+        stops++;
+        if (t.getAttribute('data-locked') === 'true') locked++;
+    }
+
+    // The FOCUS target is the row, not the thumb: the thumb is `aria-hidden`
+    // with `tabindex="-1"`, so it is the element that holds the value and not
+    // the one that takes the keys.
+    if (row) row.setAttribute(P.attr, P.value);
+    return { found: true, now: now, min: (lo === null ? 0 : lo), max: hi,
+             names: names.slice(0, 4), named: named, marked: !!row,
+             locked: locked, stops: stops,
+             keys: row ? norm(row.getAttribute('aria-keyshortcuts')) : '' };
+}"""
+
+
+async def _chatgpt_drive_effort_slider(page, *, tag, tiers, verbs, trace=None) -> str:
+    """Drive the open picker's tier SLIDER onto the policy tier.
+
+    Returns one of:
+      * ``""``          — there is no slider here. Not a failure: it is how every
+                          older layout opts out, and the caller's row walk runs
+                          exactly as it does today.
+      * ``"already"``   — a stop naming the tier was ALREADY selected.
+      * ``"moved"``     — the thumb was driven onto a stop naming the tier.
+      * ``"no_target"`` — every stop was visited and none names the tier, or the
+                          thumb will not pass a LOCKED stop. Both are the honest
+                          "this account does not offer that tier" signal.
+      * ``"unsure"``    — a slider is there and could not be read or driven.
+
+    ⛔ `already` and `moved` are NOT success. They say what this function did; the
+    caller still closes the picker and re-reads the pill, because the pill is the
+    only thing that proves the app took the change. Step 3 of this block's rule —
+    verify the OUTCOME, never the action — is not suspended for a keystroke.
+
+    Never raises.
+    """
+    tr = trace if trace is not None else {}
+    params = {"attr": _SR_CLICK_MARK, "value": "effort-slider",
+              "rowWords": p1_words("chatgpt", "slider_row_words")}
+
+    def _on_tier(names) -> bool:
+        """A stop is the target when one of its names carries a tier word and is
+        not a sales prompt. Same two-part rule as the row picker's, deliberately:
+        a slider whose top stop reads "Upgrade to Pro" is the free account's
+        upsell, not the tier."""
+        for n in names or []:
+            s = str(n or "")
+            if verbs and has_term(s, verbs):
+                continue
+            if has_term(s, tiers):
+                return True
+        return False
+
+    try:
+        st = await page.evaluate(_CHATGPT_SLIDER_JS, params) or {}
+    except Exception as e:
+        log(f"{tag} slider read failed ({e})", "INFO")
+        return ""
+    if not isinstance(st, dict) or not st.get("found"):
+        # ⚠ `(st or {}).get(...)` is NOT enough: a truthy non-dict — a string,
+        # a list — passes the `or` and then has no `.get`, which raises out of a
+        # function whose whole contract is that it never does.
+        reason = str(st.get("reason") or "unreadable") if isinstance(st, dict) else "unreadable"
+        # ⛔⛔ AN ALLOW-LIST, NOT A NEGATION, AND THE DIFFERENCE IS A REGRESSION I
+        # SHIPPED AND CAUGHT. This read `if reason != "no_slider": return "unsure"`,
+        # so ANY answer it did not recognise — an empty dict, a transport that gave
+        # back something else, a future build of this JS with a new reason string —
+        # was treated as "a slider is here and I cannot work it", and that verdict
+        # SHORT-CIRCUITS the row walk. Two existing `no_target` tests went to
+        # `unsure` on the spot: a real tier list with no Pro row stopped reporting
+        # the lapsed subscription, which is the one thing that path exists to say.
+        #
+        # Only a POSITIVE report of an unusable slider may stop the row walk. Not
+        # knowing is not a finding, and it must degrade to "carry on as before".
+        if reason not in ("ambiguous_slider", "no_value"):
+            if reason != "no_slider":
+                log(f"{tag} the slider read answered {reason!r}, which says nothing "
+                    f"about whether a slider is there — carrying on to the rows",
+                    "DEBUG")
+            return ""
+        # A slider IS there and this function cannot work it. Say so and stop —
+        # do not fall through to the row walk, which would spend real clicks on a
+        # live page hunting tier rows that a slider layout does not have.
+        log(f"{tag} the picker holds a tier slider this pass cannot use "
+            f"(reason={reason}, count={(st or {}).get('count')}) — leaving it to "
+            f"the next rung", "WARN")
+        tr["detail"] = f"slider unusable: {reason}"
+        return "unsure"
+
+    try:
+        now, lo, hi = int(st.get("now")), int(st.get("min") or 0), int(st.get("max"))
+    except (TypeError, ValueError):
+        # `found` without a usable range. The JS cannot produce this, but a page
+        # can answer anything and this function promises never to raise.
+        log(f"{tag} the slider reported itself found with no usable range "
+            f"({st.get('now')!r}..{st.get('max')!r})", "WARN")
+        return ""
+    names = list(st.get("names") or [])
+    log(f"{tag} the tier control is a SLIDER at stop {now} of {lo}..{hi} "
+        f"(keys={st.get('keys') or '-'}, locked {st.get('locked')}/{st.get('stops')}"
+        f"{', policy-named' if st.get('named') else ''}) reading "
+        f"{json.dumps([str(n)[:44] for n in names[:2]], ensure_ascii=False)}")
+    tr["via"] = f"{tr.get('via') or ''}/slider".lstrip("/")
+
+    if not names:
+        # ⛔ Never drive a control whose stops cannot be identified. Without a
+        # name, the only rule left is "go to the maximum", and the whole reason
+        # this path names its stops is that the maximum is not always the tier.
+        log(f"{tag} the slider names none of its stops — not driving a control "
+            f"whose positions cannot be identified", "WARN")
+        tr["detail"] = f"slider {now}/{hi}, no stop name"
+        return "unsure"
+    if _on_tier(names):
+        log(f"{tag} the slider already sits on the {tiers[0]!r} stop "
+            f"({now}/{hi}, {str(names[0])[:44]!r})")
+        tr["detail"] = f"slider already at {now}/{hi}"
+        return "already"
+    if now >= hi:
+        log(f"{tag} the slider is at its TOP stop ({now}/{hi}) and it reads "
+            f"{str(names[0])[:44]!r}, which does not name {tiers[0]!r} — this "
+            f"account does not offer that tier", "WARN")
+        tr["detail"] = f"slider topped out at {str(names[0])[:24]!r}"
+        return "no_target"
+    if not st.get("marked"):
+        log(f"{tag} the slider has no row to aim keys at (the thumb itself is "
+            f"aria-hidden and untabbable) — leaving it to the next rung", "WARN")
+        tr["detail"] = "slider has no focusable row"
+        return "unsure"
+
+    sel = f'[{_SR_CLICK_MARK}="effort-slider"]'
+    try:
+        # ⛔ focus(), NOT click(). See the block comment: a click on a slider sets
+        # the value from the pointer's position along the track.
+        await page.focus(sel, timeout=4000)
+    except Exception as e:
+        log(f"{tag} could not focus the slider row ({type(e).__name__}) — leaving "
+            f"it to the next rung", "INFO")
+        try:
+            await page.evaluate(_SR_UNMARK_JS, {"attr": _SR_CLICK_MARK})
+        except Exception:
+            pass
+        tr["detail"] = "slider row would not take focus"
+        return "unsure"
+
+    start, last, verdict = now, now, "unsure"
+    try:
+        # Bounded by the control's OWN range, so a slider that reports a value it
+        # never reaches cannot turn this into an unbounded keypress loop on a live
+        # page. One press per stop, re-reading in between — the same
+        # never-trust-the-action discipline as the click paths.
+        for _ in range(max(0, hi - start)):
+            try:
+                await page.keyboard.press("ArrowRight")
+            except Exception as e:
+                log(f"{tag} ArrowRight failed ({type(e).__name__})", "INFO")
+                break
+            await asyncio.sleep(0.3)
+            try:
+                st = await page.evaluate(_CHATGPT_SLIDER_JS, params) or {}
+            except Exception as e:
+                log(f"{tag} slider re-read failed mid-drive ({e})", "INFO")
+                break
+            if not (isinstance(st, dict) and st.get("found")):
+                log(f"{tag} the slider went away mid-drive "
+                    f"(reason={st.get('reason') if isinstance(st, dict) else st!r})",
+                    "WARN")
+                break
+            cur = int(st.get("now"))
+            names = list(st.get("names") or [])
+            if cur == last:
+                # One press that does not move the thumb IS the diagnosis. A
+                # locked stop ahead says the plan stops here, which is a tier
+                # fact; anything else is a fact about our keyboard, which is not.
+                if int(st.get("locked") or 0) > 0:
+                    log(f"{tag} the slider will not advance past stop {cur}/{hi} "
+                        f"and {st.get('locked')} of {st.get('stops')} stops are "
+                        f"locked — this account does not offer the {tiers[0]!r} "
+                        f"tier", "WARN")
+                    tr["detail"] = f"slider locked at {cur}/{hi}"
+                    verdict = "no_target"
+                else:
+                    log(f"{tag} ArrowRight did not move the slider off stop "
+                        f"{cur}/{hi} — the keys are not reaching it; leaving it "
+                        f"to the next rung", "WARN")
+                    tr["detail"] = f"slider stuck at {cur}/{hi}"
+                    verdict = "unsure"
+                break
+            last = cur
+            if _on_tier(names):
+                log(f"{tag} drove the slider {start} → {cur} of {hi}; the stop "
+                    f"reads {str(names[0])[:44]!r} ✓")
+                tr["detail"] = f"slider {start}→{cur}/{hi} = {str(names[0])[:24]!r}"
+                verdict = "moved"
+                break
+        else:
+            # Ran the full range without a stop naming the tier. Every stop was
+            # visited and named, which is the strong form of the no-tier signal.
+            log(f"{tag} drove the slider {start} → {last} (its top) and no stop "
+                f"names {tiers[0]!r} — last stop reads "
+                f"{str((names or ['?'])[0])[:44]!r}; this account does not offer "
+                f"that tier", "WARN")
+            tr["detail"] = f"slider swept {start}→{last}/{hi}, no {tiers[0]!r} stop"
+            verdict = "no_target"
+    finally:
+        try:
+            await page.evaluate(_SR_UNMARK_JS, {"attr": _SR_CLICK_MARK})
+        except Exception:
+            pass
+    return verdict
+
+
 async def _chatgpt_pick_effort_tier(page, *, label="ChatGPT", phase=1,
                                     _trace=None) -> str:
     """The `builtin` rung of `chatgpt.select_model` — pick the policy EFFORT TIER
@@ -19776,6 +20091,38 @@ async def _chatgpt_pick_effort_tier(page, *, label="ChatGPT", phase=1,
     if (snap or {}).get("census_ignored"):
         log(f"{tag} the pre-open census matched every candidate, so it was ignored "
             f"for this read — the conversation-link exclusion still applies", "WARN")
+    # ⭐⭐ THE SLIDER RUNG, before anything is ranked or clicked. On a layout that
+    # has no slider this is one `evaluate` that returns `no_slider`, and every
+    # line below runs exactly as it did — which is the whole reason it sits here
+    # rather than replacing the row walk. On today's layout it is the only rung
+    # that can answer at all: the tiers are slider stops, so there is no row to
+    # rank and the walk below can only ever reach `unsure`, which is precisely
+    # what the 2026-09-19 E2E logged before handing the job to CUA.
+    #
+    # It runs BEFORE the `not rows` bail-out on purpose: a picker that mounts a
+    # slider and no text rows at all is still a picker this can drive, and
+    # reporting "no rows mounted" for it would be true and useless.
+    _slider = await _chatgpt_drive_effort_slider(page, tag=tag, tiers=tiers,
+                                                 verbs=verbs, trace=tr)
+    if _slider in ("already", "moved"):
+        # Settle, close, and ask the PILL — never the slider we just wrote to.
+        # A control reporting the value we put into it is not evidence the app
+        # accepted it; the trigger's own label is the app's answer.
+        await asyncio.sleep(1.0 if _slider == "moved" else 0.25)
+        await _escape()
+        post = await _chatgpt_read_effort_tier(page)
+        if post.get("on_target"):
+            log(f"{tag} the pill now reads {post.get('text')!r} ✓")
+            return "already" if _slider == "already" else "selected"
+        log(f"{tag} the slider reports the {tiers[0]!r} stop but the pill still "
+            f"reads {post.get('text')!r} — NOT claiming the tier was selected", "WARN")
+        tr["detail"] = (f"slider on tier; pill still "
+                        f"{str(post.get('text'))[:32]!r}")
+        return "unverified"
+    if _slider in ("no_target", "unsure"):
+        await _escape()
+        return _slider
+
     if not rows:
         # Say what was there. "No rows" alone cannot tell a rotated hook from a
         # menu that never opened, and the corpus has exactly one occurrence of
@@ -25560,7 +25907,8 @@ def _wrong_conversation_copy(platform: str) -> "tuple[str, str]":
 
 def fail_agent(agent_key: str, title: str, details: str = "", skip_only: bool = False,
                phase: "int | None" = None, auto_skip_deadline: "float | None" = None,
-               recoverability: "str | None" = None, arm_registry: bool = True):
+               recoverability: "str | None" = None, arm_registry: bool = True,
+               raw_err: str = ""):
     """Template B: per-agent error alert (Phase 2 in the common case). Emits
     pipeline_error scoped to one agent with [Retry, Skip]. NO Stop. #955: the
     single "Retry" restarts the agent (close tab + re-run setup) — the only
@@ -25634,7 +25982,18 @@ def fail_agent(agent_key: str, title: str, details: str = "", skip_only: bool = 
     # exactly this case — the parked-decision resolver owns its timeout.
     emit_decision(phase=_eff_phase, agent=agent_key,
                   intent=("agent_failed_handsoff" if skip_only else "agent_failed"),
-                  facts={"title": title, "details": details, "agent": agent_key},
+                  # ⭐⭐ `raw_err` — THE EVIDENCE SLOT, FINALLY WRITTEN. It has
+                  # been READ at `_draft_alert_copy` since that drafter was
+                  # written, and no caller anywhere in the repo ever set it, so
+                  # the drafter's one source of real evidence has always been
+                  # empty and it fell back to `details` — the same constant
+                  # sentence the template already showed. This is the owner's
+                  # "both surfaces work from the same facts": `facts` is now the
+                  # one dict carrying what was actually on screen, filled by the
+                  # emitter that has it, and CUA and Vision reach it through the
+                  # same channel (they already share one reply string).
+                  facts={"title": title, "details": details, "agent": agent_key,
+                         "raw_err": raw_err},
                   alert_id=_agent_error_alert_id(agent_key, _eff_phase),
                   auto_skip_deadline=(None if skip_only else auto_skip_deadline),
                   recoverability=recoverability, arm_registry=arm_registry)
@@ -36741,6 +37100,96 @@ _CUA_STOP_LINE = _verdict_line_re("stop[_ -]?button", "yes", "no", "unsure")
 _CUA_CONCLUSION_LINE = _verdict_line_re(
     "conclusion", "generating", "done", "needs_click", "error")
 
+# ⭐⭐ THE ONE FREE-TEXT FIELD THE CONTRACT ALREADY ASKS FOR, AND NOBODY READ.
+#
+# `_CUA_CONTRACT_BLOCK` has demanded "EVIDENCE: <one short line naming what you
+# actually saw>" since it was written, and no code in this repo has ever parsed
+# it. On 2026-09-19 Claude stopped because the ACCOUNT hit its usage limit; the
+# model read "Usage limit reached · Resets Sep 20 at 1:00 AM" off the screen and
+# wrote it down, and the user's alert said "Hit a snag at the research step with
+# Claude — retrying." Nothing was retrying and nothing named the limit. The one
+# sentence that would have explained the whole thing had been collected and
+# dropped.
+#
+# ⛔ This cannot use `_verdict_line_re`: that builds a reader for a CLOSED value
+# set, which is exactly right for a decision and exactly wrong for a sentence.
+# Same three properties, though — start-of-line anchored (so an echoed
+# instruction mid-prose is not the answer), horizontal whitespace only, and
+# case-insensitive — for the same reasons written there.
+_CUA_EVIDENCE_LINE = re.compile(
+    r"^[^\S\n]*evidence[^\S\n]*[:=][^\S\n]*(.+)$", re.I | re.M)
+#: The contract's other keywords. A "last non-empty line" fallback must not
+#: hand back the machine-readable lines as if they were prose.
+_CUA_FIELD_LINE = re.compile(
+    r"^[^\S\n]*(?:verdict|stop[_ -]?button|conclusion|evidence)[^\S\n]*[:=]",
+    re.I)
+#: Words that make the WEB swallow a card. `isQuietInfraCard` in
+#: `src/lib/pipeline-errors.ts` classes a title carrying any of these as
+#: transient infrastructure and renders it as a passive banner with no Retry and
+#: no Skip — so putting one in a title turns an actionable alert into a shrug.
+#: ⚠ This is a FRONTEND rule mirrored here. It is duplicated on purpose (the two
+#: repos ship separately and a shared constant would be a lie about coupling),
+#: and it is pinned by a test on each side.
+_ALERT_QUIET_INFRA_WORDS = ("rate-limit", "rate_limit", "ratelimit",
+                            "overloaded", "529")
+_EVIDENCE_MAX = 200
+
+
+def _cua_error_evidence(cua_text: str) -> str:
+    """The one short sentence naming what the model actually saw, or ``""``.
+
+    Two rungs, in order:
+      1. the contract's own `EVIDENCE:` line — the channel we already ask for;
+      2. failing that, the last non-empty line that is not one of the contract's
+         machine-readable fields. A model that ignored the format still usually
+         ends with its observation.
+
+    ⛔ THE RESULT IS UNTRUSTED PAGE TEXT and it is about to become user-facing
+    copy, so it is flattened to one line, whitespace-collapsed and length-capped
+    here rather than at each use. Callers still decide whether it may be a
+    TITLE — see `_alert_title_safe`.
+
+    Pure and total: never raises, returns "" on anything it cannot read.
+    """
+    try:
+        t = str(cua_text or "")
+        hits = _CUA_EVIDENCE_LINE.findall(t)
+        # LAST, for the reason `_last_verdict` takes the last: a reply that
+        # quotes its own instructions names the field before it answers it.
+        raw = hits[-1] if hits else ""
+        if not raw:
+            for line in reversed(t.splitlines()):
+                s = line.strip()
+                if not s or _CUA_FIELD_LINE.match(line):
+                    continue
+                # A whole paragraph is not "one short line naming what you saw".
+                if len(s) > _EVIDENCE_MAX * 2:
+                    continue
+                raw = s
+                break
+        out = re.sub(r"\s+", " ", str(raw)).strip().strip("`*_\"' ")
+        # A placeholder echoed back from the contract is not evidence.
+        if out.startswith("<") and out.endswith(">"):
+            return ""
+        return out[:_EVIDENCE_MAX]
+    except Exception:
+        return ""
+
+
+def _alert_title_safe(evidence: str) -> bool:
+    """May this evidence go in an alert TITLE?
+
+    ⛔⛔ THE FRONTEND SWALLOWS SOME TITLES. A card whose title carries
+    "overloaded", "529" or a spelling of "rate limit" is classified as transient
+    infrastructure and rendered as a passive banner with NO Retry and NO Skip
+    button. So a faithful quote of an overload banner would make the alert
+    honest and simultaneously take away the two controls the user needs — worse
+    than the vague sentence it replaced. Such evidence still goes in the BODY,
+    where nothing filters it; only the headline falls back.
+    """
+    low = str(evidence or "").lower()
+    return bool(low) and not any(w in low for w in _ALERT_QUIET_INFRA_WORDS)
+
 
 def _cua_completion_report(cua_text: str) -> dict:
     """Read a vision completion answer. Returns {verdict, stop_seen, source}.
@@ -36793,7 +37242,11 @@ def _cua_completion_report(cua_text: str) -> dict:
 
     if stop_seen and verdict != "generating":
         verdict = "generating"
-    return {"verdict": verdict, "stop_seen": stop_seen, "source": source}
+    # ⭐ `evidence` is the fourth key, and it is inert for every existing caller
+    # — they index by name. It is here so the channel the contract has always
+    # demanded finally has a reader.
+    return {"verdict": verdict, "stop_seen": stop_seen, "source": source,
+            "evidence": _cua_error_evidence(t)}
 
 
 # The page-side half of the badge read, as a probe rather than a predicate: it
@@ -38573,14 +39026,16 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
             # report, and the numbering is then built from those same findings.
             _findings = []
             try:
-                _src_urls = list(getattr(_runtime, "agent_progress_snapshots", {}).get(agent_key, {}).get("source_urls", []) or [])
+                _snap_p = getattr(_runtime, "agent_progress_snapshots", {}).get(agent_key, {}) or {}
+                _src_urls = list(_snap_p.get("source_urls", []) or [])
+                _src_items = list(_snap_p.get("source_items", []) or [])
                 # ⛔ NO LONGER GATED ON THE PANEL LIST. `if _src_urls:` meant a
                 # report full of citations produced no findings whenever the
                 # panel scrape came back empty — which is most Claude runs. The
                 # report is the other input now, so the only thing that can
                 # make findings impossible is having no report.
                 if md_content:
-                    _findings = _extract_findings(md_content, _src_urls) or []
+                    _findings = _extract_findings(md_content, _src_urls, _src_items) or []
                     if _findings:
                         _runtime.agent_findings[agent_key] = _findings
                         _from_panel = sum(
@@ -44334,6 +44789,14 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 try:
                     _runtime.agent_progress_snapshots[agent_key] = {
                         "source_urls": list(progress.get("source_urls", []) or [])[:_SOURCE_LIST_CAP],
+                        # ⭐ THE PANEL'S TITLES, which used to die right here.
+                        # `source_items` is `[{url, title}]` scraped off the
+                        # platform's own source panel — the only place a real
+                        # page title is ever captured — and the snapshot took
+                        # the urls and left the titles behind, so the findings
+                        # extractor downstream had no title to use and fell back
+                        # to a heading from our own markdown.
+                        "source_items": list(progress.get("source_items", []) or [])[:_SOURCE_LIST_CAP],
                         "sections":    list(progress.get("sections", []) or [])[:20],
                         "steps":       list(progress.get("steps", []) or [])[:15],
                         "searches":    int(progress.get("searches", 0) or 0),
@@ -44803,8 +45266,21 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # once, drop the agent from rotation.
             if is_error:
                 agent_key_err = normalize_agent_key(name)
-                log(f"[{name}] CUA reported CONCLUSION: ERROR — agent UI shows a failure state. "
-                    f"Salvaging partial output and dropping from rotation.", "WARN")
+                # ⭐⭐ WHAT IT ACTUALLY SAW. `diag_text_raw` has held the model's
+                # own account of the screen since this loop was written and had
+                # exactly one consumer: the `.lower()` on the next line, on the
+                # way to a four-value enum. It was never even LOGGED, so when
+                # Claude stopped on 2026-09-19 because the account hit its usage
+                # limit — the model read "Usage limit reached · Resets Sep 20 at
+                # 1:00 AM" and wrote it down — the log said "CUA reported
+                # CONCLUSION: ERROR", the card said "Claude reported an error",
+                # and the user was told "retrying" by a UI where nothing was
+                # retrying. The whole thing had to be diagnosed from a
+                # screenshot.
+                _evidence = _cua_error_evidence(diag_text_raw)
+                log(f"[{name}] CUA reported CONCLUSION: ERROR — agent UI shows a failure state"
+                    + (f": {_evidence}" if _evidence else " (it named no evidence)")
+                    + ". Salvaging partial output and dropping from rotation.", "WARN")
                 _err_text = ""
                 try:
                     _err_text = await extract_fns[name](
@@ -44995,10 +45471,29 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 # so the phase stays open and the card stays answerable.
                 _ae_window = unacted_window_sec(_runtime.auto_skip_stuck)
                 if not p.get("failed_alert_emitted"):
-                    fail_agent(agent_key_err,
-                               f"{name} reported an error",
-                               (f"{name} showed a 'research failed' error and we kept "
-                                "what little it produced. Retry to run it fresh, or Skip it."),
+                    # ⛔ THE HEADLINE AND THE BODY TAKE THE EVIDENCE DIFFERENTLY,
+                    # and the asymmetry is the frontend's, not a preference. A
+                    # title carrying "overloaded", "529" or a spelling of "rate
+                    # limit" is classed as transient infrastructure by the web
+                    # and rendered as a passive banner with NO Retry and NO Skip
+                    # — so quoting an overload banner into the title would make
+                    # the card honest and simultaneously remove the two controls
+                    # the user needs. The body is not filtered, so the evidence
+                    # always goes THERE; only the headline falls back.
+                    _err_title = (f"{name} stopped: {_evidence}"[:90]
+                                  if _alert_title_safe(_evidence)
+                                  else f"{name} reported an error")
+                    _err_details = (
+                        f"{name} showed: {_evidence} — we kept what little it "
+                        "produced. Retry to run it fresh, or Skip it."
+                        if _evidence else
+                        f"{name} showed a 'research failed' error and we kept "
+                        "what little it produced. Retry to run it fresh, or Skip it.")
+                    fail_agent(agent_key_err, _err_title, _err_details,
+                               # The model's whole reply, for `_draft_alert_copy`
+                               # and for anything else that later wants to reason
+                               # about the failure rather than re-describe it.
+                               raw_err=diag_text_raw[:500],
                                **({"auto_skip_deadline": (time.time() + _ae_window) * 1000,
                                    "arm_registry": False} if _ae_window else {}))
                     p["failed_alert_emitted"] = True
@@ -63295,6 +63790,100 @@ def _find_heading_title(text: str) -> str:
     if out == text:
         return text
     return re.sub(r"[ \t]{2,}", " ", out).strip()
+
+
+#: The last CLOSED emphasis run before the URL, plus whatever follows it.
+#:
+#: Group 2 — the gap — is captured rather than bounded inside the pattern, so the
+#: decision about whether that gap means "this is a bibliography entry" or "this
+#: is a sentence" is made in Python, where it can be stated in words and tested.
+#: A character budget in the regex cannot tell those apart: the real reference
+#: line's gap (" Current breed materials.  \n", 28 chars) is SHORTER than an
+#: ordinary prose gap (" Prices fell by a fifth, reported at ", 37), so any
+#: threshold generous enough for the first admits the second.
+_FIND_CITE_EMPH_RE = re.compile(
+    r'(?:\*\*|\*|__|_)([^*_\n]{4,160}?)(?:\*\*|\*|__|_)([^*_]{0,200})\Z')
+
+#: A line holding nothing but a URL (a trailing comma/period/bracket is still
+#: "nothing but a URL"). This is the shape of a reference-list entry.
+_FIND_URL_ALONE_RE = re.compile(r'^\s*(?:[-*•]\s*)?<?https?://\S+>?[\s.,;)\]]*$')
+
+
+def _find_source_title(md: str, idx: int, url: str) -> str:
+    """The cited page's OWN name, read from the markdown around its URL. ``""``
+    when the report does not name it.
+
+    ⛔⛔ WHY THIS EXISTS. The title used to be "the nearest `##` heading above the
+    URL", which is a heading in OUR OWN generated markdown, not the page's name.
+    Every citation in a report whose references sit in one trailing block
+    therefore got the SAME title: all twelve rows of the 2026-09-19 ChatGPT
+    document read "Final synthesis, appendices, and references". A bibliography
+    where every entry has one name tells a reader nothing, and the repo had
+    written that symptom down as accepted behaviour with the ` — host` suffix as
+    its mitigation. The host is provenance; it is not a title.
+
+    Two rungs, both reading what the REPORT says rather than what we wrote:
+
+      1. THE LINK LABEL. `[Reuters annual outlook](https://…)` — the author named
+         the page. Nothing beats that, and it needs no heuristic.
+
+      2. THE REFERENCE LINE'S EMPHASISED TITLE. A bibliography entry is
+         `Publisher. *The page's title.* Note.` followed by the bare URL, and the
+         emphasis IS the title — that is what emphasis means in a citation.
+
+    ⛔ RUNG 2 IS STRUCTURALLY GATED, NOT LENGTH-GATED, and the difference is the
+    whole safety of it. Emphasis is also how prose opens a paragraph
+    ("**Appendix: method.** Prices fell by a fifth, reported at <url>"), and
+    stealing that as a page title would be a silent, confident lie on ordinary
+    text — strictly worse than the duplicate heading it replaces. So rung 2 fires
+    only on a shape prose does not have:
+
+      * the URL STANDS ALONE ON ITS LINE (the reference-list wrap), or
+      * only whitespace and punctuation separate the emphasis from the URL
+        (`*Title.* https://…`).
+
+    A sentence that merely mentions a URL satisfies neither: it has words between
+    the emphasis and the link, and its line carries the rest of the sentence.
+
+    Never raises.
+    """
+    try:
+        # ── rung 1: the link label ────────────────────────────────────────
+        if idx >= 2 and md[idx - 2:idx] == "](":
+            # Bounded window: a label is capped at 200 chars by the pattern, and
+            # scanning the whole document per URL is what the heading pre-scan
+            # above exists to avoid.
+            for m in _FIND_MD_LINK_RE.finditer(md, max(0, idx - 260),
+                                               idx + len(url) + 2):
+                if m.start(2) != idx:
+                    continue
+                label = _FIND_MD_IMG_RE.sub("", m.group(1))
+                label = re.sub(r'\s+', ' ', label).strip(" \t*_`")
+                # A label that is just the URL again names nothing.
+                if len(label) >= 2 and not label.lower().startswith(("http://", "https://")):
+                    return label[:80]
+                break
+
+        # ── rung 2: the reference line's emphasised title ────────────────
+        line_start = md.rfind("\n", 0, idx) + 1
+        prev_start = md.rfind("\n", 0, max(0, line_start - 1)) + 1
+        m = _FIND_CITE_EMPH_RE.search(md[prev_start:idx])
+        if not m:
+            return ""
+        gap = m.group(2)
+        line_end = md.find("\n", idx)
+        line = md[line_start:(line_end if line_end >= 0 else len(md))]
+        url_alone = bool(_FIND_URL_ALONE_RE.match(line))
+        # "Only punctuation between" — no letters, no digits.
+        gap_is_quiet = not re.search(r'[^\W_]', gap, re.UNICODE)
+        if not (url_alone or gap_is_quiet):
+            return ""
+        title = re.sub(r'\s+', ' ', m.group(1)).strip(" \t*_`")
+        if len(title) < 4 or title.lower().startswith(("http://", "https://")):
+            return ""
+        return title[:80]
+    except Exception:
+        return ""
 #: Bare URLs in a report. Hoisted out of `save_meta` (which harvests the same
 #: markdown for `sourceUrls`) so one definition serves both — the two disagreeing
 #: about what a URL is would put a source in the list and not in the findings.
@@ -63470,7 +64059,7 @@ def _find_is_platform_host(u: str) -> bool:
     return _is_platform_host(host)
 
 
-def _extract_findings(md: str, source_urls: list) -> list:
+def _extract_findings(md: str, source_urls: list, source_items: list = None) -> list:
     """For each cited source URL, locate the enclosing sentence in the
     agent's markdown report and return a structured finding entry:
     `{"url": str, "snippet": str, "sourceTitle": str}`.
@@ -63488,8 +64077,12 @@ def _extract_findings(md: str, source_urls: list) -> list:
       - Skip when expanded snippet is < 30 chars (almost certainly a
         bare reference list entry, not a real cited mention).
 
-    SourceTitle = first non-empty heading (`##` / `###`) preceding the
-    URL, or hostname fallback if no heading is found before it.
+    SourceTitle — the page's OWN name, by the ladder in `_find_source_title`:
+    the report's link label, then the emphasised title on a reference line, then
+    the title the platform's source panel scraped (`source_items`), then the
+    nearest preceding heading, then the hostname. ⛔ The heading rung used to be
+    the WHOLE rule, which gave every citation in a trailing reference block one
+    identical title; see `_find_source_title` for the incident.
 
     Caps result list at 12 per agent. Order = first-mention order in
     the markdown, deduped by URL.
@@ -63563,6 +64156,22 @@ def _extract_findings(md: str, source_urls: list) -> list:
     _candidates = _candidates[:_SOURCE_LIST_CAP]
     source_urls = [c["lookup"] for c in _candidates]
     _emit_for = {c["lookup"]: c["emit"] for c in _candidates}
+    # The titles the platform's own source panel scraped, keyed by NORMALISED
+    # url. Normalised because the panel's spelling and the report's are routinely
+    # different for the same page — the panel's carries the platform's tracking
+    # parameter (`?utm_source=chatgpt.com`) and the report's does not, so a
+    # raw-string key misses every time and the rung silently never fires.
+    # ⚠ A panel item's title is often "" (the inline-activity capture path writes
+    # it empty by construction), so empty entries are dropped rather than stored
+    # — an empty title must fall THROUGH to the heading, not shadow it.
+    _panel_titles: dict = {}
+    for _it in (source_items or []):
+        try:
+            _u, _t = str(_it.get("url") or ""), str(_it.get("title") or "").strip()
+            if _u and _t:
+                _panel_titles.setdefault(_find_normalize_url(_u), _t[:80])
+        except Exception:
+            continue
     findings: list = []
     seen_urls: set = set()
     # Pre-scan headings so we can find the nearest preceding heading
@@ -63611,12 +64220,27 @@ def _extract_findings(md: str, source_urls: list) -> list:
         snippet = re.sub(r'\s+', ' ', snippet).strip()
         if len(snippet) > 280:
             snippet = snippet[:279].rstrip() + "…"
-        # Locate nearest preceding heading.
-        title = ""
-        for h_pos, h_text in headings:
-            if h_pos > idx:
-                break
-            title = h_text
+        # ── The source's TITLE, best evidence first. ────────────────────────
+        # ⭐⭐ THE HEADING IS NOW THE THIRD-BEST ANSWER, NOT THE ONLY ONE. It is a
+        # heading in OUR markdown, so a report whose references all sit under one
+        # trailing heading gave every row the same name — twelve rows reading
+        # "Final synthesis, appendices, and references" in the 2026-09-19
+        # document. It stays as a rung because it is genuinely right for a report
+        # that cites inline under topic headings; it was only ever wrong as the
+        # FIRST answer.
+        #
+        # 1. what the report calls the page (link label, reference emphasis)
+        # 2. what the platform's own source panel called it
+        # 3. the nearest heading above it        ← the old rule
+        # 4. the host
+        title = _find_source_title(md, idx, url)
+        if not title:
+            title = _panel_titles.get(_find_normalize_url(url), "")
+        if not title:
+            for h_pos, h_text in headings:
+                if h_pos > idx:
+                    break
+                title = h_text
         if not title:
             try:
                 from urllib.parse import urlparse as _urlparse
@@ -63848,12 +64472,24 @@ def _doc_sources_row(n: int, url: str, title: str) -> str:
     renderer-computed number would survive neither — the numbers in the prose
     would then point at positions nothing states.
 
-    ⭐ AND THE HOST IS PRINTED BESIDE THE TITLE. `_extract_findings`' title is
-    the nearest HEADING IN OUR OWN DOCUMENT, not the page's own name, so two
-    sources cited under one heading arrive with the same title — a bibliography
-    reading "1. Battery prices / 2. Battery prices" tells a reader nothing about
-    where either went. The web's row spends that column on the agent's name,
-    which a per-agent document already states in its H1."""
+    ⭐ AND THE HOST IS PRINTED BESIDE THE TITLE — as PROVENANCE, which is what it
+    was always good for. The web's row spends that column on the agent's name,
+    which a per-agent document already states in its H1.
+
+    ⛔⛔ THIS PARAGRAPH USED TO SAY SOMETHING ELSE, AND THE REPO WAS ARGUING
+    AGAINST ITS OWN FIX. It read: "`_extract_findings`' title is the nearest
+    HEADING IN OUR OWN DOCUMENT, not the page's own name, so two sources cited
+    under one heading arrive with the same title — a bibliography reading
+    '1. Battery prices / 2. Battery prices' tells a reader nothing" — and then
+    offered the host suffix as the mitigation. That is an accurate description of
+    a DEFECT written down as accepted behaviour, and on 2026-09-19 it reached its
+    worst case: all twelve rows of a delivered document read "Final synthesis,
+    appendices, and references", because that report put every reference under
+    one trailing heading. `_extract_findings` now reads the page's own name from
+    the report (link label, reference-line emphasis) and from the platform's
+    source panel, and only then falls back to a heading. The host suffix stays
+    because a reader still wants to know where a title came from, and
+    `tail = "" if host == title` already suppresses it when it would be noise."""
     host = _doc_source_host(url)
     tail = "" if not host or host == title else " — %s" % host
     return "%d. [%s](%s)%s" % (n, _doc_escape_link_text(title),
@@ -67377,14 +68013,16 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     try:
                         _findings = list((getattr(_runtime, "agent_findings", {}) or {}).get(_agent_lc) or [])
                         if not _findings:
-                            _src_urls = list(getattr(_runtime, "agent_progress_snapshots", {}).get(_agent_lc, {}).get("source_urls", []) or [])
+                            _snap_f = getattr(_runtime, "agent_progress_snapshots", {}).get(_agent_lc, {}) or {}
+                            _src_urls = list(_snap_f.get("source_urls", []) or [])
+                            _src_items = list(_snap_f.get("source_items", []) or [])
                             # Same de-gating as the primary site: this backstop
                             # exists for resume/re-finalize, exactly when the
                             # snapshot ring may have been cleared — so keying it
                             # on the panel list made it useless in the one case
                             # it was written for.
                             if _agent_md:
-                                _findings = _extract_findings(_agent_md, _src_urls) or []
+                                _findings = _extract_findings(_agent_md, _src_urls, _src_items) or []
                                 if _findings:
                                     _runtime.agent_findings[_agent_lc] = _findings
                     except Exception:
@@ -80732,13 +81370,118 @@ def _delegate_agent_via_pipx(agent_args: "list[str]") -> int:
 
 
 def _sr_version() -> str:
-    """Installed package version (from wheel metadata), or a source-checkout
-    label when not pip-installed."""
+    """The INSTALLED package version, read from wheel metadata on disk.
+
+    ⛔⛔ THIS IS NOT "THE VERSION OF THE CODE THAT IS RUNNING", and reading it as
+    though it were cost a whole diagnosis on 2026-09-19 — see `_sr_build_label`
+    below, which is what every report about a RUN must use. `importlib.metadata`
+    answers from whatever `*.dist-info` is discoverable on `sys.path`, and that
+    is a different artifact from the module the interpreter actually loaded.
+
+    ⚠ Its old docstring promised "or a source-checkout label when not
+    pip-installed". That almost never fires: an editable install (`pip install
+    -e .`, which is how this repo is set up) leaves real, discoverable metadata,
+    so a checkout answers with a real number from the LAST wheel that was built.
+    Callers still testing `startswith("(")` as a source detector are testing a
+    branch that hardly ever runs; `_is_source_checkout()` is the real answer.
+
+    Correct callers: the update machinery, which genuinely asks "which
+    distribution is installed" so it can compare against PyPI.
+    """
     try:
         from importlib.metadata import version as _v
         return _v("superresearch")
     except Exception:
         return "(source checkout)"
+
+
+# What a SOURCE build's label ends with. A reader seeing it knows the number came
+# from the tree, and that package metadata has nothing to say about this process.
+_SRC_BUILD_SUFFIX = "+src"
+_BUILD_LABEL_CACHE: "str | None" = None
+
+
+def _source_tree_version() -> str:
+    """The version declared by the checkout this module was loaded from.
+
+    The tree's own `pyproject.toml`, beside `research.py` — the one artifact that
+    is guaranteed to exist in a checkout, needs no network, and is exactly what
+    settled the 2026-09-19 argument (it said 0.1.14 while the dist-info beside it
+    said 0.1.13). `tomllib` is stdlib from 3.11 and this repo requires ≥3.11; the
+    regex is there for the compiled build, where `pyproject.toml` may not ship
+    and a parse error must not cost the label."""
+    try:
+        p = Path(__file__).resolve().parent / "pyproject.toml"
+        raw = p.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+    try:
+        import tomllib
+        v = ((tomllib.loads(raw).get("project") or {}).get("version") or "")
+        if v:
+            return str(v).strip()
+    except Exception:
+        pass
+    try:
+        m = re.search(r'(?m)^\s*version\s*=\s*["\']([^"\']+)["\']', raw)
+        return m.group(1).strip() if m else ""
+    except Exception:
+        return ""
+
+
+def _sr_build_label() -> str:
+    """⭐⭐ THE VERSION OF THE CODE THAT IS ACTUALLY EXECUTING. Use this in every
+    report ABOUT A RUN — log lines, run `meta.json`, the support bundle, the
+    `X-Build` header, the bundle row.
+
+    ⛔⛔ WHY THIS EXISTS, in one incident. On 2026-09-19 a machine executed source
+    stamped 0.1.14 while every log line, the support bundle index and the ingest
+    header all said `build=0.1.13`, because `_sr_version()` reads dist-info and
+    an editable install had left 0.1.13's behind. I read that label, told the
+    owner they had run a stale wheel, and was wrong — they said "I'm confident we
+    have used this code only" and they were right. The run was only pinned to the
+    real source by grepping log strings that exist in no earlier revision. A
+    label that can send the person reading it to the wrong revision is worse than
+    no label.
+
+    Two cases, and they are distinguishable at a glance:
+      * a source checkout → ``"<pyproject version>+src"``, e.g. ``0.1.14+src``.
+        The suffix is the point: it says the number came from the TREE and that
+        metadata has nothing to say about this process.
+      * an installed build → `_sr_version()`, where metadata and code ship as one
+        artifact and the two cannot disagree.
+
+    ⛔ NOT `_serving_version()`, which is a tempting near-miss: that is the SAME
+    metadata read, merely frozen at import so a pipx upgrade cannot flip it
+    mid-process. It answers 0.1.13 in the scenario above too.
+
+    Computed once. Both inputs are fixed for the life of the process, and this is
+    called on log lines — a `pyproject.toml` read per line is not free. Never
+    raises and never touches the network.
+    """
+    global _BUILD_LABEL_CACHE
+    if _BUILD_LABEL_CACHE is not None:
+        return _BUILD_LABEL_CACHE
+    label = ""
+    try:
+        if _is_source_checkout():
+            v = _source_tree_version()
+            # No readable pyproject: say "a checkout, version unknown" rather
+            # than borrowing the installed number, which is the whole defect.
+            label = (v + _SRC_BUILD_SUFFIX) if v else "(source checkout)"
+        else:
+            label = _sr_version()
+    except Exception:
+        label = ""
+    _BUILD_LABEL_CACHE = label or "(unknown build)"
+    return _BUILD_LABEL_CACHE
+
+
+def _is_src_build_label(label: "str | None") -> bool:
+    """True for a label this module minted for a source tree. One reader, so the
+    suffix and the fallback string cannot drift apart across call sites."""
+    s = str(label or "")
+    return s.endswith(_SRC_BUILD_SUFFIX) or s == "(source checkout)"
 
 
 # What THIS process is executing, frozen at import.
@@ -80773,12 +81516,23 @@ _RUNNING_VERSION_PATH = _STATE_DIR / "running-version.json"
 
 
 def _write_running_version() -> None:
-    """Record what this serve process is running. Best-effort — never blocks serve."""
+    """Record what this serve process is running. Best-effort — never blocks serve.
+
+    ⚠ TWO FIELDS, ON PURPOSE, and they answer different questions.
+      * `version` — the INSTALLED distribution as this process saw it at boot. It
+        is what `_restart_pending` compares against the currently-installed one
+        to decide "an update landed, the old code is still serving". Replacing it
+        with the honest build label would make every dev checkout report a
+        permanent phantom restart-pending (`0.1.14+src` never equals `0.1.13`).
+      * `build` — the code actually executing. Nothing compares it; it is here so
+        that anyone reading this file by hand, or any future consumer, gets the
+        truthful answer rather than inferring one from `version`.
+    """
     try:
         _STATE_DIR.mkdir(parents=True, exist_ok=True)
         _RUNNING_VERSION_PATH.write_text(
-            json.dumps({"version": _sr_version(), "pid": os.getpid(),
-                        "started_at": time.time()}),
+            json.dumps({"version": _sr_version(), "build": _sr_build_label(),
+                        "pid": os.getpid(), "started_at": time.time()}),
             encoding="utf-8")
     except Exception:
         pass
@@ -80821,8 +81575,17 @@ def _restart_pending() -> "tuple[str, str] | None":
     running = _running_version()
     if not running:
         return None
+    # ⛔ A CHECKOUT IS NEVER PENDING A RESTART. There is no wheel to have landed;
+    # `git pull` is the update path (`--update` already answers "unsupported"
+    # here). The old guard below was `installed.startswith("(")`, which is the
+    # near-dead branch: an editable install leaves real, discoverable metadata,
+    # so a checkout answers with a number and sails past it. `_is_source_checkout`
+    # is the authoritative PATH check, the same one `_device_version_fields`
+    # already had to reach for after the VivobookPro bug.
+    if _is_source_checkout():
+        return None
     installed = _sr_version()
-    if not installed or installed.startswith("("):     # source checkout
+    if not installed or installed.startswith("("):     # metadata unreadable
         return None
     if running == installed:
         return None
@@ -81209,7 +81972,10 @@ def _post_bundle_to_ingest(local_path: "Path", code: str,
         "Content-Type": BUNDLE_CONTENT_TYPE,
         "X-Support-Code": code,
         "X-Install-Id": str(_install_uuid_best_effort() or ""),
-        "X-Build": _sr_version(),
+        # The build that produced the logs being posted. ⚠ The receiver caps this
+        # at 32 chars and truncates SILENTLY (`/api/logs/ingest`), so the `+src`
+        # suffix has to stay short — it is 4 characters on a label of about 10.
+        "X-Build": _sr_build_label(),
     }
     if email:
         headers["X-Contact-Email"] = email
@@ -83181,11 +83947,26 @@ def main():
         _install_session_tee(_session_cmd)
 
     if args.show_version:
-        print(f"  {_c(_BOLD + _ACCENT, 'Super')} {_c(_BOLD, 'Research')}  {_c(_BOLD, 'v' + _sr_version())}")
-        # This line reports the INSTALLED build. If a different build is actually
-        # serving, say so right here — otherwise --version reads as "update done"
-        # while the old code is still live (the exact trap the old --update copy
-        # walked users into).
+        # ⭐ THE CODE THIS COMMAND IS RUNNING, not the metadata beside it. On a
+        # checkout those differ — 0.1.14+src against an 0.1.13 dist-info — and
+        # the whole of #484 is that the second number was the one being shown.
+        _blabel = _sr_build_label()
+        print(f"  {_c(_BOLD + _ACCENT, 'Super')} {_c(_BOLD, 'Research')}  {_c(_BOLD, 'v' + _blabel)}")
+        if _is_src_build_label(_blabel):
+            # Name the installed distribution too, and say which is which. A dev
+            # comparing this against a wheel needs both numbers, and leaving the
+            # metadata one out would just move the ambiguity rather than end it.
+            try:
+                _inst = _sr_version()
+            except Exception:
+                _inst = ""
+            if _inst and not _inst.startswith("("):
+                _lead = "running from source; the installed package metadata says"
+                _tail = "— it does not describe this process"
+                print(f"     {_c(_DIM, _lead)} {_c(_BOLD, 'v' + _inst)} {_c(_DIM, _tail)}")
+        # If a different build is actually serving, say so right here — otherwise
+        # --version reads as "update done" while the old code is still live (the
+        # exact trap the old --update copy walked users into).
         try:
             _pend = _restart_pending()
         except Exception:
