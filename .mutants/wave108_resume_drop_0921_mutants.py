@@ -29,8 +29,20 @@ looking installed. The ones that matter most are the quiet ones:
         deliberate stop read identically. Flattening is this project's
         recurring way of undoing a fix while keeping it.
 
+⭐ THE W SECTION IS THE SAME WAVE'S OTHER HALF: a run whose WORKER abandoned it.
+The #64 backstop marks such runs `paused_backend_restart` so a Resume appears —
+and it covered ONE death path in four. The supervisor gives up on a worker when
+the initial fleet spawn fails, when a respawn after a watchdog kill fails, in
+the crash loop, and when a respawn after a crash fails; only the crash loop
+wrote the marker worker 1 reads. W1-W3 are those three paths going quiet again;
+W5 and W6 are the two lines that make the whole mechanism run and that fifteen
+existing tests never touched — delete either and every one of them still passes.
+
 ⛔ ANCHORS ARE SINGLE STRING LITERALS AND MUST MATCH EXACTLY ONCE. A stale
-anchor is a harness fault, not a survivor, and faults are counted OUT.
+anchor is a harness fault, not a survivor, and faults are counted OUT. W4 proved
+it on its first run: `"reason": reason,` matches a second payload elsewhere in
+the file, and the static sweep caught it before the harness could report a
+phantom kill.
 
   .venv/bin/python .mutants/wave108_resume_drop_0921_mutants.py
   .venv/bin/python .mutants/wave108_resume_drop_0921_mutants.py R4 R6
@@ -42,7 +54,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-SUITES = "tests/test_resume_drop_writeback_108.py"
+SUITES = ("tests/test_resume_drop_writeback_108.py "
+          "tests/test_dead_worker_wiring_108.py")
 RESEARCH = "research.py"
 FILES = (RESEARCH,)
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
@@ -75,6 +88,28 @@ B_TRANSIENT = ("                            log(\n"
                "                                \"Resume: read denied on research doc + no backendRunId in payload — drop queue entry\",\n"
                "                                \"WARN\",\n"
                "                            )")
+
+# ── anchors: the dead-worker backstop's wiring ──────────────────────────────
+#: The boot spawn that never marked.
+W_BOOT = ('            if _st is None:\n'
+          '                _write_worker_dead_marker(k, reason="spawn_failed_at_boot")')
+#: The respawn after a watchdog kill that never marked.
+W_WATCHDOG = ('                            _write_worker_dead_marker(\n'
+              '                                k, reason="respawn_failed_after_watchdog")')
+#: The respawn after a crash that never marked.
+W_CRASH_RESPAWN = ('                        _write_worker_dead_marker(\n'
+                   '                            k, crash_count=len(state.get("crash_window") or []),\n'
+                   '                            reason="respawn_failed_after_crash")')
+#: The parameter that lets four outcomes say four things.
+#: ⛔ ANCHORED ON THE LINE ABOVE IT TOO. `"reason": reason,` alone matches a
+#: second payload elsewhere in the file, and the sweep caught it before the
+#: harness could report a phantom kill. `died_at` is unique to this marker.
+W_REASON = ('            "died_at": int(time.time() * 1000),\n'
+            '            "reason": reason,')
+#: Worker 1 scheduling the reconciler — the line that makes all of it run.
+W_SCHEDULE = "            asyncio.create_task(_dead_worker_reconcile_loop())"
+#: A repaired worker retracting its own marker at boot.
+W_RETRACT = "            _clear_worker_dead_marker(WORKER_ID)"
 
 MUTANTS = [
     ("R1", "under", RESEARCH,
@@ -149,6 +184,43 @@ MUTANTS = [
      "way",
      [(B_TRANSIENT, B_TRANSIENT +
        "\n                            _resume_drop_writeback(target_uid, target_rid, RESUME_DROP_ARTIFACTS_GONE)")]),
+
+    # ── W: the Resume backstop for a run its worker abandoned ──────────────
+    ("W1", "under", RESEARCH,
+     "⛔⛔ THE BOOT-SPAWN DEATH GOES UNMARKED AGAIN — a worker that never comes "
+     "up still owns yesterday's runs, and with no marker worker 1 cannot see "
+     "it. Those runs stay frozen ongoing with no Resume, which is exactly the "
+     "2026-07-16 state the stale KNOWN LIMITATION still describes",
+     [(W_BOOT, "            if False:\n                pass")]),
+
+    ("W2", "under", RESEARCH,
+     "⛔ the watchdog-respawn death goes unmarked — the watchdog killed a wedged "
+     "worker, it would not come back, and the runs it held get no rescue",
+     [(W_WATCHDOG, "                            pass")]),
+
+    ("W3", "under", RESEARCH,
+     "⛔ the crash-respawn death goes unmarked — indistinguishable to the person "
+     "from the crash-loop branch one step above it, which DOES mark",
+     [(W_CRASH_RESPAWN, "                        pass")]),
+
+    ("W4", "under", RESEARCH,
+     "⛔ all four deaths report the same cause again. Nothing READS the reason, "
+     "so this costs nothing at runtime and everything to the next reader — one "
+     "hardcoded literal is why three missing call sites survived two months",
+     [(W_REASON, '            "died_at": int(time.time() * 1000),\n'
+                 '            "reason": "crash_loop",')]),
+
+    ("W5", "under", RESEARCH,
+     "⛔⛔ THE RECONCILER IS NEVER SCHEDULED. Fifteen tests drive it as a "
+     "function and every one still passes, while no orphaned run is ever marked "
+     "recoverable again — the helper-pinned-consumer-not shape at its purest",
+     [(W_SCHEDULE, "            pass")]),
+
+    ("W6", "under", RESEARCH,
+     "⛔ a repaired worker no longer retracts its own marker, so worker 1 keeps "
+     "re-pausing the runs that worker is booting to recover — an operator repair "
+     "gains a manual step nobody documents",
+     [(W_RETRACT, "            pass")]),
 ]
 
 

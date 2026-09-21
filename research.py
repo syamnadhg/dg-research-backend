@@ -462,11 +462,27 @@ def _worker_dead_marker_path(worker_id: int) -> Path:
 
 
 def _write_worker_dead_marker(worker_id: int, *, pid: "int | None" = None,
-                              crash_count: int = 0) -> None:
+                              crash_count: int = 0,
+                              reason: str = "crash_loop") -> None:
     """Supervisor-side: durably record that `worker_id` was declared dead.
     Atomic tmp+os.replace (mirrors _write_worker_lock) so a concurrent worker-1
     scan never reads a half-written file. The `.dead.tmp` suffix is excluded from
-    the reader's `.worker.*.dead` glob. Best-effort; failures logged DEBUG."""
+    the reader's `.worker.*.dead` glob. Best-effort; failures logged DEBUG.
+
+    ⛔⛔ `reason` EXISTS BECAUSE THIS WAS WRITTEN ON ONE DEATH PATH IN FOUR, and
+    the literal "crash_loop" it used to hardcode is why nobody noticed. The
+    supervisor gives up on a worker in four places — the initial fleet spawn
+    failing, a respawn after a watchdog kill failing, the crash loop, and a
+    respawn after a crash failing — and only the crash loop wrote a marker. The
+    other three left `{"_dead": True}` in the table and nothing on disk, so
+    worker 1's reconciler never saw them and their abandoned runs stayed frozen
+    "ongoing" with no Resume: exactly the state the KNOWN LIMITATION comment 160
+    lines below the reconciler still describes, for three cases out of four.
+
+    Nothing READS this field — `_read_dead_worker_ids` keys on `worker_id` and
+    `died_at` alone — so it is diagnostics, and diagnostics that name one cause
+    for four outcomes are how a gap this size stays invisible.
+    """
     tmp = None
     try:
         lock_dir = Path(__file__).parent / "queues"
@@ -477,7 +493,7 @@ def _write_worker_dead_marker(worker_id: int, *, pid: "int | None" = None,
             "worker_id": worker_id,
             "pid": pid,
             "died_at": int(time.time() * 1000),
-            "reason": "crash_loop",
+            "reason": reason,
             "crash_count": crash_count,
             "supervisor_pid": os.getpid(),
         }), encoding="utf-8")
@@ -78733,8 +78749,20 @@ def run_daemon_loop(port: int = 8000):
                         f"health (in-process reconnect failing)")
 
         # Initial spawn of all workers.
+        #
+        # ⛔ A WORKER THAT NEVER COMES UP AT BOOT STILL OWNS YESTERDAY'S RUNS.
+        # This slot took `{"_dead": True}` and wrote nothing, so worker 1's
+        # reconciler could not see it and every run assigned to this worker in
+        # a previous session stayed frozen "ongoing" with no Resume. Marking is
+        # safe here for the same reasons it is safe on the crash-loop branch:
+        # the reconciler refuses a run a LIVE sibling holds the lock on, refuses
+        # one whose delivery.json says the BE already handed off, and a later
+        # successful boot of this worker retracts the marker itself.
         for k in range(1, n_workers + 1):
-            workers[k] = _spawn_worker(k) or {"_dead": True}
+            _st = _spawn_worker(k)
+            if _st is None:
+                _write_worker_dead_marker(k, reason="spawn_failed_at_boot")
+            workers[k] = _st or {"_dead": True}
 
         try:
             while True:
@@ -78773,6 +78801,11 @@ def run_daemon_loop(port: int = 8000):
                             new_state["watchdog_window"] = state.get("watchdog_window", [])
                             workers[k] = new_state
                         else:
+                            # ⛔ Same gap as the boot spawn: the watchdog killed
+                            # this worker and it would not come back, and the
+                            # runs it was holding had nothing to rescue them.
+                            _write_worker_dead_marker(
+                                k, reason="respawn_failed_after_watchdog")
                             workers[k] = {"_dead": True}
                         continue
                     if rc == 0:
@@ -78906,6 +78939,13 @@ def run_daemon_loop(port: int = 8000):
                         new_state["watchdog_window"] = state.get("watchdog_window", [])  # (#717)
                         workers[k] = new_state
                     else:
+                        # ⛔ The last of the three. A crash we were willing to
+                        # restart from, followed by a respawn that would not
+                        # start — indistinguishable to the person from the
+                        # crash-loop case one branch above, which DID mark.
+                        _write_worker_dead_marker(
+                            k, crash_count=len(state.get("crash_window") or []),
+                            reason="respawn_failed_after_crash")
                         workers[k] = {"_dead": True}
         except KeyboardInterrupt:
             _terminate_worker_fleet(workers, "Interrupted (Ctrl+C)")
