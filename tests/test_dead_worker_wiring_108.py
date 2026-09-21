@@ -159,21 +159,41 @@ def test_worker_one_actually_starts_the_reconciler():
         "pass their own tests")
 
 
-def test_the_supervisor_retracts_the_marker_when_a_retry_SUCCEEDS():
-    """⛔⛔ CROSS-VERIFY CAUGHT THE PREMISE OF MY OWN WIDENING. `_dead` does not
-    mean the supervisor gave up: the 2-second tick respawns any slot that is
-    None or `_dead`. So a marker written on a single failed spawn survives a
-    SUCCESSFUL retry until the child reaches its own `--serve` boot — well past
-    Firebase init. If that exceeds the 60-second grace and worker 1's reconcile
-    tick lands in the window, it stamps `paused_backend_restart` on every
-    ongoing run of a worker that is mid-boot, and that worker's own rehydration
-    then skips them because they are no longer ongoing. A supervised device
-    silently stops recovering its own runs."""
+def test_the_SUPERVISOR_never_retracts_a_marker():
+    """⛔⛔ THIS TEST ASSERTED THE OPPOSITE ONE ROUND AGO, AND IT WAS WRONG.
+
+    Round one found the marker outliving a successful retry, so the repair made
+    every successful respawn retract it — three call sites — and this test
+    counted them. Round two then proved the premise false by reading
+    `_spawn_worker`: it returns the instant `Popen` succeeds. No health check,
+    no poll, no port probe after launch. So "a worker that came up" is not what
+    those branches measured, and a worker that dies at import had its marker
+    cleared about SEVEN SECONDS after it was written — never reaching the
+    reader's sixty-second grace. The repair deleted the rescue it was widening,
+    and the test counted call sites, which is satisfied identically by three
+    correct retractions and three harmful ones.
+
+    ⭐ THE CHILD'S OWN `--serve` BOOT IS THE ONLY HONEST RETRACTION: a process
+    that reaches there is, by construction, alive. And nothing may retract at
+    BOOT — a marker left by the previous supervisor session is the whole reason
+    the mechanism exists.
+    """
     fn = _fn("run_daemon_loop")
     clears = _calls_named(fn, "_clear_worker_dead_marker")
-    assert len(clears) >= 3, (
-        f"only {len(clears)} of the supervisor's successful-spawn paths retract "
-        f"the marker — the marker outlives the failure it records")
+    assert clears == [], (
+        f"the supervisor retracts a dead-marker at {[c.lineno for c in clears]} — "
+        f"`_spawn_worker` returns on a successful fork, not a live worker, so "
+        f"this clears markers for workers that are genuinely dead before the "
+        f"reader's grace window can ever see them")
+
+
+def test_the_only_retraction_is_the_child_proving_itself_alive():
+    """⭐ ACCEPT POLARITY for the refusal above. Removing every retraction would
+    strand a repaired worker's runs for ever, which is the opposite failure."""
+    fn = _fn("run_server")
+    assert _calls_named(fn, "_clear_worker_dead_marker"), (
+        "nothing retracts a dead-marker at all — a repaired worker stays dead "
+        "to the reconciler for ever")
 
 
 def test_a_worker_that_boots_retracts_its_own_marker():

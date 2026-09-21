@@ -247,6 +247,45 @@ def test_the_stop_exit_does_not_overwrite_a_terminal_status():
         "the guard is present but the write is outside it")
 
 
+def test_the_stop_exit_fails_OPEN_where_the_write_back_fails_closed():
+    """⛔⛔ THE SAME GUARD, OPPOSITE DIRECTIONS, AND ROUND TWO CAUGHT THE ONE I
+    GOT WRONG. Fail-closed is cheap at `_resume_drop_writeback` — the cost is a
+    sentence with no status change. At the stop exit it suppresses the ONLY
+    terminal status that exit writes, so one unreadable read leaves a run the
+    person stopped sitting `ongoing` for ever with Stop and Pause live, and
+    `_schedule_server_exit` calls os._exit(0) three seconds later so nothing
+    corrects it. Reachable from the local HTTP /stop endpoint, which closes the
+    browser inline and writes no status of its own."""
+    h = _except_handler()
+    branch = next(n for n in ast.walk(h)
+                  if isinstance(n, ast.If) and isinstance(n.test, ast.Name)
+                  and n.test.id == "_stop_requested")
+    calls = [n for n in ast.walk(branch)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+             and n.func.id == "_research_is_terminal"]
+    assert calls, "the stop exit no longer consults the terminal check"
+    kw = {k.arg: k.value for k in calls[0].keywords}
+    assert "on_error" in kw, (
+        "the stop exit takes the default direction — one failed read there "
+        "leaves a stopped run active for ever")
+    assert isinstance(kw["on_error"], ast.Constant) and kw["on_error"].value is False
+
+
+def test_the_write_back_keeps_the_other_direction(monkeypatch):
+    """⭐ ACCEPT POLARITY, executed. The two callers must differ, or one of them
+    is wrong."""
+    writes = []
+    monkeypatch.setattr(research, "_update_research_doc",
+                        lambda u, r, up: writes.append(up) or True)
+    monkeypatch.setattr(research, "_firebase_db", None)
+    # unreadable → the write-back treats it as terminal and leaves the status
+    research._resume_drop_writeback("uid", "rid", "because")
+    assert "status" not in writes[0]
+    # …and the same unreadable state is NOT terminal for the stop exit
+    assert research._research_is_terminal("uid", "rid", on_error=False) is False
+    assert research._research_is_terminal("uid", "rid") is True
+
+
 def test_the_terminal_set_the_guard_reads_matches_the_pre_claim_gate():
     """⭐ ONE LIST, AND IT ALREADY EXISTED IN THIS FILE AS A LITERAL. The
     pre-claim gate a few hundred lines below names the same five; if the two

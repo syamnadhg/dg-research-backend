@@ -250,7 +250,16 @@ def test_the_helper_can_leave_the_status_alone(monkeypatch):
     monkeypatch.setattr(research, "_update_research_doc",
                         lambda u, r, up: calls.append(up) or True)
     research._resume_drop_writeback("uid", "rid", "why", status=None)
-    assert calls == [{"lastError": "why"}]
+    assert "status" not in calls[0], "status=None still moved the status"
+    # ⛔⛔ AND THE REASON GOES TO ITS OWN FIELD. Round two proved that scoping
+    # the card's substitution by STATUS deadlocked against the terminal guard:
+    # on a terminal run the status is deliberately not moved, so a reason
+    # carried only by `lastError` reached a card that would not read it, and
+    # the chat's fallback then spoke over a refusal that can never change.
+    # `resumeDropReason` has one writer and one meaning, so the card can prefer
+    # it for every recovery status.
+    assert calls[0]["resumeDropReason"] == "why"
+    assert isinstance(calls[0]["resumeDropAt"], int)
     calls.clear()
     research._resume_drop_writeback("uid", "rid", "why")
     assert calls[0]["status"] == "paused_backend_restart_failed"
@@ -395,6 +404,30 @@ def _calls_not_under_a_nested_if(stmts):
     return found
 
 
+def _branch_calls(node):
+    """Write/delete calls that decide THIS branch, one level into a fork.
+
+    Each arm of a nested `if` is folded in separately, together with the outer
+    branch's own deletes — because an arm and its sibling never both run, but
+    an arm and the delete after the fork always do.
+    """
+    outer = _calls_not_under_a_nested_if(node.body) + _calls_not_under_a_nested_if(node.orelse)
+    # ⛔ ONLY FOLD A FORK THAT IS THIS BRANCH'S WHOLE DECISION. A branch with
+    # writes of its own, or with several nested `if`s, is an ordinary block —
+    # folding there drags in writes from branches that are nobody's sibling and
+    # reports deletes-before-writes that never both execute. My first attempt
+    # folded unconditionally and did exactly that.
+    if any(k == "write" for k, _ in outer):
+        return outer
+    forks = [n for n in node.body + node.orelse if isinstance(n, ast.If)]
+    if len(forks) != 1:
+        return outer
+    arms = []
+    for arm in (forks[0].body, forks[0].orelse):
+        arms.extend(_calls_not_under_a_nested_if(arm))
+    return outer + arms
+
+
 def test_every_write_back_precedes_its_delete_in_the_parse_tree():
     """⛔⛔ A `toContain` CANNOT TELL WRITE-THEN-DELETE FROM DELETE-THEN-WRITE,
     and the delete is what makes the write unrepeatable — a failure here is
@@ -411,12 +444,21 @@ def test_every_write_back_precedes_its_delete_in_the_parse_tree():
         # failed on code that was correct — a false alarm is the same disease
         # as a silent pass. The write and the delete that concern each other
         # are siblings, so siblings is what this reads.
-        # ⛔ BOTH ARMS. Checking only `body` meant an `else:` that also writes
-        # was invisible — and the repair that split the no-backendRunId branch
-        # put a write in exactly that arm. A checker blind to half a branch
-        # under-counts, which is how `seen` came out one short and told me so.
-        body_calls = (_calls_not_under_a_nested_if(node.body)
-                      + _calls_not_under_a_nested_if(node.orelse))
+        # ⛔⛔ THE CHECKER FOLLOWS ONE LEVEL INTO A NESTED FORK, and round two
+        # of cross-verify proved why by executing it. When the repair moved a
+        # write inside `if _orphaned is not None:` while the delete stayed
+        # outside, the outer branch held a delete and no write — so it was
+        # SKIPPED ENTIRELY, and the delete-before-write regression this test
+        # exists to catch survived on the exact branch the repair rewrote. A
+        # copy with the delete hoisted above the fork PASSED.
+        #
+        # ⛔ And the previous attempt at this — concatenating `orelse` — was a
+        # provable no-op: run the walk with and without it and both give the
+        # same counts. The comment justifying it was false. Worse, merging the
+        # two arms would compare line numbers across branches that never both
+        # execute, so each arm is evaluated SEPARATELY against the outer
+        # branch's own deletes.
+        body_calls = _branch_calls(node)
         kinds = [k for k, _ in body_calls]
         if "write" not in kinds:
             continue
@@ -450,7 +492,10 @@ def test_every_write_back_precedes_its_delete_in_the_parse_tree():
     # branch, the 12-hour guard, and the no-backendRunId fork — whose two arms
     # are two writes inside ONE `if`, so it counts once.
     assert seen >= 4, f"expected at least 4 write-back branches, walked {seen}"
-    assert paired >= 2, f"expected 2 write-then-delete branches, found {paired}"
+    # ⛔ RESTORED TO THREE. It was lowered to two when the fork made the outer
+    # branch invisible to the checker; following the fork restores the coverage
+    # rather than accepting the number.
+    assert paired >= 3, f"expected 3 write-then-delete branches, found {paired}"
 
 
 def test_the_no_run_id_branch_asks_the_disk_before_closing_recovery():
@@ -481,12 +526,35 @@ def test_the_no_run_id_branch_asks_the_disk_before_closing_recovery():
     ]
     assert forks, "the disk answer is fetched and then never branched on"
     fork = forks[0]
-    on_disk = _calls_not_under_a_nested_if(fork.body)
-    absent = _calls_not_under_a_nested_if(fork.orelse)
-    assert on_disk and absent, "one arm of the fork writes nothing"
-    src = ast.dump(ast.Module(body=fork.body, type_ignores=[]))
-    assert "status" in src and "None" in src, (
-        "the on-disk arm must pass status=None — its run can still be resumed")
+    # ⛔⛔ THE ON-DISK ARM REPAIRS, IT DOES NOT REFUSE. Round two of cross-verify
+    # caught the first version finding the directory, logging it, and refusing
+    # anyway with "try Resume once more" — a closed loop, because nothing
+    # between two presses writes `backendRunId` back, so the next press takes
+    # the identical branch and the sentence tells the person to keep pressing
+    # it. The directory's own name IS the missing run id.
+    # ⛔⛔ IT MUST USE THE DIRECTORY'S OWN NAME, not merely mention the field.
+    # A mutant set `backend_run_id = ""` and kept the write — the document then
+    # gains an empty id, the next press takes the identical branch, and the pin
+    # stayed green because the word `backendRunId` was still there.
+    assigns = [
+        n for n in ast.walk(ast.Module(body=fork.body, type_ignores=[]))
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "backend_run_id" for t in n.targets)
+    ]
+    assert assigns, "the on-disk arm never adopts the run id it found"
+    src = ast.dump(assigns[0].value)
+    assert "name" in src, (
+        "the on-disk arm assigns something other than the directory's name — "
+        "the run id it proved exists is the one thing it must carry forward")
+    on_disk = ast.dump(ast.Module(body=fork.body, type_ignores=[]))
+    assert "backendRunId" in on_disk, (
+        "the on-disk arm does not write the run id it just found back to the "
+        "document — the next press takes the same branch for ever")
+    assert "_resume_drop_writeback" not in on_disk, (
+        "the on-disk arm still refuses a run it proved is recoverable")
+    absent = ast.dump(ast.Module(body=fork.orelse, type_ignores=[]))
+    assert "_resume_drop_writeback" in absent, (
+        "the genuinely-absent case lost its refusal sentence")
 
 
 def test_a_run_whose_folder_is_on_disk_is_found_by_its_owner_file(tmp_path, monkeypatch):
@@ -510,12 +578,11 @@ def test_the_three_sentences_are_distinct_and_none_is_empty():
     say the same thing about a swept folder and a deliberate stop, which is the
     class of flattening this project keeps having to undo."""
     lines = [research.RESUME_DROP_NO_RUN_ID,
-             research.RESUME_DROP_NO_RUN_ID_ON_DISK,
              research.RESUME_DROP_ARTIFACTS_GONE,
              research.RESUME_DROP_TERMINALLY_STOPPED,
              research.RESUME_DROP_WENT_STALE]
     assert all(len(s.strip()) > 40 for s in lines)
-    assert len(set(lines)) == 5
+    assert len(set(lines)) == 4
     # Each one tells the person what to do next, which is the whole point of
     # writing it rather than logging it.
     for s in lines:

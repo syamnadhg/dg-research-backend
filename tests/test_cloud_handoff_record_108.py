@@ -259,6 +259,70 @@ def test_a_connection_cut_mid_flight_is_not_reported_as_never_arriving():
     assert "may be finishing it" in body, "the cut-mid-flight case has no sentence of its own"
 
 
+def test_the_classification_is_EXECUTED_not_read():
+    """⛔⛔ A MUTANT NEUTERED THIS TO `False and isinstance(...)` AND EVERY
+    ASSERTION STAYED GREEN, because they read the parse tree for NAMES and the
+    names survive. That is the fifth time in this wave that a pin of mine
+    measured nothing, and the fix is the same each time: extract the decision
+    and run it."""
+    import requests as rq
+    ex = rq.exceptions
+    # never left — the cloud has nothing
+    for exc in (ex.ConnectTimeout("t"), ex.ProxyError("p"), ex.ConnectionError("c")):
+        assert research._dispatch_never_left(exc, 120) is True, type(exc).__name__
+    # ⛔ AND THE CLOCK DOES NOT OVERRULE THE CLASS. A black-holed SYN fails at
+    # the OS connect timeout, tens of seconds in — far past the threshold — so
+    # a time-only test filed it as "the cloud received it".
+    assert research._dispatch_never_left(ex.ConnectionError("c"), 3600) is True
+    # received — the cloud had it and this machine stopped watching
+    for exc in (ex.ReadTimeout("r"), ex.ChunkedEncodingError("c")):
+        assert research._dispatch_never_left(exc, 301) is False, type(exc).__name__
+    # ⭐ and a ReadTimeout is a ConnectionError subclass in some versions, so
+    # the order of the checks is load-bearing, not incidental.
+    assert research._dispatch_never_left(ex.ReadTimeout("r"), 1) is False
+    # an exception class we cannot place falls back to the clock
+    assert research._dispatch_never_left(ValueError("?"), 1) is True
+    assert research._dispatch_never_left(ValueError("?"), 3600) is False
+
+
+def test_the_exception_CLASS_decides_whether_the_request_ever_left():
+    """⛔⛔ THE CLOCK NAMES THE WRONG SUBJECT ON ITS OWN, which round two of
+    cross-verify proved. `requests` raises ConnectionError/ConnectTimeout when
+    the request never left and ReadTimeout when the cloud already has it — and
+    a black-holed SYN does not fail instantly, it fails at the OS connect
+    timeout, tens of seconds later, past any elapsed-time threshold. So a
+    time-only test filed a request that never left the machine as one the cloud
+    received, in the run's permanent support-bundle record."""
+    import ast
+    import inspect
+    import textwrap
+    src = textwrap.dedent(inspect.getsource(research._post_fe_p4p5_trigger))
+    drive = next(n for n in ast.walk(ast.parse(src))
+                 if isinstance(n, ast.FunctionDef) and n.name == "_drive_once")
+    handler = next(n for n in ast.walk(drive) if isinstance(n, ast.Try)).handlers[0]
+    dumped = ast.dump(handler)
+    assert "_dispatch_never_left" in dumped, (
+        "the branch no longer consults the classifier — elapsed time alone "
+        "cannot tell a request that never left from one the cloud received")
+    # and the verdict must GATE the optimistic sentence, not merely appear
+    ifs = [n for n in ast.walk(handler) if isinstance(n, ast.If)
+           and any(isinstance(x, ast.Name) and x.id == "_never_left"
+                   for x in ast.walk(n.test))]
+    assert ifs, "the class verdict is computed and then never branched on"
+
+
+def test_the_connect_phase_is_bounded_below_the_threshold():
+    """⛔ `timeout=3600` AS A SCALAR SETS THE CONNECT TIMEOUT TOO. That is what
+    let a no-route failure outlive the threshold. A pair bounds the connect
+    while leaving the read matched to the route's Cloud Run ceiling."""
+    import inspect
+    src = inspect.getsource(research._post_fe_p4p5_trigger)
+    assert "timeout=(10, 3600)" in src, (
+        "the connect phase is unbounded again, so a black-holed SYN fails long "
+        "after the discriminator has stopped being able to tell")
+    assert "timeout=3600," not in src
+
+
 def test_the_threshold_is_far_below_the_measured_severance():
     """⭐ 300 seconds is where the real severance lands. The threshold only has
     to separate "never left" (DNS, refused, no route — instant) from anything

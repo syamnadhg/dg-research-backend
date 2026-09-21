@@ -65,7 +65,7 @@ ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
 # ── anchors: research.py ────────────────────────────────────────────────────
 #: The helper's identity refusal.
-IDENTITY = "    if not uid or not research_id:\n        return False\n    updates: dict = {\"lastError\": reason}"
+IDENTITY = "    if not uid or not research_id:\n        return False\n    # \u26d4\u26d4 ITS OWN FIELD"
 #: The optional status, which one caller needs to be absent.
 OPTIONAL_STATUS = ("    if status and not _research_is_terminal(uid, research_id):\n"
                    "        updates[\"status\"] = status")
@@ -81,7 +81,7 @@ S_STOPPED = "RESUME_DROP_TERMINALLY_STOPPED = ("
 #: with no pre-write compile guard would have reported those as kills.
 B_NO_RUN = ("                    else:\n"
             "                        _resume_drop_writeback(target_uid, target_rid, RESUME_DROP_NO_RUN_ID)\n"
-            "                    try: doc.reference.delete()")
+            "                        try: doc.reference.delete()")
 #: Branch 2 — the run folder was swept.
 B_GONE = ("                    _resume_drop_writeback(target_uid, target_rid, RESUME_DROP_ARTIFACTS_GONE)\n"
           "                    try: doc.reference.delete()")
@@ -174,17 +174,37 @@ W_RETRACT = "            _clear_worker_dead_marker(WORKER_ID)"
 X_TERMINAL = "    if status and not _research_is_terminal(uid, research_id):"
 #: Its fail-closed direction on an unreadable document.
 X_FAILCLOSED = ('    except Exception as _tr_err:\n'
-                '        log(f"[resume-drop] terminal check failed for {research_id[:8]}… "\n'
-                '            f"({_tr_err}) — leaving the status alone", "DEBUG")\n'
-                '        return True')
+                '        log(f"[terminal-check] read failed for {research_id[:8]}… "\n'
+                '            f"({_tr_err}) — assuming terminal={on_error}", "DEBUG")\n'
+                '        return on_error')
 #: The same guard on the new Stop exit.
-X_STOPGUARD = "            if _fb_uid and _fb_research_id and not _research_is_terminal(_fb_uid, _fb_research_id):"
+X_STOPGUARD = ("            if _fb_uid and _fb_research_id and not _research_is_terminal(\n"
+               "                    _fb_uid, _fb_research_id, on_error=False):")
 #: The elapsed-time evidence that tells a cut connection from one never made.
-X_ELAPSED = "            if _elapsed >= _DRIVE_SENT_AFTER_SEC:"
+X_ELAPSED = "            if not _never_left and _elapsed >= _DRIVE_SENT_AFTER_SEC:"
 #: The disk second-opinion before closing a run's automatic recovery.
 X_ONDISK = "                    if _orphaned is not None:"
-#: A successful respawn retracting the marker its failure wrote.
-X_RETRACT = "                            _clear_worker_dead_marker(k)\n                            new_state[\"watchdog_window\"]"
+#: (X_RETRACT retired with X6 — round two removed the supervisor's retraction
+#: entirely, and Z2 mutates it back from the correct direction.)
+
+# ── anchors: round two of cross-verify ─────────────────────────────────────
+#: The dedicated field the card can read for every recovery status.
+Z_FIELD = '        "resumeDropReason": reason,'
+#: The failure direction, chosen per caller.
+Z_DIRECTION = "def _research_is_terminal(uid: str, research_id: str, *, on_error: bool = True) -> bool:"
+#: The stop exit asking for the OTHER direction.
+Z_STOPDIR = "                    _fb_uid, _fb_research_id, on_error=False):"
+#: The on-disk arm repairing the document instead of refusing.
+Z_REPAIR = "                        backend_run_id = _orphaned.name"
+#: The connect timeout, bounded below the discriminator.
+Z_TIMEOUT = "                timeout=(10, 3600),"
+#: The exception class deciding whether the request ever left.
+#: ⛔ THE FIRST AIM WAS AN EQUIVALENT MUTANT, WHICH IS A HARNESS FAULT AND NOT A
+#: SURVIVOR. It removed the ConnectTimeout/ProxyError check — and both are
+#: SUBCLASSES of ConnectionError, so the line below still caught them and the
+#: behaviour was unchanged. It is aimed at the classifier's whole premise now:
+#: the clock deciding alone, which is the defect this function exists to end.
+Z_CLASS = "    exc_mod = _rq.exceptions"
 
 MUTANTS = [
     ("R1", "under", RESEARCH,
@@ -192,8 +212,7 @@ MUTANTS = [
      "again. The person's banner sits unchanged, still offering a Resume that "
      "takes the same path and vanishes the same way",
      [(B_NO_RUN, "                    else:\n"
-                 "                        pass\n"
-                 "                    try: doc.reference.delete()")]),
+                 "                        try: doc.reference.delete()")]),
 
     ("R2", "under", RESEARCH,
      "⛔⛔ the swept-folder drop goes quiet. This is the likeliest of the three: "
@@ -213,11 +232,10 @@ MUTANTS = [
      "before the sentence is written. A source pin cannot tell these apart",
      [(B_NO_RUN,
        "                    else:\n"
-       "                        pass\n"
-       "                    try: doc.reference.delete()\n"
-       "                    except Exception: pass\n"
-       "                    _resume_drop_writeback(target_uid, target_rid, RESUME_DROP_NO_RUN_ID)\n"
-       "                    try: pass")]),
+       "                        try: doc.reference.delete()\n"
+       "                        except Exception: pass\n"
+       "                        _resume_drop_writeback(target_uid, target_rid, RESUME_DROP_NO_RUN_ID)\n"
+       "                        try: pass")]),
 
     ("R5", "under", RESEARCH,
      "⛔⛔ THE 12-HOUR CARVE-OUT, RESTORED. A resume that waited overnight is "
@@ -244,7 +262,7 @@ MUTANTS = [
      "⛔ the helper stops refusing a half identity, so a queue doc missing its "
      "uid writes to `users//researches/...` — either a raise inside a listener "
      "callback or a write nobody can find",
-     [(IDENTITY, "    updates: dict = {\"lastError\": reason}")]),
+     [(IDENTITY, "    # \u26d4\u26d4 ITS OWN FIELD")]),
 
     ("R9", "under", RESEARCH,
      "⛔ the three reasons collapse into one, so a swept folder, a missing "
@@ -477,14 +495,64 @@ MUTANTS = [
      "status it gets is outside BOTH enqueue whitelists",
      [(X_ONDISK, "                    if False:")]),
 
-    ("X6", "under", RESEARCH,
-     "⛔⛔ A SUCCESSFUL RESPAWN STOPS RETRACTING THE MARKER. The 2-second tick "
-     "respawns any dead slot, so a marker written on one failed spawn outlives "
-     "the retry that fixed it — and if the child's own boot takes longer than "
-     "the 60s grace, worker 1 pauses every ongoing run of a worker that is "
-     "mid-boot, whose rehydration then skips them because they are no longer "
-     "ongoing",
-     [(X_RETRACT, "                            new_state[\"watchdog_window\"]")]),
+    # ── Z: round two of cross-verify — the repairs that cancelled ─────────
+    ("Z1", "under", RESEARCH,
+     "⛔⛔ THE DEADLOCK, RESTORED — the refusal goes back to `lastError` alone. "
+     "On the two TERMINAL recovery statuses the status is deliberately not "
+     "moved, so the card (which cannot read a stale `lastError`) never changes, "
+     "and the chat's 45-second fallback stamps 'your computer didn't pick this "
+     "up' over a refusal that can never change — frozen, beside a Resume that "
+     "cannot work. Worse than what it replaced",
+     [(Z_FIELD, '        "_unread": reason,')]),
+
+    ("Z2", "over", RESEARCH,
+     "⛔⛔ THE SUPERVISOR RETRACTS AGAIN. `_spawn_worker` returns the instant "
+     "`Popen` succeeds — no health check, no poll — so this measures a "
+     "successful FORK, not a live worker: a worker that dies at import has its "
+     "marker cleared about seven seconds after it was written, never reaching "
+     "the reader's sixty-second grace. The rescue is deleted by the code that "
+     "was widening it",
+     [("                            new_state[\"watchdog_window\"] = state.get(\"watchdog_window\", [])",
+       "                            _clear_worker_dead_marker(k)\n"
+       "                            new_state[\"watchdog_window\"] = state.get(\"watchdog_window\", [])")]),
+
+    ("Z3", "over", RESEARCH,
+     "⛔⛔ THE STOP EXIT FAILS THE WRONG WAY. One unreadable read there "
+     "suppresses the ONLY terminal status that exit writes, so a run the person "
+     "stopped sits `ongoing` for ever with Stop and Pause live — and the process "
+     "calls os._exit(0) three seconds later, so nothing corrects it",
+     [(Z_STOPDIR, "                    _fb_uid, _fb_research_id):")]),
+
+    ("Z4", "under", RESEARCH,
+     "⛔ the on-disk arm finds the run id and throws it away again, refusing a "
+     "run it just proved is recoverable and advising a Resume that takes the "
+     "identical branch for ever — a closed loop whose own sentence tells the "
+     "person to keep pressing it",
+     [(Z_REPAIR, "                        backend_run_id = \"\"")]),
+
+    ("Z5", "under", RESEARCH,
+     "⛔ the connect timeout goes back to 3600 with the read. A black-holed SYN "
+     "then fails tens of seconds later rather than at once, past the "
+     "discriminator — and the run's permanent record says the cloud received a "
+     "request that never left the machine",
+     [(Z_TIMEOUT, "                timeout=3600,")]),
+
+    ("Z7", "under", RESEARCH,
+     "⛔ the read-timeout check moves BELOW the connection-error check. "
+     "`ReadTimeout` is a `ConnectionError` subclass in some versions of "
+     "requests, so a request the cloud received and worked on for five minutes "
+     "is filed as one that never left — the order of these checks is "
+     "load-bearing, not incidental",
+     [("    if isinstance(exc, (exc_mod.ReadTimeout, exc_mod.ChunkedEncodingError)):\n"
+       "        return False\n",
+       "")]),
+
+    ("Z6", "under", RESEARCH,
+     "⛔ the exception class stops deciding and the clock decides alone, which "
+     "names the wrong subject: only a sub-second DNS failure lands on the "
+     "honest side, and every other never-left failure is filed as one the cloud "
+     "received",
+     [(Z_CLASS, "    return elapsed_sec < _DRIVE_SENT_AFTER_SEC\n    exc_mod = _rq.exceptions")]),
 ]
 
 

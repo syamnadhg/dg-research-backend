@@ -2685,11 +2685,6 @@ RESUME_DROP_TERMINALLY_STOPPED = (
 )
 
 
-RESUME_DROP_NO_RUN_ID_ON_DISK = (
-    "This run's saved files are still on the computer, but the app lost track "
-    "of which folder they are in. Try Resume once more, or start it again to "
-    "run it fresh."
-)
 RESUME_DROP_WENT_STALE = (
     "Your earlier Resume sat waiting for more than 12 hours because Super "
     "Research wasn't running on the computer, so it was dropped. The run's "
@@ -2741,7 +2736,28 @@ def _resume_drop_writeback(uid: str, research_id: str, reason: str,
     """
     if not uid or not research_id:
         return False
-    updates: dict = {"lastError": reason}
+    # ⛔⛔ ITS OWN FIELD, AND ROUND TWO OF CROSS-VERIFY IS WHY. Round one found
+    # a stale `lastError` — three writers, no deleter — speaking for statuses it
+    # was never written about, so the card was scoped to read it for one status
+    # only. That scoping collided with the terminal guard above: on the two
+    # TERMINAL recovery statuses the status is deliberately not moved, so the
+    # reason landed in a field the card would not read, the card could not
+    # change, and the chat's 45-second fallback then stamped "your computer
+    # didn't pick this up" over a refusal that can never change — FROZEN there,
+    # beside a Resume that cannot work. Three repairs cancelling each other, and
+    # worse than what they replaced.
+    #
+    # ⭐ A DEDICATED FIELD BREAKS THE KNOT. `resumeDropReason` is written by
+    # exactly one function — this one — and means one thing: "the Resume you
+    # just pressed could not be taken, and here is why." The card prefers it for
+    # EVERY recovery status and never reads `lastError` at all, so the stale
+    # field stops mattering without needing a deleter. `resumeDropAt` is what
+    # lets a reader tell this refusal from an older one.
+    updates: dict = {
+        "lastError": reason,
+        "resumeDropReason": reason,
+        "resumeDropAt": int(time.time() * 1000),
+    }
     if status and not _research_is_terminal(uid, research_id):
         updates["status"] = status
     return _update_research_doc(uid, research_id, updates)
@@ -2773,26 +2789,35 @@ def _run_dir_owning_research(research_id: str):
     return None
 
 
-def _research_is_terminal(uid: str, research_id: str) -> bool:
+def _research_is_terminal(uid: str, research_id: str, *, on_error: bool = True) -> bool:
     """Is this run already over, according to the document?
 
-    ⚠ FAILS CLOSED, and that is the cheap direction here. An unreadable
-    document is treated as terminal, so the worst case is a sentence written
-    without a status change — the person still learns why their Resume went
-    nowhere. The other direction demotes a finished run, which hands the
-    listing page a Stop button that overwrites the record.
+    ⛔⛔ THE FAILURE DIRECTION IS THE CALLER'S TO CHOOSE, and round two of
+    cross-verify is why. The first version always failed CLOSED — an unreadable
+    document read as terminal — reasoning that the worst case is a sentence
+    written without a status change. That is true at `_resume_drop_writeback`
+    and INVERTED at `run_pipeline`'s stop exit, where this guard suppresses the
+    ONLY terminal status that exit writes: one failed read there leaves a run
+    the person stopped sitting `ongoing` for ever, with Stop and Pause live on
+    it, and the process calls `os._exit(0)` three seconds later so nothing
+    corrects it. Reachable from the local HTTP /stop endpoint, which closes the
+    browser inline and writes no status of its own.
+
+    ⭐ So: True at the write-back (a sentence without a status change costs
+    little), False at the stop exit (overwriting a status we could not read
+    beats leaving a finished run active).
     """
     if not _firebase_db:
-        return True
+        return on_error
     try:
         snap = (_firebase_db.collection("users").document(uid)
                 .collection("researches").document(research_id).get())
     except Exception as _tr_err:
-        log(f"[resume-drop] terminal check failed for {research_id[:8]}… "
-            f"({_tr_err}) — leaving the status alone", "DEBUG")
-        return True
+        log(f"[terminal-check] read failed for {research_id[:8]}… "
+            f"({_tr_err}) — assuming terminal={on_error}", "DEBUG")
+        return on_error
     if not snap.exists:
-        return True
+        return on_error
     return (snap.to_dict() or {}).get("status") in TERMINAL_RESEARCH_STATUSES
 
 
@@ -14126,19 +14151,26 @@ def start_firestore_start_listener(job_queue, loop):
                     # carries nothing. Closing auto-recovery there is permanent
                     # — the status is outside both enqueue whitelists — so we
                     # look on the disk before taking it away.
+                    # ⛔⛔ AND IT USES WHAT IT FOUND. Round two of cross-verify
+                    # caught the first version finding the directory, logging
+                    # it, and then REFUSING anyway with "try Resume once more" —
+                    # a closed loop, because nothing between two presses writes
+                    # `backendRunId` back, so the next press takes the identical
+                    # branch, and the sentence tells the person to keep pressing
+                    # it. The directory's own name IS the missing run id.
                     _orphaned = _run_dir_owning_research(target_rid)
                     if _orphaned is not None:
                         log(f"Resume: {target_rid[:8]}… has no backendRunId but "
-                            f"{_orphaned.name} on disk claims it — recording the "
-                            f"reason without closing recovery", "WARN")
-                        _resume_drop_writeback(target_uid, target_rid,
-                                               RESUME_DROP_NO_RUN_ID_ON_DISK,
-                                               status=None)
+                            f"{_orphaned.name} on disk claims it — repairing the "
+                            f"document and resuming", "WARN")
+                        backend_run_id = _orphaned.name
+                        _update_research_doc(target_uid, target_rid,
+                                             {"backendRunId": backend_run_id})
                     else:
                         _resume_drop_writeback(target_uid, target_rid, RESUME_DROP_NO_RUN_ID)
-                    try: doc.reference.delete()
-                    except Exception: pass
-                    continue
+                        try: doc.reference.delete()
+                        except Exception: pass
+                        continue
                 queue_dir = Path(__file__).parent / "queues" / backend_run_id
                 if not queue_dir.exists():
                     log(f"Resume: queue_dir missing for {backend_run_id} — disk artifacts gone", "WARN")
@@ -16222,6 +16254,36 @@ def _post_fe_phase_notice(uid, research_id, phase, event_type, seq):
 _DRIVE_SENT_AFTER_SEC = 10
 
 
+def _dispatch_never_left(exc: BaseException, elapsed_sec: float) -> bool:
+    """Did the P4/P5 POST fail before the cloud ever had it?
+
+    ⛔⛔ EXTRACTED SO IT CAN BE EXECUTED, and a mutant is why. Inline, the
+    classification could be neutered to `False and isinstance(...)` and every
+    assertion about it stayed green — they were reading the parse tree for the
+    NAMES, which survive. A decision worth making is a decision worth running.
+
+    ⛔ THE CLASS DECIDES, THE CLOCK IS EVIDENCE. `requests` raises
+    ConnectionError/ConnectTimeout when the request never left and ReadTimeout
+    or a reset AFTER the connection when the cloud has it. Elapsed time alone
+    named the wrong subject: a black-holed SYN does not fail instantly, it
+    fails at the OS connect timeout — tens of seconds, past any threshold — so
+    a time-only test filed a request that never left as one the cloud received,
+    in the run's permanent support-bundle record.
+    """
+    try:
+        import requests as _rq
+    except Exception:
+        return elapsed_sec < _DRIVE_SENT_AFTER_SEC
+    exc_mod = _rq.exceptions
+    if isinstance(exc, (exc_mod.ReadTimeout, exc_mod.ChunkedEncodingError)):
+        return False
+    if isinstance(exc, (exc_mod.ConnectTimeout, exc_mod.ProxyError)):
+        return True
+    if isinstance(exc, exc_mod.ConnectionError):
+        return True
+    return elapsed_sec < _DRIVE_SENT_AFTER_SEC
+
+
 def _post_fe_p4p5_trigger(uid, research_id):
     """Option C (#742): drive P4 (YouTube) + P5 (Doc/email) autonomously so a
     run completes even when the chat app is never opened.
@@ -16279,7 +16341,14 @@ def _post_fe_p4p5_trigger(uid, research_id):
                 f"{_FE_BASE_URL}/api/uploadYouTube",
                 headers={"Authorization": f"Bearer {id_token}"},
                 json={"research_id": research_id, "ownerUid": uid},
-                timeout=3600,  # match the route's Cloud Run maxDuration (long podcast encode + upload)
+                # ⛔ A PAIR, NOT A SCALAR. A scalar sets the CONNECT timeout to
+                # 3600 as well, so a black-holed SYN — firewall drop, no route,
+                # VPN down — does not fail fast; it fails tens of seconds later,
+                # past the threshold below, and the record then says the cloud
+                # received a request that never left the machine. Ten seconds
+                # bounds the connect; the read stays matched to the route's
+                # Cloud Run maxDuration (long podcast encode + upload).
+                timeout=(10, 3600),
             )
             # ⛔⛔ EVERY ONE OF THESE LINES USED TO LAND NOWHERE. `log()` copies
             # into the sink that is armed AT WRITE TIME, and by now this run's
@@ -16329,10 +16398,26 @@ def _post_fe_p4p5_trigger(uid, research_id):
             # been open for a while was received and may well be finishing. We
             # do not claim to know which — we say what we saw.
             _elapsed = int(time.monotonic() - _t0)
-            if _elapsed >= _DRIVE_SENT_AFTER_SEC:
+            # ⛔⛔ THE EXCEPTION CLASS DECIDES, AND THE CLOCK IS EVIDENCE — round
+            # two of cross-verify corrected this the other way round. Elapsed
+            # time alone names the wrong subject: `requests` raises
+            # ConnectionError/ConnectTimeout when the request never left, and
+            # ReadTimeout or a reset AFTER the connection when the cloud has it.
+            # Only a sub-second DNS failure landed on the honest side of a
+            # time-only test.
+            _never_left = _dispatch_never_left(_e, _elapsed)
+            if not _never_left and _elapsed >= _DRIVE_SENT_AFTER_SEC:
+                # ⛔ THE CATCH-UP CLAUSE BELONGS HERE TOO. This is now the branch
+                # most late failures take, and "may be finishing it" is right
+                # for the measured 300-second severance and optimistic for a
+                # dropped link, a sleeping laptop or an instance that died at
+                # thirty seconds. Naming what actually recovers the run costs a
+                # clause and covers every one of them.
                 _hl = (f"P4/P5 connection cut after {_elapsed}s ({_e}). The cloud "
                        f"received the request and may be finishing it; this "
-                       f"machine stopped being able to watch.")
+                       f"machine stopped being able to watch. If it did not "
+                       f"finish, the run stays on phase 3 until the chat is "
+                       f"opened and the catch-up fires.")
             else:
                 _hl = (f"P4/P5 dispatch never reached the cloud after {_elapsed}s "
                        f"({_e}). The run stays on phase 3 until the chat is "
@@ -70183,7 +70268,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # listener then CLEARED the card: the person lost the only sentence
             # explaining a ceiling stop, and both its buttons. Before this wave
             # the block wrote no status at all, which is why it never showed.
-            if _fb_uid and _fb_research_id and not _research_is_terminal(_fb_uid, _fb_research_id):
+            if _fb_uid and _fb_research_id and not _research_is_terminal(
+                    _fb_uid, _fb_research_id, on_error=False):
                 _update_firestore_research({"status": "stopped", "phase": last_phase})
             else:
                 log("STOP: the run already carries a terminal status — "
@@ -79202,10 +79288,10 @@ def run_daemon_loop(port: int = 8000):
             _st = _spawn_worker(k)
             if _st is None:
                 _write_worker_dead_marker(k, reason="spawn_failed_at_boot")
-            else:
-                # A worker that came up owns its runs again — drop any marker a
-                # previous boot's failure left behind before worker 1 acts on it.
-                _clear_worker_dead_marker(k)
+            # ⛔ AND ABSOLUTELY NOT AT BOOT. A marker left by the PREVIOUS
+            # supervisor session is the whole reason the mechanism exists;
+            # wiping it milliseconds into a restart is how the runs it was
+            # written about stay frozen for ever.
             workers[k] = _st or {"_dead": True}
 
         try:
@@ -79242,18 +79328,18 @@ def run_daemon_loop(port: int = 8000):
                         _time.sleep(2)
                         new_state = _spawn_worker(k)
                         if new_state is not None:
-                            # ⛔⛔ THE MARKER IS RETRACTED HERE TOO, not only by
-                            # the child's own boot. Cross-verify caught the gap:
-                            # the 2-second tick respawns any slot that is None
-                            # or `_dead`, so a marker written on a single failed
-                            # spawn survives a SUCCESSFUL retry until the child
-                            # reaches its own `--serve` boot — well past Firebase
-                            # init. If that exceeds the 60-second grace and
-                            # worker 1's reconcile tick lands in the window, it
-                            # pauses every ongoing run of a worker that is
-                            # mid-boot, and that worker's own rehydration then
-                            # skips them because they are no longer ongoing.
-                            _clear_worker_dead_marker(k)
+                            # ⛔⛔ NO RETRACTION HERE — round two of cross-verify
+                            # reversed this, and the reversal is the point.
+                            # `_spawn_worker` returns the instant `Popen`
+                            # succeeds: no health check, no poll, no port probe
+                            # after launch. So retracting here measures a
+                            # successful FORK, not a live worker — and a worker
+                            # that dies at import had its marker cleared about
+                            # seven seconds after it was written, never reaching
+                            # the reader's 60-second grace. The repair removed
+                            # the very rescue it was widening. The child's own
+                            # `--serve` boot is the one honest retraction, and
+                            # it is already there.
                             new_state["watchdog_window"] = state.get("watchdog_window", [])
                             workers[k] = new_state
                         else:
@@ -79393,9 +79479,9 @@ def run_daemon_loop(port: int = 8000):
                         new_state["keystore_wiped"] = state["keystore_wiped"]
                         new_state["restarts"] = state["restarts"]
                         new_state["watchdog_window"] = state.get("watchdog_window", [])  # (#717)
-                        # Same retraction as the watchdog respawn above: a
-                        # successful retry outranks the marker its failure wrote.
-                        _clear_worker_dead_marker(k)
+                        # No retraction here either — see the note on the
+                        # watchdog respawn above. A `Popen` that returned is not
+                        # a worker that is running.
                         workers[k] = new_state
                     else:
                         # ⛔ The last of the three. A crash we were willing to
