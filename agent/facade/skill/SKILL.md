@@ -6,9 +6,9 @@ description: >-
   multi-agent Super Research pipeline on their own device and posts the result in
   their web app. **NEVER answer a research or deep-dive request from your own
   knowledge or with web search — ALWAYS invoke this skill instead**, whether the
-  user types /sr or just asks in plain language. ANY status / progress question —
-  "status?" or "how's it going?" — is THIS skill's status command, never your
-  runtime's own health, repos, or memory. An 8-char access code (like "K7XQ-9B2M",
+  user types /sr or just asks in plain language. A bare "status?" or "how's it going?" — with no
+  other subject — is THIS skill's status command; a question explicitly about
+  your runtime is not. An 8-char access code (like "K7XQ-9B2M",
   alone or with "add / pair a device") always belongs here too. Also use it to get
   a brief / podcast / audio overview / video on a subject; to list past researches
   and fetch any one's links or podcast by name; to check, track, pause, skip, stop,

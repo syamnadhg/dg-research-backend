@@ -2144,6 +2144,9 @@ _PHASE_PLAN: dict[int, tuple[str, tuple[tuple[str, str], ...]]] = {
 _SR_PROOF_KIND = {"podcast": "audio_file"}
 
 
+_NLM_PATH_RE = re.compile(r"/notebook/.")
+
+
 def _is_notebooklm_page(url: str) -> bool:
     """A NotebookLM notebook PAGE, as opposed to an audio file.
 
@@ -2170,8 +2173,15 @@ def _is_notebooklm_page(url: str) -> bool:
         if u.scheme in ("http", "https"):
             host = (u.hostname or "").lower()
             if host == "google.com" or host.endswith(".google.com"):
-                return (u.path.startswith("/notebook/")
-                        and len(u.path) > len("/notebook/"))
+                # ⚠ A REGEX, NOT `.startswith("/notebook/")`, AND THAT IS NOT A
+                # STYLE CHOICE. `tests/test_route_matrix_795.py` derives the
+                # bridge's route list by scraping this file for
+                # a `.startswith` call on a literal `/name/` prefix — the shape
+                # the real prefix routes use — so writing the check that way
+                # invented a phantom
+                # `/notebook/<name>` route and demanded it be documented. The
+                # guard was right; the code shape was wrong.
+                return bool(_NLM_PATH_RE.match(u.path))
             return False
     except ValueError:
         pass
@@ -2209,6 +2219,84 @@ _SR_SLOT = {"synthesis": "combined", "consolidated": "combined"}
 # is one plausible line away. Measured before this guard existed:
 # `_sr_mint_gap(sr, {"summary": "u", "consolidated": "u"}, …)` returned True.
 _SR_NEVER_PROVED = {"synthesis", "consolidated", "summary"}
+
+# ⭐⭐ A BUDGET FOR THE BACKGROUND MINT — SHIPPED OFF, BY DECISION (owner,
+# 2026-09-21). The watchdog re-checks every run in its 20-row window once a
+# minute; a run whose gap can never close therefore costs one billed
+# POST /api/mintSrLinks per minute, forever. The three known ways to open such a
+# gap are plugged, and the fourth (an unmintable podcast proof) was closed in
+# this same wave — but the hole is structural, not enumerable, so a budget is the
+# only thing that bounds the class rather than its instances.
+#
+# ⛔⛔ AND IT IS OFF UNTIL WE HAVE NUMBERS, because its worst case is worse than
+# the bill. The 🎉 completion banner is posted ONCE and de-duped forever, and its
+# permanent links come from `phaseUpdates`, which is built from `sr` AFTER the
+# mint on that same tick. Suppress the mint on the tick a run completes and the
+# single delivery message a person ever sees ships with a missing Brief or report
+# link, with no later tick to repair it. There is currently NO production
+# measurement of how often the background mint even fires — so the instrumentation
+# below lands first and the switch stays off until the log says what it is worth.
+#
+# ⛔ THE SIGNATURE IS WHAT MAKES IT SAFE. Keyed on (runId, status, phase,
+# updatedAt, completed-phase count) — anything that means the run ADVANCED mints a
+# brand-new key with a full budget, so a completing run always gets its mint. A
+# memo keyed on runId alone is the obvious version and it is the one that breaks
+# the banner.
+#
+# ⛔ `monotonic`, NEVER wall clock: a laptop suspend or an NTP correction would
+# otherwise either collapse the cooldown to nothing or park it for hours.
+_SR_MINT_BUDGET_ENABLED = (os.environ.get("DG_SR_MINT_BUDGET") or "").strip().lower()     in ("1", "true", "yes", "on")
+_SR_MINT_TRIES = 3          # attempts per unchanged run signature
+_SR_MINT_COOLDOWN = 1800.0  # seconds before an exhausted signature may try again
+_SR_MINT_MEMO_MAX = 200
+
+# The approval poll's backoff cursor. In memory by design — see `_device_ask_due`.
+_DEVICE_ASK_CURSOR: "dict[str, float]" = {}
+_DEVICE_ASK_CURSOR_LOCK = threading.Lock()
+
+
+def _sr_mint_signature(run: dict, done: dict) -> tuple:
+    """What has to change before a run earns a fresh mint budget."""
+    return (str(run.get("id") or ""), str(run.get("status") or ""),
+            run.get("phase"), str(run.get("updatedAt") or ""),
+            len([p for p, st in (done or {}).items() if st == "complete"]))
+
+
+_SR_MINT_MEMO: "dict[str, tuple]" = {}   # rid -> (signature, tries, last_monotonic)
+_SR_MINT_MEMO_LOCK = threading.Lock()
+
+
+def _sr_mint_allowed(rid: str, signature: tuple) -> bool:
+    """May the BACKGROUND mint fire for this run right now?
+
+    ⛔ ALWAYS True WHILE THE BUDGET IS OFF, which is the shipped default — the
+    memo is still maintained so the instrumentation can report what it WOULD have
+    done, but nothing is ever suppressed until the switch is thrown.
+
+    ⛔ THE MANUAL PATH IS NEVER GATED. `sr status` force-mints unconditionally, so
+    a person who asks always gets the link even when the background budget for
+    that run is spent. That is what makes a budget acceptable at all.
+    """
+    if not rid:
+        return True
+    now = time.monotonic()
+    with _SR_MINT_MEMO_LOCK:
+        prev = _SR_MINT_MEMO.get(rid)
+        if prev is None or prev[0] != signature:
+            # The run ADVANCED (or we have never seen it) — a fresh budget. This
+            # is the clause that guarantees a completing run still gets its mint,
+            # and therefore that the one completion message keeps its links.
+            _SR_MINT_MEMO[rid] = (signature, 1, now)
+            allowed = True
+        elif prev[1] < _SR_MINT_TRIES or (now - prev[2]) >= _SR_MINT_COOLDOWN:
+            tries = 1 if (now - prev[2]) >= _SR_MINT_COOLDOWN else prev[1] + 1
+            _SR_MINT_MEMO[rid] = (signature, tries, now)
+            allowed = True
+        else:
+            allowed = False
+        while len(_SR_MINT_MEMO) > _SR_MINT_MEMO_MAX:
+            _SR_MINT_MEMO.pop(next(iter(_SR_MINT_MEMO)))
+    return allowed if _SR_MINT_BUDGET_ENABLED else True
 
 
 def _enabled_agents(doc: dict) -> set:
@@ -4128,9 +4216,17 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             #
             # ⛔ THE ORIGIN IS WHAT MAKES IT ANNOUNCEABLE. It names the chat that
             # is waiting; without it there is nowhere to deliver the answer.
-            prefs.set_device_ask({"deviceId": device_id,
-                                  "origin": _clean_origin(ask_body.get("origin")),
-                                  "at": time.time()}, sess.uid)
+            # ⛔ ONLY WHEN A CHAT IS ACTUALLY WAITING. `_clean_origin` returns None
+            # unless BOTH platform and chat_id are present, and with no origin
+            # there is nowhere to deliver the answer — so parking would buy
+            # nothing but a week of web requests against a route nobody reads.
+            # A terminal `agent device ask` lands here and behaves as it always
+            # did. The held-research park next door already gates this way.
+            _ask_origin = _clean_origin(ask_body.get("origin"))
+            if _ask_origin:
+                prefs.set_device_ask({"deviceId": device_id,
+                                      "origin": _ask_origin,
+                                      "at": time.time()}, sess.uid)
             self._json(200, {"ok": True, "deviceId": device_id,
                              "status": body.get("status") or "pending"})
 
@@ -5143,6 +5239,36 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             prefs.clear_held_research()
             self._json(200, {"runId": rid, "queueId": qid, "deviceId": device_id})
 
+        def _device_ask_due(self, device_id: str, asked_at: float) -> bool:
+            """Is this tick one the approval poll should actually spend?
+
+            The ladder: every tick for the first ten minutes (an owner who is
+            right there still gets told within a minute), then every five to the
+            first hour, then every half hour. ~354 requests over seven days
+            instead of ~10,080, with the common case unchanged.
+
+            ⛔ THE CURSOR IS IN MEMORY, ON PURPOSE. Persisting it would mean a
+            prefs.json write per poll, and `prefs.save()` is a mkstemp +
+            os.replace that this same file records a truncated-write incident
+            against — raising its write frequency to save web requests is a bad
+            trade. A bridge restart simply re-opens the ladder at the top, which
+            costs a handful of extra requests and never a missed announce.
+
+            ⛔ AGE IS THE ASK'S OWN, NOT THIS PROCESS'S, so a restart cannot walk
+            a week-old ask back to one-a-minute forever.
+            """
+            now = time.monotonic()
+            age = max(0.0, time.time() - asked_at) if asked_at else 0.0
+            interval = 0.0 if age < 600 else (300.0 if age < 3600 else 1800.0)
+            with _DEVICE_ASK_CURSOR_LOCK:
+                last = _DEVICE_ASK_CURSOR.get(device_id)
+                if last is not None and (now - last) < interval:
+                    return False
+                _DEVICE_ASK_CURSOR[device_id] = now
+                while len(_DEVICE_ASK_CURSOR) > 50:
+                    _DEVICE_ASK_CURSOR.pop(next(iter(_DEVICE_ASK_CURSOR)))
+            return True
+
         def _device_access_note(self, out: dict, sess, fs, want_platform: str,
                                 want_chat: str, scope_chat: bool) -> None:
             """Did the public computer this account asked for come through?
@@ -5182,6 +5308,28 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 # announce — same rule the sign-in note follows.
                 return
             device_id = str(ask.get("deviceId") or "")
+            # ⭐⭐ A LADDER, NOT A CAP — AND BELOW THE SCOPE CHECK, DELIBERATELY.
+            # Once an ask is pending this issued one web request per tick for the
+            # full seven-day TTL: ~10,080 for a single unanswered request, each
+            # amplifying to roughly four Firestore ops inside a serverless
+            # handler. Rate-limit safe (5 of a 60-per-5-minute budget) but about
+            # thirty times more than the job needs. Its sibling
+            # `_support_log_note` got `_BUNDLE_WATCH_SECONDS` in the same commit;
+            # this one got nothing.
+            #
+            # ⛔ A HARD CAP WAS THE WRONG SHAPE and was rejected: a wall-clock
+            # deadline burns while the host is asleep, so an ask made Friday and
+            # approved Saturday is NEVER announced on a laptop reopened Monday.
+            # Today it is. That is a product regression dressed as a cost fix. The
+            # ladder only ever DELAYS the notice — most approvals are still seen
+            # within a minute, and the worst case settles at half an hour.
+            #
+            # ⛔ AND IT SITS BELOW THE SCOPE CHECK. Above it, a non-matching chat's
+            # tick would spend the interval and starve the watchdog that actually
+            # owns the ask — on a host with several armed chats that is an
+            # announce delayed indefinitely rather than by thirty minutes.
+            if not self._device_ask_due(device_id, float(ask.get("at") or 0)):
+                return
             status, body = _fe_api_get(sess, "/api/devices/access-request")
             if status != 200 or not isinstance(body, dict):
                 # ⛔ SILENT. This runs every tick; a route having a bad minute
@@ -5569,7 +5717,21 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 if via_agent:
                     done = _completed_phases(r)
                     if _sr_mint_gap(sr, _platform_links(r), done, _enabled_agents(r)):
-                        fresh = _mint_sr(sess, r.get("id"), r.get("title") or r.get("topic") or "")
+                        # ⭐⭐ THE MEASUREMENT THAT DOES NOT EXIST YET. Nothing anywhere
+                        # records how often this fires, which is why the budget above
+                        # ships off: we would be tuning a cooldown against a guess.
+                        # One INFO line per actual mint cannot change behaviour and
+                        # turns "is this loop real in production?" into a grep.
+                        _rid = str(r.get("id") or "")
+                        _gapped = sorted(
+                            src[3:] for p, st in (done or {}).items() if st == "complete"
+                            for _lbl, src in _PHASE_PLAN.get(p, ("", ()))[1]
+                            if src.startswith("sr:") and src[3:] not in sr)
+                        _allowed = _sr_mint_allowed(_rid, _sr_mint_signature(r, done))
+                        log.info("sr-mint gap on %s: missing=%s budget=%s",
+                                 _rid, ",".join(_gapped) or "-",
+                                 "allowed" if _allowed else "SPENT")
+                        fresh = _mint_sr(sess, r.get("id"), r.get("title") or r.get("topic") or "") if _allowed else None
                         if fresh:
                             sr = {**sr, **fresh}
                     phase_updates = _phase_updates(r, sr)
