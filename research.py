@@ -2624,6 +2624,55 @@ def _resolve_run_submitter(tree_uid, claimed_by) -> "tuple[str | None, str]":
     return None, "disputed"
 
 
+def _owner_control_refused(data, where: str) -> bool:
+    """True when a queue doc names SOMEBODY ELSE'S run and its writer is not
+    the device owner. Logs the reason.
+
+    ⛔⛔ THE HOLE THIS CLOSES, FOUND 2026-09-21. The Firestore rule pinned
+    `submittedBy` — the field this listener does NOT act on — and left `uid`
+    free, which is the one it reads to decide whose tree to write into and
+    whose run to stop. The identity guard that would have caught the divergence
+    is scoped to `action == "start"`, below the line that skips every other
+    action. So one client write let any member of a shared computer cancel,
+    purge or force-resume another member's run, and the victim's chat said
+    "Stopped by the device owner" — false, and unattributed. A cancel carrying
+    `ownerControl` additionally sets `cancelled: True`, which drives the web's
+    delete-on-close cascade, so the research went with it.
+
+    ⭐ THE DIVERGENCE ITSELF IS A REAL FEATURE AND STAYS. It is exactly how the
+    owner's "Shared with" popup stops a sharer's run — the web writes
+    `uid=<sharer>, submittedBy=<owner>` on purpose. What changes is WHO may do
+    it: the paired owner of this machine, and nobody else.
+
+    ⭐⭐ AND IT IS HERE AS WELL AS IN THE RULES BECAUSE THE RULES DEPLOY
+    SEPARATELY FROM THE CODE. A rule is one command and a wheel is a release;
+    the two are never in step, and this listener is the thing that acts.
+
+    ⛔ ABSENT IS NOT DISAGREEING, as with the start-doc guard: a doc naming no
+    writer is a legacy shape and is left alone.
+    """
+    # ⭐ THE DISAGREEMENT IS DEFINED ONCE, and this reuses it rather than
+    # restating it — the file's own note beside that helper says why ("one
+    # definition, two claim sites"), and a second copy of the same two lines
+    # also made another harness's anchor match twice, which the sweep caught.
+    # What differs here is only WHO is allowed to disagree.
+    conflict = _start_doc_identity_conflict(data)
+    if conflict is None:
+        return False
+    uid, claimed = conflict
+    owner = ""
+    try:
+        owner = str(load_paired_uid() or "").strip()
+    except Exception:
+        owner = ""
+    if owner and claimed == owner:
+        return False
+    log(f"[{where}] refusing {(data or {}).get('action', '?')} — it names "
+        f"another person's run (uid={uid[:8]}…) and its writer "
+        f"(submittedBy={claimed[:8]}…) is not this machine's owner", "WARN")
+    return True
+
+
 def _start_doc_identity_conflict(data) -> "tuple[str, str] | None":
     """(tree uid, pinned writer) when a queue START doc's two identities
     disagree, else None.
@@ -13806,6 +13855,10 @@ def start_firestore_start_listener(job_queue, loop):
             # actively-running job is handled by its own per-run command
             # listener, not here.
             if action == "cancel":
+                if _owner_control_refused(data, "start-listener"):
+                    try: doc.reference.delete()
+                    except Exception: pass
+                    continue
                 target_rid = data.get("researchId", "")
                 target_uid = data.get("uid", "")
                 # 2026-05-28: owner-initiated stop/cancel of a SHARER's run
@@ -14098,6 +14151,10 @@ def start_firestore_start_listener(job_queue, loop):
             # is a fresh daemon process), so the token-queue is the only path
             # that re-enqueues the job from disk artifacts.
             if action == "resume":
+                if _owner_control_refused(data, "start-listener"):
+                    try: doc.reference.delete()
+                    except Exception: pass
+                    continue
                 target_uid = data.get("uid", "")
                 target_rid = data.get("researchId", "")
                 if not target_uid or not target_rid:
