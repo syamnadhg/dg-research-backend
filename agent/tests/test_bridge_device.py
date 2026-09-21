@@ -1498,3 +1498,53 @@ def test_a_refusal_still_clears_the_ask_immediately():
     head = body[:body.index("usable = pair_state_usable(row)")]
     assert "prefs.clear_device_ask()" in head, (
         "the not-a-member branch must clear the ask inline — it announces nothing")
+
+
+
+# ── the one forever-loop that was reachable today ────────────────────────────
+
+def test_a_podcast_proof_the_app_will_not_accept_does_not_open_a_gap():
+    """⭐⭐ A LIVE BILLED LOOP, NOT A HYPOTHETICAL. `_SR_PROOF_KIND` proves a
+    podcast share ought to exist from the mere presence of `links.audio_file` —
+    but the web app refuses to mint one when that url is a NotebookLM notebook
+    PAGE rather than a media file (p5-handlers.ts `isNlmPage`). On such a run the
+    agent saw a gap the app would never close and re-issued a billed
+    POST /api/mintSrLinks on every status poll, for the life of the run.
+
+    ⛔ NO LITERAL SET COULD HAVE CAUGHT THIS ONE, which is why it matters. The
+    three earlier instances of this loop were each fixed by widening a hand-kept
+    set of doc types; here the doc type IS mintable in general and it is THIS
+    run's url shape that makes it impossible. The fix has to be the app's own
+    shape test, not another name.
+    """
+    sr = {"brief": "u", "chatgpt": "u", "gemini": "u", "claude": "u"}
+    done = {1: "complete", 2: "complete", 3: "complete"}
+    agents = {"chatgpt", "gemini", "claude"}
+    nlm = {"audio_file": "https://notebooklm.google.com/notebook/abc123"}
+    assert bridge._sr_mint_gap(sr, nlm, done, agents) is False
+
+    # ⛔ NEGATIVE CONTROL — A REAL AUDIO FILE STILL OPENS THE GAP. Without this
+    # the fix could be "never mint a podcast", which would silently cost every
+    # run its podcast link and pass the assertion above.
+    real = {"audio_file": "https://storage.googleapis.com/sr/run/audio.mp3"}
+    assert bridge._sr_mint_gap(sr, real, done, agents) is True
+
+
+def test_the_agent_and_the_app_agree_on_what_a_notebook_page_is():
+    """⛔ TWO ANSWERS TO ONE QUESTION IS HOW THE LOOP COMES BACK. The predicate
+    mirrors `isNotebookLmPageUrl` (pipelineConfigDerive.ts), including its
+    fallback substring probe — callers pass free-form ERROR TEXT that merely
+    contains such a link, and reporting False for that would reopen the loop for
+    exactly the failed runs most likely to be in this state."""
+    yes = ["https://notebooklm.google.com/notebook/abc",
+           "https://google.com/notebook/x",
+           "P3 failed: see https://notebooklm.google.com/notebook/zz"]
+    no = ["https://storage.googleapis.com/a/b.mp3",
+          "https://notebooklm.google.com/",          # no notebook id
+          "https://evil.example.com/notebook/abc",   # wrong host
+          "ftp://google.com/notebook/abc",           # wrong scheme
+          "", None]
+    for u in yes:
+        assert bridge._is_notebooklm_page(u) is True, u
+    for u in no:
+        assert bridge._is_notebooklm_page(u) is False, u

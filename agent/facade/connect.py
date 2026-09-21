@@ -27,9 +27,15 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+
+try:
+    import fcntl  # POSIX advisory file lock. The Hermes host is always POSIX;
+except ImportError:  # None elsewhere (Windows, which this repo treats as
+    fcntl = None     # production) → the identical unlocked write it does today.
 
 # ── runtime profiles ─────────────────────────────────────────────────────────
 # Everything that differs between chat runtimes, in ONE place — so connect / cli /
@@ -693,6 +699,77 @@ def _stream_jobs_present(jobs_file: Path) -> bool | None:
     return any(_is_stream_job(j) for j in jobs)
 
 
+class _JobsLock:
+    """The advisory lock every other writer of Hermes' jobs.json already takes.
+
+    ⛔⛔ WITHOUT IT, A WHOLE-FILE REWRITE DROPS A NEIGHBOUR'S JOB. Both callers
+    below read jobs.json, filter it and replace it; a gateway save landing in
+    between is discarded, deleting whatever it had just written — possibly
+    another skill's cron entry. The confirm-read afterwards notices only whether
+    OUR removal survived; it is blind to somebody else's addition vanishing. This
+    is the one place Super Research can damage a neighbouring skill's state, and
+    the product already knows the rule: sr.py and sr_attention_poll.py both take
+    this same lock on this same file.
+
+    ⛔⛔ NON-BLOCKING, UNLIKE sr.py's. That difference is the whole reason this is
+    a separate helper rather than a lift-and-shift. `_sweep_orphan_stream_crons`
+    runs inside `connect`, and `selfupdate` spawns a detached
+    `connect --yes --no-login` AFTER the bridge has already shut down — so a
+    blocking `LOCK_EX` here means a bridge that never comes back and a chat that
+    is dead until the next login. sr.py's equivalent stall costs one slow command;
+    this one costs the agent. We try briefly, then proceed unlocked, which is
+    exactly today's behaviour and therefore cannot be a regression.
+
+    ⛔ POSIX ONLY, BY THE SAME GUARD THE SIBLINGS USE. `fcntl` does not exist on
+    Windows, which this repo treats as production — there the lock is a no-op and
+    the write takes the identical unlocked path it takes today.
+
+    ⛔ AND IT DOES NOT CREATE THE DIRECTORY. sr.py may `mkdir` the cron dir
+    because it runs inside a Hermes that owns that tree; `connect` must never
+    materialise a `cron/` dir in a runtime home that never had one.
+    """
+
+    def __init__(self, jobs_file: Path):
+        self._path = jobs_file.parent / ".jobs.lock"
+        self._fd = None
+        self.held = False
+
+    def __enter__(self):
+        if fcntl is None or not self._path.parent.is_dir():
+            return self
+        try:
+            self._fd = open(self._path, "a+")
+        except OSError:
+            return self
+        # Bounded: ~0.5s total. Long enough to clear a neighbour mid-write,
+        # far short of anything a person or a self-update waiter would notice.
+        for _ in range(10):
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.held = True
+                return self
+            except OSError:
+                time.sleep(0.05)
+        # ⛔ NO LOG LINE AND NO FAILURE. connect.py has no logger by design (it
+        # speaks to a person through the branded step output, not to a file), and
+        # a lock we could not take is not an error — it is today's behaviour,
+        # which shipped for two months without this class existing at all.
+        return self
+
+    def __exit__(self, *exc):
+        if self._fd is not None:
+            try:
+                if self.held:
+                    fcntl.flock(self._fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                self._fd.close()
+            except OSError:
+                pass
+        return False
+
+
 def _remove_stream_cron(home: Path | None) -> bool:
     """Remove the watchdog cron jobs from the runtime's cron/jobs.json so they
     stop firing (and erroring on the now-removed scripts) after disconnect —
@@ -713,21 +790,34 @@ def _remove_stream_cron(home: Path | None) -> bool:
     jobs_file = (home or Path.home()) / ".hermes" / "cron" / "jobs.json"
     if not jobs_file.is_file():
         return True  # no jobs file → nothing references the watchdog script
-    present = _stream_jobs_present(jobs_file)
-    if present is None:
-        return False  # can't read/parse → can't confirm; keep the script to be safe
-    if not present:
-        return True  # already clean
-    try:
-        data = json.loads(jobs_file.read_text("utf-8"))
-        data["jobs"] = [j for j in data.get("jobs", []) if not _is_stream_job(j)]
-        tmp = jobs_file.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data), "utf-8")
-        os.replace(tmp, jobs_file)
-    except (OSError, ValueError):
-        return False
-    # Confirm the removal stuck (a racing gateway save could have re-added it).
-    return _stream_jobs_present(jobs_file) is False
+    # ⛔ ACQUIRED ONCE, OUTERMOST, AND HELD ACROSS THE CONFIRM READ. flock is
+    # per open-file-description, so a second open+flock on this file from THIS
+    # process would block against itself forever — `_stream_jobs_present` is
+    # called twice below and must stay lock-free.
+    with _JobsLock(jobs_file):
+        present = _stream_jobs_present(jobs_file)
+        if present is None:
+            return False  # can't read/parse → can't confirm; keep the script
+        if not present:
+            return True  # already clean
+        try:
+            data = json.loads(jobs_file.read_text("utf-8"))
+            data["jobs"] = [j for j in data.get("jobs", []) if not _is_stream_job(j)]
+            # ⛔⛔ PER-PID, BECAUSE A SHARED TEMP NAME IS A SHARED BUFFER. Two
+            # processes writing `jobs.json.tmp` at once interleave into one file and
+            # whichever wins the `os.replace` publishes a hybrid — which for this file
+            # means every cron job on the host, including other skills', replaced by
+            # garbage in a single step. Not hypothetical here: `selfupdate` spawns a
+            # detached `connect --yes --no-login` while a person may be running
+            # `agent disconnect` by hand. sr.py has used a per-pid name for this exact
+            # file since it learned the same lesson (sr.py:930).
+            tmp = jobs_file.with_suffix(".json.tmp.%d" % os.getpid())
+            tmp.write_text(json.dumps(data), "utf-8")
+            os.replace(tmp, jobs_file)
+        except (OSError, ValueError):
+            return False
+        # Confirm the removal stuck (a racing gateway save could have re-added it).
+        return _stream_jobs_present(jobs_file) is False
 
 
 def _sweep_orphan_stream_crons(home: Path | None) -> int:
@@ -744,34 +834,47 @@ def _sweep_orphan_stream_crons(home: Path | None) -> int:
     best-effort; returns the number of orphans removed."""
     jobs_file = (home or Path.home()) / ".hermes" / "cron" / "jobs.json"
     scripts = hermes_scripts_dir(home)
-    try:
-        data = json.loads(jobs_file.read_text("utf-8"))
-    except (OSError, ValueError):
-        return 0
-    jobs = data.get("jobs") if isinstance(data, dict) else None
-    if not isinstance(jobs, list):
-        return 0
+    # ⛔ THE LOCK SPANS THE READ *AND* THE WRITE, or it buys nothing: the race
+    # is a gateway save landing between them. Non-blocking by design — this runs
+    # inside `connect`, which the detached self-update waiter must complete for a
+    # bridge to come back, so a stall here is a dead agent rather than a slow one.
+    with _JobsLock(jobs_file):
+        try:
+            data = json.loads(jobs_file.read_text("utf-8"))
+        except (OSError, ValueError):
+            return 0
+        jobs = data.get("jobs") if isinstance(data, dict) else None
+        if not isinstance(jobs, list):
+            return 0
 
-    def _is_orphan_shim_job(job: object) -> bool:
-        if not isinstance(job, dict):
-            return False
-        script = job.get("script")
-        if not (isinstance(script, str) and _POLL_SHIM_RE.fullmatch(script)):
-            return False
-        return not (scripts / script).is_file()  # shim gone → orphan
+        def _is_orphan_shim_job(job: object) -> bool:
+            if not isinstance(job, dict):
+                return False
+            script = job.get("script")
+            if not (isinstance(script, str) and _POLL_SHIM_RE.fullmatch(script)):
+                return False
+            return not (scripts / script).is_file()  # shim gone → orphan
 
-    kept = [j for j in jobs if not _is_orphan_shim_job(j)]
-    removed = len(jobs) - len(kept)
-    if not removed:
-        return 0
-    data["jobs"] = kept
-    try:
-        tmp = jobs_file.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data), "utf-8")
-        os.replace(tmp, jobs_file)
-    except OSError:
-        return 0
-    return removed
+        kept = [j for j in jobs if not _is_orphan_shim_job(j)]
+        removed = len(jobs) - len(kept)
+        if not removed:
+            return 0
+        data["jobs"] = kept
+        try:
+            # ⛔⛔ PER-PID, BECAUSE A SHARED TEMP NAME IS A SHARED BUFFER. Two
+            # processes writing `jobs.json.tmp` at once interleave into one file and
+            # whichever wins the `os.replace` publishes a hybrid — which for this file
+            # means every cron job on the host, including other skills', replaced by
+            # garbage in a single step. Not hypothetical here: `selfupdate` spawns a
+            # detached `connect --yes --no-login` while a person may be running
+            # `agent disconnect` by hand. sr.py has used a per-pid name for this exact
+            # file since it learned the same lesson (sr.py:930).
+            tmp = jobs_file.with_suffix(".json.tmp.%d" % os.getpid())
+            tmp.write_text(json.dumps(data), "utf-8")
+            os.replace(tmp, jobs_file)
+        except OSError:
+            return 0
+        return removed
 
 
 def _normalize_modes(target: Path) -> None:

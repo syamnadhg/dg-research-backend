@@ -28,3 +28,19 @@ session.json
 # wheel ships only sr.py + sr_attention_poll.py; see pyproject package-data).
 facade/skill/scripts/sr_poll_*.py
 facade/skill/scripts/.sr_*.json
+
+# ⛔⛔ RUNTIME STATE THIS PACKAGE WRITES INTO ITS OWN TREE WHEN RUN FROM A
+# CHECKOUT. All four were sitting here untracked and unignored, so a single
+# `git add -A` would have committed them — and two of them carry real content:
+# `prefs.json` holds the signed-in ACCOUNT's label, install id and runtime, and
+# `bridge_launcher.py` is generated with an absolute pipx path from whoever ran
+# it (a `/home/<user>/...` string, useless and identifying on any other machine).
+# `podcasts/` is downloaded media and `.version_check.json` is a PyPI-poll cache.
+#
+# ⛔ NONE OF THESE BELONG TO THE PACKAGE. The published wheel ships from
+# pyproject's explicit file list, so ignoring them cannot affect what is built —
+# it only stops the repo swallowing a developer's own account state.
+prefs.json
+bridge_launcher.py
+.version_check.json
+podcasts/

@@ -2143,6 +2143,41 @@ _PHASE_PLAN: dict[int, tuple[str, tuple[tuple[str, str], ...]]] = {
 # per-link proof used to answer by accident.
 _SR_PROOF_KIND = {"podcast": "audio_file"}
 
+
+def _is_notebooklm_page(url: str) -> bool:
+    """A NotebookLM notebook PAGE, as opposed to an audio file.
+
+    ⭐⭐ THE ONE FOREVER-LOOP THAT IS REACHABLE TODAY. `_SR_PROOF_KIND` proves a
+    podcast share OUGHT to exist from the mere presence of `links.audio_file` —
+    but the web app refuses to mint one when that url is a notebook page rather
+    than a media file (p5-handlers.ts `isNlmPage`). So on a run whose `audio_file`
+    holds an NLM page, the agent sees a gap the app will never close and re-issues
+    a billed POST /api/mintSrLinks on every status poll, for the life of the run.
+    No literal set can catch this one: the doc type IS mintable in general, it is
+    this run's url shape that makes it impossible.
+
+    ⛔ THE SAME SHAPE TEST AS THE APP, deliberately — two answers to "is this a
+    notebook page" is how the loop comes back. Mirrors `isNotebookLmPageUrl`
+    (pipelineConfigDerive.ts): an http(s) google.com host with a non-empty
+    /notebook/ path, falling back to a substring probe for free-form text that
+    merely CONTAINS such a link, because callers pass error strings here too.
+    """
+    raw = str(url or "").strip()
+    if not raw:
+        return False
+    try:
+        u = urlsplit(raw)
+        if u.scheme in ("http", "https"):
+            host = (u.hostname or "").lower()
+            if host == "google.com" or host.endswith(".google.com"):
+                return (u.path.startswith("/notebook/")
+                        and len(u.path) > len("/notebook/"))
+            return False
+    except ValueError:
+        pass
+    return bool(re.search(r"\bnotebook(?:lm)?\.google\.com/notebook/[^\s/]",
+                          raw, re.I))
+
 # Document kinds whose existence a COMPLETE phase proves on its own — no
 # platform link required, because the phase's own completion gate is the
 # markdown reaching Firestore.
@@ -2241,6 +2276,12 @@ def _sr_mint_gap(sr_links: dict, platform: dict, done: dict, enabled: set | None
                 if dt == "brief" or dt in enabled:
                     return True
             elif _SR_PROOF_KIND.get(dt, dt) in platform:
+                # ⛔ A PROOF THE APP WILL NOT ACCEPT IS NOT A PROOF. The podcast's
+                # evidence is `links.audio_file`, and the app declines to mint from
+                # one holding a notebook PAGE — so treating its presence as a gap
+                # asks for a mint that can never succeed, once a minute, forever.
+                if dt == "podcast" and _is_notebooklm_page(platform.get("audio_file")):
+                    continue
                 return True
     return False
 
