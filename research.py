@@ -4560,14 +4560,35 @@ def _serve_boot_preview(port: int) -> None:
 # section. This used to be six `log("  GET  /api/runs …")` calls inside the
 # serve boot path, which put a static reference through the timestamped logger
 # on every start. A reference belongs on the reference surface.
+#
+# ⛔⛔ TWO OF THESE ROWS DESCRIBED ROUTES DELETED ON 2026-04-29 — `GET
+# /api/runs/{id}/events` and `WS /ws/{run_id}` — and `--help` went on
+# advertising them for five months. Nothing could notice: the only test asked
+# whether each row appeared in the rendered output, which is a question about
+# the renderer, not about the API. `test_help_advertises_no_route_that_was_deleted`
+# now asks the source, so a deleted route takes its reference row with it.
 _LOCAL_API_ROUTES: "tuple[tuple[str, str], ...]" = (
     ("GET  /api/runs",                      "List all runs"),
     ("POST /api/runs",                      "Start a new run {topic, email}"),
     ("GET  /api/runs/{id}",                 "Run details + meta"),
     ("GET  /api/runs/{id}/documents/{type}", "Document content (brief/chatgpt/gemini/claude)"),
-    ("GET  /api/runs/{id}/events",          "Progress events"),
-    ("WS   /ws/{run_id}",                   "Real-time event stream"),
+    ("GET  /api/runs/{id}/audio/{filename}", "Podcast audio for a finished run"),
+    ("POST /api/runs/{id}/stop",            "Stop a run (terminal) and exit the backend"),
+    ("POST /api/runs/{id}/pause",           "Pause at the next checkpoint (resumable)"),
+    ("POST /api/runs/{id}/resume",          "Resume a paused run"),
+    ("POST /api/runs/{id}/feedback",        "Save feedback for a phase and pause to redo it"),
+    ("POST /api/runs/{id}/add_context",     "Add context mid-run (Phase 1 only)"),
+    ("PATCH /api/runs/{id}/config",         "Update pipeline config mid-run"),
+    ("DELETE /api/runs/{id}",               "Delete a run's queue dir (destructive)"),
+    ("GET  /api/queue",                     "Queue status: running + pending count"),
+    ("GET  /api/health",                    "Liveness + heartbeat counters (no token needed)"),
 )
+# ⛔⛔ AND IT IS CHECKED IN BOTH DIRECTIONS, because one direction is how the
+# phantom rows survived. `test_help_advertises_no_route_that_was_deleted` asks
+# that every row here still exists; `test_help_advertises_every_route_that_does`
+# asks that every route is listed. Without the second, a fifteenth route is
+# gated by the middleware and invisible on the only surface that describes the
+# API — and DELETE, the one route that destroys data, was exactly that.
 
 
 def _setup_step(n: int, total: int, title: str):
@@ -70721,12 +70742,42 @@ async def run_server(port=8000):
     _exit_scheduled = False
 
     app = FastAPI(title="Research Pipeline API")
-    # ⛔⛔ NOT `allow_origins=["*"]` ANY MORE. This API has no authentication of any
-    # kind: `GET /api/runs` returns every run folder on the machine across every
-    # account that shares it, `/documents/{type}` and `/audio/{name}` serve the
-    # report bodies and the podcasts, and `POST /api/runs` starts a run taking the
-    # `uid` FROM THE REQUEST BODY. A wildcard origin means any page a person
-    # visits, in any tab, can read and drive all of it.
+
+    # ── The caller check. Wave 10.5, and it is the thing the two comments
+    # below used to say was missing ──────────────────────────────────────────
+    # ⛔⛔ UNTIL NOW THIS API AUTHENTICATED NOBODY. Loopback binding narrowed
+    # WHO could reach it to this machine; every route still served whoever
+    # asked. `GET /api/runs` returned every run folder on the machine across
+    # every account that shares it, `/documents/{type}` and `/audio/{name}`
+    # served the report bodies and the podcasts, `DELETE` removed them, and
+    # `POST /api/runs` started a run billing the `uid` IT WAS HANDED IN THE
+    # BODY. Open since 2026-08-31; skipped by two waves.
+    #
+    # ⭐ ONE GATE AT THE ASGI LAYER, NOT A DECORATOR PER ROUTE. There are
+    # fourteen routes below and a route is protected by EXISTING, so the
+    # fifteenth is covered the day it is written. `/api/health` is the only
+    # exemption and `auth/serve_token.py` holds the reason.
+    #
+    # ⛔ THE TOKEN MUST EXIST BEFORE THE FIRST REQUEST CAN BE ANSWERED, and
+    # `ensure_token` is the exclusive-create that settles which of the N
+    # workers mints it.
+    from auth.serve_token import ServeTokenMiddleware, ensure_token, token_path
+    try:
+        ensure_token()
+    except Exception as _te:
+        # ⛔ FAIL CLOSED, LOUDLY. The middleware refuses everything without a
+        # readable token, so serving on is safe — but say why, or the operator
+        # sees only blanket 401s from a backend that boots perfectly.
+        log(f"[serve] local API token unavailable ({_te}) — every request "
+            f"except /api/health will be refused until {token_path()} is "
+            f"readable", "ERROR")
+    app.add_middleware(ServeTokenMiddleware)
+
+    # ⛔⛔ NOT `allow_origins=["*"]`, AND ADDED **AFTER** THE GATE ON PURPOSE.
+    # Starlette's `add_middleware` makes the LAST-added the OUTERMOST, so this
+    # CORS layer wraps the token gate. Swap the two and the gate answers the
+    # browser's preflight — which carries no headers to authenticate with — so
+    # every cross-origin call would 401 before the origin policy ever ran.
     #
     # ⭐ THE LIST IS LOOPBACK-ONLY BECAUSE NOTHING ELSE HAS EVER CALLED IT. The web
     # app talks to the machine through Firestore (Track D) and contains zero
@@ -72524,12 +72575,21 @@ async def run_server(port=8000):
 
     @app.get("/api/health")
     async def health_check():
-        """Server health check. Q8: includes lastHeartbeatAt (millis since
-        epoch) + consecutive heartbeat failure count so the FE can sanity-
-        check 'device offline despite localhost responsive' cases. The
-        Account-tile online indicator reads Firestore lastHeartbeat — if
-        Firestore writes are failing but local HTTP is fine, this endpoint
-        shows the disparity directly."""
+        """Server health check. ⭐ THE ONE ROUTE THAT NEEDS NO TOKEN — see
+        `auth/serve_token.EXEMPT_PATHS`, which names its four callers and the
+        reason (the supervisor watchdog force-respawns a worker whose health
+        goes unreachable, so this probe must never fail for an auth reason).
+
+        Q8: includes lastHeartbeatAt (millis since epoch) + consecutive
+        heartbeat failure count, so a PERSON AT THIS MACHINE can sanity-check
+        'device offline despite localhost responsive'. ⛔ It used to say "so
+        the FE can sanity-check" — the web app has never called this API at
+        all; it reaches the machine through Firestore and contains zero
+        references to this port. That sentence is the kind of imagined
+        consumer a later change widens CORS for. The Account-tile online
+        indicator reads Firestore `lastHeartbeat`; if Firestore writes are
+        failing but local HTTP is fine, this endpoint shows the disparity to
+        whoever is standing in front of the computer."""
         return {
             "status": "ok",
             "running": bool(_QUEUE_STATE.get("running")),
@@ -72633,7 +72693,32 @@ async def run_server(port=8000):
             return JSONResponse({"error": "topic is required"}, 400)
         topic = topic.strip()
         email = request_data.get("email", "")
-        uid = request_data.get("uid", "")  # Firebase user ID for Firestore bridge
+        # ⛔⛔ THE IDENTITY COMES FROM THE PAIRING, NOT FROM THE CALLER. This
+        # line used to be `request_data.get("uid", "")` — the single clearest
+        # statement that the API authenticated nobody: whoever could reach it
+        # chose which Firebase account the run was written to and billed to.
+        # `load_paired_uid()` is the machine's own answer to "whose computer is
+        # this", and it is the only one a caller cannot forge.
+        uid = load_paired_uid() or ""
+        # ⛔ A MISMATCH IS REFUSED, NOT QUIETLY REWRITTEN. A caller that names a
+        # uid is telling us where it believes the run is going; running it
+        # somewhere else would put somebody's research in an account they did
+        # not ask for and report success. Silence is the worse failure here.
+        # `str(...)` because the body is whatever JSON arrived — a dict or a
+        # list here would make `.strip()` raise and turn a refusal into a 500.
+        _claimed = str(request_data.get("uid") or "").strip()
+        if _claimed and _claimed != uid:
+            # ⛔ TWO DIFFERENT SENTENCES, because "omit it and the pairing is
+            # used" is a lie on a machine that has no pairing: the caller drops
+            # the uid, gets a 200, and the run executes on disk attached to
+            # nobody while they wait for it in the web app.
+            return JSONResponse(
+                {"error": ("uid does not match the account this machine is "
+                           "paired to — omit it and the pairing is used")
+                          if uid else
+                          ("this machine is not paired to any account, so it "
+                           "cannot start a run for uid "
+                           f"{_claimed[:8]}… — run `--pair` first")}, 403)
         config = request_data.get("config", {})
         brief_text = (request_data.get("briefText") or "").strip()
         # Validate config
@@ -72696,8 +72781,15 @@ async def run_server(port=8000):
     #      strip lands as a deliberate second beat instead of an orphan block.
     _branded_header("aegis", _BOLD + _ACCENT, "standing watch")
     _serve_boot_preview(port)
-    # Banner shows localhost so users can copy-click; uvicorn still binds
-    # to 0.0.0.0 below so the FE web app can reach this BE.
+    # Banner shows localhost so users can copy-click, and that is also exactly
+    # where uvicorn binds.
+    # ⛔ THIS COMMENT USED TO CLAIM THE SERVER BOUND EVERY INTERFACE so the FE
+    # web app could reach it — untrue on both halves since 2026-09-05. The bind
+    # moved to `host="127.0.0.1"`, and the FE has never reached this API at all:
+    # it talks to the machine through Firestore, and the web source contains
+    # zero references to this port. A comment describing a security posture the
+    # code no longer has is how a future edit talks itself into restoring it,
+    # which is why the sentence is gone rather than corrected in place.
     log(f"Starting API server on http://localhost:{port}")
     # ⭐ 2026-08-17 — WHERE THE BLOCK CAME FROM, asked once at the earliest point
     # the app owns. The arm-time check runs AFTER Firestore, gRPC, four watchers
@@ -73412,10 +73504,21 @@ async def run_server(port=8000):
             _device_val = f"{_c(_BOLD, _device_name)}  {_state_chip}"
     else:
         _device_val = _c(_DIM, "(none)")
+    # ⭐ THE TOKEN'S HOME, NOT THE TOKEN. The person who just typed --serve is
+    # the one who needs to find it, and this strip is where they are looking.
+    # Printing the value here would put a live credential into every terminal
+    # scrollback, screenshot and pasted log — `--help` and this row both name
+    # the FILE, and the file is 0600.
+    try:
+        from auth.serve_token import token_path as _srv_token_path
+        _token_row = [("API token", _c(_DIM, str(_srv_token_path())))]
+    except Exception:
+        _token_row = []
     _ctx_rows_serve = [
         ("Paired to", _paired_val),
         ("Device",    _device_val),
         ("Local API", _c(_BOLD, f"http://localhost:{port}")),
+        *_token_row,
         # ⛔ A CADENCE IS NOT A HEARTBEAT. This row printed a constant, and the
         # task that does the beating is only created when the client exists —
         # so on a disconnected boot it advertised a rhythm nothing was keeping.
@@ -73509,13 +73612,12 @@ async def run_server(port=8000):
             ("python research.py --unpair", "fully disconnect this machine"),
         ])
 
-    # ⛔⛔ LOOPBACK, NOT `0.0.0.0`. Bound to every interface, this unauthenticated
-    # API was reachable by anything on the same network — a coffee-shop wifi, an
-    # office LAN, a shared house. `GET /api/runs` hands over every run topic on the
+    # ⛔⛔ LOOPBACK, NOT `0.0.0.0`. Bound to every interface, this API was
+    # reachable by anything on the same network — a coffee-shop wifi, an office
+    # LAN, a shared house. `GET /api/runs` hands over every run topic on the
     # machine for every account that shares it; `/api/runs/{id}/documents/{type}`
     # hands over the report bodies; `POST /api/runs/{id}/stop` stops somebody
-    # else's research; `POST /api/runs` starts one and takes the `uid` from the
-    # request body. None of it asks who is calling.
+    # else's research.
     #
     # ⭐ AND IT BREAKS NOTHING, WHICH IS WHY IT IS ONE LINE RATHER THAN A PROJECT.
     # Everything that has ever called this API already used loopback: the web app
@@ -73524,10 +73626,16 @@ async def run_server(port=8000):
     # function prints advertises `http://localhost:{port}`. The bind address was
     # the only thing claiming otherwise.
     #
-    # ⚠ THIS IS A REDUCTION IN EXPOSURE, NOT AUTHENTICATION. A process or a page on
-    # THIS machine can still reach it unauthenticated. The real answer is a token,
-    # which is a larger change; this removes the network from the problem so that
-    # what remains is somebody who is already on the computer.
+    # ✅ AND THE OTHER HALF IS NOW DONE TOO — wave 10.5, 2026-09-20. This block
+    # used to end "None of it asks who is calling… the real answer is a token,
+    # which is a larger change". The token exists: `ServeTokenMiddleware` is
+    # installed at the top of this function and every route but `/api/health`
+    # requires it, and `POST /api/runs` takes its identity from the pairing
+    # rather than from the request body.
+    #
+    # ⛔ THE BIND STILL MATTERS AND IS NOT REDUNDANT. The two are layers: the
+    # bind keeps the LAN out of a race with the gate, and neither has to be
+    # perfect alone. Do not widen it because authentication now exists.
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="info",
                             log_config=_uvicorn_log_config())
     server = uvicorn.Server(config)
@@ -81101,8 +81209,18 @@ def run_commands_help():
     # boot as six timestamped `[INFO]   GET /api/runs …` lines — a static
     # reference pushed through the logger, which no other command did. It is
     # reference material, so it lives on the reference surface.
+    # ⭐ THE TOKEN ROW LEADS, because without it every row under it answers 401
+    # and the reference would be describing an API the reader cannot call. The
+    # PATH is printed, never the value — `--help` output gets pasted into chats
+    # and screenshots, and a secret that travels that way is not one.
+    try:
+        from auth.serve_token import HEADER as _API_HEADER, token_path as _api_token_path
+        _token_rows = [(f"{_API_HEADER}: <token>",
+                        f"Required on every route but /api/health — value in {_api_token_path()}")]
+    except Exception:
+        _token_rows = []
     _section(f"Local API  (while {_PROG} --serve is running)",
-             [(route, desc) for route, desc in _LOCAL_API_ROUTES])
+             _token_rows + [(route, desc) for route, desc in _LOCAL_API_ROUTES])
 
     _section("Internal / Debug", [
         ("python research.py --daemon-loop",

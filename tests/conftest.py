@@ -343,3 +343,37 @@ def _alert_ai_copy_off_by_default():
     via a raw os.environ write (rather than monkeypatch) can't leak forward."""
     os.environ["DG_ALERT_AI_COPY"] = "0"
     yield
+
+
+@pytest.fixture(scope="session")
+def _serve_token_dir(tmp_path_factory):
+    """One scratch directory for the whole session — see the fixture below."""
+    return tmp_path_factory.mktemp("sr-serve-token")
+
+
+@pytest.fixture(autouse=True)
+def _the_serve_token_never_lands_in_the_real_home(_serve_token_dir, monkeypatch):
+    """⛔⛔ The local API token is a LIVE CREDENTIAL in the developer's own
+    `~/.super-research/`, and wave 10.5 gave the suite a reason to write it.
+
+    `auth.serve_token` derives its directory from `keystore._FALLBACK_DIR`,
+    which is baked from `Path.home()` at import — the exact shape this file's
+    other home-isolation fixture exists for. Without this, any test that
+    reaches `ensure_token()` mints a real token into the developer's home, and
+    a later `_harden` or a stray write could disturb the one a running backend
+    is currently authenticating against.
+
+    Redirected for EVERY test, not per-file: the keystore's own tests each
+    remember to patch `_FALLBACK_DIR`, which is isolation the suite does not
+    have. Tests that want a specific directory patch after this one and win.
+
+    ⛔ ONE DIRECTORY FOR THE WHOLE SESSION, not one per test. The first
+    version called `tmp_path_factory.mktemp` inside this function-scoped
+    fixture, which meant ~8,400 empty `sr-serve-token*` directories per run and
+    a basetemp scan that grows with every one of them. A session-scoped
+    `mktemp` gives the same isolation — it is off the real home, which is the
+    whole requirement — for one directory.
+    """
+    from auth import serve_token
+    monkeypatch.setattr(serve_token, "_KEYSTORE_DIR", _serve_token_dir)
+    yield

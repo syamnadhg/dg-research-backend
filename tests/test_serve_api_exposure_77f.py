@@ -20,9 +20,23 @@ through Firestore); the health probe asks `http://localhost:{port}`; the `--serv
 banner advertises `http://localhost:{port}`. The bind address was the only thing
 claiming a remote consumer existed.
 
-⚠ AND IT IS NOT AUTHENTICATION. A process or a page on THIS machine still reaches
-it unauthenticated. What this removes is the network. The tests below say so
-explicitly, so nobody reads the wave as having solved the larger problem.
+⚠ AND IT WAS NOT AUTHENTICATION. A process or a page on THIS machine still
+reached it unauthenticated. What that wave removed was the network, and the
+tests below said so explicitly so nobody would read it as having solved the
+larger problem.
+
+✅ 2026-09-20, WAVE 10.5 — THE LARGER PROBLEM IS NOW SOLVED, and this file was
+written to be inverted on the day it was. Its own instruction was: "If one of
+them GAINS an auth check, this list should shrink and whoever shrinks it should
+say so." The list did not shrink; it went to ZERO, because the gate is one ASGI
+middleware under every route rather than a check per handler. The honest half
+below is therefore replaced by its opposite, and the behaviour of the gate is
+executed — not read — in `tests/test_serve_api_token_105.py`.
+
+⭐ WHAT STAYS HERE: the loopback bind, the non-wildcard CORS, and the evidence
+those rest on. Authentication does not retire either one — the bind is what
+keeps the LAN out of a race with the gate, and the two together are the reason
+neither has to be perfect alone.
 
 Run:  pytest tests/test_serve_api_exposure_77f.py -v
 """
@@ -50,7 +64,14 @@ def test_cors_is_not_a_wildcard():
     # ⛔ ANCHORED ON THE CALL, NOT THE NAME — `src.index("CORSMiddleware")` finds
     # the IMPORT, hundreds of lines above, and the window then contains none of
     # the configuration. Fourth time that has bitten this codebase in one wave.
-    at = src.index("app.add_middleware(")
+    #
+    # ⛔⛔ AND A FIFTH TIME, 2026-09-20: this anchored on `app.add_middleware(`
+    # and silently assumed CORS was the FIRST one. Wave 10.5 added the token
+    # gate above it, so the window slid up to include the explanatory comment —
+    # which quotes `allow_origins=["*"]` to say what was removed — and this test
+    # failed on the sentence documenting the fix, exactly as the note above
+    # predicted for a different anchor. The anchor is now the CORS call itself.
+    at = src.index("app.add_middleware(\n        CORSMiddleware,")
     window = src[at:src.index(")", src.index("allow_headers", at))]
     assert "localhost:{port}" in window
     assert "127.0.0.1:{port}" in window
@@ -61,26 +82,44 @@ def test_cors_is_not_a_wildcard():
     assert 'allow_origins=["*"]' not in window
 
 
-def test_the_endpoints_this_protects_still_have_no_auth_of_their_own():
-    """⛔⛔ THE HONEST HALF, AND IT IS A TEST SO IT CANNOT BE FORGOTTEN.
+def test_the_endpoints_this_protects_now_have_a_caller_check_too():
+    """✅ THE HONEST HALF, INVERTED ON THE DAY IT WAS EARNED — wave 10.5.
 
-    Binding to loopback narrows WHO can reach these routes; it does not add a
-    caller check to any of them. If somebody later re-exposes the port — a
-    tunnel, a container port map, a `--host` flag — every one of these is open
-    again. This test exists to make that explicit rather than to pass.
+    The old version of this test asserted that these four routes asked NOBODY
+    who was calling, and said in its own words that whoever changed that should
+    say so. Here is the saying-so.
+
+    Binding to loopback narrowed WHO could reach these routes. It is still the
+    outer wall and it still matters: if somebody re-exposes the port — a
+    tunnel, a container port map, a `--host` flag — the gate is now what is
+    standing there, instead of nothing. The two are layers, not alternatives.
     """
     src = _src()
-    # The routes that read or drive somebody's research, none of which asks who
-    # is calling. If one of them GAINS an auth check, this list should shrink and
-    # whoever shrinks it should say so.
+    # Still here, still the routes that read or drive somebody's research — and
+    # now every one of them sits under a single ASGI gate rather than under a
+    # per-handler check that a fifteenth route could forget.
     for route in ('@app.get("/api/runs")',
                   '@app.post("/api/runs")',
                   '@app.get("/api/runs/{run_id}/documents/{doc_type}")',
                   '@app.get("/api/runs/{run_id}/audio/{filename}")'):
         assert route in src, route
-    # `POST /api/runs` still takes the uid from the body — the single clearest
-    # statement that this is exposure reduction and not authentication.
-    assert 'uid = request_data.get("uid", "")' in src
+    assert "app.add_middleware(ServeTokenMiddleware)" in src, (
+        "the gate is gone — every route below it is open again")
+    # ⛔⛔ AND THE LINE THAT MADE THE POINT IN THE FIRST PLACE IS GONE. `POST
+    # /api/runs` took the billing identity FROM THE REQUEST BODY; it now takes
+    # it from the pairing, which a caller cannot forge.
+    assert 'uid = request_data.get("uid", "")' not in src
+    assert 'uid = load_paired_uid() or ""' in src
+
+
+def test_the_gate_is_not_quietly_reduced_to_the_bind_again():
+    """⛔ The failure this file was written about was a whole wave believing
+    the bind WAS the fix. Both layers, named separately, so removing either one
+    is a visible act."""
+    src = _src()
+    assert 'host="127.0.0.1", port=port' in src          # the outer wall
+    assert "app.add_middleware(ServeTokenMiddleware)" in src  # the caller check
+    assert "from auth.serve_token import" in src
 
 
 def test_the_health_probe_and_the_banner_agree_with_the_bind():
