@@ -2106,7 +2106,18 @@ def _completed_phases(doc: dict) -> dict:
                     out.setdefault(pn, st)
     cur = doc.get("phase")
     if isinstance(cur, int):
-        for p in range(cur):
+        # ⛔⛔ ONLY THE MACHINE-OWNED PHASES CAN BE INFERRED FROM THIS FIELD
+        # (2026-09-20). "Advanced past it" is sound while the pointer is the
+        # machine's own progress marker, and the machine writes 0-3 and hands
+        # off. From today the WEB advances it to 4 at the upload's start and 5
+        # at delivery's — so a bare `range(cur)` reads a run that merely
+        # REACHED phase 5 as proof that phase 4 completed, and prints
+        # "Phase 4 (Video) complete" for a video that failed or was skipped.
+        #
+        # ⭐ Phases 4 and 5 leave explicit `phases[]` entries when they finish
+        # — including "errored" ones, as of the same wave — so they are read
+        # from evidence above rather than inferred from a pointer here.
+        for p in range(min(cur, 4)):
             out.setdefault(p, "complete")  # advanced past it
         if doc.get("status") == "completed":
             out.setdefault(cur, "complete")  # clean end → current phase done

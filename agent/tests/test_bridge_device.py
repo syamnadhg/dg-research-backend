@@ -580,6 +580,44 @@ def test_completed_phases_from_status_and_advancement():
     assert 3 not in done  # the current ongoing phase isn't done yet
 
 
+def test_completed_phases_does_not_infer_phase_4_from_the_webs_pointer():
+    """⛔⛔ THE WEB ADVANCES `phase` TO 4 AND 5 FROM 2026-09-20, so "advanced
+    past it" stops being proof for those two.
+
+    The machine writes 0-3 and hands off; the upload and the delivery are the
+    web's, and it now claims each phase at its START. A bare `range(cur)`
+    therefore read a run that merely REACHED delivery as proof the video had
+    been made, and the agent printed "Phase 4 (Video) complete" for a run whose
+    upload failed or was skipped.
+
+    Phases 4 and 5 leave explicit `phases[]` entries when they finish — errored
+    ones included — so they are read from evidence, never inferred here.
+    """
+    # Delivery has started; the upload FAILED and says so.
+    done = bridge._completed_phases({
+        "phase": 5, "status": "ongoing",
+        "phases": [{"phase": 4, "status": "errored"}],
+    })
+    assert done.get(4) is None, "a failed phase 4 must not be reported complete"
+    # The machine's own phases are still inferred, exactly as before.
+    assert done.get(0) == "complete" and done.get(3) == "complete"
+
+    # And with no entry at all, phase 4 is simply unknown rather than claimed.
+    bare = bridge._completed_phases({"phase": 5, "status": "ongoing"})
+    assert 4 not in bare
+    assert bare.get(3) == "complete"
+
+
+def test_completed_phases_still_reads_a_real_phase_4_completion():
+    """⭐ The over-correction guard: refusing to INFER phase 4 must not stop us
+    reading a phase 4 that really did complete."""
+    done = bridge._completed_phases({
+        "phase": 5, "status": "ongoing",
+        "phases": [{"phase": 4, "status": "complete"}],
+    })
+    assert done.get(4) == "complete"
+
+
 def test_completed_phases_clean_completion_marks_final():
     done = bridge._completed_phases({"phase": 5, "status": "completed"})
     assert done.get(5) == "complete"
