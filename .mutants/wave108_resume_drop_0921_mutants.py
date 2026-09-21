@@ -55,7 +55,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 SUITES = ("tests/test_resume_drop_writeback_108.py "
-          "tests/test_dead_worker_wiring_108.py")
+          "tests/test_dead_worker_wiring_108.py "
+          "tests/test_stop_is_not_a_crash_108.py")
 RESEARCH = "research.py"
 FILES = (RESEARCH,)
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
@@ -108,6 +109,20 @@ W_REASON = ('            "died_at": int(time.time() * 1000),\n'
             '            "reason": reason,')
 #: Worker 1 scheduling the reconciler — the line that makes all of it run.
 W_SCHEDULE = "            asyncio.create_task(_dead_worker_reconcile_loop())"
+
+# ── anchors: a Stop is not a crash, and a crash we gave up on stays up ──────
+#: The branch that tells a deliberate Stop apart from a browser death.
+S_BRANCH = "        if _stop_requested:"
+#: What that branch writes, which this exit never used to write at all.
+S_STATUS = '            _update_firestore_research({"status": "stopped", "phase": last_phase})'
+#: The marker the terminal card leaves so automatic paths stop relaunching.
+S_MARK = "                (queue_dir / NO_AUTO_RETRY_MARKER).write_text("
+#: The gate that reads it.
+S_GATE = "    if _stop_path is not None and _no_auto_retry_marked(_stop_path.parent):"
+#: The human path clearing it — the reason the gate needs no caller list.
+S_CLEAR = "                _clear_no_auto_retry(queue_dir)"
+#: The marker's name, which must not be the terminal stop sentinel.
+S_NAME = 'NO_AUTO_RETRY_MARKER = ".no_auto_retry"'
 #: A repaired worker retracting its own marker at boot.
 W_RETRACT = "            _clear_worker_dead_marker(WORKER_ID)"
 
@@ -221,6 +236,49 @@ MUTANTS = [
      "re-pausing the runs that worker is booting to recover — an operator repair "
      "gains a manual step nobody documents",
      [(W_RETRACT, "            pass")]),
+
+    # ── S: a Stop is not a crash, and a crash we gave up on stays down ─────
+    ("S1", "under", RESEARCH,
+     "⛔⛔ THE DEFECT I SHIPPED ON 09-20 — a deliberate Stop falls through to "
+     "the crash branches again and the person who ended their own run is told "
+     "'The run kept hitting errors'. The Stop handler closes the browser on "
+     "purpose and every unwind site now tags that as a crash, so the two are "
+     "indistinguishable without this test",
+     [(S_BRANCH, "        if False:")]),
+
+    ("S2", "under", RESEARCH,
+     "⛔ the stop branch stops writing a run-level status, so a Stop that "
+     "arrives mid-phase leaves the document `ongoing` for ever — the listing "
+     "tile animates a run that ended, which is the wave-10.7 defect reached "
+     "through a door 10.7 never looked at",
+     [(S_STATUS, "            pass")]),
+
+    ("S3", "under", RESEARCH,
+     "⛔⛔ THE TERMINAL CARD STOPS RECORDING THAT IT GAVE UP. `_crash_retries` "
+     "is a function parameter, so with nothing on disk a supervised boot "
+     "re-enqueues the run at attempt zero — three more Chrome launches while "
+     "the person looks at a card saying we stopped trying",
+     [(S_MARK, "                (queue_dir / \"unused.tmp\").write_text(")]),
+
+    ("S4", "under", RESEARCH,
+     "⛔ the enqueue funnel stops reading the marker, so writing it becomes "
+     "bookkeeping nobody consults — the exact shape of a guard that is present, "
+     "greppable and decorative",
+     [(S_GATE, "    if False:")]),
+
+    ("S5", "over", RESEARCH,
+     "⛔⛔ THE OVER-CORRECTION — the human path stops clearing the marker, so a "
+     "person pressing Retry on the crash card is refused by a gate meant only "
+     "for machines. The card offers an action that silently does nothing, which "
+     "is worse than offering none",
+     [(S_CLEAR, "                pass")]),
+
+    ("S6", "over", RESEARCH,
+     "⛔⛔ AND THE ONE-LINE VERSION OF THIS FIX THAT LOOKS TIDIER — reuse "
+     "`.stop`. It refuses the person's own Retry the same way, and since this "
+     "wave's drop write-back it also tells them the run 'was stopped for good', "
+     "which is a false account of a crash",
+     [(S_NAME, 'NO_AUTO_RETRY_MARKER = ".stop"')]),
 ]
 
 

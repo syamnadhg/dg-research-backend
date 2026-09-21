@@ -461,6 +461,33 @@ def _worker_dead_marker_path(worker_id: int) -> Path:
     return Path(__file__).parent / "queues" / f".worker.{worker_id}.dead"
 
 
+# ⭐ "AUTOMATIC RECOVERY IS EXHAUSTED FOR THIS RUN." Written beside the
+# checkpoint when `run_pipeline` gives up and shows the terminal card, and read
+# by the paths that would otherwise start the run again with nobody asking:
+# the supervised boot rehydration and the disk restore. A HUMAN pressing Retry
+# clears it — the budget is theirs to spend — which is the whole reason this is
+# not `.stop`.
+NO_AUTO_RETRY_MARKER = ".no_auto_retry"
+
+
+def _no_auto_retry_marked(queue_dir) -> bool:
+    """Has this run already used up every automatic attempt?"""
+    try:
+        return (Path(queue_dir) / NO_AUTO_RETRY_MARKER).exists()
+    except Exception:
+        return False
+
+
+def _clear_no_auto_retry(queue_dir) -> None:
+    """A person asked for another go. Give them a clean budget."""
+    try:
+        (Path(queue_dir) / NO_AUTO_RETRY_MARKER).unlink()
+    except FileNotFoundError:
+        pass
+    except Exception as _err:
+        log(f"[no-auto-retry] could not clear marker (non-fatal): {_err}", "DEBUG")
+
+
 def _write_worker_dead_marker(worker_id: int, *, pid: "int | None" = None,
                               crash_count: int = 0,
                               reason: str = "crash_loop") -> None:
@@ -13935,6 +13962,14 @@ def start_firestore_start_listener(job_queue, loop):
                     try: doc.reference.delete()
                     except Exception: pass
                     continue
+                # ⭐ A PERSON ASKED FOR ANOTHER GO, so the automatic-attempts
+                # marker goes. `run_pipeline` writes it when it gives up and
+                # shows the terminal card; `_safe_enqueue` refuses anything
+                # carrying it, which is what stops a supervised boot silently
+                # relaunching a run whose budget is spent. Retry is a decision
+                # to spend a fresh one — and clearing it HERE, on the one path a
+                # human drives, is why that gate needs no list of callers.
+                _clear_no_auto_retry(queue_dir)
                 # Clear .pause signal so the dispatcher / phase loops drain.
                 p = queue_dir / ".pause"
                 if p.exists():
@@ -14807,6 +14842,20 @@ def _safe_enqueue(job_queue, job, source: str,
                 return False
         except Exception:
             pass
+    # ── auto-recovery exhausted: refuse, but only the AUTOMATIC callers ──
+    # ⛔⛔ THE CRASH BUDGET DIED WITH ITS CALL. `_crash_retries` is a parameter
+    # of `run_pipeline`, so a supervised boot that re-enqueues a run whose
+    # terminal crash card is on screen starts it over at attempt zero — three
+    # more Chrome launches nobody asked for, and the person watching a card
+    # that says we gave up. The marker makes exhaustion survive the re-enqueue.
+    #
+    # ⭐ THE HUMAN PATH CLEARS IT BEFORE IT GETS HERE, which is why this gate
+    # needs no caller list and cannot drift out of step with one. Pressing
+    # Retry is a decision to spend a fresh budget; a machine rebooting is not.
+    if _stop_path is not None and _no_auto_retry_marked(_stop_path.parent):
+        log(f"[safe_enqueue:{source}] skipped — run {rid[:24]}… exhausted its "
+            f"automatic attempts (a person's Retry clears this)", "INFO")
+        return False
     if _firebase_db is None:
         log(f"[safe_enqueue:{source}] skipped — Firestore unavailable", "WARN")
         return False
@@ -69798,7 +69847,37 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # the `try`, so it's always bound here.
         _will_silent_retry, _, _ = _plan_pipeline_auto_retry(
             queue_dir, resume_dir, _captured_failure_kind, _crash_retries)
-        if _will_silent_retry:
+        # ⛔⛔ A STOP IS NOT A CRASH, AND SINCE 2026-09-20 IT LOOKS EXACTLY LIKE
+        # ONE. The Stop handler closes the research browser deliberately — that
+        # is how it ends a run mid-phase — and the five unwind sites added that
+        # day tag every browser death with the literal "(browser crash)" so
+        # `_is_browser_close_error` can re-derive the kind from the exception
+        # alone. Both changes are right; together they mean a person pressing
+        # Stop during phase 2 or 3 raises a crash error, lands here, and is
+        # shown "The run kept hitting errors" about a run they ended themselves.
+        #
+        # The auto-retry was already refused for the right reason (Gate 2 sees
+        # the `.stop` sentinel), so only the SENTENCE was wrong — and the run
+        # was left with no terminal status of its own, because this exit never
+        # wrote one. Both are fixed by taking the same exit the phase-boundary
+        # stop takes, which is the one every other stop path in this function
+        # already uses.
+        _stop_requested = False
+        try:
+            _stop_requested = _controls.is_stop() or (queue_dir / ".stop").exists()
+        except Exception:
+            pass
+        if _stop_requested:
+            log(f"STOP requested during phase {last_phase} — the browser closed "
+                f"because we closed it; not a crash", "WARN")
+            try:
+                save_meta(queue_dir, topic, last_phase, status="stopped")
+                update_delivery(status="stopped")
+            except Exception as _sm_err:
+                log(f"stop bookkeeping (non-fatal): {_sm_err}", "WARN")
+            emit_event("pipeline_stopped", phase=last_phase, reason="stop")
+            _update_firestore_research({"status": "stopped", "phase": last_phase})
+        elif _will_silent_retry:
             _att = _crash_retries + 1
             log(f"Browser crash at phase {last_phase} (attempt {_att}/"
                 f"{BROWSER_CRASH_MAX_RETRIES + 1}) — auto-retrying from "
@@ -69861,6 +69940,30 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # firer is dead post-run, so the catalog correctly omits auto_skip —
             # no deadline is ever armed). [retry_resume, discard] expands
             # byte-identically to the explicit Retry/Skip list this dropped.
+            # ⛔⛔ AND AUTO-RECOVERY IS OVER, WHICH NOTHING ON DISK USED TO SAY.
+            # The crash budget lives in `_crash_retries`, a PARAMETER of this
+            # function — so it dies with the call. A supervised device's boot
+            # rehydration then finds artifacts on disk and no `.stop`, enqueues
+            # the run again, and `run_pipeline` starts over at attempt zero:
+            # three more Chrome launches on a run that just exhausted its
+            # budget, silently, with the person's terminal card still on screen.
+            #
+            # ⭐ NOT `.stop`, DELIBERATELY. That sentinel means "ended for good"
+            # and is checked by the resume path too — it would refuse the very
+            # Retry this card is offering, and since wave 10.8's drop write-back
+            # it would tell the person their run "was stopped for good", which
+            # is the wrong story for a crash. This marker refuses only the
+            # AUTOMATIC paths; a human pressing Retry clears it and gets a fresh
+            # budget, because they chose to spend it.
+            try:
+                (queue_dir / NO_AUTO_RETRY_MARKER).write_text(
+                    json.dumps({
+                        "at": int(time.time() * 1000),
+                        "phase": last_phase,
+                        "kind": _captured_failure_kind or "error",
+                    }), encoding="utf-8")
+            except Exception as _nar_err:
+                log(f"[no-auto-retry] marker write failed (non-fatal): {_nar_err}", "WARN")
             fail_phase(
                 phase=last_phase,
                 error="The run kept hitting errors",
