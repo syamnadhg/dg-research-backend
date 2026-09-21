@@ -2096,7 +2096,28 @@ def _read_agent_log_tail(cap: int = _AGENT_LOG_MAX_BYTES) -> bytes:
 # Mirrors what the delivered Phase-5 Google Doc embeds, grouped by phase.
 _PHASE_PLAN: dict[int, tuple[str, tuple[tuple[str, str], ...]]] = {
     1: ("Research Brief", (("Brief", "sr:brief"),)),
-    2: ("Deep Research", (("ChatGPT", "sr:chatgpt"), ("Gemini", "sr:gemini"), ("Claude", "sr:claude"))),
+    2: ("Deep Research", (("ChatGPT", "sr:chatgpt"), ("Gemini", "sr:gemini"), ("Claude", "sr:claude"),
+                          # ⭐⭐ THE TWO DOCUMENTS THE WEB APP SYNTHESISES AT P5, and
+                          # the agent was the only surface that never showed them
+                          # (owner, 2026-09-20). Their share ids have been on the
+                          # wire the whole time — `mintSrDocLinks` iterates
+                          # DOCUMENT_KINDS, which carries both, and `_sr_links`
+                          # copies every srShares key unfiltered — so this table
+                          # was the only thing dropping them.
+                          # ⛔ HERE, AFTER THE THREE REPORTS AND BEFORE P3's
+                          # NotebookLM, because that is where the delivered Google
+                          # Doc puts them (p5-doc.ts). The two surfaces list the
+                          # same documents in the same order or they read as two
+                          # different products.
+                          # ⚠ WRITTEN AT P5, LISTED UNDER P2. A mid-run status
+                          # therefore shows this block WITHOUT them until delivery
+                          # mints the shares; a spec whose url does not resolve is
+                          # skipped, so that renders clean rather than empty-rowed.
+                          # ⛔ `consolidated` is the NARROW FALLBACK, not a second
+                          # combined document — see `_SR_SLOT`.
+                          ("Super Research", "sr:synthesis"),
+                          ("Consolidated", "sr:consolidated"),
+                          ("Summary", "sr:summary"))),
     3: ("Audio Overview", (("NotebookLM", "pf:notebooklm"), ("Podcast", "sr:podcast"))),
     4: ("Video", (("YouTube", "pf:youtube"),)),
     5: ("Delivery", (("Google Doc", "pf:gdocs"),)),
@@ -2126,6 +2147,33 @@ _SR_PROOF_KIND = {"podcast": "audio_file"}
 # platform link required, because the phase's own completion gate is the
 # markdown reaching Firestore.
 _SR_PHASE_PROVED = {"brief", "chatgpt", "gemini", "claude"}
+
+# ⛔⛔ TWO DOCUMENT KINDS, ONE DELIVERY SLOT. The web synthesises `synthesis`
+# from the same material the machine stacked into `consolidated`, so side by side
+# they read as two near-identical documents. The web app hides the stack whenever
+# a synthesis exists (doc-kinds.ts `visibleDocuments`) and the delivered Google
+# Doc enforces the same precedence with a shared slot (p5-doc.ts) — this is the
+# PRODUCT's rule, and the agent mirrors it rather than inventing a third answer.
+#
+# ⛔ AND THE AGENT IS GENUINELY EXPOSED TO IT. `consolidated` left DOCUMENT_KINDS
+# so it is never minted again, but shares already minted are permanent and cached
+# on the run doc, and `_sr_links` copies EVERY srShares key — so a re-delivered
+# older run can hand us both. Iterate naively and chat prints the combined
+# document twice. Dropping `consolidated` outright instead would silently delete
+# the only combined document such a run has.
+_SR_SLOT = {"synthesis": "combined", "consolidated": "combined"}
+
+# ⛔⛔ AND THESE THREE CAN NEVER OPEN A MINT GAP. `_sr_mint_gap`'s fallback
+# branch asks whether a PLATFORM link named like the doc type exists, and answers
+# "then it should have been minted". For these it would be answering about a
+# document the bridge cannot mint at all — they are written by the web app at P5
+# — so the gap would never close: one POST /api/mintSrLinks per status poll, for
+# the life of the run. `consolidated` makes that concrete rather than theoretical,
+# because it is already live backend vocabulary for a document
+# (`save_document_to_firestore("consolidated")`), so a platform link by that name
+# is one plausible line away. Measured before this guard existed:
+# `_sr_mint_gap(sr, {"summary": "u", "consolidated": "u"}, …)` returned True.
+_SR_NEVER_PROVED = {"synthesis", "consolidated", "summary"}
 
 
 def _enabled_agents(doc: dict) -> set:
@@ -2183,6 +2231,10 @@ def _sr_mint_gap(sr_links: dict, platform: dict, done: dict, enabled: set | None
             dt = src[3:]
             if dt in sr_links:
                 continue
+            # ⛔ BEFORE the proof branches, so a platform link that merely SHARES
+            # one of these names cannot open a gap no mint can ever close.
+            if dt in _SR_NEVER_PROVED:
+                continue
             if dt in _SR_PHASE_PROVED:
                 # The phase's own completion is the proof — but only for an
                 # agent that ran. `brief` is not an agent and is always in play.
@@ -2227,8 +2279,14 @@ def _phase_updates(doc: dict, sr_links: dict) -> list:
             continue
         name, specs = _PHASE_PLAN[p]
         links = []
+        # ⛔ ONE ROW PER SLOT, NOT PER SPEC — the first combined document that
+        # resolves wins and the fallback is skipped (mirrors p5-doc.ts).
+        filled: set = set()
         if st == "complete":
             for label, src in specs:
+                slot = _SR_SLOT.get(src[3:]) if src.startswith("sr:") else None
+                if slot and slot in filled:
+                    continue
                 if src.startswith("sr:"):
                     url = sr_links.get(src[3:])
                     permanent = True
@@ -2240,6 +2298,11 @@ def _phase_updates(doc: dict, sr_links: dict) -> list:
                     )
                     permanent = False
                 if url:
+                    # ⛔ FILLED ONLY WHEN A URL ACTUALLY RESOLVED. Marking the slot
+                    # on the SPEC instead would let a missing synthesis suppress the
+                    # `consolidated` fallback and deliver no combined document at all.
+                    if slot:
+                        filled.add(slot)
                     links.append({"label": label, "url": url, "permanent": permanent})
         out.append({"phase": p, "name": name, "status": st, "links": links,
                     "final": completed and p == last_done})

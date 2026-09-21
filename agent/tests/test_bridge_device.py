@@ -600,7 +600,13 @@ def test_phase_updates_sr_for_p1_p2_podcast_platform_for_notebook_yt_doc():
     pus = {pu["phase"]: pu for pu in bridge._phase_updates(doc, sr)}
     # P1 / P2 → SR permanent
     assert [lk["label"] for lk in pus[1]["links"]] == ["Brief"] and pus[1]["links"][0]["permanent"]
-    assert {lk["label"] for lk in pus[2]["links"]} == {"ChatGPT", "Gemini", "Claude"}
+    # ⚠ AN ORDERED LIST, NOT A SET. A set cannot see POSITION, which is the whole
+    # of what the P2 block now promises: the delivered Google Doc's own order,
+    # ending immediately before P3's NotebookLM. This fixture's srShares has no
+    # synthesis/summary, so those specs resolve to no url and are skipped — which
+    # is exactly the mid-run shape, and why this assertion kept passing while the
+    # two documents were missing from every delivery.
+    assert [lk["label"] for lk in pus[2]["links"]] == ["ChatGPT", "Gemini", "Claude"]
     assert all(lk["permanent"] for lk in pus[2]["links"])
     # P3 → NotebookLM (platform) + Podcast (SR permanent)
     p3 = {lk["label"]: lk for lk in pus[3]["links"]}
@@ -614,6 +620,81 @@ def test_phase_updates_sr_for_p1_p2_podcast_platform_for_notebook_yt_doc():
     assert pus[5]["final"] is True
     assert pus[5]["links"][0]["label"] == "Google Doc" and pus[5]["links"][0]["permanent"] is False
     assert pus[5]["links"][0]["url"] == "https://docs.google.com/d/final"
+
+
+def test_phase_updates_puts_the_two_documents_between_the_reports_and_notebooklm():
+    """⭐⭐ THE OWNER'S ASK, 2026-09-20: "for the delivery in agent i should be
+    getting super research document and summary document too … Place them between
+    Research document and notebooklm."
+
+    ⛔⛔ AND THE SHARE IDS WERE ALREADY ON THE WIRE THE WHOLE TIME. `mintSrDocLinks`
+    iterates DOCUMENT_KINDS, which carries `synthesis` and `summary`, and
+    `_sr_links` copies every srShares key unfiltered — so nothing was missing from
+    the data. `_PHASE_PLAN` was the only thing dropping them, which is why the fix
+    is one table and not a new link kind. (`runview.KIND_ORDER` is NOT involved:
+    these two never travel through `links.{kind}` at all.)
+    """
+    doc = {"phase": 5, "status": "completed",
+           "srShares": {"brief": "B", "chatgpt": "C", "gemini": "G", "claude": "CL",
+                        "synthesis": "SY", "summary": "SU", "podcast": "P"},
+           "links": {"notebooklm": {"url": "https://notebooklm.google.com/n", "phase": 3}}}
+    pus = {pu["phase"]: pu for pu in bridge._phase_updates(doc, bridge._sr_links(doc))}
+    assert [lk["label"] for lk in pus[2]["links"]] == [
+        "ChatGPT", "Gemini", "Claude", "Super Research", "Summary"]
+    assert all(lk["permanent"] for lk in pus[2]["links"])
+    # ⛔ AND NOTEBOOKLM IS THE VERY NEXT ROW — the placement is the ask, not just
+    # the presence. P2 ends, P3 opens with it.
+    assert pus[3]["links"][0]["label"] == "NotebookLM"
+    assert pus[2]["links"][3]["url"].endswith("/shared/doc/SY")
+    assert pus[2]["links"][4]["url"].endswith("/shared/doc/SU")
+
+
+def test_phase_updates_delivers_one_combined_document_never_two():
+    """⛔⛔ `synthesis` AND `consolidated` ARE THE SAME DOCUMENT. The web
+    synthesises one from the material the machine stacked into the other, so
+    listing both prints it twice under two names — and the web app itself hides
+    the stack whenever a synthesis exists (doc-kinds.ts `visibleDocuments`).
+
+    ⛔ BUT `consolidated` IS NOT DROPPED, IT IS THE FALLBACK. It is never minted
+    any more, yet shares already minted are permanent and cached on the run doc,
+    so a re-delivered older run carries only that one — dropping it outright would
+    leave such a run showing no combined document at all.
+
+    ⚠ THE FIXTURE SITS AT phase 3 ON PURPOSE. `_completed_phases` credits the
+    CURRENT phase only when status == "completed"; at `phase: 2, ongoing` phase 2
+    is NOT done, `_phase_updates` emits no P2 block, and both halves of this test
+    would compare against an empty list. Do not "simplify" it back to 2.
+    """
+    base = {"phase": 3, "status": "ongoing", "links": {}}
+
+    both = dict(base, srShares={"chatgpt": "C", "synthesis": "SY", "consolidated": "OLD"})
+    p2 = {pu["phase"]: pu for pu in bridge._phase_updates(both, bridge._sr_links(both))}[2]
+    assert [lk["label"] for lk in p2["links"]] == ["ChatGPT", "Super Research"]
+
+    legacy = dict(base, srShares={"chatgpt": "C", "consolidated": "OLD"})
+    p2 = {pu["phase"]: pu for pu in bridge._phase_updates(legacy, bridge._sr_links(legacy))}[2]
+    assert [lk["label"] for lk in p2["links"]] == ["ChatGPT", "Consolidated"]
+
+
+def test_the_p5_documents_can_never_open_a_mint_gap():
+    """⛔⛔ A GAP THAT NO MINT CAN CLOSE IS A POST PER STATUS POLL, FOREVER.
+    `_sr_mint_gap`'s fallback branch asks whether a PLATFORM link named like the
+    doc type exists and concludes it should have been minted. These three are
+    written by the WEB APP at P5 and the bridge cannot mint them at all, so that
+    question must never be asked about them.
+
+    ⛔ AND THE EMPTY-PLATFORM CASE PROVES NOTHING — that was the trap. Measured
+    before the guard existed: with `platform={}` the gap was already False (so a
+    test passing only that would have stayed green through the regression), while
+    `{"summary": "u", "consolidated": "u"}` returned True. `consolidated` is live
+    backend vocabulary for a document already, so the collision is one line away.
+    """
+    sr = {"brief": "u", "chatgpt": "u", "gemini": "u", "claude": "u"}
+    done = {1: "complete", 2: "complete"}
+    agents = {"chatgpt", "gemini", "claude"}
+    for platform in ({}, {"summary": "u", "consolidated": "u"}, {"synthesis": "u"},
+                     {"synthesis": "u", "summary": "u", "consolidated": "u"}):
+        assert bridge._sr_mint_gap(sr, platform, done, agents) is False, platform
 
 
 def test_sr_mint_gap_detects_unminted_complete_phase():

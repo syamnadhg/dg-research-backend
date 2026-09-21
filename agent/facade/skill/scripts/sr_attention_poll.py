@@ -409,7 +409,8 @@ def _title(run: dict) -> str:
 def _final_lines(run: dict) -> list[str]:
     """The single end-of-run message: the pipeline-complete banner + EVERY phase's
     link, gathered across all phaseUpdates, de-duped, in phase order — the SR
-    permanent links (🔒: Brief, the three reports, the Podcast) AND the real platform
+    permanent links (🔒: Brief, the three reports, the Super Research and Summary
+    documents, the Podcast) AND the real platform
     links (🔗: NotebookLM, YouTube, the Google Doc). Results were also emailed."""
     lines = [f"🎉 “{_title(run)}” · pipeline complete — results have been emailed."]
     seen: set[str] = set()

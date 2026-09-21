@@ -406,10 +406,25 @@ def _agent_directive_block(directive_lines: list[str]) -> list[str]:
     return ["", _AGENT_ONLY_MARKER, *directive_lines]
 
 
+# ⭐ THE WEB APP'S OWN NAMES for the two documents it writes at delivery
+# (doc-kinds.ts FULL_LABEL). "Super Research" is the product name the synthesised
+# document literally carries in the delivered Doc, so shortening it here would put
+# a second spelling of one document in front of the same person.
 _SR_LINK_LABELS = {
     "brief": "Brief", "chatgpt": "ChatGPT report", "gemini": "Gemini report",
-    "claude": "Claude report", "podcast": "Podcast",
+    "claude": "Claude report", "synthesis": "Super Research",
+    "consolidated": "Consolidated", "summary": "Summary", "podcast": "Podcast",
 }
+
+# ⛔⛔ ONE COMBINED DOCUMENT, NEVER BOTH — the same rule the bridge and the
+# delivered Google Doc apply. The web synthesises `synthesis` from the material
+# the machine stacked into `consolidated`, so listing both prints the same
+# document twice under two names; the web app hides the stack whenever a
+# synthesis exists (doc-kinds.ts `visibleDocuments`). `consolidated` is never
+# minted any more, but an older re-delivered run still carries its share — so it
+# stays as the FALLBACK rather than being dropped, or such a run would show no
+# combined document at all.
+_SR_COMBINED = ("synthesis", "consolidated")
 
 
 def _fmt_sr_links(sr_links: dict) -> list[str]:
@@ -419,7 +434,16 @@ def _fmt_sr_links(sr_links: dict) -> list[str]:
     if not sr_links:
         return []
     out = ["  Permanent links (never expire — safe to share):"]
-    for key in ("podcast", "brief", "chatgpt", "gemini", "claude"):
+    # ⛔ PODCAST STAYS FIRST — this block answers "the podcast link" more often
+    # than anything else. The documents then follow the delivered Doc's own order.
+    combined_done = False
+    for key in ("podcast", "brief", "chatgpt", "gemini", "claude",
+                "synthesis", "consolidated", "summary"):
+        if key in _SR_COMBINED:
+            if combined_done:
+                continue
+            if sr_links.get(key):
+                combined_done = True
         url = sr_links.get(key)
         if url:
             # Channel-neutral (label + bare URL): the raw URL auto-links on every
@@ -432,7 +456,8 @@ def _fmt_sr_links(sr_links: dict) -> list[str]:
 
 def _fmt_phase_updates(phase_updates: list) -> list[str]:
     """Per-phase links for a status snapshot — one block per DONE phase. Carries the
-    SR permanent links (🔒: Brief + the agent reports + the Podcast) AND the real
+    SR permanent links (🔒: Brief + the agent reports + the Super Research and
+    Summary documents + the Podcast) AND the real
     platform links (🔗: NotebookLM + YouTube + the Google Doc). Mirrors what the
     streaming watchdog posts so a manual `status` shows the SAME links. On-demand
     path: lists the links available SO FAR while a run is mid-flight (the proactive

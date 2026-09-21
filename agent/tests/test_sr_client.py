@@ -1417,3 +1417,44 @@ def test_updates_limit_cap_clamps_to_100(bridge_port):
     assert FakeFS.last_page_size == 100    # clamped to the ceiling, not 50, not 500
     sr._get("/updates?limit=5")            # below → honored verbatim
     assert FakeFS.last_page_size == 5
+
+
+
+# ── the FALLBACK link renderer, which had no test at all ─────────────────────
+
+def test_the_fallback_renderer_lists_the_two_delivery_documents():
+    """⛔⛔ THIS RENDERER HAD ZERO COVERAGE. `_fmt_sr_links` is the path taken when
+    the bridge sent no `phaseUpdates` (an older bridge, or a run with none yet),
+    and it carries its OWN allowlist — a hardcoded key tuple, separate from the
+    bridge's `_PHASE_PLAN`. So the two documents could be fixed on the primary
+    path and still silently missing here, which is the same one-surface-of-two
+    split the owner reported on 2026-09-20.
+    """
+    out = "\n".join(sr._fmt_sr_links({
+        "brief": "https://x/B", "chatgpt": "https://x/C", "gemini": "https://x/G",
+        "claude": "https://x/CL", "synthesis": "https://x/SY",
+        "summary": "https://x/SU", "podcast": "https://x/P"}))
+    assert "Super Research: https://x/SY" in out, out
+    assert "Summary: https://x/SU" in out, out
+    # ⛔ PODCAST STAYS FIRST — this block answers "the podcast link" most often.
+    assert out.index("Podcast:") < out.index("Brief:")
+    # ⛔ AND THE DOCUMENTS FOLLOW THE REPORTS, as in the delivered Doc.
+    assert out.index("Claude report:") < out.index("Super Research:") < out.index("Summary:")
+
+
+def test_the_fallback_renderer_shows_one_combined_document_never_two():
+    """⛔ `synthesis` and `consolidated` are the SAME document under two names.
+    The web app hides the stack whenever a synthesis exists; the agent mirrors
+    that rather than printing it twice."""
+    both = "\n".join(sr._fmt_sr_links({"chatgpt": "https://x/C",
+                                       "synthesis": "https://x/SY",
+                                       "consolidated": "https://x/OLD"}))
+    assert "Super Research: https://x/SY" in both
+    assert "Consolidated" not in both, both
+
+    # ⛔ BUT AN OLDER RUN KEEPS ITS ONLY COMBINED DOCUMENT. `consolidated` is
+    # never minted any more, yet minted shares are permanent and cached on the run
+    # doc — dropping it outright would show such a run no combined document at all.
+    legacy = "\n".join(sr._fmt_sr_links({"chatgpt": "https://x/C",
+                                         "consolidated": "https://x/OLD"}))
+    assert "Consolidated: https://x/OLD" in legacy, legacy

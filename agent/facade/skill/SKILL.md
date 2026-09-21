@@ -462,13 +462,18 @@ like a shortcut, makes a claim about a conversation that did not happen.
 to hand out; relay them **as the client prints** (present them however reads cleanest
 for this chat — one link per line; don't invent your own URLs):
 - **🔒 SR permanent links** — **Brief (P1)**, the **ChatGPT / Gemini / Claude
-  reports (P2)**, and the **Podcast (P3 audio overview)**. Same links embedded in
-  the delivered Google Doc: they never expire and survive "Revoke All Shares".
+  reports (P2)**, the **Super Research** document and the **Summary** (both written
+  at delivery; an older run may show **Consolidated** in the Super Research
+  document's place — never both, they are the same document), and the **Podcast
+  (P3 audio overview)**. Same links embedded in the delivered Google Doc: they
+  never expire and survive "Revoke All Shares".
 - **🔗 platform links** — the **NotebookLM** notebook (P3), the **YouTube** video
   (P4), and the **final Google Doc** (P5). All open fine for anyone.
 
 Hand over whichever the user asks for: "the brief link" → 🔒 Brief; "a report link"
-→ the 🔒 report; "the podcast / audio overview" → the 🔒 Podcast (its audio comes
+→ the 🔒 report; "the super research doc / the combined document" → 🔒 Super
+Research (or 🔒 Consolidated on an older run); "the summary" → 🔒 Summary;
+"the podcast / audio overview" → the 🔒 Podcast (its audio comes
 from `podcast`); "the NotebookLM link" → 🔗 NotebookLM; "the video" → 🔗 YouTube;
 "the doc" → 🔗 Google Doc; "results of X" → all of that run's links. A link that
 isn't there yet → that phase hasn't finished; say so and offer to check again.
