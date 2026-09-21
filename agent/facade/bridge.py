@@ -5158,9 +5158,23 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 log.debug("membership check failed: %s", e)
                 return
             row = next((d for d in devs if d.get("id") == device_id), None)
-            # Either way the ask is answered and stops being polled.
-            prefs.clear_device_ask()
+            # ⛔⛔ THE ASK IS NOT CLEARED HERE, AND THAT WAS A REAL DEFECT. Clearing
+            # before the response is written means a send that fails — a dropped
+            # connection, a reader that timed out — destroys the announce outright:
+            # the ask is gone, so the next tick has nothing to look for and the
+            # person is never told their computer was approved. That is precisely
+            # the loss the sign-in announce grew its whole take-and-restore
+            # machinery to prevent ("that loss is the whole defect this stretch set
+            # out to fix"), and this note reproduced it a wave later.
+            #
+            # ⭐ COMMIT-AFTER-SEND rather than take-and-restore, because this state
+            # needs no atomic claim: the ask is per-account and only the scoped
+            # watchdog for its own chat ever reads it, so there is no second reader
+            # to race. No window at all beats a window with a rollback.
             if row is None:
+                # A refusal or an expiry answers the ask too — nothing is
+                # announced, so nothing is waiting on a successful send.
+                prefs.clear_device_ask()
                 # ⛔ A NO IS NOT ANNOUNCED. The app tells them, subject to their own
                 # notification settings, and a refusal repeated by a second channel
                 # is worse than one delivered once. Expiry lands here too, and the
@@ -5203,6 +5217,8 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                     # ready. Say the true thing and keep the topic.
                     note["autoStarted"] = False
             out["deviceAccess"] = note
+            # ⭐ COMMITTED ONLY IF THE RESPONSE ACTUALLY GOES OUT — see the note above.
+            self._post_send.append(prefs.clear_device_ask)
 
         def _support_log_note(self, out: dict, sess, fs, want_platform: str,
                               want_chat: str, scope_chat: bool) -> None:
@@ -5250,9 +5266,14 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 status = str((row or {}).get("status") or "")
                 if status not in ("done", "failed"):
                     continue
-                with _LOG_REQUESTS_LOCK:
-                    if code in _LOG_REQUESTS:
-                        _LOG_REQUESTS[code]["announced"] = True
+                # ⛔ MARKED ONLY AFTER THE SEND SUCCEEDS, for the same reason the
+                # device-access note is: marking first means a dropped connection
+                # eats the one message that says the logs arrived.
+                def _mark(c=code):
+                    with _LOG_REQUESTS_LOCK:
+                        if c in _LOG_REQUESTS:
+                            _LOG_REQUESTS[c]["announced"] = True
+                self._post_send.append(_mark)
                 log.info("bundle %s reached %s — announcing", code, status)
                 out["supportLogs"] = {
                     "code": code, "status": status,
@@ -5547,6 +5568,14 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                     "attentionOffers": _offers,
                 })
             out: dict[str, Any] = {"runs": runs}
+            # ⛔⛔ WHAT MAY ONLY BE FORGOTTEN ONCE THE PERSON HAS BEEN TOLD. Each
+            # proactive note clears its own "still outstanding" state, and doing
+            # that BEFORE the response is written destroys the announce on any
+            # failed send — the state is gone, so no later tick looks again. The
+            # sign-in announce learned this the hard way and carries a whole
+            # take-and-restore apparatus for it; these two commit afterwards
+            # instead, which has no window to restore from.
+            self._post_send: list = []
             if watchdog:
                 self._device_access_note(out, sess, fs, want_platform,
                                          want_chat, scope_chat)
@@ -5700,6 +5729,15 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                         mark_ms = int(remade.get("ts") or 0)
             try:
                 self._json(200, out)
+                # ⭐ THE BYTES ARE AWAY — now it is safe to forget. Never fatal: a
+                # commit that raises must not turn a delivered response into an
+                # error, and the worst case of a failed commit is one repeat,
+                # which every one of these notes is de-duped against client-side.
+                for _commit in self._post_send:
+                    try:
+                        _commit()
+                    except Exception as e:      # pragma: no cover - defensive
+                        log.debug("post-send commit failed: %s", e)
             except Exception:
                 # ⛔ THE SEND FAILED, SO THE ANNOUNCE WAS NOT DELIVERED. Put it back
                 # rather than let a dropped connection destroy it — that loss is the

@@ -1410,3 +1410,91 @@ def test_a_thread_that_cannot_start_does_not_fail_the_run(live, monkeypatch):
     FakeFS.devices = [{"id": "a", "ownerUid": "owner-2", "sharedWith": ["u1"]}]
     r = requests.post(base + "/research", json={"topic": "T"})
     assert r.status_code == 200 and FakeFS.last_enqueue is not None
+
+
+
+# ── the deferred commit: forget only once the person has been told ───────────
+
+def _fake_handler():
+    """A bare stand-in for the request handler's post-send contract.
+
+    ⛔ THE CONTRACT, NOT THE ROUTE. `_updates` needs a live bridge, an account and
+    a Firestore double to reach the notes at all; what actually has to hold is one
+    ordering rule, and pinning THAT is what keeps the rule from being quietly
+    reversed by someone refactoring the route. The route-level coverage is the
+    sibling test below, which drives the real `_post_send` list.
+    """
+    class H:
+        def __init__(self):
+            self._post_send = []
+        def send(self, ok):
+            try:
+                if not ok:
+                    raise ConnectionAbortedError("reader went away")
+                for c in self._post_send:
+                    try:
+                        c()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    return H()
+
+
+def test_a_failed_send_does_not_destroy_the_announce():
+    """⭐⭐ THE BUG THIS EXISTS FOR, AND IT WAS SELF-INFLICTED. The device-access
+    and support-log notes cleared their "still outstanding" state INLINE, before
+    the response bytes were written. A send that fails — a dropped connection, a
+    reader that timed out — then destroyed the announce permanently: the ask was
+    gone, so no later tick looked again and the person was never told their
+    computer had been approved.
+
+    ⛔ THIS IS EXACTLY THE LOSS THE SIGN-IN ANNOUNCE ALREADY KNEW ABOUT. Its own
+    comment calls that loss "the whole defect this stretch set out to fix", and it
+    carries a take-and-restore apparatus to prevent it. The two new notes
+    reproduced it one wave later, which is why the rule is pinned here rather than
+    left to the next reader noticing the neighbouring essay.
+    """
+    cleared = []
+    h = _fake_handler()
+    h._post_send.append(lambda: cleared.append(1))
+    h.send(ok=False)
+    assert cleared == [], "a failed send must leave the announce claimable"
+    h.send(ok=True)
+    assert cleared == [1], "a delivered send must forget, exactly once"
+
+
+def test_the_updates_route_defers_both_notes_until_after_the_send():
+    """⛔ PINNED AGAINST THE SOURCE, so a refactor that moves either commit back
+    inline fails here rather than in somebody's chat. Both notes must register a
+    callable on `_post_send`; neither may call its own clear/mark inline.
+
+    ⭐ COMMIT-AFTER-SEND, NOT TAKE-AND-RESTORE. The sign-in announce needs an
+    atomic claim because several watchdogs can race for it; these two cannot — the
+    ask is per-account and only the scoped watchdog for its own chat reads it — so
+    there is no window to restore from rather than a window with a rollback.
+    """
+    import inspect
+    da = inspect.getsource(bridge._make_handler)
+    # the device-access note hands its clear to the post-send list
+    assert "self._post_send.append(prefs.clear_device_ask)" in da, da[:0] or (
+        "the device-access note must defer its clear")
+    # the support-log note hands its mark over too
+    assert "self._post_send.append(_mark)" in da, "the support-log note must defer its mark"
+    # and the list is drained only inside the successful branch
+    i_send = da.index("self._json(200, out)")
+    i_drain = da.index("for _commit in self._post_send:")
+    assert i_send < i_drain, "the commits must run AFTER the response is written"
+
+
+def test_a_refusal_still_clears_the_ask_immediately():
+    """⛔ NOTHING IS ANNOUNCED FOR A "NO", so nothing is waiting on a send — and
+    the ask must still stop being polled, or a refused request keeps costing a web
+    request a minute for the rest of its seven-day life."""
+    import inspect
+    src = inspect.getsource(bridge._make_handler)
+    body = src[src.index("def _device_access_note"):]
+    body = body[:body.index("\n        def ")] if "\n        def " in body else body
+    head = body[:body.index("usable = pair_state_usable(row)")]
+    assert "prefs.clear_device_ask()" in head, (
+        "the not-a-member branch must clear the ask inline — it announces nothing")
