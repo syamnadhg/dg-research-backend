@@ -56,7 +56,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 SUITES = ("tests/test_resume_drop_writeback_108.py "
           "tests/test_dead_worker_wiring_108.py "
-          "tests/test_stop_is_not_a_crash_108.py")
+          "tests/test_stop_is_not_a_crash_108.py "
+          "tests/test_cloud_handoff_record_108.py")
 RESEARCH = "research.py"
 FILES = (RESEARCH,)
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
@@ -123,6 +124,18 @@ S_GATE = "    if _stop_path is not None and _no_auto_retry_marked(_stop_path.par
 S_CLEAR = "                _clear_no_auto_retry(queue_dir)"
 #: The marker's name, which must not be the terminal stop sentinel.
 S_NAME = 'NO_AUTO_RETRY_MARKER = ".no_auto_retry"'
+
+# ── anchors: the run's record surviving the hand-off ───────────────────────
+#: Resolving the destination from the RESEARCH, not from whatever is armed.
+H_RESOLVE = "        folders = _run_folders_for_research_any(rid)"
+#: The resolver's match — on meta.json's researchId, never on the folder name.
+H_MATCH = '        if str(meta.get("researchId") or "").strip() == rid:'
+#: Its own file, because the capped writer is closed after the seal.
+H_FILE = '            with open(folder / CLOUD_HANDOFF_FILENAME, "a", encoding="utf-8") as fh:'
+#: Re-checked immediately before the write.
+H_RECHECK = "            if not folder.is_dir():"
+#: The one call both POST outcomes reach.
+H_BOTH = "            _note_cloud_handoff(research_id, _hl)"
 #: A repaired worker retracting its own marker at boot.
 W_RETRACT = "            _clear_worker_dead_marker(WORKER_ID)"
 
@@ -279,6 +292,60 @@ MUTANTS = [
      "wave's drop write-back it also tells them the run 'was stopped for good', "
      "which is a false account of a crash",
      [(S_NAME, 'NO_AUTO_RETRY_MARKER = ".stop"')]),
+
+    # ── H: the run's record surviving the hand-off ────────────────────────
+    ("H1", "under", RESEARCH,
+     "⛔⛔ THE CROSS-RUN MIS-ATTRIBUTION, RESTORED — the destination comes from "
+     "whatever sink is armed at write time again. The drive writes minutes "
+     "after this run's sink was popped, so run A's outcome lands in run B's "
+     "folder and ships in B's support bundle. Filed as a HIGH in its own right",
+     [(H_RESOLVE,
+       "        _s = _active_run_sink()\n"
+       "        folders = [_s.dir] if _s is not None else []")]),
+
+    ("H2", "under", RESEARCH,
+     "⛔ the sweep's resolver is reused, and it SKIPS a folder a sink is armed "
+     "on — correct for a delete path, wrong here. The drive starts while the "
+     "pipeline is still finishing, so the pre-seal line is dropped and the "
+     "harder case looks handled",
+     [(H_RESOLVE, "        folders = _run_log_folders_for_research(rid)")]),
+
+    ("H3", "under", RESEARCH,
+     "⛔ the resolver matches on the FOLDER NAME instead of the meta. The name "
+     "is sanitised, so two researches can share a prefix and a research whose "
+     "id the pattern strips does not appear in its own name at all",
+     [(H_MATCH, "        if rid[:8] in folder.name:")]),
+
+    ("H4", "under", RESEARCH,
+     "⛔⛔ THE LINE GOES BACK INTO `run.log`, WHICH IS CLOSED. `finalize()` "
+     "closes the capped writer and a write to a closed writer is a silent "
+     "no-op — the record is lost at exactly the moment it matters, and nothing "
+     "reports a failure",
+     [(H_FILE, '            with open(folder / "run.log", "a", encoding="utf-8") as fh:')]),
+
+    # ⛔ THIS MUTANT WAS EQUIVALENT ON ITS FIRST RUN, and that is a HARNESS bug,
+    # not a survivor. It removed the `is_dir()` re-check — but `open(..., "a")`
+    # does not create parent directories, so the only thing that changed was a
+    # DEBUG line. The property the test actually asserts is that the folder is
+    # never RE-CREATED, so the mutant now does the thing that would break it.
+    ("H5", "over", RESEARCH,
+     "⛔ a `mkdir` creeps in beside the write — the natural repair for the "
+     "exception the missing folder throws — and a sweep that removed the "
+     "folder between the listing and the append gets it back holding one line "
+     "and no meta: a shape the next sweep cannot identify and the bundle index "
+     "cannot describe",
+     [(H_RECHECK,
+       "            folder.mkdir(parents=True, exist_ok=True)\n"
+       "            if not folder.is_dir():")]),
+
+    ("H6", "under", RESEARCH,
+     "⛔⛔ THE REFUSAL STOPS BEING RECORDED — the shared call moves inside the "
+     "2xx branch, so a 401/403 leaves nothing anywhere. The web deliberately "
+     "writes nothing on those two exits (no verified identity to write under) "
+     "and says in its own words that this half belongs to the machine. This is "
+     "the whole of the item",
+     [(H_BOTH, "            if _resp.status_code in (200, 202):\n"
+               "                _note_cloud_handoff(research_id, _hl)")]),
 ]
 
 

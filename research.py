@@ -3001,6 +3001,104 @@ def _log_write_through(line: str, level: str) -> None:
         _RUN_LOG_TLS.busy = False
 
 
+CLOUD_HANDOFF_FILENAME = "handoff.log"
+
+
+def _run_folders_for_research_any(research_id, root=None) -> "list[Path]":
+    """Every run-log folder for one research — LIVE ONES INCLUDED.
+
+    ⛔⛔ DELIBERATELY NOT `_run_log_folders_for_research`. That one is the
+    DELETE path's resolver and skips any folder a sink is currently armed on,
+    which is exactly right for a sweep and exactly wrong here: the P4/P5 drive
+    starts while the pipeline is still finishing, so its first line can arrive
+    before the seal. Reusing the sweep's resolver would silently drop that line
+    and leave the harder case — the one we are here to fix — looking fixed.
+
+    Matched on `meta.json`'s researchId, never on the folder name, for the same
+    reason the sweep does: the name is sanitised and two researches can share a
+    prefix.
+    """
+    out: "list[Path]" = []
+    rid = str(research_id or "").strip()
+    if not rid:
+        return out
+    base = Path(root) if root is not None else _runs_log_root()
+    try:
+        folders = [p for p in base.iterdir() if p.is_dir()]
+    except OSError:
+        return out
+    for folder in folders:
+        try:
+            meta = json.loads((folder / "meta.json").read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if str(meta.get("researchId") or "").strip() == rid:
+            out.append(folder)
+    out.sort(key=_safe_mtime)
+    return out
+
+
+def _note_cloud_handoff(research_id, line: str) -> bool:
+    """Put one line about the P4/P5 hand-off into THAT run's own folder.
+
+    ⛔⛔ WHY THIS EXISTS, MEASURED ON A REAL DISK. `log()` copies into
+    `_RUN_LOG_SINKS[-1]` — a module-global stack, read at WRITE time. The drive
+    thread posts to `/api/uploadYouTube` with a 3600s timeout and writes its
+    outcome minutes later, by which point the pipeline's sink has been popped.
+    Across all three run folders on this machine the drive's own outcome strings
+    appear ZERO times, while the synchronous marker line written one second
+    earlier — same run, same function, worker thread — is there. And if the NEXT
+    run has armed a sink by then, the line lands in that run's folder and ships
+    in that person's support bundle.
+
+    ⭐ SO THE FOLDER IS ADDRESSED BY `researchId`, NEVER BY "whatever is armed".
+    Writing into a SEALED folder is already the pattern here twice —
+    `_patch_run_log_status` reaches into a finalized meta, `_pull_cloud_logs`
+    drops `cloud.log` into a finished run — so this is a third use of a shape
+    the collector already walks: `folder.rglob("*")` picks it up with no bundle
+    change at all.
+
+    ⛔ AND IT IS AN APPEND TO ITS OWN FILE, not to `run.log`. `finalize()`
+    closes the capped writer, and `write_line` on a closed writer is a silent
+    no-op — a line written there after the seal would be lost exactly when it
+    matters most.
+    """
+    rid = str(research_id or "").strip()
+    if not rid or not line:
+        return False
+    try:
+        folders = _run_folders_for_research_any(rid)
+    except Exception:
+        return False
+    if not folders:
+        return False
+    stamped = f"[{datetime.now().strftime('%H:%M:%S')}] {line}\n"
+    wrote = False
+    for folder in folders[-1:]:
+        try:
+            # ⛔ NEVER `mkdir` HERE. Clear Logs and the orphan sweep can remove
+            # the folder between the listing above and this write, and
+            # re-creating it would leave a directory holding one line and no
+            # meta — a shape the next sweep cannot identify and the bundle
+            # index cannot describe. `_pull_cloud_logs` takes the same care and
+            # says so.
+            #
+            # ⚠ THE RE-CHECK IS HYGIENE, NOT THE GUARD, and a mutant made me
+            # say so properly: `open(..., "a")` does not create parent
+            # directories, so removing this line changes nothing but a DEBUG
+            # log. The thing that must stay true is the ABSENCE of a mkdir, and
+            # that is what the test pins.
+            if not folder.is_dir():
+                continue
+            with open(folder / CLOUD_HANDOFF_FILENAME, "a", encoding="utf-8") as fh:
+                fh.write(stamped)
+            wrote = True
+        except Exception as _hf_err:
+            log(f"[handoff-log] could not record for {rid[:8]}… (non-fatal): {_hf_err}",
+                "DEBUG")
+    return wrote
+
+
 def _run_log_folder_name(research_id, started_utc, attempt=0) -> str:
     """Folder key for one run's log directory.
 
@@ -16062,16 +16160,43 @@ def _post_fe_p4p5_trigger(uid, research_id):
                 json={"research_id": research_id, "ownerUid": uid},
                 timeout=3600,  # match the route's Cloud Run maxDuration (long podcast encode + upload)
             )
+            # ⛔⛔ EVERY ONE OF THESE LINES USED TO LAND NOWHERE. `log()` copies
+            # into the sink that is armed AT WRITE TIME, and by now this run's
+            # sink has been popped — so the machine's only account of how the
+            # cloud half went was a line in a machine-wide file nobody can cut
+            # a run out of. Measured: zero occurrences across every run folder
+            # on this disk. `_note_cloud_handoff` addresses the run's OWN
+            # folder by researchId, which is also what stops a slow encode
+            # dropping this run's line into the NEXT run's support bundle.
             if _resp.status_code in (200, 202):
+                _hl = f"P4/P5 dispatched to the cloud ✓ (HTTP {_resp.status_code})"
                 log(f"FE trigger: BE-driven P4/P5 dispatched ✓ (HTTP {_resp.status_code}) rid={research_id[:8]}…")
             else:
+                # ⭐⭐ THE REFUSAL CASE, AND THE WEB SAYS IN ITS OWN WORDS THAT
+                # THIS HALF IS OURS. `uploadYouTube` leaves a marker on every
+                # post-auth exit, and deliberately NOT on the 401/403 ones: a
+                # 401 has no verified identity and a 403 has one that failed
+                # its check, so writing from there means writing under a
+                # caller's CLAIMED ownerUid — the exact relay hole the check
+                # closes. It also drops its own captured lines for those two
+                # exits, because the key they would be filed under is the
+                # thing in question. So on a refusal NOTHING was written
+                # anywhere, by anyone. We know who we are; we write it here.
+                _hl = (f"P4/P5 refused by the cloud — HTTP {_resp.status_code} "
+                       f"({_resp.text[:160]}). The run is still on phase 3 until "
+                       f"the chat is opened and the catch-up fires.")
                 log(
                     f"FE trigger: BE-driven P4/P5 HTTP {_resp.status_code} "
                     f"({_resp.text[:160]}) — FE catch-up covers via marker",
                     "WARN",
                 )
+            _note_cloud_handoff(research_id, _hl)
         except Exception as _e:
             log(f"FE trigger: BE-driven P4/P5 dispatch failed ({_e}) — FE catch-up covers via marker", "WARN")
+            _note_cloud_handoff(
+                research_id,
+                f"P4/P5 dispatch never reached the cloud ({_e}). The run is still "
+                f"on phase 3 until the chat is opened and the catch-up fires.")
 
     try:
         import threading as _threading
