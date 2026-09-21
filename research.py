@@ -2601,6 +2601,83 @@ def _start_doc_identity_conflict(data) -> "tuple[str, str] | None":
     return None
 
 
+# ── A Resume we cannot take has to say so ──────────────────────────────────
+# ⛔⛔ MEASURED 2026-09-21. The resume handler has exactly ONE Firestore write
+# and it is on the success path. NINE other exits delete the queue entry and
+# write nothing, so the research document keeps whatever status put the Resume
+# banner on screen — which the web reads as a run that is paused but NOT over.
+# The web side closes the loop the wrong way round: `resumePipelineFromCheckpoint`
+# is a bare addDoc with no listener and no timeout, and the chat used to clear
+# its card the moment that write resolved. Four seconds later there was no
+# banner, no error and no button, on a request this process had already thrown
+# away.
+#
+# ⭐ ONLY THREE OF THE NINE GET A WRITE-BACK, and the line between them is
+# whether the person can do anything. The zombie and claim-error exits leave the
+# banner up with the artifacts intact and replay on the next restart — telling
+# somebody a run failed when it is about to be retried would be the next false
+# sentence. These three cannot be retried by anyone:
+#   · no backendRunId  — there is no run directory to point at;
+#   · queue_dir gone   — the 7-day sweep took the artifacts;
+#   · .stop present    — the run was terminally stopped.
+#
+# ⭐⭐ AND `paused_backend_restart_failed` COSTS NOTHING HERE, which is why this
+# needed no owner decision. That status is absent from `_safe_enqueue`'s
+# whitelist, so writing it permanently closes auto-resume for the run — a real
+# cost on a recoverable run, and none at all on these three, where every
+# re-enqueue path is already blocked: `.stop` is that funnel's FIRST gate, and
+# the other two have no artifacts to resume from. Blocking a resume that cannot
+# work is not a loss.
+RESUME_DROP_NO_RUN_ID = (
+    "This run has no saved checkpoint on the computer, so there is nothing to "
+    "pick up from. Start it again to run it fresh."
+)
+RESUME_DROP_ARTIFACTS_GONE = (
+    "The saved files for this run have been cleared from the computer, so it "
+    "can't be picked up from where it stopped. Start it again to run it fresh."
+)
+RESUME_DROP_TERMINALLY_STOPPED = (
+    "This run was stopped for good, so it can't be resumed. Start it again to "
+    "run it fresh."
+)
+
+
+RESUME_DROP_WENT_STALE = (
+    "Your earlier Resume sat waiting for more than 12 hours because Super "
+    "Research wasn't running on the computer, so it was dropped. The run's "
+    "files are still there — start the app and tap Resume again."
+)
+
+
+def _resume_drop_writeback(uid: str, research_id: str, reason: str,
+                           status: "str | None" = "paused_backend_restart_failed") -> bool:
+    """Record that a Resume was received and cannot be honoured.
+
+    ⭐ THE STATUS IS THE ONE THE WEB ALREADY DRAWS. `paused_backend_restart_failed`
+    has a card, and as of wave 10.8 that card renders `lastError` in place of its
+    generic line — so the sentence passed here is what the person reads. Nothing
+    new had to be added to the status union, and no surface had to learn a word.
+
+    ⛔⛔ `status=None` MEANS LEAVE IT ALONE, AND ONE CALLER NEEDS THAT. The
+    12-hour abandoned sweep drops a resume request whose artifacts are still on
+    disk — nothing has swept them at twelve hours, the 7-day sweep does that —
+    so the run really is still resumable and stamping the failed status would
+    close auto-resume on a run that can be picked up. That caller writes the
+    sentence and nothing else: the banner stays, still offering Resume, and now
+    says why the last one went nowhere.
+
+    Returns whatever the write returned; the caller deletes the queue entry
+    either way, because a queue document we cannot act on must not be left to
+    be re-read on the next snapshot.
+    """
+    if not uid or not research_id:
+        return False
+    updates: dict = {"lastError": reason}
+    if status:
+        updates["status"] = status
+    return _update_research_doc(uid, research_id, updates)
+
+
 def _start_doc_identity_refused(data, where: str) -> bool:
     """True when this START doc must not be claimed. Logs the reason.
 
@@ -13358,7 +13435,18 @@ def start_firestore_start_listener(job_queue, loop):
                 # (incl. an owner-initiated Stop/Cancel) with no feedback.
                 # Processing a stale cancel is a cheap idempotent no-op
                 # (the target run is long terminal), so let it through.
-                # (resume docs keep their prior behavior — out of scope.)
+                #
+                # ⛔⛔ 2026-09-21 (wave 10.8): "resume docs keep their prior
+                # behavior — out of scope" was the note here, and the prior
+                # behaviour is a SILENT DELETE. The banner's own copy is "Start
+                # Super Research on your PC, then tap Resume" — so tapping
+                # before booting is the order the product asks for, and a
+                # person who does that overnight had their request dropped at
+                # twelve hours with nothing said anywhere. The artifacts are
+                # untouched at this point (the 7-day sweep is what removes
+                # them), so the run is still resumable and the STATUS must not
+                # move — this writes the sentence alone, leaving the banner up
+                # and still offering Resume.
                 #
                 # #904 review catch (wake-before-boot hole): the keepalive
                 # re-stamps restDeferredAt only while the BE is ALIVE. Park
@@ -13404,6 +13492,10 @@ def start_firestore_start_listener(job_queue, loop):
                     f"age={_age_ms // 1000}s — deleting",
                     "INFO",
                 )
+                if data.get("action") == "resume":
+                    _resume_drop_writeback(
+                        data.get("uid") or "", data.get("researchId") or "",
+                        RESUME_DROP_WENT_STALE, status=None)
                 try:
                     doc.reference.delete()
                 except Exception:
@@ -13809,18 +13901,21 @@ def start_firestore_start_listener(job_queue, loop):
                     backend_run_id = rd.get("backendRunId") or ""
                 if not backend_run_id:
                     log(f"Resume: research {target_rid[:8]}... has no backendRunId", "WARN")
+                    _resume_drop_writeback(target_uid, target_rid, RESUME_DROP_NO_RUN_ID)
                     try: doc.reference.delete()
                     except Exception: pass
                     continue
                 queue_dir = Path(__file__).parent / "queues" / backend_run_id
                 if not queue_dir.exists():
                     log(f"Resume: queue_dir missing for {backend_run_id} — disk artifacts gone", "WARN")
+                    _resume_drop_writeback(target_uid, target_rid, RESUME_DROP_ARTIFACTS_GONE)
                     try: doc.reference.delete()
                     except Exception: pass
                     continue
                 # Block resume of terminal-stopped runs (mirrors HTTP endpoint).
                 if (queue_dir / ".stop").exists():
                     log(f"Resume: run {backend_run_id} marked .stop (terminal) — skipping", "WARN")
+                    _resume_drop_writeback(target_uid, target_rid, RESUME_DROP_TERMINALLY_STOPPED)
                     try: doc.reference.delete()
                     except Exception: pass
                     continue
