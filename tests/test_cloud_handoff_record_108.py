@@ -233,6 +233,39 @@ def test_the_drive_records_every_outcome_it_can_have():
         "a dispatch that never reached the cloud leaves no record")
 
 
+def test_a_connection_cut_mid_flight_is_not_reported_as_never_arriving():
+    """⛔⛔ THE FIRST VERSION OF THIS RECORD LIED ON THE MAJORITY PATH, and the
+    wave's own measurement convicted it. Something in front of Cloud Run severs
+    this socket at EXACTLY 300 seconds while the route keeps working — one
+    measured run finished at 497s — so `requests` raises on every P4/P5 longer
+    than five minutes, and the exception branch wrote "never reached the cloud …
+    still on phase 3" into the run's permanent record on runs that SUCCEEDED.
+    A lying diagnostic is worse than none, and this file rides the support
+    bundle."""
+    import ast
+    import inspect
+    import textwrap
+    src = textwrap.dedent(inspect.getsource(research._post_fe_p4p5_trigger))
+    drive = next(n for n in ast.walk(ast.parse(src))
+                 if isinstance(n, ast.FunctionDef) and n.name == "_drive_once")
+    handler = next(n for n in ast.walk(drive) if isinstance(n, ast.Try)).handlers[0]
+    # the branch must ASK how long the connection lasted
+    names = {n.id for n in ast.walk(handler) if isinstance(n, ast.Name)}
+    assert "_DRIVE_SENT_AFTER_SEC" in names, (
+        "the exception branch cannot tell a connection that never opened from "
+        "one that was cut after the cloud had the request")
+    body = ast.dump(handler)
+    assert "never reached the cloud" in body, "the genuine never-arrived case lost its sentence"
+    assert "may be finishing it" in body, "the cut-mid-flight case has no sentence of its own"
+
+
+def test_the_threshold_is_far_below_the_measured_severance():
+    """⭐ 300 seconds is where the real severance lands. The threshold only has
+    to separate "never left" (DNS, refused, no route — instant) from anything
+    the cloud actually received, so it sits close to zero and nowhere near 300."""
+    assert 1 <= research._DRIVE_SENT_AFTER_SEC <= 60
+
+
 def test_the_refusal_line_says_what_happens_next():
     """⭐ A record nobody can act on is a log line with extra steps. The run is
     recoverable — `needsFeTrigger` was written synchronously before the POST —

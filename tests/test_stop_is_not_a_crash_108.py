@@ -219,6 +219,44 @@ def test_a_stopped_run_gets_a_terminal_status_and_an_event():
     assert "'stopped'" in src or '"stopped"' in src
 
 
+def test_the_stop_exit_does_not_overwrite_a_terminal_status():
+    """⛔⛔ CROSS-VERIFY CAUGHT THIS IN THE FIX ITSELF. A watchdog kill writes
+    `stopped_by_watchdog` AND queues a stop command, whose handler closes the
+    browser — so that death lands in this very branch, sees `.stop`, and a
+    blind write of plain "stopped" erased the attribution seconds later. Plain
+    `stopped` is not a recovery status, so the chat's listener then CLEARED the
+    card: the person lost the only sentence explaining a ceiling stop and both
+    of its buttons. Before this wave the block wrote no status at all, which is
+    exactly why the defect could not exist until I added the write."""
+    h = _except_handler()
+    branch = next(n for n in ast.walk(h)
+                  if isinstance(n, ast.If) and isinstance(n.test, ast.Name)
+                  and n.test.id == "_stop_requested")
+    guarded = [
+        n for n in ast.walk(branch)
+        if isinstance(n, ast.If)
+        and any(isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+                and c.func.id == "_research_is_terminal" for c in ast.walk(n.test))
+    ]
+    assert guarded, (
+        "the stop exit writes a status without asking whether the run already "
+        "carries a terminal one — a watchdog kill lands here and loses its "
+        "attribution and its card")
+    src = ast.dump(ast.Module(body=guarded[0].body, type_ignores=[]))
+    assert "_update_research_doc" in src or "_update_firestore_research" in src, (
+        "the guard is present but the write is outside it")
+
+
+def test_the_terminal_set_the_guard_reads_matches_the_pre_claim_gate():
+    """⭐ ONE LIST, AND IT ALREADY EXISTED IN THIS FILE AS A LITERAL. The
+    pre-claim gate a few hundred lines below names the same five; if the two
+    drift, a run terminal to one is resumable to the other."""
+    assert set(research.TERMINAL_RESEARCH_STATUSES) == {
+        "stopped", "completed", "archived",
+        "terminated_by_user_discard", "stopped_by_watchdog",
+    }
+
+
 def test_the_terminal_crash_card_records_that_it_gave_up():
     """⛔ Without this write the marker is a constant nothing ever sets, and
     every test above passes against a product that still relaunches."""

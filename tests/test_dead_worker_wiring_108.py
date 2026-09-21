@@ -159,6 +159,23 @@ def test_worker_one_actually_starts_the_reconciler():
         "pass their own tests")
 
 
+def test_the_supervisor_retracts_the_marker_when_a_retry_SUCCEEDS():
+    """⛔⛔ CROSS-VERIFY CAUGHT THE PREMISE OF MY OWN WIDENING. `_dead` does not
+    mean the supervisor gave up: the 2-second tick respawns any slot that is
+    None or `_dead`. So a marker written on a single failed spawn survives a
+    SUCCESSFUL retry until the child reaches its own `--serve` boot — well past
+    Firebase init. If that exceeds the 60-second grace and worker 1's reconcile
+    tick lands in the window, it stamps `paused_backend_restart` on every
+    ongoing run of a worker that is mid-boot, and that worker's own rehydration
+    then skips them because they are no longer ongoing. A supervised device
+    silently stops recovering its own runs."""
+    fn = _fn("run_daemon_loop")
+    clears = _calls_named(fn, "_clear_worker_dead_marker")
+    assert len(clears) >= 3, (
+        f"only {len(clears)} of the supervisor's successful-spawn paths retract "
+        f"the marker — the marker outlives the failure it records")
+
+
 def test_a_worker_that_boots_retracts_its_own_marker():
     """⛔ THE OTHER HALF OF THE SAME MECHANISM. Without the retraction an
     operator repair needs a manual step nobody documents, and worker 1

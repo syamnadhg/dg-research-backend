@@ -239,6 +239,7 @@ def test_the_helper_refuses_a_half_identity(monkeypatch):
 
 
 def test_the_helper_can_leave_the_status_alone(monkeypatch):
+    monkeypatch.setattr(research, "_research_is_terminal", lambda u, r: False)
     """⛔⛔ THE 12-HOUR CASE NEEDS THIS AND THE OTHER THREE MUST NOT USE IT.
     `paused_backend_restart_failed` is absent from `_safe_enqueue`'s whitelist,
     so writing it permanently closes auto-resume for that run. On the three
@@ -253,6 +254,49 @@ def test_the_helper_can_leave_the_status_alone(monkeypatch):
     calls.clear()
     research._resume_drop_writeback("uid", "rid", "why")
     assert calls[0]["status"] == "paused_backend_restart_failed"
+
+
+def test_a_run_that_is_already_OVER_gets_the_sentence_and_keeps_its_status(monkeypatch):
+    """⛔⛔ THE NASTIEST SHAPE IN THE WAVE, CAUGHT BY CROSS-VERIFY BEFORE THE
+    PUSH. The recovery card offers Resume for all four statuses INCLUDING the
+    two terminal ones, so pressing it on a watchdog-stopped or discarded run
+    reaches these branches. A blind write of `paused_backend_restart_failed`
+    demotes a finished run to a non-terminal one — and that status is
+    deliberately absent from the web's TERMINAL_RUN_STATUSES, so the listing
+    page recomputes `isActivePipeline` as true and puts Stop and Pause back on
+    a run that ended hours ago. That is the wave-10.7 defect reopened, and
+    pressing Stop there overwrites the record permanently."""
+    writes = []
+    monkeypatch.setattr(research, "_update_research_doc",
+                        lambda u, r, up: writes.append(up) or True)
+    for terminal in research.TERMINAL_RESEARCH_STATUSES:
+        writes.clear()
+        monkeypatch.setattr(research, "_firebase_db", _FakeDb({}, {"status": terminal}))
+        research._resume_drop_writeback("uid", "rid", "because")
+        assert writes and "status" not in writes[0], (
+            f"a {terminal} run was demoted to paused_backend_restart_failed")
+        assert writes[0]["lastError"] == "because", "and it still says why"
+    # ⭐ ACCEPT POLARITY — a run that is genuinely still going IS moved.
+    writes.clear()
+    monkeypatch.setattr(research, "_firebase_db", _FakeDb({}, {"status": "ongoing"}))
+    research._resume_drop_writeback("uid", "rid", "because")
+    assert writes[0]["status"] == "paused_backend_restart_failed"
+
+
+def test_an_unreadable_document_leaves_the_status_alone(monkeypatch):
+    """⚠ FAILS CLOSED, and that is the cheap direction. The worst case is a
+    sentence with no status change — the person still learns why. The other
+    direction demotes a finished run."""
+    writes = []
+    monkeypatch.setattr(research, "_update_research_doc",
+                        lambda u, r, up: writes.append(up) or True)
+    monkeypatch.setattr(research, "_firebase_db", _FakeDb({}, RuntimeError("503")))
+    research._resume_drop_writeback("uid", "rid", "because")
+    assert "status" not in writes[0]
+    monkeypatch.setattr(research, "_firebase_db", None)
+    writes.clear()
+    research._resume_drop_writeback("uid", "rid", "because")
+    assert "status" not in writes[0]
 
 
 def test_the_failed_status_is_still_outside_the_enqueue_whitelist(monkeypatch):
@@ -367,7 +411,12 @@ def test_every_write_back_precedes_its_delete_in_the_parse_tree():
         # failed on code that was correct — a false alarm is the same disease
         # as a silent pass. The write and the delete that concern each other
         # are siblings, so siblings is what this reads.
-        body_calls = _calls_not_under_a_nested_if(node.body)
+        # ⛔ BOTH ARMS. Checking only `body` meant an `else:` that also writes
+        # was invisible — and the repair that split the no-backendRunId branch
+        # put a write in exactly that arm. A checker blind to half a branch
+        # under-counts, which is how `seen` came out one short and told me so.
+        body_calls = (_calls_not_under_a_nested_if(node.body)
+                      + _calls_not_under_a_nested_if(node.orelse))
         kinds = [k for k, _ in body_calls]
         if "write" not in kinds:
             continue
@@ -390,8 +439,70 @@ def test_every_write_back_precedes_its_delete_in_the_parse_tree():
     # ⛔ AND THE COUNTS, or this whole test passes vacuously on a file where
     # nothing calls the helper at all. Three branches write AND delete in the
     # same breath; the fourth is the 12-hour guard described above.
+    # ⛔ THE COUNTS MOVED WITH A REPAIR, AND THE REASON IS RECORDED RATHER
+    # THAN THE NUMBER QUIETLY LOWERED. Cross-verify found the no-backendRunId
+    # branch closing auto-recovery on runs whose files are still on disk, so
+    # that branch now forks: an on-disk run gets the sentence with no status
+    # change, an absent one gets the full refusal. Both sub-branches write and
+    # the delete is their shared sibling — the same shape the 12-hour guard
+    # already had. So more branches WRITE, and the same two write-then-delete.
+    # FOUR, measured, not guessed: the queue_dir-gone branch, the `.stop`
+    # branch, the 12-hour guard, and the no-backendRunId fork — whose two arms
+    # are two writes inside ONE `if`, so it counts once.
     assert seen >= 4, f"expected at least 4 write-back branches, walked {seen}"
-    assert paired >= 3, f"expected 3 write-then-delete branches, found {paired}"
+    assert paired >= 2, f"expected 2 write-then-delete branches, found {paired}"
+
+
+def test_the_no_run_id_branch_asks_the_disk_before_closing_recovery():
+    """⛔⛔ CROSS-VERIFY SEPARATED TWO THINGS I HAD CONFLATED. "There is no run
+    directory to point at" was my justification for closing auto-recovery on
+    this branch — and it is true of the DOCUMENT, not the disk. The start
+    listener writes `backendRunId` back with an update and falls back to a
+    merged set precisely because that write can fail; when both fail the run
+    proceeds with a real `queues/<run_id>` directory while the document carries
+    nothing. `paused_backend_restart_failed` is outside BOTH enqueue whitelists,
+    so writing it there ends that run's automatic recovery for ever."""
+    fn = _resume_branch_nodes()
+    # The call is in the assignment above the fork, so find the name it binds
+    # and then the `if` that branches on it — matching the call inside the test
+    # would pin a spelling rather than the structure.
+    bound = {
+        t.id for n in ast.walk(fn) if isinstance(n, ast.Assign)
+        for t in n.targets
+        if isinstance(t, ast.Name) and isinstance(n.value, ast.Call)
+        and isinstance(n.value.func, ast.Name)
+        and n.value.func.id == "_run_dir_owning_research"
+    }
+    assert bound, "the no-backendRunId branch no longer consults the disk"
+    forks = [
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.If)
+        and any(isinstance(c, ast.Name) and c.id in bound for c in ast.walk(n.test))
+    ]
+    assert forks, "the disk answer is fetched and then never branched on"
+    fork = forks[0]
+    on_disk = _calls_not_under_a_nested_if(fork.body)
+    absent = _calls_not_under_a_nested_if(fork.orelse)
+    assert on_disk and absent, "one arm of the fork writes nothing"
+    src = ast.dump(ast.Module(body=fork.body, type_ignores=[]))
+    assert "status" in src and "None" in src, (
+        "the on-disk arm must pass status=None — its run can still be resumed")
+
+
+def test_a_run_whose_folder_is_on_disk_is_found_by_its_owner_file(tmp_path, monkeypatch):
+    """⭐ The disk is the second opinion, and it is matched on `owner.json`'s
+    researchId rather than the folder name — the name is sanitised and two
+    researches can share a prefix."""
+    monkeypatch.setattr(research, "__file__", str(tmp_path / "research.py"))
+    d = tmp_path / "queues" / "Topic_20260101_000000"
+    d.mkdir(parents=True)
+    (d / "owner.json").write_text('{"uid": "u", "researchId": "chat_A"}', encoding="utf-8")
+    other = tmp_path / "queues" / "Topic_20260101_010000"
+    other.mkdir(parents=True)
+    (other / "owner.json").write_text('{"uid": "u", "researchId": "chat_B"}', encoding="utf-8")
+    assert research._run_dir_owning_research("chat_A") == d
+    assert research._run_dir_owning_research("chat_missing") is None
+    assert research._run_dir_owning_research("") is None
 
 
 def test_the_three_sentences_are_distinct_and_none_is_empty():
@@ -399,11 +510,12 @@ def test_the_three_sentences_are_distinct_and_none_is_empty():
     say the same thing about a swept folder and a deliberate stop, which is the
     class of flattening this project keeps having to undo."""
     lines = [research.RESUME_DROP_NO_RUN_ID,
+             research.RESUME_DROP_NO_RUN_ID_ON_DISK,
              research.RESUME_DROP_ARTIFACTS_GONE,
              research.RESUME_DROP_TERMINALLY_STOPPED,
              research.RESUME_DROP_WENT_STALE]
     assert all(len(s.strip()) > 40 for s in lines)
-    assert len(set(lines)) == 4
+    assert len(set(lines)) == 5
     # Each one tells the person what to do next, which is the whole point of
     # writing it rather than logging it.
     for s in lines:

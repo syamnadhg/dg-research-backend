@@ -67,13 +67,20 @@ ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 #: The helper's identity refusal.
 IDENTITY = "    if not uid or not research_id:\n        return False\n    updates: dict = {\"lastError\": reason}"
 #: The optional status, which one caller needs to be absent.
-OPTIONAL_STATUS = "    if status:\n        updates[\"status\"] = status"
+OPTIONAL_STATUS = ("    if status and not _research_is_terminal(uid, research_id):\n"
+                   "        updates[\"status\"] = status")
 #: The three sentences.
 S_NO_RUN = "RESUME_DROP_NO_RUN_ID = ("
 S_GONE = "RESUME_DROP_ARTIFACTS_GONE = ("
 S_STOPPED = "RESUME_DROP_TERMINALLY_STOPPED = ("
 #: Branch 1 — no backendRunId at all.
-B_NO_RUN = ("                    _resume_drop_writeback(target_uid, target_rid, RESUME_DROP_NO_RUN_ID)\n"
+#: ⛔ RE-ANCHORED IN THE REPAIR ROUND. The branch grew a fork — a run whose
+#: files are still on disk keeps its recovery — so the old two-line needle
+#: matched inside the `else:` arm and removing it left that arm EMPTY. The
+#: mutant stopped parsing, which the backend's own ratchet caught: a harness
+#: with no pre-write compile guard would have reported those as kills.
+B_NO_RUN = ("                    else:\n"
+            "                        _resume_drop_writeback(target_uid, target_rid, RESUME_DROP_NO_RUN_ID)\n"
             "                    try: doc.reference.delete()")
 #: Branch 2 — the run folder was swept.
 B_GONE = ("                    _resume_drop_writeback(target_uid, target_rid, RESUME_DROP_ARTIFACTS_GONE)\n"
@@ -136,7 +143,11 @@ H_FILE = '            with open(folder / CLOUD_HANDOFF_FILENAME, "a", encoding="
 #: Re-checked immediately before the write.
 H_RECHECK = "            if not folder.is_dir():"
 #: The one call both POST outcomes reach.
-H_BOTH = "            _note_cloud_handoff(research_id, _hl)"
+#: ⛔ ANCHORED WITH THE LINE ABOVE. The repair round added a SECOND
+#: `_note_cloud_handoff(research_id, _hl)` in the exception branch, so the
+#: bare line started matching twice and the sweep caught it.
+H_BOTH = ("            _note_cloud_handoff(research_id, _hl)\n"
+          "        except Exception as _e:")
 
 # ── anchors: the comments the region navigates by ──────────────────────────
 #: The identity check that is the whole safety margin on `manual_brief`.
@@ -158,12 +169,31 @@ C_NOLINE = "No line number on purpose"
 #: A repaired worker retracting its own marker at boot.
 W_RETRACT = "            _clear_worker_dead_marker(WORKER_ID)"
 
+# ── anchors: the repair round, after cross-verify ──────────────────────────
+#: The guard that stops a drop write-back demoting a finished run.
+X_TERMINAL = "    if status and not _research_is_terminal(uid, research_id):"
+#: Its fail-closed direction on an unreadable document.
+X_FAILCLOSED = ('    except Exception as _tr_err:\n'
+                '        log(f"[resume-drop] terminal check failed for {research_id[:8]}… "\n'
+                '            f"({_tr_err}) — leaving the status alone", "DEBUG")\n'
+                '        return True')
+#: The same guard on the new Stop exit.
+X_STOPGUARD = "            if _fb_uid and _fb_research_id and not _research_is_terminal(_fb_uid, _fb_research_id):"
+#: The elapsed-time evidence that tells a cut connection from one never made.
+X_ELAPSED = "            if _elapsed >= _DRIVE_SENT_AFTER_SEC:"
+#: The disk second-opinion before closing a run's automatic recovery.
+X_ONDISK = "                    if _orphaned is not None:"
+#: A successful respawn retracting the marker its failure wrote.
+X_RETRACT = "                            _clear_worker_dead_marker(k)\n                            new_state[\"watchdog_window\"]"
+
 MUTANTS = [
     ("R1", "under", RESEARCH,
      "⛔⛔ THE DEFECT ITSELF — a resume with no saved run is dropped in silence "
      "again. The person's banner sits unchanged, still offering a Resume that "
      "takes the same path and vanishes the same way",
-     [(B_NO_RUN, "                    try: doc.reference.delete()")]),
+     [(B_NO_RUN, "                    else:\n"
+                 "                        pass\n"
+                 "                    try: doc.reference.delete()")]),
 
     ("R2", "under", RESEARCH,
      "⛔⛔ the swept-folder drop goes quiet. This is the likeliest of the three: "
@@ -182,6 +212,8 @@ MUTANTS = [
      "the queue entry — the only thing that would bring us back here — is gone "
      "before the sentence is written. A source pin cannot tell these apart",
      [(B_NO_RUN,
+       "                    else:\n"
+       "                        pass\n"
        "                    try: doc.reference.delete()\n"
        "                    except Exception: pass\n"
        "                    _resume_drop_writeback(target_uid, target_rid, RESUME_DROP_NO_RUN_ID)\n"
@@ -364,7 +396,8 @@ MUTANTS = [
      "and says in its own words that this half belongs to the machine. This is "
      "the whole of the item",
      [(H_BOTH, "            if _resp.status_code in (200, 202):\n"
-               "                _note_cloud_handoff(research_id, _hl)")]),
+               "                _note_cloud_handoff(research_id, _hl)\n"
+               "        except Exception as _e:")]),
 
     # ── C: the comments the region navigates by ───────────────────────────
     ("C1", "under", RESEARCH,
@@ -403,6 +436,55 @@ MUTANTS = [
      "this pair got out of step in the first place",
      [(C_GATE, "    crash_budget_ok = crash_retries < BROWSER_CRASH_MAX_RETRIES\n"
                "    if resume_dir:")]),
+
+    # ── X: the repair round, after cross-verify ───────────────────────────
+    ("X1", "over", RESEARCH,
+     "⛔⛔ THE NASTIEST SHAPE IN THE WAVE, RESTORED — a drop write-back demotes a "
+     "TERMINAL run. The card offers Resume on a watchdog-stopped or discarded "
+     "run, so pressing it lands here, and `paused_backend_restart_failed` is "
+     "deliberately outside the web's terminal set: the listing page recomputes "
+     "the run as active and puts Stop and Pause back on something that ended "
+     "hours ago, where pressing Stop overwrites the record for good",
+     [(X_TERMINAL, "    if status:")]),
+
+    ("X2", "over", RESEARCH,
+     "⛔ the terminal check fails OPEN on an unreadable document, so one 503 "
+     "demotes a finished run. Failing closed costs a sentence without a status "
+     "change; failing open costs the record",
+     [(X_FAILCLOSED, '    except Exception:\n        return False')]),
+
+    ("X3", "over", RESEARCH,
+     "⛔⛔ THE STOP EXIT OVERWRITES `stopped_by_watchdog` AGAIN. A watchdog kill "
+     "queues a stop command whose handler closes the browser, so that death "
+     "lands in this branch — and a blind plain-'stopped' write erases the "
+     "attribution seconds later. Plain `stopped` is not a recovery status, so "
+     "the chat then CLEARS the card and the person loses the only sentence "
+     "explaining a ceiling stop, and both its buttons",
+     [(X_STOPGUARD, "            if True:")]),
+
+    ("X4", "under", RESEARCH,
+     "⛔⛔ THE HAND-OFF RECORD LIES ON THE MAJORITY PATH AGAIN. Something severs "
+     "this socket at exactly 300s while the route keeps working, so the "
+     "exception branch fires on every P4/P5 over five minutes — and without the "
+     "elapsed-time evidence it writes 'never reached the cloud … still on phase "
+     "3' into the permanent record of runs that SUCCEEDED",
+     [(X_ELAPSED, "            if False:")]),
+
+    ("X5", "over", RESEARCH,
+     "⛔ the no-backendRunId branch stops asking the disk, so a run whose files "
+     "are still in `queues/` — the write-back of that field can fail while the "
+     "run proceeds — has its automatic recovery closed permanently, because the "
+     "status it gets is outside BOTH enqueue whitelists",
+     [(X_ONDISK, "                    if False:")]),
+
+    ("X6", "under", RESEARCH,
+     "⛔⛔ A SUCCESSFUL RESPAWN STOPS RETRACTING THE MARKER. The 2-second tick "
+     "respawns any dead slot, so a marker written on one failed spawn outlives "
+     "the retry that fixed it — and if the child's own boot takes longer than "
+     "the 60s grace, worker 1 pauses every ongoing run of a worker that is "
+     "mid-boot, whose rehydration then skips them because they are no longer "
+     "ongoing",
+     [(X_RETRACT, "                            new_state[\"watchdog_window\"]")]),
 ]
 
 

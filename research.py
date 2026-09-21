@@ -2685,6 +2685,11 @@ RESUME_DROP_TERMINALLY_STOPPED = (
 )
 
 
+RESUME_DROP_NO_RUN_ID_ON_DISK = (
+    "This run's saved files are still on the computer, but the app lost track "
+    "of which folder they are in. Try Resume once more, or start it again to "
+    "run it fresh."
+)
 RESUME_DROP_WENT_STALE = (
     "Your earlier Resume sat waiting for more than 12 hours because Super "
     "Research wasn't running on the computer, so it was dropped. The run's "
@@ -2692,9 +2697,30 @@ RESUME_DROP_WENT_STALE = (
 )
 
 
+# The statuses that mean the run is OVER. Mirrors the pre-claim gate a few
+# hundred lines below and the web's `TERMINAL_RUN_STATUSES`; a run in this set
+# may gain a sentence but must never be moved out of it.
+TERMINAL_RESEARCH_STATUSES = (
+    "stopped", "completed", "archived",
+    "terminated_by_user_discard", "stopped_by_watchdog",
+)
+
+
 def _resume_drop_writeback(uid: str, research_id: str, reason: str,
                            status: "str | None" = "paused_backend_restart_failed") -> bool:
     """Record that a Resume was received and cannot be honoured.
+
+    ⛔⛔ AND IT NEVER MOVES A RUN OUT OF A TERMINAL STATUS. Cross-verify caught
+    this before the push and it is the nastiest shape in the wave: the recovery
+    card offers Resume for all four statuses INCLUDING the two terminal ones, so
+    pressing it on a watchdog-stopped or discarded run reaches these branches —
+    and a blind write of `paused_backend_restart_failed` silently demotes a
+    finished run to a non-terminal one. `paused_backend_restart_failed` is
+    deliberately absent from the web's `TERMINAL_RUN_STATUSES`, so the listing
+    page recomputes `isActivePipeline` as true and puts Stop and Pause back on a
+    run that ended hours ago — the exact wave-10.7 defect, reopened for the runs
+    this card serves, and pressing Stop there overwrites the record permanently.
+    A terminal run gets the SENTENCE and keeps its status.
 
     ⭐ THE STATUS IS THE ONE THE WEB ALREADY DRAWS. `paused_backend_restart_failed`
     has a card, and as of wave 10.8 that card renders `lastError` in place of its
@@ -2716,9 +2742,58 @@ def _resume_drop_writeback(uid: str, research_id: str, reason: str,
     if not uid or not research_id:
         return False
     updates: dict = {"lastError": reason}
-    if status:
+    if status and not _research_is_terminal(uid, research_id):
         updates["status"] = status
     return _update_research_doc(uid, research_id, updates)
+
+
+def _run_dir_owning_research(research_id: str):
+    """The queue directory whose `owner.json` names this research, if any.
+
+    ⭐ THE DISK IS THE SECOND OPINION. A research document with no
+    `backendRunId` may still have a real run directory — the write-back of that
+    field can fail while the run proceeds — and the difference decides whether
+    a Resume refusal is permanent or merely confused.
+    """
+    rid = str(research_id or "").strip()
+    if not rid:
+        return None
+    root = Path(__file__).parent / "queues"
+    try:
+        entries = [p for p in root.iterdir() if p.is_dir()]
+    except OSError:
+        return None
+    for d in entries:
+        try:
+            owner = json.loads((d / "owner.json").read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if str(owner.get("researchId") or "").strip() == rid:
+            return d
+    return None
+
+
+def _research_is_terminal(uid: str, research_id: str) -> bool:
+    """Is this run already over, according to the document?
+
+    ⚠ FAILS CLOSED, and that is the cheap direction here. An unreadable
+    document is treated as terminal, so the worst case is a sentence written
+    without a status change — the person still learns why their Resume went
+    nowhere. The other direction demotes a finished run, which hands the
+    listing page a Stop button that overwrites the record.
+    """
+    if not _firebase_db:
+        return True
+    try:
+        snap = (_firebase_db.collection("users").document(uid)
+                .collection("researches").document(research_id).get())
+    except Exception as _tr_err:
+        log(f"[resume-drop] terminal check failed for {research_id[:8]}… "
+            f"({_tr_err}) — leaving the status alone", "DEBUG")
+        return True
+    if not snap.exists:
+        return True
+    return (snap.to_dict() or {}).get("status") in TERMINAL_RESEARCH_STATUSES
 
 
 def _start_doc_identity_refused(data, where: str) -> bool:
@@ -14042,7 +14117,25 @@ def start_firestore_start_listener(job_queue, loop):
                     backend_run_id = rd.get("backendRunId") or ""
                 if not backend_run_id:
                     log(f"Resume: research {target_rid[:8]}... has no backendRunId", "WARN")
-                    _resume_drop_writeback(target_uid, target_rid, RESUME_DROP_NO_RUN_ID)
+                    # ⛔ "NO RUN DIRECTORY TO POINT AT" IS TRUE OF THE DOCUMENT,
+                    # NOT OF THE DISK, and cross-verify was right to separate
+                    # them. The start listener writes `backendRunId` back with
+                    # an update and falls back to a merged set precisely because
+                    # that write can fail; when both fail the run proceeds with
+                    # a real `queues/<run_id>` directory while the document
+                    # carries nothing. Closing auto-recovery there is permanent
+                    # — the status is outside both enqueue whitelists — so we
+                    # look on the disk before taking it away.
+                    _orphaned = _run_dir_owning_research(target_rid)
+                    if _orphaned is not None:
+                        log(f"Resume: {target_rid[:8]}… has no backendRunId but "
+                            f"{_orphaned.name} on disk claims it — recording the "
+                            f"reason without closing recovery", "WARN")
+                        _resume_drop_writeback(target_uid, target_rid,
+                                               RESUME_DROP_NO_RUN_ID_ON_DISK,
+                                               status=None)
+                    else:
+                        _resume_drop_writeback(target_uid, target_rid, RESUME_DROP_NO_RUN_ID)
                     try: doc.reference.delete()
                     except Exception: pass
                     continue
@@ -16122,6 +16215,13 @@ def _post_fe_phase_notice(uid, research_id, phase, event_type, seq):
     return True
 
 
+# ⭐ How long a connection must have been open before we treat it as having
+# REACHED the cloud. A request that dies inside a couple of seconds never left
+# — DNS, a refused connection, no route. One that dies later was received, and
+# the measured 300-second severance lands far past this.
+_DRIVE_SENT_AFTER_SEC = 10
+
+
 def _post_fe_p4p5_trigger(uid, research_id):
     """Option C (#742): drive P4 (YouTube) + P5 (Doc/email) autonomously so a
     run completes even when the chat app is never opened.
@@ -16169,6 +16269,9 @@ def _post_fe_p4p5_trigger(uid, research_id):
             _fe_handoff_end(drive=True)
 
     def _drive_once():
+        # When the POST actually left, so the failure branch can tell a
+        # connection that was never made from one that was cut mid-flight.
+        _t0 = time.monotonic()
         try:
             import requests as _requests
             from auth.v2_flow import FE_BASE_URL as _FE_BASE_URL
@@ -16211,10 +16314,30 @@ def _post_fe_p4p5_trigger(uid, research_id):
             _note_cloud_handoff(research_id, _hl)
         except Exception as _e:
             log(f"FE trigger: BE-driven P4/P5 dispatch failed ({_e}) — FE catch-up covers via marker", "WARN")
-            _note_cloud_handoff(
-                research_id,
-                f"P4/P5 dispatch never reached the cloud ({_e}). The run is still "
-                f"on phase 3 until the chat is opened and the catch-up fires.")
+            # ⛔⛔ THIS SENTENCE WAS FALSE ON THE MAJORITY PATH, and the wave's
+            # own measurement convicted it. Something in front of Cloud Run
+            # severs this connection at EXACTLY 300 seconds while the route
+            # keeps working (one measured run finished at 497 s), so `requests`
+            # raises here on every P4/P5 longer than five minutes — and the
+            # first version wrote "never reached the cloud … still on phase 3"
+            # into the run's permanent record, on runs that succeeded. A lying
+            # diagnostic is worse than none: this file exists to be the
+            # authoritative per-run account, and it rides the support bundle.
+            #
+            # ⭐ THE ELAPSED TIME IS WHAT TELLS THE TWO APART. A request that
+            # died instantly never left; one that died after the connection had
+            # been open for a while was received and may well be finishing. We
+            # do not claim to know which — we say what we saw.
+            _elapsed = int(time.monotonic() - _t0)
+            if _elapsed >= _DRIVE_SENT_AFTER_SEC:
+                _hl = (f"P4/P5 connection cut after {_elapsed}s ({_e}). The cloud "
+                       f"received the request and may be finishing it; this "
+                       f"machine stopped being able to watch.")
+            else:
+                _hl = (f"P4/P5 dispatch never reached the cloud after {_elapsed}s "
+                       f"({_e}). The run stays on phase 3 until the chat is "
+                       f"opened and the catch-up fires.")
+            _note_cloud_handoff(research_id, _hl)
 
     try:
         import threading as _threading
@@ -70051,7 +70174,20 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             except Exception as _sm_err:
                 log(f"stop bookkeeping (non-fatal): {_sm_err}", "WARN")
             emit_event("pipeline_stopped", phase=last_phase, reason="stop")
-            _update_firestore_research({"status": "stopped", "phase": last_phase})
+            # ⛔⛔ AND IT DOES NOT OVERWRITE A TERMINAL STATUS SOMEBODY ELSE
+            # WROTE. Cross-verify caught this: a watchdog kill writes
+            # `stopped_by_watchdog` AND queues a stop command, whose handler
+            # closes the browser — so that death lands HERE, sees `.stop`, and
+            # a blind write of plain "stopped" erased the attribution seconds
+            # later. Plain `stopped` is not a recovery status, so the chat's
+            # listener then CLEARED the card: the person lost the only sentence
+            # explaining a ceiling stop, and both its buttons. Before this wave
+            # the block wrote no status at all, which is why it never showed.
+            if _fb_uid and _fb_research_id and not _research_is_terminal(_fb_uid, _fb_research_id):
+                _update_firestore_research({"status": "stopped", "phase": last_phase})
+            else:
+                log("STOP: the run already carries a terminal status — "
+                    "leaving it and its card alone", "INFO")
         elif _will_silent_retry:
             _att = _crash_retries + 1
             log(f"Browser crash at phase {last_phase} (attempt {_att}/"
@@ -79066,6 +79202,10 @@ def run_daemon_loop(port: int = 8000):
             _st = _spawn_worker(k)
             if _st is None:
                 _write_worker_dead_marker(k, reason="spawn_failed_at_boot")
+            else:
+                # A worker that came up owns its runs again — drop any marker a
+                # previous boot's failure left behind before worker 1 acts on it.
+                _clear_worker_dead_marker(k)
             workers[k] = _st or {"_dead": True}
 
         try:
@@ -79102,6 +79242,18 @@ def run_daemon_loop(port: int = 8000):
                         _time.sleep(2)
                         new_state = _spawn_worker(k)
                         if new_state is not None:
+                            # ⛔⛔ THE MARKER IS RETRACTED HERE TOO, not only by
+                            # the child's own boot. Cross-verify caught the gap:
+                            # the 2-second tick respawns any slot that is None
+                            # or `_dead`, so a marker written on a single failed
+                            # spawn survives a SUCCESSFUL retry until the child
+                            # reaches its own `--serve` boot — well past Firebase
+                            # init. If that exceeds the 60-second grace and
+                            # worker 1's reconcile tick lands in the window, it
+                            # pauses every ongoing run of a worker that is
+                            # mid-boot, and that worker's own rehydration then
+                            # skips them because they are no longer ongoing.
+                            _clear_worker_dead_marker(k)
                             new_state["watchdog_window"] = state.get("watchdog_window", [])
                             workers[k] = new_state
                         else:
@@ -79241,6 +79393,9 @@ def run_daemon_loop(port: int = 8000):
                         new_state["keystore_wiped"] = state["keystore_wiped"]
                         new_state["restarts"] = state["restarts"]
                         new_state["watchdog_window"] = state.get("watchdog_window", [])  # (#717)
+                        # Same retraction as the watchdog respawn above: a
+                        # successful retry outranks the marker its failure wrote.
+                        _clear_worker_dead_marker(k)
                         workers[k] = new_state
                     else:
                         # ⛔ The last of the three. A crash we were willing to
