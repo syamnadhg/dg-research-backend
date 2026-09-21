@@ -15273,15 +15273,33 @@ _FE_HANDOFF_WAIT_SEC = 90
 # ⭐⭐ And a far longer one for the P4/P5 drive, because that request is not a
 # notification — it IS the rest of the run.
 #
-# ⛔ The route wires `req.signal` to an abort handler that SIGTERMs the in-flight
-# ffmpeg child and writes `status: "stopped"`. So exiting this process while the
-# drive is connected does not merely lose a message: it kills the video encode
-# and terminalises the user's research as stopped. Ninety seconds would land
-# squarely in the middle of a long encode.
+# ⛔⛔ THE REASON WRITTEN HERE EXPIRED ON 2026-09-19, AND THE NUMBER OUTLIVED
+# IT. It used to say: the route wires `req.signal` to an abort handler that
+# SIGTERMs the in-flight ffmpeg child and writes `status: "stopped"`, so
+# exiting this process while the drive is connected kills the encode and
+# terminalises the run. That was true when it was written and is not true now.
+# `uploadYouTube`'s second pass that day removed it, in its own words — "A
+# CLOSED SOCKET IS NOT A STOP" — and the commit carrying it is on `origin/main`,
+# which IS the production deploy. A hang-up now triggers a Firestore read and
+# cancels only if a terminal status is really recorded.
 #
-# Matched to the route's own Cloud Run ceiling, which is the point past which the
-# request cannot still be alive. Waiting that long costs a worker that does not
-# pick up new jobs meanwhile; not waiting costs the run in progress.
+# ⚠ AND THE HANG-UP IS EVERY RUN. Measured on both of that day's runs: something
+# in front of Cloud Run severs this connection at EXACTLY 300 seconds while the
+# route keeps working (one run's own log shows it finishing at 497 s). So
+# `requests` raises here at ~300 s, the `finally` clears the in-flight flag, and
+# the 3600-second budget is a ceiling practice never reaches.
+#
+# ⭐ WHY IT STAYS ANYWAY, WHICH IS A DIFFERENT REASON FROM THE OLD ONE: the
+# route processes P4 and P5 INLINE inside this request, so while the socket is
+# alive this worker's exit still abandons work that nothing else is driving.
+# Ninety seconds would land mid-encode. The bound is matched to the route's own
+# Cloud Run ceiling because that is the point past which the request cannot
+# still be alive — not because disconnecting is destructive any more.
+#
+# ⛔ DO NOT "TIDY" THIS TO 300 s ON THE STRENGTH OF THE MEASUREMENT ABOVE. What
+# severs at 300 s has not been identified — the owner's E2E carries a line to
+# settle whether it is the edge or the revision — and a bound set to an unknown
+# mechanism's current behaviour is a bound that breaks when it changes.
 _FE_DRIVE_WAIT_SEC = 3600
 
 
@@ -18170,10 +18188,24 @@ class PipelineRuntime:
         # Phoenix-resumed run skip events the FE already saw, instead of
         # replaying them and producing dup phase transitions in chat.
         self.last_event_id: str = ""
-        # True when run_pipeline is invoked with resume_dir set (auto-retry
-        # from checkpoint OR user-resume from paused). Currently used only
-        # for non-browser-crash recovery decisions; browser crashes are
-        # always-auto regardless of this flag (see last_failure_kind).
+        # ⛔⛔ DEAD, AND TWO COMMENTS ELSEWHERE STILL SEND READERS TO IT.
+        # Declared here, assigned in exactly one place (`run_pipeline`'s resume
+        # branch) and READ NOWHERE — `grep -n "is_retry_attempt"` returns three
+        # hits and not one of them is a read. The description below is what it
+        # was FOR; nothing has consulted it since the #725 crash-retry rework
+        # moved that decision into `_plan_pipeline_auto_retry`, which takes
+        # `resume_dir` and `failure_kind` as arguments and never touches
+        # `_runtime`.
+        #
+        # ⭐ KEPT RATHER THAN DELETED, deliberately and in line with how this
+        # file treats the other unreachable branch it has chosen to hold: the
+        # wave that found it was a comment sweep, and removing a field from a
+        # class that several long functions close over is not a comment change.
+        # What was actually harmful was the two comments asserting a branch
+        # that does not exist; those are corrected. Filed for deletion.
+        #
+        # (was: True when run_pipeline is invoked with resume_dir set —
+        # auto-retry from checkpoint OR user-resume from paused.)
         self.is_retry_attempt: bool = False
         # Tag for the most recent failure that bubbled out of a phase.
         # Set at fail-detection sites (browser-crash, agent timeout, etc.)
@@ -26171,8 +26203,15 @@ def emit_browser_recovery_status(phase: int, agent: str | None = None, *,
 
     Use this on the FIRST attempt (initial run, not a resume_dir retry).
     On a retry attempt the auto-retry guard won't fire again, so callers
-    must use fail_phase/fail_agent instead — see the `_runtime.is_retry_attempt`
-    branch at each browser-crash site."""
+    must use fail_phase/fail_agent instead.
+
+    ⛔ THIS USED TO SAY "see the `_runtime.is_retry_attempt` branch at each
+    browser-crash site". THERE IS NO SUCH BRANCH, and there is no site that
+    reads that flag at all — it is assigned once and never consulted. The
+    decision it describes lives in `_plan_pipeline_auto_retry`, which is given
+    `resume_dir` and `failure_kind` and never touches `_runtime`. A pointer to
+    a branch that does not exist costs the next reader a search of an
+    85,000-line file for something that was never there."""
     # #907: a --login in flight killed this Chrome ON PURPOSE. No auto-retry
     # happens (the planner stands down), so a "tab crashed — auto-retrying"
     # banner would be both wrong and alarming; run_pipeline's failure path
@@ -66009,9 +66048,20 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # dir we're about to resume from. Also re-set at line ~17235
         # for symmetry with the new-run branch — idempotent.
         init_tracks(queue_dir.name)
-        # Mark as retry/resume so browser-crash sites surface the real alert
-        # (auto-retry won't fire from finally for this attempt — the guard
-        # at the bottom of run_pipeline gates on `not resume_dir`).
+        # ⛔⛔ BOTH HALVES OF THIS COMMENT WERE FALSE, and the second one is the
+        # dangerous kind — it describes a safety property the code does not
+        # have. It said auto-retry "won't fire from finally for this attempt —
+        # the guard at the bottom of run_pipeline gates on `not resume_dir`".
+        # Since #725 that guard reads
+        #     if not ((not resume_dir) or (is_crash and crash_budget_ok)):
+        # so a browser crash on a RESUMED run retries anyway, up to the budget.
+        # That is deliberate and it is why a person's Retry buys three more
+        # silent relaunches — but anyone reading here would have concluded the
+        # opposite.
+        #
+        # ⛔ And the assignment itself does nothing: `is_retry_attempt` is read
+        # nowhere. Kept with the field, not silently dropped, so the two facts
+        # stay together.
         _runtime.is_retry_attempt = True
         start_phase, reason = detect_resume_phase(queue_dir)
         log(f"RESUME: {reason}")
@@ -70480,23 +70530,49 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
                 _i_own = (_owner_worker == WORKER_ID)
                 if not _i_own:
                     if 1 <= _owner_worker <= _fleet_size:
-                        # KNOWN LIMITATION (#966, documented 2026-07-16): if the
-                        # owning sibling is PERMANENTLY dead (the daemon-loop marks
-                        # a worker≥2 `_dead` after a crash loop / repeated spawn
-                        # failure) it never runs its own rehydration, so this run
-                        # stays frozen "ongoing" with no Resume CTA until the
-                        # operator repairs that worker (a loud `_sup_audit` ERROR
-                        # fires on the death; the on-disk checkpoint survives, so
-                        # the run self-heals once the worker is back). A worker-1
-                        # backstop that marked such runs paused was prototyped and
-                        # REVERTED: the only cheap liveness signal (the per-run
-                        # worker-lock) is released the moment BE phases finish, so
-                        # it can't tell a dead worker from one whose run is simply
-                        # in its long FE-owned P4/P5 tail (or tab-closed) — it
-                        # would false-mark routine healthy runs, which is worse
-                        # than the rare abandonment. A correct backstop needs a
-                        # real per-worker liveness heartbeat (not present in
-                        # Firestore today); tracked for a follow-up.
+                        # ⛔⛔ THIS COMMENT SAID THE OPPOSITE OF THE CODE FOR
+                        # TWO MONTHS, AND IT IS WHAT A READER FINDS FIRST. It
+                        # was written 2026-07-16 as `KNOWN LIMITATION (#966)`:
+                        # a run owned by a permanently dead sibling "stays
+                        # frozen ongoing with no Resume CTA until the operator
+                        # repairs that worker", and a worker-1 backstop had
+                        # been "prototyped and REVERTED" because the only cheap
+                        # liveness signal could not tell a dead worker from one
+                        # in its long FE-owned P4/P5 tail.
+                        #
+                        # ⭐ #64 SHIPPED THE NEXT MORNING and solved exactly
+                        # that. It does not use the worker-lock: the SUPERVISOR
+                        # drops an on-disk `.worker.{k}.dead` marker when it
+                        # stops respawning a worker, and worker 1's
+                        # `_dead_worker_reconcile_loop` marks those runs
+                        # `paused_backend_restart`. The tail case the revert
+                        # feared is handled by reading `delivery.json` — a run
+                        # the BE already handed off is skipped. Worst-case
+                        # latency is about 150 seconds.
+                        #
+                        # ⛔ The comment survived its own fix, so a reader
+                        # following it would rebuild a backstop that exists —
+                        # and a cross-check lens did exactly that in wave 10.8,
+                        # reporting the item as open on the strength of these
+                        # words. Wave 10.8 also widened the marker from ONE
+                        # death path to four (boot spawn, watchdog respawn,
+                        # crash loop, crash respawn); before that it covered a
+                        # quarter of the cases, which is the grain of truth the
+                        # comment had left.
+                        #
+                        # ⚠ WHAT IS STILL TRUE, and it is narrow: Firestore has
+                        # no per-worker liveness heartbeat — `lastHeartbeatAt`
+                        # is worker-1-only — so the mechanism rests on the
+                        # supervisor's marker rather than on a pulse. And
+                        # `_reconcile_dead_worker_runs` queries the paired
+                        # OWNER's tree only, so a run a SHARER submitted is not
+                        # covered. Both are real; neither is this comment's
+                        # original claim.
+                        #
+                        # ⭐ NO LINE NUMBER ON PURPOSE. The previous note here
+                        # cited one that had drifted; see
+                        # `_dead_worker_reconcile_loop` and
+                        # `_write_worker_dead_marker` by name.
                         log(
                             f"[rehydrate] {research_id[:24]}… owned by sibling "
                             f"worker {_owner_worker} (fleet={_fleet_size}) — leaving "

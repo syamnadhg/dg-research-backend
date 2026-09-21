@@ -57,7 +57,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SUITES = ("tests/test_resume_drop_writeback_108.py "
           "tests/test_dead_worker_wiring_108.py "
           "tests/test_stop_is_not_a_crash_108.py "
-          "tests/test_cloud_handoff_record_108.py")
+          "tests/test_cloud_handoff_record_108.py "
+          "tests/test_region_comments_108.py")
 RESEARCH = "research.py"
 FILES = (RESEARCH,)
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
@@ -136,6 +137,24 @@ H_FILE = '            with open(folder / CLOUD_HANDOFF_FILENAME, "a", encoding="
 H_RECHECK = "            if not folder.is_dir():"
 #: The one call both POST outcomes reach.
 H_BOTH = "            _note_cloud_handoff(research_id, _hl)"
+
+# ── anchors: the comments the region navigates by ──────────────────────────
+#: The identity check that is the whole safety margin on `manual_brief`.
+C_GUARD = "    if actions is None:\n        # #955: the default action set is authored by the intent catalog"
+#: The first of the two emitters that dodge the unwired token.
+C_DODGE = ('                emit_decision(intent="manual_brief", event_name="manual_brief_required",\n'
+           '                              phase=1, actions=[],')
+#: The planner gate the corrected comment now asserts.
+#: ⛔ ANCHORED WITH THE LINE ABOVE IT. The gate's text alone matches TWICE —
+#: the corrected comment beside the dead flag quotes it verbatim, which is the
+#: same trap that made the first version of that comment's test pass off its
+#: own prose. `crash_budget_ok =` appears once.
+C_GATE = ("    crash_budget_ok = crash_retries < BROWSER_CRASH_MAX_RETRIES\n"
+          "    if not ((not resume_dir) or (is_crash and crash_budget_ok)):")
+#: The assignment to the dead flag, beside the comment that says it is dead.
+C_DEAD = "        _runtime.is_retry_attempt = True"
+#: A comment that deliberately refuses to cite a line number.
+C_NOLINE = "No line number on purpose"
 #: A repaired worker retracting its own marker at boot.
 W_RETRACT = "            _clear_worker_dead_marker(WORKER_ID)"
 
@@ -346,6 +365,44 @@ MUTANTS = [
      "the whole of the item",
      [(H_BOTH, "            if _resp.status_code in (200, 202):\n"
                "                _note_cloud_handoff(research_id, _hl)")]),
+
+    # ── C: the comments the region navigates by ───────────────────────────
+    ("C1", "under", RESEARCH,
+     "⛔⛔ THE `manual_brief` CRASH GOES LIVE — one emitter stops passing an "
+     "explicit empty action list, so the expander runs, finds a catalogue "
+     "token the builder has no case for, and raises out of phase 1 at a person "
+     "waiting to type their brief. The existing test pins the trap OPEN and "
+     "passes either way",
+     [(C_DODGE, '                emit_decision(intent="manual_brief", event_name="manual_brief_required",\n'
+                '                              phase=1,')]),
+
+    ("C2", "under", RESEARCH,
+     "⛔⛔ AND THE ONE-WORD VERSION OF THE SAME THING — `is None` becomes a "
+     "truthiness test. `[]` is falsy, so both dodges stop working at once and "
+     "the crash is live on both paths. This is the commonest tidy-up in Python "
+     "and it is the entire safety margin here",
+     [(C_GUARD, "    if not actions:\n        # #955: the default action set is authored by the intent catalog")]),
+
+    ("C3", "under", RESEARCH,
+     "⛔ a new `research.py:NNNN` self-pointer is added. Every one already in "
+     "the file lands on unrelated code, and the sweep that fixes them is wave "
+     "10.10's — the ratchet exists to stop the count growing while that waits",
+     [(C_NOLINE, "see research.py:12345")]),
+
+    ("C4", "under", RESEARCH,
+     "⛔ something READS `is_retry_attempt`, so the comments calling it dead "
+     "become the next wrong pointer — and a comment wrong in a safe-sounding "
+     "direction is the one nobody re-checks",
+     [(C_DEAD, "        _runtime.is_retry_attempt = True\n"
+               "        _ = _runtime.is_retry_attempt")]),
+
+    ("C5", "over", RESEARCH,
+     "⛔ the planner stops letting a crash retry a resumed run — which is what "
+     "the OLD comment claimed and what the corrected one denies. The behaviour "
+     "may be worth changing one day; changing it without the comment is how "
+     "this pair got out of step in the first place",
+     [(C_GATE, "    crash_budget_ok = crash_retries < BROWSER_CRASH_MAX_RETRIES\n"
+               "    if resume_dir:")]),
 ]
 
 
