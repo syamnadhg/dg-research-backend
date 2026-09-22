@@ -198,7 +198,7 @@ def test_the_notebook_recovery_loop_can_still_end_the_wait(src):
 
 # ── 4. the P2 → P3 handoff, which the removal ran straight through ──────────
 
-def test_the_p2_to_p3_handoff_still_reads_a_url_per_agent():
+def test_the_p2_to_p3_handoff_still_reads_a_url_per_agent(tmp_path):
     """⛔ THE ONE SILENT, HOURS-LATER FAILURE IN THE WHOLE WAVE. `links.json` is
     written at the end of P2 and its EXISTENCE is what the resume-from-Phase-3
     rung checks. The builder used to prefer `_runtime.agent_share_urls[name]`
@@ -216,10 +216,18 @@ def test_the_p2_to_p3_handoff_still_reads_a_url_per_agent():
     src = code_only(inspect.getsource(research._build_phase2_to_phase3_handoff))
     assert 'agent_share_urls' not in src
     assert '_r.get("url")' in src, "the guards below have nothing to judge without it"
-    assert 'p3_links[_name] = in_app_document_url(' in src
     # ⛔ The universal, not the sample: no branch may put the judged value into
-    # the published map.
-    assert "p3_links[_name] = _url" not in src
+    # the published map. EXECUTED, because wave 10.9 moved the decision into
+    # `_p2_to_p3_link_for` — a kept agent is a third answer, and a text search
+    # for the old inline line would from then on be a pin on nothing.
+    (tmp_path / "documents").mkdir()
+    judged = "https://gemini.google.com/app/0f1e2d3c4b5a"
+    results = {"Gemini": {"status": "done", "text": "x" * 30_000, "url": judged,
+                          "verified": True}}
+    research._build_phase2_to_phase3_handoff(results, tmp_path)
+    published = dict(research._runtime.p2_links_for_p3)
+    assert published == {"Gemini": research.in_app_document_url("gemini")}
+    assert judged not in published.values()
 
 
 def test_the_handoff_still_drops_an_off_topic_or_foreign_conversation():

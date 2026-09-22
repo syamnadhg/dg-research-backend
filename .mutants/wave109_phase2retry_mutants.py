@@ -45,6 +45,18 @@ looking installed. The quiet ones:
         the spec warns against: the safety filter then throws the kept reports
         away and their tiles vanish from every phase_start.
 
+⭐ WHAT REPAIR ROUND 2 ADDED (M5 and M9): the first round put back HALF of what
+a kept agent owns.
+  H*  — `save_meta` reads TWO rings off `_runtime` per agent and round 1
+        restored one. A kept agent is never relaunched, so nothing ticks its
+        `agent_progress_history`, and the run's final save — a whole-FIELD
+        replace — wrote `progressHistory: []` over the curve the agent earned.
+        The sparkline read "No data" for the one agent that did the work.
+  K*  — `_p2_resume_plan` hands back `url=""`, and the P2→P3 handoff read that
+        as "contributed nothing". A kept agent's markdown reached NotebookLM
+        while `links.json`, delivery.json's `research_links` and the "Links
+        saved:" line listed only the agents that re-ran.
+
 ⭐ M11 (the owner decision): a Chrome window closed by hand mid-phase-2 takes the
 silent-relaunch path, and that stays. B1/B2 are that decision being reversed or
 its budget going off by one.
@@ -52,8 +64,8 @@ its budget going off by one.
 ⛔ ANCHORS ARE SINGLE STRING LITERALS AND MUST MATCH EXACTLY ONCE. A stale
 anchor is a harness fault, not a survivor, and faults are counted OUT.
 
-  .venv/bin/python .mutants/wave109_phase2retry_mutants.py
-  .venv/bin/python .mutants/wave109_phase2retry_mutants.py P1 W2
+  python .mutants/wave109_phase2retry_mutants.py
+  python .mutants/wave109_phase2retry_mutants.py P1 W2
 """
 import os
 import subprocess
@@ -63,10 +75,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 SUITES = ("tests/test_p2_idempotent_resume_109.py "
-          "tests/test_browser_death_unwinds_0920.py")
+          "tests/test_browser_death_unwinds_0920.py "
+          "tests/test_p2_share_removed_0828.py "
+          "tests/test_link_sinks_removed_0902.py "
+          "tests/test_save_meta_status_carry.py")
 RESEARCH = "research.py"
 FILES = (RESEARCH,)
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+# ⭐ The interpreter running this harness, not `.venv/bin/python` under ROOT: a
+# builder's worktree has no venv of its own, and a missing interpreter fails
+# every run — which a harness reads as every mutant killed.
+PY = sys.executable
 
 # ── anchors: research.py ────────────────────────────────────────────────────
 #: The record half of "keep only with BOTH".
@@ -99,8 +118,8 @@ SNAP_COERCE = ("            try:\n"
                "                out[k] = int(snapshot[k] or 0)\n"
                "            except (TypeError, ValueError):\n"
                "                pass")
-SNAP_STORED = "                       \"progress\": _p2_progress_snapshot(progress)}"
-SNAP_PASSED = "                            progress=_snap)"
+SNAP_STORED = "                       \"progress\": _p2_progress_snapshot(progress),"
+SNAP_PASSED = "                            progress=_snap,"
 SNAP_RESTORE = "            _runtime.agent_progress_snapshots[key] = dict(snap)"
 A_SOURCE_URLS = "                       sourceUrls=snap.get(\"source_urls\", []),"
 A_SOURCES_MAX = ("                       sources=max(int(snap.get(\"sources\", 0) or 0),\n"
@@ -108,7 +127,8 @@ A_SOURCES_MAX = ("                       sources=max(int(snap.get(\"sources\", 0
 #: The writer, in the complete branch.
 WRITER = ("        _p2_mark_agent_done(queue_dir, agent_key, True, elapsed_sec=elapsed_sec,\n"
           "                            findings=getattr(_runtime, \"agent_findings\", {}).get(agent_key),\n"
-          "                            progress=_snap)")
+          "                            progress=_snap,\n"
+          "                            history=getattr(_runtime, \"agent_progress_history\", {}).get(agent_key))")
 FAILED_BRANCH = ("        try:\n"
                  "            _write_agent_terminal_status(agent_key, \"errored\")\n"
                  "        except Exception:\n"
@@ -156,6 +176,38 @@ A_LINK = ("            emit_event(\"link_extracted\", phase=2, agent=key, url=ur
 #: M11 — the relaunch itself.
 ELIGIBLE = "    eligible = (1 < phase <= 4) or (is_crash and 0 <= phase <= 4)"
 BUDGET = "    crash_budget_ok = crash_retries < BROWSER_CRASH_MAX_RETRIES"
+
+# ── anchors: M5, the curve a kept agent earned (repair round 2) ────────────
+#: The record's half of it, downsampled the way save_meta writes.
+H_RECORD = "                       \"progressHistory\": _downsample_progress_history(history)}"
+#: The one branch that has a curve to record.
+H_CALL = "                            history=getattr(_runtime, \"agent_progress_history\", {}).get(agent_key))"
+#: Reading it back off disk…
+H_READ = "                    \"history\": history if isinstance(history, list) else []}"
+#: …onto the kept result…
+H_PLAN = "            \"_history\": r[\"history\"],"
+#: …and into the ring save_meta persists from.
+H_RESTORE = ("        if hist:\n"
+             "            _runtime.agent_progress_history[key] = list(hist)\n")
+#: The belt: an empty rebuild does not erase what is already persisted.
+H_CARRY = ("            if not _down_hist:\n"
+           "                _prev_hist = existing.get(\"progressHistory\")\n"
+           "                if isinstance(_prev_hist, list) and _prev_hist:\n"
+           "                    _down_hist = _prev_hist\n")
+#: The step spans the GAPS, so the last index is exactly the last sample.
+H_STEP = "    step = (len(raw) - 1) / float(cap - 1)\n"
+
+# ── anchors: M9, the kept agent's row in links.json (repair round 2) ───────
+#: The sweep's veto, first.
+L_VETO = ("    if r.get(\"off_topic_rejected\"):\n"
+          "        return \"\"\n")
+#: The kept agent's own arm: no conversation address, and a report all the same.
+L_KEPT = ("    if not conversation_url and not r.get(\"_restored\"):\n"
+          "        return \"\"\n")
+#: What is published — our page, never the address that was judged.
+L_VALUE = "    return in_app_document_url(name.lower().replace(\" \", \"\"))\n"
+#: The consumer, which must ask.
+L_CALL = "        _link_url = _p2_to_p3_link_for(_name, _r, _url)\n"
 
 MUTANTS = [
     # ── P: the decision ─────────────────────────────────────────────────────
@@ -357,10 +409,10 @@ MUTANTS = [
     ("S1", "under", RESEARCH,
      "⛔ the record stops keeping the progress snapshot, so a resumed agent's card "
      "shows complete with 0 sources and no sections for the rest of the phase",
-     [(SNAP_STORED, "                       \"progress\": {}}")]),
+     [(SNAP_STORED, "                       \"progress\": {},")]),
     ("S2", "under", RESEARCH,
      "the completion branch stops handing the snapshot to the record",
-     [(SNAP_PASSED, "                            progress=None)")]),
+     [(SNAP_PASSED, "                            progress=None,")]),
     ("S3", "under", RESEARCH,
      "the announce stops carrying the sources it kept — the web's merge keeps the "
      "re-seeded empty row",
@@ -391,6 +443,98 @@ MUTANTS = [
     ("B2", "over", RESEARCH,
      "the crash budget is off by one — a spent budget still relaunches silently",
      [(BUDGET, "    crash_budget_ok = crash_retries <= BROWSER_CRASH_MAX_RETRIES")]),
+
+    # ── H: M5 (repair round 2), the curve a kept agent earned ───────────────
+    ("H1", "under", RESEARCH,
+     "⛔⛔ THE RECORD STOPS KEEPING THE CURVE — there is nothing to "
+     "restore, and the kept agent's sparkline reads 'No data' after the reload",
+     [(H_RECORD, "                       \"progressHistory\": []}")]),
+
+    ("H2", "under", RESEARCH,
+     "⛔ the whole 240-sample ring goes into the record — four times the "
+     "curve the run's own save would have written, and a different one",
+     [(H_RECORD, "                       \"progressHistory\": list(history or [])}")]),
+
+    ("H3", "under", RESEARCH,
+     "⛔ the completion never reads the ring, so the record is written empty "
+     "by the one branch that has a curve to write",
+     [(H_CALL, "                            history=None)")]),
+
+    ("H4", "under", RESEARCH,
+     "⛔ the reader drops the curve on its way off disk: recorded, and never "
+     "handed to the plan",
+     [(H_READ, "                    \"history\": []}")]),
+
+    ("H5", "under", RESEARCH,
+     "⛔ the plan drops it one step later — the kept result the phase "
+     "merges carries everything but the curve",
+     [(H_PLAN, "            \"_history\": [],")]),
+
+    ("H6", "under", RESEARCH,
+     "⛔⛔ THE DEFECT ITSELF — the announce restores the snapshot and "
+     "not the history, which is exactly what repair round 1 did",
+     [(H_RESTORE, "        if hist:\n"
+                  "            pass\n")]),
+
+    ("H7", "under", RESEARCH,
+     "⛔⛔ THE BELT GOES — a rebuild with an empty ring erases the "
+     "curve a previous attempt persisted, in meta.json and in the whole-field "
+     "Firestore replace",
+     [(H_CARRY, "            if False:\n"
+                "                _prev_hist = existing.get(\"progressHistory\")\n"
+                "                if isinstance(_prev_hist, list) and _prev_hist:\n"
+                "                    _down_hist = _prev_hist\n")]),
+
+    ("H8", "over", RESEARCH,
+     "⛔ the persisted curve is preferred to the LIVE ring — an agent "
+     "that ran again this attempt is frozen on its first attempt's curve",
+     [(H_CARRY, "            _prev_hist = existing.get(\"progressHistory\")\n"
+                "            if isinstance(_prev_hist, list) and _prev_hist:\n"
+                "                _down_hist = _prev_hist\n")]),
+
+    # ⭐ H9 WAS AN EQUIVALENT MUTANT AND IS GONE. It deleted the two lines that
+    # overwrote `out[0]`/`out[-1]` with `raw[0]`/`raw[-1]`, and with a step of
+    # (n-1)/(cap-1) those lines never had anything to correct — no test could
+    # tell them from nothing, and against a WRONG step they would have made a
+    # mis-sampled curve look right at both ends. The lines are gone from
+    # research.py; H9 is the step itself now.
+    ("H9", "under", RESEARCH,
+     "⛔ the step spans the SAMPLES instead of the gaps — sixty points "
+     "with plausible endpoints and the wrong curve between them",
+     [(H_STEP, "    step = len(raw) / float(cap)\n")]),
+
+    # ── K: M9 (repair round 2), the kept agent's row in links.json ──────────
+    # ⚠ K, not L: the launch section above already owns L1-L5, and two mutants
+    # under one id make `python <harness> L1` run both and a survivor ambiguous.
+    ("K1", "under", RESEARCH,
+     "⛔⛔ THE DEFECT ITSELF — a kept agent has no conversation "
+     "address, so it vanishes from links.json and delivery.json while its report "
+     "still goes to NotebookLM",
+     [(L_KEPT, "    if not conversation_url:\n"
+               "        return \"\"\n")]),
+
+    ("K2", "over", RESEARCH,
+     "⛔⛔ the sweep's veto is lost on the kept path: a leg refused as "
+     "off-topic is published as a source because it was restored",
+     [(L_VETO, "    if False:\n"
+               "        return \"\"\n")]),
+
+    ("K3", "over", RESEARCH,
+     "⛔⛔ every leg publishes — including one that never opened a "
+     "tab, and both drop guards are skipped on the way",
+     [(L_KEPT, "    if False:\n"
+               "        return \"\"\n")]),
+
+    ("K4", "under", RESEARCH,
+     "⛔⛔ the consumer stops asking the decision and gates on the "
+     "conversation address again — the decision is still there, unread",
+     [(L_CALL, "        _link_url = (in_app_document_url(_name.lower().replace(\" \", \"\"))\n"
+               "                     if _url else \"\")\n")]),
+
+    ("K5", "under", RESEARCH,
+     "⛔ what is JUDGED becomes what is PUBLISHED again — the "
+     "conversation address lands in links.json and goes to NotebookLM as a source",
+     [(L_VALUE, "    return conversation_url\n")]),
 ]
 
 
@@ -400,7 +544,7 @@ def _run(cmd):
 
 
 def green():
-    r = _run(f".venv/bin/python -m pytest {SUITES} -q -p no:cacheprovider")
+    r = _run(f"\"{PY}\" -m pytest {SUITES} -q -p no:cacheprovider")
     # ⛔ THE SUMMARY LINE, NEVER THE EXIT CODE. This repo's backend suite once
     # died at 27% and exited 0, and a commit rode on it. The LAST line only: a
     # pytest warning about tmp cleanup says "error removing" further up.

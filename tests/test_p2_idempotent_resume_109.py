@@ -166,17 +166,21 @@ class _Browser:
 
 
 class _Runtime:
-    def __init__(self, snapshots=None):
+    def __init__(self, snapshots=None, history=None):
         self.agent_findings = {}
         self.agent_progress_snapshots = dict(snapshots or {})
+        # ⛔⛔ `save_meta` reads TWO rings off `_runtime` per agent, and the
+        # first repair round restored one of them. This is the other.
+        self.agent_progress_history = dict(history or {})
         self.restart_requested = False
 
 
 def _drive_the_extractor(monkeypatch, tmp_path, report, *, saved_ok=True,
-                         research_id="rid-1", snapshot=None):
+                         research_id="rid-1", snapshot=None, history=None):
     """The REAL `extract_and_record_agent`, with only the browser, the network
-    and Firestore stubbed. `snapshot` seeds the agent's live progress ring, the
-    way the pollers fill it while the agent works."""
+    and Firestore stubbed. `snapshot` seeds the agent's live progress ring and
+    `history` its progress-history ring, the way the pollers fill both while the
+    agent works."""
     async def _extract(page, **kw):
         return report
 
@@ -190,7 +194,8 @@ def _drive_the_extractor(monkeypatch, tmp_path, report, *, saved_ok=True,
         return None
 
     monkeypatch.setattr(research, "_runtime",
-                        _Runtime({"chatgpt": snapshot} if snapshot else None),
+                        _Runtime({"chatgpt": snapshot} if snapshot else None,
+                                 {"chatgpt": history} if history else None),
                         raising=False)
     monkeypatch.setattr(research, "extract_chatgpt_response", _extract)
     monkeypatch.setattr(research, "reject_off_topic_text", lambda text, *a, **k: text)
@@ -486,6 +491,194 @@ def test_a_record_written_before_the_snapshot_existed_still_announces(
     prog = [k for t, k in events if t == "agent_progress"][0]
     assert prog["status"] == "complete"
     assert prog["sourceUrls"] == [] and prog["sections"] == [] and prog["sources"] == 0
+
+
+# ── the kept agent's curve ────────────────────────────────────────────────────
+#
+# ⛔⛔ THE SECOND THING `save_meta` READS OFF `_runtime`, AND THE FIRST REPAIR
+# ROUND PUT BACK ONLY THE FIRST. A kept agent is never relaunched, so nothing
+# ticks its `agent_progress_history` on the attempt that finishes the run — and
+# `run_pipeline` resets the ring on every re-entry. `save_meta` then wrote
+# `progressHistory: []` for it, into meta.json and into a whole-FIELD Firestore
+# replace, so the web's All-Agents sparkline and the post-reload chart read
+# "No data" for the one agent that actually did the work, while the relaunched
+# ones kept their curves. Before this wave the kept agent re-ran and rebuilt
+# its history, which is what hid it.
+
+CURVE = [{"t": i * 60_000, "sources": i, "chars": i * 900, "sections": i,
+          "searches": i * 2, "sectionsDone": 0, "sectionsTotal": 4}
+         for i in range(1, 7)]
+
+
+def test_the_record_keeps_the_curve_the_agent_earned(monkeypatch, tmp_path):
+    q, _res = _drive_the_extractor(monkeypatch, tmp_path, REPORT["chatgpt"],
+                                   history=CURVE)
+    assert _record(q)["chatgpt"]["progressHistory"] == CURVE
+
+
+def test_the_record_stores_the_curve_downsampled_the_way_save_meta_would(
+        monkeypatch, tmp_path):
+    """⭐ ONE DOWNSAMPLER, TWO WRITERS. The live ring holds 240 samples and
+    `save_meta` persists 60 of them; a record that kept all 240 would hand back
+    a curve the run's own save would never have written."""
+    ring = [{"t": i * 1000, "chars": i * 10} for i in range(240)]
+    q, _res = _drive_the_extractor(monkeypatch, tmp_path, REPORT["chatgpt"],
+                                   history=ring)
+    stored = _record(q)["chatgpt"]["progressHistory"]
+    assert len(stored) == 60
+    assert stored == research._downsample_progress_history(ring)
+
+
+def test_the_downsampler_samples_evenly_and_leaves_a_short_ring_alone():
+    """⛔⛔ THE ARITHMETIC, PINNED ON A RING WHERE IT IS EXACT. 119 samples into
+    60 points is every second one, first and last included — the step spans the
+    GAPS, `(n-1)/(cap-1)`, not the samples. A step of `n/cap` gives 60 points
+    with the right endpoints and the wrong curve in between, and the two lines
+    that used to overwrite the endpoints would have hidden exactly that; they
+    are gone, and this is what replaced them."""
+    ring = [{"t": i} for i in range(119)]
+    assert research._downsample_progress_history(ring) == ring[::2]
+    assert research._downsample_progress_history(ring)[-1] is ring[-1]
+    long_ring = [{"t": i} for i in range(500)]
+    assert len(research._downsample_progress_history(long_ring)) == 60
+    short = [{"t": 1}, {"t": 2}]
+    assert research._downsample_progress_history(short) == short
+    assert research._downsample_progress_history(None) == []
+
+
+def test_a_kept_agent_gets_its_curve_back_into_the_ring(monkeypatch, tmp_path):
+    """The restore, executed: a daemon restart starts with an empty ring, and
+    the durable record is the only place the curve can come from."""
+    q, _res = _drive_the_extractor(monkeypatch, tmp_path, REPORT["chatgpt"],
+                                   history=CURVE)
+    rt = _Runtime()
+    monkeypatch.setattr(research, "_runtime", rt, raising=False)
+    monkeypatch.setattr(research, "emit_event", lambda *a, **k: None)
+    monkeypatch.setattr(research, "_write_agent_terminal_status", lambda *a, **k: None)
+    _launch, kept = research._p2_resume_plan(q, ALL)
+    research._p2_announce_restored(kept)
+    assert rt.agent_progress_history["chatgpt"] == CURVE
+
+
+def _save_meta_env(monkeypatch, tmp_path):
+    """The REAL `save_meta`, with only the Firestore propagation captured."""
+    captured = {}
+    monkeypatch.setattr(research, "_update_firestore_research",
+                        lambda updates: captured.update(updates))
+    monkeypatch.setattr(research, "_agent_status_by_rid", {}, raising=False)
+    monkeypatch.setattr(research, "_phase_status_by_rid", {}, raising=False)
+    return captured
+
+
+def test_the_run_that_keeps_an_agent_persists_its_curve_not_an_empty_one(
+        monkeypatch, tmp_path):
+    """⛔⛔ THE DEFECT, END TO END, over the two records the web reads: the run
+    resumes, keeps ChatGPT, and saves. Against round 1's code the curve reaching
+    both meta.json and the Firestore payload here is `[]`."""
+    q, _res = _drive_the_extractor(monkeypatch, tmp_path, REPORT["chatgpt"],
+                                   history=CURVE)
+    rt = _Runtime()          # a fresh worker: run_pipeline has reset the ring
+    monkeypatch.setattr(research, "_runtime", rt, raising=False)
+    monkeypatch.setattr(research, "emit_event", lambda *a, **k: None)
+    monkeypatch.setattr(research, "_write_agent_terminal_status", lambda *a, **k: None)
+    _launch, kept = research._p2_resume_plan(q, ALL)
+    research._p2_announce_restored(kept)
+
+    captured = _save_meta_env(monkeypatch, tmp_path)
+    research.save_meta(q, "Grid storage", 2)
+    meta = json.loads((q / "meta.json").read_text(encoding="utf-8"))
+    assert meta["agents"]["chatgpt"]["progressHistory"] == CURVE
+    assert captured["agents"]["chatgpt"]["progressHistory"] == CURVE
+
+
+def test_a_save_with_nothing_to_say_does_not_erase_a_persisted_curve(
+        monkeypatch, tmp_path):
+    """⛔ THE BELT, for a record written before the curve was kept in it — or
+    one that failed to write. `save_meta` consults `existing` for every other
+    field it cannot rebuild; the history does too now. The Firestore write is a
+    whole-field replace, so an empty rebuild used to destroy the curve there as
+    well as on disk."""
+    q = _queue(tmp_path, done=["chatgpt"], docs=["chatgpt"])
+    (q / "meta.json").write_text(json.dumps(
+        {"agents": {"chatgpt": {"progressHistory": CURVE}}}), encoding="utf-8")
+    monkeypatch.setattr(research, "_runtime", _Runtime(), raising=False)
+    captured = _save_meta_env(monkeypatch, tmp_path)
+    research.save_meta(q, "Grid storage", 2)
+    meta = json.loads((q / "meta.json").read_text(encoding="utf-8"))
+    assert meta["agents"]["chatgpt"]["progressHistory"] == CURVE
+    assert captured["agents"]["chatgpt"]["progressHistory"] == CURVE
+
+
+def test_a_live_ring_still_wins_over_what_was_persisted(monkeypatch, tmp_path):
+    """⭐ ACCEPT POLARITY, and the reason the carry-forward is gated on an EMPTY
+    rebuild: an agent that ran again this attempt has a newer curve, and the
+    fallback must never hold the old one in front of it."""
+    q = _queue(tmp_path, docs=["chatgpt"])
+    (q / "meta.json").write_text(json.dumps(
+        {"agents": {"chatgpt": {"progressHistory": CURVE}}}), encoding="utf-8")
+    fresh = [{"t": 1, "chars": 1}, {"t": 2, "chars": 2}]
+    monkeypatch.setattr(research, "_runtime", _Runtime(history={"chatgpt": fresh}),
+                        raising=False)
+    captured = _save_meta_env(monkeypatch, tmp_path)
+    research.save_meta(q, "Grid storage", 2)
+    assert captured["agents"]["chatgpt"]["progressHistory"] == fresh
+
+
+# ── the kept agent's row in links.json ────────────────────────────────────────
+#
+# ⛔⛔ A KEPT AGENT HANDED OVER A FILE AND NO LINK. `_p2_resume_plan` sets
+# `url=""` — the conversation address is only a reattach key and a kept agent is
+# not reattached — and the P2→P3 handoff read that as "this agent contributed
+# nothing". So `links.json`, delivery.json's `research_links`, the "Links saved:"
+# line and `/api/runs/{id}` listed only the agents that re-ran, while the kept
+# agent's markdown went to NotebookLM as usual. The handoff's own docstring says
+# the map exists so "produced no reports" and "refused its reports" are
+# different records on disk; a kept agent was a third state reading like the
+# first.
+
+def _merged_with_a_fresh_gemini(kept):
+    out = dict(kept)
+    out["Gemini"] = {"status": "done", "text": REPORT["gemini"], "verified": True,
+                     "url": "https://gemini.google.com/app/0f1e2d3c4b5a"}
+    return out
+
+
+def test_a_kept_agent_still_gets_its_row_in_the_links_map(monkeypatch, tmp_path):
+    monkeypatch.setattr(research, "_fb_research_id", "rid-1")
+    q = _queue(tmp_path, done=["chatgpt"], docs=["chatgpt", "gemini"])
+    _launch, kept = research._p2_resume_plan(q, ALL)
+    research._build_phase2_to_phase3_handoff(_merged_with_a_fresh_gemini(kept), q)
+    assert dict(research._runtime.p2_links_for_p3) == {
+        "ChatGPT": research.in_app_document_url("chatgpt"),
+        "Gemini": research.in_app_document_url("gemini")}
+    # …and the file half, which was never the broken one.
+    assert sorted(p.name for p in research._runtime.p2_md_files_for_p3) == [
+        "chatgpt.md", "gemini.md"]
+
+
+def test_a_kept_agent_the_sweep_refused_publishes_nothing(monkeypatch, tmp_path):
+    """⛔ ACCEPT POLARITY. The off-topic sweep runs over the MERGED results, kept
+    legs included, and a refused leg is not a source however it got here."""
+    monkeypatch.setattr(research, "_fb_research_id", "rid-1")
+    q = _queue(tmp_path, done=["chatgpt"], docs=["chatgpt"])
+    _launch, kept = research._p2_resume_plan(q, ALL)
+    kept["ChatGPT"]["off_topic_rejected"] = True
+    research._build_phase2_to_phase3_handoff(kept, q)
+    assert dict(research._runtime.p2_links_for_p3) == {}
+    assert list(research._runtime.p2_md_files_for_p3) == []
+
+
+def test_a_leg_that_never_reached_a_page_still_publishes_nothing(
+        monkeypatch, tmp_path):
+    """⛔ ACCEPT POLARITY, and the whole reason the new arm asks `_restored`
+    rather than "no url": an agent that never opened a tab has an empty address
+    too, and publishing a row for it would skip both drop guards on the way."""
+    monkeypatch.setattr(research, "_fb_research_id", "rid-1")
+    q = _queue(tmp_path, docs=["chatgpt"])
+    research._build_phase2_to_phase3_handoff(
+        {"ChatGPT": {"status": "done", "text": REPORT["chatgpt"], "url": "",
+                     "verified": True}}, q)
+    assert dict(research._runtime.p2_links_for_p3) == {}
 
 
 # ── the wiring inside run_pipeline, by AST shape ──────────────────────────────

@@ -39188,6 +39188,61 @@ async def _page_is_dead(page):
     return None
 
 
+def _watched_for_a_hung_browser(what):
+    """Run one of the run's long browser waits with somebody watching the
+    browser from OUTSIDE it. `what` names the wait, for the log and the unwind.
+
+    ⛔⛔ THE GUARDS ALL LIVE BETWEEN THE AWAITS, AND A HUNG CHROME PARKS US IN
+    ONE (wave 10.9, repair round). Phase 2's tick awaits
+    `browser.switch_to_page(page)` → `page.bring_to_front()` and
+    `page.evaluate(...)`, neither of which the driver bounds, and it consults
+    `_browser_context_is_dead` only after a tab reports CLOSED — which a hung
+    Chrome's tabs never do. The phase ceiling above only warns, so the run sat
+    frozen until the worker's five-hour ceiling (#547). A tick that overran
+    cannot report its own overrun either: the overrun IS an await that never
+    returns, so there is no line after it to check the clock on.
+
+    ⛔⛔ AND #547 IS THREE WAITS, NOT ONE (wave 10.9, repair round 2). The first
+    repair wrapped phase 2 alone, so the identical freeze stayed live in phase
+    1's poll and the phase-3 audio wait: both carry the same unbounded page
+    calls, both are ceilinged with `soft_warn_only=True`, and that banner is
+    BUTTONLESS — there is no Retry or Skip to consume, so the loop warns once
+    and keeps polling for ever. Every one of the three is decorated now; the
+    phase-3 UPLOAD was already hard-capped and asks the context itself.
+
+    ⭐ ON THE DEFINITION, NOT AT THE CALL, so no caller can be written that
+    forgets it — and because nothing in the suite can execute these waits
+    themselves, the mark below is the only thing a test can hold each wiring by.
+    `_run_watching_for_a_hung_browser` holds the decision; this only ties it to
+    the coroutines that need it.
+
+    ⚠ The browser is found BY NAME in the wrapped call, because the three
+    signatures put it in three different places (`poll_until_done` takes it as a
+    keyword). A wait handed no browser is watched by nobody — the probe has
+    nothing to ask — which is what the unwatched code already did.
+    """
+    import functools
+    import inspect
+
+    def _decorate(wait_fn):
+        signature = inspect.signature(wait_fn)
+
+        @functools.wraps(wait_fn)
+        async def _watched(*args, **kwargs):
+            try:
+                browser = signature.bind_partial(*args, **kwargs).arguments.get("browser")
+            except TypeError:
+                browser = None   # a call the wait itself will reject
+            return await _run_watching_for_a_hung_browser(
+                browser, wait_fn(*args, **kwargs), what)
+
+        _watched.watches_for_a_hung_browser = what
+        return _watched
+
+    return _decorate
+
+
+@_watched_for_a_hung_browser("phase 1's poll")
 async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                           browser=None, cua_client=None, verbose=False, phase=2):
     """Poll page until response is complete. Smart: uses CUA to check if DOM selectors fail."""
@@ -40912,7 +40967,8 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
         # whole, on disk and reachable. See `_p2_mark_agent_done`.
         _p2_mark_agent_done(queue_dir, agent_key, True, elapsed_sec=elapsed_sec,
                             findings=getattr(_runtime, "agent_findings", {}).get(agent_key),
-                            progress=_snap)
+                            progress=_snap,
+                            history=getattr(_runtime, "agent_progress_history", {}).get(agent_key))
         # F4 (2026-05-06): persist agent terminal status to root doc on
         # the individual complete-emit instead of waiting for the bulk
         # phase_complete write at :19641. On chat reopen mid-Phase-2,
@@ -43436,37 +43492,7 @@ async def _sweep_foreign_chatgpt_tabs(pending: dict, results: dict, *,
     return dropped
 
 
-def _watched_for_a_hung_browser(poll_fn):
-    """Run the phase-2 poll with somebody watching the browser from OUTSIDE it.
-
-    ⛔⛔ THE GUARDS ALL LIVE BETWEEN THE AWAITS, AND A HUNG CHROME PARKS US IN
-    ONE (wave 10.9, repair round). The tick below awaits
-    `browser.switch_to_page(page)` → `page.bring_to_front()` and
-    `page.evaluate(...)`, neither of which the driver bounds, and it consults
-    `_browser_context_is_dead` only after a tab reports CLOSED — which a hung
-    Chrome's tabs never do. The phase ceiling above only warns, so the run sat
-    frozen until the worker's five-hour ceiling (#547). A tick that overran
-    cannot report its own overrun either: the overrun IS an await that never
-    returns, so there is no line after it to check the clock on.
-
-    ⭐ ON THE DEFINITION, NOT AT THE CALL, so no caller can be written that
-    forgets it — and because nothing in the suite can execute the poll itself,
-    the mark below is the only thing a test can hold the wiring by.
-    `_poll_phase2_watching_for_a_hang` holds the decision; this only ties it to
-    the one coroutine that needs it.
-    """
-    import functools
-
-    @functools.wraps(poll_fn)
-    async def _watched(agents, browser, cua_client, *args, **kwargs):
-        return await _poll_phase2_watching_for_a_hang(
-            browser, poll_fn(agents, browser, cua_client, *args, **kwargs))
-
-    _watched.watches_for_a_hung_browser = True
-    return _watched
-
-
-@_watched_for_a_hung_browser
+@_watched_for_a_hung_browser("phase 2")
 async def poll_all_agents_round_robin(agents, browser, cua_client,
                                        max_wait_min=90, poll_interval=30, verbose=False):
     """Round-robin poll all verified agents until each completes or times out.
@@ -62307,6 +62333,40 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
 
 # ── Phase 2 → Phase 3 handoff ────────────────────────────────────────────────
 
+def _p2_to_p3_link_for(name, r, conversation_url) -> str:
+    """The report page this agent publishes into the P2→P3 link map, or "" for
+    no row at all.
+
+    `conversation_url` is what the handoff's two guards left of the agent's
+    CONVERSATION address — blank when the off-topic sweep rejected the leg or
+    the tab predates the run — because those two are the only things in the
+    pipeline that can judge one.
+
+    ⛔⛔ A KEPT AGENT HAS NO CONVERSATION ADDRESS BY CONSTRUCTION (wave 10.9,
+    repair round 2). `_p2_resume_plan` hands one back with `url=""` — it is not
+    reattached, and the address is only a reattach key — and the gate here read
+    that as "this agent contributed nothing". So a crash retry dropped the one
+    agent whose report SURVIVED from `links.json`, from delivery.json's
+    `research_links` and from the "Links saved:" line, while its markdown went
+    to NotebookLM as usual: a third state that read on disk exactly like "this
+    run produced no reports", which is the distinction this map exists to draw.
+    What earns a row is a surviving CONTRIBUTION, and a kept agent's is its
+    restored report page — the same page the relaunched agents publish.
+
+    ⚠ The sweep still vetoes either way: it runs over the merged results, kept
+    legs included, and a rejected leg is not a source however it got here.
+    """
+    if r.get("off_topic_rejected"):
+        return ""
+    if not conversation_url and not r.get("_restored"):
+        return ""
+    # ⚠ The key stays the DISPLAY name (`ChatGPT`, not `chatgpt`) because
+    # `links.json` is read by people; the value is built from the agent key,
+    # which is the same normalisation the phase-2 completion emit uses, so the
+    # two agree by construction rather than by luck.
+    return in_app_document_url(name.lower().replace(" ", ""))
+
+
 def _build_phase2_to_phase3_handoff(results: dict, queue_dir) -> None:
     """Populate _runtime.p2_links_for_p3 + _runtime.p2_md_files_for_p3 from
     P2 state (results + on-disk MDs). Idempotent.
@@ -62371,29 +62431,28 @@ def _build_phase2_to_phase3_handoff(results: dict, queue_dir) -> None:
             log(f"[Phase 2→3 handoff] dropping {_name}'s link {_url!r} — that "
                 f"conversation predates this run", "WARN")
             _url = ""
-        if _url:
-            # ⛔⛔ 2026-09-02, stretch 7.5 step 5 — WHAT IS PUBLISHED IS NO LONGER
-            # WHAT IS JUDGED. The two guards above still read the CONVERSATION
-            # address, because that is the only thing they can judge: the sweep's
-            # verdict is recorded against it, and the age test decodes an id out
-            # of it. But the value that goes into this map — and from here into
-            # `links.json`, the delivery mirror and the run log — is now the
-            # agent's report page in OUR app.
-            #
-            # ▶ Emptying the map instead was the obvious move and it was wrong
-            # twice. It would have left both guards above with nothing to act on,
-            # so the four tests that execute them would have gone from proving a
-            # drop to proving an empty dict — passing for a reason that has
-            # nothing to do with the guard. And it would have made "this run
-            # produced no reports" and "this run refused its reports" the same
-            # record on disk, which is exactly the distinction the guards exist
-            # to draw.
-            #
-            # ⚠ The key stays the DISPLAY name (`ChatGPT`, not `chatgpt`) because
-            # `links.json` is read by people; the value is built from the agent
-            # key, which is the same normalisation the phase-2 completion emit
-            # uses, so the two agree by construction rather than by luck.
-            p3_links[_name] = in_app_document_url(_name.lower().replace(" ", ""))
+        # ⛔⛔ 2026-09-02, stretch 7.5 step 5 — WHAT IS PUBLISHED IS NO LONGER
+        # WHAT IS JUDGED. The two guards above still read the CONVERSATION
+        # address, because that is the only thing they can judge: the sweep's
+        # verdict is recorded against it, and the age test decodes an id out
+        # of it. But the value that goes into this map — and from here into
+        # `links.json`, the delivery mirror and the run log — is the agent's
+        # report page in OUR app.
+        #
+        # ▶ Emptying the map instead was the obvious move and it was wrong
+        # twice. It would have left both guards above with nothing to act on,
+        # so the four tests that execute them would have gone from proving a
+        # drop to proving an empty dict — passing for a reason that has
+        # nothing to do with the guard. And it would have made "this run
+        # produced no reports" and "this run refused its reports" the same
+        # record on disk, which is exactly the distinction the guards exist
+        # to draw.
+        #
+        # ⛔ The decision itself is `_p2_to_p3_link_for`, because a kept agent
+        # is a THIRD answer and an inline `if _url:` could only ever give two.
+        _link_url = _p2_to_p3_link_for(_name, _r, _url)
+        if _link_url:
+            p3_links[_name] = _link_url
         # ⛔⛔ 2026-09-02 — AND THE SWEEP'S OWN SENTENCE WAS HALF FALSE. When it
         # rejects a leg it logs that the text "will not be written to documents/,
         # mirrored to Firestore, merged into consolidated.md, or handed to
@@ -64060,6 +64119,7 @@ def _playwright_foreign_artifact_dirs(browser):
     return out
 
 
+@_watched_for_a_hung_browser("the phase-3 audio wait")
 async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose=False, podcast_length="long", prefer_existing_audio: bool = False):
     """Phase 3 (step b): Generate audio overview in NotebookLM + share public.
 
@@ -66896,6 +66956,43 @@ def _run_started_ms(queue_dir) -> int:
     return min(stamps) if stamps else int(time.time() * 1000)
 
 
+def _downsample_progress_history(raw, cap=60):
+    """The per-agent progressHistory ring (240 live samples) cut down to `cap`
+    evenly-spaced points, the first and the last among them.
+
+    The FE GraphAnalysis All-Agents sparklines and the post-reload in-tile chart
+    restoration both consume the result — without it, reopening a finished run
+    shows a flat "No data" because the in-memory ring is already gone.
+
+    ⭐ ONE DOWNSAMPLER, TWO WRITERS (wave 10.9, repair round 2). `save_meta`
+    persists the live ring; the Phase-2 completion record stores the same curve
+    per agent, so an agent kept across a crash retry can put back the curve it
+    earned. Two copies of this arithmetic would drift, and a kept agent's curve
+    would stop matching the one its own attempt persisted.
+
+    ⛔ THE STEP SPANS THE GAPS, NOT THE SAMPLES — `(n-1)/(cap-1)`, so the last
+    index is exactly `n-1` and the endpoints are the agent's real first and last
+    reading. This used to be followed by two lines that overwrote `out[0]` and
+    `out[-1]` with `raw[0]` and `raw[-1]` "so the endpoints land on real
+    values"; with this step they never had anything to correct — mutation
+    proved it, no test could tell them from nothing — and against a WRONG step
+    they would have made a mis-sampled curve look right at both ends, which is
+    the one thing a reader checks. The arithmetic is pinned by a test instead.
+    """
+    raw = list(raw or [])
+    if len(raw) <= cap:
+        return raw
+    step = (len(raw) - 1) / float(cap - 1)
+    seen: set = set()
+    out: list = []
+    for i in range(cap):
+        idx = min(int(round(i * step)), len(raw) - 1)
+        if idx not in seen:
+            seen.add(idx)
+            out.append(raw[idx])
+    return out
+
+
 def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
     """Save/update meta.json — powers ALL frontend components (graphs, analytics, tracking).
     Contains: Research object + per-agent stats + phase timeline + source references."""
@@ -67075,23 +67172,22 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
                 _raw_hist = list(getattr(_runtime, "agent_progress_history", {}).get(platform, []) or [])
             except Exception:
                 _raw_hist = []
-            _down_hist: list = []
-            if len(_raw_hist) <= 60:
-                _down_hist = _raw_hist
-            elif _raw_hist:
-                _step = (len(_raw_hist) - 1) / 59.0
-                _seen: set = set()
-                for _i in range(60):
-                    _idx = min(int(round(_i * _step)), len(_raw_hist) - 1)
-                    if _idx not in _seen:
-                        _seen.add(_idx)
-                        _down_hist.append(_raw_hist[_idx])
-                # Always pin first + last so the curve endpoints land on
-                # real values, not the closest sampled neighbor.
-                if _down_hist and _down_hist[0] is not _raw_hist[0]:
-                    _down_hist[0] = _raw_hist[0]
-                if _down_hist and _down_hist[-1] is not _raw_hist[-1]:
-                    _down_hist[-1] = _raw_hist[-1]
+            _down_hist = _downsample_progress_history(_raw_hist)
+            # ⛔⛔ AND A REBUILD WITH NOTHING TO SAY DOES NOT ERASE WHAT A
+            # PREVIOUS ATTEMPT PERSISTED (wave 10.9, repair round 2). The write
+            # below replaces the whole `agents` field, and `run_pipeline` resets
+            # the live ring on every re-entry — so a resume that KEEPS a
+            # finished agent (it is never relaunched, so nothing ticks its ring
+            # this attempt) overwrote its persisted curve with [], and the one
+            # agent that did the work was the one reading "No data". Every other
+            # field on this entry already falls back to `existing`; the history
+            # does too now. The kept agent's own curve comes back through
+            # `_p2_announce_restored`; this is the belt for a record written
+            # before that existed, or one that failed to write.
+            if not _down_hist:
+                _prev_hist = existing.get("progressHistory")
+                if isinstance(_prev_hist, list) and _prev_hist:
+                    _down_hist = _prev_hist
             try:
                 _findings = list(getattr(_runtime, "agent_findings", {}).get(platform, []) or [])
             except Exception:
@@ -67376,7 +67472,7 @@ def _p2_progress_snapshot(snapshot) -> dict:
 
 
 def _p2_mark_agent_done(queue_dir, agent_key, done, elapsed_sec=0, findings=None,
-                        progress=None):
+                        progress=None, history=None):
     """Add one agent to the durable Phase-2 completion record, or with
     `done=False` take it out.
 
@@ -67403,7 +67499,16 @@ def _p2_mark_agent_done(queue_dir, agent_key, done, elapsed_sec=0, findings=None
                        # so a card announced without these sits on 0 sources and no
                        # sections for the rest of the phase. The in-process
                        # snapshot ring dies with the daemon, like the record itself.
-                       "progress": _p2_progress_snapshot(progress)}
+                       "progress": _p2_progress_snapshot(progress),
+                       # ⛔⛔ AND THE CURVE, for the same reason one step later
+                       # (wave 10.9, repair round 2). `save_meta` persists
+                       # `progressHistory` off the live ring, and a kept agent is
+                       # never relaunched — so nothing ticks its ring on the
+                       # attempt that finishes the run, and the whole-field
+                       # `agents` write replaced its real curve with []. Stored
+                       # downsampled, the same shape `save_meta` writes, so what
+                       # comes back is what the first attempt would have saved.
+                       "progressHistory": _downsample_progress_history(history)}
     elif key in agents:
         del agents[key]
     else:
@@ -67418,8 +67523,8 @@ def _p2_mark_agent_done(queue_dir, agent_key, done, elapsed_sec=0, findings=None
 
 
 def _p2_restorable_agents(queue_dir, enabled_agents) -> dict:
-    """{agent_key: {"text", "elapsed_sec", "findings", "progress"}} for each
-    enabled agent a Phase-2 re-entry must NOT launch again.
+    """{agent_key: {"text", "elapsed_sec", "findings", "progress", "history"}}
+    for each enabled agent a Phase-2 re-entry must NOT launch again.
 
     ⛔ BOTH HALVES, ALWAYS. An agent qualifies only with a completion record AND
     its report still on disk over 100 bytes (`detect_resume_phase`'s bar). The
@@ -67466,9 +67571,11 @@ def _p2_restorable_agents(queue_dir, enabled_agents) -> dict:
         except (TypeError, ValueError):
             elapsed = 0
         findings = entry.get("findings")
+        history = entry.get("progressHistory")
         out[key] = {"text": md, "elapsed_sec": elapsed,
                     "findings": findings if isinstance(findings, list) else [],
-                    "progress": _p2_progress_snapshot(entry.get("progress"))}
+                    "progress": _p2_progress_snapshot(entry.get("progress")),
+                    "history": history if isinstance(history, list) else []}
     return out
 
 
@@ -67498,6 +67605,7 @@ def _p2_resume_plan(queue_dir, enabled_agents):
             "md_saved": True,
             "_findings": r["findings"],
             "_progress": r["progress"],
+            "_history": r["history"],
             "_restored": True,
         }
     return launch, kept
@@ -67524,19 +67632,29 @@ def _p2_announce_restored(kept) -> None:
     sections and steps left the kept agent reading "complete, 0 sources, no
     sections" for the rest of the phase. The snapshot comes off the record because
     the in-process ring is empty after a daemon restart; it is put back into the
-    ring too, for `save_meta`'s own readers."""
+    ring too, for `save_meta`'s own readers.
+
+    ⛔⛔ AND SO DOES THE CURVE (repair round 2). `save_meta` reads TWO things off
+    `_runtime` per agent, and the round-1 restore put back one of them. A kept
+    agent is never relaunched, so nothing ticks its `agent_progress_history` on
+    this attempt — and the run's final save writes the whole `agents` field, so
+    an empty ring erased the sparkline the agent that did the work had earned,
+    while the relaunched ones kept theirs."""
     for name, r in (kept or {}).items():
         key = name.lower().replace(" ", "")
         n = len(r.get("text") or "")
         url = r.get("_in_app_url") or in_app_document_url(key)
         label = f"Read {name} report"
         snap = r.get("_progress") or {}
+        hist = r.get("_history") or []
         log(f"[phase2] {name} finished before the restart — keeping its report "
             f"({n} chars), not launching it again")
         if r.get("_findings"):
             _runtime.agent_findings[key] = list(r["_findings"])
         if snap:
             _runtime.agent_progress_snapshots[key] = dict(snap)
+        if hist:
+            _runtime.agent_progress_history[key] = list(hist)
         try:
             emit_event("link_extracted", phase=2, agent=key, url=url, label=label,
                        verified=True, primary=True)
@@ -67805,7 +67923,7 @@ async def _p3_upload_failure_kind(exc, browser) -> str:
     return "other"
 
 
-# ── The phase-2 hang watchdog ──────────────────────────────────────────────
+# ── The browser hang watchdog ──────────────────────────────────────────────
 # ⛔⛔ EVERY GUARD ABOVE RUNS INSIDE THE RUN, AND A HUNG CHROME NEVER GIVES THE
 # RUN ITS TURN BACK (wave 10.9, repair round). The bounded probe answers "dead"
 # beautifully — at the call sites that reach it. Phase 2's round-robin does not:
@@ -67815,6 +67933,14 @@ async def _p3_upload_failure_kind(exc, browser) -> str:
 # hung Chrome's tabs never do. So the tick parks inside one of those awaits and
 # the phase ceiling above it only warns (soft_warn_only), leaving the run frozen
 # until the worker's five-hour ceiling — the freeze #547 is about.
+#
+# ⛔⛔ AND THE SAME SENTENCE IS TRUE OF TWO MORE WAITS (repair round 2). Phase
+# 1's poll and the phase-3 audio wait carry the same unbounded page calls under
+# the same buttonless soft ceiling, and neither asks `_browser_context_is_dead`
+# anywhere. The first repair wrapped phase 2 only, so #547 stayed live in both.
+# `_watched_for_a_hung_browser` now decorates all three; the constants below
+# are the ladder for every one of them, which is why they are not named for a
+# phase.
 #
 # ⛔ AND A TICK THAT OVERRAN CANNOT REPORT ITS OWN OVERRUN, because the overrun
 # IS an await that never returns: there is no line after it to check the clock
@@ -67828,8 +67954,8 @@ async def _p3_upload_failure_kind(exc, browser) -> str:
 # outright — answers instantly, with an error, and is NOT this watchdog's
 # business: the poll's own crash sweep already handles a closed browser, and a
 # pause must never be mistaken for one. Only silence counts.
-#: How often the watchdog asks, while phase 2 polls.
-_PHASE2_HANG_CHECK_SEC = 120.0
+#: How often the watchdog asks, while a watched wait runs.
+_BROWSER_HANG_CHECK_SEC = 120.0
 #: How many consecutive silences unwind the run. Each one is a full
 #: `_CTX_PROBE_TIMEOUT_SEC` of silence and they are a check apart, so three
 #: means the browser PROCESS has not answered a trivial CDP read across ~four
@@ -67837,10 +67963,10 @@ _PHASE2_HANG_CHECK_SEC = 120.0
 #: working — cookies are the browser process's, not the renderer's — so three
 #: buys immunity to a one-off stall (a laptop waking, a disk stall on the
 #: profile) for four minutes of a ceiling measured in hours.
-_PHASE2_HANG_STRIKES = 3
-#: How long the cancelled poll gets to unwind before we raise anyway. It is
+_BROWSER_HANG_STRIKES = 3
+#: How long the cancelled wait gets to unwind before we raise anyway. It is
 #: cancelled INSIDE a call that is not answering, so its own unwind may be slow.
-_PHASE2_HANG_UNWIND_GRACE_SEC = 30.0
+_BROWSER_HANG_UNWIND_GRACE_SEC = 30.0
 
 
 async def _browser_context_is_unresponsive(browser) -> bool:
@@ -67880,25 +68006,31 @@ def _discard_task_outcome(task):
             pass
 
 
-async def _poll_phase2_watching_for_a_hang(browser, poll_coro):
-    """Run phase 2's round-robin poll with somebody watching the browser.
+async def _run_watching_for_a_hung_browser(browser, wait_coro, what):
+    """Run one of the run's long browser waits with somebody watching the
+    browser. `what` names the wait — "phase 2", "phase 1's poll", "the phase-3
+    audio wait" — and goes into the log line and the unwind's sentence.
 
-    Returns whatever the poll returns and re-raises whatever it raises — the
+    Returns whatever the wait returns and re-raises whatever it raises — the
     crash sweep's own RuntimeError included, untouched. The one thing it adds:
-    when Chrome has gone silent for `_PHASE2_HANG_STRIKES` checks in a row, the
-    poll is cancelled and the SAME "(browser crash)" RuntimeError the sweep
+    when Chrome has gone silent for `_BROWSER_HANG_STRIKES` checks in a row, the
+    wait is cancelled and the SAME "(browser crash)" RuntimeError the sweep
     raises is raised in its place, with `last_failure_kind` set the same way, so
     the recovery that already exists — unwind, bounded close (which kills our
     profile's Chrome), silent relaunch and resume, and the Retry card once
     BROWSER_CRASH_MAX_RETRIES is spent — runs exactly as it does for a crash.
     No second opinion about what a dead browser means, and no second unwind.
+
+    ⭐ THE SAME RECOVERY FOR ALL THREE WAITS. A crash in phase 1 or in phase 3
+    already resumes from its own checkpoint, so a hang unwound here rejoins the
+    path a crash at the same point has always taken.
     """
-    task = asyncio.ensure_future(poll_coro)
+    task = asyncio.ensure_future(wait_coro)
     silences = 0
     try:
         while True:
             done, _still_running = await asyncio.wait(
-                {task}, timeout=_PHASE2_HANG_CHECK_SEC)
+                {task}, timeout=_BROWSER_HANG_CHECK_SEC)
             if done:
                 return task.result()
             if not await _browser_context_is_unresponsive(browser):
@@ -67910,22 +68042,22 @@ async def _poll_phase2_watching_for_a_hang(browser, poll_coro):
                 continue
             silences += 1
             log(f"[browser] Chrome did not answer a cookie read within "
-                f"{_CTX_PROBE_TIMEOUT_SEC:g}s while phase 2 was polling "
-                f"({silences}/{_PHASE2_HANG_STRIKES})", "WARN")
-            if silences < _PHASE2_HANG_STRIKES:
+                f"{_CTX_PROBE_TIMEOUT_SEC:g}s while {what} was waiting on it "
+                f"({silences}/{_BROWSER_HANG_STRIKES})", "WARN")
+            if silences < _BROWSER_HANG_STRIKES:
                 continue
             if task.done():
                 # ⭐ THE RACE THE LADDER CREATES. Each rung costs a full probe,
-                # and the poll can come back during one — with the phase's
+                # and the wait can come back during one — with the phase's
                 # results. Unwinding on a browser nobody is waiting on any more
                 # would buy the whole of phase 2 a second time.
                 return task.result()
             log("[browser] the research browser has been silent for "
-                f"{silences} checks and phase 2 is waiting on it — unwinding "
+                f"{silences} checks and {what} is waiting on it — unwinding "
                 "the run so the crash path can replace it", "WARN")
             _runtime.last_failure_kind = "browser_crash"
             raise RuntimeError(
-                "research browser hung during phase 2 (browser crash)")
+                f"research browser hung during {what} (browser crash)")
     finally:
         if not task.done():
             task.cancel()
@@ -67936,7 +68068,7 @@ async def _poll_phase2_watching_for_a_hang(browser, poll_coro):
             # may still be stuck on, and its await fails then. The callback is
             # attached rather than called so it also covers that late finish.
             task.add_done_callback(_discard_task_outcome)
-            await asyncio.wait({task}, timeout=_PHASE2_HANG_UNWIND_GRACE_SEC)
+            await asyncio.wait({task}, timeout=_BROWSER_HANG_UNWIND_GRACE_SEC)
 
 
 def _plan_pipeline_auto_retry(queue_dir, resume_dir, failure_kind, crash_retries):

@@ -36,6 +36,13 @@ looking installed. The quiet ones:
           card appears: the run quietly proceeds without NotebookLM.
   M8    — a closed tab asks the person instead of retrying: the fix the lens
           warned was WORSE than the bug under the "self-heal silent" rule.
+  X5/X6 — repair round 2. The watchdog is wired to phase 2 alone again, so the
+          identical freeze stays live in phase 1's poll and the phase-3 audio
+          wait — both unbounded, both under a BUTTONLESS soft ceiling — while
+          the decoration on phase 2 still reads as if #547 were closed.
+  X7    — the wrapper finds the browser POSITIONALLY. Correct for phase 2, and
+          `None` for the two waits whose signatures put it elsewhere: the mark
+          says watched, the probe asks something with no context, nothing fires.
 
 ⛔ ANCHORS ARE SINGLE STRING LITERALS AND MUST MATCH EXACTLY ONCE. A stale
 anchor is a harness fault, not a survivor, and faults are counted OUT. Every
@@ -109,31 +116,31 @@ C_CLEAR = ("            self.context = None\n"
 C_KILL_HEAD = "            # Kill only OUR profile's chromium — never nuke all chrome.exe\n"
 C_STOP_CONST = "_BROWSER_STOP_TIMEOUT_SEC = 10.0\n"
 
-# ── anchors: D5, the watchdog beside phase 2's poll ────────────────────────
+# ── anchors: D5, the watchdog beside every soft-ceilinged browser wait ─────
 #: The narrow question — did it ANSWER — and the wide one it is not.
 W_ASK = "            if not await _browser_context_is_unresponsive(browser):\n"
 #: An answer wipes the slate.
 W_RESET = ("                silences = 0\n"
            "                continue\n")
 #: The ladder.
-W_LADDER = ("            if silences < _PHASE2_HANG_STRIKES:\n"
+W_LADDER = ("            if silences < _BROWSER_HANG_STRIKES:\n"
             "                continue\n")
-#: The poll can come back DURING the probe that spends the ladder.
+#: The wait can come back DURING the probe that spends the ladder.
 W_RACE = ("            if task.done():\n"
           "                # ⭐ THE RACE THE LADDER CREATES. Each rung costs a full probe,\n"
-          "                # and the poll can come back during one — with the phase's\n"
+          "                # and the wait can come back during one — with the phase's\n"
           "                # results. Unwinding on a browser nobody is waiting on any more\n"
           "                # would buy the whole of phase 2 a second time.\n"
           "                return task.result()\n")
-#: The unwind: the flag, and the sweep's own sentence.
+#: The unwind: the flag, the sweep's own sentence, and the wait it names.
 W_RAISE = ("            _runtime.last_failure_kind = \"browser_crash\"\n"
            "            raise RuntimeError(\n"
-           "                \"research browser hung during phase 2 (browser crash)\")\n")
-#: The poll must not keep driving the old tabs.
+           "                f\"research browser hung during {what} (browser crash)\")\n")
+#: The wait must not keep driving the old tabs.
 W_CANCEL = ("        if not task.done():\n"
             "            task.cancel()\n")
-W_CHECK_CONST = "_PHASE2_HANG_CHECK_SEC = 120.0\n"
-W_STRIKES_CONST = "_PHASE2_HANG_STRIKES = 3\n"
+W_CHECK_CONST = "_BROWSER_HANG_CHECK_SEC = 120.0\n"
+W_STRIKES_CONST = "_BROWSER_HANG_STRIKES = 3\n"
 #: `_browser_context_is_unresponsive`: no handle is not a silence.
 U_NONE = ("    ctx = getattr(browser, \"context\", None)\n"
           "    if ctx is None:\n"
@@ -142,12 +149,18 @@ U_NONE = ("    ctx = getattr(browser, \"context\", None)\n"
 U_BOUND = ("        await asyncio.wait_for(ctx.cookies(),\n"
            "                               timeout=_CTX_PROBE_TIMEOUT_SEC)\n")
 
-# ── anchors: D5, the decoration that ties the watchdog to the poll ─────────
-X_DECO = ("@_watched_for_a_hung_browser\n"
+# ── anchors: D5, the decorations that tie the watchdog to the three waits ──
+X_DECO = ("@_watched_for_a_hung_browser(\"phase 2\")\n"
           "async def poll_all_agents_round_robin(agents, browser, cua_client,\n")
-X_WRAPS = "    @functools.wraps(poll_fn)\n"
-X_BODY = ("        return await _poll_phase2_watching_for_a_hang(\n"
-          "            browser, poll_fn(agents, browser, cua_client, *args, **kwargs))\n")
+X_DECO_P1 = ("@_watched_for_a_hung_browser(\"phase 1's poll\")\n"
+             "async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,\n")
+X_DECO_P3 = ("@_watched_for_a_hung_browser(\"the phase-3 audio wait\")\n"
+             "async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir,")
+X_WRAPS = "        @functools.wraps(wait_fn)\n"
+X_BODY = ("            return await _run_watching_for_a_hung_browser(\n"
+          "                browser, wait_fn(*args, **kwargs), what)\n")
+#: Finding the browser wherever the signature puts it.
+X_FIND = ("                browser = signature.bind_partial(*args, **kwargs).arguments.get(\"browser\")\n")
 #: …and an answer is an answer, whatever it says.
 U_ARMS = ("    except asyncio.TimeoutError:\n"
           "        return True\n"
@@ -452,20 +465,46 @@ MUTANTS = [
      [(X_DECO, "async def poll_all_agents_round_robin(agents, browser, cua_client,\n")]),
 
     ("X2", "under", RESEARCH,
-     "\u26d4\u26d4 the decoration is applied and awaits the poll DIRECTLY: the "
+     "\u26d4\u26d4 the decoration is applied and awaits the wait DIRECTLY: the "
      "mark is set, the watchdog is imported, and the freeze is unchanged",
-     [(X_BODY, "        return await poll_fn(agents, browser, cua_client, *args, **kwargs)\n")]),
+     [(X_BODY, "            return await wait_fn(*args, **kwargs)\n")]),
 
     ("X3", "under", RESEARCH,
      "\u26d4 the watchdog is handed the wrong argument \u2014 it probes something "
      "with no context, which never answers 'silent', so it can never fire",
-     [(X_BODY, "        return await _poll_phase2_watching_for_a_hang(\n"
-               "            agents, poll_fn(agents, browser, cua_client, *args, **kwargs))\n")]),
+     [(X_FIND, "                browser = None\n"
+               "                _ = signature\n")]),
 
     ("X4", "under", RESEARCH,
-     "\u26d4 the wrapper stops carrying `__wrapped__`: eight other files read "
-     "this function's SOURCE and would silently start reading the wrapper's",
+     "\u26d4 the wrapper stops carrying `__wrapped__`: dozens of other files read "
+     "these functions' SOURCE and would silently start reading the wrapper's",
      [(X_WRAPS, "")]),
+
+    # \u2500\u2500 D5 (repair round 2): the two waits the first repair left frozen \u2500\u2500
+    ("X5", "under", RESEARCH,
+     "\u26d4\u26d4 #547 STAYS LIVE IN PHASE 1 \u2014 the brief poll is declared "
+     "undecorated again, under a soft ceiling whose banner has no button",
+     [(X_DECO_P1,
+       "async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,\n")]),
+
+    ("X6", "under", RESEARCH,
+     "\u26d4\u26d4 #547 STAYS LIVE IN THE PHASE-3 AUDIO WAIT \u2014 90 minutes of "
+     "soft ceiling and then a warning nobody can act on",
+     [(X_DECO_P3,
+       "async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir,")]),
+
+    ("X7", "under", RESEARCH,
+     "\u26d4\u26d4 the browser is found POSITIONALLY \u2014 right for phase 2, "
+     "`None` for the other two, so both keep freezing while the mark says watched",
+     [(X_FIND, "                browser = args[1] if len(args) > 1 else None\n"
+               "                _ = signature\n")]),
+
+    ("X8", "under", RESEARCH,
+     "\u26d4 every unwind says 'phase 2' \u2014 the line the freeze was diagnosed "
+     "off, naming the wrong wait for two of the three",
+     [(W_RAISE, "            _runtime.last_failure_kind = \"browser_crash\"\n"
+                "            raise RuntimeError(\n"
+                "                \"research browser hung during phase 2 (browser crash)\")\n")]),
 ]
 
 
