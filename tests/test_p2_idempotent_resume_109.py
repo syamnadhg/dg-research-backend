@@ -990,7 +990,12 @@ def test_the_safety_filter_reads_the_display_names_the_phase_writes():
 
 
 def test_the_finalize_resave_asks_the_helper():
-    tree = _tree(research.run_pipeline)
+    """⭐ Wave 10.9, 2026-09-22 — the finalize re-save moved out of
+    `run_pipeline` into `_p2_persist_reports` (so a test could drive the writes
+    against a fake Firestore) and the loop moved with it, unchanged. Re-pointed,
+    not relaxed: the gate is still the helper call, and it is still the loop's
+    first statement."""
+    tree = _tree(research._p2_persist_reports)
     loops = [n for n in ast.walk(tree) if isinstance(n, ast.For)
              and ast.unparse(n.iter) == "results.items()"
              and "save_document_to_firestore(_agent_lc" in ast.unparse(n)]

@@ -31,6 +31,7 @@ pages. A presence assertion would pass against a filter that cannot run.
 
 import asyncio
 import json
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -1021,16 +1022,30 @@ def test_EVERY_writer_of_an_agent_md_is_covered_by_one_guard_or_the_other():
 
 
 def test_the_consolidated_build_is_downstream_of_the_sweep():
+    """⭐ Wave 10.9, 2026-09-22 — the claim is unchanged and it is now made in
+    two halves that meet at one call. The merged corpus moved out of
+    `run_pipeline` into `_p2_persist_reports` so a test could DRIVE the writes,
+    and a single `index()` comparison over module text would no longer mean
+    anything: the helper is defined thousands of lines ABOVE the sweep it has to
+    run after. So: the sweep happens inside `run_phase2`, `run_pipeline` hands
+    the phase's return straight to the helper without reassigning it, and the
+    helper builds the corpus before it touches `results` again.
+
+    ⛔ The third assertion used to index the Firestore mirror. That write is
+    retired (wave 10.9 — the web's Summary reads `documents/synthesis`), so it
+    is pinned ABSENT from the whole module instead: an ordering claim about a
+    write that must not exist is weaker than its absence."""
     from conftest import code_only  # type: ignore
     src = code_only(Path(research.__file__).read_text(encoding="utf-8"))
-    sweep = src.index("apply_off_topic_sweep(results, _p2_run_dir())")
-    # ⭐ Wave 10, 2026-09-18 — the disk write this used to index is retired, so
-    # the anchor moves to the BUILD itself, which is one line EARLIER than the
-    # write was: an off-topic leg must be blanked before its text is merged at
-    # all, not merely before it is persisted. Strictly more than the old claim.
-    consolidated = src.index('consolidated_parts = [f"# Consolidated Research Report')
-    assert sweep < consolidated
-    assert src.index('save_document_to_firestore("consolidated"') > consolidated
+    assert "apply_off_topic_sweep(results, _p2_run_dir())" in code_only(research.run_phase2)
+    pipeline = code_only(research.run_pipeline)
+    call = pipeline.index("await _p2_persist_reports(")
+    phase = pipeline.rindex("await _p2_run_with_resume(", 0, call)
+    assert not re.findall(r"^\s*results\s*=", pipeline[phase:call], re.M)
+    persist = code_only(research._p2_persist_reports)
+    build = persist.index('consolidated_parts = [f"# Consolidated Research Report')
+    assert not re.findall(r"^\s*results\s*=", persist[:build], re.M)
+    assert 'save_document_to_firestore("consolidated"' not in src
 
 
 def test_the_skip_branch_runs_the_guard_on_what_it_extracted():

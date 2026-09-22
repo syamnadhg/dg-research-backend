@@ -165,7 +165,9 @@ R_SOFT_RETRY = ("                    emit_event(\"phase_restart\", phase=2, "
 R_LEGACY = "                launch, kept = list(enabled_agents), {}  # wave 10.9, as above"
 R_RESTART = ("        # ⭐ Wave 10.9: new input re-runs the whole phase, kept agents too.\n"
              "        launch, kept = list(enabled_agents), {}")
-RESAVE_SITE = "                if _p2_needs_resave(r):"
+#: Wave 10.9, 09-22: the finalize re-save moved into `_p2_persist_reports` so a
+#: test could drive the writes; the line is unchanged, the indent is not.
+RESAVE_SITE = "        if _p2_needs_resave(r):"
 #: The announce.
 A_STATUS = "            _write_agent_terminal_status(key, \"complete\")"
 A_PROGRESS = "            emit_event(\"agent_progress\", phase=2, agent=key, status=\"complete\","
@@ -337,7 +339,7 @@ MUTANTS = [
      [(FILTER, "    return _p2_only_enabled(results, launch), user_skipped, False")]),
     ("M11", "under", RESEARCH,
      "the finalize re-save re-writes kept reports again",
-     [(RESAVE_SITE, "                if r[\"text\"]:")]),
+     [(RESAVE_SITE, "        if r[\"text\"]:")]),
     ("M12", "under", RESEARCH,
      "⛔⛔ THE DEFECT, RE-OPENED BY ONE ADDED LINE — the launch list is widened "
      "back to the roster after the plan was made, so every finished Deep Research "

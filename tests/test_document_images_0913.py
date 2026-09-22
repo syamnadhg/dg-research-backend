@@ -1144,6 +1144,24 @@ def _pipeline():
     return code_only(R.run_pipeline)
 
 
+def _persist():
+    """The Phase-2 persistence helper.
+
+    ⭐ Wave 10.9, 2026-09-22 — the finalize re-save and the merged corpus moved
+    out of `run_pipeline` into `_p2_persist_reports`, so a test could drive the
+    writes against a fake Firestore instead of only reading their source."""
+    return code_only(R._p2_persist_reports)
+
+
+def _writers():
+    """`run_pipeline` and that helper as ONE text.
+
+    ⛔ Every count below is over the pair, never over one of them: the move put
+    two of the document writes on the other side of a call, and a count that saw
+    only one half would be satisfied by emptying the other."""
+    return _pipeline() + "\n" + _persist()
+
+
 def test_every_brief_save_is_built_from_rehosted_text():
     """SOURCE PIN — `run_pipeline` cannot be executed here. For each brief build,
     the LAST assignment to `brief_text` before it is the rehost, and its save
@@ -1174,8 +1192,9 @@ def test_every_brief_save_is_built_from_rehosted_text():
 
 
 def test_every_results_loop_that_writes_a_document_is_fed_by_the_rehost():
-    """SOURCE PIN — the finalize re-save and both regen re-saves."""
-    src = _pipeline()
+    """SOURCE PIN — the finalize re-save (now in `_p2_persist_reports`) and both
+    regen re-saves. Over the pair, so the count is still three."""
+    src = _writers()
     writers = [m.start() for m in re.finditer(r'\(queue_dir / "documents" / fname\)\.write_text\(', src)]
     assert len(writers) == 3
     for w in writers:
@@ -1186,25 +1205,32 @@ def test_every_results_loop_that_writes_a_document_is_fed_by_the_rehost():
 
 
 def test_the_consolidated_build_reads_the_rehosted_results():
-    src = _pipeline()
+    src = _persist()
     build = src.index("consolidated_parts = ")
     funnel = src.rindex("await _rehost_result_texts(results)", 0, build)
     between = src[funnel:build]
     assert "results = " not in between and "results[" not in between
-    # ⭐ Wave 10, 2026-09-18 — this used to point at the disk write, which is
-    # retired (`tests/test_stacked_document_retired_0918.py`). The ordering claim
-    # is unchanged and now rides the write that survived, the Firestore mirror;
-    # the disk write is additionally pinned ABSENT, so re-pointing asserts more
-    # than it did rather than less.
-    assert '"consolidated.md").write_text' not in src
-    assert src.index('save_document_to_firestore("consolidated", _consolidated_md') > build
+    # ⭐ Wave 10.9, 2026-09-22 — the merged corpus has NO persisted copy left to
+    # index: the disk write went on 09-18 and the Firestore mirror goes now (the
+    # web's Summary reads `documents/synthesis`). Both are pinned ABSENT from the
+    # whole module, which is strictly more than the ordering claim they carried.
+    # What survives the rehost funnel is the STRING, and the two readers it is
+    # handed to are pinned in test_stacked_document_retired_0918.py.
+    mod = code_only(Path(R.__file__).read_text(encoding="utf-8"))
+    assert '"consolidated.md").write_text' not in mod
+    assert 'save_document_to_firestore("consolidated"' not in mod
+    assert "_consolidated_md" not in _pipeline()
 
 
 def test_the_pipeline_has_exactly_the_measured_document_saves():
-    """Three brief saves, the finalize re-save, the consolidated report, two regen
-    re-saves. A new save site fails here until it is funneled and counted."""
-    src = _pipeline()
-    assert src.count("save_document_to_firestore(") == 7
+    """Three brief saves, the finalize re-save, two regen re-saves. A new save
+    site fails here until it is funneled and counted.
+
+    ⭐ Wave 10.9, 2026-09-22 — six, not seven: the `consolidated` mirror is
+    retired. The count is over `run_pipeline` AND `_p2_persist_reports`, because
+    the finalize re-save now lives in the helper."""
+    src = _writers()
+    assert src.count("save_document_to_firestore(") == 6
     assert src.count("await _rehost_document_images(") == 3
     assert src.count("await _rehost_result_texts(results)") == 3
     # Round 4: the phase-1 skip branch's brief (no save, a local file and the paste).

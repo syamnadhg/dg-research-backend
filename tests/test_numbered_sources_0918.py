@@ -621,15 +621,24 @@ def test_every_document_write_site_routes_through_the_numbering_funnel():
     other three were bought outright. `code_only_deep` blanks comments AND
     docstrings, so a mention of the call is no longer a call; per-function
     counts stop a new site anywhere from paying for a deleted one somewhere
-    else."""
+    else.
+
+    ⭐ Wave 10.9, 2026-09-22 — a FOURTH key, not a lowered total. The finalize
+    re-save moved into `_p2_persist_reports` (so a test could drive the writes
+    against a fake Firestore), so `run_pipeline` keeps the two regen sites and
+    the helper owns one. Splitting the key is the whole point of counting per
+    function: had the helper's site been folded into the old total, deleting it
+    and adding a regen site would still have read as three."""
     from conftest import code_only_deep
 
     sites = {fn.__name__: code_only_deep(fn).count("_document_with_sources(")
-             for fn in (research.run_pipeline, research.run_phase2,
-                        research.extract_and_record_agent)}
+             for fn in (research.run_pipeline, research._p2_persist_reports,
+                        research.run_phase2, research.extract_and_record_agent)}
     assert sites == {
-        # the finalize re-save + the two regen re-saves
-        "run_pipeline": 3,
+        # the two regen re-saves
+        "run_pipeline": 2,
+        # the finalize re-save, which wave 10.9 moved out of run_pipeline
+        "_p2_persist_reports": 1,
         # nothing: phase 2 records through extract_and_record_agent
         "run_phase2": 0,
         # the per-agent save, the site the executed test above drives

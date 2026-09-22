@@ -28821,7 +28821,8 @@ def apply_off_topic_sweep(results: dict, queue_dir) -> "list[str]":
     Four things happen to a rejected entry, and all four are load-bearing:
 
       * `text` is cleared, which is what keeps it out of `documents/<agent>.md`,
-        the Firestore documents subcollection, `consolidated.md` and `save_meta`.
+        the Firestore documents subcollection, the merged corpus the run's
+        one-line summary and its title refresh are built from, and `save_meta`.
         Every one of those reads this field.
       * `verified` is cleared, so the agent cannot be bucketed as `linked` and
         offered to the user as "Read <agent> report" pointing at a file we refused
@@ -62605,8 +62606,8 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         _swept = apply_off_topic_sweep(results, _p2_run_dir())
         if _swept:
             log(f"[Phase 2] off-topic sweep rejected {_swept} — their text will not be "
-                f"written to documents/, mirrored to Firestore, merged into "
-                f"consolidated.md, or handed to NotebookLM", "ERROR")
+                f"written to documents/, mirrored to Firestore, merged into the "
+                f"run's summary and title, or handed to NotebookLM", "ERROR")
     except Exception as _swe:
         log(f"[Phase 2] off-topic sweep errored ({_swe}) — results unchanged", "WARN")
 
@@ -62737,10 +62738,10 @@ def _build_phase2_to_phase3_handoff(results: dict, queue_dir) -> None:
             p3_links[_name] = _link_url
         # ⛔⛔ 2026-09-02 — AND THE SWEEP'S OWN SENTENCE WAS HALF FALSE. When it
         # rejects a leg it logs that the text "will not be written to documents/,
-        # mirrored to Firestore, merged into consolidated.md, or handed to
-        # NotebookLM". True of the link, which the branch above drops. NOT true of
-        # the FILE: the append below asked only whether a file exists on disk and
-        # was over 100 bytes. Nothing about the rejection reached it.
+        # mirrored to Firestore, merged into the run's summary and title, or
+        # handed to NotebookLM". True of the link, which the branch above drops.
+        # NOT true of the FILE: the append below asked only whether a file exists
+        # on disk and was over 100 bytes. Nothing about the rejection reached it.
         #
         # Today that gap is closed by luck rather than by design — the writers are
         # all gated on the text the sweep blanks, so a rejected leg leaves no file
@@ -68123,6 +68124,156 @@ async def _p2_run_with_resume(queue_dir, enabled_agents, research_brief, *,
     return _p2_only_enabled(results, enabled_agents), user_skipped, False
 
 
+async def _p2_persist_reports(results, queue_dir, topic, brief_text) -> None:
+    """Everything a finished Phase 2 PERSISTS, and everything it hands on.
+
+    ⛔⛔ THIS IS THE DECISION, AND IT LIVES HERE SO A TEST CAN RUN IT. Inside
+    `run_pipeline` it was four thousand lines deep behind a browser and a queue,
+    so the only pins it could ever have were on its source TEXT — and the one
+    claim that matters here is about what a completed run WRITES. Driven with a
+    fake Firestore, this answers it: the three agent reports go out, and nothing
+    else does (`tests/test_consolidated_write_retired_109.py`).
+
+    Writes each agent's numbered report to `documents/<agent>.md` and to the
+    Firestore documents subcollection, builds the merged corpus in memory, and
+    dispatches the two readers that take it as text."""
+    # ⭐ Wave 4: rehost images in `results` BEFORE the re-save and the merged
+    # corpus below. Texts from extract_and_record_agent are already references
+    # (no fetch); a salvaged partial is not.
+    await _rehost_result_texts(results)
+    for name, r in results.items():
+        if _p2_needs_resave(r):  # wave 10.9: a kept agent's copies stand
+            fname = name.lower().replace(" ", "") + ".md"
+            _agent_md = f"# {name} Deep Research\n\n{r['text']}"
+            _agent_lc = name.lower().replace(" ", "")
+            # Backstop findings extraction at the P2 finalize re-save
+            # site. The primary site is in extract_and_record_agent
+            # (~research.py:10988), but this resave path can run on
+            # resume / manual re-finalize when the snapshot ring may
+            # have been cleared. Reuses findings that already exist.
+            #
+            # ⛔⛔ WAVE 10 — AHEAD OF THE WRITE, for the reason the
+            # primary site states: the numbering below appends a
+            # bibliography, and a findings pass run after it would read
+            # that bibliography as the report's own citations.
+            _findings = []
+            try:
+                _findings = list((getattr(_runtime, "agent_findings", {}) or {}).get(_agent_lc) or [])
+                if not _findings:
+                    _snap_f = getattr(_runtime, "agent_progress_snapshots", {}).get(_agent_lc, {}) or {}
+                    _src_urls = list(_snap_f.get("source_urls", []) or [])
+                    _src_items = list(_snap_f.get("source_items", []) or [])
+                    # Same de-gating as the primary site: this backstop
+                    # exists for resume/re-finalize, exactly when the
+                    # snapshot ring may have been cleared — so keying it
+                    # on the panel list made it useless in the one case
+                    # it was written for.
+                    if _agent_md:
+                        _findings = _extract_findings(_agent_md, _src_urls, _src_items) or []
+                        if _findings:
+                            _runtime.agent_findings[_agent_lc] = _findings
+            except Exception:
+                _findings = []
+            # ⭐ Wave 10 — numbered sources, on the same document both
+            # writes below carry.
+            _agent_md = _document_with_sources(_agent_md, findings=_findings)
+            (queue_dir / "documents" / fname).write_text(_agent_md, encoding="utf-8")
+            # Sync to Firestore documents subcollection — doc_type is the
+            # agent key (chatgpt / gemini / claude), consistent with the
+            # frontend's Documents page expectation.
+            save_document_to_firestore(_agent_lc, _agent_md, f"{name} Deep Research")
+    # ⛔⛔ 2026-09-22, WAVE 10.9 — THE MACHINE NO LONGER PERSISTS THE STACKED
+    # DOCUMENT ANYWHERE, AND THE STRING BELOW IS ALL THAT IS LEFT OF IT. The
+    # stack is exactly what it looks like: one H1 and each agent's report
+    # verbatim, no model, no budget, no cap. `documents/consolidated.md` went on
+    # 09-18; the Firestore mirror under the `consolidated` doc type goes here.
+    #
+    # ▶ WHY NOW — and it is the condition THIS BLOCK wrote down for itself, "no
+    # surface needs a combined document for a run without a synthesis":
+    #   * the P5 SUMMARY reads the Super Research document and only it (owner's
+    #     decision D-3 — `summary-generate.ts` takes `documents/synthesis`, the
+    #     three agent reports for the contributor roster alone, and this stack
+    #     not at all). It used to read `documents/consolidated` as its ONLY
+    #     source and refuse without it; that is why the mirror outlived the disk
+    #     copy, and it is why the mirror could not go until the web half shipped.
+    #   * the cloud route is the ONLY runner of phases 4 and 5 — the browser asks
+    #     it to run and nothing else does — and `/api/summary` and
+    #     `/api/superresearch` no longer exist, so there is no second path left
+    #     that could want the stack as an input.
+    #   * a run that never reaches phase 5 has no synthesis AND no summary, and
+    #     every phase-4 exit is terminal with its reason on the run. "No
+    #     synthesis" is a stated outcome now, not a gap a stand-in document
+    #     papers over.
+    #
+    # ▶ AND A PERSISTED STACK WAS WRONG ON EVERY RE-RUN ANYWAY. It was built HERE
+    # and nowhere else, while the pause-with-extra-context resume and the Retry
+    # at the Phase-3 "no documents" gate each re-write and re-mirror
+    # `documents/<agent>.md` — so a resumed run's saved stack was the previous
+    # attempt's text under a name that claimed otherwise. If a combined DOCUMENT
+    # is ever wanted again it is the web's synthesis, which is rebuilt from the
+    # reports that exist at the time.
+    #
+    # ⛔⛔ THE STRING STAYS, AND IT IS NOT A LEFTOVER. `_consolidated_md` is the
+    # in-memory input to the two readers below — the one-line `summary` FIELD on
+    # /researches and the post-P2 title refresh — which both need all three
+    # reports at once and take the TEXT, never a saved document. Deleting the
+    # build along with the write stops both of them silently: the gate goes
+    # False, no error and no log line.
+    #
+    # ▶ HISTORICAL RUNS KEEP THEIRS, so the readers stay put. Every run made
+    # before today still has a saved `consolidated` document and must keep
+    # opening: the chat's document catalogue still lists it, and the web's
+    # `visibleDocuments` hides the stack when a synthesis exists and KEEPS it
+    # when none does. The three derived-stem exclusions (the P3 NotebookLM scan,
+    # the Flow-B fallback scan, the P1 attach scan) stay for the same reason — a
+    # resume of an old run reads a directory that still holds `consolidated.md`.
+    consolidated_parts = [f"# Consolidated Research Report: {topic}\n"]
+    for name in ["ChatGPT", "Gemini", "Claude"]:
+        r = results.get(name, {})
+        if r.get("text"):
+            consolidated_parts.append(f"\n## {name} Research\n\n{r['text']}")
+    if len(consolidated_parts) > 1:
+        _consolidated_md = "\n".join(consolidated_parts)
+        # 2026-05-10: kick off the final post-research summary using
+        # the merged agent reports (all 3, as built above).
+        # Overwrites the earlier brief-based stub with a "what the
+        # research found" line — this is the version users see on
+        # /researches after the pipeline finishes. Non-blocking
+        # daemon thread; subsequent P3 (podcast) and FE P4/P5
+        # (distribution) phases add no new research content, so
+        # this is the final refresh of THIS field.
+        # ⭐ NOT the P5 Summary DOCUMENT, which is the web's and is
+        # built from the Super Research document: this is the
+        # `summary` FIELD on the research, the paragraph the
+        # /researches tile animates. `_consolidated_md` reaches it as
+        # in-process text, which is why retiring the Firestore mirror
+        # left this line untouched.
+        try:
+            _generate_research_summary_async(
+                topic,
+                brief_text,
+                _consolidated_md,
+            )
+        except Exception as _sum_e:
+            log(f"[summary] post-P2 dispatch failed: {_sum_e}", "WARN")
+        # 2026-05-11: also refresh research.title now that we have
+        # actual findings (not just the user's raw brief). The FE
+        # /api/title call at pipeline start gave us a 4-8 word
+        # startup title based ONLY on the user's input — often a
+        # paragraph with "Goal:" / "Already sorted" sections that
+        # produces a less-focused title. Post-P2 the agents have
+        # produced concrete findings; the refresh reflects what
+        # was actually researched.
+        try:
+            _refresh_research_title_async(
+                topic,
+                brief_text,
+                _consolidated_md,
+            )
+        except Exception as _tit_e:
+            log(f"[title-refresh] post-P2 dispatch failed: {_tit_e}", "WARN")
+
+
 # ── Browser-crash recovery (#725) ───────────────────────────────────────────
 # Max CONSECUTIVE silent browser-crash auto-retries before run_pipeline
 # escalates to a user-facing Retry/Skip card. 2 silent retries = 3 total
@@ -70933,8 +71084,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             #
             # Everything below this line reads `results[name]["text"]`: the link
             # buckets, the per-agent `documents/<agent>.md` write, the Firestore
-            # documents subcollection, consolidated.md, save_meta, and the P2→P3
-            # handoff that hands those files to NotebookLM. So this is the ONE
+            # documents subcollection, the merged corpus the one-line summary and
+            # the title refresh are built from (wave 10.9: it is a string now, no
+            # longer a document anywhere), save_meta, and the P2→P3 handoff that
+            # hands those files to NotebookLM. So this is the ONE
             # place a wrong-topic report can be stopped before it becomes the run's
             # deliverable, regardless of which path produced it.
             #
@@ -70951,9 +71104,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             if _off_topic:
                 log(f"[Phase 2] off-topic sweep rejected {_off_topic} — their text "
                     f"will not be written to documents/, mirrored to Firestore, "
-                    f"merged into consolidated.md, or handed to NotebookLM", "ERROR")
+                    f"merged into the run's summary and title, or handed to "
+                    f"NotebookLM", "ERROR")
             # ── 2026-05-10: Emit phase_complete:2 EARLY (before heavy persistence) ──
-            # The MD writes, consolidated.md build, save_meta enrichment, and
+            # The MD writes, the merged corpus, save_meta enrichment, and the
             # P2→P3 handoff are BE-internal (FE doesn't gate on them). Emitting
             # phase_complete:2 FIRST:
             #   • Flips the P2 tile to green immediately on the FE.
@@ -71174,151 +71328,18 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 log("[Phase 2] stop/pause detected — skipping phase2_complete.marker so resume re-runs P2", "INFO")
 
             # ── Heavy persistence (BE-internal, FE-invisible) ──
-            # Per-agent MD disk writes + Firestore documents subcollection,
-            # consolidated.md build, save_meta enrichment, P2→P3 handoff.
-            # Runs AFTER phase_complete:2 so the user sees P2 turn green
-            # immediately while this work completes invisibly.
-            # ⭐ Wave 4: rehost images in `results` BEFORE the re-save and the
-            # consolidated build below. Texts from extract_and_record_agent are
-            # already references (no fetch); a salvaged partial is not.
-            await _rehost_result_texts(results)
-            for name, r in results.items():
-                if _p2_needs_resave(r):  # wave 10.9: a kept agent's copies stand
-                    fname = name.lower().replace(" ", "") + ".md"
-                    _agent_md = f"# {name} Deep Research\n\n{r['text']}"
-                    _agent_lc = name.lower().replace(" ", "")
-                    # Backstop findings extraction at the P2 finalize re-save
-                    # site. The primary site is in extract_and_record_agent
-                    # (~research.py:10988), but this resave path can run on
-                    # resume / manual re-finalize when the snapshot ring may
-                    # have been cleared. Reuses findings that already exist.
-                    #
-                    # ⛔⛔ WAVE 10 — AHEAD OF THE WRITE, for the reason the
-                    # primary site states: the numbering below appends a
-                    # bibliography, and a findings pass run after it would read
-                    # that bibliography as the report's own citations.
-                    _findings = []
-                    try:
-                        _findings = list((getattr(_runtime, "agent_findings", {}) or {}).get(_agent_lc) or [])
-                        if not _findings:
-                            _snap_f = getattr(_runtime, "agent_progress_snapshots", {}).get(_agent_lc, {}) or {}
-                            _src_urls = list(_snap_f.get("source_urls", []) or [])
-                            _src_items = list(_snap_f.get("source_items", []) or [])
-                            # Same de-gating as the primary site: this backstop
-                            # exists for resume/re-finalize, exactly when the
-                            # snapshot ring may have been cleared — so keying it
-                            # on the panel list made it useless in the one case
-                            # it was written for.
-                            if _agent_md:
-                                _findings = _extract_findings(_agent_md, _src_urls, _src_items) or []
-                                if _findings:
-                                    _runtime.agent_findings[_agent_lc] = _findings
-                    except Exception:
-                        _findings = []
-                    # ⭐ Wave 10 — numbered sources, on the same document both
-                    # writes below carry.
-                    _agent_md = _document_with_sources(_agent_md, findings=_findings)
-                    (queue_dir / "documents" / fname).write_text(_agent_md, encoding="utf-8")
-                    # Sync to Firestore documents subcollection — doc_type is the
-                    # agent key (chatgpt / gemini / claude), consistent with the
-                    # frontend's Documents page expectation.
-                    save_document_to_firestore(_agent_lc, _agent_md, f"{name} Deep Research")
-            # ⛔⛔ 2026-09-18, WAVE 10 — THE STACKED DOCUMENT NO LONGER REACHES
-            # DISK, AND THE STACK ITSELF IS ON ITS WAY OUT. This block is exactly
-            # what it looks like: one H1 and each agent's report verbatim, written
-            # to `documents/consolidated.md` AND mirrored to Firestore under the
-            # `consolidated` doc type. No model, no budget, no cap. The web now
-            # SYNTHESISES the real combined document at P5
-            # (`superresearch-generate.ts` → `documents/synthesis`: planner →
-            # sections → stitch, sources numbered before the first call), and it
-            # reads THE THREE PER-AGENT REPORTS, never this stack — so nothing
-            # consumes the concatenation as an INPUT any more; what is left reads
-            # it as a document, and only for a run that has no synthesis (below).
-            #
-            # ▶ THE DISK COPY IS GONE, and dropping it settles three things at
-            # once rather than one:
-            #   * the redundancy. Every consumer of `documents/` already refused
-            #     this file BY NAME — the P3 NotebookLM scan, the Flow-B fallback
-            #     scan and the P1 attach scan each carry a derived-stem exclusion
-            #     for it — so all it did was cost ~250 KB a run.
-            #   * it disagreed with its own inputs on every re-run. `run_phase2`
-            #     has three consumers, and the pause-with-extra-context resume and
-            #     the Retry at the Phase-3 "no documents" gate each re-write
-            #     `documents/<agent>.md` and re-mirror it; neither rebuilt the
-            #     stack, because it was built HERE and nowhere else. A resumed
-            #     run's combined file was the previous attempt's text, under a
-            #     name that claimed otherwise.
-            #   * it was written unguarded — one `write_text`, no retry, and on a
-            #     targeted resume the feedback sweep unlinks every non-brief MD,
-            #     so the file could also simply vanish and be rebuilt by nothing.
-            #
-            # ⛔⛔ THE FIRESTORE MIRROR STAYS FOR NOW, AND THE REASON IS NOT THE
-            # ONE THAT USED TO BE WRITTEN HERE. Until 2026-09-21 this block said
-            # the P5 Summary document read `documents/consolidated` as its ONLY
-            # source and refused without it, so deleting the mirror cost every run
-            # its Summary. That contract is GONE: the web now builds the Summary
-            # from the Super Research document and only from it (owner's decision
-            # D-3 — `summary-generate.ts`, which reads the synthesis, the three
-            # agent reports for the contributor list alone, and this stack not at
-            # all); phase 5 writes the synthesis first, and a run whose synthesis
-            # was refused gets no Summary and a reason saying so.
-            # ▶ WHAT STILL READS `consolidated`, both for runs with no synthesis
-            # only: the chat's `get_document` fallback, and the documents
-            # catalogue — `visibleDocuments` hides the stack when a synthesis
-            # exists and KEEPS it when none does, which is a live run whose
-            # synthesis was refused as much as it is a historical one.
-            # ▶ So the condition for dropping this write is not "the summary moved"
-            # — it has — but that no surface needs a combined document for a run
-            # without a synthesis. It is ~250 KB a run until then, and the removal
-            # goes out AFTER the web half is pushed, never before: a machine that
-            # stopped writing it while the deployed web still falls back to it
-            # leaves those runs with nothing to show.
-            consolidated_parts = [f"# Consolidated Research Report: {topic}\n"]
-            for name in ["ChatGPT", "Gemini", "Claude"]:
-                r = results.get(name, {})
-                if r.get("text"):
-                    consolidated_parts.append(f"\n## {name} Research\n\n{r['text']}")
-            if len(consolidated_parts) > 1:
-                _consolidated_md = "\n".join(consolidated_parts)
-                save_document_to_firestore("consolidated", _consolidated_md, "Consolidated Report")
-                # 2026-05-10: kick off the final post-research summary using
-                # the merged agent reports (all 3, as built above).
-                # Overwrites the earlier brief-based stub with a "what the
-                # research found" line — this is the version users see on
-                # /researches after the pipeline finishes. Non-blocking
-                # daemon thread; subsequent P3 (podcast) and FE P4/P5
-                # (distribution) phases add no new research content, so
-                # this is the final refresh of THIS field.
-                # ⭐ NOT the P5 Summary DOCUMENT, which is the web's and is
-                # built from the Super Research document: this is the
-                # `summary` FIELD on the research, the paragraph the
-                # /researches tile animates. `_consolidated_md` is passed as
-                # in-process text — the Firestore mirror above is not its
-                # input, and dropping that write would not touch this.
-                try:
-                    _generate_research_summary_async(
-                        topic,
-                        brief_artifact.text if brief_artifact else "",
-                        _consolidated_md,
-                    )
-                except Exception as _sum_e:
-                    log(f"[summary] post-P2 dispatch failed: {_sum_e}", "WARN")
-                # 2026-05-11: also refresh research.title now that we have
-                # actual findings (not just the user's raw brief). The FE
-                # /api/title call at pipeline start gave us a 4-8 word
-                # startup title based ONLY on the user's input — often a
-                # paragraph with "Goal:" / "Already sorted" sections that
-                # produces a less-focused title. Post-P2 the agents have
-                # produced concrete findings; the refresh reflects what
-                # was actually researched.
-                try:
-                    _refresh_research_title_async(
-                        topic,
-                        brief_artifact.text if brief_artifact else "",
-                        _consolidated_md,
-                    )
-                except Exception as _tit_e:
-                    log(f"[title-refresh] post-P2 dispatch failed: {_tit_e}", "WARN")
+            # Per-agent MD disk writes + Firestore documents subcollection and
+            # the merged corpus's two in-memory readers (`_p2_persist_reports`),
+            # then save_meta enrichment and the P2→P3 handoff. Runs AFTER
+            # phase_complete:2 so the user sees P2 turn green immediately while
+            # this work completes invisibly.
+            # ⭐ Wave 10.9: the writes live in the helper so a test can DRIVE
+            # them — the claim "a completed run saves the three agent reports
+            # and no combined document" is about what is written, and inside
+            # this function nothing could ever have executed it.
+            await _p2_persist_reports(
+                results, queue_dir, topic,
+                brief_artifact.text if brief_artifact else "")
             log(f"\nPHASE 2 COMPLETE: {done_count}/{len(results)} agents finished")
             for name, r in results.items():
                 log(f"  {name:10s} status={r['status']:12s} text={len(r['text']):>6d} chars")

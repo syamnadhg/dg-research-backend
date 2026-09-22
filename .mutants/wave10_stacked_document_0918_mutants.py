@@ -8,14 +8,17 @@ left, and the disk copy goes.
 
 ⛔⛔ WHAT IT KEPT, AND WHY A WRITE-ONLY DELETION WOULD HAVE BEEN WORSE THAN NO
 DELETION:
-  · THE FIRESTORE MIRROR STAYS. `documents/consolidated` is the ONLY source the
-    web's P5 Summary has (`summary-generate.ts:103`), and on both P5 legs the
-    summary runs BEFORE the synthesis, so `documents/synthesis` does not exist
-    when that input is built. Deleting the mirror costs every run its Summary
-    document, silently — and that document is minted a share link and quoted in
-    the delivery mail.
-  · THE MERGED TEXT STAYS. It is the in-memory input to the post-P2 summary AND
-    to the title refresh, which both need all three reports at once.
+  · THE FIRESTORE MIRROR STAYED — AND WENT ON 2026-09-22, WAVE 10.9. It stayed
+    while `documents/consolidated` was the ONLY source the web's P5 Summary had,
+    because deleting it cost every run its Summary, silently. The Summary is now
+    built from the Super Research document and only from it (decision D-3;
+    `summary-generate.ts` reads `documents/synthesis`), the cloud route is the
+    only runner of phases 4 and 5, and `/api/summary` and `/api/superresearch`
+    no longer exist. So the machine saves no combined document anywhere, and T3
+    is INVERTED rather than deleted: the defect is now the write coming back.
+  · THE MERGED TEXT STAYS, and it is now the only thing left of the stack. It is
+    the in-memory input to the post-P2 summary AND to the title refresh, which
+    both need all three reports at once.
   · THE DERIVED-STEM EXCLUSIONS STAY. Every run made before today still carries
     `consolidated.md` on disk, and a resume of one reads that directory — so it
     must still be kept out of the NotebookLM upload, the P1 attach list and the
@@ -31,17 +34,18 @@ would still have passed.
   T2  — the file comes back under ANOTHER NAME. The pin is an EQUALITY on what
         `run_pipeline` writes into `documents/`, not a `not in` on one spelling,
         and this is the mutant that says so.
-  T3  — the Firestore mirror goes. This is the cross-repo contract; when the web
-        moves its summary onto the synthesis, THIS is the assertion to delete on
-        purpose, and until then it is the one that must not drift.
+  T3  — the Firestore mirror COMES BACK (inverted 09-22). It used to be "the
+        mirror goes", the cross-repo contract this file said to flip on purpose
+        when the web moved its summary onto the synthesis. The web moved; this is
+        that flip.
   T4  — the `> 1` gate loosens to `>= 1`, so a run where every agent failed
-        publishes a consolidated document that is an H1 and nothing else, and
-        the web summarises a title.
+        hands an H1 and nothing else to the one-line summary and the title
+        refresh, and two model calls summarise a heading.
   T8  — THE BUILD IS EMPTIED while every wire stays attached. `_consolidated_md`
         is still handed to both readers and the list is never filled, so the
-        gate is False, the mirror never happens, and the summary and the title
-        refresh silently stop — no error, no log line. Nothing in the suite
-        could fail on this before the pin added with this harness.
+        gate is False and the summary and the title refresh silently stop — no
+        error, no log line. Nothing in the suite could fail on this before the
+        pin added with this harness.
 
 ⛔ DELIBERATELY ABSENT — recorded so the next reader does not re-add them:
   * "the resume scan stops accepting a partial research". `has_partial_research`
@@ -84,7 +88,8 @@ MINE = (
     "stacked_file_is_not_written_anywhere or "
     "merged_corpus_still_reaches_both_of_its_readers or "
     "merged_corpus_is_really_built_from_the_three_reports or "
-    "firestore_mirror_survives or derived_stem_exclusions_outlive_the_writer"
+    "firestore_mirror_is_retired_too or "
+    "derived_stem_exclusions_outlive_the_writer"
 )
 
 OWNED_FILES = ("tests/test_stacked_document_retired_0918.py",)
@@ -96,17 +101,18 @@ ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 _INFLIGHT = Path(__file__).with_suffix(".inflight")
 
 # ── anchors ─────────────────────────────────────────────────────────────
+# ⛔ RE-ANCHORED 2026-09-22, WAVE 10.9. The block moved out of `run_pipeline`
+# into `_p2_persist_reports` — a module-level function a test can DRIVE — so
+# every anchor below is the same line at a shallower indent. Nothing about what
+# they mutate changed.
 #: The gate and the build, together — the two lines a re-added write would sit
-#: under, and the gate the web reads as "no agent output, no document".
-GATE_AND_BUILD = ('            if len(consolidated_parts) > 1:\n'
-                  '                _consolidated_md = "\\n".join(consolidated_parts)')
+#: under, and the gate that says "no agent output, no merged corpus".
+GATE_AND_BUILD = ('    if len(consolidated_parts) > 1:\n'
+                  '        _consolidated_md = "\\n".join(consolidated_parts)')
 #: The gate alone, for the mutant that loosens it.
-GATE = '            if len(consolidated_parts) > 1:'
-#: The Firestore mirror — the cross-repo contract.
-MIRROR = ('                save_document_to_firestore("consolidated", '
-          '_consolidated_md, "Consolidated Report")')
+GATE = '    if len(consolidated_parts) > 1:'
 #: The one line that actually FILLS the merged corpus.
-APPEND = ('                    consolidated_parts.append(f"\\n## {name} Research'
+APPEND = ('            consolidated_parts.append(f"\\n## {name} Research'
           '\\n\\n{r[\'text\']}")')
 #: The three derived-stem exclusions that outlive the writer.
 STEMS_NLM = '    _DERIVED_STEMS = {"brief", "consolidated"}'
@@ -125,8 +131,8 @@ MUTANTS = [
      "which pins the write targets by EQUALITY",
      [(GATE_AND_BUILD,
        GATE_AND_BUILD + '\n'
-       '                (queue_dir / "documents" / "consolidated.md").write_text(\n'
-       '                    _consolidated_md, encoding="utf-8")')]),
+       '        (queue_dir / "documents" / "consolidated.md").write_text(\n'
+       '            _consolidated_md, encoding="utf-8")')]),
     ("T2", "under",
      "⛔⛔ THE WRITE COMES BACK UNDER ANOTHER NAME. This is why the pin is an "
      "EQUALITY on the write targets and not a `not in` on one spelling: a `not "
@@ -136,40 +142,49 @@ MUTANTS = [
      "test_the_pipeline_writes_only_the_brief_and_the_three_agent_reports_to_disk",
      [(GATE_AND_BUILD,
        GATE_AND_BUILD + '\n'
-       '                (queue_dir / "documents" / "stack.md").write_text(\n'
-       '                    _consolidated_md, encoding="utf-8")')]),
+       '        (queue_dir / "documents" / "stack.md").write_text(\n'
+       '            _consolidated_md, encoding="utf-8")')]),
     ("T3", "under",
-     "⛔⛔ THE FIRESTORE MIRROR GOES WITH THE DISK COPY — the write-only "
-     "deletion's mirror image, and the one that costs every run its SUMMARY "
-     "document. `documents/consolidated` is the only source the web's P5 summary "
-     "has, and it runs before the synthesis on both legs, so there is nothing "
-     "for it to fall back to. Silent: the summary simply refuses, and that "
-     "document is minted a share link and quoted in the delivery mail. "
+     "⛔⛔ THE FIRESTORE MIRROR COMES BACK — INVERTED 2026-09-22, WAVE 10.9. "
+     "Until 09-21 this mutant DELETED the mirror, because the web's P5 Summary "
+     "read `documents/consolidated` as its only source and refused without it. "
+     "The Summary is built from the Super Research document now (decision D-3), "
+     "the cloud route is the only phase-5 runner, and the machine writes no "
+     "combined document at all — so the defect is the write returning: ~250 KB a "
+     "run, a seventh row in a documents list that hides it, and a document that "
+     "disagrees with its own inputs on every resume. "
      "KILLED BY tests/test_stacked_document_retired_0918.py::"
-     "test_the_firestore_mirror_survives_because_the_web_summary_reads_it",
-     [(MIRROR, '                pass')]),
+     "test_the_firestore_mirror_is_retired_too_and_did_not_move",
+     [(GATE_AND_BUILD,
+       GATE_AND_BUILD + '\n'
+       '        save_document_to_firestore("consolidated", _consolidated_md,\n'
+       '                                   "Consolidated Report")')]),
     ("T4", "over",
      "⛔ THE GATE LOOSENS TO `>= 1`, so a phase where every agent failed still "
-     "publishes a consolidated document — an H1 and nothing else — and the web "
-     "summarises a title. The gate is what the web reads as \"with no agent "
-     "output there is no document at all\" (summary-doc.ts); it is a cross-repo "
-     "contract, not an implementation detail. "
+     "hands an H1 and nothing else to the one-line summary and the title "
+     "refresh — two model calls that summarise a heading, and a /researches tile "
+     "that animates the result as what the research found. "
      "KILLED BY tests/test_stacked_document_retired_0918.py::"
-     "test_the_firestore_mirror_survives_because_the_web_summary_reads_it, whose "
-     "last assertion is an exact count of that gate",
-     [(GATE, '            if len(consolidated_parts) >= 1:')]),
+     "test_the_firestore_mirror_is_retired_too_and_did_not_move, whose last "
+     "assertion is an exact count of that gate — and, on the behaviour itself, "
+     "by tests/test_consolidated_write_retired_109.py::"
+     "test_a_run_where_every_agent_failed_saves_nothing_and_dispatches_nothing",
+     [(GATE, '    if len(consolidated_parts) >= 1:')]),
     ("T8", "under",
      "⛔⛔ THE MERGED CORPUS IS NEVER FILLED, AND EVERY WIRE STAYS ATTACHED. "
-     "`_consolidated_md` is still built, still mirrored, still handed to the "
-     "summary and the title refresh — and the list is one long, so the gate is "
-     "False and NONE of it happens. No error, no log line, every run quietly "
-     "losing its Summary document and its refreshed title. This is the exact "
-     "shape the file's header says a write-only deletion would have had, and "
-     "nothing in the suite could fail on it. "
+     "`_consolidated_md` is still built and still handed to the summary and the "
+     "title refresh — and the list is one long, so the gate is False and NONE of "
+     "it happens. No error, no log line, every run quietly losing its /researches "
+     "one-liner and its refreshed title. This is the exact shape the file's "
+     "header says a write-only deletion would have had, and nothing in the suite "
+     "could fail on it. Wave 10.9 makes it worse, not better: with the mirror "
+     "retired the corpus has no persisted copy left, so this pin and the drive "
+     "in tests/test_consolidated_write_retired_109.py are the only things that "
+     "would notice. "
      "KILLED BY tests/test_stacked_document_retired_0918.py::"
      "test_the_merged_corpus_is_really_built_from_the_three_reports, ADDED WITH "
      "THIS HARNESS",
-     [(APPEND, '                    pass')]),
+     [(APPEND, '            pass')]),
     ("T5", "under",
      "⛔ THE NOTEBOOKLM UPLOAD STOPS EXCLUDING THE STEM. Every run made before "
      "today still has `consolidated.md` on disk, so a resume of one uploads the "

@@ -18,15 +18,16 @@ has no reader of its own left, and the disk copy is retired here.
     once. Deleting the BUILD along with the write would have left those two
     summarising nothing, and every assertion about the write alone would still
     have passed. That is the failure this file exists to make impossible.
-  · THE FIRESTORE MIRROR IS PINNED **PRESENT**, ON PURPOSE. The web's P5 SUMMARY
-    document reads `documents/consolidated` as its ONLY source and refuses
-    without it (`summary-generate.ts:103`, `summary-doc.ts:76` — "no consolidated
-    report to summarise"). On BOTH P5 legs the summary runs BEFORE the synthesis,
-    so `documents/synthesis` does not exist when that input is built, and the
-    web's own note calls swapping the two call sites FILED, NOT BUILT. Deleting
-    the mirror today costs every run its Summary document, silently — and that
-    document is minted a share link and quoted in the delivery mail. When the web
-    moves, THIS is the assertion to delete on purpose.
+  · THE FIRESTORE MIRROR IS PINNED **ABSENT** — 2026-09-22, WAVE 10.9, AND IT IS
+    THE ASSERTION THIS FILE SAID TO DELETE ON PURPOSE. Until 09-21 the mirror was
+    pinned PRESENT here, because the web's P5 Summary read `documents/consolidated`
+    as its ONLY source and refused without it, so deleting the mirror cost every
+    run its Summary, silently. The web moved: the Summary is built from the Super
+    Research document and only from it (owner's decision D-3 — `summary-generate.ts`
+    reads `documents/synthesis`, plus the three agent reports for the contributor
+    roster alone), the cloud route is the only runner of phases 4 and 5, and
+    `/api/summary` and `/api/superresearch` no longer exist. So the machine stops
+    writing the stack anywhere, and the pin is inverted rather than dropped.
   · THE DERIVED-STEM EXCLUSIONS STAY. Runs made before today still carry
     `consolidated.md` on disk, so a resume of one must still keep it out of the
     NotebookLM upload, out of the P1 attach list and out of the agent hydration.
@@ -40,6 +41,14 @@ so these are SOURCE pins on `code_only` text, the same mechanism and the same
 reason as `test_document_images_0913.py`'s save-site pins. `code_only` blanks
 every `#` comment first, so nothing in the prose above the code can satisfy an
 assertion below it.
+
+⭐⭐ AND AS OF WAVE 10.9 THEY ARE NO LONGER THE ONLY PINS. The writes moved into
+`_p2_persist_reports`, which is a module-level function a test CAN run, so the
+claim these pins could only read — a completed run saves the three agent reports
+and no combined document, while the summary and the title refresh still get the
+merged text — is EXECUTED against a fake Firestore in
+`tests/test_consolidated_write_retired_109.py`. These stay as the cheap guard
+that the write was retired rather than relocated; that file is the measurement.
 """
 from __future__ import annotations
 
@@ -54,6 +63,20 @@ def _pipeline() -> str:
     return code_only(R.run_pipeline)
 
 
+def _persist() -> str:
+    """The Phase-2 persistence helper — the finalize re-save and the merged
+    corpus, which wave 10.9 moved out of `run_pipeline` so a test could run
+    them."""
+    return code_only(R._p2_persist_reports)
+
+
+def _writers() -> str:
+    """Both halves as one text. ⛔ Every count over `documents/` is over the
+    PAIR: the move put the finalize write on the other side of a call, and a
+    count that saw one half would be satisfied by emptying the other."""
+    return _pipeline() + "\n" + _persist()
+
+
 def _module() -> str:
     return code_only(Path(R.__file__).read_text(encoding="utf-8"))
 
@@ -61,9 +84,13 @@ def _module() -> str:
 def test_the_pipeline_writes_only_the_brief_and_the_three_agent_reports_to_disk():
     """EQUALITY, not absence. The stacked file was the seventh write into
     `documents/`; the six that remain are the brief (first save, skip-branch save,
-    regen save) and the per-agent report (finalize, and the two regen paths)."""
+    regen save) and the per-agent report (finalize, and the two regen paths).
+
+    ⭐ Wave 10.9 — the finalize write is in `_p2_persist_reports` now, so it is
+    the LAST of the six here rather than the fourth: `run_pipeline` contributes
+    the three briefs and the two regen paths, the helper the finalize."""
     targets = re.findall(r'\(queue_dir / "documents" / ([^)]+)\)\.write_text',
-                         _pipeline())
+                         _writers())
     assert targets == ['"brief.md"', '"brief.md"', '"brief.md"',
                        "fname", "fname", "fname"], targets
 
@@ -72,9 +99,12 @@ def test_the_stacked_file_is_not_written_anywhere_in_the_module():
     """The write is RETIRED, not relocated. Scoped to the whole module so moving
     it into a helper — or into the resume path that never rebuilt it — fails."""
     mod = _module()
-    # The QUOTED literal, because two live log strings still name the file as a
-    # sink a rejected leg does NOT reach (`f"consolidated.md, or handed to
-    # NotebookLM"`), and a bare `in` would be satisfied by those forever.
+    # The QUOTED literal. It used to be the only spelling that worked, because
+    # two live off-topic-sweep log lines named the file as a sink a rejected leg
+    # does NOT reach; wave 10.9 re-pointed both at the merged corpus, since
+    # nothing has merged into a FILE since 09-18. The quoted form stays anyway —
+    # it is what a re-added write would be spelled as, and it cannot be paid for
+    # by prose that happens to mention the name.
     assert '"consolidated.md"' not in mod
     assert '"documents" / "consolidated' not in mod
     assert ".write_text(_consolidated_md" not in mod
@@ -83,10 +113,15 @@ def test_the_stacked_file_is_not_written_anywhere_in_the_module():
 def test_the_merged_corpus_still_reaches_both_of_its_readers():
     """⛔ THE ONE A WRITE-ONLY DELETION WOULD HAVE BROKEN SILENTLY. The merged
     text is the input to the post-P2 summary and to the title refresh; both take
-    "what the research found" from all three reports at once. Four uses, by
-    equality: the build, the Firestore mirror, and one per reader."""
-    src = _pipeline()
-    assert len(re.findall(r"_consolidated_md", src)) == 4
+    "what the research found" from all three reports at once.
+
+    ⭐ Wave 10.9 — THREE uses now, by equality, and the one that went is the
+    Firestore mirror. The readers take the STRING, never a saved document, which
+    is exactly why retiring the mirror could leave them untouched — and why the
+    equality has to drop to three rather than be relaxed to a minimum: a fourth
+    use would be a re-added write."""
+    src = _persist()
+    assert len(re.findall(r"_consolidated_md", src)) == 3
     build = src.index('_consolidated_md = "\\n".join(consolidated_parts)')
     for call in ("_generate_research_summary_async(", "_refresh_research_title_async("):
         at = src.index(call, build)
@@ -107,7 +142,7 @@ def test_the_merged_corpus_is_really_built_from_the_three_reports():
     import ast
     import textwrap
 
-    tree = ast.parse(textwrap.dedent(_pipeline()))
+    tree = ast.parse(textwrap.dedent(_persist()))
     appends = [n for n in ast.walk(tree)
                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                and n.func.attr == "append"
@@ -126,19 +161,29 @@ def test_the_merged_corpus_is_really_built_from_the_three_reports():
         "ChatGPT", "Gemini", "Claude"]
 
 
-def test_the_firestore_mirror_survives_because_the_web_summary_reads_it():
-    """⛔⛔ DELIBERATE, AND THE REASON IS IN ANOTHER REPO. `documents/consolidated`
-    is the only source the web's P5 summary has, and it runs before the synthesis
-    on both legs. The disk copy going while the mirror stays is the whole shape of
-    this change."""
+def test_the_firestore_mirror_is_retired_too_and_did_not_move():
+    """⛔⛔ 2026-09-22, WAVE 10.9 — INVERTED ON PURPOSE, AND THE REASON IS IN
+    ANOTHER REPO. This assertion pinned the mirror PRESENT while the web's P5
+    Summary read `documents/consolidated` as its only source. The Summary is now
+    built from the Super Research document and only from it (decision D-3), the
+    cloud route is the only phase-5 runner, and `/api/summary` and
+    `/api/superresearch` are gone — so the machine writes no combined document
+    at all, and the pin flips rather than disappearing.
+
+    ⛔ ABSENCE OF THE DOC TYPE, not of one call spelling: scoped to the whole
+    module, on the `"consolidated"` ARGUMENT, so re-adding the write under
+    `save_document_to_firestore_with_retry`, from the regen paths, or from a
+    helper fails here too.
+
+    ⭐ THE GATE STAYS, and it is the reason this is not simply a deletion. With
+    no agent output there is no merged corpus, and the summary and the title
+    refresh must not be dispatched on an H1 and nothing else."""
     mod = _module()
     assert '"consolidated.md"' not in mod
-    assert mod.count(
-        'save_document_to_firestore("consolidated", _consolidated_md, "Consolidated Report")'
-    ) == 1
-    # The gate the web reads as "with no agent output there is no document at
-    # all" (summary-doc.ts). It is a cross-repo contract, not an implementation
-    # detail, so it moves only with that file.
+    assert 'save_document_to_firestore("consolidated"' not in mod
+    assert '"consolidated", _consolidated_md' not in mod
+    assert not re.search(r'save_document_to_firestore\w*\(\s*\n?\s*"consolidated"', mod)
+    assert "Consolidated Report" not in mod
     assert mod.count("if len(consolidated_parts) > 1:") == 1
 
 

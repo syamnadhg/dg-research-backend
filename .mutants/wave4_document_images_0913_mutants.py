@@ -443,9 +443,11 @@ MUTANTS = [
     ('K6', RP, 'under',
      '⛔ THE FINALIZE RE-SAVE AND THE CONSOLIDATED BUILD READ UNREHOSTED RESULTS — a salvaged partial overwrites the document with platform URLs',
      # Wave 10.9: the re-save's test became `_p2_needs_resave(r)` (a kept agent
-     # is not re-written); the mutant — the funnel call deleted — is unchanged.
-     [('            await _rehost_result_texts(results)\n            for name, r in results.items():\n                if _p2_needs_resave(r):',
-       '            for name, r in results.items():\n                if _p2_needs_resave(r):')]),
+     # is not re-written), and on 09-22 the whole block moved into
+     # `_p2_persist_reports` so a test could drive the writes. Re-indented twice;
+     # the mutant — the funnel call deleted — is unchanged both times.
+     [('    await _rehost_result_texts(results)\n    for name, r in results.items():\n        if _p2_needs_resave(r):',
+       '    for name, r in results.items():\n        if _p2_needs_resave(r):')]),
     ('K7', RP, 'under',
      'THE RESUME-WITH-INPUT REGEN RE-SAVE IS UNFUNNELED',
      [('                    # Rewrite documents\n                    await _rehost_result_texts(results)',
