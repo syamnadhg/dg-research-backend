@@ -13162,12 +13162,19 @@ def _pick_selected_runs(rows, only_runs, requester_uid=None,
 # tails are owner-only for that reason already; what goes here is the link from
 # that content to a PERSON, and the topic in the fields that exist to carry one.
 
-#: A Firebase Auth uid: 28 letters and digits, and real ones mix all three
-#: classes — which keeps hex digests and long CamelCase words out. `%2F` counts
-#: as a boundary because Storage URLs encode the object path.
+#: A Firebase Auth uid: 28 letters and digits, mixing upper and lower case —
+#: which keeps hex digests and long single-case words out. `%2F` counts as a
+#: boundary because Storage URLs encode the object path.
+#:
+#: ⛔ THIS RULE ALSO REQUIRED A DIGIT, AND ABOUT ONE UID IN A HUNDRED AND FIFTY
+#: HAS NONE. A member whose run folders and queues have aged out is known to
+#: this redactor by shape and by nothing else, so theirs shipped verbatim in the
+#: tails — measured on `audio/<uid>/` and on a `sharedWith` list. The digit was
+#: never what kept a digest out; the two cases are, because a digest is one
+#: case, and they still do.
 _BUNDLE_UID_SHAPE_RE = re.compile(
     r"(?:(?<![A-Za-z0-9])|(?<=%2F)|(?<=%2f))"
-    r"(?=[A-Za-z0-9]*[0-9])(?=[A-Za-z0-9]*[a-z])(?=[A-Za-z0-9]*[A-Z])"
+    r"(?=[A-Za-z0-9]*[a-z])(?=[A-Za-z0-9]*[A-Z])"
     r"[A-Za-z0-9]{28}(?![A-Za-z0-9])")
 #: `users/<uid>` — a Firestore path, whatever the uid looks like.
 _BUNDLE_USERS_PATH_RE = re.compile(
@@ -13179,17 +13186,67 @@ _BUNDLE_UID_KEY_RE = re.compile(
     r"(?<![A-Za-z0-9_])"
     r"([A-Za-z_]*?(?:(?<![Uu])(?:uid|Uid|UID)|_owner|submittedBy|submitted_by))"
     r"([\"']?\s*[=:]\s*[\"']?)([A-Za-z0-9_-]+)")
-#: `topic='…'` / `topic "…"` as a repr, and a bare `topic=…` up to the next key.
+#: A key that carries somebody's research subject, with a quoted value: the
+#: `topic='…'` / `topic "…"` reprs the logs print, JSON's `"topic": "…"`, a
+#: Python dict repr's `{'topic': '…'}`.
+#:
+#: ⛔ IT KNEW `topic=` AND `topic '…'` AND NOTHING ELSE. An unattributed run.log
+#: — which is every fleet run until the attributing wheel ships — holds the JSON
+#: and repr forms too, and those went to support verbatim.
 _BUNDLE_TOPIC_QUOTED_RE = re.compile(
-    r"(?<![\w-])(topic)(=|[ \t]+)('(?:[^'\\\n]|\\.)*'|\"(?:[^\"\\\n]|\\.)*\")")
+    r"(?<![\w\-/])([\"']?topic[\"']?[ \t]*[=:]|topic)([ \t]*)"
+    r"('(?:[^'\\\n]|\\.)*'|\"(?:[^\"\\\n]|\\.)*\")", re.IGNORECASE)
+#: The same key with an unquoted value — `topic=…`, `topic: …`, the CLI's
+#: `Topic: …` — up to the next `key=` or the end of the line. A quoted value is
+#: left to the rule above, which is the one that keeps the quotes on.
 _BUNDLE_TOPIC_BARE_RE = re.compile(
-    r"(?<![\w-])(topic=)(?!['\"])[^\n]*?(?=[ \t]+[A-Za-z_]+=|\n|$)", re.MULTILINE)
+    r"(?<![\w\-/])(topic[ \t]*[=:])(?![ \t]*['\"])[^\n]*?(?=[ \t]+[A-Za-z_]+=|\n|$)",
+    re.MULTILINE | re.IGNORECASE)
+#: Lines this program itself wrote into the machine log with a research subject
+#: in them and NO key to find it by — the queued-job pickup, the idle-rescan
+#: orphan claim, and the two NotebookLM rename lines.
+#:
+#: ⛔⛔ THE SOURCE LINES NO LONGER CARRY A TOPIC (`_log_job_ref` and the call
+#: sites around it), and this rule exists anyway because a tail is fourteen days
+#: deep: every bundle sent before those lines age out still ships them, and no
+#: `topic=` pattern can see them — the subject sits after a colon or inside
+#: brackets with no key at all. ⭐ The replacement lines are deliberately NOT of
+#: these shapes, so the research id they carry instead survives this rule.
+_BUNDLE_TOPIC_LINE_RE = re.compile(
+    r"(?<![\w-])(?:"
+    r"(?P<head>(?:Starting queued job:|Renaming notebook to|"
+    r"DOM rename OK \(read-back verified\):)[ \t]*)[^\n]*"
+    r"|"
+    r"(?P<orphan>picking up orphan[ \t]+[^\s(\n]*[ \t]*\()[^)\n]*(?P<close>\))"
+    r")")
 #: A queue directory name, `safe_name(topic)_YYYYMMDD_HHMMSS`, wherever it appears.
 _BUNDLE_QUEUE_NAME_RE = re.compile(r"(?<![\w-])[\w-]+_(\d{8}_\d{6})(?![\w-])")
 #: Values a person-key carries that are not a person.
 _BUNDLE_UID_NON_VALUES = frozenset(
     {"None", "none", "null", "True", "False", "true", "false", "unknown"})
 _BUNDLE_TOPIC_MARK = "<topic removed>"
+#: How much text one redaction pass rewrites at a time, in characters.
+_BUNDLE_REDACT_CHUNK = 1 << 20
+
+
+def _bundle_line_chunks(s: str, size: int = _BUNDLE_REDACT_CHUNK) -> "list[str]":
+    """`s` cut into pieces of roughly `size` characters, always after a newline.
+
+    ⛔⛔ THE CUT IS ON A LINE BOUNDARY AND THAT IS THE WHOLE ARGUMENT FOR CUTTING
+    AT ALL: no redaction rule spans a newline — every quoted value and every
+    character class excludes it, and the bare-topic rule ends at one — so a piece
+    that ends after a `\\n` is rewritten exactly as the whole string would be.
+    Cut anywhere else and a uid split in half ships in two halves.
+    """
+    if len(s) <= size:
+        return [s]
+    out, start, n = [], 0, len(s)
+    while start < n:
+        cut = s.find("\n", start + size)
+        end = n if cut < 0 else cut + 1
+        out.append(s[start:end])
+        start = end
+    return out
 
 
 class _BundleRedactor:
@@ -13247,15 +13304,66 @@ class _BundleRedactor:
             return m.group(0)
         return m.group(1) + m.group(2) + self.swap(value)
 
-    def text(self, s: str) -> str:
-        s = _BUNDLE_QUEUE_NAME_RE.sub(self._queue, s)
-        s = _BUNDLE_TOPIC_QUOTED_RE.sub(r"\1\2" + _BUNDLE_TOPIC_MARK, s)
-        s = _BUNDLE_TOPIC_BARE_RE.sub(r"\1" + _BUNDLE_TOPIC_MARK, s)
-        s = _BUNDLE_USERS_PATH_RE.sub(lambda m: m.group(1) + self.swap(m.group(2)), s)
-        s = _BUNDLE_UID_KEY_RE.sub(self._keyed, s)
+    @staticmethod
+    def _topic_quoted(m) -> str:
+        # ⭐ THE QUOTES STAY ON. A run.log line and a meta.json are read as JSON
+        # or as a Python repr, and a bare `<topic removed>` where a string was
+        # leaves the reader of the archive holding a file that no longer parses.
+        quote = m.group(3)[0]
+        return m.group(1) + m.group(2) + quote + _BUNDLE_TOPIC_MARK + quote
+
+    @staticmethod
+    def _topic_line(m) -> str:
+        head = m.group("head")
+        if head is not None:
+            return head + _BUNDLE_TOPIC_MARK
+        return m.group("orphan") + _BUNDLE_TOPIC_MARK + m.group("close")
+
+    def _shaped(self, m) -> str:
+        return self.swap(m.group(0))
+
+    def _users_path(self, m) -> str:
+        return m.group(1) + self.swap(m.group(2))
+
+    def _passes(self) -> list:
+        """The rewrite rules, in the order they run.
+
+        ⛔ ORDER IS OUTPUT. `member-N` is handed out on first appearance, so
+        moving a pass renames people; and the quoted-topic rule has to see a
+        value before the bare one does, or the quotes come off."""
+        out = [
+            lambda t: _BUNDLE_QUEUE_NAME_RE.sub(self._queue, t),
+            lambda t: _BUNDLE_TOPIC_LINE_RE.sub(self._topic_line, t),
+            lambda t: _BUNDLE_TOPIC_QUOTED_RE.sub(self._topic_quoted, t),
+            lambda t: _BUNDLE_TOPIC_BARE_RE.sub(r"\1" + _BUNDLE_TOPIC_MARK, t),
+            lambda t: _BUNDLE_USERS_PATH_RE.sub(self._users_path, t),
+            lambda t: _BUNDLE_UID_KEY_RE.sub(self._keyed, t),
+        ]
         if self._known_re is not None:
-            s = self._known_re.sub(lambda m: self.swap(m.group(0)), s)
-        return _BUNDLE_UID_SHAPE_RE.sub(lambda m: self.swap(m.group(0)), s)
+            out.append(lambda t: self._known_re.sub(self._shaped, t))
+        out.append(lambda t: _BUNDLE_UID_SHAPE_RE.sub(self._shaped, t))
+        return out
+
+    def text(self, s: str) -> str:
+        """Every rule, over the whole text — a line-sized bite at a time.
+
+        ⛔⛔ EVERY PASS GOES OVER EVERY PIECE BEFORE THE NEXT PASS STARTS: pass
+        first, piece second. `member-N` is first-appearance order, so finishing
+        piece 1 before starting piece 2 would number the same two people
+        differently and the chunking would stop being invisible.
+
+        ⛔ WHY IT IS CHUNKED AT ALL. A worker's bundle builds on a daemon thread
+        inside the `--serve` process, beside the asyncio loop driving a live
+        pipeline. One `re.sub` over a capped 32 MB run.log holds the GIL for its
+        whole run — measured at up to 8.5 s per pass on a loaded machine, and
+        there are eight passes — so every other thread stops. A bite at a time
+        the interpreter can switch away between calls, and only one piece of the
+        rewritten copy is alive at once."""
+        pieces = _bundle_line_chunks(s, _BUNDLE_REDACT_CHUNK)
+        for run in self._passes():
+            for i, piece in enumerate(pieces):
+                pieces[i] = run(piece)
+        return "".join(pieces)
 
     def data(self, raw: bytes) -> bytes:
         # surrogateescape round-trips any byte that is not UTF-8, so a file the
@@ -15655,6 +15763,42 @@ def start_firestore_start_listener(job_queue, loop):
 
     _start_listener = col_ref.on_snapshot(_guard_snapshot(on_snapshot, "start"))
     log(f"Firestore start listener active on {listener_label}")
+
+
+#: What `_log_job_ref` prints when a job carries nothing it may name.
+_LOG_REF_UNKNOWN = "?"
+#: The `YYYYMMDD_HHMMSS` half of a `safe_name(topic)_<stamp>` run id — the same
+#: cut `_BUNDLE_QUEUE_NAME_RE` makes, and it has to END the name, so a stamp-like
+#: run of digits inside the slug cannot be mistaken for it.
+_RUN_ID_STAMP_RE = re.compile(r"(?<!\d)(\d{8}_\d{6})(?![\w-])")
+
+
+def _log_job_ref(job) -> str:
+    """How a machine-wide log line names one queued job: its research id, short.
+
+    ⛔⛔ NEVER THE TOPIC. `backend.log` belongs to the MACHINE, not to one
+    person: on a shared computer every member's jobs land in it, and the owner's
+    support bundle ships its tail. The pickup line printed the whole topic, and
+    so did the idle-rescan claim and the two notebook-rename lines — none of
+    them behind a `topic=` key any redactor could find, which is how they
+    outlived a redactor written for the keyed shapes. A research id ties the
+    line to the run folder, the queue and the Firestore doc, which is what a
+    reader of these logs follows anyway.
+
+    ⛔ `run_id` AND `resume_dir` ARE NOT SAFE WHOLE. Both are
+    `safe_name(topic)_YYYYMMDD_HHMMSS`, so only the stamp may be printed — the
+    same cut the bundle redactor makes on a queue directory name.
+    """
+    if not isinstance(job, dict):
+        return _LOG_REF_UNKNOWN
+    research_id = str(job.get("research_id") or "").strip()
+    if research_id:
+        return research_id[:8] + "…"
+    for key in ("run_id", "resume_dir"):
+        stamp = _RUN_ID_STAMP_RE.search(str(job.get(key) or ""))
+        if stamp:
+            return "queue " + stamp.group(1)
+    return _LOG_REF_UNKNOWN
 
 
 def setup_firestore_run(uid, research_id, loop=None, run_id=None):
@@ -62765,7 +62909,9 @@ async def _nlm_dom_rename(page, title, label="NotebookLM"):
             return false;
         }""", title)
         if committed:
-            log(f"[{label}] DOM rename OK (read-back verified): '{title}'")
+            # ⛔ The read-back proves the field holds the title; printing it
+            # would put the topic in the machine log — see `_log_job_ref`.
+            log(f"[{label}] DOM rename OK (read-back verified, {len(title)} chars)")
             return True
         log(f"[{label}] DOM rename did not commit (read-back mismatch) — "
             f"CUA fallback will handle it", "WARN")
@@ -63179,7 +63325,11 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
             # Rename notebook — use the smart title (Firestore-synced) so NotebookLM,
             # YouTube, and the email subject all line up on the same short name.
             title = smart_title(topic)
-            log(f"Renaming notebook to '{title}'...")
+            # ⛔ THE LENGTH, NOT THE TITLE — see `_log_job_ref`. The smart title
+            # IS the topic, and this line goes to the machine-wide backend.log.
+            # The length is what this line was ever read for: the FIFA run's
+            # appended title showed up as a doubled character count.
+            log(f"Renaming notebook (smart title, {len(title)} chars)...")
             emit_event("agent_progress", phase=3, agent="notebooklm",
                        status="renaming", stage="notebook",
                        progress=f"Renaming notebook to '{title}'…")
@@ -73879,7 +74029,10 @@ async def run_server(port=8000):
                 continue
 
             run_id = f"{safe_name(topic)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            log(f"[idle-rescan] worker {WORKER_ID}: picking up orphan {research_id[:8]}… ({topic[:40]}) submittedBy={(d.get('submittedBy') or '?')[:8]}")
+            # ⛔ NO TOPIC — see `_log_job_ref`. This claim is logged to the
+            # machine-wide `backend.log`, whose tail travels in the owner's
+            # support bundle; the research id says which run this was.
+            log(f"[idle-rescan] worker {WORKER_ID}: picking up orphan {research_id[:8]}… submittedBy={(d.get('submittedBy') or '?')[:8]}")
 
             # Flip research-doc status to ongoing (the listener path
             # writes this when the worker is idle on first dequeue;
@@ -74066,7 +74219,10 @@ async def run_server(port=8000):
                 ).start()
             except Exception:
                 pass
-            log(f"Starting queued job: {job['topic'][:60]}")
+            # ⛔ THE RESEARCH ID, NOT THE TOPIC — see `_log_job_ref`. This line
+            # is in `backend.log`, which is every member's jobs in the owner's
+            # file, and the owner's support bundle ships its tail.
+            log(f"Starting queued job {_log_job_ref(job)}")
             # Publish currentRunId on the device doc so sharers / sibling
             # tabs can see "device is busy with run X" and render the
             # QueuedBanner correctly when they submit a NEW research.
@@ -84286,6 +84442,30 @@ def _send_logs_consent_lines(runs: int = BUNDLE_MAX_RUNS,
     return lines
 
 
+def _send_logs_left_out_line(count: int, keep_uid) -> str:
+    """What the terminal says about the runs the bundle left out. "" for none.
+
+    ⛔⛔ "ANOTHER MEMBER RAN THEM" IS A CLAIM, AND ON AN UNPAIRED MACHINE IT IS A
+    FALSE ONE. `--send-logs` is what somebody runs when their computer is in
+    trouble, which is exactly when the pairing may be gone: `--unpair`, a relink
+    that cleared it, a config that never carried it. `load_paired_uid()` is then
+    None, the builder rightly keeps nobody — and what it left out is the
+    person's OWN attributed runs, on a computer that may have no other member at
+    all. Measured through the real command: "0 run(s)" and "2 run(s) left out —
+    another member ran them", with both runs the owner's.
+
+    ⭐ THE OMISSION IS RIGHT EITHER WAY; only the reason changes. An unpaired
+    machine cannot prove whose run any folder is, and a support bundle is the
+    wrong place to guess."""
+    n = max(0, int(count or 0))
+    if not n:
+        return ""
+    if keep_uid:
+        return f"{n} run(s) left out — another member ran them"
+    return (f"{n} run(s) left out — this machine is not paired, so it cannot "
+            f"tell whose they are")
+
+
 def _queued_bundle_rows_path() -> "Path":
     return _logs_root() / "pending-bundle-rows.jsonl"
 
@@ -84548,14 +84728,18 @@ def cmd_send_logs(assume_yes: bool = False, email: "str | None" = None,
     code = _mint_support_code()
     dest = _logs_root() / "outgoing" / f"support-{code}{BUNDLE_SUFFIX}"
 
+    # ⛔ THE PAIRED UID, read from this machine's own config: the terminal has
+    # no Firestore to ask who owns the device. An unpaired machine gets None,
+    # and the builder then keeps nobody's identity (#539). Read ONCE and kept,
+    # because the sentence printed below is only true if it describes the same
+    # answer the bundle was built from.
+    _keep_uid = load_paired_uid()
+
     # ── Rung 0: the file. Always, first, and printed. ──
     try:
-        # ⛔ THE PAIRED UID, read from this machine's own config: the terminal
-        # has no Firestore to ask who owns the device. An unpaired machine gets
-        # None, and the builder then keeps nobody's identity (#539).
         summary = _build_log_bundle(dest, support_code=code, max_runs=n_runs,
                                     only_runs=only_runs,
-                                    keep_uid=load_paired_uid())
+                                    keep_uid=_keep_uid)
     except Exception as exc:
         print(f"  {_c(_WARN, '⚠')}  Could not build the log bundle: {exc}")
         print(f"  {_c(_DIM, 'The raw logs are still here:')}  "
@@ -84571,10 +84755,11 @@ def cmd_send_logs(assume_yes: bool = False, email: "str | None" = None,
         # ⛔ Never a silent truncation: a bundle that quietly dropped the run
         # somebody is asking about reads as complete coverage.
         print(f"     {_c(_DIM, f'{_n_dropped} older item(s) left out for size')}")
-    _n_others = int(summary.get("runsOtherMembers") or 0)
-    if _n_others:
-        # The same rule for the #539 omission: fewer runs than asked, said.
-        print(f"     {_c(_DIM, f'{_n_others} run(s) left out — another member ran them')}")
+    # The same rule for the #539 omission: fewer runs than asked, said — and
+    # said truthfully, which on an unpaired machine is a different sentence.
+    _others_line = _send_logs_left_out_line(summary.get("runsOtherMembers"), _keep_uid)
+    if _others_line:
+        print(f"     {_c(_DIM, _others_line)}")
     print()
 
     landed_via = None

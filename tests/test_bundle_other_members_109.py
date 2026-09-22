@@ -163,6 +163,31 @@ def test_an_unattributed_run_ships_redacted(machine):
     assert "runs/legacy_x/run.log" in collected["filesRedacted"]
 
 
+def test_an_unpaired_machines_unattributed_run_is_still_redacted(machine):
+    """⛔⛔ `keep_uid=None` KEEPS NOBODY, AT THE BUILDER, NOT ONLY IN THE
+    REDACTOR. That rule was tested on the pure redactor and on ATTRIBUTED runs,
+    and the one line that carries it for unattributed folders — `own_uid and
+    row.get("submitterUid") == own_uid` — had nothing on it. Drop the `own_uid
+    and` guard and `None == None` marks every unattributed folder as the kept
+    person's own, so it ships byte for byte: that is the terminal's
+    `--send-logs` on an unpaired machine, where every fleet run is unattributed.
+    Measured: the mutant passed 353 tests across eight bundle suites.
+
+    ⭐ ACCEPT POLARITY is `test_the_owners_own_run_ships_byte_for_byte` next
+    door: a folder with a uid that matches still ships whole, so "redact
+    everything" is not what makes this pass."""
+    _run(machine, "legacy_x", None,
+         "Firestore bridge active: users/U_BOB/researches/rB\n"
+         "Queue: /srv/queues/bobs_secret_topic_20260920_000847\n")
+    summary, blobs = _build(machine, keep_uid=None)
+    log = blobs["runs/legacy_x/run.log"]
+    assert b"U_BOB" not in log, "an unattributed run shipped a member verbatim"
+    assert b"bobs_secret_topic" not in log
+    assert b"users/member-1/researches/rB" in log
+    assert summary["runCount"] == 1, "the run itself must still be collected"
+    assert "runs/legacy_x/run.log" in json.loads(blobs["collected.json"])["filesRedacted"]
+
+
 def test_the_owners_own_run_ships_byte_for_byte(machine):
     """⭐ ACCEPT POLARITY. The kept person's own folder is theirs, topic and all
     — a redactor run over it would strip a topic nobody else owns."""
@@ -337,15 +362,186 @@ def test_redacting_twice_changes_nothing_more():
 
 
 def test_topic_fields_are_removed_in_both_shapes():
+    """⭐ A QUOTED VALUE KEEPS ITS QUOTES — the line was `topic=<topic removed>`
+    until a JSON run.log proved that a string replaced by a bare token leaves
+    the reader of the archive holding a file that no longer parses."""
     r = _red()
     assert (r.text("claimed abc… topic='Bobs secret' submittedBy=U_ALIC")
-            == "claimed abc… topic=<topic removed> submittedBy=U_ALIC")
+            == "claimed abc… topic='<topic removed>' submittedBy=U_ALIC")
     assert (r.text('check ABSTAINED, topic "it\'s bobs" yields')
-            == "check ABSTAINED, topic <topic removed> yields")
+            == 'check ABSTAINED, topic "<topic removed>" yields')
     assert (r.text("start: topic=Bobs Secret Topic run_id=20260920_000847")
             == "start: topic=<topic removed> run_id=20260920_000847")
     assert r.text("fields: topic=Bobs Secret\nnext") == "fields: topic=<topic removed>\nnext"
     assert r.text("the off-topic sweep") == "the off-topic sweep"
+
+
+def test_a_topic_in_json_repr_or_after_a_colon_is_removed_too():
+    """⛔⛔ THE REDACTOR KNEW `topic=` AND `topic '…'` AND NOTHING ELSE. An
+    unattributed run.log — every fleet run until the attributing wheel ships —
+    carries the subject as JSON, as a Python repr and after a plain colon, and
+    all three went to support verbatim. EXECUTED against a real bundle in
+    `test_no_other_members_uid_or_topic_in_any_bundle_member` as well.
+
+    ⭐ The JSON and the repr must still PARSE afterwards, so the rewritten value
+    is round-tripped through `json.loads` / `ast.literal_eval` here rather than
+    compared as text."""
+    import ast
+
+    r = _red()
+    out = r.text('{"topic": "Bobs divorce shortlist", "uid": "U_ALICE"}')
+    assert json.loads(out) == {"topic": "<topic removed>", "uid": "U_ALICE"}
+    out = r.text("{'topic': 'Bobs divorce shortlist'}")
+    assert ast.literal_eval(out) == {"topic": "<topic removed>"}
+    assert r.text("Topic: Bobs divorce shortlist") == "Topic:<topic removed>"
+    assert r.text("topic: Bobs divorce shortlist\nnext") == "topic:<topic removed>\nnext"
+    # ⭐ ACCEPT POLARITY: a word that merely ends in "topic", and a key that only
+    # looks like one, are not somebody's subject.
+    assert r.text("the off-topic sweep: fine") == "the off-topic sweep: fine"
+    assert r.text('{"topics": 3}') == '{"topics": 3}'
+    assert r.text("topical: yes") == "topical: yes"
+
+
+def test_the_topic_bearing_log_lines_lose_their_subject():
+    """⛔⛔ THE LINES THIS PROGRAM ITSELF WROTE, with no key to find them by.
+    `backend.log` is the machine's, so every member's pickups are in the owner's
+    copy, and the tail ships. Measured on a real owner bundle: 9 of 9
+    `Starting queued job` topics, 1 of 1 orphan lines and 5 of 5 notebook
+    renames survived the redactor.
+
+    ⭐ THE LINES THE FIX NOW WRITES MUST SURVIVE IT, which is why they are here
+    too: they are deliberately not of these shapes, so the research id they
+    carry instead is still readable in a bundle."""
+    r = _red()
+    assert (r.text("[00:08:47] [INFO] Starting queued job: Bobs divorce shortlist")
+            == "[00:08:47] [INFO] Starting queued job: <topic removed>")
+    assert (r.text("[idle-rescan] worker 1: picking up orphan rB123456… "
+                   "(Bobs divorce shortlist) submittedBy=U_ALIC")
+            == "[idle-rescan] worker 1: picking up orphan rB123456… "
+               "(<topic removed>) submittedBy=U_ALIC")
+    assert (r.text("Renaming notebook to 'Bobs Divorce Shortlist'...")
+            == "Renaming notebook to <topic removed>")
+    assert (r.text("[nlm] DOM rename OK (read-back verified): 'Bobs Divorce'")
+            == "[nlm] DOM rename OK (read-back verified): <topic removed>")
+    for now_written in (
+            f"Starting queued job {research._log_job_ref({'research_id': 'rB1234567'})}",
+            "[idle-rescan] worker 1: picking up orphan rB123456… submittedBy=U_ALIC",
+            "Renaming notebook (smart title, 47 chars)...",
+            "[nlm] DOM rename OK (read-back verified, 47 chars)"):
+        assert research._BUNDLE_TOPIC_MARK not in r.text(now_written), now_written
+
+
+def test_a_uid_with_no_digit_is_still_uid_shaped():
+    """⛔ About one Firebase uid in a hundred and fifty has no digit, and the
+    shape rule demanded one. A member whose run folders and queues have aged out
+    is known to the redactor by shape and by nothing else, so theirs shipped.
+
+    ⭐ ACCEPT POLARITY is `test_a_digest_is_not_a_uid` next door: the two CASES
+    are what keep a digest out, and they still do."""
+    no_digit = "bObXyZqrstuvWXYZabcdefghIJKL"
+    assert len(no_digit) == 28
+    r = _red(keep=U28_ALICE)
+    assert (r.text(f"audio/{no_digit}/rX/pod.mp3")
+            == "audio/member-1/rX/pod.mp3")
+    assert r.text(f"sharedWith=['{no_digit}']") == "sharedWith=['member-1']"
+
+
+def test_the_owner_of_a_digit_less_uid_is_still_kept():
+    """⭐ ACCEPT POLARITY for the widened shape: widening it must not start
+    aliasing the KEPT person, whose uid has no digit either."""
+    no_digit = "bObXyZqrstuvWXYZabcdefghIJKL"
+    r = _red(keep=no_digit)
+    assert r.text(f"audio/{no_digit}/rX.mp3") == f"audio/{no_digit}/rX.mp3"
+
+
+def test_a_machine_log_line_names_the_research_never_the_topic():
+    """⛔⛔ THE LINE THAT NEVER CARRIES IT CANNOT LEAK IT. `backend.log` is the
+    machine's, so every member's pickups land in the owner's copy and the tail
+    ships in the owner's bundle; the redactor above is the backstop for the
+    fourteen days of lines already on disk, not the fix.
+
+    ⛔ `run_id` AND `resume_dir` ARE `safe_name(topic)_<stamp>`, so printing
+    either whole would put the subject back in a different spelling. Only the
+    stamp may go."""
+    ref = research._log_job_ref
+    assert ref({"research_id": "rB12345678", "topic": "Bobs divorce"}) == "rB123456…"
+    # no research id: the queue's stamp, never its slug
+    assert ref({"run_id": "bobs_divorce_20260920_000847",
+                "topic": "Bobs divorce"}) == "queue 20260920_000847"
+    assert ref({"resume_dir": "/srv/queues/bobs_divorce_20260920_000847",
+                "topic": "Bobs divorce"}) == "queue 20260920_000847"
+    # nothing to name is said as nothing, not guessed at
+    assert ref({"topic": "Bobs divorce"}) == "?"
+    assert ref({"research_id": "  ", "run_id": "no_stamp_here"}) == "?"
+    assert ref(None) == "?" and ref("bobs divorce") == "?"
+    for job in ({"research_id": "rB12345678", "topic": "Bobs divorce"},
+                {"run_id": "bobs_divorce_20260920_000847", "topic": "Bobs divorce"},
+                {"resume_dir": "/q/bobs_divorce_20260920_000847"},
+                {"topic": "Bobs divorce"}):
+        assert "bobs" not in ref(job).lower() and "divorce" not in ref(job).lower()
+
+
+# ══ 5b. the redactor, chunked ══════════════════════════════════════════
+def _corpus(reps):
+    u_bob = U28_BOB
+    u_carol = "ZzYyXxWwVvUuTtSsRrQqPpOoNnMm"
+    lines = [
+        # ⛔ CAROL FIRST AND ONLY SHAPE-MATCHED, BOB SECOND AND PATH-MATCHED, and
+        # that order is the whole point: the users/ pass runs before the shape
+        # pass, so whole-string numbering gives bob member-1 even though carol
+        # appears first. A redactor that finished each piece before starting the
+        # next would number them the other way round.
+        f"[audio] audio/{u_carol}/rX/pod.mp3 sharedWith=['{u_carol}']\n",
+        f"[fs] write users/{u_bob}/researches/chat_178 ownerUid='{u_bob}'\n",
+        "Starting queued job: somebody's private subject\n",
+        "[idle-rescan] worker 1: picking up orphan rB123456… (a subject) submittedBy=B0bXyzAA\n",
+        '{"topic": "a private subject", "uid": "' + u_bob + '"}\n',
+        "queues/some_slug_20260920_000847 run_id=some_slug_20260920_000847\n",
+        "[cua] screenshot 1280x800 action=left_click (640, 400) step 17/40\n",
+    ]
+    return "".join(lines) * reps
+
+
+@pytest.mark.parametrize("tail", ["\n", ""])
+@pytest.mark.parametrize("reps", [1, 7, 61])
+@pytest.mark.parametrize("size", [1, 64, 4096])
+def test_a_chunked_redaction_is_the_whole_string_one(monkeypatch, reps, size, tail):
+    """⛔⛔ CHUNKING HAS TO BE INVISIBLE, and the thing that could make it visible
+    is not a cut uid — it is the ALIAS NUMBERING. `member-N` is handed out on
+    first appearance, so running every pass over piece 1 before piece 2 would
+    number the same two people differently. Pass first, piece second is what
+    keeps the output equal, and this is what says so: the same corpus through a
+    one-piece redactor and through a many-piece one, output AND alias map."""
+    text = _corpus(reps).rstrip("\n") + tail
+    monkeypatch.setattr(research, "_BUNDLE_REDACT_CHUNK", 1 << 30)
+    whole = _red(keep=U28_ALICE, known=[U28_BOB])
+    expected = whole.text(text)
+    monkeypatch.setattr(research, "_BUNDLE_REDACT_CHUNK", size)
+    pieced = _red(keep=U28_ALICE, known=[U28_BOB])
+    assert pieced.text(text) == expected
+    assert pieced.aliases == whole.aliases
+    # ⭐ ACCEPT POLARITY: the corpus really does carry two members and a topic,
+    # so "both came out empty" cannot be what made this pass. And bob is
+    # member-1 although carol's line comes first — that ordering is what a
+    # piece-at-a-time redactor would get wrong.
+    assert "member-1" in expected and "member-2" in expected
+    assert whole.aliases[U28_BOB] == "member-1"
+    assert research._BUNDLE_TOPIC_MARK in expected
+    assert U28_BOB not in expected
+
+
+def test_a_chunk_never_ends_mid_line():
+    """⛔ A cut anywhere but after a newline splits a uid in half and ships both
+    halves. Every piece but the last has to end on `\\n`, and they have to
+    rejoin into exactly what came in."""
+    text = _corpus(40)
+    pieces = research._bundle_line_chunks(text, 50)
+    assert len(pieces) > 5, "one piece proves nothing about cutting"
+    assert "".join(pieces) == text
+    for piece in pieces[:-1]:
+        assert piece.endswith("\n")
+    assert research._bundle_line_chunks("no trailing newline", 4)[-1] == "no trailing newline"
+    assert research._bundle_line_chunks("short", 1000) == ["short"]
 
 
 def test_queue_names_lose_their_topic_unless_owned():
@@ -513,3 +709,45 @@ def test_the_terminal_keeps_the_paired_uid(monkeypatch, capsys):
     assert seen["keep_uid"] == "U_PAIRED"
     assert "2 run(s) left out — another member ran them" in capsys.readouterr().out
     assert rows and all("runsOtherMembers" not in p for p in rows)
+
+
+def test_an_unpaired_terminal_does_not_blame_a_member(monkeypatch, capsys):
+    """⛔⛔ THE SENTENCE WAS FALSE ON THE MACHINE MOST LIKELY TO PRINT IT.
+    `--send-logs` is what somebody runs when their computer is in trouble, which
+    is exactly when the pairing may be gone — and the runs it then leaves out
+    are the person's OWN, on a computer that may have no other member at all.
+    Measured through this same command: "0 run(s)" and "2 run(s) left out —
+    another member ran them", with both runs the owner's.
+
+    ⭐ The omission itself is right and is NOT changed here: an unpaired machine
+    cannot prove whose any folder is."""
+    seen = {}
+
+    def _build(dest, **k):
+        seen.update(k)
+        return {"path": dest, "sizeBytes": 1, "runCount": 0, "sessionCount": 0,
+                "maxRunsApplied": 30, "uncompressedBytes": 1,
+                "droppedForSize": [], "sourcesRefused": [], "runsOtherMembers": 2}
+
+    monkeypatch.setattr(research, "_build_log_bundle", _build)
+    monkeypatch.setattr(research, "load_paired_uid", lambda: None)
+    monkeypatch.setattr(research, "load_device_id", lambda: None)
+    monkeypatch.setattr(research, "_fresh_user_mode_id_token", lambda: None)
+    monkeypatch.setattr(research, "_post_bundle_to_ingest", lambda *a, **k: None)
+    research.cmd_send_logs(assume_yes=True)
+    out = capsys.readouterr().out
+    assert seen["keep_uid"] is None, "the builder must still keep nobody"
+    assert "another member ran them" not in out
+    assert "2 run(s) left out" in out and "not paired" in out
+
+
+def test_the_left_out_line_is_the_count_and_who_it_blames():
+    """The decision the two tests above drive, executed directly — including the
+    zero case, where a bundle that left nothing out must say nothing."""
+    say = research._send_logs_left_out_line
+    assert say(0, "U_PAIRED") == "" and say(None, None) == "" and say(0, None) == ""
+    assert "another member ran them" in say(2, "U_PAIRED")
+    assert "another member" not in say(2, None)
+    assert "2 run(s) left out" in say(2, None) and "2 run(s) left out" in say(2, "U")
+    # An empty-string uid is no uid: `load_paired_uid` strips before returning.
+    assert "another member" not in say(1, "")

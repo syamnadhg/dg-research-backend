@@ -93,31 +93,56 @@ OPEN_MODE = "os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)"
 OPEN_CALL = "    with _open_private_bundle(dest) as fh, \\"
 #: The callers.
 DEVICE_KEEP = "                keep_uid=owner_uid)"
-CLI_KEEP = "                                    keep_uid=load_paired_uid())"
+CLI_KEEP = "                                    keep_uid=_keep_uid)"
 #: Reporting.
 COLLECTED_COUNT = '            "runsOtherMembers": other_members,'
 SUMMARY_COUNT = '        "runsOtherMembers": other_members,\n        "sizeBytes"'
 ROW_PATCH = ('                "runsApplied": int(summary["maxRunsApplied"]),\n'
              "            })\n"
              "            object_path")
-CLI_SAY = "    if _n_others:"
-#: The redactor's passes.
-P_USERS = "        s = _BUNDLE_USERS_PATH_RE.sub("
-P_KEYED = "        s = _BUNDLE_UID_KEY_RE.sub(self._keyed, s)"
-P_KNOWN = "            s = self._known_re.sub(lambda m: self.swap(m.group(0)), s)"
-P_SHAPE = "        return _BUNDLE_UID_SHAPE_RE.sub(lambda m: self.swap(m.group(0)), s)"
-P_QUEUE = "        s = _BUNDLE_QUEUE_NAME_RE.sub(self._queue, s)"
-P_TOPIC_Q = "        s = _BUNDLE_TOPIC_QUOTED_RE.sub("
-P_TOPIC_B = "        s = _BUNDLE_TOPIC_BARE_RE.sub("
+CLI_SAY = "    if _others_line:"
+CLI_LINE = ('    _others_line = _send_logs_left_out_line(summary.get("runsOtherMembers"),'
+            " _keep_uid)")
+SAY_BLAME = ('    if keep_uid:\n'
+             '        return f"{n} run(s) left out — another member ran them"')
+#: The redactor's passes. ⛔ ONE LIST, ONE LINE EACH, and the order in it is
+#: output: `member-N` is first-appearance order.
+P_USERS = "            lambda t: _BUNDLE_USERS_PATH_RE.sub(self._users_path, t),"
+P_KEYED = "            lambda t: _BUNDLE_UID_KEY_RE.sub(self._keyed, t),"
+P_KNOWN = "            out.append(lambda t: self._known_re.sub(self._shaped, t))"
+P_SHAPE = "        out.append(lambda t: _BUNDLE_UID_SHAPE_RE.sub(self._shaped, t))"
+P_QUEUE = "            lambda t: _BUNDLE_QUEUE_NAME_RE.sub(self._queue, t),"
+P_TOPIC_L = "            lambda t: _BUNDLE_TOPIC_LINE_RE.sub(self._topic_line, t),"
+P_TOPIC_Q = "            lambda t: _BUNDLE_TOPIC_QUOTED_RE.sub(self._topic_quoted, t),"
+P_TOPIC_B = (r'            lambda t: _BUNDLE_TOPIC_BARE_RE.sub(r"\1" + '
+             "_BUNDLE_TOPIC_MARK, t),")
+#: Chunking, and the loop order that keeps it invisible.
+TEXT_LOOP = ("        for run in self._passes():\n"
+             "            for i, piece in enumerate(pieces):\n"
+             "                pieces[i] = run(piece)")
+CHUNK_CUT = '        cut = s.find("\\n", start + size)'
+#: The topic rules themselves.
+TOPIC_Q_RE = r'''    r"(?<![\w\-/])([\"']?topic[\"']?[ \t]*[=:]|topic)([ \t]*)"'''
+TOPIC_B_RE = r'''    r"(?<![\w\-/])(topic[ \t]*[=:])(?![ \t]*['\"])[^\n]*?(?=[ \t]+[A-Za-z_]+=|\n|$)",'''
+#: The two rules as they shipped in the first pass, for T2 / T3.
+TOPIC_Q_OLD = r'''    r"(?<![\w-])(topic)(=|[ \t]+)"'''
+TOPIC_B_OLD = r'''    r"(?<![\w-])(topic=)(?!['\"])[^\n]*?(?=[ \t]+[A-Za-z_]+=|\n|$)",'''
+TOPIC_KEEP_QUOTES = ("        return m.group(1) + m.group(2) + quote + "
+                     "_BUNDLE_TOPIC_MARK + quote")
+TOPIC_ORPHAN = '        return m.group("orphan") + _BUNDLE_TOPIC_MARK + m.group("close")'
+#: What a machine-wide log line may name instead of a topic.
+REF_RID = '    research_id = str(job.get("research_id") or "").strip()'
+REF_STAMP = '            return "queue " + stamp.group(1)'
 #: The redactor's decisions.
 KEPT = "value == self.keep or (len(value) >= 6 and self.keep.startswith(value)))"
 IDEMPOTENT = "if self._is_kept(value) or value in self._alias_names:"
 PREFIX_KEY = "key = next((u for u in self._known if u.startswith(value)), value)"
 SHAPE_CAPITAL = "(?=[A-Za-z0-9]*[A-Z])"
+SHAPE_CLASSES = r'    r"(?=[A-Za-z0-9]*[a-z])(?=[A-Za-z0-9]*[A-Z])"'
 NOT_UUID = "(?<![Uu])(?:uid|Uid|UID)"
 NON_VALUES = "        if value in _BUNDLE_UID_NON_VALUES:"
 SHAPE_BOUNDARY = ('r"(?:(?<![A-Za-z0-9])|(?<=%2F)|(?<=%2f))"\n'
-                  '    r"(?=[A-Za-z0-9]*[0-9])')
+                  '    r"(?=[A-Za-z0-9]*[a-z])')
 USERS_ENCODED = "(users(?:/|\\\\|%2F|%2f))"
 DECODE = 'raw.decode("utf-8", "surrogateescape")'
 QUEUE_OWNED = "return m.group(0) if m.group(0) in self.owned_queues else m.group(1)"
@@ -256,31 +281,31 @@ MUTANTS = [
     # ══ the redactor's passes ════════════════════════════════════════
     ("R1", "under", RESEARCH,
      "a Firestore path keeps any uid the other rules miss",
-     [(P_USERS, "        s = s or _BUNDLE_USERS_PATH_RE.sub(")]),
+     [(P_USERS, "            lambda t: t,")]),
 
     ("R2", "under", RESEARCH,
      "`submittedBy=<prefix>` / `ownerUid='…'` survive",
-     [(P_KEYED, "        s = s")]),
+     [(P_KEYED, "            lambda t: t,")]),
 
     ("R3", "under", RESEARCH,
      "a known uid in an unpatterned shape survives",
-     [(P_KNOWN, "            s = s")]),
+     [(P_KNOWN, "            pass")]),
 
     ("R4", "under", RESEARCH,
      "⛔ a Firebase uid in an audio URL or a Storage object path survives",
-     [(P_SHAPE, "        return s")]),
+     [(P_SHAPE, "        pass")]),
 
     ("R5", "under", RESEARCH,
      "⛔ `queues/<topic-slug>_<ts>` and `run_id=<topic-slug>_<ts>` keep the topic",
-     [(P_QUEUE, "        s = s")]),
+     [(P_QUEUE, "            lambda t: t,")]),
 
     ("R6", "under", RESEARCH,
      "`topic='…'` survives",
-     [(P_TOPIC_Q, "        s = s or _BUNDLE_TOPIC_QUOTED_RE.sub(")]),
+     [(P_TOPIC_Q, "            lambda t: t,")]),
 
     ("R7", "under", RESEARCH,
      "a bare `topic=…` survives",
-     [(P_TOPIC_B, "        s = s or _BUNDLE_TOPIC_BARE_RE.sub(")]),
+     [(P_TOPIC_B, "            lambda t: t,")]),
 
     # ══ the redactor's decisions ═════════════════════════════════════
     ("R8", "over", RESEARCH,
@@ -313,7 +338,7 @@ MUTANTS = [
 
     ("R15", "under", RESEARCH,
      "a uid inside a URL-encoded Storage path (`logs%2F<uid>%2F`) survives",
-     [(SHAPE_BOUNDARY, 'r"(?<![A-Za-z0-9])"\n    r"(?=[A-Za-z0-9]*[0-9])')]),
+     [(SHAPE_BOUNDARY, 'r"(?<![A-Za-z0-9])"\n    r"(?=[A-Za-z0-9]*[a-z])')]),
 
     ("R16", "under", RESEARCH,
      "a URL-encoded Firestore path (`users%2F<uid>`) survives",
@@ -335,6 +360,87 @@ MUTANTS = [
     ("Q2", "under", RESEARCH,
      "the map is always empty, so no queue is ever the owner's",
      [(MAP_WRITE, "            pass")]),
+
+    # ══ the repair (cross-verify round 1) ════════════════════════════
+    # ⛔⛔ THE FIRST PASS SHIPPED WITH THE TOPIC STILL IN THE TAILS. The redactor
+    # knew `topic=` and `topic '…'`, and the lines this program actually writes
+    # carry the subject with no key at all — measured in the owner's own
+    # backend*.log, 9 of 9 queued-job pickups, 1 of 1 orphan claims and 5 of 5
+    # notebook renames came through a bundle unchanged. The four source lines no
+    # longer carry it AND the redactor now knows the shapes, because a tail is
+    # fourteen days deep.
+    ("T1", "under", RESEARCH,
+     "⛔⛔ the lines with no `topic=` key ship their subject again — `Starting "
+     "queued job: <topic>`, the orphan claim, both notebook renames",
+     [(P_TOPIC_L, "            lambda t: t,")]),
+
+    ("T2", "under", RESEARCH,
+     "⛔ the quoted rule goes back to knowing only `topic=` and `topic '…'`, so "
+     "an unattributed run.log's JSON and repr topics ship",
+     [(TOPIC_Q_RE, TOPIC_Q_OLD)]),
+
+    ("T3", "under", RESEARCH,
+     "the bare rule goes back to `topic=` only, so `Topic: …` and `topic: …` ship",
+     [(TOPIC_B_RE, TOPIC_B_OLD)]),
+
+    ("T4", "over", RESEARCH,
+     "the quotes come off a redacted value — reads as tidier, and a run.log or "
+     "meta.json line that was JSON stops parsing for whoever opens the archive",
+     [(TOPIC_KEEP_QUOTES,
+       "        return m.group(1) + m.group(2) + _BUNDLE_TOPIC_MARK")]),
+
+    ("T5", "under", RESEARCH,
+     "the idle-rescan claim keeps the subject in its brackets",
+     [(TOPIC_ORPHAN, "        return m.group(0)")]),
+
+    ("T6", "under", RESEARCH,
+     "⛔ the pickup line names the TOPIC again at the source — the shape that "
+     "put every member's subject in the owner's machine log",
+     [(REF_RID, '    research_id = str(job.get("topic") or "").strip()')]),
+
+    ("T7", "under", RESEARCH,
+     "the reference falls back to the whole `run_id`, which is "
+     "`safe_name(topic)_<stamp>` — the subject back in another spelling",
+     [(REF_STAMP, '            return "queue " + stamp.string')]),
+
+    ("U1", "under", RESEARCH,
+     "⛔ the uid shape demands a digit again — about one uid in a hundred and "
+     "fifty has none, and a member whose folders have aged out is known by "
+     "shape alone",
+     [(SHAPE_CLASSES, '    r"(?=[A-Za-z0-9]*[0-9])(?=[A-Za-z0-9]*[a-z])'
+                      '(?=[A-Za-z0-9]*[A-Z])"')]),
+
+    ("C1", "under", RESEARCH,
+     "⛔⛔ the chunk loop turns inside out — every pass on piece 1 before piece "
+     "2 — so `member-N` is handed out in a different order and the same person "
+     "is a different pseudonym than the whole-string redactor gives them",
+     [(TEXT_LOOP, "        passes = self._passes()\n"
+                  "        for i, piece in enumerate(pieces):\n"
+                  "            for run in passes:\n"
+                  "                piece = run(piece)\n"
+                  "            pieces[i] = piece")]),
+
+    ("C2", "under", RESEARCH,
+     "⛔⛔ a chunk ends wherever the count runs out instead of after a newline, "
+     "so a uid cut in half ships in two halves",
+     [(CHUNK_CUT, "        cut = start + size")]),
+
+    ("B26", "under", RESEARCH,
+     "⛔⛔ the `own_uid and` guard goes, so on an unpaired machine `None == "
+     "None` marks every unattributed folder as the kept person's own and it "
+     "ships verbatim — which is the terminal's `--send-logs` there",
+     [(REDACT_RUN, 'redact_run = not (row.get("submitterUid") == own_uid)')]),
+
+    ("M1", "under", RESEARCH,
+     "the terminal blames another member however the machine is paired",
+     [(SAY_BLAME, '    if True:\n'
+                  '        return f"{n} run(s) left out — another member ran them"')]),
+
+    ("M2", "over", RESEARCH,
+     "the terminal says 'not paired' on a paired machine — the honest sentence "
+     "aimed at the wrong half",
+     [(CLI_LINE, '    _others_line = _send_logs_left_out_line('
+                 'summary.get("runsOtherMembers"), None)')]),
 ]
 
 
