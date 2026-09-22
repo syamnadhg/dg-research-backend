@@ -29,6 +29,7 @@ recovery loop that recovers it stays. What stopped being true is that a link
 decides whether the phase succeeded.
 """
 import ast
+import asyncio
 import inspect
 import textwrap
 
@@ -81,15 +82,40 @@ def test_the_storage_url_is_only_set_when_the_upload_returned_one(publish_src):
 def test_the_storage_url_is_answered_on_every_path_out_of_the_publisher():
     """The caller's `.get(...)` must never depend on which path was taken. It
     used to be an initialiser at the top of the phase; it is now the one thing
-    this function can answer, and every path out of it answers a string.
-
-    ⭐ EXECUTED, not read. `tests/test_incognito_machine_skips_109.py` runs the
-    failure paths; this pin holds the signature they rest on."""
+    this function can answer, and every path out of it answers a string."""
     tree = ast.parse(textwrap.dedent(inspect.getsource(research._p3_publish_audio)))
     returns = [n for n in ast.walk(tree) if isinstance(n, ast.Return)]
     assert returns, "the publisher must answer its caller"
     for node in returns:
         assert node.value is not None, "a bare return would hand the caller None"
+
+
+@pytest.mark.parametrize("break_it", ["no file", "upload returns none", "upload raises"])
+def test_the_publisher_answers_a_string_on_every_failure_path(
+        break_it, monkeypatch, tmp_path):
+    """⛔ EXECUTED, and it is the half the AST cannot see. The phase stores this
+    straight into `audio_stored_url` and the completion gate compares it — a
+    `None` there is the same disagreement between completion and delivery this
+    whole file exists to close, arriving from a new direction.
+
+    ⭐ Every failure path, because the swallow at the bottom is exactly where a
+    value stops being chosen deliberately."""
+    path = tmp_path / "Deep_Dive.m4a"
+    if break_it != "no file":
+        path.write_bytes(b"audio")
+    else:
+        path = None
+
+    def upload(_p):
+        if break_it == "upload raises":
+            raise RuntimeError("storage said no")
+        return None
+    monkeypatch.setattr(research, "upload_audio_to_storage", upload)
+    monkeypatch.setattr(research, "_audio_duration_sec", lambda p: 10)
+    monkeypatch.setattr(research, "save_audio_to_firestore", lambda *a: None)
+    monkeypatch.setattr(research, "log", lambda *a, **k: None)
+    out = asyncio.run(research._p3_publish_audio(path, "chat_1755500000000_3"))
+    assert out == "", f"{break_it!r} answered {out!r} instead of an empty string"
 
 
 def test_the_early_returns_carry_no_audio(audio_src):

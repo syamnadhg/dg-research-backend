@@ -52,7 +52,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 SUITES = ("tests/test_incognito_capability_109.py "
           "tests/test_incognito_run_id_and_logs_109.py "
-          "tests/test_incognito_machine_skips_109.py")
+          "tests/test_incognito_machine_skips_109.py "
+          "tests/test_incognito_expiry_109.py")
 RESEARCH = "research.py"
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
@@ -127,6 +128,15 @@ REHYDRATE_STOP = ("                if _is_incognito_research(research_id):\n"
                   "                    if _update_research_doc(tree_uid, research_id,\n"
                   "                                            _restart_recovery_patch(research_id)):")
 RECONCILE_PATCH = "        _patch = _restart_recovery_patch(research_id)"
+
+# ── anchors: the fuse ───────────────────────────────────────────────────────
+EXPIRE_HOURS = "_INCOGNITO_EXPIRE_HOURS = 24"
+EXPIRE_GATE = ("    if not _is_incognito_research(research_id):\n"
+               "        return None")
+EXPIRE_BASE = "    base = now if now is not None else datetime.now(timezone.utc)"
+DOC_EXPIRE = ('                    **({"expireAt": _expire_at} if _expire_at else {}),')
+EVENT_EXPIRE = ('        "expireAt": (_incognito_expire_at(_fb_research_id)\n'
+                "                     or datetime.now(timezone.utc) + timedelta(days=30)),")
 
 MUTANTS = [
     # ══ the one predicate ══════════════════════════════════════════════════
@@ -271,6 +281,30 @@ MUTANTS = [
      [(REHYDRATE_STOP, "                if False:\n"
                        "                    if _update_research_doc(tree_uid, research_id,\n"
                        "                                            _restart_recovery_patch(research_id)):")]),
+    # ══ the fuse ═══════════════════════════════════════════════════════════
+    ("E1", "under", "⛔⛔ nothing is fused, so a run whose purge never ran keeps "
+     "its whole content for ever and the rules refuse its reports",
+     [(EXPIRE_GATE, "    if True:\n        return None")]),
+    ("E2", "over", "every run is fused, so ordinary research starts "
+     "disappearing a day after it is written",
+     [(EXPIRE_GATE, "    if False:\n        return None")]),
+    ("E3", "under", "⛔⛔ the fuse is naive, so Firestore guesses its zone and "
+     "the rules' `is timestamp` is the only thing that catches it",
+     [(EXPIRE_BASE, "    base = now if now is not None else datetime.now()")]),
+    ("E4", "over", "the fuse is set past the rules' 48-hour ceiling, so every "
+     "incognito write is refused",
+     [(EXPIRE_HOURS, "_INCOGNITO_EXPIRE_HOURS = 72")]),
+    ("E5", "under", "⛔ the report is written without its fuse — the documents "
+     "are the whole content of the research",
+     [(DOC_EXPIRE, "")]),
+    ("E6", "under", "⛔ the timeline keeps its thirty days for a run that keeps "
+     "nothing, under a record that is already gone",
+     [(EVENT_EXPIRE, '        "expireAt": datetime.now(timezone.utc) + timedelta(days=30),')]),
+    ("E7", "over", "every run's events burn in a day, so an older research's "
+     "phase dropdown empties itself",
+     [(EVENT_EXPIRE, '        "expireAt": (_incognito_expire_at(_fb_research_id)\n'
+                     "                     or datetime.now(timezone.utc) + timedelta(hours=24)),")]),
+
     ("N13", "under", "the dead-worker reconciler writes the parked patch "
      "directly again, so the two recovery paths disagree",
      [(RECONCILE_PATCH, '        _patch = {"status": "paused_backend_restart",\n'

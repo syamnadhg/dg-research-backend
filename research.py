@@ -5961,6 +5961,44 @@ def _mint_run_id(topic, research_id=None, now=None) -> str:
     return f"{safe_name(topic)}_{stamp}"
 
 
+#: How far ahead an incognito run's own writes are fused, in hours.
+#:
+#: ⛔⛔ EVERY WRITE CARRIES ITS OWN FUSE, because the purge that normally removes
+#: them is exactly what fails in the cases the promise has to survive: the tab
+#: was closed and the cloud hand-off never landed, or this machine died. Firestore
+#: TTL is then the only thing left, and it acts only on a timestamp-typed value
+#: that is already in the past.
+#:
+#: ⛔ 48 HOURS IS THE RULES' CEILING, NOT THIS NUMBER. `ephemeralExpiryOk()`
+#: refuses anything further out, and the gap between 24 and 48 is the room a long
+#: run has to renew its record. A wheel that stamped the ceiling would leave a
+#: run with no room at all.
+#:
+#: ⭐ AND THE WORDING SAYS "WITHIN TWO DAYS", not "in a day": Firestore removes
+#: an expired document within about 24 hours of its expiry, so 24 + 24 is what
+#: can honestly be promised.
+_INCOGNITO_EXPIRE_HOURS = 24
+
+
+def _incognito_expire_at(research_id, now=None):
+    """The `expireAt` this write must carry, or None for an ordinary run.
+
+    ⛔ TIMEZONE-AWARE, AND THAT IS THE LOAD-BEARING HALF. Firestore stores a
+    naive datetime by guessing, and the rules test `is timestamp` precisely
+    because a value that merely looks like a time expires nothing, for ever —
+    the web's own stripper turned a Timestamp into `{seconds, nanoseconds}` and
+    it sat in the field looking correct until this wave.
+
+    Returns None rather than a far-future date for an ordinary run, so a caller
+    that spreads it writes no key at all and every existing document keeps the
+    expiry policy it already has."""
+    if not _is_incognito_research(research_id):
+        return None
+    from datetime import timedelta, timezone
+    base = now if now is not None else datetime.now(timezone.utc)
+    return base + timedelta(hours=_INCOGNITO_EXPIRE_HOURS)
+
+
 def _loggable_topic(topic, research_id=None, limit=40) -> str:
     """What a log line may say this run is about.
 
@@ -14627,11 +14665,19 @@ def save_document_to_firestore(doc_type: str, content: str, name: str | None = N
     Firestore client, blank content, or API error). Callers gate the
     `link_extracted` emit on this so an unsynced doc never gets a "Read
     report" button that would open an empty modal.
+
+    ⛔⛔ A RUN THAT KEEPS NOTHING FUSES ITS REPORTS (wave 10.9, #536). These
+    documents are the whole content of the research and the body of the mail,
+    and they are what is left behind in exactly the cases the purge cannot
+    reach: the tab closed and the hand-off lost, or this machine dead. The rule
+    on `documents` REFUSES an incognito create without `expireAt`, so an old
+    wheel — which stamps none — cannot write a report it would then keep.
     """
     if not _firebase_db or not _fb_uid or not _fb_research_id:
         return False
     if not content or not content.strip():
         return False
+    _expire_at = _incognito_expire_at(_fb_research_id)
     try:
         _grpc_write_with_heal(
             lambda: _firebase_db.collection("users").document(_fb_uid)
@@ -14644,6 +14690,10 @@ def save_document_to_firestore(doc_type: str, content: str, name: str | None = N
                     "content": content,
                     "size": f"{len(content) / 1024:.0f} KB",
                     "createdAt": int(time.time() * 1000),
+                    # ⭐ Absent for an ordinary run, so every document already in
+                    # the database keeps the policy it has (there is none) and
+                    # nothing about a normal research changes.
+                    **({"expireAt": _expire_at} if _expire_at else {}),
                 })),
             what=f"document {doc_type}")
         return True
@@ -16924,10 +16974,16 @@ def _emit_to_firestore(event):
         new_seq = _fb_seq + 1
     _fb_seq = new_seq
     from datetime import timedelta, timezone
+    # ⛔⛔ A RUN THAT KEEPS NOTHING BURNS IN A DAY, NOT A MONTH (wave 10.9, #536).
+    # Thirty days is right for an ordinary run's timeline; for one whose purge
+    # never ran it is thirty days of that person's phase-by-phase history left
+    # under a record that is already gone — and a late event written after the
+    # purge is an orphan nothing lists and nothing sweeps.
     doc_data = {
         **event,
         "seq": _fb_seq,
-        "expireAt": datetime.now(timezone.utc) + timedelta(days=30),
+        "expireAt": (_incognito_expire_at(_fb_research_id)
+                     or datetime.now(timezone.utc) + timedelta(days=30)),
     }
     try:
         _grpc_write_with_heal(
