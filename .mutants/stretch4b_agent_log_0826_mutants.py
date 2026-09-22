@@ -347,8 +347,11 @@ MUTANTS = [
      "in the bucket after the privacy button reports the bundle cleared — and so "
      "does the machine's own bundle whenever a lost status write left the row with "
      "no path, which is how the button manufactured its own orphan",
-     [("    for (const path of await folderContents(uid, row)) {",
-       "    for (const path of (row.objectPath ? [row.objectPath] : [])) {")]),
+     # ⚠ RE-ANCHORED 2026-09-22 (wave 10.9): `folderContents` now returns
+     # {paths, certain} and the caller destructures it — the listing's own
+     # certainty is what decides whether an unseen folder may be dropped.
+     [("    const { paths, certain } = await folderContents(uid, row);",
+       "    const paths = row.objectPath ? [row.objectPath] : []; const certain = true;")]),
     ("C2", BUNDLES, "over",
      "⛔ the prefix loses a segment, so the listing asks for `logs/{uid}/{deviceId}` "
      "— which the rules deny, because {fileName} is a single-segment wildcard. "
@@ -358,8 +361,11 @@ MUTANTS = [
     ("C3", BUNDLES, "under",
      "a listing failure deletes nothing instead of falling back to the path the "
      "row can name — a completeness gain traded for a regression",
-     [("    console.warn(`[logBundles] could not list ${prefix}, falling back to the row:`, err);\n    return row.objectPath ? [row.objectPath] : [];",
-       "    console.warn(`[logBundles] could not list ${prefix}, falling back to the row:`, err);\n    return [];")]),
+     # ⚠ RE-ANCHORED 2026-09-22 (wave 10.9): the fallback now also reports that
+     # the listing was NOT certain, so a refused listing can no longer read as
+     # an empty folder.
+     [("    return { paths: row.objectPath ? [row.objectPath] : [], certain: false };",
+       "    return { paths: [], certain: true };")]),
     ("C4", BUNDLES, "under",
      "the row's own path is no longer added when the listing misses it, so an "
      "object written moments ago survives a clear that reports success",
@@ -368,7 +374,10 @@ MUTANTS = [
      "the row is deleted even when one object in its folder survived, which is "
      "what makes a readable file INVISIBLE — the precise failure the object-first "
      "order exists to avoid, now able to happen per-sibling",
-     [("    if (objectSurvived) continue;", "    if (false) continue;")]),
+     # ⚠ RE-ANCHORED 2026-09-22 (wave 10.9): the survivor count replaced the
+     # boolean, and an unseen folder counts as a survivor unless the lifecycle
+     # has provably removed everything the row could name.
+     [("    if (survivors > 0) {", "    if (false) {")]),
 ]
 
 
