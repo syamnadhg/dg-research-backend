@@ -16,11 +16,15 @@ Every test below EXECUTES the decision — the pure helpers directly, and the
 consumers through the real builder, the real device handler and the real
 terminal command.
 """
+import ast
+import builtins
 import json
 import os
+import re
 import stat
 import time
 import zipfile
+from pathlib import Path
 
 import pytest
 
@@ -77,6 +81,26 @@ def _build(m, name="b.zip", **kw):
 
 def _red(keep="U_ALICE", known=(), owned=()):
     return research._BundleRedactor(keep, known_uids=known, owned_queues=owned)
+
+
+def _spy_on_chunks(monkeypatch):
+    """(pieces per call, the real cutter) — how many pieces the redactor
+    actually asked the cutter for.
+
+    ⛔ THE CONSUMER, NOT THE HELPER. `_bundle_line_chunks` was pinned directly
+    while `text()` was free to stop calling it, and `pieces = [s]` then passed
+    every test in this file. The real cutter comes back too, so an expectation
+    can be computed without the spy counting its own call."""
+    real = research._bundle_line_chunks
+    seen = []
+
+    def _counted(*a, **k):
+        out = real(*a, **k)
+        seen.append(len(out))
+        return out
+
+    monkeypatch.setattr(research, "_bundle_line_chunks", _counted)
+    return seen, real
 
 
 # ══ 1. the selection, pure ═════════════════════════════════════════════
@@ -386,8 +410,6 @@ def test_a_topic_in_json_repr_or_after_a_colon_is_removed_too():
     ⭐ The JSON and the repr must still PARSE afterwards, so the rewritten value
     is round-tripped through `json.loads` / `ast.literal_eval` here rather than
     compared as text."""
-    import ast
-
     r = _red()
     out = r.text('{"topic": "Bobs divorce shortlist", "uid": "U_ALICE"}')
     assert json.loads(out) == {"topic": "<topic removed>", "uid": "U_ALICE"}
@@ -481,6 +503,354 @@ def test_a_machine_log_line_names_the_research_never_the_topic():
         assert "bobs" not in ref(job).lower() and "divorce" not in ref(job).lower()
 
 
+def test_the_sidebar_and_title_refresh_lines_lose_their_subject():
+    """⛔⛔ THE FIRST PASS KNEW FOUR SHAPES AND THERE WERE NINE. Measured
+    2026-09-22 against this owner's LIVE `backend.log`: 148 characters of
+    another member's research subject survived in the shipped tail — the Gemini
+    sidebar-adoption recovery names the chat it opens, the title-refresh refusal
+    names the title it threw away, and both of those and the off-topic
+    diagnostics print the topic's own distinctive words. None of them has a
+    `topic=` key, so nothing in the first pass could see them.
+
+    ⭐ The sources no longer write any of this (below), and the rule is here
+    anyway for the same reason the first four are: a tail is fourteen days deep.
+    """
+    r = _red()
+    cases = [
+        ("[Gemini] top recent sidebar chats ['Bobs divorce shortlist', 'Bob v Bob']"
+         " do NOT match our brief — not adopting (won't hijack a past run)",
+         "[Gemini] top recent sidebar chats [<topic removed>] do NOT match our "
+         "brief — not adopting (won't hijack a past run)"),
+        ("[Gemini] opening owned sidebar chat 'Bobs divorce shortlist' (1/2) "
+         "from the sidebar",
+         "[Gemini] opening owned sidebar chat '<topic removed>' (1/2) from the sidebar"),
+        ("[Gemini] sidebar entry 'Bobs divorce shortlist' vanished before open"
+         " — trying next",
+         "[Gemini] sidebar entry '<topic removed>' vanished before open — trying next"),
+        ("[title-refresh] REFUSING the generated title 'Bobs Divorce Shortlist' "
+         "— it shares none of the topic's distinctive terms (divorce, lawyer, "
+         "custody), AND neither does the corpus it was written from.",
+         "[title-refresh] REFUSING the generated title '<topic removed>' — it "
+         "shares none of the topic's distinctive terms (<topic removed>), AND "
+         "neither does the corpus it was written from."),
+        ("[chatgpt] OFF-TOPIC text REJECTED at save: 900 chars mention none of "
+         "the topic's distinctive terms (divorce, lawyer, custody) — this is "
+         "not this run's research. Not saving it.",
+         "[chatgpt] OFF-TOPIC text REJECTED at save: 900 chars mention none of "
+         "the topic's distinctive terms (<topic removed>) — this is not this "
+         "run's research. Not saving it."),
+        ("[Phase 2] off-topic sweep is INERT this run: topic 'bobs divorce' "
+         "yields 2 distinctive word(s) (divorce, bobs), below the 3 needed",
+         "[Phase 2] off-topic sweep is INERT this run: topic '<topic removed>' "
+         "yields 2 distinctive word(s) (<topic removed>), below the 3 needed"),
+    ]
+    for raw, want in cases:
+        assert r.text(raw) == want, raw
+    # ⛔ NOTHING ESCAPES THESE VALUES — they are interpolated straight into an
+    # f-string — so a title with an apostrophe in it closes its own quoted value
+    # for any `[^']*` rule and ships the rest, and a list entry with a bracket
+    # does the same. Both are ordinary research titles.
+    assert (r.text("[Gemini] opening owned sidebar chat 'Bob's divorce shortlist' "
+                   "(1/2) from the sidebar")
+            == "[Gemini] opening owned sidebar chat '<topic removed>' (1/2) "
+               "from the sidebar")
+    assert (r.text("[Gemini] top recent sidebar chats ['Bobs [2026] divorce'] do NOT")
+            == "[Gemini] top recent sidebar chats [<topic removed>] do NOT")
+    # ⭐ ACCEPT POLARITY. The lines the sources now write keep everything they
+    # are read for — the counts, and the sentence around the bracket. The three
+    # sidebar lines name nothing at all any more, so nothing is taken from them.
+    for now_written in (
+            "[Gemini] top 2 recent sidebar chat(s) ([31, 9] chars) do NOT match our brief",
+            "[Gemini] opening owned sidebar chat #1/2 (31 chars) from the sidebar",
+            "[Gemini] sidebar entry #1 (31 chars) vanished before open — trying next"):
+        assert r.text(now_written) == now_written, now_written
+    assert (r.text("[title-refresh] REFUSING the generated title (22 chars) — it "
+                   "shares none of the topic's distinctive terms (divorce, lawyer), "
+                   "AND neither does the corpus it was written from.")
+            == "[title-refresh] REFUSING the generated title (22 chars) — it "
+               "shares none of the topic's distinctive terms (<topic removed>), "
+               "AND neither does the corpus it was written from.")
+
+
+def test_a_subject_with_an_equals_sign_in_it_keeps_none_of_its_tail():
+    """⛔⛔ THE VALUE ENDED AT THE FIRST `word=` INSIDE IT. `Firestore start:
+    uid=… topic=why E=mc2 changed physics run_id=…` stopped the topic at `E=`
+    and shipped `mc2 changed physics`. A subject written with an equals sign —
+    a formula, a config key, `does p=np matter` — is all it takes."""
+    r = _red()
+    assert (r.text("Firestore start: uid=U_BOB topic=why E=mc2 changed physics "
+                   "run_id=bobs_20260101_010101")
+            == "Firestore start: uid=member-1 topic=<topic removed> "
+               "run_id=20260101_010101")
+    assert (r.text("topic=does p=np matter for crypto\nnext")
+            == "topic=<topic removed>\nnext")
+    # ⭐ ACCEPT POLARITY: the run id a reader follows the line by is still there,
+    # and a key that is not one of the known enders now costs that key rather
+    # than ending the subject early — the safe direction.
+    assert "run_id=20260101_010101" in r.text(
+        "topic=why E=mc2 changed physics run_id=bobs_20260101_010101")
+    assert (r.text("topic=bobs divorce elapsed=12s")
+            == "topic=<topic removed>")
+
+
+def test_the_possessive_in_the_topics_is_not_an_opening_quote():
+    """⛔⛔ THE BARE `topic` ALTERNATIVE READ `topic's` AS A QUOTED VALUE and
+    deleted the line from that apostrophe to the next one. Ninety characters of
+    the off-topic diagnostic went, and whether a line survived depended only on
+    whether a second apostrophe happened to sit on it — which is also what made
+    the anchors above LOOK redacted while nothing had decided they should be."""
+    r = _red()
+    # The real line, both halves at once: the words in the bracket go, and the
+    # ninety characters of sentence after them stay. Before the fix this came
+    # back as `…mentions NONE of the topic'<topic removed>'s research`.
+    assert (r.text("Phase 1: the brief (900 chars) mentions NONE of the topic's "
+                   "distinctive terms (divorce, lawyer, custody) — this is not a "
+                   "brief for this run's research")
+            == "Phase 1: the brief (900 chars) mentions NONE of the topic's "
+               "distinctive terms (<topic removed>) — this is not a "
+               "brief for this run's research")
+    assert r.text("nothing here matched the topic's shape at all") == \
+        "nothing here matched the topic's shape at all"
+    # ⭐ ACCEPT POLARITY: the shape the alternative exists for — a bare `topic`
+    # then a SPACE then a quoted value — is still removed.
+    assert (r.text("brief topic check ABSTAINED — topic 'bobs divorce' yields 2")
+            == "brief topic check ABSTAINED — topic '<topic removed>' yields 2")
+    assert (r.text('sweep INERT: topic "bobs divorce" yields 2')
+            == 'sweep INERT: topic "<topic removed>" yields 2')
+
+
+# ══ 5c. every log line that names a subject, derived from the source ═══
+#
+# ⛔⛔ A RULE-SHAPED RE-CHECK CANNOT FIND THE NEXT ONE. The first pass closed
+# four shapes and re-checked its work by re-applying its own rules, which can
+# only see shapes the rules already know; five more were sitting in this
+# owner's live `backend.log` the whole time. So this does not ask "do the rules
+# still match the lines I thought of" — it asks the SOURCE which lines exist.
+#
+# Every `log(f"…")` in research.py that interpolates a research subject is
+# rendered with a sentinel in place of that subject, written into a real
+# machine tail, and put through the REAL builder. Nothing may come out.
+_SUBJECT = "ZqSubjectZq"
+_NEUTRAL = "x"
+#: A variable whose NAME says subject…
+_SUBJECT_NAME_RE = re.compile(r"(?i)(title|topic|anchor)")
+#: …a dict key that fetches one…
+_SUBJECT_KEY = frozenset({"topic", "title"})
+#: …and a variable ASSIGNED from a function that returns one, which is how the
+#: title-refresh lines' `text` and the sweep's `_t` / `_a` are subjects without
+#: saying so in their names.
+_SUBJECT_CALLS = frozenset({"topic_anchors", "smart_title", "_shape_title",
+                            "_try_llm_title", "_run_topic_for_guard"})
+#: ⛔ THE ONLY WAY PAST THIS TEST, and each one is a claim a reviewer can check:
+#: the name says subject and the value is not one. Keyed by a literal from the
+#: line itself, and every row must still match a line (below), so a row left
+#: behind by an edit is a failure rather than a hole.
+_NOT_A_SUBJECT = {
+    "fail_agent suppressed": "`title` is the alert card's own title",
+    "off-topic sweep rejected": "`_off_topic` is a list of agent keys",
+}
+
+
+class _Ghost:
+    """A stand-in for anything a log line interpolates, carrying one word.
+
+    ⛔⛔ A SLICE OF IT IS STILL THE WHOLE WORD. It used to return the sliced
+    STRING, so `', '.join(anchors[:6])` rendered as `Z, q, S, u, b, j` — the
+    sentinel cut into letters, and every anchor-list line passed this test
+    without ever carrying a subject. The mutant that put the words back in a
+    spelling the bundle cannot see survived because of it."""
+
+    def __init__(self, word, subjects=frozenset()):
+        self._w = word
+        self._s = subjects
+
+    def __getitem__(self, k):
+        return self
+
+    def __iter__(self):
+        return iter([self._w, self._w, self._w])
+
+    def __len__(self):
+        return len(self._w)
+
+    def __str__(self):
+        return self._w
+
+    def __repr__(self):
+        return repr(self._w)
+
+    def __format__(self, spec):
+        return format(self._w, spec) if spec else self._w
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return _Ghost(_SUBJECT if name in self._s else self._w, self._s)
+
+    def __call__(self, *a, **k):
+        if any(isinstance(x, str) and x in self._s for x in a):
+            return _Ghost(_SUBJECT, self._s)
+        return self
+
+    def __bool__(self):
+        return True
+
+    def __or__(self, other):
+        return self
+
+    def __ror__(self, other):
+        return self
+
+    def __add__(self, other):
+        return self._w + str(other)
+
+    def __radd__(self, other):
+        return str(other) + self._w
+
+    def __hash__(self):
+        return hash(self._w)
+
+
+class _GhostNs(dict):
+    """The namespace a line is rendered in: real builtins, ghosts for the rest."""
+
+    def __init__(self, subjects):
+        super().__init__()
+        self._subjects = subjects
+
+    def __missing__(self, name):
+        if name not in self._subjects and hasattr(builtins, name):
+            return getattr(builtins, name)
+        g = _Ghost(_SUBJECT if name in self._subjects else _NEUTRAL, self._subjects)
+        self[name] = g
+        return g
+
+
+def _names_in(node):
+    out = set()
+    for n in ast.walk(node):
+        if isinstance(n, ast.Name):
+            out.add(n.id)
+        elif isinstance(n, ast.Attribute):
+            out.add(n.attr)
+        elif isinstance(n, ast.Constant) and n.value in _SUBJECT_KEY:
+            out.add(str(n.value))
+    return out
+
+
+def _subjects_assigned_in(scope, body_only=False):
+    out = set()
+    nodes = scope.body if body_only else list(ast.walk(scope))
+    for node in nodes:
+        targets = getattr(node, "targets", None) or (
+            [node.target] if isinstance(node, (ast.AnnAssign, ast.AugAssign)) else [])
+        value = getattr(node, "value", None)
+        if not targets or not isinstance(value, ast.Call):
+            continue
+        fn = value.func
+        fn = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", "")
+        if fn in _SUBJECT_CALLS:
+            out |= {t.id for t in targets if isinstance(t, ast.Name)}
+    return out
+
+
+def _render_log_line(joined, subjects):
+    """One `log(f"…")` argument, rendered with the subjects replaced."""
+    ns = _GhostNs(subjects)
+    try:
+        return eval(compile(ast.Expression(joined), "<log>", "eval"), ns, ns)
+    except Exception:
+        pass  # an expression no ghost can stand in for — render it textually
+    out = []
+    for part in joined.values:
+        if isinstance(part, ast.Constant):
+            out.append(str(part.value))
+        elif isinstance(part, ast.FormattedValue):
+            e = part.value
+            if (isinstance(e, ast.Call) and isinstance(e.func, ast.Name)
+                    and e.func.id == "len"):
+                out.append("12")
+            else:
+                out.append(_SUBJECT if _names_in(e) & subjects else _NEUTRAL)
+    return "".join(out)
+
+
+def _subject_log_lines():
+    """Every log line in research.py that puts a research subject in it.
+
+    Derived from the source, never from a list kept by hand — a list kept by
+    hand is what left five of these shipping."""
+    tree = ast.parse(Path(research.__file__).read_text(encoding="utf-8"))
+    scopes = [(tree, True)] + [(n, False) for n in ast.walk(tree)
+                               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    found: "dict[int, tuple]" = {}
+    for scope, body_only in scopes:
+        assigned = _subjects_assigned_in(scope, body_only)
+        for node in ast.walk(scope):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == "log" and node.args):
+                continue
+            arg = node.args[0]
+            if not isinstance(arg, ast.JoinedStr):
+                continue
+            subs = set()
+            for part in arg.values:
+                if not isinstance(part, ast.FormattedValue):
+                    continue
+                for name in _names_in(part.value):
+                    # An ALL-CAPS name is a module constant, never a subject.
+                    if not name.isupper() and (name in assigned
+                                               or _SUBJECT_NAME_RE.search(name)):
+                        subs.add(name)
+            if subs:
+                prev = found.get(node.lineno, (arg, set()))[1]
+                found[node.lineno] = (arg, prev | subs)
+    return {lineno: _render_log_line(arg, subs)
+            for lineno, (arg, subs) in found.items()}
+
+
+def test_no_log_line_that_names_a_subject_survives_the_bundle(machine):
+    """⛔⛔ EVERY LINE THIS PROGRAM WRITES WITH A SUBJECT IN IT, asked of the
+    source and put through the real builder. Measured 2026-09-22 against this
+    owner's live `backend.log`: the first pass left 148 characters of another
+    member's research subject in the tail that ships — `opening owned sidebar
+    chat '…'`, `REFUSING the generated title '…'` and the topic's own
+    distinctive words — because it re-checked its fix with the rules the fix had
+    written. This asks a different question: whatever the sources say today,
+    none of it may reach support.
+
+    ⭐ A line passes either way it can be safe — by not writing the subject at
+    all (the counts the sources now print) or by writing it behind a key the
+    redactor finds. The two exemptions are named above and checked below."""
+    lines = _subject_log_lines()
+    assert len(lines) > 20, "the derivation found nothing — it is measuring nothing"
+    exempt, corpus = {}, []
+    for lineno, rendered in sorted(lines.items()):
+        one = " ".join(rendered.split())
+        hit = next((k for k in _NOT_A_SUBJECT if k in one), None)
+        if hit:
+            exempt[hit] = lineno
+            continue
+        corpus.append(f"[00:08:47] [WARN] {one}")
+    # ⭐ ACCEPT POLARITY, and it is the whole test: the corpus really does carry
+    # the sentinel, on more than a handful of lines, so "nothing was rendered"
+    # cannot be what makes this pass.
+    carriers = [ln for ln in corpus if _SUBJECT in ln]
+    assert len(carriers) >= 15, f"only {len(carriers)} lines carried a subject"
+    (machine["root"] / "backend.log").write_text("\n".join(corpus) + "\n",
+                                                 encoding="utf-8")
+    _summary, blobs = _build(machine, keep_uid="U_ALICE")
+    tail = blobs["system/backend.log"].decode("utf-8", "surrogateescape")
+    survivors = [ln for ln in tail.splitlines() if _SUBJECT in ln]
+    assert not survivors, "a research subject reached the bundle:\n" + "\n".join(survivors)
+    # ⭐ AND THE LINES REALLY SHIPPED — a tail that dropped them would be green
+    # for the wrong reason.
+    assert len(tail.splitlines()) == len(corpus)
+    assert research._BUNDLE_TOPIC_MARK in tail
+    assert sorted(exempt) == sorted(_NOT_A_SUBJECT), (
+        "a row in _NOT_A_SUBJECT matches no line any more: " + str(exempt))
+
+
 # ══ 5b. the redactor, chunked ══════════════════════════════════════════
 def _corpus(reps):
     u_bob = U28_BOB
@@ -511,15 +881,26 @@ def test_a_chunked_redaction_is_the_whole_string_one(monkeypatch, reps, size, ta
     first appearance, so running every pass over piece 1 before piece 2 would
     number the same two people differently. Pass first, piece second is what
     keeps the output equal, and this is what says so: the same corpus through a
-    one-piece redactor and through a many-piece one, output AND alias map."""
+    one-piece redactor and through a many-piece one, output AND alias map.
+
+    ⛔⛔ AND IT MUST PROVE THE CUT HAPPENED. Comparing a chunked run to a whole
+    one is green when there is NO chunking — both sides take the identical path
+    — so `pieces = [s]` survived this test, and the helper next door pinned the
+    helper, not its consumer. The spy is what makes the comparison mean
+    something: the consumer has to have asked for the pieces it was given."""
     text = _corpus(reps).rstrip("\n") + tail
+    seen, cut = _spy_on_chunks(monkeypatch)
     monkeypatch.setattr(research, "_BUNDLE_REDACT_CHUNK", 1 << 30)
     whole = _red(keep=U28_ALICE, known=[U28_BOB])
     expected = whole.text(text)
+    assert seen == [1], "the whole-string run must still go through the cutter"
     monkeypatch.setattr(research, "_BUNDLE_REDACT_CHUNK", size)
     pieced = _red(keep=U28_ALICE, known=[U28_BOB])
     assert pieced.text(text) == expected
     assert pieced.aliases == whole.aliases
+    # ⭐ The consumer cut this text itself, into exactly what the helper gives
+    # for this size — not into one piece because there is no chunking left.
+    assert seen == [1, len(cut(text, size))]
     # ⭐ ACCEPT POLARITY: the corpus really does carry two members and a topic,
     # so "both came out empty" cannot be what made this pass. And bob is
     # member-1 although carol's line comes first — that ordering is what a
@@ -528,6 +909,27 @@ def test_a_chunked_redaction_is_the_whole_string_one(monkeypatch, reps, size, ta
     assert whole.aliases[U28_BOB] == "member-1"
     assert research._BUNDLE_TOPIC_MARK in expected
     assert U28_BOB not in expected
+
+
+def test_the_shipped_chunk_size_really_cuts_a_real_tail(monkeypatch):
+    """⛔⛔ THE CONSTANT IS HALF THE FIX AND NOTHING WATCHED IT. Raise
+    `_BUNDLE_REDACT_CHUNK` past any real log and the chunking is inert while
+    every test that monkeypatches it stays green — and the stall is back: one
+    `re.sub` over a capped 32 MB run.log holds the GIL for its whole run, eight
+    passes deep, on a daemon thread beside the asyncio loop driving a live
+    pipeline. No monkeypatch here: the SHIPPED size has to cut a text the size
+    of a tail that really ships."""
+    assert research._BUNDLE_REDACT_CHUNK < research.BUNDLE_MAX_BYTES
+    seen, _cut = _spy_on_chunks(monkeypatch)
+    line = "[00:08:47] [INFO] health probe ok, nothing to see here\n"
+    text = (line * (research._BUNDLE_REDACT_CHUNK // len(line) + 8)
+            + "Starting queued job: somebody's private subject\n")
+    assert len(text) > research._BUNDLE_REDACT_CHUNK
+    out = _red(keep=U28_ALICE).text(text)
+    assert seen and seen[0] > 1, "the shipped chunk size cut nothing"
+    # ⭐ ACCEPT POLARITY: cutting it did not cost the redaction or the text.
+    assert research._BUNDLE_TOPIC_MARK in out
+    assert "private subject" not in out and out.count(line) == text.count(line)
 
 
 def test_a_chunk_never_ends_mid_line():

@@ -122,14 +122,49 @@ TEXT_LOOP = ("        for run in self._passes():\n"
              "                pieces[i] = run(piece)")
 CHUNK_CUT = '        cut = s.find("\\n", start + size)'
 #: The topic rules themselves.
-TOPIC_Q_RE = r'''    r"(?<![\w\-/])([\"']?topic[\"']?[ \t]*[=:]|topic)([ \t]*)"'''
-TOPIC_B_RE = r'''    r"(?<![\w\-/])(topic[ \t]*[=:])(?![ \t]*['\"])[^\n]*?(?=[ \t]+[A-Za-z_]+=|\n|$)",'''
+TOPIC_Q_RE = (r'''    r"(?<![\w\-/])([\"']?topic[\"']?[ \t]*[=:]'''
+              r'''|topic(?=[ \t]))([ \t]*)"''')
+#: The bare alternative's space lookahead — what keeps `topic's` from reading as
+#: a quoted value.
+TOPIC_Q_POSSESSIVE = r'''|topic(?=[ \t]))([ \t]*)"'''
+TOPIC_B_RE = (r'''    r"(?<![\w\-/])(topic[ \t]*[=:])(?![ \t]*['\"])[^\n]*?"''' "\n"
+              r'''    r"(?=[ \t]+(?:" + _BUNDLE_TOPIC_END_KEYS + r")=|\n|$)",''')
+#: Where a bare topic value is allowed to end.
+TOPIC_B_TAIL = r'''    r"(?=[ \t]+(?:" + _BUNDLE_TOPIC_END_KEYS + r")=|\n|$)",'''
+#: The three shapes the first pass missed, each named so `_topic_line` still
+#: finds its groups when one is made unmatchable.
+LINE_TERMS = r'''    r"(?P<terms>distinctive[ \t]+(?:terms|word\(s\))[ \t]*\()[^)\n]*"'''
+LINE_CHATS = r'''    r"(?P<chats>top recent sidebar chats[ \t]*\[)[^\n]*(?P<chats_close>\])"'''
+#: What may sit inside a quoted title: an apostrophe followed by a letter is
+#: part of the title, because nothing escapes these values.
+LINE_NAMED_VALUE = r'''    r"(?:(?!(?P=quote))[^\n]|(?P=quote)(?=[A-Za-z]))*(?P=quote)"'''
+LINE_NAMED = (r'''    r"(?P<named>(?:generated title|opening owned sidebar chat'''
+              r'''|sidebar entry)"''')
+#: Whether the text is cut at all, and how small the bites are.
+TEXT_CHUNK = "        pieces = _bundle_line_chunks(s, _BUNDLE_REDACT_CHUNK)"
+CHUNK_SIZE = "_BUNDLE_REDACT_CHUNK = 1 << 20"
+#: The machine-log call sites themselves — `_log_job_ref` is a helper, and a
+#: helper is not a call site: all four of these could name the subject again
+#: with the helper untouched.
+SITE_QUEUED = '            log(f"Starting queued job {_log_job_ref(job)}")'
+SITE_RENAME = '            log(f"Renaming notebook (smart title, {len(title)} chars)...")'
+SITE_DOM_RENAME = ('            log(f"[{label}] DOM rename OK '
+                   '(read-back verified, {len(title)} chars)")')
+SITE_ORPHAN = ('            log(f"[idle-rescan] worker {WORKER_ID}: picking up orphan '
+               "{research_id[:8]}… submittedBy={(d.get('submittedBy') or '?')[:8]}\")")
+#: And the five round-2 ones.
+SITE_SIDEBAR_LIST = '        log(f"[{label}] top {len(_titles)} recent sidebar chat(s) "'
+SITE_SIDEBAR_OPEN = ('        log(f"[{label}] opening owned sidebar chat '
+                     '#{_ci + 1}/{len(_owned)} "')
+SITE_REFUSE = '                        log(f"[title-refresh] REFUSING the generated title "'
+SITE_BRIEF_ANCHORS = ("""        f"distinctive terms ({', '.join(anchors[:6])}) """
+                      '''— this is not a brief "''')
 #: The two rules as they shipped in the first pass, for T2 / T3.
 TOPIC_Q_OLD = r'''    r"(?<![\w-])(topic)(=|[ \t]+)"'''
 TOPIC_B_OLD = r'''    r"(?<![\w-])(topic=)(?!['\"])[^\n]*?(?=[ \t]+[A-Za-z_]+=|\n|$)",'''
 TOPIC_KEEP_QUOTES = ("        return m.group(1) + m.group(2) + quote + "
                      "_BUNDLE_TOPIC_MARK + quote")
-TOPIC_ORPHAN = '        return m.group("orphan") + _BUNDLE_TOPIC_MARK + m.group("close")'
+TOPIC_ORPHAN = "                return opener + _BUNDLE_TOPIC_MARK + m.group(close_name)"
 #: What a machine-wide log line may name instead of a topic.
 REF_RID = '    research_id = str(job.get("research_id") or "").strip()'
 REF_STAMP = '            return "queue " + stamp.group(1)'
@@ -390,8 +425,9 @@ MUTANTS = [
        "        return m.group(1) + m.group(2) + _BUNDLE_TOPIC_MARK")]),
 
     ("T5", "under", RESEARCH,
-     "the idle-rescan claim keeps the subject in its brackets",
-     [(TOPIC_ORPHAN, "        return m.group(0)")]),
+     "every bracketed shape keeps its subject — the idle-rescan claim, the "
+     "distinctive terms, the sidebar list — the line is matched and handed back",
+     [(TOPIC_ORPHAN, "                return m.group(0)")]),
 
     ("T6", "under", RESEARCH,
      "⛔ the pickup line names the TOPIC again at the source — the shape that "
@@ -441,6 +477,104 @@ MUTANTS = [
      "aimed at the wrong half",
      [(CLI_LINE, '    _others_line = _send_logs_left_out_line('
                  'summary.get("runsOtherMembers"), None)')]),
+
+    # ══ the repair (cross-verify round 2) ════════════════════════════
+    # ⛔⛔ THE FIRST REPAIR RE-CHECKED ITSELF WITH ITS OWN RULES, which can only
+    # see the shapes the rules already know. Five more were shipping the whole
+    # time — measured in this owner's LIVE backend.log, 148 characters of
+    # another member's research subject in the tail that goes to support.
+    ("V1", "under", RESEARCH,
+     "⛔⛔ the off-topic diagnostics ship the topic's own distinctive words "
+     "again — `distinctive terms (<the subject's words>)`, which have no key",
+     [(LINE_TERMS,
+       r'''    r"(?P<terms>distinctive[ \t]+(?:termsNEVER)[ \t]*\()[^)\n]*"''')]),
+
+    ("V2", "under", RESEARCH,
+     "Gemini's sidebar probe ships the list of other members' chat titles",
+     [(LINE_CHATS, r'''    r"(?P<chats>top recent sidebar chatsNEVER[ \t]*\[)'''
+                   r'''[^\]\n]*(?P<chats_close>\])"''')]),
+
+    ("V3", "under", RESEARCH,
+     "⛔⛔ the adopted chat title and the refused generated title ship — the two "
+     "shapes measured surviving in the owner's live log",
+     [(LINE_NAMED, r'''    r"(?P<named>(?:generated titleNEVER)"''')]),
+
+    ("V16", "under", RESEARCH,
+     "⛔ a chat title with an apostrophe in it closes its own quoted value, so "
+     "`opening owned sidebar chat 'Bobs' divorce'` ships everything after the "
+     "first apostrophe — and nothing escapes these values",
+     [(LINE_NAMED_VALUE, r'''    r"[^'\"\n]*(?P=quote)"''')]),
+
+    ("V4", "over", RESEARCH,
+     "⛔ the bare `topic` alternative reads the possessive in `topic's` as an "
+     "opening quote again and deletes the diagnostic to the next apostrophe",
+     [(TOPIC_Q_POSSESSIVE, r'''|topic)([ \t]*)"''')]),
+
+    ("V5", "under", RESEARCH,
+     "a bare topic value ends at any `word=` again, so a subject with an equals "
+     "sign in it — a formula, `p=np` — keeps its tail",
+     [(TOPIC_B_TAIL, r'''    r"(?=[ \t]+[A-Za-z_]+=|\n|$)",''')]),
+
+    # ⛔ THE SOURCE HALF. The redactor is the fourteen-day backstop; these are
+    # the lines, and a subject put back in a spelling the backstop does not know
+    # goes straight to support.
+    ("V6", "under", RESEARCH,
+     "the queued-job pickup names the topic again AT THE CALL SITE — the helper "
+     "is untouched, so nothing that watches the helper can see it",
+     [(SITE_QUEUED, """            log(f"Starting queued job {job.get('topic')}")""")]),
+
+    ("V7", "under", RESEARCH,
+     "the notebook rename prints the smart title, which IS the topic",
+     [(SITE_RENAME, '            log(f"Renaming notebook - {title}...")')]),
+
+    ("V8", "under", RESEARCH,
+     "the DOM rename read-back prints the title behind a `title=` key, which no "
+     "redaction rule knows",
+     [(SITE_DOM_RENAME,
+       '            log(f"[{label}] DOM rename OK (read-back verified, title={title})")')]),
+
+    ("V9", "under", RESEARCH,
+     "the idle-rescan orphan claim carries the subject again",
+     [(SITE_ORPHAN,
+       '            log(f"[idle-rescan] worker {WORKER_ID}: picking up orphan '
+       "{research_id[:8]}… for {d.get('topic')} "
+       "submittedBy={(d.get('submittedBy') or '?')[:8]}\")")]),
+
+    ("V10", "under", RESEARCH,
+     "Gemini's sidebar probe prints the titles themselves again",
+     [(SITE_SIDEBAR_LIST,
+       '        log(f"[{label}] top {_titles} recent sidebar chat(s) "')]),
+
+    ("V11", "under", RESEARCH,
+     "the adoption line prints the chat title it is opening",
+     [(SITE_SIDEBAR_OPEN,
+       '        log(f"[{label}] opening owned sidebar chat {_cand_title} "')]),
+
+    ("V12", "under", RESEARCH,
+     "the title-refresh refusal prints the generated title again",
+     [(SITE_REFUSE,
+       '                        log(f"[title-refresh] REFUSING the generated '
+       'title {text} "')]),
+
+    ("V13", "under", RESEARCH,
+     "⛔ the Phase 1 brief gate keeps naming the topic's distinctive words — "
+     "which it is meant to — but in a spelling `distinctive terms (…)` cannot "
+     "see, so the bundle stops taking them out",
+     [(SITE_BRIEF_ANCHORS,
+       """        f"never mentions {', '.join(anchors[:6])} """
+       '''— this is not a brief "''')]),
+
+    # ⛔⛔ AND THE CHUNKING, whose only tests monkeypatched the size and
+    # compared chunked to whole — identical paths when there is no chunking.
+    ("V14", "under", RESEARCH,
+     "⛔⛔ the text is not cut at all — one `re.sub` over a capped 32 MB run.log "
+     "holds the GIL for seconds, eight passes deep, beside a live pipeline",
+     [(TEXT_CHUNK, "        pieces = [s]")]),
+
+    ("V15", "under", RESEARCH,
+     "the bite is bigger than any log that can ship, so the cutting is inert "
+     "while every test that monkeypatches the size stays green",
+     [(CHUNK_SIZE, "_BUNDLE_REDACT_CHUNK = 1 << 40")]),
 ]
 
 

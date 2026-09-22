@@ -1679,6 +1679,10 @@ def title_refusal_verdict(title: str, topic: str, corpus: str) -> str:
         Security Boundaries' — it shares none of the topic's distinctive terms
         (nemoclaw, nemohermes, nemotron, openshell).
 
+    (Quoted as it was written that day. The line now prints the title's LENGTH
+    rather than the title — `backend.log` is the machine's and its tail ships in
+    the owner's support bundle; see `_log_job_ref`.)
+
     NVIDIA is the vendor of Nemotron. The sources were docs.nvidia.com and
     build.nvidia.com. The corpus had already been through `apply_off_topic_sweep`
     and passed — no "OFF-TOPIC text REJECTED" line anywhere in the run. So the
@@ -1794,12 +1798,22 @@ def _refresh_research_title_async(topic, brief_text="", findings_text=""):
                     # is the part that was never in doubt: drop the title, keep
                     # the topic-derived name, which is what `smart_title` reads
                     # and what P3 types into the notebook.
+                    # ⛔⛔ NOT THE TITLE — see `_log_job_ref`. The generated
+                    # title is a research subject, and both of these lines go to
+                    # the machine-wide `backend.log`, whose tail ships in the
+                    # OWNER's support bundle: measured 2026-09-22 in this
+                    # owner's live log, 57 characters of another member's title
+                    # in the archive that goes to support. Its LENGTH is what
+                    # this line is read for; the title itself is on the research
+                    # doc. ⭐ The anchors stay, for the reason the Phase 1 gate
+                    # gives, and the bundle takes them out of the copy that
+                    # travels.
                     if _verdict == "refuse_loud":
-                        log(f"[title-refresh] REFUSING the generated title {text!r} — it "
-                            f"shares none of the topic's distinctive terms "
-                            f"({', '.join(_t_anchors[:6])}), AND neither does the "
-                            f"corpus it was written from. The research went "
-                            f"off-topic.", "ERROR")
+                        log(f"[title-refresh] REFUSING the generated title "
+                            f"({len(text)} chars) — it shares none of the topic's "
+                            f"distinctive terms ({', '.join(_t_anchors[:6])}), AND "
+                            f"neither does the corpus it was written from. The "
+                            f"research went off-topic.", "ERROR")
                         try:
                             emit_event(
                                 "pipeline_warning", phase=2,
@@ -1830,9 +1844,10 @@ def _refresh_research_title_async(topic, brief_text="", findings_text=""):
                         # nothing is shown. Logged, because "the title we picked
                         # was thrown away" should still be greppable.
                         log(f"[title-refresh] keeping the topic-derived name: the "
-                            f"generated title {text!r} shares none of the topic's "
-                            f"distinctive terms ({', '.join(_t_anchors[:6])}), but "
-                            f"the corpus does — no alert raised.", "WARN")
+                            f"generated title ({len(text)} chars) shares none of the "
+                            f"topic's distinctive terms "
+                            f"({', '.join(_t_anchors[:6])}), but the corpus does "
+                            f"— no alert raised.", "WARN")
                     text = ""
             if text:
                 _update_firestore_research({"title": text, "updatedAt": int(time.time() * 1000)})
@@ -13257,18 +13272,36 @@ _BUNDLE_UID_KEY_RE = re.compile(
 #: ⛔ IT KNEW `topic=` AND `topic '…'` AND NOTHING ELSE. An unattributed run.log
 #: — which is every fleet run until the attributing wheel ships — holds the JSON
 #: and repr forms too, and those went to support verbatim.
+#:
+#: ⛔⛔ THE BARE `topic` ALTERNATIVE MUST BE FOLLOWED BY A SPACE. Without the
+#: lookahead it read the apostrophe in the English possessive `topic's` as an
+#: opening quote and deleted the line from there to the next apostrophe —
+#: measured on the off-topic diagnostics, which say "none of the topic's
+#: distinctive terms (…)" and lost ninety characters of the sentence a support
+#: engineer opened the archive for. Whether a line survived depended only on
+#: whether a second apostrophe happened to sit on it.
 _BUNDLE_TOPIC_QUOTED_RE = re.compile(
-    r"(?<![\w\-/])([\"']?topic[\"']?[ \t]*[=:]|topic)([ \t]*)"
+    r"(?<![\w\-/])([\"']?topic[\"']?[ \t]*[=:]|topic(?=[ \t]))([ \t]*)"
     r"('(?:[^'\\\n]|\\.)*'|\"(?:[^\"\\\n]|\\.)*\")", re.IGNORECASE)
+#: The keys a bare topic value ends at. A quoted value is left to the rule
+#: above, which is the one that keeps the quotes on.
+#:
+#: ⛔⛔ IT WAS ANY `word=`, AND A SUBJECT CAN CONTAIN ONE. `topic=why E=mc2
+#: changed physics run_id=…` ended the value at `E=`, so `mc2 changed physics`
+#: shipped. These are the keys this program actually prints beside a topic, so
+#: an equals sign inside the subject is no longer a place the value can end —
+#: and an unknown key after one now costs that key, which is the safe direction.
+_BUNDLE_TOPIC_END_KEYS = "run_id|resume_dir|submittedBy|submitted_by|uid|rid"
 #: The same key with an unquoted value — `topic=…`, `topic: …`, the CLI's
-#: `Topic: …` — up to the next `key=` or the end of the line. A quoted value is
-#: left to the rule above, which is the one that keeps the quotes on.
+#: `Topic: …` — up to one of those keys or the end of the line.
 _BUNDLE_TOPIC_BARE_RE = re.compile(
-    r"(?<![\w\-/])(topic[ \t]*[=:])(?![ \t]*['\"])[^\n]*?(?=[ \t]+[A-Za-z_]+=|\n|$)",
+    r"(?<![\w\-/])(topic[ \t]*[=:])(?![ \t]*['\"])[^\n]*?"
+    r"(?=[ \t]+(?:" + _BUNDLE_TOPIC_END_KEYS + r")=|\n|$)",
     re.MULTILINE | re.IGNORECASE)
 #: Lines this program itself wrote into the machine log with a research subject
 #: in them and NO key to find it by — the queued-job pickup, the idle-rescan
-#: orphan claim, and the two NotebookLM rename lines.
+#: orphan claim, the two NotebookLM rename lines, Gemini's sidebar-adoption
+#: recovery, the title-refresh refusal and the off-topic diagnostics.
 #:
 #: ⛔⛔ THE SOURCE LINES NO LONGER CARRY A TOPIC (`_log_job_ref` and the call
 #: sites around it), and this rule exists anyway because a tail is fourteen days
@@ -13276,13 +13309,46 @@ _BUNDLE_TOPIC_BARE_RE = re.compile(
 #: `topic=` pattern can see them — the subject sits after a colon or inside
 #: brackets with no key at all. ⭐ The replacement lines are deliberately NOT of
 #: these shapes, so the research id they carry instead survives this rule.
+#:
+#: ⛔⛔ THE FIRST PASS KNEW FOUR SHAPES AND THERE WERE NINE. Measured on this
+#: owner's live `backend.log`: another member's chat title survived in
+#: `opening owned sidebar chat '…'`, their generated title in `REFUSING the
+#: generated title '…'` and their topic's own distinctive words in
+#: `distinctive terms (…)` — 148 characters of research subject in the tail that
+#: ships. The off-topic diagnostics looked redacted only because the possessive
+#: in "the topic's" was being misread as a quote; fixing that took the accident
+#: away, so they are named here on purpose instead.
+#:
+#: ⛔ THE QUOTED TITLES ARE NOT ESCAPED. These values are interpolated straight
+#: into an f-string, so a title with an apostrophe in it closes the value early
+#: for any `[^']*` rule and ships its tail. An apostrophe followed by a LETTER
+#: is part of the value here, which covers `Bob's …`; the list keeps its own
+#: bracket to the last `]` on the line for the same reason. ⚠ A title whose
+#: apostrophe is followed by a SPACE (`Bobs' divorce`) still ends the value
+#: there and the rest of that title survives — nothing on the line tells the
+#: closing quote from that one. The sources no longer write these lines at all,
+#: so what is left is the fourteen days of them already on disk.
 _BUNDLE_TOPIC_LINE_RE = re.compile(
     r"(?<![\w-])(?:"
     r"(?P<head>(?:Starting queued job:|Renaming notebook to|"
     r"DOM rename OK \(read-back verified\):)[ \t]*)[^\n]*"
     r"|"
     r"(?P<orphan>picking up orphan[ \t]+[^\s(\n]*[ \t]*\()[^)\n]*(?P<close>\))"
+    r"|"
+    r"(?P<terms>distinctive[ \t]+(?:terms|word\(s\))[ \t]*\()[^)\n]*"
+    r"(?P<terms_close>\))"
+    r"|"
+    r"(?P<chats>top recent sidebar chats[ \t]*\[)[^\n]*(?P<chats_close>\])"
+    r"|"
+    r"(?P<named>(?:generated title|opening owned sidebar chat|sidebar entry)"
+    r"[ \t]*)(?P<quote>['\"])"
+    r"(?:(?!(?P=quote))[^\n]|(?P=quote)(?=[A-Za-z]))*(?P=quote)"
     r")")
+#: The bracketing groups of every alternative above but `head`, which runs to the
+#: end of its line. Read by `_topic_line`, so an alternative added to the rule
+#: without a row here would be a crash, not a silent pass-through.
+_BUNDLE_TOPIC_LINE_PAIRS = (("orphan", "close"), ("terms", "terms_close"),
+                            ("chats", "chats_close"))
 #: A queue directory name, `safe_name(topic)_YYYYMMDD_HHMMSS`, wherever it appears.
 _BUNDLE_QUEUE_NAME_RE = re.compile(r"(?<![\w-])[\w-]+_(\d{8}_\d{6})(?![\w-])")
 #: Values a person-key carries that are not a person.
@@ -13381,7 +13447,15 @@ class _BundleRedactor:
         head = m.group("head")
         if head is not None:
             return head + _BUNDLE_TOPIC_MARK
-        return m.group("orphan") + _BUNDLE_TOPIC_MARK + m.group("close")
+        for open_name, close_name in _BUNDLE_TOPIC_LINE_PAIRS:
+            opener = m.group(open_name)
+            if opener is not None:
+                return opener + _BUNDLE_TOPIC_MARK + m.group(close_name)
+        # ⭐ THE QUOTES STAY ON, for the reason `_topic_quoted` gives: these
+        # lines are read back as text, and a bare mark where a quoted title was
+        # reads as the line having been truncated.
+        quote = m.group("quote")
+        return m.group("named") + quote + _BUNDLE_TOPIC_MARK + quote
 
     def _shaped(self, m) -> str:
         return self.swap(m.group(0))
@@ -28293,6 +28367,13 @@ async def brief_topic_gate(brief_text: str, topic: str, *,
 
     anchors = topic_anchors(topic)
     retries_left = max(0, max_retries - retry_count)
+    # ⭐ THE WORDS STAY HERE and are taken out of the BUNDLE instead. They are
+    # the topic's own distinctive words, so they are a research subject, and
+    # `backend.log` is the machine's — but an operator cannot review a rejection
+    # that does not say what was looked for (`test_the_rejection_names_the_terms
+    # _it_looked_for`), and the owner already holds this file. The line that
+    # goes to SUPPORT loses them: `_BUNDLE_TOPIC_LINE_RE` knows the
+    # `distinctive terms (…)` shape. Keep the shape if this wording changes.
     log(f"Phase 1: the brief ({_len} chars) mentions NONE of the topic's "
         f"distinctive terms ({', '.join(anchors[:6])}) — this is not a brief "
         f"for this run's research", "ERROR")
@@ -28383,6 +28464,7 @@ def reject_off_topic_text(text: str, queue_dir, label: str, agent_key: str,
     if not topic or not text_is_off_topic(text, topic):
         return text
     anchors = topic_anchors(topic)
+    # ⭐ THE WORDS STAY, THE BUNDLE LOSES THEM — see the Phase 1 gate above.
     log(f"[{label}] OFF-TOPIC text REJECTED at {op}: {len(text)} chars mention "
         f"none of the topic's distinctive terms ({', '.join(anchors[:6])}) — "
         f"this is not this run's research. Not saving it.", "ERROR")
@@ -28411,6 +28493,7 @@ def _second_opinion_on_agent(text: str, topic: str, agent_key: str,
     verdict = report_second_opinion(text, topic, mid_run_witness_text(agent_key))
     _anchors = topic_anchors(topic)
     if verdict == "drift_corroborated":
+        # ⭐ THE WORDS STAY, THE BUNDLE LOSES THEM — see the Phase 1 gate above.
         log(f"[{label}] SECOND OPINION — the report ({len(text)} chars) mentions "
             f"none of the topic's distinctive terms ({', '.join(_anchors[:6])}), "
             f"AND neither did anything the agent's own panel said while it "
@@ -28486,6 +28569,9 @@ def apply_off_topic_sweep(results: dict, queue_dir) -> "list[str]":
     _t = _run_topic_for_guard(queue_dir)
     _a = topic_anchors(_t)
     if len(_a) < _TOPIC_GUARD_MIN_ANCHORS:
+        # ⭐ THE WORDS STAY, THE BUNDLE LOSES THEM — see the Phase 1 gate above;
+        # the topic itself sits behind its `topic '…'` key, which the bundle
+        # redactor finds, and the word list behind `distinctive word(s) (…)`.
         log(f"[Phase 2] off-topic sweep is INERT this run: topic {_t[:60]!r} yields "
             f"{len(_a)} distinctive word(s) ({', '.join(_a) or 'none'}), below the "
             f"{_TOPIC_GUARD_MIN_ANCHORS} needed to judge anything", "WARN")
@@ -59135,12 +59221,22 @@ async def _gemini_adopt_lost_conversation(page, pasted_text: str, label: str,
     # body actually holds our brief. Never adopt an entry we can't prove is ours.
     _owned = [_t for _t in _titles if _gemini_owns_candidate(_t, pasted_head)]
     if not _owned:
-        log(f"[{label}] top recent sidebar chats {[t[:40] for t in _titles]} do NOT "
+        # ⛔⛔ THE LENGTHS, NEVER THE TITLES — see `_log_job_ref`. A sidebar entry
+        # is another member's chat and its title is their research subject; this
+        # line goes to the machine-wide `backend.log`, whose tail ships in the
+        # OWNER's support bundle. Measured 2026-09-22 in this owner's live log.
+        # What this line is read for is "how many did we see and did the
+        # ownership gate reject all of them", and the lengths distinguish an
+        # empty entry from a real one.
+        log(f"[{label}] top {len(_titles)} recent sidebar chat(s) "
+            f"({[len(t) for t in _titles]} chars) do NOT "
             "match our brief — not adopting (won't hijack a past run)", "WARN")
         return page, False
     for _ci, _cand_title in enumerate(_owned):
-        log(f"[{label}] opening owned sidebar chat '{_cand_title[:60]}' "
-            f"({_ci + 1}/{len(_owned)}) from the sidebar", "WARN")
+        # ⛔ NO TITLE — same reason. The candidate's INDEX is what the attempts
+        # below and the adopt/abandon lines are followed by.
+        log(f"[{label}] opening owned sidebar chat #{_ci + 1}/{len(_owned)} "
+            f"({len(_cand_title)} chars) from the sidebar", "WARN")
         # 2026-07-19 e2e: ONE click + one 15s route-wait abandoned adoption of
         # the CORRECT sole candidate — the wedged SPA (the same platform state
         # that dropped our send and left us on the bare /app home) silently ate
@@ -59164,7 +59260,10 @@ async def _gemini_adopt_lost_conversation(page, pasted_text: str, label: str,
                 _before_u = ""
             try:
                 if not await page.evaluate(_CLICK_ENTRY_BY_TITLE_JS, _cand_title):
-                    log(f"[{label}] sidebar entry '{_cand_title[:40]}' vanished before open — trying next", "WARN")
+                    # ⛔ NO TITLE — see `_log_job_ref`. The index names the same
+                    # candidate the line above opened.
+                    log(f"[{label}] sidebar entry #{_ci + 1} ({len(_cand_title)} chars) "
+                        "vanished before open — trying next", "WARN")
                     _entry_gone = True
                     break
             except Exception:
