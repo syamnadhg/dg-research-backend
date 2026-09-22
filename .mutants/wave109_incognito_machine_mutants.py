@@ -53,7 +53,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SUITES = ("tests/test_incognito_capability_109.py "
           "tests/test_incognito_run_id_and_logs_109.py "
           "tests/test_incognito_machine_skips_109.py "
-          "tests/test_incognito_expiry_109.py")
+          "tests/test_incognito_expiry_109.py "
+          "tests/test_incognito_no_resurrection_109.py")
 RESEARCH = "research.py"
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
@@ -137,6 +138,27 @@ EXPIRE_BASE = "    base = now if now is not None else datetime.now(timezone.utc)
 DOC_EXPIRE = ('                    **({"expireAt": _expire_at} if _expire_at else {}),')
 EVENT_EXPIRE = ('        "expireAt": (_incognito_expire_at(_fb_research_id)\n'
                 "                     or datetime.now(timezone.utc) + timedelta(days=30)),")
+
+# ── anchors: never bringing a purged record back ────────────────────────────
+WRITE_GATE = ("    if not _is_incognito_research(research_id):\n"
+              "        return doc_ref.set(payload, merge=merge)\n"
+              "    return doc_ref.update(_merge_field_paths(payload))")
+PATHS_DESCEND = ("            for inner, inner_value in value.items():\n"
+                 '                out[f"{key}.{inner}"] = inner_value')
+PATHS_GUARD = ("        if (type(value) is dict and value\n"
+               "                and all(isinstance(k, str) and _FIELD_PATH_SEGMENT_RE.match(k)\n"
+               "                        for k in value)\n"
+               "                and _FIELD_PATH_SEGMENT_RE.match(str(key))):")
+CLAIM_ABORT = ("                if _is_incognito_research(research_id):\n"
+               '                    log(f"[start-listener] {research_id[:8]}… keeps nothing and its "')
+# ⛔ `doc.reference.delete()` inside a try appears six times in this file, so the
+# anchor carries the line above it — the one sentence only this branch writes.
+CLAIM_QUEUE_DELETE = ('                        f"recreating it", "WARN")\n'
+                      "                    try:\n"
+                      "                        doc.reference.delete()\n"
+                      "                    except Exception:\n"
+                      "                        pass\n"
+                      "                    continue")
 
 MUTANTS = [
     # ══ the one predicate ══════════════════════════════════════════════════
@@ -304,6 +326,28 @@ MUTANTS = [
      "phase dropdown empties itself",
      [(EVENT_EXPIRE, '        "expireAt": (_incognito_expire_at(_fb_research_id)\n'
                      "                     or datetime.now(timezone.utc) + timedelta(hours=24)),")]),
+
+    # ══ never bringing a purged record back ════════════════════════════════
+    ("C1", "under", "⛔⛔ every write is a set-merge again, so a purged record "
+     "comes back as a fragment with no createdAt — invisible for ever",
+     [(WRITE_GATE, "    return doc_ref.set(payload, merge=merge)")]),
+    ("C2", "over", "every write becomes an update, so the machine loses the "
+     "race the app has not finished creating the record in",
+     [(WRITE_GATE, "    return doc_ref.update(_merge_field_paths(payload))")]),
+    ("C3", "under", "⛔⛔ the nested map rides an update whole, so writing one "
+     "agent's status deletes the other two",
+     [(PATHS_DESCEND, '            out[key] = value')]),
+    ("C4", "over", "a name that needs quoting is spliced into a path unquoted, "
+     "so the write lands on a different field entirely",
+     [(PATHS_GUARD, "        if type(value) is dict and value:")]),
+    ("C5", "under", "⛔⛔ the claim recreates a record that was deleted, which is "
+     "the one thing the promise cannot survive",
+     [(CLAIM_ABORT, "                if False:\n"
+                    '                    log(f"[start-listener] {research_id[:8]}… keeps nothing and its "')]),
+    ("C6", "under", "the abandoned start leaves its queue document, so the "
+     "idle-rescan claims it again on the next pass, for ever",
+     [(CLAIM_QUEUE_DELETE, '                        f"recreating it", "WARN")\n'
+                           "                    continue")]),
 
     ("N13", "under", "the dead-worker reconciler writes the parked patch "
      "directly again, so the two recovery paths disagree",

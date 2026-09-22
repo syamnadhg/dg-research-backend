@@ -16104,7 +16104,28 @@ def start_firestore_start_listener(job_queue, loop):
             # `_update_research_doc` returns False on failure (logs WARN);
             # we then attempt a set(merge=True) as a fallback for the
             # "doc doesn't exist yet" race (FE hasn't created it).
+            #
+            # ⛔⛔ EXCEPT THAT A RUN THAT KEEPS NOTHING ABORTS INSTEAD (wave 10.9,
+            # #536). For an ordinary research this fallback covers a race: the
+            # app is still creating the record. For an incognito one it covers
+            # something else — the record was DELETED, by somebody leaving the
+            # chat or by the fuse burning out while the run waited in a queue —
+            # and recreating it is the one thing the promise cannot survive. The
+            # fragment would carry no `createdAt`, so no list, no sweep and no
+            # TTL could ever find it again.
+            #
+            # ⭐ THE QUEUE DOC GOES WITH IT. Left behind, the idle-rescan would
+            # claim it on the next pass and arrive here again, for ever.
             if not _update_research_doc(uid, research_id, status_payload):
+                if _is_incognito_research(research_id):
+                    log(f"[start-listener] {research_id[:8]}… keeps nothing and its "
+                        f"record is gone — abandoning the start rather than "
+                        f"recreating it", "WARN")
+                    try:
+                        doc.reference.delete()
+                    except Exception:
+                        pass
+                    continue
                 _set_research_doc(uid, research_id, status_payload, merge=True)
             # Delete the queue doc (was: mark processed). Queue subcollection
             # accumulated forever before this — every start request a permanent
@@ -17054,10 +17075,14 @@ def update_link_in_firestore(kind: str, url: str, **fields):
         return
     payload = {"url": url, **fields}
     try:
+        # ⛔ NEVER A CREATE FOR A RUN THAT KEEPS NOTHING — `_write_research_doc`.
+        # This is one of the three machine set-merges that could bring a purged
+        # record back as an invisible fragment.
         _grpc_write_with_heal(
-            lambda: _firebase_db.collection("users").document(_fb_uid)
-                .collection("researches").document(_fb_research_id)
-                .set(_be_payload({"links": {kind: payload}}), merge=True),
+            lambda: _write_research_doc(
+                _firebase_db.collection("users").document(_fb_uid)
+                    .collection("researches").document(_fb_research_id),
+                _be_payload({"links": {kind: payload}}), _fb_research_id),
             what=f"link {kind}",
         )
     except Exception as e:
@@ -17091,10 +17116,15 @@ def append_user_source_in_firestore(kind: str, url: str, label: str = "", phase:
             "phase": phase,
             "ts": int(time.time() * 1000),
         }
+        # ⛔ NEVER A CREATE FOR A RUN THAT KEEPS NOTHING — `_write_research_doc`.
+        # `ArrayUnion` is a sentinel, not a map, so the field-path rewrite leaves
+        # it exactly as it is and an update appends the same way a merge did.
         _grpc_write_with_heal(
-            lambda: _firebase_db.collection("users").document(_fb_uid)
-                .collection("researches").document(_fb_research_id)
-                .set(_be_payload({"userSources": _gcfs.ArrayUnion([entry])}), merge=True),
+            lambda: _write_research_doc(
+                _firebase_db.collection("users").document(_fb_uid)
+                    .collection("researches").document(_fb_research_id),
+                _be_payload({"userSources": _gcfs.ArrayUnion([entry])}),
+                _fb_research_id),
             what=f"userSource {entry['kind']}",
         )
     except Exception as e:
@@ -17249,19 +17279,83 @@ def _update_research_doc(uid: str, research_id: str, updates: dict) -> bool:
         return False
 
 
+#: A field name safe to put on the left of a dot in a Firestore field path.
+#: Anything else (a dot, a backtick, a space) has to be back-quoted, and rather
+#: than build that quoting the write falls back to a whole-map replace.
+_FIELD_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _merge_field_paths(payload: dict) -> dict:
+    """`{"links": {"audio_file": {…}}}` as `{"links.audio_file": {…}}`.
+
+    ⛔⛔ AN `update()` WITH A NESTED MAP AS ONE VALUE REPLACES THAT MAP, deleting
+    every key the new one omits — the exact trap `apply_firestore_update` in the
+    test conftest documents, and the one that erased `needsRestart` when
+    `updateStatus` was written whole. A dotted path merges instead. So a payload
+    that was written as `set(…, merge=True)` keeps meaning the same thing when
+    it is written as an update: `agents.chatgpt` leaves `agents.gemini` alone.
+
+    ⭐ ONE LEVEL, AND ONLY FOR PLAIN MAPS OF SIMPLE NAMES. A sentinel
+    (`DELETE_FIELD`, `ArrayUnion`) is not a dict and passes through untouched; a
+    key that would need back-quoting keeps its whole-map form rather than being
+    spliced into a path this code cannot quote correctly."""
+    out: dict = {}
+    for key, value in (payload or {}).items():
+        if (type(value) is dict and value
+                and all(isinstance(k, str) and _FIELD_PATH_SEGMENT_RE.match(k)
+                        for k in value)
+                and _FIELD_PATH_SEGMENT_RE.match(str(key))):
+            for inner, inner_value in value.items():
+                out[f"{key}.{inner}"] = inner_value
+        else:
+            out[key] = value
+    return out
+
+
+def _write_research_doc(doc_ref, payload: dict, research_id, *, merge: bool = True):
+    """Put `payload` on a research document — and never bring one back.
+
+    ⛔⛔ A `set(…, merge=True)` TO A MISSING DOCUMENT IS A CREATE (wave 10.9,
+    #536). Three writers on this machine and `saveResearch` in the app all
+    set-merge, so a research that was purged — by somebody leaving the chat, by
+    the P5 chain, or by its own fuse — comes back on the next write as a
+    fragment carrying only the merged fields. It has no `createdAt`, and every
+    list in the app orders by `createdAt`, so the fragment is invisible to every
+    screen, every sweep and the TTL itself: a permanent orphan holding whatever
+    that write carried.
+
+    ⭐ THE RULES REFUSE IT TOO, for every wheel ever shipped, because R1 demands
+    `expireAt` on an incognito record and a merge that recreates one carries
+    none. This is the same answer reached a second way, on the machine that can
+    still say something useful about the failure in its own log.
+
+    ⛔ AND IT IS NOT THE ANSWER FOR AN ORDINARY RUN. The set-merge is
+    load-bearing there: the machine writes `backendRunId` on first arrival,
+    sometimes before the app has finished creating the record, and an update
+    would lose that race every time."""
+    if not _is_incognito_research(research_id):
+        return doc_ref.set(payload, merge=merge)
+    return doc_ref.update(_merge_field_paths(payload))
+
+
 def _set_research_doc(uid: str, research_id: str, data: dict, *, merge: bool = True) -> bool:
     """Centralized `set(..., merge=True)` of `users/{uid}/researches/{rid}`
     — the "doc may not exist yet" sibling of `_update_research_doc`. Used
     when writing `backendRunId` on first arrival (before the FE has
     created the doc) and on error-rescue paths where the doc state is
-    uncertain. Same Track D PR-D5a seam as `_update_research_doc`."""
+    uncertain. Same Track D PR-D5a seam as `_update_research_doc`.
+
+    ⛔ EXCEPT FOR A RUN THAT KEEPS NOTHING, which is never created anew — see
+    `_write_research_doc`. `merge` is then moot: the write is an update, which
+    merges by definition and fails rather than resurrecting."""
     if not _firebase_db or not uid or not research_id:
         return False
     try:
         _grpc_write_with_heal(
-            lambda: _firebase_db.collection("users").document(uid)
-                .collection("researches").document(research_id)
-                .set(_be_payload(data), merge=merge),
+            lambda: _write_research_doc(
+                _firebase_db.collection("users").document(uid)
+                    .collection("researches").document(research_id),
+                _be_payload(data), research_id, merge=merge),
             what=f"set research {research_id[:8]}…",
         )
         return True
