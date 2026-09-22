@@ -54,8 +54,9 @@ _DECIDE = """    machine_wanted = (is_owner and _parse_include_machine(data)) if
 
 _NOTHING = """        if not only_runs and not machine_wanted:"""
 
+# Re-anchored 2026-09-21 (#539): the call gained a `keep_uid=` line after this.
 _CLI_BUILD = """        summary = _build_log_bundle(dest, support_code=code, max_runs=n_runs,
-                                    only_runs=only_runs)"""
+                                    only_runs=only_runs,"""
 
 MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     # ══ the flag itself ═══════════════════════════════════════════════
@@ -97,7 +98,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [(_CLI_BUILD,
        "        summary = _build_log_bundle(dest, support_code=code, max_runs=n_runs,\n"
        "                                    only_runs=only_runs,\n"
-       "                                    include_machine=False)")],
+       "                                    include_machine=False,")],
      [T_NEW, T_CLI, T_CLI_OLD]),
 
     # ══ nothing to send ══════════════════════════════════════════════

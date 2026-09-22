@@ -108,8 +108,9 @@ _CONSENT_CALL = """    for line in _send_logs_consent_lines(
             len(only_runs) if only_runs is not None else n_runs,
             chosen_exactly=only_runs is not None):"""
 
+# Re-anchored 2026-09-21 (#539): the call gained a `keep_uid=` line after this.
 _BUILDER_CALL = """        summary = _build_log_bundle(dest, support_code=code, max_runs=n_runs,
-                                    only_runs=only_runs)"""
+                                    only_runs=only_runs,"""
 
 _EXACT_COPY = """        first = ("no runs — this machine's own log files only" if n == 0 else
                  f"the {n} run{'' if n == 1 else 's'} you chose, and only those")"""
@@ -204,7 +205,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      "accepted and ignored — and every stub in the suite takes `**k`, so nothing "
      "else would notice",
      [(_BUILDER_CALL,
-       "        summary = _build_log_bundle(dest, support_code=code, max_runs=n_runs)")],
+       "        summary = _build_log_bundle(dest, support_code=code, max_runs=n_runs,")],
      [T_NEW, T_CLI]),
     ("C3", "under", "the disclosure is printed BEFORE the choice, so the screen "
      "names a number the person has not chosen yet and then builds a different "

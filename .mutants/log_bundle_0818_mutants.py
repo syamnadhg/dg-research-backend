@@ -285,8 +285,10 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_BUNDLE]),
     ("B19", "under", "the archive is stored uncompressed, turning a 700 KB "
      "bundle into 18 MB on a connection that is already the problem",
-     [('    with _zipfile.ZipFile(dest, "w", compression=_zipfile.ZIP_DEFLATED) as zf:',
-       '    with _zipfile.ZipFile(dest, "w") as zf:')],
+     # Re-anchored 2026-09-21 (#539): the archive is now opened through
+     # `_open_private_bundle` (0600) and the ZipFile wraps that handle.
+     [('            _zipfile.ZipFile(fh, "w", compression=_zipfile.ZIP_DEFLATED) as zf:',
+       '            _zipfile.ZipFile(fh, "w") as zf:')],
      [T_BUNDLE]),
 ]
 

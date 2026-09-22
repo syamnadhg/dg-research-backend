@@ -669,17 +669,18 @@ def test_the_retry_reads_the_claim_off_the_armed_sink(monkeypatch):
 
 
 def test_the_new_keys_do_not_leak_into_the_bundle_index(monkeypatch, tmp_path):
-    """⛔⛔ THE PIN MOVED FROM THE ROW TO THE ARCHIVE, ON PURPOSE.
-
-    It used to assert `_scan_run_folders` carried no submitter at all. Wave 8
-    needs it on the row — that is where the intersection reads it — so keeping
-    the old assertion would have meant a second meta read per folder for a
-    property nobody wanted. What actually mattered was never the row: it was
-    that a uid must not travel inside a support bundle. index.json is the thing
-    that ships, so index.json is where the pin belongs.
+    """The row carries the submitter; index.json, built from the row, does not.
 
     ⭐ Asserted against the REAL archive, not against `_INDEX_PRIVATE_KEYS`. A
-    constant can be correct while the comprehension that reads it is not."""
+    constant can be correct while the comprehension that reads it is not.
+
+    ⛔⛔ AND THIS IS NO LONGER THE UID PIN (#541b). It used to claim "a uid must
+    not travel inside a support bundle" while reading index.json ONLY — and the
+    same archive shipped the uid twice beside it, in `meta.json` and in the
+    run.log header, so it could not fail against the leak it named. That claim
+    now lives in `test_no_other_members_uid_or_topic_in_any_bundle_member`,
+    which reads the raw bytes of every member. This keeps only what it measures:
+    the index's keys."""
     import zipfile
 
     _captured_meta(monkeypatch, topic="t",
@@ -691,22 +692,84 @@ def test_the_new_keys_do_not_leak_into_the_bundle_index(monkeypatch, tmp_path):
     assert rows[0]["submitterSource"] == "queue"
 
     dest = tmp_path / "b.zip"
-    research._build_log_bundle(dest, support_code="ABCD2345")
+    research._build_log_bundle(dest, support_code="ABCD2345", keep_uid="UID_ALICE")
     with zipfile.ZipFile(dest) as zf:
         index = json.loads(zf.read("index.json").decode("utf-8"))
     assert index, "the archive's index was empty — this proves nothing"
     for entry in index:
         assert "submitterUid" not in entry
         assert "submitterSource" not in entry
-    assert "UID_ALICE" not in zf_index_text(dest), "a uid reached the archive index"
+    assert "UID_ALICE" not in json.dumps(index), "a uid reached the archive index"
 
 
-def zf_index_text(dest) -> str:
-    """index.json as raw text — a key-name check would miss a uid smuggled in
-    as a VALUE under some other key."""
+@pytest.fixture()
+def two_member_machine(tmp_path, monkeypatch):
+    """#539's fixture: alice owns the machine, bob is a member who ran one too.
+
+    Bob is in his run folder (meta.json, and a run.log that names his tree and
+    his queue — whose directory name is his topic), in the raw tail and in a
+    session: every place a real owner bundle was measured carrying him."""
+    root = tmp_path / "logs"
+    for sub in ("runs", "sessions"):
+        (root / sub).mkdir(parents=True)
+    queues = tmp_path / "queues"
+    monkeypatch.setattr(research, "_logs_root", lambda: root)
+    monkeypatch.setattr(research, "_runs_log_root", lambda: root / "runs")
+    monkeypatch.setattr(research, "_sessions_log_root", lambda: root / "sessions")
+    now = time.time()
+    for name, uid, lines in (
+            ("alice_20260920T000001", "U_ALICE",
+             "Firestore bridge active: users/U_ALICE/researches/rA\n"
+             "Queue: /srv/queues/alices_topic_20260920_000001\n"),
+            ("bob_20260920T000847", "U_BOB",
+             "Firestore bridge active: users/U_BOB/researches/rB\n"
+             "Queue: /srv/queues/bobs_secret_topic_20260920_000847\n")):
+        folder = root / "runs" / name
+        folder.mkdir()
+        (folder / "meta.json").write_text(json.dumps({
+            "schema": 1, "status": "complete", "researchId": name.split("_")[0],
+            "startedUtc": "2026-09-20T00:00:01Z", "submitterUid": uid,
+            "submitterSource": "queue"}), encoding="utf-8")
+        (folder / "run.log").write_text(lines, encoding="utf-8")
+        os.utime(folder / "meta.json", (now, now))
+    both = ("[00:00:01] [INFO] Firestore bridge active: users/U_ALICE/researches/rA\n"
+            "[00:08:47] [INFO] Firestore bridge active: users/U_BOB/researches/rB\n"
+            "[00:08:47] [INFO] Queue: /srv/queues/bobs_secret_topic_20260920_000847\n")
+    (root / "backend.log").write_text(both, encoding="utf-8")
+    (root / "sessions" / "serve_20260920T000000.log").write_text(both, encoding="utf-8")
+    return {"root": root, "queues": queues}
+
+
+def test_no_other_members_uid_or_topic_in_any_bundle_member(two_member_machine,
+                                                            tmp_path):
+    """⛔⛔ #539 + #541b — THE UID PIN, ON EVERY MEMBER'S RAW BYTES.
+
+    Not index.json, not a key name: every file in the archive, byte for byte, so
+    a uid in meta.json, in a run.log header or in a raw tail all fail it alike.
+
+    ⭐ ACCEPT POLARITY IN THE SAME TEST, because "ship nothing" passes every
+    absence: alice's own run is still there and still names her, and the raw
+    tail is still there. And bob's folder is gone rather than merely rewritten —
+    the redactor alone would scrub his uid and still ship his run."""
     import zipfile
+
+    dest = tmp_path / "owner.zip"
+    research._build_log_bundle(dest, support_code="ABCD2345", keep_uid="U_ALICE",
+                               queues_root=two_member_machine["queues"])
     with zipfile.ZipFile(dest) as zf:
-        return zf.read("index.json").decode("utf-8")
+        blobs = {n: zf.read(n) for n in zf.namelist()}
+    for name, data in blobs.items():
+        assert b"U_BOB" not in data, f"another member's uid reached {name}"
+        assert b"bobs_secret_topic" not in data, f"another member's topic reached {name}"
+    assert not any(n.startswith("runs/bob_") for n in blobs), \
+        "another member's run folder was shipped (rewritten is not left out)"
+    alice_log = blobs.get("runs/alice_20260920T000001/run.log")
+    assert alice_log is not None, "the owner's own run is missing — this proves nothing"
+    assert b"users/U_ALICE/researches/rA" in alice_log
+    assert "system/backend.log" in blobs, "the raw tail is missing — this proves nothing"
+    assert b"users/U_ALICE/researches/rA" in blobs["system/backend.log"], \
+        "the owner's own uid was scrubbed from the machine tail"
+    assert json.loads(blobs["collected.json"])["runsOtherMembers"] == 1
 
 
 def test_a_status_patch_preserves_the_submitter(monkeypatch):

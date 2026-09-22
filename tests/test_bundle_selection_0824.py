@@ -207,14 +207,20 @@ def test_a_sharer_bundle_carries_only_their_own_run(machine, tmp_path):
 
 def test_the_owner_bundle_still_carries_the_machine(machine, tmp_path):
     """⭐ THE ACCEPT-POLARITY PIN. An omission that omits everything ships a
-    bundle with no evidence in it, and every assertion above still passes."""
+    bundle with no evidence in it, and every assertion above still passes.
+
+    ⛔⛔ FLIPPED 2026-09-21 (#539): it asserted `runs/bob_` WAS in alice's
+    bundle, which was the leak itself — bob's folder is his uid and his topic,
+    and it reached support on alice's consent. The owner's machine material and
+    the owner's own run still ship; another member's run does not."""
     dest = tmp_path / "owner.zip"
-    research._build_log_bundle(dest, support_code="ABCD2345")
+    research._build_log_bundle(dest, support_code="ABCD2345", keep_uid="U_ALICE")
     names = _members(dest)
     assert any(n.startswith("sessions/") for n in names)
     assert any(n.startswith("system/") for n in names)
     assert any(n.startswith("runs/alice_") for n in names)
-    assert any(n.startswith("runs/bob_") for n in names)
+    assert not any(n.startswith("runs/bob_") for n in names), \
+        "another member's run folder reached the owner's bundle"
 
 
 def test_an_owner_who_ticks_nothing_still_gets_the_machine(machine, tmp_path):
@@ -279,12 +285,24 @@ def test_a_bogus_folder_name_reaches_no_path(machine, tmp_path):
     assert not any(n.startswith("runs/") for n in _members(dest))
 
 
-def test_the_default_call_is_byte_for_byte_the_old_behaviour(machine, tmp_path):
-    """⛔ EVERY PRE-WAVE-8 CALLER STILL GOES THROUGH THIS FUNCTION. If the new
-    keywords changed what they get, the terminal command and the device handler
-    would both quietly start shipping something else."""
+def test_a_call_that_names_no_owner_keeps_no_attributed_run(machine, tmp_path):
+    """⛔ EVERY PRE-WAVE-8 CALLER STILL GOES THROUGH THIS FUNCTION, so what the
+    bare call does is a decision, not a leftover.
+
+    ⛔⛔ FLIPPED 2026-09-21 (#539). This was `..._is_byte_for_byte_the_old_
+    behaviour` and asserted `runCount == 2` — both members' runs in a bundle
+    that named no owner at all. The bare call now keeps NOBODY: a caller that
+    forgets `keep_uid` (or an unpaired terminal) collects less, never more. The
+    machine material still ships, redacted, so the pairing-failure case keeps
+    its evidence; both real callers pass the owner."""
     dest = tmp_path / "d.zip"
     summary = research._build_log_bundle(dest, support_code="ABCD2345")
-    assert summary["runCount"] == 2
+    assert summary["runCount"] == 0
+    assert summary["runsOtherMembers"] == 2
     assert summary["sessionCount"] == 1
     assert summary["machineIncluded"] is True
+
+    owner = research._build_log_bundle(tmp_path / "o.zip", support_code="ABCD2345",
+                                       keep_uid="U_ALICE")
+    assert owner["runCount"] == 1
+    assert owner["runsOtherMembers"] == 1

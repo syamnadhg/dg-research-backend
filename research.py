@@ -3649,6 +3649,31 @@ def _queue_owner_map(queues_root=None) -> "dict[str, str]":
     return out
 
 
+def _queue_dir_owner_map(queues_root=None) -> "dict[str, str]":
+    """queue directory NAME → uid, from the same `owner.json` as above.
+
+    ⭐ Keyed by the directory, not the research, because that is the form a log
+    line carries it in: `queues/<topic-slug>_<ts>` and `run_id=<topic-slug>_<ts>`.
+    The support bundle's redactor asks one question of it — is this queue the
+    kept person's? — and a directory with no readable owner is NOT, so a swept
+    queue loses its topic slug rather than keeping it on a guess."""
+    out: "dict[str, str]" = {}
+    base = Path(queues_root) if queues_root is not None else (Path(__file__).parent / "queues")
+    try:
+        entries = [d for d in base.iterdir() if d.is_dir()]
+    except OSError:
+        return out
+    for d in entries:
+        try:
+            owner = json.loads((d / "owner.json").read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        uid = str(owner.get("uid") or "").strip() if isinstance(owner, dict) else ""
+        if uid:
+            out[d.name] = uid
+    return out
+
+
 def _render_cloud_log(docs) -> str:
     """Turn the cloud's captured records into one file for the run folder.
 
@@ -10825,11 +10850,15 @@ def _handle_send_logs_command(data: dict, device_id: str, limited: bool = False,
             # because it is everything the machine has ever done for everyone who
             # uses it. Same reasoning as the sink-side consent check: a flag the
             # app sets is a flag a future caller can set differently.
+            # ⛔ `keep_uid` IS THE DEVICE'S OWNER, whoever pressed: support may
+            # see the owner's identity in the machine's own material and nobody
+            # else's (#539). A sharer's scoped bundle keeps its requester anyway.
             summary = _build_log_bundle(
                 dest, support_code=code, max_runs=runs,
                 only_runs=only_runs,
                 requester_uid=(submitted_by if selected else None),
-                include_machine=machine_wanted)
+                include_machine=machine_wanted,
+                keep_uid=owner_uid)
             # ⛔⛔ THE MACHINE'S OWN LOG SAID "received" AND "bundle uploaded (N
             # bytes)" AND NOTHING ELSE. Eleven facts went to Firestore and one
             # reached the log — so the artefact a support engineer opens FIRST,
@@ -12299,6 +12328,8 @@ def _scan_run_folders(root=None) -> "list[dict]":
 # identifier: it is the one thing in the row that names a PERSON rather than a
 # run, and the archive already travels to us with the owner's consent for the
 # machine, not with every submitter's consent for their identity.
+# ⛔ This covers index.json ONLY. The files beside it are held to the same rule
+# by `_split_other_members_runs` and `_BundleRedactor` (#539).
 _INDEX_PRIVATE_KEYS = ("dir", "submitterUid", "submitterSource")
 
 
@@ -12919,8 +12950,9 @@ def _clear_local_logs(root=None, telemetry_root=None) -> dict:
 
     ⭐ THE COLLECTOR'S SOURCES ARE NOT A GUESS, and that is the whole reason this
     lives beside the collector instead of next to the command that calls it.
-    `_build_log_bundle` reads exactly three places — the `runs/` folders,
-    `_select_bundle_sessions()` and `_system_log_tails()` — so clearing those
+    `_build_log_bundle` collects from exactly three places — the `runs/` folders,
+    `_select_bundle_sessions()` and `_system_log_tails()` (it also READS each
+    queue's `owner.json`, to redact, and ships none of it) — so clearing those
     three IS "there is nothing left here to send", and the test proves it by
     BUILDING a bundle afterwards rather than by re-reading this list. A clear
     defined by its own inventory drifts the moment the collector grows a fourth
@@ -13116,11 +13148,166 @@ def _pick_selected_runs(rows, only_runs, requester_uid=None,
     }
 
 
+# ─── Other members' identities, in a bundle that is not theirs (#539) ──
+# ⛔⛔ `_INDEX_PRIVATE_KEYS` KEPT THE UID OUT OF index.json AND NOTHING ELSE DID.
+# MEASURED 2026-09-21 in three real owner bundles: the same archive carried a
+# second member's uid in their run's `meta.json` and `run.log`, and uids and
+# topics in the sessions and raw tails as `users/<uid>/`, `audio/<uid>/`,
+# `o/logs%2F<uid>%2F…`, `ownerUid='<uid>'`, `submittedBy=<prefix>`, `topic='…'`,
+# and `queues/<topic-slug>_<ts>` / `run_id=<topic-slug>_<ts>`. The owner agreed
+# to send their machine; nobody else agreed to send who they are.
+#
+# ⚠ WHAT THIS DOES NOT REMOVE, said once: a run's own narration still names its
+# subject in places no pattern can know (a source title, an agent's answer). The
+# tails are owner-only for that reason already; what goes here is the link from
+# that content to a PERSON, and the topic in the fields that exist to carry one.
+
+#: A Firebase Auth uid: 28 letters and digits, and real ones mix all three
+#: classes — which keeps hex digests and long CamelCase words out. `%2F` counts
+#: as a boundary because Storage URLs encode the object path.
+_BUNDLE_UID_SHAPE_RE = re.compile(
+    r"(?:(?<![A-Za-z0-9])|(?<=%2F)|(?<=%2f))"
+    r"(?=[A-Za-z0-9]*[0-9])(?=[A-Za-z0-9]*[a-z])(?=[A-Za-z0-9]*[A-Z])"
+    r"[A-Za-z0-9]{28}(?![A-Za-z0-9])")
+#: `users/<uid>` — a Firestore path, whatever the uid looks like.
+_BUNDLE_USERS_PATH_RE = re.compile(
+    r"(?:(?<![A-Za-z0-9])|(?<=%2F)|(?<=%2f))(users(?:/|\\|%2F|%2f))([A-Za-z0-9_-]+)")
+#: A key that names a person: anything ending in uid/Uid/UID (never `uuid`), the
+#: command's `submittedBy`, and the `*_owner` keys the ownership checks print.
+#: The value may be a whole uid or the `uid[:8]` prefix the logs usually print.
+_BUNDLE_UID_KEY_RE = re.compile(
+    r"(?<![A-Za-z0-9_])"
+    r"([A-Za-z_]*?(?:(?<![Uu])(?:uid|Uid|UID)|_owner|submittedBy|submitted_by))"
+    r"([\"']?\s*[=:]\s*[\"']?)([A-Za-z0-9_-]+)")
+#: `topic='…'` / `topic "…"` as a repr, and a bare `topic=…` up to the next key.
+_BUNDLE_TOPIC_QUOTED_RE = re.compile(
+    r"(?<![\w-])(topic)(=|[ \t]+)('(?:[^'\\\n]|\\.)*'|\"(?:[^\"\\\n]|\\.)*\")")
+_BUNDLE_TOPIC_BARE_RE = re.compile(
+    r"(?<![\w-])(topic=)(?!['\"])[^\n]*?(?=[ \t]+[A-Za-z_]+=|\n|$)", re.MULTILINE)
+#: A queue directory name, `safe_name(topic)_YYYYMMDD_HHMMSS`, wherever it appears.
+_BUNDLE_QUEUE_NAME_RE = re.compile(r"(?<![\w-])[\w-]+_(\d{8}_\d{6})(?![\w-])")
+#: Values a person-key carries that are not a person.
+_BUNDLE_UID_NON_VALUES = frozenset(
+    {"None", "none", "null", "True", "False", "true", "false", "unknown"})
+_BUNDLE_TOPIC_MARK = "<topic removed>"
+
+
+class _BundleRedactor:
+    """One per bundle: every member that is not provably the kept person's own
+    goes through `data()`, so the aliases agree across files.
+
+    ⭐ PSEUDONYMS, NOT DELETION. `member-1` is the same person in every file of
+    this archive, so a reader can still follow one person's request from the
+    listener to the pipeline — and the numbering is per-archive, so it can never
+    be joined against another bundle or hashed back to an account.
+
+    ⛔ `keep_uid=None` KEEPS NOBODY. An unpaired machine has no owner to spare,
+    and resolving that doubt toward collecting less is this collector's rule."""
+
+    def __init__(self, keep_uid=None, known_uids=(), owned_queues=()):
+        keep = keep_uid.strip() if isinstance(keep_uid, str) else ""
+        self.keep = keep or None
+        self.owned_queues = frozenset(owned_queues)
+        self.aliases: "dict[str, str]" = {}
+        self._alias_names: "set[str]" = set()
+        self._known = sorted({str(u).strip() for u in known_uids
+                              if u and str(u).strip() and str(u).strip() != self.keep},
+                             key=len, reverse=True)
+        self._known_re = re.compile(
+            r"(?:(?<![A-Za-z0-9])|(?<=%2F)|(?<=%2f))(?:"
+            + "|".join(re.escape(u) for u in self._known)
+            + r")(?![A-Za-z0-9])") if self._known else None
+
+    def _is_kept(self, value: str) -> bool:
+        # The logs print `uid[:8]`, so a long enough prefix of the kept uid is
+        # the kept person too.
+        return self.keep is not None and (
+            value == self.keep or (len(value) >= 6 and self.keep.startswith(value)))
+
+    def swap(self, value: str) -> str:
+        """The kept person's id unchanged; anyone else's as `member-N`."""
+        if self._is_kept(value) or value in self._alias_names:
+            return value
+        key = value
+        if len(value) >= 6:
+            key = next((u for u in self._known if u.startswith(value)), value)
+        alias = self.aliases.get(key)
+        if alias is None:
+            alias = f"member-{len(self.aliases) + 1}"
+            self.aliases[key] = alias
+            self._alias_names.add(alias)
+        return alias
+
+    def _queue(self, m) -> str:
+        return m.group(0) if m.group(0) in self.owned_queues else m.group(1)
+
+    def _keyed(self, m) -> str:
+        value = m.group(3)
+        if value in _BUNDLE_UID_NON_VALUES:
+            return m.group(0)
+        return m.group(1) + m.group(2) + self.swap(value)
+
+    def text(self, s: str) -> str:
+        s = _BUNDLE_QUEUE_NAME_RE.sub(self._queue, s)
+        s = _BUNDLE_TOPIC_QUOTED_RE.sub(r"\1\2" + _BUNDLE_TOPIC_MARK, s)
+        s = _BUNDLE_TOPIC_BARE_RE.sub(r"\1" + _BUNDLE_TOPIC_MARK, s)
+        s = _BUNDLE_USERS_PATH_RE.sub(lambda m: m.group(1) + self.swap(m.group(2)), s)
+        s = _BUNDLE_UID_KEY_RE.sub(self._keyed, s)
+        if self._known_re is not None:
+            s = self._known_re.sub(lambda m: self.swap(m.group(0)), s)
+        return _BUNDLE_UID_SHAPE_RE.sub(lambda m: self.swap(m.group(0)), s)
+
+    def data(self, raw: bytes) -> bytes:
+        # surrogateescape round-trips any byte that is not UTF-8, so a file the
+        # rules find nothing in comes back byte-identical.
+        return self.text(raw.decode("utf-8", "surrogateescape")).encode(
+            "utf-8", "surrogateescape")
+
+
+def _split_other_members_runs(rows, keep_uid) -> "tuple[list, int]":
+    """The run rows a bundle for `keep_uid` may carry, and how many it may not.
+
+    ⛔⛔ ATTRIBUTED TO SOMEBODY ELSE MEANS LEFT OUT, and only counted. The old
+    argument for shipping every folder — the owner already holds these files —
+    covers the owner, not support: a folder is a person's uid (meta.json, the
+    run.log header) and their topic (the queue path) in one piece. A member sends
+    their own runs through the selected action.
+
+    ⭐ UNATTRIBUTED RUNS STAY — that is every fleet run until the wheel carrying
+    `submitterUid` is published — and they go through the redactor instead,
+    because nothing proves they are the kept person's. `keep_uid=None` keeps no
+    attributed run at all."""
+    keep = keep_uid.strip() if isinstance(keep_uid, str) else ""
+    kept, others = [], 0
+    for row in rows:
+        uid = row.get("submitterUid")
+        if uid and uid != keep:
+            others += 1
+            continue
+        kept.append(row)
+    return kept, others
+
+
+def _open_private_bundle(dest):
+    """The archive's file, created 0600 — and re-chmodded, because `O_CREAT`'s
+    mode does nothing to a file that already exists.
+
+    ⛔ It was `-rw-r--r--` in a 0755 `logs/outgoing`: every other account on the
+    computer could read a whole-machine bundle."""
+    fd = os.open(str(dest), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.chmod(str(dest), 0o600)
+    except OSError:
+        pass
+    return os.fdopen(fd, "wb")
+
+
 def _build_log_bundle(dest_path, support_code=None, now=None,
                       max_runs=BUNDLE_MAX_RUNS, max_age_days=BUNDLE_MAX_AGE_DAYS,
                       max_bytes=BUNDLE_MAX_BYTES,
                       only_runs=None, requester_uid=None,
-                      include_machine=True) -> dict:
+                      include_machine=True, keep_uid=None,
+                      queues_root=None) -> dict:
     """Write the support bundle to `dest_path`. Returns a summary dict.
 
     Order inside the archive is the order a reader needs it: the manifest and
@@ -13134,10 +13321,16 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
     terminal and every pre-Wave-8 caller still get.
 
     ⭐ `requester_uid` — scope the selection to runs attributed to this person.
-    `None` means "no attribution filter", which is the OWNER AT THE MACHINE: they
-    already hold every one of these files on their own disk, so filtering grants
-    nothing and would only hide the unattributed runs from the one person who
-    can act on them.
+    `None` means the selection is not scoped to a requester — the owner's
+    bundle — and then `keep_uid` decides whose runs and identity it carries.
+
+    ⛔⛔ `keep_uid` — the machine owner (#539). The owner holds every file on
+    this disk, but the archive goes to SUPPORT, and that argument covers the
+    owner, not support. So an owner's bundle leaves out runs attributed to
+    anybody else (counted as `runsOtherMembers`, never named), and every member
+    that is not provably the kept person's own — unattributed runs, sessions,
+    the raw tails — goes through ONE `_BundleRedactor`. `None` keeps nobody.
+    A scoped bundle keeps its requester instead: every run in it is theirs.
 
     ⛔⛔ `include_machine=False` is what makes a sharer's bundle honest. MEASURED
     on this machine: `backend.log` carries 18 distinct research ids and 15 topics
@@ -13154,15 +13347,34 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
     dest = Path(dest_path)
     dest.parent.mkdir(parents=True, exist_ok=True)
     rows = _scan_run_folders()
+    # ⛔⛔ WHOSE IDENTITY MAY STAY IN THIS ARCHIVE, decided once. A scoped bundle
+    # is its requester's; any other is the machine owner's.
+    own_uid = requester_uid if requester_uid is not None else keep_uid
     if only_runs is None:
-        selected = _select_bundle_runs(rows, max_runs=max_runs,
+        # Other members' runs leave BEFORE the count bound, so the owner still
+        # gets up to N runs of their own rather than N minus everyone else's.
+        candidates, other_members = _split_other_members_runs(rows, own_uid)
+        selected = _select_bundle_runs(candidates, max_runs=max_runs,
                                        max_age_days=max_age_days, now=now)
         selection_report = {}
     else:
         selected, selection_report = _pick_selected_runs(
             rows, only_runs, requester_uid=requester_uid, max_runs=max_runs)
+        # AFTER the pick, so a ticked foreign run is counted here and never
+        # named in `runsNotOnDisk`. A no-op on a scoped pick, which has already
+        # refused everything not attributed to its requester.
+        selected, other_members = _split_other_members_runs(selected, own_uid)
     sessions = (_select_bundle_sessions(max_age_days=max_age_days, now=now)
                 if include_machine else [])
+    # ⭐ The owner.json map is read, never archived: it answers "whose queue is
+    # this" and "which uids exist here", and neither answer ships.
+    queue_owners = _queue_dir_owner_map(queues_root)
+    redactor = _BundleRedactor(
+        own_uid,
+        known_uids=[r.get("submitterUid") for r in rows] + list(queue_owners.values()),
+        owned_queues=[name for name, uid in queue_owners.items()
+                      if own_uid and uid == own_uid])
+    redacted: "list[str]" = []
 
     written = 0
     dropped_runs: "list[str]" = []
@@ -13175,25 +13387,43 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
     # and the only honest place for it is beside the bytes it explains.
     tail_stats: "dict[str, dict]" = {}
 
-    def _add_file(zf, source, arcname) -> bool:
+    def _add_file(zf, source, arcname, redact) -> bool:
         """Allowlist, then write, then account. ⛔ There is deliberately NO
         per-file size check here: the cap decides per RUN and per SESSION GROUP
         above, and a second per-file check was proved unreachable by mutation —
-        dead code that reads as protection is worse than none."""
+        dead code that reads as protection is worse than none.
+
+        ⛔ `redact` IS REQUIRED, NOT DEFAULTED, so every call site has to say
+        whether this member is provably the kept person's own. A default of
+        "no" is how a new source would ship unredacted without anyone deciding."""
         nonlocal written
         src = Path(source)
         if not _bundle_source_is_allowed(src):
             refused.append(str(src))
             return False
+        if not redact:
+            try:
+                size = src.stat().st_size
+            except OSError:
+                return False
+            try:
+                zf.write(str(src), arcname)
+            except OSError:
+                return False
+            written += size
+            return True
         try:
-            size = src.stat().st_size
+            raw = src.read_bytes()
+            # from_file keeps the member's own mtime, as `zf.write` would.
+            info = _zipfile.ZipInfo.from_file(str(src), arcname)
         except OSError:
             return False
-        try:
-            zf.write(str(src), arcname)
-        except OSError:
-            return False
-        written += size
+        info.compress_type = _zipfile.ZIP_DEFLATED
+        data = redactor.data(raw)
+        if data != raw:
+            redacted.append(arcname)
+        zf.writestr(info, data)
+        written += len(data)
         return True
 
     def _add_bytes(zf, data, arcname) -> None:
@@ -13201,7 +13431,8 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
         zf.writestr(arcname, data)
         written += len(data)
 
-    with _zipfile.ZipFile(dest, "w", compression=_zipfile.ZIP_DEFLATED) as zf:
+    with _open_private_bundle(dest) as fh, \
+            _zipfile.ZipFile(fh, "w", compression=_zipfile.ZIP_DEFLATED) as zf:
         index = [{k: v for k, v in row.items() if k not in _INDEX_PRIVATE_KEYS}
                  for row in selected]
         _add_bytes(zf, json.dumps({
@@ -13248,10 +13479,13 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
             if not newest and written + folder_bytes > int(max_bytes):
                 dropped_runs.append(row["name"])
                 continue
+            # ⭐ Verbatim only when the folder is attributed to the kept person —
+            # an unattributed one could be anybody's, so it is redacted.
+            redact_run = not (own_uid and row.get("submitterUid") == own_uid)
             added_any = False
             for member in members:
                 arc = f"runs/{row['name']}/{member.relative_to(folder).as_posix()}"
-                if _add_file(zf, member, arc):
+                if _add_file(zf, member, arc, redact_run):
                     added_any = True
             (included_runs if added_any else dropped_runs).append(row["name"])
 
@@ -13270,7 +13504,8 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
                 continue
             added_any = False
             for member in members:
-                if _add_file(zf, member, f"sessions/{member.name}"):
+                # A session is the machine's, never provably one person's.
+                if _add_file(zf, member, f"sessions/{member.name}", True):
                     added_any = True
             if added_any:
                 session_count += 1
@@ -13292,6 +13527,12 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
             data = _tail_bytes(path, stats=stats)
             if not data:
                 continue
+            # Everyone who uses the machine is in these, so every tail is
+            # redacted — before the size check, which must see what ships.
+            clean = redactor.data(data)
+            if clean != data:
+                redacted.append(f"system/{path.name}")
+            data = clean
             # ⛔ SAY IT IN THE FILE, not only in the manifest. A reader who opens
             # `system/backend.log` and finds no health probes in five megabytes
             # would conclude the probes stopped — which is a diagnosis, and a
@@ -13313,6 +13554,11 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
             "systemTailFilter": tail_stats,
             "uncompressedBytes": written,
             "machineIncluded": bool(include_machine),
+            # ⛔ A COUNT, NEVER NAMES — a folder name is a research id. And the
+            # members a redactor rewrote are named, so a reader who meets
+            # `member-2` or `<topic removed>` knows it was done on purpose.
+            "runsOtherMembers": other_members,
+            "filesRedacted": redacted,
             # Empty when no selection was made. Present and specific when one
             # was, because "you ticked six and got four" is a fact the person
             # is owed and only this function knows.
@@ -13336,6 +13582,12 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
         "requesterScoped": requester_uid is not None,
         "machineIncluded": bool(include_machine),
         **selection_report,
+        # ⛔⛔ NOT FOR THE logBundles ROW YET. The rules' `hasOnly` on that row
+        # refuses an unknown key, and it refuses the WHOLE write — the bundle
+        # would stall at 'collecting'. Both row writers pick their keys by name,
+        # so this reaches the zip (collected.json) and the terminal only; wire
+        # it onto the row in the same change as the rules deploy that allows it.
+        "runsOtherMembers": other_members,
         "sizeBytes": dest.stat().st_size if dest.exists() else 0,
         "uncompressedBytes": written,
         "runCount": len(included_runs),
@@ -83980,8 +84232,12 @@ def cmd_send_logs(assume_yes: bool = False, email: "str | None" = None,
 
     # ── Rung 0: the file. Always, first, and printed. ──
     try:
+        # ⛔ THE PAIRED UID, read from this machine's own config: the terminal
+        # has no Firestore to ask who owns the device. An unpaired machine gets
+        # None, and the builder then keeps nobody's identity (#539).
         summary = _build_log_bundle(dest, support_code=code, max_runs=n_runs,
-                                    only_runs=only_runs)
+                                    only_runs=only_runs,
+                                    keep_uid=load_paired_uid())
     except Exception as exc:
         print(f"  {_c(_WARN, '⚠')}  Could not build the log bundle: {exc}")
         print(f"  {_c(_DIM, 'The raw logs are still here:')}  "
@@ -83997,6 +84253,10 @@ def cmd_send_logs(assume_yes: bool = False, email: "str | None" = None,
         # ⛔ Never a silent truncation: a bundle that quietly dropped the run
         # somebody is asking about reads as complete coverage.
         print(f"     {_c(_DIM, f'{_n_dropped} older item(s) left out for size')}")
+    _n_others = int(summary.get("runsOtherMembers") or 0)
+    if _n_others:
+        # The same rule for the #539 omission: fewer runs than asked, said.
+        print(f"     {_c(_DIM, f'{_n_others} run(s) left out — another member ran them')}")
     print()
 
     landed_via = None
