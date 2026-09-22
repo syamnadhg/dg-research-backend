@@ -2673,6 +2673,148 @@ def _owner_control_refused(data, where: str) -> bool:
     return True
 
 
+def _refuse_owner_control(doc, data, where: str) -> bool:
+    """Refuse a cross-person queue doc: drop it and say so. True when refused.
+
+    ⛔⛔ THE WHOLE REFUSAL, NOT JUST THE VERDICT, and round three of cross-verify
+    is why. The two dispatch branches each carried their own copy of
+    `if _owner_control_refused(...): delete; continue`, and the tests pinned
+    them by searching the branch's parse tree for the NAME. I built the two
+    mutants myself and ran the suite's own logic against them: wrapping the call
+    as `if False and _owner_control_refused(...)` stayed green, and so did
+    keeping the call and replacing its body with a log — which is this wave's
+    founding defect, verbatim, back in the tree with every assertion passing.
+    A helper that performs the refusal can be EXECUTED against a fake document
+    and asked whether the delete actually fired.
+    """
+    if not _owner_control_refused(data, where):
+        return False
+    try:
+        doc.reference.delete()
+    except Exception:
+        pass
+    return True
+
+
+def _job_is_another_persons(job, target_uid: str) -> bool:
+    """Does this in-flight job belong to somebody other than the named person?
+
+    ⛔⛔ THE HALF THE IDENTITY GUARD CANNOT SEE, found by round three. Both
+    layers of the owner-control fix ask the same question — does `uid` disagree
+    with `submittedBy` — and neither asks whether the `researchId` belongs to
+    `uid`. So a member of a shared computer signs honestly as themselves and
+    names somebody else's run: no divergence, the rule passes, the machine's
+    guard passes, and the cancel handler matches its target on `research_id`
+    ALONE. It then requests a stop, touches `.stop` — which is permanent, and
+    as of this wave every later Resume is answered "This run was stopped for
+    good" — and schedules the exit. The status write lands in the ATTACKER's
+    own tree, so the victim is told nothing at all. The material is published:
+    `queueOwners` carries `{uid, runId}` and every sharer may read the device
+    document whole.
+
+    ⭐ THE JOB ITSELF CARRIES THE ANSWER. `_safe_enqueue` refuses anything with
+    no uid, so a running job always names its owner — this is a lookup, not a
+    round trip.
+
+    ⛔ ABSENT IS NOT DISAGREEING, the same rule the identity guards state: a job
+    dict with no uid is a shape from before that gate and is left alone.
+    """
+    owner = str((job or {}).get("uid") or "").strip()
+    wanted = str(target_uid or "").strip()
+    return bool(owner and wanted and owner != wanted)
+
+
+def _another_persons_run_locally(jobs, research_id: str, target_uid: str) -> bool:
+    """True when any job this process knows about for `research_id` is somebody
+    else's.
+
+    ⭐ ONE GATE, NOT FIVE. The cancel handler matches its target in five places
+    — the gate-pending job, the running job, both of their race re-checks, and
+    the deque scan — and a check added to some of them is not a check. Asking
+    once, before anything is stopped or written, also covers the branch with no
+    local job at all: the deferred path deletes the START doc and flips the
+    research status for a run this process never held.
+    """
+    rid = str(research_id or "").strip()
+    if not rid:
+        return False
+    for j in jobs or ():
+        if str((j or {}).get("research_id") or "").strip() != rid:
+            continue
+        if _job_is_another_persons(j, target_uid):
+            return True
+    return False
+
+
+def _refuse_foreign_run(doc, jobs, research_id: str, target_uid: str,
+                        where: str) -> bool:
+    """Refuse a cancel aimed at somebody else's run: drop it and say so.
+
+    ⛔⛔ A MUTANT SURVIVED THE FIRST VERSION OF THIS, and it is the same disease
+    the guard beside it was extracted to cure. The branch read
+    `if _another_persons_run_locally(...)` and the test asked whether that NAME
+    appeared in the branch and whether its line came before `request_stop`.
+    Wrapping the call as `if False and _another_persons_run_locally(...)` keeps
+    the name, keeps the line number and keeps the ordering — so the test passed
+    while the victim's run was stopped anyway. Name-presence in a parse tree is
+    not a measurement of what a branch DOES; that is the third time this wave
+    has paid for the lesson.
+
+    ⭐ SO THE REFUSAL IS PERFORMED HERE, where a test can hand it a fake
+    document and ask whether the delete actually fired — and the consumer is
+    pinned on its SHAPE (a bare call, a bare `continue`) rather than on the
+    words it contains.
+    """
+    if not _another_persons_run_locally(jobs, research_id, target_uid):
+        return False
+    log(f"[{where}] refusing cancel of {str(research_id)[:8]}… — the run this "
+        f"names belongs to another person on this computer", "WARN")
+    try:
+        doc.reference.delete()
+    except Exception:
+        pass
+    return True
+
+
+def _corroborated_run_id(claimed_run_id: str, research_id: str) -> str:
+    """A client-supplied `backendRunId`, kept only if the disk agrees it is this
+    research's run. Returns "" when it cannot be corroborated as belonging
+    elsewhere, which sends the caller to the research document instead.
+
+    ⛔⛔ THE FIELD IS READ STRAIGHT OFF THE QUEUE DOCUMENT ON PURPOSE — that is
+    how a synth user who cannot read the research doc still resumes — so
+    nothing upstream checks that the run it names is the research it names.
+    Unchecked it resumes another person's run directory under this person's
+    research, clearing their `.no_auto_retry` and their `.pause` on the way.
+
+    ⛔⛔ AND THE FIRST VERSION WAS AN `if` INSIDE THE LISTENER, WHICH A MUTANT
+    SURVIVED: `if False and backend_run_id:` left every name the test looked
+    for exactly where it was. Extracted, the decision can be EXECUTED against a
+    real directory — and the caller assigns from it unconditionally, so there
+    is no branch left to neuter.
+
+    ⭐ SILENCE FROM THE DISK IS NOT A REFUSAL. A directory with no readable
+    `owner.json` is the ordinary pre-owner.json shape and keeps its claim; only
+    a directory that positively names a DIFFERENT research loses it.
+    """
+    claimed = str(claimed_run_id or "").strip()
+    rid = str(research_id or "").strip()
+    if not claimed or not rid:
+        return claimed
+    try:
+        owner = json.loads(
+            (Path(__file__).parent / "queues" / claimed / "owner.json")
+            .read_text(encoding="utf-8"))
+    except Exception:
+        return claimed
+    owns = str((owner or {}).get("researchId") or "").strip()
+    if owns and owns != rid:
+        log(f"Resume: payload named run {claimed} for {rid[:8]}… but that run "
+            f"belongs to {owns[:8]}… — ignoring the claim", "WARN")
+        return ""
+    return claimed
+
+
 def _start_doc_identity_conflict(data) -> "tuple[str, str] | None":
     """(tree uid, pinned writer) when a queue START doc's two identities
     disagree, else None.
@@ -13782,7 +13924,18 @@ def start_firestore_start_listener(job_queue, loop):
                     f"age={_age_ms // 1000}s — deleting",
                     "INFO",
                 )
-                if data.get("action") == "resume":
+                # ⛔⛔ AND THIS WRITE IS SIXTY LINES ABOVE THE LINE THAT READS
+                # `action`, so it reached a named person's research document
+                # before either owner-control layer was consulted — the one path
+                # where the machine's guard and the Firestore rule are not two
+                # layers but one. In the window the rule's own docstring exists
+                # for (rules deploy in a command, a machine upgrades when its
+                # owner chooses), a resume doc naming somebody else's tree put
+                # `lastError`, `resumeDropReason` and its stamp into their
+                # document — and this wave taught the card to prefer that reason
+                # for every recovery status.
+                if (data.get("action") == "resume"
+                        and not _owner_control_refused(data, "stale-sweep")):
                     _resume_drop_writeback(
                         data.get("uid") or "", data.get("researchId") or "",
                         RESUME_DROP_WENT_STALE, status=None)
@@ -13855,9 +14008,7 @@ def start_firestore_start_listener(job_queue, loop):
             # actively-running job is handled by its own per-run command
             # listener, not here.
             if action == "cancel":
-                if _owner_control_refused(data, "start-listener"):
-                    try: doc.reference.delete()
-                    except Exception: pass
+                if _refuse_owner_control(doc, data, "start-listener"):
                     continue
                 target_rid = data.get("researchId", "")
                 target_uid = data.get("uid", "")
@@ -13888,6 +14039,28 @@ def start_firestore_start_listener(job_queue, loop):
                 # actually cancels now, so no "couldn't cancel" message
                 # path is needed.)
                 current = _QUEUE_STATE.get("current_job") or {}
+                # ⛔⛔ AND THE RUN HAS TO BE THE ONE THEY NAMED, which neither
+                # the rule nor the identity guard can tell. Both of those ask
+                # whether `uid` disagrees with `submittedBy`; a member of a
+                # shared computer signs honestly as themselves and puts
+                # SOMEBODY ELSE'S researchId in the doc, and every match below
+                # keys on `research_id` alone. That stopped the victim's run,
+                # left a permanent `.stop` behind it, and wrote the status into
+                # the sender's own tree so the victim was never told. Their
+                # researchId is on the device document every member may read.
+                #
+                # ⭐ ASKED ONCE, BEFORE ANYTHING IS STOPPED OR WRITTEN. The
+                # deferred branch has no local job at all and still deletes a
+                # start doc and flips a status, so a per-match check would have
+                # left the quietest path open.
+                _local_jobs = [current, _QUEUE_STATE.get("gate_pending_job") or {}]
+                try:
+                    _local_jobs.extend(list(job_queue._queue))
+                except Exception:
+                    pass
+                if _refuse_foreign_run(doc, _local_jobs, target_rid, target_uid,
+                                       "start-listener"):
+                    continue
                 # 2026-05-12: also check the gate-pending job. Worker pops
                 # from job_queue then awaits _wait_for_prior_fe_completion
                 # BEFORE setting current_job — so a cancel that arrives
@@ -13957,7 +14130,12 @@ def start_firestore_start_listener(job_queue, loop):
                         # job that JUST entered the gate wait. Same fix as
                         # the sync path.
                         gate_pending_now = _QUEUE_STATE.get("gate_pending_job") or {}
-                        if gate_pending_now.get("research_id") == rid:
+                        # ⛔ THE RACE RE-CHECKS RE-ASK THE OWNERSHIP QUESTION
+                        # TOO. The listener-thread gate ran before this callback
+                        # was scheduled, and the whole reason these two branches
+                        # exist is that a job can arrive in the window between.
+                        if (gate_pending_now.get("research_id") == rid
+                                and not _job_is_another_persons(gate_pending_now, u)):
                             _log_about_the_armed_run(f"Cancel: target {rid[:8]}… moved to gate wait between listener checks — requesting stop{' (owner '+oc+')' if oc else ''}")
                             _controls.request_stop()
                             if _firebase_db:
@@ -13984,7 +14162,8 @@ def start_firestore_start_listener(job_queue, loop):
                         # pipeline would start despite the cancel. Re-checking
                         # current_job here closes that window.
                         current_now = _QUEUE_STATE.get("current_job") or {}
-                        if current_now.get("research_id") == rid:
+                        if (current_now.get("research_id") == rid
+                                and not _job_is_another_persons(current_now, u)):
                             _log_about_the_armed_run(f"Cancel: target {rid[:8]}… popped to current_job between listener checks — routing to stop+exit{' (owner '+oc+')' if oc else ''}")
                             _controls.request_stop()
                             run_id_now = current_now.get("run_id") or ""
@@ -14010,8 +14189,15 @@ def start_firestore_start_listener(job_queue, loop):
                             _schedule_server_exit("token-cancel-current-late")
                             return
                         dq = job_queue._queue  # deque
-                        kept = [j for j in dq if j.get("research_id") != rid]
-                        removed = any(j.get("research_id") == rid for j in dq)
+                        # ⛔ AND THE DEQUE SCAN DROPS ONLY THIS PERSON'S JOB.
+                        # Matching on research_id alone made "remove the job I
+                        # named" and "remove the job I own" the same sentence,
+                        # which is exactly the confusion this repair is about.
+                        def _cancels(j, _r=rid, _u=u):
+                            return (j.get("research_id") == _r
+                                    and not _job_is_another_persons(j, _u))
+                        kept = [j for j in dq if not _cancels(j)]
+                        removed = any(_cancels(j) for j in dq)
                         dq.clear()
                         for j in kept:
                             dq.append(j)
@@ -14151,9 +14337,7 @@ def start_firestore_start_listener(job_queue, loop):
             # is a fresh daemon process), so the token-queue is the only path
             # that re-enqueues the job from disk artifacts.
             if action == "resume":
-                if _owner_control_refused(data, "start-listener"):
-                    try: doc.reference.delete()
-                    except Exception: pass
+                if _refuse_owner_control(doc, data, "start-listener"):
                     continue
                 target_uid = data.get("uid", "")
                 target_rid = data.get("researchId", "")
@@ -14170,6 +14354,26 @@ def start_firestore_start_listener(job_queue, loop):
                 # safe even when we skip the doc-read branch entirely.
                 rd: dict = {}
                 backend_run_id = (data.get("backendRunId") or "").strip()
+                # ⛔⛔ AND A CLIENT-SUPPLIED RUN ID IS A CLAIM, NOT A FACT. This
+                # field is read straight off the queue document precisely so a
+                # synth user who cannot read the research doc still resumes —
+                # which means nothing upstream has checked that the run it names
+                # is the research it names. Left unchecked it resumes somebody
+                # else's run directory under this person's research, clears
+                # their `.no_auto_retry` and their `.pause`, and rewrites the
+                # artifacts' status. The disk already holds the answer:
+                # `owner.json` names the research the directory belongs to, and
+                # `_run_dir_owning_research` is that lookup in the other
+                # direction. A run id we cannot corroborate falls back to the
+                # document, which is the path that was always there.
+                #
+                # ⛔⛔ ASSIGNED UNCONDITIONALLY, AND A MUTANT IS WHY. Written as
+                # an `if` here, the whole corroboration could be neutered to
+                # `if False and backend_run_id:` with every name the test looked
+                # for still in place — and it survived the harness. There is no
+                # branch to neuter now, and the decision itself is executed by
+                # its own test against a real directory.
+                backend_run_id = _corroborated_run_id(backend_run_id, target_rid)
                 if not backend_run_id:
                     try:
                         rs = _firebase_db.collection("users").document(target_uid) \
@@ -14308,8 +14512,25 @@ def start_firestore_start_listener(job_queue, loop):
                 # _safe_enqueue's whitelist accepts ongoing). #728: re-stamp
                 # assignedWorker = the worker resuming it (this process), so a
                 # later restart's rehydration keeps the affinity correct.
+                #
+                # ⛔⛔ AND THE REFUSAL GOES WITH IT — THIS IS THE DELETER. Round
+                # one found a stale `lastError` speaking for statuses it was
+                # never written about; the repair was a dedicated field, and
+                # round three found the same defect waiting on the replacement.
+                # `resumeDropReason` had one writer and NO deleter while the
+                # card was widened to prefer it for all four recovery statuses,
+                # so a Resume that succeeded left its old refusal standing:
+                # the run hits the watchdog ceiling hours later and the card
+                # reads "Your earlier Resume sat waiting for more than 12
+                # hours…" under "Run stopped — it hit the time limit",
+                # suppressing "Your PC was fine throughout" — the sentence a
+                # 2026-09-01 measurement exists to protect. A resume that WORKED
+                # is the one moment we know the refusal is spent.
+                from google.cloud.firestore import DELETE_FIELD as _DF_RESUME
                 _update_research_doc(target_uid, target_rid,
-                                     {"status": "ongoing", "assignedWorker": WORKER_ID})
+                                     {"status": "ongoing", "assignedWorker": WORKER_ID,
+                                      "resumeDropReason": _DF_RESUME,
+                                      "resumeDropAt": _DF_RESUME})
                 # Delete the queue doc — Firestore's onSnapshot replays it
                 # otherwise, double-enqueueing on every BE restart.
                 try: doc.reference.delete()
@@ -16319,13 +16540,26 @@ def _dispatch_never_left(exc: BaseException, elapsed_sec: float) -> bool:
     assertion about it stayed green — they were reading the parse tree for the
     NAMES, which survive. A decision worth making is a decision worth running.
 
-    ⛔ THE CLASS DECIDES, THE CLOCK IS EVIDENCE. `requests` raises
-    ConnectionError/ConnectTimeout when the request never left and ReadTimeout
-    or a reset AFTER the connection when the cloud has it. Elapsed time alone
-    named the wrong subject: a black-holed SYN does not fail instantly, it
-    fails at the OS connect timeout — tens of seconds, past any threshold — so
-    a time-only test filed a request that never left as one the cloud received,
-    in the run's permanent support-bundle record.
+    ⛔ THE CLASS DECIDES ONLY WHERE THE CLASS IS UNAMBIGUOUS. A black-holed SYN
+    does not fail instantly — it fails at the OS connect timeout, tens of
+    seconds, past any threshold — so a clock-only rule filed a request that
+    never left as one the cloud received. `requests` names that case precisely:
+    ConnectTimeout, and ProxyError for a proxy that would not open the tunnel.
+
+    ⛔⛔ BUT A BARE `ConnectionError` NAMES BOTH SIDES OF THE LINE, and round
+    three of cross-verify induced the real exception to prove it. This route's
+    defining failure — something in front of Cloud Run severing the socket at
+    EXACTLY 300 seconds while the request keeps being served, one measured run
+    finishing at 497 s — arrives as ConnectionError(ProtocolError('Connection
+    aborted.', ConnectionResetError)), because urllib3 wraps a mid-flight reset
+    in the same class it uses for a connection that never opened. Sending every
+    ConnectionError to "never left" therefore re-broke the majority path round
+    one had fixed, and wrote "never reached the cloud" into the permanent
+    support-bundle record of runs the cloud received and finished.
+
+    ⭐ SO THE CLOCK KEEPS THIS ONE. A ConnectionError inside a couple of
+    seconds never left; one at five minutes was a severance. ReadTimeout cannot
+    arbitrate it — with a 3600 s read timeout it does not fire for an hour.
     """
     try:
         import requests as _rq
@@ -16335,8 +16569,6 @@ def _dispatch_never_left(exc: BaseException, elapsed_sec: float) -> bool:
     if isinstance(exc, (exc_mod.ReadTimeout, exc_mod.ChunkedEncodingError)):
         return False
     if isinstance(exc, (exc_mod.ConnectTimeout, exc_mod.ProxyError)):
-        return True
-    if isinstance(exc, exc_mod.ConnectionError):
         return True
     return elapsed_sec < _DRIVE_SENT_AFTER_SEC
 
@@ -16455,13 +16687,15 @@ def _post_fe_p4p5_trigger(uid, research_id):
             # been open for a while was received and may well be finishing. We
             # do not claim to know which — we say what we saw.
             _elapsed = int(time.monotonic() - _t0)
-            # ⛔⛔ THE EXCEPTION CLASS DECIDES, AND THE CLOCK IS EVIDENCE — round
-            # two of cross-verify corrected this the other way round. Elapsed
-            # time alone names the wrong subject: `requests` raises
-            # ConnectionError/ConnectTimeout when the request never left, and
-            # ReadTimeout or a reset AFTER the connection when the cloud has it.
-            # Only a sub-second DNS failure landed on the honest side of a
-            # time-only test.
+            # ⛔⛔ AND THE CLASS ARBITRATES ONLY WHERE IT CAN. Round two moved
+            # this decision onto the exception class alone; round three induced
+            # the real severance and found that urllib3 reports a socket cut
+            # mid-flight as the SAME bare `ConnectionError` it uses for a
+            # connection that never opened — so the class-only rule sent this
+            # route's defining 300-second failure back to "never reached the
+            # cloud", the exact sentence round one removed. `_dispatch_never_left`
+            # now answers only for the classes that are unambiguous and leaves
+            # the rest to the clock.
             _never_left = _dispatch_never_left(_e, _elapsed)
             if not _never_left and _elapsed >= _DRIVE_SENT_AFTER_SEC:
                 # ⛔ THE CATCH-UP CLAUSE BELONGS HERE TOO. This is now the branch

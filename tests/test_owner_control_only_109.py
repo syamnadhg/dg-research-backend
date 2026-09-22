@@ -130,32 +130,22 @@ def test_an_unknown_owner_refuses_rather_than_waving_it_through():
 
 
 # ══ 2. the wiring, because a helper is not a consumer ══════════════════
-def test_both_branches_that_act_on_uid_consult_it():
-    """⛔⛔ HELPER-PINNED, CONSUMER-NOT is this project's commonest miss — and
-    the original defect was precisely a guard that existed and was scoped to a
-    branch that did not need it."""
-    # ⛔ THE DISPATCH BRANCHES ONLY — `if action == "<verb>"`. My first version
-    # matched any `if` whose test merely MENTIONED the word, which swept in the
-    # abandoned-sweep condition (`action != "cancel"`) and failed on code that
-    # is correct. A false alarm is the same disease as a silent pass.
-    fn = _fn("start_firestore_start_listener")
-    guarded = _dispatch_branches(fn)
-    assert {v for v, _ in guarded} == {"cancel", "resume"}, (
-        f"expected the cancel and resume dispatch branches, found "
-        f"{sorted(v for v, _ in guarded)}")
-    for verb, node in guarded:
-        body = ast.dump(ast.Module(body=node.body, type_ignores=[]))
-        assert "_owner_control_refused" in body, (
-            f"the {verb} branch acts on another person's uid with no guard")
-
-
+#
+# ⛔⛔ AND NAME-PRESENCE IN A PARSE TREE WAS NOT ENOUGH, which round three of
+# cross-verify proved by building the mutants and running this file's own logic
+# against them. Both `if False and _owner_control_refused(...)` and a guard
+# whose body was replaced by a log stayed green — the second being this wave's
+# founding defect, verbatim. The refusal is now performed by
+# `_refuse_owner_control`, which a test can EXECUTE against a fake document and
+# ask whether the delete actually fired:
+# see tests/test_round_three_repairs_108.py, section 1.
 def test_the_guard_runs_BEFORE_the_branch_reads_the_uid():
     """⛔ ORDER. A refusal after the write is not a refusal."""
     fn = _fn("start_firestore_start_listener")
     for _verb, node in _dispatch_branches(fn):
         guards = [n.lineno for n in ast.walk(node)
                   if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-                  and n.func.id == "_owner_control_refused"]
+                  and n.func.id in ("_refuse_owner_control", "_owner_control_refused")]
         writes = [n.lineno for n in ast.walk(node)
                   if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
                   and n.func.id in ("_update_research_doc", "_owner_control_patch")]
@@ -165,13 +155,9 @@ def test_the_guard_runs_BEFORE_the_branch_reads_the_uid():
                 "whether it is allowed to")
 
 
-def test_the_start_guard_is_still_scoped_to_start():
-    """⭐ THE TWO GUARDS ARE DIFFERENT RULES AND MUST STAY SEPARATE. The start
-    guard refuses ANY divergence, because a divergent start doc would run in
-    somebody else's tree. This one permits the owner's, because that is the
-    feature. Collapsing them would break the Shared-with popup."""
-    src = Path(research.__file__).with_name("research.py").read_text(encoding="utf-8")
-    assert "_start_doc_identity_refused" in src
-    assert "if uid and claimed and uid != claimed:" in src, (
-        "the start guard learned about owners — it must not; a divergent START "
-        "doc runs in a tree its writer does not own, whoever wrote it")
+# ⛔⛔ THE START-GUARD PIN THAT USED TO LIVE HERE MEASURED NOTHING. It asserted
+# `"if uid and claimed and uid != claimed:" in src`, and that literal occurs
+# exactly once — inside `_start_doc_identity_conflict`, the helper the NEW guard
+# also calls. So adding an owner exemption to `_start_doc_identity_refused`, the
+# exact edit its docstring forbids, left the assertion green. Replaced by an
+# executed one: test_the_start_guard_refuses_the_owners_divergence_too.

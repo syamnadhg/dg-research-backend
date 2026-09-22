@@ -58,7 +58,12 @@ SUITES = ("tests/test_resume_drop_writeback_108.py "
           "tests/test_dead_worker_wiring_108.py "
           "tests/test_stop_is_not_a_crash_108.py "
           "tests/test_cloud_handoff_record_108.py "
-          "tests/test_region_comments_108.py")
+          "tests/test_region_comments_108.py "
+          # ⛔ ROUND THREE'S TWO SUITES, because a mutant whose killer lives
+          # outside the harness's own test list survives for a reason that has
+          # nothing to do with the code.
+          "tests/test_owner_control_only_109.py "
+          "tests/test_round_three_repairs_108.py")
 RESEARCH = "research.py"
 FILES = (RESEARCH,)
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
@@ -89,7 +94,11 @@ B_GONE = ("                    _resume_drop_writeback(target_uid, target_rid, RE
 B_STOPPED = ("                    _resume_drop_writeback(target_uid, target_rid, RESUME_DROP_TERMINALLY_STOPPED)\n"
              "                    try: doc.reference.delete()")
 #: The 12-hour sweep's write, and the guard that keeps it off start docs.
-B_STALE = ("                if data.get(\"action\") == \"resume\":\n"
+#: ⛔ RE-AIMED 2026-09-21 (round three). This branch grew an owner-control gate:
+#: it ran sixty lines above the line that even reads `action`, so it reached a
+#: named person's research document before either ownership layer was consulted.
+B_STALE = ("                if (data.get(\"action\") == \"resume\"\n"
+           "                        and not _owner_control_refused(data, \"stale-sweep\")):\n"
            "                    _resume_drop_writeback(\n"
            "                        data.get(\"uid\") or \"\", data.get(\"researchId\") or \"\",\n"
            "                        RESUME_DROP_WENT_STALE, status=None)")
@@ -553,6 +562,182 @@ MUTANTS = [
      "honest side, and every other never-left failure is filed as one the cloud "
      "received",
      [(Z_CLASS, "    return elapsed_sec < _DRIVE_SENT_AFTER_SEC\n    exc_mod = _rq.exceptions")]),
+
+    # ── Z8/Z9: the classifier, corrected the OTHER way ─────────────────────
+    #
+    # ⛔⛔ ROUND THREE INDUCED THE REAL EXCEPTION AND FOUND Z6's FIX TOO WIDE.
+    # urllib3 wraps a socket cut MID-FLIGHT in the same bare `ConnectionError`
+    # it uses for a connection that never opened — and a mid-flight cut is this
+    # route's defining failure, a severance at exactly 300 s while the request
+    # keeps being served. So the class may answer only where it is unambiguous.
+    ("Z8", "under", RESEARCH,
+     "⛔⛔⛔ EVERY bare ConnectionError is filed as 'never left' again, so the "
+     "permanent support-bundle record says the cloud never received requests it "
+     "received and finished — the exact sentence round one removed, on the "
+     "majority path",
+     [("    if isinstance(exc, (exc_mod.ConnectTimeout, exc_mod.ProxyError)):\n"
+       "        return True\n",
+       "    if isinstance(exc, (exc_mod.ConnectTimeout, exc_mod.ProxyError)):\n"
+       "        return True\n"
+       "    if isinstance(exc, exc_mod.ConnectionError):\n"
+       "        return True\n")]),
+
+    ("Z9", "under", RESEARCH,
+     "⛔ ChunkedEncodingError leaves the received tuple. Exercised only at 301 s "
+     "the clock fallback agreed anyway, so this survived — a body-stream break "
+     "moments after dispatch is still a request the cloud received",
+     [("    if isinstance(exc, (exc_mod.ReadTimeout, exc_mod.ChunkedEncodingError)):",
+       "    if isinstance(exc, (exc_mod.ReadTimeout,)):")]),
+
+    # ── O: round three, and the half both identity layers could not see ────
+    #
+    # ⛔⛔ THE WIRING TESTS COULD NOT SEE THE FOUNDING DEFECT COME BACK. Round
+    # three built O1 and O2 by hand and ran the previous suite's own AST logic
+    # against them; both stayed green, and O2 IS this wave's founding defect
+    # verbatim. A guard worth having is a guard a test can execute.
+    ("O1", "under", RESEARCH,
+     "⛔⛔ the refusal stops DELETING the document it refused, so the next "
+     "snapshot re-reads it and the idle rescan sweeps up precisely the documents "
+     "the listener declined — a refusal implemented as a delay",
+     [("    try:\n        doc.reference.delete()\n    except Exception:\n        pass\n"
+       "    return True\n\n\ndef _job_is_another_persons",
+       "    return True\n\n\ndef _job_is_another_persons")]),
+
+    ("O2", "under", RESEARCH,
+     "⛔⛔ the verdict is computed, logged and thrown away — the branch falls "
+     "through and cancels the victim's run anyway. This is the wave's founding "
+     "defect verbatim, and the previous wiring test passed against it",
+     [("    if not _owner_control_refused(data, where):\n        return False\n",
+       "    if not _owner_control_refused(data, where):\n        return False\n"
+       "    return False\n")]),
+
+    ("O3", "under", RESEARCH,
+     "⛔ the cancel branch's guard becomes one term of a compound condition, so "
+     "something else decides the branch while a name-search still finds the call",
+     [('                if _refuse_owner_control(doc, data, "start-listener"):\n'
+       '                    continue\n'
+       '                target_rid = data.get("researchId", "")',
+       '                if False and _refuse_owner_control(doc, data, "start-listener"):\n'
+       '                    continue\n'
+       '                target_rid = data.get("researchId", "")')]),
+
+    ("O4", "under", RESEARCH,
+     "⛔⛔ a job's owner stops being consulted, so a member who signs honestly as "
+     "themselves and names somebody else's researchId stops, purges and "
+     "permanently un-resumes that person's run — with no identity divergence for "
+     "either layer to catch",
+     [("    owner = str((job or {}).get(\"uid\") or \"\").strip()\n"
+       "    wanted = str(target_uid or \"\").strip()\n"
+       "    return bool(owner and wanted and owner != wanted)",
+       "    return False")]),
+
+    ("O5", "over", RESEARCH,
+     "⛔ absent becomes disagreeing, so a job dict from before the uid "
+     "requirement can no longer be cancelled by anyone — the shape that takes "
+     "the product away instead of the attack",
+     [("    return bool(owner and wanted and owner != wanted)",
+       "    return owner != wanted")]),
+
+    # ⛔⛔⛔ O6 AND O9 SURVIVED THEIR FIRST RUN, and both for the same reason:
+    # the guard was an `if` inside a 4000-line listener and the test read the
+    # parse tree for NAMES. `if False and <call>` keeps every name, every line
+    # number and every ordering. The fix in both cases was the one this wave
+    # already used twice — extract the decision so a test can EXECUTE it, and
+    # pin the consumer on its SHAPE rather than its words. These two are re-aimed
+    # at the shape, and O13-O16 attack the extractions themselves.
+    ("O6", "under", RESEARCH,
+     "⛔⛔ the cancel branch stops asking whose run it is before stopping it. "
+     "`.stop` is permanent, and this wave's own resume path then answers every "
+     "later Resume with 'This run was stopped for good'",
+     [("                if _refuse_foreign_run(doc, _local_jobs, target_rid, target_uid,\n"
+       "                                       \"start-listener\"):\n"
+       "                    continue\n",
+       "")]),
+
+    ("O13", "under", RESEARCH,
+     "⛔⛔⛔ THE MUTANT THAT SURVIVED ROUND THREE'S FIRST HARNESS RUN — the "
+     "ownership gate becomes one term of a compound condition. Every name stays, "
+     "every line number stays, the ordering stays, and the victim's run is "
+     "stopped anyway",
+     [("                if _refuse_foreign_run(doc, _local_jobs, target_rid, target_uid,\n",
+       "                if False and _refuse_foreign_run(doc, _local_jobs, target_rid, target_uid,\n")]),
+
+    ("O14", "under", RESEARCH,
+     "⛔⛔ the foreign-run refusal keeps its verdict and stops DELETING the "
+     "document, so the next snapshot re-reads it and the idle rescan sweeps up "
+     "exactly the cancel the listener declined",
+     [("    log(f\"[{where}] refusing cancel of {str(research_id)[:8]}… — the run this \"\n"
+       "        f\"names belongs to another person on this computer\", \"WARN\")\n"
+       "    try:\n        doc.reference.delete()\n    except Exception:\n        pass\n"
+       "    return True",
+       "    log(f\"[{where}] refusing cancel of {str(research_id)[:8]}… — the run this \"\n"
+       "        f\"names belongs to another person on this computer\", \"WARN\")\n"
+       "    return True")]),
+
+    ("O15", "under", RESEARCH,
+     "⛔ the corroborated run id is computed and then not used — the assignment "
+     "keeps the client's claim, which is the surviving mutant's effect achieved "
+     "by a different route",
+     [("                backend_run_id = _corroborated_run_id(backend_run_id, target_rid)",
+       "                _corroborated_run_id(backend_run_id, target_rid)")]),
+
+    ("O16", "over", RESEARCH,
+     "⛔⛔ a directory with no readable owner.json loses its claim, so every run "
+     "predating that file stops being resumable at all — the over-correction "
+     "that takes the product away instead of the attack",
+     [("    except Exception:\n        return claimed\n    owns = str((owner or {}).get(\"researchId\") or \"\").strip()",
+       "    except Exception:\n        return \"\"\n    owns = str((owner or {}).get(\"researchId\") or \"\").strip()")]),
+
+    ("O7", "under", RESEARCH,
+     "⛔ the deque scan drops any job with the named research id regardless of "
+     "who owns it — 'the job I named' and 'the job I own' become the same "
+     "sentence again",
+     [("                            return (j.get(\"research_id\") == _r\n"
+       "                                    and not _job_is_another_persons(j, _u))",
+       "                            return j.get(\"research_id\") == _r")]),
+
+    ("O8", "under", RESEARCH,
+     "⛔ the race re-check on current_job loses its ownership clause — and that "
+     "branch exists precisely because a job can arrive after the listener-thread "
+     "gate ran, so the one window the gate cannot cover is the one left open",
+     [("                        if (current_now.get(\"research_id\") == rid\n"
+       "                                and not _job_is_another_persons(current_now, u)):",
+       "                        if current_now.get(\"research_id\") == rid:")]),
+
+    ("O9", "under", RESEARCH,
+     "⛔⛔ a client-supplied backendRunId is taken on trust again, so a resume "
+     "runs somebody else's run directory under this person's research — clearing "
+     "their .no_auto_retry and their .pause on the way",
+     [("                backend_run_id = _corroborated_run_id(backend_run_id, target_rid)\n", "")]),
+
+    ("O10", "under", RESEARCH,
+     "⛔ the mismatch is REPORTED and then used anyway — a log line where a "
+     "refusal should be, which is the shape round two caught on the "
+     "no-backendRunId branch",
+     [("    if owns and owns != rid:\n"
+       "        log(f\"Resume: payload named run {claimed} for {rid[:8]}… but that run \"\n"
+       "            f\"belongs to {owns[:8]}… — ignoring the claim\", \"WARN\")\n"
+       "        return \"\"\n",
+       "    if owns and owns != rid:\n"
+       "        log(f\"Resume: payload named run {claimed} for {rid[:8]}… but that run \"\n"
+       "            f\"belongs to {owns[:8]}… — ignoring the claim\", \"WARN\")\n")]),
+
+    ("O11", "under", RESEARCH,
+     "⛔⛔ the twelve-hour sweep writes into a named person's research document "
+     "again, sixty lines above the line that even reads `action` — the one path "
+     "where the machine guard and the Firestore rule are not two layers but one",
+     [("                if (data.get(\"action\") == \"resume\"\n"
+       "                        and not _owner_control_refused(data, \"stale-sweep\")):",
+       "                if data.get(\"action\") == \"resume\":")]),
+
+    ("O12", "under", RESEARCH,
+     "⛔⛔ a successful resume stops retiring its own refusal, so "
+     "`resumeDropReason` has one writer and no deleter again — round one's "
+     "stale-field defect on the field that replaced it, and the card now prefers "
+     "it for all four recovery statuses",
+     [("                                      \"resumeDropReason\": _DF_RESUME,\n"
+       "                                      \"resumeDropAt\": _DF_RESUME})",
+       "                                      })")]),
 ]
 
 

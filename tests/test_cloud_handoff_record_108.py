@@ -267,19 +267,50 @@ def test_the_classification_is_EXECUTED_not_read():
     and run it."""
     import requests as rq
     ex = rq.exceptions
-    # never left — the cloud has nothing
-    for exc in (ex.ConnectTimeout("t"), ex.ProxyError("p"), ex.ConnectionError("c")):
+    # ⭐ THE UNAMBIGUOUS CLASSES ANSWER ON THEIR OWN, and the clock does not
+    # overrule them: a black-holed SYN fails at the OS connect timeout, tens of
+    # seconds in, far past any threshold.
+    for exc in (ex.ConnectTimeout("t"), ex.ProxyError("p")):
         assert research._dispatch_never_left(exc, 120) is True, type(exc).__name__
-    # ⛔ AND THE CLOCK DOES NOT OVERRULE THE CLASS. A black-holed SYN fails at
-    # the OS connect timeout, tens of seconds in — far past the threshold — so
-    # a time-only test filed it as "the cloud received it".
-    assert research._dispatch_never_left(ex.ConnectionError("c"), 3600) is True
+        assert research._dispatch_never_left(exc, 3600) is True, type(exc).__name__
+    # ⛔⛔ AND A BARE ConnectionError IS NOT ONE OF THEM — round three of
+    # cross-verify induced the real exception and this assertion used to say the
+    # opposite. urllib3 wraps a socket cut MID-FLIGHT in the same class it uses
+    # for a connection that never opened:
+    #   ConnectionError(ProtocolError('Connection aborted.', ConnectionResetError))
+    # and that is this route's DEFINING failure — something in front of Cloud
+    # Run severs it at exactly 300 s while the request keeps being served, one
+    # measured run finishing at 497 s. Answering "never left" for those wrote a
+    # false sentence into the permanent record of runs that SUCCEEDED, which is
+    # the exact defect round one removed. So the clock keeps this one.
+    assert research._dispatch_never_left(ex.ConnectionError("c"), 3600) is False
+    assert research._dispatch_never_left(ex.ConnectionError("c"), 300) is False
+    assert research._dispatch_never_left(ex.ConnectionError("c"), 1) is True
+    # ⭐ AND THE REAL ONE, BUILT THE WAY urllib3 BUILDS IT — a bare
+    # `ConnectionError("c")` is my own construction and could be the only shape
+    # this rule handles correctly.
+    import urllib3.exceptions as _u3
+    _real = ex.ConnectionError(_u3.ProtocolError(
+        "Connection aborted.", ConnectionResetError(54, "Connection reset by peer")))
+    assert research._dispatch_never_left(_real, 300) is False
+    assert research._dispatch_never_left(_real, 497) is False
     # received — the cloud had it and this machine stopped watching
     for exc in (ex.ReadTimeout("r"), ex.ChunkedEncodingError("c")):
         assert research._dispatch_never_left(exc, 301) is False, type(exc).__name__
-    # ⭐ and a ReadTimeout is a ConnectionError subclass in some versions, so
-    # the order of the checks is load-bearing, not incidental.
+    # ⛔ AND BOTH OF THOSE ANSWER BEFORE THE CLOCK COULD AGREE WITH THEM. Tested
+    # only at 301 s, the `elapsed < 10` fallback returns False anyway, so
+    # deleting either class from the tuple left the suite green — round three
+    # executed both values to find it. A body-stream break moments after
+    # dispatch is still a request the cloud received.
     assert research._dispatch_never_left(ex.ReadTimeout("r"), 1) is False
+    assert research._dispatch_never_left(ex.ChunkedEncodingError("c"), 1) is False
+    # ⭐ AND THE ORDER OF THE CHECKS IS LOAD-BEARING, EXECUTED RATHER THAN
+    # CLAIMED. The old comment asserted this was true "in some versions" and
+    # pinned nothing; in the pinned requests it is false, so the claim was
+    # unfalsifiable. A class that IS both must read as received.
+    class _Both(ex.ReadTimeout, ex.ConnectionError):
+        pass
+    assert research._dispatch_never_left(_Both("b"), 3600) is False
     # an exception class we cannot place falls back to the clock
     assert research._dispatch_never_left(ValueError("?"), 1) is True
     assert research._dispatch_never_left(ValueError("?"), 3600) is False
@@ -287,12 +318,18 @@ def test_the_classification_is_EXECUTED_not_read():
 
 def test_the_exception_CLASS_decides_whether_the_request_ever_left():
     """⛔⛔ THE CLOCK NAMES THE WRONG SUBJECT ON ITS OWN, which round two of
-    cross-verify proved. `requests` raises ConnectionError/ConnectTimeout when
-    the request never left and ReadTimeout when the cloud already has it — and
-    a black-holed SYN does not fail instantly, it fails at the OS connect
-    timeout, tens of seconds later, past any elapsed-time threshold. So a
-    time-only test filed a request that never left the machine as one the cloud
-    received, in the run's permanent support-bundle record."""
+    cross-verify proved. A black-holed SYN does not fail instantly — it fails at
+    the OS connect timeout, tens of seconds later, past any elapsed-time
+    threshold — so a time-only rule filed a request that never left the machine
+    as one the cloud received, in the run's permanent support-bundle record.
+    `requests` names that case exactly: ConnectTimeout, and ProxyError.
+
+    ⛔⛔ AND ROUND THREE CORRECTED THE CORRECTION. A bare `ConnectionError` does
+    NOT name it — urllib3 raises the same class for a socket cut mid-flight, so
+    routing every one of them to "never left" re-broke the majority path. The
+    branch must consult the classifier AND the classifier must leave the
+    ambiguous class to the clock; `test_the_classification_is_EXECUTED_not_read`
+    is where that second half is measured."""
     import ast
     import inspect
     import textwrap
