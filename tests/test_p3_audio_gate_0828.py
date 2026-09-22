@@ -28,7 +28,9 @@ audio step (`run_phase3_audio` cannot reach the notebook without it), so the
 recovery loop that recovers it stays. What stopped being true is that a link
 decides whether the phase succeeded.
 """
+import ast
 import inspect
+import textwrap
 
 import pytest
 
@@ -46,6 +48,15 @@ def audio_src() -> str:
     return code_only(inspect.getsource(research.run_phase3_audio))
 
 
+@pytest.fixture(scope="module")
+def publish_src() -> str:
+    """Wave 10.9: the three publishing writes moved out of `run_phase3_audio`
+    into `_p3_publish_audio`, so a test could RUN the decision instead of
+    reading it — the phase itself is only reachable by driving NotebookLM. The
+    claims below are unchanged; only where they live moved."""
+    return code_only(inspect.getsource(research._p3_publish_audio))
+
+
 # ── 1. the artefact is returned, not just written ───────────────────────────
 
 def test_the_audio_phase_returns_the_storage_url():
@@ -56,22 +67,29 @@ def test_the_audio_phase_returns_the_storage_url():
     assert 'return {"audio_path": audio_path, "audio_stored_url": audio_stored_url}' in src
 
 
-def test_the_storage_url_is_only_set_when_the_upload_returned_one(audio_src):
+def test_the_storage_url_is_only_set_when_the_upload_returned_one(publish_src):
     """`upload_audio_to_storage` returns None on a failed upload AND on a
-    response with no downloadTokens. `audio_stored_url` must inherit exactly
-    that — assigning `audio_path` or a truthy default here would put the old
-    lie back with a new name."""
-    assert "audio_stored_url = audio_url" in audio_src
-    i_guard = audio_src.index("if audio_url:")
-    i_set = audio_src.index("audio_stored_url = audio_url")
-    assert i_guard < i_set, "the assignment must sit inside the `if audio_url` guard"
+    response with no downloadTokens. The answer must inherit exactly that —
+    returning `audio_path` or a truthy default here would put the old lie back
+    with a new name."""
+    assert "return audio_url" in publish_src
+    i_guard = publish_src.index("if audio_url:")
+    i_set = publish_src.index("return audio_url")
+    assert i_guard < i_set, "the return must sit inside the `if audio_url` guard"
 
 
-def test_the_storage_url_is_initialised_before_any_return(audio_src):
-    """The function has eight early returns. `audio_stored_url` is initialised
-    at the top so the caller's `.get(...)` never depends on which one fired."""
-    assert 'audio_stored_url = ""' in audio_src
-    assert audio_src.index('audio_stored_url = ""') < audio_src.index("audio_stored_url = audio_url")
+def test_the_storage_url_is_answered_on_every_path_out_of_the_publisher():
+    """The caller's `.get(...)` must never depend on which path was taken. It
+    used to be an initialiser at the top of the phase; it is now the one thing
+    this function can answer, and every path out of it answers a string.
+
+    ⭐ EXECUTED, not read. `tests/test_incognito_machine_skips_109.py` runs the
+    failure paths; this pin holds the signature they rest on."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(research._p3_publish_audio)))
+    returns = [n for n in ast.walk(tree) if isinstance(n, ast.Return)]
+    assert returns, "the publisher must answer its caller"
+    for node in returns:
+        assert node.value is not None, "a bare return would hand the caller None"
 
 
 def test_the_early_returns_carry_no_audio(audio_src):
@@ -201,14 +219,16 @@ def test_delivery_prefers_the_playable_file_over_the_notebook_page(pipeline_src)
     assert "update_delivery(audio_url=_p3_audio_stored or audio_overview_url or notebook_url)" in pipeline_src
 
 
-def test_the_audio_download_leg_survived(audio_src):
+def test_the_audio_download_leg_survived(audio_src, publish_src):
     """⛔ `_nlm_open_audio_menu` / `_nlm_menu_pick` had two callers and only the
     SHARE one goes. The DOWNLOAD is the step that produces the file the phase
     now completes on — removing it would have deleted the artefact and the gate
     in one edit."""
     assert "_nlm_open_audio_menu(browser.page)" in audio_src
     assert 'want=("download",)' in audio_src
-    assert "upload_audio_to_storage" in audio_src
+    assert "upload_audio_to_storage" in publish_src
+    assert "_p3_publish_audio(audio_path" in audio_src, (
+        "the phase must still hand the downloaded file to the publisher")
 
 
 def test_the_pasted_audio_link_path_is_untouched(pipeline_src):

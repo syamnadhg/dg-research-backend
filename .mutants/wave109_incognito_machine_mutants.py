@@ -51,7 +51,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 SUITES = ("tests/test_incognito_capability_109.py "
-          "tests/test_incognito_run_id_and_logs_109.py")
+          "tests/test_incognito_run_id_and_logs_109.py "
+          "tests/test_incognito_machine_skips_109.py")
 RESEARCH = "research.py"
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
@@ -97,6 +98,35 @@ TM_STARTED = ("            tm.tm_emit(tm.Ev.RUN_STARTED,\n"
               "                       research_id=_tm_research_id(self.research_id),\n"
               "                       worker=WORKER_ID)")
 TM_FINISHED = "                       research_id=_tm_research_id(sink.research_id),"
+
+# ── anchors: the writes that outlive a run ──────────────────────────────────
+IMG_SKIP = ("        if _is_incognito_research(rid):\n"
+            '            log(f"[{label}] document images: a run that keeps nothing stores "\n'
+            '                "none — every image becomes a caption", "INFO")\n'
+            "            raise _DocImgStopRequested()")
+FUNNEL = "    return _doc_scrub_private_links(await _doc_images_rehost(text, label))"
+AUDIO_SKIP = ('    if _is_incognito_research(research_id):\n'
+              '        log("[Phase3] a run that keeps nothing publishes no podcast — no Storage "\n'
+              '            "object, no audios row, no audio_file link", "INFO")\n'
+              '        return ""')
+AUDIO_FALLTHROUGH = (
+    '        log("[Phase3] Firebase Storage upload failed — audio still saved locally", "WARN")\n'
+    "    except Exception as e:\n"
+    '        log(f"Audio Firestore/Storage sync failed: {e}", "WARN")\n'
+    '    return ""')
+NOTICE_SKIP = ('    if _is_incognito_research(research_id):\n'
+               '        log(f"phase-notify: {research_id[:8]}… keeps nothing — no notice asked for",\n'
+               '            "INFO")\n'
+               "        return False")
+INDEX_SKIP = ('        if _is_incognito_research(row.get("researchId")):\n'
+              "            continue")
+RECOVERY_STOP = ('    if _is_incognito_research(research_id):\n'
+                 '        return {\n'
+                 '            "status": "stopped",')
+REHYDRATE_STOP = ("                if _is_incognito_research(research_id):\n"
+                  "                    if _update_research_doc(tree_uid, research_id,\n"
+                  "                                            _restart_recovery_patch(research_id)):")
+RECONCILE_PATCH = "        _patch = _restart_recovery_patch(research_id)"
 
 MUTANTS = [
     # ══ the one predicate ══════════════════════════════════════════════════
@@ -194,6 +224,58 @@ MUTANTS = [
                    "                       worker=WORKER_ID)")]),
     ("I25", "under", "the run-finished event forwards the raw id",
      [(TM_FINISHED, "                       research_id=sink.research_id,")]),
+
+    # ══ the writes that outlive a run ══════════════════════════════════════
+    ("N1", "under", "⛔ the report figures are fetched and stored again — the "
+     "one residue class with no fuse, in a bucket with no TTL",
+     [(IMG_SKIP, "        if False:\n            raise _DocImgStopRequested()")]),
+    ("N2", "over", "⛔⛔ the skip moves to the FUNNEL, so the private-link scrub "
+     "is skipped with it and the agents' signed links reach the mail",
+     [(FUNNEL, "    if _is_incognito_research(_fb_research_id):\n"
+               "        return text\n"
+               "    return _doc_scrub_private_links(await _doc_images_rehost(text, label))")]),
+    ("N3", "under", "⛔ the podcast is uploaded, the audios row written and "
+     "links.audio_file stamped for a run that keeps nothing",
+     [(AUDIO_SKIP, '    if False:\n        return ""')]),
+    ("N4", "over", "no run publishes its podcast at all",
+     [(AUDIO_SKIP, '    if True:\n        return ""')]),
+    # ⛔ THE MUTANT THAT WAS HERE MEASURED NOTHING. It guarded `_p3_publish_audio`
+    # at its call site as well as inside — the same observable behaviour by both
+    # routes, so an EQUIVALENT mutant, which is a harness fault and not a hole.
+    # What is worth refusing at this seam is a phase that calls the publisher and
+    # then believes a local file is a published podcast.
+    ("N5", "over", "a failed upload answers with the local path, so completion "
+     "and delivery disagree about the same run again",
+     [(AUDIO_FALLTHROUGH, AUDIO_FALLTHROUGH[:-len('    return ""')]
+       + "    return str(audio_path or \"\")")]),
+    ("N6", "under", "⛔ the phase notice is asked for again — an inbox row that "
+     "outlives the run, linking to a chat that will not exist",
+     [(NOTICE_SKIP, "    if False:\n        return False")]),
+    ("N7", "over", "no run asks for a phase notice, so a closed tab never "
+     "catches up on anything",
+     [(NOTICE_SKIP, "    if True:\n        return False")]),
+    ("N8", "under", "⛔ the Send Logs picker offers a run that keeps nothing, "
+     "by id, to the person it is hidden from",
+     [(INDEX_SKIP, '        if False:\n            continue')]),
+    ("N9", "over", "the picker drops the whole submitter when one of their runs "
+     "keeps nothing, so their ordinary runs become unsendable",
+     [(INDEX_SKIP, '        if _is_incognito_research(row.get("researchId")):\n'
+                   "            break")]),
+    ("N10", "under", "⛔⛔ boot recovery parks a run that keeps nothing behind a "
+     "Resume card in a chat nobody can reopen",
+     [(RECOVERY_STOP, '    if False:\n        return {\n            "status": "stopped",')]),
+    ("N11", "over", "every restarted run is ended instead of offered a Resume",
+     [(RECOVERY_STOP, '    if True:\n        return {\n            "status": "stopped",')]),
+    ("N12", "under", "⛔⛔ the rehydrate branch goes, so a run that keeps nothing "
+     "is auto-resumed on this machine's browser profiles hours later",
+     [(REHYDRATE_STOP, "                if False:\n"
+                       "                    if _update_research_doc(tree_uid, research_id,\n"
+                       "                                            _restart_recovery_patch(research_id)):")]),
+    ("N13", "under", "the dead-worker reconciler writes the parked patch "
+     "directly again, so the two recovery paths disagree",
+     [(RECONCILE_PATCH, '        _patch = {"status": "paused_backend_restart",\n'
+                        '                  "summary": "Backend restarted mid-run — hit Resume to '
+                        'pick up from the last checkpoint."}')]),
 ]
 
 

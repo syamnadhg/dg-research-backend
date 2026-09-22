@@ -92,20 +92,22 @@ MUTANTS = [
        '                    else "no_audio_generated")',
        '                _p3_audio_reason = "no_audio_generated"')]),
 
+    # ⛔ RE-ANCHORED, wave 10.9: these three writes moved out of
+    # `run_phase3_audio` into `_p3_publish_audio` so a test could RUN the
+    # decision instead of reading it. Same claims, same kills, new addresses.
     ("P6", "over",
      "⛔ the Storage URL is set from the local path, so the gate is satisfied by "
      "a file that never uploaded — the same lie with a new name",
-     [("                audio_stored_url = audio_url",
-       "                audio_stored_url = str(audio_path)")]),
+     [("            return audio_url",
+       "            return str(audio_path)")]),
 
     ("P7", "under",
-     "⛔ the assignment leaves the `if audio_url:` guard, so a failed upload "
+     "⛔ the answer leaves the `if audio_url:` guard, so a failed upload "
      "still sets the artefact",
-     [("            if audio_url:\n"
-       "                update_link_in_firestore(\"audio_file\", audio_url,",
-       "            audio_stored_url = audio_url or \"\"\n"
-       "            if audio_url:\n"
-       "                update_link_in_firestore(\"audio_file\", audio_url,")]),
+     [("        if audio_url:\n"
+       "            update_link_in_firestore(\"audio_file\", audio_url,",
+       "        if True:\n"
+       "            update_link_in_firestore(\"audio_file\", audio_url,")]),
 
     ("P8", "under",
      "⛔ the function stops returning the artefact, so the gate reads \"\" on every "
@@ -113,11 +115,18 @@ MUTANTS = [
      [('    return {"audio_path": audio_path, "audio_stored_url": audio_stored_url}',
        '    return {"audio_path": audio_path}')]),
 
+    # ⛔ RE-ANCHORED, wave 10.9. The claim was "the artefact is defined before
+    # every return", held by an initialiser at the top of the phase. With the
+    # writes extracted there is no initialiser to delete — the phase assigns the
+    # publisher's answer once — so what is worth refusing at this seam is a
+    # publisher that hands its caller nothing on a path out.
     ("P9", "under",
-     "⛔ the initialisation goes, so any of the eight early returns raises "
-     "UnboundLocalError instead of reporting no audio",
-     [('    audio_stored_url = ""\n\n    # ── The audio SHARE page: REMOVED',
-       "    # ── The audio SHARE page: REMOVED")]),
+     "⛔ the publisher answers None on its failure path, so the caller's "
+     "completion gate reads a value it cannot compare",
+     [('        log(f"Audio Firestore/Storage sync failed: {e}", "WARN")\n'
+       '    return ""',
+       '        log(f"Audio Firestore/Storage sync failed: {e}", "WARN")\n'
+       "    return None")]),
 
     ("P10", "under",
      "⛔⛔ THE AUTO-RETRY LEG READS THE REMOVED KEY AGAIN. `.get(…, \"\")` on a "

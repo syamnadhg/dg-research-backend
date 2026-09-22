@@ -12648,11 +12648,25 @@ def _run_index_by_submitter(rows) -> "dict[str, dict]":
     ⛔ Newest first and then truncated, so what a bound removes is the oldest —
     the opposite direction was measured wrong once already in this file, on the
     source cap, and the comment there is explicit that truncation DIRECTION
-    matters as much as the number."""
+    matters as much as the number.
+
+    ⛔⛔ A RUN THAT KEEPS NOTHING IS NOT OFFERED (wave 10.9, #536). This document
+    is the Send Logs picker's whole source of truth — the app cannot know what is
+    on that disk — so a row here is a run the person can name and send to
+    support. An incognito run has no row in any list by design, and the folder it
+    names is removed when the run ends; offering it would put a run the app
+    deliberately does not show back in front of the person, in a picker, by id.
+
+    ⭐ DROPPED HERE RATHER THAN IN `_scan_run_folders`, because that scan also
+    feeds the support bundle's own selection, and a machine's owner asking for
+    their whole machine still gets their own diagnostics. This is the APP-facing
+    list, and it is the only one that has to be silent."""
     grouped: "dict[str, list]" = {}
     for row in rows:
         uid = row.get("submitterUid")
         if not uid:
+            continue
+        if _is_incognito_research(row.get("researchId")):
             continue
         grouped.setdefault(str(uid), []).append(row)
     out = {}
@@ -14503,6 +14517,99 @@ def save_audio_to_firestore(audio_id: str, name: str, duration_sec: int, audio_u
             what=f"audio {audio_id}")
     except Exception as e:
         log(f"Failed to sync audio to Firestore: {e}", "WARN")
+
+
+async def _p3_publish_audio(audio_path, research_id) -> str:
+    """Put phase 3's podcast where every consumer looks for it, and answer with
+    the Storage URL — `""` when there is nothing there.
+
+    Three writes, and all three outlive the run: the mp3 in a Storage bucket
+    that has no TTL and no purge, the `audios` row the Podcasts page lists from,
+    and `links.audio_file` on the record — which is what FE-P4's video gate, the
+    /shared/podcast player and the in-chat Play button all read.
+
+    ⛔⛔ A RUN THAT KEEPS NOTHING PUBLISHES NO PODCAST (wave 10.9, #536). The
+    rules refuse the `audios` row on every wheel and `storage.rules` refuses the
+    object, so this gate is the second net rather than the first — but a run
+    that spends minutes on an upload it is about to be denied has still spent
+    them, and leaves a 403 nobody can explain.
+
+    ⭐ PHASE 3 IS OFF FOR AN INCOGNITO RUN ANYWAY, decided beside the owner's
+    "video off": nothing is left on the computer owner's NotebookLM account and
+    nothing is produced that the person cannot receive by mail. This gate is
+    what holds when that configuration does not arrive — a resume whose
+    config.json predates the flip, or a caller that drops the key.
+
+    ⛔ EXTRACTED FROM `run_phase3_audio` SO A TEST CAN RUN IT. Its caller is a
+    six-hundred-line browser coroutine, and the decision below was reachable
+    only by driving NotebookLM. Called unconditionally there — a guard at the
+    call site would put half of this decision back out of reach.
+
+    Best-effort throughout: the pipeline continues whatever happens here, which
+    is why every failure answers `""` rather than raising."""
+    if _is_incognito_research(research_id):
+        log("[Phase3] a run that keeps nothing publishes no podcast — no Storage "
+            "object, no audios row, no audio_file link", "INFO")
+        return ""
+    if not (audio_path and audio_path.exists()):
+        return ""
+    try:
+        # B2 (2026-05-01): to_thread so the asyncio event loop (and
+        # _heartbeat_loop on it) keeps ticking — a blocking probe ate
+        # 1/6 of the 30s offline threshold. 2026-07-12: probing goes
+        # through _audio_duration_sec (tinytag primary — pure Python,
+        # pip-installed, works on a clean machine with no ffmpeg;
+        # ffprobe fallback). durationSec: 0 froze the FE player's
+        # progress bar (seek clamps to 0), so a failed probe WARNs.
+        dur_sec = await asyncio.to_thread(_audio_duration_sec, audio_path)
+        if dur_sec <= 0:
+            log("[Phase3] audio duration probe failed (tinytag + ffprobe) "
+                "— writing durationSec=0; FE will self-heal from media "
+                "metadata", "WARN")
+        # B2: Firebase Storage upload (50-100MB on slow uplinks) was the
+        # biggest single blocker — easily blew past the 30s offline window.
+        audio_url = await asyncio.to_thread(upload_audio_to_storage, audio_path)
+        # Use the filename stem as doc id so re-runs upsert in place
+        # instead of stacking duplicates. Display name = research
+        # title from Firestore (set by FE's /api/title early in P1)
+        # so the Podcasts page shows one human-readable title instead
+        # of the auto-generated underscore .m4a filename. If the
+        # Firestore title isn't set (rare P3-before-P1-write race),
+        # smart_title falls back to a stem-derived topic with
+        # underscores swapped for spaces — still readable.
+        display_name = smart_title(audio_path.stem.replace("_", " "))
+        # B2: sync Firestore .set() — small payload but on slow links
+        # still worth offloading.
+        await asyncio.to_thread(save_audio_to_firestore,
+                                audio_path.stem, display_name, dur_sec, audio_url)
+        # FE-P4 cutover (2026-05-10): also pin the Storage URL into
+        # research.links.audio_file so the FE-P4 trigger
+        # (readResearchForP4 → /api/uploadYouTube) can fetch the
+        # downloadable audio without query-walking the audios
+        # subcollection. links.audio stays as the NLM share URL
+        # (page, not a media file) — the Doc still renders that as
+        # "Audio Overview"; links.audio_file is purely for the FE
+        # YouTube upload step.
+        if audio_url:
+            update_link_in_firestore("audio_file", audio_url,
+                                     label="Podcast Audio (Storage)", phase=3,
+                                     verified=True)
+            # ⛔⛔ RETURNED, NOT JUST WRITTEN. Until 2026-08-28 this URL was
+            # written to Firestore and then dropped on the floor — the phase's
+            # return carried only `audio_path`, so its own completion gate could
+            # not see whether the bytes had actually reached Storage. A local
+            # file with a failed upload emitted a green phase_complete:3 and a
+            # "Podcast ready" notice, while FE-P4 read `links.audio_file`, found
+            # nothing, and silently skipped the video. Completion and delivery
+            # disagreed about the same run.
+            return audio_url
+        # Storage upload is best-effort — local playback still works via
+        # the backend, and Phase 5 can still upload to YouTube from the
+        # local file. Warn (not error) if it failed.
+        log("[Phase3] Firebase Storage upload failed — audio still saved locally", "WARN")
+    except Exception as e:
+        log(f"Audio Firestore/Storage sync failed: {e}", "WARN")
+    return ""
 
 
 def save_document_to_firestore(doc_type: str, content: str, name: str | None = None) -> bool:
@@ -17111,6 +17218,40 @@ def _set_research_doc(uid: str, research_id: str, data: dict, *, merge: bool = T
         return False
 
 
+def _restart_recovery_patch(research_id) -> dict:
+    """What the machine writes over a run it found abandoned by a restart.
+
+    ⛔⛔ AN INCOGNITO RUN IS ENDED, NOT PARKED (wave 10.9, #536).
+    `paused_backend_restart` is an OFFER: it puts a Resume card in the chat and
+    leaves the run non-terminal until somebody takes it. An incognito chat is in
+    no list and cannot be reopened, so there is no chat for the card to appear
+    in and nobody who can press it — the run would simply sit there, holding its
+    documents and its folder, until its fuse burned out. `stopped` is the
+    terminal status the app already draws, and it is the truth about a run this
+    machine will never pick up again.
+
+    ⛔ THE SENTENCE SAYS WHAT HAPPENED AND PROMISES NOTHING. What is kept, and
+    for how long, is said by the app in the commit that makes it true (wave 6's
+    rule); a machine-written summary that got there first would be the promise
+    arriving before the behaviour.
+
+    ⭐ ONE PATCH FOR BOTH RECOVERY PATHS — boot rehydration and worker-1's
+    dead-worker reconcile. They wrote the same two fields in two places, and a
+    branch added to one of them is a run recovered differently depending on how
+    its worker died."""
+    if _is_incognito_research(research_id):
+        return {
+            "status": "stopped",
+            "summary": "The research computer restarted. This run could not be "
+                       "picked up again, so it ended here.",
+        }
+    return {
+        "status": "paused_backend_restart",
+        "summary": "Backend restarted mid-run — hit Resume to pick up from the "
+                   "last checkpoint.",
+    }
+
+
 def _owner_control_patch(oc: str, *, running: bool) -> dict:
     """Research-doc patch for an OWNER-initiated device-queue stop/cancel.
 
@@ -17277,6 +17418,21 @@ def _post_fe_phase_notice(uid, research_id, phase, event_type, seq):
     the web app answered. Best-effort; never raises.
     """
     if not uid or not research_id:
+        return False
+    # ⛔⛔ A RUN THAT KEEPS NOTHING ASKS FOR NO NOTICE (wave 10.9, #536). The
+    # route this posts to writes a notification into the person's inbox, and an
+    # inbox entry is a row in the app that outlives the run — it survives the
+    # purge, and its `/research/{id}` link points at a chat that will not exist.
+    # The person is watching the run in the chat it is running in; the whole
+    # reason this call exists is the tab that is CLOSED, and a closed incognito
+    # tab cannot be reopened.
+    #
+    # ⭐ The app also drops an incognito notice on read (`isEphemeralNoticeHref`),
+    # because the SERVER writes notices this call never touches. That is the
+    # reader's net; this is not asking in the first place.
+    if _is_incognito_research(research_id):
+        log(f"phase-notify: {research_id[:8]}… keeps nothing — no notice asked for",
+            "INFO")
         return False
     id_token = _fresh_user_mode_id_token()
     if not id_token:
@@ -49865,6 +50021,25 @@ async def _doc_images_rehost(text: str, label: str = "document") -> str:
     run.stats["dropped"] += dropped
     pool = None
     try:
+        # ⛔⛔ A RUN THAT KEEPS NOTHING STORES NO IMAGE (wave 10.9, #536). Every
+        # image here would be fetched and written into the web's Storage bucket,
+        # which has no TTL and no purge — the one residue class that outlives
+        # both the record and its documents. So the network half is refused and
+        # each image becomes its caption.
+        #
+        # ⛔ THE SKIP IS HERE, INSIDE THE IMAGE HALF, AND NOT AT THE FUNNEL. The
+        # caller runs `_doc_scrub_private_links` on whatever this hands back, and
+        # a document that skipped the funnel would skip the scrub with it —
+        # writing the agents' signed file links and conversation URLs into the
+        # saved text and into everything built from it, which for an incognito
+        # run is the mail. The privacy fix must not open a privacy hole.
+        #
+        # ⭐ IT TAKES THE PASS THIS FUNCTION ALREADY HAS for "no network at all",
+        # rather than a second one beside it.
+        if _is_incognito_research(rid):
+            log(f"[{label}] document images: a run that keeps nothing stores "
+                "none — every image becomes a caption", "INFO")
+            raise _DocImgStopRequested()
         # ⛔⛔ An exit already scheduled: no worker, no fetch, no upload — the pass
         # below writes at once, so the save lands before the process exits.
         if _doc_img_exit_coming():
@@ -65399,8 +65574,6 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         except Exception as _ie:
             log(f"[Phase3] Post-cleanup invariant check failed: {_ie}", "WARN")
 
-    audio_stored_url = ""
-
     # ── The audio SHARE page: REMOVED 2026-08-28 (stretch 6.6C) ──
     #
     # ⛔⛔ IT SPENT CUA CALLS TO PRODUCE A URL ITS OWN FALLBACK ALREADY HELD.
@@ -65425,68 +65598,10 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
     # ("Delete" sits two rows below "Download").
 
     # ── Sync to Firebase Storage + Firestore audios subcollection ──
-    # Upload the audio file so the Vercel Podcasts page can stream it
-    # without needing the local backend to be reachable. Duration via
-    # ffprobe for nice display (M:SS). Best-effort — pipeline continues
-    # even if sync fails.
-    if audio_path and audio_path.exists():
-        try:
-            # B2 (2026-05-01): to_thread so the asyncio event loop (and
-            # _heartbeat_loop on it) keeps ticking — a blocking probe ate
-            # 1/6 of the 30s offline threshold. 2026-07-12: probing goes
-            # through _audio_duration_sec (tinytag primary — pure Python,
-            # pip-installed, works on a clean machine with no ffmpeg;
-            # ffprobe fallback). durationSec: 0 froze the FE player's
-            # progress bar (seek clamps to 0), so a failed probe WARNs.
-            dur_sec = await asyncio.to_thread(_audio_duration_sec, audio_path)
-            if dur_sec <= 0:
-                log("[Phase3] audio duration probe failed (tinytag + ffprobe) "
-                    "— writing durationSec=0; FE will self-heal from media "
-                    "metadata", "WARN")
-            # B2: Firebase Storage upload (50-100MB on slow uplinks) was the
-            # biggest single blocker — easily blew past the 30s offline window.
-            audio_url = await asyncio.to_thread(upload_audio_to_storage, audio_path)
-            # Use the filename stem as doc id so re-runs upsert in place
-            # instead of stacking duplicates. Display name = research
-            # title from Firestore (set by FE's /api/title early in P1)
-            # so the Podcasts page shows one human-readable title instead
-            # of the auto-generated underscore .m4a filename. If the
-            # Firestore title isn't set (rare P3-before-P1-write race),
-            # smart_title falls back to a stem-derived topic with
-            # underscores swapped for spaces — still readable.
-            display_name = smart_title(audio_path.stem.replace("_", " "))
-            # B2: sync Firestore .set() — small payload but on slow links
-            # still worth offloading.
-            await asyncio.to_thread(save_audio_to_firestore,
-                                    audio_path.stem, display_name, dur_sec, audio_url)
-            # FE-P4 cutover (2026-05-10): also pin the Storage URL into
-            # research.links.audio_file so the FE-P4 trigger
-            # (readResearchForP4 → /api/uploadYouTube) can fetch the
-            # downloadable audio without query-walking the audios
-            # subcollection. links.audio stays as the NLM share URL
-            # (page, not a media file) — the Doc still renders that as
-            # "Audio Overview"; links.audio_file is purely for the FE
-            # YouTube upload step.
-            if audio_url:
-                update_link_in_firestore("audio_file", audio_url,
-                                         label="Podcast Audio (Storage)", phase=3,
-                                         verified=True)
-                # ⛔⛔ RETURNED, NOT JUST WRITTEN. Until 2026-08-28 this URL was
-                # written to Firestore and then dropped on the floor — the return
-                # below carried only `audio_path`, so the phase's own completion
-                # gate could not see whether the bytes had actually reached
-                # Storage. A local file with a failed upload emitted a green
-                # phase_complete:3 and a "Podcast ready" notice, while FE-P4 read
-                # `links.audio_file`, found nothing, and silently skipped the
-                # video. Completion and delivery disagreed about the same run.
-                audio_stored_url = audio_url
-            # Storage upload is best-effort — local playback still works via
-            # the backend, and Phase 5 can still upload to YouTube from the
-            # local file. Warn (not error) if it failed.
-            if not audio_url:
-                log("[Phase3] Firebase Storage upload failed — audio still saved locally", "WARN")
-        except Exception as e:
-            log(f"Audio Firestore/Storage sync failed: {e}", "WARN")
+    # ⛔ CALLED UNCONDITIONALLY. The decision inside it is the whole subject of a
+    # test, and a caller that guarded the call would put half of that decision
+    # back where nothing executes it.
+    audio_stored_url = await _p3_publish_audio(audio_path, _fb_research_id)
 
     # ⛔ `audio_stored_url` IS THE COMPLETION ARTEFACT. It is non-empty only when
     # `upload_audio_to_storage` returned a URL, which means firebasestorage
@@ -73372,6 +73487,30 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
                 # queues/{run}/) let detect_resume_phase() skip completed phases.
                 # Only a run I OWN needs the supervised read (an orphan is marked
                 # paused regardless — I can't re-open it on my profile).
+                #
+                # ⛔⛔ EXCEPT A RUN THAT KEEPS NOTHING, WHICH IS ENDED HERE (wave
+                # 10.9, #536). Neither outcome below is available to it: an
+                # auto-resume would re-open somebody's private research on this
+                # machine's browser profiles hours later, on a device whose owner
+                # was told only that a run happened; and the paused mark is an
+                # offer of a Resume card in a chat that is in no list and cannot
+                # be reopened, which would hold the run's documents and its
+                # folder non-terminal until the fuse burned out instead.
+                #
+                # ⭐ PLACED AFTER EVERY OWNERSHIP GUARD ABOVE, deliberately. A
+                # run a LIVE sibling holds, or one an in-fleet worker will
+                # rehydrate onto its own profile, has already `continue`d — so
+                # this cannot stop a run that is fine.
+                if _is_incognito_research(research_id):
+                    if _update_research_doc(tree_uid, research_id,
+                                            _restart_recovery_patch(research_id)):
+                        orphaned += 1
+                        log(f"Rehydrate: {research_id[:24]}… keeps nothing — "
+                            "stopped rather than parked for a Resume nobody "
+                            "can reach", "INFO")
+                    else:
+                        log(f"Rehydrate: stop-mark failed for {research_id[:24]}…", "WARN")
+                    continue
                 is_supervised = False
                 if _i_own:
                     device_id = data.get("deviceId") or ""
@@ -73489,10 +73628,8 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
                     # — this fires at worker boot, the exact window a stale/
                     # claim-propagation-race token would 403 and the FE Resume
                     # CTA never fire.
-                    if _update_research_doc(tree_uid, research_id, {
-                        "status": "paused_backend_restart",
-                        "summary": "Backend restarted mid-run — hit Resume to pick up from the last checkpoint.",
-                    }):
+                    if _update_research_doc(tree_uid, research_id,
+                                            _restart_recovery_patch(research_id)):
                         orphaned += 1
                     else:
                         log(f"Rehydrate: mark paused_backend_restart failed for {research_id}", "WARN")
@@ -73575,13 +73712,15 @@ async def _reconcile_dead_worker_runs(tree_uid: str, dead_ids: "set[int]") -> in
         # place in the file that got the meaning right, in a private copy.
         if _claim_is_handed_off(data.get("backendRunId")):
             continue
-        if _update_research_doc(tree_uid, research_id, {
-            "status": "paused_backend_restart",
-            "summary": "Backend restarted mid-run — hit Resume to pick up from the last checkpoint.",
-        }):
+        # ⛔ THE SAME PATCH AS BOOT RECOVERY'S — see `_restart_recovery_patch`.
+        # A run whose worker died is recovered the same way whether the whole
+        # process restarted or one worker was given up on, and an incognito run
+        # is ended in both rather than parked for a card nobody can reach.
+        _patch = _restart_recovery_patch(research_id)
+        if _update_research_doc(tree_uid, research_id, _patch):
             marked += 1
             log(f"[dead-worker-reconcile] {research_id[:24]}… owned by dead worker "
-                f"{owner} — marked paused_backend_restart")
+                f"{owner} — marked {_patch['status']}")
         else:
             log(f"[dead-worker-reconcile] mark failed for {research_id[:24]}…", "WARN")
     return marked
