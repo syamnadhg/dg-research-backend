@@ -187,13 +187,14 @@ U_BLOCK = ("    claimed = str((data or {}).get(\"submittedBy\") or \"\").strip()
            "                f\"that may write this queue stamps submittedBy\", \"WARN\")\n"
            "            return True\n")
 #: The refusal's verdict, so the log can be kept while the answer is lost.
-U_VERDICT = ("stamps submittedBy\", \"WARN\")\n"
+U_VERDICT = ("that may write this queue stamps submittedBy\", \"WARN\")\n"
              "            return True\n")
 #: The test itself — `    if not claimed:` alone matches twice.
 U_TEST = ("    if not claimed:\n"
           "        unsigned = str((data or {}).get(\"uid\") or \"\").strip()\n")
 #: The half that keeps a doc naming NOBODY out of it.
-U_NAMED = "        if unsigned:\n"
+U_NAMED = ("        if unsigned:\n"
+           "            log(f\"[{where}] refusing {(data or {}).get('action', '?')} — it names \"\n")
 #: The gate the unsigned test has to run BEFORE.
 U_ORDER_TAIL = ("    # ⭐ THE DISAGREEMENT IS DEFINED ONCE, and this reuses it rather than\n"
                 "    # restating it — the file's own note beside that helper says why (\"one\n"
@@ -476,7 +477,7 @@ MUTANTS = [
     ("U2", "under", RESEARCH,
      "⛔⛔ THE FOUNDING DEFECT'S SHAPE — the refusal keeps its log and loses its "
      "verdict, so the machine says it refused and admits the doc anyway",
-     [(U_VERDICT, "stamps submittedBy\", \"WARN\")\n")]),
+     [(U_VERDICT, "that may write this queue stamps submittedBy\", \"WARN\")\n")]),
 
     ("U3", "under", RESEARCH,
      "⛔⛔ the unsigned rule is scoped to `cancel`, and resume is the half that "
@@ -495,7 +496,8 @@ MUTANTS = [
      "⛔ a doc naming NOBODY is refused too, so the `{}` and missing-uid shapes "
      "the branch's own guard handles are turned into owner-control refusals "
      "and logged as somebody's run",
-     [(U_NAMED, "        if True:\n")]),
+     [(U_NAMED, "        if True:\n"
+                "            log(f\"[{where}] refusing {(data or {}).get('action', '?')} — it names \"\n")]),
 
     ("S1", "under", RESEARCH,
      "⛔⛔⛔ THE START HALF OF THE BYPASS — an unsigned doc naming another "

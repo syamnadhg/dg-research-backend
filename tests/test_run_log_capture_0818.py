@@ -913,12 +913,27 @@ def test_a_legacy_meta_scans_as_unknown_not_as_queued(tmp_path, monkeypatch):
 def test_the_refusal_decides_and_says_why(caplog):
     """The decision half, driven for real — including that a refusal is never
     silent, because a queue doc that vanishes with no line is indistinguishable
-    from one that was never written."""
+    from one that was never written.
+
+    ⛔⛔ THE UNSIGNED CASE FLIPPED 2026-09-22 (wave 10.9, cross-verify round 2).
+    It used to assert that `{"uid": U1}` — a tree named, no writer — was
+    ADMITTED, on the reasonable-sounding ground that "absent is not disagreeing"
+    and that refusing it would refuse every doc from an older build. Checked
+    rather than assumed: `devices/{id}/queue` has required
+    `submittedBy == request.auth.uid` on CREATE since the collection was made
+    (`8b556c82`, 2026-05-20), and this listener subscribes to nothing else — the
+    tokens-path shape that sentence was written for cannot arrive here. What the
+    shape DOES buy is a paid run inside the tree it names, attributable to
+    nobody. `_start_doc_identity_conflict` still answers "not a disagreement";
+    the refusal is the caller's, and it is about the missing writer."""
     caplog.clear()
     assert research._start_doc_identity_refused(
         {"uid": "U1", "submittedBy": "U2", "researchId": "chat_1_1"},
         "start-listener") is True
-    assert research._start_doc_identity_refused({"uid": "U1"}, "start-listener") is False
+    assert research._start_doc_identity_refused({"uid": "U1"}, "start-listener") is True
+    assert research._start_doc_identity_refused({}, "start-listener") is False
+    assert research._start_doc_identity_refused(
+        {"researchId": "chat_1_1"}, "start-listener") is False
     assert research._start_doc_identity_refused(
         {"uid": "U1", "submittedBy": "U1"}, "start-listener") is False
 
