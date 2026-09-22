@@ -13,6 +13,13 @@ and rewritten — and on the paths where that cure does not work it still:
   M16 — let `get()` ask the keyring first, so the fresh token in the file was
         unreachable whenever the old keychain entry survived.
 
+⭐ AND WHAT THE CROSS-VERIFY THEN FOUND IN M15 (2026-09-21). A LOCKED keychain
+refuses the delete as surely as the write, so the record written before it
+described nothing that happened — three per refresh, one worker, 71 records and
+79 KB in a day, in a log nothing rotates, burying the `clear_all` wipes it
+exists to attribute. The delete is no longer attempted there, and what is not
+attempted is not recorded; K31-K37 are the ways that could rot.
+
 Every mutant below is a way the fix could be put back to decoration while still
 looking installed. The quiet ones:
 
@@ -83,7 +90,7 @@ W_BLOCK = ('            blob = _file_load()\n'
            '            blob[acct] = value\n'
            '            blob[acct + _FALLBACK_STAMP] = datetime.now(timezone.utc).isoformat()\n'
            '            _file_save(blob)\n')
-W_SAVE = '            _file_save(blob)\n            # The only destructive op'
+W_SAVE = '            _file_save(blob)\n            # Audited, and skipped when'
 #: The quiet reader's catch.
 Q_CATCH = '    except (OSError, ValueError):\n        return None'
 #: The purge dropping the stamp, and noticing a lone one.
@@ -97,19 +104,39 @@ U_WARN = ('        log.warning(\n'
 X_POP = '    blob.pop(_keyring_account(slot, install_id) + _FALLBACK_STAMP, None)\n'
 
 # ── anchors: M15, the audited delete ────────────────────────────────────────
-A_CALL = ('            _write_wipe_audit(install_id, _oserror_hint(e),\n'
-          '                              event="keyring-delete-before-rewrite", slot=slot)\n')
-A_EVENT = '                              event="keyring-delete-before-rewrite", slot=slot)'
+#: ⭐ 2026-09-21: the audit and the delete moved into `_delete_before_rewrite`
+#: (the repair below), so these anchors sit at ITS indentation, not `set`'s.
+#: Same lines, same defects, one scope in.
+A_CALL = ('    _write_wipe_audit(install_id, _oserror_hint(refusal),\n'
+          '                      event="keyring-delete-before-rewrite", slot=slot)\n')
+A_EVENT = '                      event="keyring-delete-before-rewrite", slot=slot)'
 A_REC_EVENT = '            "event": event,  # clear_all | keyring-delete-before-rewrite'
 A_REC_SLOT = '            "slot": slot,  # None = every slot'
 #: The end of the delete's try/except — where a moved line would land.
-DEL_END = ('                log.warning("keyring slot=%s: could not delete the old entry "\n'
-           '                            "before rewriting (%s)", slot, _oserror_hint(de))\n')
-DEL_LOG = ('                log.warning("keyring slot=%s: could not delete the old entry "\n'
-           '                            "before rewriting (%s)", slot, _oserror_hint(de))')
+DEL_END = ('        log.warning("keyring slot=%s: could not delete the old entry "\n'
+           '                    "before rewriting (%s)", slot, _oserror_hint(de))\n'
+           '        return "failed"\n')
+DEL_LOG = ('        log.warning("keyring slot=%s: could not delete the old entry "\n'
+           '                    "before rewriting (%s)", slot, _oserror_hint(de))')
+#: `set`'s one call to it — where the file write would land if it moved back.
+FATE_CALL = '            fate = _delete_before_rewrite(kr, acct, slot, install_id, e)\n'
 #: The hot path.
 HOT = ('            kr.set_password(SERVICE, acct, value)  # type: ignore[attr-defined]\n'
        '            # Keyring is the live store')
+
+# ── anchors: the locked keychain that is not audited (2026-09-21) ───────────
+#: The decision, and the early return it guards.
+LOCK_TEST = '    return str(_INTERACTION_NOT_ALLOWED) in str(e)'
+LOCK_SKIP = ('    if _refusal_forbids_deleting(refusal):\n'
+             '        return "skipped"\n')
+#: What the closing ERROR says became of an entry it did not remove.
+BECAME = ('                became = {"failed": "that could not be removed",\n'
+          '                          "skipped": "that the locked keychain would not let "\n'
+          '                                     "us remove",\n'
+          '                          "deleted": "that is there again after being removed",\n'
+          '                          }[fate]\n')
+#: The INFO line that must not claim a cure that never ran.
+CURED = '                if fate == "deleted":'
 
 MUTANTS = [
     # ── M13: the probe, and what the log says about a keychain it cannot read ─
@@ -224,7 +251,7 @@ MUTANTS = [
      "stamped, still greppable — and while the rewrite runs the credential is "
      "in neither store; if the file then refuses too, it is nowhere",
      [(W_BLOCK, ""),
-      (DEL_END, DEL_END + W_BLOCK)]),
+      (FATE_CALL, FATE_CALL + W_BLOCK)]),
 
     ("K13", "under", TARGET,
      "⛔⛔ THE SHAPE THAT DESTROYS THE LAST COPY — a failing file write is "
@@ -232,7 +259,7 @@ MUTANTS = [
      "reached no store at all",
      [(W_SAVE, '            with contextlib.suppress(Exception):\n'
                '                _file_save(blob)\n'
-               '            # The only destructive op')]),
+               '            # Audited, and skipped when')]),
 
     ("K14", "under", TARGET,
      "⛔⛔ the delete is unaudited again — the only destructive op on an error "
@@ -273,7 +300,53 @@ MUTANTS = [
     ("K21", "under", TARGET,
      "⛔ the delete's outcome is swallowed again — `contextlib.suppress` in all "
      "but name",
-     [(DEL_LOG, '                pass')]),
+     [(DEL_LOG, '        pass')]),
+
+    # ── the locked keychain that is not audited (cross-verify, 2026-09-21) ───
+    ("K31", "over", TARGET,
+     "⛔⛔ THE DEFECT ITSELF — a LOCKED keychain is asked to delete anyway and "
+     "the record is written first. Every refresh is three writes, so three "
+     "stack traces per refresh (measured: 24 refreshes, 71 records, 79 KB) in "
+     "a log nothing rotates, for deletes that destroyed nothing",
+     [(LOCK_SKIP, "")]),
+
+    ("K32", "under", TARGET,
+     "⛔⛔ the skip swallows the FOREIGN-ITEM case as well, so the one delete "
+     "that cures anything never runs and the one destructive op on an error "
+     "path is never recorded",
+     [(LOCK_TEST, '    return True')]),
+
+    ("K33", "under", TARGET,
+     "⛔ the test names the wrong OSStatus — -25244 deletes cleanly and needs "
+     "to, a locked keychain does not and is recorded anyway. Both halves "
+     "wrong, and the constant still reads like a deliberate choice",
+     [('_INTERACTION_NOT_ALLOWED: Final[int] = -25308',
+       '_INTERACTION_NOT_ALLOWED: Final[int] = -25244')]),
+
+    ("K34", "over", TARGET,
+     "⛔ the record is skipped but the delete is still attempted — the audit "
+     "stops describing what the code does, which is the whole point of it",
+     [(LOCK_SKIP, ""),
+      (A_CALL, '    if not _refusal_forbids_deleting(refusal):\n    ' + A_CALL)]),
+
+    ("K35", "under", TARGET,
+     "the skipped delete is reported as one that was refused, so the ERROR "
+     "tells the owner the keychain would not let go of an entry nobody asked "
+     "it about",
+     [('            fate = _delete_before_rewrite(kr, acct, slot, install_id, e)',
+       '            fate = _delete_before_rewrite(kr, acct, slot, install_id, e)\n'
+       '            fate = "failed" if fate == "skipped" else fate')]),
+
+    ("K37", "under", TARGET,
+     "the ERROR goes back to one fixed sentence, so an entry no delete was "
+     "ever attempted on is reported as one that 'could not be removed'",
+     [(BECAME, '                became = "that could not be removed"\n')]),
+
+    ("K36", "under", TARGET,
+     "a write that succeeded on the second attempt claims the old item was "
+     "deleted and re-created under this binary — naming a cure that never ran "
+     "as the reason it worked",
+     [(CURED, '                if True:')]),
 ]
 
 

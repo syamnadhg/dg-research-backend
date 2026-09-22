@@ -51,7 +51,10 @@ _INSTALL_UUID_PATH = _FALLBACK_DIR / "install_uuid"
 # BEFORE deletion so a wipe always names its culprit even if the supervisor's
 # console log is lost. ⛔ NOT every delete: `delete()` is also the routine tail
 # of every rotation (`pending` after promotion), and a line per refresh in a log
-# nothing rotates would bury the two that matter.
+# nothing rotates would bury the two that matter. ⛔ And not a delete that is
+# never attempted: a LOCKED keychain refuses every op, so the failed write below
+# tries no delete there and writes no record — otherwise every refresh, on every
+# slot, left a stack trace here for something that destroyed nothing.
 _WIPE_LOG = _FALLBACK_DIR / "keystore-audit.log"
 # Cross-process lock file serialising refresh-token rotation across the N
 # separate `--serve` worker processes (a per-process threading.Lock can't —
@@ -398,6 +401,56 @@ def _oserror_hint(e: BaseException) -> str:
     return text
 
 
+#: errSecInteractionNotAllowed — the keychain is LOCKED and cannot prompt.
+_INTERACTION_NOT_ALLOWED: Final[int] = -25308
+
+
+def _refusal_forbids_deleting(e: BaseException) -> bool:
+    """True when the refusal that stopped a write stops a DELETE just as surely.
+
+    Only errSecInteractionNotAllowed (-25308): the keychain is locked, so every
+    operation on it — read, write, delete — is refused until somebody unlocks
+    it. Matched on the OSStatus in the message, the way `_oserror_hint` reads it
+    (`keyring` hands us "Unknown Error" and the number, nothing typed).
+
+    ⛔ Not -25244 and not -25243: those are about ONE item's ownership or ACL,
+    the item deletes cleanly, and deleting it is the whole cure.
+    """
+    return str(_INTERACTION_NOT_ALLOWED) in str(e)
+
+
+def _delete_before_rewrite(kr, acct: str, slot: str, install_id: str,
+                           refusal: BaseException) -> str:
+    """Remove the keychain item a refused `set` is about to rewrite.
+
+    Returns "deleted", "failed", or "skipped" — what the closing log line says
+    about the old entry has to be what actually happened to it.
+
+    ⛔⛔ A LOCKED KEYCHAIN IS NOT AUDITED, BECAUSE NOTHING IS DELETED. The audit
+    log is the durable record of the ops that destroy a credential nothing else
+    holds, and nothing rotates it. With the login keychain locked, every `set`
+    on every slot takes this path, so each token refresh wrote THREE records —
+    measured 2026-09-21: 24 refreshes left 71 records and 79 KB, one worker,
+    about 70 KB a day — each one a stack trace for a delete that then raised
+    -25308 and destroyed nothing. That buries the `clear_all` wipes the log
+    exists to attribute. A delete that cannot happen is not attempted and not
+    recorded; every delete that IS attempted still gets its record first.
+    """
+    if _refusal_forbids_deleting(refusal):
+        return "skipped"
+    # The only destructive op on an error path, so it is audited like
+    # `clear_all`: BEFORE the delete, naming the refusal that caused it.
+    _write_wipe_audit(install_id, _oserror_hint(refusal),
+                      event="keyring-delete-before-rewrite", slot=slot)
+    try:
+        kr.delete_password(SERVICE, acct)  # type: ignore[attr-defined]
+    except Exception as de:
+        log.warning("keyring slot=%s: could not delete the old entry "
+                    "before rewriting (%s)", slot, _oserror_hint(de))
+        return "failed"
+    return "deleted"
+
+
 def _purge_file_shadow(acct: str) -> None:
     """Drop `acct` (and its refused-write stamp) from auth.json so the file
     cannot answer with a stale token.
@@ -488,20 +541,24 @@ def set(slot: Slot, install_id: str, value: str) -> None:  # noqa: A001 - dict-i
             blob[acct] = value
             blob[acct + _FALLBACK_STAMP] = datetime.now(timezone.utc).isoformat()
             _file_save(blob)
-            # The only destructive op on an error path, so it is audited like
-            # `clear_all`: BEFORE the delete, naming the refusal that caused it.
-            _write_wipe_audit(install_id, _oserror_hint(e),
-                              event="keyring-delete-before-rewrite", slot=slot)
-            try:
-                kr.delete_password(SERVICE, acct)  # type: ignore[attr-defined]
-            except Exception as de:
-                log.warning("keyring slot=%s: could not delete the old entry "
-                            "before rewriting (%s)", slot, _oserror_hint(de))
+            # Audited, and skipped when the keychain is locked and no delete
+            # can happen at all — see `_delete_before_rewrite`.
+            fate = _delete_before_rewrite(kr, acct, slot, install_id, e)
             try:
                 kr.set_password(SERVICE, acct, value)  # type: ignore[attr-defined]
-                log.info(
-                    "keyring slot=%s belonged to another binary (%s) — "
-                    "recreated it under this one", slot, _oserror_hint(e))
+                if fate == "deleted":
+                    log.info(
+                        "keyring slot=%s belonged to another binary (%s) — "
+                        "recreated it under this one", slot, _oserror_hint(e))
+                else:
+                    # Nothing was removed, so nothing was re-created: the
+                    # keychain simply took the second write (it was locked for
+                    # the first). Saying otherwise would name a cure that never
+                    # ran as the reason this worked.
+                    log.info(
+                        "keyring slot=%s refused the first write (%s) and took "
+                        "the second, with the old entry left as it was",
+                        slot, _oserror_hint(e))
                 _purge_file_shadow(acct)
                 return
             except Exception:
@@ -513,14 +570,21 @@ def set(slot: Slot, install_id: str, value: str) -> None:  # noqa: A001 - dict-i
             if answer == "value":
                 # Two stores, disagreeing, and the old one cannot be silenced.
                 # ERROR, and name the remedy — a WARNING is what hid this for
-                # as long as it hid.
+                # as long as it hid. What happened to the old entry is said
+                # exactly: a delete that was refused, one a locked keychain
+                # never let us try, and — a race — one that is back.
+                became = {"failed": "that could not be removed",
+                          "skipped": "that the locked keychain would not let "
+                                     "us remove",
+                          "deleted": "that is there again after being removed",
+                          }[fate]
                 log.error(
                     "keyring write of slot=%s failed (%s) and an OLDER entry is "
-                    "still readable there that could not be removed. This "
-                    "install now reads the new token from the file store; "
-                    "anything else reading the keychain gets the old one. "
+                    "still readable there %s. This install now reads the new "
+                    "token from the file store; anything else reading the "
+                    "keychain gets the old one. "
                     "Clear it with: security delete-generic-password -s %s -a %s",
-                    slot, _oserror_hint(e), SERVICE, acct)
+                    slot, _oserror_hint(e), became, SERVICE, acct)
             elif answer == "unknown":
                 # ⛔ Not "silent": a keychain we cannot read may still hold the
                 # old entry. Say only what is known.

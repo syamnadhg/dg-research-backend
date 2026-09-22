@@ -320,6 +320,110 @@ def test_the_delete_a_refused_write_makes_is_audited_first(home, monkeypatch, ca
     assert not [w for w in _said(caplog) if "could not delete" in w]
 
 
+def test_a_locked_keychain_attempts_no_delete_and_records_none(
+        home, monkeypatch, caplog):
+    """⛔⛔ THE PIN. errSecInteractionNotAllowed (-25308) means the keychain is
+    LOCKED: the write was refused, and so is every delete until somebody
+    unlocks it. The record was written first anyway, for a delete that then
+    destroyed nothing — and every refresh runs `set("pending")` +
+    `promote_pending()`, which is three writes, so three stack traces per
+    refresh in a log nothing rotates. Measured 2026-09-21: 24 refreshes left 71
+    records and 79 KB from one worker. Nothing was deleted; nothing may be
+    recorded."""
+    kr = FakeKeyring(store={ACCT: "stale-token"}, refuse_sets=ALWAYS,
+                     set_error=LOCKED_SET, delete_error=LOCKED_DEL, locked=True)
+    _use(monkeypatch, kr)
+
+    with caplog.at_level("DEBUG", logger="auth.keystore"):
+        keystore.set("pending", INSTALL, "rotated")
+        keystore.promote_pending(INSTALL)
+
+    assert _audit(home) == [], "a delete that cannot happen was still recorded"
+    # `promote_pending` clears `pending` at its tail — the routine rotation
+    # delete, which is not this path. No slot whose WRITE was just refused may
+    # be asked for one.
+    written = {f"current:{INSTALL}", f"previous:{INSTALL}"}
+    assert not [c for c in kr.calls if c[0] == "delete" and c[1] in written], (
+        "the locked keychain was asked to delete anyway")
+    assert not [w for w in _said(caplog) if "could not delete" in w], (
+        "it reported failing at something it never attempted")
+    # ⭐ And the refresh still works: the token is durable and readable, which
+    # is what an empty audit log must not have cost.
+    assert keystore.get("current", INSTALL) == "rotated"
+    assert keystore._file_load()[f"current:{INSTALL}"] == "rotated"
+
+
+def test_the_record_is_still_written_for_a_delete_that_is_attempted(
+        home, monkeypatch, caplog):
+    """⭐ ACCEPT POLARITY, and the line the audit log exists for. -25244 is one
+    ITEM's owner, not a locked keychain: the delete is the cure, it runs, and it
+    gets its record first — whether it then succeeds or is refused."""
+    kr = FakeKeyring(store={ACCT: "stale-token"}, refuse_sets=ALWAYS,
+                     delete_error=OWNER_DEL)
+    _use(monkeypatch, kr)
+
+    with caplog.at_level("DEBUG", logger="auth.keystore"):
+        keystore.set(SLOT, INSTALL, "fresh-token")
+
+    (rec,) = _audit(home)
+    assert rec["event"] == "keyring-delete-before-rewrite"
+    assert ("delete", ACCT) in kr.calls
+    assert [w for w in _said(caplog, "WARNING") if "could not delete" in w]
+
+
+def test_a_refusal_that_forbids_deleting_is_only_the_locked_one(home):
+    """The decision itself, both polarities. A locked keychain refuses every
+    op; -25244 and -25243 are about one item, which deletes cleanly, and
+    deleting it is the whole cure."""
+    assert keystore._refusal_forbids_deleting(Exception(LOCKED_SET)) is True
+    assert keystore._refusal_forbids_deleting(Exception(LOCKED_DEL)) is True
+    assert keystore._refusal_forbids_deleting(Exception(OWNER_SET)) is False
+    assert keystore._refusal_forbids_deleting(
+        Exception("Can't store password on keychain: (-25243, 'Unknown Error')")) is False
+    assert keystore._refusal_forbids_deleting(OSError("keyring backend gone")) is False
+
+
+def test_the_log_says_what_became_of_the_entry_it_did_not_remove(
+        home, monkeypatch, caplog):
+    """⛔ THE SIBLING THE SKIP OPENS. The ERROR for "an older entry is still
+    readable" used to end "that could not be removed" — a claim about a delete.
+    Skip the delete and that sentence describes something that never ran. The
+    keychain here refuses writes and deletes with -25308 but still ANSWERS
+    reads, which is the state that reaches this branch."""
+    kr = FakeKeyring(store={ACCT: "old-current"}, refuse_sets=ALWAYS,
+                     set_error=LOCKED_SET, delete_error=LOCKED_DEL)
+    _use(monkeypatch, kr)
+
+    with caplog.at_level("DEBUG", logger="auth.keystore"):
+        keystore.set(SLOT, INSTALL, "fresh-token")
+
+    (err,) = _said(caplog, "ERROR")
+    assert "still readable" in err
+    assert "locked keychain would not let us remove" in err, err
+    assert "delete-generic-password" in err, "it must still say how to clear it"
+    assert ("delete", ACCT) not in kr.calls
+    assert _audit(home) == []
+
+
+def test_a_keychain_that_unlocks_mid_write_does_not_claim_a_cure_it_skipped(
+        home, monkeypatch, caplog):
+    """The other end of the same sentence: the second write succeeds because the
+    keychain unlocked, not because an item was removed and re-created. The INFO
+    line names the reason a reader would act on."""
+    kr = FakeKeyring(store={ACCT: "stale-token"}, refuse_sets=1,
+                     set_error=LOCKED_SET)
+    _use(monkeypatch, kr)
+
+    with caplog.at_level("DEBUG", logger="auth.keystore"):
+        keystore.set(SLOT, INSTALL, "fresh-token")
+
+    assert kr.store[ACCT] == "fresh-token"
+    said = _said(caplog, "INFO")
+    assert not [s for s in said if "recreated it under this one" in s], said
+    assert [s for s in said if "took the second" in s], said
+    assert _audit(home) == []
+
+
 def test_writes_that_destroy_nothing_audit_nothing(home, monkeypatch):
     """⭐ ACCEPT POLARITY: the hot path and the no-keyring path delete nothing,
     so they must not write the audit line — a record on every rotation would

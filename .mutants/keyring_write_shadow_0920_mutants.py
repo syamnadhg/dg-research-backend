@@ -77,10 +77,14 @@ _INFLIGHT = Path(__file__).with_suffix(".inflight")
 # at the same defect in the new shape; wave109_keystore_mutants.py attacks what
 # wave 10.9 added.
 #: The ONE delete. It cures the ownership problem AND silences a stale value.
-DEL = ('            try:\n'
-       '                kr.delete_password(SERVICE, acct)  # type: ignore[attr-defined]')
-#: The rewrite that takes ownership.
-REWRITE = '                kr.set_password(SERVICE, acct, value)  # type: ignore[attr-defined]\n                log.info('
+#: ⭐ 2026-09-21: the delete moved into `_delete_before_rewrite`, which is where
+#: a locked keychain now turns it away; the anchor follows it there.
+DEL = ('    try:\n'
+       '        kr.delete_password(SERVICE, acct)  # type: ignore[attr-defined]')
+#: The rewrite that takes ownership. Its INFO line is now chosen by what became
+#: of the old item, so the anchor ends at that branch.
+REWRITE = ('                kr.set_password(SERVICE, acct, value)  # type: ignore[attr-defined]\n'
+           '                if fate == "deleted":')
 #: The hot path — one call, no repair.
 HOT = ('            kr.set_password(SERVICE, acct, value)  # type: ignore[attr-defined]\n'
        '            # Keyring is the live store')
@@ -107,14 +111,15 @@ MUTANTS = [
      "`get()` looks FIRST. The fresh token goes to the file, which nobody "
      "reads. On the `current` slot that is every refresh presenting a dead "
      "token until the machine has to be paired again",
-     [(DEL, "            try:\n                pass")]),
+     [(DEL, "    try:\n        pass")]),
 
     ("M2", "under",
      "⛔⛔ the rewrite after the delete goes, so the keyring is emptied and "
      "never refilled. Every rotation from here on lands in the file and the "
      "keyring is permanently unused — correct by luck, because the delete "
      "happens to silence it, and one line away from losing the token entirely",
-     [(REWRITE, '                raise RuntimeError("no rewrite")\n                log.info(')]),
+     [(REWRITE, '                raise RuntimeError("no rewrite")\n'
+                '                if fate == "deleted":')]),
 
     ("M3", "over",
      "⛔ the repair moves onto the HOT path: every good write now deletes "
