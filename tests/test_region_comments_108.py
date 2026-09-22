@@ -17,8 +17,6 @@ import ast
 import re
 from pathlib import Path
 
-import pytest
-
 import research
 
 SRC = Path(research.__file__).with_name("research.py").read_text(encoding="utf-8")
