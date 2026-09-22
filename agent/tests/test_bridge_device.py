@@ -627,7 +627,15 @@ def test_phase_updates_sr_for_p1_p2_podcast_platform_for_notebook_yt_doc():
     # Policy: SR permanent links (🔒) for Brief (P1), the three reports (P2) and the
     # Podcast (P3); the REAL platform links (🔗) for NotebookLM (P3), YouTube (P4)
     # and the final Google Doc (P5) — public / unlisted / shareable, open fine.
+    #
+    # ⛔ THE CLOUD PHASES CARRY THEIR OWN `phases[]` ENTRY, and this fixture used to
+    # leave them out. Since 8e16c0d the pointer alone no longer proves phase 4
+    # finished (the web advances it at the upload's START), so a run whose video
+    # really completed says so in `phases[]` — and this test went red the day that
+    # changed, unseen, because no gate ran the agent suite. The companion below
+    # pins the other half: a run that merely REACHED phase 5 reports no phase 4.
     doc = {"phase": 5, "status": "completed",
+           "phases": [{"phase": 4, "status": "complete"}, {"phase": 5, "status": "complete"}],
            "srShares": {"brief": "B", "chatgpt": "C", "gemini": "G", "claude": "CL", "podcast": "P"},
            "links": {
                "notebooklm": {"url": "https://notebooklm.google.com/n", "phase": 3},
@@ -652,6 +660,20 @@ def test_phase_updates_sr_for_p1_p2_podcast_platform_for_notebook_yt_doc():
     assert pus[5]["final"] is True
     assert pus[5]["links"][0]["label"] == "Google Doc" and pus[5]["links"][0]["permanent"] is False
     assert pus[5]["links"][0]["url"] == "https://docs.google.com/d/final"
+
+
+def test_a_run_that_only_reached_phase_five_reports_no_finished_video():
+    """⛔⛔ A POINTER IS NOT EVIDENCE FOR THE CLOUD PHASES. The web moves `phase` to
+    4 when the upload STARTS and to 5 when delivery starts, so inferring "every
+    phase below the pointer is complete" printed "Phase 4 (Video) complete" for a
+    video that failed or was skipped. Phases 4 and 5 leave their own `phases[]`
+    entry when they truly finish; nothing else may stand in for it."""
+    doc = {"phase": 5, "status": "ongoing",
+           "phases": [{"phase": 3, "status": "complete"}],
+           "links": {"youtube": {"url": "https://youtu.be/x", "phase": 4}}}
+    pus = {pu["phase"]: pu for pu in bridge._phase_updates(doc, bridge._sr_links(doc))}
+    assert 4 not in pus and 5 not in pus
+    assert pus[3]["status"] == "complete"
 
 
 def test_sr_mint_gap_detects_unminted_complete_phase():
