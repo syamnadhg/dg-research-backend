@@ -59,7 +59,12 @@ def test_ffprobe_bin_returns_none_when_absent(monkeypatch):
 
 
 def test_p3_audio_probe_uses_shared_helper_and_warns():
-    src = inspect.getsource(research.run_phase3_audio)
+    # ⛔ Wave 10.9: the probe moved with the three publishing writes into
+    # `_p3_publish_audio`, so a test could RUN them. Both halves of phase 3 are
+    # read here, because what this pin is about is the probe's implementation,
+    # not which function holds it.
+    src = (inspect.getsource(research.run_phase3_audio)
+           + inspect.getsource(research._p3_publish_audio))
     assert "_audio_duration_sec" in src, (
         "run_phase3_audio must probe via _audio_duration_sec (tinytag "
         "primary / ffprobe fallback) — the bare ffprobe argv silently "

@@ -182,9 +182,14 @@ def test_the_storage_upload_still_follows_the_download():
     re-deriving the notebook URL its own fallback already held. The step that
     now has to follow the download is the one Phase 3 COMPLETES on: the Firebase
     Storage upload. An early return past it produces a local file the app can
-    never reach, which is a worse version of the bug this test was written for."""
+    never reach, which is a worse version of the bug this test was written for.
+
+    ⛔ Wave 10.9 moved the upload itself into `_p3_publish_audio` — earlier in
+    the FILE than the phase, which is why this has to anchor on the CALL and not
+    on the upload's own line. The ordering it guards is unchanged."""
     dl = SRC.index("        # Use Playwright download event to capture the file reliably")
-    upload = SRC.index("audio_url = await asyncio.to_thread(upload_audio_to_storage, audio_path)")
+    upload = SRC.index(
+        "audio_stored_url = await _p3_publish_audio(audio_path, _fb_research_id)")
     assert dl < upload, "the Storage upload must still run after the download block"
 
 
