@@ -892,7 +892,8 @@ def _save_api_key_to_env_file(name: str, value: str, path=None) -> bool:
 
     Returns True on successful write, False on bad name / IO failure.
     Uses atomic write-then-rename so a crash mid-write doesn't corrupt
-    the file."""
+    the file, and the file is owner-only (0600) from its first byte —
+    see `_write_owner_only_text`."""
     if not _LOCAL_KEY_NAME_RE.match(name):
         log(f"[save-api-key-local] invalid env var name: {name!r}", "WARN")
         return False
@@ -921,9 +922,12 @@ def _save_api_key_to_env_file(name: str, value: str, path=None) -> bool:
         out = "\n".join(new_lines)
         if not out.endswith("\n"):
             out += "\n"
-        tmp = target.with_suffix(target.suffix + ".tmp")
-        tmp.write_text(out, encoding="utf-8")
-        tmp.replace(target)
+        # ⛔⛔ #538: NOT `tmp.write_text(out); tmp.replace(target)`. The rename
+        # hands the target the TEMP file's inode, so that pair re-created this
+        # file at the umask's 0644 on every save — throwing away the seed's
+        # 0600 — and the fixed-name `.tmp` held the key world-readable while it
+        # was being written.
+        _write_owner_only_text(target, out)
         return True
     except Exception as e:
         log(f"[save-api-key-local] write {target} failed: {e}", "WARN")
@@ -1017,9 +1021,9 @@ def _clear_api_key_from_env_file(name: str, path=None) -> bool:
         out = "\n".join(new_lines)
         if out and not out.endswith("\n"):
             out += "\n"
-        tmp = target.with_suffix(target.suffix + ".tmp")
-        tmp.write_text(out, encoding="utf-8")
-        tmp.replace(target)
+        # Same writer as the save, same reason: the rewrite still carries every
+        # OTHER key in the file, and a plain rename would publish them at 0644.
+        _write_owner_only_text(target, out)
         return True
     except Exception as e:
         log(f"[clear-api-key-local] clear {target} failed: {e}", "WARN")
@@ -8049,6 +8053,8 @@ def _atomic_write_text(path: Path, text: str, create_parents: bool = True) -> No
     import tempfile
     if create_parents:
         path.parent.mkdir(parents=True, exist_ok=True)
+    # ⛔ mkstemp's 0600 is LOAD-BEARING: `_write_owner_only_text` relies on it to
+    # keep the API-keys file unreadable by other accounts. Never widen the temp.
     fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -8060,6 +8066,38 @@ def _atomic_write_text(path: Path, text: str, create_parents: bool = True) -> No
         except OSError:
             pass
         raise
+
+
+def _write_owner_only_text(path, text: str) -> None:
+    """Atomically replace `path` with `text`, readable by this OS account only.
+
+    ⛔⛔ #538. `mkstemp` (inside `_atomic_write_text`) opens the temp O_EXCL at
+    0600 whatever the umask, and `os.replace` carries THAT inode onto the target
+    — so the bytes are never readable by another account, not even for the
+    instant before the rename, and a leftover 0644 `.tmp` from an older build is
+    never reused. No parent is created: the API-keys file sits beside the code,
+    which exists. Raises on failure, with the temp already removed."""
+    _atomic_write_text(Path(path), text, create_parents=False)
+
+
+def _owner_only(path) -> None:
+    """Take group and other access off ONE existing file or directory — 0644 →
+    0600, 0755 → 0700 — leaving the owner's own bits exactly as they were.
+
+    ⛔ NEVER FOLLOWS A SYMLINK. `_harden_owner_only_paths` walks whole trees, and
+    a link in one points at something that is not ours to re-permission. An
+    absent path, a link and a refused chmod are all silent: this runs on every
+    boot and must never be the reason a command fails."""
+    import stat as _stat
+    try:
+        st = os.lstat(path)
+        if _stat.S_ISLNK(st.st_mode):
+            return
+        mode = _stat.S_IMODE(st.st_mode)
+        if mode & 0o077:
+            os.chmod(path, mode & ~0o077)
+    except OSError:
+        pass
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:
@@ -77655,9 +77693,10 @@ def _load_env_file(path) -> dict[str, str]:
 
 def _seed_env_file_if_missing() -> bool:
     """Copy scripts/dg-supervisor.env.example to .dg-supervisor.env if absent.
-    On POSIX, chmod 0600 (API key sensitivity). Idempotent — no-op if target
-    exists. Returns True if a fresh seed was written. Called by `--resurrect`
-    so first-time install lays down a documented, all-commented env file."""
+    Owner-only (0600) from its first byte, through the same writer as every key
+    save (API key sensitivity). Idempotent — no-op if target exists. Returns True
+    if a fresh seed was written. Called by `--resurrect` so first-time install
+    lays down a documented, all-commented env file."""
     target = _SUPERVISOR_ENV_FILE_DEFAULT_PATH
     if target.exists():
         return False
@@ -77666,17 +77705,70 @@ def _seed_env_file_if_missing() -> bool:
         log(f"[env] no example template at {example} — skipping seed", "WARN")
         return False
     try:
-        target.write_text(example.read_text(encoding="utf-8-sig"), encoding="utf-8")
+        _write_owner_only_text(target, example.read_text(encoding="utf-8-sig"))
     except Exception as e:
         log(f"[env] failed to seed {target}: {e}", "WARN")
         return False
-    if sys.platform != "win32":
-        try:
-            os.chmod(target, 0o600)
-        except Exception as e:
-            log(f"[env] could not chmod 0600 {target}: {e}", "WARN")
     log(f"[env] seeded {target} from scripts/dg-supervisor.env.example", "INFO")
     return True
+
+
+def _queues_root() -> "Path":
+    """`<install>/queues/` — every run folder this machine writes, each named for
+    its topic and holding the brief, the reports and the podcast. The directory
+    the worker locks and `setup_firestore_run` spell out inline."""
+    return Path(__file__).parent / "queues"
+
+
+def _harden_owner_only_paths() -> None:
+    """Narrow, at every boot, what earlier builds left readable by the OTHER OS
+    accounts on this computer: the API-keys file, the state dir and its audit
+    logs, the whole logs/ tree (run logs, session logs, support zips in
+    outgoing/) and the queues/ root. Group and other bits come off; the owner's
+    own bits and every byte of content stay exactly as they were.
+
+    ⛔⛔ WHY AT BOOT AND NOT ONLY IN THE WRITERS. The writers are fixed for what
+    they write from now on; this is for what is already on disk. MEASURED
+    2026-09-21 on the owner's Mac: `.dg-supervisor.env` -rw-r--r-- (every key
+    save since August re-created it at the umask's 0644), ~/.super-research,
+    logs/, runs/, sessions/, outgoing/ and queues/ all drwxr-xr-x, support zips
+    and keystore-audit.log -rw-r--r--. The home is drwxr-x--- with group
+    `staff`, which EVERY macOS account is in, and a wheel puts the key file and
+    queues/ in site-packages under a 0755 ~/.local — so any other account on the
+    machine could read the keys, other members' uids and every topic.
+
+    ⭐ queues/ is CREATED 0700 when absent, not just narrowed: a worker makes it
+    on its first claim, AFTER this has run, so "narrow it next boot" would leave
+    a fresh install's run folders open for the whole life of its first serve.
+    Its sub-folders are not walked; a 0700 root already stops anyone else
+    reaching them.
+
+    Only the DEFAULT env file: a custom `--env-file` is the user's own to
+    permission. Never raises — every command passes through here."""
+    if sys.platform == "win32":
+        return  # mode bits mean next to nothing on NTFS; the per-user profile ACL is the boundary there
+    try:
+        env_file = _SUPERVISOR_ENV_FILE_DEFAULT_PATH
+        for p in (env_file,
+                  # A pre-#538 save that died between its write and its rename
+                  # left the key HERE, at 0644, under this fixed name.
+                  env_file.with_name(env_file.name + ".tmp"),
+                  _STATE_DIR,
+                  _STATE_DIR / "keystore-audit.log",
+                  _STATE_DIR / "selfheal-audit.log"):
+            _owner_only(p)
+        queues = _queues_root()
+        try:
+            queues.mkdir(mode=0o700, exist_ok=True)
+        except OSError:
+            pass
+        _owner_only(queues)
+        for root, _dirs, files in os.walk(_logs_root()):
+            _owner_only(root)
+            for name in files:
+                _owner_only(os.path.join(root, name))
+    except Exception:
+        pass
 
 
 def _supervisor_platform() -> str:
@@ -85530,6 +85622,11 @@ def main():
     if not (args.serve or args.daemon_loop or args.restart or args.update
             or args.retire or args.unpair or args.resurrect):
         _warn_if_restart_pending()
+
+    # ⛔⛔ #538 / N4: take other OS accounts' access off what earlier builds left
+    # open — the keys file, the state dir, the logs tree, the queues root —
+    # before any subcommand runs. A bare call on purpose: every command passes.
+    _harden_owner_only_paths()
 
     # Load .dg-supervisor.env BEFORE subcommand dispatch so every subcommand
     # (--serve, --daemon-loop, --resurrect, etc.) inherits the same values.
