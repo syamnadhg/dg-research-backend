@@ -139,7 +139,7 @@ LINKS_BRANCH = ('    if (queue_dir / "links.json").exists():\n'
 MARKER_BRANCH = ('    if marker.exists():\n'
                  '        return 3, "Phase 2 complete marker present — resuming from Phase 3"')
 PARTIAL_BRANCH = ('    if has_partial_research:\n'
-                  '        return 2, "Phase 2 partial MDs present without completion marker — re-running Phase 2 (all agents)"')
+                  '        return 2, "Phase 2 partial MDs present without completion marker — re-running Phase 2 (unfinished agents)"')
 PAUSE_HEAD = ('async def pause_and_close_browser(browser, queue_dir, phase, extra_kwargs=None):\n'
               '    """Save pause checkpoint → close browser → block until resume or stop."""\n'
               '    _runtime.phase = phase\n')
@@ -356,7 +356,7 @@ MUTANTS = [
      "happened to have written a file — the coarse-marker bug, restored",
      [(PARTIAL_BRANCH,
        '    if has_partial_research:\n'
-       '        return 3, "Phase 2 partial MDs present without completion marker — re-running Phase 2 (all agents)"')]),
+       '        return 3, "Phase 2 partial MDs present without completion marker — re-running Phase 2 (unfinished agents)"')]),
 
     # ═════════ P11 — the pause's own early exit ═════════════════════════════
     ("P11", "over",

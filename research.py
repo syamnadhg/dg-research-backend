@@ -40287,6 +40287,11 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
                                "verified": True, "primary": True}])
         except Exception:
             pass
+        # ⭐ Wave 10.9 — the same fact, durably, for a crash retry. Here and
+        # nowhere else: this is the one branch that has proved the report is
+        # whole, on disk and reachable. See `_p2_mark_agent_done`.
+        _p2_mark_agent_done(queue_dir, agent_key, True, elapsed_sec=elapsed_sec,
+                            findings=getattr(_runtime, "agent_findings", {}).get(agent_key))
         # F4 (2026-05-06): persist agent terminal status to root doc on
         # the individual complete-emit instead of waiting for the bulk
         # phase_complete write at :19641. On chat reopen mid-Phase-2,
@@ -60102,6 +60107,9 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         # force=True: this is a legitimate relaunch reset, so it must override a
         # stale "skipped"/"errored" (the guard blocks only the stale retry path).
         _write_agent_terminal_status("chatgpt", "running", force=True)
+        # ⭐ Wave 10.9: a launch un-finishes the agent in the durable record, so a
+        # crash during THIS attempt can never hand back the last attempt's file.
+        _p2_mark_agent_done(_p2_run_dir(), "chatgpt", False)
         # 2026-07-06 bot-score work: REUSE the warm Phase-1 ChatGPT tab instead
         # of opening a second one. Every cold top-level chatgpt.com load is a
         # Cloudflare-scored event; P1 already paid it and left a warm,
@@ -60284,6 +60292,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                             f"effort) + Research tools...")
         # #929: launch-site persisted-status reset — see the 2A note.
         _write_agent_terminal_status("claude", "running", force=True)
+        _p2_mark_agent_done(_p2_run_dir(), "claude", False)  # wave 10.9 — see 2A
         for attempt in range(2):
             if attempt > 0:
                 log("[2B] Retrying Claude (fresh tab)...", "WARN")
@@ -60395,6 +60404,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         emit_event("agent_progress", phase=2, agent="gemini", status="starting", progress="Opening Gemini and submitting research brief...")
         # #929: launch-site persisted-status reset — see the 2A note.
         _write_agent_terminal_status("gemini", "running", force=True)
+        _p2_mark_agent_done(_p2_run_dir(), "gemini", False)  # wave 10.9 — see 2A
         gemini_page, gemini_setup_ok = await start_agent_no_gemini_wait(
             browser, cua_client, "https://gemini.google.com",
             PROMPT_GEMINI_DEEP_RESEARCH,
@@ -66374,19 +66384,18 @@ def detect_resume_phase(queue_dir):
     if marker.exists():
         return 3, "Phase 2 complete marker present — resuming from Phase 3"
     # No marker but some MDs on disk → P2 was interrupted. Restart Phase 2
-    # so the unfinished agents complete. NOTE: re-running P2 re-extracts
-    # ALL enabled agents from scratch (`run_phase2` doesn't currently scan
-    # disk to skip already-finished agents). Existing MDs are overwritten
-    # via the Firestore upsert in `save_document_to_firestore`. Wasteful
-    # on time but safe — the only correctness cost is a few extra minutes
-    # of agent work; data-wise the new MDs are at least as good as the
-    # old. An idempotency guard ("if documents/{agent}.md exists, skip
-    # launching") would be a real refactor, not landed here.
+    # so the unfinished agents complete.
+    # ⛔⛔ WAVE 10.9 — THIS SAID RE-RUNNING P2 "RE-EXTRACTS ALL ENABLED AGENTS
+    # FROM SCRATCH" and called the cost "a few extra minutes". It was every
+    # finished Deep Research bought again, on every silent crash relaunch, with
+    # its tile flipped back to "running". The main Phase-2 entry now keeps an
+    # agent that finished (`_p2_resume_plan`) and launches only the rest. This
+    # function still only picks the PHASE; which agents run is decided there.
     research_dir = queue_dir / "documents"
     has_partial_research = research_dir.exists() and any(
         f for f in research_dir.glob("*.md") if f.stat().st_size > 100 and f.stem != "brief")
     if has_partial_research:
-        return 2, "Phase 2 partial MDs present without completion marker — re-running Phase 2 (all agents)"
+        return 2, "Phase 2 partial MDs present without completion marker — re-running Phase 2 (unfinished agents)"
     # Phase 1 done → resume from Phase 2: check if brief exists
     brief = queue_dir / "documents" / "brief.md"
     if not brief.exists():
@@ -66394,6 +66403,179 @@ def detect_resume_phase(queue_dir):
     if brief.exists() and brief.stat().st_size > 100:
         return 2, "Brief exists — Phase 1 done, resuming from Phase 2"
     return 0, "Starting from Phase 0 (Init)"
+
+
+# ── Phase 2 re-entry keeps the agents that finished (wave 10.9) ─────────────
+# ⛔⛔ A CRASH RETRY USED TO BUY EVERY DEEP RESEARCH AGAIN. An interrupted Phase 2
+# resumes through `run_phase2`, which launched every enabled agent from zero —
+# so each silent relaunch after a Chrome death (up to BROWSER_CRASH_MAX_RETRIES
+# of them, and a daemon restart resumes the same way) paid again for reports
+# already on disk and in Firestore, and flipped their finished tiles back to
+# "running".
+#
+# ⭐ THE RECORD IS WRITTEN WHERE `complete` IS ANNOUNCED AND NOWHERE ELSE. A
+# report file proves nothing on its own: the Stop path and the finalize re-save
+# both write `documents/<agent>.md` from a salvaged partial. Only the complete
+# branch of `extract_and_record_agent` adds an agent here, and every LAUNCH of
+# that agent in `run_phase2` takes it out again, so an entry always describes
+# the agent's latest attempt. It is a file because the in-process status map
+# dies with the daemon.
+#
+# ⚠ Not covered: an agent still GENERATING when Chrome died is re-run from zero
+# (reattaching it through the pause checkpoint's addresses is a separate change).
+_P2_AGENTS_DONE_FILE = "phase2_agents_done.json"
+
+
+def _p2_mark_agent_done(queue_dir, agent_key, done, elapsed_sec=0, findings=None):
+    """Add one agent to the durable Phase-2 completion record, or with
+    `done=False` take it out.
+
+    Never raises: a record that fails to write only means the agent is re-run
+    on a crash retry, which is what always happened before."""
+    if not queue_dir or not agent_key:
+        return
+    path = Path(queue_dir) / _P2_AGENTS_DONE_FILE
+    key = str(agent_key).lower()
+    try:
+        agents = json.loads(path.read_text(encoding="utf-8")).get("agents") or {}
+    except Exception:
+        agents = {}
+    if not isinstance(agents, dict):
+        agents = {}
+    if done:
+        agents[key] = {"completedAt": int(time.time() * 1000),
+                       "elapsedSec": int(elapsed_sec or 0),
+                       # Kept so a restored agent's Findings tab is the one its
+                       # own extraction built, not save_meta's heading fallback.
+                       "findings": list(findings or [])}
+    elif key in agents:
+        del agents[key]
+    else:
+        # Nothing to take out, so nothing is written: a launch on a fresh run
+        # never creates the file, or recreates a deleted run's folder.
+        return
+    try:
+        _atomic_write_text(path, json.dumps({"agents": agents}), create_parents=False)
+    except Exception as _e:
+        log(f"[phase2] completion record for {key} not written ({_e}) — a crash "
+            f"retry will re-run it", "WARN")
+
+
+def _p2_restorable_agents(queue_dir, enabled_agents) -> dict:
+    """{agent_key: {"text", "elapsed_sec", "findings"}} for each enabled agent a
+    Phase-2 re-entry must NOT launch again.
+
+    ⛔ BOTH HALVES, ALWAYS. An agent qualifies only with a completion record AND
+    its report still on disk over 100 bytes (`detect_resume_phase`'s bar). The
+    record alone is not enough: a feedback-targeted resume unlinks every agent
+    report and leaves the record behind. The file alone is not enough: see the
+    block comment above. Anything unreadable answers "run it again"."""
+    if not queue_dir:
+        return {}
+    qd = Path(queue_dir)
+    try:
+        done = json.loads((qd / _P2_AGENTS_DONE_FILE).read_text(encoding="utf-8")).get("agents")
+    except Exception:
+        return {}
+    if not isinstance(done, dict):
+        return {}
+    out = {}
+    for agent in enabled_agents or ():
+        key = str(agent).lower()
+        entry = done.get(key)
+        if not isinstance(entry, dict):
+            continue
+        doc = qd / "documents" / f"{key}.md"
+        try:
+            if doc.stat().st_size <= 100:
+                continue
+            md = doc.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        # Our own `# <Agent> Deep Research` header comes off: the extractor's
+        # `text` never carried it, and every re-save adds it back.
+        first, _nl, rest = md.partition("\n")
+        if first.startswith("# ") and "Deep Research" in first:
+            md = rest.lstrip("\n")
+        if not md.strip():
+            continue
+        try:
+            elapsed = int(entry.get("elapsedSec") or 0)
+        except (TypeError, ValueError):
+            elapsed = 0
+        findings = entry.get("findings")
+        out[key] = {"text": md, "elapsed_sec": elapsed,
+                    "findings": findings if isinstance(findings, list) else []}
+    return out
+
+
+def _p2_resume_plan(queue_dir, enabled_agents):
+    """(agents to launch, results to keep) for one entry into Phase 2.
+
+    The launch list is `enabled_agents` minus the finished agents, in order.
+    The kept results have the shape of `extract_and_record_agent`'s successful
+    return, keyed by display name as `run_phase2`'s are, and are marked
+    `_restored` so the finalize re-save leaves their files alone.
+
+    On a fresh run there is no record, so this launches everything."""
+    restored = _p2_restorable_agents(queue_dir, enabled_agents)
+    launch = [a for a in (enabled_agents or []) if str(a).lower() not in restored]
+    kept = {}
+    for key, r in restored.items():
+        kept[_agent_display_name(key)] = {
+            "status": "done",
+            "text": r["text"],
+            # No conversation address: it is only a reattach key, and this agent
+            # is not reattached. The P2→P3 hand-off still finds its report file.
+            "url": "",
+            "_in_app_url": in_app_document_url(key),
+            "verified": True,
+            "page": None,
+            "elapsed_sec": r["elapsed_sec"],
+            "md_saved": True,
+            "_findings": r["findings"],
+            "_restored": True,
+        }
+    return launch, kept
+
+
+def _p2_needs_resave(r) -> bool:
+    """Does the Phase-2 finalize pass re-write this agent's report? Not for a
+    kept agent: its file and its Firestore copy are the ones written when it
+    finished, and re-wrapping its text would stack a second header on it."""
+    return bool(r.get("text")) and not r.get("_restored")
+
+
+def _p2_announce_restored(kept) -> None:
+    """Tell the app each kept agent is done, the way its own completion did.
+
+    ⛔ NOT COSMETIC. A checkpoint resume emits a FULL `phase_restart`, and the
+    web re-seeds every Phase-2 agent's detail on it, so without this a kept
+    agent would sit on its seed row for the whole phase. The persisted status
+    is written too, because a daemon restart starts with an empty status map."""
+    for name, r in (kept or {}).items():
+        key = name.lower().replace(" ", "")
+        n = len(r.get("text") or "")
+        url = r.get("_in_app_url") or in_app_document_url(key)
+        label = f"Read {name} report"
+        log(f"[phase2] {name} finished before the restart — keeping its report "
+            f"({n} chars), not launching it again")
+        if r.get("_findings"):
+            _runtime.agent_findings[key] = list(r["_findings"])
+        try:
+            emit_event("link_extracted", phase=2, agent=key, url=url, label=label,
+                       verified=True, primary=True)
+            emit_event("agent_progress", phase=2, agent=key, status="complete",
+                       progress=f"Finished before the restart — kept its report ({n:,} chars)",
+                       partialTextLen=n, elapsedSec=int(r.get("elapsed_sec") or 0),
+                       links=[{"label": label, "url": url, "verified": True,
+                               "primary": True}])
+        except Exception:
+            pass
+        try:
+            _write_agent_terminal_status(key, "complete")
+        except Exception:
+            pass
 
 
 # ── Browser-crash recovery (#725) ───────────────────────────────────────────
@@ -66733,10 +66915,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # Emit resume marker so frontend knows to ignore events before this point
         emit_event("pipeline_resumed", phase=start_phase, resumeReason=reason)
         # #929: full-restart marker. A checkpoint resume re-runs the phase
-        # from scratch (run_phase2 relaunches ALL enabled agents — a pre-pause
+        # (every enabled agent that had not FINISHED is relaunched — a pre-pause
         # user skip is a per-attempt decision, not persisted), so the FE must
         # reset that phase's UI state too: per-agent icons/steppers/details
-        # and any stale alert cards from the paused attempt. full=True is
+        # and any stale alert cards from the paused attempt. (Wave 10.9: a kept,
+        # finished P2 agent re-announces itself — `_p2_announce_restored`.) full=True is
         # emitted ONLY here — the many soft-retry phase_restart sites must
         # NOT wipe live phase UI (their agents keep running).
         if isinstance(start_phase, int) and 0 <= start_phase <= 3:
@@ -68937,6 +69120,15 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # persisted either, so the listing tile rendered the skipped
                 # agent as completed (green ✓). Dual-source defense-in-depth.
                 emit_event("agent_skipped", phase=2, agent=da, reason="Disabled in pipeline config")
+            # ⭐⭐ Wave 10.9 — A RE-ENTRY RUNS ONLY THE AGENTS THAT HAD NOT FINISHED.
+            # A crash retry or a daemon-restart resume lands here with some
+            # agents' reports already recorded; those are kept and announced
+            # instead of bought again (see `_p2_resume_plan`).
+            # ⛔ `enabled_agents` itself is NOT trimmed. The phase_start emits
+            # above and the safety filter below read it, and a kept agent missing
+            # from it would lose its tile or be filtered out of the results.
+            _p2_launch, _p2_restored = _p2_resume_plan(queue_dir, enabled_agents)
+            _p2_announce_restored(_p2_restored)
             _p2_start = time.time()
             # Active-time ceiling for Phase 2 — paused seconds don't count.
             # Per-phase login probe removed (2026-04-24) — Phase 0 is the
@@ -68966,11 +69158,14 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         results = await _await_phase_with_active_deadline(
                             2, PHASE_2_MAX_MIN,
                             lambda: run_phase2(browser, cua_client, research_brief, verbose,
-                                               enabled_agents=enabled_agents),
+                                               enabled_agents=_p2_launch),
                             soft_warn_only=True,  # 2026-05-04: long DR runs are legitimate; warn but don't bail
                         )
                         break  # success
                     except _PhaseSoftDecision as _sd:
+                        # ⭐ Wave 10.9: a person's Retry or Skip decides for the
+                        # WHOLE phase, as it always has — kept agents included.
+                        _p2_launch, _p2_restored = list(enabled_agents), {}
                         # User picked Retry/Skip on the soft-timeout warn.
                         # Wait is implicit — never reaches this except (the
                         # helper keeps polling on Wait until run_task either
@@ -68996,6 +69191,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         # unreachable for P2. Kept as a safety net in case
                         # something inside run_phase2 raises a bare
                         # TimeoutError that escapes the helper's wrap.
+                        _p2_launch, _p2_restored = list(enabled_agents), {}  # wave 10.9, as above
                         _decision = await _phase_timeout_decision(2, PHASE_2_MAX_MIN)
                         if _decision == "retry":
                             emit_event("phase_restart", phase=2, reason="user_retry_after_timeout")
@@ -69016,11 +69212,18 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 if not extra_ctx_retry:
                     log("[Phase 2] restart_requested but extra_context empty — continuing", "WARN")
                     break
+                # ⭐ Wave 10.9: new input re-runs the whole phase, kept agents too.
+                _p2_launch, _p2_restored = list(enabled_agents), {}
                 research_brief += f'\n\nADDITIONAL USER CONTEXT (restart #{_p2_attempt+1}):\n{extra_ctx_retry}'
                 log(f"[Phase 2] Mid-phase restart with +{len(extra_ctx_retry)} chars of user input")
                 emit_event("phase_restart", phase=2,
                            reason="mid_phase_input_on_resume",
                            chars=len(extra_ctx_retry), attempt=_p2_attempt+1)
+            # ⭐ Wave 10.9: the kept agents join the results HERE, ahead of the
+            # safety filter and the off-topic sweep, so every reader below — the
+            # links, the per-agent status, the marker, save_meta, the P2→P3
+            # hand-off — sees the whole phase, and the sweep judges them again.
+            results.update(_p2_restored)
             # Safety filter: ensure only enabled agents appear in results
             if enabled_agents:
                 agent_name_map = {"chatgpt": "ChatGPT", "gemini": "Gemini", "claude": "Claude"}
@@ -69281,7 +69484,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # already references (no fetch); a salvaged partial is not.
             await _rehost_result_texts(results)
             for name, r in results.items():
-                if r["text"]:
+                if _p2_needs_resave(r):  # wave 10.9: a kept agent's copies stand
                     fname = name.lower().replace(" ", "") + ".md"
                     _agent_md = f"# {name} Deep Research\n\n{r['text']}"
                     _agent_lc = name.lower().replace(" ", "")

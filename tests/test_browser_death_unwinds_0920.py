@@ -195,3 +195,47 @@ def test_the_cookie_gate_no_longer_buries_a_browser_death_at_debug():
     window = src[max(0, i - 400):i + 400]
     assert "_is_browser_close_error(e)" in window
     assert '"WARN"' in window
+
+
+# ── a Chrome window closed BY HAND in the middle of phase 2 (wave 10.9) ───
+
+def test_a_hand_closed_chrome_window_mid_phase_two_relaunches_silently_and_keeps_the_finished_agents(
+        tmp_path, monkeypatch):
+    """⛔⛔ AN OWNER DECISION, PINNED SO THAT CHANGING IT MEANS FACING IT.
+
+    A person closing the research Chrome window leaves no `.stop` and no
+    `.pause`, and nothing at the CDP level tells a deliberate close from a
+    segfault — so it takes the crash path: a SILENT relaunch that resumes from
+    the checkpoint, up to BROWSER_CRASH_MAX_RETRIES times, then the card. That is
+    the self-heal rule ("alert only when the user must act"), and it stays. (On
+    macOS closing the window usually leaves Chrome alive, so this is mostly the
+    Windows and Linux path, where the last window quits Chrome.)
+
+    What made it expensive was not the relaunch but what the relaunch did: it
+    bought every finished Deep Research again. So the pin runs on in to the
+    relaunch's own plan — the agent that finished is kept, the rest launch.
+
+    ⚠ The budget belongs to the RELAUNCHES (resume_dir set). The first failure
+    always gets its one shot whatever the counter says, so the spent-budget case
+    is asked the way the recursion asks it."""
+    monkeypatch.setattr(research, "_login_interrupt_active", lambda *a, **k: False)
+    q = tmp_path / "run"
+    (q / "documents").mkdir(parents=True)
+    (q / "documents" / "brief.md").write_text("# Research Brief\n\n" + "b" * 200,
+                                              encoding="utf-8")
+    (q / "documents" / "chatgpt.md").write_text("# ChatGPT Deep Research\n\n" + "c" * 400,
+                                                encoding="utf-8")
+    research._p2_mark_agent_done(q, "chatgpt", True, elapsed_sec=600)
+
+    # The window closes mid-phase-2: no sentinel, no delivery status.
+    assert research._plan_pipeline_auto_retry(q, None, "browser_crash", 0) == (True, 2, True)
+    # …and the silent relaunch buys only the agents that had not finished.
+    launch, kept = research._p2_resume_plan(q, ["chatgpt", "gemini", "claude"])
+    assert launch == ["gemini", "claude"]
+    assert list(kept) == ["ChatGPT"] and kept["ChatGPT"]["status"] == "done"
+    # One close short of the budget still relaunches silently…
+    assert research._plan_pipeline_auto_retry(
+        q, str(q), "browser_crash", research.BROWSER_CRASH_MAX_RETRIES - 1) == (True, 2, True)
+    # …and once it is spent, the next close puts the card in front of them.
+    assert research._plan_pipeline_auto_retry(
+        q, str(q), "browser_crash", research.BROWSER_CRASH_MAX_RETRIES)[0] is False
