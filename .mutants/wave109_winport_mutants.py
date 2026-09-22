@@ -18,7 +18,9 @@
           stamps `_sr_build.json` (a CRLF-blind fingerprint of the first-party
           sources, plus commit/dirty hints) BEFORE compiling, and
           tools/check_release.py refuses a release whose wheels disagree or
-          carry no stamp.
+          carry no stamp. ⭐ Repair round 2: and one that is not WHOLE — the
+          check said OK to a single staged wheel, because one wheel agrees
+          with itself.
 
 The quiet mutants matter most:
 
@@ -33,6 +35,10 @@ The quiet mutants matter most:
   C7  — the check compares commits too: stricter-looking, and it refuses the
         ordinary release where two machines built the same source from two
         commits.
+  C15 — the platform must equal the tag rather than sit inside it: the Mac
+        wheel's deployment target moves and every real release is refused.
+  C16 — a `.whl.part`, the carry that died halfway, lends its name's platform
+        to the release it was meant to complete.
 
 ⛔ ANCHORS ARE SINGLE STRING LITERALS AND MUST MATCH EXACTLY ONCE, and every
 mutated file must still COMPILE — a mutant that does not parse fails every test
@@ -118,6 +124,11 @@ C_EMPTY = "    if not wheels:\n        return False, ["
 C_DIR = '        out.extend(sorted(p.glob("*.whl")) if p.is_dir() else [p])'
 C_ADD = '        sources.add(stamp["source_sha256"])'
 C_EXIT = "    return 0 if ok else 1"
+C_REQUIRED = 'REQUIRED_PLATFORMS = {"macosx": "macOS", "win_amd64": "Windows", "manylinux": "Linux"}'
+C_ABSENT = ("    absent = missing_platforms(wheels)\n"
+            "    if absent:\n")
+C_ANY = '            if not any(key in tag for tag in tags)]'
+C_SUFFIX = '    if wheel.suffix != ".whl":\n        return ""\n'
 C_EXCEPT = "    except (OSError, KeyError, ValueError, zipfile.BadZipFile):"
 
 MUTANTS = [
@@ -312,6 +323,31 @@ MUTANTS = [
     ("C10", "under", CHECK,
      "the check reads a name the build does not write",
      [(S_NAME, 'STAMP_NAME = "sr_build.json"')]),
+
+    # ── repair round 2: the release has to be WHOLE ────────────────────────
+    ("C11", "under", CHECK,
+     "⛔⛔ THE DEFECT — the platforms are not counted: one wheel agrees with "
+     "itself, so a release staged without the Mac wheel passes the gate",
+     [(C_ABSENT, "    absent = []\n    if absent:\n")]),
+    ("C12", "under", CHECK,
+     "⛔ only the Mac is required — a release without the Windows wheel, the case "
+     "install.ps1 cannot catch either, publishes",
+     [(C_REQUIRED, 'REQUIRED_PLATFORMS = {"macosx": "macOS"}')]),
+    ("C13", "under", CHECK,
+     "the Linux wheel is optional",
+     [(C_REQUIRED, 'REQUIRED_PLATFORMS = {"macosx": "macOS", "win_amd64": "Windows"}')]),
+    ("C14", "under", CHECK,
+     "⛔ ANY wheel satisfies EVERY platform — three source-mode wheels are a "
+     "whole release",
+     [(C_ANY, "            if not tags]")]),
+    ("C15", "over", CHECK,
+     "⛔ the whole tag must equal the fragment: the Mac wheel's deployment target "
+     "(and the manylinux glibc) makes every real release refuse",
+     [(C_ANY, "            if not any(key == tag for tag in tags)]")]),
+    ("C16", "over", CHECK,
+     "a file that is not a wheel still lends its name's platform — the "
+     "`.whl.part` of an interrupted copy stands in for the wheel",
+     [(C_SUFFIX, "")]),
 ]
 
 

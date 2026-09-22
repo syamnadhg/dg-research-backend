@@ -15,7 +15,10 @@ definitions resolve, and an image's name lookup ends at the image's deadline.
        clipboard read on Windows) matched no definition, so every reference image
        stayed `![c][1]` and its definition kept the platform URL.
   (+) `_doc_img_resolve_host` → getaddrinfo had no time bound and ran outside the
-       image's deadline; so did the connect's own lookup.
+       image's deadline; so did the connect's own lookup. ⭐ Repair round 2 gave
+       that bound a constant of its own (`_DOC_IMG_LOOKUP_TIMEOUT`) above one
+       resolver retry, and made a lookup the CLOCK ended something the research
+       does not remember.
 
 Every mutant below is a way the fix could go back to decoration while looking
 installed. The quiet ones matter most:
@@ -31,6 +34,14 @@ installed. The quiet ones matter most:
         real link alive, and the label a renderer reads loses every definition.
   L2  — the URL check hands the lookup a deadline an hour away: the bound exists
         and binds nothing the image's clock can see.
+  L14/L15 — ⛔⛔ REPAIR ROUND 2. The bound the wave shipped WAS the connect
+        timeout, and 5 s is a stub resolver's own first-attempt timeout: one lost
+        UDP query answered at ~5.1 s and read as a resolver that is down. Both
+        mutants put it back, one at the constant and one at the use.
+  L17 — and the other half: that verdict went into the per-research cache with
+        115 of the document's 120 s unspent, so the brief, the other agent
+        reports, the consolidated report and the Super Research all captioned the
+        same chart without asking again.
 
 ⛔ ANCHORS ARE SINGLE STRING LITERALS AND MUST MATCH EXACTLY ONCE, and every
 mutated file must still COMPILE — a mutant that does not parse fails every test
@@ -120,7 +131,15 @@ L_CHECK = "        addrs = _doc_img_resolve_host(parts.hostname, 443, deadline)\
 L_RESOLVE = "    return [info[4][0] for info in _doc_img_lookup(host, port, deadline)]"
 L_CONNECT = ('        infos = _doc_img_lookup(host.strip("[]"), port, deadline,\n'
              "                                allowed_gai_family())[:_DOC_IMG_CONNECT_ADDRS]\n")
-L_LEFT = "    left = min(_DOC_IMG_TIMEOUT[0], deadline - time.monotonic())\n"
+L_LEFT = "    left = min(_DOC_IMG_LOOKUP_TIMEOUT, deadline - time.monotonic())\n"
+L_BOUND = "_DOC_IMG_LOOKUP_TIMEOUT = 10.0"
+L_CHECK_TO = ('        raise _DocImageRefused("failed", timed_out=isinstance(exc, TimeoutError))'
+              " from None\n    if not addrs")
+L_CONNECT_TO = ('        raise _DocImageRefused("failed", timed_out=isinstance(exc, TimeoutError))'
+                " from None\n    skipped")
+L_KEEP = "    if cut_off and (timed_out or time.monotonic() >= run.deadline):\n"
+L_SET = "        timed_out = refusal.timed_out\n"
+L_FIELD = "        self.timed_out = timed_out\n"
 L_GUARD = ('    if left <= 0:\n        raise TimeoutError("lookup")\n    box: dict = {}\n')
 L_GAI = "            box[\"infos\"] = socket.getaddrinfo(host, port, family, socket.SOCK_STREAM)\n"
 L_CATCH = "        except BaseException as exc:  # noqa: BLE001 — raised again in the waiting thread\n"
@@ -333,6 +352,46 @@ MUTANTS = [
     ("L13", "over", RESEARCH,
      "the lookup asks for every socket type, not a stream",
      [(L_GAI, "            box[\"infos\"] = socket.getaddrinfo(host, port, family)\n")]),
+
+    # ── repair round 2: the lookup's own bound, and the clock's verdict ─────
+    ("L14", "under", RESEARCH,
+     "⛔⛔ THE DEFECT — the lookup's bound goes back onto a resolver's own retry "
+     "interval: one lost UDP query is a resolver that is DOWN",
+     [(L_BOUND, "_DOC_IMG_LOOKUP_TIMEOUT = 5.0")]),
+    ("L15", "under", RESEARCH,
+     "⛔⛔ THE DEFECT AT THE OTHER SITE — the lookup borrows the CONNECT timeout "
+     "again, whatever its own constant says",
+     [(L_LEFT, "    left = min(_DOC_IMG_TIMEOUT[0], deadline - time.monotonic())\n")]),
+    ("L16", "over", RESEARCH,
+     "the bound is above the image's whole budget — it binds nothing the image's "
+     "clock cannot already see",
+     [(L_BOUND, "_DOC_IMG_LOOKUP_TIMEOUT = 300.0")]),
+    ("L17", "under", RESEARCH,
+     "⛔⛔ THE SECOND HALF OF THE DEFECT — a lookup the clock ended is remembered "
+     "for the research again, so every later document captions that image",
+     [(L_KEEP, "    if cut_off and time.monotonic() >= run.deadline:\n")]),
+    ("L18", "over", RESEARCH,
+     "nothing decided while the image was being read is ever remembered: the "
+     "per-image limit is paid again by every document of the research",
+     [(L_KEEP, "    if cut_off:\n")]),
+    ("L19", "over", RESEARCH,
+     "⛔ every resolver failure reads as the clock — a name that does not exist is "
+     "looked up again in every document",
+     [(L_CHECK_TO, '        raise _DocImageRefused("failed", timed_out=True) from None\n'
+                   "    if not addrs")]),
+    ("L20", "under", RESEARCH,
+     "the URL check's lookup no longer says the clock ended it",
+     [(L_CHECK_TO, '        raise _DocImageRefused("failed") from None\n    if not addrs')]),
+    ("L21", "under", RESEARCH,
+     "the CONNECT's lookup no longer says the clock ended it — the second answer, "
+     "inside the requests chain",
+     [(L_CONNECT_TO, '        raise _DocImageRefused("failed") from None\n    skipped')]),
+    ("L22", "under", RESEARCH,
+     "the refusal says the clock ended it and the funnel does not read that",
+     [(L_SET, "")]),
+    ("L23", "under", RESEARCH,
+     "the refusal carries the flag and never sets it",
+     [(L_FIELD, "        self.timed_out = False\n")]),
 ]
 
 

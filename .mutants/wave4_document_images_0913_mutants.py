@@ -865,13 +865,15 @@ MUTANTS = [
        '_DOC_IMG_STOP_POLL_SEC = 5.0')]),
 
     # ── repair round 3: what is remembered for the rest of the research ──────
+    # ⭐ Re-aimed 2026-09-21 (wave 10.9, repair round 2): the same rule now also
+    # lets a lookup the CLOCK ended out of the cache (`timed_out`).
     ('CU1', RP, 'under',
      '⛔ AN IMAGE CUT OFF BY THE DOCUMENT\'S SPENT BUDGET IS CACHED AS FAILED: a chart that started with 3 s left is a caption in every later document, each with a fresh budget',
-     [('    if cut_off and time.monotonic() >= run.deadline:\n        return ref\n',
+     [('    if cut_off and (timed_out or time.monotonic() >= run.deadline):\n        return ref\n',
        '')]),
     ('CU2', RP, 'under',
      '⛔ THE CUT-OFF RULE WIDENS to any failure while reading: a dead host that fails at once is refetched by every document',
-     [('    if cut_off and time.monotonic() >= run.deadline:',
+     [('    if cut_off and (timed_out or time.monotonic() >= run.deadline):',
        '    if cut_off:')]),
     ('CU3', RP, 'under',
      'A DEFINITE VERDICT AT THE DEADLINE IS FORGOTTEN: a login-only image answered as the budget ran out is fetched again by every document',
@@ -959,8 +961,8 @@ MUTANTS = [
     # `_doc_img_lookup`, the one bounded lookup both the URL check and the connect use.
     ('CN4', RP, 'over',
      'A LOOKUP STARTS AFTER THE IMAGE\'S DEADLINE',
-     [('    left = min(_DOC_IMG_TIMEOUT[0], deadline - time.monotonic())\n    if left <= 0:\n        raise TimeoutError("lookup")\n',
-       '    left = min(_DOC_IMG_TIMEOUT[0], deadline - time.monotonic())\n')]),
+     [('    left = min(_DOC_IMG_LOOKUP_TIMEOUT, deadline - time.monotonic())\n    if left <= 0:\n        raise TimeoutError("lookup")\n',
+       '    left = min(_DOC_IMG_LOOKUP_TIMEOUT, deadline - time.monotonic())\n')]),
     ('CN5', RP, 'under',
      'A CONNECT STARTS WITH NO TIME LEFT: a socket is made and a negative timeout raises out of the loop, leaking it',
      [('        left = deadline - time.monotonic()\n        if left <= 0:\n            out_of_time = True\n            break\n',

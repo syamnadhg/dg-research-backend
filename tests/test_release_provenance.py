@@ -346,7 +346,15 @@ def test_the_build_stamps_the_uncompiled_source_into_every_wheel(tmp_path, monke
     with zipfile.ZipFile(compiled) as z:
         assert "def main():\n    return 0" not in z.read("research.py").decode("utf-8"), (
             "the stand-ins did not reach the compile step — this test measured nothing")
-    assert release.main([str(outdir)]) == 0
+    # ⭐ What the check makes of this build: the stamps it wrote are readable and
+    # they agree — the ONLY thing it refuses is that one machine builds one
+    # platform and a release is all of them. So the verdict is read from the
+    # report, not from the exit code, and the platform names are not asserted:
+    # they depend on the machine this suite runs on.
+    ok, report = release.check(wheels)
+    refusals = [ln for ln in report if ln.startswith("REFUSED")]
+    assert not ok and len(refusals) == 1, report
+    assert "not a whole release" in refusals[0], report
 
 
 # ── check_release: one release, one source ──────────────────────────────────
@@ -415,18 +423,73 @@ def test_one_wheel_without_a_usable_stamp_fails(tmp_path, bad):
 
 
 def test_a_file_that_is_not_a_wheel_fails(tmp_path):
-    wheels = _release(tmp_path, _stamp(), _stamp())
+    """⭐ A WHOLE release plus the junk, so the junk is the only thing wrong with
+    it — with two wheels this also refused for the platform it was missing."""
+    wheels = _release(tmp_path, _stamp(), _stamp(), _stamp())
     junk = tmp_path / f"superresearch-{VERSION}-cp313-cp313-win_amd64.whl.part"
     junk.write_bytes(b"not a zip")
     assert release.main([str(w) for w in wheels] + [str(junk)]) == 1
 
 
-def test_no_wheels_is_not_a_pass(tmp_path):
-    """An empty glob or an empty staging directory checked nothing."""
-    assert release.main([]) == 1
-    empty = tmp_path / "staging"
-    empty.mkdir()
-    assert release.main([str(empty)]) == 1
+@pytest.mark.parametrize("left_out, named", [(0, "macOS"), (1, "Windows"), (2, "Linux")])
+def test_a_release_staged_without_one_platform_is_refused(tmp_path, capsys, left_out, named):
+    """⛔⛔ THE GATE'S WHOLE PURPOSE. The Windows box builds win + linux and the Mac
+    wheel is carried over by hand; a forgotten carry used to print "OK: every wheel
+    (1) was built from the same source" and exit 0 — one wheel agrees with itself.
+    The refusal NAMES the platform, because the person reading it is about to run
+    the single publish command."""
+    staged = [_wheel(tmp_path / f"superresearch-{VERSION}-{plat}.whl", _stamp())
+              for i, plat in enumerate(_PLATFORMS) if i != left_out]
+    assert release.main([str(w) for w in staged]) == 1
+    out = capsys.readouterr().out
+    assert "REFUSED" in out and named in out
+
+
+def test_an_interrupted_copy_does_not_stand_in_for_the_wheel_it_was_becoming(tmp_path, capsys):
+    """A `.whl.part` is the carry that died halfway — the exact way the Mac wheel
+    goes missing. Its NAME says win_amd64/macosx all the same, and the platform
+    must be read from a wheel, not from a file name."""
+    staged = [_wheel(tmp_path / f"superresearch-{VERSION}-{plat}.whl", _stamp())
+              for plat in _PLATFORMS if "win_amd64" not in plat]
+    part = tmp_path / f"superresearch-{VERSION}-cp313-cp313-win_amd64.whl.part"
+    part.write_bytes(b"not a zip")
+    assert release.main([str(w) for w in staged] + [str(part)]) == 1
+    assert "Windows" in capsys.readouterr().out, "the missing platform is not named"
+
+
+def test_a_source_mode_wheel_does_not_stand_in_for_a_platform(tmp_path, capsys):
+    """A `py3-none-any` wheel is the build's source-mode fallback — it is no
+    platform's, and counting files instead of platforms would let it pass."""
+    wheels = [_wheel(tmp_path / f"superresearch-{VERSION}-{plat}.whl", _stamp())
+              for plat in _PLATFORMS[:2]]
+    wheels.append(_wheel(tmp_path / f"superresearch-{VERSION}-py3-none-any.whl", _stamp()))
+    assert release.main([str(w) for w in wheels]) == 1
+    assert "Linux" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("mac", ["cp313-cp313-macosx_11_0_arm64",
+                                 "cp313-cp313-macosx_14_0_arm64",
+                                 "cp313-cp313-macosx_11_0_arm64.macosx_12_0_x86_64"])
+def test_the_mac_wheels_deployment_target_is_not_part_of_the_test(tmp_path, mac):
+    """Accept polarity: `--macos-target` decides how the Mac tag reads, and a
+    release must not start failing the day it moves (or the day the wheel is
+    retagged for two architectures). What is checked is that the platform is HERE."""
+    wheels = [_wheel(tmp_path / f"superresearch-{VERSION}-{plat}.whl", _stamp())
+              for plat in (mac,) + _PLATFORMS[1:]]
+    assert release.main([str(w) for w in wheels]) == 0
+
+
+def test_no_wheels_is_not_a_pass(tmp_path, capsys):
+    """An empty glob or an empty staging directory checked nothing.
+
+    ⛔ AND IT SAYS SO IN ITS OWN WORDS. The platform count refuses this too — no
+    wheels, so no platform — and would leave the person who typed a glob that
+    matched nothing reading about a Mac wheel they never built. The exit code
+    alone cannot tell the two apart, so the sentence is what is pinned."""
+    for argv in ([], [str((tmp_path / "staging").resolve())]):
+        (tmp_path / "staging").mkdir(exist_ok=True)
+        assert release.main(argv) == 1
+        assert "checking nothing is not a pass" in capsys.readouterr().out
 
 
 def test_a_staging_directory_stands_for_every_wheel_in_it(tmp_path):

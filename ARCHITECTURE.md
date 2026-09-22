@@ -833,8 +833,13 @@ fingerprint of the first-party `.py` sources with CRLF read as LF — so a Windo
 autocrlf checkout, an rsync copy and a zip of the same code all agree — plus the
 git commit and dirty flag where the build tree could say. The check prints every
 wheel's stamp side by side and exits 1 if any wheel has none or the fingerprints
-differ. Commits are shown, never compared. It does not check that every platform
-is present; that is still the staging step's job.
+differ. Commits are shown, never compared. **It also counts the platforms** —
+macOS, Windows and Linux — and names the one that is missing: agreeing about the
+source says nothing about whether the release is whole, and a single staged wheel
+agrees with itself, so this printed `OK: every wheel (1)` and exited 0 on exactly
+the partial release the paragraph above is about. A wheel's platform is read from
+its tag as a fragment (`macosx`, `win_amd64`, `manylinux`), so the Mac deployment
+target and the glibc version can move without failing the check.
 
 **This is a code-execution supply chain, and it is worth being explicit about
 the surface.** The agent self-update resolves from the configured index —

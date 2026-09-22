@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Refuse a release whose wheels were not all built from the same source.
+"""Refuse a release that is not all of one release: a platform's wheel missing, or
+wheels that were not all built from the same source.
 
 WHY
 ---
@@ -18,6 +19,14 @@ value whether the build tree came from git, rsync or a zip, on any OS; plus
 every wheel it is given, prints them side by side, and exits 1 if any wheel has
 no readable stamp or the fingerprints disagree. `commit` and `dirty` are shown,
 never compared: two machines can build the same source from different commits.
+
+⛔⛔ AND IT COUNTS THE PLATFORMS (repair round 2). Agreeing about the source says
+nothing about whether the release is WHOLE, and one wheel agrees with itself:
+staged without the Mac wheel — the one carried over to the Windows box by hand —
+this printed "OK: every wheel (1) was built from the same source" and exited 0,
+the one gate that exists to stop exactly that. A version on PyPI without one
+platform's wheel takes every host on that platform down at its next upgrade, so a
+missing platform is refused here and named.
 
 Run it on the staged release, right before the single publish command.
 
@@ -39,6 +48,30 @@ from pathlib import Path
 #: check that the two names agree.
 STAMP_NAME = "_sr_build.json"
 
+#: The platforms one release publishes together, each keyed by the fragment the
+#: build writes into the wheel's platform tag and named the way a person says it.
+#: ⛔ A FRAGMENT, NOT A WHOLE TAG: the Mac wheel's tag carries its deployment
+#: target (`macosx_11_0_arm64`, `macosx_14_0_arm64` — tools/build_compiled.py
+#: `--macos-target`) and the manylinux tag its glibc, so a release would fail this
+#: check the day either moved. What must be true is that each platform is HERE.
+REQUIRED_PLATFORMS = {"macosx": "macOS", "win_amd64": "Windows", "manylinux": "Linux"}
+
+
+def platform_tag(wheel: Path) -> str:
+    """The platform tag `wheel`'s file name declares — the last of the "-" fields
+    of a wheel name — or "" when the name is not a wheel's at all. The build's
+    source-mode fallback tags `py3-none-any`, which is no platform."""
+    if wheel.suffix != ".whl":
+        return ""
+    return wheel.stem.rpartition("-")[2]
+
+
+def missing_platforms(wheels: "list[Path]") -> "list[str]":
+    """The platforms of `REQUIRED_PLATFORMS` no wheel here carries, in that order."""
+    tags = [platform_tag(w) for w in wheels]
+    return [name for key, name in REQUIRED_PLATFORMS.items()
+            if not any(key in tag for tag in tags)]
+
 
 def read_stamp(wheel: Path) -> "dict | None":
     """The provenance stamp inside `wheel`, or None when there is no usable one:
@@ -54,7 +87,8 @@ def read_stamp(wheel: Path) -> "dict | None":
 
 
 def check(wheels: "list[Path]") -> "tuple[bool, list[str]]":
-    """(ok, report lines) for one release's wheels."""
+    """(ok, report lines) for one release's wheels: every `REQUIRED_PLATFORMS`
+    platform present, every wheel stamped, and one source behind them all."""
     if not wheels:
         return False, ["REFUSED: no wheels given — checking nothing is not a pass"]
     lines: "list[str]" = []
@@ -73,9 +107,15 @@ def check(wheels: "list[Path]") -> "tuple[bool, list[str]]":
     if len(sources) > 1:
         problems.append(f"the wheels fingerprint {len(sources)} different sources — "
                         "they were not built from the same code")
+    absent = missing_platforms(wheels)
+    if absent:
+        problems.append("this is not a whole release — no " + " and no ".join(absent)
+                        + " wheel. Publishing a version without one platform's wheel "
+                        "takes every host on that platform down at its next upgrade.")
     if problems:
         return False, lines + ["REFUSED: " + p for p in problems]
-    return True, lines + [f"OK: every wheel ({len(wheels)}) was built from the same source"]
+    return True, lines + [f"OK: every wheel ({len(wheels)}) was built from the same "
+                          f"source, and all {len(REQUIRED_PLATFORMS)} platforms are here"]
 
 
 def wheels_from(args: "list[str]") -> "list[Path]":

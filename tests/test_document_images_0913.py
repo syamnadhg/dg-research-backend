@@ -3956,11 +3956,16 @@ def test_a_hung_second_lookup_inside_the_real_chain_ends_at_the_deadline(monkeyp
     assert [c[0] for c in calls] == ["img.example.com", "img.example.com"] and made == []
 
 
-def test_a_lookup_gets_no_more_than_a_connect_timeout(monkeypatch):
-    """Far from the image's deadline, a lookup still ends at the connect timeout — a
-    resolver that is down costs each image that, not its whole budget."""
+def test_a_lookup_gets_no_more_than_its_own_bound(monkeypatch):
+    """Far from the image's deadline, a lookup still ends at `_DOC_IMG_LOOKUP_TIMEOUT`
+    — a resolver that is down costs each image that, not its whole budget.
+
+    ⛔⛔ AND THAT BOUND IS THE LOOKUP'S OWN, never `_DOC_IMG_TIMEOUT[0]`: the connect
+    timeout left at 5 s here is what the lookup used to borrow, and it sat exactly on
+    a stub resolver's own retry interval (section 39)."""
     release, _calls = _hung_resolver(monkeypatch)
-    monkeypatch.setattr(R, "_DOC_IMG_TIMEOUT", (0.3, 10.0))
+    monkeypatch.setattr(R, "_DOC_IMG_TIMEOUT", (5.0, 10.0))
+    monkeypatch.setattr(R, "_DOC_IMG_LOOKUP_TIMEOUT", 0.3)
     t0 = time.monotonic()
     try:
         with pytest.raises(R._DocImageRefused) as got:
@@ -4018,3 +4023,107 @@ def test_every_hop_checks_its_url_against_the_images_deadline(net):
     end = far()
     assert R._doc_img_fetch("https://img.example.com/a.png", end) == png()
     assert net.deadlines == [end, end]
+
+
+# ═══ 39. repair round 2 — the lookup's own bound, and the clock's verdict ══════
+#
+# ⛔⛔ WAVE 10.9 BOUNDED THE LOOKUP WITH THE CONNECT TIMEOUT, and 5 s is a stub
+# resolver's own first-attempt timeout: one lost UDP query — ordinary on congested
+# wifi or a VPN — answered at ~5.1 s and read as a resolver that is DOWN. The image
+# was "failed" with 25 of its 30 s and 115 of the document's 120 s unspent, and
+# because the DOCUMENT's deadline had not passed the verdict went into the
+# per-research cache: the brief, the other agent reports, the consolidated report
+# and the Super Research all captioned that chart without asking again. Before the
+# wave, getaddrinfo was unbounded and a 5.1 s answer simply arrived.
+#
+# So the bound is the lookup's own, above one resolver retry — and a lookup the
+# CLOCK ended is not remembered at all, whatever the document has left.
+
+def test_the_lookup_bound_is_above_one_resolver_retry_and_under_the_image_budget():
+    """The two real values, not a monkeypatched pair. ⛔ AT the connect timeout is
+    the defect: a resolver's first attempt times out there and retries, so the bound
+    would decide against every answer that arrives on the retry. Under the per-image
+    budget is what makes it a bound at all — a resolver that is down must cost the
+    image, never the document."""
+    assert R._DOC_IMG_LOOKUP_TIMEOUT > R._DOC_IMG_TIMEOUT[0]
+    assert R._DOC_IMG_LOOKUP_TIMEOUT < R._DOC_IMG_PER_IMAGE_SEC
+
+
+def test_a_resolver_answering_one_retry_late_still_keeps_the_image(monkeypatch):
+    """⛔⛔ ACCEPT POLARITY — the defect itself, EXECUTED. The answer lands past the
+    connect timeout and far inside the image's budget; the URL check keeps it."""
+    monkeypatch.setattr(R, "_DOC_IMG_TIMEOUT", (0.2, 10.0))
+    monkeypatch.setattr(R, "_DOC_IMG_LOOKUP_TIMEOUT", 0.6)
+    calls = []
+
+    def late(host, port, family=0, type=0, *a, **k):
+        calls.append(host)
+        time.sleep(0.3)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+    monkeypatch.setattr(socket, "getaddrinfo", late)
+    R._doc_img_check_url("https://img.example.com/a.png", far())
+    assert calls == ["img.example.com"]
+
+
+def test_a_lookup_that_ran_out_of_time_is_not_remembered_for_the_research(world, monkeypatch):
+    """⛔⛔ THE FUNNEL, TWO DOCUMENTS OF ONE RESEARCH. The first document's lookup
+    times out with almost all of its 120 s left, so the document-deadline escape
+    cannot excuse it; the second must still fetch the image and store it."""
+    url = "https://img.example.com/chart.png"
+    looks = []
+
+    def timing_out(host, port, deadline):
+        looks.append(host)
+        raise TimeoutError("lookup")
+    monkeypatch.setattr(R, "_doc_img_resolve_host", timing_out)
+    assert rehost(f"![Chart]({url})", "ChatGPT") == "![Chart]()"
+    assert looks == ["img.example.com"] and world.fetches == [url]
+    assert world.logs[-1][1].endswith("failed=1 linked=0 captioned=1 removed=0")
+    # The next document of the SAME research, the resolver answering again.
+    world.images[url] = png()
+    monkeypatch.setattr(R, "_doc_img_resolve_host",
+                        lambda host, port, deadline: ["93.184.216.34"])
+    assert rehost(f"again ![Chart]({url})", "Gemini") == f"again ![Chart]({ref_for(png())})"
+    assert world.fetches == [url, url]
+
+
+def test_a_host_that_does_not_resolve_is_still_remembered(world, monkeypatch):
+    """Polarity: the ANSWER refused this image, not the clock. The name does not
+    exist, and asking again in every document of the research buys nothing."""
+    url = "https://nowhere.example.com/chart.png"
+    looks = []
+
+    def missing(host, port, deadline):
+        looks.append(host)
+        raise socket.gaierror(8, "nodename nor servname provided")
+    monkeypatch.setattr(R, "_doc_img_resolve_host", missing)
+    assert rehost(f"![Chart]({url})", "ChatGPT") == "![Chart]()"
+    world.images[url] = png()
+    assert rehost(f"again ![Chart]({url})", "Gemini") == "again ![Chart]()"
+    assert looks == ["nowhere.example.com"] and world.fetches == [url]
+
+
+def test_the_connect_lookup_running_out_is_not_remembered_either(monkeypatch):
+    """The SECOND lookup — the connect's own, inside the real requests chain. The URL
+    check's lookup answers, the connect's hangs, and that is the clock too."""
+    monkeypatch.setattr(R, "_doc_img_cache", collections.OrderedDict())
+    monkeypatch.setattr(R, "_fresh_user_mode_id_token", lambda: "tok-1")
+    # ⭐ The IMAGE's budget bounds the lookup here, not `_DOC_IMG_LOOKUP_TIMEOUT`:
+    # what is under test is the verdict, and it must go red for that alone. The
+    # document keeps its whole 120 s, so its own deadline cannot excuse the write.
+    monkeypatch.setattr(R, "_DOC_IMG_PER_IMAGE_SEC", 0.3)
+    release, calls = _hung_resolver(monkeypatch, answer_first=1)
+    made = []
+    monkeypatch.setattr(socket, "socket", lambda *a, **k: made.append(a))
+    url = "https://img.example.com/a.png"
+    try:
+        first = R._DocImageRun(UID, RID, "ChatGPT", 120.0)
+        assert R._doc_img_resolve_src(url, first) is None
+        second = R._DocImageRun(UID, RID, "Gemini", 120.0)
+        assert R._doc_img_resolve_src(url, second) is None
+    finally:
+        release.set()
+    # Two lookups for the first document — the URL check's answered, the connect's
+    # hung — and a THIRD for the second document: the clock's verdict was not kept.
+    assert [c[0] for c in calls] == ["img.example.com"] * 3
+    assert first.stats["failed"] == 1 and second.stats["failed"] == 1 and made == []

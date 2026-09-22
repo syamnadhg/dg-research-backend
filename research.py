@@ -47956,6 +47956,18 @@ _DOC_IMG_DOC_BUDGET_SEC = 120.0
 # (or at the document's deadline, if sooner). `_DOC_IMG_TIMEOUT` bounds one socket
 # receive only; see `_DocImgDeadline`.
 _DOC_IMG_PER_IMAGE_SEC = 30.0
+# ⛔⛔ A NAME LOOKUP IS NOT A CONNECT, AND THIS IS NOT `_DOC_IMG_TIMEOUT[0]`
+# (wave 10.9, repair round 2). The bound exists so a resolver that is DOWN cannot
+# hold the rehost thread past the image's deadline — not to say how long a
+# WORKING resolver may take. A stub resolver's own first attempt times out at 5 s
+# and then retries, so bounding the lookup at the 5 s connect timeout made one
+# lost UDP query — ordinary on congested wifi or a VPN — a "failed" image with 25
+# of its 30 s and 115 of the document's 120 s unspent; and that verdict was
+# remembered for the whole research, so every later document captioned the same
+# chart without retrying. Above one resolver retry, well under the per-image
+# budget. ⭐ A lookup that times out anyway is not remembered either; see the
+# cache write in `_doc_img_resolve_src`.
+_DOC_IMG_LOOKUP_TIMEOUT = 10.0
 # ⛔ How many of the addresses an image host resolves to one connection tries
 # (`_doc_img_connect`). Each try gets min(connect timeout, time left).
 _DOC_IMG_CONNECT_ADDRS = 4
@@ -48048,12 +48060,18 @@ class _DocImageRefused(Exception):
     "refused" (a URL or address rule), "dropped" (too small) or "failed".
     "linked" — the destination answered a web page — carries `fallback`: the bucket
     it lands in when its markup is not a citation (`_doc_img_citation_shaped`).
-    ⛔ Carries no URL — its message is only ever the bucket name."""
+    ⛔ Carries no URL — its message is only ever the bucket name.
 
-    def __init__(self, kind: str, fallback: str = ""):
+    ⛔⛔ `timed_out` is THE CLOCK, not the image: a name lookup that ran out of time
+    says nothing about the host, so the verdict is not remembered for the research
+    (`_doc_img_resolve_src`) and the next document tries it again. Set only where a
+    bound this code chose ran out — never for a refusal the answer earned."""
+
+    def __init__(self, kind: str, fallback: str = "", timed_out: bool = False):
         super().__init__(kind)
         self.kind = kind
         self.fallback = fallback or kind
+        self.timed_out = timed_out
 
 
 class _DocImageRun:
@@ -48280,10 +48298,10 @@ def _doc_img_address_is_public(addr) -> bool:
 
 
 def _doc_img_lookup(host: str, port: int, deadline: float, family: int = 0) -> list:
-    """`socket.getaddrinfo` for one image, bounded by min(connect timeout, time left
-    before `deadline`). Out of time — before it starts or while it waits — is a
-    `TimeoutError`, an OSError, so every caller's failure path takes it; any other
-    error the lookup raised is raised here.
+    """`socket.getaddrinfo` for one image, bounded by min(`_DOC_IMG_LOOKUP_TIMEOUT`,
+    time left before `deadline`). Out of time — before it starts or while it waits
+    — is a `TimeoutError`, an OSError, so every caller's failure path takes it; any
+    other error the lookup raised is raised here.
 
     ⛔⛔ WHY A THREAD (wave 10.9). getaddrinfo takes no timeout, and a resolver that
     never answered held the rehost thread OUTSIDE the image's deadline: the URL check
@@ -48293,7 +48311,7 @@ def _doc_img_lookup(host: str, port: int, deadline: float, family: int = 0) -> l
     keeps only that thread, until the resolver gives up; it is a daemon, so it never
     holds the process's exit (a pool's threads are joined at exit).
     ⭐ Started from a rehost thread, it inherits that thread's blocked signals."""
-    left = min(_DOC_IMG_TIMEOUT[0], deadline - time.monotonic())
+    left = min(_DOC_IMG_LOOKUP_TIMEOUT, deadline - time.monotonic())
     if left <= 0:
         raise TimeoutError("lookup")
     box: dict = {}
@@ -48321,7 +48339,9 @@ def _doc_img_resolve_host(host: str, port: int, deadline: float) -> "list[str]":
 def _doc_img_check_url(url: str, deadline: float) -> None:
     """Refuse unless the URL is https on the default port, carries no credentials,
     and EVERY address its host resolves to is public. The lookup ends at the
-    image's `deadline` (`_doc_img_lookup`); a lookup that does not is "failed"."""
+    image's `deadline` or `_DOC_IMG_LOOKUP_TIMEOUT`, whichever is sooner
+    (`_doc_img_lookup`); a lookup that does not answer by then is "failed", and
+    "failed BY THE CLOCK" — nothing about this host was learned."""
     if len(url) > _DOC_IMG_MAX_URL_CHARS or _DOC_IMG_URL_BAD_CHARS_RE.search(url):
         raise _DocImageRefused("refused")
     try:
@@ -48337,8 +48357,8 @@ def _doc_img_check_url(url: str, deadline: float) -> None:
         raise _DocImageRefused("refused")
     try:
         addrs = _doc_img_resolve_host(parts.hostname, 443, deadline)
-    except OSError:
-        raise _DocImageRefused("failed") from None
+    except OSError as exc:
+        raise _DocImageRefused("failed", timed_out=isinstance(exc, TimeoutError)) from None
     if not addrs or not all(_doc_img_address_is_public(a) for a in addrs):
         raise _DocImageRefused("refused")
 
@@ -48367,9 +48387,9 @@ def _doc_img_connect(host: str, port: int, deadline: float, socket_options=None)
     packets held the worker about 150 s — past the per-image limit, the document
     budget and the hard stop — and the timer had nothing to shut.
     So: no lookup and no connect is started once `deadline` has passed; one lookup,
-    bounded like a connect (`_doc_img_lookup`, wave 10.9 — it was not bounded at
-    all); at most `_DOC_IMG_CONNECT_ADDRS` addresses; each try gets min(connect
-    timeout, time left).
+    bounded by `_DOC_IMG_LOOKUP_TIMEOUT` (`_doc_img_lookup`, wave 10.9 — it was not
+    bounded at all); at most `_DOC_IMG_CONNECT_ADDRS` addresses; each try gets
+    min(connect timeout, time left).
     ⛔⛔ An address that is not public is skipped BEFORE its socket is made: the URL
     check resolved the name once, this lookup is a second answer, and a rebinding
     name would otherwise get a TCP handshake with a LAN host before
@@ -48383,14 +48403,15 @@ def _doc_img_connect(host: str, port: int, deadline: float, socket_options=None)
     research, so an image the CLOCK ran out on was a caption in every later
     document. `out_of_time` keeps the two apart: the clock raises "failed", which
     `_doc_img_resolve_src` lets out of the cache when the document's budget is
-    spent, and the next document tries it again."""
+    spent — or, for a lookup that ran out (`timed_out`), whatever is left of it —
+    and the next document tries it again."""
     from urllib3.util.connection import allowed_gai_family
     try:
         # ⭐ The deadline is checked inside, before the lookup starts.
         infos = _doc_img_lookup(host.strip("[]"), port, deadline,
                                 allowed_gai_family())[:_DOC_IMG_CONNECT_ADDRS]
-    except OSError:
-        raise _DocImageRefused("failed") from None
+    except OSError as exc:
+        raise _DocImageRefused("failed", timed_out=isinstance(exc, TimeoutError)) from None
     skipped = tried = out_of_time = False
     for af, socktype, proto, _canon, addr in infos:
         if not _doc_img_address_is_public(addr[0]):
@@ -48890,9 +48911,17 @@ def _doc_img_resolve_src(src: str, run: "_DocImageRun", may_link: bool = False):
     # document. ⭐ Still remembered: the per-image limit (it ends BEFORE the
     # document's deadline), every verdict that is not "failed" (refused, login,
     # dropped, a page), and anything decided after the bytes were read.
+    # ⛔⛔ AND THE SAME FOR A NAME LOOKUP THAT RAN OUT (`timed_out`, repair round
+    # 2), whatever the document has left. The lookup's bound is this code's, not
+    # the document's, and it is spent per lookup — a resolver answering one retry
+    # late failed the image with 115 of the document's 120 s unused, so the
+    # deadline test below could never excuse it and the whole research captioned
+    # that chart. A timed-out lookup learned NOTHING about the host; the next
+    # document asks again.
     # Ends: with this call. Read by: the cache write below only.
     reading = True
     cut_off = False
+    timed_out = False
     try:
         data = (_doc_img_decode_data_uri(src) if is_data else
                 _doc_img_fetch(src, min(run.deadline, time.monotonic() + _DOC_IMG_PER_IMAGE_SEC)))
@@ -48913,10 +48942,11 @@ def _doc_img_resolve_src(src: str, run: "_DocImageRun", may_link: bool = False):
                 ref = _DOC_IMG_LINKED
         run.stats["linked" if ref is _DOC_IMG_LINKED else refusal.fallback] += 1
         cut_off = reading and refusal.kind == "failed"
+        timed_out = refusal.timed_out
     except Exception:
         run.stats["failed"] += 1
         cut_off = reading
-    if cut_off and time.monotonic() >= run.deadline:
+    if cut_off and (timed_out or time.monotonic() >= run.deadline):
         return ref
     # ⛔ An abandoned rehost remembers nothing: the next document reads this cache.
     if run.stopped:
@@ -70883,8 +70913,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # SYNTHESISES the real combined document at P5
             # (`superresearch-generate.ts` → `documents/synthesis`: planner →
             # sections → stitch, sources numbered before the first call), and it
-            # reads THE THREE PER-AGENT REPORTS, never this stack — so the
-            # concatenation has no reader of its own left.
+            # reads THE THREE PER-AGENT REPORTS, never this stack — so nothing
+            # consumes the concatenation as an INPUT any more; what is left reads
+            # it as a document, and only for a run that has no synthesis (below).
             #
             # ▶ THE DISK COPY IS GONE, and dropping it settles three things at
             # once rather than one:
@@ -70903,19 +70934,27 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             #     targeted resume the feedback sweep unlinks every non-brief MD,
             #     so the file could also simply vanish and be rebuilt by nothing.
             #
-            # ⛔⛔ THE FIRESTORE MIRROR STAYS, AND THAT IS NOT THE TASK LEFT HALF
-            # DONE — IT HAS A LIVE READER ON THE WEB. The P5 SUMMARY document
-            # reads `documents/consolidated` as its ONLY source and refuses
-            # without it ("no consolidated report to summarise" —
-            # summary-generate.ts:103, summary-doc.ts:76). On BOTH P5 legs the
-            # summary runs BEFORE the synthesis, so `documents/synthesis` does not
-            # exist yet at the moment that input is built, and the web's own note
-            # calls swapping the two call sites FILED, NOT BUILT.
-            # ▶ So this mirror is the last line of the stack, and it goes the
-            # moment the summary reads the synthesis instead (or joins the three
-            # agent documents itself). Deleting it today costs every run its
-            # Summary document, silently, and that document is minted a share link
-            # and quoted in the delivery mail.
+            # ⛔⛔ THE FIRESTORE MIRROR STAYS FOR NOW, AND THE REASON IS NOT THE
+            # ONE THAT USED TO BE WRITTEN HERE. Until 2026-09-21 this block said
+            # the P5 Summary document read `documents/consolidated` as its ONLY
+            # source and refused without it, so deleting the mirror cost every run
+            # its Summary. That contract is GONE: the web now builds the Summary
+            # from the Super Research document and only from it (owner's decision
+            # D-3 — `summary-generate.ts`, which reads the synthesis, the three
+            # agent reports for the contributor list alone, and this stack not at
+            # all); phase 5 writes the synthesis first, and a run whose synthesis
+            # was refused gets no Summary and a reason saying so.
+            # ▶ WHAT STILL READS `consolidated`, both for runs with no synthesis
+            # only: the chat's `get_document` fallback, and the documents
+            # catalogue — `visibleDocuments` hides the stack when a synthesis
+            # exists and KEEPS it when none does, which is a live run whose
+            # synthesis was refused as much as it is a historical one.
+            # ▶ So the condition for dropping this write is not "the summary moved"
+            # — it has — but that no surface needs a combined document for a run
+            # without a synthesis. It is ~250 KB a run until then, and the removal
+            # goes out AFTER the web half is pushed, never before: a machine that
+            # stopped writing it while the deployed web still falls back to it
+            # leaves those runs with nothing to show.
             consolidated_parts = [f"# Consolidated Research Report: {topic}\n"]
             for name in ["ChatGPT", "Gemini", "Claude"]:
                 r = results.get(name, {})
@@ -70931,7 +70970,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # /researches after the pipeline finishes. Non-blocking
                 # daemon thread; subsequent P3 (podcast) and FE P4/P5
                 # (distribution) phases add no new research content, so
-                # this is the final summary refresh.
+                # this is the final refresh of THIS field.
+                # ⭐ NOT the P5 Summary DOCUMENT, which is the web's and is
+                # built from the Super Research document: this is the
+                # `summary` FIELD on the research, the paragraph the
+                # /researches tile animates. `_consolidated_md` is passed as
+                # in-process text — the Firestore mirror above is not its
+                # input, and dropping that write would not touch this.
                 try:
                     _generate_research_summary_async(
                         topic,
