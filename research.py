@@ -4251,7 +4251,8 @@ class _RunLogCapture:
             _RUN_LOG_SINKS.append(sink)
             self.sink = sink
             tm.tm_emit(tm.Ev.RUN_STARTED,
-                       research_id=self.research_id, worker=WORKER_ID)
+                       research_id=_tm_research_id(self.research_id),
+                       worker=WORKER_ID)
         except Exception as exc:
             self.sink = None
             log(f"[run-log] capture unavailable for this run: {exc}", "WARN")
@@ -4284,7 +4285,7 @@ class _RunLogCapture:
             # EVERY run's terminal state, including the ones that die by
             # exception, and it already has the id and the duration.
             tm.tm_emit(tm.Ev.RUN_FINISHED,
-                       research_id=sink.research_id,
+                       research_id=_tm_research_id(sink.research_id),
                        outcome={"complete": tm.RunOutcome.COMPLETE,
                                 "errored": tm.RunOutcome.ERRORED,
                                 "cancelled": tm.RunOutcome.STOPPED,
@@ -5895,6 +5896,91 @@ def safe_name(topic, max_len=50):
     # leaked into queue dir names (e.g. multi-line Flow C topics like
     # "Research\n\nLinks to..."), which Windows rejects with WinError 123.
     return re.sub(r'[^\w-]+', '_', topic).strip('_')[:max_len]
+
+
+# ── A research that keeps nothing ────────────────────────────────────────────
+# ⛔⛔ THE ID IS THE SIGNAL, AND IT IS THE ONLY ONE (wave 10.9, #536). An
+# incognito research runs like any other paid run and leaves nothing in Super
+# Research once it ends. Four parties have to agree about which runs those are,
+# and only one of them could read a field: `firestore.rules` and `storage.rules`
+# see the PATH — the document id — before they see any data, and they are the
+# only thing that can refuse a write from a wheel shipped before this wave. A
+# `set(…, merge=True)` that resurrects a purged record carries only its merged
+# fields, so a flag ON the record is absent from the one write the promise most
+# needs refused. The id is in the path of every one of them.
+#
+# ⛔ THE SHAPE IS DUPLICATED IN THE WEB REPO — `src/lib/incognito.ts`,
+# `firestore.rules` and `storage.rules` all carry `incog_[0-9]{13}_[0-9]{1,6}`,
+# because rules cannot import and neither can this file. Change one and the four
+# stop agreeing about which runs the product refuses to keep.
+#
+# ⭐ ANCHORED AT BOTH ENDS, for the reason the web's copy gives: a bare
+# `startswith("incog_")` would call somebody's hand-made `incog_notes` record
+# ephemeral and hang a 48-hour fuse on an ordinary research.
+_INCOGNITO_ID_RE = re.compile(r"^incog_[0-9]{13}_[0-9]{1,6}$")
+
+
+def _is_incognito_research(research_id) -> bool:
+    """True when this research id names a run that must keep nothing.
+
+    ⛔ IT TAKES THE ID, NEVER THE ACTIVE-RUN GLOBAL. This process runs one
+    pipeline at a time, but its start listener, its sweeps and its boot recovery
+    all touch OTHER people's records in the same process — a helper that read
+    `_fb_research_id` would answer about the wrong run at every one of those
+    sites. Callers that mean the running pipeline pass `_fb_research_id`
+    themselves, and they are the minority."""
+    return isinstance(research_id, str) and bool(_INCOGNITO_ID_RE.match(research_id))
+
+
+def _mint_run_id(topic, research_id=None, now=None) -> str:
+    """The name of this run's queue directory, and the `backendRunId` the app
+    reads back.
+
+    ⛔⛔ AN ORDINARY RUN ID CARRIES THE TOPIC — `safe_name(topic)_YYYYMMDD_HHMMSS`
+    — deliberately, so an operator reading `queues/` can see what each folder is.
+    An incognito run cannot have that. This name reaches the device document's
+    `workers.{n}.runId`, which the machine's OWNER reads; the record's
+    `backendRunId`; every log line that names the job; and the folder on disk.
+    For somebody running on a computer they do not own, that is their research
+    subject written across another person's machine and another person's app —
+    while the owner is deliberately told only that a run happened.
+
+    ⭐ SAME SHAPE, so everything that parses a run id keeps working: the stamp
+    still ENDS the name (`_RUN_ID_STAMP_RE`, `_BUNDLE_QUEUE_NAME_RE`), and the
+    slug is still the part that identifies the run.
+
+    ⭐ UNIQUENESS COMES FROM THE RESEARCH ID, NOT FROM A RANDOM SOURCE. Dropping
+    the topic collapses every incognito run of the same second onto one folder
+    name, and two members of a shared computer claiming at the same second would
+    then share a queue directory — each writing the other's documents. The id's
+    own `<ms>_<counter>` tail is already unique per record, so the mint stays a
+    pure function of its arguments and can be pinned without seeding a clock."""
+    stamp = (now or datetime.now()).strftime("%Y%m%d_%H%M%S")
+    if _is_incognito_research(research_id):
+        return f"incognito_{research_id.removeprefix('incog_')}_{stamp}"
+    return f"{safe_name(topic)}_{stamp}"
+
+
+def _loggable_topic(topic, research_id=None, limit=40) -> str:
+    """What a log line may say this run is about.
+
+    ⛔ `backend.log` IS THE MACHINE'S, NOT ONE PERSON'S — `_log_job_ref` makes
+    the whole argument. Its tail ships in the owner's support bundle, and on a
+    shared computer every member's runs land in it. An ordinary run's topic is
+    allowed there: the owner can already see it in the queue folder name and the
+    app. An incognito run's is the one thing that must not be.
+
+    ⭐ THE MARK IS THE BUNDLE REDACTOR'S OWN, on purpose. `<topic removed>` is
+    already this product's word for "a research subject is not here", it is what
+    `_BUNDLE_TOPIC_BARE_RE` writes over the keyed shapes, and re-marking an
+    already-marked value is a no-op — so a redacted bundle and a live log read
+    the same, and there is one vocabulary instead of two.
+
+    Byte-identical to the old expression for every non-incognito run, which is
+    what keeps this off the ordinary path."""
+    if _is_incognito_research(research_id):
+        return _BUNDLE_TOPIC_MARK
+    return str(topic or "")[:limit]
 
 
 # ── Run-name reference ───────────────────────────────────────────────────────
@@ -15297,7 +15383,7 @@ def start_firestore_start_listener(job_queue, loop):
             # links from these in the P3-skip block of run_pipeline.
             user_links = data.get("userLinks") or []
             if not topic or not uid or not research_id:
-                log(f"Firestore start request missing fields: uid={uid}, rid={research_id}, topic={topic[:30]}", "WARN")
+                log(f"Firestore start request missing fields: uid={uid}, rid={research_id}, topic={_loggable_topic(topic, research_id, 30)}", "WARN")
                 try:
                     doc.reference.delete()
                 except Exception:
@@ -15511,7 +15597,7 @@ def start_firestore_start_listener(job_queue, loop):
                         _defer_reason = "claim-in-flight"
                     log(
                         f"[start-listener] worker {WORKER_ID}: defer {research_id[:8]}… "
-                        f"topic={topic[:40]!r} submittedBy={(data.get('submittedBy') or '?')[:8]} "
+                        f"topic={_loggable_topic(topic, research_id)!r} submittedBy={(data.get('submittedBy') or '?')[:8]} "
                         f"reason={_defer_reason}",
                         "INFO",
                     )
@@ -15672,7 +15758,7 @@ def start_firestore_start_listener(job_queue, loop):
                             # for cross-account triage.
                             log(
                                 f"[start-listener] worker {WORKER_ID}: FIFO defer {research_id[:8]}… "
-                                f"topic={topic[:40]!r} submittedBy={(data.get('submittedBy') or '?')[:8]} "
+                                f"topic={_loggable_topic(topic, research_id)!r} submittedBy={(data.get('submittedBy') or '?')[:8]} "
                                 f"(older unclaimed {_head_id[:8]}… is head)",
                                 "INFO",
                             )
@@ -15751,7 +15837,7 @@ def start_firestore_start_listener(job_queue, loop):
                         # silent skip is traceable from log alone.
                         log(
                             f"[start-listener] worker {WORKER_ID}: claim error — skipping {research_id[:8]}… "
-                            f"topic={topic[:40]!r} submittedBy={(data.get('submittedBy') or '?')[:8]} "
+                            f"topic={_loggable_topic(topic, research_id)!r} submittedBy={(data.get('submittedBy') or '?')[:8]} "
                             f"(idle-rescan will retry)",
                             "WARN",
                         )
@@ -15759,11 +15845,11 @@ def start_firestore_start_listener(job_queue, loop):
                     if _claim_outcome is False:
                         log(
                             f"[start-listener] worker {WORKER_ID}: queue doc lost to sibling — skipping {research_id[:8]}… "
-                            f"topic={topic[:40]!r} submittedBy={(data.get('submittedBy') or '?')[:8]}",
+                            f"topic={_loggable_topic(topic, research_id)!r} submittedBy={(data.get('submittedBy') or '?')[:8]}",
                             "INFO",
                         )
                         continue
-                    log(f"[start-listener] worker {WORKER_ID}: claimed {research_id[:8]}… topic={topic[:40]!r} submittedBy={(data.get('submittedBy') or '?')[:8]}", "INFO")
+                    log(f"[start-listener] worker {WORKER_ID}: claimed {research_id[:8]}… topic={_loggable_topic(topic, research_id)!r} submittedBy={(data.get('submittedBy') or '?')[:8]}", "INFO")
                     # Synchronously reserve a "pending enqueue" slot
                     # BEFORE call_soon_threadsafe schedules the actual
                     # put. This closes the back-to-back-claim race
@@ -15775,8 +15861,8 @@ def start_firestore_start_listener(job_queue, loop):
                     _pending_enq_inc()
 
             # Generate run_id
-            run_id = f"{safe_name(topic)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            log(f"Firestore start: uid={uid[:8]}... topic={topic[:40]} run_id={run_id}")
+            run_id = _mint_run_id(topic, research_id)
+            log(f"Firestore start: uid={uid[:8]}... topic={_loggable_topic(topic, research_id)} run_id={run_id}")
             # Decide initial status: "ongoing" if worker is idle AND the gate
             # won't block, else "queued" with position + behind-target so the
             # chat banner + tile badge can tell the user which run must
@@ -68927,7 +69013,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     _labels.append(_lbl)
             if _labels:
                 topic = "Research from " + ", ".join(_labels[:5])
-        run_name = run_id or f"{safe_name(topic)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        run_name = run_id or _mint_run_id(topic, research_id)
         queue_dir = Path(__file__).parent / "queues" / run_name
         queue_dir.mkdir(parents=True, exist_ok=True)
         (queue_dir / "documents").mkdir(exist_ok=True)
@@ -72964,6 +73050,19 @@ def _tm_platform(agent) -> "object | None":
     }.get(key, tm.Platform.OTHER)
 
 
+def _tm_research_id(research_id):
+    """The research id telemetry may carry, or None.
+
+    ⛔⛔ ONE ANSWER FOR ALL THREE EMITTERS. `RUN_STARTED`, `RUN_FINISHED` and the
+    per-event tap each hold the id and each would have to remember this on its
+    own — and `tm_emit` drops a `None` field silently, so a site that forgot
+    would look exactly like a site that remembered until somebody read the
+    spool. An incognito run reports its phases and its outcome; it does not
+    report WHICH run they belonged to, because that key is what would join its
+    whole timeline back together."""
+    return None if _is_incognito_research(research_id) else research_id
+
+
 def _tm_note_event(event_type, phase=None, agent=None) -> None:
     """`emit_event`'s tap into the content-free tier.
 
@@ -72971,7 +73070,21 @@ def _tm_note_event(event_type, phase=None, agent=None) -> None:
     mapped onto an enum. `**data` is structurally never passed, and
     `test_the_tier1_tap_forwards_a_literal_tuple` pins that set, because
     "temporarily" adding one field is how free text re-enters a content-free
-    path."""
+    path.
+
+    ⛔⛔ AND AN INCOGNITO RUN SENDS NO RESEARCH ID AT ALL (wave 10.9, #536). Two
+    reasons, and either alone would be enough. The telemetry module admits ONE
+    string shape — `RESEARCH_ID_RE`, `chat_<13 digits>_<counter>` — so an
+    `incog_…` id makes `coerce_field` raise, and `tm_emit` then logs a WARNING
+    and spools a TELEMETRY_INVALID counter for EVERY event of the run: a warning
+    flood on the person's own machine, and an invalid-event count that says the
+    product is broken when it is behaving. Widening that regex would be the
+    wrong repair — the id is the one field here that could join a run's whole
+    timeline back together, which is the thing an incognito run does not leave
+    behind. The events still ride (phase and platform are content-free); they
+    just stop naming the run.
+
+    ⭐ The ordinary path is untouched: a `chat_` run still carries its id."""
     mapped = _TM_EVENT_MAP.get(str(event_type))
     if mapped is None:
         return
@@ -72987,6 +73100,7 @@ def _tm_note_event(event_type, phase=None, agent=None) -> None:
         rid = sink.research_id if sink is not None else None
     except Exception:
         rid = None
+    rid = _tm_research_id(rid)
     if rid:
         fields["research_id"] = rid
     tm.tm_emit(mapped, **fields)
@@ -74955,7 +75069,7 @@ async def run_server(port=8000):
                     pass
                 continue
 
-            run_id = f"{safe_name(topic)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            run_id = _mint_run_id(topic, research_id)
             # ⛔ NO TOPIC — see `_log_job_ref`. This claim is logged to the
             # machine-wide `backend.log`, whose tail travels in the owner's
             # support bundle; the research id says which run this was.
@@ -75595,8 +75709,12 @@ async def run_server(port=8000):
         agents_cfg = config.get("agents", {"chatgpt": True, "gemini": True, "claude": True})
         if not any(agents_cfg.values()):
             return JSONResponse({"error": "at least one agent must be enabled"}, 400)
-        from datetime import datetime as _dt
-        run_id = f"{safe_name(topic)}_{_dt.now().strftime('%Y%m%d_%H%M%S')}"
+        # ⭐ THE SAME MINT AS EVERY OTHER START, with no research id to hand it:
+        # a serve-API run has no Firestore record, so it can never be incognito
+        # and gets the ordinary `safe_name(topic)_<stamp>` name. Routed through
+        # the helper anyway so this file has ONE place a run id is built — a
+        # fifth literal here is how the fourth one survived until wave 10.9.
+        run_id = _mint_run_id(topic)
         await _job_queue.put({"topic": topic, "email": email, "config": config,
                               "run_id": run_id, "uid": uid, "brief_text": brief_text})
         position = _job_queue.qsize()
@@ -85858,13 +85976,42 @@ def _newer_version_notice() -> "str | None":
     return _VERSION_NOTICE_MEMO  # type: ignore[return-value]
 
 
+#: ⛔⛔ WHAT THIS CODE KNOWS HOW TO DO, PUBLISHED SO THE APP CAN REFUSE IT — wave
+#: 10.9 (#536). An incognito run only keeps its promise if the machine that
+#: executes it understands one: a wheel shipped before this wave reads the
+#: record, sees an id it has no opinion about, and runs the ordinary pipeline —
+#: uploading the podcast, writing the `audios` row, stamping its events 30 days
+#: out and parking the run for Resume. Every one of those is the promise broken,
+#: and by then the person has paid for the run.
+#:
+#: The rules refuse those writes on every wheel (R1-R5), so nothing is KEPT
+#: either way — but a run that dies halfway through on a 403 has still spent the
+#: money. This key is what lets the app decline up front instead.
+#:
+#: ⭐ A VERSION NUMBER COULD NOT DO THIS JOB. A source checkout publishes
+#: `version: None` (below), which is exactly the owner's own machine, so a
+#: "newer than X" gate would refuse the developer's computer for ever. A
+#: capability answers the question that is actually being asked.
+#:
+#: ⭐ IT RIDES THE EXISTING THROTTLED VERSION PATCH rather than the 5-second
+#: heartbeat, and `incognitoRuns` was admitted to the device key list (and
+#: value-checked as an int) in the rules BEFORE this wheel sends it — a rules
+#: deploy lagging the wheel would refuse the whole patch under `hasOnly` and
+#: take the About row's update signal down with it.
+#:
+#: ⛔ THE VALUE IS A COUNT OF NOTHING; it is the KEY that carries the meaning.
+#: `1` is what the rules admit and what the app tests for presence of.
+_INCOGNITO_RUNS_CAPABILITY = 1
+
+
 def _device_version_fields(*, force: bool = False) -> dict:
     """Version fields the heartbeat publishes to the device doc: `version` (the
     BE's running package version) and `updateAvailable` (the newer version on
-    PyPI, or None when current). The FE reads these to show the backend version +
-    an update prompt. Sync (file read + 24h-cached PyPI); call OFF the event loop.
-    `force=True` does a FRESH PyPI check (the app's on-demand "Check for updates"
-    device command).
+    PyPI, or None when current), plus `incognitoRuns` — the capability the app
+    gates an incognito run on (see `_INCOGNITO_RUNS_CAPABILITY`). The FE reads
+    these to show the backend version + an update prompt. Sync (file read +
+    24h-cached PyPI); call OFF the event loop. `force=True` does a FRESH PyPI
+    check (the app's on-demand "Check for updates" device command).
 
     A SOURCE CHECKOUT yields version None + updateAvailable None: the app then
     shows "Backend version unknown" and offers no update, because a dev tree isn't
@@ -85879,8 +86026,12 @@ def _device_version_fields(*, force: bool = False) -> dict:
         # pull" and hide the Check/Update control — distinct from a pipx build
         # that just hasn't reported its version yet (offline/just-started), which
         # is also version None but SHOULD keep Check.
+        # ⛔ THE CAPABILITY IS ON THIS BRANCH TOO, and this is the branch that
+        # matters most today: the owner's own machine is a source checkout, and
+        # it is where the first incognito run will be fired.
         return {"version": None, "updateAvailable": None, "sourceCheckout": True,
-                "servingVersion": None}
+                "servingVersion": None,
+                "incognitoRuns": _INCOGNITO_RUNS_CAPABILITY}
     try:
         _v = _sr_version()
         version = _v if (_v and not _v.startswith("(")) else None
@@ -85915,7 +86066,8 @@ def _device_version_fields(*, force: bool = False) -> dict:
     _sv = _serving_version()
     serving = _sv if (_sv and not _sv.startswith("(")) else None
     return {"version": version, "updateAvailable": update_available,
-            "sourceCheckout": False, "servingVersion": serving}
+            "sourceCheckout": False, "servingVersion": serving,
+            "incognitoRuns": _INCOGNITO_RUNS_CAPABILITY}
 
 
 def _pipx_cmd() -> "list[str] | None":
