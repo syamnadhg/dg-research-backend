@@ -1069,10 +1069,12 @@ def test_the_device_handler_keeps_the_owner_and_nobody_else(machine, device):
     assert b"users/U_ALICE/researches/rA" in blobs["system/backend.log"]
 
 
-def test_the_count_never_reaches_the_bundle_row(machine, device):
-    """⛔⛔ NOT UNTIL THE RULES ALLOW IT. The row's `hasOnly` refuses an unknown
-    key and refuses the whole write with it — the row would stall at
-    'collecting'. The count lives in the zip until the rules deploy."""
+def test_the_count_reaches_the_DONE_row_and_no_other(machine, device):
+    """⛔ FLIPPED, wave 10.9 (W9). This pinned the count OFF the row, because the
+    row's `hasOnly` refused the key and refused the whole write with it. The
+    rules now name it, so the person who pressed Send is told that another
+    member's run was left out — as a count, on the `done` write only, which is
+    the one beside "Sent". The earlier writes stay as they were."""
     _run(machine, "bob_x", "U_BOB", "b\n")
     research._handle_send_logs_command(
         {"action": research.SEND_LOGS_ACTION, "code": "7QK4M2XZ",
@@ -1080,9 +1082,11 @@ def test_the_count_never_reaches_the_bundle_row(machine, device):
         "d-1", selected=False)
     writes = [op for op in device["_ops"] if "logBundles" in op[1]]
     assert writes, "no row was written — this proves nothing"
-    assert any(op[2].get("status") == "done" for op in writes)
+    done = [p for _k, _p, p in writes if p.get("status") == "done"]
+    assert len(done) == 1 and done[0]["runsOtherMembers"] == 1
     for _kind, _path, payload in writes:
-        assert "runsOtherMembers" not in payload
+        if payload.get("status") != "done":
+            assert "runsOtherMembers" not in payload
 
 
 def test_the_terminal_keeps_the_paired_uid(monkeypatch, capsys):
@@ -1110,7 +1114,9 @@ def test_the_terminal_keeps_the_paired_uid(monkeypatch, capsys):
     research.cmd_send_logs(assume_yes=True)
     assert seen["keep_uid"] == "U_PAIRED"
     assert "2 run(s) left out — another member ran them" in capsys.readouterr().out
-    assert rows and all("runsOtherMembers" not in p for p in rows)
+    # ⛔ FLIPPED, wave 10.9 (W9): the terminal's `done` row carries the count too,
+    # so a bundle sent from the terminal says the same on the web as it printed.
+    assert rows and rows[-1]["status"] == "done" and rows[-1]["runsOtherMembers"] == 2
 
 
 def test_an_unpaired_terminal_does_not_blame_a_member(monkeypatch, capsys):

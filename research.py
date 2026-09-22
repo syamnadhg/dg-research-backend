@@ -10569,15 +10569,63 @@ def _write_log_bundle_status(owner_uid: str, code: str, patch: dict,
     try:
         ref = (_firebase_db.collection("users").document(owner_uid)
                .collection("logBundles").document(code))
-        payload = _be_payload(body)
-        _grpc_write_with_heal(
-            (lambda: ref.set(payload)) if create else (lambda: ref.update(payload)),
-            what="log_bundle_status")
+
+        def _write(fields: dict) -> None:
+            payload = _be_payload(fields)
+            _grpc_write_with_heal(
+                (lambda: ref.set(payload)) if create else (lambda: ref.update(payload)),
+                what="log_bundle_status")
+
+        try:
+            _write(body)
+        except Exception as denied:
+            # ⛔⛔ THE LEFT-OUT COUNTS ARE THE ONE PART OF THIS ROW THE RULES MAY
+            # NOT KNOW YET (wave 10.9). `hasOnly` refuses the WHOLE write on an
+            # unknown key, and rules deploy separately from this code — so
+            # against an older ruleset the `done` write would lose its
+            # `objectPath` too, and the row would sit at 'uploading' naming
+            # nothing: the pathless row Clear logs has to hold back. The counts
+            # are worth less than the path, so a DENIAL of a write carrying them
+            # is tried once more without them. A network failure is not retried
+            # here — the heal ladder has already done that.
+            # ⛔ ONE more attempt, inline, never a recursive call: a write with
+            # nothing to strip re-raises at once instead of retrying itself.
+            bare = {k: v for k, v in body.items() if k not in _LOG_BUNDLE_LEFT_OUT_KEYS}
+            if len(bare) == len(body) or not _is_synth_permission_denied(denied):
+                raise
+            log("[send-logs] the row refused the left-out counts — the deployed "
+                "rules predate them; writing it without them", "WARN")
+            _write(bare)
         return True
     except Exception as exc:
         log(f"[send-logs] status write failed ({type(exc).__name__}) — the upload "
             f"continues; the row will look stale", "WARN")
         return False
+
+
+# ⭐ WHAT A BUNDLE LEFT OUT, as the row carries it (wave 10.9). The builder has
+# always counted these; they reached its own log line and the terminal, and
+# never the screen of the person who pressed Send.
+_LOG_BUNDLE_LEFT_OUT_KEYS = ("droppedForSize", "runsNotAttributed", "runsOtherMembers")
+
+
+def _log_bundle_left_out(summary: dict) -> dict:
+    """The three counts of what a bundle left out, for its `done` row.
+
+    ⛔ COUNTS, NEVER NAMES. `droppedForSize` is a list of folder and file names
+    in the builder's summary, and a run folder's name is a research id — the
+    row is read by a person whose bundle may have left out somebody else's run.
+    So only its length leaves this function.
+
+    ⭐ READ FROM THE BUILDER'S SUMMARY, on `maxRunsApplied`'s provenance rule:
+    what the archive was actually cut with, never what the caller asked for.
+    `runsNotAttributed` exists only on a selection; absent reads as zero, which
+    is what it means there."""
+    return {
+        "droppedForSize": len(summary.get("droppedForSize") or []),
+        "runsNotAttributed": int(summary.get("runsNotAttributed") or 0),
+        "runsOtherMembers": int(summary.get("runsOtherMembers") or 0),
+    }
 
 
 def _refuse_log_bundle_with_row(owner_uid: str, code: str, device_id: str,
@@ -11031,6 +11079,8 @@ def _handle_send_logs_command(data: dict, device_id: str, limited: bool = False,
                     "sessionCount": int(summary["sessionCount"]),
                     "sizeBytes": int(summary["sizeBytes"]),
                     "runsApplied": int(summary["maxRunsApplied"]),
+                    # On `done` only: what the person is shown beside "Sent".
+                    **_log_bundle_left_out(summary),
                 })
             else:
                 _write_log_bundle_status(row_uid, code, {
@@ -13880,11 +13930,11 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
         "requesterScoped": requester_uid is not None,
         "machineIncluded": bool(include_machine),
         **selection_report,
-        # ⛔⛔ NOT FOR THE logBundles ROW YET. The rules' `hasOnly` on that row
-        # refuses an unknown key, and it refuses the WHOLE write — the bundle
-        # would stall at 'collecting'. Both row writers pick their keys by name,
-        # so this reaches the zip (collected.json) and the terminal only; wire
-        # it onto the row in the same change as the rules deploy that allows it.
+        # ⭐ ON THE ROW SINCE WAVE 10.9, as a count, beside `droppedForSize` and
+        # `runsNotAttributed` — see `_log_bundle_left_out`. The rules' `hasOnly`
+        # refuses an unknown key and refuses the WHOLE write, so those rules
+        # deploy first, and `_write_log_bundle_status` retries a denied write
+        # without the three counts rather than lose the `done` write over them.
         "runsOtherMembers": other_members,
         "sizeBytes": dest.stat().st_size if dest.exists() else 0,
         "uncompressedBytes": written,
@@ -85541,7 +85591,8 @@ def cmd_send_logs(assume_yes: bool = False, email: "str | None" = None,
             patch = {"status": "done", "objectPath": object_path,
                      "runCount": int(summary["runCount"]),
                      "sessionCount": int(summary["sessionCount"]),
-                     "sizeBytes": int(summary["sizeBytes"])}
+                     "sizeBytes": int(summary["sizeBytes"]),
+                     **_log_bundle_left_out(summary)}
             # ⛔⛔ THE ROW IS THE ONLY THING CLEAR LOGS CAN SEE. It walks rows,
             # not objects — so a send whose row never lands leaves a readable
             # bundle in the bucket that the privacy button cannot reach.

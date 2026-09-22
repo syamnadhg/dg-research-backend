@@ -24,9 +24,10 @@ looking installed. The ones that matter most are the quiet ones:
         protection; it strips the owner's own topic from their own run.
   B11 — the redactor is called and its result thrown away — the shape of a fix
         that reads as installed.
-  B22 — the count reaches the logBundles row. The rules' `hasOnly` refuses the
-        WHOLE write, so every bundle stalls at 'collecting' until a rules
-        deploy — the over-correction a reviewer waves through as "reporting".
+  B22 — the count rides the 'uploading' write. Since W9 it belongs on the
+        `done` write only, beside "Sent"; earlier, it states a fact about a
+        bundle nothing has sent yet (re-aimed 2026-09-21 — it used to guard the
+        row against the count entirely, before the rules allowed it).
   R8  — the kept uid must match whole; the logs print `uid[:8]`, so the owner's
         own prefixes turn into `member-N` in their own bundle.
   R12 — the uid shape stops requiring a capital, so every 28-char hex digest
@@ -296,9 +297,13 @@ MUTANTS = [
      "the zip stops saying how many runs were left out",
      [(COLLECTED_COUNT, '            "runsOtherMembers": 0,')]),
 
+    # ⚠ RE-AIMED 2026-09-21 (wave 10.9, W9): the count now reaches the `done`
+    # write ON PURPOSE, beside the rules that allow it. What stays wrong is it
+    # riding the `uploading` write — a fact about a sent bundle, stated before
+    # anything was sent, on the write a failed send never finishes.
     ("B22", "over", RESEARCH,
-     "⛔⛔ the count reaches the logBundles row before the rules allow it — the "
-     "rules refuse the whole write and every bundle stalls at 'collecting'",
+     "⛔ the count rides the 'uploading' write too — a claim about a sent bundle "
+     "made before the upload, on a row a failed send leaves standing",
      [(ROW_PATCH, '                "runsApplied": int(summary["maxRunsApplied"]),\n'
                   '                "runsOtherMembers": int(summary["runsOtherMembers"]),\n'
                   "            })\n"
