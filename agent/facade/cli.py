@@ -453,9 +453,23 @@ def _signin_step(*, explicit: bool | None = None, assume_yes: bool = False,
         return False
     if state == "start-failed":
         b.dim("Web sign-in unreachable right now — host-local fallback:  agent login --local")
+        b.dim(_local_signin_needs())
     else:
         b.dim("Finish sign-in later:  /sr login  in chat  (or: agent login).")
     return False
+
+
+def _local_signin_needs() -> str:
+    """The one line saying what `agent login --local` still depends on.
+
+    ⛔ THE FALLBACK IS NOT INDEPENDENT OF THE WEB APP. The local page's Google
+    window opens on ``config.AUTH_DOMAIN`` — superresearch.io, served by the same
+    web app whose failed sign-in start is why --local gets offered at all. So
+    --local helps when only the broker route is broken, not when the site is down,
+    and a line offering it must say so rather than promise a way round an outage.
+    Named from the value rather than spelled out, so a staging override keeps the
+    line true."""
+    return f"Its Google sign-in window opens on {config.AUTH_DOMAIN}, so that site must be up too."
 
 
 def _connect_next(*, runtime: str, logged_in: bool, startup_pinned: bool) -> list[tuple[str, list[tuple[str, str]]]]:
@@ -931,13 +945,15 @@ def cmd_login(args: argparse.Namespace) -> int:
     if not getattr(args, "local", False):
         # Default: sign in on the SR web app (superresearch.io) — same page as /sr login.
         return _login_remote(args)
-    # --local: host-local fallback (the bridge's own page; no SR web app needed).
+    # --local: host-local fallback (the bridge's own page, no broker round-trip —
+    # but its Google window still opens on the web app's host; see config.AUTH_DOMAIN).
     url = config.login_origin() + "/login"
     runtime = prefs.get_runtime()
     if runtime:
         url += f"?runtime={runtime}"  # glow the connected runtime's watermark
     b.line(f"Opening {url}")
     b.dim("Sign in with your Super Research Google account (research-only).")
+    b.dim(_local_signin_needs())
     try:
         webbrowser.open(url)
     except Exception:
@@ -1019,6 +1035,7 @@ def _login_remote(args: argparse.Namespace) -> int:
         b.dim("Re-run:  agent login")
     elif state == "start-failed":
         b.dim("Web sign-in unreachable — host-local fallback:  agent login --local")
+        b.dim(_local_signin_needs())
     return 1
 
 

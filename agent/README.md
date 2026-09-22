@@ -283,7 +283,9 @@ re-login.
 (`https://superresearch.io/agent-auth`) — the same page everywhere — brokering an
 approve-on-your-phone flow that makes only **outbound** calls (no localhost
 needed). `agent login --local` is the host-local Google page
-(`http://localhost:9876/login`) fallback for dev / no-network.
+(`http://localhost:9876/login`), a fallback for when the web app's sign-in start
+fails. It is not independent of the web app: its Google window opens on
+`superresearch.io` too, so it cannot help while that site is down.
 
 ```sh
 agent login --remote --runtime hermes
