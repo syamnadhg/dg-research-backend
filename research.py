@@ -3247,7 +3247,33 @@ def _start_doc_identity_refused(data, where: str) -> bool:
 
     ⭐ THE DECISION AND ITS SENTENCE TOGETHER, because the two claim sites had
     begun to carry a copy of each. A refusal whose message is written twice
-    drifts, and the drifted one is always the path nobody exercises."""
+    drifts, and the drifted one is always the path nobody exercises.
+
+    ⛔⛔ A START DOC THAT NAMES A TREE AND NO WRITER IS REFUSED TOO, and the
+    reason is the same one the owner-control gate learned in round two: the
+    disagreement below needs BOTH identity fields, so writing LESS skipped the
+    whole check. On start that buys a paid run inside somebody else's account —
+    their reports, their billing, their tile — and the sentence "a member
+    started it" would be unattributable, because `_resolve_run_submitter` reads
+    exactly the field that was left off.
+
+    ⭐ AN UNNAMED doc is a different shape and still runs. `uid` absent is the
+    legacy/pre-Wave-8 document this listener has always accepted; it ends up
+    `unclaimed`, which is honest. What is refused is naming a person's tree
+    while refusing to say who asked.
+
+    ⭐⭐ COSTS NOTHING TODAY: `devices/{id}/queue` has required
+    `submittedBy == request.auth.uid` on create since the collection was made,
+    and every writer (the web's queue payload and owner-control path, the
+    agent's REST start/resume/cancel) stamps it. This is the half that keeps
+    being true while the rules are stale, which this project has shipped."""
+    if not str((data or {}).get("submittedBy") or "").strip():
+        unsigned = str((data or {}).get("uid") or "").strip()
+        if unsigned:
+            log(f"[{where}] refusing start — it names a tree "
+                f"(uid={unsigned[:8]}…) and no writer at all; every client that "
+                f"may write this queue stamps submittedBy", "WARN")
+            return True
     conflict = _start_doc_identity_conflict(data)
     if conflict is None:
         return False

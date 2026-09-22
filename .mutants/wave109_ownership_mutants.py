@@ -204,6 +204,21 @@ U_ORDER_TAIL = ("    # ⭐ THE DISAGREEMENT IS DEFINED ONCE, and this reuses it 
                 "    if conflict is None:\n"
                 "        return False\n")
 
+# ── anchors: the START half of the same rule (wave 10.9, round 2's carry-out) ─
+#: The unsigned-start refusal, whole.
+S_BLOCK = ("    if not str((data or {}).get(\"submittedBy\") or \"\").strip():\n"
+           "        unsigned = str((data or {}).get(\"uid\") or \"\").strip()\n"
+           "        if unsigned:\n"
+           "            log(f\"[{where}] refusing start — it names a tree \"\n"
+           "                f\"(uid={unsigned[:8]}…) and no writer at all; every client that \"\n"
+           "                f\"may write this queue stamps submittedBy\", \"WARN\")\n"
+           "            return True\n")
+#: Its verdict alone, so the sentence can be kept while the answer is lost.
+S_VERDICT = ("f\"may write this queue stamps submittedBy\", \"WARN\")\n"
+             "            return True\n")
+#: The half that keeps a doc naming NOBODY running.
+S_NAMED = "        if unsigned:\n            log(f\"[{where}] refusing start"
+
 MUTANTS = [
     # ── N1: the disk record's person half ──────────────────────────────────
     ("M1", "under", RESEARCH,
@@ -481,6 +496,23 @@ MUTANTS = [
      "the branch's own guard handles are turned into owner-control refusals "
      "and logged as somebody's run",
      [(U_NAMED, "        if True:\n")]),
+
+    ("S1", "under", RESEARCH,
+     "⛔⛔⛔ THE START HALF OF THE BYPASS — an unsigned doc naming another "
+     "member's tree opens a PAID run inside it: their reports, their bill, "
+     "their tile, and `unclaimed` as the answer to who asked for it",
+     [(S_BLOCK, "")]),
+
+    ("S2", "under", RESEARCH,
+     "⛔⛔ the refusal keeps its sentence and loses its verdict — the machine "
+     "says it refused the start and claims the document anyway",
+     [(S_VERDICT, "f\"may write this queue stamps submittedBy\", \"WARN\")\n")]),
+
+    ("S3", "over", RESEARCH,
+     "⛔ a start doc naming NOBODY is refused too, so every pre-Wave-8 client's "
+     "document — the shape `_resolve_run_submitter` calls unclaimed on purpose "
+     "— stops running at all",
+     [(S_NAMED, "        if True:\n            log(f\"[{where}] refusing start")]),
 
     ("W4", "over", RESEARCH,
      "⛔⛔ the research document is read from the WRITER's tree, where a sharer's "

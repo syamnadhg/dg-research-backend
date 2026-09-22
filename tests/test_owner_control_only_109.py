@@ -410,3 +410,61 @@ def test_a_stale_resume_they_signed_still_gets_its_sentence(tmp_path, monkeypatc
         timestamp=old)
     assert [w[:2] for w in lis.writes] == [(SHARER, SHARER_RID)]
     assert lis.writes[0][2]["resumeDropReason"] == research.RESUME_DROP_WENT_STALE
+
+# ══ 5. the START half of the same shape ════════════════════════════════
+#
+# ⛔⛔ ROUND TWO CLOSED CANCEL AND RESUME AND LEFT START OPEN, deliberately and
+# on a reasonable argument: a start CREATES a run rather than destroying one.
+# But what it creates is a paid research inside the tree the doc names — the
+# reports, the billing and the tile are the victim's, and the run is
+# `unclaimed`, so nothing can say who asked for it. The rule is the same one
+# sentence: a queue doc that names a person's tree must name its writer.
+#
+# ⭐ `uid` ABSENT still runs. That is the legacy document this listener has
+# always taken, and `_resolve_run_submitter` calls it unclaimed on purpose.
+
+
+def test_a_start_that_names_a_tree_and_no_writer_is_refused():
+    assert research._start_doc_identity_refused(
+        {"action": "start", "uid": SHARER, "researchId": SHARER_RID}, "t") is True
+
+
+def test_a_start_that_names_nobody_still_runs():
+    """⭐ THE SHAPE THE REFUSAL MUST NOT TAKE WITH IT — the pre-Wave-8 doc."""
+    assert research._start_doc_identity_refused(
+        {"action": "start", "researchId": SHARER_RID}, "t") is False
+    assert research._start_doc_identity_refused({"action": "start"}, "t") is False
+
+
+def test_a_start_the_person_signed_still_runs():
+    assert research._start_doc_identity_refused(
+        {"action": "start", "uid": SHARER, "submittedBy": SHARER,
+         "researchId": SHARER_RID}, "t") is False
+
+
+def test_the_owners_own_tree_is_not_an_exemption_on_start():
+    """⛔ Naming the machine owner's tree is the most valuable target, not a
+    reason to admit an unsigned doc."""
+    assert research._start_doc_identity_refused(
+        {"action": "start", "uid": OWNER, "researchId": SHARER_RID}, "t") is True
+
+
+def test_an_unsigned_start_queues_no_run_in_their_tree(tmp_path, monkeypatch):
+    """⛔⛔ THE CONSUMER. Without the gate this enqueues a paid pipeline whose
+    research document, reports and bill are the named person's."""
+    lis = Listener(monkeypatch, tmp_path, owner=OWNER, research_docs={
+        (SHARER, SHARER_RID): {"status": "queued"}}).feed(
+        action="start", uid=SHARER, researchId=SHARER_RID, topic="anything")
+    assert lis.enqueued == [], "an unsigned start queued a run in a member's tree"
+    assert lis.writes == [], "an unsigned start wrote into a member's tree"
+    assert SHARER_RID not in str(lis.enqueued)
+
+
+def test_a_signed_start_still_queues(tmp_path, monkeypatch):
+    """⭐ ACCEPT POLARITY: the shape every real client writes still runs."""
+    lis = Listener(monkeypatch, tmp_path, owner=OWNER, research_docs={
+        (SHARER, SHARER_RID): {"status": "queued"}}).feed(
+        action="start", uid=SHARER, submittedBy=SHARER, researchId=SHARER_RID,
+        topic="anything")
+    assert [j.get("research_id") for j in lis.enqueued] == [SHARER_RID], (
+        "a member's own start was refused")
