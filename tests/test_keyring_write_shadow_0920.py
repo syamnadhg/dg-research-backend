@@ -189,6 +189,18 @@ def test_the_two_stores_are_never_left_disagreeing_in_silence(home, monkeypatch,
     assert "delete-generic-password" in said, "it must say how to clear it"
     # The token is still persisted — losing it as well would be worse.
     assert keystore._file_load()[ACCT] == "fresh-token"
+    # ⛔⛔ WAVE 10.9: AND THE READER GETS IT. The first repair logged this state
+    # and left `get()` asking the keyring first — which still answers, with the
+    # token the rotation replaced. The stale entry is deliberately still there
+    # and still readable, so nothing but the read order can make this pass.
+    assert kr.get_password(None, ACCT) == "stale-token"
+    assert keystore.get("previous", INSTALL) == "fresh-token", (
+        "the keychain's old value outranked the write it could not take")
+    # And the sentence says what is now true: the old entry IS readable, but
+    # this install no longer returns it — "reads may return an OLD token" was
+    # the claim that stopped being true the moment the read order was fixed.
+    assert "still readable" in said
+    assert "reads may return an OLD token" not in said
 
 
 def test_and_a_CLEAN_fallback_is_not_reported_as_that(home, monkeypatch, caplog):

@@ -70,8 +70,14 @@ ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 _INFLIGHT = Path(__file__).with_suffix(".inflight")
 
 # ── anchors ─────────────────────────────────────────────────────────────
+# ⛔ RE-ANCHORED 2026-09-21 (wave 10.9, keystore group). The delete lost its
+# `contextlib.suppress` for a try/except that logs the outcome, the probe became
+# three-valued (`_keyring_answers`), and the unreadable-keychain case got its
+# own `log.error(` — so M1, M4, M5 and M8 matched 0x/0x/0x/2x. Each is re-aimed
+# at the same defect in the new shape; wave109_keystore_mutants.py attacks what
+# wave 10.9 added.
 #: The ONE delete. It cures the ownership problem AND silences a stale value.
-DEL = ('            with contextlib.suppress(Exception):\n'
+DEL = ('            try:\n'
        '                kr.delete_password(SERVICE, acct)  # type: ignore[attr-defined]')
 #: The rewrite that takes ownership.
 REWRITE = '                kr.set_password(SERVICE, acct, value)  # type: ignore[attr-defined]\n                log.info('
@@ -79,17 +85,19 @@ REWRITE = '                kr.set_password(SERVICE, acct, value)  # type: ignore
 HOT = ('            kr.set_password(SERVICE, acct, value)  # type: ignore[attr-defined]\n'
        '            # Keyring is the live store')
 #: The honest question: can a reader still get something out of the keyring?
-ASK = '            if _keyring_can_still_answer(kr, acct):'
+ASK = '            if answer == "value":'
 #: The probe itself — asked of `get`, not inferred from a delete.
-PROBE = '        return bool(kr.get_password(SERVICE, acct))'
+PROBE = '    return "value" if val else "empty"'
 #: The OSStatus translator's search.
 HINT = ('    for code, name in _OSSTATUS_NAMES.items():\n'
         '        if str(code) in text:\n'
         '            return f"{text} — {name}"')
 #: The code this whole file exists because of.
 CODE = '    -25244: "errSecInvalidOwnerEdit: the item exists but belongs to a different binary",'
-#: The level the unsilenceable case is reported at.
-LOUD = '                log.error('
+#: The level the unsilenceable case is reported at. ⛔ Anchored on its own
+#: sentence: the unreadable-keychain branch has a `log.error(` too.
+LOUD = ('                log.error(\n'
+        '                    "keyring write of slot=%s failed (%s) and an OLDER entry is "')
 
 MUTANTS = [
     ("M1", "under",
@@ -99,7 +107,7 @@ MUTANTS = [
      "`get()` looks FIRST. The fresh token goes to the file, which nobody "
      "reads. On the `current` slot that is every refresh presenting a dead "
      "token until the machine has to be paired again",
-     [(DEL, "            pass")]),
+     [(DEL, "            try:\n                pass")]),
 
     ("M2", "under",
      "⛔⛔ the rewrite after the delete goes, so the keyring is emptied and "
@@ -121,13 +129,13 @@ MUTANTS = [
      "⛔⛔ the divergence check is inverted: a clean fallback shouts ERROR and "
      "a genuine two-store disagreement goes out as a WARNING. Both halves are "
      "harmful — the false alarm trains everybody to ignore the real one",
-     [(ASK, '            if not _keyring_can_still_answer(kr, acct):')]),
+     [(ASK, '            if answer == "empty":')]),
 
     ("M5", "under",
      "⛔⛔ the probe answers from the store's EXISTENCE rather than from what "
      "`get` returns. An entry holding an empty string reads as a live stale "
      "token, and the one thing this function exists to mirror is `get`",
-     [(PROBE, '        return kr.get_password(SERVICE, acct) is not None')]),
+     [(PROBE, '    return "value" if val is not None else "empty"')]),
 
     ("M6", "under",
      "⛔ the OSStatus hint stops firing and the log goes back to "
@@ -148,7 +156,8 @@ MUTANTS = [
      "different values for the same credential, with no way to clear either, "
      "is not a warning — and a warning is precisely what hid this for as long "
      "as it hid",
-     [(LOUD, '                log.warning(')]),
+     [(LOUD, '                log.warning(\n'
+             '                    "keyring write of slot=%s failed (%s) and an OLDER entry is "')]),
 ]
 
 
