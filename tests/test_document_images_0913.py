@@ -135,7 +135,7 @@ def world(monkeypatch):
     monkeypatch.setattr(R, "_fb_research_id", RID)
     monkeypatch.setattr(R, "_doc_img_cache", collections.OrderedDict())
     monkeypatch.setattr(R, "_doc_img_decorative_pending", 0)
-    monkeypatch.setattr(R, "_doc_img_resolve_host", lambda host, port: ["93.184.216.34"])
+    monkeypatch.setattr(R, "_doc_img_resolve_host", lambda host, port, deadline: ["93.184.216.34"])
     # A fresh Stop/Pause state: the funnel reads it, and another test's Stop must
     # not turn every rehost here into the offline pass.
     monkeypatch.setattr(R, "_controls", R.PipelineControls())
@@ -162,7 +162,7 @@ def world(monkeypatch):
             if isinstance(got, BaseException):
                 raise got
             return got
-        R._doc_img_check_url(url)  # the real URL rules refuse non-https forms
+        R._doc_img_check_url(url, deadline)  # the real URL rules refuse non-https forms
         raise R._DocImageRefused("failed")
     monkeypatch.setattr(R, "_doc_img_fetch", fetch)
 
@@ -699,35 +699,38 @@ def test_public_addresses_pass(addr):
     "https://img.example.com/a\x00.png", "https://img.example.com/" + "a" * 4100,
 ])
 def test_url_rules_refuse(url, monkeypatch):
-    monkeypatch.setattr(R, "_doc_img_resolve_host", lambda h, p: ["93.184.216.34"])
+    monkeypatch.setattr(R, "_doc_img_resolve_host", lambda h, p, d: ["93.184.216.34"])
     with pytest.raises(R._DocImageRefused) as got:
-        R._doc_img_check_url(url)
+        R._doc_img_check_url(url, far())
     assert got.value.kind == "refused"
 
 
 @pytest.mark.parametrize("addrs", [["93.184.216.34", "10.0.0.8"], ["127.0.0.1"], []])
 def test_every_resolved_address_must_be_public(addrs, monkeypatch):
-    monkeypatch.setattr(R, "_doc_img_resolve_host", lambda h, p: addrs)
+    monkeypatch.setattr(R, "_doc_img_resolve_host", lambda h, p, d: addrs)
     with pytest.raises(R._DocImageRefused) as got:
-        R._doc_img_check_url("https://img.example.com/a.png")
+        R._doc_img_check_url("https://img.example.com/a.png", far())
     assert got.value.kind == "refused"
 
 
 def test_a_name_that_does_not_resolve_fails(monkeypatch):
-    def boom(h, p):
+    def boom(h, p, d):
         raise OSError("nxdomain")
     monkeypatch.setattr(R, "_doc_img_resolve_host", boom)
     with pytest.raises(R._DocImageRefused) as got:
-        R._doc_img_check_url("https://img.example.com/a.png")
+        R._doc_img_check_url("https://img.example.com/a.png", far())
     assert got.value.kind == "failed"
 
 
 def test_https_on_443_with_public_addresses_passes(monkeypatch):
+    """⭐ And the lookup gets the IMAGE's deadline (wave 10.9: it had none)."""
     seen = []
-    monkeypatch.setattr(R, "_doc_img_resolve_host", lambda h, p: seen.append((h, p)) or ["8.8.8.8"])
-    R._doc_img_check_url("https://IMG.example.com:443/a.png?x=1")
-    R._doc_img_check_url("https://img.example.com/b.png")
-    assert seen == [("img.example.com", 443), ("img.example.com", 443)]
+    monkeypatch.setattr(R, "_doc_img_resolve_host",
+                        lambda h, p, d: seen.append((h, p, d)) or ["8.8.8.8"])
+    end = far()
+    R._doc_img_check_url("https://IMG.example.com:443/a.png?x=1", end)
+    R._doc_img_check_url("https://img.example.com/b.png", end)
+    assert seen == [("img.example.com", 443, end), ("img.example.com", 443, end)]
 
 
 class FakeSock:
@@ -884,10 +887,11 @@ class FakeSession:
 
 @pytest.fixture
 def net(monkeypatch):
-    n = types.SimpleNamespace(dns={}, resolved=[], session=None)
+    n = types.SimpleNamespace(dns={}, resolved=[], deadlines=[], session=None)
 
-    def resolve(host, port):
+    def resolve(host, port, deadline):
         n.resolved.append(host)
+        n.deadlines.append(deadline)
         return n.dns.get(host, ["93.184.216.34"])
     monkeypatch.setattr(R, "_doc_img_resolve_host", resolve)
     monkeypatch.setattr(R, "_doc_img_session", lambda guard: n.session)
@@ -995,7 +999,7 @@ def test_a_passed_deadline_stops_the_fetch_and_the_read(net):
 
 
 def test_a_refused_address_inside_the_document_is_counted_and_captioned(world, monkeypatch):
-    monkeypatch.setattr(R, "_doc_img_resolve_host", lambda h, p: ["192.168.0.10"])
+    monkeypatch.setattr(R, "_doc_img_resolve_host", lambda h, p, d: ["192.168.0.10"])
     out = rehost("![Router admin](https://router.example.com/cam.png)")
     assert out == "![Router admin]()"
     assert world.logs[-1][1].endswith("refused=1 login=0 failed=0 linked=0 captioned=1 removed=0")
@@ -1342,7 +1346,7 @@ def _trust_local_server(monkeypatch, cert):
     """The real session, trusting the local certificate, with the public-address
     rules off (the server is 127.0.0.1)."""
     real_session = R._doc_img_session
-    monkeypatch.setattr(R, "_doc_img_check_url", lambda url: None)
+    monkeypatch.setattr(R, "_doc_img_check_url", lambda url, deadline: None)
     monkeypatch.setattr(R, "_doc_img_check_peer", lambda sock: None)
     # The connect's own address rule too (round 4: checked before a socket is made).
     monkeypatch.setattr(R, "_doc_img_address_is_public", lambda addr: True)
@@ -2903,7 +2907,7 @@ def _unreachable_host(monkeypatch, n, refuse):
             pass
     monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
     monkeypatch.setattr(socket, "socket", Sock)
-    monkeypatch.setattr(R, "_doc_img_check_url", lambda url: None)
+    monkeypatch.setattr(R, "_doc_img_check_url", lambda url, deadline: None)
     return stop, made, lookups
 
 
@@ -3643,3 +3647,374 @@ def test_claudes_T2_panel_rejection_reports_the_prose_length_the_gate_weighed(mo
     assert f"returned {R._doc_img_prose_len(md)} chars" in line[0]
     assert f"returned {len(md)} chars" not in line[0]
     assert "below 2000-char floor" in line[0]
+
+
+# ═══ 36. wave 10.9 — a saved document carries no PRIVATE link ═══════════════════
+#
+# ⛔⛔ Only a link AROUND an image was ever checked, and a document with no image
+# never entered the funnel at all: a report's signed file link, its `sandbox:`
+# download, the agent's own conversation URL or a googleusercontent definition was
+# saved as written — into the document, the NotebookLM upload and every frozen
+# share, where an https one is a live link.
+# ⭐ Only the private SHAPES go. A platform's help page is a real source for a
+# research about that platform, and stays.
+
+PRIVATE_FILE = "https://files.oaiusercontent.com/file-1?se=2026&sig=x"
+PRIVATE_DEF = "https://lh3.googleusercontent.com/x"
+
+
+def test_an_image_free_document_loses_its_private_links_and_keeps_their_text(world, monkeypatch):
+    """⛔⛔ THE DEFECT, EXECUTED — the funnel handed this text back byte for byte: no
+    image, so it never looked. Still no thread for a document with no image."""
+    monkeypatch.setattr(R, "_doc_img_executor", lambda: pytest.fail("thread started"))
+    text = (f"See [the file]({PRIVATE_FILE}), [csv](sandbox:/mnt/data/a.csv), "
+            "the chat https://chatgpt.com/c/abc and [Reuters](https://news.example.com/a).")
+    assert rehost(text) == "See the file, csv, the chat and [Reuters](https://news.example.com/a)."
+    assert world.fetches == [] and world.posts == []
+
+
+@pytest.mark.parametrize("href", [
+    "data:text/csv;base64,YSxi", "blob:https://chatgpt.com/1234", "sandbox:/mnt/data/a.csv",
+    "SANDBOX:/mnt/data/a.csv", "<sandbox:/mnt/data/a b.csv>", f'{PRIVATE_FILE} "the file"',
+    "https://oaiusercontent.com/x", "//files.oaiusercontent.com/file-2",
+    "https://lh3.googleusercontent.com/SIGNED=w800", "https://yt3.ggpht.com/abc",
+    "https://chatgpt.com/c/abc", "https://www.chatgpt.com/c/abc",
+    "https://chatgpt.com/g/g-p-123/c/abc", "https://chat.openai.com/c/abc",
+    "https://claude.ai/chat/0f1e", "https://gemini.google.com/app/9a8b",
+    "https://gemini.google.com/u/1/app/9a8b", "https://notebooklm.google.com/notebook/5c6d",
+])
+def test_every_private_link_shape_keeps_only_its_text(world, href):
+    assert rehost(f"per [the source]({href}) today") == "per the source today"
+
+
+def test_a_platform_help_page_cited_as_a_source_survives(world):
+    """⛔⛔ The refuter's pin: the platform host list names help.openai.com, and a
+    research about the product cites it."""
+    text = "Per [policy](https://help.openai.com/en/articles/1), usage is capped."
+    assert rehost(text) == text
+
+
+@pytest.mark.parametrize("url", [
+    "https://support.anthropic.com/en/articles/2", "https://cdn.openai.com/papers/gpt-4.pdf",
+    "https://docs.anthropic.com/en/docs", "https://www.gstatic.com/charts/loader.js",
+    "https://chatgpt.com/share/abc", "https://claude.ai/public/artifacts/abc",
+    "https://gemini.google.com/app", "https://gemini.google.com/share/abc",
+    "https://notebooklm.google.com/", "https://notchatgpt.com/c/abc",
+    "https://googleusercontent.com.example.org/x", "https://example.com/c/abc",
+    "https://example.com/r?u=https://chatgpt.com/c/abc",
+])
+def test_a_platform_page_that_is_not_a_private_shape_survives_as_a_link_and_as_text(world, url):
+    """A public share, a product's home, a help or docs page, a lookalike host."""
+    text = f"per [the page]({url}) and {url} today"
+    assert rehost(text) == text
+
+
+@pytest.mark.parametrize("use, kept", [("[see][1]", "see"), ("[1][]", "1"), ("[1]", "1")])
+def test_a_private_definition_goes_and_every_reference_keeps_its_text(world, use, kept):
+    assert rehost(f"Cited {use} here.\n\n[1]: {PRIVATE_DEF}\n") == f"Cited {kept} here.\n\n"
+    assert rehost(f"Cited {use} here.\n\n[1]: <{PRIVATE_DEF}> \"t\"\n") == f"Cited {kept} here.\n\n"
+
+
+def test_only_a_private_labels_references_lose_their_brackets(world):
+    text = (f"Cited [see][1], [ok][2] and [sic].\n\n[1]: {PRIVATE_DEF}\n"
+            "[2]: https://news.example.com/a\n")
+    assert rehost(text) == "Cited see, [ok][2] and [sic].\n\n[2]: https://news.example.com/a\n"
+
+
+def test_a_label_whose_first_definition_is_private_loses_every_definition(world):
+    """The renderer resolves a label through its FIRST definition."""
+    text = f"Cited [see][1].\n\n[1]: {PRIVATE_DEF}\n[1]: https://news.example.com/a\n"
+    assert rehost(text) == "Cited see.\n\n"
+
+
+def test_a_later_private_duplicate_goes_alone_and_the_label_keeps_its_link(world):
+    text = f"Cited [see][1].\n\n[1]: https://news.example.com/a\n[1]: {PRIVATE_DEF}\n"
+    assert rehost(text) == "Cited [see][1].\n\n[1]: https://news.example.com/a\n"
+
+
+def test_a_private_definition_an_image_and_a_link_share_stores_the_image_and_drops_the_link(world):
+    """The image resolves through the definition FIRST; the link that kept it alive
+    is then a private link like any other."""
+    world.images[SIGNED] = png()
+    text = f"Chart ![fig][1] and cited [see][1].\n\n[1]: {SIGNED}\n"
+    assert rehost(text) == f"Chart ![fig]({ref_for(png())}) and cited see.\n\n"
+    assert world.fetches == [SIGNED]
+
+
+def test_a_platform_image_is_still_fetched_and_stored_not_scrubbed(world):
+    """⛔ THE ORDER. Scrubbed before the image pass, the definition an image resolves
+    through and a data: image's bytes would be gone before either was stored."""
+    world.images[SIGNED] = png()
+    data = png(64, 64)
+    uri = "data:image/png;base64," + base64.b64encode(data).decode()
+    out = rehost(f"![fig][1] and ![inline]({uri})\n\n[1]: {SIGNED}\n")
+    assert out == f"![fig]({ref_for(png())}) and ![inline]({ref_for(data)})\n\n"
+
+
+def test_a_document_with_images_is_scrubbed_after_they_are_stored(world):
+    url = "https://img.example.com/chart.png"
+    world.images[url] = png()
+    out = rehost(f"![Chart]({url}) from [the file]({PRIVATE_FILE}).")
+    assert out == f"![Chart]({ref_for(png())}) from the file."
+
+
+@pytest.mark.parametrize("path", ["offline", "raised"])
+def test_every_path_of_the_image_half_is_scrubbed(world, monkeypatch, path):
+    """The offline pass (an exit scheduled), and the rewrite that raised and handed
+    its input back — the one path that returns the RAW text."""
+    url = "https://img.example.com/chart.png"
+    world.images[url] = png()
+    if path == "offline":
+        monkeypatch.setattr(R, "_exit_scheduled", True)
+    else:
+        def boom(text, run):
+            raise RuntimeError("rewrite broke")
+        monkeypatch.setattr(R, "_doc_images_rewrite_sync", boom)
+    out = rehost(f"![Chart]({url}) from [the file]({PRIVATE_FILE}).")
+    assert out == ("![Chart]() from the file." if path == "offline"
+                   else f"![Chart]({url}) from the file.")
+
+
+def test_skipping_the_image_half_still_scrubs(world, monkeypatch):
+    """⛔⛔ THE SEAM. Incognito will upload nothing: it skips `_doc_images_rehost` and
+    NEVER the scrub. With that half replaced by a pass-through, every private address
+    still goes — an image's too, which is left a caption."""
+    async def skipped(text, label="document"):
+        return text
+    monkeypatch.setattr(R, "_doc_images_rehost", skipped)
+    text = (f"![Chart](<{SIGNED}>) from [the file]({PRIVATE_FILE}), "
+            "![Kept](https://img.example.com/a.png) and [Reuters](https://news.example.com/a).")
+    assert rehost(text) == ("![Chart]() from the file, ![Kept](https://img.example.com/a.png) "
+                            "and [Reuters](https://news.example.com/a).")
+    assert world.fetches == []
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("the chat https://chatgpt.com/c/abc and more", "the chat and more"),
+    ("the chat at https://chatgpt.com/c/abc.", "the chat at."),
+    ("(see https://chatgpt.com/c/abc) now", "(see) now"),
+    ("at <https://chatgpt.com/c/abc> now", "at now"),
+    ("at <sandbox:/mnt/data/a.csv> now", "at now"),
+    ("go to www.chatgpt.com/c/abc now", "go to now"),
+    ("Session: HTTPS://CHATGPT.COM/c/abc", "Session:"),
+    ('<a href="https://chatgpt.com/c/abc">the session</a>', '<a href="">the session</a>'),
+    ("The metadata:text/plain header", "The metadata:text/plain header"),
+])
+def test_a_bare_or_autolinked_private_address_goes(world, text, expected):
+    assert rehost(text) == expected
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("Sources:\n- https://chatgpt.com/c/abc\n- [R](https://news.example.com/a)\n",
+     "Sources:\n- [R](https://news.example.com/a)\n"),
+    ("Sources:\r\n- https://chatgpt.com/c/abc\r\n- [R](https://news.example.com/a)\r\n",
+     "Sources:\r\n- [R](https://news.example.com/a)\r\n"),
+    ("Steps:\n1. https://chatgpt.com/c/abc\n2. done\n", "Steps:\n2. done\n"),
+    ("> quote\n> https://chatgpt.com/c/abc\n> more\n", "> quote\n> more\n"),
+    ("a\n\nhttps://chatgpt.com/c/abc\n\nb", "a\n\n\nb"),
+])
+def test_a_line_left_with_nothing_but_a_marker_goes_whole(world, text, expected):
+    """⛔ `-` left under a paragraph is a setext underline: "Sources:" would render as
+    a heading. A blank line that was blank before stays."""
+    assert rehost(text) == expected
+
+
+def test_code_keeps_a_private_address_byte_for_byte(world):
+    fence = "```\n[f](https://files.oaiusercontent.com/f?sig=1) https://chatgpt.com/c/abc\n```\n"
+    text = fence + "and `https://chatgpt.com/c/abc` inline, but https://chatgpt.com/c/abc goes\n"
+    assert rehost(text) == fence + "and `https://chatgpt.com/c/abc` inline, but goes\n"
+
+
+@pytest.mark.parametrize("text, expected", [
+    # The image pass skipped: an image's brackets are never a reference's.
+    (f"![c][1] and [see][1]\n\n[1]: {PRIVATE_DEF}\n", "![c][1] and see\n\n"),
+    # An escaped "!" is text, so the brackets after it ARE a link.
+    (f"\\![c][1] and [see][1]\n\n[1]: {PRIVATE_DEF}\n", "\\!c and see\n\n"),
+    # An escaped bracket is text, not a reference.
+    (f"a \\[1] b [1] c\n\n[1]: {PRIVATE_DEF}\n", "a \\[1] b 1 c\n\n"),
+    # An inline link whose text names the label is its own link.
+    (f"[1](https://news.example.com/x) and [1]\n\n[1]: {PRIVATE_DEF}\n",
+     "[1](https://news.example.com/x) and 1\n\n"),
+    # An inline image is the image pass's; its address goes, its caption stays.
+    ("![c](https://chatgpt.com/c/abc) end", "![c]() end"),
+    ("\\![c](https://chatgpt.com/c/abc) end", "\\!c end"),
+])
+def test_the_scrub_tells_links_from_images_and_escapes(text, expected):
+    """EXECUTED on the scrub itself: after the image pass these shapes never reach it,
+    so only the image-free seam (incognito) sees them."""
+    assert R._doc_scrub_private_links(text) == expected
+
+
+def test_the_scrub_hands_back_the_same_text_when_nothing_is_private():
+    text = "Plain [link](https://news.example.com/a) and `code` here.\n"
+    assert R._doc_scrub_private_links(text) is text
+    assert R._doc_scrub_private_links("") == "" and R._doc_scrub_private_links(None) is None
+
+
+# ═══ 37. wave 10.9 — CRLF reference definitions resolve ═════════════════════════
+#
+# ⛔ The definition pattern ended in `\n` only. A CRLF document — Gemini's in-page
+# clipboard read on Windows — matched no definition: every reference image stayed
+# `![c][1]`, and its definition kept the platform URL in the saved document.
+
+def test_a_crlf_reference_image_resolves_through_its_definition(world):
+    url = "https://img.example.com/a.png"
+    world.images[url] = png()
+    out = rehost(f"![c][1]\r\n\r\n[1]: {url}\r\n")
+    assert out == f"![c]({ref_for(png())})\r\n\r\n"
+    assert world.fetches == [url]
+
+
+def test_a_crlf_definition_title_on_the_next_line_goes_with_it(world):
+    url = "https://cdn.example.com/x.png"
+    world.images[url] = png()
+    out = rehost(f'![f][fig]\r\n\r\n[fig]: {url}\r\n  "Figure title"\r\nafter\r\n')
+    assert out == f"![f]({ref_for(png())})\r\n\r\nafter\r\n"
+    out = rehost(f'![f][fig]\r\n\r\n[fig]: {url}\r\n"Quoted" said he.\r\n')
+    assert out == f'![f]({ref_for(png())})\r\n\r\n"Quoted" said he.\r\n'
+
+
+def test_a_crlf_private_definition_a_link_uses_goes(world):
+    assert rehost(f"Cited [see][1].\r\n\r\n[1]: {PRIVATE_DEF}\r\n") == "Cited see.\r\n\r\n"
+
+
+# ═══ 38. wave 10.9 — an image's name lookup ends at the image's deadline ════════
+#
+# ⛔⛔ getaddrinfo takes no timeout, and both lookups ran outside the image's clock:
+# the URL check's before any socket existed for the deadline to shut, the connect's
+# after its deadline check. A resolver that never answered held the rehost thread
+# for as long as it liked.
+
+def _hung_resolver(monkeypatch, answer_first=0):
+    """`socket.getaddrinfo` answering the first `answer_first` lookups with a public
+    address and blocking every later one until the test releases it (5 s at most,
+    so a surviving mutant's thread does not outlive its test for long)."""
+    release = threading.Event()
+    calls = []
+
+    def getaddrinfo(host, port, family=0, type=0, *a, **k):
+        calls.append((host, port, family, type))
+        if len(calls) > answer_first:
+            release.wait(5)
+            raise socket.gaierror(8, "released")
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    return release, calls
+
+
+def test_a_hung_url_check_lookup_ends_the_image_at_its_deadline(monkeypatch):
+    """⛔⛔ EXECUTED — the REAL fetch, its URL check's lookup never answering. Before,
+    the thread sat in getaddrinfo whatever the deadline, and no request followed."""
+    release, calls = _hung_resolver(monkeypatch)
+    session = FakeSession([])
+    monkeypatch.setattr(R, "_doc_img_session", lambda guard: session)
+    try:
+        th, box = _fetch_in_thread("https://img.example.com/a.png", 0.4, 3.0)
+        alive = th.is_alive()
+    finally:
+        release.set()
+    th.join(6)
+    assert not alive, "the lookup outlived the image's deadline"
+    assert isinstance(box.get("error"), R._DocImageRefused) and box["error"].kind == "failed", box
+    assert box["elapsed"] < 1.5, box
+    assert [c[0] for c in calls] == ["img.example.com"] and session.calls == []
+
+
+def test_a_hung_connect_lookup_fails_within_the_image_deadline(monkeypatch):
+    """The connect's OWN lookup — the second answer — never answering. No socket."""
+    from urllib3.util.connection import allowed_gai_family
+    release, calls = _hung_resolver(monkeypatch)
+    made = []
+    monkeypatch.setattr(socket, "socket", lambda *a, **k: made.append(a))
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(R._DocImageRefused) as got:
+            R._doc_img_connect("img.example.com", 443, time.monotonic() + 0.4)
+        elapsed = time.monotonic() - t0
+    finally:
+        release.set()
+    assert got.value.kind == "failed" and elapsed < 1.5, elapsed
+    assert calls == [("img.example.com", 443, allowed_gai_family(), socket.SOCK_STREAM)]
+    assert made == []
+
+
+def test_a_hung_second_lookup_inside_the_real_chain_ends_at_the_deadline(monkeypatch):
+    """The consumer: fetch → URL check (answers) → requests → urllib3 → `_new_conn` →
+    `_doc_img_connect`, whose lookup hangs."""
+    release, calls = _hung_resolver(monkeypatch, answer_first=1)
+    made = []
+    monkeypatch.setattr(socket, "socket", lambda *a, **k: made.append(a))
+    try:
+        th, box = _fetch_in_thread("https://img.example.com/a.png", 0.5, 3.0)
+        alive = th.is_alive()
+    finally:
+        release.set()
+    th.join(6)
+    assert not alive, "the connect's lookup outlived the image's deadline"
+    assert isinstance(box.get("error"), R._DocImageRefused) and box["error"].kind == "failed", box
+    assert box["elapsed"] < 1.5, box
+    assert [c[0] for c in calls] == ["img.example.com", "img.example.com"] and made == []
+
+
+def test_a_lookup_gets_no_more_than_a_connect_timeout(monkeypatch):
+    """Far from the image's deadline, a lookup still ends at the connect timeout — a
+    resolver that is down costs each image that, not its whole budget."""
+    release, _calls = _hung_resolver(monkeypatch)
+    monkeypatch.setattr(R, "_DOC_IMG_TIMEOUT", (0.3, 10.0))
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(R._DocImageRefused) as got:
+            R._doc_img_check_url("https://img.example.com/a.png", far())
+        elapsed = time.monotonic() - t0
+    finally:
+        release.set()
+    assert got.value.kind == "failed" and 0.2 <= elapsed < 2.0, elapsed
+
+
+@pytest.mark.parametrize("via", ["check", "connect"])
+def test_no_lookup_starts_once_the_image_deadline_has_passed(monkeypatch, via):
+    release, calls = _hung_resolver(monkeypatch)
+    try:
+        with pytest.raises(R._DocImageRefused) as got:
+            if via == "check":
+                R._doc_img_check_url("https://img.example.com/a.png", time.monotonic() - 0.01)
+            else:
+                R._doc_img_connect("img.example.com", 443, time.monotonic() - 0.01)
+        time.sleep(0.2)  # a lookup thread started anyway has called by now
+    finally:
+        release.set()
+    assert got.value.kind == "failed" and calls == []
+
+
+def test_a_lookup_left_behind_is_a_daemon_and_never_holds_the_exit(monkeypatch):
+    release, _calls = _hung_resolver(monkeypatch)
+    try:
+        with pytest.raises(TimeoutError):
+            R._doc_img_lookup("img.example.com", 443, time.monotonic() + 0.2)
+        left = [t for t in threading.enumerate() if t.name == "doc-images-lookup"]
+        assert left and all(t.daemon for t in left)
+    finally:
+        release.set()
+
+
+def test_a_lookup_error_reaches_the_caller_as_it_did(monkeypatch):
+    """A resolver error is the check's "failed"; any other error the lookup raised
+    is raised in the caller, as when it ran there (`_doc_img_resolve_src` counts it)."""
+    def getaddrinfo(host, port, *a, **k):
+        if host.startswith("bad"):
+            raise UnicodeError("label too long")
+        raise socket.gaierror(8, "nodename nor servname provided")
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    with pytest.raises(R._DocImageRefused) as got:
+        R._doc_img_check_url("https://img.example.com/a.png", far())
+    assert got.value.kind == "failed"
+    with pytest.raises(UnicodeError):
+        R._doc_img_check_url("https://bad.example.com/a.png", far())
+
+
+def test_every_hop_checks_its_url_against_the_images_deadline(net):
+    net.session = FakeSession([FakeHTTPResponse(302, {"Location": "/moved/a.png"}),
+                               FakeHTTPResponse(200, {}, [png()])])
+    end = far()
+    assert R._doc_img_fetch("https://img.example.com/a.png", end) == png()
+    assert net.deadlines == [end, end]

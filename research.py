@@ -47590,10 +47590,13 @@ _DOC_IMG_MD_RE = re.compile(
 # ⭐ The title may sit on the NEXT line (CommonMark allows it); matched only when
 # nothing else follows it on that line, so a quoted sentence under a definition
 # stays prose. Before this, removing a used definition left the title behind.
+# ⛔ `\r?` at both line ends (wave 10.9): a CRLF document — Gemini's in-page
+# clipboard read on Windows — matched no definition at all, so every reference
+# image kept `![c][1]` and its definition kept the platform URL.
 _DOC_IMG_DEF_RE = re.compile(
     r"^[ ]{0,3}\[(?P<label>[^\[\]\n]{1,999})\]:[ \t]*"
     r"(?:<(?P<adest>[^<>\n]*)>|(?P<dest>\S+))"
-    r"(?:(?:[ \t]+|[ \t]*\n[ \t]*)(?:\"[^\"\n]*\"|'[^'\n]*'|\([^()\n]*\)))?[ \t]*(?:\n|\Z)", re.M)
+    r"(?:(?:[ \t]+|[ \t]*\r?\n[ \t]*)(?:\"[^\"\n]*\"|'[^'\n]*'|\([^()\n]*\)))?[ \t]*(?:\r?\n|\Z)", re.M)
 # Any `[text]`, `[text][label]` or `[text][]` — which of them is a LINK reference
 # (not an image, not an inline link) is decided by `_doc_img_link_ref_labels`.
 _DOC_IMG_BRACKET_RE = re.compile(
@@ -47868,13 +47871,49 @@ def _doc_img_address_is_public(addr) -> bool:
     return all(c.is_global and not c.is_multicast for c in candidates)
 
 
-def _doc_img_resolve_host(host: str, port: int) -> "list[str]":
-    return [info[4][0] for info in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)]
+def _doc_img_lookup(host: str, port: int, deadline: float, family: int = 0) -> list:
+    """`socket.getaddrinfo` for one image, bounded by min(connect timeout, time left
+    before `deadline`). Out of time — before it starts or while it waits — is a
+    `TimeoutError`, an OSError, so every caller's failure path takes it; any other
+    error the lookup raised is raised here.
+
+    ⛔⛔ WHY A THREAD (wave 10.9). getaddrinfo takes no timeout, and a resolver that
+    never answered held the rehost thread OUTSIDE the image's deadline: the URL check
+    runs before any socket exists for `_DocImgDeadline` to shut, and the connect's
+    own lookup started after its deadline check. So the lookup runs on a thread of
+    its own and this one stops waiting at the bound. A lookup that never returns
+    keeps only that thread, until the resolver gives up; it is a daemon, so it never
+    holds the process's exit (a pool's threads are joined at exit).
+    ⭐ Started from a rehost thread, it inherits that thread's blocked signals."""
+    left = min(_DOC_IMG_TIMEOUT[0], deadline - time.monotonic())
+    if left <= 0:
+        raise TimeoutError("lookup")
+    box: dict = {}
+
+    def _resolve():
+        try:
+            box["infos"] = socket.getaddrinfo(host, port, family, socket.SOCK_STREAM)
+        except BaseException as exc:  # noqa: BLE001 — raised again in the waiting thread
+            box["error"] = exc
+
+    th = _threading.Thread(target=_resolve, name="doc-images-lookup", daemon=True)
+    th.start()
+    th.join(left)
+    if th.is_alive():
+        raise TimeoutError("lookup")
+    if "error" in box:
+        raise box["error"]
+    return box["infos"]
 
 
-def _doc_img_check_url(url: str) -> None:
+def _doc_img_resolve_host(host: str, port: int, deadline: float) -> "list[str]":
+    return [info[4][0] for info in _doc_img_lookup(host, port, deadline)]
+
+
+def _doc_img_check_url(url: str, deadline: float) -> None:
     """Refuse unless the URL is https on the default port, carries no credentials,
-    and EVERY address its host resolves to is public."""
+    and EVERY address its host resolves to is public. The lookup ends at the
+    image's `deadline` (`_doc_img_lookup`); a lookup that does not is "failed"."""
     if len(url) > _DOC_IMG_MAX_URL_CHARS or _DOC_IMG_URL_BAD_CHARS_RE.search(url):
         raise _DocImageRefused("refused")
     try:
@@ -47889,7 +47928,7 @@ def _doc_img_check_url(url: str) -> None:
     if port not in (None, 443):
         raise _DocImageRefused("refused")
     try:
-        addrs = _doc_img_resolve_host(parts.hostname, 443)
+        addrs = _doc_img_resolve_host(parts.hostname, 443, deadline)
     except OSError:
         raise _DocImageRefused("failed") from None
     if not addrs or not all(_doc_img_address_is_public(a) for a in addrs):
@@ -47919,13 +47958,14 @@ def _doc_img_connect(host: str, port: int, deadline: float, socket_options=None)
     socket `_DocImgDeadline` could watch: a host with thirty addresses that drop
     packets held the worker about 150 s — past the per-image limit, the document
     budget and the hard stop — and the timer had nothing to shut.
-    So: no connect is started once `deadline` has passed; one lookup; at most
-    `_DOC_IMG_CONNECT_ADDRS` addresses; each try gets min(connect timeout, time left).
+    So: no lookup and no connect is started once `deadline` has passed; one lookup,
+    bounded like a connect (`_doc_img_lookup`, wave 10.9 — it was not bounded at
+    all); at most `_DOC_IMG_CONNECT_ADDRS` addresses; each try gets min(connect
+    timeout, time left).
     ⛔⛔ An address that is not public is skipped BEFORE its socket is made: the URL
     check resolved the name once, this lookup is a second answer, and a rebinding
     name would otherwise get a TCP handshake with a LAN host before
     `_doc_img_check_peer` (kept, the second guard) closed it.
-    ⚠ The name lookup itself is not bounded (recorded).
     Only non-public addresses, nothing tried and time still left → a "refused"
     refusal (what the peer check said before). Every other failure is "failed": the
     image is not kept, nothing more.
@@ -47937,11 +47977,10 @@ def _doc_img_connect(host: str, port: int, deadline: float, socket_options=None)
     `_doc_img_resolve_src` lets out of the cache when the document's budget is
     spent, and the next document tries it again."""
     from urllib3.util.connection import allowed_gai_family
-    if time.monotonic() >= deadline:
-        raise _DocImageRefused("failed")
     try:
-        infos = socket.getaddrinfo(host.strip("[]"), port, allowed_gai_family(),
-                                   socket.SOCK_STREAM)[:_DOC_IMG_CONNECT_ADDRS]
+        # ⭐ The deadline is checked inside, before the lookup starts.
+        infos = _doc_img_lookup(host.strip("[]"), port, deadline,
+                                allowed_gai_family())[:_DOC_IMG_CONNECT_ADDRS]
     except OSError:
         raise _DocImageRefused("failed") from None
     skipped = tried = out_of_time = False
@@ -48196,7 +48235,7 @@ def _doc_img_fetch(url: str, deadline: float) -> bytes:
     guard.start()
     try:
         for _hop in range(_DOC_IMG_MAX_REDIRECTS + 1):
-            _doc_img_check_url(url)
+            _doc_img_check_url(url, deadline)
             if time.monotonic() >= deadline:
                 raise _DocImageRefused("failed")
             resp = session.get(url, stream=True, allow_redirects=False,
@@ -48680,12 +48719,14 @@ def _doc_images_rewrite_sync(text: str, run: "_DocImageRun") -> str:
     return unmask(_DOC_IMG_DEF_RE.sub(_definition, text))
 
 
-# A link around an image: `[![alt](src)](href "title")`. The text may hold more than
-# the image, and brackets three deep (an alt with `[1]` inside a link's text).
-_DOC_IMG_WRAP_RE = re.compile(
-    r"(?<![\\!])\[(?P<text>(?:\\.|[^\[\]\\]|\[(?:\\.|[^\[\]\\]|\[(?:\\.|[^\[\]\\])*+\])*+\]){0,4000}+)\]"
+# An inline link, `[text](href "title")`. The text may hold an image and brackets
+# three deep (an alt with `[1]` inside a link's text).
+_DOC_LINK_INLINE = (
+    r"\[(?P<text>(?:\\.|[^\[\]\\]|\[(?:\\.|[^\[\]\\]|\[(?:\\.|[^\[\]\\])*+\])*+\]){0,4000}+)\]"
     r"\([ \t\n]*(?:<(?P<ahref>[^<>\n]*)>|(?P<href>(?:[^\s()\\]|\\.|\((?:[^\s()\\]|\\.)*+\))*+))"
     r"(?:[ \t\n]+(?:\"(?:[^\"\\]|\\.)*+\"|'(?:[^'\\]|\\.)*+'|\((?:[^()\\]|\\.)*+\)))?[ \t\n]*\)")
+# A link around an image: `[![alt](src)](href "title")`.
+_DOC_IMG_WRAP_RE = re.compile(r"(?<![\\!])" + _DOC_LINK_INLINE)
 
 
 def _doc_img_unwrap_self_links(text: str, slot_re, slots: list) -> str:
@@ -48701,7 +48742,9 @@ def _doc_img_unwrap_self_links(text: str, slot_re, slots: list) -> str:
     chart came from) stays, and so does the same address cited elsewhere.
     ⛔ Which images sit inside a link is read from their SLOTS (`slots[i]` = what the
     image became, its source), never guessed from the link's text: a removed image
-    leaves none, and `[![](<S>) View full size](S)` kept S once the words remained."""
+    leaves none, and `[![](<S>) View full size](S)` kept S once the words remained.
+    ⭐ Every other private link — around no image, or in a document with no image
+    at all — is `_doc_scrub_private_links`'s (wave 10.9)."""
     if not slots:
         return text
 
@@ -48723,6 +48766,135 @@ def _doc_img_unwrap_self_links(text: str, slot_re, slots: list) -> str:
         return m.group(0)
 
     return _DOC_IMG_WRAP_RE.sub(_link, text)
+
+
+# ── Private links (wave 10.9) ────────────────────────────────────────────────
+#
+# ⛔⛔ WHY. Only a link AROUND an image was ever checked (above), and a document
+# with no image never entered the funnel at all. So a report's own
+# `[the file](https://files.oaiusercontent.com/…?sig=…)`, `[csv](sandbox:/mnt/…)`,
+# the agent's conversation `https://chatgpt.com/c/…` or a `[1]: <googleusercontent>`
+# definition was saved as written — into the document, the NotebookLM upload and
+# every frozen share, where an https one is a live link to the owner's private
+# file or session.
+# ⭐ ONLY THE PRIVATE SHAPES: an address only the writer's browser can open, a
+# file or image on the platforms' user-content hosts, and a conversation or
+# notebook PATH. ⛔ NEVER the platform host list as a whole (`_is_platform_host`):
+# it names help.openai.com and support.anthropic.com, real sources for a research
+# about those products. (gstatic.com, in the image veto, serves no private file.)
+_DOC_PRIVATE_LINK_SCHEMES = ("data:", "blob:", "sandbox:")
+_DOC_PRIVATE_LINK_HOSTS = ("oaiusercontent.com", "googleusercontent.com", "ggpht.com")
+# (host, the path that is a conversation or a notebook). ChatGPT's also under a GPT
+# or a project (`/g/<id>/c/…`); Gemini's also under an account index (`/u/1/app/…`).
+_DOC_PRIVATE_LINK_PATHS = (
+    ("chatgpt.com", re.compile(r"/(?:g/[^/]+/)?c/")),
+    ("chat.openai.com", re.compile(r"/(?:g/[^/]+/)?c/")),
+    ("claude.ai", re.compile(r"/chat/")),
+    ("gemini.google.com", re.compile(r"/(?:u/\d+/)?app/")),
+    ("notebooklm.google.com", re.compile(r"/notebook/")),
+)
+# An inline link that is not an image: `\![t](…)` IS a link — a citation after "!"
+# the image pass escaped (`_DOC_IMG_LINKED`).
+_DOC_PRIVATE_INLINE_RE = re.compile(r"(?<!\\)(?<!(?<!\\)!)" + _DOC_LINK_INLINE)
+# An address written as text — bare, or an autolink in angle brackets — with the
+# one space before it. Candidates only: `_doc_link_is_private` decides.
+_DOC_PRIVATE_BARE_RE = re.compile(
+    r"[ \t]?(?P<lt><)?(?<![A-Za-z0-9])"
+    r"(?P<url>(?:https?://|www\.|sandbox:|blob:|data:[a-z]+/)[^\s<>()\[\]\"'`]++)(?(lt)>)", re.I)
+# What is left of a line whose only content was a private address: nothing, or a
+# bare list or quote marker. ⛔ Dropped whole — `-` left under a paragraph is a
+# setext underline, and the paragraph above it would render as a heading.
+_DOC_EMPTIED_LINE_RE = re.compile(r"[ \t>]*(?:[-*+]|\d{1,9}[.)])?[ \t\r]*\Z")
+
+
+def _doc_link_is_private(dest: str) -> bool:
+    """Is this destination one only its writer can open, or a platform's record of
+    the conversation? See `_DOC_PRIVATE_LINK_SCHEMES`."""
+    dest = (dest or "").strip()
+    low = dest.lower()
+    if low.startswith(_DOC_PRIVATE_LINK_SCHEMES):
+        return True
+    if low.startswith("www."):
+        dest = "https://" + dest
+    try:
+        parts = urlsplit(dest)
+    except ValueError:
+        return False
+    host = parts.hostname or ""
+
+    def _on(name: str) -> bool:
+        return host == name or host.endswith("." + name)
+
+    if any(_on(h) for h in _DOC_PRIVATE_LINK_HOSTS):
+        return True
+    return any(_on(h) and rx.match(parts.path) for h, rx in _DOC_PRIVATE_LINK_PATHS)
+
+
+def _doc_scrub_private_links(text: str) -> str:
+    """`text` with every PRIVATE destination dropped (`_doc_link_is_private`). An
+    inline link or a link reference keeps its TEXT; a definition goes, line and
+    all; an autolink or a bare address goes. Ordinary links, image markup and code
+    are untouched. `text` itself when nothing changed.
+
+    ⭐ A label whose FIRST definition is private — the one a renderer uses — loses
+    every definition and every reference; a later private duplicate goes alone.
+    ⛔ No network, and no image rewritten: runs AFTER the image pass on every path
+    (`_rehost_document_images`), so what reaches it is a reference or a caption. If
+    that pass is skipped, a private address inside image markup still goes — by
+    the address rule, leaving `![alt]()`."""
+    if not text:
+        return text
+    masked, unmask = _doc_img_mask_code(text)
+    private: set = set()
+    seen: set = set()
+    for m in _DOC_IMG_DEF_RE.finditer(masked):
+        key = _doc_img_label_key(m.group("label"))
+        if key not in seen:
+            seen.add(key)
+            dest = m.group("adest") if m.group("adest") is not None else m.group("dest")
+            if _doc_link_is_private(dest):
+                private.add(key)
+
+    def _definition(m):
+        dest = m.group("adest") if m.group("adest") is not None else m.group("dest")
+        if _doc_img_label_key(m.group("label")) in private or _doc_link_is_private(dest):
+            return ""
+        return m.group(0)
+
+    def _inline(m):
+        href = m.group("ahref") if m.group("ahref") is not None else m.group("href")
+        return m.group("text") if _doc_link_is_private(href) else m.group(0)
+
+    def _reference(m):
+        s, i = m.string, m.start()
+        # Not an escaped bracket, not an image's, not an inline link's text.
+        if s[i - 1:i] == "\\" or (s[i - 1:i] == "!" and s[i - 2:i - 1] != "\\"):
+            return m.group(0)
+        if m.group("label") is None and s.startswith("(", m.end()):
+            return m.group(0)
+        key = _doc_img_label_key(m.group("label") or m.group("text"))
+        return m.group("text") if key in private else m.group(0)
+
+    def _bare(m):
+        url, tail = m.group("url"), ""
+        if m.group("lt") is None:
+            # Trailing punctuation ends the sentence, not the address — as the
+            # renderer's autolink reads it.
+            core = url.rstrip(".,:;!?*_~")
+            url, tail = core, url[len(core):]
+        return tail if _doc_link_is_private(url) else m.group(0)
+
+    out = _DOC_IMG_DEF_RE.sub(_definition, masked)
+    out = _DOC_PRIVATE_INLINE_RE.sub(_inline, out)
+    if private:
+        out = _DOC_IMG_BRACKET_RE.sub(_reference, out)
+    lines = []
+    for line in out.split("\n"):
+        new = _DOC_PRIVATE_BARE_RE.sub(_bare, line)
+        if new == line or not _DOC_EMPTIED_LINE_RE.match(new):
+            lines.append(new)
+    out = "\n".join(lines)
+    return text if out == masked else unmask(out)
 
 
 def _doc_img_leftover_close(text: str, start: int) -> int:
@@ -48805,9 +48977,9 @@ def _doc_img_executor():
     `to_thread`, and a fetch cut off by the hard stop keeps its thread until its
     own deadline ends it. ⛔ And not one pool for the process: idle threads that
     never end are threads every process-wide signal can land on.
-    Ends: `_rehost_document_images` shuts it down (no wait) when the document is
+    Ends: `_doc_images_rehost` shuts it down (no wait) when the document is
     done; a thread still inside a fetch ends at that image's deadline.
-    Read by: `_rehost_document_images` only."""
+    Read by: `_doc_images_rehost` only."""
     import concurrent.futures
     return concurrent.futures.ThreadPoolExecutor(
         max_workers=_DOC_IMG_WORKERS, thread_name_prefix="doc-images",
@@ -48841,7 +49013,7 @@ def _doc_img_exit_coming() -> bool:
     process; `run_server` resets it on entry). ⚠ A signal's first press is a
     graceful uvicorn shutdown that cancels the pipeline task — that ends the
     rehost as a cancelled task, not through here.
-    Ends: with the process. Read by: `_rehost_document_images` (before the worker
+    Ends: with the process. Read by: `_doc_images_rehost` (before the worker
     starts) and `_doc_img_until_stop` (every poll)."""
     return bool(_exit_scheduled)
 
@@ -48856,7 +49028,7 @@ async def _doc_img_until_stop(work):
     itself, and a caption can never become an image again — the source address is
     gone from the text. See `_doc_img_exit_coming`.
     Ends: when the worker answers, when the exit is seen, or when the caller's hard
-    stop cancels this wait. Read by: `_rehost_document_images` only.
+    stop cancels this wait. Read by: `_doc_images_rehost` only.
     ⚠ On the way out the waiting future is cancelled, as `wait_for` did, so a worker
     that fails later leaves no "exception never retrieved"."""
     try:
@@ -48872,12 +49044,29 @@ async def _doc_img_until_stop(work):
 
 
 async def _rehost_document_images(text: str, label: str = "document") -> str:
-    """Every image in an extracted document, rehosted — THE funnel.
+    """THE funnel — called before a document is written anywhere, so the local .md,
+    the Firestore document and whatever is built from the text later (the
+    consolidated report) all carry what it hands back. Two halves:
+      · `_doc_images_rehost` — every image fetched, stored by the web and
+        referenced: the network half;
+      · `_doc_scrub_private_links` — every private link dropped: no network.
 
-    Called before a document is written anywhere, so the local .md, the Firestore
-    document and whatever is built from the text later (the consolidated report)
-    all carry references. Idempotent: a reference to this research is left alone,
-    so a second pass over rewritten text costs no fetch.
+    ⛔⛔ THE SEAM (wave 10.9). The scrub runs on whatever the image half hands back,
+    on every path of it — a document with no image, the offline pass, a rewrite
+    that raised and handed its input back. Anything that skips the images
+    (incognito uploads nothing) skips `_doc_images_rehost` and NEVER this call: a
+    skipped scrub writes the agents' signed file links and conversation URLs into
+    the saved text and everything built from it.
+    ⭐ AFTER the images, not before: a definition an image resolves through is the
+    image half's to consume, and a `data:` or platform image is stored, not
+    dropped — scrubbed first, its source would be gone before it could be fetched."""
+    return _doc_scrub_private_links(await _doc_images_rehost(text, label))
+
+
+async def _doc_images_rehost(text: str, label: str = "document") -> str:
+    """Every image in an extracted document, rehosted — the image half of THE
+    funnel (`_rehost_document_images`). Idempotent: a reference to this research is
+    left alone, so a second pass over rewritten text costs no fetch.
 
     ⭐ The fetches run off the event loop, so other tasks keep ticking. ⛔ But the
     CALLER waits: `extract_and_record_agent` awaits this, and the round-robin loop
