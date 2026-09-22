@@ -2667,9 +2667,33 @@ def _owner_control_refused(data, where: str) -> bool:
     SEPARATELY FROM THE CODE. A rule is one command and a wheel is a release;
     the two are never in step, and this listener is the thing that acts.
 
-    ⛔ ABSENT IS NOT DISAGREEING, as with the start-doc guard: a doc naming no
-    writer is a legacy shape and is left alone.
+    ⛔⛔ AND "ABSENT IS NOT DISAGREEING" DOES NOT HOLD HERE, which round two of
+    cross-verify executed against this listener: the disagreement below needs
+    BOTH fields, so a doc that carried another member's `uid` and simply left
+    `submittedBy` off disagreed with nobody and skipped the whole gate. It
+    resumed their run, merged the sender's config into their config.json and
+    wrote `{status: "stopped", cancelled: True}` into THEIR tree — worse than
+    the hole above, whose status write at least landed on the sender.
+
+    ⭐ REFUSING IT COSTS NOTHING, which is why the start guard's rule is not
+    copied here. `devices/{id}/queue` has required `submittedBy ==
+    request.auth.uid` on create since the collection existed (2026-05-20), and
+    every writer stamps it: the web's `buildQueuePayload` and
+    `ownerControlPipeline`, and the agent's start, resume and cancel. Nothing
+    else creates a document here — this machine consumes and deletes them, and
+    the phone only reads. So there is no legacy unsigned shape to keep working;
+    only the one shape no honest client writes.
     """
+    # ⛔⛔ THE UNSIGNED DOC IS ANSWERED FIRST, because the disagreement cannot
+    # see it: it is a claim about a run with nobody behind it.
+    claimed = str((data or {}).get("submittedBy") or "").strip()
+    if not claimed:
+        unsigned = str((data or {}).get("uid") or "").strip()
+        if unsigned:
+            log(f"[{where}] refusing {(data or {}).get('action', '?')} — it names "
+                f"a run (uid={unsigned[:8]}…) and no writer at all; every client "
+                f"that may write this queue stamps submittedBy", "WARN")
+            return True
     # ⭐ THE DISAGREEMENT IS DEFINED ONCE, and this reuses it rather than
     # restating it — the file's own note beside that helper says why ("one
     # definition, two claim sites"), and a second copy of the same two lines

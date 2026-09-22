@@ -25,6 +25,7 @@ step, and this listener is the thing that acts.
 """
 import ast
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -106,12 +107,15 @@ def test_everyone_still_governs_their_own_run():
         _doc(uid=OWNER, submittedBy=OWNER), "t") is False
 
 
-def test_a_doc_that_names_no_writer_is_left_alone():
-    """⛔ ABSENT IS NOT DISAGREEING — the same rule the start-doc guard states.
-    A legacy doc naming no writer must still work; it simply ends up
-    attributable to nobody."""
-    assert research._owner_control_refused(_doc(submittedBy=""), "t") is False
+def test_a_doc_that_names_nobody_at_all_is_left_alone():
+    """⭐ A doc with neither identity names no tree to act on, and the branch's
+    own missing-uid guard drops it. Nothing here to refuse.
+
+    ⛔⛔ THIS TEST USED TO SAY THE OPPOSITE FOR `submittedBy=""` — "absent is
+    not disagreeing", borrowed from the start guard — and that sentence WAS the
+    bypass. See section 4."""
     assert research._owner_control_refused(_doc(uid=""), "t") is False
+    assert research._owner_control_refused(_doc(uid="", submittedBy=""), "t") is False
     assert research._owner_control_refused({}, "t") is False
 
 
@@ -273,3 +277,136 @@ def test_the_owner_resumes_a_sharers_run_this_process_is_holding(
 # also calls. So adding an owner exemption to `_start_doc_identity_refused`, the
 # exact edit its docstring forbids, left the assertion green. Replaced by an
 # executed one: test_the_start_guard_refuses_the_owners_divergence_too.
+
+
+# ══ 4. a doc that names a run must name its writer ═══════════════════════
+#
+# ⛔⛔ WHAT ROUND TWO OF CROSS-VERIFY EXECUTED AGAINST THIS LISTENER. Everything
+# above turns on the two identities DISAGREEING, and a disagreement needs both
+# of them. So a queue doc carrying another member's `uid` and simply leaving
+# `submittedBy` off disagreed with nobody and walked through this gate — and
+# then through every check the wave added after it, each of which compared the
+# victim's uid to itself and admitted: `_refuse_foreign_run`,
+# `_corroborated_run_id`, `_owner_record_admits`, `_deferred_start_doc_id`.
+# Signing nothing was stronger than signing honestly. The cancel wrote
+# `{status: "stopped", cancelled: True}` into the VICTIM's tree — the
+# delete-on-close cascade, so their research went with it — and the resume
+# re-enqueued their run, cleared their `.pause` and `.no_auto_retry` and merged
+# the sender's config into their config.json.
+#
+# ⭐ AND NO HONEST CLIENT WRITES THAT SHAPE, which is the whole reason the
+# start guard's "absent is not disagreeing" is not copied here. The create rule
+# on `devices/{id}/queue` has required `submittedBy == request.auth.uid` since
+# the collection existed (2026-05-20, the commit that moved the queue there),
+# the web stamps it in `buildQueuePayload` and `ownerControlPipeline`, and the
+# agent stamps it on start, resume and cancel. Nothing else creates a document
+# here: this machine consumes and deletes them, and the phone only reads. There
+# is no legacy unsigned shape to keep working.
+#
+# ⛔ The rule is only load-bearing while the rules are STALE or rolled back,
+# which is exactly what this guard exists for — its own docstring says so, and
+# wave 10.8 shipped stale rules.
+
+def test_a_doc_naming_a_run_with_no_writer_is_refused():
+    """⛔⛔ THE BYPASS ITSELF, in the gate that has to answer it."""
+    assert research._owner_control_refused(
+        _doc(uid=SHARER, submittedBy=""), "t") is True
+    assert research._owner_control_refused(
+        {"action": "cancel", "uid": SHARER, "researchId": "chat_1"}, "t") is True
+    assert research._owner_control_refused(
+        {"action": "resume", "uid": SHARER, "researchId": "chat_1"}, "t") is True
+
+
+def test_the_owners_own_tree_is_not_an_exemption():
+    """⛔ THE EXEMPTION A REVIEWER WOULD ASK FOR — "leave a doc naming the
+    machine owner's own tree alone, it must be their older client". Nothing
+    writes it, and admitting it would hand the owner's own running research to
+    any member who can read a research id off the device document."""
+    assert research._owner_control_refused(
+        _doc(uid=OWNER, submittedBy=""), "t") is True
+
+
+def test_an_unsigned_cancel_of_a_members_held_run_stops_nothing(
+        tmp_path, monkeypatch):
+    """⛔⛔ THE CONSUMER, on the worst case: the run is the one this worker is
+    holding, so without the gate the cancel lands on the victim's own tree."""
+    lis = Listener(monkeypatch, tmp_path, owner=OWNER,
+                   current_job=dict(_SHARERS_JOB)).feed(
+        action="cancel", uid=SHARER, researchId=SHARER_RID)
+    assert lis.controls.stops == 0, "an unsigned cancel stopped a member's run"
+    assert lis.writes == [], (
+        "an unsigned cancel wrote a terminal status into a member's tree")
+    assert lis.exits == [], "an unsigned cancel took the process down with it"
+    assert "incoming" in lis.incoming, "the refused cancel was left to be re-read"
+
+
+def test_an_unsigned_resume_moves_nothing_of_theirs(tmp_path, monkeypatch):
+    """⛔⛔ THE RESUME HALF. Every marker the fixture leaves is one the resume
+    branch clears, and the config is the sender's."""
+    d = _sharers_run(tmp_path, monkeypatch)
+    (d / ".pause").write_text("", encoding="utf-8")
+    (d / research.NO_AUTO_RETRY_MARKER).write_text("", encoding="utf-8")
+    (d / "config.json").write_text(json.dumps({"podcast": True}), encoding="utf-8")
+    lis = Listener(monkeypatch, tmp_path, owner=OWNER, research_docs={
+        (SHARER, SHARER_RID): {"backendRunId": SHARER_RUN}}).feed(
+        action="resume", uid=SHARER, researchId=SHARER_RID,
+        backendRunId=SHARER_RUN, config={"podcast": False})
+    assert lis.enqueued == [], "an unsigned resume re-enqueued a member's run"
+    assert (d / ".pause").exists(), "an unsigned resume cleared their .pause"
+    assert (d / research.NO_AUTO_RETRY_MARKER).exists(), (
+        "an unsigned resume cleared their .no_auto_retry")
+    assert json.loads((d / "config.json").read_text(encoding="utf-8")) == {"podcast": True}, (
+        "the sender's config was merged into a member's run")
+    assert lis.writes == []
+
+
+def test_an_unsigned_stale_resume_writes_no_reason_into_their_tree(
+        tmp_path, monkeypatch):
+    """⛔⛔ THE THIRD CLAIM SITE. The abandoned sweep's write-back sits sixty
+    lines ABOVE the line that reads `action`, so an unsigned doc reached a named
+    person's research document before either dispatch branch ran."""
+    old = int(time.time() * 1000) - (13 * 60 * 60 * 1000)
+    lis = Listener(monkeypatch, tmp_path, owner=OWNER).feed(
+        action="resume", uid=SHARER, researchId=SHARER_RID, timestamp=old)
+    assert lis.writes == [], (
+        "the stale sweep wrote a drop reason into a member's tree")
+
+
+# ── accept polarity: what a blanket refusal would take away ───────────────
+#
+# ⭐ The owner's own control path is driven in section 3 above, in the shape the
+# web writes (`uid=<sharer>, submittedBy=<owner>`) — a gate that refused on the
+# missing writer by refusing every cross-person doc would fail those four.
+
+def test_a_member_still_cancels_their_own_held_run(tmp_path, monkeypatch):
+    """⭐ The refusal is about the missing writer, never about the verb."""
+    lis = Listener(monkeypatch, tmp_path, owner=OWNER,
+                   current_job=dict(_SHARERS_JOB)).feed(
+        action="cancel", uid=SHARER, submittedBy=SHARER, researchId=SHARER_RID)
+    assert lis.controls.stops == 1, "a member's own Stop was dropped"
+    assert [w[:2] for w in lis.writes] == [(SHARER, SHARER_RID)]
+    assert lis.writes[0][2]["cancelled"] is True
+
+
+def test_a_member_still_resumes_their_own_run(tmp_path, monkeypatch):
+    """⭐ ...and their own Resume still reaches the disk and the queue."""
+    d = _sharers_run(tmp_path, monkeypatch)
+    (d / ".pause").write_text("", encoding="utf-8")
+    lis = Listener(monkeypatch, tmp_path, owner=OWNER, research_docs={
+        (SHARER, SHARER_RID): {"backendRunId": SHARER_RUN}}).feed(
+        action="resume", uid=SHARER, submittedBy=SHARER, researchId=SHARER_RID,
+        backendRunId=SHARER_RUN)
+    assert [j["run_id"] for j in lis.enqueued] == [SHARER_RUN], (
+        "a member's own Resume was refused")
+    assert not (d / ".pause").exists(), "their own Resume left the run paused"
+
+
+def test_a_stale_resume_they_signed_still_gets_its_sentence(tmp_path, monkeypatch):
+    """⭐ ACCEPT POLARITY FOR THE SWEEP, which wave 10.8 built on purpose: the
+    person who tapped Resume before booting is still told why it was dropped."""
+    old = int(time.time() * 1000) - (13 * 60 * 60 * 1000)
+    lis = Listener(monkeypatch, tmp_path, owner=OWNER).feed(
+        action="resume", uid=SHARER, submittedBy=SHARER, researchId=SHARER_RID,
+        timestamp=old)
+    assert [w[:2] for w in lis.writes] == [(SHARER, SHARER_RID)]
+    assert lis.writes[0][2]["resumeDropReason"] == research.RESUME_DROP_WENT_STALE

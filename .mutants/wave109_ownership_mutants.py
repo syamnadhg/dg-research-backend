@@ -38,6 +38,13 @@ past all of it:
         tuple living in the test file, so no change to the gate could turn them
         red; the gate now reads the module's one `TERMINAL_RESEARCH_STATUSES`
         and its tests drive the real start branch.
+  U1-U5 — and the whole ownership gate was bypassed by writing LESS: the
+        disagreement it rests on needs both identity fields, so a doc carrying
+        another member's `uid` and no `submittedBy` disagreed with nobody. Every
+        check above then compared the victim's uid to itself and admitted.
+        Refusing it costs nothing — the create rule has required `submittedBy`
+        since the collection existed and every writer stamps it — so the gate
+        now answers the unsigned doc first (U1-U5).
 
 Every mutant below is a way the fix could be put back to decoration while still
 looking installed. The quiet ones matter most:
@@ -168,6 +175,34 @@ T_SET = ("TERMINAL_RESEARCH_STATUSES = (\n"
          "    \"terminated_by_user_discard\", \"stopped_by_watchdog\",\n"
          ")")
 T_GATE = "                if _rd_status in TERMINAL_RESEARCH_STATUSES:"
+
+# ── anchors: a doc that names a run must name its writer ───────────────────
+#: The whole unsigned refusal, comment excluded so a deletion still parses.
+U_BLOCK = ("    claimed = str((data or {}).get(\"submittedBy\") or \"\").strip()\n"
+           "    if not claimed:\n"
+           "        unsigned = str((data or {}).get(\"uid\") or \"\").strip()\n"
+           "        if unsigned:\n"
+           "            log(f\"[{where}] refusing {(data or {}).get('action', '?')} — it names \"\n"
+           "                f\"a run (uid={unsigned[:8]}…) and no writer at all; every client \"\n"
+           "                f\"that may write this queue stamps submittedBy\", \"WARN\")\n"
+           "            return True\n")
+#: The refusal's verdict, so the log can be kept while the answer is lost.
+U_VERDICT = ("stamps submittedBy\", \"WARN\")\n"
+             "            return True\n")
+#: The test itself — `    if not claimed:` alone matches twice.
+U_TEST = ("    if not claimed:\n"
+          "        unsigned = str((data or {}).get(\"uid\") or \"\").strip()\n")
+#: The half that keeps a doc naming NOBODY out of it.
+U_NAMED = "        if unsigned:\n"
+#: The gate the unsigned test has to run BEFORE.
+U_ORDER_TAIL = ("    # ⭐ THE DISAGREEMENT IS DEFINED ONCE, and this reuses it rather than\n"
+                "    # restating it — the file's own note beside that helper says why (\"one\n"
+                "    # definition, two claim sites\"), and a second copy of the same two lines\n"
+                "    # also made another harness's anchor match twice, which the sweep caught.\n"
+                "    # What differs here is only WHO is allowed to disagree.\n"
+                "    conflict = _start_doc_identity_conflict(data)\n"
+                "    if conflict is None:\n"
+                "        return False\n")
 
 MUTANTS = [
     # ── N1: the disk record's person half ──────────────────────────────────
@@ -414,6 +449,38 @@ MUTANTS = [
      "resume a sharer's run whose backendRunId write-back failed",
      [(A_DISK_CALL, "                    _orphaned = _run_dir_owning_research(target_rid, "
                     "data.get(\"submittedBy\") or target_uid)")]),
+
+    # ── round two: a doc that names a run must name its writer ────────────
+    ("U1", "under", RESEARCH,
+     "⛔⛔⛔ THE BYPASS ITSELF — omitting `submittedBy` skips the whole ownership "
+     "gate, because the disagreement below needs both fields. A doc carrying "
+     "another member's uid and no writer resumes their run and writes "
+     "{status: stopped, cancelled: True} into THEIR tree",
+     [(U_BLOCK, "")]),
+
+    ("U2", "under", RESEARCH,
+     "⛔⛔ THE FOUNDING DEFECT'S SHAPE — the refusal keeps its log and loses its "
+     "verdict, so the machine says it refused and admits the doc anyway",
+     [(U_VERDICT, "stamps submittedBy\", \"WARN\")\n")]),
+
+    ("U3", "under", RESEARCH,
+     "⛔⛔ the unsigned rule is scoped to `cancel`, and resume is the half that "
+     "merges the sender's config into another member's run and clears their "
+     "pause — the sweep's write-back goes with it",
+     [(U_TEST, "    if not claimed and (data or {}).get(\"action\") == \"cancel\":\n"
+               "        unsigned = str((data or {}).get(\"uid\") or \"\").strip()\n")]),
+
+    ("U4", "under", RESEARCH,
+     "⛔⛔ THE TIDY-UP — the unsigned test moves below the disagreement, which "
+     "returns False on an unsigned doc before it is ever reached. Every line "
+     "of the refusal is still there, in the wrong order",
+     [(U_BLOCK + U_ORDER_TAIL, U_ORDER_TAIL + U_BLOCK)]),
+
+    ("U5", "over", RESEARCH,
+     "⛔ a doc naming NOBODY is refused too, so the `{}` and missing-uid shapes "
+     "the branch's own guard handles are turned into owner-control refusals "
+     "and logged as somebody's run",
+     [(U_NAMED, "        if True:\n")]),
 
     ("W4", "over", RESEARCH,
      "⛔⛔ the research document is read from the WRITER's tree, where a sharer's "
