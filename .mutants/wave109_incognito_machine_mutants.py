@@ -171,8 +171,8 @@ RECHECK = ("    if _is_incognito_research(research_id):\n"
            "    return (float(now) - float(last_verified_at or 0.0)) >= float(recheck_sec)")
 QUEUE_DIR_CLAIM = ('    claim = Path(str(resume)).name if resume else bound.arguments.get("run_id")')
 CATCHUP = ('    if _is_incognito_research(research_id):\n'
-           '        return ("nothing here can re-drive it — a run that keeps nothing has no "\n'
-           '                "chat to reopen")')
+           '        return ("nothing here can ask the route again — a run that keeps nothing "\n'
+           '                "has no chat to reopen")')
 
 CLAIM_QUEUE_DELETE = ('                        f"recreating it", "WARN")\n'
                       "                    try:\n"
@@ -406,11 +406,11 @@ MUTANTS = [
     ("T11", "under", "⛔ the run's own account promises a catch-up that cannot "
      "happen — a lying diagnostic in the file that rides the support bundle",
      [(CATCHUP, "    if False:\n        return \"\"")]),
-    ("T12", "over", "every run's account stops naming the catch-up that DOES "
+    ("T12", "over", "every run's account stops naming the re-drive that DOES "
      "recover it, so a recoverable run reads as lost",
      [(CATCHUP, "    if True:\n"
-                '        return ("nothing here can re-drive it — a run that keeps nothing has no "\n'
-                '                "chat to reopen")')]),
+                '        return ("nothing here can ask the route again — a run that keeps nothing "\n'
+                '                "has no chat to reopen")')]),
 
     ("N13", "under", "the dead-worker reconciler writes the parked patch "
      "directly again, so the two recovery paths disagree",
