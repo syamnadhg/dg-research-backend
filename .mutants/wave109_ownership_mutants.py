@@ -62,9 +62,10 @@ looking installed. The quiet ones matter most:
         person whose research id collides cannot cancel their own queued run.
   D5  — the deferred scan asks the writer instead of the tree: the owner's Stop
         on a sharer's queued run silently does nothing.
-  M13a-c — the list the cancel gate reads loses a slot. The gate-pending and
-        running checks that follow it have NO ownership clause of their own, so
-        a forgotten slot is a run another member can stop.
+  M13a/c — the list the cancel gate reads loses a slot. The running check that
+        follows it has NO ownership clause of its own, so a forgotten slot is a
+        run another member can stop. (M13b aimed at a third slot,
+        `gate_pending_job`, which retired with the queue gate in wave 10.9.)
 
 ⛔ ANCHORS ARE SINGLE STRING LITERALS AND MUST MATCH EXACTLY ONCE, and every
 mutated file must still COMPILE — a mutant that does not parse fails every test
@@ -126,8 +127,10 @@ R_GATE_HEAD = "                if _refuse_foreign_run(doc, _jobs_held_locally(jo
 R_GATE_JOBS = "_refuse_foreign_run(doc, _jobs_held_locally(job_queue), target_rid,"
 
 # ── anchors: the jobs this process holds ───────────────────────────────────
-J_SLOTS = ("    jobs = [_QUEUE_STATE.get(\"current_job\") or {},\n"
-           "            _QUEUE_STATE.get(\"gate_pending_job\") or {}]")
+#: ⛔ RE-ANCHORED (wave 10.9, N8). The list had a second slot,
+#: `gate_pending_job`, for the job a worker held while it waited on the previous
+#: run's cloud tail; that wait and its slot are gone, and M13b went with them.
+J_SLOTS = "    jobs = [_QUEUE_STATE.get(\"current_job\") or {}]"
 J_DEQUE = ("    try:\n        jobs.extend(list(job_queue._queue))\n    except Exception:\n"
            "        pass\n    return jobs")
 J_CANCEL = "                _local_jobs = _jobs_held_locally(job_queue)"
@@ -165,9 +168,13 @@ N_CALL = ("    run_dir = _run_dir_inside_queues(claimed)\n"
 #: The disk lookup will not follow a link out of `queues/`.
 N_DISK = "        if _run_dir_inside_queues(d.name) is None:\n            continue\n"
 #: The dead-worker sweep's delivery-tail probe.
-N_SWEEP = ("        _run_dir = _run_dir_inside_queues(data.get(\"backendRunId\"))\n"
-           "        if _run_dir is not None:\n"
-           "            _dpath = _run_dir / \"delivery.json\"\n")
+#: ⛔ RE-ANCHORED (wave 10.9, 542-4). The sweep held a private copy of the
+#: hand-off test; both halves — the claim test and what `delivery.json` MEANS —
+#: moved into `_claim_is_handed_off`, which the boot rehydrate and the resume
+#: path ask as well. Eight leading spaces: the rehydrate's call is the same line
+#: at sixteen.
+N_SWEEP = ("        if _claim_is_handed_off(data.get(\"backendRunId\")):\n"
+           "            continue\n")
 
 # ── anchors: the pre-claim terminal gate ───────────────────────────────────
 T_SET = ("TERMINAL_RESEARCH_STATUSES = (\n"
@@ -316,12 +323,12 @@ MUTANTS = [
      "⛔⛔ the running job leaves the list — the cancel branch's running-job "
      "check has no ownership clause of its own, so Bob stops Alice's live run, "
      "touches a permanent .stop and schedules the exit",
-     [(J_SLOTS, "    jobs = [_QUEUE_STATE.get(\"gate_pending_job\") or {}]")]),
+     [(J_SLOTS, "    jobs = []")]),
 
-    ("M13b", "under", RESEARCH,
-     "⛔⛔ the gate-pending job leaves the list — its sync check matches on "
-     "research_id alone, so Bob stops Alice's run while it waits at the gate",
-     [(J_SLOTS, "    jobs = [_QUEUE_STATE.get(\"current_job\") or {}]")]),
+    # ⛔ M13b RETIRED WITH THE SLOT IT AIMED AT (wave 10.9, N8): the gate-pending
+    # job. There is no longer a state in which a dequeued job is held by this
+    # process and is not `current_job`, so the mutant would have been an
+    # equivalent one — which is a harness fault, not a survivor.
 
     ("M13c", "under", RESEARCH,
      "⛔ the deque leaves the list, so a cancel naming a job queued here for "
@@ -426,7 +433,12 @@ MUTANTS = [
      "the Cloud-Run-tail branch on a delivery.json that was never a run's",
      [(N_SWEEP, "        _dpath = (Path(__file__).parent / \"queues\"\n"
                 "                  / (data.get(\"backendRunId\") or \"\") / \"delivery.json\")\n"
-                "        if data.get(\"backendRunId\"):\n")]),
+                "        try:\n"
+                "            if _dpath.exists() and json.loads(\n"
+                "                    _dpath.read_text(encoding=\"utf-8\")).get(\"status\") == \"completed\":\n"
+                "                continue\n"
+                "        except Exception:\n"
+                "            pass\n")]),
 
     # ── the pre-claim terminal gate, which used to be tested by a replica ──
     ("T1", "under", RESEARCH,

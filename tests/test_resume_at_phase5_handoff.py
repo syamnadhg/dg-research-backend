@@ -2,8 +2,8 @@
 
 DGOPS-9508. `run_pipeline`'s `start_phase == 5` branch is the "P4 was done before
 the crash, but FE-owned Phase 5 may not have run" path. It re-emits
-`phase_complete phase=4` so the FE listener re-fires `triggerFeP5`, then marks the
-run done for the queue gate and posts the trigger directly.
+`phase_complete phase=4`, then records the hand-off and kicks the cloud route
+directly.
 
 **Its last three steps never executed.** The branch called `update_delivery(...)`,
 and `update_delivery` is a nested `def` ~365 lines FURTHER DOWN in the same
@@ -21,10 +21,9 @@ never happened was everything after:
     _update_firestore_research(beDone, phase=5, currentPhase=5)
     _post_fe_p4p5_trigger(...)
 
-So `beDone` never landed (the queue gate for the next job never fired),
-`currentPhase` stayed stale at 4 — the exact symptom the comment directly above
-that call says it fixes — and the FE trigger never posted, leaving the chain
-dangling whenever the FE listener was not alive to catch the event.
+So `beDone` never landed, `currentPhase` stayed stale at 4 — the exact symptom
+the comment directly above that call says it fixes — and the cloud kick never
+posted, leaving the chain dangling whenever no tab was open to catch the event.
 
 No test invoked `run_pipeline` anywhere in the suite before this file, which is
 why a guaranteed crash on a user-reachable path survived. It is reachable with a
@@ -124,7 +123,9 @@ def test_resume_at_phase5_marks_bedone_and_advances_currentphase(resumed_run):
         "update_delivery to the beDone marker"
     )
     patch = rec.firestore[-1]
-    assert patch["beDone"] is True, "the queue gate keys off beDone"
+    assert patch["beDone"] is True, (
+        "beDone is the hand-off itself — the line after which the run is "
+        "cloud-owned and the machine writes nothing more about it")
     assert patch["phase"] == 5
     assert patch["currentPhase"] == 5, (
         "currentPhase must advance to 5 or the homepage diagram keeps painting "
@@ -182,12 +183,42 @@ def test_the_whole_branch_runs_in_order_without_raising(resumed_run):
     assert rec.triggers
 
 
-def test_a_completed_run_is_not_resumed(monkeypatch, resumed_run):
-    """start_phase >= 6 returns early — no delivery write, no beDone, no trigger."""
+def test_an_already_handed_off_run_re_fires_the_kick_instead_of_sitting_down(
+        monkeypatch, resumed_run):
+    """⛔⛔ SIX MEANS HANDED OFF, NOT FINISHED (wave 10.9, 542-4), and this
+    branch used to log "already complete" and return.
+
+    `detect_resume_phase` answers 6 off `delivery.json`'s "completed" — which is
+    written at the END OF PHASE 3, beside the `beDone` marker, with phases 4 and
+    5 not yet started. So a person pressing Resume on a run whose cloud kick
+    never landed got one log line and nothing else, for ever, with no tab open
+    to re-kick it. That is the last door out of #542.
+
+    The machine still writes NOTHING about the run — status, phase and the fe*
+    fields are the cloud's from `beDone` onward. It re-fires the kick it owns,
+    and the route's claim makes a repeated kick safe."""
     rec, queue_dir, run = resumed_run
-    monkeypatch.setattr(research, "detect_resume_phase", lambda _qd: (6, "complete"))
+    monkeypatch.setattr(research, "detect_resume_phase", lambda _qd: (6, "handed off"))
+    monkeypatch.setattr(research, "_research_is_terminal", lambda *a, **k: False)
+    run()
+
+    assert not (queue_dir / "delivery.json").exists(), (
+        "the machine wrote a delivery record for a run it does not own")
+    assert rec.firestore == [], (
+        "the machine stamped a handed-off run — after beDone the document's "
+        "status, phase and fe* fields belong to the cloud route")
+    assert rec.triggers, (
+        "a Resume on a run whose cloud tail never ran did nothing at all")
+
+
+def test_a_finished_run_is_left_alone(monkeypatch, resumed_run):
+    """⭐ REFUSE POLARITY, and the reason the status is read at all: a run the
+    route has already finished is not kicked again."""
+    rec, queue_dir, run = resumed_run
+    monkeypatch.setattr(research, "detect_resume_phase", lambda _qd: (6, "handed off"))
+    monkeypatch.setattr(research, "_research_is_terminal", lambda *a, **k: True)
     run()
 
     assert not (queue_dir / "delivery.json").exists()
     assert rec.firestore == []
-    assert rec.triggers == []
+    assert rec.triggers == [], "a completed run was kicked again"

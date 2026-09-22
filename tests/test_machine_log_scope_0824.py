@@ -365,15 +365,22 @@ def test_the_escape_hatch_puts_the_scope_back():
 
 
 def test_every_cancel_of_a_running_job_uses_the_escape_hatch():
-    """The four branches that name the running or gate-pending job. A fifth
-    `Cancel:` line about a QUEUED run is correctly machine business — it is not
-    about anything armed — so this counts the branches, not the word."""
+    """The branches that name the RUNNING job. A `Cancel:` line about a QUEUED
+    run is correctly machine business — it is not about anything armed — so this
+    counts the branches, not the word.
+
+    ⛔ THERE WERE FOUR UNTIL WAVE 10.9 (N8). Two of them named the GATE-PENDING
+    job — the one a worker held while it waited on the previous run's cloud
+    tail — and that wait, and the slot it registered itself in, are gone: a
+    dequeued job is `current_job` from the moment it leaves the queue. The count
+    is still asserted rather than iterated, because the failure this guards is a
+    branch that stops a live run and logs it as machine business, and a new one
+    that forgets the hatch would otherwise pass unnoticed."""
     from conftest import code_only
     src = code_only(research.start_firestore_start_listener)
-    assert src.count("_log_about_the_armed_run(") == 4, (
-        "expected exactly the four cancel branches that stop a live run")
-    for phrase in ("is the running job", "is in gate wait",
-                   "moved to gate wait", "popped to current_job"):
+    assert src.count("_log_about_the_armed_run(") == 2, (
+        "expected exactly the two cancel branches that stop a live run")
+    for phrase in ("is the running job", "popped to current_job"):
         idx = src.index(phrase)
         head = src.rfind("\n", 0, src.rfind("(", 0, idx))
         assert "_log_about_the_armed_run" in src[head:idx], (

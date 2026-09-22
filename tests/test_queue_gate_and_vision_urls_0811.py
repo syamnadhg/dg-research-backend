@@ -1,27 +1,18 @@
-"""Two log lines that were false, and the sources one of them cost.
+"""A log line that was false, and the sources it cost.
 
-THE QUEUE GATE ANNOUNCED A 70-MINUTE WAIT AND ENDED IT IN THE SAME SECOND
+⛔⛔ THE QUEUE-GATE HALF OF THIS FILE IS GONE (wave 10.9, N8). It pinned the
+wording and the branch order of `_wait_for_prior_fe_completion` — the wait that
+held the next dequeue behind the PREVIOUS run's cloud tail — and that function
+has been deleted, because phases 4 and 5 run on Cloud Run and there was never
+anything on this machine for the next run to contend with. Its own log lines
+were the tell: a 70-minute wait announced and abandoned in the same second, then
+a "force-dequeue" apologising for holding somebody up. What replaces those pins
+is `tests/test_handoff_is_the_end_109.py`, which executes the start listener and
+measures that an idle worker starts a run immediately whatever the previous run
+is doing.
 
-    15:57:38 [queue-gate] waiting for prior run … FE-P5 completion (fallback in 4200s)
-    15:57:38 [queue-gate] FE never reported completed in 4200s — force-dequeueing
-
-Both lines are wrong, and they are wrong for the same reason. The deadline is
-anchored to when the PRIOR run finished (`last_be_done_at`), not to when the
-gate opened. On a device that has been idle longer than the window — the normal
-case, since the owner starts the next run hours later — the deadline is already
-in the past, so the first line's "4200s" was really a negative number and the
-second line's "in 4200s" was really "two and a half hours ago".
-
-The second line also asserted the one thing the gate had not checked. The
-deadline test was the FIRST statement in the poll loop, so it returned before
-the loop had read the prior research doc even once. The prior run was sitting
-right there at `status="completed"`; had the read happened first, the gate
-would have logged `prior run terminal (status=completed) — dequeueing`, which
-is both accurate and the branch that already existed.
-
-So: the read moved above the deadline test, and both messages now quote elapsed
-time they actually measured. Behaviour is unchanged — the gate still releases —
-except that it now usually releases for the accurate reason.
+The vision-URL half below is untouched and unrelated; it shares this file only
+because the two fixes shipped together.
 
 THE VISION URL EXTRACTOR RAN OUT OF TOKENS AND CALLED IT A PARSE ERROR
 
@@ -42,13 +33,9 @@ was overwhelmingly fine.
 
 WHAT THESE TESTS PIN
 
-  1. The gate reads before it gives up, and every message quotes a measured
-     number rather than the constant.
-  2. ⭐ The gate still releases on every terminal signal it released on before —
-     this fix must not make a worker wait where it used to proceed.
-  3. The token ceiling is above narrate's, and the response's `finishReason` is
+  1. The token ceiling is above narrate's, and the response's `finishReason` is
      named when the JSON does not parse.
-  4. Whole URLs survive a truncated response; a clipped one never does.
+  2. Whole URLs survive a truncated response; a clipped one never does.
 """
 import ast
 import inspect
@@ -88,20 +75,6 @@ def code_only(src: str) -> str:
 
 
 @functools.lru_cache(maxsize=1)
-def gate_src() -> str:
-    """The queue-gate wait function, comments blanked.
-
-    It is a closure inside the serve body, so it is reached through the module
-    source rather than `inspect.getsource` on the function object."""
-    src = code_only(inspect.getsource(research))
-    start = src.index('log(f"[queue-gate] waiting for prior run')
-    # Walk back to the enclosing def so the whole body is in view.
-    head = src.rindex("    async def ", 0, start)
-    end = src.index("    async def _rescan_queue_for_unclaimed", start)
-    return src[head:end]
-
-
-@functools.lru_cache(maxsize=1)
 def vision_src() -> str:
     """The vision-URL extractor body, comments blanked — from its request
     payload through the filter that every returned URL passes."""
@@ -110,132 +83,6 @@ def vision_src() -> str:
     start = src.rindex("    payload = {", 0, start)
     end = src.index("    return filtered[:_SOURCE_LIST_CAP]") + 60
     return src[start:end]
-
-
-# ------------------------------------------------------------- queue gate
-
-
-def test_the_gate_reads_the_prior_doc_before_it_gives_up():
-    """⭐ THE BUG. With the deadline test first, an expired deadline returned
-    before a single read — so the gate reported that the FE had never written
-    `completed` for a run whose doc said exactly that."""
-    src = gate_src()
-    read = src.index("snap = await asyncio.to_thread(_doc_ref.get)")
-    giveup = src.index("force-dequeueing")
-    assert read < giveup, (
-        "the deadline test is back above the status read; an already-expired "
-        "deadline will again return without ever looking at the prior run"
-    )
-
-
-def test_the_gate_no_longer_claims_a_wait_it_did_not_perform():
-    """The exact false sentence, gone. Comment-blanked, because the paragraph
-    above the fix quotes it while explaining it."""
-    src = gate_src()
-    assert "FE never reported completed in" not in src
-
-
-def test_the_entry_line_quotes_measured_time_not_the_constant():
-    """`fallback in {BE_PHASES_TIMEOUT_SEC}s` was true only on the first run
-    after a reboot."""
-    src = gate_src()
-    assert "_gate_left_ms = deadline - int(time.time() * 1000)" in src
-    assert "fallback in {int(_gate_left_ms / 1000)}s" in src
-    assert "fallback in {BE_PHASES_TIMEOUT_SEC}s" not in src
-
-
-def test_an_already_expired_window_says_so_instead_of_pretending_to_wait():
-    src = gate_src()
-    assert "if _gate_left_ms > 0:" in src
-    assert "not waiting" in src
-
-
-def test_the_giveup_line_reports_elapsed_time_it_measured():
-    """And says only what it observed: no terminal status SEEN. It cannot claim
-    the FE never wrote one — on a failed read it never looked."""
-    src = gate_src()
-    assert "{int((now_ms - _pdone) / 1000)}s past its backend finish" in src
-    # The phrase is split across two adjacent literals in the source, so join
-    # them the way Python will before looking for it.
-    joined = re.sub(r'"\s*\n\s*f?"', "", src)
-    assert "with no terminal status seen" in joined
-
-
-def test_the_deadline_test_still_exists_and_still_releases():
-    """Moving it must not delete it — without a deadline the gate could wait
-    forever on a prior run whose doc never changes."""
-    src = gate_src()
-    assert "if now_ms >= deadline:" in src
-    body = src[src.index("if now_ms >= deadline:"):]
-    assert '_QUEUE_STATE.pop("gate_pending_job", None)' in body[:900]
-    assert "return" in body[:900]
-
-
-def test_the_deadline_test_is_reachable_after_a_failed_read():
-    """The read is wrapped; if an exception skipped past the deadline test the
-    gate would spin every 2s forever. The test must sit after the except."""
-    src = gate_src()
-    except_at = src.index('log(f"[queue-gate] Firestore read failed: {e}", "WARN")')
-    deadline_at = src.index("if now_ms >= deadline:")
-    sleep_at = src.index("await asyncio.sleep(2)")
-    assert except_at < deadline_at < sleep_at
-
-
-@pytest.mark.parametrize("release", [
-    'if _controls.is_stop():',
-    'log(f"[queue-gate] prior run {_prid[:8]}… doc missing — dequeueing")',
-    'log(f"[queue-gate] prior run terminal (status={status}) — dequeueing")',
-    'if fe_p5_state == "failed":',
-    'FE-P5 ghosted, force-dequeueing',
-    'log("[queue-gate] read denied (synth user) — releasing gate (Track D)", "DEBUG")',
-])
-def test_every_prior_release_path_survives(release):
-    """⛔ A worker that used to proceed must still proceed. Each of these was a
-    separately root-caused way the gate could otherwise hang for 70 minutes."""
-    assert release in gate_src()
-
-
-def test_the_resume_and_errored_short_circuits_are_untouched():
-    """Both run before the wait and both prevent a circular deadlock.
-
-    ⭐ Asserted on the CONDITIONS, not on the messages they log. The message
-    version of this passed against `if False:` — the log line sits inside the
-    disabled branch and goes on matching. That is the same trap that cost two
-    rounds on the Phase 1 completion guard."""
-    src = gate_src()
-    assert 'if _current_job and (_current_job.get("research_id") or "") == _prid:' in src
-    assert "if _pdone <= 0:" in src
-    # and the branches still say what they do
-    assert "matches last_completed_rid — resume path, skipping wait" in src
-    assert "prior run errored — skipping FE-completion wait" in src
-
-
-def test_no_branch_in_the_wait_loop_skips_the_deadline_test():
-    """The deadline test is the last statement before the sleep, so anything
-    that `continue`s past it makes the gate un-expirable. Read off the syntax
-    tree: a textual search cannot tell a loop-level `continue` from one inside
-    a nested for-loop elsewhere in the function."""
-    fn = textwrap.dedent(gate_src())
-    tree = ast.parse(fn)
-    loops = [n for n in ast.walk(tree)
-             if isinstance(n, ast.While) and isinstance(n.test, ast.Constant)
-             and n.test.value is True]
-    assert len(loops) == 1, "expected exactly one `while True:` poll loop"
-    # `continue` statements belonging to THIS loop — not to any loop nested in it.
-    def owned_continues(node):
-        found = []
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.While, ast.For, ast.AsyncFor,
-                                  ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            if isinstance(child, ast.Continue):
-                found.append(child)
-            found.extend(owned_continues(child))
-        return found
-    assert owned_continues(loops[0]) == [], (
-        "a `continue` in the poll loop can jump past the deadline test — on a "
-        "prior doc that keeps failing to read, the gate would never expire"
-    )
 
 
 # --------------------------------------------------------- vision URLs

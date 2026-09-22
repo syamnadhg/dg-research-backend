@@ -197,13 +197,17 @@ def _sharers_run(tmp_path, monkeypatch, record=None):
     return d
 
 
-@pytest.mark.parametrize("slot", ["current_job", "gate_pending"])
 def test_the_owner_stops_a_sharers_run_this_process_is_holding(
-        slot, tmp_path, monkeypatch):
+        tmp_path, monkeypatch):
     """⭐⭐ THE SHARED-WITH POPUP'S STOP, on a run this worker is actually
-    running or holding at the gate — the case the badge exists for."""
+    running — the case the badge exists for.
+
+    ⛔ This was parametrized over two slots until wave 10.9. The second,
+    `gate_pending`, stood for a job held while the worker waited on the previous
+    run's cloud tail; that wait is gone (N8) and a dequeued job is
+    `current_job` from the moment it leaves the queue."""
     lis = Listener(monkeypatch, tmp_path, owner=OWNER,
-                   **{slot: dict(_SHARERS_JOB)}).feed(
+                   current_job=dict(_SHARERS_JOB)).feed(
         action="cancel", uid=SHARER, submittedBy=OWNER, researchId=SHARER_RID,
         ownerControl="stop")
     assert lis.controls.stops == 1, "the owner's Stop of a sharer's held run was dropped"

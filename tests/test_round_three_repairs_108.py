@@ -287,9 +287,16 @@ def test_the_ownership_gate_is_the_WHOLE_condition():
 
 
 def test_the_race_rechecks_ask_it_too():
-    """⛔ THE WHOLE REASON THOSE TWO BRANCHES EXIST is that a job can arrive
-    after the listener-thread gate ran, so they are exactly where the gate
-    cannot be assumed to have covered the job they match."""
+    """⛔ THE WHOLE REASON THIS BRANCH EXISTS is that a job can arrive after the
+    listener-thread gate ran, so it is exactly where the gate cannot be assumed
+    to have covered the job it matches.
+
+    ⛔ THERE WERE TWO OF THEM until wave 10.9. The second re-checked
+    `gate_pending_now` — the job a worker held while it waited on the previous
+    run's cloud tail — and that wait, and its slot, are gone (N8): a dequeued
+    job is `current_job` from the moment it leaves the queue. The count is
+    asserted, not merely iterated, so a re-check that quietly stops asking the
+    ownership question still fails this."""
     fn = _fn("start_firestore_start_listener")
     do_cancel = next(n for n in ast.walk(fn)
                      if isinstance(n, ast.FunctionDef) and n.name == "_do_cancel")
@@ -298,13 +305,13 @@ def test_the_race_rechecks_ask_it_too():
         if not isinstance(node, ast.If):
             continue
         names = {n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)}
-        if not ({"gate_pending_now", "current_now"} & names):
+        if "current_now" not in names:
             continue
         assert "_job_is_another_persons" in names, (
             "a race re-check matches on research_id alone — the window the "
             "listener-thread gate cannot cover is the window left open")
         checked += 1
-    assert checked == 2, f"expected both race re-checks, saw {checked}"
+    assert checked == 1, f"expected the race re-check, saw {checked}"
 
 
 def test_the_deque_scan_drops_only_this_persons_job():

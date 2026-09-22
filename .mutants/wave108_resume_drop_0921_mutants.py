@@ -48,6 +48,7 @@ phantom kill.
   .venv/bin/python .mutants/wave108_resume_drop_0921_mutants.py R4 R6
 """
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -162,8 +163,15 @@ H_RECHECK = "            if not folder.is_dir():"
 #: ⛔ ANCHORED WITH THE LINE ABOVE. The repair round added a SECOND
 #: `_note_cloud_handoff(research_id, _hl)` in the exception branch, so the
 #: bare line started matching twice and the sweep caught it.
-H_BOTH = ("            _note_cloud_handoff(research_id, _hl)\n"
-          "        except Exception as _e:")
+#: ⛔ RE-ANCHORED (wave 10.9, 542-5/S4). The drive became a retry ladder and
+#: each outcome got its own sentence, so the single post-branch call this used
+#: to name is gone — but the shape the item is about survives: the refusal and
+#: the exhausted ladder SHARE one unconditional record at the bottom, and
+#: guarding it is still how a 401/403 comes to leave nothing anywhere.
+#: ⚠ THE CALL ALONE, not the call plus the line after it: a comment landed
+#: between the two and the two-line anchor stopped matching, which the sweep
+#: caught. This one is unique and cannot drift on a comment edit.
+H_BOTH = "    note(_sentence)\n"
 
 # ── anchors: the comments the region navigates by ──────────────────────────
 #: The identity check that is the whole safety margin on `manual_brief`.
@@ -197,7 +205,9 @@ X_FAILCLOSED = ('    except Exception as _tr_err:\n'
 X_STOPGUARD = ("            if _fb_uid and _fb_research_id and not _research_is_terminal(\n"
                "                    _fb_uid, _fb_research_id, on_error=False):")
 #: The elapsed-time evidence that tells a cut connection from one never made.
-X_ELAPSED = "            if not _never_left and _elapsed >= _DRIVE_SENT_AFTER_SEC:"
+#: (X_ELAPSED retired with X4 — wave 10.9's retry ladder moved that branch into
+#: `_dispatch_verdict`, and `wave109_handoff_mutants.py` H17 aims at it there.
+#: Two harnesses mutating one line is duplicated cost, not doubled coverage.)
 #: The disk second-opinion before closing a run's automatic recovery.
 X_ONDISK = "                    if _orphaned is not None:"
 #: (X_RETRACT retired with X6 — round two removed the supervisor's retraction
@@ -213,7 +223,9 @@ Z_STOPDIR = "                    _fb_uid, _fb_research_id, on_error=False):"
 #: The on-disk arm repairing the document instead of refusing.
 Z_REPAIR = "                        backend_run_id = _orphaned.name"
 #: The connect timeout, bounded below the discriminator.
-Z_TIMEOUT = "                timeout=(10, 3600),"
+#: ⛔ RE-ANCHORED (wave 10.9, 542-5): the POST moved into `_post`, one nesting
+#: level shallower, so the indentation changed from sixteen spaces to twelve.
+Z_TIMEOUT = "            timeout=(10, 3600),"
 #: The exception class deciding whether the request ever left.
 #: ⛔ THE FIRST AIM WAS AN EQUIVALENT MUTANT, WHICH IS A HARNESS FAULT AND NOT A
 #: SURVIVOR. It removed the ConnectTimeout/ProxyError check — and both are
@@ -429,9 +441,7 @@ MUTANTS = [
      "writes nothing on those two exits (no verified identity to write under) "
      "and says in its own words that this half belongs to the machine. This is "
      "the whole of the item",
-     [(H_BOTH, "            if _resp.status_code in (200, 202):\n"
-               "                _note_cloud_handoff(research_id, _hl)\n"
-               "        except Exception as _e:")]),
+     [(H_BOTH, "    if verdict != \"refused\":\n        note(_sentence)\n")]),
 
     # ── C: the comments the region navigates by ───────────────────────────
     ("C1", "under", RESEARCH,
@@ -496,13 +506,9 @@ MUTANTS = [
      "explaining a ceiling stop, and both its buttons",
      [(X_STOPGUARD, "            if True:")]),
 
-    ("X4", "under", RESEARCH,
-     "⛔⛔ THE HAND-OFF RECORD LIES ON THE MAJORITY PATH AGAIN. Something severs "
-     "this socket at exactly 300s while the route keeps working, so the "
-     "exception branch fires on every P4/P5 over five minutes — and without the "
-     "elapsed-time evidence it writes 'never reached the cloud … still on phase "
-     "3' into the permanent record of runs that SUCCEEDED",
-     [(X_ELAPSED, "            if False:")]),
+    # (X4 retired — see X_ELAPSED above. The branch it named moved into
+    # `_dispatch_verdict` with wave 10.9's retry ladder, where
+    # `wave109_handoff_mutants.py` H17 mutates it.)
 
     ("X5", "over", RESEARCH,
      "⛔ the no-backendRunId branch stops asking the disk, so a run whose files "
@@ -551,7 +557,7 @@ MUTANTS = [
      "then fails tens of seconds later rather than at once, past the "
      "discriminator — and the run's permanent record says the cloud received a "
      "request that never left the machine",
-     [(Z_TIMEOUT, "                timeout=3600,")]),
+     [(Z_TIMEOUT, "            timeout=3600,")]),
 
     ("Z7", "under", RESEARCH,
      "⛔ the read-timeout check moves BELOW the connection-error check. "
@@ -765,7 +771,13 @@ def _run(cmd):
 
 
 def green():
-    r = _run(f".venv/bin/python -m pytest {SUITES} -q")
+    # ⭐ THE INTERPRETER RUNNING THIS FILE, not a hard-coded `.venv/bin/python`
+    # (wave 10.9). A worktree has no `.venv` of its own, so the literal path
+    # made every run from one report BASELINE RED — a harness that cannot load
+    # its own runner looks exactly like a suite that is broken, and the repair
+    # in flight looks like the cause. pytest puts the cwd first on sys.path, so
+    # the tree under test is still the one measured.
+    r = _run(f"{shlex.quote(sys.executable)} -m pytest {SUITES} -q -p no:cacheprovider")
     out = (r.stdout or "") + (r.stderr or "")
     # ⛔ THE SUMMARY LINE, NEVER THE EXIT CODE. This repo's backend suite once
     # died at 27% and exited 0, and a commit rode on it.

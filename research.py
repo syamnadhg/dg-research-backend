@@ -2825,10 +2825,17 @@ def _refuse_foreign_run(doc, jobs, research_id: str, target_uid: str,
 
 
 def _jobs_held_locally(job_queue) -> list:
-    """Every job this process holds: the running one, the one in the gate wait,
-    and the deque. Empty slots come back as `{}`, which matches nothing."""
-    jobs = [_QUEUE_STATE.get("current_job") or {},
-            _QUEUE_STATE.get("gate_pending_job") or {}]
+    """Every job this process holds: the running one and the deque. Empty slots
+    come back as `{}`, which matches nothing.
+
+    ⛔ A THIRD SLOT LIVED HERE — `gate_pending_job`, the job a worker held while
+    it waited on the PREVIOUS run's cloud tail. That wait is gone (wave 10.9,
+    N8), and with it the only window in which a dequeued job was held by this
+    process and named by neither of the two slots left. The cancel gate that
+    reads this list has no ownership clause of its own, so a slot that still
+    existed and was not read here would be a run another member could stop —
+    which is why the slot is REMOVED rather than left reading `{}` for ever."""
+    jobs = [_QUEUE_STATE.get("current_job") or {}]
     try:
         jobs.extend(list(job_queue._queue))
     except Exception:
@@ -6376,14 +6383,17 @@ _QUEUE_STATE = {
     # run_server (research.py:24049-24051) before the device-cmd listener
     # starts at research.py:24898.
     "persist_fn": None, "_hard_reset_lock": None,
-    # 2026-05-11: prior-run tracking for the FE-completion queue gate
-    # (BE_PHASES_TIMEOUT_SEC). The worker's finally{} block records the
-    # just-completed run's uid+rid+timestamp here so the NEXT dequeue can
-    # poll its Firestore status until FE-P5 flips it to "completed" (or
-    # the 4200s fallback fires). last_be_done_at=0 on error/timeout paths
-    # short-circuits the gate so a watchdog-stopped run doesn't wedge the
-    # queue for 70 min.
-    "last_completed_uid": None, "last_completed_rid": None, "last_be_done_at": 0,
+    # ⛔⛔ THE PRIOR-RUN POINTER IS GONE (wave 10.9, N8). Three keys lived here
+    # — last_completed_uid / last_completed_rid / last_be_done_at — so the next
+    # dequeue could hold itself behind the PREVIOUS run's cloud tail until that
+    # run's status reached "completed" or a 4200-second fallback fired. It
+    # serialized nothing: phases 4 and 5 run on Cloud Run, not on this computer,
+    # so the "resource contention" it was written for is contention with a
+    # machine that is idle. What it did instead was hold the next person's run
+    # on a shared computer for as long as somebody else's cloud tail took, and
+    # its disk snapshot brought the wait back across a restart. The browser lock
+    # it was paired with is deleted (D-1) and the YouTube ceiling is a daily
+    # count, not a concurrency limit, so there is nothing left for it to protect.
     # 2026-05-22: listener-replay dual-claim gate.
     # Firestore on_snapshot delivers ADDED changes synchronously in a
     # callback thread; the actual asyncio.Queue.put happens via
@@ -7397,13 +7407,10 @@ def _pending_enq_reset():
     with lock:
         _QUEUE_STATE["_pending_listener_enqueues"] = 0
 
-# 2026-05-11: queue gate fallback — wait at most this many seconds for the
-# prior run's FE-P5 to flip status="completed" before force-dequeueing the
-# next job. Hoisted to module scope (2026-05-12) so the Firestore start
-# listener (module-level) can reference the same constant when predicting
-# whether the gate will block at queue-banner time; the worker's existing
-# in-server reference resolves via normal global lookup.
-BE_PHASES_TIMEOUT_SEC = 4200
+# ⛔ BE_PHASES_TIMEOUT_SEC (4200) STOOD HERE AND IS GONE (wave 10.9, N8). It
+# was the queue gate's fallback: how long the next dequeue would wait for the
+# PREVIOUS run's cloud tail to flip its status to "completed". Nothing waits
+# on another run's tail any more, so the constant has no reader.
 
 
 def _try_claim_queue_doc(doc_ref, worker_id: int, log_prefix: str = "[claim]",
@@ -11511,16 +11518,12 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                 #      blob.upload_from_filename leaves a half-written
                 #      blob whose Firestore audios/{id} doc already
                 #      points at it.
-                #   3. Clear the queue-gate state (last_completed_*) so
-                #      daemon-loop's respawn rehydrates a clean slate.
-                #      Without this, the next --serve picks up the same
-                #      stale prior-run pointer and re-engages the wedge
-                #      that prompted the reset in the first place.
+                #   3. Flush a clean queue snapshot to disk so the
+                #      daemon-loop's respawn starts from an empty slate.
                 #      Race-guarded by _QUEUE_STATE["_hard_reset_lock"]:
-                #      the worker `finally` acquires the same lock
-                #      around its gate-state writes + persist call so
-                #      a worker finishing within our exit window can't
-                #      interleave between our clear and our persist.
+                #      the worker `finally` acquires the same lock so a
+                #      worker finishing within our exit window can't write
+                #      a job back into the snapshot we just cleaned.
                 #   4. Schedule os._exit via _schedule_server_exit with
                 #      a 1.5s grace (shorter than the 3s default for
                 #      research stop because we have less to ack —
@@ -11611,40 +11614,33 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                         log("[device-cmds] HARD_RESET: uploads drained")
                 except Exception as _ue:
                     log(f"[device-cmds] HARD_RESET: upload-settle check failed: {_ue}", "WARN")
-                # 2026-05-15: clear queue-gate state + persist clean
-                # snapshot under the hard-reset lock so the worker
-                # `finally` block (research.py:~24400) can't race
-                # between our clear and our persist. _persist_pending_queue
+                # 2026-05-15: flush a clean snapshot to disk under the
+                # hard-reset lock so the worker's `finally` block can't
+                # race us and write a job back into it. _persist_pending_queue
                 # is a closure inside run_server, so we look it up via
                 # _QUEUE_STATE["persist_fn"] (set at the function-def
                 # tail, research.py:~24153). The atomic .tmp + os.replace
                 # write inside that helper means a mid-write os._exit
                 # can't corrupt _pending_queue.json — either the OLD file
                 # (replace not committed) or NEW (clean) survives.
+                # ⛔ The prior-run pointer this block also used to clear is gone
+                # with the queue gate (wave 10.9, N8); Reset Backend no longer
+                # has a wedge to escape from.
                 try:
                     _hr_lock = _QUEUE_STATE.get("_hard_reset_lock")
                     _persist_fn = _QUEUE_STATE.get("persist_fn")
                     if _hr_lock is None or _persist_fn is None:
                         # Pre-run_server-init hard_reset (boot-time race).
                         # No worker yet → no race risk → no lock needed
-                        # AND no in-memory gate state to clear yet, so the
-                        # disk snapshot (if any) lives on. Best-effort log.
-                        log("[device-cmds] HARD_RESET: pre-init — gate clear skipped (no run_server yet)", "WARN")
+                        # AND nothing in memory to flush, so the disk
+                        # snapshot (if any) lives on. Best-effort log.
+                        log("[device-cmds] HARD_RESET: pre-init — snapshot flush skipped (no run_server yet)", "WARN")
                     else:
                         with _hr_lock:
-                            _QUEUE_STATE["last_completed_uid"] = None
-                            _QUEUE_STATE["last_completed_rid"] = None
-                            _QUEUE_STATE["last_be_done_at"] = 0
-                            # Also clear gate_pending_job so any worker
-                            # currently sitting in _wait_for_prior_fe_
-                            # completion immediately falls through on
-                            # its next is_stop() check (we set request
-                            # _stop below in the foreground branch).
-                            _QUEUE_STATE.pop("gate_pending_job", None)
                             _persist_fn(current_job=None)
-                        log("[device-cmds] HARD_RESET: cleared queue-gate state and persisted clean snapshot")
+                        log("[device-cmds] HARD_RESET: persisted clean queue snapshot")
                 except Exception as _ge:
-                    log(f"[device-cmds] HARD_RESET: gate clear/persist failed: {_ge}", "WARN")
+                    log(f"[device-cmds] HARD_RESET: snapshot flush failed: {_ge}", "WARN")
 
                 # Drain queued jobs — Reset Backend means "stop everything
                 # on this device, not just the active run". Without this,
@@ -11838,10 +11834,8 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                 # session and never finished writing a terminal status
                 # (process crash, kill -9, BE-restart-without-finally, etc).
                 # Pre-fix, those zombie docs kept the FE chat tile showing
-                # "Ongoing" forever and the queue gate (which keys on the
-                # most recent beDone marker) would refuse to advance into
-                # the NEXT user's queued run until the user manually went
-                # tile-by-tile in Settings → Manage devices to delete them.
+                # "Ongoing" forever until the user manually went tile-by-tile
+                # in Settings → Manage devices to delete them.
                 #
                 # Filter: by deviceId so other devices' in-flight work
                 # isn't accidentally killed. The research doc's deviceId
@@ -14821,31 +14815,14 @@ def start_firestore_start_listener(job_queue, loop):
                 if _refuse_foreign_run(doc, _local_jobs, target_rid, target_uid,
                                        "start-listener"):
                     continue
-                # 2026-05-12: also check the gate-pending job. Worker pops
-                # from job_queue then awaits _wait_for_prior_fe_completion
-                # BEFORE setting current_job — so a cancel that arrives
-                # while the worker is in the gate wait sees neither
-                # current_job nor a queue entry and silently no-ops. The
-                # gate_pending_job marker closes this gap.
-                gate_pending = _QUEUE_STATE.get("gate_pending_job") or {}
-                if gate_pending.get("research_id") == target_rid:
-                    _log_about_the_armed_run(f"Cancel: target {target_rid[:8]}… is in gate wait — requesting stop + flipping status{' (owner '+_oc+')' if _oc else ''}")
-                    loop.call_soon_threadsafe(_controls.request_stop)
-                    if _firebase_db:
-                        from google.cloud.firestore import DELETE_FIELD as _DF
-                        _update_research_doc(target_uid, target_rid, _owner_control_patch(_oc, running=False) or {
-                            "status": "stopped",
-                            "summary": "Cancelled while queued",
-                            "cancelled": True,
-                            "queuePosition": _DF,
-                            "queuedBehindRunId": _DF,
-                            "queuedBehindTitle": _DF,
-                        })
-                    try:
-                        doc.reference.delete()
-                    except Exception:
-                        pass
-                    continue
+                # ⛔ THE GATE-WAIT BRANCH RETIRED WITH THE GATE (wave 10.9, N8).
+                # A worker used to pop from job_queue and then await the
+                # previous run's cloud tail BEFORE setting current_job, so for
+                # the length of that wait a dequeued job was in neither
+                # current_job nor the queue and a cancel silently no-opped. The
+                # wait is gone: `current_job` is now set in the same breath as
+                # the dequeue, so the two branches below cover every job this
+                # process holds.
                 if current.get("research_id") == target_rid:
                     _log_about_the_armed_run(f"Cancel: target {target_rid[:8]}… is the running job — requesting stop + scheduling exit{' (owner '+_oc+')' if _oc else ''}")
                     loop.call_soon_threadsafe(_controls.request_stop)
@@ -14885,34 +14862,6 @@ def start_firestore_start_listener(job_queue, loop):
                     continue
                 def _do_cancel(rid=target_rid, u=target_uid, dref=doc.reference, oc=_oc):
                     try:
-                        # 2026-05-12: also re-check gate_pending_job. The
-                        # listener-thread initial check above could miss a
-                        # job that JUST entered the gate wait. Same fix as
-                        # the sync path.
-                        gate_pending_now = _QUEUE_STATE.get("gate_pending_job") or {}
-                        # ⛔ THE RACE RE-CHECKS RE-ASK THE OWNERSHIP QUESTION
-                        # TOO. The listener-thread gate ran before this callback
-                        # was scheduled, and the whole reason these two branches
-                        # exist is that a job can arrive in the window between.
-                        if (gate_pending_now.get("research_id") == rid
-                                and not _job_is_another_persons(gate_pending_now, u)):
-                            _log_about_the_armed_run(f"Cancel: target {rid[:8]}… moved to gate wait between listener checks — requesting stop{' (owner '+oc+')' if oc else ''}")
-                            _controls.request_stop()
-                            if _firebase_db:
-                                from google.cloud.firestore import DELETE_FIELD as _DF
-                                _update_research_doc(u, rid, _owner_control_patch(oc, running=False) or {
-                                    "status": "stopped",
-                                    "summary": "Cancelled while queued",
-                                    "cancelled": True,
-                                    "queuePosition": _DF,
-                                    "queuedBehindRunId": _DF,
-                                    "queuedBehindTitle": _DF,
-                                })
-                            try:
-                                dref.delete()
-                            except Exception:
-                                pass
-                            return
                         # Race-safe re-check: between the listener's initial
                         # current_job read (above) and this callback running on
                         # the asyncio loop, the worker may have completed its
@@ -14921,6 +14870,16 @@ def start_firestore_start_listener(job_queue, loop):
                         # job would be missing (already popped) → no-op → the
                         # pipeline would start despite the cancel. Re-checking
                         # current_job here closes that window.
+                        #
+                        # ⛔ THE RACE RE-CHECK RE-ASKS THE OWNERSHIP QUESTION
+                        # TOO. The listener-thread gate ran before this callback
+                        # was scheduled, and the whole reason this branch exists
+                        # is that a job can arrive in the window between.
+                        #
+                        # ⛔ A SIBLING BRANCH FOR `gate_pending_job` STOOD HERE
+                        # and retired with the queue gate (wave 10.9, N8): there
+                        # is no longer a state in which a dequeued job is held by
+                        # this process and is not `current_job`.
                         current_now = _QUEUE_STATE.get("current_job") or {}
                         if (current_now.get("research_id") == rid
                                 and not _job_is_another_persons(current_now, u)):
@@ -15823,31 +15782,13 @@ def start_firestore_start_listener(job_queue, loop):
             # chat banner + tile badge can tell the user which run must
             # finish first.
             is_busy = bool(_QUEUE_STATE.get("running")) or job_queue.qsize() > 0
-            # 2026-05-12: also predict the queue gate. Even when the worker is
-            # idle and queue empty, `_wait_for_prior_fe_completion` can block
-            # the dequeue for up to BE_PHASES_TIMEOUT_SEC waiting on a prior
-            # run's FE-P5. Without surfacing this, the new run lands as
-            # status="ongoing" but with no phase_start:0 events for the entire
-            # gate window — the FE renders an "ongoing" chat with no Phase 0
-            # tile (the inconsistency the user flagged 2026-05-12). Compute
-            # the same predicate the gate uses so the user sees a queued
-            # banner during the wait instead of empty silence.
-            _gate_will_block = False
-            _gate_prid = _QUEUE_STATE.get("last_completed_rid") or ""
-            _gate_puid = _QUEUE_STATE.get("last_completed_uid") or ""
-            _gate_pdone = int(_QUEUE_STATE.get("last_be_done_at") or 0)
-            if (
-                not is_busy
-                and _gate_prid and _gate_puid and _gate_pdone > 0
-                # Skip when this rid IS the gate's prior rid (resume path —
-                # the helper at research.py:22457 skips the wait for this
-                # case, so we must NOT show a banner either).
-                and research_id != _gate_prid
-            ):
-                _gate_deadline = _gate_pdone + (BE_PHASES_TIMEOUT_SEC * 1000)
-                if int(time.time() * 1000) < _gate_deadline:
-                    _gate_will_block = True
-            if is_busy or _gate_will_block:
+            # ⛔ THE QUEUE-GATE PREDICTION RETIRED WITH THE GATE (wave 10.9,
+            # N8). A block stood here computing the gate's own predicate, so a
+            # run submitted while the PREVIOUS run's cloud tail was in flight
+            # landed "queued" with a banner naming that other run — on a shared
+            # computer, somebody else's. An idle worker now starts immediately,
+            # so busy-ness is the whole of the question again.
+            if is_busy:
                 # Bug A fix (2026-05-22): position calc via device-wide
                 # FIFO scan instead of per-worker `job_queue.qsize()+1`.
                 # In multi-worker installs the local qsize misses
@@ -15871,30 +15812,17 @@ def start_firestore_start_listener(job_queue, loop):
                     )
                     position = job_queue.qsize() + 1
                     behind_rid = ""
-                # Gate-blocked path special-case: when no behind-doc
-                # found in the global queue (we're head), fill behind
-                # from the prior run whose FE-P5 the gate is waiting
-                # on. Best-effort title read.
-                if not behind_rid and _gate_will_block:
-                    behind_rid = _gate_prid
-                    # ⛔⛔ THE WHOLE READ IS GONE, NOT JUST THE SLICE — 7.7E, found by
-                    # cross-verify after the first pass missed it. `behind_rid` is
-                    # assigned on the line above from `_gate_prid`, so this Firestore
-                    # get existed ONLY to populate `behind_title`: a cross-tree read of
-                    # ANOTHER account's research document (`_gate_puid` is the prior
-                    # run's submitter, not this one), to fetch their topic, for a value
-                    # every consumer now writes as a field delete. One extra read of
-                    # somebody else's private record, per gate-blocked start, for
-                    # nothing.
-                    #
-                    # ⭐ This is the fifth carrier. The other four were found by design
-                    # review; this one survived because the backend guard written for
-                    # them checked only the two spellings those four used. The guard
-                    # now checks the shape.
-                # Falling back to local current_job ONLY if global helper
-                # returned no behind AND we're not in gate-block — happens
-                # when I'm position 1 and worker has a job mid-completion
-                # not yet visible as currentRunId on device doc.
+                # ⛔⛔ THE GATE-BLOCKED SPECIAL CASE IS GONE WITH THE GATE
+                # (wave 10.9, N8). It filled `behind_rid` from the PREVIOUS
+                # run's id — on a shared computer, another person's — and
+                # before 7.7E it also read that person's research document to
+                # fetch their topic for a field every consumer now deletes.
+                # Nothing waits behind a cloud tail any more, so there is no
+                # such "behind" to name.
+                # Falling back to local current_job ONLY if the global helper
+                # returned no behind — happens when I'm position 1 and the
+                # worker has a job mid-completion not yet visible as
+                # currentRunId on the device doc.
                 if not behind_rid:
                     current = _QUEUE_STATE.get("current_job")
                     if current:
@@ -17157,27 +17085,42 @@ def _owner_control_patch(oc: str, *, running: bool) -> dict:
 
 
 def _fire_fe_p4_trigger(uid, research_id):
-    """Write a `needsFeTrigger` marker on the research doc so the FE
-    catch-up hook re-fires the autonomous P4 + P5 chain on next
-    chat-open. Without an Admin SDK service account, the BE can no
-    longer mint user ID tokens or enqueue Cloud Tasks directly — the
-    FE-side catch-up is the canonical trigger.
+    """Write a `needsFeTrigger` marker on the research doc so a chat opening on
+    this run asks the cloud route to run phases 4 and 5. It is the backstop
+    behind the machine's own kick, and the marker a reopened chat reads.
 
-    Returns False (no successful enqueue ever happens from this BE).
-    The caller doesn't actually distinguish True/False besides log
-    formatting; the FE catch-up always handles it."""
+    Returns True when the marker is on the document, False otherwise.
+
+    ⛔⛔ IT USED TO SAY "marker written" WHATEVER HAPPENED (wave 10.9, 542-S4).
+    The write went through `_update_firestore_research`, which returns None on
+    every path — including the one where it declines because the module globals
+    are unset, and including a `_update_research_doc` that logged its own
+    failure and returned False. Nothing raised, so the success line printed
+    over a marker that was not there. That line is the FIRST of the two a stuck
+    run's report is read from; saying it unconditionally is what made those
+    reports unanswerable.
+
+    ⭐ AND THE TARGET IS NAMED, NOT INHERITED. `_update_research_doc(uid, rid)`
+    takes the run this call is about, so the same function is safe from the boot
+    rehydrate and the resume path — where the pipeline globals belong to another
+    run, or to none."""
     if not uid or not research_id:
         log(f"FE trigger: skip (uid={bool(uid)} rid={bool(research_id)})", "WARN")
         return False
     try:
-        _update_firestore_research({
+        written = _update_research_doc(uid, research_id, {
             "needsFeTrigger": True,
             "needsFeTriggerAt": int(time.time() * 1000),
         })
-        log(f"FE trigger: needsFeTrigger marker written rid={research_id[:8]}…")
     except Exception as e:
-        log(f"FE trigger: marker write failed: {e}", "WARN")
-    return False
+        log(f"FE trigger: marker write raised: {e}", "WARN")
+        return False
+    if written:
+        log(f"FE trigger: needsFeTrigger marker written rid={research_id[:8]}…")
+    else:
+        log(f"FE trigger: needsFeTrigger marker NOT written rid={research_id[:8]}… "
+            f"— a chat opening on this run has no marker to catch up from", "WARN")
+    return bool(written)
 
 
 def _summarize_notify_reply(body_text) -> str:
@@ -17378,38 +17321,356 @@ def _dispatch_never_left(exc: BaseException, elapsed_sec: float) -> bool:
     return elapsed_sec < _DRIVE_SENT_AFTER_SEC
 
 
+#: The pauses between cloud-kick attempts, in seconds. One more attempt than
+#: there are pauses.
+#:
+#: ⭐ SIZED FOR A DRIVE, NOT FOR A NOTICE. `_post_fe_phase_notice` retries three
+#: times two seconds apart, which is right for it: it announces a phase that has
+#: already finished, and arriving a few seconds late is the whole point. This
+#: request IS the rest of the run. The web's own route already spends ~2.5 s of
+#: ladder on its Firestore read and says in a comment that anything outstanding
+#: longer than that is the MACHINE's to come back for — so a six-second budget
+#: here would close almost none of the window it was written to close. Just under
+#: two minutes covers a route restart, a rolling deploy and a brief network drop,
+#: and is still far inside the time the person would otherwise wait for nothing.
+_DRIVE_BACKOFF_SEC = (5, 15, 30, 60)
+
+
+def _answered_without_phase_5(body_text) -> bool:
+    """Did the route answer phase 4 and stop, without running phase 5?
+
+    ⛔⛔ THE ROUTE SAYS SO IN ITS OWN WORDS, and the machine was not listening.
+    `casRouteP4`'s already-completed short-circuit returns 200 with the video
+    link and NO `p5` key, and its comment names the contract: "the browser reads
+    exactly that as 'ask for phase 5 alone'". The GCS-link branch answers the
+    same way. So a kick that lands on a run whose phase 4 is already done — the
+    boot re-kick and the Resume re-kick are exactly that shape — got a 200, and
+    this side called the chain finished while phase 5 had never run: no Super
+    Research, no Doc, no email, on a machine with no tab open to notice. #542's
+    symptom, reached through the fix for it.
+
+    ⭐ THE SAME RULE AS `cloudKickOutcome`, and no more of it. An answer that
+    cannot be parsed is NOT a missing phase 5 — the browser reads that as a
+    transport failure and does not follow up either, and guessing here would ask
+    for a phase 5 that may be mid-flight. The route streams keep-alive spaces
+    before its JSON, which `json.loads` skips; an answer of spaces alone parses
+    to nothing and reads as unparseable."""
+    try:
+        parsed = json.loads(body_text or "")
+    except Exception:
+        return False
+    return isinstance(parsed, dict) and "p5" not in parsed
+
+
+def _dispatch_verdict(status_code=None, exc=None, elapsed_sec: float = 0.0) -> str:
+    """What one attempt at the cloud kick means. One of:
+
+      "ran"     — the route ran the chain and answered (HTTP 2xx).
+      "claimed" — HTTP 202: ANOTHER caller holds the claim. The work is
+                  somebody's; it is not this call's, and it is not a failure.
+      "cut"     — the connection died AFTER the cloud had the request. The route
+                  does not stop when a socket closes, so this machine has simply
+                  stopped being able to watch. Asking again would only take a 202.
+      "retry"   — nothing ran and asking again could change it: a 5xx, or a
+                  request that never left this machine.
+      "refused" — the route declined on the merits and repeating it changes
+                  nothing except the load.
+
+    ⛔⛔ EXTRACTED SO IT CAN BE EXECUTED, for the same reason `_dispatch_never_left`
+    was: a retry ladder whose classification is inline can be neutered to
+    `if False` while every name a test reads for survives.
+
+    ⛔ 401 AND 403 ARE RETRIED, and they are the only 4xx that are. A 401 means
+    the ID token this attempt minted was not accepted — a fresh mint is exactly
+    what the next attempt does. A 403 is `authorizeSynthForResearch` refusing
+    the device→research binding, which is the shape that loses a
+    claim-propagation race right after a run is claimed. Both can clear on their
+    own; a 400 or a 404 cannot.
+
+    ⭐ AND THE RETRYABLE SIDE IS THE DEFAULT, so a status nobody anticipated is
+    asked again rather than written off — the direction where the cost is one
+    more request instead of a run that never finishes."""
+    if exc is not None:
+        return "retry" if _dispatch_never_left(exc, elapsed_sec) else "cut"
+    if status_code == 202:
+        return "claimed"
+    if isinstance(status_code, int) and 200 <= status_code < 300:
+        return "ran"
+    if status_code in (401, 403):
+        return "retry"
+    if isinstance(status_code, int) and 400 <= status_code < 500:
+        return "refused"
+    return "retry"
+
+
+def _record_cloud_kick_refusal(uid, research_id, reason: str) -> bool:
+    """Put a refused hand-off somewhere the chat can see it: phase 4's own
+    entry on the research document, errored, carrying the reason.
+
+    ⛔⛔ DELIBERATELY NOT `feP4State: "failed"`, and the route's own source says
+    why. `cloudKickDecision` reads `feP4State`, and any terminal value there
+    means "phase 4 has been TRIED": the next hand-off then asks the route for
+    phase 5 ALONE, and the Doc and the email go out with no video for an upload
+    that never ran. That is 542-S2 through a different door, and it would be a
+    fix that reroutes somebody's run rather than reporting on it.
+
+    ⭐ `phases[4].status` IS THE SURFACE THAT WORKS. `cloudPhaseRecorded` reads
+    it first, so the phase-4 tile goes red on an open chat, on a reopened one and
+    on the researches-list card alike — while `cloudKickDecision`, which never
+    looks at `phases`, still re-drives BOTH phases when a chat opens. The record
+    is visible and the run stays recoverable, which is the pair this needs.
+
+    ⚠ `reason` rides along as the document's durable account. It is the phases
+    entry's existing field — `reopenedPhaseSkip` reads it only for a SKIPPED
+    entry, so an errored one cannot be mistaken for a skip — and no surface
+    renders it today. The tile is what a person sees; this is what the support
+    bundle and the next reader of the document get.
+
+    ⚠ THE RACE, NAMED: this is a read-modify-write on `phases`, and so is the
+    route's. It only runs where the kick did NOT reach the route, so there is
+    normally nothing on the other side — the exception is a 403 arriving while a
+    BROWSER's kick has the route running, where this could put a stale "errored"
+    over the claim's "running" until the route's next `phases` write corrects
+    it. That window is narrow and self-healing; recording nothing at all is
+    #542's symptom, which is not.
+
+    Explicit uid/rid: this runs on a detached thread minutes after the POST, by
+    which time the pipeline globals may belong to the NEXT run."""
+    if not _firebase_db or not uid or not research_id:
+        return False
+    ref = _firebase_db.collection("users").document(uid) \
+        .collection("researches").document(research_id)
+
+    def _op():
+        snap = ref.get()
+        data = (snap.to_dict() or {}) if snap.exists else {}
+        phases = list(data.get("phases") or [])
+        entry = None
+        for row in phases:
+            if isinstance(row, dict) and row.get("phase") == 4:
+                entry = row
+                break
+        if entry is None:
+            entry = {"phase": 4, "label": "Phase 4",
+                     "startedAt": int(time.time() * 1000)}
+            phases.append(entry)
+        entry["status"] = "errored"
+        entry["reason"] = reason
+        ref.update(_be_payload({"phases": phases}))
+
+    try:
+        _grpc_write_with_heal(_op, what=f"cloud-kick refusal rid={research_id[:8]}…")
+        return True
+    except Exception as e:
+        log(f"FE trigger: could not record the refusal on the document: {e}", "WARN")
+        return False
+
+
+def _drive_cloud_phases(uid, research_id, *, post, mint_token, sleep, note,
+                        record_failure) -> str:
+    """Ask the cloud to run phases 4 and 5 until it answers, refuses, or the
+    attempts run out. Returns the verdict the drive ended on.
+
+    ⛔⛔ IT USED TO BE ONE POST (wave 10.9, 542-5). No token, a POST that never
+    left the machine, or a 5xx left the `needsFeTrigger` marker and nothing
+    else: no video, no Super Research, no Doc, no email, and a run reading
+    "ongoing" until somebody happened to open its chat. On a machine whose owner
+    is asleep, that is for ever — and the marker is only ever read BY a chat
+    opening, so the backstop and the failure need the same thing to happen.
+
+    ⭐ EFFECTS ARE ARGUMENTS so the ladder, the classification and the record
+    are all executed by tests rather than read as source.
+    `post(id_token, p5_only)` returns `(status_code, text)` or raises;
+    `mint_token()` returns the synth device user's fresh ID token or None;
+    `note(line)` files a sentence in this run's own folder;
+    `record_failure(reason)` is what the chat ends up seeing.
+
+    ⭐ AND IT FOLLOWS THE ROUTE'S "ANSWERED WITHOUT PHASE 5" CONTRACT, which
+    the machine did not (`_answered_without_phase_5`). A 200 carrying no `p5`
+    means phase 4 is over and phase 5 never ran; the drive asks again for phase
+    5 alone, with a budget of its own.
+
+    ⛔ A CONNECTION CUT AFTER THE CLOUD HAD THE REQUEST IS NOT RETRIED. That is
+    this route's defining failure — something in front of Cloud Run severs the
+    socket at exactly 300 seconds while the route keeps working, one measured
+    run finishing at 497 s — so the chain is running and asking again would at
+    best take a 202 off its own claim."""
+    attempts = len(_DRIVE_BACKOFF_SEC) + 1
+    verdict = "retry"
+    why = "never attempted"
+    # ⭐ "ANSWERED WITHOUT PHASE 5" IS ASKED FOR AGAIN, exactly as the browser
+    # does. `p5_only` flips once, and the second pass gets a budget of its own:
+    # phase 5 is the rest of the run, not a postscript to the attempts phase 4
+    # happened to use up.
+    _p5_only = False
+    _attempt = 0
+    while _attempt < attempts:
+        _attempt += 1
+        _elapsed = 0
+        id_token = mint_token()
+        if not id_token:
+            verdict, why = "retry", "no synth id-token (creds revoked?)"
+            _text = ""
+        else:
+            _t0 = time.monotonic()
+            try:
+                _status, _text = post(id_token, _p5_only)
+                verdict = _dispatch_verdict(status_code=_status)
+                why = f"HTTP {_status}" + (f" ({str(_text)[:160]})" if _text else "")
+            except Exception as _e:
+                _elapsed = int(time.monotonic() - _t0)
+                verdict = _dispatch_verdict(exc=_e, elapsed_sec=_elapsed)
+                why = f"{_e}"
+                _text = ""
+        if verdict == "ran":
+            if not _p5_only and _answered_without_phase_5(_text):
+                # ⛔⛔ NOT A FINISHED CHAIN. `casRouteP4`'s already-completed
+                # short-circuit and the GCS-link branch both answer phase 4 and
+                # stop, carrying no `p5` — and the route's own comment names
+                # this as the caller's cue to ask for phase 5 alone. The machine
+                # used to call it done here, which on a boot or Resume re-kick
+                # (the two that land on a finished phase 4) meant no Super
+                # Research, no Doc and no email, with nobody awake to notice.
+                note(f"P4/P5: the route answered phase 4 and stopped ({why}) — "
+                     f"asking it for phase 5 alone.")
+                log(f"FE trigger: BE-driven P4/P5 — the route answered phase 4 "
+                    f"without running phase 5 ({why}) — asking for phase 5 alone "
+                    f"rid={research_id[:8]}…")
+                _p5_only = True
+                _attempt = 0
+                continue
+            note(f"P4/P5 dispatched to the cloud and the route ran it ✓ ({why})")
+            log(f"FE trigger: BE-driven P4/P5 — the cloud ran the chain ✓ ({why}) "
+                f"rid={research_id[:8]}…")
+            return verdict
+        if verdict == "claimed":
+            # ⛔⛔ LOGGED AS "dispatched ✓" UNTIL WAVE 10.9 (542-S4). A 202 means
+            # somebody ELSE holds the claim — an open tab, or an earlier kick
+            # still running — so this call did nothing, and the tick said it
+            # had. On a run that then stalled, the one line the report rested on
+            # named the wrong party.
+            note("P4/P5 was already claimed by another caller (HTTP 202) — "
+                 "the cloud is running it, and this machine's kick did nothing.")
+            log(f"FE trigger: BE-driven P4/P5 already claimed by another caller "
+                f"(HTTP 202) — nothing dispatched rid={research_id[:8]}…")
+            return verdict
+        if verdict == "cut":
+            note(f"P4/P5 connection cut after {_elapsed}s ({why}). The cloud "
+                 f"received the request and may be finishing it; this machine "
+                 f"stopped being able to watch. If it did not finish, the run "
+                 f"stays on phase 3 until the chat is opened and the catch-up "
+                 f"fires.")
+            log(f"FE trigger: BE-driven P4/P5 connection cut after {_elapsed}s "
+                f"({why}) — the cloud has the request rid={research_id[:8]}…", "WARN")
+            return verdict
+        if verdict == "refused":
+            # ⭐⭐ THE REFUSAL CASE, AND THE WEB SAYS IN ITS OWN WORDS THAT THIS
+            # HALF IS OURS. `uploadYouTube` leaves a marker on every post-auth
+            # exit and deliberately NOT on the 401/403 ones: a 401 has no
+            # verified identity and a 403 has one that failed its check, so
+            # writing from there would mean writing under a caller's CLAIMED
+            # ownerUid — the exact relay hole the check closes. It also drops
+            # its own captured lines for those two exits. So on a refusal
+            # NOTHING was written anywhere, by anyone. We know who we are; we
+            # write it here.
+            break
+        # "retry" — nothing ran, and asking again can change it.
+        if _attempt >= attempts:
+            break
+        _delay = _DRIVE_BACKOFF_SEC[_attempt - 1]
+        log(f"FE trigger: BE-driven P4/P5 attempt {_attempt} did not land ({why}) "
+            f"— retrying in {_delay}s rid={research_id[:8]}…", "WARN")
+        sleep(_delay)
+    # ⛔ THE PHASE IT GAVE UP ON, NAMED. A drive that had already flipped to
+    # `p5_only` failed on PHASE 5, and saying "P4/P5" there would send the next
+    # reader looking for an upload that succeeded.
+    _leg = "P5" if _p5_only else "P4/P5"
+    _sentence = (
+        f"{_leg} was refused by the cloud — {why}. Nothing ran, and nothing was "
+        f"recorded on the cloud side. Phase 4 is marked errored on this run so "
+        f"the chat can show it; opening the chat asks the route again."
+        if verdict == "refused" else
+        f"{_leg} never reached the cloud after {_attempt} attempt(s) — {why}. "
+        f"Phase 4 is marked errored on this run so the chat can show it; "
+        f"opening the chat asks the route again."
+    )
+    note(_sentence)
+    # ⛔ `_attempt`, NOT `attempts` (542-S4). A refusal stops on the FIRST ask,
+    # and reporting the whole budget there claims a persistence the drive did
+    # not have — the same class of overstatement as the 202 logged as a dispatch.
+    log(f"FE trigger: BE-driven {_leg} gave up after {_attempt} attempt(s) "
+        f"({verdict}: {why}) rid={research_id[:8]}… — recording the failure on "
+        f"the run", "WARN")
+    try:
+        record_failure(_sentence)
+    except Exception as _re:
+        log(f"FE trigger: recording the refusal failed ({_re})", "WARN")
+    return verdict
+
+
 def _post_fe_p4p5_trigger(uid, research_id):
     """Option C (#742): drive P4 (YouTube) + P5 (Doc/email) autonomously so a
     run completes even when the chat app is never opened.
 
     Two cooperating parts:
       1) Write the `needsFeTrigger` marker synchronously (via
-         _fire_fe_p4_trigger) — the long-standing FE catch-up backstop AND the
-         safe fallback if the autonomous POST below can't run. This uses the
-         worker's module-global Firestore context, so it MUST run here in the
-         worker thread, never the background thread.
-      2) Additionally POST {FE_BASE_URL}/api/uploadYouTube authenticated with
-         the synth-device user's OWN fresh ID token; the route authorizes the
-         device->research binding (authorizeSynthForResearch) and runs P4 then
+         _fire_fe_p4_trigger) — the backstop a chat opening on this run reads,
+         and the record that the hand-off happened at all.
+      2) POST {FE_BASE_URL}/api/uploadYouTube authenticated with the synth
+         device user's OWN fresh ID token; the route authorizes the
+         device→research binding (authorizeSynthForResearch) and runs P4, then
          chains P5 server-side on Cloud Run. We hit ONLY uploadYouTube (it owns
-         the P5 chain) to avoid a double P5. casRouteP4 dedups this against the
-         FE catch-up, so the two triggers coexist safely.
+         the P5 chain) to avoid a double P5. `casRouteP4` dedups this against a
+         browser's kick, so the two coexist safely — a repeated kick is safe by
+         design, and answers 202 while a claim is fresh.
 
     The POST runs in a detached daemon thread with a long timeout: the encode +
     resumable upload can take minutes and the route processes inline while the
     connection is open, so we must neither block the worker (it has a queue to
     drain) nor disconnect early (a client-disconnect can abort the route
-    mid-encode). On any POST failure the marker — already written — ensures the
-    FE catch-up still runs on next chat-open. Best-effort; never raises."""
-    # (1) marker backstop — synchronous, worker context (module globals valid).
+    mid-encode). Best-effort; never raises.
+
+    ⭐ THE TOKEN IS MINTED PER ATTEMPT, INSIDE THE THREAD (wave 10.9, 542-5). It
+    used to be minted once here, in the worker, and a `None` returned early with
+    the marker as the only trace — so a machine whose token refresh blipped
+    delivered nothing and said so only in a log line. `_drive_cloud_phases`
+    retries the mint like any other attempt, and records the outcome on the run
+    when the attempts run out.
+
+    ⭐ SAFE TO CALL FOR A RUN THAT IS NOT THE ONE IN THE PIPELINE GLOBALS. Every
+    write underneath names `uid`/`research_id` explicitly, which is what lets
+    the boot rehydrate and the resume path re-fire a kick for a run this worker
+    is not executing."""
+    # (1) marker backstop.
     _fire_fe_p4_trigger(uid, research_id)
     if not uid or not research_id:
         return False
-    # (2) autonomous server-to-server trigger.
-    id_token = _fresh_user_mode_id_token()
-    if not id_token:
-        log("FE trigger: no synth id-token (creds revoked?) — needsFeTrigger marker only", "INFO")
-        return False
+
+    def _post(id_token, p5_only=False):
+        """One POST. Returns (status_code, text); raises what `requests` raises.
+
+        ⭐ `p5_only` IS THE ROUTE'S OWN FLAG, not a second endpoint. It is
+        handled immediately after the synth auth — before the phase-4 scope read
+        — so the same body and the same credentials ask for phase 5 alone."""
+        import requests as _requests
+        from auth.v2_flow import FE_BASE_URL as _FE_BASE_URL
+        _body = {"research_id": research_id, "ownerUid": uid}
+        if p5_only:
+            _body["p5_only"] = True
+        _resp = _requests.post(
+            f"{_FE_BASE_URL}/api/uploadYouTube",
+            headers={"Authorization": f"Bearer {id_token}"},
+            json=_body,
+            # ⛔ A PAIR, NOT A SCALAR. A scalar sets the CONNECT timeout to
+            # 3600 as well, so a black-holed SYN — firewall drop, no route,
+            # VPN down — does not fail fast; it fails tens of seconds later,
+            # past `_DRIVE_SENT_AFTER_SEC`, and the record then says the cloud
+            # received a request that never left the machine. Ten seconds
+            # bounds the connect; the read stays matched to the route's
+            # Cloud Run maxDuration (long podcast encode + upload).
+            timeout=(10, 3600),
+        )
+        return _resp.status_code, _resp.text
 
     def _drive():
         # ⭐⭐ Counted as an in-flight DRIVE, not a brief handoff. This request is
@@ -17420,105 +17681,28 @@ def _post_fe_p4p5_trigger(uid, research_id):
         # `_FE_DRIVE_WAIT_SEC`.
         _fe_handoff_begin(drive=True)
         try:
-            _drive_once()
+            # ⛔⛔ EVERY LINE THE DRIVE WRITES USED TO LAND NOWHERE. `log()`
+            # copies into the sink that is armed AT WRITE TIME, and by the time
+            # this thread finishes, this run's sink has been popped — so the
+            # machine's only account of how the cloud half went was a line in a
+            # machine-wide file nobody can cut a run out of. Measured: zero
+            # occurrences across every run folder on this disk.
+            # `_note_cloud_handoff` addresses the run's OWN folder by
+            # researchId, which is also what stops a slow encode dropping this
+            # run's line into the NEXT run's support bundle.
+            _drive_cloud_phases(
+                uid, research_id,
+                post=_post,
+                mint_token=_fresh_user_mode_id_token,
+                sleep=time.sleep,
+                note=lambda _line: _note_cloud_handoff(research_id, _line),
+                record_failure=lambda _reason: _record_cloud_kick_refusal(
+                    uid, research_id, _reason),
+            )
+        except Exception as _e:
+            log(f"FE trigger: BE-driven P4/P5 drive raised ({_e})", "WARN")
         finally:
             _fe_handoff_end(drive=True)
-
-    def _drive_once():
-        # When the POST actually left, so the failure branch can tell a
-        # connection that was never made from one that was cut mid-flight.
-        _t0 = time.monotonic()
-        try:
-            import requests as _requests
-            from auth.v2_flow import FE_BASE_URL as _FE_BASE_URL
-            _resp = _requests.post(
-                f"{_FE_BASE_URL}/api/uploadYouTube",
-                headers={"Authorization": f"Bearer {id_token}"},
-                json={"research_id": research_id, "ownerUid": uid},
-                # ⛔ A PAIR, NOT A SCALAR. A scalar sets the CONNECT timeout to
-                # 3600 as well, so a black-holed SYN — firewall drop, no route,
-                # VPN down — does not fail fast; it fails tens of seconds later,
-                # past the threshold below, and the record then says the cloud
-                # received a request that never left the machine. Ten seconds
-                # bounds the connect; the read stays matched to the route's
-                # Cloud Run maxDuration (long podcast encode + upload).
-                timeout=(10, 3600),
-            )
-            # ⛔⛔ EVERY ONE OF THESE LINES USED TO LAND NOWHERE. `log()` copies
-            # into the sink that is armed AT WRITE TIME, and by now this run's
-            # sink has been popped — so the machine's only account of how the
-            # cloud half went was a line in a machine-wide file nobody can cut
-            # a run out of. Measured: zero occurrences across every run folder
-            # on this disk. `_note_cloud_handoff` addresses the run's OWN
-            # folder by researchId, which is also what stops a slow encode
-            # dropping this run's line into the NEXT run's support bundle.
-            if _resp.status_code in (200, 202):
-                _hl = f"P4/P5 dispatched to the cloud ✓ (HTTP {_resp.status_code})"
-                log(f"FE trigger: BE-driven P4/P5 dispatched ✓ (HTTP {_resp.status_code}) rid={research_id[:8]}…")
-            else:
-                # ⭐⭐ THE REFUSAL CASE, AND THE WEB SAYS IN ITS OWN WORDS THAT
-                # THIS HALF IS OURS. `uploadYouTube` leaves a marker on every
-                # post-auth exit, and deliberately NOT on the 401/403 ones: a
-                # 401 has no verified identity and a 403 has one that failed
-                # its check, so writing from there means writing under a
-                # caller's CLAIMED ownerUid — the exact relay hole the check
-                # closes. It also drops its own captured lines for those two
-                # exits, because the key they would be filed under is the
-                # thing in question. So on a refusal NOTHING was written
-                # anywhere, by anyone. We know who we are; we write it here.
-                _hl = (f"P4/P5 refused by the cloud — HTTP {_resp.status_code} "
-                       f"({_resp.text[:160]}). The run is still on phase 3 until "
-                       f"the chat is opened and the catch-up fires.")
-                log(
-                    f"FE trigger: BE-driven P4/P5 HTTP {_resp.status_code} "
-                    f"({_resp.text[:160]}) — FE catch-up covers via marker",
-                    "WARN",
-                )
-            _note_cloud_handoff(research_id, _hl)
-        except Exception as _e:
-            log(f"FE trigger: BE-driven P4/P5 dispatch failed ({_e}) — FE catch-up covers via marker", "WARN")
-            # ⛔⛔ THIS SENTENCE WAS FALSE ON THE MAJORITY PATH, and the wave's
-            # own measurement convicted it. Something in front of Cloud Run
-            # severs this connection at EXACTLY 300 seconds while the route
-            # keeps working (one measured run finished at 497 s), so `requests`
-            # raises here on every P4/P5 longer than five minutes — and the
-            # first version wrote "never reached the cloud … still on phase 3"
-            # into the run's permanent record, on runs that succeeded. A lying
-            # diagnostic is worse than none: this file exists to be the
-            # authoritative per-run account, and it rides the support bundle.
-            #
-            # ⭐ THE ELAPSED TIME IS WHAT TELLS THE TWO APART. A request that
-            # died instantly never left; one that died after the connection had
-            # been open for a while was received and may well be finishing. We
-            # do not claim to know which — we say what we saw.
-            _elapsed = int(time.monotonic() - _t0)
-            # ⛔⛔ AND THE CLASS ARBITRATES ONLY WHERE IT CAN. Round two moved
-            # this decision onto the exception class alone; round three induced
-            # the real severance and found that urllib3 reports a socket cut
-            # mid-flight as the SAME bare `ConnectionError` it uses for a
-            # connection that never opened — so the class-only rule sent this
-            # route's defining 300-second failure back to "never reached the
-            # cloud", the exact sentence round one removed. `_dispatch_never_left`
-            # now answers only for the classes that are unambiguous and leaves
-            # the rest to the clock.
-            _never_left = _dispatch_never_left(_e, _elapsed)
-            if not _never_left and _elapsed >= _DRIVE_SENT_AFTER_SEC:
-                # ⛔ THE CATCH-UP CLAUSE BELONGS HERE TOO. This is now the branch
-                # most late failures take, and "may be finishing it" is right
-                # for the measured 300-second severance and optimistic for a
-                # dropped link, a sleeping laptop or an instance that died at
-                # thirty seconds. Naming what actually recovers the run costs a
-                # clause and covers every one of them.
-                _hl = (f"P4/P5 connection cut after {_elapsed}s ({_e}). The cloud "
-                       f"received the request and may be finishing it; this "
-                       f"machine stopped being able to watch. If it did not "
-                       f"finish, the run stays on phase 3 until the chat is "
-                       f"opened and the catch-up fires.")
-            else:
-                _hl = (f"P4/P5 dispatch never reached the cloud after {_elapsed}s "
-                       f"({_e}). The run stays on phase 3 until the chat is "
-                       f"opened and the catch-up fires.")
-            _note_cloud_handoff(research_id, _hl)
 
     try:
         import threading as _threading
@@ -26645,9 +26829,8 @@ def fail_phase(phase: int, title: str = "", details: str = "",
     NotebookLM starts — pre-fix, the FE rendered NLM with a red
     error badge while the pipeline was still at Phase 0 Init, which
     falsely implied NLM itself had failed. With this flag, the
-    pipeline_error banner + Retry/Skip actions still fire, and the
-    queue-gate "_errored" flag is still set; only the icon-state
-    write is skipped."""
+    pipeline_error banner + Retry/Skip actions still fire; only the
+    icon-state write is skipped."""
     if title == "" and error:
         title = error
     if details == "" and reason:
@@ -26731,17 +26914,11 @@ def fail_phase(phase: int, title: str = "", details: str = "",
     # Skipped for preflight aborts — see docstring.
     if mark_phase_errored:
         _write_phase_terminal_status(phase, "errored")
-    # 2026-05-12: flag the queue gate so the next dequeue short-circuits.
-    # Without this, run_pipeline returning cleanly after fail_phase leaves
-    # the worker's `finally` block setting `last_be_done_at = now` (the
-    # same as a successful run) — wedging the next queued run for the
-    # full 4200s fallback. The `except` path at research.py:22589 already
-    # sets this for raised exceptions; fail_phase covers the
-    # clean-return-after-fail path that the except never sees.
-    try:
-        _QUEUE_STATE["_errored"] = True
-    except Exception:
-        pass
+    # ⛔ A `_QUEUE_STATE["_errored"]` FLAG WAS RAISED HERE AND IS GONE (wave
+    # 10.9, N8). Its only reader was the queue gate: the worker's `finally`
+    # recorded a zero finish-time for a failed run so the NEXT dequeue would not
+    # sit waiting for a cloud tail that was never going to come. No dequeue
+    # waits on another run any more, so there is nothing to tell.
 
 
 _PRO_TIER_DETAILS_BY_KEY = {
@@ -36888,8 +37065,7 @@ class Browser:
             # racing the dialog, EPIPE from the Patchright Node driver
             # during HV recovery, etc.) escalated the whole BE process
             # to exit code 0xFFFFFFFF and the daemon-loop respawned —
-            # losing the in-flight pipeline and leaving the queue-gate
-            # wedged on a stale prior-run pointer. The page is gone; we
+            # losing the in-flight pipeline. The page is gone; we
             # have nothing useful to do with the file. Drop a WARN and
             # let the caller's own retry / timeout path handle it.
             try:
@@ -67465,22 +67641,67 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
         log(f"save_meta: firestore propagation failed: {_e}", "WARN")
 
 
+def _handed_off_to_cloud(queue_dir) -> bool:
+    """Has this run's queue directory recorded the hand-off to the cloud?
+
+    ⛔⛔ `delivery.json`'s "completed" MEANS THE HAND-OFF IS DONE, NOT THAT THE
+    RUN IS. There are exactly two writers of that value and both are the
+    hand-off itself: `update_delivery(status="completed")` fires at the end of
+    PHASE 3, in the same breath as the `beDone` marker and the cloud kick, with
+    phases 4 and 5 not yet started. Reading it as "the run finished" is how a
+    Resume came to do nothing at all (`detect_resume_phase` answers 6) and how
+    the boot sweep came to stamp a run the cloud was actively uploading.
+
+    ⭐ THIS IS THE ONE DEFINITION (wave 10.9, 542-4). The dead-worker sweep had
+    a private copy of it inline, the boot gate had none at all and stamped
+    "stopped" over the runs it names, and the resume path read the same file
+    through `detect_resume_phase` and drew the opposite conclusion. Three
+    readers, three answers, one file.
+
+    A directory that is missing, unreadable, or has no delivery record at all
+    reads as NOT handed off — the fail-toward-recovery direction, since a run
+    the machine never finished is one a checkpoint resume can still pick up.
+    """
+    if queue_dir is None:
+        return False
+    try:
+        delivery_path = Path(queue_dir) / "delivery.json"
+        if not delivery_path.exists():
+            return False
+        return json.loads(
+            delivery_path.read_text(encoding="utf-8")).get("status") == "completed"
+    except Exception:
+        return False
+
+
+def _claim_is_handed_off(claimed_run_id) -> bool:
+    """Does this research document's `backendRunId` name a run directory whose
+    hand-off to the cloud is already recorded?
+
+    ⛔ THE RUN ID ON A DOCUMENT IS A CLAIM, NOT A PATH. `_run_dir_inside_queues`
+    is what turns it into a directory at all: a claim carrying a separator, or
+    one whose join lands anywhere but directly inside `queues/`, is treated
+    exactly as an absent one — the same refusal every other reader of that field
+    makes, so a path claim cannot decide this branch on a file that was never a
+    run's."""
+    return _handed_off_to_cloud(_run_dir_inside_queues(claimed_run_id))
+
+
 def detect_resume_phase(queue_dir):
     """Detect which phase to resume from based on existing output files.
     Returns (phase_number, description). 5-phase BE model (0-4) plus
-    FE-owned Phase 5 (Doc + email). Return value of 5 means "BE work is
-    done, FE-P5 still needs to fire" — run_pipeline handles this by
-    re-emitting phase_complete phase=4 to retrigger triggerFeP5 on the
-    frontend (its CAS guard makes a re-trigger idempotent). 6 means
-    "delivery.json marks the run completed — nothing to resume"."""
+    cloud-owned Phase 5 (Doc + email). Return value of 5 means "BE work is
+    done, phase 5 still needs to fire" — run_pipeline handles this by
+    handing off: `beDone`, the marker and the kick to the cloud route.
+
+    6 means "this run was already handed off — the machine has nothing left to
+    resume". ⛔ It does NOT mean the run is complete: `delivery.json` says
+    hand-off, not completion (see `handed_off_to_cloud`). The caller decides
+    what to do about a handed-off run whose document still says "ongoing" —
+    which is to re-fire the kick, not to sit down."""
     queue_dir = Path(queue_dir)
-    if (queue_dir / "delivery.json").exists():
-        try:
-            delivery = json.loads((queue_dir / "delivery.json").read_text(encoding="utf-8"))
-            if delivery.get("status") == "completed":
-                return 6, "Pipeline already complete"
-        except Exception:
-            pass
+    if _handed_off_to_cloud(queue_dir):
+        return 6, "Already handed off to the cloud — nothing left for this machine to run"
     cp = load_checkpoint(queue_dir)
     # Phase 4 done — BE work complete, FE-P5 retriggered via re-emit of
     # phase_complete phase=4 inside run_pipeline.
@@ -68448,7 +68669,29 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             emit_event("phase_restart", phase=start_phase,
                        reason="resume_from_checkpoint", full=True)
         if start_phase >= 6:
-            log("Pipeline already complete — nothing to resume")
+            # ⛔⛔ THIS BRANCH SAID "already complete" AND SAT DOWN (wave 10.9,
+            # 542-4). Six means the HAND-OFF is recorded, not that the run
+            # finished — `delivery.json` is written at the end of phase 3 — so a
+            # Resume pressed on a run whose cloud tail never ran logged one line
+            # and did nothing at all. That is the last door out of #542 for a
+            # person with no tab open: the machine's part is genuinely over, but
+            # the kick it owns may never have landed.
+            #
+            # ⭐ SO IT RE-FIRES THE KICK, and writes nothing. The run's status,
+            # phase and fe* fields belong to the cloud route from `beDone`
+            # onward; the route's own claim makes a repeated kick safe (202
+            # while one is fresh). An unreadable document kicks too —
+            # `on_error=False` — because the cost of an extra 202 is nothing
+            # beside a run that stays ongoing for ever.
+            if _research_is_terminal(_fb_uid, _fb_research_id, on_error=False):
+                log("Already handed off and the run has since finished — nothing to do")
+                return
+            log("Already handed off to the cloud, and the run is still open — "
+                "re-firing the cloud kick")
+            try:
+                _post_fe_p4p5_trigger(_fb_uid, _fb_research_id)
+            except Exception as _trig_err:
+                log(f"FE trigger dispatch failed on handed-off resume (non-fatal): {_trig_err}", "WARN")
             return
         if start_phase == 5:
             # P4 was done before crash but FE-P5 may not have completed
@@ -68478,8 +68721,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # Pre-fix this only wrote phase=4, leaving currentPhase stale
             # at 4 and the diagram painting YouTube as the active node
             # forever post-resume.
-            # 2026-05-11: same beDone marker as the main exit so the
-            # queue gate also fires for resume-from-checkpoint runs.
+            # 2026-05-11: the same beDone marker as the main exit, so a
+            # resume-from-checkpoint hands off exactly as a clean finish does.
+            # ⭐ THIS WRITE IS THE HAND-OFF ITSELF, which is why it may still
+            # touch `status` and `phase`: contract rule 1 closes the machine out
+            # of those fields FROM `beDone` ONWARD, and this is the line that
+            # sets it. Everything after it on this run is the cloud's.
             _update_firestore_research({
                 "status": "ongoing", "phase": 5, "currentPhase": 5,
                 "beDone": True, "beDoneAt": int(time.time() * 1000),
@@ -69231,18 +69478,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                            progress="Checking vision/CUA availability…")
                 try:
                     await _probe_cua_available(cua_client)
-                    # #724 item 4: a PRIOR failed probe iteration set the queue
-                    # gate's "_errored" flag via fail_phase; clear it now that
-                    # the probe succeeded, so a run that fully RECOVERED (user
-                    # fixed the key + Retry) isn't mis-flagged as errored in the
-                    # job-finally gate (which would short-circuit the next
-                    # dequeue's FE-P5 wait, "next run starts sooner"). Fail-open
-                    # no-op on a first-try success. See gate at job-finally
-                    # (_QUEUE_STATE.pop("_errored", ...)).
-                    try:
-                        _QUEUE_STATE.pop("_errored", None)
-                    except Exception:
-                        pass
+                    # ⛔ #724 item 4 CLEARED THE QUEUE GATE'S "_errored" FLAG
+                    # HERE — a prior failed probe iteration had raised it via
+                    # fail_phase, and a run that fully RECOVERED (the person
+                    # fixed the key and hit Retry) must not be filed as errored.
+                    # The flag and its one reader retired with the gate (wave
+                    # 10.9, N8); nothing carries a run's probe failure past its
+                    # own recovery any more.
                     break  # reachable — proceed to login walk / phases
                 except CuaUnavailableError as cua_err:
                     log(f"Phase 0: CUA availability probe failed — {cua_err}", "ERROR")
@@ -70493,10 +70735,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # returns, teardown_firestore_run() drops the per-run command
                 # listener, so Retry/Skip would write to a dead command bus
                 # (dead-end buttons). actions=[] renders a title/details card
-                # with a corner ✕ and no buttons. fail_phase is KEPT (its
-                # unconditional _QUEUE_STATE["_errored"]=True is what lets the
-                # next queued run dequeue promptly). Distinct alert_id avoids the
-                # generic phase2_error dismiss-ledger collision.
+                # with a corner ✕ and no buttons. fail_phase is KEPT — it is
+                # what records the phase's errored status on the document.
+                # Distinct alert_id avoids the generic phase2_error
+                # dismiss-ledger collision.
                 fail_phase(2, "No brief to research",
                            "There's no research brief yet, so deep research "
                            "can't start. This run stopped here.",
@@ -70570,8 +70812,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     # tears down the FE run + BE command listener). Every agent
                     # was already skipped by the user, so there's no action left
                     # to offer; the per-agent agent_skipped events above carry
-                    # the reasons. fail_phase is KEPT (its _errored=True advances
-                    # the queue). Both all-skipped sites (verify-gate + preskip)
+                    # the reasons. fail_phase is KEPT — it records the phase's
+                    # errored status. Both all-skipped sites (verify-gate + preskip)
                     # share one alert_id so they're one logical card, not two
                     # byte-dup cards colliding on the generic phase2_error slot.
                     fail_phase(2,
@@ -70605,8 +70847,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     # tears down the FE run + BE command listener). Every agent
                     # was already skipped by the user, so there's no action left
                     # to offer; the per-agent agent_skipped events above carry
-                    # the reasons. fail_phase is KEPT (its _errored=True advances
-                    # the queue). Both all-skipped sites (verify-gate + preskip)
+                    # the reasons. fail_phase is KEPT — it records the phase's
+                    # errored status. Both all-skipped sites (verify-gate + preskip)
                     # share one alert_id so they're one logical card, not two
                     # byte-dup cards colliding on the generic phase2_error slot.
                     fail_phase(2,
@@ -72283,21 +72525,29 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             _controls._awaiting_user = False
         except Exception as _clr_err:
             log(f"terminal pause-clear (non-fatal): {_clr_err}", "WARN")
+        # ⛔⛔ "completed" HERE MEANS THE HAND-OFF, NOT THE RUN — and this is
+        # the line that writes it. Phases 4 and 5 have not started. Every reader
+        # of this file goes through `_handed_off_to_cloud`, which says so.
         update_delivery(status="completed")
-        # 2026-05-11: write beDone marker so the queue gate
-        # (_wait_for_prior_fe_completion) knows BE handed off to FE.
-        # research.status stays "ongoing" until FE-P5 flips it to
-        # "completed" — that's the signal the gate actually waits on;
-        # beDoneAt anchors the 4200s fallback timer.
+        # THE HAND-OFF (contract rule 1). `beDone` is the line after which this
+        # machine writes no `status`, no `phase` and no fe* field on this run:
+        # a restart, a rehydrate or a Resume from here on re-fires the kick
+        # instead of stamping the run. research.status deliberately stays
+        # "ongoing" through the cloud tail — the route's final phase-5 write is
+        # what makes it "completed".
         _update_firestore_research({"beDone": True, "beDoneAt": int(time.time() * 1000)})
-        # 2026-05-12: autonomous P4/P5 trigger. BE has finished its work
-        # through P3 (audio in Firebase Storage). Enqueue a Cloud Task that
-        # POSTs to /api/uploadYouTube so Cloud Run runs P4 (YouTube upload)
-        # + P5 (Doc + email) + flips status="completed" server-side. The
-        # queue gate (_wait_for_prior_fe_completion) waits on status, so
-        # this chain advances the queue even when the user's phone or tab
-        # isn't open. Cloud Tasks owns delivery + retries; the call below
-        # is a fast unary RPC (~50ms typical) — no thread held.
+        # The cloud kick. The machine has finished its work through P3 (audio in
+        # Firebase Storage); `/api/uploadYouTube` runs P4 (YouTube upload), then
+        # chains P5 (Super Research, summary, Doc, email) and writes
+        # status="completed" — all of it on Cloud Run, so the run finishes
+        # whether or not a tab is ever opened.
+        # ⛔ NOT A CLOUD TASK AND NOT A UNARY RPC. This comment said "Enqueue a
+        # Cloud Task … ~50ms typical, no thread held" for months; there has been
+        # no Admin SDK service account to enqueue with since Track D's cutover.
+        # It is an HTTPS POST from a detached daemon thread, retried on its own
+        # (`_post_fe_p4p5_trigger`), and on a long upload it stays open for
+        # minutes — which is exactly why `_fe_handoff_begin(drive=True)` holds
+        # the respawn while it runs.
         try:
             _post_fe_p4p5_trigger(_fb_uid, _fb_research_id)
         except Exception as _trig_err:
@@ -72937,6 +73187,42 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
                     if WORKER_ID != 1:
                         # Orphan (owner ∉ fleet), but I'm not the marker of record.
                         continue
+                    _orphan_safety_net = True
+                else:
+                    _orphan_safety_net = False
+                # ⛔⛔ AFTER THE HAND-OFF THE RUN IS THE CLOUD'S, AND THIS SCAN
+                # USED TO TAKE IT BACK (wave 10.9, 542-4). The query is
+                # status=="ongoing", and a run in its cloud tail is deliberately
+                # "ongoing" for the whole of phases 4 and 5 — so every restart
+                # during a tail either stamped the run `paused_backend_restart`
+                # (a Resume CTA over an upload that was fine) or, on a supervised
+                # device, RE-ENQUEUED it: a second worker on the same research,
+                # re-running phase 3, while Cloud Run finished the first one.
+                # The dead-worker sweep had this guard from the day it was
+                # written; this scan, which sees far more runs, never did.
+                #
+                # ⭐ AND SITTING STILL IS NOT THE ANSWER EITHER. If the kick
+                # never landed — no token, a POST that died, a 5xx — nobody is
+                # running those phases and no tab is open to notice. So the
+                # machine re-fires the kick it already owns. The route is
+                # idempotent through its own claim (it answers 202 while one is
+                # fresh), and this machine is the only party awake.
+                if _claim_is_handed_off(data.get("backendRunId")):
+                    log(f"[rehydrate] {research_id[:24]}… was handed off to the cloud "
+                        f"before this restart — re-firing the kick, leaving status alone",
+                        "INFO")
+                    try:
+                        await asyncio.to_thread(
+                            _post_fe_p4p5_trigger, tree_uid, research_id)
+                    except Exception as _kick_err:
+                        log(f"[rehydrate] re-kick failed for {research_id[:24]}…: "
+                            f"{_kick_err}", "WARN")
+                    continue
+                # ⛔ SAID AFTER THE HAND-OFF GUARD, NOT BEFORE IT. This line used
+                # to be printed at the moment the orphan branch was taken, so a
+                # handed-off orphan announced a paused mark that the guard above
+                # then (correctly) did not make.
+                if _orphan_safety_net:
                     log(
                         f"[rehydrate] {research_id[:24]}… owned by out-of-fleet "
                         f"worker {_owner_worker} (fleet={_fleet_size}) — marking "
@@ -73140,25 +73426,20 @@ async def _reconcile_dead_worker_runs(tree_uid: str, dead_ids: "set[int]") -> in
         # the scanner's PID-alive guard, so it never blocks here).
         if _scan_sibling_locks_for_research(research_id, WORKER_ID):
             continue
-        # BE-tail guard: once delivery.json flips to "completed" the BE has handed
-        # P4/P5 to an autonomous Cloud-Run task that finishes the run on its own
-        # (research.status stays "ongoing" until FE-P5 flips it). Unreadable /
-        # missing delivery.json ⇒ treat as BE-incomplete ⇒ mark (recoverable from
-        # the on-disk checkpoint).
+        # BE-tail guard: once the hand-off is recorded the cloud route finishes
+        # the run on its own (research.status stays "ongoing" through that tail),
+        # so marking it paused would pop a false Resume on a healthy run.
+        # Unreadable / missing delivery.json ⇒ treat as BE-incomplete ⇒ mark
+        # (recoverable from the on-disk checkpoint).
         # ⛔ THE RUN ID ON THE DOCUMENT IS A CLAIM HERE TOO, and joining it raw
         # read `delivery.json` from anywhere on the disk — a path claim decided
-        # this branch on a file that was never a run's. A claim that is not the
-        # name of a run directory is treated exactly as an absent one, which is
-        # a shape this guard already handles.
-        _run_dir = _run_dir_inside_queues(data.get("backendRunId"))
-        if _run_dir is not None:
-            _dpath = _run_dir / "delivery.json"
-            try:
-                if _dpath.exists() and json.loads(
-                        _dpath.read_text(encoding="utf-8")).get("status") == "completed":
-                    continue
-            except Exception:
-                pass
+        # this branch on a file that was never a run's. Both halves — the claim
+        # test and what the delivery record MEANS — now live in
+        # `_claim_is_handed_off`, which is also what the boot rehydrate and the
+        # resume path ask (wave 10.9, 542-4); this branch used to be the only
+        # place in the file that got the meaning right, in a private copy.
+        if _claim_is_handed_off(data.get("backendRunId")):
+            continue
         if _update_research_doc(tree_uid, research_id, {
             "status": "paused_backend_restart",
             "summary": "Backend restarted mid-run — hit Resume to pick up from the last checkpoint.",
@@ -74377,16 +74658,12 @@ async def run_server(port=8000):
                 "ts_ms": int(time.time() * 1000),
                 "current": current_job,
                 "pending": pending,
-                # 2026-05-11: persist the queue-gate's prior-run state so
-                # a daemon restart mid-FE-P5 doesn't lose the wait
-                # context. Without this, fresh _QUEUE_STATE after respawn
-                # means the gate skips and the next pipeline races
-                # against the in-flight FE-P5 of the prior run.
-                "gate": {
-                    "last_completed_uid": _QUEUE_STATE.get("last_completed_uid"),
-                    "last_completed_rid": _QUEUE_STATE.get("last_completed_rid"),
-                    "last_be_done_at": int(_QUEUE_STATE.get("last_be_done_at") or 0),
-                },
+                # ⛔ A "gate" SUB-OBJECT LIVED HERE (wave 10.9, N8). It carried
+                # the previous run's uid/rid/finish-time across a restart so the
+                # queue gate could resume waiting on that run's cloud tail —
+                # which is how a wait for somebody else's run survived a reboot.
+                # The gate is gone; a snapshot written by an older build still
+                # carries the key and is simply ignored on read.
             }
             # 2026-05-11: atomic write — write to tmp, then os.replace
             # (atomic on POSIX and Windows same-volume). Protects against
@@ -74443,186 +74720,17 @@ async def run_server(port=8000):
     # audio soft-warn advisories (60+120+90 = 270 min) of real work before
     # the deadlock backstop. 2026-05-06 (Stream 2 F12): bumped 4h → 5h.
     WORKER_OUTER_TIMEOUT_SEC = 5 * 60 * 60
-    # BE_PHASES_TIMEOUT_SEC lives at module scope (research.py:1224) since
-    # 2026-05-12 so the Firestore start listener (also module-level) can
-    # predict whether the gate will block when assigning queue position.
-    # This block kept as a doc anchor — the constant itself moved.
-
-    async def _wait_for_prior_fe_completion(_current_job=None):
-        """Hold the next dequeue until the prior run's FE-P5 reports
-        completion via research.status=='completed', or the fallback
-        timer expires.
-
-        `_current_job` is the just-dequeued job (passed in by the worker
-        BEFORE _QUEUE_STATE["current_job"] is set). Used to detect the
-        resume-of-same-rid edge case described below."""
-        _puid = _QUEUE_STATE.get("last_completed_uid")
-        _prid = _QUEUE_STATE.get("last_completed_rid")
-        _pdone = int(_QUEUE_STATE.get("last_be_done_at") or 0)
-        if not _firebase_db or not _puid or not _prid:
-            return  # first run or missing context — nothing to wait on
-        # 2026-05-11: skip the gate when the dequeued job IS the same rid
-        # as the just-finished run. This happens on resume-from-checkpoint
-        # paths where Firestore re-enqueues the same rid after a BE crash
-        # or restart — the "prior" run from the gate's POV is actually
-        # the current dequeued run; waiting on its own FE-P5 would
-        # circular-deadlock (BE never starts → FE-P5 never fires → gate
-        # waits the full 4200s fallback). Resume semantics handle the
-        # state machine separately; the gate only matters for the
-        # successor-pipeline-after-different-prior case.
-        if _current_job and (_current_job.get("research_id") or "") == _prid:
-            log(f"[queue-gate] dequeued rid {_prid[:8]}… matches last_completed_rid — resume path, skipping wait")
-            return
-        if _pdone <= 0:
-            # Error path marker: prior run was watchdog-stopped /
-            # errored / never reached BE PIPELINE COMPLETE. FE-P5
-            # will never write "completed" for it, so don't block.
-            log("[queue-gate] prior run errored — skipping FE-completion wait")
-            return
-        deadline = _pdone + BE_PHASES_TIMEOUT_SEC * 1000
-        # Mid-session stuck-status self-heal — if the prior FE-P5 just
-        # legitimately ghosted (user closed the tab, FE-P5 errored without
-        # flipping status, browser was force-quit), the gate previously
-        # waited the full 70-min deadline before giving up. Now: take a
-        # snapshot of (status, feP5State) on entry and force-release if
-        # both stay unchanged for STUCK_STATUS_RELEASE_MS (5 min). The
-        # deadline still backstops the slow-FE-P5 case (large YouTube
-        # uploads), but the common-case stuck-prior gets unstuck in 5 min
-        # without needing a BE restart or Reset Backend tap.
-        STUCK_STATUS_RELEASE_MS = 5 * 60 * 1000
-        _stuck_first_seen_ms: int = 0
-        _stuck_status_signature: str = ""  # f"{status}|{feP5State}"
-        # 2026-08-11: say how long is ACTUALLY left, not the constant. The
-        # deadline is anchored to when the PRIOR run finished, not to when this
-        # gate opened — so on a device that has been idle for longer than the
-        # window (the normal case: the owner starts the next run hours later)
-        # it is already in the past. The old line announced a 4200s wait and
-        # the very next line, in the same second, announced that 4200s had
-        # elapsed. Both were false, and chasing them cost real time.
-        _gate_left_ms = deadline - int(time.time() * 1000)
-        if _gate_left_ms > 0:
-            log(f"[queue-gate] waiting for prior run {_prid[:8]}… FE-P5 completion "
-                f"(fallback in {int(_gate_left_ms / 1000)}s)")
-        else:
-            log(f"[queue-gate] prior run {_prid[:8]}… finished "
-                f"{int((int(time.time() * 1000) - _pdone) / 1000)}s ago, past its "
-                f"{BE_PHASES_TIMEOUT_SEC}s FE-P5 window — checking its status once, "
-                f"not waiting")
-        # 2026-05-12: register the gate-pending job so cancel handlers can
-        # see it. Without this, a cancel that arrives while the worker is
-        # blocked in the gate wait silently no-ops — neither in job_queue
-        # (already popped) nor in current_job (not set until after gate).
-        # User saw "Cancel: rid=… removed_from_queue=False" with no status
-        # flip + no banner unmount. Cleared on gate return.
-        if _current_job:
-            _QUEUE_STATE["gate_pending_job"] = _current_job
-        while True:
-            # 2026-05-12: honor explicit stop requests during gate wait.
-            # When the cancel handler matches gate_pending_job and calls
-            # request_stop, this poll loop exits cleanly so the worker can
-            # bail out of the gate and drop the job.
-            try:
-                if _controls.is_stop():
-                    log("[queue-gate] stop requested during gate wait — releasing", "INFO")
-                    _QUEUE_STATE.pop("gate_pending_job", None)
-                    return
-            except Exception:
-                pass
-            now_ms = int(time.time() * 1000)
-            try:
-                # 2026-05-11: offload the blocking Firestore .get() to a
-                # worker thread so the gate's 2s poll doesn't block the
-                # event loop on the round-trip (50-200ms typical, longer
-                # under network contention). Keeps heartbeat / listener
-                # callbacks responsive while the gate waits.
-                _doc_ref = _firebase_db.collection("users").document(_puid) \
-                    .collection("researches").document(_prid)
-                snap = await asyncio.to_thread(_doc_ref.get)
-                if not snap.exists:
-                    # Prior research doc was deleted (user purged from
-                    # /researches). Treat as terminal — there's nothing
-                    # left to wait on. Without this branch the gate
-                    # would spin silently until the deadline fires
-                    # (worst case BE_PHASES_TIMEOUT_SEC = 70 min).
-                    log(f"[queue-gate] prior run {_prid[:8]}… doc missing — dequeueing")
-                    _QUEUE_STATE.pop("gate_pending_job", None)
-                    return
-                if snap.exists:
-                    data = snap.to_dict() or {}
-                    status = data.get("status", "")
-                    fe_p5_state = data.get("feP5State", "")
-                    if status in ("completed", "stopped", "stopped_by_watchdog",
-                                  "cancelled", "terminated_by_user_discard", "errored"):
-                        log(f"[queue-gate] prior run terminal (status={status}) — dequeueing")
-                        _QUEUE_STATE.pop("gate_pending_job", None)
-                        return
-                    # 2026-05-11: markFeP5Failed writes feP5State="failed"
-                    # but doesn't flip research.status — so a thrown FE-P5
-                    # exception would hang the gate for the full 4200s.
-                    # Release the gate on this fast-fail marker too.
-                    if fe_p5_state == "failed":
-                        log("[queue-gate] prior run's FE-P5 failed — dequeueing")
-                        _QUEUE_STATE.pop("gate_pending_job", None)
-                        return
-                    # Stuck-status self-heal: if (status, feP5State) hasn't
-                    # changed in STUCK_STATUS_RELEASE_MS, the prior FE has
-                    # ghosted and is never coming back. Force-release. The
-                    # first-seen marker resets on any signature change so
-                    # a slow-but-progressing FE-P5 (e.g., long YouTube
-                    # upload that flips feP5State queued→running→completed
-                    # over several minutes) doesn't trip the heal.
-                    _sig = f"{status}|{fe_p5_state}"
-                    if _sig != _stuck_status_signature:
-                        _stuck_status_signature = _sig
-                        _stuck_first_seen_ms = now_ms
-                    elif (now_ms - _stuck_first_seen_ms) >= STUCK_STATUS_RELEASE_MS:
-                        log(
-                            f"[queue-gate] prior run {_prid[:8]}… stuck at "
-                            f"({status},{fe_p5_state}) for "
-                            f"{int((now_ms - _stuck_first_seen_ms) / 1000)}s — "
-                            f"FE-P5 ghosted, force-dequeueing"
-                        )
-                        _QUEUE_STATE.pop("gate_pending_job", None)
-                        return
-            except Exception as e:
-                _e_str = str(e)
-                if (
-                    "403" in _e_str
-                    or "PERMISSION_DENIED" in _e_str
-                    or "Missing or insufficient permissions" in _e_str
-                ):
-                    # Track D: synth user denied on prior run's research
-                    # doc. We can't poll its terminal status — but we
-                    # also can't sit in a 2-second poll loop spamming
-                    # 403s and wedging the queue for BE_PHASES_TIMEOUT_SEC
-                    # (4200s by default). The on-disk gate-state and
-                    # _safe_enqueue's whitelist already de-dupe restart
-                    # races, so release the gate immediately and let
-                    # the worker proceed. Under-Track-D this is the
-                    # right behavior: every research is owned by some
-                    # device, the BE only sees its own device-queue
-                    # entries, and two queued runs on the same device
-                    # arrive in order via the start listener.
-                    log("[queue-gate] read denied (synth user) — releasing gate (Track D)", "DEBUG")
-                    _QUEUE_STATE.pop("gate_pending_job", None)
-                    return
-                log(f"[queue-gate] Firestore read failed: {e}", "WARN")
-            # 2026-08-11: deadline check moved BELOW the status read. It used
-            # to be the first thing in the loop, so an already-expired deadline
-            # returned before the poll had read anything even once — the gate
-            # released without ever learning that the prior run was sitting
-            # right there at status="completed", and then reported the one
-            # thing it had not checked ("FE never reported completed"). Every
-            # earlier branch returns, and the read is wrapped, so this stays
-            # reachable on every path: no read, failed read, or non-terminal.
-            if now_ms >= deadline:
-                log(f"[queue-gate] prior run {_prid[:8]}… is "
-                    f"{int((now_ms - _pdone) / 1000)}s past its backend finish with no "
-                    f"terminal status seen (FE-P5 window {BE_PHASES_TIMEOUT_SEC}s) — "
-                    f"force-dequeueing")
-                _QUEUE_STATE.pop("gate_pending_job", None)
-                return
-            await asyncio.sleep(2)
+    # ⛔⛔ `_wait_for_prior_fe_completion` STOOD HERE AND IS GONE (wave 10.9,
+    # N8). It held the next dequeue until the PREVIOUS run's cloud tail flipped
+    # research.status to "completed", or for up to 4200 seconds. Phases 4 and 5
+    # run on Cloud Run — no browser, no ffmpeg, nothing of this computer's — so
+    # the contention it was written for does not exist, and the browser lock it
+    # was paired with is deleted (D-1). What it actually did was hold one
+    # person's run on a shared computer behind another person's cloud tail, for
+    # as long as that tail took; its 5-minute stuck-status heal and its
+    # "force-dequeueing" fallback were both apologies for that. The YouTube
+    # ceiling it is sometimes justified by is a DAILY COUNT, not a concurrency
+    # limit, so serializing starts buys nothing there either.
 
     async def _rescan_queue_for_unclaimed():
         """Multi-worker orphan recovery (2026-05-21).
@@ -74671,14 +74779,12 @@ async def run_server(port=8000):
         if (
             _QUEUE_STATE.get("running")
             or _job_queue.qsize() > 0
-            or _QUEUE_STATE.get("gate_pending_job")
         ):
-            # Not actually idle: running a job, a job already queued locally, OR
-            # blocked in _wait_for_prior_fe_completion (gate_pending_job is set
-            # while the worker holds a dequeued job in the FE-completion gate with
-            # running=False/qsize=0). Without the gate check a periodic rescan
-            # would treat a gated worker as idle and claim a SECOND doc, serializing
-            # it behind the still-gated job.
+            # Not actually idle: running a job, or a job already queued locally.
+            # ⛔ A third clause read `gate_pending_job` — the slot a worker held
+            # while it waited on the previous run's cloud tail. Both the wait and
+            # the slot retired in wave 10.9 (N8); `running` is set in the same
+            # breath as the dequeue now, so there is no window left to miss.
             return
         # #903: a resting worker never claims — neither fresh docs nor
         # orphans. The wake transition is caught by the next rescan tick.
@@ -74746,7 +74852,6 @@ async def run_server(port=8000):
                 _exit_scheduled
                 or _QUEUE_STATE.get("running")
                 or _job_queue.qsize() > 0
-                or _QUEUE_STATE.get("gate_pending_job")
                 or await asyncio.to_thread(_worker_is_resting)
             ):
                 return
@@ -74908,32 +75013,27 @@ async def run_server(port=8000):
             # (HARD_RESET at 18:13:28 with no active run → Kalki claimed
             # at 18:20:45 → bailed 18:20:46 without ever starting).
             # Safe because (a) cancels for in-queue jobs remove from
-            # queue (never reach pop), (b) cancels for THIS job's gate-
-            # pending phase will RE-SET the flag via the gate_pending_job
-            # match at research.py:4421, (c) cancels for the running job
+            # queue (never reach pop), and (b) cancels for the running job
             # set the flag and run_pipeline consumes it internally.
             try:
                 _controls.reset()
             except Exception:
                 pass
-            # 2026-05-11: gate on prior run's FE-P5 completion. Phases
-            # 4+5 are FE-owned — BE PIPELINE COMPLETE fires after P3,
-            # but the actual run isn't done until FE Doc+Email lands.
-            # Without this gate, the next pipeline's BE phases race
-            # against the prior pipeline's FE-P4/P5 (resource contention,
-            # listener cross-pollination, the queue-pileup symptom).
-            # Pass `job` so the gate can detect resume-of-same-rid and
-            # skip (otherwise circular deadlock — see helper docstring).
-            await _wait_for_prior_fe_completion(_current_job=job)
-            # 2026-05-12: stop-requested-during-gate-wait shortcut. The
-            # cancel handler at research.py:2208 flips status="stopped"
-            # and request_stop()s when a cancel matches gate_pending_job.
-            # Honor it here so we don't proceed to launch a browser for
-            # an already-cancelled job. Clear the stop flag so the next
-            # job runs clean.
+            # ⛔⛔ THE PRIOR-RUN WAIT STOOD HERE (wave 10.9, N8): the worker
+            # awaited `_wait_for_prior_fe_completion(_current_job=job)` before
+            # touching `running` or `current_job`, so a dequeued job was in
+            # limbo for as long as the PREVIOUS run's cloud tail took. The
+            # contention it named is not real — phases 4 and 5 run on Cloud Run
+            # — and on a shared computer it held one person's start behind
+            # another person's tail. The dequeue now flows straight through.
+            #
+            # ⚠ A stop that SURVIVED the reset above is still honoured: the
+            # reset is wrapped, so a reset that threw can leave the flag set,
+            # and starting a browser for a job somebody has already cancelled is
+            # the failure this branch was originally written against.
             try:
                 if _controls.is_stop():
-                    log(f"[worker] job {job.get('research_id', '')[:8]}… cancelled during gate wait — skipping run_pipeline", "INFO")
+                    log(f"[worker] job {job.get('research_id', '')[:8]}… carries a stop the reset did not clear — skipping run_pipeline", "INFO")
                     try:
                         _controls.reset()
                     except Exception:
@@ -74941,9 +75041,9 @@ async def run_server(port=8000):
                     # The listener bumped the pending counter when it
                     # claimed this job; we're skipping the running-flag
                     # flip below where the normal decrement lands. Drain
-                    # the counter here so a stop-during-gate-wait
-                    # doesn't leak a slot (would falsely defer all
-                    # subsequent submissions on this worker).
+                    # the counter here so this early drop doesn't leak a
+                    # slot (would falsely defer all subsequent
+                    # submissions on this worker).
                     _pending_enq_dec()
                     _job_queue.task_done()
                     # Keep the queue running but drop this job entirely.
@@ -74952,15 +75052,11 @@ async def run_server(port=8000):
                 pass
             _QUEUE_STATE["running"] = True
             _QUEUE_STATE["current_job"] = job
-            # Listener-replay counter decrement (Bug B fix). Tied to
-            # the running-flag flip rather than the earlier
-            # `_job_queue.get()` because `_wait_for_prior_fe_completion`
-            # above can suspend the coroutine for the full
-            # BE_PHASES_TIMEOUT_SEC window; decrementing at get() would
-            # let the gate at research.py:~4106 look idle (counter=0,
-            # qsize=0, running still False) for minutes while this
-            # worker is occupied waiting on FE-P5. Setting running=True
-            # FIRST then dec'ing closes that window.
+            # Listener-replay counter decrement (Bug B fix). Tied to the
+            # running-flag flip rather than the earlier `_job_queue.get()`:
+            # decrementing at get() would let the listener's idle gate see
+            # counter=0, qsize=0 and running still False in the window before
+            # the flip. Setting running=True FIRST then dec'ing closes it.
             _pending_enq_dec()
             # Multi-worker claim sentinel. Written here (at dequeue, the
             # earliest point we own the job) so a sibling worker booting
@@ -75153,12 +75249,6 @@ async def run_server(port=8000):
                 actual_status = flip_outcome[len("skipped("):-1]
                 if actual_status in BAIL_STATUSES:
                     should_run = False
-                    # 2026-05-11: flag bail as errored so the queue gate
-                    # short-circuits on the next dequeue. Without this,
-                    # a bail on paused_backend_restart* (which is NOT in
-                    # the gate's terminal status set) would wedge the
-                    # next gate for the full 4200s fallback.
-                    _QUEUE_STATE["_errored"] = True
                     log(f"[worker] Bailing on job — actual_status={actual_status} (terminal/recovery), skipping run_pipeline to spare sibling browsers", "INFO")
                 else:
                     log(f"[worker] Proceeding despite skipped flip — actual_status={actual_status} is active (FE pre-flipped or normal mid-run resume)", "INFO")
@@ -75239,16 +75329,9 @@ async def run_server(port=8000):
                         "status": "stopped_by_watchdog",
                         "summary": f"Stopped — pipeline exceeded {hours}h ceiling",
                     })
-                # 2026-05-11: error path — daemon-restart will reset
-                # _QUEUE_STATE anyway, but flag for completeness.
-                _QUEUE_STATE["_errored"] = True
                 _schedule_server_exit("worker-watchdog")
             except Exception as e:
                 log(f"Pipeline job error: {e}", "ERROR")
-                # 2026-05-11: error path — flag so the next dequeue's
-                # gate doesn't block waiting for FE-P5 on a run that
-                # will never reach it.
-                _QUEUE_STATE["_errored"] = True
             finally:
                 # Capture before clearing — `current_job` is the job that
                 # just finished. We need its uid+rid to clear stale queue
@@ -75269,35 +75352,13 @@ async def run_server(port=8000):
                 # too via _schedule_server_exit at research.py:_schedule_server_exit
                 # 2026-05-22).
                 _clear_current_run_id_best_effort("job-finally")
-                # 2026-05-11: record what the next dequeue's gate needs.
-                # last_be_done_at=0 on error/watchdog paths short-circuits
-                # the gate (since FE-P5 will never write "completed").
-                _errored = _QUEUE_STATE.pop("_errored", False)
-                # 2026-05-15: skip gate-state writes if a hard_reset is
-                # in progress. Without this guard, a worker finishing
-                # within hard_reset's exit window resurrects the wedged
-                # prior-run pointer the user just clicked Reset Backend
-                # to escape. The lock acquisition makes the check-and-act
-                # atomic w.r.t. hard_reset's clear+persist (research.py:
-                # ~1920) — without the lock, a thread schedule between
-                # our flag-read and our state-write lets hard_reset's
-                # clear land BEFORE our write, and our write resurrects
-                # the uid_X we should be discarding.
-                _hr_lock = _QUEUE_STATE.get("_hard_reset_lock")
-                if _hr_lock is not None:
-                    with _hr_lock:
-                        if not _QUEUE_STATE.get("_hard_reset_in_progress"):
-                            _QUEUE_STATE["last_completed_uid"] = completed.get("uid")
-                            _QUEUE_STATE["last_completed_rid"] = completed.get("research_id")
-                            _QUEUE_STATE["last_be_done_at"] = 0 if _errored else int(time.time() * 1000)
-                else:
-                    # Lock not initialised yet (impossible at runtime: the
-                    # worker only runs inside run_server, which sets up
-                    # the lock at research.py:~24058 before launching the
-                    # worker — kept as belt-and-braces).
-                    _QUEUE_STATE["last_completed_uid"] = completed.get("uid")
-                    _QUEUE_STATE["last_completed_rid"] = completed.get("research_id")
-                    _QUEUE_STATE["last_be_done_at"] = 0 if _errored else int(time.time() * 1000)
+                # ⛔ THE PRIOR-RUN POINTER WAS WRITTEN HERE (wave 10.9, N8):
+                # the just-finished run's uid, rid and finish time, for the next
+                # dequeue's gate to wait on — with a hard-reset lock around it
+                # so a worker finishing inside Reset Backend's exit window could
+                # not resurrect the wedge the person had just clicked to escape.
+                # Nothing waits on another run any more, so none of it is
+                # recorded and the `_errored` flag that fed it is gone too.
                 _job_queue.task_done()
                 # Clear the just-finished job's queue tracking fields from
                 # Firestore. `_flip_queued_to_ongoing` already deletes
@@ -75635,106 +75696,29 @@ async def run_server(port=8000):
     # Track D: device identity loads via load_device_id() / the OS
     # keystore. No legacy researchToken to fetch here — if init_firebase
     # already failed, the user needs to run --pair first.
-    # 2026-05-11: hoist queue-gate state rehydration above worker
-    # creation. The full disk-restore block at the bottom of serve
-    # (rehydrates pending + current_job) runs much later, after the
-    # Firestore start listener has already enqueued docs. If the
-    # worker had been created first, it could dequeue a Firestore-
-    # rehydrated job and call _wait_for_prior_fe_completion() with
-    # fresh-init _QUEUE_STATE (last_completed_uid=None → gate skips)
-    # BEFORE the disk snapshot's gate sub-object lands. That'd race
-    # the first post-restart pipeline against the previous run's
-    # in-flight FE-P5. Pure dict mutation here — no I/O dependency on
-    # the later block.
-    try:
-        if _pending_queue_path.exists():
-            _snap = json.loads(_pending_queue_path.read_text(encoding="utf-8"))
-            _gate = _snap.get("gate") or {}
-            _gate_uid = _gate.get("last_completed_uid")
-            _gate_rid = _gate.get("last_completed_rid")
-            if _gate_uid and _gate_rid:
-                # Orphan detection — three cases get treated as terminal so
-                # the gate doesn't wedge the next submission:
-                #   (a) Prior research doc DELETED (user purged it from
-                #       /researches → snap.exists False).
-                #   (b) Prior status is non-terminal ("queued"/"ongoing")
-                #       → BE crashed mid-run; without a worker to
-                #       advance it, the status never becomes terminal.
-                #   (c) Read failed entirely (network, transient denial)
-                #       → safer to release than wedge for 70 min.
-                # In every case we drop the gate-state IN-MEMORY *and* on
-                # disk; otherwise the next BE restart's rehydrate re-loads
-                # the same zombie pointer and the wedge re-engages.
-                _is_orphan = False
-                _orphan_reason = ""
-                if _firebase_db:
-                    try:
-                        _prior_snap = _firebase_db.collection("users") \
-                            .document(_gate_uid).collection("researches") \
-                            .document(_gate_rid).get()
-                        if not _prior_snap.exists:
-                            _is_orphan = True
-                            _orphan_reason = "doc deleted"
-                        else:
-                            _prior_status = (_prior_snap.to_dict() or {}).get("status", "")
-                            # Terminal-non-success statuses also qualify as
-                            # orphan: a prior run that errored / stopped /
-                            # was watchdog-killed never reaches FE-P5
-                            # (Phase 4 + 5 only run on a clean BE finish),
-                            # so the queue-gate's wait-for-prior-FE-P5
-                            # would block forever (BE_PHASES_TIMEOUT_SEC =
-                            # 4200s fallback). Treat them like queued/
-                            # ongoing — clear the gate so the next run
-                            # can dequeue. Pre-fix the gate wedged every
-                            # new submission with "waiting for prior run
-                            # … FE-P5 completion" for 70 minutes whenever
-                            # the prior run hit any failure path.
-                            if _prior_status in (
-                                "queued", "ongoing",
-                                "error", "errored", "stopped",
-                            ):
-                                _is_orphan = True
-                                _orphan_reason = f"status={_prior_status}"
-                    except Exception as _orphan_check_err:
-                        log(f"[queue-gate] orphan-check read failed — treating as orphan: {_orphan_check_err}", "DEBUG")
-                        _is_orphan = True
-                        _orphan_reason = "read failed"
-                if _is_orphan:
-                    log(f"[queue-gate] prior-run {_gate_rid[:8]}… orphaned ({_orphan_reason}) — clearing gate state")
-                    # Best-effort status flip (will silently 403 for legacy
-                    # research docs without a deviceId field, since
-                    # deviceUpdatingFor requires resource.data.deviceId match;
-                    # don't depend on it).
-                    try:
-                        _update_research_doc(_gate_uid, _gate_rid, {
-                            "status": "stopped",
-                            "lastError": "Backend restarted before this run reached completion. Resubmit to retry.",
-                        })
-                    except Exception:
-                        pass
-                    # Drop gate state both in memory AND on disk so next
-                    # restart doesn't re-engage the wedge.
-                    _QUEUE_STATE["last_completed_uid"] = None
-                    _QUEUE_STATE["last_completed_rid"] = None
-                    _QUEUE_STATE["last_be_done_at"] = 0
-                    try:
-                        _clean = {**_snap, "gate": {
-                            "last_completed_uid": None,
-                            "last_completed_rid": None,
-                            "last_be_done_at": 0,
-                        }}
-                        _tmp = _pending_queue_path.with_suffix(".json.tmp")
-                        _tmp.write_text(json.dumps(_clean, indent=2), encoding="utf-8")
-                        os.replace(str(_tmp), str(_pending_queue_path))
-                    except Exception as _persist_err:
-                        log(f"[queue-gate] orphan-clear persist failed (continuing): {_persist_err}", "WARN")
-                else:
-                    _QUEUE_STATE["last_completed_uid"] = _gate_uid
-                    _QUEUE_STATE["last_completed_rid"] = _gate_rid
-                    _QUEUE_STATE["last_be_done_at"] = int(_gate.get("last_be_done_at") or 0)
-                    log(f"[queue-gate] pre-worker rehydrate: prior-run {_gate_rid[:8]}…")
-    except Exception as _e:
-        log(f"[queue-gate] pre-worker rehydrate failed (non-fatal): {_e}", "WARN")
+    # ⛔⛔ THE BOOT ORPHAN BLOCK STOOD HERE AND IS GONE (wave 10.9, N8/542-4).
+    # It re-loaded the queue gate's prior-run pointer from the disk snapshot
+    # before the worker started, read that run's research document, and — when
+    # the status was anything it could not wait on — STAMPED IT:
+    #
+    #     status: "stopped",
+    #     lastError: "Backend restarted before this run reached completion.
+    #                 Resubmit to retry."
+    #
+    # ⛔ THAT SENTENCE LANDED ON HANDED-OFF RUNS. After `beDone` the run is
+    # CLOUD-OWNED and deliberately stays "ongoing" for the whole of phases 4
+    # and 5, which Cloud Run finishes with no worker awake — and "ongoing" was
+    # in this block's orphan list. So every restart during a cloud tail told the
+    # person their run had died, over a run that was mid-upload, and offered
+    # them a resubmit; #542's report is exactly that screen.
+    #
+    # ⛔ AND IT RELABELLED FAILURES. "errored" was in the same list, so an
+    # errored run came back from the next restart reading "stopped" with a
+    # restart blamed for it — the cause overwritten by the sweep that found it.
+    #
+    # The gate it fed is gone, and a run's terminal status belongs to whoever
+    # actually ran it. `_rehydrate_ongoing_for_tree` (which sees the same runs,
+    # by their status rather than by a pointer) re-fires the cloud kick instead.
 
     worker_task = asyncio.create_task(_job_worker())
     log("Job worker started (direct)")
@@ -75858,7 +75842,6 @@ async def run_server(port=8000):
                         _idle = (
                             not _QUEUE_STATE.get("running")
                             and _job_queue.qsize() == 0
-                            and not _QUEUE_STATE.get("gate_pending_job")
                             and not _exit_scheduled
                         )
                         if _idle and _pending_enq_read() > 0:
@@ -76057,17 +76040,10 @@ async def run_server(port=8000):
         try:
             if _pending_queue_path.exists():
                 snap = json.loads(_pending_queue_path.read_text(encoding="utf-8"))
-                # 2026-05-11: rehydrate queue-gate state so the worker
-                # gate respects a still-in-flight FE-P5 across daemon
-                # restart. The "gate" key was added 2026-05-11; legacy
-                # snapshots without it default to empty (gate becomes a
-                # no-op for that one boot — same as fresh start).
-                _gate = snap.get("gate") or {}
-                if _gate.get("last_completed_uid"):
-                    _QUEUE_STATE["last_completed_uid"] = _gate.get("last_completed_uid")
-                    _QUEUE_STATE["last_completed_rid"] = _gate.get("last_completed_rid")
-                    _QUEUE_STATE["last_be_done_at"] = int(_gate.get("last_be_done_at") or 0)
-                    log(f"[queue-gate] rehydrated prior-run state for {(_gate.get('last_completed_rid') or '')[:8]}…")
+                # ⛔ The snapshot's "gate" sub-object was read back here so the
+                # queue gate could resume waiting on the previous run's cloud
+                # tail across a restart (wave 10.9, N8). A snapshot written by
+                # an older build still carries the key; nothing reads it.
                 # Seed dedupe with anything Firestore-rehydration touched
                 # (ongoing-status only — queued docs are handled by the
                 # listener, not rehydration), then add what's currently

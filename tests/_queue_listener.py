@@ -174,9 +174,16 @@ class _Controls:
 class Listener:
     """One registered listener over one fake machine. `feed` hands it a doc."""
 
+    # ⛔ A `gate_pending` SLOT WAS ACCEPTED HERE AND IS GONE (wave 10.9, N8).
+    # It stood for the job a worker held while it waited on the PREVIOUS run's
+    # cloud tail; that wait, and the `_QUEUE_STATE["gate_pending_job"]` slot it
+    # registered itself in, no longer exist. A worker now sets `current_job` in
+    # the same breath as the dequeue, so `current_job` and the deque are the
+    # whole of what this process can be holding.
     def __init__(self, monkeypatch, tmp_path, *, owner="uid-owner",
                  queue_docs=None, research_docs=None, current_job=None,
-                 gate_pending=None, deque_jobs=None, real_terminal_check=False):
+                 deque_jobs=None, real_terminal_check=False,
+                 last_completed=None):
         box: dict = {}
         self.db = FakeDb(box, queue_docs, research_docs)
         self.writes: list = []
@@ -220,7 +227,13 @@ class Listener:
         monkeypatch.setattr(research, "_schedule_server_exit",
                             lambda reason, *a, **k: self.exits.append(reason))
         monkeypatch.setitem(research._QUEUE_STATE, "current_job", current_job)
-        monkeypatch.setitem(research._QUEUE_STATE, "gate_pending_job", gate_pending)
+        # ⭐ `last_completed` PUTS THE RETIRED QUEUE GATE'S POINTER BACK, as a
+        # test of the listener's INDIFFERENCE to it. The three keys are the ones
+        # `_wait_for_prior_fe_completion` was fed from; a listener that still
+        # predicted a gate from them would answer a submission differently
+        # depending on what somebody else's run was doing (wave 10.9, N8).
+        for _k, _v in (last_completed or {}).items():
+            monkeypatch.setitem(research._QUEUE_STATE, _k, _v)
         monkeypatch.setitem(research._QUEUE_STATE, "recompute_fn", None)
         monkeypatch.setitem(research._QUEUE_STATE, "recompute_deferred_fn", None)
         research.start_firestore_start_listener(self.jobs, _Loop())

@@ -25,10 +25,7 @@ and that folder's last line is `Browser closed`, one second after it.
 drops `cloud.log` into a sealed folder. The collector walks `folder.rglob("*")`,
 so a new file rides the support bundle with no collector change at all.
 """
-import io
 import json
-import time
-from pathlib import Path
 
 import pytest
 
@@ -181,56 +178,85 @@ def test_an_unreadable_meta_is_skipped_rather_than_matched(runs):
 
 
 # ══ 3. the caller, because a helper is not a consumer ══════════════════
+#: A 200 from a route that RAN the chain. ⛔ The `p5` key is load-bearing, not
+#: decoration: a 200 carrying no `p5` is the route saying it answered phase 4
+#: and stopped, and the drive asks again for phase 5 alone. `"{}"` would make
+#: every "the route ran it" case below a follow-up case instead.
+_RAN = '{"p5": {"ok": true}}'
+#: The same 200 the already-completed short-circuit and the GCS branch send.
+_P4_ONLY = '{"already_completed": true, "youtube_url": "https://y/1"}'
+
+
+def _drive(**kw):
+    """Run the real drive with fake effects. Returns (verdict, record).
+
+    ⛔⛔ THE FOUR TESTS THAT STOOD HERE READ `_drive_once`'s PARSE TREE — which
+    branch came first, which name appeared inside which handler — and wave 10.9
+    turned the single POST into a retry ladder (542-5), so every one of them was
+    asking about a shape that no longer exists. They are rebuilt here as
+    EXECUTIONS: the ladder, the classification, the sentences and the record all
+    run, and a mutant that neuters any of them has to survive a real call."""
+    calls = {"posts": [], "notes": [], "failures": [], "slept": [], "p5only": []}
+    answers = list(kw.get("answers") or [])
+
+    def _post(_token, _p5_only=False):
+        calls["posts"].append(_token)
+        calls["p5only"].append(_p5_only)
+        a = answers[min(len(calls["posts"]), len(answers)) - 1] if answers else (200, '{"p5":{}}')
+        if isinstance(a, BaseException):
+            raise a
+        return a
+
+    tokens = list(kw.get("tokens") or ["tok"])
+
+    def _mint():
+        return tokens[min(len(calls["posts"]), len(tokens) - 1)]
+
+    verdict = research._drive_cloud_phases(
+        "uid-1", "rid-abcdef01",
+        post=_post,
+        mint_token=kw.get("mint_token") or _mint,
+        sleep=calls["slept"].append,
+        note=calls["notes"].append,
+        record_failure=calls["failures"].append,
+    )
+    return verdict, calls
+
+
 def test_the_drive_records_every_outcome_it_can_have():
-    """⛔⛔ HELPER-PINNED, CONSUMER-NOT is this project's commonest miss. The
-    three outcomes are dispatched, refused, and never-arrived, and the refusal
-    is the one nothing anywhere else records."""
-    import ast
-    import inspect
-    import textwrap
-    src = textwrap.dedent(inspect.getsource(research._post_fe_p4p5_trigger))
-    drive = next(n for n in ast.walk(ast.parse(src))
-                 if isinstance(n, ast.FunctionDef) and n.name == "_drive_once")
-    tries = [n for n in ast.walk(drive) if isinstance(n, ast.Try)]
-    assert tries, "_drive_once no longer guards the POST"
-    t = tries[0]
+    """⛔⛔ HELPER-PINNED, CONSUMER-NOT is this project's commonest miss. Every
+    outcome the drive can reach leaves a line in the run's own folder — the
+    refusal above all, because it is the one the web deliberately does not
+    write (task #524)."""
+    for answers, expected in (
+        ([(200, _RAN)], "ran"),
+        ([(202, '{"in_flight":true}')], "claimed"),
+        ([(400, "invalid json")], "refused"),
+    ):
+        verdict, calls = _drive(answers=answers)
+        assert verdict == expected, (expected, verdict)
+        assert calls["notes"], f"the {expected} outcome left no record"
+    # and the transport failures, both directions
+    import requests as rq
+    verdict, calls = _drive(answers=[rq.exceptions.ConnectTimeout("no route")])
+    assert verdict == "retry"
+    assert calls["notes"], "a dispatch that never reached the cloud leaves no record"
 
-    def _notes(stmts):
-        return [n for s in stmts for n in ast.walk(s)
-                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-                and n.func.id == "_note_cloud_handoff"]
 
-    # ⛔ COUNTING CALL SITES WAS THE WRONG MEASURE, and my first version of this
-    # test said 3 and found 2. The 2xx and the refusal SHARE one call after the
-    # branch — which is better, not worse: a single writer cannot record one
-    # outcome and forget the other. What has to be true is that both branches
-    # reach it, and that the exception path has its own.
-    status_ifs = [n for n in ast.walk(t) if isinstance(n, ast.If)
-                  and any(isinstance(c, ast.Attribute) and c.attr == "status_code"
-                          for c in ast.walk(n.test))]
-    assert status_ifs, "the drive no longer branches on the response status"
-    branch = status_ifs[0]
-    assert branch.body and branch.orelse, "the refusal branch is gone"
-    # ⛔⛔ THE RECORD MUST BE UNCONDITIONAL, AND A MUTANT PROVED THIS TEST COULD
-    # NOT SEE OTHERWISE. Asking only "is there a call after the branch" is
-    # satisfied by `if status in (200, 202): _note_cloud_handoff(...)` placed
-    # after it — which records the success and drops the refusal, i.e. removes
-    # the whole of task #524 while leaving every name this test looks for in
-    # place. So the call has to be a DIRECT statement of the try body, reached
-    # however the branch above resolved.
-    after = [s for s in t.body if getattr(s, "lineno", 0) > (branch.end_lineno or 0)]
-    unconditional = [
-        s for s in after
-        if isinstance(s, ast.Expr) and isinstance(s.value, ast.Call)
-        and isinstance(s.value.func, ast.Name)
-        and s.value.func.id == "_note_cloud_handoff"
-    ]
-    assert unconditional, (
-        "the hand-off record is either missing or guarded by a condition — the "
-        "refusal is the outcome the web deliberately does not write, and "
-        "recording only the successes is the whole of task #524 undone")
-    assert _notes(t.handlers[0].body if t.handlers else []), (
-        "a dispatch that never reached the cloud leaves no record")
+def test_only_a_refusal_and_an_exhausted_ladder_are_written_to_the_run():
+    """⛔⛔ THE RECORD ON THE DOCUMENT IS NOT THE RECORD IN THE FOLDER. A 200, a
+    202 and a mid-flight cut all mean somebody is running the chain — writing
+    phase 4 "errored" over any of them would paint a red tile on a healthy run.
+    Only an outright refusal, or a ladder that ran out with nothing landed, is
+    the machine's to report."""
+    import requests as rq
+    for answers in ([(200, _RAN)], [(202, "{}")],
+                    [rq.exceptions.ReadTimeout("cut at 300s")]):
+        _verdict, calls = _drive(answers=answers)
+        assert calls["failures"] == [], f"{answers} was written to the run as a failure"
+    _verdict, calls = _drive(answers=[(400, "invalid json")])
+    assert len(calls["failures"]) == 1, "a refusal left nothing the chat can show"
+    assert "refused" in calls["failures"][0]
 
 
 def test_a_connection_cut_mid_flight_is_not_reported_as_never_arriving():
@@ -241,22 +267,22 @@ def test_a_connection_cut_mid_flight_is_not_reported_as_never_arriving():
     than five minutes, and the exception branch wrote "never reached the cloud …
     still on phase 3" into the run's permanent record on runs that SUCCEEDED.
     A lying diagnostic is worse than none, and this file rides the support
-    bundle."""
-    import ast
-    import inspect
-    import textwrap
-    src = textwrap.dedent(inspect.getsource(research._post_fe_p4p5_trigger))
-    drive = next(n for n in ast.walk(ast.parse(src))
-                 if isinstance(n, ast.FunctionDef) and n.name == "_drive_once")
-    handler = next(n for n in ast.walk(drive) if isinstance(n, ast.Try)).handlers[0]
-    # the branch must ASK how long the connection lasted
-    names = {n.id for n in ast.walk(handler) if isinstance(n, ast.Name)}
-    assert "_DRIVE_SENT_AFTER_SEC" in names, (
-        "the exception branch cannot tell a connection that never opened from "
-        "one that was cut after the cloud had the request")
-    body = ast.dump(handler)
-    assert "never reached the cloud" in body, "the genuine never-arrived case lost its sentence"
-    assert "may be finishing it" in body, "the cut-mid-flight case has no sentence of its own"
+    bundle.
+
+    ⛔ AND IT IS NOT RETRIED. The cloud has the request; asking again would at
+    best take a 202 off the claim the first call already made."""
+    import requests as rq
+    verdict, calls = _drive(answers=[rq.exceptions.ReadTimeout("severed")])
+    assert verdict == "cut"
+    assert len(calls["posts"]) == 1, "a request the cloud received was sent twice"
+    said = " ".join(calls["notes"])
+    assert "may be finishing it" in said
+    assert "never reached the cloud" not in said, (
+        "a socket cut after the cloud had the request was filed as one that "
+        "never left this machine")
+    # ⭐ and the genuine never-arrived case keeps its own sentence
+    _v, calls = _drive(answers=[rq.exceptions.ConnectTimeout("no route")] * 5)
+    assert "never reached the cloud" in " ".join(calls["notes"])
 
 
 def test_the_classification_is_EXECUTED_not_read():
@@ -326,26 +352,199 @@ def test_the_exception_CLASS_decides_whether_the_request_ever_left():
 
     ⛔⛔ AND ROUND THREE CORRECTED THE CORRECTION. A bare `ConnectionError` does
     NOT name it — urllib3 raises the same class for a socket cut mid-flight, so
-    routing every one of them to "never left" re-broke the majority path. The
-    branch must consult the classifier AND the classifier must leave the
-    ambiguous class to the clock; `test_the_classification_is_EXECUTED_not_read`
-    is where that second half is measured."""
-    import ast
-    import inspect
-    import textwrap
-    src = textwrap.dedent(inspect.getsource(research._post_fe_p4p5_trigger))
-    drive = next(n for n in ast.walk(ast.parse(src))
-                 if isinstance(n, ast.FunctionDef) and n.name == "_drive_once")
-    handler = next(n for n in ast.walk(drive) if isinstance(n, ast.Try)).handlers[0]
-    dumped = ast.dump(handler)
-    assert "_dispatch_never_left" in dumped, (
-        "the branch no longer consults the classifier — elapsed time alone "
-        "cannot tell a request that never left from one the cloud received")
-    # and the verdict must GATE the optimistic sentence, not merely appear
-    ifs = [n for n in ast.walk(handler) if isinstance(n, ast.If)
-           and any(isinstance(x, ast.Name) and x.id == "_never_left"
-                   for x in ast.walk(n.test))]
-    assert ifs, "the class verdict is computed and then never branched on"
+    routing every one of them to "never left" re-broke the majority path.
+
+    ⭐ EXECUTED THROUGH THE VERDICT, not read off the drive's parse tree: the
+    classifier has to be what decides, and the only proof of that is two
+    exception classes taking two different branches through the real function."""
+    import requests as rq
+    ex = rq.exceptions
+    # never left → retried
+    assert research._dispatch_verdict(exc=ex.ConnectTimeout("t"), elapsed_sec=120) == "retry"
+    assert research._dispatch_verdict(exc=ex.ProxyError("p"), elapsed_sec=3600) == "retry"
+    # received → not retried
+    assert research._dispatch_verdict(exc=ex.ReadTimeout("r"), elapsed_sec=1) == "cut"
+    _real = ex.ConnectionError(__import__("urllib3").exceptions.ProtocolError(
+        "Connection aborted.", ConnectionResetError(54, "Connection reset by peer")))
+    assert research._dispatch_verdict(exc=_real, elapsed_sec=300) == "cut"
+    # and the drive acts on the difference: one is asked again, the other is not
+    _v, never = _drive(answers=[ex.ConnectTimeout("no route"), (200, _RAN)])
+    assert len(never["posts"]) == 2, "a request that never left was not retried"
+    _v, cut = _drive(answers=[ex.ReadTimeout("severed"), (200, _RAN)])
+    assert len(cut["posts"]) == 1, "a request the cloud received was sent again"
+
+
+def test_the_ladder_retries_what_can_clear_and_refuses_what_cannot():
+    """⛔⛔ THE WHOLE OF 542-5. A single POST meant no token, a POST that never
+    left, or one 5xx delivered nothing at all: no video, no Super Research, no
+    Doc, no email, and a run reading "ongoing" until somebody opened its chat.
+
+    ⛔ 401 AND 403 ARE THE ONLY 4xx RETRIED, and they are retried with a FRESH
+    token — a stale ID token and a claim-propagation race are exactly what they
+    look like. A 400 cannot clear, and repeating it only adds load."""
+    # a 5xx clears on the second ask
+    verdict, calls = _drive(answers=[(503, "try again"), (200, _RAN)])
+    assert verdict == "ran" and len(calls["posts"]) == 2
+    assert calls["slept"], "the retry did not back off"
+    # a 401 is retried, with a token minted again for the second attempt
+    verdict, calls = _drive(answers=[(401, "unauthorized"), (200, _RAN)],
+                            tokens=["stale", "fresh"])
+    assert verdict == "ran"
+    assert calls["posts"] == ["stale", "fresh"], (
+        "the retry re-used the token the route had just rejected")
+    # a 403 likewise
+    verdict, calls = _drive(answers=[(403, "device not authorized"), (200, _RAN)])
+    assert verdict == "ran" and len(calls["posts"]) == 2
+    # ⛔ and a refusal stops at once
+    verdict, calls = _drive(answers=[(400, "invalid json"), (200, _RAN)])
+    assert verdict == "refused"
+    assert len(calls["posts"]) == 1, "a refusal on the merits was asked again"
+    assert calls["slept"] == []
+
+
+def test_a_route_that_answered_phase_4_and_stopped_is_asked_for_phase_5():
+    """⛔⛔ THE ROUTE SAYS SO IN ITS OWN WORDS AND THE MACHINE WAS NOT LISTENING
+    (wave 10.9, 542-5). `casRouteP4`'s already-completed short-circuit answers
+    200 with the video link and NO `p5` key, and its comment names the contract:
+    "the browser reads exactly that as 'ask for phase 5 alone'". The GCS-link
+    branch answers the same way.
+
+    That is precisely the shape a RE-KICK lands on — the boot rehydrate and the
+    Resume both fire at runs whose phase 4 may already be done — so the machine
+    took a 200, called the chain finished, and left phase 5 unrun: no Super
+    Research, no Doc, no email, with nobody awake to notice. #542's symptom,
+    reached through the fix for it."""
+    verdict, calls = _drive(answers=[(200, _P4_ONLY), (200, _RAN)])
+    assert verdict == "ran"
+    assert calls["p5only"] == [False, True], (
+        "the route answered phase 4 without phase 5 and the machine stopped")
+    said = " ".join(calls["notes"])
+    assert "asking it for phase 5 alone" in said
+    assert calls["failures"] == []
+
+
+def test_the_follow_up_is_asked_once_and_gets_its_own_budget():
+    """⛔ ONCE: the `p5_only` answer always carries `p5`, but a route that
+    somehow answered without it must not put the drive in a loop.
+
+    ⭐ AND ITS OWN BUDGET, because phase 5 is the rest of the run, not a
+    postscript to the attempts phase 4 happened to use up."""
+    # the follow-up itself answers without p5 — it is not asked a third time
+    verdict, calls = _drive(answers=[(200, _P4_ONLY), (200, _P4_ONLY)])
+    assert verdict == "ran"
+    assert calls["p5only"] == [False, True]
+    # phase 4 burns most of the ladder; phase 5 still gets a full one
+    verdict, calls = _drive(answers=[(503, "x"), (503, "x"), (503, "x"), (503, "x"),
+                                     (200, _P4_ONLY), (503, "x"), (200, _RAN)])
+    assert verdict == "ran"
+    assert calls["p5only"] == [False] * 5 + [True, True]
+
+
+def test_the_real_post_asks_for_phase_5_alone_when_told_to(monkeypatch):
+    """⛔⛔ HELPER-PINNED, CONSUMER-NOT — the harness caught this one too. Every
+    test above hands the drive its OWN `post`, so the body the REAL closure
+    builds was never executed: dropping `p5_only` from it left them all green
+    while the follow-up asked the route to run phase 4 again, got the same
+    answer, and delivered nothing.
+
+    ⭐ It is also where the timeout PAIR is executed rather than read. A scalar
+    there sets the connect timeout to 3600 too, and a black-holed SYN then fails
+    long after the classifier can tell it from a severance."""
+    import threading
+    import requests
+    sent = []
+    done = threading.Event()
+
+    class _Resp:
+        status_code = 200
+        text = _RAN
+
+    monkeypatch.setattr(requests, "post",
+                        lambda url, **kw: (sent.append((url, kw)) or _Resp()))
+
+    def _spy(uid, rid, *, post, mint_token, sleep, note, record_failure):
+        post("tok", False)
+        post("tok", True)
+        done.set()
+        return "ran"
+
+    monkeypatch.setattr(research, "_drive_cloud_phases", _spy)
+    monkeypatch.setattr(research, "_fire_fe_p4_trigger", lambda u, r: True)
+    monkeypatch.setattr(research, "_fe_handoff_begin", lambda drive=False: None)
+    monkeypatch.setattr(research, "_fe_handoff_end", lambda drive=False: None)
+    monkeypatch.setattr(research, "log", lambda *a, **k: None)
+
+    research._post_fe_p4p5_trigger("uid-1", "rid-abcdef01")
+    assert done.wait(5), "the dispatch thread never ran"
+    assert len(sent) == 2, sent
+    first, follow = sent[0][1]["json"], sent[1][1]["json"]
+    assert first["research_id"] == "rid-abcdef01" and first["ownerUid"] == "uid-1"
+    assert "p5_only" not in first, (
+        "the first ask carried p5_only — phase 4 would never run")
+    assert follow["p5_only"] is True, (
+        "the follow-up asked for the whole chain again, so the route repeats "
+        "the phase-4 path and answers the same way")
+    assert follow["research_id"] == "rid-abcdef01" and follow["ownerUid"] == "uid-1"
+    assert sent[0][1]["timeout"] == (10, 3600)
+    assert sent[0][0].endswith("/api/uploadYouTube")
+
+
+def test_an_unreadable_answer_is_not_a_missing_phase_5():
+    """⛔ GUESSING HERE ASKS FOR A PHASE 5 THAT MAY BE MID-FLIGHT. The browser
+    reads an unparseable answer as a transport failure and does not follow up;
+    this is the same rule. The route streams keep-alive spaces before its JSON,
+    so an answer of spaces alone parses to nothing."""
+    for body in ("", "   ", "not json at all", "[1,2,3]", '"a string"'):
+        assert research._answered_without_phase_5(body) is False, body
+    # ⭐ ACCEPT POLARITY, including the leading keep-alive spaces
+    assert research._answered_without_phase_5('   {"already_completed": true}') is True
+    assert research._answered_without_phase_5('   {"p5": null}') is False
+
+
+def test_a_missing_token_is_retried_rather_than_returning_in_silence():
+    """⛔⛔ `_fresh_user_mode_id_token()` RETURNING None USED TO END THE WHOLE
+    HAND-OFF: one INFO line, the marker, and nothing else ever. A refresh that
+    blips — DNS, a five-second outage — cost the run its last two phases."""
+    minted = []
+
+    def _mint():
+        minted.append(1)
+        return None if len(minted) < 3 else "tok"
+
+    verdict, calls = _drive(answers=[(200, _RAN)], mint_token=_mint)
+    assert verdict == "ran"
+    assert len(minted) == 3, "the token was minted once and given up on"
+    assert len(calls["posts"]) == 1
+
+    # ⛔ and when it never comes back, the run is told
+    verdict, calls = _drive(answers=[(200, _RAN)], mint_token=lambda: None)
+    assert verdict == "retry"
+    assert calls["posts"] == []
+    assert len(calls["failures"]) == 1
+    assert "never reached the cloud" in calls["failures"][0]
+
+
+def test_the_ladder_is_bounded_and_actually_backs_off():
+    """⛔ A retry with no ceiling is a thread that never ends and a respawn that
+    never happens — `_fe_handoff_begin(drive=True)` holds the process open for
+    as long as this runs.
+
+    ⛔⛔ AND THE DELAYS ARE MEASURED AGAINST NUMBERS, NOT AGAINST THE CONSTANT.
+    The first version of this asserted `slept == list(_DRIVE_BACKOFF_SEC)`,
+    which is a tautology: a mutant that zeroed every delay changed both sides
+    and survived. Five requests fired back to back at a route that is
+    restarting is not a retry ladder."""
+    import requests as rq
+    verdict, calls = _drive(answers=[rq.exceptions.ConnectTimeout("no route")] * 20)
+    assert verdict == "retry"
+    assert len(calls["posts"]) == len(research._DRIVE_BACKOFF_SEC) + 1
+    assert len(calls["slept"]) == len(research._DRIVE_BACKOFF_SEC)
+    assert all(d >= 1 for d in calls["slept"]), (
+        f"the ladder does not pause between attempts: {calls['slept']}")
+    assert calls["slept"] == sorted(calls["slept"]), "the backoff does not back off"
+    assert 30 <= sum(calls["slept"]) < 600, (
+        "the ladder is either too short to outlast a route restart or longer "
+        "than anything worth waiting for")
 
 
 def test_the_connect_phase_is_bounded_below_the_threshold():
@@ -367,11 +566,68 @@ def test_the_threshold_is_far_below_the_measured_severance():
     assert 1 <= research._DRIVE_SENT_AFTER_SEC <= 60
 
 
+def test_the_real_dispatch_wires_the_record_and_the_refusal(monkeypatch):
+    """⛔⛔ HELPER-PINNED, CONSUMER-NOT — and the harness caught it. Every test
+    above runs `_drive_cloud_phases` with its OWN `note` and `record_failure`,
+    so cutting either wire inside `_post_fe_p4p5_trigger` left all of them
+    green: the drive would record its refusals into a lambda that returns None,
+    which is #542's symptom exactly.
+
+    This runs the real dispatch and checks what the drive is actually handed."""
+    import threading
+    seen = {}
+    done = threading.Event()
+
+    def _spy(uid, rid, *, post, mint_token, sleep, note, record_failure):
+        seen["ids"] = (uid, rid)
+        note("a line for the run's own folder")
+        record_failure("because the cloud said no")
+        done.set()
+        return "refused"
+
+    recorded, noted = [], []
+    monkeypatch.setattr(research, "_drive_cloud_phases", _spy)
+    monkeypatch.setattr(research, "_fire_fe_p4_trigger", lambda u, r: True)
+    monkeypatch.setattr(research, "_fe_handoff_begin", lambda drive=False: None)
+    monkeypatch.setattr(research, "_fe_handoff_end", lambda drive=False: None)
+    monkeypatch.setattr(research, "_record_cloud_kick_refusal",
+                        lambda u, r, why: recorded.append((u, r, why)))
+    monkeypatch.setattr(research, "_note_cloud_handoff",
+                        lambda rid, line: noted.append((rid, line)))
+    monkeypatch.setattr(research, "log", lambda *a, **k: None)
+
+    assert research._post_fe_p4p5_trigger("uid-1", "rid-abcdef01") is True
+    assert done.wait(5), "the dispatch thread never ran"
+    assert seen["ids"] == ("uid-1", "rid-abcdef01")
+    assert recorded == [("uid-1", "rid-abcdef01", "because the cloud said no")], (
+        "the drive's refusal reached nothing the chat can read")
+    # ⛔ AND THE LINE GOES INTO THIS RUN'S OWN FOLDER, addressed by researchId —
+    # the whole point of `_note_cloud_handoff` over a bare `log()`.
+    assert noted and noted[0][0] == "rid-abcdef01"
+
+
 def test_the_refusal_line_says_what_happens_next():
     """⭐ A record nobody can act on is a log line with extra steps. The run is
-    recoverable — `needsFeTrigger` was written synchronously before the POST —
-    so the sentence says so rather than implying the run is lost."""
-    import inspect
-    src = inspect.getsource(research._post_fe_p4p5_trigger)
-    assert "still on phase 3 until" in src
-    assert "catch-up fires" in src
+    recoverable — `needsFeTrigger` was written before the POST, and opening the
+    chat re-kicks the route — so the sentence says so rather than implying the
+    run is lost."""
+    _v, calls = _drive(answers=[(400, "invalid json")])
+    said = " ".join(calls["notes"])
+    assert "opening the chat asks the route again" in said
+    assert calls["failures"] and "opening the chat asks the route again" in calls["failures"][0]
+
+
+def test_the_202_is_not_reported_as_a_dispatch():
+    """⛔⛔ IT WAS LOGGED "dispatched ✓" (wave 10.9, 542-S4). A 202 means ANOTHER
+    caller holds the claim — an open tab, or an earlier kick still running — so
+    this call did nothing at all, and the tick said it had. On a run that then
+    stalled, the one line the report rested on named the wrong party."""
+    verdict, calls = _drive(answers=[(202, '{"in_flight":true}')])
+    assert verdict == "claimed"
+    said = " ".join(calls["notes"])
+    assert "already claimed by another caller" in said
+    assert "dispatched" not in said, (
+        "a 202 is still being reported as this machine's dispatch")
+    # ⭐ ACCEPT POLARITY: a 200 IS this machine's dispatch and still says so.
+    _v, ran = _drive(answers=[(200, _RAN)])
+    assert "the route ran it" in " ".join(ran["notes"])

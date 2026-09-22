@@ -412,13 +412,15 @@ def test_the_device_owner_still_cancels_a_sharers_queued_run(tmp_path, monkeypat
 
 # ⛔ THE CANCEL GATE NOW READS ITS JOBS FROM `_jobs_held_locally`, shared with
 # the resume branch. Each slot it collects is where a job can be parked, and the
-# gate-pending and running checks that follow it have NO ownership clause of
-# their own — so a slot the helper forgets is a run another member can stop.
+# running check that follows it has NO ownership clause of its own — so a slot
+# the helper forgets is a run another member can stop. (A third slot,
+# `gate_pending_job`, retired with the queue gate in wave 10.9; a dequeued job
+# is `current_job` from the moment it leaves the queue.)
 
 _ALICES_JOB = {"research_id": RID, "uid": ALICE, "run_id": RUN}
 
 
-@pytest.mark.parametrize("slot", ["current_job", "gate_pending", "deque_jobs"])
+@pytest.mark.parametrize("slot", ["current_job", "deque_jobs"])
 def test_a_cancel_naming_a_run_held_here_for_another_person_is_refused(
         slot, tmp_path, monkeypatch):
     held = {slot: [dict(_ALICES_JOB)] if slot == "deque_jobs" else dict(_ALICES_JOB)}
@@ -431,10 +433,14 @@ def test_a_cancel_naming_a_run_held_here_for_another_person_is_refused(
         assert list(lis.jobs._queue) == [_ALICES_JOB]
 
 
-def test_a_person_still_cancels_their_own_run_in_the_gate_wait(tmp_path, monkeypatch):
-    """⭐ ACCEPT POLARITY for the gate above."""
+def test_a_person_still_cancels_their_own_run_this_process_holds(tmp_path, monkeypatch):
+    """⭐ ACCEPT POLARITY for the gate above.
+
+    ⛔ It used to name the `gate_pending` slot, which retired with the queue
+    gate (wave 10.9, N8). The slot is gone; the acceptance it measured is not,
+    so it moves to the slot that now holds a dequeued job."""
     lis = Listener(monkeypatch, tmp_path, owner=OWNER,
-                   gate_pending=dict(_ALICES_JOB)).feed(**_cancel(ALICE))
+                   current_job=dict(_ALICES_JOB)).feed(**_cancel(ALICE))
     assert lis.controls.stops == 1
     assert [w[:2] for w in lis.writes] == [(ALICE, RID)]
 
