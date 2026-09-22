@@ -8,19 +8,25 @@ Research bought again on each silent relaunch after a Chrome death (up to
 BROWSER_CRASH_MAX_RETRIES of them; a daemon restart resumes the same way), with
 the finished tile flipped back to "running".
 
-⭐ THE FIX HAS FOUR PARTS, AND EACH ONE IS EXECUTED HERE:
+⭐ THE FIX HAS FIVE PARTS, AND EACH ONE IS EXECUTED HERE:
   * `extract_and_record_agent` writes a durable completion record in the ONE
     branch that announces `complete` — driven end to end below;
   * every launch in `run_phase2` takes its agent back out of the record — driven
     below up to the moment the agent would open;
-  * `_p2_resume_plan` keeps an agent only with BOTH the record and its report;
-  * `_p2_announce_restored` re-ticks the kept agent's tile, which the resume's
-    full `phase_restart` has just re-seeded on the web.
+  * `_p2_resume_plan` keeps an agent only with BOTH the record and its report,
+    and hands back the text a fresh extraction would have returned;
+  * `_p2_announce_restored` re-ticks the kept agent's tile — with the sources,
+    sections and steps its own completion carried — which the resume's full
+    `phase_restart` has just re-seeded on the web;
+  * `_p2_run_with_resume` is the phase itself: plan → attempts → merge → safety
+    filter, driven below with a fake attempt runner.
 
-The wiring inside `run_pipeline` — a 5,000-line coroutine that cannot be driven
-here — is pinned by AST SHAPE, not by name: each statement must be a direct,
-unconditional child of the block it belongs to, in order, so `if False:` or a
-moved line fails the pin.
+⛔⛔ THAT LAST ONE USED TO BE NINETY LINES INSIDE `run_pipeline`, a 5,000-line
+coroutine nothing can drive, pinned only by AST SHAPE — and one added line
+reassigning the launch list or the kept results put every finished Deep Research
+back on the bill with this whole suite green. What is left in `run_pipeline` is
+one call, one `return`, and the promise that nothing stands between the phase
+and the off-topic sweep; those three are what the AST still checks.
 """
 import ast
 import asyncio
@@ -160,15 +166,17 @@ class _Browser:
 
 
 class _Runtime:
-    def __init__(self):
+    def __init__(self, snapshots=None):
         self.agent_findings = {}
-        self.agent_progress_snapshots = {}
+        self.agent_progress_snapshots = dict(snapshots or {})
+        self.restart_requested = False
 
 
 def _drive_the_extractor(monkeypatch, tmp_path, report, *, saved_ok=True,
-                         research_id="rid-1"):
+                         research_id="rid-1", snapshot=None):
     """The REAL `extract_and_record_agent`, with only the browser, the network
-    and Firestore stubbed."""
+    and Firestore stubbed. `snapshot` seeds the agent's live progress ring, the
+    way the pollers fill it while the agent works."""
     async def _extract(page, **kw):
         return report
 
@@ -181,7 +189,9 @@ def _drive_the_extractor(monkeypatch, tmp_path, report, *, saved_ok=True,
     async def _no_sleep(*a, **k):
         return None
 
-    monkeypatch.setattr(research, "_runtime", _Runtime(), raising=False)
+    monkeypatch.setattr(research, "_runtime",
+                        _Runtime({"chatgpt": snapshot} if snapshot else None),
+                        raising=False)
     monkeypatch.setattr(research, "extract_chatgpt_response", _extract)
     monkeypatch.setattr(research, "reject_off_topic_text", lambda text, *a, **k: text)
     monkeypatch.setattr(research, "_rehost_document_images", _rehost)
@@ -238,6 +248,43 @@ def test_a_report_with_no_research_anchor_is_not_recorded(monkeypatch, tmp_path)
     q, _res = _drive_the_extractor(monkeypatch, tmp_path, REPORT["chatgpt"],
                                    research_id=None)
     assert not (q / research._P2_AGENTS_DONE_FILE).exists()
+
+
+# ── what a kept agent hands back: the extraction's text, not the file's ───────
+
+OWN_LIST = ("## Battery prices\n\nPack prices fell by a fifth, reported at "
+            "https://bnef.example.com/packs in a note nobody has disputed, and "
+            "[the agency](https://iea.example.com/renewables) agreed with it.\n\n"
+            "## Sources\n\n1. [BNEF pack survey](https://bnef.example.com/packs)\n")
+
+
+def test_a_kept_agents_text_is_what_a_fresh_extraction_returned(monkeypatch, tmp_path):
+    """⛔⛔ THE DOCUMENT IS NUMBERED AND THE `text` NEVER WAS. Every
+    `documents/<agent>.md` is written with our inline `[\\[n\\]]` markers and a
+    `##### Sources` list on the end, while the agents that re-ran hand back plain
+    text. Read the file back as it stands and the kept agent's bibliography lands
+    in the MIDDLE of the consolidated report — where the web's end-anchored strip
+    leaves it, beside the web's own differently numbered list, in the Summary
+    prompt and in the machine's own summary and title steps."""
+    q, res = _drive_the_extractor(monkeypatch, tmp_path, CITED)
+    on_disk = (q / "documents" / "chatgpt.md").read_text(encoding="utf-8")
+    # The published document keeps its numbering — this is not a rollback of it.
+    assert "##### Sources" in on_disk and "[\\[1\\]](" in on_disk
+    got = research._p2_restorable_agents(q, ALL)["chatgpt"]["text"]
+    # Trailing newlines are the one thing the numbering cannot give back: it
+    # rstrips the document before appending its list.
+    assert got == res["text"].rstrip("\n")
+
+
+def test_the_agents_own_links_and_its_own_sources_list_are_left_alone(
+        monkeypatch, tmp_path):
+    """Accept polarity: only what this machine added comes off. An agent's own
+    markdown links and its own trailing sources list are the report."""
+    q, res = _drive_the_extractor(monkeypatch, tmp_path, OWN_LIST)
+    got = research._p2_restorable_agents(q, ALL)["chatgpt"]["text"]
+    assert got == res["text"].rstrip("\n")
+    assert "[the agency](https://iea.example.com/renewables)" in got
+    assert got.endswith("## Sources\n\n1. [BNEF pack survey](https://bnef.example.com/packs)")
 
 
 # ── the record's eraser: every launch, executed ───────────────────────────────
@@ -339,6 +386,108 @@ def test_a_kept_agent_is_announced_complete_and_persisted(monkeypatch, tmp_path)
     assert rt.agent_findings == {"claude": FINDING}
 
 
+SNAP = {"source_urls": ["https://a.example/one", "https://b.example/two"],
+        "sections": ["Overview", "Prices"],
+        "steps": ["searched the web", "read 12 pages"],
+        "searches": 12, "observed_sources": 7, "sources": 1,
+        # The findings extractor's raw input — the big one, and not worth keeping.
+        "source_items": [{"url": "https://a.example/one", "title": "One"}]}
+
+
+def test_the_record_keeps_the_progress_the_completion_emit_carried(
+        monkeypatch, tmp_path):
+    q, _res = _drive_the_extractor(monkeypatch, tmp_path, REPORT["chatgpt"],
+                                   snapshot=SNAP)
+    prog = _record(q)["chatgpt"]["progress"]
+    assert prog["source_urls"] == SNAP["source_urls"]
+    assert prog["sections"] == SNAP["sections"]
+    assert prog["steps"] == SNAP["steps"]
+    assert prog["searches"] == 12 and prog["observed_sources"] == 7
+    assert "source_items" not in prog
+
+
+def test_a_kept_agents_card_carries_the_sources_sections_and_steps_it_had(
+        monkeypatch, tmp_path):
+    """⛔⛔ A RESUME RE-SEEDS THE WEB'S PHASE-2 DETAILS, and the `agent_progress`
+    merge keeps the seed for every field an event does not carry. Announced
+    without these, a kept agent read "complete — 0 sources, no sections, no
+    steps" for the rest of the phase, while the agents still working filled in."""
+    q, _res = _drive_the_extractor(monkeypatch, tmp_path, REPORT["chatgpt"],
+                                   snapshot=SNAP)
+    # A daemon restart: a NEW process, so the in-process snapshot ring is empty
+    # and the durable record is the only place this can come from.
+    rt = _Runtime()
+    monkeypatch.setattr(research, "_runtime", rt, raising=False)
+    events = []
+    monkeypatch.setattr(research, "emit_event", lambda t, **k: events.append((t, k)))
+    monkeypatch.setattr(research, "_write_agent_terminal_status", lambda *a, **k: None)
+    _launch, kept = research._p2_resume_plan(q, ALL)
+    research._p2_announce_restored(kept)
+
+    prog = [k for t, k in events if t == "agent_progress"][0]
+    assert prog["sourceUrls"] == SNAP["source_urls"]
+    assert prog["sections"] == SNAP["sections"]
+    assert prog["steps"] == SNAP["steps"]
+    assert prog["searches"] == 12 and prog["observedSources"] == 7
+    # Never smaller than the list of sources the card is about to draw.
+    assert prog["sources"] == 2
+    # …and save_meta's own readers get the ring back with it.
+    assert rt.agent_progress_snapshots["chatgpt"]["source_urls"] == SNAP["source_urls"]
+
+
+def test_the_snapshot_is_kept_in_the_shapes_the_card_needs():
+    got = research._p2_progress_snapshot(
+        {"source_urls": ["https://a.example/one"], "sections": "not a list",
+         "steps": ["read 12 pages"], "searches": "12", "observed_sources": None,
+         "sources": 3, "source_items": [{"url": "https://a.example/one"}]})
+    assert got == {"source_urls": ["https://a.example/one"],
+                   "steps": ["read 12 pages"], "searches": 12,
+                   "observed_sources": 0, "sources": 3}
+    assert research._p2_progress_snapshot(None) == {}
+
+
+def test_a_record_whose_counts_are_not_numbers_still_announces(
+        monkeypatch, tmp_path):
+    """⛔ THE SAME EMIT CARRIES THE REPORT LINK. A snapshot read back off disk is
+    not trusted to be well shaped — a count that raised inside the emit would
+    cost the kept agent its whole progress event, not just its number."""
+    q = _queue(tmp_path, done=["claude"], docs=["claude"])
+    rec = json.loads((q / research._P2_AGENTS_DONE_FILE).read_text(encoding="utf-8"))
+    rec["agents"]["claude"]["progress"] = {"searches": "many", "sections": "none",
+                                           "source_urls": ["https://a.example/one"]}
+    (q / research._P2_AGENTS_DONE_FILE).write_text(json.dumps(rec), encoding="utf-8")
+    monkeypatch.setattr(research, "_runtime", _Runtime(), raising=False)
+    events = []
+    monkeypatch.setattr(research, "emit_event", lambda t, **k: events.append((t, k)))
+    monkeypatch.setattr(research, "_write_agent_terminal_status", lambda *a, **k: None)
+    _launch, kept = research._p2_resume_plan(q, ALL)
+    research._p2_announce_restored(kept)
+
+    prog = [k for t, k in events if t == "agent_progress"][0]
+    assert prog["status"] == "complete" and prog["searches"] == 0
+    assert prog["sections"] == [] and prog["sourceUrls"] == ["https://a.example/one"]
+
+
+def test_a_record_written_before_the_snapshot_existed_still_announces(
+        monkeypatch, tmp_path):
+    """Accept polarity: a run interrupted across an upgrade has no `progress` in
+    its record, and its kept agent must still be announced complete."""
+    q = _queue(tmp_path, done=["claude"], docs=["claude"])
+    rec = json.loads((q / research._P2_AGENTS_DONE_FILE).read_text(encoding="utf-8"))
+    del rec["agents"]["claude"]["progress"]
+    (q / research._P2_AGENTS_DONE_FILE).write_text(json.dumps(rec), encoding="utf-8")
+    monkeypatch.setattr(research, "_runtime", _Runtime(), raising=False)
+    events = []
+    monkeypatch.setattr(research, "emit_event", lambda t, **k: events.append((t, k)))
+    monkeypatch.setattr(research, "_write_agent_terminal_status", lambda *a, **k: None)
+    _launch, kept = research._p2_resume_plan(q, ALL)
+    research._p2_announce_restored(kept)
+
+    prog = [k for t, k in events if t == "agent_progress"][0]
+    assert prog["status"] == "complete"
+    assert prog["sourceUrls"] == [] and prog["sections"] == [] and prog["sources"] == 0
+
+
 # ── the wiring inside run_pipeline, by AST shape ──────────────────────────────
 
 def _tree(fn):
@@ -369,46 +518,61 @@ def _is_call(node, func):
     return ast.unparse(f) == func
 
 
-def _plan_block():
+def _phase2_call():
+    """The one place `run_pipeline` runs Phase 2."""
     for owner, block in _blocks(_tree(research.run_pipeline)):
         for i, st in enumerate(block):
-            if (isinstance(st, ast.Assign) and _names(st.targets[0]) == ["_p2_launch", "_p2_restored"]
-                    and _is_call(st.value, "_p2_resume_plan")):
-                return block, i, st
-    raise AssertionError("the Phase-2 plan is not assigned anywhere in run_pipeline")
+            if (isinstance(st, ast.Assign)
+                    and _names(st.targets[0]) == ["results", "_p2_user_skipped", "_p2_stopped"]
+                    and isinstance(st.value, ast.Await)
+                    and _is_call(st.value.value, "_p2_run_with_resume")):
+                return block, i, st.value.value
+    raise AssertionError("run_pipeline does not run Phase 2 through _p2_run_with_resume")
 
 
-def test_the_plan_is_made_announced_and_merged_unconditionally_in_order():
-    block, i, st = _plan_block()
-    assert [ast.unparse(a) for a in st.value.args] == ["queue_dir", "enabled_agents"]
-    # Announced at once, as the very next statement.
-    assert ast.unparse(block[i + 1]) == "_p2_announce_restored(_p2_restored)"
+def test_run_pipeline_runs_the_phase_through_the_helper_and_returns_on_a_stop():
+    """⛔ THE CONSUMER CALLS THE DECISION UNCONDITIONALLY, and the decision
+    itself is executed by the tests below rather than read. This pin is what is
+    left over once the plan, the attempts, the merge and the safety filter live
+    in `_p2_run_with_resume`: the call, the stop, and the promise that nothing
+    stands between the phase and the sink."""
+    block, i, call = _phase2_call()
+    assert [ast.unparse(a) for a in call.args] == [
+        "queue_dir", "enabled_agents", "research_brief"]
+    kw = {k.arg: ast.unparse(k.value) for k in call.keywords}
+    assert kw["run_attempt"] == "_p2_attempt"
+    assert kw["soft_decision_exc"] == "_PhaseSoftDecision"
+    # A person who stopped the run at the timeout card ends the pipeline here.
+    nxt = block[i + 1]
+    assert isinstance(nxt, ast.If) and ast.unparse(nxt.test) == "_p2_stopped"
+    assert isinstance(nxt.body[0], ast.Return) and nxt.body[0].value is None
+    # ⛔ The off-topic sweep judges exactly what the helper returned, and the
+    # roster stays the roster — a trimmed `enabled_agents` would drop the kept
+    # reports out of the phase_start emits and out of the helper's own filter.
     rest = block[i + 1:]
-    loop = next(j for j, s in enumerate(rest)
-                if isinstance(s, ast.For) and ast.unparse(s.target) == "_p2_attempt")
-    merge = next(j for j, s in enumerate(rest)
-                 if ast.unparse(s) == "results.update(_p2_restored)")
     sweep = next(j for j, s in enumerate(rest)
                  if isinstance(s, ast.Assign) and "apply_off_topic_sweep" in ast.unparse(s.value))
-    # After the attempts, ahead of the off-topic sweep and everything it guards.
-    assert loop < merge < sweep
-    # ⛔ The roster is never trimmed to the launch list: the safety filter below
-    # keeps only `enabled_agents`, so a trimmed roster throws the kept reports away.
     for s in rest[:sweep]:
         for n in ast.walk(s):
             if isinstance(n, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
                 targets = n.targets if isinstance(n, ast.Assign) else [n.target]
-                assert "enabled_agents" not in {ast.unparse(t) for t in targets}, ast.unparse(n)
+                assert not ({"results", "enabled_agents"}
+                            & {ast.unparse(t) for t in targets}), ast.unparse(n)
 
 
-def test_the_main_call_launches_the_plan_and_the_deliberate_reruns_do_not():
+def test_the_main_call_launches_what_it_is_handed_and_the_deliberate_reruns_do_not():
     tree = _tree(research.run_pipeline)
     calls = [n for n in ast.walk(tree) if _is_call(n, "run_phase2")]
     lam = [n.body for n in ast.walk(tree) if isinstance(n, ast.Lambda)
            and _is_call(n.body, "run_phase2")]
     assert len(lam) == 1
     kw = {k.arg: ast.unparse(k.value) for k in lam[0].keywords}
-    assert kw["enabled_agents"] == "_p2_launch"
+    # `_launch` is the attempt runner's own parameter, and only the helper calls
+    # it — so the roster cannot reach `run_phase2` through this site at all.
+    assert kw["enabled_agents"] == "_launch"
+    attempt = next(n for n in ast.walk(tree)
+                   if isinstance(n, ast.AsyncFunctionDef) and n.name == "_p2_attempt")
+    assert [a.arg for a in attempt.args.args] == ["_launch", "_brief"]
     # The pause's Resume-with-input and the Phase-3 gate's Retry re-run on
     # purpose, and keep their own full rosters.
     others = sorted({ast.unparse(k.value) for c in calls if c not in lam
@@ -416,32 +580,220 @@ def test_the_main_call_launches_the_plan_and_the_deliberate_reruns_do_not():
     assert others == ["_retry_enabled", "enabled_agents_now"]
 
 
-def test_a_persons_retry_skip_or_new_input_decides_for_the_whole_phase():
-    """A Retry or Skip on the soft-timeout card, the legacy timeout card, and a
-    restart with new input all mean the WHOLE phase, as they always did: each
-    widens the launch back to the roster and drops the kept results, first
-    thing, before any decision is acted on."""
-    block, _i, _st = _plan_block()
-    loop = next(s for s in block if isinstance(s, ast.For)
-                and ast.unparse(s.target) == "_p2_attempt")
-    reset = "_p2_launch, _p2_restored = (list(enabled_agents), {})"
-    owners = []
-    for owner, body in _blocks(loop):
-        for j, s in enumerate(body):
-            if ast.unparse(s) == reset:
-                if isinstance(owner, ast.ExceptHandler):
-                    owners.append(ast.unparse(owner.type))
-                    # Before the handler acts on the decision.
-                    first_if = next(k for k, x in enumerate(body) if isinstance(x, ast.If))
-                    assert j < first_if
-                else:
-                    owners.append(type(owner).__name__)
-    assert sorted(owners) == ["For", "_PhaseSoftDecision", "asyncio.TimeoutError"]
-    # The restart site sits in the attempt loop itself, ahead of the restart emit.
-    body = loop.body
-    j = next(k for k, s in enumerate(body) if ast.unparse(s) == reset)
-    emit = next(k for k, s in enumerate(body) if "mid_phase_input_on_resume" in ast.unparse(s))
-    assert j < emit
+# ── the phase itself, RUN: plan → attempts → merge → filter ───────────────────
+
+
+class _Soft(Exception):
+    """Stands in for `run_pipeline`'s own `_PhaseSoftDecision`, which is defined
+    inside that coroutine and handed to the helper as a parameter."""
+
+    def __init__(self, decision):
+        super().__init__(decision)
+        self.decision = decision
+
+
+class _Controls:
+    def __init__(self, extra=()):
+        self.extra = list(extra)
+
+    def pop_extra_context(self):
+        return self.extra.pop(0) if self.extra else ""
+
+
+BRIEF = "research this: the grid"
+
+
+def _drive_the_phase(monkeypatch, q, enabled, outcomes, *, extra=(), decisions=()):
+    """The REAL `_p2_run_with_resume`, with a fake attempt runner.
+
+    `outcomes` is one entry per attempt — a results dict to return, an exception
+    to raise, or a callable that does something first and returns one."""
+    launched, events = [], []
+    decisions = list(decisions)
+    rt = _Runtime()
+    monkeypatch.setattr(research, "_runtime", rt, raising=False)
+    monkeypatch.setattr(research, "_controls", _Controls(extra), raising=False)
+    monkeypatch.setattr(research, "emit_event", lambda t, **k: events.append((t, k)))
+    monkeypatch.setattr(research, "_write_agent_terminal_status", lambda *a, **k: None)
+    monkeypatch.setattr(research, "_fb_research_id", "rid-1")
+
+    async def _attempt(launch, brief):
+        launched.append((list(launch), brief))
+        # In the same list as the emits, so "announced before the phase ran" is
+        # a thing a test can read rather than a thing a comment claims.
+        events.append(("attempt", {"launch": list(launch)}))
+        out = outcomes[len(launched) - 1]
+        if callable(out) and not isinstance(out, BaseException):
+            out = out()
+        if isinstance(out, BaseException):
+            raise out
+        return dict(out)
+
+    async def _hard():
+        return decisions.pop(0) if decisions else "stop"
+
+    got = asyncio.run(research._p2_run_with_resume(
+        q, enabled, BRIEF, run_attempt=_attempt, soft_decision_exc=_Soft,
+        hard_timeout_decision=_hard))
+    return got, launched, events, rt
+
+
+def _fresh(*keys):
+    """What `run_phase2` hands back for the agents it actually ran."""
+    return {research._agent_display_name(k): {"status": "done", "text": REPORT[k]}
+            for k in keys}
+
+
+def test_the_phase_launches_only_the_unfinished_and_hands_back_the_kept_with_them(
+        tmp_path, monkeypatch):
+    """⛔⛔ THE WHOLE POINT, EXECUTED. Gemini finished before the crash; it is not
+    launched again, and it is in the results the rest of the pipeline reads."""
+    q = _queue(tmp_path, done=["gemini"], docs=ALL)
+    (results, skipped, stopped), launched, events, _rt = _drive_the_phase(
+        monkeypatch, q, ALL, [_fresh("chatgpt", "claude")])
+    assert [lst for lst, _b in launched] == [["chatgpt", "claude"]]
+    assert sorted(results) == ["ChatGPT", "Claude", "Gemini"]
+    assert results["Gemini"]["_restored"] is True
+    assert results["Gemini"]["text"] == REPORT["gemini"]
+    assert (skipped, stopped) == (False, False)
+    # ⛔ And it was announced BEFORE the phase ran, not at the end of it: the
+    # resume's full `phase_restart` has just re-seeded its row on the web, and
+    # the agents that did launch have the rest of the phase to run.
+    assert [(t, k.get("agent") or k.get("launch")) for t, k in events] == [
+        ("link_extracted", "gemini"),
+        ("agent_progress", "gemini"),
+        ("attempt", ["chatgpt", "claude"])]
+    assert [k["status"] for t, k in events if t == "agent_progress"] == ["complete"]
+
+
+def test_a_fresh_run_launches_the_whole_roster(tmp_path, monkeypatch):
+    q = _queue(tmp_path, docs=ALL)
+    (results, _s, _st), launched, _ev, _rt = _drive_the_phase(
+        monkeypatch, q, ALL, [_fresh(*ALL)])
+    assert [lst for lst, _b in launched] == [ALL]
+    assert sorted(results) == ["ChatGPT", "Claude", "Gemini"]
+    assert not any(r.get("_restored") for r in results.values())
+
+
+def test_a_soft_timeout_retry_buys_the_whole_phase_again(tmp_path, monkeypatch):
+    """A person's Retry means the WHOLE phase: the launch widens back to the
+    roster and the kept report is dropped, so Gemini's tile is the new run's."""
+    q = _queue(tmp_path, done=["gemini"], docs=ALL)
+    (results, skipped, stopped), launched, events, _rt = _drive_the_phase(
+        monkeypatch, q, ALL, [_Soft("retry"), _fresh(*ALL)])
+    assert [lst for lst, _b in launched] == [["chatgpt", "claude"], ALL]
+    assert sorted(results) == ["ChatGPT", "Claude", "Gemini"]
+    assert not any(r.get("_restored") for r in results.values())
+    assert ("phase_restart", {"phase": 2, "reason": "user_retry_after_soft_timeout"}) in events
+    assert (skipped, stopped) == (False, False)
+
+
+def test_a_soft_timeout_skip_ends_the_phase_with_nothing(tmp_path, monkeypatch):
+    """⛔ AND THE KEPT RESULTS GO WITH IT. A phase the person SKIPPED must not be
+    recorded complete off the back of a report the last attempt left on disk —
+    `phase_skipped` has already said otherwise."""
+    q = _queue(tmp_path, done=["gemini"], docs=ALL)
+    (results, skipped, stopped), launched, events, _rt = _drive_the_phase(
+        monkeypatch, q, ALL, [_Soft("skip")])
+    assert results == {}
+    assert (skipped, stopped) == (True, False)
+    assert len(launched) == 1
+    assert ("phase_skipped", {"phase": 2, "reason": "user_skip_after_soft_timeout"}) in events
+
+
+def test_a_soft_decision_that_is_neither_surfaces(tmp_path, monkeypatch):
+    q = _queue(tmp_path, done=["gemini"], docs=ALL)
+    with pytest.raises(_Soft):
+        _drive_the_phase(monkeypatch, q, ALL, [_Soft("wait")])
+
+
+def test_the_legacy_timeout_cards_retry_buys_the_whole_phase_again(tmp_path, monkeypatch):
+    q = _queue(tmp_path, done=["gemini"], docs=ALL)
+    (results, _s, _st), launched, events, _rt = _drive_the_phase(
+        monkeypatch, q, ALL, [asyncio.TimeoutError(), _fresh(*ALL)], decisions=["retry"])
+    assert [lst for lst, _b in launched] == [["chatgpt", "claude"], ALL]
+    assert not any(r.get("_restored") for r in results.values())
+    assert ("phase_restart", {"phase": 2, "reason": "user_retry_after_timeout"}) in events
+
+
+def test_the_legacy_timeout_cards_skip_ends_the_phase_with_nothing(tmp_path, monkeypatch):
+    q = _queue(tmp_path, done=["gemini"], docs=ALL)
+    (results, skipped, stopped), _launched, events, _rt = _drive_the_phase(
+        monkeypatch, q, ALL, [asyncio.TimeoutError()], decisions=["skip"])
+    assert results == {}
+    assert (skipped, stopped) == (True, False)
+    assert ("phase_skipped", {"phase": 2, "reason": "user_skip_after_timeout"}) in events
+
+
+def test_a_stop_at_the_timeout_card_tells_the_caller_to_end_the_run(tmp_path, monkeypatch):
+    q = _queue(tmp_path, done=["gemini"], docs=ALL)
+    (_results, _skipped, stopped), _launched, events, _rt = _drive_the_phase(
+        monkeypatch, q, ALL, [asyncio.TimeoutError()], decisions=["stop"])
+    assert stopped is True
+    assert ("pipeline_stopped", {"phase": 2, "reason": "user_stop_after_timeout"}) in events
+
+
+def test_new_input_mid_phase_re_runs_the_whole_phase_with_it(tmp_path, monkeypatch):
+    q = _queue(tmp_path, done=["gemini"], docs=ALL)
+
+    def _asks_for_a_restart():
+        research._runtime.restart_requested = True
+        return _fresh("chatgpt", "claude")
+
+    (results, _s, _st), launched, events, _rt = _drive_the_phase(
+        monkeypatch, q, ALL, [_asks_for_a_restart, _fresh(*ALL)],
+        extra=["also cover permitting"])
+    assert [lst for lst, _b in launched] == [["chatgpt", "claude"], ALL]
+    assert "also cover permitting" in launched[1][1]
+    assert "ADDITIONAL USER CONTEXT (restart #1)" in launched[1][1]
+    assert launched[0][1] == BRIEF  # the first attempt got the brief as handed in
+    assert not any(r.get("_restored") for r in results.values())
+    assert [k for t, k in events if t == "phase_restart"] == [
+        {"phase": 2, "reason": "mid_phase_input_on_resume",
+         "chars": len("also cover permitting"), "attempt": 1}]
+
+
+def test_a_restart_asked_for_with_no_input_does_not_re_run(tmp_path, monkeypatch):
+    q = _queue(tmp_path, done=["gemini"], docs=ALL)
+
+    def _asks_for_a_restart():
+        research._runtime.restart_requested = True
+        return _fresh("chatgpt", "claude")
+
+    (results, _s, _st), launched, _ev, _rt = _drive_the_phase(
+        monkeypatch, q, ALL, [_asks_for_a_restart, _fresh(*ALL)])
+    assert len(launched) == 1
+    assert results["Gemini"]["_restored"] is True
+
+
+def test_three_restarts_are_the_cap(tmp_path, monkeypatch):
+    q = _queue(tmp_path, docs=ALL)
+
+    def _asks_for_a_restart():
+        research._runtime.restart_requested = True
+        return _fresh(*ALL)
+
+    _got, launched, _ev, _rt = _drive_the_phase(
+        monkeypatch, q, ALL, [_asks_for_a_restart] * 4, extra=["a", "b", "c", "d"])
+    assert len(launched) == 3
+
+
+def test_only_the_enabled_agents_come_out_of_the_phase(tmp_path, monkeypatch):
+    """The safety filter, with a kept agent in the results: it keeps the ROSTER,
+    never the launch list, or every kept report would be thrown away here."""
+    q = _queue(tmp_path, done=["gemini"], docs=ALL)
+    (results, _s, _st), launched, _ev, _rt = _drive_the_phase(
+        monkeypatch, q, ["gemini", "claude"], [_fresh("claude", "chatgpt")])
+    assert [lst for lst, _b in launched] == [["claude"]]
+    assert sorted(results) == ["Claude", "Gemini"]
+
+
+def test_the_safety_filter_reads_the_display_names_the_phase_writes():
+    r = {"ChatGPT": {"text": "a"}, "Gemini": {"text": "b"}}
+    assert sorted(research._p2_only_enabled(r, ["gemini"])) == ["Gemini"]
+    assert sorted(research._p2_only_enabled(r, ["ChatGPT"])) == ["ChatGPT"]
+    # No roster configured at all is not "drop everything".
+    assert research._p2_only_enabled(r, []) == r
 
 
 def test_the_finalize_resave_asks_the_helper():

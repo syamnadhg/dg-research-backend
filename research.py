@@ -40801,7 +40801,8 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
         # nowhere else: this is the one branch that has proved the report is
         # whole, on disk and reachable. See `_p2_mark_agent_done`.
         _p2_mark_agent_done(queue_dir, agent_key, True, elapsed_sec=elapsed_sec,
-                            findings=getattr(_runtime, "agent_findings", {}).get(agent_key))
+                            findings=getattr(_runtime, "agent_findings", {}).get(agent_key),
+                            progress=_snap)
         # F4 (2026-05-06): persist agent terminal status to root doc on
         # the individual complete-emit instead of waiting for the bulk
         # phase_complete write at :19641. On chat reopen mid-Phase-2,
@@ -66688,6 +66689,48 @@ def _strip_numbered_sources_section(md: str) -> str:
     return _DOC_SOURCES_BLOCK_RE.sub("", md)
 
 
+#: Our inline marker, with the space the numbering inserts in front of it.
+#: ⛔ THE SPACE IS OPTIONAL AND IT HAS TO BE. `_number_document_sources` adds one
+#: only when the character before the insertion point is not whitespace, so a
+#: marker that follows a newline has none — and taking a space off only when a
+#: non-space precedes it cannot eat one the report wrote itself.
+#: The address never contains a bracket, a space or a parenthesis: linkable URLs
+#: reject whitespace and `_doc_markdown_url` percent-encodes the parentheses.
+_DOC_SOURCE_MARK_INLINE_RE = re.compile(
+    r'(?:(?<=\S) )?\[\\\[\d{1,3}\\\]\]\([^()\s]*\)')
+
+
+def _document_without_sources(md: str) -> str:
+    """The document as the extractor handed it over: our bibliography off AND
+    our inline numbers out.
+
+    ⛔⛔ THE READER IS A PHASE-2 RE-ENTRY. `documents/<agent>.md` is written
+    NUMBERED, so an agent kept across a crash retry (`_p2_restorable_agents`)
+    reads its own report back with `[\\[n\\]](url)` markers and a `##### Sources`
+    list in it, while the agents that re-ran hand back plain text. Concatenated,
+    that lands a numbered list in the MIDDLE of the consolidated report — and the
+    web's own strip (`MACHINE_SOURCES_TAIL_RE`) is anchored at the end of the
+    string, so it removes the markers and leaves the list sitting next to the
+    web's own, differently numbered one in the Summary prompt.
+
+    Only ever removes this module's own grammar: the tail
+    `_strip_numbered_sources_section` owns, then the escaped-bracket markers
+    `_doc_source_marker` writes. An agent's own `[Title](url)` links and its own
+    sources list are left alone.
+
+    ⚠ A marker an agent ECHOED comes off too, and that is the same trade the
+    web's own strip makes on model output — the escaped brackets are this
+    machine's grammar wherever they turn up. `_number_document_sources` refuses
+    to number a document that already carries one, so an echo is the only marker
+    such a document has.
+
+    ⚠ Trailing whitespace does not come back — the numbering rstrips the document
+    before appending its list — so this is the extraction's text, not its bytes.
+
+    ⛔ ORDER: the strip is gated on the markers being present, so it runs FIRST."""
+    return _DOC_SOURCE_MARK_INLINE_RE.sub("", _strip_numbered_sources_section(md))
+
+
 def _document_with_sources(md: str, source_urls=None, findings=None) -> str:
     """The write-site face: number `md`, extracting its findings if none given.
 
@@ -67179,7 +67222,38 @@ def detect_resume_phase(queue_dir):
 _P2_AGENTS_DONE_FILE = "phase2_agents_done.json"
 
 
-def _p2_mark_agent_done(queue_dir, agent_key, done, elapsed_sec=0, findings=None):
+#: The progress fields a `complete` emit carries, kept in the record so a restored
+#: agent's card can carry them too. `source_items` is deliberately NOT here: it is
+#: the findings extractor's raw input, it is the big one, and the findings it
+#: produced are already stored.
+_P2_SNAPSHOT_LISTS = ("source_urls", "sections", "steps")
+_P2_SNAPSHOT_COUNTS = ("searches", "observed_sources", "sources")
+
+
+def _p2_progress_snapshot(snapshot) -> dict:
+    """The part of an agent's live progress snapshot worth keeping on disk, in
+    the shapes the emit needs.
+
+    It runs on both sides — writing the record from the live ring and reading it
+    back off disk — because a kept agent's card is not worth an exception at
+    either end, and the emit that carries it also carries its report link."""
+    if not isinstance(snapshot, dict):
+        return {}
+    out = {}
+    for k in _P2_SNAPSHOT_LISTS:
+        if isinstance(snapshot.get(k), list):
+            out[k] = list(snapshot[k])
+    for k in _P2_SNAPSHOT_COUNTS:
+        if k in snapshot:
+            try:
+                out[k] = int(snapshot[k] or 0)
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+def _p2_mark_agent_done(queue_dir, agent_key, done, elapsed_sec=0, findings=None,
+                        progress=None):
     """Add one agent to the durable Phase-2 completion record, or with
     `done=False` take it out.
 
@@ -67200,7 +67274,13 @@ def _p2_mark_agent_done(queue_dir, agent_key, done, elapsed_sec=0, findings=None
                        "elapsedSec": int(elapsed_sec or 0),
                        # Kept so a restored agent's Findings tab is the one its
                        # own extraction built, not save_meta's heading fallback.
-                       "findings": list(findings or [])}
+                       "findings": list(findings or []),
+                       # ⭐ And the sources / sections / steps its own `complete`
+                       # emit carried: a resume re-seeds the web's Phase-2 details,
+                       # so a card announced without these sits on 0 sources and no
+                       # sections for the rest of the phase. The in-process
+                       # snapshot ring dies with the daemon, like the record itself.
+                       "progress": _p2_progress_snapshot(progress)}
     elif key in agents:
         del agents[key]
     else:
@@ -67215,8 +67295,8 @@ def _p2_mark_agent_done(queue_dir, agent_key, done, elapsed_sec=0, findings=None
 
 
 def _p2_restorable_agents(queue_dir, enabled_agents) -> dict:
-    """{agent_key: {"text", "elapsed_sec", "findings"}} for each enabled agent a
-    Phase-2 re-entry must NOT launch again.
+    """{agent_key: {"text", "elapsed_sec", "findings", "progress"}} for each
+    enabled agent a Phase-2 re-entry must NOT launch again.
 
     ⛔ BOTH HALVES, ALWAYS. An agent qualifies only with a completion record AND
     its report still on disk over 100 bytes (`detect_resume_phase`'s bar). The
@@ -67250,6 +67330,12 @@ def _p2_restorable_agents(queue_dir, enabled_agents) -> dict:
         first, _nl, rest = md.partition("\n")
         if first.startswith("# ") and "Deep Research" in first:
             md = rest.lstrip("\n")
+        # …and so does our numbering. ⛔⛔ THE FILE IS WRITTEN NUMBERED AND THE
+        # `text` IN `results` NEVER WAS: the agents that re-ran hand back plain
+        # text, so a kept agent's `##### Sources` list would land in the MIDDLE of
+        # the consolidated report, where the web's end-anchored strip leaves it.
+        # See `_document_without_sources`.
+        md = _document_without_sources(md)
         if not md.strip():
             continue
         try:
@@ -67258,7 +67344,8 @@ def _p2_restorable_agents(queue_dir, enabled_agents) -> dict:
             elapsed = 0
         findings = entry.get("findings")
         out[key] = {"text": md, "elapsed_sec": elapsed,
-                    "findings": findings if isinstance(findings, list) else []}
+                    "findings": findings if isinstance(findings, list) else [],
+                    "progress": _p2_progress_snapshot(entry.get("progress"))}
     return out
 
 
@@ -67287,6 +67374,7 @@ def _p2_resume_plan(queue_dir, enabled_agents):
             "elapsed_sec": r["elapsed_sec"],
             "md_saved": True,
             "_findings": r["findings"],
+            "_progress": r["progress"],
             "_restored": True,
         }
     return launch, kept
@@ -67305,22 +67393,40 @@ def _p2_announce_restored(kept) -> None:
     ⛔ NOT COSMETIC. A checkpoint resume emits a FULL `phase_restart`, and the
     web re-seeds every Phase-2 agent's detail on it, so without this a kept
     agent would sit on its seed row for the whole phase. The persisted status
-    is written too, because a daemon restart starts with an empty status map."""
+    is written too, because a daemon restart starts with an empty status map.
+
+    ⛔⛔ AND IT CARRIES THE SAME FIELDS THE AGENT'S OWN `complete` EMIT DID. The
+    re-seeded row is the SEED, and the web's `agent_progress` merge keeps the seed
+    for anything an event does not carry — so an announce without the sources,
+    sections and steps left the kept agent reading "complete, 0 sources, no
+    sections" for the rest of the phase. The snapshot comes off the record because
+    the in-process ring is empty after a daemon restart; it is put back into the
+    ring too, for `save_meta`'s own readers."""
     for name, r in (kept or {}).items():
         key = name.lower().replace(" ", "")
         n = len(r.get("text") or "")
         url = r.get("_in_app_url") or in_app_document_url(key)
         label = f"Read {name} report"
+        snap = r.get("_progress") or {}
         log(f"[phase2] {name} finished before the restart — keeping its report "
             f"({n} chars), not launching it again")
         if r.get("_findings"):
             _runtime.agent_findings[key] = list(r["_findings"])
+        if snap:
+            _runtime.agent_progress_snapshots[key] = dict(snap)
         try:
             emit_event("link_extracted", phase=2, agent=key, url=url, label=label,
                        verified=True, primary=True)
             emit_event("agent_progress", phase=2, agent=key, status="complete",
                        progress=f"Finished before the restart — kept its report ({n:,} chars)",
                        partialTextLen=n, elapsedSec=int(r.get("elapsed_sec") or 0),
+                       sourceUrls=snap.get("source_urls", []),
+                       sections=snap.get("sections", []),
+                       steps=snap.get("steps", []),
+                       searches=int(snap.get("searches", 0) or 0),
+                       observedSources=int(snap.get("observed_sources", 0) or 0),
+                       sources=max(int(snap.get("sources", 0) or 0),
+                                   len(snap.get("source_urls", []) or [])),
                        links=[{"label": label, "url": url, "verified": True,
                                "primary": True}])
         except Exception:
@@ -67329,6 +67435,124 @@ def _p2_announce_restored(kept) -> None:
             _write_agent_terminal_status(key, "complete")
         except Exception:
             pass
+
+
+def _p2_only_enabled(results, enabled_agents) -> dict:
+    """Phase-2 results with only the agents this run enabled left in.
+
+    ⛔ THE ROSTER, NEVER THE LAUNCH LIST. A re-entry launches only the agents
+    that had not finished, and the ones it kept are in these results under their
+    display names — filtering on what was launched throws every kept report away.
+
+    Keyed through the one display-name helper `_p2_resume_plan` already uses, so
+    the two sides agree by construction."""
+    if not enabled_agents:
+        return dict(results or {})
+    names = {_agent_display_name(a) for a in enabled_agents}
+    return {n: r for n, r in (results or {}).items() if n in names}
+
+
+async def _p2_run_with_resume(queue_dir, enabled_agents, research_brief, *,
+                              run_attempt, soft_decision_exc, hard_timeout_decision):
+    """Phase 2 from one entry into it: plan → attempts → merge → safety filter.
+
+    Returns `(results, user_skipped, stopped)`. `stopped` means the person chose
+    neither Retry nor Skip at the hard timeout card and `pipeline_stopped` has
+    been emitted — the caller must return.
+
+    ⛔⛔ THIS IS THE DECISION, AND IT LIVES HERE SO A TEST CAN RUN IT. It used to
+    be ninety lines inside `run_pipeline` — a 5,000-line coroutine nothing can
+    drive — where the only thing holding the shape together was a pin on the
+    AST: one added line reassigning the launch list or the kept results put
+    every finished Deep Research back on the bill with the whole suite green.
+
+    `run_attempt(launch, brief)` is one attempt under the phase's active-time
+    deadline; it may raise `soft_decision_exc` (`.decision` is "retry"/"skip") or
+    `asyncio.TimeoutError`, and `hard_timeout_decision()` answers the second.
+    They are parameters because `run_pipeline` defines all three inside itself.
+
+    ⭐ A DELIBERATE RE-RUN MEANS THE WHOLE PHASE, kept agents included: the
+    soft-timeout card's Retry and Skip, the legacy timeout card's, and a restart
+    with new input each widen the launch back to the roster and drop the kept
+    results FIRST, before the decision is acted on.
+
+    ⛔ `enabled_agents` is not trimmed to the launch list — `run_pipeline`'s
+    phase_start emits read it, and so does the safety filter this ends with; a
+    kept agent missing from it would lose its tile or be filtered out."""
+    launch, kept = _p2_resume_plan(queue_dir, enabled_agents)
+    _p2_announce_restored(kept)
+    # Restart loop: if mid-phase pause + input triggers a restart, merge the new
+    # context into the brief and rerun the whole phase. Cap at 3 restarts to
+    # prevent infinite loops if something goes sideways.
+    results = {}
+    user_skipped = False
+    for _p2_attempt in range(3):
+        _runtime.restart_requested = False
+        while True:  # timeout-retry loop
+            try:
+                results = await run_attempt(launch, research_brief)
+                break  # success
+            except soft_decision_exc as _sd:
+                # ⭐ Wave 10.9: a person's Retry or Skip decides for the WHOLE
+                # phase, as it always has — kept agents included.
+                launch, kept = list(enabled_agents), {}
+                # User picked Retry/Skip on the soft-timeout warn.
+                # Wait is implicit — never reaches this except (the
+                # helper keeps polling on Wait until run_task either
+                # finishes naturally OR user picks Retry/Skip).
+                if _sd.decision == "retry":
+                    emit_event("phase_restart", phase=2, reason="user_retry_after_soft_timeout")
+                    results = {}
+                    continue
+                if _sd.decision == "skip":
+                    emit_event("phase_skipped", phase=2, reason="user_skip_after_soft_timeout")
+                    user_skipped = True
+                    results = {}
+                    break
+                # Defensive — the soft decision only carries "retry"/"skip";
+                # anything else means the helper contract drifted. Log +
+                # re-raise so it surfaces.
+                log(f"[P2] Unexpected _PhaseSoftDecision.decision={_sd.decision!r}", "ERROR")
+                raise
+            except asyncio.TimeoutError:
+                # Legacy hard-path. With soft_warn_only=True the helper
+                # raises the soft decision instead of TimeoutError, so this
+                # except block is normally unreachable for P2. Kept as a
+                # safety net in case something inside run_phase2 raises a
+                # bare TimeoutError that escapes the helper's wrap.
+                launch, kept = list(enabled_agents), {}  # wave 10.9, as above
+                _decision = await hard_timeout_decision()
+                if _decision == "retry":
+                    emit_event("phase_restart", phase=2, reason="user_retry_after_timeout")
+                    results = {}
+                    continue
+                if _decision == "skip":
+                    emit_event("phase_skipped", phase=2, reason="user_skip_after_timeout")
+                    user_skipped = True
+                    results = {}
+                    break
+                emit_event("pipeline_stopped", phase=2, reason=f"user_{_decision}_after_timeout")
+                return results, user_skipped, True
+        if user_skipped:
+            break  # exit outer for loop too
+        if not _runtime.restart_requested:
+            break
+        extra_ctx_retry = _controls.pop_extra_context()
+        if not extra_ctx_retry:
+            log("[Phase 2] restart_requested but extra_context empty — continuing", "WARN")
+            break
+        # ⭐ Wave 10.9: new input re-runs the whole phase, kept agents too.
+        launch, kept = list(enabled_agents), {}
+        research_brief += f'\n\nADDITIONAL USER CONTEXT (restart #{_p2_attempt+1}):\n{extra_ctx_retry}'
+        log(f"[Phase 2] Mid-phase restart with +{len(extra_ctx_retry)} chars of user input")
+        emit_event("phase_restart", phase=2,
+                   reason="mid_phase_input_on_resume",
+                   chars=len(extra_ctx_retry), attempt=_p2_attempt+1)
+    # ⭐ Wave 10.9: the kept agents join the results HERE, so every reader in
+    # `run_pipeline` — the off-topic sweep, the links, the per-agent status, the
+    # marker, save_meta, the P2→P3 hand-off — sees the whole phase.
+    results.update(kept)
+    return _p2_only_enabled(results, enabled_agents), user_skipped, False
 
 
 # ── Browser-crash recovery (#725) ───────────────────────────────────────────
@@ -70057,15 +70281,6 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # persisted either, so the listing tile rendered the skipped
                 # agent as completed (green ✓). Dual-source defense-in-depth.
                 emit_event("agent_skipped", phase=2, agent=da, reason="Disabled in pipeline config")
-            # ⭐⭐ Wave 10.9 — A RE-ENTRY RUNS ONLY THE AGENTS THAT HAD NOT FINISHED.
-            # A crash retry or a daemon-restart resume lands here with some
-            # agents' reports already recorded; those are kept and announced
-            # instead of bought again (see `_p2_resume_plan`).
-            # ⛔ `enabled_agents` itself is NOT trimmed. The phase_start emits
-            # above and the safety filter below read it, and a kept agent missing
-            # from it would lose its tile or be filtered out of the results.
-            _p2_launch, _p2_restored = _p2_resume_plan(queue_dir, enabled_agents)
-            _p2_announce_restored(_p2_restored)
             _p2_start = time.time()
             # Active-time ceiling for Phase 2 — paused seconds don't count.
             # Per-phase login probe removed (2026-04-24) — Phase 0 is the
@@ -70083,89 +70298,33 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 research_brief += f'\n\nUSER FEEDBACK (incorporate this into your research): {fb2}'
                 log(f"Phase 2: Injecting user feedback: {fb2[:100]}")
                 clear_feedback(2)
-            # Restart loop: if mid-phase pause + input triggers a restart, merge
-            # the new context into the brief and rerun the whole phase. Cap at
-            # 3 restarts to prevent infinite loops if something goes sideways.
-            results = {}
-            _p2_user_skipped = False
-            for _p2_attempt in range(3):
-                _runtime.restart_requested = False
-                while True:  # timeout-retry loop
-                    try:
-                        results = await _await_phase_with_active_deadline(
-                            2, PHASE_2_MAX_MIN,
-                            lambda: run_phase2(browser, cua_client, research_brief, verbose,
-                                               enabled_agents=_p2_launch),
-                            soft_warn_only=True,  # 2026-05-04: long DR runs are legitimate; warn but don't bail
-                        )
-                        break  # success
-                    except _PhaseSoftDecision as _sd:
-                        # ⭐ Wave 10.9: a person's Retry or Skip decides for the
-                        # WHOLE phase, as it always has — kept agents included.
-                        _p2_launch, _p2_restored = list(enabled_agents), {}
-                        # User picked Retry/Skip on the soft-timeout warn.
-                        # Wait is implicit — never reaches this except (the
-                        # helper keeps polling on Wait until run_task either
-                        # finishes naturally OR user picks Retry/Skip).
-                        if _sd.decision == "retry":
-                            emit_event("phase_restart", phase=2, reason="user_retry_after_soft_timeout")
-                            results = {}
-                            continue
-                        if _sd.decision == "skip":
-                            emit_event("phase_skipped", phase=2, reason="user_skip_after_soft_timeout")
-                            _p2_user_skipped = True
-                            results = {}
-                            break
-                        # Defensive — _PhaseSoftDecision only carries
-                        # "retry"/"skip"; anything else means the helper
-                        # contract drifted. Log + re-raise so it surfaces.
-                        log(f"[P2] Unexpected _PhaseSoftDecision.decision={_sd.decision!r}", "ERROR")
-                        raise
-                    except asyncio.TimeoutError:
-                        # Legacy hard-path. With soft_warn_only=True the
-                        # helper raises _PhaseSoftDecision instead of
-                        # TimeoutError, so this except block is normally
-                        # unreachable for P2. Kept as a safety net in case
-                        # something inside run_phase2 raises a bare
-                        # TimeoutError that escapes the helper's wrap.
-                        _p2_launch, _p2_restored = list(enabled_agents), {}  # wave 10.9, as above
-                        _decision = await _phase_timeout_decision(2, PHASE_2_MAX_MIN)
-                        if _decision == "retry":
-                            emit_event("phase_restart", phase=2, reason="user_retry_after_timeout")
-                            results = {}
-                            continue
-                        if _decision == "skip":
-                            emit_event("phase_skipped", phase=2, reason="user_skip_after_timeout")
-                            _p2_user_skipped = True
-                            results = {}
-                            break
-                        emit_event("pipeline_stopped", phase=2, reason=f"user_{_decision}_after_timeout")
-                        return
-                if _p2_user_skipped:
-                    break  # exit outer for loop too
-                if not _runtime.restart_requested:
-                    break
-                extra_ctx_retry = _controls.pop_extra_context()
-                if not extra_ctx_retry:
-                    log("[Phase 2] restart_requested but extra_context empty — continuing", "WARN")
-                    break
-                # ⭐ Wave 10.9: new input re-runs the whole phase, kept agents too.
-                _p2_launch, _p2_restored = list(enabled_agents), {}
-                research_brief += f'\n\nADDITIONAL USER CONTEXT (restart #{_p2_attempt+1}):\n{extra_ctx_retry}'
-                log(f"[Phase 2] Mid-phase restart with +{len(extra_ctx_retry)} chars of user input")
-                emit_event("phase_restart", phase=2,
-                           reason="mid_phase_input_on_resume",
-                           chars=len(extra_ctx_retry), attempt=_p2_attempt+1)
-            # ⭐ Wave 10.9: the kept agents join the results HERE, ahead of the
-            # safety filter and the off-topic sweep, so every reader below — the
-            # links, the per-agent status, the marker, save_meta, the P2→P3
-            # hand-off — sees the whole phase, and the sweep judges them again.
-            results.update(_p2_restored)
-            # Safety filter: ensure only enabled agents appear in results
-            if enabled_agents:
-                agent_name_map = {"chatgpt": "ChatGPT", "gemini": "Gemini", "claude": "Claude"}
-                enabled_names = {agent_name_map.get(a, a) for a in enabled_agents}
-                results = {n: r for n, r in results.items() if n in enabled_names}
+
+            async def _p2_attempt(_launch, _brief):
+                """One Phase-2 attempt, under the phase's active-time ceiling."""
+                return await _await_phase_with_active_deadline(
+                    2, PHASE_2_MAX_MIN,
+                    lambda: run_phase2(browser, cua_client, _brief, verbose,
+                                       enabled_agents=_launch),
+                    soft_warn_only=True,  # 2026-05-04: long DR runs are legitimate; warn but don't bail
+                )
+
+            # ⭐⭐ Wave 10.9 — A RE-ENTRY RUNS ONLY THE AGENTS THAT HAD NOT
+            # FINISHED. A crash retry or a daemon-restart resume lands here with
+            # some agents' reports already recorded; those are kept, announced and
+            # merged instead of bought again.
+            # ⛔⛔ THE WHOLE DECISION — plan, attempts, merge, safety filter — IS
+            # `_p2_run_with_resume`, and it is there because a test can run it
+            # and cannot run this coroutine. Nothing may stand between this call
+            # and the sweep below: everything from here down reads `results`, and
+            # `enabled_agents` stays the roster (the phase_start emits above and
+            # the helper's own filter read it).
+            results, _p2_user_skipped, _p2_stopped = await _p2_run_with_resume(
+                queue_dir, enabled_agents, research_brief,
+                run_attempt=_p2_attempt,
+                soft_decision_exc=_PhaseSoftDecision,
+                hard_timeout_decision=lambda: _phase_timeout_decision(2, PHASE_2_MAX_MIN))
+            if _p2_stopped:
+                return
 
             # ── ⭐⭐ THE OFF-TOPIC SWEEP AT THE SINK (2026-08-05) ──
             #

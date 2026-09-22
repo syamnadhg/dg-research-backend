@@ -11,8 +11,19 @@ in Firestore, and flipped their finished tiles back to "running". The comment in
 `extract_and_record_agent` that announces `complete`, and taken out again by
 every LAUNCH in `run_phase2`; `_p2_resume_plan` keeps an agent only with BOTH
 the record and its report on disk; `_p2_announce_restored` re-ticks the kept
-tile the resume's full `phase_restart` has just re-seeded; and the main Phase-2
-entry launches the complement and merges the kept results.
+tile the resume's full `phase_restart` has just re-seeded; and
+`_p2_run_with_resume` is the phase itself — plan, attempts, merge, safety filter.
+
+⭐ WHAT THE REPAIR ROUND ADDED (the cross-verify's D8, D15, D16):
+  * the phase used to be ninety lines inside `run_pipeline`, pinned only by AST
+    SHAPE — M12/M13 are the two added lines that re-opened the defect with the
+    whole suite green, and they are killed by RUNNING the phase now;
+  * N — a kept agent's text is what a fresh extraction returned, not the numbered
+    file: its `##### Sources` list used to land in the MIDDLE of the consolidated
+    report, where the web's end-anchored strip leaves it;
+  * S — a kept agent's card carries the sources, sections and steps its own
+    completion emit carried, because the resume re-seeds the web's details and
+    the merge keeps the seed for anything an event omits.
 
 Every mutant below is a way the fix could be put back to decoration while still
 looking installed. The quiet ones:
@@ -25,8 +36,9 @@ looking installed. The quiet ones:
         finished, including one whose Firestore copy the app cannot open.
   L4  — the launch still clears the record, but only after the tab opens: a
         crash in between hands back the LAST attempt's file as done.
-  M3  — the merge moves below the off-topic sweep, so a kept report is never
-        judged again. Still present, still greppable.
+  M3  — the kept reports are dropped between the phase and the sink, so the
+        off-topic sweep and everything after it judge a phase without them.
+        Still present, still greppable, and the call above reads right.
   M9  — a person's Skip stops dropping the kept results, so a phase they SKIPPED
         is recorded complete after `phase_skipped` already said otherwise.
   M10 — the roster is trimmed to the launch list — the "obvious" simplification
@@ -74,14 +86,34 @@ VERIFIED = ("            \"_in_app_url\": in_app_document_url(key),\n"
 RESTORED_FLAG = "            \"_restored\": True,"
 RESAVE = "    return bool(r.get(\"text\")) and not r.get(\"_restored\")"
 KEPT_KEY = "        kept[_agent_display_name(key)] = {"
+#: The de-numbering a kept agent's text goes through (wave 10.9 repair, D15).
+DENUMBER_CALL = "        md = _document_without_sources(md)"
+DENUMBER_BODY = ("    return _DOC_SOURCE_MARK_INLINE_RE.sub(\"\", "
+                 "_strip_numbered_sources_section(md))")
+#: Raw — the pattern it anchors on is itself a pile of backslashes.
+MARK_INLINE_RE = r"""    r'(?:(?<=\S) )?\[\\\[\d{1,3}\\\]\]\([^()\s]*\)')"""
+MARK_INLINE_WIDE = r"""    r'(?:(?<=\S) )?\[[^\]]*\]\([^()\s]*\)')"""
+#: The progress snapshot a kept agent's card is drawn from (wave 10.9 repair, D16).
+SNAP_LISTS = "_P2_SNAPSHOT_LISTS = (\"source_urls\", \"sections\", \"steps\")"
+SNAP_COERCE = ("            try:\n"
+               "                out[k] = int(snapshot[k] or 0)\n"
+               "            except (TypeError, ValueError):\n"
+               "                pass")
+SNAP_STORED = "                       \"progress\": _p2_progress_snapshot(progress)}"
+SNAP_PASSED = "                            progress=_snap)"
+SNAP_RESTORE = "            _runtime.agent_progress_snapshots[key] = dict(snap)"
+A_SOURCE_URLS = "                       sourceUrls=snap.get(\"source_urls\", []),"
+A_SOURCES_MAX = ("                       sources=max(int(snap.get(\"sources\", 0) or 0),\n"
+                 "                                   len(snap.get(\"source_urls\", []) or [])),")
 #: The writer, in the complete branch.
 WRITER = ("        _p2_mark_agent_done(queue_dir, agent_key, True, elapsed_sec=elapsed_sec,\n"
-          "                            findings=getattr(_runtime, \"agent_findings\", {}).get(agent_key))")
+          "                            findings=getattr(_runtime, \"agent_findings\", {}).get(agent_key),\n"
+          "                            progress=_snap)")
 FAILED_BRANCH = ("        try:\n"
                  "            _write_agent_terminal_status(agent_key, \"errored\")\n"
                  "        except Exception:\n"
                  "            pass")
-FINDINGS = "findings=getattr(_runtime, \"agent_findings\", {}).get(agent_key))"
+FINDINGS = "findings=getattr(_runtime, \"agent_findings\", {}).get(agent_key),"
 ERASE = "        del agents[key]"
 NO_WRITE = ("        # never creates the file, or recreates a deleted run's folder.\n"
             "        return")
@@ -91,20 +123,28 @@ L_CHATGPT = "        _p2_mark_agent_done(_p2_run_dir(), \"chatgpt\", False)"
 L_CLAUDE = "        _p2_mark_agent_done(_p2_run_dir(), \"claude\", False)"
 L_GEMINI = "        _p2_mark_agent_done(_p2_run_dir(), \"gemini\", False)"
 AFTER_2A_OPEN = "        # #905: stamp research start at SUBMIT time"
-#: The main Phase-2 entry.
-MAIN_CALL = "enabled_agents=_p2_launch),"
-MERGE = "            results.update(_p2_restored)"
-SWEEP_NEXT = "            # ── 2026-05-10: Emit phase_complete:2 EARLY (before heavy persistence) ──"
-ANNOUNCE = ("            _p2_announce_restored(_p2_restored)\n"
-            "            _p2_start = time.time()")
-PLAN = "_p2_launch, _p2_restored = _p2_resume_plan(queue_dir, enabled_agents)"
-R_SOFT = ("                        # WHOLE phase, as it always has — kept agents included.\n"
-          "                        _p2_launch, _p2_restored = list(enabled_agents), {}")
-R_SOFT_RETRY = ("                            emit_event(\"phase_restart\", phase=2, "
+#: The main Phase-2 entry — the decision itself is `_p2_run_with_resume` now, and
+#: what is left in `run_pipeline` is the call, the stop and the sweep.
+MAIN_CALL = "enabled_agents=_launch),"
+MERGE = "    results.update(kept)"
+FILTER = "    return _p2_only_enabled(results, enabled_agents), user_skipped, False"
+FILTER_BODY = "    names = {_agent_display_name(a) for a in enabled_agents}"
+FILTER_EMPTY = ("    if not enabled_agents:\n"
+                "        return dict(results or {})")
+CAP = "    for _p2_attempt in range(3):"
+STOPPED = "                return results, user_skipped, True"
+CONSUMER_STOP = ("            if _p2_stopped:\n"
+                 "                return")
+ANNOUNCE = ("    launch, kept = _p2_resume_plan(queue_dir, enabled_agents)\n"
+            "    _p2_announce_restored(kept)")
+PLAN = "    launch, kept = _p2_resume_plan(queue_dir, enabled_agents)"
+R_SOFT = ("                # phase, as it always has — kept agents included.\n"
+          "                launch, kept = list(enabled_agents), {}")
+R_SOFT_RETRY = ("                    emit_event(\"phase_restart\", phase=2, "
                 "reason=\"user_retry_after_soft_timeout\")")
-R_LEGACY = "                        _p2_launch, _p2_restored = list(enabled_agents), {}  # wave 10.9, as above"
-R_RESTART = ("                # ⭐ Wave 10.9: new input re-runs the whole phase, kept agents too.\n"
-             "                _p2_launch, _p2_restored = list(enabled_agents), {}")
+R_LEGACY = "                launch, kept = list(enabled_agents), {}  # wave 10.9, as above"
+R_RESTART = ("        # ⭐ Wave 10.9: new input re-runs the whole phase, kept agents too.\n"
+             "        launch, kept = list(enabled_agents), {}")
 RESAVE_SITE = "                if _p2_needs_resave(r):"
 #: The announce.
 A_STATUS = "            _write_agent_terminal_status(key, \"complete\")"
@@ -173,7 +213,7 @@ MUTANTS = [
     ("W3", "under", RESEARCH,
      "the findings are not carried, so a kept agent's Findings tab falls back to "
      "section headings",
-     [(FINDINGS, "findings=None)")]),
+     [(FINDINGS, "findings=None,")]),
     ("W4", "under", RESEARCH,
      "taking an agent out does nothing — a relaunched agent keeps its old entry",
      [(ERASE, "        pass")]),
@@ -204,49 +244,72 @@ MUTANTS = [
      [(L_CHATGPT, "        for _k in (\"chatgpt\", \"gemini\", \"claude\"):\n"
                   "            _p2_mark_agent_done(_p2_run_dir(), _k, False)")]),
 
-    # ── M: the main Phase-2 entry ───────────────────────────────────────────
+    # ── M: the phase itself, `_p2_run_with_resume` ──────────────────────────
     ("M1", "under", RESEARCH,
      "⛔⛔ the main call launches the roster, not the plan",
      [(MAIN_CALL, "enabled_agents=enabled_agents),")]),
     ("M2", "under", RESEARCH,
      "the kept results never join — the phase reports them as missing",
-     [(MERGE, "            pass")]),
-    ("M3", "under", RESEARCH,
-     "⛔ THE MERGE MOVES BELOW THE OFF-TOPIC SWEEP — a kept report is never judged "
-     "again",
-     [(MERGE, "            pass"),
-      (SWEEP_NEXT, MERGE + "\n" + SWEEP_NEXT)]),
+     [(MERGE, "    pass")]),
+    ("M3", "over", RESEARCH,
+     "⛔ THE KEPT REPORTS ARE DROPPED BETWEEN THE PHASE AND THE SINK — the "
+     "off-topic sweep, the links and the hand-off judge a phase that is missing "
+     "them, and the call above still reads exactly right",
+     [(CONSUMER_STOP, CONSUMER_STOP + "\n"
+       "            results = {n: r for n, r in results.items() if not r.get(\"_restored\")}")]),
     ("M4", "under", RESEARCH,
      "the kept agents are never announced — they sit on the web's re-seeded row "
      "for the whole phase",
-     [(ANNOUNCE, "            _p2_start = time.time()")]),
+     [(ANNOUNCE, PLAN)]),
     ("M5", "under", RESEARCH,
      "the plan is asked about no run at all, so it keeps nothing",
-     [(PLAN, "_p2_launch, _p2_restored = _p2_resume_plan(None, enabled_agents)")]),
+     [(PLAN, "    launch, kept = _p2_resume_plan(None, enabled_agents)")]),
     ("M6", "over", RESEARCH,
      "a person's soft-timeout Retry/Skip stops meaning the whole phase",
-     [(R_SOFT, "                        # WHOLE phase, as it always has — kept agents included.")]),
+     [(R_SOFT, "                # phase, as it always has — kept agents included.")]),
     ("M7", "over", RESEARCH,
      "the legacy timeout card's Retry/Skip stops meaning the whole phase",
-     [(R_LEGACY, "                        pass  # wave 10.9, as above")]),
+     [(R_LEGACY, "                pass  # wave 10.9, as above")]),
     ("M8", "over", RESEARCH,
      "new input mid-phase stops reaching the kept agents",
-     [(R_RESTART, "                # ⭐ Wave 10.9: new input re-runs the whole phase, kept agents too.")]),
+     [(R_RESTART, "        # ⭐ Wave 10.9: new input re-runs the whole phase, kept agents too.")]),
     ("M9", "over", RESEARCH,
      "⛔ ONLY RETRY WIDENS — a Skip keeps the kept results, so a phase the person "
      "skipped is recorded complete after `phase_skipped` said otherwise",
-     [(R_SOFT, "                        # WHOLE phase, as it always has — kept agents included."),
-      (R_SOFT_RETRY, "                            _p2_launch, _p2_restored = list(enabled_agents), {}\n"
+     [(R_SOFT, "                # phase, as it always has — kept agents included."),
+      (R_SOFT_RETRY, "                    launch, kept = list(enabled_agents), {}\n"
                      + R_SOFT_RETRY)]),
     ("M10", "over", RESEARCH,
-     "⛔⛔ THE ROSTER IS TRIMMED TO THE LAUNCH LIST — the safety filter throws the "
-     "kept reports away",
-     [(ANNOUNCE, "            _p2_announce_restored(_p2_restored)\n"
-                 "            enabled_agents = _p2_launch\n"
-                 "            _p2_start = time.time()")]),
+     "⛔⛔ THE SAFETY FILTER IS GIVEN THE LAUNCH LIST INSTEAD OF THE ROSTER — the "
+     "obvious simplification, and it throws every kept report away on its way out",
+     [(FILTER, "    return _p2_only_enabled(results, launch), user_skipped, False")]),
     ("M11", "under", RESEARCH,
      "the finalize re-save re-writes kept reports again",
      [(RESAVE_SITE, "                if r[\"text\"]:")]),
+    ("M12", "under", RESEARCH,
+     "⛔⛔ THE DEFECT, RE-OPENED BY ONE ADDED LINE — the launch list is widened "
+     "back to the roster after the plan was made, so every finished Deep Research "
+     "is bought again while the plan above still looks installed",
+     [(ANNOUNCE, ANNOUNCE + "\n    launch = list(enabled_agents)")]),
+    ("M13", "under", RESEARCH,
+     "⛔⛔ THE SAME, FROM THE OTHER END — one added line empties the kept results, "
+     "so they are announced and persisted complete and then dropped from the phase",
+     [(MERGE, "    kept = {}\n" + MERGE)]),
+    ("M14", "over", RESEARCH,
+     "a person's Stop at the timeout card no longer ends the run — the pipeline "
+     "carries an empty Phase 2 into Phase 3",
+     [(STOPPED, "                return results, user_skipped, False")]),
+    ("M15", "over", RESEARCH,
+     "the restart cap goes from three attempts to one",
+     [(CAP, "    for _p2_attempt in range(1):")]),
+    ("M16", "over", RESEARCH,
+     "the safety filter drops a kept agent as well as the disabled ones",
+     [(FILTER_BODY, "    names = {_agent_display_name(a) for a in enabled_agents}\n"
+                    "    results = {n: r for n, r in (results or {}).items() "
+                    "if not r.get(\"_restored\")}")]),
+    ("M17", "over", RESEARCH,
+     "no roster configured means DROP EVERYTHING rather than keep everything",
+     [(FILTER_EMPTY, "    if not enabled_agents:\n        return {}")]),
 
     # ── A: the announce ─────────────────────────────────────────────────────
     ("A1", "under", RESEARCH,
@@ -265,6 +328,60 @@ MUTANTS = [
     ("A5", "under", RESEARCH,
      "the kept agent's report link is never re-emitted",
      [(A_LINK, "            pass")]),
+
+    # ── N: the kept agent's TEXT is the extraction's, not the file's (D15) ──
+    ("N1", "under", RESEARCH,
+     "⛔⛔ THE NUMBERED FILE IS HANDED BACK AS THE EXTRACTION — a kept agent's "
+     "`##### Sources` list lands in the MIDDLE of the consolidated report, where "
+     "the web's end-anchored strip leaves it",
+     [(DENUMBER_CALL, "        pass")]),
+    ("N2", "under", RESEARCH,
+     "only the markers come off — the bibliography still rides into the middle of "
+     "the consolidated report",
+     [(DENUMBER_BODY, "    return _DOC_SOURCE_MARK_INLINE_RE.sub(\"\", md)")]),
+    ("N3", "under", RESEARCH,
+     "only the bibliography comes off — the inline `[n]` numbers point at a list "
+     "that is no longer there",
+     [(DENUMBER_BODY, "    return _strip_numbered_sources_section(md)")]),
+    ("N4", "over", RESEARCH,
+     "⛔ THE MARKER PATTERN IS WIDENED TO ANY MARKDOWN LINK — every link the agent "
+     "wrote itself is deleted out of its own report",
+     [(MARK_INLINE_RE, MARK_INLINE_WIDE)]),
+    ("N5", "under", RESEARCH,
+     "⛔ THE TWO STEPS SWAP — the strip is gated on the markers being present, so "
+     "removing them first makes it a no-op and the bibliography survives",
+     [(DENUMBER_BODY, "    return _strip_numbered_sources_section("
+                      "_DOC_SOURCE_MARK_INLINE_RE.sub(\"\", md))")]),
+
+    # ── S: the kept agent's CARD keeps what its completion showed (D16) ─────
+    ("S1", "under", RESEARCH,
+     "⛔ the record stops keeping the progress snapshot, so a resumed agent's card "
+     "shows complete with 0 sources and no sections for the rest of the phase",
+     [(SNAP_STORED, "                       \"progress\": {}}")]),
+    ("S2", "under", RESEARCH,
+     "the completion branch stops handing the snapshot to the record",
+     [(SNAP_PASSED, "                            progress=None)")]),
+    ("S3", "under", RESEARCH,
+     "the announce stops carrying the sources it kept — the web's merge keeps the "
+     "re-seeded empty row",
+     [(A_SOURCE_URLS, "                       sourceUrls=[],")]),
+    ("S4", "under", RESEARCH,
+     "the sources COUNT ignores the list it is drawn beside — a panel that never "
+     "reported a count leaves the card saying 0 sources over a list of them",
+     [(A_SOURCES_MAX, "                       sources=int(snap.get(\"sources\", 0) or 0),")]),
+    ("S5", "under", RESEARCH,
+     "the in-process snapshot ring is not put back, so save_meta's own readers "
+     "see a kept agent with nothing",
+     [(SNAP_RESTORE, "            pass")]),
+    ("S6", "over", RESEARCH,
+     "the record keeps the findings extractor's raw input too — the one field "
+     "with no reader and all of the size",
+     [(SNAP_LISTS, "_P2_SNAPSHOT_LISTS = (\"source_urls\", \"sections\", \"steps\", "
+                   "\"source_items\")")]),
+    ("S7", "under", RESEARCH,
+     "a count that is not a number goes through as it is, and the emit that "
+     "carries the kept agent's report link raises on it",
+     [(SNAP_COERCE, "            out[k] = snapshot[k]")]),
 
     # ── B: M11, the owner decision ──────────────────────────────────────────
     ("B1", "over", RESEARCH,
