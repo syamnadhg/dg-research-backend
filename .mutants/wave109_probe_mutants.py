@@ -93,6 +93,69 @@ C_BOUND = ("                await asyncio.wait_for(self.context.close(),\n"
 C_CONST = "_BROWSER_CLOSE_TIMEOUT_SEC = 30.0\n"
 C_LOG = "            log(f\"Browser close error: {str(e) or type(e).__name__}\", \"WARN\")\n"
 
+# ── anchors: D14, the driver the kill arm used to leave running ────────────
+#: The stop, bounded, in its own try, AFTER the kill.
+C_STOP = ("            if self.playwright:\n"
+          "                try:\n"
+          "                    await asyncio.wait_for(self.playwright.stop(),\n"
+          "                                           timeout=_BROWSER_STOP_TIMEOUT_SEC)\n"
+          "                except Exception as _stop_err:\n"
+          "                    log(f\"Playwright stop error: \"\n"
+          "                        f\"{str(_stop_err) or type(_stop_err).__name__}\", \"WARN\")\n")
+#: Giving up both handles, so a second close() repeats nothing.
+C_CLEAR = ("            self.context = None\n"
+           "            self.playwright = None\n")
+#: The head of the kill loop — the line the stop must come AFTER.
+C_KILL_HEAD = "            # Kill only OUR profile's chromium — never nuke all chrome.exe\n"
+C_STOP_CONST = "_BROWSER_STOP_TIMEOUT_SEC = 10.0\n"
+
+# ── anchors: D5, the watchdog beside phase 2's poll ────────────────────────
+#: The narrow question — did it ANSWER — and the wide one it is not.
+W_ASK = "            if not await _browser_context_is_unresponsive(browser):\n"
+#: An answer wipes the slate.
+W_RESET = ("                silences = 0\n"
+           "                continue\n")
+#: The ladder.
+W_LADDER = ("            if silences < _PHASE2_HANG_STRIKES:\n"
+            "                continue\n")
+#: The poll can come back DURING the probe that spends the ladder.
+W_RACE = ("            if task.done():\n"
+          "                # ⭐ THE RACE THE LADDER CREATES. Each rung costs a full probe,\n"
+          "                # and the poll can come back during one — with the phase's\n"
+          "                # results. Unwinding on a browser nobody is waiting on any more\n"
+          "                # would buy the whole of phase 2 a second time.\n"
+          "                return task.result()\n")
+#: The unwind: the flag, and the sweep's own sentence.
+W_RAISE = ("            _runtime.last_failure_kind = \"browser_crash\"\n"
+           "            raise RuntimeError(\n"
+           "                \"research browser hung during phase 2 (browser crash)\")\n")
+#: The poll must not keep driving the old tabs.
+W_CANCEL = ("        if not task.done():\n"
+            "            task.cancel()\n")
+W_CHECK_CONST = "_PHASE2_HANG_CHECK_SEC = 120.0\n"
+W_STRIKES_CONST = "_PHASE2_HANG_STRIKES = 3\n"
+#: `_browser_context_is_unresponsive`: no handle is not a silence.
+U_NONE = ("    ctx = getattr(browser, \"context\", None)\n"
+          "    if ctx is None:\n"
+          "        return False\n")
+#: …and its own bound on the question.
+U_BOUND = ("        await asyncio.wait_for(ctx.cookies(),\n"
+           "                               timeout=_CTX_PROBE_TIMEOUT_SEC)\n")
+
+# ── anchors: D5, the decoration that ties the watchdog to the poll ─────────
+X_DECO = ("@_watched_for_a_hung_browser\n"
+          "async def poll_all_agents_round_robin(agents, browser, cua_client,\n")
+X_WRAPS = "    @functools.wraps(poll_fn)\n"
+X_BODY = ("        return await _poll_phase2_watching_for_a_hang(\n"
+          "            browser, poll_fn(agents, browser, cua_client, *args, **kwargs))\n")
+#: …and an answer is an answer, whatever it says.
+U_ARMS = ("    except asyncio.TimeoutError:\n"
+          "        return True\n"
+          "    except Exception:\n"
+          "        # It answered. Whatever it said, it is talking to us.\n"
+          "        return False\n"
+          "    return False\n")
+
 # ── anchors: M8, the helper ────────────────────────────────────────────────
 H_BODY = ("    if await _browser_context_is_dead(browser):\n"
           "        return \"browser_dead\"\n"
@@ -246,6 +309,163 @@ MUTANTS = [
      "\u26d4 the unwind loses its flag: the kind rides on the text alone, and the "
      "top-level login-interrupt check reads the flag",
      [(U_DEAD, "            if _p3_fail_kind == \"browser_dead\":\n")]),
+
+    # ── D14 (repair round): the driver behind the kill ──
+    ("C5", "under", RESEARCH,
+     "\u26d4\u26d4 THE LEAK ITSELF \u2014 the kill arm gives up on Chrome and "
+     "leaves the node driver and its pipe running for the life of --serve",
+     [(C_STOP, "")]),
+
+    ("C6", "under", RESEARCH,
+     "\u26d4\u26d4 the stop is there and unbounded: the run's way out now waits "
+     "on a driver that is itself waiting, which is the freeze one layer down",
+     [(C_STOP, "            if self.playwright:\n"
+               "                try:\n"
+               "                    await self.playwright.stop()\n"
+               "                except Exception as _stop_err:\n"
+               "                    log(f\"Playwright stop error: \"\n"
+               "                        f\"{str(_stop_err) or type(_stop_err).__name__}\", \"WARN\")\n")]),
+
+    ("C7", "under", RESEARCH,
+     "\u26d4 the handles survive the arm: the next close() repeats the bounded "
+     "wait, the kill and the stop on a browser we already gave up on",
+     [(C_CLEAR, "")]),
+
+    ("C8", "under", RESEARCH,
+     "\u26d4 only the context is given up \u2014 the stopped driver handle stays, "
+     "so a second close() stops it again",
+     [(C_CLEAR, "            self.context = None\n")]),
+
+    ("C9", "over", RESEARCH,
+     "\u26d4 the stop runs BEFORE the kill: stopping a driver that is waiting "
+     "for a Chrome which never exits is the wait we are escaping",
+     [(C_STOP, ""),
+      (C_KILL_HEAD,
+       "            if self.playwright:\n"
+       "                try:\n"
+       "                    await asyncio.wait_for(self.playwright.stop(),\n"
+       "                                           timeout=_BROWSER_STOP_TIMEOUT_SEC)\n"
+       "                except Exception as _stop_err:\n"
+       "                    log(f\"Playwright stop error: \"\n"
+       "                        f\"{str(_stop_err) or type(_stop_err).__name__}\", \"WARN\")\n"
+       "            # Kill only OUR profile's chromium \u2014 never nuke all chrome.exe\n")]),
+
+    ("C10", "under", RESEARCH,
+     "\u26d4 a stop that throws escapes close() \u2014 out of the arm that IS the "
+     "unwind, past the kill it just did",
+     [(C_STOP, "            if self.playwright:\n"
+               "                await asyncio.wait_for(self.playwright.stop(),\n"
+               "                                       timeout=_BROWSER_STOP_TIMEOUT_SEC)\n")]),
+
+    ("C11", "under", RESEARCH,
+     "\u26d4 the driver bound is an hour",
+     [(C_STOP_CONST, "_BROWSER_STOP_TIMEOUT_SEC = 3600.0\n")]),
+
+    # ── D5 (repair round): the watchdog beside phase 2's poll ──
+    ("W1", "under", RESEARCH,
+     "\u26d4\u26d4 THE PAUSE ENDS IN A FAKE CRASH \u2014 the watchdog asks the "
+     "wide question, so a browser somebody CLOSED reads as one gone silent",
+     [(W_ASK, "            if not await _browser_context_is_dead(browser):\n")]),
+
+    ("W2", "under", RESEARCH,
+     "\u26d4 an answer stops wiping the slate: stalls minutes apart add up and "
+     "a healthy run is unwound at the third one, whenever it comes",
+     [(W_RESET, "                continue\n")]),
+
+    ("W3", "under", RESEARCH,
+     "\u26d4\u26d4 THE FREEZE, WITH A LOG LINE \u2014 the hang is noticed, named, "
+     "and watched for ever: nothing unwinds",
+     [(W_RAISE, "            silences = 0\n"
+                "            continue\n")]),
+
+    ("W4", "under", RESEARCH,
+     "\u26d4 the unwind loses the marker the top-level handler re-derives the "
+     "kind from, so a reset runtime downgrades it to an ordinary failure card",
+     [(W_RAISE, "            _runtime.last_failure_kind = \"browser_crash\"\n"
+                "            raise RuntimeError(\n"
+                "                \"research browser hung during phase 2\")\n")]),
+
+    ("W5", "under", RESEARCH,
+     "\u26d4 the unwind loses its flag",
+     [(W_RAISE, "            raise RuntimeError(\n"
+                "                \"research browser hung during phase 2 (browser crash)\")\n")]),
+
+    ("W6", "under", RESEARCH,
+     "\u26d4\u26d4 the poll is abandoned, not cancelled: the relaunch builds a "
+     "second browser under a loop still driving the first one's tabs",
+     [(W_CANCEL, "        if not task.done():\n"
+                 "            pass\n")]),
+
+    ("W7", "under", RESEARCH,
+     "\u26d4 the watchdog looks once an hour \u2014 a phase-long freeze with a "
+     "check in it",
+     [(W_CHECK_CONST, "_PHASE2_HANG_CHECK_SEC = 3600.0\n")]),
+
+    ("W8", "over", RESEARCH,
+     "\u26d4\u26d4 THE OVER-CORRECTION \u2014 one silence unwinds the run, so a "
+     "single stalled cookie read costs a healthy phase 2 and a crash-budget unit",
+     [(W_STRIKES_CONST, "_PHASE2_HANG_STRIKES = 1\n")]),
+
+    ("W9", "over", RESEARCH,
+     "\u26d4 a browser with no context reads as silent \u2014 the state a pause "
+     "leaves behind between the close and the relaunch",
+     [(U_NONE, "    ctx = getattr(browser, \"context\", None)\n"
+               "    if ctx is None:\n"
+               "        return True\n")]),
+
+    ("W10", "over", RESEARCH,
+     "\u26d4\u26d4 the narrow question widens back into the wide one: a close "
+     "error counts as silence, and the watchdog owns the closed browser again",
+     [(U_ARMS, "    except asyncio.TimeoutError:\n"
+               "        return True\n"
+               "    except Exception as _e:\n"
+               "        return _is_browser_close_error(_e)\n"
+               "    return False\n")]),
+
+    ("W11", "under", RESEARCH,
+     "\u26d4\u26d4 silence reads as an answer: the watchdog runs, probes, and "
+     "can never see the one thing it is there for",
+     [(U_ARMS, "    except asyncio.TimeoutError:\n"
+               "        return False\n"
+               "    except Exception:\n"
+               "        return False\n"
+               "    return False\n")]),
+
+    ("W12", "over", RESEARCH,
+     "\u26d4 the ladder is one rung whatever the constant says",
+     [(W_LADDER, "            if silences < 1:\n"
+                 "                continue\n")]),
+
+    ("W13", "under", RESEARCH,
+     "\u26d4\u26d4 the watchdog's own question is unbounded \u2014 the one probe "
+     "left in the run hangs on the browser it is asking about",
+     [(U_BOUND, "        await ctx.cookies()\n")]),
+
+    ("W14", "under", RESEARCH,
+     "⛔ a phase 2 that came back DURING the last probe is thrown away and "
+     "bought again — the unwind decides on a browser nobody is waiting on",
+     [(W_RACE, "")]),
+
+    ("X1", "under", RESEARCH,
+     "\u26d4\u26d4 THE WIRING \u2014 the poll is declared undecorated, so every "
+     "word of the watchdog is still there and nothing runs it",
+     [(X_DECO, "async def poll_all_agents_round_robin(agents, browser, cua_client,\n")]),
+
+    ("X2", "under", RESEARCH,
+     "\u26d4\u26d4 the decoration is applied and awaits the poll DIRECTLY: the "
+     "mark is set, the watchdog is imported, and the freeze is unchanged",
+     [(X_BODY, "        return await poll_fn(agents, browser, cua_client, *args, **kwargs)\n")]),
+
+    ("X3", "under", RESEARCH,
+     "\u26d4 the watchdog is handed the wrong argument \u2014 it probes something "
+     "with no context, which never answers 'silent', so it can never fire",
+     [(X_BODY, "        return await _poll_phase2_watching_for_a_hang(\n"
+               "            agents, poll_fn(agents, browser, cua_client, *args, **kwargs))\n")]),
+
+    ("X4", "under", RESEARCH,
+     "\u26d4 the wrapper stops carrying `__wrapped__`: eight other files read "
+     "this function's SOURCE and would silently start reading the wrapper's",
+     [(X_WRAPS, "")]),
 ]
 
 

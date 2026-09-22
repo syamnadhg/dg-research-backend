@@ -36275,6 +36275,11 @@ async def scrape_chatgpt_activity_panel_tracking(page):
 # profile's Chrome instead. A healthy close takes a second or two; the bound is
 # generous because a kill can drop a sign-in Chrome has not flushed yet (#898b).
 _BROWSER_CLOSE_TIMEOUT_SEC = 30.0
+# How long the same fallback then lets the node DRIVER shut down. Short, because
+# by then our Chrome has already been killed and a driver with no browser left
+# to wait for exits in well under a second — anything longer is the driver
+# itself wedged, and we are throwing the handle away either way.
+_BROWSER_STOP_TIMEOUT_SEC = 10.0
 
 
 class Browser:
@@ -36905,6 +36910,30 @@ class Browser:
                         pass
             except Exception:
                 pass
+            # ⛔⛔ AND THE DRIVER OUTLIVES THE KILL UNLESS WE STOP IT (wave 10.9,
+            # repair round). `playwright.stop()` lives on the success path only,
+            # so every close that ended here — a hung Chrome now, an erroring
+            # close before that — left the node driver process and its open pipe
+            # running for the life of `--serve`, and the relaunch above started
+            # another one. Days of crash retries meant a driver apiece.
+            #
+            # ⭐ AFTER the kill, on purpose: stopping the driver first means
+            # waiting on a node process that is itself waiting for a Chrome that
+            # never exits. Bounded, in its own try, for the reason the close is —
+            # this arm is the run's way out, and nothing in it may block it.
+            if self.playwright:
+                try:
+                    await asyncio.wait_for(self.playwright.stop(),
+                                           timeout=_BROWSER_STOP_TIMEOUT_SEC)
+                except Exception as _stop_err:
+                    log(f"Playwright stop error: "
+                        f"{str(_stop_err) or type(_stop_err).__name__}", "WARN")
+            # Neither handle is usable now, and a second close() must not repeat
+            # the bounded wait and the kill on handles we have already given up
+            # on (`pause_and_close_browser` and run_pipeline's finally both call
+            # close() on the same Browser). `start()` installs fresh ones.
+            self.context = None
+            self.playwright = None
 
 
 # ── Action Executor ────────────────────────────────────────────────────────────
@@ -43296,6 +43325,37 @@ async def _sweep_foreign_chatgpt_tabs(pending: dict, results: dict, *,
     return dropped
 
 
+def _watched_for_a_hung_browser(poll_fn):
+    """Run the phase-2 poll with somebody watching the browser from OUTSIDE it.
+
+    ⛔⛔ THE GUARDS ALL LIVE BETWEEN THE AWAITS, AND A HUNG CHROME PARKS US IN
+    ONE (wave 10.9, repair round). The tick below awaits
+    `browser.switch_to_page(page)` → `page.bring_to_front()` and
+    `page.evaluate(...)`, neither of which the driver bounds, and it consults
+    `_browser_context_is_dead` only after a tab reports CLOSED — which a hung
+    Chrome's tabs never do. The phase ceiling above only warns, so the run sat
+    frozen until the worker's five-hour ceiling (#547). A tick that overran
+    cannot report its own overrun either: the overrun IS an await that never
+    returns, so there is no line after it to check the clock on.
+
+    ⭐ ON THE DEFINITION, NOT AT THE CALL, so no caller can be written that
+    forgets it — and because nothing in the suite can execute the poll itself,
+    the mark below is the only thing a test can hold the wiring by.
+    `_poll_phase2_watching_for_a_hang` holds the decision; this only ties it to
+    the one coroutine that needs it.
+    """
+    import functools
+
+    @functools.wraps(poll_fn)
+    async def _watched(agents, browser, cua_client, *args, **kwargs):
+        return await _poll_phase2_watching_for_a_hang(
+            browser, poll_fn(agents, browser, cua_client, *args, **kwargs))
+
+    _watched.watches_for_a_hung_browser = True
+    return _watched
+
+
+@_watched_for_a_hung_browser
 async def poll_all_agents_round_robin(agents, browser, cua_client,
                                        max_wait_min=90, poll_interval=30, verbose=False):
     """Round-robin poll all verified agents until each completes or times out.
@@ -67396,6 +67456,140 @@ async def _p3_upload_failure_kind(exc, browser) -> str:
     if _is_browser_close_error(exc):
         return "tab_closed"
     return "other"
+
+
+# ── The phase-2 hang watchdog ──────────────────────────────────────────────
+# ⛔⛔ EVERY GUARD ABOVE RUNS INSIDE THE RUN, AND A HUNG CHROME NEVER GIVES THE
+# RUN ITS TURN BACK (wave 10.9, repair round). The bounded probe answers "dead"
+# beautifully — at the call sites that reach it. Phase 2's round-robin does not:
+# its tick awaits `browser.switch_to_page(page)` → `page.bring_to_front()` and
+# `page.evaluate(...)`, which the driver sends with no timeout of its own, and
+# `_browser_context_is_dead` is consulted only after a tab reports CLOSED. A
+# hung Chrome's tabs never do. So the tick parks inside one of those awaits and
+# the phase ceiling above it only warns (soft_warn_only), leaving the run frozen
+# until the worker's five-hour ceiling — the freeze #547 is about.
+#
+# ⛔ AND A TICK THAT OVERRAN CANNOT REPORT ITS OWN OVERRUN, because the overrun
+# IS an await that never returns: there is no line after it to check the clock
+# on. The only thing that can see it is somebody OUTSIDE the tick — hence a
+# watchdog task beside the poll rather than more bounds inside it. Bounding each
+# page call in turn would also have to be redone for every call the loop grows.
+#
+# ⭐ AND IT ASKS THE ONE QUESTION THAT SEPARATES A HANG FROM EVERYTHING ELSE:
+# did the browser ANSWER? A context that is closed — the pause path closes the
+# browser and blocks for as long as the person likes, and a crash closes it
+# outright — answers instantly, with an error, and is NOT this watchdog's
+# business: the poll's own crash sweep already handles a closed browser, and a
+# pause must never be mistaken for one. Only silence counts.
+#: How often the watchdog asks, while phase 2 polls.
+_PHASE2_HANG_CHECK_SEC = 120.0
+#: How many consecutive silences unwind the run. Each one is a full
+#: `_CTX_PROBE_TIMEOUT_SEC` of silence and they are a check apart, so three
+#: means the browser PROCESS has not answered a trivial CDP read across ~four
+#: minutes. A live Chrome answers one in milliseconds however hard its tabs are
+#: working — cookies are the browser process's, not the renderer's — so three
+#: buys immunity to a one-off stall (a laptop waking, a disk stall on the
+#: profile) for four minutes of a ceiling measured in hours.
+_PHASE2_HANG_STRIKES = 3
+#: How long the cancelled poll gets to unwind before we raise anyway. It is
+#: cancelled INSIDE a call that is not answering, so its own unwind may be slow.
+_PHASE2_HANG_UNWIND_GRACE_SEC = 30.0
+
+
+async def _browser_context_is_unresponsive(browser) -> bool:
+    """Did the context fail to ANSWER, as opposed to answering "I am closed"?
+
+    ⭐ THE DISTINCTION `_browser_context_is_dead` DELIBERATELY DOES NOT MAKE.
+    That question is "can this context run a phase", and a closed context and a
+    silent one both answer no. This one is narrower on purpose: it is asked by
+    the watchdog, on a schedule, about a browser NOBODY has reported anything
+    wrong with — so it must say yes only to the state that no other guard can
+    see. A context that answers with a close error is a browser somebody closed
+    (a pause) or one that died (the poll's crash sweep raises within a tick).
+    Neither is a hang, and neither is ours to act on.
+    """
+    ctx = getattr(browser, "context", None)
+    if ctx is None:
+        return False
+    try:
+        await asyncio.wait_for(ctx.cookies(),
+                               timeout=_CTX_PROBE_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        return True
+    except Exception:
+        # It answered. Whatever it said, it is talking to us.
+        return False
+    return False
+
+
+def _discard_task_outcome(task):
+    """Consume an abandoned task's exception so Python does not print
+    "Task exception was never retrieved" for a failure we have already
+    reported and acted on."""
+    if not task.cancelled():
+        try:
+            task.exception()
+        except Exception:
+            pass
+
+
+async def _poll_phase2_watching_for_a_hang(browser, poll_coro):
+    """Run phase 2's round-robin poll with somebody watching the browser.
+
+    Returns whatever the poll returns and re-raises whatever it raises — the
+    crash sweep's own RuntimeError included, untouched. The one thing it adds:
+    when Chrome has gone silent for `_PHASE2_HANG_STRIKES` checks in a row, the
+    poll is cancelled and the SAME "(browser crash)" RuntimeError the sweep
+    raises is raised in its place, with `last_failure_kind` set the same way, so
+    the recovery that already exists — unwind, bounded close (which kills our
+    profile's Chrome), silent relaunch and resume, and the Retry card once
+    BROWSER_CRASH_MAX_RETRIES is spent — runs exactly as it does for a crash.
+    No second opinion about what a dead browser means, and no second unwind.
+    """
+    task = asyncio.ensure_future(poll_coro)
+    silences = 0
+    try:
+        while True:
+            done, _still_running = await asyncio.wait(
+                {task}, timeout=_PHASE2_HANG_CHECK_SEC)
+            if done:
+                return task.result()
+            if not await _browser_context_is_unresponsive(browser):
+                # ⭐ ACCEPT POLARITY, and the whole reason for the counter: a
+                # browser that is merely SLOW — a heavy page, an agent mid
+                # stream, a tick that legitimately runs for minutes — answers,
+                # and answering wipes the slate.
+                silences = 0
+                continue
+            silences += 1
+            log(f"[browser] Chrome did not answer a cookie read within "
+                f"{_CTX_PROBE_TIMEOUT_SEC:g}s while phase 2 was polling "
+                f"({silences}/{_PHASE2_HANG_STRIKES})", "WARN")
+            if silences < _PHASE2_HANG_STRIKES:
+                continue
+            if task.done():
+                # ⭐ THE RACE THE LADDER CREATES. Each rung costs a full probe,
+                # and the poll can come back during one — with the phase's
+                # results. Unwinding on a browser nobody is waiting on any more
+                # would buy the whole of phase 2 a second time.
+                return task.result()
+            log("[browser] the research browser has been silent for "
+                f"{silences} checks and phase 2 is waiting on it — unwinding "
+                "the run so the crash path can replace it", "WARN")
+            _runtime.last_failure_kind = "browser_crash"
+            raise RuntimeError(
+                "research browser hung during phase 2 (browser crash)")
+    finally:
+        if not task.done():
+            task.cancel()
+            # It is cancelled inside an await that is not answering, so give it
+            # a bounded moment to unwind and then leave — this path is the run's
+            # way out and may not wait on the thing it is escaping. The relaunch
+            # builds a new Browser; the bounded close kills the Chrome this task
+            # may still be stuck on, and its await fails then. The callback is
+            # attached rather than called so it also covers that late finish.
+            task.add_done_callback(_discard_task_outcome)
+            await asyncio.wait({task}, timeout=_PHASE2_HANG_UNWIND_GRACE_SEC)
 
 
 def _plan_pipeline_auto_retry(queue_dir, resume_dir, failure_kind, crash_retries):

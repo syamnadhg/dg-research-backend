@@ -152,8 +152,10 @@ class _HungCloseCtx:
     def __init__(self):
         self.never = asyncio.Event()
         self.closed = False
+        self.attempts = 0
 
     async def close(self):
+        self.attempts += 1
         await self.never.wait()
 
 
@@ -166,29 +168,49 @@ class _QuickCloseCtx:
 
 
 class _Pw:
-    def __init__(self):
+    """The node driver handle. mode: 'ok' | 'hang' | 'error'. `events` is
+    shared with the fake Chrome processes so a test can read the ORDER."""
+
+    def __init__(self, mode="ok", events=None):
+        self.mode = mode
         self.stopped = False
+        self.stops = 0
+        self.events = [] if events is None else events
+        self.never = asyncio.Event()
 
     async def stop(self):
+        self.stops += 1
+        self.events.append("stop")
+        if self.mode == "hang":
+            await self.never.wait()
+        if self.mode == "error":
+            raise Exception("Driver connection already gone")
         self.stopped = True
 
 
 class _Proc:
-    def __init__(self, name, cmdline):
+    def __init__(self, name, cmdline, events=None):
         self.info = {"pid": 4242, "name": name, "cmdline": cmdline}
         self.killed = False
+        self.kills = 0
+        self.events = [] if events is None else events
 
     def kill(self):
         self.killed = True
+        self.kills += 1
+        self.events.append("kill")
 
 
-def _browser_with(tmp_path, ctx, monkeypatch):
+def _browser_with(tmp_path, ctx, monkeypatch, pw=None, events=None):
+    events = [] if events is None else events
     profile = tmp_path / "browser-profile"
     profile.mkdir()
     b = research.Browser(str(profile))
-    b.context, b.playwright = ctx, _Pw()
+    b.context = ctx
+    b.playwright = _Pw(events=events) if pw is None else pw
     ours = _Proc("Google Chrome", ["/Applications/Google Chrome",
-                                   f"--user-data-dir={profile.resolve()}"])
+                                   f"--user-data-dir={profile.resolve()}"],
+                 events=events)
     theirs = _Proc("Google Chrome", ["/Applications/Google Chrome",
                                      f"--user-data-dir={tmp_path.resolve()}/browser-profile-2"])
     psutil = pytest.importorskip("psutil")
@@ -221,6 +243,97 @@ def test_the_default_close_bound_is_generous_but_finite():
     """Generous because a kill can drop a sign-in Chrome has not flushed
     (#898b); finite because the unwind behind it is the only way out."""
     assert 5.0 <= research._BROWSER_CLOSE_TIMEOUT_SEC <= 120.0
+
+
+# ── D14: the kill arm gives up the DRIVER too ──────────────────────────────
+# ⛔⛔ THE LEAK (repair round). `playwright.stop()` lived on the success path
+# only, so every close that ended in the kill arm — a hung Chrome now, an
+# erroring close long before that — left the node driver process and its open
+# pipe running for the life of `--serve`, while the relaunch started another.
+# A week of crash retries meant a driver apiece, and "Future exception was
+# never retrieved" noise from the pipes nobody was reading.
+
+def test_a_hung_close_stops_the_driver_and_gives_up_its_handles(
+        tmp_path, monkeypatch, logs):
+    """⛔⛔ THE DEFECT. Before the repair `playwright.stop calls: 0` and the
+    handle was still set — the refuter's probe printed exactly that."""
+    monkeypatch.setattr(research, "_BROWSER_CLOSE_TIMEOUT_SEC", 0.05)
+    events = []
+    pw = _Pw(events=events)
+    b, ours, _theirs = _browser_with(tmp_path, _HungCloseCtx(), monkeypatch,
+                                     pw=pw, events=events)
+    _run_bounded(b.close())
+    assert pw.stops == 1, "the driver outlives the kill unless we stop it"
+    assert b.playwright is None and b.context is None
+    assert ours.kills == 1
+    assert events == ["kill", "stop"], (
+        "the kill comes FIRST — stopping the driver while it is still waiting "
+        "for a Chrome that never exits is the freeze one layer down")
+
+
+def test_a_driver_that_will_not_stop_does_not_hold_the_unwind(
+        tmp_path, monkeypatch, logs):
+    """The stop is bounded for the reason the close is: this arm is the run's
+    way out. Against an unbounded stop the outer wait times out here."""
+    monkeypatch.setattr(research, "_BROWSER_CLOSE_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(research, "_BROWSER_STOP_TIMEOUT_SEC", 0.05)
+    events = []
+    pw = _Pw("hang", events)
+    b, ours, _theirs = _browser_with(tmp_path, _HungCloseCtx(), monkeypatch,
+                                     pw=pw, events=events)
+    _run_bounded(b.close())
+    assert pw.stops == 1 and ours.kills == 1
+    assert b.playwright is None and b.context is None
+
+
+def test_a_driver_that_errors_on_stop_still_gives_up_its_handles(
+        tmp_path, monkeypatch, logs):
+    """A stop that throws must not escape close() — the callers that reach
+    this arm are a pause and run_pipeline's own finally."""
+    monkeypatch.setattr(research, "_BROWSER_CLOSE_TIMEOUT_SEC", 0.05)
+    events = []
+    pw = _Pw("error", events)
+    b, ours, _theirs = _browser_with(tmp_path, _HungCloseCtx(), monkeypatch,
+                                     pw=pw, events=events)
+    _run_bounded(b.close())
+    assert ours.kills == 1
+    assert b.playwright is None and b.context is None
+    assert any(lvl == "WARN" and "stop" in m.lower() for lvl, m in logs), logs
+
+
+def test_a_second_close_after_a_hung_one_is_a_no_op(tmp_path, monkeypatch, logs):
+    """⭐ The handles are cleared so the SECOND close — `pause_and_close_browser`
+    and run_pipeline's finally both call it — does not repeat the bounded wait,
+    the kill and the stop on handles we already gave up on."""
+    monkeypatch.setattr(research, "_BROWSER_CLOSE_TIMEOUT_SEC", 0.05)
+    events = []
+    pw = _Pw(events=events)
+    ctx = _HungCloseCtx()
+    b, ours, _theirs = _browser_with(tmp_path, ctx, monkeypatch,
+                                     pw=pw, events=events)
+    _run_bounded(b.close())
+    _run_bounded(b.close())
+    assert ctx.attempts == 1, "nothing left to close"
+    assert pw.stops == 1 and ours.kills == 1
+
+
+def test_a_healthy_close_stops_the_driver_exactly_once(tmp_path, monkeypatch, logs):
+    """⭐ ACCEPT POLARITY. The success path is untouched: one stop, no kill,
+    and the fallback's stop does not run a second time on top of it."""
+    monkeypatch.setattr(research, "_BROWSER_CLOSE_TIMEOUT_SEC", 0.5)
+    events = []
+    pw = _Pw(events=events)
+    b, ours, theirs = _browser_with(tmp_path, _QuickCloseCtx(), monkeypatch,
+                                    pw=pw, events=events)
+    _run_bounded(b.close())
+    assert pw.stops == 1 and events == ["stop"]
+    assert ours.kills == 0 and theirs.kills == 0
+
+
+def test_the_driver_stop_bound_is_short_and_finite():
+    """Short because our Chrome is already dead by then and a driver with
+    nothing left to wait for exits at once."""
+    assert 1.0 <= research._BROWSER_STOP_TIMEOUT_SEC <= 60.0
 
 
 # ── M8: the upload failure asks the context before it reads the text ───────
@@ -373,3 +486,319 @@ def test_an_ordinary_failure_on_a_live_browser_still_gets_the_card(p3):
     assert len(p3.cards) == 1 and p3.cards[0][2].get("can_retry") is True
     assert p3.decisions == [3]
     assert research._runtime.last_failure_kind == ""
+
+
+# ── D5: the hang phase 2's poll loop could not see ─────────────────────────
+# ⛔⛔ THE PROBE NEVER REACHED IT (repair round). The round-robin tick awaits
+# `browser.switch_to_page(page)` → `page.bring_to_front()` and `page.evaluate`,
+# none of which the driver bounds, and it consults `_browser_context_is_dead`
+# only after a tab reports CLOSED — which a hung Chrome's tabs never do. So the
+# tick parked inside a page call, the phase ceiling above it only warns, and the
+# run sat frozen until the worker's five-hour ceiling.
+#
+# ⛔ A tick that overran cannot report its own overrun: the overrun IS an await
+# that never returns, so there is no line after it to check the clock on. Only
+# somebody outside the tick can see it. These tests drive that somebody.
+
+class _ScriptedCtx:
+    """A context whose answers are scripted per probe: 'ok' | 'hang' | 'closed'.
+    The last entry repeats, so one word describes every probe."""
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+        self.asked = 0
+        self.never = asyncio.Event()
+
+    async def cookies(self):
+        self.asked += 1
+        answer = self.answers[min(self.asked - 1, len(self.answers) - 1)]
+        if answer == "hang":
+            await self.never.wait()  # nobody ever sets it
+        if answer == "closed":
+            raise Exception(CLOSED)
+        return []
+
+
+class _CtxThatFreesThePoll:
+    """Silent, and on the silence that would spend the ladder it lets the poll
+    finish first — the race a counter of silences creates."""
+
+    def __init__(self, free_on, event):
+        self.free_on, self.event = free_on, event
+        self.asked = 0
+        self.never = asyncio.Event()
+
+    async def cookies(self):
+        self.asked += 1
+        if self.asked >= self.free_on:
+            self.event.set()
+            await asyncio.sleep(0.005)   # …and let it actually run to the end
+        await self.never.wait()          # still inside this probe's bound
+
+
+class _FrozenPoll:
+    """The round-robin, parked in a page call the driver never bounds."""
+
+    def __init__(self):
+        self.cancelled = False
+        self.never = asyncio.Event()
+
+    async def run(self):
+        try:
+            await self.never.wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        return {"never": "reached"}
+
+
+class _WorkingPoll:
+    """The round-robin doing something slow but real: a heavy page's evaluate
+    can legitimately take tens of seconds, and several watchdog checks fall
+    inside one of them."""
+
+    def __init__(self, evaluate_sec, rounds=1):
+        self.evaluate_sec, self.rounds = evaluate_sec, rounds
+        self.cancelled = False
+
+    async def run(self):
+        try:
+            for _ in range(self.rounds):
+                await asyncio.sleep(self.evaluate_sec)   # page.evaluate(...)
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        return {"ChatGPT": {"status": "complete"}}
+
+
+@pytest.fixture
+def fast_watchdog(monkeypatch):
+    """The real ladder on a millisecond clock: three probes' worth of silence,
+    a check apart, with the same arithmetic the shipped constants have."""
+    monkeypatch.setattr(research, "_CTX_PROBE_TIMEOUT_SEC", 0.02)
+    monkeypatch.setattr(research, "_PHASE2_HANG_CHECK_SEC", 0.01)
+    monkeypatch.setattr(research, "_PHASE2_HANG_STRIKES", 2)
+    monkeypatch.setattr(research, "_PHASE2_HANG_UNWIND_GRACE_SEC", 0.5)
+    monkeypatch.setattr(research._runtime, "last_failure_kind", "")
+
+
+def test_a_hung_chrome_unwinds_phase_two_instead_of_freezing_it(fast_watchdog, logs):
+    """⛔⛔ THE DEFECT. Against the code before this repair the outer wait times
+    out here — which is the bug, in one line: the run never comes back."""
+    ctx, poll = _ScriptedCtx("hang"), _FrozenPoll()
+    with pytest.raises(RuntimeError, match=r"\(browser crash\)") as ei:
+        _run_bounded(research._poll_phase2_watching_for_a_hang(
+            _Browser(ctx), poll.run()))
+    # The same sentence shape the crash sweep raises, so the top-level handler
+    # re-derives the kind from the exception alone — and the flag as well.
+    assert research._is_browser_close_error(ei.value) is True
+    assert research._runtime.last_failure_kind == "browser_crash"
+    assert ctx.asked == 2, "one silence per check, until the ladder is spent"
+
+
+def test_the_frozen_poll_is_cancelled_before_the_unwind_leaves(fast_watchdog, logs):
+    """A run that unwound while its poll kept polling would relaunch Chrome
+    underneath a loop still driving the old tabs.
+
+    ⛔ Read AT THE RAISE, not after the test's event loop has closed: closing a
+    loop cancels whatever is still pending, so a check made afterwards passes
+    for code that never cancelled anything."""
+    poll = _FrozenPoll()
+
+    async def _go():
+        try:
+            await asyncio.wait_for(research._poll_phase2_watching_for_a_hang(
+                _Browser(_ScriptedCtx("hang")), poll.run()), OUTER)
+        except RuntimeError:
+            return poll.cancelled
+        raise AssertionError("the hang did not unwind")
+    assert asyncio.run(_go()) is True
+
+
+def test_a_slow_but_answering_browser_is_left_to_work(fast_watchdog, logs):
+    """⭐ ACCEPT POLARITY, and the one the spec names: a tick sitting in a page
+    evaluate that takes many checks is not a hang while the browser answers."""
+    ctx = _ScriptedCtx("ok")
+    poll = _WorkingPoll(evaluate_sec=0.2)
+    out = _run_bounded(research._poll_phase2_watching_for_a_hang(
+        _Browser(ctx), poll.run()))
+    assert out == {"ChatGPT": {"status": "complete"}}
+    assert poll.cancelled is False
+    assert ctx.asked >= 2, "the watchdog really did check while it worked"
+
+
+def test_a_stall_between_answers_never_adds_up(fast_watchdog, logs):
+    """A one-off silence — a waking laptop, a disk stall on the profile — is
+    not a hang: only CONSECUTIVE silences are, so an answer wipes the slate."""
+    ctx = _ScriptedCtx("hang", "ok", "hang", "ok", "ok")
+    poll = _WorkingPoll(evaluate_sec=0.02, rounds=12)
+    out = _run_bounded(research._poll_phase2_watching_for_a_hang(
+        _Browser(ctx), poll.run()))
+    assert out == {"ChatGPT": {"status": "complete"}}
+    assert poll.cancelled is False
+    assert ctx.asked >= 5, "both silences happened and neither counted"
+
+
+def test_a_phase_that_finished_during_the_last_probe_is_not_thrown_away(
+        fast_watchdog, logs):
+    """⭐ Each rung of the ladder costs a full probe, and the poll can come back
+    during one — carrying the phase's results. Unwinding on a browser nobody is
+    waiting on any more would buy the whole of phase 2 a second time."""
+    freed = asyncio.Event()
+    ctx = _CtxThatFreesThePoll(free_on=2, event=freed)
+
+    async def _poll():
+        await freed.wait()
+        return {"ChatGPT": {"status": "complete"}}
+
+    out = _run_bounded(research._poll_phase2_watching_for_a_hang(
+        _Browser(ctx), _poll()))
+    assert out == {"ChatGPT": {"status": "complete"}}
+    assert ctx.asked == 2, "the ladder really was spent — this is the race"
+
+
+def test_a_closed_browser_is_not_the_watchdogs_business(fast_watchdog, logs):
+    """⛔⛔ THE PAUSE. `pause_and_close_browser` closes the browser and blocks
+    for as long as the person likes; the poll resumes and relaunches after. A
+    closed context ANSWERS, instantly, with an error — and reading that as a
+    hang would end every long pause in a fake browser crash."""
+    ctx = _ScriptedCtx("closed")
+    poll = _WorkingPoll(evaluate_sec=0.2)
+    out = _run_bounded(research._poll_phase2_watching_for_a_hang(
+        _Browser(ctx), poll.run()))
+    assert out == {"ChatGPT": {"status": "complete"}}
+    assert poll.cancelled is False
+    assert ctx.asked >= 2
+
+
+def test_a_browser_with_no_context_is_not_a_hang(fast_watchdog, logs):
+    """Same reason: between a close and the relaunch there is no handle to be
+    silent. `_browser_context_is_dead` answers True there, on purpose, and that
+    is exactly the answer this watchdog must not act on."""
+    poll = _WorkingPoll(evaluate_sec=0.15)
+    out = _run_bounded(research._poll_phase2_watching_for_a_hang(
+        _Browser(None), poll.run()))
+    assert out == {"ChatGPT": {"status": "complete"}} and poll.cancelled is False
+
+
+def test_the_polls_own_crash_comes_back_untouched(fast_watchdog, logs):
+    """The sweep's own unwind — the one this wave's first commit added — must
+    reach the caller as itself, not as the watchdog's version of it."""
+    boom = RuntimeError("research browser died during phase 2 (browser crash)")
+
+    async def _poll():
+        raise boom
+    with pytest.raises(RuntimeError) as ei:
+        _run_bounded(research._poll_phase2_watching_for_a_hang(
+            _Browser(_ScriptedCtx("ok")), _poll()))
+    assert ei.value is boom
+
+
+def test_the_polls_results_come_back_unchanged(fast_watchdog, logs):
+    """⭐ ACCEPT POLARITY for the ordinary phase: the wrapper is a wrapper."""
+    results = {"Claude": {"status": "complete", "text": "x"}}
+    ctx = _ScriptedCtx("ok")
+
+    async def _poll():
+        return results
+    out = _run_bounded(research._poll_phase2_watching_for_a_hang(
+        _Browser(ctx), _poll()))
+    assert out is results
+    assert ctx.asked == 0, "a poll that returns is never asked about"
+
+
+@pytest.mark.parametrize("ctx, want", [
+    (lambda: _Ctx("hung"), True),
+    (lambda: _Ctx("alive"), False),
+    # ⭐ The distinction `_browser_context_is_dead` deliberately does not make:
+    # a context that says "I am closed" is talking to us. Somebody closed it
+    # (a pause) or it died (the poll's own sweep unwinds within a tick).
+    (lambda: _Ctx("dead"), False),
+    (lambda: _Ctx("dead", exc=Exception("net::ERR_INTERNET_DISCONNECTED")), False),
+    (lambda: _Ctx("slow", delay=0.01), False),
+    (lambda: None, False),
+])
+def test_only_silence_reads_as_unresponsive(short_probe, logs, ctx, want):
+    got = _run_bounded(research._browser_context_is_unresponsive(_Browser(ctx())))
+    assert got is want
+
+
+def test_the_silent_probe_is_cancelled_not_leaked(short_probe, logs):
+    """One probe per check for as long as phase 2 runs — a leaked one apiece
+    would pile up on the browser that is already not answering."""
+    ctx = _Ctx("hung")
+    _run_bounded(research._browser_context_is_unresponsive(_Browser(ctx)))
+    assert ctx.cancelled is True
+
+
+def test_the_poll_everybody_calls_is_the_watched_one():
+    """⛔ THE WIRING. Nothing in the suite can execute the poll itself — four
+    thousand lines of live browser work — so the decoration's mark on the
+    function object is the pin, and the decorator's own decision is executed
+    below on a stand-in the size of a test."""
+    assert research.poll_all_agents_round_robin.watches_for_a_hung_browser is True
+
+
+def test_the_decoration_stays_transparent_to_getsource():
+    """Eight other files read this function's SOURCE. A wrapper that did not
+    carry `__wrapped__` would hand them the three-line wrapper instead, and
+    every one of those pins would quietly start measuring nothing."""
+    import inspect
+    assert (inspect.getsource(research.poll_all_agents_round_robin)
+            == inspect.getsource(research.poll_all_agents_round_robin.__wrapped__))
+
+
+def test_the_decoration_puts_the_watchdog_around_the_poll(fast_watchdog, logs):
+    """The decorator's decision, executed: a hung browser unwinds the call."""
+    poll = _FrozenPoll()
+
+    @research._watched_for_a_hung_browser
+    async def _poll(agents, browser, cua_client, verbose=False):
+        return await poll.run()
+
+    with pytest.raises(RuntimeError, match=r"\(browser crash\)"):
+        _run_bounded(_poll({}, _Browser(_ScriptedCtx("hang")), None))
+
+
+def test_the_decoration_watches_the_browser_the_caller_passed(fast_watchdog, logs):
+    """By keyword as well as second-positional — a wrapper that watched the
+    wrong argument would probe something with no context and never see a hang."""
+    poll = _FrozenPoll()
+
+    @research._watched_for_a_hung_browser
+    async def _poll(agents, browser, cua_client, verbose=False):
+        return await poll.run()
+
+    with pytest.raises(RuntimeError, match=r"\(browser crash\)"):
+        _run_bounded(_poll({}, browser=_Browser(_ScriptedCtx("hang")),
+                           cua_client=None))
+
+
+def test_the_decoration_hands_the_poll_its_arguments_and_its_result_back(
+        fast_watchdog, logs):
+    """⭐ ACCEPT POLARITY: on a browser that answers, the decoration is nothing
+    but a pass-through — every argument in, the results out."""
+    seen = {}
+
+    @research._watched_for_a_hung_browser
+    async def _poll(agents, browser, cua_client, max_wait_min=90, verbose=False):
+        seen.update(agents=agents, cua=cua_client,
+                    max_wait_min=max_wait_min, verbose=verbose)
+        return {"Claude": {"status": "complete"}}
+
+    out = _run_bounded(_poll({"Claude": 1}, _Browser(_ScriptedCtx("ok")), "cua",
+                             max_wait_min=7, verbose=True))
+    assert out == {"Claude": {"status": "complete"}}
+    assert seen == {"agents": {"Claude": 1}, "cua": "cua",
+                    "max_wait_min": 7, "verbose": True}
+
+
+def test_the_watchdog_ladder_is_generous_but_finite():
+    """Generous: a live Chrome answers a cookie read in milliseconds however
+    hard its tabs work, but a machine can stall once. Finite: the ceiling this
+    replaces is the worker's, measured in hours."""
+    assert 30.0 <= research._PHASE2_HANG_CHECK_SEC <= 600.0
+    assert 2 <= research._PHASE2_HANG_STRIKES <= 10
+    assert (research._PHASE2_HANG_CHECK_SEC
+            * research._PHASE2_HANG_STRIKES) <= 1800.0
+    assert 5.0 <= research._PHASE2_HANG_UNWIND_GRACE_SEC <= 120.0
