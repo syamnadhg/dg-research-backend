@@ -2845,6 +2845,52 @@ def _owner_record_admits(owner, uid) -> bool:
     return not recorded or recorded == str(uid or "").strip()
 
 
+def _run_dir_inside_queues(claimed_run_id) -> "Path | None":
+    """`queues/<claim>` when the claim is a plain NAME sitting directly inside
+    `queues/`, else None.
+
+    ⛔⛔ A RUN ID IS A NAME, AND IT WAS BEING USED AS A PATH (found by round two
+    of wave 10.9's cross-verify, executed both ways against the real listener).
+    Every ownership check here asks `queues/<claim>/owner.json` whose run it is,
+    and a directory with no readable record deliberately keeps its claim — so a
+    claim that is a PATH walked past all of it:
+
+      · `<somebody's run>/documents` is a real directory with no `owner.json` of
+        its own, so the claim was kept. The resume then merged the sender's
+        config into that folder, removed the `.pause` above it and enqueued the
+        remaining phases rooted inside somebody else's run.
+      · an ABSOLUTE claim leaves `queues/` altogether — `Path("/a") / "/b"` is
+        `/b` — so any directory this account can write became a run folder: its
+        `config.json` was merged over, its `.pause` unlinked, and `run_pipeline`
+        given it as the run directory.
+
+    ⭐ THE FILESYSTEM ANSWERS, NOT A SPELLING RULE. The separator test refuses
+    what a run id never contains — `safe_name` collapses both slashes into `_`,
+    so neither can reach a real one; the containment test asks where the join
+    actually LANDS, which is what settles `.`, `..`, a doubled separator, and a
+    symlink inside `queues/` pointing out of it. Neither needs the directory to
+    exist — a claim naming a run whose folder is gone is an ordinary "artifacts
+    gone" refusal further down, not an attack.
+
+    ⛔ AND NOT A DATE-SHAPED PATTERN, which is the tempting version of this and
+    is wrong: `safe_name` returns "" for a topic of pure punctuation, so a real
+    run id can be `_20260921_101500`, and a pattern insisting on a name before
+    the stamp would refuse its owner's own resume for ever.
+    """
+    claimed = str(claimed_run_id or "").strip()
+    if not claimed or "/" in claimed or "\\" in claimed:
+        return None
+    root = Path(__file__).parent / "queues"
+    candidate = root / claimed
+    try:
+        if candidate.resolve().parent != root.resolve():
+            return None
+    except (OSError, ValueError):
+        # An embedded NUL raises ValueError; a symlink loop raises OSError.
+        return None
+    return candidate
+
+
 def _corroborated_run_id(claimed_run_id: str, research_id: str, uid: str) -> str:
     """A client-supplied `backendRunId`, kept only if the disk agrees it is this
     research's run AND this person's. Returns "" when it cannot be corroborated
@@ -2874,15 +2920,27 @@ def _corroborated_run_id(claimed_run_id: str, research_id: str, uid: str) -> str
     ⭐ SILENCE FROM THE DISK IS NOT A REFUSAL. A directory with no readable
     `owner.json` is the ordinary pre-owner.json shape and keeps its claim; only
     a directory that positively names a DIFFERENT research or person loses it.
+
+    ⛔⛔ WHICH IS EXACTLY WHY THE CLAIM MUST BE A NAME FIRST. "Silence keeps the
+    claim" is safe for a run directory and catastrophic for a path: a claim of
+    `<somebody's run>/documents` or `/anywhere/at/all` is silent here because
+    there is no `owner.json` under it, and it was kept. `_run_dir_inside_queues`
+    is asked before the record is read, so both questions are asked of the same
+    directory and that directory is always one of ours.
     """
     claimed = str(claimed_run_id or "").strip()
     rid = str(research_id or "").strip()
-    if not claimed or not rid:
+    if not claimed:
+        return claimed
+    run_dir = _run_dir_inside_queues(claimed)
+    if run_dir is None:
+        log(f"Resume: run id {claimed[:60]!r} is not the name of a run "
+            f"directory on this computer — ignoring the claim", "WARN")
+        return ""
+    if not rid:
         return claimed
     try:
-        owner = json.loads(
-            (Path(__file__).parent / "queues" / claimed / "owner.json")
-            .read_text(encoding="utf-8"))
+        owner = json.loads((run_dir / "owner.json").read_text(encoding="utf-8"))
     except Exception:
         return claimed
     owns = str((owner or {}).get("researchId") or "").strip()
@@ -3000,9 +3058,10 @@ RESUME_DROP_WENT_STALE = (
 )
 
 
-# The statuses that mean the run is OVER. Mirrors the pre-claim gate a few
-# hundred lines below and the web's `TERMINAL_RUN_STATUSES`; a run in this set
-# may gain a sentence but must never be moved out of it.
+# The statuses that mean the run is OVER. Read by `_research_is_terminal` AND
+# by the start listener's pre-claim gate — which used to keep its own copy of
+# these five words — and mirrors the web's `TERMINAL_RUN_STATUSES`; a run in
+# this set may gain a sentence but must never be moved out of it.
 TERMINAL_RESEARCH_STATUSES = (
     "stopped", "completed", "archived",
     "terminated_by_user_discard", "stopped_by_watchdog",
@@ -3097,6 +3156,11 @@ def _run_dir_owning_research(research_id: str, uid: str):
     except OSError:
         return None
     for d in entries:
+        # ⛔ A LISTING IS A CLAIM TOO, once anything in it is a symlink.
+        # `is_dir()` follows one, so a link in `queues/` pointing anywhere on
+        # the disk would be handed back as a run directory to resume into.
+        if _run_dir_inside_queues(d.name) is None:
+            continue
         try:
             owner = json.loads((d / "owner.json").read_text(encoding="utf-8"))
         except Exception:
@@ -15173,10 +15237,13 @@ def start_firestore_start_listener(job_queue, loop):
                 # queue doc so it doesn't replay on listener attach.
                 _rd_data = research_doc.to_dict() or {}
                 _rd_status = _rd_data.get("status")
-                if _rd_status in (
-                    "stopped", "completed", "archived",
-                    "terminated_by_user_discard", "stopped_by_watchdog",
-                ):
+                # ⛔ ONE TUPLE, NOT TWO. This gate carried its own copy of the
+                # terminal statuses and the module constant's comment promised
+                # they mirrored each other — a promise nothing measured, and the
+                # tests for this gate were a third copy in the test file. It
+                # reads the constant now, so the set has one definition and the
+                # tests that drive this branch measure it.
+                if _rd_status in TERMINAL_RESEARCH_STATUSES:
                     log(
                         f"Queue: skipped — research {research_id[:24]}… "
                         f"already status={_rd_status} (cancel landed mid-claim?)",
@@ -72349,9 +72416,14 @@ async def _reconcile_dead_worker_runs(tree_uid: str, dead_ids: "set[int]") -> in
         # (research.status stays "ongoing" until FE-P5 flips it). Unreadable /
         # missing delivery.json ⇒ treat as BE-incomplete ⇒ mark (recoverable from
         # the on-disk checkpoint).
-        run_id = data.get("backendRunId") or ""
-        if run_id:
-            _dpath = Path(__file__).parent / "queues" / run_id / "delivery.json"
+        # ⛔ THE RUN ID ON THE DOCUMENT IS A CLAIM HERE TOO, and joining it raw
+        # read `delivery.json` from anywhere on the disk — a path claim decided
+        # this branch on a file that was never a run's. A claim that is not the
+        # name of a run directory is treated exactly as an absent one, which is
+        # a shape this guard already handles.
+        _run_dir = _run_dir_inside_queues(data.get("backendRunId"))
+        if _run_dir is not None:
+            _dpath = _run_dir / "delivery.json"
             try:
                 if _dpath.exists() and json.loads(
                         _dpath.read_text(encoding="utf-8")).get("status") == "completed":

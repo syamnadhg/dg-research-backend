@@ -154,6 +154,9 @@ class _JobQueue:
     def put_nowait(self, job):
         self.put.append(job)
 
+    def qsize(self):
+        return len(self._queue)
+
 
 class _Loop:
     def call_soon_threadsafe(self, fn, *a):
@@ -173,7 +176,7 @@ class Listener:
 
     def __init__(self, monkeypatch, tmp_path, *, owner="uid-owner",
                  queue_docs=None, research_docs=None, current_job=None,
-                 gate_pending=None, deque_jobs=None):
+                 gate_pending=None, deque_jobs=None, real_terminal_check=False):
         box: dict = {}
         self.db = FakeDb(box, queue_docs, research_docs)
         self.writes: list = []
@@ -185,10 +188,23 @@ class Listener:
         monkeypatch.setattr(research, "load_device_id", lambda: "dev-abcdef")
         monkeypatch.setattr(research, "load_paired_uid", lambda: owner)
         monkeypatch.setattr(research, "_worker_is_resting", lambda *a, **k: False)
+        # ⛔ THE MACHINE'S OWN CONFIG IS NOT TEST INPUT. `load_worker_count`
+        # reads this developer's `config.json` (2 on the box this was written
+        # on), and `_REST_DEFER_SEEN` is a module global that an earlier test
+        # can leave set — between them they decide whether the start branch
+        # takes the multi-worker claim path. Pinned to the single-worker shape
+        # so a start doc behaves the same everywhere.
+        monkeypatch.setattr(research, "load_worker_count", lambda: 1)
+        monkeypatch.setitem(research._REST_DEFER_SEEN, "v", False)
         monkeypatch.setattr(research, "_guard_snapshot", lambda cb, _label: cb)
         monkeypatch.setattr(research, "_try_claim_queue_doc", lambda *a, **k: True)
         monkeypatch.setattr(research, "load_checkpoint", lambda _qd: {"topic": "t"})
-        monkeypatch.setattr(research, "_research_is_terminal", lambda *a, **k: False)
+        # ⛔ `real_terminal_check=True` LEAVES THE REAL ONE IN PLACE, for a test
+        # whose subject IS whether a run counts as over. Stubbed by default
+        # because a refusal test would otherwise have to state a status for
+        # every research document it never asks about.
+        if not real_terminal_check:
+            monkeypatch.setattr(research, "_research_is_terminal", lambda *a, **k: False)
 
         def _record(uid, rid, updates):
             self.writes.append((uid, rid, dict(updates)))

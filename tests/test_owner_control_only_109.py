@@ -24,11 +24,13 @@ one command; the machine upgrades when its owner chooses. The two are never in
 step, and this listener is the thing that acts.
 """
 import ast
+import json
 from pathlib import Path
 
 import pytest
 
 import research
+from _queue_listener import Listener
 
 OWNER = "uid-owner"
 SHARER = "uid-sharer"
@@ -153,6 +155,116 @@ def test_the_guard_runs_BEFORE_the_branch_reads_the_uid():
             assert min(guards) < min(writes), (
                 "the branch writes to another person's tree before it checks "
                 "whether it is allowed to")
+
+
+# ══ 3. the owner's control of a sharer's run, EXECUTED ═══════════════════
+#
+# ⛔⛔ THE FEATURE'S OWN PATH WAS NEVER DRIVEN, and round two of cross-verify
+# proved it by mutation. Everything above establishes that the identity guard
+# lets the owner through; NOTHING drove the owner through the four gates that
+# follow it, all of which were given whose run it is in the same wave. Swapping
+# the tree's uid for the WRITER's (`data["submittedBy"]`) at any one of them
+# left all seven ownership and cancel suites green — and each swap looks
+# STRICTER while silently breaking exactly one thing: the owner's control of
+# somebody else's run, with no signal to either of them.
+#
+#   the cancel gate   → the owner's Stop of a sharer's held run is dropped
+#   the resume gate   → the owner's Resume of a sharer's held run is dropped
+#   the disk lookup   → the owner cannot resume a run only the disk knows about
+#   the document read → the owner's Resume is read from the owner's own tree,
+#                       where the sharer's research does not exist
+#
+# ⭐ So each is driven here through the REAL listener, in the shape the web
+# writes: `uid=<sharer>, submittedBy=<owner>`.
+
+SHARER_RID = "chat_1758400000000_7"
+SHARER_RUN = "Sharer_topic_20260921_101500"
+_SHARERS_JOB = {"research_id": SHARER_RID, "uid": SHARER, "run_id": SHARER_RUN}
+
+
+def _sharers_run(tmp_path, monkeypatch, record=None):
+    """The sharer's paused run on disk, owned by the sharer."""
+    monkeypatch.setattr(research, "__file__", str(tmp_path / "research.py"))
+    d = tmp_path / "queues" / SHARER_RUN
+    d.mkdir(parents=True)
+    (d / "owner.json").write_text(json.dumps(
+        record if record is not None
+        else {"uid": SHARER, "researchId": SHARER_RID}), encoding="utf-8")
+    return d
+
+
+@pytest.mark.parametrize("slot", ["current_job", "gate_pending"])
+def test_the_owner_stops_a_sharers_run_this_process_is_holding(
+        slot, tmp_path, monkeypatch):
+    """⭐⭐ THE SHARED-WITH POPUP'S STOP, on a run this worker is actually
+    running or holding at the gate — the case the badge exists for."""
+    lis = Listener(monkeypatch, tmp_path, owner=OWNER,
+                   **{slot: dict(_SHARERS_JOB)}).feed(
+        action="cancel", uid=SHARER, submittedBy=OWNER, researchId=SHARER_RID,
+        ownerControl="stop")
+    assert lis.controls.stops == 1, "the owner's Stop of a sharer's held run was dropped"
+    assert [w[:2] for w in lis.writes] == [(SHARER, SHARER_RID)], (
+        "the owner's Stop wrote somewhere other than the sharer's own tree")
+    patch = lis.writes[0][2]
+    assert patch["status"] == "stopped"
+    assert patch["stoppedBy"] == "owner_stop"
+    assert "cancelled" not in patch, "an owner STOP must not purge the run"
+
+
+def test_a_sharer_still_cannot_stop_the_owners_held_run(tmp_path, monkeypatch):
+    """⛔ ACCEPT POLARITY'S MIRROR, and the reason the gate is there at all: the
+    same shape signed by the sharer, naming the owner's run, is refused."""
+    owners_job = {"research_id": SHARER_RID, "uid": OWNER, "run_id": SHARER_RUN}
+    lis = Listener(monkeypatch, tmp_path, owner=OWNER,
+                   current_job=owners_job).feed(
+        action="cancel", uid=OWNER, submittedBy=SHARER, researchId=SHARER_RID,
+        ownerControl="stop")
+    assert lis.controls.stops == 0
+    assert lis.writes == []
+
+
+def test_the_owner_resumes_a_sharers_run_from_the_sharers_own_document(
+        tmp_path, monkeypatch):
+    """⛔⛔ THE DOCUMENT IS READ FROM THE TREE THE DOC NAMES. The owner's Resume
+    of a sharer's run carries no `backendRunId` of its own — the owner's FE has
+    never seen one — so the run id comes from the sharer's research document,
+    which does not exist in the owner's tree."""
+    _sharers_run(tmp_path, monkeypatch)
+    lis = Listener(monkeypatch, tmp_path, owner=OWNER, research_docs={
+        (SHARER, SHARER_RID): {"backendRunId": SHARER_RUN}}).feed(
+        action="resume", uid=SHARER, submittedBy=OWNER, researchId=SHARER_RID)
+    assert lis.db.reads == [(SHARER, SHARER_RID)], (
+        "the resume read the research document out of the wrong person's tree")
+    assert [(j["uid"], j["run_id"]) for j in lis.enqueued] == [(SHARER, SHARER_RUN)]
+
+
+def test_the_owner_resumes_a_sharers_run_the_disk_alone_knows_about(
+        tmp_path, monkeypatch):
+    """⛔⛔ THE DISK ARM. The `backendRunId` write-back can fail while the run
+    proceeds, so the directory is the only record — and it is the SHARER'S, so
+    a lookup asked about the owner finds nothing and closes the run's recovery
+    for good."""
+    _sharers_run(tmp_path, monkeypatch)
+    lis = Listener(monkeypatch, tmp_path, owner=OWNER, research_docs={
+        (SHARER, SHARER_RID): {"status": "paused_backend_restart"}}).feed(
+        action="resume", uid=SHARER, submittedBy=OWNER, researchId=SHARER_RID)
+    assert (SHARER, SHARER_RID, {"backendRunId": SHARER_RUN}) in lis.writes, (
+        "the sharer's document was not repaired from the directory that is hers")
+    assert [j["run_id"] for j in lis.enqueued] == [SHARER_RUN]
+
+
+def test_the_owner_resumes_a_sharers_run_this_process_is_holding(
+        tmp_path, monkeypatch):
+    """⛔⛔ THE RESUME-SIDE LOCAL GATE, on the one shape the disk cannot settle:
+    a directory written before `owner.json` carried a uid. The job in hand names
+    its owner, and the gate must be asked about the TREE the doc names."""
+    _sharers_run(tmp_path, monkeypatch, record={"researchId": SHARER_RID})
+    lis = Listener(monkeypatch, tmp_path, owner=OWNER,
+                   current_job=dict(_SHARERS_JOB)).feed(
+        action="resume", uid=SHARER, submittedBy=OWNER, researchId=SHARER_RID,
+        backendRunId=SHARER_RUN)
+    assert [j["run_id"] for j in lis.enqueued] == [SHARER_RUN], (
+        "the owner's Resume of a sharer's held run was refused")
 
 
 # ⛔⛔ THE START-GUARD PIN THAT USED TO LIVE HERE MEASURED NOTHING. It asserted

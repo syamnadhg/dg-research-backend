@@ -18,6 +18,27 @@ tree, so a member signing honestly as themselves could:
   (+) boot recovery read `backendRunId` off a research document in the scanned
        tree and auto-resumed that directory into it — the same claim, unchecked.
 
+⛔⛔ AND ROUND TWO OF CROSS-VERIFY FOUND THE FIX HALF-BUILT. Every check above
+asks `queues/<claim>/owner.json` whose run a claim is, and a directory with no
+readable record keeps its claim on purpose — so a claim that was a PATH walked
+past all of it:
+
+  N1r — `<Alice's run>/documents` has no `owner.json` of its own, so the claim
+        was kept: Bob's config was merged into Alice's folder, her `.pause` was
+        removed and a run was enqueued rooted inside her run. An ABSOLUTE claim
+        left `queues/` altogether, so any directory this account can write was
+        merged over and handed to `run_pipeline`. Both executed against the real
+        listener. The claim is a NAME now, and the filesystem is asked where the
+        join lands (N1-N7).
+  W1-W4 — the owner's own control of a sharer's run was never EXECUTED: four
+        one-token swaps from the tree's uid to the writer's each left all seven
+        ownership and cancel suites green, and each silently drops exactly one
+        thing the owner is supposed to be able to do.
+  T1-T3 — the pre-claim terminal gate's tests were a replica of its status
+        tuple living in the test file, so no change to the gate could turn them
+        red; the gate now reads the module's one `TERMINAL_RESEARCH_STATUSES`
+        and its tests drive the real start branch.
+
 Every mutant below is a way the fix could be put back to decoration while still
 looking installed. The quiet ones matter most:
 
@@ -124,6 +145,29 @@ D_ARGS = "col_ref.limit(50).stream(), rid, u)"
 # ── anchors: boot recovery ─────────────────────────────────────────────────
 H_CLAIM = ("                    run_id = _corroborated_run_id(data.get(\"backendRunId\"),\n"
            "                                                  research_id, tree_uid)")
+
+# ── anchors: a run id is a NAME, not a path ────────────────────────────────
+#: The spelling half — nothing with a separator in it is a directory name.
+N_SPELLING = "    if not claimed or \"/\" in claimed or \"\\\\\" in claimed:\n        return None\n"
+#: The containment half — where the join actually lands.
+N_CONTAIN = ("        if candidate.resolve().parent != root.resolve():\n"
+             "            return None\n")
+#: The corroboration asks the question before it reads the record.
+N_CALL = ("    run_dir = _run_dir_inside_queues(claimed)\n"
+          "    if run_dir is None:\n")
+#: The disk lookup will not follow a link out of `queues/`.
+N_DISK = "        if _run_dir_inside_queues(d.name) is None:\n            continue\n"
+#: The dead-worker sweep's delivery-tail probe.
+N_SWEEP = ("        _run_dir = _run_dir_inside_queues(data.get(\"backendRunId\"))\n"
+           "        if _run_dir is not None:\n"
+           "            _dpath = _run_dir / \"delivery.json\"\n")
+
+# ── anchors: the pre-claim terminal gate ───────────────────────────────────
+T_SET = ("TERMINAL_RESEARCH_STATUSES = (\n"
+         "    \"stopped\", \"completed\", \"archived\",\n"
+         "    \"terminated_by_user_discard\", \"stopped_by_watchdog\",\n"
+         ")")
+T_GATE = "                if _rd_status in TERMINAL_RESEARCH_STATUSES:"
 
 MUTANTS = [
     # ── N1: the disk record's person half ──────────────────────────────────
@@ -291,6 +335,96 @@ MUTANTS = [
      "ever auto-resumes again — the #724 sharer rehydration quietly turned off",
      [(H_CLAIM, "                    run_id = _corroborated_run_id(data.get(\"backendRunId\"),\n"
                 "                                                  research_id, owner_uid)")]),
+
+    # ── round two: a run id is a NAME, not a path ──────────────────────────
+    ("N1", "under", RESEARCH,
+     "⛔⛔⛔ THE DEFECT ITSELF — the claim is joined onto queues/ wherever it "
+     "points. `<Alice's run>/documents` has no owner.json of its own, so silence "
+     "keeps it; an absolute claim leaves queues/ altogether",
+     [(N_CONTAIN, "        if False:\n            return None\n")]),
+
+    ("N2", "under", RESEARCH,
+     "⛔ the spelling half goes, so a claim that walks out of a run and back in "
+     "by name is taken — a run id stops being a name and becomes a path again",
+     [(N_SPELLING, "    if not claimed:\n        return None\n")]),
+
+    ("N3", "under", RESEARCH,
+     "⛔⛔ HELPER-PINNED, CONSUMER-NOT — the corroboration goes on reading "
+     "`queues/<claim>/owner.json` and the shape question is asked of nobody",
+     [(N_CALL, "    run_dir = Path(__file__).parent / \"queues\" / claimed\n"
+               "    if False:\n")]),
+
+    ("N4", "over", RESEARCH,
+     "⛔ a claim whose directory is gone is refused HERE instead of further "
+     "down, so a run whose artifacts were cleaned up loses the sentence that "
+     "says so and every legacy claim is answered as an attack",
+     [(N_CONTAIN, N_CONTAIN + "        if not candidate.exists():\n            return None\n")]),
+
+    ("N5", "under", RESEARCH,
+     "⛔ the containment test stops resolving, so a symlink inside queues/ "
+     "pointing anywhere on the disk passes as a run directory",
+     [(N_CONTAIN, "        if candidate.parent != root:\n            return None\n")]),
+
+    ("N6", "under", RESEARCH,
+     "⛔ the disk lookup follows a link out of queues/ again — `is_dir()` "
+     "follows one, so whatever sits at the other end is handed back as a run",
+     [(N_DISK, "")]),
+
+    ("N7", "under", RESEARCH,
+     "⛔ the dead-worker sweep joins the document's run id raw again and decides "
+     "the Cloud-Run-tail branch on a delivery.json that was never a run's",
+     [(N_SWEEP, "        _dpath = (Path(__file__).parent / \"queues\"\n"
+                "                  / (data.get(\"backendRunId\") or \"\") / \"delivery.json\")\n"
+                "        if data.get(\"backendRunId\"):\n")]),
+
+    # ── the pre-claim terminal gate, which used to be tested by a replica ──
+    ("T1", "under", RESEARCH,
+     "⛔⛔ a watchdog-stopped run stops counting as over, so the queue doc that "
+     "replays after a cancel is claimed and the cancelled job runs",
+     [(T_SET, T_SET.replace(" \"stopped_by_watchdog\",", ""))]),
+
+    ("T2", "over", RESEARCH,
+     "⛔ the pre-claim gate calls a paused run finished, and every start doc for "
+     "a run the person paused is deleted instead of claimed",
+     [(T_GATE, "                if _rd_status in TERMINAL_RESEARCH_STATUSES + (\"paused\",):")]),
+
+    ("T3", "under", RESEARCH,
+     "⛔⛔ the pre-claim gate is neutered the quiet way — every name and line "
+     "stays and a finished run's document is stamped with a fresh run id",
+     [(T_GATE, "                if False and _rd_status in TERMINAL_RESEARCH_STATUSES:")]),
+
+    # ── the owner's control of a sharer's run, never executed until now ────
+    ("W1", "over", RESEARCH,
+     "⛔⛔ the cancel gate judges a held job by the WRITER, so the owner's Stop of "
+     "a sharer's running or gate-pending run is silently dropped",
+     [("                if _refuse_foreign_run(doc, _local_jobs, target_rid, target_uid,",
+       "                if _refuse_foreign_run(doc, _local_jobs, target_rid, "
+       "data.get(\"submittedBy\") or target_uid,")]),
+
+    ("W2", "over", RESEARCH,
+     "⛔⛔ the same swap on the resume side: the owner's Resume of a sharer's "
+     "held run is refused as if it were somebody else's",
+     [(R_GATE, "                if _refuse_foreign_run(doc, _jobs_held_locally(job_queue), target_rid,\n"
+               "                                       data.get(\"submittedBy\") or target_uid, "
+               "\"start-listener\", verb=\"resume\"):\n"
+               "                    continue\n")]),
+
+    ("W3", "over", RESEARCH,
+     "⛔⛔ the disk lookup is asked about the WRITER, so the owner can never "
+     "resume a sharer's run whose backendRunId write-back failed",
+     [(A_DISK_CALL, "                    _orphaned = _run_dir_owning_research(target_rid, "
+                    "data.get(\"submittedBy\") or target_uid)")]),
+
+    ("W4", "over", RESEARCH,
+     "⛔⛔ the research document is read from the WRITER's tree, where a sharer's "
+     "research does not exist — the owner's Resume becomes 'research not found'",
+     [("    snap = (_firebase_db.collection(\"users\").document(uid)\n"
+       "            .collection(\"researches\").document(research_id).get())\n"
+       "    if not snap.exists:\n",
+       "    snap = (_firebase_db.collection(\"users\")"
+       ".document((data or {}).get(\"submittedBy\") or uid)\n"
+       "            .collection(\"researches\").document(research_id).get())\n"
+       "    if not snap.exists:\n")]),
 ]
 
 

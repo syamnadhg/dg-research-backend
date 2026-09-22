@@ -34,6 +34,7 @@ OWNER = "uid-owner"      # the device owner (paired)
 ALICE = "uid-alice"      # a member whose run is at stake
 BOB = "uid-bob"          # another member, naming Alice's research id
 RID = "chat_1758400000000_1"
+BOB_RID = "chat_1758400000000_9"   # Bob's own research, minted in his own tree
 RUN = "Alice_topic_20260921_101500"
 
 
@@ -516,3 +517,193 @@ def test_boot_recovery_still_auto_resumes_the_trees_own_run(alices_run, monkeypa
     updates, enqueues = _rehydrate(monkeypatch, ALICE, {ALICE: _ongoing_doc()})
     assert [(j["uid"], j["run_id"]) for j in enqueues] == [(ALICE, RUN)]
     assert updates == []
+
+
+# ══ 6. a run id is a NAME, and a claim that is a path is not one ══════════
+#
+# ⛔⛔ ROUND TWO OF CROSS-VERIFY, EXECUTED BOTH WAYS. Everything above asks
+# `queues/<claim>/owner.json` whose run a claim is, and a directory with no
+# readable record deliberately keeps its claim — so a claim that was a PATH
+# walked past the whole section. `<Alice's run>/documents` has no `owner.json`
+# of its own: the claim was kept, Bob's config was merged into Alice's folder
+# and a run was enqueued rooted inside it. An ABSOLUTE claim left `queues/`
+# altogether, so any directory this account can write had its `config.json`
+# merged over, its `.pause` unlinked and `run_pipeline` pointed at it.
+
+
+def test_a_claim_into_a_subfolder_of_another_persons_run_is_refused(alices_run):
+    """⛔⛔ THE CLAIM THE PROBE SENT. `documents/` is Alice's, and it is the one
+    corner of her run that carries no record of its own."""
+    (alices_run / "documents").mkdir()
+    assert research._corroborated_run_id(f"{RUN}/documents", BOB_RID, BOB) == ""
+    # ⛔ AND NOT BECAUSE IT IS BOB'S. It is not a run id, so it is nobody's —
+    # Alice gets the same answer for the same string.
+    assert research._corroborated_run_id(f"{RUN}/documents", RID, ALICE) == ""
+
+
+def test_an_absolute_claim_that_leaves_queues_is_refused(alices_run, tmp_path):
+    """⛔⛔ `Path("/a") / "/b"` is `/b`. The join simply left our tree."""
+    outside = tmp_path / "elsewhere" / "someapp"
+    outside.mkdir(parents=True)
+    assert research._corroborated_run_id(str(outside), RID, ALICE) == ""
+
+
+def test_a_claim_that_spells_its_way_back_into_queues_is_refused_too(
+        alices_run, tmp_path):
+    """⛔ A RUN ID IS A NAME. This one lands back inside `queues/` — so asking
+    the filesystem where it ends up is not enough on its own, and it is Alice's
+    OWN run at the end of it, which is what makes this pin about the spelling
+    and nothing else."""
+    _run_dir(tmp_path, run="Bob_run", owner={"uid": BOB, "researchId": BOB_RID})
+    assert research._corroborated_run_id(f"Bob_run/../{RUN}", RID, ALICE) == ""
+
+
+def test_a_run_id_that_is_a_plain_name_is_still_taken(tmp_path, monkeypatch):
+    """⭐⭐ ACCEPT POLARITY, AND WHY THIS IS NOT A PATTERN MATCH. `safe_name`
+    returns "" for a topic of pure punctuation, so a real run id can be
+    `_20260921_101500`; a rule insisting on a name before the stamp would refuse
+    its owner's own resume for ever. A name for a run whose folder is gone is
+    kept too — that refusal belongs further down, where it says "artifacts
+    gone"."""
+    monkeypatch.setattr(research, "__file__", str(tmp_path / "research.py"))
+    run = f"{research.safe_name('...')}_20260921_101500"
+    assert run == "_20260921_101500"
+    _run_dir(tmp_path, run=run, owner={"uid": ALICE, "researchId": RID})
+    assert research._corroborated_run_id(run, RID, ALICE) == run
+    assert research._corroborated_run_id("never_existed", RID, ALICE) == "never_existed"
+
+
+def test_the_disk_lookup_will_not_follow_a_link_out_of_queues(alices_run, tmp_path):
+    """⛔ A LISTING IS A CLAIM TOO. `is_dir()` follows a symlink, so a link in
+    `queues/` was handed back as a run directory to resume into — with whatever
+    `owner.json` sits at the other end of it."""
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "owner.json").write_text(
+        json.dumps({"uid": BOB, "researchId": BOB_RID}), encoding="utf-8")
+    (tmp_path / "queues" / "Bob_run").symlink_to(outside, target_is_directory=True)
+    assert research._run_dir_owning_research(BOB_RID, BOB) is None
+    # ⭐ ACCEPT POLARITY — the same record in a real directory is still found.
+    real = _run_dir(tmp_path, run="Bob_real_run",
+                    owner={"uid": BOB, "researchId": BOB_RID})
+    assert research._run_dir_owning_research(BOB_RID, BOB) == real
+
+
+def _bobs_paused_research():
+    return {(BOB, BOB_RID): {"status": "paused_backend_restart"}}
+
+
+def _bobs_resume(**over):
+    d = {"action": "resume", "uid": BOB, "submittedBy": BOB, "researchId": BOB_RID}
+    d.update(over)
+    return d
+
+
+def test_a_resume_claiming_a_subfolder_of_their_run_touches_nothing_in_it(
+        alices_run, tmp_path, monkeypatch):
+    """⛔⛔⛔ THE CONSUMER, and the probe's own scenario: Bob resumes his OWN
+    research and points it at a corner of Alice's run."""
+    docs = alices_run / "documents"
+    docs.mkdir()
+    (docs / "chatgpt.md").write_text("Alice's report", encoding="utf-8")
+    lis = Listener(monkeypatch, tmp_path, owner=OWNER,
+                   research_docs=_bobs_paused_research()).feed(
+        **_bobs_resume(backendRunId=f"{RUN}/documents", config={"planted": True}))
+    assert lis.enqueued == [], "a run was enqueued rooted inside Alice's run folder"
+    assert sorted(p.name for p in docs.iterdir()) == ["chatgpt.md"], (
+        "Bob's payload config was written into Alice's run folder")
+    _untouched(alices_run)
+    assert [w[:2] for w in lis.writes] == [(BOB, BOB_RID)]
+
+
+def test_a_resume_claiming_an_absolute_path_touches_nothing_outside_queues(
+        tmp_path, monkeypatch):
+    """⛔⛔⛔ THE CONSUMER for the absolute claim: a directory that was never a
+    run of ours, with its own settings and its own `.pause`."""
+    app = tmp_path / "app"
+    (app / "queues").mkdir(parents=True)
+    victim = tmp_path / "elsewhere" / "someapp"
+    victim.mkdir(parents=True)
+    (victim / "config.json").write_text(
+        json.dumps({"server": "https://good"}), encoding="utf-8")
+    (victim / ".pause").write_text("", encoding="utf-8")
+    lis = Listener(monkeypatch, app, owner=OWNER,
+                   research_docs=_bobs_paused_research()).feed(
+        **_bobs_resume(backendRunId=str(victim), config={"server": "https://evil"}))
+    assert lis.enqueued == []
+    assert json.loads((victim / "config.json").read_text(encoding="utf-8")) == {
+        "server": "https://good"}, "a payload config was merged outside queues/"
+    assert (victim / ".pause").exists(), "a .pause outside queues/ was cleared"
+
+
+def test_boot_recovery_will_not_take_a_path_claim_either(alices_run, monkeypatch):
+    """⛔⛔ THE SAME CLAIM ON THE OTHER CONSUMER. A supervised device's next boot
+    reads `backendRunId` off a document in the scanned tree."""
+    docs = alices_run / "documents"
+    docs.mkdir()
+    updates, enqueues = _rehydrate(monkeypatch, BOB, {BOB: [_RSnap(BOB_RID, {
+        "deviceId": "dev1", "status": "ongoing",
+        "backendRunId": f"{RUN}/documents"})]})
+    assert enqueues == [], "boot recovery auto-resumed a folder inside Alice's run"
+    assert [(u, r) for u, r, _p in updates] == [(BOB, BOB_RID)]
+
+
+# ── the dead-worker reconciler reads a run's delivery.json on the same claim ──
+
+class _ReconcileDb:
+    """`users/{uid}/researches`; the query itself goes through `_fs_where`."""
+
+    def collection(self, _n):
+        return self
+
+    def document(self, _n):
+        return self
+
+
+def _reconcile(monkeypatch, tmp_path, docs):
+    marks = []
+    monkeypatch.setattr(research, "__file__", str(tmp_path / "research.py"))
+    monkeypatch.setattr(research, "_firebase_db", _ReconcileDb())
+    monkeypatch.setattr(research, "_fs_where",
+                        lambda col, *a, **k: type("Q", (), {"get": lambda _s: docs})())
+    monkeypatch.setattr(research, "_owner_worker_of", lambda _a: 2)
+    monkeypatch.setattr(research, "_scan_sibling_locks_for_research", lambda r, w: [])
+    monkeypatch.setattr(research, "_update_research_doc",
+                        lambda u, r, p: marks.append((u, r)) or True)
+    asyncio.run(research._reconcile_dead_worker_runs(ALICE, {2}))
+    return marks
+
+
+def test_the_dead_worker_sweep_will_not_read_a_delivery_file_outside_queues(
+        tmp_path, monkeypatch):
+    """⛔ THE FOURTH CONSUMER of the same claim, found while fixing the other
+    three: this joined `backendRunId` raw to decide whether the autonomous
+    Cloud-Run tail had finished the run, so a path claim answered the question
+    with a file that was never a run's. An unusable claim now reads exactly like
+    an absent one — the shape this guard already handles — so the run is
+    marked."""
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "delivery.json").write_text(
+        json.dumps({"status": "completed"}), encoding="utf-8")
+    marks = _reconcile(monkeypatch, tmp_path,
+                       [_RSnap(RID, {"assignedWorker": 2,
+                                     "backendRunId": str(outside)})])
+    assert marks == [(ALICE, RID)]
+
+
+def test_the_dead_worker_sweep_still_leaves_a_finished_tail_alone(
+        tmp_path, monkeypatch):
+    """⭐ ACCEPT POLARITY, and the guard's whole purpose: a run whose BE handed
+    P4/P5 to Cloud Run stays `ongoing` on purpose and must not gain a false
+    Resume."""
+    d = _run_dir(tmp_path, owner={"uid": ALICE, "researchId": RID})
+    (d / "delivery.json").write_text(
+        json.dumps({"status": "completed"}), encoding="utf-8")
+    assert _reconcile(monkeypatch, tmp_path,
+                      [_RSnap(RID, {"assignedWorker": 2, "backendRunId": RUN})]) == []
+    (d / "delivery.json").write_text(
+        json.dumps({"status": "ongoing"}), encoding="utf-8")
+    assert _reconcile(monkeypatch, tmp_path,
+                      [_RSnap(RID, {"assignedWorker": 2,
+                                    "backendRunId": RUN})]) == [(ALICE, RID)]

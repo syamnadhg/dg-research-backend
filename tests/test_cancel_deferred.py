@@ -36,8 +36,12 @@ another member's queued run, left all five green. They now drive the REAL
 listener callback through `_queue_listener.Listener`: a fake Firestore, one
 cancel document, and a record of what the listener deleted and wrote.
 
-⚠ Layer 2 is still a replica of the terminal-status tuple, and says so; it is
-outside the wave-10.9 item that replaced Layer 1.
+⛔⛔ AND SO WAS LAYER 2, disclosed when Layer 1 was repaired and left standing
+because it was out of that item's scope. Round two of cross-verify came back
+for it: its ten parametrised tests called a copy of the terminal-status tuple
+kept in this file, so no change to research.py could turn them red. They drive
+the real start branch now, and the gate reads the module's one
+`TERMINAL_RESEARCH_STATUSES` instead of keeping a second copy of the words.
 
 Run via:
     pytest tests/test_cancel_deferred.py -v
@@ -153,33 +157,71 @@ def test_a_cancel_naming_another_persons_deferred_run_leaves_it(tmp_path, monkey
 
 
 # ── Layer 2: pre-claim status re-check ─────────────────────────────────
+#
+# ⛔⛔ LAYER 2 WAS A REPLICA TOO (found 2026-09-21 by wave 10.9's second
+# cross-verify). `_inline_pre_claim_status_check` was a copy of the terminal
+# tuple living in this file, and all ten parametrised tests called only that
+# copy — so dropping `stopped_by_watchdog` from the real gate, or adding
+# `paused` to it, left every one of them green. The Layer-1 repair in this wave
+# did not reach them, and the commit that made it said so.
+#
+# ⭐ They drive the real start branch now — one start document, one research
+# document carrying the status under test — and the gate itself was changed to
+# read the module's single `TERMINAL_RESEARCH_STATUSES` instead of keeping a
+# second copy of the words. `_research_is_terminal` is NOT stubbed here; this
+# file's subject is exactly whether a run counts as over.
 
-def _inline_pre_claim_status_check(research_doc_status):
-    """Replicates the new pre-claim status re-check from
-    research.py:~4411. Returns True if the listener should SKIP the
-    claim (terminal status), False if it should proceed."""
-    return research_doc_status in (
-        "stopped", "completed", "archived",
-        "terminated_by_user_discard", "stopped_by_watchdog",
-    )
+BULLDOG = "rid-bulldog"
+
+
+def _start_with_status(tmp_path, monkeypatch, status):
+    return Listener(monkeypatch, tmp_path, owner=OWNER, real_terminal_check=True,
+                    research_docs={(SHARER, BULLDOG): {"status": status}}).feed(
+        **_start(BULLDOG, SHARER, "Bull Dog"))
 
 
 @pytest.mark.parametrize("terminal_status", [
     "stopped", "completed", "archived",
     "terminated_by_user_discard", "stopped_by_watchdog",
 ])
-def test_pre_claim_skips_terminal_status(terminal_status):
+def test_pre_claim_skips_terminal_status(terminal_status, tmp_path, monkeypatch):
     """The cross-worker race window: worker A claimed + scheduled
     enqueue; cancel handler flipped research to terminal; worker A's
     listener now picks up the queue doc again on replay and must drop
-    it instead of running the cancelled job."""
-    assert _inline_pre_claim_status_check(terminal_status) is True
+    it instead of running the cancelled job.
+
+    ⛔ THE WRITE IS THE MEASUREMENT, not the empty queue. `_safe_enqueue` keeps
+    a whitelist of its own that refuses these statuses as well, so "nothing was
+    enqueued" would stay true with this gate deleted. Only the gate stops the
+    run BEFORE the branch stamps `backendRunId` on a finished run's document."""
+    lis = _start_with_status(tmp_path, monkeypatch, terminal_status)
+    assert lis.writes == [], f"a {terminal_status} run's document was written to"
+    assert lis.enqueued == [], f"a {terminal_status} run was enqueued anyway"
+    assert lis.incoming == ["incoming"], (
+        "the queue doc was left to replay on the next listener attach")
 
 
 @pytest.mark.parametrize("active_status", [
     "queued", "ongoing", "paused_backend_restart", "paused", None,
 ])
-def test_pre_claim_proceeds_for_active_status(active_status):
-    """Live and recovery states must still allow the claim. The
-    pre-claim re-check is a narrow drop, not a broad gate."""
-    assert _inline_pre_claim_status_check(active_status) is False
+def test_pre_claim_proceeds_for_active_status(active_status, tmp_path, monkeypatch):
+    """⭐ ACCEPT POLARITY, and the whole product: live and recovery states must
+    still get past this gate. It is a narrow drop, not a broad one — widened by
+    one word it would refuse a status the machine sees every day."""
+    lis = _start_with_status(tmp_path, monkeypatch, active_status)
+    assert [w[:2] for w in lis.writes] == [(SHARER, BULLDOG)], (
+        f"a {active_status} run was dropped by the pre-claim gate")
+    assert lis.writes[0][2]["backendRunId"]
+
+
+@pytest.mark.parametrize("enqueueable_status", [
+    "queued", "ongoing", "paused_backend_restart",
+])
+def test_an_active_run_reaches_the_queue(enqueueable_status, tmp_path, monkeypatch):
+    """⭐ AND ALL THE WAY THROUGH, for the three statuses `_safe_enqueue` admits.
+    `paused` and a missing status pass the gate above and are then refused by
+    that whitelist — a distinction the replica these tests replace could not
+    make, because it only ever described the gate's own tuple."""
+    lis = _start_with_status(tmp_path, monkeypatch, enqueueable_status)
+    assert [j["research_id"] for j in lis.enqueued] == [BULLDOG]
+    assert lis.writes[0][2]["status"] == "ongoing"
