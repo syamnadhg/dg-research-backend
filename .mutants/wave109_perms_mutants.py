@@ -28,6 +28,9 @@ looking installed. The ones that matter most are the quiet ones:
         over-correction that "readable only by its owner" invites.
   S1/S2 — the hook follows a link out of the tree and re-permissions somebody's
         file elsewhere on the disk.
+  Q4  — the cross-verify's own regression, back again: queues/ is created
+        whoever is running, so ONE sudo'd command on a fresh wheel leaves a
+        root-owned 0700 directory the real user can never write a run into.
 
 ⛔ ANCHORS ARE SINGLE STRING LITERALS AND MUST MATCH EXACTLY ONCE. A stale
 anchor is a harness fault, not a survivor, and faults are counted OUT. So is a
@@ -89,6 +92,20 @@ WIN_GUARD = ("    if sys.platform == \"win32\":\n"
              "        return  # mode bits mean next to nothing on NTFS")
 QUEUES_FN = ("    the worker locks and `setup_firestore_run` spell out inline.\"\"\"\n"
              "    return Path(__file__).parent / \"queues\"")
+#: The guard that keeps a sudo'd command from creating the directory.
+QUEUES_GUARD = ("        try:\n"
+                "            ours = os.stat(queues.parent).st_uid == os.geteuid()\n"
+                "        except OSError:\n"
+                "            ours = False  # no install directory to read: nothing to create in\n"
+                "        if ours:\n"
+                "            try:\n"
+                "                queues.mkdir(mode=0o700, exist_ok=True)\n"
+                "            except OSError:\n"
+                "                pass\n")
+#: The one line that decides it.
+QUEUES_TEST = "            ours = os.stat(queues.parent).st_uid == os.geteuid()"
+#: Where the unconditional narrowing sits, right after the guarded create.
+QUEUES_NARROW = "                pass\n        _owner_only(queues)\n"
 
 MUTANTS = [
     # ── K: the writers ───────────────────────────────────────────────────────
@@ -209,6 +226,42 @@ MUTANTS = [
      [(QUEUES_FN,
        "    the worker locks and `setup_firestore_run` spell out inline.\"\"\"\n"
        "    return Path(__file__).parent / \"queue\"")]),
+
+    ("Q4", "over", RESEARCH,
+     "⛔⛔ THE SUDO REGRESSION — queues/ is created whoever is running, so one "
+     "`sudo` command on a fresh wheel leaves a root-owned 0700 directory and "
+     "every later run as the actual owner cannot write a run folder into it",
+     [(QUEUES_GUARD,
+       "        try:\n"
+       "            queues.mkdir(mode=0o700, exist_ok=True)\n"
+       "        except OSError:\n"
+       "            pass\n")]),
+
+    ("Q5", "under", RESEARCH,
+     "the guard swallows the NARROWING too — a sudo'd command (or any run in a "
+     "tree this account does not own) stops narrowing the owner's existing "
+     "0755 queues/, which a chmod could have done perfectly well",
+     [(QUEUES_NARROW, "                pass\n            _owner_only(queues)\n")]),
+
+    ("Q6", "under", RESEARCH,
+     "the test becomes \"am I root\" instead of \"is this tree mine\" — root's "
+     "own install never gets its queues/, and a run as some third account "
+     "still scatters directories through a tree it does not own",
+     [(QUEUES_TEST, "            ours = os.geteuid() != 0")]),
+
+    ("Q8", "under", RESEARCH,
+     "the guard reads the REAL uid, not the effective one — the filesystem "
+     "judges the mkdir by the effective uid, so the check answers about a "
+     "different account than the one that would own the directory",
+     [(QUEUES_TEST,
+       "            ours = os.stat(queues.parent).st_uid == os.getuid()")]),
+
+    ("Q9", "under", RESEARCH,
+     "the guard stats queues/ itself instead of the directory it would be "
+     "created in — when it is absent the stat raises, so the one case the "
+     "create exists for never happens",
+     [(QUEUES_TEST,
+       "            ours = os.stat(queues).st_uid == os.geteuid()")]),
 
     ("L1", "under", RESEARCH,
      "the walk narrows files but not directories — runs/, sessions/ and "

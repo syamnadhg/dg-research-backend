@@ -79051,7 +79051,8 @@ def _harden_owner_only_paths() -> None:
     on its first claim, AFTER this has run, so "narrow it next boot" would leave
     a fresh install's run folders open for the whole life of its first serve.
     Its sub-folders are not walked; a 0700 root already stops anyone else
-    reaching them.
+    reaching them. It is created ONLY WHEN THE INSTALL DIRECTORY IS THIS
+    ACCOUNT'S — see the mkdir below; narrowing an existing one is unconditional.
 
     Only the DEFAULT env file: a custom `--env-file` is the user's own to
     permission. Never raises — every command passes through here."""
@@ -79068,10 +79069,24 @@ def _harden_owner_only_paths() -> None:
                   _STATE_DIR / "selfheal-audit.log"):
             _owner_only(p)
         queues = _queues_root()
+        # ⛔⛔ CREATE IT ONLY IF THIS ACCOUNT WOULD OWN IT. The wheel ships no
+        # queues/ (pyproject excludes it) and the installers warn against
+        # `sudo` — but people still reach for it. One sudo'd command before the
+        # first real run would otherwise make <site-packages>/queues root-owned
+        # at 0700, and every later run as the actual user could never write a
+        # run folder into it again. The install directory's owner is the test:
+        # a normal run creates it, a sudo'd one leaves it to the worker that
+        # comes after, and an install that really is root's, run as root, still
+        # gets it. Narrowing below is unconditional — a chmod creates nothing.
         try:
-            queues.mkdir(mode=0o700, exist_ok=True)
+            ours = os.stat(queues.parent).st_uid == os.geteuid()
         except OSError:
-            pass
+            ours = False  # no install directory to read: nothing to create in
+        if ours:
+            try:
+                queues.mkdir(mode=0o700, exist_ok=True)
+            except OSError:
+                pass
         _owner_only(queues)
         for root, _dirs, files in os.walk(_logs_root()):
             _owner_only(root)

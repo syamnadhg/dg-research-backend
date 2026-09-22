@@ -278,6 +278,93 @@ def test_boot_hook_creates_a_missing_queues_root_owner_only(machine):
     _owner_only_and_usable_dir(q)
 
 
+# ── the sudo'd first command ────────────────────────────────────────────────
+
+def _remove_queues(q) -> None:
+    """The wheel ships no queues/ — pyproject excludes it — so this is what a
+    fresh install looks like before its first claim."""
+    for p in sorted(q.rglob("*"), reverse=True):
+        p.rmdir() if p.is_dir() else p.unlink()
+    q.rmdir()
+
+
+def _the_hook_ran_past_queues(m) -> None:
+    """⛔ The whole hook is wrapped in `except Exception: pass`, so "queues/ was
+    not created" is also what a hook that DIED before the mkdir looks like. The
+    logs walk is the step AFTER the queues block: if the support zip came out
+    narrowed, the queues decision was reached and taken."""
+    _owner_only_and_usable_file(m["logs"] / "outgoing" / "support-ABCD1234.zip")
+
+
+def test_a_command_run_under_sudo_creates_no_queues_root_the_owner_cannot_use(
+        machine, monkeypatch):
+    """⛔⛔ THE PIN. The installers warn against `sudo` and people still use it.
+    One sudo'd command before the first real run used to leave
+    <site-packages>/queues root-owned at 0700 — and then every run as the actual
+    user fails to make a run folder in it, for good. Leave it to the worker."""
+    q = machine["queues"]
+    _remove_queues(q)
+    # ⛔ Only this one patch comes off below — `monkeypatch.undo()` would take
+    # the fixture's `_queues_root` with it and point the hook at the real repo.
+    real_geteuid = os.geteuid
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+
+    research._harden_owner_only_paths()
+
+    assert not q.exists(), (
+        "a root-owned queues/ was created in an install this account owns")
+    _the_hook_ran_past_queues(machine)
+    # And the run that comes after, as the real user, still gets it.
+    monkeypatch.setattr(os, "geteuid", real_geteuid)
+    research._harden_owner_only_paths()
+    _owner_only_and_usable_dir(q)
+
+
+def test_a_sudo_run_still_narrows_a_queues_root_that_is_already_there(
+        machine, monkeypatch):
+    """⭐ ACCEPT POLARITY. Only the CREATE is conditional: a chmod makes nothing,
+    and the owner's existing 0755 folder of topic-named runs is exactly what the
+    hook is for. Skipping the whole block under sudo would lose that."""
+    q = machine["queues"]
+    os.chmod(q, 0o755)
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+
+    research._harden_owner_only_paths()
+
+    _owner_only_and_usable_dir(q)
+    _the_hook_ran_past_queues(machine)
+
+
+def test_the_account_that_owns_the_install_creates_its_own_queues_root(
+        machine, monkeypatch):
+    """⭐ ACCEPT POLARITY, and the reason the test is the install directory's
+    OWNER and not "is this root". An install that really is root's, run as root,
+    is the same account owning the same tree: it must still get its queues/."""
+    q = machine["queues"]
+    _remove_queues(q)
+    monkeypatch.setattr(os, "geteuid", lambda: os.stat(q.parent).st_uid)
+
+    research._harden_owner_only_paths()
+
+    assert q.is_dir()
+    _owner_only_and_usable_dir(q)
+
+
+def test_an_install_that_belongs_to_another_account_is_not_populated(
+        machine, monkeypatch):
+    """Nothing is created in a tree this account does not own, whoever we are —
+    the mkdir would have failed there anyway, and the run folders belong to
+    whichever account the workers actually run as."""
+    q = machine["queues"]
+    _remove_queues(q)
+    monkeypatch.setattr(os, "geteuid", lambda: os.stat(q.parent).st_uid + 1)
+
+    research._harden_owner_only_paths()
+
+    assert not q.exists()
+    _the_hook_ran_past_queues(machine)
+
+
 def test_boot_hook_never_re_permissions_what_a_link_points_at(machine):
     outside = machine["tmp"] / "elsewhere"
     outside.mkdir()
