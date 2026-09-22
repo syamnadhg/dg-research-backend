@@ -81,6 +81,8 @@ SESSION_REDACT = 'f"sessions/{member.name}", True)'
 TAIL_REDACT = "            clean = redactor.data(data)"
 #: The redacted writer's own call.
 FILE_REDACT = "        data = redactor.data(raw)"
+#: The redacted writer follows the archive's compression setting.
+FILE_COMPRESS = "        info.compress_type = zf.compression"
 #: Which queues are the kept person's.
 OWNED = "                      if own_uid and uid == own_uid])"
 #: Where the redactor learns which uids exist.
@@ -182,6 +184,11 @@ MUTANTS = [
      "⛔ the redactor's result is thrown away in the file writer — installed, "
      "greppable, and doing nothing",
      [(FILE_REDACT, "        data = raw")]),
+
+    ("B25", "under", RESEARCH,
+     "redacted files are stored uncompressed — every unattributed run and "
+     "every session, i.e. most of a fleet bundle",
+     [(FILE_COMPRESS, "        info.compress_type = _zipfile.ZIP_STORED")]),
 
     ("B12", "under", RESEARCH,
      "every queue counts as the owner's, so every member's topic slug stays",

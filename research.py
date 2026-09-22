@@ -13418,7 +13418,9 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
             info = _zipfile.ZipInfo.from_file(str(src), arcname)
         except OSError:
             return False
-        info.compress_type = _zipfile.ZIP_DEFLATED
+        # The archive's own setting, not a second copy of it: one place decides
+        # whether a bundle is compressed, whichever writer a member goes through.
+        info.compress_type = zf.compression
         data = redactor.data(raw)
         if data != raw:
             redacted.append(arcname)

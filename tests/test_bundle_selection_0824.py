@@ -225,10 +225,16 @@ def test_the_owner_bundle_still_carries_the_machine(machine, tmp_path):
 
 def test_an_owner_who_ticks_nothing_still_gets_the_machine(machine, tmp_path):
     """⭐ THE PAIRING-FAILURE CASE, and the founding incident's shape: no run was
-    ever produced, so the whole evidence is a session and a tail."""
+    ever produced, so the whole evidence is a session and a tail.
+
+    ⛔ IT NAMES THE OWNER (#539), and that is what keeps it measuring. With no
+    `keep_uid` every attributed run is left out anyway, so "an empty pick means
+    everything" (wave8 selection S1) would ship nothing and pass here — the
+    selection harness found exactly that after #539 landed."""
     dest = tmp_path / "none.zip"
     summary = research._build_log_bundle(
-        dest, support_code="ABCD2345", only_runs=[], include_machine=True)
+        dest, support_code="ABCD2345", only_runs=[], include_machine=True,
+        keep_uid="U_ALICE")
     names = _members(dest)
     assert not any(n.startswith("runs/") for n in names)
     assert any(n.startswith("sessions/") for n in names)
