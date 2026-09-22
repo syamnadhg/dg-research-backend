@@ -183,7 +183,14 @@ def test_the_sweep_finds_the_victims_job_wherever_it_is_parked():
         [mine, victim], "chat_v", SHARER) is True
     assert research._another_persons_run_locally(
         [mine, victim], "chat_m", SHARER) is False
-    # a research this process knows nothing about is not somebody else's
+    # ⛔⛔ A research this process holds no job for is not something the LOCAL
+    # sweep can judge — which is all this asserts, and all it ever could. The
+    # comment here used to read "is not somebody else's", and that was the
+    # unguarded case (wave 10.9): a deferred run is held by nobody, so this is
+    # False for it and the deferred scan deleted the victim's start doc. That
+    # path now asks the START doc's own uid (`_deferred_start_doc_id`, executed
+    # in test_member_run_ownership_109.py). Not flipped: refusing every cancel
+    # for a research nobody holds would refuse a person's own queued run.
     assert research._another_persons_run_locally([mine], "chat_x", SHARER) is False
     assert research._another_persons_run_locally([], "chat_v", SHARER) is False
     # ⛔ and an empty research id must not match the empty slots the caller
@@ -327,10 +334,14 @@ def _queues(tmp_path, monkeypatch):
     fake.write_text("", encoding="utf-8")
     monkeypatch.setattr(research, "__file__", str(fake))
     q = tmp_path / "queues"
-    for run, rid in (("run_victim", "chat_victim"), ("run_mine", "chat_mine")):
+    # ⭐ BOTH HALVES OF THE RECORD, as `setup_firestore_run` writes it. The
+    # fixture used to carry the research alone, which is how the person half
+    # of the question went unasked (wave 10.9).
+    for run, rid, uid in (("run_victim", "chat_victim", OTHER),
+                          ("run_mine", "chat_mine", SHARER)):
         (q / run).mkdir(parents=True)
         (q / run / "owner.json").write_text(
-            json.dumps({"researchId": rid}), encoding="utf-8")
+            json.dumps({"uid": uid, "researchId": rid}), encoding="utf-8")
     (q / "run_legacy").mkdir(parents=True)          # no owner.json at all
     return q
 
@@ -347,10 +358,13 @@ def test_a_resume_payload_cannot_point_at_another_runs_directory(_queues):
     "owner.json" and for an assignment of `""`. Both survive
     `if False and backend_run_id:`, and the harness proved it."""
     # the claim names a run that belongs to somebody else → refused
-    assert research._corroborated_run_id("run_victim", "chat_mine") == ""
+    assert research._corroborated_run_id("run_victim", "chat_mine", SHARER) == ""
+    # ⛔⛔ AND NAMING THE VICTIM'S RESEARCH TOO NO LONGER HELPS (wave 10.9).
+    # Research ids are published to every member, so this is the real attack.
+    assert research._corroborated_run_id("run_victim", "chat_victim", SHARER) == ""
     # the claim is honest → kept
-    assert research._corroborated_run_id("run_mine", "chat_mine") == "run_mine"
-    assert research._corroborated_run_id("run_victim", "chat_victim") == "run_victim"
+    assert research._corroborated_run_id("run_mine", "chat_mine", SHARER) == "run_mine"
+    assert research._corroborated_run_id("run_victim", "chat_victim", OTHER) == "run_victim"
 
 
 def test_silence_from_the_disk_is_not_a_refusal(_queues):
@@ -359,18 +373,21 @@ def test_silence_from_the_disk_is_not_a_refusal(_queues):
     shape; only a directory that positively names a DIFFERENT research loses
     its claim. Refusing on absence would break resume for every run that
     predates that file."""
-    assert research._corroborated_run_id("run_legacy", "chat_mine") == "run_legacy"
-    assert research._corroborated_run_id("run_missing", "chat_mine") == "run_missing"
+    assert research._corroborated_run_id("run_legacy", "chat_mine", SHARER) == "run_legacy"
+    assert research._corroborated_run_id("run_missing", "chat_mine", SHARER) == "run_missing"
     # and the degenerate inputs pass through rather than being invented
-    assert research._corroborated_run_id("", "chat_mine") == ""
-    assert research._corroborated_run_id("run_mine", "") == "run_mine"
+    assert research._corroborated_run_id("", "chat_mine", SHARER) == ""
+    assert research._corroborated_run_id("run_mine", "", SHARER) == "run_mine"
 
 
 def test_the_predicate_in_the_other_direction_still_works(_queues):
-    """`_run_dir_owning_research` is the same question asked from the disk."""
-    assert research._run_dir_owning_research("chat_victim") == _queues / "run_victim"
-    assert research._run_dir_owning_research("chat_mine") == _queues / "run_mine"
-    assert research._run_dir_owning_research("chat_absent") is None
+    """`_run_dir_owning_research` is the same question asked from the disk —
+    and, as of wave 10.9, asked about the person as well as the research."""
+    assert research._run_dir_owning_research("chat_victim", OTHER) == _queues / "run_victim"
+    assert research._run_dir_owning_research("chat_mine", SHARER) == _queues / "run_mine"
+    assert research._run_dir_owning_research("chat_absent", SHARER) is None
+    assert research._run_dir_owning_research("chat_victim", SHARER) is None, (
+        "the disk handed one member another member's run directory")
 
 
 def test_the_resume_branch_assigns_through_the_corroboration_unconditionally():
@@ -386,12 +403,23 @@ def test_the_resume_branch_assigns_through_the_corroboration_unconditionally():
                   and n.test.comparators
                   and isinstance(n.test.comparators[0], ast.Constant)
                   and n.test.comparators[0].value == "resume")
+    # ⛔⛔ RE-AIMED IN WAVE 10.9, deliberately. The branch used to assign
+    # `backend_run_id = _corroborated_run_id(backend_run_id, target_rid)` and
+    # then took the research document's `backendRunId` UNCHECKED — the same
+    # claim, from the sender's own tree. Both claims now go through one
+    # resolution, `_resume_run_id`, assigned as a tuple; its behaviour (and
+    # this branch's) is EXECUTED in test_member_run_ownership_109.py. What is
+    # left for the parse tree is the shape the surviving mutant exploited.
+    def _binds_run_id(t):
+        if isinstance(t, ast.Name):
+            return t.id == "backend_run_id"
+        return isinstance(t, ast.Tuple) and any(
+            isinstance(e, ast.Name) and e.id == "backend_run_id" for e in t.elts)
     assigns = [n for n in ast.walk(branch) if isinstance(n, ast.Assign)
-               and any(isinstance(t, ast.Name) and t.id == "backend_run_id"
-                       for t in n.targets)]
+               and any(_binds_run_id(t) for t in n.targets)]
     through = [n for n in assigns if isinstance(n.value, ast.Call)
                and isinstance(n.value.func, ast.Name)
-               and n.value.func.id == "_corroborated_run_id"]
+               and n.value.func.id == "_resume_run_id"]
     assert through, (
         "the payload's run id is used without being corroborated against the "
         "directory it names")
@@ -403,19 +431,28 @@ def test_the_resume_branch_assigns_through_the_corroboration_unconditionally():
     # assignment is of course in its body — so a correct fix failed the test.
     # That is the second time in this round that my own checker was the thing
     # that was wrong.
+    # ⛔ ANYWHERE UNDER IT, NOT ONLY AS A DIRECT CHILD (wave 10.9). The call now
+    # sits in a `try:` — so an `if False:` wrapped round that `try` would have
+    # held the assignment as a grandchild, and a direct-children check passes.
     for node in ast.walk(branch):
         if not isinstance(node, ast.If) or node is branch:
             continue
-        if any(a is through[0] for a in node.body) or any(a is through[0] for a in node.orelse):
+        guarded = [x for part in (node.body, node.orelse) for stmt in part
+                   for x in ast.walk(stmt)]
+        if any(a is through[0] for a in guarded):
             raise AssertionError(
                 "the corroboration is guarded by a condition again — that is "
                 "the exact shape the mutant neutered")
-    # and the raw payload read feeds it rather than bypassing it
-    raw = [n for n in assigns if isinstance(n.value, ast.Call)
-           and "backendRunId" in ast.dump(n.value)]
-    assert len(raw) == 1, (
-        f"expected exactly one read of the payload's backendRunId, found {len(raw)}")
-    assert raw[0].lineno < through[0].lineno
+    # ⛔ AND NOTHING ELSE IN THE BRANCH SETS THE RUN ID but the disk arm, which
+    # adopts a directory `_run_dir_owning_research` found for this person. A raw
+    # `backend_run_id = data.get("backendRunId")` or `rd.get(...)` re-added here
+    # would bypass the resolution — the hole this wave closed on the document.
+    others = [n for n in assigns if n is not through[0]]
+    for n in others:
+        assert (isinstance(n.value, ast.Attribute) and n.value.attr == "name"), (
+            f"line {n.lineno} sets the run id from something other than the "
+            f"resolution or the disk arm: {ast.dump(n.value)[:80]}")
+    assert "backendRunId" not in "".join(ast.dump(n.value) for n in others)
 
 
 # ══ 4. the twelve-hour sweep writes into a named person's document ═════════

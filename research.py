@@ -2730,10 +2730,14 @@ def _another_persons_run_locally(jobs, research_id: str, target_uid: str) -> boo
 
     ⭐ ONE GATE, NOT FIVE. The cancel handler matches its target in five places
     — the gate-pending job, the running job, both of their race re-checks, and
-    the deque scan — and a check added to some of them is not a check. Asking
-    once, before anything is stopped or written, also covers the branch with no
-    local job at all: the deferred path deletes the START doc and flips the
-    research status for a run this process never held.
+    the deque scan — and a check added to some of them is not a check.
+
+    ⛔⛔ AND IT CANNOT SEE A RUN NOBODY HERE HOLDS, which this docstring used to
+    claim it could. A deferred run sits in Firestore unclaimed, so no local job
+    names it and this returns False — and on a multi-worker machine every
+    sibling that does not hold a job reaches the deferred path even when the
+    holder refuses. That path asks its own question, of the START doc's own
+    uid: `_deferred_start_doc_id`.
     """
     rid = str(research_id or "").strip()
     if not rid:
@@ -2747,8 +2751,9 @@ def _another_persons_run_locally(jobs, research_id: str, target_uid: str) -> boo
 
 
 def _refuse_foreign_run(doc, jobs, research_id: str, target_uid: str,
-                        where: str) -> bool:
-    """Refuse a cancel aimed at somebody else's run: drop it and say so.
+                        where: str, verb: str = "cancel") -> bool:
+    """Refuse a cancel or resume aimed at somebody else's run: drop it and say
+    so. `verb` only names the request in the log line.
 
     ⛔⛔ A MUTANT SURVIVED THE FIRST VERSION OF THIS, and it is the same disease
     the guard beside it was extracted to cure. The branch read
@@ -2767,7 +2772,7 @@ def _refuse_foreign_run(doc, jobs, research_id: str, target_uid: str,
     """
     if not _another_persons_run_locally(jobs, research_id, target_uid):
         return False
-    log(f"[{where}] refusing cancel of {str(research_id)[:8]}… — the run this "
+    log(f"[{where}] refusing {verb} of {str(research_id)[:8]}… — the run this "
         f"names belongs to another person on this computer", "WARN")
     try:
         doc.reference.delete()
@@ -2776,16 +2781,85 @@ def _refuse_foreign_run(doc, jobs, research_id: str, target_uid: str,
     return True
 
 
-def _corroborated_run_id(claimed_run_id: str, research_id: str) -> str:
+def _jobs_held_locally(job_queue) -> list:
+    """Every job this process holds: the running one, the one in the gate wait,
+    and the deque. Empty slots come back as `{}`, which matches nothing."""
+    jobs = [_QUEUE_STATE.get("current_job") or {},
+            _QUEUE_STATE.get("gate_pending_job") or {}]
+    try:
+        jobs.extend(list(job_queue._queue))
+    except Exception:
+        pass
+    return jobs
+
+
+def _deferred_start_doc_id(docs, research_id: str, uid: str) -> "str | None":
+    """The id of the queued START doc a cancel may delete, or None.
+
+    ⛔⛔ FOUND 2026-09-21 (wave 10.9): THIS SCAN MATCHED ON `researchId` ALONE.
+    A deferred run is unclaimed by definition, so no worker holds it and the
+    local ownership gate has nothing to look at. A member who signed a cancel
+    honestly as themselves and named somebody else's research id — published on
+    the device document in `queueOwners` — deleted that person's start doc. The
+    status write then landed in the SENDER's tree, so the victim's tile sat on
+    "queued" with nothing behind it, and no one was told.
+
+    ⭐ THE START DOC CARRIES ITS OWNER, so the answer is on the document being
+    deleted. The owner's Stop on a sharer's queued run writes `uid=<sharer>` —
+    the same uid that sharer's start doc carries — so that path is unchanged.
+
+    ⛔ STRICT, NOT "ABSENT IS NOT DISAGREEING". A start doc with no uid never
+    runs (the start branch deletes it as missing a field), so refusing to match
+    it costs nothing; matching it would let anyone who knows the id delete it.
+    """
+    rid = str(research_id or "").strip()
+    who = str(uid or "").strip()
+    if not rid or not who:
+        return None
+    for snap in docs or ():
+        d = snap.to_dict() or {}
+        if (d.get("action") or "start") != "start":
+            continue
+        if str(d.get("researchId") or "").strip() != rid:
+            continue
+        if str(d.get("uid") or "").strip() != who:
+            log(f"Cancel: the queued start doc for {rid[:8]}… belongs to another "
+                f"person — leaving it", "WARN")
+            continue
+        return snap.id
+    return None
+
+
+def _owner_record_admits(owner, uid) -> bool:
+    """Does a run directory's `owner.json` leave THIS person free to act on it?
+
+    ⛔ ABSENT IS NOT DISAGREEING. `setup_firestore_run` writes both halves of
+    the record, so a record naming no uid is an older or hand-made shape and
+    decides nothing; a record naming somebody else decides everything.
+    """
+    recorded = str((owner or {}).get("uid") or "").strip()
+    return not recorded or recorded == str(uid or "").strip()
+
+
+def _corroborated_run_id(claimed_run_id: str, research_id: str, uid: str) -> str:
     """A client-supplied `backendRunId`, kept only if the disk agrees it is this
-    research's run. Returns "" when it cannot be corroborated as belonging
-    elsewhere, which sends the caller to the research document instead.
+    research's run AND this person's. Returns "" when it cannot be corroborated
+    as belonging to them, which sends the caller to the research document
+    instead.
 
     ⛔⛔ THE FIELD IS READ STRAIGHT OFF THE QUEUE DOCUMENT ON PURPOSE — that is
     how a synth user who cannot read the research doc still resumes — so
     nothing upstream checks that the run it names is the research it names.
     Unchecked it resumes another person's run directory under this person's
     research, clearing their `.no_auto_retry` and their `.pause` on the way.
+
+    ⛔⛔ AND MATCHING THE RESEARCH WAS HALF THE QUESTION (wave 10.9). Research
+    ids are not secret — `queueOwners` publishes them to every member — and the
+    rules let a member create a research document with ANY id in their own
+    tree. So "this run belongs to research X" proved nothing about the person
+    asking: a member named X, the research matched, and the remaining phases of
+    somebody else's run were written into the sender's tree, with `owner.json`
+    rewritten to them on the way. The record names the person too; ask it.
 
     ⛔⛔ AND THE FIRST VERSION WAS AN `if` INSIDE THE LISTENER, WHICH A MUTANT
     SURVIVED: `if False and backend_run_id:` left every name the test looked
@@ -2795,7 +2869,7 @@ def _corroborated_run_id(claimed_run_id: str, research_id: str) -> str:
 
     ⭐ SILENCE FROM THE DISK IS NOT A REFUSAL. A directory with no readable
     `owner.json` is the ordinary pre-owner.json shape and keeps its claim; only
-    a directory that positively names a DIFFERENT research loses it.
+    a directory that positively names a DIFFERENT research or person loses it.
     """
     claimed = str(claimed_run_id or "").strip()
     rid = str(research_id or "").strip()
@@ -2809,10 +2883,49 @@ def _corroborated_run_id(claimed_run_id: str, research_id: str) -> str:
         return claimed
     owns = str((owner or {}).get("researchId") or "").strip()
     if owns and owns != rid:
-        log(f"Resume: payload named run {claimed} for {rid[:8]}… but that run "
+        log(f"Resume: run {claimed} was named for {rid[:8]}… but that run "
             f"belongs to {owns[:8]}… — ignoring the claim", "WARN")
         return ""
+    if not _owner_record_admits(owner, uid):
+        log(f"Resume: run {claimed} was named for {rid[:8]}… but it belongs to "
+            f"another person on this computer — ignoring the claim", "WARN")
+        return ""
     return claimed
+
+
+def _resume_run_id(data, uid: str, research_id: str) -> "tuple[str, dict | None]":
+    """Which run directory a Resume queue doc may act on: (run id, research doc).
+
+    Both places a run id can come from are the SENDER'S claims, and both are
+    corroborated against the disk for the person the doc names:
+      · the payload's `backendRunId`, read off the queue doc on purpose so a
+        synth user who cannot read the research doc still resumes;
+      · the research document's `backendRunId`, read only when the first is
+        absent or refused.
+    Returns ("", doc) when neither survives — the caller then asks the disk,
+    by owner, in `_run_dir_owning_research` — and ("", None) when the research
+    document does not exist. A failed read RAISES; that exit is transient and
+    the caller keeps it silent.
+
+    ⛔⛔ THE DOCUMENT IS A CLAIM TOO, and checking only the payload would have
+    moved the hole rather than closed it. The document sits in the sender's own
+    tree, which the rules let them create with any id and any field — so a
+    refused payload claim followed by an unchecked document field is the same
+    attack with one more write.
+
+    ⭐ ONE FUNCTION, ASSIGNED UNCONDITIONALLY, so the resume branch has no
+    condition of its own left to neuter and a test can hand this a queue doc
+    naming somebody else and read the answer.
+    """
+    claimed = _corroborated_run_id((data or {}).get("backendRunId"), research_id, uid)
+    if claimed:
+        return claimed, {}
+    snap = (_firebase_db.collection("users").document(uid)
+            .collection("researches").document(research_id).get())
+    if not snap.exists:
+        return "", None
+    rd = snap.to_dict() or {}
+    return _corroborated_run_id(rd.get("backendRunId"), research_id, uid), rd
 
 
 def _start_doc_identity_conflict(data) -> "tuple[str, str] | None":
@@ -2954,13 +3067,22 @@ def _resume_drop_writeback(uid: str, research_id: str, reason: str,
     return _update_research_doc(uid, research_id, updates)
 
 
-def _run_dir_owning_research(research_id: str):
-    """The queue directory whose `owner.json` names this research, if any.
+def _run_dir_owning_research(research_id: str, uid: str):
+    """The queue directory whose `owner.json` names this research AND this
+    person, if any.
 
     ⭐ THE DISK IS THE SECOND OPINION. A research document with no
     `backendRunId` may still have a real run directory — the write-back of that
     field can fail while the run proceeds — and the difference decides whether
     a Resume refusal is permanent or merely confused.
+
+    ⛔⛔ AND IT IS ASKED ABOUT A PERSON, NOT ONLY A RESEARCH (wave 10.9). A
+    member could create a research document in their own tree under somebody
+    else's published research id, leave `backendRunId` off it, and press
+    Resume: this lookup found the other person's directory, the caller
+    "repaired" the sender's document with it and resumed it into their tree.
+    A directory naming somebody else is skipped, not refused — the loop goes on
+    looking for one that is this person's.
     """
     rid = str(research_id or "").strip()
     if not rid:
@@ -2975,7 +3097,8 @@ def _run_dir_owning_research(research_id: str):
             owner = json.loads((d / "owner.json").read_text(encoding="utf-8"))
         except Exception:
             continue
-        if str(owner.get("researchId") or "").strip() == rid:
+        if (str(owner.get("researchId") or "").strip() == rid
+                and _owner_record_admits(owner, uid)):
             return d
     return None
 
@@ -14049,15 +14172,14 @@ def start_firestore_start_listener(job_queue, loop):
                 # the sender's own tree so the victim was never told. Their
                 # researchId is on the device document every member may read.
                 #
-                # ⭐ ASKED ONCE, BEFORE ANYTHING IS STOPPED OR WRITTEN. The
-                # deferred branch has no local job at all and still deletes a
-                # start doc and flips a status, so a per-match check would have
-                # left the quietest path open.
-                _local_jobs = [current, _QUEUE_STATE.get("gate_pending_job") or {}]
-                try:
-                    _local_jobs.extend(list(job_queue._queue))
-                except Exception:
-                    pass
+                # ⭐ ASKED ONCE, BEFORE ANYTHING IS STOPPED OR WRITTEN, over
+                # every job this process holds.
+                # ⛔⛔ AND IT CANNOT SEE A DEFERRED RUN, which this comment used
+                # to say it covered. Nobody holds a deferred run, so this gate
+                # passes it, and a sibling worker reaches the deferred scan even
+                # when the holder refuses. That scan checks the START doc's own
+                # uid — see `_deferred_start_doc_id` in `_do_cancel` below.
+                _local_jobs = _jobs_held_locally(job_queue)
                 if _refuse_foreign_run(doc, _local_jobs, target_rid, target_uid,
                                        "start-listener"):
                     continue
@@ -14222,12 +14344,13 @@ def start_firestore_start_listener(job_queue, loop):
                         _start_doc_id = None
                         if not removed and _firebase_db:
                             try:
-                                for _qsnap in col_ref.limit(50).stream():
-                                    _qd = _qsnap.to_dict() or {}
-                                    if (_qd.get("researchId") == rid
-                                            and (_qd.get("action") or "start") == "start"):
-                                        _start_doc_id = _qsnap.id
-                                        break
+                                # ⛔⛔ ONLY THIS PERSON'S START DOC. The scan
+                                # matched on researchId alone, so a member's
+                                # cancel naming somebody else's published id
+                                # deleted that person's queued run. Assigned,
+                                # not branched on — see the helper.
+                                _start_doc_id = _deferred_start_doc_id(
+                                    col_ref.limit(50).stream(), rid, u)
                                 if _start_doc_id is not None:
                                     try:
                                         col_ref.document(_start_doc_id).delete()
@@ -14346,6 +14469,14 @@ def start_firestore_start_listener(job_queue, loop):
                     try: doc.reference.delete()
                     except Exception: pass
                     continue
+                # ⛔⛔ A RUN THIS PROCESS HOLDS FOR SOMEBODY ELSE IS NOT THEIRS
+                # TO RESUME, whatever the disk says. The owner.json checks below
+                # carry the person too, but a directory written before the uid
+                # half existed decides nothing; the job in hand always names its
+                # owner. The cancel branch asks the same question the same way.
+                if _refuse_foreign_run(doc, _jobs_held_locally(job_queue), target_rid,
+                                       target_uid, "start-listener", verb="resume"):
+                    continue
                 # Track D: synth user can't read users/{ownerUid}/researches.
                 # FE now carries backendRunId in the queue payload, so the
                 # research-doc read is a fallback only (legacy Admin-SDK BEs
@@ -14353,54 +14484,47 @@ def start_firestore_start_listener(job_queue, loop):
                 # Initialize `rd` so the topic fallback at line ~2829 is
                 # safe even when we skip the doc-read branch entirely.
                 rd: dict = {}
-                backend_run_id = (data.get("backendRunId") or "").strip()
-                # ⛔⛔ AND A CLIENT-SUPPLIED RUN ID IS A CLAIM, NOT A FACT. This
-                # field is read straight off the queue document precisely so a
-                # synth user who cannot read the research doc still resumes —
-                # which means nothing upstream has checked that the run it names
-                # is the research it names. Left unchecked it resumes somebody
-                # else's run directory under this person's research, clears
-                # their `.no_auto_retry` and their `.pause`, and rewrites the
-                # artifacts' status. The disk already holds the answer:
-                # `owner.json` names the research the directory belongs to, and
-                # `_run_dir_owning_research` is that lookup in the other
-                # direction. A run id we cannot corroborate falls back to the
-                # document, which is the path that was always there.
+                # ⛔⛔ AND A CLIENT-SUPPLIED RUN ID IS A CLAIM, NOT A FACT. The
+                # payload's field is read straight off the queue document
+                # precisely so a synth user who cannot read the research doc
+                # still resumes — which means nothing upstream has checked that
+                # the run it names is the research it names, or the person's.
+                # Left unchecked it resumes somebody else's run directory under
+                # this person's research, clears their `.no_auto_retry` and
+                # their `.pause`, and rewrites the artifacts' status. The
+                # document's field is the same kind of claim: it sits in the
+                # sender's own tree. `_resume_run_id` corroborates both against
+                # `owner.json` — research AND person.
                 #
                 # ⛔⛔ ASSIGNED UNCONDITIONALLY, AND A MUTANT IS WHY. Written as
                 # an `if` here, the whole corroboration could be neutered to
                 # `if False and backend_run_id:` with every name the test looked
                 # for still in place — and it survived the harness. There is no
-                # branch to neuter now, and the decision itself is executed by
-                # its own test against a real directory.
-                backend_run_id = _corroborated_run_id(backend_run_id, target_rid)
-                if not backend_run_id:
-                    try:
-                        rs = _firebase_db.collection("users").document(target_uid) \
-                            .collection("researches").document(target_rid).get()
-                    except Exception as ex:
-                        err_str = str(ex)
-                        if (
-                            "403" in err_str
-                            or "PERMISSION_DENIED" in err_str
-                            or "Missing or insufficient permissions" in err_str
-                        ):
-                            log(
-                                "Resume: read denied on research doc + no backendRunId in payload — drop queue entry",
-                                "WARN",
-                            )
-                        else:
-                            log(f"Resume: failed to read research doc: {ex}", "WARN")
-                        try: doc.reference.delete()
-                        except Exception: pass
-                        continue
-                    if not rs.exists:
-                        log(f"Resume: research {target_rid[:8]}... not found", "WARN")
-                        try: doc.reference.delete()
-                        except Exception: pass
-                        continue
-                    rd = rs.to_dict() or {}
-                    backend_run_id = rd.get("backendRunId") or ""
+                # branch to neuter now; the resolution is executed by its own
+                # tests with a queue doc naming somebody else.
+                try:
+                    backend_run_id, rd = _resume_run_id(data, target_uid, target_rid)
+                except Exception as ex:
+                    err_str = str(ex)
+                    if (
+                        "403" in err_str
+                        or "PERMISSION_DENIED" in err_str
+                        or "Missing or insufficient permissions" in err_str
+                    ):
+                        log(
+                            "Resume: read denied on research doc + no usable backendRunId in payload — drop queue entry",
+                            "WARN",
+                        )
+                    else:
+                        log(f"Resume: failed to read research doc: {ex}", "WARN")
+                    try: doc.reference.delete()
+                    except Exception: pass
+                    continue
+                if rd is None:
+                    log(f"Resume: research {target_rid[:8]}... not found", "WARN")
+                    try: doc.reference.delete()
+                    except Exception: pass
+                    continue
                 if not backend_run_id:
                     log(f"Resume: research {target_rid[:8]}... has no backendRunId", "WARN")
                     # ⛔ "NO RUN DIRECTORY TO POINT AT" IS TRUE OF THE DOCUMENT,
@@ -14419,7 +14543,11 @@ def start_firestore_start_listener(job_queue, loop):
                     # `backendRunId` back, so the next press takes the identical
                     # branch, and the sentence tells the person to keep pressing
                     # it. The directory's own name IS the missing run id.
-                    _orphaned = _run_dir_owning_research(target_rid)
+                    # ⛔⛔ ONLY A DIRECTORY THAT IS THIS PERSON'S. Asked about the
+                    # research alone, this found another member's run for a
+                    # research id the sender had minted in their own tree, and
+                    # the arm below "repaired" the sender's document with it.
+                    _orphaned = _run_dir_owning_research(target_rid, target_uid)
                     if _orphaned is not None:
                         log(f"Resume: {target_rid[:8]}… has no backendRunId but "
                             f"{_orphaned.name} on disk claims it — repairing the "
@@ -71144,7 +71272,15 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
 
                 auto_resumed = False
                 if _i_own and is_supervised:
-                    run_id = data.get("backendRunId") or ""
+                    # ⛔⛔ THE SAME CLAIM AS THE RESUME PAYLOAD'S (wave 10.9).
+                    # This document sits in the scanned person's own tree, which
+                    # the rules let them create under any research id with any
+                    # `backendRunId` — so on a sharer's tree an unchecked field
+                    # auto-resumed another member's run directory into it at the
+                    # next boot. Refused, it falls through to the paused mark in
+                    # the scanned tree, which is theirs to write.
+                    run_id = _corroborated_run_id(data.get("backendRunId"),
+                                                  research_id, tree_uid)
                     if run_id:
                         queue_dir = Path(__file__).parent / "queues" / run_id
                         # Only auto-resume if the on-disk artifacts are intact

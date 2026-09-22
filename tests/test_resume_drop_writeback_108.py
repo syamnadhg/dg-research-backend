@@ -29,8 +29,6 @@ import inspect
 import time
 from pathlib import Path
 
-import pytest
-
 import research
 
 
@@ -568,9 +566,12 @@ def test_a_run_whose_folder_is_on_disk_is_found_by_its_owner_file(tmp_path, monk
     other = tmp_path / "queues" / "Topic_20260101_010000"
     other.mkdir(parents=True)
     (other / "owner.json").write_text('{"uid": "u", "researchId": "chat_B"}', encoding="utf-8")
-    assert research._run_dir_owning_research("chat_A") == d
-    assert research._run_dir_owning_research("chat_missing") is None
-    assert research._run_dir_owning_research("") is None
+    assert research._run_dir_owning_research("chat_A", "u") == d
+    assert research._run_dir_owning_research("chat_missing", "u") is None
+    assert research._run_dir_owning_research("", "u") is None
+    # ⛔⛔ wave 10.9: and it asks about the person too — the directory is found
+    # for the uid its owner.json names, and for nobody else.
+    assert research._run_dir_owning_research("chat_A", "someone-else") is None
 
 
 def test_the_three_sentences_are_distinct_and_none_is_empty():

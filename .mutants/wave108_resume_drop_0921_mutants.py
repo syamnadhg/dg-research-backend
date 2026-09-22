@@ -63,7 +63,11 @@ SUITES = ("tests/test_resume_drop_writeback_108.py "
           # outside the harness's own test list survives for a reason that has
           # nothing to do with the code.
           "tests/test_owner_control_only_109.py "
-          "tests/test_round_three_repairs_108.py")
+          "tests/test_round_three_repairs_108.py "
+          # ⛔ AND WAVE 10.9's, for the same reason: O9 and O15 were re-aimed at
+          # the resume resolution that replaced their old line, and the tests
+          # that EXECUTE the resume branch live there.
+          "tests/test_member_run_ownership_109.py")
 RESEARCH = "research.py"
 FILES = (RESEARCH,)
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
@@ -103,10 +107,13 @@ B_STALE = ("                if (data.get(\"action\") == \"resume\"\n"
            "                        data.get(\"uid\") or \"\", data.get(\"researchId\") or \"\",\n"
            "                        RESUME_DROP_WENT_STALE, status=None)")
 #: A transient exit that must stay silent — the doc replays on restart.
-B_TRANSIENT = ("                            log(\n"
-               "                                \"Resume: read denied on research doc + no backendRunId in payload — drop queue entry\",\n"
-               "                                \"WARN\",\n"
-               "                            )")
+#: ⛔ RE-ANCHORED IN WAVE 10.9. The read moved into `_resume_run_id` and the
+#: listener's `except` around it lost a level of indentation; the sentence
+#: gained "usable", because a refused payload claim now reaches it too.
+B_TRANSIENT = ("                        log(\n"
+               "                            \"Resume: read denied on research doc + no usable backendRunId in payload — drop queue entry\",\n"
+               "                            \"WARN\",\n"
+               "                        )")
 
 # ── anchors: the dead-worker backstop's wiring ──────────────────────────────
 #: The boot spawn that never marked.
@@ -289,7 +296,7 @@ MUTANTS = [
      "it is about to resume is the lie this wave exists to end, pointed the other "
      "way",
      [(B_TRANSIENT, B_TRANSIENT +
-       "\n                            _resume_drop_writeback(target_uid, target_rid, RESUME_DROP_ARTIFACTS_GONE)")]),
+       "\n                        _resume_drop_writeback(target_uid, target_rid, RESUME_DROP_ARTIFACTS_GONE)")]),
 
     # ── W: the Resume backstop for a run its worker abandoned ──────────────
     ("W1", "under", RESEARCH,
@@ -666,11 +673,13 @@ MUTANTS = [
      "⛔⛔ the foreign-run refusal keeps its verdict and stops DELETING the "
      "document, so the next snapshot re-reads it and the idle rescan sweeps up "
      "exactly the cancel the listener declined",
-     [("    log(f\"[{where}] refusing cancel of {str(research_id)[:8]}… — the run this \"\n"
+     # ⛔ RE-ANCHORED IN WAVE 10.9: the log line names `{verb}`, because the
+     # resume branch now asks the same question through the same helper.
+     [("    log(f\"[{where}] refusing {verb} of {str(research_id)[:8]}… — the run this \"\n"
        "        f\"names belongs to another person on this computer\", \"WARN\")\n"
        "    try:\n        doc.reference.delete()\n    except Exception:\n        pass\n"
        "    return True",
-       "    log(f\"[{where}] refusing cancel of {str(research_id)[:8]}… — the run this \"\n"
+       "    log(f\"[{where}] refusing {verb} of {str(research_id)[:8]}… — the run this \"\n"
        "        f\"names belongs to another person on this computer\", \"WARN\")\n"
        "    return True")]),
 
@@ -678,8 +687,11 @@ MUTANTS = [
      "⛔ the corroborated run id is computed and then not used — the assignment "
      "keeps the client's claim, which is the surviving mutant's effect achieved "
      "by a different route",
-     [("                backend_run_id = _corroborated_run_id(backend_run_id, target_rid)",
-       "                _corroborated_run_id(backend_run_id, target_rid)")]),
+     # ⛔ RE-AIMED IN WAVE 10.9 at the consumer's new shape: the resolution is
+     # still called, and the branch reads the raw payload claim anyway.
+     [("                    backend_run_id, rd = _resume_run_id(data, target_uid, target_rid)\n",
+       "                    _unused, rd = _resume_run_id(data, target_uid, target_rid)\n"
+       "                    backend_run_id = (data.get(\"backendRunId\") or \"\").strip() or _unused\n")]),
 
     ("O16", "over", RESEARCH,
      "⛔⛔ a directory with no readable owner.json loses its claim, so every run "
@@ -708,18 +720,24 @@ MUTANTS = [
      "⛔⛔ a client-supplied backendRunId is taken on trust again, so a resume "
      "runs somebody else's run directory under this person's research — clearing "
      "their .no_auto_retry and their .pause on the way",
-     [("                backend_run_id = _corroborated_run_id(backend_run_id, target_rid)\n", "")]),
+     # ⛔ RE-AIMED IN WAVE 10.9: the payload claim is corroborated inside
+     # `_resume_run_id` now, so "taken on trust" is that line reading it raw.
+     [("    claimed = _corroborated_run_id((data or {}).get(\"backendRunId\"), research_id, uid)\n",
+       "    claimed = str((data or {}).get(\"backendRunId\") or \"\").strip()\n")]),
 
     ("O10", "under", RESEARCH,
      "⛔ the mismatch is REPORTED and then used anyway — a log line where a "
      "refusal should be, which is the shape round two caught on the "
      "no-backendRunId branch",
+     # ⛔ RE-ANCHORED IN WAVE 10.9: the helper now corroborates the research
+     # document's claim and boot recovery's too, so the log stopped saying
+     # "payload".
      [("    if owns and owns != rid:\n"
-       "        log(f\"Resume: payload named run {claimed} for {rid[:8]}… but that run \"\n"
+       "        log(f\"Resume: run {claimed} was named for {rid[:8]}… but that run \"\n"
        "            f\"belongs to {owns[:8]}… — ignoring the claim\", \"WARN\")\n"
        "        return \"\"\n",
        "    if owns and owns != rid:\n"
-       "        log(f\"Resume: payload named run {claimed} for {rid[:8]}… but that run \"\n"
+       "        log(f\"Resume: run {claimed} was named for {rid[:8]}… but that run \"\n"
        "            f\"belongs to {owns[:8]}… — ignoring the claim\", \"WARN\")\n")]),
 
     ("O11", "under", RESEARCH,
