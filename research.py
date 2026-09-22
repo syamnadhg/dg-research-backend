@@ -36060,6 +36060,12 @@ async def scrape_chatgpt_activity_panel_tracking(page):
 
 # ── Browser ────────────────────────────────────────────────────────────────────
 
+# How long `Browser.close()` lets the context close before it kills our
+# profile's Chrome instead. A healthy close takes a second or two; the bound is
+# generous because a kill can drop a sign-in Chrome has not flushed yet (#898b).
+_BROWSER_CLOSE_TIMEOUT_SEC = 30.0
+
+
 class Browser:
     """Playwright persistent Chrome context — proven from original research.py."""
 
@@ -36659,11 +36665,21 @@ class Browser:
 
     async def close(self):
         try:
-            if self.context: await self.context.close()
+            # ⛔⛔ BOUNDED (wave 10.9). The driver closes a persistent context by
+            # sending Chrome `Browser.close` and then waiting, with no timeout,
+            # for the process to exit. A HUNG Chrome never exits, so an unbounded
+            # close froze `run_pipeline`'s finally — the very unwind a hung
+            # browser is sent down — before the relaunch or any card could run.
+            # A timeout lands in the arm below, which kills our profile's Chrome;
+            # nothing else will, because `start()`'s orphan sweep spares any
+            # Chrome younger than this process, and the hung one is.
+            if self.context:
+                await asyncio.wait_for(self.context.close(),
+                                       timeout=_BROWSER_CLOSE_TIMEOUT_SEC)
             if self.playwright: await self.playwright.stop()
             log("Browser closed")
         except Exception as e:
-            log(f"Browser close error: {e}", "WARN")
+            log(f"Browser close error: {str(e) or type(e).__name__}", "WARN")
             # Kill only OUR profile's chromium — never nuke all chrome.exe
             try:
                 import psutil
@@ -63076,17 +63092,34 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
             # have worked; nothing here can upload anything until Chrome is
             # relaunched.
             #
-            # `_is_browser_close_error` already knows this string — the
-            # navigate() retry path and the Phase-2 sweep both key on it — so
-            # the fix is to ASK it, and then unwind the way every other
-            # browser-death site does, into the silent relaunch-and-resume that
-            # `_plan_pipeline_auto_retry` exists to perform.
-            if _is_browser_close_error(e):
+            # The fix is to unwind the way every other browser-death site does,
+            # into the silent relaunch-and-resume that `_plan_pipeline_auto_retry`
+            # exists to perform.
+            #
+            # ⛔ AND TO ASK THE CONTEXT, NOT JUST THE TEXT (wave 10.9). That
+            # string also means one closed TAB, and a closed tab on a live
+            # browser needs a fresh tab, not a relaunch — the next attempt opens
+            # one. Silently, while an attempt is left; the last one falls through
+            # to the card below, because a run that quietly drops NotebookLM is
+            # worse than a question.
+            _p3_fail_kind = await _p3_upload_failure_kind(e, browser)
+            if _p3_fail_kind == "browser_dead":
                 _runtime.last_failure_kind = "browser_crash"
                 log("[Phase3] the browser is gone, not the upload — unwinding "
                     "for checkpoint recovery", "WARN")
                 raise RuntimeError(
                     "research browser died before the NotebookLM upload (browser crash)")
+            if _p3_fail_kind == "tab_closed" and p3_attempt < p3_max_retries:
+                log("[Phase3] the NotebookLM tab closed but the browser is alive — "
+                    "retrying the upload in a fresh tab", "WARN")
+                p3_attempt += 1
+                # A crashed tab can linger as a sad tab; close it the way the
+                # Retry path below does, so the fresh one is the only one.
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+                continue
             # Distinguish session-expired from generic upload failure — the
             # frontend can offer "re-login then retry" vs "just retry".
             _err_msg = str(e)
@@ -66839,6 +66872,11 @@ def _p2_announce_restored(kept) -> None:
 # `_crash_retries` param (NOT _runtime, which `reset()`s per run).
 BROWSER_CRASH_MAX_RETRIES = 2
 
+# How long `_browser_context_is_dead` waits for the context to answer. A live
+# Chrome answers `cookies()` in milliseconds; this only has to outlast a stall,
+# not a page load. See the docstring for what a timeout is taken to MEAN.
+_CTX_PROBE_TIMEOUT_SEC = 10.0
+
 
 async def _browser_context_is_dead(browser) -> bool:
     """Is the whole BrowserContext gone, as opposed to one tab having closed?
@@ -66858,17 +66896,40 @@ async def _browser_context_is_dead(browser) -> bool:
     answer, so this shares its string set with the navigate() retry path rather
     than growing a second opinion about what "gone" looks like.
 
-    ⚠ FAILS SAFE TOWARDS "ALIVE". A False here costs what we have today — a
-    per-agent failure — while a wrong True would unwind a healthy run and
-    relaunch Chrome underneath it. So anything unrecognised, and any missing
-    handle, answers False.
+    ⚠ FAILS SAFE TOWARDS "ALIVE" ON AN ERROR IT DOES NOT RECOGNISE. A False
+    here costs what we have today — a per-agent failure — while a wrong True
+    would unwind a healthy run and relaunch Chrome underneath it. So an
+    unrecognised exception answers False. (A missing context handle answers
+    True: there is nothing left to run the phase on.)
+
+    ⛔⛔ BUT A PROBE THAT NEVER ANSWERS IS DEAD, NOT ALIVE (wave 10.9). The probe
+    used to await `cookies()` with no bound, and the driver gives that call no
+    timeout of its own. A HUNG Chrome — process alive, CDP silent — therefore
+    parked this coroutine for ever, at every call site — and the notebook park
+    sits outside any phase ceiling, so nothing above it would ever time out: the
+    run froze with no card and nothing in the log after the last line.
+
+    The probe is bounded now, and a timeout answers True, on purpose: a context
+    that cannot answer a cookie read in ten seconds cannot run a phase either,
+    and True is what sends the run down the crash path — unwind,
+    `Browser.close()` (bounded, and it kills our profile's Chrome when the close
+    does not finish), silent relaunch and resume, and the Retry card once
+    BROWSER_CRASH_MAX_RETRIES is spent. False would hand the hung browser back
+    to a caller whose next call hangs the same way.
     """
     ctx = getattr(browser, "context", None)
     if ctx is None:
         return True
     try:
-        await ctx.cookies()
+        await asyncio.wait_for(ctx.cookies(), timeout=_CTX_PROBE_TIMEOUT_SEC)
         return False
+    except asyncio.TimeoutError:
+        # ⛔ Caught BEFORE the generic arm, which would read an empty
+        # TimeoutError as "unrecognised" and answer alive.
+        log(f"[browser] the context did not answer a cookie read within "
+            f"{_CTX_PROBE_TIMEOUT_SEC:g}s — treating a hung Chrome as a dead one "
+            f"so the crash path can replace it", "WARN")
+        return True
     except Exception as _e:
         return _is_browser_close_error(_e)
 
@@ -66907,6 +66968,28 @@ def _is_browser_close_error(exc) -> bool:
         # is the half that cannot be lost by a `reset()`.
         or "(browser crash)" in msg
     )
+
+
+async def _p3_upload_failure_kind(exc, browser) -> str:
+    """Why did a Phase-3 NotebookLM upload attempt fail? One of
+    "browser_dead", "tab_closed" or "other".
+
+    ⛔ THE UPLOAD WAS THE ONE BROWSER-DEATH SITE THAT JUDGED BY TEXT ALONE
+    (wave 10.9). Every other site asks the context; this handler read "Target
+    page, context or browser has been closed" and unwound the whole run — a
+    Chrome relaunch plus one unit of the crash budget — when all that had gone
+    was the NotebookLM TAB, which each attempt opens afresh anyway.
+
+    ⭐ So the context is asked FIRST, for every failure: a dead or hung browser
+    unwinds whatever the exception said (an upload that timed out on a dead
+    Chrome says nothing about closing, and its Retry card could never work).
+    Only a live context lets the close text mean "just this tab".
+    """
+    if await _browser_context_is_dead(browser):
+        return "browser_dead"
+    if _is_browser_close_error(exc):
+        return "tab_closed"
+    return "other"
 
 
 def _plan_pipeline_auto_retry(queue_dir, resume_dir, failure_kind, crash_retries):

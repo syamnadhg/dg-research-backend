@@ -175,16 +175,33 @@ def test_the_login_interrupt_still_wins():
 
 # ── phase 3, which reported an upload failure about a dead browser ────────
 
-def test_phase_three_classifies_a_dead_browser_before_blaming_the_upload():
+def test_phase_three_classifies_a_dead_browser_before_blaming_the_upload(tmp_path, monkeypatch):
     """"We couldn't upload the reports to NotebookLM. Retry to try again" was
-    said about a browser that no longer existed. Retry could not have worked."""
-    src = code_only(open(research.__file__, encoding="utf-8").read())
-    i = src.index('log(f"NotebookLM upload error: {e}", "ERROR")')
-    branch = src[i:src.index("fail_phase(3", i)]
-    assert "_is_browser_close_error(e)" in branch
-    assert "raise RuntimeError" in branch
-    # …and the browser check comes BEFORE the login/generic classification.
-    assert branch.index("_is_browser_close_error(e)") < branch.index("is_login_err")
+    said about a browser that no longer existed. Retry could not have worked.
+
+    ⛔ FLIPPED FROM A SOURCE PIN TO AN EXECUTION (wave 10.9). This used to
+    assert that `_is_browser_close_error(e)` appeared in the handler text. The
+    handler now asks `_p3_upload_failure_kind`, which probes the context first,
+    so that text is gone — and the pin could never tell "present" from
+    "reachable" anyway. The property is driven for real instead: a dead context
+    behind the incident's own error unwinds, and no upload card is raised."""
+    md = tmp_path / "claude.md"
+    md.write_text("x" * 200, encoding="utf-8")
+    monkeypatch.setattr(research._runtime, "p2_links_for_p3", {"claude": "u"})
+    monkeypatch.setattr(research._runtime, "p2_md_files_for_p3", [md])
+    monkeypatch.setattr(research._runtime, "last_failure_kind", "")
+    monkeypatch.setattr(research._controls, "skipped_agents", set())
+    cards = []
+    monkeypatch.setattr(research, "fail_phase", lambda *a, **k: cards.append(a))
+
+    class _Dead(_Browser):
+        async def new_tab(self, url):
+            raise Exception("BrowserContext.new_page: Target page, context or browser has been closed")
+
+    with pytest.raises(RuntimeError, match=r"\(browser crash\)"):
+        asyncio.run(research.run_phase3_upload(_Dead(_Ctx(True)), None, {}, "t", tmp_path))
+    assert research._runtime.last_failure_kind == "browser_crash"
+    assert cards == [], "an upload card about a browser that no longer exists"
 
 
 def test_the_cookie_gate_no_longer_buries_a_browser_death_at_debug():
