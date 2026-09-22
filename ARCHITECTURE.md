@@ -783,6 +783,7 @@ native extensions with Nuitka:
 | `_sr_core` | the pipeline itself — `research.py` compiled |
 | `models`, `prompts`, `vision`, `narrate`, `selfheal`, `telemetry`, `logquiet` | compiled extensions |
 | `auth/`, `scripts/` | **source, deliberately** |
+| `_sr_build.json` | the provenance stamp — see "Every platform wheel of a release publishes together" below |
 
 **Eight** compiled modules. A wheel showing six or seven was built from a stale
 checkout. A `py3-none-any` wheel means the build fell back to source mode and
@@ -825,6 +826,15 @@ its guard and its drift check on a variable that is empty in exactly that case.
 Stage all of a release's wheels into one directory and publish in a single
 command; `uv publish` does not recurse into subdirectories, so publishing from a
 tree that keeps one platform in a subfolder silently ships a partial release.
+
+**Before that command, run `python tools/check_release.py <staging-dir>`.** Each
+wheel carries `_sr_build.json`, written by the build BEFORE it compiles: a
+fingerprint of the first-party `.py` sources with CRLF read as LF — so a Windows
+autocrlf checkout, an rsync copy and a zip of the same code all agree — plus the
+git commit and dirty flag where the build tree could say. The check prints every
+wheel's stamp side by side and exits 1 if any wheel has none or the fingerprints
+differ. Commits are shown, never compared. It does not check that every platform
+is present; that is still the staging step's job.
 
 **This is a code-execution supply chain, and it is worth being explicit about
 the surface.** The agent self-update resolves from the configured index —

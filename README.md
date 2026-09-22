@@ -1232,7 +1232,8 @@ research-automate/
 │                               # never enters it; see agent/README.md.
 ├── tools/
 │   ├── build_compiled.py       # Nuitka build — one wheel per OS × CPython minor (see § Python version)
-│   └── bump_version.py
+│   ├── bump_version.py
+│   └── check_release.py        # Run before publishing: refuses wheels whose source fingerprints differ or are missing
 ├── scripts/
 │   ├── dg-supervisor.env.example  # Committed env-file template — install-time copied to .dg-supervisor.env if absent
 │   ├── run_supervisor.cmd      # Manual-debug CMD helper (NOT wired into the Scheduled Task — supervisor invokes pythonw directly with --env-file)

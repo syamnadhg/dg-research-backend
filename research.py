@@ -79197,6 +79197,56 @@ class _PortProbeUnavailable(Exception):
     """
 
 
+#: The foreign address a TCP row shows while it is LISTENING, IPv4 and IPv6.
+_NETSTAT_LISTEN_FOREIGN = ("0.0.0.0:0", "[::]:0")
+
+
+def _netstat_listening_pids(text: str, port: int) -> "set[int]":
+    """PIDs that Windows `netstat -ano` output shows listening on TCP `port`.
+
+    ⛔⛔ A ROW IS A LISTENER BY ITS FOREIGN ADDRESS, NOT BY ITS STATE WORD.
+    netstat translates the state column ("ABHÖREN" on a German Windows,
+    "ÉCOUTE" on a French one, "IN ASCOLTO" in Italian), and this parse used to
+    keep only rows containing the English "LISTENING". On those machines it
+    matched nothing, and `_listening_pids` still reported that the probe RAN, so
+    a held port came back as "nothing listening" rather than "could not look":
+    the confusion `_PortProbeUnavailable` exists to prevent. The address columns
+    are never translated, and a TCP row has `0.0.0.0:0` / `[::]:0` as its
+    foreign address only while it listens. (`netstat -q` would add bound, idle
+    rows with the same address; the caller does not pass `-q`.)
+
+    The port is matched on the LOCAL address only. The old substring test
+    matched `:8000 ` anywhere in the line, the foreign column included, which is
+    the `lsof -ti` defect again, held off only by the word filter.
+
+    Pure so it runs off Windows: this is the one branch of the probe that no
+    developer machine here executes.
+    """
+    pids: "set[int]" = set()
+    want = str(port)
+    for line in (text or "").splitlines():
+        # "  TCP    0.0.0.0:8000    0.0.0.0:0    LISTENING    1234". The foreign
+        # address alone also rules out the translated headers and every UDP row
+        # (whose foreign column is "*:*"). A translated state can be several
+        # words, so the pid is read from the END of the row, never a column.
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        if parts[2] not in _NETSTAT_LISTEN_FOREIGN:
+            continue
+        if parts[1].rpartition(":")[2] != want:
+            continue
+        try:
+            pid = int(parts[-1])
+        except ValueError:
+            continue
+        # 0 is the System Idle Process. Nothing may be handed a pid to signal
+        # that is not a real process.
+        if pid > 0:
+            pids.add(pid)
+    return pids
+
+
 def _listening_pids(port: int) -> "set[int]":
     """PIDs LISTENING on `port` — psutil first, a shell tool only as fallback.
 
@@ -79252,26 +79302,20 @@ def _listening_pids(port: int) -> "set[int]":
         _p = str(port)
         try:
             if plat == "Windows":
+                # ⛔ No `-p TCP`: that filter is IPv4-only (`-p TCPv6` is a
+                # separate protocol), so a listener on `[::]` never reached the
+                # parse. ⛔ `errors="replace"`: netstat writes the console's OEM
+                # code page and text mode decodes with the ANSI one, so a French
+                # "ÉCOUTE" (0x90 in cp850, undefined in cp1252) raised
+                # UnicodeDecodeError and the whole probe read as "could not
+                # look". The parse needs no word from the state column anyway.
                 r = _sp.run(
-                    ["netstat", "-ano", "-p", "TCP"],
-                    capture_output=True, text=True, timeout=8,
+                    ["netstat", "-ano"],
+                    capture_output=True, text=True, errors="replace", timeout=8,
                     creationflags=_PS_NO_WINDOW,
                 )
-                for line in (r.stdout or "").splitlines():
-                    # Format: "  TCP    0.0.0.0:8000    0.0.0.0:0    LISTENING    1234"
-                    if "LISTENING" not in line:
-                        continue
-                    if f":{_p} " not in line and not line.endswith(f":{_p}"):
-                        if f" :{_p}\t" not in line and f"0.0.0.0:{_p}" not in line and f"[::]:{_p}" not in line:
-                            continue
-                    parts = line.split()
-                    if not parts:
-                        continue
-                    try:
-                        pid = int(parts[-1])
-                    except ValueError:
-                        continue
-                    if pid > 0 and pid != me:
+                for pid in _netstat_listening_pids(r.stdout or "", port):
+                    if pid != me:
                         pids.add(pid)
                 shell_ok = True
             elif plat in ("Darwin", "Linux"):

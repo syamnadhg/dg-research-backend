@@ -12,7 +12,9 @@ PIPELINE
 --------
 1. Build the normal source wheel (`pip wheel . --no-deps`) — gives us correct
    METADATA / entry_points / dist-info for free.
-2. Unpack it.
+2. Unpack it, and stamp it: `_sr_build.json` fingerprints the first-party
+   sources BEFORE anything is compiled (see `stamp_tree`), so every wheel of a
+   release can be checked against the others by tools/check_release.py.
 3. Compile each first-party top-level module to a native extension via
    `nuitka --module`, and DELETE its source .py from the unpacked tree:
        research.py  ->  _sr_core.<abi>.pyd     (RENAMED — so a readable
@@ -53,6 +55,8 @@ cp314-cp314-win_amd64) — build it on EACH OS/python you want to publish for.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -154,6 +158,88 @@ if __name__ == "__main__":
         print("\\n  Cancelled. Re-run when ready.")
         sys.exit(130)
 '''
+
+
+#: The provenance stamp, written at the root of the unpacked tree so it ships in
+#: every wheel of a release, the source fallback included. tools/check_release.py
+#: reads it back by the same name; tests/test_release_provenance.py drives that
+#: round trip, so the two spellings cannot drift apart unnoticed.
+STAMP_NAME = "_sr_build.json"
+
+
+def _git(repo: Path, *args: str) -> "str | None":
+    """stdout of `git -C repo <args>`, or None when git is missing or refuses."""
+    try:
+        r = subprocess.run(["git", "-C", str(repo), *args],
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def _git_provenance(repo: Path) -> "tuple[str | None, bool | None]":
+    """(commit, dirty) for `repo`, each None when git cannot say.
+
+    ⛔ Only when `repo` IS the work tree's root. git walks up to the nearest
+    enclosing repository, so an rsync or zip copy unpacked somewhere inside
+    another one (a home directory kept in git, say) would otherwise be stamped
+    with THAT repository's HEAD: a confident commit describing none of this
+    code. A real build passes the repository root (REPO), so a checkout is
+    never refused by this."""
+    out = (_git(repo, "rev-parse", "--show-toplevel", "HEAD") or "").splitlines()
+    if len(out) != 2 or Path(out[0]).resolve() != repo.resolve():
+        return None, None
+    status = _git(repo, "status", "--porcelain")
+    return out[1].strip(), (None if status is None else bool(status.strip()))
+
+
+def _lf_sha256(path: Path) -> str:
+    """sha256 of `path` with every CRLF read as LF (see `stamp_tree`)."""
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
+
+def stamp_tree(tree: Path, repo: Path) -> dict:
+    """Write `tree/_sr_build.json` and return what it says.
+
+    ⛔⛔ WHY A CONTENT HASH AND NOT ONLY A COMMIT. Nothing could say which code
+    was inside a published wheel: a compiled module cannot be read back to its
+    source, and the wheels of one release are built on different machines.
+    A commit alone polices nothing on exactly the builds it is meant for, since
+    a tree that arrived by rsync or zip has no `.git` and says "unknown". So
+    `source_sha256` fingerprints the sources themselves, taken here, BEFORE the
+    compile replaces them: the same code gives the same value whether the tree
+    came from git, rsync or a zip, on any OS. `commit` and `dirty` ride along
+    as hints, None when git cannot answer for `repo`.
+
+    What it covers: every .py in the unpacked tree, i.e. research.py, the
+    TOP_MODULES siblings and the auth/ and scripts/ packages as they will ship,
+    after DROP_FROM_WHEEL. Derived rather than listed, because a hand-kept list
+    is how `selfheal` shipped readable for weeks; the source wheel is built with
+    `--no-deps`, so every .py in it is first-party. Non-.py files (METADATA and
+    the version in it, RECORD, the env template) are not code and do not count.
+
+    ⛔ CRLF IS READ AS LF, and only CRLF. A Windows checkout with autocrlf holds
+    the same code in different bytes and must fingerprint the same. Dropping
+    every CR instead would be wrong: a lone CR is a line break to Python, so
+    `A = 1<CR>B = 2` (two statements) would fingerprint as `A = 1B = 2`, which
+    does not even parse. Each file enters as
+    `<sha256>  <posix path>`, sorted by that path as a string (a Windows path
+    sorts case-blind), so a rename is a change and filesystem order is not.
+    """
+    rels = sorted(p.relative_to(tree).as_posix() for p in tree.rglob("*.py"))
+    if "research.py" not in rels:
+        raise SystemExit(f"[build] {tree} has no research.py — refusing to stamp a tree "
+                         "that is not the pipeline's source")
+    # ⚠ `_lf_sha256` is a function, not inlined here, because its `b"\r\n"`
+    # inside an f-string expression is a SyntaxError before 3.12 and this
+    # script runs on 3.11+.
+    manifest = "".join(f"{_lf_sha256(tree / rel)}  {rel}\n" for rel in rels)
+    commit, dirty = _git_provenance(repo)
+    stamp = {"source_sha256": hashlib.sha256(manifest.encode("utf-8")).hexdigest(),
+             "commit": commit, "dirty": dirty}
+    (tree / STAMP_NAME).write_text(json.dumps(stamp, indent=2, sort_keys=True) + "\n",
+                                   encoding="utf-8", newline="\n")
+    return stamp
 
 
 def run(cmd: list, **kw) -> None:
@@ -263,7 +349,15 @@ def main() -> None:
             f.unlink()
             print(f"[build] dropped local-only {rel}")
 
-    # 2b. Optional py3-none-any SOURCE fallback — pack the CLEANED tree BEFORE
+    # 2b. Provenance stamp. AFTER the drop, so it fingerprints what ships; BEFORE
+    # the source fallback is packed and before anything compiles, so every wheel
+    # of the release (fallback included) carries the fingerprint of the same
+    # uncompiled source. tools/check_release.py compares them before publishing.
+    stamp = stamp_tree(tree, REPO)
+    print(f"[build] {STAMP_NAME}: source_sha256={stamp['source_sha256']} "
+          f"commit={stamp['commit'] or 'unknown'} dirty={stamp['dirty']}")
+
+    # 2c. Optional py3-none-any SOURCE fallback — pack the CLEANED tree BEFORE
     # compiling (pure readable source, universal). Identical to the compiled wheel
     # except the first-party modules aren't Nuitka-compiled. pip uses the compiled
     # wheel where it matches, this otherwise (any Python 3.11+/OS).

@@ -366,3 +366,193 @@ def test_serve_refuses_with_its_own_words_when_it_could_not_look():
     assert "SystemExit(3)" in window, "an unclearable port must still refuse the bind"
     assert "still held after stopping" not in window, (
         "the stuck copy claims we stopped something; here we saw nothing")
+
+
+# ── the Windows branch nothing ran (wave 10.9) ──────────────────────────────
+#
+# ⛔⛔ EVERY TEST ABOVE DRIVES "Linux" OR "Unsupported". The netstat branch was
+# never executed on any machine: it runs only on Windows, only when psutil
+# raised or found nothing, and nobody here develops on Windows. It also kept a
+# row only if it contained the English word LISTENING, while netstat translates
+# that column. On a German or French Windows the fallback then matched nothing
+# and still reported that it RAN, so a held port read as free: the "[] because
+# I could not look" defect this file exists for, one platform over.
+#
+# The netstat stand-in below reproduces the two behaviours of the real tool
+# that each hid a defect, and nothing more:
+#   * `-p TCP` shows IPv4 TCP rows only (IPv6 is the separate `-p TCPv6`), so
+#     the old call never saw a `[::]` listener its own parse was written for;
+#   * the output is in the console's OEM code page (cp850 in Western Europe)
+#     while text mode decodes with the ANSI one (cp1252), strictly — so a byte
+#     that code page leaves undefined raises, as the real call does.
+#
+# ⚠ The translated state words are the ones reported for those Windows
+# languages; no localized machine was available to capture a fixture from.
+# The fix does not depend on them being exact: it reads no word at all.
+
+_STATE_WORDS = {
+    # language: (listening, established, time-wait, header line)
+    "en": ("LISTENING", "ESTABLISHED", "TIME_WAIT",
+           "  Proto  Local Address          Foreign Address        State           PID"),
+    "de": ("ABHÖREN", "HERGESTELLT", "WARTEND",
+           "  Proto  Lokale Adresse         Remoteadresse          Status           PID"),
+    "fr": ("ÉCOUTE", "ÉTABLI", "TIME_WAIT",
+           "  Proto  Adresse locale         Adresse distante       État            PID"),
+    # Two words: a parse that reads the pid from a fixed column breaks here.
+    "it": ("IN ASCOLTO", "STABILITA", "TIME_WAIT",
+           "  Proto  Indirizzo locale       Indirizzo esterno      Stato           PID"),
+}
+
+
+def _netstat_text(lang, me=2468):
+    """`netstat -ano` as a Windows box in `lang` prints it, port 8000 held.
+
+    Listening on 8000: pid 1234 on IPv4 AND IPv6, and `me` on IPv6 loopback
+    only. Everything else is a row that must NOT count, each for its own
+    reason."""
+    listen, estab, wait, header = _STATE_WORDS[lang]
+    rows = [
+        "",
+        "Active Connections",
+        "",
+        header,
+        f"  TCP    0.0.0.0:135            0.0.0.0:0              {listen}       1016",
+        f"  TCP    0.0.0.0:8000           0.0.0.0:0              {listen}       1234",
+        # a different port whose digits END in 8000
+        f"  TCP    0.0.0.0:18000          0.0.0.0:0              {listen}       555",
+        # an accepted connection to our port, handed to another process
+        f"  TCP    127.0.0.1:8000         127.0.0.1:52344        {estab}     4321",
+        # the client end: an OUTBOUND connection to somebody's port 8000
+        f"  TCP    127.0.0.1:52344        127.0.0.1:8000         {estab}     999",
+        f"  TCP    10.0.0.2:51000         1.2.3.4:8000           {estab}     998",
+        f"  TCP    127.0.0.1:8000         127.0.0.1:52345        {wait}       0",
+        # never a real process, so never a pid anyone may be handed to signal
+        f"  TCP    0.0.0.0:8000           0.0.0.0:0              {listen}       0",
+        f"  TCP    [::]:135               [::]:0                 {listen}       1016",
+        f"  TCP    [::]:8000              [::]:0                 {listen}       1234",
+        f"  TCP    [::1]:8000             [::]:0                 {listen}       {me}",
+        # UDP has no state column and no listeners
+        "  UDP    0.0.0.0:8000           *:*                                    777",
+        "  UDP    [::]:8000              *:*                                    777",
+        # a row cut short (a truncated read) is skipped, not a crash
+        "  TCP    0.0.0.0:8000",
+    ]
+    return "\r\n".join(rows) + "\r\n"
+
+
+def _row_proto(line):
+    parts = line.split()
+    if not parts or parts[0] not in ("TCP", "UDP"):
+        return None
+    return parts[0] + ("V6" if len(parts) > 1 and parts[1].startswith("[") else "")
+
+
+def _windows_netstat(monkeypatch, text, oem="cp850", ansi="cp1252"):
+    """Windows, no psutil, and a `subprocess.run` that answers as netstat."""
+    monkeypatch.setattr(R, "_supervisor_platform", lambda: "Windows")
+    _no_psutil(monkeypatch)
+    calls = []
+
+    def _run(cmd, *a, **kw):
+        argv = list(cmd)
+        calls.append(argv)
+        lines = text.splitlines()
+        if "-p" in argv:
+            want = argv[argv.index("-p") + 1].upper()
+            lines = [ln for ln in lines if _row_proto(ln) in (None, want)]
+        out = "\r\n".join(lines).encode(oem)
+        if kw.get("text") or kw.get("universal_newlines") or kw.get("encoding"):
+            out = out.decode(kw.get("encoding") or ansi, kw.get("errors") or "strict")
+            out = out.replace("\r\n", "\n")
+        return type("r", (), {"stdout": out, "returncode": 0})()
+
+    monkeypatch.setattr(subprocess, "run", _run)
+    return calls
+
+
+def test_the_windows_parse_keeps_only_listeners_on_the_port():
+    """The parse on its own, English. Every row that must not count is in the
+    fixture with the reason it must not: another port whose digits end in 8000,
+    an accepted connection held by another process, an outbound connection TO
+    port 8000, a TIME_WAIT row, pid 0, UDP, and a row cut short."""
+    assert R._netstat_listening_pids(_netstat_text("en"), 8000) == {1234, 2468}
+
+
+@pytest.mark.parametrize("lang", ["de", "fr", "it"])
+def test_a_translated_state_column_finds_the_same_listeners(lang):
+    """⛔⛔ NEW-2. The same machine state, in German, French and Italian, must
+    give the same answer as in English. The old parse kept only rows with the
+    English word LISTENING and found nothing in any of them."""
+    assert R._netstat_listening_pids(_netstat_text(lang), 8000) == {1234, 2468}
+
+
+def test_the_windows_parse_answers_for_the_port_it_was_asked():
+    """Accept polarity: 18000 is a real listener when 18000 is the question.
+    Without this, a parse that refused every port but 8000 would pass above."""
+    assert R._netstat_listening_pids(_netstat_text("de"), 18000) == {555}
+    assert R._netstat_listening_pids(_netstat_text("de"), 135) == {1016}
+    assert R._netstat_listening_pids(_netstat_text("de"), 9000) == set()
+
+
+def test_the_windows_probe_finds_the_holder_and_never_us(monkeypatch):
+    """OPS-7, the control: the real `_listening_pids` on Windows with psutil
+    unavailable, English output. Our own pid is listening too and must not come
+    back — the caller of this signals what it is given."""
+    me = R.os.getpid()
+    calls = _windows_netstat(monkeypatch, _netstat_text("en", me=me))
+    assert R._listening_pids(8000) == {1234}
+    assert calls and calls[0][0] == "netstat", "the Windows branch never ran"
+    # and it asks about the port it was given, not the usual one
+    assert R._listening_pids(18000) == {555}
+
+
+def test_the_windows_probe_sees_an_IPv6_only_listener(monkeypatch):
+    """⛔ `netstat -p TCP` is IPv4 only, so the old call never produced the
+    `[::]` rows its own parse checked for: a process listening on IPv6 alone
+    held the port invisibly. Here 1234 is gone and only the IPv6 listener
+    remains."""
+    text = "\r\n".join(ln for ln in _netstat_text("en", me=4242).splitlines()
+                       if " 1234" not in ln)
+    _windows_netstat(monkeypatch, text)
+    assert R._listening_pids(8000) == {4242}
+
+
+@pytest.mark.parametrize("lang", ["de", "fr", "it"])
+def test_a_translated_windows_still_finds_the_holder(monkeypatch, lang):
+    """⛔⛔ NEW-2 through the real probe. Before: German matched no row and
+    returned an empty set from a probe that "ran" (a held port read as free);
+    French never got that far — "ÉCOUTE" is 0x90 in cp850, undefined in
+    cp1252, and the decode raised, so the probe read as "could not look" on
+    every French machine without psutil."""
+    me = R.os.getpid()
+    _windows_netstat(monkeypatch, _netstat_text(lang, me=me))
+    assert R._listening_pids(8000) == {1234}
+
+
+def test_windows_netstat_listing_nothing_is_a_real_empty(monkeypatch):
+    """OPS-7 case two: netstat ran and listed no rows. That is "nothing
+    listening", an answer — not an exception."""
+    _windows_netstat(monkeypatch, "\r\nActive Connections\r\n\r\n"
+                     + _STATE_WORDS["en"][3] + "\r\n")
+    assert R._listening_pids(8000) == set()
+
+
+def test_windows_netstat_that_cannot_run_is_could_not_look(monkeypatch):
+    """OPS-7 case three: with psutil gone too, a netstat that will not start is
+    the double failure, and it must raise rather than answer."""
+    monkeypatch.setattr(R, "_supervisor_platform", lambda: "Windows")
+    _no_psutil(monkeypatch)
+    calls = _no_shell_tool(monkeypatch, exc=OSError("netstat"))
+    with pytest.raises(R._PortProbeUnavailable) as caught:
+        R._listening_pids(8000)
+    assert calls and calls[0][0] == "netstat"
+    assert "netstat" in str(caught.value), "the message names the tool that failed"
+
+
+def test_free_port_on_a_german_windows_clears_the_held_port(monkeypatch,
+                                                            _never_actually_kill):
+    """The consequence the doctor and the respawn path saw: `_free_port` read a
+    held port as free on a German Windows and cleared nothing."""
+    _windows_netstat(monkeypatch, _netstat_text("de", me=R.os.getpid()))
+    assert R._free_port(8000) == ([1234], True)
+    assert _never_actually_kill == [[1234]]
