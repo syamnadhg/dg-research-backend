@@ -54,7 +54,9 @@ SUITES = ("tests/test_incognito_capability_109.py "
           "tests/test_incognito_run_id_and_logs_109.py "
           "tests/test_incognito_machine_skips_109.py "
           "tests/test_incognito_expiry_109.py "
-          "tests/test_incognito_no_resurrection_109.py")
+          "tests/test_incognito_no_resurrection_109.py "
+          "tests/test_incognito_teardown_109.py "
+          "tests/test_cloud_handoff_record_108.py")
 RESEARCH = "research.py"
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
@@ -153,6 +155,25 @@ CLAIM_ABORT = ("                if _is_incognito_research(research_id):\n"
                '                    log(f"[start-listener] {research_id[:8]}… keeps nothing and its "')
 # ⛔ `doc.reference.delete()` inside a try appears six times in this file, so the
 # anchor carries the line above it — the one sentence only this branch writes.
+# ── anchors: the folders this disk keeps ────────────────────────────────────
+PURGE_GATE = ("    if not _is_incognito_research(research_id):\n"
+              "        return False")
+PURGE_OVER = "    if status not in _RUN_DELIVERY_OVER:\n        return False"
+PURGE_OVER_SET = '_RUN_DELIVERY_OVER = frozenset({"completed", "stopped"})'
+PURGE_UNREADABLE = ("    except Exception:\n"
+                    "        # ⛔ UNREADABLE MEANS LEAVE IT.")
+PURGE_CALL = "            _purge_incognito_run_dirs(_run_pipeline_queue_dir(args, kwargs), _rid)"
+PURGE_LOGS = ("    for folder in log_folders:\n"
+              "        try:\n"
+              "            _shutil.rmtree(folder)")
+RECHECK = ("    if _is_incognito_research(research_id):\n"
+           "        return True\n"
+           "    return (float(now) - float(last_verified_at or 0.0)) >= float(recheck_sec)")
+QUEUE_DIR_CLAIM = ('    claim = Path(str(resume)).name if resume else bound.arguments.get("run_id")')
+CATCHUP = ('    if _is_incognito_research(research_id):\n'
+           '        return ("nothing here can re-drive it — a run that keeps nothing has no "\n'
+           '                "chat to reopen")')
+
 CLAIM_QUEUE_DELETE = ('                        f"recreating it", "WARN")\n'
                       "                    try:\n"
                       "                        doc.reference.delete()\n"
@@ -348,6 +369,48 @@ MUTANTS = [
      "idle-rescan claims it again on the next pass, for ever",
      [(CLAIM_QUEUE_DELETE, '                        f"recreating it", "WARN")\n'
                            "                    continue")]),
+
+    # ══ the folders this disk keeps ════════════════════════════════════════
+    ("T1", "under", "⛔⛔ nothing is purged, so a run folder holding the "
+     "documents, the delivery record and the topic waits on the hourly sweep",
+     [(PURGE_GATE, "    if True:\n        return False")]),
+    ("T2", "over", "every finished run's folder is deleted, taking local "
+     "retention and the support bundle with it",
+     [(PURGE_GATE, "    if False:\n        return False")]),
+    ("T3", "over", "⛔⛔ a paused or crashed run is purged too, so the Retry and "
+     "the Resume both lose the checkpoint they resume from",
+     [(PURGE_OVER, "    if False:\n        return False")]),
+    ("T4", "over", "an `ongoing` run — one still executing — counts as over",
+     [(PURGE_OVER_SET, '_RUN_DELIVERY_OVER = frozenset({"completed", "stopped", "ongoing"})')]),
+    ("T5", "over", "an unreadable delivery record is treated as over, which is "
+     "the shape a run that died mid-construction has",
+     [(PURGE_UNREADABLE, "    except Exception:\n"
+                         "        status = \"completed\"\n"
+                         "    if False:\n"
+                         "        # ⛔ UNREADABLE MEANS LEAVE IT.")]),
+    ("T6", "under", "⛔⛔ the wrapper stops purging, so the helper is perfect "
+     "and nothing ever calls it",
+     [(PURGE_CALL, "            pass")]),
+    ("T7", "under", "the log folders stay, so the run's diagnostics outlive it",
+     [(PURGE_LOGS, "    for folder in []:\n        try:\n            _shutil.rmtree(folder)")]),
+    ("T8", "under", "⛔ the hourly memo holds an incognito folder after all, for "
+     "sixty-five minutes after the app said nothing was kept",
+     [(RECHECK, "    return (float(now) - float(last_verified_at or 0.0)) >= float(recheck_sec)")]),
+    ("T9", "over", "the memo is bypassed for EVERY research, which is the "
+     "per-tick Firestore read the memo was added to stop",
+     [(RECHECK, "    return True")]),
+    ("T10", "under", "⛔ a resume's full path is used as a run-id claim, so the "
+     "containment check is handed something it was written to refuse",
+     [(QUEUE_DIR_CLAIM,
+       '    claim = str(resume) if resume else bound.arguments.get("run_id")')]),
+    ("T11", "under", "⛔ the run's own account promises a catch-up that cannot "
+     "happen — a lying diagnostic in the file that rides the support bundle",
+     [(CATCHUP, "    if False:\n        return \"\"")]),
+    ("T12", "over", "every run's account stops naming the catch-up that DOES "
+     "recover it, so a recoverable run reads as lost",
+     [(CATCHUP, "    if True:\n"
+                '        return ("nothing here can re-drive it — a run that keeps nothing has no "\n'
+                '                "chat to reopen")')]),
 
     ("N13", "under", "the dead-worker reconciler writes the parked patch "
      "directly again, so the two recovery paths disagree",

@@ -115,8 +115,11 @@ _CAP_STORE = """        self.submitted_by = submitted_by"""
 
 _BIND = """                bound.arguments.get("uid") or None)"""
 
-_WRAP = """    with _RunLogCapture(research_id=_rid, attempt=_attempt,
-                        submitted_by=_submitter, claimed_by=_claimed):"""
+# ⛔ RE-INDENTED, wave 10.9: the wrapper's `with` now sits inside a `try` whose
+# `finally` takes an incognito run's folders off this disk. Same statement, one
+# level deeper.
+_WRAP = """        with _RunLogCapture(research_id=_rid, attempt=_attempt,
+                            submitted_by=_submitter, claimed_by=_claimed):"""
 
 _DOC_NOCALLER = """    ⚠ NO PRODUCTION CALLER — selection happens in the browser. This is the"""
 
@@ -228,7 +231,7 @@ MUTANTS: list[tuple[str, str, str, str, list[tuple[str, str]], list[str]]] = [
      [(_BIND, "                None)")],
      [T_NEW, T_CAP]),
     ("A4", SRC, "under", "the wrapper never forwards the submitter it just bound",
-     [(_WRAP, "    with _RunLogCapture(research_id=_rid, attempt=_attempt):")],
+     [(_WRAP, "        with _RunLogCapture(research_id=_rid, attempt=_attempt):")],
      [T_NEW, T_CAP]),
     ("A5", SRC, "over", "`submitterSource` is hardcoded, so a local run claims "
      "to have come from the queue and a null reads as a lost value rather than "

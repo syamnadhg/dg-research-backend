@@ -213,7 +213,7 @@ def _drive(**kw):
         return tokens[min(len(calls["posts"]), len(tokens) - 1)]
 
     verdict = research._drive_cloud_phases(
-        "uid-1", "rid-abcdef01",
+        "uid-1", kw.get("rid") or "rid-abcdef01",
         post=_post,
         mint_token=kw.get("mint_token") or _mint,
         sleep=calls["slept"].append,
@@ -615,6 +615,29 @@ def test_the_refusal_line_says_what_happens_next():
     said = " ".join(calls["notes"])
     assert "opening the chat asks the route again" in said
     assert calls["failures"] and "opening the chat asks the route again" in calls["failures"][0]
+
+
+def test_the_refusal_line_promises_no_re_drive_that_cannot_happen():
+    """⛔⛔ "OPENING THE CHAT ASKS THE ROUTE AGAIN" IS FALSE FOR A RUN THAT KEEPS
+    NOTHING (wave 10.9, #536-C11). That re-drive needs somebody to REOPEN the
+    research, and an incognito chat is in no list — a closed tab is the end of
+    it. This file is the run's permanent account and it rides the support
+    bundle, so a lying diagnostic here is the failure this whole seam exists to
+    stop, arriving one wave later in a new sentence."""
+    _v, calls = _drive(answers=[(400, "invalid json")], rid="incog_1758400000000_1")
+    said = " ".join(calls["notes"] + calls["failures"])
+    assert "opening the chat asks the route again" not in said, said
+    assert "no chat to reopen" in said
+
+
+def test_a_cut_connection_says_the_same_thing_about_the_same_run():
+    """⛔ THE OTHER OUTCOME SENTENCE, and the one a run most often takes: the
+    300-second severance. Both must come from the same clause or they drift."""
+    _v, ordinary = _drive(answers=[TimeoutError("cut")], rid="chat_1755500000000_1")
+    _v2, keeps_nothing = _drive(answers=[TimeoutError("cut")],
+                                rid="incog_1758400000000_1")
+    assert "opening the chat asks the route again" in " ".join(ordinary["notes"])
+    assert "no chat to reopen" in " ".join(keeps_nothing["notes"])
 
 
 def test_the_202_is_not_reported_as_a_dispatch():

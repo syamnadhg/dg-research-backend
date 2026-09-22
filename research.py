@@ -3592,6 +3592,27 @@ def _run_folders_for_research_any(research_id, root=None) -> "list[Path]":
     return out
 
 
+def _cloud_catchup_clause(research_id) -> str:
+    """What re-drives a run whose cloud hand-off did not land — one clause, for
+    every outcome sentence this file writes about it.
+
+    ⛔⛔ "OPENING THE CHAT ASKS THE ROUTE AGAIN" IS FALSE FOR A RUN THAT KEEPS
+    NOTHING (wave 10.9, #536-C11). That re-drive needs somebody to REOPEN the
+    research, and an incognito chat is in no list — there is nothing to reopen,
+    so a closed tab is the end of it. This file is the run's own permanent
+    account and it rides the support bundle; a lying diagnostic here is the
+    failure `_note_cloud_handoff` was added to stop — "never reached the cloud"
+    written onto runs that succeeded — arriving one wave later in a new sentence.
+
+    ⛔ IT DESCRIBES THE MACHINE'S SIDE AND PROMISES NOTHING ELSE. What becomes
+    of the record, and by when, is the app's sentence to write in the commit
+    that makes it true (wave 6's rule)."""
+    if _is_incognito_research(research_id):
+        return ("nothing here can ask the route again — a run that keeps nothing "
+                "has no chat to reopen")
+    return "opening the chat asks the route again"
+
+
 def _note_cloud_handoff(research_id, line: str) -> bool:
     """Put one line about the P4/P5 hand-off into THAT run's own folder.
 
@@ -3907,6 +3928,106 @@ def _run_log_folders_for_research(research_id, root=None) -> "list[Path]":
             continue
         out.append(folder)
     return out
+
+
+#: Delivery statuses that mean this machine is finished with a run.
+#:
+#: ⛔⛔ DELIBERATELY NOT "paused" AND NOT A CRASH. Both of those leave a Retry or
+#: a Resume on offer, and both need the on-disk checkpoint to take it. `ongoing`
+#: is a run still executing. Only these two say nobody here is coming back.
+_RUN_DELIVERY_OVER = frozenset({"completed", "stopped"})
+
+
+def _orphan_recheck_due(last_verified_at, now: float, research_id,
+                        recheck_sec: float) -> bool:
+    """Should the orphan sweep ask Firestore about this run directory again?
+
+    ⛔⛔ THE MEMO WAS WORTH AN HOUR OF LATENCY AND IS NOT WORTH IT HERE. It exists
+    because the sweep billed one read per finished directory every five minutes,
+    for ever — 288 reads a day for one old run, always answering "still there".
+    Its stated cost was a deleted research surviving up to an hour on local disk
+    instead of up to five minutes, "latency on a cleanup path with no
+    user-visible surface". For a run that keeps nothing that sentence stops
+    being true: the surface is a promise the app has already made, and the
+    folder holds the documents, the delivery record and the topic.
+
+    ⭐ THE EXTRA READS ARE BOUNDED BY WHAT THE PURGE REFUSED. A finished
+    incognito run removes its own folders on the way out
+    (`_purge_incognito_run_dirs`), so what still reaches the sweep is the crash,
+    the pause and the machine that died — and each of those is gone the first
+    time the sweep finds its record missing.
+
+    ⛔ EXTRACTED FROM `_orphan_sweep_loop`, which is a closure inside
+    `run_server` and cannot be called from a test. Called unconditionally there."""
+    if _is_incognito_research(research_id):
+        return True
+    return (float(now) - float(last_verified_at or 0.0)) >= float(recheck_sec)
+
+
+def _purge_incognito_run_dirs(queue_dir, research_id) -> bool:
+    """Take a finished incognito run's folders off this disk, now.
+
+    ⛔⛔ THE SWEEP IS NOT FAST ENOUGH TO BE THE ANSWER. `_orphan_sweep_loop`
+    removes a queue directory only once its research is GONE from Firestore, and
+    it memoises a research it has seen for an hour — so a run folder holding the
+    documents, the delivery record and the topic could sit here for about
+    sixty-five minutes after the run ended. "Nothing stays once the run ends" is
+    a sentence about this disk too, and it has to be true the moment it is said.
+
+    ⛔ BUT ONLY WHEN NOBODY HERE IS COMING BACK — `_RUN_DELIVERY_OVER`. A crash
+    card offers Retry and a login interrupt offers Resume, and both resume from
+    the checkpoint inside this very directory; deleting it would turn a
+    recoverable paid run into a lost one. Those are left to the sweep, which for
+    an incognito folder now re-checks on every tick instead of hourly.
+
+    ⭐ THE LOG FOLDER GOES TOO, and by `meta.json`'s researchId rather than by
+    name — the same rule the orphan sweep uses, for the same reason: the folder
+    name is sanitised, so a prefix match would either miss it or take somebody
+    else's diagnostics.
+
+    Returns True when anything was removed. Never raises: this runs on the way
+    out of a pipeline, and a cleanup that can end a run is worse than a leftover
+    directory."""
+    if not _is_incognito_research(research_id):
+        return False
+    import shutil as _shutil
+    queue_dir = Path(queue_dir) if queue_dir else None
+    try:
+        status = json.loads(
+            (queue_dir / "delivery.json").read_text(encoding="utf-8")).get("status", "")
+    except Exception:
+        # ⛔ UNREADABLE MEANS LEAVE IT. A missing or broken delivery.json is the
+        # shape a run that died mid-construction has, and that run may still be
+        # recoverable — the orphan sweep's own defensive default, kept here.
+        return False
+    if status not in _RUN_DELIVERY_OVER:
+        return False
+    # ⛔ THE LOG FOLDERS ARE RESOLVED BEFORE THE QUEUE DIRECTORY GOES. If this
+    # process dies between the two removals, a queue dir already deleted leaves
+    # the log folders with no attribution key at all — the orphan sweep makes
+    # the same ordering argument for the same reason.
+    try:
+        log_folders = _run_log_folders_for_research(research_id)
+    except Exception as exc:
+        log(f"[incognito] log-folder lookup failed for {research_id[:8]}…: {exc}", "WARN")
+        log_folders = []
+    removed = False
+    try:
+        if queue_dir is not None and queue_dir.exists():
+            _shutil.rmtree(queue_dir)
+            removed = True
+    except Exception as exc:
+        log(f"[incognito] could not remove {queue_dir}: {exc}", "WARN")
+    for folder in log_folders:
+        try:
+            _shutil.rmtree(folder)
+            removed = True
+        except Exception as exc:
+            log(f"[incognito] could not remove {folder.name}: {exc}", "WARN")
+    if removed:
+        log(f"[incognito] {research_id[:8]}… ended — its run folder and "
+            f"{len(log_folders)} log folder(s) removed from this computer", "INFO")
+    return removed
 
 
 _MAINT_TASKS: "set" = set()
@@ -17950,8 +18071,8 @@ def _drive_cloud_phases(uid, research_id, *, post, mint_token, sleep, note,
             note(f"P4/P5 connection cut after {_elapsed}s ({why}). The cloud "
                  f"received the request and may be finishing it; this machine "
                  f"stopped being able to watch. If it did not finish, the run "
-                 f"stays on phase 3 until the chat is opened and the catch-up "
-                 f"fires.")
+                 f"stays on phase 3 and "
+                 f"{_cloud_catchup_clause(research_id)}.")
             log(f"FE trigger: BE-driven P4/P5 connection cut after {_elapsed}s "
                 f"({why}) — the cloud has the request rid={research_id[:8]}…", "WARN")
             return verdict
@@ -17977,14 +18098,18 @@ def _drive_cloud_phases(uid, research_id, *, post, mint_token, sleep, note,
     # `p5_only` failed on PHASE 5, and saying "P4/P5" there would send the next
     # reader looking for an upload that succeeded.
     _leg = "P5" if _p5_only else "P4/P5"
+    # ⛔ AND WHAT RE-DRIVES IT IS NOT THE SAME FOR EVERY RUN — see
+    # `_cloud_catchup_clause`. A run that keeps nothing has no chat to reopen,
+    # so this file must not tell its reader to open one.
+    _catchup = _cloud_catchup_clause(research_id)
     _sentence = (
         f"{_leg} was refused by the cloud — {why}. Nothing ran, and nothing was "
         f"recorded on the cloud side. Phase 4 is marked errored on this run so "
-        f"the chat can show it; opening the chat asks the route again."
+        f"the chat can show it; {_catchup}."
         if verdict == "refused" else
         f"{_leg} never reached the cloud after {_attempt} attempt(s) — {why}. "
         f"Phase 4 is marked errored on this run so the chat can show it; "
-        f"opening the chat asks the route again."
+        f"{_catchup}."
     )
     note(_sentence)
     # ⛔ `_attempt`, NOT `attempts` (542-S4). A refusal stops on the FIRST ask,
@@ -73245,9 +73370,47 @@ async def run_pipeline_captured(*args, **kwargs):
     # exactly like a legacy start doc.
     _claimed = kwargs.pop("_submitted_by", None)
     _rid, _attempt, _submitter = _run_pipeline_capture_key(args, kwargs)
-    with _RunLogCapture(research_id=_rid, attempt=_attempt,
-                        submitted_by=_submitter, claimed_by=_claimed):
-        return await run_pipeline(*args, **kwargs)
+    try:
+        with _RunLogCapture(research_id=_rid, attempt=_attempt,
+                            submitted_by=_submitter, claimed_by=_claimed):
+            return await run_pipeline(*args, **kwargs)
+    finally:
+        # ⛔⛔ AND NOW THE FOLDERS GO, for a run that keeps nothing (wave 10.9,
+        # #536). Here rather than at the end of the pipeline body for three
+        # reasons: this runs on EVERY exit, including the eight early returns
+        # the body has; the sink is finalized by the time the `with` has
+        # closed, so the log folder is no longer live and can be removed; and
+        # the auto-retry recursion happens INSIDE the body, so by the time
+        # control reaches this point the last attempt is genuinely the last.
+        #
+        # ⭐ The helper refuses unless `delivery.json` says the run is over, so
+        # a crash card's Retry and a login interrupt's Resume both keep the
+        # checkpoint they resume from.
+        try:
+            _purge_incognito_run_dirs(_run_pipeline_queue_dir(args, kwargs), _rid)
+        except Exception as _pe:
+            log(f"[incognito] run-folder cleanup failed (non-fatal): {_pe}", "WARN")
+
+
+def _run_pipeline_queue_dir(args, kwargs) -> "Path | None":
+    """The queue directory a `run_pipeline` call will work in, or None.
+
+    ⛔ RESOLVED THROUGH `_run_dir_inside_queues`, which is this file's one answer
+    to "a run id is a NAME, not a path". A resume carries a full path and only
+    its last segment is a name; anything that would land outside `queues/` is
+    refused rather than followed.
+
+    ⭐ None when the call mints its own id — the CLI's local runs, which have no
+    Firestore record and so can never be incognito. An incognito run always
+    arrives from the start listener with the id it minted."""
+    try:
+        bound = _RUN_PIPELINE_SIG.bind(*args, **kwargs)
+        bound.apply_defaults()
+    except Exception:
+        return None
+    resume = bound.arguments.get("resume_dir")
+    claim = Path(str(resume)).name if resume else bound.arguments.get("run_id")
+    return _run_dir_inside_queues(claim)
 
 
 def _run_pipeline_capture_key(args, kwargs) -> "tuple[str | None, int, str | None]":
@@ -74435,8 +74598,9 @@ async def run_server(port=8000):
                     if not uid or not rid:
                         continue
                     _seen_key = f"{uid}/{rid}"
-                    if (now_ts_inner - _orphan_verified.get(_seen_key, 0.0)
-                            < ORPHAN_RECHECK_SEC):
+                    if not _orphan_recheck_due(
+                            _orphan_verified.get(_seen_key, 0.0), now_ts_inner,
+                            rid, ORPHAN_RECHECK_SEC):
                         continue
                     try:
                         ref = _firebase_db.collection("users").document(uid) \
