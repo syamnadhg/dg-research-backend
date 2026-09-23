@@ -27771,18 +27771,37 @@ def emit_decision(*, phase, title=None, details="", actions=None, recoverability
     emit_event(event_name, phase=phase, agent=agent, **_data)
     if mirror is not None:
         _persist_pending_decision(mirror)
-    # #955 Phase 3: best-effort async AI copy sharpen for the vague cards. Fully
-    # gated — env off by default (DG_ALERT_AI_COPY), only `ai_upgrade` intents,
-    # only inside a running loop. The template just emitted is the guaranteed
-    # fallback; the upgrade re-emits the SAME alert_id+decision_id in place iff
-    # still live. The re-emit passes _ai_upgraded=True so it never respawns.
-    if (intent is not None and not _ai_upgraded
-            and ALERT_INTENTS.get(intent, {}).get("ai_upgrade")
-            and _alert_ai_copy_enabled()):
-        _spawn_alert_copy_upgrade(
-            decision_id=decision_id, alert_id=alert_id, intent=intent,
-            phase=phase, agent=agent, base_title=title, base_details=details,
-            facts=facts, actions=actions)
+    # #955 Phase 3: best-effort async AI copy sharpen for the vague cards. ON
+    # unless DG_ALERT_AI_COPY turns it off (see `_alert_ai_copy_enabled`); only
+    # `ai_upgrade` intents; only inside a running loop. The plain card has
+    # ALREADY been emitted above, so it reaches the person whatever happens
+    # next; the upgrade re-emits the SAME alert_id+decision_id in place iff still
+    # live, and passes _ai_upgraded=True so it never respawns.
+    # ⛔ Only a card that still carries its intent's OWN class. A caller that
+    # forces `recoverability="blocker"` onto agent_failed is one of the four
+    # Anthropic cards (key rate-limited, key over its cap, key rejected, service
+    # overloaded): its copy already says exactly what to do, the drafter is
+    # forbidden to mention API keys, and the re-emit re-derives the class from
+    # the catalog — so a rewrite could only drop the instruction AND demote a
+    # must-act blocker to a recoverable card.
+    # ⛔ Guarded whole: nothing in a best-effort nicety may raise into the
+    # phase that raised the card.
+    try:
+        if (intent is not None and not _ai_upgraded
+                and ALERT_INTENTS.get(intent, {}).get("ai_upgrade")
+                and recoverability == ALERT_INTENTS[intent]["class"]
+                and _alert_ai_copy_enabled()):
+            _spawn_alert_copy_upgrade(
+                decision_id=decision_id, alert_id=alert_id, intent=intent,
+                phase=phase, agent=agent, base_title=title, base_details=details,
+                facts=facts, actions=actions,
+                auto_skip_deadline=auto_skip_deadline, arm_registry=arm_registry)
+    except Exception as _copy_e:
+        try:
+            log(f"[alert-copy] rewrite not started ({type(_copy_e).__name__}) — "
+                "the plain card stands", "WARN")
+        except Exception:
+            pass
     return decision_id
 
 
@@ -27792,10 +27811,40 @@ def emit_decision(*, phase, title=None, details="", actions=None, recoverability
 # deterministic template (already emitted) is the GUARANTEED fallback — any
 # failure, timeout, rejected draft, resolved card, or disabled flag keeps it.
 # Actions and the recoverability class are NEVER AI — only the two copy strings.
-# Default OFF: prod enables via the launcher env (DG_NARRATOR_USE_GEMINI
-# pattern); every test keeps it off (tests/conftest.py) so alert copy stays the
-# template the byte-parity tests assert.
+#
+# ⭐ ON BY DEFAULT since 2026-09-23 (the owner's call: clearer wording for
+# everyone). Until then this comment said production switched it on "via the
+# launcher env" — no launcher, plist, scheduled task or env example ever set
+# DG_ALERT_AI_COPY, so the feature was built, tested and off everywhere.
+# `DG_ALERT_AI_COPY=0` (or false / no / off) in .dg-supervisor.env turns it
+# off; see `_alert_ai_copy_enabled`. The test suite still pins it OFF
+# (tests/conftest.py) so every OTHER test sees the template the byte-parity
+# tests assert; tests/test_alert_ai_copy_955.py clears that pin to measure the
+# real default.
+#
+# The cost and failure side — every row ends with the plain card still up:
+#   • no AI key            → `_call_text_narrator` makes no request at all.
+#   • the call fails / 429 → the draft is None, nothing is re-emitted.
+#   • empty, over-long or unsafe rewrite → `_parse_and_validate_alert_copy`
+#     refuses it (the caps are 90 / 280 chars; a rewrite LONGER than a vague
+#     original but inside the caps is the point, so it is allowed).
+#   • slow call            → the draft runs on its own daemon thread, never the
+#     loop's shared executor, and is abandoned after _ALERT_COPY_DEADLINE_S.
+#   • a burst of cards     → at most _ALERT_COPY_MAX_PER_MIN rewrites start in
+#     any rolling minute; the rest keep their plain copy and cost nothing.
 _alert_copy_tasks: set = set()   # strong refs so detached tasks aren't GC'd
+
+# A rewrite that has not come back by now is abandoned: the person has read the
+# plain card already, and swapping its words under them much later is worse
+# than keeping them. Above the narrator's own HTTP budget (14 s default), so a
+# healthy fallback to Haiku still lands.
+_ALERT_COPY_DEADLINE_S = 20.0
+# Rewrites started in any rolling 60 s, per process. Sized to one whole Phase 2
+# failing at once (up to six agents); a runaway loop of failure cards past that
+# spends nothing more.
+_ALERT_COPY_MAX_PER_MIN = 6
+_alert_copy_starts: "collections.deque" = collections.deque()
+_alert_copy_starts_lock = threading.Lock()
 
 # Credential-bait an upgraded card must never solicit (a hijacked page could try
 # to steer the LLM into a phishing string). Word-boundaried regex, not a bare
@@ -27818,10 +27867,47 @@ _ALERT_COPY_KNOWN_LABELS = {
 }
 
 
+_ALERT_AI_COPY_OFF_WORDS = frozenset({"0", "false", "no", "off", "disable", "disabled"})
+_ALERT_AI_COPY_ON_WORDS = frozenset({"1", "true", "yes", "on", "enable", "enabled"})
+_alert_ai_copy_warned = {"value": None}   # the last unreadable value we logged
+
+
 def _alert_ai_copy_enabled() -> bool:
-    """True when the launcher armed the async alert-copy sharpen. Read at call
-    time (not import) so a fresh BE process / a test env pin is honored."""
-    return (os.environ.get("DG_ALERT_AI_COPY") or "").strip().lower() in ("1", "true", "yes")
+    """Is the async alert-copy sharpen on? ON unless DG_ALERT_AI_COPY says off.
+
+    Unset or empty → ON (the default). 0 / false / no / off / disable(d) → OFF.
+    Any other value keeps the default and says so ONCE per distinct value in
+    the log: a typo must neither silently cancel the owner's decision nor
+    fail an alert, and the line names the value that does turn it off.
+    Read at call time (not import) because `.dg-supervisor.env` is loaded by
+    `main()`, long after this module binds its constants."""
+    val = (os.environ.get("DG_ALERT_AI_COPY") or "").strip().lower()
+    if val in _ALERT_AI_COPY_OFF_WORDS:
+        return False
+    if val and val not in _ALERT_AI_COPY_ON_WORDS and _alert_ai_copy_warned["value"] != val:
+        _alert_ai_copy_warned["value"] = val
+        try:
+            log(f"[alert-copy] DG_ALERT_AI_COPY={val!r} is not an on/off value — "
+                "keeping the default (ON); set it to 0 to turn the clearer "
+                "alert wording off", "WARN")
+        except Exception:
+            pass
+    return True
+
+
+def _alert_copy_take_slot(now: "float | None" = None) -> bool:
+    """Claim one of the _ALERT_COPY_MAX_PER_MIN rewrites allowed in any rolling
+    minute. False → this card keeps its plain copy and no call is made. Locked
+    so the prune-check-append stays atomic if two loop threads ever raise cards
+    at once; `now` is a monotonic clock reading, injectable for tests."""
+    now = time.monotonic() if now is None else now
+    with _alert_copy_starts_lock:
+        while _alert_copy_starts and now - _alert_copy_starts[0] >= 60.0:
+            _alert_copy_starts.popleft()
+        if len(_alert_copy_starts) >= _ALERT_COPY_MAX_PER_MIN:
+            return False
+        _alert_copy_starts.append(now)
+        return True
 
 
 def _parse_and_validate_alert_copy(text, allowed_labels):
@@ -27940,29 +28026,96 @@ def _draft_alert_copy(intent, base_title, base_details, facts, actions):
         return None
 
 
-async def _upgrade_alert_copy(*, decision_id, alert_id, intent, phase, agent,
-                              base_title, base_details, facts, actions):
-    """(async best-effort.) Draft sharper copy off the loop thread, then — iff
-    the card is STILL live — re-emit it in place under the same alert_id +
-    decision_id. The liveness check and the re-emit run with NO await between
-    them (both sync on the loop), so a Retry/Skip landing mid-draft is never
-    overwritten and a resolved card is never resurrected."""
+def _alert_copy_note(intent, agent, outcome):
+    """One INFO line per vague card saying what became of its rewrite — the
+    line an end-to-end run greps for (`[alert-copy]`). Names the intent and the
+    agent only, never the copy: the draft is built partly from untrusted page
+    text, and this log's tail ships in the owner's support bundle."""
     try:
-        drafted = await asyncio.to_thread(
-            _draft_alert_copy, intent, base_title, base_details, facts, actions)
+        log(f"[alert-copy] {intent} card for {agent or 'the run'}: {outcome}", "INFO")
     except Exception:
+        pass
+
+
+def _draft_alert_copy_off_loop(intent, base_title, base_details, facts, actions):
+    """Run `_draft_alert_copy` on its OWN daemon thread; return a loop future
+    that settles with its result (None on any failure).
+
+    ⛔ NOT `asyncio.to_thread`. That borrows the loop's default executor — the
+    same few workers every `await asyncio.to_thread(...)` in the pipeline queues
+    on — so a burst of slow drafts would stall a phase's own work behind them,
+    and `asyncio.run()` waits for that executor at exit, so a hung draft would
+    hold a finished run open for as long as the HTTP call took. A daemon thread
+    holds neither. The context is copied so the draft's log lines go where the
+    card's would (what `to_thread` did for free)."""
+    import contextvars
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+
+    def _settle(result):
+        if not fut.done():      # abandoned at the deadline → nobody is waiting
+            fut.set_result(result)
+
+    def _work():
+        try:
+            result = _draft_alert_copy(intent, base_title, base_details, facts, actions)
+        except Exception:
+            result = None
+        try:
+            loop.call_soon_threadsafe(_settle, result)
+        except RuntimeError:
+            pass                # the loop closed while we drafted — drop it quietly
+
+    ctx = contextvars.copy_context()
+    threading.Thread(target=ctx.run, args=(_work,), name="dg-alert-copy",
+                     daemon=True).start()
+    return fut
+
+
+async def _upgrade_alert_copy(*, decision_id, alert_id, intent, phase, agent,
+                              base_title, base_details, facts, actions,
+                              auto_skip_deadline=None, arm_registry=True):
+    """(async best-effort.) Draft sharper copy off the loop, then — iff the card
+    is STILL live — re-emit it in place under the same alert_id + decision_id.
+    The liveness check and the re-emit run with NO await between them (both
+    sync on the loop), so a Retry/Skip landing mid-draft is never overwritten
+    and a resolved card is never resurrected. A draft slower than
+    _ALERT_COPY_DEADLINE_S is abandoned and the plain card stays."""
+    try:
+        drafted = await asyncio.wait_for(
+            _draft_alert_copy_off_loop(intent, base_title, base_details, facts, actions),
+            timeout=_ALERT_COPY_DEADLINE_S)
+    except asyncio.TimeoutError:
+        _alert_copy_note(intent, agent, "kept the plain wording — no answer within "
+                                        f"{_ALERT_COPY_DEADLINE_S:g} s")
         return
+    except Exception:
+        return  # failed to start → the plain card stays
     if not drafted:
+        _alert_copy_note(intent, agent, "kept the plain wording — no usable rewrite "
+                                        "(no AI key, the call failed, or the draft "
+                                        "was refused)")
         return  # brain down / draft rejected → the template stays
     new_title, new_details = drafted
     # ── atomic on the loop from here: no await until emit_decision returns ──
     if decision_id not in _active_decisions:
+        _alert_copy_note(intent, agent, "kept the plain wording — the card was "
+                                        "answered or replaced first")
         return  # resolved (Retry / Skip / auto-skip) while drafting — do NOT resurrect
-    # Re-derive the deadline from the LIVE registry: a poke/wait-longer/growth
-    # disarm may have dropped it, and the spawn-time value would re-arm a
-    # cancelled deadline. (A disarm also retires the id from _active_decisions,
-    # so we'd have bailed above — this is belt-and-suspenders.)
-    live_deadline = _pending_decisions.get(decision_id, {}).get("deadline")
+    if arm_registry:
+        # Re-derive the deadline from the LIVE registry: a poke/wait-longer/growth
+        # disarm may have dropped it, and the spawn-time value would re-arm a
+        # cancelled deadline. (A disarm also retires the id from _active_decisions,
+        # so we'd have bailed above — this is belt-and-suspenders.)
+        live_deadline = _pending_decisions.get(decision_id, {}).get("deadline")
+    else:
+        # ⛔ A card whose OWN wait is the firer (`arm_registry=False` — the parked
+        # agent_error card, which is exactly the vague card this rewrites) never
+        # had a registry entry, so the lookup above always answers None: the
+        # rewrite would erase the countdown from the card while the park still
+        # skips the agent on time. Its deadline is the one stamped at emit, and a
+        # resolve retires the id, which the liveness check above already read.
+        live_deadline = auto_skip_deadline
     # Refresh the durable mirror in place ONLY if this card still owns the single
     # slot; if a sibling's card took it, suppress so we don't clobber the sibling.
     owns_mirror = bool(_pending_decision_active and _pending_decision_did == decision_id)
@@ -27971,22 +28124,29 @@ async def _upgrade_alert_copy(*, decision_id, alert_id, intent, phase, agent,
             phase=phase, agent=agent, intent=intent,
             facts={"title": new_title, "details": new_details},
             alert_id=alert_id, decision_id=decision_id,
-            auto_skip_deadline=live_deadline,
+            auto_skip_deadline=live_deadline, arm_registry=arm_registry,
             suppress_generic_mirror=(not owns_mirror),
             _ai_upgraded=True)
     except Exception:
         return
+    _alert_copy_note(intent, agent, "rewritten in plain words")
 
 
 def _spawn_alert_copy_upgrade(**kw):
     """Schedule _upgrade_alert_copy as a detached task IFF a loop is running
-    (sync / test callers have none → the template just stays). Never raises into
-    the caller; keeps a strong ref so the task isn't GC'd mid-flight, and
-    retrieves the task's exception in a done-callback so a late failure doesn't
-    log 'Task exception was never retrieved'."""
+    (sync / test callers have none → the template just stays) and the rolling
+    per-minute budget has room (a burst past it keeps its plain copy). Never
+    raises into the caller; keeps a strong ref so the task isn't GC'd
+    mid-flight, and retrieves the task's exception in a done-callback so a late
+    failure doesn't log 'Task exception was never retrieved'."""
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
+        return
+    if not _alert_copy_take_slot():
+        _alert_copy_note(kw.get("intent"), kw.get("agent"),
+                         f"kept the plain wording — {_ALERT_COPY_MAX_PER_MIN} "
+                         "rewrites already started this minute")
         return
     try:
         task = loop.create_task(_upgrade_alert_copy(**kw))
