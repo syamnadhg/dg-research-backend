@@ -28,10 +28,15 @@ somebody could plausibly add "for consistency", and each one deletes the lines
 that explain why a run died.
 
     python .mutants/wave8_machine_scope_0824_mutants.py
+    python .mutants/wave8_machine_scope_0824_mutants.py H1 X4     # a spot check
+
+⛔ THE VERDICT IS PYTEST'S SUMMARY LINE (wave 10.10), never its exit code, and
+every mutant is compiled before it is written — see `green` and the loop.
 """
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -293,18 +298,39 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
 ]
 
 
-def green(tests: list[str]) -> tuple[bool, bool]:
+#: One count out of pytest's summary line, e.g. "20 passed, 2 failed in 3.1s".
+_COUNT = re.compile(r"(\d+) (passed|failed|skipped|errors?|deselected)")
+
+
+def green(tests: list[str]) -> tuple[bool, bool, int]:
+    """(green, timed out, passed) — read off pytest's SUMMARY LINE.
+
+    ⛔⛔ NOT THE EXIT CODE (wave 10.10). This decided on `returncode == 0`, and
+    this repo's backend suite once died at 27% and exited 0. A run that printed
+    no summary is not a verdict either way: it raises ValueError, which the loop
+    below counts as a harness fault rather than a kill. The PASSED count comes
+    back too, so a mutant that makes tests SKIP — fewer passes, nothing failed —
+    is a kill rather than a clean run."""
     try:
         # ⛔⛔ A stale `__pycache__/*.pyc` served OLD bytecode for three rounds of
         # measurement in this repo. In a harness that rewrites the source between
         # runs it is a kill or a survivor invented out of nothing.
-        rc = subprocess.run([PY, "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider",
-                             *tests], cwd=ROOT, capture_output=True,
-                            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
-                            timeout=_TEST_TIMEOUT_S).returncode
-        return rc == 0, False
+        r = subprocess.run([PY, "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider",
+                            *tests], cwd=ROOT, capture_output=True, text=True,
+                           env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                           timeout=_TEST_TIMEOUT_S)
     except subprocess.TimeoutExpired:
-        return False, True
+        return False, True, 0
+    out = (r.stdout or "") + (r.stderr or "")
+    lines = [ln for ln in out.splitlines()
+             if re.search(r" in [\d.]+s", ln) and _COUNT.search(ln)]
+    if not lines:
+        raise ValueError("pytest printed no summary line — the run did not happen")
+    counts = {"passed": 0, "failed": 0, "error": 0}
+    for n, kind in _COUNT.findall(lines[-1]):
+        counts["error" if kind.startswith("error") else kind] = int(n)
+    return (not counts["failed"] and not counts["error"] and counts["passed"] > 0,
+            False, counts["passed"])
 
 
 def snapshot() -> dict[str, str]:
@@ -320,16 +346,35 @@ def main() -> int:
     before = snapshot()
 
     print("baseline… ", end="", flush=True)
-    ok, timed_out = green(ALL)
+    try:
+        ok, timed_out, _ = green(ALL)
+    except ValueError as exc:
+        print(f"FAULT: {exc}. Nothing below would mean anything.")
+        return 2
     if not ok:
         print(f"{'TIMED OUT' if timed_out else 'RED'}. "
               f"Nothing below would mean anything.")
         return 2
+    # ⭐ One baseline PASS COUNT per test list a mutant names, so "fewer passed"
+    # is measured against the same selection it ran.
+    base_passed: dict[tuple, int] = {}
+    for tests in {tuple(m[4]) for m in MUTANTS}:
+        try:
+            ok, timed_out, n = green(list(tests))
+        except ValueError as exc:
+            print(f"FAULT on {' '.join(tests)}: {exc}")
+            return 2
+        if not ok:
+            print(f"RED on {' '.join(tests)}. Nothing below would mean anything.")
+            return 2
+        base_passed[tests] = n
     print("green", flush=True)
 
+    only = set(sys.argv[1:])
+    selected = [m for m in MUTANTS if not only or m[0] in only]
     survivors: list[tuple] = []
     stale: list[tuple] = []
-    for mid, direction, why, edits, tests in MUTANTS:
+    for mid, direction, why, edits, tests in selected:
         target = ROOT / SRC
         original = target.read_text(encoding="utf-8")
         try:
@@ -341,8 +386,16 @@ def main() -> int:
                 if hits != 1:
                     raise ValueError(f"anchor occurs {hits}x (needs exactly 1): {frm[:60]}")
                 mutated = mutated.replace(frm, to)
+            # ⛔ COMPILED BEFORE IT IS WRITTEN. An unparseable mutant reds the
+            # suite on an import error, and a red suite used to bank a kill no
+            # assertion earned — H1 did exactly that from 2026-08-24 on.
+            try:
+                compile(mutated, SRC, "exec")
+            except SyntaxError as syn:
+                raise ValueError(f"the mutant does not parse ({syn.lineno}: {syn.msg})")
             target.write_text(mutated, encoding="utf-8")
-            passed, timed_out = green(tests)
+            ok, timed_out, n = green(tests)
+            passed = ok and n >= base_passed[tuple(tests)]
             killed = not passed
             note = " (via TIMEOUT — a test hung rather than failed, fix it)" if timed_out else ""
             print(f"{'✓ killed  ' if killed else '✗ SURVIVED'} {mid} "
@@ -363,8 +416,8 @@ def main() -> int:
               "your source:\n" + "\n".join(left))
         return 3
 
-    over = sum(1 for m in MUTANTS if m[1] == "over")
-    print(f"\n{len(MUTANTS) - len(survivors) - len(stale)}/{len(MUTANTS)} killed "
+    over = sum(1 for m in selected if m[1] == "over")
+    print(f"\n{len(selected) - len(survivors) - len(stale)}/{len(selected)} killed "
           f"({over} over-corrections)")
     if stale:
         print("⚠ STALE ANCHORS (harness faults — these measured NOTHING):\n"
