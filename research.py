@@ -69838,6 +69838,12 @@ def _record_hand_off(queue_dir, research, phase3_began_ms) -> None:
     is written back as read — including a phase-4 row a watched run's browser
     may already have had the route stamp — under `_phases_write_lock`, so the
     machine's own status write cannot interleave either.
+    ⚠ ONE WINDOW IS LEFT, AND NAMED: a route write that lands between this read
+    and this write. Only on a watched run, whose browser can kick the route on
+    `phase_complete:3` before this write; an unwatched run's kick is sent after
+    it. A transaction would close it and is not available here — Track D
+    denies this machine transactional reads on the user tree (#720) — and the
+    route's own read-modify-write has the same window from its side.
 
     ⛔ NOTHING IS INVENTED. `phase3_began_ms` is when phase 3 began in THIS
     process; a phase 3 that was skipped or resumed past has none, and a start

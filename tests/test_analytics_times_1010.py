@@ -30,11 +30,9 @@ call sites inside `run_pipeline` — a 5,000-line coroutine nothing can drive th
 far — are pinned by their parse tree, and their argument expressions are
 EVALUATED, not read.
 
-⚠ NOT FIXED HERE, and said so rather than implied: phase 3 still has no
-`save_meta` at a normal finish (only on a stop), so its row is still the web's
-status-only stub. That call belongs at the phase-3 hand-off, which another round
-is editing, and after the hand-off the machine must not write the phases array
-at all — the cloud owns phases 4 and 5.
+⚠ Phase 3 is not here: it ends in the hand-off's own write, and after the
+hand-off the machine writes no phase list at all — the cloud owns phases 4 and
+5. That half is `tests/test_phase3_handoff_1010.py`.
 """
 import ast
 import inspect
