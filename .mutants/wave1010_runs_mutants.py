@@ -45,6 +45,7 @@ T_LOCAL = "tests/test_local_run_api_1010.py"
 T_EDGES = "tests/test_incognito_edges_1010.py"
 T_LEASE = "tests/test_incognito_fuse_renewal_109.py"
 T_OWNER = "tests/test_owner_log_lines_1010.py"
+T_PRIVATE_API = "tests/test_serve_api_private_runs_1010.py"
 
 # ══ task 1: the recency tier ══════════════════════════════════════════════
 TIER = ("    if (last_write_at is not None\n"
@@ -135,6 +136,21 @@ DEF_RECONNECT = "\nasync def _firebase_reconnect_loop():"
 DEF_RELINK = "\nasync def _revoked_recovery_loop():"
 DEF_DEVICE = "    def _on_snap(_col_snapshot, changes, _read_time):"
 WORKER_TASK = "                    _pipe_task = asyncio.ensure_future("
+
+# ══ task 5: the serve API and a private run ═══════════════════════════════
+ROW_PRIVATE = "    private = _queue_dir_keeps_nothing(d)"
+ROW_META = "    if meta_path.exists() and not private:"
+ROW_SUBJECT = "    subject = (_BUNDLE_TOPIC_MARK if private"
+DETAILS_CALL = ("        if _queue_dir_keeps_nothing(queue):\n"
+                "            return _local_run_private_details(queue)")
+DETAILS_CP = ("    return {\"meta\": _local_run_row(queue_dir), \"checkpoint\": None,\n"
+              "            \"delivery\": None, \"pipeline_state\": _local_run_state(queue_dir)}")
+DOC_GATE = ("        if _queue_dir_keeps_nothing(queues_root / run_id):\n"
+            "            return JSONResponse({\"error\": _LOCAL_RUN_PRIVATE_REFUSAL}, 403)\n"
+            "        # All documents live in documents/ (brief included)")
+AUDIO_GATE = ("        if _queue_dir_keeps_nothing(queues_root / run_id):\n"
+              "            return JSONResponse({\"error\": _LOCAL_RUN_PRIVATE_REFUSAL}, 403)\n"
+              "        # Sanitize filename to prevent path traversal")
 
 MUTANTS = [
     # ── task 1 ────────────────────────────────────────────────────────────
@@ -327,6 +343,47 @@ MUTANTS = [
      "private run is held back from the owner's log",
      [(WORKER_TASK, "                    _LOG_RUN.set(job.get(\"research_id\"))\n"
                     "                    _pipe_task = asyncio.ensure_future(")], [T_OWNER]),
+
+    # ── task 5: the serve API ─────────────────────────────────────────────
+    ("S1", "under", "⛔⛔ the list never asks whose run a folder is, so a private "
+     "run's title and topic go to whoever holds the serve token",
+     [(ROW_PRIVATE, "    private = False")], [T_PRIVATE_API, T_LOCAL]),
+    ("S2", "under", "⛔ a private run's meta.json is returned whole — every "
+     "report's section titles with it",
+     [(ROW_META, "    if meta_path.exists():")], [T_PRIVATE_API, T_LOCAL]),
+    ("S3", "under", "a private run with no meta.json lists its checkpoint's topic",
+     [(ROW_SUBJECT, "    subject = (_BUNDLE_TOPIC_MARK if False")], [T_PRIVATE_API, T_LOCAL]),
+    ("S4", "over", "every run's subject is masked, so the owner's own runs "
+     "list as '<topic removed>'",
+     [(ROW_SUBJECT, "    subject = (_BUNDLE_TOPIC_MARK if True")], [T_PRIVATE_API, T_LOCAL]),
+    ("S5", "under", "⛔⛔ THE CONSUMER IGNORES THE RULE: one private run is "
+     "served whole — meta, checkpoint and delivery record",
+     [(DETAILS_CALL, "        if False:\n"
+                     "            return _local_run_private_details(queue)")],
+     [T_PRIVATE_API, T_LOCAL]),
+    ("S6", "under", "the private details hand back the checkpoint, which holds "
+     "the topic",
+     [(DETAILS_CP, "    return {\"meta\": _local_run_row(queue_dir), "
+                   "\"checkpoint\": load_checkpoint(queue_dir),\n"
+                   "            \"delivery\": None, \"pipeline_state\": _local_run_state(queue_dir)}")],
+     [T_PRIVATE_API]),
+    ("S7", "under", "⛔⛔ a private run's report is served — the subject in its "
+     "strongest form",
+     [(DOC_GATE, "        if False:\n"
+                 "            return JSONResponse({\"error\": _LOCAL_RUN_PRIVATE_REFUSAL}, 403)\n"
+                 "        # All documents live in documents/ (brief included)")], [T_PRIVATE_API]),
+    ("S8", "under", "⛔ a private run's podcast is served",
+     [(AUDIO_GATE, "        if False:\n"
+                   "            return JSONResponse({\"error\": _LOCAL_RUN_PRIVATE_REFUSAL}, 403)\n"
+                   "        # Sanitize filename to prevent path traversal")], [T_PRIVATE_API]),
+    ("S9", "over", "every run's report is refused",
+     [(DOC_GATE, "        if True:\n"
+                 "            return JSONResponse({\"error\": _LOCAL_RUN_PRIVATE_REFUSAL}, 403)\n"
+                 "        # All documents live in documents/ (brief included)")], [T_PRIVATE_API]),
+    ("S10", "over", "every run's podcast is refused",
+     [(AUDIO_GATE, "        if True:\n"
+                   "            return JSONResponse({\"error\": _LOCAL_RUN_PRIVATE_REFUSAL}, 403)\n"
+                   "        # Sanitize filename to prevent path traversal")], [T_PRIVATE_API]),
 ]
 
 

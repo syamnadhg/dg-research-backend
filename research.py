@@ -75995,10 +75995,20 @@ _LOCAL_RUN_LIST_STATUS = {"running": "ongoing"}
 def _local_run_row(queue_dir) -> dict:
     """One row of `GET /api/runs` for one run folder: its `meta.json` when it
     has a readable one, else a row built from the checkpoint and
-    `_local_run_state`."""
+    `_local_run_state`.
+
+    ⛔⛔ AN INCOGNITO RUN'S ROW CARRIES NO SUBJECT (wave 10.10). This API
+    answers whoever holds the serve token — the computer's owner, whom the
+    feature promises is told only that a run happened — and it returned an
+    in-flight private run's `meta.json` whole: its title, its topic and every
+    report's section titles. Such a folder is now described only by what
+    carries no subject — its folder name (minted without the topic), state,
+    phase and times — with `_BUNDLE_TOPIC_MARK` where the subject was, the mark
+    `_loggable_topic` puts in the log and the bundle redactor in a bundle."""
     d = Path(queue_dir)
+    private = _queue_dir_keeps_nothing(d)
     meta_path = d / "meta.json"
-    if meta_path.exists():
+    if meta_path.exists() and not private:
         try:
             return json.loads(meta_path.read_text(encoding="utf-8"))
         except Exception:
@@ -76006,10 +76016,12 @@ def _local_run_row(queue_dir) -> dict:
     cp = load_checkpoint(d)
     phase = cp.get("last_completed_phase", 0) if cp else 0
     state = _local_run_state(d)
+    subject = (_BUNDLE_TOPIC_MARK if private
+               else (cp.get("topic", d.name) if cp else d.name))
     return {
         "id": d.name,
-        "title": cp.get("topic", d.name) if cp else d.name,
-        "topic": cp.get("topic", d.name) if cp else d.name,
+        "title": subject,
+        "topic": subject,
         "status": _LOCAL_RUN_LIST_STATUS.get(state, state),
         "phase": max(0, phase - 1),
         "platforms": ["chatgpt", "gemini", "claude"],
@@ -76017,6 +76029,19 @@ def _local_run_row(queue_dir) -> dict:
         "createdAt": int(d.stat().st_ctime * 1000),
         "updatedAt": int(d.stat().st_mtime * 1000),
     }
+
+
+#: What the local serve API says instead of an incognito run's report or podcast.
+_LOCAL_RUN_PRIVATE_REFUSAL = ("this run is incognito — its documents and audio "
+                              "are not served here")
+
+
+def _local_run_private_details(queue_dir) -> dict:
+    """`GET /api/runs/{id}` for an incognito run's folder: the redacted row as
+    its meta, its state, and nothing else. The checkpoint and the delivery
+    record both hold the topic, and the checkpoint the brief's address too."""
+    return {"meta": _local_run_row(queue_dir), "checkpoint": None,
+            "delivery": None, "pipeline_state": _local_run_state(queue_dir)}
 
 
 async def run_server(port=8000):
@@ -76383,6 +76408,10 @@ async def run_server(port=8000):
         queue = queues_root / run_id
         if not queue.exists():
             return JSONResponse({"error": "not found"}, 404)
+        # ⛔ An incognito run is described without its subject — its meta,
+        # checkpoint and delivery record all carry it. See `_local_run_row`.
+        if _queue_dir_keeps_nothing(queue):
+            return _local_run_private_details(queue)
         # Load meta (frontend-compatible Research object)
         meta_path = queue / "meta.json"
         meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else None
@@ -77796,6 +77825,9 @@ async def run_server(port=8000):
     @app.get("/api/runs/{run_id}/documents/{doc_type}")
     async def get_document(run_id: str, doc_type: str):
         """Get document content. doc_type: brief, chatgpt, gemini, claude."""
+        # ⛔ Not an incognito run's: the report IS its subject (wave 10.10).
+        if _queue_dir_keeps_nothing(queues_root / run_id):
+            return JSONResponse({"error": _LOCAL_RUN_PRIVATE_REFUSAL}, 403)
         # All documents live in documents/ (brief included)
         path = queues_root / run_id / "documents" / f"{doc_type}.md"
         if not path.exists():
@@ -77814,6 +77846,9 @@ async def run_server(port=8000):
     async def get_audio(run_id: str, filename: str):
         """Serve audio file from podcasts directory."""
         from fastapi.responses import FileResponse as _FileResponse
+        # ⛔ Not an incognito run's podcast either (wave 10.10).
+        if _queue_dir_keeps_nothing(queues_root / run_id):
+            return JSONResponse({"error": _LOCAL_RUN_PRIVATE_REFUSAL}, 403)
         # Sanitize filename to prevent path traversal
         safe = Path(filename).name
         path = queues_root / run_id / "podcasts" / safe
