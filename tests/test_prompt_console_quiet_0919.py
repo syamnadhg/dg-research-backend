@@ -14,11 +14,13 @@ of `main()`, and its stdlib `log.debug` reaches `log()` through the bridge, whic
 is attached at DEBUG deliberately. The main thread is parked in `input()` while
 that happens, so no amount of moving statements around on the main thread helps.
 
-⚠ WITHHELD, NEVER DISCARDED — which is the part worth testing hardest. Every
-line still reaches the run file on its normal path, and the console copy replays
+⚠ WITHHELD FROM THE SCREEN, NEVER FROM THE FILES — which is the part worth
+testing hardest. Every line still reaches the run file on its normal path and
+the session log the moment it arrives, and the screen replays the newest 500
 the instant the answer is read. A prompt that ate diagnostics would trade a
 cosmetic problem for a real one: the next support bundle is built from exactly
-these lines.
+these lines. (Until wave 10.10 this said "never discarded" while line 501 onward
+reached no file at all.)
 """
 import threading
 import time
@@ -33,10 +35,12 @@ def _reset():
     research._CONSOLE_QUIET.clear()
     with research._CONSOLE_HELD_LOCK:
         research._CONSOLE_HELD[:] = []
+        research._CONSOLE_HELD_DROPPED[0] = 0
     yield
     research._CONSOLE_QUIET.clear()
     with research._CONSOLE_HELD_LOCK:
         research._CONSOLE_HELD[:] = []
+        research._CONSOLE_HELD_DROPPED[0] = 0
 
 
 def test_a_log_line_does_not_print_while_a_question_is_open(capsys):
@@ -70,18 +74,92 @@ def test_a_line_from_ANOTHER_THREAD_is_held_too(capsys):
     assert "batch posted" in capsys.readouterr().out
 
 
-def test_the_line_still_reaches_the_run_file(monkeypatch, capsys):
-    """⛔⛔ THE GUARD THAT MATTERS MOST. Quieting the console must not quiet the
-    LOG. Support bundles are assembled from these lines, and a prompt that
-    silently dropped them would cost a future diagnosis — which is exactly the
-    kind of loss this whole day has been about."""
+def _session(tmp_path, monkeypatch):
+    """A real session tee on `sys.stdout`, as `--pair`/`--login`/`--doctor`
+    install one: the screen is a buffer, the file is a real capped writer."""
+    import io
+    import sys
+    screen = io.StringIO()
+    path = tmp_path / "session.log"
+    writer = research._CappedLogWriter(path)
+    monkeypatch.setattr(sys, "stdout", research._SessionTee(screen, writer))
+    return screen, writer, path
+
+
+def test_every_held_line_reaches_the_session_log_exactly_once(tmp_path, monkeypatch):
+    """⛔⛔ THE GUARD THAT MATTERS MOST, AND IT USED TO PASS EITHER WAY. It
+    logged one line and looked for it in the run file — true before and after
+    the defect it was named for. What was really lost: while a question was
+    open, line 501 onward was neither shown NOR written anywhere, because the
+    session log is a copy of the screen and those lines never reached the
+    screen. Every held line must now be in the session file exactly once — not
+    missing, and not written again when the screen replays it — and in the run
+    file exactly once too."""
+    screen, writer, path = _session(tmp_path, monkeypatch)
     written = []
     monkeypatch.setattr(research, "_log_write_through",
-                        lambda line, level: written.append((line, level)))
+                        lambda line, level: written.append(line))
+    n = research._CONSOLE_HELD_MAX + 50
     with research._console_quiet_for_prompt():
-        research.log("something worth keeping", "WARN")
-    assert any("something worth keeping" in ln for ln, _lv in written)
-    assert any(lv == "WARN" for _ln, lv in written)
+        for i in range(n):
+            research.log(f"held line {i:04d}", "WARN")
+    writer.close()
+    kept = path.read_text(encoding="utf-8")
+    missing = [i for i in range(n) if f"held line {i:04d}" not in kept]
+    twice = [i for i in range(n) if kept.count(f"held line {i:04d}") > 1]
+    assert not missing, f"{len(missing)} held line(s) never reached the session log"
+    assert not twice, f"{len(twice)} held line(s) were written to it twice"
+    assert all(sum(f"held line {i:04d}" in w for w in written) == 1 for i in range(n)), (
+        "a held line did not reach the run file exactly once")
+
+
+def test_the_screen_replays_the_newest_and_says_where_the_rest_are(tmp_path,
+                                                                    monkeypatch):
+    """⭐ WHAT A PERSON SEES: the newest 500, and one line saying how many
+    earlier lines arrived and which file has them."""
+    screen, writer, path = _session(tmp_path, monkeypatch)
+    n = research._CONSOLE_HELD_MAX + 50
+    with research._console_quiet_for_prompt():
+        for i in range(n):
+            research.log(f"held line {i:04d}")
+        assert screen.getvalue() == "", "a held line printed over the question"
+    shown = screen.getvalue()
+    assert shown.count("held line") == research._CONSOLE_HELD_MAX
+    assert "held line 0049" not in shown and "held line 0050" in shown
+    assert f"held line {n - 1:04d}" in shown
+    assert "50 earlier line(s)" in shown and str(path) in shown
+    # the note comes BEFORE the lines it explains are missing from
+    assert shown.index("50 earlier line(s)") < shown.index("held line 0050")
+
+
+def test_without_a_session_log_the_note_says_they_were_not_kept(capsys):
+    """⛔ `--send-logs` keeps no session log, so there is no file to point at —
+    and the note must not claim one."""
+    n = research._CONSOLE_HELD_MAX + 3
+    with research._console_quiet_for_prompt():
+        for i in range(n):
+            research.log(f"held line {i:04d}")
+    shown = capsys.readouterr().out
+    assert shown.count("held line") == research._CONSOLE_HELD_MAX
+    assert "3 earlier line(s)" in shown and "were not kept" in shown
+
+
+def test_a_short_prompt_says_nothing_extra(tmp_path, monkeypatch):
+    """⭐ The ordinary case: a handful of lines replay as they were, with no note
+    — even right after a long prompt, whose count must not carry over."""
+    screen, writer, path = _session(tmp_path, monkeypatch)
+    with research._console_quiet_for_prompt():
+        for i in range(research._CONSOLE_HELD_MAX + 5):
+            research.log(f"held line {i:04d}")
+    assert "5 earlier line(s)" in screen.getvalue()
+    screen.seek(0)
+    screen.truncate()
+    with research._console_quiet_for_prompt():
+        research.log("one quiet line")
+    writer.close()
+    assert "one quiet line" in screen.getvalue()
+    assert "earlier line(s)" not in screen.getvalue(), screen.getvalue()
+    assert path.read_text(encoding="utf-8").count("one quiet line") == 1
 
 
 def test_the_hold_is_bounded(capsys):

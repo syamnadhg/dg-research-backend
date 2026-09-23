@@ -2285,27 +2285,64 @@ def _log_date_marker(day: str, ts: str) -> "str | None":
 # thread is printing over the question — nothing about ordering on the main
 # thread can fix it.
 #
-# ⚠ WITHHELD, NEVER DISCARDED. Every line still goes to the run file through
-# `_log_write_through` on its normal path, and the console copy is replayed the
-# moment the answer is read. A prompt that ate diagnostics would trade a
+# ⚠ WITHHELD FROM THE SCREEN, NEVER FROM THE FILES. Every line still goes to the
+# run file through `_log_write_through` on its normal path, and to this
+# command's session log THE MOMENT IT ARRIVES (see `_console_print`); only the
+# screen copy waits for the answer. A prompt that ate diagnostics would trade a
 # cosmetic problem for a real one — the next support bundle is assembled from
 # exactly these lines.
+#
+# ⛔⛔ THE SCREEN COPY IS BOUNDED, AND THIS COMMENT USED TO PROMISE MORE (wave
+# 10.10). It said "never discarded" while line 501 onward of a long prompt was
+# neither shown nor kept: the session log is a copy of what reaches the screen,
+# so a line held back from the screen and then dropped reached no file at all.
+# Now the file gets every line as it arrives, the screen replays the NEWEST 500
+# when the answer is read, and one line says how many earlier ones are only in
+# the session log.
 _CONSOLE_QUIET = threading.Event()
+#: `(text, tee)` per held line — `tee` is the session mirror the line was
+#: already written to, or None when this command keeps no session log.
 _CONSOLE_HELD: list = []
 _CONSOLE_HELD_LOCK = threading.Lock()
 #: A held buffer is a courtesy, not a queue. A prompt left open overnight must
 #: not grow one line per telemetry flush until the process dies.
 _CONSOLE_HELD_MAX = 500
+#: How many held lines fell off the front of the buffer during this prompt.
+_CONSOLE_HELD_DROPPED = [0]
 
 
 def _console_print(text: str) -> None:
-    """`print`, unless a question is on screen — then hold it for replay."""
+    """`print`, unless a question is on screen — then hold it for replay.
+
+    ⭐ A HELD LINE REACHES THE SESSION LOG NOW. `print` would have put it there
+    through the tee on `sys.stdout`; holding it must not change that, so it is
+    written to the same writer directly and only the screen copy waits."""
     if not _CONSOLE_QUIET.is_set():
         print(text)
         return
+    tee = sys.stdout if isinstance(sys.stdout, _SessionTee) else None
+    if tee is not None:
+        try:
+            tee._writer.write_line(_visible_text(text))
+        except Exception:
+            tee = None
     with _CONSOLE_HELD_LOCK:
-        if len(_CONSOLE_HELD) < _CONSOLE_HELD_MAX:
-            _CONSOLE_HELD.append(text)
+        _CONSOLE_HELD.append((text, tee))
+        if len(_CONSOLE_HELD) > _CONSOLE_HELD_MAX:
+            del _CONSOLE_HELD[0]
+            _CONSOLE_HELD_DROPPED[0] += 1
+
+
+def _console_replay(text: str, tee) -> None:
+    """Put one held line on the screen — and ONLY the screen when the session
+    log already has it, or the file would hold every held line twice."""
+    if tee is None:
+        print(text)
+        return
+    try:
+        tee._stream.write(text + "\n")
+    except Exception:
+        pass
 
 
 @contextlib.contextmanager
@@ -2322,8 +2359,16 @@ def _console_quiet_for_prompt():
         _CONSOLE_QUIET.clear()
         with _CONSOLE_HELD_LOCK:
             held, _CONSOLE_HELD[:] = list(_CONSOLE_HELD), []
-        for line in held:
-            print(line)
+            dropped, _CONSOLE_HELD_DROPPED[0] = _CONSOLE_HELD_DROPPED[0], 0
+        if dropped:
+            _writer = next((t._writer for _x, t in held if t is not None), None)
+            _where = (f"all of them are in the session log {_writer.primary}"
+                      if _writer is not None else
+                      "this command keeps no session log, so they were not kept")
+            log(f"[console] {dropped} earlier line(s) arrived while the question "
+                f"was open and are not shown here — {_where}", "INFO")
+        for line, tee in held:
+            _console_replay(line, tee)
 
 
 def log(msg, level="INFO"):
@@ -18108,12 +18153,86 @@ def _incognito_runs_held() -> "list[tuple[str, str]]":
     return held
 
 
+#: Incognito runs this worker still holds whose record the lease found GONE, as
+#: {(uid, research id)} — asked about once, and not again while they are held.
+_INCOGNITO_LEASE_GONE: "set[tuple]" = set()
+
+
+def _lease_renew_record(uid, rid) -> str:
+    """One lease write on a held run's record: "renewed", "gone" or "failed".
+
+    ⭐ THE SAME WRITE `_update_research_doc` MAKES — an update carrying only
+    the fuse, through the same heal — kept apart only so the caller can tell a
+    record the web DELETED from one it could not reach. A network failure must
+    be retried next hour; a deleted record never comes back."""
+    try:
+        _grpc_write_with_heal(
+            lambda: _firebase_db.collection("users").document(uid)
+                .collection("researches").document(rid)
+                .update(_be_payload(_with_incognito_renewal({}, rid))),
+            what=f"update research {rid[:8]}…",
+        )
+        return "renewed"
+    except Exception as e:
+        try:
+            import google.api_core.exceptions as _gax_exc
+            if isinstance(e, _gax_exc.NotFound):
+                return "gone"
+        except Exception:
+            pass
+        log(f"research doc update failed "
+            f"(uid={uid[:8]}.., rid={rid[:8]}..): {e}", "WARN")
+        return "failed"
+
+
+def _drop_gone_incognito_job(uid, rid) -> int:
+    """Take a held incognito job whose record the web deleted out of this
+    worker's own queue, and out of the queue snapshot on disk. Returns how many
+    waiting jobs were removed (the running one is never touched here).
+
+    ⛔⛔ LEFT THERE, IT WOULD RUN (wave 10.10). A job waiting in this worker's
+    queue has no queue document any more — the claim deleted it — so a cancel
+    that never arrived (the tab was closed) leaves it here. When its turn came
+    the flip would find no record, say "proceeding, as before", and spend a
+    whole paid run writing into nothing; until then the lease warned about it
+    every hour. `deque.remove` one job at a time, never clear-and-refill, so a
+    worker taking its next job at the same moment loses nothing else."""
+    queue = _QUEUE_STATE.get("queue_ref")
+    if queue is None:
+        return 0
+    removed = 0
+    try:
+        for job in [j for j in list(queue._queue)
+                    if str((j or {}).get("uid") or "").strip() == uid
+                    and (j or {}).get("research_id") == rid]:
+            try:
+                queue._queue.remove(job)
+                removed += 1
+            except ValueError:
+                pass
+    except Exception:
+        return removed
+    if removed:
+        try:
+            _shed_from_pending_snapshot(queue)
+        except Exception:
+            pass
+    return removed
+
+
 def _renew_incognito_leases() -> dict:
     """Carry the fuse forward on every incognito run this worker holds.
 
     Returns counts: `renewed` records, `documents` renewed under them, and
     `failed` writes (a record that is gone counts once and its reports are left
-    alone)."""
+    alone).
+
+    ⛔⛔ A RECORD THE WEB DELETED IS ASKED ABOUT ONCE (wave 10.10). It was asked
+    again every hour, with a WARN each time, for as long as the run was held —
+    and a cancelled run waiting in this worker's queue stays held until its
+    turn. Now a not-found record is said once, its waiting job leaves the queue
+    (`_drop_gone_incognito_job`), and a running one is remembered in
+    `_INCOGNITO_LEASE_GONE` so it is not written to again."""
     out = {"renewed": 0, "documents": 0, "failed": 0}
     if not _firebase_db:
         return out
@@ -18122,15 +18241,26 @@ def _renew_incognito_leases() -> dict:
     for key in list(_INCOGNITO_DOCS_WRITTEN):
         if key not in held:
             _INCOGNITO_DOCS_WRITTEN.pop(key, None)
+    for key in list(_INCOGNITO_LEASE_GONE):
+        if key not in held:
+            _INCOGNITO_LEASE_GONE.discard(key)
     for uid, rid in held:
-        # ⭐ AN EMPTY PATCH, ON PURPOSE: `_update_research_doc` is the seam that
-        # stamps the fuse on every write, so the lease is simply a write that
-        # carries nothing else. An update, so a record that was purged stays
-        # purged.
-        if not _update_research_doc(uid, rid, {}):
+        if (uid, rid) in _INCOGNITO_LEASE_GONE:
+            continue
+        # ⭐ AN EMPTY PATCH, ON PURPOSE: the same fuse-stamping update every
+        # record write makes, carrying nothing else. An update, so a record
+        # that was purged stays purged.
+        verdict = _lease_renew_record(uid, rid)
+        if verdict != "renewed":
             # ⛔ THE RECORD IS GONE OR UNREACHABLE, SO ITS REPORTS ARE NOT
             # RENEWED. Carrying their fuse forward under a parent that no longer
             # exists would keep the content of a research that was taken away.
+            if verdict == "gone":
+                _INCOGNITO_LEASE_GONE.add((uid, rid))
+                _dropped = _drop_gone_incognito_job(uid, rid)
+                log(f"[incognito-lease] a held run's record is gone from the web — "
+                    f"no longer renewing it; {_dropped} waiting job(s) left this "
+                    f"worker's queue", "INFO")
             out["failed"] += 1
             continue
         out["renewed"] += 1
@@ -75796,6 +75926,89 @@ async def _arm_stop_signals(server, port):
         _hold_stop_signals(_sig, _signums, _on_stop, _reported)
 
 
+# ── What this computer's own run folders say about their runs ────────────────
+
+#: The queue folder name `_mint_run_id` gives a run that keeps nothing:
+#: `incognito_<13-digit ms>_<counter>_<YYYYMMDD>_<HHMMSS>`.
+_INCOGNITO_RUN_DIR_RE = re.compile(r"^incognito_[0-9]{13}_[0-9]{1,6}_[0-9]{8}_[0-9]{6}$")
+
+
+def _queue_dir_keeps_nothing(queue_dir) -> bool:
+    """Is this run folder an incognito run's?
+
+    ⭐ TWO WITNESSES, AND EITHER IS ENOUGH, because every caller uses the answer
+    to HOLD SOMETHING BACK — a refusal or a redaction — never to delete. The
+    folder's `owner.json` is the record `_queue_dir_research_id` reads; the
+    folder NAME is the mint's own shape, and it covers the run whose
+    `owner.json` write failed. A deletion must never rest on the name (it is
+    sanitised); holding back on it costs, at worst, an ordinary run that
+    somebody named exactly like a private one."""
+    if not queue_dir:
+        return False
+    p = Path(queue_dir)
+    return (_is_incognito_research(_queue_dir_research_id(p))
+            or bool(_INCOGNITO_RUN_DIR_RE.fullmatch(p.name)))
+
+
+def _local_run_state(queue_dir, delivery=None) -> str:
+    """What a run folder says its run is doing: "stopped", "paused",
+    "completed" or "running".
+
+    ⛔⛔ ONE READING FOR BOTH OF THE LOCAL SERVE API'S VIEWS (wave 10.10). The
+    single-run route read the stop and pause markers and the delivery status;
+    the list read "delivery.json exists" as "completed" — but delivery.json is
+    written at the START of a run, as "ongoing", so the list called every run
+    finished the moment it began. Both routes now ask this.
+
+    `delivery` is the parsed file when the caller already has it; otherwise
+    it is read here, and an unreadable one says nothing either way."""
+    q = Path(queue_dir)
+    if (q / ".stop").exists():
+        return "stopped"
+    if (q / ".pause").exists():
+        return "paused"
+    if delivery is None:
+        try:
+            delivery = json.loads((q / "delivery.json").read_text(encoding="utf-8"))
+        except Exception:
+            delivery = None
+    if isinstance(delivery, dict) and delivery.get("status") == "completed":
+        return "completed"
+    return "running"
+
+
+#: `_local_run_state` in the list's vocabulary, which is the app's `Research`
+#: status: a run that is running is "ongoing" there.
+_LOCAL_RUN_LIST_STATUS = {"running": "ongoing"}
+
+
+def _local_run_row(queue_dir) -> dict:
+    """One row of `GET /api/runs` for one run folder: its `meta.json` when it
+    has a readable one, else a row built from the checkpoint and
+    `_local_run_state`."""
+    d = Path(queue_dir)
+    meta_path = d / "meta.json"
+    if meta_path.exists():
+        try:
+            return json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    cp = load_checkpoint(d)
+    phase = cp.get("last_completed_phase", 0) if cp else 0
+    state = _local_run_state(d)
+    return {
+        "id": d.name,
+        "title": cp.get("topic", d.name) if cp else d.name,
+        "topic": cp.get("topic", d.name) if cp else d.name,
+        "status": _LOCAL_RUN_LIST_STATUS.get(state, state),
+        "phase": max(0, phase - 1),
+        "platforms": ["chatgpt", "gemini", "claude"],
+        "documents": [], "audios": [],
+        "createdAt": int(d.stat().st_ctime * 1000),
+        "updatedAt": int(d.stat().st_mtime * 1000),
+    }
+
+
 async def run_server(port=8000):
     """Start FastAPI server for real-time web app streaming."""
     from fastapi import FastAPI
@@ -76148,28 +76361,10 @@ async def run_server(port=8000):
             for d in sorted(queues_root.iterdir(), reverse=True):
                 if not d.is_dir():
                     continue
-                meta_path = d / "meta.json"
-                if meta_path.exists():
-                    try:
-                        runs.append(json.loads(meta_path.read_text(encoding="utf-8")))
-                        continue
-                    except Exception:
-                        pass
-                # Fallback: build from checkpoint
-                cp = load_checkpoint(d)
-                has_delivery = (d / "delivery.json").exists()
-                phase = cp.get("last_completed_phase", 0) if cp else 0
-                runs.append({
-                    "id": d.name,
-                    "title": cp.get("topic", d.name) if cp else d.name,
-                    "topic": cp.get("topic", d.name) if cp else d.name,
-                    "status": "completed" if has_delivery else "ongoing",
-                    "phase": max(0, phase - 1),
-                    "platforms": ["chatgpt", "gemini", "claude"],
-                    "documents": [], "audios": [],
-                    "createdAt": int(d.stat().st_ctime * 1000),
-                    "updatedAt": int(d.stat().st_mtime * 1000),
-                })
+                # ⛔ One row per folder through `_local_run_row`, whose fallback
+                # reads the run's state the way `get_run` does — it used to
+                # call a run "completed" as soon as delivery.json existed.
+                runs.append(_local_run_row(d))
         return runs
 
     @app.get("/api/runs/{run_id}")
@@ -76184,14 +76379,9 @@ async def run_server(port=8000):
         cp = load_checkpoint(queue)
         delivery_file = queue / "delivery.json"
         delivery = json.loads(delivery_file.read_text(encoding="utf-8")) if delivery_file.exists() else None
-        # Pipeline state: stopped is terminal, paused is resumable
-        pipeline_state = "running"
-        if (queue / ".stop").exists():
-            pipeline_state = "stopped"
-        elif (queue / ".pause").exists():
-            pipeline_state = "paused"
-        elif delivery and delivery.get("status") == "completed":
-            pipeline_state = "completed"
+        # Pipeline state: stopped is terminal, paused is resumable. The same
+        # reading the list uses — see `_local_run_state`.
+        pipeline_state = _local_run_state(queue, delivery)
         return {"meta": meta, "checkpoint": cp, "delivery": delivery, "pipeline_state": pipeline_state}
 
     # 2026-04-29: GET /api/runs/{id}/events + WS /ws/{run_id} +
@@ -76289,6 +76479,11 @@ async def run_server(port=8000):
         queue = queues_root / run_id
         if not queue.exists():
             return JSONResponse({"error": "not found"}, 404)
+        # ⛔ THE SAME DOOR AS THE TERMINAL'S `--resume` (wave 10.10): this
+        # enqueues a job with no account on it, so no lease keeps an incognito
+        # run's record alive while it runs. Refused with the same policy.
+        if _queue_dir_keeps_nothing(queue):
+            return JSONResponse({"error": _resume_refusal(queue, "here")}, 409)
         # Block resume of stopped (terminal) runs
         if (queue / ".stop").exists():
             return JSONResponse({"error": "Run was stopped (terminal). Cannot resume — start a new run."}, 409)
@@ -86379,9 +86574,15 @@ def run_doctor():
             if "Environment=" in _unit_content and "DISPLAY=" in _unit_content:
                 _ok("Unit has DISPLAY embedded", "reboot-safe")
             else:
+                # ⛔ THE BARE REMEDY, AND THE HINT IN THE WARNING (wave 10.10).
+                # `_dedupe_actions` compares whole strings, so the remedy with
+                # the hint glued on and the plain one `--serve not running`
+                # adds were two different steps — and Linux listed
+                # `--resurrect` twice in one summary.
                 _warn("Unit missing Environment=DISPLAY=...",
-                      "browser may fail post-reboot — re-run --resurrect")
-                manual_actions.append(_remedy_resurrect() + "  — run it from a graphical-session terminal")
+                      "browser may fail post-reboot — re-run --resurrect from a "
+                      "graphical-session terminal")
+                manual_actions.append(_remedy_resurrect())
         else:
             _warn("Unit file not installed", "supervisor disabled")
             manual_actions.append(_remedy_resurrect())
@@ -89178,6 +89379,30 @@ def _self_uninstall() -> int:
     return 1
 
 
+def _resume_refusal(resume_path, where: str = "from the terminal") -> "str | None":
+    """The one sentence a resume answers with for an incognito run's folder,
+    or None to go ahead. `where` names the door: the terminal, or the local
+    serve API's resume route.
+
+    ⛔⛔ A RESUME BY FOLDER CANNOT KEEP AN INCOGNITO RUN'S PROMISES (wave 10.10).
+    Its record is kept alive by the lease, and the lease renews only jobs that
+    carry their account — `--resume` runs outside `--serve` altogether, and the
+    serve API's resume enqueues a job with no account on it. A run resumed
+    either way could lose its record to its own fuse halfway through and then
+    write for hours into nothing. Boot recovery already ends such a run rather
+    than parking it for Resume (`_restart_recovery_patch`); both doors now
+    follow the same policy instead of running it."""
+    if _queue_dir_keeps_nothing(resume_path):
+        return (f"This is an incognito run, and an incognito run can't be "
+                f"resumed {where} — start a new research in the app instead.")
+    return None
+
+
+def _terminal_resume_refusal(resume_path) -> "str | None":
+    """`_resume_refusal` for the terminal's `--resume`."""
+    return _resume_refusal(resume_path)
+
+
 def main():
     # Before anything else can log: auth/, vision, selfheal and narrate all use
     # the standard library, and without this their WARNINGs go to bare stderr
@@ -89513,6 +89738,10 @@ def main():
         resume_path = Path(args.resume)
         if not resume_path.is_absolute():
             resume_path = Path(__file__).parent / "queues" / args.resume
+        _refusal = _terminal_resume_refusal(resume_path)
+        if _refusal:
+            print(f"  {_c(_ERR, '✗')}  {_refusal}")
+            sys.exit(1)
         log(f"Resuming from: {resume_path}")
         global _cli_mode
         _cli_mode = True

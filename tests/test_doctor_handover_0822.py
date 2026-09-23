@@ -125,3 +125,85 @@ def test_the_line_itself_still_names_both_routes():
     assert "Report Bug" in line
     assert 'add_argument("--send-logs"' in inspect.getsource(research), (
         "the line names a command that no longer exists")
+
+
+# ══ wave 10.10: the Linux page names each fix once ═════════════════════
+#
+# ⛔⛔ EXECUTED, NOT READ — the one doctor test in this file that runs the
+# doctor. Every probe it makes is faked at its seam (the platform, the
+# subprocess calls, the process list, the port), so the page is the real
+# `run_doctor` printing a real summary.
+#
+# WHAT WAS WRONG: on Linux, a supervisor unit missing DISPLAY added the
+# `--resurrect` remedy WITH a hint glued on, and `--serve not running` added the
+# plain one. `_dedupe_actions` compares whole strings, so both survived and the
+# summary told the reader to run `--resurrect` twice.
+
+def _linux_doctor(tmp_path, monkeypatch, capsys, *, unit_has_display, serving):
+    import contextlib
+    import subprocess
+    import types
+
+    unit = tmp_path / "dgresearch-supervisor.service"
+    unit.write_text("[Service]\n" + ("Environment=DISPLAY=:0\n" if unit_has_display else ""),
+                    encoding="utf-8")
+
+    def _run(argv, **_kw):
+        cmd = " ".join(str(a) for a in argv)
+        out = ""
+        if "sync_playwright" in cmd:
+            out = "OK"
+        elif "is-active" in cmd:
+            out = "active"
+        elif "show-environment" in cmd:
+            out = "DISPLAY=:0\n"
+        return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", _run)
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.setattr(research, "_supervisor_platform", lambda: "Linux")
+    monkeypatch.setattr(research, "load_paired_uid", lambda: "uid-1")
+    monkeypatch.setattr(research, "load_device_id", lambda: "dev-1")
+    monkeypatch.setattr(research, "_sync_spinner_ctx",
+                        lambda *a, **k: contextlib.nullcontext())
+    monkeypatch.setattr(research, "init_firebase", lambda: True)
+    monkeypatch.setattr(research, "_SUPERVISOR_UNIT_PATH", unit)
+    monkeypatch.setattr(research, "_check_linger_status", lambda: "yes")
+    monkeypatch.setattr(research, "_installed_supervisor_path", lambda: "")
+    monkeypatch.setattr(research, "_supervisor_path_value", lambda: "")
+    monkeypatch.setattr(research, "_search_path_findings",
+                        lambda **kw: {"rows": [], "actions": []})
+    monkeypatch.setattr(research, "_enumerate_research_py_procs",
+                        lambda: [(4242, "research.py --serve", "serve")] if serving else [])
+    monkeypatch.setattr(research, "_supervisor_evidence",
+                        lambda **kw: {"lines": [], "legacy": False})
+    monkeypatch.setattr(research, "_port_holders", lambda port: [])
+    monkeypatch.setattr(research.tm, "tm_emit", lambda *a, **k: None)
+    monkeypatch.setattr(research, "_detect_supervised", lambda: False)
+    capsys.readouterr()
+    research.run_doctor()
+    page = capsys.readouterr().out
+    assert "Manual steps still required" in page, page[-1500:]
+    steps = page[page.index("Manual steps still required"):]
+    return page, [ln for ln in steps.splitlines() if "--resurrect" in ln]
+
+
+def test_a_linux_page_names_resurrect_once_when_both_findings_ask_for_it(
+        tmp_path, monkeypatch, capsys):
+    """⛔⛔ THE DEFECT: both findings on one page, one remedy in the list."""
+    page, resurrects = _linux_doctor(tmp_path, monkeypatch, capsys,
+                                     unit_has_display=False, serving=False)
+    assert "Unit missing Environment=DISPLAY" in page
+    assert "--serve not running" in page
+    assert len(resurrects) == 1, f"--resurrect listed {len(resurrects)} times: {resurrects}"
+
+
+def test_the_graphical_session_hint_moved_into_the_warning(tmp_path, monkeypatch,
+                                                            capsys):
+    """⭐ The hint was worth keeping; it now rides the finding that needs it,
+    not the remedy that two findings share."""
+    page, resurrects = _linux_doctor(tmp_path, monkeypatch, capsys,
+                                     unit_has_display=False, serving=True)
+    warn = next(ln for ln in page.splitlines() if "Unit missing Environment=DISPLAY" in ln)
+    assert "graphical-session terminal" in warn
+    assert len(resurrects) == 1 and "graphical-session" not in resurrects[0]
