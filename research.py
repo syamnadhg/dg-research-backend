@@ -69850,7 +69850,11 @@ def _record_hand_off(queue_dir, research, phase3_began_ms) -> None:
     uid, rid = research
     handoff_ms = int(time.time() * 1000)
     handoff = {"beDone": True, "beDoneAt": handoff_ms}
-    row = _close_phase_three_on_disk(queue_dir, rid, phase3_began_ms, handoff_ms)
+    try:
+        row = _close_phase_three_on_disk(queue_dir, rid, phase3_began_ms, handoff_ms)
+    except Exception as e:
+        log(f"hand-off: could not close phase 3 in meta.json ({e})", "WARN")
+        row = None
     if row is None or not (_firebase_db and uid and rid):
         _update_research_doc(uid, rid, handoff)
         return
@@ -69887,8 +69891,13 @@ def _close_phase_three_on_disk(queue_dir, rid, began_ms, end_ms):
     ⛔ A ROW AN EARLIER ATTEMPT CLOSED IS REOPENED. A stop or a pause saves
     phase 3 closed at that moment; a resume that runs phase 3 again ends it
     HERE, and that is the span it ran. `_phase_rows` never rewrites a closed
-    row, which is right for a repeat save and wrong for this."""
-    if not isinstance(began_ms, int) or isinstance(began_ms, bool):
+    row, which is right for a repeat save and wrong for this.
+
+    ⭐ THE REFUSAL IS THE LAST CHECK, not the first: `_phase_rows` believes a
+    start only if it is an int between the run's start and the hand-off, and a
+    row whose start is not the one handed in is never written. The `None` test
+    below only spares the file a read on a run where phase 3 did not run."""
+    if began_ms is None:
         return None
     meta_path = Path(queue_dir) / "meta.json"
     with _meta_json_lock:
