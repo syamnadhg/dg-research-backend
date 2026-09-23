@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import re
 import time
 from typing import Any, Callable
 
@@ -157,6 +158,27 @@ def doc_id(name: str) -> str:
     return name.rsplit("/", 1)[-1]
 
 
+# ── a research that keeps nothing ───────────────────────────────────────────
+# ⛔⛔ THE ID IS THE SIGNAL, AND THIS PATTERN HAS FOUR OTHER COPIES. An incognito
+# research (wave 10.9) runs like any other paid run and leaves nothing in Super
+# Research once it ends. The web app mints its id as `incog_<13-digit ms>_<n>`,
+# and that id is the only thing that marks it: there is no field. The web app
+# (`src/lib/incognito.ts`), `firestore.rules`, `storage.rules` and the research
+# computer (`research.py`'s `_INCOGNITO_ID_RE`) all carry this exact pattern.
+# This package is published on its own and can import none of them, so
+# `tests/test_incognito_hidden_1010.py` holds this copy to research.py's.
+#
+# ⭐ WHOLE-STRING MATCH. `incog_notes`, `incog_1_1` and `xincog_…` are somebody's
+# ordinary research. It is `fullmatch`, not `match`, because Python's `$` also
+# matches before a trailing newline and the web's and the rules' `$` do not.
+_INCOGNITO_ID_RE = re.compile(r"^incog_[0-9]{13}_[0-9]{1,6}$")
+
+
+def is_incognito_research(research_id: Any) -> bool:
+    """True when this research id names a run that keeps nothing."""
+    return isinstance(research_id, str) and _INCOGNITO_ID_RE.fullmatch(research_id) is not None
+
+
 def pair_state_usable(d: dict[str, Any]) -> bool:
     """Would the web app's submit gate accept this machine? Mirrors
     ``isDeviceEligible`` (``device-order.ts``): ``!pairState || pairState ===
@@ -261,14 +283,26 @@ class FirestoreRest:
         a "most recent run" query over a name-ordered window would pick the wrong
         docs once the account has more than a page of researches. We order by
         createdAt desc to mirror the web app (firestore.ts orderBy createdAt desc).
+
+        ⛔⛔ AN INCOGNITO RESEARCH IS NEVER IN THIS LIST. It is dropped HERE, at the
+        one read every list goes through, so no route can forget it: `/researches`
+        (the run list), `/updates` (which `sr list`, `sr status` and the bare
+        `stop`/`pause`/`resume` read WITHOUT `via=agent`, so they saw every run),
+        and `/logs/runs`, where a held run of an incognito research keeps its row
+        and reads by its date, as the web app's `labelHeldRuns` does. The test is
+        on the document's PATH, never on a field, because the path is the one
+        signal the rules and the web app read too.
         """
         url = (f"{config.FIRESTORE_BASE}/users/{uid}/researches"
                f"?pageSize={page_size}&orderBy=createdAt%20desc")
         body = self._request("GET", url)
         out: list[dict[str, Any]] = []
         for d in body.get("documents", []):
+            rid = doc_id(d.get("name", ""))
+            if is_incognito_research(rid):
+                continue
             row = fields_to_dict(d)
-            row["id"] = doc_id(d.get("name", ""))
+            row["id"] = rid
             out.append(row)
         return out
 
