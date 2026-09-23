@@ -56676,7 +56676,11 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
     # (Step 1A FAIL, Step 1B FAIL, the outer except). A stale entry from a
     # PREVIOUS run would then be read as "the version that just failed" by the
     # step-back path and steer the retry off a number from another run.
+    # ⛔ The effort state too, for the same reason: it is written only at the
+    # end of Step 3, so a setup that returns early left the LAST run's tier in
+    # place, and the pre-send line and caption named a tier this run never read.
     _P2_PICKED_VERSION.pop("claude", None)
+    _P2_THINKING_STATE.pop("claude", None)
     try:
         await asyncio.sleep(2)
 
@@ -58102,10 +58106,13 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                             f"{_claude_effort!r} was NOT confirmed in the submenu "
                             f"— the run proceeds at whatever the model's default "
                             f"is, and reports it as unconfirmed", "WARN")
-                elif not _effort_confirmed:
+                elif not _effort_confirmed and not _eff_marked:
                     # ⚠ `_effort_confirmed`, not `_effort_already_known`: the row
                     # read above confirms without opening anything, and a WARN
                     # about a control we chose not to press would be false.
+                    # ⚠ And only when NO row was marked: a row that was found and
+                    # pressed without a submenu mounting has its own WARN above,
+                    # and "not found" after it is a wrong diagnosis.
                     log(f"[setup_claude_dr] Step 1C WARN: Effort control not found "
                         f"in the {_eff_mark.get('menus', 0)} open menu(s) (the popover "
                         f"closes when a model is picked — it should have been "
@@ -58349,21 +58356,16 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
         # ⭐ 2026-09-23 — AND WHICH TIER THE RUN IS ON, said in the log, in the
         # ledger below and, when it was read and is not the one wanted, on
         # Claude's tile. A Low run says Low. See `_claude_effort_report`.
+        # ⛔ NOT ON THE TILE FROM HERE. The computer-use pass that runs after
+        # this is told to set the tier, so a caption posted now said "Low — Max
+        # could not be set" for minutes after that pass had set Max. The caption
+        # goes up in `start_agent_no_gemini_wait`, once that pass has run and
+        # the model button has been read again.
         _effort_got = _claude_effort_in_effect(
             confirmed=_effort_confirmed, wanted=_claude_effort,
             row_shows=_eff_row_shows, pressed=_eff_option_pressed)
         _eff_report = _claude_effort_report(_claude_effort, _effort_got)
         log(f"[setup_claude_dr] {_eff_report['log']}", _eff_report["level"])
-        # Said ONCE, at the initial setup (the only call that passes
-        # `allow_probe`). The pre-send re-activation and the step-back run this
-        # function too, and the caption rides the tile's CURRENT status — sent
-        # seconds before the brief goes out it is noise, and the log says it anyway.
-        if _eff_report["notice"] and allow_probe:
-            try:
-                emit_event("agent_progress", phase=2, agent="claude", status="starting",
-                           progress=_eff_report["notice"])
-            except Exception:
-                pass
         _P2_THINKING_STATE["claude"] = {"effort": _effort_confirmed, "thinking": _thinking_confirmed,
                                         "effort_got": _effort_got}
         # ⭐⭐ 2026-08-06 — Claude's effort tier had NO entry in the run's DOM-intent
@@ -62474,6 +62476,20 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                     log(f"[{label}] Phoenix: {_eff_after['note']}", "INFO")
                 if _eff_after["missing"]:
                     _missing.append(_eff_after["missing"])
+                # ⭐ The tile caption goes up HERE, not in setup: the computer-use
+                # pass has now had its turn at the tier and the button has been
+                # read again, so "Low — Max could not be set" is still true when
+                # the person reads it. Only a tier that was READ
+                # (`_claude_effort_report` gives no caption for an unknown one).
+                _eff_caption = (_claude_effort_report(
+                    _pol.get("effort"), _tstate.get("effort_got"))["notice"]
+                    if _eff_after["missing"] else None)
+                if _eff_caption:
+                    try:
+                        emit_event("agent_progress", phase=2, agent="claude",
+                                   status="starting", progress=_eff_caption)
+                    except Exception:
+                        pass
             if _missing:
                 _ms = " + ".join(_missing)
                 # Telemetry only — deliberately NOT an _emit_model_drift_alert (see

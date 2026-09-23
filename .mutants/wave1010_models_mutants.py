@@ -274,12 +274,28 @@ MUTANTS = [
        '                "notice": None}',
        '                           f"be weaker than the run reports"),\n'
        '                "notice": "Claude could not confirm its effort"}')]),
-    # ── the consumer: setup_claude_dr ──────────────────────────────────────
+    # ── the consumer: the pre-send check in start_agent_no_gemini_wait ─────
+    # (repair 1: moved out of setup_claude_dr, which posted it BEFORE the
+    # computer-use pass that is told to set the tier, and never corrected it)
     ("E9", "under", "⛔ the consumer ignores the rule: the caption is never shown",
-     [('        if _eff_report["notice"] and allow_probe:', "        if False:")]),
-    ("E10", "over", "the caption is re-sent from every re-activation and step-back",
-     [('        if _eff_report["notice"] and allow_probe:',
-       '        if _eff_report["notice"]:')]),
+     [("                if _eff_caption:\n", "                if False:\n")]),
+    ("E10", "over", "⛔ the caption says Low after the computer-use pass set Max",
+     [('                    if _eff_after["missing"] else None)',
+       "                    if True else None)")]),
+    ("E18", "over", "⛔ the caption goes up in setup again, before the computer-use "
+     "pass is even asked to set the tier",
+     [('        _P2_THINKING_STATE["claude"] = {"effort": _effort_confirmed, '
+       '"thinking": _thinking_confirmed,',
+       '        if _eff_report["notice"] and allow_probe:\n'
+       '            emit_event("agent_progress", phase=2, agent="claude", '
+       'status="starting", progress=_eff_report["notice"])\n'
+       '        _P2_THINKING_STATE["claude"] = {"effort": _effort_confirmed, '
+       '"thinking": _thinking_confirmed,')]),
+    ("E19", "over", "⛔ the effort state outlives the setup that wrote it: a setup "
+     "that stops early names the LAST run's tier",
+     [('    _P2_PICKED_VERSION.pop("claude", None)\n'
+       '    _P2_THINKING_STATE.pop("claude", None)\n',
+       '    _P2_PICKED_VERSION.pop("claude", None)\n')]),
     ("E11", "over", "⛔ the press is not passed on, so a stale pre-press read is "
      "reported as the tier",
      [("row_shows=_eff_row_shows, pressed=_eff_option_pressed)",
@@ -378,9 +394,19 @@ MUTANTS = [
     ("R15", "over", "no wanted tier is 'confirmed' by an empty row",
      [('    return bool(w) and str(row_shows or "").strip().lower() == w',
        '    return str(row_shows or "").strip().lower() == w')]),
-    ("R16", "over", "a row-confirmed run still logs 'Effort control not found'",
-     [("                elif not _effort_confirmed:\n",
-       "                elif not _effort_already_known:\n")]),
+    # (repair 1: the old R16, `_effort_already_known` for `_effort_confirmed`,
+    # became equivalent once a marked row can never reach this line; re-aimed
+    # at the half that still decides — the trigger-confirmed run, never marked.)
+    ("R16", "over", "a trigger-confirmed run still logs 'Effort control not found'",
+     [("                elif not _effort_confirmed and not _eff_marked:\n",
+       "                elif not _eff_marked:\n")]),
+    ("R19", "over", "⛔ a row that was found and PRESSED is then reported as 'not "
+     "found' — the wrong diagnosis, one line after the right one",
+     [("                elif not _effort_confirmed and not _eff_marked:\n",
+       "                elif not _effort_confirmed:\n")]),
+    ("R20", "under", "a menu with no Effort row at all no longer says so",
+     [("                elif not _effort_confirmed and not _eff_marked:\n",
+       "                elif False:\n")]),
     ("R17", "under", "the click mark is left on the row nobody pressed",
      [("                    try:\n"
        "                        await page.evaluate(_SR_UNMARK_JS, {\"attr\": _SR_CLICK_MARK})\n"

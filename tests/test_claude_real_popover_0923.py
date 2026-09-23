@@ -483,6 +483,7 @@ def test_e2e_today_the_weekly_check_finds_5_5_is_the_newest(said):
     page = DomPage(_page())
     _run(page, allow_probe=True)
     assert _lines(said, "Step 1B*: opus 5.5 is already the highest offered (5.5)"), said["log"]
+    assert not _lines(said, "Effort control not found"), said["log"]
     assert not any(c in ("Opus 5.5", "Fable 5.1") for c in page.clicks), page.clicks
     assert research._P2_PICKED_VERSION.get("claude") == "5.5"
     assert research._P2_THINKING_STATE["claude"]["effort"] is True
@@ -510,15 +511,58 @@ def test_e2e_a_low_row_is_pressed_on_the_row_and_the_run_says_low(said):
     """The 09-20 account (Low), on today's markup. The press lands on the real
     row, not the sidebar button that precedes it. No submenu mounts (none was
     captured), the popover is not mistaken for one, the picker never runs
-    against it — and the run says Low in the log and on the tile."""
+    against it — and the run says Low in the log, and records it for the tile.
+
+    ⛔ NOT ON THE TILE YET. The computer-use pass that runs next is told to set
+    Max; a caption posted here said "Low — Max could not be set" for minutes
+    after that pass had set it. The caption is the pre-send check's (below).
+    ⛔ And no "Effort control not found" after the row WAS found and pressed."""
     page = DomPage(_page(trigger="Opus 5.5", effort="Low"))
     _run(page, allow_probe=True)
     assert page.presses == [EFFORT_ROW_ID], page.presses
     assert _lines(said, "no submenu mounted"), said["log"]
+    assert not _lines(said, "Effort control not found"), said["log"]
     assert not page.ran("isWanted"), "the picker searched the popover as a submenu"
     assert _lines(said, "effort in effect: 'low' — wanted 'max', which could not be set")
-    assert _captions(said) == ["Claude is researching at Low effort — Max could not be set"]
+    assert _captions(said) == []
     assert research._P2_THINKING_STATE["claude"]["effort"] is False
+    assert research._P2_THINKING_STATE["claude"]["effort_got"] == "low"
+
+
+def _without_effort_row(spec):
+    """The captured page with the Effort row taken out of the popover."""
+    def _prune(node):
+        node["kids"] = [k for k in node.get("kids", [])
+                        if k["attrs"].get("id") != EFFORT_ROW_ID]
+        for k in node["kids"]:
+            _prune(k)
+    _prune(spec)
+    assert _find(spec, lambda n: n["attrs"].get("id") == EFFORT_ROW_ID) is None
+    return spec
+
+
+def test_e2e_a_menu_with_no_effort_row_says_the_control_was_not_found(said):
+    """The other polarity: with no row to press, "not found" IS the diagnosis."""
+    page = DomPage(_without_effort_row(_page(trigger="Opus 5.5")))
+    _run(page, allow_probe=True)
+    assert page.presses == [], page.presses
+    assert _lines(said, "Effort control not found in the 1 open menu(s)"), said["log"]
+    assert not _lines(said, "no submenu mounted"), said["log"]
+
+
+def test_e2e_a_setup_that_stops_early_does_not_keep_the_last_runs_tier(said):
+    """⛔ The effort state is process-wide and written only at the end of setup.
+    Run 1 reads Low; run 2 stops at Step 1B. Before the fix run 2's pre-send
+    line said "effort is 'low'" — a tier run 2 never read."""
+    _run(DomPage(_page(trigger="Opus 5.5", effort="Low")), allow_probe=True)
+    assert research._P2_THINKING_STATE["claude"]["effort_got"] == "low"
+    assert _run(DomPage(_page()), step_below="5.5") is False
+    assert _lines(said, "Step 1B FAIL"), said["log"]
+    assert "claude" not in research._P2_THINKING_STATE
+    lines, captions = _run_telemetry(research._P2_THINKING_STATE.get("claude"),
+                                     {"effortOk": False}, with_captions=True)
+    assert [m for _, m in lines if "thinking config unconfirmed (max effort)" in m], lines
+    assert captions == []
 
 
 def _open_constructed_submenu(labels, *, checks=True):
@@ -606,15 +650,18 @@ def _telemetry_source() -> str:
     return "def __telemetry__(research_ok):\n" + textwrap.indent(block, "    ")
 
 
-def _run_telemetry(state, mode_state):
-    lines = []
+def _run_telemetry(state, mode_state, with_captions=False):
+    lines, events = [], []
     ns = dict(vars(research))
     ns.update({"platform_l": "claude", "label": "2B", "mode_state": mode_state,
                "_P2_THINKING_STATE": {"claude": state},
                "record_known_good": lambda *a, **k: None,
+               "emit_event": lambda *a, **k: events.append((a, k)),
                "log": lambda msg, level="INFO", *a, **k: lines.append((level, msg))})
     exec(compile(_telemetry_source(), "<telemetry>", "exec"), ns)
     ns["__telemetry__"](True)
+    if with_captions:
+        return lines, _captions({"events": events})
     return lines
 
 
@@ -631,6 +678,31 @@ def test_the_telemetry_line_rereads_the_button_after_the_computer_use_pass():
     assert not [m for _, m in lines if "thinking config unconfirmed" in m], lines
     assert [m for lv, m in lines
             if lv == "INFO" and "effort 'max' now shows on the model button" in m], lines
+
+
+def test_a_low_run_says_low_on_the_tile_once_the_computer_use_pass_has_run():
+    """⭐ The caption goes up at the pre-send check, after the computer-use pass
+    was told to set Max and the button was read again: still Low → it says so."""
+    _lines_, captions = _run_telemetry(
+        {"effort": False, "thinking": False, "effort_got": "low"},
+        {"effortOk": False}, with_captions=True)
+    assert captions == ["Claude is researching at Low effort — Max could not be set"]
+
+
+def test_no_low_caption_when_the_computer_use_pass_set_max():
+    """⛔ The defect: setup read Low, the computer-use pass then set Max, and the
+    tile kept saying Low and "Max could not be set" until the run was verified."""
+    _lines_, captions = _run_telemetry(
+        {"effort": False, "thinking": False, "effort_got": "low"},
+        {"effortOk": True}, with_captions=True)
+    assert captions == []
+
+
+def test_no_caption_for_a_tier_nobody_read():
+    _lines_, captions = _run_telemetry(
+        {"effort": False, "thinking": False, "effort_got": None},
+        {"effortOk": False}, with_captions=True)
+    assert captions == []
 
 
 def test_an_unknown_tier_is_still_worded_as_before():
