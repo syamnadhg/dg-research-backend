@@ -482,7 +482,8 @@ def test_drop_works_on_both_sides_and_still_belongs_to_skip():
 def test_link_can_pair_a_computer():
     """⛔ `link` sat in the act-verb list and in NO other, so `link my computer`
     reached the catch-all — which also meant its negation veto could never fire."""
-    assert "access code" in _r("link my computer")[1]
+    # ⚠ REPINNED 2026-09-22: the add intent now opens the device screen.
+    assert _r("link my computer")[0] == ["devices"]
 
 
 def test_phone_is_a_word_people_say_even_though_nothing_is_a_phone():
@@ -1297,8 +1298,16 @@ def test_the_new_early_returns_stopped_eating_their_neighbours(phrase, expected)
 def test_an_artefact_link_is_never_answered_with_pairing_instructions():
     """⛔ `link` joined the pairing words in the same wave that added the artefact
     LINK surface — 8 driven shapes answered with a pair code."""
-    assert "access code" not in _r("the brief link for my mac")[1]
-    assert "access code" in _r("link my computer")[1]
+    # ⛔⛔ STRENGTHENED, NOT JUST REPINNED. The first line used to say "the reply
+    # does not mention an access code". Once the add intent became a COMMAND
+    # (`devices`) instead of a sentence, that line would have stayed green even if
+    # "the brief link for my mac" were routed straight to the device screen — a
+    # guard enforcing nothing, which is the exact failure this repo has eaten
+    # before. It now forbids the intent itself.
+    argv, said = _r("the brief link for my mac")
+    assert argv != ["devices"], argv
+    assert "access code" not in said
+    assert _r("link my computer")[0] == ["devices"]
 
 
 def test_ask_the_owner_for_an_artefact_is_a_fetch():

@@ -53,8 +53,14 @@ def test_the_noun_list_is_the_one_the_guards_read():
 def test_the_add_guard_reaches_every_noun(noun):
     """MEASURED AT HEAD: "add my mac" and "connect my workstation" reached the
     catch-all, which then offered to "manage your devices"."""
+    # ⚠ REPINNED 2026-09-22 TO THE PROPERTY, NOT THE WORDING. The guard's subject
+    # was always "must not reach the catch-all" (see the docstring). It used the
+    # old answer's words — a one-line "paste the access code" — as its proxy, and
+    # that sentence was itself a defect: the ELEVENTH one-route deviceless line,
+    # no public computers, no walkthrough. The add intent now opens the one device
+    # screen, which is complete whether or not the account has a computer.
     argv, lines = sr._nl_resolve(f"add my {noun}")
-    assert argv is None and "access code" in lines[0], (noun, argv, lines)
+    assert argv == ["devices"], (noun, argv, lines)
 
 
 @pytest.mark.parametrize("noun", NOUNS)

@@ -39,13 +39,13 @@ nothing to mean the most-recent / active run.
 
 - **The `── for the assistant · do NOT relay to the user ──` marker.** The client
   sometimes prints this line. **Relay everything ABOVE it verbatim; everything
-  BELOW it is an instruction for YOU, not the user.** Act on it **silently** — e.g.
-  call your `cronjob` tool with the exact args shown — and **never** show it, quote
-  it, paste the `cronjob:` line, or announce it (don't say "arming the stream").
-  The user should see only the clean message above the marker, in **one** message —
-  do not send a second message reporting that you armed anything. If your runtime
-  has no matching tool, silently skip the block. This is the ONLY thing below the
-  marker; there is never user-facing text there.
+  BELOW it is an instruction for YOU, not the user** — a tool call to make (e.g.
+  your `cronjob` tool, exact args shown) or a rule for relaying the message above.
+  Act on it **silently**: **never** show it, quote it, paste the `cronjob:` line, or
+  announce it (don't say "arming the stream"). The user sees only the clean
+  message above it, in **one** message — no second message reporting what you armed.
+  No matching tool? Silently skip only that tool call — a relay rule below the marker still
+  binds. Nothing below the marker is ever user-facing text.
 
 - **Run the client; never improvise. HARD RULE — never improvise the research,
   ever.** A "research X" / "Super Research on X" / "deep dive on Y" request is
@@ -55,8 +55,8 @@ nothing to mean the most-recent / active run.
   research request is what the client prints — Super Research runs on the user's
   device, not in this chat. This holds in EVERY case: **working normally** (relay
   the run the client started) · **no device on the account** (`sr.py research`
-  does NOT fail silently — it returns the pair-a-device step; relay it and walk
-  them through pairing) · **the account HAS computers but none is the obvious one**
+  does NOT fail silently — it returns the no-computer screen; relay it as printed,
+  in one message) · **the account HAS computers but none is the obvious one**
   (several linked, none online/selected → the client returns a "which computer
   should run this?" list; relay it — the user replies "use <name>", which the
   client remembers — NEVER the pair/install step, they already have computers) ·
@@ -82,7 +82,7 @@ nothing to mean the most-recent / active run.
   not `login-done`. Those are how *you* drive the client; tell the user what to do
   in plain words. The only commands you ever surface are the unavoidable
   machine-setup ones the user runs on their **Research Computer**, and the device-add
-  form below — put those on their own line, in a fenced code block, never inline.
+  form below — each on its own line, never inline; lines the client printed, as printed.
 - **An access code is the user's to spend — handle it, never repeat it back.** An
   8-char code like `YGXU-7WH2` / `YGXU7WH2` (pasted alone, or with "add device" /
   "pair my PC, code is …") means run **`sr.py device-add <code>`** right away. It is
@@ -133,6 +133,7 @@ run `sr.py status-account`, then branch on what it reports:
 - **Bridge unreachable** → the **Setup** above (run `connect` yourself).
 - **Bridge up, not signed in** → welcome them; tell them to just say "log me in"
   and you'll send a sign-in link.
+- **Signed in, no computer yet** → relay its screen as printed; add nothing, invite no topic.
 - **Signed in** → greet them by their account email, tell them what they can do in
   plain words (research a topic · check / stop / resume a run · their researches +
   podcasts & links by name · devices · version / update), and invite them to just
@@ -171,7 +172,8 @@ back into `do`.
 | "retry", "try again" | `sr.py retry ["<title>"]` (a run BLOCKED on a decision/error — NOT the agent's own sign-in; for "I signed in" right after a sign-in link, see **After a sign-in link**). If the reply says the run has no Retry, relay that line — do NOT try `skip` instead. |
 | "continue" / "yes" / "done" / "I signed in" — **right after you sent a sign-in link** | see **After a sign-in link** (NOT `retry`) |
 | "skip it", "skip this step" / "skip the video and the report" / "skip Claude (in P2)", "drop ChatGPT from the research" | `sr.py skip [phases\|agents] [--run "<title>"]` — phases (brief/podcast/video/report) AND the P2 research agents (chatgpt/gemini/claude), same as the app's per-agent toggles |
-| an **8-char access code** ("7F4V-6W7D"), "add a device", "pair my PC, code is K7XQ-9B2M" | `sr.py device-add <code>` — see **Devices & Research Computers** |
+| an **8-char access code** ("7F4V-6W7D"), "pair my PC, code is K7XQ-9B2M" | `sr.py device-add <code>` — see **Devices & Research Computers** |
+| "add a device" — **no code in the message** | `sr.py devices` — relay it as printed (with no computer that IS the answer: access code, public computers, walkthrough). Never ask for the code yourself first |
 | "which devices?", "what am I running on?" | `sr.py devices` (the → marks the selected one) |
 | "switch to the office PC", "run it on my laptop" | `sr.py device-use "<name>"` |
 | "remove the old laptop", "unlink that device" | **confirm**, then `sr.py device-remove "<name>"` |
@@ -256,14 +258,14 @@ should I continue?"**. The moment the user replies **anything** ("done",
    consumes the same one-shot note the proactive announce would have carried. Four shapes:
    - "✓ Signed in … 🚀 Started '<topic>' on <computer>" — already running. Say so; start
      nothing.
-   - "✓ Signed in … '<topic>' has nowhere to run yet" — walk the pair-a-computer steps it
-     prints.
+   - "✓ Signed in … '<topic>' has nowhere to run yet" — relay the no-computer screen it
+     prints, as printed, in one message.
    - "✓ Signed in … which should run '<topic>'?" — **relay that question with the
      computer names** and wait for their pick; then `sr.py device-use "<name>"`.
    - "✓ Connected as <email>. Continuing your research on '<topic>'…" — the cue to act:
      go straight to step 2.
 2. If `login-done` named a **pending topic** with that last wording, immediately run
-   `sr.py research "<that topic>"` (this also surfaces the pair-a-device prompt if
+   `sr.py research "<that topic>"` (this also returns the no-computer screen if
    they have no device yet). Do NOT run `research` for the first three shapes — the
    bridge has already decided, and starting again would duplicate or override it.
 3. If there's no pending topic, greet them and invite a topic.
@@ -343,7 +345,7 @@ route. The one-line sign-in confirmation names both routes without a list, which
 deliberate: it must not make a second call to render one.
 
 A **Research Computer** is a computer running Super Research. **Any bare 8-char
-access code (e.g. `7F4V-6W7D`, dashes optional), or "add a device", means run
+access code (e.g. `7F4V-6W7D`, dashes optional) means run
 `sr.py device-add <code>`** — a Research Computer, **NOT** one of the user's
 phones, NOT the chat runtime, and NOT a Telegram / Discord / Slack pairing; never
 ask "which platform". First pair = they own it (auto-selects, so research can start
@@ -361,10 +363,10 @@ machines, the ones the user could ask to use. One letter apart, and picking the
 wrong one either shows a list nobody wanted or publishes a computer nobody meant
 to publish, so read the intent before choosing between them.
 
-If the user wants to add a Research Computer but hasn't given a code, ask them to **paste the
-access code** shown on the computer running Super Research (8 chars; accept it with
-or without dashes). If they have **no backend set up yet**, they set up a Research Computer
-with one line, then pair:
+If the user wants to add a Research Computer but hasn't given a code, run `sr.py devices`
+and relay it as printed — with no computer linked that IS the whole answer (access
+code, public computers, walkthrough); with one linked, it names the code route. Only
+if they explicitly ask how to set up a machine, show these one-liners:
 
 ```
 irm https://superresearch.io/install.ps1 | iex      # Windows

@@ -213,10 +213,14 @@ def test_code_regex_rejects_hyphenated_words_and_embedded_tokens():
     # Dashed alternative now requires a digit — ordinary hyphenated words
     # must not fire device-add.
     assert _argv("research real-time analytics") == ["research", "real-time analytics"]
-    note = _note("add my high-tech pc as a device")
-    assert "access code" in note.lower()
-    note2 = _note("pair my new device john-dell")
-    assert "access code" in note2.lower()
+    # ⚠ REPINNED 2026-09-22. What this protects is that `high-tech` and
+    # `john-dell` are NOT read as codes — i.e. never `device-add`. The old proxy
+    # was the no-code answer's wording; that answer is now the device screen, so
+    # the assertion names the intent directly and forbids the mis-read outright.
+    for phrase in ("add my high-tech pc as a device", "pair my new device john-dell"):
+        argv, _ = sr._nl_resolve(phrase)
+        assert argv == ["devices"], (phrase, argv)
+        assert argv[0] != "device-add", (phrase, argv)
     # A code-shaped token inside a sentence isn't a pairing request.
     assert _argv("research iphone17 pricing") == ["research", "iphone17 pricing"]
     assert _argv("research iphone17") == ["research", "iphone17"]

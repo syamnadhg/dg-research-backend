@@ -234,6 +234,84 @@ def _public_offer_lines() -> list[str]:
     return lines
 
 
+# ⭐⭐ THE RELAY RULE FOR THE NO-COMPUTER SCREEN, CARRIED IN BAND (owner,
+# 2026-09-21). Measured, not guessed: asked "Add device to my Super Research", the
+# chat ran `status-account` AND `devices`, both printed this screen exactly as
+# designed — state of play, "Add a computer:", the public computers as a named
+# section with its list, the walkthrough last — and the reply the person got
+# dropped the section heading, demoted the list to an "Alternatively…" aside,
+# led with `superresearch --pair` in a fenced block, and lost the walkthrough
+# link. The client was right; the relay was not.
+#
+# ⛔⛔ AND THAT FENCED BLOCK WAS NOT IMPROVISED — SKILL.md PRESCRIBED IT. Its
+# "wants to add a computer but hasn't given a code" recipe said to ask for the code
+# and then showed exactly that block, and its formatting rule said to fence every
+# setup command. An in-band rule fighting a written recipe is a coin toss, so the
+# recipe, the routing row that sent a no-code request to `device-add`, and the
+# fence rule were all rewritten in the same change (an earlier comment here called
+# the block "of its own invention"; a review of SKILL.md showed it was not).
+#
+# ⛔ IN BAND, BECAUSE PROSE ALREADY FAILED. SKILL.md says "relay verbatim" a
+# dozen times and it was not enough for the send-logs plan either; the two relay
+# rules in this skill that have held are both attached to the bytes they govern
+# (`_AGENT_ONLY_MARKER` blocks and the `MEDIA:` line). This screen had no anchor.
+#
+# ⛔ NAMES THE FAILURE SEEN, INCLUDING THE DUPLICATE: two commands printed the
+# same screen, and a model merging two copies is exactly where sections get
+# folded together.
+# ⛔ THE ORDER IS THE WHOLE MESSAGE'S, NOT JUST THE SCREEN'S. `status-account`
+# prints an update notice AFTER the walkthrough and the sign-in paths print a
+# signed-in line or a held-topic promise BEFORE it; a rule saying "walkthrough LAST"
+# would have told a literal-minded model to drop or move the update line, and a
+# merge of two copies could shed the held-topic promise. Both are named.
+_EMPTY_STATE_RELAY = (
+    "⛔ Relay the screen above as ONE message, exactly as printed and in its "
+    "order: any line before it (who is signed in, a held topic) first, then "
+    "whether this account has a computer, “Add a computer:”, the "
+    f"“{_PUBLIC_HEAD}” section with every row, then the install "
+    "walkthrough, then any line after it (an update notice) as printed. Keep "
+    "every heading and the walkthrough link; keep the install lines where and how "
+    "they are printed, never in a code block of your own. Do NOT lead with "
+    "`superresearch --pair`, and do NOT turn the public computers into an "
+    "“Alternatively…” line or any other aside. If more than one command "
+    "printed this screen, relay it once, keeping every line any copy printed.")
+
+
+# ⭐ ONE SENTENCE, TWO SCREENS. The empty state renders it second; the populated
+# device list renders it because a no-code "add a device" now lands there too, and
+# a list that only says you MAY add one names no route.
+# ⛔ NEVER A SECOND WORDING — retyping this is the drift the shared empty state was
+# written to end; a test counts the literal.
+_ADD_WITH_CODE = ("Add a computer: paste the access code from any computer "
+                  "running Super Research — your own, or one whose owner hands "
+                  "you the code — and I’ll connect it.")
+
+
+def _with_empty_state_relay(lines: "list[str]") -> "list[str]":
+    """Close a message that ENDS with the no-computer screen with its relay rule.
+
+    ⛔⛔ ONLY AT A TERMINAL EMIT SITE, NEVER INSIDE THE SHARED RENDERER.
+    Everything below `_AGENT_ONLY_MARKER` is hidden from the person, so the block
+    has to be the LAST thing in the message. Two of the renderer's callers return
+    it as a fragment that other code extends — `_pick_device_lines` (send-logs
+    then adds its own sentence about the agent's log) and the sign-in note — and
+    a directive baked into the renderer would silently swallow whatever they
+    append. So each message that ENDS here attaches it itself: `devices`,
+    `status-account` and `research` on an empty account, `login-done` when the
+    sign-in note says there is nowhere to run, and every device command whose
+    name lookup found no computer at all (via `_resolve_device_arg`).
+
+    ⚠ KNOWN UNCOVERED, DELIBERATELY: `send-logs` with no computer renders the
+    screen through `_pick_device_lines` and then appends its own agent-log offer,
+    and `research`'s which-computer fallback reaches it only when a re-fetched
+    device list comes back empty. Neither is a whole-message tail today.
+
+    ⛔ NOT ON THE WATCHDOG'S LINE OR THE TERMINAL. The watchdog runs `no_agent`,
+    so nothing relays it; the terminal prints straight to a person.
+    """
+    return [*lines, *_agent_directive_block([_EMPTY_STATE_RELAY])]
+
+
 def _no_device_lines(lead: str | None = None) -> list[str]:
     """THE empty state. Every screen that tells somebody this account has no
     research computer renders it through here.
@@ -270,9 +348,7 @@ def _no_device_lines(lead: str | None = None) -> list[str]:
     # was rewritten for was that the public half had no NOUN — it read as the tail
     # of a sentence, so a relay folded it into the option above it and the list
     # left the message. The names fix that; the numbers were never load-bearing.
-    lines.append("Add a computer: paste the access code from any computer "
-                 "running Super Research — your own, or one whose owner hands "
-                 "you the code — and I’ll connect it.")
+    lines.append(_ADD_WITH_CODE)
     lines.append("")
     pub = _public_offer_lines()
     if pub:
@@ -575,7 +651,10 @@ def _resolve_device_arg(arg: str) -> tuple[dict | None, list[str]]:
         return None, [f"✗ {body.get('error', code)}"]
     devices = body.get("devices", [])
     if not devices:
-        return None, _no_device_lines()
+        # ⛔ WRAPPED HERE, AT THE SOURCE, because every caller emits these lines
+        # as its whole message (device-use, device-remove, device-visibility) or
+        # last (send-logs' `_say`) — so the relay rule is still the final block.
+        return None, _with_empty_state_relay(_no_device_lines())
     # ⛔ THE QUOTES COME OFF. The picker this client prints ends with
     # 'Just say: use “<name>”.', so the reply people are TOLD to send arrives
     # wrapped — and a quoted name matched nothing here, name or substring, so
@@ -1066,7 +1145,15 @@ def cmd_login_wait(args) -> int:
                                        or note.get("needsDeviceChoice")):
             # A bridge-decided outcome: relay it in the note's own words. `body` still
             # rides along so `--json` keeps every field the note carried.
-            return _emit({**body, "signedIn": note}, args.json, _signed_in_lines(note))
+            said = _signed_in_lines(note)
+            # ⛔⛔ THE USUAL FIRST-TIME PATH: signed out, asks for research, signs
+            # in, has no computer. The note's lines then END on the no-computer
+            # screen and are this message's whole body, so they carry its relay
+            # rule — the review that found this called it the likeliest place a
+            # new person meets the screen at all.
+            if note.get("needsDevice"):
+                said = _with_empty_state_relay(said)
+            return _emit({**body, "signedIn": note}, args.json, said)
         # ⛔⛔ AND THE TOPIC MUST BE READ BACK OFF THE NOTE, WHICH IS THE DEFECT THE
         # FIRST VERSION OF THIS GATE INTRODUCED. The note's FOURTH shape — a topic and
         # none of the three flags — is minted by `_autostart_worker` when its Firestore
@@ -1144,9 +1231,13 @@ def cmd_status_account(args) -> int:
     code, body = _get("/status")
     if code != 200:
         return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
+    # ⛔ Remembered, not re-derived at the end: `_has_device()` is a network
+    # read, and asking it twice could answer differently the second time.
+    empty = False
     if body.get("authed"):
         lines = [f"✓ Signed in as {body.get('email') or body.get('uid')}"]
         if not _has_device():
+            empty = True
             lines += _no_device_lines()
     elif body.get("remoteLogin") == "pending":
         # A sign-in is mid-flight: approve it in the browser and the bridge
@@ -1157,6 +1248,10 @@ def cmd_status_account(args) -> int:
     else:
         lines = ["Not signed in — tell me to log you in and I'll send a link."]
     lines += _update_notices(body)
+    # ⛔ THE UPDATE NOTICE IS FOR THE PERSON, so the relay rule goes AFTER it —
+    # attached before, the marker would hide "a new version is available".
+    if empty:
+        lines = _with_empty_state_relay(lines)
     return _emit(body, args.json, lines)
 
 
@@ -1173,7 +1268,7 @@ def cmd_devices(args) -> int:
     devices = body.get("devices", [])
     selected = body.get("selectedDeviceId")
     if not devices:
-        return _emit(body, args.json, _no_device_lines())
+        return _emit(body, args.json, _with_empty_state_relay(_no_device_lines()))
     lines = ["Devices:"]
     for d in devices:
         mark = "→" if d.get("selected") else " "
@@ -1198,7 +1293,15 @@ def cmd_devices(args) -> int:
         lines.append(f"  {mark} {_dev_label(d)}  ({kind}{state})")
     if not selected:
         lines.append("Tell me which one you’d like to use.")
-    lines.append("You can add, remove, or switch devices anytime — just ask.")
+    # ⛔⛔ A NO-CODE "add a device" NOW LANDS HERE TOO, so this branch has to
+    # answer it. It used to close on a capability claim — "you can add, remove, or
+    # switch devices anytime — just ask" — which, to somebody who just asked HOW
+    # to add one, restates the question. The route is the access code; the tail
+    # keeps the two verbs that route does not cover.
+    # ⛔ NOT the public list here: this is also what "which devices?" runs, and
+    # the public list is a second network call on every one of those.
+    lines.append(_ADD_WITH_CODE)
+    lines.append("You can remove or switch computers anytime — just ask.")
     return _emit(body, args.json, lines)
 
 
@@ -2441,7 +2544,8 @@ def cmd_research(args) -> int:
             lead = (f"“{args.topic}” has nowhere to run yet — I’ll hold it and "
                     "start it as soon as you have a computer."
                     if origin else None)
-            return _emit(body, args.json, _no_device_lines(lead), _fail_code(code))
+            return _emit(body, args.json, _with_empty_state_relay(_no_device_lines(lead)),
+                         _fail_code(code))
         if reason in ("no_selection", "stale_selection", "selection_not_ready"):
             return _emit(body, args.json, _pick_device_lines(body, reason), _fail_code(code))
         return _emit(body, args.json, [f"✗ couldn't start: {body.get('error', code)}"], _fail_code(code))
@@ -5356,8 +5460,17 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
             (re.search(rf"\b(add|pair|connect)\b.*\b({_MACHINE_NOUNS_SAID})\b", low)
              or re.match(rf"{_NL_LEAD_IN}link\b.*\b({_MACHINE_NOUNS_SAID})\b", low))
             or re.search(r"\bpair (my|a|the|this)\b", low)):
-        return None, ["Paste the access code shown on the computer running Super "
-                      "Research (8 characters — dashes optional) and I’ll add it."]
+        # ⛔⛔ THIS WAS THE ELEVENTH DEVICELESS SENTENCE, and it survived the wave
+        # that abolished the other ten: one way out (paste a code), no word on
+        # whether the account HAS a computer, no public list, no walkthrough. The
+        # cull matched the old copies by wording, and this wording was not on the
+        # list; the renderer-call guard counts CALLS, and this door made none.
+        # ⭐ NOT A NEW SCREEN. `devices` renders the empty state on an empty
+        # account and the code route on a populated one — the same move rule 6b
+        # already made for "I don't have a computer".
+        # ⛔ A MESSAGE CARRYING A CODE NEVER REACHES HERE: rule 1 returned
+        # ["device-add", tok] above, before the `public` guard and this branch.
+        return ["devices"], None
 
     # 1b. ⛔⛤ "help" AND "what can you do?" REACHED THE CATCH-ALL, whose line opens
     #     "I didn't catch a Super Research request in that." The list that follows
