@@ -16518,6 +16518,191 @@ def _safe_enqueue(job_queue, job, source: str,
         return False
 
 
+def _snapshot_job_view(job):
+    """What the queue snapshot on disk may hold about the job a worker is
+    RUNNING right now.
+
+    ⛔⛔ THE CLAIMED JOB WAS WRITTEN OUT WHOLE (wave 10.9, #536) — the topic,
+    the person's email address and their entire brief, in plaintext, at the ROOT
+    of `queues/`, on a computer they may not own. The purge that takes a run
+    that keeps nothing off this disk reaches `queues/<run>/` and the log
+    folders, never this file; "clear local storage" keeps the top-level files on
+    purpose; and on a crash nothing rewrites it — the next boot ends the run,
+    the enqueue funnel refuses a stopped one, and the snapshot sat there with
+    all three until some unrelated later job happened to be claimed. Same class
+    as the run id, the log lines and the log folder name, reached through a file
+    none of those looked at.
+
+    ⭐ WHAT THE BOOT PATH ACTUALLY USES IS THE IDS. `research_id` dedupes
+    against what Firestore rehydration already touched and reads the record's
+    status, `uid` says whose tree that is, and `run_id` is how the `.stop`
+    sentinel is found — the mint already keeps the topic out of that name. None
+    of it is anybody's content, and a run that keeps nothing is never restored
+    from this file anyway, so the work it described was dead weight only a disk
+    could leak.
+
+    ⛔ A JOB STILL WAITING ITS TURN IS LEFT WHOLE, deliberately. The claim
+    DELETES the run's queue document from Firestore, so for a job that has been
+    claimed but not yet started this snapshot is the only description of the
+    work that exists; redacting it would silently lose a run somebody paid for
+    and is watching. Its content lives exactly as long as the wait — the claim
+    replaces it with the view above, and the run's own purge takes the rest."""
+    rid = (job or {}).get("research_id")
+    if not _is_incognito_research(rid):
+        return job
+    return {
+        "uid": (job or {}).get("uid"),
+        "research_id": rid,
+        "run_id": (job or {}).get("run_id"),
+    }
+
+
+def _write_pending_queue_snapshot(path, current_job, pending_jobs) -> None:
+    """THE one writer of `queues/_pending_queue*.json`, so the view above cannot
+    be forgotten by a caller.
+
+    2026-05-11: atomic write — write to tmp, then os.replace (atomic on POSIX
+    and Windows same-volume). Protects against the Q7 watchdog path where
+    `_schedule_server_exit`'s timer can race `os._exit(0)` past a slow
+    in-progress write, leaving the snapshot truncated. On respawn a truncated
+    file fails json.loads and disk-restore silently skips, losing pending
+    in-memory jobs not yet visible in Firestore."""
+    payload = {
+        "ts_ms": int(time.time() * 1000),
+        "current": _snapshot_job_view(current_job),
+        "pending": list(pending_jobs or []),
+        # ⛔ A "gate" SUB-OBJECT LIVED HERE (wave 10.9, N8). It carried the
+        # previous run's uid/rid/finish-time across a restart so the queue gate
+        # could resume waiting on that run's cloud tail — which is how a wait
+        # for somebody else's run survived a reboot. The gate is gone; a
+        # snapshot written by an older build still carries the key and is
+        # simply ignored on read.
+    }
+    tmp_path = Path(path).with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    os.replace(str(tmp_path), str(path))
+
+
+def _forget_pending_queue_snapshot(path, job_queue) -> None:
+    """Rewrite the boot snapshot from what is really in the queue now — or take
+    the file away when nothing is left.
+
+    ⛔⛔ THE BOOT PATH USED TO READ THIS FILE AND NEVER WRITE IT, and that is the
+    half that made a crash permanent: the run was ended, its entry could never
+    be enqueued again, and the entry stayed. Called when the snapshot held a run
+    that keeps nothing, so that a crash-then-boot for one of those leaves
+    nothing of it behind — not the entry, and not the file if it was the only
+    thing in it. Jobs that really did restore are in the queue and are written
+    back; refused ones are dropped, which is exactly what the next worker
+    boundary would have done with them anyway.
+
+    ⛔⛔ IT WRITES AROUND WHATEVER IS RUNNING NOW, and does not assert that
+    nothing is. The worker task is created BEFORE boot reaches the disk
+    snapshot, and boot awaits Firestore on the way here, so a job rehydration
+    auto-resumed can be claimed while this is still running. Forcing `current`
+    to None would then erase the only crash record of a run that had just
+    started — a boot tidying one run's leftovers taking the next run's safety
+    net with it."""
+    current = _QUEUE_STATE.get("current_job")
+    try:
+        live = list(job_queue._queue)
+    except Exception:
+        live = []
+    try:
+        if live or current:
+            _write_pending_queue_snapshot(path, current, live)
+        else:
+            Path(path).unlink(missing_ok=True)
+    except Exception as e:
+        log(f"[pending_queue] could not clear the boot snapshot: {e}", "WARN")
+
+
+def _restore_pending_queue_snapshot(path, job_queue, already_rids) -> "tuple[int, int]":
+    """Boot's disk fallback (Phoenix T3): re-offer the jobs a crash left behind.
+
+    Firestore-driven rehydration is the source of truth, but a research that
+    hadn't yet reached `status=queued` (e.g. it crashed in the put_nowait →
+    Firestore-write window) never appears there — the disk snapshot covers that
+    gap. Dedupe by research_id so nothing Firestore already restored is
+    double-enqueued, including ongoing runs that got marked
+    paused_backend_restart and must not silently re-launch from a stale
+    snapshot. Returns (restored, skipped).
+
+    ⛔⛔ A RUN THAT KEEPS NOTHING IS NOT RESTORED FROM HERE, AND ITS ENTRY DOES
+    NOT STAY (wave 10.9, #536). Boot recovery has just ended that run — there is
+    no chat to reopen, no Resume anybody can press, and `_safe_enqueue` refuses
+    a stopped run — so re-offering it could only start a run nobody is waiting
+    for, on the browser profiles of a machine whose owner was told a run
+    happened and nothing more. Its snapshot entry is therefore dropped rather
+    than handed on, and the file is rewritten so the crash leaves nothing.
+
+    ⭐ EXTRACTED FROM `run_server`'s boot block, which is a closure and cannot be
+    called from a test. Everything it touches is a parameter, so the pin runs
+    the real thing against a real file."""
+    path = Path(path)
+    if not path.exists():
+        return (0, 0)
+    snap = json.loads(path.read_text(encoding="utf-8"))
+    # Seed dedupe with anything Firestore-rehydration touched (ongoing-status
+    # only — queued docs are handled by the listener, not rehydration), then
+    # add what is currently in the in-memory queue (auto-resumed supervised
+    # runs).
+    already = set(already_rids or ())
+    try:
+        for q in list(job_queue._queue):
+            rid = (q or {}).get("research_id") or ""
+            if rid:
+                already.add(rid)
+    except Exception:
+        pass
+    cur = snap.get("current") or None
+    cur_rid = (cur or {}).get("research_id") or ""
+    pending = list(snap.get("pending") or [])
+    held_a_run_that_keeps_nothing = bool(_is_incognito_research(cur_rid)) or any(
+        _is_incognito_research((j or {}).get("research_id")) for j in pending)
+    # Restore current_job FIRST if it was mid-flight (so it resumes ahead of
+    # pending). Then the rest of pending in original order.
+    disk_jobs = []
+    if _is_incognito_research(cur_rid):
+        log(f"[pending_queue] {cur_rid[:24]}… keeps nothing — the run this "
+            f"snapshot was executing is ended by boot recovery, not restored",
+            "INFO")
+    elif cur and cur_rid not in already:
+        disk_jobs.append(cur)
+    for j in pending:
+        rid = (j or {}).get("research_id") or ""
+        if rid and rid in already:
+            continue
+        disk_jobs.append(j)
+    # Funnel each disk-restored job through _safe_enqueue (Q7) — it does the
+    # same Firestore existence check the Q1 inline loop did, plus a status
+    # whitelist. Fail-closed posture is preserved (the helper skips on
+    # missing/error/no-firebase rather than re-fire). The skipped-count is
+    # rolled up; per-job reasons are in the helper's own logs.
+    # #728: TIGHTER whitelist for the boot disk-restore — ("queued","ongoing")
+    # EXCLUDING paused_backend_restart. A run worker-1's rehydration just marked
+    # paused_backend_restart is intentionally awaiting a user Resume;
+    # auto-relaunching it from a stale per-worker disk snapshot would
+    # double-handle it (and on a sibling worker whose `_rehydrated_rids` never
+    # saw it, this is the only cross-worker guard). Genuinely-ongoing runs still
+    # restore.
+    restored = 0
+    skipped = 0
+    for j in disk_jobs:
+        if _safe_enqueue(job_queue, j, source="disk-restore",
+                         allowed_statuses=("queued", "ongoing")):
+            restored += 1
+        else:
+            skipped += 1
+    if restored or skipped:
+        log(f"[pending_queue] Disk snapshot processed: restored={restored}, skipped={skipped}")
+    else:
+        log("[pending_queue] Disk snapshot empty — nothing to restore")
+    if held_a_run_that_keeps_nothing:
+        _forget_pending_queue_snapshot(path, job_queue)
+    return (restored, skipped)
+
+
 def _crun_delete_field():
     """Firestore's DELETE_FIELD sentinel, imported lazily.
 
@@ -68164,6 +68349,41 @@ def _claim_is_handed_off(claimed_run_id) -> bool:
     return _handed_off_to_cloud(_run_dir_inside_queues(claimed_run_id))
 
 
+def _recovery_sees_handoff(research_id, data) -> bool:
+    """Has this run already been handed off to the cloud, as far as a RECOVERY
+    path can tell?
+
+    ⛔⛔ THE DISK PROOF IS DELETED FOR A RUN THAT KEEPS NOTHING (wave 10.9,
+    #536). `_claim_is_handed_off` asks the run's own `delivery.json`, and for an
+    incognito run `_purge_incognito_run_dirs` removes that directory in the same
+    breath as the hand-off — while the encode, the upload, the Doc and THE EMAIL
+    are still minutes of cloud tail away. So both recovery paths answered "never
+    handed off" for the one run type that has no other way back: the rehydrate
+    branch stamped it `stopped`, `_safe_enqueue` refuses a stopped run for ever,
+    and where the original kick had not landed (no token, a dead socket, a 5xx)
+    nobody ever ran phases 4 and 5 — the person paid, the chat said the run
+    ended, and the report they were promised by email was never sent.
+
+    ⭐ THE RECORD CARRIES THE ANSWER AND IS WRITTEN BEFORE THE PURGE. `beDone`
+    lands on the document AT the hand-off (contract rule 1), one line after
+    `delivery.json` is told the same thing. A path that believes the record
+    re-fires the kick and leaves the status alone — which a run that keeps
+    nothing needs MORE than an ordinary one, because it has no chat to reopen
+    and no Resume card anybody could press.
+
+    ⛔ THE DISK STAYS THE ANSWER FOR AN ORDINARY RUN, deliberately. `beDone` is
+    never cleared, and an ordinary run can go round again — a Resume or a Retry
+    puts it back to "ongoing" with the previous pass's marker still on the
+    document, and a restart during THAT pass must still park it for the Resume
+    its checkpoint supports. An incognito run has no second pass to be confused
+    with: the first restart ends it and no enqueue path will take it again."""
+    if _claim_is_handed_off((data or {}).get("backendRunId")):
+        return True
+    if _is_incognito_research(research_id):
+        return bool((data or {}).get("beDone"))
+    return False
+
+
 def detect_resume_phase(queue_dir):
     """Detect which phase to resume from based on existing output files.
     Returns (phase_number, description). 5-phase BE model (0-4) plus
@@ -73770,7 +73990,13 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
                 # machine re-fires the kick it already owns. The route is
                 # idempotent through its own claim (it answers 202 while one is
                 # fresh), and this machine is the only party awake.
-                if _claim_is_handed_off(data.get("backendRunId")):
+                #
+                # ⛔⛔ AND THE QUESTION IS ASKED OF THE RECORD, NOT ONLY THE DISK
+                # (wave 10.9, #536). A run that keeps nothing has had its folder
+                # deleted at the hand-off, so `delivery.json` — the disk half of
+                # this answer — cannot exist for exactly the run that most needs
+                # the re-kick. See `_recovery_sees_handoff`.
+                if _recovery_sees_handoff(research_id, data):
                     log(f"[rehydrate] {research_id[:24]}… was handed off to the cloud "
                         f"before this restart — re-firing the kick, leaving status alone",
                         "INFO")
@@ -74023,7 +74249,10 @@ async def _reconcile_dead_worker_runs(tree_uid: str, dead_ids: "set[int]") -> in
         # `_claim_is_handed_off`, which is also what the boot rehydrate and the
         # resume path ask (wave 10.9, 542-4); this branch used to be the only
         # place in the file that got the meaning right, in a private copy.
-        if _claim_is_handed_off(data.get("backendRunId")):
+        # ⛔⛔ AND THE RECORD IS ASKED TOO — a run that keeps nothing no longer
+        # has the directory that file lives in (see `_recovery_sees_handoff`),
+        # so the disk alone said "not handed off" for every one of them.
+        if _recovery_sees_handoff(research_id, data):
             continue
         # ⛔ THE SAME PATCH AS BOOT RECOVERY'S — see `_restart_recovery_patch`.
         # A run whose worker died is recovered the same way whether the whole
@@ -75235,37 +75464,19 @@ async def run_server(port=8000):
         research's Firestore doc so the FE recovery banner surfaces. The
         Phoenix auto-restore path on respawn relies on this snapshot — if
         it didn't write, there's nothing to restore from, and the run
-        would otherwise be silently lost on BE restart."""
+        would otherwise be silently lost on BE restart.
+
+        ⛔ WHAT MAY BE WRITTEN ABOUT THE RUNNING JOB IS `_snapshot_job_view`'s
+        business, not this closure's: the claimed job used to go to disk whole,
+        topic, address and brief, in a file the purge never reaches."""
         try:
             queues_root.mkdir(parents=True, exist_ok=True)
             try:
                 pending = list(_job_queue._queue)
             except Exception:
                 pending = []
-            payload = {
-                "ts_ms": int(time.time() * 1000),
-                "current": current_job,
-                "pending": pending,
-                # ⛔ A "gate" SUB-OBJECT LIVED HERE (wave 10.9, N8). It carried
-                # the previous run's uid/rid/finish-time across a restart so the
-                # queue gate could resume waiting on that run's cloud tail —
-                # which is how a wait for somebody else's run survived a reboot.
-                # The gate is gone; a snapshot written by an older build still
-                # carries the key and is simply ignored on read.
-            }
-            # 2026-05-11: atomic write — write to tmp, then os.replace
-            # (atomic on POSIX and Windows same-volume). Protects against
-            # the Q7 watchdog path where _schedule_server_exit's 3s timer
-            # can race os._exit(0) past a slow in-progress write_text(),
-            # leaving _pending_queue.json truncated. On respawn the
-            # truncated file fails json.loads and disk-restore silently
-            # skips, losing the gate state for the very FIRST post-restart
-            # dequeue (the case the boot-race fix already mitigates, but
-            # the truncated-file mode would also lose pending in-memory
-            # jobs not yet visible in Firestore).
-            _tmp_path = _pending_queue_path.with_suffix(".json.tmp")
-            _tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            os.replace(str(_tmp_path), str(_pending_queue_path))
+            _write_pending_queue_snapshot(
+                _pending_queue_path, current_job, pending)
             return True
         except Exception as e:
             log(f"[pending_queue] persist failed: {e}", "WARN")
@@ -76622,69 +76833,16 @@ async def run_server(port=8000):
                 log(f"Queue rehydration failed: {e}", "WARN")
 
         # ── pending_queue.json restoration (Phoenix T3 fallback) ──────────
-        # Firestore-driven rehydration above is the source of truth, but a
-        # research that hadn't yet reached `status=queued` (e.g. crashed in
-        # the put_nowait → Firestore-write window) won't appear there. The
-        # disk snapshot covers that gap. Dedupe by research_id so we don't
-        # double-enqueue something Firestore already restored — including
-        # ongoing runs that got marked paused_backend_restart and shouldn't
-        # silently re-launch from a stale disk snapshot.
+        # ⛔ The snapshot's "gate" sub-object was read back here so the queue
+        # gate could resume waiting on the previous run's cloud tail across a
+        # restart (wave 10.9, N8). A snapshot written by an older build still
+        # carries the key; nothing reads it.
+        # The decision — who is re-offered, who is dropped and what the file is
+        # left holding — is `_restore_pending_queue_snapshot`, which a test can
+        # run against a real file. This block is the boot's own state.
         try:
-            if _pending_queue_path.exists():
-                snap = json.loads(_pending_queue_path.read_text(encoding="utf-8"))
-                # ⛔ The snapshot's "gate" sub-object was read back here so the
-                # queue gate could resume waiting on the previous run's cloud
-                # tail across a restart (wave 10.9, N8). A snapshot written by
-                # an older build still carries the key; nothing reads it.
-                # Seed dedupe with anything Firestore-rehydration touched
-                # (ongoing-status only — queued docs are handled by the
-                # listener, not rehydration), then add what's currently
-                # in the in-memory queue (auto-resumed supervised runs).
-                already = set(_rehydrated_rids)
-                try:
-                    for q in list(_job_queue._queue):
-                        rid = (q or {}).get("research_id") or ""
-                        if rid:
-                            already.add(rid)
-                except Exception:
-                    pass
-                # Restore current_job FIRST if it was mid-flight (so it
-                # resumes ahead of pending). Then the rest of pending in
-                # original order.
-                cur = snap.get("current") or None
-                disk_jobs = []
-                if cur and (cur.get("research_id") or "") not in already:
-                    disk_jobs.append(cur)
-                for j in (snap.get("pending") or []):
-                    rid = (j or {}).get("research_id") or ""
-                    if rid and rid in already:
-                        continue
-                    disk_jobs.append(j)
-                # Funnel each disk-restored job through _safe_enqueue
-                # (Q7) — it does the same Firestore existence check the
-                # Q1 inline loop did, plus a status-whitelist. Fail-closed
-                # posture is preserved (helper skips on missing/error/no-firebase
-                # rather than re-fire). The skipped-count is rolled up;
-                # per-job reasons are in the helper's own logs.
-                # #728: TIGHTER whitelist for the boot disk-restore —
-                # ("queued","ongoing") EXCLUDING paused_backend_restart. A run
-                # worker-1's rehydration just marked paused_backend_restart is
-                # intentionally awaiting a user Resume; auto-relaunching it from a
-                # stale per-worker disk snapshot would double-handle it (and on a
-                # sibling worker whose `_rehydrated_rids` never saw it, this is the
-                # only cross-worker guard). Genuinely-ongoing runs still restore.
-                restored = 0
-                skipped = 0
-                for j in disk_jobs:
-                    if _safe_enqueue(_job_queue, j, source="disk-restore",
-                                     allowed_statuses=("queued", "ongoing")):
-                        restored += 1
-                    else:
-                        skipped += 1
-                if restored or skipped:
-                    log(f"[pending_queue] Disk snapshot processed: restored={restored}, skipped={skipped}")
-                else:
-                    log("[pending_queue] Disk snapshot empty — nothing to restore")
+            _restore_pending_queue_snapshot(
+                _pending_queue_path, _job_queue, _rehydrated_rids)
         except Exception as e:
             log(f"[pending_queue] restore failed: {e}", "WARN")
 

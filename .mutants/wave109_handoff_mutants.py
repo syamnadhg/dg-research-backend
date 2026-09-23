@@ -90,7 +90,10 @@ A_RESUME_SIX = ("    if _handed_off_to_cloud(queue_dir):\n"
 
 # ── anchors: boot recovery leaves a handed-off run alone ───────────────────
 #: Sixteen spaces — the dead-worker sweep's call is the same line at eight.
-R_GUARD = ("                if _claim_is_handed_off(data.get(\"backendRunId\")):\n"
+#: ⛔ RE-ANCHORED (wave 10.9, #536). The guard now asks `_recovery_sees_handoff`,
+#: because the disk half of the answer — `queues/<run>/delivery.json` — is
+#: deleted at the hand-off for a run that keeps nothing.
+R_GUARD = ("                if _recovery_sees_handoff(research_id, data):\n"
            "                    log(f\"[rehydrate] {research_id[:24]}… was handed off to the cloud \"\n")
 #: The re-kick itself.
 R_KICK = ("                        await asyncio.to_thread(\n"

@@ -51,6 +51,7 @@ WHAT THESE TESTS PIN
 
 Run:  pytest tests/test_handoff_is_the_end_109.py -v
 """
+import asyncio
 import json
 import os
 import sys
@@ -323,6 +324,140 @@ def test_an_out_of_fleet_handed_off_run_is_not_stamped_either(tmp_path, monkeypa
     assert updates == []
     assert not any("marking" in m and "paused_backend_restart" in m for m in said), (
         "a paused mark was announced for a run that was never marked")
+
+
+# ════ 3b. #536 — the proof of the hand-off survives the purge ═════════════
+#
+# ⛔⛔ A RUN THAT KEEPS NOTHING HAS NO `delivery.json` TO ASK. Its folder is
+# deleted the moment the hand-off is recorded, while the encode, the upload, the
+# Doc and THE EMAIL are still minutes away — so the disk, the only witness both
+# recovery paths had, says "never handed off" for exactly the run that cannot be
+# recovered any other way: no chat to reopen, no Resume card, and `_safe_enqueue`
+# refusing a stopped run for ever. The record's `beDone` is written before the
+# purge and answers the same question.
+
+INCOG = "incog_1758400000000_7"
+
+
+def _purged_from_disk(tmp_path, monkeypatch):
+    """The disk a handed-off incognito run leaves behind: `queues/` with no
+    directory for this run at all, which is what the purge makes."""
+    monkeypatch.setattr(research, "__file__", str(tmp_path / "research.py"))
+    (tmp_path / "queues").mkdir(parents=True)
+
+
+def _handed_off_record(rid, *, be_done=True, assigned=1):
+    d = {"deviceId": "dev1", "status": "ongoing", "assignedWorker": assigned,
+         "backendRunId": "run-1", "topic": "t"}
+    if be_done:
+        d["beDone"] = True
+        d["beDoneAt"] = 1758400000000
+    return _Snap(rid, d)
+
+
+def test_a_purged_incognito_run_is_re_kicked_not_stamped(tmp_path, monkeypatch):
+    """⛔⛔ THE DEFECT. The folder is gone, so `_claim_is_handed_off` answered
+    False and boot recovery fell through to the branch that ends a run that
+    keeps nothing: status "stopped", "this run could not be picked up again",
+    and no re-kick. If the first kick never landed — no token, a dead socket, a
+    5xx — phases 4 and 5 then never ran at all: the person paid, the chat said
+    the run had ended, and the report promised by email was never sent.
+
+    Nothing else can make this pass. The record is the only thing left that
+    knows the hand-off happened, and re-firing the kick is the only way the
+    email can still be sent."""
+    _purged_from_disk(tmp_path, monkeypatch)
+    updates, enqueues = _setup(
+        monkeypatch, worker_id=1, fleet=1,
+        researches={OWNER: [_handed_off_record(INCOG)]},
+        devices={"dev1": _DevSnap(True, {"supervised": True})},
+    )
+    kicks = []
+    monkeypatch.setattr(research, "_post_fe_p4p5_trigger",
+                        lambda uid, rid: kicks.append((uid, rid)))
+
+    r, o, _seen = _run(OWNER)
+    assert kicks == [(OWNER, INCOG)], (
+        "nobody re-fired the kick for a run whose email is still in the cloud")
+    assert updates == [], (
+        "the machine stamped a terminal status over a run Cloud Run was "
+        "actively finishing")
+    assert enqueues == [], "a handed-off run was re-opened on this machine"
+    assert (r, o) == (0, 0)
+
+
+def test_an_incognito_run_that_never_handed_off_is_still_ended(tmp_path, monkeypatch):
+    """⭐ ACCEPT POLARITY. Without the marker the run really was interrupted
+    mid-work, and the branch that ends it must still fire — a Resume card in a
+    chat nobody can reopen is the outcome this wave removed."""
+    _purged_from_disk(tmp_path, monkeypatch)
+    updates, _enqueues = _setup(
+        monkeypatch, worker_id=1, fleet=1,
+        researches={OWNER: [_handed_off_record(INCOG, be_done=False)]},
+        devices={"dev1": _DevSnap(True, {"supervised": False})},
+    )
+    kicks = []
+    monkeypatch.setattr(research, "_post_fe_p4p5_trigger",
+                        lambda uid, rid: kicks.append((uid, rid)))
+
+    _r, o, _seen = _run(OWNER)
+    assert kicks == [], "a run still mid-work was handed to the cloud"
+    assert [(u, rid, p["status"]) for u, rid, p in updates] == [
+        (OWNER, INCOG, "stopped")]
+    assert o == 1
+
+
+def test_an_ordinary_run_still_answers_from_its_disk(tmp_path, monkeypatch):
+    """⛔⛔ THE DISK ANSWER IS KEPT FOR EVERY OTHER RUN, and this is the pin that
+    says so. `beDone` is never cleared, so an ordinary run that went round again
+    — a Resume, a Retry — carries the previous pass's marker while its new pass
+    is mid-phase-2. Believing the record there would swap its Resume card for a
+    kick to a cloud that has nothing to finish."""
+    _purged_from_disk(tmp_path, monkeypatch)
+    updates, _enqueues = _setup(
+        monkeypatch, worker_id=1, fleet=1,
+        researches={OWNER: [_handed_off_record(RID)]},
+        devices={"dev1": _DevSnap(True, {"supervised": False})},
+    )
+    kicks = []
+    monkeypatch.setattr(research, "_post_fe_p4p5_trigger",
+                        lambda uid, rid: kicks.append((uid, rid)))
+
+    _r, o, _seen = _run(OWNER)
+    assert kicks == [], "an ordinary run was kicked on the strength of a marker"
+    assert [(rid, p["status"]) for _u, rid, p in updates] == [
+        (RID, "paused_backend_restart")]
+    assert o == 1
+
+
+def test_the_dead_worker_sweep_leaves_a_purged_incognito_run_alone(
+        tmp_path, monkeypatch):
+    """⛔⛔ THE OTHER RECOVERY PATH, and it reaches further — one worker given up
+    on rather than the whole process restarting, scanning every ongoing run in
+    the tree. It read the same deleted folder and reached the same wrong answer,
+    so a run that keeps nothing was ended there too, mid-cloud-tail."""
+    _purged_from_disk(tmp_path, monkeypatch)
+    updates, _enqueues = _setup(
+        monkeypatch, worker_id=1, fleet=1,
+        researches={OWNER: [_handed_off_record(INCOG, assigned=2)]},
+    )
+    marked = asyncio.run(research._reconcile_dead_worker_runs(OWNER, {2}))
+    assert marked == 0, "a run the cloud is finishing was marked by the sweep"
+    assert updates == []
+
+
+def test_the_dead_worker_sweep_still_parks_an_ordinary_run(tmp_path, monkeypatch):
+    """⭐ ACCEPT POLARITY on the same sweep: an ordinary run whose worker died,
+    with no delivery record on disk, is still parked for its Resume."""
+    _purged_from_disk(tmp_path, monkeypatch)
+    updates, _enqueues = _setup(
+        monkeypatch, worker_id=1, fleet=1,
+        researches={OWNER: [_handed_off_record(RID, assigned=2)]},
+    )
+    marked = asyncio.run(research._reconcile_dead_worker_runs(OWNER, {2}))
+    assert marked == 1
+    assert [(rid, p["status"]) for _u, rid, p in updates] == [
+        (RID, "paused_backend_restart")]
 
 
 # ════ 4. 542-5 — a refusal reaches the chat ═══════════════════════════════

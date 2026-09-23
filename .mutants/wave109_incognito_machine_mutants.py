@@ -56,6 +56,8 @@ SUITES = ("tests/test_incognito_capability_109.py "
           "tests/test_incognito_expiry_109.py "
           "tests/test_incognito_no_resurrection_109.py "
           "tests/test_incognito_teardown_109.py "
+          "tests/test_pending_queue_keeps_nothing_109.py "
+          "tests/test_handoff_is_the_end_109.py "
           "tests/test_cloud_handoff_record_108.py")
 RESEARCH = "research.py"
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
@@ -173,6 +175,39 @@ QUEUE_DIR_CLAIM = ('    claim = Path(str(resume)).name if resume else bound.argu
 CATCHUP = ('    if _is_incognito_research(research_id):\n'
            '        return ("nothing here can ask the route again — a run that keeps nothing "\n'
            '                "has no chat to reopen")')
+
+# ── anchors: the proof of the hand-off, and the queue snapshot ─────────────
+HANDOFF_RECORD = ('    if _claim_is_handed_off((data or {}).get("backendRunId")):\n'
+                  "        return True\n"
+                  "    if _is_incognito_research(research_id):\n"
+                  '        return bool((data or {}).get("beDone"))\n'
+                  "    return False")
+# ⛔ THE COMMENT IS PART OF THE ANCHOR: the reconcile call site is the same
+# statement at a shallower indent, so the bare line is a substring of this one.
+REHYDRATE_WITNESS = ("                # the re-kick. See `_recovery_sees_handoff`.\n"
+                     "                if _recovery_sees_handoff(research_id, data):")
+RECONCILE_WITNESS = ("        if _recovery_sees_handoff(research_id, data):\n"
+                     "            continue")
+SNAP_VIEW = ('    rid = (job or {}).get("research_id")\n'
+             "    if not _is_incognito_research(rid):\n"
+             "        return job")
+SNAP_CURRENT = '        "current": _snapshot_job_view(current_job),'
+SNAP_PENDING = '        "pending": list(pending_jobs or []),'
+RESTORE_DROP = ("    if _is_incognito_research(cur_rid):\n"
+                '        log(f"[pending_queue] {cur_rid[:24]}… keeps nothing — the run this "')
+RESTORE_HELD = ("    held_a_run_that_keeps_nothing = bool(_is_incognito_research(cur_rid)) or any(\n"
+                '        _is_incognito_research((j or {}).get("research_id")) for j in pending)')
+RESTORE_FORGET = ("    if held_a_run_that_keeps_nothing:\n"
+                  "        _forget_pending_queue_snapshot(path, job_queue)")
+# ⛔ THE LINES BELOW IT ARE PART OF THE ANCHOR: the same assignment appears at
+# two deeper indents elsewhere, and a four-space anchor is a substring of both.
+FORGET_CURRENT = ('    current = _QUEUE_STATE.get("current_job")\n'
+                  "    try:\n"
+                  "        live = list(job_queue._queue)")
+FORGET_WRITE = ("        if live or current:\n"
+                "            _write_pending_queue_snapshot(path, current, live)")
+FORGET_UNLINK = ("        else:\n"
+                 "            Path(path).unlink(missing_ok=True)")
 
 CLAIM_QUEUE_DELETE = ('                        f"recreating it", "WARN")\n'
                       "                    try:\n"
@@ -417,6 +452,72 @@ MUTANTS = [
      [(RECONCILE_PATCH, '        _patch = {"status": "paused_backend_restart",\n'
                         '                  "summary": "Backend restarted mid-run — hit Resume to '
                         'pick up from the last checkpoint."}')]),
+
+    # ══ the proof of the hand-off ══════════════════════════════════════════
+    ("H1", "under", "⛔⛔ recovery asks only the disk again — and the disk answer "
+     "for a run that keeps nothing was deleted at the hand-off, so the machine "
+     "stamps it terminally while its email is still in the cloud",
+     [(HANDOFF_RECORD, '    return _claim_is_handed_off((data or {}).get("backendRunId"))')]),
+    ("H2", "over", "every run believes the marker, so an ordinary run that went "
+     "round again is kicked instead of parked for the Resume it can serve",
+     [(HANDOFF_RECORD, '    if _claim_is_handed_off((data or {}).get("backendRunId")):\n'
+                       "        return True\n"
+                       '    return bool((data or {}).get("beDone"))')]),
+    ("H3", "under", "⛔⛔ the boot rehydrate asks the disk directly again — the "
+     "helper is right and the branch that ends the run does not use it",
+     [(REHYDRATE_WITNESS, "                # the re-kick. See `_recovery_sees_handoff`.\n"
+                          '                if _claim_is_handed_off(data.get("backendRunId")):')]),
+    ("H4", "under", "the dead-worker sweep asks the disk directly again, so one "
+     "worker dying ends a run the cloud is finishing",
+     [(RECONCILE_WITNESS, '        if _claim_is_handed_off(data.get("backendRunId")):\n'
+                          "            continue")]),
+
+    # ══ the queue snapshot at the root of queues/ ══════════════════════════
+    ("S1", "under", "⛔⛔ the claimed job goes to disk whole again — the topic, "
+     "the person's address and their whole brief, in a file the purge never "
+     "reaches and 'clear local storage' keeps",
+     [(SNAP_VIEW, '    rid = (job or {}).get("research_id")\n'
+                  "    if True:\n"
+                  "        return job")]),
+    ("S2", "over", "every claimed job is reduced to ids, so no interrupted run "
+     "on this machine can be restored from the snapshot again",
+     [(SNAP_VIEW, '    rid = (job or {}).get("research_id")\n'
+                  "    if False:\n"
+                  "        return job")]),
+    ("S3", "under", "⛔ the writer stops asking what may be written and snapshots "
+     "the job it was handed",
+     [(SNAP_CURRENT, '        "current": current_job,')]),
+    ("S4", "over", "the jobs still waiting their turn are redacted too, and the "
+     "claim already deleted their queue documents — the work is simply lost",
+     [(SNAP_PENDING, '        "pending": [_snapshot_job_view(j) for j in (pending_jobs or [])],')]),
+    ("S5", "under", "⛔⛔ boot re-offers the run it has just ended, on the browser "
+     "profiles of a machine whose owner was told only that a run happened",
+     [(RESTORE_DROP, "    if False:\n"
+                     '        log(f"[pending_queue] {cur_rid[:24]}… keeps nothing — the run this "')]),
+    ("S6", "under", "⛔⛔ boot reads the snapshot and never writes it, so the "
+     "entry a crash left behind stays for ever — nothing can claim it again",
+     [(RESTORE_FORGET, "    if False:\n"
+                       "        _forget_pending_queue_snapshot(path, job_queue)")]),
+    ("S7", "over", "every boot rewrites the snapshot, which drops jobs the "
+     "enqueue funnel refused this pass but a later one would have taken",
+     [(RESTORE_FORGET, "    if True:\n"
+                       "        _forget_pending_queue_snapshot(path, job_queue)")]),
+    ("S8", "under", "only the running job counts, so a queued run that keeps "
+     "nothing and is refused at boot keeps its brief on the disk",
+     [(RESTORE_HELD, "    held_a_run_that_keeps_nothing = bool(_is_incognito_research(cur_rid))")]),
+    ("S9", "under", "the last snapshot is left in place rather than removed, so "
+     "a machine that ran one private run still says so",
+     [(FORGET_UNLINK, "        else:\n            pass")]),
+    ("S10", "over", "the file goes even when jobs were restored into it, so the "
+     "next crash loses every one of them",
+     [(FORGET_WRITE, "        if False:\n"
+                     "            _write_pending_queue_snapshot(path, current, live)")]),
+    ("S11", "under", "⛔⛔ the rewrite outruns the worker — a run claimed while "
+     "boot was still going has its snapshot overwritten with nothing, so one "
+     "run's leftovers take the next run's only crash record with them",
+     [(FORGET_CURRENT, "    current = None\n"
+                       "    try:\n"
+                       "        live = list(job_queue._queue)")]),
 ]
 
 

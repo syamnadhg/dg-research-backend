@@ -173,7 +173,10 @@ N_DISK = "        if _run_dir_inside_queues(d.name) is None:\n            contin
 #: moved into `_claim_is_handed_off`, which the boot rehydrate and the resume
 #: path ask as well. Eight leading spaces: the rehydrate's call is the same line
 #: at sixteen.
-N_SWEEP = ("        if _claim_is_handed_off(data.get(\"backendRunId\")):\n"
+#: ⛔ RE-ANCHORED AGAIN (wave 10.9, #536): both recovery paths now ask
+#: `_recovery_sees_handoff`, which adds the RECORD's `beDone` to the disk test —
+#: a run that keeps nothing has no `delivery.json` left to read by then.
+N_SWEEP = ("        if _recovery_sees_handoff(research_id, data):\n"
            "            continue\n")
 
 # ── anchors: the pre-claim terminal gate ───────────────────────────────────
