@@ -230,10 +230,19 @@ MUTANTS = [
      "hours-later failure in the whole wave",
      [('        _url = _r.get("url") or ""', '        _url = ""')]),
 
+    # ⛔⛔ R7 WAS AN EQUIVALENT MUTANT, NOT A SURVIVOR (re-measured 2026-09-22).
+    # Wave 10.9's repair round 2 gave `_p2_to_p3_link_for` its own
+    # `off_topic_rejected` veto, because a KEPT agent has no address for the
+    # inline blank to act on. From then on the refused leg was dropped by
+    # whichever veto was left standing, so mutating the inline one alone changed
+    # nothing but a log line — and the survivor it reported was a harness fault
+    # read as a suite gap. It now removes BOTH, the way `link_sinks_removed_0902`
+    # H4 does, so it measures the decision rather than one of its two copies.
     ("R7", "under",
      "⛔ the handoff stops dropping an off-topic leg's link, so the 11:08 run's "
      "unrelated conversation ships to NotebookLM as a source again",
-     [('        if _url and _r.get("off_topic_rejected"):', "        if False:")]),
+     [('        if _url and _r.get("off_topic_rejected"):', "        if False:"),
+      ('    if r.get("off_topic_rejected"):\n        return ""', '    if False:\n        return ""')]),
 
     ("R8", "under",
      "⛔ the handoff stops dropping a conversation that predates the run",
