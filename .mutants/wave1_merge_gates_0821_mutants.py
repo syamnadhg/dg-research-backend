@@ -308,8 +308,12 @@ MUTANTS: list[tuple[str, str, str, str, list[tuple[str, str]], list[str]]] = [
     ("U3", SRC, "over", "⛔ a brace enters the unit f-string. It is evaluated "
      "BEFORE the try that would catch it, on the --resurrect path, so this is a "
      "hard crash rather than a bad unit file",
+     # ⛔ RE-AIMED 2026-09-23 (wave 10.10). `{such as ~/.local/bin}` is not an
+     # expression, so the f-string failed to COMPILE — the whole module, not
+     # the unit — and the mutant never parsed. `{such}` is an expression that
+     # fails only when the unit is RENDERED, which is the crash described.
      [("# first, so a binary in a user-writable dir such as ~/.local/bin resolves ahead",
-       "# first, so a binary in a user-writable dir {such as ~/.local/bin} resolves ahead")],
+       "# first, so a binary in a user-writable dir {such} as ~/.local/bin resolves ahead")],
      [T_NEW]),
     ("U4", SRC, "over", "⛔ the word the macOS relocation pin greps this "
      "function's raw source for is reintroduced by a comment",

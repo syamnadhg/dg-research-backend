@@ -231,7 +231,9 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     # this wave was reframed to avoid.
     ("H1", "under", "⛔⛔ the escape hatch does nothing, so a cancel of the RUNNING "
      "job is machine business and its folder never says why it stopped",
-     [(_ESCAPE_USE, "        log(msg, level)")],
+     # ⛔ RE-AIMED 2026-09-23 (wave 10.10): the replacement kept the `with`
+     # body's indent after the `with` was gone, so it never parsed.
+     [(_ESCAPE_USE, "    log(msg, level)")],
      [T_NEW]),
     ("H2", "over", "the hatch does not restore the scope, so every line after a "
      "cancel in that callback — other people's topics included — lands in "

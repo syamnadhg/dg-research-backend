@@ -291,24 +291,16 @@ def test_every_harness_is_swept():
 # 2026-08-11 — so those mutants have never once measured anything, and
 # `telemetry_0818` F2 writes keyword params after `**kwargs`, which has never
 # been legal on any day of Python.
-KNOWN_UNAPPLIABLE: "set[tuple[str, str]]" = {
-    ('broken_install_0822_mutants.py', 'N6'),
-    ('clear_local_logs_0818_mutants.py', 'C16'),
-    ('new_owner_setup_0817_mutants.py', 'F1'),
-    ('new_owner_setup_0817_mutants.py', 'F15'),
-    ('noise_and_durations_0811_mutants.py', 'D4'),
-    ('review_wave2_0813_mutants.py', 'K4'),
-    ('telemetry_0818_mutants.py', 'F2'),
-    ('watch_liveness_0822_mutants.py', 'D2'),
-    ('watch_liveness_0822_mutants.py', 'P5'),
-    ('watch_liveness_0822_mutants.py', 'R2'),
-    ('watch_liveness_0822_mutants.py', 'R6'),
-    ('wave11_router_gates_0911_mutants.py', 'Q6'),
-    ('wave11_router_gates_0911_mutants.py', 'Q8'),
-    ('wave1_merge_gates_0821_mutants.py', 'U3'),
-    ('wave8_attribution_0824_mutants.py', 'O1c'),
-    ('wave8_machine_scope_0824_mutants.py', 'H1'),
-}
+#
+# ✅ EMPTIED 2026-09-23 (wave 10.10). All sixteen that were left re-aimed so
+# they parse and say what their words say, each re-run and judged from the
+# summary line: the six `try:` → `if True:` shapes (dangling `except`) became a
+# NARROWED `except`; two list joins got their closing bracket; a dropped colon,
+# an f-string brace that failed to compile, an unterminated quote, a stray
+# indent, a cut tuple and `**kwargs` placed first were each put back into legal
+# Python; and wave11 Q6's edit now makes the mistake its own words describe.
+# ⛔ The list stays, empty — deleting it would delete the ratchet.
+KNOWN_UNAPPLIABLE: "set[tuple[str, str]]" = set()
 
 
 def test_no_new_mutant_stops_applying():

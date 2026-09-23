@@ -79,7 +79,8 @@ MUTANTS = [
      [("    return min(stamps) if stamps else int(time.time() * 1000)",
        "    return max(stamps) if stamps else int(time.time() * 1000)")]),
     ("D4", "under", "only config.json is consulted, so an owner-only dir loses its start",
-     [('    for name in ("config.json", "owner.json"):', '    for name in ("config.json",)')]),
+     # ⛔ RE-AIMED 2026-09-23 (wave 10.10): the replacement had lost its colon.
+     [('    for name in ("config.json", "owner.json"):', '    for name in ("config.json",):')]),
     ("D5", "over", "seconds are used as milliseconds — every run starts in 1970",
      [("                stamps.append(int(p.stat().st_mtime * 1000))",
        "                stamps.append(int(p.stat().st_mtime))")]),

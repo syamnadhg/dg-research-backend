@@ -72,8 +72,11 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str], str]] = [
     raise TelemetryFieldError(name)''')], [T], SRC),
     ("F2", "under", "⛔ `**kwargs` returns to the signature, and with it every "
      "field nobody named",
-     [('def tm_emit(event: Ev, *,\n            phase: "int | None" = None,',
-       'def tm_emit(event: Ev, *, _extra=None, **kwargs,\n            phase: "int | None" = None,')], [T], SRC),
+     # ⛔ RE-AIMED 2026-09-23 (wave 10.10). It put `**kwargs` FIRST, before
+     # keyword params, which has never been legal Python — so this mutant never
+     # parsed. `**kwargs` now goes where Python allows it: last.
+     [('            research_id: "str | None" = None) -> bool:',
+       '            research_id: "str | None" = None, **kwargs) -> bool:')], [T], SRC),
     ("F3", "over", "⭐ the id guard reverts to the shape that rejects EVERY real "
      "id — a feature that silently never works",
      [('RESEARCH_ID_RE = re.compile(r"^chat_[0-9]{13}_[0-9]{1,6}$")',

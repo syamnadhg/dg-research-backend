@@ -403,7 +403,7 @@ MUTANTS = [
      "with better copy in front of it. "
      "KILLED BY tests/test_port_probe_0916.py::"
      "test_serve_refuses_with_its_own_words_when_it_could_not_look, which "
-     "asserts SystemExit(3) is inside the branch's window",
+     "RUNS the branch (wave 10.10) and requires it to exit 3",
      [(SERVE_UNKNOWN_EXIT,
        '        print("      Or start this backend on another port.\\n")')]),
     ("C3", "under",
@@ -413,7 +413,7 @@ MUTANTS = [
      "unactionable refusal is where the raw EADDRINUSE left them. "
      "KILLED BY tests/test_port_probe_0916.py::"
      "test_serve_refuses_with_its_own_words_when_it_could_not_look, which "
-     "asserts _port_holder_hint(port) is inside the branch's window",
+     "RUNS the branch and requires the platform's hint to be PRINTED",
      [(SERVE_UNKNOWN_HINT,
        '        print("      Nothing here can say what is on it.")')]),
     ("C4", "under",
@@ -432,7 +432,7 @@ MUTANTS = [
      "the original report did not know. "
      "KILLED BY tests/test_port_probe_0916.py::"
      "test_the_supervisor_stops_saying_freed_nothing_when_it_could_not_look, "
-     "which asserts _port_holder_hint(_w_port) is in the same window",
+     "which RUNS the branch and requires this worker's hint in the log line",
      [(SUPERVISOR_HINT, '                                    "",')]),
     ("C6", "under",
      "⛔⛔ THE INSTALLER'S \"COULD NOT CHECK\" BRANCH NEVER FIRES, so it prints "
@@ -447,8 +447,8 @@ MUTANTS = [
      "time there is no log to go back to and no run to inspect; the printed "
      "line is the whole record. "
      "KILLED BY tests/test_port_probe_0916.py::"
-     "test_the_installer_says_something_when_it_could_not_check, which asserts "
-     "_port_holder_hint(8000) is in the same window",
+     "test_the_installer_says_something_when_it_could_not_check, which RUNS "
+     "the lines and requires port 8000's hint to be PRINTED",
      [(INSTALLER_HINT,
        "            print(f\"  {_c(_DIM, '     If the backend does not start, "
        "try again in a moment.')}\")")]),

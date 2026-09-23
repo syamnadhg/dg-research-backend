@@ -100,8 +100,14 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_BROKEN]),
     ("N6", "under", "the notice becomes one multi-line string, so every line "
      "after the first loses its timestamp and its level",
+     # ⛔ RE-AIMED 2026-09-23 (wave 10.10). It opened `"\n".join([` and never
+     # closed it, so the mutated file did not parse and — this harness scoring
+     # by exit code — every run banked a kill no assertion earned. It now closes
+     # the join too, so the list really is one multi-line string.
      [('    return [\n        "[install] This backend cannot import part of itself, so it cannot "',
-       '    return ["\\n".join([\n        "[install] This backend cannot import part of itself, so it cannot "')],
+       '    return ["\\n".join([\n        "[install] This backend cannot import part of itself, so it cannot "'),
+      ('        f"[install] {_doctor_share_logs_line()}",\n    ]',
+       '        f"[install] {_doctor_share_logs_line()}",\n    ])]')],
      [T_BROKEN]),
 
     # ══ the loop ════════════════════════════════════════════════════════

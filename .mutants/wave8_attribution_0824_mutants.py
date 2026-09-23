@@ -202,7 +202,10 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     ("O1c", "under", "⛔ the refusal goes SILENT — a queue doc that vanishes with "
      "no line is indistinguishable from one that was never written, which is the "
      "exact shape this repo keeps finding",
-     [(_REFUSE_LOG, "    if False: log(f\"[{where}] refusing start — identity fields disagree \"")],
+     # ⛔ RE-AIMED 2026-09-23 (wave 10.10): the replacement carried a closing
+     # quote the anchor does not, so the f-string was left unterminated and the
+     # mutant never parsed.
+     [(_REFUSE_LOG, "    if False: log(f\"[{where}] refusing start — identity fields disagree ")],
      [T_CAP]),
     ("O1d", "over", "the guard refuses EVERY start doc, not just a divergent one "
      "— the machine stops running research at all",

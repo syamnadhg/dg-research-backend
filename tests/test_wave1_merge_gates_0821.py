@@ -208,6 +208,24 @@ def test_the_unit_note_cannot_break_the_f_string_or_the_macos_pin():
         "'Library' — a comment reintroduced it")
 
 
+def test_every_comment_in_the_unit_renders_exactly_as_written():
+    """⛔⛔ THE GUARD ABOVE LOOKS ONLY AT LINES THAT SAY "PATH", and the note is
+    five lines long. A brace on the line after — `{such} as ~/.local/bin` — got
+    past it: wave 10.10's harness re-aim of `wave1_merge_gates` U3 put exactly
+    that there, and every test in this file passed.
+
+    ⭐ So the template is RENDERED: every name it interpolates gets a stand-in,
+    and each comment line must come out byte-for-byte as it went in. A brace
+    that is an expression interpolates (and the line changes); one that is not
+    fails to compile — the crash on the `--resurrect` path, before its `try`."""
+    tpl = _unit_template()
+    names = set(re.findall(r"\{([A-Za-z_]\w*)", tpl))
+    rendered = eval('f"""' + tpl + '"""', {}, {n: f"<{n}>" for n in names})
+    comments = [ln for ln in tpl.splitlines() if ln.lstrip().startswith("#")]
+    assert comments, "the unit carries no comment at all"
+    assert [ln for ln in rendered.splitlines() if ln.lstrip().startswith("#")] == comments
+
+
 def _unit_template() -> str:
     src = inspect.getsource(research._arm_supervisor_linux)
     m = re.search(r'unit_content = f"""(.*?)"""', src, re.S)

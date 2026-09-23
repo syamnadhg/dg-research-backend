@@ -776,6 +776,21 @@ def test_a_dropped_run_control_never_becomes_another_mutating_act(phrase):
     assert argv is None or argv[0] not in ("device-use", "skip"), argv
 
 
+@pytest.mark.parametrize("phrase, argv", [
+    ("skip it on my computer", ["skip"]),
+    ("skip that on the office machine", ["skip"]),
+    ("skip the Mars run on my computer", ["skip", "--run=Mars"]),
+])
+def test_a_machine_word_does_not_push_a_bare_skip_out_of_its_branch(phrase, argv):
+    """⛔⛔ BRANCH 2 MUST NOT GET BRANCH 1'S DEVICE-NOUN BAIL — this wave's own
+    lesson, written in sr.py's comment, and UNPINNED: wave 10.10 re-aimed the
+    harness mutant that makes exactly that mistake (wave11 Q6) and every test
+    passed. The bail is not inert; it hands the message down the ladder — a bare
+    skip lands on the catch-all, and a skip naming a run lands on the DEVICE
+    LIST, the wrong feature entirely."""
+    assert _r(phrase)[0] == argv, (phrase, _r(phrase))
+
+
 def test_the_drop_guard_does_not_break_the_branches_below_it():
     """⭐ It gates only what mutates BELOW. Everything that legitimately reaches
     the switch and skip branches must still get there."""
