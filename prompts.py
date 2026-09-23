@@ -6,6 +6,7 @@ Imported by research.py — edit prompts here, logic stays in research.py.
 """
 
 from models import (
+    VERSION_ORDER_RULE,
     free_family_note,
     p1_select_pro_directive,
     p2_family,
@@ -272,7 +273,12 @@ def _fam_bits(family: str = "") -> tuple:
 
 def claude_deep_research_prompt(family: str = "") -> str:
     """CUA system prompt for Claude P2 setup. Runs only after the DOM path
-    failed, so it keeps the upgrade lever (open the menu, take the highest)."""
+    failed, so it keeps the upgrade lever (open the menu, take the highest).
+
+    ⚠ 2026-09-23: "HIGHEST-numbered" carries VERSION_ORDER_RULE, the sentence the
+    setup directive (its user message in the same call) already carries — as
+    decimals the release after nine-after-the-dot reads OLDER, and the two strings
+    must not disagree about which model is newest."""
     fam, swap = _fam_bits(family)
     no_upsell = upsell_warning(fam)
     return SYSTEM_BASE + f"""
@@ -281,7 +287,7 @@ Your task: Configure Claude for research. Nothing else.
 
 Steps:
 1. Look at the Claude.ai page.
-2. MODEL: {swap}the model must be {fam} — the VERSION NUMBER DOES NOT MATTER, and a higher number is always better. Open the model selector ONCE and pick the HIGHEST-numbered {fam} in the list; if the highest {fam} is the one already selected, close the menu without clicking it. {no_upsell} In that SAME popover, if an "Effort" submenu is present, choose "{_CL_EFFORT}". If the menu will not open but the button already reads "{fam} …", that is fine — leave the model as it is and go to step 3.
+2. MODEL: {swap}the model must be {fam} — the VERSION NUMBER DOES NOT MATTER, and a higher number is always better. Open the model selector ONCE and pick the HIGHEST-numbered {fam} in the list; if the highest {fam} is the one already selected, close the menu without clicking it. {VERSION_ORDER_RULE} {no_upsell} In that SAME popover, if an "Effort" submenu is present, choose "{_CL_EFFORT}". If the menu will not open but the button already reads "{fam} …", that is fine — leave the model as it is and go to step 3.
 3. Click the "+" or tools menu near the input; enable the "Research" mode/tool.
 4. Close the menu (Escape) and click the message input area to focus it.
 5. Say "ready for paste" and STOP.
@@ -405,7 +411,7 @@ def claude_validate_setup_prompt(family: str = "", effort_ok: bool = True) -> st
 Your task: Verify Claude is ready for Deep Research and fix ONLY what is wrong. The ONE thing that matters is the Research tool — everything else is secondary.
 
 Read the composer. Do NOT open the model popover unless step 1 explicitly tells you to.
-1. MODEL: {swap}the model-selector button (bottom of the composer) shows the current model. If it reads "{fam}" followed by ANY version number — or "{fam}" with no number at all — the model is FINE; do nothing to it. The version number is irrelevant here and a higher one is always correct. {effort_clause} ONLY touch the model if the button does not name "{fam}" anywhere at all: then open it once, pick the highest-numbered "{fam}", and close it. {no_upsell}
+1. MODEL: {swap}the model-selector button (bottom of the composer) shows the current model. If it reads "{fam}" followed by ANY version number — or "{fam}" with no number at all — the model is FINE; do nothing to it. The version number is irrelevant here and a higher one is always correct. {effort_clause} ONLY touch the model if the button does not name "{fam}" anywhere at all: then open it once, pick the highest-numbered "{fam}", and close it. {VERSION_ORDER_RULE} {no_upsell}
 2. RESEARCH TOOL (the priority — this is what actually matters): is "Research" / "Deep research" enabled near the composer (an active/highlighted pill or chip, or a checkmark beside "Research" in the "+" tools menu)? If you cannot tell from the current view, open the "+" / tools menu and look. If Research is OFF, turn it ON. If it is already ON, leave it.
 3. ATTACHMENTS: if a stale attachment is already visible in the composer, click its X to remove it.
 4. Click the input area to focus it.

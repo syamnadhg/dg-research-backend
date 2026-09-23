@@ -55321,6 +55321,23 @@ _CLAUDE_MODE_STATE_JS = """(P) => {
 _CLAUDE_MODEL_TRIGGER_TESTID = "model-selector-dropdown"
 _CLAUDE_EFFORT_TRIGGER_TESTID = "effort-menu-trigger"
 
+# ⭐⭐ 2026-09-23 — THE EFFORT ROW STEP 1C CHOSE, written onto the row itself.
+#
+# The live capture of 2026-09-23 (tests/fixtures/panels/claude_model_popover_
+# 20260923.html) has NO `effort-menu-trigger` test id: the Effort row is a plain
+# `role="menuitem"` inside the `role="menu"` popover. The submenu probe and the
+# row picker both told "the popover" from "the submenu" by that id alone, so on
+# today's page the popover counted as a submenu: the picker searched it first,
+# and the 09-20 log's "no 'max' row in the submenu — rows=[opus 5…, effortlow,
+# more models]" is the POPOVER's rows, not the submenu's. The one line that
+# could have diagnosed the miss described the wrong menu.
+#
+# So the Step 1C marker, which is the one place that decides which row is the
+# Effort row, now also leaves this attribute on it, and the probe and the picker
+# exclude the menu that holds it. One decision, read three times — not a second
+# definition of "the Effort row" that could drift from the first.
+_CLAUDE_EFFORT_ROW_ATTR = "data-sr-effort-row"
+
 
 def _claude_effort_option_testid(effort: str) -> str:
     """The option row's test id for a policy effort word.
@@ -55415,6 +55432,61 @@ def _claude_effort_in_effect(*, confirmed: bool, wanted, row_shows,
     if pressed:
         return None
     return row_shows or None
+
+
+def _claude_effort_row_confirms(row_shows, wanted) -> bool:
+    """Does the Effort row ALREADY show the tier we want? Then there is nothing
+    to set, and the submenu stays shut.
+
+    ⭐ 2026-09-23. The live capture shows the popover's Effort row carrying the
+    tier in effect beside its label ("Effort" + "Max"), the same fact the model
+    button carries when it reads "Opus 5 Max" — and a trigger read of that is
+    already trusted to skip the whole popover. Reading it one level down means
+    today's page, which shows Max, is confirmed WITHOUT pressing into a submenu
+    whose markup has never been captured.
+
+    ⛔ Only a POSITIVE read confirms. An unread row, or one showing another tier,
+    falls through to the submenu exactly as before; nothing here can turn a miss
+    into a confirmation. And no wanted tier means nothing to confirm."""
+    w = str(wanted or "").strip().lower()
+    return bool(w) and str(row_shows or "").strip().lower() == w
+
+
+def _claude_effort_after_setup(wanted, state, button_shows_wanted: bool) -> dict:
+    """What the post-setup telemetry line says about Claude's effort, once the
+    computer-use pass has run.
+
+    ⭐ 2026-09-23. That line used to say "unconfirmed (max effort)" whenever the
+    DOM setup had not confirmed the tier — even when setup had READ the tier in
+    effect ('low') and recorded it, and even when the computer-use pass had since
+    set it. It is written just before the brief is sent, so it can say both:
+
+      * `state["effort"]`       — setup confirmed the wanted tier: nothing to add.
+      * `button_shows_wanted`   — the pre-send read of the model button (taken
+                                  AFTER the computer-use pass) shows the wanted
+                                  tier: it was set after setup. A note, no miss.
+      * `state["effort_got"]`   — the tier setup read and could not change: named.
+      * otherwise               — unknown, worded exactly as before, so the model
+                                  refresh report keeps counting it.
+
+    Returns {"missing": clause for the "unconfirmed (…)" list or None,
+             "note": a line to log or None}.
+    ⛔ No parentheses in a clause: the report reads the list up to the first ')'.
+    """
+    w = str(wanted or "").strip().lower()
+    st = state if isinstance(state, dict) else {}
+    if not w or st.get("effort"):
+        return {"missing": None, "note": None}
+    if button_shows_wanted:
+        return {"missing": None,
+                "note": (f"effort '{w}' now shows on the model button — set after "
+                         f"setup, by the computer-use pass")}
+    got = str(st.get("effort_got") or "").strip().lower()
+    if got == w:
+        return {"missing": None, "note": None}
+    if got:
+        return {"missing": f"effort is '{got}', not the '{w}' wanted", "note": None}
+    return {"missing": f"{w} effort", "note": None}
 
 
 def _claude_effort_report(wanted, got) -> dict:
@@ -55535,6 +55607,9 @@ _CLAUDE_TRIGGER_EXPANDED_JS = r"""(P) => {
 # amount of sidebar can crowd the answer out. Same scoping rule Step 1C' already
 # uses to PICK the row: the submenu is the visible menu that does NOT contain the
 # Effort trigger; the parent popover carries its own 'EffortMax' row.
+# ⚠ 2026-09-23: "contains the Effort trigger" is read by the test id OR by
+# `P.rowAttr`, the mark Step 1C left on the row. Today's page has no test id, and
+# without the mark the popover alone read as 'maybe' rather than 'closed'.
 _CLAUDE_EFFORT_SUBMENU_JS = r"""(P) => {
     // Icon-font ligatures live in the private-use area and are invisible in a
     // screenshot but present in text — strip them before comparing, exactly as
@@ -55560,8 +55635,12 @@ _CLAUDE_EFFORT_SUBMENU_JS = r"""(P) => {
         const labels = rows.map(e => norm(e.textContent))
                            .filter(t => t && t.length <= 24);
         out.overlays.push({
-            trigger: !!(P.trigTestid &&
-                        c.querySelector('[data-testid="' + P.trigTestid + '"]')),
+            // The parent popover: the menu holding the Effort row — by its old
+            // test id, or by the attribute Step 1C's marker wrote on the row it
+            // chose (today's page has no test id; see _CLAUDE_EFFORT_ROW_ATTR).
+            trigger: !!((P.trigTestid &&
+                         c.querySelector('[data-testid="' + P.trigTestid + '"]'))
+                        || (P.rowAttr && c.querySelector('[' + P.rowAttr + ']'))),
             option: !!(P.optTestid &&
                        c.querySelector('[data-testid="' + P.optTestid + '"]')),
             rungs: labels.filter(isRung).length,
@@ -57046,6 +57125,13 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                     for (const el of document.querySelectorAll('[' + P.attr + ']')) {
                         el.removeAttribute(P.attr);
                     }
+                    // The row mark from an EARLIER pass must not name a row now:
+                    // the probe and the picker exclude whatever menu holds it.
+                    if (P.rowAttr) {
+                        for (const el of document.querySelectorAll('[' + P.rowAttr + ']')) {
+                            el.removeAttribute(P.rowAttr);
+                        }
+                    }
                     // Icon-font ligatures land in the private-use area: they are
                     // invisible on screen but present in text, and they are why the
                     // log read the row as 'effortmax' plus a stray glyph. It also
@@ -57078,6 +57164,18 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                         || (el.querySelector && el.querySelector('a[href]'));
                     const rejected = [];
                     let trigger = null, via = '';
+                    // ⭐⭐ 2026-09-23 — INSIDE AN OPEN MENU, NEVER ANYWHERE ON THE
+                    // PAGE. The comment above asked for container-scoping and
+                    // said it needed a capture. The 2026-09-23 capture settles
+                    // it: the Effort row is a `role="menuitem"` inside the
+                    // `role="menu"` popover, and it no longer carries the
+                    // 08-17 test id — so every run since fell through to the
+                    // text search below, which walked the DOCUMENT in order, and
+                    // the sidebar comes first. Both searches now look only inside
+                    // visible menus: a sidebar conversation, a markdown bullet or
+                    // a button elsewhere on the page cannot be the row pressed.
+                    const menus = [...document.querySelectorAll('[role="menu"]')]
+                        .filter(m => m.getClientRects().length > 0);
                     // ⭐⭐ 2026-08-17 — THE TEST ID, FIRST. The comment below asked
                     // for "container-scoping … it needs a live claude.ai capture
                     // we do not have". The capture arrived, and it is better than
@@ -57087,27 +57185,33 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                     // prefix, no length bound, no anchor arms, nothing that a
                     // sidebar conversation or a markdown bullet can satisfy.
                     if (P.testid) {
-                        for (const el of document.querySelectorAll(
-                                '[data-testid="' + P.testid + '"]')) {
-                            if (!el.getClientRects().length) continue;
-                            trigger = el; via = 'testid'; break;
+                        for (const m of menus) {
+                            for (const el of m.querySelectorAll(
+                                    '[data-testid="' + P.testid + '"]')) {
+                                if (!el.getClientRects().length) continue;
+                                trigger = el; via = 'testid'; break;
+                            }
+                            if (trigger) break;
                         }
                     }
-                    // The text search stays as the FALLBACK, unchanged, for an
-                    // older layout that predates the id. It keeps its guards: they
-                    // are what make it survivable, and it is now reached only when
-                    // the exact hook is absent.
+                    // The text search stays as the FALLBACK for a layout without
+                    // the id — which, since 2026-09-23, is today's. It keeps its
+                    // guards: a menu can hold a link, and the length bound still
+                    // separates a row from prose.
                     if (!trigger) {
-                        for (const el of document.querySelectorAll(
-                                '[role="menuitem"], button, [role="option"], li')) {
-                            if (!el.getClientRects().length) continue;
-                            const t = norm(el.textContent);
-                            if (!t.startsWith('effort')) continue;
-                            // The Effort row shows its current value + a submenu chevron.
-                            if (linky(el)) { rejected.push(['link', t.slice(0, 60)]); continue; }
-                            if (t.length > 40) { rejected.push(['long', t.slice(0, 60)]); continue; }
-                            trigger = el; via = 'text';
-                            break;
+                        for (const m of menus) {
+                            for (const el of m.querySelectorAll(
+                                    '[role="menuitem"], button, [role="option"], li')) {
+                                if (!el.getClientRects().length) continue;
+                                const t = norm(el.textContent);
+                                if (!t.startsWith('effort')) continue;
+                                // The Effort row shows its current value + a submenu chevron.
+                                if (linky(el)) { rejected.push(['link', t.slice(0, 60)]); continue; }
+                                if (t.length > 40) { rejected.push(['long', t.slice(0, 60)]); continue; }
+                                trigger = el; via = 'text';
+                                break;
+                            }
+                            if (trigger) break;
                         }
                     }
                     // ⭐ 2026-08-17 — THE ANCESTRY IS CAPTURED **HERE**, while the
@@ -57141,6 +57245,9 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                     };
                     if (trigger) {
                         trigger.setAttribute(P.attr, P.value);
+                        // Left on the row for the submenu probe and the picker:
+                        // the menu holding it is the popover, not the submenu.
+                        if (P.rowAttr) trigger.setAttribute(P.rowAttr, '1');
                         const chain = [];
                         for (let el = trigger, i = 0; el && i < 8; i++, el = el.parentElement) {
                             chain.push(desc(el));
@@ -57148,13 +57255,14 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                         return {marked: true, via: via,
                                 text: norm(trigger.textContent).slice(0, 60),
                                 shows: spaced(trigger).slice(0, 60),
-                                chain: chain,
+                                chain: chain, menus: menus.length,
                                 rejected: rejected.slice(0, 5)};
                     }
                     return {marked: false, via: '', text: '', chain: [],
-                            rejected: rejected.slice(0, 5)};
+                            menus: menus.length, rejected: rejected.slice(0, 5)};
                 }""", {"attr": _SR_CLICK_MARK, "value": "claude-effort",
-                       "testid": _CLAUDE_EFFORT_TRIGGER_TESTID}) or {}
+                       "testid": _CLAUDE_EFFORT_TRIGGER_TESTID,
+                       "rowAttr": _CLAUDE_EFFORT_ROW_ATTR}) or {}
                 _eff_marked = bool(_eff_mark.get("marked"))
                 # The tier the row SHOWS — the one in effect before anything
                 # below touches it. Read from the gap-aware text (`shows`).
@@ -57165,7 +57273,25 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                         f"{json.dumps(_eff_mark['rejected'], ensure_ascii=False)}", "INFO")
                 # 'open' | 'maybe' | 'closed' — see `_claude_effort_submenu_verdict`.
                 _eff_state, _eff_opened = "closed", False
-                if _eff_marked:
+                # ⭐⭐ 2026-09-23 — THE ROW ALREADY SHOWS THE TIER: NOTHING TO SET.
+                # Today's page reads "Effort Max" on this row. Pressing into the
+                # submenu to "set" Max would run a picker against markup nobody
+                # has captured, for a tier that is already in effect — and that
+                # picker's miss is what made every run report Max unconfirmed.
+                # See `_claude_effort_row_confirms`: only a positive read counts.
+                # ⛔ Not when the policy wants the Thinking toggle: it lives INSIDE
+                # the submenu, so the submenu has work to do whatever the row says.
+                if _eff_marked and not _claude_wants_thinking \
+                        and _claude_effort_row_confirms(_eff_row_shows, _claude_effort):
+                    _effort_confirmed = True
+                    _effort_via = "row"
+                    log(f"[setup_claude_dr] Step 1C OK: the Effort row already shows "
+                        f"{_eff_row_shows!r} — nothing to set, the submenu stays shut")
+                    try:
+                        await page.evaluate(_SR_UNMARK_JS, {"attr": _SR_CLICK_MARK})
+                    except Exception:
+                        pass
+                elif _eff_marked:
                     log(f"[setup_claude_dr] Step 1C: marked the Effort row "
                         f"{_eff_mark.get('text','')!r} (via {_eff_mark.get('via')})")
                     _how = await _sr_real_click(page, "claude-effort",
@@ -57192,6 +57318,7 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                             _eff_probe = await page.evaluate(
                                 _CLAUDE_EFFORT_SUBMENU_JS,
                                 {"trigTestid": _CLAUDE_EFFORT_TRIGGER_TESTID,
+                                 "rowAttr": _CLAUDE_EFFORT_ROW_ATTR,
                                  "optTestid": _claude_effort_option_testid(
                                      _claude_effort)}) or {}
                         except Exception:
@@ -57396,8 +57523,15 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                         // it — the same "chose the wrong sink" shape as the gate
                         // above. Falls back to the newest menu, then the document,
                         // so an older UI without the test id still resolves.
+                        // ⭐⭐ 2026-09-23 — OR THE ROW STEP 1C MARKED. Today's page
+                        // has no trigger test id, so on its own this let the
+                        // popover through as a "submenu": it was searched FIRST,
+                        // and the 09-20 miss reported the popover's rows
+                        // ("opus 5…", "effortlow", "more models") as the
+                        // submenu's. See _CLAUDE_EFFORT_ROW_ATTR.
                         const cands = menus.filter(m =>
-                            !m.querySelector('[data-testid="' + P.trigTestid + '"]'));
+                            !m.querySelector('[data-testid="' + P.trigTestid + '"]')
+                            && !(P.rowAttr && m.querySelector('[' + P.rowAttr + ']')));
                         // ⛔ 2026-08-17 — NO FALLBACK INTO THE TRIGGER'S OWN MENU.
                         // This used to end `|| menus[menus.length - 1]`, which is
                         // reached in exactly one situation: every visible menu
@@ -57462,10 +57596,26 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                             if (hit) { pick = hit; scope = c; items = rows; break; }
                         }
                         if (!pick) {
+                            // ⭐ 2026-09-23 — A MISS NAMES THE SUBMENU'S OWN ROWS,
+                            // long ones included (cut, not dropped). The submenu's
+                            // markup has never been captured, and a row that carries
+                            // a description, as every model row on the popover does,
+                            // is longer than the 24 characters this used to keep —
+                            // so the one log line that could say what the submenu
+                            // offers came back empty. Rows only (no wrapper divs),
+                            // and only from a MENU: the document pool keeps the
+                            // short-label rule, because there a long text is the
+                            // user's own conversation.
+                            const fromMenu = pools.length > 0 && pools[0] !== document;
+                            const saw = fromMenu
+                                ? [...pools[0].querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="option"], button, li')]
+                                    .filter(el => el.getClientRects().length > 0)
+                                    .map(el => norm(el.textContent).slice(0, 40)).filter(Boolean)
+                                : items.map(el => norm(el.textContent))
+                                    .filter(t => t && t.length <= 24);
                             return {set: null, scoped: cands.length > 0,
                                     menus: menus.length, cands: cands.length,
-                                    saw: items.map(el => norm(el.textContent))
-                                        .filter(t => t && t.length <= 24).slice(0, 10)};
+                                    saw: saw.slice(0, 10)};
                         }
                         const already = pick.getAttribute('aria-checked') === 'true' ||
                                         pick.dataset.state === 'checked' || pick.dataset.state === 'on';
@@ -57491,6 +57641,7 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                                 scoped: scope !== document, menus: menus.length,
                                 cands: cands.length};
                     }""", {"trigTestid": _CLAUDE_EFFORT_TRIGGER_TESTID,
+                           "rowAttr": _CLAUDE_EFFORT_ROW_ATTR,
                            "optTestid": _claude_effort_option_testid(_claude_effort),
                            "word": str(_claude_effort or "").lower(),
                            "attr": _SR_CLICK_MARK,
@@ -57556,10 +57707,14 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                             f"{_claude_effort!r} was NOT confirmed in the submenu "
                             f"— the run proceeds at whatever the model's default "
                             f"is, and reports it as unconfirmed", "WARN")
-                elif not _effort_already_known:
-                    log("[setup_claude_dr] Step 1C WARN: Effort control not found "
-                        "(the popover closes when a model is picked — it should "
-                        "have been re-opened above) — reported as unconfirmed", "WARN")
+                elif not _effort_confirmed:
+                    # ⚠ `_effort_confirmed`, not `_effort_already_known`: the row
+                    # read above confirms without opening anything, and a WARN
+                    # about a control we chose not to press would be false.
+                    log(f"[setup_claude_dr] Step 1C WARN: Effort control not found "
+                        f"in the {_eff_mark.get('menus', 0)} open menu(s) (the popover "
+                        f"closes when a model is picked — it should have been "
+                        f"re-opened above) — reported as unconfirmed", "WARN")
             except Exception as _ee:
                 log(f"[setup_claude_dr] Step 1C/1D errored: {_ee}", "WARN")
             await asyncio.sleep(0.3)
@@ -59367,9 +59522,13 @@ async def ensure_deep_mode_active(page, platform, label, reactivate=True) -> dic
             log(f"[{label}] Claude DR pre-send check: active={ok} reactivate={reactivate}"
                 f" extended={bool(state.get('hasExtended'))}"
                 f" research={bool(state.get('researchOn'))}", "DEBUG")
+            # `effortOk` is REPORTED, never gated on (see the detector): it is the
+            # only read of the effort taken AFTER the computer-use pass, and the
+            # post-setup telemetry line uses it to say what that pass left.
             return {"platform": "claude", "active": ok,
                     "hasExtended": bool(state.get("hasExtended")),
-                    "researchOn": bool(state.get("researchOn"))}
+                    "researchOn": bool(state.get("researchOn")),
+                    "effortOk": bool(state.get("effortOk"))}
     except Exception as e:
         log(f"[{label}] ensure_deep_mode_active error: {e}", "WARN")
     return {"platform": platform_l, "active": True}
@@ -61908,8 +62067,18 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             _missing = []
             if _pol.get("thinking") and not _tstate.get("thinking"):
                 _missing.append("extended thinking" if platform_l == "gemini" else "the thinking toggle")
-            if platform_l == "claude" and _pol.get("effort") and not _tstate.get("effort"):
-                _missing.append("max effort")
+            if platform_l == "claude" and _pol.get("effort"):
+                # ⭐ 2026-09-23 — RE-READ, not left "unconfirmed". Setup recorded
+                # the tier it read (`effort_got`), and the pre-send check just
+                # read the model button again — AFTER the computer-use pass. Say
+                # what those found; "max effort" alone is left for "unknown".
+                _eff_after = _claude_effort_after_setup(
+                    _pol.get("effort"), _tstate,
+                    bool((mode_state or {}).get("effortOk")))
+                if _eff_after["note"]:
+                    log(f"[{label}] Phoenix: {_eff_after['note']}", "INFO")
+                if _eff_after["missing"]:
+                    _missing.append(_eff_after["missing"])
             if _missing:
                 _ms = " + ".join(_missing)
                 # Telemetry only — deliberately NOT an _emit_model_drift_alert (see

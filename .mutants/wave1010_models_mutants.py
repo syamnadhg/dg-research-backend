@@ -37,6 +37,20 @@ reader) and the run says which tier it is on. The quiet ones:
          the 2026-06-22 decision removed.
   E9   — the consumer ignores the rule: everything is computed, nothing shown.
 
+⛔⛔ AND THE THIRD (R, T, P, K): the owner-approved capture of 2026-09-23 showed
+the Effort row inside the `role="menu"` popover with NO test id — the id Step 1C
+used both to find the row and to tell the popover from the submenu. The quiet ones:
+
+  R1   — the row search walks the DOCUMENT again; the sidebar comes first.
+  R6   — the picker searches the popover first, and its miss names the POPOVER's
+         rows: exactly the 09-20 log line nobody could diagnose from.
+  R7-R9 — the consumer ignores the rule: one call site is not handed the mark.
+  R13  — the Thinking policy lever is lost behind the row read.
+  R14  — any read of the row confirms Max: a Low run reported as Max.
+  T1   — the post-computer-use button read is never passed to the telemetry line.
+  K1   — the shim's kept document is the one it was GIVEN, so every chained
+         test here would measure nothing.
+
 ⛔ ANCHORS ARE SINGLE STRING LITERALS AND MUST MATCH EXACTLY ONCE. A stale
 anchor is a harness fault, not a survivor, and faults are counted OUT. Every
 mutated file is COMPILED before it is written. The JS mutants are written to
@@ -57,10 +71,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-SUITES = ("tests/test_model_selection_precision.py "
+SUITES = ("tests/test_claude_real_popover_0923.py "
+          "tests/test_drift_review_0805.py "
+          "tests/test_model_selection_precision.py "
           "tests/test_known_good_fallback.py "
           "tests/test_claude_popover_skip.py "
           "tests/test_model_policy.py "
+          "tests/test_prompts_model_policy.py "
           "tests/test_family_only_selection.py "
           "tests/test_claude_model_pick.py "
           "tests/test_gemini_flash_rank.py "
@@ -118,10 +135,10 @@ MUTANTS = [
        "    p, f = ((version_key(picked), version_key(failed))\n"
        "            if isinstance(picked, (int, float)) and isinstance(failed, (int, float))\n"
        "            else (None, None))\n")], MODELS),
+    # ⚠ RE-ANCHORED 2026-09-23: the sentence is now models.VERSION_ORDER_RULE,
+    # shared with the system prompt that rides in the same call (P1-P4 below).
     ("M16", "under", "the computer-use fallback loses the 'ten after nine' rule",
-     [('f"one, close the menu without clicking it. Compare versions part by part "\n'
-       '        f"as whole numbers, never as decimals: the part after the dot counts on "\n'
-       '        f"past nine, so ten after the dot is NEWER than nine after the dot. "\n',
+     [('f"one, close the menu without clicking it. {VERSION_ORDER_RULE} "\n',
        'f"one, close the menu without clicking it. "\n')], MODELS),
 
     # ── _VERSION_ORDER_JS: the browser's one definition ────────────────────
@@ -281,6 +298,141 @@ MUTANTS = [
     ("E16", "under", "⛔ the run log never names the tier",
      [("        log(f\"[setup_claude_dr] {_eff_report['log']}\", _eff_report[\"level\"])\n",
        "")]),
+
+    # ══ task 3 — Step 1C against the REAL 2026-09-23 popover ══════════════
+    # ── the Effort row is found inside an open menu, never on the page ─────
+    ("R1", "over", "⛔⛔ the text search walks the DOCUMENT again: the sidebar "
+     "button that precedes the portalled popover is the row pressed",
+     [("                            for (const el of m.querySelectorAll(\n"
+       "                                    '[role=\"menuitem\"], button, [role=\"option\"], li')) {",
+       "                            for (const el of document.querySelectorAll(\n"
+       "                                    '[role=\"menuitem\"], button, [role=\"option\"], li')) {")]),
+    ("R2", "over", "the test id is resolved anywhere on the page again",
+     [("                            for (const el of m.querySelectorAll(\n"
+       "                                    '[data-testid=\"' + P.testid + '\"]')) {",
+       "                            for (const el of document.querySelectorAll(\n"
+       "                                    '[data-testid=\"' + P.testid + '\"]')) {")]),
+    ("R3", "under", "⛔ the chosen row is never marked for the probe and the picker, "
+     "so today's popover (no test id) reads as a submenu again",
+     [("                        if (P.rowAttr) trigger.setAttribute(P.rowAttr, '1');\n", "")]),
+    ("R4", "over", "a row mark from an earlier pass survives and names the wrong menu",
+     [("                        for (const el of document.querySelectorAll('[' + P.rowAttr + ']')) {\n"
+       "                            el.removeAttribute(P.rowAttr);\n",
+       "                        for (const el of []) {\n"
+       "                            el.removeAttribute(P.rowAttr);\n")]),
+    # The 08-05 guards, now measured INSIDE a menu (test_drift_review_0805 was
+    # re-anchored: outside a menu nothing is a candidate). Arm 1 of `linky` is
+    # left out on purpose — `closest` includes the element itself, so arm 2
+    # already covers a bare anchor and removing arm 1 is an equivalent mutant.
+    ("D2", "over", "a row nested INSIDE a link is pressed — a navigation",
+     [("\n                        || (el.closest && el.closest('a[href]'))\n", "\n")]),
+    ("D3", "over", "an `li` WRAPPING a conversation link is pressed — a navigation",
+     [("\n                        || (el.querySelector && el.querySelector('a[href]'));",
+       ";")]),
+    ("D4", "over", "⛔ links inside the menu are candidates again",
+     [("if (linky(el)) { rejected.push(['link', t.slice(0, 60)]); continue; }", "")]),
+    ("D5", "over", "prose starting 'Effort…' inside a menu is the row pressed",
+     [("if (t.length > 40) { rejected.push(['long', t.slice(0, 60)]); continue; }", "")]),
+    # ── the popover is excluded from the submenu, by the mark ──────────────
+    ("R5", "under", "⛔ the probe ignores the mark: the popover alone reads 'maybe' "
+     "and the picker runs against it",
+     [("\n                        || (P.rowAttr && c.querySelector('[' + P.rowAttr + ']'))),",
+       "),")]),
+    ("R6", "under", "⛔⛔ the picker ignores the mark: it searches the popover first "
+     "and its miss names the POPOVER's rows — the 09-20 log line",
+     [("\n                            && !(P.rowAttr && m.querySelector('[' + P.rowAttr + ']')));",
+       ");")]),
+    ("R7", "under", "⛔ the consumer ignores the rule: the marker is never asked to "
+     "write the row mark",
+     [('                       "testid": _CLAUDE_EFFORT_TRIGGER_TESTID,\n'
+       '                       "rowAttr": _CLAUDE_EFFORT_ROW_ATTR}) or {}',
+       '                       "testid": _CLAUDE_EFFORT_TRIGGER_TESTID}) or {}')]),
+    ("R8", "under", "⛔ the consumer ignores the rule: the probe is not handed the mark",
+     [('                                 "rowAttr": _CLAUDE_EFFORT_ROW_ATTR,\n', "")]),
+    ("R9", "under", "⛔ the consumer ignores the rule: the picker is not handed the mark",
+     [('}""", {"trigTestid": _CLAUDE_EFFORT_TRIGGER_TESTID,\n'
+       '                           "rowAttr": _CLAUDE_EFFORT_ROW_ATTR,\n',
+       '}""", {"trigTestid": _CLAUDE_EFFORT_TRIGGER_TESTID,\n')]),
+    # ── a miss is loud: the submenu's own rows, long ones cut not dropped ──
+    ("R10", "under", "a submenu row with a description is dropped from the miss "
+     "report, which comes back empty",
+     [("const fromMenu = pools.length > 0 && pools[0] !== document;",
+       "const fromMenu = false;")]),
+    ("R11", "over", "⛔ the long-row report reaches the DOCUMENT pool: the user's "
+     "own conversation goes into the log",
+     [("const fromMenu = pools.length > 0 && pools[0] !== document;",
+       "const fromMenu = pools.length > 0;")]),
+    # ── the row already shows the tier: nothing is set ─────────────────────
+    ("R12", "under", "⛔ the consumer ignores the rule: a row reading Max still sends "
+     "the run into the uncaptured submenu",
+     [("                if _eff_marked and not _claude_wants_thinking \\\n",
+       "                if False and _eff_marked and not _claude_wants_thinking \\\n")]),
+    ("R13", "over", "⛔ the Thinking policy lever is lost: with `thinking` on, the "
+     "row read skips the submenu the toggle lives in",
+     [("                if _eff_marked and not _claude_wants_thinking \\\n",
+       "                if _eff_marked \\\n")]),
+    ("R14", "over", "⛔⛔ ANY read of the row confirms the wanted tier — a Low run "
+     "is reported as Max",
+     [('    return bool(w) and str(row_shows or "").strip().lower() == w',
+       "    return bool(w) and bool(row_shows)")]),
+    ("R15", "over", "no wanted tier is 'confirmed' by an empty row",
+     [('    return bool(w) and str(row_shows or "").strip().lower() == w',
+       '    return str(row_shows or "").strip().lower() == w')]),
+    ("R16", "over", "a row-confirmed run still logs 'Effort control not found'",
+     [("                elif not _effort_confirmed:\n",
+       "                elif not _effort_already_known:\n")]),
+    ("R17", "under", "the click mark is left on the row nobody pressed",
+     [("                    try:\n"
+       "                        await page.evaluate(_SR_UNMARK_JS, {\"attr\": _SR_CLICK_MARK})\n"
+       "                    except Exception:\n"
+       "                        pass\n"
+       "                elif _eff_marked:",
+       "                    pass\n"
+       "                elif _eff_marked:")]),
+    ("R18", "under", "the ledger cannot tell a row read from a submenu set",
+     [('                    _effort_via = "row"\n', '                    _effort_via = "submenu"\n')]),
+
+    # ══ after the computer-use pass: the telemetry line says what is known ═
+    ("T1", "under", "⛔ the consumer ignores the rule: the post-CUA button read is "
+     "never passed, so a tier the CUA pass set is still 'unconfirmed'",
+     [('                    bool((mode_state or {}).get("effortOk")))',
+       "                    False)")]),
+    ("T2", "under", "⛔ the pre-send check drops the button read on the way out",
+     [('                    "effortOk": bool(state.get("effortOk"))}',
+       "                    }")]),
+    ("T3", "under", "the tier setup read is never named — 'unconfirmed' again",
+     [("    if got:\n        return {\"missing\": f\"effort is '{got}', not the '{w}' wanted\", \"note\": None}\n",
+       "")]),
+    ("T4", "under", "the button read is ignored",
+     [("    if button_shows_wanted:\n", "    if False:\n")]),
+    ("T5", "under", "the post-CUA confirmation is computed and never said",
+     [("                    log(f\"[{label}] Phoenix: {_eff_after['note']}\", \"INFO\")\n",
+       "                    pass\n")]),
+    ("T6", "over", "a row that read the wanted tier is reported as 'not the wanted'",
+     [("    if got == w:\n        return {\"missing\": None, \"note\": None}\n", "")]),
+    ("T7", "over", "a tier setup CONFIRMED is reported as unconfirmed",
+     [('    if not w or st.get("effort"):', "    if not w:")]),
+
+    # ══ the computer-use missions read "highest" by ORDER ════════════════
+    ("P1", "under", "⛔ the system prompt that rides with the setup directive loses "
+     "the rule — two readings of 'highest' in one call",
+     [("close the menu without clicking it. {VERSION_ORDER_RULE} {no_upsell} In that SAME",
+       "close the menu without clicking it. {no_upsell} In that SAME")], "prompts.py"),
+    ("P2", "under", "the validator loses the rule",
+     [('pick the highest-numbered "{fam}", and close it. {VERSION_ORDER_RULE} {no_upsell}',
+       'pick the highest-numbered "{fam}", and close it. {no_upsell}')], "prompts.py"),
+    ("P3", "under", "ChatGPT's tier mission loses the rule",
+     [("        f'highest-numbered one. {VERSION_ORDER_RULE} Ignore any {cta} button — '",
+       "        f'highest-numbered one. Ignore any {cta} button — '")], MODELS),
+    ("P4", "under", "⛔ the rule reads versions as DECIMALS",
+     [('"after the dot is NEWER than nine after the dot."',
+       '"after the dot is OLDER than nine after the dot."')], MODELS),
+
+    # ══ the harness that measures the above: the shim keeps the document ══
+    ("K1", "under", "⛔⛔ the 'kept' document is the one the script was GIVEN — "
+     "every mark evaporates between scripts and the chained tests measure nothing",
+     [("  return { ret: out.ret, clicks: out.clicks, dom: toSpec(ROOT) };",
+       "  return { ret: out.ret, clicks: out.clicks, dom: spec };")], "tests/_domshim.py"),
 ]
 
 

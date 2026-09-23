@@ -265,6 +265,18 @@ UPSELL_VERBS = ("upgrade", "subscribe", "unlock", "get", "try")
 # for a preposition or two, far short of a sentence.
 UPSELL_WINDOW = 24
 
+# ⭐ HOW TO READ "HIGHEST", said to a computer-use agent. Every instruction that
+# tells an agent to pick the highest-numbered model carries this sentence, and
+# they all carry THIS one, so the setup directive, the system prompt it rides
+# with, the validator and ChatGPT's tier mission cannot disagree about which of
+# two versions is newer. A reader who treats a version as a decimal calls the
+# release after nine-after-the-dot OLDER than it (".10" < ".9") — the mistake the
+# DOM rankers made until 2026-09-23. ⛔ No digits: the Claude setup directive must
+# name no version at all (test_claude_setup_directive_names_no_version).
+VERSION_ORDER_RULE = ("Compare versions part by part as whole numbers, never as "
+                      "decimals: the part after the dot counts on past nine, so ten "
+                      "after the dot is NEWER than nine after the dot.")
+
 
 # ── Reaching the pipeline core from a sibling module ────────────────────
 #
@@ -530,8 +542,8 @@ def p1_select_pro_directive() -> str:
         f'word "{tier}" (it will look like "<model name> {tier}" or "{tier} mode" — '
         f'the model name and version number change over time and DO NOT matter; '
         f'match on "{tier}"). If more than one {tier} option is offered, take the '
-        f'highest-numbered one. Ignore any {cta} button — that is a sales prompt, '
-        f'not the model.',
+        f'highest-numbered one. {VERSION_ORDER_RULE} Ignore any {cta} button — '
+        f'that is a sales prompt, not the model.',
     ]
     if has_thinking_control("chatgpt", 1):
         parts.append(
@@ -1511,14 +1523,14 @@ def p2_claude_setup_directive(family: str = "") -> str:
     fam = (str(family) or primary).capitalize()                # "Opus" / "Sonnet"
     effort = str(pol.get("effort", "max")).capitalize()        # "Max"
     tool = str(pol.get("tool", "research")).capitalize()       # "Research"
-    # ⭐ HOW TO READ "HIGHEST" (the sentence after "close the menu"), in words and
-    # with NO DIGITS. A person reading versions as decimals calls the release
-    # after nine-after-the-dot OLDER than it (".10" < ".9"), which is the same
-    # mistake the DOM rankers made until 2026-09-23. The plan asked for the
+    # ⭐ HOW TO READ "HIGHEST" (the sentence after "close the menu") is
+    # VERSION_ORDER_RULE, in words and with NO DIGITS. The plan asked for the
     # literal "5.10 is newer than 5.9"; it is spelled out instead because this
     # string must name no version at all (see the docstring — a named version is
     # what made the agent treat a higher model as wrong, and
-    # `test_claude_setup_directive_names_no_version` holds that).
+    # `test_claude_setup_directive_names_no_version` holds that). ⚠ The system
+    # prompt this rides with (prompts.claude_deep_research_prompt) carries the
+    # same constant: two strings in one call must not disagree about "highest".
     # Only on the fallback path, and only about the family we are NOT using.
     swapped = "" if fam.lower() == primary.lower() else \
         f"{free_family_note(primary.capitalize(), fam)} "
@@ -1527,9 +1539,7 @@ def p2_claude_setup_directive(family: str = "") -> str:
         f"Model rule: the model must be {fam} — the VERSION NUMBER DOES NOT MATTER "
         f"and a higher one is always correct. Open the model menu ONCE and select "
         f"the HIGHEST {fam} it offers; if the highest {fam} is already the selected "
-        f"one, close the menu without clicking it. Compare versions part by part "
-        f"as whole numbers, never as decimals: the part after the dot counts on "
-        f"past nine, so ten after the dot is NEWER than nine after the dot. "
+        f"one, close the menu without clicking it. {VERSION_ORDER_RULE} "
         f"{upsell_warning(fam)} If the "
         f"button already shows {fam} and the menu will not open, that is fine — "
         f"leave the model as it is. Do NOT type — just set up and focus input. "
