@@ -260,7 +260,22 @@ RESTORE_DROP = ("    if _is_incognito_research(cur_rid):\n"
 RESTORE_HELD = ("    held_a_run_that_keeps_nothing = bool(_is_incognito_research(cur_rid)) or any(\n"
                 '        _is_incognito_research((j or {}).get("research_id")) for j in pending)')
 RESTORE_FORGET = ("    if held_a_run_that_keeps_nothing:\n"
-                  "        _forget_pending_queue_snapshot(path, job_queue)")
+                  "        _forget_pending_queue_snapshot(path, job_queue, refused)")
+RESTORE_REFUSED = ("            skipped += 1\n"
+                   "            refused.append(j)")
+RESTORE_WHITELIST = ('        if _safe_enqueue(job_queue, j, source="disk-restore",\n'
+                     '                         allowed_statuses=("queued", "ongoing")):')
+FORGET_KEEP = ("    live += [j for j in (unrestored or ())\n"
+               '             if not _is_incognito_research((j or {}).get("research_id"))]')
+# ── anchors: a cancel sheds a waiting run that keeps nothing (repair) ───────
+CANCEL_SHED = ("                        if removed and _is_incognito_research(rid):\n"
+               "                            _shed_from_pending_snapshot(job_queue)")
+SHED_LOCK = "    with (lock if lock is not None else contextlib.nullcontext()):"
+SHED_RESET = ('        if _QUEUE_STATE.get("_hard_reset_in_progress"):\n'
+              "            return\n"
+              "        _forget_pending_queue_snapshot(_pending_queue_snapshot_path(), job_queue)")
+SNAP_PATH_ONE = ("    if WORKER_ID == 1:\n"
+                 '        return root / "_pending_queue.json"')
 # ⛔ THE LINES BELOW IT ARE PART OF THE ANCHOR: the same assignment appears at
 # two deeper indents elsewhere, and a four-space anchor is a substring of both.
 FORGET_CURRENT = ('    current = _QUEUE_STATE.get("current_job")\n'
@@ -682,11 +697,12 @@ MUTANTS = [
     ("S6", "under", "⛔⛔ boot reads the snapshot and never writes it, so the "
      "entry a crash left behind stays for ever — nothing can claim it again",
      [(RESTORE_FORGET, "    if False:\n"
-                       "        _forget_pending_queue_snapshot(path, job_queue)")]),
-    ("S7", "over", "every boot rewrites the snapshot, which drops jobs the "
-     "enqueue funnel refused this pass but a later one would have taken",
+                       "        _forget_pending_queue_snapshot(path, job_queue, refused)")]),
+    ("S7", "over", "every boot rewrites the snapshot, even one that held no run "
+     "that keeps nothing — the file an ordinary boot never touched moves under "
+     "it and loses what rehydration already recovered",
      [(RESTORE_FORGET, "    if True:\n"
-                       "        _forget_pending_queue_snapshot(path, job_queue)")]),
+                       "        _forget_pending_queue_snapshot(path, job_queue, refused)")]),
     ("S8", "under", "only the running job counts, so a queued run that keeps "
      "nothing and is refused at boot keeps its brief on the disk",
      [(RESTORE_HELD, "    held_a_run_that_keeps_nothing = bool(_is_incognito_research(cur_rid))")]),
@@ -703,6 +719,41 @@ MUTANTS = [
      [(FORGET_CURRENT, "    current = None\n"
                        "    try:\n"
                        "        live = list(job_queue._queue)")]),
+    # ── the repair round: ordinary work survives the rewrite, a cancel sheds ──
+    ("S12", "under", "⛔⛔ the boot rewrite drops the ordinary jobs the funnel "
+     "could not check this time — a transient Firestore error and somebody's "
+     "paid research is gone, because a private run shared its snapshot",
+     [(RESTORE_FORGET, "    if held_a_run_that_keeps_nothing:\n"
+                       "        _forget_pending_queue_snapshot(path, job_queue)")]),
+    ("S13", "under", "the refused jobs are never collected, so the rewrite is "
+     "handed an empty list and drops them all the same",
+     [(RESTORE_REFUSED, "            skipped += 1")]),
+    ("S14", "over", "⛔ a refused run that keeps nothing is written back too — "
+     "its topic, address and brief stay on the disk the boot was clearing",
+     [(FORGET_KEEP, "    live += list(unrestored or ())")]),
+    ("S15", "under", "⛔⛔ #728 comes back: boot hands the funnel its DEFAULT "
+     "whitelist, and a run parked for its person's Resume is relaunched from a "
+     "sibling's stale snapshot",
+     [(RESTORE_WHITELIST, '        if _safe_enqueue(job_queue, j, source="disk-restore"):')]),
+    ("S16", "under", "⛔⛔ a cancel leaves the snapshot alone — the waiting run "
+     "that keeps nothing stays on the disk, whole, until the run in front of it "
+     "ends, after its person was told nothing is kept",
+     [(CANCEL_SHED, "                        if False:\n"
+                    "                            _shed_from_pending_snapshot(job_queue)")]),
+    ("S17", "over", "every cancel rewrites the snapshot, so an ordinary cancel "
+     "starts writing a file it never wrote before",
+     [(CANCEL_SHED, "                        if removed:\n"
+                    "                            _shed_from_pending_snapshot(job_queue)")]),
+    ("S18", "under", "the shed ignores Reset Backend and rewrites from memory "
+     "inside the reset's own clean write",
+     [(SHED_RESET, "        _forget_pending_queue_snapshot(_pending_queue_snapshot_path(), job_queue)")]),
+    ("S19", "under", "the shed skips the lock every other writer of this file "
+     "takes, so two threads write one tmp file at once",
+     [(SHED_LOCK, "    with contextlib.nullcontext():")]),
+    ("S20", "under", "the shed rewrites a file nobody reads — worker 1's "
+     "snapshot is looked for under a sibling's name",
+     [(SNAP_PATH_ONE, "    if WORKER_ID == 0:\n"
+                      '        return root / "_pending_queue.json"')]),
 
     # ══ the stop has to hold at BOTH ends ══════════════════════════════════
     ("A1", "over", "⛔⛔ the enqueue funnel accepts `stopped`, so the status a "

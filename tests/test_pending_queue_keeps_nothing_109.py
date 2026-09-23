@@ -25,7 +25,11 @@ WHAT THESE PIN
      is the only copy of the work left).
   2. What BOOT does with it: the entry is not re-offered to the enqueue funnel,
      and the file is left holding nothing of that run — gone entirely when it was
-     the only thing in it.
+     the only thing in it — while every ordinary job boot could not restore THIS
+     time stays, whole, for the next attempt.
+  3. What a CANCEL does with it (a leave sends the same cancel): a waiting run
+     that keeps nothing leaves the file at the press, not when the run in front
+     of it happens to end.
 
 ⭐ EVERY PIN RUNS THE REAL FUNCTION AGAINST A REAL FILE and reads the bytes back.
 
@@ -35,9 +39,12 @@ import json
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import research  # noqa: E402
+from _queue_listener import Listener  # noqa: E402
 
 INCOG = "incog_1758400000000_4"
 CHAT = "chat_1758400000000_4"
@@ -290,3 +297,176 @@ def test_a_missing_snapshot_is_not_an_error(tmp_path, monkeypatch):
     _enqueue_recorder(monkeypatch)
     assert research._restore_pending_queue_snapshot(
         tmp_path / "_pending_queue.json", _Queue(), set()) == (0, 0)
+
+
+@pytest.mark.parametrize("slot", ["current", "pending"])
+def test_boot_keeps_an_ordinary_job_it_could_not_check_this_time(
+        tmp_path, monkeypatch, slot):
+    """⛔⛔ AN ORDINARY-RUN REGRESSION THE LAST REPAIR MADE. The rewrite that
+    takes a run that keeps nothing off the disk was built from the live queue —
+    so an ordinary job the funnel refused on THIS boot went with it. The funnel
+    refuses on a transient Firestore error too (a DeadlineExceeded, an
+    UNAVAILABLE), and the claim had already deleted that job's queue document:
+    this file was its only description. Its record stayed "queued" and nothing
+    would ever start it — somebody's paid research, silently gone, because a
+    stranger's private run happened to share the snapshot.
+
+    ⭐ Before that repair boot never wrote this file, so the job waited for the
+    next boot or the next worker boundary. It still does."""
+    ordinary = _job(CHAT, run_id="cats_1")
+    path = _snapshot(tmp_path / "_pending_queue.json",
+                     current=ordinary if slot == "current" else _job(INCOG),
+                     pending=[_job(INCOG)] if slot == "current" else [ordinary])
+    offered = _enqueue_recorder(monkeypatch, accept=False)
+
+    research._restore_pending_queue_snapshot(path, _Queue(), set())
+
+    assert CHAT in [j["research_id"] for j in offered], "it was never even offered"
+    raw = _written(path)
+    kept = json.loads(raw)["pending"]
+    assert [j["research_id"] for j in kept] == [CHAT], (
+        "an ordinary job the funnel could not check this time was dropped")
+    assert kept[0]["topic"] == TOPIC and kept[0]["email"] == EMAIL, (
+        "the job was kept without the work it describes")
+    assert INCOG not in raw, "the run that keeps nothing came back with it"
+
+
+class _Statuses:
+    """`users/{uid}/researches/{rid}` for the REAL enqueue funnel: each record
+    answers with the status named for it."""
+
+    def __init__(self, by_rid):
+        self._by_rid = by_rid
+        self._rid = None
+
+    def collection(self, _name):
+        return self
+
+    def document(self, name):
+        self._rid = name
+        return self
+
+    def get(self):
+        status = self._by_rid.get(self._rid)
+        return type("Snap", (), {"exists": status is not None,
+                                 "to_dict": lambda _s: {"status": status}})()
+
+
+def test_boot_does_not_relaunch_a_run_parked_for_somebodys_resume(
+        tmp_path, monkeypatch):
+    """⛔⛔ #728, AND UNTIL NOW NOTHING RAN IT THROUGH THE CALLER. The boot
+    restore hands the funnel a TIGHTER whitelist than its default — no
+    `paused_backend_restart` — because worker 1's rehydration has just parked
+    that run for its person's Resume, and relaunching it from a sibling's stale
+    snapshot is the double-handling #728 closed. The tests above fake the funnel
+    and discard the argument, so deleting it left them green.
+
+    ⭐ THE REAL FUNNEL, against records that answer. Both polarities: the run
+    that is genuinely ongoing still comes back."""
+    parked = {**_job("chat_1758400000000_5", run_id="parked_1"),
+              "resume_dir": str(tmp_path / "parked_1")}
+    ongoing = {**_job("chat_1758400000000_6", run_id="ongoing_1"),
+               "resume_dir": str(tmp_path / "ongoing_1")}
+    for job in (parked, ongoing):
+        os.makedirs(job["resume_dir"])
+    path = _snapshot(tmp_path / "_pending_queue.json", pending=[parked, ongoing])
+    monkeypatch.setattr(research, "_firebase_db", _Statuses({
+        parked["research_id"]: "paused_backend_restart",
+        ongoing["research_id"]: "ongoing"}))
+    monkeypatch.setattr(research, "log", lambda *a, **k: None)
+    queue = _Queue()
+
+    restored, skipped = research._restore_pending_queue_snapshot(path, queue, set())
+
+    assert [j["research_id"] for j in queue._queue] == [ongoing["research_id"]], (
+        "a run parked for its person's Resume was relaunched from the disk")
+    assert (restored, skipped) == (1, 1)
+
+
+# ══ 3. a cancel takes a waiting run that keeps nothing off the disk ═══════
+
+RUNNING_TOPIC = "the history of the printing press"
+
+
+def _running():
+    """Somebody else's ordinary run, on the worker, with its crash record."""
+    return {**_job(CHAT, run_id="printing_20260922"), "uid": "uid-owner",
+            "submitted_by": "uid-owner", "topic": RUNNING_TOPIC,
+            "email": "owner@example.com", "brief_text": ""}
+
+
+class _Lock:
+    """The hard-reset lock, recording that the shed waited its turn."""
+
+    def __init__(self):
+        self.entered = 0
+
+    def __enter__(self):
+        self.entered += 1
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _cancel_while_it_waits(monkeypatch, tmp_path, waiting, *, resetting=False):
+    """The REAL start listener, holding `waiting` in its deque behind a running
+    job, with the snapshot the worker wrote when it claimed that job — then the
+    person's cancel (which is also what leaving their chat sends)."""
+    lis = Listener(monkeypatch, tmp_path, owner="uid-owner",
+                   current_job=_running(), deque_jobs=[waiting])
+    lock = _Lock()
+    monkeypatch.setitem(research._QUEUE_STATE, "_hard_reset_lock", lock)
+    monkeypatch.setitem(research._QUEUE_STATE, "_hard_reset_in_progress", resetting)
+    path = tmp_path / "queues" / "_pending_queue.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    research._write_pending_queue_snapshot(path, _running(), [waiting])
+    before = _written(path)
+    lis.feed(action="cancel", researchId=waiting["research_id"],
+             uid="uid-sharer", submittedBy="uid-sharer")
+    assert not lis.jobs._queue, "the cancel did not reach the waiting job"
+    return path, before, lock
+
+
+def test_a_cancelled_run_that_keeps_nothing_leaves_the_snapshot_at_the_press(
+        tmp_path, monkeypatch):
+    """⛔⛔ THE PERSON WAS TOLD NOTHING IS KEPT, AND THE FILE KEPT IT. A job
+    waiting behind somebody else's run is written whole — it has to be, the
+    claim deleted its queue document — and a Cancel or a leave took it out of
+    the queue without touching the file. Its topic, address and brief then sat
+    at the root of `queues/` until the running job ended, hours later."""
+    path, _before, lock = _cancel_while_it_waits(monkeypatch, tmp_path, _job(INCOG))
+
+    raw = _written(path)
+    assert TOPIC not in raw, "the cancelled run's topic outlived the press"
+    assert EMAIL not in raw, "the cancelled run's address outlived the press"
+    assert BRIEF not in raw, "the cancelled run's brief outlived the press"
+    snap = json.loads(raw)
+    # ⭐ AND THE RUNNING JOB KEEPS ITS CRASH RECORD — tidying one person's
+    # leftovers must not take another person's safety net with it.
+    assert snap["current"]["research_id"] == CHAT
+    assert snap["current"]["topic"] == RUNNING_TOPIC
+    assert lock.entered == 1, (
+        "the rewrite did not wait for Reset Backend's own write of this file")
+
+
+def test_an_ordinary_cancel_leaves_the_snapshot_as_it_was(tmp_path, monkeypatch):
+    """⭐ ACCEPT POLARITY. An ordinary cancelled job left in the file is harmless
+    — boot re-offers it and the funnel refuses a stopped run — and the next
+    worker boundary tidies it, exactly as before this repair."""
+    ordinary = {**_job("chat_1758400000000_8", run_id="cats_2"),
+                "uid": "uid-sharer"}
+    path, before, _lock = _cancel_while_it_waits(monkeypatch, tmp_path, ordinary)
+
+    assert _written(path) == before
+
+
+def test_a_cancel_during_reset_backend_leaves_the_resets_snapshot_alone(
+        tmp_path, monkeypatch):
+    """⛔ THE SAME RULE THE WORKER'S OWN BOUNDARY FOLLOWS. Reset Backend writes
+    this file itself, under the lock, and then drains the queue; a rewrite from
+    memory landing inside that would put back what the reset is clearing."""
+    path, before, _lock = _cancel_while_it_waits(
+        monkeypatch, tmp_path, _job(INCOG), resetting=True)
+
+    assert _written(path) == before

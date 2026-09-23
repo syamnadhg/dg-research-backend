@@ -15497,6 +15497,11 @@ def start_firestore_start_listener(job_queue, loop):
                         dq.clear()
                         for j in kept:
                             dq.append(j)
+                        # ⛔⛔ AND THE SNAPSHOT FORGETS A RUN THAT KEEPS NOTHING
+                        # NOW, not when the run in front of it ends — a leave
+                        # sends this same cancel. See the helper.
+                        if removed and _is_incognito_research(rid):
+                            _shed_from_pending_snapshot(job_queue)
                         # Bug Cancel-Stale (2026-05-22): for deferred jobs
                         # (still in Firestore queue, no worker has claimed
                         # them) the local dq scan misses, removed=False,
@@ -16796,7 +16801,7 @@ def _write_pending_queue_snapshot(path, current_job, pending_jobs) -> None:
     os.replace(str(tmp_path), str(path))
 
 
-def _forget_pending_queue_snapshot(path, job_queue) -> None:
+def _forget_pending_queue_snapshot(path, job_queue, unrestored=()) -> None:
     """Rewrite the boot snapshot from what is really in the queue now — or take
     the file away when nothing is left.
 
@@ -16806,8 +16811,20 @@ def _forget_pending_queue_snapshot(path, job_queue) -> None:
     that keeps nothing, so that a crash-then-boot for one of those leaves
     nothing of it behind — not the entry, and not the file if it was the only
     thing in it. Jobs that really did restore are in the queue and are written
-    back; refused ones are dropped, which is exactly what the next worker
-    boundary would have done with them anyway.
+    back.
+
+    ⛔⛔ AND SO ARE THE ORDINARY JOBS BOOT COULD NOT RESTORE THIS TIME —
+    `unrestored` (wave 10.9 repair). This rewrite was built from the live queue
+    alone, so an ordinary job the funnel refused went with the private run: and
+    the funnel refuses on a transient Firestore error too, for a job whose queue
+    document the claim had already deleted — this file was the only description
+    of it left, its record stayed "queued", and nothing would ever start it.
+    Before the rewrite existed such a job waited for the next boot or the next
+    worker boundary; it still does. Only a run that keeps nothing is shed from
+    this list, which is the whole reason the rewrite exists.
+
+    Also called by a cancel that takes a waiting run that keeps nothing out of
+    the queue — see `_shed_from_pending_snapshot`.
 
     ⛔⛔ IT WRITES AROUND WHATEVER IS RUNNING NOW, and does not assert that
     nothing is. The worker task is created BEFORE boot reaches the disk
@@ -16821,6 +16838,8 @@ def _forget_pending_queue_snapshot(path, job_queue) -> None:
         live = list(job_queue._queue)
     except Exception:
         live = []
+    live += [j for j in (unrestored or ())
+             if not _is_incognito_research((j or {}).get("research_id"))]
     try:
         if live or current:
             _write_pending_queue_snapshot(path, current, live)
@@ -16828,6 +16847,40 @@ def _forget_pending_queue_snapshot(path, job_queue) -> None:
             Path(path).unlink(missing_ok=True)
     except Exception as e:
         log(f"[pending_queue] could not clear the boot snapshot: {e}", "WARN")
+
+
+def _pending_queue_snapshot_path() -> Path:
+    """This worker's queue snapshot. Worker 1 keeps the legacy name, so a
+    single-worker install that never re-paired still finds its file; workers 2+
+    get their own, because two writers sharing one tmp-then-replace race."""
+    root = Path(__file__).parent / "queues"
+    if WORKER_ID == 1:
+        return root / "_pending_queue.json"
+    return root / f"_pending_queue_worker_{WORKER_ID}.json"
+
+
+def _shed_from_pending_snapshot(job_queue) -> None:
+    """Rewrite this worker's snapshot after a cancel took a waiting run that
+    keeps nothing out of the queue.
+
+    ⛔⛔ A CANCEL NEVER TOUCHED THIS FILE (wave 10.9 repair). A job waiting its
+    turn is written whole — it has to be, the claim deleted its queue document
+    and this is the only description of the work left — so a run that keeps
+    nothing, cancelled or left while it waited behind somebody else's run, kept
+    its topic, its delivery address and its brief at the root of `queues/`
+    until that other run ended, hours after the person was told nothing is kept.
+
+    ⭐ UNDER THE SAME LOCK, AND THE SAME RULE, AS THE WORKER'S OWN BOUNDARY:
+    Reset Backend writes this file itself and then drains the queue, and a
+    rewrite from memory landing inside that would put back what it is clearing.
+    Only the job's OWN leaving is handled here — an ordinary cancelled job left
+    in the file is harmless (boot re-offers it and the funnel refuses a stopped
+    run), so an ordinary cancel still writes nothing."""
+    lock = _QUEUE_STATE.get("_hard_reset_lock")
+    with (lock if lock is not None else contextlib.nullcontext()):
+        if _QUEUE_STATE.get("_hard_reset_in_progress"):
+            return
+        _forget_pending_queue_snapshot(_pending_queue_snapshot_path(), job_queue)
 
 
 def _restore_pending_queue_snapshot(path, job_queue, already_rids) -> "tuple[int, int]":
@@ -16901,18 +16954,20 @@ def _restore_pending_queue_snapshot(path, job_queue, already_rids) -> "tuple[int
     # restore.
     restored = 0
     skipped = 0
+    refused = []
     for j in disk_jobs:
         if _safe_enqueue(job_queue, j, source="disk-restore",
                          allowed_statuses=("queued", "ongoing")):
             restored += 1
         else:
             skipped += 1
+            refused.append(j)
     if restored or skipped:
         log(f"[pending_queue] Disk snapshot processed: restored={restored}, skipped={skipped}")
     else:
         log("[pending_queue] Disk snapshot empty — nothing to restore")
     if held_a_run_that_keeps_nothing:
-        _forget_pending_queue_snapshot(path, job_queue)
+        _forget_pending_queue_snapshot(path, job_queue, refused)
     return (restored, skipped)
 
 
@@ -75861,10 +75916,10 @@ async def run_server(port=8000):
     # file only — siblings restore their own. Single-worker installs
     # keep the legacy filename (worker 1 = no suffix) so a pre-PR install
     # that never re-pairs into multi-worker still finds its snapshot.
-    if WORKER_ID == 1:
-        _pending_queue_path = queues_root / "_pending_queue.json"
-    else:
-        _pending_queue_path = queues_root / f"_pending_queue_worker_{WORKER_ID}.json"
+    # ⭐ ONE ANSWER for the name, shared with the cancel path that sheds a run
+    # that keeps nothing from this file (`_shed_from_pending_snapshot`) — two
+    # spellings of one path are how a writer and a rewriter drift apart.
+    _pending_queue_path = _pending_queue_snapshot_path()
 
     # Forward declaration so the module-scope device-cmd listener at
     # research.py:1766 can call this closure via _QUEUE_STATE["persist_fn"].
