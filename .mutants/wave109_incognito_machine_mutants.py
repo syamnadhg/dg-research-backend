@@ -73,7 +73,7 @@ ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 # ── anchors: the predicate and the mint ─────────────────────────────────────
 ID_RE = '_INCOGNITO_ID_RE = re.compile(r"^incog_[0-9]{13}_[0-9]{1,6}$")'
 PREDICATE = ('    return isinstance(research_id, str) and '
-             'bool(_INCOGNITO_ID_RE.match(research_id))')
+             'bool(_INCOGNITO_ID_RE.fullmatch(research_id))')
 MINT_INCOG = ('    if _is_incognito_research(research_id):\n'
               '        return f"incognito_{research_id.removeprefix(\'incog_\')}_{stamp}"')
 MINT_PLAIN = '    return f"{safe_name(topic)}_{stamp}"'
@@ -307,12 +307,19 @@ CLAIM_QUEUE_DELETE = ('                        f"recreating it", "WARN")\n'
 
 MUTANTS = [
     # ══ the one predicate ══════════════════════════════════════════════════
+    # ⛔ I1 AND I2 PUT `.match` BACK AS WELL. Under `fullmatch` a pattern that
+    # loses its `$` means exactly what it meant with it, so the pattern edit
+    # alone became an equivalent mutant — a harness bug, not a kill.
     ("I1", "over", "a bare prefix match — `incog_notes` becomes a run that "
      "keeps nothing, and its owner never sees it again",
-     [(ID_RE, '_INCOGNITO_ID_RE = re.compile(r"^incog_")')]),
+     [(ID_RE, '_INCOGNITO_ID_RE = re.compile(r"^incog_")'),
+      (PREDICATE, "    return isinstance(research_id, str) and "
+                  "bool(_INCOGNITO_ID_RE.match(research_id))")]),
     ("I2", "over", "⛔⛔ the end anchor goes — `incog_…-copy` is ephemeral, and "
      "a TTL rule is handed an id it will expire",
-     [(ID_RE, '_INCOGNITO_ID_RE = re.compile(r"^incog_[0-9]{13}_[0-9]{1,6}")')]),
+     [(ID_RE, '_INCOGNITO_ID_RE = re.compile(r"^incog_[0-9]{13}_[0-9]{1,6}")'),
+      (PREDICATE, "    return isinstance(research_id, str) and "
+                  "bool(_INCOGNITO_ID_RE.match(research_id))")]),
     ("I3", "under", "⛔⛔ the predicate answers False for everything — nothing "
      "about an ordinary run breaks and the whole feature is decoration",
      [(PREDICATE, "    return False")]),
@@ -321,7 +328,12 @@ MUTANTS = [
      [(PREDICATE, "    return True")]),
     ("I5", "under", "a non-string id raises instead of answering, which stops "
      "a sweep mid-scan",
-     [(PREDICATE, "    return bool(_INCOGNITO_ID_RE.match(research_id))")]),
+     [(PREDICATE, "    return bool(_INCOGNITO_ID_RE.fullmatch(research_id))")]),
+    ("I26", "over", "⛔ `match` again, so `$` takes the id with a trailing "
+     "newline that the app and both rules refuse — the machine fuses and "
+     "purges a research the app still lists",
+     [(PREDICATE, "    return isinstance(research_id, str) and "
+                  "bool(_INCOGNITO_ID_RE.match(research_id))")]),
 
     # ══ the run id ═════════════════════════════════════════════════════════
     ("I6", "under", "⛔⛔ the mint forgets incognito — the topic is back in the "

@@ -49,6 +49,10 @@ def test_an_id_this_app_mints_is_incognito(rid):
     "xincog_1758400000000_1",      # not anchored at the front
     "incog_1758400000000_1-copy",  # not anchored at the end
     "incog_1758400000000_1234567",  # counter past the shape
+    # ⛔ A TRAILING NEWLINE. Python's `$` matches just before one, so `.match`
+    # said yes where the app's `RegExp.test` and both rules' `matches()` say
+    # no — the machine would fuse, purge and silence a research the app lists.
+    "incog_1758400000000_1\n",
     "",
 ])
 def test_every_other_id_this_database_holds_is_an_ordinary_research(rid):

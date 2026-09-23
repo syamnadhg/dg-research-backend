@@ -6076,6 +6076,12 @@ def safe_name(topic, max_len=50):
 # ⭐ ANCHORED AT BOTH ENDS, for the reason the web's copy gives: a bare
 # `startswith("incog_")` would call somebody's hand-made `incog_notes` record
 # ephemeral and hang a 48-hour fuse on an ordinary research.
+#
+# ⛔ AND ASKED WITH `fullmatch`, NEVER `match`. Python's `$` also matches just
+# before a final newline, so `match` said yes to `incog_…_1\n` while the app's
+# `RegExp.test` and both rules files say no — the four copies agreed in spelling
+# and disagreed in meaning. The pattern text stays as the web spells it, because
+# the parity pin compares the text.
 _INCOGNITO_ID_RE = re.compile(r"^incog_[0-9]{13}_[0-9]{1,6}$")
 
 
@@ -6088,7 +6094,7 @@ def _is_incognito_research(research_id) -> bool:
     `_fb_research_id` would answer about the wrong run at every one of those
     sites. Callers that mean the running pipeline pass `_fb_research_id`
     themselves, and they are the minority."""
-    return isinstance(research_id, str) and bool(_INCOGNITO_ID_RE.match(research_id))
+    return isinstance(research_id, str) and bool(_INCOGNITO_ID_RE.fullmatch(research_id))
 
 
 def _mint_run_id(topic, research_id=None, now=None) -> str:
