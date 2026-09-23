@@ -56,7 +56,7 @@ ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 # ── anchors: the rule ───────────────────────────────────────────────────────
 RULE_READ = ('        snap = (_firebase_db.collection("users").document(uid)\n'
              '                .collection("researches").document(rid).get())\n'
-             "        exists = bool(snap.exists)")
+             "        # Inside the try: a snapshot")
 RULE_FAILED = ('                f"not a deletion", "WARN")\n'
                "        return None, None")
 RULE_GONE = ('        _log_pickup_stand_down(where, rid, "deleted")\n'
@@ -125,7 +125,7 @@ MUTANTS = [
      "the uid's place — so it answers about a record that is never there",
      [(RULE_READ, '        snap = (_firebase_db.collection("users").document(rid)\n'
                   '                .collection("researches").document(rid).get())\n'
-                  "        exists = bool(snap.exists)")]),
+                  "        # Inside the try: a snapshot")]),
     ("L1", "under", "⛔ the stand-down line is written into whatever run is "
      "armed — on a shared computer, somebody else's",
      [(LINE_SCOPE, "    if True:\n"
