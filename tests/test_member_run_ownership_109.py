@@ -267,6 +267,35 @@ def test_a_resume_for_a_research_that_does_not_exist_writes_nothing(tmp_path, mo
     assert lis.incoming == ["incoming"]
 
 
+class _FailsOnce(dict):
+    """Research records whose FIRST read fails and whose later reads answer."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.calls = 0
+
+    def get(self, key, default=None):
+        self.calls += 1
+        if self.calls == 1:
+            raise TimeoutError("DeadlineExceeded")
+        return super().get(key, default)
+
+
+def test_a_resume_whose_record_is_gone_after_a_failed_read_writes_nothing(
+        alices_run, tmp_path, monkeypatch):
+    """⛔ THE NOT-FOUND EXIT, REACHED THE ONE WAY IT STILL CAN (wave 10.10).
+    The pickup rule now reads the record first and stands a missing one down,
+    so the test above is decided by the rule. But a read that FAILS takes the
+    job, and the run id is then resolved from the document — which a moment
+    later says there is none. That exit must still write nothing: there is no
+    document to write to, and the disk fallback would find Alice's run."""
+    lis = Listener(monkeypatch, tmp_path, owner=OWNER,
+                   research_docs=_FailsOnce()).feed(**_queue_doc(ALICE))
+    assert lis.writes == [], "a refusal was written to a document nobody has"
+    assert lis.enqueued == []
+    assert lis.incoming == ["incoming"]
+
+
 def test_the_person_whose_run_it_is_still_resumes_it(alices_run, tmp_path, monkeypatch):
     """⭐ ACCEPT POLARITY — the whole product. Without this, a guard that
     refused every resume would pass every refusal above.
@@ -298,11 +327,19 @@ def test_the_person_whose_run_it_is_still_resumes_it_from_the_disk_alone(
 
 def test_the_device_owner_still_resumes_a_sharers_run(alices_run, tmp_path, monkeypatch):
     """⭐⭐ THE OWNER-CONTROL PATH writes `uid=<sharer>`, `submittedBy=<owner>`
-    on purpose. The sharer's own owner.json names the sharer, so it matches."""
+    on purpose. The sharer's own owner.json names the sharer, so it matches.
+
+    ⛔ AND IT MATCHES ON THE PAYLOAD'S CLAIM, NOT ON A RESCUE. The record has no
+    `backendRunId` (its write-back failed), so a claim wrongly refused would be
+    found again from the disk and "repair" the document on the way — the resume
+    would still happen and hide the refusal. No repair write is the proof the
+    claim itself was honoured."""
     lis = Listener(monkeypatch, tmp_path, owner=OWNER,
                    research_docs={(ALICE, RID): {"status": "paused_backend_restart"}}).feed(
         **_queue_doc(ALICE, submittedBy=OWNER, backendRunId=RUN))
     assert [(j["uid"], j["run_id"]) for j in lis.enqueued] == [(ALICE, RUN)]
+    assert not any("backendRunId" in w[2] for w in lis.writes), (
+        "the owner's claim was refused and the run found again from the disk")
 
 
 def _legacy_held(tmp_path):
