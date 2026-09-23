@@ -13,8 +13,8 @@ Public surface:
     ImgMeta               — screenshot metadata (viewport + DPR)
     ActionResult          — typed return from ask()/act()
     VisionMetrics         — call counts, tokens, cost, p95 latency
-    with_vision_fallback  — wrapper used by Playwright sites at hotspots
     execute_action        — runs an ActionResult against a Playwright page
+    act_loop              — Vision drives the page at a hotspot (DG_VISION_TIER=act)
 
 Design source: scratch/vision_hotspots.md (8 hotspots + 4 generic capabilities)
               + V1 advisor `a29c1dcf8b2ec8059` (perfection-grade spec).
@@ -487,8 +487,7 @@ class VisionClient:
         high_stakes: bool = False,
         timeout_s: float = DEFAULT_TIMEOUT_S,
     ) -> ActionResult:
-        """Convenience: screenshot the page then ask the model. The bread-
-        and-butter call from with_vision_fallback()."""
+        """Convenience: screenshot the page then ask the model."""
         image, meta = await self.screenshot(page)
         # Inject viewport into flow_context — vision needs this to reason
         # about coords. Caller doesn't have to remember.
@@ -708,7 +707,7 @@ async def execute_action(page: Any, result: ActionResult, img_meta: ImgMeta) -> 
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# with_vision_fallback — the V3 wire-in pattern. Lives here for caller ease.
+# The V3 wire-in: the mode switch, and what runs at an escalation site.
 # ─────────────────────────────────────────────────────────────────────────
 
 def is_vision_enabled() -> Literal["off", "shadow", "tier2", "tier3"]:
@@ -718,9 +717,8 @@ def is_vision_enabled() -> Literal["off", "shadow", "tier2", "tier3"]:
     - "shadow" — Vision runs in PARALLEL with CUA at tier-2 escalation
                  sites; logs Vision's proposed action but CUA's output is
                  what acts. Used for promotion-criterion telemetry.
-    - "tier2"  — Vision ACTS before CUA at escalation sites (act_loop /
-                 with_vision_fallback drive the page; CUA stays the tier-3
-                 safety net). ``DG_VISION_TIER=act`` is an alias — it is
+    - "tier2"  — Vision ACTS before CUA at escalation sites (act_loop
+                 drives the page; CUA stays the tier-3 safety net). ``DG_VISION_TIER=act`` is an alias — it is
                  the ONE switch that arms the Track-B acting path for the
                  user's validation runs.
     - "tier3"  — Vision runs only AFTER CUA also fails. Reserved.
@@ -795,8 +793,8 @@ async def shadow_observe_then_cua(
     proposed action for offline comparison, but ONLY return CUA's result.
     Vision NEVER touches the page. Zero risk to pipeline.
 
-    Promotion criterion (per scratch/vision_v3_plan.md): a hotspot flips
-    from this helper to with_vision_fallback() once N >= 10 events show
+    Promotion criterion (per scratch/vision_v3_plan.md): a hotspot is ready
+    for the act tier (`act_loop`, DG_VISION_TIER=act) once N >= 10 events show
     >= 80% action-class agreement and >= 70% coord proximity within 0.10.
 
     Caller must enable via DG_VISION_TIER=shadow. Default off — caller
@@ -1251,45 +1249,6 @@ async def act_loop(
     else:
         _log_step(steps_used, {"terminal": final.action}, is_final=True, outc=outcome)
     return final
-
-
-async def with_vision_fallback(
-    page: Any,
-    primary_fn: Callable[[], Awaitable[Any]],
-    *,
-    flow_context: dict,
-    cua_fallback: Callable[[Any, dict, str], Awaitable[Any]] | None = None,
-    vision: VisionClient | None = None,
-    high_stakes: bool = False,
-) -> Any:
-    """Run `primary_fn` (Playwright). On failure, ask Vision; if Vision
-    proposes an action, execute it then re-enter `primary_fn` once. If
-    Vision escalates or `primary_fn` fails again, fall through to CUA.
-
-    `primary_fn` MUST be re-entrant (idempotent reads OK; idempotent writes
-    handled by the underlying workflow's resume logic). ⛔ The example this
-    named — the P2 `extract_share_link_*` extractors — was removed on
-    2026-08-28; the live re-entrant callers are the NotebookLM extractors.
-    """
-    vc = vision or default_client()
-    try:
-        return await primary_fn()
-    except Exception as e:
-        flow_context = dict(flow_context)
-        flow_context["context_hint"] = (
-            f"playwright failed: {type(e).__name__}: {str(e)[:200]}"
-        )
-        result = await vc.act(page, flow_context, high_stakes=high_stakes)
-        if result.action == "declare_success":
-            return result
-        if result.action in ("escalate_to_cua", "declare_failure") or result.low_confidence:
-            if cua_fallback:
-                return await cua_fallback(page, flow_context, result.reason)
-            raise  # no CUA — re-raise the original Playwright error
-        # Vision proposed a concrete action — execute and resume primary.
-        _, meta = await vc.screenshot(page)  # refresh meta in case viewport changed
-        await execute_action(page, result, meta)
-        return await primary_fn()  # one resume attempt; further failures re-raise
 
 
 # ─────────────────────────────────────────────────────────────────────────

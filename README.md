@@ -1203,7 +1203,7 @@ research-automate/
 │                               # version literals) + UPSELL_VERBS. Bump a model here, not in research.py.
 ├── vision.py                   # Anthropic Sonnet vision client (tier-2 acting). Module surface:
 │                               # default_client, is_vision_enabled, execute_action, act_loop,
-│                               # with_vision_fallback, shadow_observe_then_cua, observe_only,
+│                               # shadow_observe_then_cua, observe_only,
 │                               # reset_default_metrics.  (This line used to name `take_screenshot`
 │                               # and `vision_action`; neither symbol exists anywhere in the repo.)
 ├── narrate.py           # Vision-tier panel narrator (PHASE_BUDGET=0 by default; retired 2026-04-30 — re-enable via DG_VISION_NARRATE=1)

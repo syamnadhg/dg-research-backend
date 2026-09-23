@@ -219,6 +219,18 @@ MUTANTS = [
      [('            }""", _gm_family)',
        '            }""", "flash")')],
      RESEARCH, RANK),
+
+    # ══ the rule the dead vision helper claimed, pinned where it really lives ══
+    # ⭐ `with_vision_fallback` was deleted: nothing called it, and its
+    # docstring named callers that do not exist. The RULE it described — the
+    # page is read first and Vision only rescues — lives in
+    # `_shadow_observed_cua`'s mode gate, and this is the proof that removing
+    # the helper removed no measurement: breaking the gate is still caught.
+    ("V1", "under", "⛔ with Vision switched off, an escalation still goes to "
+     "Vision first — the reverse of 'the page comes first, Vision rescues'",
+     [('    if _mode not in ("shadow", "tier2"):',
+       '    if _mode not in ("off", "shadow", "tier2"):')],
+     RESEARCH, ["tests/test_vision_act_dispatch.py"]),
 ]
 
 

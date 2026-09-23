@@ -139,17 +139,6 @@ async def smoke_test() -> int:
     assert result.confidence == 0.0, "failure result has zero confidence"
     print(f"  [ok] bad-key path returns declare_failure (reason: {result.reason[:60]})")
 
-    # 5. with_vision_fallback contract — primary success returns directly
-    async def primary_ok():
-        return "primary-ran"
-    out = await vision.with_vision_fallback(
-        page=None, primary_fn=primary_ok,
-        flow_context={"workflow_name": "smoke"},
-        vision=client,
-    )
-    assert out == "primary-ran", "primary success should pass through"
-    print("  [ok] with_vision_fallback: primary success path")
-
     print("--- smoke test PASSED --------------------------------------")
     return 0
 
