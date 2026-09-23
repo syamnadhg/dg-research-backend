@@ -13,6 +13,20 @@ Every mutant reverts ONE decision. The ones that matter most are the quiet ones:
   C7/C8 — the copy is computed and the card ignores it: the consumer-ignores-
         the-rule shape, which a test of the words alone cannot see.
 
+  P / A — phase 0 ends when phase 1 starts; each agent's time reaches the cloud.
+
+  T / H / L / S / D (rebuilt 2026-09-23 after the crash) — phase 3 ends in the
+        hand-off's own write, no machine write lands a stale phase list over a
+        row's end, and the late phase-3 save writes what it was dispatched
+        with and nothing about where the run is. T1, S1 and D1 are the
+        consumer-ignores-the-rule mutants: the tail, save_meta and the dispatch
+        each dropping what the helper beside it gets right.
+
+  ⚠ NOT MUTATED, AND SAID SO: `_meta_json_lock`. It closes an in-process window
+  of microseconds between the late save's re-read of meta.json and its write;
+  no deterministic test can open that window, so a mutant of it would survive
+  without meaning anything. The re-read it protects IS mutated (S3).
+
 ⛔ ANCHORS ARE SINGLE STRING LITERALS AND MUST MATCH EXACTLY ONCE. A stale
 anchor is a harness fault, not a survivor, and faults are counted OUT. Every
 mutated file is COMPILED before it is written.
@@ -34,7 +48,9 @@ SUITES = ("tests/test_crash_card_chrome_1010.py "
           "tests/test_stop_is_not_a_crash_108.py "
           "tests/test_analytics_times_1010.py "
           "tests/test_phase_durations_0811.py "
-          "tests/test_phase1_status_order_0811.py")
+          "tests/test_phase1_status_order_0811.py "
+          "tests/test_phase3_handoff_1010.py "
+          "tests/test_late_writers_name_their_run_109.py")
 RESEARCH = "research.py"
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
@@ -70,6 +86,51 @@ A_BOOL = ('                and isinstance(_secs, (int, float)) and not isinstanc
 A_ZERO = '                and _secs > 0):'
 A_SET = '            agents.setdefault(_key, {})["completionTimeSec"] = int(_secs)'
 A_SITE = '            save_meta(queue_dir, topic, 2, agent_results=results)'
+
+# ── anchors: phase 3 ends at the hand-off (the pipeline's tail) ─────────────
+T_CALL = ('        _record_hand_off(queue_dir, (_fb_uid, _fb_research_id),\n'
+          '                         int(_p3_start * 1000) if _p3_start else None)')
+T_BIND = '    _p3_start = None\n'
+
+# ── anchors: the hand-off's write (`_record_hand_off` + its disk half) ──────
+H_MERGE = '                    rows[i] = {**have, **row}'
+H_APPEND = '                rows.append(dict(row))'
+H_READ = ('            rows = list(data.get("phases") or [])\n'
+          '            for i, have in enumerate(rows):')
+H_FALLBACK = ('            f"writing the hand-off on its own", "WARN")\n'
+              '        _update_research_doc(uid, rid, handoff)')
+H_GUARD = ('    try:\n'
+           '        row = _close_phase_three_on_disk(queue_dir, rid, phase3_began_ms, handoff_ms)\n'
+           '    except Exception as e:\n'
+           '        log(f"hand-off: could not close phase 3 in meta.json ({e})", "WARN")\n'
+           '        row = None')
+H_REOPEN = '            rows[3]["completedAt"] = None'
+H_REFUSE = '        if row is None or row.get("startedAt") != began_ms:'
+H_DISK = ('        meta["phases"] = rows\n'
+          '        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")\n'
+          '        return dict(row)')
+
+# ── anchors: one machine writer of the phase list at a time ────────────────
+L_STATUS = ('        with _phases_write_lock:\n'
+            '            snap = ref.get()\n'
+            '            data = (snap.to_dict() or {}) if snap.exists else {}\n'
+            '            phases = list(data.get("phases") or [])')
+L_HANDOFF = ('        with _phases_write_lock:\n'
+             '            snap = ref.get()\n'
+             '            data = (snap.to_dict() or {}) if snap.exists else {}\n'
+             '            rows = list(data.get("phases") or [])')
+L_ACQ = '    _phases_write_lock.acquire()\n'
+L_REL = '        _phases_write_lock.release()'
+
+# ── anchors: the late phase-3 save (save_meta + its dispatch) ──────────────
+S_RT = '    _rt = runtime if runtime is not None else _runtime'
+S_RECORD = ('    if scans_only:\n'
+            '        _record = {"agents": agents, "updatedAt": now_ms}')
+S_DISK = ('        if scans_only:\n'
+          '            # ⛔ Where the run IS')
+D_RUNTIME = '                    "runtime": _runtime_at_dispatch(),\n'
+D_SCANS = '                    "scans_only": True},'
+D_COPY = '            setattr(held, name, _copy.deepcopy(live))'
 
 MUTANTS = [
     # ── C: the terminal crash card ─────────────────────────────────────────
@@ -170,6 +231,102 @@ MUTANTS = [
     ("A7", "under", "⛔ only an agent that already has an entry gets its time, "
      "so the one that ran 25 minutes and died with no report says nothing",
      [(A_SET, '            if _key in agents: agents[_key]["completionTimeSec"] = int(_secs)')]),
+
+    # ── T: the pipeline's tail hands phase 3's end to the hand-off ─────────
+    ("T1", "under", "⛔⛔ THE CONSUMER IGNORES THE RULE — the tail makes the old "
+     "bare beDone write, and every test of the helper still passes while no run "
+     "ever gets an end on phase 3",
+     [(T_CALL, '        _update_firestore_research({"beDone": True, '
+               '"beDoneAt": int(time.time() * 1000)})')]),
+    ("T2", "under", "⛔ the tail hands over no start, so the hand-off writes "
+     "itself alone on every run and phase 3 stays the status write's stub",
+     [(T_CALL, '        _record_hand_off(queue_dir, (_fb_uid, _fb_research_id),\n'
+               '                         None)')]),
+    ("T3", "under", "⛔ the start goes in seconds, not milliseconds — before the "
+     "run began by 55 years, so it is refused and nothing closes",
+     [(T_CALL, '        _record_hand_off(queue_dir, (_fb_uid, _fb_research_id),\n'
+               '                         int(_p3_start) if _p3_start else None)')]),
+    ("T4", "under", "⛔⛔ the binding at the top goes, so a run that skipped "
+     "phase 3 or resumed past it raises UnboundLocalError at the hand-off, "
+     "and the crash card replaces the cloud kick",
+     [(T_BIND, "    pass\n")]),
+
+    # ── H: the hand-off's write ────────────────────────────────────────────
+    ("H1", "under", "⛔⛔ the row is computed and the record's stub is kept — "
+     "the status write's 'Phase 3' with no end, which is the defect",
+     [(H_MERGE, "                    rows[i] = have")]),
+    ("H2", "under", "⛔ the stub wins the merge — its label, and a start that is "
+     "really when the phase finished, over the row this write computed",
+     [(H_MERGE, "                    rows[i] = {**row, **have}")]),
+    ("H3", "under", "⛔ when the hand-off lands before the status write, there "
+     "is no stub to merge into and phase 3 gets no row at all",
+     [(H_APPEND, "                pass")]),
+    ("H4", "over", "⛔⛔ THE OVERWRITE THE RULE FORBIDS — the record's rows are not "
+     "read back, so the hand-off erases phases 0-2 and any row the cloud has "
+     "already stamped for 4 or 5",
+     [(H_READ, "            rows = []\n"
+               "            for i, have in enumerate(rows):")]),
+    ("H5", "under", "⛔⛔ a refused read costs the hand-off itself — no beDone, "
+     "and a restart stamps a run the cloud is finishing",
+     [(H_FALLBACK, '            f"writing the hand-off on its own", "WARN")')]),
+    ("H6", "under", "⛔ a meta.json the hand-off cannot use raises out of it, "
+     "and the run ends with no beDone and no cloud kick",
+     [(H_GUARD, "    row = _close_phase_three_on_disk(queue_dir, rid, "
+                "phase3_began_ms, handoff_ms)")]),
+    ("H7", "under", "⛔ a row an earlier attempt closed is kept, so a resume "
+     "that ran phase 3 again reports the stopped attempt's span",
+     [(H_REOPEN, "            pass")]),
+    ("H8", "over", "⛔⛔ THE INVENTION — a start the rows refused is written "
+     "anyway, and phase 3 is given the backfilled start: phase 2's end, or the "
+     "run's start when phase 2 never saved",
+     [(H_REFUSE, "        if row is None:")]),
+    ("H9", "under", "⛔ the row reaches the record and not the disk, so the next "
+     "save on this run rebuilds phase 3 from a file that never saw it end",
+     [(H_DISK, "        return dict(row)")]),
+
+    # ── L: one machine writer of the phase list at a time ──────────────────
+    ("L1", "under", "⛔⛔ THE RACE, RESTORED — the status write reads, the "
+     "hand-off lands phase 3's end, and the status write lands the array it read",
+     [(L_STATUS, "        if True:\n"
+                 "            snap = ref.get()\n"
+                 "            data = (snap.to_dict() or {}) if snap.exists else {}\n"
+                 "            phases = list(data.get(\"phases\") or [])")]),
+    ("L2", "under", "⛔ the hand-off takes no lock, so it reads under a status "
+     "write that has read and not yet written, and loses to it",
+     [(L_HANDOFF, "        if True:\n"
+                  "            snap = ref.get()\n"
+                  "            data = (snap.to_dict() or {}) if snap.exists else {}\n"
+                  "            rows = list(data.get(\"phases\") or [])")]),
+    ("L3", "under", "⛔ save_meta's whole-array write takes no lock, and phase "
+     "2's end goes the way phase 3's did",
+     [(L_ACQ, "    pass\n"), (L_REL, "        pass")]),
+
+    # ── S / D: the late phase-3 save ───────────────────────────────────────
+    ("S1", "under", "⛔⛔ THE CONSUMER IGNORES THE RULE — save_meta is handed the "
+     "runtime as it was at dispatch and reads the live one anyway, so the next "
+     "run's reset empties this run's findings",
+     [(S_RT, "    _rt = _runtime")]),
+    ("S2", "over", "⛔⛔ THE LATE WRITE OVER THE CLOUD — the phase-3 save writes "
+     "the phase list, the phase and the status after the hand-off: the rows the "
+     "web stamped for 4 and 5 are gone and the pointer goes back to 3",
+     [(S_RECORD, "    if False:\n"
+                 "        _record = {\"agents\": agents, \"updatedAt\": now_ms}")]),
+    ("S3", "over", "⛔ the same on disk — the file the save read before its scan "
+     "is written back over the hand-off's end",
+     [(S_DISK, "        if False:\n"
+               "            # ⛔ Where the run IS")]),
+    ("D1", "under", "⛔⛔ THE DEFECT, RESTORED — the dispatch hands over no "
+     "runtime, so the save reads whatever the next run has put there",
+     [(D_RUNTIME, "")]),
+    ("D2", "over", "⛔⛔ the dispatch forgets `scans_only`, and the late save "
+     "writes where the run is again",
+     [(D_SCANS, '                    "scans_only": False},')]),
+    ("D3", "under", "⛔ a shallow copy — the lists inside are still the run's "
+     "own, so a change in place reaches the late write",
+     [(D_COPY, "            setattr(held, name, live)")]),
+    ("D4", "under", "⛔ no copy at all — the save holds the live maps, which "
+     "only survives because today's reset happens to rebind them",
+     [(D_COPY, "            setattr(held, name, getattr(_runtime, name))")]),
 ]
 
 
