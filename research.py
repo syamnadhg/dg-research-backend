@@ -75182,10 +75182,16 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # ⛔ "Kept closing" only when it did. The planner can also refuse
             # a FIRST Chrome death (a run past the phases it can re-enter),
             # and "1 times in a row" is the sentence this exists to remove.
+            #
+            # ⛔ THE TITLE KEEPS THE "stopped:" SHAPE. The web rewrites any title
+            # its `humanizeError` does not recognise into "Hit a snag at the
+            # research step — retrying.", which sat above a body saying we
+            # stopped. "<who> stopped: <what>" is the shape it passes through
+            # verbatim (the 09-19 evidence headline), so no web change is needed.
             if _captured_failure_kind == "browser_crash":
                 _closes = _crash_retries + 1
-                _card_error = ("Chrome kept closing" if _closes > 1
-                               else "Chrome closed unexpectedly")
+                _card_error = ("Research stopped: Chrome kept closing" if _closes > 1
+                               else "Research stopped: Chrome closed unexpectedly")
                 _card_reason = (
                     (f"Chrome closed {_closes} times in a row on the research "
                      f"computer, so we stopped reopening it. " if _closes > 1

@@ -57,7 +57,8 @@ ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 # ── anchors: the terminal crash card ────────────────────────────────────────
 C_BRANCH = '            if _captured_failure_kind == "browser_crash":'
 C_COUNT = "                _closes = _crash_retries + 1"
-C_TITLE = '                _card_error = ("Chrome kept closing" if _closes > 1'
+C_TITLE = ('                _card_error = ("Research stopped: Chrome kept closing" '
+           'if _closes > 1')
 C_STREAK = ('                     f"computer, so we stopped reopening it. " '
             'if _closes > 1')
 C_ADVICE = ('                    + "Quit other Chrome windows there, update Chrome, or "\n'
@@ -147,7 +148,7 @@ MUTANTS = [
      [(C_COUNT, "                _closes = _crash_retries")]),
     ("C4", "over", "⛔ a single close is called a streak in the title — "
      "'Chrome kept closing' about one death the planner refused to retry",
-     [(C_TITLE, '                _card_error = ("Chrome kept closing" if _closes > 0')]),
+     [(C_TITLE, C_TITLE.replace("if _closes > 1", "if _closes > 0"))]),
     ("C5", "over", "⛔ a single close is called a streak in the details — "
      "'Chrome closed 1 times in a row', the sentence this wave removes",
      [(C_STREAK, '                     f"computer, so we stopped reopening it. " '

@@ -26,6 +26,7 @@ card off the one `fail_phase` call the terminal branch makes. Only the edges of
 the run are stubbed: the network, the clipboard, the log file and the browser.
 """
 import asyncio
+import re
 
 import pytest
 
@@ -105,7 +106,7 @@ def test_after_chrome_closed_over_and_over_the_card_names_chrome(crashed_run):
     "The run kept hitting errors" — which says nothing about Chrome at all."""
     run, _qd = crashed_run
     card = run(_chrome_died(), crash_retries=research.BROWSER_CRASH_MAX_RETRIES)
-    assert card["error"] == "Chrome kept closing"
+    assert card["error"] == "Research stopped: Chrome kept closing"
     closes = research.BROWSER_CRASH_MAX_RETRIES + 1
     assert f"Chrome closed {closes} times in a row" in card["reason"], (
         "the card must say how many times Chrome closed — it is the fact that "
@@ -163,10 +164,35 @@ def test_a_single_close_does_not_claim_a_streak(crashed_run, monkeypatch):
                         lambda *a, **k: (False, 0, True))
     run, _qd = crashed_run
     card = run(_chrome_died(), crash_retries=0)
-    assert card["error"] == "Chrome closed unexpectedly"
+    assert card["error"] == "Research stopped: Chrome closed unexpectedly"
     assert "times in a row" not in card["reason"]
     assert "Quit other Chrome windows" in card["reason"], (
         "the advice is the same whichever way Chrome went")
+
+
+# ══ 4. the title reaches the screen ════════════════════════════════════
+#: The web's `humanizeError` (src/lib/pipeline-errors.ts) passes a title through
+#: verbatim when it matches this, on the lower-cased title; anything it does not
+#: recognise becomes "Hit a snag at the research step — retrying." — a false
+#: line above a body saying we stopped.
+_WEB_VERBATIM_STOPPED = re.compile(r"\bstopped:\s*\S")
+
+
+@pytest.mark.parametrize("streak", [False, True])
+def test_the_chrome_title_is_one_the_web_shows_as_written(crashed_run, monkeypatch,
+                                                         streak):
+    """⛔ Wave 10.10's first cut titled the card "Chrome kept closing"; the web
+    matched it to nothing and showed "Hit a snag … — retrying." instead, so the
+    new title never reached the screen. Both close counts are driven."""
+    retries = research.BROWSER_CRASH_MAX_RETRIES if streak else 0
+    if not streak:
+        monkeypatch.setattr(research, "_plan_pipeline_auto_retry",
+                            lambda *a, **k: (False, 0, True))
+    run, _qd = crashed_run
+    title = run(_chrome_died(), crash_retries=retries)["error"]
+    assert _WEB_VERBATIM_STOPPED.search(title.lower()), title
+    assert "Chrome" in title.split("stopped:", 1)[1]
+    assert not research._web_swallows_title(title)
 
 
 def test_the_card_still_records_that_the_run_gave_up(crashed_run):
