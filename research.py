@@ -69898,8 +69898,9 @@ def _close_phase_three_on_disk(queue_dir, rid, began_ms, end_ms):
         except Exception:
             return None
         if "id" not in meta:
-            meta["id"] = Path(queue_dir).name
-            meta["createdAt"] = _run_started_ms(queue_dir)
+            # The same first-write stamp as `save_meta`: a run that skipped
+            # phases 1 and 2 has written no meta.json before this.
+            meta.update(id=Path(queue_dir).name, createdAt=_run_started_ms(queue_dir))
         rows = meta.get("phases")
         if isinstance(rows, list) and len(rows) > 3 and isinstance(rows[3], dict):
             rows[3]["completedAt"] = None

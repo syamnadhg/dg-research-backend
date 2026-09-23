@@ -340,10 +340,11 @@ TITLE_WRITE = ('                _update_research_doc(_uid, _rid, {"title": text,
                '"updatedAt": int(time.time() * 1000)})')
 TITLE_CARD = "                            if (_fb_uid, _fb_research_id) == (_uid, _rid):"
 SUMMARY_WRITE = '                _update_research_doc(_uid, _rid, {"summary": text})'
-META_DISPATCH = '            kwargs={"research": (_fb_uid, _fb_research_id)},'
+# ⚠ 2026-09-23 re-anchored (wave 10.10): the dispatch also hands over the
+# runtime it copied and `scans_only`, on the lines after this one.
+META_DISPATCH = '            kwargs={"research": (_fb_uid, _fb_research_id),'
 META_WRITE = ("        if research:\n"
               "            _update_research_doc(_uid, _rid, _record)")
-META_PSTAT = "    _pstat = _phase_status_by_rid.get(_rid, {}) or {}"
 META_ASTAT = "        _astat = (_agent_status_by_rid.get(_rid, {}) or {}).get(platform) \\"
 # ── anchors: the route's reply is not quoted for a private run ─────────────
 REPLY_GATE = "    _quote_reply = not _is_incognito_research(research_id)"
@@ -993,14 +994,18 @@ MUTANTS = [
      [(SUMMARY_WRITE, '                _update_firestore_research({"summary": text})')]),
     ("LW8", "under", "⛔⛔ the phase-3 meta thread names no research, so its "
      "agents map — every agent's sources and findings — lands on whoever runs next",
-     [(META_DISPATCH, "            kwargs={},")]),
+     [(META_DISPATCH, "            kwargs={")]),
     ("LW9", "under", "⛔ save_meta is handed the research and writes through the "
      "globals anyway — the helper is perfect and nothing honours it",
      [(META_WRITE, "        if False:\n"
                    "            _update_research_doc(_uid, _rid, _record)")]),
-    ("LW10", "under", "the phase timeline is stamped with the NEXT run's phase "
-     "statuses",
-     [(META_PSTAT, "    _pstat = _phase_status_by_rid.get(_fb_research_id, {}) or {}")]),
+    # LW10 RETIRED 2026-09-23 (wave 10.10) — it was "the phase timeline is
+    # stamped with the NEXT run's phase statuses", and the phase-3 thread no
+    # longer writes a phase timeline at all (`scans_only`; phase 3 ends in the
+    # hand-off's own write). The stamp moved into `_phase_rows`, whose every
+    # caller now hands it the RUNNING research's id, so the mutant is equivalent
+    # and would count as a kill it never earned. What the thread must not write
+    # is pinned in `tests/test_phase3_handoff_1010.py`.
     ("LW11", "under", "the agents map is stamped with the NEXT run's agent "
      "statuses",
      [(META_ASTAT, "        _astat = (_agent_status_by_rid.get(_fb_research_id, {}) "

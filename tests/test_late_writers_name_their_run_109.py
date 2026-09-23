@@ -190,8 +190,8 @@ def test_the_phase_three_meta_thread_lands_on_the_run_that_dispatched_it(
     a thread so the ffprobe per podcast does not hold up `phase_complete`, and
     the run hands phases 4 and 5 to the cloud and returns moments later. The
     thread's write is the whole agents map — every agent's sources and
-    findings — and the phase timeline, stamped with the statuses the runtime
-    recorded for the run it names."""
+    findings — stamped with the statuses the runtime recorded for the run it
+    names."""
     queue_dir = tmp_path / "divorce_20260922_101500"
     (queue_dir / "documents").mkdir(parents=True)
     monkeypatch.setitem(research._phase_status_by_rid, A_RID, {3: "complete"})
@@ -205,6 +205,8 @@ def test_the_phase_three_meta_thread_lands_on_the_run_that_dispatched_it(
     [(path, payload)] = world.db.writes
     assert path == _record(A_UID, A_RID), f"the meta write went to {path}"
     # ⭐ AND WHAT IT CARRIES IS A's — not B's statuses stamped onto A's record.
-    [phase3] = [p for p in payload["phases"] if p.get("phase") == 3]
-    assert phase3["status"] == "complete", payload["phases"]
     assert payload["agents"]["claude"]["status"] == "complete", payload["agents"]
+    # ⚠ 2026-09-23 (wave 10.10): it no longer carries a phase timeline at all —
+    # phase 3 ends in the hand-off's own write, and after the hand-off the
+    # phase list is the cloud's. `tests/test_phase3_handoff_1010.py` pins that.
+    assert "phases" not in payload, payload.get("phases")

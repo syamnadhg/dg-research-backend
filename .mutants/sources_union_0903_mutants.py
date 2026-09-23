@@ -59,7 +59,9 @@ PANEL = (
     '            _panel_urls = []\n'
     '            try:\n'
     '                _panel_urls = [\n'
-    '                    u for u in (getattr(_runtime, "agent_progress_snapshots", {})\n'
+    # ⚠ 2026-09-23 re-anchored (wave 10.10): `save_meta` reads the runtime it
+    # was handed, `_rt`, so a late save writes what it was dispatched with.
+    '                    u for u in (getattr(_rt, "agent_progress_snapshots", {})\n'
     '                                .get(platform, {}) or {}).get("source_urls", []) or []\n'
     '                    if isinstance(u, str) and u.lower().startswith(("http://", "https://"))\n'
     '                    and not _find_is_platform_host(u)\n'
@@ -126,7 +128,7 @@ MUTANTS = [
      "the same way, which is what pointed at the try/except as the thing worth "
      "mutating",
      [(PANEL, "            _panel_urls = [\n"
-              '                u for u in (getattr(_runtime, "agent_progress_snapshots", {})\n'
+              '                u for u in (getattr(_rt, "agent_progress_snapshots", {})\n'
               '                            .get(platform, {}) or {}).get("source_urls", []) or []\n'
               '                if isinstance(u, str) and u.lower().startswith(("http://", "https://"))\n'
               "                and not _find_is_platform_host(u)\n"
