@@ -120,11 +120,16 @@ MUTANTS = [
      "heartbeat dropping the client in the same second drops the run",
      [(NO_CLIENT, '        log(f"[safe_enqueue:{source}] skipped — Firestore '
                   'unavailable", "WARN")\n        return False')]),
-    ("T5", "over", "⛔⛔ taking is widened to a record that is GONE — a deleted "
-     "research is started from the listener",
+    # ⚠ WIDENING THE EXISTENCE CHECK ALONE IS AN EQUIVALENT MUTANT, measured:
+    # a record that is gone has no status, so the whitelist below refuses it
+    # anyway. The first run of this harness reported it as a survivor. The
+    # real way to start a deleted research is to widen BOTH checks.
+    ("T5", "over", "⛔⛔ taking is widened to every answer — a deleted research "
+     "is started from the listener",
      [(EXISTS, "            if not snap.exists and not take_unreadable:\n"
                '                log(f"[safe_enqueue:{source}] skipped — research {rid[:24]}… '
-               'no longer exists in Firestore", "INFO")')]),
+               'no longer exists in Firestore", "INFO")'),
+      (STATUS, "            if status not in allowed_statuses and not take_unreadable:")]),
     ("T6", "over", "⛔⛔ taking is widened past the whitelist — a run somebody "
      "stopped between the claim and the enqueue is started",
      [(STATUS, "            if status not in allowed_statuses and not take_unreadable:")]),
