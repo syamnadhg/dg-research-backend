@@ -201,14 +201,15 @@ back into `do`.
 | "what can you do?", "help", "what is Super Research", "how do I start", "options", "commands" | `sr.py do "<message>"` relays the capability line — the same list the catch-all prints, without the sentence in front that says the request was not understood. ⛔ Not `status-account`: on an account that already has a computer that prints `✓ Signed in as <email>` and nothing else |
 | "the brief link", "a report link", "the NotebookLM link", "the doc", "the video" | `sr.py status ["<title>"]` — every link lives in the status output; there is no separate link command. Said on their own these name the most-recent run |
 | "my past research", "my researches", "my runs" | `sr.py list` |
-| "skip the podcast on \"<title>\"", "skip the video on the <title> run" | `sr.py skip <phase> --run "<title>"` — a phase of a run that is **not** the newest. Without `--run` every skip lands on the most-recent active run |
+| "skip the podcast on \"<title>\"", "skip the video on the <title> run" | `sr.py skip <phase> --run "<title>"` — a phase of a run that is **not** the newest. Without `--run` every skip lands on the most-recent active run — or asks which run, when the user has one chat can't manage |
 | "skip phase 3", "skip phases 4 and 5" | `sr.py skip 3` / `sr.py skip 4 5` — the numbers are 1 (brief), 3 (podcast/audio), 4 (video/youtube), 5 (report/email). Any other number is refused by name |
 | "skip all but the podcast", "skip everything except the brief" | the **complement** — `sr.py skip brief video report` keeps the podcast. Never pass the phase they said to KEEP |
 | "cancel the run" | `sr.py stop` — same as "stop"; the word `cancel` withdraws nothing else |
 | "research <topic> without video", "…with no email" | `sr.py research "<topic>" --no-video` / `--no-email` |
 | "send the computer's own logs" | `sr.py send-logs --machine` |
 
-**Safe defaults:** unnamed run → the **most-recent active** run. **Confirm before
+**Safe defaults:** unnamed run → the **most-recent active** run (a run verb asks
+which one instead while the user has a run chat can't manage). **Confirm before
 `stop`, `logout`, `device-remove`, `device-ask`, `device-approve`, `device-deny`,
 `device-visibility public`, `update`, and `install`** (a quick "Stop the EV run?" is enough);
 everything else runs on a clear request. The four device ones destroy nothing and
@@ -302,6 +303,10 @@ never `retry`, never a question back to the user.
   *isn't ready yet*.
 - **stop** → confirm first. ENDS the run (terminal "stopped") and keeps the results
   so far + the chat (deletes nothing). Use **pause** for a temporary, resumable hold.
+- **"I can’t tell which run you mean"** → a stop / pause / resume / retry / skip
+  with no run named, while the user has a run chat can't manage. **Relay it and
+  wait for them to name a run. ⛔ Never pick one of the listed runs for them** —
+  the run they meant may be the one chat can't manage, and a stop can't be undone.
 - **skip** → no args → skip whatever the run is **blocked** on. ⛔ NOT EVERY
   BLOCKER HAS A SKIP — some cards offer only Retry, and the reply will say so
   ("that card has no Skip"). **That is a real answer, not an error to work

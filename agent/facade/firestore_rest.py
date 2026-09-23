@@ -179,6 +179,42 @@ def is_incognito_research(research_id: Any) -> bool:
     return isinstance(research_id, str) and _INCOGNITO_ID_RE.fullmatch(research_id) is not None
 
 
+def unshown_husk(doc: dict[str, Any]) -> dict[str, Any]:
+    """All the assistant keeps of a research it must not show: its ``status``,
+    and whether a decision card sits on it. Nothing else of the document is
+    decoded — not its id, title, topic, links, or the card's own words.
+
+    ⛔⛔ WHY IT KEEPS ANYTHING AT ALL. Leaving the run out of every list made a
+    bare "stop" in chat stop the newest run it COULD see — the person's ordinary
+    run — while the one they had just started, the incognito one, kept going.
+    Stop cannot be undone. The chat has to know that a run it cannot show is
+    still going, so that it refuses to guess instead of guessing wrong. The path
+    says the run is one to hide; these two fields say whether it is still one a
+    person could mean. Neither says what it is about.
+
+    ⭐ THE CARD IS TESTED FOR PRESENCE ON THE RAW WIRE VALUE. A card's title and
+    message are words about the run, so they are never decoded here."""
+    fields = doc.get("fields") or {}
+    status = fields.get("status")
+    card = (fields.get("pendingDecision") or {}).get("mapValue") or {}
+    return {"status": from_value(status) if isinstance(status, dict) else None,
+            "card": bool(card.get("fields"))}
+
+
+class ResearchList(list):
+    """``list_researches``' answer: the rows it may show, newest first — and, on
+    ``unshown``, one ``unshown_husk`` per research it left out.
+
+    ⭐ A LIST, SO EVERY READER THAT TAKES A LIST STILL DOES. The husks ride on the
+    same answer because they come from the same read: a second request for them
+    would cost a Firestore list on every chat poll, and a separate method would
+    be a second read that a route could call instead of this one."""
+
+    def __init__(self, rows: Any = (), unshown: Any = ()) -> None:
+        super().__init__(rows)
+        self.unshown: list[dict[str, Any]] = list(unshown)
+
+
 def pair_state_usable(d: dict[str, Any]) -> bool:
     """Would the web app's submit gate accept this machine? Mirrors
     ``isDeviceEligible`` (``device-order.ts``): ``!pairState || pairState ===
@@ -275,7 +311,7 @@ class FirestoreRest:
         return resp.json() if resp.content else {}
 
     # ── reads ──
-    def list_researches(self, uid: str, *, page_size: int = 50) -> list[dict[str, Any]]:
+    def list_researches(self, uid: str, *, page_size: int = 50) -> ResearchList:
         """List the user's research docs, NEWEST first.
 
         The REST documents.list endpoint, absent ``orderBy``, returns docs by
@@ -292,14 +328,20 @@ class FirestoreRest:
         and reads by its date, as the web app's `labelHeldRuns` does. The test is
         on the document's PATH, never on a field, because the path is the one
         signal the rules and the web app read too.
+
+        ⭐ WHAT IS LEFT OUT IS COUNTED, NOT SHOWN: each dropped research leaves an
+        ``unshown_husk`` on the answer's ``unshown`` — its status and whether a
+        card is on it, and nothing else — so the bridge can tell the chat that a
+        run it cannot show is still going (see ``ResearchList``).
         """
         url = (f"{config.FIRESTORE_BASE}/users/{uid}/researches"
                f"?pageSize={page_size}&orderBy=createdAt%20desc")
         body = self._request("GET", url)
-        out: list[dict[str, Any]] = []
+        out = ResearchList()
         for d in body.get("documents", []):
             rid = doc_id(d.get("name", ""))
             if is_incognito_research(rid):
+                out.unshown.append(unshown_husk(d))
                 continue
             row = fields_to_dict(d)
             row["id"] = rid

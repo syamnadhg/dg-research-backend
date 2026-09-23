@@ -59,7 +59,12 @@ def only(name: str) -> tuple:
 
 
 # ── anchors: the read ───────────────────────────────────────────────────────
+# ⭐ The husk line sits inside the filter since the bare-verb follow-up: what is
+# left out is counted (`ResearchList.unshown`) — every replacement keeps it, so
+# each mutant still changes only what it says it changes.
+HUSK = "                out.unshown.append(unshown_husk(d))\n"
 FILTER = ("            if is_incognito_research(rid):\n"
+          + HUSK +
           "                continue\n")
 
 # ── anchors: the rule ───────────────────────────────────────────────────────
@@ -105,15 +110,15 @@ MUTANTS = [
     ("F2", "under", "⛔ the filter believes a field on the record instead of "
      "its path, which is the one signal the rules and the web app read",
      [(FILTER, "            if is_incognito_research(fields_to_dict(d).get(\"id\")):\n"
-               "                continue\n")], REST, ALL),
+               + HUSK + "                continue\n")], REST, ALL),
     ("F3", "over", "the filter is a prefix test, so `incog_notes` — somebody's "
      "ordinary research — vanishes from their lists",
      [(FILTER, "            if rid.startswith(\"incog\"):\n"
-               "                continue\n")], REST, ALL),
+               + HUSK + "                continue\n")], REST, ALL),
     ("F4", "over", "the list stops at the first incognito row, so every older "
      "ordinary research goes with it",
      [(FILTER, "            if is_incognito_research(rid):\n"
-               "                break\n")], REST, ALL),
+               + HUSK + "                break\n")], REST, ALL),
 
     # ══ the rule ═══════════════════════════════════════════════════════════
     ("P1", "under", "⛔⛔ the predicate answers False for everything",

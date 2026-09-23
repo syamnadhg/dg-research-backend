@@ -494,6 +494,52 @@ def _pick_run(runs: list, arg: str | None, *, prefer_active: bool = False) -> di
     return runs[0]
 
 
+#: What a bare verb would have done, for the sentence that says it did not.
+_NOT_DONE = {"stop": "stopped", "pause": "paused", "resume": "resumed",
+             "retry": "retried", "skip": "skipped"}
+
+
+def _refuse_to_guess(body: dict, verb: str) -> tuple[dict, list[str]] | None:
+    """(payload, chat lines) refusing a BARE run verb — or None to go ahead.
+
+    ⛔⛔ A BARE VERB MUST NOT SILENTLY PICK A DIFFERENT RUN. An incognito run is
+    in no list the chat can read, so a bare "stop" said right after starting one
+    used to stop the newest run the chat COULD see — the person's ordinary run —
+    and leave the one they meant going. Stop cannot be undone. The bridge now
+    says a run it cannot show is still going (`hiddenLiveRun`), and a bare verb
+    then asks instead of choosing.
+
+    ⭐ ONE RULE FOR ALL FIVE VERBS. It refuses even where the hidden run could not
+    have been the one meant (a bare resume while it is running): telling which
+    verb could have meant which run would need the hidden run's age and state in
+    the chat, and those are exactly what the chat must not hold.
+
+    ⛔ IT NAMES NOTHING OF THE HIDDEN RUN beyond "a run you can’t manage from
+    chat" — no topic, no id, not how many. It names the runs it CAN manage
+    (`live` on each row: the bridge's own test, so the two cannot disagree).
+
+    ⛔ `is True`, NOT TRUTHINESS: an older bridge does not send the field, and a
+    run it lists is one this client may act on exactly as it always did."""
+    if not (isinstance(body, dict) and body.get("hiddenLiveRun") is True):
+        return None
+    mine = [r for r in body.get("runs") or [] if isinstance(r, dict) and r.get("live") is True]
+    lines = [f"I can’t tell which run you mean, so I haven’t {_NOT_DONE[verb]} anything."]
+    if mine:
+        lines.append("You have a run you can’t manage from chat. These are the ones I can:")
+        lines += [f"  • “{r.get('title') or r.get('topic') or r.get('runId')}” — "
+                  f"{r.get('status') or '?'}" for r in mine]
+        lines.append("Tell me which one by name.")
+    else:
+        lines.append("You have a run you can’t manage from chat, and no other run in progress.")
+    lines += _agent_directive_block([
+        f"Do not {verb} any run until the person names one. Never pick one of "
+        "these runs for them — the run they meant may be one chat cannot manage."])
+    payload = {"ok": False, "reason": "which_run", "error": lines[0],
+               "runs": [{"runId": r.get("runId"), "title": r.get("title"),
+                         "status": r.get("status")} for r in mine]}
+    return payload, lines
+
+
 def _device_names() -> dict:
     """{deviceId: friendly name} from /devices (name → hostname → id). Empty on failure."""
     code, body = _get("/devices")
@@ -3156,6 +3202,9 @@ def cmd_stop(args) -> int:
     code, body, runs = _fetch_runs(limit=_LOOKUP_LIMIT)
     if code != 200:
         return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
+    unsure = None if args.runId else _refuse_to_guess(body, "stop")
+    if unsure:
+        return _emit(unsure[0], args.json, unsure[1], 1)
     run = _pick_run(runs, args.runId, prefer_active=True)
     if run is None:
         which = f"matching “{args.runId}”" if args.runId else "to stop"
@@ -3178,6 +3227,9 @@ def cmd_pause(args) -> int:
     code, body, runs = _fetch_runs(limit=_LOOKUP_LIMIT)
     if code != 200:
         return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
+    unsure = None if args.runId else _refuse_to_guess(body, "pause")
+    if unsure:
+        return _emit(unsure[0], args.json, unsure[1], 1)
     run = _pick_run(runs, args.runId, prefer_active=True)
     if run is None:
         which = f"matching “{args.runId}”" if args.runId else "to pause"
@@ -3198,6 +3250,9 @@ def cmd_resume(args) -> int:
     code, body, runs = _fetch_runs(limit=_LOOKUP_LIMIT)
     if code != 200:
         return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
+    unsure = None if args.runId else _refuse_to_guess(body, "resume")
+    if unsure:
+        return _emit(unsure[0], args.json, unsure[1], 1)
     # Prefer a PAUSED run (that's what resume targets) before the generic newest pick,
     # so a bare "resume" doesn't grab a newer ongoing/terminal run.
     paused = [r for r in runs if (r.get("status") or "") == "paused"]
@@ -3218,6 +3273,9 @@ def cmd_retry(args) -> int:
     code, body, runs = _fetch_runs(limit=_LOOKUP_LIMIT)
     if code != 200:
         return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
+    unsure = None if args.runId else _refuse_to_guess(body, "retry")
+    if unsure:
+        return _emit(unsure[0], args.json, unsure[1], 1)
     run = _pick_run(runs, args.runId, prefer_active=True)
     if run is None:
         which = f"matching “{args.runId}”" if args.runId else "to retry"
@@ -3253,6 +3311,11 @@ def cmd_skip(args) -> int:
     code, body, runs = _fetch_runs(limit=_LOOKUP_LIMIT)
     if code != 200:
         return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
+    # ⛔ Bare means no run NAMED — phases or not. `skip video` with no `--run`
+    # reconfigures whichever run it picks, so it asks exactly as `skip` does.
+    unsure = None if args.run else _refuse_to_guess(body, "skip")
+    if unsure:
+        return _emit(unsure[0], args.json, unsure[1], 1)
     run = _pick_run(runs, args.run or None, prefer_active=True)
     if run is None:
         which = f"matching “{args.run}”" if args.run else "to skip in"
