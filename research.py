@@ -3663,6 +3663,42 @@ def _console_withholds_line() -> bool:
     return about_the_run and bool(origin) and _is_incognito_research(origin)
 
 
+def _line_is_another_runs(sink) -> bool:
+    """True when the line being written came from a run OTHER than the one
+    whose folder is armed — so the folder must not get it.
+
+    ⛔⛔ THE FOLDER WAS STILL DECIDED AT WRITE TIME (wave 10.10). Wave 10.9's
+    last repair taught the console to ask a line's ORIGIN, but the folder copy
+    kept asking only "what is armed now". A private run's work that outlives
+    the run — a `to_thread` worker still inside a fetch, a copied-context
+    thread, a task nobody awaited — then wrote into the NEXT run's folder
+    while it stayed out of `backend.log`, and that folder ships in the next
+    person's support bundle. A verifier measured exactly that.
+
+    The four cases, decided:
+      · SAME origin as the folder's research → the run's own line: kept.
+      · a DIFFERENT origin → somebody else's line: not this folder's.
+      · NO origin → the machine's or the server's (a loop the server started,
+        an SDK callback, a raw thread) → kept, UNCHANGED. The per-run command
+        listener's `Command received: STOP` and the reap after it run on a
+        thread no context reaches, and they are the only account some runs
+        have of how they ended — see the comment above `_LOG_SCOPE`. Those
+        lines print to `backend.log` too; nothing about them is private.
+      · an origin, and a folder whose research is UNKNOWN → not kept. The line
+        is known to be one run's, and a folder that cannot say it is that
+        run's does not get it. A run whose own id is unknown sets no origin
+        (`run_pipeline_captured` sets exactly the id it armed the folder
+        with), so no run ever loses its own lines to this branch.
+
+    ⭐ Compared as stripped strings, the way `_run_folders_for_research_any`
+    matches a folder to a research."""
+    origin = str(_LOG_RUN.get() or "").strip()
+    if not origin:
+        return False
+    armed = str(getattr(sink, "research_id", None) or "").strip()
+    return origin != armed
+
+
 def _log_write_through(line: str, level: str) -> None:
     """Copy one already-formatted `log()` line into the armed run folder.
 
@@ -3670,16 +3706,19 @@ def _log_write_through(line: str, level: str) -> None:
     through `log()`, and a background thread's line must not be silenced just
     because the pipeline thread happens to be mid-write.
 
-    ⭐ THE ONE EXCLUSION IS EXPLICIT. Everything still reaches the armed run
+    ⭐ TWO EXCLUSIONS, BOTH EXPLICIT. Everything still reaches the armed run
     except what a standing machine-concern loop deliberately wrapped — see
     `_machine_log_scope`, and the list of loops that are NOT wrapped, which is
-    the more important half."""
+    the more important half — and a line whose origin is ANOTHER run; see
+    `_line_is_another_runs`."""
     if _LOG_SCOPE.get() == _LOG_SCOPE_MACHINE:
         return
     if getattr(_RUN_LOG_TLS, "busy", False):
         return
     sink = _RUN_LOG_SINKS[-1] if _RUN_LOG_SINKS else None
     if sink is None:
+        return
+    if _line_is_another_runs(sink):
         return
     _RUN_LOG_TLS.busy = True
     try:
