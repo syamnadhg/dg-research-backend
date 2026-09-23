@@ -1882,7 +1882,13 @@ def _refresh_research_title_async(topic, brief_text="", findings_text=""):
                 pass
 
     try:
-        _threading.Thread(target=_worker, name="research-title-refresh", daemon=True).start()
+        # ⛔ UNDER A COPY OF THE RUN'S CONTEXT (wave 10.10). A raw thread starts
+        # with an empty one, so its lines had no run origin and went into
+        # whatever folder was armed when they were written — the next run's,
+        # after a long model call. The copy carries `_LOG_RUN`, so a late line
+        # stays out of another run's folder (`_line_is_another_runs`).
+        _threading.Thread(target=_log_contextvars.copy_context().run, args=(_worker,),
+                          name="research-title-refresh", daemon=True).start()
     except Exception as e:
         try:
             log(f"[title-refresh] dispatch failed: {e}", "WARN")
@@ -2073,7 +2079,9 @@ def _generate_research_summary_async(topic, brief_text="", findings_text=""):
                 pass
 
     try:
-        _threading.Thread(target=_worker, name="research-summary", daemon=True).start()
+        # ⛔ Under a copy of the run's context — see the title refresh above.
+        _threading.Thread(target=_log_contextvars.copy_context().run, args=(_worker,),
+                          name="research-summary", daemon=True).start()
     except Exception as e:
         try:
             log(f"[summary] dispatch failed: {e}", "WARN")
@@ -69895,9 +69903,12 @@ def _save_meta_in_background(queue_dir, topic, phase) -> None:
     is where phase 3 ends (`_record_hand_off`) — after it, the phase list is the
     cloud's."""
     try:
+        # ⛔ Under a copy of the run's context, so its WARN and heal lines keep
+        # the run's origin and stay out of the next run's folder (wave 10.10) —
+        # the same late-thread shape as the title refresh.
         _threading.Thread(
-            target=save_meta,
-            args=(queue_dir, topic, phase),
+            target=_log_contextvars.copy_context().run,
+            args=(save_meta, queue_dir, topic, phase),
             kwargs={"research": (_fb_uid, _fb_research_id),
                     "runtime": _runtime_at_dispatch(),
                     "scans_only": True},

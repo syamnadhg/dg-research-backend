@@ -404,13 +404,13 @@ class _LateThread:
 
     started: "list" = []
 
-    def __init__(self, target=None, **_kw):
-        self._target = target
+    def __init__(self, target=None, args=(), kwargs=None, **_kw):
+        self._target, self._args, self._kwargs = target, args, kwargs or {}
 
     def start(self):
         _LateThread.started.append(self._target)
         research._fb_research_id = None
-        self._target()
+        self._target(*self._args, **self._kwargs)
 
 
 @pytest.mark.parametrize("verdict", ["refuse_loud", "refuse_silent"])

@@ -213,3 +213,61 @@ def test_a_thread_the_first_run_left_behind_writes_nothing_into_the_second_runs_
         assert SECRET not in out, "a private run's late line reached backend.log"
     else:
         assert SECRET in out, "an ordinary run's late line vanished from backend.log"
+
+
+# ══ 3. the run's own late threads — title refresh, summary, phase-3 save ═══
+#
+# ⛔⛔ THE KNOWN THREE (wave 10.10 repair). Each is a RAW thread the run starts
+# and does not wait for: a model call for the title and the summary, an ffprobe
+# per podcast for the phase-3 save. A raw thread starts with an empty context,
+# so its lines had NO origin and went into whatever folder was armed when they
+# were written — the next run's. Each is dispatched through its REAL function
+# from inside the first run; only the slow call it waits on is replaced, and
+# that replacement writes the line once the second run is running.
+
+def _late_dispatch(monkeypatch, which, write_late):
+    monkeypatch.setattr(research, "_firebase_db", None)
+    monkeypatch.setattr(research, "_update_research_doc", lambda *a, **k: True)
+    if which == "title":
+        monkeypatch.setattr(research, "_try_llm_title", lambda *a, **k: write_late() or "")
+        return lambda: research._refresh_research_title_async(SECRET, "brief", "findings")
+    if which == "summary":
+        monkeypatch.setattr(research, "_try_llm_summary", lambda *a, **k: write_late() or "")
+        return lambda: research._generate_research_summary_async(SECRET, "brief", "findings")
+    monkeypatch.setattr(research, "save_meta", lambda *a, **k: write_late())
+    return lambda: research._save_meta_in_background("unused", SECRET, 3)
+
+
+@pytest.mark.parametrize("which", ["title", "summary", "phase3-save"])
+def test_a_late_thread_of_the_run_writes_nothing_into_the_next_runs_folder(
+        tmp_path, monkeypatch, capsys, which):
+    monkeypatch.setattr(research, "__file__", str(tmp_path / "research.py"))
+    second_is_running = threading.Event()
+    late_line_written = threading.Event()
+
+    def _write_late():
+        second_is_running.wait(10)
+        research.log(f"[{which}] late answer for {SECRET}", "WARN")
+        late_line_written.set()
+
+    dispatch = _late_dispatch(monkeypatch, which, _write_late)
+
+    async def _first_body():
+        research.log("first run: own line")
+        dispatch()
+
+    async def _second_body():
+        research.log("second run: own line")
+        second_is_running.set()
+        await asyncio.to_thread(late_line_written.wait, 10)
+
+    asyncio.run(_run(monkeypatch, CHAT, _first_body))
+    asyncio.run(_run(monkeypatch, OTHER, _second_body))
+    out = capsys.readouterr().out
+
+    assert late_line_written.is_set(), "the late thread never wrote — this measured nothing"
+    second_folder = _folder_of(OTHER)
+    assert "second run: own line" in second_folder
+    assert SECRET not in second_folder, (
+        f"the {which} thread's late line landed in the next run's folder:\n{second_folder}")
+    assert SECRET in out, "an ordinary run's late line vanished from backend.log"

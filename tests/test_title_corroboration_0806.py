@@ -131,9 +131,13 @@ class TestTheAlertOnlyFiresOnTheLoudVerdict:
         monkeypatch.setattr(research, "_update_research_doc",
                             lambda _uid, _rid, d: writes.append(d))
         started = []
+        # ⚠ Honours `args`/`kwargs` the way a real Thread does: the worker is
+        # started as `copy_context().run(_worker)`, so a double that called
+        # `target()` bare would run nothing.
         monkeypatch.setattr(research._threading, "Thread",
-                            lambda target, **kw: type("T", (), {
-                                "start": lambda _s: started.append(target()),
+                            lambda target, args=(), kwargs=None, **kw: type("T", (), {
+                                "start": lambda _s: started.append(
+                                    target(*args, **(kwargs or {}))),
                             })())
         research._refresh_research_title_async(TOPIC, "brief", ON_TOPIC_CORPUS)
         return recorded, logged, writes
