@@ -56693,9 +56693,10 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
     # (Step 1A FAIL, Step 1B FAIL, the outer except). A stale entry from a
     # PREVIOUS run would then be read as "the version that just failed" by the
     # step-back path and steer the retry off a number from another run.
-    # ⛔ The effort state too, for the same reason: it is written only at the
-    # end of Step 3, so a setup that returns early left the LAST run's tier in
-    # place, and the pre-send line and caption named a tier this run never read.
+    # ⛔ The effort state too, for the same reason: it is written only once
+    # setup reaches its end, so a setup that returns early left the LAST run's
+    # tier in place, and the pre-send line and caption named a tier this run
+    # never read.
     _P2_PICKED_VERSION.pop("claude", None)
     _P2_THINKING_STATE.pop("claude", None)
     try:
