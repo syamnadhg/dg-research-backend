@@ -96,7 +96,8 @@ DEQUEUE_FALLBACK = ("                    if not _snap.exists:\n"
 DEQUEUE_BAIL = ("                _PICKUP_WITHDRAWN_STATUS,\n"
                 "            }")
 RESTORE = ('                             "disk-restore")[0]:')
-RESTORE_SHED = "    if held_a_run_that_keeps_nothing or withdrew:"
+#: ⛔ Its own `elif`, so wave 10.9's `RESTORE_FORGET` anchor still matches.
+RESTORE_SHED = "    elif withdrew:"
 REHYDRATE = '                        _pickup_withdrawn, tree_uid, research_id, "rehydrate"))[0]:'
 RECONCILE = '                _pickup_withdrawn, tree_uid, research_id, "dead-worker-reconcile"))[0]:'
 
@@ -171,7 +172,7 @@ MUTANTS = [
      [(RESTORE, '                             "disk-restore")[0] and False:')]),
     ("C10", "under", "the boot restore asks but never sheds — the withdrawn "
      "entry stays in the file for good",
-     [(RESTORE_SHED, "    if held_a_run_that_keeps_nothing:")]),
+     [(RESTORE_SHED, "    elif False:")]),
     ("C11", "under", "the rehydrate stops asking — an archive made since the "
      "query is undone by the Resume mark",
      [(REHYDRATE, '                        _pickup_withdrawn, tree_uid, research_id, '

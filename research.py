@@ -17182,7 +17182,11 @@ def _restore_pending_queue_snapshot(path, job_queue, already_rids) -> "tuple[int
         log(f"[pending_queue] Disk snapshot processed: restored={restored}, skipped={skipped}")
     else:
         log("[pending_queue] Disk snapshot empty — nothing to restore")
-    if held_a_run_that_keeps_nothing or withdrew:
+    if held_a_run_that_keeps_nothing:
+        _forget_pending_queue_snapshot(path, job_queue, refused)
+    elif withdrew:
+        # The same rewrite, for the same reason: what restored is in the queue
+        # and what the funnel refused is kept; only the withdrawn entry goes.
         _forget_pending_queue_snapshot(path, job_queue, refused)
     return (restored, skipped)
 
