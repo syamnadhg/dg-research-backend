@@ -204,8 +204,9 @@ MUTANTS = [
      IMAGES, PINS),
     ("C11", "under", "⛔ the incognito id-shape pins read their own path again, so "
      "a mistyped SR_WEB_REPO is not a failure there",
-     [('    web = require_web_repo("the four copies of the incognito id shape")\n',
-       '    web = Path(__file__).resolve().parents[2] / "dg-research"\n')],
+     # (repair 1: `_web()` now RETURNS the finder's answer — its own skip is gone.)
+     [('    return require_web_repo("the four copies of the incognito id shape")\n',
+       '    return Path(__file__).resolve().parents[2] / "dg-research"\n')],
      INCOGNITO, [INCOGNITO]),
     ("C12", "under", "the release tool's default is probed against this "
      "checkout's own parent again, which in a worktree holds no app at all",
