@@ -146,18 +146,15 @@ def _web() -> Path:
     every cross-repo pin in the suite gets both. The worktree case and the
     mistyped-path case are still driven from this file, below.
 
-    ⭐ The only skip of its own is the web half of this wave not being in the
-    checkout that was found. The two halves land together, and this suite
-    cannot be red in the ordinary checkout because another repo's branch has
-    not merged yet — but the skip names the checkout it read, and the mutation
-    harness treats a skip of this file as a hard error rather than as a pass."""
-    web = require_web_repo("the four copies of the incognito id shape")
-    if not (web / _HALF).exists():
-        pytest.skip(
-            f"⛔ the web half of this wave (src/lib/incognito.ts) is not in {web}"
-            " — the four copies of the incognito id shape were NOT compared; "
-            "point SR_WEB_REPO at a checkout that carries it")
-    return web
+    ⛔ NO SKIP OF ITS OWN ANY MORE (wave 10.10 repair). It used to skip when
+    the checkout it found had no `src/lib/incognito.ts`, on the grounds that
+    the web half of wave 10.9 had not merged — true once, false since 10.9
+    shipped it. So a gate aimed on purpose at a wrong or older checkout read
+    these two pins as "skipped", the only mechanical check that the four
+    copies agree. Now it follows the finder's rule, like every other
+    cross-repo pin: once a checkout is found, a missing file FAILS, and
+    `_web_text` says which one."""
+    return require_web_repo("the four copies of the incognito id shape")
 
 
 def _web_text(web: Path, rel: str) -> str:
@@ -330,17 +327,24 @@ def test_an_SR_WEB_REPO_that_is_not_a_web_checkout_is_never_a_skip(
     assert "not a dg-research checkout" in str(err), str(err)
 
 
-def test_the_pins_skip_only_when_the_webs_half_is_nowhere_on_this_disk(
+def test_a_named_checkout_without_the_webs_copy_fails_never_skips(
         tmp_path, monkeypatch):
-    """⭐ THE ONE CONCESSION, BOUNDED. The two halves of this wave land
-    together, so a backend suite cannot be red because the app's branch has not
-    merged — but the skip has to name every path it looked in, and it may only
-    ever be reached when the web's own file is genuinely absent."""
+    """⛔⛔ A NAMED-BUT-WRONG CHECKOUT (cross-verify, wave 10.10). It has the
+    rules file, so the finder accepts it, but not `src/lib/incognito.ts`: an
+    older checkout, or the wrong one. The id-shape pin used to SKIP there with
+    "the web half of this wave has not merged yet", which stopped being true
+    when wave 10.9 shipped that file — so a gate aimed at the wrong checkout
+    read the only mechanical check of the four copies as skipped. It fails,
+    and says which file is missing where."""
     web = _fake_web(tmp_path, ts=None)
     monkeypatch.setenv("SR_WEB_REPO", str(web))
     err = _raised(test_the_id_shape_agrees_with_every_copy_in_the_web_repo)
-    assert isinstance(err, pytest.skip.Exception), f"answered {err!r}"
+    assert isinstance(err, AssertionError), (
+        f"a named checkout without incognito.ts answered {type(err).__name__} — "
+        f"a skip here is the defect: {err}")
     assert str(web) in str(err) and "incognito.ts" in str(err), str(err)
+    # …and the rules pin, which never reads that file, still judges the rules.
+    test_the_rules_admit_the_capability_key_the_machine_now_writes()
 
 
 def _git(*args, cwd):
