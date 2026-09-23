@@ -16158,7 +16158,16 @@ def start_firestore_start_listener(job_queue, loop):
                 # ongoing (which no-ops on already-ongoing, NOT in the
                 # BAIL_STATUSES set) and worker enters run_pipeline for
                 # an already-running research → dual-spawn.
-                if _rd_status == "ongoing":
+                #
+                # ⛔⛔ AND WHEN THE RECORD COULD NOT BE READ (wave 10.10). A
+                # failed read has no status, so this guard never ran — and since
+                # a failed read now TAKES the job, a duplicate start doc for a run
+                # a sibling is executing went on to run it twice, on two browser
+                # sessions, billed twice. The lock is a local file and needs no
+                # Firestore, so it decides alone: a live sibling running THIS
+                # research makes this doc a duplicate. With no such sibling the
+                # job is taken, exactly as the pickup rule says.
+                if _rd_status == "ongoing" or _rd_found is None:
                     _siblings = _scan_sibling_locks_for_research(
                         research_id, WORKER_ID
                     )

@@ -203,6 +203,51 @@ def test_start_still_refuses_what_the_enqueue_read_answered(monkeypatch, tmp_pat
     assert lis.enqueued == []
 
 
+# ── …but a failed read never runs a research twice ─────────────────────────
+#
+# ⛔⛔ THE PRICE OF TAKING ON A FAILED READ (cross-verify, wave 10.10). The
+# duplicate guard — "a sibling worker already runs this research, so this start
+# doc is a copy" — sat under `status == "ongoing"`, and a failed read has no
+# status. Before this wave the funnel's own read, failing too, dropped the copy
+# by accident; now the copy is taken and a second worker runs the same research
+# on a second browser, billed twice. The sibling's lock is a local file, so the
+# guard runs on it alone when the record cannot be read.
+
+def _sibling_runs(tmp_path, research_id, worker_id=2):
+    """A LIVE sibling claim: this process's pid, started just now."""
+    research._write_worker_lock(worker_id, research_id, RUN)
+    assert research._scan_sibling_locks_for_research(research_id, research.WORKER_ID), (
+        "precondition: the scan sees the sibling — otherwise this measures nothing")
+
+
+def test_a_failed_read_never_starts_a_research_a_sibling_is_running(monkeypatch, tmp_path):
+    monkeypatch.setattr(research, "__file__", str(tmp_path / "research.py"))
+    _sibling_runs(tmp_path, RID)
+    lis = _start(monkeypatch, tmp_path, _Answers(TimeoutError("DeadlineExceeded")))
+    assert lis.enqueued == [], "a duplicate start doc ran the sibling's research twice"
+    assert lis.incoming == ["incoming"], "the duplicate's queue doc must go, or it replays"
+    assert lis.writes == [], "the duplicate wrote over the running record"
+
+
+def test_a_failed_read_still_takes_a_run_no_sibling_is_running(monkeypatch, tmp_path):
+    """⭐ OTHER POLARITY — the lock must be for THIS research. A sibling busy
+    with somebody else's run is no reason to drop this one."""
+    monkeypatch.setattr(research, "__file__", str(tmp_path / "research.py"))
+    _sibling_runs(tmp_path, "chat_someone_else")
+    lis = _start(monkeypatch, tmp_path, _Answers(TimeoutError("DeadlineExceeded")))
+    assert [j["research_id"] for j in lis.enqueued] == [RID]
+
+
+def test_a_readable_waiting_run_is_not_second_guessed_by_a_lock(monkeypatch, tmp_path):
+    """⭐ NO WIDER THAN THE HOLE. A record that READ as queued is not a duplicate
+    by status — a sibling may still be closing an earlier run of it — so a lock
+    alone never refuses it."""
+    monkeypatch.setattr(research, "__file__", str(tmp_path / "research.py"))
+    _sibling_runs(tmp_path, RID)
+    lis = _start(monkeypatch, tmp_path, _Answers(QUEUED))
+    assert [j["research_id"] for j in lis.enqueued] == [RID]
+
+
 # ══ 2. the idle rescan — the same, from `run_server`'s own closure ════════
 
 class _QueueRef:
