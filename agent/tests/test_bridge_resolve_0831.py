@@ -332,6 +332,61 @@ def test_a_run_with_no_device_is_still_refused(live):
     assert FakeFS.resumes == []
 
 
+# ── a queued run never moves to another computer ─────────────────────────────
+#
+# ⛔⛔ EVERY TEST ABOVE HAS ONE DEVICE, and the session's default device is
+# None — so "the resume targets the run's own device" and "the resume targets
+# whatever this chat would pick for a NEW run" gave the same answer, and either
+# implementation passed. A run's checkpoint, its browser profiles and its
+# half-written files live on the computer that ran it; a resume sent anywhere
+# else starts a run that cannot find any of them. So these seat a second
+# computer AND make it the session's default, and every write must still name
+# the run's own.
+
+@pytest.fixture()
+def two_computers(live, monkeypatch):
+    FakeFS.devices = [{"id": "dev-a", "name": "My PC", "ownerUid": "u1"},
+                      {"id": "dev-b", "name": "Laptop", "ownerUid": "u1"}]
+    monkeypatch.setattr(bridge.prefs, "get_selected_device", lambda uid: "dev-b")
+    return live
+
+
+def test_a_retry_resumes_on_the_runs_computer_not_the_default(two_computers):
+    _seed(card=crash_loop_card(), device="dev-a")
+    r = _resolve(two_computers, "retry")
+    assert r.status_code == 200 and r.json()["transport"] == "queue_resume"
+    assert [q["device_id"] for q in FakeFS.resumes] == ["dev-a"]
+
+
+def test_a_restart_paused_resume_stays_on_the_runs_computer(two_computers):
+    _seed(status="paused_backend_restart", device="dev-a")
+    r = requests.post(two_computers + "/research/r1/resume")
+    assert r.status_code == 200 and r.json()["transport"] == "queue_resume"
+    assert [q["device_id"] for q in FakeFS.resumes] == ["dev-a"]
+
+
+def test_a_command_goes_to_the_runs_computer_not_the_default(two_computers):
+    """The command transport too: a paused run's own listener is on its own
+    computer, and a skip written for the default would never be read."""
+    _seed(status="paused", device="dev-a")
+    assert requests.post(two_computers + "/research/r1/resume").status_code == 200
+    _seed(rid="r2", card=worktab_login_card(), device="dev-a")
+    assert _resolve(two_computers, "skip", rid="r2").status_code == 200
+    assert [c["device_id"] for c in FakeFS.commands] == ["dev-a", "dev-a"]
+
+
+def test_a_run_with_no_computer_is_refused_rather_than_given_the_default(two_computers):
+    """⛔ The tempting repair for "run has no device" is to fall back to the
+    session's default — which is exactly the move to another computer."""
+    _seed(card=crash_loop_card(), device="")
+    r = _resolve(two_computers, "retry")
+    assert r.status_code == 409 and "no device" in r.json()["error"]
+    _seed(rid="r2", status="paused_backend_restart", device="")
+    r = requests.post(two_computers + "/research/r2/resume")
+    assert r.status_code == 409 and "no device" in r.json()["error"]
+    assert FakeFS.resumes == [] and FakeFS.commands == []
+
+
 def test_a_malformed_card_does_not_take_the_updates_route_down(live):
     """A card whose fields are the wrong types must not 500 /updates — that would
     hide every OTHER run on the account behind one bad document."""

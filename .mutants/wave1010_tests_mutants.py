@@ -56,6 +56,13 @@ RESEARCH = "research.py"
 #: Only the rewritten test: the rest of that file still reads source text, and
 #: a kill from one of those would not measure the rewrite.
 RANK = ["tests/test_gemini_flash_rank.py", "-k", "reject_list_and_family"]
+#: A test list that starts with this runs from `agent/` — see `summary`.
+AGENT = "@agent"
+BRIDGE = "agent/facade/bridge.py"
+#: Only the two-computer tests, so a kill cannot come from the one-device ones
+#: that could never tell the run's computer from the session's default.
+TWO_COMPUTERS = [AGENT, "tests/test_bridge_resolve_0831.py", "-k",
+                 "runs_computer or no_computer"]
 
 # ── anchors: the one finder ─────────────────────────────────────────────────
 ENV_CLAIM = ('        assert (Path(env) / WEB_REPO_MARKER).is_file(), (\n'
@@ -76,6 +83,18 @@ LOUD_SKIP = ('        pytest.skip(\n'
 ONLY_CANDIDATE = ('    if env:\n'
                   '        return [Path(env)]\n'
                   '    return sibling_web_checkouts(here)')
+
+# ── anchors: where the bridge reads a run's computer ────────────────────────
+RESOLVE_DEVICE = ('            device_id = (doc.get("deviceId") or "").strip()\n'
+                  '            if not device_id:\n'
+                  '                self._json(409, {"error": "run has no device"})\n'
+                  '                return\n'
+                  '            transport = spec["transport"]')
+RESUME_DEVICE = ('            device_id = (doc.get("deviceId") or "").strip()\n'
+                 '            if not device_id:\n'
+                 '                self._json(409, {"error": "run has no device"})\n'
+                 '                return\n'
+                 '            # ⛔⛔ A RESUME OF A RESTART-PAUSED RUN CANNOT GO DOWN THIS CHANNEL.')
 
 # ── the old shapes each consumer had ────────────────────────────────────────
 OLD_SKIP = '        pytest.skip("sibling app repo not checked out")\n'
@@ -231,6 +250,36 @@ MUTANTS = [
      [('    if _mode not in ("shadow", "tier2"):',
        '    if _mode not in ("off", "shadow", "tier2"):')],
      RESEARCH, ["tests/test_vision_act_dispatch.py"]),
+
+    # ══ a queued run never moves to another computer ═════════════════════════
+    # ⛔ Every one of these passed the ONE-device tests that existed: with a
+    # single computer and no default, "the run's computer" and "this chat's
+    # default" are the same answer. Only the two-computer tests are run.
+    ("B1", "under", "⛔⛔ /resolve sends the resume to this chat's default "
+     "computer, which has none of the run's checkpoint",
+     [(RESOLVE_DEVICE, RESOLVE_DEVICE.replace(
+         '(doc.get("deviceId") or "")',
+         '(prefs.get_selected_device(sess.uid) or doc.get("deviceId") or "")', 1))],
+     BRIDGE, TWO_COMPUTERS),
+    ("B2", "under", "⛔⛔ /resume sends a restart-paused run, or a paused run's "
+     "command, to the default computer",
+     [(RESUME_DEVICE, RESUME_DEVICE.replace(
+         '(doc.get("deviceId") or "")',
+         '(prefs.get_selected_device(sess.uid) or doc.get("deviceId") or "")', 1))],
+     BRIDGE, TWO_COMPUTERS),
+    ("B3", "over", "a run with no computer is 'repaired' by giving it the "
+     "default one on /resolve — the move to another computer, as a fallback",
+     [(RESOLVE_DEVICE, RESOLVE_DEVICE.replace(
+         '            if not device_id:\n',
+         '            device_id = device_id or (prefs.get_selected_device(sess.uid) or "")\n'
+         '            if not device_id:\n', 1))],
+     BRIDGE, TWO_COMPUTERS),
+    ("B4", "over", "the same fallback on /resume",
+     [(RESUME_DEVICE, RESUME_DEVICE.replace(
+         '            if not device_id:\n',
+         '            device_id = device_id or (prefs.get_selected_device(sess.uid) or "")\n'
+         '            if not device_id:\n', 1))],
+     BRIDGE, TWO_COMPUTERS),
 ]
 
 
@@ -240,11 +289,19 @@ _COUNT = re.compile(r"(\d+) (passed|failed|skipped|errors?|xfailed|xpassed|desel
 
 
 def summary(tests):
-    """pytest's own tally for `tests`, from its SUMMARY LINE — or a fault."""
+    """pytest's own tally for `tests`, from its SUMMARY LINE — or a fault.
+
+    ⛔ A list that starts with AGENT runs from `agent/`, as the agent gate does:
+    `-m` then puts THIS worktree's `facade` first on sys.path. Run from the repo
+    root instead and `facade` is not importable at all — or, worse, resolves to
+    whatever checkout the venv's editable install points at."""
+    cwd = ROOT
+    if tests and tests[0] == AGENT:
+        cwd, tests = ROOT / "agent", tests[1:]
     try:
         r = subprocess.run(
             [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *tests],
-            cwd=ROOT, env=ENV, capture_output=True, text=True, timeout=_RUN_TIMEOUT_S)
+            cwd=cwd, env=ENV, capture_output=True, text=True, timeout=_RUN_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         raise AssertionError(f"the tests ran past {_RUN_TIMEOUT_S}s — a hang, not a kill")
     out = (r.stdout or "") + (r.stderr or "")
