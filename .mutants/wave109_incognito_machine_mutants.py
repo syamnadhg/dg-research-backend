@@ -318,6 +318,10 @@ TB_GATE = ("    if _is_incognito_research(research_id):\n"
            "        return\n"
            "    traceback.print_exc()")
 TB_CALL = "        _print_pipeline_traceback(research_id)"
+# ⛔ THE CONSUMER'S ARGUMENTS. `links_out_summary_in_0828` P5 replaces the whole
+# call; these two mutate only what the call is asked about.
+P3_CALL = ("                _p3_audio_reason, _p3_audio_detail = _p3_no_podcast_report(\n"
+           "                    audio_path, _fb_research_id)")
 
 # ── anchors: the two seams a recovery status has to satisfy at once ─────────
 ENQUEUE_WHITELIST = (
@@ -920,6 +924,16 @@ MUTANTS = [
      [(TB_GATE, "    if _is_incognito_research(research_id):\n"
                 "        return\n"
                 "    traceback.print_exc()")]),
+
+    # ══ phase 3 asks about THIS run (repair round) ══════════════════════════
+    ("P3a", "under", "⛔⛔ the phase asks about no run, and a run that keeps "
+     "nothing is told its podcast is 'still on your research computer'",
+     [(P3_CALL, "                _p3_audio_reason, _p3_audio_detail = _p3_no_podcast_report(\n"
+                "                    audio_path, None)")]),
+    ("P3b", "under", "the phase forgets the file it made, so an ordinary run "
+     "whose upload failed is told no podcast was produced",
+     [(P3_CALL, "                _p3_audio_reason, _p3_audio_detail = _p3_no_podcast_report(\n"
+                "                    None, _fb_research_id)")]),
 
     # ══ the pins that hold four copies of the id shape together ════════════
     # ⛔ THESE MUTATE A TEST FILE, which is the only place their decision

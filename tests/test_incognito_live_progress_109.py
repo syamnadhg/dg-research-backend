@@ -315,6 +315,67 @@ def test_an_ordinary_run_is_still_told_exactly_which_of_the_two_failed(
         assert "No audio overview was produced" in detail
 
 
+# ── …and the phase actually asks it about THIS run ─────────────────────────
+#
+# ⛔⛔ A TESTED HELPER IS NOT A TESTED CONSUMER. Every pin above picks the id it
+# hands `_p3_no_podcast_report` itself, and the only thing tying the pipeline
+# to the helper was a source read that stopped at the open parenthesis — so the
+# call could pass `None`, or the wrong id, and tell a run that keeps nothing
+# its podcast is "still on your research computer" with every test green.
+#
+# ⭐ THE BRANCH IS RUN, NOT READ. It sits a thousand lines inside a browser
+# coroutine, so its statements are lifted out of `run_pipeline`'s own parse tree
+# and executed as they are — only the names the pipeline would have bound around
+# them are supplied here.
+
+def _p3_no_podcast_branch():
+    """The real body of `run_pipeline`'s `elif _p3_no_skip:` branch, as a
+    function of no arguments whose free names are globals."""
+    import ast
+    import inspect
+    import textwrap
+    tree = ast.parse(textwrap.dedent(inspect.getsource(research.run_pipeline)))
+    found = [n for n in ast.walk(tree)
+             if isinstance(n, ast.If) and isinstance(n.test, ast.Name)
+             and n.test.id == "_p3_no_skip"]
+    assert len(found) == 1, (
+        f"expected ONE `elif _p3_no_skip:` in run_pipeline, found {len(found)} — "
+        "re-anchor this pin on the branch that reports a phase 3 with no podcast")
+    shell = ast.parse("def _branch():\n    pass\n")
+    shell.body[0].body = found[0].body
+    ast.fix_missing_locations(shell)
+    return compile(shell, research.__file__, "exec")
+
+
+@pytest.mark.parametrize("rid", [INCOG, CHAT])
+def test_the_phase_tells_the_run_it_is_running_what_is_true_of_it(tmp_path, rid):
+    """⛔⛔ THE PATH THE HELPER EXISTS FOR: an incognito run resumed with a
+    config.json from before the flip, so phase 3 ran and made audio, and the
+    machine refused to publish it. The phase asks about the RUNNING research —
+    `_fb_research_id` — and nothing else."""
+    audio = tmp_path / "Deep_Dive.m4a"
+    audio.write_bytes(b"audio")
+    events = []
+    scope = {**vars(research),
+             "audio_path": audio, "_fb_research_id": rid,
+             "_p3_start": 0.0, "_p3_links": {},
+             "log": lambda *a, **k: None,
+             "emit_event": lambda name, **kw: events.append((name, kw))}
+    exec(_p3_no_podcast_branch(), scope)
+    scope["_branch"]()
+
+    [(name, data)] = events
+    assert name == "phase_skipped" and data["phase"] == 3
+    if rid == INCOG:
+        assert "still on your research computer" not in data["detail"], (
+            "a run that keeps nothing was told its podcast sits on that computer")
+        assert data["reason"] == research._P3_KEEPS_NOTHING_REASON
+    else:
+        assert data["reason"] == "audio_generated_but_upload_failed"
+        assert "still on your research computer" in data["detail"], (
+            "an ordinary run lost the one sentence that says where its podcast is")
+
+
 # ══ 3. a resume that ends the run still takes the folder ══════════════════
 
 def _resumable(tmp_path, monkeypatch, rid, status="completed"):
