@@ -274,6 +274,10 @@ _EXPECTED_MARKED = {
     # A line in the armed run's folder would tell its reader that a private run
     # is waiting behind theirs.
     "_incognito_lease_loop",
+    # Wave 10.10: the cloud-delivery thread writes its outcome minutes after its
+    # own run's sink is gone, and since 10.9 the next run — often somebody
+    # else's — is armed by then. Its own account is `_note_cloud_handoff`.
+    "_post_fe_p4p5_trigger._drive",
 }
 
 # ⛔⛔ THE MORE IMPORTANT LIST. Each of these logs while a run is armed and each

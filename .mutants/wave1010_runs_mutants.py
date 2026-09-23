@@ -6,7 +6,8 @@ lines, and each with a way to quietly go back to what it was:
   O*  a deleted research's folders leave within minutes when it ran today, and
       the hour still holds for every older run (the read bill);
   D*  the cloud-delivery thread's lines stay out of whichever run is armed
-      next, and a private run's route answer stays out of the owner's log;
+      next, and a private run's route answer stays out of the owner's log
+      (through the shipped `_quote_reply`, since the integration);
   T*  the terminal log keeps what a prompt holds back; the Linux health check
       names a fix once; the local run list tells an ongoing run from a finished
       one; a terminal resume of a private run is refused; the lease forgets a
@@ -36,6 +37,8 @@ ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
 T_SWEEP = "tests/test_incognito_teardown_109.py"
 T_COST = "tests/test_orphan_sweep_read_cost_0920.py"
+T_HANDOFF = "tests/test_cloud_handoff_record_108.py"
+T_SCOPE = "tests/test_machine_log_scope_0824.py"
 
 # ══ task 1: the recency tier ══════════════════════════════════════════════
 TIER = ("    if (last_write_at is not None\n"
@@ -44,6 +47,29 @@ TIER = ("    if (last_write_at is not None\n"
 WINDOW = "_ORPHAN_RECENT_WINDOW_SEC = 24 * 60 * 60"
 WROTE_AT = "                        _wrote_at = delivery_path.stat().st_mtime"
 TIER_CALL = "                            rid, ORPHAN_RECHECK_SEC, _wrote_at):"
+
+# ══ task 2: the delivery thread's lines ═══════════════════════════════════
+# ⚠ 2026-09-23 (integration onto wave 10.9's last repair): the branch's own
+# log-only `why_logged` is gone. The shipped `_quote_reply` already cuts the
+# reply from `why` itself for a private run, so every line — logged, noted,
+# recorded — says the status only, and a second variable for the log half
+# could only ever equal the first. D2-D4 now measure that one gate from this
+# lane's tests; D5-D8 put the route's raw answer back into one line each.
+DRIVE_MARK = "    @_machine_logged\n    def _drive():"
+REPLY_GATE = "    _quote_reply = not _is_incognito_research(research_id)"
+LOG_FOLLOWUP = "                    f\"without running phase 5 ({why}) — asking for phase 5 alone \""
+LOG_RAN = "            log(f\"FE trigger: BE-driven P4/P5 — the cloud ran the chain ✓ ({why}) \""
+LOG_RETRY = "        log(f\"FE trigger: BE-driven P4/P5 attempt {_attempt} did not land ({why}) \""
+LOG_GAVE_UP = "        f\"({verdict}: {why}) rid={research_id[:8]}… — recording the failure on \""
+#: This lane's own delivery pins, by node id — so D2-D8 prove THEY still
+#: measure the gate, not only the shipped round's pins in the same file.
+T_HANDOFF_1010 = [
+    T_HANDOFF + "::test_the_next_runs_folder_gets_none_of_the_drives_lines",
+    T_HANDOFF + "::test_a_private_runs_route_answer_stays_out_of_the_machine_log",
+    T_HANDOFF + "::test_an_ordinary_runs_route_answer_is_still_logged",
+    T_HANDOFF + "::test_every_line_the_ladder_logs_for_a_private_run_names_the_status_only",
+]
+_RAW = "{str(_text)[:160]}"
 
 MUTANTS = [
     # ── task 1 ────────────────────────────────────────────────────────────
@@ -74,6 +100,35 @@ MUTANTS = [
      [(TIER, "    if (last_write_at is None\n"
              "            or abs(float(now) - float(last_write_at)) < _ORPHAN_RECENT_WINDOW_SEC):\n"
              "        return True")], [T_SWEEP, T_COST]),
+
+    # ── task 2 ────────────────────────────────────────────────────────────
+    ("D1", "under", "⛔⛔ THE LEAK: the delivery thread is not a machine line, so "
+     "the next person's run collects this run's id and the route's answer in "
+     "its run.log and support bundle",
+     [(DRIVE_MARK, "    def _drive():")], [T_HANDOFF, T_SCOPE]),
+    ("D2", "under", "⛔⛔ a private run's route answer — an email error about "
+     "this very research — rides the machine line into backend.log",
+     [(REPLY_GATE, "    _quote_reply = True")], T_HANDOFF_1010),
+    ("D3", "over", "every run's route answer is cut from the log, so the first "
+     "thing a stuck-run report is read from says only a status code",
+     [(REPLY_GATE, "    _quote_reply = False")], T_HANDOFF_1010),
+    ("D4", "under", "the drive asks about the account instead of the run, so a "
+     "private run is logged like any other",
+     [(REPLY_GATE, "    _quote_reply = not _is_incognito_research(uid)")],
+     T_HANDOFF_1010),
+    ("D5", "under", "the follow-up line quotes the route's raw answer again",
+     [(LOG_FOLLOWUP, "                    f\"without running phase 5 ({why} " + _RAW
+                     + ") — asking for phase 5 alone \"")], T_HANDOFF_1010),
+    ("D6", "under", "the 'ran the chain' line quotes the route's raw answer again",
+     [(LOG_RAN, "            log(f\"FE trigger: BE-driven P4/P5 — the cloud ran the chain ✓ ({why} "
+                + _RAW + ") \"")], T_HANDOFF_1010),
+    ("D7", "under", "the retry line quotes the route's raw answer again",
+     [(LOG_RETRY, "        log(f\"FE trigger: BE-driven P4/P5 attempt {_attempt} did not land ({why} "
+                  + _RAW + ") \"")], T_HANDOFF_1010),
+    ("D8", "under", "the give-up line quotes the route's raw answer again",
+     [(LOG_GAVE_UP, "        f\"({verdict}: {why} " + _RAW
+                    + ") rid={research_id[:8]}… — recording the failure on \"")],
+     T_HANDOFF_1010),
 ]
 
 

@@ -18703,7 +18703,13 @@ def _drive_cloud_phases(uid, research_id, *, post, mint_token, sleep, note,
     this route's defining failure — something in front of Cloud Run severs the
     socket at exactly 300 seconds while the route keeps working, one measured
     run finishing at 497 s — so the chain is running and asking again would at
-    best take a 202 off its own claim."""
+    best take a 202 off its own claim.
+
+    ⭐ ITS LINES ARE MACHINE LINES (wave 10.10): they reach `backend.log`
+    whatever run is armed, and never the next run's folder (see
+    `_post_fe_p4p5_trigger`). That is why the reply is cut from `why` itself
+    for a run that keeps nothing (`_quote_reply`) — every line below, logged
+    or noted, carries only the status for such a run."""
     attempts = len(_DRIVE_BACKOFF_SEC) + 1
     verdict = "retry"
     why = "never attempted"
@@ -18846,9 +18852,11 @@ def _post_fe_p4p5_trigger(uid, research_id):
 
     The POST runs in a detached daemon thread with a long timeout: the encode +
     resumable upload can take minutes and the route processes inline while the
-    connection is open, so we must neither block the worker (it has a queue to
-    drain) nor disconnect early (a client-disconnect can abort the route
-    mid-encode). Best-effort; never raises.
+    connection is open, so we must not block the worker (it has a queue to
+    drain). A disconnect no longer aborts the route — its abort handler was
+    removed on 09-19 — but the route is still working inside this request, so
+    the worker holds its respawn for it (`_FE_DRIVE_WAIT_SEC`). Best-effort;
+    never raises.
 
     ⭐ THE TOKEN IS MINTED PER ATTEMPT, INSIDE THE THREAD (wave 10.9, 542-5). It
     used to be minted once here, in the worker, and a `None` returned early with
@@ -18892,24 +18900,34 @@ def _post_fe_p4p5_trigger(uid, research_id):
         )
         return _resp.status_code, _resp.text
 
+    # ⛔⛔ MACHINE LINES, WHATEVER RUN IS ARMED WHEN THEY ARE WRITTEN (wave
+    # 10.10). `log()` copies each line into the run armed AT WRITE TIME, and
+    # this thread writes its outcome minutes after this run's own sink has
+    # been popped. Wave 10.9 removed the wait that held the next run's start
+    # behind this delivery, so the next run — often somebody else's, on a
+    # shared computer — is now routinely armed by then, and it collected this
+    # run's research id and up to 160 characters of the route's answer in its
+    # own run.log and support bundle. The removed wait had been preventing that
+    # by accident. This run's own account is `note()` → `_note_cloud_handoff`,
+    # addressed by researchId, and it is unchanged.
+    @_machine_logged
     def _drive():
         # ⭐⭐ Counted as an in-flight DRIVE, not a brief handoff. This request is
-        # not a notification — it is the rest of the run, and the route wires
-        # `req.signal` to an abort handler that SIGTERMs the in-flight ffmpeg
-        # child and writes `status: "stopped"`. Exiting this process while it is
-        # connected kills the encode and terminalises the user's research. See
+        # not a notification — it is the rest of the run: the route runs phases
+        # 4 and 5 INLINE while this socket is open, so a worker that exits
+        # mid-request abandons work nothing else is driving. (A hang-up alone no
+        # longer stops the route — its abort handler was removed on 09-19 — so
+        # the reason is the abandoned work, not a destructive disconnect.) See
         # `_FE_DRIVE_WAIT_SEC`.
         _fe_handoff_begin(drive=True)
         try:
-            # ⛔⛔ EVERY LINE THE DRIVE WRITES USED TO LAND NOWHERE. `log()`
-            # copies into the sink that is armed AT WRITE TIME, and by the time
-            # this thread finishes, this run's sink has been popped — so the
-            # machine's only account of how the cloud half went was a line in a
-            # machine-wide file nobody can cut a run out of. Measured: zero
-            # occurrences across every run folder on this disk.
-            # `_note_cloud_handoff` addresses the run's OWN folder by
-            # researchId, which is also what stops a slow encode dropping this
-            # run's line into the NEXT run's support bundle.
+            # ⛔⛔ EVERY LINE THE DRIVE WRITES USED TO LAND NOWHERE. By the time
+            # this thread finishes, this run's sink has been popped, so its
+            # outcome reached no run folder — measured: zero occurrences across
+            # every run folder on this disk. `note()` addresses the run's OWN
+            # folder by researchId. ⚠ It never stopped the drive's `log()`
+            # lines reaching the NEXT run's folder; the marking on this function
+            # does that.
             _drive_cloud_phases(
                 uid, research_id,
                 post=_post,

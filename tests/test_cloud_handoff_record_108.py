@@ -692,3 +692,122 @@ def test_the_202_is_not_reported_as_a_dispatch():
     # ⭐ ACCEPT POLARITY: a 200 IS this machine's dispatch and still says so.
     _v, ran = _drive(answers=[(200, _RAN)])
     assert "the route ran it" in " ".join(ran["notes"])
+
+
+# ══ 4. the drive's lines are the machine's (wave 10.10) ════════════════
+#
+# ⛔⛔ WHAT WAS WRONG. `_note_cloud_handoff` put this run's account into its own
+# folder, but the drive's `log()` lines still went into whichever run was armed
+# when they were written — minutes after this run's sink was popped. Wave 10.9
+# removed the wait that held the next run's start behind this delivery, so on a
+# shared computer the next run (somebody else's) now routinely collected this
+# run's research id and up to 160 characters of the route's answer in its
+# run.log and support bundle. The thread is now a machine line: backend.log
+# only. And for a run that keeps nothing, the route's answer stays out of that
+# log too — it can be an email error about this very research. (Since wave
+# 10.9's last repair, `_quote_reply`, it stays out of the run's own record as
+# well: `why` carries the status only, for every line the drive writes.)
+
+INCOG_RID = "incog_1758400000000_7"
+SECRET = "could not email the report on a very private subject"
+
+
+class _NextRunSink:
+    """The run armed AFTER this one — somebody else's, on a shared computer."""
+
+    def __init__(self, research_id="chat_NEXT"):
+        self.research_id = research_id
+        self.lines = []
+
+    def note_line(self, line, level):
+        self.lines.append(line)
+
+
+def _real_drive(monkeypatch, rid, answer):
+    """Run the REAL dispatch — its thread, its `_drive`, its ladder — with only
+    the network and the disk faked. Returns what `note()` was handed, once the
+    thread has finished (its `finally` is the last thing it does)."""
+    import threading
+
+    import requests
+    finished = threading.Event()
+    noted = []
+
+    class _Resp:
+        status_code, text = answer
+
+    monkeypatch.setattr(requests, "post", lambda url, **kw: _Resp())
+    monkeypatch.setattr(research, "_fresh_user_mode_id_token", lambda: "tok")
+    monkeypatch.setattr(research, "_fire_fe_p4_trigger", lambda u, r: True)
+    monkeypatch.setattr(research, "_fe_handoff_begin", lambda drive=False: None)
+    monkeypatch.setattr(research, "_fe_handoff_end",
+                        lambda drive=False: finished.set())
+    monkeypatch.setattr(research, "_record_cloud_kick_refusal",
+                        lambda u, r, why: True)
+    monkeypatch.setattr(research, "_note_cloud_handoff",
+                        lambda r, line: noted.append((r, line)))
+    assert research._post_fe_p4p5_trigger("uid-1", rid) is True
+    assert finished.wait(10), "the delivery thread never finished"
+    return noted
+
+
+def test_the_next_runs_folder_gets_none_of_the_drives_lines(monkeypatch, capsys):
+    """⛔⛔ THE LEAK. The next person's run is armed while this run's delivery
+    finishes; not one of the drive's lines may reach its folder."""
+    nxt = _NextRunSink()
+    monkeypatch.setattr(research, "_RUN_LOG_SINKS", [nxt])
+    noted = _real_drive(monkeypatch, "chat_A0000001", (200, _RAN))
+    leaked = [ln for ln in nxt.lines if "FE trigger" in ln or "chat_A00" in ln]
+    assert leaked == [], f"run A's delivery landed in the next run's folder: {leaked}"
+    # ⭐ ACCEPT POLARITY: the machine's own log still has it, and run A's own
+    # account still went to run A.
+    assert "the cloud ran the chain" in capsys.readouterr().out
+    assert noted and noted[0][0] == "chat_A0000001"
+
+
+def test_a_private_runs_route_answer_stays_out_of_the_machine_log(monkeypatch, capsys):
+    """⛔⛔ Machine lines reach backend.log whatever is armed, so the route's
+    answer about a run that keeps nothing must not ride them — driven through
+    the real dispatch thread. Its own record gets the status and not the answer
+    either (`_quote_reply`, wave 10.9's last repair)."""
+    noted = _real_drive(monkeypatch, INCOG_RID,
+                        (200, json.dumps({"p5": {"error": SECRET}})))
+    out = capsys.readouterr().out
+    assert "the cloud ran the chain ✓ (HTTP 200)" in out
+    assert SECRET not in out, "a private run's route answer reached backend.log"
+    assert noted and all(SECRET not in line for _r, line in noted), noted
+    assert any("HTTP 200" in line for _r, line in noted), noted
+
+
+def test_an_ordinary_runs_route_answer_is_still_logged(monkeypatch, capsys):
+    """⭐ ACCEPT POLARITY. An ordinary run's answer has always been in the
+    machine's log, and it is the first thing a stuck-run report is read from."""
+    _real_drive(monkeypatch, "chat_B0000001",
+                (200, json.dumps({"p5": {"error": SECRET}})))
+    assert SECRET in capsys.readouterr().out
+
+
+def test_every_line_the_ladder_logs_for_a_private_run_names_the_status_only(
+        monkeypatch):
+    """⛔ ALL FOUR LINES THAT CARRY THE ANSWER: the follow-up ask, the retry,
+    the give-up after a refusal and after an exhausted ladder. An ordinary
+    run's own record keeps the answer each time; a private run's keeps the
+    status and not the answer (`_quote_reply`)."""
+    for rid, keeps in ((INCOG_RID, False), ("chat_C0000001", True)):
+        lines = []
+        monkeypatch.setattr(research, "log",
+                            lambda msg, level="INFO", _l=lines: _l.append(msg))
+        p4_only = json.dumps({"already_completed": True, "detail": SECRET})
+        _v, followed = _drive(answers=[(200, p4_only), (200, _RAN)], rid=rid)
+        _v, refused = _drive(answers=[(400, SECRET)], rid=rid)
+        _v, exhausted = _drive(answers=[(500, SECRET)] * 5, rid=rid)
+        said = "\n".join(lines)
+        for fragment in ("without running phase 5 (HTTP 200",
+                         "(refused: HTTP 400",
+                         "did not land (HTTP 500",
+                         "(retry: HTTP 500"):
+            assert fragment in said, (rid, fragment, said)
+        assert (SECRET in said) is keeps, (rid, said)
+        for calls in (followed, refused, exhausted):
+            assert (SECRET in " ".join(calls["notes"])) is keeps, (
+                rid, "the run's own record", calls["notes"])
