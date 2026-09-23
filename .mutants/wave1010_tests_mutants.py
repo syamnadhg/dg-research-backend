@@ -52,6 +52,10 @@ BUNDLE = "tests/test_bundle_left_out_row_109.py"
 IMAGES = "tests/test_document_images_0913.py"
 INCOGNITO = "tests/test_incognito_capability_109.py"
 BUMP = "tests/test_bump_version.py"
+RESEARCH = "research.py"
+#: Only the rewritten test: the rest of that file still reads source text, and
+#: a kill from one of those would not measure the rewrite.
+RANK = ["tests/test_gemini_flash_rank.py", "-k", "reject_list_and_family"]
 
 # ── anchors: the one finder ─────────────────────────────────────────────────
 ENV_CLAIM = ('        assert (Path(env) / WEB_REPO_MARKER).is_file(), (\n'
@@ -186,6 +190,35 @@ MUTANTS = [
      [('    looked = sibling_web_checkouts()\n',
        '    looked = [Path(bump_mod.__file__).resolve().parents[1].parent / "dg-research"]\n')],
      BUMP, PINS),
+
+    # ══ the Gemini ranker's caller, executed rather than read ═══════════════
+    # ⛔ These mutate the CALLER in research.py. The test they answer to used
+    # to read that caller's source by line numbers taken at import, so it
+    # failed about one run in ten; it now runs the caller against a page
+    # double, and only that test is run here.
+    ("R1", "under", "⛔ the ranker is handed a baked-in family instead of the "
+     "policy's, so a family rename changes nothing the browser does",
+     [('"fam": _gm_family, "reject": _gm_reject,',
+       '"fam": "flash", "reject": _gm_reject,')],
+     RESEARCH, RANK),
+    ("R2", "under", "⛔ the ranker is handed no reject list, so Flash-Lite or a Pro "
+     "row can win on version number",
+     [('"fam": _gm_family, "reject": _gm_reject,',
+       '"fam": _gm_family, "reject": [],')],
+     RESEARCH, RANK),
+    ("R3", "under", "the family stops coming from policy at all",
+     [('        _gm_family = p2_family("gemini") or "flash"',
+       '        _gm_family = "flash"')],
+     RESEARCH, RANK),
+    ("R4", "under", "the reject list is read for the wrong platform",
+     [('        _gm_reject = reject_terms("gemini")',
+       '        _gm_reject = reject_terms("claude")')],
+     RESEARCH, RANK),
+    ("R5", "under", "the trigger read hunts a literal family, so on a rename the "
+     "ranker can click the dropdown's own button and call it a pick",
+     [('            }""", _gm_family)',
+       '            }""", "flash")')],
+     RESEARCH, RANK),
 ]
 
 
