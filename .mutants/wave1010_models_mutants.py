@@ -26,6 +26,17 @@ Every mutant below reverts ONE decision. The quiet ones:
   V1   — the browser stops reading a number pin, the legacy half of the
          translator: a stored 5.0 no longer exact-matches "Opus 5".
 
+⛔⛔ AND THE SECOND TASK (E1-E17): Claude's Deep Research went out at Low on
+09-20 with a log that said only "Max NOT confirmed". Step 1C now reads the
+Effort row the way it is rendered (the walker copied from the ChatGPT trigger
+reader) and the run says which tier it is on. The quiet ones:
+
+  E4/E11/E12 — a row read BEFORE an unverified press is reported as the tier:
+         the log and the caption state a tier nothing proved.
+  E8   — an UNREAD tier reaches the person: the "could not confirm" false alarm
+         the 2026-06-22 decision removed.
+  E9   — the consumer ignores the rule: everything is computed, nothing shown.
+
 ⛔ ANCHORS ARE SINGLE STRING LITERALS AND MUST MATCH EXACTLY ONCE. A stale
 anchor is a harness fault, not a survivor, and faults are counted OUT. Every
 mutated file is COMPILED before it is written. The JS mutants are written to
@@ -52,7 +63,8 @@ SUITES = ("tests/test_model_selection_precision.py "
           "tests/test_model_policy.py "
           "tests/test_family_only_selection.py "
           "tests/test_claude_model_pick.py "
-          "tests/test_gemini_flash_rank.py")
+          "tests/test_gemini_flash_rank.py "
+          "tests/test_claude_mode_detect.py")
 RESEARCH = "research.py"
 MODELS = "models.py"
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
@@ -213,6 +225,62 @@ MUTANTS = [
     ("S7", "under", "⛔ the consumer ignores the rule: the learned pin is never sent",
      [("            _pin = (_kg if _failed_v is not None\n",
        "            _pin = (None if _failed_v is not None\n")]),
+
+    # ══ task 2 — the effort the run ACTUALLY got ═══════════════════════════
+    # ── the page read: the Effort row, gap-aware ───────────────────────────
+    ("E1", "under", "⛔ the row is read glued again ('efforthighdefault'): a "
+     "two-span tier is no tier at all",
+     [("                                shows: spaced(trigger).slice(0, 60),",
+       "                                shows: norm(trigger.textContent).slice(0, 60),")]),
+    ("E2", "under", "the walker supplies no gap at an element boundary",
+     [("\n                                else if (c.nodeType === 1) { out += ' '; walk(c); out += ' '; }",
+       "\n                                else if (c.nodeType === 1) { walk(c); }")]),
+    # ── the pure reads ─────────────────────────────────────────────────────
+    ("E3", "under", "a one-node row ('EffortLow') names no tier",
+     [('        if w.startswith("effort"):\n            return w[len("effort"):]\n', "")]),
+    ("E17", "under", "the tier is not the word AFTER 'effort'",
+     [("            return words[i + 1] if i + 1 < len(words) else None\n",
+       "            return words[i]\n")]),
+    ("E4", "over", "⛔ a row read BEFORE an unverified press is still reported as "
+     "the tier in effect",
+     [("    if pressed:\n        return None\n    return row_shows or None",
+       "    return row_shows or None")]),
+    ("E5", "under", "a CONFIRMED tier reports the stale pre-set row instead",
+     [('        return str(wanted or "").strip().lower() or None\n    if pressed:',
+       "        return row_shows or None\n    if pressed:")]),
+    ("E6", "over", "⛔ a run AT the wanted tier gets the 'could not be set' caption",
+     [("    if g and (g == w or not w):", "    if g and not w:")]),
+    ("E7", "over", "a policy that wants nothing shows '— could not be set'",
+     [("    if g and (g == w or not w):", "    if g and g == w:")]),
+    ("E8", "over", "⛔ an UNREAD tier is shown to the person — the 06-22 false alarm back",
+     [('                           f"be weaker than the run reports"),\n'
+       '                "notice": None}',
+       '                           f"be weaker than the run reports"),\n'
+       '                "notice": "Claude could not confirm its effort"}')]),
+    # ── the consumer: setup_claude_dr ──────────────────────────────────────
+    ("E9", "under", "⛔ the consumer ignores the rule: the caption is never shown",
+     [('        if _eff_report["notice"] and allow_probe:', "        if False:")]),
+    ("E10", "over", "the caption is re-sent from every re-activation and step-back",
+     [('        if _eff_report["notice"] and allow_probe:',
+       '        if _eff_report["notice"]:')]),
+    ("E11", "over", "⛔ the press is not passed on, so a stale pre-press read is "
+     "reported as the tier",
+     [("row_shows=_eff_row_shows, pressed=_eff_option_pressed)",
+       "row_shows=_eff_row_shows, pressed=False)")]),
+    ("E12", "over", "the landed press is never recorded",
+     [("                        _eff_option_pressed = _eff_pressed\n", "")]),
+    ("E13", "under", "the consumer reads the glued `text`, not the gap-aware `shows`",
+     [('_eff_row_shows = _claude_effort_from_row(_eff_mark.get("shows"))',
+       '_eff_row_shows = _claude_effort_from_row(_eff_mark.get("text"))')]),
+    ("E14", "under", "the DOM ledger keeps saying only 'tier left as it was'",
+     [('            detail=("" if _effort_confirmed else _eff_report["detail"]))',
+       '            detail=("" if _effort_confirmed else "tier left as it was"))')]),
+    ("E15", "under", "the tier in effect is not recorded with the run's effort state",
+     [('                                        "effort_got": _effort_got}',
+       '                                        "effort_got": None}')]),
+    ("E16", "under", "⛔ the run log never names the tier",
+     [("        log(f\"[setup_claude_dr] {_eff_report['log']}\", _eff_report[\"level\"])\n",
+       "")]),
 ]
 
 

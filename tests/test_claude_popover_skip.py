@@ -113,8 +113,15 @@ class ScriptedPage:
 
     def __init__(self, trigger_text, *, chat_tab="chat", research_on=True,
                  offered=5.0, menu_mounts=True, rows=None, trigger_is_model_ctl=True,
-                 popover_opens=True, row_label=None):
+                 popover_opens=True, row_label=None, effort_row_shows="effort max",
+                 wanted_row=True, wanted_already=True):
         self.trigger_text = trigger_text
+        # The Effort row read gap-aware (the script's `shows`), e.g. "effort low".
+        self.effort_row_shows = effort_row_shows
+        # Does the submenu offer the wanted tier's row at all (False = the 09-20
+        # page: no 'max' row), and is it already the selected one?
+        self.wanted_row = wanted_row
+        self.wanted_already = wanted_already
         # How a picked row's LABEL reads (the real picker returns the row's
         # first 60 characters). Default "Opus <version>"; a test can hand in a
         # row whose version sits past the slice, so the label carries none.
@@ -244,7 +251,7 @@ class ScriptedPage:
             # test_drift_review_0805.py; here the double only has to answer in the
             # right SHAPE.
             return {"marked": self.effort_marked, "text": "effort max",
-                    "rejected": []}
+                    "shows": self.effort_row_shows, "rejected": []}
         if _SUBMENU_ROWS_MARK in script:
             # 2026-08-04: the submenu now has to be SEEN, not assumed. Marking
             # the Effort row and pressing it is not evidence that a nested menu
@@ -272,6 +279,12 @@ class ScriptedPage:
             # picker started reporting which row it chose. The bare string used
             # to make `_eff_set.get(...)` raise straight into Step 1C's own
             # `except`, so these tests could only ever see that the script RAN.
+            if not self.wanted_row:                  # the 09-20 page: no 'max' row
+                return {"set": None, "scoped": True, "menus": 2, "cands": 1,
+                        "saw": ["opus 5for complex tasks", "effortlow", "more models"]}
+            if not self.wanted_already:              # there, but not selected: marked
+                return {"set": "marked", "already": False, "via": "testid",
+                        "picked": "max", "scoped": True, "menus": 2, "cands": 1}
             return {"set": "max (already)", "already": True, "via": "text",
                     "picked": "max", "scoped": True, "menus": 2, "cands": 1}
         if "cowork" in script.lower():
@@ -839,3 +852,71 @@ def test_the_learned_version_is_the_one_the_picker_reported():
     assert research._P2_PICKED_VERSION.get("claude") == "5.10", (
         f"learned {research._P2_PICKED_VERSION.get('claude')!r} — the version the "
         "picker actually clicked was thrown away")
+
+
+# ── 2026-09-23: the run says which effort it actually got ─────────────────
+# The 09-20 run: the trigger read "Opus 5 Low", the Effort row showed Low, the
+# submenu had no 'max' row, and the run went out at Low with a log that said only
+# "NOT confirmed". These drive the real coroutine and read what it SAYS.
+
+def _speaking(monkeypatch):
+    said = {"log": [], "events": []}
+    monkeypatch.setattr(research, "log",
+                        lambda msg, level="INFO", *a, **k: said["log"].append((level, msg)))
+    monkeypatch.setattr(research, "emit_event",
+                        lambda *a, **k: said["events"].append((a, k)))
+    return said
+
+
+def _captions(said):
+    return [k.get("progress") for a, k in said["events"]
+            if a and a[0] == "agent_progress" and k.get("agent") == "claude"]
+
+
+def _ledger(said):
+    return [m for _, m in said["log"] if "claude.select_effort_tier" in m]
+
+
+def test_a_run_left_at_low_says_low(monkeypatch):
+    said = _speaking(monkeypatch)
+    page = ScriptedPage("Opus 5 Low", effort_row_shows="effort low", wanted_row=False)
+    _run(page, allow_probe=True)
+    assert any("effort in effect: 'low'" in m for _, m in said["log"]), said["log"]
+    assert _captions(said) == ["Claude is researching at Low effort — Max could not be set"]
+    assert research._P2_THINKING_STATE["claude"]["effort_got"] == "low"
+    assert _ledger(said) and "tier is 'low'" in _ledger(said)[-1], _ledger(said)
+
+
+def test_the_caption_is_said_once_at_the_initial_setup(monkeypatch):
+    """The pre-send re-activation and the step-back call this function too. The
+    caption rides the tile's CURRENT status, and a pass made seconds before the
+    brief goes out must not re-send it — the log still says it."""
+    said = _speaking(monkeypatch)
+    page = ScriptedPage("Opus 5 Low", effort_row_shows="effort low", wanted_row=False)
+    _run(page)                                  # not the initial setup
+    assert any("effort in effect: 'low'" in m for _, m in said["log"]), said["log"]
+    assert _captions(said) == []
+
+
+def test_a_press_that_did_not_verify_claims_no_tier(monkeypatch):
+    """The Max row was there and a press landed, but it never read back as
+    selected. The row was read BEFORE the press, so 'low' may be stale and 'max'
+    is unproven: the run says unknown, and shows nothing."""
+    said = _speaking(monkeypatch)
+    page = ScriptedPage("Opus 5 Low", effort_row_shows="effort low",
+                        wanted_row=True, wanted_already=False)
+    _run(page, allow_probe=True)
+    assert any("claude-effort-option" in p for p in page.presses), (
+        "precondition: the Max row was pressed")
+    assert any("effort in effect: unknown" in m for _, m in said["log"]), said["log"]
+    assert _captions(said) == []
+    assert research._P2_THINKING_STATE["claude"]["effort_got"] is None
+
+
+def test_a_run_at_max_says_max_and_shows_nothing(monkeypatch):
+    said = _speaking(monkeypatch)
+    page = ScriptedPage("Opus 5 Max")           # read off the trigger
+    _run(page, allow_probe=True)
+    assert any("effort in effect: 'max'" in m for _, m in said["log"]), said["log"]
+    assert _captions(said) == []
+    assert research._P2_THINKING_STATE["claude"]["effort_got"] == "max"

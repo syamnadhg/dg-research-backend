@@ -22,7 +22,10 @@ no longer inline, that slice ran on past the detector into the #744 diagnostic
 dump, which happens to contain the same `getClientRects()` idiom. It kept
 passing while testing nothing.
 """
+import pytest
+
 import research
+from _domshim import NODE, el, evaluate_js, run_js
 from conftest import code_only_deep, js_code_only
 
 DETECTOR = js_code_only(research._CLAUDE_MODE_STATE_JS)
@@ -226,3 +229,114 @@ def test_the_effort_term_is_reported_not_self_gated():
     assert "effortOk" not in window, (
         "the pre-send gate must NOT require effort — see the note in the detector"
     )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 2026-09-23 — the effort the run ACTUALLY got, read off the Effort row
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# The 09-20 run marked the Effort row as 'effortlow', found no 'max' row in the
+# submenu, WARNed "effort 'max' was NOT confirmed", and went out at Low — and
+# nothing anywhere said Low. The row shows the tier in effect, but its spans
+# ("Effort" and "Low") are glued by `textContent`. Step 1C now also reads it with
+# the gap-aware walker copied from the ChatGPT trigger reader, and the run's log,
+# its DOM ledger and Claude's tile name the tier it is actually on.
+
+_needs_node = pytest.mark.skipif(NODE is None, reason="node runs the page script")
+_PUA = chr(0xE08F)          # an icon-font glyph, as claude.ai renders the chevron
+
+
+def _effort_row_js():
+    return evaluate_js(research.setup_claude_dr, contains="const linky = el =>")
+
+
+def _mark(spec):
+    return run_js(spec, _effort_row_js(),
+                  {"attr": research._SR_CLICK_MARK, "value": "claude-effort",
+                   "testid": research._CLAUDE_EFFORT_TRIGGER_TESTID})["ret"]
+
+
+def _popover(row):
+    return el("body", {}, "", [el("div", {"role": "menu"}, "", [
+        el("div", {"role": "menuitemradio"}, "Opus 5 For complex tasks"), row])])
+
+
+@_needs_node
+def test_the_0920_row_reads_as_low_not_effortlow():
+    """The captured shape: two spans and a glyph, found by its text. `text` is
+    what the log has always printed ('effortlow'); `shows` is the same row read
+    with the gaps a person sees, and that is what names the tier."""
+    row = el("div", {"role": "menuitem"}, "", [
+        el("span", {}, "Effort"), el("span", {}, "Low"), el("span", {}, _PUA)])
+    ret = _mark(_popover(row))
+    assert ret["marked"] is True and ret["text"] == "effortlow"
+    assert ret["shows"] == "effort low"
+    assert research._claude_effort_from_row(ret["shows"]) == "low"
+
+
+@_needs_node
+def test_a_two_word_tier_is_read_as_its_tier_word():
+    """Only the walker separates a value rendered as two spans ('High' +
+    'Default', the captured default rung). Glued it reads 'highdefault', which
+    is no tier at all. Found by test id, the way the live row is found today."""
+    row = el("div", {"role": "menuitem",
+                     "data-testid": research._CLAUDE_EFFORT_TRIGGER_TESTID}, "", [
+        el("span", {}, "Effort"), el("span", {}, "High"), el("span", {}, "Default")])
+    ret = _mark(_popover(row))
+    assert ret["via"] == "testid"
+    assert research._claude_effort_from_row(ret["shows"]) == "high", ret["shows"]
+
+
+@pytest.mark.parametrize("text,want", [
+    ("effort low", "low"),
+    ("Effort Max" + _PUA, "max"),
+    ("effort high default", "high"),
+    ("EffortLow", "low"),           # one text node: no gap for the walker to supply
+    ("effortmax" + _PUA, "max"),
+    ("effort", None),               # the label with no value
+    ("", None),
+    (None, None),
+    ("opus 5 for complex tasks", None),
+])
+def test_the_tier_is_the_word_after_effort(text, want):
+    assert research._claude_effort_from_row(text) == want
+
+
+@pytest.mark.parametrize("confirmed,pressed,row,want", [
+    (True, False, "low", "max"),    # confirmed: the wanted tier, whatever the row said before
+    (True, True, "low", "max"),
+    (False, False, "low", "low"),   # ⭐ the 09-20 run: nothing changed it, so the row is the truth
+    (False, True, "low", None),     # a press landed and did not verify: the row read is stale
+    (False, False, None, None),     # nothing was read
+])
+def test_the_tier_in_effect_is_only_what_the_page_proved(confirmed, pressed, row, want):
+    assert research._claude_effort_in_effect(
+        confirmed=confirmed, wanted="max", row_shows=row, pressed=pressed) == want
+
+
+def test_a_low_run_says_low_in_every_place_it_speaks():
+    r = research._claude_effort_report("max", "low")
+    assert r["level"] == "WARN"
+    assert "'low'" in r["log"] and "'max'" in r["log"]
+    assert "'low'" in r["detail"]
+    assert r["notice"] == "Claude is researching at Low effort — Max could not be set"
+
+
+def test_a_run_at_the_wanted_tier_says_so_and_shows_nothing():
+    r = research._claude_effort_report("max", "max")
+    assert r["level"] == "INFO" and "'max'" in r["log"] and r["notice"] is None
+
+
+def test_an_unread_tier_is_logged_but_never_shown():
+    """⛔ No caption for "we could not read it". An unconfirmed tier on nearly
+    every run is the false alarm the 2026-06-22 decision took out of view."""
+    r = research._claude_effort_report("max", None)
+    assert r["level"] == "WARN" and "unknown" in r["log"] and r["notice"] is None
+    assert "wanted 'max'" in r["detail"]
+
+
+def test_no_wanted_tier_means_nothing_to_fall_short_of():
+    """A policy with no effort word asks for nothing, so a tier read off the row
+    is a fact to log, not a shortfall to show ("— could not be set")."""
+    r = research._claude_effort_report("", "low")
+    assert r["level"] == "INFO" and r["notice"] is None

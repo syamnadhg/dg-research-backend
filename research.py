@@ -55368,6 +55368,89 @@ def _claude_effort_is_set(*, marked: bool, already: bool,
     return bool(pressed and checked)
 
 
+# ⭐⭐ 2026-09-23 — WHICH EFFORT IS THE RUN ACTUALLY ON? Everything above answers
+# "did we set the tier we wanted". Nothing answered "which tier did we get", so
+# the 09-20 run marked the Effort row as 'effortlow', found no 'max' row, logged
+# "NOT confirmed", and went out at Low with no record anywhere that it was Low.
+# The Effort row in the model popover SHOWS the tier in effect beside its label;
+# these three read it, decide what the page proved, and word it. Pure, so the
+# answer and the words a person reads are tested by calling them.
+
+def _claude_effort_from_row(text) -> "str | None":
+    """The effort tier Claude's Effort row shows: 'effort low' → 'low'.
+
+    Step 1C reads the row with the gap-aware walker (copied from the ChatGPT
+    trigger reader), because `textContent` glues its spans — the 09-20 log has
+    'effortlow' — and a value rendered as two spans ('High' + 'Default', the
+    captured default rung) only separates when the walker supplies the gaps.
+    The tier is the word AFTER "effort". A row that is ONE text node
+    ('EffortLow': no element boundary for the walker to see) is read by prefix.
+    Icon-font glyphs and punctuation split words like spaces do.
+
+    No tier list on purpose: this reports what the row SAYS, and the caller
+    compares it with what was wanted. None when the row names no tier."""
+    words = [w for w in re.split(r"[^a-z0-9]+", str(text or "").lower()) if w]
+    for i, w in enumerate(words):
+        if w == "effort":
+            return words[i + 1] if i + 1 < len(words) else None
+        if w.startswith("effort"):
+            return w[len("effort"):]
+    return None
+
+
+def _claude_effort_in_effect(*, confirmed: bool, wanted, row_shows,
+                             pressed: bool) -> "str | None":
+    """The effort tier the run is on, as far as the page PROVED it. None when
+    nothing proved one.
+
+      * `confirmed` — the wanted tier was read off the trigger, or set in the
+                      submenu and read back as selected: that tier.
+      * `pressed`   — a press on an option landed and did NOT read back as
+                      selected. The row was read BEFORE that press, so what it
+                      showed may no longer be true — unknown, never a guess.
+      * otherwise   — what the Effort row showed; nothing here changed it.
+    """
+    if confirmed:
+        return str(wanted or "").strip().lower() or None
+    if pressed:
+        return None
+    return row_shows or None
+
+
+def _claude_effort_report(wanted, got) -> dict:
+    """What the run says about its effort tier: the log line (and its level),
+    the DOM-ledger detail, and the caption a person sees on Claude's tile.
+
+    ⛔ THE CAPTION IS ONLY FOR A TIER THAT WAS READ AND IS NOT THE ONE WANTED.
+    An unread tier goes to the log and the ledger, never to the person: "could
+    not confirm the effort" on nearly every run is the false alarm the
+    2026-06-22 decision took out of their view.
+
+    ⛔ A CAPTION, NOT AN ALERT, for the reason `_report_claude_plan_limit` gives:
+    a fact the run cannot change, not a question for the person. And not a
+    lasting notice either — the computer-use pass that runs after this may still
+    set the tier, and a notice that outlived that would be false. The log line
+    and the end-of-run `[dom-summary]` are the durable record."""
+    w = str(wanted or "").strip().lower()
+    g = str(got or "").strip().lower()
+    if g and (g == w or not w):
+        return {"log": f"effort in effect: '{g}'", "level": "INFO",
+                "detail": f"the Effort row shows '{g}'", "notice": None}
+    if not g:
+        return {"log": (f"effort in effect: unknown — wanted '{w}', and the page "
+                        f"did not show which tier the run is on"),
+                "level": "WARN",
+                "detail": (f"tier left as it was; wanted '{w}' — the answer may "
+                           f"be weaker than the run reports"),
+                "notice": None}
+    return {"log": f"effort in effect: '{g}' — wanted '{w}', which could not be set",
+            "level": "WARN",
+            "detail": (f"tier is '{g}', not the '{w}' wanted — the answer may be "
+                       f"weaker than the run reports"),
+            "notice": (f"Claude is researching at {g.capitalize()} effort — "
+                       f"{w.capitalize()} could not be set")}
+
+
 def _claude_validator_effort_ok(thinking_state) -> bool:
     """Should the CUA validator be told the effort tier is already set?
 
@@ -56341,6 +56424,12 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
         # Carried so the single intent record at the end of this function can tell
         # a correct skip from a real verification, which the boolean alone cannot.
         _effort_via = ""
+        # ⭐ 2026-09-23 — what the Effort row SHOWED when Step 1C found it (the
+        # tier in effect before anything here touched it: 'low' on the 09-20
+        # run), and whether a press on an effort OPTION landed after that read,
+        # which makes the read stale. See `_claude_effort_in_effect`.
+        _eff_row_shows = None
+        _eff_option_pressed = False
         if model_ok:
             # Model already correct — record it but DO NOT re-pick (the #744
             # re-click loop). We still open the popover below for Effort/Thinking.
@@ -56964,6 +57053,26 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                     const norm = s => (s || '')
                         .replace(/[\\ue000-\\uf8ff]/g, ' ')
                         .replace(/\\s+/g, ' ').trim().toLowerCase();
+                    // ⭐ 2026-09-23 — THE ROW READ THE WAY IT IS RENDERED. The
+                    // Effort row carries the tier in effect as its own span
+                    // ("Effort" + "Low"), and `textContent` glues them: the
+                    // 09-20 log says 'effortlow'. Copied, unchanged, from the
+                    // ChatGPT trigger reader (`_CHATGPT_MODEL_TRIGGER_JS`),
+                    // which explains why `innerText` is not the answer either:
+                    // walk the tree and put a gap at every element boundary.
+                    const spaced = el => {
+                        let out = '';
+                        const walk = n => {
+                            for (const c of n.childNodes || []) {
+                                if (c.nodeType === 3) out += c.nodeValue || '';
+                                else if (c.nodeType === 1) { out += ' '; walk(c); out += ' '; }
+                            }
+                        };
+                        walk(el);
+                        // Fall back to textContent for a node the walk cannot read — a glued
+                        // label still beats no label, and every caller tolerates a miss.
+                        return norm(out) || norm(el.textContent);
+                    };
                     const linky = el => (el.tagName === 'A' && el.getAttribute('href'))
                         || (el.closest && el.closest('a[href]'))
                         || (el.querySelector && el.querySelector('a[href]'));
@@ -57038,6 +57147,7 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                         }
                         return {marked: true, via: via,
                                 text: norm(trigger.textContent).slice(0, 60),
+                                shows: spaced(trigger).slice(0, 60),
                                 chain: chain,
                                 rejected: rejected.slice(0, 5)};
                     }
@@ -57046,6 +57156,9 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                 }""", {"attr": _SR_CLICK_MARK, "value": "claude-effort",
                        "testid": _CLAUDE_EFFORT_TRIGGER_TESTID}) or {}
                 _eff_marked = bool(_eff_mark.get("marked"))
+                # The tier the row SHOWS — the one in effect before anything
+                # below touches it. Read from the gap-aware text (`shows`).
+                _eff_row_shows = _claude_effort_from_row(_eff_mark.get("shows"))
                 if _eff_mark.get("rejected"):
                     log(f"[setup_claude_dr] Step 1C: refused "
                         f"{len(_eff_mark['rejected'])} 'Effort…' candidate(s) — "
@@ -57406,6 +57519,7 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                     if _eff_set and not _eff_already:
                         _eff_pressed = bool(await _sr_real_click(
                             page, "claude-effort-option", tag="[setup_claude_dr]"))
+                        _eff_option_pressed = _eff_pressed
                         if _eff_pressed:
                             await asyncio.sleep(0.4)
                             _eff_ok = {}
@@ -57682,7 +57796,26 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
         # Phoenix model_refresh — record the advisory thinking/effort state for
         # the caller's soft notice (NOT part of the success contract — model +
         # research remain the only hard gates).
-        _P2_THINKING_STATE["claude"] = {"effort": _effort_confirmed, "thinking": _thinking_confirmed}
+        # ⭐ 2026-09-23 — AND WHICH TIER THE RUN IS ON, said in the log, in the
+        # ledger below and, when it was read and is not the one wanted, on
+        # Claude's tile. A Low run says Low. See `_claude_effort_report`.
+        _effort_got = _claude_effort_in_effect(
+            confirmed=_effort_confirmed, wanted=_claude_effort,
+            row_shows=_eff_row_shows, pressed=_eff_option_pressed)
+        _eff_report = _claude_effort_report(_claude_effort, _effort_got)
+        log(f"[setup_claude_dr] {_eff_report['log']}", _eff_report["level"])
+        # Said ONCE, at the initial setup (the only call that passes
+        # `allow_probe`). The pre-send re-activation and the step-back run this
+        # function too, and the caption rides the tile's CURRENT status — sent
+        # seconds before the brief goes out it is noise, and the log says it anyway.
+        if _eff_report["notice"] and allow_probe:
+            try:
+                emit_event("agent_progress", phase=2, agent="claude", status="starting",
+                           progress=_eff_report["notice"])
+            except Exception:
+                pass
+        _P2_THINKING_STATE["claude"] = {"effort": _effort_confirmed, "thinking": _thinking_confirmed,
+                                        "effort_got": _effort_got}
         # ⭐⭐ 2026-08-06 — Claude's effort tier had NO entry in the run's DOM-intent
         # ledger while ChatGPT's model pill did, so when the Effort submenu failed
         # to mount the run carried on with whatever tier was already set and the
@@ -57698,9 +57831,7 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
             "claude.select_effort_tier",
             _claude_effort_outcome(_effort_confirmed, _effort_via),
             phase=2, via=(_effort_via or "none"),
-            detail=("" if _effort_confirmed else
-                    f"tier left as it was; wanted '{_claude_effort}' — the "
-                    f"answer may be weaker than the run reports"))
+            detail=("" if _effort_confirmed else _eff_report["detail"]))
         # Record the selected model version for on-the-fly known-good learning.
         # ⚠ PREFER THE PICK. The trigger read is a page-wide max over every
         # visible button, so an upsell chip naming a model the account cannot
