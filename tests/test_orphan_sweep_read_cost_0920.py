@@ -16,15 +16,19 @@ remembering. A directory confirmed present is re-checked at most hourly; one
 never seen before is still read on the very next tick, so a genuine orphan —
 the thing the sweep is actually for — is detected exactly as fast as it was.
 
-⚠ THE COST, STATED HONESTLY: a research deleted in the app keeps its local queue
-directory for up to an hour instead of up to five minutes. That is latency on a
-cleanup path with no user-visible surface; the Firestore side of the delete has
-already happened before this sweep ever looks.
+⛔ THE COST WAS STATED AS "a research deleted in the app keeps its local queue
+directory for up to an hour", and wave 10.10 found who paid it: the person who
+deleted a research on the day they ran it, whose folders and logs then stayed on
+the computer for up to about sixty-five minutes. So a folder whose run wrote its
+`delivery.json` within the last day is asked about every tick again, and the
+hour holds only after that. The tests at the bottom hold the hour where it must
+still hold — the read bill for every older run is what this file exists for.
 """
 import re
 
 import research
 from conftest import code_only
+from test_incognito_teardown_109 import CHAT, HOUR, NOW, _sweep_tick
 
 
 def _sweep_src() -> str:
@@ -95,3 +99,45 @@ def test_the_in_flight_statuses_still_skip_before_any_of_this():
     make a live run eligible for deletion."""
     body = _sweep_src()
     assert body.index("ORPHAN_SWEEP_IN_FLIGHT_STATUSES") < body.index("_orphan_verified.get(")
+
+
+# ── wave 10.10: the recency tier must not bring the read bill back ────────
+#
+# ⛔⛔ EXECUTED, through the real `_orphan_sweep_loop` rebuilt from
+# `run_server` (the helper lives in test_incognito_teardown_109.py). Each of
+# these fails if the tier widens to every folder, which is the 288-reads-a-day
+# defect this file was written for.
+
+def test_a_day_old_folder_still_skips_its_read_within_the_hour(tmp_path):
+    """⛔⛔ THE READ BILL. A run that finished two days ago, confirmed present a
+    minute ago, costs nothing this tick — even though its research is in fact
+    gone, which is the hour of latency the old tier still pays on purpose."""
+    still_there, reads = _sweep_tick(tmp_path, CHAT, verified_at=NOW - 60.0,
+                                     record_exists=False,
+                                     wrote_at=NOW - 2 * 86400)
+    assert still_there and reads == 0, (
+        f"a two-day-old folder cost {reads} read(s) inside its hour")
+
+
+def test_a_file_stamped_days_ahead_is_not_recent_for_ever(tmp_path):
+    """⛔ A CLOCK THAT MOVED BACKWARDS leaves files stamped in the future. If
+    "recent" meant only "not older than a day", every such folder would be
+    read on every tick until the clock caught up — days of it."""
+    still_there, reads = _sweep_tick(tmp_path, CHAT, verified_at=NOW - 60.0,
+                                     record_exists=False,
+                                     wrote_at=NOW + 3 * 86400)
+    assert still_there and reads == 0
+
+
+def test_the_tier_is_one_day_wide_on_both_sides():
+    """The window's edges, on the helper: inside a day either way is recent,
+    a day or more is not, and an unknown time is the old tier."""
+    day = research._ORPHAN_RECENT_WINDOW_SEC
+    assert day == 86400
+    due = research._orphan_recheck_due
+    assert due(NOW - 60, NOW, CHAT, HOUR, NOW - day + 1) is True
+    assert due(NOW - 60, NOW, CHAT, HOUR, NOW + day - 1) is True
+    assert due(NOW - 60, NOW, CHAT, HOUR, NOW - day) is False
+    assert due(NOW - 60, NOW, CHAT, HOUR, NOW + day) is False
+    assert due(NOW - 60, NOW, CHAT, HOUR, None) is False
+    assert due(NOW - 60, NOW, CHAT, HOUR) is False

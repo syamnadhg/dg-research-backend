@@ -314,9 +314,18 @@ class _Firestore:
         return types.SimpleNamespace(exists=self.exists)
 
 
-def _sweep_tick(tmp_path, rid, *, verified_at, record_exists):
+#: Two days before NOW — a run that finished long enough ago to sit in the
+#: sweep's hourly tier.
+LONG_AGO = NOW - 2 * 86400
+
+
+def _sweep_tick(tmp_path, rid, *, verified_at, record_exists, wrote_at=LONG_AGO):
     """Run ONE tick of the real `_orphan_sweep_loop` over one finished run
-    directory. Returns (the directory is still there, Firestore reads)."""
+    directory. Returns (the directory is still there, Firestore reads).
+
+    `wrote_at` is when the run last wrote its `delivery.json`. The directory
+    and `owner.json` are always stamped long ago, so only the file the sweep is
+    meant to read can make a folder recent."""
     code = next((c for c in research.run_server.__code__.co_consts
                  if isinstance(c, types.CodeType)
                  and c.co_name == "_orphan_sweep_loop"), None)
@@ -329,6 +338,8 @@ def _sweep_tick(tmp_path, rid, *, verified_at, record_exists):
                                           encoding="utf-8")
     (folder / "owner.json").write_text(
         json.dumps({"uid": "u1", "researchId": rid}), encoding="utf-8")
+    os.utime(folder / "delivery.json", (wrote_at, wrote_at))
+    os.utime(folder / "owner.json", (LONG_AGO, LONG_AGO))
     os.utime(folder, (NOW - 100_000, NOW - 100_000))   # older than the age bound
 
     db = _Firestore(record_exists)
@@ -390,4 +401,31 @@ def test_a_run_that_keeps_nothing_is_left_alone_while_its_record_lives(tmp_path)
     there, and the run may still be resumable from it."""
     still_there, reads = _sweep_tick(tmp_path, INCOG, verified_at=NOW - 1.0,
                                      record_exists=True)
+    assert still_there and reads == 1
+
+
+# ══ 6. a research deleted on the day it ran leaves within minutes ═════════
+#
+# ⛔⛔ WAVE 10.10. The hourly memo held EVERY ordinary folder, including the one
+# a person had just deleted in the app, so that research's queue folder and logs
+# stayed on the computer for up to about sixty-five minutes. A folder whose run
+# wrote its `delivery.json` within the last day is now asked about on every
+# five-minute tick; older ones keep the hour. Executed through the same rebuilt
+# closure as above — the helper alone is not the consumer.
+
+def test_a_research_deleted_on_the_day_it_ran_goes_on_the_next_tick(tmp_path):
+    """⛔⛔ THE FIX. Confirmed present a minute ago, finished an hour ago,
+    deleted since: the sweep asks again anyway, finds it gone and takes the
+    folder. Before the tier this cost zero reads and the folder stayed."""
+    still_there, reads = _sweep_tick(tmp_path, CHAT, verified_at=NOW - 60.0,
+                                     record_exists=False, wrote_at=NOW - HOUR)
+    assert not still_there, "a research deleted today outlived its delete by the memo"
+    assert reads == 2, f"the sweep did not re-read a recent folder: {reads} read(s)"
+
+
+def test_a_recent_folder_whose_research_lives_is_asked_about_and_kept(tmp_path):
+    """⭐ ASKING IS NOT DELETING. A run from today whose research is still there
+    costs one read a tick for the day, and its folder stays."""
+    still_there, reads = _sweep_tick(tmp_path, CHAT, verified_at=NOW - 60.0,
+                                     record_exists=True, wrote_at=NOW - HOUR)
     assert still_there and reads == 1

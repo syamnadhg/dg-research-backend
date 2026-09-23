@@ -230,9 +230,11 @@ RECHECK = ("    if _is_incognito_research(research_id):\n"
 # 2026-09-22: four tests pinned the helper's truth table and nothing executed
 # the one line that calls it, so putting the old inline comparison back left
 # the whole suite green and the harness reporting a clean score.
+# ⚠ 2026-09-23 re-anchored (wave 10.10): the call now also hands the helper the
+# folder's `delivery.json` time for the recency tier.
 RECHECK_CALL = ("                    if not _orphan_recheck_due(\n"
                 "                            _orphan_verified.get(_seen_key, 0.0), now_ts_inner,\n"
-                "                            rid, ORPHAN_RECHECK_SEC):\n"
+                "                            rid, ORPHAN_RECHECK_SEC, _wrote_at):\n"
                 "                        continue")
 QUEUE_DIR_CLAIM = ('    claim = Path(str(resume)).name if resume else bound.arguments.get("run_id")')
 CATCHUP = ('    if _is_incognito_research(research_id):\n'

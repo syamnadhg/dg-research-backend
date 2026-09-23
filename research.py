@@ -4018,9 +4018,33 @@ def _run_log_folders_for_research(research_id, root=None) -> "list[Path]":
 _RUN_DELIVERY_OVER = frozenset({"completed", "stopped"})
 
 
+#: How long after a run last wrote its `delivery.json` the orphan sweep keeps
+#: asking about it on every tick (five minutes) instead of hourly.
+#:
+#: ⛔⛔ A DAY, NOT "ALWAYS", AND NOT "SINCE THIS PROCESS FIRST SAW IT". The hour
+#: exists because the sweep once billed a read per finished folder per tick for
+#: ever — 288 reads a day for one old run. A research is almost always deleted
+#: in the day it ran, while somebody is still looking at it, so that day is
+#: where five minutes is worth paying for; after it the hour comes back. Keyed on
+#: the FILE's time because a process-local "first seen" would start every folder
+#: on the disk over again after each restart and bring the old read bill back.
+_ORPHAN_RECENT_WINDOW_SEC = 24 * 60 * 60
+
+
 def _orphan_recheck_due(last_verified_at, now: float, research_id,
-                        recheck_sec: float) -> bool:
+                        recheck_sec: float, last_write_at=None) -> bool:
     """Should the orphan sweep ask Firestore about this run directory again?
+
+    ⛔⛔ A DELETED RESEARCH SAT ON THIS DISK FOR UP TO AN HOUR (wave 10.10).
+    The hourly memo below covered every ordinary folder, including the one a
+    person had just deleted in the app — so its queue folder and its logs stayed
+    here for up to about sixty-five minutes. `last_write_at` (the folder's
+    `delivery.json` modified time) now splits the folders in two: one whose run
+    wrote within `_ORPHAN_RECENT_WINDOW_SEC` is asked about on every tick, and
+    one older than that keeps the hour. "Within" counts both ways, so a file
+    stamped ahead by a clock that moved is recent for at most a day and can
+    never be recent for ever. An unknown time (`None`) is the old tier: the read
+    bill is the thing this memo exists to hold down.
 
     ⛔⛔ THE MEMO WAS WORTH AN HOUR OF LATENCY AND IS NOT WORTH IT HERE. It exists
     because the sweep billed one read per finished directory every five minutes,
@@ -4039,6 +4063,9 @@ def _orphan_recheck_due(last_verified_at, now: float, research_id,
 
     ⛔ EXTRACTED FROM `_orphan_sweep_loop`, a closure inside `run_server` that
     no test could call — so the CALL SITE is pinned by rebuilding that closure."""
+    if (last_write_at is not None
+            and abs(float(now) - float(last_write_at)) < _ORPHAN_RECENT_WINDOW_SEC):
+        return True
     if _is_incognito_research(research_id):
         return True
     return (float(now) - float(last_verified_at or 0.0)) >= float(recheck_sec)
@@ -75924,10 +75951,14 @@ async def run_server(port=8000):
     # hourly; one never seen before is still checked on the very next tick, so
     # a genuine orphan is detected exactly as fast as it was.
     #
-    # ⚠ The cost of the memo is a DELETED research surviving up to an hour
-    # longer on local disk instead of up to five minutes. That is latency on a
-    # cleanup path with no user-visible surface — the Firestore side of the
-    # delete has already happened before this sweep ever looks.
+    # ⛔⛔ BUT NOT A RUN FROM TODAY (wave 10.10). The memo's stated cost was "a
+    # deleted research survives up to an hour", and that hour landed on exactly
+    # the research somebody had just deleted: its folders and logs stayed here
+    # for up to about sixty-five minutes after the app said it was gone. A
+    # folder whose `delivery.json` was written within the last day is asked
+    # about on every tick again (`_orphan_recheck_due`, `last_write_at`); only
+    # older ones keep the hour, so the read bill stays bounded by one day of
+    # runs rather than by every run this machine has ever finished.
     ORPHAN_RECHECK_SEC = 3600
     _orphan_verified: dict = {}
 
@@ -75962,6 +75993,13 @@ async def run_server(port=8000):
                         continue
                     if not status or status in ORPHAN_SWEEP_IN_FLIGHT_STATUSES:
                         continue
+                    # ⭐ WHEN THIS RUN LAST WROTE, for the recency tier. The
+                    # file, not the directory: a directory's time moves only
+                    # when an entry is added or removed.
+                    try:
+                        _wrote_at = delivery_path.stat().st_mtime
+                    except OSError:
+                        _wrote_at = None
                     owner_path = d / "owner.json"
                     if not owner_path.exists():
                         continue
@@ -75975,7 +76013,7 @@ async def run_server(port=8000):
                     _seen_key = f"{uid}/{rid}"
                     if not _orphan_recheck_due(
                             _orphan_verified.get(_seen_key, 0.0), now_ts_inner,
-                            rid, ORPHAN_RECHECK_SEC):
+                            rid, ORPHAN_RECHECK_SEC, _wrote_at):
                         continue
                     try:
                         ref = _firebase_db.collection("users").document(uid) \
