@@ -36,7 +36,7 @@ import pytest
 
 import research
 from _queue_listener import Listener
-from _run_server_closure import lift
+from _run_server_closure import lift, run_worker_once
 
 UID = "uid-alice"
 RID = "chat_1758600000000_1"
@@ -387,83 +387,13 @@ def test_the_rescan_takes_an_ordinary_or_unreadable_research(monkeypatch, tmp_pa
 
 # ══ 4. the dequeue — the last pickup every job passes ═════════════════════
 
-class _Done(Exception):
-    """Raised by the fake queue's second `get()`: the worker loop is endless."""
-
-
-class _WorkerQueue:
-    def __init__(self, job):
-        self._jobs = [job]
-        self._queue = collections.deque()
-
-    async def get(self):
-        if not self._jobs:
-            raise _Done()
-        return self._jobs.pop(0)
-
-    def task_done(self):
-        pass
-
-    def qsize(self):
-        return 0
-
-
-class _Controls:
-    _awaiting_user = False
-
-    def reset(self):
-        pass
-
-    def is_stop(self):
-        return False
-
-    def is_pause(self):
-        return False
-
-    def request_stop(self):
-        pass
-
-
 def _dequeue(monkeypatch, tmp_path, flip, record="absent"):
     """Run the real worker loop over one job. Returns the pipelines it started."""
-    started = []
-
-    def _pipeline(**kw):
-        started.append(kw)
-        done = asyncio.get_running_loop().create_future()
-        done.set_result(None)
-        return done
-
-    async def _nothing():
-        return None
-
     store = Store(record)
     job = {"topic": TOPIC, "email": "", "run_id": RUN, "uid": UID, "research_id": RID,
            "resume_dir": str(tmp_path / "queues" / RUN)}
-    monkeypatch.setattr(research, "__file__", str(tmp_path / "research.py"))
-    monkeypatch.setattr(research, "_firebase_db", store)
-    monkeypatch.setattr(research, "_job_queue", _WorkerQueue(job), raising=False)
-    monkeypatch.setattr(research, "_flip_queued_to_ongoing", lambda u, r: flip, raising=False)
-    monkeypatch.setattr(research, "_persist_pending_queue", lambda current_job=None: None,
-                        raising=False)
-    monkeypatch.setattr(research, "_recompute_queue_positions", lambda: None, raising=False)
-    monkeypatch.setattr(research, "_rescan_queue_for_unclaimed", _nothing, raising=False)
-    monkeypatch.setattr(research, "WORKER_OUTER_TIMEOUT_SEC", 3600, raising=False)
-    monkeypatch.setattr(research, "run_pipeline_captured", _pipeline)
-    monkeypatch.setattr(research, "_controls", _Controls())
-    monkeypatch.setattr(research, "_write_worker_lock", lambda *a, **k: None)
-    monkeypatch.setattr(research, "_delete_worker_lock", lambda *a, **k: None)
-    monkeypatch.setattr(research, "_clear_current_run_id_best_effort", lambda *a, **k: None)
-    monkeypatch.setattr(research, "_recompute_deferred_queue_positions", lambda: None)
-    monkeypatch.setattr(research, "_pending_enq_dec", lambda: None)
-    monkeypatch.setattr(research, "load_device_id", lambda: None)
-    monkeypatch.setattr(research, "_update_research_doc", store.update_research)
-    monkeypatch.setitem(research._QUEUE_STATE, "running", False)
-    monkeypatch.setitem(research._QUEUE_STATE, "current_job", None)
-    monkeypatch.setitem(research._QUEUE_STATE, "_hard_reset_lock", None)
-    with pytest.raises(_Done):
-        asyncio.run(lift("_job_worker")())
-    return started
+    return run_worker_once(monkeypatch, tmp_path, job, flip=flip, db=store,
+                           update_research=store.update_research)
 
 
 @pytest.mark.parametrize("flip,record", [
