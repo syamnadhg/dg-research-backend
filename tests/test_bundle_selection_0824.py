@@ -166,13 +166,21 @@ def machine(tmp_path, monkeypatch):
 
     import time as _t
     now = _t.time()
+    # ⛔⛔ THE START TIME IS RELATIVE TO NOW, AND THAT IS NOT COSMETIC. It was the
+    # literal "2026-08-24T00:00:01Z", and `_scan_run_folders` prefers that stamp
+    # over the folder's mtime — so on 2026-09-23T00:00:01Z, thirty days later to
+    # the second, both runs fell outside `BUNDLE_MAX_AGE_DAYS` and the two
+    # age-bound pins below started failing on the clock alone, for everybody,
+    # with nothing in the tree having changed. A fixture that describes "a run
+    # this machine did recently" has to say so in terms of now.
+    started_utc = _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(now - 3600))
     for name, uid in (("alice_20260824T000001", "U_ALICE"),
                       ("bob_20260824T000002", "U_BOB")):
         folder = root / "runs" / name
         folder.mkdir()
         (folder / "meta.json").write_text(json.dumps({
             "schema": 1, "status": "complete", "researchId": name.split("_")[0],
-            "startedUtc": "2026-08-24T00:00:01Z", "submitterUid": uid,
+            "startedUtc": started_utc, "submitterUid": uid,
             "submitterSource": "queue",
         }), encoding="utf-8")
         (folder / "run.log").write_text(f"log for {name}\n", encoding="utf-8")
