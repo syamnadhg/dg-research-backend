@@ -22,7 +22,7 @@ import re
 
 import pytest
 
-from conftest import code_only_deep
+from conftest import code_only_deep, web_file
 
 import research
 import telemetry as tm
@@ -415,9 +415,8 @@ def test_the_install_id_reaches_the_device_doc_at_pair_time():
     from pathlib import Path
     flow = Path("auth/v2_flow.py").read_text(encoding="utf-8")
     assert '"installUuid": _install_uuid_best_effort()' in flow
-    route = Path(__file__).resolve().parents[2] / "dg-research" / "src" / "app" / "api" / "devices" / "initiate-pair" / "route.ts"
-    if not route.exists():
-        pytest.skip("sibling app repo not checked out")
+    route = web_file("the pairing route's install id",
+                     "src/app/api/devices/initiate-pair/route.ts")
     text = route.read_text(encoding="utf-8")
     assert "installUuid" in text
     assert "INSTALL_UUID_RE" in text, (

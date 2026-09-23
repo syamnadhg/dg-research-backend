@@ -370,7 +370,11 @@ SEQ_MONOTONIC = ("    new_seq = int(time.time() * 1000)\n"
 # a test, and its failure mode is silence: it reaches into another checkout, so
 # "found nothing" and "found nothing wrong" look identical from here. These
 # three mutants are aimed at the guards that tell those apart.
+# ⭐ Wave 10.10 moved two of those guards into `tests/conftest.py`, the one web
+# finder every cross-repo pin now shares, so W2 and W3 mutate THAT file — and
+# this file's tests are still the ones that must notice.
 CAP_TEST = "tests/test_incognito_capability_109.py"
+CONFTEST = "tests/conftest.py"
 CAP_MISSING_FILE = ('    path = web / rel\n'
                     '    assert path.exists(), (\n'
                     '        f"{rel} is missing from {web} — this pin holds four copies of one id "\n'
@@ -378,11 +382,12 @@ CAP_MISSING_FILE = ('    path = web / rel\n'
                     '        f"the web moved the file")\n'
                     '    return path.read_text(encoding="utf-8")')
 CAP_ENV_CLAIM = ('    if env:\n'
-                 '        assert (Path(env) / "firestore.rules").exists(), (\n'
+                 '        assert (Path(env) / WEB_REPO_MARKER).is_file(), (\n'
                  '            f"SR_WEB_REPO={env!r} is not a dg-research checkout — there is no "\n'
-                 '            f"firestore.rules there, so the parity pins were aimed at nothing")')
+                 '            f"{WEB_REPO_MARKER} there, so every cross-repo pin was aimed at nothing")\n'
+                 '        return Path(env)')
 CAP_COMMON_DIR = ("        if common.returncode == 0 and common.stdout.strip():\n"
-                  '            out.append(Path(common.stdout.strip()).parent.parent / "dg-research")')
+                  '            via_common = Path(common.stdout.strip()).parent.parent / "dg-research"')
 
 CLAIM_QUEUE_DELETE = ('                        f"recreating it", "WARN")\n'
                       "                    try:\n"
@@ -1052,16 +1057,18 @@ MUTANTS = [
     ("W2", "under", "⛔⛔ a mistyped SR_WEB_REPO goes back to reading as 'there "
      "is no web repo here', so the one place somebody thought they had switched "
      "the parity pins ON is the place they go quiet",
-     [(CAP_ENV_CLAIM, '    if env and not (Path(env) / "firestore.rules").exists():\n'
+     [(CAP_ENV_CLAIM, '    if env and not (Path(env) / WEB_REPO_MARKER).is_file():\n'
                       '        pytest.skip("no web checkout beside this one; '
-                      'set SR_WEB_REPO")')],
-     CAP_TEST),
+                      'set SR_WEB_REPO")\n'
+                      '    if env:\n'
+                      '        return Path(env)')],
+     CONFTEST),
     ("W3", "under", "⛔⛔ the resolver looks only in the directory holding this "
      "checkout, so in the worktree every wave of this branch is built and gated "
      "in, both parity pins skip and nothing compares the four copies",
      [(CAP_COMMON_DIR, "        if False:\n"
-                       '            out.append(Path(common.stdout.strip()).parent.parent / "dg-research")')],
-     CAP_TEST),
+                       '            via_common = Path(common.stdout.strip()).parent.parent / "dg-research"')],
+     CONFTEST),
 ]
 
 

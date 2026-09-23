@@ -17,7 +17,6 @@ paired with its accept polarity: a predicate that answered `False` for
 everything would pass every "an ordinary research is not incognito" assertion
 and take the whole feature away silently.
 """
-import os
 import re
 import shutil
 import subprocess
@@ -26,6 +25,7 @@ from pathlib import Path
 import pytest
 
 import research
+from conftest import require_web_repo, web_repo_candidates
 
 
 # ══ 1. the id is the signal, and it has exactly one shape ═════════════════
@@ -137,67 +137,27 @@ def test_nothing_else_about_the_published_fields_moved(monkeypatch):
 _HALF = Path("src") / "lib" / "incognito.ts"
 
 
-def _web_candidates(here: "Path | None" = None) -> "list[Path]":
-    """Every place the web checkout could be, most explicit first.
-
-    ⛔⛔ THE WORKTREE WAS THE HOLE. `parents[2]` is the directory the BACKEND
-    sits in, and this branch is built and gated in a worktree — where that
-    directory holds other worktrees and no `dg-research` at all. Both parity
-    pins below therefore skipped in the one place the wave's gate actually
-    runs, which is the most expensive silence in this file: they are the only
-    mechanical check that the four copies of the incognito id shape agree.
-
-    ⭐ So the git COMMON dir is asked too, exactly as
-    `tests/test_document_images_0913.py` already does for the upload contract:
-    a worktree's common dir is the real checkout's `.git`, whose grandparent
-    holds the sibling repos."""
-    env = os.environ.get("SR_WEB_REPO")
-    if env:
-        # ⛔ AN EXPLICIT PATH IS THE ONLY CANDIDATE. Falling back from a typo
-        # would put this pin back on a checkout nobody asked about.
-        return [Path(env)]
-    here = Path(here) if here is not None else Path(__file__).resolve().parents[1]
-    out = [here.parent / "dg-research"]
-    try:
-        common = subprocess.run(
-            ["git", "-C", str(here), "rev-parse", "--path-format=absolute",
-             "--git-common-dir"],
-            capture_output=True, text=True, encoding="utf-8", timeout=10)
-        if common.returncode == 0 and common.stdout.strip():
-            out.append(Path(common.stdout.strip()).parent.parent / "dg-research")
-    except (OSError, subprocess.SubprocessError):
-        pass
-    return out
-
-
 def _web() -> Path:
     """The web checkout these pins hold the machine against.
 
-    ⛔⛔ A MISTYPED `SR_WEB_REPO` IS A FAILURE, NEVER A SKIP. The old resolver
-    answered `None` for anything without a `firestore.rules`, so pointing the
-    gate at the wrong directory read as "there is no web repo here" and both
-    pins went quiet — the same silence, arriving from the one place somebody
-    thought they had switched them ON.
+    ⭐ FOUND BY conftest's ONE FINDER (wave 10.10). This file grew the good
+    version of it first — the git common dir, and a mistyped `SR_WEB_REPO` as a
+    FAILURE rather than a skip — and it now lives in `tests/conftest.py` so
+    every cross-repo pin in the suite gets both. The worktree case and the
+    mistyped-path case are still driven from this file, below.
 
-    ⭐ The only skip left is the web half not being on this disk at all. The
-    two halves of this wave land together, and this suite cannot be red in the
-    ordinary checkout because another repo's branch has not merged yet — but
-    the skip names every path it tried, and the mutation harness treats a skip
-    of this file as a hard error rather than as a pass."""
-    tried = _web_candidates()
-    env = os.environ.get("SR_WEB_REPO")
-    if env:
-        assert (Path(env) / "firestore.rules").exists(), (
-            f"SR_WEB_REPO={env!r} is not a dg-research checkout — there is no "
-            f"firestore.rules there, so the parity pins were aimed at nothing")
-    for base in tried:
-        if (base / _HALF).exists():
-            return base
-    pytest.skip(
-        "⛔ the web half of this wave (src/lib/incognito.ts) is in none of "
-        + ", ".join(str(p) for p in tried)
-        + " — the four copies of the incognito id shape were NOT compared; "
-          "point SR_WEB_REPO at a checkout that carries it")
+    ⭐ The only skip of its own is the web half of this wave not being in the
+    checkout that was found. The two halves land together, and this suite
+    cannot be red in the ordinary checkout because another repo's branch has
+    not merged yet — but the skip names the checkout it read, and the mutation
+    harness treats a skip of this file as a hard error rather than as a pass."""
+    web = require_web_repo("the four copies of the incognito id shape")
+    if not (web / _HALF).exists():
+        pytest.skip(
+            f"⛔ the web half of this wave (src/lib/incognito.ts) is not in {web}"
+            " — the four copies of the incognito id shape were NOT compared; "
+            "point SR_WEB_REPO at a checkout that carries it")
+    return web
 
 
 def _web_text(web: Path, rel: str) -> str:
@@ -419,7 +379,7 @@ def test_a_worktree_looks_past_its_own_parent_for_the_web_repo(tmp_path,
     made = _git("worktree", "add", "-q", "-b", "side", str(wt), cwd=main)
     assert made.returncode == 0, made.stderr
 
-    candidates = _web_candidates(wt)
+    candidates = web_repo_candidates(wt)
     assert home / "dg-research" in candidates, (
         f"a worktree found nowhere to look but its own parent: {candidates}")
     assert not (wt.parent / "dg-research").exists(), (

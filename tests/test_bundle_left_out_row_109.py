@@ -17,13 +17,13 @@ Every test below EXECUTES the writer — the pure helper directly, and the
 consumers through the real device handler, the real terminal command and the real
 row writer against a fake Firestore that captures what it is sent.
 """
-import os
 import re
 from pathlib import Path
 
 import pytest
 
 import research
+from conftest import web_file
 
 CODE = "7QK4M2XZ"
 LEFT_OUT = ("droppedForSize", "runsNotAttributed", "runsOtherMembers")
@@ -253,23 +253,15 @@ def test_the_retry_keeps_everything_but_the_counts(db):
 
 
 # ══ the rules name exactly what the machine writes ═════════════════════
-def _web_rules() -> "Path | None":
-    """The web repo's rules: `SR_WEB_REPO` when set (a worktree layout), else the
-    sibling checkout this repo's other rules-parity tests read."""
-    env = os.environ.get("SR_WEB_REPO")
-    base = Path(env) if env else Path(__file__).resolve().parents[2] / "dg-research"
-    path = base / "firestore.rules"
-    return path if path.exists() else None
-
-
 def test_the_web_rules_allow_each_count_as_an_int():
     """⛔ THE HOLD, MADE MECHANICAL. This commit writes three keys the rules'
     `hasOnly` must name. Against a web checkout without them this FAILS — which
     is the signal that the rules have not landed yet, and the reason this commit
-    waits for their deploy."""
-    rules = _web_rules()
-    if rules is None:
-        pytest.skip("no web checkout beside this one; set SR_WEB_REPO")
+    waits for their deploy.
+
+    Found through conftest's one finder: its own used to read a mistyped
+    `SR_WEB_REPO` as "no web checkout here" and skip."""
+    rules = web_file("the logBundles left-out counts", "firestore.rules")
     text = rules.read_text(encoding="utf-8")
     block = text[text.index("match /logBundles/{code}"):]
     block = block[:block.index("allow create:")]

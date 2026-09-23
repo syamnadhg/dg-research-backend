@@ -49,7 +49,7 @@ import pytest
 import requests
 
 import research as R
-from conftest import code_only  # type: ignore
+from conftest import code_only, require_web_repo  # type: ignore
 
 RID = "rid_0913-A"
 UID = "uid-owner-1"
@@ -1898,24 +1898,11 @@ def test_findings_snippets_carry_no_image_markup():
 WEB_CONTRACT_REV = "main"
 
 
-def _web_repo():
-    here = Path(R.__file__).resolve().parent
-    candidates = [here.parent / "dg-research"]
-    try:
-        common = subprocess.run(["git", "-C", str(here), "rev-parse", "--path-format=absolute",
-                                 "--git-common-dir"], capture_output=True, text=True, encoding="utf-8", timeout=10)
-        if common.returncode == 0 and common.stdout.strip():
-            candidates.append(Path(common.stdout.strip()).parent.parent / "dg-research")
-    except (OSError, subprocess.SubprocessError):
-        pass
-    return next((c for c in candidates if (c / ".git").exists()), None)
-
-
 def _web_file(path):
-    repo = _web_repo()
-    if repo is None:
-        pytest.skip("⛔⛔ THE WEB REPO (dg-research) IS NOT ON THIS DISK — the machine/web upload "
-                    "contract was NOT compared")
+    # ⭐ conftest's ONE finder, which this file's own used to be the model for:
+    # `SR_WEB_REPO`, else the sibling, else the git common dir's sibling. Its
+    # own did not honour `SR_WEB_REPO` at all.
+    repo = require_web_repo("the machine/web upload contract")
     got = subprocess.run(["git", "-C", str(repo), "show", f"{WEB_CONTRACT_REV}:{path}"],
                          capture_output=True, text=True, encoding="utf-8", timeout=30)
     assert got.returncode == 0, f"{repo} has no {WEB_CONTRACT_REV}:{path}: {got.stderr.strip()}"

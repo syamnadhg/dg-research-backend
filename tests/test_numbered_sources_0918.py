@@ -40,7 +40,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import research  # noqa: E402
-from conftest import code_only  # noqa: E402
+from conftest import code_only, web_file  # noqa: E402
 
 
 #: The web's own token regex, ported character for character from
@@ -117,11 +117,8 @@ class TestTheGrammarIsNotTheWebsToken:
         It reads the sibling checkout when there is one. SKIPPED is the honest
         answer where there is not — a shipped wheel has no web repo beside it —
         and the skip names what went unmeasured rather than passing quietly."""
-        ts = (Path(__file__).resolve().parents[2]
-              / "dg-research" / "src" / "lib" / "doc-sources.ts")
-        if not ts.exists():
-            pytest.skip("no dg-research checkout beside this repo: the web's "
-                        "SOURCE_TOKEN_RE was NOT compared against the port")
+        ts = web_file("the web's SOURCE_TOKEN_RE, against this port",
+                      "src/lib/doc-sources.ts")
         m = re.search(r"export const SOURCE_TOKEN_RE = /(?P<body>.+?)/[gimsuy]*;",
                       ts.read_text(encoding="utf-8"))
         assert m, "SOURCE_TOKEN_RE is no longer declared the way this reads it"

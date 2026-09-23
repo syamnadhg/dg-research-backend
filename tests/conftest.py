@@ -11,10 +11,12 @@ import ast
 import inspect
 import io
 import os
+import subprocess
 import sys
 import textwrap
 import tokenize
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 
@@ -29,6 +31,103 @@ os.environ["DG_ALERT_AI_COPY"] = "0"
 # it on pass the value into `_color_decision` directly or set it on a
 # subprocess env (see tests/test_cli_color_decision.py).
 os.environ.pop("FORCE_COLOR", None)
+
+
+# ══ the web checkout, found ONE way ═══════════════════════════════════════════
+#
+# ⛔⛔ ELEVEN CROSS-REPO PINS, FOUR WAYS OF LOOKING, AND EIGHT OF THEM BLIND IN A
+# WORKTREE. Every file that compared this machine with the web app used to build
+# `parents[2] / "dg-research"` itself. That is the directory holding THIS
+# checkout, and a worktree's holds other worktrees — so eight pins skipped in the
+# one layout every wave is built and gated in (a gate read `13 skipped` and nobody
+# could tell which of them mattered). Three files had grown their own better
+# finders, each slightly different. This is the one they all use now.
+#
+# The order is the whole rule:
+#   1. `SR_WEB_REPO`, when set, is the ONLY answer — and a value that is not a
+#      web checkout FAILS. A path somebody named is a claim; answering it with a
+#      skip is the silence that looks like a switch-on.
+#   2. else the sibling of this checkout (the ordinary layout);
+#   3. else the sibling of the git COMMON dir: a worktree's common dir is the
+#      real checkout's `.git`, whose grandparent holds the sibling repos.
+# Nothing found is the only skip left, and it names every place it looked.
+
+#: A web checkout is a directory with the web's Firestore rules at its root.
+WEB_REPO_MARKER = "firestore.rules"
+
+
+def sibling_web_checkouts(here=None) -> "list":
+    """The LAYOUT candidates — never `SR_WEB_REPO` — most direct first.
+
+    Separate from `web_repo_candidates` because one pin (the release tool's
+    default in `test_bump_version.py`) is about the sibling LAYOUT itself, and
+    an explicit path elsewhere on disk says nothing about that layout."""
+    here = Path(here) if here is not None else Path(__file__).resolve().parents[1]
+    out = [here.parent / "dg-research"]
+    try:
+        common = subprocess.run(
+            ["git", "-C", str(here), "rev-parse", "--path-format=absolute",
+             "--git-common-dir"],
+            capture_output=True, text=True, encoding="utf-8", timeout=10)
+        if common.returncode == 0 and common.stdout.strip():
+            via_common = Path(common.stdout.strip()).parent.parent / "dg-research"
+            if via_common not in out:
+                out.append(via_common)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return out
+
+
+def web_repo_candidates(here=None) -> "list":
+    """Every place the web checkout could be. An explicit `SR_WEB_REPO` is the
+    ONLY candidate: falling back from a typo would put every pin back on a
+    checkout nobody asked about."""
+    env = os.environ.get("SR_WEB_REPO")
+    if env:
+        return [Path(env)]
+    return sibling_web_checkouts(here)
+
+
+def web_repo(here=None):
+    """The web checkout the cross-repo pins read, or None when none is on disk.
+
+    ⛔ Never None for a set `SR_WEB_REPO`: a value that is not a web checkout is
+    an AssertionError, so the gate that thought it had switched these pins on
+    finds out it had not."""
+    env = os.environ.get("SR_WEB_REPO")
+    if env:
+        assert (Path(env) / WEB_REPO_MARKER).is_file(), (
+            f"SR_WEB_REPO={env!r} is not a dg-research checkout — there is no "
+            f"{WEB_REPO_MARKER} there, so every cross-repo pin was aimed at nothing")
+        return Path(env)
+    for base in sibling_web_checkouts(here):
+        if (base / WEB_REPO_MARKER).is_file():
+            return base
+    return None
+
+
+def require_web_repo(what: str):
+    """`web_repo()`, or a LOUD skip naming what went unmeasured and every place
+    that was looked in. The only way a cross-repo pin may skip."""
+    web = web_repo()
+    if web is None:
+        pytest.skip(
+            f"⛔ NO WEB CHECKOUT on this disk (looked in "
+            f"{', '.join(str(p) for p in web_repo_candidates())}) — {what} was "
+            f"NOT compared; set SR_WEB_REPO to a dg-research checkout")
+    return web
+
+
+def web_file(what: str, rel: str):
+    """One file of the web checkout. ⛔ Once a checkout IS found, a missing
+    file FAILS: that is the web having moved the thing this pin compares, and a
+    skip would hide exactly the drift the pin exists for."""
+    web = require_web_repo(what)
+    path = web / rel
+    assert path.is_file(), (
+        f"{rel} is missing from the web checkout at {web} — {what} "
+        f"cannot be compared without it; re-anchor this pin if the web moved it")
+    return path
 
 
 def serving_version(monkeypatch, version: "str | None"):

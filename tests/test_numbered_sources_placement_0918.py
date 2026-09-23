@@ -46,18 +46,17 @@ import re
 import sys
 from pathlib import Path
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import research  # noqa: E402
 
-from conftest import code_only_deep  # noqa: E402
+from conftest import code_only_deep, web_file  # noqa: E402
 
 #: Our marker, as `tests/test_numbered_sources_0918.py` spells it.
 MARKER_RE = re.compile(r"\[\\\[(\d{1,3})\\\]\]\(([^)]*)\)")
 
-#: The sibling web checkout, when there is one beside this repo.
-WEB_LIB = Path(__file__).resolve().parents[2] / "dg-research" / "src" / "lib"
+#: Where the web keeps the three readers below, inside whichever web checkout
+#: conftest's one finder answers with.
+WEB_LIB = Path("src") / "lib"
 
 #: The web's own heading index, ported from `indexSlices` in
 #: `superresearch-doc.ts:228`. Every match becomes a slice the planner may hand
@@ -415,11 +414,9 @@ class TestOurHeadingIsNotAResearchSlice:
 
         SKIPPED is the honest answer with no web checkout beside this repo, and
         the skip names what went unmeasured rather than passing quietly."""
-        if not WEB_LIB.exists():
-            pytest.skip("no dg-research checkout beside this repo: the planner "
-                        "and viewer heading rules were NOT compared")
         for name, pairs in WEB_LITERALS.items():
-            src = (WEB_LIB / name).read_text(encoding="utf-8")
+            src = web_file("the planner and viewer heading rules",
+                           str(WEB_LIB / name)).read_text(encoding="utf-8")
             for decl, ported in pairs:
                 m = re.search(decl, src)
                 assert m, "%s: %s is no longer declared the way this reads it" % (name, decl)

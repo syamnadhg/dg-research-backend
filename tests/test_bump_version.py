@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import sibling_web_checkouts
+
 _TOOL = Path(__file__).resolve().parents[1] / "tools" / "bump_version.py"
 
 
@@ -361,17 +363,27 @@ def test_the_real_checkout_is_found_with_NO_env_override(tmp_path, monkeypatch):
     `script.exists()` check before reaching the argument fix at all.
 
     ⭐ Asserted against the REAL checkout on disk, with the override explicitly
-    cleared. A fixture would have proved only that the probe loop runs."""
+    cleared. A fixture would have proved only that the probe loop runs.
+
+    ⭐ THE LAYOUT COMES FROM conftest's `sibling_web_checkouts` — this
+    checkout's sibling, else its main checkout's — so a worktree probes the
+    real layout instead of skipping, which it did on every wave's gate.
+    `SR_WEB_REPO` is deliberately NOT asked: a web checkout named from
+    elsewhere on disk says nothing about the sibling layout this default is for."""
     monkeypatch.delenv("SR_WEB_ROOT", raising=False)
-    root = Path(bump_mod.__file__).resolve().parents[1]
-    sibling = root.parent / "dg-research"
-    if not sibling.is_dir():
+    looked = sibling_web_checkouts()
+    sibling = next((p for p in looked if p.is_dir()), None)
+    if sibling is None:
         pytest.skip(
-            f"the app checkout is not beside this one ({sibling}), so there is "
-            f"no real layout to probe here — the property is pinned without it "
+            f"⛔ no app checkout beside this one or beside its main checkout "
+            f"({', '.join(str(p) for p in looked)}), so the release tool's "
+            f"default layout was NOT probed — the property is pinned without it "
             f"by test_the_probe_names_the_app_repo_and_prefers_it"
         )
+    root = sibling.parent / "dg-research-backend"
     web = bump_mod._web_root(root)
+    assert web == sibling, (
+        f"the default web root is {web}, not the app checkout beside it ({sibling})")
     assert (web / "scripts" / "sync-agent-skill.mjs").is_file(), (
         f"the default web root does not hold the sync script: {web}. The release "
         f"sync short-circuits here, before the bundle path is ever passed."
