@@ -548,7 +548,26 @@ def test_a_BUMP_never_touches_the_twin(monkeypatch, tmp_path, capsys):
     assert called == [], "the bump synced the twin"
     out = capsys.readouterr().out
     assert "NOT synced by a bump" in out
-    assert "--sync-twin" in out
+    # ⛔ AND IT NAMES THE ONE STEP THAT DOES IT (2026-09-23). It used to print the
+    # hand route - move AGENT_WHEEL_PUBLISHED, then `--sync-twin` - which never
+    # opens the agent-log gate, and it was the only release instruction anyone
+    # read at bump time.
+    assert "python tools/bump_version.py --post-publish 0.1.29" in out
+    assert "--sync-twin" not in out
+    assert "move AGENT_WHEEL_PUBLISHED" not in out
+
+
+def test_sync_twin_REFUSAL_points_at_the_post_publish_step(monkeypatch, tmp_path, capsys):
+    """The refusal is read at exactly the moment somebody is doing the release by
+    hand; it names the step that does all of it, with the version to pass."""
+    root = _make_tree(tmp_path / "be", "0.1.29")
+    _with_twin(root, "0.1.28", published="0.1.28")
+    monkeypatch.setattr(bump_mod, "_REPO_ROOT", root)
+    monkeypatch.setattr(bump_mod, "sync_fe_twin", lambda *a, **k: (True, "synced"))
+    assert bump_mod.main(["--sync-twin"]) == 2
+    err = capsys.readouterr().err
+    assert "--post-publish 0.1.29" in err
+    assert "move AGENT_WHEEL_PUBLISHED" not in err
 
 
 def test_sync_twin_REFUSES_until_the_published_constant_has_moved(monkeypatch, tmp_path, capsys):

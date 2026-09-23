@@ -23,10 +23,11 @@ Hand-editing these is exactly how they drift — and how the same bump got done 
 from two machines. One command instead::
 
     python tools/bump_version.py --agent 0.1.29 --be 0.1.9   # bump both (independent versions)
-    python tools/bump_version.py --agent 0.1.29              # agent only (+ sync the twin)
+    python tools/bump_version.py --agent 0.1.29              # agent only (the twin does NOT move)
     python tools/bump_version.py --be 0.1.9                  # BE only (+ re-seed the guard)
     python tools/bump_version.py --check                     # verify agent lockstep + BE guard
-    python tools/bump_version.py --agent 0.1.29 --no-sync    # skip the FE twin sync
+    python tools/bump_version.py --post-publish 0.1.29       # AFTER the agent is on PyPI:
+                                                             # web gates + hosted twin
 
 WHY ``_SKILL_BUILD`` CANNOT JUST READ THE PACKAGE METADATA
 ----------------------------------------------------------
@@ -387,13 +388,12 @@ def sync_fe_twin(root: Path = _REPO_ROOT) -> tuple[bool, str]:
 # backwards. `sync_fe_twin` has always done the safe half — copy the bundle, write
 # the record, refuse when the versions disagree. Every WRITE that makes a release
 # real stayed manual: moving `AGENT_WHEEL_PUBLISHED`, flipping
-# `AGENT_LOG_STEP_PUBLISHED`, and the two tests that pin them.
+# `AGENT_LOG_STEP_PUBLISHED`, and the tests that pinned them.
 #
-# ⛔ AND ONE OF THOSE HAND-EDITS FAILS SILENTLY. `hostedSkillTwin.test.ts` wraps
-# assertions in `if (AGENT_WHEEL_PUBLISHED === "<old>")`. The moment the constant
-# moves, that block stops asserting and the suite stays green — a guard retiring
-# itself at the one moment it is needed. Forgetting the twin sync is loud;
-# forgetting this is invisible. That asymmetry is the reason this command exists.
+# ⛔ AND THE TESTS WERE THE HALF THAT WENT WRONG. Scripting their rewrite was the
+# first answer, and a rehearsal on 2026-09-23 showed it left the web suite red on
+# the day (see `post_publish`). The second answer is that a release edits no
+# test: each one reads the published version and holds on both sides of it.
 #
 # ⭐ AND "PUBLISHED" IS VERIFIED, NOT ASSERTED. Everything downstream keys off
 # `AGENT_WHEEL_PUBLISHED`, a number a human types after believing they published.
@@ -445,21 +445,34 @@ def _flip_gate(path: Path, const: str, new_literal: str) -> tuple[bool, str]:
     return True, f"{const}: {m.group(2).strip()} -> {new_literal}"
 
 
-def _retarget_pin(path: Path, old: str, new: str) -> tuple[bool, str]:
-    """Move a test's expectation. Idempotent; reports when there is nothing to do."""
-    if not path.exists():
-        return True, f"{path.name} absent - skipped"
-    text, _nl = _read(path)
-    if old not in text:
-        return (True, f"{path.name}: already retargeted") if new in text else \
-               (False, f"{path.name}: neither the old nor the new form is present - "
-                       f"look at it by hand")
-    _write(path, text.replace(old, new))
-    return True, f"{path.name}: {old!r} -> {new!r}"
+#: Every web path `post_publish` writes, relative to the web checkout: the two
+#: gates, and what the FE sync script writes (the served skill and its record).
+#: ⛔ THE PRINTED COMMIT IS BUILT FROM THIS, and
+#: `tests/test_post_publish_rehearsal.py` fails if the step changes a file that is
+#: not under one of these. The old command was typed by hand and named
+#: `tests/unit`, a folder the step had stopped needing, while the `.mutants/`
+#: anchors it broke were in no command at all.
+POST_PUBLISH_WEB_PATHS = (
+    "src/lib/agent-release-gates.ts",
+    "public/.well-known/skills",
+    "scripts/agent-skill-sync.json",
+)
 
 
 def post_publish(version: str, root: Path = _REPO_ROOT) -> tuple[bool, list[str]]:
-    """Move the web repo to 'this version is published', then sync the twin."""
+    """Move the web repo to 'this version is published', then sync the twin.
+
+    ⛔⛔ IT WRITES NO TEST AND NO HARNESS, AND THAT IS THE FIX (2026-09-23). It
+    used to rewrite three web tests by string replacement, and a rehearsal of the
+    real step on copies of both repos, with PyPI faked, left the web unit suite
+    at 3 failed: the hosted-skill test's version guard was moved without its
+    assertion being inverted, and two mutation-harness anchors on
+    `AGENT_LOG_STEP_PUBLISHED = false;` matched nothing once the flag moved. Those
+    tests now read `AGENT_WHEEL_PUBLISHED` and the anchors name the declaration
+    rather than its value, so they hold on both sides of the publish and there is
+    nothing here to rewrite. `tests/test_post_publish_rehearsal.py` runs this step
+    against copies of both repos and then the web tests and anchors it touches.
+    """
     msgs: list[str] = []
     if not valid_version(version):
         return False, [f"not a valid version string: {version!r}"]
@@ -482,26 +495,11 @@ def post_publish(version: str, root: Path = _REPO_ROOT) -> tuple[bool, list[str]
     gates = web / "src" / "lib" / "agent-release-gates.ts"
     if not gates.exists():
         return False, [*msgs, f"no web checkout beside this repo (looked for {gates})"]
-    was = _published_version(root)
 
     steps = [
         _flip_gate(gates, "AGENT_WHEEL_PUBLISHED", f'"{version}"'),
         _flip_gate(gates, "AGENT_LOG_STEP_PUBLISHED", "true"),
     ]
-    # The two tests that pin AGENT_LOG_STEP_PUBLISHED false.
-    for rel in ("tests/unit/documentImagesContract.test.ts",
-                "tests/unit/sendLogsAgentLogLine.test.ts"):
-        steps.append(_retarget_pin(
-            web / rel,
-            "expect(AGENT_LOG_STEP_PUBLISHED).toBe(false)",
-            "expect(AGENT_LOG_STEP_PUBLISHED).toBe(true)"))
-    # ⛔ The one that silently stops asserting. Its guard names the OLD version.
-    if was:
-        steps.append(_retarget_pin(
-            web / "tests/unit/hostedSkillTwin.test.ts",
-            f'if (AGENT_WHEEL_PUBLISHED === "{was}")',
-            f'if (AGENT_WHEEL_PUBLISHED === "{version}")'))
-
     for ok_i, msg in steps:
         msgs.append(("  OK    " if ok_i else "  FAIL  ") + msg)
     if not all(ok for ok, _ in steps):
@@ -512,15 +510,20 @@ def post_publish(version: str, root: Path = _REPO_ROOT) -> tuple[bool, list[str]
     if not ok_sync:
         return False, msgs
 
+    # ⭐ The real path, quoted, so the lines can be pasted as they are - on the
+    # Windows box too, where the checkout path can hold a space.
+    where = f'git -C "{web}"'
     msgs += [
         "",
-        "Commit the WEB repo (one commit - the gates, the two pins, the twin and its record):",
-        "  git -C <web> add src/lib/agent-release-gates.ts tests/unit public/.well-known/skills "
-        "scripts/agent-skill-sync.json",
-        f'  git -C <web> commit -m "release: agent {version} is published"',
+        f"Run the web unit suite in {web}:",
+        "  npx vitest run tests/unit",
+        "Then commit the WEB repo (one commit - both gates, the served skill and its",
+        "sync record):",
+        f"  {where} add {' '.join(POST_PUBLISH_WEB_PATHS)}",
+        f'  {where} commit -m "release: agent {version} is published"',
         "",
-        "⚠ The twin is SERVED, so it only reaches anyone on the next FE deploy.",
-        "⚠ Run the web suite before pushing: the two pins above now expect true.",
+        "Then push the web repo. The twin is SERVED, so it reaches people only on",
+        "that deploy.",
     ]
     return True, msgs
 
@@ -531,7 +534,8 @@ def main(argv: list[str] | None = None) -> int:
         description="Bump the agent version (pyproject + _SKILL_BUILD + __init__ + FE twin) "
                     "and/or the BE version (pyproject + release-dep guard snapshot).")
     ap.add_argument("--agent", metavar="VERSION",
-                    help="new AGENT version, e.g. 0.1.29 (bumps all 3 sites + syncs the FE twin)")
+                    help="new AGENT version, e.g. 0.1.29 (bumps all 3 sites; the FE twin "
+                         "moves only at --post-publish)")
     ap.add_argument("--be", metavar="VERSION",
                     help="new BE (superresearch) version, e.g. 0.1.9 (+ re-seeds released_deps.json)")
     ap.add_argument("--check", action="store_true",
@@ -539,12 +543,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-sync", action="store_true",
                     help="(retained, now a no-op: a bump never syncs the twin)")
     ap.add_argument("--sync-twin", action="store_true",
-                    help="refresh the hosted twin from this tree — run ONLY after "
-                         "the wheel is published and AGENT_WHEEL_PUBLISHED has moved")
+                    help="re-sync the hosted twin alone, once AGENT_WHEEL_PUBLISHED "
+                         "already names this version (--post-publish does this as "
+                         "part of the release)")
     ap.add_argument("--post-publish", metavar="VERSION",
                     help="after the agent wheel is REALLY on PyPI: verify it there, "
                          "move AGENT_WHEEL_PUBLISHED, flip AGENT_LOG_STEP_PUBLISHED, "
-                         "retarget the tests that pin both, and sync the twin")
+                         "and sync the twin")
     args = ap.parse_args(argv)
 
     # Windows consoles default to cp1252, which cannot encode check/warn glyphs
@@ -592,8 +597,9 @@ def main(argv: list[str] | None = None) -> int:
         if published != building:
             print(f"REFUSED: this repo is building {building} and the web repo says "
                   f"{published} is published.\n"
-                  f"  Publish {building} first, then move AGENT_WHEEL_PUBLISHED to "
-                  f"it, then re-run.", file=sys.stderr)
+                  f"  Publish {building} first, then run "
+                  f"`python tools/bump_version.py --post-publish {building}` - it "
+                  f"moves the web repo and syncs the twin in one step.", file=sys.stderr)
             return 2
         ok, msg = sync_fe_twin()
         print(("OK:   " if ok else "ERROR: ") + msg)
@@ -632,16 +638,21 @@ def main(argv: list[str] | None = None) -> int:
         # and the accident stopped protecting us; fixing one without the other would
         # have shipped unpublished code to the Hub at the next bump.
         #
-        # ⭐ THE ORDER AT A RELEASE, and `--sync-twin` is the step that belongs
+        # ⭐ THE ORDER AT A RELEASE, and `--post-publish` is the step that belongs
         # after the publish, never before it:
         #     1. bump here          2. build + publish the wheel to PyPI
-        #     3. move AGENT_WHEEL_PUBLISHED in the web repo
-        #     4. tools/bump_version.py --sync-twin      5. deploy the web app
-        print("NOTE: the hosted twin is NOT synced by a bump — it tracks the "
+        #     3. tools/bump_version.py --post-publish VERSION  (checks PyPI, moves
+        #        both web gates, syncs the twin)
+        #     4. run the web suite, commit, deploy the web app
+        # ⛔ This used to print the hand route - move AGENT_WHEEL_PUBLISHED, then
+        # `--sync-twin` - which skips the agent-log gate entirely and was the only
+        # instruction anyone saw at bump time (found 2026-09-23).
+        print("NOTE: the hosted twin is NOT synced by a bump - it tracks the "
               "PUBLISHED wheel.")
-        print("      After publishing, move AGENT_WHEEL_PUBLISHED in the web repo, "
-              "then run:")
-        print("          python tools/bump_version.py --sync-twin")
+        print(f"      Once {args.agent} is on PyPI, run:")
+        print(f"          python tools/bump_version.py --post-publish {args.agent}")
+        print("      It checks PyPI first, then moves the web repo's published "
+              "version and agent-log gate, syncs the twin, and prints the web commit.")
         ok, msgs = check_lockstep()
         print("\n".join(msgs))
         rc = rc or (0 if ok else 1)
@@ -661,7 +672,7 @@ def main(argv: list[str] | None = None) -> int:
     if rc == 0:
         bits = []
         if args.agent:
-            bits.append("agent/ (+ web twin) — rebuild `cd agent && python -m build --wheel`")
+            bits.append("agent/ — rebuild `cd agent && python -m build --wheel`")
         if args.be:
             bits.append("pyproject.toml + tests/released_deps.json — rebuild the compiled wheels "
                         "(`python tools/build_compiled.py`, + WSL for linux)")
