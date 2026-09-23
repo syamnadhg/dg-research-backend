@@ -241,7 +241,9 @@ def test_the_owner_resumes_a_sharers_run_from_the_sharers_own_document(
     lis = Listener(monkeypatch, tmp_path, owner=OWNER, research_docs={
         (SHARER, SHARER_RID): {"backendRunId": SHARER_RUN}}).feed(
         action="resume", uid=SHARER, submittedBy=OWNER, researchId=SHARER_RID)
-    assert lis.db.reads == [(SHARER, SHARER_RID)], (
+    # ⭐ EVERY read, not one: since wave 10.10 the pickup rule reads the record
+    # before the run id is resolved, and both must be of the sharer's tree.
+    assert lis.db.reads and set(lis.db.reads) == {(SHARER, SHARER_RID)}, (
         "the resume read the research document out of the wrong person's tree")
     assert [(j["uid"], j["run_id"]) for j in lis.enqueued] == [(SHARER, SHARER_RUN)]
 
@@ -267,7 +269,9 @@ def test_the_owner_resumes_a_sharers_run_this_process_is_holding(
     a directory written before `owner.json` carried a uid. The job in hand names
     its owner, and the gate must be asked about the TREE the doc names."""
     _sharers_run(tmp_path, monkeypatch, record={"researchId": SHARER_RID})
+    # The sharer's record exists — a Resume whose research is gone stands down.
     lis = Listener(monkeypatch, tmp_path, owner=OWNER,
+                   research_docs={(SHARER, SHARER_RID): {"status": "paused_backend_restart"}},
                    current_job=dict(_SHARERS_JOB)).feed(
         action="resume", uid=SHARER, submittedBy=OWNER, researchId=SHARER_RID,
         backendRunId=SHARER_RUN)

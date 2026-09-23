@@ -16809,16 +16809,19 @@ def _pickup_withdrawn(uid, research_id, where: str) -> "tuple[str | None, dict |
     try:
         snap = (_firebase_db.collection("users").document(uid)
                 .collection("researches").document(rid).get())
+        # Inside the try: a snapshot that cannot say whether it exists is an
+        # unreadable record, not a missing one.
+        exists = bool(snap.exists)
+        record = (snap.to_dict() or {}) if exists else None
     except Exception as err:
         with _machine_log_scope():
             log(f"[pickup:{where}] {rid[:8]}… record unreadable "
                 f"({type(err).__name__}) — taking the job: a read that fails is "
                 f"not a deletion", "WARN")
         return None, None
-    if not snap.exists:
+    if not exists:
         _log_pickup_stand_down(where, rid, "deleted")
         return "deleted", None
-    record = snap.to_dict() or {}
     if record.get("status") == _PICKUP_WITHDRAWN_STATUS:
         _log_pickup_stand_down(where, rid, "archived")
         return "archived", record

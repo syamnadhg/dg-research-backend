@@ -202,8 +202,13 @@ def test_a_failed_read_is_raised_for_the_caller_to_keep_silent(alices_run, monke
 def test_a_resume_naming_another_persons_run_touches_nothing_of_theirs(
         alices_run, tmp_path, monkeypatch):
     """⛔⛔⛔ THE CONSUMER. Bob's queue doc, signed honestly as Bob, names Alice's
-    research and Alice's run. Nothing of Alice's may move."""
-    lis = Listener(monkeypatch, tmp_path, owner=OWNER).feed(
+    research and Alice's run. Nothing of Alice's may move.
+
+    ⛔ BOB'S RECORD EXISTS (wave 10.10). Without it the pickup rule stands the
+    Resume down as a deleted research before the ownership question is asked,
+    and this test would pass with that question switched off."""
+    lis = Listener(monkeypatch, tmp_path, owner=OWNER,
+                   research_docs={(BOB, RID): {"status": "paused_backend_restart"}}).feed(
         **_queue_doc(BOB, backendRunId=RUN, config={"podcast": False}))
     assert lis.enqueued == [], "Alice's run was enqueued under Bob"
     _untouched(alices_run)
@@ -264,8 +269,13 @@ def test_a_resume_for_a_research_that_does_not_exist_writes_nothing(tmp_path, mo
 
 def test_the_person_whose_run_it_is_still_resumes_it(alices_run, tmp_path, monkeypatch):
     """⭐ ACCEPT POLARITY — the whole product. Without this, a guard that
-    refused every resume would pass every refusal above."""
-    lis = Listener(monkeypatch, tmp_path, owner=OWNER).feed(
+    refused every resume would pass every refusal above.
+
+    ⭐ HER RECORD EXISTS, as it always does when a Resume is sent: the web reads
+    it to route the request. A Resume for a research with no record is one whose
+    research was deleted, and it stands down (wave 10.10)."""
+    lis = Listener(monkeypatch, tmp_path, owner=OWNER,
+                   research_docs={(ALICE, RID): {"status": "paused_backend_restart"}}).feed(
         **_queue_doc(ALICE, backendRunId=RUN))
     assert len(lis.enqueued) == 1, "Alice could not resume her own run"
     job = lis.enqueued[0]
@@ -289,7 +299,8 @@ def test_the_person_whose_run_it_is_still_resumes_it_from_the_disk_alone(
 def test_the_device_owner_still_resumes_a_sharers_run(alices_run, tmp_path, monkeypatch):
     """⭐⭐ THE OWNER-CONTROL PATH writes `uid=<sharer>`, `submittedBy=<owner>`
     on purpose. The sharer's own owner.json names the sharer, so it matches."""
-    lis = Listener(monkeypatch, tmp_path, owner=OWNER).feed(
+    lis = Listener(monkeypatch, tmp_path, owner=OWNER,
+                   research_docs={(ALICE, RID): {"status": "paused_backend_restart"}}).feed(
         **_queue_doc(ALICE, submittedBy=OWNER, backendRunId=RUN))
     assert [(j["uid"], j["run_id"]) for j in lis.enqueued] == [(ALICE, RUN)]
 
@@ -303,8 +314,12 @@ def _legacy_held(tmp_path):
 
 def test_a_run_held_here_for_another_person_is_not_theirs_to_resume(tmp_path, monkeypatch):
     """⛔⛔ THE LOCAL GATE ON THE RESUME SIDE. The directory cannot say whose it
-    is, but the job in hand always names its owner."""
+    is, but the job in hand always names its owner.
+
+    ⛔ BOB'S RECORD EXISTS (wave 10.10), or the pickup rule would refuse this as
+    a deleted research and the gate could be switched off unnoticed."""
     lis = Listener(monkeypatch, tmp_path, owner=OWNER,
+                   research_docs={(BOB, RID): {"status": "paused_backend_restart"}},
                    current_job=_legacy_held(tmp_path)).feed(
         **_queue_doc(BOB, backendRunId="Legacy_run"))
     assert lis.enqueued == [], "a run held for Alice was resumed under Bob"
@@ -314,6 +329,7 @@ def test_a_run_held_here_for_another_person_is_not_theirs_to_resume(tmp_path, mo
 
 def test_a_run_held_here_is_still_resumable_by_its_owner(tmp_path, monkeypatch):
     lis = Listener(monkeypatch, tmp_path, owner=OWNER,
+                   research_docs={(ALICE, RID): {"status": "paused_backend_restart"}},
                    current_job=_legacy_held(tmp_path)).feed(
         **_queue_doc(ALICE, backendRunId="Legacy_run"))
     assert [j["run_id"] for j in lis.enqueued] == ["Legacy_run"]
