@@ -28194,7 +28194,8 @@ def emit_decision(*, phase, title=None, details="", actions=None, recoverability
 # async LLM rewrite that re-emits the SAME alert_id + decision_id in place. The
 # deterministic template (already emitted) is the GUARANTEED fallback — any
 # failure, timeout, rejected draft, resolved card, or disabled flag keeps it.
-# Actions and the recoverability class are NEVER AI — only the two copy strings.
+# Actions and the recoverability class are NEVER AI, and neither is the TITLE
+# (the web's headline rules read it — see `_upgrade_alert_copy`): only the body.
 #
 # ⭐ ON BY DEFAULT since 2026-09-23 (the owner's call: clearer wording for
 # everyone). Until then this comment said production switched it on "via the
@@ -28378,7 +28379,9 @@ def _draft_alert_copy(intent, base_title, base_details, facts, actions):
             "You rewrite ONE status/alert card shown to a person watching an "
             "automated multi-agent research pipeline. Given the CURRENT card "
             "copy plus raw context, return a SHARPER, calmer, more specific "
-            "version with the SAME meaning and the SAME facts.\n\n"
+            "version with the SAME meaning and the SAME facts.\n"
+            "The TITLE is always shown exactly as it is: copy it into \"title\" "
+            "unchanged and rewrite only \"details\".\n\n"
             "OUTPUT: a single minified JSON object and nothing else — "
             '{"title": "...", "details": "..."}\n\n'
             "HARD RULES (your text ships verbatim to the user, zero editing):\n"
@@ -28480,7 +28483,17 @@ async def _upgrade_alert_copy(*, decision_id, alert_id, intent, phase, agent,
                                         "(no AI key, the call failed, or the draft "
                                         "was refused)")
         return  # brain down / draft rejected → the template stays
-    new_title, new_details = drafted
+    # ⛔⛔ THE TITLE IS NEVER REWRITTEN — only the body. The web picks a card's
+    # headline FROM its title: quiet-infra words ("overloaded", "rate limit", …)
+    # turn it into a "retrying automatically, no action needed" banner
+    # (`isQuietInfraCard`), and `humanizeError` passes only the
+    # "<Agent> stopped: <evidence>" shape through verbatim, replacing anything
+    # else with "Hit a snag … retrying". The plain titles are written to survive
+    # both (`_alert_title_safe`); a rephrased title was held to neither, so a
+    # parked agent read as auto-retrying and the evidence headline was swapped
+    # for a false "retrying". The web shows the body verbatim, so it is the one
+    # string a clearer wording can safely change.
+    _drafted_title_unused, new_details = drafted
     # ── atomic on the loop from here: no await until emit_decision returns ──
     if decision_id not in _active_decisions:
         _alert_copy_note(intent, agent, "kept the plain wording — the card was "
@@ -28506,7 +28519,7 @@ async def _upgrade_alert_copy(*, decision_id, alert_id, intent, phase, agent,
     try:
         emit_decision(
             phase=phase, agent=agent, intent=intent,
-            facts={"title": new_title, "details": new_details},
+            facts={"title": base_title, "details": new_details},
             alert_id=alert_id, decision_id=decision_id,
             auto_skip_deadline=live_deadline, arm_registry=arm_registry,
             suppress_generic_mirror=(not owns_mirror),

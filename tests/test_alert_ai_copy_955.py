@@ -3,8 +3,9 @@
 The vague cards (agent_failed / agent_stuck / agent_link_failed) get a cheap
 async LLM rewrite that re-emits the SAME alert_id + decision_id IN PLACE. The
 deterministic template already emitted is the guaranteed fallback — any failure,
-timeout, rejected draft, resolved card, or the OFF flag keeps it. Actions and
-the recoverability class are NEVER AI; only the two copy strings change.
+timeout, rejected draft, resolved card, or the OFF flag keeps it. Actions, the
+recoverability class and the TITLE are NEVER AI; only the body changes (the
+web's headline rules read the title — see the last section).
 
 Invariants pinned here:
   • DG_ALERT_AI_COPY defaults ON (the owner's call, 2026-09-23); 0 / false /
@@ -34,7 +35,9 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 import os
+import re
 import sys
 import threading
 import time
@@ -405,7 +408,8 @@ def test_upgrade_lands_when_card_live(monkeypatch):
 
     assert len(calls) == 1
     kw = calls[0]
-    assert kw["facts"] == {"title": "New Title", "details": "New details."}
+    # The drafted title is dropped: the web's headline rules read the plain one.
+    assert kw["facts"] == {"title": "old", "details": "New details."}
     assert kw["alert_id"] == "aid"
     assert kw["decision_id"] == "decX"
     assert kw["auto_skip_deadline"] == 12345          # re-derived from LIVE registry
@@ -519,14 +523,16 @@ def test_end_to_end_upgrade_lands_and_does_not_respawn(monkeypatch):
                                facts={"title": "template T", "details": "template D"},
                                alert_id="aid")
         for _ in range(100):
-            if any(k.get("error") == "Sharp T" for (_a, k) in events):
+            if any(k.get("details") == "Sharp D." for (_a, k) in events):
                 break
             await asyncio.sleep(0.01)
 
     asyncio.run(_go())
-    errors = [k.get("error") for (_a, k) in events if _a and _a[0] == "pipeline_error"]
-    assert "template T" in errors                        # template emitted first
-    assert "Sharp T" in errors                            # sharpened re-emit landed
+    cards = [k for (_a, k) in events if _a and _a[0] == "pipeline_error"]
+    assert [(c["error"], c["details"]) for c in cards] == [
+        ("template T", "template D"),                     # template emitted first
+        ("template T", "Sharp D."),                       # re-emit: new body, same title
+    ]
     assert draft_calls == [1], "the re-emit must NOT respawn another upgrade"
     # The line an end-to-end run greps for — and it never carries the copy.
     assert [ln for ln in lines if ln.startswith("[alert-copy]")] == [
@@ -762,18 +768,81 @@ def test_a_parked_cards_countdown_survives_its_rewrite(monkeypatch):
                             phase=2, raw_err="a banner", auto_skip_deadline=deadline,
                             arm_registry=False)
         for _ in range(200):
-            if "Sharp T" in _pipeline_errors(events):
+            if any(k.get("details") == "Sharp D." for (_a, k) in events):
                 break
             await asyncio.sleep(0.01)
 
     asyncio.run(_go())
     cards = [k for (_a, k) in events if _a and _a[0] == "pipeline_error"]
-    assert [c["error"] for c in cards] == ["Gemini reported an error", "Sharp T"]
+    assert [(c["error"], c["details"]) for c in cards] == [
+        ("Gemini reported an error", "Retry or Skip."),
+        ("Gemini reported an error", "Sharp D.")]
     assert cards[0]["auto_skip_deadline"] == deadline
     assert cards[1].get("auto_skip_deadline") == deadline, (
         "the rewrite erased the card's countdown")
     assert research._pending_decisions == {}, (
         "the park is this card's firer; the rewrite must not arm the registry")
+
+
+# ── the title is never rewritten: the web's headline rules read it ───────────
+#
+# The web decides a card's headline from its TITLE alone. Quiet-infra words turn
+# it into "Hiccup — retrying automatically … no action needed" (isQuietInfraCard),
+# and only the "<Agent> stopped: <evidence>" shape passes humanizeError verbatim;
+# anything else becomes "Hit a snag … retrying". The plain titles are built to
+# survive both. Each test runs the REAL path — fail_agent → emit_decision →
+# spawn → upgrade → the real drafter and validator — with only the narrator's
+# HTTP call replaced, and proves the rewrite LANDED (the body changed) before
+# reading the title, so a rewrite that never ran cannot pass.
+
+def _rewrite_through_the_real_path(monkeypatch, *, agent, title, drafted):
+    monkeypatch.delenv("DG_ALERT_AI_COPY", raising=False)
+    events = _capture_emit_event(monkeypatch)
+    monkeypatch.setattr(research, "resolve_gemini_api_key", lambda: "k")
+    monkeypatch.setattr(research, "_call_text_narrator",
+                        lambda *a, **k: (json.dumps(drafted), 200))
+
+    async def _go():
+        research.fail_agent(agent, title, "Retry or Skip.", phase=2,
+                            raw_err="text the page showed")
+        for _ in range(300):
+            if any(k.get("details") == drafted["details"] for (_a, k) in events):
+                break
+            await asyncio.sleep(0.01)
+
+    asyncio.run(_go())
+    cards = [k for (_a, k) in events if _a and _a[0] == "pipeline_error"]
+    assert len(cards) == 2 and cards[1]["details"] == drafted["details"], (
+        f"the rewrite never landed — this measured nothing: {cards}")
+    return cards
+
+
+def test_a_rewrite_never_puts_quiet_infra_words_in_the_title(monkeypatch):
+    drafted = {"title": "Claude is overloaded right now",
+               "details": "Claude's servers said they were overloaded, so it "
+                          "produced nothing more. Retry to run it fresh, or Skip it."}
+    # The draft is one the web WOULD swallow, and the validator accepts it —
+    # so only the rewrite's own rule can keep it off the card.
+    assert research._web_swallows_title(drafted["title"])
+    assert research._parse_and_validate_alert_copy(
+        json.dumps(drafted), ["Retry", "Skip"]) is not None
+    cards = _rewrite_through_the_real_path(
+        monkeypatch, agent="claude", title="Claude reported an error", drafted=drafted)
+    assert cards[1]["error"] == "Claude reported an error"
+    assert not research._web_swallows_title(cards[1]["error"]), (
+        "the web would show a parked agent as 'retrying automatically, no action needed'")
+
+
+def test_a_rewrite_keeps_the_stopped_evidence_headline(monkeypatch):
+    headline = "Claude stopped: A red banner reads: something went wrong"
+    drafted = {"title": "Claude's research page showed an error",
+               "details": "Claude's page showed a red banner saying something "
+                          "went wrong. Retry to run it fresh, or Skip it."}
+    cards = _rewrite_through_the_real_path(
+        monkeypatch, agent="claude", title=headline, drafted=drafted)
+    assert cards[1]["error"] == headline
+    # The one shape the web passes through verbatim (pipeline-errors.ts).
+    assert re.search(r"\bstopped:\s*\S", cards[1]["error"])
 
 
 # ── resurrect-gap regression (no-deadline card retired on resolve) ───────────
