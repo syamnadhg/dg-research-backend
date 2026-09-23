@@ -74526,12 +74526,42 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     }), encoding="utf-8")
             except Exception as _nar_err:
                 log(f"[no-auto-retry] marker write failed (non-fatal): {_nar_err}", "WARN")
+            # ⛔⛔ WHEN IT WAS CHROME, THE CARD SAYS CHROME (wave 10.10). This
+            # card said "The run kept hitting errors" for every kind, although
+            # the kind is known right here — captured above, spent on its own
+            # relaunch budget, written into the marker one line up. So somebody
+            # whose research Chrome closed three times in a row read "errors"
+            # and got a Retry into the same Chrome.
+            #
+            # ⭐ `browser_crash_copy` IS NOT REUSED, deliberately: it describes
+            # one page dying under a run that CARRIED ON ("the run continued
+            # without it") and never names a cause. Here the run stopped, and
+            # the advice about the person's side is the point.
+            #
+            # ⛔ "Kept closing" only when it did. The planner can also refuse
+            # a FIRST Chrome death (a run past the phases it can re-enter),
+            # and "1 times in a row" is the sentence this exists to remove.
+            if _captured_failure_kind == "browser_crash":
+                _closes = _crash_retries + 1
+                _card_error = ("Chrome kept closing" if _closes > 1
+                               else "Chrome closed unexpectedly")
+                _card_reason = (
+                    (f"Chrome closed {_closes} times in a row on the research "
+                     f"computer, so we stopped reopening it. " if _closes > 1
+                     else "Chrome closed on the research computer while the run "
+                          "was using it. ")
+                    + "Quit other Chrome windows there, update Chrome, or "
+                      "restart that computer, then Retry to start again from "
+                      "the last checkpoint — or Skip to stop here.")
+            else:
+                _card_error = "The run kept hitting errors"
+                _card_reason = ("We tried to recover a couple of times and it didn't "
+                                "take. Retry to start again from the last checkpoint, "
+                                "or Skip to stop here.")
             fail_phase(
                 phase=last_phase,
-                error="The run kept hitting errors",
-                reason="We tried to recover a couple of times and it didn't "
-                       "take. Retry to start again from the last checkpoint, "
-                       "or Skip to stop here.",
+                error=_card_error,
+                reason=_card_reason,
                 agent=None,
                 intent="crash_loop",
                 # #62: distinct alert_id so a dismissed phase-timeout card
