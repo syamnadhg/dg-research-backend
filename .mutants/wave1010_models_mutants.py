@@ -175,6 +175,16 @@ MUTANTS = [
     ("G6", "under", "Gemini compares ranks with a bare `>` (arrays as strings)",
      [("        if (bestEl === null || rank[0] > bestRank[0] || (rank[0] === bestRank[0] && d > 0)",
        "        if (bestEl === null || rank[0] > bestRank[0] || (rank[0] === bestRank[0] && rank[1] > bestRank[1])")]),
+    # (repair 1: the source pins that covered G7/G8/P7/P8 were deleted this wave
+    # and nothing executed replaced them — both survived every model suite.)
+    ("G7", "under", "⛔ Gemini's step-back takes a VERSION-LESS row ('Flash Newest', "
+     "maybe the model that just failed, renamed) and spends the one retry on it",
+     [("\n                if (k === null || cmpVer(k, bound) >= 0) continue;",
+       "\n                if (k !== null && cmpVer(k, bound) >= 0) continue;")]),
+    ("G8", "under", "Gemini's retired pin bounds the step-back instead of the "
+     "failed version: 3.1 is picked over 3.9, a deeper downgrade than needed",
+     [("\n                const bound = belowK !== null ? belowK : pinK;",
+       "\n                const bound = pinK !== null ? pinK : belowK;")]),
 
     # ── Claude: the picker ─────────────────────────────────────────────────
     ("P1", "under", "⛔ the Claude picker parses with parseFloat again (5.10 under 5.5)",
@@ -197,6 +207,14 @@ MUTANTS = [
     ("P6", "under", "the Claude picker compares ranks with a bare `>`",
      [("                if (best === null || rank[0] > bestRank[0] || (rank[0] === bestRank[0] && d > 0)",
        "                if (best === null || rank[0] > bestRank[0] || (rank[0] === bestRank[0] && rank[1] > bestRank[1])")]),
+    ("P7", "under", "⛔ the Claude step-back takes a VERSION-LESS row ('Opus Newest') "
+     "and spends the one retry on it",
+     [("                        if (k === null || cmpVer(k, bound) >= 0) continue;",
+       "                        if (k !== null && cmpVer(k, bound) >= 0) continue;")]),
+    ("P8", "under", "the Claude retired pin bounds the step-back instead of the "
+     "failed version",
+     [("                        const bound = belowK !== null ? belowK : pinK;",
+       "                        const bound = pinK !== null ? pinK : belowK;")]),
 
     # ── Claude: the trigger read and the offered-probe ─────────────────────
     ("T1", "under", "⛔ the trigger reads 'Opus 5.10 Max' as 5.1 again",

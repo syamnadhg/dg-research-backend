@@ -221,6 +221,51 @@ def test_a_retired_pin_still_falls_back_to_the_best_strictly_older_row():
     assert out["clicks"][-1].startswith("Opus 4.8")
 
 
+@needs_node
+def test_a_retired_gemini_pin_falls_back_to_the_step_below_not_below_the_pin():
+    """The Gemini half of the retired-pin rule (wave 10.10 deleted the source pin
+    that covered both pickers; its replacement above is Claude's). The bound is
+    `below` — the version that failed — not the pin: with the pin as the bound
+    the ranker skips 3.9 and takes 3.1, a deeper downgrade than the retry needs."""
+    labels = ["3.10 Flash Current", "3.9 Flash Previous", "3.1 Flash Old"]
+    spec = el("body", {}, "", [el("div", {"role": "menu"}, "", [
+        el("div", {"role": "menuitem"}, t) for t in labels])])
+    out = run_js(spec, _gemini_rank_js(), _gem_args(pin="3.5", below="3.10"))
+    assert out["ret"]["version"] == "3.9", out["ret"]
+    assert out["clicks"] == ["3.9 Flash Previous"], out["clicks"]
+
+
+@needs_node
+@pytest.mark.parametrize("picker", ["claude", "gemini"])
+@pytest.mark.parametrize("pin", [None, "retired"])
+def test_a_row_with_no_version_is_never_a_step_back_target(picker, pin):
+    """⛔ A version-less row cannot be proven OLDER than the model that just
+    failed — "Opus Newest" is as likely a renamed copy of it. On a step-back it
+    must be skipped, so a menu offering only that and the failed row picks
+    NOTHING rather than spending the one retry re-picking the failed model.
+    Both pickers, with and without a (retired) pin riding along."""
+    if picker == "claude":
+        labels, role = ["Opus Newest", "Opus 5.10"], "menuitemradio"
+        js, args = _claude_pick_js(), _claude_args(
+            below="5.10", pin=("5.5" if pin else None))
+    else:
+        labels, role = ["Flash Newest", "3.10 Flash"], "menuitem"
+        js, args = _gemini_rank_js(), _gem_args(
+            below="3.10", pin=("3.5" if pin else None))
+    spec = el("body", {}, "", [el("div", {"role": "menu"}, "", [
+        el("div", {"role": role}, t) for t in labels])])
+    out = run_js(spec, js, args)
+    assert out["clicks"] == [], f"the step-back clicked {out['clicks']}"
+    if picker == "claude":
+        assert out["ret"] is None, out["ret"]
+    else:
+        assert out["ret"]["clicked"] is False and out["ret"]["version"] is None, out["ret"]
+    # …and the same menu with NO step-back does pick (both polarities): the
+    # version-less row is excluded by the step-back rule, not by the parser.
+    free = run_js(spec, js, {**args, "below": None, "pin": None})
+    assert free["clicks"], "precondition: with no step-back the menu has a pick"
+
+
 # ═════════════════════════════════════════════════════════════════════════
 # F21 — both parsers must read both version orders
 # ═════════════════════════════════════════════════════════════════════════
