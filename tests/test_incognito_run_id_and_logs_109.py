@@ -255,6 +255,13 @@ def spool(tmp_path, monkeypatch):
     monkeypatch.setenv("SR_TELEMETRY", "1")
     monkeypatch.setattr(tm, "_install_uuid", lambda: "iuid-test")
     monkeypatch.setattr(tm, "_build", lambda: "0.1.13")
+    # ⛔ THE FLUSH IS NOT THE SUBJECT, AND IT RACES THE READ. Leaving a capture
+    # starts `tm.flush_in_background()`, whose thread renames this very spool to
+    # `.sending.` while it posts — so on a loaded machine the read below found
+    # no file and both lifecycle pins failed with nothing wrong (measured in the
+    # whole-suite gate, 2026-09-23; each passed alone). What these pins read is
+    # what was SPOOLED, so the delivery is stood down.
+    monkeypatch.setattr(tm, "flush_in_background", lambda *a, **k: None)
 
     def _read():
         path = tm.spool_path()
