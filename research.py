@@ -15763,6 +15763,21 @@ def start_firestore_start_listener(job_queue, loop):
                 if _refuse_foreign_run(doc, _jobs_held_locally(job_queue), target_rid,
                                        target_uid, "start-listener", verb="resume"):
                     continue
+                # ⛔⛔ AND THE RECORD IS READ BEFORE ANYTHING ELSE IS BELIEVED
+                # (wave 10.10). A Resume that carries its run id used to be taken
+                # on the disk's word alone — `_resume_run_id` reads the document
+                # only when the payload has no usable id — so a research deleted
+                # while its recovery card offered Resume was resumed and EMAILED.
+                # Deleting sends a queue cancel to catch exactly this, but with
+                # the computer offline the two documents arrive in no fixed
+                # order, and the cancel finds nothing to cancel about half the
+                # time. Nothing is written back: there is no record to write to,
+                # or it is archived and put away.
+                _withdrawn, _ = _pickup_withdrawn(target_uid, target_rid, "resume")
+                if _withdrawn:
+                    try: doc.reference.delete()
+                    except Exception: pass
+                    continue
                 # Track D: synth user can't read users/{ownerUid}/researches.
                 # FE now carries backendRunId in the queue payload, so the
                 # research-doc read is a fallback only (legacy Admin-SDK BEs
@@ -16037,16 +16052,18 @@ def start_firestore_start_listener(job_queue, loop):
             # of API calls on work the user already abandoned. Mark the
             # queue doc staleSkipped so it doesn't replay on future
             # listener attaches.
+            # ⭐ THE ONE PICKUP RULE (wave 10.10) — deleted or archived stands
+            # down and takes the queue doc with it; an unreadable record is
+            # taken, as this branch always did ("allowing through"). The record
+            # it read is handed on, so the checks below do not read it again.
+            _withdrawn, _rd_found = _pickup_withdrawn(uid, research_id, "start")
+            if _withdrawn:
+                try:
+                    doc.reference.delete()
+                except Exception:
+                    pass
+                continue
             try:
-                research_doc = _firebase_db.collection("users").document(uid) \
-                    .collection("researches").document(research_id).get()
-                if not research_doc.exists:
-                    log(f"Queue: skipped — research doc {research_id} no longer exists (user deleted chat?)", "INFO")
-                    try:
-                        doc.reference.delete()
-                    except Exception:
-                        pass
-                    continue
                 # 2026-05-22 (cancel-stale fix): cross-worker cancel race
                 # mitigation. The cancel handler at research.py:4090 flips
                 # research status="stopped" + cancelled=True, but there's
@@ -16057,7 +16074,9 @@ def start_firestore_start_listener(job_queue, loop):
                 # Pre-claim status re-check catches this: if the research
                 # doc is already in a terminal state, skip + delete the
                 # queue doc so it doesn't replay on listener attach.
-                _rd_data = research_doc.to_dict() or {}
+                # None when the read failed: no status, so nothing below
+                # refuses it — the same "allowing through" as ever.
+                _rd_data = _rd_found or {}
                 _rd_status = _rd_data.get("status")
                 # ⛔ ONE TUPLE, NOT TWO. This gate carried its own copy of the
                 # terminal statuses and the module constant's comment promised
@@ -16118,7 +16137,7 @@ def start_firestore_start_listener(job_queue, loop):
                             pass
                         continue
             except Exception as e:
-                log(f"Queue: research-doc existence check failed (allowing through): {e}", "WARN")
+                log(f"Queue: research-doc status checks failed (allowing through): {e}", "WARN")
 
             # ── Multi-worker claim (2026-05-21) ─────────────────────────────
             # With workerCount>1, every worker's listener fires for this same
@@ -16740,6 +16759,72 @@ _exit_scheduled = False
 _active_browser_ref = None  # type: Optional["Browser"]
 
 
+# ── A research the person took back is never picked up ─────────────────────
+#: The one status, beside the record being gone, that withdraws a research from
+#: every pickup. ⛔ NOT the whole terminal set: a Resume is offered for a
+#: watchdog-stopped or discarded run, so "over" cannot mean "withdrawn" here.
+#: "archived" can — the old archive wrote it over a QUEUED run, and that record
+#: must never be started by a machine coming back online.
+_PICKUP_WITHDRAWN_STATUS = "archived"
+
+
+def _log_pickup_stand_down(where: str, research_id, reason: str) -> None:
+    """The line every stand-down writes: the machine's, and never the topic.
+
+    ⭐ THE MACHINE'S, because the job is not running — nothing about it belongs
+    in whatever run happens to be armed, which on a shared computer is somebody
+    else's. The research id says which job; the topic is the person's."""
+    with _machine_log_scope():
+        log(f"[pickup:{where}] {str(research_id or '')[:8]}… was {reason} — "
+            f"standing down, nothing is picked up", "INFO")
+
+
+def _pickup_withdrawn(uid, research_id, where: str) -> "tuple[str | None, dict | None]":
+    """Read the research record before a job is taken: (why it must stand
+    down, the record).
+
+    The reason is "deleted" (the read succeeded and there is no record) or
+    "archived", and None means take the job. The record is the document's data
+    when it could be read and exists, else None — so a caller that needs the
+    status for its own checks does not read it twice.
+
+    ⛔⛔ A READ THAT FAILS TAKES THE JOB — it is never a deletion. Standing
+    down is irreversible and silent: every caller deletes the only copy of the
+    request (the queue document, or the boot snapshot's entry) and tells
+    nobody, while the person watches a tile that says queued. A read fails for
+    reasons that say nothing about the record — a network blip at boot, a token
+    mid-refresh, the fresh-sharer-document race the rules file documents — and
+    all of them happen to runs somebody is waiting for. The opposite mistake is
+    bounded: a job taken on an unreadable record meets a second, independent
+    read at the worker's dequeue, which applies this same rule, so a deleted
+    research runs only if both reads fail.
+
+    ⭐ ONE DEFINITION FOR EVERY PICKUP — start, Resume, the idle rescan, the
+    dequeue, the boot restore, the rehydrate and the dead-worker reconcile. A
+    rule written per path is a rule one path forgets, and a Resume that named
+    its run was that path: it never read the record at all."""
+    rid = str(research_id or "").strip()
+    if not (_firebase_db and uid and rid):
+        return None, None
+    try:
+        snap = (_firebase_db.collection("users").document(uid)
+                .collection("researches").document(rid).get())
+    except Exception as err:
+        with _machine_log_scope():
+            log(f"[pickup:{where}] {rid[:8]}… record unreadable "
+                f"({type(err).__name__}) — taking the job: a read that fails is "
+                f"not a deletion", "WARN")
+        return None, None
+    if not snap.exists:
+        _log_pickup_stand_down(where, rid, "deleted")
+        return "deleted", None
+    record = snap.to_dict() or {}
+    if record.get("status") == _PICKUP_WITHDRAWN_STATUS:
+        _log_pickup_stand_down(where, rid, "archived")
+        return "archived", record
+    return None, record
+
+
 def _safe_enqueue(job_queue, job, source: str,
                   allowed_statuses: "tuple[str, ...]" = ("queued", "ongoing", "paused_backend_restart")) -> bool:
     """Existence-validate + status-whitelist check before put_nowait.
@@ -17069,7 +17154,20 @@ def _restore_pending_queue_snapshot(path, job_queue, already_rids) -> "tuple[int
     restored = 0
     skipped = 0
     refused = []
+    withdrew = False
     for j in disk_jobs:
+        # ⛔⛔ THE PICKUP RULE FIRST, AND ITS ANSWER IS THE ONE THAT SHEDS
+        # (wave 10.10). The funnel below refuses a deleted or archived research
+        # too, but it cannot say WHY — it refuses on a failed read as well, and
+        # a refusal must be kept for the next boot — so nothing ever shed a
+        # deleted research's entry: it was re-offered and refused at every boot
+        # until a worker boundary happened to rewrite the file. Only this
+        # answer removes an entry; an unreadable record is kept.
+        if _pickup_withdrawn((j or {}).get("uid"), (j or {}).get("research_id"),
+                             "disk-restore")[0]:
+            skipped += 1
+            withdrew = True
+            continue
         if _safe_enqueue(job_queue, j, source="disk-restore",
                          allowed_statuses=("queued", "ongoing")):
             restored += 1
@@ -17080,7 +17178,7 @@ def _restore_pending_queue_snapshot(path, job_queue, already_rids) -> "tuple[int
         log(f"[pending_queue] Disk snapshot processed: restored={restored}, skipped={skipped}")
     else:
         log("[pending_queue] Disk snapshot empty — nothing to restore")
-    if held_a_run_that_keeps_nothing:
+    if held_a_run_that_keeps_nothing or withdrew:
         _forget_pending_queue_snapshot(path, job_queue, refused)
     return (restored, skipped)
 
@@ -75304,6 +75402,14 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
                     _orphan_safety_net = True
                 else:
                     _orphan_safety_net = False
+                # ⭐ THE PICKUP RULE, ASKED OF THE RECORD NOW (wave 10.10). The
+                # query said "ongoing" when the scan began; every branch below
+                # writes this record or restarts its run, and a paused mark on a
+                # record archived since then would undo the archive and offer a
+                # Resume for it. Unreadable is taken, as the scan always did.
+                if (await asyncio.to_thread(
+                        _pickup_withdrawn, tree_uid, research_id, "rehydrate"))[0]:
+                    continue
                 # ⛔⛔ AFTER THE HAND-OFF THE RUN IS THE CLOUD'S, AND THIS SCAN
                 # USED TO TAKE IT BACK (wave 10.9, 542-4). The query is
                 # status=="ongoing", and a run in its cloud tail is deliberately
@@ -75584,6 +75690,12 @@ async def _reconcile_dead_worker_runs(tree_uid: str, dead_ids: "set[int]") -> in
         # has the directory that file lives in (see `_recovery_sees_handoff`),
         # so the disk alone said "not handed off" for every one of them.
         if _recovery_sees_handoff(research_id, data):
+            continue
+        # ⭐ THE PICKUP RULE, ASKED OF THE RECORD NOW (wave 10.10) — the query
+        # is a scan old by the time this write lands, and the mark would undo an
+        # archive made since and offer a Resume for it. Unreadable is marked.
+        if (await asyncio.to_thread(
+                _pickup_withdrawn, tree_uid, research_id, "dead-worker-reconcile"))[0]:
             continue
         # ⛔ THE SAME PATCH AS BOOT RECOVERY'S — see `_restart_recovery_patch`.
         # A run whose worker died is recovered the same way whether the whole
@@ -77169,6 +77281,20 @@ async def run_server(port=8000):
                     pass
                 continue
 
+            # ⛔⛔ THE RECORD, BEFORE THE WRITE BELOW (wave 10.10). That write is
+            # `status: "ongoing"`, so a doc whose research was archived while it
+            # waited had its archive UNDONE here and then passed the funnel's
+            # whitelist as an ordinary ongoing run. Deleted or archived stands
+            # down and the claimed doc goes; unreadable is taken — see the rule.
+            _withdrawn, _ = await asyncio.to_thread(
+                _pickup_withdrawn, uid, research_id, "idle-rescan")
+            if _withdrawn:
+                try:
+                    await asyncio.to_thread(snap.reference.delete)
+                except Exception:
+                    pass
+                continue
+
             run_id = _mint_run_id(topic, research_id)
             # ⛔ NO TOPIC — see `_log_job_ref`. This claim is logged to the
             # machine-wide `backend.log`, whose tail travels in the owner's
@@ -77454,6 +77580,12 @@ async def run_server(port=8000):
                 "stopped",
                 "cancelled",
                 "completed",
+                # ⛔⛔ AND ARCHIVED (wave 10.10). Missing from this set, a job
+                # whose research was archived while it waited in this queue —
+                # which the old archive allowed — met "actual_status=archived is
+                # active" below and ran. The pickup rule's own word, so the two
+                # cannot drift apart.
+                _PICKUP_WITHDRAWN_STATUS,
             }
             should_run = True
             # ⚠ 2026-08-06 — "COULD NOT EVALUATE" IS NOT "PROCEED". The flip has
@@ -77469,7 +77601,13 @@ async def run_server(port=8000):
                              .get())
                     _cur = ((_snap.to_dict() or {}).get("status")
                             if _snap.exists else None)
-                    if _cur:
+                    # ⛔ A READ THAT SUCCEEDS AND FINDS NOTHING IS AN ANSWER —
+                    # the record was deleted — and it used to fall into the
+                    # "could not be read" arm below and run. See the stand-down
+                    # after this block.
+                    if not _snap.exists:
+                        flip_outcome = "missing"
+                    elif _cur:
                         flip_outcome = f"skipped({_cur})"
                         log(f"[flip] the transaction was refused; a plain read says "
                             f"status={_cur!r} — deciding from that", "INFO")
@@ -77480,6 +77618,12 @@ async def run_server(port=8000):
                     log(f"[flip] the transaction was refused and the fallback "
                         f"read also failed ({type(_fe).__name__}) — "
                         f"proceeding, as before", "WARN")
+            # ⛔⛔ THE LAST PICKUP EVERY JOB PASSES (wave 10.10). "missing" was
+            # a WARN and a run: a Resume taken before its research was deleted
+            # reached this point, found no record, and ran and emailed anyway.
+            if flip_outcome == "missing":
+                should_run = False
+                _log_pickup_stand_down("dequeue", job.get("research_id"), "deleted")
             if flip_outcome and flip_outcome.startswith("skipped(") and flip_outcome.endswith(")"):
                 actual_status = flip_outcome[len("skipped("):-1]
                 if actual_status in BAIL_STATUSES:
