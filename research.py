@@ -16663,7 +16663,10 @@ def start_firestore_start_listener(job_queue, loop):
                          # PINNED writer. Read at the dequeue, not here — the
                          # job dict is the only thing that survives the hop.
                          "submitted_by": sb},
-                        source="start-listener"):
+                        source="start-listener",
+                        # ⛔⛔ THE QUEUE DOC IS ALREADY DELETED (above), so a
+                        # refusal on a failed read would drop the run for good.
+                        take_unreadable=True):
                     _recompute = _QUEUE_STATE.get("recompute_fn")
                     if _recompute is not None:
                         try:
@@ -16869,7 +16872,8 @@ def _pickup_withdrawn(uid, research_id, where: str) -> "tuple[str | None, dict |
 
 
 def _safe_enqueue(job_queue, job, source: str,
-                  allowed_statuses: "tuple[str, ...]" = ("queued", "ongoing", "paused_backend_restart")) -> bool:
+                  allowed_statuses: "tuple[str, ...]" = ("queued", "ongoing", "paused_backend_restart"),
+                  *, take_unreadable: bool = False) -> bool:
     """Existence-validate + status-whitelist check before put_nowait.
 
     Returns True if the job entered the queue, False if it was skipped.
@@ -16890,6 +16894,31 @@ def _safe_enqueue(job_queue, job, source: str,
     this also closes the multi-worker double-enqueue: worker-2's per-process
     disk-restore can't re-fire a run worker-1 already parked, even though
     worker-2's local `_rehydrated_rids` set never saw it.
+
+    ⛔⛔ WHAT A READ THAT FAILS DOES IS THE CALLER'S TO SAY — `take_unreadable`
+    (wave 10.10). The funnel refused on any failure that was not a 403, and on
+    no Firestore client at all, and that is right only for a caller who still
+    holds the job somewhere. The start listener and the idle rescan do not: by
+    the time they get here they have DELETED the job's queue document, so a
+    refusal was the end of the request — a paid run gone on a Firestore blip,
+    its record left saying "ongoing" or "queued", and nobody told. Those two
+    pass True and a failed read TAKES the job, the way `_pickup_withdrawn`
+    takes it: the record was read a moment earlier on the way in, and the
+    worker's dequeue reads it again before anything runs — it stands a deleted
+    research down and bails on every terminal status — so a withdrawn run
+    starts only if all three reads fail.
+
+    ⭐ THE DEFAULT STAYS A REFUSAL, for the two callers who keep the job:
+      · the BOOT RESTORE, which leans on it on purpose. Its snapshot is a stale
+        local copy, and this read is the only thing between it and relaunching
+        a run worker 1's rehydration has just parked for its person's Resume
+        (#728) — so it must not act on a status it could not see. It keeps a
+        refused entry for the next boot instead.
+      · the supervised AUTO-RESUME at rehydrate, which falls through to the
+        `paused_backend_restart` mark when refused: the person gets a Resume
+        card, which is a slower run, not a lost one.
+    A read that SUCCEEDED and said no — the record gone, a status outside the
+    whitelist — is an answer, and refuses for every caller.
     """
     rid = (job or {}).get("research_id") or ""
     uid_v = (job or {}).get("uid") or ""
@@ -16935,41 +16964,48 @@ def _safe_enqueue(job_queue, job, source: str,
         log(f"[safe_enqueue:{source}] skipped — run {rid[:24]}… exhausted its "
             f"automatic attempts (a person's Retry clears this)", "INFO")
         return False
+    unreadable = None
     if _firebase_db is None:
-        log(f"[safe_enqueue:{source}] skipped — Firestore unavailable", "WARN")
-        return False
-    try:
-        snap = _firebase_db.collection("users").document(uid_v) \
-            .collection("researches").document(rid).get()
-        if not snap.exists:
-            log(f"[safe_enqueue:{source}] skipped — research {rid[:24]}… no longer exists in Firestore", "INFO")
+        unreadable = "Firestore unavailable"
+    else:
+        try:
+            snap = _firebase_db.collection("users").document(uid_v) \
+                .collection("researches").document(rid).get()
+            if not snap.exists:
+                log(f"[safe_enqueue:{source}] skipped — research {rid[:24]}… no longer exists in Firestore", "INFO")
+                return False
+            status = (snap.to_dict() or {}).get("status")
+            if status not in allowed_statuses:
+                log(f"[safe_enqueue:{source}] skipped — research {rid[:24]}… status={status} (not in {allowed_statuses})", "INFO")
+                return False
+        except Exception as e:
+            # Track D synth-device-user can't read `users/{ownerUid}/
+            # researches/{rid}` — the rule's `allow read` requires
+            # auth.uid==userId and the synth uid never matches the owner.
+            # Treat 403 as "trust the FE", since the queue-listener entry
+            # we're acting on was authenticated FE-side (the FE rule for
+            # devices/{id}/queue gates create on submittedBy==auth.uid).
+            # Any OTHER exception is the caller's call — see the docstring.
+            err_str = str(e)
+            if (
+                "403" in err_str
+                or "PERMISSION_DENIED" in err_str
+                or "Missing or insufficient permissions" in err_str
+            ):
+                log(
+                    f"[safe_enqueue:{source}] existence check denied (user-mode read "
+                    f"rule blocks synth user) — trusting FE-side queue write",
+                    "DEBUG",
+                )
+            else:
+                unreadable = f"Firestore check failed ({type(e).__name__}: {e})"
+    if unreadable is not None:
+        if not take_unreadable:
+            log(f"[safe_enqueue:{source}] skipped — {unreadable} for {rid[:24]}…", "WARN")
             return False
-        status = (snap.to_dict() or {}).get("status")
-        if status not in allowed_statuses:
-            log(f"[safe_enqueue:{source}] skipped — research {rid[:24]}… status={status} (not in {allowed_statuses})", "INFO")
-            return False
-    except Exception as e:
-        # Track D synth-device-user can't read `users/{ownerUid}/
-        # researches/{rid}` — the rule's `allow read` requires
-        # auth.uid==userId and the synth uid never matches the owner.
-        # Treat 403 as "trust the FE", since the queue-listener entry
-        # we're acting on was authenticated FE-side (the FE rule for
-        # devices/{id}/queue gates create on submittedBy==auth.uid).
-        # Any OTHER exception still bails defensively.
-        err_str = str(e)
-        if (
-            "403" in err_str
-            or "PERMISSION_DENIED" in err_str
-            or "Missing or insufficient permissions" in err_str
-        ):
-            log(
-                f"[safe_enqueue:{source}] existence check denied (user-mode read "
-                f"rule blocks synth user) — trusting FE-side queue write",
-                "DEBUG",
-            )
-        else:
-            log(f"[safe_enqueue:{source}] skipped — Firestore check failed for {rid[:24]}…: {e}", "WARN")
-            return False
+        log(f"[safe_enqueue:{source}] {unreadable} for {rid[:24]}… — taking the "
+            f"job anyway: its queue document is already gone, and the worker "
+            f"reads the record again before anything runs", "WARN")
     try:
         job_queue.put_nowait(job)
         return True
@@ -77615,7 +77651,10 @@ async def run_server(port=8000):
                 "user_sources": d.get("userSources") or [],
                 "user_links": d.get("userLinks") or [],
                 "submitted_by": str(d.get("submittedBy") or "").strip(),
-            }, source="idle-rescan")
+            }, source="idle-rescan",
+                # ⛔⛔ THE CLAIMED DOC IS DELETED JUST ABOVE, so a refusal on a
+                # failed read would drop the run for good. See `_safe_enqueue`.
+                take_unreadable=True)
             # Real-time deferred-doc renumber (2026-05-22): the just-
             # claimed orphan was at some position N in the global FIFO
             # (often head — idle-rescan picks the oldest unclaimed).
