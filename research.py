@@ -69272,6 +69272,28 @@ def save_meta(queue_dir, topic, phase, status="ongoing", *, research=None, **ext
                 # sources below being mistaken for a report that was produced.
                 _entry.setdefault("outputChars", 0)
 
+    # ── How long each agent took (wave 10.10) ──
+    # ⛔⛔ THE CLOUD USED TO GET 0 HERE FOR EVERY RUN NOBODY WATCHED. The
+    # rebuild above keeps `completionTimeSec` from meta.json, and the phase-2
+    # block wrote the real value into meta.json only AFTER this function had
+    # sent the agents to the cloud. Phase 2's `results` now come in, and each
+    # time lands in the entry this write already carries — beside every
+    # sibling field, which is the lesson recorded at `_merge_field_paths`.
+    #
+    # ⛔ ONLY A REAL TIME, AND ONLY FOR AN AGENT THAT RAN. A zero is what a
+    # resume hands back for an agent it kept rather than re-ran, and letting it
+    # through would erase the time that agent earned last attempt. An agent
+    # absent from the results was switched off and gets no row at all. An agent
+    # that ran and died with no report DOES get one: it ran, and for how long
+    # is the one thing its entry can still say.
+    for _name, _r in (extra.get("agent_results") or {}).items():
+        _key = str(_name).lower().replace(" ", "")
+        _secs = _r.get("elapsed_sec") if isinstance(_r, dict) else None
+        if (_key in ("chatgpt", "gemini", "claude")
+                and isinstance(_secs, (int, float)) and not isinstance(_secs, bool)
+                and _secs > 0):
+            agents.setdefault(_key, {})["completionTimeSec"] = int(_secs)
+
     # ── Phase timeline (for timeline graph) ──
     phases = meta.get("phases", [])
     # Canonical 6-phase timeline (0-5). Audio is part of NotebookLM (phase 3),
@@ -69297,6 +69319,28 @@ def save_meta(queue_dir, topic, phase, status="ongoing", *, research=None, **ext
             "completedAt": None,
             "durationSec": 0,
         })
+    # ⛔⛔ A PHASE ENDS WHEN THE NEXT ONE STARTS (wave 10.10). The first write is
+    # the END of phase 1, and the loop above backfills phase 0 open, so phase 0
+    # never had an end and phase 1 — starting at the run's start — carried
+    # phase 0's whole span. A caller that knows when its phase began says so in
+    # `started_ms`, and that instant opens this phase and closes phase 0.
+    #
+    # ⛔ ONLY PHASE 0 IS CLOSED THIS WAY, and not for want of generality. Its
+    # start is the run's own start; every other row this function leaves open is
+    # a backfill whose start is a guess (a phase skipped, or never saved), so
+    # closing it would print a duration for a phase that may never have run —
+    # the invention the web's timeline refuses and shows as "—" instead.
+    # ⛔ And a start before the run began or after now is two clocks
+    # disagreeing, not a boundary: it is ignored. A row already closed is never
+    # rewritten.
+    _began = extra.get("started_ms")
+    if (isinstance(_began, int) and meta.get("createdAt", 0) <= _began <= now_ms
+            and 0 < phase < len(phases) and phases[phase]["completedAt"] is None):
+        phases[phase]["startedAt"] = _began
+        _prev = phases[phase - 1]
+        if phase == 1 and _prev.get("completedAt") is None:
+            _prev["completedAt"] = _began
+            _prev["durationSec"] = max(0, (_began - int(_prev.get("startedAt") or _began)) // 1000)
     # Mark current phase as completed with actual duration
     if phase < len(phases) and phases[phase]["completedAt"] is None:
         phases[phase]["completedAt"] = now_ms
@@ -72420,7 +72464,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # from it, or an earlier fail_phase's "errored" is what lands
                 # on disk and nothing rewrites the file.
                 _write_phase_terminal_status(1, "complete")
-                save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip())
+                save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip(),
+                          started_ms=int(_p1_start * 1000))
                 emit_event("phase_complete", phase=1,
                     durationSec=int(time.time() - _p1_start), links=_p1_links,
                     summary=f"Research brief loaded from file ({brief_artifact.chars} chars)")
@@ -72500,7 +72545,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # while Firestore (written after) said complete. Recording first
                 # makes the file and the doc agree.
                 _write_phase_terminal_status(1, "complete")
-                save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip())
+                save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip(),
+                          started_ms=int(_p1_start * 1000))
                 emit_event("phase_complete", phase=1, durationSec=int(time.time() - _p1_start),
                     links=_p1_links,
                     summary=f"Research brief generated ({brief_artifact.chars} chars, {len(brief_artifact.sections)} sections)")
@@ -73129,24 +73175,15 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # hand-off writes forty lines later, from a map that IS guarded and
             # now carries our own in-app pages; a second, earlier, unguarded copy
             # of the same idea has nothing left to contribute.
-            # Enrich meta with per-agent data from results + track events
-            save_meta(queue_dir, topic, 2)
-            meta_path = queue_dir / "meta.json"
-            if meta_path.exists():
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                agents = meta.get("agents", {})
-                for name, r in results.items():
-                    key = name.lower().replace(" ", "")
-                    if key not in agents:
-                        agents[key] = {}
-                    agents[key]["completionTimeSec"] = r.get("elapsed_sec", 0)
-                # 2026-04-29: events.jsonl scrape merge removed — events.jsonl
-                # is no longer written to disk (Firestore pipeline_events is
-                # the single transport). The agents map is already kept in
-                # sync via per-event `_update_firestore_research` calls
-                # during P2; the disk-merge here was a redundant backstop.
-                meta["agents"] = agents
-                meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            # Enrich meta with per-agent data from results + track events.
+            # ⛔⛔ EACH AGENT'S TIME RIDES THE SAME WRITE (wave 10.10). It used
+            # to be written into meta.json here, AFTER `save_meta` had already
+            # sent the agents to the cloud with whatever the file held before —
+            # 0 on a fresh run — so only a browser tab left open recorded how
+            # long each agent took, and an unwatched run's analytics said "—".
+            # `save_meta` now puts the time into the entry it builds, and the
+            # disk and the cloud get one number from one write.
+            save_meta(queue_dir, topic, 2, agent_results=results)
             # ── 2026-04-25: Markdown-as-primary phase_complete (P1 mirror) ──
             # extract_and_record_agent already emitted link_extracted with the
             # in-app /documents primary the moment each agent's MD landed.

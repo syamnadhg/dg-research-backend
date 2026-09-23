@@ -31,7 +31,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 SUITES = ("tests/test_crash_card_chrome_1010.py "
-          "tests/test_stop_is_not_a_crash_108.py")
+          "tests/test_stop_is_not_a_crash_108.py "
+          "tests/test_analytics_times_1010.py "
+          "tests/test_phase_durations_0811.py "
+          "tests/test_phase1_status_order_0811.py")
 RESEARCH = "research.py"
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
@@ -46,6 +49,27 @@ C_ADVICE = ('                    + "Quit other Chrome windows there, update Chro
             '                      "the last checkpoint — or Skip to stop here.")')
 C_USE_ERROR = "                error=_card_error,"
 C_USE_REASON = "                reason=_card_reason,"
+
+# ── anchors: phase rows (save_meta) ─────────────────────────────────────────
+P_GATE = ('    if (isinstance(_began, int) and meta.get("createdAt", 0) <= _began <= now_ms\n'
+          '            and 0 < phase < len(phases) and phases[phase]["completedAt"] is None):')
+P_OPEN = '        phases[phase]["startedAt"] = _began'
+P_ONLY_ZERO = '        if phase == 1 and _prev.get("completedAt") is None:'
+P_CLOSE_AT = '            _prev["completedAt"] = _began'
+P_SITE_FILE = ('                          started_ms=int(_p1_start * 1000))\n'
+               '                emit_event("phase_complete", phase=1,\n')
+P_SITE_GEN = ('                          started_ms=int(_p1_start * 1000))\n'
+              '                emit_event("phase_complete", phase=1, durationSec=')
+
+# ── anchors: each agent's time (save_meta + the phase-2 save) ───────────────
+A_LOOP = '    for _name, _r in (extra.get("agent_results") or {}).items():'
+A_KEY = '        _key = str(_name).lower().replace(" ", "")'
+A_WHO = '        if (_key in ("chatgpt", "gemini", "claude")'
+A_BOOL = ('                and isinstance(_secs, (int, float)) and not isinstance(_secs, bool)\n'
+          '                and _secs > 0):')
+A_ZERO = '                and _secs > 0):'
+A_SET = '            agents.setdefault(_key, {})["completionTimeSec"] = int(_secs)'
+A_SITE = '            save_meta(queue_dir, topic, 2, agent_results=results)'
 
 MUTANTS = [
     # ── C: the terminal crash card ─────────────────────────────────────────
@@ -80,6 +104,72 @@ MUTANTS = [
      [(C_USE_REASON, '                reason="We tried to recover a couple of '
                      'times and it didn\'t take. Retry to start again from the '
                      'last checkpoint, or Skip to stop here.",')]),
+
+    # ── P: a phase ends when the next one starts ───────────────────────────
+    ("P1", "under", "⛔⛔ THE DEFECT, RESTORED — save_meta ignores the start it "
+     "is handed, so phase 0 never ends and phase 1 carries its span again",
+     [(P_GATE, "    if False:")]),
+    ("P2", "under", "⛔ phase 0 is never closed although phase 1 now opens at "
+     "its real start — a gap of 'nothing' between the two on every timeline",
+     [(P_CLOSE_AT, "            pass")]),
+    ("P3", "under", "⛔ phase 0 closes but phase 1 still opens at the run's "
+     "start, so phase 1's duration includes phase 0's twice over in the total",
+     [(P_OPEN, "        pass")]),
+    ("P4", "over", "⛔⛔ THE INVENTION — any open row before the saved phase is "
+     "closed at its start, so a skipped or never-saved phase is given phase "
+     "0's span as a duration it never ran",
+     [(P_ONLY_ZERO, '        if _prev.get("completedAt") is None:')]),
+    ("P5", "over", "⛔ phase 0 is closed at NOW rather than at phase 1's start, "
+     "which swaps one wrong span for another",
+     [(P_CLOSE_AT, "            _prev[\"completedAt\"] = now_ms")]),
+    ("P6", "over", "⛔ a start before the run began is believed — a clock "
+     "disagreement printed as a negative-looking boundary",
+     [(P_GATE, '    if (isinstance(_began, int) and _began <= now_ms\n'
+               '            and 0 < phase < len(phases) and phases[phase]["completedAt"] is None):')]),
+    ("P7", "over", "⛔ a start in the future is believed — phase 0 is closed "
+     "after phase 1 has finished",
+     [(P_GATE, '    if (isinstance(_began, int) and meta.get("createdAt", 0) <= _began\n'
+               '            and 0 < phase < len(phases) and phases[phase]["completedAt"] is None):')]),
+    ("P8", "over", "⛔ a closed row is rewritten — a stop right after phase 1 "
+     "re-saves phase 1 and moves boundaries already recorded",
+     [(P_GATE, '    if (isinstance(_began, int) and meta.get("createdAt", 0) <= _began <= now_ms\n'
+               '            and 0 < phase < len(phases)):')]),
+    ("P9", "under", "⛔⛔ THE CONSUMER IGNORES THE RULE — the brief-from-file "
+     "save stops saying when phase 1 began, and every save_meta test still "
+     "passes while that branch's runs never close phase 0",
+     [(P_SITE_FILE, '                          )\n'
+                    '                emit_event("phase_complete", phase=1,\n')]),
+    ("P10", "under", "⛔⛔ THE CONSUMER IGNORES THE RULE — the generated-brief "
+     "save, the one nearly every run takes",
+     [(P_SITE_GEN, '                          )\n'
+                   '                emit_event("phase_complete", phase=1, durationSec=')]),
+    ("P11", "under", "⛔ the start is passed in seconds, not milliseconds — "
+     "before the run began by 55 years, so it is ignored and nothing closes",
+     [(P_SITE_GEN, '                          started_ms=int(_p1_start))\n'
+                   '                emit_event("phase_complete", phase=1, durationSec=')]),
+
+    # ── A: each agent's time reaches the cloud ─────────────────────────────
+    ("A1", "under", "⛔⛔ THE DEFECT, RESTORED — save_meta ignores the results, "
+     "so the cloud row of every unwatched run says 0 for every agent",
+     [(A_LOOP, "    for _name, _r in {}.items():")]),
+    ("A2", "under", "⛔⛔ THE CONSUMER IGNORES THE RULE — the phase-2 save stops "
+     "handing over the results, and every save_meta test still passes",
+     [(A_SITE, "            save_meta(queue_dir, topic, 2)")]),
+    ("A3", "under", "⛔ the display name is not normalised, so 'ChatGPT' never "
+     "matches 'chatgpt' and no time lands anywhere",
+     [(A_KEY, "        _key = str(_name)")]),
+    ("A4", "over", "⛔ a zero overwrites — the agent a resume KEPT loses the "
+     "time it earned last attempt, and an agent that never ran gets a row",
+     [(A_ZERO, "                and _secs >= 0):")]),
+    ("A5", "over", "⛔ any name is accepted, so a stray key in the results "
+     "invents an agent the analytics page then tries to draw",
+     [(A_WHO, "        if (True")]),
+    ("A6", "over", "⛔ a bool is taken as a number of seconds",
+     [(A_BOOL, "                and isinstance(_secs, (int, float))\n"
+               "                and _secs > 0):")]),
+    ("A7", "under", "⛔ only an agent that already has an entry gets its time, "
+     "so the one that ran 25 minutes and died with no report says nothing",
+     [(A_SET, '            if _key in agents: agents[_key]["completionTimeSec"] = int(_secs)')]),
 ]
 
 
