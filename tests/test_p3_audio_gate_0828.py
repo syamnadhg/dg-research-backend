@@ -119,6 +119,36 @@ def test_the_publisher_answers_a_string_on_every_failure_path(
     assert out == "", f"{break_it!r} answered {out!r} instead of an empty string"
 
 
+def test_a_podcast_that_is_not_on_disk_is_never_published(monkeypatch, tmp_path):
+    """⛔⛔ THE BAIL IS ABOUT THE FILE, NOT ABOUT THE NAME. A NotebookLM
+    download that fails still leaves the phase holding a Path — the name it
+    was going to save under — and nothing about that object says the bytes
+    never arrived. Asking only `if not audio_path` lets that name through into
+    the duration probe, a Storage upload of a file that is not there, an
+    `audios` row the Podcasts page lists, and `links.audio_file`, which is what
+    the video step and the in-chat Play button read. The person then gets a
+    podcast row that plays nothing.
+
+    ⭐ Every write is counted rather than the answer alone: a publisher that
+    uploaded and then answered `""` would pass the parametrised case above and
+    still have left the row and the link behind."""
+    path = tmp_path / "Deep_Dive.m4a"          # named, never written
+    calls = []
+    monkeypatch.setattr(research, "_audio_duration_sec",
+                        lambda p: calls.append("probe") or 10)
+    monkeypatch.setattr(research, "upload_audio_to_storage",
+                        lambda p: calls.append("upload") or "https://x/a.m4a")
+    monkeypatch.setattr(research, "save_audio_to_firestore",
+                        lambda *a: calls.append("audios row"))
+    monkeypatch.setattr(research, "update_link_in_firestore",
+                        lambda *a, **k: calls.append("audio_file link"))
+    monkeypatch.setattr(research, "log", lambda *a, **k: None)
+
+    out = asyncio.run(research._p3_publish_audio(path, "chat_1755500000000_3"))
+    assert calls == [], f"a podcast that is not on disk was published: {calls}"
+    assert out == "", f"answered {out!r} for a file that does not exist"
+
+
 def test_the_early_returns_carry_no_audio(audio_src):
     """Every bail-out returns `{"audio_path": None}` — no stored url key, which
     the caller reads with a default. A bail that claimed one would be the same

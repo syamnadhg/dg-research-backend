@@ -14,7 +14,10 @@ very directory — deleting it would turn a recoverable paid run into a lost one
 Those are left to the sweep, which for an incognito folder now re-checks every
 tick instead of hourly.
 """
+import asyncio
 import json
+import os
+import types
 
 import pytest
 
@@ -251,3 +254,140 @@ def test_a_run_that_keeps_nothing_is_never_held_by_the_memo():
     For this run the surface is a promise the app has already made, and the
     folder holds the documents, the delivery record and the topic."""
     assert research._orphan_recheck_due(NOW, NOW + 0.1, INCOG, HOUR) is True
+
+
+# ══ 5. …and the sweep actually ASKS it ════════════════════════════════════
+#
+# ⛔⛔ A TESTED HELPER IS NOT A TESTED CONSUMER. The four assertions above pin
+# `_orphan_recheck_due`'s truth table perfectly and not one of them touches the
+# single line that calls it. Put that line back the way it was — an inline
+# `if (now - _orphan_verified.get(key, 0.0)) < ORPHAN_RECHECK_SEC: continue` —
+# and every test in this branch still passes and the harness still reports a
+# clean score, while the folder holding the documents, the delivery record and
+# the topic sits on somebody else's computer for up to sixty-five minutes after
+# the app said nothing was kept. Measured: with the call site reverted the
+# directory below survives the tick and costs zero Firestore reads.
+#
+# ⭐ THE LOOP IS A CLOSURE INSIDE `run_server`, SO IT IS RECONSTRUCTED, NOT
+# COPIED. The code object is the real one; only the values `run_server` would
+# have closed over are supplied here. A test that re-implemented the loop would
+# be a second opinion about what it does, which is worth nothing.
+
+INTERVAL = 300.0
+
+
+class _SweepStopped(BaseException):
+    """⛔ NOT AN `Exception`: the loop swallows those to survive a bad tick."""
+
+
+class _FakeAsyncio:
+    """`asyncio` as the loop uses it — one tick, then out."""
+    CancelledError = asyncio.CancelledError
+
+    def __init__(self):
+        self.ticks = 0
+
+    async def sleep(self, seconds):
+        # The interval sleep is the top of the loop; the 0.25 is the pause
+        # between the two existence reads and must be allowed through.
+        if seconds == INTERVAL:
+            self.ticks += 1
+            if self.ticks > 1:
+                raise _SweepStopped
+        return None
+
+
+class _Firestore:
+    """Answers `exists` for every research, and counts what it was asked."""
+
+    def __init__(self, exists):
+        self.exists, self.reads = exists, 0
+
+    def collection(self, _name):
+        return self
+
+    def document(self, _name):
+        return self
+
+    def get(self):
+        self.reads += 1
+        return types.SimpleNamespace(exists=self.exists)
+
+
+def _sweep_tick(tmp_path, rid, *, verified_at, record_exists):
+    """Run ONE tick of the real `_orphan_sweep_loop` over one finished run
+    directory. Returns (the directory is still there, Firestore reads)."""
+    code = next((c for c in research.run_server.__code__.co_consts
+                 if isinstance(c, types.CodeType)
+                 and c.co_name == "_orphan_sweep_loop"), None)
+    assert code is not None, "the orphan sweep is no longer a closure of run_server"
+
+    root = tmp_path / "queues"
+    folder = root / f"run_{rid}"
+    (folder / "documents").mkdir(parents=True)
+    (folder / "delivery.json").write_text(json.dumps({"status": "completed"}),
+                                          encoding="utf-8")
+    (folder / "owner.json").write_text(
+        json.dumps({"uid": "u1", "researchId": rid}), encoding="utf-8")
+    os.utime(folder, (NOW - 100_000, NOW - 100_000))   # older than the age bound
+
+    db = _Firestore(record_exists)
+    cells = {
+        "ORPHAN_RECHECK_SEC": HOUR,
+        "ORPHAN_SWEEP_INTERVAL_SEC": INTERVAL,
+        "ORPHAN_SWEEP_IN_FLIGHT_STATUSES": frozenset({"ongoing", "queued"}),
+        "ORPHAN_SWEEP_MIN_AGE_SEC": 300,
+        "_orphan_verified": {f"u1/{rid}": verified_at},
+        "queues_root": root,
+    }
+    env = dict(research.__dict__)
+    env.update(asyncio=_FakeAsyncio(),
+               time=types.SimpleNamespace(time=lambda: NOW),
+               _firebase_db=db,
+               _run_log_folders_for_research=lambda _rid: [],
+               log=lambda *a, **k: None)
+    loop = types.FunctionType(
+        code, env, "_orphan_sweep_loop", None,
+        tuple(types.CellType(cells[name]) for name in code.co_freevars))
+    try:
+        asyncio.run(loop())
+    except _SweepStopped:
+        pass
+    return folder.exists(), db.reads
+
+
+def test_the_sweep_re_reads_a_run_that_keeps_nothing_on_the_very_next_tick(
+        tmp_path):
+    """⛔⛔ THE CONSUMER. Confirmed present one second ago, and the sweep asks
+    again anyway — finds the record gone and takes the folder with it."""
+    still_there, reads = _sweep_tick(tmp_path, INCOG, verified_at=NOW - 1.0,
+                                     record_exists=False)
+    assert not still_there, "the folder outlived the run the app said kept nothing"
+    assert reads == 2, f"the sweep did not re-read the record: {reads} read(s)"
+
+
+def test_the_sweep_still_trusts_the_memo_for_an_ordinary_research(tmp_path):
+    """⭐ ACCEPT POLARITY, and it is the whole reason the memo exists: 288
+    Firestore reads a day for one finished run, always answering 'still there'.
+    A consumer that asked on every tick for everybody would pass the test above
+    and undo that."""
+    still_there, reads = _sweep_tick(tmp_path, CHAT, verified_at=NOW - 1.0,
+                                     record_exists=False)
+    assert still_there and reads == 0, (
+        f"an ordinary folder confirmed a second ago cost {reads} read(s)")
+
+
+def test_an_ordinary_research_is_swept_once_its_hour_is_up(tmp_path):
+    """The memo delays the ordinary case; it does not cancel it."""
+    still_there, reads = _sweep_tick(tmp_path, CHAT, verified_at=NOW - 2 * HOUR,
+                                     record_exists=False)
+    assert not still_there and reads == 2
+
+
+def test_a_run_that_keeps_nothing_is_left_alone_while_its_record_lives(tmp_path):
+    """⛔ THE SWEEP REMOVES ORPHANS, NOT RUNS. Asking every tick must not turn
+    into deleting every tick — this folder belongs to a research that is still
+    there, and the run may still be resumable from it."""
+    still_there, reads = _sweep_tick(tmp_path, INCOG, verified_at=NOW - 1.0,
+                                     record_exists=True)
+    assert still_there and reads == 1

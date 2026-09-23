@@ -199,16 +199,49 @@ def test_the_agents_writer_asks_the_same_question(db, monkeypatch, rid, verb):
                        else {"agents": {"gemini": {"status": "x"}}})
 
 
+class _GoneDocRef(_DocRef):
+    """The document a purge already took: an update raises NotFound, and a
+    set-merge would quietly RECREATE it."""
+
+    def collection(self, name):
+        return _GoneDocRef(self.sink, f"{self.path}/{name}")
+
+    def document(self, name):
+        return _GoneDocRef(self.sink, f"{self.path}/{name}")
+
+    def update(self, data):
+        self.sink.append(("update-raised", dict(data)))
+        raise RuntimeError("404 NOT_FOUND: no document to update")
+
+
+class _GoneDb:
+    def __init__(self, sink):
+        self.sink = sink
+
+    def collection(self, name):
+        return _GoneDocRef(self.sink, name)
+
+
 def test_a_write_that_cannot_land_answers_false_rather_than_raising(db, monkeypatch):
     """An update to a document that is gone raises NotFound. The machine must
     record that and carry on — this is a best-effort seam, and a raise here
-    would take the run down instead of the write."""
-    monkeypatch.setattr(research, "_fb_research_id", INCOG)
+    would take the run down instead of the write.
 
-    def boom(op, what=None, **k):
-        raise RuntimeError("404 NOT_FOUND")
-    monkeypatch.setattr(research, "_grpc_write_with_heal", boom)
+    ⛔ THE RAISE IS INJECTED AT THE UPDATE, not at `_grpc_write_with_heal`.
+    Injecting it at the wrapper never reached the `update()` this branch added
+    at all: the exception was thrown before the write was chosen, so the test
+    passed word for word against the code before this wave and said nothing
+    about it. The raise now comes from the document itself.
+
+    ⛔⛔ AND THE FAILURE MUST NOT FALL BACK. A `except NotFound: set(merge=True)`
+    here would look like resilience and be the resurrection this whole file
+    exists to refuse — a fragment with no `createdAt`, invisible to every list,
+    every sweep and the TTL itself."""
+    monkeypatch.setattr(research, "_fb_research_id", INCOG)
+    monkeypatch.setattr(research, "_firebase_db", _GoneDb(db))
     assert research._set_research_doc(UID, INCOG, {"status": "ongoing"}) is False
+    assert [kind for kind, _p in db] == ["update-raised"], (
+        f"the purged record was written to some other way: {db}")
 
 
 # ══ 3. the claim: an abort, not a resurrection ════════════════════════════

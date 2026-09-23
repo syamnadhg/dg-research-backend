@@ -3957,8 +3957,8 @@ def _orphan_recheck_due(last_verified_at, now: float, research_id,
     the pause and the machine that died — and each of those is gone the first
     time the sweep finds its record missing.
 
-    ⛔ EXTRACTED FROM `_orphan_sweep_loop`, which is a closure inside
-    `run_server` and cannot be called from a test. Called unconditionally there."""
+    ⛔ EXTRACTED FROM `_orphan_sweep_loop`, a closure inside `run_server` that
+    no test could call — so the CALL SITE is pinned by rebuilding that closure."""
     if _is_incognito_research(research_id):
         return True
     return (float(now) - float(last_verified_at or 0.0)) >= float(recheck_sec)

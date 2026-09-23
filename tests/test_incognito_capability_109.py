@@ -19,6 +19,8 @@ and take the whole feature away silently.
 """
 import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -127,12 +129,85 @@ def test_nothing_else_about_the_published_fields_moved(monkeypatch):
 
 # ══ 3. the shape lives in four files that cannot import each other ════════
 
-def _web() -> "Path | None":
-    """The web repo: `SR_WEB_REPO` when set (a worktree layout), else the
-    sibling checkout this repo's other parity tests read."""
+#: The web file that says the wave's web half is in a checkout at all.
+_HALF = Path("src") / "lib" / "incognito.ts"
+
+
+def _web_candidates(here: "Path | None" = None) -> "list[Path]":
+    """Every place the web checkout could be, most explicit first.
+
+    ⛔⛔ THE WORKTREE WAS THE HOLE. `parents[2]` is the directory the BACKEND
+    sits in, and this branch is built and gated in a worktree — where that
+    directory holds other worktrees and no `dg-research` at all. Both parity
+    pins below therefore skipped in the one place the wave's gate actually
+    runs, which is the most expensive silence in this file: they are the only
+    mechanical check that the four copies of the incognito id shape agree.
+
+    ⭐ So the git COMMON dir is asked too, exactly as
+    `tests/test_document_images_0913.py` already does for the upload contract:
+    a worktree's common dir is the real checkout's `.git`, whose grandparent
+    holds the sibling repos."""
     env = os.environ.get("SR_WEB_REPO")
-    base = Path(env) if env else Path(__file__).resolve().parents[2] / "dg-research"
-    return base if (base / "firestore.rules").exists() else None
+    if env:
+        # ⛔ AN EXPLICIT PATH IS THE ONLY CANDIDATE. Falling back from a typo
+        # would put this pin back on a checkout nobody asked about.
+        return [Path(env)]
+    here = Path(here) if here is not None else Path(__file__).resolve().parents[1]
+    out = [here.parent / "dg-research"]
+    try:
+        common = subprocess.run(
+            ["git", "-C", str(here), "rev-parse", "--path-format=absolute",
+             "--git-common-dir"],
+            capture_output=True, text=True, encoding="utf-8", timeout=10)
+        if common.returncode == 0 and common.stdout.strip():
+            out.append(Path(common.stdout.strip()).parent.parent / "dg-research")
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return out
+
+
+def _web() -> Path:
+    """The web checkout these pins hold the machine against.
+
+    ⛔⛔ A MISTYPED `SR_WEB_REPO` IS A FAILURE, NEVER A SKIP. The old resolver
+    answered `None` for anything without a `firestore.rules`, so pointing the
+    gate at the wrong directory read as "there is no web repo here" and both
+    pins went quiet — the same silence, arriving from the one place somebody
+    thought they had switched them ON.
+
+    ⭐ The only skip left is the web half not being on this disk at all. The
+    two halves of this wave land together, and this suite cannot be red in the
+    ordinary checkout because another repo's branch has not merged yet — but
+    the skip names every path it tried, and the mutation harness treats a skip
+    of this file as a hard error rather than as a pass."""
+    tried = _web_candidates()
+    env = os.environ.get("SR_WEB_REPO")
+    if env:
+        assert (Path(env) / "firestore.rules").exists(), (
+            f"SR_WEB_REPO={env!r} is not a dg-research checkout — there is no "
+            f"firestore.rules there, so the parity pins were aimed at nothing")
+    for base in tried:
+        if (base / _HALF).exists():
+            return base
+    pytest.skip(
+        "⛔ the web half of this wave (src/lib/incognito.ts) is in none of "
+        + ", ".join(str(p) for p in tried)
+        + " — the four copies of the incognito id shape were NOT compared; "
+          "point SR_WEB_REPO at a checkout that carries it")
+
+
+def _web_text(web: Path, rel: str) -> str:
+    """One of the web's copies, or a sentence saying which one moved.
+
+    ⛔ `read_text` straight off the path raised a bare `FileNotFoundError`,
+    which reads as a broken test rather than as the finding it is: a checkout
+    whose half of this wave is only partly there."""
+    path = web / rel
+    assert path.exists(), (
+        f"{rel} is missing from {web} — this pin holds four copies of one id "
+        f"shape together and cannot do it without that file; re-anchor it if "
+        f"the web moved the file")
+    return path.read_text(encoding="utf-8")
 
 
 def test_the_id_shape_agrees_with_every_copy_in_the_web_repo():
@@ -146,19 +221,18 @@ def test_the_id_shape_agrees_with_every_copy_in_the_web_repo():
     whole-string match; the two regex copies carry the anchors because `.test()`
     and `re.search()` are not. So the pin compares the BODY."""
     web = _web()
-    if web is None:
-        pytest.skip("no web checkout beside this one; set SR_WEB_REPO")
     body = research._INCOGNITO_ID_RE.pattern.strip("^$")
     assert body == "incog_[0-9]{13}_[0-9]{1,6}"
 
-    ts = (web / "src" / "lib" / "incognito.ts").read_text(encoding="utf-8")
+    ts = _web_text(web, str(_HALF))
     m = re.search(r"INCOGNITO_ID_RE\s*=\s*/(.+?)/;", ts)
-    assert m, "the web's INCOGNITO_ID_RE moved — re-anchor this pin"
+    assert m, f"the web's INCOGNITO_ID_RE moved in {web} — re-anchor this pin"
     assert m.group(1).strip("^$") == body, (
-        "the app and the machine disagree about which ids keep nothing")
+        f"the app and the machine disagree about which ids keep nothing: "
+        f"{m.group(1)!r} in {web} vs {research._INCOGNITO_ID_RE.pattern!r} here")
 
     for name in ("firestore.rules", "storage.rules"):
-        text = (web / name).read_text(encoding="utf-8")
+        text = _web_text(web, name)
         found = re.findall(r"matches\('\^?(incog_[^']*?)\$?'\)", text)
         assert found, f"{name} no longer matches an incognito id — re-anchor"
         assert set(found) == {body}, f"{name} carries a different id shape: {found}"
@@ -171,11 +245,179 @@ def test_the_rules_admit_the_capability_key_the_machine_now_writes():
     whose rules have not been deployed. Against a web checkout without the key
     this FAILS, which is the signal that the deploy has not happened yet."""
     web = _web()
-    if web is None:
-        pytest.skip("no web checkout beside this one; set SR_WEB_REPO")
-    text = (web / "firestore.rules").read_text(encoding="utf-8")
+    text = _web_text(web, "firestore.rules")
     assert "'incognitoRuns'" in text, (
         "incognitoRuns is not on the device key list — the version patch would "
         "be refused whole")
     assert re.search(r"request\.resource\.data\.get\('incognitoRuns',\s*0\)\s+is\s+int",
                      text), "the rules must type-check incognitoRuns as an int"
+
+
+# ══ 4. the two pins above, measured ═══════════════════════════════════════
+#
+# ⛔⛔ A CROSS-REPO PIN IS THE EASIEST KIND TO LOSE. It reaches outside the
+# checkout, so the ordinary way it fails is by finding nothing and saying
+# nothing — and in the worktree this branch is built in, that is exactly what
+# both of them did: `20 passed, 2 skipped`, with the only mechanical agreement
+# between the machine, the app and both rules files silently unchecked.
+#
+# ⭐ So the pins are DRIVEN here, against synthetic web checkouts built to be
+# wrong in one way each. Nothing about this reads source text for a name: every
+# assertion below runs the real pin and judges what it raises.
+
+_TS_OK = ('export const INCOGNITO_ID_RE = /^incog_[0-9]{13}_[0-9]{1,6}$/;\n')
+_RULES_OK = (
+    "function isIncognitoResearch(researchId) {\n"
+    "  return researchId.matches('^incog_[0-9]{13}_[0-9]{1,6}$');\n"
+    "}\n"
+    "hasOnly(['version', 'updateAvailable', 'incognitoRuns'])\n"
+    "request.resource.data.get('incognitoRuns', 0) is int\n")
+_STORAGE_OK = "return researchId.matches('^incog_[0-9]{13}_[0-9]{1,6}$');\n"
+
+
+def _fake_web(tmp_path, *, ts=_TS_OK, rules=_RULES_OK, storage=_STORAGE_OK):
+    """A web checkout with exactly the three files these pins read — any of
+    which can be left out (`None`) or made to disagree."""
+    web = tmp_path / "dg-research"
+    (web / "src" / "lib").mkdir(parents=True)
+    for rel, body in ((_HALF, ts), (Path("firestore.rules"), rules),
+                      (Path("storage.rules"), storage)):
+        if body is not None:
+            (web / rel).write_text(body, encoding="utf-8")
+    return web
+
+
+def _raised(fn):
+    """What the pin raises, whatever kind of thing it is.
+
+    ⛔ `pytest.raises(AssertionError)` alone would let a `Skipped` through as an
+    ERROR in the report — and a skip escaping from here would also trip the
+    mutation harness's own "the parity pins SKIPPED" guard, which aborts the
+    whole run. So every outcome is caught and judged as a value."""
+    with pytest.raises(BaseException) as err:   # noqa: PT011 — the point is the type
+        fn()
+    return err.value
+
+
+def test_both_pins_run_and_pass_against_a_web_checkout_that_agrees(
+        tmp_path, monkeypatch):
+    """⭐ ACCEPT POLARITY, and the one that proves `SR_WEB_REPO` is honoured:
+    without it every refusal below is satisfied by a pin that raises at
+    everything."""
+    monkeypatch.setenv("SR_WEB_REPO", str(_fake_web(tmp_path)))
+    test_the_id_shape_agrees_with_every_copy_in_the_web_repo()
+    test_the_rules_admit_the_capability_key_the_machine_now_writes()
+
+
+def test_a_web_copy_that_disagrees_is_named_on_both_sides(tmp_path, monkeypatch):
+    """⛔⛔ THE WHOLE POINT OF THE PIN. The counter bound widens in the app and
+    nowhere else, so a seven-digit id is ephemeral to the browser and ordinary
+    to the machine, the rules and the sweep."""
+    web = _fake_web(tmp_path, ts="export const INCOGNITO_ID_RE = "
+                                 "/^incog_[0-9]{13}_[0-9]{1,7}$/;\n")
+    monkeypatch.setenv("SR_WEB_REPO", str(web))
+    err = _raised(test_the_id_shape_agrees_with_every_copy_in_the_web_repo)
+    assert isinstance(err, AssertionError), f"answered {err!r}"
+    assert "{1,7}" in str(err) and "{1,6}" in str(err), (
+        f"the reader is not told which two shapes disagree: {err}")
+
+
+def test_a_rules_file_the_web_moved_is_a_sentence_not_a_traceback(
+        tmp_path, monkeypatch):
+    """⛔⛔ THE BARE `FileNotFoundError`. Against a real sibling checkout whose
+    web half has not landed, this pin died on `read_text` — a stack trace about
+    pathlib, in the one place a reader needs to be told that the app and the
+    machine could not be compared at all."""
+    monkeypatch.setenv("SR_WEB_REPO", str(_fake_web(tmp_path, storage=None)))
+    err = _raised(test_the_id_shape_agrees_with_every_copy_in_the_web_repo)
+    assert isinstance(err, AssertionError), (
+        f"a missing web file answered {type(err).__name__}: {err}")
+    assert "storage.rules" in str(err), str(err)
+
+
+def test_a_web_checkout_without_the_capability_key_fails_loudly(
+        tmp_path, monkeypatch):
+    """The deploy signal: rules without the key would 403 the WHOLE version
+    patch, so this must be a failure and never a quiet pass."""
+    monkeypatch.setenv("SR_WEB_REPO", str(_fake_web(
+        tmp_path, rules="function isIncognitoResearch(researchId) {\n"
+                        "  return researchId.matches("
+                        "'^incog_[0-9]{13}_[0-9]{1,6}$');\n}\n")))
+    err = _raised(test_the_rules_admit_the_capability_key_the_machine_now_writes)
+    assert isinstance(err, AssertionError), f"answered {err!r}"
+    assert "device key list" in str(err), str(err)
+
+
+@pytest.mark.parametrize("pin", [
+    test_the_id_shape_agrees_with_every_copy_in_the_web_repo,
+    test_the_rules_admit_the_capability_key_the_machine_now_writes,
+])
+def test_an_SR_WEB_REPO_that_is_not_a_web_checkout_is_never_a_skip(
+        tmp_path, monkeypatch, pin):
+    """⛔⛔ THE SILENCE THAT LOOKS LIKE A SWITCH-ON. Somebody sets the variable,
+    mistypes the path, and the pins answer exactly what they answer when nobody
+    set it at all — nothing. A path that was named explicitly is a claim, and a
+    claim this pin cannot honour has to be loud."""
+    monkeypatch.setenv("SR_WEB_REPO", str(tmp_path / "not-a-checkout"))
+    err = _raised(pin)
+    assert isinstance(err, AssertionError), (
+        f"a mistyped SR_WEB_REPO answered {type(err).__name__} — a skip here "
+        f"is the defect: {err}")
+    assert "not a dg-research checkout" in str(err), str(err)
+
+
+def test_the_pins_skip_only_when_the_webs_half_is_nowhere_on_this_disk(
+        tmp_path, monkeypatch):
+    """⭐ THE ONE CONCESSION, BOUNDED. The two halves of this wave land
+    together, so a backend suite cannot be red because the app's branch has not
+    merged — but the skip has to name every path it looked in, and it may only
+    ever be reached when the web's own file is genuinely absent."""
+    web = _fake_web(tmp_path, ts=None)
+    monkeypatch.setenv("SR_WEB_REPO", str(web))
+    err = _raised(test_the_id_shape_agrees_with_every_copy_in_the_web_repo)
+    assert isinstance(err, pytest.skip.Exception), f"answered {err!r}"
+    assert str(web) in str(err) and "incognito.ts" in str(err), str(err)
+
+
+def _git(*args, cwd):
+    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
+                          text=True, encoding="utf-8", timeout=60)
+
+
+def test_a_worktree_looks_past_its_own_parent_for_the_web_repo(tmp_path,
+                                                               monkeypatch):
+    """⛔⛔ THE SKIP THAT COST THIS ITEM ITS ONLY CROSS-REPO CHECK, driven
+    through a REAL worktree rather than described.
+
+    With no `SR_WEB_REPO` the resolver used to offer exactly one candidate —
+    the directory holding the backend — and in a worktree that directory holds
+    other worktrees and no checkout at all. Every wave of this branch was built
+    and gated in one, so both parity pins skipped every single time.
+
+    ⭐ A synthetic tree is the only way to measure this without asserting facts
+    about the machine the suite happens to run on: `git worktree` is set up for
+    real, and the sibling the resolver must reach sits beside the MAIN
+    checkout, two directories away from where the worktree lives."""
+    if shutil.which("git") is None:
+        pytest.skip("no git on this machine — the worktree resolution was NOT "
+                    "measured")
+    monkeypatch.delenv("SR_WEB_REPO", raising=False)
+    home = tmp_path / "SuperResearch"
+    main = home / "dg-research-backend"
+    (main / "tests").mkdir(parents=True)
+    (home / "dg-research" / "src" / "lib").mkdir(parents=True)
+    (main / "research.py").write_text("# a checkout\n", encoding="utf-8")
+    assert _git("init", "-q", "-b", "main", cwd=main).returncode == 0
+    assert _git("add", "-A", cwd=main).returncode == 0
+    assert _git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q",
+                "-m", "one", "--no-gpg-sign", cwd=main).returncode == 0
+    wt = tmp_path / "elsewhere" / "wt" / "a-branch"
+    made = _git("worktree", "add", "-q", "-b", "side", str(wt), cwd=main)
+    assert made.returncode == 0, made.stderr
+
+    candidates = _web_candidates(wt)
+    assert home / "dg-research" in candidates, (
+        f"a worktree found nowhere to look but its own parent: {candidates}")
+    assert not (wt.parent / "dg-research").exists(), (
+        "the parent candidate exists in this fixture, so reaching the sibling "
+        "proves nothing")

@@ -478,9 +478,61 @@ def test_the_dead_worker_reconciler_still_parks_an_ordinary_run(monkeypatch):
     assert patch["status"] == "paused_backend_restart"
 
 
-def test_a_stopped_incognito_run_can_no_longer_be_re_enqueued(monkeypatch):
-    """⛔ THE STATUS HAS TO BE ONE THE ENQUEUE GUARD REFUSES, or the stop is a
-    label and the next boot picks the run up again. `_safe_enqueue`'s whitelist
-    is queued / ongoing / paused_backend_restart."""
-    assert "stopped" not in research._safe_enqueue.__defaults__[0]
-    assert "paused_backend_restart" in research._safe_enqueue.__defaults__[0]
+class _StatusDb:
+    """Firestore as `_safe_enqueue` reads it: one research, one status."""
+
+    def __init__(self, status):
+        self.status = status
+
+    def collection(self, _name):
+        return self
+
+    def document(self, _name):
+        return self
+
+    def get(self):
+        return types.SimpleNamespace(
+            exists=True, to_dict=lambda: {"status": self.status})
+
+
+def _enqueue_after_a_restart(monkeypatch, rid):
+    """Write the recovery patch this branch chose, then offer the run to the
+    enqueue funnel exactly as a boot would. Returns (accepted, status)."""
+    monkeypatch.setattr(research, "log", lambda *a, **k: None)
+    status = research._restart_recovery_patch(rid)["status"]
+    monkeypatch.setattr(research, "_firebase_db", _StatusDb(status))
+    taken = []
+    queue = types.SimpleNamespace(put_nowait=taken.append)
+    ok = research._safe_enqueue(queue, {"research_id": rid, "uid": UID}, "boot")
+    assert ok is (len(taken) == 1)
+    return ok, status
+
+
+def test_the_status_a_restart_writes_over_a_run_that_keeps_nothing_is_refused(
+        monkeypatch):
+    """⛔⛔ THE TWO HALVES, RUN TOGETHER. The stop is only a stop if the funnel
+    that re-offers runs at boot refuses the word it wrote — otherwise it is a
+    label, and the next boot picks up a run whose chat cannot be reopened, on
+    somebody else's computer.
+
+    ⛔ This used to read `_safe_enqueue.__defaults__[0]` and assert what was in
+    it. That tuple is untouched by this branch, so the assertion was equally
+    true of the code an hour before it — it could not fail on anything this
+    wave decided. What this wave decided is WHICH STATUS gets written, so the
+    patch writer feeds the funnel here and the funnel answers."""
+    accepted, status = _enqueue_after_a_restart(monkeypatch, INCOG)
+    assert accepted is False, (
+        f"a restart wrote status={status!r} over a run that keeps nothing, and "
+        f"the enqueue funnel took it straight back")
+    assert status == "stopped"
+
+
+def test_the_status_a_restart_writes_over_an_ordinary_run_is_still_taken(
+        monkeypatch):
+    """⭐ ACCEPT POLARITY, and it is the reason the incognito branch exists at
+    all: an ordinary run is PARKED, and parked means the person's Resume — and
+    the machine's own re-enqueue — can still pick it up."""
+    accepted, status = _enqueue_after_a_restart(monkeypatch, CHAT)
+    assert accepted is True, (
+        f"a parked ordinary run (status={status!r}) can no longer be resumed")
+    assert status == "paused_backend_restart"

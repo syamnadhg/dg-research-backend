@@ -14,6 +14,7 @@ wheel that predates this wave from writing a report it would then keep.
 Every pin below runs the real writer against a fake Firestore and reads the
 payload that was actually handed to it.
 """
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -123,9 +124,9 @@ def test_a_run_that_keeps_nothings_report_carries_a_timestamp(db, monkeypatch):
 
 # ══ 3. the timeline ═══════════════════════════════════════════════════════
 
-def _emit(monkeypatch, rid):
+def _emit(monkeypatch, rid, *, last_seq=0):
     monkeypatch.setattr(research, "_fb_research_id", rid)
-    monkeypatch.setattr(research, "_fb_seq", 0)
+    monkeypatch.setattr(research, "_fb_seq", last_seq)
     return research._emit_to_firestore({"type": "phase_start", "phase": 2})
 
 
@@ -150,10 +151,23 @@ def test_a_run_that_keeps_nothings_events_burn_in_a_day(db, monkeypatch):
 
 
 def test_the_event_still_carries_everything_else_it_did(db, monkeypatch):
-    """⛔ THE FUSE IS AN ADDITION. The sequence number is what the app's
-    `where("seq", ">", lastSeq)` filter reads, and losing it drops every event
-    the chat has not seen yet."""
-    assert _emit(monkeypatch, INCOG)
+    """⛔ THE FUSE IS AN ADDITION — asserted in the SAME write as the fuse.
+
+    The sequence number is what the app's `where("seq", ">", lastSeq)` filter
+    reads, and losing it drops every event the chat has not seen yet.
+
+    ⛔⛔ `assert payload["seq"] > 0` MEASURED NOTHING. Every seq this function
+    can produce is a millisecond clock, so any code that ever ran satisfied it —
+    including the code before this wave, and including a seq that went
+    BACKWARDS. So the previous event's number is set ahead of the clock here:
+    the only way past this assertion is the monotonic guard, and the fuse the
+    same write carries is what makes it a fact about this branch rather than
+    about the function it changed."""
+    ahead = int(time.time() * 1000) + 5_000
+    seq = _emit(monkeypatch, INCOG, last_seq=ahead)
     [(_kind, _path, payload, _merge)] = db
     assert payload["type"] == "phase_start" and payload["phase"] == 2
-    assert payload["seq"] > 0
+    assert payload["seq"] == ahead + 1 == seq == research._fb_seq, (
+        f"an event landed with seq={payload['seq']} behind the last one the "
+        f"chat saw ({ahead}) — the app's filter never shows it")
+    assert payload["expireAt"] < datetime.now(timezone.utc) + timedelta(hours=48)

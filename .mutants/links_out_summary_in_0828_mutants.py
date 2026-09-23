@@ -119,18 +119,29 @@ MUTANTS = [
      [('    return {"audio_path": audio_path, "audio_stored_url": audio_stored_url}',
        '    return {"audio_path": audio_path}')]),
 
-    # ⛔ RE-ANCHORED, wave 10.9. The claim was "the artefact is defined before
-    # every return", held by an initialiser at the top of the phase. With the
-    # writes extracted there is no initialiser to delete — the phase assigns the
-    # publisher's answer once — so what is worth refusing at this seam is a
-    # publisher that hands its caller nothing on a path out.
-    ("P9", "under",
-     "⛔ the publisher answers None on its failure path, so the caller's "
-     "completion gate reads a value it cannot compare",
-     [('        log(f"Audio Firestore/Storage sync failed: {e}", "WARN")\n'
-       '    return ""',
-       '        log(f"Audio Firestore/Storage sync failed: {e}", "WARN")\n'
-       "    return None")]),
+    # ⛔ RE-ANCHORED TWICE, and the first re-anchor is the lesson. The claim was
+    # "the artefact is defined before every return", held by an initialiser at
+    # the top of the phase; with the writes extracted there is no initialiser to
+    # delete, so wave 10.9 pointed P9 at the publisher answering `None` instead
+    # of `""` on its swallow path. That mutant CANNOT FAIL: all three consumers
+    # read the answer through a truthiness test or an `or` fallback
+    # (`if _p3_no_skip and _p3_audio_stored`, `update_delivery(audio_url=… or …)`,
+    # `log(f"  Podcast: {… or 'N/A'}")`), so None and "" produce byte-identical
+    # behaviour everywhere. It was scored as killed only by an `assert out == ""`
+    # — a string-identity check with no production meaning. An EQUIVALENT mutant
+    # is a harness fault, not a hole, and a slot reporting a kill while measuring
+    # nothing is the one thing this directory exists to prevent.
+    # ⭐ So P9 now refuses a decision at the same seam that a consumer CAN see:
+    # the bail asks whether the podcast is on the disk, not whether the phase
+    # happens to be holding a name for it.
+    ("P9", "over",
+     "⛔⛔ the bail asks only whether a NAME was minted, so a NotebookLM "
+     "download that never landed is probed, uploaded, written as an `audios` "
+     "row and stamped into links.audio_file — a podcast row that plays nothing",
+     [('    if not (audio_path and audio_path.exists()):\n'
+       '        return ""',
+       '    if not audio_path:\n'
+       '        return ""')]),
 
     ("P10", "under",
      "⛔⛔ THE AUTO-RETRY LEG READS THE REMOVED KEY AGAIN. `.get(…, \"\")` on a "

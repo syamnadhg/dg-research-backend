@@ -19,10 +19,15 @@ The ones that matter most are the quiet ones:
         documents.
   I13 — the telemetry id is dropped for EVERYBODY, which loses the join for
         every ordinary run while looking like a privacy fix.
-  N4  — the document scrub is skipped along with the upload, which writes the
+  N2  — the document scrub is skipped along with the upload, which writes the
         agents' signed file links into the text the email carries.
-  C2  — the claim fallback recreates a purged incognito record, the exact
+  C5  — the claim fallback recreates a purged incognito record, the exact
         resurrection the rules and this code both exist to refuse.
+
+⛔ THOSE TWO IDS WERE WRONG UNTIL 2026-09-22: this list said N4 and C2, which
+are "no run publishes its podcast at all" and "every write becomes an update".
+A reader triaging a survivor by the name printed beside it was sent to the
+wrong seam, which is how the wrong repair gets made under time pressure.
 
 ⛔ ANCHORS ARE SINGLE STRING LITERALS AND MUST MATCH EXACTLY ONCE. A stale
 anchor is a harness fault, not a survivor, and faults are counted OUT. Every
@@ -184,6 +189,14 @@ PURGE_LOGS = ("    for folder in log_folders:\n"
 RECHECK = ("    if _is_incognito_research(research_id):\n"
            "        return True\n"
            "    return (float(now) - float(last_verified_at or 0.0)) >= float(recheck_sec)")
+# ⛔⛔ THE CONSUMER OF THE LINE ABOVE, which had no anchor at all until
+# 2026-09-22: four tests pinned the helper's truth table and nothing executed
+# the one line that calls it, so putting the old inline comparison back left
+# the whole suite green and the harness reporting a clean score.
+RECHECK_CALL = ("                    if not _orphan_recheck_due(\n"
+                "                            _orphan_verified.get(_seen_key, 0.0), now_ts_inner,\n"
+                "                            rid, ORPHAN_RECHECK_SEC):\n"
+                "                        continue")
 QUEUE_DIR_CLAIM = ('    claim = Path(str(resume)).name if resume else bound.arguments.get("run_id")')
 CATCHUP = ('    if _is_incognito_research(research_id):\n'
            '        return ("nothing here can ask the route again — a run that keeps nothing "\n'
@@ -221,6 +234,34 @@ FORGET_WRITE = ("        if live or current:\n"
                 "            _write_pending_queue_snapshot(path, current, live)")
 FORGET_UNLINK = ("        else:\n"
                  "            Path(path).unlink(missing_ok=True)")
+
+# ── anchors: the two seams a recovery status has to satisfy at once ─────────
+ENQUEUE_WHITELIST = (
+    'def _safe_enqueue(job_queue, job, source: str,\n'
+    '                  allowed_statuses: "tuple[str, ...]" = '
+    '("queued", "ongoing", "paused_backend_restart")) -> bool:')
+SEQ_MONOTONIC = ("    new_seq = int(time.time() * 1000)\n"
+                 "    if new_seq <= _fb_seq:\n"
+                 "        new_seq = _fb_seq + 1")
+
+# ── anchors: the web-parity pins' own guards (a TEST file) ──────────────────
+# ⛔⛔ THE ONLY MECHANICAL CHECK THAT FOUR COPIES OF THE ID SHAPE AGREE lives in
+# a test, and its failure mode is silence: it reaches into another checkout, so
+# "found nothing" and "found nothing wrong" look identical from here. These
+# three mutants are aimed at the guards that tell those apart.
+CAP_TEST = "tests/test_incognito_capability_109.py"
+CAP_MISSING_FILE = ('    path = web / rel\n'
+                    '    assert path.exists(), (\n'
+                    '        f"{rel} is missing from {web} — this pin holds four copies of one id "\n'
+                    '        f"shape together and cannot do it without that file; re-anchor it if "\n'
+                    '        f"the web moved the file")\n'
+                    '    return path.read_text(encoding="utf-8")')
+CAP_ENV_CLAIM = ('    if env:\n'
+                 '        assert (Path(env) / "firestore.rules").exists(), (\n'
+                 '            f"SR_WEB_REPO={env!r} is not a dg-research checkout — there is no "\n'
+                 '            f"firestore.rules there, so the parity pins were aimed at nothing")')
+CAP_COMMON_DIR = ("        if common.returncode == 0 and common.stdout.strip():\n"
+                  '            out.append(Path(common.stdout.strip()).parent.parent / "dg-research")')
 
 CLAIM_QUEUE_DELETE = ('                        f"recreating it", "WARN")\n'
                       "                    try:\n"
@@ -490,6 +531,13 @@ MUTANTS = [
     ("T9", "over", "the memo is bypassed for EVERY research, which is the "
      "per-tick Firestore read the memo was added to stop",
      [(RECHECK, "    return True")]),
+    ("T8b", "under", "⛔⛔ THE SWEEP STOPS ASKING. The helper above is perfect "
+     "and the one line that calls it goes back to the inline comparison, so an "
+     "incognito folder is held by the hourly memo for up to sixty-five minutes "
+     "after the app said nothing was kept",
+     [(RECHECK_CALL, "                    if (now_ts_inner - _orphan_verified.get("
+                     "_seen_key, 0.0)) < ORPHAN_RECHECK_SEC:\n"
+                     "                        continue")]),
     ("T10", "under", "⛔ a resume's full path is used as a run-id claim, so the "
      "containment check is handed something it was written to refuse",
      [(QUEUE_DIR_CLAIM,
@@ -574,6 +622,52 @@ MUTANTS = [
      [(FORGET_CURRENT, "    current = None\n"
                        "    try:\n"
                        "        live = list(job_queue._queue)")]),
+
+    # ══ the stop has to hold at BOTH ends ══════════════════════════════════
+    ("A1", "over", "⛔⛔ the enqueue funnel accepts `stopped`, so the status a "
+     "restart writes over a run that keeps nothing is a LABEL: the next boot "
+     "re-offers the run, on a machine whose owner was told only that a run "
+     "happened",
+     [(ENQUEUE_WHITELIST, ENQUEUE_WHITELIST.replace(
+         '("queued", "ongoing", "paused_backend_restart")',
+         '("queued", "ongoing", "paused_backend_restart", "stopped")'))]),
+    ("C10", "over", "⛔⛔ a failed update FALLS BACK to the set-merge, which "
+     "looks like resilience and is the resurrection itself — the purged record "
+     "comes back as a fragment with no createdAt on the very next write",
+     [(WRITE_GATE, "    if not _is_incognito_research(research_id):\n"
+                   "        return doc_ref.set(payload, merge=merge)\n"
+                   "    try:\n"
+                   "        return doc_ref.update(_merge_field_paths(payload))\n"
+                   "    except Exception:\n"
+                   "        return doc_ref.set(payload, merge=merge)")]),
+    ("E8", "under", "⛔ the seq stops being monotonic, so two events in the "
+     "same millisecond tie and the app's `where(seq > lastSeq)` filter never "
+     "shows the second — the fuse rides on this write and must not cost it",
+     [(SEQ_MONOTONIC, "    new_seq = int(time.time() * 1000)")]),
+
+    # ══ the pins that hold four copies of the id shape together ════════════
+    # ⛔ THESE MUTATE A TEST FILE, which is the only place their decision
+    # lives: a cross-repo pin that cannot say "I found nothing" is a pin that
+    # reports agreement it never checked.
+    ("W1", "under", "⛔⛔ the parity pin reads a web file without asking whether "
+     "it is there, so a checkout whose half of this wave has not landed dies on "
+     "a bare FileNotFoundError instead of saying which copy moved",
+     [(CAP_MISSING_FILE, '    path = web / rel\n'
+                         '    return path.read_text(encoding="utf-8")')],
+     CAP_TEST),
+    ("W2", "under", "⛔⛔ a mistyped SR_WEB_REPO goes back to reading as 'there "
+     "is no web repo here', so the one place somebody thought they had switched "
+     "the parity pins ON is the place they go quiet",
+     [(CAP_ENV_CLAIM, '    if env and not (Path(env) / "firestore.rules").exists():\n'
+                      '        pytest.skip("no web checkout beside this one; '
+                      'set SR_WEB_REPO")')],
+     CAP_TEST),
+    ("W3", "under", "⛔⛔ the resolver looks only in the directory holding this "
+     "checkout, so in the worktree every wave of this branch is built and gated "
+     "in, both parity pins skip and nothing compares the four copies",
+     [(CAP_COMMON_DIR, "        if False:\n"
+                       '            out.append(Path(common.stdout.strip()).parent.parent / "dg-research")')],
+     CAP_TEST),
 ]
 
 
@@ -605,7 +699,14 @@ def green():
 # every harness in this directory with `spec.loader.exec_module`, which
 # EXECUTES it — an unguarded runner turns a seconds-long check into a full run.
 if __name__ == "__main__":
-    files = sorted({RESEARCH})
+    # ⛔ A FIFTH COLUMN NAMES THE FILE, and most mutants do not carry one: the
+    # machine's decisions live in research.py, but three of them live in the
+    # parity pins themselves, which are a test file. Everything is normalised
+    # to five columns here so the loop below — and the two sweeps in
+    # `.mutants/_*.py`, which read this loop to learn what the columns mean —
+    # see one shape.
+    MUTANTS = [(*m, RESEARCH)[:5] for m in MUTANTS]
+    files = sorted({m[4] for m in MUTANTS})
     ORIGINALS = {f: _path(f).read_text(encoding="utf-8") for f in files}
 
     def restore():
@@ -622,9 +723,9 @@ if __name__ == "__main__":
     survivors = []
     faults = []
     selected = [m for m in MUTANTS if not only or m[0] in only]
-    for mid, direction, why, edits in selected:
-        path = _path(RESEARCH)
-        original = ORIGINALS[RESEARCH]
+    for mid, direction, why, edits, fname in selected:
+        path = ROOT / fname
+        original = ORIGINALS[fname]
         try:
             mutated = original
             for frm, to in edits:
@@ -633,10 +734,10 @@ if __name__ == "__main__":
                 hits = mutated.count(frm)
                 if hits != 1:
                     raise AssertionError(
-                        f"anchor occurs {hits}x in {RESEARCH} (needs exactly 1): {frm[:70]!r}")
+                        f"anchor occurs {hits}x in {fname} (needs exactly 1): {frm[:70]!r}")
                 mutated = mutated.replace(frm, to)
             try:
-                compile(mutated, RESEARCH, "exec")
+                compile(mutated, fname, "exec")
             except SyntaxError as e:
                 raise AssertionError(f"mutant does not parse: {e}")
             path.write_text(mutated, encoding="utf-8")
