@@ -640,6 +640,44 @@ def test_a_cut_connection_says_the_same_thing_about_the_same_run():
     assert "no chat to reopen" in " ".join(keeps_nothing["notes"])
 
 
+#: What a chain that emails the report can answer with — the mail error names
+#: the person's address.
+_ADDRESS = "someone@example.com"
+_REPLIES = (
+    [(500, f"send to {_ADDRESS} failed: 550 mailbox unavailable")],   # retried, gave up
+    [(400, f"invalid recipient {_ADDRESS}")],                         # refused
+    [(200, f'{{"p5": {{"ok": true, "sentTo": "{_ADDRESS}"}}}}')],    # ran
+)
+
+
+def _everything_the_drive_said(monkeypatch, answers, rid):
+    logged = []
+    monkeypatch.setattr(research, "log", lambda m, *a, **k: logged.append(str(m)))
+    _v, calls = _drive(answers=answers, rid=rid)
+    return "\n".join(logged + calls["notes"] + calls["failures"])
+
+
+@pytest.mark.parametrize("answers", _REPLIES)
+def test_a_run_that_keeps_nothing_files_the_status_and_not_the_reply(monkeypatch, answers):
+    """⛔⛔ THE REPLY OUTLIVES THE RUN (wave 10.9, last repair). Up to 160
+    characters of the route's answer rode `why` into the log, the run's folder
+    and the record, after the run had ended — and for a chain that sends the
+    report by email, that answer can be the mail error naming the person's
+    address. The status says what happened; the text is theirs."""
+    said = _everything_the_drive_said(monkeypatch, answers, "incog_1758400000000_1")
+
+    assert _ADDRESS not in said, said
+    assert f"HTTP {answers[0][0]}" in said, "the status went too — the line says nothing now"
+
+
+@pytest.mark.parametrize("answers", _REPLIES)
+def test_an_ordinary_run_still_quotes_the_reply(monkeypatch, answers):
+    """⭐ ACCEPT POLARITY — the reply is the diagnosis for everybody else."""
+    said = _everything_the_drive_said(monkeypatch, answers, "chat_1755500000000_1")
+
+    assert _ADDRESS in said
+
+
 def test_the_202_is_not_reported_as_a_dispatch():
     """⛔⛔ IT WAS LOGGED "dispatched ✓" (wave 10.9, 542-S4). A 202 means ANOTHER
     caller holds the claim — an open tab, or an earlier kick still running — so

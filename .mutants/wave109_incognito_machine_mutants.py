@@ -67,6 +67,7 @@ SUITES = ("tests/test_incognito_capability_109.py "
           "tests/test_cloud_handoff_record_108.py "
           "tests/test_incognito_fuse_renewal_109.py "
           "tests/test_incognito_backend_log_109.py "
+          "tests/test_late_writers_name_their_run_109.py "
           "tests/test_machine_log_scope_0824.py")
 RESEARCH = "research.py"
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
@@ -290,8 +291,20 @@ FORGET_UNLINK = ("        else:\n"
 LOG_CONSOLE = ("    if not _console_withholds_line():\n"
                "        _console_print(line)")
 CW_SCOPE = "    about_the_run = _LOG_SCOPE.get() != _LOG_SCOPE_MACHINE"
-CW_ARMED = '    armed = getattr(sink, "research_id", None)'
-CW_ANY = "        _is_incognito_research(rid) for rid in (armed, _fb_research_id) if rid)"
+# ⛔ THE ORIGIN, NOT WHAT IS ARMED (last repair). The rule used to read the armed
+# sink and `_fb_research_id`; B22/B23 put each of those back.
+CW_ORIGIN = "    origin = _LOG_RUN.get()"
+CW_RULE = "    return about_the_run and bool(origin) and _is_incognito_research(origin)"
+ORIGIN_SET = "            _origin = _LOG_RUN.set(_rid)"
+ORIGIN_RESET = "                _LOG_RUN.reset(_origin)"
+TEARDOWN_FINALLY = ("    try:\n"
+                    "        if _fb_listener:\n"
+                    "            _fb_listener.unsubscribe()\n"
+                    "            _fb_listener = None\n"
+                    "    finally:\n"
+                    "        _fb_uid = None\n"
+                    "        _fb_research_id = None\n"
+                    "        _fb_seq = 0")
 QUIET_NOTE = ("    if _is_incognito_research(_rid):\n"
               '        log(f"[incognito] {_rid[:8]}… keeps nothing')
 # ⛔ THE LINE ABOVE IS PART OF EACH SWEEP ANCHOR: the ZOMBIE and ABANDONED
@@ -309,9 +322,29 @@ RESCAN_ERR = ("claim error — skipping {(d.get('researchId') or '')[:8]}… \"\
 RESCAN_LOST = ("lost to sibling — skipping {(d.get('researchId') or '')[:8]}… \"\n"
                "                    f\"topic={_loggable_topic(d.get('topic'), d.get('researchId'))!r}")
 LOGIN_TITLE = "                    if not _is_incognito_research(_queue_dir_research_id(qdir)):"
-TITLE_WHOSE = "    _keeps_nothing = _is_incognito_research(_fb_research_id)"
-TITLE_WORDS = ("                    _anchor_words = (_BUNDLE_TOPIC_MARK if _keeps_nothing\n"
-               '                                     else ", ".join(_t_anchors[:6]))')
+# ── anchors: the late writers name their run (last repair) ─────────────────
+# ⛔ THE COMMENT LINE IS PART OF EACH SKIP ANCHOR: the title and the summary
+# open with the same capture and the same test at the same indent.
+TITLE_SKIP = ("    # worker is a model call on its private topic and findings that outlives it.\n"
+              "    if _is_incognito_research(_rid):\n"
+              "        return")
+SUMMARY_SKIP = ("    # member's /researches tile.\n"
+                "    _uid, _rid = _fb_uid, _fb_research_id\n"
+                "    if _is_incognito_research(_rid):\n"
+                "        return")
+TITLE_LOCK_READ = ("                    snap = _firebase_db.collection(\"users\").document(_uid) \\\n"
+                   "                        .collection(\"researches\").document(_rid).get()")
+TITLE_WRITE = ('                _update_research_doc(_uid, _rid, {"title": text, '
+               '"updatedAt": int(time.time() * 1000)})')
+TITLE_CARD = "                            if (_fb_uid, _fb_research_id) == (_uid, _rid):"
+SUMMARY_WRITE = '                _update_research_doc(_uid, _rid, {"summary": text})'
+META_DISPATCH = '            kwargs={"research": (_fb_uid, _fb_research_id)},'
+META_WRITE = ("        if research:\n"
+              "            _update_research_doc(_uid, _rid, _record)")
+META_PSTAT = "    _pstat = _phase_status_by_rid.get(_rid, {}) or {}"
+META_ASTAT = "        _astat = (_agent_status_by_rid.get(_rid, {}) or {}).get(platform) \\"
+# ── anchors: the route's reply is not quoted for a private run ─────────────
+REPLY_GATE = "    _quote_reply = not _is_incognito_research(research_id)"
 TB_GATE = ("    if _is_incognito_research(research_id):\n"
            "        for line in traceback.format_exc().rstrip().splitlines():\n"
            '            log(line, "ERROR")\n'
@@ -758,6 +791,12 @@ MUTANTS = [
      "snapshot is looked for under a sibling's name",
      [(SNAP_PATH_ONE, "    if WORKER_ID == 0:\n"
                       '        return root / "_pending_queue.json"')]),
+    ("S21", "under", "⛔⛔ the shed rewrites from an EMPTY queue — the private run "
+     "is gone from the file and so is every ordinary job still waiting behind "
+     "the head, whose queue documents the claim already deleted",
+     [(SHED_RESET, SHED_RESET.replace(
+         "_forget_pending_queue_snapshot(_pending_queue_snapshot_path(), job_queue)",
+         "_forget_pending_queue_snapshot(_pending_queue_snapshot_path(), None)"))]),
 
     # ══ the stop has to hold at BOTH ends ══════════════════════════════════
     ("A1", "over", "⛔⛔ the enqueue funnel accepts `stopped`, so the status a "
@@ -855,18 +894,37 @@ MUTANTS = [
      "nothing asks it, so a private run's topic, brief and pages reach the "
      "owner's log and support bundle",
      [(LOG_CONSOLE, "    _console_print(line)")]),
-    ("B2", "under", "⛔⛔ the rule stops asking the armed run, so every queued "
+    ("B2", "under", "⛔⛔ the rule stops asking the line's origin, so every "
      "private run prints its lines like any other",
-     [(CW_ARMED, "    armed = None")]),
-    ("B3", "under", "⛔ the second witness goes — a run whose folder could not be "
-     "armed prints everything",
-     [(CW_ANY, "        _is_incognito_research(rid) for rid in (armed,) if rid)")]),
+     [(CW_ORIGIN, "    origin = None")]),
+    ("B3", "under", "⛔⛔ the wrapper stops naming the run it runs — the rule is "
+     "perfect and no line ever carries an origin to judge",
+     [(ORIGIN_SET, "            _origin = _LOG_RUN.set(None)")]),
     ("B4", "over", "⛔⛔ the machine's own lines are withheld too, so a private run "
      "on a shared computer blinds its owner to the heartbeat and the sweeps",
      [(CW_SCOPE, "    about_the_run = True")]),
-    ("B5", "over", "⛔⛔ every armed run is withheld, so the owner's log loses every "
-     "ordinary run's account of itself",
-     [(CW_ANY, "        True for rid in (armed, _fb_research_id) if rid)")]),
+    ("B5", "over", "⛔⛔ every run with an origin is withheld, so the owner's log "
+     "loses every ordinary run's account of itself",
+     [(CW_RULE, "    return about_the_run and bool(origin)")]),
+    ("B22", "over", "⛔⛔ the rule goes back to asking what is ARMED when a line "
+     "is written, so an ordinary run's late hand-off and the owner's alarms "
+     "vanish while a private run is running",
+     [(CW_ORIGIN, '    origin = _LOG_RUN.get() or getattr(_active_run_sink(), '
+                  '"research_id", None)')]),
+    ("B23", "over", "⛔ the pipeline global comes back as a witness, so the run "
+     "that is running NOW decides whose line a stray thread wrote",
+     [(CW_ORIGIN, "    origin = _LOG_RUN.get() or _fb_research_id")]),
+    ("B24", "over", "the origin is never given back, so the line telling the "
+     "owner a private run ended is swallowed as the run's own",
+     [(ORIGIN_RESET, "                pass")]),
+    ("B25", "under", "⛔ a teardown that raises keeps the finished run's ids, "
+     "naming it to every global-target writer until the next setup",
+     [(TEARDOWN_FINALLY, "    if _fb_listener:\n"
+                         "        _fb_listener.unsubscribe()\n"
+                         "        _fb_listener = None\n"
+                         "    _fb_uid = None\n"
+                         "    _fb_research_id = None\n"
+                         "    _fb_seq = 0")]),
     ("B6", "under", "the gap is not explained — an hour of silence in the owner's "
      "log reads as a hung machine",
      [(QUIET_NOTE, "    if False:\n"
@@ -893,16 +951,62 @@ MUTANTS = [
     ("B13", "over", "`--login` stops naming any run, so the owner cannot tell "
      "which of their runs it is about to close",
      [(LOGIN_TITLE, "                    if False:")]),
-    ("B14", "under", "⛔ a late title refusal prints a private run's topic words",
-     [(TITLE_WHOSE, "    _keeps_nothing = False")]),
-    ("B15", "under", "⛔⛔ the worker asks whose run it is when it WRITES — by then "
-     "the run has returned, nobody knows, and the words go out",
-     [(TITLE_WORDS, "                    _anchor_words = (_BUNDLE_TOPIC_MARK if "
-                    "_is_incognito_research(_fb_research_id)\n"
-                    '                                     else ", ".join(_t_anchors[:6]))')]),
-    ("B16", "over", "every run's refusal line loses its anchors, which is the "
-     "one thing an operator reads it for",
-     [(TITLE_WHOSE, "    _keeps_nothing = True")]),
+    # ══ the late writers name their run (last repair) ══════════════════════
+    # ⛔ B14-B16 measured the anchor masking of a private run's title-refusal
+    # line. A private run now dispatches no refresh, so that code was deleted
+    # rather than left behind as a guard nothing can reach.
+    ("LW1", "under", "⛔⛔ a private run dispatches the title refresh again — a "
+     "model call on its topic and findings that outlives it, onto a record "
+     "that is purged",
+     [(TITLE_SKIP, "    # worker is a model call on its private topic and findings that outlives it.\n"
+                   "    if False:\n"
+                   "        return")]),
+    ("LW2", "under", "⛔⛔ the late title goes back through the globals — onto the "
+     "NEXT member's record, into their sidebar",
+     [(TITLE_WRITE, '                _update_firestore_research({"title": text, '
+                    '"updatedAt": int(time.time() * 1000)})')]),
+    ("LW3", "under", "the rename lock is read off the next member's record, so "
+     "one person's rename decides whether another's title is written",
+     [(TITLE_LOCK_READ, "                    snap = _firebase_db.collection(\"users\").document(_fb_uid) \\\n"
+                        "                        .collection(\"researches\").document(_fb_research_id).get()")]),
+    ("LW4", "under", "⛔⛔ the off-topic card is raised whoever is running now — "
+     "quoting one person's generated title in another person's chat",
+     [(TITLE_CARD, "                            if True:")]),
+    ("LW5", "over", "the off-topic card is never raised, even on the run that "
+     "is still going — the guard's whole reason to exist",
+     [(TITLE_CARD, "                            if False:")]),
+    ("LW6", "under", "⛔⛔ a private run dispatches the summary again — 'what the "
+     "research found', made from its findings, outliving it",
+     [(SUMMARY_SKIP, "    # member's /researches tile.\n"
+                     "    _uid, _rid = _fb_uid, _fb_research_id\n"
+                     "    if False:\n"
+                     "        return")]),
+    ("LW7", "under", "⛔⛔ the late summary goes back through the globals — onto "
+     "the next member's /researches tile",
+     [(SUMMARY_WRITE, '                _update_firestore_research({"summary": text})')]),
+    ("LW8", "under", "⛔⛔ the phase-3 meta thread names no research, so its "
+     "agents map — every agent's sources and findings — lands on whoever runs next",
+     [(META_DISPATCH, "            kwargs={},")]),
+    ("LW9", "under", "⛔ save_meta is handed the research and writes through the "
+     "globals anyway — the helper is perfect and nothing honours it",
+     [(META_WRITE, "        if False:\n"
+                   "            _update_research_doc(_uid, _rid, _record)")]),
+    ("LW10", "under", "the phase timeline is stamped with the NEXT run's phase "
+     "statuses",
+     [(META_PSTAT, "    _pstat = _phase_status_by_rid.get(_fb_research_id, {}) or {}")]),
+    ("LW11", "under", "the agents map is stamped with the NEXT run's agent "
+     "statuses",
+     [(META_ASTAT, "        _astat = (_agent_status_by_rid.get(_fb_research_id, {}) "
+                   "or {}).get(platform) \\")]),
+
+    # ══ the route's reply is not quoted for a private run (last repair) ════
+    ("F1", "under", "⛔⛔ a private run's hand-off quotes the route's reply again — "
+     "the mail error naming the person's address, logged and filed after the "
+     "run has ended",
+     [(REPLY_GATE, "    _quote_reply = True")]),
+    ("F2", "over", "no run quotes the route's reply, so an ordinary run's refusal "
+     "loses the one line that diagnoses it",
+     [(REPLY_GATE, "    _quote_reply = False")]),
     ("B17", "under", "⛔ a dying private run prints its traceback — and the "
      "exception's own text — to backend.err.log",
      [(TB_GATE, "    traceback.print_exc()")]),

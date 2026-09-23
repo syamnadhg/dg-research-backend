@@ -1746,12 +1746,19 @@ def _refresh_research_title_async(topic, brief_text="", findings_text=""):
     _findings = _corpus[:5000]
     if not _topic and not _brief and not _findings:
         return
-    # ⛔ WHOSE RUN THIS IS, read at DISPATCH (wave 10.9 repair). The worker is a
-    # raw thread that can still be writing after the run has returned — for a
-    # run that keeps nothing phases 3 and 4 are off, so it ends seconds after
-    # this — and by then neither the run folder nor `_fb_research_id` says whose
-    # line it is. Its refusal lines print the topic's own words.
-    _keeps_nothing = _is_incognito_research(_fb_research_id)
+    # ⛔⛔ WHOSE RESEARCH THIS IS, read at DISPATCH (wave 10.9, last repair). The
+    # worker is a raw thread with a model call in front of its write, and the
+    # run can end while that call is out: teardown clears the pipeline globals,
+    # the worker dequeues the next member's run at once, and setup points them
+    # at THAT person's research. Read at write time, this run's title — made
+    # from its topic and findings — went onto their record, into their sidebar.
+    # So the worker reads and writes the research that dispatched it, by name.
+    _uid, _rid = _fb_uid, _fb_research_id
+    # ⛔ AND A RUN THAT KEEPS NOTHING DISPATCHES NO REFRESH AT ALL. Its record is
+    # purged when it ends, so a better name is worth nothing to it — and the
+    # worker is a model call on its private topic and findings that outlives it.
+    if _is_incognito_research(_rid):
+        return
 
     def _worker():
         try:
@@ -1761,10 +1768,10 @@ def _refresh_research_title_async(topic, brief_text="", findings_text=""):
             # post-P2 with richer findings. Asymmetric with the FE startup
             # /api/title (which has its own heuristic guard) — both honor
             # the lock.
-            if _firebase_db and _fb_uid and _fb_research_id:
+            if _firebase_db and _uid and _rid:
                 try:
-                    snap = _firebase_db.collection("users").document(_fb_uid) \
-                        .collection("researches").document(_fb_research_id).get()
+                    snap = _firebase_db.collection("users").document(_uid) \
+                        .collection("researches").document(_rid).get()
                     if snap.exists:
                         data = snap.to_dict() or {}
                         if bool(data.get("titleLocked")):
@@ -1813,38 +1820,43 @@ def _refresh_research_title_async(topic, brief_text="", findings_text=""):
                     # this line is read for; the title itself is on the research
                     # doc. ⭐ The anchors stay, for the reason the Phase 1 gate
                     # gives, and the bundle takes them out of the copy that
-                    # travels. ⛔ Except for a run that keeps nothing, whose
-                    # anchors are its subject and whose line can land after the
-                    # run — outside every net the run itself has.
-                    _anchor_words = (_BUNDLE_TOPIC_MARK if _keeps_nothing
-                                     else ", ".join(_t_anchors[:6]))
+                    # travels. (A run that keeps nothing never gets here — it
+                    # dispatches no refresh.)
+                    _anchor_words = ", ".join(_t_anchors[:6])
                     if _verdict == "refuse_loud":
                         log(f"[title-refresh] REFUSING the generated title "
                             f"({len(text)} chars) — it shares none of the topic's "
                             f"distinctive terms ({_anchor_words}), AND "
                             f"neither does the corpus it was written from. The "
                             f"research went off-topic.", "ERROR")
+                        # ⛔⛔ ONLY WHILE THIS RUN IS STILL THE ONE RUNNING.
+                        # `emit_event` writes to whatever research the globals
+                        # name NOW, and this card quotes the generated title —
+                        # after the run has ended it would land in the next
+                        # member's chat. A card about a run that has ended is
+                        # one nobody reads, so it is simply not raised.
                         try:
-                            emit_event(
-                                "pipeline_warning", phase=2,
-                                # `message=`, not `error=`: the web app's warning
-                                # branch reads message/warning and falls back to
-                                # the literal string "Backend warning", which is
-                                # what the user saw on the card.
-                                message="The findings may not match your topic",
-                                details=(f"We named this research from its own findings "
-                                         f"and got \"{text}\", which does not mention "
-                                         f"your topic at all — and neither does the "
-                                         f"research it was written from. One of the "
-                                         f"agents may have reported on something else."),
-                                # Explicit empty list, not omitted: the web app
-                                # invents a [Skip] for a phase alert whose actions
-                                # are undefined, and phase 2 is already Complete
-                                # by the time this can fire — there is nothing to
-                                # skip. `[]` means "informational", and it is what
-                                # every other warning in this file already passes.
-                                actions=[], alert_id="phase2_topic_mismatch",
-                                alertType="warn", dismissible=True)
+                            if (_fb_uid, _fb_research_id) == (_uid, _rid):
+                                emit_event(
+                                    "pipeline_warning", phase=2,
+                                    # `message=`, not `error=`: the web app's warning
+                                    # branch reads message/warning and falls back to
+                                    # the literal string "Backend warning", which is
+                                    # what the user saw on the card.
+                                    message="The findings may not match your topic",
+                                    details=(f"We named this research from its own findings "
+                                             f"and got \"{text}\", which does not mention "
+                                             f"your topic at all — and neither does the "
+                                             f"research it was written from. One of the "
+                                             f"agents may have reported on something else."),
+                                    # Explicit empty list, not omitted: the web app
+                                    # invents a [Skip] for a phase alert whose actions
+                                    # are undefined, and phase 2 is already Complete
+                                    # by the time this can fire — there is nothing to
+                                    # skip. `[]` means "informational", and it is what
+                                    # every other warning in this file already passes.
+                                    actions=[], alert_id="phase2_topic_mismatch",
+                                    alertType="warn", dismissible=True)
                         except Exception:
                             pass
                     else:
@@ -1860,7 +1872,7 @@ def _refresh_research_title_async(topic, brief_text="", findings_text=""):
                             f"— no alert raised.", "WARN")
                     text = ""
             if text:
-                _update_firestore_research({"title": text, "updatedAt": int(time.time() * 1000)})
+                _update_research_doc(_uid, _rid, {"title": text, "updatedAt": int(time.time() * 1000)})
         except Exception as e:
             try:
                 log(f"[title-refresh] worker failed: {e}", "WARN")
@@ -2038,13 +2050,20 @@ def _generate_research_summary_async(topic, brief_text="", findings_text=""):
     _findings = (findings_text or "").strip()[:5000]
     if not _topic and not _brief and not _findings:
         return
+    # ⛔⛔ WHOSE RESEARCH THIS IS, read at DISPATCH, and no summary at all for a
+    # run that keeps nothing — see `_refresh_research_title_async`. A summary is
+    # "what the research found": written at write time, it landed on the next
+    # member's /researches tile.
+    _uid, _rid = _fb_uid, _fb_research_id
+    if _is_incognito_research(_rid):
+        return
 
     def _worker():
         try:
             text = _try_llm_summary(_topic, _brief, _findings) or _fallback_summary(_topic, _brief, _findings)
             text = _shape_summary(text)
             if text:
-                _update_firestore_research({"summary": text})
+                _update_research_doc(_uid, _rid, {"summary": text})
         except Exception as e:
             try:
                 log(f"[summary] worker failed: {e}", "WARN")
@@ -3441,6 +3460,11 @@ import contextlib as _log_contextlib  # noqa: E402
 
 _LOG_SCOPE_MACHINE = "machine"
 _LOG_SCOPE = _log_contextvars.ContextVar("sr_log_scope", default="")
+#: The research a line is written FOR — its origin, not whatever run is armed
+#: when it is written. Set by `run_pipeline_captured` around the pipeline, and
+#: carried by every task and `to_thread` hop the pipeline makes, because a
+#: context goes wherever its work goes. See `_console_withholds_line`.
+_LOG_RUN = _log_contextvars.ContextVar("sr_log_run", default=None)
 
 
 @_log_contextlib.contextmanager
@@ -3556,31 +3580,30 @@ def _console_withholds_line() -> bool:
     a time would miss the next one somebody writes, so the decision is made
     once, here.
 
-    ⭐ WITH THE ATTRIBUTION THE RUN FOLDER ALREADY USES: the armed sink, and a
-    line inside the machine scope is never the run's. So the heartbeat, the
-    sweeps and the start listener keep reaching the owner's log while a private
-    run is armed, and exactly what the folder takes, the console gives up.
+    ⛔⛔ DECIDED BY THE LINE'S ORIGIN — `_LOG_RUN` — AND NEVER BY WHAT IS ARMED
+    WHEN IT IS WRITTEN (wave 10.9, last repair). The first version asked the
+    armed sink and the pipeline's `_fb_research_id`, i.e. which run was running
+    NOW, and a write-time question has three wrong answers: an ordinary run's
+    late hand-off lines were swallowed because the NEXT run was private; the
+    owner's alarms — the relink notice before the process exits, Reset
+    Backend's record of stopping other members' jobs, the outage notices — went
+    only into a private run's folder, which leaves with it; and a teardown that
+    raised left `_fb_research_id` naming a finished run, silencing the machine
+    for hours. The origin is set where the run's work begins and travels with
+    that work through every task and `to_thread` hop, so a line knows whose it
+    is wherever it lands. A line with no run origin — a loop the server
+    started, an SDK callback, a raw thread — is the machine's, and prints.
 
-    ⭐ THE RUNNING PIPELINE'S OWN ID IS THE SECOND WITNESS. The capture never
-    raises into a run, so a disk that refused the run folder arms no sink at
-    all — and without this every line of that run would reach the console.
+    ⭐ The machine scope still wins: a line inside it is never the run's, even
+    when the run's own call stack wrote it.
 
     ⛔ AN ABSENT ID IS NEVER ASKED ABOUT. This runs for every line the process
     writes, from inside every exception handler in the file; the predicate is
     only handed an id that exists, so no answer about "no run" can ever make
-    `log()` itself raise.
-
-    ⚠ THE COST, SAID OUT LOUD: while a run that keeps nothing is armed, the
-    unmarked loops that explain a run's fate — the reconnect loop, the revoked
-    credential, the device commands, the worker watchdog — write only into that
-    run's folder, which leaves with it. `run_pipeline_captured` says in the
-    owner's log that the run is quiet on purpose, so the gap is not read as a
-    hang."""
+    `log()` itself raise."""
     about_the_run = _LOG_SCOPE.get() != _LOG_SCOPE_MACHINE
-    sink = _RUN_LOG_SINKS[-1] if _RUN_LOG_SINKS else None
-    armed = getattr(sink, "research_id", None)
-    return about_the_run and any(
-        _is_incognito_research(rid) for rid in (armed, _fb_research_id) if rid)
+    origin = _LOG_RUN.get()
+    return about_the_run and bool(origin) and _is_incognito_research(origin)
 
 
 def _log_write_through(line: str, level: str) -> None:
@@ -16600,14 +16623,21 @@ def setup_firestore_run(uid, research_id, loop=None, run_id=None):
 
 
 def teardown_firestore_run():
-    """Clean up per-run Firestore state."""
+    """Clean up per-run Firestore state.
+
+    ⛔ THE RUN'S IDS ARE CLEARED EVEN WHEN THE UNSUBSCRIBE RAISES (wave 10.9,
+    last repair). `run_pipeline`'s finally survives that raise on purpose, and
+    the ids used to stay behind it — naming a run that had ended, to every
+    global-target writer, until the next run's setup hours later."""
     global _fb_uid, _fb_research_id, _fb_seq, _fb_listener
-    if _fb_listener:
-        _fb_listener.unsubscribe()
-        _fb_listener = None
-    _fb_uid = None
-    _fb_research_id = None
-    _fb_seq = 0
+    try:
+        if _fb_listener:
+            _fb_listener.unsubscribe()
+            _fb_listener = None
+    finally:
+        _fb_uid = None
+        _fb_research_id = None
+        _fb_seq = 0
 
 
 _exit_scheduled = False
@@ -18654,6 +18684,12 @@ def _drive_cloud_phases(uid, research_id, *, post, mint_token, sleep, note,
     # happened to use up.
     _p5_only = False
     _attempt = 0
+    # ⛔⛔ THE ROUTE'S REPLY IS NOT QUOTED FOR A RUN THAT KEEPS NOTHING (wave
+    # 10.9, last repair). `why` is logged and filed after the run has ended,
+    # and the reply of a chain that sends the report by email can carry the
+    # mail error — which names the person's address. The status says what
+    # happened; the text is theirs.
+    _quote_reply = not _is_incognito_research(research_id)
     while _attempt < attempts:
         _attempt += 1
         _elapsed = 0
@@ -18666,7 +18702,8 @@ def _drive_cloud_phases(uid, research_id, *, post, mint_token, sleep, note,
             try:
                 _status, _text = post(id_token, _p5_only)
                 verdict = _dispatch_verdict(status_code=_status)
-                why = f"HTTP {_status}" + (f" ({str(_text)[:160]})" if _text else "")
+                why = f"HTTP {_status}" + (f" ({str(_text)[:160]})"
+                                           if _text and _quote_reply else "")
             except Exception as _e:
                 _elapsed = int(time.monotonic() - _t0)
                 verdict = _dispatch_verdict(exc=_e, elapsed_sec=_elapsed)
@@ -68399,9 +68436,15 @@ def _downsample_progress_history(raw, cap=60):
     return out
 
 
-def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
+def save_meta(queue_dir, topic, phase, status="ongoing", *, research=None, **extra):
     """Save/update meta.json — powers ALL frontend components (graphs, analytics, tracking).
-    Contains: Research object + per-agent stats + phase timeline + source references."""
+    Contains: Research object + per-agent stats + phase timeline + source references.
+
+    ⛔ `research` is `(uid, research_id)` for a caller that can still be running
+    after its run has ended — the phase-3 thread (`_save_meta_in_background`).
+    Without it the record is whichever one the pipeline globals name when the
+    write happens, which by then can be the next member's."""
+    _uid, _rid = research if research else (_fb_uid, _fb_research_id)
     queue_dir = Path(queue_dir)
     meta_path = queue_dir / "meta.json"
     meta = {}
@@ -68634,7 +68677,7 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
         # entry to hold the status. Config-disabled agents never call
         # _write_agent_terminal_status and have no md, so _astat stays falsy →
         # no spurious entry is created for them.
-        _astat = (_agent_status_by_rid.get(_fb_research_id, {}) or {}).get(platform) \
+        _astat = (_agent_status_by_rid.get(_rid, {}) or {}).get(platform) \
             or _prior_agent_status.get(platform)
         if _astat:
             agents.setdefault(platform, {})["status"] = _astat
@@ -68726,7 +68769,7 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
     # write) would be lost unless we re-stamp it here. Only overwrite when the
     # runtime knows a status for that phase; otherwise leave any status already
     # carried in meta.json (resume) intact.
-    _pstat = _phase_status_by_rid.get(_fb_research_id, {}) or {}
+    _pstat = _phase_status_by_rid.get(_rid, {}) or {}
     for _entry in phases:
         if isinstance(_entry, dict):
             _ps = _pstat.get(_entry.get("phase"))
@@ -68753,16 +68796,42 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
     # Without this, the frontend Analytics page never sees per-agent stats or
     # phase timelines for live runs — they live only on disk. Uses a shallow
     # update so we don't clobber other fields (like pipelineConfig).
+    _record = {
+        "agents": agents,
+        "phases": phases,
+        "status": status,
+        "phase": phase,
+        "updatedAt": now_ms,
+    }
     try:
-        _update_firestore_research({
-            "agents": agents,
-            "phases": phases,
-            "status": status,
-            "phase": phase,
-            "updatedAt": now_ms,
-        })
+        if research:
+            _update_research_doc(_uid, _rid, _record)
+        else:
+            _update_firestore_research(_record)
     except Exception as _e:
         log(f"save_meta: firestore propagation failed: {_e}", "WARN")
+
+
+def _save_meta_in_background(queue_dir, topic, phase) -> None:
+    """`save_meta` on a daemon thread, for the research running NOW.
+
+    ⛔⛔ THE THREAD OUTLIVES THE RUN (wave 10.9, last repair). Phase 3 hands this
+    off so the ffprobe per podcast (~5 s a file) does not hold up
+    `phase_complete`, and the run hands phases 4 and 5 to the cloud and returns
+    moments later — teardown, the next member's run dequeued, setup. Asked at
+    write time, the thread wrote this run's agents map — every agent's sources
+    and findings — onto THAT person's record. The research is named here, at
+    dispatch."""
+    try:
+        _threading.Thread(
+            target=save_meta,
+            args=(queue_dir, topic, phase),
+            kwargs={"research": (_fb_uid, _fb_research_id)},
+            name=f"p{phase}-savemeta-ffprobe",
+            daemon=True,
+        ).start()
+    except Exception as _smt_e:
+        log(f"[Phase {phase}] failed to dispatch save_meta thread: {_smt_e}", "WARN")
 
 
 def _handed_off_to_cloud(queue_dir) -> bool:
@@ -73336,15 +73405,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # waiting on this and the P3→P4 transition looked stuck for
             # ~5s. save_meta only enriches meta.json with audio duration;
             # no downstream phase reads from meta.json synchronously.
-            try:
-                _threading.Thread(
-                    target=save_meta,
-                    args=(queue_dir, topic, 3),
-                    name="p3-savemeta-ffprobe",
-                    daemon=True,
-                ).start()
-            except Exception as _smt_e:
-                log(f"[Phase 3] failed to dispatch save_meta thread: {_smt_e}", "WARN")
+            # ⛔ And it names THIS research for its write — see the helper.
+            _save_meta_in_background(queue_dir, topic, 3)
             # Build Phase 3 links — include both notebook and audio overview
             # Only include links that pass validation (no fake/placeholder URLs)
             _p3_links = []
@@ -74062,7 +74124,14 @@ async def run_pipeline_captured(*args, **kwargs):
     try:
         with _RunLogCapture(research_id=_rid, attempt=_attempt,
                             submitted_by=_submitter, claimed_by=_claimed):
-            return await run_pipeline(*args, **kwargs)
+            # ⭐ THE RUN'S ORIGIN, around exactly the run's own work — so the
+            # capture's own lines and the purge's line below stay the
+            # machine's, and a disk that refused the folder still names the run.
+            _origin = _LOG_RUN.set(_rid)
+            try:
+                return await run_pipeline(*args, **kwargs)
+            finally:
+                _LOG_RUN.reset(_origin)
     finally:
         # ⛔⛔ AND NOW THE FOLDERS GO, for a run that keeps nothing (wave 10.9,
         # #536). Here rather than at the end of the pipeline body for three

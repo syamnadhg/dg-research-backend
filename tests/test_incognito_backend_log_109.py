@@ -23,8 +23,10 @@ the real thing and is paired with the ordinary run, whose lines must not move.
 Run:  pytest tests/test_incognito_backend_log_109.py -v
 """
 import asyncio
+import contextlib
 import json
 import os
+import threading
 import time
 import types
 
@@ -60,6 +62,7 @@ class _Sink:
 @pytest.fixture(autouse=True)
 def _nothing_armed(monkeypatch):
     """No run armed and no pipeline running, unless the test says so."""
+    assert research._LOG_RUN.get() is None, "a test before this one leaked a run origin"
     saved = list(research._RUN_LOG_SINKS)
     research._RUN_LOG_SINKS.clear()
     monkeypatch.setattr(research, "_fb_research_id", None)
@@ -74,13 +77,25 @@ def _arm(research_id):
     return sink
 
 
+@contextlib.contextmanager
+def _running(research_id, *, arm=True):
+    """A run's own work, framed the way `run_pipeline_captured` frames it: its
+    folder armed, and its ORIGIN set — which is what the console decides by."""
+    sink = _arm(research_id) if arm else None
+    token = research._LOG_RUN.set(research_id)
+    try:
+        yield sink
+    finally:
+        research._LOG_RUN.reset(token)
+
+
 # ══ 1. the console decides, through the real `log()` ══════════════════════
 
 def test_an_ordinary_run_still_prints_every_line_it_writes(capsys):
     """⭐ ACCEPT POLARITY FIRST. A console rule that swallowed everything would
     pass every refusal below and leave the owner a log with nothing in it."""
-    sink = _arm(CHAT)
-    research.log(f"Phase 2: off-topic sweep is INERT this run: topic {SECRET!r}")
+    with _running(CHAT) as sink:
+        research.log(f"Phase 2: off-topic sweep is INERT this run: topic {SECRET!r}")
 
     assert SECRET in capsys.readouterr().out
     assert SECRET in "\n".join(sink.lines)
@@ -90,8 +105,8 @@ def test_a_line_a_run_that_keeps_nothing_writes_stays_out_of_backend_log(capsys)
     """⛔⛔ THE DEFECT. Every line the run writes was printed to the worker's
     stdout — which IS `backend.log` — as well as into the run's own folder, and
     only the folder is removed when the run ends."""
-    sink = _arm(INCOG)
-    research.log(f"Phase 2: off-topic sweep is INERT this run: topic {SECRET!r}")
+    with _running(INCOG) as sink:
+        research.log(f"Phase 2: off-topic sweep is INERT this run: topic {SECRET!r}")
 
     _says_nothing_of_it(capsys.readouterr().out)
     # ⭐ AND THE RUN STILL HAS ITS OWN ACCOUNT, in the folder that leaves with it.
@@ -103,28 +118,28 @@ def test_a_machine_line_written_while_it_runs_still_reaches_backend_log(capsys):
     """⭐ THE MACHINE'S OWN LINES ARE NOT THE RUN'S. The heartbeat, the sweeps
     and the start listener write inside the machine scope, and the owner's log
     must keep them — a private run on a shared computer cannot blind its owner
-    to what the computer is doing."""
-    _arm(INCOG)
-    with research._machine_log_scope():
-        research.log("[heartbeat] device doc refreshed")
+    to what the computer is doing. The scope wins even inside the run's own
+    call stack."""
+    with _running(INCOG):
+        with research._machine_log_scope():
+            research.log("[heartbeat] device doc refreshed")
 
     assert "[heartbeat] device doc refreshed" in capsys.readouterr().out
 
 
-def test_a_run_whose_folder_could_not_be_armed_is_still_recognised(capsys, monkeypatch):
+def test_a_run_with_no_folder_is_still_recognised_by_its_origin(capsys):
     """⛔ THE CAPTURE NEVER RAISES INTO THE RUN, so a disk that refused the run
-    folder leaves no sink at all — and every line of that run would have gone
-    to `backend.log`. The pipeline's own research id is the second witness."""
-    monkeypatch.setattr(research, "_fb_research_id", INCOG)
-    research.log(f"Phase 1: Injecting user feedback: {SECRET}")
+    folder leaves no sink at all. The origin does not depend on the folder."""
+    with _running(INCOG, arm=False):
+        research.log(f"Phase 1: Injecting user feedback: {SECRET}")
 
     _says_nothing_of_it(capsys.readouterr().out)
 
 
-def test_the_second_witness_still_prints_an_ordinary_run(capsys, monkeypatch):
-    """⭐ ACCEPT POLARITY for the witness above."""
-    monkeypatch.setattr(research, "_fb_research_id", CHAT)
-    research.log(f"Phase 1: Injecting user feedback: {SECRET}")
+def test_an_ordinary_origin_with_no_folder_still_prints(capsys):
+    """⭐ ACCEPT POLARITY for the case above."""
+    with _running(CHAT, arm=False):
+        research.log(f"Phase 1: Injecting user feedback: {SECRET}")
 
     assert SECRET in capsys.readouterr().out
 
@@ -376,19 +391,24 @@ def test_login_still_names_an_ordinary_run_by_its_title(tmp_path, monkeypatch):
 
 # ══ 5. a thread the run leaves behind ═════════════════════════════════════
 #
-# ⛔ THE FOLDER'S ATTRIBUTION ENDS WHEN THE RUN DOES. A raw thread the pipeline
-# spawned and that is still writing after the run has returned reaches
-# `backend.log` as a machine line — and for a run that keeps nothing, phases 3
-# and 4 are off, so the run ends seconds after the title refresh is dispatched.
+# ⛔ A RAW THREAD CARRIES NO RUN'S ORIGIN, so its lines are the machine's and
+# reach `backend.log` — and for a run that keeps nothing, phases 3 and 4 are
+# off, so the run ends seconds after the title refresh is dispatched. Such a run
+# dispatches no refresh at all (its record is purged, and the model call on its
+# topic would outlive it); where its words could go is pinned in
+# `test_late_writers_name_their_run_109.py`.
 
 class _LateThread:
     """Runs the worker when started — AFTER the run has ended, which is when a
-    slow title model answers for a run that keeps nothing."""
+    slow title model answers."""
+
+    started: "list" = []
 
     def __init__(self, target=None, **_kw):
         self._target = target
 
     def start(self):
+        _LateThread.started.append(self._target)
         research._fb_research_id = None
         self._target()
 
@@ -399,11 +419,12 @@ def test_a_late_title_refusal_names_no_incognito_topic_words(
         monkeypatch, logged, rid, verdict):
     """The refusal lines print the topic's distinctive WORDS — the anchors — so
     an operator can see why a title was thrown away. For a run that keeps
-    nothing those words are its subject."""
+    nothing those words are its subject, and it starts no refresh to print them."""
     monkeypatch.setattr(research, "_firebase_db", None)
     monkeypatch.setattr(research, "_try_llm_title", lambda *a, **k: "Golden Retriever Care")
     monkeypatch.setattr(research, "title_refusal_verdict", lambda *a, **k: verdict)
     monkeypatch.setattr(research, "emit_event", lambda *a, **k: None)
+    monkeypatch.setattr(_LateThread, "started", [])
     monkeypatch.setattr(research, "_threading",
                         types.SimpleNamespace(Thread=_LateThread))
     monkeypatch.setattr(research, "_fb_research_id", rid)
@@ -411,10 +432,11 @@ def test_a_late_title_refusal_names_no_incognito_topic_words(
     research._refresh_research_title_async(SECRET, "", "findings")
     blob = "\n".join(logged)
 
-    assert "[title-refresh]" in blob, "the refusal branch was not reached"
     if rid == INCOG:
+        assert _LateThread.started == [], "a run that keeps nothing started a refresh"
         _says_nothing_of_it(blob)
     else:
+        assert "[title-refresh]" in blob, "the refusal branch was not reached"
         assert "divorce, settlement" in blob, "an ordinary refusal lost its anchors"
 
 
@@ -477,3 +499,192 @@ def test_an_ordinary_run_still_prints_its_traceback_to_stderr(
     err = capsys.readouterr().err
 
     assert "Traceback" in err and SECRET in err
+
+
+# ══ 7. a line belongs to the run it was written FOR (last repair) ══════════
+#
+# ⛔⛔ THE FIRST RULE ASKED WHICH RUN WAS ARMED NOW. Every line written while a
+# private run was running was treated as that run's — an ordinary run's late
+# hand-off, the owner's alarms, Reset Backend's record of stopping other
+# people's jobs — and a teardown that raised kept a finished run's id alive to
+# silence the machine for hours. The rule now asks where the line CAME FROM.
+# Each case below drives the real `run_pipeline_captured`, with a body that
+# sets the run up with the real `setup_firestore_run`/`teardown_firestore_run`
+# exactly as `run_pipeline` does, and fails against the previous commit.
+
+RUN_ID = "incognito_1758400000000_7_20260922_101500"
+
+
+def _a_run_with(monkeypatch, tmp_path, rid, during):
+    """The REAL `run_pipeline_captured` for `rid`, whose body sets the run up,
+    awaits `during()` while it runs, and tears it down."""
+    monkeypatch.setattr(research, "__file__", str(tmp_path / "research.py"))
+    monkeypatch.setattr(research, "_firebase_db", None)
+
+    async def _body(*_a, **_k):
+        research.setup_firestore_run(SHARER, rid)
+        try:
+            await during()
+        finally:
+            research.teardown_firestore_run()
+
+    monkeypatch.setattr(research, "run_pipeline", _body)
+    return research.run_pipeline_captured(
+        topic=SECRET, research_id=rid, uid=SHARER, run_id=RUN_ID)
+
+
+def test_an_ordinary_runs_late_hand_off_still_reaches_backend_log_while_a_private_run_runs(
+        tmp_path, monkeypatch, capsys):
+    """⛔⛔ THE REVIEWER'S CASE. Member A's ordinary run ends and its P4/P5
+    drive — a raw thread — keeps the POST open for minutes. The worker dequeues
+    member B's private run at once. Every line the drive then wrote was judged
+    by B's run: kept off `backend.log` and written into B's folder, which is
+    deleted when B ends — so a drive that failed for an ORDINARY run left no
+    record anywhere. It is the real drive, started before B, writing while B
+    runs."""
+    private_is_running = threading.Event()
+    drive_is_done = threading.Event()
+
+    def _ordinary_drive():
+        private_is_running.wait(10)
+        try:
+            research._drive_cloud_phases(
+                SHARER, CHAT, post=lambda *_a: (503, "busy"),
+                mint_token=lambda: "tok", sleep=lambda _s: None,
+                note=lambda _l: None, record_failure=lambda _r: None)
+        finally:
+            drive_is_done.set()
+
+    threading.Thread(target=_ordinary_drive, daemon=True).start()
+
+    async def _during():
+        private_is_running.set()
+        await asyncio.to_thread(drive_is_done.wait, 10)
+
+    asyncio.run(_a_run_with(monkeypatch, tmp_path, INCOG, _during))
+    out = capsys.readouterr().out
+
+    assert drive_is_done.is_set(), "the ordinary run's drive never finished"
+    assert "P4/P5 gave up" in out and f"rid={CHAT[:8]}" in out, (
+        f"the ordinary run's hand-off went missing from backend.log:\n{out}")
+
+
+def test_the_owners_alarm_from_a_standing_loop_reaches_backend_log_while_a_private_run_runs(
+        tmp_path, monkeypatch, capsys):
+    """⛔⛔ THE RELINK NOTICE BEFORE THE PROCESS EXITS. `run_server` starts the
+    revoked-credential loop, the reconnect loop and the device-command listener
+    — none of them is a run's work, and while a private run was armed their
+    lines went only into its folder. The owner's last line before `os._exit`
+    was written nowhere they could read."""
+    relink = ("[relink] giving up — this serve is stopping now; nothing on this "
+              "computer will restart it")
+
+    async def _server():
+        started, said = asyncio.Event(), asyncio.Event()
+
+        async def _standing_loop():      # started by the server, not by a run
+            await started.wait()
+            research.log(relink, "ERROR")
+            said.set()
+
+        task = asyncio.create_task(_standing_loop())
+
+        async def _during():
+            started.set()
+            await said.wait()
+
+        await _a_run_with(monkeypatch, tmp_path, INCOG, _during)
+        await task
+
+    asyncio.run(_server())
+
+    assert relink in capsys.readouterr().out
+
+
+def test_a_teardown_that_raises_still_lets_go_of_the_run(monkeypatch, capsys):
+    """⛔ `run_pipeline`'s finally survives an unsubscribe that raises, on
+    purpose — and the run's ids stayed behind it, naming a finished private run
+    to everything that asks, until the next run's setup hours later."""
+    class _Stuck:
+        def unsubscribe(self):
+            raise RuntimeError("the listen stream was already closed")
+
+    monkeypatch.setattr(research, "_fb_uid", SHARER)
+    monkeypatch.setattr(research, "_fb_research_id", INCOG)
+    monkeypatch.setattr(research, "_fb_listener", _Stuck())
+
+    with pytest.raises(RuntimeError):
+        research.teardown_firestore_run()
+
+    assert (research._fb_uid, research._fb_research_id) == (None, None), (
+        "a teardown that raised left the finished run's ids behind")
+    research.log("[reconnect] Firestore unreachable — retrying in 30s", "WARN")
+    assert "[reconnect] Firestore unreachable" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("rid", [INCOG, CHAT])
+def test_every_hop_of_the_runs_own_work_carries_its_origin(
+        tmp_path, monkeypatch, capsys, rid):
+    """⭐ THE ORIGIN GOES WHERE THE WORK GOES — a task the pipeline creates and a
+    `to_thread` hop it makes are still the run's, in both directions."""
+    async def _a_task():
+        research.log(f"task: {SECRET}")
+
+    async def _during():
+        research.log(f"direct: {SECRET}")
+        await asyncio.to_thread(research.log, f"to_thread: {SECRET}")
+        await asyncio.create_task(_a_task())
+
+    asyncio.run(_a_run_with(monkeypatch, tmp_path, rid, _during))
+    out = capsys.readouterr().out
+    [run_log] = list(research._runs_log_root().glob("*/run.log"))
+    kept = run_log.read_text(encoding="utf-8")
+
+    for hop in ("direct", "to_thread", "task"):
+        assert f"{hop}: {SECRET}" in kept, f"the run's folder lost its {hop} line"
+        if rid == INCOG:
+            assert f"{hop}: " not in out, f"the private run's {hop} line reached backend.log"
+        else:
+            assert f"{hop}: {SECRET}" in out, f"an ordinary run's {hop} line went missing"
+
+
+def test_a_private_run_whose_folder_was_refused_keeps_its_lines_out_anyway(
+        tmp_path, monkeypatch, capsys):
+    """⛔ THE CAPTURE NEVER RAISES INTO A RUN, so a disk that refused the folder
+    arms nothing — and the pipeline's first lines come before its Firestore
+    setup. Neither is what says whose line it is. ⭐ And the machine's own line
+    about its disk is still the owner's."""
+    monkeypatch.setattr(research, "__file__", str(tmp_path / "research.py"))
+
+    def _refused():
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(research, "_runs_log_root", _refused)
+
+    async def _body(*_a, **_k):
+        research.log(f"Topic: {SECRET}")
+
+    monkeypatch.setattr(research, "run_pipeline", _body)
+    asyncio.run(research.run_pipeline_captured(
+        topic=SECRET, research_id=INCOG, uid=SHARER, run_id=RUN_ID))
+    out = capsys.readouterr().out
+
+    _says_nothing_of_it(out)
+    assert "capture unavailable for this run" in out
+
+
+def test_the_owner_is_told_a_private_run_ended(tmp_path, monkeypatch, capsys):
+    """⭐ "TOLD A RUN HAPPENED, NEVER ITS TOPIC" — the other half. The run's
+    origin ends with the run's work, so the line saying its folders were taken
+    off this computer is the machine's and reaches the owner."""
+    async def _during():
+        queue_dir = tmp_path / "queues" / RUN_ID
+        queue_dir.mkdir(parents=True, exist_ok=True)
+        (queue_dir / "delivery.json").write_text(
+            json.dumps({"status": "completed"}), encoding="utf-8")
+
+    asyncio.run(_a_run_with(monkeypatch, tmp_path, INCOG, _during))
+    out = capsys.readouterr().out
+
+    assert f"[incognito] {INCOG[:8]}… ended — its run folder" in out, out
+    _says_nothing_of_it(out)

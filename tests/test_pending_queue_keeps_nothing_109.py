@@ -409,22 +409,37 @@ class _Lock:
         return False
 
 
-def _cancel_while_it_waits(monkeypatch, tmp_path, waiting, *, resetting=False):
+def _queued(n):
+    """Somebody else's ordinary run, waiting its turn on this worker — written
+    whole, because the claim deleted its queue document and this file is the
+    only description of it left."""
+    return {**_job(f"chat_17584000000{n:02d}_9", run_id=f"ordinary_{n}_20260922"),
+            "uid": "uid-other", "submitted_by": "uid-other",
+            "topic": f"a queued ordinary topic {n}", "email": "other@example.com",
+            "brief_text": ""}
+
+
+def _cancel_while_it_waits(monkeypatch, tmp_path, waiting, *, resetting=False,
+                           ahead=(), behind=()):
     """The REAL start listener, holding `waiting` in its deque behind a running
-    job, with the snapshot the worker wrote when it claimed that job — then the
-    person's cancel (which is also what leaving their chat sends)."""
+    job — with anybody else's jobs `ahead` of it and `behind` it — and the
+    snapshot the worker wrote when it claimed that job; then the person's
+    cancel (which is also what leaving their chat sends)."""
+    queue = [*ahead, waiting, *behind]
     lis = Listener(monkeypatch, tmp_path, owner="uid-owner",
-                   current_job=_running(), deque_jobs=[waiting])
+                   current_job=_running(), deque_jobs=queue)
     lock = _Lock()
     monkeypatch.setitem(research._QUEUE_STATE, "_hard_reset_lock", lock)
     monkeypatch.setitem(research._QUEUE_STATE, "_hard_reset_in_progress", resetting)
     path = tmp_path / "queues" / "_pending_queue.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    research._write_pending_queue_snapshot(path, _running(), [waiting])
+    research._write_pending_queue_snapshot(path, _running(), queue)
     before = _written(path)
     lis.feed(action="cancel", researchId=waiting["research_id"],
              uid="uid-sharer", submittedBy="uid-sharer")
-    assert not lis.jobs._queue, "the cancel did not reach the waiting job"
+    assert [j["research_id"] for j in lis.jobs._queue] == [
+        j["research_id"] for j in (*ahead, *behind)], (
+        "the cancel did not take exactly the waiting job out of the queue")
     return path, before, lock
 
 
@@ -435,7 +450,9 @@ def test_a_cancelled_run_that_keeps_nothing_leaves_the_snapshot_at_the_press(
     claim deleted its queue document — and a Cancel or a leave took it out of
     the queue without touching the file. Its topic, address and brief then sat
     at the root of `queues/` until the running job ended, hours later."""
-    path, _before, lock = _cancel_while_it_waits(monkeypatch, tmp_path, _job(INCOG))
+    ahead, behind = _queued(1), _queued(2)
+    path, _before, lock = _cancel_while_it_waits(
+        monkeypatch, tmp_path, _job(INCOG), ahead=[ahead], behind=[behind])
 
     raw = _written(path)
     assert TOPIC not in raw, "the cancelled run's topic outlived the press"
@@ -446,6 +463,12 @@ def test_a_cancelled_run_that_keeps_nothing_leaves_the_snapshot_at_the_press(
     # leftovers must not take another person's safety net with it.
     assert snap["current"]["research_id"] == CHAT
     assert snap["current"]["topic"] == RUNNING_TOPIC
+    # ⛔⛔ AND SO DOES EVERYBODY STILL WAITING, in their order and whole. The
+    # file is the only description of a claimed job left; a rewrite that
+    # dropped them would strand every ordinary run queued on this worker the
+    # moment one private run behind the head was cancelled.
+    assert snap["pending"] == [ahead, behind], (
+        "the rewrite dropped the ordinary jobs still waiting their turn")
     assert lock.entered == 1, (
         "the rewrite did not wait for Reset Backend's own write of this file")
 
