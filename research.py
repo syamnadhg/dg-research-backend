@@ -6158,6 +6158,34 @@ def _incognito_expire_at(research_id, now=None):
     return base + timedelta(hours=_INCOGNITO_EXPIRE_HOURS)
 
 
+def _with_incognito_renewal(payload: dict, research_id, now=None) -> dict:
+    """`payload` with the record's fuse pushed a day out in front of it — or
+    `payload` itself, untouched, for an ordinary run.
+
+    ⛔⛔ THE RECORD WAS FUSED ONCE AND NEVER RENEWED (wave 10.9 repair). The app
+    stamps `expireAt` when it creates an incognito record, and until now no
+    write from this machine moved it. A run still alive a day later — parked at
+    a sign-in prompt, or waiting behind somebody else's run — lost its record to
+    Firestore's own sweep while it ran: every later write here failed, the
+    reports piled up under a parent that was gone, and phase 5 found no record
+    to deliver. With the tab closed this machine is the only writer, so every
+    write it makes to the record is proof the run is alive and carries the fuse
+    forward. When the writes stop, so does the renewal — which is exactly when
+    the fuse should burn.
+
+    ⭐ THE SAME OBJECT BACK FOR AN ORDINARY RUN, not a copy that happens to be
+    equal: an ordinary record has no fuse and must be written exactly as it was
+    before this existed.
+
+    ⛔ THE VALUE IS `_incognito_expire_at`'s, so it is timezone-aware and a day
+    out against the rules' 48-hour ceiling — and `ephemeralExpiryOk()` checks
+    the MERGED document, which after this write holds this value."""
+    at = _incognito_expire_at(research_id, now)
+    if at is None:
+        return payload
+    return {**payload, "expireAt": at}
+
+
 def _loggable_topic(topic, research_id=None, limit=40) -> str:
     """What a log line may say this run is about.
 
@@ -14914,6 +14942,13 @@ def save_document_to_firestore(doc_type: str, content: str, name: str | None = N
                     **({"expireAt": _expire_at} if _expire_at else {}),
                 })),
             what=f"document {doc_type}")
+        if _expire_at:
+            # ⛔ SO THE LEASE CAN CARRY THIS REPORT'S FUSE FORWARD TOO — see
+            # `_renew_incognito_leases`. Remembered only once it landed, and
+            # only for a run that keeps nothing: an ordinary report has no
+            # fuse and must never be handed one.
+            _INCOGNITO_DOCS_WRITTEN.setdefault(
+                (_fb_uid, _fb_research_id), set()).add(doc_type)
         return True
     except Exception as e:
         # F5 (2026-05-13): include exception class + gRPC/HTTP status code
@@ -17662,14 +17697,20 @@ def _update_research_doc(uid: str, research_id: str, updates: dict) -> bool:
     `deviceUpdatingFor` rule passes; in legacy mode it's a no-op.
 
     Returns True on success, False on failure (logged WARN; never raises).
-    Sync — async callers wrap with `asyncio.to_thread`."""
+    Sync — async callers wrap with `asyncio.to_thread`.
+
+    ⛔⛔ AND IT RENEWS A RUN THAT KEEPS NOTHING (wave 10.9 repair) — see
+    `_with_incognito_renewal`. This is the seam every status, phase, agent and
+    decision write goes through; it never reached `_write_research_doc`, so a
+    renewal placed there alone would have ridden only on the rare link and
+    source writes and missed nearly every write a run makes."""
     if not _firebase_db or not uid or not research_id:
         return False
     try:
         _grpc_write_with_heal(
             lambda: _firebase_db.collection("users").document(uid)
                 .collection("researches").document(research_id)
-                .update(_be_payload(updates)),
+                .update(_be_payload(_with_incognito_renewal(updates, research_id))),
             what=f"update research {research_id[:8]}…",
         )
         return True
@@ -17761,10 +17802,14 @@ def _write_research_doc(doc_ref, payload: dict, research_id, *, merge: bool = Tr
     ⛔ AND IT IS NOT THE ANSWER FOR AN ORDINARY RUN. The set-merge is
     load-bearing there: the machine writes `backendRunId` on first arrival,
     sometimes before the app has finished creating the record, and an update
-    would lose that race every time."""
+    would lose that race every time.
+
+    ⭐ THE UPDATE CARRIES THE FUSE FORWARD (`_with_incognito_renewal`), and only
+    the update: a record that is still there is a run that is still alive, and
+    one that is gone stays gone — the update fails rather than recreating it."""
     if not _is_incognito_research(research_id):
         return doc_ref.set(payload, merge=merge)
-    return doc_ref.update(_merge_field_paths(payload))
+    return doc_ref.update(_merge_field_paths(_with_incognito_renewal(payload, research_id)))
 
 
 def _set_research_doc(uid: str, research_id: str, data: dict, *, merge: bool = True) -> bool:
@@ -17795,6 +17840,154 @@ def _set_research_doc(uid: str, research_id: str, data: dict, *, merge: bool = T
             "WARN",
         )
         return False
+
+
+# ── The lease: what keeps a WAITING run that keeps nothing alive ─────────────
+#
+# ⛔⛔ RENEWING ON WRITES DOES NOT COVER A WAIT, BECAUSE A WAIT WRITES NOTHING.
+# Measured on this file (wave 10.9 repair): a run parked at a sign-in prompt sits
+# in `wait_if_paused` or `await_phase_decision`, and both only sleep — one logs a
+# line every ten minutes to the local log, neither touches the record, and both
+# give up after 24 hours, which is the fuse's own length. The fuse was last
+# pushed by the write BEFORE the wait began, so it always burns first. A run
+# claimed into this worker's own queue behind another is the same: its record is
+# written when the queue moves and not otherwise, and a queue does not move while
+# the run ahead of it is itself waiting on a person. The agents' 60-second
+# `heartbeat` goes to `pipeline_events`, which renews nothing above it.
+#
+# So the renewal needs a beat of its own, and this is it: once an hour, every
+# worker re-lights the fuse on each incognito run it HOLDS — the one it is
+# running and the ones it has claimed into its own queue — and on the reports
+# it has written for them.
+#
+# ⭐ HELD, AND ONLY HELD. A job still waiting in the DEVICE queue is not this
+# worker's: its queue document carries a fuse nobody may move (the rules allow a
+# claimed job to change three fields, none of them `expireAt`), so the app's
+# design lets the job and its record burn down TOGETHER. Renewing that record
+# from here would leave a record with no job behind it. Once a worker claims the
+# job it deletes the queue document, and from then on the record's fuse is the
+# only one — so from then on, this renews it.
+#
+# ⭐ AND IT STOPS WHEN THE RUN STOPS BEING HELD. A machine that dies takes its
+# lease with it and the fuse burns a day later, which is the promise for exactly
+# that case.
+
+#: How often a worker renews the fuse of every incognito run it holds, seconds.
+#: ⛔ Well inside the 24-hour fuse, so a renewal lost to a network blip or a slow
+#: tick still leaves most of a day of headroom.
+_INCOGNITO_LEASE_INTERVAL_SEC = 3600
+
+#: The reports this process has written for each incognito run, as
+#: {(uid, research id): {document id, …}}.
+#:
+#: ⛔⛔ THE RECORD IS NOT THE WHOLE RUN. `documents` carry fuses of their own —
+#: Firestore's TTL takes the document it is declared on and never its children —
+#: so on a run past a day the brief written in the first hour burns under a live
+#: record, and phase 5 builds the email without it. They have to be renewed with
+#: the record.
+#:
+#: ⭐ REMEMBERED, NOT LISTED. The rules let a shared machine WRITE a sharer's
+#: reports and not READ them (`documents` read is owner-machine only, 7.7E), so a
+#: lease that listed the subcollection would renew nothing on exactly the
+#: machines that run other people's research.
+_INCOGNITO_DOCS_WRITTEN: "dict[tuple, set]" = {}
+
+
+def _incognito_runs_held() -> "list[tuple[str, str]]":
+    """(uid, research id) of every incognito run this worker holds right now:
+    the one it is running, then the ones claimed into its own queue, in order,
+    each once. Ordinary runs are never in it."""
+    jobs = [_QUEUE_STATE.get("current_job")]
+    queue = _QUEUE_STATE.get("queue_ref")
+    if queue is not None:
+        try:
+            jobs.extend(list(queue._queue))
+        except Exception:
+            pass
+    held: "list[tuple[str, str]]" = []
+    for job in jobs:
+        uid = str((job or {}).get("uid") or "").strip()
+        rid = (job or {}).get("research_id")
+        if uid and _is_incognito_research(rid) and (uid, rid) not in held:
+            held.append((uid, rid))
+    return held
+
+
+def _renew_incognito_leases() -> dict:
+    """Carry the fuse forward on every incognito run this worker holds.
+
+    Returns counts: `renewed` records, `documents` renewed under them, and
+    `failed` writes (a record that is gone counts once and its reports are left
+    alone)."""
+    out = {"renewed": 0, "documents": 0, "failed": 0}
+    if not _firebase_db:
+        return out
+    held = _incognito_runs_held()
+    # A run this worker no longer holds has nothing left to renew here.
+    for key in list(_INCOGNITO_DOCS_WRITTEN):
+        if key not in held:
+            _INCOGNITO_DOCS_WRITTEN.pop(key, None)
+    for uid, rid in held:
+        # ⭐ AN EMPTY PATCH, ON PURPOSE: `_update_research_doc` is the seam that
+        # stamps the fuse on every write, so the lease is simply a write that
+        # carries nothing else. An update, so a record that was purged stays
+        # purged.
+        if not _update_research_doc(uid, rid, {}):
+            # ⛔ THE RECORD IS GONE OR UNREACHABLE, SO ITS REPORTS ARE NOT
+            # RENEWED. Carrying their fuse forward under a parent that no longer
+            # exists would keep the content of a research that was taken away.
+            out["failed"] += 1
+            continue
+        out["renewed"] += 1
+        for doc_id in sorted(_INCOGNITO_DOCS_WRITTEN.get((uid, rid), ())):
+            try:
+                _grpc_write_with_heal(
+                    lambda doc_id=doc_id, uid=uid, rid=rid: _firebase_db
+                        .collection("users").document(uid)
+                        .collection("researches").document(rid)
+                        .collection("documents").document(doc_id)
+                        .update(_be_payload({"expireAt": _incognito_expire_at(rid)})),
+                    what=f"incognito lease document {doc_id}")
+                out["documents"] += 1
+            except Exception as e:
+                out["failed"] += 1
+                log(f"[incognito-lease] a report's fuse was not renewed: "
+                    f"{type(e).__name__}", "DEBUG")
+    return out
+
+
+def _incognito_lease_report(res) -> "str | None":
+    """One machine-log line for a tick that did something, or nothing.
+
+    ⛔ COUNTS ONLY. The runs it names are other people's, and some are waiting
+    behind the run this line would otherwise have landed in."""
+    if not isinstance(res, dict) or not (res.get("renewed") or res.get("failed")):
+        return None
+    line = (f"[incognito-lease] renewed the fuse on {res.get('renewed', 0)} run(s) "
+            f"and {res.get('documents', 0)} report(s) this worker holds")
+    if res.get("failed"):
+        line += f" · {res['failed']} write(s) did not land"
+    return line
+
+
+@_machine_logged
+async def _incognito_lease_loop():
+    """The beat that keeps a held incognito run's fuse ahead of it while it
+    waits. Armed on EVERY worker, because each worker holds its own runs; idle
+    whenever this worker holds none, and whenever Firestore is down."""
+    try:
+        while True:
+            await asyncio.sleep(_INCOGNITO_LEASE_INTERVAL_SEC)
+            try:
+                res = await asyncio.to_thread(_renew_incognito_leases)
+            except Exception as err:
+                log(f"[incognito-lease] tick skipped ({type(err).__name__})", "DEBUG")
+                continue
+            line = _incognito_lease_report(res)
+            if line:
+                log(line, "INFO")
+    except asyncio.CancelledError:
+        return
 
 
 def _restart_recovery_patch(research_id) -> dict:
@@ -76668,6 +76861,13 @@ async def run_server(port=8000):
     # _firebase_db is set. After any reconnect it schedules a clean respawn (when
     # idle) so the fresh boot re-binds every Firestore listener.
     asyncio.create_task(_firebase_reconnect_loop())
+    # ⛔⛔ The lease on every incognito run this worker holds (wave 10.9
+    # repair) — a run waiting at a sign-in prompt or behind another run writes
+    # nothing, and without this its record's fuse burns under it. EVERY worker,
+    # not worker 1: each holds its own runs in its own process. Armed
+    # unconditionally, like the reconnect loop above, and idle while Firestore
+    # is down or nothing incognito is held.
+    asyncio.create_task(_incognito_lease_loop())
     # Start heartbeat so frontend can show Online/Offline status.
     # Multi-worker (2026-05-21): only worker 1 heartbeats. FE only needs
     # a single "device alive" signal and devices/{deviceId}.lastHeartbeat

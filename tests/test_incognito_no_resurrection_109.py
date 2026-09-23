@@ -110,10 +110,25 @@ def test_an_ordinary_run_still_writes_a_set_merge():
     assert calls == [("set", {"backendRunId": "r_1"}, True)]
 
 
+def _without_fuse(payload: dict) -> dict:
+    """The payload with the record's renewed fuse checked and taken off.
+
+    ⭐ Every incognito update now carries `expireAt` forward (wave 10.9 repair,
+    `_with_incognito_renewal`, pinned in test_incognito_fuse_renewal_109.py).
+    The pins in this file are about what ELSE the write says, so they check the
+    fuse is there and a real timestamp, then compare the rest exactly."""
+    out = dict(payload)
+    fuse = out.pop("expireAt")
+    assert fuse.tzinfo is not None, "the renewed fuse is naive"
+    return out
+
+
 def test_a_run_that_keeps_nothing_writes_an_update():
     calls = []
     research._write_research_doc(_Ref(calls), {"backendRunId": "r_1"}, INCOG)
-    assert calls == [("update", {"backendRunId": "r_1"}, None)]
+    [(verb, payload, merge)] = calls
+    assert (verb, merge) == ("update", None)
+    assert _without_fuse(payload) == {"backendRunId": "r_1"}
 
 
 def test_a_run_that_keeps_nothing_keeps_its_other_agents():
@@ -122,7 +137,7 @@ def test_a_run_that_keeps_nothing_keeps_its_other_agents():
     calls = []
     research._write_research_doc(
         _Ref(calls), {"agents": {"claude": {"status": "complete"}}}, INCOG)
-    assert calls[0][1] == {"agents.claude.status": "complete"}
+    assert _without_fuse(calls[0][1]) == {"agents.claude.status": "complete"}
 
 
 # ── the consumers ─────────────────────────────────────────────────────────
@@ -171,7 +186,8 @@ def test_the_links_writer_asks_the_same_question(db, monkeypatch, rid, verb):
     [(kind, payload)] = db
     assert kind == verb
     if verb == "update":
-        assert payload == {"links.brief.url": "https://x/1", "links.brief.label": "Brief"}
+        assert _without_fuse(payload) == {"links.brief.url": "https://x/1",
+                                          "links.brief.label": "Brief"}
     else:
         assert payload == {"links": {"brief": {"url": "https://x/1", "label": "Brief"}}}
 
@@ -185,6 +201,8 @@ def test_the_user_sources_writer_asks_the_same_question(db, monkeypatch, rid, ve
     research.append_user_source_in_firestore("doc", "https://x/2", label="A doc")
     [(kind, payload)] = db
     assert kind == verb
+    if verb == "update":
+        payload = _without_fuse(payload)
     assert list(payload) == ["userSources"]
     assert type(payload["userSources"]).__name__ == "ArrayUnion"
 
@@ -195,8 +213,10 @@ def test_the_agents_writer_asks_the_same_question(db, monkeypatch, rid, verb):
     assert research._set_research_doc(UID, rid, {"agents": {"gemini": {"status": "x"}}})
     [(kind, payload)] = db
     assert kind == verb
-    assert payload == ({"agents.gemini.status": "x"} if verb == "update"
-                       else {"agents": {"gemini": {"status": "x"}}})
+    if verb == "update":
+        assert _without_fuse(payload) == {"agents.gemini.status": "x"}
+    else:
+        assert payload == {"agents": {"gemini": {"status": "x"}}}
 
 
 class _GoneDocRef(_DocRef):

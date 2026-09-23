@@ -180,6 +180,12 @@ def test_the_record_a_run_that_keeps_nothing_builds_is_the_ordinary_one(live,
             ref, {"links": {"brief": {"url": "https://x/2"}}}, rid)
         docs[rid] = doc.data
 
+    # ⭐ ONE DIFFERENCE IS THE POINT (wave 10.9 repair): the record of a run that
+    # keeps nothing carries its fuse forward on every write, and an ordinary
+    # record is never handed one. Everything else must be the same document.
+    fuse = docs[INCOG].pop("expireAt")
+    assert "expireAt" not in docs[CHAT], "an ordinary record was handed a fuse"
+    assert fuse.tzinfo is not None
     assert docs[INCOG] == docs[CHAT]
     assert docs[INCOG]["agents"]["chatgpt"]["sources"] == 43
     assert docs[INCOG]["links"]["brief"]["label"] == "Brief", (

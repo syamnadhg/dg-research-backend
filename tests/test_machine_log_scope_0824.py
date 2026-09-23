@@ -269,6 +269,11 @@ _EXPECTED_MARKED = {
     "run_server._dead_worker_reconcile_loop",
     "run_server._aegis_pulse_loop",
     "run_server._idle_rescan_loop",
+    # Wave 10.9 repair: the lease renews every incognito run the worker HOLDS,
+    # which includes runs queued behind the armed one — often somebody else's.
+    # A line in the armed run's folder would tell its reader that a private run
+    # is waiting behind theirs.
+    "_incognito_lease_loop",
 }
 
 # ⛔⛔ THE MORE IMPORTANT LIST. Each of these logs while a run is armed and each

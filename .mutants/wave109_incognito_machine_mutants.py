@@ -64,7 +64,9 @@ SUITES = ("tests/test_incognito_capability_109.py "
           "tests/test_incognito_teardown_109.py "
           "tests/test_pending_queue_keeps_nothing_109.py "
           "tests/test_handoff_is_the_end_109.py "
-          "tests/test_cloud_handoff_record_108.py")
+          "tests/test_cloud_handoff_record_108.py "
+          "tests/test_incognito_fuse_renewal_109.py "
+          "tests/test_machine_log_scope_0824.py")
 RESEARCH = "research.py"
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
@@ -155,9 +157,42 @@ EVENT_EXPIRE = ('        "expireAt": (_incognito_expire_at(_fb_research_id)\n'
                 "                     or datetime.now(timezone.utc) + timedelta(days=30)),")
 
 # ── anchors: never bringing a purged record back ────────────────────────────
+#: The incognito branch's write, fuse and all. ⛔ Re-anchored 2026-09-22 when the
+#: renewal joined it; C2 and C10 below keep the renewal in their replacements so
+#: each still measures ONLY the decision it names.
+WRITE_UPDATE = ("    return doc_ref.update(_merge_field_paths("
+                "_with_incognito_renewal(payload, research_id)))")
 WRITE_GATE = ("    if not _is_incognito_research(research_id):\n"
-              "        return doc_ref.set(payload, merge=merge)\n"
-              "    return doc_ref.update(_merge_field_paths(payload))")
+              "        return doc_ref.set(payload, merge=merge)\n" + WRITE_UPDATE)
+
+# ── anchors: the fuse moves with the run (wave 10.9 repair) ─────────────────
+RENEW_BODY = ("    at = _incognito_expire_at(research_id, now)\n"
+              "    if at is None:\n"
+              "        return payload\n"
+              '    return {**payload, "expireAt": at}')
+RENEW_UPDATE_SEAM = ("                .update(_be_payload(_with_incognito_renewal("
+                     "updates, research_id))),")
+HELD_CURRENT = '    jobs = [_QUEUE_STATE.get("current_job")]'
+HELD_QUEUE = "            jobs.extend(list(queue._queue))"
+HELD_FILTER = "        if uid and _is_incognito_research(rid) and (uid, rid) not in held:"
+LEASE_PRUNE = "    for key in list(_INCOGNITO_DOCS_WRITTEN):"
+LEASE_GONE = ('            out["failed"] += 1\n'
+              "            continue\n"
+              '        out["renewed"] += 1')
+LEASE_DOCS = "        for doc_id in sorted(_INCOGNITO_DOCS_WRITTEN.get((uid, rid), ())):"
+LEASE_DOC_WRITE = ('                        .update(_be_payload({"expireAt": '
+                   '_incognito_expire_at(rid)})),')
+SAVE_REMEMBERS = ("            _INCOGNITO_DOCS_WRITTEN.setdefault(\n"
+                  "                (_fb_uid, _fb_research_id), set()).add(doc_type)")
+SAVE_GATE = ("        if _expire_at:\n"
+             "            # ⛔ SO THE LEASE CAN CARRY THIS REPORT'S FUSE FORWARD TOO")
+LEASE_INTERVAL = "_INCOGNITO_LEASE_INTERVAL_SEC = 3600"
+LOOP_TICK = "                res = await asyncio.to_thread(_renew_incognito_leases)"
+LOOP_SKIP = ('                log(f"[incognito-lease] tick skipped ({type(err).__name__})", '
+             '"DEBUG")\n'
+             "                continue")
+LOOP_MARK = "@_machine_logged\nasync def _incognito_lease_loop():"
+LOOP_START = "    asyncio.create_task(_incognito_lease_loop())"
 PATHS_DESCEND = ("            for inner, inner_value in value.items():\n"
                  '                _expand(f"{path}.{inner}", inner_value)')
 PATHS_GUARD = ("        if (type(value) is dict and value\n"
@@ -458,7 +493,7 @@ MUTANTS = [
      [(WRITE_GATE, "    return doc_ref.set(payload, merge=merge)")]),
     ("C2", "over", "every write becomes an update, so the machine loses the "
      "race the app has not finished creating the record in",
-     [(WRITE_GATE, "    return doc_ref.update(_merge_field_paths(payload))")]),
+     [(WRITE_GATE, WRITE_UPDATE)]),
     ("C3", "under", "⛔⛔ the nested map rides an update whole, so writing one "
      "agent's status deletes the other two",
      [(PATHS_DESCEND, '            out[path] = value')]),
@@ -637,13 +672,82 @@ MUTANTS = [
      [(WRITE_GATE, "    if not _is_incognito_research(research_id):\n"
                    "        return doc_ref.set(payload, merge=merge)\n"
                    "    try:\n"
-                   "        return doc_ref.update(_merge_field_paths(payload))\n"
+                   "    " + WRITE_UPDATE + "\n"
                    "    except Exception:\n"
                    "        return doc_ref.set(payload, merge=merge)")]),
     ("E8", "under", "⛔ the seq stops being monotonic, so two events in the "
      "same millisecond tie and the app's `where(seq > lastSeq)` filter never "
      "shows the second — the fuse rides on this write and must not cost it",
      [(SEQ_MONOTONIC, "    new_seq = int(time.time() * 1000)")]),
+
+    # ══ the fuse moves with the run (wave 10.9 repair) ═════════════════════
+    ("R1", "under", "⛔⛔ nothing renews the record, so a run alive past a day "
+     "loses it to Firestore's sweep mid-run and phase 5 has nothing to deliver",
+     [(RENEW_BODY, "    return payload")]),
+    ("R2", "over", "⛔⛔ an ordinary record is handed a fuse on its next write, "
+     "and somebody's saved research disappears a day later",
+     [(RENEW_BODY, RENEW_BODY.replace(
+         "    if at is None:\n        return payload\n",
+         '    if at is None:\n        at = _incognito_expire_at("incog_1758400000000_1", now)\n'))]),
+    ("R3", "under", "a caller's own `expireAt` wins over the renewal, so a write "
+     "can carry a stale fuse — or clear it — past the one seam that owns it",
+     [(RENEW_BODY, RENEW_BODY.replace('{**payload, "expireAt": at}',
+                                      '{"expireAt": at, **payload}'))]),
+    ("R4", "under", "⛔⛔ the status seam stops renewing — the write nearly every "
+     "status, phase, agent and sign-in card goes through, and the one the spec "
+     "did not name",
+     [(RENEW_UPDATE_SEAM, "                .update(_be_payload(updates)),")]),
+    ("R5", "under", "⛔ the set-merge seam stops renewing, so the link, source "
+     "and backendRunId writes leave the fuse where it was",
+     [(WRITE_UPDATE, "    return doc_ref.update(_merge_field_paths(payload))")]),
+
+    # ══ the lease: what keeps a WAITING run alive ══════════════════════════
+    ("L1", "under", "⛔⛔ the lease forgets the worker's own queue, so a run "
+     "claimed behind another burns down while it waits its turn",
+     [(HELD_QUEUE, "            pass")]),
+    ("L2", "under", "⛔⛔ the lease forgets the running job, so the run parked at "
+     "a sign-in prompt — the case this exists for — is never renewed",
+     [(HELD_CURRENT, "    jobs = []")]),
+    ("L3", "over", "⛔ every held run is leased, so an ordinary run gets a write "
+     "it never used to get, every hour",
+     [(HELD_FILTER, "        if uid and rid and (uid, rid) not in held:")]),
+    ("L4", "under", "⛔⛔ the reports are not renewed with the record, so a run "
+     "past a day mails a research whose brief has already burned",
+     [(LEASE_DOCS, "        for doc_id in []:")]),
+    ("L5", "over", "⛔ a report is renewed under a record that is gone, keeping "
+     "the content of a research somebody took away",
+     [(LEASE_GONE, '            out["failed"] += 1\n        out["renewed"] += 1')]),
+    ("L6", "under", "the save stops remembering its reports, so the lease has "
+     "nothing to renew — the helper is perfect and never fed",
+     [(SAVE_REMEMBERS, "            pass")]),
+    ("L7", "over", "an ordinary run's reports are remembered as ones that "
+     "carry a fuse",
+     [(SAVE_GATE, SAVE_GATE.replace("        if _expire_at:", "        if True:"))]),
+    ("L8", "under", "⛔⛔ the loop sleeps and never renews — started, running, "
+     "and measuring nothing",
+     [(LOOP_TICK, "                res = None")]),
+    ("L9", "under", "⛔⛔ the server never starts the lease, so every piece above "
+     "is a helper nobody calls",
+     [(LOOP_START, "    pass")]),
+    ("L10", "under", "the lease runs on worker 1 only, so a run held by worker 2 "
+     "— its own process, its own queue — is never renewed",
+     [(LOOP_START, "    if WORKER_ID == 1:\n"
+                   "        asyncio.create_task(_incognito_lease_loop())")]),
+    ("L11", "under", "the lease renews once a day, racing the fuse it exists to "
+     "keep ahead of",
+     [(LEASE_INTERVAL, "_INCOGNITO_LEASE_INTERVAL_SEC = 86400")]),
+    ("L12", "under", "one failed tick ends the lease for the life of the process",
+     [(LOOP_SKIP, LOOP_SKIP.replace("                continue", "                return"))]),
+    ("L13", "under", "a run the worker no longer holds is never forgotten, so "
+     "the list of private runs this process has served only grows",
+     [(LEASE_PRUNE, "    for key in []:")]),
+    ("L14", "over", "the lease's lines land in the armed run's folder, telling "
+     "its reader a private run is waiting behind theirs",
+     [(LOOP_MARK, "async def _incognito_lease_loop():")]),
+    ("L15", "over", "⛔⛔ a report is renewed with a set-merge, which RECREATES "
+     "one the purge already took, as a fragment holding only a fuse",
+     [(LEASE_DOC_WRITE, '                        .set(_be_payload({"expireAt": '
+                        '_incognito_expire_at(rid)}), merge=True),')]),
 
     # ══ the pins that hold four copies of the id shape together ════════════
     # ⛔ THESE MUTATE A TEST FILE, which is the only place their decision
