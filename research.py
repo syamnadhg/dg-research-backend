@@ -20325,8 +20325,18 @@ class PipelineControls:
         never-die contract: the user being AFK shouldn't terminate
         their run. The FE watchdog T3 catches genuinely-dead runs via
         silence detection; this timeout is now effectively a no-op
-        backstop. BE keeps heartbeating in the await loop so the
-        watchdog stays alive while paused for user decision."""
+        backstop.
+
+        ⛔ THIS LOOP WRITES NOTHING — it only polls in-memory events and
+        sleeps. It used to say the backend "keeps heartbeating in the await
+        loop so the watchdog stays alive"; there is no such heartbeat here,
+        and believing there was is what hid that an incognito record could
+        expire under a run parked at this very wait (its fuse is 24h, the
+        same as this timeout, and started at the last write BEFORE the wait).
+        What keeps a waiting run's record alive is the hourly incognito
+        lease (`_incognito_lease_loop`, started in `run_server`), not this
+        loop. What keeps the worker-watchdog
+        from calling the wait "stuck" is `_awaiting_user`, set below."""
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout
         # Fix D (2026-05-27): mark "blocked on a user decision" so the outer
