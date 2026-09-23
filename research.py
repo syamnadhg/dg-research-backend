@@ -1746,6 +1746,12 @@ def _refresh_research_title_async(topic, brief_text="", findings_text=""):
     _findings = _corpus[:5000]
     if not _topic and not _brief and not _findings:
         return
+    # ⛔ WHOSE RUN THIS IS, read at DISPATCH (wave 10.9 repair). The worker is a
+    # raw thread that can still be writing after the run has returned — for a
+    # run that keeps nothing phases 3 and 4 are off, so it ends seconds after
+    # this — and by then neither the run folder nor `_fb_research_id` says whose
+    # line it is. Its refusal lines print the topic's own words.
+    _keeps_nothing = _is_incognito_research(_fb_research_id)
 
     def _worker():
         try:
@@ -1807,11 +1813,15 @@ def _refresh_research_title_async(topic, brief_text="", findings_text=""):
                     # this line is read for; the title itself is on the research
                     # doc. ⭐ The anchors stay, for the reason the Phase 1 gate
                     # gives, and the bundle takes them out of the copy that
-                    # travels.
+                    # travels. ⛔ Except for a run that keeps nothing, whose
+                    # anchors are its subject and whose line can land after the
+                    # run — outside every net the run itself has.
+                    _anchor_words = (_BUNDLE_TOPIC_MARK if _keeps_nothing
+                                     else ", ".join(_t_anchors[:6]))
                     if _verdict == "refuse_loud":
                         log(f"[title-refresh] REFUSING the generated title "
                             f"({len(text)} chars) — it shares none of the topic's "
-                            f"distinctive terms ({', '.join(_t_anchors[:6])}), AND "
+                            f"distinctive terms ({_anchor_words}), AND "
                             f"neither does the corpus it was written from. The "
                             f"research went off-topic.", "ERROR")
                         try:
@@ -1846,7 +1856,7 @@ def _refresh_research_title_async(topic, brief_text="", findings_text=""):
                         log(f"[title-refresh] keeping the topic-derived name: the "
                             f"generated title ({len(text)} chars) shares none of the "
                             f"topic's distinctive terms "
-                            f"({', '.join(_t_anchors[:6])}), but the corpus does "
+                            f"({_anchor_words}), but the corpus does "
                             f"— no alert raised.", "WARN")
                     text = ""
             if text:
@@ -2306,7 +2316,10 @@ def log(msg, level="INFO"):
         _console_print(marker)
         _log_write_through(marker, "INFO")
     line = f"[{ts}] [{level}] {msg}"
-    _console_print(line)
+    # ⛔⛔ EXCEPT A LINE OF A RUN THAT KEEPS NOTHING, which the console — i.e.
+    # the machine's `backend.log` — never sees. See `_console_withholds_line`.
+    if not _console_withholds_line():
+        _console_print(line)
     # ⭐ The printed format is byte-for-byte what it always was. The second
     # sink is the armed per-run folder — see `_log_write_through`, which is a
     # no-op when nothing is armed and can never recurse back through here.
@@ -3526,6 +3539,48 @@ def _run_submitted_by() -> "str | None":
     would hand back the wrong person here."""
     sink = _active_run_sink()
     return getattr(sink, "claimed_by", None) if sink is not None else None
+
+
+def _console_withholds_line() -> bool:
+    """True when the line `log()` is writing belongs to a run that keeps nothing
+    — so it goes to that run's own folder and never to the console.
+
+    ⛔⛔ THE CONSOLE IS `backend.log`, AND IT IS THE MACHINE OWNER'S (wave 10.9
+    repair). Every worker's stdout is appended to it, its tail rides the owner's
+    support bundle, it is never cleaned by a run ending, and on a shared
+    computer it holds every member's runs. Every line a run writes was printed
+    there as well as into the run's folder — and only the folder is removed
+    when a run that keeps nothing ends. Those lines carry the run: the topic
+    words its checks compare against, the feedback a person typed at the brief
+    gate, what the agents' pages said to the CUA. Hunting them one call site at
+    a time would miss the next one somebody writes, so the decision is made
+    once, here.
+
+    ⭐ WITH THE ATTRIBUTION THE RUN FOLDER ALREADY USES: the armed sink, and a
+    line inside the machine scope is never the run's. So the heartbeat, the
+    sweeps and the start listener keep reaching the owner's log while a private
+    run is armed, and exactly what the folder takes, the console gives up.
+
+    ⭐ THE RUNNING PIPELINE'S OWN ID IS THE SECOND WITNESS. The capture never
+    raises into a run, so a disk that refused the run folder arms no sink at
+    all — and without this every line of that run would reach the console.
+
+    ⛔ AN ABSENT ID IS NEVER ASKED ABOUT. This runs for every line the process
+    writes, from inside every exception handler in the file; the predicate is
+    only handed an id that exists, so no answer about "no run" can ever make
+    `log()` itself raise.
+
+    ⚠ THE COST, SAID OUT LOUD: while a run that keeps nothing is armed, the
+    unmarked loops that explain a run's fate — the reconnect loop, the revoked
+    credential, the device commands, the worker watchdog — write only into that
+    run's folder, which leaves with it. `run_pipeline_captured` says in the
+    owner's log that the run is quiet on purpose, so the gap is not read as a
+    hang."""
+    about_the_run = _LOG_SCOPE.get() != _LOG_SCOPE_MACHINE
+    sink = _RUN_LOG_SINKS[-1] if _RUN_LOG_SINKS else None
+    armed = getattr(sink, "research_id", None)
+    return about_the_run and any(
+        _is_incognito_research(rid) for rid in (armed, _fb_research_id) if rid)
 
 
 def _log_write_through(line: str, level: str) -> None:
@@ -6212,6 +6267,26 @@ def _loggable_topic(topic, research_id=None, limit=40) -> str:
     if _is_incognito_research(research_id):
         return _BUNDLE_TOPIC_MARK
     return str(topic or "")[:limit]
+
+
+def _print_pipeline_traceback(research_id) -> None:
+    """The traceback of a pipeline that died — to stderr as always, or, for a
+    run that keeps nothing, into that run's own folder only.
+
+    ⛔ STDERR IS `backend.err.log`, THE MACHINE'S OTHER HALF (wave 10.9 repair).
+    `_console_withholds_line` keeps the run's `log()` lines out of the owner's
+    log, but a raw `print_exc` bypasses `log()` altogether — and the exception
+    it prints is the same text `Fatal: {e}` carries: a source's file name, a URL
+    the page was on, whatever the failing call was holding. Routed through
+    `log()` it lands in the run's folder beside that line and leaves with it.
+
+    ⭐ An ordinary run's traceback goes exactly where it always went."""
+    import traceback
+    if _is_incognito_research(research_id):
+        for line in traceback.format_exc().rstrip().splitlines():
+            log(line, "ERROR")
+        return
+    traceback.print_exc()
 
 
 # ── Run-name reference ───────────────────────────────────────────────────────
@@ -15091,7 +15166,7 @@ def start_firestore_start_listener(job_queue, loop):
                 if _age_since_claim > ZOMBIE_GRACE_MS:
                     log(
                         f"Queue: stale-skip ZOMBIE {(data.get('researchId') or '')[:8]}… "
-                        f"topic={(data.get('topic') or '')[:40]!r} "
+                        f"topic={_loggable_topic(data.get('topic'), data.get('researchId'))!r} "
                         f"submittedBy={(data.get('submittedBy') or '?')[:8]} "
                         f"assignedWorker={_aw} claimedAt={_ca} "
                         f"age_since_claim={_age_since_claim // 1000}s — deleting",
@@ -15176,7 +15251,7 @@ def start_firestore_start_listener(job_queue, loop):
                         continue
                 log(
                     f"Queue: stale-skip ABANDONED {(data.get('researchId') or '')[:8]}… "
-                    f"topic={(data.get('topic') or '')[:40]!r} "
+                    f"topic={_loggable_topic(data.get('topic'), data.get('researchId'))!r} "
                     f"submittedBy={(data.get('submittedBy') or '?')[:8]} "
                     f"age={_age_ms // 1000}s — deleting",
                     "INFO",
@@ -15241,7 +15316,7 @@ def start_firestore_start_listener(job_queue, loop):
                                 log(
                                     f"Queue: stale-skip ABANDONED-BY-RESEARCH "
                                     f"{_rid_legacy[:24]}… "
-                                    f"topic={(data.get('topic') or '')[:40]!r} "
+                                    f"topic={_loggable_topic(data.get('topic'), _rid_legacy)!r} "
                                     f"research_age={_rd_age_ms // 1000}s — deleting",
                                     "INFO",
                                 )
@@ -73627,10 +73702,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # Uncaught exception anywhere in the pipeline — surface it with
         # whatever phase context we have so the frontend can route the
         # error to the correct phase tile instead of silently dropping it.
-        import traceback
         _dom_summary("run failed")
         log(f"Fatal: {e}", "ERROR")
-        traceback.print_exc()
+        _print_pipeline_traceback(research_id)
         # _runtime.phase is the most-recently-entered phase — use it as
         # the routing hint so the error lands on the right phase tile
         # instead of defaulting to 0 and polluting the P0 dropdown.
@@ -73924,6 +73998,12 @@ async def run_pipeline_captured(*args, **kwargs):
     # exactly like a legacy start doc.
     _claimed = kwargs.pop("_submitted_by", None)
     _rid, _attempt, _submitter = _run_pipeline_capture_key(args, kwargs)
+    # ⭐ SAID BEFORE THE CAPTURE ARMS, so it is the one line of this run the
+    # owner's log does get: from here the run's own lines go only to its folder
+    # (`_console_withholds_line`), and an hour of silence must not read as a hang.
+    if _is_incognito_research(_rid):
+        log(f"[incognito] {_rid[:8]}… keeps nothing — its own lines stay out of "
+            f"this log")
     try:
         with _RunLogCapture(research_id=_rid, attempt=_attempt,
                             submitted_by=_submitter, claimed_by=_claimed):
@@ -76004,14 +76084,14 @@ async def run_server(port=8000):
                 # account triage when the orphan is a sharer's doc.
                 log(
                     f"[idle-rescan] worker {WORKER_ID}: claim error — skipping {(d.get('researchId') or '')[:8]}… "
-                    f"topic={(d.get('topic') or '')[:40]!r} submittedBy={(d.get('submittedBy') or '?')[:8]}",
+                    f"topic={_loggable_topic(d.get('topic'), d.get('researchId'))!r} submittedBy={(d.get('submittedBy') or '?')[:8]}",
                     "WARN",
                 )
                 continue
             if _outcome is False:
                 log(
                     f"[idle-rescan] worker {WORKER_ID}: lost to sibling — skipping {(d.get('researchId') or '')[:8]}… "
-                    f"topic={(d.get('topic') or '')[:40]!r} submittedBy={(d.get('submittedBy') or '?')[:8]}",
+                    f"topic={_loggable_topic(d.get('topic'), d.get('researchId'))!r} submittedBy={(d.get('submittedBy') or '?')[:8]}",
                     "INFO",
                 )
                 continue
@@ -78920,8 +79000,15 @@ def _enumerate_ongoing_runs() -> "list[dict]":
                     continue
                 title = run_id
                 try:
-                    meta = json.loads((qdir / "meta.json").read_text(encoding="utf-8"))
-                    title = str(meta.get("title") or meta.get("topic") or run_id)
+                    # ⛔ NOT FOR A RUN THAT KEEPS NOTHING (wave 10.9 repair).
+                    # `--login` reads this title out on the OWNER's terminal —
+                    # "Closing Run 1 — <title>" — and into the session log their
+                    # support bundle carries; for a member's private run the
+                    # title is its topic. Its run id says which run it was and
+                    # carries no topic by construction (`_mint_run_id`).
+                    if not _is_incognito_research(_queue_dir_research_id(qdir)):
+                        meta = json.loads((qdir / "meta.json").read_text(encoding="utf-8"))
+                        title = str(meta.get("title") or meta.get("topic") or run_id)
                 except Exception:
                     pass
                 out.append({"worker": wid, "run_id": run_id, "title": title})

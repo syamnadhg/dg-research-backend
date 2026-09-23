@@ -281,10 +281,12 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      "marked loop stops printing to stdout as well — the machine's OWN log loses "
      "the lines the exclusion exists to keep",
      # ⚠ 2026-09-19 re-anchored: print → _console_print (prompt-quiet window).
-     [("    line = f\"[{ts}] [{level}] {msg}\"\n    _console_print(line)",
-       "    line = f\"[{ts}] [{level}] {msg}\"\n"
+     # ⚠ 2026-09-23 re-anchored: the print now sits behind the wave 10.9
+     # console rule for a run that keeps nothing; the gate still lands in
+     # front of it, which is all this mutant ever claimed.
+     [("    if not _console_withholds_line():\n        _console_print(line)",
        "    if _LOG_SCOPE.get() == _LOG_SCOPE_MACHINE:\n        return\n"
-       "    _console_print(line)")],
+       "    if not _console_withholds_line():\n        _console_print(line)")],
      [T_NEW]),
 ]
 

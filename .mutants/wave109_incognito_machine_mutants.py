@@ -66,6 +66,7 @@ SUITES = ("tests/test_incognito_capability_109.py "
           "tests/test_handoff_is_the_end_109.py "
           "tests/test_cloud_handoff_record_108.py "
           "tests/test_incognito_fuse_renewal_109.py "
+          "tests/test_incognito_backend_log_109.py "
           "tests/test_machine_log_scope_0824.py")
 RESEARCH = "research.py"
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
@@ -269,6 +270,39 @@ FORGET_WRITE = ("        if live or current:\n"
                 "            _write_pending_queue_snapshot(path, current, live)")
 FORGET_UNLINK = ("        else:\n"
                  "            Path(path).unlink(missing_ok=True)")
+
+# ── anchors: backend.log is the machine's (repair) ──────────────────────────
+LOG_CONSOLE = ("    if not _console_withholds_line():\n"
+               "        _console_print(line)")
+CW_SCOPE = "    about_the_run = _LOG_SCOPE.get() != _LOG_SCOPE_MACHINE"
+CW_ARMED = '    armed = getattr(sink, "research_id", None)'
+CW_ANY = "        _is_incognito_research(rid) for rid in (armed, _fb_research_id) if rid)"
+QUIET_NOTE = ("    if _is_incognito_research(_rid):\n"
+              '        log(f"[incognito] {_rid[:8]}… keeps nothing')
+# ⛔ THE LINE ABOVE IS PART OF EACH SWEEP ANCHOR: the ZOMBIE and ABANDONED
+# topic lines are the same expression at two indents, and the shallower one is
+# a substring of the deeper.
+SWEEP_ZOMBIE = ("stale-skip ZOMBIE {(data.get('researchId') or '')[:8]}… \"\n"
+                "                        f\"topic={_loggable_topic(data.get('topic'), "
+                "data.get('researchId'))!r} \"")
+SWEEP_ABANDONED = ("stale-skip ABANDONED {(data.get('researchId') or '')[:8]}… \"\n"
+                   "                    f\"topic={_loggable_topic(data.get('topic'), "
+                   "data.get('researchId'))!r} \"")
+SWEEP_LEGACY = "f\"topic={_loggable_topic(data.get('topic'), _rid_legacy)!r} \""
+RESCAN_ERR = ("claim error — skipping {(d.get('researchId') or '')[:8]}… \"\n"
+              "                    f\"topic={_loggable_topic(d.get('topic'), d.get('researchId'))!r}")
+RESCAN_LOST = ("lost to sibling — skipping {(d.get('researchId') or '')[:8]}… \"\n"
+               "                    f\"topic={_loggable_topic(d.get('topic'), d.get('researchId'))!r}")
+LOGIN_TITLE = "                    if not _is_incognito_research(_queue_dir_research_id(qdir)):"
+TITLE_WHOSE = "    _keeps_nothing = _is_incognito_research(_fb_research_id)"
+TITLE_WORDS = ("                    _anchor_words = (_BUNDLE_TOPIC_MARK if _keeps_nothing\n"
+               '                                     else ", ".join(_t_anchors[:6]))')
+TB_GATE = ("    if _is_incognito_research(research_id):\n"
+           "        for line in traceback.format_exc().rstrip().splitlines():\n"
+           '            log(line, "ERROR")\n'
+           "        return\n"
+           "    traceback.print_exc()")
+TB_CALL = "        _print_pipeline_traceback(research_id)"
 
 # ── anchors: the two seams a recovery status has to satisfy at once ─────────
 ENQUEUE_WHITELIST = (
@@ -760,6 +794,81 @@ MUTANTS = [
      "one the purge already took, as a fragment holding only a fuse",
      [(LEASE_DOC_WRITE, '                        .set(_be_payload({"expireAt": '
                         '_incognito_expire_at(rid)}), merge=True),')]),
+
+    # ══ backend.log is the machine's (repair round) ═════════════════════════
+    ("B1", "under", "⛔⛔ log() prints every line again — the rule is perfect and "
+     "nothing asks it, so a private run's topic, brief and pages reach the "
+     "owner's log and support bundle",
+     [(LOG_CONSOLE, "    _console_print(line)")]),
+    ("B2", "under", "⛔⛔ the rule stops asking the armed run, so every queued "
+     "private run prints its lines like any other",
+     [(CW_ARMED, "    armed = None")]),
+    ("B3", "under", "⛔ the second witness goes — a run whose folder could not be "
+     "armed prints everything",
+     [(CW_ANY, "        _is_incognito_research(rid) for rid in (armed,) if rid)")]),
+    ("B4", "over", "⛔⛔ the machine's own lines are withheld too, so a private run "
+     "on a shared computer blinds its owner to the heartbeat and the sweeps",
+     [(CW_SCOPE, "    about_the_run = True")]),
+    ("B5", "over", "⛔⛔ every armed run is withheld, so the owner's log loses every "
+     "ordinary run's account of itself",
+     [(CW_ANY, "        True for rid in (armed, _fb_research_id) if rid)")]),
+    ("B6", "under", "the gap is not explained — an hour of silence in the owner's "
+     "log reads as a hung machine",
+     [(QUIET_NOTE, "    if False:\n"
+                   '        log(f"[incognito] {_rid[:8]}… keeps nothing')]),
+    ("B7", "under", "⛔ the zombie sweep prints the topic again",
+     [(SWEEP_ZOMBIE, "stale-skip ZOMBIE {(data.get('researchId') or '')[:8]}… \"\n"
+                     "                        f\"topic={(data.get('topic') or '')[:40]!r} \"")]),
+    ("B8", "under", "⛔⛔ the abandoned sweep prints the topic again — the measured "
+     "path: a cancelled private run, a switched-off computer, the owner's boot",
+     [(SWEEP_ABANDONED, "stale-skip ABANDONED {(data.get('researchId') or '')[:8]}… \"\n"
+                        "                    f\"topic={(data.get('topic') or '')[:40]!r} \"")]),
+    ("B9", "under", "the legacy staleness sweep prints the topic again",
+     [(SWEEP_LEGACY, "f\"topic={(data.get('topic') or '')[:40]!r} \"")]),
+    ("B10", "under", "⛔ the idle rescan's claim-error line prints the topic again",
+     [(RESCAN_ERR, "claim error — skipping {(d.get('researchId') or '')[:8]}… \"\n"
+                   "                    f\"topic={(d.get('topic') or '')[:40]!r}")]),
+    ("B11", "under", "⛔ the idle rescan's lost-to-a-sibling line prints the topic "
+     "again — ordinary on any machine with two workers",
+     [(RESCAN_LOST, "lost to sibling — skipping {(d.get('researchId') or '')[:8]}… \"\n"
+                    "                    f\"topic={(d.get('topic') or '')[:40]!r}")]),
+    ("B12", "under", "⛔⛔ `--login` reads a member's private topic out on the "
+     "owner's own terminal and into their session log",
+     [(LOGIN_TITLE, "                    if True:")]),
+    ("B13", "over", "`--login` stops naming any run, so the owner cannot tell "
+     "which of their runs it is about to close",
+     [(LOGIN_TITLE, "                    if False:")]),
+    ("B14", "under", "⛔ a late title refusal prints a private run's topic words",
+     [(TITLE_WHOSE, "    _keeps_nothing = False")]),
+    ("B15", "under", "⛔⛔ the worker asks whose run it is when it WRITES — by then "
+     "the run has returned, nobody knows, and the words go out",
+     [(TITLE_WORDS, "                    _anchor_words = (_BUNDLE_TOPIC_MARK if "
+                    "_is_incognito_research(_fb_research_id)\n"
+                    '                                     else ", ".join(_t_anchors[:6]))')]),
+    ("B16", "over", "every run's refusal line loses its anchors, which is the "
+     "one thing an operator reads it for",
+     [(TITLE_WHOSE, "    _keeps_nothing = True")]),
+    ("B17", "under", "⛔ a dying private run prints its traceback — and the "
+     "exception's own text — to backend.err.log",
+     [(TB_GATE, "    traceback.print_exc()")]),
+    ("B18", "under", "⛔⛔ the pipeline prints the traceback itself again, so the "
+     "helper is perfect and nothing calls it",
+     [(TB_CALL, '        __import__("traceback").print_exc()')]),
+    ("B19", "under", "the pipeline asks about no run, so every traceback goes to "
+     "stderr",
+     [(TB_CALL, "        _print_pipeline_traceback(None)")]),
+    ("B20", "over", "an ordinary run's traceback is swallowed — where an operator "
+     "has always looked is empty",
+     [(TB_GATE, "    if True:\n"
+                "        for line in traceback.format_exc().rstrip().splitlines():\n"
+                '            log(line, "ERROR")\n'
+                "        return\n"
+                "    traceback.print_exc()")]),
+    ("B21", "under", "a private run's traceback is dropped instead of kept in its "
+     "own lines, so its folder cannot say how it died",
+     [(TB_GATE, "    if _is_incognito_research(research_id):\n"
+                "        return\n"
+                "    traceback.print_exc()")]),
 
     # ══ the pins that hold four copies of the id shape together ════════════
     # ⛔ THESE MUTATE A TEST FILE, which is the only place their decision
