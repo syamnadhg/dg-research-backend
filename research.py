@@ -19218,6 +19218,19 @@ _phase_status_by_rid: dict = {}
 # → status strings); 64 recent runs is far more than any worker holds live.
 _STATUS_BY_RID_CAP = 64
 
+# ⛔⛔ ONE MACHINE WRITER OF THE PHASE LIST AT A TIME (wave 10.10). "Ordering no
+# longer matters" above is true of the STATUS, and it is not true of the rest of
+# a row. `_do_phase_terminal_status_write` is a read-modify-write on a daemon
+# thread, fired by `phase_complete`: it reads the array, and if a whole-array
+# write lands between its read and its write — the save that closes phase 2, the
+# hand-off that closes phase 3 — it writes back the array it READ, and the row's
+# end and duration are gone. That is the row the web's timeline measured on
+# every run that finished normally: phase 3 "complete", a "Phase 3" label, no
+# end and no duration. Held across each writer's read and write, the later
+# writer always reads what the earlier one wrote. Re-entrant, and never held
+# while `_grpc_heal_lock` is: `_grpc_write_with_heal` never calls its op under it.
+_phases_write_lock = threading.RLock()
+
 
 def _record_terminal_status(store: dict, rid: str, key, status: str) -> None:
     """Synchronously record a terminal status under store[rid][key], evicting
@@ -19378,20 +19391,23 @@ def _do_phase_terminal_status_write(phase_num: int, status: str):
         # the READ too — wrap the whole read+upsert+update so the heal's force-
         # refresh re-runs both. _be_payload the update (deviceUpdatingFor's
         # payload clause REQUIRES deviceId; a raw dict 403s even fresh).
-        snap = ref.get()
-        data = (snap.to_dict() or {}) if snap.exists else {}
-        phases = list(data.get("phases") or [])
-        # Upsert by phase number
-        found = False
-        for entry in phases:
-            if isinstance(entry, dict) and entry.get("phase") == phase_num:
-                entry["status"] = status
-                found = True
-                break
-        if not found:
-            phases.append({"phase": phase_num, "label": f"Phase {phase_num}",
-                           "startedAt": int(time.time() * 1000), "status": status})
-        ref.update(_be_payload({"phases": phases}))
+        # ⛔⛔ Under `_phases_write_lock`, read AND write (wave 10.10): this is the
+        # write that used to land the array it read over a row's end.
+        with _phases_write_lock:
+            snap = ref.get()
+            data = (snap.to_dict() or {}) if snap.exists else {}
+            phases = list(data.get("phases") or [])
+            # Upsert by phase number
+            found = False
+            for entry in phases:
+                if isinstance(entry, dict) and entry.get("phase") == phase_num:
+                    entry["status"] = status
+                    found = True
+                    break
+            if not found:
+                phases.append({"phase": phase_num, "label": f"Phase {phase_num}",
+                               "startedAt": int(time.time() * 1000), "status": status})
+            ref.update(_be_payload({"phases": phases}))
 
     try:
         _grpc_write_with_heal(_op, what=f"phase-status phase={phase_num}")
@@ -69268,15 +69284,110 @@ def _downsample_progress_history(raw, cap=60):
     return out
 
 
-def save_meta(queue_dir, topic, phase, status="ongoing", *, research=None, **extra):
+#: ⛔ One writer of a run's `meta.json` at a time, in this process (wave 10.10).
+#: The phase-3 save runs on a thread and reads the file BEFORE a podcast scan of
+#: a few seconds; the hand-off closes phase 3 in the same file in between. Held
+#: only across a read-and-write that is fast — never across the scan.
+_meta_json_lock = threading.RLock()
+
+
+def _phase_rows(meta, phase, now_ms, _began, _rid):
+    """The run's phase rows, backfilled up to `phase`, with `phase` closed at
+    `now_ms` and each row carrying the status recorded for research `_rid`.
+
+    Moved out of `save_meta` (wave 10.10) so the hand-off closes phase 3 with
+    exactly these rules — `_record_hand_off` — rather than a second copy of
+    them. `_began` is when the caller's phase began, if it knows (see below).
+    Mutates and returns `meta["phases"]` when it exists."""
+    phases = meta.get("phases", [])
+    # Canonical 6-phase timeline (0-5). Audio is part of NotebookLM (phase 3),
+    # NOT a separate phase — the BE records the whole NLM+audio span as phase 3
+    # (see the phase_complete phase=3 with the full _p3_start duration). Phase 4
+    # is YouTube, phase 5 is Delivery (both FE-stamped). The old 7-entry array
+    # split "Audio Overview" out as its own phase, which mislabeled the Analytics
+    # timeline; kept in lockstep with web PHASE_META + the FE P4/P5 phase stamps.
+    phase_labels = ["Initializing", "Research Brief", "Deep Research",
+                    "Links + NotebookLM + Audio", "Video + YouTube", "Delivery"]
+    # Ensure all phases up to current exist
+    while len(phases) <= phase:
+        p_idx = len(phases)
+        # Start time: use previous phase's completedAt, or createdAt for first phase
+        start = meta.get("createdAt", now_ms)
+        if p_idx > 0 and len(phases) > 0 and phases[-1].get("completedAt"):
+            start = phases[-1]["completedAt"]
+        phases.append({
+            "phase": p_idx,
+            "label": phase_labels[p_idx] if p_idx < len(phase_labels) else f"Phase {p_idx}",
+            "startedAt": start,
+            "completedAt": None,
+            "durationSec": 0,
+        })
+    # ⛔⛔ A PHASE ENDS WHEN THE NEXT ONE STARTS (wave 10.10). The first write is
+    # the END of phase 1, and the loop above backfills phase 0 open, so phase 0
+    # never had an end and phase 1 — starting at the run's start — carried
+    # phase 0's whole span. A caller that knows when its phase began says so in
+    # `started_ms`, and that instant opens this phase and closes phase 0.
+    #
+    # ⛔ ONLY PHASE 0 IS CLOSED THIS WAY, and not for want of generality. Its
+    # start is the run's own start; every other row this function leaves open is
+    # a backfill whose start is a guess (a phase skipped, or never saved), so
+    # closing it would print a duration for a phase that may never have run —
+    # the invention the web's timeline refuses and shows as "—" instead.
+    # ⛔ And a start before the run began or after now is two clocks
+    # disagreeing, not a boundary: it is ignored. A row already closed is never
+    # rewritten.
+    if (isinstance(_began, int) and meta.get("createdAt", 0) <= _began <= now_ms
+            and 0 < phase < len(phases) and phases[phase]["completedAt"] is None):
+        phases[phase]["startedAt"] = _began
+        _prev = phases[phase - 1]
+        if phase == 1 and _prev.get("completedAt") is None:
+            _prev["completedAt"] = _began
+            _prev["durationSec"] = max(0, (_began - int(_prev.get("startedAt") or _began)) // 1000)
+    # Mark current phase as completed with actual duration
+    if phase < len(phases) and phases[phase]["completedAt"] is None:
+        phases[phase]["completedAt"] = now_ms
+        started = phases[phase].get("startedAt", now_ms)
+        phases[phase]["durationSec"] = max(0, (now_ms - started) // 1000)
+
+    # #722 Bug A: carry per-phase terminal status onto the rebuilt entries.
+    # A Firestore array can't be dotted-merged, so the whole-array
+    # .update({"phases": …}) below always replaces it — the status that
+    # _write_phase_terminal_status wrote (via the daemon-thread read-modify-
+    # write) would be lost unless we re-stamp it here. Only overwrite when the
+    # runtime knows a status for that phase; otherwise leave any status already
+    # carried in meta.json (resume) intact.
+    _pstat = _phase_status_by_rid.get(_rid, {}) or {}
+    for _entry in phases:
+        if isinstance(_entry, dict):
+            _ps = _pstat.get(_entry.get("phase"))
+            if _ps:
+                _entry["status"] = _ps
+    return phases
+
+
+def save_meta(queue_dir, topic, phase, status="ongoing", *, research=None,
+              runtime=None, scans_only=False, **extra):
     """Save/update meta.json — powers ALL frontend components (graphs, analytics, tracking).
     Contains: Research object + per-agent stats + phase timeline + source references.
 
     ⛔ `research` is `(uid, research_id)` for a caller that can still be running
     after its run has ended — the phase-3 thread (`_save_meta_in_background`).
     Without it the record is whichever one the pipeline globals name when the
-    write happens, which by then can be the next member's."""
+    write happens, which by then can be the next member's.
+
+    ⛔ `runtime` is that caller's per-agent data, captured when it was
+    dispatched (`_runtime_at_dispatch`) — the same argument as `research`, for
+    the data rather than the address. None reads the live `_runtime`.
+
+    ⛔⛔ `scans_only` is that caller again (wave 10.10): write what this save
+    SCANNED — documents, podcasts, agents — and nothing about where the run IS.
+    No `status`, no `phase`, no phase list, on disk or in the cloud. The thread
+    usually lands after the hand-off, and from the hand-off on the cloud owns
+    all three: its `phase: 3` dragged the pointer back off the upload the route
+    had just claimed, and its phase list was a whole-array write over the rows
+    the web stamps for phases 4 and 5."""
     _uid, _rid = research if research else (_fb_uid, _fb_research_id)
+    _rt = runtime if runtime is not None else _runtime
     queue_dir = Path(queue_dir)
     meta_path = queue_dir / "meta.json"
     meta = {}
@@ -69409,7 +69520,7 @@ def save_meta(queue_dir, topic, phase, status="ongoing", *, research=None, **ext
             _panel_urls = []
             try:
                 _panel_urls = [
-                    u for u in (getattr(_runtime, "agent_progress_snapshots", {})
+                    u for u in (getattr(_rt, "agent_progress_snapshots", {})
                                 .get(platform, {}) or {}).get("source_urls", []) or []
                     if isinstance(u, str) and u.lower().startswith(("http://", "https://"))
                     and not _find_is_platform_host(u)
@@ -69440,7 +69551,7 @@ def save_meta(queue_dir, topic, phase, status="ongoing", *, research=None, **ext
             # window prunes past 50 entries and the values defaulted to 0,
             # making the stub show only chars+sources after a long break.
             try:
-                _snap = dict(getattr(_runtime, "agent_progress_snapshots", {}).get(platform, {}) or {})
+                _snap = dict(getattr(_rt, "agent_progress_snapshots", {}).get(platform, {}) or {})
             except Exception:
                 _snap = {}
             # Downsample the per-agent progressHistory ring (cap 240) to
@@ -69450,7 +69561,7 @@ def save_meta(queue_dir, topic, phase, status="ongoing", *, research=None, **ext
             # finished run shows flat "No data" because the in-memory
             # ring is already gone.
             try:
-                _raw_hist = list(getattr(_runtime, "agent_progress_history", {}).get(platform, []) or [])
+                _raw_hist = list(getattr(_rt, "agent_progress_history", {}).get(platform, []) or [])
             except Exception:
                 _raw_hist = []
             _down_hist = _downsample_progress_history(_raw_hist)
@@ -69470,7 +69581,7 @@ def save_meta(queue_dir, topic, phase, status="ongoing", *, research=None, **ext
                 if isinstance(_prev_hist, list) and _prev_hist:
                     _down_hist = _prev_hist
             try:
-                _findings = list(getattr(_runtime, "agent_findings", {}).get(platform, []) or [])
+                _findings = list(getattr(_rt, "agent_findings", {}).get(platform, []) or [])
             except Exception:
                 _findings = []
             agents[platform] = {
@@ -69541,7 +69652,7 @@ def save_meta(queue_dir, topic, phase, status="ongoing", *, research=None, **ext
         if platform not in agents or "sources" not in agents.get(platform, {}):
             try:
                 _fallback_snap = dict(
-                    getattr(_runtime, "agent_progress_snapshots", {}).get(platform, {}) or {})
+                    getattr(_rt, "agent_progress_snapshots", {}).get(platform, {}) or {})
             except Exception:
                 _fallback_snap = {}
             _fallback_urls = list(_fallback_snap.get("source_urls", []) or [])[:_SOURCE_LIST_CAP]
@@ -69586,71 +69697,9 @@ def save_meta(queue_dir, topic, phase, status="ongoing", *, research=None, **ext
             agents.setdefault(_key, {})["completionTimeSec"] = int(_secs)
 
     # ── Phase timeline (for timeline graph) ──
-    phases = meta.get("phases", [])
-    # Canonical 6-phase timeline (0-5). Audio is part of NotebookLM (phase 3),
-    # NOT a separate phase — the BE records the whole NLM+audio span as phase 3
-    # (see the phase_complete phase=3 with the full _p3_start duration). Phase 4
-    # is YouTube, phase 5 is Delivery (both FE-stamped). The old 7-entry array
-    # split "Audio Overview" out as its own phase, which mislabeled the Analytics
-    # timeline; kept in lockstep with web PHASE_META + the FE P4/P5 phase stamps.
-    phase_labels = ["Initializing", "Research Brief", "Deep Research",
-                    "Links + NotebookLM + Audio", "Video + YouTube", "Delivery"]
+    # The rows are built by `_phase_rows`, which the hand-off shares.
     now_ms = int(time.time() * 1000)
-    # Ensure all phases up to current exist
-    while len(phases) <= phase:
-        p_idx = len(phases)
-        # Start time: use previous phase's completedAt, or createdAt for first phase
-        start = meta.get("createdAt", now_ms)
-        if p_idx > 0 and len(phases) > 0 and phases[-1].get("completedAt"):
-            start = phases[-1]["completedAt"]
-        phases.append({
-            "phase": p_idx,
-            "label": phase_labels[p_idx] if p_idx < len(phase_labels) else f"Phase {p_idx}",
-            "startedAt": start,
-            "completedAt": None,
-            "durationSec": 0,
-        })
-    # ⛔⛔ A PHASE ENDS WHEN THE NEXT ONE STARTS (wave 10.10). The first write is
-    # the END of phase 1, and the loop above backfills phase 0 open, so phase 0
-    # never had an end and phase 1 — starting at the run's start — carried
-    # phase 0's whole span. A caller that knows when its phase began says so in
-    # `started_ms`, and that instant opens this phase and closes phase 0.
-    #
-    # ⛔ ONLY PHASE 0 IS CLOSED THIS WAY, and not for want of generality. Its
-    # start is the run's own start; every other row this function leaves open is
-    # a backfill whose start is a guess (a phase skipped, or never saved), so
-    # closing it would print a duration for a phase that may never have run —
-    # the invention the web's timeline refuses and shows as "—" instead.
-    # ⛔ And a start before the run began or after now is two clocks
-    # disagreeing, not a boundary: it is ignored. A row already closed is never
-    # rewritten.
-    _began = extra.get("started_ms")
-    if (isinstance(_began, int) and meta.get("createdAt", 0) <= _began <= now_ms
-            and 0 < phase < len(phases) and phases[phase]["completedAt"] is None):
-        phases[phase]["startedAt"] = _began
-        _prev = phases[phase - 1]
-        if phase == 1 and _prev.get("completedAt") is None:
-            _prev["completedAt"] = _began
-            _prev["durationSec"] = max(0, (_began - int(_prev.get("startedAt") or _began)) // 1000)
-    # Mark current phase as completed with actual duration
-    if phase < len(phases) and phases[phase]["completedAt"] is None:
-        phases[phase]["completedAt"] = now_ms
-        started = phases[phase].get("startedAt", now_ms)
-        phases[phase]["durationSec"] = max(0, (now_ms - started) // 1000)
-
-    # #722 Bug A: carry per-phase terminal status onto the rebuilt entries.
-    # A Firestore array can't be dotted-merged, so the whole-array
-    # .update({"phases": …}) below always replaces it — the status that
-    # _write_phase_terminal_status wrote (via the daemon-thread read-modify-
-    # write) would be lost unless we re-stamp it here. Only overwrite when the
-    # runtime knows a status for that phase; otherwise leave any status already
-    # carried in meta.json (resume) intact.
-    _pstat = _phase_status_by_rid.get(_rid, {}) or {}
-    for _entry in phases:
-        if isinstance(_entry, dict):
-            _ps = _pstat.get(_entry.get("phase"))
-            if _ps:
-                _entry["status"] = _ps
+    phases = _phase_rows(meta, phase, now_ms, extra.get("started_ms"), _rid)
 
     # ── Write meta ──
     meta.update({
@@ -69666,7 +69715,22 @@ def save_meta(queue_dir, topic, phase, status="ongoing", *, research=None, **ext
         "phases": phases,
         "updatedAt": now_ms,
     })
-    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    with _meta_json_lock:
+        if scans_only:
+            # ⛔ Where the run IS, as the file says it NOW — not as it said when
+            # this save began, before a podcast scan the hand-off did not wait
+            # for. Read under the lock the hand-off writes under.
+            try:
+                _on_disk = (json.loads(meta_path.read_text(encoding="utf-8"))
+                            if meta_path.exists() else {})
+            except Exception:
+                _on_disk = {}
+            for _k in ("status", "phase", "phases"):
+                if _k in _on_disk:
+                    meta[_k] = _on_disk[_k]
+                else:
+                    meta.pop(_k, None)
+        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     # ── Propagate structured agents/phases to Firestore research doc ──
     # Without this, the frontend Analytics page never sees per-agent stats or
@@ -69679,6 +69743,11 @@ def save_meta(queue_dir, topic, phase, status="ongoing", *, research=None, **ext
         "phase": phase,
         "updatedAt": now_ms,
     }
+    if scans_only:
+        _record = {"agents": agents, "updatedAt": now_ms}
+    # ⛔⛔ Under `_phases_write_lock` (wave 10.10): this whole-array write is the
+    # one a phase-status thread's stale read used to land on top of.
+    _phases_write_lock.acquire()
     try:
         if research:
             _update_research_doc(_uid, _rid, _record)
@@ -69686,6 +69755,8 @@ def save_meta(queue_dir, topic, phase, status="ongoing", *, research=None, **ext
             _update_firestore_research(_record)
     except Exception as _e:
         log(f"save_meta: firestore propagation failed: {_e}", "WARN")
+    finally:
+        _phases_write_lock.release()
 
 
 def _save_meta_in_background(queue_dir, topic, phase) -> None:
@@ -69697,17 +69768,148 @@ def _save_meta_in_background(queue_dir, topic, phase) -> None:
     moments later — teardown, the next member's run dequeued, setup. Asked at
     write time, the thread wrote this run's agents map — every agent's sources
     and findings — onto THAT person's record. The research is named here, at
-    dispatch."""
+    dispatch.
+
+    ⛔⛔ AND SO IS WHAT IT WRITES (wave 10.10). Naming the research moved the
+    write to the right record and left it reading `_runtime` — the panel
+    sources, the progress curves, the findings — at write time, and the next
+    run's `_runtime.reset()` empties exactly those. So the late write put an
+    empty findings list and no curves on its OWN run's record. They are copied
+    here, before the thread exists.
+
+    ⛔⛔ AND IT SAYS NOTHING ABOUT WHERE THE RUN IS (`scans_only`): no status, no
+    phase, no phase list. It usually lands after the hand-off, and the hand-off
+    is where phase 3 ends (`_record_hand_off`) — after it, the phase list is the
+    cloud's."""
     try:
         _threading.Thread(
             target=save_meta,
             args=(queue_dir, topic, phase),
-            kwargs={"research": (_fb_uid, _fb_research_id)},
+            kwargs={"research": (_fb_uid, _fb_research_id),
+                    "runtime": _runtime_at_dispatch(),
+                    "scans_only": True},
             name=f"p{phase}-savemeta-ffprobe",
             daemon=True,
         ).start()
     except Exception as _smt_e:
         log(f"[Phase {phase}] failed to dispatch save_meta thread: {_smt_e}", "WARN")
+
+
+def _runtime_at_dispatch():
+    """The per-agent data `save_meta` reads off `_runtime`, copied NOW, for a
+    save that will run after this run's runtime is gone.
+
+    ⛔ A COPY, NOT A REFERENCE. `reset()` rebinds these maps today, so holding
+    the old ones would happen to work — until a reset that clears in place, or
+    a late mutation by this run's own teardown. The copy is the only form that
+    means "as of dispatch" whatever either of those does."""
+    import copy as _copy
+
+    class _AtDispatch:
+        pass
+
+    held = _AtDispatch()
+    for name in ("agent_progress_snapshots", "agent_progress_history", "agent_findings"):
+        live = dict(getattr(_runtime, name, {}) or {})
+        try:
+            setattr(held, name, _copy.deepcopy(live))
+        except Exception:
+            setattr(held, name, live)
+    return held
+
+
+def _record_hand_off(queue_dir, research, phase3_began_ms) -> None:
+    """THE HAND-OFF'S WRITE: `beDone`, and phase 3's end with it (wave 10.10).
+
+    ⛔⛔ PHASE 3 HAD NO END ON A RUN THAT FINISHED NORMALLY. Only a stop saved
+    phase 3; the phase-3 thread closed it BEFORE the no-audio retries and
+    `phase_complete`, and then the status write that `phase_complete` fires —
+    a read-modify-write on a daemon thread — landed the array it had read over
+    it. What the web's timeline measured was the status write's own row: a
+    "Phase 3" label, a `startedAt` that is really when the phase FINISHED, no
+    end and no duration.
+
+    ⭐ THE HAND-OFF IS PHASE 3'S END, and it already makes one write. The row
+    goes into that write, so there is no later machine write of the phase list
+    to race anything: from `beDone` on, phases 4 and 5 are the cloud's and the
+    web writes them.
+
+    ⛔ ONLY PHASE 3's ROW CHANGES. The record's array is read and every other row
+    is written back as read — including a phase-4 row a watched run's browser
+    may already have had the route stamp — under `_phases_write_lock`, so the
+    machine's own status write cannot interleave either.
+
+    ⛔ NOTHING IS INVENTED. `phase3_began_ms` is when phase 3 began in THIS
+    process; a phase 3 that was skipped or resumed past has none, and a start
+    the rows refuse (before the run, after now) is no start. Either way the
+    write is the hand-off alone, exactly as before.
+
+    ⛔ AND THE HAND-OFF ALWAYS LANDS. `beDone` is what stops a restart stamping
+    a run the cloud is finishing; if the read-and-write that carries the row
+    fails, the hand-off is written on its own."""
+    uid, rid = research
+    handoff_ms = int(time.time() * 1000)
+    handoff = {"beDone": True, "beDoneAt": handoff_ms}
+    row = _close_phase_three_on_disk(queue_dir, rid, phase3_began_ms, handoff_ms)
+    if row is None or not (_firebase_db and uid and rid):
+        _update_research_doc(uid, rid, handoff)
+        return
+    ref = _firebase_db.collection("users").document(uid) \
+        .collection("researches").document(rid)
+
+    def _op():
+        with _phases_write_lock:
+            snap = ref.get()
+            data = (snap.to_dict() or {}) if snap.exists else {}
+            rows = list(data.get("phases") or [])
+            for i, have in enumerate(rows):
+                if isinstance(have, dict) and have.get("phase") == 3:
+                    rows[i] = {**have, **row}
+                    break
+            else:
+                rows.append(dict(row))
+            ref.update(_be_payload(_with_incognito_renewal(
+                {**handoff, "phases": rows}, rid)))
+
+    try:
+        _grpc_write_with_heal(_op, what=f"hand-off rid={rid[:8]}…")
+    except Exception as e:
+        log(f"hand-off: phase 3's end did not reach the record ({e}) — "
+            f"writing the hand-off on its own", "WARN")
+        _update_research_doc(uid, rid, handoff)
+
+
+def _close_phase_three_on_disk(queue_dir, rid, began_ms, end_ms):
+    """Phase 3's row in `meta.json`, closed at the hand-off; returned for the
+    record, or None when there is nothing true to write (see
+    `_record_hand_off`).
+
+    ⛔ A ROW AN EARLIER ATTEMPT CLOSED IS REOPENED. A stop or a pause saves
+    phase 3 closed at that moment; a resume that runs phase 3 again ends it
+    HERE, and that is the span it ran. `_phase_rows` never rewrites a closed
+    row, which is right for a repeat save and wrong for this."""
+    if not isinstance(began_ms, int) or isinstance(began_ms, bool):
+        return None
+    meta_path = Path(queue_dir) / "meta.json"
+    with _meta_json_lock:
+        try:
+            meta = (json.loads(meta_path.read_text(encoding="utf-8"))
+                    if meta_path.exists() else {})
+        except Exception:
+            return None
+        if "id" not in meta:
+            meta["id"] = Path(queue_dir).name
+            meta["createdAt"] = _run_started_ms(queue_dir)
+        rows = meta.get("phases")
+        if isinstance(rows, list) and len(rows) > 3 and isinstance(rows[3], dict):
+            rows[3]["completedAt"] = None
+        rows = _phase_rows(meta, 3, end_ms, began_ms, rid)
+        row = rows[3] if len(rows) > 3 and isinstance(rows[3], dict) else None
+        if row is None or row.get("startedAt") != began_ms:
+            return None
+        meta["phases"] = rows
+        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        return dict(row)
 
 
 def _handed_off_to_cloud(queue_dir) -> bool:
@@ -71343,6 +71545,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     # supposed to report what happened. The comment directly above records that
     # this exact trap was already paid for once with `audio_overview_url`.
     _p3_audio_stored = ""
+    # ⛔ AND ONCE MORE (wave 10.10): the hand-off reads when phase 3 began, to
+    # close its row. A run that skipped phase 3 or resumed past it never
+    # assigns this, and must reach the hand-off saying "no start", not raising.
+    _p3_start = None
 
     # #910: a resumed run is ongoing again. Clear a stale local "paused"
     # (login-interrupt / in-process pause) so _plan_pipeline_auto_retry's
@@ -74647,7 +74853,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # instead of stamping the run. research.status deliberately stays
         # "ongoing" through the cloud tail — the route's final phase-5 write is
         # what makes it "completed".
-        _update_firestore_research({"beDone": True, "beDoneAt": int(time.time() * 1000)})
+        # ⛔⛔ AND PHASE 3 ENDS IN THIS WRITE (wave 10.10) — the only place it can
+        # without a later machine write of the phase list. See the helper.
+        _record_hand_off(queue_dir, (_fb_uid, _fb_research_id),
+                         int(_p3_start * 1000) if _p3_start else None)
         # The cloud kick. The machine has finished its work through P3 (audio in
         # Firebase Storage); `/api/uploadYouTube` runs P4 (YouTube upload), then
         # chains P5 (Super Research, summary, Doc, email) and writes
