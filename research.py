@@ -16789,9 +16789,10 @@ def _pickup_withdrawn(uid, research_id, where: str) -> "tuple[str | None, dict |
     status for its own checks does not read it twice.
 
     ⛔⛔ A READ THAT FAILS TAKES THE JOB — it is never a deletion. Standing
-    down is irreversible and silent: every caller deletes the only copy of the
-    request (the queue document, or the boot snapshot's entry) and tells
-    nobody, while the person watches a tile that says queued. A read fails for
+    down is irreversible and silent: the listener and the rescan delete the
+    queue document and the boot restore sheds the snapshot's entry — the only
+    copy of the request — and nobody is told, while the person watches a tile
+    that says queued. A read fails for
     reasons that say nothing about the record — a network blip at boot, a token
     mid-refresh, the fresh-sharer-document race the rules file documents — and
     all of them happen to runs somebody is waiting for. The opposite mistake is
