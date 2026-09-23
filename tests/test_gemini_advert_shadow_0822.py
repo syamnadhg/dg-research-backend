@@ -107,7 +107,7 @@ def test_a_versioned_sales_row_beats_every_genuine_row_today():
     """The live behaviour: shadow mode leaves the advert row winning."""
     got = _rank([ADVERT_VERSIONED, *GENUINE_ROWS])
     assert got["clicked"] is True
-    assert got["version"] == 4.0
+    assert got["version"] == "4.0"
     assert "google ai ultra" in got["pick"]
 
 
@@ -157,7 +157,7 @@ def test_the_family_keyed_rule_still_leaves_the_dangerous_row_clicked():
 def test_enforcing_drops_the_sales_row_and_takes_the_real_winner():
     got = _rank([ADVERT_VERSIONED, *GENUINE_ROWS], drop=True)
     assert got["clicked"] is True
-    assert got["version"] == 3.6
+    assert got["version"] == "3.6"
     assert got["pick"].startswith("3.6 flash")
     assert got["advertPick"] is False
 
@@ -172,7 +172,7 @@ def test_enforcing_does_not_touch_a_genuine_row_whose_blurb_says_advanced():
     row = "3.6 FlashTry our advanced reasoning on everyday questions"
     got = _rank([row], drop=True)
     assert got["clicked"] is True
-    assert got["version"] == 3.6
+    assert got["version"] == "3.6"
     assert got["adverts"] == []
 
 
@@ -195,7 +195,7 @@ def test_a_row_is_scored_before_reject_so_the_measurement_is_not_hollow():
 def test_shadow_scores_the_winner_without_dropping_it():
     got = _rank([ADVERT_VERSIONED, *GENUINE_ROWS], drop=False)
     assert got["advertPick"] is True
-    assert got["version"] == 4.0
+    assert got["version"] == "4.0"
 
 
 def test_the_two_modes_pick_differently_on_the_same_menu():
@@ -219,7 +219,7 @@ def test_no_nouns_means_no_rule_at_all():
     """An empty noun list must not silently fall back to the family word."""
     got = _rank([ADVERT_VERSIONED, *GENUINE_ROWS], nouns=[], drop=True)
     assert got["adverts"] == []
-    assert got["version"] == 4.0
+    assert got["version"] == "4.0"
 
 
 # ── 5. The ported matcher agrees with its Python definition ──────────────────
@@ -360,8 +360,8 @@ def test_pick_highest_model_can_mirror_the_gemini_rule():
     tight = models.pick_highest_model(labels, "flash", reject=rej,
                                       drop_upsell=True,
                                       sale_nouns=models.upsell_nouns("gemini"))
-    assert loose["version"] == 4.0        # the family-keyed rule cannot see it
-    assert tight["version"] == 3.6        # the plan-keyed rule drops it
+    assert loose["version"] == "4.0"      # the family-keyed rule cannot see it
+    assert tight["version"] == "3.6"      # the plan-keyed rule drops it
 
 
 def test_sale_nouns_without_the_flag_changes_nothing():
@@ -370,7 +370,7 @@ def test_sale_nouns_without_the_flag_changes_nothing():
     got = models.pick_highest_model(labels, "flash",
                                     reject=models.reject_terms("gemini"),
                                     sale_nouns=models.upsell_nouns("gemini"))
-    assert got["version"] == 4.0
+    assert got["version"] == "4.0"
 
 
 # ── 9. What the caller says ──────────────────────────────────────────────────

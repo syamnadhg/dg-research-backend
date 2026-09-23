@@ -29,7 +29,9 @@ def test_ranker_rejects_siblings_before_parsing_the_version():
         "the ranker must reject lite/deep-think/pro BEFORE parsing the version."
     )
     # Highest-version-wins with shortest-text tie-break (prefer leaf over wrapper).
-    assert "rank[1] > bestRank[1]" in js and "t.length < bestLen" in js
+    # Version ORDER, not a float compare, since 2026-09-23 — executed in
+    # test_model_selection_precision.py (test_the_gemini_ranker_takes_3_10_over_3_8).
+    assert "cmpVer(rank[1], bestRank[1])" in js and "t.length < bestLen" in js
 
 
 def test_reject_list_and_family_come_from_policy_not_the_js():

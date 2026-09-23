@@ -103,9 +103,9 @@ def _claude_menu_with_wrapper():
 
 @needs_node
 def test_a_pinned_claude_version_clicks_the_row_not_the_wrapper():
-    out = run_js(_claude_menu_with_wrapper(), _claude_pick_js(), _claude_args(pin=5.0))
+    out = run_js(_claude_menu_with_wrapper(), _claude_pick_js(), _claude_args(pin="5"))
     assert out["ret"] is not None, "the pinned version is on the menu — it must be picked"
-    assert out["ret"]["version"] == 5.0
+    assert out["ret"]["version"] == "5"
     assert out["clicks"], "nothing was clicked"
     clicked = out["clicks"][-1]
     assert clicked.startswith("Opus 5"), f"clicked {clicked!r}"
@@ -126,9 +126,9 @@ def test_a_pinned_gemini_version_clicks_the_row_not_the_wrapper():
         el("div", {"role": "menuitem"}, "3.5 Flash Older"),
     ]
     spec = el("body", {}, "", [el("li", {}, "", rows)])   # <li> wrapper = a ranker candidate
-    out = run_js(spec, _gemini_rank_js(), _gem_args(pin=3.6))
+    out = run_js(spec, _gemini_rank_js(), _gem_args(pin="3.6"))
     assert out["ret"]["clicked"] is True
-    assert out["ret"]["version"] == 3.6
+    assert out["ret"]["version"] == "3.6"
     clicked = out["clicks"][-1].strip().lower()
     assert clicked == "3.6 flash all-around help", (
         f"clicked {clicked!r} — the wrapper li carries the pinned version in its "
@@ -147,13 +147,14 @@ def test_the_weekly_upgrade_end_to_end_selects_the_row_not_the_wrapper():
     probe = run_js(spec, _claude_probe_js(), {"fam": "opus"})
     # `chips` rides along on every probe result — it is what tells a plan limit
     # from a rename one layer up. Zero here: this menu offers genuine rows.
-    assert probe["ret"] == {"menu": True, "n": probe["ret"]["n"], "highest": 5.0,
+    assert probe["ret"] == {"menu": True, "n": probe["ret"]["n"], "highest": "5",
                             "chips": 0, "chipsAny": False}
     offered = probe["ret"]["highest"]
-    cur = 4.8
-    assert offered > cur + 0.001, "the upgrade branch must be the one taken"
+    cur = "4.8"
+    assert models.version_key(offered) > models.version_key(cur), (
+        "the upgrade branch must be the one taken")
     pick = run_js(spec, _claude_pick_js(), _claude_args(pin=offered, below=None))
-    assert pick["ret"]["version"] == 5.0
+    assert pick["ret"]["version"] == "5"
     assert pick["clicks"][-1] == "Opus 5 For complex tasks", (
         f"the upgrade clicked {pick['clicks'][-1][:60]!r} — an element that is not "
         "the row, so the model never changes while the run reports an upgrade")
@@ -170,7 +171,7 @@ def test_the_body_fallback_still_picks_when_no_menu_has_mounted():
     ])
     out = run_js(spec, _claude_pick_js(), _claude_args(triggerText="Opus 5 Max"))
     assert out["ret"] is not None, "no menu mounted and nothing was considered"
-    assert out["ret"]["version"] == 4.8
+    assert out["ret"]["version"] == "4.8"
     assert out["clicks"][-1] == "Opus 4.8 Older", (
         "the body fallback must still prefer the leaf, and must never click the "
         "trigger — clicking it just shuts the popover while reporting success")
@@ -192,16 +193,16 @@ def test_the_pin_outranks_a_newer_row_that_the_step_back_also_allows(pick_js_nam
         labels = ["Opus 4.8 Previous generation", "Opus 4.2 Known good"]
         spec = el("body", {}, "", [el("div", {"role": "menu"}, "", [
             el("div", {"role": "menuitemradio"}, t) for t in labels])])
-        out = run_js(spec, _claude_pick_js(), _claude_args(pin=4.2, below=5.0))
+        out = run_js(spec, _claude_pick_js(), _claude_args(pin="4.2", below="5"))
         want = "Opus 4.2"
     else:
         labels = ["3.5 Flash Previous", "3.2 Flash Known good"]
         spec = el("body", {}, "", [el("div", {"role": "menu"}, "", [
             el("div", {"role": "menuitem"}, t) for t in labels])])
-        out = run_js(spec, _gemini_rank_js(), _gem_args(pin=3.2, below=3.6))
+        out = run_js(spec, _gemini_rank_js(), _gem_args(pin="3.2", below="3.6"))
         want = "3.2 flash"
-    ver = out["ret"]["version"] if pick_js_name == "claude" else out["ret"]["version"]
-    assert ver == (4.2 if pick_js_name == "claude" else 3.2), (
+    ver = out["ret"]["version"]
+    assert ver == ("4.2" if pick_js_name == "claude" else "3.2"), (
         f"the pin lost to a newer row: got v{ver}")
     assert out["clicks"][-1].lower().startswith(want.lower()), out["clicks"][-1]
 
@@ -215,8 +216,8 @@ def test_a_retired_pin_still_falls_back_to_the_best_strictly_older_row():
         el("div", {"role": "menuitemradio"}, "Opus 4.8 Previous generation"),
     ]
     spec = el("body", {}, "", [el("div", {"role": "menu"}, "", rows)])
-    out = run_js(spec, _claude_pick_js(), _claude_args(pin=4.2, below=5.0))
-    assert out["ret"]["version"] == 4.8, "no 4.2 row exists — take the best below 5.0"
+    out = run_js(spec, _claude_pick_js(), _claude_args(pin="4.2", below="5"))
+    assert out["ret"]["version"] == "4.8", "no 4.2 row exists — take the best below 5"
     assert out["clicks"][-1].startswith("Opus 4.8")
 
 
@@ -247,7 +248,7 @@ def test_the_claude_picker_reads_either_version_order(label, rows):
         el("div", {"role": "menuitemradio"}, r) for r in rows])])
     out = run_js(spec, _claude_pick_js(), _claude_args())
     assert out["ret"] is not None, f"{label}: nothing picked"
-    assert out["ret"]["version"] == 5.0, f"{label}: parsed {out['ret']['version']}"
+    assert out["ret"]["version"] == "5", f"{label}: parsed {out['ret']['version']}"
     assert "4.8" not in out["clicks"][-1] and "Older" not in out["clicks"][-1], (
         f"{label}: the shortest label won, i.e. the version went unparsed — "
         "that is the downgrade this test exists for")
@@ -259,7 +260,7 @@ def test_the_gemini_ranker_reads_either_version_order(label, rows):
     spec = el("body", {}, "", [el("div", {"role": "menu"}, "", [
         el("div", {"role": "menuitem"}, r) for r in rows])])
     out = run_js(spec, _gemini_rank_js(), _gem_args())
-    assert out["ret"]["version"] == 3.6, f"{label}: parsed {out['ret']['version']}"
+    assert out["ret"]["version"] == "3.6", f"{label}: parsed {out['ret']['version']}"
     assert "older" not in out["clicks"][-1].lower(), f"{label}: picked the older row"
 
 
@@ -282,12 +283,12 @@ def test_a_sibling_family_above_ours_can_never_win_the_pick(sibling):
             el("div", {"role": "menuitemradio"}, t) for t in labels])])])
     args = _claude_args(triggerText="Opus 5 Max")
     pick = run_js(spec, _claude_pick_js(), args)
-    assert pick["ret"]["version"] == 5.0, (
+    assert pick["ret"]["version"] == "5", (
         f"read v{pick['ret']['version']} — a sibling family's number was taken "
         "for ours")
     assert pick["clicks"][-1] == "Opus 5", f"clicked {pick['clicks'][-1]!r}"
     probe = run_js(spec, _claude_probe_js(), {"fam": "opus"})
-    assert probe["ret"]["highest"] == 5.0, (
+    assert probe["ret"]["highest"] == "5", (
         f"the probe offers v{probe['ret']['highest']} — it would pin the picker "
         "to a version that is not on the menu, and record it as known-good")
 
@@ -296,12 +297,12 @@ def test_a_sibling_family_above_ours_can_never_win_the_pick(sibling):
 @pytest.mark.parametrize("rows,want", [
     # A digit in the DESCRIPTION, glued to the title — family-first must not
     # reach across the blurb to find it.
-    (["3.6 Flashall-around help, 2x faster", "3.5 Flash Older"], 3.6),
+    (["3.6 Flashall-around help, 2x faster", "3.5 Flash Older"], "3.6"),
     # ⭐ A digit in the description separated only by PUNCTUATION. "No letters in
     # between" does not exclude a comma, so this row read as version 2 — and the
     # older sibling then won the rank. A downgrade, produced by the adjacency
     # guard that exists to stop one.
-    (["3.6 Flash, 2x faster", "3.5 Flash Older"], 3.6),
+    (["3.6 Flash, 2x faster", "3.5 Flash Older"], "3.6"),
 ])
 def test_a_number_in_the_description_can_never_become_the_version(rows, want):
     spec = el("body", {}, "", [el("div", {"role": "menu"}, "", [
@@ -324,16 +325,19 @@ def test_the_claude_probe_reads_either_version_order(label, rows):
         el("div", {"role": "menuitemradio"}, r) for r in rows])])
     out = run_js(spec, _claude_probe_js(), {"fam": "opus"})
     assert out["ret"]["menu"] is True
-    assert out["ret"]["highest"] == 5.0, f"{label}: probe read {out['ret']['highest']}"
+    assert out["ret"]["highest"] == "5", f"{label}: probe read {out['ret']['highest']}"
 
 
 @pytest.mark.parametrize("text,fam,expected", [
-    ("opus 5 for complex tasks", "opus", 5.0),
-    ("5 opus for complex tasks", "opus", 5.0),
-    ("claude 3 opus", "opus", 3.0),
-    ("opus (4.8)", "opus", 4.8),
-    ("3.6 flashall-around help", "flash", 3.6),
-    ("flash 3.6all-around help", "flash", 3.6),
+    # The matched TEXT (2026-09-23): `float` read "5.10" as 5.1, below 5.5.
+    ("opus 5 for complex tasks", "opus", "5"),
+    ("5 opus for complex tasks", "opus", "5"),
+    ("claude 3 opus", "opus", "3"),
+    ("opus (4.8)", "opus", "4.8"),
+    ("3.6 flashall-around help", "flash", "3.6"),
+    ("flash 3.6all-around help", "flash", "3.6"),
+    ("opus 5.10 max", "opus", "5.10"),
+    ("3.10 flashnewest", "flash", "3.10"),
     ("opus for complex tasks", "opus", None),
     ("opus max", "opus", None),
     # ⭐⭐ THE WRAPPER. claude.ai renders a scroll container around the rows, so
@@ -342,19 +346,19 @@ def test_the_claude_probe_reads_either_version_order(label, rows):
     # 5.1, which outranks the real `Opus 5` leaf — so the picker clicked the
     # container (changing nothing) and reported an upgrade to a version no Opus
     # row ever had, which `record_known_good` then persisted as the pin target.
-    ("fable 5.1opus 5sonnet 5haiku 4.5", "opus", 5.0),
-    ("fable 5opus 5sonnet 5haiku 4.5", "opus", 5.0),
-    ("fable 4.9opus 5sonnet 5", "opus", 5.0),
+    ("fable 5.1opus 5sonnet 5haiku 4.5", "opus", "5"),
+    ("fable 5opus 5sonnet 5haiku 4.5", "opus", "5"),
+    ("fable 4.9opus 5sonnet 5", "opus", "5"),
     # ⭐ And the reason the ORDER alone is not the fix: family-first must not be
     # allowed to reach across the description to a number in the blurb.
-    ("3.6 flashall-around help, 2x faster", "flash", 3.6),
-    ("3.5 flash-litefastest answers new3.6 flash all-around help", "flash", 3.5),
+    ("3.6 flashall-around help, 2x faster", "flash", "3.6"),
+    ("3.5 flash-litefastest answers new3.6 flash all-around help", "flash", "3.5"),
     # ⭐ …and the reason "no LETTERS in between" is not enough either: a comma is
     # not a letter, so `3.6 Flash, 2x faster` read as version 2 — a downgrade
     # produced by the very guard meant to prevent one. Only plain separators.
-    ("3.6 flash, 2x faster", "flash", 3.6),
-    ("5 opus, 2x faster", "opus", 5.0),
-    ("opus (4.8)", "opus", 4.8),
+    ("3.6 flash, 2x faster", "flash", "3.6"),
+    ("5 opus, 2x faster", "opus", "5"),
+    ("opus (4.8)", "opus", "4.8"),
 ])
 def test_the_python_mirror_reads_both_orders_adjacently(text, fam, expected):
     assert models.parse_family_version(text, fam) == expected
@@ -435,10 +439,18 @@ def test_the_browser_reject_port_agrees_with_python_row_for_row(text, rejected):
     (None, 5.0, False),      # ⭐ the reported bug: DR recovered, nothing re-picked
     (5.0, 5.0, False),       # same model — not a step-back
     (5.0, 4.8, False),       # somehow newer — certainly not a step-back
-    (4.9999, 5.0, False),    # inside the epsilon
     (4.8, None, False),      # unknown failed version proves nothing
     (None, None, False),
-    ("4.8", 5.0, False),     # a string is not a version
+    # ⭐ 2026-09-23 — versions now travel as the TEXT the rankers matched, so
+    # text is a version (this row used to read "a string is not a version").
+    ("4.8", "5", True),
+    ("4.8", 5.0, True),      # text against a number stored before the change
+    ("5", 5.0, False),       # …and the same model in the two shapes
+    # ⛔ The case the floats got backwards: 5.9 is OLDER than 5.10. As floats it
+    # read 5.9 > 5.1, so a real retreat off a failed 5.10 was denied.
+    ("5.9", "5.10", True),
+    ("5.10", "5.9", False),
+    ("abc", "5", False),     # text that is not a version proves nothing
     (True, 5.0, False),      # a flag must not read as v1
     (1.0, True, False),
 ])
@@ -459,7 +471,7 @@ def _step_back_block():
 
 def test_the_step_back_notice_is_gated_on_a_proven_retreat():
     block = _step_back_block()
-    assert "if stepped_back_to(_stepped_to, _failed_f):" in block, (
+    assert "if stepped_back_to(_stepped_to, _failed_v):" in block, (
         "the drift notice must be gated on the predicate, not emitted whenever "
         "the retry happened to succeed")
     alert = block.index("_emit_model_drift_alert(")
@@ -765,7 +777,7 @@ def test_a_claude_menu_that_tops_out_on_an_older_opus_is_still_picked(top):
     assert out["ret"] is not None, (
         f"the highest opus offered is {top} and the picker selected nothing — a "
         f"version floor strands every account whose menu stops below it")
-    assert out["ret"]["version"] == float(top), f"picked v{out['ret']['version']}"
+    assert out["ret"]["version"] == top, f"picked v{out['ret']['version']}"
     assert out["clicks"] and out["clicks"][-1].startswith(f"Opus {top}"), (
         f"clicked {out['clicks'][-1] if out['clicks'] else None!r}")
 
@@ -780,5 +792,222 @@ def test_a_gemini_menu_that_tops_out_on_an_older_flash_is_still_picked(top):
     out = run_js(spec, _gemini_rank_js(), _gem_args())
     assert out["ret"] is not None and out["ret"]["clicked"], (
         f"the highest flash offered is {top} and the ranker selected nothing")
-    assert out["ret"]["version"] == float(top), f"picked v{out['ret']['version']}"
+    assert out["ret"]["version"] == top, f"picked v{out['ret']['version']}"
     assert "older" not in out["clicks"][-1].lower(), f"clicked {out['clicks'][-1]!r}"
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# 2026-09-23 — a version is whole numbers split at the dot, NOT a decimal
+# ═════════════════════════════════════════════════════════════════════════
+#
+# Every page script that read a version ended in `parseFloat(m[1])`, so "5.10"
+# was 5.1. Measured under node on the code before this fix: {Opus 5.5, Opus 5.10}
+# clicked 5.5; Gemini {3.8, 3.10} clicked 3.8; a computer already on 5.10 read its
+# trigger as 5.1, saw 5.5 "offered" and was moved BACK to it under the log line
+# "UPGRADE"; a step-back below a failed 5.10 on {5.9, 5.10} picked nothing. Every
+# case below fails against that code. Gemini Flash is already at 3.8, so 3.10 is
+# two releases away and its dropdown opens on every run.
+
+def _version_order_js():
+    return research._VERSION_ORDER_JS
+
+
+def _trigger_read_js():
+    return js_constant(research.setup_claude_dr, "_TRIGGER_READ_JS")
+
+
+def _claude_menu(rows):
+    return el("body", {}, "", [el("div", {"role": "menu"}, "", [
+        el("div", {"role": "menuitemradio"}, r) for r in rows])])
+
+
+def _gemini_menu(rows):
+    return el("body", {}, "", [el("div", {"role": "menu"}, "", [
+        el("div", {"role": "menuitem"}, r) for r in rows])])
+
+
+@needs_node
+@pytest.mark.parametrize("rows", [
+    ["Opus 5.5 For complex tasks", "Opus 5.10 For complex tasks"],
+    ["Opus 5.10 For complex tasks", "Opus 5.5 For complex tasks"],   # order is not the answer
+])
+def test_the_claude_picker_takes_5_10_over_5_5(rows):
+    out = run_js(_claude_menu(rows), _claude_pick_js(), _claude_args())
+    assert out["ret"] == {"label": "Opus 5.10 For complex tasks", "version": "5.10"}, (
+        f"picked {out['ret']!r} — 5.10 read as 5.1 ranks under 5.5, a silent "
+        "downgrade reported as a successful pick")
+    assert out["clicks"][-1] == "Opus 5.10 For complex tasks"
+
+
+@needs_node
+@pytest.mark.parametrize("rows", [
+    ["3.8 Flash All-around help", "3.10 Flash All-around help"],
+    ["3.10 Flash All-around help", "3.8 Flash All-around help"],
+])
+def test_the_gemini_ranker_takes_3_10_over_3_8(rows):
+    out = run_js(_gemini_menu(rows), _gemini_rank_js(), _gem_args())
+    assert out["ret"]["clicked"] is True
+    assert out["ret"]["version"] == "3.10", f"picked v{out['ret']['version']}"
+    assert out["clicks"][-1] == "3.10 Flash All-around help"
+
+
+@needs_node
+def test_the_claude_probe_reports_5_10_as_the_highest_offered():
+    """The probe decides whether the weekly upgrade fires at all: reading 5.5 as
+    the highest on a {5.5, 5.10} menu is what dragged a 5.10 account backwards."""
+    out = run_js(_claude_menu(["Opus 5.10 Newest", "Opus 5.5 Older"]),
+                 _claude_probe_js(), {"fam": "opus"})
+    assert out["ret"]["highest"] == "5.10", f"probe read {out['ret']['highest']!r}"
+
+
+@needs_node
+def test_the_trigger_read_takes_5_10_over_5_9_and_keeps_the_text():
+    """The trigger read is a max over every visible button. As floats a stray
+    `Opus 5.9` elsewhere on the page outranked the real `Opus 5.10 Max` trigger
+    (5.9 > 5.1), and the effort was then read off the wrong button."""
+    spec = el("body", {}, "", [
+        el("button", {"aria-label": "Recent"}, "Opus 5.9"),
+        el("button", {"aria-label": "Model selector"}, "Opus 5.10 Max"),
+    ])
+    out = run_js(spec, _trigger_read_js(), {"effortWord": "max", "fam": "opus"})
+    assert out["ret"]["ver"] == "5.10", f"trigger read {out['ret']['ver']!r}"
+    assert out["ret"]["trigger_text"] == "Opus 5.10 Max"
+    assert out["ret"]["effort"] == "max"
+
+
+@needs_node
+@pytest.mark.parametrize("which", ["claude", "gemini"])
+def test_a_step_back_below_a_failed_x_10_takes_x_9(which):
+    """The retreat off a failed 5.10. As floats `below` was 5.1, so 5.9 (> 5.1)
+    was excluded and the one retry found nothing to pick."""
+    if which == "claude":
+        out = run_js(_claude_menu(["Opus 5.10 Newest", "Opus 5.9 Previous"]),
+                     _claude_pick_js(), _claude_args(below="5.10"))
+        assert out["ret"] == {"label": "Opus 5.9 Previous", "version": "5.9"}
+    else:
+        out = run_js(_gemini_menu(["3.10 Flash Newest", "3.9 Flash Previous"]),
+                     _gemini_rank_js(), _gem_args(below="3.10"))
+        assert out["ret"]["version"] == "3.9" and out["ret"]["clicked"] is True
+    assert "newest" not in out["clicks"][-1].lower(), (
+        "the step-back re-picked the version that just failed")
+
+
+@needs_node
+@pytest.mark.parametrize("which", ["claude", "gemini"])
+def test_an_exact_pin_on_x_10_is_not_x_1(which):
+    """The exact-pin test compared floats within 0.001, so a pin of 5.10 matched
+    the 5.1 row just as well — and the shorter label won the tie."""
+    if which == "claude":
+        out = run_js(_claude_menu(["Opus 5.1", "Opus 5.10 Newest"]),
+                     _claude_pick_js(), _claude_args(pin="5.10"))
+    else:
+        out = run_js(_gemini_menu(["3.1 Flash", "3.10 Flash Newest"]),
+                     _gemini_rank_js(), _gem_args(pin="3.10"))
+    assert out["ret"]["version"] in ("5.10", "3.10"), f"pinned to {out['ret']!r}"
+    assert "newest" in out["clicks"][-1].lower()
+
+
+@needs_node
+@pytest.mark.parametrize("which,pin,rows,want", [
+    # ⭐ THE TRANSLATOR, browser half. A computer that learned its pin before
+    # this change hands the picker a NUMBER (5.0, 3.8). `String(5.0)` is "5", so
+    # the stored pin must still exact-match its own row — and outrank the newer
+    # row the step-back also allows, or the proven model is passed over.
+    ("claude", 5.0, ["Opus 5.1 Newer", "Opus 5 Known good"], "Opus 5 Known good"),
+    ("gemini", 3.8, ["3.9 Flash Newer", "3.8 Flash Known good"], "3.8 Flash Known good"),
+])
+def test_a_pin_stored_as_a_number_still_matches_its_row(which, pin, rows, want):
+    """A legacy number and the text it now reads as must land on the SAME row."""
+    if which == "claude":
+        out = run_js(_claude_menu(rows), _claude_pick_js(),
+                     _claude_args(pin=pin, below="5.5"))
+    else:
+        out = run_js(_gemini_menu(rows), _gemini_rank_js(),
+                     _gem_args(pin=pin, below="3.10"))
+    assert out["clicks"][-1] == want, f"clicked {out['clicks'][-1]!r}"
+
+
+@needs_node
+@pytest.mark.parametrize("which,pin,rows,want", [
+    # A stored 3.0 now reads back as "3" (models.version_text), and Gemini has
+    # shipped rows written "3.0 Flash". The pin must still be an EXACT match for
+    # that row — a missing part counts as zero — or it is demoted to an ordinary
+    # candidate and the newer row the step-back also allows wins instead.
+    ("gemini", "3", ["3.1 Flash Newer", "3.0 Flash Known good"], "3.0 Flash Known good"),
+    ("claude", "5", ["Opus 5.1 Newer", "Opus 5.0 Known good"], "Opus 5.0 Known good"),
+])
+def test_a_pin_without_its_trailing_zero_still_matches_the_row(which, pin, rows, want):
+    if which == "claude":
+        out = run_js(_claude_menu(rows), _claude_pick_js(),
+                     _claude_args(pin=pin, below="5.5"))
+    else:
+        out = run_js(_gemini_menu(rows), _gemini_rank_js(),
+                     _gem_args(pin=pin, below="3.5"))
+    assert out["clicks"][-1] == want, f"clicked {out['clicks'][-1]!r}"
+
+
+@needs_node
+@pytest.mark.parametrize("a,b,want", [
+    ("5.10", "5.9", 1), ("5.9", "5.10", -1), ("5", "5.0", 0), ("5.0", "5", 0),
+    ("6", "5.10", 1), ("4.8", 5, -1), (5, "5", 0), (3.8, "3.8", 0), ("3.8", "3.10", -1),
+])
+def test_the_browser_version_order(a, b, want):
+    """`_VERSION_ORDER_JS` directly: whole-number parts, a missing part is zero,
+    and a number reads through `String()` — the legacy-pin path."""
+    js = ("(P) => {" + _version_order_js()
+          + " const d = cmpVer(verKey(P.a), verKey(P.b));"
+          + " return d === 0 ? 0 : (d < 0 ? -1 : 1); }")
+    assert run_js(el("body"), js, {"a": a, "b": b})["ret"] == want
+
+
+@needs_node
+@pytest.mark.parametrize("x", ["", "5.", ".5", "5..1", "v5", "5a", "-5", None, "٣", True])
+def test_the_browser_version_reader_refuses_what_is_not_a_version(x):
+    """A junk pin must read as NO pin (so nothing is filtered on it), never as a
+    version that silently excludes rows."""
+    js = "(P) => {" + _version_order_js() + " return verKey(P.x); }"
+    assert run_js(el("body"), js, {"x": x})["ret"] is None
+
+
+@pytest.mark.parametrize("a,b", [("5.10", "5.9"), ("3.10", "3.8"), ("6", "5.10"),
+                                 ("5.1", "5"), ("5.0.1", "5")])
+def test_the_python_version_order_agrees(a, b):
+    assert models.version_key(a) > models.version_key(b)
+
+
+@pytest.mark.parametrize("stored,text", [(5.0, "5"), (3.8, "3.8"), (4, "4"),
+                                         ("5.0", "5"), ("5.10", "5.10"),
+                                         (" 5.10 ", "5.10"), ("0", "0")])
+def test_the_translator_reads_both_stored_shapes(stored, text):
+    """⭐ THE TRANSLATOR, python half. `~/.super-research/model_refresh.json`
+    holds `{"claude": {"known_good": 5.0}, "gemini": {"known_good": 3.8}}` as JSON
+    numbers on every installed computer; new writes are text. Both must read."""
+    assert models.version_text(stored) == text
+    assert models.version_key(stored) == models.version_key(text)
+
+
+@pytest.mark.parametrize("junk", [None, True, False, "", "abc", "5.", "-5", -1.0,
+                                  float("nan"), float("inf"), "٣", "5²", [5], {"v": 5}])
+def test_the_translator_refuses_what_is_not_a_version(junk):
+    assert models.version_key(junk) is None
+    assert models.version_text(junk) is None
+
+
+def test_a_trailing_zero_is_the_same_version_but_zero_itself_is_kept():
+    assert models.version_key("5.0") == models.version_key("5") == (5,)
+    assert models.version_key("0") == (0,), "an all-zero version must not become ()"
+
+
+def test_the_python_mirror_takes_5_10_over_5_5_and_steps_back_to_5_9():
+    best = models.pick_highest_model(["Opus 5.5", "Opus 5.10"], "opus")
+    assert best["label"] == "Opus 5.10" and best["version"] == "5.10"
+    back = models.pick_highest_model(["Opus 5.10", "Opus 5.9"], "opus", below="5.10")
+    assert back["label"] == "Opus 5.9"
+    # A junk `below` is no bound — the browser reads it as null and filters
+    # nothing, and the mirror must answer the same way rather than raise.
+    assert models.pick_highest_model(["Opus 5.10"], "opus", below="x")["version"] == "5.10"
+
+
+def test_the_chatgpt_tier_tie_break_orders_by_version_too():
+    got = models.pick_effort_tier(["Pro 5.5", "Pro 5.10"], ["pro"])
+    assert got["label"] == "Pro 5.10", f"picked {got!r}"

@@ -168,6 +168,8 @@ from models import (
     record_probe,
     record_known_good,
     stepped_back_to,
+    version_key,
+    version_text,
 )
 
 # Vision tier-2 module (shadow-eval today, tier-2 promotion per hotspot
@@ -54197,9 +54199,10 @@ async def _chatgpt_p2_effort_tier(page) -> str:
 _P2_THINKING_STATE: dict = {}
 
 # Phoenix (model_refresh) — last model VERSION the setup actually selected per
-# platform (numeric), written by setup_*_dr and read by the caller to record
-# the latest verified-working model as known_good (on-the-fly learning). Float
-# or None; process-local; last write wins.
+# platform, written by setup_*_dr and read by the caller to record the latest
+# verified-working model as known_good (on-the-fly learning). Dotted TEXT as the
+# ranker matched it ("5.10", "3.8") or None — never a float, because 5.10 is not
+# 5.1 (see models.version_key). Process-local; last write wins.
 _P2_PICKED_VERSION: dict = {}
 
 # Phoenix — the model FAMILY this run is actually on, per platform, when it is
@@ -54381,6 +54384,44 @@ async def _selfheal_try(page, intent_id: str, *, check_active, confirmed_off) ->
         return False
 
 
+# ⭐⭐ THE BROWSER'S ONE DEFINITION OF VERSION ORDER (2026-09-23), spliced into all
+# four page scripts that read a model version: the Gemini Flash ranker below, and
+# Claude's trigger read, picker and offered-probe inside `setup_claude_dr`.
+#
+# ⛔ Every one of them used to end in `parseFloat(m[1])`, so "5.10" read as 5.1:
+# {Opus 5.5, Opus 5.10} picked 5.5, Gemini {3.8 Flash, 3.10 Flash} picked 3.8,
+# and an account already on 5.10 was "upgraded" back to 5.5 with the log calling
+# it an UPGRADE. The same number was the exact-pin test, the step-back bound and
+# the learned known-good, so the fix is one ORDER, not four patched comparisons.
+# The regexes that find the number are untouched — what matches does not change,
+# only what it is worth.
+#
+# The Python twin is `models.version_key`. It drops trailing zeros where this
+# pads with them; both order "5" and "5.0" as equal, and Python must normalise
+# only because tuple EQUALITY does not pad. A pin arrives as text ("5.10") or, from
+# a computer that learned it before this change, as a number — `String(5.0)` is
+# "5" and `String(3.8)` is "3.8", so a stored pin still exact-matches its row.
+# Regex-free for the #913 reason this file states.
+_VERSION_ORDER_JS = """
+    const verKey = x => {
+        const out = [];
+        for (const part of String(x).split('.')) {
+            if (!part) return null;
+            for (const c of part) if (c < '0' || c > '9') return null;
+            out.push(parseInt(part, 10));
+        }
+        return out;
+    };
+    const cmpVer = (a, b) => {
+        for (let i = 0; i < Math.max(a.length, b.length); i++) {
+            const x = i < a.length ? a[i] : 0, y = i < b.length ? b[i] : 0;
+            if (x !== y) return x < y ? -1 : 1;
+        }
+        return 0;
+    };
+"""
+
+
 # Gemini "pick the newest Flash" ranker. Mirrors models.pick_highest_model
 # (Python, unit-tested): among visible dropdown rows, reject Flash-Lite / Pro /
 # Deep-Think FIRST, parse the version (row text is title+desc concatenated, so no
@@ -54396,7 +54437,8 @@ async def _selfheal_try(page, intent_id: str, *, check_active, confirmed_off) ->
 # empty the menu — but it is never a step-back target, since it cannot be proven
 # older than what just failed.
 _GEMINI_FLASH_RANK_JS = """({below, doClick, pin, fam, reject, triggerText,
-                             nouns, verbs, upsellWindow, dropUpsell}) => {
+                             nouns, verbs, upsellWindow, dropUpsell}) => {""" + _VERSION_ORDER_JS + """
+    const pinK = verKey(pin), belowK = verKey(below);
     const items = [...document.querySelectorAll(
         '[role="menuitem"], [role="menuitemradio"], [role="option"], button, a, li')];
     const famRe = new RegExp(fam, 'i');
@@ -54409,9 +54451,10 @@ _GEMINI_FLASH_RANK_JS = """({below, doClick, pin, fam, reject, triggerText,
     // success — a silent downgrade, and `version: null` also disarms the step-back.
     const verFamFirst = new RegExp(fam + '[ ._/()-]{0,3}([0-9]+(?:\\\\.[0-9]+)?)', 'i');
     const verNumFirst = new RegExp('([0-9]+(?:\\\\.[0-9]+)?)[ ._/()-]{0,3}' + fam, 'i');
+    // The matched TEXT, never parseFloat — its worth is `verKey`'s to say.
     const flashVer = t => {
         const m = (t || '').match(verFamFirst) || (t || '').match(verNumFirst);
-        return m ? parseFloat(m[1]) : null;
+        return m ? m[1] : null;
     };
     // Character-level port of models.reject_matches — ONE definition of reject
     // semantics, not a second opinion. A term matches at a word boundary on the
@@ -54492,6 +54535,7 @@ _GEMINI_FLASH_RANK_JS = """({below, doClick, pin, fam, reject, triggerText,
     // clicking it just shuts the menu while we report a successful pick.
     const trig = (triggerText || '').replace(/\\s+/g, ' ').trim().toLowerCase();
     let bestEl = null, best = '', bestRank = null, bestLen = Infinity, bestAdv = false;
+    let bestVer = null;
     const adverts = [];
     for (const el of items) {
         if (!el.offsetParent) continue;
@@ -54521,8 +54565,9 @@ _GEMINI_FLASH_RANK_JS = """({below, doClick, pin, fam, reject, triggerText,
         if (dropUpsell && adv) continue;
         const v = flashVer(t);
         if (v === null && !famRe.test(t)) continue;
+        const k = verKey(v);
         let rank;
-        if (pin != null && v !== null && Math.abs(v - pin) <= 0.001) {
+        if (pinK !== null && k !== null && cmpVer(k, pinK) === 0) {
             // ⭐ Exact known-good — outranks everything below, but as a RANK TIER,
             // never a `break`. `items` is a document-wide query returned in
             // document order, so the first element whose text carries the pinned
@@ -54531,21 +54576,23 @@ _GEMINI_FLASH_RANK_JS = """({below, doClick, pin, fam, reject, triggerText,
             // model, yet clicked:true is returned and the caller logs a successful
             // pick. Falling through applies the same shortest-text leaf preference
             // the rest of this ranker uses — the same fix as in _pick_opus_js.
-            rank = [2, v];
+            rank = [2, k];
         } else {
-            if (pin != null || below != null) {
+            if (pinK !== null || belowK !== null) {
                 // Step-back: only rows strictly older than what just failed. When a
                 // pin was requested this is the FALLBACK for a pin that is no longer
                 // on the menu — see the same rule in _pick_opus_js.
-                const bound = below != null ? below : pin;
-                if (v === null || v >= bound - 0.001) continue;
+                const bound = belowK !== null ? belowK : pinK;
+                if (k === null || cmpVer(k, bound) >= 0) continue;
             }
-            rank = v === null ? [0, 0] : [1, v];
+            rank = k === null ? [0, []] : [1, k];
         }
-        if (bestEl === null || rank[0] > bestRank[0] || (rank[0] === bestRank[0] && rank[1] > bestRank[1])
-                || (rank[0] === bestRank[0] && rank[1] === bestRank[1] && t.length < bestLen)) {
+        const d = bestEl === null ? 0 : cmpVer(rank[1], bestRank[1]);
+        if (bestEl === null || rank[0] > bestRank[0] || (rank[0] === bestRank[0] && d > 0)
+                || (rank[0] === bestRank[0] && d === 0 && t.length < bestLen)) {
             bestEl = el; best = t.slice(0, 40); bestRank = rank; bestLen = t.length;
             bestAdv = adv;
+            bestVer = v;
         }
     }
     if (doClick && bestEl) bestEl.click();
@@ -54553,7 +54600,9 @@ _GEMINI_FLASH_RANK_JS = """({below, doClick, pin, fam, reject, triggerText,
     // `adverts` is a bounded sample for reading the vendor's actual copy back
     // out of a log — 60 chars each so a row's plan phrase survives the slice,
     // 8 rows because that is already more than a Gemini model menu holds.
-    return { pick: best, version: bestRank && bestRank[0] ? bestRank[1] : null,
+    // `version` is the winner's matched TEXT ("3.10"), not its sort key, and
+    // null for a version-less winner (its `v` was null).
+    return { pick: best, version: bestVer,
              clicked: !!(doClick && bestEl),
              advertPick: !!(bestEl && bestAdv), adverts };
 }"""
@@ -56179,7 +56228,7 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
         # "the FOURTH parsing site and the easiest to forget", whose answer
         # decides whether an upgrade fires. Two copies drifting is not a
         # hypothetical here; it is the failure this file keeps recording.
-        _TRIGGER_READ_JS = """({effortWord, fam}) => {
+        _TRIGGER_READ_JS = """({effortWord, fam}) => {""" + _VERSION_ORDER_JS + """
             const famRe = new RegExp(fam, 'i');
             // The SAME two-order, adjacency-bounded parse as the picker and the
             // probe. This is the FOURTH parsing site and the easiest to forget:
@@ -56190,9 +56239,10 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
             // upgrade re-fires on every single run.
             const verFamFirst = new RegExp(fam + '[ ._/()-]{0,3}([0-9]+(?:\\\\.[0-9]+)?)', 'i');
             const verNumFirst = new RegExp('([0-9]+(?:\\\\.[0-9]+)?)[ ._/()-]{0,3}' + fam, 'i');
+            // The matched TEXT, never parseFloat — see _VERSION_ORDER_JS.
             const verOf = t => {
                 const m = (t || '').match(verFamFirst) || (t || '').match(verNumFirst);
-                return m ? parseFloat(m[1]) : null;
+                return m ? m[1] : null;
             };
             // An upsell chip ("Try Opus 6", "Upgrade to Opus") names the family
             // and a version without being the selected model. Reading one as the
@@ -56218,11 +56268,14 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                 const tid = (b.getAttribute('data-testid') || '').toLowerCase();
                 return a.includes('model') || tid.includes('model');
             };
-            let best = null, bestText = '', famOnly = '';
+            let best = null, bestK = null, bestText = '', famOnly = '';
             for (const b of btns) {
                 const t = b.textContent || '';
                 const v = verOf(t);
-                if (v !== null && (best === null || v > best)) { best = v; bestText = t; }
+                const k = verKey(v);
+                if (k !== null && (bestK === null || cmpVer(k, bestK) > 0)) {
+                    best = v; bestK = k; bestText = t;
+                }
                 // Family word with NO version: the day the platform drops version
                 // numbers from the label, this is the only evidence the family is
                 // selected. Shortest such button wins (a leaf, not a wrapper).
@@ -56309,7 +56362,8 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
         # version". A family row with NO version is a valid last-resort candidate
         # (a version-less rename must not empty the menu), but it is never a
         # step-back target — we cannot prove it is below what just failed.
-        _pick_opus_js = """({pin, below, fam, triggerText, verbs, upsellWindow}) => {
+        _pick_opus_js = """({pin, below, fam, triggerText, verbs, upsellWindow}) => {""" + _VERSION_ORDER_JS + """
+            const pinK = verKey(pin), belowK = verKey(below);
             const vis = el => el.getClientRects().length > 0;
             const famRe = new RegExp(fam, 'i');
             // ⭐ BOTH VERSION ORDERS, deliberately — see models.parse_family_version,
@@ -56329,9 +56383,10 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
             const items = roots.flatMap(m => [...m.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"], [role="option"], button, a, li, div, span')])
                 .filter(el => vis(el) && !seen.has(el) && seen.add(el));
             const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+            // The matched TEXT, never parseFloat — see _VERSION_ORDER_JS.
             const verOf = t => {
                 const m = (t || '').match(verFamFirst) || (t || '').match(verNumFirst);
-                return m ? parseFloat(m[1]) : null;
+                return m ? m[1] : null;
             };
             // Character-level port of models.is_upsell — ONE definition of what
             // a sales prompt looks like, not a second opinion. "Upgrade to Opus"
@@ -56388,7 +56443,7 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
             // would happily treat the TRIGGER BUTTON as a row and click it,
             // which just toggles the popover shut while reporting success.
             const trig = norm(triggerText);
-            let best = null, bestRank = null, bestLen = Infinity;
+            let best = null, bestRank = null, bestLen = Infinity, bestVer = null;
             for (const el of items) {
                 const t = (el.textContent || '').trim();
                 if (trig && norm(t) === trig) continue;        // never click the trigger
@@ -56400,8 +56455,9 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                 const v = verOf(t);
                 const isFam = v !== null || famRe.test(t);
                 if (!isFam) continue;
+                const k = verKey(v);
                 let rank;
-                if (pin != null && v !== null && Math.abs(v - pin) <= 0.001) {
+                if (pinK !== null && k !== null && cmpVer(k, pinK) === 0) {
                     // ⭐ Exact known-good — outranks every other candidate, but as a
                     // RANK TIER, never a `break`. `items` is document order,
                     // ancestors first, so the FIRST element carrying the pinned
@@ -56411,9 +56467,9 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                     // truthy and the caller logs an upgrade and records a known-good.
                     // Falling through keeps the shortest-text leaf preference the
                     // rest of this function already applies.
-                    rank = [2, v];
+                    rank = [2, k];
                 } else {
-                    if (pin != null || below != null) {
+                    if (pinK !== null || belowK !== null) {
                         // ⭐ A PIN THAT IS NO LONGER ON THE MENU MUST NOT PARK THE RUN.
                         // The learned known-good has no expiry, so weeks later the
                         // platform may have retired it. Treating "exact pin absent"
@@ -56421,22 +56477,25 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                         // and sent the leg to the chat-mode gate — losing the retry
                         // this whole path exists to provide. Fall back to the same
                         // strictly-older rule the no-history route uses.
-                        const bound = below != null ? below : pin;
-                        if (v === null || v >= bound - 0.001) continue;
+                        const bound = belowK !== null ? belowK : pinK;
+                        if (k === null || cmpVer(k, bound) >= 0) continue;
                     }
-                    // Any version outranks no version; then higher wins; tie → shorter
-                    // text (a leaf menu item, not a wrapper listing several models).
-                    rank = v === null ? [0, 0] : [1, v];
+                    // Any version outranks no version; then higher wins (by ORDER:
+                    // 5.10 above 5.9); tie → shorter text (a leaf menu item, not a
+                    // wrapper listing several models).
+                    rank = k === null ? [0, []] : [1, k];
                 }
-                if (best === null || rank[0] > bestRank[0] || (rank[0] === bestRank[0] && rank[1] > bestRank[1])
-                        || (rank[0] === bestRank[0] && rank[1] === bestRank[1] && t.length < bestLen)) {
-                    best = el; bestRank = rank; bestLen = t.length;
+                const d = best === null ? 0 : cmpVer(rank[1], bestRank[1]);
+                if (best === null || rank[0] > bestRank[0] || (rank[0] === bestRank[0] && d > 0)
+                        || (rank[0] === bestRank[0] && d === 0 && t.length < bestLen)) {
+                    best = el; bestRank = rank; bestLen = t.length; bestVer = v;
                 }
             }
             if (best) {
                 best.click();
+                // The winner's matched TEXT ("5.10"); null for a version-less row.
                 return { label: best.textContent.trim().slice(0, 60),
-                         version: bestRank[0] === 0 ? null : bestRank[1] };
+                         version: bestVer };
             }
             return null;
         }"""
@@ -56450,7 +56509,7 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
         # already have" — so a popover that mounts a beat slowly would report
         # "nothing newer" and, under the weekly cadence, burn the whole interval's
         # check on a no-op. `menu` tells the caller whether the answer is real.
-        _probe_opus_js = """({fam, verbs, upsellWindow}) => {
+        _probe_opus_js = """({fam, verbs, upsellWindow}) => {""" + _VERSION_ORDER_JS + """
             const vis = el => el.getClientRects().length > 0;
             // Same two-order parse as the picker — they must agree on what a row
             // is worth. A probe that could not read the renamed order would report
@@ -56469,9 +56528,10 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
             const seen = new Set();
             const items = menus.flatMap(m => [...m.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"], [role="option"], button, a, li, div, span')])
                 .filter(el => vis(el) && !seen.has(el) && seen.add(el));
+            // The matched TEXT, never parseFloat — see _VERSION_ORDER_JS.
             const verOf = t => {
                 const m = (t || '').match(verFamFirst) || (t || '').match(verNumFirst);
-                return m ? parseFloat(m[1]) : null;
+                return m ? m[1] : null;
             };
             // Same port, same reason, as the picker's — and it has to be here
             // too or the two disagree in the one direction that costs a run
@@ -56527,7 +56587,7 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
             // did nothing on that markup. A count that is right about the number
             // and blind to the fact is worse than no count: the fact is the part
             // a decision rests on.
-            let n = 0, highest = null, chips = 0, chipsAny = false;
+            let n = 0, highest = null, highK = null, chips = 0, chipsAny = false;
             for (const el of items) {
                 const raw = (el.textContent || '').trim();
                 if (isUpsell(raw)) {
@@ -56543,8 +56603,10 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                 const v = verOf(raw);
                 if (v === null) continue;
                 n += 1;
-                if (highest === null || v > highest) highest = v;
+                const k = verKey(v);
+                if (highK === null || cmpVer(k, highK) > 0) { highest = v; highK = k; }
             }
+            // `highest` is the matched TEXT ("5.10"), compared by ORDER above.
             return {menu: true, n: n, highest: highest, chips: chips, chipsAny: chipsAny};
         }"""
 
@@ -56769,9 +56831,16 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                     # `model_trigger_ver` is None on a version-less label; any
                     # numbered row then counts as newer (we can't compare, and a
                     # named version is the more specific choice).
-                    _cur = model_trigger_ver if isinstance(model_trigger_ver, (int, float)) else None
-                    if isinstance(_offered, (int, float)) and (
-                            _cur is None or _offered > _cur + 0.001):
+                    # ⛔ Compared by ORDER (models.version_key), not as floats and
+                    # not through a numbers-only gate. The page scripts return the
+                    # matched TEXT ("5.10"): a numbers-only gate reads every one of
+                    # them as "nothing offered" and the weekly upgrade goes quiet
+                    # for good, and as floats a computer on 5.10 read 5.1 and was
+                    # "upgraded" DOWN to 5.5 on every probe.
+                    _cur_k = version_key(model_trigger_ver)
+                    _off_k = version_key(_offered)
+                    _cur = model_trigger_ver if _cur_k is not None else None
+                    if _off_k is not None and (_cur_k is None or _off_k > _cur_k):
                         # Select it through the ONE picker that exists, stepping
                         # everything below the newer version out of contention.
                         _up = await page.evaluate(
@@ -57639,9 +57708,12 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
         # later fallback — a poisoned value that outlives the run. A version we
         # clicked in the menu is ground truth; the trigger is only the backstop
         # for the path where nothing was picked because nothing needed picking.
+        # ⛔ "Is it a version" is `version_key`'s question, not `isinstance(…,
+        # float)`: the picker returns TEXT, and a numbers-only gate would throw
+        # every real pick away and fall through to re-parsing the label.
         _P2_PICKED_VERSION["claude"] = (
             _picked_version
-            if isinstance(_picked_version, (int, float))
+            if version_key(_picked_version) is not None
             else (parse_family_version(opus_selected or "", _claude_family)
                   or (model_trigger_ver if model_ok else None)))
         # Success only when all three critical knobs are in place
@@ -61596,21 +61668,30 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 _kg = p2_known_good(platform_l, _step_fam)
             except Exception:
                 _kg = None      # a malformed overlay must never kill the retry
-            _failed_f = float(_failed) if isinstance(_failed, (int, float)) else None
+            # ⛔⛔ BY VERSION ORDER, AND TEXT GETS THROUGH (2026-09-23). The
+            # rankers return the matched text ("5.10") and the learned value is
+            # now stored as text; this used to accept numbers only, so a text
+            # version left BOTH targets None and the guard below skipped the
+            # one retry this path exists for. As floats, a failed 5.10 read 5.1
+            # and a known-good 5.9 was "not older". `version_key` reads text and
+            # the legacy stored number alike; `version_text` is what travels on.
+            _failed_v = version_text(_failed)
             # Only pin to known-good when it is a strictly OLDER model than the
             # one that just failed: re-pinning the same version can't help (it
             # just failed) and would needlessly re-click an already-correct model
             # (the #744-adjacent action).
-            # ⚠ `_failed_f is None` is NOT "any pin is fine". With the failed
+            # ⚠ `_failed_v is None` is NOT "any pin is fine". With the failed
             # version unknown we cannot prove the pin is older, so pinning could
             # re-select the model that just failed and burn the single retry.
-            _pin = (_kg if isinstance(_kg, (int, float))
-                    and _failed_f is not None and _kg < _failed_f - 0.001 else None)
+            # (`_kg` is already dotted text — p2_known_good normalises it.)
+            _pin = (_kg if _failed_v is not None
+                    and version_key(_kg) is not None
+                    and version_key(_kg) < version_key(_failed_v) else None)
             # `below` rides along WITH the pin, not instead of it: the picker
             # prefers an exact pin match and falls back to the best strictly-older
             # row when the pinned version is no longer on the menu (a learned
             # known-good never expires, so weeks later it may simply be gone).
-            _below = _failed_f
+            _below = _failed_v
             if _pin is not None or _below is not None:
                 log(f"[{label}] step-back: {platform_l} v{_failed} did not verify into Deep "
                     f"Research — retrying once on an older model "
@@ -61646,10 +61727,10 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                     # a literal "vNone" in an amber notice, attached to a claim
                     # that was false. Prove the retreat before reporting it.
                     _stepped_to = _P2_PICKED_VERSION.get(platform_l)
-                    # `_below` IS `_failed_f` and `_pin` can only be set when
-                    # `_failed_f` is a number, so the guard above guarantees a
+                    # `_below` IS `_failed_v` and `_pin` can only be set when
+                    # `_failed_v` is a version, so the guard above guarantees a
                     # reachable step-back knows the version that failed.
-                    if stepped_back_to(_stepped_to, _failed_f):
+                    if stepped_back_to(_stepped_to, _failed_v):
                         _emit_model_drift_alert(
                             platform_l,
                             f"{_agent_name} used an older model (v{_stepped_to}) for Deep Research",

@@ -79,6 +79,19 @@ def test_claude_setup_directive_names_no_version():
     assert "VERSION NUMBER DOES NOT MATTER" in d
 
 
+def test_claude_setup_directive_says_how_to_read_highest():
+    """⭐ 2026-09-23. "Select the HIGHEST" is exactly where a reader who treats a
+    version as a decimal goes wrong: ten-after-the-dot reads as smaller than
+    nine-after-the-dot. The DOM rankers made that mistake until this wave, and the
+    computer-use fallback is told the same thing in words — with no digits, which
+    the test above holds for a reason of its own."""
+    low = models.p2_claude_setup_directive().lower()
+    assert "never as decimals" in low
+    assert "ten after the dot is newer than nine after the dot" in low
+    # …on the fallback family too, since that render is a different string.
+    assert "never as decimals" in models.p2_claude_setup_directive("sonnet").lower()
+
+
 def test_claude_setup_directive_keeps_an_upgrade_lever():
     """⚠ This string runs ONLY after the DOM path FAILED. Telling the agent to
     leave the model alone here — the rule the VALIDATE string correctly uses —
@@ -157,8 +170,20 @@ def test_overlay_ignored_when_flag_off(monkeypatch, tmp_path):
 
 
 def test_known_good_from_overlay_when_armed(monkeypatch, tmp_path):
+    # A JSON NUMBER — the shape every computer stored before 2026-09-23 — reads
+    # back as the dotted text versions now travel as.
     _arm(monkeypatch, tmp_path, {"claude": {"known_good": 4.8}})
-    assert models.p2_known_good("claude") == 4.8
+    assert models.p2_known_good("claude") == "4.8"
+
+
+def test_a_stored_whole_number_reads_back_as_its_row_text(monkeypatch, tmp_path):
+    """⭐ The live file holds `{"claude": {"known_good": 5.0}, "gemini":
+    {"known_good": 3.8}}`. 5.0 must come back as "5" — the text the "Opus 5" row
+    matches — not as junk, or the first run after the upgrade loses its pin."""
+    _arm(monkeypatch, tmp_path, {"claude": {"known_good": 5.0},
+                                 "gemini": {"known_good": 3.8}})
+    assert models.p2_known_good("claude") == "5"
+    assert models.p2_known_good("gemini") == "3.8"
 
 
 def test_corrupt_overlay_falls_back_to_defaults(monkeypatch, tmp_path):
@@ -219,18 +244,33 @@ def test_record_known_good_is_noop_when_flag_off(monkeypatch, tmp_path):
     assert models.record_known_good("claude", 4.8) is False
 
 
-def test_record_known_good_writes_and_reads_back_as_float(monkeypatch, tmp_path):
-    _arm(monkeypatch, tmp_path, None)
-    assert models.record_known_good("claude", 4.8) is True
-    assert models.p2_known_good("claude") == 4.8
-    assert isinstance(models.p2_known_good("claude"), float)
+def test_record_known_good_writes_and_reads_back_as_dotted_text(monkeypatch, tmp_path):
+    """⛔ 2026-09-23: this used to store `float(version)`, so a verified Opus
+    5.10 was SAVED as 5.1 — a model that was never on the menu, pinned to on the
+    next step-back. It is stored as the text the ranker matched."""
+    path = _arm(monkeypatch, tmp_path, None)
+    assert models.record_known_good("claude", "5.10") is True
+    assert models.p2_known_good("claude") == "5.10"
+    assert json.loads(path.read_text(encoding="utf-8"))["claude"]["known_good"] == "5.10"
 
 
 def test_record_known_good_only_writes_on_change(monkeypatch, tmp_path):
     _arm(monkeypatch, tmp_path, None)
-    assert models.record_known_good("claude", 4.8) is True
-    assert models.record_known_good("claude", 4.8) is False  # unchanged → no churn
-    assert models.record_known_good("claude", 5.0) is True   # advanced → write
+    assert models.record_known_good("claude", "4.8") is True
+    assert models.record_known_good("claude", "4.8") is False  # unchanged → no churn
+    assert models.record_known_good("claude", "5") is True     # advanced → write
+    assert models.record_known_good("claude", "5.0") is False  # the same model
+    assert models.record_known_good("claude", "5.10") is True  # NOT 5.1 — a new model
+
+
+def test_a_legacy_stored_number_is_the_same_model_as_its_text(monkeypatch, tmp_path):
+    """No migration write: the first run after the upgrade verifies "5" on a
+    computer that stored 5.0, and that must be read as unchanged — the version
+    ORDER decides, not the type on disk."""
+    _arm(monkeypatch, tmp_path, {"claude": {"known_good": 5.0}})
+    assert models.record_known_good("claude", "5") is False
+    assert models.record_known_good("claude", "5.5") is True
+    assert models.p2_known_good("claude") == "5.5"
 
 
 def test_record_known_good_rejects_junk(monkeypatch, tmp_path):
@@ -239,19 +279,24 @@ def test_record_known_good_rejects_junk(monkeypatch, tmp_path):
     assert models.record_known_good("claude", "abc") is False
     assert models.record_known_good("claude", -1) is False
     assert models.record_known_good("claude", 0) is False
+    assert models.record_known_good("claude", "0.0") is False
+    assert models.record_known_good("claude", True) is False
+    assert models.p2_known_good("claude") is None, "junk must not have been written"
 
 
 def test_record_known_good_preserves_other_platforms(monkeypatch, tmp_path):
     _arm(monkeypatch, tmp_path, None)
-    models.record_known_good("claude", 4.8)
-    models.record_known_good("gemini", 3.5)
-    assert models.p2_known_good("claude") == 4.8
-    assert models.p2_known_good("gemini") == 3.5
+    models.record_known_good("claude", "4.8")
+    models.record_known_good("gemini", "3.5")
+    assert models.p2_known_good("claude") == "4.8"
+    assert models.p2_known_good("gemini") == "3.5"
 
 
-def test_p2_known_good_coerces_string_overlay_value(monkeypatch, tmp_path):
+def test_p2_known_good_reads_text_and_refuses_junk(monkeypatch, tmp_path):
     _arm(monkeypatch, tmp_path, {"claude": {"known_good": "4.8"}})
-    assert models.p2_known_good("claude") == 4.8
+    assert models.p2_known_good("claude") == "4.8"
+    _arm(monkeypatch, tmp_path, {"claude": {"known_good": "5.10"}})
+    assert models.p2_known_good("claude") == "5.10", "5.10 must not collapse to 5.1"
     _arm(monkeypatch, tmp_path, {"claude": {"known_good": "nope"}})
     assert models.p2_known_good("claude") is None
 
@@ -261,11 +306,11 @@ def test_learning_a_value_does_not_create_a_floor(monkeypatch, tmp_path):
     a known-good must not feed anything the picker consults. Reading it back is
     the ONLY way it can be used, and only the step-back caller does that."""
     _arm(monkeypatch, tmp_path, None)
-    models.record_known_good("claude", 5.0)
+    models.record_known_good("claude", "5")
     # An account offered only an older model must still be pickable: the ranker
     # is asked for the highest offered, with no lower bound of any kind.
     best = models.pick_highest_model(["Opus 4.8", "Sonnet 4.6"], "opus")
-    assert best is not None and best["version"] == 4.8
+    assert best is not None and best["version"] == "4.8"
 
 
 # ── The probe cadence ─────────────────────────────────────────────────────
@@ -331,11 +376,11 @@ def test_probe_days_is_a_live_env_read(monkeypatch):
 
 def test_probe_and_known_good_share_the_file_without_clobbering(monkeypatch, tmp_path):
     _arm(monkeypatch, tmp_path, None)
-    models.record_known_good("claude", 5.0)
+    models.record_known_good("claude", "5")
     models.record_probe("claude", saw_menu=True)
-    models.record_known_good("gemini", 3.5)
-    assert models.p2_known_good("claude") == 5.0
-    assert models.p2_known_good("gemini") == 3.5
+    models.record_known_good("gemini", "3.5")
+    assert models.p2_known_good("claude") == "5"
+    assert models.p2_known_good("gemini") == "3.5"
     assert models.model_probe_due("claude") is False
 
 
@@ -352,9 +397,11 @@ def test_overlay_temp_file_is_per_process(monkeypatch, tmp_path):
 # ── parse_family_version / has_family / pick_highest_model ────────────────
 
 def test_parse_family_version_handles_concatenated_row_text():
-    assert models.parse_family_version("3.5 FlashAll-around help", "flash") == 3.5
-    assert models.parse_family_version("Gemini 4.0 Flash · fast", "flash") == 4.0
-    assert models.parse_family_version("Opus 4.8 Max", "opus") == 4.8
+    # The matched TEXT, as the row wrote it — its ORDER is `version_key`'s job.
+    assert models.parse_family_version("3.5 FlashAll-around help", "flash") == "3.5"
+    assert models.parse_family_version("Gemini 4.0 Flash · fast", "flash") == "4.0"
+    assert models.parse_family_version("Opus 4.8 Max", "opus") == "4.8"
+    assert models.parse_family_version("Opus 5.10 Max", "opus") == "5.10"
     assert models.parse_family_version("Sonnet 4.6", "opus") is None
     assert models.parse_family_version("", "flash") is None
 
@@ -371,13 +418,13 @@ def test_has_family_matches_with_or_without_a_version():
 def test_pick_highest_flash_picks_the_newest():
     rows = ["3.1 Flash — fast", "3.5 FlashAll-around help", "2.0 Flash"]
     best = models.pick_highest_model(rows, "flash", reject=["lite", "deep think", "pro"])
-    assert best["version"] == 3.5 and best["index"] == 1
+    assert best["version"] == "3.5" and best["index"] == 1
 
 
 def test_pick_highest_flash_rejects_siblings():
     rows = ["4.0 Flash-Lite", "3.5 Flash", "4.2 Pro", "5.0 Deep Think"]
     best = models.pick_highest_model(rows, "flash", reject=["lite", "deep think", "pro"])
-    assert best["version"] == 3.5, "Lite/Pro/Deep-Think must be rejected before ranking"
+    assert best["version"] == "3.5", "Lite/Pro/Deep-Think must be rejected before ranking"
 
 
 def test_pick_highest_takes_the_newest_even_when_ancient_rows_exist():
@@ -385,7 +432,7 @@ def test_pick_highest_takes_the_newest_even_when_ancient_rows_exist():
     a downgrade, so nothing has to be excluded by version."""
     rows = ["Opus 3.0", "Opus 4.8", "Opus 6.1", "Opus 4.0"]
     best = models.pick_highest_model(rows, "opus")
-    assert best["version"] == 6.1
+    assert best["version"] == "6.1"
 
 
 def test_pick_highest_tie_breaks_to_shortest_label():
@@ -397,19 +444,19 @@ def test_pick_highest_tie_breaks_to_shortest_label():
 def test_pick_highest_reject_boundary_before_only():
     rows = ["3.5 Flash elite tier", "3.1 Flash"]
     best = models.pick_highest_model(rows, "flash", reject=["lite*"])
-    assert best["version"] == 3.5, "'elite' must not false-reject on 'lite'"
+    assert best["version"] == "3.5", "'elite' must not false-reject on 'lite'"
 
 
 def test_pick_highest_rejects_glued_sibling():
     rows = ["3.1 flash-litefastest answers", "3.0 Flash"]
     best = models.pick_highest_model(rows, "flash", reject=["lite*"])
-    assert best["version"] == 3.0
+    assert best["version"] == "3.0"
 
 
 def test_pick_highest_opus_family():
     rows = ["Opus 4.8 Max", "Sonnet 4.6", "Opus 5"]
     best = models.pick_highest_model(rows, "opus", reject=[])
-    assert best["version"] == 5.0
+    assert best["version"] == "5"
 
 
 def test_pick_highest_none_when_no_candidate():
@@ -423,7 +470,7 @@ def test_pick_highest_accepts_a_version_less_family_row_as_last_resort():
     but never in preference to a row that names a version."""
     assert models.pick_highest_model(["Opus", "Sonnet 4.6"], "opus")["version"] is None
     both = models.pick_highest_model(["Opus", "Opus 4.8"], "opus")
-    assert both["version"] == 4.8, "a named version outranks a bare family row"
+    assert both["version"] == "4.8", "a named version outranks a bare family row"
 
 
 def test_pick_highest_below_steps_back_one_release():
@@ -431,7 +478,7 @@ def test_pick_highest_below_steps_back_one_release():
     with no hardcoded 'previous version' anywhere."""
     rows = ["Opus 6.0", "Opus 5.0", "Opus 4.8"]
     best = models.pick_highest_model(rows, "opus", below=6.0)
-    assert best["version"] == 5.0
+    assert best["version"] == "5.0"
 
 
 def test_pick_highest_below_never_returns_the_failed_version():

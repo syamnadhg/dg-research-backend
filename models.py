@@ -806,6 +806,63 @@ def has_term(text: str, terms) -> bool:
     return reject_matches(text, terms)
 
 
+def version_key(v):
+    """The ORDER of a model version: whole numbers split at the dot, as a tuple
+    with trailing zeros dropped. `"5.10"` → (5, 10), `"5"` and `"5.0"` → (5,).
+    None for anything that is not a version.
+
+    ⛔⛔ A VERSION IS NOT A DECIMAL. Every ranker used to read the version with
+    `parseFloat`/`float`, so `"5.10"` read as 5.1 and ranked BELOW 5.5: a menu of
+    {Opus 5.5, Opus 5.10} picked 5.5, Gemini {3.8, 3.10} picked 3.8, and an
+    account already on 5.10 was "upgraded" back to 5.5 while the log said
+    UPGRADE. Gemini Flash is already at 3.8, so that is two releases away. Tuples
+    compare part by part, which is what a version means.
+
+    ⭐ THIS IS ALSO THE TRANSLATOR FOR WHAT IS ALREADY ON DISK. Every installed
+    computer remembers its last working model as a JSON NUMBER (5.0, 3.8), so a
+    number is read through `repr(float(x))` — the shortest text that round-trips,
+    which is exactly the text the old `parseFloat` was given — and then parsed
+    like any other text. 5.0 → (5,), 3.8 → (3, 8). No migration write: the old
+    shape and the new one both read, and the next write stores text. A stored 5.1
+    is unambiguous only because no two-digit minor has shipped yet, which is why
+    this had to land before one does.
+
+    ⛔ `bool` is refused before `int`, because `isinstance(True, int)` is true
+    and a stray flag would otherwise read as version 1. ⚠ ASCII digits only:
+    `str.isdigit` accepts superscripts and other scripts' digits, and the
+    browser's parser does not.
+
+    The browser's twin is `_VERSION_ORDER_JS` in research.py. It pads with zeros
+    instead of dropping them, which orders identically; Python has to normalise
+    because tuple EQUALITY does not pad."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        s = repr(float(v))
+    elif isinstance(v, str):
+        s = v.strip()
+    else:
+        return None
+    parts = s.split(".")
+    if not all(p.isascii() and p.isdigit() for p in parts):
+        return None
+    key = [int(p) for p in parts]
+    while len(key) > 1 and key[-1] == 0:
+        key.pop()
+    return tuple(key)
+
+
+def version_text(v):
+    """A version as the plain dotted text it is stored, logged and passed to the
+    browser as from now on — `"5.10"`, `"5"`, `"3.8"` — or None.
+
+    Normalised through `version_key`, so a legacy stored 5.0 comes back as "5"
+    and 3.8 as "3.8". Logs keep this plain form (never a tuple or a list), which
+    is what `scripts/model_refresh_report.py`'s `v([0-9.]+|None)` reads."""
+    key = version_key(v)
+    return None if key is None else ".".join(str(p) for p in key)
+
+
 def pick_effort_tier(labels, tier_words, upgrade_verbs=()):
     """From ChatGPT's model-menu row labels, pick the row naming the target
     EFFORT TIER. Returns {'index', 'version', 'label'} or None.
@@ -857,7 +914,8 @@ def pick_effort_tier(labels, tier_words, upgrade_verbs=()):
             v = parse_family_version(t, term)
             if v is not None:
                 break
-        rank = (0, 0.0) if v is None else (1, v)
+        # By version ORDER, not the text: `"5.10" > "5.9"` is False as strings.
+        rank = (0, ()) if v is None else (1, version_key(v))
         if best is None or rank > best["_rank"] or (rank == best["_rank"] and len(t) < best["_len"]):
             best = {"index": i, "version": v, "label": (raw or "").strip(),
                     "_rank": rank, "_len": len(t)}
@@ -890,9 +948,15 @@ def _known_good_key(platform: str, family: str = "") -> str:
 
 def p2_known_good(platform: str, family: str = ""):
     """The last verified-working model version for a platform+family (the C1
-    fallback target when the latest can't be verified). None until a real run
-    records one (see record_known_good). Coerced to float so a stringly-typed
-    overlay value can't break the float comparisons in the picker JS."""
+    fallback target when the latest can't be verified), as dotted text — "5",
+    "3.8", "5.10". None until a real run records one (see record_known_good),
+    and None for junk.
+
+    ⭐ READS BOTH SHAPES. Every computer installed before 2026-09-23 stored this
+    as a JSON number (5.0, 3.8); from then on it is written as text. Both go
+    through `version_key`, so a stored 5.0 comes back as "5" and still pins the
+    "Opus 5" row — without that, the first run after the upgrade would read its
+    own memory as junk, lose the pin, and spend the one step-back retry blind."""
     # ⚠ isinstance, not `.get(platform, {})` and not `or {}`. The dict default
     # only fires when the KEY IS MISSING, and `or {}` only when the value is
     # FALSY — a hand-edited overlay whose platform maps to a truthy scalar
@@ -900,10 +964,7 @@ def p2_known_good(platform: str, family: str = ""):
     # reader's one caller is the step-back path, so the crash would land at
     # exactly the recovery moment and kill the agent instead of parking it.
     raw = _platform_entry(platform).get(_known_good_key(platform, family))
-    try:
-        return float(raw) if raw is not None else None
-    except (TypeError, ValueError):
-        return None
+    return version_text(raw)
 
 
 def _write_model_refresh_overlay(data: dict) -> bool:
@@ -994,35 +1055,39 @@ def record_known_good(platform: str, version, family: str = "") -> bool:
     would let one learned value strand a run on an account that is no longer
     offered that version.
 
-    Pure side-channel: it can never change what a run does. Coerces to float,
-    ignores junk, and writes ONLY when the value actually changes (no per-run
-    disk churn). Never raises. Returns True iff it wrote."""
+    Pure side-channel: it can never change what a run does. Ignores junk, and
+    writes ONLY when the value actually changes (no per-run disk churn). Never
+    raises. Returns True iff it wrote.
+
+    ⭐ WRITTEN AS DOTTED TEXT, COMPARED AS A VERSION. `float("5.10")` is 5.1, so
+    the old coercion would have SAVED Opus 5.10 as 5.1 and pinned a later
+    step-back to a model that was never on the menu. "Unchanged" is decided by
+    `version_key`, so a legacy stored 5.0 and a fresh "5" are the same model and
+    cause no write."""
     if not model_refresh_enabled():
         return False
-    try:
-        v = float(version)
-    except (TypeError, ValueError):
-        return False
-    if v <= 0:
+    v = version_key(version)
+    if v is None or v == (0,):
         return False
     key = _known_good_key(platform, family)
-    cur = _platform_entry(platform).get(key)
-    try:
-        if cur is not None and abs(float(cur) - v) < 0.001:
-            return False  # unchanged — skip the write
-    except (TypeError, ValueError):
-        pass
-    return _merge_overlay_entry(platform, **{key: v})
+    if version_key(_platform_entry(platform).get(key)) == v:
+        return False  # unchanged — skip the write
+    return _merge_overlay_entry(platform, **{key: version_text(version)})
 
 
 def parse_family_version(text: str, family: str):
     """Parse a version adjacent to the family word out of a model-dropdown row
     label, in EITHER order:
-      • num-before-family (Gemini): '3.5 flash' → 3.5, 'gemini 4.0 flash' → 4.0
-      • family-before-num (Claude): 'opus 4.8 max' → 4.8
+      • num-before-family (Gemini): '3.5 flash' → '3.5', 'gemini 4.0 flash' → '4.0'
+      • family-before-num (Claude): 'opus 4.8 max' → '4.8'
     Row text is often title+description CONCATENATED ('3.5 FlashAll-around
-    help'), so there is no trailing boundary after the family word. Returns a
-    float or None.
+    help'), so there is no trailing boundary after the family word. Returns the
+    matched dotted TEXT, exactly as the row wrote it, or None.
+
+    ⛔⛔ TEXT, NOT A FLOAT (2026-09-23). `float('5.10')` is 5.1, which ranks below
+    5.5 — the picker then selects the OLDER model and reports success. Order is
+    `version_key`'s job; this only finds the number. The JS rankers return their
+    match the same way (`m[1]`, no `parseFloat`).
 
     ⭐ Both orders at BOTH sites. Each JS ranker used to parse only its own
     platform's order, which is correct right up until that vendor renames — at
@@ -1055,7 +1120,7 @@ def parse_family_version(text: str, family: str):
     fam = re.escape(family.lower())
     m = (re.search(fam + r"[ ._/()-]{0,3}([0-9]+(?:\.[0-9]+)?)", t)
          or re.search(r"([0-9]+(?:\.[0-9]+)?)[ ._/()-]{0,3}" + fam, t))
-    return float(m.group(1)) if m else None
+    return m.group(1) if m else None
 
 
 def stepped_back_to(picked, failed) -> bool:
@@ -1075,14 +1140,17 @@ def stepped_back_to(picked, failed) -> bool:
     auto-skip window helpers: this is the boolean that was wrong, and a boolean
     can only be tested by calling it.
 
-    Booleans are rejected explicitly — `isinstance(True, int)` is True in Python,
-    so a truthy flag arriving here would otherwise compare as version 1.
+    Booleans are rejected (by `version_key`) — `isinstance(True, int)` is True in
+    Python, so a truthy flag arriving here would otherwise compare as version 1.
+
+    ⭐ Compared as versions, not decimals: the versions arrive as the dotted text
+    the rankers return ("5.9" after a failed "5.10"), and a legacy number still
+    reads. `float` here would call 5.9 NEWER than 5.10 and deny a real retreat.
     """
-    if isinstance(picked, bool) or isinstance(failed, bool):
+    p, f = version_key(picked), version_key(failed)
+    if p is None or f is None:
         return False
-    if not isinstance(picked, (int, float)) or not isinstance(failed, (int, float)):
-        return False
-    return float(picked) < float(failed) - 0.001
+    return p < f
 
 
 def has_family(text: str, family: str) -> bool:
@@ -1345,13 +1413,16 @@ def pick_highest_model(labels, family: str, below=None, reject=(), drop_upsell=F
         v = parse_family_version(t, family)
         if v is None and not has_family(t, family):
             continue
-        if below is not None:
+        k = version_key(v)
+        bound = version_key(below)
+        if bound is not None:
             # Un-versioned rows can't be proven below the failed version, so the
             # step-back path skips them rather than risk re-picking what failed.
-            if v is None or v >= float(below) - 0.001:
+            if k is None or k >= bound:
                 continue
-        # Rank: any version beats no version; higher version wins; tie → shorter.
-        rank = (0, 0.0) if v is None else (1, v)
+        # Rank: any version beats no version; higher version wins (by ORDER —
+        # 5.10 above 5.9); tie → shorter.
+        rank = (0, ()) if k is None else (1, k)
         if best is None or rank > best["_rank"] or (rank == best["_rank"] and len(t) < best["_len"]):
             best = {"index": i, "version": v, "label": (raw or "").strip(),
                     "_rank": rank, "_len": len(t)}
@@ -1440,6 +1511,14 @@ def p2_claude_setup_directive(family: str = "") -> str:
     fam = (str(family) or primary).capitalize()                # "Opus" / "Sonnet"
     effort = str(pol.get("effort", "max")).capitalize()        # "Max"
     tool = str(pol.get("tool", "research")).capitalize()       # "Research"
+    # ⭐ HOW TO READ "HIGHEST" (the sentence after "close the menu"), in words and
+    # with NO DIGITS. A person reading versions as decimals calls the release
+    # after nine-after-the-dot OLDER than it (".10" < ".9"), which is the same
+    # mistake the DOM rankers made until 2026-09-23. The plan asked for the
+    # literal "5.10 is newer than 5.9"; it is spelled out instead because this
+    # string must name no version at all (see the docstring — a named version is
+    # what made the agent treat a higher model as wrong, and
+    # `test_claude_setup_directive_names_no_version` holds that).
     # Only on the fallback path, and only about the family we are NOT using.
     swapped = "" if fam.lower() == primary.lower() else \
         f"{free_family_note(primary.capitalize(), fam)} "
@@ -1448,7 +1527,10 @@ def p2_claude_setup_directive(family: str = "") -> str:
         f"Model rule: the model must be {fam} — the VERSION NUMBER DOES NOT MATTER "
         f"and a higher one is always correct. Open the model menu ONCE and select "
         f"the HIGHEST {fam} it offers; if the highest {fam} is already the selected "
-        f"one, close the menu without clicking it. {upsell_warning(fam)} If the "
+        f"one, close the menu without clicking it. Compare versions part by part "
+        f"as whole numbers, never as decimals: the part after the dot counts on "
+        f"past nine, so ten after the dot is NEWER than nine after the dot. "
+        f"{upsell_warning(fam)} If the "
         f"button already shows {fam} and the menu will not open, that is fine — "
         f"leave the model as it is. Do NOT type — just set up and focus input. "
         f"Say 'ready for paste'."

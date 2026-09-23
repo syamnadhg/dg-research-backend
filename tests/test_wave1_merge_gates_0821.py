@@ -156,15 +156,14 @@ def _js_constant(fn, name: str) -> str:
     """The value of a `name = \"\"\"…\"\"\"` assignment inside `fn`.
 
     Read out of the REAL function source, so this cannot drift from the string
-    production hands to the browser."""
-    src = inspect.getsource(fn)
-    tree = ast.parse(inspect.cleandoc("if True:\n" + src) if False else src.lstrip())
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
-            for t in node.targets:
-                if getattr(t, "id", None) == name:
-                    return str(node.value.value)
-    raise AssertionError(f"{name} is no longer a string constant in {fn.__name__}")
+    production hands to the browser.
+
+    ⭐ 2026-09-23 — delegates to `_domshim.js_constant`, which FOLDS a composed
+    constant. The pickers are `\"\"\"head\"\"\" + _VERSION_ORDER_JS + \"\"\"body\"\"\"`
+    now (one shared definition of version order), and this helper only knew a
+    bare literal, so it reported the picker as "no longer a string constant"."""
+    from _domshim import js_constant
+    return js_constant(fn, name)
 
 
 # ══ 2. the systemd unit says what its PATH does ════════════════════════

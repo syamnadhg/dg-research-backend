@@ -75,7 +75,8 @@ def test_the_tier_word_needs_a_word_boundary_on_both_sides():
 
 def test_a_version_only_breaks_a_tie_between_rows_that_already_name_the_tier():
     got = models.pick_effort_tier(["Pro", "Pro 5.5", "Instant 9.9"], TIERS, VERBS)
-    assert (got["label"], got["version"]) == ("Pro 5.5", 5.5)
+    # The version is the matched TEXT since 2026-09-23 (a float read 5.10 as 5.1).
+    assert (got["label"], got["version"]) == ("Pro 5.5", "5.5")
 
 
 def test_the_glued_wrapper_is_killed_by_the_boundary_rule_alone():
