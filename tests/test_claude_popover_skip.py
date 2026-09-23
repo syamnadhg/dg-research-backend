@@ -882,15 +882,17 @@ def test_a_run_left_at_low_says_low(monkeypatch):
     page = ScriptedPage("Opus 5 Low", effort_row_shows="effort low", wanted_row=False)
     _run(page, allow_probe=True)
     assert any("effort in effect: 'low'" in m for _, m in said["log"]), said["log"]
-    assert _captions(said) == ["Claude is researching at Low effort — Max could not be set"]
+    # Recorded for the pre-send check, which puts the caption on the tile once
+    # the computer-use pass has had its turn (test_claude_real_popover_0923).
+    assert _captions(said) == []
     assert research._P2_THINKING_STATE["claude"]["effort_got"] == "low"
     assert _ledger(said) and "tier is 'low'" in _ledger(said)[-1], _ledger(said)
 
 
-def test_the_caption_is_said_once_at_the_initial_setup(monkeypatch):
-    """The pre-send re-activation and the step-back call this function too. The
-    caption rides the tile's CURRENT status, and a pass made seconds before the
-    brief goes out must not re-send it — the log still says it."""
+def test_the_caption_is_never_said_from_setup(monkeypatch):
+    """The pre-send re-activation and the step-back call this function too, and
+    no call of it posts the caption: the computer-use pass that runs after the
+    initial setup may still set the tier. The log still says it."""
     said = _speaking(monkeypatch)
     page = ScriptedPage("Opus 5 Low", effort_row_shows="effort low", wanted_row=False)
     _run(page)                                  # not the initial setup
