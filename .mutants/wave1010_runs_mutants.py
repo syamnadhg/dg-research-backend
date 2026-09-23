@@ -44,6 +44,7 @@ T_DOCTOR = "tests/test_doctor_handover_0822.py"
 T_LOCAL = "tests/test_local_run_api_1010.py"
 T_EDGES = "tests/test_incognito_edges_1010.py"
 T_LEASE = "tests/test_incognito_fuse_renewal_109.py"
+T_OWNER = "tests/test_owner_log_lines_1010.py"
 
 # ══ task 1: the recency tier ══════════════════════════════════════════════
 TIER = ("    if (last_write_at is not None\n"
@@ -118,6 +119,22 @@ DROP_MATCH = ("                    if str((j or {}).get(\"uid\") or \"\").strip(
 DROP_SHED = ("    if removed:\n"
              "        try:\n"
              "            _shed_from_pending_snapshot(queue)")
+
+# ══ task 4: owner lines ═══════════════════════════════════════════════════
+# ⚠ 2026-09-23 (integration onto wave 10.9's last repair): the branch's third
+# scope (`_owner_log_scope` / `@_owner_logged`) is gone. The shipped origin rule
+# already sends a line with no run origin to the owner's log AND the armed
+# run's folder, and none of the four is a run's work. F1-F5 now measure what
+# this lane's executed loop pins hold on the origin rule: the console judging
+# by the armed run again, a loop marked as the machine's (its run's folder goes
+# quiet — the 08-24 silence), and the watchdog's verdict carrying the run's
+# origin because the worker set it.
+ORIGIN_READ = ("    origin = _LOG_RUN.get()\n"
+               "    return about_the_run and bool(origin) and _is_incognito_research(origin)")
+DEF_RECONNECT = "\nasync def _firebase_reconnect_loop():"
+DEF_RELINK = "\nasync def _revoked_recovery_loop():"
+DEF_DEVICE = "    def _on_snap(_col_snapshot, changes, _read_time):"
+WORKER_TASK = "                    _pipe_task = asyncio.ensure_future("
 
 MUTANTS = [
     # ── task 1 ────────────────────────────────────────────────────────────
@@ -283,6 +300,33 @@ MUTANTS = [
      [(DROP_SHED, "    if False:\n"
                   "        try:\n"
                   "            _shed_from_pending_snapshot(queue)")], [T_EDGES, T_LEASE]),
+
+    # ── task 4: owner lines ───────────────────────────────────────────────
+    ("F1", "under", "⛔⛔ a line with no origin is judged by the run that is "
+     "armed, so a revoked credential, a Reset Backend or a watchdog kill "
+     "vanishes from the owner's log while a private run is armed",
+     [(ORIGIN_READ, "    origin = _LOG_RUN.get() or getattr(_active_run_sink(), "
+                    "\"research_id\", None)\n"
+                    "    return about_the_run and bool(origin) and _is_incognito_research(origin)")],
+     [T_OWNER]),
+    ("F2", "over", "⛔⛔ the reconnect loop becomes a machine line, so an "
+     "ORDINARY run's folder no longer says its commands stopped because of an "
+     "outage — the 08-24 silence",
+     [(DEF_RECONNECT, "\n@_machine_logged\nasync def _firebase_reconnect_loop():")],
+     [T_OWNER]),
+    ("F3", "over", "⛔ the revoked-credential loop becomes a machine line, so "
+     "the run's folder no longer says why its writes failed",
+     [(DEF_RELINK, "\n@_machine_logged\nasync def _revoked_recovery_loop():")],
+     [T_OWNER]),
+    ("F4", "over", "⛔ the device-command callback becomes a machine line, so "
+     "the run a Reset Backend killed has no line saying so",
+     [(DEF_DEVICE, "    @_machine_logged\n"
+                   "    def _on_snap(_col_snapshot, changes, _read_time):")], [T_OWNER]),
+    ("F5", "under", "⛔⛔ the worker sets the run's origin itself, not the "
+     "wrapper around exactly the pipeline — so the watchdog's verdict on a "
+     "private run is held back from the owner's log",
+     [(WORKER_TASK, "                    _LOG_RUN.set(job.get(\"research_id\"))\n"
+                    "                    _pipe_task = asyncio.ensure_future(")], [T_OWNER]),
 ]
 
 

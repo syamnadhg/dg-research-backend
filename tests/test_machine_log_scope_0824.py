@@ -284,6 +284,11 @@ _EXPECTED_MARKED = {
 # explains that run's fate; marking any of them would produce a folder that says
 # nothing about why its run ended, which is the failure the whole capture exists
 # to prevent.
+#
+# ⭐ Wave 10.10: the first two, the device-command callback and the watchdog's
+# verdict also always reach the owner's log while a private run is armed —
+# with no marking, because none of them carries a run origin (`_LOG_RUN`). That
+# is held, each one executed, in tests/test_owner_log_lines_1010.py.
 _MUST_NOT_BE_MARKED = {
     "_firebase_reconnect_loop",              # an outage is why commands stopped
     "_revoked_recovery_loop",                # a revoke is why writes failed

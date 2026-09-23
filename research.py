@@ -3502,6 +3502,16 @@ _RUN_LOG_TLS = _log_threading.local()
 # device-command listener (a hard reset is why the run died), and the worker
 # watchdog. Silence about why a run ended is the failure this whole capture
 # exists to prevent.
+#
+# ⭐ AND THE OWNER'S LOG GETS THEM TOO, WITH NO MARKING (wave 10.10, on the
+# origin rule of 10.9's last repair). None of the four is a run's work — the
+# server starts the two loops, the SDK's own thread runs the device-command
+# callback, and the watchdog's verdict is written by the worker outside the
+# pipeline's task — so their lines carry no run origin, and
+# `_console_withholds_line` never holds back a line with no origin, even while
+# a private run is armed. They name a run, if at all, by its research-id prefix
+# or its queue folder name, which for a private run is minted without the
+# topic. Held by tests/test_owner_log_lines_1010.py, each loop executed.
 import contextvars as _log_contextvars  # noqa: E402
 import contextlib as _log_contextlib  # noqa: E402
 
