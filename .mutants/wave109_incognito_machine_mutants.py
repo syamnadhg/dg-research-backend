@@ -360,10 +360,12 @@ P3_CALL = ("                _p3_audio_reason, _p3_audio_detail = _p3_no_podcast_
            "                    audio_path, _fb_research_id)")
 
 # ── anchors: the two seams a recovery status has to satisfy at once ─────────
+# ⚠ Re-anchored in wave 10.10: the signature gained a keyword-only
+# `take_unreadable` after the whitelist, so the anchor stops at the tuple.
 ENQUEUE_WHITELIST = (
     'def _safe_enqueue(job_queue, job, source: str,\n'
     '                  allowed_statuses: "tuple[str, ...]" = '
-    '("queued", "ongoing", "paused_backend_restart")) -> bool:')
+    '("queued", "ongoing", "paused_backend_restart")')
 SEQ_MONOTONIC = ("    new_seq = int(time.time() * 1000)\n"
                  "    if new_seq <= _fb_seq:\n"
                  "        new_seq = _fb_seq + 1")
