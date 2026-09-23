@@ -3964,6 +3964,37 @@ def _orphan_recheck_due(last_verified_at, now: float, research_id,
     return (float(now) - float(last_verified_at or 0.0)) >= float(recheck_sec)
 
 
+def _queue_dir_research_id(queue_dir) -> str:
+    """Whose research a run FOLDER is, read from the `owner.json` beside its
+    checkpoint — `""` when the folder cannot say.
+
+    ⛔⛔ THE CALLER DOES NOT ALWAYS KNOW (wave 10.9 repair). `superresearch
+    --resume queues/<run>` hands the pipeline a directory and nothing else, so
+    the wrapper's capture key binds no research id at all and every gate that
+    asks "is this a run that keeps nothing?" answers no. The purge then refused
+    at its first line, and a run that ENDED on that resume left its documents,
+    its delivery record and its topic on the computer until the orphan sweep
+    noticed the record was gone.
+
+    ⭐ `owner.json` IS THE ANSWER ALREADY IN USE — by the resume's own ownership
+    check and by `_queue_owner_map` — because it is the one place on this disk
+    where a run folder sits beside the person and the research it belongs to.
+    The folder NAME is never used for this: it is sanitised, and for an
+    incognito run it deliberately carries no topic at all.
+
+    ⛔ NO RECORD, NO CLAIM. An absent or unreadable `owner.json` answers `""`,
+    and a caller must read that as "leave it alone" — removing a directory on a
+    guess is how somebody else's unfinished work disappears."""
+    if not queue_dir:
+        return ""
+    try:
+        owner = json.loads(
+            (Path(queue_dir) / "owner.json").read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    return str((owner or {}).get("researchId") or "").strip()
+
+
 def _purge_incognito_run_dirs(queue_dir, research_id) -> bool:
     """Take a finished incognito run's folders off this disk, now.
 
@@ -3985,13 +4016,20 @@ def _purge_incognito_run_dirs(queue_dir, research_id) -> bool:
     name is sanitised, so a prefix match would either miss it or take somebody
     else's diagnostics.
 
+    ⭐ AND IT ASKS THE FOLDER WHEN THE CALLER SAID NOTHING — `--resume` names a
+    directory and no research at all. The folder's own `owner.json` answers;
+    a caller that DID name a research is never second-guessed, so a stale record
+    beside an ordinary run cannot turn its folder into an ephemeral one.
+
     Returns True when anything was removed. Never raises: this runs on the way
     out of a pipeline, and a cleanup that can end a run is worse than a leftover
     directory."""
+    queue_dir = Path(queue_dir) if queue_dir else None
+    if not research_id:
+        research_id = _queue_dir_research_id(queue_dir)
     if not _is_incognito_research(research_id):
         return False
     import shutil as _shutil
-    queue_dir = Path(queue_dir) if queue_dir else None
     try:
         status = json.loads(
             (queue_dir / "delivery.json").read_text(encoding="utf-8")).get("status", "")
@@ -14771,6 +14809,65 @@ async def _p3_publish_audio(audio_path, research_id) -> str:
     return ""
 
 
+#: What phase 3 tells the person when it ends holding no podcast for a run that
+#: keeps nothing — the tile's line and the notice's line.
+#:
+#: ⛔⛔ PROSE, NOT A SLUG, AND THAT IS LOAD-BEARING. The app enumerates the skip
+#: reasons it knows and de-underscores any other one into "Skipped — a slug like
+#: this"; a reason carrying a capital or a space is a sentence somebody wrote and
+#: is returned untouched. So these arrive as written, with nothing to ship beside
+#: them — and a new slug would have arrived as a slug.
+#:
+#: ⭐ AND PROSE RAISES NO NOTICE, which is the right answer here rather than a
+#: happy accident: `isAutomaticSkip` classifies a prose reason as not-automatic,
+#: so no bell entry is minted — and a bell entry for a run that keeps nothing
+#: names a research the person can no longer open. An ordinary run's two slugs
+#: still notify.
+_P3_KEEPS_NOTHING_REASON = "No podcast — this research keeps nothing"
+_P3_KEEPS_NOTHING_DETAIL = (
+    "A research that keeps nothing leaves no podcast: nothing is published, and "
+    "anything made on the research computer goes when the run ends.")
+
+
+def _p3_no_podcast_report(audio_path, research_id) -> "tuple[str, str]":
+    """`(reason, detail)` for the `phase_skipped` event phase 3 emits when it
+    ends with no podcast anybody can play.
+
+    ⛔⛔ A REFUSAL IS NOT A FAILURE (wave 10.9, #536). Phase 3 is off for a run
+    that keeps nothing, and `_p3_publish_audio` is the net for when that
+    configuration does not arrive — a resume whose config.json predates the
+    flip, or a caller that drops the key. On that path the podcast IS made and
+    publication IS declined, so a gate reading only the artefact saw a file with
+    no Storage URL and called it `audio_generated_but_upload_failed`: "The
+    podcast was generated but couldn't be uploaded — it's still on your research
+    computer." Nothing failed, and the file is not still anywhere —
+    `_purge_incognito_run_dirs` takes that folder minutes later. The person is
+    running on somebody else's computer, and this told them their private
+    research was sitting on it.
+
+    ⭐ ONE ANSWER FOR THAT RUN, whether or not the audio was made. "We made one
+    and kept nothing" and "we never made one" differ only in a repair that
+    neither has here: there is nothing to fetch and nothing to retry, and a
+    sentence naming a podcast would be a claim about a file nobody can reach.
+
+    ⭐ AND THE ORDINARY RUN KEEPS BOTH OF ITS ANSWERS. "No podcast" and "a
+    podcast we could not upload" are different states with different repairs,
+    and in the second one the file really is on that computer — saying so was
+    the whole point of the branch this came out of.
+
+    ⛔ EXTRACTED SO A TEST CAN RUN IT, exactly as `_p3_publish_audio` was: this
+    decision sits inside a six-hundred-line browser coroutine and was otherwise
+    reachable only by driving NotebookLM. Called unconditionally there."""
+    if _is_incognito_research(research_id):
+        return (_P3_KEEPS_NOTHING_REASON, _P3_KEEPS_NOTHING_DETAIL)
+    if audio_path:
+        return ("audio_generated_but_upload_failed",
+                "NotebookLM notebook created. The podcast was generated but "
+                "couldn't be uploaded — it's still on your research computer.")
+    return ("no_audio_generated",
+            "NotebookLM notebook created. No audio overview was produced.")
+
+
 def save_document_to_firestore(doc_type: str, content: str, name: str | None = None) -> bool:
     """Upsert a research document (brief/chatgpt/gemini/claude/consolidated)
     into the user's Firestore documents subcollection so the Documents page
@@ -17588,11 +17685,20 @@ def _update_research_doc(uid: str, research_id: str, updates: dict) -> bool:
 #: A field name safe to put on the left of a dot in a Firestore field path.
 #: Anything else (a dot, a backtick, a space) has to be back-quoted, and rather
 #: than build that quoting the write falls back to a whole-map replace.
-_FIELD_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+#:
+#: ⛔⛔ THE CLIENT'S OWN GRAMMAR, NOT A GUESS AT IT. `parse_field_path` in
+#: google.cloud.firestore accepts an unquoted segment of `[A-Za-z_][A-Za-z0-9_]*`
+#: and RAISES on anything else: this pattern used to admit `-` and a leading
+#: digit, so a link kind like `audio-file` would have gone in as
+#: `links.audio-file` and the client would have thrown `Path … not consumed`
+#: INSIDE the write — swallowed by the caller's except as a WARN, so the write
+#: an ordinary run lands with a set-merge would simply not happen for a run that
+#: keeps nothing. Narrow, and such a key takes the whole-map path below instead.
+_FIELD_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _merge_field_paths(payload: dict) -> dict:
-    """`{"links": {"audio_file": {…}}}` as `{"links.audio_file": {…}}`.
+    """`{"agents": {"claude": {"status": …}}}` as `{"agents.claude.status": …}`.
 
     ⛔⛔ AN `update()` WITH A NESTED MAP AS ONE VALUE REPLACES THAT MAP, deleting
     every key the new one omits — the exact trap `apply_firestore_update` in the
@@ -17601,18 +17707,35 @@ def _merge_field_paths(payload: dict) -> dict:
     that was written as `set(…, merge=True)` keeps meaning the same thing when
     it is written as an update: `agents.chatgpt` leaves `agents.gemini` alone.
 
-    ⭐ ONE LEVEL, AND ONLY FOR PLAIN MAPS OF SIMPLE NAMES. A sentinel
-    (`DELETE_FIELD`, `ArrayUnion`) is not a dict and passes through untouched; a
-    key that would need back-quoting keeps its whole-map form rather than being
-    spliced into a path this code cannot quote correctly."""
+    ⛔⛔ AND IT GOES ALL THE WAY DOWN, because that trap is not a property of the
+    first level (wave 10.9 repair). Stopping after one, `{"agents": {"claude":
+    {"status": "complete"}}}` became `update({"agents.claude": {…}})` — a map as
+    one value again, one step lower — so the write that says an agent FINISHED
+    deleted that agent's sources, sourceUrls, findings, progressHistory and
+    completionTimeSec, and the card in the chat went blank on everything it had
+    just spent twenty minutes collecting. `set(…, merge=True)` merges at every
+    depth; only a rewrite at every depth means the same thing.
+
+    ⭐ ONLY FOR PLAIN MAPS OF SIMPLE NAMES, AT EVERY LEVEL. A sentinel
+    (`DELETE_FIELD`, `ArrayUnion`) is not a dict and rides its path untouched, so
+    an append still appends; a key this code cannot spell in a field path stops
+    the descent at the level above it — a replace of that sub-map, never a write
+    to a different field; and an EMPTY map stops it too, because expanding `{}`
+    into zero paths is a write that says nothing, silently."""
     out: dict = {}
-    for key, value in (payload or {}).items():
+
+    def _expand(path: str, value) -> None:
         if (type(value) is dict and value
                 and all(isinstance(k, str) and _FIELD_PATH_SEGMENT_RE.match(k)
-                        for k in value)
-                and _FIELD_PATH_SEGMENT_RE.match(str(key))):
+                        for k in value)):
             for inner, inner_value in value.items():
-                out[f"{key}.{inner}"] = inner_value
+                _expand(f"{path}.{inner}", inner_value)
+        else:
+            out[path] = value
+
+    for key, value in (payload or {}).items():
+        if _FIELD_PATH_SEGMENT_RE.match(str(key)):
+            _expand(str(key), value)
         else:
             out[key] = value
     return out
@@ -73147,9 +73270,14 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # and the second one still has the file sitting on the research
                 # computer — telling the user only that Phase 3 did not finish
                 # would throw that away.
-                _p3_audio_reason = (
-                    "audio_generated_but_upload_failed" if audio_path
-                    else "no_audio_generated")
+                #
+                # ⛔⛔ AND FOR A RUN THAT KEEPS NOTHING, NAME NEITHER — nothing
+                # failed there, the machine declined to publish, and the file
+                # this sentence used to point at is deleted minutes later. All
+                # three sentences live in `_p3_no_podcast_report`, which is the
+                # half of this decision a test can run.
+                _p3_audio_reason, _p3_audio_detail = _p3_no_podcast_report(
+                    audio_path, _fb_research_id)
                 log(f"[Phase3] no deliverable podcast ({_p3_audio_reason}) — "
                     f"reporting phase 3 as skipped rather than complete", "WARN")
                 # ⛔⛔ `detail=`, NOT `summary=`. The frontend's phase_skipped
@@ -73162,10 +73290,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # path already prefers.
                 emit_event("phase_skipped", phase=3, reason=_p3_audio_reason,
                            durationSec=int(time.time() - _p3_start), links=_p3_links,
-                           detail=("NotebookLM notebook created. The podcast was generated but "
-                                   "couldn't be uploaded — it's still on your research computer."
-                                   if audio_path else
-                                   "NotebookLM notebook created. No audio overview was produced."))
+                           detail=_p3_audio_detail)
         else:
             links_file = queue_dir / "links.json"
             if links_file.exists():

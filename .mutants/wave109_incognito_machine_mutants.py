@@ -51,6 +51,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 SUITES = ("tests/test_incognito_capability_109.py "
+          "tests/test_incognito_live_progress_109.py "
           "tests/test_incognito_run_id_and_logs_109.py "
           "tests/test_incognito_machine_skips_109.py "
           "tests/test_incognito_expiry_109.py "
@@ -120,6 +121,11 @@ AUDIO_FALLTHROUGH = (
     "    except Exception as e:\n"
     '        log(f"Audio Firestore/Storage sync failed: {e}", "WARN")\n'
     '    return ""')
+P3_REPORT_INCOG = ("    if _is_incognito_research(research_id):\n"
+                   "        return (_P3_KEEPS_NOTHING_REASON, _P3_KEEPS_NOTHING_DETAIL)")
+P3_REPORT_REASON = '_P3_KEEPS_NOTHING_REASON = "No podcast — this research keeps nothing"'
+# ⛔ The CALL SITE is mutated by `links_out_summary_in_0828` (P5), whose suites
+# include the phase-3 gate file. One address, one owner.
 NOTICE_SKIP = ('    if _is_incognito_research(research_id):\n'
                '        log(f"phase-notify: {research_id[:8]}… keeps nothing — no notice asked for",\n'
                '            "INFO")\n'
@@ -148,11 +154,13 @@ WRITE_GATE = ("    if not _is_incognito_research(research_id):\n"
               "        return doc_ref.set(payload, merge=merge)\n"
               "    return doc_ref.update(_merge_field_paths(payload))")
 PATHS_DESCEND = ("            for inner, inner_value in value.items():\n"
-                 '                out[f"{key}.{inner}"] = inner_value')
+                 '                _expand(f"{path}.{inner}", inner_value)')
 PATHS_GUARD = ("        if (type(value) is dict and value\n"
                "                and all(isinstance(k, str) and _FIELD_PATH_SEGMENT_RE.match(k)\n"
-               "                        for k in value)\n"
-               "                and _FIELD_PATH_SEGMENT_RE.match(str(key))):")
+               "                        for k in value)):")
+PATHS_TOP_GUARD = ("        if _FIELD_PATH_SEGMENT_RE.match(str(key)):\n"
+                   "            _expand(str(key), value)")
+PATHS_SEGMENT_RE = '_FIELD_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")'
 CLAIM_ABORT = ("                if _is_incognito_research(research_id):\n"
                '                    log(f"[start-listener] {research_id[:8]}… keeps nothing and its "')
 # ⛔ `doc.reference.delete()` inside a try appears six times in this file, so the
@@ -160,6 +168,11 @@ CLAIM_ABORT = ("                if _is_incognito_research(research_id):\n"
 # ── anchors: the folders this disk keeps ────────────────────────────────────
 PURGE_GATE = ("    if not _is_incognito_research(research_id):\n"
               "        return False")
+PURGE_ASKS_FOLDER = ("    if not research_id:\n"
+                     "        research_id = _queue_dir_research_id(queue_dir)")
+OWNER_UNREADABLE = ('    except Exception:\n'
+                    '        return ""\n'
+                    '    return str((owner or {}).get("researchId") or "").strip()')
 PURGE_OVER = "    if status not in _RUN_DELIVERY_OVER:\n        return False"
 PURGE_OVER_SET = '_RUN_DELIVERY_OVER = frozenset({"completed", "stopped"})'
 PURGE_UNREADABLE = ("    except Exception:\n"
@@ -336,6 +349,21 @@ MUTANTS = [
      "and delivery disagree about the same run again",
      [(AUDIO_FALLTHROUGH, AUDIO_FALLTHROUGH[:-len('    return ""')]
        + "    return str(audio_path or \"\")")]),
+    ("N4b", "under", "⛔⛔ the phase reports the refusal to publish as an upload "
+     "FAILURE again, and tells somebody running on another person's computer "
+     "that their private podcast is still on it — minutes before the purge "
+     "deletes the folder",
+     [(P3_REPORT_INCOG, "    if False:\n"
+                        "        return (_P3_KEEPS_NOTHING_REASON, _P3_KEEPS_NOTHING_DETAIL)")]),
+    ("N4c", "over", "every run gets that answer, so an ordinary run stops being "
+     "told which of the two happened — and loses the one sentence that says its "
+     "podcast can still be fetched",
+     [(P3_REPORT_INCOG, "    if True:\n"
+                        "        return (_P3_KEEPS_NOTHING_REASON, _P3_KEEPS_NOTHING_DETAIL)")]),
+    ("N4d", "under", "the tile line goes back to being a SLUG, which the app "
+     "renders as a de-underscored word salad because it enumerates the slugs it "
+     "knows and this is not one of them",
+     [(P3_REPORT_REASON, '_P3_KEEPS_NOTHING_REASON = "no_podcast_kept"')]),
     ("N6", "under", "⛔ the phase notice is asked for again — an inbox row that "
      "outlives the run, linking to a chat that will not exist",
      [(NOTICE_SKIP, "    if False:\n        return False")]),
@@ -392,10 +420,24 @@ MUTANTS = [
      [(WRITE_GATE, "    return doc_ref.update(_merge_field_paths(payload))")]),
     ("C3", "under", "⛔⛔ the nested map rides an update whole, so writing one "
      "agent's status deletes the other two",
-     [(PATHS_DESCEND, '            out[key] = value')]),
+     [(PATHS_DESCEND, '            out[path] = value')]),
     ("C4", "over", "a name that needs quoting is spliced into a path unquoted, "
      "so the write lands on a different field entirely",
      [(PATHS_GUARD, "        if type(value) is dict and value:")]),
+    ("C7", "under", "⛔⛔ the rewrite stops after ONE level, so the write that "
+     "says an agent finished deletes that agent's sources, its findings and its "
+     "progress curve — the live tile going blank",
+     [(PATHS_DESCEND, '            for inner, inner_value in value.items():\n'
+                      '                out[f"{path}.{inner}"] = inner_value')]),
+    ("C8", "over", "a top-level name the client cannot parse is spliced in "
+     "anyway, so the whole write raises inside the update and is swallowed as a "
+     "WARN — an ordinary run's set-merge lands and this one does not",
+     [(PATHS_TOP_GUARD, "        if True:\n            _expand(str(key), value)")]),
+    ("C9", "over", "the segment pattern admits a hyphen and a leading digit "
+     "again, which `parse_field_path` refuses — the same swallowed write, from "
+     "one level down",
+     [(PATHS_SEGMENT_RE,
+       '_FIELD_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_-]+$")')]),
     ("C5", "under", "⛔⛔ the claim recreates a record that was deleted, which is "
      "the one thing the promise cannot survive",
      [(CLAIM_ABORT, "                if False:\n"
@@ -426,6 +468,20 @@ MUTANTS = [
     ("T6", "under", "⛔⛔ the wrapper stops purging, so the helper is perfect "
      "and nothing ever calls it",
      [(PURGE_CALL, "            pass")]),
+    ("T6b", "under", "⛔⛔ a `--resume` that ENDS the run purges nothing, because "
+     "the CLI names a directory and no research — the documents, the delivery "
+     "record and the topic stay until the orphan sweep notices",
+     [(PURGE_ASKS_FOLDER, "    if False:\n"
+                          "        research_id = _queue_dir_research_id(queue_dir)")]),
+    ("T6c", "over", "the folder's own record overrules the caller, so a stale "
+     "`owner.json` beside an ordinary run takes that run's folder",
+     [(PURGE_ASKS_FOLDER, "    if True:\n"
+                          "        research_id = _queue_dir_research_id(queue_dir)")]),
+    ("T6d", "over", "⛔ a folder that cannot name its run is GUESSED at, which is "
+     "how somebody else's unfinished work disappears",
+     [(OWNER_UNREADABLE, '    except Exception:\n'
+                         '        return "incog_1758400000000_1"\n'
+                         '    return str((owner or {}).get("researchId") or "").strip()')]),
     ("T7", "under", "the log folders stay, so the run's diagnostics outlive it",
      [(PURGE_LOGS, "    for folder in []:\n        try:\n            _shutil.rmtree(folder)")]),
     ("T8", "under", "⛔ the hourly memo holds an incognito folder after all, for "

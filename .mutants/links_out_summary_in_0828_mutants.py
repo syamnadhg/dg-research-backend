@@ -83,14 +83,18 @@ MUTANTS = [
        '                _suppressed = lambda *a, **k: None\n'
        '                _suppressed("phase_skipped", phase=3, reason=_p3_audio_reason,')]),
 
+    # ⛔ RE-ANCHORED, wave 10.9 repair: the three sentences moved into
+    # `_p3_no_podcast_report` so a test could RUN them — and so the phase could
+    # stop telling a run that keeps nothing its podcast was still on the
+    # research computer. Same claim, same kill, new address: the branch now
+    # decides by ASKING, and a gate that decides for itself is the bug.
     ("P5", "under",
      "⛔ the skip stops distinguishing the two failures, so a user whose podcast "
      "is sitting on the research computer is told only that the phase did not "
      "finish",
-     [('                _p3_audio_reason = (\n'
-       '                    "audio_generated_but_upload_failed" if audio_path\n'
-       '                    else "no_audio_generated")',
-       '                _p3_audio_reason = "no_audio_generated"')]),
+     [('                _p3_audio_reason, _p3_audio_detail = _p3_no_podcast_report(\n'
+       '                    audio_path, _fb_research_id)',
+       '                _p3_audio_reason, _p3_audio_detail = ("no_audio_generated", "")')]),
 
     # ⛔ RE-ANCHORED, wave 10.9: these three writes moved out of
     # `run_phase3_audio` into `_p3_publish_audio` so a test could RUN the

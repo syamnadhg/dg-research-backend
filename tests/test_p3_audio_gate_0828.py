@@ -31,6 +31,7 @@ decides whether the phase succeeded.
 import ast
 import asyncio
 import inspect
+import pathlib
 import textwrap
 
 import pytest
@@ -154,16 +155,42 @@ def test_a_run_with_no_deliverable_podcast_reports_a_skip_not_a_silence(pipeline
     terminal event, not a missing one."""
     assert "elif _p3_no_skip:" in pipeline_src
     tail = pipeline_src[pipeline_src.index("elif _p3_no_skip:"):]
-    assert 'emit_event("phase_skipped", phase=3' in tail[:1400]
+    # ⭐ THE BRANCH, NOT A CHARACTER COUNT. This read `tail[:1400]`, which is the
+    # same claim only for as long as nobody adds a comment to the branch — and
+    # the wave 10.9 repair did. `else:` at eight spaces is where this branch ends.
+    branch = tail[:tail.index("\n        else:")]
+    assert 'emit_event("phase_skipped", phase=3' in branch
 
 
-def test_the_skip_names_which_of_the_two_failed(pipeline_src):
+@pytest.mark.parametrize("made_audio,reason", [
+    (True, "audio_generated_but_upload_failed"),
+    (False, "no_audio_generated"),
+])
+def test_the_skip_names_which_of_the_two_failed(tmp_path, made_audio, reason):
     """"No audio was generated" and "a podcast we could not upload" are
     different states with different repairs — and in the second one the file is
-    still on the research computer, which the user needs to be told."""
-    assert '"audio_generated_but_upload_failed" if audio_path' in pipeline_src
-    assert '"no_audio_generated"' in pipeline_src
-    assert "still on your research computer" in pipeline_src
+    still on the research computer, which the user needs to be told.
+
+    ⭐ RUN, NOT READ (wave 10.9): the two sentences moved into
+    `_p3_no_podcast_report` so this claim could be executed, for the same reason
+    the three publishing writes moved into `_p3_publish_audio`."""
+    audio = tmp_path / "Deep_Dive.m4a"
+    audio.write_bytes(b"audio")
+    got_reason, got_detail = research._p3_no_podcast_report(
+        audio if made_audio else None, "chat_1755500000000_3")
+    assert got_reason == reason
+    assert ("still on your research computer" in got_detail) is made_audio
+
+
+def test_the_phase_asks_that_helper_rather_than_deciding_inline(pipeline_src):
+    """⛔ THE WIRING, and it is all this file can say about it: the decision sits
+    a thousand lines inside a browser coroutine. A gate that computed the reason
+    itself is exactly what carried the sentence about somebody else's computer
+    into a run that was about to delete the file."""
+    assert ("_p3_audio_reason, _p3_audio_detail = _p3_no_podcast_report("
+            in pipeline_src)
+    assert "detail=_p3_audio_detail" in pipeline_src
+    assert "still on your research computer" not in pipeline_src
 
 
 def test_the_complete_summary_no_longer_claims_an_audio_link(pipeline_src):
@@ -305,10 +332,15 @@ def test_the_skip_sends_its_sentence_where_the_frontend_reads_it(pipeline_src):
     the research computer reached no surface at all, and the tile showed a
     de-underscored slug instead."""
     tail = pipeline_src[pipeline_src.index("elif _p3_no_skip:"):]
-    emit = tail[:tail.index("else:")] if "else:" in tail[:2000] else tail[:2000]
-    assert "detail=(" in emit
+    emit = tail[:tail.index("\n        else:")]
+    assert "detail=_p3_audio_detail" in emit
     assert "summary=(" not in emit
-    assert "still on your research computer" in emit
+    # ⭐ AND THE SENTENCE ITSELF IS NOW RUN, not read: it moved into
+    # `_p3_no_podcast_report` so a test could ask for it instead of grepping the
+    # coroutine it is emitted from.
+    _reason, detail = research._p3_no_podcast_report(
+        pathlib.Path("Deep_Dive.m4a"), "chat_1755500000000_3")
+    assert "still on your research computer" in detail
 
 
 def test_the_upload_card_does_not_claim_the_upload_succeeded(pipeline_src):

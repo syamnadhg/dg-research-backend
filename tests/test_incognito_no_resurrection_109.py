@@ -38,15 +38,21 @@ def test_a_nested_map_becomes_a_field_path():
     """⛔⛔ AN UPDATE WITH A NESTED MAP AS ONE VALUE REPLACES THAT MAP, deleting
     every key the new one omits — the trap that erased `needsRestart` when
     `updateStatus` was written whole. `agents.chatgpt` leaves `agents.gemini`
-    alone; `agents` as a map does not."""
+    alone; `agents` as a map does not.
+
+    ⛔⛔ AND ONE LEVEL WAS NOT ENOUGH, which is what this assertion used to say.
+    `{"agents.chatgpt": {"status": …}}` is a map as one value all over again,
+    one step lower, so the write that said an agent had FINISHED deleted that
+    agent's sources, findings and progress curve. The document that proves it is
+    in tests/test_incognito_live_progress_109.py; this is the shape it needs."""
     out = research._merge_field_paths({"agents": {"chatgpt": {"status": "complete"}}})
-    assert out == {"agents.chatgpt": {"status": "complete"}}
+    assert out == {"agents.chatgpt.status": "complete"}
 
 
 def test_two_keys_under_one_map_each_get_their_own_path():
     out = research._merge_field_paths({"links": {"brief": {"url": "a"},
                                                  "audio_file": {"url": "b"}}})
-    assert out == {"links.brief": {"url": "a"}, "links.audio_file": {"url": "b"}}
+    assert out == {"links.brief.url": "a", "links.audio_file.url": "b"}
 
 
 def test_a_sentinel_is_never_descended_into():
@@ -59,14 +65,21 @@ def test_a_sentinel_is_never_descended_into():
         "userSources": sentinel}
 
 
-def test_a_name_that_would_need_quoting_keeps_its_whole_map_form():
+@pytest.mark.parametrize("name", ["a.b", "audio-file", "2x", "a b", "a`b"])
+def test_a_name_that_would_need_quoting_keeps_its_whole_map_form(name):
     """⛔ A field name with a dot in it has to be back-quoted in a path, and
     splicing it in unquoted would write to a DIFFERENT field. Rather than build
     that quoting, such a payload stays a whole-map value — the pre-existing
-    behaviour, which is at worst a replace and never a wrong address."""
-    payload = {"links": {"a.b": {"url": "x"}}}
+    behaviour, which is at worst a replace and never a wrong address.
+
+    ⛔⛔ AND THE SET IS THE CLIENT'S, NOT A GUESS. `parse_field_path` accepts
+    `[A-Za-z_][A-Za-z0-9_]*` unquoted and RAISES on anything else, so a hyphen
+    or a leading digit is not "at worst a replace" — it is an exception thrown
+    inside the write, swallowed by the caller as a WARN, and the write an
+    ordinary run lands with a set-merge simply never happens."""
+    payload = {"links": {name: {"url": "x"}}}
     assert research._merge_field_paths(payload) == payload
-    assert research._merge_field_paths({"a.b": {"c": 1}}) == {"a.b": {"c": 1}}
+    assert research._merge_field_paths({name: {"c": 1}}) == {name: {"c": 1}}
 
 
 def test_an_empty_map_is_not_expanded_into_nothing():
@@ -109,7 +122,7 @@ def test_a_run_that_keeps_nothing_keeps_its_other_agents():
     calls = []
     research._write_research_doc(
         _Ref(calls), {"agents": {"claude": {"status": "complete"}}}, INCOG)
-    assert calls[0][1] == {"agents.claude": {"status": "complete"}}
+    assert calls[0][1] == {"agents.claude.status": "complete"}
 
 
 # ── the consumers ─────────────────────────────────────────────────────────
@@ -158,7 +171,7 @@ def test_the_links_writer_asks_the_same_question(db, monkeypatch, rid, verb):
     [(kind, payload)] = db
     assert kind == verb
     if verb == "update":
-        assert payload == {"links.brief": {"url": "https://x/1", "label": "Brief"}}
+        assert payload == {"links.brief.url": "https://x/1", "links.brief.label": "Brief"}
     else:
         assert payload == {"links": {"brief": {"url": "https://x/1", "label": "Brief"}}}
 
@@ -182,7 +195,7 @@ def test_the_agents_writer_asks_the_same_question(db, monkeypatch, rid, verb):
     assert research._set_research_doc(UID, rid, {"agents": {"gemini": {"status": "x"}}})
     [(kind, payload)] = db
     assert kind == verb
-    assert payload == ({"agents.gemini": {"status": "x"}} if verb == "update"
+    assert payload == ({"agents.gemini.status": "x"} if verb == "update"
                        else {"agents": {"gemini": {"status": "x"}}})
 
 
