@@ -297,12 +297,25 @@ def test_the_refusal_tells_them_how_to_look():
     Now it pins the PROPERTY — a command is given, and it is chosen for the
     platform. The per-platform behaviour of `_port_holder_hint` is asserted in
     tests/test_stretch7_0902.py; this side pins the CONSUMER, because a helper
-    nobody calls is not a fix."""
-    server = _src_of("run_server")
-    assert "_port_holder_hint(port)" in server, (
-        "give the command, not just the diagnosis — and let the platform pick it")
-    assert "lsof" not in server, (
-        "a hardcoded lsof is back; on Windows that line cannot run")
+    nobody calls is not a fix.
+
+    ⭐ RUN, since wave 10.10: a source read passed with the call disabled. Both
+    refusals that tell a person to look are executed (see
+    `test_port_probe_0916._lifted`) with a sentinel for the hint, so the
+    sentinel must be PRINTED — and nothing else they print may name lsof."""
+    from test_port_probe_0916 import _hint, _lifted, _printer, _serve_port_branch
+    for state, holders in (("stuck", [{"pid": 31337}]), ("unknown", [])):
+        out = []
+        with pytest.raises(SystemExit):
+            _lifted(_serve_port_branch(state), _port_state=state,
+                    _port_holders_found=holders, port=8123, print=_printer(out),
+                    _port_holder_hint=_hint)
+        text = "\n".join(out)
+        assert "LOOK-AT<8123>" in text, (
+            f"{state}: give the command, not just the diagnosis — and let the "
+            f"platform pick it: {text}")
+        assert "lsof" not in text, (
+            f"{state}: a hardcoded lsof is back; on Windows that line cannot run")
 
 
 def test_a_port_check_that_itself_fails_does_not_block_boot():

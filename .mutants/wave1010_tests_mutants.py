@@ -56,6 +56,9 @@ RESEARCH = "research.py"
 #: Only the rewritten test: the rest of that file still reads source text, and
 #: a kill from one of those would not measure the rewrite.
 RANK = ["tests/test_gemini_flash_rank.py", "-k", "reject_list_and_family"]
+#: The executing port pins, and nothing that still reads the source.
+PORT_T = ["tests/test_port_probe_0916.py", "tests/test_serve_port_reclaim_0810.py",
+          "-k", "could_not_look or could_not_check or how_to_look"]
 #: A test list that starts with this runs from `agent/` — see `summary`.
 AGENT = "@agent"
 BRIDGE = "agent/facade/bridge.py"
@@ -280,6 +283,34 @@ MUTANTS = [
          '            device_id = device_id or (prefs.get_selected_device(sess.uid) or "")\n'
          '            if not device_id:\n', 1))],
      BRIDGE, TWO_COMPUTERS),
+
+    # ══ the stuck-port refusals, executed rather than read ═══════════════════
+    # ⛔ Each of S1-S4 keeps the text `_port_holder_hint(...)` exactly where the
+    # old source-window pins looked for it, and DISABLES the call. Every one of
+    # them passed those pins. They are run against the executing ones only.
+    ("S1", "under", "⛔ `--serve` refuses a port nobody could look at and prints "
+     "no way to look — the call is still in the source, disabled",
+     [('        print(f"      Look yourself with:  {_port_holder_hint(port)}")',
+       '        if False: print(f"      Look yourself with:  {_port_holder_hint(port)}")')],
+     RESEARCH, PORT_T),
+    ("S2", "under", "the stuck refusal's 'Check with:' names nothing",
+     [('              f"{_port_holder_hint(port)}\\n")',
+       '              f"{(0 and _port_holder_hint(port)) or str()}\\n")')],
+     RESEARCH, PORT_T),
+    ("S3", "under", "⛔ the crash-looping worker's only trace says nothing could "
+     "look and not how to look",
+     [('                                    f"{_port_holder_hint(_w_port)}",',
+       '                                    f"{(0 and _port_holder_hint(_w_port)) or str()}",')],
+     RESEARCH, PORT_T),
+    ("S4", "under", "the installer says it could not check, and not how to",
+     [("look yourself: {_port_holder_hint(8000)}')}\")",
+       "look yourself: {(0 and _port_holder_hint(8000)) or str()}')}\")")],
+     RESEARCH, PORT_T),
+    ("S5", "under", "the supervisor hands over the command for the BASE port, "
+     "not the worker's own — worker 2 is told to look at worker 1's port",
+     [('                                    f"{_port_holder_hint(_w_port)}",',
+       '                                    f"{_port_holder_hint(port)}",')],
+     RESEARCH, PORT_T),
 ]
 
 

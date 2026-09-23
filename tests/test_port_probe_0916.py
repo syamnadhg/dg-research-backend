@@ -51,14 +51,6 @@ RESEARCH = Path(__file__).resolve().parents[1] / "research.py"
 SRC = RESEARCH.read_text(encoding="utf-8")
 
 
-def _src_of(name: str) -> str:
-    tree = ast.parse(SRC)
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
-            return ast.get_source_segment(SRC, node) or ""
-    raise AssertionError(f"{name} not found")
-
-
 # ── the two worlds every test below compares ────────────────────────────────
 
 class _Conn:
@@ -260,27 +252,125 @@ def test_every_caller_reads_the_probe_flag():
             f"research.py:{lineno} does not unpack (pids, probed)")
 
 
-def test_the_supervisor_stops_saying_freed_nothing_when_it_could_not_look():
+# ── the three callers, RUN ──────────────────────────────────────────────────
+#
+# ⛔⛔ THESE USED TO READ SOURCE TEXT (wave 10.10). Each asserted that
+# `_port_holder_hint(...)` appeared in a window of the caller's source, so a
+# call that was disabled — commented out, behind `if False`, or reduced to
+# `0 and _port_holder_hint(port)` — still passed, and the person still got a
+# refusal with no way to look.
+#
+# ⭐ The callers are too big to run whole (`run_server` is 2,300 lines of boot
+# before its port check), so their real statements are LIFTED out of
+# research.py's parse tree and executed as the body of a small function. Only
+# the names the caller would have bound around them are supplied, and the hint
+# is a sentinel, so what is judged is what the statements PRINT.
+
+def _lifted(stmts, **names):
+    """Run real statements of research.py with `names` bound around them."""
+    shell = ast.parse("def _lifted_branch():\n    pass\n")
+    shell.body[0].body = list(stmts)
+    ast.fix_missing_locations(shell)
+    scope = {**vars(R), **names}
+    exec(compile(shell, str(RESEARCH), "exec"), scope)
+    return scope["_lifted_branch"]()
+
+
+def _function(name):
+    """`name`'s node in the parse tree of the FILE. ⛔ Never `inspect.getsource`:
+    it slices the file by line numbers taken at import, which is the one-in-ten
+    failure the Gemini rank pin had."""
+    for node in ast.walk(ast.parse(SRC)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return node
+    raise AssertionError(f"{name} not found")
+
+
+def _one(found, what):
+    assert len(found) == 1, f"expected ONE {what}, found {len(found)} — re-anchor this pin"
+    return found[0]
+
+
+def _supervisor_port_branch():
+    """The body of `run_daemon_loop`'s `if _serve_exit_was_port_conflict(...)`."""
+    return _one([n.body for n in ast.walk(_function("run_daemon_loop"))
+                 if isinstance(n, ast.If) and isinstance(n.test, ast.Call)
+                 and isinstance(n.test.func, ast.Name)
+                 and n.test.func.id == "_serve_exit_was_port_conflict"],
+                "port-conflict branch in run_daemon_loop")
+
+
+def _installer_port_lines():
+    """`run_resurrect`'s `… = _free_port_8000()` and the statement that reads it."""
+    found = []
+    for node in ast.walk(_function("run_resurrect")):
+        for field in ("body", "orelse"):
+            stmts = getattr(node, field, None)
+            if not isinstance(stmts, list):
+                continue
+            for i, s in enumerate(stmts):
+                if (isinstance(s, ast.Assign) and isinstance(s.value, ast.Call)
+                        and isinstance(s.value.func, ast.Name)
+                        and s.value.func.id == "_free_port_8000"):
+                    found.append(stmts[i:i + 2])
+    return _one(found, "_free_port_8000() call in run_resurrect")
+
+
+def _serve_port_branch(state):
+    """`run_server`'s own `if _port_state == "<state>":` statement."""
+    return [_one([n for n in _function("run_server").body
+                  if isinstance(n, ast.If) and isinstance(n.test, ast.Compare)
+                  and isinstance(n.test.left, ast.Name) and n.test.left.id == "_port_state"
+                  and isinstance(n.test.comparators[0], ast.Constant)
+                  and n.test.comparators[0].value == state],
+                 f'`if _port_state == "{state}":` in run_server')]
+
+
+def _hint(port):
+    return f"LOOK-AT<{port}>"
+
+
+def _printer(out):
+    return lambda *a, **k: out.append(" ".join(str(x) for x in a))
+
+
+@pytest.mark.parametrize("probed", [False, True])
+def test_the_supervisor_stops_saying_freed_nothing_when_it_could_not_look(probed):
     """The crash-respawn path had ALREADY proved the port was occupied. "freed
-    nothing" was never the fact; "nothing here could look" is."""
-    body = _src_of("run_daemon_loop")
-    at = body.index("_free_port(_w_port)")
-    window = body[at:at + 2000]
-    assert "if _probed:" in window, "the flag is fetched and not consulted"
-    assert "_port_holder_hint(_w_port)" in window, (
-        "say how to look, with the tool that exists on THIS platform")
+    nothing" was never the fact; "nothing here could look" is — and the line has
+    to say how to look, for THIS worker's port, with this platform's tool."""
+    lines = []
+    _lifted(_supervisor_port_branch(),
+            _free_port=lambda p: ([4242] if probed else [], probed),
+            _w_port=8124, port=8000, k=2,
+            log=lambda msg, level="INFO": lines.append((level, msg)),
+            _port_holder_hint=_hint)
+    [(level, msg)] = lines
+    assert level == "WARN"
+    if probed:
+        assert "freed [4242]" in msg and "LOOK-AT" not in msg, msg
+    else:
+        assert "NO PROBE COULD LOOK" in msg, "the flag is fetched and not consulted"
+        assert "LOOK-AT<8124>" in msg, (
+            f"say how to look at THIS worker's port, with this platform's tool: {msg}")
 
 
-def test_the_installer_says_something_when_it_could_not_check():
+@pytest.mark.parametrize("found, probed", [([], False), ([777], True), ([], True)])
+def test_the_installer_says_something_when_it_could_not_check(found, probed):
     """It printed on success only, so a probe that never ran was invisible — on
     the one path where the very next thing is a daemon-loop that will crash-loop
     on the bind we could not clear."""
-    body = _src_of("run_resurrect")
-    at = body.index("_free_port_8000()")
-    window = body[at:at + 900]
-    assert "elif not _port_probed:" in window, (
-        "an unprobed port still prints nothing at install time")
-    assert "_port_holder_hint(8000)" in window
+    out = []
+    _lifted(_installer_port_lines(), _free_port_8000=lambda: (found, probed),
+            print=_printer(out), _port_holder_hint=_hint)
+    text = "\n".join(out)
+    if not probed:
+        assert "Could not check port 8000" in text, "an unprobed port still prints nothing"
+        assert "LOOK-AT<8000>" in text, f"and it must say how to look: {text}"
+    elif found:
+        assert "Cleared port 8000" in text and "777" in text and "LOOK-AT" not in text, text
+    else:
+        assert text == "", f"a free port that was checked has nothing to report: {text}"
 
 
 # ── _port_holders and _reclaim_port: the careful path ───────────────────────
@@ -356,16 +446,20 @@ def test_an_identifiable_holder_is_unaffected_by_all_of_this(monkeypatch):
 def test_serve_refuses_with_its_own_words_when_it_could_not_look():
     """⛔ POSITION, not just mechanism. A new state that `run_server` has no
     branch for falls straight through and binds anyway — and the one refusal a
-    person reads would still be the one that says we stopped something."""
-    server = _src_of("run_server")
-    assert '_port_state == "unknown"' in server, (
-        "the new state has no branch; it falls through to binding")
-    at = server.index('_port_state == "unknown"')
-    window = server[at:at + 1200]
-    assert "_port_holder_hint(port)" in window, "name the tool that exists here"
-    assert "SystemExit(3)" in window, "an unclearable port must still refuse the bind"
-    assert "still held after stopping" not in window, (
+    person reads would still be the one that says we stopped something.
+
+    ⭐ RUN: the branch is executed and what it prints is judged."""
+    out = []
+    with pytest.raises(SystemExit) as refused:
+        _lifted(_serve_port_branch("unknown"), _port_state="unknown",
+                _port_holders_found=[], port=8123, print=_printer(out),
+                _port_holder_hint=_hint)
+    assert refused.value.code == 3, "an unclearable port must still refuse the bind"
+    text = "\n".join(out)
+    assert "LOOK-AT<8123>" in text, f"name the tool that exists here: {text}"
+    assert "still held after stopping" not in text, (
         "the stuck copy claims we stopped something; here we saw nothing")
+    assert "nothing was stopped" in text
 
 
 # ── the Windows branch nothing ran (wave 10.9) ──────────────────────────────
