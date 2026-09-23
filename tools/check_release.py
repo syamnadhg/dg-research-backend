@@ -30,6 +30,9 @@ missing platform is refused here and named.
 
 Run it on the staged release, right before the single publish command.
 
+The agent's own wheel (`superresearch_agent-*`) may sit in the same folder: it is
+named, set aside with a line saying so, and never counted as a machine wheel.
+
 USAGE
 -----
     python tools/check_release.py dist/*.whl
@@ -55,6 +58,27 @@ STAMP_NAME = "_sr_build.json"
 #: `--macos-target`) and the manylinux tag its glibc, so a release would fail this
 #: check the day either moved. What must be true is that each platform is HERE.
 REQUIRED_PLATFORMS = {"macosx": "macOS", "win_amd64": "Windows", "manylinux": "Linux"}
+
+#: The agent's distribution, as a wheel file name spells it.
+#: ⛔⛔ SKIPPED, AND SAID SO, RATHER THAN REFUSED (2026-09-23). Staged in the same
+#: folder as the three machine wheels, the agent wheel was refused as "carries no
+#: provenance stamp" and the whole release with it — so the only way to pass was
+#: to publish the two packages from two folders, which the checklist never said.
+#: ⭐ It is not part of what this checks, and accepting it would mean nothing: it
+#: is a separate package with its own version, it is pure Python, and it is
+#: built ONCE for every platform, so there is no second machine whose build it
+#: could disagree with. Its own checks are `tools/bump_version.py --check` before
+#: the publish and `--post-publish` (which asks PyPI) after it.
+#: ⛔ Matched by NAME, never by the `py3-none-any` tag: that tag is also what the
+#: machine build's source-mode fallback writes, and that wheel must still count
+#: as no platform at all.
+AGENT_DISTRIBUTION = "superresearch_agent"
+
+
+def distribution(wheel: Path) -> str:
+    """The distribution `wheel`'s file name declares: its first "-" field, which
+    a wheel name always spells with "_" for the project's own "-"."""
+    return wheel.name.split("-", 1)[0]
 
 
 def platform_tag(wheel: Path) -> str:
@@ -88,10 +112,17 @@ def read_stamp(wheel: Path) -> "dict | None":
 
 def check(wheels: "list[Path]") -> "tuple[bool, list[str]]":
     """(ok, report lines) for one release's wheels: every `REQUIRED_PLATFORMS`
-    platform present, every wheel stamped, and one source behind them all."""
+    platform present, every wheel stamped, and one source behind them all. An
+    agent wheel among them is named and set aside (see `AGENT_DISTRIBUTION`)."""
+    agent = [w for w in wheels if distribution(w) == AGENT_DISTRIBUTION]
+    skipped = [f"  {w.name}\n      skipped - the agent is its own package, checked by "
+               "tools/bump_version.py --check before the publish and --post-publish "
+               "after it" for w in agent]
+    wheels = [w for w in wheels if w not in agent]
     if not wheels:
-        return False, ["REFUSED: no wheels given — checking nothing is not a pass"]
-    lines: "list[str]" = []
+        return False, [*skipped, "REFUSED: no machine wheels given — checking nothing "
+                                 "is not a pass"]
+    lines: "list[str]" = [*skipped]
     problems: "list[str]" = []
     sources: "set[str]" = set()
     for wheel in wheels:

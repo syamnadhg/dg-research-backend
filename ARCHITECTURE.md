@@ -839,7 +839,13 @@ source says nothing about whether the release is whole, and a single staged whee
 agrees with itself, so this printed `OK: every wheel (1)` and exited 0 on exactly
 the partial release the paragraph above is about. A wheel's platform is read from
 its tag as a fragment (`macosx`, `win_amd64`, `manylinux`), so the Mac deployment
-target and the glibc version can move without failing the check.
+target and the glibc version can move without failing the check. An agent wheel
+(`superresearch_agent-*`) staged in the same folder is named and skipped: it is a
+separate, pure-Python package built once for every platform, so there is no
+cross-machine build for it to disagree with. `tools/bump_version.py --check`
+covers it before the publish, and `--post-publish VERSION` after it — that step
+confirms the version on PyPI, moves the web repo's published version and
+agent-log gate, and syncs the hosted skill.
 
 **This is a code-execution supply chain, and it is worth being explicit about
 the surface.** The agent self-update resolves from the configured index —

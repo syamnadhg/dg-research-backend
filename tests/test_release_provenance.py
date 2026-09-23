@@ -501,6 +501,62 @@ def test_a_staging_directory_stands_for_every_wheel_in_it(tmp_path):
     assert release.main([str(staging)]) == 1, "a directory must not stop at its first wheel"
 
 
+# ── the agent's own wheel in the same folder (2026-09-23) ───────────────────
+#
+# ⛔⛔ A rehearsal of THE DEPLOY staged the agent wheel beside the three machine
+# wheels and the check refused the whole release: "carries no provenance stamp".
+# The agent is a separate, pure-Python package built once for every platform, so
+# it is named and set aside, never compared and never counted.
+
+def _agent_wheel(folder: Path) -> Path:
+    """The agent wheel as its build names it: pure Python, and never stamped."""
+    return _wheel(folder / "superresearch_agent-0.1.33-py3-none-any.whl", None)
+
+
+def test_the_agent_wheel_beside_a_whole_release_is_named_and_skipped(tmp_path, capsys):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    _release(staging, _stamp(), _stamp(), _stamp())
+    agent = _agent_wheel(staging)
+    assert release.main([str(staging)]) == 0
+    out = capsys.readouterr().out
+    assert agent.name in out, "the skip is said out loud, not done silently"
+    assert "skipped - the agent is its own package" in out
+    assert "--post-publish" in out, "it names where the agent IS checked"
+    # ⛔ and it is not counted as one of the release's wheels
+    assert "every wheel (3)" in out
+
+
+def test_the_agent_wheel_is_not_a_release_on_its_own(tmp_path, capsys):
+    """Skipping it must not turn 'nothing to check' into a pass."""
+    assert release.main([str(_agent_wheel(tmp_path))]) == 1
+    out = capsys.readouterr().out
+    assert "checking nothing is not a pass" in out
+    assert "no machine wheels" in out
+
+
+def test_the_agent_wheel_does_not_stand_in_for_a_missing_platform(tmp_path, capsys):
+    """Its tag is `py3-none-any`, which is no platform: two machine wheels and the
+    agent are still a release with one platform missing."""
+    wheels = [_wheel(tmp_path / f"superresearch-{VERSION}-{plat}.whl", _stamp())
+              for plat in _PLATFORMS[:2]]
+    wheels.append(_agent_wheel(tmp_path))
+    assert release.main([str(w) for w in wheels]) == 1
+    assert "no Linux wheel" in capsys.readouterr().out
+
+
+def test_an_unstamped_MACHINE_wheel_is_not_mistaken_for_the_agent(tmp_path, capsys):
+    """⛔ The skip goes by the package NAME, never by the `py3-none-any` tag the
+    agent happens to carry: the machine build's source-mode fallback writes that
+    tag too, and an unstamped machine wheel must still be refused."""
+    wheels = _release(tmp_path, _stamp(), _stamp(), _stamp())
+    stray = _wheel(tmp_path / f"superresearch-{VERSION}-py3-none-any.whl", None)
+    assert release.main([str(w) for w in wheels] + [str(stray)]) == 1
+    out = capsys.readouterr().out
+    assert f"{stray.name} carries no provenance stamp" in out
+    assert "skipped" not in out
+
+
 def test_the_build_writes_the_name_the_check_reads(tmp_path):
     """The two scripts spell the stamp's name separately. Stamp a tree with the
     build's function, pack it, read it back with the check's."""
