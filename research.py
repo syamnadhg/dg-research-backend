@@ -2301,7 +2301,8 @@ def _log_date_marker(day: str, ts: str) -> "str | None":
 # exactly these lines.
 #
 # ⛔⛔ THE SCREEN COPY IS BOUNDED, AND THIS COMMENT USED TO PROMISE MORE (wave
-# 10.10). It said "never discarded" while line 501 onward of a long prompt was
+# 10.10). It said "never discarded" while every line after the 500th of a long
+# prompt was
 # neither shown nor kept: the session log is a copy of what reaches the screen,
 # so a line held back from the screen and then dropped reached no file at all.
 # Now the file gets every line as it arrives, the screen replays the NEWEST 500
@@ -34931,8 +34932,8 @@ async def scrape_progress_claude(page):
             // research-panel scope. The .font-claude-message + .contents
             // selectors used to be here (2026-04-30 removed) but they
             // grabbed conversation-thread chrome ("# You said:", "# Claude
-            // responded:") which got prepended with "Building: " at line
-            // 7102 and contaminated r.steps[] / r.progress, then leaked
+            // responded:") which got prepended with "Building: " further
+            // down this scraper and contaminated r.steps[] / r.progress, then leaked
             // into narrator inputs as parroted "Claude responded: I'll
             // start by..." narration. Belt-and-suspenders chrome filter
             // on the .filter() line defends against any future selector

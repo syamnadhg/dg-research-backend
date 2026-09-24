@@ -19,8 +19,8 @@ testing hardest. Every line still reaches the run file on its normal path and
 the session log the moment it arrives, and the screen replays the newest 500
 the instant the answer is read. A prompt that ate diagnostics would trade a
 cosmetic problem for a real one: the next support bundle is built from exactly
-these lines. (Until wave 10.10 this said "never discarded" while line 501 onward
-reached no file at all.)
+these lines. (Until wave 10.10 this said "never discarded" while every line after
+the 500th reached no file at all.)
 """
 import threading
 import time
@@ -90,7 +90,7 @@ def test_every_held_line_reaches_the_session_log_exactly_once(tmp_path, monkeypa
     """⛔⛔ THE GUARD THAT MATTERS MOST, AND IT USED TO PASS EITHER WAY. It
     logged one line and looked for it in the run file — true before and after
     the defect it was named for. What was really lost: while a question was
-    open, line 501 onward was neither shown NOR written anywhere, because the
+    open, every line after the 500th was neither shown NOR written anywhere, because the
     session log is a copy of the screen and those lines never reached the
     screen. Every held line must now be in the session file exactly once — not
     missing, and not written again when the screen replays it — and in the run
