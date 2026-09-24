@@ -58,13 +58,14 @@ MARKER_RE = re.compile(r"\[\\\[(\d{1,3})\\\]\]\(([^)]*)\)")
 #: conftest's one finder answers with.
 WEB_LIB = Path("src") / "lib"
 
-#: The web's own heading index, ported from `indexSlices` in
-#: `superresearch-doc.ts:228`. Every match becomes a slice the planner may hand
+#: The web's own heading index, ported from `indexSlices`'s `HEADING_LINE_RE`
+#: in `superresearch-doc.ts`. Every match becomes a slice the planner may hand
 #: a section writer as "Your material".
 WEB_HEADING_LINE_RE = re.compile(r"^(#{1,4})\s+(.+?)\s*$", re.M)
 
 #: The web's DOCUMENT VIEWER and public share, ported from
-#: `markdown-components.tsx:140,151`. The last heading a document has is folded
+#: `HEADING_RE` and `SOURCES_HEADING_RE` in `markdown-components.tsx`. The last
+#: heading a document has is folded
 #: into a `Sources · n` disclosure when both of these accept it.
 WEB_VIEWER_HEADING_RE = re.compile(r"^ {0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
 WEB_VIEWER_SOURCES_RE = re.compile(r"^sources\b", re.I)
@@ -375,8 +376,8 @@ class TestOneSourcesHeadingPerDocument:
 
 class TestOurHeadingIsNotAResearchSlice:
     def test_numbering_adds_no_heading_the_web_planner_would_index(self):
-        """⛔⛔ `superresearch-doc.ts:242` indexes each agent report by its own
-        ATX headings and `superresearch-doc.ts:483` feeds that list to the plan
+        """⛔⛔ `indexSlices` (superresearch-doc.ts) indexes each agent report by its own
+        ATX headings and `planPromptInput` feeds that list to the plan
         call, so our `## Sources` became a slice a section writer could be handed
         as "Your material" — up to three per run, each one a list of links. The
         web is shipped and read-only to this repo."""

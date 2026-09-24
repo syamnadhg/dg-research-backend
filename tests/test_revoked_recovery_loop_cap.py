@@ -5,7 +5,7 @@ After Reset Pair Code triggers the BE's refresh-token revoke, the loop
 polls the pending subdoc for a fresh customToken (15-min window from the
 FE side). Before this fix the PollTimeout branch slept 5min and re-looped
 forever — fine while the device doc existed, but after the device doc's
-Firestore TTL fires (15min mark, reset-pair-code/route.ts:269) the
+Firestore TTL fires (15min mark, the `expireAt` the web reset-pair-code route writes) the
 pending subdoc path becomes unreachable. The loop just span CPU + log
 volume forever. The cap exits cleanly so the supervisor sees a clean
 exit code (and stops respawning into the same dead loop).
@@ -172,7 +172,7 @@ class TestRevokedRecoveryLoopCap:
             poll_timeout_after_calls=1,  # 1st PollTimeout, 2nd succeeds
         )
         # Need `_pair_patch_device` to be stubbed too (success branch
-        # calls it before os._exit at research.py:2128-2143).
+        # calls it before its os._exit).
         monkeypatch.setattr(research, "_pair_patch_device", lambda *_a, **_kw: True)
         with pytest.raises(_RaisedExitCode) as excinfo:
             _run(research._revoked_recovery_loop())
@@ -188,7 +188,7 @@ class TestRevokedRecoveryLoopCap:
         # _firebase_db not None on first check → loop sleeps and loops.
         # We monkeypatch asyncio.sleep to raise CancelledError after the
         # first sleep so the loop exits via the except CancelledError
-        # branch (research.py:2168 returns cleanly).
+        # branch (which returns cleanly).
         monkeypatch.setattr(research, "_firebase_db", object())  # truthy
         monkeypatch.setattr(research, "load_poll_secret", lambda: "ps")
         monkeypatch.setattr(research, "load_device_id", lambda: "did")
@@ -198,5 +198,5 @@ class TestRevokedRecoveryLoopCap:
 
         monkeypatch.setattr(asyncio, "sleep", cancel_sleep)
         # No exception expected — the loop exits via the
-        # `except asyncio.CancelledError: return` branch at line 2168.
+        # `except asyncio.CancelledError: return` branch.
         _run(research._revoked_recovery_loop())

@@ -82,7 +82,7 @@ def test_node_is_installed_so_the_page_js_suites_are_not_silently_skipped() -> N
     """The one assertion in this repo that can fail because node is missing.
 
     ⛔ `_domshim.NODE` is the shared resolver every one of those `skipif` marks
-    reads (`shutil.which("node")`, `_domshim.py:34`). Nothing else can make this
+    reads (`shutil.which("node")` in `tests/_domshim.py`). Nothing else can make this
     pass: there is no fixture, flag or stub that produces a path here. Either node
     is on PATH or it is not.
     """

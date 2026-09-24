@@ -16,8 +16,8 @@ Bug context (2026-05-22 5-run repro):
 
 The helper scans `devices/{id}/queue/` candidates, sorts by FIFO key
 (timestamp ASC, doc-id tiebreaker), filters out claimed-by-sibling /
-processed / non-start docs (matching the existing pre-claim filter at
-research.py:4226), and returns the doc's 1-indexed position + the
+processed / non-start docs (matching the pre-claim FIFO filter in the start
+listener's `on_snapshot`), and returns the doc's 1-indexed position + the
 immediately-prior doc's research-id/topic for the "behind X" label.
 
 Run via:
@@ -220,7 +220,7 @@ def test_sort_by_timestamp_ascending():
 def test_missing_timestamp_legacy_docs_sort_last():
     """Legacy docs missing `timestamp` get tiebreaker key (1, 0, id) —
     sorted after all well-formed docs. Mirrors the pre-claim FIFO
-    sort behavior at research.py:4226."""
+    sort in the start listener's `on_snapshot`."""
     snaps = [
         _q_doc("qd-modern", timestamp_ms=2_000, topic="Modern", research_id="rid-m"),
         _FakeSnap("qd-legacy", {"topic": "Legacy", "researchId": "rid-l",
@@ -289,7 +289,7 @@ def test_the_topic_of_the_run_ahead_is_never_returned():
 def test_submitted_at_overrides_client_timestamp():
     """When both submittedAt + timestamp are set, submittedAt wins. The
     FE writes both via buildQueuePayload (legacy `timestamp` is kept for
-    BE stale-queue defense at research.py:~2658); ordering MUST use the
+    BE stale-queue defense in `start_firestore_start_listener`); ordering MUST use the
     server-side value for clock-skew immunity."""
     snaps = [
         # Client says A is older (1_000ms) but server says it landed

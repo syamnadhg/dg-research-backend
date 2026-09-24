@@ -262,7 +262,8 @@ def test_seam_agent_carrying_resume_scoped(monkeypatch):
 
 def test_seam_whole_run_resume_clears_all(monkeypatch):
     # pause→resume→no-fire: the whole-run pause emits an AGENT-LESS
-    # pipeline_resumed (research.py ~24122); its rebuilt `pending` carries no
+    # pipeline_resumed (from `poll_all_agents_round_robin`'s pause branch); its
+    # rebuilt `pending` carries no
     # stuck bookkeeping, so the module-global registry MUST be cleared or a
     # stale deadline fires on the first post-resume tick.
     _seam_stub(monkeypatch)

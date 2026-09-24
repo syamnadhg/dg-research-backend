@@ -53,7 +53,7 @@ def _last(events, name):
 
 def test_skip_login_is_destination_aware_and_names_the_platform():
     # phase >= 1, single platform → "Skip <Label>" / skip_agent (work-tab pause);
-    # matches FE loginDecisionAlert pipeline-decision.ts:96-103.
+    # matches FE `loginDecisionAlert` in pipeline-decision.ts.
     acts = research._alert_actions_for("login_required", 1, "chatgpt")
     assert acts == [
         {"id": "retry", "label": "Retry", "style": "primary",
@@ -81,7 +81,7 @@ def test_skip_login_at_phase0_is_skip_init_verify():
 
 def test_hv_solvable_is_resume_plus_named_skip():
     # non-Cloudflare HV → Resume + Skip (byte-exact to FE humanVerifyAlert
-    # non-Cloudflare branch, pipeline-decision.ts:159-171). command+style match;
+    # non-Cloudflare branch in pipeline-decision.ts). command+style match;
     # id/label of the Skip intentionally reuse the generic skip_agent token
     # (the §8.10 waiver — FE-inert since the FE builds its own HV buttons).
     acts = research._alert_actions_for("hv_solvable", 2, "claude")
@@ -105,7 +105,7 @@ def test_hv_wall_is_skip_only_primary():
 
 def test_agent_link_tokens_are_agent_decision_commands():
     # agent_link_failed → agent_decision(retry|skip), byte-exact to FE
-    # agentLinkFailedAlert (pipeline-decision.ts:182-185).
+    # `agentLinkFailedAlert` in pipeline-decision.ts.
     acts = research._alert_actions_for("agent_link_failed", 2, "claude")
     assert acts == [
         {"id": "retry", "label": "Retry", "style": "primary",

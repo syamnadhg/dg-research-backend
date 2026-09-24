@@ -12,7 +12,8 @@ That is why the first test here is the un-minted token and not the 401.
 
 ⛔ CONFIRMATION IS TWO ANSWERS, AND ONE OF THEM IS A 404. HTTP 200 confirms, and
 so does HTTP 404 whose BODY says `device_not_found` — the route's own
-already-gone answer (dg-research/src/app/api/devices/unpair-self/route.ts:149),
+already-gone answer (its `device_not_found` 404 in
+dg-research/src/app/api/devices/unpair-self/route.ts),
 where there is nothing left to strand. A 404 from a proxy or an edge, which is
 what a wrong FE_BASE_URL produces, carries no such body and must NOT confirm.
 The discrimination is on the body, never on the bare status.
@@ -349,7 +350,7 @@ def test_a_recoverable_keystore_still_gets_the_plain_nothing_changed(wired):
 # ── (f) the cases where "run it again" is wrong advice ───────────────────────
 
 def test_a_500_does_NOT_tell_the_user_to_run_it_again(wired):
-    """⛔ route.ts:199-201 in its own words: 'It is NOT retryable from the
+    """⛔ The unpair-self route in its own words: 'It is NOT retryable from the
     machine: the revoke above has already run.' Telling them to retry loops
     them through a command that can no longer authenticate."""
     wired["resp"] = _Resp(500, {"error": "auth_delete_failed"})

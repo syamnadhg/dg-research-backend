@@ -4,10 +4,10 @@ Covers the F6 regression in PR #2 where Phase 2B's claude_chat_mode
 pause's `r` (resume) and `s` (skip) keypresses released `wait_if_paused`
 but the downstream `await_agent_decision` coroutine hung indefinitely.
 The dispatcher only called `request_resume` / `request_skip_phase`, but
-await_agent_decision (research.py:4274) polls for `consume_continue_anyway`
+`PipelineControls.await_agent_decision` polls for `consume_continue_anyway`
 / `consume_retry_agent` / `skipped_agents`, NOT phase-level flags.
 
-Fix (research.py:3781-3815 dispatcher): `r` at claude_chat_mode now calls
+Fix (the CLI dispatcher, `_start_cli_command_reader`): `r` at claude_chat_mode now calls
 `set_continue_anyway()`; `s` at claude_chat_mode now calls
 `request_skip_agent("claude")`. Both before `request_resume()`.
 
@@ -52,8 +52,8 @@ class TestPipelineControlsContract:
 
     def test_consume_continue_anyway_is_one_shot(self):
         """First consume returns True; second returns False. Prevents
-        leak into later phases that also consume continue_anyway (Phase 1
-        Pro backstop at line ~14220, etc.)."""
+        leak into later phases that also consume continue_anyway (the Phase 1
+        Pro backstop, etc.)."""
         from research import PipelineControls
         c = PipelineControls()
         c.set_continue_anyway()
@@ -75,8 +75,8 @@ class TestPipelineControlsContract:
         assert "claude" in c.skipped_agents
 
     def test_set_continue_anyway_also_releases_pause(self):
-        """set_continue_anyway clears pause_event so wait_if_paused (line
-        18702) returns immediately. Without this, the chat-mode coroutine
+        """set_continue_anyway clears pause_event so
+        `PipelineControls.wait_if_paused` returns immediately. Without this, the chat-mode coroutine
         would still wait for resume_event to fire separately."""
         from research import PipelineControls
         c = PipelineControls()
@@ -175,7 +175,7 @@ class TestAwaitAgentDecisionIntegration:
 # ─────────────────────────────────────────────────────────────────────
 
 class TestBug1AgentLinkFailedFix:
-    """Bug 1: wait_for_agent_decision (research.py:6381) used to return
+    """Bug 1: `wait_for_agent_decision` used to return
     "skip" silently for CLI `r` because pop_agent_decision returned None
     (dispatcher never called set_agent_decision). Fix: pause reason
     "agent_link_failed" + dispatcher r → set_agent_decision("retry"),
@@ -196,7 +196,8 @@ class TestBug1AgentLinkFailedFix:
         assert c.pop_agent_decision() is None
 
     def test_set_agent_decision_rejects_invalid_values(self):
-        """Whitelist guard at research.py:3978 — only retry/skip/stop accepted."""
+        """Whitelist guard in `PipelineControls.set_agent_decision` — only
+        retry/skip/stop accepted."""
         from research import PipelineControls
         c = PipelineControls()
         c.set_agent_decision("garbage")
@@ -294,7 +295,7 @@ class TestBug1WaitForAgentDecisionIntegration:
 # ─────────────────────────────────────────────────────────────────────
 
 class TestBug2HumanVerificationFix:
-    """Bug 2: Human verification pause's poll loop (research.py:18372)
+    """Bug 2: Human verification pause's poll loop (`wait_for_verification_clearance`)
     checks `skipped_agents`. CLI `s` used to set `skipped_phases` —
     wrong set, silently no-op. Fix: pause_target_agent field carries
     the platform name so dispatcher's `s` can call request_skip_agent
@@ -340,10 +341,10 @@ class TestBug2HumanVerificationFix:
 # ─────────────────────────────────────────────────────────────────────
 
 class TestBug3CuaUnavailableFix:
-    """Bug 3: cua_unavailable block (research.py:21796) used to always
+    """Bug 3: cua_unavailable block (Phase 0 of `run_pipeline`) used to always
     retry — no skip path at all, even though CLI `s` at Phase 0 sets
     skip_init_verify. Fix: add `if skip_init_verify: break` after the
-    is_stop check, matching the login_required pattern at line ~21700."""
+    is_stop check, matching the login_required pattern beside it."""
 
     def test_request_skip_init_verify_sets_flag(self):
         from research import PipelineControls
@@ -352,7 +353,7 @@ class TestBug3CuaUnavailableFix:
         assert c.skip_init_verify is True
 
     def test_request_skip_init_verify_releases_pause(self):
-        """request_skip_init_verify at research.py:4104 also clears
+        """`PipelineControls.request_skip_init_verify` also clears
         pause_event + sets resume_event so wait_if_paused returns."""
         from research import PipelineControls
         c = PipelineControls()

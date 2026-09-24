@@ -354,7 +354,7 @@ def test_running_write_refused_over_terminal_status(monkeypatch):
     # "complete" OR "skipped" in the shared _agent_status_by_rid map (the guard
     # returns before recording), while a legitimate "errored"->"running"
     # badge-clear still lands. Stub the Firebase globals so the function gets
-    # past its no-Firestore early-return (8315), and neuter the async write.
+    # past its no-Firestore early-return, and neuter the async write.
     monkeypatch.setattr(research, "_firebase_db", object(), raising=False)
     monkeypatch.setattr(research, "_fb_uid", "uid-test", raising=False)
     monkeypatch.setattr(research, "_fb_research_id", "rid-test", raising=False)

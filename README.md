@@ -1112,7 +1112,7 @@ Every failure category — timeouts, CUA fallbacks, Anthropic 429/529 retries, s
 
 ### Alert intent catalog + non-blocking decisions (#955)
 
-Alerts are authored through one seam — `emit_decision` (research.py ~14421) over an `ALERT_INTENTS` catalog (~14173) — so every actionable card carries a **recoverability class**, a `decision_id`, and (when auto-skippable) a deadline:
+Alerts are authored through one seam — `emit_decision` in research.py, over an `ALERT_INTENTS` catalog — so every actionable card carries a **recoverability class**, a `decision_id`, and (when auto-skippable) a deadline:
 
 - **recoverable** → `[Retry][Skip]`; **hands_off** → Skip-only (Cloudflare/HV — a Retry would only re-hit the wall); **blocker** → must-act (e.g. a dead Anthropic key), never silently swallowed into a retry banner and it bypasses the dismiss-then-resurface ledger (FE #65); **infra** → environment/CUA-unavailable.
 - **Non-blocking:** the P2 setup gates — HV (#1b), `pro_required` (#1a), `chat_mode` (#1c) — are send-before-decision and do **not** pause the round-robin; every alert **auto-resumes** on resolve, and the pause is released on every HV/skip/timeout path.

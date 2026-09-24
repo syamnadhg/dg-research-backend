@@ -3,7 +3,7 @@ that prevents back-to-back dual-claim during Firestore on_snapshot replay.
 
 Bug context (2026-05-22 St Bernard repro): on worker boot, Firestore
 replays every unprocessed queue doc as ADDED in a single callback
-batch. The busy-gate at research.py:~4106 read `job_queue.qsize()` to
+batch. The busy-gate in the start listener's `on_snapshot` read `job_queue.qsize()` to
 decide whether to claim, but the enqueue runs via
 `loop.call_soon_threadsafe(...)` — asynchronous, hasn't landed on the
 event loop yet by the time the listener iterates to the next change.

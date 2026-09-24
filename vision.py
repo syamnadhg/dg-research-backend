@@ -317,7 +317,8 @@ class VisionClient:
         if not key:
             # Routes through the canonical precedence chain (Firestore →
             # user-scope env → os.environ). Eliminates the two-ladder split
-            # with research.py:25404 (which now also uses resolve_api_key).
+            # with the pairing flow's CUA client in research.py
+            # (`_continue_pair_stages_2_to_6`, which now also uses resolve_api_key).
             #
             # ⭐ Resolved via `models.core_attr`, NOT `from research import …`.
             # In the compiled wheel research.py is a launcher shim exporting

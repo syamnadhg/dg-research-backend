@@ -11,7 +11,7 @@ Even sharers right? Please fix that too."
 
 The wrapper reads `devices/{deviceId}.sharedWith[]` and iterates the
 per-user sweep over [owner, *sharers]. Firestore rules
-(firestore.rules:45-49 `deviceMemberOf`) allow the synth-device-user
+(the `deviceMemberOf` function in firestore.rules) allow the synth-device-user
 to read/write any user-tree where `deviceOwnership` is satisfied
 (device's ownerUid OR sharedWith[] includes the userId).
 

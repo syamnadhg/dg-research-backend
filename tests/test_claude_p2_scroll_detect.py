@@ -6,7 +6,8 @@ reading as still-running. `detect_completion_claude` scrapes document.body.inner
 but Claude renders the finished report + its "Research complete · N sources · Xm Ys"
 done-marker inside a VIRTUALIZED artifact panel — the marker isn't in innerText
 until the panel is scrolled. The poll loop scrolled to the bottom only before the
-5-min CUA check (research.py ~:24444), not before the per-cycle DOM detect, so the
+5-min CUA check (in `poll_all_agents_round_robin`), not before the per-cycle DOM
+detect, so the
 DOM detector never fired and completion was caught only by the slow CUA path
 (logs: flat "5 URLs, 15 steps" for ~50m, zero "Done-marker confirmed" lines,
 completion via "CUA confirms complete ✓").

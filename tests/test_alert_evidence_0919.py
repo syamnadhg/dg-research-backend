@@ -194,7 +194,7 @@ def test_the_card_body_names_what_was_seen(monkeypatch):
 def test_the_facts_dict_is_the_shared_one(monkeypatch):
     """⛔⛔ THE OWNER'S ASK, PINNED: "all facts must be consistent for CUA and
     vision both". `facts` is the one dict an alert is built from, and its
-    evidence slot — the key `_draft_alert_copy` reads at its line 24477 — was
+    evidence slot — the key `_draft_alert_copy` reads — was
     dead: no caller in the repo had ever written it, so the drafter fell back
     to `details`, the same constant sentence the template already showed.
 
