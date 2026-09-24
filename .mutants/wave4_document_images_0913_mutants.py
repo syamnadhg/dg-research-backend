@@ -687,8 +687,10 @@ MUTANTS = [
      '⛔ ANY IMAGE SOURCE IN THE DOCUMENT COUNTS, not the one inside the link: `per [Reuters](url)` loses its link because a captioned image elsewhere used that address',
      [('        sources = {slots[int(i)][1] for i in slot_re.findall(inner)}',
        '        sources = {src for _out, src in slots}')]),
+    # ⭐ Since wave 10.9 the scrub also drops an lh3 link, so P6 is killed on a public
+    # image host, where nothing but this rule can take the link out.
     ('P6', RP, 'over',
-     '⛔ A LINK AROUND A REMOVED IMAGE STAYS: `[](https://lh3…)` and `[ View full size](https://lh3…)` — a removed image leaves no text, and its link keeps the platform URL',
+     '⛔ A LINK AROUND A REMOVED IMAGE STAYS: `[](S)` and `[ View full size](S)` — a removed image leaves no text, and its link keeps the image\'s own source',
      [('        sources = {slots[int(i)][1] for i in slot_re.findall(inner)}',
        '        sources = {slots[int(i)][1] for i in slot_re.findall(inner) if slots[int(i)][0]}')]),
     ('P8', RP, 'over',
@@ -941,8 +943,11 @@ MUTANTS = [
        '    return isinstance(exc, (requests.ConnectionError, requests.Timeout,')]),
 
     # ── repair round 3: a link around an image to a platform host ────────────
+    # ⭐ Since wave 10.9 the scrub also drops an lh3 or oaiusercontent link, so LK1 is
+    # killed on the platform hosts the scrub keeps (gstatic, a chatgpt.com address
+    # outside a conversation), where nothing but this rule can take the link out.
     ('LK1', RP, 'over',
-     '⛔⛔ A CLICK-TO-ENLARGE LINK TO ANOTHER SIZE ON THE PLATFORM HOST STAYS: `[![Chart](ref)](https://lh3…=s0)` keeps a signed platform URL in the document and every share',
+     '⛔⛔ A CLICK-TO-ENLARGE LINK TO ANOTHER ADDRESS ON A PLATFORM HOST STAYS: `[![Chart](ref)](https://encrypted-tbn0.gstatic.com/…)` keeps a platform URL in the document and every share',
      [('        if sources and _doc_img_is_platform_host(href_host):\n            return inner\n',
        '')]),
 

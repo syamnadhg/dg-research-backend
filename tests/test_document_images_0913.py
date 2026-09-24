@@ -1983,6 +1983,23 @@ def test_a_self_link_around_a_removed_image_with_words_goes_and_the_words_stay(w
     assert out == " View full size" and "googleusercontent" not in out
 
 
+_PUBLIC_CHART = "https://cdn.example.com/chart.png"
+
+
+@pytest.mark.parametrize("words", ["", " View full size"], ids=["no-words", "with-words"])
+def test_a_self_link_around_a_removed_image_goes_on_a_host_no_other_rule_scrubs(world, words):
+    """⛔ The two cases above link to googleusercontent, and since wave 10.9
+    `_doc_scrub_private_links` drops every link to that host by itself — so they
+    pass whether or not this rule finds a REMOVED image inside the link. On a public
+    host only this rule can: the link is the image's own source, and the removed
+    image left no text behind, only its slot."""
+    assert not R._doc_link_is_private(_PUBLIC_CHART)
+    md = R.html_to_markdown(f'<p>a <a href="{_PUBLIC_CHART}"><img src="{_PUBLIC_CHART}">{words}</a> b</p>')
+    assert md == f"a [![](<{_PUBLIC_CHART}>){words}]({_PUBLIC_CHART}) b"
+    world.images[_PUBLIC_CHART] = R._DocImageRefused("failed")
+    assert rehost(md) == f"a {words} b"
+
+
 def test_a_link_to_a_different_page_around_a_removed_image_with_words_stays(world):
     page = "https://news.example.com/a"
     md = R.html_to_markdown(f'<p>see <a href="{page}"><img src="{SIGNED}"> Caption</a> end</p>')
@@ -2866,6 +2883,25 @@ def test_a_link_around_an_image_to_a_platform_product_host_goes(world):
     md = R.html_to_markdown(f'<p><a href="{href}"><img src="{src}" alt="Chart"> Open</a></p>')
     world.images[src] = png()
     assert rehost(md) == f"![Chart]({ref_for(png())}) Open"
+
+
+@pytest.mark.parametrize("href", [
+    "https://encrypted-tbn0.gstatic.com/images?q=tbn:full-size",
+    "https://chatgpt.com/share/abc-123",
+], ids=["gstatic", "chatgpt-not-a-conversation"])
+@pytest.mark.parametrize("kept", [True, False], ids=["stored", "captioned"])
+def test_a_link_around_an_image_to_a_platform_host_no_other_rule_scrubs_goes(world, href, kept):
+    """⛔ The two tests above link to googleusercontent and oaiusercontent, and since
+    wave 10.9 `_doc_scrub_private_links` drops those by itself — so they pass
+    whether or not this rule looks at the host. These two are the platforms' own
+    hosts that the scrub keeps (a gstatic address; a chatgpt.com address outside a
+    conversation path): around an image, only this rule takes them out."""
+    assert R._doc_img_is_platform_host(href.split("/")[2]) and not R._doc_link_is_private(href)
+    src = "https://cdn.example.com/chart.png"
+    md = R.html_to_markdown(f'<p>See <a href="{href}"><img src="{src}" alt="Chart"></a> end</p>')
+    assert md == f"See [![Chart](<{src}>)]({href}) end"
+    world.images[src] = png() if kept else R._DocImageRefused("failed")
+    assert rehost(md) == (f"See ![Chart]({ref_for(png())}) end" if kept else "See ![Chart]() end")
 
 
 # ═══ 24. repair round 3 — one image connection is bounded by the image's clock ═
