@@ -87,6 +87,12 @@ SURVIVOR_CONFIRMATIONS = 3
 
 # (id, file, direction, why, [(from, to), ...])
 MUTANTS = [
+    # ⛔⛔ RE-ANCHORED 2026-09-24 — the agent's 2026-09-20..23 fixes moved the text
+    # under these, and `test_no_new_stale_anchors` caught it before a push:
+    #   D4, D7 — the rendered lines are built first (`said`) and may carry the
+    #   empty-state relay
+    # Each keeps its ORIGINAL defect on the new text, and each was re-run and
+    # KILLED against this harness's own selection before this note was written.
     # ══ A — one sign-in, one identity ═══════════════════════════════════════
     ("A1", BRIDGE, "under",
      "⛔⛔ THE SECOND CLOCK COMES BACK. The note mints its own `time.time()` a few ms "
@@ -222,7 +228,7 @@ MUTANTS = [
     ("D4", SR, "under",
      "the note is claimed and then not rendered — the debt is taken and not paid, which "
      "is the silent eater this whole line of work exists to end, one function further in",
-     [('            return _emit({**body, "signedIn": note}, args.json, _signed_in_lines(note))',
+     [('            return _emit({**body, "signedIn": note}, args.json, said)',
        '            return _emit({**body, "signedIn": note}, args.json, [])')]),
 
     ("D6", SR, "under",
@@ -239,8 +245,8 @@ MUTANTS = [
     ("D7", SR, "under",
      "the `--json` payload goes back to the poll body alone, so a caller reading JSON "
      "gets `state: connected` and none of the news this command just consumed",
-     [('            return _emit({**body, "signedIn": note}, args.json, _signed_in_lines(note))',
-       '            return _emit(body, args.json, _signed_in_lines(note))')]),
+     [('            return _emit({**body, "signedIn": note}, args.json, said)',
+       '            return _emit(body, args.json, said)')]),
 
     # ══ E — the two readers agree about a missing timestamp ═════════════════
     ("E1", POLL, "under",

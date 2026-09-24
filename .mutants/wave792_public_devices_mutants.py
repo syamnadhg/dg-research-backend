@@ -86,6 +86,13 @@ _INFLIGHT = Path(__file__).with_suffix(".inflight")
 
 # (id, file, direction, why, [(from, to), ...])
 MUTANTS = [
+    # ⛔⛔ RE-ANCHORED 2026-09-24 — the agent's 2026-09-20..23 fixes moved the text
+    # under these, and `test_no_new_stale_anchors` caught it before a push:
+    #   P11, P12, A2, Q3 — ids only on colliding rows, the owner's shorter
+    #   invite, `ask_body`, and a second `outgoing` reader (the approval
+    #   watcher) beside the list route
+    # Each keeps its ORIGINAL defect on the new text, and each was re-run and
+    # KILLED against this harness's own selection before this note was written.
     # ═══════════ G — the authenticated GET that did not exist ════════════════
     ("G1", BRIDGE, "under",
      "⛔⛔ THE GET STOPS SENDING THE SESSION, which is the whole of B1 — the two "
@@ -335,15 +342,18 @@ MUTANTS = [
      [('        print("No computers are being offered publicly right now.")\n        print(_PUBLIC_NONE_WHY_T)\n',
        '        print("No computers are being offered publicly right now.")\n')]),
     ("P11", SR, "under",
-     "⛔⛔ CHAT'S PUBLIC LIST DROPS THE ID, and chat is the surface where public "
-     "names collide worst — every unrenamed machine is the identical string",
-     [('    return f"  • {label}{dot}{full}  (id {d.get(\'deviceId\')})"',
+     "⛔⛔ CHAT'S PUBLIC LIST DROPS THE ID EVEN WHERE TWO ROWS COLLIDE — every "
+     "unrenamed machine is the identical string, and the id is shown exactly "
+     "there so the reader has something to hand back",
+     [('    return f"  • {label}{dot}{full}" + (f"  (id {d.get(\'deviceId\')})" if show_id else "")',
        '    return f"  • {label}{dot}{full}"')]),
     ("P12", SR, "under",
      "chat stops saying that asking names the person, so the disclosure exists on "
      "one client and not the other",
-     [('_PUBLIC_ASK_INVITE = ("Tell me which one to ask for — its name, or the id beside it "\n                      "if two read the same. Its owner decides, and they see your "\n                      "name — or your email, if you haven’t set one.")',
-       '_PUBLIC_ASK_INVITE = "Tell me which one to ask for and I’ll ask its owner."')]),
+     [('_PUBLIC_ASK_INVITE = ("Tell me which one to ask for. Once the request is accepted "\n'
+       '                      "you can use that computer. They see your name.")',
+       '_PUBLIC_ASK_INVITE = ("Tell me which one to ask for. Once the request is accepted "\n'
+       '                      "you can use that computer.")')]),
 
     # ═══════════ A — ask ═════════════════════════════════════════════════════
     ("A1", BRIDGE, "under",
@@ -353,21 +363,11 @@ MUTANTS = [
     ("A2", BRIDGE, "under",
      "⛔ AN EMPTY deviceId REACHES THE WEB APP, spending one of five asks an hour "
      "on a request that cannot succeed",
-     [('            device_id = (self._read_json().get("deviceId") or "").strip()\n'
+     [('            device_id = (ask_body.get("deviceId") or "").strip()\n'
        '            if not device_id:\n'
        '                self._json(400, {"error": "deviceId is required"})\n'
-       '                return\n'
-       '            acct = self._account()\n'
-       '            if acct is None:\n'
-       '                return\n'
-       '            sess, _fs = acct\n'
-       '            status, body = _fe_api_post(sess, "/api/devices/access-request",',
-       '            device_id = (self._read_json().get("deviceId") or "").strip()\n'
-       '            acct = self._account()\n'
-       '            if acct is None:\n'
-       '                return\n'
-       '            sess, _fs = acct\n'
-       '            status, body = _fe_api_post(sess, "/api/devices/access-request",')]),
+       '                return\n',
+       '            device_id = (ask_body.get("deviceId") or "").strip()\n')]),
     ("A3", BRIDGE, "under",
      "⛔ `retryAfterMs` IS DROPPED FROM THE RELAY, so the one refusal in the "
      "product where the server knows the wait arrives without it and both clients "
@@ -478,8 +478,10 @@ MUTANTS = [
     ("Q3", BRIDGE, "over",
      "the two halves are swapped, so a person is shown other people's requests "
      "for THEIR machine and told it is what they are waiting on",
-     [('            rows = body.get("outgoing")\n',
-       '            rows = body.get("incoming")\n')]),
+     [('            rows = body.get("outgoing")\n'
+       '            incoming = body.get("incoming")\n',
+       '            rows = body.get("incoming")\n'
+       '            incoming = body.get("incoming")\n')]),
     ("Q4", CLI, "over",
      "⛔⛔ THE SENTENCE MOVES INSIDE THE NON-EMPTY BRANCH. Empty is exactly when "
      "somebody decides for themselves that the silence means no",

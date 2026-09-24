@@ -136,7 +136,9 @@ BE_BULLET = (
 )
 
 BE_ROW = (
-    '| "send the agent\'s log too", "include the bridge log", "the log from this chat" | ⛔ **SAID INSIDE THE SEND-LOGS FLOW** — on its own, "include the bridge log" names no request to add it to, so `sr.py do` answers with the catch-all. add `--agent-log` to the **bare** command **and to `--confirm`** — or say `--runs 0`, which is the same thing and is the number the plan prints for it. It uploads nothing on either; it makes the plan name it, and makes the client hand you `sr.py send-logs --status <CODE> --agent-log` for once the bundle lands. **Not** owner-gated. See **Sending logs to support** |\n'
+    (
+    '| "send the agent\'s log too", "include the bridge log", "the log from this chat" | ⛔ **SAID INSIDE THE SEND-LOGS FLOW** — on its own, "include the bridge log" names no request to add it to, so `sr.py do` answers with the catch-all. add `--agent-log` to the **bare** command **and to `--confirm`** — or say `--runs 0`, which is the same thing and is the number the plan prints for it. On the bare command it only makes the plan name it. On `--confirm` the client sends it **immediately and on its own**, before it asks the research computer for anything, and hands back **a second support code** for it — quote both, and never re-send it with `--status <CODE> --agent-log`. **Not** owner-gated. See **Sending logs to support** |\n'
+)
 )
 
 FORK_OFFER_BLOCK = (
@@ -148,6 +150,13 @@ FORK_OFFER_BLOCK = (
 
 # (id, file, direction, why, [(from, to), ...])
 MUTANTS = [
+    # ⛔⛔ RE-ANCHORED 2026-09-24 — the agent's 2026-09-20..23 fixes moved the text
+    # under these, and `test_no_new_stale_anchors` caught it before a push:
+    #   BE_ROW, B1, B3, B7, B9-B12, C3, C7 — the agent's log now goes FIRST, on
+    #   its own, under a second code; the second step these guarded is gone, so
+    #   each now guards its successor
+    # Each keeps its ORIGINAL defect on the new text, and each was re-run and
+    # KILLED against this harness's own selection before this note was written.
     # ═══════════ F — the fork's document, the only route it has ═════════════
     ("F1", FORK_SKILL, "under",
      "⛔ THE WHOLE OFFER GOES — prose and command — and the flag is unreachable "
@@ -237,7 +246,41 @@ MUTANTS = [
      "⛔ THE BULLET GOES. The NL router still honours somebody who says the exact "
      "words, so the option survives for people who already know it — and is never "
      "OFFERED to anyone else",
-     [('- **The agent\'s own log on THIS host** is a third thing and a third computer —\n  the program running this chat, not their Research Computer. `--agent-log`\n  asks for it on the bare command, so the plan names it, and `--runs 0` is the\n  same request by the number the plan prints. Unlike `--machine`\n  there is **no ownership gate**, so no refusal will stop you: offer it only\n  when the problem is this chat reaching their computer at all. It covers the\n  rotated copies as well as the newest file, not just this conversation, so it\n  can reach back further than the problem being reported. ⛔ And say what it\n  holds before they agree: it covers **everyone who has signed in on that host**,\n  not only them, and it carries a masked form of their email address, their\n  account id and the ids of the computers and runs this agent has touched. The\n  client\'s plan prints all of that — relay it, do not summarise it away.\n  ⭐ **It CAN go on its own, and that is often the right offer.**\n  `--agent-log --none` — or `--runs 0` with nothing else — sends this file and\n  nothing else, with **a support code of its own**, and it needs\n  **no Research Computer at all**. Offer it to somebody who has no computer paired yet, or cannot reach the\n  one they have, because those are exactly the people who cannot build a bundle\n  for it to ride. It is still two steps: the bare command prints the plan, and\n  nothing leaves until you pass `--confirm`.\n  ⛔ Riding a bundle is the OTHER shape and still works the old way. When runs\n  ARE going, **it does not ride the send** — so **pass `--agent-log` on\n  `--confirm` too**: nothing is uploaded on that call either, and it is what\n  makes the client tell the user a step is still outstanding and hand you the\n  exact follow-up command. Leave it off and you get neither, and the second step\n  survives only in your memory. Run that follow-up when the user asks you to\n  check, never on a timer. Refused before then is by design, not a fault; a\n  failure there leaves the bundle and the support code untouched; "nothing to\n  add" means the log was empty.\n',
+     [("- **The agent's own log on THIS host** is a third thing and a third computer —\n"
+       '  the program running this chat, not their Research Computer. `--agent-log`\n'
+       '  asks for it on the bare command, so the plan names it, and `--runs 0` is the\n'
+       '  same request by the number the plan prints. Unlike `--machine`\n'
+       '  there is **no ownership gate**, so no refusal will stop you: offer it only\n'
+       '  when the problem is this chat reaching their computer at all. It covers the\n'
+       '  rotated copies as well as the newest file, not just this conversation, so it\n'
+       '  can reach back further than the problem being reported. ⛔ And say what it\n'
+       '  holds before they agree: it covers **everyone who has signed in on that host**,\n'
+       '  not only them, and it carries a masked form of their email address, their\n'
+       '  account id and the ids of the computers and runs this agent has touched. The\n'
+       "  client's plan prints all of that — relay it, do not summarise it away.\n"
+       '  ⭐ **It CAN go on its own, and that is often the right offer.**\n'
+       '  `--agent-log --none` — or `--runs 0` with nothing else — sends this file and\n'
+       '  nothing else, with **a support code of its own**, and it needs\n'
+       '  **no Research Computer at all**. Offer it to somebody who has no computer paired yet, or cannot reach the\n'
+       '  one they have, because those are exactly the people who cannot build a bundle\n'
+       '  for it to ride. It is still two steps: the bare command prints the plan, and\n'
+       '  nothing leaves until you pass `--confirm`.\n'
+       '  ⭐ **When runs are going too, it STILL goes on its own — and it goes FIRST.**\n'
+       "  **Pass `--agent-log` on `--confirm` as well**: the client uploads this host's\n"
+       '  log standalone, under **its own second support code**, *before* it asks the\n'
+       '  research computer for anything. So it survives a computer that never answers,\n'
+       '  a Firestore that is down, and a selection that went stale — every state in\n'
+       '  which it used to be lost. You get **two codes**: tell the user which is which\n'
+       "  (one is this host's log, sent; the other is that computer's bundle, requested)\n"
+       '  and quote both. Leave the flag off `--confirm` and the log does not go at all.\n'
+       '  ⛔ **Never re-send it.** `--status <CODE> --agent-log` attaches a log to a\n'
+       '  bundle and exists only for a request made WITHOUT `--agent-log` on the confirm.\n'
+       '  Running it after a two-code send uploads the same file twice and spends one of\n'
+       "  the account's ten uploads an hour on a duplicate. The client tells you outright\n"
+       '  when it has already gone — believe it.\n'
+       '  ⛔ Refused before the bundle lands is by design, not a fault; a failure there\n'
+       '  leaves the bundle and the support code untouched; "nothing to add" means the\n'
+       '  log was empty.\n',
        '')]),
     ("B2", BE_SKILL, "under",
      "⛔⛔ THE ROW GOES AND THE SECTION STAYS. The table is what a model actually "
@@ -245,9 +288,9 @@ MUTANTS = [
      "lookup is not an offer",
      [(BE_ROW, "")]),
     ("B3", BE_SKILL, "over",
-     "⛔⛔ THE ROW DROPS `--confirm` FROM THE FLOW and still promises the client "
-     "hands over the follow-up. Measured: a plain `--confirm` prints neither the "
-     "person's line nor the directive, so the row's own claim becomes false",
+     "⛔⛔ THE ROW DROPS `--confirm` FROM THE FLOW and still promises the second "
+     "code. Leave the flag off `--confirm` and the log does not go at all, so "
+     "the row's own promise becomes false",
      # ⛔⛔ RE-ANCHORED 2026-09-06 (wave 7.9-1) AND GOT IT WRONG THE FIRST TIME.
      # The row gained a clause naming `--runs 0`, so the old anchor no longer
      # matched; the replacement I wrote for it left "**and to `--confirm`**"
@@ -255,12 +298,8 @@ MUTANTS = [
      # substring is in the row. It survived — a mutant that no longer touches its
      # own subject, which reads as a hole in the tests and is a hole in the
      # harness. The mutation removes `--confirm` from the row again.
-     [("add `--agent-log` to the **bare** command **and to `--confirm`** — or say "
-       "`--runs 0`, which is the same thing and is the number the plan prints for "
-       "it. It uploads nothing on either; it makes the plan name it, and makes the "
-       "client hand you",
-       "add `--agent-log` to the **bare** command — or say `--runs 0` — so the plan "
-       "names it. The client hands you")]),
+     [('add `--agent-log` to the **bare** command **and to `--confirm`** — or say `--runs 0`, which is the same thing and is the number the plan prints for it. On the bare command it only makes the plan name it. On `--confirm` the client sends it',
+       'add `--agent-log` to the **bare** command — or say `--runs 0` — so the plan names it. The client sends it')]),
     ("B4", BE_SKILL, "under",
      "the absence of an ownership gate stops being stated, one bullet below the "
      "owner-only rule it must not be confused with",
@@ -279,16 +318,16 @@ MUTANTS = [
      [("  the program running this chat, not their Research Computer. `--agent-log`\n",
        "  `--agent-log`\n")]),
     ("B7", BE_SKILL, "under",
-     "the separate step stops being named, so the assistant adds the flag to the "
-     "send and stops there",
-     [('**it does not ride the send** — so **pass `--agent-log` on\n',
-       '')]),
+     "the instruction to pass the flag on `--confirm` goes, so the assistant "
+     "confirms without it — and without it the log does not go at all",
+     [("  **Pass `--agent-log` on `--confirm` as well**: the client uploads this host's\n",
+       "  The client uploads this host's\n")]),
     ("B12", BE_SKILL, "under",
-     "⛔⛔ THE INSTRUCTION THAT MAKES THE CLIENT SPEAK GOES. Without the flag on "
-     "`--confirm` this client prints neither the outstanding-step line nor the "
-     "follow-up command — measured by driving it both ways",
-     [('  `--confirm` too**: nothing is uploaded on that call either, and it is what\n  makes the client tell the user a step is still outstanding and hand you the\n  exact follow-up command. Leave it off and you get neither, and the second step\n  survives only in your memory. Run that follow-up when the user asks you to\n  check, never on a timer. ',
-       '  the client hands you the exact follow-up command; run it when the user asks\n  you to check, never on a timer. ')]),
+     "⛔⛔ WHAT LEAVING THE FLAG OFF COSTS STOPS BEING SAID. Off `--confirm`, the "
+     "log does not go at all, and nothing in the bullet then tells the assistant "
+     "that dropping it drops the log",
+     [('  and quote both. Leave the flag off `--confirm` and the log does not go at all.\n',
+       '  and quote both.\n')]),
     ("B8", BE_SKILL, "under",
      "the rotation clause goes, so the log reads as this conversation's when it "
      "covers everything since the file last rotated",
@@ -297,15 +336,19 @@ MUTANTS = [
     ("B9", BE_SKILL, "under",
      "the deliberate refusal stops being called deliberate, so the ordering that "
      "keeps a log deletable reads as a bug",
-     [("Refused before then is by design, not a fault; ", "")]),
+     [('Refused before the bundle lands is by design, not a fault; ',
+       '')]),
     ("B10", BE_SKILL, "under",
      "a failure on the second step stops being scoped and reads as the whole send "
      "failing",
-     [("failure there leaves the bundle and the support code untouched; ", "")]),
+     [('failure there\n'
+       '  leaves the bundle and the support code untouched; ',
+       '')]),
     ("B11", BE_SKILL, "over",
      "an empty log is reported as a successful send rather than as nothing to send",
-     [("\"nothing to\n  add\" means the log was empty.",
-       "\"nothing to\n  add\" means it went.")]),
+     [('"nothing to add" means the\n'
+       '  log was empty.',
+       '"nothing to add" means it went.')]),
 
     # ═══ C — the CLIENTS move, and the documents must notice ════════════════
     #
@@ -328,11 +371,14 @@ MUTANTS = [
        '    if agent_log:\n'
        '        _post("/logs/agent-log", {"code": ""})')]),
     ("C3", BE_SR, "under",
-     "⛔⛔ the client stops printing the follow-up the table promises, so the "
-     "document sends the assistant looking for a directive that never arrives",
+     "⛔⛔ the client stops telling the assistant the log has ALREADY gone, so the "
+     "table's 'never re-send it' has nothing behind it at the one moment it "
+     "matters, and the same file goes up twice",
      [('        directives.append(\n'
-       '            f"Once the bundle shows done, run: sr send-logs --status {support} "\n'
-       '            "--agent-log   (it is refused until then, by design)")',
+       '            f"⛔ The agent’s log is ALREADY SENT, as {agent_log_code}. Do NOT run "\n'
+       '            f"`--status {support} --agent-log` — that would upload the same file "\n'
+       '            "a second time under the other code, and spend one of the account’s "\n'
+       '            "ten uploads an hour on a duplicate.")',
        '        pass')]),
     ("C4", FORK_SR, "over",
      "an ownership gate appears on the fork's agent log, so the document now "
@@ -350,12 +396,13 @@ MUTANTS = [
        '    if agent_log:\n'
        '        _say("The log from the program running this chat follows.")')]),
     ("C7", BE_SR, "under",
-     "⛔ the backend client stops reading the flag after the send, so the "
-     "document's instruction to pass it on `--confirm` becomes cargo cult",
-     [('    if agent_log:\n'
-       '        # ⛔⛔ THE AGENT\'S LOG CANNOT GO YET,',
+     "⛔ the backend client stops reading the flag on `--confirm`, so the "
+     "document's instruction to pass it there becomes cargo cult and the log "
+     "never goes",
+     [('    if getattr(args, "confirm", False) and _wants_agent_log(args):\n'
+       '        agent_log_code, agent_log_lines = _send_agent_log_now(args)',
        '    if False:\n'
-       '        # ⛔⛔ THE AGENT\'S LOG CANNOT GO YET,')]),
+       '        agent_log_code, agent_log_lines = _send_agent_log_now(args)')]),
 ]
 
 

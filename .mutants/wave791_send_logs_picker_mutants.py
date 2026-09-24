@@ -92,6 +92,12 @@ _INFLIGHT = Path(__file__).with_suffix(".inflight")
 
 # (id, file, direction, why, [(from, to), ...])
 MUTANTS = [
+    # ⛔⛔ RE-ANCHORED 2026-09-24 — the agent's 2026-09-20..23 fixes moved the text
+    # under these, and `test_no_new_stale_anchors` caught it before a push:
+    #   P10, P11, C2, C5, C8, X20 — row 0 is `Run 0` and prints FIRST, refusals
+    #   go through `_say`
+    # Each keeps its ORIGINAL defect on the new text, and each was re-run and
+    # KILLED against this harness's own selection before this note was written.
     # ═══════════ P — the terminal's picker ══════════════════════════════════
     ("P1", CLI, "under",
      "⛔⛔ `0` STOPS BEING THE AGENT LOG and falls back to the range check that "
@@ -158,9 +164,13 @@ MUTANTS = [
      "⛔⛔ THE SHARPEST ONE. The row moves inside the has-runs branch, so it "
      "vanishes on exactly the two branches where somebody reaches for it — a "
      "machine holding none of their runs, and one that has published no list",
-     [('        if body.get("truncated"):\n'
-       '            print("  (only the most recent are listed — it holds more)")\n'
-       '    _print_agent_log_choice()\n',
+     [('    _print_agent_log_choice()\n'
+       '    print(f"Research computer: {name}")\n',
+       '    print(f"Research computer: {name}")\n'),
+      ('        _print_held_runs(rows)\n'
+       '        if body.get("truncated"):\n'
+       '            print("  (only the most recent are listed — it holds more)")\n',
+       '        _print_held_runs(rows)\n'
        '        if body.get("truncated"):\n'
        '            print("  (only the most recent are listed — it holds more)")\n'
        '        _print_agent_log_choice()\n')]),
@@ -168,10 +178,10 @@ MUTANTS = [
      "⛔ THE ROW STOPS NAMING THE OTHER COMPUTER, so a numbered line under a list "
      "of that machine's runs reads as one more of that machine's runs — the exact "
      "confusion a sibling guard polices in the consent copy",
-     [('    print("   0  the log from the agent on THIS host — the machine you are "\n'
+     [('    print("  Run 0  the log from the agent on THIS host — the machine you are "\n'
        '          "typing on,")\n'
-       '    print("      which may not be that computer")',
-       '    print("   0  the log from the agent on THIS host")')]),
+       '    print("         which may not be that computer")',
+       '    print("  Run 0  the log from the agent on THIS host")')]),
     ("P12", CLI, "over",
      "⛔⛔ THE RUNS RENUMBER FROM ZERO, so the agent's log and the first run share "
      "a number and the log silently becomes run one. `0` is free ONLY because the "
@@ -197,9 +207,11 @@ MUTANTS = [
      "and the rest is sent, so fewer runs go than were asked for and it reports "
      "success — the one direction a log request must not fail in",
      [('        chosen, picked_agent_log, refusal = _resolve_log_selection(rows, args.runs)\n'
-       '        if refusal:\n            return _emit(body, args.json, refusal, 1)\n',
+       '        if refusal:\n'
+       '            return _say(body, refusal, 1)\n',
        '        chosen, picked_agent_log, refusal = _resolve_log_selection(rows, args.runs)\n'
-       '        if refusal:\n            chosen = chosen or []\n')]),
+       '        if refusal:\n'
+       '            chosen = chosen or []\n')]),
     ("C3", SR, "over",
      "⛔⛔ THE PLAN LISTS ONLY WHAT IS GOING, so the numbers of everything else "
      "are off screen and cannot be asked for — a list nobody can pick FROM",
@@ -214,12 +226,12 @@ MUTANTS = [
     ("C5", SR, "under",
      "⛔ THE `0` ROW APPEARS ONLY WHEN IT IS ALREADY GOING, so it is shown to "
      "everyone who does not need it and to nobody who does",
-     [('        lines.append(f"  0 {\'•\' if agent_log else \'·\'} the log from the agent on "\n'
+     [('        lines.append(f"  Run 0 {\'•\' if agent_log else \'·\'} the log from the agent on "\n'
        '                     "THIS host — the machine running this chat, which may not "\n'
        '                     "be that computer"\n'
        '                     f"{\'\' if agent_log else \'   (not picked)\'}")\n',
        '        if agent_log:\n'
-       '            lines.append("  0 • the log from the agent on THIS host")\n')]),
+       '            lines.append("  Run 0 • the log from the agent on THIS host")\n')]),
     ("C6", SR, "under",
      "⛔ THE LINE THAT SAYS THE NUMBERS ARE SAYABLE GOES. Nothing else in the "
      "conversation tells a person, or the assistant relaying for them, that "
@@ -248,8 +260,10 @@ MUTANTS = [
     ("C8", SR, "under",
      "⛔ CHAT'S AGENT-LOG-ONLY REFUSAL GOES, so the two clients disagree about "
      "the one thing they were just made to agree on",
-     [('        if agent_log:\n            # ⛔ THE MACHINE OFFER SURVIVES, AND STILL ONLY FOR AN OWNER — a\n            # non-owner is refused `--machine` a few lines above, so offering it to\n            # them would send them round the circle a previous wave closed.\n            return _send_agent_log_alone(args, offer_machine=owned, name=name)\n',
-       '        if False:\n            pass\n')]),
+     [('        if agent_log:\n'
+       '            # ⛔⛔ ON A CONFIRM IT HAS ALREADY GONE',
+       '        if False:\n'
+       '            # ⛔⛔ ON A CONFIRM IT HAS ALREADY GONE')]),
     ("N1", SR, "under",
      "⛔⛔ THE LIVE DEFECT RESTORED. `--machine` leaves the allowlist, `cmd_do` "
      "reads it as free text and pushes it behind `--`, `send-logs` has no "
@@ -571,7 +585,8 @@ MUTANTS = [
      "⛔ THE ROUTING ROW THAT MAKES `--runs` REACHABLE FROM CHAT GOES. The table "
      "is what the assistant reads to decide what to run; the section further down "
      "is not an offer",
-     [('| "just the one about X", "only the first two", "not all of them" | ⛔ **ANSWERS TO THE PLAN THIS COMMAND JUST PRINTED**, not standalone asks — `sr.py do` cannot resolve them, because the numbers exist only on the screen in front of the user. the plan numbers every run — pass those numbers back with `--runs`, comma-separated: `sr.py send-logs --runs 1,3` (and again on `--confirm`). `--runs 0` is the agent\'s own log, `--runs all` is every run listed. A name works too. Do **not** guess a number the plan did not print |\n', "")]),
+     [('| "just the one about X", "only the first two", "not all of them" | ⛔ **ANSWERS TO THE PLAN THIS COMMAND JUST PRINTED**, not standalone asks — `sr.py do` cannot resolve them, because the numbers exist only on the screen in front of the user. the plan labels every row — `Run 0`, `Run 1`, `Run 2` — pass those numbers back with `--runs`, comma-separated: `sr.py send-logs --runs 1,3` (and again on `--confirm`). `--runs 0` is the agent\'s own log, `--runs all` is every run listed. A name works too. ⛔ **POSITIONAL PHRASES RESOLVE AGAINST THE LABEL, NEVER THE SCREEN POSITION** — `Run 0` is printed FIRST, so "the first two" means `Run 0` and `Run 1`, i.e. `--runs 0,1`, and "the first one" is `--runs 0`. Read the label off the row; do not count down the screen. Do **not** guess a number the plan did not print |\n',
+       '')]),
 ]
 
 

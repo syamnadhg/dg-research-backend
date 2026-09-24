@@ -679,6 +679,17 @@ def test_the_document_says_to_pass_it_on_the_confirmed_call_too() -> None:
     assert "elif agent_log:" in after_send, (
         "the client no longer reads the flag after the send — the instruction to "
         "pass it on --confirm may now be stale")
+    # ⭐⭐ AND THE READ THAT GIVES THE INSTRUCTION ITS MEANING COMES BEFORE ALL OF
+    # THAT. Since 2026-09-20 the log goes FIRST, on `--confirm`, ahead of
+    # `/logs/runs` — so that gate, not the `elif` above, is what "pass it on
+    # `--confirm`" feeds. Pinning only the `elif` let mutation C7 (re-aimed
+    # 2026-09-24) switch the upload off with every guard here still green.
+    before_runs = body[:body.index('path = "/logs/runs"')]
+    assert ('if getattr(args, "confirm", False) and _wants_agent_log(args):\n'
+            '        agent_log_code, agent_log_lines = _send_agent_log_now(args)'
+            in before_runs), (
+        "the confirmed call no longer uploads the agent's log up front — the "
+        "instruction to pass the flag on --confirm now feeds nothing")
     bullet = _agent_log_bullet()
     # ⛔ RE-AIMED IN WAVE 8 AND MADE SPECIFIC. The bullet now distinguishes two
     # shapes — the log riding a bundle and the log travelling alone — so "it"

@@ -63,6 +63,12 @@ MUTATED_FILES = (BRIDGE, REST, CLI, SR, SKILL)
 
 # (id, file, direction, why, [(from, to), ...])
 MUTANTS = [
+    # ⛔⛔ RE-ANCHORED 2026-09-24 — the agent's 2026-09-20..23 fixes moved the text
+    # under these, and `test_no_new_stale_anchors` caught it before a push:
+    #   H1, H2, H11 — the plan header names no computer, every exit goes through
+    #   `_say`, and not-back-yet is `_bundle_waiting_lines`
+    # Each keeps its ORIGINAL defect on the new text, and each was re-run and
+    # KILLED against this harness's own selection before this note was written.
     # ═══════════ A — the action name is the permission ══════════════════════
     ("A1", BRIDGE, "over",
      "⛔⛔ the whole-machine action goes on the wire — every run the computer "
@@ -387,9 +393,9 @@ MUTANTS = [
      "⛔⛔ the bare command SENDS — the plan is never shown and the consent flag "
      "claims a conversation that did not happen",
      [('    if not getattr(args, "confirm", False):\n'
-       '        lines = [f"I can send Super Research support the logs from “{name}”:"]',
+       '        # ⭐⭐ THE HEADER NAMES NO COMPUTER',
        '    if False:\n'
-       '        lines = [f"I can send Super Research support the logs from “{name}”:"]')]),
+       '        # ⭐⭐ THE HEADER NAMES NO COMPUTER')]),
     ("H2", SR, "over",
      "the sharer refusal goes, so somebody on a shared computer asks for its "
      "own logs and is silently given a smaller bundle",
@@ -397,10 +403,11 @@ MUTANTS = [
        '        # Said here rather than after a round trip. The computer would refuse\n'
        '        # this anyway; what this decides is whether the person is TOLD, and on\n'
        '        # a shared computer that is the ordinary case rather than the odd one.\n'
-       '        return _emit(body, args.json, [\n'
+       '        return _say(body, [\n'
        '            f"“{name}”’s own logs belong to whoever owns it, so I can’t include "\n'
        '            "them. Ask again without them and you’ll still get every run of "\n'
-       '            "yours it’s holding."], 1)\n', "")]),
+       '            "yours it’s holding."], 1)\n',
+       '')]),
     ("H3", SR, "under",
      "⛔⛔ the two sentences collapse in chat: a computer we cannot see is "
      "reported to the user as holding none of their runs",
@@ -453,9 +460,8 @@ MUTANTS = [
     ("H11", SR, "under",
      "nothing back yet is reported as a failure, which fires on every computer "
      "that is merely slow to package",
-     [('            return _emit(body, args.json, [\n'
-       '                f"Nothing has come back for {want} yet. That computer may still "\n'
-       '                "be packaging it, or may not have picked the request up."])',
+     [('            return _emit(body, args.json,\n'
+       '                         _bundle_waiting_lines(want, body))',
        '            return _emit(body, args.json, [f"✗ {want} failed."], 1)')]),
 
     # ═══════════ W — what the assistant is told to do ═══════════════════════

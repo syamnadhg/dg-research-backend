@@ -94,6 +94,13 @@ _INFLIGHT = Path(__file__).with_suffix(".inflight")
 
 # (id, file, direction, why, [(from, to), ...])
 MUTANTS = [
+    # ⛔⛔ RE-ANCHORED 2026-09-24 — the agent's 2026-09-20..23 fixes moved the text
+    # under these, and `test_no_new_stale_anchors` caught it before a push:
+    #   E2-E5, L1, L2, L5, L10, L11, T2-T4, W2, X14, X15, X17, X19 — the `Public
+    #   computers` section, `_public_rows_block`, the install page in place of
+    #   `--pair`; X22 retired (see there)
+    # Each keeps its ORIGINAL defect on the new text, and each was re-run and
+    # KILLED against this harness's own selection before this note was written.
     # ═══════════ E — the empty state itself ══════════════════════════════════
     ("E1", SR, "under",
      "⛔⛔ THE FIRST THING GOES. Without it the reader cannot tell whether the "
@@ -102,21 +109,28 @@ MUTANTS = [
     ("E2", SR, "under",
      "the pair-code route goes, so somebody who ALREADY HAS a machine is never "
      "told the one step that connects it",
-     [('    lines.append("Add your own: paste the access code from the computer running "\n                 "Super Research and I’ll connect it.")\n',
-       '')]),
+     [('    lines.append(_ADD_WITH_CODE)\n'
+       '    lines.append("")\n'
+       '    pub = _public_offer_lines()\n',
+       '    lines.append("")\n'
+       '    pub = _public_offer_lines()\n')]),
     ("E3", SR, "under",
      "⛔⛔ THE THIRD THING GOES ENTIRELY and every screen is a dead end again — "
      "the exact state this wave exists to end, on all seven chat doors at once",
-     [('    lines += _public_offer_lines()\n', '')]),
+     [('    pub = _public_offer_lines()\n',
+       '    pub = []\n')]),
     ("E4", SR, "under",
      "⛔⛔ A FAILED LOOK EATS THE OFFER. The option is true whether or not the "
      "list could be fetched, so a transport hiccup silently restores one way out",
-     [('        return ["Or ask to use somebody else’s — say “show me public computers” "\n                "and I’ll look again."]',
+     [('        return [f"{_PUBLIC_HEAD} — ask to use somebody else’s. Say "\n'
+       '                "“show me public computers” and I’ll look again."]',
        '        return []')]),
     ("E5", SR, "under",
      "⛔⛔ NOBODY OFFERING TODAY EATS THE OFFER, so the reader is told only the "
      "bad news about a route they were never told existed",
-     [('        lines = ["Or ask to use somebody else’s — but nobody is offering one "\n                 "publicly right now.",\n                 _PUBLIC_NONE_WHY]',
+     [('        lines = [f"{_PUBLIC_HEAD} — ask to use somebody else’s. Nobody is "\n'
+       '                 "offering one publicly right now.",\n'
+       '                 _PUBLIC_NONE_WHY]',
        '        lines = [_PUBLIC_NONE_WHY]')]),
     ("E6", SR, "under",
      "the lead is dropped, so the sign-in announce stops naming the topic that "
@@ -137,12 +151,13 @@ MUTANTS = [
     ("L1", SR, "under",
      "⛔⛔ THE OFFER KEEPS ITS SENTENCE AND LOSES ITS ROWS. \"Or ask for a public "
      "one\" with nothing named is advice, and the reader has no id to hand back",
-     [('        lines = ["Or ask to use somebody else’s — these are on offer right now:"]\n    lines += [_public_row_line(d) for d in rows]',
-       '        lines = ["Or ask to use somebody else’s — these are on offer right now:"]')]),
+     [('                 "offer right now:"]\n'
+       '    lines += _public_rows_block(rows)\n',
+       '                 "offer right now:"]\n')]),
     ("L2", SR, "under",
-     "⛔⛔ THE ID LEAVES THE ROW, and public labels COLLIDE — every unnamed "
-     "machine reads as the identical string, so nothing identifies a row",
-     [("    return f\"  • {label}{dot}{full}  (id {d.get('deviceId')})\"",
+     "⛔⛔ THE ID LEAVES THE ROW EVEN WHERE LABELS COLLIDE — every unnamed machine "
+     "reads as the identical string, so nothing identifies a row",
+     [('    return f"  • {label}{dot}{full}" + (f"  (id {d.get(\'deviceId\')})" if show_id else "")',
        '    return f"  • {label}{dot}{full}"')]),
     ("L3", SR, "under",
      "⛔ THE `full` MARKER GOES, so a machine that will certainly refuse is "
@@ -158,7 +173,9 @@ MUTANTS = [
      "reads as the whole story when the scan filled up",
      [('    if body.get("truncated"):\n'
        '        lines.append(_PUBLIC_TRUNCATED_SOME)\n'
+       '    lines.append("")\n'
        '    lines.append(_PUBLIC_ASK_INVITE)',
+       '    lines.append("")\n'
        '    lines.append(_PUBLIC_ASK_INVITE)')]),
     ("L6", SR, "under",
      "⛔⛔ TRUNCATION IS UNREPORTED ON THE EMPTY BRANCH — the branch where it "
@@ -182,15 +199,18 @@ MUTANTS = [
      [('_PUBLIC_LOOK_TIMEOUT = 20', '_PUBLIC_LOOK_TIMEOUT = 40')]),
     ("L10", SR, "under",
      "the empty-public branch drops the option and keeps only the bad news",
-     [('        lines = ["Or ask to use somebody else’s — but nobody is offering one "\n                 "publicly right now.",',
-       '        lines = ["Nobody is offering one publicly right now.",')]),
+     [('        lines = [f"{_PUBLIC_HEAD} — ask to use somebody else’s. Nobody is "\n'
+       '                 "offering one publicly right now.",\n',
+       '        lines = ["Nobody is offering one publicly right now.",\n')]),
     ("L11", SR, "over",
      "⛔⛔ THE EMPTY STATE STOPS SHARING THE BROWSE SCREEN'S ROW RENDERER and "
      "writes its own. That is exactly how ten wordings of one fact came to exist; "
      "extracting a helper does not test it, so this asks whether BOTH consumers "
      "still read it",
-     [('        lines = ["Or ask to use somebody else’s — these are on offer right now:"]\n    lines += [_public_row_line(d) for d in rows]',
-       '        lines = ["Or ask to use somebody else’s — these are on offer right now:"]\n    lines += [f"  • {d.get(\'label\')}" for d in rows]')]),
+     [('                 "offer right now:"]\n'
+       '    lines += _public_rows_block(rows)\n',
+       '                 "offer right now:"]\n'
+       '    lines += [f"  • {d.get(\'label\')}" for d in rows]\n')]),
 
     # ═══════════ T — the terminal, which had the emptiest screen of all ══════
     ("T1", CLI, "under",
@@ -202,18 +222,24 @@ MUTANTS = [
     ("T2", CLI, "under",
      "the terminal keeps the offer and loses the list, so the reader is told to "
      "ask for a computer and given no id to ask for",
-     [('    print("     Or ask to use somebody else\'s — on offer right now:")\n    for i, d in enumerate(rows, 1):\n        print(_public_row(i, d))\n',
-       '    print("     Or ask to use somebody else\'s — on offer right now:")\n')]),
+     [('          "now:")\n'
+       '    for i, d in enumerate(rows, 1):\n'
+       '        print(_public_row(i, d))\n',
+       '          "now:")\n')]),
     ("T3", CLI, "under",
      "a failed look eats the terminal's offer too, on the one surface where the "
      "reader cannot simply ask again in words",
-     [('        print("     Or ask to use somebody else\'s:  agent device public")\n        return\n',
+     [('        print("  Public computers — ask to use somebody else\'s:  "\n'
+       '              "agent device public")\n'
+       '        _print_install_block_t()\n'
+       '        return\n',
+       '        _print_install_block_t()\n'
        '        return\n')]),
     ("T4", CLI, "over",
      "⛔ THE TERMINAL INVENTS A THIRD NAME FOR THE CODE. The chat client, this "
      "file's own installer copy and SKILL.md all say \"8-char access code\"",
-     [('          "8-char access code —")',
-       '          "8-char code —")')]),
+     [('    print("                       8-char access code — your own, or one whose")',
+       '    print("                       8-char code — your own, or one whose")')]),
     ("T5", CLI, "over",
      "⛔⛔ THE TERMINAL'S INVITATION SAYS \"your name and email address\" AGAIN — "
      "wrong twice, and the phrasing the chat confirm was corrected away from in "
@@ -232,8 +258,11 @@ MUTANTS = [
      "⛔⛔ THE WATCHER DROPS IT TOO. It runs with `no_agent`, so its text reaches "
      "the person with no model turn to launder it — and it is PROACTIVE, which "
      "makes it the one screen somebody reads without having asked anything",
-     [('            f"Two ways to fix that. Ask to use somebody else\'s — ask me for the "\n            f"public computers and I\'ll list the ones on offer; their owner "\n            f"decides, and they see your name — or your email, if you have not "\n            f"set one.\\n\\n"\n            f"Or add your own. On a computer with Super Research, run:\\n"',
-       '            f"On a computer with Super Research, run:\\n"')]),
+     [('            f"Public computers — ask to use somebody else\'s. Ask me for the "\n'
+       '            f"public computers and I\'ll list the ones on offer, and tell me which "\n'
+       '            f"one to ask for; they see your name — or your email, if you have not "\n'
+       '            f"set one.\\n\\n"\n',
+       '')]),
     ("W3", BRIDGE, "under",
      "the wire sentence loses the access-code half instead, so somebody who owns "
      "a machine already is sent to ask a stranger for one",
@@ -406,8 +435,9 @@ MUTANTS = [
      "⛔ THE SHARED SENTENCE IS SPLICED AFTER AN EM-DASH AGAIN, printing "
      "\"— A computer shows up there…\" with a capital A mid-sentence. It is "
      "written as a sentence because the browse screen uses it as one",
-     [('                 "publicly right now.",\n                 _PUBLIC_NONE_WHY]',
-       '                 "publicly right now — " + _PUBLIC_NONE_WHY]')]),
+     [('                 "offering one publicly right now.",\n'
+       '                 _PUBLIC_NONE_WHY]',
+       '                 "offering one publicly right now — " + _PUBLIC_NONE_WHY]')]),
 
     # ═══════════ X — THE REPAIRS CROSS-VERIFICATION FORCED ═══════════════════
     #   ⛔⛔ 7.9-3's OWN RECORD IS WHY THIS SERIES EXISTS. That wave fixed 68
@@ -491,11 +521,15 @@ MUTANTS = [
        '    rows = body.get("devices") or []\n    if not rows:\n        lines = ["Nobody is offering')]),
     ("X14", SR, "under",
      '⛔ A LIST OF NOTHING BUT FULL MACHINES CALLS ITSELF AN OFFER, and every ask it invites is a certain `share_cap_reached`',
-     [('    if all(d.get("full") for d in rows):\n        lines = ["Or ask to use somebody else’s — but every computer on offer is "\n                 "already shared with as many people as it can hold:"]\n    else:\n',
-       '')]),
+     [('    if all(d.get("full") for d in rows):\n'
+       '        lines = [f"{_PUBLIC_HEAD} — ask to use somebody else’s, but every "',
+       '    if False:\n'
+       '        lines = [f"{_PUBLIC_HEAD} — ask to use somebody else’s, but every "')]),
     ("X15", SR, "under",
      'a rate-limited look is reported as a failed one, so the reader is told to ask again immediately and spends another look on the same refusal',
-     [('        if isinstance(body, dict) and body.get("error") == "rate_limited":\n            return [f"Or ask to use somebody else’s — {said[0].lower()}{said[1:]}"]\n',
+     [('        if isinstance(body, dict) and body.get("error") == "rate_limited":\n'
+       '            return [f"{_PUBLIC_HEAD} — ask to use somebody else’s. "\n'
+       '                    f"{said}"]\n',
        '')]),
     ("X16", SR, "under",
      '⛔⛔ THE DEVICE LIST RELAYS THE BRIDGE\'S TERMINAL SYNTAX INTO CHAT — "not signed in — run /login" — and this wave made this command the answer to "I have no computer", so it hits exactly the people it was written for',
@@ -503,15 +537,19 @@ MUTANTS = [
        '        return _emit(body, args.json, [f"✗ {body.get(\'error\', code)}"],')]),
     ("X17", WATCH, "under",
      '⛔⛔ THE WATCHER DROPS THE EMAIL HALF OF THE DISCLOSURE. Somebody who never set a display name is told a stranger sees their NAME when the product hands over their EMAIL — and this surface reaches them verbatim, with no model turn',
-     [('            f"decides, and they see your name — or your email, if you have not "\n            f"set one.\\n\\n"',
-       '            f"decides, and they see your name.\\n\\n"')]),
+     [('            f"one to ask for; they see your name — or your email, if you have not "\n'
+       '            f"set one.\\n\\n"\n',
+       '            f"one to ask for; they see your name.\\n\\n"\n')]),
     ("X18", BRIDGE, "under",
      "the wire's two commands lose their program name, so neither is runnable as printed on the one surface that prints this sentence verbatim",
      [('                                          "it here (agent device add <code>), or ask "\n                                          "to use somebody else\'s (agent device public)"})',
        '                                          "it here (device add <code>), or ask "\n                                          "to use somebody else\'s (device public)"})')]),
     ("X19", CLI, "under",
-     'the terminal loses the route for somebody with NO machine at all, and offers a pair code from a computer that may be running nothing',
-     [('    print("     No Super Research on any computer yet? Install it there first:")\n    print("       Windows:      irm https://superresearch.io/install.ps1 | iex")\n    print("       macOS/Linux:  curl -fsSL https://superresearch.io/install.sh | sh")\n    print("                     superresearch --pair")\n',
+     "the terminal loses the route for somebody with NO machine at all — the "
+     "install page — on every exit from the empty state",
+     [('    print("\\n  Don\'t have your own Research Computer yet? Set one up: "\n'
+       '          "https://superresearch.io/install")\n'
+       '    print("  It gives you an 8-char access code — add it with:  agent device add <code>")\n',
        '')]),
     ("X20", CLI, "over",
      'the terminal looks AFTER it starts printing again, so it emits three lines and then blocks for up to twenty seconds mid-message',
@@ -521,10 +559,13 @@ MUTANTS = [
      '`phone` leaves the strip while staying in the bare test, so "remove my phone LABPC001" quotes “phone LABPC001” back',
      [('_NAMEABLE_NOUNS = r"pcs?|laptops?|macs?|macbooks?|desktops?|workstations?|phones?"',
        '_NAMEABLE_NOUNS = r"pcs?|laptops?|macs?|macbooks?|desktops?|workstations?"')]),
-    ("X22", SR, "under",
-     'the invitation stops offering the id, on a screen whose rows collide — every unnamed machine reads as the identical string',
-     [('_PUBLIC_ASK_INVITE = ("Tell me which one to ask for — its name, or the id beside it "\n                      "if two read the same. Its owner decides, and they see your "\n                      "name — or your email, if you haven’t set one.")',
-       '_PUBLIC_ASK_INVITE = ("Tell me which one to ask for and I’ll ask its owner. They "\n                      "see your name — or your email, if you haven’t set one.")')]),
+    # ⛔ X22 RETIRED 2026-09-24 — ITS SUBJECT WAS REMOVED BY THE OWNER, NOT BY DRIFT.
+    # It guarded the invitation offering "the id beside it". On 2026-09-20 the owner
+    # asked for the invitation to name no id ("it's quite confusing") and to keep
+    # only "they see your name"; the id now appears on a row ONLY when two labels
+    # collide (`_public_rows_block`), which L2 and wave792 P11 still measure. A
+    # mutant re-aimed onto some other sentence would be a different mutant under
+    # an old name, so it is retired rather than moved.
     ("X23", SKILL, "under",
      '⛔ SKILL.md GATES `install` ON A STRING NO SURFACE PRINTS ANY MORE, so the documented trigger for the one command that turns the local PC into a Research Computer cannot be recognised',
      [('  the PC). Use ONLY when `research` reports **"no research computer on this account\n  yet"** (reason `no_devices`) — the older wording "no devices yet" is gone —',

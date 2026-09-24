@@ -259,3 +259,50 @@ def test_the_two_clients_state_the_same_three_facts(monkeypatch, chat, capsys):
                   "ids of the computers and runs"):
         assert claim in chat_out, claim
         assert claim in term_out, claim
+
+
+# ── the machine holds none of their runs, and they asked for the agent's log ──
+
+class _EmptyMachineWire(_ChatWire):
+    def get(self, path, timeout=None):
+        if path.startswith("/logs/runs"):
+            return 200, {"deviceId": "dev1", "deviceName": "Studio PC", "owned": True,
+                         "published": True, "runs": [], "truncated": False}
+        return super().get(path, timeout)
+
+
+@pytest.fixture()
+def empty_machine(monkeypatch):
+    w = _EmptyMachineWire()
+    monkeypatch.setattr(sr, "_get", w.get)
+    monkeypatch.setattr(sr, "_post", w.post)
+    return w
+
+
+def test_an_empty_machine_still_offers_the_agents_log_on_its_own(empty_machine, capsys):
+    """⛔⛔ THEY ASKED FOR TWO THINGS AND ONE OF THEM CAN STILL HAPPEN. The research
+    computer is holding none of their runs, so there is no bundle — but the agent's
+    log lives on THIS host and needs none. Answering with the machine's refusal
+    alone drops the half they can have, and exits 1 on a request that can still
+    succeed. Mutation wave791 C8 (re-aimed 2026-09-24) did exactly that with every
+    guard in this harness green."""
+    rc = sr.cmd_send_logs(_chat_args(agent_log=True))
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "the log from the agent on THIS" in out, out
+    assert empty_machine.posts == [], "the plan sends nothing"
+
+
+def test_on_a_confirm_it_has_already_gone_and_goes_once(empty_machine, capsys):
+    """⛔⛔ ON `--confirm` THE LOG WENT UP BEFORE THE RUN LIST WAS FETCHED, so this
+    branch reports the empty machine and stops. Refusing (exit 1) would disown a send
+    that happened; calling the standalone command again would upload a second copy
+    and spend another of the account's ten uploads an hour."""
+    rc = sr.cmd_send_logs(_chat_args(agent_log=True, confirm=True))
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "so there was no bundle to ask it for" in out, out
+    uploads = [p for p in empty_machine.posts if p["path"] == "/logs/agent-log"]
+    assert len(uploads) == 1, empty_machine.posts
+    assert not any(p["path"] == "/logs/send" for p in empty_machine.posts), \
+        "no bundle may be requested from a machine holding none of their runs"

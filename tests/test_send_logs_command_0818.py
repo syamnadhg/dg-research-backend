@@ -15,6 +15,7 @@ import inspect
 import json
 import re
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -160,7 +161,19 @@ def _run_sync(monkeypatch):
         def start(self):
             self._target()
 
-    monkeypatch.setattr(research._log_threading, "Thread", _Inline)
+    # ⛔⛔ RESEARCH'S OWN REFERENCE, NEVER THE REAL MODULE. `_log_threading` IS
+    # `threading`, so setting `.Thread` on it replaced Thread for the whole process
+    # — and on Windows `subprocess.communicate` reads each pipe on a
+    # `threading.Thread(target=…, args=…)`. This double drops `args`, so the git
+    # call `web_repo()` makes raised TypeError the moment a web checkout was on
+    # disk: every write the fake store checks then "failed", and fourteen tests
+    # here went red on Windows only (POSIX reads pipes with selectors). Found
+    # 2026-09-24, the first time this suite ran on Windows with the web repo beside
+    # it — without it the fake enforced nothing and the same tests passed quietly.
+    shim = types.ModuleType("threading")
+    shim.__dict__.update(research._log_threading.__dict__)
+    shim.Thread = _Inline
+    monkeypatch.setattr(research, "_log_threading", shim)
     return started
 
 

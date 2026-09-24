@@ -59,7 +59,10 @@ def _run(m, name, uid, text, age=0.0):
         "schema": 1, "status": "complete", "researchId": name.split("_")[0],
         "startedUtc": iso, "submitterUid": uid,
         "submitterSource": "queue" if uid else "unclaimed"}), encoding="utf-8")
-    (folder / "run.log").write_text(text, encoding="utf-8")
+    # ⛔ BYTES, NOT TEXT. The byte-for-byte tests compare against `text.encode()`;
+    # `write_text` on Windows turns every \n into \r\n on disk, the bundle then
+    # (correctly) ships those bytes, and the test fails on a product that is exact.
+    (folder / "run.log").write_bytes(text.encode("utf-8"))
     return folder
 
 

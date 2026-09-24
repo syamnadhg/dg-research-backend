@@ -96,6 +96,12 @@ ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
 # (id, file, direction, why, [(from, to), ...])
 MUTANTS = [
+    # ⛔⛔ RE-ANCHORED 2026-09-24 — the agent's 2026-09-20..23 fixes moved the text
+    # under these, and `test_no_new_stale_anchors` caught it before a push:
+    #   D9 — the expiring-record reader added beside it copies the empty-uid
+    #   prologue, so the anchor carries one more line
+    # Each keeps its ORIGINAL defect on the new text, and each was re-run and
+    # KILLED against this harness's own selection before this note was written.
     # ═══════════ D — durable, uid-bound, and cleared in one place ═══════════
     ("D1", BRIDGE, "under",
      "⛔ the announce stops being parked at all, so it lives only in process "
@@ -158,10 +164,14 @@ MUTANTS = [
      "redundant and the mutant unobservable. A mutant that measures nothing is a "
      "harness fault however true its sentence is, so it now edits the guard that "
      "actually decides the case",
-     [("    if not uid:\n        return None\n    data = load()",
-       "    data = load()"),
-      ("    if isinstance(ev, dict) and ev and owner and owner == uid:",
-       "    if isinstance(ev, dict) and ev and owner == uid:")]),
+     [('    if not uid:\n'
+       '        return None\n'
+       '    data = load()\n'
+       '    ev = data.get(_PENDING_ANNOUNCE)\n',
+       '    data = load()\n'
+       '    ev = data.get(_PENDING_ANNOUNCE)\n'),
+      ('    if isinstance(ev, dict) and ev and owner and owner == uid:',
+       '    if isinstance(ev, dict) and ev and owner == uid:')]),
     ("D10", BRIDGE, "over",
      "⛔ the park stops being best-effort, so a read-only disk takes the SIGN-IN "
      "down with it — a courtesy message failing the thing it is a courtesy about",
