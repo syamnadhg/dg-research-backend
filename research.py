@@ -17288,17 +17288,21 @@ def _settle_held_entry(job_queue, job, answer: str, record: dict) -> None:
     worker can dequeue the job, and no snapshot rewrite can see it, in between.
 
     ⭐ AN ENTRY LEAVES THE HELD LIST ONLY ON AN ANSWER, and an entry that is no
-    longer held — Reset Backend drained it while its read was out — is left
-    alone. A "take" is then asked `_run_taken_since_boot`: a run somebody has
-    started since boot is let go, not started a second time."""
-    if not any(h is job for h in list(_UNREAD_RESTORES)):
-        return
+    longer held — Reset Backend drained it — is left alone. A "take" is then
+    asked `_run_taken_since_boot`: a run somebody has started since boot is let
+    go, not started a second time."""
     if answer == "unread":
         return
     try:
         _UNREAD_RESTORES.remove(job)
     except ValueError:
-        pass
+        # ⛔ NO LONGER HELD IS NO LONGER THE RETRY'S. Reset Backend drains this
+        # list on the command listener's thread — while this entry's read was
+        # out, or at any moment up to this remove — and a run it stopped must
+        # not start. A membership check first, then this remove falling
+        # through on a miss, left the gap between the two open (re-verify of
+        # this wave); the remove is the one question now.
+        return
     if answer != "take":
         return
     rid = str((job or {}).get("research_id") or "")

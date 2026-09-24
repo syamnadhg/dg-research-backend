@@ -753,6 +753,39 @@ def test_an_entry_reset_backend_drained_while_its_read_was_out_is_not_started(
     assert list(q._queue) == [], "a run Reset Backend drained was started by the retry"
 
 
+class _DrainedAtTheRemove(list):
+    """The held list, with Reset Backend's drain (`del _UNREAD_RESTORES[:]`, on
+    the command listener's thread) landing at the last moment it can: after the
+    read has answered and the settle has begun, as the settle removes the
+    entry — a thread switch between two statements."""
+
+    def remove(self, x):
+        del self[:]
+        raise ValueError("list.remove(x): x not in list")
+
+
+def test_an_entry_reset_backend_drains_as_the_settle_removes_it_is_not_started(
+        monkeypatch, tmp_path):
+    """⛔ THE SAME DRAIN, LATER (re-verify of this wave). The settle asked
+    whether the entry was still held, then removed it; a drain between the two
+    made the remove find nothing, and the settle went on to queue a run the
+    reset had just stopped. Through the REAL re-offer, whose read answers
+    "queued"."""
+    answers = _Answers(QUEUED)
+    _machine(monkeypatch, tmp_path, answers)
+    monkeypatch.setattr(research, "_UNREAD_RESTORES", _DrainedAtTheRemove([_job()]))
+    monkeypatch.setattr(research, "_RESTART_RETRY_DELAYS_S", (0,))
+    q = _Q()
+
+    asyncio.run(research._reoffer_unread_restores(q))
+
+    assert answers.reads == 1, "the retry never asked"
+    assert list(q._queue) == [], (
+        "a run Reset Backend drained as the settle removed it was started by "
+        "the retry")
+    assert list(research._UNREAD_RESTORES) == []
+
+
 def _hard_reset(monkeypatch, tmp_path, held):
     """Drive the REAL Reset Backend through the device-command listener, on a
     foreground serve, with `held` entries boot could not check."""

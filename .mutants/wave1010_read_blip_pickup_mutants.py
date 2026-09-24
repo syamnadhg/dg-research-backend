@@ -25,6 +25,8 @@ The quiet ones matter most:
   K1    — the writer stops carrying held entries: the first worker boundary
         erases the only description of the run, which is the defect itself.
   X1    — Reset Backend leaves a held entry, and it runs after the reset.
+  Q4b   — the re-offer starts an entry Reset Backend drained while its read
+        was out, or at any moment up to the settle's remove.
   T1-T4/R3 — the re-offer starts a second copy of a run a Resume started here
         or on a sibling worker, or one a sibling holds the lock for.
   T7/T8 — the re-offer reads a missing worker stamp as worker 1's, and worker 2
@@ -86,11 +88,9 @@ RETRY_LET_GO = ('    if answer == "unread":\n'
                 '        _UNREAD_RESTORES.remove(job)')
 RETRY_RELEASE = ("    try:\n"
                  "        _UNREAD_RESTORES.remove(job)\n"
-                 "    except ValueError:\n"
-                 "        pass\n"
+                 "    except ValueError:")
+DRAINED_SINCE = ("        return\n"
                  '    if answer != "take":')
-STILL_HELD = ("    if not any(h is job for h in list(_UNREAD_RESTORES)):\n"
-              "        return")
 RETRY_ROUNDS = ("    for delay in _RESTART_RETRY_DELAYS_S:\n"
                 "        await asyncio.sleep(delay)\n"
                 "        for job in list(_UNREAD_RESTORES):")
@@ -216,8 +216,11 @@ MUTANTS = [
      "round and carried to every boot",
      [(RETRY_RELEASE, "    try:\n"
                       "        pass\n"
-                      "    except ValueError:\n"
-                      "        pass\n"
+                      "    except ValueError:")],
+     RESEARCH, PICKUP),
+    ("Q4b", "over", "⛔ an entry Reset Backend drained between the settle's check "
+     "and its remove is queued anyway — a run the reset just stopped starts",
+     [(DRAINED_SINCE, "        pass\n"
                       '    if answer != "take":')],
      RESEARCH, PICKUP),
     ("Q5", "under", "the retry asks once and gives up — the schedule is one round",
@@ -238,11 +241,10 @@ MUTANTS = [
                    "_UNREAD_RESTORES[0]),\n"
                    "                    timeout=_RESTART_RETRY_READ_TIMEOUT_S)")],
      RESEARCH, PICKUP),
-    ("Q8", "over", "⛔ an entry Reset Backend drained while its read was out is "
-     "started anyway when the read answers",
-     [(STILL_HELD, "    if False:\n"
-                   "        return")],
-     RESEARCH, PICKUP),
+    # ⛔ Q8 IS RETIRED, NOT LOST. It removed the settle's membership check
+    # before the remove; once the remove itself returns on a miss (Q4b's
+    # decision) that check was redundant, so Q8 became an equivalent mutant —
+    # and the check went, leaving the remove as the one guard.
     ("Q9", "over", "⛔ the read runs ON the loop — every held entry freezes the "
      "pipeline, the local API and the listeners for as long as it takes",
      [(RETRY_READ, "                answer, record = _ask_about_held_entry(job)")],
