@@ -14,7 +14,6 @@ checkable — a named branch exists, a dodge is still in place, a count does not
 grow — and those are the three shapes that actually went wrong.
 """
 import ast
-import re
 from pathlib import Path
 
 import research
@@ -22,38 +21,19 @@ import research
 SRC = Path(research.__file__).with_name("research.py").read_text(encoding="utf-8")
 
 
-# ══ 1. the pointer ratchet ═════════════════════════════════════════════
-#: Measured 2026-09-21. A ratchet, not a target: the sweep that fixes them is
-#: wave 10.10's, and it is scheduled LAST AND ALONE because ~250 of them across
-#: 50 files is a mechanical change nothing else should be mixed with.
-SELF_POINTER_CEILING = 47
-
-
-def test_the_file_does_not_gain_more_pointers_to_its_own_line_numbers():
-    """⛔⛔ EVERY ONE OF THESE IS WRONG ALREADY. Sampled five independently in
-    the cross-check and all five land on unrelated code — a prompt string, a
-    console helper, a uvicorn log comment, a CUA shadow comment, a mid-sentence
-    fragment. The file has grown by tens of thousands of lines since they were
-    written and nothing re-anchors them, so each one costs the next reader a
-    wrong turn.
-
-    ⭐ THE RATCHET IS THE POINT. Fixing them is wave 10.10's job, scheduled
-    last and alone. What this stops is the count going UP while that waits —
-    and one comment in this very region already knows the hazard and says so:
-    "(No line number on purpose: the previous note here cited one that had
-    drifted ~70 lines.)"
-    """
-    hits = re.findall(r"research\.py:\d+", SRC)
-    assert len(hits) <= SELF_POINTER_CEILING, (
-        f"{len(hits)} self-pointers, up from {SELF_POINTER_CEILING}. Every one "
-        f"of these is already wrong; name the function instead. New: "
-        f"{sorted(set(hits))[-5:]}")
+# ══ 1. the pointers ════════════════════════════════════════════════════
+# ⭐ The ratchet that stood here (ceiling 47, measured 2026-09-21) is replaced
+# by `tests/test_no_line_pointers.py`: wave 10.10 swept every line-number
+# pointer in the repository to the name it meant, and that guard holds the
+# count at ZERO over every form — this one saw only `research.py:N`, which was
+# 42 of the file's 141.
 
 
 def test_the_two_notes_that_deliberately_refuse_a_line_number_are_still_there():
-    """⭐ ACCEPT POLARITY for the ratchet above. A guard that only ever counts
-    down is satisfied by deleting the comments, and these two are the ones that
-    teach the habit."""
+    """⭐ ACCEPT POLARITY for the pointer guard. A guard that only ever counts
+    down is satisfied by deleting the comments, and this is the one that
+    teaches the habit — in its own words, the previous note there cited a
+    number that had drifted by seventy lines."""
     assert "No line number on purpose" in SRC
 
 

@@ -174,8 +174,16 @@ class TestThePauseSplitIsWrittenDown:
 class TestCitationsCannotRotAgain:
     def test_no_line_number_citation_survives(self):
         """All sixteen were wrong. A pointer that rots in silence is worse than
-        naming the symbol, so the shape is banned rather than re-anchored."""
+        naming the symbol, so the shape is banned rather than re-anchored.
+
+        ⭐ WIDENED IN WAVE 10.10 to the whole family the repository-wide guard
+        (`tests/test_no_line_pointers.py`) bans — a `.js` file, "line ~N", a
+        bare colon-number, "(~N)" — on top of this file's original three
+        shapes, which stay because the bare tilde-number here was stricter than
+        the shared one (it does not excuse a unit)."""
+        import _line_pointers as lp
         bad = re.findall(r"research\.py:\d+|\.tsx?:\d+|~\d{4,}", DOC)
+        bad += [m for _line, para in lp.prose_notes(DOC) for _form, m in lp.find_in_text(para)]
         assert bad == [], f"line-number citations are banned: {bad[:5]}"
 
     def test_the_ban_is_stated_where_someone_would_readd_one(self):

@@ -68,7 +68,10 @@ SUITES = ("tests/test_resume_drop_writeback_108.py "
           # ⛔ AND WAVE 10.9's, for the same reason: O9 and O15 were re-aimed at
           # the resume resolution that replaced their old line, and the tests
           # that EXECUTE the resume branch live there.
-          "tests/test_member_run_ownership_109.py")
+          "tests/test_member_run_ownership_109.py "
+          # ⛔ AND WAVE 10.10's POINTER GUARD, which replaced the ratchet in
+          # test_region_comments_108 — C3 inserts a pointer and only it can see.
+          "tests/test_no_line_pointers.py")
 RESEARCH = "research.py"
 FILES = (RESEARCH,)
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
@@ -460,11 +463,16 @@ MUTANTS = [
      "and it is the entire safety margin here",
      [(C_GUARD, "    if not actions:\n        # #955: the default action set is authored by the intent catalog")]),
 
+    # ⛔ RE-AIMED IN WAVE 10.10. This used to REPLACE the sentence, so the
+    # sentence check killed it and the pointer ratchet it was written for was
+    # never what did. The ratchet is now `tests/test_no_line_pointers.py`
+    # (ceiling zero, in SUITES above) and the sentence is KEPT, so only the
+    # pointer guard can kill this.
     ("C3", "under", RESEARCH,
-     "⛔ a new `research.py:NNNN` self-pointer is added. Every one already in "
-     "the file lands on unrelated code, and the sweep that fixes them is wave "
-     "10.10's — the ratchet exists to stop the count growing while that waits",
-     [(C_NOLINE, "see research.py:12345")]),
+     "⛔ a new `research.py:NNNN` self-pointer is added. Every one the wave "
+     "10.10 sweep replaced had landed on unrelated code; the guard holds the "
+     "count at zero",
+     [(C_NOLINE, "No line number on purpose (see research.py:12345)")]),
 
     ("C4", "under", RESEARCH,
      "⛔ something READS `is_retry_attempt`, so the comments calling it dead "
