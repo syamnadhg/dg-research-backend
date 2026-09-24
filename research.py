@@ -7359,7 +7359,7 @@ def _phase_estimate_ms(phase: int) -> int:
     keyed by phase int; convert to ms here.
 
     Forward-reference safe — `_phase_averages` is defined at module
-    further down (after this helper) but Python resolves globals
+    scope further down (after this helper) but Python resolves globals
     at call time so this works as long as `load_analytics()` has run
     before any `_estimate_queue_eta_ms` call (it runs in server
     startup, well before listeners fire)."""
@@ -17366,7 +17366,7 @@ def _clear_current_run_id_best_effort(reason: str) -> None:
         # phase_start emit would overwrite, but in the gap between worker-1
         # picking up the new job and that emit landing, the FE QueuedBanner
         # head-phase line would show the prior run's stale phase. Pair this
-        # with the publish-on-pickup patch in `_job_worker` (~line 29773)
+        # with the publish-on-pickup patch in `_job_worker`
         # which writes phase=0 the moment a new job is claimed.
         _firebase_db.collection("devices").document(_did).update({
             "currentRunId": _CR_DF,
@@ -19344,7 +19344,7 @@ def _do_agent_terminal_status_write(agent_key: str, status: str,
                                     reason: str = "", detail: str = ""):
     """Inner sync write — kept separate so the public _write_*
     helpers can fire-and-forget on a daemon thread, avoiding the
-    event-loop blocking that B2 (research.py:1046) called out for
+    event-loop blocking that B2 (`_heartbeat_loop`) called out for
     sync Firestore I/O on the main asyncio loop."""
     if not _firebase_db or not _fb_uid or not _fb_research_id:
         return
@@ -19398,7 +19398,7 @@ def _write_agent_terminal_status(agent_key: str, status: str, force: bool = Fals
 
     Fire-and-forget on a daemon thread so the sync Firestore round-trip
     doesn't block the asyncio event loop (heartbeat, command listener,
-    narration ticker). Same lesson as B2 (research.py:1046) — any
+    narration ticker). Same lesson as B2 (`_heartbeat_loop`) — any
     multi-second sync I/O on the main loop starves heartbeat and trips
     the FE 30s offline threshold.
 
@@ -19753,7 +19753,7 @@ def _start_command_listener(uid, research_id, loop):
             if action == "stop":
                 # Mark processed BEFORE scheduling the 3s exit timer so the
                 # flag lands even if the Firestore Admin SDK buffers the
-                # tail-end mark-processed write (at line ~1455) and
+                # tail-end mark-processed write (at the bottom of this handler) and
                 # os._exit(0) kills the buffer before flush. Without this,
                 # an ungraceful exit leaves the stop doc unprocessed and
                 # the next serve replays it the moment the listener
@@ -19874,7 +19874,7 @@ def _start_command_listener(uid, research_id, loop):
                     # a delayed onSnapshot delivery can leave the chat
                     # icon row out of sync with the tile that just sent
                     # this command. Mirrors the HTTP /api/runs/{id}/config
-                    # PATCH path (line ~18347) which already emits.
+                    # PATCH path (`update_config`) which already emits.
                     try:
                         emit_event("config_updated", config=cfg)
                     except Exception:
@@ -19921,10 +19921,10 @@ def _start_command_listener(uid, research_id, loop):
                     # #777 parity: retract any durable "Hit a snag" pendingDecision
                     # mirror the instant the user clicks Skip. A launch-failed agent
                     # (fail_agent → skipped_agents but NOT in `pending`) never emits
-                    # agent_skipped, so the central clear seam (~11606) never fires and
+                    # agent_skipped, so the central clear seam in `emit_event` never fires and
                     # the fail_agent mirror lingered → the FE AgentAlertPanel fallback
                     # (decisionToCard) re-rendered the snag card even after the agent
-                    # was skipped. Symmetric to the retry_agent clear at ~7787/7805;
+                    # was skipped. Symmetric to the retry_agent clear below (#777);
                     # idempotent DELETE_FIELD; one chokepoint covers every skip_agent
                     # site (P2 fail_agent Skip + P3/P4 verify-gate Skip). Agent-scoped
                     # (pass _ag) so skipping ONE agent's card can't retract a DIFFERENT
@@ -20034,9 +20034,9 @@ def _start_command_listener(uid, research_id, loop):
                     loop.call_soon_threadsafe(_controls.request_retry_agent_hard, _ag)
                     loop.call_soon_threadsafe(_controls.request_resume)
                     # Auto-resume the FE across ALL surfaces on Retry. A fail_agent
-                    # card FE-auto-pauses the run locally (usePipeline:3063) with no
+                    # card FE-auto-pauses the run locally (usePipeline.ts) with no
                     # BE pause, and this intake otherwise emits NO resume (see the
-                    # 8692 note) — so a second tab / phone / cold reopen stayed stuck
+                    # #777 note below) — so a second tab / phone / cold reopen stayed stuck
                     # "Paused MM:SS" (the user's "still paused after retry" report).
                     # The acting tab clears optimistically FE-side; this covers the
                     # rest. Scheduled on the loop thread (emit does Firestore I/O);
@@ -20051,7 +20051,7 @@ def _start_command_listener(uid, research_id, loop):
                     # the instant the user clicks Retry. The agent-retry path resolves
                     # the decision via request_retry_agent_hard + request_resume +
                     # await_agent_decision()=="retry" — it emits NO pipeline_resumed /
-                    # phase_restart event, so the central clear seam (~11387) never
+                    # phase_restart event, so the central clear seam in `emit_event` never
                     # fired and the snag card lingered until the run advanced PAST the
                     # phase (FE staleness guard nulled it on docPhase>pd.phase). This
                     # ONE chokepoint covers EVERY Phase-2 fail_agent→retry site
@@ -20193,7 +20193,8 @@ def _start_cli_command_reader(loop):
             if cmd in ("r", "resume"):
                 # At a Phase 0 pro_required pause, a bare resume falls through
                 # to the post-pause "no explicit choice → Free-acknowledged"
-                # branch (line ~18877) — even if the user just upgraded to Pro
+                # branch (Phase 0's pro_required pause in `run_pipeline`) — even if
+                # the user just upgraded to Pro
                 # in the browser. The web frontend's Retry button on the
                 # pro_required banner sets retry_phase(0); CLI 'r' must do the
                 # same so Phase 0 actually re-verifies ChatGPT/Gemini/Claude
@@ -20204,7 +20205,7 @@ def _start_cli_command_reader(loop):
                 #
                 # DGOPS-7710 (F6, 2026-05-18): claude_chat_mode pause needs a
                 # DIFFERENT consume path — Phase 2B's `await_agent_decision`
-                # (line 4274) polls consume_continue_anyway / skipped_agents,
+                # polls consume_continue_anyway / skipped_agents,
                 # NOT phase-level flags. Plain `request_resume` releases
                 # wait_if_paused but await_agent_decision then hangs for the
                 # 3h timeout. CLI `r` here means [Continue in chat mode] (the
@@ -20231,7 +20232,7 @@ def _start_cli_command_reader(loop):
                     log("[CMD] resume → retry agent (link_failed alert)")
                     loop.call_soon_threadsafe(_controls.set_agent_decision, "retry")
                 # human_verification_required `r` falls through to plain
-                # resume — the poll loop at line ~18430 already detects
+                # resume — the poll loop in `wait_for_verification_clearance` already detects
                 # is_pause()==False and re-checks the browser. No special
                 # flag needed; behavior preserved.
                 else:
@@ -20280,7 +20281,7 @@ def _start_cli_command_reader(loop):
                     loop.call_soon_threadsafe(_controls.request_resume)
                 elif pr == "cua_unavailable":
                     # #705: cua_unavailable is a fail-closed INFRA gate — the P0
-                    # probe loop (research.py:28426) re-probes and ignores
+                    # probe loop in `run_pipeline` re-probes and ignores
                     # skip_init_verify, so `s` would silently re-card forever.
                     # Don't pretend to skip; tell the user the real recovery.
                     log("[CMD] skip unavailable at cua_unavailable — vision/CUA is required infra. "
@@ -20306,7 +20307,7 @@ def _start_cli_command_reader(loop):
                 # pro_required banner button. Only meaningful at a
                 # pro_required pause; gated to avoid leaking the
                 # continue_anyway flag into later phases that also
-                # consume it (Phase 1 Pro selector backstop @ 14220,
+                # consume it (the Phase 1 Pro selector backstop,
                 # etc.). To stop the pipeline, use Ctrl+C.
                 pr = getattr(_controls, "pause_reason", "") or ""
                 if pr == "pro_required":
@@ -20526,8 +20527,8 @@ class PipelineControls:
         """Called from command listener when user chooses retry/skip/stop
         for an agent_link_failed prompt. Whitelist-guards the value; only
         retry/skip/stop are written. NOTE: does NOT release the pause —
-        callers must invoke `request_resume()` separately (the dispatcher
-        at research.py:3819-3854 does this explicitly for both `r` and `s`
+        callers must invoke `request_resume()` separately (the CLI dispatcher
+        in `_start_cli_command_reader` does this explicitly for both `r` and `s`
         branches at agent_link_failed pauses).
 
         #955 Phase 5: `agent` scopes the decision so the NON-blocking Claude
@@ -20622,7 +20623,7 @@ class PipelineControls:
                 actions = f"  r) resume (re-check verification)   s) skip {target or 'agent'}"
             elif reason == "cua_unavailable":
                 header = "[PAUSE] cua_unavailable — fix Anthropic key/cap, then:"
-                # #705: NO skip option. The P0 probe loop (research.py:28426)
+                # #705: NO skip option. The P0 probe loop in `run_pipeline`
                 # is fail-closed and ignores skip_init_verify — vision/CUA is
                 # required infra, not a login the user can wave past. Advertising
                 # `s` here only re-cards forever (Stop was the sole real exit).
@@ -21240,8 +21241,8 @@ class PipelineRuntime:
         self.agent_modes: dict = {}
         # 2026-05-03: per-agent live progress snapshot keyed by lowercase
         # platform name. Polling loop writes into this on every emit cycle
-        # (research.py:~12091) so the P2 completion emit at
-        # extract_and_record_agent (research.py:~10705) can pull the latest
+        # (in `poll_all_agents_round_robin`) so the P2 completion emit in
+        # `extract_and_record_agent` can pull the latest
         # rich fields (source_urls / sections / steps / searches /
         # observed_sources) into the `complete` agent_progress payload.
         # Without this, the completion emit only shipped partialTextLen +
@@ -21874,7 +21875,7 @@ async def _probe_cua_available(cua_client) -> None:
     """
     if cua_client is None:
         # No client == no key resolved. run_pipeline returns early on an empty
-        # key (:27272) so this is belt-and-suspenders, but treat it as a hard
+        # key, so this is belt-and-suspenders, but treat it as a hard
         # unavailable rather than silently degrading.
         raise CuaUnavailableError("No Anthropic client (API key did not resolve)")
     try:
@@ -21893,7 +21894,8 @@ async def _probe_cua_available(cua_client) -> None:
         kind = _anthropic_err_kind(err)
         # Only the unambiguously-structural classes block the run: a bad/capped
         # key (401 / workspace cap) or a rate-limit (429) the user must clear.
-        # These are exactly the classes verify_login_cua raises on (:8503).
+        # These are exactly the classes verify_login_cua raises on (via
+        # `_cua_login_call`).
         if kind in ("rate_limit", "key"):
             log(f"[probe_cua] Anthropic unavailable ({kind}) — fail-closed at P0: {err[:160]}", "ERROR")
             raise CuaUnavailableError(err) from e
@@ -24127,8 +24129,8 @@ async def _cua_pro_tier_call(page, platform: str, cua_client, heavy: bool = Fals
             return "free"
         # #724 item 2: an ambiguous LIGHT-model verdict gets one escalated
         # re-read on the heavy model (Opus 4.8) before we fall back to fail-open
-        # "unsure" — mirrors verify_login_cua's attempts>=2 rule (research.py
-        # ~9040). A fresh screenshot after a short settle covers the common
+        # "unsure" — mirrors verify_login_cua's attempts>=2 rule. A fresh
+        # screenshot after a short settle covers the common
         # case where the Pro/Free chrome simply hadn't finished rendering when
         # the first shot was taken. heavy=True passes don't recurse (guard is
         # `not heavy`), so this is at most ONE extra screenshot + Opus call,
@@ -26085,7 +26087,7 @@ async def verified_paste_brief(page, brief_text, platform, label, max_retries=1)
     # this function — five call sites, one recording point.
     #
     # ⛔ FIRST PASTE ONLY, NEVER OVERWRITTEN. This function also pastes MID-RUN
-    # FOLLOW-UPS (the dispatcher at :19801). Letting a follow-up replace the
+    # FOLLOW-UPS (via `paste_followup`). Letting a follow-up replace the
     # fingerprint would re-identify the conversation by the newest thing typed
     # into it, so a resume-with-added-input would make the run stop recognising
     # its own tab.
@@ -26382,7 +26384,7 @@ def emit_event(event_type, phase=None, agent=None, **data):
     # OVERWRITES a prior "errored" — important when user picks Retry on
     # a fail_phase alert and the retry succeeds. ALL agent_skipped emits
     # now carry a `reason` (config-skips emit "Disabled in pipeline
-    # config" — research.py:19402, runtime skips emit "user_skip…") and
+    # config" at Phase 2's start in run_pipeline, runtime skips emit "user_skip…") and
     # all persist to root doc as dual-source defense-in-depth: the
     # FE-side pipelineConfig snapshot can be missing on legacy docs or
     # overwritten by the Settings cascade mid-run, so we want the icon
@@ -26396,7 +26398,7 @@ def emit_event(event_type, phase=None, agent=None, **data):
             # "complete" for it anyway, on a daemon thread, while the call site
             # wrote "skipped" or "errored" on another — two non-transactional
             # read-modify-writes on the same `phases` array, and the last one
-            # home won. P1's post-error skip (research.py ~59482) has had that
+            # home won. P1's post-error skip in `run_pipeline` has had that
             # race since it was written; P2's wipeout verdict inherited it, and I
             # claimed in the same change that passing the marker made this one
             # writer. It did not. This is what makes that true.
@@ -26628,7 +26630,7 @@ def emit_event(event_type, phase=None, agent=None, **data):
         # currentRunPhaseStartedAt to the device doc so queued-doc ETA
         # computations + the FE banner's "Current run is in Phase X"
         # line have live source of truth. Worker-1 only (mirrors
-        # currentRunId/Title/StartedAt convention at research.py:~29193;
+        # currentRunId/Title/StartedAt convention in `_job_worker`;
         # multi-worker per-worker tracking is a future schema bump).
         # Fire-and-forget — never block emit_event on a Firestore write.
         try:
@@ -26698,8 +26700,8 @@ def emit_event(event_type, phase=None, agent=None, **data):
     # was reverted because completed/stopped runs MUST preserve their full
     # event timeline for replay/post-mortem. Cleanup happens only when the
     # user explicitly deletes a research — see deleteResearch cascade in
-    # firestore.ts and the BE orphan-sweep in startup. The FE seq filter at
-    # firestore.ts:925 (where("seq", ">", lastSeq) + localStorage) keeps
+    # firestore.ts and the BE orphan-sweep in startup. The FE seq filter in
+    # firestore.ts (where("seq", ">", lastSeq) + localStorage) keeps
     # cold-start reads bounded regardless of subcollection size.
 
 
@@ -28019,7 +28021,7 @@ def _alert_actions_for(intent: str, phase, agent=None):
                         "command": {"action": "stop"}})
         elif token == "skip_login":
             # #955 Phase 5: login_required Skip is destination-aware — byte-exact
-            # to the FE loginDecisionAlert (pipeline-decision.ts:96-103). At a
+            # to the FE `loginDecisionAlert` in pipeline-decision.ts. At a
             # phase-time work-tab pause (phase >= 1, single platform) Skip drops
             # THIS platform (skip_agent); at the P0 init walk / env-check (phase
             # 0) it bypasses the sign-in verification (skip_init_verify). The FE
@@ -28035,18 +28037,18 @@ def _alert_actions_for(intent: str, phase, agent=None):
                             "command": {"action": "skip_init_verify"}})
         elif token == "resume":
             # #955 Phase 5: solvable-HV Resume → resume (byte-exact to FE
-            # humanVerifyAlert non-Cloudflare branch, pipeline-decision.ts:164).
+            # humanVerifyAlert's non-Cloudflare branch in pipeline-decision.ts).
             out.append({"id": "resume", "label": "Resume", "style": "primary",
                         "command": {"action": "resume"}})
         elif token == "retry_link":
             # #955 Phase 5: agent_link_failed Retry → agent_decision(retry)
-            # (byte-exact to FE agentLinkFailedAlert, pipeline-decision.ts:183).
+            # (byte-exact to FE `agentLinkFailedAlert` in pipeline-decision.ts).
             out.append({"id": "retry", "label": "Retry", "style": "primary",
                         "command": {"action": "agent_decision", "agent": agent,
                                     "decision": "retry"}})
         elif token == "skip_link":
             # #955 Phase 5: agent_link_failed Skip → agent_decision(skip)
-            # (byte-exact to FE agentLinkFailedAlert, pipeline-decision.ts:184).
+            # (byte-exact to FE `agentLinkFailedAlert`'s Skip in pipeline-decision.ts).
             out.append({"id": "skip", "label": f"Skip {_agent_display_name(agent)}",
                         "style": "default",
                         "command": {"action": "agent_decision", "agent": agent,
@@ -28664,7 +28666,7 @@ def fail_phase(phase: int, title: str = "", details: str = "",
     # 2026-05-21: when mark_phase_errored=False (preflight aborts), also
     # flag the event payload as quiet=True so the FE listing-page tile
     # doesn't paint the target phase's node red via the volatile
-    # pipeline.phaseAlerts fallback (researches/page.tsx:786-792 unions
+    # pipeline.phaseAlerts fallback (researches/page.tsx unions
     # alerts into erroredPhases only when !quiet). Pre-fix, the persistent
     # write was suppressed but the tile still went red on the Flow B
     # preflight abort because the alert side-channel was unconditional.
@@ -29598,7 +29600,7 @@ def fail_agent(agent_key: str, title: str, details: str = "", skip_only: bool = 
     defaults a mode-less retry_agent to that restart.
 
     `phase` defaults to the LIVE run phase (`_runtime.phase`) so a P1-context
-    relaunch failure (research.py:~11201) is honestly tagged phase 1 instead of
+    relaunch failure (one raised while Phase 1 runs) is honestly tagged phase 1 instead of
     the old hardcoded phase 2 — which mislabeled a P1 ChatGPT failure as a P2
     agent card and leaked it into the P2 dropdown. Pass an explicit phase only
     to override the live value.
@@ -29633,7 +29635,7 @@ def fail_agent(agent_key: str, title: str, details: str = "", skip_only: bool = 
         pass
     # Dismiss button removed 2026-04-28 — the alert's corner ✕ already
     # records the alertId in dismissedAlertIds and clears the visible
-    # alert (PhaseDropdown.tsx:2062-2069), so an in-action Dismiss button
+    # alert (PhaseDropdown.tsx's `dismissedAlertIds`), so an in-action Dismiss button
     # was a duplicate path that just added noise.
     _eff_phase = phase if isinstance(phase, int) and phase >= 0 else (
         _runtime.phase if isinstance(_runtime.phase, int) and _runtime.phase >= 0 else 2)
@@ -29777,12 +29779,12 @@ def _narrator_cadence_for_phase(phase: int) -> float:
 
 # Chat-thread chrome that leaks via DOM scrape into events. Strip from
 # narrator inputs ONLY (scrape outputs untouched — chip/step count still
-# read those raw). Patterns mirror the FE filter at
-# PhaseDropdown.tsx:2034-2041 plus 'brief.md' and the partial form
+# read those raw). Patterns mirror the FE filter `isNoiseLabel` in
+# PhaseDropdown.tsx plus 'brief.md' and the partial form
 # without trailing colon. Compiled once at module load.
 _NARR_NOISE_PREFIX_RE = re.compile(
     # Optional leading verb-prefix (e.g. "Building: ", "Searching: ") allows
-    # the JS-prepended composites at research.py:7102 to be cleaned —
+    # the JS-prepended composites from `scrape_progress_claude` to be cleaned —
     # "Building: Claude responded: I'll start by..." → "I'll start by..."
     r"^\s*(?:\w+:\s*)?(?:you|chatgpt|gemini|claude|notebooklm|gpt)\s+(?:said|responded)\b\s*[:.]?\s*",
     re.IGNORECASE,
@@ -30740,7 +30742,7 @@ def _extract_top_hosts(events: list, limit: int = 2) -> list:
 # fallback when both Tier-2 (Haiku/Flash on real events) AND Tier-3
 # (LLM with hardcoded timeline) refuse or fail. Three phrasings per
 # (akey, phase) so consecutive emits don't collide on the dedupe
-# equality guard at line ~7131/~7207 (silent-emit trap).
+# equality guard in `_narrator_loop` (silent-emit trap).
 AGENT_TIER4_VARIANTS = {
     ("chatgpt", 1): [
         "ChatGPT is reasoning through the brief with its latest thinking model.",
@@ -34678,7 +34680,7 @@ async def scrape_progress_gemini(page):
             // ANIMATION NAME. Both misses are real. What is NOT measured is
             // Gemini's DOM while it DRAFTS THE PLAN — and `isActive` feeds
             // `status`, which the 2D plan-wait reads as its streaming clock
-            // (research.py ~51055): a status of 'generating' resets the clock and
+            // (in `run_phase2`): a status of 'generating' resets the clock and
             // can flip `_streaming_handoff`, which SKIPS the CUA recovery ladder
             // for a genuinely dead plan. So making this tier see more, off a
             // capture taken while research was already running, would change
@@ -35498,7 +35500,7 @@ async def detect_completion_claude(page):
             // "stop_btn_present" on a genuinely-done report and completion fell to
             // the slow 5-min CUA fallback (stuck-despite-complete, live E2E
             // 2026-07-10). This is the exact guard verify_claude_generating
-            // adopted 2026-05-14 (research.py:19872) but never back-ported here.
+            // adopted 2026-05-14 but never back-ported here.
             if (!hasStop) {
                 for (const el of document.querySelectorAll(
                     '[class*="animate"], [class*="spin"], [class*="pulse"], [class*="loading"], .streaming'
@@ -37953,7 +37955,7 @@ async def scrape_chatgpt_activity_panel_tracking(page):
         // sidebar nav / model-switcher rows and bled UI chrome into
         // out.steps[]. Min length raised 4→12 to drop "OK"/"Done"
         // single-word noise. Activity-verb gate mirrors Claude's panel
-        // walker at research.py:7052 — without it the walker grabs any
+        // walker in `scrape_progress_claude` — without it the walker grabs any
         // 4-240-char text inside a panel-shaped div.
         const STEP_SELS = [
             'li', '[role="listitem"]',
@@ -38935,7 +38937,7 @@ class Browser:
         # Self-heal if self.page was closed out from under us. Common
         # trigger: a throwaway tab opened via new_tab() (which reassigns
         # self.page) and then close()'d by the caller — e.g. the verify-
-        # at-phase-time flow at :7718 / :7851. Pre-fix, run_phase1's
+        # at-phase-time flow (`_phase_verify_gate`). Pre-fix, run_phase1's
         # first navigate hit TargetClosedError on the stale self.page
         # because nothing restored it post-verify. context.new_page()
         # gives us a live page on the same persistent profile (logins
@@ -38998,8 +39000,8 @@ class Browser:
         verify/probe tabs the caller will close in a finally. Critical
         because new_tab() reassigns self.page — closing the returned
         page would leave self.page pointing at a dead page and break
-        the next Browser-level navigate. See verify_at_phase_time
-        (:7718) — pre-fix, that flow used new_tab + tab.close() and
+        the next Browser-level navigate. See `_phase_verify_gate`
+        — pre-fix, that flow used new_tab + tab.close() and
         crashed P1's first navigate with TargetClosedError every time
         skipInitVerify was on."""
         page = await self.context.new_page()
@@ -39652,7 +39654,7 @@ async def _verify_chatgpt_generating_diag(page) -> str:
     in the real verify too).
 
     NOTE: kept in sync MANUALLY with verify_chatgpt_generating's host_hit
-    block (research.py:~14495-14597). If you touch one, touch the other.
+    block. If you touch one, touch the other.
     Drift only affects diagnostic accuracy — the real verify path is
     unaffected and the safety-net CUA escalation still works."""
     try:
@@ -41287,7 +41289,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
     # Mirrors the per-agent dict P2 round-robin uses, scoped to this single
     # poll call. Flips _panel_open_done True on first verified open. DOM
     # misses count both "found:false" AND "clicked but verify:false". CUA
-    # tier-3 capped at 1/call. The same robust helper (research.py:5048)
+    # tier-3 capped at 1/call. The same robust helper (`_open_chatgpt_activity_panel`)
     # works regardless of phase — Pro+ET in P1 produces the same React-
     # rendered styled <div> strip that DR in P2 does.
     _panel_open_done = False
@@ -41974,7 +41976,8 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                         sources=progress.get("sources", 0),
                         sourceUrls=progress.get("source_urls", []),
                         # 2026-07-20: emit the titled {url,title} items too, at
-                        # parity with the P2 round-robin emit (~27303). The P1
+                        # parity with the P2 round-robin emit in
+                        # `poll_all_agents_round_robin`. The P1
                         # panel walk above builds progress["source_items"] but
                         # this emit only ever sent bare sourceUrls, so the
                         # raw-activity popup could show hostnames but never the
@@ -42865,8 +42868,8 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
             # Extract real cited-source findings from the markdown so the FE
             # GraphAnalysis Findings tab can render rich
             # {url, snippet, sourceTitle} cards instead of just section
-            # headings. Persisted by save_meta's agents map writer
-            # (research.py:~17686). Source URLs come from the in-memory
+            # headings. Persisted by save_meta's agents map writer.
+            # Source URLs come from the in-memory
             # progress snapshot (already deduped).
             #
             # ⛔⛔ WAVE 10 — THIS RUNS BEFORE THE WRITE NOW, and the order is the
@@ -43003,7 +43006,7 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
                             history=getattr(_runtime, "agent_progress_history", {}).get(agent_key))
         # F4 (2026-05-06): persist agent terminal status to root doc on
         # the individual complete-emit instead of waiting for the bulk
-        # phase_complete write at :19641. On chat reopen mid-Phase-2,
+        # phase_complete write at the end of Phase 2. On chat reopen mid-Phase-2,
         # an agent that finished early (e.g. ChatGPT done while Claude
         # is still researching) should already show as 100% complete in
         # research.agents[k].status — pre-fix, only the message bucket
@@ -43236,8 +43239,8 @@ async def _claude_asking_clarification(page):
 async def _claude_send_clarification_reply(page, label):
     """Type the defer-to-Claude reply into the chat input, then submit.
 
-    Submit strategy: try the Send button first (matches paste_followup at
-    research.py:5170), fall back to Enter if no enabled button is found.
+    Submit strategy: try the Send button first (matches `paste_followup`'s
+    send step), fall back to Enter if no enabled button is found.
     Send-button-first protects against future Claude composer A/B tests
     that might bind Enter to newline (Shift+Enter→Enter swap pattern).
 
@@ -43261,7 +43264,7 @@ async def _claude_send_clarification_reply(page, label):
     if typed_into is None:
         log(f"[{label}] No composer found for clarification reply", "WARN")
         return False
-    # Send-button-first (mirror paste_followup pattern at research.py:5170).
+    # Send-button-first (mirror `paste_followup`'s send step).
     for sel in (
         'button[data-testid="send-button"]',
         'button[aria-label="Send prompt"]',
@@ -43401,7 +43404,7 @@ async def _claude_skip_question_cards(page, label, max_skips=6) -> int:
 # previously unblocked these stalls by typing "Done?" which produced
 # the same "I'm on it" → card-appears sequence).
 #
-# Mirrors the Claude clarification block above (research.py:16179):
+# Mirrors the Claude clarification block above (`_CLAUDE_CLARIFICATION_SIGNOFF_RE`):
 # regex + lightweight DOM probe + one-shot nudge + state reset.
 
 # ACK patterns Gemini emits after "Start research" — confirm Gemini
@@ -43422,7 +43425,7 @@ _GEMINI_KICKOFF_ACK_RE = re.compile(
 #   - "Researching websites..." (no number — Salaar Part 2 run 2026-05-24)
 #   - "Researching N searches..." / "Researching N sites..." (variants)
 # Match any of these to suppress the nudge once kickoff succeeded.
-# Mirrors the noun list in scrape_progress_gemini at research.py:~12054
+# Mirrors the noun list in scrape_progress_gemini
 # (`websites?|sources?|searches?|sites?`).
 _GEMINI_RESEARCH_CARD_RE = re.compile(
     r"researching\s+(?:\d+\s+)?(?:websites?|sources?|searches?|sites?)",
@@ -45139,7 +45142,8 @@ async def _gemini_send_kickoff_nudge(page, label, attempt_idx=0):
 
     Reuses paste_followup so the nudge picks up _PASTE_SELECTORS["gemini"]
     composer selectors + the unified Send-button fallback chain — same
-    machinery as the existing user-poke follow-up at research.py:~17498.
+    machinery as the existing user-poke follow-up (the `consume_poke_agent`
+    branch of `poll_all_agents_round_robin`).
     Returns True on send, False if the composer was unreachable."""
     idx = max(0, min(attempt_idx, len(_GEMINI_KICKOFF_NUDGES) - 1))
     nudge = _GEMINI_KICKOFF_NUDGES[idx]
